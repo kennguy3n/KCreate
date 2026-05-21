@@ -1,0 +1,40 @@
+[package]
+name = "kcreate_bridge"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "N-API bridge between the Electron renderer process and the kcreate_renderer crate"
+build = "build.rs"
+
+[lints]
+workspace = true
+
+[lib]
+name = "kcreate_bridge"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+kcreate_renderer = { path = "../kcreate_renderer" }
+napi.workspace = true
+napi-derive.workspace = true
+parking_lot.workspace = true
+log.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[build-dependencies]
+napi-build.workspace = true
+
+[dev-dependencies]
+# The bridge state machine is a process-global singleton, so tests that
+# mutate it must run serialized.
+serial_test = "3"
+
+[features]
+default = []
+# Mirror the renderer's CPU-only feature flag for headless N-API builds.
+cpu-only = ["kcreate_renderer/cpu-only"]

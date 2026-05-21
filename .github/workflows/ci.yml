@@ -41,11 +41,12 @@ jobs:
         run: clang --version
       - name: windows build environment
         if: runner.os == 'Windows'
-        # No extra packages needed — D3D12 ships with the runner; if no GPU
-        # adapter is reachable in CI, the tiny-skia software backend is used.
+        # No extra packages needed. The runner ships with MSVC + D3D12.
+        # `cl.exe` lives behind vcvars, but cargo finds it through its
+        # own probe, so we just log the rustc host triple.
         shell: pwsh
         run: |
-          cl /Bv 2>&1 | Select-Object -First 1
+          rustc --version --verbose
       - uses: Swatinem/rust-cache@v2
       - name: cargo fmt --check
         run: cargo fmt --all --check

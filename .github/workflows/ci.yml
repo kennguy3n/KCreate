@@ -1,9 +1,25 @@
 name: ci
 
+# CI strategy (changed on PR #2 after observed runner-shortage stalls):
+#
+# Every PR runs the *fast lane* by default — Linux Rust (clippy + tests) and
+# the Node TypeScript checks. That gives sub-25-minute feedback even when
+# GitHub's hosted runner pool is saturated.
+#
+# The cross-platform matrix (macOS + Windows) is gated and only runs when:
+#   - a PR is labeled `full-ci` (preferred), or
+#   - a commit message contains `[full-ci]` (one-shot opt-in), or
+#   - the change has landed on `main`, or
+#   - the workflow is triggered manually via `workflow_dispatch`.
+#
+# Every job carries a `timeout-minutes` so no run can hang forever in the
+# queue or in cargo's link step.
+
 on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
@@ -14,39 +30,66 @@ env:
   RUSTFLAGS: "-D warnings"
 
 jobs:
+  # Fast lane — runs on every PR.
   rust:
-    name: rust (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-22.04, macos-13, windows-2022]
+    name: rust (ubuntu-22.04)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - name: install rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-      - name: install gpu deps (linux)
-        if: runner.os == 'Linux'
+      - name: install gpu deps
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             libwayland-dev libxkbcommon-dev libxcb1-dev libgl1 libvulkan1 \
             mesa-vulkan-drivers
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo fmt --check
+        run: cargo fmt --all --check
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: cargo check
+        run: cargo check --workspace --all-targets
+      - name: cargo test
+        run: cargo test --workspace --all-targets
+      - name: cargo bench (compile only)
+        run: cargo bench -p kcreate_renderer --no-run
+
+  # Cross-platform lane — gated. See header comment for opt-in triggers.
+  rust-extended:
+    name: rust (${{ matrix.os }})
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+      (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'full-ci')) ||
+      contains(github.event.head_commit.message, '[full-ci]')
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-13, windows-2022]
+    steps:
+      - uses: actions/checkout@v4
+      - name: install rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
       - name: macos build environment
         if: runner.os == 'macOS'
-        # No extra packages needed — Metal ships with macOS, Xcode CLT is preinstalled
-        # on GitHub's macos-13 runner. CPU fallback works headless.
+        # Metal ships with macOS; Xcode CLT is preinstalled on macos-13.
+        # CPU fallback works headless.
         run: clang --version
       - name: windows build environment
         if: runner.os == 'Windows'
-        # No extra packages needed. The runner ships with MSVC + D3D12.
-        # `cl.exe` lives behind vcvars, but cargo finds it through its
-        # own probe, so we just log the rustc host triple.
+        # MSVC + D3D12 ship with the runner. cargo finds cl.exe via its
+        # own probe; we just log the rustc host triple.
         shell: pwsh
-        run: |
-          rustc --version --verbose
+        run: rustc --version --verbose
       - uses: Swatinem/rust-cache@v2
       - name: cargo fmt --check
         run: cargo fmt --all --check
@@ -62,6 +105,7 @@ jobs:
   node:
     name: node (typescript)
     runs-on: ubuntu-22.04
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4

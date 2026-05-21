@@ -111,6 +111,21 @@ Bridge tests share a process-global renderer singleton; they use the
 
 4. Push and open a PR against `main`. CI must be green before review.
 
+### CI lanes
+
+CI is gated to keep PR feedback fast:
+
+| Lane              | When it runs                                                                                                                                                                                                                                | Jobs                                                                       |
+| ----------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------- |
+| **Fast (default)**| Every PR.                                                                                                                                                                                                                                  | `rust (ubuntu-22.04)`, `node (typescript)`                                 |
+| **Cross-platform**| Push to `main`; PR with the `full-ci` label; commit message containing `[full-ci]`; manual `workflow_dispatch`.                                                                                                                              | `rust (macos-13)`, `rust (windows-2022)`                                   |
+
+To verify a PR on all three platforms before merge, add the `full-ci`
+label (preferred — it re-runs the matrix on every push to the PR) or
+amend the latest commit message to include `[full-ci]`. Every job has a
+`timeout-minutes` cap so a runner-shortage queue can never stall a PR
+indefinitely.
+
 ## License
 
 By contributing, you agree your contribution is licensed under

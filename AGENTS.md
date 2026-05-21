@@ -37,7 +37,7 @@ KCreate/
 ├── PROGRESS.md              phase tracking
 ├── CONTRIBUTING.md          contributor guide
 ├── SECURITY.md              security policy
-└── .github/workflows/ci.yml ubuntu-22.04 / macos-13 / windows-2022 matrix
+└── .github/workflows/ci.yml fast lane (ubuntu + node) + gated cross-platform matrix (macos-13 + windows-2022, opt-in via `full-ci` label / `[full-ci]` in commit msg / push to main / workflow_dispatch). Every job has `timeout-minutes`.
 ```
 
 ## Phase 0 contract

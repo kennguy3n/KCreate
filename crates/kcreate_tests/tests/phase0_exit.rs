@@ -17,15 +17,15 @@ use kcreate_core::document::DocumentGraph;
 use kcreate_core::node::{Bounds, Node, NodeType, Transform2D};
 use kcreate_core::operation::Operation;
 use kcreate_export::{
-    export_jpeg_to_bytes, export_pdf_from_document, export_png_to_bytes,
-    export_svg_from_document, export_webp_to_bytes, JpegExportOptions, PdfExportOptions,
-    PngExportOptions, RasterPixelCache, SvgExportOptions, WebpExportOptions,
+    export_jpeg_to_bytes, export_pdf_from_document, export_png_to_bytes, export_svg_from_document,
+    export_webp_to_bytes, JpegExportOptions, PdfExportOptions, PngExportOptions, RasterPixelCache,
+    SvgExportOptions, WebpExportOptions,
 };
 use kcreate_mcp::tools::{ArtboardInfo, DocumentAccess};
 use kcreate_renderer::{
     geometry::Vec2,
     scene::{Object, ObjectKind, Scene},
-    Color, RenderContext, Rect, Style,
+    Color, Rect, RenderContext, Style,
 };
 use kcreate_storage::ProjectStore;
 use kcreate_vector::{PathPoint, PathSegment, VectorPath};
@@ -199,11 +199,7 @@ fn phase0_canvas_pan_zoom_changes_pixels() {
     ctx.set_viewport(Vec2::ZERO, 1.0);
     ctx.invalidate_all();
     let f1 = ctx.render_frame(&scene).expect("render identity");
-    let baseline = ctx
-        .get_frame_pixels(f1)
-        .expect("frame")
-        .pixels()
-        .to_vec();
+    let baseline = ctx.get_frame_pixels(f1).expect("frame").pixels().to_vec();
 
     // Zoom to 2x and shift the pan; the rasterised image must differ.
     ctx.set_viewport(Vec2::new(5.0, 7.0), 2.0);
@@ -245,8 +241,7 @@ fn phase0_local_bg_removal_runs_on_cpu() {
             input[i + 3] = 255;
         }
     }
-    let output =
-        remove_background(&input, W, H, BgRemoveOptions::default()).expect("bg remove");
+    let output = remove_background(&input, W, H, BgRemoveOptions::default()).expect("bg remove");
     assert_eq!(output.len(), input.len());
     // At least the corner pixels (definitely background) must be
     // transparent.
@@ -333,11 +328,8 @@ fn scene_with_rect() -> Scene {
         }),
         stroke: None,
     };
-    let rect = Object::new(
-        ObjectKind::Rect(Rect::new(0.0, 0.0, 16.0, 16.0)),
-        style,
-    )
-    .with_translation(4.0, 4.0);
+    let rect = Object::new(ObjectKind::Rect(Rect::new(0.0, 0.0, 16.0, 16.0)), style)
+        .with_translation(4.0, 4.0);
     scene.add_object(rect);
     scene
 }

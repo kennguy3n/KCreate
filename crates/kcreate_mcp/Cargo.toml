@@ -1,0 +1,24 @@
+[package]
+name = "kcreate_mcp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Local loopback MCP server (HTTP JSON-RPC) exposing three tools"
+
+[lints]
+workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+log.workspace = true
+parking_lot.workspace = true
+tiny_http.workspace = true
+kcreate_core = { path = "../kcreate_core" }
+kcreate_storage = { path = "../kcreate_storage" }
+kcreate_export = { path = "../kcreate_export" }

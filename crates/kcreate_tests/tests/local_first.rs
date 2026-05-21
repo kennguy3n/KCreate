@@ -30,6 +30,11 @@ const DENIED_CRATES: &[&str] = &[
     "rumqttc",
     "lapin",
     "rdkafka",
+    // The MCP sidecar (kcreate_mcp) links tiny_http. Per AGENTS.md it
+    // must NOT appear in the editing-path tree under default features:
+    // kcreate_bridge declares kcreate_mcp behind the optional `mcp`
+    // feature so default builds (and this test) keep tiny_http out.
+    "tiny_http",
 ];
 
 /// Crates whose runtime is networking-heavy. We enforce a stronger

@@ -117,6 +117,20 @@ pub fn invalidate(region: Option<Rect>) -> Result<()> {
 
 pub fn render(scene_json: &str) -> Result<FrameId> {
     let scene = parse_scene(scene_json)?;
+    render_scene(scene)
+}
+
+/// Render an already-parsed [`Scene`].
+///
+/// This bypasses the JSON wire format and is used by
+/// [`crate::document`] when it synchronises the document graph
+/// directly into the renderer — JSON round-tripping a scene built
+/// in-process is wasted work, and the wire format can't represent
+/// every native scene (e.g. the [`SceneSync`] selection highlights
+/// reuse `ObjectKind::Rect` with a stroked-only style that the wire
+/// `WireKind::Rect` shape also covers, but skipping serialisation
+/// keeps the hot path tight regardless).
+pub fn render_scene(scene: Scene) -> Result<FrameId> {
     let guard = slot().lock();
     let ctx = guard.as_ref().ok_or(BridgeError::NotInitialized)?;
     let id = ctx.render_frame(&scene)?;

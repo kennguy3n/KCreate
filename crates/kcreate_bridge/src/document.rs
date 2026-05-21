@@ -83,6 +83,13 @@ struct Workspace {
     /// bounded by `OperationLog::max_depth` (a few KB even on the most
     /// generous device tier).
     persisted_op_ids: HashSet<Uuid>,
+    /// Bidirectional uuid ⇄ `ObjectId` mapping rebuilt by [`scene_sync`]
+    /// on every mutation. Lives in the workspace (not a sibling
+    /// singleton) so it can't outlive the project it describes.
+    scene_sync: crate::scene_sync::SceneSync,
+    /// Currently selected document nodes. Selection is rendered as
+    /// highlight overlays in the next scene sync.
+    selection: Vec<Uuid>,
 }
 
 fn slot() -> &'static Mutex<Option<Workspace>> {
@@ -209,7 +216,15 @@ pub fn project_create(name: &str, dir: &Path) -> Result<ProjectInfo> {
         project,
         store,
         persisted_op_ids: HashSet::new(),
+        scene_sync: crate::scene_sync::SceneSync::new(),
+        selection: Vec::new(),
     });
+    // First scene sync. Errors from `state::render_scene` are silently
+    // tolerated here because creating a project before the renderer is
+    // initialised is a legitimate sequence (the host may create a
+    // project headlessly for tests). The next renderer_init + sync
+    // will recover.
+    let _ = sync_scene_locked(&mut guard);
     drop(guard);
     Ok(info)
 }
@@ -256,7 +271,10 @@ pub fn project_open(dir: &Path) -> Result<ProjectInfo> {
         project,
         store,
         persisted_op_ids,
+        scene_sync: crate::scene_sync::SceneSync::new(),
+        selection: Vec::new(),
     });
+    let _ = sync_scene_locked(&mut guard);
     drop(guard);
     Ok(info)
 }
@@ -411,6 +429,7 @@ pub fn document_create_node(
     let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
     let id = ws.project.document.insert_node(node)?;
     ws.project.modified_at = Utc::now();
+    let _ = sync_scene_locked(&mut guard);
     drop(guard);
     Ok(id)
 }
@@ -457,6 +476,7 @@ pub fn document_update_node(id: Uuid, changes: &UpdateNodeProps) -> Result<()> {
     }
     node.touch();
     ws.project.modified_at = Utc::now();
+    let _ = sync_scene_locked(&mut guard);
     drop(guard);
     Ok(())
 }
@@ -473,6 +493,10 @@ pub fn document_delete_node(id: Uuid) -> Result<()> {
         return Err(DocumentBridgeError::NodeNotFound(id));
     }
     ws.project.modified_at = Utc::now();
+    // Drop any selection entries that refer to the deleted node so the
+    // host doesn't keep painting highlights over thin air.
+    ws.selection.retain(|sel| *sel != id);
+    let _ = sync_scene_locked(&mut guard);
     drop(guard);
     Ok(())
 }
@@ -520,6 +544,457 @@ pub fn document_redo() -> Result<Option<Vec<Uuid>>> {
     let affected = ws.project.redo().map(|op| op.affected_nodes);
     drop(guard);
     Ok(affected)
+}
+
+// -----------------------------------------------------------------------------
+// Scene synchronisation (document graph → renderer)
+// -----------------------------------------------------------------------------
+
+/// Rebuild the renderer scene from the current document state.
+///
+/// Called automatically after every CRUD mutation, selection change,
+/// import, or undo/redo. The host can also call it explicitly via the
+/// `document_sync_scene` N-API export when it wants to force a redraw
+/// (e.g. after the renderer has been re-initialised at a new size).
+///
+/// Quiet on "renderer not initialised" — that's a legitimate state
+/// when the host creates a project headlessly (e.g. in tests) before
+/// constructing a canvas. All other renderer errors are returned so
+/// the host can surface them.
+pub fn document_sync_scene() -> Result<()> {
+    let mut guard = slot().lock();
+    let _ = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
+    sync_scene_locked(&mut guard)?;
+    drop(guard);
+    Ok(())
+}
+
+/// Internal scene-sync used by every mutation site. Caller must hold
+/// the workspace lock. Failures to render are propagated; failures to
+/// find a renderer (host hasn't initialised yet) are swallowed.
+fn sync_scene_locked(guard: &mut parking_lot::MutexGuard<'_, Option<Workspace>>) -> Result<()> {
+    let Some(ws) = guard.as_mut() else {
+        return Ok(());
+    };
+    let scene = ws.scene_sync.sync_document_to_scene(
+        &ws.project.document,
+        Some(ws.store.blobs()),
+        &ws.selection,
+    );
+    // Renderer not initialised is fine here: the host may be working
+    // headlessly. Other render errors propagate.
+    match crate::state::render_scene(scene) {
+        Ok(_) | Err(crate::state::BridgeError::NotInitialized) => Ok(()),
+        Err(e) => Err(DocumentBridgeError::Bridge(e)),
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Selection
+// -----------------------------------------------------------------------------
+
+/// Replace the selection with the given node ids.
+///
+/// Unknown ids are silently dropped so the host can't get out of sync
+/// with the document — selecting a node and then deleting it must not
+/// produce a stale selection entry.
+pub fn document_set_selection(ids: Vec<Uuid>) -> Result<()> {
+    let mut guard = slot().lock();
+    let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
+    let valid: Vec<Uuid> = ids
+        .into_iter()
+        .filter(|id| ws.project.document.contains(*id))
+        .collect();
+    ws.selection = valid;
+    let _ = sync_scene_locked(&mut guard);
+    drop(guard);
+    Ok(())
+}
+
+/// Snapshot of the current selection.
+pub fn document_get_selection() -> Result<Vec<Uuid>> {
+    let guard = slot().lock();
+    let ws = guard.as_ref().ok_or(DocumentBridgeError::NoProject)?;
+    let sel = ws.selection.clone();
+    drop(guard);
+    Ok(sel)
+}
+
+/// Clear the selection. No-op when nothing is selected.
+pub fn document_clear_selection() -> Result<()> {
+    let mut guard = slot().lock();
+    let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
+    if ws.selection.is_empty() {
+        return Ok(());
+    }
+    ws.selection.clear();
+    let _ = sync_scene_locked(&mut guard);
+    drop(guard);
+    Ok(())
+}
+
+// -----------------------------------------------------------------------------
+// Hit testing
+// -----------------------------------------------------------------------------
+
+/// Hit-test a viewport-relative screen point against the current
+/// scene. Returns the document uuid of the topmost selectable node
+/// under the cursor, or `None` if no node is under the cursor.
+///
+/// The host passes the *current* viewport (pan + zoom) because the
+/// bridge does not own the canvas' viewport state — that lives in
+/// the React shell and is shipped over IPC for each hit query.
+pub fn canvas_hit_test(
+    screen_x: f32,
+    screen_y: f32,
+    pan_x: f32,
+    pan_y: f32,
+    zoom: f32,
+) -> Result<Option<Uuid>> {
+    let mut guard = slot().lock();
+    let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
+    // Rebuild the scene from the document on every hit-test. This
+    // sidesteps the "is the renderer's cached scene up to date?"
+    // question entirely: a hit-test is cheap (a few hundred reverse-z
+    // AABB checks) compared to its UX cost when wrong.
+    let scene = ws.scene_sync.sync_document_to_scene(
+        &ws.project.document,
+        Some(ws.store.blobs()),
+        &ws.selection,
+    );
+    let vp = crate::hit_test::Viewport::new(kcreate_renderer::Vec2::new(pan_x, pan_y), zoom);
+    let hit = crate::hit_test::hit_test(&ws.scene_sync, &scene, screen_x, screen_y, vp);
+    drop(guard);
+    Ok(hit)
+}
+
+// -----------------------------------------------------------------------------
+// Canvas shape creation
+// -----------------------------------------------------------------------------
+
+/// Create a rectangle vector layer covering `(x, y, w, h)` (world
+/// space). Returns the new node's uuid. Records an `op_kind` of
+/// `"canvas_create_rect"` on the operation log so undo/redo cycles
+/// through this gesture symmetrically.
+pub fn canvas_create_rect(parent_id: Option<Uuid>, x: f64, y: f64, w: f64, h: f64) -> Result<Uuid> {
+    let path = kcreate_vector::VectorPath::new(vec![
+        kcreate_vector::PathSegment::MoveTo(kcreate_vector::PathPoint::new(x, y)),
+        kcreate_vector::PathSegment::LineTo(kcreate_vector::PathPoint::new(x + w, y)),
+        kcreate_vector::PathSegment::LineTo(kcreate_vector::PathPoint::new(x + w, y + h)),
+        kcreate_vector::PathSegment::LineTo(kcreate_vector::PathPoint::new(x, y + h)),
+        kcreate_vector::PathSegment::Close,
+    ]);
+    create_vector_layer(
+        parent_id,
+        "Rectangle",
+        x,
+        y,
+        w,
+        h,
+        path,
+        "canvas_create_rect",
+    )
+}
+
+/// Create an ellipse vector layer centered at `(cx, cy)` with radii
+/// `(rx, ry)`. The ellipse is approximated by four cubic Bezier
+/// segments using the standard `(4/3) * tan(pi/8)` magic constant
+/// (the same approximation `<circle>` SVG renderers use under the
+/// hood — visually indistinguishable from a true ellipse at any
+/// reasonable display resolution).
+pub fn canvas_create_ellipse(
+    parent_id: Option<Uuid>,
+    cx: f64,
+    cy: f64,
+    rx: f64,
+    ry: f64,
+) -> Result<Uuid> {
+    const KAPPA: f64 = 0.552_284_749_830_793_4;
+    let ox = rx * KAPPA;
+    let oy = ry * KAPPA;
+    let path = kcreate_vector::VectorPath::new(vec![
+        kcreate_vector::PathSegment::MoveTo(kcreate_vector::PathPoint::new(cx - rx, cy)),
+        kcreate_vector::PathSegment::CubicTo {
+            ctrl1: kcreate_vector::PathPoint::new(cx - rx, cy - oy),
+            ctrl2: kcreate_vector::PathPoint::new(cx - ox, cy - ry),
+            end: kcreate_vector::PathPoint::new(cx, cy - ry),
+        },
+        kcreate_vector::PathSegment::CubicTo {
+            ctrl1: kcreate_vector::PathPoint::new(cx + ox, cy - ry),
+            ctrl2: kcreate_vector::PathPoint::new(cx + rx, cy - oy),
+            end: kcreate_vector::PathPoint::new(cx + rx, cy),
+        },
+        kcreate_vector::PathSegment::CubicTo {
+            ctrl1: kcreate_vector::PathPoint::new(cx + rx, cy + oy),
+            ctrl2: kcreate_vector::PathPoint::new(cx + ox, cy + ry),
+            end: kcreate_vector::PathPoint::new(cx, cy + ry),
+        },
+        kcreate_vector::PathSegment::CubicTo {
+            ctrl1: kcreate_vector::PathPoint::new(cx - ox, cy + ry),
+            ctrl2: kcreate_vector::PathPoint::new(cx - rx, cy + oy),
+            end: kcreate_vector::PathPoint::new(cx - rx, cy),
+        },
+        kcreate_vector::PathSegment::Close,
+    ]);
+    create_vector_layer(
+        parent_id,
+        "Ellipse",
+        cx - rx,
+        cy - ry,
+        rx * 2.0,
+        ry * 2.0,
+        path,
+        "canvas_create_ellipse",
+    )
+}
+
+/// Create a single-line stroke from `(x1, y1)` to `(x2, y2)`.
+pub fn canvas_create_line(
+    parent_id: Option<Uuid>,
+    x1: f64,
+    y1: f64,
+    x2: f64,
+    y2: f64,
+) -> Result<Uuid> {
+    let path = kcreate_vector::VectorPath::new(vec![
+        kcreate_vector::PathSegment::MoveTo(kcreate_vector::PathPoint::new(x1, y1)),
+        kcreate_vector::PathSegment::LineTo(kcreate_vector::PathPoint::new(x2, y2)),
+    ]);
+    let bx = x1.min(x2);
+    let by = y1.min(y2);
+    let bw = (x2 - x1).abs();
+    let bh = (y2 - y1).abs();
+    create_vector_layer(
+        parent_id,
+        "Line",
+        bx,
+        by,
+        bw,
+        bh,
+        path,
+        "canvas_create_line",
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn create_vector_layer(
+    parent_id: Option<Uuid>,
+    default_name: &str,
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+    path: kcreate_vector::VectorPath,
+    op_kind: &str,
+) -> Result<Uuid> {
+    let mut node = Node::new(NodeType::VectorLayer, default_name);
+    node.parent_id = parent_id;
+    node.bounds = kcreate_core::node::Bounds {
+        x,
+        y,
+        width: w,
+        height: h,
+    };
+    node.metadata.insert(
+        crate::scene_sync::VECTOR_PATH_METADATA_KEY.to_string(),
+        serde_json::to_value(&path)?,
+    );
+    let mut guard = slot().lock();
+    let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
+    let id = ws.project.document.insert_node(node)?;
+    ws.project.modified_at = Utc::now();
+    // Record an operation so the gesture is undoable. The bridge owns
+    // the "create" patch semantics: before=null, after=full node, so
+    // an undo deletes and a redo recreates.
+    let snapshot = ws
+        .project
+        .document
+        .get_node(id)
+        .map_or(serde_json::Value::Null, |n| {
+            serde_json::to_value(n).unwrap_or(serde_json::Value::Null)
+        });
+    let op = Operation::new("user", op_kind, serde_json::Value::Null, snapshot, vec![id]);
+    ws.project.execute_operation(op);
+    let _ = sync_scene_locked(&mut guard);
+    drop(guard);
+    Ok(id)
+}
+
+// -----------------------------------------------------------------------------
+// Canvas node transform (move)
+// -----------------------------------------------------------------------------
+
+/// Translate a node by `(dx, dy)` in world coordinates, recording an
+/// undoable operation. The host calls this once per pointer gesture
+/// (i.e. on mouseup with the accumulated delta), not once per
+/// pointer-move event, so the operation log doesn't get spammed.
+pub fn canvas_move_node(node_id: Uuid, dx: f64, dy: f64) -> Result<()> {
+    let mut guard = slot().lock();
+    let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
+    let before;
+    let after;
+    {
+        let node = ws
+            .project
+            .document
+            .get_node_mut(node_id)
+            .ok_or(DocumentBridgeError::NodeNotFound(node_id))?;
+        before = serde_json::to_value(node.transform)?;
+        node.transform.tx += dx;
+        node.transform.ty += dy;
+        node.touch();
+        after = serde_json::to_value(node.transform)?;
+    }
+    ws.project.modified_at = Utc::now();
+    let op = Operation::new("user", "canvas_move_node", before, after, vec![node_id]);
+    ws.project.execute_operation(op);
+    let _ = sync_scene_locked(&mut guard);
+    drop(guard);
+    Ok(())
+}
+
+// -----------------------------------------------------------------------------
+// Raster image import
+// -----------------------------------------------------------------------------
+
+/// Import a raster image from disk, storing it in the project's
+/// content-addressed blob store and creating a [`NodeType::RasterLayer`]
+/// node that references it.
+///
+/// Returns the new node's uuid. Records an undoable operation so the
+/// import can be reverted with a normal undo gesture.
+///
+/// Phase 0 supports anything the `image` crate can decode (PNG, JPEG,
+/// WebP); the blob is stored raw (the original encoded bytes) so the
+/// project file size stays small. Decoding to RGBA8 happens on demand
+/// at scene-sync time.
+pub fn document_import_image(parent_id: Option<Uuid>, file_path: &Path) -> Result<Uuid> {
+    let bytes = std::fs::read(file_path)?;
+    let img = image::load_from_memory(&bytes).map_err(|e| {
+        DocumentBridgeError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+    })?;
+    let rgba = img.to_rgba8();
+    let (width, height) = rgba.dimensions();
+    let mime_type = mime_for_path(file_path);
+    let mut guard = slot().lock();
+    let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
+    let blob = ws
+        .store
+        .blobs()
+        .store(&bytes, mime_type)
+        .map_err(|e| DocumentBridgeError::Io(std::io::Error::other(e.to_string())))?;
+    let meta = crate::scene_sync::RasterImageMeta {
+        blob_hash: blob.hash,
+        width,
+        height,
+    };
+    let mut node = Node::new(NodeType::RasterLayer, "Image");
+    node.parent_id = parent_id;
+    node.bounds = kcreate_core::node::Bounds {
+        x: 0.0,
+        y: 0.0,
+        width: f64::from(width),
+        height: f64::from(height),
+    };
+    node.metadata.insert(
+        crate::scene_sync::RASTER_IMAGE_METADATA_KEY.to_string(),
+        serde_json::to_value(&meta)?,
+    );
+    let id = ws.project.document.insert_node(node)?;
+    ws.project.modified_at = Utc::now();
+    let snapshot = ws
+        .project
+        .document
+        .get_node(id)
+        .map_or(serde_json::Value::Null, |n| {
+            serde_json::to_value(n).unwrap_or(serde_json::Value::Null)
+        });
+    let op = Operation::new(
+        "user",
+        "document_import_image",
+        serde_json::Value::Null,
+        snapshot,
+        vec![id],
+    );
+    ws.project.execute_operation(op);
+    let _ = sync_scene_locked(&mut guard);
+    drop(guard);
+    Ok(id)
+}
+
+fn mime_for_path(path: &Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|s| s.to_str())
+        .map(str::to_ascii_lowercase)
+    {
+        Some(ext) => match ext.as_str() {
+            "png" => "image/png",
+            "jpg" | "jpeg" => "image/jpeg",
+            "webp" => "image/webp",
+            "gif" => "image/gif",
+            _ => "application/octet-stream",
+        },
+        None => "application/octet-stream",
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Text layer creation
+// -----------------------------------------------------------------------------
+
+/// Create a [`NodeType::TextLayer`] at `(x, y)` rendering `text` in the
+/// given family + size. Returns the new node's uuid and records an
+/// undoable operation.
+pub fn canvas_create_text(
+    parent_id: Option<Uuid>,
+    x: f64,
+    y: f64,
+    text: String,
+    font_family: String,
+    font_size: f32,
+) -> Result<Uuid> {
+    let meta = crate::scene_sync::TextLayerMeta {
+        text: text.clone(),
+        font_family,
+        font_size,
+    };
+    let mut node = Node::new(NodeType::TextLayer, "Text");
+    node.parent_id = parent_id;
+    node.bounds = kcreate_core::node::Bounds {
+        x,
+        y,
+        // Bounds height defaults to font size; the layer panel can
+        // refine it once shaping has run.
+        width: f64::from(font_size) * (text.len().max(1) as f64) * 0.6,
+        height: f64::from(font_size),
+    };
+    node.metadata.insert(
+        crate::scene_sync::TEXT_LAYER_METADATA_KEY.to_string(),
+        serde_json::to_value(&meta)?,
+    );
+    let mut guard = slot().lock();
+    let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
+    let id = ws.project.document.insert_node(node)?;
+    ws.project.modified_at = Utc::now();
+    let snapshot = ws
+        .project
+        .document
+        .get_node(id)
+        .map_or(serde_json::Value::Null, |n| {
+            serde_json::to_value(n).unwrap_or(serde_json::Value::Null)
+        });
+    let op = Operation::new(
+        "user",
+        "canvas_create_text",
+        serde_json::Value::Null,
+        snapshot,
+        vec![id],
+    );
+    ws.project.execute_operation(op);
+    let _ = sync_scene_locked(&mut guard);
+    drop(guard);
+    Ok(id)
 }
 
 // -----------------------------------------------------------------------------
@@ -649,6 +1124,260 @@ pub fn export_png_file(output_path: &Path, options: &PngExportRequest) -> Result
     export_png(&scene, &opts, output_path)?;
     let meta = std::fs::metadata(output_path)?;
     Ok(meta.len())
+}
+
+// -----------------------------------------------------------------------------
+// PDF export
+// -----------------------------------------------------------------------------
+
+/// JSON-friendly PDF export options. Mirrors
+/// [`kcreate_export::pdf::PdfExportOptions`].
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PdfExportRequest {
+    pub width_mm: f64,
+    pub height_mm: f64,
+    #[serde(default)]
+    pub title: Option<String>,
+}
+
+/// Render the open document to PDF. Returns the number of bytes written.
+pub fn export_pdf_file(output_path: &Path, options: &PdfExportRequest) -> Result<u64> {
+    let guard = slot().lock();
+    let ws = guard.as_ref().ok_or(DocumentBridgeError::NoProject)?;
+    let mut rasters = kcreate_export::pdf::RasterPixelCache::new();
+    // Preload every raster layer's pixels so the export crate doesn't
+    // need to know about the storage layer. Decode happens once per
+    // unique blob hash (HashMap dedupes for free).
+    for (_uuid, node) in ws.project.document.iter() {
+        if !matches!(node.node_type, NodeType::RasterLayer) {
+            continue;
+        }
+        let Some(meta_value) = node
+            .metadata
+            .get(crate::scene_sync::RASTER_IMAGE_METADATA_KEY)
+        else {
+            continue;
+        };
+        let Ok(meta) =
+            serde_json::from_value::<crate::scene_sync::RasterImageMeta>(meta_value.clone())
+        else {
+            continue;
+        };
+        if rasters.contains_key(&meta.blob_hash) {
+            continue;
+        }
+        let bytes = match ws.store.blobs().load(&meta.blob_hash) {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        if let Ok(pixels) = kcreate_export::pdf::RasterPixels::decode(&bytes) {
+            rasters.insert(meta.blob_hash, pixels);
+        }
+    }
+    let opts = kcreate_export::pdf::PdfExportOptions {
+        width_mm: options.width_mm,
+        height_mm: options.height_mm,
+        title: options
+            .title
+            .clone()
+            .unwrap_or_else(|| ws.project.name.clone()),
+    };
+    let bytes = kcreate_export::pdf::export_pdf_from_document(
+        &ws.project.document,
+        &opts,
+        &rasters,
+        output_path,
+    )
+    .map_err(|e| DocumentBridgeError::Io(std::io::Error::other(e.to_string())))?;
+    drop(guard);
+    Ok(bytes as u64)
+}
+
+// -----------------------------------------------------------------------------
+// AI: background removal
+// -----------------------------------------------------------------------------
+
+/// Run threshold-based background removal on a raster layer node.
+///
+/// Reads the source layer's blob from the project's content-addressed
+/// store, runs `kcreate_ai::remove_background`, writes the result as a
+/// new PNG blob, inserts a sibling `RasterLayer` node pointing at the
+/// new blob, and appends an AI action to the global action log.
+///
+/// The original layer is left in place — the host can stack the result
+/// on top for an "Apply / before / after / cancel" UI. An undo
+/// operation deletes the new node (its `before_patch` is `null`).
+pub fn ai_remove_background(node_id: Uuid) -> Result<Uuid> {
+    let (encoded_bytes, parent) = {
+        let guard = slot().lock();
+        let ws = guard.as_ref().ok_or(DocumentBridgeError::NoProject)?;
+        let node = ws
+            .project
+            .document
+            .get_node(node_id)
+            .ok_or(DocumentBridgeError::NodeNotFound(node_id))?;
+        if !matches!(node.node_type, NodeType::RasterLayer) {
+            return Err(DocumentBridgeError::InvalidNodeType(format!(
+                "{:?}",
+                node.node_type
+            )));
+        }
+        let meta_value = node
+            .metadata
+            .get(crate::scene_sync::RASTER_IMAGE_METADATA_KEY)
+            .ok_or_else(|| {
+                DocumentBridgeError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "raster layer missing image metadata",
+                ))
+            })?;
+        let meta: crate::scene_sync::RasterImageMeta = serde_json::from_value(meta_value.clone())?;
+        let bytes = ws
+            .store
+            .blobs()
+            .load(&meta.blob_hash)
+            .map_err(|e| DocumentBridgeError::Io(std::io::Error::other(e.to_string())))?;
+        (bytes, node.parent_id)
+    };
+
+    // Decode → run bg removal → re-encode PNG.
+    let img = image::load_from_memory(&encoded_bytes).map_err(|e| {
+        DocumentBridgeError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+    })?;
+    let rgba = img.to_rgba8();
+    let (width, height) = rgba.dimensions();
+    let out_rgba = kcreate_ai::remove_background(
+        rgba.as_raw(),
+        width,
+        height,
+        kcreate_ai::BgRemoveOptions::default(),
+    )
+    .map_err(|e| DocumentBridgeError::Io(std::io::Error::other(e.to_string())))?;
+    let mut png: Vec<u8> = Vec::new();
+    {
+        let mut cursor = std::io::Cursor::new(&mut png);
+        image::write_buffer_with_format(
+            &mut cursor,
+            &out_rgba,
+            width,
+            height,
+            image::ColorType::Rgba8,
+            image::ImageFormat::Png,
+        )
+        .map_err(|e| DocumentBridgeError::Io(std::io::Error::other(e.to_string())))?;
+    }
+
+    // Store the new blob, insert a sibling node, append an op + AI action.
+    let mut guard = slot().lock();
+    let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
+    let blob = ws
+        .store
+        .blobs()
+        .store(&png, "image/png")
+        .map_err(|e| DocumentBridgeError::Io(std::io::Error::other(e.to_string())))?;
+    let new_meta = crate::scene_sync::RasterImageMeta {
+        blob_hash: blob.hash,
+        width,
+        height,
+    };
+    let mut new_node = Node::new(NodeType::RasterLayer, "Background removed");
+    new_node.parent_id = parent;
+    new_node.bounds = kcreate_core::node::Bounds {
+        x: 0.0,
+        y: 0.0,
+        width: f64::from(width),
+        height: f64::from(height),
+    };
+    new_node.metadata.insert(
+        crate::scene_sync::RASTER_IMAGE_METADATA_KEY.to_string(),
+        serde_json::to_value(&new_meta)?,
+    );
+    let new_id = ws.project.document.insert_node(new_node)?;
+    let snapshot = ws
+        .project
+        .document
+        .get_node(new_id)
+        .map_or(serde_json::Value::Null, |n| {
+            serde_json::to_value(n).unwrap_or(serde_json::Value::Null)
+        });
+    let op = Operation::new(
+        "ai",
+        "ai_remove_background",
+        serde_json::Value::Null,
+        snapshot,
+        vec![new_id, node_id],
+    )
+    .as_ai_generated();
+    ws.project.execute_operation(op);
+    kcreate_ai::ActionLog::global()
+        .lock()
+        .append(kcreate_ai::AiAction {
+            id: Uuid::new_v4(),
+            timestamp: Utc::now(),
+            task_type: "background_removal".into(),
+            model: "threshold-v0".into(),
+            compute_device: "cpu".into(),
+            affected_nodes: vec![new_id, node_id],
+            confidence: None,
+        });
+    ws.project.modified_at = Utc::now();
+    let _ = sync_scene_locked(&mut guard);
+    drop(guard);
+    Ok(new_id)
+}
+
+/// Snapshot of the global AI action log as a JSON array, newest first.
+pub fn ai_get_action_log() -> Result<String> {
+    let log = kcreate_ai::ActionLog::global().lock();
+    let snap = log.snapshot();
+    let json = serde_json::to_string(&snap)?;
+    Ok(json)
+}
+
+// -----------------------------------------------------------------------------
+// MCP server
+// -----------------------------------------------------------------------------
+
+/// Start the local MCP server. Loopback-only. Idempotent.
+#[cfg(feature = "mcp")]
+pub fn mcp_start() -> Result<u32> {
+    let port = kcreate_mcp::server::start_global()
+        .map_err(|e| DocumentBridgeError::Io(std::io::Error::other(e.to_string())))?;
+    Ok(u32::from(port))
+}
+
+/// Compile-time disabled MCP entry point. The host can rebuild with
+/// `--features mcp` to enable it.
+#[cfg(not(feature = "mcp"))]
+pub fn mcp_start() -> Result<u32> {
+    Err(DocumentBridgeError::Io(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "MCP server disabled at compile time (build with --features mcp)",
+    )))
+}
+
+#[cfg(feature = "mcp")]
+pub fn mcp_stop() -> Result<()> {
+    kcreate_mcp::server::stop_global();
+    Ok(())
+}
+
+#[cfg(not(feature = "mcp"))]
+pub const fn mcp_stop() -> Result<()> {
+    Ok(())
+}
+
+#[cfg(feature = "mcp")]
+#[must_use]
+pub fn mcp_is_running() -> bool {
+    kcreate_mcp::server::is_running()
+}
+
+#[cfg(not(feature = "mcp"))]
+#[must_use]
+pub const fn mcp_is_running() -> bool {
+    false
 }
 
 // -----------------------------------------------------------------------------

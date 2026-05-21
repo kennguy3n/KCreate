@@ -1,0 +1,20 @@
+[package]
+name = "kcreate_text"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Font discovery (fontdb) + text shaping (rustybuzz) for KCreate"
+
+[lints]
+workspace = true
+
+[dependencies]
+fontdb.workspace = true
+rustybuzz.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+parking_lot.workspace = true
+log.workspace = true

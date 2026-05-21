@@ -7,6 +7,10 @@ members = [
     "crates/kcreate_storage",
     "crates/kcreate_vector",
     "crates/kcreate_export",
+    "crates/kcreate_raster",
+    "crates/kcreate_text",
+    "crates/kcreate_ai",
+    "crates/kcreate_mcp",
     "crates/kcreate_tests",
 ]
 
@@ -37,6 +41,24 @@ cast_possible_truncation = "allow"
 cast_sign_loss = "allow"
 cast_possible_wrap = "allow"
 similar_names = "allow"
+# Stylistic preferences that don't catch real bugs:
+many_single_char_names = "allow"     # x/y/w/h and HSL/RGB are conventional
+doc_markdown = "allow"               # acronyms like XObject, IPC, MCP shouldn't need backticks
+too_long_first_doc_paragraph = "allow"
+needless_pass_by_value = "allow"     # sometimes ownership is intentional (thread moves)
+single_match_else = "allow"
+manual_let_else = "allow"
+option_if_let_else = "allow"
+# Nursery lints that over-fire on the codebase:
+missing_const_for_fn = "allow"       # often wrong on platform-specific code
+significant_drop_tightening = "allow" # conflicts with explicit unlock points
+float_cmp = "allow"                   # intentional in test assertions
+redundant_pub_crate = "allow"
+suboptimal_flops = "allow"            # mul_add is rarely a real win and obscures intent
+branches_sharing_code = "allow"
+missing_fields_in_debug = "allow"
+unused_async = "allow"
+or_fun_call = "allow"
 
 [workspace.dependencies]
 # GPU rendering
@@ -89,8 +111,24 @@ usvg = "0.44"
 # Spatial index
 rstar = "0.12"
 
-# Raster encoding (PNG)
-image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+# Raster encoding (PNG, JPEG, WebP)
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
+
+# PDF export
+printpdf = { version = "0.7", default-features = false, features = ["embedded_images"] }
+
+# Data-parallel iteration (used by raster tile ops + batch export)
+rayon = "1.10"
+
+# Font discovery + text shaping (Phase 1 text crate)
+fontdb = { version = "0.22", default-features = false, features = ["std", "memmap", "fs"] }
+rustybuzz = "0.18"
+
+# Base64 used by image wire format for inlined pixel payloads
+base64 = "0.22"
+
+# Loopback-only HTTP server for the local MCP sidecar
+tiny_http = { version = "0.12", default-features = false }
 
 # System info probe for device tiering
 sys-info = "0.9"

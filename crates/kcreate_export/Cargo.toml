@@ -16,11 +16,13 @@ kcreate_core = { path = "../kcreate_core" }
 kcreate_vector = { path = "../kcreate_vector" }
 kcreate_renderer = { path = "../kcreate_renderer" }
 image.workspace = true
+printpdf.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 thiserror.workspace = true
 uuid = { workspace = true, features = ["v4", "serde"] }
 log.workspace = true
+rayon.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

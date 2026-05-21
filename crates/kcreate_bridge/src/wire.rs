@@ -7,6 +7,7 @@
 //! The schema deliberately mirrors only what [`kcreate_renderer::Scene`]
 //! supports today.
 
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use kcreate_renderer::{
     Color, Object, ObjectKind, PathCommand, Point2, Rect, Scene, Stroke, Style,
 };
@@ -69,6 +70,29 @@ pub enum WireKind {
     Path {
         commands: Vec<WirePathCommand>,
     },
+    /// A raster image. The pixel buffer is RGBA8 base64-encoded.
+    /// `pixels_width` × `pixels_height` × 4 bytes, straight alpha.
+    /// `x`/`y`/`width`/`height` define the destination rect in
+    /// local coordinates; the image is scaled to fit.
+    Image {
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
+        pixels_width: u32,
+        pixels_height: u32,
+        /// Base64-encoded RGBA8 pixel data.
+        pixels_b64: String,
+    },
+    /// A short string painted at `(x, y)`. The renderer resolves the
+    /// font and shapes glyphs via `kcreate_text`.
+    Text {
+        x: f32,
+        y: f32,
+        text: String,
+        font_family: String,
+        font_size: f32,
+    },
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -104,6 +128,15 @@ pub enum WirePathCommand {
 pub enum WireError {
     #[error("invalid scene JSON: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("invalid base64 image payload: {0}")]
+    Base64(#[from] base64::DecodeError),
+    #[error("image pixel buffer is {got} bytes, expected {expected} for {width}x{height} RGBA")]
+    ImageSize {
+        got: usize,
+        expected: usize,
+        width: u32,
+        height: u32,
+    },
 }
 
 /// Parse a JSON scene description into a renderer [`Scene`].
@@ -135,6 +168,46 @@ pub fn parse_scene(json: &str) -> Result<Scene, WireError> {
             WireKind::Path { commands } => {
                 ObjectKind::Path(commands.iter().map(map_path_cmd).collect())
             }
+            WireKind::Image {
+                x,
+                y,
+                width,
+                height,
+                pixels_width,
+                pixels_height,
+                pixels_b64,
+            } => {
+                let pixels = BASE64.decode(pixels_b64.as_bytes())?;
+                let expected = (pixels_width as usize)
+                    .saturating_mul(pixels_height as usize)
+                    .saturating_mul(4);
+                if pixels.len() != expected {
+                    return Err(WireError::ImageSize {
+                        got: pixels.len(),
+                        expected,
+                        width: pixels_width,
+                        height: pixels_height,
+                    });
+                }
+                ObjectKind::Image {
+                    rect: Rect::new(x, y, width, height),
+                    pixels_width,
+                    pixels_height,
+                    pixels,
+                }
+            }
+            WireKind::Text {
+                x,
+                y,
+                text,
+                font_family,
+                font_size,
+            } => ObjectKind::Text {
+                origin: Point2::new(x, y),
+                text,
+                font_family,
+                font_size,
+            },
         };
         let style = Style {
             fill: obj.style.fill.map(|c| Color::rgba(c[0], c[1], c[2], c[3])),

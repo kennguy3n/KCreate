@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'" />
+    <title>KCreate</title>
+    <style>
+      html, body { margin: 0; height: 100%; background: #1e1e1e; color: #ddd; font-family: -apple-system, system-ui, sans-serif; }
+      #root { height: 100%; }
+      .kcreate-shell { display: flex; flex-direction: column; height: 100%; }
+      .kcreate-titlebar {
+        display: flex;
+        justify-content: space-between;
+        padding: 6px 12px;
+        background: #2a2a2c;
+        border-bottom: 1px solid #444;
+        font-size: 12px;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

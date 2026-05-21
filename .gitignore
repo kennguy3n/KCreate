@@ -1,0 +1,48 @@
+# Rust
+target/
+**/*.rs.bk
+Cargo.lock.bak
+
+# Node
+node_modules/
+.pnpm-store/
+dist/
+out/
+.parcel-cache/
+.next/
+.turbo/
+.vite/
+
+# napi-rs
+*.node
+*.napi-rs-build/
+
+# Electron
+release/
+build/
+electron-builder.cache/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# Test output
+coverage/
+.nyc_output/
+*.tsbuildinfo
+
+# Logs
+*.log
+npm-debug.log*
+pnpm-debug.log*
+yarn-debug.log*
+
+# Env
+.env
+.env.local
+.env.*.local

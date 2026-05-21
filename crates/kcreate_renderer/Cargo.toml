@@ -1,0 +1,49 @@
+[package]
+name = "kcreate_renderer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Offscreen wgpu renderer with CPU fallback for KCreate"
+
+[lints]
+workspace = true
+
+[dependencies]
+wgpu.workspace = true
+pollster.workspace = true
+bytemuck.workspace = true
+tiny-skia.workspace = true
+glam.workspace = true
+parking_lot.workspace = true
+crossbeam-channel.workspace = true
+log.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+
+[features]
+default = []
+# Force the CPU backend even when a GPU adapter is available (useful for CI / headless tests / deterministic frames).
+cpu-only = []
+
+[[bench]]
+name = "frame_render_empty"
+harness = false
+
+[[bench]]
+name = "frame_render_shapes"
+harness = false
+
+[[bench]]
+name = "frame_readback"
+harness = false
+
+[[bench]]
+name = "viewport_pan"
+harness = false

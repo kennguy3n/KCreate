@@ -1,0 +1,29 @@
+{
+  "name": "kcreate",
+  "version": "0.0.1",
+  "private": true,
+  "description": "KCreate — local-first vector design editor (Electron + Rust offscreen wgpu renderer)",
+  "license": "AGPL-3.0-or-later",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/kennguy3n/KCreate.git"
+  },
+  "packageManager": "pnpm@10.26.0",
+  "engines": {
+    "node": ">=20.11.0",
+    "pnpm": ">=9.0.0"
+  },
+  "scripts": {
+    "build": "pnpm -r build",
+    "typecheck": "pnpm -r typecheck",
+    "lint": "pnpm -r lint",
+    "cargo:check": "cargo check --workspace --all-targets",
+    "cargo:test": "cargo test --workspace",
+    "cargo:fmt": "cargo fmt --all",
+    "cargo:fmt-check": "cargo fmt --all -- --check",
+    "cargo:clippy": "cargo clippy --workspace --all-targets -- -D warnings"
+  },
+  "devDependencies": {
+    "typescript": "5.6.3"
+  }
+}

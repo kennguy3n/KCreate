@@ -144,6 +144,42 @@ fn hash_object(o: &Object, h: &mut impl Hasher) {
             3u8.hash(h);
             hash_path(cmds, h);
         }
+        ObjectKind::Image {
+            rect,
+            pixels_width,
+            pixels_height,
+            pixels,
+        } => {
+            4u8.hash(h);
+            rect.x.to_bits().hash(h);
+            rect.y.to_bits().hash(h);
+            rect.width.to_bits().hash(h);
+            rect.height.to_bits().hash(h);
+            pixels_width.hash(h);
+            pixels_height.hash(h);
+            // Hash the byte-length plus a content fingerprint so two
+            // images with the same dimensions but different pixels
+            // produce distinct fingerprints. We blake-hash the buffer
+            // once via the std SipHash that the rest of this file
+            // uses (Hasher::write).
+            pixels.len().hash(h);
+            for chunk in pixels.chunks(4096) {
+                chunk.hash(h);
+            }
+        }
+        ObjectKind::Text {
+            origin,
+            text,
+            font_family,
+            font_size,
+        } => {
+            5u8.hash(h);
+            origin.x.to_bits().hash(h);
+            origin.y.to_bits().hash(h);
+            text.hash(h);
+            font_family.hash(h);
+            font_size.to_bits().hash(h);
+        }
     }
 }
 

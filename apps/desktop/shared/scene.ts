@@ -20,7 +20,37 @@ export type ObjectKind =
   | { type: "rect"; x: number; y: number; width: number; height: number }
   | { type: "circle"; cx: number; cy: number; radius: number }
   | { type: "line"; x1: number; y1: number; x2: number; y2: number }
-  | { type: "path"; commands: PathCommand[] };
+  | { type: "path"; commands: PathCommand[] }
+  | {
+      /**
+       * A raster image. `x`/`y`/`width`/`height` define the destination
+       * rect in local coordinates; the image is scaled to fit. Pixel
+       * data is RGBA8 base64-encoded — length is
+       * `pixels_width × pixels_height × 4`.
+       */
+      type: "image";
+      x: number;
+      y: number;
+      width: number;
+      height: number;
+      pixels_width: number;
+      pixels_height: number;
+      pixels_b64: string;
+    }
+  | {
+      /**
+       * A short string painted at `(x, y)`. The renderer resolves the
+       * font via `kcreate_text` (`fontdb` + `rustybuzz`). The fill is
+       * taken from `style.fill` on the parent object so styling stays
+       * uniform across kinds.
+       */
+      type: "text";
+      x: number;
+      y: number;
+      text: string;
+      font_family: string;
+      font_size: number;
+    };
 
 export type PathCommand =
   | { type: "move"; x: number; y: number }
@@ -262,20 +292,247 @@ export interface RuntimeBridge {
   cleanupScratchProjects(): Promise<ScratchCleanupResult>;
 }
 
+/** PDF export options. `width_mm`/`height_mm` are the page size in mm. */
+export interface PdfExportOptions {
+  widthMm: number;
+  heightMm: number;
+  title: string;
+}
+
+/** WebP export options. `quality` is 0..100; `lossless` overrides quality. */
+export interface WebpExportOptions {
+  width: number;
+  height: number;
+  scale: number;
+  quality: number;
+  lossless: boolean;
+  background: Color | null;
+}
+
+/** JPEG export options. `quality` is 0..100. */
+export interface JpegExportOptions {
+  width: number;
+  height: number;
+  scale: number;
+  quality: number;
+  background: Color | null;
+}
+
 /**
  * Export pipeline.
  *
  * `svg` walks the document graph directly, so it can render a
  * caller-specified node subset (`nodeIds` empty = whole document).
- * `png` rasterises the live renderer scene; the renderer's id space
- * (`u64`) is disjoint from the document graph's (`Uuid`), so
- * per-node PNG export waits on the Phase 1 document→scene translator
- * — the API surface omits a `nodeIds` parameter rather than accepting
- * one it would silently ignore.
+ * `png` / `webp` / `jpeg` rasterise the live renderer scene at the
+ * requested dimensions. `pdf` walks the document graph and embeds
+ * vector paths + raster images directly into the PDF page.
  */
 export interface ExportBridge {
   svg(nodeIds: string[], options: SvgExportOptions): Promise<string>;
   png(outputPath: string, options: PngExportOptions): Promise<number>;
+  pdf(outputPath: string, options: PdfExportOptions): Promise<number>;
+  webp(outputPath: string, options: WebpExportOptions): Promise<number>;
+  jpeg(outputPath: string, options: JpegExportOptions): Promise<number>;
+}
+
+/**
+ * Canvas-side interactions. `hitTest` returns the document Uuid (as a
+ * string) of the topmost node at the given screen-space point, or
+ * `null` if the point misses every object.
+ *
+ * `hitTest` takes **screen-space** coordinates plus the current
+ * viewport (pan + zoom) so the Rust side can do the screen→world
+ * transform once, against the same `Viewport` math used by the
+ * renderer presenter. Callers must NOT pre-transform `(x, y)` into
+ * world space — the bridge owns that conversion (see
+ * `crates/kcreate_bridge/src/document.rs::canvas_hit_test`).
+ *
+ * `setSelection` / `getSelection` / `clearSelection` manage the
+ * selection set that the scene-sync layer paints as a highlight
+ * overlay. The `createRect/Ellipse/Line/Text` and `moveNode` calls go
+ * through the operation log and re-sync the scene on success.
+ */
+export interface CanvasBridge {
+  syncScene(): Promise<void>;
+  hitTest(
+    screenX: number,
+    screenY: number,
+    panX: number,
+    panY: number,
+    zoom: number,
+  ): Promise<string | null>;
+  setSelection(nodeIds: string[]): Promise<void>;
+  getSelection(): Promise<string[]>;
+  clearSelection(): Promise<void>;
+  importImage(
+    parentId: string | null,
+    filePath: string,
+  ): Promise<string>;
+  createRect(
+    parentId: string | null,
+    x: number,
+    y: number,
+    width: number,
+    height: number,
+  ): Promise<string>;
+  createEllipse(
+    parentId: string | null,
+    cx: number,
+    cy: number,
+    rx: number,
+    ry: number,
+  ): Promise<string>;
+  createLine(
+    parentId: string | null,
+    x1: number,
+    y1: number,
+    x2: number,
+    y2: number,
+  ): Promise<string>;
+  createText(
+    parentId: string | null,
+    x: number,
+    y: number,
+    text: string,
+    fontFamily: string,
+    fontSize: number,
+  ): Promise<string>;
+  moveNode(nodeId: string, dx: number, dy: number): Promise<void>;
+}
+
+/**
+ * AI Assist bridge. Phase 0 ships the threshold-based background
+ * removal; `getActionLog()` returns the JSON-serialised newest-first
+ * log so the AI Assist panel can show provenance ("model
+ * `threshold-v0`, ran locally on CPU, affected N nodes").
+ */
+export interface AiBridge {
+  removeBackground(nodeId: string): Promise<string>;
+  getActionLog(): Promise<string>;
+}
+
+/**
+ * Local MCP server bridge. The server is bound to `127.0.0.1` only
+ * (no remote access ever) and is opt-in — disabled until
+ * `start()` is called, and dropped on `stop()` or process exit.
+ */
+export interface McpBridge {
+  start(): Promise<number>;
+  stop(): Promise<void>;
+  isRunning(): Promise<boolean>;
+}
+
+// -----------------------------------------------------------------------------
+// Design tokens / brand kits / export presets (Task 19)
+//
+// These mirror the Rust types in `kcreate_core::project`. They are
+// declared here so the renderer can typecheck the JSON crossing the
+// bridge — every field name and casing matches the snake_case
+// serde representation used on the Rust side, because the bridge
+// hands the renderer a JSON string verbatim.
+// -----------------------------------------------------------------------------
+
+/** RGBA in [0, 1] — same as `kcreate_core::node::RgbaColor`. */
+export interface RgbaColor {
+  r: number;
+  g: number;
+  b: number;
+  a: number;
+}
+
+/** Typography token mirroring `kcreate_core::project::TypographyToken`. */
+export interface TypographyToken {
+  font_family: string;
+  font_weight: number;
+  font_size: number;
+  line_height: number;
+  letter_spacing: number;
+}
+
+/** Drop-shadow token. */
+export interface ShadowToken {
+  offset_x: number;
+  offset_y: number;
+  blur: number;
+  spread: number;
+  color: RgbaColor;
+}
+
+/** Project-wide reusable tokens. Maps mirror `HashMap<String, T>`. */
+export interface DesignTokens {
+  colors: Record<string, RgbaColor>;
+  typography: Record<string, TypographyToken>;
+  spacing: Record<string, number>;
+  radii: Record<string, number>;
+  shadows: Record<string, ShadowToken>;
+}
+
+/** Named color inside a brand kit. */
+export interface NamedColor {
+  name: string;
+  color: RgbaColor;
+}
+
+/** Font reference inside a brand kit. */
+export interface FontRef {
+  family: string;
+  weight: number;
+  italic: boolean;
+  embedded_asset_id: string | null;
+}
+
+export type ExportFormat = "png" | "svg" | "pdf" | "webp" | "jpeg";
+
+/** A pre-configured export target. */
+export interface ExportPreset {
+  id: string;
+  name: string;
+  format: ExportFormat;
+  scale: number;
+  suffix: string;
+}
+
+/** A brand kit: top-level palette / typography / logos / spacing /
+ * per-format export rules. */
+export interface BrandKit {
+  id: string;
+  name: string;
+  logo_asset_id: string | null;
+  colors: NamedColor[];
+  fonts: FontRef[];
+  spacing_scale: number[];
+  export_rules: ExportPreset[];
+}
+
+/**
+ * Design-token CRUD bridge. The setter does NOT persist; call
+ * `window.kcreate.document.save()` after a setter to land the change
+ * on disk.
+ */
+export interface DesignTokensBridge {
+  get(): Promise<DesignTokens>;
+  set(tokens: DesignTokens): Promise<void>;
+}
+
+/**
+ * Brand-kit CRUD bridge. `create` returns the new kit's UUID;
+ * `update` replaces the existing row keyed on `kit.id`.
+ */
+export interface BrandKitBridge {
+  create(name: string): Promise<string>;
+  update(kit: BrandKit): Promise<void>;
+  list(): Promise<BrandKit[]>;
+  delete(kitId: string): Promise<boolean>;
+}
+
+/**
+ * Export-preset CRUD bridge. Used by both the Export panel and the
+ * project home page (to seed default presets).
+ */
+export interface ExportPresetBridge {
+  create(name: string, format: ExportFormat, scale: number): Promise<string>;
+  list(): Promise<ExportPreset[]>;
+  delete(presetId: string): Promise<boolean>;
 }
 
 declare global {
@@ -283,8 +540,14 @@ declare global {
     kcreate: {
       renderer: RendererBridge;
       document: DocumentBridge;
+      canvas: CanvasBridge;
+      ai: AiBridge;
+      mcp: McpBridge;
       runtime: RuntimeBridge;
       export: ExportBridge;
+      designTokens: DesignTokensBridge;
+      brandKit: BrandKitBridge;
+      exportPreset: ExportPresetBridge;
     };
   }
 }

@@ -2,10 +2,15 @@
 //! description of what to draw. The same list is replayed on pan/zoom
 //! without re-walking the scene graph.
 
+use std::sync::Arc;
+
 use crate::geometry::{PathCommand, Point2, Rect, Style};
 use crate::scene::{Object, ObjectId, ObjectKind};
 
 /// A single drawing command. Pure data, trivially clonable.
+///
+/// `DrawImage` shares its pixel buffer via [`Arc`] so cloning the
+/// display list (e.g. for the cache) is O(1) instead of O(pixels).
 #[derive(Debug, Clone)]
 pub enum DisplayCommand {
     Clear, // The renderer is responsible for the clear color.
@@ -25,6 +30,24 @@ pub enum DisplayCommand {
     },
     FillPath {
         commands: Vec<PathCommand>,
+        style: Style,
+    },
+    /// Blit `pixels` into the destination `rect`. The pixel buffer is
+    /// RGBA8 row-major straight alpha with stride `pixels_width * 4`.
+    DrawImage {
+        rect: Rect,
+        pixels_width: u32,
+        pixels_height: u32,
+        pixels: Arc<Vec<u8>>,
+    },
+    /// Paint text at `origin` using the named font. The CPU backend
+    /// shapes the glyphs via `kcreate_text` at draw time and rasters
+    /// them through tiny-skia.
+    DrawText {
+        origin: Point2,
+        text: String,
+        font_family: String,
+        font_size: f32,
         style: Style,
     },
 }
@@ -104,6 +127,29 @@ impl DisplayList {
             },
             ObjectKind::Path(cmds) => DisplayCommand::FillPath {
                 commands: cmds.iter().map(|c| translate_path(c, dx, dy)).collect(),
+                style: object.style,
+            },
+            ObjectKind::Image {
+                rect,
+                pixels_width,
+                pixels_height,
+                pixels,
+            } => DisplayCommand::DrawImage {
+                rect: Rect::new(rect.x + dx, rect.y + dy, rect.width, rect.height),
+                pixels_width: *pixels_width,
+                pixels_height: *pixels_height,
+                pixels: Arc::new(pixels.clone()),
+            },
+            ObjectKind::Text {
+                origin,
+                text,
+                font_family,
+                font_size,
+            } => DisplayCommand::DrawText {
+                origin: Point2::new(origin.x + dx, origin.y + dy),
+                text: text.clone(),
+                font_family: font_family.clone(),
+                font_size: *font_size,
                 style: object.style,
             },
         }

@@ -22,8 +22,13 @@ clone to a green CI run in roughly 10 minutes.
 sudo apt-get update
 sudo apt-get install -y --no-install-recommends \
     libwayland-dev libxkbcommon-dev libxcb1-dev libgl1 libvulkan1 \
-    mesa-vulkan-drivers build-essential pkg-config
+    mesa-vulkan-drivers build-essential pkg-config \
+    libfontconfig1-dev
 ```
+
+`libfontconfig1-dev` is needed by `kcreate_text` (via `fontdb`) to
+enumerate system fonts. Without it, font discovery falls back to the
+bundled-only set.
 
 The `kcreate_renderer` crate falls back to its `tiny-skia` CPU
 rasterizer if no Vulkan adapter is available, so headless containers

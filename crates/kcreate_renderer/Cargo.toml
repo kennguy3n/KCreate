@@ -24,6 +24,11 @@ thiserror.workspace = true
 uuid.workspace = true
 serde.workspace = true
 
+# Text shaping + glyph outline extraction. The renderer's CPU backend
+# converts a `Text` scene object into glyph path commands at draw
+# time via this crate.
+kcreate_text = { path = "../kcreate_text" }
+
 [dev-dependencies]
 criterion.workspace = true
 

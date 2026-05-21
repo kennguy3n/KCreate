@@ -18,7 +18,7 @@ use kcreate_core::config::RuntimeConfig;
 use kcreate_core::document::{DocumentError, DocumentGraph};
 use kcreate_core::node::{Node, NodeType};
 use kcreate_core::operation::Operation;
-use kcreate_core::project::{Project, ProjectError};
+use kcreate_core::project::{BrandKit, DesignTokens, ExportPreset, Project, ProjectError};
 use kcreate_export::png::{export_png, PngExportError, PngExportOptions};
 use kcreate_export::svg::{export_svg_from_document, SvgDocumentExportError, SvgExportOptions};
 use kcreate_storage::project_io::{ProjectStore, ProjectStoreError};
@@ -83,6 +83,13 @@ struct Workspace {
     /// bounded by `OperationLog::max_depth` (a few KB even on the most
     /// generous device tier).
     persisted_op_ids: HashSet<Uuid>,
+    /// Bidirectional uuid ⇄ `ObjectId` mapping rebuilt by [`scene_sync`]
+    /// on every mutation. Lives in the workspace (not a sibling
+    /// singleton) so it can't outlive the project it describes.
+    scene_sync: crate::scene_sync::SceneSync,
+    /// Currently selected document nodes. Selection is rendered as
+    /// highlight overlays in the next scene sync.
+    selection: Vec<Uuid>,
 }
 
 fn slot() -> &'static Mutex<Option<Workspace>> {
@@ -209,7 +216,15 @@ pub fn project_create(name: &str, dir: &Path) -> Result<ProjectInfo> {
         project,
         store,
         persisted_op_ids: HashSet::new(),
+        scene_sync: crate::scene_sync::SceneSync::new(),
+        selection: Vec::new(),
     });
+    // First scene sync. Errors from `state::render_scene` are silently
+    // tolerated here because creating a project before the renderer is
+    // initialised is a legitimate sequence (the host may create a
+    // project headlessly for tests). The next renderer_init + sync
+    // will recover.
+    let _ = sync_scene_locked(&mut guard);
     drop(guard);
     Ok(info)
 }
@@ -229,9 +244,9 @@ pub fn project_open(dir: &Path) -> Result<ProjectInfo> {
     let document = store.load_document()?;
     let manifest = store.manifest();
     // We deliberately *don't* call `install_default_export_presets`
-    // here — reopen should never invent fresh preset UUIDs. Once the
-    // store learns to persist design tokens / brand kits / presets,
-    // they will round-trip through `manifest`/`load_*` instead.
+    // here — reopen should never invent fresh preset UUIDs. Design
+    // tokens, brand kits, and export presets round-trip through the
+    // store so identifiers stay stable across close/reopen.
     //
     // Same device-tier wiring as `project_create` (`ANALYSIS_0003` on
     // PR #2). The on-disk operation history may contain *more* rows
@@ -245,6 +260,9 @@ pub fn project_open(dir: &Path) -> Result<ProjectInfo> {
     project.created_at = manifest.created_at;
     project.modified_at = manifest.modified_at;
     project.document = document;
+    project.design_tokens = store.load_design_tokens()?;
+    project.brand_kits = store.load_brand_kits()?;
+    project.export_presets = store.load_export_presets()?;
     // Restore the operation log from disk so undo survives close+reopen.
     let max_depth = project.operation_log.max_depth();
     let history = store.load_operations(max_depth)?;
@@ -256,7 +274,10 @@ pub fn project_open(dir: &Path) -> Result<ProjectInfo> {
         project,
         store,
         persisted_op_ids,
+        scene_sync: crate::scene_sync::SceneSync::new(),
+        selection: Vec::new(),
     });
+    let _ = sync_scene_locked(&mut guard);
     drop(guard);
     Ok(info)
 }
@@ -291,6 +312,35 @@ pub fn project_save() -> Result<()> {
     let mut guard = slot().lock();
     let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
     ws.store.save_document(&ws.project.document)?;
+    // Persist project-level metadata (design tokens, brand kits,
+    // export presets). These mirror the in-memory `Project` fields
+    // and must round-trip across close/reopen so identifiers stay
+    // stable. Brand kits / presets are upserted by id; the design
+    // tokens table holds a single row keyed on `'current'`.
+    ws.store.save_design_tokens(&ws.project.design_tokens)?;
+    for kit in &ws.project.brand_kits {
+        ws.store.save_brand_kit(kit)?;
+    }
+    // Reconcile deleted brand kits: any rows on disk whose id is no
+    // longer in memory must be removed so deletes survive the next
+    // reopen.
+    let kit_ids: HashSet<Uuid> = ws.project.brand_kits.iter().map(|k| k.id).collect();
+    let on_disk_kits = ws.store.load_brand_kits()?;
+    for kit in &on_disk_kits {
+        if !kit_ids.contains(&kit.id) {
+            ws.store.delete_brand_kit(kit.id)?;
+        }
+    }
+    for preset in &ws.project.export_presets {
+        ws.store.save_export_preset(preset)?;
+    }
+    let preset_ids: HashSet<Uuid> = ws.project.export_presets.iter().map(|p| p.id).collect();
+    let on_disk_presets = ws.store.load_export_presets()?;
+    for preset in &on_disk_presets {
+        if !preset_ids.contains(&preset.id) {
+            ws.store.delete_export_preset(preset.id)?;
+        }
+    }
 
     let current_ids: HashSet<Uuid> = ws.project.operation_log.iter().map(|op| op.id).collect();
     // Collect new ops first so we can satisfy the borrow checker (the
@@ -339,6 +389,119 @@ pub fn project_info() -> Option<ProjectInfo> {
         .map(|ws| build_info(&ws.project, ws.store.project_dir()));
     drop(guard);
     info
+}
+
+// -----------------------------------------------------------------------------
+// Design tokens / brand kits / export presets
+// -----------------------------------------------------------------------------
+
+/// Snapshot the current project's design tokens. Returns the empty
+/// default `DesignTokens` when no project is open so callers can keep
+/// a stable React state shape without special-casing the no-project
+/// path.
+pub fn design_tokens_get() -> Result<DesignTokens> {
+    let guard = slot().lock();
+    let ws = guard.as_ref().ok_or(DocumentBridgeError::NoProject)?;
+    Ok(ws.project.design_tokens.clone())
+}
+
+/// Replace the entire design-tokens bag. The caller is responsible
+/// for calling [`project_save`] afterwards; this only mutates the
+/// in-memory project.
+pub fn design_tokens_set(tokens: DesignTokens) -> Result<()> {
+    let mut guard = slot().lock();
+    let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
+    ws.project.design_tokens = tokens;
+    drop(guard);
+    Ok(())
+}
+
+/// Create a new (empty) brand kit and append it to the project.
+/// Returns the new kit's id.
+pub fn brand_kit_create(name: String) -> Result<Uuid> {
+    let mut guard = slot().lock();
+    let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
+    let kit = BrandKit::new(name);
+    let id = kit.id;
+    ws.project.brand_kits.push(kit);
+    drop(guard);
+    Ok(id)
+}
+
+/// Replace an existing brand kit by id. Returns
+/// [`DocumentBridgeError::NodeNotFound`] if the id doesn't match any
+/// in-memory kit — brand-kit ids share the `Uuid` namespace with
+/// node ids and the bridge surface treats both as opaque, so we
+/// reuse the existing error variant rather than introducing a
+/// second "not found" type that callers would have to disambiguate.
+pub fn brand_kit_update(kit: BrandKit) -> Result<()> {
+    let mut guard = slot().lock();
+    let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
+    let slot_idx = ws
+        .project
+        .brand_kits
+        .iter()
+        .position(|k| k.id == kit.id)
+        .ok_or(DocumentBridgeError::NodeNotFound(kit.id))?;
+    ws.project.brand_kits[slot_idx] = kit;
+    drop(guard);
+    Ok(())
+}
+
+/// List every brand kit in the project, in insertion order.
+pub fn brand_kit_list() -> Result<Vec<BrandKit>> {
+    let guard = slot().lock();
+    let ws = guard.as_ref().ok_or(DocumentBridgeError::NoProject)?;
+    Ok(ws.project.brand_kits.clone())
+}
+
+/// Remove a brand kit by id. Returns true when something was removed.
+pub fn brand_kit_delete(id: Uuid) -> Result<bool> {
+    let mut guard = slot().lock();
+    let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
+    let before = ws.project.brand_kits.len();
+    ws.project.brand_kits.retain(|k| k.id != id);
+    Ok(ws.project.brand_kits.len() != before)
+}
+
+/// Create a new export preset and append it to the project. Returns the new id.
+pub fn export_preset_create(name: String, format: &str, scale: f32) -> Result<Uuid> {
+    let format = parse_export_format(format)?;
+    let mut guard = slot().lock();
+    let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
+    let preset = ExportPreset::new(name, format, scale);
+    let id = preset.id;
+    ws.project.export_presets.push(preset);
+    drop(guard);
+    Ok(id)
+}
+
+/// List every export preset, in insertion order.
+pub fn export_preset_list() -> Result<Vec<ExportPreset>> {
+    let guard = slot().lock();
+    let ws = guard.as_ref().ok_or(DocumentBridgeError::NoProject)?;
+    Ok(ws.project.export_presets.clone())
+}
+
+/// Delete an export preset by id. Returns true when something was removed.
+pub fn export_preset_delete(id: Uuid) -> Result<bool> {
+    let mut guard = slot().lock();
+    let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
+    let before = ws.project.export_presets.len();
+    ws.project.export_presets.retain(|p| p.id != id);
+    Ok(ws.project.export_presets.len() != before)
+}
+
+fn parse_export_format(format: &str) -> Result<kcreate_core::project::ExportFormat> {
+    use kcreate_core::project::ExportFormat;
+    match format.to_ascii_lowercase().as_str() {
+        "png" => Ok(ExportFormat::Png),
+        "svg" => Ok(ExportFormat::Svg),
+        "pdf" => Ok(ExportFormat::Pdf),
+        "webp" => Ok(ExportFormat::Webp),
+        "jpeg" | "jpg" => Ok(ExportFormat::Jpeg),
+        other => Err(DocumentBridgeError::InvalidNodeType(other.to_string())),
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -411,6 +574,7 @@ pub fn document_create_node(
     let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
     let id = ws.project.document.insert_node(node)?;
     ws.project.modified_at = Utc::now();
+    let _ = sync_scene_locked(&mut guard);
     drop(guard);
     Ok(id)
 }
@@ -457,6 +621,7 @@ pub fn document_update_node(id: Uuid, changes: &UpdateNodeProps) -> Result<()> {
     }
     node.touch();
     ws.project.modified_at = Utc::now();
+    let _ = sync_scene_locked(&mut guard);
     drop(guard);
     Ok(())
 }
@@ -473,6 +638,10 @@ pub fn document_delete_node(id: Uuid) -> Result<()> {
         return Err(DocumentBridgeError::NodeNotFound(id));
     }
     ws.project.modified_at = Utc::now();
+    // Drop any selection entries that refer to the deleted node so the
+    // host doesn't keep painting highlights over thin air.
+    ws.selection.retain(|sel| *sel != id);
+    let _ = sync_scene_locked(&mut guard);
     drop(guard);
     Ok(())
 }
@@ -520,6 +689,475 @@ pub fn document_redo() -> Result<Option<Vec<Uuid>>> {
     let affected = ws.project.redo().map(|op| op.affected_nodes);
     drop(guard);
     Ok(affected)
+}
+
+// -----------------------------------------------------------------------------
+// Scene synchronisation (document graph → renderer)
+// -----------------------------------------------------------------------------
+
+/// Rebuild the renderer scene from the current document state.
+///
+/// Called automatically after every CRUD mutation, selection change,
+/// import, or undo/redo. The host can also call it explicitly via the
+/// `document_sync_scene` N-API export when it wants to force a redraw
+/// (e.g. after the renderer has been re-initialised at a new size).
+///
+/// Quiet on "renderer not initialised" — that's a legitimate state
+/// when the host creates a project headlessly (e.g. in tests) before
+/// constructing a canvas. All other renderer errors are returned so
+/// the host can surface them.
+pub fn document_sync_scene() -> Result<()> {
+    let mut guard = slot().lock();
+    let _ = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
+    sync_scene_locked(&mut guard)?;
+    drop(guard);
+    Ok(())
+}
+
+/// Internal scene-sync used by every mutation site. Caller must hold
+/// the workspace lock. Failures to render are propagated; failures to
+/// find a renderer (host hasn't initialised yet) are swallowed.
+///
+/// # Lock-ordering invariant
+///
+/// This function takes the **renderer singleton lock** (via
+/// `crate::state::render_scene`) while the **workspace lock** is
+/// already held by the caller's `MutexGuard`. Every call site in this
+/// module therefore observes the same lock order:
+///
+/// > workspace lock  →  renderer singleton lock
+///
+/// No code path in `kcreate_bridge` may take these locks in the
+/// opposite order. In particular, the renderer crate itself never
+/// reaches back into the workspace, and the [`WorkspaceAccess`] MCP
+/// impl only enters the workspace lock — it never enters the renderer
+/// lock except indirectly through this function (which always
+/// observes the canonical order). As long as both invariants hold,
+/// there is no path that can deadlock by acquiring them in opposite
+/// orders.
+fn sync_scene_locked(guard: &mut parking_lot::MutexGuard<'_, Option<Workspace>>) -> Result<()> {
+    let Some(ws) = guard.as_mut() else {
+        return Ok(());
+    };
+    let scene = ws.scene_sync.sync_document_to_scene(
+        &ws.project.document,
+        Some(ws.store.blobs()),
+        &ws.selection,
+    );
+    // Renderer not initialised is fine here: the host may be working
+    // headlessly. Other render errors propagate.
+    match crate::state::render_scene(scene) {
+        Ok(_) | Err(crate::state::BridgeError::NotInitialized) => Ok(()),
+        Err(e) => Err(DocumentBridgeError::Bridge(e)),
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Selection
+// -----------------------------------------------------------------------------
+
+/// Replace the selection with the given node ids.
+///
+/// Unknown ids are silently dropped so the host can't get out of sync
+/// with the document — selecting a node and then deleting it must not
+/// produce a stale selection entry.
+pub fn document_set_selection(ids: Vec<Uuid>) -> Result<()> {
+    let mut guard = slot().lock();
+    let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
+    let valid: Vec<Uuid> = ids
+        .into_iter()
+        .filter(|id| ws.project.document.contains(*id))
+        .collect();
+    ws.selection = valid;
+    let _ = sync_scene_locked(&mut guard);
+    drop(guard);
+    Ok(())
+}
+
+/// Snapshot of the current selection.
+pub fn document_get_selection() -> Result<Vec<Uuid>> {
+    let guard = slot().lock();
+    let ws = guard.as_ref().ok_or(DocumentBridgeError::NoProject)?;
+    let sel = ws.selection.clone();
+    drop(guard);
+    Ok(sel)
+}
+
+/// Clear the selection. No-op when nothing is selected.
+pub fn document_clear_selection() -> Result<()> {
+    let mut guard = slot().lock();
+    let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
+    if ws.selection.is_empty() {
+        return Ok(());
+    }
+    ws.selection.clear();
+    let _ = sync_scene_locked(&mut guard);
+    drop(guard);
+    Ok(())
+}
+
+// -----------------------------------------------------------------------------
+// Hit testing
+// -----------------------------------------------------------------------------
+
+/// Hit-test a viewport-relative screen point against the current
+/// scene. Returns the document uuid of the topmost selectable node
+/// under the cursor, or `None` if no node is under the cursor.
+///
+/// The host passes the *current* viewport (pan + zoom) because the
+/// bridge does not own the canvas' viewport state — that lives in
+/// the React shell and is shipped over IPC for each hit query.
+pub fn canvas_hit_test(
+    screen_x: f32,
+    screen_y: f32,
+    pan_x: f32,
+    pan_y: f32,
+    zoom: f32,
+) -> Result<Option<Uuid>> {
+    let mut guard = slot().lock();
+    let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
+    // Rebuild the scene from the document on every hit-test. This
+    // sidesteps the "is the renderer's cached scene up to date?"
+    // question entirely: a hit-test is cheap (a few hundred reverse-z
+    // AABB checks) compared to its UX cost when wrong.
+    let scene = ws.scene_sync.sync_document_to_scene(
+        &ws.project.document,
+        Some(ws.store.blobs()),
+        &ws.selection,
+    );
+    let vp = crate::hit_test::Viewport::new(kcreate_renderer::Vec2::new(pan_x, pan_y), zoom);
+    let hit = crate::hit_test::hit_test(&ws.scene_sync, &scene, screen_x, screen_y, vp);
+    drop(guard);
+    Ok(hit)
+}
+
+// -----------------------------------------------------------------------------
+// Canvas shape creation
+// -----------------------------------------------------------------------------
+
+/// Create a rectangle vector layer covering `(x, y, w, h)` (world
+/// space). Returns the new node's uuid. Records an `op_kind` of
+/// `"canvas_create_rect"` on the operation log so undo/redo cycles
+/// through this gesture symmetrically.
+pub fn canvas_create_rect(parent_id: Option<Uuid>, x: f64, y: f64, w: f64, h: f64) -> Result<Uuid> {
+    let path = kcreate_vector::VectorPath::new(vec![
+        kcreate_vector::PathSegment::MoveTo(kcreate_vector::PathPoint::new(x, y)),
+        kcreate_vector::PathSegment::LineTo(kcreate_vector::PathPoint::new(x + w, y)),
+        kcreate_vector::PathSegment::LineTo(kcreate_vector::PathPoint::new(x + w, y + h)),
+        kcreate_vector::PathSegment::LineTo(kcreate_vector::PathPoint::new(x, y + h)),
+        kcreate_vector::PathSegment::Close,
+    ]);
+    create_vector_layer(
+        parent_id,
+        "Rectangle",
+        x,
+        y,
+        w,
+        h,
+        path,
+        "canvas_create_rect",
+    )
+}
+
+/// Create an ellipse vector layer centered at `(cx, cy)` with radii
+/// `(rx, ry)`. The ellipse is approximated by four cubic Bezier
+/// segments using the standard `(4/3) * tan(pi/8)` magic constant
+/// (the same approximation `<circle>` SVG renderers use under the
+/// hood — visually indistinguishable from a true ellipse at any
+/// reasonable display resolution).
+pub fn canvas_create_ellipse(
+    parent_id: Option<Uuid>,
+    cx: f64,
+    cy: f64,
+    rx: f64,
+    ry: f64,
+) -> Result<Uuid> {
+    const KAPPA: f64 = 0.552_284_749_830_793_4;
+    let ox = rx * KAPPA;
+    let oy = ry * KAPPA;
+    let path = kcreate_vector::VectorPath::new(vec![
+        kcreate_vector::PathSegment::MoveTo(kcreate_vector::PathPoint::new(cx - rx, cy)),
+        kcreate_vector::PathSegment::CubicTo {
+            ctrl1: kcreate_vector::PathPoint::new(cx - rx, cy - oy),
+            ctrl2: kcreate_vector::PathPoint::new(cx - ox, cy - ry),
+            end: kcreate_vector::PathPoint::new(cx, cy - ry),
+        },
+        kcreate_vector::PathSegment::CubicTo {
+            ctrl1: kcreate_vector::PathPoint::new(cx + ox, cy - ry),
+            ctrl2: kcreate_vector::PathPoint::new(cx + rx, cy - oy),
+            end: kcreate_vector::PathPoint::new(cx + rx, cy),
+        },
+        kcreate_vector::PathSegment::CubicTo {
+            ctrl1: kcreate_vector::PathPoint::new(cx + rx, cy + oy),
+            ctrl2: kcreate_vector::PathPoint::new(cx + ox, cy + ry),
+            end: kcreate_vector::PathPoint::new(cx, cy + ry),
+        },
+        kcreate_vector::PathSegment::CubicTo {
+            ctrl1: kcreate_vector::PathPoint::new(cx - ox, cy + ry),
+            ctrl2: kcreate_vector::PathPoint::new(cx - rx, cy + oy),
+            end: kcreate_vector::PathPoint::new(cx - rx, cy),
+        },
+        kcreate_vector::PathSegment::Close,
+    ]);
+    create_vector_layer(
+        parent_id,
+        "Ellipse",
+        cx - rx,
+        cy - ry,
+        rx * 2.0,
+        ry * 2.0,
+        path,
+        "canvas_create_ellipse",
+    )
+}
+
+/// Create a single-line stroke from `(x1, y1)` to `(x2, y2)`.
+pub fn canvas_create_line(
+    parent_id: Option<Uuid>,
+    x1: f64,
+    y1: f64,
+    x2: f64,
+    y2: f64,
+) -> Result<Uuid> {
+    let path = kcreate_vector::VectorPath::new(vec![
+        kcreate_vector::PathSegment::MoveTo(kcreate_vector::PathPoint::new(x1, y1)),
+        kcreate_vector::PathSegment::LineTo(kcreate_vector::PathPoint::new(x2, y2)),
+    ]);
+    let bx = x1.min(x2);
+    let by = y1.min(y2);
+    let bw = (x2 - x1).abs();
+    let bh = (y2 - y1).abs();
+    create_vector_layer(
+        parent_id,
+        "Line",
+        bx,
+        by,
+        bw,
+        bh,
+        path,
+        "canvas_create_line",
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn create_vector_layer(
+    parent_id: Option<Uuid>,
+    default_name: &str,
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+    path: kcreate_vector::VectorPath,
+    op_kind: &str,
+) -> Result<Uuid> {
+    let mut node = Node::new(NodeType::VectorLayer, default_name);
+    node.parent_id = parent_id;
+    node.bounds = kcreate_core::node::Bounds {
+        x,
+        y,
+        width: w,
+        height: h,
+    };
+    node.metadata.insert(
+        crate::scene_sync::VECTOR_PATH_METADATA_KEY.to_string(),
+        serde_json::to_value(&path)?,
+    );
+    let mut guard = slot().lock();
+    let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
+    let id = ws.project.document.insert_node(node)?;
+    ws.project.modified_at = Utc::now();
+    // Record an operation so the gesture is undoable. The bridge owns
+    // the "create" patch semantics: before=null, after=full node, so
+    // an undo deletes and a redo recreates.
+    let snapshot = ws
+        .project
+        .document
+        .get_node(id)
+        .map_or(serde_json::Value::Null, |n| {
+            serde_json::to_value(n).unwrap_or(serde_json::Value::Null)
+        });
+    let op = Operation::new("user", op_kind, serde_json::Value::Null, snapshot, vec![id]);
+    ws.project.execute_operation(op);
+    let _ = sync_scene_locked(&mut guard);
+    drop(guard);
+    Ok(id)
+}
+
+// -----------------------------------------------------------------------------
+// Canvas node transform (move)
+// -----------------------------------------------------------------------------
+
+/// Translate a node by `(dx, dy)` in world coordinates, recording an
+/// undoable operation. The host calls this once per pointer gesture
+/// (i.e. on mouseup with the accumulated delta), not once per
+/// pointer-move event, so the operation log doesn't get spammed.
+pub fn canvas_move_node(node_id: Uuid, dx: f64, dy: f64) -> Result<()> {
+    let mut guard = slot().lock();
+    let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
+    let before;
+    let after;
+    {
+        let node = ws
+            .project
+            .document
+            .get_node_mut(node_id)
+            .ok_or(DocumentBridgeError::NodeNotFound(node_id))?;
+        before = serde_json::to_value(node.transform)?;
+        node.transform.tx += dx;
+        node.transform.ty += dy;
+        node.touch();
+        after = serde_json::to_value(node.transform)?;
+    }
+    ws.project.modified_at = Utc::now();
+    let op = Operation::new("user", "canvas_move_node", before, after, vec![node_id]);
+    ws.project.execute_operation(op);
+    let _ = sync_scene_locked(&mut guard);
+    drop(guard);
+    Ok(())
+}
+
+// -----------------------------------------------------------------------------
+// Raster image import
+// -----------------------------------------------------------------------------
+
+/// Import a raster image from disk, storing it in the project's
+/// content-addressed blob store and creating a [`NodeType::RasterLayer`]
+/// node that references it.
+///
+/// Returns the new node's uuid. Records an undoable operation so the
+/// import can be reverted with a normal undo gesture.
+///
+/// Phase 0 supports anything the `image` crate can decode (PNG, JPEG,
+/// WebP); the blob is stored raw (the original encoded bytes) so the
+/// project file size stays small. Decoding to RGBA8 happens on demand
+/// at scene-sync time.
+pub fn document_import_image(parent_id: Option<Uuid>, file_path: &Path) -> Result<Uuid> {
+    let bytes = std::fs::read(file_path)?;
+    let img = image::load_from_memory(&bytes).map_err(|e| {
+        DocumentBridgeError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+    })?;
+    let rgba = img.to_rgba8();
+    let (width, height) = rgba.dimensions();
+    let mime_type = mime_for_path(file_path);
+    let mut guard = slot().lock();
+    let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
+    let blob = ws
+        .store
+        .blobs()
+        .store(&bytes, mime_type)
+        .map_err(|e| DocumentBridgeError::Io(std::io::Error::other(e.to_string())))?;
+    let meta = crate::scene_sync::RasterImageMeta {
+        blob_hash: blob.hash,
+        width,
+        height,
+    };
+    let mut node = Node::new(NodeType::RasterLayer, "Image");
+    node.parent_id = parent_id;
+    node.bounds = kcreate_core::node::Bounds {
+        x: 0.0,
+        y: 0.0,
+        width: f64::from(width),
+        height: f64::from(height),
+    };
+    node.metadata.insert(
+        crate::scene_sync::RASTER_IMAGE_METADATA_KEY.to_string(),
+        serde_json::to_value(&meta)?,
+    );
+    let id = ws.project.document.insert_node(node)?;
+    ws.project.modified_at = Utc::now();
+    let snapshot = ws
+        .project
+        .document
+        .get_node(id)
+        .map_or(serde_json::Value::Null, |n| {
+            serde_json::to_value(n).unwrap_or(serde_json::Value::Null)
+        });
+    let op = Operation::new(
+        "user",
+        "document_import_image",
+        serde_json::Value::Null,
+        snapshot,
+        vec![id],
+    );
+    ws.project.execute_operation(op);
+    let _ = sync_scene_locked(&mut guard);
+    drop(guard);
+    Ok(id)
+}
+
+fn mime_for_path(path: &Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|s| s.to_str())
+        .map(str::to_ascii_lowercase)
+    {
+        Some(ext) => match ext.as_str() {
+            "png" => "image/png",
+            "jpg" | "jpeg" => "image/jpeg",
+            "webp" => "image/webp",
+            "gif" => "image/gif",
+            _ => "application/octet-stream",
+        },
+        None => "application/octet-stream",
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Text layer creation
+// -----------------------------------------------------------------------------
+
+/// Create a [`NodeType::TextLayer`] at `(x, y)` rendering `text` in the
+/// given family + size. Returns the new node's uuid and records an
+/// undoable operation.
+pub fn canvas_create_text(
+    parent_id: Option<Uuid>,
+    x: f64,
+    y: f64,
+    text: String,
+    font_family: String,
+    font_size: f32,
+) -> Result<Uuid> {
+    let meta = crate::scene_sync::TextLayerMeta {
+        text: text.clone(),
+        font_family,
+        font_size,
+    };
+    let mut node = Node::new(NodeType::TextLayer, "Text");
+    node.parent_id = parent_id;
+    node.bounds = kcreate_core::node::Bounds {
+        x,
+        y,
+        // Bounds height defaults to font size; the layer panel can
+        // refine it once shaping has run.
+        width: f64::from(font_size) * (text.len().max(1) as f64) * 0.6,
+        height: f64::from(font_size),
+    };
+    node.metadata.insert(
+        crate::scene_sync::TEXT_LAYER_METADATA_KEY.to_string(),
+        serde_json::to_value(&meta)?,
+    );
+    let mut guard = slot().lock();
+    let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
+    let id = ws.project.document.insert_node(node)?;
+    ws.project.modified_at = Utc::now();
+    let snapshot = ws
+        .project
+        .document
+        .get_node(id)
+        .map_or(serde_json::Value::Null, |n| {
+            serde_json::to_value(n).unwrap_or(serde_json::Value::Null)
+        });
+    let op = Operation::new(
+        "user",
+        "canvas_create_text",
+        serde_json::Value::Null,
+        snapshot,
+        vec![id],
+    );
+    ws.project.execute_operation(op);
+    let _ = sync_scene_locked(&mut guard);
+    drop(guard);
+    Ok(id)
 }
 
 // -----------------------------------------------------------------------------
@@ -649,6 +1287,418 @@ pub fn export_png_file(output_path: &Path, options: &PngExportRequest) -> Result
     export_png(&scene, &opts, output_path)?;
     let meta = std::fs::metadata(output_path)?;
     Ok(meta.len())
+}
+
+// -----------------------------------------------------------------------------
+// PDF export
+// -----------------------------------------------------------------------------
+
+/// JSON-friendly PDF export options. Mirrors
+/// [`kcreate_export::pdf::PdfExportOptions`].
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PdfExportRequest {
+    pub width_mm: f64,
+    pub height_mm: f64,
+    #[serde(default)]
+    pub title: Option<String>,
+}
+
+/// Render the open document to PDF. Returns the number of bytes written.
+pub fn export_pdf_file(output_path: &Path, options: &PdfExportRequest) -> Result<u64> {
+    let guard = slot().lock();
+    let ws = guard.as_ref().ok_or(DocumentBridgeError::NoProject)?;
+    let mut rasters = kcreate_export::pdf::RasterPixelCache::new();
+    // Preload every raster layer's pixels so the export crate doesn't
+    // need to know about the storage layer. Decode happens once per
+    // unique blob hash (HashMap dedupes for free).
+    for (_uuid, node) in ws.project.document.iter() {
+        if !matches!(node.node_type, NodeType::RasterLayer) {
+            continue;
+        }
+        let Some(meta_value) = node
+            .metadata
+            .get(crate::scene_sync::RASTER_IMAGE_METADATA_KEY)
+        else {
+            continue;
+        };
+        let Ok(meta) =
+            serde_json::from_value::<crate::scene_sync::RasterImageMeta>(meta_value.clone())
+        else {
+            continue;
+        };
+        if rasters.contains_key(&meta.blob_hash) {
+            continue;
+        }
+        let bytes = match ws.store.blobs().load(&meta.blob_hash) {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        if let Ok(pixels) = kcreate_export::pdf::RasterPixels::decode(&bytes) {
+            rasters.insert(meta.blob_hash, pixels);
+        }
+    }
+    let opts = kcreate_export::pdf::PdfExportOptions {
+        width_mm: options.width_mm,
+        height_mm: options.height_mm,
+        title: options
+            .title
+            .clone()
+            .unwrap_or_else(|| ws.project.name.clone()),
+    };
+    let bytes = kcreate_export::pdf::export_pdf_from_document(
+        &ws.project.document,
+        &opts,
+        &rasters,
+        output_path,
+    )
+    .map_err(|e| DocumentBridgeError::Io(std::io::Error::other(e.to_string())))?;
+    drop(guard);
+    Ok(bytes as u64)
+}
+
+// -----------------------------------------------------------------------------
+// WebP export
+// -----------------------------------------------------------------------------
+
+/// JSON-friendly WebP export options. Mirrors
+/// [`kcreate_export::webp::WebpExportOptions`].
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct WebpExportRequest {
+    pub width: u32,
+    pub height: u32,
+    #[serde(default = "default_scale")]
+    pub scale: f32,
+    #[serde(default = "default_quality")]
+    pub quality: u32,
+    #[serde(default = "default_lossless")]
+    pub lossless: bool,
+    #[serde(default)]
+    pub background: Option<[f32; 4]>,
+}
+
+const fn default_quality() -> u32 {
+    90
+}
+const fn default_lossless() -> bool {
+    true
+}
+
+/// Render the current renderer scene to WebP at `output_path`. Returns
+/// the number of bytes written.
+pub fn export_webp_file(output_path: &Path, options: &WebpExportRequest) -> Result<u64> {
+    let scene = crate::state::current_scene()?;
+    let opts = kcreate_export::WebpExportOptions {
+        width: options.width,
+        height: options.height,
+        scale: options.scale,
+        quality: options.quality,
+        lossless: options.lossless,
+        background: options
+            .background
+            .map(|[r, g, b, a]| kcreate_renderer::geometry::Color::rgba(r, g, b, a)),
+    };
+    kcreate_export::export_webp(&scene, &opts, output_path)
+        .map_err(|e| DocumentBridgeError::Io(std::io::Error::other(e.to_string())))?;
+    let meta = std::fs::metadata(output_path)?;
+    Ok(meta.len())
+}
+
+// -----------------------------------------------------------------------------
+// JPEG export
+// -----------------------------------------------------------------------------
+
+/// JSON-friendly JPEG export options. Mirrors
+/// [`kcreate_export::jpeg::JpegExportOptions`].
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct JpegExportRequest {
+    pub width: u32,
+    pub height: u32,
+    #[serde(default = "default_scale")]
+    pub scale: f32,
+    #[serde(default = "default_quality")]
+    pub quality: u32,
+    #[serde(default)]
+    pub background: Option<[f32; 4]>,
+}
+
+/// Render the current renderer scene to JPEG at `output_path`. Returns
+/// the number of bytes written.
+pub fn export_jpeg_file(output_path: &Path, options: &JpegExportRequest) -> Result<u64> {
+    let scene = crate::state::current_scene()?;
+    let opts = kcreate_export::JpegExportOptions {
+        width: options.width,
+        height: options.height,
+        scale: options.scale,
+        quality: options.quality,
+        background: options
+            .background
+            .map(|[r, g, b, a]| kcreate_renderer::geometry::Color::rgba(r, g, b, a)),
+    };
+    kcreate_export::export_jpeg(&scene, &opts, output_path)
+        .map_err(|e| DocumentBridgeError::Io(std::io::Error::other(e.to_string())))?;
+    let meta = std::fs::metadata(output_path)?;
+    Ok(meta.len())
+}
+
+// -----------------------------------------------------------------------------
+// AI: background removal
+// -----------------------------------------------------------------------------
+
+/// Run threshold-based background removal on a raster layer node.
+///
+/// Reads the source layer's blob from the project's content-addressed
+/// store, runs `kcreate_ai::remove_background`, writes the result as a
+/// new PNG blob, inserts a sibling `RasterLayer` node pointing at the
+/// new blob, and appends an AI action to the global action log.
+///
+/// The original layer is left in place — the host can stack the result
+/// on top for an "Apply / before / after / cancel" UI. An undo
+/// operation deletes the new node (its `before_patch` is `null`).
+pub fn ai_remove_background(node_id: Uuid) -> Result<Uuid> {
+    let (encoded_bytes, parent) = {
+        let guard = slot().lock();
+        let ws = guard.as_ref().ok_or(DocumentBridgeError::NoProject)?;
+        let node = ws
+            .project
+            .document
+            .get_node(node_id)
+            .ok_or(DocumentBridgeError::NodeNotFound(node_id))?;
+        if !matches!(node.node_type, NodeType::RasterLayer) {
+            return Err(DocumentBridgeError::InvalidNodeType(format!(
+                "{:?}",
+                node.node_type
+            )));
+        }
+        let meta_value = node
+            .metadata
+            .get(crate::scene_sync::RASTER_IMAGE_METADATA_KEY)
+            .ok_or_else(|| {
+                DocumentBridgeError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "raster layer missing image metadata",
+                ))
+            })?;
+        let meta: crate::scene_sync::RasterImageMeta = serde_json::from_value(meta_value.clone())?;
+        let bytes = ws
+            .store
+            .blobs()
+            .load(&meta.blob_hash)
+            .map_err(|e| DocumentBridgeError::Io(std::io::Error::other(e.to_string())))?;
+        (bytes, node.parent_id)
+    };
+
+    // Decode → run bg removal → re-encode PNG.
+    let img = image::load_from_memory(&encoded_bytes).map_err(|e| {
+        DocumentBridgeError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+    })?;
+    let rgba = img.to_rgba8();
+    let (width, height) = rgba.dimensions();
+    let out_rgba = kcreate_ai::remove_background(
+        rgba.as_raw(),
+        width,
+        height,
+        kcreate_ai::BgRemoveOptions::default(),
+    )
+    .map_err(|e| DocumentBridgeError::Io(std::io::Error::other(e.to_string())))?;
+    let mut png: Vec<u8> = Vec::new();
+    {
+        let mut cursor = std::io::Cursor::new(&mut png);
+        image::write_buffer_with_format(
+            &mut cursor,
+            &out_rgba,
+            width,
+            height,
+            image::ColorType::Rgba8,
+            image::ImageFormat::Png,
+        )
+        .map_err(|e| DocumentBridgeError::Io(std::io::Error::other(e.to_string())))?;
+    }
+
+    // Store the new blob, insert a sibling node, append an op + AI action.
+    let mut guard = slot().lock();
+    let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
+    let blob = ws
+        .store
+        .blobs()
+        .store(&png, "image/png")
+        .map_err(|e| DocumentBridgeError::Io(std::io::Error::other(e.to_string())))?;
+    let new_meta = crate::scene_sync::RasterImageMeta {
+        blob_hash: blob.hash,
+        width,
+        height,
+    };
+    let mut new_node = Node::new(NodeType::RasterLayer, "Background removed");
+    new_node.parent_id = parent;
+    new_node.bounds = kcreate_core::node::Bounds {
+        x: 0.0,
+        y: 0.0,
+        width: f64::from(width),
+        height: f64::from(height),
+    };
+    new_node.metadata.insert(
+        crate::scene_sync::RASTER_IMAGE_METADATA_KEY.to_string(),
+        serde_json::to_value(&new_meta)?,
+    );
+    let new_id = ws.project.document.insert_node(new_node)?;
+    let snapshot = ws
+        .project
+        .document
+        .get_node(new_id)
+        .map_or(serde_json::Value::Null, |n| {
+            serde_json::to_value(n).unwrap_or(serde_json::Value::Null)
+        });
+    let op = Operation::new(
+        "ai",
+        "ai_remove_background",
+        serde_json::Value::Null,
+        snapshot,
+        vec![new_id, node_id],
+    )
+    .as_ai_generated();
+    ws.project.execute_operation(op);
+    kcreate_ai::ActionLog::global()
+        .lock()
+        .append(kcreate_ai::AiAction {
+            id: Uuid::new_v4(),
+            timestamp: Utc::now(),
+            task_type: "background_removal".into(),
+            model: "threshold-v0".into(),
+            compute_device: "cpu".into(),
+            affected_nodes: vec![new_id, node_id],
+            confidence: None,
+        });
+    ws.project.modified_at = Utc::now();
+    let _ = sync_scene_locked(&mut guard);
+    drop(guard);
+    Ok(new_id)
+}
+
+/// Snapshot of the global AI action log as a JSON array, newest first.
+pub fn ai_get_action_log() -> Result<String> {
+    let log = kcreate_ai::ActionLog::global().lock();
+    let snap = log.snapshot();
+    let json = serde_json::to_string(&snap)?;
+    Ok(json)
+}
+
+// -----------------------------------------------------------------------------
+// MCP server
+// -----------------------------------------------------------------------------
+
+/// `DocumentAccess` implementation that talks to the process-global
+/// workspace [`slot`]. Each method takes the workspace lock for the
+/// minimum duration needed.
+///
+/// The MCP server holds an `Arc<dyn DocumentAccess>` for its full
+/// lifetime, but only calls into this impl while servicing a request
+/// on its worker thread — so the workspace lock is held briefly and
+/// never across an `await` boundary. Lock-ordering relative to the
+/// renderer singleton is documented on [`sync_scene_locked`].
+#[cfg(feature = "mcp")]
+struct WorkspaceAccess;
+
+#[cfg(feature = "mcp")]
+impl kcreate_mcp::tools::DocumentAccess for WorkspaceAccess {
+    fn list_artboards(&self) -> Vec<kcreate_mcp::tools::ArtboardInfo> {
+        let guard = slot().lock();
+        let Some(ws) = guard.as_ref() else {
+            return Vec::new();
+        };
+        ws.project
+            .document
+            .iter()
+            .filter(|(_, n)| n.node_type == NodeType::Artboard)
+            .map(|(id, n)| kcreate_mcp::tools::ArtboardInfo {
+                id: id.to_string(),
+                name: n.name.clone(),
+                bounds: n.bounds.into(),
+            })
+            .collect()
+    }
+
+    fn create_node(
+        &self,
+        node_type: NodeType,
+        name: String,
+        parent_id: Option<Uuid>,
+    ) -> std::result::Result<Uuid, String> {
+        let mut guard = slot().lock();
+        let ws = guard
+            .as_mut()
+            .ok_or_else(|| "no project open".to_string())?;
+        let mut node = Node::new(node_type, name);
+        node.parent_id = parent_id;
+        let id = ws
+            .project
+            .document
+            .insert_node(node)
+            .map_err(|e| e.to_string())?;
+        ws.project.modified_at = Utc::now();
+        // Sync the scene so the renderer sees the new node immediately.
+        // Failure to sync (e.g. renderer not initialised in a headless
+        // host) is non-fatal: the next renderer_init + sync recovers.
+        let _ = sync_scene_locked(&mut guard);
+        Ok(id)
+    }
+
+    fn export_svg(&self, node_ids: &[Uuid]) -> std::result::Result<String, String> {
+        let guard = slot().lock();
+        let ws = guard
+            .as_ref()
+            .ok_or_else(|| "no project open".to_string())?;
+        kcreate_export::svg::export_svg_from_document(
+            &ws.project.document,
+            node_ids,
+            &kcreate_export::svg::SvgExportOptions::default(),
+        )
+        .map_err(|e| e.to_string())
+    }
+}
+
+/// Start the local MCP server. Loopback-only. Idempotent.
+#[cfg(feature = "mcp")]
+pub fn mcp_start() -> Result<u32> {
+    let access: std::sync::Arc<dyn kcreate_mcp::tools::DocumentAccess> =
+        std::sync::Arc::new(WorkspaceAccess);
+    let port = kcreate_mcp::server::start_global(access)
+        .map_err(|e| DocumentBridgeError::Io(std::io::Error::other(e.to_string())))?;
+    Ok(u32::from(port))
+}
+
+/// Compile-time disabled MCP entry point. The host can rebuild with
+/// `--features mcp` to enable it.
+#[cfg(not(feature = "mcp"))]
+pub fn mcp_start() -> Result<u32> {
+    Err(DocumentBridgeError::Io(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "MCP server disabled at compile time (build with --features mcp)",
+    )))
+}
+
+#[cfg(feature = "mcp")]
+pub fn mcp_stop() -> Result<()> {
+    kcreate_mcp::server::stop_global();
+    Ok(())
+}
+
+#[cfg(not(feature = "mcp"))]
+pub const fn mcp_stop() -> Result<()> {
+    Ok(())
+}
+
+#[cfg(feature = "mcp")]
+#[must_use]
+pub fn mcp_is_running() -> bool {
+    kcreate_mcp::server::is_running()
+}
+
+#[cfg(not(feature = "mcp"))]
+#[must_use]
+pub const fn mcp_is_running() -> bool {
+    false
 }
 
 // -----------------------------------------------------------------------------
@@ -1074,6 +2124,128 @@ mod tests {
         // A final save with no new ops must be a no-op (no PRIMARY KEY
         // violation, no spurious rewrites).
         project_save().expect("idempotent save");
+        project_close();
+    }
+
+    #[test]
+    #[serial]
+    fn brand_kit_create_list_update_delete_round_trips_through_save() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("bk", dir.path()).expect("create");
+
+        let id = brand_kit_create("KChat".into()).expect("create");
+        // Editing the kit just-created.
+        let mut kits = brand_kit_list().expect("list");
+        assert_eq!(kits.len(), 1);
+        let mut kit = kits.remove(0);
+        assert_eq!(kit.id, id);
+        kit.colors.push(kcreate_core::project::NamedColor {
+            name: "primary".into(),
+            color: kcreate_core::node::RgbaColor::KCHAT_PRIMARY,
+        });
+        brand_kit_update(kit).expect("update");
+
+        project_save().expect("save");
+        project_close();
+        project_open(&dir.path().join("bk.kstudio")).expect("reopen");
+        let kits2 = brand_kit_list().expect("list2");
+        assert_eq!(kits2.len(), 1);
+        assert_eq!(kits2[0].id, id);
+        assert_eq!(kits2[0].colors[0].name, "primary");
+
+        // Deleting + saving must drop the on-disk row so a second
+        // reopen agrees the kit is gone.
+        let removed = brand_kit_delete(id).expect("delete");
+        assert!(removed);
+        project_save().expect("save after delete");
+        project_close();
+        project_open(&dir.path().join("bk.kstudio")).expect("reopen 2");
+        assert!(brand_kit_list().expect("list3").is_empty());
+        project_close();
+    }
+
+    #[test]
+    #[serial]
+    fn design_tokens_set_persists_across_close_and_reopen() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("dt", dir.path()).expect("create");
+
+        let mut tokens = design_tokens_get().expect("initial");
+        assert!(tokens.colors.is_empty());
+        tokens.colors.insert(
+            "brand/primary".into(),
+            kcreate_core::node::RgbaColor::KCHAT_PRIMARY,
+        );
+        tokens.spacing.insert("space/4".into(), 16.0);
+        design_tokens_set(tokens).expect("set");
+
+        project_save().expect("save");
+        project_close();
+        project_open(&dir.path().join("dt.kstudio")).expect("reopen");
+        let loaded = design_tokens_get().expect("get after reopen");
+        assert_eq!(loaded.colors.len(), 1);
+        assert!(loaded.colors.contains_key("brand/primary"));
+        assert_eq!(loaded.spacing.get("space/4").copied(), Some(16.0));
+        project_close();
+    }
+
+    #[test]
+    #[serial]
+    fn export_preset_create_list_delete_round_trip() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("ep", dir.path()).expect("create");
+
+        // `project_create` installs the default presets, so we record
+        // the baseline count rather than asserting on a fixed number.
+        // The on-disk reconciliation must preserve every default
+        // preset alongside the ones we add.
+        let baseline = export_preset_list().expect("baseline").len();
+
+        let one = export_preset_create("PNG @1x".into(), "png", 1.0).expect("create 1x");
+        let two = export_preset_create("PNG @2x".into(), "png", 2.0).expect("create 2x");
+        let presets = export_preset_list().expect("list");
+        assert_eq!(presets.len(), baseline + 2);
+        assert!(presets.iter().any(|p| p.id == one));
+        assert!(presets.iter().any(|p| p.id == two));
+
+        // Save → reopen → still baseline + 2.
+        project_save().expect("save");
+        project_close();
+        project_open(&dir.path().join("ep.kstudio")).expect("reopen");
+        assert_eq!(
+            export_preset_list().expect("list2").len(),
+            baseline + 2,
+            "reopen must restore every saved preset"
+        );
+
+        // Delete + save reconciles the on-disk row so the reopened
+        // project no longer has it.
+        let removed = export_preset_delete(one).expect("delete");
+        assert!(removed);
+        project_save().expect("save after delete");
+        project_close();
+        project_open(&dir.path().join("ep.kstudio")).expect("reopen 2");
+        let presets2 = export_preset_list().expect("list3");
+        assert_eq!(presets2.len(), baseline + 1);
+        assert!(
+            presets2.iter().all(|p| p.id != one),
+            "deleted preset must not reappear after reopen"
+        );
+        assert!(presets2.iter().any(|p| p.id == two));
+        project_close();
+    }
+
+    #[test]
+    #[serial]
+    fn export_preset_create_rejects_unknown_format() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("ep2", dir.path()).expect("create");
+        let err = export_preset_create("nope".into(), "bmp", 1.0).expect_err("bmp");
+        assert!(matches!(err, DocumentBridgeError::InvalidNodeType(_)));
         project_close();
     }
 }

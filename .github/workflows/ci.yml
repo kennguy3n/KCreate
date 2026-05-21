@@ -41,12 +41,13 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-      - name: install gpu deps
+      - name: install gpu + font deps
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             libwayland-dev libxkbcommon-dev libxcb1-dev libgl1 libvulkan1 \
-            mesa-vulkan-drivers
+            mesa-vulkan-drivers \
+            libfontconfig1-dev
       - uses: Swatinem/rust-cache@v2
       - name: cargo fmt --check
         run: cargo fmt --all --check
@@ -57,7 +58,10 @@ jobs:
       - name: cargo test
         run: cargo test --workspace --all-targets
       - name: cargo bench (compile only)
-        run: cargo bench -p kcreate_renderer --no-run
+        run: |
+          cargo bench -p kcreate_renderer --no-run
+          cargo bench -p kcreate_raster --no-run
+          cargo bench -p kcreate_ai --no-run
 
   # Cross-platform lane — gated. See header comment for opt-in triggers.
   rust-extended:
@@ -100,7 +104,10 @@ jobs:
       - name: cargo test
         run: cargo test --workspace --all-targets
       - name: cargo bench (compile only)
-        run: cargo bench -p kcreate_renderer --no-run
+        run: |
+          cargo bench -p kcreate_renderer --no-run
+          cargo bench -p kcreate_raster --no-run
+          cargo bench -p kcreate_ai --no-run
 
   node:
     name: node (typescript)

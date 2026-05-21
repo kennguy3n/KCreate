@@ -16,9 +16,59 @@ pub struct ObjectId(pub u64);
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ObjectKind {
     Rect(Rect),
-    Circle { center: Point2, radius: f32 },
-    Line { start: Point2, end: Point2 },
+    Circle {
+        center: Point2,
+        radius: f32,
+    },
+    Line {
+        start: Point2,
+        end: Point2,
+    },
     Path(Vec<PathCommand>),
+    /// Bitmap image. In Phase 0 the pixel buffer is inlined on the
+    /// scene; Phase 1 will swap to a GPU texture handle keyed by
+    /// content-addressed blob hash. The `pixels` buffer is RGBA8,
+    /// row-major, straight alpha — exactly the format the host's
+    /// `ImageData`/`putImageData` path uses.
+    Image {
+        /// Local-space rect the image is painted into. Width / height
+        /// here may differ from `pixels` width / height (scaling).
+        rect: Rect,
+        /// Pixel buffer width in pixels.
+        pixels_width: u32,
+        /// Pixel buffer height in pixels.
+        pixels_height: u32,
+        /// RGBA8 pixel data. Length must equal
+        /// `pixels_width * pixels_height * 4`.
+        pixels: Vec<u8>,
+    },
+    /// A short string painted at `origin`. The renderer uses
+    /// [`kcreate_text::shape_text`] to convert this into glyph paths
+    /// at draw time. Style fill is used as the text color; stroke
+    /// outlines glyphs.
+    Text {
+        /// Local-space baseline origin for the first glyph.
+        origin: Point2,
+        /// Text content (one short paragraph; multiline support is
+        /// Phase 1).
+        text: String,
+        /// Family name; the text crate resolves this against the
+        /// system font database.
+        font_family: String,
+        /// Em size in pixels (multiplied by viewport zoom at draw
+        /// time).
+        font_size: f32,
+    },
+}
+
+impl ObjectKind {
+    /// True for the structurally-large variants (`Image`). Used by
+    /// debug logging and by the wire serializer to avoid dumping
+    /// megabytes of pixel data.
+    #[must_use]
+    pub const fn is_heavy(&self) -> bool {
+        matches!(self, Self::Image { .. })
+    }
 }
 
 /// A single drawable object in the scene.
@@ -129,6 +179,20 @@ fn local_bounds(kind: &ObjectKind) -> Rect {
             Rect::new(x, y, max_x - x, max_y - y)
         }
         ObjectKind::Path(cmds) => path_bounds(cmds),
+        ObjectKind::Image { rect, .. } => *rect,
+        ObjectKind::Text {
+            origin,
+            font_size,
+            text,
+            ..
+        } => {
+            // Rough text bounds without shaping. Used only for scissor
+            // culling — a slight over-estimate is fine. The CPU
+            // backend shapes the actual text at draw time.
+            let line_h = *font_size * 1.25;
+            let approx_w = (text.chars().count() as f32) * font_size * 0.6;
+            Rect::new(origin.x, origin.y - line_h, approx_w, line_h)
+        }
     }
 }
 

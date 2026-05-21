@@ -17,6 +17,8 @@
 #![forbid(unsafe_op_in_unsafe_fn)]
 
 pub mod document;
+pub mod hit_test;
+pub mod scene_sync;
 pub mod state;
 pub mod wire;
 
@@ -510,4 +512,328 @@ pub fn export_png(output_path: String, options_json: String) -> NapiResult<u32> 
     let bytes =
         document::export_png_file(&PathBuf::from(output_path), &opts).map_err(map_doc_err)?;
     Ok(u32::try_from(bytes).unwrap_or(u32::MAX))
+}
+
+/// Export the open document to PDF at `output_path`. Returns the file
+/// size in bytes. `options_json` accepts `{ width_mm, height_mm, title? }`.
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn export_pdf(output_path: String, options_json: String) -> NapiResult<u32> {
+    let opts: document::PdfExportRequest = serde_json::from_str(&options_json).map_err(|e| {
+        NapiError::new(
+            Status::InvalidArg,
+            format!("kcreate_bridge: bad pdf options json: {e}"),
+        )
+    })?;
+    let bytes =
+        document::export_pdf_file(&PathBuf::from(output_path), &opts).map_err(map_doc_err)?;
+    Ok(u32::try_from(bytes).unwrap_or(u32::MAX))
+}
+
+/// Render the current renderer scene to WebP at `output_path`. Returns
+/// the file size in bytes.
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn export_webp(output_path: String, options_json: String) -> NapiResult<u32> {
+    let opts: document::WebpExportRequest = serde_json::from_str(&options_json).map_err(|e| {
+        NapiError::new(
+            Status::InvalidArg,
+            format!("kcreate_bridge: bad webp options json: {e}"),
+        )
+    })?;
+    let bytes =
+        document::export_webp_file(&PathBuf::from(output_path), &opts).map_err(map_doc_err)?;
+    Ok(u32::try_from(bytes).unwrap_or(u32::MAX))
+}
+
+/// Render the current renderer scene to JPEG at `output_path`. Returns
+/// the file size in bytes.
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn export_jpeg(output_path: String, options_json: String) -> NapiResult<u32> {
+    let opts: document::JpegExportRequest = serde_json::from_str(&options_json).map_err(|e| {
+        NapiError::new(
+            Status::InvalidArg,
+            format!("kcreate_bridge: bad jpeg options json: {e}"),
+        )
+    })?;
+    let bytes =
+        document::export_jpeg_file(&PathBuf::from(output_path), &opts).map_err(map_doc_err)?;
+    Ok(u32::try_from(bytes).unwrap_or(u32::MAX))
+}
+
+// =============================================================================
+// Canvas / scene synchronisation
+// =============================================================================
+
+/// Force a scene re-sync. The host calls this after re-initialising the
+/// renderer (resize, tier change) when it wants to immediately repaint
+/// the document instead of waiting for the next mutation.
+#[napi]
+pub fn document_sync_scene() -> NapiResult<()> {
+    document::document_sync_scene().map_err(map_doc_err)
+}
+
+/// Hit-test viewport-relative screen coordinates against the current
+/// scene. Returns the topmost selectable node's uuid as a string, or
+/// `null` when the cursor is over empty canvas.
+#[napi]
+pub fn canvas_hit_test(
+    x: f64,
+    y: f64,
+    pan_x: f64,
+    pan_y: f64,
+    zoom: f64,
+) -> NapiResult<Option<String>> {
+    let hit =
+        document::canvas_hit_test(x as f32, y as f32, pan_x as f32, pan_y as f32, zoom as f32)
+            .map_err(map_doc_err)?;
+    Ok(hit.map(|u| u.to_string()))
+}
+
+/// Replace the document selection. Unknown node ids are silently dropped.
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn document_set_selection(node_ids: Vec<String>) -> NapiResult<()> {
+    let ids: Vec<Uuid> = node_ids
+        .iter()
+        .map(|s| parse_uuid(s))
+        .collect::<NapiResult<_>>()?;
+    document::document_set_selection(ids).map_err(map_doc_err)
+}
+
+/// Snapshot of the current selection.
+#[napi]
+pub fn document_get_selection() -> NapiResult<Vec<String>> {
+    document::document_get_selection()
+        .map(|v| v.into_iter().map(|u| u.to_string()).collect())
+        .map_err(map_doc_err)
+}
+
+/// Clear the selection.
+#[napi]
+pub fn document_clear_selection() -> NapiResult<()> {
+    document::document_clear_selection().map_err(map_doc_err)
+}
+
+/// Create a rectangle vector layer covering `(x, y, w, h)` in world
+/// coordinates. Returns the new node's uuid.
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn canvas_create_rect(
+    parent_id: Option<String>,
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+) -> NapiResult<String> {
+    let parent = match parent_id.as_deref() {
+        Some(s) => Some(parse_uuid(s)?),
+        None => None,
+    };
+    document::canvas_create_rect(parent, x, y, w, h)
+        .map(|u| u.to_string())
+        .map_err(map_doc_err)
+}
+
+/// Create an ellipse vector layer.
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn canvas_create_ellipse(
+    parent_id: Option<String>,
+    cx: f64,
+    cy: f64,
+    rx: f64,
+    ry: f64,
+) -> NapiResult<String> {
+    let parent = match parent_id.as_deref() {
+        Some(s) => Some(parse_uuid(s)?),
+        None => None,
+    };
+    document::canvas_create_ellipse(parent, cx, cy, rx, ry)
+        .map(|u| u.to_string())
+        .map_err(map_doc_err)
+}
+
+/// Create a line vector layer from `(x1, y1)` to `(x2, y2)`.
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn canvas_create_line(
+    parent_id: Option<String>,
+    x1: f64,
+    y1: f64,
+    x2: f64,
+    y2: f64,
+) -> NapiResult<String> {
+    let parent = match parent_id.as_deref() {
+        Some(s) => Some(parse_uuid(s)?),
+        None => None,
+    };
+    document::canvas_create_line(parent, x1, y1, x2, y2)
+        .map(|u| u.to_string())
+        .map_err(map_doc_err)
+}
+
+/// Translate a node by `(dx, dy)` in world coordinates. Records an
+/// undoable operation.
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn canvas_move_node(node_id: String, dx: f64, dy: f64) -> NapiResult<()> {
+    let id = parse_uuid(&node_id)?;
+    document::canvas_move_node(id, dx, dy).map_err(map_doc_err)
+}
+
+/// Create a text layer at `(x, y)` with the given content + font.
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn canvas_create_text(
+    parent_id: Option<String>,
+    x: f64,
+    y: f64,
+    text: String,
+    font_family: String,
+    font_size: f64,
+) -> NapiResult<String> {
+    let parent = match parent_id.as_deref() {
+        Some(s) => Some(parse_uuid(s)?),
+        None => None,
+    };
+    document::canvas_create_text(parent, x, y, text, font_family, font_size as f32)
+        .map(|u| u.to_string())
+        .map_err(map_doc_err)
+}
+
+/// Import a raster image from disk into the project. The image bytes
+/// are stored as a content-addressed blob and a `RasterLayer` node is
+/// inserted referencing it. Returns the new node's uuid.
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn document_import_image(parent_id: Option<String>, file_path: String) -> NapiResult<String> {
+    let parent = match parent_id.as_deref() {
+        Some(s) => Some(parse_uuid(s)?),
+        None => None,
+    };
+    document::document_import_image(parent, &PathBuf::from(file_path))
+        .map(|u| u.to_string())
+        .map_err(map_doc_err)
+}
+
+// =============================================================================
+// AI / MCP
+// =============================================================================
+
+/// Run local-CPU background removal on a `RasterLayer` node.
+///
+/// Creates a new `RasterLayer` with the resulting transparent image,
+/// records an AI operation in the project log (so undo restores the
+/// original), and returns the new node's uuid.
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn ai_remove_background(node_id: String) -> NapiResult<String> {
+    let id = parse_uuid(&node_id)?;
+    document::ai_remove_background(id)
+        .map(|u| u.to_string())
+        .map_err(map_doc_err)
+}
+
+/// Returns the AI action log as a JSON array.
+#[napi]
+pub fn ai_get_action_log() -> NapiResult<String> {
+    document::ai_get_action_log().map_err(map_doc_err)
+}
+
+/// Start the local MCP server on loopback. Returns the bound port.
+/// The server is opt-in (the `mcp` cargo feature must be enabled at
+/// bridge build time) and bound to 127.0.0.1 — never the public
+/// network.
+#[napi]
+pub fn mcp_start() -> NapiResult<u32> {
+    document::mcp_start().map_err(map_doc_err)
+}
+
+/// Stop the local MCP server. Idempotent.
+#[napi]
+pub fn mcp_stop() -> NapiResult<()> {
+    document::mcp_stop().map_err(map_doc_err)
+}
+
+/// Returns true when the MCP server is bound and accepting requests.
+#[napi]
+pub fn mcp_is_running() -> bool {
+    document::mcp_is_running()
+}
+
+// -----------------------------------------------------------------------------
+// Design tokens / brand kits / export presets (Task 19)
+// -----------------------------------------------------------------------------
+
+/// Return the current project's design tokens as a JSON object.
+#[napi]
+pub fn design_tokens_get() -> NapiResult<String> {
+    let tokens = document::design_tokens_get().map_err(map_doc_err)?;
+    serde_json::to_string(&tokens).map_err(|e| NapiError::from_reason(e.to_string()))
+}
+
+/// Replace the design-tokens bag from JSON. Persisted on the next
+/// `project_save`.
+#[napi]
+pub fn design_tokens_set(tokens_json: String) -> NapiResult<()> {
+    let tokens: kcreate_core::project::DesignTokens =
+        serde_json::from_str(&tokens_json).map_err(|e| NapiError::from_reason(e.to_string()))?;
+    document::design_tokens_set(tokens).map_err(map_doc_err)
+}
+
+/// Create a new brand kit with the given display name. Returns the
+/// new kit's UUID as a string.
+#[napi]
+pub fn brand_kit_create(name: String) -> NapiResult<String> {
+    document::brand_kit_create(name)
+        .map(|id| id.to_string())
+        .map_err(map_doc_err)
+}
+
+/// Replace an existing brand kit. The kit's id field is the key.
+#[napi]
+pub fn brand_kit_update(kit_json: String) -> NapiResult<()> {
+    let kit: kcreate_core::project::BrandKit =
+        serde_json::from_str(&kit_json).map_err(|e| NapiError::from_reason(e.to_string()))?;
+    document::brand_kit_update(kit).map_err(map_doc_err)
+}
+
+/// List every brand kit in the project as a JSON array.
+#[napi]
+pub fn brand_kit_list() -> NapiResult<String> {
+    let kits = document::brand_kit_list().map_err(map_doc_err)?;
+    serde_json::to_string(&kits).map_err(|e| NapiError::from_reason(e.to_string()))
+}
+
+/// Delete a brand kit by id. Returns true when something was
+/// removed; false if no matching kit existed.
+#[napi]
+pub fn brand_kit_delete(kit_id: String) -> NapiResult<bool> {
+    let id = parse_uuid(&kit_id)?;
+    document::brand_kit_delete(id).map_err(map_doc_err)
+}
+
+/// Create a new export preset. `format` is one of `png` / `svg` /
+/// `pdf` / `webp` / `jpeg`. Returns the new preset's UUID.
+#[napi]
+pub fn export_preset_create(name: String, format: String, scale: f64) -> NapiResult<String> {
+    document::export_preset_create(name, &format, scale as f32)
+        .map(|id| id.to_string())
+        .map_err(map_doc_err)
+}
+
+/// List every export preset in the project as a JSON array.
+#[napi]
+pub fn export_preset_list() -> NapiResult<String> {
+    let presets = document::export_preset_list().map_err(map_doc_err)?;
+    serde_json::to_string(&presets).map_err(|e| NapiError::from_reason(e.to_string()))
+}
+
+/// Delete an export preset by id. Returns true when something was removed.
+#[napi]
+pub fn export_preset_delete(preset_id: String) -> NapiResult<bool> {
+    let id = parse_uuid(&preset_id)?;
+    document::export_preset_delete(id).map_err(map_doc_err)
 }

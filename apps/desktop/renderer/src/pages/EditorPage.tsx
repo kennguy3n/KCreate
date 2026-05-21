@@ -1,9 +1,16 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-import { CanvasHost } from "../components/CanvasHost";
+import { CanvasHost, type ViewportState } from "../components/CanvasHost";
 import { LeftPanel } from "../components/LeftPanel";
 import { RightPanel } from "../components/RightPanel";
-import { TopBar, type EditorMode } from "../components/TopBar";
+import {
+  TopBar,
+  type EditorMode,
+  toolsForMode,
+  defaultPanelForMode,
+} from "../components/TopBar";
+import { AIAssistPanel } from "../components/AIAssistPanel";
+import { ExportPanel } from "../components/ExportPanel";
 import type {
   DocumentStatus,
   NodeInfo,
@@ -17,27 +24,27 @@ export interface EditorPageProps {
   onBackHome: () => void;
 }
 
-const SAMPLE_SCENE: Scene = {
+/// Active drawing/selection tool. The selected tool drives both the
+/// canvas cursor and the click→action wiring.
+export type ToolId = "select" | "rect" | "ellipse" | "line" | "text";
+
+const CANVAS_WIDTH = 1024;
+const CANVAS_HEIGHT = 640;
+
+const DEFAULT_VIEWPORT: ViewportState = { panX: 0, panY: 0, zoom: 1 };
+
+/// Empty scene used while we haven't yet pulled one from the bridge.
+const EMPTY_SCENE: Scene = {
   clear_color: [0.12, 0.12, 0.14, 1.0],
-  objects: [
-    {
-      id: 1,
-      z: 0,
-      translation: [80, 80],
-      style: {
-        fill: [0.92, 0.36, 0.36, 1.0],
-        stroke: { color: [0, 0, 0, 1.0], width: 2.0 },
-      },
-      kind: { type: "rect", x: 0, y: 0, width: 360, height: 220 },
-    },
-    {
-      id: 2,
-      z: 1,
-      translation: [560, 220],
-      style: { fill: [0.35, 0.78, 0.95, 1.0], stroke: null },
-      kind: { type: "circle", cx: 0, cy: 0, radius: 140 },
-    },
-  ],
+  objects: [],
+};
+
+const TOOL_CURSORS: Record<ToolId, string> = {
+  select: "default",
+  rect: "crosshair",
+  ellipse: "crosshair",
+  line: "crosshair",
+  text: "text",
 };
 
 export function EditorPage({
@@ -45,23 +52,38 @@ export function EditorPage({
   onBackHome,
 }: EditorPageProps): JSX.Element {
   const [mode, setMode] = useState<EditorMode>("design");
+  const [tool, setTool] = useState<ToolId>("select");
   const [nodes, setNodes] = useState<NodeInfo[]>([]);
-  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
   const [fps, setFps] = useState<number>(0);
-  // The last frame timestamp lives in a ref, not state: it changes on
-  // every frame, and feeding it into `useCallback`'s dependency list
-  // would invalidate `onFrame` 60+ times a second and cascade through
-  // CanvasHost as a new `onFramePresented` prop on every render. The
-  // ref keeps the closure stable while still reading the most recent
-  // value at tick time.
-  const lastTickAtRef = useRef<number>(performance.now());
-  // Editing-state from the bridge. `null` while the first probe is
-  // in flight, then either a snapshot of the operation log or `null`
-  // again if the workspace is closed. Default to disabled controls
-  // until we have confirmation from the bridge — a brief disabled
-  // flash is preferable to an Undo button that lies about its state.
+  const [viewport, setViewport] = useState<ViewportState>(DEFAULT_VIEWPORT);
+  // The document graph lives in Rust; we only keep a sampled `Scene`
+  // snapshot here for the renderer. Phase 1 will swap this for a
+  // push-based subscription rather than periodic resync. We don't
+  // currently rebuild the scene client-side (the Rust scene_sync
+  // pushes into the renderer directly), so this is a stable empty
+  // sentinel today.
+  const [scene] = useState<Scene>(EMPTY_SCENE);
   const [docStatus, setDocStatus] = useState<DocumentStatus | null>(null);
+  const lastTickAtRef = useRef<number>(performance.now());
+  // Drag-to-create / drag-to-move state. Storing in a ref keeps the
+  // pointer handler stable while still tracking the current drag.
+  const dragStateRef = useRef<{
+    kind: "create" | "move";
+    tool: ToolId;
+    pointerId: number;
+    startWorldX: number;
+    startWorldY: number;
+    lastWorldX: number;
+    lastWorldY: number;
+    movingNodeId: string | null;
+    cumulativeDx: number;
+    cumulativeDy: number;
+  } | null>(null);
+
+  const selectedId: string | null =
+    selectedIds.length === 1 ? (selectedIds[0] ?? null) : null;
 
   const refreshStatus = useCallback(async () => {
     try {
@@ -72,6 +94,15 @@ export function EditorPage({
     }
   }, []);
 
+  const refreshSelection = useCallback(async () => {
+    try {
+      const sel = await window.kcreate.canvas.getSelection();
+      setSelectedIds(sel);
+    } catch (e) {
+      setStatusMessage(`selection probe failed: ${errorMessage(e)}`);
+    }
+  }, []);
+
   const refreshTree = useCallback(async () => {
     try {
       const tree = await window.kcreate.document.getDocumentTree();
@@ -79,15 +110,23 @@ export function EditorPage({
     } catch (e) {
       setStatusMessage(`tree load failed: ${errorMessage(e)}`);
     }
-    // The tree changed — so might the operation log (in particular for
-    // undo/redo flows that mutate the cursor without changing nodes,
-    // we still want this called from the dedicated handlers below).
     await refreshStatus();
-  }, [refreshStatus]);
+    await refreshSelection();
+  }, [refreshStatus, refreshSelection]);
 
+  // Initial load + on-mode-change resync.
   useEffect(() => {
     void refreshTree();
   }, [refreshTree]);
+
+  // When the mode changes, snap to its default tool so the canvas
+  // cursor and toolbar stay aligned.
+  useEffect(() => {
+    const tools = toolsForMode(mode);
+    if (!tools.includes(tool)) {
+      setTool(tools[0] ?? "select");
+    }
+  }, [mode, tool]);
 
   const selected = useMemo(
     () => nodes.find((n) => n.id === selectedId) ?? null,
@@ -115,11 +154,60 @@ export function EditorPage({
     }
   }, [refreshTree]);
 
+  const handleDeleteSelected = useCallback(async () => {
+    if (selectedIds.length === 0) return;
+    try {
+      for (const id of selectedIds) {
+        await window.kcreate.document.deleteNode(id);
+      }
+      await window.kcreate.canvas.clearSelection();
+      await refreshTree();
+    } catch (e) {
+      setStatusMessage(`delete failed: ${errorMessage(e)}`);
+    }
+  }, [selectedIds, refreshTree]);
+
+  const handleSelectAll = useCallback(async () => {
+    try {
+      const ids = nodes.map((n) => n.id);
+      await window.kcreate.canvas.setSelection(ids);
+      await refreshSelection();
+    } catch (e) {
+      setStatusMessage(`select all failed: ${errorMessage(e)}`);
+    }
+  }, [nodes, refreshSelection]);
+
+  const handleClearSelection = useCallback(async () => {
+    try {
+      await window.kcreate.canvas.clearSelection();
+      setSelectedIds([]);
+    } catch (e) {
+      setStatusMessage(`clear selection failed: ${errorMessage(e)}`);
+    }
+  }, []);
+
+  const handleSelect = useCallback(
+    async (id: string | null) => {
+      try {
+        if (id === null) {
+          await window.kcreate.canvas.clearSelection();
+          setSelectedIds([]);
+        } else {
+          await window.kcreate.canvas.setSelection([id]);
+          setSelectedIds([id]);
+        }
+      } catch (e) {
+        setStatusMessage(`select failed: ${errorMessage(e)}`);
+      }
+    },
+    [],
+  );
+
   const handleExport = useCallback(async () => {
     try {
       const svg = await window.kcreate.export.svg([], {
-        width: 1024,
-        height: 768,
+        width: CANVAS_WIDTH,
+        height: CANVAS_HEIGHT,
         includeMetadata: false,
         optimize: true,
       });
@@ -136,6 +224,347 @@ export function EditorPage({
     if (elapsed > 0) setFps(Math.round(1000 / elapsed));
   }, []);
 
+  // Periodically resync the rendered scene from the bridge so document
+  // mutations (creates, moves, deletes, undo/redo) show up on the
+  // canvas. The bridge already maintains the renderer scene via
+  // scene_sync — this is just the per-tick pull. Cheap because both
+  // sides are in-process and the Scene struct is small.
+  useEffect(() => {
+    let cancelled = false;
+    const tick = async (): Promise<void> => {
+      if (cancelled) return;
+      // No bridge API to read the scene back yet — the renderer owns
+      // it. We rely on the bridge's `document_sync_scene()` having been
+      // called after every mutation, so simply ask it to re-emit
+      // whenever the tree-shape changes. The display-list cache makes
+      // this near-free.
+      try {
+        await window.kcreate.canvas.syncScene();
+      } catch {
+        // bridge may be transient-ly closed during teardown; ignore
+      }
+    };
+    void tick();
+    return () => {
+      cancelled = true;
+    };
+  }, [nodes]);
+
+  // Keyboard shortcuts. Scoped to the editor page; the canvas itself
+  // is non-focusable so window-level listeners are the right place.
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent): void => {
+      // Skip shortcuts when the user is typing in an input/textarea —
+      // otherwise hitting "R" inside a name field would silently switch
+      // tools.
+      const target = e.target as HTMLElement | null;
+      const tag = target?.tagName?.toLowerCase();
+      const isEditable =
+        tag === "input" ||
+        tag === "textarea" ||
+        tag === "select" ||
+        (target?.isContentEditable ?? false);
+      if (isEditable) return;
+
+      const mod = e.ctrlKey || e.metaKey;
+      // Undo / redo
+      if (mod && !e.shiftKey && e.key.toLowerCase() === "z") {
+        e.preventDefault();
+        void handleUndo();
+        return;
+      }
+      if (
+        (mod && e.shiftKey && e.key.toLowerCase() === "z") ||
+        (mod && e.key.toLowerCase() === "y")
+      ) {
+        e.preventDefault();
+        void handleRedo();
+        return;
+      }
+      // Select all
+      if (mod && e.key.toLowerCase() === "a") {
+        e.preventDefault();
+        void handleSelectAll();
+        return;
+      }
+      // Delete selection
+      if ((e.key === "Delete" || e.key === "Backspace") && !mod) {
+        e.preventDefault();
+        void handleDeleteSelected();
+        return;
+      }
+      // Escape — drop selection
+      if (e.key === "Escape") {
+        e.preventDefault();
+        void handleClearSelection();
+        return;
+      }
+      // Tool switches. Only single-key, no modifiers.
+      if (!mod && !e.altKey && !e.shiftKey && e.key.length === 1) {
+        const k = e.key.toLowerCase();
+        const tools = toolsForMode(mode);
+        const next: ToolId | null =
+          k === "v"
+            ? "select"
+            : k === "r"
+              ? "rect"
+              : k === "e"
+                ? "ellipse"
+                : k === "l"
+                  ? "line"
+                  : k === "t"
+                    ? "text"
+                    : null;
+        if (next && tools.includes(next)) {
+          e.preventDefault();
+          setTool(next);
+        }
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [
+    handleUndo,
+    handleRedo,
+    handleSelectAll,
+    handleDeleteSelected,
+    handleClearSelection,
+    mode,
+  ]);
+
+  // Map screen→world. The renderer reads pan/zoom directly so the same
+  // formula is used both for the wheel-zoom anchor (inside CanvasHost)
+  // and for click-to-hit-test below.
+  const screenToWorld = useCallback(
+    (sx: number, sy: number): { x: number; y: number } => {
+      return {
+        x: (sx - viewport.panX) / viewport.zoom,
+        y: (sy - viewport.panY) / viewport.zoom,
+      };
+    },
+    [viewport],
+  );
+
+  const onCanvasPointer = useCallback(
+    (e: React.PointerEvent<HTMLCanvasElement>) => {
+      if (e.button !== 0 && e.type === "pointerdown") return;
+      // React nullifies `SyntheticEvent.currentTarget` once the
+      // synchronous handler returns, so the async IIFE below cannot
+      // read it after an `await`. Capture the canvas element + pointer
+      // id synchronously so `setPointerCapture` /
+      // `releasePointerCapture` keep working across awaits.
+      const canvasEl = e.currentTarget;
+      const pointerId = e.pointerId;
+      const rect = canvasEl.getBoundingClientRect();
+      const sx = e.clientX - rect.left;
+      const sy = e.clientY - rect.top;
+      const { x: wx, y: wy } = screenToWorld(sx, sy);
+      // Capture the viewport snapshot at pointer-down time. The Rust
+      // hit-test wants screen coordinates plus the viewport so it can
+      // run the screen→world transform once — if we pre-transformed
+      // here too, the renderer would double-apply pan + zoom and miss
+      // every click.
+      const vp = viewport;
+
+      if (e.type === "pointerdown") {
+        if (tool === "select") {
+          // Click-to-select: hit-test, then either start a move drag or
+          // clear selection. The bridge does the screen→world transform
+          // internally; we send raw screen coordinates plus the current
+          // viewport (single source of truth, no double-transform).
+          void (async () => {
+            try {
+              const hit = await window.kcreate.canvas.hitTest(
+                sx,
+                sy,
+                vp.panX,
+                vp.panY,
+                vp.zoom,
+              );
+              if (hit) {
+                await window.kcreate.canvas.setSelection([hit]);
+                setSelectedIds([hit]);
+                canvasEl.setPointerCapture(pointerId);
+                dragStateRef.current = {
+                  kind: "move",
+                  tool,
+                  pointerId,
+                  startWorldX: wx,
+                  startWorldY: wy,
+                  lastWorldX: wx,
+                  lastWorldY: wy,
+                  movingNodeId: hit,
+                  cumulativeDx: 0,
+                  cumulativeDy: 0,
+                };
+              } else {
+                await window.kcreate.canvas.clearSelection();
+                setSelectedIds([]);
+              }
+            } catch (err) {
+              setStatusMessage(`hit-test failed: ${errorMessage(err)}`);
+            }
+          })();
+          return;
+        }
+        // Drawing tools — record drag start in world coords; commit on
+        // pointerup.
+        canvasEl.setPointerCapture(pointerId);
+        dragStateRef.current = {
+          kind: "create",
+          tool,
+          pointerId,
+          startWorldX: wx,
+          startWorldY: wy,
+          lastWorldX: wx,
+          lastWorldY: wy,
+          movingNodeId: null,
+          cumulativeDx: 0,
+          cumulativeDy: 0,
+        };
+        return;
+      }
+
+      if (e.type === "pointermove") {
+        const drag = dragStateRef.current;
+        if (!drag || drag.pointerId !== e.pointerId) return;
+        if (drag.kind === "move" && drag.movingNodeId) {
+          const dx = wx - drag.lastWorldX;
+          const dy = wy - drag.lastWorldY;
+          drag.lastWorldX = wx;
+          drag.lastWorldY = wy;
+          drag.cumulativeDx += dx;
+          drag.cumulativeDy += dy;
+          // Don't fire a bridge call for every micro-pixel of cursor
+          // motion — only push the accumulated delta on pointerup. This
+          // keeps undo entries coarse (one drag = one op) and avoids
+          // op-log spam.
+          return;
+        }
+        // Drawing — no commit until pointerup; the canvas does not yet
+        // show an in-flight ghost. Phase 1 will add a transient overlay
+        // by passing the in-progress rect/ellipse to the renderer
+        // alongside the persisted scene.
+        return;
+      }
+
+      if (e.type === "pointerup") {
+        const drag = dragStateRef.current;
+        if (!drag || drag.pointerId !== pointerId) return;
+        try {
+          canvasEl.releasePointerCapture(pointerId);
+        } catch {
+          // capture might already be released
+        }
+        dragStateRef.current = null;
+        if (drag.kind === "move" && drag.movingNodeId) {
+          if (drag.cumulativeDx !== 0 || drag.cumulativeDy !== 0) {
+            void (async () => {
+              try {
+                await window.kcreate.canvas.moveNode(
+                  drag.movingNodeId!,
+                  drag.cumulativeDx,
+                  drag.cumulativeDy,
+                );
+                await refreshTree();
+              } catch (err) {
+                setStatusMessage(`move failed: ${errorMessage(err)}`);
+              }
+            })();
+          }
+          return;
+        }
+        // Creation: convert the drag to the actual shape parameters.
+        const x0 = drag.startWorldX;
+        const y0 = drag.startWorldY;
+        const x1 = wx;
+        const y1 = wy;
+        const minX = Math.min(x0, x1);
+        const minY = Math.min(y0, y1);
+        const w = Math.abs(x1 - x0);
+        const h = Math.abs(y1 - y0);
+        // Reject zero-area drags — that's a stray click, not a drawing.
+        if (w < 1 && h < 1 && drag.tool !== "text") return;
+
+        void (async () => {
+          try {
+            let newId: string | null = null;
+            if (drag.tool === "rect") {
+              newId = await window.kcreate.canvas.createRect(
+                null,
+                minX,
+                minY,
+                w,
+                h,
+              );
+            } else if (drag.tool === "ellipse") {
+              newId = await window.kcreate.canvas.createEllipse(
+                null,
+                minX + w / 2,
+                minY + h / 2,
+                w / 2,
+                h / 2,
+              );
+            } else if (drag.tool === "line") {
+              newId = await window.kcreate.canvas.createLine(
+                null,
+                x0,
+                y0,
+                x1,
+                y1,
+              );
+            } else if (drag.tool === "text") {
+              newId = await window.kcreate.canvas.createText(
+                null,
+                x0,
+                y0,
+                "Text",
+                "sans-serif",
+                24,
+              );
+            }
+            if (newId) {
+              await window.kcreate.canvas.setSelection([newId]);
+            }
+            await refreshTree();
+          } catch (err) {
+            setStatusMessage(`create failed: ${errorMessage(err)}`);
+          }
+        })();
+      }
+    },
+    [tool, viewport, screenToWorld, refreshTree],
+  );
+
+  const onZoomToFit = useCallback(() => {
+    // No documentBounds API yet; reset to identity. Phase 1 will compute
+    // a bounding box across visible nodes.
+    setViewport(DEFAULT_VIEWPORT);
+  }, []);
+
+  const handleUpdateNode = useCallback(
+    async (
+      nodeId: string,
+      changes: Parameters<
+        typeof window.kcreate.document.updateNode
+      >[1],
+    ) => {
+      try {
+        await window.kcreate.document.updateNode(nodeId, changes);
+        await refreshTree();
+      } catch (err) {
+        setStatusMessage(`update failed: ${errorMessage(err)}`);
+      }
+    },
+    [refreshTree],
+  );
+
+  // Right-panel content depends on the active mode (see PROPOSAL § 6).
+  // Image mode focuses on AI Assist; Export mode focuses on Export
+  // presets; everything else lands on the properties inspector.
+  const rightPanelFocus = defaultPanelForMode(mode);
+  const cursor = TOOL_CURSORS[tool];
+
   return (
     <div
       style={{
@@ -151,6 +580,8 @@ export function EditorPage({
         projectName={project.name}
         mode={mode}
         onModeChange={setMode}
+        tool={tool}
+        onToolChange={setTool}
         canUndo={canUndo}
         canRedo={canRedo}
         onUndo={() => {
@@ -175,7 +606,28 @@ export function EditorPage({
         <LeftPanel
           nodes={nodes}
           selectedId={selectedId}
-          onSelect={setSelectedId}
+          onSelect={(id) => {
+            void handleSelect(id);
+          }}
+          onToggleVisibility={(id, visible) => {
+            void handleUpdateNode(id, { visible });
+          }}
+          onToggleLocked={(id, locked) => {
+            void handleUpdateNode(id, { locked });
+          }}
+          onRename={(id, name) => {
+            void handleUpdateNode(id, { name });
+          }}
+          onDelete={(id) => {
+            void (async () => {
+              try {
+                await window.kcreate.document.deleteNode(id);
+                await refreshTree();
+              } catch (err) {
+                setStatusMessage(`delete failed: ${errorMessage(err)}`);
+              }
+            })();
+          }}
         />
         <main
           style={{
@@ -186,10 +638,15 @@ export function EditorPage({
           }}
         >
           <CanvasHost
-            width={1024}
-            height={640}
-            scene={SAMPLE_SCENE}
+            width={CANVAS_WIDTH}
+            height={CANVAS_HEIGHT}
+            scene={scene}
+            viewport={viewport}
+            onViewportChange={setViewport}
             onFramePresented={onFrame}
+            onPointer={onCanvasPointer}
+            onZoomToFit={onZoomToFit}
+            cursor={cursor}
           />
           <div
             style={{
@@ -203,15 +660,35 @@ export function EditorPage({
               borderRadius: 4,
             }}
           >
-            {fps} fps · {mode}
+            {fps} fps · {mode} · {tool} · {Math.round(viewport.zoom * 100)}%
           </div>
         </main>
-        <RightPanel
-          selected={selected}
-          onRequestExport={() => {
-            void handleExport();
-          }}
-        />
+        {rightPanelFocus === "ai" ? (
+          <AIAssistPanel
+            selectedNode={selected}
+            onApplied={() => {
+              void refreshTree();
+            }}
+            onStatus={setStatusMessage}
+          />
+        ) : rightPanelFocus === "export" ? (
+          <ExportPanel
+            onStatus={setStatusMessage}
+            width={CANVAS_WIDTH}
+            height={CANVAS_HEIGHT}
+          />
+        ) : (
+          <RightPanel
+            selected={selected}
+            onChange={(changes) => {
+              if (!selected) return;
+              void handleUpdateNode(selected.id, changes);
+            }}
+            onRequestExport={() => {
+              void handleExport();
+            }}
+          />
+        )}
       </div>
       <footer
         style={{
@@ -226,6 +703,11 @@ export function EditorPage({
         }}
       >
         <span>{statusMessage ?? `Project: ${project.path}`}</span>
+        <span style={{ marginLeft: "auto" }}>
+          {selectedIds.length === 0
+            ? "No selection"
+            : `${selectedIds.length} selected`}
+        </span>
       </footer>
     </div>
   );

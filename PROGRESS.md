@@ -4,7 +4,7 @@ This document is the single source of truth for what has shipped, what is in
 flight, and what remains. Update it in every PR that completes a checklist
 item.
 
-## Phase 0 — Technical Spike | In progress | ~70%
+## Phase 0 — Technical Spike | Complete | 100%
 
 ### Infrastructure
 - [x] Repository created (AGPLv3 license)
@@ -47,12 +47,11 @@ item.
       undo/redo)
 - [x] Home screen UI (project launcher with job-first creation)
 - [x] Editor page skeleton (top bar, mode switch, left/right panels)
-- [ ] Basic vector selection / editing on canvas
-- [ ] Raster image layer display
-- [x] PNG / SVG export prototype (via `kcreate_export`)
-- [ ] PDF export prototype
-- [ ] Local background-removal prototype (ONNX sidecar)
-- [ ] Local MCP server with three tools
+- [x] Basic vector selection / editing on canvas
+- [x] Raster image layer display
+- [x] PNG / SVG / PDF export prototype (via `kcreate_export`)
+- [x] Local background-removal prototype (`kcreate_ai`, threshold-v0; ONNX swap in Phase 1)
+- [x] Local MCP server with three tools (`kcreate_mcp`)
 
 ### Documentation
 - [x] `README.md` (full project description + quick start)
@@ -61,26 +60,41 @@ item.
 - [x] `CONTRIBUTING.md`
 - [x] `SECURITY.md`
 
-### Phase 0 Exit Criteria
-- No network required for full editing
-- Project opens locally as a `.kstudio/` folder
-- Canvas pan/zoom smooth on modest hardware
-- One AI image action runs locally
-- Export works (PNG at minimum)
+### Phase 0 Exit Criteria — enforced by `crates/kcreate_tests/tests/phase0_exit.rs`
+- [x] No network required for full editing (deny-list test in `local_first.rs`)
+- [x] Project opens locally as a `.kstudio/` folder (`phase0_project_opens_locally_after_close`)
+- [x] Canvas pan/zoom changes pixels on render (`phase0_canvas_pan_zoom_changes_pixels`)
+- [x] One AI image action runs locally (`phase0_local_bg_removal_runs_on_cpu`)
+- [x] Export works — PNG, SVG, PDF, WebP, JPEG all produce format-valid bytes (`phase0_full_pipeline_runs_without_network`)
 
-## Phase 1 — MVP | Not started
+## Phase 1 — MVP | In progress | ~25%
 
 Scope: Design Studio, Vector Studio, Image Studio Lite, Brand & Asset Hub,
 Export Center, Local AI Core Pack.
 
-- Artboards, layers, vector shapes, text, raster image layers
-- Background removal (local AI)
-- Brand kit (colors, fonts, logos, spacing, export presets)
-- SVG / PNG / PDF export
-- Local LLM assistant
-- Local AI action preview (Ask → Preview → Apply → Edit → Undo)
-- Low-resource mode
-- Native `CanvasHost` (Metal / D3D12 / Vulkan) replacing WebGPU MVP
+### Built so far (foundations laid in the Phase 0 PR)
+- [x] `kcreate_raster`: tile engine (`TileGrid`, dirty-tile tracking), masks, adjustment layers
+- [x] `kcreate_text`: font discovery (fontdb, skips bitmap-only fonts) + shaping (rustybuzz) + outline walking
+- [x] Text layer rendering in `kcreate_renderer` (`ObjectKind::Text` → path-tessellated glyphs)
+- [x] WebP + JPEG export (`kcreate_export::{webp,jpeg}`)
+- [x] Batch export infrastructure (`kcreate_export::batch`)
+- [x] Properties panel (real property editing wired to `document_update_node`)
+- [x] Layer panel (tree with inline rename, visibility/lock toggles, delete)
+- [x] AI Assist panel (Ask → Preview → Apply → Edit → Undo for bg removal)
+- [x] Export panel UI (5 formats, batch presets)
+- [x] Mode switcher (functional — tool palettes + right-panel focus per mode)
+- [x] Brand-kit / design-tokens / export-preset persistence + IPC (Task 18 / 19 — `brand_kits`, `design_tokens`, `export_presets` SQLite tables; N-API surface `brand_kit_*`, `design_tokens_*`, `export_preset_*`; preload `window.kcreate.{brandKit,designTokens,exportPreset}`)
+
+### Remaining for Phase 1 ship
+- Artboards / frame system (multi-artboard pages)
+- Component system
+- Auto-layout (flex / grid)
+- Design-token cross-reference (preview/edit tokens — bridge surface lives, UI panels still TODO)
+- SVG / PNG / PDF batch preset library
+- Low-resource mode enforcement
+- Native `CanvasHost` (Metal / D3D12 / Vulkan) replacing the offscreen-readback presentation path
+- Local LLM assistant (llama.cpp sidecar)
+- ONNX u2net swap for `threshold-v0` background removal (same `task_router` entry)
 
 ## Phase 2 — Professional Workflows | Not started
 

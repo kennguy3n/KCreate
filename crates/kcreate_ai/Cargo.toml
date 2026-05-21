@@ -1,0 +1,29 @@
+[package]
+name = "kcreate_ai"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Local AI sidecar (Phase 0 threshold bg-removal) for KCreate"
+
+[lints]
+workspace = true
+
+[dependencies]
+image.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+parking_lot.workspace = true
+chrono.workspace = true
+kcreate_core = { path = "../kcreate_core" }
+
+[dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "bg_remove"
+harness = false

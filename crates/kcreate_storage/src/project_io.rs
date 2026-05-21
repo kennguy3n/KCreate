@@ -27,6 +27,7 @@ use chrono::{DateTime, Utc};
 use kcreate_core::document::{DocumentError, DocumentGraph};
 use kcreate_core::node::{Node, NodeType};
 use kcreate_core::operation::Operation;
+use kcreate_core::project::{BrandKit, DesignTokens, ExportPreset};
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -357,6 +358,119 @@ impl ProjectStore {
         Ok(blob)
     }
 
+    /// Persist a brand kit. `id` matches `BrandKit::id`, so this is a
+    /// content-replacing upsert — a second save with the same id wins.
+    pub fn save_brand_kit(&mut self, kit: &BrandKit) -> Result<(), ProjectStoreError> {
+        self.db.conn().execute(
+            "INSERT INTO brand_kits (id, data, updated_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT(id) DO UPDATE SET data = excluded.data, updated_at = excluded.updated_at",
+            params![
+                kit.id.to_string(),
+                serde_json::to_string(kit)?,
+                Utc::now().to_rfc3339(),
+            ],
+        )?;
+        self.touch_modified()?;
+        Ok(())
+    }
+
+    /// Load all brand kits, ordered by `updated_at` ascending so the
+    /// most recently edited appears last (the UI shows the list
+    /// reversed if it wants most-recent-first).
+    pub fn load_brand_kits(&self) -> Result<Vec<BrandKit>, ProjectStoreError> {
+        let mut stmt = self
+            .db
+            .conn()
+            .prepare("SELECT data FROM brand_kits ORDER BY updated_at ASC")?;
+        let kits: Vec<BrandKit> = stmt
+            .query_map([], |row| row.get::<_, String>(0))?
+            .map(|raw| -> Result<BrandKit, ProjectStoreError> {
+                Ok(serde_json::from_str::<BrandKit>(&raw?)?)
+            })
+            .collect::<Result<_, _>>()?;
+        Ok(kits)
+    }
+
+    /// Delete a brand kit by id. Returns the number of rows removed (0 or 1).
+    pub fn delete_brand_kit(&mut self, id: Uuid) -> Result<usize, ProjectStoreError> {
+        let n = self.db.conn().execute(
+            "DELETE FROM brand_kits WHERE id = ?1",
+            params![id.to_string()],
+        )?;
+        if n > 0 {
+            self.touch_modified()?;
+        }
+        Ok(n)
+    }
+
+    /// Persist the singleton design tokens bag. There is exactly one
+    /// row in this table; the `key` column is `'current'`.
+    pub fn save_design_tokens(&mut self, tokens: &DesignTokens) -> Result<(), ProjectStoreError> {
+        self.db.conn().execute(
+            "INSERT INTO design_tokens (key, data, updated_at) VALUES ('current', ?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET data = excluded.data, updated_at = excluded.updated_at",
+            params![serde_json::to_string(tokens)?, Utc::now().to_rfc3339()],
+        )?;
+        self.touch_modified()?;
+        Ok(())
+    }
+
+    /// Load the design tokens. Returns `DesignTokens::default()` when
+    /// nothing has been persisted yet (fresh projects).
+    pub fn load_design_tokens(&self) -> Result<DesignTokens, ProjectStoreError> {
+        match self.db.conn().query_row(
+            "SELECT data FROM design_tokens WHERE key = 'current'",
+            [],
+            |row| row.get::<_, String>(0),
+        ) {
+            Ok(s) => Ok(serde_json::from_str::<DesignTokens>(&s)?),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(DesignTokens::default()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Persist a single export preset. Upsert keyed on `ExportPreset::id`.
+    pub fn save_export_preset(&mut self, preset: &ExportPreset) -> Result<(), ProjectStoreError> {
+        self.db.conn().execute(
+            "INSERT INTO export_presets (id, data, updated_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT(id) DO UPDATE SET data = excluded.data, updated_at = excluded.updated_at",
+            params![
+                preset.id.to_string(),
+                serde_json::to_string(preset)?,
+                Utc::now().to_rfc3339(),
+            ],
+        )?;
+        self.touch_modified()?;
+        Ok(())
+    }
+
+    /// Load every export preset, ordered by creation time (`updated_at` ASC).
+    pub fn load_export_presets(&self) -> Result<Vec<ExportPreset>, ProjectStoreError> {
+        let mut stmt = self
+            .db
+            .conn()
+            .prepare("SELECT data FROM export_presets ORDER BY updated_at ASC")?;
+        let presets: Vec<ExportPreset> = stmt
+            .query_map([], |row| row.get::<_, String>(0))?
+            .map(|raw| -> Result<ExportPreset, ProjectStoreError> {
+                Ok(serde_json::from_str::<ExportPreset>(&raw?)?)
+            })
+            .collect::<Result<_, _>>()?;
+        Ok(presets)
+    }
+
+    /// Delete an export preset by id. Returns the number of rows removed.
+    pub fn delete_export_preset(&mut self, id: Uuid) -> Result<usize, ProjectStoreError> {
+        let n = self.db.conn().execute(
+            "DELETE FROM export_presets WHERE id = ?1",
+            params![id.to_string()],
+        )?;
+        if n > 0 {
+            self.touch_modified()?;
+        }
+        Ok(n)
+    }
+
     /// Bump `modified_at` and persist.
     fn touch_modified(&mut self) -> Result<(), ProjectStoreError> {
         self.manifest.modified_at = Utc::now();
@@ -557,5 +671,90 @@ mod tests {
         drop(store);
         let err = ProjectStore::create(&p, "Other").expect_err("must err");
         assert!(matches!(err, ProjectStoreError::Io(_)));
+    }
+
+    #[test]
+    fn brand_kit_round_trip_survives_close_and_reopen() {
+        use kcreate_core::node::RgbaColor;
+        use kcreate_core::project::{BrandKit, NamedColor};
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = dir.path().join("My.kstudio");
+        let mut store = ProjectStore::create(&p, "My").expect("create");
+
+        let mut kit = BrandKit::new("KChat brand");
+        kit.colors.push(NamedColor {
+            name: "primary".into(),
+            color: RgbaColor::new(0.486, 0.227, 0.929, 1.0),
+        });
+        let kit_id = kit.id;
+        store.save_brand_kit(&kit).expect("save kit");
+
+        drop(store);
+        let reopened = ProjectStore::open(&p).expect("reopen");
+        let kits = reopened.load_brand_kits().expect("load kits");
+        assert_eq!(kits.len(), 1, "exactly one kit persisted");
+        assert_eq!(kits[0].id, kit_id);
+        assert_eq!(kits[0].name, "KChat brand");
+        assert_eq!(kits[0].colors[0].name, "primary");
+    }
+
+    #[test]
+    fn design_tokens_round_trip_survives_reopen() {
+        use kcreate_core::node::RgbaColor;
+        use kcreate_core::project::DesignTokens;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = dir.path().join("My.kstudio");
+        let mut store = ProjectStore::create(&p, "My").expect("create");
+
+        // Default-empty load before any save.
+        let initial = store.load_design_tokens().expect("default load");
+        assert!(initial.colors.is_empty());
+
+        let mut tokens = DesignTokens::default();
+        tokens.colors.insert(
+            "brand/primary".into(),
+            RgbaColor::new(0.486, 0.227, 0.929, 1.0),
+        );
+        tokens.spacing.insert("space/4".into(), 16.0);
+        store.save_design_tokens(&tokens).expect("save");
+
+        drop(store);
+        let reopened = ProjectStore::open(&p).expect("reopen");
+        let loaded = reopened.load_design_tokens().expect("load");
+        assert_eq!(loaded.colors.len(), 1);
+        assert!(loaded.colors.contains_key("brand/primary"));
+        assert_eq!(loaded.spacing.get("space/4").copied(), Some(16.0));
+    }
+
+    #[test]
+    fn export_preset_round_trip_and_delete() {
+        use kcreate_core::project::{ExportFormat, ExportPreset};
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = dir.path().join("My.kstudio");
+        let mut store = ProjectStore::create(&p, "My").expect("create");
+
+        let one = ExportPreset::new("PNG @1x", ExportFormat::Png, 1.0);
+        let two = ExportPreset::new("PNG @2x", ExportFormat::Png, 2.0);
+        store.save_export_preset(&one).expect("save 1x");
+        store.save_export_preset(&two).expect("save 2x");
+
+        let presets = store.load_export_presets().expect("load");
+        assert_eq!(presets.len(), 2);
+        let ids: Vec<_> = presets.iter().map(|p| p.id).collect();
+        assert!(ids.contains(&one.id));
+        assert!(ids.contains(&two.id));
+
+        // Delete one.
+        let removed = store.delete_export_preset(one.id).expect("delete");
+        assert_eq!(removed, 1);
+        let after = store.load_export_presets().expect("load after delete");
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].id, two.id);
+
+        // Deleting an unknown id is a no-op.
+        let missing = store
+            .delete_export_preset(Uuid::new_v4())
+            .expect("delete missing");
+        assert_eq!(missing, 0);
     }
 }

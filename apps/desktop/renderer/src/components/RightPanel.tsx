@@ -1,6 +1,9 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 
-import type { NodeInfo } from "../../../shared/scene";
+import type {
+  NodeInfo,
+  UpdateNodeProps,
+} from "../../../shared/scene";
 import { colors, radius, spacing } from "../styles/tokens";
 
 export type RightPanelTab =
@@ -22,18 +25,20 @@ const TABS: ReadonlyArray<{ id: RightPanelTab; label: string }> = [
 
 export interface RightPanelProps {
   selected: NodeInfo | null;
+  onChange?: (changes: UpdateNodeProps) => void;
   onRequestExport: () => void;
 }
 
 export function RightPanel({
   selected,
+  onChange,
   onRequestExport,
 }: RightPanelProps): JSX.Element {
   const [tab, setTab] = useState<RightPanelTab>("properties");
   return (
     <aside
       style={{
-        width: 280,
+        width: 300,
         background: colors.bg,
         borderLeft: `1px solid ${colors.border}`,
         display: "flex",
@@ -64,6 +69,7 @@ export function RightPanel({
               color: tab === t.id ? colors.accent : colors.textMuted,
               border: "none",
               borderRadius: radius.pill,
+              cursor: "pointer",
             }}
           >
             {t.label}
@@ -79,7 +85,9 @@ export function RightPanel({
           color: colors.text,
         }}
       >
-        {tab === "properties" ? <PropertiesPanel node={selected} /> : null}
+        {tab === "properties" ? (
+          <PropertiesPanel node={selected} onChange={onChange} />
+        ) : null}
         {tab === "effects" ? (
           <Hint>
             {selected
@@ -89,17 +97,15 @@ export function RightPanel({
         ) : null}
         {tab === "ai" ? (
           <Hint>
-            Local-only AI panel: Ask → Preview → Apply → Edit → Undo. Wired
-            in Phase 1.
+            Switch to <b>Image</b> mode for the local AI Assist workflow
+            (Ask → Preview → Apply → Edit → Undo).
           </Hint>
         ) : null}
         {tab === "export" ? (
-          <ExportPanel onRequestExport={onRequestExport} />
+          <ExportTabContent onRequestExport={onRequestExport} />
         ) : null}
         {tab === "inspect" ? (
-          <Hint>
-            Read-only inspect: tokens, computed bounds, accessibility checks.
-          </Hint>
+          <InspectPanel node={selected} />
         ) : null}
         {tab === "history" ? (
           <Hint>
@@ -112,52 +118,209 @@ export function RightPanel({
   );
 }
 
-function PropertiesPanel({ node }: { node: NodeInfo | null }): JSX.Element {
+function PropertiesPanel({
+  node,
+  onChange,
+}: {
+  node: NodeInfo | null;
+  onChange?: (changes: UpdateNodeProps) => void;
+}): JSX.Element {
+  // We keep a local draft of the editable name so the user can type
+  // freely without firing a bridge call on every keystroke. The
+  // commit fires on blur / Enter, matching the LeftPanel rename UX.
+  const [draftName, setDraftName] = useState("");
+  useEffect(() => {
+    setDraftName(node?.name ?? "");
+  }, [node?.id, node?.name]);
+
   if (!node) {
     return <Hint>Nothing selected. Click a layer to edit its properties.</Hint>;
   }
+  const commitName = (): void => {
+    if (draftName.trim().length > 0 && draftName !== node.name) {
+      onChange?.({ name: draftName.trim() });
+    } else {
+      setDraftName(node.name);
+    }
+  };
   return (
-    <dl
+    <div
       style={{
-        margin: 0,
-        display: "grid",
-        gridTemplateColumns: "auto 1fr",
-        rowGap: spacing.xs,
-        columnGap: spacing.md,
+        display: "flex",
+        flexDirection: "column",
+        gap: spacing.sm,
       }}
     >
-      <dt style={dtStyle}>id</dt>
-      <dd style={ddStyle}>{node.id}</dd>
-      <dt style={dtStyle}>type</dt>
-      <dd style={ddStyle}>{node.nodeType}</dd>
-      <dt style={dtStyle}>name</dt>
-      <dd style={ddStyle}>{node.name}</dd>
-      <dt style={dtStyle}>parent</dt>
-      <dd style={ddStyle}>{node.parentId ?? "—"}</dd>
-      <dt style={dtStyle}>children</dt>
-      <dd style={ddStyle}>{node.children.length}</dd>
-      <dt style={dtStyle}>visible</dt>
-      <dd style={ddStyle}>{node.visible ? "yes" : "no"}</dd>
-      <dt style={dtStyle}>locked</dt>
-      <dd style={ddStyle}>{node.locked ? "yes" : "no"}</dd>
-    </dl>
+      <Field label="Name">
+        <input
+          value={draftName}
+          onChange={(e) => setDraftName(e.target.value)}
+          onBlur={commitName}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") (e.target as HTMLInputElement).blur();
+            if (e.key === "Escape") setDraftName(node.name);
+          }}
+          style={textInputStyle}
+        />
+      </Field>
+      <Row>
+        <ToggleField
+          label="Visible"
+          value={node.visible}
+          onChange={(v) => onChange?.({ visible: v })}
+        />
+        <ToggleField
+          label="Locked"
+          value={node.locked}
+          onChange={(v) => onChange?.({ locked: v })}
+        />
+      </Row>
+      <hr style={hrStyle} />
+      <Field label="Type">
+        <Readonly>{node.nodeType}</Readonly>
+      </Field>
+      <Field label="ID">
+        <Readonly mono>{node.id}</Readonly>
+      </Field>
+      <Field label="Parent">
+        <Readonly mono>{node.parentId ?? "—"}</Readonly>
+      </Field>
+      <Field label="Children">
+        <Readonly>{node.children.length}</Readonly>
+      </Field>
+    </div>
   );
 }
 
-const dtStyle: React.CSSProperties = {
-  color: colors.textMuted,
-  fontWeight: 500,
-  margin: 0,
-};
-const ddStyle: React.CSSProperties = {
+function InspectPanel({ node }: { node: NodeInfo | null }): JSX.Element {
+  if (!node) {
+    return <Hint>Select a layer to inspect its computed state.</Hint>;
+  }
+  return (
+    <pre
+      style={{
+        background: colors.bgSoft,
+        padding: spacing.sm,
+        margin: 0,
+        borderRadius: radius.card / 2,
+        fontSize: 11,
+        lineHeight: 1.5,
+        whiteSpace: "pre-wrap",
+        wordBreak: "break-all",
+        color: colors.textMuted,
+      }}
+    >
+      {JSON.stringify(node, null, 2)}
+    </pre>
+  );
+}
+
+function Field({
+  label,
+  children,
+}: {
+  label: string;
+  children: React.ReactNode;
+}): JSX.Element {
+  return (
+    <label
+      style={{
+        display: "flex",
+        flexDirection: "column",
+        gap: 4,
+        fontSize: 11,
+        color: colors.textMuted,
+      }}
+    >
+      <span>{label}</span>
+      {children}
+    </label>
+  );
+}
+
+function Row({ children }: { children: React.ReactNode }): JSX.Element {
+  return (
+    <div
+      style={{
+        display: "flex",
+        gap: spacing.md,
+      }}
+    >
+      {children}
+    </div>
+  );
+}
+
+function ToggleField({
+  label,
+  value,
+  onChange,
+}: {
+  label: string;
+  value: boolean;
+  onChange: (v: boolean) => void;
+}): JSX.Element {
+  return (
+    <label
+      style={{
+        display: "flex",
+        alignItems: "center",
+        gap: 6,
+        fontSize: 12,
+        color: colors.text,
+        cursor: "pointer",
+      }}
+    >
+      <input
+        type="checkbox"
+        checked={value}
+        onChange={(e) => onChange(e.target.checked)}
+      />
+      {label}
+    </label>
+  );
+}
+
+function Readonly({
+  children,
+  mono = false,
+}: {
+  children: React.ReactNode;
+  mono?: boolean;
+}): JSX.Element {
+  return (
+    <span
+      style={{
+        color: colors.text,
+        fontSize: 12,
+        fontFamily: mono
+          ? 'ui-monospace, SFMono-Regular, Menlo, "Roboto Mono", monospace'
+          : undefined,
+        wordBreak: "break-all",
+      }}
+    >
+      {children}
+    </span>
+  );
+}
+
+const textInputStyle: React.CSSProperties = {
+  background: colors.bgSoft,
   color: colors.text,
-  margin: 0,
-  fontFamily:
-    'ui-monospace, SFMono-Regular, Menlo, "Roboto Mono", monospace',
-  wordBreak: "break-all",
+  border: `1px solid ${colors.border}`,
+  borderRadius: 4,
+  padding: "4px 6px",
+  fontSize: 12,
+  fontFamily: "inherit",
 };
 
-function ExportPanel({
+const hrStyle: React.CSSProperties = {
+  border: "none",
+  borderTop: `1px solid ${colors.border}`,
+  margin: `${spacing.xs}px 0`,
+};
+
+function ExportTabContent({
   onRequestExport,
 }: {
   onRequestExport: () => void;
@@ -165,8 +328,8 @@ function ExportPanel({
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: spacing.sm }}>
       <Hint>
-        SVG / PNG output flows through the Rust export crate — no network
-        round trip.
+        Switch to <b>Export</b> mode for the full export panel with PNG /
+        SVG / PDF / WebP / JPEG presets and batch export.
       </Hint>
       <button
         type="button"

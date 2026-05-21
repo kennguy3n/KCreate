@@ -23,6 +23,7 @@ pub mod readback;
 pub mod scene;
 pub mod spatial;
 pub mod surface;
+pub mod text;
 pub mod viewport;
 
 use std::sync::atomic::{AtomicU64, Ordering};

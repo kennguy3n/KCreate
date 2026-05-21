@@ -70,6 +70,24 @@ pub const MIGRATIONS: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS idx_nodes_parent ON nodes(parent_id);",
     "CREATE INDEX IF NOT EXISTS idx_operations_timestamp ON operations(timestamp);",
     "CREATE INDEX IF NOT EXISTS idx_assets_hash ON assets(hash);",
+    // 7: brand kits (one row per kit; id == BrandKit::id)
+    r"CREATE TABLE IF NOT EXISTS brand_kits (
+        id TEXT PRIMARY KEY,
+        data TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    );",
+    // 8: design tokens (single-row by convention; key='current')
+    r"CREATE TABLE IF NOT EXISTS design_tokens (
+        key TEXT PRIMARY KEY,
+        data TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    );",
+    // 9: export presets (one row per preset; id == ExportPreset::id)
+    r"CREATE TABLE IF NOT EXISTS export_presets (
+        id TEXT PRIMARY KEY,
+        data TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    );",
 ];
 
 /// Schema-level errors. Wraps `rusqlite::Error` and adds a couple of
@@ -205,6 +223,9 @@ mod tests {
             "_migrations",
             "ai_actions",
             "assets",
+            "brand_kits",
+            "design_tokens",
+            "export_presets",
             "nodes",
             "operations",
             "project_meta",

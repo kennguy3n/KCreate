@@ -8,7 +8,10 @@
 //! `width * height * 4` bytes, exactly matching what an Electron
 //! `<canvas>` expects via `ImageData`.
 
-use tiny_skia::{FillRule, Paint, Path, PathBuilder, Pixmap, Stroke as SkStroke, Transform};
+use tiny_skia::{
+    BlendMode, FillRule, IntSize, Paint, Path, PathBuilder, Pixmap, PixmapPaint, PixmapRef,
+    Stroke as SkStroke, Transform,
+};
 
 use crate::display_list::{DisplayCommand, DisplayList};
 use crate::geometry::{Color, PathCommand, Point2, Style};
@@ -107,6 +110,29 @@ impl CpuBackend {
                         self.draw_path(&pb, *style, transform);
                     }
                 }
+                DisplayCommand::DrawImage {
+                    rect,
+                    pixels_width,
+                    pixels_height,
+                    pixels,
+                } => {
+                    self.draw_image(
+                        *rect,
+                        *pixels_width,
+                        *pixels_height,
+                        pixels.as_slice(),
+                        transform,
+                    );
+                }
+                DisplayCommand::DrawText {
+                    origin,
+                    text,
+                    font_family,
+                    font_size,
+                    style,
+                } => {
+                    self.draw_text(*origin, text, font_family, *font_size, *style, transform);
+                }
             }
         }
 
@@ -118,6 +144,122 @@ impl CpuBackend {
         // `ImageData`/`putImageData` expects straight alpha — unmultiply.
         unpremultiply_in_place(out);
         Ok(())
+    }
+
+    /// Blit an RGBA8 buffer into `dst_rect` (local space; world
+    /// transform from the viewport is applied via `transform`).
+    ///
+    /// The pixel buffer is straight alpha; tiny-skia expects
+    /// premultiplied, so we premultiply on the fly into a scratch
+    /// pixmap before drawing. Premultiplied is the canonical wire
+    /// format for compositors and matches what `draw_pixmap`
+    /// consumes.
+    fn draw_image(
+        &mut self,
+        dst_rect: crate::geometry::Rect,
+        pixels_width: u32,
+        pixels_height: u32,
+        pixels: &[u8],
+        transform: Transform,
+    ) {
+        if !dst_rect.width.is_finite()
+            || !dst_rect.height.is_finite()
+            || dst_rect.width <= 0.0
+            || dst_rect.height <= 0.0
+            || pixels_width == 0
+            || pixels_height == 0
+        {
+            return;
+        }
+        let expected_len = (pixels_width as usize)
+            .saturating_mul(pixels_height as usize)
+            .saturating_mul(4);
+        if pixels.len() != expected_len {
+            return; // corrupt buffer
+        }
+        let Some(size) = IntSize::from_wh(pixels_width, pixels_height) else {
+            return;
+        };
+        // Premultiply into a scratch buffer because the renderer's
+        // wire-format contract is straight alpha but tiny-skia stores
+        // premultiplied.
+        let mut premul = Vec::with_capacity(pixels.len());
+        for px in pixels.chunks_exact(4) {
+            let a = px[3];
+            let af = f32::from(a) / 255.0;
+            premul.push((f32::from(px[0]) * af) as u8);
+            premul.push((f32::from(px[1]) * af) as u8);
+            premul.push((f32::from(px[2]) * af) as u8);
+            premul.push(a);
+        }
+        let Some(src) = PixmapRef::from_bytes(&premul, size.width(), size.height()) else {
+            return;
+        };
+        let sx = dst_rect.width / pixels_width as f32;
+        let sy = dst_rect.height / pixels_height as f32;
+        let placement = Transform::from_scale(sx, sy).post_translate(dst_rect.x, dst_rect.y);
+        let final_transform = placement.post_concat(transform);
+        let paint = PixmapPaint {
+            opacity: 1.0,
+            blend_mode: BlendMode::SourceOver,
+            quality: tiny_skia::FilterQuality::Bilinear,
+        };
+        self.pixmap
+            .draw_pixmap(0, 0, src, &paint, final_transform, None);
+    }
+
+    /// Paint shaped text. Resolves the font through `kcreate_text`
+    /// and rasterizes glyph outlines via tiny-skia. The first found
+    /// outline font is used; bitmap-only fonts fall back to the
+    /// closest sans-serif.
+    fn draw_text(
+        &mut self,
+        origin: Point2,
+        text: &str,
+        font_family: &str,
+        font_size: f32,
+        style: Style,
+        transform: Transform,
+    ) {
+        if text.is_empty() || !font_size.is_finite() || font_size <= 0.0 {
+            return;
+        }
+        let Some(commands) = crate::text::shape_to_path_commands(text, font_family, font_size)
+        else {
+            return;
+        };
+        let mut pb = PathBuilder::new();
+        for c in &commands {
+            match c {
+                PathCommand::MoveTo(p) => pb.move_to(p.x + origin.x, p.y + origin.y),
+                PathCommand::LineTo(p) => pb.line_to(p.x + origin.x, p.y + origin.y),
+                PathCommand::QuadTo { ctrl, end } => pb.quad_to(
+                    ctrl.x + origin.x,
+                    ctrl.y + origin.y,
+                    end.x + origin.x,
+                    end.y + origin.y,
+                ),
+                PathCommand::CubicTo { c1, c2, end } => pb.cubic_to(
+                    c1.x + origin.x,
+                    c1.y + origin.y,
+                    c2.x + origin.x,
+                    c2.y + origin.y,
+                    end.x + origin.x,
+                    end.y + origin.y,
+                ),
+                PathCommand::Close => pb.close(),
+            }
+        }
+        if let Some(path) = pb.finish() {
+            // Default to a solid fill if the caller didn't supply one
+            // — text is meaningless without color.
+            let style = if style.fill.is_none() && style.stroke.is_none() {
+                Style::filled(Color::rgba(0.0, 0.0, 0.0, 1.0))
+            } else {
+                style
+            };
+            self.draw_path(&path, style, transform);
+        }
     }
 
     fn draw_path(&mut self, path: &Path, style: Style, transform: Transform) {

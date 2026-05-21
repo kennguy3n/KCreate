@@ -1,0 +1,27 @@
+[package]
+name = "kcreate_raster"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Tile engine, raster layers, masks, and adjustments for KCreate"
+
+[lints]
+workspace = true
+
+[dependencies]
+image.workspace = true
+rayon.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+kcreate_core = { path = "../kcreate_core" }
+
+[dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "tile_ops"
+harness = false

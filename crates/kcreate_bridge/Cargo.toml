@@ -21,6 +21,17 @@ kcreate_renderer = { path = "../kcreate_renderer" }
 kcreate_core = { path = "../kcreate_core" }
 kcreate_storage = { path = "../kcreate_storage" }
 kcreate_export = { path = "../kcreate_export" }
+kcreate_vector = { path = "../kcreate_vector" }
+kcreate_ai = { path = "../kcreate_ai" }
+# The MCP server is the *only* component of the editing-side runtime
+# that links a networking library (`tiny_http`). Per AGENTS.md the
+# editing path must stay network-free, so this is optional and gated
+# on the `mcp` feature flag; default builds don't pull `tiny_http`.
+# The Electron host enables `mcp` explicitly when packaging the
+# release binary, and `crates/kcreate_tests/tests/local_first.rs`
+# checks the default-feature dep tree.
+kcreate_mcp = { path = "../kcreate_mcp", optional = true }
+kcreate_text = { path = "../kcreate_text" }
 napi.workspace = true
 napi-derive.workspace = true
 parking_lot.workspace = true
@@ -30,6 +41,8 @@ serde.workspace = true
 serde_json.workspace = true
 uuid = { workspace = true, features = ["v4", "serde"] }
 chrono = { workspace = true, features = ["serde"] }
+base64.workspace = true
+image.workspace = true
 
 [build-dependencies]
 napi-build.workspace = true
@@ -39,9 +52,12 @@ napi-build.workspace = true
 # mutate it must run serialized.
 serial_test = "3"
 tempfile.workspace = true
-kcreate_vector = { path = "../kcreate_vector" }
 
 [features]
 default = []
 # Mirror the renderer's CPU-only feature flag for headless N-API builds.
 cpu-only = ["kcreate_renderer/cpu-only"]
+# Enable the local MCP sidecar (loopback-only HTTP JSON-RPC). Off by
+# default so the editing path stays free of networking libraries; the
+# Electron host enables this when packaging the release binary.
+mcp = ["dep:kcreate_mcp"]

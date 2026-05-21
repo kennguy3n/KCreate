@@ -6,12 +6,24 @@ import { contextBridge, ipcRenderer } from "electron";
 
 import type {
   AcquiredFrame,
+  AiBridge,
+  BrandKit,
+  BrandKitBridge,
+  CanvasBridge,
   CreateNodeProps,
+  DesignTokens,
+  DesignTokensBridge,
   DocumentBridge,
   DocumentStatus,
   ExportBridge,
+  ExportFormat,
+  ExportPreset,
+  ExportPresetBridge,
   FrameInfo,
+  JpegExportOptions,
+  McpBridge,
   NodeInfo,
+  PdfExportOptions,
   PngExportOptions,
   ProjectInfo,
   RendererBridge,
@@ -22,6 +34,7 @@ import type {
   ScratchCleanupResult,
   SvgExportOptions,
   UpdateNodeProps,
+  WebpExportOptions,
 } from "../../shared/scene";
 
 type FrameInfoSnake = {
@@ -304,11 +317,220 @@ const exportApi: ExportBridge = {
       JSON.stringify(options),
     )) as number;
   },
+  async pdf(outputPath: string, options: PdfExportOptions): Promise<number> {
+    return (await ipcRenderer.invoke(
+      "kcreate/export/pdf",
+      outputPath,
+      JSON.stringify(options),
+    )) as number;
+  },
+  async webp(outputPath: string, options: WebpExportOptions): Promise<number> {
+    return (await ipcRenderer.invoke(
+      "kcreate/export/webp",
+      outputPath,
+      JSON.stringify(options),
+    )) as number;
+  },
+  async jpeg(outputPath: string, options: JpegExportOptions): Promise<number> {
+    return (await ipcRenderer.invoke(
+      "kcreate/export/jpeg",
+      outputPath,
+      JSON.stringify(options),
+    )) as number;
+  },
+};
+
+const canvas: CanvasBridge = {
+  async syncScene(): Promise<void> {
+    await ipcRenderer.invoke("kcreate/document/syncScene");
+  },
+  async hitTest(
+    screenX: number,
+    screenY: number,
+    panX: number,
+    panY: number,
+    zoom: number,
+  ): Promise<string | null> {
+    return (await ipcRenderer.invoke(
+      "kcreate/canvas/hitTest",
+      screenX,
+      screenY,
+      panX,
+      panY,
+      zoom,
+    )) as string | null;
+  },
+  async setSelection(nodeIds: string[]): Promise<void> {
+    await ipcRenderer.invoke("kcreate/document/setSelection", nodeIds);
+  },
+  async getSelection(): Promise<string[]> {
+    return (await ipcRenderer.invoke(
+      "kcreate/document/getSelection",
+    )) as string[];
+  },
+  async clearSelection(): Promise<void> {
+    await ipcRenderer.invoke("kcreate/document/clearSelection");
+  },
+  async importImage(
+    parentId: string | null,
+    filePath: string,
+  ): Promise<string> {
+    return (await ipcRenderer.invoke(
+      "kcreate/document/importImage",
+      parentId,
+      filePath,
+    )) as string;
+  },
+  async createRect(parentId, x, y, w, h): Promise<string> {
+    return (await ipcRenderer.invoke(
+      "kcreate/canvas/createRect",
+      parentId,
+      x,
+      y,
+      w,
+      h,
+    )) as string;
+  },
+  async createEllipse(parentId, cx, cy, rx, ry): Promise<string> {
+    return (await ipcRenderer.invoke(
+      "kcreate/canvas/createEllipse",
+      parentId,
+      cx,
+      cy,
+      rx,
+      ry,
+    )) as string;
+  },
+  async createLine(parentId, x1, y1, x2, y2): Promise<string> {
+    return (await ipcRenderer.invoke(
+      "kcreate/canvas/createLine",
+      parentId,
+      x1,
+      y1,
+      x2,
+      y2,
+    )) as string;
+  },
+  async createText(
+    parentId,
+    x,
+    y,
+    text,
+    fontFamily,
+    fontSize,
+  ): Promise<string> {
+    return (await ipcRenderer.invoke(
+      "kcreate/canvas/createText",
+      parentId,
+      x,
+      y,
+      text,
+      fontFamily,
+      fontSize,
+    )) as string;
+  },
+  async moveNode(nodeId: string, dx: number, dy: number): Promise<void> {
+    await ipcRenderer.invoke("kcreate/canvas/moveNode", nodeId, dx, dy);
+  },
+};
+
+const ai: AiBridge = {
+  async removeBackground(nodeId: string): Promise<string> {
+    return (await ipcRenderer.invoke(
+      "kcreate/ai/removeBackground",
+      nodeId,
+    )) as string;
+  },
+  async getActionLog(): Promise<string> {
+    return (await ipcRenderer.invoke("kcreate/ai/getActionLog")) as string;
+  },
+};
+
+const mcp: McpBridge = {
+  async start(): Promise<number> {
+    return (await ipcRenderer.invoke("kcreate/mcp/start")) as number;
+  },
+  async stop(): Promise<void> {
+    await ipcRenderer.invoke("kcreate/mcp/stop");
+  },
+  async isRunning(): Promise<boolean> {
+    return (await ipcRenderer.invoke("kcreate/mcp/isRunning")) as boolean;
+  },
+};
+
+const designTokens: DesignTokensBridge = {
+  async get(): Promise<DesignTokens> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/designTokens/get",
+    )) as string;
+    return JSON.parse(raw) as DesignTokens;
+  },
+  async set(tokens: DesignTokens): Promise<void> {
+    await ipcRenderer.invoke(
+      "kcreate/designTokens/set",
+      JSON.stringify(tokens),
+    );
+  },
+};
+
+const brandKit: BrandKitBridge = {
+  async create(name: string): Promise<string> {
+    return (await ipcRenderer.invoke(
+      "kcreate/brandKit/create",
+      name,
+    )) as string;
+  },
+  async update(kit: BrandKit): Promise<void> {
+    await ipcRenderer.invoke("kcreate/brandKit/update", JSON.stringify(kit));
+  },
+  async list(): Promise<BrandKit[]> {
+    const raw = (await ipcRenderer.invoke("kcreate/brandKit/list")) as string;
+    return JSON.parse(raw) as BrandKit[];
+  },
+  async delete(kitId: string): Promise<boolean> {
+    return (await ipcRenderer.invoke(
+      "kcreate/brandKit/delete",
+      kitId,
+    )) as boolean;
+  },
+};
+
+const exportPreset: ExportPresetBridge = {
+  async create(
+    name: string,
+    format: ExportFormat,
+    scale: number,
+  ): Promise<string> {
+    return (await ipcRenderer.invoke(
+      "kcreate/exportPreset/create",
+      name,
+      format,
+      scale,
+    )) as string;
+  },
+  async list(): Promise<ExportPreset[]> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/exportPreset/list",
+    )) as string;
+    return JSON.parse(raw) as ExportPreset[];
+  },
+  async delete(presetId: string): Promise<boolean> {
+    return (await ipcRenderer.invoke(
+      "kcreate/exportPreset/delete",
+      presetId,
+    )) as boolean;
+  },
 };
 
 contextBridge.exposeInMainWorld("kcreate", {
   renderer,
   document,
+  canvas,
+  ai,
+  mcp,
   runtime,
   export: exportApi,
+  designTokens,
+  brandKit,
+  exportPreset,
 });

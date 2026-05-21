@@ -346,7 +346,7 @@ When detected (or explicitly enabled in `RuntimeConfig`):
                            │ AI Action request
                            ▼
                 ┌────────────────────┐
-                │  AI Task Router    │  (in kcreate_ai, future)
+                │  AI Task Router    │  (in kcreate_ai)
                 └─────┬──────────────┘
                       │ chooses model pack
         ┌─────────────┼──────────────────┐
@@ -372,12 +372,13 @@ When detected (or explicitly enabled in `RuntimeConfig`):
 
 ### MCP server
 
-`kcreate_mcp` (Phase 1+) exposes a permissioned local-loopback MCP
-server. Initial tools:
+`kcreate_mcp` exposes a permissioned local-loopback MCP server
+(loopback-only HTTP JSON-RPC via `tiny_http`, disabled by default).
+Initial tools:
 
 1. `list_artboards` — return artboard names + ids.
 2. `create_node(parent_id, node_type, props)` — create a layer.
-3. `export_artboard(id, format, path)` — export to file.
+3. `export_artboard(id, format, path)` — export to file (SVG today).
 
 Permission model: every tool call surfaces a dialog the first time it
 is invoked from a new client; the user can grant once / always / deny.
@@ -421,18 +422,18 @@ crates/
 ├── kcreate_bridge/      # N-API cdylib (renderer + document + export IPC)    [EXISTS]
 ├── kcreate_vector/      # Path math, boolean ops, SVG import/export, R-tree
 ├── kcreate_storage/     # SQLite + content-addressed blob store + .kstudio I/O
-└── kcreate_export/      # PNG and SVG export pipelines
+├── kcreate_export/      # PNG / SVG / PDF / WebP / JPEG export + batch
+├── kcreate_raster/      # tile engine, masks, adjustment layers              [EXISTS]
+├── kcreate_text/        # font discovery (fontdb), shaping (rustybuzz)       [EXISTS]
+├── kcreate_ai/          # task router, threshold-v0 bg-removal               [EXISTS]
+└── kcreate_mcp/         # local-loopback MCP server (3 tools)                [EXISTS]
 ```
 
-Planned (Phase 1+):
+Planned (Phase 2+):
 
 ```
 crates/
-├── kcreate_raster/      # tile engine, filters, masks
-├── kcreate_text/        # font discovery, shaping, glyph atlas
 ├── kcreate_layout/      # page layout, master pages, flow
-├── kcreate_ai/          # task router, model manager
-├── kcreate_mcp/         # local MCP server
 └── kcreate_audit/       # operation log persistence, AI action audit
 ```
 
@@ -451,12 +452,14 @@ crates/
 | Blob store (BLAKE3)          | Built    | `crates/kcreate_storage/src/blobs.rs`                |
 | Path + boolean + SVG         | Built    | `crates/kcreate_vector/src/*`                        |
 | Spatial index                | Built    | `crates/kcreate_vector/src/spatial_index.rs`         |
-| PNG / SVG export             | Built    | `crates/kcreate_export/src/{png,svg}.rs`             |
+| PNG / SVG / PDF / WebP / JPEG export | Built | `crates/kcreate_export/src/{png,svg,pdf,webp,jpeg,batch}.rs` |
 | Home / Editor pages          | Built    | `apps/desktop/renderer/src/pages/*`                  |
-| AI sidecar                   | Planned  | `crates/kcreate_ai/*` (Phase 1)                      |
-| MCP server                   | Planned  | `crates/kcreate_mcp/*` (Phase 1)                     |
-| Raster tile engine           | Planned  | `crates/kcreate_raster/*` (Phase 1)                  |
-| Text shaping                 | Planned  | `crates/kcreate_text/*` (Phase 1)                    |
+| Document→Scene translator    | Built    | `crates/kcreate_bridge/src/scene_sync.rs`            |
+| Canvas hit testing           | Built    | `crates/kcreate_bridge/src/hit_test.rs`              |
+| Local AI bg removal          | Built    | `crates/kcreate_ai/src/{bg_remove,task_router,action_log}.rs` |
+| Loopback MCP server          | Built    | `crates/kcreate_mcp/src/{server,tools}.rs`           |
+| Raster tile engine           | Built    | `crates/kcreate_raster/src/{tile,layer}.rs`          |
+| Text shaping + outlining     | Built    | `crates/kcreate_text/src/{font_db,shaper,outline}.rs`|
 | Layout engine                | Planned  | `crates/kcreate_layout/*` (Phase 2)                  |
 
 ### Recommended Rust dependencies

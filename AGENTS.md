@@ -22,8 +22,15 @@ KCreate/
 │   │                        index (rstar)
 │   ├── kcreate_storage/     SQLite (rusqlite, bundled), content-addressed
 │   │                        BLAKE3 blob store, .kstudio/ project I/O
-│   ├── kcreate_export/      PNG (scene → image crate) and SVG (document
-│   │                        graph → kcreate_vector::svg_export) export
+│   ├── kcreate_export/      PNG / SVG / PDF / WebP / JPEG export, plus
+│   │                        batch export driver
+│   ├── kcreate_raster/      tile engine, masks, adjustment layers (Phase 1)
+│   ├── kcreate_text/        font discovery (fontdb), shaping (rustybuzz),
+│   │                        outline walking (ttf-parser) → renderer paths
+│   ├── kcreate_ai/          local AI task router, action log, threshold-v0
+│   │                        background removal (ONNX u2net swap-in for Phase 1)
+│   ├── kcreate_mcp/         loopback-only MCP server (tiny_http JSON-RPC,
+│   │                        3 tools: list_artboards, create_node, export_artboard)
 │   └── kcreate_tests/       cross-crate integration tests (no library
 │                            surface — see tests/ subdir)
 ├── apps/
@@ -104,8 +111,14 @@ pnpm lint
 | Document graph operations                | `crates/kcreate_core/src/document.rs`              |
 | Undo/redo or operation provenance        | `crates/kcreate_core/src/operation.rs`             |
 | Add a vector path operation              | `crates/kcreate_vector/`                           |
+| Add a text layer / font feature          | `crates/kcreate_text/`                             |
+| Raster tile / mask / adjustment          | `crates/kcreate_raster/`                           |
 | Persistent storage (SQLite/blobs)        | `crates/kcreate_storage/`                          |
-| Export pipeline (PNG/SVG/PDF/WebP)       | `crates/kcreate_export/`                           |
+| Export pipeline (PNG/SVG/PDF/WebP/JPEG)  | `crates/kcreate_export/`                           |
+| Document→Scene translation               | `crates/kcreate_bridge/src/scene_sync.rs`          |
+| Canvas hit testing                       | `crates/kcreate_bridge/src/hit_test.rs`            |
+| AI action / task router                  | `crates/kcreate_ai/`                               |
+| MCP tool                                 | `crates/kcreate_mcp/src/tools.rs`                  |
 | Add a new N-API export (renderer)        | thin wrapper in `kcreate_bridge/src/lib.rs`, logic in `state.rs`     |
 | Add a new N-API export (document/project)| thin wrapper in `kcreate_bridge/src/lib.rs`, logic in `document.rs`  |
 | Add an IPC channel                       | `apps/desktop/main/src/main.ts` + `preload/src/preload.ts` + `shared/scene.ts` |

@@ -133,10 +133,12 @@ KCreate/
 │   ├── kcreate_bridge/           N-API bindings (cdylib)
 │   ├── kcreate_vector/           Path math, boolean ops, SVG, R-tree
 │   ├── kcreate_storage/          SQLite + BLAKE3 blobs + .kstudio I/O
-│   └── kcreate_export/           PNG + SVG export
-├── tests/integration/            Cross-crate integration tests
-├── docs/
-│   └── PLAN.md                   Phase 0 plan (consolidated history)
+│   ├── kcreate_export/           PNG / SVG / PDF / WebP / JPEG export + batch
+│   ├── kcreate_raster/           Tile engine, masks, adjustment layers
+│   ├── kcreate_text/             Font discovery (fontdb) + shaping (rustybuzz)
+│   ├── kcreate_ai/               Local AI task router + threshold-v0 bg-removal
+│   ├── kcreate_mcp/              Loopback-only MCP server (3 tools)
+│   └── kcreate_tests/            Cross-crate integration tests
 ├── PROPOSAL.md                   Product specification
 ├── ARCHITECTURE.md               Technical architecture
 ├── PROGRESS.md                   Phase tracking

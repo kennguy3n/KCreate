@@ -19,6 +19,7 @@ import type {
   RuntimeBridge,
   RuntimeStatus,
   Scene,
+  ScratchCleanupResult,
   SvgExportOptions,
   UpdateNodeProps,
 } from "../../shared/scene";
@@ -280,6 +281,11 @@ const runtime: RuntimeBridge = {
   },
   async tempDir(): Promise<string> {
     return (await ipcRenderer.invoke("kcreate/runtime/tempDir")) as string;
+  },
+  async cleanupScratchProjects(): Promise<ScratchCleanupResult> {
+    return (await ipcRenderer.invoke(
+      "kcreate/runtime/cleanupScratchProjects",
+    )) as ScratchCleanupResult;
   },
 };
 

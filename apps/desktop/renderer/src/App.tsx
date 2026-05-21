@@ -68,6 +68,23 @@ async function openScratchProject(): Promise<ProjectInfo> {
   // backslash before `Temp`) instead of the intended `C:\Temp`, so
   // project creation failed on Windows. The host's `os.tmpdir()` is
   // correct on every platform and survives sandboxing.
+  //
+  // Before creating the new scratch project, ask the host to sweep
+  // stale `scratch-*.kstudio` directories from the temp dir. Without
+  // this, every Home→Editor transition leaks one directory — harmless
+  // on macOS/Linux (their temp reapers eventually clean up) but
+  // accumulates indefinitely on Windows. The cleanup IPC is
+  // intentionally fire-and-forget: we don't gate project creation on
+  // it because a locked file (e.g. another KCreate instance holding
+  // the SQLite file open) shouldn't block the user from opening their
+  // new scratch.
+  void window.kcreate.runtime
+    .cleanupScratchProjects()
+    .catch(() => {
+      // Errors are already counted inside the host sweep; the renderer
+      // doesn't surface them — best-effort housekeeping must never
+      // block the user-facing path.
+    });
   const name = `scratch-${Date.now()}`;
   const dir = await window.kcreate.runtime.tempDir();
   return window.kcreate.document.createProject(name, dir);

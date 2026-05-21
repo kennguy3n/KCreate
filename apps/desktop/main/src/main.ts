@@ -3,10 +3,81 @@
 // native addon.
 
 import { app, BrowserWindow, ipcMain } from "electron";
+import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 
 import { loadBridge, type Bridge } from "./bridge";
+
+/// Naming convention for scratch projects opened from the Home tile.
+/// Centralised here so the cleanup pass (`cleanupScratchProjects`) and
+/// the renderer's create-scratch path (`App.tsx`) agree on what is
+/// considered "scratch" and therefore safe to delete.
+const SCRATCH_PREFIX = "scratch-";
+const SCRATCH_SUFFIX = ".kstudio";
+
+/// Best-effort cleanup of stale scratch projects in the OS temp dir.
+///
+/// A "scratch" project is a `.kstudio` directory created from the Home
+/// tile click path; the user never named or saved it, so we own its
+/// lifecycle. Phase 0 leaks one of these per Home→Editor transition
+/// (issue ANALYSIS_0005), which is harmless on macOS/Linux (their temp
+/// reapers eventually sweep them) but accumulates indefinitely on
+/// Windows. Sweeping here, in the host process where `fs.rm` and the
+/// authoritative `os.tmpdir()` live, keeps the cleanup safely scoped:
+/// the renderer never gets a path-walk capability.
+///
+/// Safety constraints, deliberately strict:
+///   * Only direct children of `os.tmpdir()` are inspected — we never
+///     recurse.
+///   * Each candidate name must start with `SCRATCH_PREFIX` AND end
+///     with `SCRATCH_SUFFIX`.
+///   * Each candidate must resolve (via `path.join`) to a path whose
+///     parent is `os.tmpdir()` after `path.resolve` — defence against
+///     a future bug introducing `..` segments.
+///   * Each candidate must be a directory.
+///   * Per-entry errors are swallowed and counted, never thrown, so
+///     one locked file on Windows doesn't poison the whole sweep.
+async function cleanupScratchProjects(): Promise<{
+  scanned: number;
+  removed: number;
+  errors: number;
+}> {
+  const base = os.tmpdir();
+  let scanned = 0;
+  let removed = 0;
+  let errors = 0;
+  let entries: import("node:fs").Dirent[];
+  try {
+    entries = await fs.readdir(base, { withFileTypes: true });
+  } catch {
+    return { scanned, removed, errors: 1 };
+  }
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const name = entry.name;
+    if (!name.startsWith(SCRATCH_PREFIX) || !name.endsWith(SCRATCH_SUFFIX)) {
+      continue;
+    }
+    scanned += 1;
+    const candidate = path.resolve(base, name);
+    // Refuse to delete anything whose resolved parent isn't the temp
+    // dir itself. This is a paranoia check; readdir won't return
+    // entries outside `base`, but symlink-into-temp + traversal would
+    // be a credible future regression.
+    if (path.dirname(candidate) !== path.resolve(base)) {
+      errors += 1;
+      continue;
+    }
+    try {
+      await fs.rm(candidate, { recursive: true, force: true });
+      removed += 1;
+    } catch {
+      errors += 1;
+    }
+  }
+  return { scanned, removed, errors };
+}
 
 // The native bridge is loaded eagerly in `app.whenReady`, BEFORE any IPC
 // handlers are registered. This is the architecturally correct moment:
@@ -159,6 +230,13 @@ function registerIpcHandlers(): void {
   // rendering one. Surfacing it through the runtime bridge lets the
   // renderer stay agnostic of POSIX vs Windows path conventions.
   ipcMain.handle("kcreate/runtime/tempDir", () => os.tmpdir());
+  // Sweep stale scratch projects (`scratch-*.kstudio` under
+  // `os.tmpdir()`). See `cleanupScratchProjects` for safety
+  // constraints — this is intentionally a zero-argument IPC so the
+  // renderer never picks the path/prefix.
+  ipcMain.handle("kcreate/runtime/cleanupScratchProjects", () =>
+    cleanupScratchProjects(),
+  );
 
   ipcMain.handle(
     "kcreate/export/svg",

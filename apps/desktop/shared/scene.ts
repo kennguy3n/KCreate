@@ -223,6 +223,16 @@ export interface DocumentBridge {
   status(): Promise<DocumentStatus | null>;
 }
 
+/** Result of a scratch-project cleanup sweep. */
+export interface ScratchCleanupResult {
+  /** Number of `scratch-*.kstudio` entries inspected. */
+  scanned: number;
+  /** Number of entries successfully removed. */
+  removed: number;
+  /** Number of entries that errored during inspection/removal. */
+  errors: number;
+}
+
 /** Runtime / device probe. */
 export interface RuntimeBridge {
   status(): Promise<RuntimeStatus>;
@@ -233,6 +243,15 @@ export interface RuntimeBridge {
    * value is stable for the lifetime of the process.
    */
   tempDir(): Promise<string>;
+  /**
+   * Best-effort sweep of stale `scratch-*.kstudio` projects in the OS
+   * temp directory. Owned by the host because (a) it needs filesystem
+   * access the renderer doesn't have, and (b) the prefix/suffix and
+   * base directory are fixed in host code to keep the API surface
+   * narrow (the renderer cannot ask the host to delete arbitrary
+   * paths). Never throws; reports per-entry errors via the result.
+   */
+  cleanupScratchProjects(): Promise<ScratchCleanupResult>;
 }
 
 /**

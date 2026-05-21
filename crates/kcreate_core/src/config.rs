@@ -150,7 +150,11 @@ impl RuntimeConfig {
     /// classification.
     #[must_use]
     pub fn detect() -> Self {
-        // sys-info reports kB on Linux/macOS; convert to MB.
+        // `sys_info::mem_info().total` is in kB on every platform we
+        // support (Linux, macOS, Windows) — the crate normalises the
+        // platform-specific source (sysinfo/GlobalMemoryStatusEx/
+        // sysctl) into a uniform kB-typed `MemInfo`. Divide by 1024 to
+        // get MB.
         let total_ram_mb = sys_info::mem_info().map_or(0, |m| m.total / 1024);
         let gpu_available = probe_gpu_available();
         let info = SystemInfo {

@@ -56,11 +56,20 @@ interface Viewport {
 
 const ZERO_VIEWPORT: Viewport = { panX: 0, panY: 0, zoom: 1 };
 
+function viewportEquals(a: Viewport, b: Viewport): boolean {
+  return a.panX === b.panX && a.panY === b.panY && a.zoom === b.zoom;
+}
+
 export function CanvasHost(props: CanvasHostProps): JSX.Element {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const ctxRef = useRef<CanvasRenderingContext2D | null>(null);
   const imageDataRef = useRef<ImageData | null>(null);
+  const imageDataDimsRef = useRef<{ w: number; h: number }>({ w: 0, h: 0 });
   const lastFrameIdRef = useRef<number>(0);
+  // Last viewport sent to the bridge. Used to short-circuit setViewport
+  // calls — the Rust side also dedupes internally, but skipping the IPC
+  // round-trip is strictly better for end-to-end latency.
+  const lastSentViewportRef = useRef<Viewport | null>(null);
   const sceneRef = useRef<Scene>(props.scene);
   const viewportRef = useRef<Viewport>(props.viewport ?? ZERO_VIEWPORT);
   const dprRef = useRef<number>(
@@ -72,6 +81,12 @@ export function CanvasHost(props: CanvasHostProps): JSX.Element {
   sceneRef.current = props.scene;
   viewportRef.current = props.viewport ?? ZERO_VIEWPORT;
 
+  // Init / rAF loop. This effect runs ONCE per component mount — its
+  // dependency array is empty. Width / height changes are funnelled
+  // through the `renderer.init(...)` call below (which is idempotent
+  // and resizes in place if the renderer already exists at a different
+  // size), so we never tear down the GPU device just because the host
+  // resized the canvas.
   useEffect(() => {
     const bridge = window.kcreate?.renderer;
     if (!bridge) {
@@ -94,13 +109,20 @@ export function CanvasHost(props: CanvasHostProps): JSX.Element {
     let cancelled = false;
     let rafHandle: number | null = null;
 
+    const ensureImageData = (w: number, h: number): void => {
+      const dims = imageDataDimsRef.current;
+      if (dims.w === w && dims.h === h && imageDataRef.current) return;
+      imageDataRef.current = ctx.createImageData(w, h);
+      imageDataDimsRef.current = { w, h };
+      canvas.width = w;
+      canvas.height = h;
+    };
+
     (async () => {
       const dpr = dprRef.current;
       const wPx = Math.max(1, Math.round(props.width * dpr));
       const hPx = Math.max(1, Math.round(props.height * dpr));
-      canvas.width = wPx;
-      canvas.height = hPx;
-      imageDataRef.current = ctx.createImageData(wPx, hPx);
+      ensureImageData(wPx, hPx);
 
       try {
         await bridge.init(wPx, hPx);
@@ -109,6 +131,7 @@ export function CanvasHost(props: CanvasHostProps): JSX.Element {
           viewportRef.current.panY,
           viewportRef.current.zoom,
         );
+        lastSentViewportRef.current = { ...viewportRef.current };
       } catch (err) {
         if (!cancelled) {
           setInitError(
@@ -121,21 +144,33 @@ export function CanvasHost(props: CanvasHostProps): JSX.Element {
       const tick = async (): Promise<void> => {
         if (cancelled) return;
         try {
-          // Sync viewport into the renderer every frame. The renderer
-          // ignores no-op changes (it compares old vs new values
-          // internally before invalidating).
+          // Only sync the viewport if the host actually changed it.
+          // Saves an IPC round trip per frame for the steady-state /
+          // static-viewport case. The Rust side also dedupes, but
+          // skipping the IPC round-trip avoids serializing / awaiting
+          // a no-op promise.
           const vp = viewportRef.current;
-          await bridge.setViewport(vp.panX, vp.panY, vp.zoom);
+          const last = lastSentViewportRef.current;
+          if (!last || !viewportEquals(last, vp)) {
+            await bridge.setViewport(vp.panX, vp.panY, vp.zoom);
+            lastSentViewportRef.current = { ...vp };
+          }
 
           const frameId = await bridge.render(sceneRef.current);
           if (frameId !== lastFrameIdRef.current) {
-            const buf = await bridge.getFrame();
-            const info = await bridge.frameInfo();
-            if (buf && info && imageDataRef.current) {
-              const expected = info.width * info.height * 4;
-              if (buf.byteLength === expected) {
-                imageDataRef.current.data.set(buf);
-                ctx.putImageData(imageDataRef.current, 0, 0);
+            // Atomically get bytes + dimensions in a single IPC round
+            // trip. `acquireFrame` guarantees the buffer length matches
+            // the reported width × height × 4 even if a resize is in
+            // flight on the host side, eliminating the tearing window
+            // that existed when we called `getFrame()` and
+            // `frameInfo()` separately.
+            const frame = await bridge.acquireFrame();
+            if (frame) {
+              const expected = frame.width * frame.height * 4;
+              if (frame.bytes.byteLength === expected) {
+                ensureImageData(frame.width, frame.height);
+                imageDataRef.current!.data.set(frame.bytes);
+                ctx.putImageData(imageDataRef.current!, 0, 0);
               }
             }
             lastFrameIdRef.current = frameId;
@@ -166,21 +201,28 @@ export function CanvasHost(props: CanvasHostProps): JSX.Element {
       }
     });
 
+    // IMPORTANT: we deliberately do NOT call `bridge.shutdown()` here.
+    // The Rust renderer is a process-wide singleton owned by the main
+    // process; the Electron main process tears it down in its
+    // `will-quit` handler. Calling shutdown from a component
+    // teardown would (a) destroy the GPU device for any other
+    // CanvasHost instance that happens to be mounted, and (b) race
+    // with React StrictMode's intentional mount → unmount → mount
+    // cycle, causing the renderer to be re-initialized on every
+    // mount even though `init` is itself idempotent.
     return () => {
       cancelled = true;
       if (rafHandle !== null) cancelAnimationFrame(rafHandle);
-      void bridge.shutdown().catch(() => {
-        /* best-effort */
-      });
     };
-    // We intentionally do NOT depend on props.scene/viewport: those are
-    // tracked via refs so the rAF loop sees current values without
-    // re-subscribing. The effect lifecycle owns init/shutdown.
+    // Empty deps: this effect owns the lifecycle of the rAF loop. Size
+    // changes are handled by the separate resize effect below.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [props.width, props.height]);
+  }, []);
 
-  // Handle resize separately from init/shutdown to avoid tearing down
-  // the renderer on every viewport change.
+  // Resize: width/height changes drive `bridge.resize(...)`, which is a
+  // no-op on the GPU device (only the offscreen surface and presenter
+  // buffers are reallocated) and matches the canvas backing store. The
+  // rAF loop above picks up the new ImageData on its next frame.
   useEffect(() => {
     const bridge = window.kcreate?.renderer;
     if (!bridge) return;
@@ -188,13 +230,14 @@ export function CanvasHost(props: CanvasHostProps): JSX.Element {
     const wPx = Math.max(1, Math.round(props.width * dpr));
     const hPx = Math.max(1, Math.round(props.height * dpr));
     void bridge.resize(wPx, hPx).catch(() => {
-      /* swallow during teardown */
+      /* renderer may not be initialized yet; init effect will catch up */
     });
     const canvas = canvasRef.current;
     if (canvas && ctxRef.current) {
       canvas.width = wPx;
       canvas.height = hPx;
       imageDataRef.current = ctxRef.current.createImageData(wPx, hPx);
+      imageDataDimsRef.current = { w: wPx, h: hPx };
     }
   }, [props.width, props.height]);
 

@@ -7,11 +7,21 @@ import * as path from "node:path";
 
 import { loadBridge, type Bridge } from "./bridge";
 
+// The native bridge is loaded eagerly in `app.whenReady`, BEFORE any IPC
+// handlers are registered. This is the architecturally correct moment:
+// `process.dlopen` is a synchronous, one-shot operation, and loading it
+// inside the IPC handlers (the old `getBridge()` lazy pattern) opened a
+// race where two concurrent IPC events could both observe `bridge ===
+// null` and call `loadBridge()` twice. Eager loading at startup
+// eliminates the race entirely and also surfaces native-load failures
+// at app startup rather than on the first user interaction.
 let bridge: Bridge | null = null;
 
-function getBridge(): Bridge {
+function requireBridge(): Bridge {
   if (!bridge) {
-    bridge = loadBridge();
+    throw new Error(
+      "kcreate native bridge accessed before app initialization completed",
+    );
   }
   return bridge;
 }
@@ -45,19 +55,20 @@ function createWindow(): BrowserWindow {
 
 function registerIpcHandlers(): void {
   ipcMain.handle("kcreate/renderer/init", (_e, width: number, height: number) =>
-    getBridge().rendererInit(width, height),
+    requireBridge().rendererInit(width, height),
   );
   ipcMain.handle("kcreate/renderer/shutdown", () => {
-    getBridge().rendererShutdown();
+    requireBridge().rendererShutdown();
   });
   ipcMain.handle(
     "kcreate/renderer/resize",
-    (_e, width: number, height: number) => getBridge().rendererResize(width, height),
+    (_e, width: number, height: number) =>
+      requireBridge().rendererResize(width, height),
   );
   ipcMain.handle(
     "kcreate/renderer/setViewport",
     (_e, panX: number, panY: number, zoom: number) =>
-      getBridge().rendererSetViewport(panX, panY, zoom),
+      requireBridge().rendererSetViewport(panX, panY, zoom),
   );
   ipcMain.handle(
     "kcreate/renderer/invalidate",
@@ -65,7 +76,7 @@ function registerIpcHandlers(): void {
       _e,
       region: { x: number; y: number; width: number; height: number } | null,
     ) =>
-      getBridge().rendererInvalidate(
+      requireBridge().rendererInvalidate(
         region?.x ?? null,
         region?.y ?? null,
         region?.width ?? null,
@@ -73,17 +84,23 @@ function registerIpcHandlers(): void {
       ),
   );
   ipcMain.handle("kcreate/renderer/render", (_e, sceneJson: string) =>
-    getBridge().rendererRender(sceneJson),
+    requireBridge().rendererRender(sceneJson),
   );
   ipcMain.handle("kcreate/renderer/getFrame", () =>
-    getBridge().rendererGetFrame(),
+    requireBridge().rendererGetFrame(),
   );
   ipcMain.handle("kcreate/renderer/frameInfo", () =>
-    getBridge().rendererFrameInfo(),
+    requireBridge().rendererFrameInfo(),
+  );
+  ipcMain.handle("kcreate/renderer/acquireFrame", () =>
+    requireBridge().rendererAcquireFrame(),
   );
 }
 
 void app.whenReady().then(() => {
+  // Load the native bridge synchronously, before any window/IPC traffic
+  // can hit `requireBridge()`. See the comment above `let bridge`.
+  bridge = loadBridge();
   registerIpcHandlers();
   createWindow();
 

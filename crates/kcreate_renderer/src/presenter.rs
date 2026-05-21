@@ -11,8 +11,6 @@
 //! being rendered, and keeps allocations stable across frames (the
 //! buffers only grow on resize).
 
-use std::sync::atomic::{AtomicU64, Ordering};
-
 use parking_lot::{RwLock, RwLockReadGuard};
 
 /// Sequence number assigned to each published frame.
@@ -36,7 +34,6 @@ impl Slot {
 
 #[derive(Debug)]
 pub struct Presenter {
-    width: AtomicU64, // packed as u32; use u64 to fit width<<32 | height
     inner: RwLock<Inner>,
 }
 
@@ -48,6 +45,10 @@ struct Inner {
     // `acquire_staging` and returned to `idle` on `publish`.
     width: u32,
     height: u32,
+    /// True once any frame has been published. Tracked explicitly so
+    /// [`Self::latest`] doesn't have to scan the buffer to decide
+    /// whether a frame is available.
+    has_published: bool,
 }
 
 impl Presenter {
@@ -57,30 +58,27 @@ impl Presenter {
             idle: Slot::empty(width, height),
             width,
             height,
+            has_published: false,
         };
         Self {
-            width: AtomicU64::new(pack_size(width, height)),
             inner: RwLock::new(inner),
         }
     }
 
     pub fn resize(&self, width: u32, height: u32) {
-        {
-            let mut g = self.inner.write();
-            g.width = width;
-            g.height = height;
-            let needed = (width as usize) * (height as usize) * 4;
-            g.published.bytes.resize(needed, 0);
-            g.idle.bytes.resize(needed, 0);
-        }
-        self.width
-            .store(pack_size(width, height), Ordering::Release);
+        let mut g = self.inner.write();
+        g.width = width;
+        g.height = height;
+        let needed = (width as usize) * (height as usize) * 4;
+        g.published.bytes.resize(needed, 0);
+        g.idle.bytes.resize(needed, 0);
     }
 
     /// Acquire a buffer to render into. The renderer writes RGBA8 pixels
-    /// into the returned Vec then calls [`Self::publish`].
+    /// into the returned Vec then calls [`Self::publish`] (or
+    /// [`Self::recycle_staging`] if rendering failed).
     pub fn acquire_staging(&self, width: u32, height: u32) -> Vec<u8> {
-        let buf = {
+        let mut buf = {
             let mut g = self.inner.write();
             if g.width != width || g.height != height {
                 g.width = width;
@@ -89,7 +87,6 @@ impl Presenter {
             std::mem::take(&mut g.idle.bytes)
         };
         let needed = (width as usize) * (height as usize) * 4;
-        let mut buf = buf;
         buf.clear();
         buf.reserve(needed);
         buf
@@ -100,12 +97,24 @@ impl Presenter {
         let mut g = self.inner.write();
         let old_published = std::mem::replace(&mut g.published, Slot { id, bytes });
         g.idle = old_published;
+        g.has_published = true;
+    }
+
+    /// Return a staging buffer to the idle pool without publishing it.
+    /// Called when `render()` errors so the allocation is not lost.
+    pub fn recycle_staging(&self, bytes: Vec<u8>) {
+        let mut g = self.inner.write();
+        // Keep whichever buffer has more capacity; drop the other to
+        // bound memory growth across repeated render failures.
+        if bytes.capacity() > g.idle.bytes.capacity() {
+            g.idle.bytes = bytes;
+        }
     }
 
     /// Borrow the latest published frame.
     pub fn latest(&self) -> Option<FrameLease<'_>> {
         let guard = self.inner.read();
-        if guard.published.id.0 == 0 && guard.published.bytes.iter().all(|&b| b == 0) {
+        if !guard.has_published {
             return None;
         }
         Some(FrameLease { guard })
@@ -116,25 +125,18 @@ impl Presenter {
     /// lookup, matching the amendment's `get_frame_pixels` semantics.)
     pub fn lease(&self, frame: FrameId) -> Option<FrameLease<'_>> {
         let guard = self.inner.read();
-        if guard.published.id == frame {
+        if guard.has_published && guard.published.id == frame {
             Some(FrameLease { guard })
         } else {
             None
         }
     }
 
-    /// The dimensions reported by the most recent resize/publish.
+    /// The dimensions of the current staging/published buffers.
     pub fn size(&self) -> (u32, u32) {
-        unpack_size(self.width.load(Ordering::Acquire))
+        let g = self.inner.read();
+        (g.width, g.height)
     }
-}
-
-fn pack_size(w: u32, h: u32) -> u64 {
-    (u64::from(w) << 32) | u64::from(h)
-}
-
-const fn unpack_size(v: u64) -> (u32, u32) {
-    ((v >> 32) as u32, v as u32)
 }
 
 /// Read-only borrow of the latest frame's pixels.
@@ -210,5 +212,33 @@ mod tests {
     fn latest_returns_none_before_any_publish() {
         let p = Presenter::new(4, 4);
         assert!(p.latest().is_none());
+    }
+
+    #[test]
+    fn all_zero_first_frame_is_still_visible() {
+        // Regression: previously `latest()` did a byte-scan and reported
+        // "no frame" when the first published frame was all-zero. Now we
+        // track `has_published` explicitly so a black frame is a valid
+        // frame.
+        let p = Presenter::new(4, 4);
+        let mut buf = p.acquire_staging(4, 4);
+        buf.resize(4 * 4 * 4, 0);
+        p.publish(FrameId(1), buf);
+        let lease = p.latest().expect("frame should be visible even if black");
+        assert_eq!(lease.frame_id(), FrameId(1));
+        assert!(lease.pixels().iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn recycle_staging_after_failure_preserves_capacity() {
+        let p = Presenter::new(4, 4);
+        let mut buf = p.acquire_staging(8, 8);
+        buf.reserve(8 * 8 * 4);
+        let cap = buf.capacity();
+        assert!(cap >= 8 * 8 * 4);
+        p.recycle_staging(buf);
+        // Next acquire should reuse that capacity.
+        let buf2 = p.acquire_staging(8, 8);
+        assert!(buf2.capacity() >= cap);
     }
 }

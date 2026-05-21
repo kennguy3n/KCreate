@@ -15,6 +15,13 @@ type FrameInfoSnake = {
   byte_length: number;
 };
 
+type AcquiredFrameSnake = {
+  frame_id: number;
+  width: number;
+  height: number;
+  bytes: Uint8Array;
+};
+
 export interface Bridge {
   rendererInit(
     width: number,
@@ -32,6 +39,7 @@ export interface Bridge {
   rendererRender(sceneJson: string): number;
   rendererGetFrame(): Uint8Array | null;
   rendererFrameInfo(): FrameInfoSnake | null;
+  rendererAcquireFrame(): AcquiredFrameSnake | null;
 }
 
 function bridgeBinaryPath(): string {

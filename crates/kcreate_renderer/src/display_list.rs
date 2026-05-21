@@ -31,17 +31,24 @@ pub enum DisplayCommand {
 
 /// Ordered list of commands derived from a `Scene` snapshot.
 ///
-/// The display list is keyed by [`Pipeline`]'s scene-version counter, so
-/// successive frames that share the same scene can reuse the previous list
-/// directly.
+/// The display list is viewport-independent: it contains every visible
+/// scene object with per-command world bounds attached. The rasterizer
+/// scissors against the visible viewport at draw time so a pan does not
+/// invalidate the cache.
 #[derive(Debug, Clone, Default)]
 pub struct DisplayList {
     pub commands: Vec<DisplayCommand>,
     /// World-space bounds of every command in this list. Used for early
     /// scissor culling against the visible viewport.
     pub world_bounds: Option<Rect>,
-    /// Stable id of the object each command came from (parallel array).
+    /// Stable id of the object each command came from (parallel array,
+    /// `None` for non-object-derived commands like [`DisplayCommand::Clear`]).
     pub origins: Vec<Option<ObjectId>>,
+    /// Per-command world bounds (parallel array). `None` for commands
+    /// without spatial extent (e.g. [`DisplayCommand::Clear`]). The
+    /// rasterizer skips a command when its bounds are entirely outside
+    /// the visible viewport rect.
+    pub cmd_bounds: Vec<Option<Rect>>,
 }
 
 impl DisplayList {
@@ -55,12 +62,18 @@ impl DisplayList {
         self.world_bounds = Some(self.world_bounds.map_or(bounds, |b| b.union(&bounds)));
         self.commands.push(cmd);
         self.origins.push(Some(object.id));
+        self.cmd_bounds.push(Some(bounds));
     }
 
     /// Push a non-object-derived command (e.g. background clear).
-    pub fn push_raw(&mut self, cmd: DisplayCommand) {
+    /// `bounds` is `None` for commands without spatial extent.
+    pub fn push_raw(&mut self, cmd: DisplayCommand, bounds: Option<Rect>) {
+        if let Some(b) = bounds {
+            self.world_bounds = Some(self.world_bounds.map_or(b, |w| w.union(&b)));
+        }
         self.commands.push(cmd);
         self.origins.push(None);
+        self.cmd_bounds.push(bounds);
     }
 
     pub const fn len(&self) -> usize {

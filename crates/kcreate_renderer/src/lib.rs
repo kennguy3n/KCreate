@@ -171,18 +171,35 @@ impl RenderContext {
         Ok(())
     }
 
-    /// Update the viewport (pan/zoom). This does not allocate a new display
-    /// list — pan/zoom is applied as a uniform transform on the cached list.
+    /// Update the viewport (pan/zoom). No-op if the new pan/zoom match
+    /// the current values — in particular, the dirty region is NOT
+    /// extended in that case, so callers can safely call `set_viewport`
+    /// every frame without defeating the dirty-region optimization.
     pub fn set_viewport(&self, pan: Vec2, zoom: f32) {
-        {
+        let changed = {
             let mut vp = self.viewport.lock();
-            vp.set_pan(pan);
-            vp.set_zoom(zoom);
+            let cur_pan = vp.pan;
+            let cur_zoom = vp.zoom;
+            // Exact equality is exactly the right semantics here:
+            // we are checking "did the host hand us the identical
+            // numeric values they handed us last time?" — a strictly
+            // monotonic predicate for cache invalidation. Approximate
+            // comparison would either over-invalidate (e.g.
+            // tolerating a non-zero pan delta) or miss real updates.
+            #[allow(clippy::float_cmp)]
+            let changed = cur_pan != pan || cur_zoom != zoom;
+            if changed {
+                vp.set_pan(pan);
+                vp.set_zoom(zoom);
+            }
+            changed
+        };
+        if changed {
+            // Pan/zoom does not invalidate the display list — but it does
+            // mean we need to repaint the whole framebuffer.
+            *self.dirty_region.lock() =
+                Some(Rect::new(0.0, 0.0, self.width as f32, self.height as f32));
         }
-        // Pan/zoom does not invalidate the display list — but it does mean
-        // we need to repaint the whole framebuffer.
-        *self.dirty_region.lock() =
-            Some(Rect::new(0.0, 0.0, self.width as f32, self.height as f32));
     }
 
     /// Mark a region of the canvas as needing redraw.
@@ -200,8 +217,12 @@ impl RenderContext {
     /// Render the given scene to the offscreen target and publish a new frame.
     ///
     /// Returns the [`FrameId`] of the published frame. If no work was needed
-    /// (no dirty region and no viewport change), the previous frame's id is
-    /// returned and no GPU/CPU work occurs.
+    /// (no dirty region and a frame has previously been published), the
+    /// previous frame's id is returned and no GPU/CPU work occurs.
+    ///
+    /// If the backend errors mid-render, the dirty region is restored so a
+    /// subsequent retry still knows to repaint the affected area. The
+    /// frame id counter is not incremented on failure.
     pub fn render_frame(&self, scene: &Scene) -> Result<FrameId> {
         let dirty = {
             let mut guard = self.dirty_region.lock();
@@ -209,28 +230,45 @@ impl RenderContext {
         };
         let viewport = *self.viewport.lock();
 
+        if dirty.is_none() && self.sequence.load(Ordering::Acquire) > 0 {
+            // Nothing dirty — return the previous frame without rebuilding
+            // the display list. (The cache would be a hit anyway, but
+            // skipping the call avoids hashing the scene every rAF tick.)
+            return Ok(FrameId(self.sequence.load(Ordering::Acquire)));
+        }
+
         let display_list = {
             let mut pipeline = self.pipeline.lock();
             pipeline.build_display_list(scene, &viewport, (self.width, self.height))
         };
 
-        if dirty.is_none() && self.sequence.load(Ordering::Acquire) > 0 {
-            // Nothing dirty — return the previous frame.
-            return Ok(FrameId(self.sequence.load(Ordering::Acquire)));
-        }
-
         let frame_id = FrameId(self.next_frame_id.fetch_add(1, Ordering::AcqRel));
         let mut staging = self.presenter.acquire_staging(self.width, self.height);
-        self.backend.lock().render(
+        let render_result = self.backend.lock().render(
             scene,
             &viewport,
             &display_list,
             &mut staging,
             (self.width, self.height),
-        )?;
-        self.presenter.publish(frame_id, staging);
-        self.sequence.store(frame_id.0, Ordering::Release);
-        Ok(frame_id)
+        );
+        match render_result {
+            Ok(()) => {
+                self.presenter.publish(frame_id, staging);
+                self.sequence.store(frame_id.0, Ordering::Release);
+                Ok(frame_id)
+            }
+            Err(e) => {
+                // Restore the dirty region so a future render still knows
+                // to repaint the affected area. Union with any region
+                // that has accrued since we took it.
+                if let Some(rect) = dirty {
+                    let mut g = self.dirty_region.lock();
+                    *g = Some(g.map_or(rect, |existing| existing.union(&rect)));
+                }
+                self.presenter.recycle_staging(staging);
+                Err(e)
+            }
+        }
     }
 
     /// Borrow the pixels for the most recently published frame.

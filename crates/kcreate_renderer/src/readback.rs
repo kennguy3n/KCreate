@@ -5,16 +5,22 @@
 //! handles the row-padding round-trip and unpads the bytes into a
 //! tightly-packed RGBA8 buffer that downstream consumers can use
 //! directly (no row-stride math needed in Electron).
+//!
+//! The caller passes in the staging buffer (owned by
+//! [`crate::surface::OffscreenSurface`]) so allocations are amortized
+//! across frames — the buffer is recreated only on resize.
 
 use crate::gpu::bytes_per_row_aligned;
 use crate::{RendererError, Result};
 
 /// Read `texture` (assumed `Rgba8Unorm`) into a tightly-packed RGBA8
-/// `Vec<u8>` of length `width * height * 4`.
+/// `Vec<u8>` of length `width * height * 4`. `staging` must have been
+/// sized for `bytes_per_row_aligned(width) * height` bytes.
 pub fn read_texture_to_vec(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     texture: &wgpu::Texture,
+    staging: &wgpu::Buffer,
     width: u32,
     height: u32,
     out: &mut Vec<u8>,
@@ -23,14 +29,13 @@ pub fn read_texture_to_vec(
         return Err(RendererError::InvalidDimensions { width, height });
     }
     let padded_bytes_per_row = bytes_per_row_aligned(width);
-    let buffer_size = u64::from(padded_bytes_per_row) * u64::from(height);
-
-    let staging = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("kcreate-readback-staging"),
-        size: buffer_size,
-        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-        mapped_at_creation: false,
-    });
+    let required = u64::from(padded_bytes_per_row) * u64::from(height);
+    if staging.size() < required {
+        return Err(RendererError::Wgpu(format!(
+            "readback staging buffer is {} bytes but {required} are required for {width}x{height}",
+            staging.size()
+        )));
+    }
 
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("kcreate-readback-encoder"),
@@ -43,7 +48,7 @@ pub fn read_texture_to_vec(
             aspect: wgpu::TextureAspect::All,
         },
         wgpu::TexelCopyBufferInfo {
-            buffer: &staging,
+            buffer: staging,
             layout: wgpu::TexelCopyBufferLayout {
                 offset: 0,
                 bytes_per_row: Some(padded_bytes_per_row),
@@ -59,7 +64,7 @@ pub fn read_texture_to_vec(
     queue.submit(std::iter::once(encoder.finish()));
 
     let (tx, rx) = std::sync::mpsc::channel::<std::result::Result<(), wgpu::BufferAsyncError>>();
-    let slice = staging.slice(..);
+    let slice = staging.slice(..required);
     slice.map_async(wgpu::MapMode::Read, move |result| {
         let _ = tx.send(result);
     });
@@ -68,27 +73,34 @@ pub fn read_texture_to_vec(
     // (in `wait` mode) until all submitted work + map callbacks fire.
     let _ = device.poll(wgpu::PollType::wait_indefinitely());
 
-    rx.recv()
+    let map_result = rx
+        .recv()
         .map_err(|e| RendererError::Wgpu(format!("readback channel closed: {e}")))?
-        .map_err(|e| RendererError::Wgpu(format!("buffer map failed: {e}")))?;
+        .map_err(|e| RendererError::Wgpu(format!("buffer map failed: {e}")));
 
-    // Drop the mapped view before unmap().
-    {
-        let view = slice.get_mapped_range();
-        let row_bytes = (width * 4) as usize;
-        out.clear();
-        out.reserve(row_bytes * height as usize);
-        if padded_bytes_per_row as usize == row_bytes {
-            out.extend_from_slice(&view);
-        } else {
-            for row in 0..height as usize {
-                let start = row * padded_bytes_per_row as usize;
-                out.extend_from_slice(&view[start..start + row_bytes]);
+    // Always unmap before returning, even on map failure, to leave the
+    // buffer in a reusable state for the next frame.
+    let result = match map_result {
+        Ok(()) => {
+            let view = slice.get_mapped_range();
+            let row_bytes = (width * 4) as usize;
+            out.clear();
+            out.reserve(row_bytes * height as usize);
+            if padded_bytes_per_row as usize == row_bytes {
+                out.extend_from_slice(&view[..row_bytes * height as usize]);
+            } else {
+                for row in 0..height as usize {
+                    let start = row * padded_bytes_per_row as usize;
+                    out.extend_from_slice(&view[start..start + row_bytes]);
+                }
             }
+            drop(view);
+            Ok(())
         }
-    }
+        Err(e) => Err(e),
+    };
     staging.unmap();
-    Ok(())
+    result
 }
 
 #[cfg(test)]
@@ -166,7 +178,14 @@ mod tests {
         );
         queue.submit(std::iter::empty());
         let mut out = Vec::new();
-        read_texture_to_vec(&device, &queue, &texture, w, h, &mut out).unwrap();
+        let padded = bytes_per_row_aligned(w);
+        let staging = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("test-readback"),
+            size: u64::from(padded) * u64::from(h),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        read_texture_to_vec(&device, &queue, &texture, &staging, w, h, &mut out).unwrap();
         assert_eq!(out.len(), (w * h * 4) as usize);
         assert_eq!(out, pixels);
     }

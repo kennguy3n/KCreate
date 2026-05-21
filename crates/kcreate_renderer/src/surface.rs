@@ -12,6 +12,12 @@ use crate::{RendererError, Result};
 pub struct OffscreenSurface {
     texture: wgpu::Texture,
     view: wgpu::TextureView,
+    /// Cached readback staging buffer. Sized to
+    /// `bytes_per_row_aligned(width) * height` and reused across frames —
+    /// recreated only when [`Self::resize`] changes the dimensions.
+    /// Avoids per-frame GPU buffer allocation (which is one of the
+    /// most expensive things you can do in wgpu).
+    readback_buffer: wgpu::Buffer,
     width: u32,
     height: u32,
 }
@@ -43,9 +49,11 @@ impl OffscreenSurface {
             view_formats: &[],
         });
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let readback_buffer = create_readback_buffer(device, width, height);
         Ok(Self {
             texture,
             view,
+            readback_buffer,
             width,
             height,
         })
@@ -130,15 +138,34 @@ impl OffscreenSurface {
         if width != self.width || height != self.height {
             return Err(RendererError::InvalidDimensions { width, height });
         }
-        crate::readback::read_texture_to_vec(device, queue, &self.texture, width, height, out)
+        crate::readback::read_texture_to_vec(
+            device,
+            queue,
+            &self.texture,
+            &self.readback_buffer,
+            width,
+            height,
+            out,
+        )
     }
 
-    /// Total VRAM footprint in bytes (texture + readback buffer alignment).
+    /// Total VRAM footprint in bytes (texture + cached readback buffer).
     pub fn approx_vram_bytes(&self) -> u64 {
         let padded = u64::from(bytes_per_row_aligned(self.width));
         let _ = nonzero_or_one(self.height);
         padded * u64::from(self.height) * 2
     }
+}
+
+fn create_readback_buffer(device: &wgpu::Device, width: u32, height: u32) -> wgpu::Buffer {
+    let padded_bytes_per_row = bytes_per_row_aligned(width);
+    let size = u64::from(padded_bytes_per_row) * u64::from(height);
+    device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("kcreate-readback-staging"),
+        size,
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    })
 }
 
 #[cfg(test)]

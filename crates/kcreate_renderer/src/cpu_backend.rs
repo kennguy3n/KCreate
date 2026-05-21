@@ -54,27 +54,45 @@ impl CpuBackend {
             -viewport.pan.y * viewport.zoom,
         );
 
-        for cmd in &display_list.commands {
+        // Per-frame scissor culling: visible scene rect lives in world
+        // coordinates; commands whose world bounds don't intersect it can
+        // be skipped. The display list itself is viewport-independent.
+        let visible = viewport.visible_scene_rect((w, h));
+
+        for (cmd, bounds) in display_list
+            .commands
+            .iter()
+            .zip(display_list.cmd_bounds.iter())
+        {
+            if let Some(b) = bounds {
+                if !visible.intersects(b) {
+                    continue;
+                }
+            }
             match cmd {
                 DisplayCommand::Clear => {
                     self.pixmap.fill(scene.clear_color.to_tiny_skia());
                 }
                 DisplayCommand::FillRect { rect, style } => {
-                    let pb = path_for_rect(*rect);
-                    self.draw_path(&pb, *style, transform);
+                    if let Some(pb) = path_for_rect(*rect) {
+                        self.draw_path(&pb, *style, transform);
+                    }
                 }
                 DisplayCommand::FillCircle {
                     center,
                     radius,
                     style,
                 } => {
-                    let pb = path_for_circle(*center, *radius);
-                    self.draw_path(&pb, *style, transform);
+                    if let Some(pb) = path_for_circle(*center, *radius) {
+                        self.draw_path(&pb, *style, transform);
+                    }
                 }
                 DisplayCommand::FillLine { start, end, style } => {
                     // Lines are stroked, not filled — pretend any "fill"
                     // request maps to a hairline stroke.
-                    let pb = path_for_line(*start, *end);
+                    let Some(pb) = path_for_line(*start, *end) else {
+                        continue;
+                    };
                     let stroke_style = if style.stroke.is_some() {
                         *style
                     } else if let Some(c) = style.fill {
@@ -85,8 +103,9 @@ impl CpuBackend {
                     self.draw_path(&pb, stroke_style, transform);
                 }
                 DisplayCommand::FillPath { commands, style } => {
-                    let pb = path_for_commands(commands);
-                    self.draw_path(&pb, *style, transform);
+                    if let Some(pb) = path_for_commands(commands) {
+                        self.draw_path(&pb, *style, transform);
+                    }
                 }
             }
         }
@@ -127,30 +146,52 @@ impl CpuBackend {
     }
 }
 
-fn path_for_rect(r: crate::geometry::Rect) -> Path {
+// All `path_for_*` helpers return `Option<Path>` because `tiny_skia`'s
+// `PathBuilder::finish` returns `None` for degenerate geometry (zero-size
+// rects, zero-radius circles, zero-length lines, paths containing
+// NaN/Inf, etc.). Returning `None` lets the caller skip the command
+// instead of panicking — which is the correct response for a renderer
+// that must stay alive in the face of bad inputs from the host.
+fn path_for_rect(r: crate::geometry::Rect) -> Option<Path> {
+    if r.is_empty() || !r.width.is_finite() || !r.height.is_finite() {
+        return None;
+    }
     let mut pb = PathBuilder::new();
     pb.move_to(r.x, r.y);
     pb.line_to(r.max_x(), r.y);
     pb.line_to(r.max_x(), r.max_y());
     pb.line_to(r.x, r.max_y());
     pb.close();
-    pb.finish().expect("rect path")
+    pb.finish()
 }
 
-fn path_for_circle(center: Point2, radius: f32) -> Path {
+fn path_for_circle(center: Point2, radius: f32) -> Option<Path> {
+    if !(radius.is_finite() && radius > 0.0 && center.x.is_finite() && center.y.is_finite()) {
+        return None;
+    }
     let mut pb = PathBuilder::new();
     pb.push_circle(center.x, center.y, radius);
-    pb.finish().expect("circle path")
+    pb.finish()
 }
 
-fn path_for_line(start: Point2, end: Point2) -> Path {
+fn path_for_line(start: Point2, end: Point2) -> Option<Path> {
+    if !(start.x.is_finite() && start.y.is_finite() && end.x.is_finite() && end.y.is_finite()) {
+        return None;
+    }
+    if (start.x - end.x).abs() < f32::EPSILON && (start.y - end.y).abs() < f32::EPSILON {
+        // Zero-length line — tiny-skia rejects, and there's nothing to draw.
+        return None;
+    }
     let mut pb = PathBuilder::new();
     pb.move_to(start.x, start.y);
     pb.line_to(end.x, end.y);
-    pb.finish().expect("line path")
+    pb.finish()
 }
 
-fn path_for_commands(commands: &[PathCommand]) -> Path {
+fn path_for_commands(commands: &[PathCommand]) -> Option<Path> {
+    if commands.is_empty() {
+        return None;
+    }
     let mut pb = PathBuilder::new();
     for c in commands {
         match c {
@@ -163,13 +204,7 @@ fn path_for_commands(commands: &[PathCommand]) -> Path {
             PathCommand::Close => pb.close(),
         }
     }
-    pb.finish().unwrap_or_else(|| {
-        // Empty path — return a single move-to so tiny-skia accepts it
-        // (no-op for drawing, but means downstream code never panics).
-        let mut pb = PathBuilder::new();
-        pb.move_to(0.0, 0.0);
-        pb.finish().expect("fallback path")
-    })
+    pb.finish()
 }
 
 /// tiny-skia stores premultiplied RGBA. The renderer's contract is
@@ -203,11 +238,15 @@ mod tests {
         let mut backend = CpuBackend::new(32, 32);
         let scene = Scene::new(Color::rgba(0.0, 0.0, 0.0, 1.0));
         let mut list = DisplayList::new();
-        list.push_raw(DisplayCommand::Clear);
-        list.push_raw(DisplayCommand::FillRect {
-            rect: Rect::new(8.0, 8.0, 8.0, 8.0),
-            style: Style::filled(Color::rgba(0.0, 1.0, 0.0, 1.0)),
-        });
+        let rect = Rect::new(8.0, 8.0, 8.0, 8.0);
+        list.push_raw(DisplayCommand::Clear, None);
+        list.push_raw(
+            DisplayCommand::FillRect {
+                rect,
+                style: Style::filled(Color::rgba(0.0, 1.0, 0.0, 1.0)),
+            },
+            Some(rect),
+        );
         let mut out = Vec::new();
         backend
             .render(
@@ -231,12 +270,22 @@ mod tests {
         let mut backend = CpuBackend::new(32, 32);
         let scene = Scene::new(Color::rgba(0.0, 0.0, 0.0, 1.0));
         let mut list = DisplayList::new();
-        list.push_raw(DisplayCommand::Clear);
-        list.push_raw(DisplayCommand::FillLine {
-            start: Point2::new(0.0, 16.0),
-            end: Point2::new(32.0, 16.0),
-            style: Style::stroked(Stroke::new(Color::rgba(1.0, 1.0, 1.0, 1.0), 2.0)),
-        });
+        let start = Point2::new(0.0, 16.0);
+        let end = Point2::new(32.0, 16.0);
+        list.push_raw(DisplayCommand::Clear, None);
+        list.push_raw(
+            DisplayCommand::FillLine {
+                start,
+                end,
+                style: Style::stroked(Stroke::new(Color::rgba(1.0, 1.0, 1.0, 1.0), 2.0)),
+            },
+            Some(Rect::new(
+                start.x.min(end.x),
+                start.y.min(end.y) - 1.0,
+                (end.x - start.x).abs(),
+                ((end.y - start.y).abs()).max(2.0),
+            )),
+        );
         let mut out = Vec::new();
         backend
             .render(

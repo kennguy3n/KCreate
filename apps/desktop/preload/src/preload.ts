@@ -5,6 +5,7 @@
 import { contextBridge, ipcRenderer } from "electron";
 
 import type {
+  AcquiredFrame,
   FrameInfo,
   RendererBridge,
   RendererInfo,
@@ -16,6 +17,13 @@ type FrameInfoSnake = {
   width: number;
   height: number;
   byte_length: number;
+};
+
+type AcquiredFrameSnake = {
+  frame_id: number;
+  width: number;
+  height: number;
+  bytes: Uint8Array;
 };
 
 const renderer: RendererBridge = {
@@ -72,6 +80,27 @@ const renderer: RendererBridge = {
       width: info.width,
       height: info.height,
       byteLength: info.byte_length,
+    };
+  },
+  async acquireFrame(): Promise<AcquiredFrame | null> {
+    const frame = (await ipcRenderer.invoke(
+      "kcreate/renderer/acquireFrame",
+    )) as AcquiredFrameSnake | null;
+    if (!frame) return null;
+    // Node Buffer is a subclass of Uint8Array; tighten to plain
+    // Uint8Array so the renderer doesn't see Node-specific Buffer
+    // methods. Use the underlying ArrayBuffer with explicit byteOffset
+    // / byteLength so we don't copy.
+    const bytes = new Uint8Array(
+      frame.bytes.buffer,
+      frame.bytes.byteOffset,
+      frame.bytes.byteLength,
+    );
+    return {
+      frameId: frame.frame_id,
+      width: frame.width,
+      height: frame.height,
+      bytes,
     };
   },
 };

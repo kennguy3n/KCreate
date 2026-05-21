@@ -24,14 +24,15 @@ use napi::bindgen_prelude::{Buffer, Error as NapiError, Result as NapiResult, St
 use napi_derive::napi;
 
 use crate::state::{
-    BridgeError, RendererFrameInfo as CoreFrameInfo, RendererInfo as CoreRendererInfo,
+    AcquiredFrame as CoreAcquiredFrame, BridgeError, RendererFrameInfo as CoreFrameInfo,
+    RendererInfo as CoreRendererInfo,
 };
 
 // Taken by value so it can be passed directly to `Result::map_err`.
 #[allow(clippy::needless_pass_by_value)]
 fn map_err(e: BridgeError) -> NapiError {
     let status = match e {
-        BridgeError::NotInitialized | BridgeError::AlreadyInitialized => Status::InvalidArg,
+        BridgeError::NotInitialized => Status::InvalidArg,
         _ => Status::GenericFailure,
     };
     NapiError::new(status, format!("kcreate_bridge: {e}"))
@@ -151,6 +152,41 @@ impl From<CoreFrameInfo> for FrameInfo {
 #[napi]
 pub fn renderer_frame_info() -> NapiResult<Option<FrameInfo>> {
     state::get_frame_info()
+        .map(|opt| opt.map(Into::into))
+        .map_err(map_err)
+}
+
+/// Bytes + metadata for the latest published frame, atomically captured
+/// under the renderer lock.
+#[napi(object)]
+#[derive(Clone)]
+#[allow(missing_debug_implementations)] // `Buffer` from napi has no Debug impl.
+pub struct AcquiredFrame {
+    pub frame_id: u32,
+    pub width: u32,
+    pub height: u32,
+    pub bytes: Buffer,
+}
+
+impl From<CoreAcquiredFrame> for AcquiredFrame {
+    fn from(c: CoreAcquiredFrame) -> Self {
+        Self {
+            frame_id: c.frame_id as u32,
+            width: c.width,
+            height: c.height,
+            bytes: Buffer::from(c.bytes),
+        }
+    }
+}
+
+/// One-call replacement for `renderer_get_frame` + `renderer_frame_info`.
+///
+/// Returns `null` if no frame has been published yet, otherwise an
+/// `AcquiredFrame` whose `bytes`, `width`, `height`, and `frame_id`
+/// all describe the exact same frame (i.e. cannot tear across a resize).
+#[napi]
+pub fn renderer_acquire_frame() -> NapiResult<Option<AcquiredFrame>> {
+    state::acquire_frame()
         .map(|opt| opt.map(Into::into))
         .map_err(map_err)
 }

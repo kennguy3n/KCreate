@@ -226,16 +226,29 @@ export interface DocumentBridge {
 /** Runtime / device probe. */
 export interface RuntimeBridge {
   status(): Promise<RuntimeStatus>;
+  /**
+   * OS-appropriate temporary directory, resolved by the Electron main
+   * process via Node's `os.tmpdir()` so the renderer never has to
+   * hard-code paths (`/tmp` on POSIX, `%TEMP%` on Windows, etc.). The
+   * value is stable for the lifetime of the process.
+   */
+  tempDir(): Promise<string>;
 }
 
-/** Export pipeline. */
+/**
+ * Export pipeline.
+ *
+ * `svg` walks the document graph directly, so it can render a
+ * caller-specified node subset (`nodeIds` empty = whole document).
+ * `png` rasterises the live renderer scene; the renderer's id space
+ * (`u64`) is disjoint from the document graph's (`Uuid`), so
+ * per-node PNG export waits on the Phase 1 document→scene translator
+ * — the API surface omits a `nodeIds` parameter rather than accepting
+ * one it would silently ignore.
+ */
 export interface ExportBridge {
   svg(nodeIds: string[], options: SvgExportOptions): Promise<string>;
-  png(
-    nodeIds: string[],
-    outputPath: string,
-    options: PngExportOptions,
-  ): Promise<number>;
+  png(outputPath: string, options: PngExportOptions): Promise<number>;
 }
 
 declare global {

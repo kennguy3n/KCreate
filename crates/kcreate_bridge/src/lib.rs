@@ -283,18 +283,27 @@ pub struct RuntimeStatus {
     pub gpu_available: bool,
     pub gpu_name: Option<String>,
     pub platform: String,
-    pub total_ram_mb: u32,
+    /// Total system RAM, in megabytes. Carried over the N-API boundary
+    /// as `f64` because JS `number` (an IEEE-754 double) can faithfully
+    /// represent every integer up to 2⁵³ — i.e. ~9 PB worth of MB,
+    /// which covers any plausible hardware. Using `u32` would silently
+    /// cap at ~4 TB; `i64` would force the TS side into `BigInt` and
+    /// break `RuntimeStatus: { totalRamMb: number }`.
+    pub total_ram_mb: f64,
 }
 
 impl From<CoreRuntimeStatus> for RuntimeStatus {
-    #[allow(clippy::cast_possible_truncation)]
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "u64 → f64 is exact for values ≤ 2^53, which covers all realistic RAM sizes (2^53 MB ≈ 9 PB)"
+    )]
     fn from(c: CoreRuntimeStatus) -> Self {
         Self {
             device_tier: c.device_tier,
             gpu_available: c.gpu_available,
             gpu_name: c.gpu_name,
             platform: c.platform,
-            total_ram_mb: c.total_ram_mb.min(u64::from(u32::MAX)) as u32,
+            total_ram_mb: c.total_ram_mb as f64,
         }
     }
 }
@@ -468,19 +477,18 @@ pub fn export_svg(node_ids: Vec<String>, options_json: String) -> NapiResult<Str
     document::export_svg(&ids, &opts).map_err(map_doc_err)
 }
 
-/// Export the current scene to PNG at `output_path`. Returns the file
-/// size in bytes.
+/// Export the current renderer scene to PNG at `output_path`. Returns
+/// the file size in bytes.
+///
+/// Phase 0 deliberately omits a `node_ids` parameter: PNG export
+/// rasterises the live renderer scene (held by `crate::state`), whose
+/// id space is `u64`-keyed and disjoint from the document graph's
+/// `Uuid`s. Per-node PNG export will land in Phase 1 alongside the
+/// document→scene translator. SVG export, which walks the document
+/// graph directly, *does* accept node ids today.
 #[napi]
 #[allow(clippy::needless_pass_by_value)]
-pub fn export_png(
-    node_ids: Vec<String>,
-    output_path: String,
-    options_json: String,
-) -> NapiResult<u32> {
-    let ids: Vec<Uuid> = node_ids
-        .iter()
-        .map(|s| parse_uuid(s))
-        .collect::<NapiResult<_>>()?;
+pub fn export_png(output_path: String, options_json: String) -> NapiResult<u32> {
     let opts: CorePngRequest = serde_json::from_str(&options_json).map_err(|e| {
         NapiError::new(
             Status::InvalidArg,
@@ -488,6 +496,6 @@ pub fn export_png(
         )
     })?;
     let bytes =
-        document::export_png_file(&ids, &PathBuf::from(output_path), &opts).map_err(map_doc_err)?;
+        document::export_png_file(&PathBuf::from(output_path), &opts).map_err(map_doc_err)?;
     Ok(u32::try_from(bytes).unwrap_or(u32::MAX))
 }

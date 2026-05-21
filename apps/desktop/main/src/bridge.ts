@@ -101,11 +101,7 @@ export interface Bridge {
   documentStatus(): DocumentStatusSnake | null;
   runtimeStatus(): RuntimeStatusSnake;
   exportSvg(nodeIds: string[], optionsJson: string): string;
-  exportPng(
-    nodeIds: string[],
-    outputPath: string,
-    optionsJson: string,
-  ): number;
+  exportPng(outputPath: string, optionsJson: string): number;
 }
 
 function bridgeBinaryPath(): string {

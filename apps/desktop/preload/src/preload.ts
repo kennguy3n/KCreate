@@ -278,6 +278,9 @@ const runtime: RuntimeBridge = {
     )) as RuntimeStatusSnake;
     return runtimeFromSnake(raw);
   },
+  async tempDir(): Promise<string> {
+    return (await ipcRenderer.invoke("kcreate/runtime/tempDir")) as string;
+  },
 };
 
 const exportApi: ExportBridge = {
@@ -288,14 +291,9 @@ const exportApi: ExportBridge = {
       JSON.stringify(options),
     )) as string;
   },
-  async png(
-    nodeIds: string[],
-    outputPath: string,
-    options: PngExportOptions,
-  ): Promise<number> {
+  async png(outputPath: string, options: PngExportOptions): Promise<number> {
     return (await ipcRenderer.invoke(
       "kcreate/export/png",
-      nodeIds,
       outputPath,
       JSON.stringify(options),
     )) as number;

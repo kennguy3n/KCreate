@@ -3,6 +3,7 @@
 // native addon.
 
 import { app, BrowserWindow, ipcMain } from "electron";
+import * as os from "node:os";
 import * as path from "node:path";
 
 import { loadBridge, type Bridge } from "./bridge";
@@ -153,6 +154,11 @@ function registerIpcHandlers(): void {
   ipcMain.handle("kcreate/runtime/status", () =>
     requireBridge().runtimeStatus(),
   );
+  // The OS temp dir is owned by the host (Node `os.tmpdir()`), not by
+  // the Rust bridge — it's a process-environment concern, not a
+  // rendering one. Surfacing it through the runtime bridge lets the
+  // renderer stay agnostic of POSIX vs Windows path conventions.
+  ipcMain.handle("kcreate/runtime/tempDir", () => os.tmpdir());
 
   ipcMain.handle(
     "kcreate/export/svg",
@@ -161,13 +167,8 @@ function registerIpcHandlers(): void {
   );
   ipcMain.handle(
     "kcreate/export/png",
-    (
-      _e,
-      nodeIds: string[],
-      outputPath: string,
-      optionsJson: string,
-    ) =>
-      requireBridge().exportPng(nodeIds, outputPath, optionsJson),
+    (_e, outputPath: string, optionsJson: string) =>
+      requireBridge().exportPng(outputPath, optionsJson),
   );
 }
 

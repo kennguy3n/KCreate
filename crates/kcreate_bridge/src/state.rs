@@ -120,8 +120,23 @@ pub fn render(scene_json: &str) -> Result<FrameId> {
     let guard = slot().lock();
     let ctx = guard.as_ref().ok_or(BridgeError::NotInitialized)?;
     let id = ctx.render_frame(&scene)?;
-    drop(guard);
+    // Publish the scene snapshot for PNG export *before* releasing the
+    // renderer lock. The render lock is the single serialisation point
+    // for the renderer; doing the `scene_slot` write inside it makes
+    // (frame, scene) advance atomically with respect to any concurrent
+    // observer. ANALYSIS_0006 on PR #2 noted that the original
+    // drop-then-publish ordering was benign because N-API runs on the
+    // JS event loop (no concurrent `render` calls in practice), but
+    // moving the write inside the lock is defense-in-depth for the
+    // day a future worker thread, off-main-thread napi async task,
+    // or test harness drives `render` concurrently — and it costs us
+    // exactly nothing because the renderer lock is already held.
+    //
+    // `scene_slot()` is a separate mutex from `slot()`, so this can't
+    // deadlock; the lock order is `slot -> scene_slot` and never the
+    // reverse (`current_scene()` only takes `scene_slot`).
     *scene_slot().lock() = Some(scene);
+    drop(guard);
     Ok(id)
 }
 

@@ -270,9 +270,57 @@ app.on("window-all-closed", () => {
   }
 });
 
-app.on("will-quit", () => {
-  if (bridge) {
-    bridge.rendererShutdown();
-    bridge = null;
-  }
+// Final cleanup before the process exits. Three concerns, in order:
+//   1. **Close any open project.** Releases the SQLite file handle so
+//      `cleanupScratchProjects` (next step) can actually delete the
+//      `.kstudio` directory on Windows, where mandatory file locking
+//      would otherwise leave the SQLite file in a "delete pending"
+//      state and the parent directory non-empty.
+//   2. **Sweep scratch projects.** The renderer creates one
+//      `scratch-*.kstudio` per Home→Editor click. The next sweep would
+//      catch them, but only if the app is opened again — if the user
+//      quits, the directory leaks until the next session. macOS/Linux
+//      temp reapers eventually clean up; Windows `%TEMP%` accumulates
+//      indefinitely. Sweeping here closes that gap (issue ANALYSIS_0005).
+//   3. **Shutdown the renderer.** Drops the wgpu adapter, the readback
+//      buffers, and the GPU device. Last step because nothing else
+//      depends on it.
+//
+// Electron's `will-quit` fires synchronously. To run async cleanup
+// safely we use the standard `event.preventDefault()` + re-quit
+// pattern: prevent the first quit, run cleanup, then re-issue
+// `app.quit()` which re-fires `will-quit` with `didFinalCleanup`
+// guarding us against infinite recursion.
+let didFinalCleanup = false;
+app.on("will-quit", (event) => {
+  if (didFinalCleanup) return;
+  event.preventDefault();
+  void (async () => {
+    try {
+      if (bridge) {
+        // `projectClose` is sync and infallible (it just drops the
+        // workspace slot). Wrap in try so a bug here never blocks
+        // shutdown.
+        try {
+          bridge.projectClose();
+        } catch {
+          // best-effort
+        }
+      }
+      // Sweep AFTER projectClose so the just-closed scratch directory
+      // is itself eligible for deletion.
+      await cleanupScratchProjects();
+      if (bridge) {
+        try {
+          bridge.rendererShutdown();
+        } catch {
+          // best-effort
+        }
+        bridge = null;
+      }
+    } finally {
+      didFinalCleanup = true;
+      app.quit();
+    }
+  })();
 });

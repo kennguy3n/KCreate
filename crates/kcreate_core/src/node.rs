@@ -89,7 +89,20 @@ impl Bounds {
         }
     }
 
-    /// True when `point` is strictly inside `self`.
+    /// True when `point` is inside `self` on the half-open interval
+    /// `[min, max)` per axis.
+    ///
+    /// # Containment convention
+    ///
+    /// `kcreate_core` and `kcreate_vector` both use the **half-open**
+    /// convention (`[x, x + width)` × `[y, y + height)`), matching
+    /// `kcreate_vector::path::BoundingBox::contains`. Half-open is
+    /// the standard choice for axis-aligned containment in raster /
+    /// spatial-index contexts because it makes tilings *partitions*:
+    /// every point belongs to exactly one tile, never two adjacent
+    /// tiles claiming the same boundary pixel. Tests below pin the
+    /// boundary semantics so a future "round to inclusive" tweak
+    /// can't silently regress hit-testing.
     #[must_use]
     pub fn contains_point(&self, point: Point2D) -> bool {
         point.x >= self.x && point.x < self.right() && point.y >= self.y && point.y < self.bottom()

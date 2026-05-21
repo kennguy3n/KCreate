@@ -113,10 +113,29 @@ impl BoundingBox {
         }
     }
 
-    /// `true` if `(x, y)` falls inside (inclusive).
+    /// `true` if `(x, y)` falls inside the box on the half-open
+    /// interval `[min, max)` per axis.
+    ///
+    /// # Containment convention
+    ///
+    /// This crate and `kcreate_core` both use the **half-open**
+    /// convention (`[min_x, max_x)` × `[min_y, max_y)`), matching
+    /// `kcreate_core::node::Bounds::contains_point`. Half-open is
+    /// the standard choice for axis-aligned containment in raster /
+    /// spatial-index contexts because it makes tilings *partitions*:
+    /// every point belongs to exactly one tile, never two adjacent
+    /// tiles claiming the same boundary pixel.
+    ///
+    /// Devin Review (`ANALYSIS_0007` on PR #2) flagged the prior closed
+    /// `[min, max]` semantics as inconsistent with the document-layer
+    /// `Bounds::contains_point`. The fix is to align both on
+    /// half-open; closed semantics would have meant a point on the
+    /// shared edge of two adjacent boxes is reported `true` by both,
+    /// which silently double-counts in any pipeline that consumes
+    /// the result of a spatial query.
     #[must_use]
     pub const fn contains(&self, x: f64, y: f64) -> bool {
-        x >= self.min_x && x <= self.max_x && y >= self.min_y && y <= self.max_y
+        x >= self.min_x && x < self.max_x && y >= self.min_y && y < self.max_y
     }
 
     /// Build from a `kurbo::Rect`.
@@ -503,6 +522,31 @@ mod tests {
         let p = VectorPath::new(Vec::new());
         let b = p.bounds();
         assert!(b.is_empty());
+    }
+
+    /// Regression test for `ANALYSIS_0007` on PR #2.
+    ///
+    /// `BoundingBox::contains` was originally closed (`[min, max]`),
+    /// disagreeing with the document-layer `Bounds::contains_point`
+    /// (half-open). The fix aligned both on the half-open convention
+    /// `[min, max)`. This test pins the boundary semantics so a
+    /// future "round to inclusive" tweak can't silently regress
+    /// hit-testing in any pipeline that consumes a spatial query.
+    #[test]
+    fn bounding_box_contains_is_half_open() {
+        let b = BoundingBox::new(0.0, 0.0, 10.0, 10.0);
+        // Min corner is inclusive.
+        assert!(b.contains(0.0, 0.0));
+        // Strictly-interior points are inside.
+        assert!(b.contains(5.0, 5.0));
+        // Max-edge points are exclusive — this is the half-open
+        // contract.
+        assert!(!b.contains(10.0, 5.0));
+        assert!(!b.contains(5.0, 10.0));
+        assert!(!b.contains(10.0, 10.0));
+        // Outside on either axis is exclusive.
+        assert!(!b.contains(-1.0, 5.0));
+        assert!(!b.contains(11.0, 5.0));
     }
 
     #[test]

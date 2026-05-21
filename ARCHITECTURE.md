@@ -293,14 +293,39 @@ affected layers.
 
 ### Device performance tiers
 
-Defined in `kcreate_core::config::DeviceTier`:
+Defined in `kcreate_core::config::DeviceTier` (selected by
+`DeviceTier::from_system_info` — a pure function over
+`SystemInfo { total_ram_mb, gpu_available, … }`):
 
-| Tier   | RAM      | GPU                 | Behavior                                                      |
-| ------ | -------- | ------------------- | ------------------------------------------------------------- |
-| Tier 0 | ≥ 4 GB   | CPU only            | Low-resource mode forced. Small undo depth. CPU rasterizer.   |
-| Tier 1 | ≥ 8 GB   | iGPU                | GPU backend on; AI models limited to ≤ 2 GB.                  |
-| Tier 2 | ≥ 16 GB  | modern iGPU / dGPU  | Full GPU pipeline; AI models up to 7 GB.                      |
-| Tier 3 | ≥ 32 GB  | dGPU / Apple Silicon| All features; larger model packs; multi-document.             |
+| Tier   | RAM bound     | GPU required? | Behavior                                                      |
+| ------ | ------------- | ------------- | ------------------------------------------------------------- |
+| Tier 0 | `< 8 GB`      | No            | Low-resource mode forced. Undo depth 32. CPU rasterizer only. |
+| Tier 1 | `≥ 8 GB`      | No            | Undo depth 128. GPU backend used if probed available, CPU fallback otherwise. AI models limited to ≤ 2 GB. |
+| Tier 2 | `≥ 16 GB`     | **Yes**       | Undo depth 256. Full GPU pipeline. AI models up to 7 GB.       |
+| Tier 3 | `≥ 32 GB`     | **Yes**       | Undo depth 1024. All features; larger model packs; multi-document. |
+
+Selection rules, encoded directly in
+[`DeviceTier::from_system_info`](../crates/kcreate_core/src/config.rs):
+
+1. **RAM is the floor; GPU upgrades the ceiling.** RAM-only thresholds
+   are evaluated top-down. A box with ≥ 16 GB but no usable GPU is
+   classified Tier 1 (not Tier 2), because the GPU-dependent budgets
+   for Tier 2+ assume a working GPU pipeline. The same machine with
+   a discrete GPU is Tier 2.
+2. **No minimum on Tier 0.** Anything that doesn't meet Tier 1's 8 GB
+   threshold — including a host where the RAM probe failed and
+   `total_ram_mb` is `0` — falls to Tier 0. Tier 0 stays usable on
+   minimal hardware (the CPU rasterizer is in-tree and forbids
+   `unsafe`), but defaults to low-resource mode.
+3. **Apple Silicon counts as a "GPU".** `gpu_available` is set true
+   on Apple Silicon by the host probe even for unified-memory
+   systems, so an M-series Mac with ≥ 32 GB lands in Tier 3.
+
+The decision is intentionally pure and unit-testable: the platform
+probe lives in [`RuntimeConfig::detect`](../crates/kcreate_core/src/config.rs)
+and produces `SystemInfo`; tier selection consumes it without
+touching the OS. Tests construct `SystemInfo` directly to verify
+the boundary cases (no-GPU/16 GB, GPU/8 GB, etc.).
 
 ### Low-resource mode
 

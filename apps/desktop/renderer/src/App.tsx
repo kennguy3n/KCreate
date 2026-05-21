@@ -73,18 +73,29 @@ async function openScratchProject(): Promise<ProjectInfo> {
   // stale `scratch-*.kstudio` directories from the temp dir. Without
   // this, every Home→Editor transition leaks one directory — harmless
   // on macOS/Linux (their temp reapers eventually clean up) but
-  // accumulates indefinitely on Windows. The cleanup IPC is
-  // intentionally fire-and-forget: we don't gate project creation on
-  // it because a locked file (e.g. another KCreate instance holding
-  // the SQLite file open) shouldn't block the user from opening their
-  // new scratch.
-  void window.kcreate.runtime
-    .cleanupScratchProjects()
-    .catch(() => {
-      // Errors are already counted inside the host sweep; the renderer
-      // doesn't surface them — best-effort housekeeping must never
-      // block the user-facing path.
-    });
+  // accumulates indefinitely on Windows.
+  //
+  // The sweep is `await`-ed (NOT fire-and-forget) on purpose. An
+  // earlier version of this code dispatched the cleanup as
+  // `void cleanupScratchProjects()` so we wouldn't block on a locked
+  // file from another running KCreate instance, but Devin Review
+  // (BUG_0001 on PR #2) caught the race: `cleanupScratchProjects`'s
+  // `fs.readdir` runs on the libuv thread pool, so the readdir can
+  // resolve *after* `createProject` has already mkdir'd the new
+  // `scratch-{timestamp}.kstudio` directory. The new directory's name
+  // matches the sweep filter, so the cleanup loop would `fs.rm` it
+  // out from under the live SQLite handle on macOS/Linux (no
+  // mandatory file locking) — corrupting the project on the next
+  // save. Awaiting guarantees the sweep observes a temp dir that
+  // *doesn't* yet contain the new project. The sweep is fast
+  // (single `readdir` + N `rm` calls in parallel internally) and
+  // already swallows per-entry errors, so locked files from other
+  // instances are skipped without blocking the user.
+  await window.kcreate.runtime.cleanupScratchProjects().catch(() => {
+    // Errors are already counted inside the host sweep; the renderer
+    // doesn't surface them — best-effort housekeeping must never
+    // block the user-facing path.
+  });
   const name = `scratch-${Date.now()}`;
   const dir = await window.kcreate.runtime.tempDir();
   return window.kcreate.document.createProject(name, dir);

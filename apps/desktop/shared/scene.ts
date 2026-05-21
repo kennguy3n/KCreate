@@ -114,10 +114,117 @@ export interface RendererBridge {
   acquireFrame(): Promise<AcquiredFrame | null>;
 }
 
+/**
+ * Project identity returned by `createProject` / `openProject`.
+ */
+export interface ProjectInfo {
+  id: string;
+  name: string;
+  path: string;
+  createdAt: string;
+  modifiedAt: string;
+}
+
+/**
+ * Flattened document node. The host UI builds the layer tree by
+ * walking parent → children — it does not have to mirror the full
+ * `kcreate_core::Node` payload.
+ */
+export interface NodeInfo {
+  id: string;
+  nodeType: string;
+  parentId: string | null;
+  children: string[];
+  name: string;
+  visible: boolean;
+  locked: boolean;
+}
+
+/**
+ * Static runtime + device snapshot for the home screen / model badge.
+ */
+export interface RuntimeStatus {
+  deviceTier: string;
+  gpuAvailable: boolean;
+  gpuName: string | null;
+  platform: string;
+  totalRamMb: number;
+}
+
+/** Optional props accepted by `createNode`. */
+export interface CreateNodeProps {
+  name?: string;
+  visible?: boolean;
+  locked?: boolean;
+  metadata?: Record<string, unknown>;
+}
+
+/** Optional changes accepted by `updateNode`. Only present fields are applied. */
+export type UpdateNodeProps = CreateNodeProps;
+
+/** SVG export options. `0` for width/height means "fit to content". */
+export interface SvgExportOptions {
+  width: number;
+  height: number;
+  includeMetadata: boolean;
+  optimize: boolean;
+}
+
+/** PNG export options. `scale` multiplies width/height. */
+export interface PngExportOptions {
+  width: number;
+  height: number;
+  scale: number;
+  background: Color | null;
+}
+
+/**
+ * Document + project lifecycle bridge. Exposed on
+ * `window.kcreate.document`. All methods round-trip through the
+ * Electron main process; the renderer never imports the native addon
+ * directly.
+ */
+export interface DocumentBridge {
+  createProject(name: string, dir: string): Promise<ProjectInfo>;
+  openProject(dir: string): Promise<ProjectInfo>;
+  saveProject(): Promise<void>;
+  closeProject(): Promise<void>;
+  getProjectInfo(): Promise<ProjectInfo | null>;
+
+  getDocumentTree(): Promise<NodeInfo[]>;
+  createNode(
+    nodeType: string,
+    parentId: string | null,
+    props: CreateNodeProps,
+  ): Promise<string>;
+  updateNode(nodeId: string, changes: UpdateNodeProps): Promise<void>;
+  deleteNode(nodeId: string): Promise<void>;
+  undo(): Promise<string[] | null>;
+  redo(): Promise<string[] | null>;
+}
+
+/** Runtime / device probe. */
+export interface RuntimeBridge {
+  status(): Promise<RuntimeStatus>;
+}
+
+/** Export pipeline. */
+export interface ExportBridge {
+  svg(nodeIds: string[], options: SvgExportOptions): Promise<string>;
+  png(
+    nodeIds: string[],
+    outputPath: string,
+    options: PngExportOptions,
+  ): Promise<number>;
+}
+
 declare global {
   interface Window {
     kcreate: {
       renderer: RendererBridge;
+      document: DocumentBridge;
+      runtime: RuntimeBridge;
+      export: ExportBridge;
     };
   }
 }

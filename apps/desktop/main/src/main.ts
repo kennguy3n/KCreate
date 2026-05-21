@@ -95,6 +95,77 @@ function registerIpcHandlers(): void {
   ipcMain.handle("kcreate/renderer/acquireFrame", () =>
     requireBridge().rendererAcquireFrame(),
   );
+
+  // Document / project lifecycle.
+  ipcMain.handle(
+    "kcreate/project/create",
+    (_e, name: string, dir: string) =>
+      requireBridge().projectCreate(name, dir),
+  );
+  ipcMain.handle("kcreate/project/open", (_e, dir: string) =>
+    requireBridge().projectOpen(dir),
+  );
+  ipcMain.handle("kcreate/project/save", () => {
+    requireBridge().projectSave();
+  });
+  ipcMain.handle("kcreate/project/close", () => {
+    requireBridge().projectClose();
+  });
+  ipcMain.handle("kcreate/project/getInfo", () =>
+    requireBridge().projectGetInfo(),
+  );
+
+  ipcMain.handle("kcreate/document/getTree", () =>
+    requireBridge().documentGetTree(),
+  );
+  ipcMain.handle(
+    "kcreate/document/createNode",
+    (
+      _e,
+      nodeType: string,
+      parentId: string | null,
+      propsJson: string,
+    ) =>
+      requireBridge().documentCreateNode(nodeType, parentId, propsJson),
+  );
+  ipcMain.handle(
+    "kcreate/document/updateNode",
+    (_e, nodeId: string, changesJson: string) => {
+      requireBridge().documentUpdateNode(nodeId, changesJson);
+    },
+  );
+  ipcMain.handle(
+    "kcreate/document/deleteNode",
+    (_e, nodeId: string) => {
+      requireBridge().documentDeleteNode(nodeId);
+    },
+  );
+  ipcMain.handle("kcreate/document/undo", () =>
+    requireBridge().documentUndo(),
+  );
+  ipcMain.handle("kcreate/document/redo", () =>
+    requireBridge().documentRedo(),
+  );
+
+  ipcMain.handle("kcreate/runtime/status", () =>
+    requireBridge().runtimeStatus(),
+  );
+
+  ipcMain.handle(
+    "kcreate/export/svg",
+    (_e, nodeIds: string[], optionsJson: string) =>
+      requireBridge().exportSvg(nodeIds, optionsJson),
+  );
+  ipcMain.handle(
+    "kcreate/export/png",
+    (
+      _e,
+      nodeIds: string[],
+      outputPath: string,
+      optionsJson: string,
+    ) =>
+      requireBridge().exportPng(nodeIds, outputPath, optionsJson),
+  );
 }
 
 void app.whenReady().then(() => {

@@ -1,0 +1,28 @@
+[package]
+name = "kcreate_tests"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+description = "Cross-crate integration tests for the KCreate workspace."
+
+[lib]
+# This crate exists only to host integration tests under `tests/`. The
+# library file is intentionally empty.
+path = "src/lib.rs"
+
+[dev-dependencies]
+kcreate_core = { path = "../kcreate_core" }
+kcreate_export = { path = "../kcreate_export" }
+kcreate_renderer = { path = "../kcreate_renderer" }
+kcreate_storage = { path = "../kcreate_storage" }
+kcreate_vector = { path = "../kcreate_vector" }
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+uuid = { workspace = true }
+
+[lints]
+workspace = true

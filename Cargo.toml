@@ -3,6 +3,11 @@ resolver = "2"
 members = [
     "crates/kcreate_renderer",
     "crates/kcreate_bridge",
+    "crates/kcreate_core",
+    "crates/kcreate_storage",
+    "crates/kcreate_vector",
+    "crates/kcreate_export",
+    "crates/kcreate_tests",
 ]
 
 [workspace.package]
@@ -63,8 +68,38 @@ uuid = { version = "1.10", features = ["v4", "serde"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
+# Time
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
+
+# Persistence (statically linked SQLite)
+rusqlite = { version = "0.34", features = ["bundled", "blob", "chrono", "uuid"] }
+
+# Content-addressed hashing
+blake3 = "1.5"
+
+# Path math
+kurbo = { version = "0.11", features = ["serde"] }
+
+# Polygon boolean operations (Greiner–Hormann / Vatti family, real production-grade impl)
+i_overlay = "2"
+
+# SVG parsing
+usvg = "0.44"
+
+# Spatial index
+rstar = "0.12"
+
+# Raster encoding (PNG)
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+
+# System info probe for device tiering
+sys-info = "0.9"
+
 # Benchmarks
 criterion = { version = "0.5", features = ["html_reports"] }
+
+# Test fixtures
+tempfile = "3"
 
 # N-API bindings
 # `dyn-symbols` resolves napi symbols at runtime via libloading so the crate

@@ -1,63 +1,71 @@
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useState } from "react";
 
-import { CanvasHost } from "./components/CanvasHost";
-import type { Scene } from "../../shared/scene";
+import { EditorPage } from "./pages/EditorPage";
+import { HomePage } from "./pages/HomePage";
+import type { ProjectInfo } from "../../shared/scene";
+
+type Route =
+  | { kind: "home" }
+  | { kind: "editor"; project: ProjectInfo }
+  | { kind: "error"; message: string };
 
 export function App(): JSX.Element {
-  const [size] = useState({ width: 1024, height: 640 });
-  const [fps, setFps] = useState<number>(0);
-  const [lastTickAt, setLastTickAt] = useState<number>(performance.now());
+  const [route, setRoute] = useState<Route>({ kind: "home" });
 
-  const scene: Scene = useMemo<Scene>(
-    () => ({
-      clear_color: [0.12, 0.12, 0.14, 1.0],
-      objects: [
-        {
-          id: 1,
-          z: 0,
-          translation: [80, 80],
-          style: {
-            fill: [0.92, 0.36, 0.36, 1.0],
-            stroke: { color: [0.0, 0.0, 0.0, 1.0], width: 2.0 },
-          },
-          kind: { type: "rect", x: 0, y: 0, width: 360, height: 220 },
-        },
-        {
-          id: 2,
-          z: 1,
-          translation: [560, 220],
-          style: {
-            fill: [0.35, 0.78, 0.95, 1.0],
-            stroke: null,
-          },
-          kind: { type: "circle", cx: 0, cy: 0, radius: 140 },
-        },
-      ],
-    }),
-    [],
-  );
+  const handleOpenEditor = useCallback(async (_jobKind: string) => {
+    // Phase 0: we don't yet show a directory picker (electron dialog
+    // glue lands with the project manager in Phase 1). Until then we
+    // create a scratch project under the OS temp dir so the editor
+    // skeleton has something to show. The Rust side already does the
+    // right thing with persistence + reopen.
+    try {
+      const project = await openScratchProject();
+      setRoute({ kind: "editor", project });
+    } catch (e) {
+      setRoute({
+        kind: "error",
+        message: e instanceof Error ? e.message : String(e),
+      });
+    }
+  }, []);
 
-  const onFrame = useCallback(() => {
-    const now = performance.now();
-    const elapsed = now - lastTickAt;
-    setLastTickAt(now);
-    if (elapsed > 0) setFps(Math.round(1000 / elapsed));
-  }, [lastTickAt]);
+  const handleBackHome = useCallback(() => {
+    void window.kcreate.document.closeProject().finally(() => {
+      setRoute({ kind: "home" });
+    });
+  }, []);
 
-  return (
-    <div className="kcreate-shell">
-      <header className="kcreate-titlebar">
-        <span>KCreate · phase 0 renderer</span>
-        <span>{fps} fps</span>
-      </header>
-      <main>
-        <CanvasHost
-          width={size.width}
-          height={size.height}
-          scene={scene}
-          onFramePresented={onFrame}
-        />
-      </main>
-    </div>
-  );
+  if (route.kind === "editor") {
+    return (
+      <EditorPage project={route.project} onBackHome={handleBackHome} />
+    );
+  }
+  if (route.kind === "error") {
+    return (
+      <div
+        style={{
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          height: "100%",
+          padding: 32,
+          color: "#B91C1C",
+        }}
+      >
+        Failed to open project: {route.message}
+      </div>
+    );
+  }
+  return <HomePage onOpenEditor={handleOpenEditor} />;
+}
+
+async function openScratchProject(): Promise<ProjectInfo> {
+  // Phase 0 scaffold: pick a deterministic scratch directory inside the
+  // app's home folder. The host owns the path; the Rust bridge persists
+  // documents under `<dir>/<name>.kstudio`.
+  const name = `scratch-${Date.now()}`;
+  const dir = await window.kcreate.runtime
+    .status()
+    .then((s) => `${s.platform === "WindowsX64" ? "C:\\\\Temp" : "/tmp"}`);
+  return window.kcreate.document.createProject(name, dir);
 }

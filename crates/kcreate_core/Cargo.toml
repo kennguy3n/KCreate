@@ -1,0 +1,24 @@
+[package]
+name = "kcreate_core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Shared types, node model, document graph, operation log, project, and runtime config for KCreate"
+
+[lints]
+workspace = true
+
+[dependencies]
+uuid = { workspace = true, features = ["v4", "serde"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+chrono.workspace = true
+thiserror.workspace = true
+sys-info.workspace = true
+log.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

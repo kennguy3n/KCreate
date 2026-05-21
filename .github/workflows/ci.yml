@@ -20,7 +20,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-22.04]
+        os: [ubuntu-22.04, macos-13, windows-2022]
     steps:
       - uses: actions/checkout@v4
       - name: install rust toolchain
@@ -34,6 +34,18 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             libwayland-dev libxkbcommon-dev libxcb1-dev libgl1 libvulkan1 \
             mesa-vulkan-drivers
+      - name: macos build environment
+        if: runner.os == 'macOS'
+        # No extra packages needed — Metal ships with macOS, Xcode CLT is preinstalled
+        # on GitHub's macos-13 runner. CPU fallback works headless.
+        run: clang --version
+      - name: windows build environment
+        if: runner.os == 'Windows'
+        # No extra packages needed — D3D12 ships with the runner; if no GPU
+        # adapter is reachable in CI, the tiny-skia software backend is used.
+        shell: pwsh
+        run: |
+          cl /Bv 2>&1 | Select-Object -First 1
       - uses: Swatinem/rust-cache@v2
       - name: cargo fmt --check
         run: cargo fmt --all --check

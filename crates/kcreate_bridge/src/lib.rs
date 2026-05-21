@@ -16,13 +16,24 @@
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 
+pub mod document;
 pub mod state;
 pub mod wire;
 
+use std::path::PathBuf;
+use std::str::FromStr;
+
+use kcreate_export::svg::SvgExportOptions;
 use kcreate_renderer::Rect;
 use napi::bindgen_prelude::{Buffer, Error as NapiError, Result as NapiResult, Status};
 use napi_derive::napi;
+use uuid::Uuid;
 
+use crate::document::{
+    CreateNodeProps, DocumentBridgeError, NodeInfo as CoreNodeInfo,
+    PngExportRequest as CorePngRequest, ProjectInfo as CoreProjectInfo,
+    RuntimeStatus as CoreRuntimeStatus, UpdateNodeProps,
+};
 use crate::state::{
     AcquiredFrame as CoreAcquiredFrame, BridgeError, RendererFrameInfo as CoreFrameInfo,
     RendererInfo as CoreRendererInfo,
@@ -36,6 +47,28 @@ fn map_err(e: BridgeError) -> NapiError {
         _ => Status::GenericFailure,
     };
     NapiError::new(status, format!("kcreate_bridge: {e}"))
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn map_doc_err(e: DocumentBridgeError) -> NapiError {
+    let status = match e {
+        DocumentBridgeError::NoProject
+        | DocumentBridgeError::InvalidNodeType(_)
+        | DocumentBridgeError::NodeNotFound(_)
+        | DocumentBridgeError::ProjectDirExists(_)
+        | DocumentBridgeError::InvalidUuid(_, _) => Status::InvalidArg,
+        _ => Status::GenericFailure,
+    };
+    NapiError::new(status, format!("kcreate_bridge: {e}"))
+}
+
+fn parse_uuid(s: &str) -> NapiResult<Uuid> {
+    Uuid::from_str(s).map_err(|e| {
+        NapiError::new(
+            Status::InvalidArg,
+            format!("kcreate_bridge: invalid uuid {s:?}: {e}"),
+        )
+    })
 }
 
 /// Renderer info returned from [`renderer_init`].
@@ -189,4 +222,233 @@ pub fn renderer_acquire_frame() -> NapiResult<Option<AcquiredFrame>> {
     state::acquire_frame()
         .map(|opt| opt.map(Into::into))
         .map_err(map_err)
+}
+
+// =============================================================================
+// Document / project bridge
+// =============================================================================
+
+#[napi(object)]
+#[derive(Debug, Clone)]
+pub struct ProjectInfo {
+    pub id: String,
+    pub name: String,
+    pub path: String,
+    pub created_at: String,
+    pub modified_at: String,
+}
+
+impl From<CoreProjectInfo> for ProjectInfo {
+    fn from(c: CoreProjectInfo) -> Self {
+        Self {
+            id: c.id.to_string(),
+            name: c.name,
+            path: c.path.display().to_string(),
+            created_at: c.created_at,
+            modified_at: c.modified_at,
+        }
+    }
+}
+
+#[napi(object)]
+#[derive(Debug, Clone)]
+pub struct NodeInfo {
+    pub id: String,
+    pub node_type: String,
+    pub parent_id: Option<String>,
+    pub children: Vec<String>,
+    pub name: String,
+    pub visible: bool,
+    pub locked: bool,
+}
+
+impl From<CoreNodeInfo> for NodeInfo {
+    fn from(c: CoreNodeInfo) -> Self {
+        Self {
+            id: c.id.to_string(),
+            node_type: c.node_type,
+            parent_id: c.parent_id.map(|p| p.to_string()),
+            children: c.children.iter().map(ToString::to_string).collect(),
+            name: c.name,
+            visible: c.visible,
+            locked: c.locked,
+        }
+    }
+}
+
+#[napi(object)]
+#[derive(Debug, Clone)]
+pub struct RuntimeStatus {
+    pub device_tier: String,
+    pub gpu_available: bool,
+    pub gpu_name: Option<String>,
+    pub platform: String,
+    pub total_ram_mb: u32,
+}
+
+impl From<CoreRuntimeStatus> for RuntimeStatus {
+    #[allow(clippy::cast_possible_truncation)]
+    fn from(c: CoreRuntimeStatus) -> Self {
+        Self {
+            device_tier: c.device_tier,
+            gpu_available: c.gpu_available,
+            gpu_name: c.gpu_name,
+            platform: c.platform,
+            total_ram_mb: c.total_ram_mb.min(u64::from(u32::MAX)) as u32,
+        }
+    }
+}
+
+/// Create a new project under `dir/<name>.kstudio`.
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn project_create(name: String, dir: String) -> NapiResult<ProjectInfo> {
+    document::project_create(&name, &PathBuf::from(dir))
+        .map(Into::into)
+        .map_err(map_doc_err)
+}
+
+/// Open an existing `.kstudio` directory.
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn project_open(dir: String) -> NapiResult<ProjectInfo> {
+    document::project_open(&PathBuf::from(dir))
+        .map(Into::into)
+        .map_err(map_doc_err)
+}
+
+/// Persist the current project to disk.
+#[napi]
+pub fn project_save() -> NapiResult<()> {
+    document::project_save().map_err(map_doc_err)
+}
+
+/// Close the current project, discarding unsaved in-memory state.
+#[napi]
+pub fn project_close() {
+    document::project_close();
+}
+
+/// Identity snapshot of the open project, or `null` if none is open.
+#[napi]
+pub fn project_get_info() -> Option<ProjectInfo> {
+    document::project_info().map(Into::into)
+}
+
+/// Flat document tree.
+#[napi]
+pub fn document_get_tree() -> NapiResult<Vec<NodeInfo>> {
+    Ok(document::document_get_tree()
+        .map_err(map_doc_err)?
+        .into_iter()
+        .map(Into::into)
+        .collect())
+}
+
+/// Create a new node. `props_json` is a JSON object with optional
+/// `name`, `visible`, `locked`, `metadata` fields. Returns the new id.
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn document_create_node(
+    node_type: String,
+    parent_id: Option<String>,
+    props_json: String,
+) -> NapiResult<String> {
+    let props: CreateNodeProps = serde_json::from_str(&props_json).map_err(|e| {
+        NapiError::new(
+            Status::InvalidArg,
+            format!("kcreate_bridge: bad node props json: {e}"),
+        )
+    })?;
+    let parent = match parent_id.as_deref() {
+        Some(s) => Some(parse_uuid(s)?),
+        None => None,
+    };
+    let id = document::document_create_node(&node_type, parent, &props).map_err(map_doc_err)?;
+    Ok(id.to_string())
+}
+
+/// Update a node in place. `changes_json` is a JSON object with
+/// optional `name`, `visible`, `locked`, `metadata` fields.
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn document_update_node(node_id: String, changes_json: String) -> NapiResult<()> {
+    let id = parse_uuid(&node_id)?;
+    let changes: UpdateNodeProps = serde_json::from_str(&changes_json).map_err(|e| {
+        NapiError::new(
+            Status::InvalidArg,
+            format!("kcreate_bridge: bad changes json: {e}"),
+        )
+    })?;
+    document::document_update_node(id, &changes).map_err(map_doc_err)
+}
+
+/// Remove a node and its descendants.
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn document_delete_node(node_id: String) -> NapiResult<()> {
+    let id = parse_uuid(&node_id)?;
+    document::document_delete_node(id).map_err(map_doc_err)
+}
+
+/// Undo last operation. Returns `null` when nothing to undo, otherwise
+/// the list of affected node ids.
+#[napi]
+pub fn document_undo() -> NapiResult<Option<Vec<String>>> {
+    let ids = document::document_undo().map_err(map_doc_err)?;
+    Ok(ids.map(|v| v.into_iter().map(|u| u.to_string()).collect()))
+}
+
+#[napi]
+pub fn document_redo() -> NapiResult<Option<Vec<String>>> {
+    let ids = document::document_redo().map_err(map_doc_err)?;
+    Ok(ids.map(|v| v.into_iter().map(|u| u.to_string()).collect()))
+}
+
+/// Static runtime / device snapshot.
+#[napi]
+pub fn runtime_status() -> RuntimeStatus {
+    document::runtime_status().into()
+}
+
+// =============================================================================
+// Export bridge
+// =============================================================================
+
+/// Export SVG for the given node ids (empty = whole document).
+/// `options_json` is a JSON object with `width`, `height`,
+/// `include_metadata`, `optimize` fields.
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn export_svg(node_ids: Vec<String>, options_json: String) -> NapiResult<String> {
+    let ids: Vec<Uuid> = node_ids
+        .iter()
+        .map(|s| parse_uuid(s))
+        .collect::<NapiResult<_>>()?;
+    let opts: SvgExportOptions = serde_json::from_str(&options_json).unwrap_or_default();
+    document::export_svg(&ids, &opts).map_err(map_doc_err)
+}
+
+/// Export the current scene to PNG at `output_path`. Returns the file
+/// size in bytes.
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn export_png(
+    node_ids: Vec<String>,
+    output_path: String,
+    options_json: String,
+) -> NapiResult<u32> {
+    let ids: Vec<Uuid> = node_ids
+        .iter()
+        .map(|s| parse_uuid(s))
+        .collect::<NapiResult<_>>()?;
+    let opts: CorePngRequest = serde_json::from_str(&options_json).map_err(|e| {
+        NapiError::new(
+            Status::InvalidArg,
+            format!("kcreate_bridge: bad png options json: {e}"),
+        )
+    })?;
+    let bytes =
+        document::export_png_file(&ids, &PathBuf::from(output_path), &opts).map_err(map_doc_err)?;
+    Ok(u32::try_from(bytes).unwrap_or(u32::MAX))
 }

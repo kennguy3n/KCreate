@@ -1,0 +1,27 @@
+[package]
+name = "kcreate_vector"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Vector path math, boolean ops, SVG import/export, and R-tree spatial index for KCreate"
+
+[lints]
+workspace = true
+
+[dependencies]
+kcreate_core = { path = "../kcreate_core" }
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+thiserror.workspace = true
+log.workspace = true
+uuid = { workspace = true, features = ["v4", "serde"] }
+kurbo.workspace = true
+i_overlay.workspace = true
+usvg.workspace = true
+rstar.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

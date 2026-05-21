@@ -6,10 +6,20 @@ import { contextBridge, ipcRenderer } from "electron";
 
 import type {
   AcquiredFrame,
+  CreateNodeProps,
+  DocumentBridge,
+  ExportBridge,
   FrameInfo,
+  NodeInfo,
+  PngExportOptions,
+  ProjectInfo,
   RendererBridge,
   RendererInfo,
+  RuntimeBridge,
+  RuntimeStatus,
   Scene,
+  SvgExportOptions,
+  UpdateNodeProps,
 } from "../../shared/scene";
 
 type FrameInfoSnake = {
@@ -105,4 +115,171 @@ const renderer: RendererBridge = {
   },
 };
 
-contextBridge.exposeInMainWorld("kcreate", { renderer });
+// Snake-case shapes returned from the native bridge. Documented here in
+// the preload so the renderer-facing API is unambiguously camelCase.
+type ProjectInfoSnake = {
+  id: string;
+  name: string;
+  path: string;
+  created_at: string;
+  modified_at: string;
+};
+
+type NodeInfoSnake = {
+  id: string;
+  node_type: string;
+  parent_id: string | null;
+  children: string[];
+  name: string;
+  visible: boolean;
+  locked: boolean;
+};
+
+type RuntimeStatusSnake = {
+  device_tier: string;
+  gpu_available: boolean;
+  gpu_name: string | null;
+  platform: string;
+  total_ram_mb: number;
+};
+
+function projectFromSnake(p: ProjectInfoSnake): ProjectInfo {
+  return {
+    id: p.id,
+    name: p.name,
+    path: p.path,
+    createdAt: p.created_at,
+    modifiedAt: p.modified_at,
+  };
+}
+
+function nodeFromSnake(n: NodeInfoSnake): NodeInfo {
+  return {
+    id: n.id,
+    nodeType: n.node_type,
+    parentId: n.parent_id,
+    children: n.children,
+    name: n.name,
+    visible: n.visible,
+    locked: n.locked,
+  };
+}
+
+function runtimeFromSnake(s: RuntimeStatusSnake): RuntimeStatus {
+  return {
+    deviceTier: s.device_tier,
+    gpuAvailable: s.gpu_available,
+    gpuName: s.gpu_name,
+    platform: s.platform,
+    totalRamMb: s.total_ram_mb,
+  };
+}
+
+const document: DocumentBridge = {
+  async createProject(name, dir): Promise<ProjectInfo> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/project/create",
+      name,
+      dir,
+    )) as ProjectInfoSnake;
+    return projectFromSnake(raw);
+  },
+  async openProject(dir): Promise<ProjectInfo> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/project/open",
+      dir,
+    )) as ProjectInfoSnake;
+    return projectFromSnake(raw);
+  },
+  async saveProject(): Promise<void> {
+    await ipcRenderer.invoke("kcreate/project/save");
+  },
+  async closeProject(): Promise<void> {
+    await ipcRenderer.invoke("kcreate/project/close");
+  },
+  async getProjectInfo(): Promise<ProjectInfo | null> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/project/getInfo",
+    )) as ProjectInfoSnake | null;
+    return raw ? projectFromSnake(raw) : null;
+  },
+  async getDocumentTree(): Promise<NodeInfo[]> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/document/getTree",
+    )) as NodeInfoSnake[];
+    return raw.map(nodeFromSnake);
+  },
+  async createNode(
+    nodeType: string,
+    parentId: string | null,
+    props: CreateNodeProps,
+  ): Promise<string> {
+    return (await ipcRenderer.invoke(
+      "kcreate/document/createNode",
+      nodeType,
+      parentId,
+      JSON.stringify(props),
+    )) as string;
+  },
+  async updateNode(
+    nodeId: string,
+    changes: UpdateNodeProps,
+  ): Promise<void> {
+    await ipcRenderer.invoke(
+      "kcreate/document/updateNode",
+      nodeId,
+      JSON.stringify(changes),
+    );
+  },
+  async deleteNode(nodeId: string): Promise<void> {
+    await ipcRenderer.invoke("kcreate/document/deleteNode", nodeId);
+  },
+  async undo(): Promise<string[] | null> {
+    return (await ipcRenderer.invoke(
+      "kcreate/document/undo",
+    )) as string[] | null;
+  },
+  async redo(): Promise<string[] | null> {
+    return (await ipcRenderer.invoke(
+      "kcreate/document/redo",
+    )) as string[] | null;
+  },
+};
+
+const runtime: RuntimeBridge = {
+  async status(): Promise<RuntimeStatus> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/runtime/status",
+    )) as RuntimeStatusSnake;
+    return runtimeFromSnake(raw);
+  },
+};
+
+const exportApi: ExportBridge = {
+  async svg(nodeIds: string[], options: SvgExportOptions): Promise<string> {
+    return (await ipcRenderer.invoke(
+      "kcreate/export/svg",
+      nodeIds,
+      JSON.stringify(options),
+    )) as string;
+  },
+  async png(
+    nodeIds: string[],
+    outputPath: string,
+    options: PngExportOptions,
+  ): Promise<number> {
+    return (await ipcRenderer.invoke(
+      "kcreate/export/png",
+      nodeIds,
+      outputPath,
+      JSON.stringify(options),
+    )) as number;
+  },
+};
+
+contextBridge.exposeInMainWorld("kcreate", {
+  renderer,
+  document,
+  runtime,
+  export: exportApi,
+});

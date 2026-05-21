@@ -1,0 +1,26 @@
+[package]
+name = "kcreate_export"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "PNG and SVG export pipelines for KCreate"
+
+[lints]
+workspace = true
+
+[dependencies]
+kcreate_core = { path = "../kcreate_core" }
+kcreate_vector = { path = "../kcreate_vector" }
+kcreate_renderer = { path = "../kcreate_renderer" }
+image.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+thiserror.workspace = true
+uuid = { workspace = true, features = ["v4", "serde"] }
+log.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

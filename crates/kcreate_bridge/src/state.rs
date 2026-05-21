@@ -6,7 +6,9 @@
 
 use std::sync::OnceLock;
 
-use kcreate_renderer::{initialize as renderer_initialize, FrameId, Rect, RenderContext, Vec2};
+use kcreate_renderer::{
+    initialize as renderer_initialize, FrameId, Rect, RenderContext, Scene, Vec2,
+};
 use parking_lot::Mutex;
 use thiserror::Error;
 
@@ -25,10 +27,17 @@ pub enum BridgeError {
 
 pub type Result<T> = std::result::Result<T, BridgeError>;
 
-/// Static singleton state. One renderer per process.
+/// Process-wide renderer state. One renderer per process.
 fn slot() -> &'static Mutex<Option<RenderContext>> {
     static RENDERER: OnceLock<Mutex<Option<RenderContext>>> = OnceLock::new();
     RENDERER.get_or_init(|| Mutex::new(None))
+}
+
+/// Latest scene handed to `render`. Cached so PNG export can re-render
+/// at arbitrary scales without round-tripping JSON through JS.
+fn scene_slot() -> &'static Mutex<Option<Scene>> {
+    static SCENE: OnceLock<Mutex<Option<Scene>>> = OnceLock::new();
+    SCENE.get_or_init(|| Mutex::new(None))
 }
 
 /// Initialize the renderer at the given size.
@@ -67,6 +76,7 @@ pub fn init(width: u32, height: u32) -> Result<RendererInfo> {
 /// Shut down the renderer (no-op if not initialized).
 pub fn shutdown() {
     *slot().lock() = None;
+    *scene_slot().lock() = None;
 }
 
 /// Test-only helper: reset state so each test starts clean. Not exposed
@@ -74,6 +84,7 @@ pub fn shutdown() {
 #[cfg(test)]
 pub(crate) fn reset_for_tests() {
     *slot().lock() = None;
+    *scene_slot().lock() = None;
 }
 
 pub fn resize(width: u32, height: u32) -> Result<()> {
@@ -110,7 +121,17 @@ pub fn render(scene_json: &str) -> Result<FrameId> {
     let ctx = guard.as_ref().ok_or(BridgeError::NotInitialized)?;
     let id = ctx.render_frame(&scene)?;
     drop(guard);
+    *scene_slot().lock() = Some(scene);
     Ok(id)
+}
+
+/// Snapshot of the most recently rendered scene. Used by PNG export
+/// to drive a fresh offscreen render at the caller's chosen size.
+pub fn current_scene() -> Result<Scene> {
+    scene_slot()
+        .lock()
+        .clone()
+        .ok_or(BridgeError::NotInitialized)
 }
 
 /// Snapshot of the latest published frame (RGBA8). Copies bytes out so

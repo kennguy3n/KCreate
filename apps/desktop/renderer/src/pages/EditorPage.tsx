@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { CanvasHost } from "../components/CanvasHost";
 import { LeftPanel } from "../components/LeftPanel";
@@ -49,7 +49,13 @@ export function EditorPage({
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
   const [fps, setFps] = useState<number>(0);
-  const [lastTickAt, setLastTickAt] = useState<number>(performance.now());
+  // The last frame timestamp lives in a ref, not state: it changes on
+  // every frame, and feeding it into `useCallback`'s dependency list
+  // would invalidate `onFrame` 60+ times a second and cascade through
+  // CanvasHost as a new `onFramePresented` prop on every render. The
+  // ref keeps the closure stable while still reading the most recent
+  // value at tick time.
+  const lastTickAtRef = useRef<number>(performance.now());
   // Editing-state from the bridge. `null` while the first probe is
   // in flight, then either a snapshot of the operation log or `null`
   // again if the workspace is closed. Default to disabled controls
@@ -125,10 +131,10 @@ export function EditorPage({
 
   const onFrame = useCallback(() => {
     const now = performance.now();
-    const elapsed = now - lastTickAt;
-    setLastTickAt(now);
+    const elapsed = now - lastTickAtRef.current;
+    lastTickAtRef.current = now;
     if (elapsed > 0) setFps(Math.round(1000 / elapsed));
-  }, [lastTickAt]);
+  }, []);
 
   return (
     <div

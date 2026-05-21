@@ -60,12 +60,15 @@ export function App(): JSX.Element {
 }
 
 async function openScratchProject(): Promise<ProjectInfo> {
-  // Phase 0 scaffold: pick a deterministic scratch directory inside the
-  // app's home folder. The host owns the path; the Rust bridge persists
-  // documents under `<dir>/<name>.kstudio`.
+  // Phase 0 scaffold: drop the scratch project into the OS temp dir
+  // resolved by the Electron main process via Node's `os.tmpdir()`. The
+  // renderer never hard-codes paths — `/tmp` doesn't exist on Windows,
+  // and the previous fallback (`C:\\\\Temp` in a JS source literal) was
+  // double-escaped: the runtime string was `C:\\Temp` (with a literal
+  // backslash before `Temp`) instead of the intended `C:\Temp`, so
+  // project creation failed on Windows. The host's `os.tmpdir()` is
+  // correct on every platform and survives sandboxing.
   const name = `scratch-${Date.now()}`;
-  const dir = await window.kcreate.runtime
-    .status()
-    .then((s) => `${s.platform === "WindowsX64" ? "C:\\\\Temp" : "/tmp"}`);
+  const dir = await window.kcreate.runtime.tempDir();
   return window.kcreate.document.createProject(name, dir);
 }

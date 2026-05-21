@@ -18,6 +18,9 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 kcreate_renderer = { path = "../kcreate_renderer" }
+kcreate_core = { path = "../kcreate_core" }
+kcreate_storage = { path = "../kcreate_storage" }
+kcreate_export = { path = "../kcreate_export" }
 napi.workspace = true
 napi-derive.workspace = true
 parking_lot.workspace = true
@@ -25,6 +28,8 @@ log.workspace = true
 thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+uuid = { workspace = true, features = ["v4", "serde"] }
+chrono = { workspace = true, features = ["serde"] }
 
 [build-dependencies]
 napi-build.workspace = true
@@ -33,6 +38,8 @@ napi-build.workspace = true
 # The bridge state machine is a process-global singleton, so tests that
 # mutate it must run serialized.
 serial_test = "3"
+tempfile.workspace = true
+kcreate_vector = { path = "../kcreate_vector" }
 
 [features]
 default = []

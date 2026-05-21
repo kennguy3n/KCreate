@@ -22,6 +22,47 @@ type AcquiredFrameSnake = {
   bytes: Uint8Array;
 };
 
+type ProjectInfoSnake = {
+  id: string;
+  name: string;
+  path: string;
+  created_at: string;
+  modified_at: string;
+};
+
+type NodeInfoSnake = {
+  id: string;
+  node_type: string;
+  parent_id: string | null;
+  children: string[];
+  name: string;
+  visible: boolean;
+  locked: boolean;
+};
+
+type RuntimeStatusSnake = {
+  device_tier: string;
+  gpu_available: boolean;
+  gpu_name: string | null;
+  platform: string;
+  total_ram_mb: number;
+};
+
+type DocumentStatusSnake = {
+  node_count: number;
+  can_undo: boolean;
+  can_redo: boolean;
+  undo_depth: number;
+  redo_depth: number;
+};
+
+export type {
+  ProjectInfoSnake,
+  NodeInfoSnake,
+  RuntimeStatusSnake,
+  DocumentStatusSnake,
+};
+
 export interface Bridge {
   rendererInit(
     width: number,
@@ -40,6 +81,27 @@ export interface Bridge {
   rendererGetFrame(): Uint8Array | null;
   rendererFrameInfo(): FrameInfoSnake | null;
   rendererAcquireFrame(): AcquiredFrameSnake | null;
+
+  // Document / project lifecycle
+  projectCreate(name: string, dir: string): ProjectInfoSnake;
+  projectOpen(dir: string): ProjectInfoSnake;
+  projectSave(): void;
+  projectClose(): void;
+  projectGetInfo(): ProjectInfoSnake | null;
+  documentGetTree(): NodeInfoSnake[];
+  documentCreateNode(
+    nodeType: string,
+    parentId: string | null,
+    propsJson: string,
+  ): string;
+  documentUpdateNode(nodeId: string, changesJson: string): void;
+  documentDeleteNode(nodeId: string): void;
+  documentUndo(): string[] | null;
+  documentRedo(): string[] | null;
+  documentStatus(): DocumentStatusSnake | null;
+  runtimeStatus(): RuntimeStatusSnake;
+  exportSvg(nodeIds: string[], optionsJson: string): string;
+  exportPng(outputPath: string, optionsJson: string): number;
 }
 
 function bridgeBinaryPath(): string {

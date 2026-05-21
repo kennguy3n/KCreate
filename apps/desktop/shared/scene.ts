@@ -114,10 +114,177 @@ export interface RendererBridge {
   acquireFrame(): Promise<AcquiredFrame | null>;
 }
 
+/**
+ * Project identity returned by `createProject` / `openProject`.
+ */
+export interface ProjectInfo {
+  id: string;
+  name: string;
+  path: string;
+  createdAt: string;
+  modifiedAt: string;
+}
+
+/**
+ * Flattened document node. The host UI builds the layer tree by
+ * walking parent → children — it does not have to mirror the full
+ * `kcreate_core::Node` payload.
+ */
+export interface NodeInfo {
+  id: string;
+  nodeType: string;
+  parentId: string | null;
+  children: string[];
+  name: string;
+  visible: boolean;
+  locked: boolean;
+}
+
+/**
+ * Static runtime + device snapshot for the home screen / model badge.
+ */
+export interface RuntimeStatus {
+  deviceTier: string;
+  gpuAvailable: boolean;
+  gpuName: string | null;
+  platform: string;
+  totalRamMb: number;
+}
+
+/** Optional props accepted by `createNode`. */
+export interface CreateNodeProps {
+  name?: string;
+  visible?: boolean;
+  locked?: boolean;
+  metadata?: Record<string, unknown>;
+}
+
+/** Optional changes accepted by `updateNode`. Only present fields are applied. */
+export type UpdateNodeProps = CreateNodeProps;
+
+/** SVG export options. `0` for width/height means "fit to content". */
+export interface SvgExportOptions {
+  width: number;
+  height: number;
+  includeMetadata: boolean;
+  optimize: boolean;
+}
+
+/** PNG export options. `scale` multiplies width/height. */
+export interface PngExportOptions {
+  width: number;
+  height: number;
+  scale: number;
+  background: Color | null;
+}
+
+/**
+ * Editing-state snapshot for the host UI. Polled after every
+ * mutation so undo/redo controls can reflect the actual operation
+ * log state instead of heuristics like "are there any layers?".
+ */
+export interface DocumentStatus {
+  nodeCount: number;
+  canUndo: boolean;
+  canRedo: boolean;
+  undoDepth: number;
+  redoDepth: number;
+}
+
+/**
+ * Document + project lifecycle bridge. Exposed on
+ * `window.kcreate.document`. All methods round-trip through the
+ * Electron main process; the renderer never imports the native addon
+ * directly.
+ */
+export interface DocumentBridge {
+  createProject(name: string, dir: string): Promise<ProjectInfo>;
+  openProject(dir: string): Promise<ProjectInfo>;
+  saveProject(): Promise<void>;
+  closeProject(): Promise<void>;
+  getProjectInfo(): Promise<ProjectInfo | null>;
+
+  getDocumentTree(): Promise<NodeInfo[]>;
+  createNode(
+    nodeType: string,
+    parentId: string | null,
+    props: CreateNodeProps,
+  ): Promise<string>;
+  updateNode(nodeId: string, changes: UpdateNodeProps): Promise<void>;
+  deleteNode(nodeId: string): Promise<void>;
+  undo(): Promise<string[] | null>;
+  redo(): Promise<string[] | null>;
+
+  /**
+   * Snapshot of the open document's editing state, or `null` if no
+   * project is open. Backed by the operation log so the host can
+   * accurately enable/disable Undo / Redo without guessing.
+   */
+  status(): Promise<DocumentStatus | null>;
+}
+
+/** Result of a scratch-project cleanup sweep. */
+export interface ScratchCleanupResult {
+  /** Number of `scratch-*.kstudio` entries inspected. */
+  scanned: number;
+  /** Number of entries successfully removed. */
+  removed: number;
+  /** Number of entries that errored during inspection/removal. */
+  errors: number;
+  /**
+   * Number of entries skipped because they were claimed by another
+   * live KCreate instance (via `.kclock` PID liveness check or the
+   * "just-created" mtime grace window). Surfaced so Phase 1
+   * observability (and the `runtime/devTools` panel) can distinguish
+   * "successfully skipped a sibling" from "failed to delete".
+   */
+  skippedOwned: number;
+}
+
+/** Runtime / device probe. */
+export interface RuntimeBridge {
+  status(): Promise<RuntimeStatus>;
+  /**
+   * OS-appropriate temporary directory, resolved by the Electron main
+   * process via Node's `os.tmpdir()` so the renderer never has to
+   * hard-code paths (`/tmp` on POSIX, `%TEMP%` on Windows, etc.). The
+   * value is stable for the lifetime of the process.
+   */
+  tempDir(): Promise<string>;
+  /**
+   * Best-effort sweep of stale `scratch-*.kstudio` projects in the OS
+   * temp directory. Owned by the host because (a) it needs filesystem
+   * access the renderer doesn't have, and (b) the prefix/suffix and
+   * base directory are fixed in host code to keep the API surface
+   * narrow (the renderer cannot ask the host to delete arbitrary
+   * paths). Never throws; reports per-entry errors via the result.
+   */
+  cleanupScratchProjects(): Promise<ScratchCleanupResult>;
+}
+
+/**
+ * Export pipeline.
+ *
+ * `svg` walks the document graph directly, so it can render a
+ * caller-specified node subset (`nodeIds` empty = whole document).
+ * `png` rasterises the live renderer scene; the renderer's id space
+ * (`u64`) is disjoint from the document graph's (`Uuid`), so
+ * per-node PNG export waits on the Phase 1 document→scene translator
+ * — the API surface omits a `nodeIds` parameter rather than accepting
+ * one it would silently ignore.
+ */
+export interface ExportBridge {
+  svg(nodeIds: string[], options: SvgExportOptions): Promise<string>;
+  png(outputPath: string, options: PngExportOptions): Promise<number>;
+}
+
 declare global {
   interface Window {
     kcreate: {
       renderer: RendererBridge;
+      document: DocumentBridge;
+      runtime: RuntimeBridge;
+      export: ExportBridge;
     };
   }
 }

@@ -440,6 +440,119 @@ function registerIpcHandlers(): void {
     (_e, outputPath: string, optionsJson: string) =>
       requireBridge().exportPng(outputPath, optionsJson),
   );
+  ipcMain.handle(
+    "kcreate/export/pdf",
+    (_e, outputPath: string, optionsJson: string) =>
+      requireBridge().exportPdf(outputPath, optionsJson),
+  );
+  ipcMain.handle(
+    "kcreate/export/webp",
+    (_e, outputPath: string, optionsJson: string) =>
+      requireBridge().exportWebp(outputPath, optionsJson),
+  );
+  ipcMain.handle(
+    "kcreate/export/jpeg",
+    (_e, outputPath: string, optionsJson: string) =>
+      requireBridge().exportJpeg(outputPath, optionsJson),
+  );
+
+  // Canvas: scene sync, hit testing, selection, shape creation, move,
+  // raster import. All N-API entry points already validate inputs and
+  // raise typed errors on misuse; this layer just marshals.
+  ipcMain.handle("kcreate/document/syncScene", () => {
+    requireBridge().documentSyncScene();
+  });
+  ipcMain.handle(
+    "kcreate/canvas/hitTest",
+    (_e, x: number, y: number) => requireBridge().canvasHitTest(x, y),
+  );
+  ipcMain.handle(
+    "kcreate/document/setSelection",
+    (_e, nodeIds: string[]) => {
+      requireBridge().documentSetSelection(nodeIds);
+    },
+  );
+  ipcMain.handle("kcreate/document/getSelection", () =>
+    requireBridge().documentGetSelection(),
+  );
+  ipcMain.handle("kcreate/document/clearSelection", () => {
+    requireBridge().documentClearSelection();
+  });
+  ipcMain.handle(
+    "kcreate/document/importImage",
+    (_e, parentId: string | null, filePath: string) =>
+      requireBridge().documentImportImage(parentId, filePath),
+  );
+  ipcMain.handle(
+    "kcreate/canvas/createRect",
+    (
+      _e,
+      parentId: string | null,
+      x: number,
+      y: number,
+      w: number,
+      h: number,
+    ) => requireBridge().canvasCreateRect(parentId, x, y, w, h),
+  );
+  ipcMain.handle(
+    "kcreate/canvas/createEllipse",
+    (
+      _e,
+      parentId: string | null,
+      cx: number,
+      cy: number,
+      rx: number,
+      ry: number,
+    ) => requireBridge().canvasCreateEllipse(parentId, cx, cy, rx, ry),
+  );
+  ipcMain.handle(
+    "kcreate/canvas/createLine",
+    (
+      _e,
+      parentId: string | null,
+      x1: number,
+      y1: number,
+      x2: number,
+      y2: number,
+    ) => requireBridge().canvasCreateLine(parentId, x1, y1, x2, y2),
+  );
+  ipcMain.handle(
+    "kcreate/canvas/createText",
+    (
+      _e,
+      parentId: string | null,
+      x: number,
+      y: number,
+      text: string,
+      fontSize: number,
+    ) => requireBridge().canvasCreateText(parentId, x, y, text, fontSize),
+  );
+  ipcMain.handle(
+    "kcreate/canvas/moveNode",
+    (_e, nodeId: string, dx: number, dy: number) => {
+      requireBridge().canvasMoveNode(nodeId, dx, dy);
+    },
+  );
+
+  // AI Assist
+  ipcMain.handle(
+    "kcreate/ai/removeBackground",
+    (_e, nodeId: string) => requireBridge().aiRemoveBackground(nodeId),
+  );
+  ipcMain.handle("kcreate/ai/getActionLog", () =>
+    requireBridge().aiGetActionLog(),
+  );
+
+  // Local MCP server. Loopback-only, opt-in. The renderer cannot bind
+  // to anything other than 127.0.0.1 — the server addr is hard-coded in
+  // kcreate_mcp::server.
+  ipcMain.handle("kcreate/mcp/start", () => requireBridge().mcpStart());
+  ipcMain.handle("kcreate/mcp/stop", () => {
+    requireBridge().mcpStop();
+  });
+  ipcMain.handle("kcreate/mcp/isRunning", () =>
+    requireBridge().mcpIsRunning(),
+  );
 }
 
 void app.whenReady().then(() => {

@@ -1175,8 +1175,10 @@ dependencies = [
 name = "kcreate_tests"
 version = "0.0.1"
 dependencies = [
+ "kcreate_ai",
  "kcreate_core",
  "kcreate_export",
+ "kcreate_mcp",
  "kcreate_renderer",
  "kcreate_storage",
  "kcreate_vector",

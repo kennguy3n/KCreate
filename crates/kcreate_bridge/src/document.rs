@@ -1195,6 +1195,92 @@ pub fn export_pdf_file(output_path: &Path, options: &PdfExportRequest) -> Result
 }
 
 // -----------------------------------------------------------------------------
+// WebP export
+// -----------------------------------------------------------------------------
+
+/// JSON-friendly WebP export options. Mirrors
+/// [`kcreate_export::webp::WebpExportOptions`].
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct WebpExportRequest {
+    pub width: u32,
+    pub height: u32,
+    #[serde(default = "default_scale")]
+    pub scale: f32,
+    #[serde(default = "default_quality")]
+    pub quality: u32,
+    #[serde(default = "default_lossless")]
+    pub lossless: bool,
+    #[serde(default)]
+    pub background: Option<[f32; 4]>,
+}
+
+const fn default_quality() -> u32 {
+    90
+}
+const fn default_lossless() -> bool {
+    true
+}
+
+/// Render the current renderer scene to WebP at `output_path`. Returns
+/// the number of bytes written.
+pub fn export_webp_file(output_path: &Path, options: &WebpExportRequest) -> Result<u64> {
+    let scene = crate::state::current_scene()?;
+    let opts = kcreate_export::WebpExportOptions {
+        width: options.width,
+        height: options.height,
+        scale: options.scale,
+        quality: options.quality,
+        lossless: options.lossless,
+        background: options
+            .background
+            .map(|[r, g, b, a]| kcreate_renderer::geometry::Color::rgba(r, g, b, a)),
+    };
+    kcreate_export::export_webp(&scene, &opts, output_path)
+        .map_err(|e| DocumentBridgeError::Io(std::io::Error::other(e.to_string())))?;
+    let meta = std::fs::metadata(output_path)?;
+    Ok(meta.len())
+}
+
+// -----------------------------------------------------------------------------
+// JPEG export
+// -----------------------------------------------------------------------------
+
+/// JSON-friendly JPEG export options. Mirrors
+/// [`kcreate_export::jpeg::JpegExportOptions`].
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct JpegExportRequest {
+    pub width: u32,
+    pub height: u32,
+    #[serde(default = "default_scale")]
+    pub scale: f32,
+    #[serde(default = "default_quality")]
+    pub quality: u32,
+    #[serde(default)]
+    pub background: Option<[f32; 4]>,
+}
+
+/// Render the current renderer scene to JPEG at `output_path`. Returns
+/// the number of bytes written.
+pub fn export_jpeg_file(output_path: &Path, options: &JpegExportRequest) -> Result<u64> {
+    let scene = crate::state::current_scene()?;
+    let opts = kcreate_export::JpegExportOptions {
+        width: options.width,
+        height: options.height,
+        scale: options.scale,
+        quality: options.quality,
+        background: options
+            .background
+            .map(|[r, g, b, a]| kcreate_renderer::geometry::Color::rgba(r, g, b, a)),
+    };
+    kcreate_export::export_jpeg(&scene, &opts, output_path)
+        .map_err(|e| DocumentBridgeError::Io(std::io::Error::other(e.to_string())))?;
+    let meta = std::fs::metadata(output_path)?;
+    Ok(meta.len())
+}
+
+// -----------------------------------------------------------------------------
 // AI: background removal
 // -----------------------------------------------------------------------------
 

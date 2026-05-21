@@ -530,6 +530,38 @@ pub fn export_pdf(output_path: String, options_json: String) -> NapiResult<u32> 
     Ok(u32::try_from(bytes).unwrap_or(u32::MAX))
 }
 
+/// Render the current renderer scene to WebP at `output_path`. Returns
+/// the file size in bytes.
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn export_webp(output_path: String, options_json: String) -> NapiResult<u32> {
+    let opts: document::WebpExportRequest = serde_json::from_str(&options_json).map_err(|e| {
+        NapiError::new(
+            Status::InvalidArg,
+            format!("kcreate_bridge: bad webp options json: {e}"),
+        )
+    })?;
+    let bytes =
+        document::export_webp_file(&PathBuf::from(output_path), &opts).map_err(map_doc_err)?;
+    Ok(u32::try_from(bytes).unwrap_or(u32::MAX))
+}
+
+/// Render the current renderer scene to JPEG at `output_path`. Returns
+/// the file size in bytes.
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn export_jpeg(output_path: String, options_json: String) -> NapiResult<u32> {
+    let opts: document::JpegExportRequest = serde_json::from_str(&options_json).map_err(|e| {
+        NapiError::new(
+            Status::InvalidArg,
+            format!("kcreate_bridge: bad jpeg options json: {e}"),
+        )
+    })?;
+    let bytes =
+        document::export_jpeg_file(&PathBuf::from(output_path), &opts).map_err(map_doc_err)?;
+    Ok(u32::try_from(bytes).unwrap_or(u32::MAX))
+}
+
 // =============================================================================
 // Canvas / scene synchronisation
 // =============================================================================

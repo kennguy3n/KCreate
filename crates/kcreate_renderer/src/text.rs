@@ -62,10 +62,10 @@ fn push_outline(outline: &[OutlineCommand], dx: f32, dy: f32, out: &mut Vec<Path
     for c in outline {
         match *c {
             OutlineCommand::MoveTo { x, y } => {
-                out.push(PathCommand::MoveTo(Point2::new(x + dx, y + dy)))
+                out.push(PathCommand::MoveTo(Point2::new(x + dx, y + dy)));
             }
             OutlineCommand::LineTo { x, y } => {
-                out.push(PathCommand::LineTo(Point2::new(x + dx, y + dy)))
+                out.push(PathCommand::LineTo(Point2::new(x + dx, y + dy)));
             }
             OutlineCommand::QuadTo { cx, cy, x, y } => out.push(PathCommand::QuadTo {
                 ctrl: Point2::new(cx + dx, cy + dy),

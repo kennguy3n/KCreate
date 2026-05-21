@@ -6,12 +6,17 @@ import { contextBridge, ipcRenderer } from "electron";
 
 import type {
   AcquiredFrame,
+  AiBridge,
+  CanvasBridge,
   CreateNodeProps,
   DocumentBridge,
   DocumentStatus,
   ExportBridge,
   FrameInfo,
+  JpegExportOptions,
+  McpBridge,
   NodeInfo,
+  PdfExportOptions,
   PngExportOptions,
   ProjectInfo,
   RendererBridge,
@@ -22,6 +27,7 @@ import type {
   ScratchCleanupResult,
   SvgExportOptions,
   UpdateNodeProps,
+  WebpExportOptions,
 } from "../../shared/scene";
 
 type FrameInfoSnake = {
@@ -304,11 +310,136 @@ const exportApi: ExportBridge = {
       JSON.stringify(options),
     )) as number;
   },
+  async pdf(outputPath: string, options: PdfExportOptions): Promise<number> {
+    return (await ipcRenderer.invoke(
+      "kcreate/export/pdf",
+      outputPath,
+      JSON.stringify(options),
+    )) as number;
+  },
+  async webp(outputPath: string, options: WebpExportOptions): Promise<number> {
+    return (await ipcRenderer.invoke(
+      "kcreate/export/webp",
+      outputPath,
+      JSON.stringify(options),
+    )) as number;
+  },
+  async jpeg(outputPath: string, options: JpegExportOptions): Promise<number> {
+    return (await ipcRenderer.invoke(
+      "kcreate/export/jpeg",
+      outputPath,
+      JSON.stringify(options),
+    )) as number;
+  },
+};
+
+const canvas: CanvasBridge = {
+  async syncScene(): Promise<void> {
+    await ipcRenderer.invoke("kcreate/document/syncScene");
+  },
+  async hitTest(x: number, y: number): Promise<string | null> {
+    return (await ipcRenderer.invoke(
+      "kcreate/canvas/hitTest",
+      x,
+      y,
+    )) as string | null;
+  },
+  async setSelection(nodeIds: string[]): Promise<void> {
+    await ipcRenderer.invoke("kcreate/document/setSelection", nodeIds);
+  },
+  async getSelection(): Promise<string[]> {
+    return (await ipcRenderer.invoke(
+      "kcreate/document/getSelection",
+    )) as string[];
+  },
+  async clearSelection(): Promise<void> {
+    await ipcRenderer.invoke("kcreate/document/clearSelection");
+  },
+  async importImage(
+    parentId: string | null,
+    filePath: string,
+  ): Promise<string> {
+    return (await ipcRenderer.invoke(
+      "kcreate/document/importImage",
+      parentId,
+      filePath,
+    )) as string;
+  },
+  async createRect(parentId, x, y, w, h): Promise<string> {
+    return (await ipcRenderer.invoke(
+      "kcreate/canvas/createRect",
+      parentId,
+      x,
+      y,
+      w,
+      h,
+    )) as string;
+  },
+  async createEllipse(parentId, cx, cy, rx, ry): Promise<string> {
+    return (await ipcRenderer.invoke(
+      "kcreate/canvas/createEllipse",
+      parentId,
+      cx,
+      cy,
+      rx,
+      ry,
+    )) as string;
+  },
+  async createLine(parentId, x1, y1, x2, y2): Promise<string> {
+    return (await ipcRenderer.invoke(
+      "kcreate/canvas/createLine",
+      parentId,
+      x1,
+      y1,
+      x2,
+      y2,
+    )) as string;
+  },
+  async createText(parentId, x, y, text, fontSize): Promise<string> {
+    return (await ipcRenderer.invoke(
+      "kcreate/canvas/createText",
+      parentId,
+      x,
+      y,
+      text,
+      fontSize,
+    )) as string;
+  },
+  async moveNode(nodeId: string, dx: number, dy: number): Promise<void> {
+    await ipcRenderer.invoke("kcreate/canvas/moveNode", nodeId, dx, dy);
+  },
+};
+
+const ai: AiBridge = {
+  async removeBackground(nodeId: string): Promise<string> {
+    return (await ipcRenderer.invoke(
+      "kcreate/ai/removeBackground",
+      nodeId,
+    )) as string;
+  },
+  async getActionLog(): Promise<string> {
+    return (await ipcRenderer.invoke("kcreate/ai/getActionLog")) as string;
+  },
+};
+
+const mcp: McpBridge = {
+  async start(): Promise<number> {
+    return (await ipcRenderer.invoke("kcreate/mcp/start")) as number;
+  },
+  async stop(): Promise<void> {
+    await ipcRenderer.invoke("kcreate/mcp/stop");
+  },
+  async isRunning(): Promise<boolean> {
+    return (await ipcRenderer.invoke("kcreate/mcp/isRunning")) as boolean;
+  },
 };
 
 contextBridge.exposeInMainWorld("kcreate", {
   renderer,
   document,
+  canvas,
+  ai,
+  mcp,
   runtime,
   export: exportApi,
 });

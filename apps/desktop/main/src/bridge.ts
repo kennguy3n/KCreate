@@ -102,6 +102,55 @@ export interface Bridge {
   runtimeStatus(): RuntimeStatusSnake;
   exportSvg(nodeIds: string[], optionsJson: string): string;
   exportPng(outputPath: string, optionsJson: string): number;
+  exportPdf(outputPath: string, optionsJson: string): number;
+  exportWebp(outputPath: string, optionsJson: string): number;
+  exportJpeg(outputPath: string, optionsJson: string): number;
+
+  // Canvas: scene sync, hit testing, selection, shape creation, move
+  documentSyncScene(): void;
+  canvasHitTest(x: number, y: number): string | null;
+  documentSetSelection(nodeIds: string[]): void;
+  documentGetSelection(): string[];
+  documentClearSelection(): void;
+  documentImportImage(parentId: string | null, filePath: string): string;
+  canvasCreateRect(
+    parentId: string | null,
+    x: number,
+    y: number,
+    w: number,
+    h: number,
+  ): string;
+  canvasCreateEllipse(
+    parentId: string | null,
+    cx: number,
+    cy: number,
+    rx: number,
+    ry: number,
+  ): string;
+  canvasCreateLine(
+    parentId: string | null,
+    x1: number,
+    y1: number,
+    x2: number,
+    y2: number,
+  ): string;
+  canvasCreateText(
+    parentId: string | null,
+    x: number,
+    y: number,
+    text: string,
+    fontSize: number,
+  ): string;
+  canvasMoveNode(nodeId: string, dx: number, dy: number): void;
+
+  // AI Assist
+  aiRemoveBackground(nodeId: string): string;
+  aiGetActionLog(): string;
+
+  // Local MCP server (loopback only, opt-in)
+  mcpStart(): number;
+  mcpStop(): void;
+  mcpIsRunning(): boolean;
 }
 
 function bridgeBinaryPath(): string {

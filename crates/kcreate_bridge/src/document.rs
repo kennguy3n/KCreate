@@ -186,8 +186,18 @@ pub fn project_create(name: &str, dir: &Path) -> Result<ProjectInfo> {
     // host sees stable ids across reopen and so the two records can't
     // drift. ProjectStore::create generates the manifest's UUID; we
     // adopt it instead of letting Project::new pick a fresh one.
+    //
+    // `with_max_undo_depth` (rather than `new`) wires the device-tier
+    // budget from `RuntimeConfig::max_undo_depth` (32 on Tier 0, 1024
+    // on Tier 3) into the new `OperationLog`. `ANALYSIS_0003` on PR #2
+    // flagged the prior `OperationLog::default()` path: low-end devices
+    // silently used a 256-deep log instead of the intended 32, and
+    // high-end devices were capped at 256 instead of 1024. Fixing it
+    // at the constructor (rather than mutating the log post-hoc) keeps
+    // the depth invariant true for the lifetime of the project.
     let manifest = store.manifest();
-    let mut project = Project::new(manifest.name.clone());
+    let mut project =
+        Project::with_max_undo_depth(manifest.name.clone(), cached_runtime().max_undo_depth);
     project.id = manifest.id;
     project.created_at = manifest.created_at;
     project.modified_at = manifest.modified_at;
@@ -222,7 +232,15 @@ pub fn project_open(dir: &Path) -> Result<ProjectInfo> {
     // here — reopen should never invent fresh preset UUIDs. Once the
     // store learns to persist design tokens / brand kits / presets,
     // they will round-trip through `manifest`/`load_*` instead.
-    let mut project = Project::new(manifest.name.clone());
+    //
+    // Same device-tier wiring as `project_create` (`ANALYSIS_0003` on
+    // PR #2). The on-disk operation history may contain *more* rows
+    // than the current tier budget allows (e.g. project saved on a
+    // Tier 3 box with 1024-deep log, reopened on a Tier 0 box with
+    // 32-deep log) — `OperationLog::restore_from` enforces the cap
+    // by dropping from the front to retain the most recent ops.
+    let mut project =
+        Project::with_max_undo_depth(manifest.name.clone(), cached_runtime().max_undo_depth);
     project.id = manifest.id;
     project.created_at = manifest.created_at;
     project.modified_at = manifest.modified_at;
@@ -508,6 +526,35 @@ pub fn document_redo() -> Result<Option<Vec<Uuid>>> {
 // Runtime status
 // -----------------------------------------------------------------------------
 
+/// Cached subset of [`RuntimeConfig::detect`] used to drive the
+/// [`Project`] undo-log budget.
+///
+/// We cache only the fields needed to size the operation log
+/// (`max_undo_depth`) plus the `runtime_status` shape — the full
+/// `RuntimeConfig` carries `PathBuf`s that don't `Clone` for free.
+#[derive(Debug, Clone)]
+struct CachedRuntime {
+    status: RuntimeStatus,
+    max_undo_depth: usize,
+}
+
+fn cached_runtime() -> &'static CachedRuntime {
+    static CACHE: OnceLock<CachedRuntime> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        let cfg = RuntimeConfig::detect();
+        CachedRuntime {
+            status: RuntimeStatus {
+                device_tier: format!("{:?}", cfg.device_tier),
+                gpu_available: cfg.gpu_available,
+                gpu_name: cfg.gpu_name,
+                platform: format!("{:?}", cfg.platform),
+                total_ram_mb: cfg.total_ram_mb,
+            },
+            max_undo_depth: cfg.max_undo_depth,
+        }
+    })
+}
+
 /// Returns a cached snapshot of the host system.
 ///
 /// The probe (`RuntimeConfig::detect()`) is not cheap — it does
@@ -515,19 +562,7 @@ pub fn document_redo() -> Result<Option<Vec<Uuid>>> {
 /// it once per process and cache the result. The values are stable
 /// for the lifetime of the process.
 pub fn runtime_status() -> RuntimeStatus {
-    static CACHE: OnceLock<RuntimeStatus> = OnceLock::new();
-    CACHE
-        .get_or_init(|| {
-            let cfg = RuntimeConfig::detect();
-            RuntimeStatus {
-                device_tier: format!("{:?}", cfg.device_tier),
-                gpu_available: cfg.gpu_available,
-                gpu_name: cfg.gpu_name,
-                platform: format!("{:?}", cfg.platform),
-                total_ram_mb: cfg.total_ram_mb,
-            }
-        })
-        .clone()
+    cached_runtime().status.clone()
 }
 
 /// Snapshot of the live document's editing state, used by the host UI

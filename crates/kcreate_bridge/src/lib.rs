@@ -466,6 +466,13 @@ pub fn document_status() -> Option<DocumentStatus> {
 /// Export SVG for the given node ids (empty = whole document).
 /// `options_json` is a JSON object with `width`, `height`,
 /// `include_metadata`, `optimize` fields.
+///
+/// Malformed JSON is rejected with `Status::InvalidArg`, matching
+/// [`export_png`]'s contract. `ANALYSIS_0002` on PR #2 flagged the
+/// previous `unwrap_or_default()` path: a typo in `optionsJson` would
+/// silently fall back to the SVG default viewport, producing a valid
+/// but unexpectedly-sized file rather than surfacing the host-side
+/// bug. Both export entry points now propagate JSON errors identically.
 #[napi]
 #[allow(clippy::needless_pass_by_value)]
 pub fn export_svg(node_ids: Vec<String>, options_json: String) -> NapiResult<String> {
@@ -473,7 +480,12 @@ pub fn export_svg(node_ids: Vec<String>, options_json: String) -> NapiResult<Str
         .iter()
         .map(|s| parse_uuid(s))
         .collect::<NapiResult<_>>()?;
-    let opts: SvgExportOptions = serde_json::from_str(&options_json).unwrap_or_default();
+    let opts: SvgExportOptions = serde_json::from_str(&options_json).map_err(|e| {
+        NapiError::new(
+            Status::InvalidArg,
+            format!("kcreate_bridge: bad svg options json: {e}"),
+        )
+    })?;
     document::export_svg(&ids, &opts).map_err(map_doc_err)
 }
 

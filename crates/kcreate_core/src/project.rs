@@ -157,7 +157,16 @@ pub struct Project {
 }
 
 impl Project {
-    /// Create a new, empty project with sensible defaults.
+    /// Create a new, empty project with the default 256-deep undo log.
+    ///
+    /// **Production callers that have a `RuntimeConfig` should prefer
+    /// [`Self::with_max_undo_depth`]** so the log respects the
+    /// device-tier budget computed by
+    /// [`crate::config::DeviceTier::default_undo_depth`] (32 on Tier 0,
+    /// 128 on Tier 1, 256 on Tier 2, 1024 on Tier 3). This entry
+    /// point keeps the simple `Project::new(name)` ergonomics for
+    /// tests, examples, and any caller for whom the default budget is
+    /// the right answer.
     ///
     /// Note: `export_presets`, `design_tokens`, and `brand_kits` start
     /// empty so identifiers are stable across save/reopen. Call
@@ -167,12 +176,33 @@ impl Project {
     /// to restore them, not on auto-population that would change ids.
     #[must_use]
     pub fn new(name: impl Into<String>) -> Self {
+        // 256 mirrors `OperationLog::default()` (Tier 2). Production
+        // paths override via `with_max_undo_depth`.
+        Self::with_max_undo_depth(name, 256)
+    }
+
+    /// Create a new, empty project whose undo log retains at most
+    /// `max_undo_depth` operations.
+    ///
+    /// This is the constructor production paths should use: it lets
+    /// the bridge thread the device-tier budget from
+    /// [`crate::config::RuntimeConfig::max_undo_depth`] all the way
+    /// down to the `OperationLog`, so a Tier 0 device (< 8 GB RAM)
+    /// actually gets a 32-deep history instead of silently retaining
+    /// 256 ops and exceeding its memory budget, and a Tier 3 device
+    /// (≥ 32 GB) actually gets the 1024-deep history its docstring
+    /// promises instead of being capped at 256.
+    ///
+    /// `0` is clamped to `1` by [`OperationLog::new`] — a useless but
+    /// well-defined edge.
+    #[must_use]
+    pub fn with_max_undo_depth(name: impl Into<String>, max_undo_depth: usize) -> Self {
         let now = Utc::now();
         Self {
             id: Uuid::new_v4(),
             name: name.into(),
             document: DocumentGraph::new(),
-            operation_log: OperationLog::default(),
+            operation_log: OperationLog::new(max_undo_depth),
             design_tokens: DesignTokens::default(),
             brand_kits: Vec::new(),
             export_presets: Vec::new(),
@@ -319,6 +349,33 @@ mod tests {
             "new() must not auto-generate presets with fresh UUIDs (footgun on reopen)"
         );
         assert!(p.brand_kits.is_empty());
+    }
+
+    /// Regression test for `ANALYSIS_0003` on PR #2.
+    ///
+    /// `Project::new` previously hard-coded `OperationLog::default()`
+    /// (256-deep), silently ignoring `RuntimeConfig::max_undo_depth`
+    /// even though `DeviceTier::default_undo_depth` returns 32 on
+    /// Tier 0 and 1024 on Tier 3. The `with_max_undo_depth`
+    /// constructor is the production entry point that threads the
+    /// device-tier budget into the log; this test pins the boundary
+    /// behavior so a future "just call `new` everywhere" refactor
+    /// can't silently regress the resource-awareness contract from
+    /// `ARCHITECTURE.md` §14.
+    #[test]
+    fn with_max_undo_depth_threads_through_to_log() {
+        let tier0 = Project::with_max_undo_depth("tier0", 32);
+        assert_eq!(tier0.operation_log.max_depth(), 32);
+        let tier3 = Project::with_max_undo_depth("tier3", 1024);
+        assert_eq!(tier3.operation_log.max_depth(), 1024);
+        // `new` still uses the documented 256 default so existing
+        // callers (tests, examples) don't shift behaviour.
+        let default_p = Project::new("default");
+        assert_eq!(default_p.operation_log.max_depth(), 256);
+        // `0` is clamped to `1` (a useless but well-defined edge),
+        // matching `OperationLog::new`.
+        let edge = Project::with_max_undo_depth("edge", 0);
+        assert_eq!(edge.operation_log.max_depth(), 1);
     }
 
     #[test]

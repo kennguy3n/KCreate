@@ -231,6 +231,14 @@ export interface ScratchCleanupResult {
   removed: number;
   /** Number of entries that errored during inspection/removal. */
   errors: number;
+  /**
+   * Number of entries skipped because they were claimed by another
+   * live KCreate instance (via `.kclock` PID liveness check or the
+   * "just-created" mtime grace window). Surfaced so Phase 1
+   * observability (and the `runtime/devTools` panel) can distinguish
+   * "successfully skipped a sibling" from "failed to delete".
+   */
+  skippedOwned: number;
 }
 
 /** Runtime / device probe. */

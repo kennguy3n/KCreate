@@ -16,6 +16,156 @@ import { loadBridge, type Bridge } from "./bridge";
 const SCRATCH_PREFIX = "scratch-";
 const SCRATCH_SUFFIX = ".kstudio";
 
+/// Lockfile written inside each scratch project directory by the
+/// instance that owns it. Presence-plus-live-PID is the signal
+/// `cleanupScratchProjects` uses to refuse deletion of a directory
+/// that another running KCreate is actively editing.
+///
+/// The dot prefix keeps it out of glob results that show user-visible
+/// project content; the extension `.kclock` (KCreate lock) is unique
+/// enough to avoid collisions with anything the editor or its tools
+/// might legitimately store inside `.kstudio`.
+const SCRATCH_LOCKFILE_NAME = ".kclock";
+
+/// Grace period during which a freshly-created scratch directory is
+/// considered "in use" even if its lockfile hasn't landed yet.
+///
+/// Closes the narrow window between
+///   1. The bridge `project_create` finishing (`.kstudio` exists), and
+///   2. The IPC handler writing the lockfile (`.kclock` lands).
+/// A concurrent instance running `cleanupScratchProjects` in that
+/// window would otherwise delete the just-created scratch project of
+/// another running KCreate. 10 s is far longer than the create
+/// pathway needs and far shorter than "genuinely stale".
+const SCRATCH_LOCKFILE_GRACE_MS = 10_000;
+
+/// Shape of `.kclock`. The PID lets a sweeping instance check
+/// liveness via `process.kill(pid, 0)`. `startedAt` is informational
+/// (helps humans tailing the temp dir) and lets us future-proof
+/// against PID reuse if we ever start matching against
+/// `app.startTime()` too.
+interface ScratchLockfile {
+  pid: number;
+  startedAt: string;
+}
+
+/// Track the path of the open scratch project (if any) so the
+/// `kcreate/project/close` and `will-quit` paths can remove its
+/// lockfile before the sweep runs. A non-null value means "this
+/// instance currently owns a scratch dir at this path".
+let ownedScratchPath: string | null = null;
+
+/// Returns true when `dir` looks like a scratch directory that this
+/// host process would own — i.e. lives directly under `os.tmpdir()`
+/// and matches the `SCRATCH_PREFIX`/`SCRATCH_SUFFIX` naming. Used to
+/// scope lockfile writes to the projects whose lifecycle we actually
+/// manage; user-named projects in `~/Documents/` never get a `.kclock`
+/// because they're never swept.
+function isOwnedScratchPath(dir: string): boolean {
+  const resolved = path.resolve(dir);
+  if (path.dirname(resolved) !== path.resolve(os.tmpdir())) return false;
+  const name = path.basename(resolved);
+  return name.startsWith(SCRATCH_PREFIX) && name.endsWith(SCRATCH_SUFFIX);
+}
+
+/// Write the lockfile that marks `projectPath` as owned by this
+/// process. Best-effort — if the write fails, the dir falls back to
+/// the mtime-grace heuristic in `isScratchDirOwnedByLiveInstance`,
+/// so the failure mode is "deletable a bit earlier than ideal" not
+/// "data loss".
+async function writeScratchLockfile(projectPath: string): Promise<void> {
+  const lockPath = path.join(projectPath, SCRATCH_LOCKFILE_NAME);
+  const payload: ScratchLockfile = {
+    pid: process.pid,
+    startedAt: new Date().toISOString(),
+  };
+  try {
+    await fs.writeFile(lockPath, JSON.stringify(payload), { encoding: "utf8" });
+  } catch {
+    // best-effort; grace window covers the lockfile-missing case.
+  }
+}
+
+/// Remove our lockfile so the directory becomes eligible for
+/// cleanup. Idempotent and silent on ENOENT.
+async function removeScratchLockfile(projectPath: string): Promise<void> {
+  const lockPath = path.join(projectPath, SCRATCH_LOCKFILE_NAME);
+  try {
+    await fs.rm(lockPath, { force: true });
+  } catch {
+    // best-effort
+  }
+}
+
+/// Cross-platform "is this PID alive right now?" check.
+///
+/// `process.kill(pid, 0)` is the POSIX idiom: signal 0 performs the
+/// permission-and-existence check without actually delivering a
+/// signal. Node's libuv wraps this on Windows too (it routes to
+/// `OpenProcess`), so the same code works across all three target
+/// platforms.
+///
+/// Two error codes we deliberately interpret as "alive":
+///   * `ESRCH` — no such process → dead.
+///   * `EPERM` — process exists but we lack permission to signal it
+///              (this happens on Windows when the other instance
+///              runs as a different user). Definitely alive; we
+///              must NOT clean its dir.
+function isProcessAlive(pid: number): boolean {
+  if (!Number.isFinite(pid) || pid <= 0 || pid === process.pid) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    return code === "EPERM";
+  }
+}
+
+/// Decide whether `dirPath` is currently in use by a live KCreate
+/// instance other than this one. Used by `cleanupScratchProjects` to
+/// skip deletion of directories another process is editing.
+///
+/// Order of evidence:
+///   1. Parse `<dir>/.kclock`. If it names a live foreign PID, the
+///      directory is owned → skip.
+///   2. If no lockfile but the directory mtime is within the grace
+///      window (`SCRATCH_LOCKFILE_GRACE_MS`), assume it's mid-create
+///      by an instance whose lockfile hasn't landed yet → skip.
+///   3. Otherwise → stale, eligible for deletion.
+///
+/// A malformed or unreadable lockfile is treated as "absent" —
+/// pessimistically *not* a reason to skip cleanup, because the
+/// alternative is leaking forever on corruption. The grace window
+/// still catches the legitimate "just created" case.
+async function isScratchDirOwnedByLiveInstance(dirPath: string): Promise<boolean> {
+  const lockPath = path.join(dirPath, SCRATCH_LOCKFILE_NAME);
+  try {
+    const raw = await fs.readFile(lockPath, { encoding: "utf8" });
+    const parsed: unknown = JSON.parse(raw);
+    if (parsed && typeof parsed === "object" && "pid" in parsed) {
+      const pid = (parsed as { pid: unknown }).pid;
+      if (typeof pid === "number" && pid !== process.pid && isProcessAlive(pid)) {
+        return true;
+      }
+    }
+  } catch {
+    // No lockfile or unreadable — fall through to the grace check.
+  }
+  try {
+    const st = await fs.stat(dirPath);
+    const ageMs = Date.now() - st.mtimeMs;
+    if (ageMs >= 0 && ageMs < SCRATCH_LOCKFILE_GRACE_MS) {
+      return true;
+    }
+  } catch {
+    // Stat failed — fall through. Returning false (not owned) is
+    // the safer choice: the subsequent `fs.rm` will fail too and be
+    // counted as an error, surfacing the underlying problem.
+  }
+  return false;
+}
+
 /// Best-effort cleanup of stale scratch projects in the OS temp dir.
 ///
 /// A "scratch" project is a `.kstudio` directory created from the Home
@@ -42,16 +192,18 @@ async function cleanupScratchProjects(): Promise<{
   scanned: number;
   removed: number;
   errors: number;
+  skippedOwned: number;
 }> {
   const base = os.tmpdir();
   let scanned = 0;
   let removed = 0;
   let errors = 0;
+  let skippedOwned = 0;
   let entries: import("node:fs").Dirent[];
   try {
     entries = await fs.readdir(base, { withFileTypes: true });
   } catch {
-    return { scanned, removed, errors: 1 };
+    return { scanned, removed, errors: 1, skippedOwned };
   }
   for (const entry of entries) {
     if (!entry.isDirectory()) continue;
@@ -69,6 +221,16 @@ async function cleanupScratchProjects(): Promise<{
       errors += 1;
       continue;
     }
+    // ANALYSIS_c42c3f1_0001: cross-instance safety. On macOS/Linux,
+    // advisory file locking doesn't prevent `fs.rm` from succeeding
+    // even while another KCreate has the SQLite file open, so the
+    // unlucky-second instance would corrupt the first's open
+    // workspace. The lockfile + liveness check below makes the host
+    // process the sole authority on "is this scratch dir in use".
+    if (await isScratchDirOwnedByLiveInstance(candidate)) {
+      skippedOwned += 1;
+      continue;
+    }
     try {
       await fs.rm(candidate, { recursive: true, force: true });
       removed += 1;
@@ -76,7 +238,7 @@ async function cleanupScratchProjects(): Promise<{
       errors += 1;
     }
   }
-  return { scanned, removed, errors };
+  return { scanned, removed, errors, skippedOwned };
 }
 
 // The native bridge is loaded eagerly in `app.whenReady`, BEFORE any IPC
@@ -169,18 +331,48 @@ function registerIpcHandlers(): void {
   );
 
   // Document / project lifecycle.
+  //
+  // The `project/create` and `project/open` handlers also manage the
+  // scratch-dir lockfile (ANALYSIS_c42c3f1_0001): after the bridge
+  // succeeds, we write `.kclock` into the project dir so a sibling
+  // KCreate's `cleanupScratchProjects` sweep refuses to delete it
+  // while we still hold the SQLite file open. `project/close`
+  // removes our own lockfile so the next sweep — either in this
+  // process or any other — will reap the directory cleanly.
   ipcMain.handle(
     "kcreate/project/create",
-    (_e, name: string, dir: string) =>
-      requireBridge().projectCreate(name, dir),
+    async (_e, name: string, dir: string) => {
+      const info = requireBridge().projectCreate(name, dir);
+      if (isOwnedScratchPath(info.path)) {
+        ownedScratchPath = info.path;
+        await writeScratchLockfile(info.path);
+      }
+      return info;
+    },
   );
-  ipcMain.handle("kcreate/project/open", (_e, dir: string) =>
-    requireBridge().projectOpen(dir),
-  );
+  ipcMain.handle("kcreate/project/open", async (_e, dir: string) => {
+    const info = requireBridge().projectOpen(dir);
+    if (isOwnedScratchPath(info.path)) {
+      ownedScratchPath = info.path;
+      await writeScratchLockfile(info.path);
+    }
+    return info;
+  });
   ipcMain.handle("kcreate/project/save", () => {
     requireBridge().projectSave();
   });
-  ipcMain.handle("kcreate/project/close", () => {
+  ipcMain.handle("kcreate/project/close", async () => {
+    // Release the lockfile *before* the bridge call so a concurrent
+    // sweep observing the empty `.kclock`-less dir would only see a
+    // workspace that's about to close; with the bridge call first,
+    // there is a TOCTOU window where the dir has been closed but the
+    // lockfile still names this PID as owner (and we'd briefly block
+    // our own sweep).
+    const path = ownedScratchPath;
+    if (path !== null) {
+      await removeScratchLockfile(path);
+      ownedScratchPath = null;
+    }
     requireBridge().projectClose();
   });
   ipcMain.handle("kcreate/project/getInfo", () =>
@@ -297,6 +489,16 @@ app.on("will-quit", (event) => {
   event.preventDefault();
   void (async () => {
     try {
+      // Drop the lockfile *first* so our own scratch dir becomes
+      // eligible for the sweep two lines below. Doing this before
+      // `projectClose` is intentional: the bridge releases the
+      // SQLite file on close, but the lockfile lives on disk and is
+      // managed entirely by the host — there is no dependency
+      // ordering between the two cleanups.
+      if (ownedScratchPath !== null) {
+        await removeScratchLockfile(ownedScratchPath);
+        ownedScratchPath = null;
+      }
       if (bridge) {
         // `projectClose` is sync and infallible (it just drops the
         // workspace slot). Wrap in try so a bug here never blocks
@@ -308,7 +510,9 @@ app.on("will-quit", (event) => {
         }
       }
       // Sweep AFTER projectClose so the just-closed scratch directory
-      // is itself eligible for deletion.
+      // is itself eligible for deletion. The lockfile check inside
+      // `cleanupScratchProjects` still protects directories belonging
+      // to *other* running KCreate instances.
       await cleanupScratchProjects();
       if (bridge) {
         try {

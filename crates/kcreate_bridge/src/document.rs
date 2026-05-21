@@ -259,11 +259,16 @@ pub fn project_open(dir: &Path) -> Result<ProjectInfo> {
 ///   since the on-disk log is the audit trail); the new op's id is
 ///   unseen, so it gets written. Nothing is dropped.
 /// * **Bounded-depth front trim** — the trimmed op's id is gone from
-///   `iter()` but its row is already on disk, so we simply prune it
-///   from `persisted_op_ids` at the end of save. No re-write attempt.
+///   `iter()` but its row is already on disk. At end of save we
+///   (1) prune it from `persisted_op_ids` (so the set stays
+///   `O(max_depth)`) and (2) ask the store to drop any on-disk rows
+///   beyond `max_depth` so the on-disk table tracks the in-memory bound
+///   instead of growing unbounded for the project lifetime.
 ///
-/// Cost: O(history.len()) hash lookups + O(new ops) inserts. With
-/// `max_depth` = 256 the hash work is in the microseconds.
+/// Cost: O(history.len()) hash lookups + O(new ops) inserts + one
+/// `DELETE` against the `operations` table (which is a single
+/// range-delete using a timestamp index). At `max_depth` = 256 the
+/// full save path stays in the microseconds.
 pub fn project_save() -> Result<()> {
     let mut guard = slot().lock();
     let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
@@ -288,9 +293,17 @@ pub fn project_save() -> Result<()> {
         ws.persisted_op_ids.insert(op.id);
     }
     // Forget ids that have aged out of the bounded in-memory log so
-    // `persisted_op_ids` stays O(max_depth). The on-disk rows for those
-    // ids remain (append-only audit trail).
+    // `persisted_op_ids` stays O(max_depth).
     ws.persisted_op_ids.retain(|id| current_ids.contains(id));
+    // Mirror the in-memory `max_depth` bound onto the on-disk table.
+    // Without this, the operations table grows for the project's
+    // lifetime; combined with the (now-fixed) load_operations bug, it
+    // would silently lose recent history once the row count exceeded
+    // `max_depth`. The on-disk bound is the same as the in-memory bound
+    // by design — the in-memory log is the canonical undo surface and
+    // the disk just snapshots it.
+    let max_depth = ws.project.operation_log.max_depth();
+    ws.store.prune_operations(max_depth)?;
     drop(guard);
     Ok(())
 }

@@ -251,12 +251,24 @@ impl ProjectStore {
     }
 
     /// Load the most recent `limit` operations, oldest first.
+    ///
+    /// SQL note: the `operations` table is append-only and grows with
+    /// project lifetime (see [`Self::prune_operations`] for the bounded
+    /// trim path). A naive `ORDER BY timestamp ASC LIMIT ?1` returns the
+    /// *oldest* rows — exactly the wrong half — once the row count
+    /// exceeds the limit. The inner subquery picks the newest `limit`
+    /// rows; the outer query re-sorts them oldest-first to match the
+    /// `OperationLog` push order callers expect.
     pub fn load_operations(&self, limit: usize) -> Result<Vec<Operation>, ProjectStoreError> {
         let mut stmt = self.db.conn().prepare(
             "SELECT id, timestamp, actor, command, before_patch, after_patch, affected_nodes, ai_generated
-             FROM operations
-             ORDER BY timestamp ASC
-             LIMIT ?1",
+             FROM (
+               SELECT id, timestamp, actor, command, before_patch, after_patch, affected_nodes, ai_generated
+               FROM operations
+               ORDER BY timestamp DESC
+               LIMIT ?1
+             ) AS recent
+             ORDER BY timestamp ASC",
         )?;
         let rows = stmt
             .query_map([limit as i64], |row| {
@@ -287,6 +299,45 @@ impl ProjectStore {
             })
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+
+    /// Trim the on-disk `operations` table to the `keep` most recent
+    /// rows.
+    ///
+    /// The in-memory `OperationLog` is bounded at `max_depth`. The
+    /// on-disk row count tracks that bound by calling this helper from
+    /// `project_save` with `keep = max_depth`. The delete is expressed
+    /// as `id NOT IN (top-N by timestamp DESC)` so the kept set is
+    /// well-defined regardless of how `keep` relates to the row count:
+    ///
+    /// * `keep >= row_count` — the inner `SELECT` returns every id, so
+    ///   `NOT IN (...)` matches nothing and the `DELETE` is a no-op
+    ///   (idempotent).
+    /// * `keep == 0` — the inner `SELECT` returns the empty set, so
+    ///   `NOT IN (...)` matches every row and the table is wiped.
+    /// * `0 < keep < row_count` — the inner `SELECT` returns the `keep`
+    ///   newest ids; `NOT IN (...)` deletes the remaining `row_count -
+    ///   keep` older rows.
+    ///
+    /// The alternative formulation (`WHERE timestamp <
+    /// (SELECT timestamp ... LIMIT 1 OFFSET keep)`) has an off-by-one
+    /// at the cutoff row and depends on timestamps being strictly
+    /// monotonic across saves; the `NOT IN` form sidesteps both.
+    pub fn prune_operations(&mut self, keep: usize) -> Result<usize, ProjectStoreError> {
+        // SQLite's bind params want i64; clamp huge `keep` values into
+        // the positive i64 range. `keep = 0` is the canonical "wipe"
+        // signal.
+        let keep_i64 = i64::try_from(keep).unwrap_or(i64::MAX);
+        let deleted = self.db.conn().execute(
+            "DELETE FROM operations
+             WHERE id NOT IN (
+               SELECT id FROM operations
+               ORDER BY timestamp DESC
+               LIMIT ?1
+             )",
+            params![keep_i64],
+        )?;
+        Ok(deleted)
     }
 
     /// Store an asset binary and record it in the `assets` table.
@@ -423,6 +474,80 @@ mod tests {
         assert_eq!(ops.len(), 1);
         assert_eq!(ops[0].id, op.id);
         assert_eq!(ops[0].actor, "user");
+    }
+
+    /// Regression: `load_operations(limit)` must return the *newest*
+    /// `limit` rows, not the oldest, once the table grows past `limit`.
+    /// Without the subquery-then-reverse trick, the SQL
+    /// `ORDER BY timestamp ASC LIMIT ?1` would return the very first
+    /// `limit` ops ever pushed and silently lose the user's recent
+    /// undo history on project reopen.
+    #[test]
+    fn load_operations_returns_most_recent_when_over_limit() {
+        let (_dir, mut store) = new_project();
+        // Insert 5 ops with controllable timestamps so the ordering is
+        // unambiguous regardless of clock resolution.
+        let mut ids = Vec::new();
+        for n in 0..5 {
+            let mut op = Operation::new(
+                "user",
+                format!("op-{n}"),
+                serde_json::json!({}),
+                serde_json::json!({}),
+                Vec::new(),
+            );
+            op.timestamp =
+                chrono::DateTime::<chrono::Utc>::from_timestamp(1_700_000_000 + i64::from(n), 0)
+                    .expect("timestamp");
+            store.save_operation(&op).expect("save");
+            ids.push(op.id);
+        }
+        // Ask for only 3 — must return ops #2, #3, #4 (oldest-first).
+        let ops = store.load_operations(3).expect("load");
+        let got: Vec<uuid::Uuid> = ops.iter().map(|o| o.id).collect();
+        let want = vec![ids[2], ids[3], ids[4]];
+        assert_eq!(
+            got, want,
+            "load_operations must select the most-recent rows, then sort oldest-first"
+        );
+    }
+
+    /// Bounded on-disk operation log. `prune_operations(keep)` removes
+    /// every row older than the `keep`-th most recent, leaving the
+    /// table at exactly `keep` rows (or fewer if it started smaller).
+    /// The kept rows must still be the *newest* ones.
+    #[test]
+    fn prune_operations_keeps_most_recent() {
+        let (_dir, mut store) = new_project();
+        let mut ids = Vec::new();
+        for n in 0..10 {
+            let mut op = Operation::new(
+                "user",
+                format!("op-{n}"),
+                serde_json::json!({}),
+                serde_json::json!({}),
+                Vec::new(),
+            );
+            op.timestamp =
+                chrono::DateTime::<chrono::Utc>::from_timestamp(1_700_000_000 + i64::from(n), 0)
+                    .expect("timestamp");
+            store.save_operation(&op).expect("save");
+            ids.push(op.id);
+        }
+        let removed = store.prune_operations(4).expect("prune");
+        assert_eq!(removed, 6, "must remove the 6 oldest rows");
+        let remaining = store.load_operations(100).expect("load after prune");
+        let got: Vec<uuid::Uuid> = remaining.iter().map(|o| o.id).collect();
+        assert_eq!(got, vec![ids[6], ids[7], ids[8], ids[9]]);
+
+        // Idempotency: re-pruning with the same budget is a no-op.
+        let removed_again = store.prune_operations(4).expect("reprune");
+        assert_eq!(removed_again, 0);
+
+        // keep=0 wipes the table.
+        let wiped = store.prune_operations(0).expect("wipe");
+        assert_eq!(wiped, 4);
+        assert!(store.load_operations(100).expect("after wipe").is_empty());
     }
 
     #[test]

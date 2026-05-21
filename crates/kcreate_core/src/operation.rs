@@ -7,6 +7,13 @@
 //!
 //! Bounded depth (`max_depth`) trims the *oldest* entries; this keeps
 //! the working memory cost bounded even for long editing sessions.
+//!
+//! Storage: backed by `VecDeque<Operation>` so the bounded-depth trim
+//! is O(1) per dropped entry (`pop_front`). Restoring a large persisted
+//! history that exceeds `max_depth` is therefore O(excess) rather than
+//! O(excess²).
+
+use std::collections::VecDeque;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -60,7 +67,9 @@ impl Operation {
 /// Bounded undo/redo log.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OperationLog {
-    history: Vec<Operation>,
+    /// Most-recent operations are at the back; the bounded-depth trim
+    /// drops from the front via `pop_front` (O(1)).
+    history: VecDeque<Operation>,
     /// Index just past the last applied op. `position == history.len()`
     /// means "all ops are applied". `position == 0` means "nothing
     /// applied".
@@ -74,7 +83,7 @@ impl OperationLog {
     #[must_use]
     pub fn new(max_depth: usize) -> Self {
         Self {
-            history: Vec::new(),
+            history: VecDeque::new(),
             position: 0,
             max_depth: max_depth.max(1),
         }
@@ -84,10 +93,11 @@ impl OperationLog {
     /// `position` and `history.len()`) are discarded.
     pub fn push(&mut self, op: Operation) {
         self.history.truncate(self.position);
-        self.history.push(op);
-        // Bound the buffer. Drop oldest entries.
+        self.history.push_back(op);
+        // Bound the buffer — drop oldest entries. `VecDeque::pop_front`
+        // is O(1).
         while self.history.len() > self.max_depth {
-            self.history.remove(0);
+            self.history.pop_front();
         }
         self.position = self.history.len();
     }
@@ -121,13 +131,31 @@ impl OperationLog {
     }
 
     #[must_use]
-    pub const fn can_redo(&self) -> bool {
+    pub fn can_redo(&self) -> bool {
+        // `VecDeque::len` is not yet const-stable (unlike `Vec::len`).
         self.position < self.history.len()
     }
 
+    /// Iterate the history in chronological order (oldest first).
+    ///
+    /// Returns an iterator rather than a slice because the underlying
+    /// `VecDeque` may not be contiguous; callers that need indexed
+    /// access should use [`Self::get`].
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = &Operation> {
+        self.history.iter()
+    }
+
+    /// Random access into the history. `idx == 0` is the oldest entry,
+    /// `idx == len() - 1` is the newest.
     #[must_use]
-    pub const fn history(&self) -> &[Operation] {
-        self.history.as_slice()
+    pub fn get(&self, idx: usize) -> Option<&Operation> {
+        self.history.get(idx)
+    }
+
+    /// The most-recently pushed entry, if any.
+    #[must_use]
+    pub fn last(&self) -> Option<&Operation> {
+        self.history.back()
     }
 
     pub fn clear(&mut self) {
@@ -136,12 +164,14 @@ impl OperationLog {
     }
 
     #[must_use]
-    pub const fn len(&self) -> usize {
+    pub fn len(&self) -> usize {
+        // `VecDeque::len` is not yet const-stable (unlike `Vec::len`).
         self.history.len()
     }
 
     #[must_use]
-    pub const fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
+        // `VecDeque::is_empty` is not yet const-stable.
         self.history.is_empty()
     }
 
@@ -171,7 +201,7 @@ impl OperationLog {
         self.history.clear();
         self.history.extend(ops);
         while self.history.len() > self.max_depth {
-            self.history.remove(0);
+            self.history.pop_front();
         }
         self.position = self.history.len();
     }
@@ -224,8 +254,8 @@ mod tests {
         log.undo();
         log.push(op("c"));
         assert!(!log.can_redo());
-        assert_eq!(log.history().len(), 2);
-        assert_eq!(log.history()[1].command, "c");
+        assert_eq!(log.len(), 2);
+        assert_eq!(log.get(1).expect("index 1").command, "c");
     }
 
     #[test]
@@ -236,7 +266,7 @@ mod tests {
         log.push(op("c"));
         log.push(op("d"));
         assert_eq!(log.len(), 3);
-        let names: Vec<&str> = log.history().iter().map(|o| o.command.as_str()).collect();
+        let names: Vec<&str> = log.iter().map(|o| o.command.as_str()).collect();
         assert_eq!(names, vec!["b", "c", "d"]);
     }
 
@@ -262,7 +292,7 @@ mod tests {
     fn ai_generated_flag_preserved() {
         let mut log = OperationLog::new(4);
         log.push(op("ai_recolor").as_ai_generated());
-        assert!(log.history()[0].ai_generated);
+        assert!(log.get(0).expect("index 0").ai_generated);
     }
 
     #[test]
@@ -280,7 +310,7 @@ mod tests {
         log.push(op("a"));
         log.push(op("b"));
         assert_eq!(log.len(), 1);
-        assert_eq!(log.history()[0].command, "b");
+        assert_eq!(log.get(0).expect("index 0").command, "b");
     }
 
     #[test]
@@ -289,7 +319,7 @@ mod tests {
         log.push(op("z")); // ensure pre-existing state is replaced
         log.restore_from(vec![op("a"), op("b"), op("c")]);
         assert_eq!(log.len(), 3);
-        let names: Vec<&str> = log.history().iter().map(|o| o.command.as_str()).collect();
+        let names: Vec<&str> = log.iter().map(|o| o.command.as_str()).collect();
         assert_eq!(names, vec!["a", "b", "c"]);
         assert!(log.can_undo());
         assert!(!log.can_redo());
@@ -300,7 +330,7 @@ mod tests {
     fn restore_from_drops_front_when_over_max_depth() {
         let mut log = OperationLog::new(2);
         log.restore_from(vec![op("a"), op("b"), op("c"), op("d")]);
-        let names: Vec<&str> = log.history().iter().map(|o| o.command.as_str()).collect();
+        let names: Vec<&str> = log.iter().map(|o| o.command.as_str()).collect();
         assert_eq!(names, vec!["c", "d"], "keep the most recent");
     }
 

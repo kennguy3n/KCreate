@@ -363,6 +363,14 @@ pub struct CreateNodeProps {
 }
 
 /// Insert a new node. Returns its id.
+///
+/// This is a **bare graph mutation** — it does not append an entry to
+/// the operation log. The host UI is responsible for calling
+/// [`document_record_operation`] separately to make the change
+/// undoable, because the bridge has no semantic context (a single
+/// user gesture often touches multiple nodes; we don't want one op
+/// per CRUD call). See [`kcreate_core::project::Project::undo`] for
+/// the full host-driven patch-application contract.
 pub fn document_create_node(
     node_type: &str,
     parent_id: Option<Uuid>,
@@ -405,6 +413,10 @@ pub struct UpdateNodeProps {
 }
 
 /// Apply an in-place update to a node.
+///
+/// Bare graph mutation. See [`document_create_node`] and
+/// [`kcreate_core::project::Project::undo`] for the host-driven
+/// patch-application contract.
 pub fn document_update_node(id: Uuid, changes: &UpdateNodeProps) -> Result<()> {
     let mut guard = slot().lock();
     let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
@@ -432,6 +444,10 @@ pub fn document_update_node(id: Uuid, changes: &UpdateNodeProps) -> Result<()> {
 }
 
 /// Remove a node and all its descendants.
+///
+/// Bare graph mutation. See [`document_create_node`] and
+/// [`kcreate_core::project::Project::undo`] for the host-driven
+/// patch-application contract.
 pub fn document_delete_node(id: Uuid) -> Result<()> {
     let mut guard = slot().lock();
     let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
@@ -444,6 +460,14 @@ pub fn document_delete_node(id: Uuid) -> Result<()> {
 }
 
 /// Push an operation onto the project's log.
+///
+/// Counterpart to [`document_create_node`] / [`document_update_node`]
+/// / [`document_delete_node`]: those mutate the graph but do **not**
+/// record an op; this records an op but does **not** mutate the
+/// graph. The host wires them together at the granularity of the
+/// user-facing gesture (e.g. one drag = one op, not one op per
+/// pointer sample). See [`kcreate_core::project::Project::undo`] for
+/// the architectural rationale.
 pub fn document_record_operation(operation: Operation) -> Result<()> {
     let mut guard = slot().lock();
     let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
@@ -452,7 +476,12 @@ pub fn document_record_operation(operation: Operation) -> Result<()> {
     Ok(())
 }
 
-/// Undo the most recent operation. Returns the affected node ids.
+/// Undo the most recent operation. Returns the affected node ids of
+/// the rolled-back operation, or `None` if the undo stack is empty.
+///
+/// Only moves the log cursor — the host applies `before_patch` to
+/// its in-memory state. See [`kcreate_core::project::Project::undo`]
+/// for the contract.
 pub fn document_undo() -> Result<Option<Vec<Uuid>>> {
     let mut guard = slot().lock();
     let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
@@ -461,7 +490,12 @@ pub fn document_undo() -> Result<Option<Vec<Uuid>>> {
     Ok(affected)
 }
 
-/// Redo the next operation. Returns the affected node ids.
+/// Redo the next operation. Returns the affected node ids of the
+/// re-applied operation, or `None` if the redo stack is empty.
+///
+/// Only moves the log cursor — the host applies `after_patch` to its
+/// in-memory state. See [`kcreate_core::project::Project::undo`] for
+/// the contract.
 pub fn document_redo() -> Result<Option<Vec<Uuid>>> {
     let mut guard = slot().lock();
     let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;

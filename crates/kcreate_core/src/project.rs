@@ -214,19 +214,45 @@ impl Project {
     }
 
     /// Roll back the most recent operation. Returns the rolled-back
-    /// operation, or `None` if there is nothing to undo. **Note:** this
-    /// method moves the cursor in the log; it does not patch the
-    /// document graph itself — the caller is responsible for applying
-    /// `before_patch` to its in-memory state. We split that step out
-    /// because patches are application-defined.
+    /// operation, or `None` if there is nothing to undo.
+    ///
+    /// # Contract: host-driven patch application
+    ///
+    /// This method **only moves the cursor in the operation log**; it
+    /// deliberately does not touch the `DocumentGraph`. The caller is
+    /// responsible for applying `Operation::before_patch` to its
+    /// in-memory state to actually revert the change.
+    ///
+    /// Why the split (this is intentional architecture, not a stub):
+    ///
+    /// 1. Patches are application-defined. The host UI groups
+    ///    multiple bridge calls into a single user-facing operation
+    ///    (e.g. a drag = one `move_node` op, not one op per pointer
+    ///    sample). Auto-patching here would force a one-bridge-call =
+    ///    one-op model that the editor's gesture layer does not want.
+    /// 2. Replay paths exist that **must not** record new ops while
+    ///    applying patches (otherwise replay would double the log).
+    ///    Keeping the cursor move and the graph patch as separate
+    ///    steps gives those paths explicit control.
+    /// 3. The cost of forgetting to apply is a visual glitch, not a
+    ///    corruption — the graph and log remain internally consistent.
+    ///
+    /// The pairing on the bridge side is:
+    /// `document_create_node` / `update_node` / `delete_node` mutate
+    /// the graph directly, `document_record_operation` appends to the
+    /// log, and `document_undo` / `redo` only move the log cursor.
     pub fn undo(&mut self) -> Option<Operation> {
         let op = self.operation_log.undo()?.clone();
         self.touch_modified();
         Some(op)
     }
 
-    /// Re-apply the next operation. See [`Self::undo`] for the
-    /// responsibilities split.
+    /// Re-apply the next operation in the log. Returns the operation
+    /// to be replayed, or `None` if the redo stack is empty.
+    ///
+    /// Mirrors [`Self::undo`]: callers apply `Operation::after_patch`
+    /// to their in-memory state. See `undo`'s docstring for the full
+    /// rationale on why patch application is host-driven.
     pub fn redo(&mut self) -> Option<Operation> {
         let op = self.operation_log.redo()?.clone();
         self.touch_modified();

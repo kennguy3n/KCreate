@@ -158,6 +158,13 @@ pub struct Project {
 
 impl Project {
     /// Create a new, empty project with sensible defaults.
+    ///
+    /// Note: `export_presets`, `design_tokens`, and `brand_kits` start
+    /// empty so identifiers are stable across save/reopen. Call
+    /// [`Self::install_default_export_presets`] explicitly when
+    /// creating a brand-new project (typically from the home page);
+    /// callers reopening an existing project must rely on persistence
+    /// to restore them, not on auto-population that would change ids.
     #[must_use]
     pub fn new(name: impl Into<String>) -> Self {
         let now = Utc::now();
@@ -168,10 +175,19 @@ impl Project {
             operation_log: OperationLog::default(),
             design_tokens: DesignTokens::default(),
             brand_kits: Vec::new(),
-            export_presets: default_export_presets(),
+            export_presets: Vec::new(),
             created_at: now,
             modified_at: now,
         }
+    }
+
+    /// Install the standard PNG/SVG/PDF export presets. Intended for
+    /// freshly-created projects; do NOT call this after
+    /// [`Self::new`] when re-opening an existing project, or you will
+    /// shadow whatever the user persisted.
+    pub fn install_default_export_presets(&mut self) {
+        self.export_presets = default_export_presets();
+        self.touch_modified();
     }
 
     /// Add a new page (with one artboard child) and return the page id.
@@ -248,7 +264,9 @@ impl Project {
     }
 }
 
-/// Built-in export presets every new project starts with.
+/// Built-in export presets a brand-new project starts with. Exposed
+/// via [`Project::install_default_export_presets`]; never called
+/// implicitly because every call generates fresh UUIDs.
 fn default_export_presets() -> Vec<ExportPreset> {
     vec![
         ExportPreset::new("PNG @1x", ExportFormat::Png, 1.0),
@@ -270,8 +288,31 @@ mod tests {
         assert_eq!(p.name, "My Project");
         assert_eq!(p.document.node_count(), 0);
         assert!(p.operation_log.is_empty());
-        assert!(!p.export_presets.is_empty());
+        assert!(
+            p.export_presets.is_empty(),
+            "new() must not auto-generate presets with fresh UUIDs (footgun on reopen)"
+        );
         assert!(p.brand_kits.is_empty());
+    }
+
+    #[test]
+    fn install_default_export_presets_populates_after_new() {
+        let mut p = Project::new("My Project");
+        assert!(p.export_presets.is_empty());
+        p.install_default_export_presets();
+        assert!(!p.export_presets.is_empty());
+    }
+
+    #[test]
+    fn install_default_export_presets_regenerates_ids() {
+        let mut a = Project::new("a");
+        a.install_default_export_presets();
+        let mut b = Project::new("b");
+        b.install_default_export_presets();
+        // Different Project instances must get different preset ids,
+        // but the count and shape match.
+        assert_eq!(a.export_presets.len(), b.export_presets.len());
+        assert_ne!(a.export_presets[0].id, b.export_presets[0].id);
     }
 
     #[test]
@@ -313,7 +354,8 @@ mod tests {
 
     #[test]
     fn export_preset_lookup() {
-        let p = Project::new("p");
+        let mut p = Project::new("p");
+        p.install_default_export_presets();
         let preset = p.export_presets[0].clone();
         let same = p.export_preset(preset.id).expect("found");
         assert_eq!(same.id, preset.id);
@@ -327,12 +369,17 @@ mod tests {
     #[test]
     fn project_serialize_roundtrip() {
         let mut p = Project::new("p");
+        p.install_default_export_presets();
         p.add_page("Home").expect("page");
         let s = serde_json::to_string(&p).expect("serialize");
         let p2: Project = serde_json::from_str(&s).expect("deserialize");
         assert_eq!(p.id, p2.id);
         assert_eq!(p.document.node_count(), p2.document.node_count());
         assert_eq!(p.export_presets.len(), p2.export_presets.len());
+        // ids must round-trip 1:1 — they're not regenerated on deserialize.
+        let original_ids: Vec<_> = p.export_presets.iter().map(|x| x.id).collect();
+        let restored_ids: Vec<_> = p2.export_presets.iter().map(|x| x.id).collect();
+        assert_eq!(original_ids, restored_ids);
     }
 
     #[test]

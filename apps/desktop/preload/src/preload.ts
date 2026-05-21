@@ -8,6 +8,7 @@ import type {
   AcquiredFrame,
   CreateNodeProps,
   DocumentBridge,
+  DocumentStatus,
   ExportBridge,
   FrameInfo,
   NodeInfo,
@@ -165,6 +166,24 @@ function nodeFromSnake(n: NodeInfoSnake): NodeInfo {
   };
 }
 
+type DocumentStatusSnake = {
+  node_count: number;
+  can_undo: boolean;
+  can_redo: boolean;
+  undo_depth: number;
+  redo_depth: number;
+};
+
+function documentStatusFromSnake(s: DocumentStatusSnake): DocumentStatus {
+  return {
+    nodeCount: s.node_count,
+    canUndo: s.can_undo,
+    canRedo: s.can_redo,
+    undoDepth: s.undo_depth,
+    redoDepth: s.redo_depth,
+  };
+}
+
 function runtimeFromSnake(s: RuntimeStatusSnake): RuntimeStatus {
   return {
     deviceTier: s.device_tier,
@@ -243,6 +262,12 @@ const document: DocumentBridge = {
     return (await ipcRenderer.invoke(
       "kcreate/document/redo",
     )) as string[] | null;
+  },
+  async status(): Promise<DocumentStatus | null> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/document/status",
+    )) as DocumentStatusSnake | null;
+    return raw ? documentStatusFromSnake(raw) : null;
   },
 };
 

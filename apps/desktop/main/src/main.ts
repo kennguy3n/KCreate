@@ -146,6 +146,9 @@ function registerIpcHandlers(): void {
   ipcMain.handle("kcreate/document/redo", () =>
     requireBridge().documentRedo(),
   );
+  ipcMain.handle("kcreate/document/status", () =>
+    requireBridge().documentStatus(),
+  );
 
   ipcMain.handle("kcreate/runtime/status", () =>
     requireBridge().runtimeStatus(),

@@ -179,6 +179,19 @@ export interface PngExportOptions {
 }
 
 /**
+ * Editing-state snapshot for the host UI. Polled after every
+ * mutation so undo/redo controls can reflect the actual operation
+ * log state instead of heuristics like "are there any layers?".
+ */
+export interface DocumentStatus {
+  nodeCount: number;
+  canUndo: boolean;
+  canRedo: boolean;
+  undoDepth: number;
+  redoDepth: number;
+}
+
+/**
  * Document + project lifecycle bridge. Exposed on
  * `window.kcreate.document`. All methods round-trip through the
  * Electron main process; the renderer never imports the native addon
@@ -201,6 +214,13 @@ export interface DocumentBridge {
   deleteNode(nodeId: string): Promise<void>;
   undo(): Promise<string[] | null>;
   redo(): Promise<string[] | null>;
+
+  /**
+   * Snapshot of the open document's editing state, or `null` if no
+   * project is open. Backed by the operation log so the host can
+   * accurately enable/disable Undo / Redo without guessing.
+   */
+  status(): Promise<DocumentStatus | null>;
 }
 
 /** Runtime / device probe. */

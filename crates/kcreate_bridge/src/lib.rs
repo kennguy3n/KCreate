@@ -299,6 +299,34 @@ impl From<CoreRuntimeStatus> for RuntimeStatus {
     }
 }
 
+/// Editing-state snapshot the host UI reads to enable/disable
+/// undo/redo controls without polling the entire layer tree.
+#[napi(object)]
+#[derive(Debug, Clone)]
+pub struct DocumentStatus {
+    pub node_count: u32,
+    pub can_undo: bool,
+    pub can_redo: bool,
+    pub undo_depth: u32,
+    pub redo_depth: u32,
+}
+
+impl From<document::DocumentStatus> for DocumentStatus {
+    #[allow(clippy::cast_possible_truncation)]
+    fn from(s: document::DocumentStatus) -> Self {
+        // The host doesn't care about exact counts beyond a few
+        // hundred (the bounded log max_depth defaults to 256); a
+        // saturating cast is fine.
+        Self {
+            node_count: u32::try_from(s.node_count).unwrap_or(u32::MAX),
+            can_undo: s.can_undo,
+            can_redo: s.can_redo,
+            undo_depth: u32::try_from(s.undo_depth).unwrap_or(u32::MAX),
+            redo_depth: u32::try_from(s.redo_depth).unwrap_or(u32::MAX),
+        }
+    }
+}
+
 /// Create a new project under `dir/<name>.kstudio`.
 #[napi]
 #[allow(clippy::needless_pass_by_value)]
@@ -409,6 +437,17 @@ pub fn document_redo() -> NapiResult<Option<Vec<String>>> {
 #[napi]
 pub fn runtime_status() -> RuntimeStatus {
     document::runtime_status().into()
+}
+
+/// Snapshot of the open document's editing state.
+///
+/// Returns `None` when no project is open. Hosts call this after any
+/// mutation that may have changed undo/redo availability (project
+/// open/close, create/update/delete node, record/undo/redo operation,
+/// save).
+#[napi]
+pub fn document_status() -> Option<DocumentStatus> {
+    document::document_status().map(Into::into)
 }
 
 // =============================================================================

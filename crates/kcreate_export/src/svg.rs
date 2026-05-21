@@ -17,8 +17,11 @@ use thiserror::Error;
 use uuid::Uuid;
 
 /// SVG export options.
+///
+/// JSON shape matches the TypeScript host: keys are camelCase
+/// (`includeMetadata`, etc.). Missing keys default per [`Default`].
 #[derive(Debug, Default, Clone, Copy, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, rename_all = "camelCase")]
 pub struct SvgExportOptions {
     /// Output canvas width in user units. `0` means "fit to content".
     pub width: f64,
@@ -241,5 +244,38 @@ mod tests {
         let svg = export_svg_from_document(&doc, &[layer_id], &SvgExportOptions::default())
             .expect("export");
         assert!(svg.contains("viewBox=\"0 0 10 10\""));
+    }
+
+    #[test]
+    fn options_accept_camel_case_wire_shape() {
+        // The TypeScript host sends camelCase keys. Locking this here
+        // so a regression where the rename_all is removed will be
+        // caught at the unit-test layer.
+        let json = r#"{
+            "width": 100.0,
+            "height": 200.0,
+            "includeMetadata": true,
+            "optimize": true
+        }"#;
+        let opts: SvgExportOptions = serde_json::from_str(json).expect("camelCase parses");
+        assert!((opts.width - 100.0).abs() < f64::EPSILON);
+        assert!((opts.height - 200.0).abs() < f64::EPSILON);
+        assert!(opts.include_metadata, "includeMetadata must map through");
+        assert!(opts.optimize);
+    }
+
+    #[test]
+    fn options_serialize_with_camel_case_keys() {
+        let opts = SvgExportOptions {
+            width: 0.0,
+            height: 0.0,
+            include_metadata: true,
+            optimize: false,
+        };
+        let json = serde_json::to_string(&opts).expect("serialize");
+        assert!(
+            json.contains("\"includeMetadata\":true"),
+            "expected camelCase keys, got: {json}"
+        );
     }
 }

@@ -154,6 +154,27 @@ impl OperationLog {
     pub const fn position(&self) -> usize {
         self.position
     }
+
+    /// Replace the entire history from persistence. Operations are
+    /// appended in iteration order with no truncation semantics
+    /// (callers are expected to pass at most `max_depth` items — extra
+    /// items are dropped from the *front* to preserve the most recent
+    /// history).
+    ///
+    /// The position cursor is reset to the end so every restored
+    /// operation is considered "already applied" — there is no redo
+    /// stack to recover across sessions.
+    pub fn restore_from<I>(&mut self, ops: I)
+    where
+        I: IntoIterator<Item = Operation>,
+    {
+        self.history.clear();
+        self.history.extend(ops);
+        while self.history.len() > self.max_depth {
+            self.history.remove(0);
+        }
+        self.position = self.history.len();
+    }
 }
 
 impl Default for OperationLog {
@@ -260,6 +281,27 @@ mod tests {
         log.push(op("b"));
         assert_eq!(log.len(), 1);
         assert_eq!(log.history()[0].command, "b");
+    }
+
+    #[test]
+    fn restore_from_replaces_history_and_marks_all_applied() {
+        let mut log = OperationLog::new(8);
+        log.push(op("z")); // ensure pre-existing state is replaced
+        log.restore_from(vec![op("a"), op("b"), op("c")]);
+        assert_eq!(log.len(), 3);
+        let names: Vec<&str> = log.history().iter().map(|o| o.command.as_str()).collect();
+        assert_eq!(names, vec!["a", "b", "c"]);
+        assert!(log.can_undo());
+        assert!(!log.can_redo());
+        assert_eq!(log.position(), 3);
+    }
+
+    #[test]
+    fn restore_from_drops_front_when_over_max_depth() {
+        let mut log = OperationLog::new(2);
+        log.restore_from(vec![op("a"), op("b"), op("c"), op("d")]);
+        let names: Vec<&str> = log.history().iter().map(|o| o.command.as_str()).collect();
+        assert_eq!(names, vec!["c", "d"], "keep the most recent");
     }
 
     #[test]

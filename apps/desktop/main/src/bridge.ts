@@ -48,7 +48,20 @@ type RuntimeStatusSnake = {
   total_ram_mb: number;
 };
 
-export type { ProjectInfoSnake, NodeInfoSnake, RuntimeStatusSnake };
+type DocumentStatusSnake = {
+  node_count: number;
+  can_undo: boolean;
+  can_redo: boolean;
+  undo_depth: number;
+  redo_depth: number;
+};
+
+export type {
+  ProjectInfoSnake,
+  NodeInfoSnake,
+  RuntimeStatusSnake,
+  DocumentStatusSnake,
+};
 
 export interface Bridge {
   rendererInit(
@@ -85,6 +98,7 @@ export interface Bridge {
   documentDeleteNode(nodeId: string): void;
   documentUndo(): string[] | null;
   documentRedo(): string[] | null;
+  documentStatus(): DocumentStatusSnake | null;
   runtimeStatus(): RuntimeStatusSnake;
   exportSvg(nodeIds: string[], optionsJson: string): string;
   exportPng(

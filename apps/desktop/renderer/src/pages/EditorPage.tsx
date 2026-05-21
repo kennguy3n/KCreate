@@ -4,7 +4,12 @@ import { CanvasHost } from "../components/CanvasHost";
 import { LeftPanel } from "../components/LeftPanel";
 import { RightPanel } from "../components/RightPanel";
 import { TopBar, type EditorMode } from "../components/TopBar";
-import type { NodeInfo, ProjectInfo, Scene } from "../../../shared/scene";
+import type {
+  DocumentStatus,
+  NodeInfo,
+  ProjectInfo,
+  Scene,
+} from "../../../shared/scene";
 import { colors, font, spacing } from "../styles/tokens";
 
 export interface EditorPageProps {
@@ -45,6 +50,21 @@ export function EditorPage({
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
   const [fps, setFps] = useState<number>(0);
   const [lastTickAt, setLastTickAt] = useState<number>(performance.now());
+  // Editing-state from the bridge. `null` while the first probe is
+  // in flight, then either a snapshot of the operation log or `null`
+  // again if the workspace is closed. Default to disabled controls
+  // until we have confirmation from the bridge — a brief disabled
+  // flash is preferable to an Undo button that lies about its state.
+  const [docStatus, setDocStatus] = useState<DocumentStatus | null>(null);
+
+  const refreshStatus = useCallback(async () => {
+    try {
+      const s = await window.kcreate.document.status();
+      setDocStatus(s);
+    } catch (e) {
+      setStatusMessage(`status probe failed: ${errorMessage(e)}`);
+    }
+  }, []);
 
   const refreshTree = useCallback(async () => {
     try {
@@ -53,7 +73,11 @@ export function EditorPage({
     } catch (e) {
       setStatusMessage(`tree load failed: ${errorMessage(e)}`);
     }
-  }, []);
+    // The tree changed — so might the operation log (in particular for
+    // undo/redo flows that mutate the cursor without changing nodes,
+    // we still want this called from the dedicated handlers below).
+    await refreshStatus();
+  }, [refreshStatus]);
 
   useEffect(() => {
     void refreshTree();
@@ -64,8 +88,8 @@ export function EditorPage({
     [nodes, selectedId],
   );
 
-  const canUndo = nodes.length > 0;
-  const canRedo = false;
+  const canUndo = docStatus?.canUndo ?? false;
+  const canRedo = docStatus?.canRedo ?? false;
 
   const handleUndo = useCallback(async () => {
     try {

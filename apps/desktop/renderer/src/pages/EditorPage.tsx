@@ -348,27 +348,47 @@ export function EditorPage({
   const onCanvasPointer = useCallback(
     (e: React.PointerEvent<HTMLCanvasElement>) => {
       if (e.button !== 0 && e.type === "pointerdown") return;
-      const rect = e.currentTarget.getBoundingClientRect();
+      // React nullifies `SyntheticEvent.currentTarget` once the
+      // synchronous handler returns, so the async IIFE below cannot
+      // read it after an `await`. Capture the canvas element + pointer
+      // id synchronously so `setPointerCapture` /
+      // `releasePointerCapture` keep working across awaits.
+      const canvasEl = e.currentTarget;
+      const pointerId = e.pointerId;
+      const rect = canvasEl.getBoundingClientRect();
       const sx = e.clientX - rect.left;
       const sy = e.clientY - rect.top;
       const { x: wx, y: wy } = screenToWorld(sx, sy);
+      // Capture the viewport snapshot at pointer-down time. The Rust
+      // hit-test wants screen coordinates plus the viewport so it can
+      // run the screen→world transform once — if we pre-transformed
+      // here too, the renderer would double-apply pan + zoom and miss
+      // every click.
+      const vp = viewport;
 
       if (e.type === "pointerdown") {
         if (tool === "select") {
           // Click-to-select: hit-test, then either start a move drag or
-          // clear selection. The bridge does the hit-test against the
-          // *world-space* renderer scene.
+          // clear selection. The bridge does the screen→world transform
+          // internally; we send raw screen coordinates plus the current
+          // viewport (single source of truth, no double-transform).
           void (async () => {
             try {
-              const hit = await window.kcreate.canvas.hitTest(wx, wy);
+              const hit = await window.kcreate.canvas.hitTest(
+                sx,
+                sy,
+                vp.panX,
+                vp.panY,
+                vp.zoom,
+              );
               if (hit) {
                 await window.kcreate.canvas.setSelection([hit]);
                 setSelectedIds([hit]);
-                e.currentTarget.setPointerCapture(e.pointerId);
+                canvasEl.setPointerCapture(pointerId);
                 dragStateRef.current = {
                   kind: "move",
                   tool,
-                  pointerId: e.pointerId,
+                  pointerId,
                   startWorldX: wx,
                   startWorldY: wy,
                   lastWorldX: wx,
@@ -389,11 +409,11 @@ export function EditorPage({
         }
         // Drawing tools — record drag start in world coords; commit on
         // pointerup.
-        e.currentTarget.setPointerCapture(e.pointerId);
+        canvasEl.setPointerCapture(pointerId);
         dragStateRef.current = {
           kind: "create",
           tool,
-          pointerId: e.pointerId,
+          pointerId,
           startWorldX: wx,
           startWorldY: wy,
           lastWorldX: wx,
@@ -430,9 +450,9 @@ export function EditorPage({
 
       if (e.type === "pointerup") {
         const drag = dragStateRef.current;
-        if (!drag || drag.pointerId !== e.pointerId) return;
+        if (!drag || drag.pointerId !== pointerId) return;
         try {
-          e.currentTarget.releasePointerCapture(e.pointerId);
+          canvasEl.releasePointerCapture(pointerId);
         } catch {
           // capture might already be released
         }
@@ -499,6 +519,7 @@ export function EditorPage({
                 x0,
                 y0,
                 "Text",
+                "sans-serif",
                 24,
               );
             }
@@ -512,7 +533,7 @@ export function EditorPage({
         })();
       }
     },
-    [tool, screenToWorld, refreshTree],
+    [tool, viewport, screenToWorld, refreshTree],
   );
 
   const onZoomToFit = useCallback(() => {

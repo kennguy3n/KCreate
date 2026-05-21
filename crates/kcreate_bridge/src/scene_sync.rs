@@ -76,6 +76,29 @@ pub const DEFAULT_CLEAR: Color = Color {
     a: 1.0,
 };
 
+/// First `ObjectId` value used for selection-highlight overlays.
+///
+/// Highlights are appended starting at [`u64::MAX`] and counting
+/// down, while document-backed objects come from a monotonic
+/// allocator starting at `1` and counting up (see
+/// [`SceneSync::next_id`]). The two ranges therefore never collide in
+/// practice: a project would need more than 2^63 live mappings before
+/// a real `ObjectId` could land at or above this threshold, which is
+/// physically impossible. Hit-testing uses the constant via
+/// [`is_selection_highlight_id`] so the exclusion is a guaranteed
+/// id-range check rather than a fragile style heuristic.
+pub const HIGHLIGHT_ID_THRESHOLD: u64 = u64::MAX / 2;
+
+/// Returns whether the given `ObjectId` was allocated for a selection
+/// highlight overlay (as opposed to a document-backed object).
+///
+/// Highlights live in the high `[HIGHLIGHT_ID_THRESHOLD, u64::MAX]`
+/// range; everything below that is a real document object.
+#[must_use]
+pub const fn is_selection_highlight_id(id: ObjectId) -> bool {
+    id.0 >= HIGHLIGHT_ID_THRESHOLD
+}
+
 /// Bidirectional `Uuid` ⇄ `ObjectId` map plus a monotonic id allocator.
 ///
 /// The id allocator is intentionally local to each [`SceneSync`] —

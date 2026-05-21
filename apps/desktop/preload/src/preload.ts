@@ -344,11 +344,20 @@ const canvas: CanvasBridge = {
   async syncScene(): Promise<void> {
     await ipcRenderer.invoke("kcreate/document/syncScene");
   },
-  async hitTest(x: number, y: number): Promise<string | null> {
+  async hitTest(
+    screenX: number,
+    screenY: number,
+    panX: number,
+    panY: number,
+    zoom: number,
+  ): Promise<string | null> {
     return (await ipcRenderer.invoke(
       "kcreate/canvas/hitTest",
-      x,
-      y,
+      screenX,
+      screenY,
+      panX,
+      panY,
+      zoom,
     )) as string | null;
   },
   async setSelection(nodeIds: string[]): Promise<void> {
@@ -402,13 +411,21 @@ const canvas: CanvasBridge = {
       y2,
     )) as string;
   },
-  async createText(parentId, x, y, text, fontSize): Promise<string> {
+  async createText(
+    parentId,
+    x,
+    y,
+    text,
+    fontFamily,
+    fontSize,
+  ): Promise<string> {
     return (await ipcRenderer.invoke(
       "kcreate/canvas/createText",
       parentId,
       x,
       y,
       text,
+      fontFamily,
       fontSize,
     )) as string;
   },

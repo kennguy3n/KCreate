@@ -759,7 +759,7 @@ pub fn mcp_stop() -> NapiResult<()> {
 
 /// Returns true when the MCP server is bound and accepting requests.
 #[napi]
-pub const fn mcp_is_running() -> bool {
+pub fn mcp_is_running() -> bool {
     document::mcp_is_running()
 }
 

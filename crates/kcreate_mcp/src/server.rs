@@ -176,6 +176,48 @@ pub fn global() -> &'static Mutex<Option<McpServer>> {
     SLOT.get_or_init(|| Mutex::new(None))
 }
 
+/// Start the process-global MCP server on a loopback port chosen by
+/// the OS. If a server is already in the global slot and still
+/// running, returns its bound port unchanged (idempotent). Otherwise
+/// boots a fresh `McpServer` with the supplied `access`, stores it,
+/// and returns the bound port.
+///
+/// The bridge calls this from `mcp_start()`; tests and other in-tree
+/// consumers can do the same. The access object is only consulted on
+/// a cold start — once a server is running, subsequent calls are
+/// no-ops and the existing access continues to back tool handlers.
+pub fn start_global(access: Arc<dyn DocumentAccess>) -> Result<u16, McpError> {
+    let mut slot = global().lock();
+    if let Some(existing) = slot.as_ref() {
+        if existing.is_running() {
+            return Ok(existing.port());
+        }
+        // Stale server in the slot (worker thread already exited).
+        // Drop it and start fresh.
+        slot.take();
+    }
+    let server = McpServer::start(0, access)?;
+    let port = server.port();
+    *slot = Some(server);
+    Ok(port)
+}
+
+/// Stop the process-global MCP server if one is running. Idempotent.
+pub fn stop_global() {
+    let mut slot = global().lock();
+    if let Some(mut server) = slot.take() {
+        server.stop();
+    }
+}
+
+/// Returns whether the process-global MCP server is currently
+/// running.
+#[must_use]
+pub fn is_running() -> bool {
+    let slot = global().lock();
+    slot.as_ref().is_some_and(McpServer::is_running)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -243,6 +285,26 @@ mod tests {
         );
         let v: Value = serde_json::from_str(&resp).expect("json");
         assert_eq!(v["error"]["code"], codes::METHOD_NOT_FOUND);
+    }
+
+    #[test]
+    fn global_start_stop_roundtrip() {
+        // The global slot persists across tests within the same binary;
+        // start fresh by stopping any leftover instance first.
+        stop_global();
+        assert!(!is_running());
+        let access = Arc::new(DocStub(PMutex::new(DocumentGraph::new())));
+        let port =
+            start_global(Arc::clone(&access) as Arc<dyn DocumentAccess>).expect("start_global");
+        assert!(port > 0);
+        assert!(is_running());
+        // Second call is idempotent: same port, no second server.
+        let port2 =
+            start_global(Arc::clone(&access) as Arc<dyn DocumentAccess>).expect("re-start_global");
+        assert_eq!(port, port2);
+        stop_global();
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(!is_running());
     }
 
     #[test]

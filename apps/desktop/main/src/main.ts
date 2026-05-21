@@ -464,7 +464,14 @@ function registerIpcHandlers(): void {
   });
   ipcMain.handle(
     "kcreate/canvas/hitTest",
-    (_e, x: number, y: number) => requireBridge().canvasHitTest(x, y),
+    (
+      _e,
+      x: number,
+      y: number,
+      panX: number,
+      panY: number,
+      zoom: number,
+    ) => requireBridge().canvasHitTest(x, y, panX, panY, zoom),
   );
   ipcMain.handle(
     "kcreate/document/setSelection",
@@ -524,8 +531,17 @@ function registerIpcHandlers(): void {
       x: number,
       y: number,
       text: string,
+      fontFamily: string,
       fontSize: number,
-    ) => requireBridge().canvasCreateText(parentId, x, y, text, fontSize),
+    ) =>
+      requireBridge().canvasCreateText(
+        parentId,
+        x,
+        y,
+        text,
+        fontFamily,
+        fontSize,
+      ),
   );
   ipcMain.handle(
     "kcreate/canvas/moveNode",

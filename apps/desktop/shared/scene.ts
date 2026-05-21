@@ -338,15 +338,29 @@ export interface ExportBridge {
 /**
  * Canvas-side interactions. `hitTest` returns the document Uuid (as a
  * string) of the topmost node at the given screen-space point, or
- * `null` if the point misses every object. `setSelection` /
- * `getSelection` / `clearSelection` manage the selection set that the
- * scene-sync layer paints as a highlight overlay. The
- * `createRect/Ellipse/Line/Text` and `moveNode` calls go through the
- * operation log and re-sync the scene on success.
+ * `null` if the point misses every object.
+ *
+ * `hitTest` takes **screen-space** coordinates plus the current
+ * viewport (pan + zoom) so the Rust side can do the screen→world
+ * transform once, against the same `Viewport` math used by the
+ * renderer presenter. Callers must NOT pre-transform `(x, y)` into
+ * world space — the bridge owns that conversion (see
+ * `crates/kcreate_bridge/src/document.rs::canvas_hit_test`).
+ *
+ * `setSelection` / `getSelection` / `clearSelection` manage the
+ * selection set that the scene-sync layer paints as a highlight
+ * overlay. The `createRect/Ellipse/Line/Text` and `moveNode` calls go
+ * through the operation log and re-sync the scene on success.
  */
 export interface CanvasBridge {
   syncScene(): Promise<void>;
-  hitTest(x: number, y: number): Promise<string | null>;
+  hitTest(
+    screenX: number,
+    screenY: number,
+    panX: number,
+    panY: number,
+    zoom: number,
+  ): Promise<string | null>;
   setSelection(nodeIds: string[]): Promise<void>;
   getSelection(): Promise<string[]>;
   clearSelection(): Promise<void>;
@@ -380,6 +394,7 @@ export interface CanvasBridge {
     x: number,
     y: number,
     text: string,
+    fontFamily: string,
     fontSize: number,
   ): Promise<string>;
   moveNode(nodeId: string, dx: number, dy: number): Promise<void>;

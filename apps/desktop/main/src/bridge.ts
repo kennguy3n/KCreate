@@ -108,7 +108,13 @@ export interface Bridge {
 
   // Canvas: scene sync, hit testing, selection, shape creation, move
   documentSyncScene(): void;
-  canvasHitTest(x: number, y: number): string | null;
+  canvasHitTest(
+    x: number,
+    y: number,
+    panX: number,
+    panY: number,
+    zoom: number,
+  ): string | null;
   documentSetSelection(nodeIds: string[]): void;
   documentGetSelection(): string[];
   documentClearSelection(): void;
@@ -139,6 +145,7 @@ export interface Bridge {
     x: number,
     y: number,
     text: string,
+    fontFamily: string,
     fontSize: number,
   ): string;
   canvasMoveNode(nodeId: string, dx: number, dy: number): void;

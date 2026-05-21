@@ -717,6 +717,24 @@ pub fn document_sync_scene() -> Result<()> {
 /// Internal scene-sync used by every mutation site. Caller must hold
 /// the workspace lock. Failures to render are propagated; failures to
 /// find a renderer (host hasn't initialised yet) are swallowed.
+///
+/// # Lock-ordering invariant
+///
+/// This function takes the **renderer singleton lock** (via
+/// `crate::state::render_scene`) while the **workspace lock** is
+/// already held by the caller's `MutexGuard`. Every call site in this
+/// module therefore observes the same lock order:
+///
+/// > workspace lock  →  renderer singleton lock
+///
+/// No code path in `kcreate_bridge` may take these locks in the
+/// opposite order. In particular, the renderer crate itself never
+/// reaches back into the workspace, and the [`WorkspaceAccess`] MCP
+/// impl only enters the workspace lock — it never enters the renderer
+/// lock except indirectly through this function (which always
+/// observes the canonical order). As long as both invariants hold,
+/// there is no path that can deadlock by acquiring them in opposite
+/// orders.
 fn sync_scene_locked(guard: &mut parking_lot::MutexGuard<'_, Option<Workspace>>) -> Result<()> {
     let Some(ws) = guard.as_mut() else {
         return Ok(());
@@ -1570,10 +1588,82 @@ pub fn ai_get_action_log() -> Result<String> {
 // MCP server
 // -----------------------------------------------------------------------------
 
+/// `DocumentAccess` implementation that talks to the process-global
+/// workspace [`slot`]. Each method takes the workspace lock for the
+/// minimum duration needed.
+///
+/// The MCP server holds an `Arc<dyn DocumentAccess>` for its full
+/// lifetime, but only calls into this impl while servicing a request
+/// on its worker thread — so the workspace lock is held briefly and
+/// never across an `await` boundary. Lock-ordering relative to the
+/// renderer singleton is documented on [`sync_scene_locked`].
+#[cfg(feature = "mcp")]
+struct WorkspaceAccess;
+
+#[cfg(feature = "mcp")]
+impl kcreate_mcp::tools::DocumentAccess for WorkspaceAccess {
+    fn list_artboards(&self) -> Vec<kcreate_mcp::tools::ArtboardInfo> {
+        let guard = slot().lock();
+        let Some(ws) = guard.as_ref() else {
+            return Vec::new();
+        };
+        ws.project
+            .document
+            .iter()
+            .filter(|(_, n)| n.node_type == NodeType::Artboard)
+            .map(|(id, n)| kcreate_mcp::tools::ArtboardInfo {
+                id: id.to_string(),
+                name: n.name.clone(),
+                bounds: n.bounds.into(),
+            })
+            .collect()
+    }
+
+    fn create_node(
+        &self,
+        node_type: NodeType,
+        name: String,
+        parent_id: Option<Uuid>,
+    ) -> std::result::Result<Uuid, String> {
+        let mut guard = slot().lock();
+        let ws = guard
+            .as_mut()
+            .ok_or_else(|| "no project open".to_string())?;
+        let mut node = Node::new(node_type, name);
+        node.parent_id = parent_id;
+        let id = ws
+            .project
+            .document
+            .insert_node(node)
+            .map_err(|e| e.to_string())?;
+        ws.project.modified_at = Utc::now();
+        // Sync the scene so the renderer sees the new node immediately.
+        // Failure to sync (e.g. renderer not initialised in a headless
+        // host) is non-fatal: the next renderer_init + sync recovers.
+        let _ = sync_scene_locked(&mut guard);
+        Ok(id)
+    }
+
+    fn export_svg(&self, node_ids: &[Uuid]) -> std::result::Result<String, String> {
+        let guard = slot().lock();
+        let ws = guard
+            .as_ref()
+            .ok_or_else(|| "no project open".to_string())?;
+        kcreate_export::svg::export_svg_from_document(
+            &ws.project.document,
+            node_ids,
+            &kcreate_export::svg::SvgExportOptions::default(),
+        )
+        .map_err(|e| e.to_string())
+    }
+}
+
 /// Start the local MCP server. Loopback-only. Idempotent.
 #[cfg(feature = "mcp")]
 pub fn mcp_start() -> Result<u32> {
-    let port = kcreate_mcp::server::start_global()
+    let access: std::sync::Arc<dyn kcreate_mcp::tools::DocumentAccess> =
+        std::sync::Arc::new(WorkspaceAccess);
+    let port = kcreate_mcp::server::start_global(access)
         .map_err(|e| DocumentBridgeError::Io(std::io::Error::other(e.to_string())))?;
     Ok(u32::from(port))
 }

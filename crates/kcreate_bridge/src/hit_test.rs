@@ -14,10 +14,10 @@
 //! hit-testing — clicking on a selection outline should not "hit" the
 //! outline itself; we want the underlying node.
 
-use kcreate_renderer::{ObjectKind, Scene, Vec2};
+use kcreate_renderer::{Scene, Vec2};
 use uuid::Uuid;
 
-use crate::scene_sync::SceneSync;
+use crate::scene_sync::{is_selection_highlight_id, SceneSync};
 
 /// Camera transform shared with the renderer's `Viewport`. We accept
 /// it as a plain struct here to keep `hit_test` independent of the
@@ -74,12 +74,14 @@ pub fn hit_test(
         if !point_in_rect(bounds, wx, wy) {
             continue;
         }
-        // Skip selection highlights — they're stroked rects with no
-        // fill that should never be selectable themselves.
-        if matches!(obj.kind, ObjectKind::Rect(_))
-            && obj.style.fill.is_none()
-            && obj.style.stroke.is_some()
-        {
+        // Skip selection highlight overlays. Highlights are appended
+        // to the scene with ids drawn from the reserved high range
+        // (`HIGHLIGHT_ID_THRESHOLD..=u64::MAX`), separate from the
+        // monotonic low-range allocator that backs real document
+        // objects. The id-range check is exact — unlike the previous
+        // "unfilled stroked rect" style heuristic, it never
+        // false-positives on a user-created outline-only rect.
+        if is_selection_highlight_id(obj.id) {
             continue;
         }
         if let Some(uuid) = scene_sync.uuid_for_object_id(obj.id) {
@@ -227,5 +229,80 @@ mod tests {
         let scene = sync.sync_document_to_scene(&doc, None, &[]);
         let vp = Viewport::new(Vec2::new(0.0, 0.0), 1.0);
         assert!(hit_test(&sync, &scene, 0.0, 0.0, vp).is_none());
+    }
+
+    /// Regression: an outline-only (stroke-no-fill) user rect must
+    /// still be hit-testable. The previous heuristic skipped *any*
+    /// stroked-unfilled rect on the assumption it was a selection
+    /// highlight; the id-range check now reliably distinguishes
+    /// document objects from highlight overlays.
+    #[test]
+    fn outline_only_user_rect_is_still_hittable() {
+        let mut doc = DocumentGraph::new();
+        let path = VectorPath::new(vec![
+            PathSegment::MoveTo(PathPoint::new(0.0, 0.0)),
+            PathSegment::LineTo(PathPoint::new(20.0, 0.0)),
+            PathSegment::LineTo(PathPoint::new(20.0, 20.0)),
+            PathSegment::LineTo(PathPoint::new(0.0, 20.0)),
+            PathSegment::Close,
+        ]);
+        let mut node = Node::new(NodeType::VectorLayer, "outline-only");
+        node.bounds = Bounds {
+            x: 0.0,
+            y: 0.0,
+            width: 20.0,
+            height: 20.0,
+        };
+        // No fill, but a stroke — same shape as the selection
+        // highlight's *style*. Hit-testing must still return the
+        // node's uuid because its ObjectId is in the low (real)
+        // range, not the highlight range.
+        node.style.fill = FillStyle::None;
+        node.style.stroke = Some(kcreate_core::node::StrokeStyle {
+            color: RgbaColor {
+                r: 0.0,
+                g: 0.0,
+                b: 0.0,
+                a: 1.0,
+            },
+            width: 1.0,
+            dash: Vec::new(),
+        });
+        node.metadata.insert(
+            crate::scene_sync::VECTOR_PATH_METADATA_KEY.to_string(),
+            serde_json::to_value(&path).unwrap(),
+        );
+        let id = doc.insert_node(node).unwrap();
+
+        let mut sync = SceneSync::new();
+        let scene = sync.sync_document_to_scene(&doc, None, &[]);
+        let vp = Viewport::new(Vec2::new(0.0, 0.0), 1.0);
+        let hit = hit_test(&sync, &scene, 5.0, 5.0, vp);
+        assert_eq!(
+            hit,
+            Some(id),
+            "outline-only user rect must still hit (id-range check, not style heuristic)"
+        );
+    }
+
+    /// Regression: a selection highlight must NOT be hit-testable,
+    /// even though it occupies the same world bounds as the
+    /// underlying selected node. Clicking inside the bounds of a
+    /// selected node should return the *node's* uuid, not nothing
+    /// and not a highlight uuid (highlights aren't in the
+    /// `ObjectId` ↔ `Uuid` map at all).
+    #[test]
+    fn click_on_selected_node_returns_node_not_highlight() {
+        let (doc, id) = make_doc_with_rect_at(10.0, 10.0, 20.0, 20.0);
+        let mut sync = SceneSync::new();
+        // Mark the node as selected so a highlight is appended.
+        let scene = sync.sync_document_to_scene(&doc, None, &[id]);
+        let vp = Viewport::new(Vec2::new(0.0, 0.0), 1.0);
+        let hit = hit_test(&sync, &scene, 15.0, 15.0, vp);
+        assert_eq!(
+            hit,
+            Some(id),
+            "hit-test must walk through the highlight overlay"
+        );
     }
 }

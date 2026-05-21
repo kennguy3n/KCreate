@@ -18,7 +18,7 @@ use kcreate_core::config::RuntimeConfig;
 use kcreate_core::document::{DocumentError, DocumentGraph};
 use kcreate_core::node::{Node, NodeType};
 use kcreate_core::operation::Operation;
-use kcreate_core::project::{Project, ProjectError};
+use kcreate_core::project::{BrandKit, DesignTokens, ExportPreset, Project, ProjectError};
 use kcreate_export::png::{export_png, PngExportError, PngExportOptions};
 use kcreate_export::svg::{export_svg_from_document, SvgDocumentExportError, SvgExportOptions};
 use kcreate_storage::project_io::{ProjectStore, ProjectStoreError};
@@ -244,9 +244,9 @@ pub fn project_open(dir: &Path) -> Result<ProjectInfo> {
     let document = store.load_document()?;
     let manifest = store.manifest();
     // We deliberately *don't* call `install_default_export_presets`
-    // here — reopen should never invent fresh preset UUIDs. Once the
-    // store learns to persist design tokens / brand kits / presets,
-    // they will round-trip through `manifest`/`load_*` instead.
+    // here — reopen should never invent fresh preset UUIDs. Design
+    // tokens, brand kits, and export presets round-trip through the
+    // store so identifiers stay stable across close/reopen.
     //
     // Same device-tier wiring as `project_create` (`ANALYSIS_0003` on
     // PR #2). The on-disk operation history may contain *more* rows
@@ -260,6 +260,9 @@ pub fn project_open(dir: &Path) -> Result<ProjectInfo> {
     project.created_at = manifest.created_at;
     project.modified_at = manifest.modified_at;
     project.document = document;
+    project.design_tokens = store.load_design_tokens()?;
+    project.brand_kits = store.load_brand_kits()?;
+    project.export_presets = store.load_export_presets()?;
     // Restore the operation log from disk so undo survives close+reopen.
     let max_depth = project.operation_log.max_depth();
     let history = store.load_operations(max_depth)?;
@@ -309,6 +312,35 @@ pub fn project_save() -> Result<()> {
     let mut guard = slot().lock();
     let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
     ws.store.save_document(&ws.project.document)?;
+    // Persist project-level metadata (design tokens, brand kits,
+    // export presets). These mirror the in-memory `Project` fields
+    // and must round-trip across close/reopen so identifiers stay
+    // stable. Brand kits / presets are upserted by id; the design
+    // tokens table holds a single row keyed on `'current'`.
+    ws.store.save_design_tokens(&ws.project.design_tokens)?;
+    for kit in &ws.project.brand_kits {
+        ws.store.save_brand_kit(kit)?;
+    }
+    // Reconcile deleted brand kits: any rows on disk whose id is no
+    // longer in memory must be removed so deletes survive the next
+    // reopen.
+    let kit_ids: HashSet<Uuid> = ws.project.brand_kits.iter().map(|k| k.id).collect();
+    let on_disk_kits = ws.store.load_brand_kits()?;
+    for kit in &on_disk_kits {
+        if !kit_ids.contains(&kit.id) {
+            ws.store.delete_brand_kit(kit.id)?;
+        }
+    }
+    for preset in &ws.project.export_presets {
+        ws.store.save_export_preset(preset)?;
+    }
+    let preset_ids: HashSet<Uuid> = ws.project.export_presets.iter().map(|p| p.id).collect();
+    let on_disk_presets = ws.store.load_export_presets()?;
+    for preset in &on_disk_presets {
+        if !preset_ids.contains(&preset.id) {
+            ws.store.delete_export_preset(preset.id)?;
+        }
+    }
 
     let current_ids: HashSet<Uuid> = ws.project.operation_log.iter().map(|op| op.id).collect();
     // Collect new ops first so we can satisfy the borrow checker (the
@@ -357,6 +389,119 @@ pub fn project_info() -> Option<ProjectInfo> {
         .map(|ws| build_info(&ws.project, ws.store.project_dir()));
     drop(guard);
     info
+}
+
+// -----------------------------------------------------------------------------
+// Design tokens / brand kits / export presets
+// -----------------------------------------------------------------------------
+
+/// Snapshot the current project's design tokens. Returns the empty
+/// default `DesignTokens` when no project is open so callers can keep
+/// a stable React state shape without special-casing the no-project
+/// path.
+pub fn design_tokens_get() -> Result<DesignTokens> {
+    let guard = slot().lock();
+    let ws = guard.as_ref().ok_or(DocumentBridgeError::NoProject)?;
+    Ok(ws.project.design_tokens.clone())
+}
+
+/// Replace the entire design-tokens bag. The caller is responsible
+/// for calling [`project_save`] afterwards; this only mutates the
+/// in-memory project.
+pub fn design_tokens_set(tokens: DesignTokens) -> Result<()> {
+    let mut guard = slot().lock();
+    let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
+    ws.project.design_tokens = tokens;
+    drop(guard);
+    Ok(())
+}
+
+/// Create a new (empty) brand kit and append it to the project.
+/// Returns the new kit's id.
+pub fn brand_kit_create(name: String) -> Result<Uuid> {
+    let mut guard = slot().lock();
+    let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
+    let kit = BrandKit::new(name);
+    let id = kit.id;
+    ws.project.brand_kits.push(kit);
+    drop(guard);
+    Ok(id)
+}
+
+/// Replace an existing brand kit by id. Returns
+/// [`DocumentBridgeError::NodeNotFound`] if the id doesn't match any
+/// in-memory kit — brand-kit ids share the `Uuid` namespace with
+/// node ids and the bridge surface treats both as opaque, so we
+/// reuse the existing error variant rather than introducing a
+/// second "not found" type that callers would have to disambiguate.
+pub fn brand_kit_update(kit: BrandKit) -> Result<()> {
+    let mut guard = slot().lock();
+    let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
+    let slot_idx = ws
+        .project
+        .brand_kits
+        .iter()
+        .position(|k| k.id == kit.id)
+        .ok_or(DocumentBridgeError::NodeNotFound(kit.id))?;
+    ws.project.brand_kits[slot_idx] = kit;
+    drop(guard);
+    Ok(())
+}
+
+/// List every brand kit in the project, in insertion order.
+pub fn brand_kit_list() -> Result<Vec<BrandKit>> {
+    let guard = slot().lock();
+    let ws = guard.as_ref().ok_or(DocumentBridgeError::NoProject)?;
+    Ok(ws.project.brand_kits.clone())
+}
+
+/// Remove a brand kit by id. Returns true when something was removed.
+pub fn brand_kit_delete(id: Uuid) -> Result<bool> {
+    let mut guard = slot().lock();
+    let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
+    let before = ws.project.brand_kits.len();
+    ws.project.brand_kits.retain(|k| k.id != id);
+    Ok(ws.project.brand_kits.len() != before)
+}
+
+/// Create a new export preset and append it to the project. Returns the new id.
+pub fn export_preset_create(name: String, format: &str, scale: f32) -> Result<Uuid> {
+    let format = parse_export_format(format)?;
+    let mut guard = slot().lock();
+    let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
+    let preset = ExportPreset::new(name, format, scale);
+    let id = preset.id;
+    ws.project.export_presets.push(preset);
+    drop(guard);
+    Ok(id)
+}
+
+/// List every export preset, in insertion order.
+pub fn export_preset_list() -> Result<Vec<ExportPreset>> {
+    let guard = slot().lock();
+    let ws = guard.as_ref().ok_or(DocumentBridgeError::NoProject)?;
+    Ok(ws.project.export_presets.clone())
+}
+
+/// Delete an export preset by id. Returns true when something was removed.
+pub fn export_preset_delete(id: Uuid) -> Result<bool> {
+    let mut guard = slot().lock();
+    let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
+    let before = ws.project.export_presets.len();
+    ws.project.export_presets.retain(|p| p.id != id);
+    Ok(ws.project.export_presets.len() != before)
+}
+
+fn parse_export_format(format: &str) -> Result<kcreate_core::project::ExportFormat> {
+    use kcreate_core::project::ExportFormat;
+    match format.to_ascii_lowercase().as_str() {
+        "png" => Ok(ExportFormat::Png),
+        "svg" => Ok(ExportFormat::Svg),
+        "pdf" => Ok(ExportFormat::Pdf),
+        "webp" => Ok(ExportFormat::Webp),
+        "jpeg" | "jpg" => Ok(ExportFormat::Jpeg),
+        other => Err(DocumentBridgeError::InvalidNodeType(other.to_string())),
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -1889,6 +2034,128 @@ mod tests {
         // A final save with no new ops must be a no-op (no PRIMARY KEY
         // violation, no spurious rewrites).
         project_save().expect("idempotent save");
+        project_close();
+    }
+
+    #[test]
+    #[serial]
+    fn brand_kit_create_list_update_delete_round_trips_through_save() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("bk", dir.path()).expect("create");
+
+        let id = brand_kit_create("KChat".into()).expect("create");
+        // Editing the kit just-created.
+        let mut kits = brand_kit_list().expect("list");
+        assert_eq!(kits.len(), 1);
+        let mut kit = kits.remove(0);
+        assert_eq!(kit.id, id);
+        kit.colors.push(kcreate_core::project::NamedColor {
+            name: "primary".into(),
+            color: kcreate_core::node::RgbaColor::KCHAT_PRIMARY,
+        });
+        brand_kit_update(kit).expect("update");
+
+        project_save().expect("save");
+        project_close();
+        project_open(&dir.path().join("bk.kstudio")).expect("reopen");
+        let kits2 = brand_kit_list().expect("list2");
+        assert_eq!(kits2.len(), 1);
+        assert_eq!(kits2[0].id, id);
+        assert_eq!(kits2[0].colors[0].name, "primary");
+
+        // Deleting + saving must drop the on-disk row so a second
+        // reopen agrees the kit is gone.
+        let removed = brand_kit_delete(id).expect("delete");
+        assert!(removed);
+        project_save().expect("save after delete");
+        project_close();
+        project_open(&dir.path().join("bk.kstudio")).expect("reopen 2");
+        assert!(brand_kit_list().expect("list3").is_empty());
+        project_close();
+    }
+
+    #[test]
+    #[serial]
+    fn design_tokens_set_persists_across_close_and_reopen() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("dt", dir.path()).expect("create");
+
+        let mut tokens = design_tokens_get().expect("initial");
+        assert!(tokens.colors.is_empty());
+        tokens.colors.insert(
+            "brand/primary".into(),
+            kcreate_core::node::RgbaColor::KCHAT_PRIMARY,
+        );
+        tokens.spacing.insert("space/4".into(), 16.0);
+        design_tokens_set(tokens).expect("set");
+
+        project_save().expect("save");
+        project_close();
+        project_open(&dir.path().join("dt.kstudio")).expect("reopen");
+        let loaded = design_tokens_get().expect("get after reopen");
+        assert_eq!(loaded.colors.len(), 1);
+        assert!(loaded.colors.contains_key("brand/primary"));
+        assert_eq!(loaded.spacing.get("space/4").copied(), Some(16.0));
+        project_close();
+    }
+
+    #[test]
+    #[serial]
+    fn export_preset_create_list_delete_round_trip() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("ep", dir.path()).expect("create");
+
+        // `project_create` installs the default presets, so we record
+        // the baseline count rather than asserting on a fixed number.
+        // The on-disk reconciliation must preserve every default
+        // preset alongside the ones we add.
+        let baseline = export_preset_list().expect("baseline").len();
+
+        let one = export_preset_create("PNG @1x".into(), "png", 1.0).expect("create 1x");
+        let two = export_preset_create("PNG @2x".into(), "png", 2.0).expect("create 2x");
+        let presets = export_preset_list().expect("list");
+        assert_eq!(presets.len(), baseline + 2);
+        assert!(presets.iter().any(|p| p.id == one));
+        assert!(presets.iter().any(|p| p.id == two));
+
+        // Save → reopen → still baseline + 2.
+        project_save().expect("save");
+        project_close();
+        project_open(&dir.path().join("ep.kstudio")).expect("reopen");
+        assert_eq!(
+            export_preset_list().expect("list2").len(),
+            baseline + 2,
+            "reopen must restore every saved preset"
+        );
+
+        // Delete + save reconciles the on-disk row so the reopened
+        // project no longer has it.
+        let removed = export_preset_delete(one).expect("delete");
+        assert!(removed);
+        project_save().expect("save after delete");
+        project_close();
+        project_open(&dir.path().join("ep.kstudio")).expect("reopen 2");
+        let presets2 = export_preset_list().expect("list3");
+        assert_eq!(presets2.len(), baseline + 1);
+        assert!(
+            presets2.iter().all(|p| p.id != one),
+            "deleted preset must not reappear after reopen"
+        );
+        assert!(presets2.iter().any(|p| p.id == two));
+        project_close();
+    }
+
+    #[test]
+    #[serial]
+    fn export_preset_create_rejects_unknown_format() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("ep2", dir.path()).expect("create");
+        let err = export_preset_create("nope".into(), "bmp", 1.0).expect_err("bmp");
+        assert!(matches!(err, DocumentBridgeError::InvalidNodeType(_)));
         project_close();
     }
 }

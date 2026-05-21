@@ -553,6 +553,42 @@ function registerIpcHandlers(): void {
   ipcMain.handle("kcreate/mcp/isRunning", () =>
     requireBridge().mcpIsRunning(),
   );
+
+  // Design tokens / brand kits / export presets (Task 19). Mutations
+  // do not auto-save — the host should call project/save when it
+  // wants the changes to land on disk.
+  ipcMain.handle("kcreate/designTokens/get", () =>
+    requireBridge().designTokensGet(),
+  );
+  ipcMain.handle(
+    "kcreate/designTokens/set",
+    (_e, tokensJson: string) => {
+      requireBridge().designTokensSet(tokensJson);
+    },
+  );
+  ipcMain.handle("kcreate/brandKit/create", (_e, name: string) =>
+    requireBridge().brandKitCreate(name),
+  );
+  ipcMain.handle("kcreate/brandKit/update", (_e, kitJson: string) => {
+    requireBridge().brandKitUpdate(kitJson);
+  });
+  ipcMain.handle("kcreate/brandKit/list", () =>
+    requireBridge().brandKitList(),
+  );
+  ipcMain.handle("kcreate/brandKit/delete", (_e, kitId: string) =>
+    requireBridge().brandKitDelete(kitId),
+  );
+  ipcMain.handle(
+    "kcreate/exportPreset/create",
+    (_e, name: string, format: string, scale: number) =>
+      requireBridge().exportPresetCreate(name, format, scale),
+  );
+  ipcMain.handle("kcreate/exportPreset/list", () =>
+    requireBridge().exportPresetList(),
+  );
+  ipcMain.handle("kcreate/exportPreset/delete", (_e, presetId: string) =>
+    requireBridge().exportPresetDelete(presetId),
+  );
 }
 
 void app.whenReady().then(() => {

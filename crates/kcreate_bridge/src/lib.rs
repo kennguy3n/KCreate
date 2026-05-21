@@ -762,3 +762,78 @@ pub fn mcp_stop() -> NapiResult<()> {
 pub const fn mcp_is_running() -> bool {
     document::mcp_is_running()
 }
+
+// -----------------------------------------------------------------------------
+// Design tokens / brand kits / export presets (Task 19)
+// -----------------------------------------------------------------------------
+
+/// Return the current project's design tokens as a JSON object.
+#[napi]
+pub fn design_tokens_get() -> NapiResult<String> {
+    let tokens = document::design_tokens_get().map_err(map_doc_err)?;
+    serde_json::to_string(&tokens).map_err(|e| NapiError::from_reason(e.to_string()))
+}
+
+/// Replace the design-tokens bag from JSON. Persisted on the next
+/// `project_save`.
+#[napi]
+pub fn design_tokens_set(tokens_json: String) -> NapiResult<()> {
+    let tokens: kcreate_core::project::DesignTokens =
+        serde_json::from_str(&tokens_json).map_err(|e| NapiError::from_reason(e.to_string()))?;
+    document::design_tokens_set(tokens).map_err(map_doc_err)
+}
+
+/// Create a new brand kit with the given display name. Returns the
+/// new kit's UUID as a string.
+#[napi]
+pub fn brand_kit_create(name: String) -> NapiResult<String> {
+    document::brand_kit_create(name)
+        .map(|id| id.to_string())
+        .map_err(map_doc_err)
+}
+
+/// Replace an existing brand kit. The kit's id field is the key.
+#[napi]
+pub fn brand_kit_update(kit_json: String) -> NapiResult<()> {
+    let kit: kcreate_core::project::BrandKit =
+        serde_json::from_str(&kit_json).map_err(|e| NapiError::from_reason(e.to_string()))?;
+    document::brand_kit_update(kit).map_err(map_doc_err)
+}
+
+/// List every brand kit in the project as a JSON array.
+#[napi]
+pub fn brand_kit_list() -> NapiResult<String> {
+    let kits = document::brand_kit_list().map_err(map_doc_err)?;
+    serde_json::to_string(&kits).map_err(|e| NapiError::from_reason(e.to_string()))
+}
+
+/// Delete a brand kit by id. Returns true when something was
+/// removed; false if no matching kit existed.
+#[napi]
+pub fn brand_kit_delete(kit_id: String) -> NapiResult<bool> {
+    let id = parse_uuid(&kit_id)?;
+    document::brand_kit_delete(id).map_err(map_doc_err)
+}
+
+/// Create a new export preset. `format` is one of `png` / `svg` /
+/// `pdf` / `webp` / `jpeg`. Returns the new preset's UUID.
+#[napi]
+pub fn export_preset_create(name: String, format: String, scale: f64) -> NapiResult<String> {
+    document::export_preset_create(name, &format, scale as f32)
+        .map(|id| id.to_string())
+        .map_err(map_doc_err)
+}
+
+/// List every export preset in the project as a JSON array.
+#[napi]
+pub fn export_preset_list() -> NapiResult<String> {
+    let presets = document::export_preset_list().map_err(map_doc_err)?;
+    serde_json::to_string(&presets).map_err(|e| NapiError::from_reason(e.to_string()))
+}
+
+/// Delete an export preset by id. Returns true when something was removed.
+#[napi]
+pub fn export_preset_delete(preset_id: String) -> NapiResult<bool> {
+    let id = parse_uuid(&preset_id)?;
+    document::export_preset_delete(id).map_err(map_doc_err)
+}

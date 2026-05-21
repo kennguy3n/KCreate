@@ -151,6 +151,17 @@ export interface Bridge {
   mcpStart(): number;
   mcpStop(): void;
   mcpIsRunning(): boolean;
+
+  // Design tokens / brand kits / export presets (Task 19)
+  designTokensGet(): string;
+  designTokensSet(tokensJson: string): void;
+  brandKitCreate(name: string): string;
+  brandKitUpdate(kitJson: string): void;
+  brandKitList(): string;
+  brandKitDelete(kitId: string): boolean;
+  exportPresetCreate(name: string, format: string, scale: number): string;
+  exportPresetList(): string;
+  exportPresetDelete(presetId: string): boolean;
 }
 
 function bridgeBinaryPath(): string {

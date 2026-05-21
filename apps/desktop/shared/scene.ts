@@ -407,6 +407,119 @@ export interface McpBridge {
   isRunning(): Promise<boolean>;
 }
 
+// -----------------------------------------------------------------------------
+// Design tokens / brand kits / export presets (Task 19)
+//
+// These mirror the Rust types in `kcreate_core::project`. They are
+// declared here so the renderer can typecheck the JSON crossing the
+// bridge — every field name and casing matches the snake_case
+// serde representation used on the Rust side, because the bridge
+// hands the renderer a JSON string verbatim.
+// -----------------------------------------------------------------------------
+
+/** RGBA in [0, 1] — same as `kcreate_core::node::RgbaColor`. */
+export interface RgbaColor {
+  r: number;
+  g: number;
+  b: number;
+  a: number;
+}
+
+/** Typography token mirroring `kcreate_core::project::TypographyToken`. */
+export interface TypographyToken {
+  font_family: string;
+  font_weight: number;
+  font_size: number;
+  line_height: number;
+  letter_spacing: number;
+}
+
+/** Drop-shadow token. */
+export interface ShadowToken {
+  offset_x: number;
+  offset_y: number;
+  blur: number;
+  spread: number;
+  color: RgbaColor;
+}
+
+/** Project-wide reusable tokens. Maps mirror `HashMap<String, T>`. */
+export interface DesignTokens {
+  colors: Record<string, RgbaColor>;
+  typography: Record<string, TypographyToken>;
+  spacing: Record<string, number>;
+  radii: Record<string, number>;
+  shadows: Record<string, ShadowToken>;
+}
+
+/** Named color inside a brand kit. */
+export interface NamedColor {
+  name: string;
+  color: RgbaColor;
+}
+
+/** Font reference inside a brand kit. */
+export interface FontRef {
+  family: string;
+  weight: number;
+  italic: boolean;
+  embedded_asset_id: string | null;
+}
+
+export type ExportFormat = "png" | "svg" | "pdf" | "webp" | "jpeg";
+
+/** A pre-configured export target. */
+export interface ExportPreset {
+  id: string;
+  name: string;
+  format: ExportFormat;
+  scale: number;
+  suffix: string;
+}
+
+/** A brand kit: top-level palette / typography / logos / spacing /
+ * per-format export rules. */
+export interface BrandKit {
+  id: string;
+  name: string;
+  logo_asset_id: string | null;
+  colors: NamedColor[];
+  fonts: FontRef[];
+  spacing_scale: number[];
+  export_rules: ExportPreset[];
+}
+
+/**
+ * Design-token CRUD bridge. The setter does NOT persist; call
+ * `window.kcreate.document.save()` after a setter to land the change
+ * on disk.
+ */
+export interface DesignTokensBridge {
+  get(): Promise<DesignTokens>;
+  set(tokens: DesignTokens): Promise<void>;
+}
+
+/**
+ * Brand-kit CRUD bridge. `create` returns the new kit's UUID;
+ * `update` replaces the existing row keyed on `kit.id`.
+ */
+export interface BrandKitBridge {
+  create(name: string): Promise<string>;
+  update(kit: BrandKit): Promise<void>;
+  list(): Promise<BrandKit[]>;
+  delete(kitId: string): Promise<boolean>;
+}
+
+/**
+ * Export-preset CRUD bridge. Used by both the Export panel and the
+ * project home page (to seed default presets).
+ */
+export interface ExportPresetBridge {
+  create(name: string, format: ExportFormat, scale: number): Promise<string>;
+  list(): Promise<ExportPreset[]>;
+  delete(presetId: string): Promise<boolean>;
+}
+
 declare global {
   interface Window {
     kcreate: {
@@ -417,6 +530,9 @@ declare global {
       mcp: McpBridge;
       runtime: RuntimeBridge;
       export: ExportBridge;
+      designTokens: DesignTokensBridge;
+      brandKit: BrandKitBridge;
+      exportPreset: ExportPresetBridge;
     };
   }
 }

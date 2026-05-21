@@ -83,13 +83,13 @@ Export Center, Local AI Core Pack.
 - [x] AI Assist panel (Ask → Preview → Apply → Edit → Undo for bg removal)
 - [x] Export panel UI (5 formats, batch presets)
 - [x] Mode switcher (functional — tool palettes + right-panel focus per mode)
+- [x] Brand-kit / design-tokens / export-preset persistence + IPC (Task 18 / 19 — `brand_kits`, `design_tokens`, `export_presets` SQLite tables; N-API surface `brand_kit_*`, `design_tokens_*`, `export_preset_*`; preload `window.kcreate.{brandKit,designTokens,exportPreset}`)
 
 ### Remaining for Phase 1 ship
 - Artboards / frame system (multi-artboard pages)
 - Component system
 - Auto-layout (flex / grid)
-- Design-token cross-reference (preview/edit tokens)
-- Brand-kit / design-tokens persistence + IPC
+- Design-token cross-reference (preview/edit tokens — bridge surface lives, UI panels still TODO)
 - SVG / PNG / PDF batch preset library
 - Low-resource mode enforcement
 - Native `CanvasHost` (Metal / D3D12 / Vulkan) replacing the offscreen-readback presentation path

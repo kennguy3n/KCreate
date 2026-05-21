@@ -7,11 +7,18 @@ import { contextBridge, ipcRenderer } from "electron";
 import type {
   AcquiredFrame,
   AiBridge,
+  BrandKit,
+  BrandKitBridge,
   CanvasBridge,
   CreateNodeProps,
+  DesignTokens,
+  DesignTokensBridge,
   DocumentBridge,
   DocumentStatus,
   ExportBridge,
+  ExportFormat,
+  ExportPreset,
+  ExportPresetBridge,
   FrameInfo,
   JpegExportOptions,
   McpBridge,
@@ -434,6 +441,70 @@ const mcp: McpBridge = {
   },
 };
 
+const designTokens: DesignTokensBridge = {
+  async get(): Promise<DesignTokens> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/designTokens/get",
+    )) as string;
+    return JSON.parse(raw) as DesignTokens;
+  },
+  async set(tokens: DesignTokens): Promise<void> {
+    await ipcRenderer.invoke(
+      "kcreate/designTokens/set",
+      JSON.stringify(tokens),
+    );
+  },
+};
+
+const brandKit: BrandKitBridge = {
+  async create(name: string): Promise<string> {
+    return (await ipcRenderer.invoke(
+      "kcreate/brandKit/create",
+      name,
+    )) as string;
+  },
+  async update(kit: BrandKit): Promise<void> {
+    await ipcRenderer.invoke("kcreate/brandKit/update", JSON.stringify(kit));
+  },
+  async list(): Promise<BrandKit[]> {
+    const raw = (await ipcRenderer.invoke("kcreate/brandKit/list")) as string;
+    return JSON.parse(raw) as BrandKit[];
+  },
+  async delete(kitId: string): Promise<boolean> {
+    return (await ipcRenderer.invoke(
+      "kcreate/brandKit/delete",
+      kitId,
+    )) as boolean;
+  },
+};
+
+const exportPreset: ExportPresetBridge = {
+  async create(
+    name: string,
+    format: ExportFormat,
+    scale: number,
+  ): Promise<string> {
+    return (await ipcRenderer.invoke(
+      "kcreate/exportPreset/create",
+      name,
+      format,
+      scale,
+    )) as string;
+  },
+  async list(): Promise<ExportPreset[]> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/exportPreset/list",
+    )) as string;
+    return JSON.parse(raw) as ExportPreset[];
+  },
+  async delete(presetId: string): Promise<boolean> {
+    return (await ipcRenderer.invoke(
+      "kcreate/exportPreset/delete",
+      presetId,
+    )) as boolean;
+  },
+};
+
 contextBridge.exposeInMainWorld("kcreate", {
   renderer,
   document,
@@ -442,4 +513,7 @@ contextBridge.exposeInMainWorld("kcreate", {
   mcp,
   runtime,
   export: exportApi,
+  designTokens,
+  brandKit,
+  exportPreset,
 });

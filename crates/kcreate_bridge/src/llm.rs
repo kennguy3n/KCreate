@@ -392,6 +392,14 @@ mod tests {
             visible: true,
             locked: false,
             children: vec![],
+            // Zero bounds — the LLM prompt builder doesn't read them;
+            // we just need the field populated to satisfy the struct.
+            bounds: crate::document::BoundsInfo {
+                x: 0.0,
+                y: 0.0,
+                width: 0.0,
+                height: 0.0,
+            },
             component_instance: None,
             metadata: std::collections::HashMap::new(),
         }

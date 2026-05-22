@@ -74,7 +74,21 @@ pub fn init(width: u32, height: u32) -> Result<RendererInfo> {
 }
 
 /// Shut down the renderer (no-op if not initialized).
+///
+/// Each `*slot().lock() = None;` statement is an acquire-then-drop:
+/// the lock guard's lifetime ends at the semicolon, so we never hold
+/// two of `{native_slot, slot, scene_slot}` at the same time here.
+/// The render path (which DOES co-hold multiple guards) acquires in
+/// the strict order `slot -> native_slot -> scene_slot`, and because
+/// shutdown holds zero of those simultaneously, the orders can't
+/// invert. Don't refactor this into a helper that takes all three
+/// guards at once without re-reading the deadlock analysis on the
+/// `Comment 54` thread of PR #5.
 pub fn shutdown() {
+    #[cfg(feature = "native_canvas")]
+    {
+        *native_slot().lock() = None;
+    }
     *slot().lock() = None;
     *scene_slot().lock() = None;
 }
@@ -83,14 +97,75 @@ pub fn shutdown() {
 /// via N-API.
 #[cfg(test)]
 pub(crate) fn reset_for_tests() {
+    #[cfg(feature = "native_canvas")]
+    {
+        *native_slot().lock() = None;
+    }
     *slot().lock() = None;
     *scene_slot().lock() = None;
 }
 
+/// Resize both the offscreen pipeline *and* (if attached) the native
+/// presentation surface in a single call.
+///
+/// The two outputs must stay in step: the renderer rasterises into
+/// the offscreen staging buffer at `(width, height)` and then either
+/// publishes via the presenter (offscreen mode) or uploads into the
+/// swapchain (native mode). If only the offscreen target were
+/// resized, native-mode frames would either get clipped (swapchain
+/// smaller than staging) or letterboxed with stale pixels
+/// (swapchain larger than staging). The host calls this once on
+/// every `<canvas>` size change and we fan it out internally.
+///
+/// On the CPU fallback the offscreen pipeline still resizes
+/// normally; a native surface cannot be attached on CPU-only
+/// renderers (see [`switch_native`]), so the native branch is
+/// a no-op in that case.
+///
+/// **Partial-failure recovery.** Devin Review PR #5 ANALYSIS-0001
+/// (commit 4ee9970) flagged a state-machine hole: if the offscreen
+/// resize succeeds but the native swapchain reconfigure fails (e.g.
+/// device loss, OOM on a constrained Wayland session), the
+/// offscreen pipeline is already committed to the new size while
+/// the native swapchain still has the old configuration. The next
+/// `render_scene` would rasterise into a `(width, height)` staging
+/// buffer but upload to a stale-sized swapchain, producing garbled
+/// output or a wgpu validation error. We recover by dropping the
+/// native surface entirely on resize failure: the next frame falls
+/// back to the offscreen path (which is already correctly resized),
+/// and the renderer surfaces a `NativeResizeFailed` error so the
+/// host can clear its `requestedMode` toggle and emit a fallback
+/// reason via `onNativeFallback`. Re-attaching the native surface
+/// later (`switch_native`) is a clean rebuild from the platform
+/// handle and won't inherit the broken swapchain.
 pub fn resize(width: u32, height: u32) -> Result<()> {
     let mut guard = slot().lock();
     let ctx = guard.as_mut().ok_or(BridgeError::NotInitialized)?;
     ctx.resize(width, height)?;
+    // Keep an attached native swapchain in step. The `native_canvas`
+    // feature must be enabled for `native_slot` to exist; default
+    // builds skip this branch entirely.
+    #[cfg(feature = "native_canvas")]
+    {
+        let mut native = native_slot().lock();
+        if let Some(surface) = native.as_mut() {
+            match ctx.resize_native_surface(surface, width, height) {
+                Ok(()) => {}
+                Err(e) => {
+                    // Drop the broken native surface so subsequent
+                    // `render_scene` calls take the offscreen path,
+                    // which is already correctly sized at
+                    // (width, height). Holding on to a stale-sized
+                    // swapchain would corrupt every subsequent
+                    // native-mode frame.
+                    *native = None;
+                    drop(native);
+                    drop(guard);
+                    return Err(e.into());
+                }
+            }
+        }
+    }
     drop(guard);
     Ok(())
 }
@@ -133,6 +208,31 @@ pub fn render(scene_json: &str) -> Result<FrameId> {
 pub fn render_scene(scene: Scene) -> Result<FrameId> {
     let guard = slot().lock();
     let ctx = guard.as_ref().ok_or(BridgeError::NotInitialized)?;
+    // Route to the native-surface fast path when one is attached.
+    // Default builds don't compile this branch (the `native_canvas`
+    // feature is off), so the binary identical to Phase 0 falls
+    // through to the offscreen path.
+    //
+    // **Lock acquisition order: `slot → native_slot → scene_slot`.**
+    // This branch holds three mutex guards simultaneously (the
+    // single most complex synchronisation point in the bridge). The
+    // ordering is consistent with `resize`, `switch_native`, and
+    // `switch_offscreen`, and `shutdown` deliberately drops each
+    // guard before acquiring the next so it can never invert the
+    // order. Devin Review PR #5 ANALYSIS-0005 (commit 4ee9970)
+    // confirmed no deadlock is reachable; the authoritative analysis
+    // lives on the `shutdown()` doc comment.
+    #[cfg(feature = "native_canvas")]
+    {
+        let native = native_slot().lock();
+        if let Some(surface) = native.as_ref() {
+            let id = ctx.render_frame_native(&scene, surface)?;
+            *scene_slot().lock() = Some(scene);
+            drop(native);
+            drop(guard);
+            return Ok(id);
+        }
+    }
     let id = ctx.render_frame(&scene)?;
     // Publish the scene snapshot for PNG export *before* releasing the
     // renderer lock. The render lock is the single serialisation point
@@ -205,6 +305,87 @@ pub fn acquire_frame() -> Result<Option<AcquiredFrame>> {
     });
     drop(guard);
     Ok(frame)
+}
+
+// -----------------------------------------------------------------------------
+// Native canvas presentation path — Phase 1, Block A, Task 5.
+//
+// The bridge tracks an *optional* `NativeSurface`. When present, the
+// next `render` call routes through `render_frame_native` and the
+// pixels go straight to the swapchain — no CPU readback, no IPC
+// `putImageData`. The default build does not compile the
+// `native_canvas` feature, so the slot is permanently `None` and the
+// only path is the offscreen → presenter → IPC chain.
+// -----------------------------------------------------------------------------
+
+#[cfg(feature = "native_canvas")]
+fn native_slot() -> &'static Mutex<Option<kcreate_renderer::NativeSurface>> {
+    static NATIVE: OnceLock<Mutex<Option<kcreate_renderer::NativeSurface>>> = OnceLock::new();
+    NATIVE.get_or_init(|| Mutex::new(None))
+}
+
+/// Currently selected presentation mode. Used by both the renderer
+/// path selection (`render_scene`) and the host UI's "Mode: Native /
+/// Offscreen" badge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PresentationMode {
+    Offscreen,
+    Native,
+}
+
+impl PresentationMode {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Offscreen => "offscreen",
+            Self::Native => "native",
+        }
+    }
+}
+
+/// Probe the bridge's current presentation mode. Returns `Offscreen`
+/// in default builds (no `native_canvas` feature) and in feature
+/// builds when no native surface has been attached yet.
+#[must_use]
+pub fn presentation_mode() -> PresentationMode {
+    #[cfg(feature = "native_canvas")]
+    {
+        if native_slot().lock().is_some() {
+            return PresentationMode::Native;
+        }
+    }
+    PresentationMode::Offscreen
+}
+
+/// Attach a native surface created from the raw handle bytes Electron
+/// ferries via `BrowserWindow::getNativeWindowHandle()`. The renderer
+/// must already be initialized via [`init`].
+///
+/// Returns the platform variant the bridge interpreted the bytes as
+/// (`appkit` / `win32` / `x11` / `wayland`). Subsequent calls to
+/// [`render`] route through the native path until
+/// [`switch_offscreen`] is called.
+#[cfg(feature = "native_canvas")]
+pub fn switch_native(handle_bytes: &[u8], width: u32, height: u32) -> Result<String> {
+    use crate::native_canvas;
+    let handle = native_canvas::wrap_handle(handle_bytes)
+        .map_err(|e| BridgeError::Renderer(kcreate_renderer::RendererError::Wgpu(e.to_string())))?;
+    let platform = handle.platform();
+    let guard = slot().lock();
+    let ctx = guard.as_ref().ok_or(BridgeError::NotInitialized)?;
+    let surface = ctx.create_native_surface(handle, width, height)?;
+    drop(guard);
+    *native_slot().lock() = Some(surface);
+    Ok(platform.as_str().to_string())
+}
+
+/// Detach the native surface and revert to the offscreen path. No-op
+/// if no surface is attached. The offscreen pipeline state is
+/// preserved (the same `RenderContext` was driving both paths) so the
+/// next `render` call resumes producing IPC frames immediately.
+#[cfg(feature = "native_canvas")]
+pub fn switch_offscreen() {
+    *native_slot().lock() = None;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -2,7 +2,9 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { CanvasHost, type ViewportState } from "../components/CanvasHost";
 import { LeftPanel } from "../components/LeftPanel";
+import { PageNavigator } from "../components/PageNavigator";
 import { RightPanel } from "../components/RightPanel";
+import { TemplatePicker } from "../components/TemplatePicker";
 import {
   TopBar,
   type EditorMode,
@@ -13,6 +15,7 @@ import { AIAssistPanel } from "../components/AIAssistPanel";
 import { ExportPanel } from "../components/ExportPanel";
 import { ArtboardDialog } from "../components/ArtboardDialog";
 import { ResponsivePreview } from "../components/ResponsivePreview";
+import { PrototypePlayer } from "../components/PrototypePlayer";
 import type {
   ArtboardInfo,
   ArtboardPreset,
@@ -76,10 +79,33 @@ export function EditorPage({
   const [scene] = useState<Scene>(EMPTY_SCENE);
   const [docStatus, setDocStatus] = useState<DocumentStatus | null>(null);
   const [artboards, setArtboards] = useState<ArtboardInfo[]>([]);
+  const [prototypePlaying, setPrototypePlaying] = useState<boolean>(false);
+  // Stable identity for `PrototypePlayer`'s `onClose` prop. Devin
+  // Review PR #5 ANALYSIS-0004 (commit 4ee9970): the player's
+  // keyboard handler lists `onClose` in its `useEffect` deps so the
+  // Escape-to-close binding stays in sync if the host swaps out the
+  // callback. An inline `() => setPrototypePlaying(false)` creates a
+  // new function identity on every parent render → re-adds the
+  // `window.addEventListener("keydown", ...)` listener every time
+  // anything else in `EditorPage` re-renders. `useCallback` with an
+  // empty deps array gives us a single stable identity (React
+  // guarantees `setState` setters are stable), eliminating the
+  // listener churn without changing behaviour.
+  const handlePrototypeClose = useCallback((): void => {
+    setPrototypePlaying(false);
+  }, []);
   const [artboardPresets, setArtboardPresets] = useState<ArtboardPreset[]>(
     [],
   );
   const [artboardDialogOpen, setArtboardDialogOpen] = useState(false);
+  // TemplatePicker is shown automatically the first time the user
+  // enters Layout mode for a given project. The sentinel below is per
+  // project id so re-opening a project skips the picker, but switching
+  // projects within one session re-prompts.
+  const [templatePickerOpen, setTemplatePickerOpen] = useState<boolean>(false);
+  const [layoutPickerShownFor, setLayoutPickerShownFor] = useState<string | null>(
+    null,
+  );
   const [components, setComponents] = useState<ComponentInfo[]>([]);
   const [resourceLimits, setResourceLimits] = useState<ResourceLimits | null>(
     null,
@@ -156,6 +182,99 @@ export function EditorPage({
   useEffect(() => {
     void refreshTree();
   }, [refreshTree]);
+
+  // First-time-into-Layout prompt: when the user switches to Layout
+  // mode for the first time on an untouched project, pop the
+  // TemplatePicker.
+  //
+  // We ask the bridge (`document.isUntouched`) instead of inferring
+  // it from the document tree shape. The bridge's signal is
+  // `Project::operation_log.is_empty()` — every host-recorded
+  // mutation runs through `Project::execute_operation`, so an empty
+  // log is the strict, authoritative "no user edits yet" check. See
+  // `crates/kcreate_bridge/src/document.rs::project_is_untouched`.
+  //
+  // The previous implementation replicated `Project::add_page("Page
+  // 1")`'s exact output in TypeScript (`nodes.length === 2 && one
+  // Page named "Page 1" && one Artboard`). That was fragile: if the
+  // Rust side ever renamed the default page, added a default layer,
+  // or restructured the initial node graph, the heuristic would
+  // silently break and the picker would never auto-open (Devin
+  // Review PR #5 ANALYSIS-0006, commit 5c16b5c). Moving the
+  // detection to the bridge keeps the source of truth on the side
+  // that actually owns the project state.
+  //
+  // The user can re-open the picker any time via the "Templates"
+  // button in the PageNavigator footer; this just controls the
+  // automatic first-pop.
+  //
+  // **One probe per project session.** Devin Review PR #5
+  // ANALYSIS-0006 on commit 4ee9970 flagged that the previous
+  // implementation re-probed the bridge on every `nodes.length`
+  // change — wasteful since the untouched→touched transition is
+  // monotonic per project session (`operation_log.is_empty()` only
+  // ever flips false→true once, because we never clear the log
+  // mid-session). One probe at project-open time is sufficient; the
+  // probe `useEffect` only fires when `project.id` changes (open /
+  // create / reopen) and the result lives in `untouchedProbe` for
+  // the remainder of the session.
+  const [untouchedProbe, setUntouchedProbe] = useState<{
+    projectId: string;
+    isUntouched: boolean;
+  } | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    void (async (): Promise<void> => {
+      try {
+        const isUntouched = await window.kcreate.document.isUntouched();
+        if (!cancelled) {
+          setUntouchedProbe({ projectId: project.id, isUntouched });
+        }
+      } catch (e) {
+        // No project open, or bridge call rejected — fall back to
+        // "not untouched" so we don't surprise the user with a
+        // modal pop during a transient error state.
+        if (!cancelled) {
+          setUntouchedProbe({ projectId: project.id, isUntouched: false });
+          setStatusMessage(`isUntouched probe failed: ${errorMessage(e)}`);
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [project.id]);
+
+  useEffect(() => {
+    if (mode !== "layout") return;
+    if (layoutPickerShownFor === project.id) return;
+    if (untouchedProbe === null) return;
+    if (untouchedProbe.projectId !== project.id) return;
+    if (!untouchedProbe.isUntouched) {
+      // User already designed something — don't surprise them with a
+      // modal they didn't ask for. Mark the sentinel anyway so the
+      // logic doesn't re-evaluate.
+      setLayoutPickerShownFor(project.id);
+      return;
+    }
+    setTemplatePickerOpen(true);
+    setLayoutPickerShownFor(project.id);
+  }, [mode, project.id, untouchedProbe, layoutPickerShownFor]);
+
+  // Layout mode page selection helper — selects the page node so the
+  // canvas pans/zooms to its bounds and the right panel shows its
+  // properties.
+  const handleSelectPage = useCallback(
+    async (pageId: string): Promise<void> => {
+      try {
+        await window.kcreate.canvas.setSelection([pageId]);
+        setSelectedIds([pageId]);
+      } catch (e) {
+        setStatusMessage(`select page failed: ${errorMessage(e)}`);
+      }
+    },
+    [],
+  );
 
   const refreshResourceLimits = useCallback(async () => {
     try {
@@ -891,10 +1010,25 @@ export function EditorPage({
         style={{
           flex: 1,
           display: "grid",
-          gridTemplateColumns: "auto 1fr auto",
+          gridTemplateColumns:
+            mode === "layout" ? "auto auto 1fr auto" : "auto 1fr auto",
           minHeight: 0,
         }}
       >
+        {mode === "layout" ? (
+          <PageNavigator
+            nodes={nodes}
+            selectedPageId={selectedId}
+            onSelectPage={(id) => {
+              void handleSelectPage(id);
+            }}
+            onStatus={setStatusMessage}
+            onChanged={() => {
+              void refreshTree();
+            }}
+            onNewFromTemplate={() => setTemplatePickerOpen(true)}
+          />
+        ) : null}
         <LeftPanel
           nodes={nodes}
           selectedId={selectedId}
@@ -994,11 +1128,49 @@ export function EditorPage({
                 inset: 0,
                 background: "rgba(17, 24, 39, 0.92)",
                 overflow: "auto",
+                display: "flex",
+                flexDirection: "column",
               }}
             >
-              <ResponsivePreview onStatus={setStatusMessage} />
+              <div
+                style={{
+                  display: "flex",
+                  justifyContent: "flex-end",
+                  padding: spacing.sm,
+                  gap: spacing.sm,
+                }}
+              >
+                <button
+                  type="button"
+                  onClick={() => setPrototypePlaying(true)}
+                  style={{
+                    padding: "6px 14px",
+                    fontSize: 12,
+                    fontWeight: 600,
+                    background: colors.accent,
+                    color: colors.textInverse,
+                    border: `1px solid ${colors.accent}`,
+                    borderRadius: 9999,
+                    cursor: "pointer",
+                  }}
+                >
+                  ▶ Play
+                </button>
+              </div>
+              <div style={{ flex: 1, overflow: "auto" }}>
+                <ResponsivePreview onStatus={setStatusMessage} />
+              </div>
             </div>
           ) : null}
+          <PrototypePlayer
+            open={prototypePlaying}
+            tree={nodes}
+            artboards={artboards}
+            startArtboardId={
+              selected && selected.nodeType === "Artboard" ? selected.id : null
+            }
+            onClose={handlePrototypeClose}
+          />
         </main>
         {rightPanelFocus === "ai" ? (
           <AIAssistPanel
@@ -1025,6 +1197,16 @@ export function EditorPage({
               void handleExport();
             }}
             layout={layoutHandlers}
+            mode={mode}
+            onStatus={setStatusMessage}
+            onSelectNode={(id) => {
+              void handleSelect(id);
+            }}
+            artboards={artboards.map((a) => ({ id: a.id, name: a.name }))}
+            tree={nodes}
+            onInteractionsChanged={() => {
+              void refreshTree();
+            }}
           />
         )}
       </div>
@@ -1060,6 +1242,20 @@ export function EditorPage({
           void handleCreateArtboard(args);
         }}
         onClose={() => setArtboardDialogOpen(false)}
+      />
+      <TemplatePicker
+        open={templatePickerOpen}
+        onClose={() => setTemplatePickerOpen(false)}
+        onApplied={(ids) => {
+          // Refresh the tree so the new pages appear in the navigator,
+          // and focus the first new page if we got any.
+          void (async () => {
+            await refreshTree();
+            const first = ids[0];
+            if (first) await handleSelectPage(first);
+          })();
+        }}
+        onStatus={setStatusMessage}
       />
     </div>
   );

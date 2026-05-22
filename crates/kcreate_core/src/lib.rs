@@ -38,11 +38,14 @@ pub use config::{DeviceTier, Platform, RuntimeConfig};
 pub use document::{DocumentError, DocumentGraph};
 pub use node::{
     standard_presets, ArtboardPreset, BlendMode, Bounds, Constraint, Constraints, Effect,
-    FillStyle, GradientKind, GradientStop, Node, NodeStyle, NodeType, Point2D, PresetCategory,
-    RgbaColor, StrokeStyle, Transform2D,
+    FillStyle, GradientKind, GradientStop, Interaction, InteractionAction, InteractionTrigger,
+    Margins, Node, NodeStyle, NodeType, PageLayout, PageOrientation, PageSize, Point2D,
+    PresetCategory, RgbaColor, StrokeStyle, Transform2D, INTERACTIONS_METADATA_KEY,
+    MASTER_PAGE_METADATA_KEY, PAGE_LAYOUT_METADATA_KEY,
 };
 pub use operation::{Operation, OperationLog};
 pub use project::{
-    BrandKit, DesignTokens, ExportFormat, ExportPreset, FontRef, NamedColor, Project, ProjectError,
-    ShadowToken, TypographyToken,
+    builtin_layout_templates, BrandKit, DesignTokens, ExportFormat, ExportPreset, FontRef,
+    LayoutTemplate, NamedColor, Project, ProjectError, SectionKind, ShadowToken, TemplateCategory,
+    TemplatePageDef, TemplateSectionDef, TypographyToken,
 };

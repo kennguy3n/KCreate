@@ -142,6 +142,42 @@ export interface RendererBridge {
    * published yet.
    */
   acquireFrame(): Promise<AcquiredFrame | null>;
+
+  /**
+   * Current presentation mode. `"offscreen"` (the default) means the
+   * host drives the rAF readback loop via `acquireFrame()`;
+   * `"native"` means the Rust renderer is presenting directly to a
+   * platform window surface and the host should hide the canvas
+   * element. Mirrors `kcreate_bridge::state::PresentationMode`.
+   */
+  presentationMode(): Promise<"offscreen" | "native">;
+
+  /**
+   * Attach a native presentation surface backed by the current
+   * BrowserWindow's platform handle. `width` and `height` are
+   * physical pixels (multiply CSS pixels by `devicePixelRatio`).
+   *
+   * Resolves to the platform variant the bridge interpreted the
+   * handle as (`"appkit"` / `"win32"` / `"x11"` / `"wayland"`).
+   * Rejects when the bridge was compiled without the `native_canvas`
+   * feature, when the handle bytes are malformed, or when GPU
+   * surface creation fails \u2014 in any of those cases the host should
+   * stay on the offscreen path.
+   *
+   * The host does NOT pass the handle bytes itself; the main process
+   * fetches them from `BrowserWindow::getNativeWindowHandle()` and
+   * forwards them to the bridge in the same IPC.
+   */
+  switchNative(
+    width: number,
+    height: number,
+  ): Promise<"appkit" | "win32" | "x11" | "wayland">;
+
+  /**
+   * Detach any attached native surface and revert to the offscreen
+   * readback path. No-op when already in offscreen mode.
+   */
+  switchOffscreen(): Promise<void>;
 }
 
 /**
@@ -172,6 +208,20 @@ export interface ComponentInstanceInfo {
   overrides: Record<string, unknown>;
 }
 
+/**
+ * Axis-aligned bounding box in document space. Mirror of
+ * `kcreate_core::Bounds` / `kcreate_bridge::Bounds`. Carried on every
+ * `NodeInfo` so panels that need hit-target geometry (PrototypePlayer
+ * hotspots, layout indicators, overlay alignment) can read it without
+ * a second IPC hop.
+ */
+export interface Bounds {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
 export interface NodeInfo {
   id: string;
   nodeType: string;
@@ -180,6 +230,12 @@ export interface NodeInfo {
   name: string;
   visible: boolean;
   locked: boolean;
+  /**
+   * Bounds of the node in document space. Always present on every
+   * node (defaults to a zero-size box if the underlying layer has
+   * no explicit geometry — e.g. groups before layout solving).
+   */
+  bounds: Bounds;
   componentInstance?: ComponentInstanceInfo;
   /**
    * Free-form metadata bag mirroring `Node::metadata` on the Rust side.
@@ -273,6 +329,18 @@ export interface DocumentBridge {
   saveProject(): Promise<void>;
   closeProject(): Promise<void>;
   getProjectInfo(): Promise<ProjectInfo | null>;
+  /**
+   * Returns `true` iff the currently open project is in its
+   * untouched, just-created state — no host-recorded operation
+   * has been applied since `createProject` / `openProject`. The
+   * host UI uses this for first-time prompts (e.g. auto-opening
+   * the TemplatePicker on the first switch to Layout mode); see
+   * `apps/desktop/renderer/src/pages/EditorPage.tsx`. Rejects
+   * with `NoProject` if no project is open. Mirrors the bridge
+   * call `project_is_untouched` in
+   * `crates/kcreate_bridge/src/document.rs`.
+   */
+  isUntouched(): Promise<boolean>;
 
   getDocumentTree(): Promise<NodeInfo[]>;
   /**
@@ -861,6 +929,187 @@ export interface ComponentBridge {
   detach(nodeId: string): Promise<void>;
 }
 
+// ============================================================================
+// Prototype interactions (mirrors `kcreate_core::node::Interaction`)
+// ============================================================================
+
+export type InteractionTrigger = "click" | "hover" | "press";
+
+export type InteractionAction =
+  | { kind: "navigate_to"; target_artboard_id: string }
+  | { kind: "scroll_to"; target_node_id: string }
+  | { kind: "open_overlay"; overlay_artboard_id: string }
+  | { kind: "close_overlay" }
+  | { kind: "back" };
+
+export interface Interaction {
+  id: string;
+  trigger: InteractionTrigger;
+  action: InteractionAction;
+}
+
+export interface InteractionBridge {
+  add(
+    nodeId: string,
+    trigger: InteractionTrigger,
+    action: InteractionAction,
+  ): Promise<string>;
+  remove(nodeId: string, interactionId: string): Promise<boolean>;
+  list(nodeId: string): Promise<Interaction[]>;
+  /**
+   * Batched [`list`]. Resolves to a map keyed by node id; nodes that
+   * have no interactions are omitted from the result, so callers
+   * should treat a missing key as an empty list. Used by the
+   * prototype player to gather all hotspots on an artboard with a
+   * single IPC round trip (Devin Review ANALYSIS-0003).
+   */
+  listBatch(nodeIds: string[]): Promise<Record<string, Interaction[]>>;
+}
+
+// ============================================================================
+// Layout Studio: pages, master pages, templates
+// (mirrors `kcreate_core::node::PageLayout` and `kcreate_core::project::*`)
+// ============================================================================
+
+/**
+ * Plain identifier for one of the well-known page sizes. Used by APIs
+ * that take a single size argument (e.g. `masterPage.create`). For the
+ * full serialised representation of a page size, see [`PageSize`].
+ */
+export type PageSizeId =
+  | "a3"
+  | "a4"
+  | "a5"
+  | "letter"
+  | "legal"
+  | "tabloid"
+  | "presentation_16x9"
+  | "presentation_4x3";
+
+/**
+ * Serialised form of `kcreate_core::node::PageSize`. Mirrors the
+ * internally-tagged serde representation: every variant is an object
+ * `{ kind: "<variant>", ...fields }`. Unit variants have just `kind`.
+ */
+export type PageSize =
+  | { kind: PageSizeId }
+  | { kind: "custom"; width_mm: number; height_mm: number };
+
+export type PageOrientation = "portrait" | "landscape";
+
+export interface Margins {
+  top_mm: number;
+  right_mm: number;
+  bottom_mm: number;
+  left_mm: number;
+}
+
+export interface PageLayout {
+  page_size: PageSize;
+  orientation: PageOrientation;
+  margins: Margins;
+  master_page_id: string | null;
+  page_number: number | null;
+}
+
+export interface MasterPageInfo {
+  id: string;
+  name: string;
+  layout: PageLayout | null;
+}
+
+export type TemplateCategory =
+  | "pitch_deck"
+  | "proposal"
+  | "brochure"
+  | "flyer"
+  | "report"
+  | "custom";
+
+export type SectionKind =
+  | "title"
+  | "subtitle"
+  | "body_text"
+  | "image"
+  | "chart"
+  | "footer"
+  | "page_number";
+
+export interface TemplateSectionDef {
+  kind: SectionKind;
+  bounds: { x: number; y: number; width: number; height: number };
+  placeholder_text: string | null;
+}
+
+export interface TemplatePageDef {
+  name: string;
+  page_size: PageSize;
+  orientation: PageOrientation;
+  sections: TemplateSectionDef[];
+}
+
+export interface LayoutTemplate {
+  id: string;
+  name: string;
+  description: string;
+  category: TemplateCategory;
+  pages: TemplatePageDef[];
+  /**
+   * Optional design-token bundle the template wants to apply to the
+   * project when instantiated (palette, typography ramp, etc.).
+   *
+   * Mirrors the `design_tokens: Option<DesignTokens>` field on
+   * `kcreate_core::project::LayoutTemplate`. Serialised as JSON `null`
+   * by serde when absent — kept in the TS shape for wire-format
+   * lockstep (AGENTS.md rule 4).
+   */
+  design_tokens: DesignTokens | null;
+}
+
+export interface MasterPageBridge {
+  create(
+    name: string,
+    size: PageSizeId,
+    orientation: PageOrientation,
+  ): Promise<string>;
+  list(): Promise<MasterPageInfo[]>;
+  apply(contentPageId: string, masterPageId: string): Promise<void>;
+  detach(contentPageId: string): Promise<void>;
+}
+
+export interface LayoutStudioBridge {
+  setPageLayout(pageId: string, layout: PageLayout): Promise<void>;
+  getPageLayout(pageId: string): Promise<PageLayout | null>;
+  listTemplates(): Promise<LayoutTemplate[]>;
+  applyTemplate(templateId: string): Promise<string[]>;
+  /**
+   * Add a new content page. When `size` and `orientation` are omitted
+   * the page is created at the workspace default (1920x1080, no page
+   * layout metadata). Returns the new page id.
+   */
+  addPage(
+    name: string,
+    size?: PageSizeId,
+    orientation?: PageOrientation,
+  ): Promise<string>;
+  /**
+   * Duplicate a page (with its artboards / layers). The new page lives
+   * at the document root and is named "<original> (copy)". Returns the
+   * new page id.
+   */
+  duplicatePage(pageId: string): Promise<string>;
+  /**
+   * Move `nodeId` to position `index` under `newParent` — or to the
+   * root list when `newParent` is `null`. Drives the PageNavigator's
+   * drag-reorder gesture and the layer panel's future move gesture.
+   */
+  reparentNode(
+    nodeId: string,
+    newParent: string | null,
+    index: number,
+  ): Promise<void>;
+}
+
 declare global {
   interface Window {
     kcreate: {
@@ -878,6 +1127,9 @@ declare global {
       artboard: ArtboardBridge;
       component: ComponentBridge;
       layout: LayoutBridge;
+      interaction: InteractionBridge;
+      masterPage: MasterPageBridge;
+      layoutStudio: LayoutStudioBridge;
     };
   }
 }

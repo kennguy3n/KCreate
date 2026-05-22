@@ -8,6 +8,8 @@ import type {
   UpdateNodeProps,
 } from "../../../shared/scene";
 import { colors, radius, spacing } from "../styles/tokens";
+import { AccessibilityPanel } from "./AccessibilityPanel";
+import { InteractionPanel } from "./InteractionPanel";
 
 export type RightPanelTab =
   | "properties"
@@ -15,9 +17,13 @@ export type RightPanelTab =
   | "ai"
   | "export"
   | "inspect"
-  | "history";
+  | "history"
+  | "accessibility"
+  | "interaction";
 
-const TABS: ReadonlyArray<{ id: RightPanelTab; label: string }> = [
+/// Tabs shown by default. Some tabs (Accessibility, Interaction) only
+/// appear when the active editor mode calls for them — gated below.
+const BASE_TABS: ReadonlyArray<{ id: RightPanelTab; label: string }> = [
   { id: "properties", label: "Properties" },
   { id: "effects", label: "Effects" },
   { id: "ai", label: "AI Assist" },
@@ -38,6 +44,31 @@ export interface RightPanelProps {
   onChange?: (changes: UpdateNodeProps) => void;
   onRequestExport: () => void;
   layout?: LayoutHandlers;
+  /**
+   * When set to `"design"` or `"inspect"`, the panel exposes an
+   * Accessibility tab driven by the local LLM sidecar. When set to
+   * `"prototype"`, the panel exposes an Interaction tab.
+   */
+  mode?:
+    | "design"
+    | "vector"
+    | "image"
+    | "layout"
+    | "prototype"
+    | "inspect"
+    | "export";
+  onStatus?: (msg: string | null) => void;
+  onSelectNode?: (nodeId: string) => void;
+  /** Artboard options used by the Interaction panel's target picker. */
+  artboards?: Array<{ id: string; name: string }>;
+  /**
+   * Full document tree, forwarded to the Interaction panel for the
+   * `scroll_to` target picker. Omitted in modes that don't show the
+   * Interaction tab.
+   */
+  tree?: NodeInfo[];
+  /** Trigger after Interaction add/remove so the host can refresh state. */
+  onInteractionsChanged?: () => void;
 }
 
 export function RightPanel({
@@ -45,7 +76,33 @@ export function RightPanel({
   onChange,
   onRequestExport,
   layout,
+  mode,
+  onStatus,
+  onSelectNode,
+  artboards,
+  tree,
+  onInteractionsChanged,
 }: RightPanelProps): JSX.Element {
+  const showAccessibility = mode === "design" || mode === "inspect";
+  const showInteraction = mode === "prototype";
+  // Memoize so the tab strip array identity is stable as long as the
+  // mode-derived booleans don't change. Otherwise the spread allocates
+  // a fresh array (and new option object literals) on every render,
+  // breaking referential equality for any downstream memo.
+  const TABS = useMemo<
+    ReadonlyArray<{ id: RightPanelTab; label: string }>
+  >(
+    () => [
+      ...BASE_TABS,
+      ...(showAccessibility
+        ? [{ id: "accessibility" as const, label: "Accessibility" }]
+        : []),
+      ...(showInteraction
+        ? [{ id: "interaction" as const, label: "Interaction" }]
+        : []),
+    ],
+    [showAccessibility, showInteraction],
+  );
   const [tab, setTab] = useState<RightPanelTab>("properties");
   return (
     <aside
@@ -128,6 +185,21 @@ export function RightPanel({
             History timeline (operation log + AI actions) lands with the
             audit crate.
           </Hint>
+        ) : null}
+        {tab === "accessibility" && showAccessibility ? (
+          <AccessibilityPanel
+            onSelectNode={onSelectNode}
+            onStatus={onStatus}
+          />
+        ) : null}
+        {tab === "interaction" && showInteraction ? (
+          <InteractionPanel
+            selected={selected}
+            artboards={artboards ?? []}
+            tree={tree}
+            onStatus={onStatus}
+            onChanged={onInteractionsChanged}
+          />
         ) : null}
       </div>
     </aside>

@@ -260,6 +260,14 @@ function requireBridge(): Bridge {
   return bridge;
 }
 
+// The currently active main BrowserWindow. Tracked at module scope
+// so the `kcreate/canvas/native-handle` IPC can extract the
+// platform-specific window handle for the native presentation path
+// (Phase 1, Block A, Task 4). Set in `createWindow`, cleared on the
+// window's `closed` event so a stale reference can never outlive the
+// native handle it would hand out.
+let mainWindow: BrowserWindow | null = null;
+
 function createWindow(): BrowserWindow {
   const win = new BrowserWindow({
     width: 1280,
@@ -284,6 +292,37 @@ function createWindow(): BrowserWindow {
   }
 
   win.once("ready-to-show", () => win.show());
+  mainWindow = win;
+  // Lifecycle for the native-canvas presentation path
+  // (`crates/kcreate_bridge/src/native_canvas.rs`). The Rust side
+  // holds an `Arc<PlatformHandle>` that wraps the BrowserWindow's
+  // OS-level handle (NSView*/HWND/XID/wl_surface*). If we let the
+  // OS destroy the window while that Arc is still alive, the
+  // wrapped pointer becomes dangling — `unsafe impl Send + Sync
+  // for PlatformHandle` is only sound while the underlying OS
+  // resource outlives the surface.
+  //
+  // Electron's `'close'` event fires *before* the OS resource is
+  // destroyed (unlike `'closed'`, which fires after). We hook it
+  // to ask the bridge to switch back to offscreen presentation,
+  // which detaches the native surface and drops the
+  // `Arc<PlatformHandle>` in the renderer state. `rendererSwitchOffscreen`
+  // is synchronous, returns immediately if no native surface is
+  // attached, and is safe to call even when the bridge was built
+  // without the `native_canvas` Cargo feature (it then no-ops).
+  win.on("close", () => {
+    if (!bridge) return;
+    try {
+      bridge.rendererSwitchOffscreen();
+    } catch {
+      // best-effort: a shutdown failure here cannot block window
+      // close, and the OS will still tear down the handle. Logging
+      // is intentionally elided to avoid noise during normal exit.
+    }
+  });
+  win.on("closed", () => {
+    if (mainWindow === win) mainWindow = null;
+  });
   return win;
 }
 
@@ -328,6 +367,38 @@ function registerIpcHandlers(): void {
   );
   ipcMain.handle("kcreate/renderer/acquireFrame", () =>
     requireBridge().rendererAcquireFrame(),
+  );
+
+  // Native canvas presentation mode (Phase 1, Block A, Tasks 4–6).
+  //
+  // The renderer can ask the main process to extract the platform
+  // window handle (`NSView*` / `HWND` / `XID` / `wl_surface*`) from
+  // the BrowserWindow and pass it back as a Buffer; the renderer then
+  // calls `switchNative` with those bytes to swap the presentation
+  // path away from CPU readback. The exact byte interpretation lives
+  // on the Rust side under `crates/kcreate_bridge/src/native_canvas.rs`,
+  // gated behind the `native_canvas` Cargo feature so the default
+  // build remains `unsafe`-free.
+  ipcMain.handle("kcreate/canvas/native-handle", () => {
+    const win = mainWindow;
+    if (!win || win.isDestroyed()) return null;
+    // Electron exposes `getNativeWindowHandle()` on every platform; it
+    // returns a Node `Buffer` containing the platform-specific handle
+    // (size + endianness vary). We forward the bytes opaquely — the
+    // bridge interprets them based on the host OS.
+    const handle = win.getNativeWindowHandle();
+    return handle;
+  });
+  ipcMain.handle(
+    "kcreate/renderer/switchNative",
+    (_e, handleBytes: Buffer, width: number, height: number) =>
+      requireBridge().rendererSwitchNative(handleBytes, width, height),
+  );
+  ipcMain.handle("kcreate/renderer/switchOffscreen", () => {
+    requireBridge().rendererSwitchOffscreen();
+  });
+  ipcMain.handle("kcreate/renderer/presentationMode", () =>
+    requireBridge().rendererPresentationMode(),
   );
 
   // Document / project lifecycle.
@@ -377,6 +448,9 @@ function registerIpcHandlers(): void {
   });
   ipcMain.handle("kcreate/project/getInfo", () =>
     requireBridge().projectGetInfo(),
+  );
+  ipcMain.handle("kcreate/project/isUntouched", () =>
+    requireBridge().projectIsUntouched(),
   );
 
   ipcMain.handle("kcreate/document/getTree", () =>
@@ -780,6 +854,94 @@ function registerIpcHandlers(): void {
     "kcreate/layout/convertToFrame",
     (_e, nodeId: string): void => {
       requireBridge().layoutConvertToFrame(nodeId);
+    },
+  );
+
+  // Prototype interactions (Phase 1, Block A)
+  ipcMain.handle(
+    "kcreate/interaction/add",
+    (_e, nodeId: string, trigger: string, actionJson: string): string =>
+      requireBridge().interactionAdd(nodeId, trigger, actionJson),
+  );
+  ipcMain.handle(
+    "kcreate/interaction/remove",
+    (_e, nodeId: string, interactionId: string): boolean =>
+      requireBridge().interactionRemove(nodeId, interactionId),
+  );
+  ipcMain.handle(
+    "kcreate/interaction/list",
+    (_e, nodeId: string): string => requireBridge().interactionList(nodeId),
+  );
+  ipcMain.handle(
+    "kcreate/interaction/list-batch",
+    (_e, nodeIds: string[]): string =>
+      requireBridge().interactionListBatch(JSON.stringify(nodeIds)),
+  );
+
+  // Layout Studio (Phase 2, Block B): page layout, master pages, templates
+  ipcMain.handle(
+    "kcreate/page/setLayout",
+    (_e, pageId: string, layoutJson: string): void => {
+      requireBridge().pageSetLayout(pageId, layoutJson);
+    },
+  );
+  ipcMain.handle(
+    "kcreate/page/getLayout",
+    (_e, pageId: string): string => requireBridge().pageGetLayout(pageId),
+  );
+  ipcMain.handle(
+    "kcreate/masterPage/create",
+    (_e, name: string, size: string, orientation: string): string =>
+      requireBridge().masterPageCreate(name, size, orientation),
+  );
+  ipcMain.handle("kcreate/masterPage/list", (): string =>
+    requireBridge().masterPageList(),
+  );
+  ipcMain.handle(
+    "kcreate/masterPage/apply",
+    (_e, contentPageId: string, masterPageId: string): void => {
+      requireBridge().masterPageApply(contentPageId, masterPageId);
+    },
+  );
+  ipcMain.handle(
+    "kcreate/masterPage/detach",
+    (_e, contentPageId: string): void => {
+      requireBridge().masterPageDetach(contentPageId);
+    },
+  );
+  ipcMain.handle("kcreate/layoutTemplate/list", (): string =>
+    requireBridge().layoutTemplateList(),
+  );
+  ipcMain.handle(
+    "kcreate/layoutTemplate/apply",
+    (_e, templateId: string): string =>
+      requireBridge().layoutTemplateApply(templateId),
+  );
+  ipcMain.handle(
+    "kcreate/page/add",
+    (
+      _e,
+      name: string,
+      size: string | undefined,
+      orientation: string | undefined,
+    ): string => requireBridge().pageAdd(name, size, orientation),
+  );
+  ipcMain.handle("kcreate/page/duplicate", (_e, pageId: string): string =>
+    requireBridge().pageDuplicate(pageId),
+  );
+  ipcMain.handle(
+    "kcreate/document/reparent",
+    (
+      _e,
+      nodeId: string,
+      newParent: string | null | undefined,
+      index: number,
+    ): void => {
+      requireBridge().documentReparentNode(
+        nodeId,
+        newParent ?? undefined,
+        index,
+      );
     },
   );
 }

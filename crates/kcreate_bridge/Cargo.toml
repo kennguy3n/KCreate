@@ -44,6 +44,12 @@ uuid = { workspace = true, features = ["v4", "serde"] }
 chrono = { workspace = true, features = ["serde"] }
 base64.workspace = true
 image.workspace = true
+# Used only behind the `native_canvas` feature to interpret raw
+# window handle bytes (NSView* / HWND / XID / wl_surface*) ferried
+# from the Electron main process. The default build does not link
+# this crate at all, so default builds stay free of unsafe pointer
+# math.
+raw-window-handle = { workspace = true, optional = true }
 
 [build-dependencies]
 napi-build.workspace = true
@@ -67,3 +73,10 @@ mcp = ["dep:kcreate_mcp"]
 # deny-list check runs without features, so default builds stay
 # network-free. The Electron host enables this for release binaries.
 llm = ["kcreate_ai/llm_sidecar"]
+# Enable the native-canvas presentation path. This is the only
+# component of the bridge that uses `unsafe` code, exclusively for
+# wrapping raw window handle bytes provided by Electron's
+# `BrowserWindow::getNativeWindowHandle()`. Off by default so the
+# Phase 0 / Phase 1 default build is `unsafe`-free; the Electron
+# host enables it when the user opts in via the settings toggle.
+native_canvas = ["dep:raw-window-handle"]

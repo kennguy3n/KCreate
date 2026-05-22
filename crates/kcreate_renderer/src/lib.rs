@@ -407,6 +407,76 @@ impl RenderContext {
         }
     }
 
+    /// Create a [`NativeSurface`] bound to this renderer's GPU device.
+    ///
+    /// Returns `Err(RendererError::Wgpu(...))` when the renderer is
+    /// running on the CPU fallback (the native presentation path
+    /// requires `wgpu::Device` / `Queue`, which the
+    /// [`crate::cpu_backend::CpuBackend`] does not expose). Callers
+    /// detect this and fall back to the offscreen / CPU readback
+    /// path (the Block A Task 6 `CanvasHost` toggle does exactly
+    /// that).
+    ///
+    /// The `handle` must outlive the returned `NativeSurface`. The
+    /// `'static` bound on `H` makes that contract explicit — callers
+    /// typically wrap the OS handle bytes in an
+    /// `Arc<PlatformHandle>` that owns its pointer for the duration
+    /// of the session.
+    pub fn create_native_surface<H>(
+        &self,
+        handle: std::sync::Arc<H>,
+        width: u32,
+        height: u32,
+    ) -> Result<NativeSurface>
+    where
+        H: raw_window_handle::HasWindowHandle
+            + raw_window_handle::HasDisplayHandle
+            + Send
+            + Sync
+            + 'static,
+    {
+        let backend = self.backend.lock();
+        match &*backend {
+            BackendKind::Gpu(g) => NativeSurface::from_window(
+                g.instance(),
+                g.adapter(),
+                g.device(),
+                handle,
+                width,
+                height,
+            ),
+            BackendKind::Cpu(_) => Err(RendererError::Wgpu(
+                "create_native_surface requires GPU backend (CPU fallback in use)".into(),
+            )),
+        }
+    }
+
+    /// Resize an attached [`NativeSurface`]'s swapchain to match a
+    /// new (width, height). The renderer's offscreen target is
+    /// *separately* resized via [`Self::resize`] — both must be kept
+    /// in step when the host canvas changes size, because the
+    /// renderer rasterises into the offscreen staging buffer and
+    /// then uploads to the swapchain.
+    ///
+    /// Returns `Err(RendererError::Wgpu(...))` on the CPU fallback
+    /// (no `wgpu::Device` to drive the swapchain reconfigure).
+    /// Callers that hit this should detach the native surface and
+    /// fall back to the offscreen / IPC path.
+    pub fn resize_native_surface(
+        &self,
+        native_surface: &mut NativeSurface,
+        width: u32,
+        height: u32,
+    ) -> Result<()> {
+        let backend = self.backend.lock();
+        match &*backend {
+            BackendKind::Gpu(g) => native_surface.resize(g.device(), width, height),
+            BackendKind::Cpu(_) => Err(RendererError::Wgpu(
+                "resize_native_surface requires GPU backend (CPU fallback in use)".into(),
+            )),
+        }
+    }
+
     /// Borrow the pixels for the most recently published frame.
     ///
     /// The returned slice is RGBA8, row-major, of length `width * height * 4`.

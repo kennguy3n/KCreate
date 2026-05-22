@@ -11,9 +11,13 @@
 //   4. Forwards pointer / keyboard events to the bridge so Rust can do
 //      hit testing and tool state.
 //
-// Phase 1 will replace the readback/transfer step with a native child
-// view that Rust composits into directly. The component interface is
-// designed to survive that swap unchanged.
+// Phase 1, Block A, Task 6 added a dual-mode surface: when `mode` is
+// `"native"`, the Rust renderer composits directly into a platform
+// window surface and the readback / `putImageData` step is skipped
+// entirely. The `<canvas>` element is still rendered (sized + hit
+// targeted) but kept transparent so the underlying native surface
+// shows through. Pointer events are still forwarded so tool state
+// works identically in both modes.
 
 import { useCallback, useEffect, useRef, useState } from "react";
 
@@ -25,6 +29,26 @@ export interface ViewportState {
   zoom: number;
 }
 
+/**
+ * Presentation strategy the host wants the canvas surface to use.
+ *
+ * - `"offscreen"`: default. The renderer publishes frames through
+ *   `acquireFrame()` and the host draws them into the `<canvas>` via
+ *   `putImageData`. Works on every platform; one CPU readback per
+ *   frame.
+ * - `"native"`: the bridge has been switched to native presentation
+ *   via `renderer.switchNative()` and is presenting directly to the
+ *   BrowserWindow's underlying surface. The `<canvas>` element stays
+ *   in the layout (to receive pointer events) but is rendered
+ *   transparent. The rAF readback loop is suspended.
+ *
+ * If the host requests `"native"` but the bridge rejects the switch
+ * (e.g. the binary was built without the `native_canvas` Cargo
+ * feature, or surface creation fails), the component falls back to
+ * `"offscreen"` and surfaces the reason via `onNativeFallback`.
+ */
+export type CanvasPresentationMode = "offscreen" | "native";
+
 export interface CanvasHostProps {
   /**
    * Width and height of the canvas in CSS pixels. Multiplied by
@@ -32,6 +56,19 @@ export interface CanvasHostProps {
    */
   width: number;
   height: number;
+  /**
+   * Requested presentation mode. Defaults to `"offscreen"`. Switching
+   * to `"native"` triggers a one-time bridge negotiation; switching
+   * back to `"offscreen"` reattaches the rAF readback loop.
+   */
+  mode?: CanvasPresentationMode;
+  /**
+   * Notified when a requested `mode = "native"` could not be honoured
+   * and the component fell back to the offscreen path. Hosts use
+   * this to surface a "native canvas unavailable" warning to the
+   * user and to clear their settings toggle.
+   */
+  onNativeFallback?: (reason: string) => void;
   /**
    * The current scene to render. The component sends this to the Rust
    * renderer when it changes. Sending the same scene object twice is
@@ -105,6 +142,8 @@ export function CanvasHost(props: CanvasHostProps): JSX.Element {
     onZoomToFit,
     onPointer,
     cursor: propCursor,
+    mode: requestedMode,
+    onNativeFallback,
   } = props;
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const ctxRef = useRef<CanvasRenderingContext2D | null>(null);
@@ -121,6 +160,15 @@ export function CanvasHost(props: CanvasHostProps): JSX.Element {
     typeof window === "undefined" ? 1 : window.devicePixelRatio || 1,
   );
   const [initError, setInitError] = useState<string | null>(null);
+  // Effective presentation mode after negotiation with the bridge.
+  // `requestedMode` is the host's preference; this is what the
+  // component is actually presenting in. Falls back to `"offscreen"`
+  // whenever the native path is requested but unavailable.
+  const [activeMode, setActiveMode] = useState<CanvasPresentationMode>(
+    "offscreen",
+  );
+  const activeModeRef = useRef<CanvasPresentationMode>("offscreen");
+  activeModeRef.current = activeMode;
 
   // Keep refs up to date on every render.
   sceneRef.current = props.scene;
@@ -203,19 +251,27 @@ export function CanvasHost(props: CanvasHostProps): JSX.Element {
 
           const frameId = await bridge.render(sceneRef.current);
           if (frameId !== lastFrameIdRef.current) {
-            // Atomically get bytes + dimensions in a single IPC round
-            // trip. `acquireFrame` guarantees the buffer length matches
-            // the reported width × height × 4 even if a resize is in
-            // flight on the host side, eliminating the tearing window
-            // that existed when we called `getFrame()` and
-            // `frameInfo()` separately.
-            const frame = await bridge.acquireFrame();
-            if (frame) {
-              const expected = frame.width * frame.height * 4;
-              if (frame.bytes.byteLength === expected) {
-                ensureImageData(frame.width, frame.height);
-                imageDataRef.current!.data.set(frame.bytes);
-                ctx.putImageData(imageDataRef.current!, 0, 0);
+            // In native mode the Rust side has already presented the
+            // frame directly to the platform window surface — there
+            // is nothing for the host to do beyond bookkeeping. Skip
+            // the readback + `putImageData` step entirely so the
+            // native path stays zero-copy and we do not waste a CPU
+            // download on every frame.
+            if (activeModeRef.current === "offscreen") {
+              // Atomically get bytes + dimensions in a single IPC round
+              // trip. `acquireFrame` guarantees the buffer length matches
+              // the reported width × height × 4 even if a resize is in
+              // flight on the host side, eliminating the tearing window
+              // that existed when we called `getFrame()` and
+              // `frameInfo()` separately.
+              const frame = await bridge.acquireFrame();
+              if (frame) {
+                const expected = frame.width * frame.height * 4;
+                if (frame.bytes.byteLength === expected) {
+                  ensureImageData(frame.width, frame.height);
+                  imageDataRef.current!.data.set(frame.bytes);
+                  ctx.putImageData(imageDataRef.current!, 0, 0);
+                }
               }
             }
             lastFrameIdRef.current = frameId;
@@ -263,6 +319,89 @@ export function CanvasHost(props: CanvasHostProps): JSX.Element {
     // changes are handled by the separate resize effect below.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // Negotiate the presentation mode whenever the host's preference
+  // changes (Phase 1, Block A, Task 6). The request is asynchronous
+  // because attaching a native surface requires the bridge to extract
+  // the platform window handle from the main process and ask wgpu to
+  // build a swapchain — neither of which is synchronous.
+  //
+  // Devin Review PR #5 ANALYSIS-0001 (commit 5c16b5c): if `switchNative`
+  // ever rejects (e.g. bridge compiled without `native_canvas`, no
+  // wgpu adapter for the window's surface, Wayland session not yet
+  // wired through), the host stays in `activeMode = "offscreen"` while
+  // `requestedMode = "native"`. Without a guard, every subsequent
+  // resize would re-fire the effect (`propWidth` / `propHeight` are in
+  // the deps array) and retry the same failing call — spamming
+  // `onNativeFallback` with the same error and re-running the wgpu
+  // surface-creation cost for nothing. `nativeRejectedForRef` records
+  // the `requestedMode` value that already failed so we short-circuit
+  // until the host itself picks a different preference (toggling back
+  // to "offscreen" and then to "native" clears the ref).
+  const nativeRejectedForRef = useRef<CanvasPresentationMode | null>(null);
+  useEffect(() => {
+    const bridge = window.kcreate?.renderer;
+    if (!bridge) return undefined;
+    const desired: CanvasPresentationMode = requestedMode ?? "offscreen";
+    if (desired === activeMode) return undefined;
+    if (desired === "native" && nativeRejectedForRef.current === desired) {
+      // Already tried this exact request, host hasn't changed its
+      // mind. Don't retry; let the resize path drive the offscreen
+      // pipeline (which is already running).
+      return undefined;
+    }
+
+    let cancelled = false;
+    void (async (): Promise<void> => {
+      if (desired === "native") {
+        const dpr = dprRef.current;
+        const wPx = Math.max(1, Math.round(propWidth * dpr));
+        const hPx = Math.max(1, Math.round(propHeight * dpr));
+        try {
+          await bridge.switchNative(wPx, hPx);
+          if (!cancelled) {
+            nativeRejectedForRef.current = null;
+            setActiveMode("native");
+          }
+        } catch (err) {
+          // Native path is unavailable — keep the offscreen loop
+          // running and let the host clear its toggle.
+          if (!cancelled) {
+            nativeRejectedForRef.current = desired;
+            const reason =
+              err instanceof Error
+                ? err.message
+                : "switchNative failed: " + String(err);
+            onNativeFallback?.(reason);
+            // Force a re-render on the next paint so the canvas
+            // reflects the offscreen state (background, transparency).
+            setActiveMode("offscreen");
+          }
+        }
+      } else {
+        // Switching away from native clears the rejection record so
+        // a subsequent flip back to "native" can try again (the host
+        // may have e.g. plugged in a GPU or restarted with the
+        // feature flag on).
+        nativeRejectedForRef.current = null;
+        try {
+          await bridge.switchOffscreen();
+        } catch {
+          // No-op: detaching the native surface is best-effort.
+        }
+        if (!cancelled) setActiveMode("offscreen");
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+    // `activeMode` is intentionally not in the dependency list: it's
+    // the result of the negotiation, not an input — including it
+    // would re-fire the effect immediately after every successful
+    // switch.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [requestedMode, propWidth, propHeight, onNativeFallback]);
 
   // Resize: width/height changes drive `bridge.resize(...)`, which is a
   // no-op on the GPU device (only the offscreen surface and presenter
@@ -465,7 +604,21 @@ export function CanvasHost(props: CanvasHostProps): JSX.Element {
         display: "block",
         cursor: cursor ?? propCursor ?? "default",
         touchAction: "none",
+        // In native mode the Rust renderer paints straight to the
+        // BrowserWindow's surface beneath the React tree. We keep the
+        // <canvas> element in the layout so pointer events still route
+        // through React (`pointerEvents: "auto"` is the default), but
+        // we have to hide its pixel buffer because the 2D context was
+        // created with `alpha: false` for the offscreen path — that
+        // makes the backing store permanently opaque, and a CSS
+        // `background: transparent` only affects the element box, not
+        // the canvas bitmap (Devin Review BUG-0003). `opacity: 0` is
+        // the cleanest way to keep the element hit-testable while
+        // letting the native surface composit underneath it.
+        opacity: activeMode === "native" ? 0 : undefined,
+        background: activeMode === "native" ? "transparent" : undefined,
       }}
+      data-presentation-mode={activeMode}
       onPointerDown={onPointerDown}
       onPointerMove={onPointerMove}
       onPointerUp={onPointerUp}

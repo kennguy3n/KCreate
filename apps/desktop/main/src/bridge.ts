@@ -30,6 +30,13 @@ type ProjectInfoSnake = {
   modified_at: string;
 };
 
+type BoundsSnake = {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+};
+
 type NodeInfoSnake = {
   id: string;
   node_type: string;
@@ -38,6 +45,11 @@ type NodeInfoSnake = {
   name: string;
   visible: boolean;
   locked: boolean;
+  /// Axis-aligned bounds in document space, mirroring
+  /// `kcreate_core::Node::bounds`. Threaded through the napi wire
+  /// shape so the renderer can place hotspot rectangles without a
+  /// second IPC hop.
+  bounds: BoundsSnake;
 };
 
 type RuntimeStatusSnake = {
@@ -59,6 +71,7 @@ type DocumentStatusSnake = {
 export type {
   ProjectInfoSnake,
   NodeInfoSnake,
+  BoundsSnake,
   RuntimeStatusSnake,
   DocumentStatusSnake,
 };
@@ -82,12 +95,27 @@ export interface Bridge {
   rendererFrameInfo(): FrameInfoSnake | null;
   rendererAcquireFrame(): AcquiredFrameSnake | null;
 
+  // Native canvas presentation mode (Phase 1, Block A, Tasks 4–6).
+  //
+  // `rendererSwitchNative` errors with a "feature not compiled in"
+  // message when the bridge was built without the `native_canvas`
+  // Cargo feature; the host should treat that as a signal to stay on
+  // the offscreen readback path.
+  rendererPresentationMode(): string;
+  rendererSwitchNative(
+    handleBytes: Buffer | Uint8Array,
+    width: number,
+    height: number,
+  ): string;
+  rendererSwitchOffscreen(): void;
+
   // Document / project lifecycle
   projectCreate(name: string, dir: string): ProjectInfoSnake;
   projectOpen(dir: string): ProjectInfoSnake;
   projectSave(): void;
   projectClose(): void;
   projectGetInfo(): ProjectInfoSnake | null;
+  projectIsUntouched(): boolean;
   documentGetTree(): NodeInfoSnake[];
   documentInspectNode(nodeId: string): string;
   documentCreateNode(
@@ -220,6 +248,49 @@ export interface Bridge {
   layoutSetGrid(nodeId: string, layoutJson: string): void;
   layoutRecompute(nodeId: string): void;
   layoutConvertToFrame(nodeId: string): void;
+
+  // Prototype interactions (Phase 1, Block A)
+  interactionAdd(
+    nodeId: string,
+    trigger: string,
+    actionJson: string,
+  ): string;
+  interactionRemove(nodeId: string, interactionId: string): boolean;
+  interactionList(nodeId: string): string;
+  /**
+   * Batched [`interactionList`] taking a JSON array of node ids and
+   * returning a JSON object keyed by node id. Used by the prototype
+   * player so a single artboard's hotspots cost one IPC round trip
+   * (Devin Review ANALYSIS-0003). The JSON input is preferred over
+   * `string[]` because napi-rs can't infer that an array parameter
+   * should arrive as JSON.
+   */
+  interactionListBatch(nodeIdsJson: string): string;
+
+  // Layout Studio (Phase 2, Block B)
+  pageSetLayout(pageId: string, layoutJson: string): void;
+  pageGetLayout(pageId: string): string;
+  masterPageCreate(
+    name: string,
+    size: string,
+    orientation: string,
+  ): string;
+  masterPageList(): string;
+  masterPageApply(contentPageId: string, masterPageId: string): void;
+  masterPageDetach(contentPageId: string): void;
+  layoutTemplateList(): string;
+  layoutTemplateApply(templateId: string): string;
+  pageAdd(
+    name: string,
+    size?: string,
+    orientation?: string,
+  ): string;
+  pageDuplicate(pageId: string): string;
+  documentReparentNode(
+    nodeId: string,
+    newParent: string | undefined,
+    index: number,
+  ): void;
 }
 
 function bridgeBinaryPath(): string {

@@ -18,7 +18,18 @@ import type {
   CreateNodeProps,
   FlexLayout,
   GridLayout,
+  Interaction,
+  InteractionAction,
+  InteractionBridge,
+  InteractionTrigger,
   LayoutBridge,
+  LayoutStudioBridge,
+  LayoutTemplate,
+  MasterPageBridge,
+  MasterPageInfo,
+  PageLayout,
+  PageOrientation,
+  PageSizeId,
   DesignTokens,
   DesignTokensBridge,
   DocumentBridge,
@@ -144,6 +155,50 @@ const renderer: RendererBridge = {
       bytes,
     };
   },
+  async presentationMode(): Promise<"offscreen" | "native"> {
+    const mode = (await ipcRenderer.invoke(
+      "kcreate/renderer/presentationMode",
+    )) as string;
+    return mode === "native" ? "native" : "offscreen";
+  },
+  async switchNative(
+    width,
+    height,
+  ): Promise<"appkit" | "win32" | "x11" | "wayland"> {
+    // The handle bytes come from the main process — we don't expose
+    // `BrowserWindow::getNativeWindowHandle()` to the sandboxed
+    // renderer. Two IPC hops in one user gesture is fine; this is a
+    // settings-toggle action, not a per-frame path.
+    const handle = (await ipcRenderer.invoke(
+      "kcreate/canvas/native-handle",
+    )) as Buffer | null;
+    if (!handle) {
+      throw new Error(
+        "switchNative: main process has no active BrowserWindow to extract the native handle from",
+      );
+    }
+    const platform = (await ipcRenderer.invoke(
+      "kcreate/renderer/switchNative",
+      handle,
+      width,
+      height,
+    )) as string;
+    // Narrow the string into the typed union the renderer expects.
+    if (
+      platform === "appkit" ||
+      platform === "win32" ||
+      platform === "x11" ||
+      platform === "wayland"
+    ) {
+      return platform;
+    }
+    throw new Error(
+      "switchNative: bridge returned unknown platform variant " + platform,
+    );
+  },
+  async switchOffscreen(): Promise<void> {
+    await ipcRenderer.invoke("kcreate/renderer/switchOffscreen");
+  },
 };
 
 // Snake-case shapes returned from the native bridge. Documented here in
@@ -156,6 +211,13 @@ type ProjectInfoSnake = {
   modified_at: string;
 };
 
+type BoundsSnake = {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+};
+
 type NodeInfoSnake = {
   id: string;
   node_type: string;
@@ -164,6 +226,11 @@ type NodeInfoSnake = {
   name: string;
   visible: boolean;
   locked: boolean;
+  /// Axis-aligned bounds in document space. Mirrors
+  /// `kcreate_core::Node::bounds`; the napi bridge carries it as
+  /// `bounds` directly on every NodeInfo so the renderer can render
+  /// hotspots / hit-test overlays without a second IPC round trip.
+  bounds: BoundsSnake;
   /// Already camelCased on the Rust side via #[serde(rename)]. We
   /// pass it through verbatim because the inner field names are
   /// also camelCased (definitionId / activeVariantId).
@@ -204,6 +271,12 @@ function nodeFromSnake(n: NodeInfoSnake): NodeInfo {
     name: n.name,
     visible: n.visible,
     locked: n.locked,
+    bounds: {
+      x: n.bounds.x,
+      y: n.bounds.y,
+      width: n.bounds.width,
+      height: n.bounds.height,
+    },
     ...(n.componentInstance ? { componentInstance: n.componentInstance } : {}),
     ...(n.metadata ? { metadata: n.metadata } : {}),
   };
@@ -264,6 +337,11 @@ const document: DocumentBridge = {
       "kcreate/project/getInfo",
     )) as ProjectInfoSnake | null;
     return raw ? projectFromSnake(raw) : null;
+  },
+  async isUntouched(): Promise<boolean> {
+    return (await ipcRenderer.invoke(
+      "kcreate/project/isUntouched",
+    )) as boolean;
   },
   async getDocumentTree(): Promise<NodeInfo[]> {
     const raw = (await ipcRenderer.invoke(
@@ -791,6 +869,138 @@ const layout: LayoutBridge = {
   },
 };
 
+const interaction: InteractionBridge = {
+  async add(
+    nodeId: string,
+    trigger: InteractionTrigger,
+    action: InteractionAction,
+  ): Promise<string> {
+    return (await ipcRenderer.invoke(
+      "kcreate/interaction/add",
+      nodeId,
+      trigger,
+      JSON.stringify(action),
+    )) as string;
+  },
+  async remove(nodeId: string, interactionId: string): Promise<boolean> {
+    return (await ipcRenderer.invoke(
+      "kcreate/interaction/remove",
+      nodeId,
+      interactionId,
+    )) as boolean;
+  },
+  async list(nodeId: string): Promise<Interaction[]> {
+    const json = (await ipcRenderer.invoke(
+      "kcreate/interaction/list",
+      nodeId,
+    )) as string;
+    return JSON.parse(json) as Interaction[];
+  },
+  async listBatch(
+    nodeIds: string[],
+  ): Promise<Record<string, Interaction[]>> {
+    const json = (await ipcRenderer.invoke(
+      "kcreate/interaction/list-batch",
+      nodeIds,
+    )) as string;
+    return JSON.parse(json) as Record<string, Interaction[]>;
+  },
+};
+
+const masterPage: MasterPageBridge = {
+  async create(
+    name: string,
+    size: PageSizeId,
+    orientation: PageOrientation,
+  ): Promise<string> {
+    return (await ipcRenderer.invoke(
+      "kcreate/masterPage/create",
+      name,
+      size,
+      orientation,
+    )) as string;
+  },
+  async list(): Promise<MasterPageInfo[]> {
+    const json = (await ipcRenderer.invoke(
+      "kcreate/masterPage/list",
+    )) as string;
+    return JSON.parse(json) as MasterPageInfo[];
+  },
+  async apply(
+    contentPageId: string,
+    masterPageId: string,
+  ): Promise<void> {
+    await ipcRenderer.invoke(
+      "kcreate/masterPage/apply",
+      contentPageId,
+      masterPageId,
+    );
+  },
+  async detach(contentPageId: string): Promise<void> {
+    await ipcRenderer.invoke("kcreate/masterPage/detach", contentPageId);
+  },
+};
+
+const layoutStudio: LayoutStudioBridge = {
+  async setPageLayout(pageId: string, layoutValue: PageLayout): Promise<void> {
+    await ipcRenderer.invoke(
+      "kcreate/page/setLayout",
+      pageId,
+      JSON.stringify(layoutValue),
+    );
+  },
+  async getPageLayout(pageId: string): Promise<PageLayout | null> {
+    const json = (await ipcRenderer.invoke(
+      "kcreate/page/getLayout",
+      pageId,
+    )) as string;
+    return json === "" ? null : (JSON.parse(json) as PageLayout);
+  },
+  async listTemplates(): Promise<LayoutTemplate[]> {
+    const json = (await ipcRenderer.invoke(
+      "kcreate/layoutTemplate/list",
+    )) as string;
+    return JSON.parse(json) as LayoutTemplate[];
+  },
+  async applyTemplate(templateId: string): Promise<string[]> {
+    const json = (await ipcRenderer.invoke(
+      "kcreate/layoutTemplate/apply",
+      templateId,
+    )) as string;
+    return JSON.parse(json) as string[];
+  },
+  async addPage(
+    name: string,
+    size?: PageSizeId,
+    orientation?: PageOrientation,
+  ): Promise<string> {
+    return (await ipcRenderer.invoke(
+      "kcreate/page/add",
+      name,
+      size,
+      orientation,
+    )) as string;
+  },
+  async duplicatePage(pageId: string): Promise<string> {
+    return (await ipcRenderer.invoke(
+      "kcreate/page/duplicate",
+      pageId,
+    )) as string;
+  },
+  async reparentNode(
+    nodeId: string,
+    newParent: string | null,
+    index: number,
+  ): Promise<void> {
+    await ipcRenderer.invoke(
+      "kcreate/document/reparent",
+      nodeId,
+      newParent,
+      index,
+    );
+  },
+};
+
 contextBridge.exposeInMainWorld("kcreate", {
   renderer,
   document,
@@ -806,4 +1016,7 @@ contextBridge.exposeInMainWorld("kcreate", {
   artboard,
   component,
   layout,
+  interaction,
+  masterPage,
+  layoutStudio,
 });

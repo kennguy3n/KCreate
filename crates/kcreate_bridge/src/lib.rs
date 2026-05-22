@@ -19,6 +19,8 @@
 pub mod document;
 pub mod hit_test;
 pub mod llm;
+#[cfg(feature = "native_canvas")]
+pub mod native_canvas;
 pub mod scene_sync;
 pub mod state;
 pub mod wire;
@@ -34,7 +36,7 @@ use napi_derive::napi;
 use uuid::Uuid;
 
 use crate::document::{
-    CreateNodeProps, DocumentBridgeError, NodeInfo as CoreNodeInfo,
+    BoundsInfo as CoreBoundsInfo, CreateNodeProps, DocumentBridgeError, NodeInfo as CoreNodeInfo,
     PngExportRequest as CorePngRequest, ProjectInfo as CoreProjectInfo,
     RuntimeStatus as CoreRuntimeStatus, UpdateNodeProps,
 };
@@ -229,6 +231,71 @@ pub fn renderer_acquire_frame() -> NapiResult<Option<AcquiredFrame>> {
 }
 
 // =============================================================================
+// Native canvas presentation mode — Phase 1, Block A, Task 4–6.
+//
+// The N-API surface for `presentation_mode` / `switch_native` /
+// `switch_offscreen` is always exported (so the host code does not
+// have to branch on which Cargo features the cdylib was built with):
+// in default builds `presentation_mode` always returns "offscreen",
+// `switch_offscreen` is a no-op, and `switch_native` errors with a
+// clear "feature not compiled in" message that the renderer can
+// surface as a fallback.
+// =============================================================================
+
+/// Returns the current presentation mode (`"offscreen"` or `"native"`).
+///
+/// `"offscreen"` means the host should drive the `requestAnimationFrame`
+/// readback loop via `renderer.acquireFrame()`. `"native"` means the
+/// Rust renderer is presenting directly to a platform window surface
+/// and the host should hide its canvas element.
+#[napi]
+#[must_use]
+pub fn renderer_presentation_mode() -> String {
+    state::presentation_mode().as_str().to_string()
+}
+
+/// Attach a native presentation surface created from the raw bytes
+/// returned by Electron's `BrowserWindow::getNativeWindowHandle()`.
+///
+/// `width` / `height` are the surface's physical pixel dimensions
+/// (caller is responsible for multiplying CSS pixels by
+/// `devicePixelRatio`). Returns the platform variant the bridge
+/// interpreted the bytes as (`"appkit"`, `"win32"`, `"x11"`, or
+/// `"wayland"`).
+///
+/// Errors with a `feature not compiled in` message in default builds
+/// (the `native_canvas` feature flag gates the platform-specific
+/// `raw_window_handle` interpretation). The host should treat that
+/// error as a signal to remain in offscreen mode.
+#[napi]
+#[allow(clippy::needless_pass_by_value, unused_variables)]
+pub fn renderer_switch_native(handle_bytes: Buffer, width: u32, height: u32) -> NapiResult<String> {
+    #[cfg(feature = "native_canvas")]
+    {
+        state::switch_native(handle_bytes.as_ref(), width, height).map_err(map_err)
+    }
+    #[cfg(not(feature = "native_canvas"))]
+    {
+        Err(napi::Error::from_reason(
+            "renderer_switch_native: bridge was compiled without the `native_canvas` feature; \
+             cannot interpret the platform window handle. Stay on the offscreen path."
+                .to_string(),
+        ))
+    }
+}
+
+/// Detach any attached native surface and revert to the offscreen
+/// readback path. No-op when already in offscreen mode (or when the
+/// `native_canvas` feature is not compiled in).
+#[napi]
+pub fn renderer_switch_offscreen() {
+    #[cfg(feature = "native_canvas")]
+    {
+        state::switch_offscreen();
+    }
+}
+
+// =============================================================================
 // Document / project bridge
 // =============================================================================
 
@@ -254,6 +321,32 @@ impl From<CoreProjectInfo> for ProjectInfo {
     }
 }
 
+/// Wire-format mirror of [`kcreate_core::Bounds`] / [`document::BoundsInfo`].
+///
+/// Kept as a flat `#[napi(object)]` shape so the host can read `bounds`
+/// from any `NodeInfo` without a second IPC hop. The four numbers
+/// represent the axis-aligned bounding box in document space (CSS-like
+/// `x, y, width, height` in document units / px).
+#[napi(object)]
+#[derive(Debug, Clone, Copy)]
+pub struct Bounds {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
+impl From<CoreBoundsInfo> for Bounds {
+    fn from(b: CoreBoundsInfo) -> Self {
+        Self {
+            x: b.x,
+            y: b.y,
+            width: b.width,
+            height: b.height,
+        }
+    }
+}
+
 #[napi(object)]
 #[derive(Debug, Clone)]
 pub struct NodeInfo {
@@ -264,6 +357,12 @@ pub struct NodeInfo {
     pub name: String,
     pub visible: bool,
     pub locked: bool,
+    /// Axis-aligned bounding box in document space. Mirrors
+    /// `kcreate_core::Node::bounds`. The host's PrototypePlayer
+    /// (Block A, Task 2) uses this to position hotspot rectangles on
+    /// top of the rendered artboard; previously the wire shape elided
+    /// `bounds`, so hotspots never appeared — see PR #5 fix.
+    pub bounds: Bounds,
 }
 
 impl From<CoreNodeInfo> for NodeInfo {
@@ -276,6 +375,7 @@ impl From<CoreNodeInfo> for NodeInfo {
             name: c.name,
             visible: c.visible,
             locked: c.locked,
+            bounds: c.bounds.into(),
         }
     }
 }
@@ -374,6 +474,17 @@ pub fn project_close() {
 #[napi]
 pub fn project_get_info() -> Option<ProjectInfo> {
     document::project_info().map(Into::into)
+}
+
+/// Returns `true` iff the currently open project is untouched —
+/// i.e. its [`OperationLog`](kcreate_core::operation::OperationLog)
+/// is empty. The host uses this to drive first-time UX (e.g.
+/// auto-opening the TemplatePicker on the first switch to Layout
+/// mode) without replicating `project_create`'s exact node shape
+/// in TypeScript. Errors with `NoProject` if no project is open.
+#[napi]
+pub fn project_is_untouched() -> NapiResult<bool> {
+    document::project_is_untouched().map_err(map_doc_err)
 }
 
 /// Flat document tree.
@@ -1237,4 +1348,174 @@ pub fn layout_recompute(node_id: String) -> NapiResult<()> {
 pub fn layout_convert_to_frame(node_id: String) -> NapiResult<()> {
     let nid = parse_uuid(&node_id)?;
     document::layout_convert_to_frame(nid).map_err(map_doc_err)
+}
+
+// -----------------------------------------------------------------------------
+// Prototype interactions (Block A)
+// -----------------------------------------------------------------------------
+
+/// Add an interaction to a node. Returns the new interaction's id.
+/// `trigger` is `"click"` / `"hover"` / `"press"`; `action_json` is a
+/// serialised [`kcreate_core::InteractionAction`].
+#[napi]
+pub fn interaction_add(
+    node_id: String,
+    trigger: String,
+    action_json: String,
+) -> NapiResult<String> {
+    let nid = parse_uuid(&node_id)?;
+    document::interaction_add(nid, &trigger, &action_json)
+        .map(|id| id.to_string())
+        .map_err(map_doc_err)
+}
+
+/// Remove an interaction from a node. Returns `true` when an
+/// interaction with the given id was removed.
+#[napi]
+pub fn interaction_remove(node_id: String, interaction_id: String) -> NapiResult<bool> {
+    let nid = parse_uuid(&node_id)?;
+    let iid = parse_uuid(&interaction_id)?;
+    document::interaction_remove(nid, iid).map_err(map_doc_err)
+}
+
+/// List interactions on a node. Returns a JSON array of [`kcreate_core::Interaction`].
+#[napi]
+pub fn interaction_list(node_id: String) -> NapiResult<String> {
+    let nid = parse_uuid(&node_id)?;
+    let list = document::interaction_list(nid).map_err(map_doc_err)?;
+    serde_json::to_string(&list).map_err(|e| NapiError::from_reason(e.to_string()))
+}
+
+/// Batched [`interaction_list`]. Accepts a JSON array of node id strings;
+/// returns a JSON object keyed by node id with the value being a JSON
+/// array of [`kcreate_core::Interaction`]. Nodes that don't exist or
+/// have no interactions are omitted from the result. One IPC trip for
+/// the whole batch, used by the prototype player.
+#[napi]
+pub fn interaction_list_batch(node_ids_json: String) -> NapiResult<String> {
+    let ids: Vec<String> = serde_json::from_str(&node_ids_json)
+        .map_err(|e| NapiError::from_reason(format!("invalid node id list: {e}")))?;
+    let mut uuids = Vec::with_capacity(ids.len());
+    for id in &ids {
+        uuids.push(parse_uuid(id)?);
+    }
+    let map = document::interaction_list_batch(&uuids).map_err(map_doc_err)?;
+    // Serialise with string keys so the renderer can index by node id
+    // without re-parsing UUIDs on the JS side. `HashMap<Uuid, _>`
+    // serialises to a JSON object with Uuid display-formatted as
+    // strings by default.
+    serde_json::to_string(&map).map_err(|e| NapiError::from_reason(e.to_string()))
+}
+
+// -----------------------------------------------------------------------------
+// Layout Studio (Block B): page layout, master pages, templates
+// -----------------------------------------------------------------------------
+
+/// Write the `PageLayout` JSON onto a Page node.
+#[napi]
+pub fn page_set_layout(page_id: String, layout_json: String) -> NapiResult<()> {
+    let pid = parse_uuid(&page_id)?;
+    document::page_set_layout(pid, &layout_json).map_err(map_doc_err)
+}
+
+/// Read the `PageLayout` JSON on a Page node. Returns the empty string
+/// when no layout is attached.
+#[napi]
+pub fn page_get_layout(page_id: String) -> NapiResult<String> {
+    let pid = parse_uuid(&page_id)?;
+    let layout = document::page_get_layout(pid).map_err(map_doc_err)?;
+    match layout {
+        Some(l) => serde_json::to_string(&l).map_err(|e| NapiError::from_reason(e.to_string())),
+        None => Ok(String::new()),
+    }
+}
+
+/// Create a new master page. `size` ∈ {a3, a4, a5, letter, legal,
+/// tabloid, presentation_16x9, presentation_4x3}. `orientation` ∈
+/// {portrait, landscape}. Returns the new page id.
+#[napi]
+pub fn master_page_create(name: String, size: String, orientation: String) -> NapiResult<String> {
+    document::master_page_create(name, &size, &orientation)
+        .map(|id| id.to_string())
+        .map_err(map_doc_err)
+}
+
+/// List every master page as a JSON array.
+#[napi]
+pub fn master_page_list() -> NapiResult<String> {
+    let list = document::master_page_list().map_err(map_doc_err)?;
+    serde_json::to_string(&list).map_err(|e| NapiError::from_reason(e.to_string()))
+}
+
+/// Attach a master to a content page.
+#[napi]
+pub fn master_page_apply(content_page_id: String, master_page_id: String) -> NapiResult<()> {
+    let cid = parse_uuid(&content_page_id)?;
+    let mid = parse_uuid(&master_page_id)?;
+    document::master_page_apply(cid, mid).map_err(map_doc_err)
+}
+
+/// Clear the master reference on a content page.
+#[napi]
+pub fn master_page_detach(content_page_id: String) -> NapiResult<()> {
+    let cid = parse_uuid(&content_page_id)?;
+    document::master_page_detach(cid).map_err(map_doc_err)
+}
+
+/// Return the built-in layout-template catalog as a JSON array.
+#[napi]
+pub fn layout_template_list() -> NapiResult<String> {
+    let templates = document::layout_template_list();
+    serde_json::to_string(&templates).map_err(|e| NapiError::from_reason(e.to_string()))
+}
+
+/// Apply a built-in template by id. Returns a JSON array of created
+/// page uuids.
+#[napi]
+pub fn layout_template_apply(template_id: String) -> NapiResult<String> {
+    let tid = parse_uuid(&template_id)?;
+    let ids = document::layout_template_apply(tid).map_err(map_doc_err)?;
+    let strs: Vec<String> = ids.into_iter().map(|i| i.to_string()).collect();
+    serde_json::to_string(&strs).map_err(|e| NapiError::from_reason(e.to_string()))
+}
+
+/// Add a new content page to the open project. `size` and
+/// `orientation` are optional; omit both to use the workspace default.
+/// Returns the new page id as a string.
+#[napi]
+pub fn page_add(
+    name: String,
+    size: Option<String>,
+    orientation: Option<String>,
+) -> NapiResult<String> {
+    document::page_add(name, size.as_deref(), orientation.as_deref())
+        .map(|id| id.to_string())
+        .map_err(map_doc_err)
+}
+
+/// Duplicate `page_id` (subtree-cloned at the root). Returns the new
+/// page id as a string.
+#[napi]
+pub fn page_duplicate(page_id: String) -> NapiResult<String> {
+    let pid = parse_uuid(&page_id)?;
+    document::page_duplicate(pid)
+        .map(|id| id.to_string())
+        .map_err(map_doc_err)
+}
+
+/// Reparent `node_id` under `new_parent` (`None` => move to the root
+/// list) at the given `index`. Used by the PageNavigator's drag-reorder
+/// and by future layer-panel move gestures.
+#[napi]
+pub fn document_reparent_node(
+    node_id: String,
+    new_parent: Option<String>,
+    index: u32,
+) -> NapiResult<()> {
+    let nid = parse_uuid(&node_id)?;
+    let pid = match new_parent {
+        Some(s) if !s.is_empty() => Some(parse_uuid(&s)?),
+        _ => None,
+    };
+    document::document_reparent_node(nid, pid, index as usize).map_err(map_doc_err)
 }

@@ -89,7 +89,7 @@ export function ScreenshotToLayout({
     setBusy(true);
     onStatus?.("screenshot: analyzing…");
     try {
-      const b64 = bytesToBase64(image.pixels);
+      const b64 = await bytesToBase64(image.pixels);
       const req: ScreenshotRequest = {
         imageBase64: b64,
         width: image.width,
@@ -303,17 +303,32 @@ function TypePill({ type }: { type: ScreenshotElementType }): JSX.Element {
   );
 }
 
-function bytesToBase64(bytes: Uint8ClampedArray): string {
-  // Chunked to avoid quadratic string concatenation on multi-megabyte
-  // images. 32 KiB per chunk is the sweet spot for V8 — anything
-  // larger trips the argument-count cap in `String.fromCharCode`.
-  const CHUNK = 0x8000;
-  const parts: string[] = [];
-  for (let i = 0; i < bytes.length; i += CHUNK) {
-    const slice = bytes.subarray(i, Math.min(i + CHUNK, bytes.length));
-    parts.push(String.fromCharCode(...slice));
-  }
-  return btoa(parts.join(""));
+async function bytesToBase64(bytes: Uint8ClampedArray): Promise<string> {
+  // FileReader.readAsDataURL is the lowest-overhead base64 path
+  // available in the renderer. Compared to the previous chunked
+  // String.fromCharCode + btoa approach it avoids the ~33 MB
+  // intermediate binary string that lived alongside the raw pixel
+  // buffer *and* the final base64 output — for a 4K screenshot that
+  // dropped peak transient memory from ~110 MB to ~77 MB. Per Devin
+  // Review ANALYSIS_pr-review-job-790e7860e5c745e0bee13295709290f4_0004.
+  const blob = new Blob([bytes], { type: "application/octet-stream" });
+  const dataUrl: string = await new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      resolve(reader.result as string);
+    };
+    reader.onerror = () => {
+      reject(
+        reader.error ??
+          new Error("FileReader failed reading screenshot bytes to base64"),
+      );
+    };
+    reader.readAsDataURL(blob);
+  });
+  // `readAsDataURL` returns e.g. `data:application/octet-stream;base64,AAAA…`.
+  // Strip everything up to and including the comma.
+  const comma = dataUrl.indexOf(",");
+  return comma === -1 ? dataUrl : dataUrl.slice(comma + 1);
 }
 
 function errMsg(e: unknown): string {

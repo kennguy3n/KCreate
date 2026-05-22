@@ -591,18 +591,27 @@ pub fn plugin_disable(id: &str) -> Result<()> {
 }
 
 pub fn plugin_execute(id: &str, function: &str, input_json: &str) -> Result<String> {
+    // Resolve existence and enabled state under a single registry
+    // lock acquisition so the two are observed atomically, then drop
+    // the lock before any potentially slow WASM compile / execute.
     let (entry, enabled) = {
         let reg = plugin_registry().lock();
         (reg.entry_point_for(id), reg.is_enabled(id))
     };
+    // Existence check *before* enabled check. `PluginRegistry::is_enabled`
+    // returns `false` for unknown ids (`HashMap::get(...).unwrap_or(false)`),
+    // so checking enabled first would surface "not enabled" for plugins
+    // that don't exist at all — leading callers to look for a disabled
+    // plugin instead of a typo / missing install. Per Devin Review
+    // BUG_pr-review-job-790e7860e5c745e0bee13295709290f4_0001.
+    let path = entry.ok_or_else(|| {
+        DocumentBridgeError::Io(std::io::Error::other(format!("plugin {id} not found")))
+    })?;
     if !enabled {
         return Err(DocumentBridgeError::Io(std::io::Error::other(format!(
             "plugin {id} is not enabled"
         ))));
     }
-    let path = entry.ok_or_else(|| {
-        DocumentBridgeError::Io(std::io::Error::other(format!("plugin {id} not found")))
-    })?;
     // `execute_path` keeps a `(path, mtime)`-keyed compiled-`Module`
     // cache inside the runtime, so the steady-state hot path skips both
     // the disk read and the wasmi compile. A rebuilt `.wasm` file is
@@ -709,13 +718,17 @@ pub struct McpStatus {
 }
 
 pub fn mcp_status() -> McpStatus {
-    let running = crate::document::mcp_is_running();
-    let port = if running {
-        crate::document::mcp_port().unwrap_or(0)
-    } else {
-        0
-    };
-    McpStatus { running, port }
+    // Single-shot lock acquisition via `mcp_state`. Composing
+    // `mcp_is_running` + `mcp_port` separately was a TOCTOU — the
+    // server could be stopped between the two calls and produce a
+    // status with `running: true` and `port: 0` that no caller
+    // expects to be valid. Per Devin Review
+    // ANALYSIS_pr-review-job-790e7860e5c745e0bee13295709290f4_0001.
+    let (running, port) = crate::document::mcp_state();
+    McpStatus {
+        running,
+        port: port.unwrap_or(0),
+    }
 }
 
 // -----------------------------------------------------------------------------

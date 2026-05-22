@@ -190,6 +190,28 @@ pub const fn mcp_port() -> Option<u32> {
     None
 }
 
+/// Atomic `(running, port)` snapshot of the MCP server, taken under
+/// a single global-lock acquisition.
+///
+/// Composing [`mcp_is_running`] and [`mcp_port`] separately is a
+/// TOCTOU race: the server can be stopped between the two calls,
+/// producing a status response with `running: true` and `port: 0`.
+/// `phase2::mcp_status` uses this accessor instead so a single
+/// status response is internally consistent. Per Devin Review
+/// ANALYSIS_pr-review-job-790e7860e5c745e0bee13295709290f4_0001.
+#[cfg(feature = "mcp")]
+#[must_use]
+pub fn mcp_state() -> (bool, Option<u32>) {
+    let (running, port) = kcreate_mcp::server::state();
+    (running, port.map(u32::from))
+}
+
+#[cfg(not(feature = "mcp"))]
+#[must_use]
+pub const fn mcp_state() -> (bool, Option<u32>) {
+    (false, None)
+}
+
 /// Test-only helper to reset the singleton between serial tests.
 #[cfg(test)]
 pub(crate) fn reset_for_tests() {

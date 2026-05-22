@@ -319,21 +319,38 @@ fn check_node_for_bleed(
     let touches_top = top < bleed_px && top >= 0.0;
     let touches_bottom = bottom > dims.height_px - bleed_px && bottom <= dims.height_px;
 
-    if touches_left || touches_right || touches_top || touches_bottom {
-        let side = if touches_left {
-            "left"
-        } else if touches_right {
-            "right"
-        } else if touches_top {
-            "top"
-        } else {
-            "bottom"
+    // Enumerate *all* sides the layer touches, not just the first
+    // match. A corner element can enter the bleed zone on two sides
+    // simultaneously and the user needs to know about both to extend
+    // it correctly. Per Devin Review
+    // ANALYSIS_pr-review-job-790e7860e5c745e0bee13295709290f4_0005.
+    let mut sides: Vec<&'static str> = Vec::with_capacity(4);
+    if touches_left {
+        sides.push("left");
+    }
+    if touches_right {
+        sides.push("right");
+    }
+    if touches_top {
+        sides.push("top");
+    }
+    if touches_bottom {
+        sides.push("bottom");
+    }
+    if !sides.is_empty() {
+        let sides_label = match sides.as_slice() {
+            [a] => (*a).to_string(),
+            [a, b] => format!("{a} and {b}"),
+            many => {
+                let (last, rest) = many.split_last().expect("non-empty");
+                format!("{}, and {last}", rest.join(", "))
+            }
         };
         issues.push(PreflightIssue {
             check: PreflightCheck::BleedMargin,
             severity: PreflightSeverity::Warning,
             message: format!(
-                "Layer '{name}' enters the {side} bleed zone ({bleed_mm:.1} mm) without extending past the page edge.",
+                "Layer '{name}' enters the {sides_label} bleed zone ({bleed_mm:.1} mm) without extending past the page edge.",
                 name = node.name,
                 bleed_mm = options.require_bleed_mm,
             ),
@@ -619,6 +636,45 @@ mod tests {
         assert!(issues
             .iter()
             .any(|i| i.check == PreflightCheck::BleedMargin));
+    }
+
+    #[test]
+    fn bleed_zone_corner_layer_lists_all_sides() {
+        // Layer touching both the left and top bleed zones must
+        // mention "left and top", not just one side. Per Devin
+        // Review ANALYSIS_pr-review-job-790e7860e5c745e0bee13295709290f4_0005.
+        let mut doc = DocumentGraph::new();
+        let page = page_with_layout(&mut doc, a4_layout(), a4_bounds());
+        let _layer = child(
+            &mut doc,
+            page,
+            NodeType::VectorLayer,
+            "corner",
+            // x=10, y=10 — both within the ≈35.43 px bleed band.
+            // width/height keep the layer inside the page so it
+            // doesn't extend past either edge.
+            Bounds::new(10.0, 10.0, 200.0, 200.0),
+        );
+        let issues = run_preflight(&doc, &[], &PreflightOptions::default());
+        let bleed: Vec<&PreflightIssue> = issues
+            .iter()
+            .filter(|i| i.check == PreflightCheck::BleedMargin)
+            .collect();
+        // Single issue per node, but its message names both sides.
+        assert_eq!(
+            bleed.len(),
+            1,
+            "expected exactly one bleed issue, got {bleed:?}",
+        );
+        let msg = &bleed[0].message;
+        assert!(
+            msg.contains("left") && msg.contains("top"),
+            "expected both 'left' and 'top' sides in message, got: {msg}",
+        );
+        assert!(
+            msg.contains("left and top"),
+            "expected 'left and top' joining phrase, got: {msg}",
+        );
     }
 
     #[test]

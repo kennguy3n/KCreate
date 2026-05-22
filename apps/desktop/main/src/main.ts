@@ -782,6 +782,62 @@ function registerIpcHandlers(): void {
       requireBridge().layoutConvertToFrame(nodeId);
     },
   );
+
+  // Prototype interactions (Phase 1, Block A)
+  ipcMain.handle(
+    "kcreate/interaction/add",
+    (_e, nodeId: string, trigger: string, actionJson: string): string =>
+      requireBridge().interactionAdd(nodeId, trigger, actionJson),
+  );
+  ipcMain.handle(
+    "kcreate/interaction/remove",
+    (_e, nodeId: string, interactionId: string): boolean =>
+      requireBridge().interactionRemove(nodeId, interactionId),
+  );
+  ipcMain.handle(
+    "kcreate/interaction/list",
+    (_e, nodeId: string): string => requireBridge().interactionList(nodeId),
+  );
+
+  // Layout Studio (Phase 2, Block B): page layout, master pages, templates
+  ipcMain.handle(
+    "kcreate/page/setLayout",
+    (_e, pageId: string, layoutJson: string): void => {
+      requireBridge().pageSetLayout(pageId, layoutJson);
+    },
+  );
+  ipcMain.handle(
+    "kcreate/page/getLayout",
+    (_e, pageId: string): string => requireBridge().pageGetLayout(pageId),
+  );
+  ipcMain.handle(
+    "kcreate/masterPage/create",
+    (_e, name: string, size: string, orientation: string): string =>
+      requireBridge().masterPageCreate(name, size, orientation),
+  );
+  ipcMain.handle("kcreate/masterPage/list", (): string =>
+    requireBridge().masterPageList(),
+  );
+  ipcMain.handle(
+    "kcreate/masterPage/apply",
+    (_e, contentPageId: string, masterPageId: string): void => {
+      requireBridge().masterPageApply(contentPageId, masterPageId);
+    },
+  );
+  ipcMain.handle(
+    "kcreate/masterPage/detach",
+    (_e, contentPageId: string): void => {
+      requireBridge().masterPageDetach(contentPageId);
+    },
+  );
+  ipcMain.handle("kcreate/layoutTemplate/list", (): string =>
+    requireBridge().layoutTemplateList(),
+  );
+  ipcMain.handle(
+    "kcreate/layoutTemplate/apply",
+    (_e, templateId: string): string =>
+      requireBridge().layoutTemplateApply(templateId),
+  );
 }
 
 void app.whenReady().then(() => {

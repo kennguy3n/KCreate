@@ -861,6 +861,143 @@ export interface ComponentBridge {
   detach(nodeId: string): Promise<void>;
 }
 
+// ============================================================================
+// Prototype interactions (mirrors `kcreate_core::node::Interaction`)
+// ============================================================================
+
+export type InteractionTrigger = "click" | "hover" | "press";
+
+export type InteractionAction =
+  | { kind: "navigate_to"; target_artboard_id: string }
+  | { kind: "scroll_to"; target_node_id: string }
+  | { kind: "open_overlay"; overlay_artboard_id: string }
+  | { kind: "close_overlay" }
+  | { kind: "back" };
+
+export interface Interaction {
+  id: string;
+  trigger: InteractionTrigger;
+  action: InteractionAction;
+}
+
+export interface InteractionBridge {
+  add(
+    nodeId: string,
+    trigger: InteractionTrigger,
+    action: InteractionAction,
+  ): Promise<string>;
+  remove(nodeId: string, interactionId: string): Promise<boolean>;
+  list(nodeId: string): Promise<Interaction[]>;
+}
+
+// ============================================================================
+// Layout Studio: pages, master pages, templates
+// (mirrors `kcreate_core::node::PageLayout` and `kcreate_core::project::*`)
+// ============================================================================
+
+/**
+ * Plain identifier for one of the well-known page sizes. Used by APIs
+ * that take a single size argument (e.g. `masterPage.create`). For the
+ * full serialised representation of a page size, see [`PageSize`].
+ */
+export type PageSizeId =
+  | "a3"
+  | "a4"
+  | "a5"
+  | "letter"
+  | "legal"
+  | "tabloid"
+  | "presentation_16x9"
+  | "presentation_4x3";
+
+/**
+ * Serialised form of `kcreate_core::node::PageSize`. Mirrors the
+ * internally-tagged serde representation: every variant is an object
+ * `{ kind: "<variant>", ...fields }`. Unit variants have just `kind`.
+ */
+export type PageSize =
+  | { kind: PageSizeId }
+  | { kind: "custom"; width_mm: number; height_mm: number };
+
+export type PageOrientation = "portrait" | "landscape";
+
+export interface Margins {
+  top_mm: number;
+  right_mm: number;
+  bottom_mm: number;
+  left_mm: number;
+}
+
+export interface PageLayout {
+  page_size: PageSize;
+  orientation: PageOrientation;
+  margins: Margins;
+  master_page_id: string | null;
+  page_number: number | null;
+}
+
+export interface MasterPageInfo {
+  id: string;
+  name: string;
+  layout: PageLayout | null;
+}
+
+export type TemplateCategory =
+  | "pitch_deck"
+  | "proposal"
+  | "brochure"
+  | "flyer"
+  | "report"
+  | "custom";
+
+export type SectionKind =
+  | "title"
+  | "subtitle"
+  | "body_text"
+  | "image"
+  | "chart"
+  | "footer"
+  | "page_number";
+
+export interface TemplateSectionDef {
+  kind: SectionKind;
+  bounds: { x: number; y: number; width: number; height: number };
+  placeholder_text: string | null;
+}
+
+export interface TemplatePageDef {
+  name: string;
+  page_size: PageSize;
+  orientation: PageOrientation;
+  sections: TemplateSectionDef[];
+}
+
+export interface LayoutTemplate {
+  id: string;
+  name: string;
+  description: string;
+  category: TemplateCategory;
+  pages: TemplatePageDef[];
+}
+
+export interface MasterPageBridge {
+  create(
+    name: string,
+    size: PageSizeId,
+    orientation: PageOrientation,
+  ): Promise<string>;
+  list(): Promise<MasterPageInfo[]>;
+  apply(contentPageId: string, masterPageId: string): Promise<void>;
+  detach(contentPageId: string): Promise<void>;
+}
+
+export interface LayoutStudioBridge {
+  setPageLayout(pageId: string, layout: PageLayout): Promise<void>;
+  getPageLayout(pageId: string): Promise<PageLayout | null>;
+  listTemplates(): Promise<LayoutTemplate[]>;
+  applyTemplate(templateId: string): Promise<string[]>;
+}
+
 declare global {
   interface Window {
     kcreate: {
@@ -878,6 +1015,9 @@ declare global {
       artboard: ArtboardBridge;
       component: ComponentBridge;
       layout: LayoutBridge;
+      interaction: InteractionBridge;
+      masterPage: MasterPageBridge;
+      layoutStudio: LayoutStudioBridge;
     };
   }
 }

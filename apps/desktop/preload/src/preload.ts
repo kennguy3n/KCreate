@@ -18,7 +18,18 @@ import type {
   CreateNodeProps,
   FlexLayout,
   GridLayout,
+  Interaction,
+  InteractionAction,
+  InteractionBridge,
+  InteractionTrigger,
   LayoutBridge,
+  LayoutStudioBridge,
+  LayoutTemplate,
+  MasterPageBridge,
+  MasterPageInfo,
+  PageLayout,
+  PageOrientation,
+  PageSizeId,
   DesignTokens,
   DesignTokensBridge,
   DocumentBridge,
@@ -791,6 +802,99 @@ const layout: LayoutBridge = {
   },
 };
 
+const interaction: InteractionBridge = {
+  async add(
+    nodeId: string,
+    trigger: InteractionTrigger,
+    action: InteractionAction,
+  ): Promise<string> {
+    return (await ipcRenderer.invoke(
+      "kcreate/interaction/add",
+      nodeId,
+      trigger,
+      JSON.stringify(action),
+    )) as string;
+  },
+  async remove(nodeId: string, interactionId: string): Promise<boolean> {
+    return (await ipcRenderer.invoke(
+      "kcreate/interaction/remove",
+      nodeId,
+      interactionId,
+    )) as boolean;
+  },
+  async list(nodeId: string): Promise<Interaction[]> {
+    const json = (await ipcRenderer.invoke(
+      "kcreate/interaction/list",
+      nodeId,
+    )) as string;
+    return JSON.parse(json) as Interaction[];
+  },
+};
+
+const masterPage: MasterPageBridge = {
+  async create(
+    name: string,
+    size: PageSizeId,
+    orientation: PageOrientation,
+  ): Promise<string> {
+    return (await ipcRenderer.invoke(
+      "kcreate/masterPage/create",
+      name,
+      size,
+      orientation,
+    )) as string;
+  },
+  async list(): Promise<MasterPageInfo[]> {
+    const json = (await ipcRenderer.invoke(
+      "kcreate/masterPage/list",
+    )) as string;
+    return JSON.parse(json) as MasterPageInfo[];
+  },
+  async apply(
+    contentPageId: string,
+    masterPageId: string,
+  ): Promise<void> {
+    await ipcRenderer.invoke(
+      "kcreate/masterPage/apply",
+      contentPageId,
+      masterPageId,
+    );
+  },
+  async detach(contentPageId: string): Promise<void> {
+    await ipcRenderer.invoke("kcreate/masterPage/detach", contentPageId);
+  },
+};
+
+const layoutStudio: LayoutStudioBridge = {
+  async setPageLayout(pageId: string, layoutValue: PageLayout): Promise<void> {
+    await ipcRenderer.invoke(
+      "kcreate/page/setLayout",
+      pageId,
+      JSON.stringify(layoutValue),
+    );
+  },
+  async getPageLayout(pageId: string): Promise<PageLayout | null> {
+    const json = (await ipcRenderer.invoke(
+      "kcreate/page/getLayout",
+      pageId,
+    )) as string;
+    return json === "" ? null : (JSON.parse(json) as PageLayout);
+  },
+  async listTemplates(): Promise<LayoutTemplate[]> {
+    const json = (await ipcRenderer.invoke(
+      "kcreate/layoutTemplate/list",
+    )) as string;
+    return JSON.parse(json) as LayoutTemplate[];
+  },
+  async applyTemplate(templateId: string): Promise<string[]> {
+    const json = (await ipcRenderer.invoke(
+      "kcreate/layoutTemplate/apply",
+      templateId,
+    )) as string;
+    return JSON.parse(json) as string[];
+  },
+};
+
 contextBridge.exposeInMainWorld("kcreate", {
   renderer,
   document,
@@ -806,4 +910,7 @@ contextBridge.exposeInMainWorld("kcreate", {
   artboard,
   component,
   layout,
+  interaction,
+  masterPage,
+  layoutStudio,
 });

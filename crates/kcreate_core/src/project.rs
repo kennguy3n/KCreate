@@ -248,6 +248,122 @@ impl Project {
         Ok(page_id)
     }
 
+    /// Create a master page (template) with the given layout.
+    ///
+    /// Returns the new page node id. Master pages are flagged via
+    /// [`crate::node::MASTER_PAGE_METADATA_KEY`] and excluded from
+    /// the normal page navigator by callers that filter on that flag.
+    ///
+    /// The master page is created with no children — callers add
+    /// header / footer / page-number layers themselves before applying
+    /// it to content pages.
+    pub fn create_master_page(
+        &mut self,
+        name: impl Into<String>,
+        layout: crate::node::PageLayout,
+    ) -> Result<Uuid, ProjectError> {
+        let mut page = Node::new(NodeType::Page, name);
+        let (w_mm, h_mm) = layout.dimensions_mm();
+        // 1 mm = ~3.7795275591 px at 96 dpi; bounds are stored in
+        // document-space pixels so the canvas can render the page at
+        // its natural size.
+        let px_per_mm = 96.0 / 25.4;
+        page.bounds = Bounds::new(0.0, 0.0, w_mm * px_per_mm, h_mm * px_per_mm);
+        page.set_page_layout(&layout);
+        page.set_master_page(true);
+        let id = page.id;
+        self.document.insert_node(page)?;
+        self.touch_modified();
+        Ok(id)
+    }
+
+    /// Iterate all pages flagged as master pages, sorted by name for
+    /// deterministic UI.
+    #[must_use]
+    pub fn list_master_pages(&self) -> Vec<&Node> {
+        let mut out: Vec<&Node> = self
+            .document
+            .iter()
+            .map(|(_, n)| n)
+            .filter(|n| n.is_master_page())
+            .collect();
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        out
+    }
+
+    /// Attach `master_page_id` to the content page's layout.
+    ///
+    /// Returns an error if either id is missing, the target is not a
+    /// `Page`, or `master_page_id` is not flagged as a master.
+    pub fn apply_master_page(
+        &mut self,
+        content_page_id: Uuid,
+        master_page_id: Uuid,
+    ) -> Result<(), ProjectError> {
+        // Validate master is real and is_master.
+        let master = self
+            .document
+            .get_node(master_page_id)
+            .ok_or(DocumentError::NodeNotFound(master_page_id))?;
+        if !master.is_master_page() {
+            return Err(DocumentError::WrongNodeType {
+                id: master_page_id,
+                expected: NodeType::Page,
+                got: master.node_type,
+            }
+            .into());
+        }
+        let target = self
+            .document
+            .get_node_mut(content_page_id)
+            .ok_or(DocumentError::NodeNotFound(content_page_id))?;
+        if target.node_type != NodeType::Page {
+            return Err(DocumentError::WrongNodeType {
+                id: content_page_id,
+                expected: NodeType::Page,
+                got: target.node_type,
+            }
+            .into());
+        }
+        let mut layout = target.page_layout().unwrap_or_default();
+        layout.master_page_id = Some(master_page_id);
+        target.set_page_layout(&layout);
+        self.touch_modified();
+        Ok(())
+    }
+
+    /// Clear the master page reference on a content page. No-op when
+    /// the page has no layout or no master attached.
+    pub fn detach_master_page(&mut self, content_page_id: Uuid) -> Result<(), ProjectError> {
+        let page = self
+            .document
+            .get_node_mut(content_page_id)
+            .ok_or(DocumentError::NodeNotFound(content_page_id))?;
+        if page.node_type != NodeType::Page {
+            return Err(DocumentError::WrongNodeType {
+                id: content_page_id,
+                expected: NodeType::Page,
+                got: page.node_type,
+            }
+            .into());
+        }
+        if let Some(mut layout) = page.page_layout() {
+            layout.master_page_id = None;
+            page.set_page_layout(&layout);
+            self.touch_modified();
+        }
+        Ok(())
+    }
+
+    /// Resolve the master page id (if any) attached to `page_id`.
+    #[must_use]
+    pub fn resolve_master_page(&self, page_id: Uuid) -> Option<Uuid> {
+        self.document
+            .get_node(page_id)
+            .and_then(Node::page_layout)
+            .and_then(|l| l.master_page_id)
+    }
+
     /// Append `operation` to the log and bump the modified timestamp.
     pub fn execute_operation(&mut self, operation: Operation) {
         self.operation_log.push(operation);
@@ -391,6 +507,311 @@ impl Project {
     }
 }
 
+// ----------------------------------------------------------------------
+// Layout Studio templates (Phase 2)
+// ----------------------------------------------------------------------
+
+/// High-level grouping of [`LayoutTemplate`]s for the template-picker UI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TemplateCategory {
+    PitchDeck,
+    Proposal,
+    Brochure,
+    Flyer,
+    Report,
+    Custom,
+}
+
+/// What a [`TemplateSectionDef`] generates on a page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SectionKind {
+    Title,
+    Subtitle,
+    BodyText,
+    Image,
+    Chart,
+    Footer,
+    PageNumber,
+}
+
+/// A region inside a template page — converted to a real node when
+/// the template is applied.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[allow(clippy::derive_partial_eq_without_eq)]
+pub struct TemplateSectionDef {
+    pub kind: SectionKind,
+    pub bounds: crate::node::Bounds,
+    pub placeholder_text: Option<String>,
+}
+
+/// A page inside a [`LayoutTemplate`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[allow(clippy::derive_partial_eq_without_eq)]
+pub struct TemplatePageDef {
+    pub name: String,
+    pub page_size: crate::node::PageSize,
+    pub orientation: crate::node::PageOrientation,
+    pub sections: Vec<TemplateSectionDef>,
+}
+
+/// A reusable Layout Studio template: deck, proposal, brochure, etc.
+///
+/// Templates ship as built-ins in [`builtin_layout_templates`]; future
+/// versions can persist user-authored templates to disk and merge them.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[allow(clippy::derive_partial_eq_without_eq)]
+pub struct LayoutTemplate {
+    pub id: Uuid,
+    pub name: String,
+    pub description: String,
+    pub category: TemplateCategory,
+    pub pages: Vec<TemplatePageDef>,
+    pub design_tokens: Option<DesignTokens>,
+}
+
+/// Built-in templates: Pitch Deck (16:9), Proposal (A4), Brochure (A4 tri-fold landscape).
+///
+/// Ids are stable across calls so the UI can keep selection state
+/// when re-listing.
+/// Section definitions for a single Pitch-Deck slide — title hero, body
+/// body, page number. Bounds are in document pixels (96 dpi); a 16:9
+/// slide is 960×540 px.
+fn pitch_template_sections(title: &str, body: &str) -> Vec<TemplateSectionDef> {
+    vec![
+        TemplateSectionDef {
+            kind: SectionKind::Title,
+            bounds: crate::node::Bounds::new(60.0, 60.0, 840.0, 80.0),
+            placeholder_text: Some(title.to_string()),
+        },
+        TemplateSectionDef {
+            kind: SectionKind::BodyText,
+            bounds: crate::node::Bounds::new(60.0, 180.0, 840.0, 280.0),
+            placeholder_text: Some(body.to_string()),
+        },
+        TemplateSectionDef {
+            kind: SectionKind::PageNumber,
+            bounds: crate::node::Bounds::new(880.0, 500.0, 60.0, 20.0),
+            placeholder_text: None,
+        },
+    ]
+}
+
+/// Section definitions for a Proposal page — title, body, footer, page
+/// number. A4 portrait is ≈ 794×1123 px @ 96 dpi.
+fn proposal_template_sections(name: &str) -> Vec<TemplateSectionDef> {
+    vec![
+        TemplateSectionDef {
+            kind: SectionKind::Title,
+            bounds: crate::node::Bounds::new(60.0, 80.0, 670.0, 60.0),
+            placeholder_text: Some(name.to_string()),
+        },
+        TemplateSectionDef {
+            kind: SectionKind::BodyText,
+            bounds: crate::node::Bounds::new(60.0, 170.0, 670.0, 880.0),
+            placeholder_text: Some("Body content".to_string()),
+        },
+        TemplateSectionDef {
+            kind: SectionKind::Footer,
+            bounds: crate::node::Bounds::new(60.0, 1080.0, 550.0, 40.0),
+            placeholder_text: Some("Confidential".to_string()),
+        },
+        TemplateSectionDef {
+            kind: SectionKind::PageNumber,
+            bounds: crate::node::Bounds::new(680.0, 1080.0, 50.0, 40.0),
+            placeholder_text: None,
+        },
+    ]
+}
+
+/// Section definitions for a Brochure panel — title, image, body. A4
+/// landscape is ≈ 1123×794 px @ 96 dpi.
+fn brochure_template_sections(name: &str) -> Vec<TemplateSectionDef> {
+    vec![
+        TemplateSectionDef {
+            kind: SectionKind::Title,
+            bounds: crate::node::Bounds::new(50.0, 60.0, 1020.0, 80.0),
+            placeholder_text: Some(name.to_string()),
+        },
+        TemplateSectionDef {
+            kind: SectionKind::Image,
+            bounds: crate::node::Bounds::new(50.0, 180.0, 500.0, 380.0),
+            placeholder_text: None,
+        },
+        TemplateSectionDef {
+            kind: SectionKind::BodyText,
+            bounds: crate::node::Bounds::new(580.0, 180.0, 490.0, 380.0),
+            placeholder_text: Some("Body text".to_string()),
+        },
+    ]
+}
+
+#[must_use]
+pub fn builtin_layout_templates() -> Vec<LayoutTemplate> {
+    let pitch_pages = [
+        ("Cover", "Cover title page"),
+        ("Problem", "Describe the problem"),
+        ("Solution", "Your solution"),
+        ("Market", "Market size & opportunity"),
+        ("Product", "Product overview"),
+        ("Business Model", "How you make money"),
+        ("Team", "Who we are"),
+        ("Ask", "Investment ask"),
+        ("Contact", "Contact details"),
+    ];
+    let proposal_pages = [
+        "Cover",
+        "Executive Summary",
+        "Scope",
+        "Timeline",
+        "Pricing",
+        "Terms",
+        "Contact",
+    ];
+    let brochure_pages = [
+        "Front Panel",
+        "Inside Left",
+        "Inside Center",
+        "Inside Right",
+        "Back Panel",
+        "Mailer Panel",
+    ];
+
+    vec![
+        LayoutTemplate {
+            id: Uuid::parse_str("11111111-1111-4111-8111-111111111111")
+                .expect("static template uuid is valid"),
+            name: "Pitch Deck".to_string(),
+            description: "9-slide investor pitch deck in 16:9.".to_string(),
+            category: TemplateCategory::PitchDeck,
+            pages: pitch_pages
+                .iter()
+                .map(|(name, body)| TemplatePageDef {
+                    name: (*name).to_string(),
+                    page_size: crate::node::PageSize::Presentation16x9,
+                    orientation: crate::node::PageOrientation::Landscape,
+                    sections: pitch_template_sections(name, body),
+                })
+                .collect(),
+            design_tokens: None,
+        },
+        LayoutTemplate {
+            id: Uuid::parse_str("22222222-2222-4222-8222-222222222222")
+                .expect("static template uuid is valid"),
+            name: "Proposal".to_string(),
+            description: "Multi-page proposal in A4 portrait.".to_string(),
+            category: TemplateCategory::Proposal,
+            pages: proposal_pages
+                .iter()
+                .map(|name| TemplatePageDef {
+                    name: (*name).to_string(),
+                    page_size: crate::node::PageSize::A4,
+                    orientation: crate::node::PageOrientation::Portrait,
+                    sections: proposal_template_sections(name),
+                })
+                .collect(),
+            design_tokens: None,
+        },
+        LayoutTemplate {
+            id: Uuid::parse_str("33333333-3333-4333-8333-333333333333")
+                .expect("static template uuid is valid"),
+            name: "Brochure".to_string(),
+            description: "Tri-fold brochure in A4 landscape.".to_string(),
+            category: TemplateCategory::Brochure,
+            pages: brochure_pages
+                .iter()
+                .map(|name| TemplatePageDef {
+                    name: (*name).to_string(),
+                    page_size: crate::node::PageSize::A4,
+                    orientation: crate::node::PageOrientation::Landscape,
+                    sections: brochure_template_sections(name),
+                })
+                .collect(),
+            design_tokens: None,
+        },
+    ]
+}
+
+impl Project {
+    /// Apply a [`LayoutTemplate`] by creating one page per
+    /// [`TemplatePageDef`] (with the template's layout) and one
+    /// artboard child holding placeholder layers for each section.
+    ///
+    /// Returns the new page ids in template order.
+    pub fn apply_layout_template(
+        &mut self,
+        template: &LayoutTemplate,
+    ) -> Result<Vec<Uuid>, ProjectError> {
+        let px_per_mm = 96.0 / 25.4;
+        let mut created = Vec::with_capacity(template.pages.len());
+        for (idx, def) in template.pages.iter().enumerate() {
+            let layout = crate::node::PageLayout {
+                page_size: def.page_size.clone(),
+                orientation: def.orientation,
+                margins: crate::node::Margins::default(),
+                master_page_id: None,
+                page_number: Some(u32::try_from(idx + 1).unwrap_or(u32::MAX)),
+            };
+            let (w_mm, h_mm) = layout.dimensions_mm();
+            let mut page = Node::new(NodeType::Page, def.name.clone());
+            page.bounds = Bounds::new(0.0, 0.0, w_mm * px_per_mm, h_mm * px_per_mm);
+            page.set_page_layout(&layout);
+            let page_id = page.id;
+            self.document.insert_node(page)?;
+
+            // One artboard per page, sized to the page.
+            let mut artboard = Node::new(NodeType::Artboard, format!("{} / Content", def.name));
+            artboard.parent_id = Some(page_id);
+            artboard.bounds = Bounds::new(0.0, 0.0, w_mm * px_per_mm, h_mm * px_per_mm);
+            let artboard_id = self.document.insert_node(artboard)?;
+
+            // Materialise each section as a placeholder node under the artboard.
+            for section in &def.sections {
+                let node_type = match section.kind {
+                    SectionKind::Title
+                    | SectionKind::Subtitle
+                    | SectionKind::BodyText
+                    | SectionKind::Footer
+                    | SectionKind::PageNumber => NodeType::TextLayer,
+                    SectionKind::Image | SectionKind::Chart => NodeType::RasterLayer,
+                };
+                let label = match section.kind {
+                    SectionKind::Title => "Title",
+                    SectionKind::Subtitle => "Subtitle",
+                    SectionKind::BodyText => "Body",
+                    SectionKind::Image => "Image",
+                    SectionKind::Chart => "Chart",
+                    SectionKind::Footer => "Footer",
+                    SectionKind::PageNumber => "Page #",
+                };
+                let mut node = Node::new(node_type, label);
+                node.parent_id = Some(artboard_id);
+                node.bounds = section.bounds;
+                if let Some(text) = &section.placeholder_text {
+                    node.metadata.insert(
+                        "placeholder_text".to_string(),
+                        serde_json::Value::String(text.clone()),
+                    );
+                }
+                node.metadata.insert(
+                    "template_section_kind".to_string(),
+                    serde_json::to_value(section.kind).unwrap_or(serde_json::Value::Null),
+                );
+                self.document.insert_node(node)?;
+            }
+
+            created.push(page_id);
+        }
+
+        if let Some(tokens) = &template.design_tokens {
+            self.design_tokens = tokens.clone();
+        }
+        self.touch_modified();
+        Ok(created)
+    }
+}
+
 /// Built-in export presets a brand-new project starts with. Exposed
 /// via [`Project::install_default_export_presets`]; never called
 /// implicitly because every call generates fresh UUIDs.
@@ -480,6 +901,71 @@ mod tests {
         assert_eq!(kids.len(), 1);
         let art = p.document.get_node(kids[0]).expect("artboard");
         assert_eq!(art.node_type, NodeType::Artboard);
+    }
+
+    #[test]
+    fn create_master_page_and_apply_to_content_page() {
+        let mut p = Project::new("doc");
+        let layout = crate::node::PageLayout::new(
+            crate::node::PageSize::A4,
+            crate::node::PageOrientation::Portrait,
+        );
+        let master = p.create_master_page("Master A", layout).expect("master");
+        let masters = p.list_master_pages();
+        assert_eq!(masters.len(), 1);
+        assert_eq!(masters[0].id, master);
+
+        // Content page lacks layout until we attach.
+        let content = p.add_page("Page 1").expect("content");
+        assert!(p.resolve_master_page(content).is_none());
+        p.apply_master_page(content, master).expect("apply");
+        assert_eq!(p.resolve_master_page(content), Some(master));
+
+        // Detaching clears the master.
+        p.detach_master_page(content).expect("detach");
+        assert!(p.resolve_master_page(content).is_none());
+    }
+
+    #[test]
+    fn apply_master_page_rejects_non_master_target() {
+        let mut p = Project::new("doc");
+        let not_master = p.add_page("Page").expect("page");
+        let content = p.add_page("Other").expect("content");
+        let err = p.apply_master_page(content, not_master).unwrap_err();
+        match err {
+            ProjectError::Document(DocumentError::WrongNodeType { .. }) => {}
+            other => panic!("unexpected: {other}"),
+        }
+    }
+
+    #[test]
+    fn builtin_layout_templates_produce_real_pages() {
+        let templates = builtin_layout_templates();
+        assert_eq!(templates.len(), 3);
+        let pitch = templates
+            .iter()
+            .find(|t| t.category == TemplateCategory::PitchDeck)
+            .expect("pitch deck template exists");
+        assert_eq!(pitch.pages.len(), 9);
+
+        let mut p = Project::new("deck");
+        let pages = p.apply_layout_template(pitch).expect("apply");
+        assert_eq!(pages.len(), 9);
+        // Every created page has a layout in 16:9 landscape.
+        for pid in pages {
+            let page = p.document.get_node(pid).expect("page exists");
+            let layout = page.page_layout().expect("page has layout");
+            assert_eq!(layout.orientation, crate::node::PageOrientation::Landscape);
+            assert_eq!(layout.page_size, crate::node::PageSize::Presentation16x9);
+        }
+    }
+
+    #[test]
+    fn layout_template_round_trip_through_json() {
+        let templates = builtin_layout_templates();
+        let json = serde_json::to_string(&templates).expect("serialize");
+        let back: Vec<LayoutTemplate> = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, templates);
     }
 
     #[test]

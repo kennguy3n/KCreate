@@ -1296,6 +1296,279 @@ pub fn artboard_presets() -> Vec<kcreate_core::ArtboardPreset> {
 }
 
 // -----------------------------------------------------------------------------
+// Prototype interactions (Block A / Phase 1)
+// -----------------------------------------------------------------------------
+
+/// Append an [`kcreate_core::Interaction`] to `node_id`'s metadata.
+///
+/// Returns the new interaction's id. `trigger` is one of `"click"`,
+/// `"hover"`, `"press"`. `action_json` is a serialized
+/// [`kcreate_core::InteractionAction`] (tagged-enum form, e.g.
+/// `{"kind":"navigate_to","target_artboard_id":"…"}`).
+pub fn interaction_add(node_id: Uuid, trigger: &str, action_json: &str) -> Result<Uuid> {
+    let trigger = match trigger {
+        "click" => kcreate_core::InteractionTrigger::Click,
+        "hover" => kcreate_core::InteractionTrigger::Hover,
+        "press" => kcreate_core::InteractionTrigger::Press,
+        other => return Err(DocumentBridgeError::InvalidNodeType(other.to_string())),
+    };
+    let action: kcreate_core::InteractionAction = serde_json::from_str(action_json)?;
+    let interaction = kcreate_core::Interaction::new(trigger, action);
+    let interaction_id = interaction.id;
+    let mut guard = slot().lock();
+    let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
+    let before;
+    let after;
+    {
+        let node = ws
+            .project
+            .document
+            .get_node_mut(node_id)
+            .ok_or(DocumentBridgeError::NodeNotFound(node_id))?;
+        let mut interactions = node.interactions();
+        before = serde_json::to_value(&interactions)?;
+        interactions.push(interaction);
+        node.set_interactions(&interactions);
+        after = serde_json::to_value(&interactions)?;
+    }
+    ws.project.modified_at = Utc::now();
+    let op = Operation::new("user", "interaction_add", before, after, vec![node_id]);
+    ws.project.execute_operation(op);
+    drop(guard);
+    Ok(interaction_id)
+}
+
+/// Remove the interaction with `interaction_id` from `node_id`. Records
+/// an undoable op when an interaction is actually removed; returns
+/// `Ok(false)` if no interaction with that id exists.
+pub fn interaction_remove(node_id: Uuid, interaction_id: Uuid) -> Result<bool> {
+    let mut guard = slot().lock();
+    let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
+    let removed;
+    let before;
+    let after;
+    {
+        let node = ws
+            .project
+            .document
+            .get_node_mut(node_id)
+            .ok_or(DocumentBridgeError::NodeNotFound(node_id))?;
+        let mut interactions = node.interactions();
+        before = serde_json::to_value(&interactions)?;
+        let original = interactions.len();
+        interactions.retain(|i| i.id != interaction_id);
+        removed = interactions.len() < original;
+        if removed {
+            node.set_interactions(&interactions);
+        }
+        after = serde_json::to_value(&interactions)?;
+    }
+    if removed {
+        ws.project.modified_at = Utc::now();
+        let op = Operation::new("user", "interaction_remove", before, after, vec![node_id]);
+        ws.project.execute_operation(op);
+    }
+    drop(guard);
+    Ok(removed)
+}
+
+/// List all interactions stored on `node_id`.
+pub fn interaction_list(node_id: Uuid) -> Result<Vec<kcreate_core::Interaction>> {
+    let guard = slot().lock();
+    let ws = guard.as_ref().ok_or(DocumentBridgeError::NoProject)?;
+    let node = ws
+        .project
+        .document
+        .get_node(node_id)
+        .ok_or(DocumentBridgeError::NodeNotFound(node_id))?;
+    Ok(node.interactions())
+}
+
+// -----------------------------------------------------------------------------
+// Layout Studio: page layout + master pages + templates (Block B / Phase 2)
+// -----------------------------------------------------------------------------
+
+/// Set the [`kcreate_core::PageLayout`] on `page_id`.
+///
+/// `layout_json` is the serialized layout. No-op (but error returned)
+/// if the node is not a `Page`.
+pub fn page_set_layout(page_id: Uuid, layout_json: &str) -> Result<()> {
+    let layout: kcreate_core::PageLayout = serde_json::from_str(layout_json)?;
+    let mut guard = slot().lock();
+    let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
+    let before;
+    let after;
+    {
+        let node = ws
+            .project
+            .document
+            .get_node_mut(page_id)
+            .ok_or(DocumentBridgeError::NodeNotFound(page_id))?;
+        if node.node_type != kcreate_core::NodeType::Page {
+            return Err(DocumentBridgeError::WrongComponentNodeType(node.node_type));
+        }
+        before = node.page_layout().map_or(serde_json::Value::Null, |l| {
+            serde_json::to_value(&l).unwrap_or(serde_json::Value::Null)
+        });
+        node.set_page_layout(&layout);
+        after = serde_json::to_value(&layout)?;
+    }
+    ws.project.modified_at = Utc::now();
+    let op = Operation::new("user", "page_set_layout", before, after, vec![page_id]);
+    ws.project.execute_operation(op);
+    drop(guard);
+    Ok(())
+}
+
+/// Read the [`kcreate_core::PageLayout`] stored on `page_id`, if any.
+pub fn page_get_layout(page_id: Uuid) -> Result<Option<kcreate_core::PageLayout>> {
+    let guard = slot().lock();
+    let ws = guard.as_ref().ok_or(DocumentBridgeError::NoProject)?;
+    let node = ws
+        .project
+        .document
+        .get_node(page_id)
+        .ok_or(DocumentBridgeError::NodeNotFound(page_id))?;
+    Ok(node.page_layout())
+}
+
+/// Wire-format payload returned by [`master_page_list`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MasterPageInfo {
+    pub id: Uuid,
+    pub name: String,
+    pub layout: Option<kcreate_core::PageLayout>,
+}
+
+/// Create a new master page. Records an undoable op. `size` is a
+/// lowercase variant tag (e.g. `"a4"`); `orientation` is `"portrait"`
+/// or `"landscape"`.
+pub fn master_page_create(name: String, size: &str, orientation: &str) -> Result<Uuid> {
+    let page_size = parse_page_size(size)?;
+    let orientation = match orientation {
+        "portrait" => kcreate_core::PageOrientation::Portrait,
+        "landscape" => kcreate_core::PageOrientation::Landscape,
+        other => return Err(DocumentBridgeError::InvalidNodeType(other.to_string())),
+    };
+    let layout = kcreate_core::PageLayout::new(page_size, orientation);
+    let mut guard = slot().lock();
+    let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
+    let id = ws.project.create_master_page(name, layout)?;
+    let snapshot = ws
+        .project
+        .document
+        .get_node(id)
+        .map_or(serde_json::Value::Null, |n| {
+            serde_json::to_value(n).unwrap_or(serde_json::Value::Null)
+        });
+    let op = Operation::new(
+        "user",
+        "master_page_create",
+        serde_json::Value::Null,
+        snapshot,
+        vec![id],
+    );
+    ws.project.execute_operation(op);
+    drop(guard);
+    Ok(id)
+}
+
+fn parse_page_size(s: &str) -> Result<kcreate_core::PageSize> {
+    Ok(match s {
+        "a3" => kcreate_core::PageSize::A3,
+        "a4" => kcreate_core::PageSize::A4,
+        "a5" => kcreate_core::PageSize::A5,
+        "letter" => kcreate_core::PageSize::Letter,
+        "legal" => kcreate_core::PageSize::Legal,
+        "tabloid" => kcreate_core::PageSize::Tabloid,
+        "presentation_16x9" | "presentation16x9" => kcreate_core::PageSize::Presentation16x9,
+        "presentation_4x3" | "presentation4x3" => kcreate_core::PageSize::Presentation4x3,
+        other => return Err(DocumentBridgeError::InvalidNodeType(other.to_string())),
+    })
+}
+
+/// List all master pages in the open project, sorted by name.
+pub fn master_page_list() -> Result<Vec<MasterPageInfo>> {
+    let guard = slot().lock();
+    let ws = guard.as_ref().ok_or(DocumentBridgeError::NoProject)?;
+    let masters = ws.project.list_master_pages();
+    Ok(masters
+        .into_iter()
+        .map(|n| MasterPageInfo {
+            id: n.id,
+            name: n.name.clone(),
+            layout: n.page_layout(),
+        })
+        .collect())
+}
+
+/// Attach `master_page_id` to a content page.
+pub fn master_page_apply(content_page_id: Uuid, master_page_id: Uuid) -> Result<()> {
+    let mut guard = slot().lock();
+    let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
+    ws.project
+        .apply_master_page(content_page_id, master_page_id)?;
+    let op = Operation::new(
+        "user",
+        "master_page_apply",
+        serde_json::to_value(content_page_id)?,
+        serde_json::to_value(master_page_id)?,
+        vec![content_page_id],
+    );
+    ws.project.execute_operation(op);
+    drop(guard);
+    Ok(())
+}
+
+/// Detach the master page reference from `content_page_id`.
+pub fn master_page_detach(content_page_id: Uuid) -> Result<()> {
+    let mut guard = slot().lock();
+    let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
+    ws.project.detach_master_page(content_page_id)?;
+    let op = Operation::new(
+        "user",
+        "master_page_detach",
+        serde_json::Value::Null,
+        serde_json::Value::Null,
+        vec![content_page_id],
+    );
+    ws.project.execute_operation(op);
+    drop(guard);
+    Ok(())
+}
+
+/// Return the catalog of built-in [`kcreate_core::LayoutTemplate`]s.
+pub fn layout_template_list() -> Vec<kcreate_core::LayoutTemplate> {
+    kcreate_core::builtin_layout_templates()
+}
+
+/// Apply a built-in template to the open project.
+///
+/// Returns the new page ids in template order. Records an undoable op.
+pub fn layout_template_apply(template_id: Uuid) -> Result<Vec<Uuid>> {
+    let templates = kcreate_core::builtin_layout_templates();
+    let template = templates
+        .into_iter()
+        .find(|t| t.id == template_id)
+        .ok_or_else(|| DocumentBridgeError::InvalidNodeType(template_id.to_string()))?;
+    let mut guard = slot().lock();
+    let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
+    let created = ws.project.apply_layout_template(&template)?;
+    let op = Operation::new(
+        "user",
+        "layout_template_apply",
+        serde_json::to_value(template_id)?,
+        serde_json::to_value(&created)?,
+        created.clone(),
+    );
+    ws.project.execute_operation(op);
+    let _ = sync_scene_locked(&mut guard);
+    drop(guard);
+    Ok(created)
+}
+
+// -----------------------------------------------------------------------------
 // Components
 // -----------------------------------------------------------------------------
 
@@ -3930,5 +4203,179 @@ mod tests {
         reset_for_tests();
         let err = document_serialise_for_ai().expect_err("no project");
         assert!(matches!(err, DocumentBridgeError::NoProject));
+    }
+
+    // ---- Prototype interaction bridge tests (Block A) ----
+
+    #[test]
+    #[serial]
+    fn interaction_add_list_remove_round_trip() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("proto", dir.path()).expect("create");
+        let tree = document_get_tree().expect("tree");
+        let page_id = tree[0].id;
+
+        // Empty list initially.
+        let empty = interaction_list(page_id).expect("list");
+        assert!(empty.is_empty());
+
+        // Add a NavigateTo interaction.
+        let target = Uuid::new_v4();
+        let action = serde_json::json!({
+            "kind": "navigate_to",
+            "target_artboard_id": target,
+        });
+        let iid = interaction_add(page_id, "click", &action.to_string()).expect("add");
+
+        let listed = interaction_list(page_id).expect("list 2");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, iid);
+        assert_eq!(listed[0].trigger, kcreate_core::InteractionTrigger::Click);
+
+        // Remove + relist.
+        let removed = interaction_remove(page_id, iid).expect("remove");
+        assert!(removed);
+        let after = interaction_list(page_id).expect("list 3");
+        assert!(after.is_empty());
+
+        // Removing again is a no-op false.
+        assert!(!interaction_remove(page_id, iid).expect("remove again"));
+        project_close();
+    }
+
+    #[test]
+    #[serial]
+    fn interaction_add_rejects_unknown_trigger() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("proto2", dir.path()).expect("create");
+        let page_id = document_get_tree().expect("tree")[0].id;
+        let action = serde_json::json!({"kind": "back"}).to_string();
+        let err = interaction_add(page_id, "long_press", &action).expect_err("unknown");
+        assert!(matches!(err, DocumentBridgeError::InvalidNodeType(_)));
+        project_close();
+    }
+
+    #[test]
+    #[serial]
+    fn interaction_remove_unknown_node_errors() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("proto3", dir.path()).expect("create");
+        let bogus = Uuid::new_v4();
+        let err = interaction_remove(bogus, Uuid::new_v4()).expect_err("no node");
+        assert!(matches!(err, DocumentBridgeError::NodeNotFound(_)));
+        project_close();
+    }
+
+    // ---- Page layout / master page / template bridge tests (Block B) ----
+
+    #[test]
+    #[serial]
+    fn page_set_and_get_layout_round_trip() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("pg", dir.path()).expect("create");
+        let page_id = document_get_tree().expect("tree")[0].id;
+        let layout = kcreate_core::PageLayout::new(
+            kcreate_core::PageSize::A4,
+            kcreate_core::PageOrientation::Portrait,
+        );
+        let json = serde_json::to_string(&layout).expect("serialize");
+        page_set_layout(page_id, &json).expect("set");
+        let got = page_get_layout(page_id).expect("get").expect("present");
+        assert_eq!(got, layout);
+        project_close();
+    }
+
+    #[test]
+    #[serial]
+    fn page_set_layout_rejects_non_page_nodes() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("pg2", dir.path()).expect("create");
+        let rect = canvas_create_rect(None, 0.0, 0.0, 10.0, 10.0).expect("rect");
+        let layout = kcreate_core::PageLayout::new(
+            kcreate_core::PageSize::A4,
+            kcreate_core::PageOrientation::Portrait,
+        );
+        let err =
+            page_set_layout(rect, &serde_json::to_string(&layout).unwrap()).expect_err("rect");
+        assert!(matches!(
+            err,
+            DocumentBridgeError::WrongComponentNodeType(_)
+        ));
+        project_close();
+    }
+
+    #[test]
+    #[serial]
+    fn master_page_create_list_apply_detach_round_trip() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("master", dir.path()).expect("create");
+        let content_page = document_get_tree().expect("tree")[0].id;
+
+        let master = master_page_create("Master A".into(), "a4", "portrait").expect("create");
+
+        let masters = master_page_list().expect("list");
+        assert_eq!(masters.len(), 1);
+        assert_eq!(masters[0].id, master);
+        assert_eq!(masters[0].name, "Master A");
+
+        master_page_apply(content_page, master).expect("apply");
+        let layout = page_get_layout(content_page)
+            .expect("get layout")
+            .expect("present");
+        assert_eq!(layout.master_page_id, Some(master));
+
+        master_page_detach(content_page).expect("detach");
+        let layout = page_get_layout(content_page)
+            .expect("get layout 2")
+            .expect("present");
+        assert!(layout.master_page_id.is_none());
+        project_close();
+    }
+
+    #[test]
+    #[serial]
+    fn master_page_create_rejects_unknown_size() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("m2", dir.path()).expect("create");
+        let err = master_page_create("bad".into(), "bogus", "portrait").expect_err("unknown size");
+        assert!(matches!(err, DocumentBridgeError::InvalidNodeType(_)));
+        project_close();
+    }
+
+    #[test]
+    #[serial]
+    fn layout_template_list_and_apply_create_pages() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("tpl", dir.path()).expect("create");
+        let templates = layout_template_list();
+        assert_eq!(templates.len(), 3);
+        let pitch = templates
+            .iter()
+            .find(|t| t.category == kcreate_core::TemplateCategory::PitchDeck)
+            .expect("pitch");
+        let created = layout_template_apply(pitch.id).expect("apply");
+        assert_eq!(created.len(), pitch.pages.len());
+        // Each created page is undoable.
+        assert!(document_undo().expect("undo").is_some());
+        project_close();
+    }
+
+    #[test]
+    #[serial]
+    fn layout_template_apply_rejects_unknown_id() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("tpl2", dir.path()).expect("create");
+        let err = layout_template_apply(Uuid::nil()).expect_err("unknown");
+        assert!(matches!(err, DocumentBridgeError::InvalidNodeType(_)));
+        project_close();
     }
 }

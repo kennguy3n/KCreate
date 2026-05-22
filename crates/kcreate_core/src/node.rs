@@ -538,6 +538,203 @@ pub struct Constraints {
     pub vertical: Constraint,
 }
 
+/// Metadata key used on a node to store its prototype interactions
+/// (serialized `Vec<Interaction>`). See [`Interaction`].
+pub const INTERACTIONS_METADATA_KEY: &str = "interactions";
+
+/// Metadata key used on a `Page` node to store its [`PageLayout`].
+pub const PAGE_LAYOUT_METADATA_KEY: &str = "page_layout";
+
+/// Metadata key used on a `Page` node to mark it as a *master page*
+/// (template inherited by content pages).
+pub const MASTER_PAGE_METADATA_KEY: &str = "is_master";
+
+/// What triggers an [`Interaction`] in prototype playback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InteractionTrigger {
+    /// Mouse / touch click.
+    Click,
+    /// Pointer hover (no click).
+    Hover,
+    /// Mouse button held down (or long-press on touch).
+    Press,
+}
+
+/// What an [`Interaction`] does when its trigger fires.
+///
+/// All fields use `Uuid` so the action can be serialised intact even
+/// when the target node has not yet been resolved by the player.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum InteractionAction {
+    /// Navigate the prototype player to a specific artboard.
+    NavigateTo { target_artboard_id: Uuid },
+    /// Scroll the canvas so `target_node_id` is in view.
+    ScrollTo { target_node_id: Uuid },
+    /// Open an artboard as an overlay above the current artboard.
+    OpenOverlay { overlay_artboard_id: Uuid },
+    /// Close the topmost overlay (no target).
+    CloseOverlay,
+    /// Step one navigation entry back in the player's history.
+    Back,
+}
+
+/// A prototype interaction bound to a [`Node`].
+///
+/// Persisted as a JSON array under
+/// [`INTERACTIONS_METADATA_KEY`] in `Node::metadata`. The renderer
+/// ignores interactions; only the prototype player reads them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Interaction {
+    pub id: Uuid,
+    pub trigger: InteractionTrigger,
+    pub action: InteractionAction,
+}
+
+impl Interaction {
+    #[must_use]
+    pub fn new(trigger: InteractionTrigger, action: InteractionAction) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            trigger,
+            action,
+        }
+    }
+}
+
+/// Print/canvas page sizes used by Layout Studio.
+///
+/// Dimensions for the predefined variants are returned in **mm**
+/// portrait orientation by [`PageSize::dimensions_mm`]. Apply
+/// [`PageOrientation::Landscape`] to swap.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[allow(clippy::derive_partial_eq_without_eq)] // contains f64 in Custom
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PageSize {
+    A4,
+    A3,
+    A5,
+    Letter,
+    Legal,
+    Tabloid,
+    /// 16:9 presentation slide (10×5.625 in @ 72dpi → 254×142.875 mm).
+    Presentation16x9,
+    /// 4:3 presentation slide (10×7.5 in → 254×190.5 mm).
+    Presentation4x3,
+    /// Caller-supplied size in mm.
+    Custom {
+        width_mm: f64,
+        height_mm: f64,
+    },
+}
+
+impl PageSize {
+    /// Portrait `(width_mm, height_mm)`.
+    ///
+    /// ISO 216 sizes follow the official millimetre dimensions
+    /// (A4 = 210×297). North-American sizes are converted from
+    /// inches at exactly 25.4 mm/in to avoid floating-point drift.
+    #[must_use]
+    pub fn dimensions_mm(&self) -> (f64, f64) {
+        match self {
+            Self::A3 => (297.0, 420.0),
+            Self::A4 => (210.0, 297.0),
+            Self::A5 => (148.0, 210.0),
+            Self::Letter => (8.5 * 25.4, 11.0 * 25.4),
+            Self::Legal => (8.5 * 25.4, 14.0 * 25.4),
+            Self::Tabloid => (11.0 * 25.4, 17.0 * 25.4),
+            Self::Presentation16x9 => (10.0 * 25.4, 5.625 * 25.4),
+            Self::Presentation4x3 => (10.0 * 25.4, 7.5 * 25.4),
+            Self::Custom {
+                width_mm,
+                height_mm,
+            } => (*width_mm, *height_mm),
+        }
+    }
+}
+
+/// Orientation of a [`PageLayout`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PageOrientation {
+    #[default]
+    Portrait,
+    Landscape,
+}
+
+/// Page margins in millimetres.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[allow(clippy::derive_partial_eq_without_eq)]
+pub struct Margins {
+    pub top_mm: f64,
+    pub right_mm: f64,
+    pub bottom_mm: f64,
+    pub left_mm: f64,
+}
+
+impl Margins {
+    #[must_use]
+    pub const fn uniform(mm: f64) -> Self {
+        Self {
+            top_mm: mm,
+            right_mm: mm,
+            bottom_mm: mm,
+            left_mm: mm,
+        }
+    }
+}
+
+impl Default for Margins {
+    fn default() -> Self {
+        Self::uniform(0.0)
+    }
+}
+
+/// Layout metadata for a `Page` node — size, orientation, margins,
+/// optional master-page reference, optional page number.
+///
+/// Persisted on `Page::metadata` under [`PAGE_LAYOUT_METADATA_KEY`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[allow(clippy::derive_partial_eq_without_eq)]
+pub struct PageLayout {
+    pub page_size: PageSize,
+    pub orientation: PageOrientation,
+    pub margins: Margins,
+    pub master_page_id: Option<Uuid>,
+    pub page_number: Option<u32>,
+}
+
+impl PageLayout {
+    /// New layout with no master, no page number, zero margins.
+    #[must_use]
+    pub fn new(page_size: PageSize, orientation: PageOrientation) -> Self {
+        Self {
+            page_size,
+            orientation,
+            margins: Margins::default(),
+            master_page_id: None,
+            page_number: None,
+        }
+    }
+
+    /// `(width_mm, height_mm)` after orientation is applied.
+    #[must_use]
+    pub fn dimensions_mm(&self) -> (f64, f64) {
+        let (w, h) = self.page_size.dimensions_mm();
+        match self.orientation {
+            PageOrientation::Portrait => (w, h),
+            PageOrientation::Landscape => (h, w),
+        }
+    }
+}
+
+impl Default for PageLayout {
+    fn default() -> Self {
+        Self::new(PageSize::A4, PageOrientation::Portrait)
+    }
+}
+
 /// A node in the document graph.
 ///
 /// Fields are flat (no recursive `Vec<Node>`); the parent/child
@@ -598,6 +795,74 @@ impl Node {
     pub fn touch(&mut self) {
         self.version += 1;
         self.updated_at = Utc::now();
+    }
+
+    /// Decode the node's stored interactions (Block A / prototype mode).
+    ///
+    /// Returns an empty `Vec` when the metadata key is absent or the
+    /// payload is malformed — readers always get a usable list, and
+    /// the renderer never crashes on partial data.
+    #[must_use]
+    pub fn interactions(&self) -> Vec<Interaction> {
+        self.metadata
+            .get(INTERACTIONS_METADATA_KEY)
+            .and_then(|v| serde_json::from_value::<Vec<Interaction>>(v.clone()).ok())
+            .unwrap_or_default()
+    }
+
+    /// Replace the node's interactions metadata. Touches the node.
+    pub fn set_interactions(&mut self, interactions: &[Interaction]) {
+        let value = serde_json::to_value(interactions).unwrap_or(serde_json::Value::Null);
+        self.metadata
+            .insert(INTERACTIONS_METADATA_KEY.to_string(), value);
+        self.touch();
+    }
+
+    /// Decode the node's [`PageLayout`] metadata. Returns `None` when
+    /// the node is not a `Page` or has no layout attached.
+    #[must_use]
+    pub fn page_layout(&self) -> Option<PageLayout> {
+        if self.node_type != NodeType::Page {
+            return None;
+        }
+        self.metadata
+            .get(PAGE_LAYOUT_METADATA_KEY)
+            .and_then(|v| serde_json::from_value::<PageLayout>(v.clone()).ok())
+    }
+
+    /// Persist a [`PageLayout`] onto a `Page` node. No-op on other
+    /// node types.
+    pub fn set_page_layout(&mut self, layout: &PageLayout) {
+        if self.node_type != NodeType::Page {
+            return;
+        }
+        let value = serde_json::to_value(layout).unwrap_or(serde_json::Value::Null);
+        self.metadata
+            .insert(PAGE_LAYOUT_METADATA_KEY.to_string(), value);
+        self.touch();
+    }
+
+    /// True when this node is a master page (template).
+    #[must_use]
+    pub fn is_master_page(&self) -> bool {
+        self.node_type == NodeType::Page
+            && self
+                .metadata
+                .get(MASTER_PAGE_METADATA_KEY)
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+    }
+
+    /// Flag this `Page` as a master page. No-op on other node types.
+    pub fn set_master_page(&mut self, master: bool) {
+        if self.node_type != NodeType::Page {
+            return;
+        }
+        self.metadata.insert(
+            MASTER_PAGE_METADATA_KEY.to_string(),
+            serde_json::Value::Bool(master),
+        );
+        self.touch();
     }
 }
 
@@ -850,5 +1115,123 @@ mod tests {
     fn preset_category_serializes_snake_case() {
         let s = serde_json::to_string(&PresetCategory::WebDesktop).expect("serialize");
         assert_eq!(s, r#""web_desktop""#);
+    }
+
+    #[test]
+    fn page_size_dimensions_match_iso_216() {
+        assert_eq!(PageSize::A4.dimensions_mm(), (210.0, 297.0));
+        assert_eq!(PageSize::A3.dimensions_mm(), (297.0, 420.0));
+        assert_eq!(PageSize::A5.dimensions_mm(), (148.0, 210.0));
+    }
+
+    #[test]
+    fn page_size_dimensions_match_us() {
+        let (w, h) = PageSize::Letter.dimensions_mm();
+        assert!((w - 215.9).abs() < 1e-6, "Letter width = {w}");
+        assert!((h - 279.4).abs() < 1e-6, "Letter height = {h}");
+        let (lw, lh) = PageSize::Legal.dimensions_mm();
+        assert!((lw - 215.9).abs() < 1e-6);
+        assert!((lh - 355.6).abs() < 1e-6);
+    }
+
+    #[test]
+    fn page_size_custom_round_trip() {
+        let s = PageSize::Custom {
+            width_mm: 100.0,
+            height_mm: 200.0,
+        };
+        assert_eq!(s.dimensions_mm(), (100.0, 200.0));
+        let json = serde_json::to_string(&s).expect("serialize");
+        let back: PageSize = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, s);
+    }
+
+    #[test]
+    fn page_layout_landscape_flips_dimensions() {
+        let portrait = PageLayout::new(PageSize::A4, PageOrientation::Portrait);
+        assert_eq!(portrait.dimensions_mm(), (210.0, 297.0));
+        let landscape = PageLayout::new(PageSize::A4, PageOrientation::Landscape);
+        assert_eq!(landscape.dimensions_mm(), (297.0, 210.0));
+    }
+
+    #[test]
+    fn page_layout_round_trips_through_json() {
+        let layout = PageLayout {
+            page_size: PageSize::Letter,
+            orientation: PageOrientation::Landscape,
+            margins: Margins::uniform(20.0),
+            master_page_id: Some(Uuid::new_v4()),
+            page_number: Some(3),
+        };
+        let json = serde_json::to_string(&layout).expect("serialize");
+        let back: PageLayout = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, layout);
+    }
+
+    #[test]
+    fn node_page_layout_round_trip_via_metadata() {
+        let mut page = Node::new(NodeType::Page, "Page 1");
+        assert!(page.page_layout().is_none());
+        let layout = PageLayout::new(PageSize::A4, PageOrientation::Portrait);
+        page.set_page_layout(&layout);
+        assert_eq!(page.page_layout(), Some(layout));
+        // On non-Page nodes, set/get are no-ops.
+        let mut layer = Node::new(NodeType::VectorLayer, "Path");
+        layer.set_page_layout(&PageLayout::default());
+        assert!(layer.page_layout().is_none());
+    }
+
+    #[test]
+    fn node_master_page_flag_round_trip() {
+        let mut page = Node::new(NodeType::Page, "Master");
+        assert!(!page.is_master_page());
+        page.set_master_page(true);
+        assert!(page.is_master_page());
+        page.set_master_page(false);
+        assert!(!page.is_master_page());
+    }
+
+    #[test]
+    fn interaction_round_trips_through_json() {
+        let interaction = Interaction::new(
+            InteractionTrigger::Click,
+            InteractionAction::NavigateTo {
+                target_artboard_id: Uuid::new_v4(),
+            },
+        );
+        let json = serde_json::to_string(&interaction).expect("serialize");
+        let back: Interaction = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, interaction);
+    }
+
+    #[test]
+    fn node_interactions_round_trip_via_metadata() {
+        let mut node = Node::new(NodeType::VectorLayer, "Button");
+        assert!(node.interactions().is_empty());
+        let interactions = vec![
+            Interaction::new(
+                InteractionTrigger::Click,
+                InteractionAction::NavigateTo {
+                    target_artboard_id: Uuid::new_v4(),
+                },
+            ),
+            Interaction::new(InteractionTrigger::Hover, InteractionAction::Back),
+        ];
+        node.set_interactions(&interactions);
+        assert_eq!(node.interactions(), interactions);
+    }
+
+    #[test]
+    fn interaction_action_close_overlay_has_no_target() {
+        let action = InteractionAction::CloseOverlay;
+        let json = serde_json::to_string(&action).expect("serialize");
+        // Must not silently emit a target_artboard_id or similar; only `kind`.
+        assert_eq!(json, r#"{"kind":"close_overlay"}"#);
+    }
+
+    #[test]
+    fn page_orientation_serializes_snake_case() {
+        let s = serde_json::to_string(&PageOrientation::Landscape).expect("serialize");
+        assert_eq!(s, r#""landscape""#);
     }
 }

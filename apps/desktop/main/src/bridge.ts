@@ -220,6 +220,29 @@ export interface Bridge {
   layoutSetGrid(nodeId: string, layoutJson: string): void;
   layoutRecompute(nodeId: string): void;
   layoutConvertToFrame(nodeId: string): void;
+
+  // Prototype interactions (Phase 1, Block A)
+  interactionAdd(
+    nodeId: string,
+    trigger: string,
+    actionJson: string,
+  ): string;
+  interactionRemove(nodeId: string, interactionId: string): boolean;
+  interactionList(nodeId: string): string;
+
+  // Layout Studio (Phase 2, Block B)
+  pageSetLayout(pageId: string, layoutJson: string): void;
+  pageGetLayout(pageId: string): string;
+  masterPageCreate(
+    name: string,
+    size: string,
+    orientation: string,
+  ): string;
+  masterPageList(): string;
+  masterPageApply(contentPageId: string, masterPageId: string): void;
+  masterPageDetach(contentPageId: string): void;
+  layoutTemplateList(): string;
+  layoutTemplateApply(templateId: string): string;
 }
 
 function bridgeBinaryPath(): string {

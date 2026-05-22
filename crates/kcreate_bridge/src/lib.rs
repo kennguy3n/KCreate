@@ -1238,3 +1238,111 @@ pub fn layout_convert_to_frame(node_id: String) -> NapiResult<()> {
     let nid = parse_uuid(&node_id)?;
     document::layout_convert_to_frame(nid).map_err(map_doc_err)
 }
+
+// -----------------------------------------------------------------------------
+// Prototype interactions (Block A)
+// -----------------------------------------------------------------------------
+
+/// Add an interaction to a node. Returns the new interaction's id.
+/// `trigger` is `"click"` / `"hover"` / `"press"`; `action_json` is a
+/// serialised [`kcreate_core::InteractionAction`].
+#[napi]
+pub fn interaction_add(
+    node_id: String,
+    trigger: String,
+    action_json: String,
+) -> NapiResult<String> {
+    let nid = parse_uuid(&node_id)?;
+    document::interaction_add(nid, &trigger, &action_json)
+        .map(|id| id.to_string())
+        .map_err(map_doc_err)
+}
+
+/// Remove an interaction from a node. Returns `true` when an
+/// interaction with the given id was removed.
+#[napi]
+pub fn interaction_remove(node_id: String, interaction_id: String) -> NapiResult<bool> {
+    let nid = parse_uuid(&node_id)?;
+    let iid = parse_uuid(&interaction_id)?;
+    document::interaction_remove(nid, iid).map_err(map_doc_err)
+}
+
+/// List interactions on a node. Returns a JSON array of [`kcreate_core::Interaction`].
+#[napi]
+pub fn interaction_list(node_id: String) -> NapiResult<String> {
+    let nid = parse_uuid(&node_id)?;
+    let list = document::interaction_list(nid).map_err(map_doc_err)?;
+    serde_json::to_string(&list).map_err(|e| NapiError::from_reason(e.to_string()))
+}
+
+// -----------------------------------------------------------------------------
+// Layout Studio (Block B): page layout, master pages, templates
+// -----------------------------------------------------------------------------
+
+/// Write the `PageLayout` JSON onto a Page node.
+#[napi]
+pub fn page_set_layout(page_id: String, layout_json: String) -> NapiResult<()> {
+    let pid = parse_uuid(&page_id)?;
+    document::page_set_layout(pid, &layout_json).map_err(map_doc_err)
+}
+
+/// Read the `PageLayout` JSON on a Page node. Returns the empty string
+/// when no layout is attached.
+#[napi]
+pub fn page_get_layout(page_id: String) -> NapiResult<String> {
+    let pid = parse_uuid(&page_id)?;
+    let layout = document::page_get_layout(pid).map_err(map_doc_err)?;
+    match layout {
+        Some(l) => serde_json::to_string(&l).map_err(|e| NapiError::from_reason(e.to_string())),
+        None => Ok(String::new()),
+    }
+}
+
+/// Create a new master page. `size` ∈ {a3, a4, a5, letter, legal,
+/// tabloid, presentation_16x9, presentation_4x3}. `orientation` ∈
+/// {portrait, landscape}. Returns the new page id.
+#[napi]
+pub fn master_page_create(name: String, size: String, orientation: String) -> NapiResult<String> {
+    document::master_page_create(name, &size, &orientation)
+        .map(|id| id.to_string())
+        .map_err(map_doc_err)
+}
+
+/// List every master page as a JSON array.
+#[napi]
+pub fn master_page_list() -> NapiResult<String> {
+    let list = document::master_page_list().map_err(map_doc_err)?;
+    serde_json::to_string(&list).map_err(|e| NapiError::from_reason(e.to_string()))
+}
+
+/// Attach a master to a content page.
+#[napi]
+pub fn master_page_apply(content_page_id: String, master_page_id: String) -> NapiResult<()> {
+    let cid = parse_uuid(&content_page_id)?;
+    let mid = parse_uuid(&master_page_id)?;
+    document::master_page_apply(cid, mid).map_err(map_doc_err)
+}
+
+/// Clear the master reference on a content page.
+#[napi]
+pub fn master_page_detach(content_page_id: String) -> NapiResult<()> {
+    let cid = parse_uuid(&content_page_id)?;
+    document::master_page_detach(cid).map_err(map_doc_err)
+}
+
+/// Return the built-in layout-template catalog as a JSON array.
+#[napi]
+pub fn layout_template_list() -> NapiResult<String> {
+    let templates = document::layout_template_list();
+    serde_json::to_string(&templates).map_err(|e| NapiError::from_reason(e.to_string()))
+}
+
+/// Apply a built-in template by id. Returns a JSON array of created
+/// page uuids.
+#[napi]
+pub fn layout_template_apply(template_id: String) -> NapiResult<String> {
+    let tid = parse_uuid(&template_id)?;
+    let ids = document::layout_template_apply(tid).map_err(map_doc_err)?;
+    let strs: Vec<String> = ids.into_iter().map(|i| i.to_string()).collect();
+    serde_json::to_string(&strs).map_err(|e| NapiError::from_reason(e.to_string()))
+}

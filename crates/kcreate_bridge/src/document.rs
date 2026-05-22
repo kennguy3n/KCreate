@@ -1417,6 +1417,30 @@ pub fn interaction_list(node_id: Uuid) -> Result<Vec<kcreate_core::Interaction>>
     Ok(node.interactions())
 }
 
+/// Batched [`interaction_list`] taking many node ids in one IPC round
+/// trip. The result is a map keyed by node id (string) with the same
+/// shape `interaction_list` would have returned for each. Unknown ids
+/// are silently skipped so a partial selection (e.g. just-deleted
+/// node) doesn't cause a whole-batch failure. Used by the prototype
+/// player to gather hotspots without doing N sequential round trips
+/// (Devin Review ANALYSIS-0003).
+pub fn interaction_list_batch(
+    node_ids: &[Uuid],
+) -> Result<std::collections::HashMap<Uuid, Vec<kcreate_core::Interaction>>> {
+    let guard = slot().lock();
+    let ws = guard.as_ref().ok_or(DocumentBridgeError::NoProject)?;
+    let mut out = std::collections::HashMap::with_capacity(node_ids.len());
+    for id in node_ids {
+        if let Some(node) = ws.project.document.get_node(*id) {
+            let v = node.interactions();
+            if !v.is_empty() {
+                out.insert(*id, v);
+            }
+        }
+    }
+    Ok(out)
+}
+
 // -----------------------------------------------------------------------------
 // Layout Studio: page layout + master pages + templates (Block B / Phase 2)
 // -----------------------------------------------------------------------------
@@ -1646,6 +1670,169 @@ pub fn layout_template_apply(template_id: Uuid) -> Result<Vec<Uuid>> {
     let _ = sync_scene_locked(&mut guard);
     drop(guard);
     Ok(created)
+}
+
+/// Add a new content page (with one default artboard) and return the
+/// new page id. Records an undoable `page_add` op.
+///
+/// Optional `size` / `orientation` set the initial page layout. When
+/// omitted, the page is created at the workspace default (A4 portrait,
+/// matching `Project::add_page`).
+pub fn page_add(
+    name: String,
+    size: Option<&str>,
+    orientation: Option<&str>,
+) -> Result<Uuid> {
+    let mut guard = slot().lock();
+    let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
+    let page_id = ws.project.add_page(name)?;
+    // Apply page layout if the caller supplied one. This must happen
+    // *after* `add_page` because `add_page` creates the artboard
+    // child whose default bounds depend on the page's bounds (not the
+    // other way around). Setting the layout now resizes the page
+    // bounds to the requested page size; the artboard inside keeps
+    // its 1920x1080 default until the user resizes it.
+    if let (Some(size_tag), Some(orientation_tag)) = (size, orientation) {
+        let layout = kcreate_core::PageLayout::new(
+            parse_page_size(size_tag)?,
+            match orientation_tag {
+                "portrait" => kcreate_core::PageOrientation::Portrait,
+                "landscape" => kcreate_core::PageOrientation::Landscape,
+                other => return Err(DocumentBridgeError::InvalidNodeType(other.to_string())),
+            },
+        );
+        if let Some(node) = ws.project.document.get_node_mut(page_id) {
+            let (w_mm, h_mm) = layout.dimensions_mm();
+            let px_per_mm = 96.0 / 25.4;
+            node.bounds = kcreate_core::node::Bounds::new(
+                0.0,
+                0.0,
+                w_mm * px_per_mm,
+                h_mm * px_per_mm,
+            );
+            node.set_page_layout(&layout);
+        }
+    }
+    let snapshot = ws
+        .project
+        .document
+        .get_node(page_id)
+        .map_or(serde_json::Value::Null, |n| {
+            serde_json::to_value(n).unwrap_or(serde_json::Value::Null)
+        });
+    let op = Operation::new(
+        "user",
+        "page_add",
+        serde_json::Value::Null,
+        snapshot,
+        vec![page_id],
+    );
+    ws.project.execute_operation(op);
+    ws.project.modified_at = Utc::now();
+    let _ = sync_scene_locked(&mut guard);
+    drop(guard);
+    Ok(page_id)
+}
+
+/// Duplicate an existing page (and its artboards / layers) at the
+/// document root. Returns the new page id. Records an undoable
+/// `page_duplicate` op.
+pub fn page_duplicate(page_id: Uuid) -> Result<Uuid> {
+    let mut guard = slot().lock();
+    let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
+    // Validate the source is a Page before we clone.
+    let source = ws
+        .project
+        .document
+        .get_node(page_id)
+        .ok_or(DocumentBridgeError::NodeNotFound(page_id))?;
+    if source.node_type != kcreate_core::NodeType::Page {
+        return Err(DocumentBridgeError::WrongComponentNodeType(source.node_type));
+    }
+    let new_id = ws.project.document.clone_subtree(page_id, None)?;
+    if let Some(node) = ws.project.document.get_node_mut(new_id) {
+        node.name = format!("{} (copy)", node.name);
+    }
+    let snapshot = ws
+        .project
+        .document
+        .get_node(new_id)
+        .map_or(serde_json::Value::Null, |n| {
+            serde_json::to_value(n).unwrap_or(serde_json::Value::Null)
+        });
+    let op = Operation::new(
+        "user",
+        "page_duplicate",
+        serde_json::to_value(page_id)?,
+        snapshot,
+        vec![new_id],
+    );
+    ws.project.execute_operation(op);
+    ws.project.modified_at = Utc::now();
+    let _ = sync_scene_locked(&mut guard);
+    drop(guard);
+    Ok(new_id)
+}
+
+/// Move `node_id` under `new_parent` (or to the root level when
+/// `new_parent` is `None`), inserting at `index` in the destination's
+/// children list. The PageNavigator uses this for drag-reorder.
+///
+/// Records an undoable `document_reparent` op carrying the prior
+/// parent + index so the patch can be reversed.
+pub fn document_reparent_node(
+    node_id: Uuid,
+    new_parent: Option<Uuid>,
+    index: usize,
+) -> Result<()> {
+    let mut guard = slot().lock();
+    let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
+    let (prior_parent, prior_index) = {
+        let node = ws
+            .project
+            .document
+            .get_node(node_id)
+            .ok_or(DocumentBridgeError::NodeNotFound(node_id))?;
+        let prior_parent = node.parent_id;
+        let prior_index = if let Some(p) = prior_parent {
+            ws.project
+                .document
+                .get_node(p)
+                .and_then(|parent| parent.children.iter().position(|c| *c == node_id))
+                .unwrap_or(0)
+        } else {
+            ws.project
+                .document
+                .root_ids()
+                .iter()
+                .position(|c| *c == node_id)
+                .unwrap_or(0)
+        };
+        (prior_parent, prior_index)
+    };
+    ws.project
+        .document
+        .reparent_node(node_id, new_parent, index)?;
+    let before = serde_json::json!({
+        "parent_id": prior_parent,
+        "index": prior_index,
+    });
+    let after = serde_json::json!({
+        "parent_id": new_parent,
+        "index": index,
+    });
+    let op = Operation::new(
+        "user",
+        "document_reparent",
+        before,
+        after,
+        vec![node_id],
+    );
+    ws.project.execute_operation(op);
+    ws.project.modified_at = Utc::now();
+    let _ = sync_scene_locked(&mut guard);
+    drop(guard);
+    Ok(())
 }
 
 // -----------------------------------------------------------------------------
@@ -4368,6 +4555,49 @@ mod tests {
 
         // Removing again is a no-op false.
         assert!(!interaction_remove(page_id, iid).expect("remove again"));
+        project_close();
+    }
+
+    /// Devin Review ANALYSIS-0003: prove `interaction_list_batch`
+    /// returns exactly the same per-node data as N individual
+    /// `interaction_list` calls would, but in one shot. Adds two
+    /// interactions to one node, leaves another node interaction-less
+    /// (so the batch must omit it), and includes a non-existent id
+    /// (so the batch must tolerate it).
+    #[test]
+    #[serial]
+    fn interaction_list_batch_matches_individual_calls() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("proto-batch", dir.path()).expect("create");
+        let tree = document_get_tree().expect("tree");
+        let page_a = tree[0].id;
+        let page_b = page_add("page b".to_string(), None, None).expect("add b");
+        let action = serde_json::json!({"kind": "back"}).to_string();
+        let iid1 = interaction_add(page_a, "click", &action).expect("add a1");
+        let iid2 = interaction_add(page_a, "hover", &action).expect("add a2");
+
+        let missing = Uuid::new_v4();
+        let ids = vec![page_a, page_b, missing];
+        let batch = interaction_list_batch(&ids).expect("batch");
+
+        // page_b has zero interactions and `missing` doesn't exist;
+        // both must be absent from the result map.
+        assert!(!batch.contains_key(&page_b));
+        assert!(!batch.contains_key(&missing));
+        let listed_a = batch.get(&page_a).cloned().unwrap_or_default();
+        assert_eq!(listed_a.len(), 2);
+        let ids_set: std::collections::HashSet<Uuid> =
+            listed_a.iter().map(|i| i.id).collect();
+        assert!(ids_set.contains(&iid1));
+        assert!(ids_set.contains(&iid2));
+
+        // Identical to per-node call results.
+        let solo_a = interaction_list(page_a).expect("solo a");
+        let solo_b = interaction_list(page_b).expect("solo b");
+        assert_eq!(solo_a.len(), listed_a.len());
+        assert!(solo_b.is_empty());
+
         project_close();
     }
 

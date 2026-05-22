@@ -891,6 +891,15 @@ const interaction: InteractionBridge = {
     )) as string;
     return JSON.parse(json) as Interaction[];
   },
+  async listBatch(
+    nodeIds: string[],
+  ): Promise<Record<string, Interaction[]>> {
+    const json = (await ipcRenderer.invoke(
+      "kcreate/interaction/list-batch",
+      nodeIds,
+    )) as string;
+    return JSON.parse(json) as Record<string, Interaction[]>;
+  },
 };
 
 const masterPage: MasterPageBridge = {
@@ -954,6 +963,36 @@ const layoutStudio: LayoutStudioBridge = {
       templateId,
     )) as string;
     return JSON.parse(json) as string[];
+  },
+  async addPage(
+    name: string,
+    size?: PageSizeId,
+    orientation?: PageOrientation,
+  ): Promise<string> {
+    return (await ipcRenderer.invoke(
+      "kcreate/page/add",
+      name,
+      size,
+      orientation,
+    )) as string;
+  },
+  async duplicatePage(pageId: string): Promise<string> {
+    return (await ipcRenderer.invoke(
+      "kcreate/page/duplicate",
+      pageId,
+    )) as string;
+  },
+  async reparentNode(
+    nodeId: string,
+    newParent: string | null,
+    index: number,
+  ): Promise<void> {
+    await ipcRenderer.invoke(
+      "kcreate/document/reparent",
+      nodeId,
+      newParent,
+      index,
+    );
   },
 };
 

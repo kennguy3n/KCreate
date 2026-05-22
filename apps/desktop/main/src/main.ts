@@ -842,6 +842,11 @@ function registerIpcHandlers(): void {
     "kcreate/interaction/list",
     (_e, nodeId: string): string => requireBridge().interactionList(nodeId),
   );
+  ipcMain.handle(
+    "kcreate/interaction/list-batch",
+    (_e, nodeIds: string[]): string =>
+      requireBridge().interactionListBatch(JSON.stringify(nodeIds)),
+  );
 
   // Layout Studio (Phase 2, Block B): page layout, master pages, templates
   ipcMain.handle(
@@ -881,6 +886,33 @@ function registerIpcHandlers(): void {
     "kcreate/layoutTemplate/apply",
     (_e, templateId: string): string =>
       requireBridge().layoutTemplateApply(templateId),
+  );
+  ipcMain.handle(
+    "kcreate/page/add",
+    (
+      _e,
+      name: string,
+      size: string | undefined,
+      orientation: string | undefined,
+    ): string => requireBridge().pageAdd(name, size, orientation),
+  );
+  ipcMain.handle("kcreate/page/duplicate", (_e, pageId: string): string =>
+    requireBridge().pageDuplicate(pageId),
+  );
+  ipcMain.handle(
+    "kcreate/document/reparent",
+    (
+      _e,
+      nodeId: string,
+      newParent: string | null | undefined,
+      index: number,
+    ): void => {
+      requireBridge().documentReparentNode(
+        nodeId,
+        newParent ?? undefined,
+        index,
+      );
+    },
   );
 }
 

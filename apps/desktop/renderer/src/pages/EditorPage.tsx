@@ -2,7 +2,9 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { CanvasHost, type ViewportState } from "../components/CanvasHost";
 import { LeftPanel } from "../components/LeftPanel";
+import { PageNavigator } from "../components/PageNavigator";
 import { RightPanel } from "../components/RightPanel";
+import { TemplatePicker } from "../components/TemplatePicker";
 import {
   TopBar,
   type EditorMode,
@@ -82,6 +84,14 @@ export function EditorPage({
     [],
   );
   const [artboardDialogOpen, setArtboardDialogOpen] = useState(false);
+  // TemplatePicker is shown automatically the first time the user
+  // enters Layout mode for a given project. The sentinel below is per
+  // project id so re-opening a project skips the picker, but switching
+  // projects within one session re-prompts.
+  const [templatePickerOpen, setTemplatePickerOpen] = useState<boolean>(false);
+  const [layoutPickerShownFor, setLayoutPickerShownFor] = useState<string | null>(
+    null,
+  );
   const [components, setComponents] = useState<ComponentInfo[]>([]);
   const [resourceLimits, setResourceLimits] = useState<ResourceLimits | null>(
     null,
@@ -158,6 +168,39 @@ export function EditorPage({
   useEffect(() => {
     void refreshTree();
   }, [refreshTree]);
+
+  // First-time-into-Layout prompt: when the user switches to Layout
+  // mode and we haven't shown the TemplatePicker for this project yet
+  // (and the project currently has no pages), pop the picker.
+  // Subsequent entries into Layout mode leave the picker closed; the
+  // user re-opens it via the "Templates" button in the PageNavigator
+  // footer.
+  useEffect(() => {
+    if (mode !== "layout") return;
+    if (layoutPickerShownFor === project.id) return;
+    const hasPages = nodes.some((n) => n.nodeType === "Page");
+    if (hasPages) {
+      setLayoutPickerShownFor(project.id);
+      return;
+    }
+    setTemplatePickerOpen(true);
+    setLayoutPickerShownFor(project.id);
+  }, [mode, project.id, nodes, layoutPickerShownFor]);
+
+  // Layout mode page selection helper — selects the page node so the
+  // canvas pans/zooms to its bounds and the right panel shows its
+  // properties.
+  const handleSelectPage = useCallback(
+    async (pageId: string): Promise<void> => {
+      try {
+        await window.kcreate.canvas.setSelection([pageId]);
+        setSelectedIds([pageId]);
+      } catch (e) {
+        setStatusMessage(`select page failed: ${errorMessage(e)}`);
+      }
+    },
+    [],
+  );
 
   const refreshResourceLimits = useCallback(async () => {
     try {
@@ -893,10 +936,25 @@ export function EditorPage({
         style={{
           flex: 1,
           display: "grid",
-          gridTemplateColumns: "auto 1fr auto",
+          gridTemplateColumns:
+            mode === "layout" ? "auto auto 1fr auto" : "auto 1fr auto",
           minHeight: 0,
         }}
       >
+        {mode === "layout" ? (
+          <PageNavigator
+            nodes={nodes}
+            selectedPageId={selectedId}
+            onSelectPage={(id) => {
+              void handleSelectPage(id);
+            }}
+            onStatus={setStatusMessage}
+            onChanged={() => {
+              void refreshTree();
+            }}
+            onNewFromTemplate={() => setTemplatePickerOpen(true)}
+          />
+        ) : null}
         <LeftPanel
           nodes={nodes}
           selectedId={selectedId}
@@ -1110,6 +1168,20 @@ export function EditorPage({
           void handleCreateArtboard(args);
         }}
         onClose={() => setArtboardDialogOpen(false)}
+      />
+      <TemplatePicker
+        open={templatePickerOpen}
+        onClose={() => setTemplatePickerOpen(false)}
+        onApplied={(ids) => {
+          // Refresh the tree so the new pages appear in the navigator,
+          // and focus the first new page if we got any.
+          void (async () => {
+            await refreshTree();
+            const first = ids[0];
+            if (first) await handleSelectPage(first);
+          })();
+        }}
+        onStatus={setStatusMessage}
       />
     </div>
   );

@@ -256,6 +256,15 @@ export interface Bridge {
   ): string;
   interactionRemove(nodeId: string, interactionId: string): boolean;
   interactionList(nodeId: string): string;
+  /**
+   * Batched [`interactionList`] taking a JSON array of node ids and
+   * returning a JSON object keyed by node id. Used by the prototype
+   * player so a single artboard's hotspots cost one IPC round trip
+   * (Devin Review ANALYSIS-0003). The JSON input is preferred over
+   * `string[]` because napi-rs can't infer that an array parameter
+   * should arrive as JSON.
+   */
+  interactionListBatch(nodeIdsJson: string): string;
 
   // Layout Studio (Phase 2, Block B)
   pageSetLayout(pageId: string, layoutJson: string): void;
@@ -270,6 +279,17 @@ export interface Bridge {
   masterPageDetach(contentPageId: string): void;
   layoutTemplateList(): string;
   layoutTemplateApply(templateId: string): string;
+  pageAdd(
+    name: string,
+    size?: string,
+    orientation?: string,
+  ): string;
+  pageDuplicate(pageId: string): string;
+  documentReparentNode(
+    nodeId: string,
+    newParent: string | undefined,
+    index: number,
+  ): void;
 }
 
 function bridgeBinaryPath(): string {

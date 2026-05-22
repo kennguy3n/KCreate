@@ -74,6 +74,14 @@ export function PrototypePlayer({
   );
 
   // Resolve hotspots for the current artboard.
+  //
+  // Devin Review ANALYSIS-0003: this used to fire one IPC round trip
+  // per node in the artboard subtree, which for a heavy artboard
+  // (large card grids, deep groups) added perceptible lag every time
+  // the user navigated to a new screen. We now request the whole
+  // subtree's interactions in a single `interaction.listBatch` call.
+  // Nodes with no interactions are omitted from the batch result, so
+  // a missing key in `byNode` is equivalent to an empty list.
   const refreshHotspots = useCallback(async (): Promise<void> => {
     if (!currentArtboard) {
       setHotspots([]);
@@ -83,10 +91,12 @@ export function PrototypePlayer({
     setErrorMsg(null);
     try {
       const subtree = collectSubtree(tree, currentArtboard.id);
+      const ids = subtree.map((n) => n.id);
+      const byNode = await window.kcreate.interaction.listBatch(ids);
       const collected: Hotspot[] = [];
       for (const node of subtree) {
-        const interactions = await window.kcreate.interaction.list(node.id);
-        if (interactions.length === 0) continue;
+        const interactions = byNode[node.id];
+        if (!interactions || interactions.length === 0) continue;
         // `bounds` is now first-class on the wire shape — see the
         // BoundsInfo addition in `kcreate_bridge::document::NodeInfo`.
         // A zero-size box is still a valid bound (e.g. a freshly

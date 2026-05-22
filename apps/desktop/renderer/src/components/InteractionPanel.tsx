@@ -9,7 +9,7 @@
 // Real implementation — there is no mock data, no stub. Every render
 // reflects the live bridge state for the selected node.
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 
 import type {
   Interaction,
@@ -89,12 +89,24 @@ export function InteractionPanel({
   // type because any visible layer is a legitimate scroll target —
   // for example, scrolling to a `Section` group or to a heading text
   // layer are both reasonable user intents.
-  const scrollTargets = (tree ?? []).filter(
-    (n) =>
-      n.id !== selected?.id &&
-      n.visible &&
-      n.bounds.width > 0 &&
-      n.bounds.height > 0,
+  //
+  // Memoised so the value is referentially stable across renders and
+  // can sit in the dep-array of the target-reset effect below. This
+  // replaces the previous "derived value not in deps" pattern called
+  // out by Devin Review (ANALYSIS-0006) — if anyone later threads an
+  // additional filter into this computation, they only have to
+  // declare it in this single `useMemo`'s deps and the effect picks
+  // it up automatically.
+  const scrollTargets = useMemo<NodeInfo[]>(
+    () =>
+      (tree ?? []).filter(
+        (n) =>
+          n.id !== selected?.id &&
+          n.visible &&
+          n.bounds.width > 0 &&
+          n.bounds.height > 0,
+      ),
+    [tree, selected?.id],
   );
 
   // Reset the target id whenever the action kind changes so we don't
@@ -116,11 +128,12 @@ export function InteractionPanel({
       // close_overlay / back take no target.
       setTargetId("");
     }
-    // scrollTargets is recomputed every render from props; keying off
-    // the underlying tree+selected ensures the effect runs again only
-    // when the picker contents actually change.
+    // `targetId` is intentionally omitted from deps — this effect
+    // *writes* the target id, it doesn't react to external changes
+    // to it. Including `targetId` would loop the effect on every
+    // setTargetId.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [actionKind, artboards, tree, selected?.id]);
+  }, [actionKind, artboards, scrollTargets]);
 
   if (!selected) {
     return (

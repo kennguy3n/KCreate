@@ -575,12 +575,18 @@ export function CanvasHost(props: CanvasHostProps): JSX.Element {
         display: "block",
         cursor: cursor ?? propCursor ?? "default",
         touchAction: "none",
-        // In native mode the Rust renderer is painting straight to the
-        // BrowserWindow's surface beneath the React tree. We still want
-        // the <canvas> element in the layout so pointer events keep
-        // routing through React, but it must not occlude the native
-        // composit. `background: transparent` plus the `pointerEvents`
-        // hint below leave the surface visible underneath.
+        // In native mode the Rust renderer paints straight to the
+        // BrowserWindow's surface beneath the React tree. We keep the
+        // <canvas> element in the layout so pointer events still route
+        // through React (`pointerEvents: "auto"` is the default), but
+        // we have to hide its pixel buffer because the 2D context was
+        // created with `alpha: false` for the offscreen path — that
+        // makes the backing store permanently opaque, and a CSS
+        // `background: transparent` only affects the element box, not
+        // the canvas bitmap (Devin Review BUG-0003). `opacity: 0` is
+        // the cleanest way to keep the element hit-testable while
+        // letting the native surface composit underneath it.
+        opacity: activeMode === "native" ? 0 : undefined,
         background: activeMode === "native" ? "transparent" : undefined,
       }}
       data-presentation-mode={activeMode}

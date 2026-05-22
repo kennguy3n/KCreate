@@ -944,6 +944,14 @@ export interface InteractionBridge {
   ): Promise<string>;
   remove(nodeId: string, interactionId: string): Promise<boolean>;
   list(nodeId: string): Promise<Interaction[]>;
+  /**
+   * Batched [`list`]. Resolves to a map keyed by node id; nodes that
+   * have no interactions are omitted from the result, so callers
+   * should treat a missing key as an empty list. Used by the
+   * prototype player to gather all hotspots on an artboard with a
+   * single IPC round trip (Devin Review ANALYSIS-0003).
+   */
+  listBatch(nodeIds: string[]): Promise<Record<string, Interaction[]>>;
 }
 
 // ============================================================================
@@ -1062,6 +1070,32 @@ export interface LayoutStudioBridge {
   getPageLayout(pageId: string): Promise<PageLayout | null>;
   listTemplates(): Promise<LayoutTemplate[]>;
   applyTemplate(templateId: string): Promise<string[]>;
+  /**
+   * Add a new content page. When `size` and `orientation` are omitted
+   * the page is created at the workspace default (1920x1080, no page
+   * layout metadata). Returns the new page id.
+   */
+  addPage(
+    name: string,
+    size?: PageSizeId,
+    orientation?: PageOrientation,
+  ): Promise<string>;
+  /**
+   * Duplicate a page (with its artboards / layers). The new page lives
+   * at the document root and is named "<original> (copy)". Returns the
+   * new page id.
+   */
+  duplicatePage(pageId: string): Promise<string>;
+  /**
+   * Move `nodeId` to position `index` under `newParent` — or to the
+   * root list when `newParent` is `null`. Drives the PageNavigator's
+   * drag-reorder gesture and the layer panel's future move gesture.
+   */
+  reparentNode(
+    nodeId: string,
+    newParent: string | null,
+    index: number,
+  ): Promise<void>;
 }
 
 declare global {

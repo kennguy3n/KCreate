@@ -1379,6 +1379,27 @@ pub fn interaction_list(node_id: String) -> NapiResult<String> {
     serde_json::to_string(&list).map_err(|e| NapiError::from_reason(e.to_string()))
 }
 
+/// Batched [`interaction_list`]. Accepts a JSON array of node id strings;
+/// returns a JSON object keyed by node id with the value being a JSON
+/// array of [`kcreate_core::Interaction`]. Nodes that don't exist or
+/// have no interactions are omitted from the result. One IPC trip for
+/// the whole batch, used by the prototype player.
+#[napi]
+pub fn interaction_list_batch(node_ids_json: String) -> NapiResult<String> {
+    let ids: Vec<String> = serde_json::from_str(&node_ids_json)
+        .map_err(|e| NapiError::from_reason(format!("invalid node id list: {e}")))?;
+    let mut uuids = Vec::with_capacity(ids.len());
+    for id in &ids {
+        uuids.push(parse_uuid(id)?);
+    }
+    let map = document::interaction_list_batch(&uuids).map_err(map_doc_err)?;
+    // Serialise with string keys so the renderer can index by node id
+    // without re-parsing UUIDs on the JS side. `HashMap<Uuid, _>`
+    // serialises to a JSON object with Uuid display-formatted as
+    // strings by default.
+    serde_json::to_string(&map).map_err(|e| NapiError::from_reason(e.to_string()))
+}
+
 // -----------------------------------------------------------------------------
 // Layout Studio (Block B): page layout, master pages, templates
 // -----------------------------------------------------------------------------
@@ -1449,4 +1470,45 @@ pub fn layout_template_apply(template_id: String) -> NapiResult<String> {
     let ids = document::layout_template_apply(tid).map_err(map_doc_err)?;
     let strs: Vec<String> = ids.into_iter().map(|i| i.to_string()).collect();
     serde_json::to_string(&strs).map_err(|e| NapiError::from_reason(e.to_string()))
+}
+
+/// Add a new content page to the open project. `size` and
+/// `orientation` are optional; omit both to use the workspace default.
+/// Returns the new page id as a string.
+#[napi]
+pub fn page_add(
+    name: String,
+    size: Option<String>,
+    orientation: Option<String>,
+) -> NapiResult<String> {
+    document::page_add(name, size.as_deref(), orientation.as_deref())
+        .map(|id| id.to_string())
+        .map_err(map_doc_err)
+}
+
+/// Duplicate `page_id` (subtree-cloned at the root). Returns the new
+/// page id as a string.
+#[napi]
+pub fn page_duplicate(page_id: String) -> NapiResult<String> {
+    let pid = parse_uuid(&page_id)?;
+    document::page_duplicate(pid)
+        .map(|id| id.to_string())
+        .map_err(map_doc_err)
+}
+
+/// Reparent `node_id` under `new_parent` (`None` => move to the root
+/// list) at the given `index`. Used by the PageNavigator's drag-reorder
+/// and by future layer-panel move gestures.
+#[napi]
+pub fn document_reparent_node(
+    node_id: String,
+    new_parent: Option<String>,
+    index: u32,
+) -> NapiResult<()> {
+    let nid = parse_uuid(&node_id)?;
+    let pid = match new_parent {
+        Some(s) if !s.is_empty() => Some(parse_uuid(&s)?),
+        _ => None,
+    };
+    document::document_reparent_node(nid, pid, index as usize).map_err(map_doc_err)
 }

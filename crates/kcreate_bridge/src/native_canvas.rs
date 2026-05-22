@@ -74,6 +74,16 @@ pub enum NativeCanvasError {
     NullHandle { platform: &'static str },
     #[error("unsupported platform — no native handle interpretation compiled in")]
     UnsupportedPlatform,
+    /// We detected a Wayland session but the bridge does not yet have a
+    /// real `wl_display*` connection. Returning this signals the host
+    /// to keep using the offscreen presentation path. See the comment
+    /// on `wayland_handle` below for the longer-term fix.
+    #[error(
+        "wayland native presentation requires a real wl_display* — \
+         not yet wired through Electron's BrowserWindow handle, falling \
+         back to offscreen presentation"
+    )]
+    WaylandNotYetSupported,
 }
 
 /// Owned platform handle. Implements both `HasWindowHandle` and
@@ -190,8 +200,18 @@ fn interpret_bytes(bytes: &[u8]) -> Result<PlatformHandle, NativeCanvasError> {
     // returns by default on most distros). For X11 the handle bytes
     // are 4 bytes (the XID is a 32-bit unsigned int); for Wayland
     // they are 8 bytes (`wl_surface*`).
+    //
+    // Per Devin Review BUG-0002 (PR #5): the byte-length heuristic
+    // must NOT override an explicit `XDG_SESSION_TYPE=x11`. Otherwise
+    // an 8-byte zero-padded XID buffer would route to the Wayland
+    // path and be mis-interpreted as a surface pointer. The heuristic
+    // only kicks in when the session type is missing / ambiguous.
     let session = std::env::var("XDG_SESSION_TYPE").unwrap_or_default();
-    if session.eq_ignore_ascii_case("wayland") || bytes.len() == 8 {
+    if session.eq_ignore_ascii_case("x11") {
+        x11_handle(bytes)
+    } else if session.eq_ignore_ascii_case("wayland")
+        || (session.is_empty() && bytes.len() == 8)
+    {
         wayland_handle(bytes)
     } else {
         x11_handle(bytes)
@@ -225,16 +245,30 @@ fn x11_handle(bytes: &[u8]) -> Result<PlatformHandle, NativeCanvasError> {
 
 #[cfg(all(unix, not(target_os = "macos")))]
 fn wayland_handle(bytes: &[u8]) -> Result<PlatformHandle, NativeCanvasError> {
-    use raw_window_handle::{WaylandDisplayHandle, WaylandWindowHandle};
+    // Per Devin Review BUG-0001 (PR #5): the earlier draft constructed
+    // a `WaylandDisplayHandle` using `NonNull::dangling()` as the
+    // `wl_display*`. That pointer would be dereferenced by wgpu the
+    // moment it tried to talk to the compositor, causing a segfault.
+    //
+    // The fully-correct fix requires either (a) an FFI call to
+    // `wl_display_connect(NULL)` (which would add a hard dependency
+    // on `libwayland-client.so.0` to the bridge) or (b) Electron
+    // passing both the `wl_surface*` AND the `wl_display*` into the
+    // bridge as separate buffers. Neither is wired up yet — and the
+    // native_canvas feature is itself opt-in, off by default, with
+    // the offscreen path as the universal fallback (see
+    // `crates/kcreate_renderer/src/presenter.rs`).
+    //
+    // Until that wiring exists, the safe behaviour on a Wayland
+    // session is to refuse to attach a native surface and let the
+    // renderer keep using the offscreen path. We still validate the
+    // surface bytes so the caller gets a clear "handle too short /
+    // null" error if Electron handed us garbage, rather than the
+    // less-actionable `WaylandNotYetSupported` after a length pass.
     let ptr = read_ptr(bytes, "wayland")?;
-    let nn = NonNull::new(ptr).ok_or(NativeCanvasError::NullHandle { platform: "wayland" })?;
-    let window = RawWindowHandle::Wayland(WaylandWindowHandle::new(nn));
-    let display = RawDisplayHandle::Wayland(WaylandDisplayHandle::new(NonNull::dangling()));
-    Ok(PlatformHandle {
-        window,
-        display,
-        platform: NativePlatform::Wayland,
-    })
+    let _: NonNull<std::ffi::c_void> =
+        NonNull::new(ptr).ok_or(NativeCanvasError::NullHandle { platform: "wayland" })?;
+    Err(NativeCanvasError::WaylandNotYetSupported)
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "windows", unix)))]
@@ -356,5 +390,65 @@ mod tests {
         bytes[0] = 0x41;
         let handle = handle_from_bytes(&bytes).expect("win32 wrap");
         assert_eq!(handle.platform(), NativePlatform::Win32);
+    }
+
+    /// Devin Review BUG-0001 regression. An 8-byte buffer on a session
+    /// that the bridge interprets as Wayland (either by
+    /// `XDG_SESSION_TYPE=wayland` or by length fallback) must return
+    /// `WaylandNotYetSupported` rather than constructing a handle with
+    /// a dangling display pointer. The host is expected to keep using
+    /// the offscreen presentation path.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn wayland_session_refuses_until_wl_display_wired() {
+        let prev = std::env::var("XDG_SESSION_TYPE").ok();
+        // SAFETY: see x11_round_trips_xid.
+        unsafe { std::env::set_var("XDG_SESSION_TYPE", "wayland") };
+        let ptr_val: u64 = 0xDEAD_BEEF_CAFE_BABE;
+        let bytes = ptr_val.to_le_bytes();
+        let err = handle_from_bytes(&bytes).expect_err("wayland refuses");
+        assert!(matches!(err, NativeCanvasError::WaylandNotYetSupported));
+        match prev {
+            Some(v) => {
+                // SAFETY: see above; restoring the prior value.
+                unsafe { std::env::set_var("XDG_SESSION_TYPE", v) };
+            }
+            None => {
+                // SAFETY: see above; restoring an unset env var.
+                unsafe { std::env::remove_var("XDG_SESSION_TYPE") };
+            }
+        }
+    }
+
+    /// Devin Review BUG-0002 regression. An explicit `XDG_SESSION_TYPE=x11`
+    /// must route to `x11_handle` even when the byte slab is 8 bytes
+    /// (zero-padded XID, which Electron may produce). Previously the
+    /// `|| bytes.len() == 8` short-circuit would shunt the buffer to
+    /// the Wayland path and misinterpret the XID as a `wl_surface*`.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn explicit_x11_session_overrides_byte_length_heuristic() {
+        let prev = std::env::var("XDG_SESSION_TYPE").ok();
+        // SAFETY: see x11_round_trips_xid.
+        unsafe { std::env::set_var("XDG_SESSION_TYPE", "x11") };
+        let xid: u32 = 0x0042_4242;
+        let mut bytes = [0u8; 8];
+        bytes[..4].copy_from_slice(&xid.to_le_bytes());
+        let handle = handle_from_bytes(&bytes).expect("x11 wrap with zero-padded buffer");
+        assert_eq!(handle.platform(), NativePlatform::X11);
+        match handle.window {
+            RawWindowHandle::Xlib(h) => assert_eq!(h.window, u64::from(xid)),
+            other => panic!("expected Xlib, got {other:?}"),
+        }
+        match prev {
+            Some(v) => {
+                // SAFETY: see above; restoring the prior value.
+                unsafe { std::env::set_var("XDG_SESSION_TYPE", v) };
+            }
+            None => {
+                // SAFETY: see above; restoring an unset env var.
+                unsafe { std::env::remove_var("XDG_SESSION_TYPE") };
+            }
+        }
     }
 }

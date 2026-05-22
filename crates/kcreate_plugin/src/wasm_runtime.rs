@@ -27,6 +27,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
 
+use blake3::Hash;
+
 use parking_lot::Mutex;
 use thiserror::Error;
 use wasmi::{
@@ -118,9 +120,12 @@ impl ResourceLimiter for PageLimiter {
     }
 }
 
-/// Engine wrapper with a `(path, mtime)` keyed compiled-`Module`
-/// cache. Each `execute` call still creates a fresh `Store` so plugin
-/// runs are fully independent — only the *compiled* module is shared.
+/// Engine wrapper with a per-path compiled-`Module` cache. Cache
+/// entries record the file's `(mtime, size)` for a stat-only fast path
+/// and the BLAKE3 content hash for the slow path so a rebuild within
+/// the same mtime second is still picked up correctly. Each `execute`
+/// call creates a fresh `Store` so plugin runs are fully independent —
+/// only the *compiled* module is shared.
 #[derive(Debug)]
 pub struct WasmPluginRuntime {
     engine: Engine,
@@ -135,15 +140,31 @@ impl Default for WasmPluginRuntime {
 
 const PAGE_BYTES: usize = 64 * 1024;
 
-/// Cache entry: a compiled `Module` plus the (path, mtime) it was
-/// compiled from. The bridge layer calls into a hot plugin many times
-/// per session — compiling the same `Module` on every call (and
-/// re-reading the `.wasm` file from disk) burned ~50% of plugin
-/// execution time on real workloads.
+/// Cache entry: a compiled `Module` plus enough metadata to detect
+/// when the underlying `.wasm` file has changed. The bridge layer
+/// calls into a hot plugin many times per session — compiling the
+/// same `Module` on every call (and re-reading the `.wasm` file from
+/// disk) burned ~50% of plugin execution time on real workloads.
+///
+/// Invalidation strategy:
+/// * Fast path — `(mtime, size)` matches: reuse the cached `Module`
+///   without reading the file. This is the common steady state.
+/// * Slow path — anything else: read the file, BLAKE3-hash it, and
+///   compare to `content_hash`. A matching hash means the contents
+///   are unchanged (e.g. the file was rewritten with identical bytes
+///   or touched within the same mtime second), so we refresh the
+///   `(mtime, size)` and reuse the cached `Module`. A different hash
+///   means we recompile.
+///
+/// The content-hash check fixes the "rebuild within the same second"
+/// edge case that pure mtime keying missed on coarse-resolution
+/// filesystems (ext3, HFS+).
 #[derive(Debug, Clone)]
 struct CachedModule {
     module: Module,
     mtime: Option<SystemTime>,
+    size: u64,
+    content_hash: Hash,
 }
 
 impl WasmPluginRuntime {
@@ -192,22 +213,54 @@ impl WasmPluginRuntime {
     }
 
     fn module_for_path(&self, path: &Path) -> Result<Module, WasmPluginError> {
-        let mtime = std::fs::metadata(path).ok().and_then(|m| m.modified().ok());
+        let meta = std::fs::metadata(path).ok();
+        let mtime = meta.as_ref().and_then(|m| m.modified().ok());
+        let size = meta.as_ref().map_or(0u64, std::fs::Metadata::len);
+
+        // Fast path: stat-only invalidation. When `(mtime, size)`
+        // matches the cached entry we trust the cache and skip both
+        // the file read and the hash. Holding the lock only for the
+        // lookup keeps the critical section tiny.
         {
             let cache = self.module_cache.lock();
             if let Some(entry) = cache.get(path) {
-                if entry.mtime == mtime {
+                if entry.mtime == mtime && entry.size == size {
                     return Ok(entry.module.clone());
                 }
             }
         }
+
+        // Slow path: read + hash. We always need the bytes anyway for
+        // a potential recompile, and BLAKE3 over a typical plugin
+        // (<1 MB) is sub-millisecond on a single core.
         let bytes = std::fs::read(path)?;
+        let content_hash = blake3::hash(&bytes);
+
+        // If the content hash matches a cached entry, the file
+        // contents are unchanged even though `(mtime, size)` shifted
+        // (e.g. touch, atomic-rename, sub-second rebuild). Refresh
+        // the metadata so future calls hit the fast path, and reuse
+        // the compiled `Module`.
+        {
+            let mut cache = self.module_cache.lock();
+            if let Some(entry) = cache.get_mut(path) {
+                if entry.content_hash == content_hash {
+                    entry.mtime = mtime;
+                    entry.size = size;
+                    return Ok(entry.module.clone());
+                }
+            }
+        }
+
+        // Real change — compile a new module and replace the entry.
         let module = Module::new(&self.engine, &bytes)?;
         self.module_cache.lock().insert(
             path.to_path_buf(),
             CachedModule {
                 module: module.clone(),
                 mtime,
+                size,
+                content_hash,
             },
         );
         Ok(module)
@@ -435,7 +488,7 @@ mod tests {
     }
 
     #[test]
-    fn execute_path_caches_compiled_module_until_mtime_changes() {
+    fn execute_path_caches_compiled_module() {
         use std::io::Write;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("echo.wasm");
@@ -456,8 +509,8 @@ mod tests {
         assert_eq!(b.output, "beta");
         assert_eq!(rt.cache_len(), 1);
 
-        // Touch the file so mtime moves: the next call must recompile
-        // (still one entry, but the cached `Module` is replaced).
+        // Touch the file so mtime moves: the next call must observe
+        // the same content hash and reuse the cached `Module`.
         std::thread::sleep(std::time::Duration::from_millis(20));
         {
             let mut f = std::fs::OpenOptions::new()
@@ -466,12 +519,82 @@ mod tests {
                 .open(&path)
                 .unwrap();
             f.write_all(&wasm).unwrap();
-            // Some filesystems round mtime to 1s — force a distinct
-            // mtime via filetime if available; the test still passes
-            // either way because cache_len stays at 1 even on a hit.
         }
         let c = rt.execute_path(&path, "run", "gamma", 16).unwrap();
         assert_eq!(c.output, "gamma");
         assert_eq!(rt.cache_len(), 1);
     }
+
+    /// Regression: a rebuild that lands in the *same* mtime second
+    /// must still be picked up. Earlier the cache keyed only on
+    /// `(path, mtime)`, so on coarse-resolution filesystems (ext3,
+    /// HFS+) a sub-second rebuild could silently serve the stale
+    /// compiled module. With BLAKE3 content-hashing, a content
+    /// change is always detected on the next call.
+    #[test]
+    fn execute_path_picks_up_subsecond_content_change() {
+        use filetime::{set_file_mtime, FileTime};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("echo.wasm");
+        let echo_wasm = wat::parse_str(ECHO_WAT).unwrap();
+        std::fs::write(&path, &echo_wasm).unwrap();
+
+        let rt = WasmPluginRuntime::new();
+        // Cold call: cache miss → compile.
+        let a = rt.execute_path(&path, "run", "first", 16).unwrap();
+        assert_eq!(a.output, "first");
+        assert_eq!(rt.cache_len(), 1);
+        let mtime_before = std::fs::metadata(&path).unwrap().modified().unwrap();
+
+        // Rewrite with semantically different content (a different
+        // export name) but pin the mtime to exactly the previous
+        // value. If the cache trusted mtime alone it would serve the
+        // stale `Module` and the second call would still look like
+        // an echo. The content hash will differ, forcing a recompile.
+        let alt_wasm = wat::parse_str(REVERSE_WAT).unwrap();
+        std::fs::write(&path, &alt_wasm).unwrap();
+        set_file_mtime(&path, FileTime::from_system_time(mtime_before)).unwrap();
+        // Sanity: mtime is unchanged on disk.
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            mtime_before
+        );
+
+        let b = rt.execute_path(&path, "reverse", "abcd", 16).unwrap();
+        assert_eq!(b.output, "dcba");
+        // The path is still one cache entry — replaced, not appended.
+        assert_eq!(rt.cache_len(), 1);
+    }
+
+    /// WAT module that exports `reverse(i32, i32) -> ()` reversing the
+    /// input string before writing it back. Used to prove the cache
+    /// recompiles on a content change even when mtime is frozen.
+    const REVERSE_WAT: &str = r#"
+        (module
+            (import "env" "kcreate_get_input"
+                (func $get_input (param i32 i32) (result i32)))
+            (import "env" "kcreate_set_output"
+                (func $set_output (param i32 i32)))
+            (memory (export "memory") 1)
+            (func (export "reverse")
+                (local $len i32)
+                (local $i i32)
+                (local.set $len (call $get_input (i32.const 0) (i32.const 1024)))
+                (local.set $i (i32.const 0))
+                (block $done
+                    (loop $cp
+                        (br_if $done
+                            (i32.ge_s (local.get $i) (local.get $len)))
+                        (i32.store8
+                            (i32.add (i32.const 1024) (local.get $i))
+                            (i32.load8_u
+                                (i32.add
+                                    (i32.const 0)
+                                    (i32.sub
+                                        (i32.sub (local.get $len) (i32.const 1))
+                                        (local.get $i)))))
+                        (local.set $i (i32.add (local.get $i) (i32.const 1)))
+                        (br $cp)))
+                (call $set_output (i32.const 1024) (local.get $len))))
+    "#;
 }

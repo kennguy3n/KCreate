@@ -18,9 +18,14 @@ serde_json.workspace = true
 thiserror.workspace = true
 log.workspace = true
 parking_lot.workspace = true
+blake3.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
 # `wat` is only used in tests to compile inline WAT modules into the
 # WASM bytes our runtime executes — production never depends on it.
 wat = "1"
+# Used by tests to backdate a file's mtime so we can prove the cache
+# detects sub-second content changes via the BLAKE3 content hash
+# rather than mtime alone. Test-only dependency.
+filetime = "0.2"

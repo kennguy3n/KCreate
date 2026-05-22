@@ -1185,6 +1185,7 @@ export function EditorPage({
             onStatus={setStatusMessage}
             width={CANVAS_WIDTH}
             height={CANVAS_HEIGHT}
+            selectedIds={selectedIds}
           />
         ) : (
           <RightPanel

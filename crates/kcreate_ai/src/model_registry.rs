@@ -52,7 +52,13 @@ pub enum ModelPackCategory {
 }
 
 /// A single model-pack entry surfaced to the UI.
+///
+/// Field naming on the wire is `camelCase` to match every other
+/// Phase 2 N-API type (`PreflightOptions`, `BatchJobStatus`,
+/// `McpStatus`, …). The TypeScript mirror in
+/// `apps/desktop/shared/scene.ts::ModelPack` uses the same casing.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ModelPack {
     pub id: String,
     pub name: String,
@@ -262,13 +268,33 @@ mod tests {
     }
 
     #[test]
-    fn pack_serialises_to_camelcase_when_set_serializer_used() {
+    fn pack_serialises_to_camelcase_wire_format() {
         let dir = tempfile::tempdir().unwrap();
         let packs = list_model_packs(dir.path());
         // Round-trip a single pack through JSON.
         let raw = serde_json::to_string(&packs[0]).unwrap();
         let p: ModelPack = serde_json::from_str(&raw).unwrap();
         assert_eq!(p, packs[0]);
+        // Wire-format lockstep: the field names must match
+        // `apps/desktop/shared/scene.ts::ModelPack` (camelCase). If you
+        // rename a field, update the TS interface and keep this test
+        // passing.
+        assert!(
+            raw.contains("\"sizeBytes\""),
+            "expected camelCase wire key `sizeBytes`, got {raw}"
+        );
+        assert!(
+            raw.contains("\"filePath\""),
+            "expected camelCase wire key `filePath`, got {raw}"
+        );
+        assert!(
+            !raw.contains("\"size_bytes\""),
+            "snake_case `size_bytes` must not leak onto the wire: {raw}"
+        );
+        assert!(
+            !raw.contains("\"file_path\""),
+            "snake_case `file_path` must not leak onto the wire: {raw}"
+        );
     }
 
     /// Wire-format lockstep: the strings on the wire must be exactly

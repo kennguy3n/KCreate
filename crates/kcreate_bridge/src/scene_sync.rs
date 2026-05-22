@@ -51,15 +51,17 @@ use kcreate_storage::blobs::BlobStore;
 use kcreate_vector::{PathSegment, VectorPath};
 use uuid::Uuid;
 
-/// Metadata key on a [`NodeType::VectorLayer`] holding the path data.
-/// Mirrors [`kcreate_export::svg::VECTOR_PATH_METADATA_KEY`] verbatim.
-pub const VECTOR_PATH_METADATA_KEY: &str = "vector_path";
-/// Metadata key on a [`NodeType::RasterLayer`] holding the blob hash
-/// (BLAKE3 hex) of the RGBA8 pixel data and the source dimensions.
-pub const RASTER_IMAGE_METADATA_KEY: &str = "raster_image";
-/// Metadata key on a [`NodeType::TextLayer`] holding the rendered
-/// string + font family + font size.
-pub const TEXT_LAYER_METADATA_KEY: &str = "text";
+// The on-disk metadata schema (DTOs + key strings) is the contract
+// between this translator and every export pipeline. Owning the schema
+// in `kcreate_export::scene_metadata` keeps consumers that do not link
+// the bridge (preflight, icon-pack rendering, PDF flatten) pointed at a
+// single source of truth. We re-export the names here so existing
+// `crate::scene_sync::…` call sites continue to work — but only one
+// definition exists.
+pub use kcreate_export::scene_metadata::{
+    RasterImageMeta, TextLayerMeta, RASTER_IMAGE_METADATA_KEY, TEXT_LAYER_METADATA_KEY,
+    VECTOR_PATH_METADATA_KEY,
+};
 
 /// Selection-highlight stroke colour (`KChat` primary `#7C3AED` at 50%).
 const SELECTION_STROKE: Color = Color {
@@ -554,25 +556,6 @@ impl SceneSync {
         scene.add_object(obj);
         *z += 1;
     }
-}
-
-/// On-disk representation of a raster layer's pixel data. Stored in
-/// `node.metadata["raster_image"]`. The hash points at a blob in the
-/// project's content-addressed [`BlobStore`].
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct RasterImageMeta {
-    pub blob_hash: String,
-    pub width: u32,
-    pub height: u32,
-}
-
-/// On-disk representation of a text layer's glyph payload. Stored in
-/// `node.metadata["text"]`.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct TextLayerMeta {
-    pub text: String,
-    pub font_family: String,
-    pub font_size: f32,
 }
 
 fn resolve_raster_image(

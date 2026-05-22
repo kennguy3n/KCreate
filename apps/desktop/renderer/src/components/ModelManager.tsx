@@ -243,7 +243,7 @@ function PackCard({ pack }: { pack: ModelPack }): JSX.Element {
       <span style={{ fontSize: 10, color: colors.textMuted }}>
         {pack.kind === "built_in"
           ? "built-in"
-          : `${(pack.size_bytes / 1024 / 1024).toFixed(0)} MB`}
+          : `${(pack.sizeBytes / 1024 / 1024).toFixed(0)} MB`}
       </span>
     </article>
   );

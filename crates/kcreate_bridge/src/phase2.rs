@@ -178,7 +178,19 @@ pub fn batch_start(job: BatchExportJob) -> Result<String> {
         let p = progress_clone.clone();
         let outcome =
             run_batch_parallel(&job, &doc, &rasters, cancel_clone.as_inner(), move |snap| {
-                *p.lock() = snap;
+                // Rayon workers complete in arbitrary order, so a later-
+                // started thread can race ahead and write a higher
+                // `completed` snapshot before an earlier thread's callback
+                // runs. Without this guard the UI would briefly see the
+                // counter go backwards on every poll. We compare against
+                // the published snapshot and only adopt monotonically
+                // newer values; the final terminal status is published by
+                // the outer `result_slot` so we never need to "catch up"
+                // to total here.
+                let mut guard = p.lock();
+                if snap.completed > guard.completed {
+                    *guard = snap;
+                }
             });
         match outcome {
             Ok(r) => *result_clone.lock() = Some(r),

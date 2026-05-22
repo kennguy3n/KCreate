@@ -1247,8 +1247,8 @@ export interface ModelPack {
   category: ModelPackCategory;
   kind: ModelKind;
   capabilities: string[];
-  size_bytes: number;
-  file_path: string;
+  sizeBytes: number;
+  filePath: string;
   installed: boolean;
 }
 

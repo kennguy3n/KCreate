@@ -100,6 +100,12 @@ export interface ExportPanelProps {
   onStatus: (msg: string | null) => void;
   width: number;
   height: number;
+  /// Currently-selected node ids in the editor. Used to scope the icon
+  /// pack generator to the user's selection so the dialog text "Render
+  /// the selected node(s)" reflects actual behaviour. Empty means "no
+  /// explicit selection" — the icon-pack backend falls back to the
+  /// whole scene.
+  selectedIds: string[];
 }
 
 type ExportFormat = "png" | "svg" | "pdf" | "webp" | "jpeg";
@@ -122,6 +128,7 @@ export function ExportPanel({
   onStatus,
   width,
   height,
+  selectedIds,
 }: ExportPanelProps): JSX.Element {
   const [format, setFormat] = useState<ExportFormat>("png");
   const [scale, setScale] = useState(1);
@@ -438,7 +445,7 @@ export function ExportPanel({
 
       {iconPackOpen ? (
         <IconPackDialog
-          nodeIds={[]}
+          nodeIds={selectedIds}
           onClose={() => setIconPackOpen(false)}
           onStatus={onStatus}
         />

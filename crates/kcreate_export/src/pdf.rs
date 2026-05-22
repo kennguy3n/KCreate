@@ -20,14 +20,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
-/// Metadata key on a [`NodeType::VectorLayer`] node holding the
-/// serialised [`VectorPath`]. Identical to the SVG exporter's key.
-pub const VECTOR_PATH_METADATA_KEY: &str = "vector_path";
-
-/// Metadata key on a [`NodeType::RasterLayer`] node holding the
-/// `{ blob_hash, width, height }` payload — the scene-sync layer
-/// writes this on import. Read-only here.
-pub const RASTER_IMAGE_METADATA_KEY: &str = "raster_image";
+pub use crate::scene_metadata::{RASTER_IMAGE_METADATA_KEY, VECTOR_PATH_METADATA_KEY};
 
 /// PDF export options.
 #[derive(Debug, Clone, Serialize, Deserialize)]

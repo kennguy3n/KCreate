@@ -16,9 +16,12 @@
 
 pub mod batch;
 pub mod code_gen;
+pub mod icon_pack;
 pub mod jpeg;
 pub mod pdf;
 pub mod png;
+pub mod preflight;
+pub mod scene_metadata;
 pub mod svg;
 pub mod webp;
 
@@ -31,3 +34,16 @@ pub use pdf::{
 pub use png::{export_png, export_png_to_bytes, PngExportError, PngExportOptions};
 pub use svg::{export_svg_from_document, SvgDocumentExportError, SvgExportOptions};
 pub use webp::{export_webp, export_webp_to_bytes, WebpExportError, WebpExportOptions};
+
+pub use icon_pack::{
+    built_in_platforms, generate_icon_pack, IconFormat, IconPackError, IconPackPlatform,
+    IconPackResult, IconSize, BUILT_IN_PLATFORMS,
+};
+pub use preflight::{
+    run_preflight, ColorSpaceTarget, PreflightCheck, PreflightIssue, PreflightOptions,
+    PreflightSeverity,
+};
+pub use scene_metadata::{
+    raster_image_meta, text_layer_meta, RasterImageMeta, TextLayerMeta,
+    RASTER_IMAGE_METADATA_KEY, TEXT_LAYER_METADATA_KEY, VECTOR_PATH_METADATA_KEY,
+};

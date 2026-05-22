@@ -1188,6 +1188,7 @@ dependencies = [
 name = "kcreate_ai"
 version = "0.0.1"
 dependencies = [
+ "base64",
  "chrono",
  "criterion",
  "image 0.25.10",
@@ -1195,6 +1196,7 @@ dependencies = [
  "log",
  "ort",
  "parking_lot",
+ "rayon",
  "serde",
  "serde_json",
  "tempfile",
@@ -1251,11 +1253,14 @@ dependencies = [
 name = "kcreate_export"
 version = "0.0.1"
 dependencies = [
+ "criterion",
  "image 0.25.10",
  "kcreate_core",
  "kcreate_renderer",
+ "kcreate_text",
  "kcreate_vector",
  "log",
+ "parking_lot",
  "printpdf",
  "rayon",
  "serde",

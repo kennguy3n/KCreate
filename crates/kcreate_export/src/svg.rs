@@ -35,7 +35,7 @@ pub struct SvgExportOptions {
 
 /// Metadata key on a `VectorLayer` node that holds the serialized
 /// `VectorPath`. Storage and export layers agree on this key.
-pub const VECTOR_PATH_METADATA_KEY: &str = "vector_path";
+pub use crate::scene_metadata::VECTOR_PATH_METADATA_KEY;
 
 /// Errors from SVG export.
 #[derive(Debug, Error)]

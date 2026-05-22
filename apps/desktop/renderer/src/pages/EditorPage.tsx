@@ -80,6 +80,20 @@ export function EditorPage({
   const [docStatus, setDocStatus] = useState<DocumentStatus | null>(null);
   const [artboards, setArtboards] = useState<ArtboardInfo[]>([]);
   const [prototypePlaying, setPrototypePlaying] = useState<boolean>(false);
+  // Stable identity for `PrototypePlayer`'s `onClose` prop. Devin
+  // Review PR #5 ANALYSIS-0004 (commit 4ee9970): the player's
+  // keyboard handler lists `onClose` in its `useEffect` deps so the
+  // Escape-to-close binding stays in sync if the host swaps out the
+  // callback. An inline `() => setPrototypePlaying(false)` creates a
+  // new function identity on every parent render → re-adds the
+  // `window.addEventListener("keydown", ...)` listener every time
+  // anything else in `EditorPage` re-renders. `useCallback` with an
+  // empty deps array gives us a single stable identity (React
+  // guarantees `setState` setters are stable), eliminating the
+  // listener churn without changing behaviour.
+  const handlePrototypeClose = useCallback((): void => {
+    setPrototypePlaying(false);
+  }, []);
   const [artboardPresets, setArtboardPresets] = useState<ArtboardPreset[]>(
     [],
   );
@@ -193,6 +207,17 @@ export function EditorPage({
   // The user can re-open the picker any time via the "Templates"
   // button in the PageNavigator footer; this just controls the
   // automatic first-pop.
+  //
+  // **One probe per project session.** Devin Review PR #5
+  // ANALYSIS-0006 on commit 4ee9970 flagged that the previous
+  // implementation re-probed the bridge on every `nodes.length`
+  // change — wasteful since the untouched→touched transition is
+  // monotonic per project session (`operation_log.is_empty()` only
+  // ever flips false→true once, because we never clear the log
+  // mid-session). One probe at project-open time is sufficient; the
+  // probe `useEffect` only fires when `project.id` changes (open /
+  // create / reopen) and the result lives in `untouchedProbe` for
+  // the remainder of the session.
   const [untouchedProbe, setUntouchedProbe] = useState<{
     projectId: string;
     isUntouched: boolean;
@@ -218,14 +243,7 @@ export function EditorPage({
     return () => {
       cancelled = true;
     };
-    // We re-probe whenever the project identity changes or the tree
-    // refreshes (a tree refresh is the renderer's signal that a
-    // mutation just landed; the operation log will have grown if the
-    // user did anything). `nodes.length` is a stable identity-proxy
-    // for "tree shape changed" without depending on the full array
-    // reference (the same pattern PageNavigator uses for
-    // `refreshMasters`).
-  }, [project.id, nodes.length]);
+  }, [project.id]);
 
   useEffect(() => {
     if (mode !== "layout") return;
@@ -1151,7 +1169,7 @@ export function EditorPage({
             startArtboardId={
               selected && selected.nodeType === "Artboard" ? selected.id : null
             }
-            onClose={() => setPrototypePlaying(false)}
+            onClose={handlePrototypeClose}
           />
         </main>
         {rightPanelFocus === "ai" ? (

@@ -275,19 +275,42 @@ export function PageNavigator({
     // is interleaved with the content pages in root order. The bot's
     // PageNavigator BUG-0001 (PR #5) caught this.
     //
-    // Translation: build a list of *root-level Page node ids in
-    // root_ids order* from the document tree, identify the subset
-    // that is content-only, and map the content-pages-relative drop
-    // index back onto the root_ids-relative slot. Using `nodes`
-    // (which `document_get_tree` produces in `root_ids` order, see
+    // Translation: build a list of *every root-level node id in
+    // root_ids order* from the document tree, classify each as
+    // content-page vs. non-content (master pages or — Devin Review
+    // PR #5 ANALYSIS-0002, commit 4ee9970 — any other root node
+    // type that some future feature might insert, e.g. a free-
+    // floating GroupLayer the user dragged out of an artboard),
+    // and map the content-pages-relative drop index back onto the
+    // full root_ids slot. Using `nodes` (which `document_get_tree`
+    // produces in `root_ids` order, see
     // `crates/kcreate_bridge/src/document.rs::document_get_tree`) means
     // we never have to round-trip another IPC call.
+    //
+    // Why we walk *all* root nodes instead of just Pages: the
+    // bridge's `reparentNode(id, null, index)` inserts into the
+    // full `DocumentGraph::root_ids` list, not into a filtered
+    // sub-list. If a non-Page root node ever exists (currently
+    // there's no UI path that creates one, but the DocumentGraph
+    // API doesn't forbid it), filtering by `nodeType === "Page"`
+    // here would silently produce an off-by-N index. The general
+    // form costs nothing extra and survives future features.
     const masterIdSet = new Set(masters.map((m) => m.id));
-    const rootPageIds: string[] = [];
+    const rootIds: string[] = [];
+    const isContentRootId = (id: string): boolean => {
+      // Content page: root-level, nodeType === "Page", NOT flagged
+      // as a master page. Anything else (master pages, hypothetical
+      // free-floating layers) is "non-content" and is preserved in
+      // position but not counted toward the content-page index.
+      const n = nodes.find((node) => node.id === id);
+      if (n === undefined) return false;
+      if (n.nodeType !== "Page") return false;
+      if (masterIdSet.has(n.id)) return false;
+      return true;
+    };
     for (const n of nodes) {
       if (n.parentId !== null) continue;
-      if (n.nodeType !== "Page") continue;
-      rootPageIds.push(n.id);
+      rootIds.push(n.id);
     }
 
     const oldContentIndex = contentPages.findIndex((p) => p.id === draggedId);
@@ -306,9 +329,9 @@ export function PageNavigator({
     // detach (the bridge always detaches first, then inserts). So we
     // model the same: take root_ids order, drop the dragged id, then
     // figure out where the bridge needs to insert so that the dragged
-    // id ends up at content position `newContentIndex` once the
-    // master pages are skipped.
-    const rootIdsAfterDetach = rootPageIds.filter((id) => id !== draggedId);
+    // id ends up at content position `newContentIndex` once
+    // non-content nodes (masters, other root types) are skipped.
+    const rootIdsAfterDetach = rootIds.filter((id) => id !== draggedId);
     // Walk root_ids; count content pages we've passed; when we've
     // passed `newContentIndex` of them, that's where the insert goes.
     let rootInsertIndex = rootIdsAfterDetach.length;
@@ -316,7 +339,7 @@ export function PageNavigator({
     for (let i = 0; i < rootIdsAfterDetach.length; i += 1) {
       const id = rootIdsAfterDetach[i];
       if (id === undefined) continue;
-      if (masterIdSet.has(id)) continue;
+      if (!isContentRootId(id)) continue;
       if (contentSeen === newContentIndex) {
         rootInsertIndex = i;
         break;

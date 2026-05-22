@@ -121,6 +121,23 @@ pub(crate) fn reset_for_tests() {
 /// normally; a native surface cannot be attached on CPU-only
 /// renderers (see [`switch_native`]), so the native branch is
 /// a no-op in that case.
+///
+/// **Partial-failure recovery.** Devin Review PR #5 ANALYSIS-0001
+/// (commit 4ee9970) flagged a state-machine hole: if the offscreen
+/// resize succeeds but the native swapchain reconfigure fails (e.g.
+/// device loss, OOM on a constrained Wayland session), the
+/// offscreen pipeline is already committed to the new size while
+/// the native swapchain still has the old configuration. The next
+/// `render_scene` would rasterise into a `(width, height)` staging
+/// buffer but upload to a stale-sized swapchain, producing garbled
+/// output or a wgpu validation error. We recover by dropping the
+/// native surface entirely on resize failure: the next frame falls
+/// back to the offscreen path (which is already correctly resized),
+/// and the renderer surfaces a `NativeResizeFailed` error so the
+/// host can clear its `requestedMode` toggle and emit a fallback
+/// reason via `onNativeFallback`. Re-attaching the native surface
+/// later (`switch_native`) is a clean rebuild from the platform
+/// handle and won't inherit the broken swapchain.
 pub fn resize(width: u32, height: u32) -> Result<()> {
     let mut guard = slot().lock();
     let ctx = guard.as_mut().ok_or(BridgeError::NotInitialized)?;
@@ -132,7 +149,21 @@ pub fn resize(width: u32, height: u32) -> Result<()> {
     {
         let mut native = native_slot().lock();
         if let Some(surface) = native.as_mut() {
-            ctx.resize_native_surface(surface, width, height)?;
+            match ctx.resize_native_surface(surface, width, height) {
+                Ok(()) => {}
+                Err(e) => {
+                    // Drop the broken native surface so subsequent
+                    // `render_scene` calls take the offscreen path,
+                    // which is already correctly sized at
+                    // (width, height). Holding on to a stale-sized
+                    // swapchain would corrupt every subsequent
+                    // native-mode frame.
+                    *native = None;
+                    drop(native);
+                    drop(guard);
+                    return Err(e.into());
+                }
+            }
         }
     }
     drop(guard);
@@ -181,6 +212,16 @@ pub fn render_scene(scene: Scene) -> Result<FrameId> {
     // Default builds don't compile this branch (the `native_canvas`
     // feature is off), so the binary identical to Phase 0 falls
     // through to the offscreen path.
+    //
+    // **Lock acquisition order: `slot → native_slot → scene_slot`.**
+    // This branch holds three mutex guards simultaneously (the
+    // single most complex synchronisation point in the bridge). The
+    // ordering is consistent with `resize`, `switch_native`, and
+    // `switch_offscreen`, and `shutdown` deliberately drops each
+    // guard before acquiring the next so it can never invert the
+    // order. Devin Review PR #5 ANALYSIS-0005 (commit 4ee9970)
+    // confirmed no deadlock is reachable; the authoritative analysis
+    // lives on the `shutdown()` doc comment.
     #[cfg(feature = "native_canvas")]
     {
         let native = native_slot().lock();

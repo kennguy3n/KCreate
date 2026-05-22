@@ -142,6 +142,42 @@ export interface RendererBridge {
    * published yet.
    */
   acquireFrame(): Promise<AcquiredFrame | null>;
+
+  /**
+   * Current presentation mode. `"offscreen"` (the default) means the
+   * host drives the rAF readback loop via `acquireFrame()`;
+   * `"native"` means the Rust renderer is presenting directly to a
+   * platform window surface and the host should hide the canvas
+   * element. Mirrors `kcreate_bridge::state::PresentationMode`.
+   */
+  presentationMode(): Promise<"offscreen" | "native">;
+
+  /**
+   * Attach a native presentation surface backed by the current
+   * BrowserWindow's platform handle. `width` and `height` are
+   * physical pixels (multiply CSS pixels by `devicePixelRatio`).
+   *
+   * Resolves to the platform variant the bridge interpreted the
+   * handle as (`"appkit"` / `"win32"` / `"x11"` / `"wayland"`).
+   * Rejects when the bridge was compiled without the `native_canvas`
+   * feature, when the handle bytes are malformed, or when GPU
+   * surface creation fails \u2014 in any of those cases the host should
+   * stay on the offscreen path.
+   *
+   * The host does NOT pass the handle bytes itself; the main process
+   * fetches them from `BrowserWindow::getNativeWindowHandle()` and
+   * forwards them to the bridge in the same IPC.
+   */
+  switchNative(
+    width: number,
+    height: number,
+  ): Promise<"appkit" | "win32" | "x11" | "wayland">;
+
+  /**
+   * Detach any attached native surface and revert to the offscreen
+   * readback path. No-op when already in offscreen mode.
+   */
+  switchOffscreen(): Promise<void>;
 }
 
 /**

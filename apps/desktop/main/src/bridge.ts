@@ -82,6 +82,20 @@ export interface Bridge {
   rendererFrameInfo(): FrameInfoSnake | null;
   rendererAcquireFrame(): AcquiredFrameSnake | null;
 
+  // Native canvas presentation mode (Phase 1, Block A, Tasks 4–6).
+  //
+  // `rendererSwitchNative` errors with a "feature not compiled in"
+  // message when the bridge was built without the `native_canvas`
+  // Cargo feature; the host should treat that as a signal to stay on
+  // the offscreen readback path.
+  rendererPresentationMode(): string;
+  rendererSwitchNative(
+    handleBytes: Buffer | Uint8Array,
+    width: number,
+    height: number,
+  ): string;
+  rendererSwitchOffscreen(): void;
+
   // Document / project lifecycle
   projectCreate(name: string, dir: string): ProjectInfoSnake;
   projectOpen(dir: string): ProjectInfoSnake;

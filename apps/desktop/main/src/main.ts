@@ -260,6 +260,14 @@ function requireBridge(): Bridge {
   return bridge;
 }
 
+// The currently active main BrowserWindow. Tracked at module scope
+// so the `kcreate/canvas/native-handle` IPC can extract the
+// platform-specific window handle for the native presentation path
+// (Phase 1, Block A, Task 4). Set in `createWindow`, cleared on the
+// window's `closed` event so a stale reference can never outlive the
+// native handle it would hand out.
+let mainWindow: BrowserWindow | null = null;
+
 function createWindow(): BrowserWindow {
   const win = new BrowserWindow({
     width: 1280,
@@ -284,6 +292,10 @@ function createWindow(): BrowserWindow {
   }
 
   win.once("ready-to-show", () => win.show());
+  mainWindow = win;
+  win.on("closed", () => {
+    if (mainWindow === win) mainWindow = null;
+  });
   return win;
 }
 
@@ -328,6 +340,38 @@ function registerIpcHandlers(): void {
   );
   ipcMain.handle("kcreate/renderer/acquireFrame", () =>
     requireBridge().rendererAcquireFrame(),
+  );
+
+  // Native canvas presentation mode (Phase 1, Block A, Tasks 4–6).
+  //
+  // The renderer can ask the main process to extract the platform
+  // window handle (`NSView*` / `HWND` / `XID` / `wl_surface*`) from
+  // the BrowserWindow and pass it back as a Buffer; the renderer then
+  // calls `switchNative` with those bytes to swap the presentation
+  // path away from CPU readback. The exact byte interpretation lives
+  // on the Rust side under `crates/kcreate_bridge/src/native_canvas.rs`,
+  // gated behind the `native_canvas` Cargo feature so the default
+  // build remains `unsafe`-free.
+  ipcMain.handle("kcreate/canvas/native-handle", () => {
+    const win = mainWindow;
+    if (!win || win.isDestroyed()) return null;
+    // Electron exposes `getNativeWindowHandle()` on every platform; it
+    // returns a Node `Buffer` containing the platform-specific handle
+    // (size + endianness vary). We forward the bytes opaquely — the
+    // bridge interprets them based on the host OS.
+    const handle = win.getNativeWindowHandle();
+    return handle;
+  });
+  ipcMain.handle(
+    "kcreate/renderer/switchNative",
+    (_e, handleBytes: Buffer, width: number, height: number) =>
+      requireBridge().rendererSwitchNative(handleBytes, width, height),
+  );
+  ipcMain.handle("kcreate/renderer/switchOffscreen", () => {
+    requireBridge().rendererSwitchOffscreen();
+  });
+  ipcMain.handle("kcreate/renderer/presentationMode", () =>
+    requireBridge().rendererPresentationMode(),
   );
 
   // Document / project lifecycle.

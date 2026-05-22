@@ -155,6 +155,50 @@ const renderer: RendererBridge = {
       bytes,
     };
   },
+  async presentationMode(): Promise<"offscreen" | "native"> {
+    const mode = (await ipcRenderer.invoke(
+      "kcreate/renderer/presentationMode",
+    )) as string;
+    return mode === "native" ? "native" : "offscreen";
+  },
+  async switchNative(
+    width,
+    height,
+  ): Promise<"appkit" | "win32" | "x11" | "wayland"> {
+    // The handle bytes come from the main process — we don't expose
+    // `BrowserWindow::getNativeWindowHandle()` to the sandboxed
+    // renderer. Two IPC hops in one user gesture is fine; this is a
+    // settings-toggle action, not a per-frame path.
+    const handle = (await ipcRenderer.invoke(
+      "kcreate/canvas/native-handle",
+    )) as Buffer | null;
+    if (!handle) {
+      throw new Error(
+        "switchNative: main process has no active BrowserWindow to extract the native handle from",
+      );
+    }
+    const platform = (await ipcRenderer.invoke(
+      "kcreate/renderer/switchNative",
+      handle,
+      width,
+      height,
+    )) as string;
+    // Narrow the string into the typed union the renderer expects.
+    if (
+      platform === "appkit" ||
+      platform === "win32" ||
+      platform === "x11" ||
+      platform === "wayland"
+    ) {
+      return platform;
+    }
+    throw new Error(
+      "switchNative: bridge returned unknown platform variant " + platform,
+    );
+  },
+  async switchOffscreen(): Promise<void> {
+    await ipcRenderer.invoke("kcreate/renderer/switchOffscreen");
+  },
 };
 
 // Snake-case shapes returned from the native bridge. Documented here in

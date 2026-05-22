@@ -231,6 +231,75 @@ pub fn renderer_acquire_frame() -> NapiResult<Option<AcquiredFrame>> {
 }
 
 // =============================================================================
+// Native canvas presentation mode — Phase 1, Block A, Task 4–6.
+//
+// The N-API surface for `presentation_mode` / `switch_native` /
+// `switch_offscreen` is always exported (so the host code does not
+// have to branch on which Cargo features the cdylib was built with):
+// in default builds `presentation_mode` always returns "offscreen",
+// `switch_offscreen` is a no-op, and `switch_native` errors with a
+// clear "feature not compiled in" message that the renderer can
+// surface as a fallback.
+// =============================================================================
+
+/// Returns the current presentation mode (`"offscreen"` or `"native"`).
+///
+/// `"offscreen"` means the host should drive the `requestAnimationFrame`
+/// readback loop via `renderer.acquireFrame()`. `"native"` means the
+/// Rust renderer is presenting directly to a platform window surface
+/// and the host should hide its canvas element.
+#[napi]
+#[must_use]
+pub fn renderer_presentation_mode() -> String {
+    state::presentation_mode().as_str().to_string()
+}
+
+/// Attach a native presentation surface created from the raw bytes
+/// returned by Electron's `BrowserWindow::getNativeWindowHandle()`.
+///
+/// `width` / `height` are the surface's physical pixel dimensions
+/// (caller is responsible for multiplying CSS pixels by
+/// `devicePixelRatio`). Returns the platform variant the bridge
+/// interpreted the bytes as (`"appkit"`, `"win32"`, `"x11"`, or
+/// `"wayland"`).
+///
+/// Errors with a `feature not compiled in` message in default builds
+/// (the `native_canvas` feature flag gates the platform-specific
+/// `raw_window_handle` interpretation). The host should treat that
+/// error as a signal to remain in offscreen mode.
+#[napi]
+#[allow(clippy::needless_pass_by_value, unused_variables)]
+pub fn renderer_switch_native(
+    handle_bytes: Buffer,
+    width: u32,
+    height: u32,
+) -> NapiResult<String> {
+    #[cfg(feature = "native_canvas")]
+    {
+        state::switch_native(handle_bytes.as_ref(), width, height).map_err(map_err)
+    }
+    #[cfg(not(feature = "native_canvas"))]
+    {
+        Err(napi::Error::from_reason(
+            "renderer_switch_native: bridge was compiled without the `native_canvas` feature; \
+             cannot interpret the platform window handle. Stay on the offscreen path."
+                .to_string(),
+        ))
+    }
+}
+
+/// Detach any attached native surface and revert to the offscreen
+/// readback path. No-op when already in offscreen mode (or when the
+/// `native_canvas` feature is not compiled in).
+#[napi]
+pub fn renderer_switch_offscreen() {
+    #[cfg(feature = "native_canvas")]
+    {
+        state::switch_offscreen();
+    }
+}
+
+// =============================================================================
 // Document / project bridge
 // =============================================================================
 

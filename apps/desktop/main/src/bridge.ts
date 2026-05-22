@@ -323,6 +323,10 @@ export interface Bridge {
   ): void;
   mcpPermissionRevoke(clientId: string, toolName: string): void;
   mcpStatus(): string;
+  // Phase 2 — color management (ICC / CMYK foundation).
+  colorSettingsGet(): string;
+  colorSettingsUpdate(settingsJson: string): void;
+  colorConvert(fromJson: string, toSpace: string): string;
 }
 
 function bridgeBinaryPath(): string {

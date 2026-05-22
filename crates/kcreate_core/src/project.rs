@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
+use crate::color::ColorSettings;
 use crate::component::{ComponentDefinition, ComponentError};
 use crate::document::{DocumentError, DocumentGraph};
 use crate::node::{Bounds, Node, NodeType, RgbaColor};
@@ -162,6 +163,12 @@ pub struct Project {
     /// is stable across re-saves (no ordering churn).
     #[serde(default)]
     pub components: HashMap<Uuid, ComponentDefinition>,
+    /// Document-level color management settings (RGB / CMYK working
+    /// spaces, rendering intent, soft-proof). `#[serde(default)]` so
+    /// older project files still deserialize cleanly with sRGB
+    /// defaults.
+    #[serde(default)]
+    pub color_settings: ColorSettings,
     pub created_at: DateTime<Utc>,
     pub modified_at: DateTime<Utc>,
 }
@@ -217,6 +224,7 @@ impl Project {
             brand_kits: Vec::new(),
             export_presets: Vec::new(),
             components: HashMap::new(),
+            color_settings: ColorSettings::default(),
             created_at: now,
             modified_at: now,
         }

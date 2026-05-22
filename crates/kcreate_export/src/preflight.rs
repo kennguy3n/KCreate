@@ -442,9 +442,12 @@ fn check_node_image_resolution(
 
 /// Color space check.
 ///
-/// Document fills are always RGBA in the current model. When the
-/// target is CMYK, any non-monochrome solid or gradient fill is
-/// flagged as a warning — conversion is a Phase 3 feature.
+/// When the target is CMYK, any chromatic *RGB* fill is flagged as a
+/// warning so the user knows the export pipeline will run an
+/// approximate sRGB → CMYK conversion (full ICC transforms are Phase
+/// 3). A `Color::Cmyk` override or grayscale RGB fill is accepted
+/// without comment; a `Color::Lab` / `Color::Hsl` override is also
+/// flagged because emission goes through the same sRGB→CMYK path.
 fn check_node_color_space(
     node: &Node,
     page_id: Uuid,
@@ -454,7 +457,7 @@ fn check_node_color_space(
     if options.target_color_space != ColorSpaceTarget::Cmyk {
         return;
     }
-    if !fill_has_chromatic_rgb(&node.style.fill) {
+    if !node_needs_cmyk_conversion(node) {
         return;
     }
     issues.push(PreflightIssue {
@@ -467,6 +470,26 @@ fn check_node_color_space(
         affected_node_id: Some(node.id),
         page_id: Some(page_id),
     });
+}
+
+/// Does this node carry a chromatic non-CMYK color that will go
+/// through the sRGB→CMYK approximation when exported to a CMYK target?
+fn node_needs_cmyk_conversion(node: &Node) -> bool {
+    // A CMYK override means the user already authored in the target
+    // space; nothing to convert. Any other override variant (sRGB,
+    // Lab, HSL) ends up going through srgb_to_cmyk and so qualifies
+    // as a chromatic RGB fill for the purposes of this check.
+    if let Some(over) = &node.style.color_override {
+        return match over {
+            kcreate_core::color::Color::Cmyk { .. } => false,
+            kcreate_core::color::Color::Srgb { r, g, b, .. } => !is_grayscale(*r, *g, *b),
+            kcreate_core::color::Color::Hsl { s, .. } => *s > 0.01,
+            kcreate_core::color::Color::Lab { a_star, b_star, .. } => {
+                a_star.abs() > 1.0 || b_star.abs() > 1.0
+            }
+        };
+    }
+    fill_has_chromatic_rgb(&node.style.fill)
 }
 
 fn fill_has_chromatic_rgb(fill: &FillStyle) -> bool {

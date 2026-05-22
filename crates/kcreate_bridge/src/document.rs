@@ -455,6 +455,7 @@ pub fn project_open(dir: &Path) -> Result<ProjectInfo> {
     project.brand_kits = store.load_brand_kits()?;
     project.export_presets = store.load_export_presets()?;
     project.components = store.load_components()?;
+    project.color_settings = store.load_color_settings()?;
     // Restore the operation log from disk so undo survives close+reopen.
     let max_depth = project.operation_log.max_depth();
     let history = store.load_operations(max_depth)?;
@@ -510,6 +511,7 @@ pub fn project_save() -> Result<()> {
     // stable. Brand kits / presets are upserted by id; the design
     // tokens table holds a single row keyed on `'current'`.
     ws.store.save_design_tokens(&ws.project.design_tokens)?;
+    ws.store.save_color_settings(&ws.project.color_settings)?;
     for kit in &ws.project.brand_kits {
         ws.store.save_brand_kit(kit)?;
     }
@@ -3129,6 +3131,12 @@ pub struct PdfExportRequest {
     pub height_mm: f64,
     #[serde(default)]
     pub title: Option<String>,
+    /// Output color mode: `"rgb"` (default), `"cmyk"`, or
+    /// `"passThrough"`. When omitted, the document's
+    /// `color_settings.working_space_cmyk` chooses CMYK iff a CMYK
+    /// working space is set; otherwise RGB.
+    #[serde(default)]
+    pub color_mode: Option<String>,
 }
 
 /// Render the open document to PDF. Returns the number of bytes written.
@@ -3165,6 +3173,28 @@ pub fn export_pdf_file(output_path: &Path, options: &PdfExportRequest) -> Result
             rasters.insert(meta.blob_hash, pixels);
         }
     }
+    let resolved_color_mode = match options.color_mode.as_deref() {
+        Some("rgb" | "Rgb") => kcreate_export::pdf::PdfColorMode::Rgb,
+        Some("cmyk" | "Cmyk" | "CMYK") => kcreate_export::pdf::PdfColorMode::Cmyk,
+        Some("passThrough" | "pass_through" | "PassThrough") => {
+            kcreate_export::pdf::PdfColorMode::PassThrough
+        }
+        Some(other) => {
+            return Err(DocumentBridgeError::InvalidArgument {
+                argument: "color_mode".into(),
+                value: other.to_string(),
+            });
+        }
+        None => {
+            // Auto-pick from the document's color settings: a CMYK
+            // working space implies the user wants a print-bound PDF.
+            if ws.project.color_settings.working_space_cmyk.is_some() {
+                kcreate_export::pdf::PdfColorMode::Cmyk
+            } else {
+                kcreate_export::pdf::PdfColorMode::Rgb
+            }
+        }
+    };
     let opts = kcreate_export::pdf::PdfExportOptions {
         width_mm: options.width_mm,
         height_mm: options.height_mm,
@@ -3172,6 +3202,7 @@ pub fn export_pdf_file(output_path: &Path, options: &PdfExportRequest) -> Result
             .title
             .clone()
             .unwrap_or_else(|| ws.project.name.clone()),
+        color_mode: resolved_color_mode,
     };
     let bytes = kcreate_export::pdf::export_pdf_from_document(
         &ws.project.document,
@@ -5229,6 +5260,120 @@ mod tests {
                 ),
                 "parse_page_size should reject case-folded form {bad:?}"
             );
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // Phase 2 — color management bridge tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    #[serial]
+    fn color_settings_default_round_trips_through_get() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("cs", dir.path()).expect("create");
+
+        let raw = crate::phase2::color_settings_get().expect("get");
+        let parsed: kcreate_core::color::ColorSettings =
+            serde_json::from_str(&raw).expect("parse");
+        assert_eq!(parsed, kcreate_core::color::ColorSettings::default());
+        project_close();
+    }
+
+    #[test]
+    #[serial]
+    fn color_settings_update_persists_across_close_reopen() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("cs", dir.path()).expect("create");
+
+        let new_settings = kcreate_core::color::ColorSettings {
+            working_space_rgb: kcreate_core::color::IccProfile::AdobeRgb1998,
+            working_space_cmyk: Some(kcreate_core::color::IccProfile::FogRa39),
+            rendering_intent: kcreate_core::color::RenderingIntent::RelativeColorimetric,
+            soft_proof_profile: Some(kcreate_core::color::IccProfile::Swop2006),
+            gamut_warning: true,
+        };
+        crate::phase2::color_settings_update(&serde_json::to_string(&new_settings).unwrap())
+            .expect("update");
+
+        project_save().expect("save");
+        project_close();
+        project_open(&dir.path().join("cs.kstudio")).expect("reopen");
+
+        let raw = crate::phase2::color_settings_get().expect("get after reopen");
+        let parsed: kcreate_core::color::ColorSettings =
+            serde_json::from_str(&raw).expect("parse after reopen");
+        assert_eq!(parsed, new_settings);
+        project_close();
+    }
+
+    #[test]
+    #[serial]
+    fn color_convert_srgb_to_cmyk_round_trip() {
+        reset_for_tests();
+        // Pure red sRGB → CMYK should pass through srgb_to_cmyk and
+        // come back with full magenta + yellow, zero cyan + black.
+        let red = kcreate_core::color::Color::Srgb {
+            r: 1.0,
+            g: 0.0,
+            b: 0.0,
+            a: 1.0,
+        };
+        let raw = crate::phase2::color_convert(&serde_json::to_string(&red).unwrap(), "cmyk")
+            .expect("convert");
+        let out: kcreate_core::color::Color = serde_json::from_str(&raw).expect("parse");
+        match out {
+            kcreate_core::color::Color::Cmyk { c, m, y, k, a } => {
+                assert!(c.abs() < 1e-5, "c should be 0, got {c}");
+                assert!((m - 1.0).abs() < 1e-5, "m should be 1, got {m}");
+                assert!((y - 1.0).abs() < 1e-5, "y should be 1, got {y}");
+                assert!(k.abs() < 1e-5, "k should be 0, got {k}");
+                assert!((a - 1.0).abs() < 1e-5);
+            }
+            other => panic!("expected Cmyk variant, got {other:?}"),
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn color_convert_preserves_authored_cmyk() {
+        // CMYK → CMYK must short-circuit so K-channel data survives.
+        // Round-tripping through sRGB would conflate (0, 0, 0, K=0.5)
+        // and (0.5, 0.5, 0.5, K=0) into the same RGB triplet, which
+        // is exactly what the print pipeline cannot tolerate.
+        let authored = kcreate_core::color::Color::Cmyk {
+            c: 0.1,
+            m: 0.2,
+            y: 0.3,
+            k: 0.5,
+            a: 1.0,
+        };
+        let raw =
+            crate::phase2::color_convert(&serde_json::to_string(&authored).unwrap(), "cmyk")
+                .expect("convert");
+        let out: kcreate_core::color::Color = serde_json::from_str(&raw).expect("parse");
+        assert_eq!(out, authored);
+    }
+
+    #[test]
+    #[serial]
+    fn color_convert_rejects_unknown_space() {
+        let red = kcreate_core::color::Color::Srgb {
+            r: 1.0,
+            g: 0.0,
+            b: 0.0,
+            a: 1.0,
+        };
+        let err = crate::phase2::color_convert(&serde_json::to_string(&red).unwrap(), "yuv")
+            .expect_err("unknown space must error");
+        match err {
+            DocumentBridgeError::InvalidArgument { argument, value } => {
+                assert_eq!(argument, "to_space");
+                assert_eq!(value, "yuv");
+            }
+            other => panic!("expected InvalidArgument, got {other:?}"),
         }
     }
 }

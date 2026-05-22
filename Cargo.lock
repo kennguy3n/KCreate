@@ -1271,6 +1271,7 @@ name = "kcreate_export"
 version = "0.0.1"
 dependencies = [
  "criterion",
+ "flate2",
  "image 0.25.10",
  "kcreate_core",
  "kcreate_renderer",

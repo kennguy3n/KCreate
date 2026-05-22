@@ -29,6 +29,10 @@ parking_lot.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 criterion.workspace = true
+# Used by the CMYK PDF export tests to inflate printpdf's
+# FlateDecode content streams so we can scrub them for raw
+# `k` / `rg` operators.
+flate2 = "1"
 
 [[bench]]
 name = "preflight"

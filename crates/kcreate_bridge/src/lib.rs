@@ -1691,3 +1691,29 @@ pub fn mcp_status() -> NapiResult<String> {
     let status = phase2::mcp_status();
     serde_json::to_string(&status).map_err(|e| NapiError::from_reason(e.to_string()))
 }
+
+// ---------------------------------------------------------------------------
+// Phase 2 — color management
+// ---------------------------------------------------------------------------
+
+/// Read the project's color management settings as JSON.
+#[napi]
+pub fn color_settings_get() -> NapiResult<String> {
+    phase2::color_settings_get().map_err(map_doc_err)
+}
+
+/// Replace the project's color management settings. `settings_json`
+/// must deserialize into `kcreate_core::color::ColorSettings`.
+/// Records an undoable `color_settings_update` operation.
+#[napi]
+pub fn color_settings_update(settings_json: String) -> NapiResult<()> {
+    phase2::color_settings_update(&settings_json).map_err(map_doc_err)
+}
+
+/// Convert a color value between color spaces. `to_space` is one of
+/// `"srgb"`, `"cmyk"`, `"lab"`, `"hsl"`. Returns the converted color
+/// as a JSON `kcreate_core::color::Color`.
+#[napi]
+pub fn color_convert(from_json: String, to_space: String) -> NapiResult<String> {
+    phase2::color_convert(&from_json, &to_space).map_err(map_doc_err)
+}

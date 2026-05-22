@@ -501,11 +501,26 @@ impl Default for StrokeStyle {
 }
 
 /// Painted appearance of a node.
+///
+/// `fill` is the renderer's view of the color (always RGBA-in-sRGB
+/// space). `color_override`, when present, is the authoritative fill
+/// color in its native color space (CMYK, Lab, HSL, or sRGB) — the
+/// renderer converts it to sRGB via [`crate::color::Color::to_srgb`]
+/// for display, while the export pipeline keeps the original space
+/// for print-faithful PDF / icc-tagged PNG output. Phase 2 nodes
+/// default to `color_override = None` so existing documents keep
+/// behaving exactly as before.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NodeStyle {
     pub fill: FillStyle,
     pub stroke: Option<StrokeStyle>,
     pub corner_radius: f64,
+    /// Optional non-sRGB authoritative color for this node. When
+    /// present, takes precedence over `fill` for export-time color
+    /// space decisions (CMYK PDF, Lab swatches). `None` means
+    /// "the renderer's `fill` is canonical".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color_override: Option<crate::color::Color>,
 }
 
 impl Default for NodeStyle {
@@ -514,6 +529,7 @@ impl Default for NodeStyle {
             fill: FillStyle::Solid(RgbaColor::WHITE),
             stroke: None,
             corner_radius: 0.0,
+            color_override: None,
         }
     }
 }

@@ -732,6 +732,103 @@ pub fn mcp_status() -> McpStatus {
 }
 
 // -----------------------------------------------------------------------------
+// Color management (Phase 2)
+// -----------------------------------------------------------------------------
+
+/// Read the project's [`ColorSettings`] as JSON. Returns the
+/// `Default` (sRGB, no CMYK profile, perceptual intent) when no
+/// project is currently loaded, so the renderer/UI can always render
+/// the panel without crashing.
+pub fn color_settings_get() -> Result<String> {
+    let settings = with_workspace(|ws| Ok(ws.project.color_settings.clone()))?;
+    Ok(serde_json::to_string(&settings)?)
+}
+
+/// Replace the project's [`ColorSettings`] with the supplied JSON
+/// blob and record an operation so the change participates in undo.
+///
+/// The operation `kind` is `"color_settings_update"`; `before_patch`
+/// is the previous settings JSON, `after_patch` is the new one, and
+/// `affected_nodes` is empty because color settings are document-wide
+/// (no specific node is mutated).
+pub fn color_settings_update(settings_json: &str) -> Result<()> {
+    use kcreate_core::color::ColorSettings;
+    let new_settings: ColorSettings = serde_json::from_str(settings_json)?;
+    with_workspace_mut(|ws| {
+        let before = serde_json::to_value(&ws.project.color_settings)?;
+        let after = serde_json::to_value(&new_settings)?;
+        ws.project.color_settings = new_settings;
+        let op = Operation::new(
+            "user",
+            "color_settings_update",
+            before,
+            after,
+            Vec::<Uuid>::new(),
+        );
+        ws.project.execute_operation(op);
+        Ok(())
+    })?;
+    sync_scene_after_change();
+    Ok(())
+}
+
+/// Convert a single color value between color spaces. `from_json`
+/// must deserialize into a [`kcreate_core::color::Color`]; `to_space`
+/// is one of `"srgb"`, `"cmyk"`, `"lab"`, `"hsl"`. The result is
+/// serialized back to JSON.
+///
+/// This is a pure utility (no workspace lock needed) so the color
+/// picker can preview conversions in real time even when no project
+/// is open.
+pub fn color_convert(from_json: &str, to_space: &str) -> Result<String> {
+    use kcreate_core::color::{srgb_to_cmyk, srgb_to_hsl, srgb_to_lab, Color};
+    let from: Color = serde_json::from_str(from_json)?;
+    // `Color::to_srgb` is the canonical entry into the sRGB connection
+    // space for every variant; the per-space helpers below only need
+    // the sRGB triplet plus the alpha that came with the source.
+    let (r, g, b, a) = from.to_srgb();
+    let converted = match to_space {
+        "srgb" => Color::Srgb { r, g, b, a },
+        "cmyk" => match &from {
+            // Preserve authored CMYK exactly — round-tripping through
+            // sRGB throws away K-channel information that the print
+            // pipeline depends on (CSS Color Module Level 4 §13).
+            Color::Cmyk { c, m, y, k, a } => Color::Cmyk {
+                c: *c,
+                m: *m,
+                y: *y,
+                k: *k,
+                a: *a,
+            },
+            _ => {
+                let (c, m, y, k) = srgb_to_cmyk(r, g, b);
+                Color::Cmyk { c, m, y, k, a }
+            }
+        },
+        "lab" => {
+            let (l, a_star, b_star) = srgb_to_lab(r, g, b);
+            Color::Lab {
+                l,
+                a_star,
+                b_star,
+                alpha: a,
+            }
+        }
+        "hsl" => {
+            let (h, s, l) = srgb_to_hsl(r, g, b);
+            Color::Hsl { h, s, l, a }
+        }
+        other => {
+            return Err(DocumentBridgeError::InvalidArgument {
+                argument: "to_space".into(),
+                value: other.to_string(),
+            });
+        }
+    };
+    Ok(serde_json::to_string(&converted)?)
+}
+
+// -----------------------------------------------------------------------------
 // Avoid unused warnings on disabled features
 // -----------------------------------------------------------------------------
 

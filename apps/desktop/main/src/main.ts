@@ -1025,6 +1025,24 @@ function registerIpcHandlers(): void {
   ipcMain.handle("kcreate/mcp/status", () =>
     requireBridge().mcpStatus(),
   );
+
+  // ---------------------------------------------------------------------
+  // Phase 2 — color management (ICC / CMYK foundation)
+  // ---------------------------------------------------------------------
+  ipcMain.handle("kcreate/color/settings/get", () =>
+    requireBridge().colorSettingsGet(),
+  );
+  ipcMain.handle(
+    "kcreate/color/settings/update",
+    (_e, settingsJson: string) => {
+      requireBridge().colorSettingsUpdate(settingsJson);
+    },
+  );
+  ipcMain.handle(
+    "kcreate/color/convert",
+    (_e, fromJson: string, toSpace: string) =>
+      requireBridge().colorConvert(fromJson, toSpace),
+  );
 }
 
 void app.whenReady().then(() => {

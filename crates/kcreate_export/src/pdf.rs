@@ -11,16 +11,41 @@ use std::fs;
 use std::path::Path;
 
 use image::{GenericImageView, ImageFormat};
+use kcreate_core::color::{srgb_to_cmyk, Color};
 use kcreate_core::document::DocumentGraph;
 use kcreate_core::node::{FillStyle, Node, NodeType};
 use kcreate_vector::{PathPoint, PathSegment, VectorPath};
 use printpdf::path::{PaintMode, WindingOrder};
-use printpdf::{Image, ImageTransform, Mm, PdfDocument, PdfLayerReference, Point, Polygon, Rgb};
+use printpdf::{
+    Cmyk, Image, ImageTransform, Mm, PdfDocument, PdfLayerReference, Point, Polygon, Rgb,
+};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
 pub use crate::scene_metadata::{RASTER_IMAGE_METADATA_KEY, VECTOR_PATH_METADATA_KEY};
+
+/// Target color space used when writing PDF color operators.
+///
+/// * `Rgb` — every fill is written with `rg` / `RG` (DeviceRGB). The
+///   default; matches the pre-Phase-2 behaviour exactly.
+/// * `Cmyk` — every fill is written with `k` / `K` (DeviceCMYK).
+///   `Color::Srgb` values are converted via
+///   [`kcreate_core::color::srgb_to_cmyk`]; `Color::Cmyk` values pass
+///   through unchanged so authored CMYK values do not get mangled by
+///   a round-trip through sRGB.
+/// * `PassThrough` — each fill is emitted in its native space. RGB
+///   fills become `rg` / `RG`; CMYK overrides become `k` / `K`. This
+///   is what print shops typically expect when handed a
+///   mixed-color-space document.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PdfColorMode {
+    #[default]
+    Rgb,
+    Cmyk,
+    PassThrough,
+}
 
 /// PDF export options.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -29,6 +54,10 @@ pub struct PdfExportOptions {
     pub width_mm: f64,
     pub height_mm: f64,
     pub title: String,
+    /// Which device color space to write to the PDF content stream.
+    /// Defaults to `Rgb` so callers that never opted into the
+    /// Phase 2 CMYK pipeline keep producing byte-identical PDFs.
+    pub color_mode: PdfColorMode,
 }
 
 impl Default for PdfExportOptions {
@@ -37,6 +66,56 @@ impl Default for PdfExportOptions {
             width_mm: 210.0,
             height_mm: 297.0,
             title: "KCreate document".to_string(),
+            color_mode: PdfColorMode::Rgb,
+        }
+    }
+}
+
+/// Resolve the authoritative fill color for a node, taking the
+/// optional [`NodeStyle::color_override`] into account. Returns
+/// `None` when the node has no fill (or fill alpha 0), in which
+/// case the caller should skip the fill operator entirely.
+fn resolve_fill_color(node: &Node) -> Option<Color> {
+    if let Some(over) = &node.style.color_override {
+        // The override carries its own alpha; we still respect the
+        // RGBA `fill`'s alpha if the override is opaque-by-default
+        // because alpha lives on the renderer-side fill in Phase 2.
+        return Some(over.clone());
+    }
+    match node.style.fill {
+        FillStyle::Solid(rgba) if rgba.a > 0.0 => Some(Color::Srgb {
+            r: rgba.r,
+            g: rgba.g,
+            b: rgba.b,
+            a: rgba.a,
+        }),
+        FillStyle::Solid(_) | FillStyle::None | FillStyle::Gradient(_) => None,
+    }
+}
+
+/// Map a [`Color`] to the `printpdf` color enum that the requested
+/// output mode dictates.
+///
+/// - `Cmyk` mode emits `DeviceCMYK` for every fill, converting sRGB →
+///   CMYK on the fly via [`srgb_to_cmyk`]. Authored CMYK values pass
+///   through unchanged so the K-channel survives.
+/// - `PassThrough` mode keeps each color in its native space: CMYK
+///   stays CMYK, everything else falls back to sRGB.
+/// - `Rgb` mode (the default) collapses every input to `DeviceRGB`.
+fn color_to_printpdf(c: &Color, mode: PdfColorMode) -> printpdf::Color {
+    let (r, g, b, _a) = c.to_srgb();
+    match (mode, c) {
+        // Both `Cmyk` mode and `PassThrough` mode preserve authored
+        // CMYK exactly so we can route them through the same arm.
+        (PdfColorMode::Cmyk | PdfColorMode::PassThrough, Color::Cmyk { c, m, y, k, .. }) => {
+            printpdf::Color::Cmyk(Cmyk::new(*c, *m, *y, *k, None))
+        }
+        (PdfColorMode::Cmyk, _) => {
+            let (cc, mm, yy, kk) = srgb_to_cmyk(r, g, b);
+            printpdf::Color::Cmyk(Cmyk::new(cc, mm, yy, kk, None))
+        }
+        (PdfColorMode::PassThrough | PdfColorMode::Rgb, _) => {
+            printpdf::Color::Rgb(Rgb::new(r, g, b, None))
         }
     }
 }
@@ -107,6 +186,7 @@ pub fn export_pdf_from_document(
         sx,
         sy,
         options.height_mm,
+        options.color_mode,
     )?;
 
     let bytes = doc
@@ -138,6 +218,7 @@ fn walk_nodes(
     sx: f64,
     sy: f64,
     page_height_mm: f64,
+    color_mode: PdfColorMode,
 ) -> Result<(), PdfExportError> {
     for id in ids {
         let Some(node) = document.get_node(*id) else {
@@ -148,7 +229,16 @@ fn walk_nodes(
         }
         match node.node_type {
             NodeType::VectorLayer => {
-                emit_vector(node, layer, origin_x, origin_y, sx, sy, page_height_mm)?;
+                emit_vector(
+                    node,
+                    layer,
+                    origin_x,
+                    origin_y,
+                    sx,
+                    sy,
+                    page_height_mm,
+                    color_mode,
+                )?;
             }
             NodeType::RasterLayer => {
                 emit_raster(
@@ -174,6 +264,7 @@ fn walk_nodes(
             sx,
             sy,
             page_height_mm,
+            color_mode,
         )?;
     }
     Ok(())
@@ -222,6 +313,7 @@ fn accumulate_bounds(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_vector(
     node: &Node,
     layer: &PdfLayerReference,
@@ -230,6 +322,7 @@ fn emit_vector(
     sx: f64,
     sy: f64,
     page_height_mm: f64,
+    color_mode: PdfColorMode,
 ) -> Result<(), PdfExportError> {
     let Some(value) = node.metadata.get(VECTOR_PATH_METADATA_KEY) else {
         return Ok(());
@@ -237,10 +330,8 @@ fn emit_vector(
     let path: VectorPath = serde_json::from_value(value.clone())
         .map_err(|e| PdfExportError::InvalidVectorPath(node.id, e.to_string()))?;
 
-    let (r, g, b, has_fill) = match node.style.fill {
-        FillStyle::Solid(rgba) => (rgba.r, rgba.g, rgba.b, rgba.a > 0.0),
-        FillStyle::None | FillStyle::Gradient(_) => (0.0, 0.0, 0.0, false),
-    };
+    let fill_color = resolve_fill_color(node);
+    let has_fill = fill_color.is_some();
 
     // Build rings: each sub-path between `MoveTo` and `Close` is a
     // ring of the polygon. Open sub-paths still become a single open
@@ -346,8 +437,23 @@ fn emit_vector(
         return Ok(());
     }
 
-    layer.set_fill_color(printpdf::Color::Rgb(Rgb::new(r, g, b, None)));
-    layer.set_outline_color(printpdf::Color::Rgb(Rgb::new(0.0, 0.0, 0.0, None)));
+    let fill_pdf_color = fill_color
+        .as_ref()
+        .map_or_else(
+            || printpdf::Color::Rgb(Rgb::new(0.0, 0.0, 0.0, None)),
+            |c| color_to_printpdf(c, color_mode),
+        );
+    // Stroke (outline) matches the requested color mode so we never
+    // mix `rg` and `K` operators in the same content stream when the
+    // caller asked for pure DeviceCMYK output.
+    let outline_pdf_color = match color_mode {
+        PdfColorMode::Cmyk => printpdf::Color::Cmyk(Cmyk::new(0.0, 0.0, 0.0, 1.0, None)),
+        PdfColorMode::Rgb | PdfColorMode::PassThrough => {
+            printpdf::Color::Rgb(Rgb::new(0.0, 0.0, 0.0, None))
+        }
+    };
+    layer.set_fill_color(fill_pdf_color);
+    layer.set_outline_color(outline_pdf_color);
     let mode = if has_fill {
         PaintMode::Fill
     } else {
@@ -497,5 +603,152 @@ mod tests {
         assert!(bytes > 0);
         let written = std::fs::read(tmp.path()).unwrap();
         assert!(written.starts_with(b"%PDF-"));
+    }
+
+    /// printpdf compresses content streams by default. The compressed
+    /// stream object is the most-recently-written stream in the PDF;
+    /// decompress it so we can scrub for raw operator tokens (`k`,
+    /// `rg`, etc.) without relying on un-deflated content.
+    fn pdf_content_stream_text(pdf: &[u8]) -> String {
+        // Find every "stream\n…endstream" body and try to inflate each;
+        // concatenate the human-readable result. PDF allows ASCII
+        // content streams too, so include the raw bytes verbatim when
+        // they don't look compressed.
+        use flate2::read::ZlibDecoder;
+        use std::io::Read;
+        let mut out = String::new();
+        let mut cursor = 0usize;
+        while let Some(rel) = pdf[cursor..].windows(7).position(|w| w == b"stream\n") {
+            let start = cursor + rel + 7;
+            let Some(rel_end) = pdf[start..].windows(9).position(|w| w == b"endstream") else {
+                break;
+            };
+            let body = &pdf[start..start + rel_end];
+            let mut buf = Vec::new();
+            if ZlibDecoder::new(body).read_to_end(&mut buf).is_ok() {
+                if let Ok(s) = std::str::from_utf8(&buf) {
+                    out.push_str(s);
+                    out.push('\n');
+                }
+            } else if let Ok(s) = std::str::from_utf8(body) {
+                out.push_str(s);
+                out.push('\n');
+            }
+            cursor = start + rel_end + 9;
+        }
+        out
+    }
+
+    fn doc_with_red_rect() -> DocumentGraph {
+        let mut doc = DocumentGraph::new();
+        let page = doc.insert_node(Node::new(NodeType::Page, "Page")).unwrap();
+        let rect = VectorPath::new(vec![
+            PathSegment::MoveTo(PathPoint::new(0.0, 0.0)),
+            PathSegment::LineTo(PathPoint::new(100.0, 0.0)),
+            PathSegment::LineTo(PathPoint::new(100.0, 100.0)),
+            PathSegment::LineTo(PathPoint::new(0.0, 100.0)),
+            PathSegment::Close,
+        ]);
+        let mut node = vector_node(&rect, 0.0, 0.0, 100.0, 100.0);
+        node.parent_id = Some(page);
+        node.style.fill = FillStyle::Solid(kcreate_core::node::RgbaColor {
+            r: 1.0,
+            g: 0.0,
+            b: 0.0,
+            a: 1.0,
+        });
+        doc.insert_node(node).unwrap();
+        doc
+    }
+
+    #[test]
+    fn pdf_export_default_writes_rgb_operators() {
+        let doc = doc_with_red_rect();
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let opts = PdfExportOptions::default();
+        let rasters = RasterPixelCache::new();
+        export_pdf_from_document(&doc, &opts, &rasters, tmp.path()).unwrap();
+        let written = std::fs::read(tmp.path()).unwrap();
+        let stream = pdf_content_stream_text(&written);
+        // DeviceRGB tokens for non-stroking + stroking color.
+        assert!(
+            stream.contains(" rg") || stream.contains(" RG"),
+            "expected `rg`/`RG` operator in {stream:?}"
+        );
+        // Default mode must NOT have emitted CMYK operators.
+        assert!(
+            !stream.contains(" k\n") && !stream.contains(" K\n"),
+            "default mode should not emit `k`/`K`, got {stream:?}"
+        );
+    }
+
+    #[test]
+    fn pdf_export_cmyk_mode_writes_cmyk_operators() {
+        let doc = doc_with_red_rect();
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let opts = PdfExportOptions {
+            color_mode: PdfColorMode::Cmyk,
+            ..PdfExportOptions::default()
+        };
+        let rasters = RasterPixelCache::new();
+        export_pdf_from_document(&doc, &opts, &rasters, tmp.path()).unwrap();
+        let written = std::fs::read(tmp.path()).unwrap();
+        let stream = pdf_content_stream_text(&written);
+        // DeviceCMYK operator (`k` lowercase = non-stroking).
+        assert!(
+            stream.contains(" k\n") || stream.contains(" k "),
+            "expected `k` (non-stroking CMYK) operator in {stream:?}"
+        );
+        // And no `rg` non-stroking RGB operator (we wrote the stroke
+        // in CMYK too, so neither `rg` nor `RG` should appear).
+        assert!(
+            !stream.contains(" rg\n") && !stream.contains(" RG\n"),
+            "CMYK mode should not emit `rg`/`RG`, got {stream:?}"
+        );
+    }
+
+    #[test]
+    fn pdf_export_passthrough_keeps_authored_cmyk() {
+        let mut doc = DocumentGraph::new();
+        let page = doc.insert_node(Node::new(NodeType::Page, "Page")).unwrap();
+        let rect = VectorPath::new(vec![
+            PathSegment::MoveTo(PathPoint::new(0.0, 0.0)),
+            PathSegment::LineTo(PathPoint::new(100.0, 0.0)),
+            PathSegment::LineTo(PathPoint::new(100.0, 100.0)),
+            PathSegment::LineTo(PathPoint::new(0.0, 100.0)),
+            PathSegment::Close,
+        ]);
+        let mut node = vector_node(&rect, 0.0, 0.0, 100.0, 100.0);
+        node.parent_id = Some(page);
+        // Authored as native CMYK: cyan ink only.
+        node.style.color_override = Some(Color::Cmyk {
+            c: 1.0,
+            m: 0.0,
+            y: 0.0,
+            k: 0.0,
+            a: 1.0,
+        });
+        doc.insert_node(node).unwrap();
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let opts = PdfExportOptions {
+            color_mode: PdfColorMode::PassThrough,
+            ..PdfExportOptions::default()
+        };
+        let rasters = RasterPixelCache::new();
+        export_pdf_from_document(&doc, &opts, &rasters, tmp.path()).unwrap();
+        let written = std::fs::read(tmp.path()).unwrap();
+        let stream = pdf_content_stream_text(&written);
+        // PassThrough on CMYK-authored fill should still emit `k`.
+        assert!(
+            stream.contains(" k\n") || stream.contains(" k "),
+            "expected DeviceCMYK in pass-through mode, got {stream:?}"
+        );
+        // Cyan-only ink => coefficients `1 0 0 0 k` (after printpdf
+        // rounding). Look for the leading channel byte.
+        assert!(
+            stream.contains("1 0 0 0 k") || stream.contains("1.00 0.00 0.00 0.00 k"),
+            "expected cyan-only CMYK coefficients, got {stream:?}"
+        );
     }
 }

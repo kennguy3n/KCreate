@@ -83,6 +83,10 @@ import type {
   PreflightRequest,
   ScreenshotElement,
   ScreenshotRequest,
+  ColorBridge,
+  ColorSettings,
+  ColorSpaceName,
+  ColorValue,
 } from "../../shared/scene";
 
 type FrameInfoSnake = {
@@ -1185,6 +1189,36 @@ const mcpPermission: McpPermissionBridge = {
   },
 };
 
+// ---------------------------------------------------------------------------
+// Phase 2 — Color management (CMYK / ICC foundation).
+// ---------------------------------------------------------------------------
+
+const color: ColorBridge = {
+  async getSettings(): Promise<ColorSettings> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/color/settings/get",
+    )) as string;
+    return JSON.parse(raw) as ColorSettings;
+  },
+  async updateSettings(settings: ColorSettings): Promise<void> {
+    await ipcRenderer.invoke(
+      "kcreate/color/settings/update",
+      JSON.stringify(settings),
+    );
+  },
+  async convert(
+    value: ColorValue,
+    toSpace: ColorSpaceName,
+  ): Promise<ColorValue> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/color/convert",
+      JSON.stringify(value),
+      toSpace,
+    )) as string;
+    return JSON.parse(raw) as ColorValue;
+  },
+};
+
 contextBridge.exposeInMainWorld("kcreate", {
   renderer,
   document,
@@ -1209,4 +1243,5 @@ contextBridge.exposeInMainWorld("kcreate", {
   aiModel,
   plugin,
   mcpPermission,
+  color,
 });

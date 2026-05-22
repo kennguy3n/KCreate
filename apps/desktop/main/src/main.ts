@@ -293,6 +293,33 @@ function createWindow(): BrowserWindow {
 
   win.once("ready-to-show", () => win.show());
   mainWindow = win;
+  // Lifecycle for the native-canvas presentation path
+  // (`crates/kcreate_bridge/src/native_canvas.rs`). The Rust side
+  // holds an `Arc<PlatformHandle>` that wraps the BrowserWindow's
+  // OS-level handle (NSView*/HWND/XID/wl_surface*). If we let the
+  // OS destroy the window while that Arc is still alive, the
+  // wrapped pointer becomes dangling — `unsafe impl Send + Sync
+  // for PlatformHandle` is only sound while the underlying OS
+  // resource outlives the surface.
+  //
+  // Electron's `'close'` event fires *before* the OS resource is
+  // destroyed (unlike `'closed'`, which fires after). We hook it
+  // to ask the bridge to switch back to offscreen presentation,
+  // which detaches the native surface and drops the
+  // `Arc<PlatformHandle>` in the renderer state. `rendererSwitchOffscreen`
+  // is synchronous, returns immediately if no native surface is
+  // attached, and is safe to call even when the bridge was built
+  // without the `native_canvas` Cargo feature (it then no-ops).
+  win.on("close", () => {
+    if (!bridge) return;
+    try {
+      bridge.rendererSwitchOffscreen();
+    } catch {
+      // best-effort: a shutdown failure here cannot block window
+      // close, and the OS will still tear down the handle. Logging
+      // is intentionally elided to avoid noise during normal exit.
+    }
+  });
   win.on("closed", () => {
     if (mainWindow === win) mainWindow = null;
   });

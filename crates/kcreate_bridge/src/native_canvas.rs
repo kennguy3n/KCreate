@@ -25,6 +25,16 @@
 //! - We never dereference the handle ourselves; we only ferry it to
 //!   wgpu via [`raw_window_handle::WindowHandle::borrow_raw`], which
 //!   itself is the unsafe-asserting boundary.
+//!
+//! Lifecycle enforcement: the Electron main process wires the
+//! BrowserWindow's `close` event (which fires *before* the OS
+//! resource is destroyed) to `bridge.rendererSwitchOffscreen()`. That
+//! call detaches the native surface and drops the
+//! `Arc<PlatformHandle>` here, so no `wgpu::Surface` ever survives
+//! its underlying OS window. See `apps/desktop/main/src/main.ts`
+//! `createWindow` (`win.on("close", ...)`). This is what makes the
+//! `Send + Sync` impls below sound in practice; the contract is not
+//! a hope, it is enforced by the host.
 
 #![cfg(feature = "native_canvas")]
 
@@ -196,25 +206,39 @@ fn interpret_bytes(bytes: &[u8]) -> Result<PlatformHandle, NativeCanvasError> {
 
 #[cfg(all(unix, not(target_os = "macos")))]
 fn interpret_bytes(bytes: &[u8]) -> Result<PlatformHandle, NativeCanvasError> {
-    // Linux can be either X11 or Wayland. We pick based on
-    // XDG_SESSION_TYPE, defaulting to X11 (which is what Electron
-    // returns by default on most distros). For X11 the handle bytes
-    // are 4 bytes (the XID is a 32-bit unsigned int); for Wayland
-    // they are 8 bytes (`wl_surface*`).
+    // Linux can be either X11 or Wayland. We resolve which by
+    // consulting two environment variables in priority order. The
+    // raw handle bytes are NOT used as a tie-breaker, because an
+    // X11 XID is conceptually a 32-bit unsigned int but Electron's
+    // `Buffer` slabs may be zero-padded to 8 bytes on 64-bit
+    // systems, making byte-length unreliable as a discriminator
+    // (Devin Review PR #5 follow-up: rejects the older
+    // `bytes.len() == 8` heuristic that could mis-route a padded
+    // X11 XID into the Wayland path).
     //
-    // Per Devin Review BUG-0002 (PR #5): the byte-length heuristic
-    // must NOT override an explicit `XDG_SESSION_TYPE=x11`. Otherwise
-    // an 8-byte zero-padded XID buffer would route to the Wayland
-    // path and be mis-interpreted as a surface pointer. The heuristic
-    // only kicks in when the session type is missing / ambiguous.
+    // Resolution order:
+    //   1. `XDG_SESSION_TYPE=x11` or `=wayland` is authoritative.
+    //      This is the standard session-manager-provided signal.
+    //   2. If `XDG_SESSION_TYPE` is unset or has any other value, we
+    //      fall back to `WAYLAND_DISPLAY`. Wayland clients are
+    //      required by the protocol to honour this env var; its
+    //      presence is a strong signal that the user is on a
+    //      Wayland compositor.
+    //   3. With neither signal present, we default to X11. The X11
+    //      path validates the XID without dereferencing it, so a
+    //      mistaken X11 default on a Wayland session fails cleanly
+    //      ("null handle") rather than touching memory.
     let session = std::env::var("XDG_SESSION_TYPE").unwrap_or_default();
     if session.eq_ignore_ascii_case("x11") {
-        x11_handle(bytes)
-    } else if session.eq_ignore_ascii_case("wayland") || (session.is_empty() && bytes.len() == 8) {
-        wayland_handle(bytes)
-    } else {
-        x11_handle(bytes)
+        return x11_handle(bytes);
     }
+    if session.eq_ignore_ascii_case("wayland") {
+        return wayland_handle(bytes);
+    }
+    if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+        return wayland_handle(bytes);
+    }
+    x11_handle(bytes)
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
@@ -330,6 +354,8 @@ pub fn wrap_handle(bytes: &[u8]) -> Result<Arc<PlatformHandle>, NativeCanvasErro
 #[cfg(test)]
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 mod tests {
+    use serial_test::serial;
+
     use super::*;
 
     #[test]
@@ -348,6 +374,7 @@ mod tests {
 
     #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
+    #[serial]
     fn x11_round_trips_xid() {
         // Force X11 path by setting XDG_SESSION_TYPE=x11. We can't
         // unset env vars cleanly inside a #[test] without affecting
@@ -403,6 +430,7 @@ mod tests {
     /// the offscreen presentation path.
     #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
+    #[serial]
     fn wayland_session_refuses_until_wl_display_wired() {
         let prev = std::env::var("XDG_SESSION_TYPE").ok();
         // SAFETY: see x11_round_trips_xid.
@@ -430,6 +458,7 @@ mod tests {
     /// the Wayland path and misinterpret the XID as a `wl_surface*`.
     #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
+    #[serial]
     fn explicit_x11_session_overrides_byte_length_heuristic() {
         let prev = std::env::var("XDG_SESSION_TYPE").ok();
         // SAFETY: see x11_round_trips_xid.
@@ -451,6 +480,76 @@ mod tests {
             None => {
                 // SAFETY: see above; restoring an unset env var.
                 unsafe { std::env::remove_var("XDG_SESSION_TYPE") };
+            }
+        }
+    }
+
+    /// Devin Review PR #5 follow-up. With `XDG_SESSION_TYPE` unset
+    /// (some minimal session managers omit it) but `WAYLAND_DISPLAY`
+    /// present, we should route to the Wayland path. Conversely, with
+    /// neither variable set, an 8-byte buffer must NOT be misrouted
+    /// to Wayland (which was the old `bytes.len() == 8` heuristic
+    /// failure mode): the safer default is X11.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    #[serial]
+    fn wayland_display_env_routes_to_wayland_when_session_unset() {
+        let prev_session = std::env::var("XDG_SESSION_TYPE").ok();
+        let prev_display = std::env::var("WAYLAND_DISPLAY").ok();
+        // SAFETY: process-global env mutation; native_canvas tests
+        // are intentionally run as a single suite with no parallelism
+        // around env mutation.
+        unsafe {
+            std::env::remove_var("XDG_SESSION_TYPE");
+            std::env::set_var("WAYLAND_DISPLAY", "wayland-0");
+        }
+        let ptr_val: u64 = 0xDEAD_BEEF_CAFE_BABE;
+        let bytes = ptr_val.to_le_bytes();
+        let err = handle_from_bytes(&bytes).expect_err("wayland refuses");
+        assert!(matches!(err, NativeCanvasError::WaylandNotYetSupported));
+        // Restore env.
+        unsafe {
+            match prev_session {
+                Some(v) => std::env::set_var("XDG_SESSION_TYPE", v),
+                None => std::env::remove_var("XDG_SESSION_TYPE"),
+            }
+            match prev_display {
+                Some(v) => std::env::set_var("WAYLAND_DISPLAY", v),
+                None => std::env::remove_var("WAYLAND_DISPLAY"),
+            }
+        }
+    }
+
+    /// Devin Review PR #5 follow-up. With neither `XDG_SESSION_TYPE`
+    /// nor `WAYLAND_DISPLAY` set, an 8-byte zero-padded XID buffer
+    /// must default to X11 (the older code defaulted to Wayland on
+    /// `bytes.len() == 8`, which mis-routed legitimate X11 sessions).
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    #[serial]
+    fn no_session_signals_defaults_to_x11_for_8_byte_buffer() {
+        let prev_session = std::env::var("XDG_SESSION_TYPE").ok();
+        let prev_display = std::env::var("WAYLAND_DISPLAY").ok();
+        // SAFETY: process-global env mutation. See sibling tests for
+        // the same rationale.
+        unsafe {
+            std::env::remove_var("XDG_SESSION_TYPE");
+            std::env::remove_var("WAYLAND_DISPLAY");
+        }
+        let xid: u32 = 0x0042_4242;
+        let mut bytes = [0u8; 8];
+        bytes[..4].copy_from_slice(&xid.to_le_bytes());
+        let handle = handle_from_bytes(&bytes).expect("x11 wrap with zero-padded buffer");
+        assert_eq!(handle.platform(), NativePlatform::X11);
+        // Restore env.
+        unsafe {
+            match prev_session {
+                Some(v) => std::env::set_var("XDG_SESSION_TYPE", v),
+                None => std::env::remove_var("XDG_SESSION_TYPE"),
+            }
+            match prev_display {
+                Some(v) => std::env::set_var("WAYLAND_DISPLAY", v),
+                None => std::env::remove_var("WAYLAND_DISPLAY"),
             }
         }
     }

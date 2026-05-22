@@ -108,6 +108,9 @@ export interface Bridge {
   llmStatus(): string;
   llmChat(messagesJson: string, maxTokens: number, temperature: number): string;
   llmSuggestForSelection(): string;
+  aiSuggestLayerNames(): string;
+  aiExtractDesignTokens(): string;
+  aiCheckAccessibility(): string;
   exportSvg(nodeIds: string[], optionsJson: string): string;
   exportPng(outputPath: string, optionsJson: string): number;
   exportPdf(outputPath: string, optionsJson: string): number;

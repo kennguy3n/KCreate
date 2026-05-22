@@ -453,6 +453,41 @@ export interface CanvasBridge {
 export interface AiBridge {
   removeBackground(nodeId: string): Promise<string>;
   getActionLog(): Promise<string>;
+  /**
+   * Ask the LLM to propose semantic names for every layer. Requires
+   * the sidecar to be `ready`; rejects otherwise.
+   */
+  suggestLayerNames(): Promise<LayerNamingResult>;
+  /**
+   * Ask the LLM to extract design tokens (colors / fonts / spacing)
+   * from the open document. Requires the sidecar to be `ready`.
+   */
+  extractDesignTokens(): Promise<LlmJsonResult>;
+  /**
+   * Ask the LLM to audit the document for accessibility issues.
+   * Requires the sidecar to be `ready`.
+   */
+  checkAccessibility(): Promise<LlmJsonResult>;
+}
+
+/** Suggestions returned by `ai.suggestLayerNames`. */
+export interface LayerNamingResult {
+  /** Parsed `(id, new-name)` pairs. May be empty if the model's
+   * reply could not be parsed; in that case the UI should fall back
+   * to displaying `raw_content`. */
+  suggestions: Array<[string, string]>;
+  raw_content: string;
+  tokens_used: number;
+  model: string;
+}
+
+/** Free-form JSON reply returned by `ai.extractDesignTokens` and
+ * `ai.checkAccessibility`. The `json` field is the model's raw
+ * output in the schema described by the prompt builder. */
+export interface LlmJsonResult {
+  json: string;
+  tokens_used: number;
+  model: string;
 }
 
 /**

@@ -29,7 +29,9 @@ import type {
   ExportPresetBridge,
   FrameInfo,
   JpegExportOptions,
+  LayerNamingResult,
   LlmBridge,
+  LlmJsonResult,
   LlmMessage,
   LlmReply,
   LlmStatus,
@@ -508,6 +510,24 @@ const ai: AiBridge = {
   },
   async getActionLog(): Promise<string> {
     return (await ipcRenderer.invoke("kcreate/ai/getActionLog")) as string;
+  },
+  async suggestLayerNames(): Promise<LayerNamingResult> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/ai/suggestLayerNames",
+    )) as string;
+    return JSON.parse(raw) as LayerNamingResult;
+  },
+  async extractDesignTokens(): Promise<LlmJsonResult> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/ai/extractDesignTokens",
+    )) as string;
+    return JSON.parse(raw) as LlmJsonResult;
+  },
+  async checkAccessibility(): Promise<LlmJsonResult> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/ai/checkAccessibility",
+    )) as string;
+    return JSON.parse(raw) as LlmJsonResult;
   },
 };
 

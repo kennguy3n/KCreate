@@ -29,6 +29,11 @@ log.workspace = true
 # `crates/kcreate_tests/tests/local_first.rs` runs with default
 # features, so this exception is enforced.
 ureq = { version = "2", default-features = false, features = ["json"], optional = true }
+# `ort` (ONNX Runtime bindings) is opt-in behind `onnx_bg_removal`.
+# Off by default because it pulls a large native runtime binary that
+# CI Linux/macOS images don't have preinstalled. When the feature is
+# off the editing path stays unchanged.
+ort = { version = "2.0.0-rc.10", default-features = false, features = ["copy-dylibs", "download-binaries", "ndarray"], optional = true }
 
 [dev-dependencies]
 criterion.workspace = true
@@ -44,3 +49,6 @@ default = []
 # Enables the loopback HTTP client used by the LLM sidecar driver.
 # Pulls `ureq`, which would otherwise be in the editing-path deny list.
 llm_sidecar = ["dep:ureq"]
+# Enables the u²-net ONNX background-removal backend. Pulls `ort`,
+# which bundles the ONNX Runtime native binary at build time.
+onnx_bg_removal = ["dep:ort"]

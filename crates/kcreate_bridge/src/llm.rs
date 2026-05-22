@@ -17,8 +17,9 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 
 use kcreate_ai::{
-    build_system_prompt, chat_completion, ChatError, ChatMessage, ChatRequest, ChatResponse,
-    ChatRole, LlmSidecar, SidecarConfig, SidecarError, SidecarStatus,
+    build_accessibility_prompt, build_design_token_prompt, build_layer_naming_prompt,
+    build_system_prompt, chat_completion, parse_layer_naming_reply, ChatError, ChatMessage,
+    ChatRequest, ChatResponse, ChatRole, LlmSidecar, SidecarConfig, SidecarError, SidecarStatus,
 };
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -151,7 +152,17 @@ pub fn llm_start(model_path: PathBuf) -> LlmBridgeResult<u16> {
     if let Some(prev) = guard.as_mut() {
         prev.stop();
     }
-    let cfg = SidecarConfig::new(model_path);
+    // Honour the device-tier cap on model size. `effective_max_model_mb()`
+    // returns the per-tier ceiling (e.g. ~1.5 GB on Tier 0); the sidecar
+    // refuses to start if the GGUF file is larger. We snapshot the
+    // value rather than holding `runtime_slot()` across the start
+    // call so a concurrent low-resource toggle never deadlocks against
+    // the LLM lock.
+    let max_model_mb = crate::document::runtime_slot()
+        .lock()
+        .effective_max_model_mb();
+    let mut cfg = SidecarConfig::new(model_path);
+    cfg.max_model_mb = max_model_mb;
     let mut sidecar = LlmSidecar::new(cfg);
     let port = sidecar.start()?;
     *guard = Some(sidecar);
@@ -171,7 +182,7 @@ pub fn llm_stop() {
 pub fn llm_status() -> LlmStatusInfo {
     let guard = slot().lock();
     match guard.as_ref() {
-        Some(s) => LlmStatusInfo::from(s.status()),
+        Some(s) => LlmStatusInfo::from(&s.status()),
         None => LlmStatusInfo {
             state: "stopped",
             model_name: None,
@@ -190,13 +201,7 @@ pub fn llm_chat(
     max_tokens: usize,
     temperature: f32,
 ) -> LlmBridgeResult<LlmReply> {
-    let port = {
-        let guard = slot().lock();
-        guard
-            .as_ref()
-            .and_then(|s| s.status().port())
-            .ok_or(LlmBridgeError::NotReady)?
-    };
+    let port = ready_port()?;
     let converted = messages
         .into_iter()
         .map(LlmMessage::into_core)
@@ -235,6 +240,96 @@ pub fn llm_suggest_for_selection() -> LlmBridgeResult<LlmReply> {
         },
     ];
     llm_chat(req, 512, 0.2)
+}
+
+/// Wire shape returned by [`ai_suggest_layer_names`]. The
+/// `suggestions` field carries the (id, new-name) pairs that survived
+/// JSON parsing; `raw_content` is the unfiltered LLM reply so the UI
+/// can show it if the user wants to see the model's full output.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LayerNamingResult {
+    pub suggestions: Vec<(uuid::Uuid, String)>,
+    pub raw_content: String,
+    pub tokens_used: usize,
+    pub model: String,
+}
+
+/// Wire shape returned by [`ai_extract_design_tokens`] and
+/// [`ai_check_accessibility`]. We hand back the raw JSON the model
+/// produced (the UI can validate / pretty-print it).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LlmJsonResult {
+    pub json: String,
+    pub tokens_used: usize,
+    pub model: String,
+}
+
+/// Ask the LLM for cleaner names for every layer in the open
+/// document. Returns the parsed `(id, name)` suggestions alongside
+/// the raw reply.
+pub fn ai_suggest_layer_names() -> LlmBridgeResult<LayerNamingResult> {
+    // Surface `NoProject` first to match the other AI actions; if no
+    // workspace is open, `document_get_tree()` would otherwise return
+    // an opaque `Invalid("no project is open …")` that the renderer
+    // can't disambiguate from a real bug.
+    let _ = project_info().ok_or(LlmBridgeError::NoProject)?;
+    let tree = document_get_tree().map_err(|e| LlmBridgeError::Invalid(e.to_string()))?;
+    if tree.is_empty() {
+        return Err(LlmBridgeError::NoProject);
+    }
+    let names: Vec<_> = tree.iter().map(|n| (n.id, n.name.clone())).collect();
+    let req = build_layer_naming_prompt(&names);
+    let port = ready_port()?;
+    let resp = chat_completion(port, &req)?;
+    let suggestions = parse_layer_naming_reply(&resp.content);
+    Ok(LayerNamingResult {
+        suggestions,
+        raw_content: resp.content,
+        tokens_used: resp.tokens_used,
+        model: resp.model,
+    })
+}
+
+/// Ask the LLM to extract design tokens (colors, fonts, spacing) from
+/// the open document. Returns the raw JSON reply.
+pub fn ai_extract_design_tokens() -> LlmBridgeResult<LlmJsonResult> {
+    let info = project_info().ok_or(LlmBridgeError::NoProject)?;
+    let tree = document_get_tree().map_err(|e| LlmBridgeError::Invalid(e.to_string()))?;
+    let summary = summarise_document(&info.name, &tree);
+    let req = build_design_token_prompt(&summary);
+    let port = ready_port()?;
+    let resp = chat_completion(port, &req)?;
+    Ok(LlmJsonResult {
+        json: resp.content,
+        tokens_used: resp.tokens_used,
+        model: resp.model,
+    })
+}
+
+/// Ask the LLM to audit the open document for accessibility issues.
+/// Returns the raw JSON reply.
+pub fn ai_check_accessibility() -> LlmBridgeResult<LlmJsonResult> {
+    let info = project_info().ok_or(LlmBridgeError::NoProject)?;
+    let tree = document_get_tree().map_err(|e| LlmBridgeError::Invalid(e.to_string()))?;
+    let summary = summarise_document(&info.name, &tree);
+    let req = build_accessibility_prompt(&summary);
+    let port = ready_port()?;
+    let resp = chat_completion(port, &req)?;
+    Ok(LlmJsonResult {
+        json: resp.content,
+        tokens_used: resp.tokens_used,
+        model: resp.model,
+    })
+}
+
+/// Look up the sidecar's listening port, failing fast with `NotReady`
+/// if the sidecar isn't `Ready`.
+fn ready_port() -> LlmBridgeResult<u16> {
+    let guard = slot().lock();
+    guard
+        .as_ref()
+        .and_then(|s| s.status().port())
+        .ok_or(LlmBridgeError::NotReady)
 }
 
 /// Compact, human-readable summary of the open document. Kept here
@@ -358,5 +453,32 @@ mod tests {
         )
         .expect_err("not ready");
         assert!(matches!(err, LlmBridgeError::NotReady));
+    }
+
+    /// The three structured AI actions all require a `ready` sidecar.
+    /// Without one (the default test state), they should each surface
+    /// `NotReady` so the renderer can prompt the user to start the
+    /// model. NoProject is also acceptable because the bridge's
+    /// global project slot is process-scoped and may be empty.
+    #[cfg(not(feature = "llm"))]
+    #[serial_test::serial]
+    #[test]
+    fn ai_actions_without_ready_surface_no_project_or_not_ready() {
+        // The project workspace is process-global; make sure no
+        // previous test left a project open before asserting the
+        // pre-project gate fires.
+        crate::document::project_close();
+        llm_stop();
+        for err in [
+            ai_suggest_layer_names().err(),
+            ai_extract_design_tokens().err(),
+            ai_check_accessibility().err(),
+        ] {
+            let err = err.expect("must error without sidecar");
+            assert!(
+                matches!(err, LlmBridgeError::NoProject),
+                "unexpected error variant: {err:?}",
+            );
+        }
     }
 }

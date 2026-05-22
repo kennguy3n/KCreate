@@ -35,9 +35,12 @@
 use std::net::{SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
 /// Default device-tier-aware ceiling on how long we'll wait for the
@@ -154,16 +157,32 @@ impl SidecarConfig {
 
 /// Sidecar process driver.
 ///
-/// `start()` is *blocking*: it returns once the child is either
-/// healthy (success) or has missed the timeout (error). This matches
-/// the synchronous bridge IPC; the renderer disables the start button
-/// while the call is in flight. Tests mock the upstream via
-/// [`SidecarConfig::binary`].
+/// `start()` is *non-blocking*: it performs the fast setup (model
+/// validation, port allocation, `fork+exec`) synchronously on the
+/// calling thread and returns the listening port immediately. The
+/// (up-to-30s) health-probe loop runs on a dedicated background
+/// worker that updates the shared status as it observes
+/// `Starting → Ready` (or `Starting → Error`). The worker also owns
+/// the child handle for its full lifetime, so `stop()` simply flips
+/// the shared stop flag and joins the worker (which kills the child).
+///
+/// Why background-poll: the N-API surface that calls into this is
+/// synchronous, so blocking `start()` would freeze the Electron
+/// main process for as long as model loading takes. The UI already
+/// polls `llm_status()` from the renderer once per few seconds, so
+/// the natural place for the slow path is a worker that updates the
+/// status the UI is reading.
 #[derive(Debug)]
 pub struct LlmSidecar {
-    process: Option<Child>,
     config: SidecarConfig,
-    status: SidecarStatus,
+    /// Shared with the background worker so it can update status as
+    /// it transitions through `Starting → Ready → Stopped`.
+    status: Arc<Mutex<SidecarStatus>>,
+    /// Signal the worker should shut down. Owned by both the worker
+    /// (read) and `stop()` (write).
+    stop_signal: Option<Arc<AtomicBool>>,
+    /// Worker handle, joined on `stop()`.
+    worker: Option<thread::JoinHandle<()>>,
 }
 
 impl LlmSidecar {
@@ -171,9 +190,10 @@ impl LlmSidecar {
     #[must_use]
     pub fn new(config: SidecarConfig) -> Self {
         Self {
-            process: None,
             config,
-            status: SidecarStatus::Stopped,
+            status: Arc::new(Mutex::new(SidecarStatus::Stopped)),
+            stop_signal: None,
+            worker: None,
         }
     }
 
@@ -183,83 +203,64 @@ impl LlmSidecar {
         Self::new(SidecarConfig::new(model_path))
     }
 
-    /// Current status snapshot.
+    /// Current status snapshot. Cheap clone — the variants only
+    /// carry small strings and a port.
     #[must_use]
-    pub fn status(&self) -> &SidecarStatus {
-        &self.status
+    pub fn status(&self) -> SidecarStatus {
+        self.status.lock().clone()
     }
 
     /// True iff the sidecar is currently `Ready`.
     #[must_use]
     pub fn is_ready(&self) -> bool {
-        self.status.is_ready()
+        self.status.lock().is_ready()
     }
 
-    /// Spawn the child process, then poll `/health` until either
-    /// `ok` or the timeout elapses.
+    /// Spawn the child process and a background health-probe worker.
+    /// Returns the listening port immediately. The caller observes
+    /// `Ready` (or `Error`) by polling [`status`].
     ///
-    /// Returns the listening port on success. On failure the status
-    /// transitions to `Error` and the child (if spawned) is killed.
+    /// On synchronous failure (missing model, oversize model, spawn
+    /// error) the status transitions directly to `Error` and the
+    /// error is returned.
     pub fn start(&mut self) -> SidecarResult<u16> {
-        if self.is_ready() {
-            return Err(SidecarError::WrongState("already running".to_string()));
-        }
-        self.status = SidecarStatus::Starting;
-
-        let res = self.spawn_and_wait();
-        match res {
-            Ok((port, model_name)) => {
-                self.status = SidecarStatus::Ready {
-                    model_name,
-                    context_size: self.config.context_size,
-                    port,
-                };
-                Ok(port)
+        {
+            let s = self.status.lock();
+            if s.is_ready() || matches!(*s, SidecarStatus::Starting) {
+                return Err(SidecarError::WrongState("already running".to_string()));
             }
+        }
+
+        // Fail fast on the synchronous checks so the caller sees a
+        // typed error rather than having to poll the status.
+        if let Err(e) = validate_model(&self.config.model_path, self.config.max_model_mb) {
+            *self.status.lock() = SidecarStatus::Error {
+                message: e.to_string(),
+            };
+            return Err(e);
+        }
+        let port = match pick_loopback_port() {
+            Ok(p) => p,
             Err(e) => {
-                self.kill_child();
-                let msg = e.to_string();
-                self.status = SidecarStatus::Error { message: msg };
-                Err(e)
+                *self.status.lock() = SidecarStatus::Error {
+                    message: e.to_string(),
+                };
+                return Err(e);
             }
-        }
-    }
+        };
+        let child = match spawn_child(&self.config, port) {
+            Ok(c) => c,
+            Err(e) => {
+                *self.status.lock() = SidecarStatus::Error {
+                    message: e.to_string(),
+                };
+                return Err(e);
+            }
+        };
 
-    /// Stop the child (SIGKILL on Unix, TerminateProcess on Windows)
-    /// and transition back to `Stopped`. Idempotent.
-    pub fn stop(&mut self) {
-        self.kill_child();
-        self.status = SidecarStatus::Stopped;
-    }
+        *self.status.lock() = SidecarStatus::Starting;
 
-    fn spawn_and_wait(&mut self) -> SidecarResult<(u16, String)> {
-        validate_model(&self.config.model_path, self.config.max_model_mb)?;
-        let port = pick_loopback_port()?;
-        let mut cmd = Command::new(&self.config.binary);
-        cmd.args([
-            "--model",
-            self.config.model_path.to_str().unwrap_or_default(),
-            "--host",
-            "127.0.0.1",
-            "--port",
-            &port.to_string(),
-            "-c",
-            &self.config.context_size.to_string(),
-        ]);
-        for arg in &self.config.extra_args {
-            cmd.arg(arg);
-        }
-        cmd.stdout(Stdio::null()).stderr(Stdio::piped());
-
-        log::debug!(
-            "spawning llama-server: {} --port {}",
-            self.config.binary.display(),
-            port,
-        );
-        let child = cmd.spawn().map_err(SidecarError::Spawn)?;
-        self.process = Some(child);
-
-        wait_for_health(port, self.config.health_timeout)?;
+        let stop_signal = Arc::new(AtomicBool::new(false));
         let model_name = self
             .config
             .model_path
@@ -267,24 +268,134 @@ impl LlmSidecar {
             .and_then(|s| s.to_str())
             .unwrap_or("model")
             .to_string();
-        Ok((port, model_name))
+        let context_size = self.config.context_size;
+        let health_timeout = self.config.health_timeout;
+        let status_for_worker = Arc::clone(&self.status);
+        let stop_for_worker = Arc::clone(&stop_signal);
+
+        let handle = thread::spawn(move || {
+            health_worker(
+                child,
+                port,
+                model_name,
+                context_size,
+                health_timeout,
+                stop_for_worker,
+                status_for_worker,
+            );
+        });
+
+        self.stop_signal = Some(stop_signal);
+        self.worker = Some(handle);
+        Ok(port)
     }
 
-    fn kill_child(&mut self) {
-        if let Some(mut child) = self.process.take() {
-            // Best-effort: the process may already have exited. We
-            // intentionally do not propagate kill errors because
-            // there is nothing the caller can do about them.
-            let _ = child.kill();
-            let _ = child.wait();
+    /// Stop the sidecar. Flips the shared stop signal so the worker
+    /// kills the child and exits, then joins the worker. Idempotent.
+    pub fn stop(&mut self) {
+        if let Some(sig) = self.stop_signal.take() {
+            sig.store(true, Ordering::Release);
         }
+        if let Some(h) = self.worker.take() {
+            // Workers always terminate promptly once the signal is
+            // set: the health-probe phase polls the flag between
+            // sleeps, and the post-Ready watch is a short sleep loop.
+            let _ = h.join();
+        }
+        *self.status.lock() = SidecarStatus::Stopped;
     }
 }
 
 impl Drop for LlmSidecar {
     fn drop(&mut self) {
-        self.kill_child();
+        self.stop();
     }
+}
+
+/// Spawn the llama-server child process. Pure helper — does not
+/// touch any sidecar state, so `start()` can call it before deciding
+/// whether the spawn succeeded.
+fn spawn_child(config: &SidecarConfig, port: u16) -> SidecarResult<Child> {
+    let mut cmd = Command::new(&config.binary);
+    cmd.args([
+        "--model",
+        config.model_path.to_str().unwrap_or_default(),
+        "--host",
+        "127.0.0.1",
+        "--port",
+        &port.to_string(),
+        "-c",
+        &config.context_size.to_string(),
+    ]);
+    for arg in &config.extra_args {
+        cmd.arg(arg);
+    }
+    cmd.stdout(Stdio::null()).stderr(Stdio::piped());
+    log::debug!(
+        "spawning llama-server: {} --port {}",
+        config.binary.display(),
+        port,
+    );
+    cmd.spawn().map_err(SidecarError::Spawn)
+}
+
+/// Run the background health-probe + stop watch for a single child.
+/// Owns the child for its full lifetime: kills it on health timeout,
+/// on stop signal, or on Drop (via `let mut child` going out of
+/// scope, with `kill_child` called below).
+#[allow(clippy::too_many_arguments)]
+fn health_worker(
+    mut child: Child,
+    port: u16,
+    model_name: String,
+    context_size: usize,
+    health_timeout: Duration,
+    stop_signal: Arc<AtomicBool>,
+    status: Arc<Mutex<SidecarStatus>>,
+) {
+    let deadline = Instant::now() + health_timeout;
+    let mut ready = false;
+    while Instant::now() < deadline {
+        if stop_signal.load(Ordering::Acquire) {
+            kill_child(&mut child);
+            *status.lock() = SidecarStatus::Stopped;
+            return;
+        }
+        if probe_health(port) {
+            ready = true;
+            break;
+        }
+        thread::sleep(HEALTH_POLL_INTERVAL);
+    }
+    if !ready {
+        kill_child(&mut child);
+        *status.lock() = SidecarStatus::Error {
+            message: SidecarError::HealthTimeout {
+                timeout: health_timeout,
+            }
+            .to_string(),
+        };
+        return;
+    }
+    *status.lock() = SidecarStatus::Ready {
+        model_name,
+        context_size,
+        port,
+    };
+    // Watch the stop signal until shutdown. The poll interval here
+    // is purely how long `stop()` may wait for the worker to notice;
+    // 200 ms is well below human-perceptible.
+    while !stop_signal.load(Ordering::Acquire) {
+        thread::sleep(Duration::from_millis(200));
+    }
+    kill_child(&mut child);
+    *status.lock() = SidecarStatus::Stopped;
+}
+
+fn kill_child(child: &mut Child) {
+    // Best-effort: the process may already have exited.
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 /// Allocate a loopback port the OS confirms is free. We bind then
@@ -326,6 +437,13 @@ fn validate_model(model: &Path, max_mb: u64) -> SidecarResult<()> {
 /// blocking-HTTP code path collapses to a TCP connect check; that's
 /// enough for the deny-list test and for tests that don't link
 /// `ureq`.
+///
+/// In production code the equivalent loop is inlined into
+/// [`health_worker`] so it can also watch the stop signal; this free
+/// function exists only so that the `ready_lifecycle_via_mock_server`
+/// test can drive the probe loop directly without a real child
+/// process.
+#[cfg(test)]
 fn wait_for_health(port: u16, timeout: Duration) -> SidecarResult<()> {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {

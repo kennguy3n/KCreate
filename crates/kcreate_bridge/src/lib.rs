@@ -525,6 +525,35 @@ pub fn llm_suggest_for_selection() -> NapiResult<String> {
         .map_err(|e| NapiError::from_reason(format!("llm_suggest encode: {e}")))
 }
 
+/// Ask the LLM to propose semantic names for every layer. Returns a
+/// JSON object: `{ suggestions: [[uuid, name], ...], raw_content,
+/// tokens_used, model }`.
+#[napi]
+pub fn ai_suggest_layer_names() -> NapiResult<String> {
+    let res = llm::ai_suggest_layer_names().map_err(map_llm_err)?;
+    serde_json::to_string(&res)
+        .map_err(|e| NapiError::from_reason(format!("ai_suggest_layer_names encode: {e}")))
+}
+
+/// Ask the LLM to extract design tokens. Returns
+/// `{ json, tokens_used, model }` where `json` is the model's reply
+/// in the schema described by `build_design_token_prompt`.
+#[napi]
+pub fn ai_extract_design_tokens() -> NapiResult<String> {
+    let res = llm::ai_extract_design_tokens().map_err(map_llm_err)?;
+    serde_json::to_string(&res)
+        .map_err(|e| NapiError::from_reason(format!("ai_extract_design_tokens encode: {e}")))
+}
+
+/// Ask the LLM to audit the document for accessibility issues.
+/// Returns `{ json, tokens_used, model }`.
+#[napi]
+pub fn ai_check_accessibility() -> NapiResult<String> {
+    let res = llm::ai_check_accessibility().map_err(map_llm_err)?;
+    serde_json::to_string(&res)
+        .map_err(|e| NapiError::from_reason(format!("ai_check_accessibility encode: {e}")))
+}
+
 /// Snapshot of the open document's editing state.
 ///
 /// Returns `None` when no project is open. Hosts call this after any

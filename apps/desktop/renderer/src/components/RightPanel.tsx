@@ -263,12 +263,27 @@ function LayoutControls({
   const [mode, setMode] = [
     stored?.kind ?? "flex",
     (next: "flex" | "grid") => {
-      if (next === "flex") {
-        void layout.setFlex(node.id, stored?.kind === "flex" ? stored.config : DEFAULT_FLEX);
-      } else {
-        void layout.setGrid(node.id, stored?.kind === "grid" ? stored.config : DEFAULT_GRID);
-      }
-      void layout.recompute(node.id);
+      // The bridge persists the layout config in the document
+      // *before* `recompute` reads it back to compute child bounds.
+      // Firing them concurrently lets `recompute` race the metadata
+      // write and snap children to the previous mode's geometry,
+      // which the user sees as a one-frame flicker on every mode
+      // switch. The same `await … await` pattern is used by the
+      // FlexControls / GridControls onCommit handlers below.
+      void (async () => {
+        if (next === "flex") {
+          await layout.setFlex(
+            node.id,
+            stored?.kind === "flex" ? stored.config : DEFAULT_FLEX,
+          );
+        } else {
+          await layout.setGrid(
+            node.id,
+            stored?.kind === "grid" ? stored.config : DEFAULT_GRID,
+          );
+        }
+        await layout.recompute(node.id);
+      })();
     },
   ] as const;
   return (

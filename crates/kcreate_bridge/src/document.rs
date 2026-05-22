@@ -2157,7 +2157,7 @@ pub fn runtime_status() -> RuntimeStatus {
 /// low-resource toggle) update this snapshot. The cached
 /// [`runtime_status`] shape stays immutable because the system probe
 /// itself (RAM, GPU detection, platform) does not change at runtime.
-fn runtime_slot() -> &'static parking_lot::Mutex<RuntimeConfig> {
+pub(crate) fn runtime_slot() -> &'static parking_lot::Mutex<RuntimeConfig> {
     static SLOT: OnceLock<parking_lot::Mutex<RuntimeConfig>> = OnceLock::new();
     SLOT.get_or_init(|| parking_lot::Mutex::new(RuntimeConfig::detect()))
 }

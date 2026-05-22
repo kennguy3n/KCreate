@@ -454,6 +454,15 @@ function registerIpcHandlers(): void {
   ipcMain.handle("kcreate/llm/suggest", (): string =>
     requireBridge().llmSuggestForSelection(),
   );
+  ipcMain.handle("kcreate/ai/suggestLayerNames", (): string =>
+    requireBridge().aiSuggestLayerNames(),
+  );
+  ipcMain.handle("kcreate/ai/extractDesignTokens", (): string =>
+    requireBridge().aiExtractDesignTokens(),
+  );
+  ipcMain.handle("kcreate/ai/checkAccessibility", (): string =>
+    requireBridge().aiCheckAccessibility(),
+  );
   // The OS temp dir is owned by the host (Node `os.tmpdir()`), not by
   // the Rust bridge — it's a process-environment concern, not a
   // rendering one. Surfacing it through the runtime bridge lets the

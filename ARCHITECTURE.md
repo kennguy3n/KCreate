@@ -57,8 +57,10 @@ KCreate runs in up to five distinct processes:
    exclusively through the preload-exposed `window.kcreate.*` API.
 3. **Electron preload** — runs in a privileged Node context, uses
    `contextBridge.exposeInMainWorld` to expose a small typed surface.
-4. **AI sidecar** (Phase 1+) — long-lived `llama.cpp` / MLX / ONNX
-   process spawned on demand. Communicates over a local socket. Runs at
+4. **AI sidecar** — long-lived `llama.cpp` / MLX / ONNX process spawned
+   on demand. Communicates over loopback HTTP (`127.0.0.1:<port>`,
+   OpenAI-compatible `/v1/chat/completions` against `llama-server`).
+   Lifecycle managed by `kcreate_ai::llm_sidecar::LlmSidecar`. Runs at
    a lower priority and is killable independently of the editor.
 5. **Optional MCP server** (Phase 1+) — local-loopback server that
    exposes a permissioned set of editor tools to AI agents (Devin,
@@ -418,14 +420,15 @@ Granted permissions are scoped per project.
 ```
 crates/
 ├── kcreate_core/        # Shared types, node model, document graph, operation log, config
-├── kcreate_renderer/    # offscreen wgpu pipeline + CPU fallback              [EXISTS]
+├── kcreate_renderer/    # offscreen wgpu pipeline + CPU fallback + native surface  [EXISTS]
 ├── kcreate_bridge/      # N-API cdylib (renderer + document + export IPC)    [EXISTS]
 ├── kcreate_vector/      # Path math, boolean ops, SVG import/export, R-tree
 ├── kcreate_storage/     # SQLite + content-addressed blob store + .kstudio I/O
-├── kcreate_export/      # PNG / SVG / PDF / WebP / JPEG export + batch
+├── kcreate_export/      # PNG / SVG / PDF / WebP / JPEG export + batch + inspect code-gen
 ├── kcreate_raster/      # tile engine, masks, adjustment layers              [EXISTS]
 ├── kcreate_text/        # font discovery (fontdb), shaping (rustybuzz)       [EXISTS]
-├── kcreate_ai/          # task router, threshold-v0 bg-removal               [EXISTS]
+├── kcreate_ai/          # task router, bg-removal (threshold + ONNX), LLM sidecar  [EXISTS]
+├── kcreate_layout/      # flex + grid solvers (pure, deterministic)          [EXISTS]
 └── kcreate_mcp/         # local-loopback MCP server (3 tools)                [EXISTS]
 ```
 
@@ -433,7 +436,6 @@ Planned (Phase 2+):
 
 ```
 crates/
-├── kcreate_layout/      # page layout, master pages, flow
 └── kcreate_audit/       # operation log persistence, AI action audit
 ```
 
@@ -460,7 +462,13 @@ crates/
 | Loopback MCP server          | Built    | `crates/kcreate_mcp/src/{server,tools}.rs`           |
 | Raster tile engine           | Built    | `crates/kcreate_raster/src/{tile,layer}.rs`          |
 | Text shaping + outlining     | Built    | `crates/kcreate_text/src/{font_db,shaper,outline}.rs`|
-| Layout engine                | Planned  | `crates/kcreate_layout/*` (Phase 2)                  |
+| Auto-layout (flex + grid)    | Built    | `crates/kcreate_layout/src/{flex,grid,padding}.rs`   |
+| LLM sidecar                  | Built    | `crates/kcreate_ai/src/{llm_sidecar,llm_chat}.rs`    |
+| ONNX bg-removal backend      | Built    | `crates/kcreate_ai/src/bg_remove.rs`                 |
+| Inspect-mode code generation | Built    | `crates/kcreate_export/src/code_gen.rs`              |
+| Native surface foundation    | Built    | `crates/kcreate_renderer/src/native_surface.rs`      |
+| Artboard management          | Built    | `crates/kcreate_core/src/document.rs` (artboard fns) |
+| Component system             | Built    | `crates/kcreate_core/src/component.rs`               |
 
 ### Recommended Rust dependencies
 
@@ -482,6 +490,9 @@ Added in this phase:
 | `rstar`     | R-tree for spatial queries on layers.                                   |
 | `image`     | PNG encoding for export.                                                |
 | `sys-info`  | Cross-platform RAM and CPU probe for device tiering.                    |
+| `ureq`      | Blocking HTTP client for the loopback LLM sidecar (`127.0.0.1` only).   |
+| `ort`       | ONNX Runtime bindings for u2net background-removal model.               |
+| `raw-window-handle` | Window-handle abstraction for the Phase 1 native swapchain surface. |
 
 Planned for Phase 1+:
 

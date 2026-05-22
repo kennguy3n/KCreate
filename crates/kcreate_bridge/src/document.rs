@@ -586,6 +586,23 @@ pub fn document_get_tree() -> Result<Vec<NodeInfo>> {
     Ok(out)
 }
 
+/// Compute the three inspect-mode code outputs (CSS, Tailwind,
+/// React inline style) for the node with `id`. The output is the
+/// same `InspectCode` struct emitted by `kcreate_export::code_gen`
+/// — we just serialize it to JSON at the N-API boundary.
+pub fn document_inspect_node(id: Uuid) -> Result<kcreate_export::InspectCode> {
+    let guard = slot().lock();
+    let ws = guard.as_ref().ok_or(DocumentBridgeError::NoProject)?;
+    let node = ws
+        .project
+        .document
+        .get_node(id)
+        .ok_or(DocumentBridgeError::NodeNotFound(id))?;
+    let code = kcreate_export::inspect_node(node);
+    drop(guard);
+    Ok(code)
+}
+
 fn push_subtree(doc: &DocumentGraph, id: Uuid, out: &mut Vec<NodeInfo>) {
     if let Some(node) = doc.get_node(id) {
         out.push(NodeInfo::from(node));

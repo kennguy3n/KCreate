@@ -383,6 +383,11 @@ function registerIpcHandlers(): void {
     requireBridge().documentGetTree(),
   );
   ipcMain.handle(
+    "kcreate/document/inspectNode",
+    (_e, nodeId: string): string =>
+      requireBridge().documentInspectNode(nodeId),
+  );
+  ipcMain.handle(
     "kcreate/document/createNode",
     (
       _e,

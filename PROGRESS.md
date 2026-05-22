@@ -67,7 +67,7 @@ item.
 - [x] One AI image action runs locally (`phase0_local_bg_removal_runs_on_cpu`)
 - [x] Export works — PNG, SVG, PDF, WebP, JPEG all produce format-valid bytes (`phase0_full_pipeline_runs_without_network`)
 
-## Phase 1 — MVP | In progress | ~25%
+## Phase 1 — MVP | In progress | ~75%
 
 Scope: Design Studio, Vector Studio, Image Studio Lite, Brand & Asset Hub,
 Export Center, Local AI Core Pack.
@@ -85,16 +85,40 @@ Export Center, Local AI Core Pack.
 - [x] Mode switcher (functional — tool palettes + right-panel focus per mode)
 - [x] Brand-kit / design-tokens / export-preset persistence + IPC (Task 18 / 19 — `brand_kits`, `design_tokens`, `export_presets` SQLite tables; N-API surface `brand_kit_*`, `design_tokens_*`, `export_preset_*`; preload `window.kcreate.{brandKit,designTokens,exportPreset}`)
 
+### Block A–J completed in this iteration (PR #4)
+- [x] Artboard / frame system (multi-artboard pages, presets, navigation panel,
+      creation dialog, HomePage preset wiring)
+- [x] Component system (create, instantiate, variants, persistence, panel UI)
+- [x] Auto-layout engine `kcreate_layout` (flex + grid solvers, integration
+      with document, UI controls in right panel)
+- [x] Low-resource mode enforcement (`RuntimeConfig::effective_*`, dynamic
+      undo depth, bridge surface, banner UI)
+- [x] Local LLM assistant (`kcreate_ai::llm_sidecar` lifecycle manager,
+      `llm_chat` OpenAI-compatible HTTP client, bridge `llm_*` exports,
+      chat panel + model manager UIs, context-aware quick actions)
+- [x] ONNX u2net background removal path (`bg_remove::BgRemovalBackend`),
+      auto-falls back to threshold when model missing
+- [x] Expanded AI tasks (layer naming, design-token extraction,
+      accessibility check) routed through LLM sidecar
+- [x] Design token editor panel
+- [x] Brand kit editor panel
+- [x] Batch export preset library (Web Assets, Social Pack, Icon Pack,
+      Print Ready, Developer Handoff)
+- [x] Inspect mode — `kcreate_export::code_gen` (`node_to_css`,
+      `node_to_tailwind`, `node_to_react_style`), bridge
+      `document_inspect_node`, InspectPanel with SegmentedControl +
+      copy-to-clipboard
+- [x] Responsive preview component (Desktop 1440 / Tablet 768 / Mobile 375,
+      1 Hz frame fetch from `renderer.acquireFrame()`)
+- [x] Native CanvasHost foundation — `raw-window-handle` dep,
+      `kcreate_renderer::native_surface::NativeSurface`, top-level
+      `PresentationMode` enum, `RenderContext::render_frame_native`
+
 ### Remaining for Phase 1 ship
-- Artboards / frame system (multi-artboard pages)
-- Component system
-- Auto-layout (flex / grid)
-- Design-token cross-reference (preview/edit tokens — bridge surface lives, UI panels still TODO)
-- SVG / PNG / PDF batch preset library
-- Low-resource mode enforcement
-- Native `CanvasHost` (Metal / D3D12 / Vulkan) replacing the offscreen-readback presentation path
-- Local LLM assistant (llama.cpp sidecar)
-- ONNX u2net swap for `threshold-v0` background removal (same `task_router` entry)
+- Native CanvasHost Electron integration (platform-specific child-window
+  embedding — the renderer-side primitive is ready)
+- Full prototype / interaction mode (Phase 1 ships scaled preview only)
+- Accessibility-checker UI panel (LLM result presentation)
 
 ## Phase 2 — Professional Workflows | Not started
 

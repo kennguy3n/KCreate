@@ -89,6 +89,7 @@ export interface Bridge {
   projectClose(): void;
   projectGetInfo(): ProjectInfoSnake | null;
   documentGetTree(): NodeInfoSnake[];
+  documentInspectNode(nodeId: string): string;
   documentCreateNode(
     nodeType: string,
     parentId: string | null,

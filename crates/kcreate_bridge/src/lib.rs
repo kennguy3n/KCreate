@@ -386,6 +386,19 @@ pub fn document_get_tree() -> NapiResult<Vec<NodeInfo>> {
         .collect())
 }
 
+/// Compute the three inspect-mode code outputs (CSS, Tailwind, and
+/// React inline-style object literal) for `node_id`. Returns the
+/// JSON-encoded `InspectCode` struct so the renderer can decode it
+/// without bespoke type-mirroring.
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn document_inspect_node(node_id: String) -> NapiResult<String> {
+    let id = parse_uuid(&node_id)?;
+    let code = document::document_inspect_node(id).map_err(map_doc_err)?;
+    serde_json::to_string(&code)
+        .map_err(|e| NapiError::from_reason(format!("document_inspect_node encode: {e}")))
+}
+
 /// Create a new node. `props_json` is a JSON object with optional
 /// `name`, `visible`, `locked`, `metadata` fields. Returns the new id.
 #[napi]

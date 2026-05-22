@@ -28,6 +28,7 @@ import type {
   ExportPreset,
   ExportPresetBridge,
   FrameInfo,
+  InspectCode,
   JpegExportOptions,
   LayerNamingResult,
   LlmBridge,
@@ -269,6 +270,13 @@ const document: DocumentBridge = {
       "kcreate/document/getTree",
     )) as NodeInfoSnake[];
     return raw.map(nodeFromSnake);
+  },
+  async inspectNode(nodeId: string): Promise<InspectCode> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/document/inspectNode",
+      nodeId,
+    )) as string;
+    return JSON.parse(raw) as InspectCode;
   },
   async createNode(
     nodeType: string,

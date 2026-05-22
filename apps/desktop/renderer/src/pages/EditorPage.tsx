@@ -12,6 +12,7 @@ import {
 import { AIAssistPanel } from "../components/AIAssistPanel";
 import { ExportPanel } from "../components/ExportPanel";
 import { ArtboardDialog } from "../components/ArtboardDialog";
+import { ResponsivePreview } from "../components/ResponsivePreview";
 import type {
   ArtboardInfo,
   ArtboardPreset,
@@ -986,6 +987,18 @@ export function EditorPage({
           >
             {fps} fps · {mode} · {tool} · {Math.round(viewport.zoom * 100)}%
           </div>
+          {mode === "prototype" ? (
+            <div
+              style={{
+                position: "absolute",
+                inset: 0,
+                background: "rgba(17, 24, 39, 0.92)",
+                overflow: "auto",
+              }}
+            >
+              <ResponsivePreview onStatus={setStatusMessage} />
+            </div>
+          ) : null}
         </main>
         {rightPanelFocus === "ai" ? (
           <AIAssistPanel

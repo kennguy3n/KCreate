@@ -1316,6 +1316,7 @@ dependencies = [
  "log",
  "parking_lot",
  "pollster",
+ "raw-window-handle",
  "serde",
  "thiserror 1.0.69",
  "tiny-skia",

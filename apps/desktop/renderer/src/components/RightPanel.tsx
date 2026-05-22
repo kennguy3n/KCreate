@@ -3,6 +3,7 @@ import { useEffect, useMemo, useState } from "react";
 import type {
   FlexLayout,
   GridLayout,
+  InspectCode,
   NodeInfo,
   UpdateNodeProps,
 } from "../../../shared/scene";
@@ -655,26 +656,141 @@ const buttonStyle: React.CSSProperties = {
   alignSelf: "flex-start",
 };
 
+type InspectTarget = "css" | "tailwind" | "react_style";
+
+const INSPECT_TARGETS: ReadonlyArray<{
+  id: InspectTarget;
+  label: string;
+  language: string;
+}> = [
+  { id: "css", label: "CSS", language: "css" },
+  { id: "tailwind", label: "Tailwind", language: "html" },
+  { id: "react_style", label: "React style", language: "tsx" },
+];
+
+/**
+ * Inspect-mode panel. Fetches the three code-gen snippets (CSS,
+ * Tailwind utility list, React inline style) from the bridge for
+ * the currently selected node and lets the user copy any of them
+ * to the clipboard.
+ *
+ * The fetch is debounced behind a `useEffect` keyed on the node's
+ * `id` and `version` (the version bumps on every mutation in the
+ * bridge), so dragging a value slider re-fetches but a transient
+ * rerender that doesn't change either does not.
+ */
 function InspectPanel({ node }: { node: NodeInfo | null }): JSX.Element {
+  const [code, setCode] = useState<InspectCode | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [target, setTarget] = useState<InspectTarget>("css");
+  const [copyStatus, setCopyStatus] = useState<string | null>(null);
+  // The `node` reference itself changes when the parent reruns a
+  // document fetch (refreshTree builds a fresh NodeInfo array), so
+  // we re-fetch the inspect output any time `node` is identity-new.
+  // For the steady state (no edits) the reference is stable, so we
+  // do not refetch on every render.
+  useEffect(() => {
+    if (!node) {
+      setCode(null);
+      setError(null);
+      return;
+    }
+    let cancelled = false;
+    void (async () => {
+      try {
+        const result = await window.kcreate.document.inspectNode(node.id);
+        if (!cancelled) {
+          setCode(result);
+          setError(null);
+        }
+      } catch (e) {
+        if (!cancelled) {
+          setError(e instanceof Error ? e.message : String(e));
+        }
+      }
+    })();
+    return (): void => {
+      cancelled = true;
+    };
+  }, [node]);
+
   if (!node) {
     return <Hint>Select a layer to inspect its computed state.</Hint>;
   }
+  if (error) {
+    return <Hint>Inspect failed: {error}</Hint>;
+  }
+  if (!code) {
+    return <Hint>Loading inspect output…</Hint>;
+  }
+  const body = code[target];
+  const language = INSPECT_TARGETS.find((t) => t.id === target)?.language;
+  const onCopy = (): void => {
+    void (async () => {
+      try {
+        await navigator.clipboard.writeText(body);
+        setCopyStatus("Copied!");
+        window.setTimeout(() => setCopyStatus(null), 1200);
+      } catch (e) {
+        setCopyStatus(`Copy failed: ${e instanceof Error ? e.message : e}`);
+        window.setTimeout(() => setCopyStatus(null), 1800);
+      }
+    })();
+  };
   return (
-    <pre
-      style={{
-        background: colors.bgSoft,
-        padding: spacing.sm,
-        margin: 0,
-        borderRadius: radius.card / 2,
-        fontSize: 11,
-        lineHeight: 1.5,
-        whiteSpace: "pre-wrap",
-        wordBreak: "break-all",
-        color: colors.textMuted,
-      }}
+    <div
+      style={{ display: "flex", flexDirection: "column", gap: spacing.sm }}
     >
-      {JSON.stringify(node, null, 2)}
-    </pre>
+      <SegmentedControl
+        value={target}
+        onChange={setTarget}
+        options={INSPECT_TARGETS.map((t) => ({ value: t.id, label: t.label }))}
+      />
+      <pre
+        data-lang={language}
+        style={{
+          background: colors.bgSoft,
+          padding: spacing.sm,
+          margin: 0,
+          borderRadius: radius.card / 2,
+          fontFamily:
+            "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
+          fontSize: 11,
+          lineHeight: 1.5,
+          whiteSpace: "pre-wrap",
+          wordBreak: "break-all",
+          color: colors.text,
+          maxHeight: 360,
+          overflow: "auto",
+        }}
+      >
+        {body}
+      </pre>
+      <div
+        style={{ display: "flex", gap: spacing.sm, alignItems: "center" }}
+      >
+        <button
+          type="button"
+          onClick={onCopy}
+          style={{
+            background: colors.accent,
+            color: "#fff",
+            border: "none",
+            borderRadius: radius.card / 2,
+            padding: `${spacing.xs}px ${spacing.md}px`,
+            fontSize: 12,
+            cursor: "pointer",
+          }}
+        >
+          Copy {INSPECT_TARGETS.find((t) => t.id === target)?.label}
+        </button>
+        {copyStatus ? (
+          <span style={{ fontSize: 11, color: colors.textMuted }}>
+            {copyStatus}
+          </span>
+        ) : null}
+      </div>
+    </div>
   );
 }
 

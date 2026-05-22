@@ -241,6 +241,27 @@ export interface DocumentStatus {
 }
 
 /**
+ * Mirror of `kcreate_export::code_gen::InspectCode`. Each field is
+ * a copy-paste-ready snippet describing one rendering target's
+ * style for the selected node.
+ *
+ * - `css`: rule body without selector or braces. Wrap in
+ *   `.my-button { ... }` at the call site.
+ * - `tailwind`: space-separated utility classes (uses arbitrary
+ *   values for non-standard sizes, e.g. `w-[123px]`).
+ * - `react_style` *(snake_case in transit, see `InspectCode`)*: a
+ *   JSX inline-style object literal — `{ width: 100, ... }`.
+ */
+export interface InspectCode {
+  css: string;
+  tailwind: string;
+  // Serde renames camelCase to snake_case for the wire — we expose
+  // the snake_case field directly to match the Rust struct.
+  // Callers should access `code.react_style`, not `reactStyle`.
+  react_style: string;
+}
+
+/**
  * Document + project lifecycle bridge. Exposed on
  * `window.kcreate.document`. All methods round-trip through the
  * Electron main process; the renderer never imports the native addon
@@ -254,6 +275,16 @@ export interface DocumentBridge {
   getProjectInfo(): Promise<ProjectInfo | null>;
 
   getDocumentTree(): Promise<NodeInfo[]>;
+  /**
+   * Inspect-mode code generation for a single node. Returns three
+   * handoff snippets (raw CSS rule body, Tailwind utility classes,
+   * React inline-style object literal) computed by
+   * `kcreate_export::code_gen`. The mapping is intentionally lossy
+   * — emitted code is a copy-paste starting point, not a
+   * pixel-perfect reproduction. See the rustdoc on
+   * `node_to_css` for details.
+   */
+  inspectNode(nodeId: string): Promise<InspectCode>;
   createNode(
     nodeType: string,
     parentId: string | null,

@@ -64,6 +64,13 @@ or_fun_call = "allow"
 [workspace.dependencies]
 # GPU rendering
 wgpu = { version = "29.0", default-features = false, features = ["wgsl", "vulkan", "metal", "dx12", "gles", "naga-ir", "std", "wgpu-core"] }
+# Window handle abstraction used by `kcreate_renderer::native_surface`
+# for Phase 1's direct-to-swapchain presentation path. The version is
+# pinned to the same release wgpu 29 re-exports so we never end up
+# with two raw-window-handle crates in the dependency graph (which
+# would silently break the `unsafe`-free `HasWindowHandle` trait
+# impl on the same type).
+raw-window-handle = "0.6"
 pollster = "0.4"
 bytemuck = { version = "1.16", features = ["derive"] }
 

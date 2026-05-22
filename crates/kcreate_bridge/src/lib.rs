@@ -837,3 +837,58 @@ pub fn export_preset_delete(preset_id: String) -> NapiResult<bool> {
     let id = parse_uuid(&preset_id)?;
     document::export_preset_delete(id).map_err(map_doc_err)
 }
+
+// ---------------------------------------------------------------------------
+// Artboards
+// ---------------------------------------------------------------------------
+
+/// Create a new artboard. `page_id` may be `None`/empty to attach to
+/// (or create) the first Page in the project. Returns the new
+/// artboard's UUID.
+#[napi]
+pub fn artboard_create(
+    page_id: Option<String>,
+    name: String,
+    width: f64,
+    height: f64,
+) -> NapiResult<String> {
+    let parent = match page_id.as_deref() {
+        Some(s) if !s.is_empty() => Some(parse_uuid(s)?),
+        _ => None,
+    };
+    document::artboard_create(parent, name, width, height)
+        .map(|id| id.to_string())
+        .map_err(map_doc_err)
+}
+
+/// List every artboard in the project as a JSON array.
+#[napi]
+pub fn artboard_list() -> NapiResult<String> {
+    let infos = document::artboard_list().map_err(map_doc_err)?;
+    serde_json::to_string(&infos).map_err(|e| NapiError::from_reason(e.to_string()))
+}
+
+/// Deep-clone an artboard and all its descendants. Returns the new
+/// artboard's UUID.
+#[napi]
+pub fn artboard_duplicate(artboard_id: String) -> NapiResult<String> {
+    let id = parse_uuid(&artboard_id)?;
+    document::artboard_duplicate(id)
+        .map(|new_id| new_id.to_string())
+        .map_err(map_doc_err)
+}
+
+/// Resize the artboard's bounds (width/height). The (x, y) corner is
+/// preserved.
+#[napi]
+pub fn artboard_resize(artboard_id: String, width: f64, height: f64) -> NapiResult<()> {
+    let id = parse_uuid(&artboard_id)?;
+    document::artboard_resize(id, width, height).map_err(map_doc_err)
+}
+
+/// Return the built-in artboard preset catalogue as a JSON array.
+#[napi]
+pub fn artboard_presets() -> NapiResult<String> {
+    let presets = document::artboard_presets();
+    serde_json::to_string(&presets).map_err(|e| NapiError::from_reason(e.to_string()))
+}

@@ -7,6 +7,9 @@ import { contextBridge, ipcRenderer } from "electron";
 import type {
   AcquiredFrame,
   AiBridge,
+  ArtboardBridge,
+  ArtboardInfo,
+  ArtboardPreset,
   BrandKit,
   BrandKitBridge,
   CanvasBridge,
@@ -522,6 +525,74 @@ const exportPreset: ExportPresetBridge = {
   },
 };
 
+type ArtboardInfoSnake = {
+  id: string;
+  name: string;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  page_id: string;
+};
+
+function artboardFromSnake(a: ArtboardInfoSnake): ArtboardInfo {
+  return {
+    id: a.id,
+    name: a.name,
+    x: a.x,
+    y: a.y,
+    width: a.width,
+    height: a.height,
+    pageId: a.page_id,
+  };
+}
+
+const artboard: ArtboardBridge = {
+  async create(
+    pageId: string | null,
+    name: string,
+    width: number,
+    height: number,
+  ): Promise<string> {
+    return (await ipcRenderer.invoke(
+      "kcreate/artboard/create",
+      pageId ?? "",
+      name,
+      width,
+      height,
+    )) as string;
+  },
+  async list(): Promise<ArtboardInfo[]> {
+    const raw = (await ipcRenderer.invoke("kcreate/artboard/list")) as string;
+    const parsed = JSON.parse(raw) as ArtboardInfoSnake[];
+    return parsed.map(artboardFromSnake);
+  },
+  async duplicate(artboardId: string): Promise<string> {
+    return (await ipcRenderer.invoke(
+      "kcreate/artboard/duplicate",
+      artboardId,
+    )) as string;
+  },
+  async resize(
+    artboardId: string,
+    width: number,
+    height: number,
+  ): Promise<void> {
+    await ipcRenderer.invoke(
+      "kcreate/artboard/resize",
+      artboardId,
+      width,
+      height,
+    );
+  },
+  async presets(): Promise<ArtboardPreset[]> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/artboard/presets",
+    )) as string;
+    return JSON.parse(raw) as ArtboardPreset[];
+  },
+};
+
 contextBridge.exposeInMainWorld("kcreate", {
   renderer,
   document,
@@ -533,4 +604,5 @@ contextBridge.exposeInMainWorld("kcreate", {
   designTokens,
   brandKit,
   exportPreset,
+  artboard,
 });

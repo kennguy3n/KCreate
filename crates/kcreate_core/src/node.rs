@@ -317,6 +317,100 @@ impl NodeType {
     }
 }
 
+/// Categorisation for the built-in artboard presets so the home page
+/// and the new-artboard dialog can group them in the UI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PresetCategory {
+    WebDesktop,
+    WebTablet,
+    WebMobile,
+    SocialMedia,
+    Print,
+    Custom,
+}
+
+/// A named artboard size offered as a preset in the UI.
+///
+/// `width` / `height` are in document units (pixels). The set is
+/// surfaced to the host through [`crate::project::Project`] /
+/// `kcreate_bridge` so React presets and Rust core share one source
+/// of truth.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ArtboardPreset {
+    pub name: String,
+    pub width: f64,
+    pub height: f64,
+    pub category: PresetCategory,
+}
+
+impl ArtboardPreset {
+    #[must_use]
+    pub fn new(name: impl Into<String>, width: f64, height: f64, category: PresetCategory) -> Self {
+        Self {
+            name: name.into(),
+            width,
+            height,
+            category,
+        }
+    }
+}
+
+/// Built-in artboard presets. Matches the sizes the PROPOSAL.md §4.2
+/// "App / Website UI", "Pitch Deck", "Social Post", and
+/// "Flyer / Poster / Brochure" home-screen affordances are spec'd
+/// against, plus the most common social-media and print formats so
+/// the new-artboard dialog can offer a useful grid without falling
+/// back to the custom-size escape hatch.
+///
+/// Print sizes are at 300dpi (A4 = 2480×3508 px, US Letter =
+/// 2550×3300 px), which is the canonical "print-ready" resolution.
+#[must_use]
+pub fn standard_presets() -> Vec<ArtboardPreset> {
+    vec![
+        // Web — desktop
+        ArtboardPreset::new("Desktop", 1440.0, 900.0, PresetCategory::WebDesktop),
+        ArtboardPreset::new("Laptop", 1280.0, 800.0, PresetCategory::WebDesktop),
+        ArtboardPreset::new("Desktop HD", 1920.0, 1080.0, PresetCategory::WebDesktop),
+        ArtboardPreset::new("MacBook Pro 14", 1512.0, 982.0, PresetCategory::WebDesktop),
+        // Web — tablet
+        ArtboardPreset::new("Tablet", 768.0, 1024.0, PresetCategory::WebTablet),
+        ArtboardPreset::new("iPad Pro 11", 834.0, 1194.0, PresetCategory::WebTablet),
+        // Web — mobile
+        ArtboardPreset::new("Mobile", 375.0, 812.0, PresetCategory::WebMobile),
+        ArtboardPreset::new("iPhone 15", 393.0, 852.0, PresetCategory::WebMobile),
+        ArtboardPreset::new("Android", 360.0, 800.0, PresetCategory::WebMobile),
+        // Social media
+        ArtboardPreset::new(
+            "Instagram Post",
+            1080.0,
+            1080.0,
+            PresetCategory::SocialMedia,
+        ),
+        ArtboardPreset::new(
+            "Instagram Story",
+            1080.0,
+            1920.0,
+            PresetCategory::SocialMedia,
+        ),
+        ArtboardPreset::new("Twitter / X", 1200.0, 675.0, PresetCategory::SocialMedia),
+        ArtboardPreset::new("Facebook Cover", 820.0, 312.0, PresetCategory::SocialMedia),
+        ArtboardPreset::new("LinkedIn Post", 1200.0, 627.0, PresetCategory::SocialMedia),
+        ArtboardPreset::new(
+            "YouTube Thumbnail",
+            1280.0,
+            720.0,
+            PresetCategory::SocialMedia,
+        ),
+        // Print (300dpi)
+        ArtboardPreset::new("A4", 2480.0, 3508.0, PresetCategory::Print),
+        ArtboardPreset::new("US Letter", 2550.0, 3300.0, PresetCategory::Print),
+        ArtboardPreset::new("A3", 3508.0, 4961.0, PresetCategory::Print),
+        ArtboardPreset::new("US Legal", 2550.0, 4200.0, PresetCategory::Print),
+        ArtboardPreset::new("Business Card", 1050.0, 600.0, PresetCategory::Print),
+    ]
+}
+
 /// Blend mode (matches SVG and Figma).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -710,5 +804,51 @@ mod tests {
         let c = Constraints::default();
         assert_eq!(c.horizontal, Constraint::Fixed);
         assert_eq!(c.vertical, Constraint::Fixed);
+    }
+
+    #[test]
+    fn standard_presets_includes_all_categories() {
+        let presets = standard_presets();
+        assert!(presets.iter().any(|p| p.name == "Desktop"
+            && (p.width - 1440.0).abs() < f64::EPSILON
+            && (p.height - 900.0).abs() < f64::EPSILON));
+        assert!(presets
+            .iter()
+            .any(|p| p.name == "Instagram Post" && p.category == PresetCategory::SocialMedia));
+        assert!(presets
+            .iter()
+            .any(|p| p.name == "A4" && p.category == PresetCategory::Print));
+        // Every preset category that's not "Custom" should be present.
+        for cat in [
+            PresetCategory::WebDesktop,
+            PresetCategory::WebTablet,
+            PresetCategory::WebMobile,
+            PresetCategory::SocialMedia,
+            PresetCategory::Print,
+        ] {
+            assert!(
+                presets.iter().any(|p| p.category == cat),
+                "missing preset for category {cat:?}",
+            );
+        }
+        // No preset should have a zero/negative size.
+        for p in &presets {
+            assert!(p.width > 0.0, "preset {} has non-positive width", p.name);
+            assert!(p.height > 0.0, "preset {} has non-positive height", p.name);
+        }
+    }
+
+    #[test]
+    fn artboard_preset_round_trips_through_json() {
+        let preset = ArtboardPreset::new("Custom", 100.0, 200.0, PresetCategory::Custom);
+        let s = serde_json::to_string(&preset).expect("serialize");
+        let restored: ArtboardPreset = serde_json::from_str(&s).expect("deserialize");
+        assert_eq!(preset, restored);
+    }
+
+    #[test]
+    fn preset_category_serializes_snake_case() {
+        let s = serde_json::to_string(&PresetCategory::WebDesktop).expect("serialize");
+        assert_eq!(s, r#""web_desktop""#);
     }
 }

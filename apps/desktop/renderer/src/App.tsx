@@ -1,7 +1,7 @@
 import { useCallback, useState } from "react";
 
 import { EditorPage } from "./pages/EditorPage";
-import { HomePage } from "./pages/HomePage";
+import { CREATE_OPTIONS, HomePage } from "./pages/HomePage";
 import type { ProjectInfo } from "../../shared/scene";
 
 type Route =
@@ -12,7 +12,7 @@ type Route =
 export function App(): JSX.Element {
   const [route, setRoute] = useState<Route>({ kind: "home" });
 
-  const handleOpenEditor = useCallback(async (_jobKind: string) => {
+  const handleOpenEditor = useCallback(async (jobKind: string) => {
     // Phase 0: we don't yet show a directory picker (electron dialog
     // glue lands with the project manager in Phase 1). Until then we
     // create a scratch project under the OS temp dir so the editor
@@ -20,6 +20,29 @@ export function App(): JSX.Element {
     // right thing with persistence + reopen.
     try {
       const project = await openScratchProject();
+      // Seed the project with the artboard preset for the workflow
+      // the user picked on the home page. We do this *after* the
+      // project is created so the bridge has a workspace to register
+      // the artboard against. Errors are surfaced via the editor's
+      // status bar (the project still opens cleanly).
+      const option = CREATE_OPTIONS.find((o) => o.id === jobKind);
+      const preset = option?.defaultArtboard ?? null;
+      if (preset) {
+        try {
+          await window.kcreate.artboard.create(
+            null,
+            preset.name,
+            preset.width,
+            preset.height,
+          );
+        } catch {
+          // Non-fatal: the editor's artboard panel can still create
+          // one manually. The error is swallowed here because surface
+          // routes (App → EditorPage status bar) aren't wired yet at
+          // this point in the boot sequence; the user sees an empty
+          // editor and can recover by clicking "+ New artboard".
+        }
+      }
       setRoute({ kind: "editor", project });
     } catch (e) {
       setRoute({

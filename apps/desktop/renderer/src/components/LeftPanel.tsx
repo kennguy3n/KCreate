@@ -1,9 +1,10 @@
 import { useState } from "react";
 
-import type { NodeInfo } from "../../../shared/scene";
+import type { ArtboardInfo, NodeInfo } from "../../../shared/scene";
 import { colors, radius, spacing } from "../styles/tokens";
+import { ArtboardPanel } from "./ArtboardPanel";
 
-export type LeftPanelTab = "pages" | "layers" | "assets";
+export type LeftPanelTab = "pages" | "artboards" | "layers" | "assets";
 
 export interface LeftPanelProps {
   nodes: NodeInfo[];
@@ -13,6 +14,17 @@ export interface LeftPanelProps {
   onToggleLocked?: (id: string, locked: boolean) => void;
   onRename?: (id: string, name: string) => void;
   onDelete?: (id: string) => void;
+
+  // Artboard-tab inputs. Optional so existing callers that haven't
+  // wired the artboard bridge yet keep working (the tab just renders
+  // an empty state).
+  artboards?: ArtboardInfo[];
+  onRequestCreateArtboard?: () => void;
+  onFocusArtboard?: (artboard: ArtboardInfo) => void;
+  onRenameArtboard?: (id: string, name: string) => void;
+  onDuplicateArtboard?: (id: string) => void;
+  onResizeArtboard?: (id: string, width: number, height: number) => void;
+  onDeleteArtboard?: (id: string) => void;
 }
 
 export function LeftPanel({
@@ -23,6 +35,13 @@ export function LeftPanel({
   onToggleLocked,
   onRename,
   onDelete,
+  artboards,
+  onRequestCreateArtboard,
+  onFocusArtboard,
+  onRenameArtboard,
+  onDuplicateArtboard,
+  onResizeArtboard,
+  onDeleteArtboard,
 }: LeftPanelProps): JSX.Element {
   const [tab, setTab] = useState<LeftPanelTab>("layers");
   return (
@@ -38,6 +57,7 @@ export function LeftPanel({
       <PanelTabs
         tabs={[
           { id: "pages", label: "Pages" },
+          { id: "artboards", label: "Artboards" },
           { id: "layers", label: "Layers" },
           { id: "assets", label: "Assets" },
         ]}
@@ -63,6 +83,18 @@ export function LeftPanel({
             emptyHint="No pages yet."
           />
         ) : null}
+        {tab === "artboards" ? (
+          <ArtboardPanel
+            artboards={artboards ?? []}
+            selectedId={selectedId}
+            onRequestCreate={onRequestCreateArtboard ?? noop}
+            onFocusArtboard={onFocusArtboard ?? noopArg}
+            onRenameArtboard={onRenameArtboard ?? noopRename}
+            onDuplicateArtboard={onDuplicateArtboard ?? noopArg}
+            onResizeArtboard={onResizeArtboard ?? noopResize}
+            onDeleteArtboard={onDeleteArtboard ?? noopArg}
+          />
+        ) : null}
         {tab === "layers" ? (
           <NodeList
             nodes={nodes}
@@ -83,6 +115,14 @@ export function LeftPanel({
     </aside>
   );
 }
+
+// Empty fallbacks so the panel doesn't need to null-check on every
+// click path. Hosts that don't wire the artboard bridge just see a
+// no-op `+ New artboard` button and an empty list.
+const noop = (): void => undefined;
+const noopArg = (_: unknown): void => undefined;
+const noopRename = (_: string, __: string): void => undefined;
+const noopResize = (_: string, __: number, ___: number): void => undefined;
 
 function PanelTabs<T extends string>({
   tabs,

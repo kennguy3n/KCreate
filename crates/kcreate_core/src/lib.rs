@@ -32,8 +32,9 @@ pub mod project;
 pub use config::{DeviceTier, Platform, RuntimeConfig};
 pub use document::{DocumentError, DocumentGraph};
 pub use node::{
-    BlendMode, Bounds, Constraint, Constraints, Effect, FillStyle, GradientKind, GradientStop,
-    Node, NodeStyle, NodeType, Point2D, RgbaColor, StrokeStyle, Transform2D,
+    standard_presets, ArtboardPreset, BlendMode, Bounds, Constraint, Constraints, Effect,
+    FillStyle, GradientKind, GradientStop, Node, NodeStyle, NodeType, Point2D, PresetCategory,
+    RgbaColor, StrokeStyle, Transform2D,
 };
 pub use operation::{Operation, OperationLog};
 pub use project::{

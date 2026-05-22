@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::node::{Bounds, Node};
+use crate::node::{Bounds, Node, NodeType};
 
 /// Errors returned by [`DocumentGraph`].
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -26,6 +26,12 @@ pub enum DocumentError {
     ChildNotInParent { parent: Uuid, child: Uuid },
     #[error("reorder set does not match parent {parent}'s current children")]
     ReorderSetMismatch { parent: Uuid },
+    #[error("node {id} has wrong type: expected {expected:?}, got {got:?}")]
+    WrongNodeType {
+        id: Uuid,
+        expected: NodeType,
+        got: NodeType,
+    },
 }
 
 /// Result alias for document operations.
@@ -291,6 +297,197 @@ impl DocumentGraph {
     pub fn contains(&self, id: Uuid) -> bool {
         self.nodes.contains_key(&id)
     }
+
+    // ------------------------------------------------------------------
+    // Artboard convenience APIs
+    // ------------------------------------------------------------------
+
+    /// Create a new artboard as a child of `page_id` with the given
+    /// `name` and `bounds`. The new artboard is appended to the page's
+    /// children list.
+    ///
+    /// Returns [`DocumentError::NodeNotFound`] if `page_id` doesn't
+    /// exist and [`DocumentError::WrongNodeType`] if the referenced
+    /// node is not a [`NodeType::Page`]. Artboards may only be direct
+    /// children of pages in Phase 1 — that constraint matches the
+    /// PROPOSAL.md §4.2 multi-artboard page model and avoids the
+    /// nested-artboard "scene-within-scene" complexity Figma had to
+    /// untangle.
+    pub fn create_artboard(&mut self, page_id: Uuid, name: &str, bounds: Bounds) -> Result<Uuid> {
+        let page = self
+            .nodes
+            .get(&page_id)
+            .ok_or(DocumentError::NodeNotFound(page_id))?;
+        if page.node_type != NodeType::Page {
+            return Err(DocumentError::WrongNodeType {
+                id: page_id,
+                expected: NodeType::Page,
+                got: page.node_type,
+            });
+        }
+        let mut artboard = Node::new(NodeType::Artboard, name);
+        artboard.parent_id = Some(page_id);
+        artboard.bounds = bounds;
+        let id = self.insert_node(artboard)?;
+        Ok(id)
+    }
+
+    /// All direct [`NodeType::Artboard`] children of `page_id`, sorted
+    /// by `bounds.x` ascending (left to right) so the left-panel
+    /// artboard list and home-screen previews display in a stable
+    /// visual order regardless of insertion order.
+    #[must_use]
+    pub fn list_artboards(&self, page_id: Uuid) -> Vec<&Node> {
+        let Some(page) = self.nodes.get(&page_id) else {
+            return Vec::new();
+        };
+        let mut artboards: Vec<&Node> = page
+            .children
+            .iter()
+            .filter_map(|c| self.nodes.get(c))
+            .filter(|n| n.node_type == NodeType::Artboard)
+            .collect();
+        artboards.sort_by(|a, b| {
+            a.bounds
+                .x
+                .partial_cmp(&b.bounds.x)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        artboards
+    }
+
+    /// Deep-clone an artboard and all its descendants, offset by
+    /// `(width + 100, 0)` so the copy lands immediately to the right
+    /// of the original with a 100-px gap.
+    ///
+    /// Returns the new artboard's id. Returns
+    /// [`DocumentError::WrongNodeType`] if `artboard_id` is not an
+    /// artboard. The clone preserves the *subtree shape* and node
+    /// properties verbatim; only the ids and parent references are
+    /// regenerated so every clone is a fresh, independent identity in
+    /// the document graph.
+    pub fn duplicate_artboard(&mut self, artboard_id: Uuid) -> Result<Uuid> {
+        let source = self
+            .nodes
+            .get(&artboard_id)
+            .ok_or(DocumentError::NodeNotFound(artboard_id))?;
+        if source.node_type != NodeType::Artboard {
+            return Err(DocumentError::WrongNodeType {
+                id: artboard_id,
+                expected: NodeType::Artboard,
+                got: source.node_type,
+            });
+        }
+        let parent_id = source.parent_id;
+        let width = source.bounds.width;
+        let dx = width + 100.0;
+        let dy = 0.0;
+
+        // Snapshot the subtree before mutation so we can deep-clone
+        // without borrowing into `self.nodes`.
+        let subtree_ids: Vec<Uuid> = std::iter::once(artboard_id)
+            .chain(self.descendants_of(artboard_id))
+            .collect();
+        let mut snapshots: HashMap<Uuid, Node> = HashMap::with_capacity(subtree_ids.len());
+        for id in &subtree_ids {
+            if let Some(n) = self.nodes.get(id) {
+                snapshots.insert(*id, n.clone());
+            }
+        }
+
+        // Map old uuid → new uuid.
+        let mut id_map: HashMap<Uuid, Uuid> = HashMap::with_capacity(subtree_ids.len());
+        for id in &subtree_ids {
+            id_map.insert(*id, Uuid::new_v4());
+        }
+
+        let new_root = *id_map.get(&artboard_id).expect("just inserted");
+
+        // Insert the new subtree top-down so each insert sees its
+        // parent in `self.nodes`.
+        for old_id in &subtree_ids {
+            let original = &snapshots[old_id];
+            let mut copy = original.clone();
+            copy.id = id_map[old_id];
+            copy.parent_id = if *old_id == artboard_id {
+                parent_id
+            } else {
+                original
+                    .parent_id
+                    .and_then(|pid| id_map.get(&pid).copied())
+                    .or(parent_id)
+            };
+            // Remap children to new ids; clone preserves order.
+            copy.children = original
+                .children
+                .iter()
+                .filter_map(|c| id_map.get(c).copied())
+                .collect();
+            if *old_id == artboard_id {
+                copy.bounds.x += dx;
+                copy.bounds.y += dy;
+                copy.name = format!("{} copy", original.name);
+            }
+            copy.version = 0;
+            let now = chrono::Utc::now();
+            copy.created_at = now;
+            copy.updated_at = now;
+
+            // Insert manually so we don't double-link children (the
+            // children list is already populated above).
+            if let Some(pid) = copy.parent_id {
+                if !self.nodes.contains_key(&pid) {
+                    return Err(DocumentError::InvalidReparent { target: pid });
+                }
+            }
+            let copy_id = copy.id;
+            let copy_parent = copy.parent_id;
+            self.nodes.insert(copy.id, copy);
+            if let Some(pid) = copy_parent {
+                // Only link the *root* of the cloned subtree into its
+                // new parent — descendants are already linked through
+                // the remapped `children` field, so re-linking them
+                // would double-list them.
+                if *old_id == artboard_id {
+                    if let Some(parent) = self.nodes.get_mut(&pid) {
+                        if !parent.children.contains(&copy_id) {
+                            parent.children.push(copy_id);
+                            parent.touch();
+                        }
+                    }
+                }
+            } else if !self.root_ids.contains(&copy_id) {
+                self.root_ids.push(copy_id);
+            }
+        }
+
+        Ok(new_root)
+    }
+
+    /// Update the artboard's bounds without touching children.
+    ///
+    /// Returns [`DocumentError::WrongNodeType`] if the node is not an
+    /// artboard. Resizes are a pure metadata change on the artboard
+    /// node — children keep their original positions/sizes, so an
+    /// artboard shrunk past a child's bounds will leave that child
+    /// hanging outside the new clip rect (the scene-sync clipping
+    /// layer is what determines whether overflowing children render).
+    pub fn resize_artboard(&mut self, artboard_id: Uuid, new_bounds: Bounds) -> Result<()> {
+        let node = self
+            .nodes
+            .get_mut(&artboard_id)
+            .ok_or(DocumentError::NodeNotFound(artboard_id))?;
+        if node.node_type != NodeType::Artboard {
+            return Err(DocumentError::WrongNodeType {
+                id: artboard_id,
+                expected: NodeType::Artboard,
+                got: node.node_type,
+            });
+        }
+        node.bounds = new_bounds;
+        node.touch();
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -497,5 +694,141 @@ mod tests {
         let g2: DocumentGraph = serde_json::from_str(&s).expect("deserialize");
         assert_eq!(g.node_count(), g2.node_count());
         assert_eq!(g.root_ids(), g2.root_ids());
+    }
+
+    // ---- Artboard convenience API tests ----
+
+    fn page(g: &mut DocumentGraph, name: &str) -> Uuid {
+        let mut p = Node::new(NodeType::Page, name);
+        p.bounds = Bounds::new(0.0, 0.0, 1920.0, 1080.0);
+        let id = p.id;
+        g.insert_node(p).expect("page");
+        id
+    }
+
+    #[test]
+    fn create_artboard_attaches_under_page() {
+        let mut g = DocumentGraph::new();
+        let page_id = page(&mut g, "Home");
+        let id = g
+            .create_artboard(page_id, "Hero", Bounds::new(0.0, 0.0, 1440.0, 900.0))
+            .expect("create");
+        let node = g.get_node(id).expect("inserted");
+        assert_eq!(node.node_type, NodeType::Artboard);
+        assert_eq!(node.parent_id, Some(page_id));
+        assert_eq!(node.bounds, Bounds::new(0.0, 0.0, 1440.0, 900.0));
+        assert_eq!(g.children_of(page_id), vec![id]);
+    }
+
+    #[test]
+    fn create_artboard_rejects_non_page_parent() {
+        let mut g = DocumentGraph::new();
+        let page_id = page(&mut g, "p");
+        let ab = g
+            .create_artboard(page_id, "Hero", Bounds::new(0.0, 0.0, 100.0, 100.0))
+            .expect("create");
+        let err = g
+            .create_artboard(ab, "Nested", Bounds::new(0.0, 0.0, 100.0, 100.0))
+            .expect_err("non-page parent rejected");
+        assert!(matches!(err, DocumentError::WrongNodeType { .. }));
+    }
+
+    #[test]
+    fn list_artboards_sorted_by_x() {
+        let mut g = DocumentGraph::new();
+        let p = page(&mut g, "Home");
+        let a = g
+            .create_artboard(p, "A", Bounds::new(2000.0, 0.0, 200.0, 200.0))
+            .expect("a");
+        let b = g
+            .create_artboard(p, "B", Bounds::new(100.0, 0.0, 200.0, 200.0))
+            .expect("b");
+        let c = g
+            .create_artboard(p, "C", Bounds::new(1000.0, 0.0, 200.0, 200.0))
+            .expect("c");
+        let ids: Vec<Uuid> = g.list_artboards(p).iter().map(|n| n.id).collect();
+        assert_eq!(ids, vec![b, c, a]);
+    }
+
+    #[test]
+    fn duplicate_artboard_preserves_subtree_with_new_ids() {
+        let mut g = DocumentGraph::new();
+        let p = page(&mut g, "Home");
+        let ab = g
+            .create_artboard(p, "Hero", Bounds::new(0.0, 0.0, 400.0, 300.0))
+            .expect("ab");
+        let mut child = Node::new(NodeType::VectorLayer, "rect");
+        child.parent_id = Some(ab);
+        child.bounds = Bounds::new(10.0, 10.0, 50.0, 50.0);
+        let child_id = g.insert_node(child).expect("child");
+        let mut grand = Node::new(NodeType::VectorLayer, "circle");
+        grand.parent_id = Some(child_id);
+        grand.bounds = Bounds::new(20.0, 20.0, 30.0, 30.0);
+        let grand_id = g.insert_node(grand).expect("grand");
+
+        let copy = g.duplicate_artboard(ab).expect("dup");
+        assert_ne!(copy, ab);
+        let copy_node = g.get_node(copy).expect("copy node");
+        // Copy is offset by width + 100 = 500 to the right.
+        assert!((copy_node.bounds.x - 500.0).abs() < f64::EPSILON);
+        assert_eq!(copy_node.parent_id, Some(p));
+        assert_eq!(copy_node.children.len(), 1);
+        let copy_child_id = copy_node.children[0];
+        assert_ne!(copy_child_id, child_id);
+        let copy_child = g.get_node(copy_child_id).expect("copy child");
+        assert_eq!(copy_child.node_type, NodeType::VectorLayer);
+        assert_eq!(copy_child.parent_id, Some(copy));
+        assert_eq!(copy_child.children.len(), 1);
+        let copy_grand_id = copy_child.children[0];
+        assert_ne!(copy_grand_id, grand_id);
+        let copy_grand = g.get_node(copy_grand_id).expect("copy grand");
+        assert_eq!(copy_grand.bounds, Bounds::new(20.0, 20.0, 30.0, 30.0));
+        // Page now has two children (original + copy).
+        assert_eq!(g.children_of(p).len(), 2);
+    }
+
+    #[test]
+    fn duplicate_artboard_rejects_non_artboard() {
+        let mut g = DocumentGraph::new();
+        let p = page(&mut g, "p");
+        let err = g
+            .duplicate_artboard(p)
+            .expect_err("page is not an artboard");
+        assert!(matches!(err, DocumentError::WrongNodeType { .. }));
+    }
+
+    #[test]
+    fn resize_artboard_leaves_children_alone() {
+        let mut g = DocumentGraph::new();
+        let p = page(&mut g, "Home");
+        let ab = g
+            .create_artboard(p, "Hero", Bounds::new(0.0, 0.0, 400.0, 300.0))
+            .expect("ab");
+        let mut child = Node::new(NodeType::VectorLayer, "rect");
+        child.parent_id = Some(ab);
+        child.bounds = Bounds::new(10.0, 10.0, 50.0, 50.0);
+        let child_id = g.insert_node(child).expect("child");
+        let original_child_bounds = g.get_node(child_id).expect("child").bounds;
+        g.resize_artboard(ab, Bounds::new(0.0, 0.0, 800.0, 600.0))
+            .expect("resize");
+        assert_eq!(
+            g.get_node(ab).expect("ab").bounds,
+            Bounds::new(0.0, 0.0, 800.0, 600.0)
+        );
+        assert_eq!(
+            g.get_node(child_id).expect("child").bounds,
+            original_child_bounds,
+            "resize must not touch child bounds",
+        );
+    }
+
+    #[test]
+    fn resize_artboard_rejects_non_artboard() {
+        let mut g = DocumentGraph::new();
+        let p = page(&mut g, "p");
+        let err = g
+            .resize_artboard(p, Bounds::new(0.0, 0.0, 1.0, 1.0))
+            .expect_err("page rejected");
+        assert!(matches!(err, DocumentError::WrongNodeType { .. }));
     }
 }

@@ -169,6 +169,18 @@ export interface Bridge {
   exportPresetCreate(name: string, format: string, scale: number): string;
   exportPresetList(): string;
   exportPresetDelete(presetId: string): boolean;
+
+  // Artboards (Phase 1, Block A)
+  artboardCreate(
+    pageId: string | null,
+    name: string,
+    width: number,
+    height: number,
+  ): string;
+  artboardList(): string;
+  artboardDuplicate(artboardId: string): string;
+  artboardResize(artboardId: string, width: number, height: number): void;
+  artboardPresets(): string;
 }
 
 function bridgeBinaryPath(): string {

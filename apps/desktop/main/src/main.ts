@@ -605,6 +605,40 @@ function registerIpcHandlers(): void {
   ipcMain.handle("kcreate/exportPreset/delete", (_e, presetId: string) =>
     requireBridge().exportPresetDelete(presetId),
   );
+
+  ipcMain.handle(
+    "kcreate/artboard/create",
+    (
+      _e,
+      pageId: string,
+      name: string,
+      width: number,
+      height: number,
+    ): string =>
+      requireBridge().artboardCreate(
+        pageId.length > 0 ? pageId : null,
+        name,
+        width,
+        height,
+      ),
+  );
+  ipcMain.handle("kcreate/artboard/list", () =>
+    requireBridge().artboardList(),
+  );
+  ipcMain.handle(
+    "kcreate/artboard/duplicate",
+    (_e, artboardId: string): string =>
+      requireBridge().artboardDuplicate(artboardId),
+  );
+  ipcMain.handle(
+    "kcreate/artboard/resize",
+    (_e, artboardId: string, width: number, height: number): void => {
+      requireBridge().artboardResize(artboardId, width, height);
+    },
+  );
+  ipcMain.handle("kcreate/artboard/presets", () =>
+    requireBridge().artboardPresets(),
+  );
 }
 
 void app.whenReady().then(() => {

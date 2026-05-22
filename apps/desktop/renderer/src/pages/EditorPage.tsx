@@ -11,7 +11,10 @@ import {
 } from "../components/TopBar";
 import { AIAssistPanel } from "../components/AIAssistPanel";
 import { ExportPanel } from "../components/ExportPanel";
+import { ArtboardDialog } from "../components/ArtboardDialog";
 import type {
+  ArtboardInfo,
+  ArtboardPreset,
   DocumentStatus,
   NodeInfo,
   ProjectInfo,
@@ -66,6 +69,11 @@ export function EditorPage({
   // sentinel today.
   const [scene] = useState<Scene>(EMPTY_SCENE);
   const [docStatus, setDocStatus] = useState<DocumentStatus | null>(null);
+  const [artboards, setArtboards] = useState<ArtboardInfo[]>([]);
+  const [artboardPresets, setArtboardPresets] = useState<ArtboardPreset[]>(
+    [],
+  );
+  const [artboardDialogOpen, setArtboardDialogOpen] = useState(false);
   const lastTickAtRef = useRef<number>(performance.now());
   // Drag-to-create / drag-to-move state. Storing in a ref keeps the
   // pointer handler stable while still tracking the current drag.
@@ -103,6 +111,15 @@ export function EditorPage({
     }
   }, []);
 
+  const refreshArtboards = useCallback(async () => {
+    try {
+      const list = await window.kcreate.artboard.list();
+      setArtboards(list);
+    } catch (e) {
+      setStatusMessage(`artboard list failed: ${errorMessage(e)}`);
+    }
+  }, []);
+
   const refreshTree = useCallback(async () => {
     try {
       const tree = await window.kcreate.document.getDocumentTree();
@@ -112,12 +129,121 @@ export function EditorPage({
     }
     await refreshStatus();
     await refreshSelection();
-  }, [refreshStatus, refreshSelection]);
+    await refreshArtboards();
+  }, [refreshStatus, refreshSelection, refreshArtboards]);
 
   // Initial load + on-mode-change resync.
   useEffect(() => {
     void refreshTree();
   }, [refreshTree]);
+
+  // Load preset catalogue once. It's deterministic and the bridge
+  // recomputes it on each call so caching once on mount is fine.
+  useEffect(() => {
+    let cancelled = false;
+    void window.kcreate.artboard
+      .presets()
+      .then((p) => {
+        if (!cancelled) setArtboardPresets(p);
+      })
+      .catch((err: unknown) => {
+        if (!cancelled) {
+          setStatusMessage(`artboard presets failed: ${errorMessage(err)}`);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // Focus the canvas viewport on an artboard with ~10% margin.
+  // World→screen transform is `screen = world * zoom + pan`, so to
+  // center an artboard of bounds (x, y, w, h) we solve for pan such
+  // that the artboard center sits at the canvas center.
+  const focusArtboard = useCallback((a: ArtboardInfo) => {
+    const marginFactor = 0.9;
+    const zoom = Math.min(
+      (CANVAS_WIDTH * marginFactor) / Math.max(a.width, 1),
+      (CANVAS_HEIGHT * marginFactor) / Math.max(a.height, 1),
+    );
+    const centerWorldX = a.x + a.width / 2;
+    const centerWorldY = a.y + a.height / 2;
+    const panX = CANVAS_WIDTH / 2 - centerWorldX * zoom;
+    const panY = CANVAS_HEIGHT / 2 - centerWorldY * zoom;
+    setViewport({ panX, panY, zoom });
+    void window.kcreate.canvas.setSelection([a.id]).then(refreshSelection);
+  }, [refreshSelection]);
+
+  const handleCreateArtboard = useCallback(
+    async (args: { name: string; width: number; height: number }) => {
+      try {
+        const id = await window.kcreate.artboard.create(
+          null,
+          args.name,
+          args.width,
+          args.height,
+        );
+        await refreshTree();
+        const list = await window.kcreate.artboard.list();
+        setArtboards(list);
+        const created = list.find((a) => a.id === id);
+        if (created) focusArtboard(created);
+      } catch (e) {
+        setStatusMessage(`create artboard failed: ${errorMessage(e)}`);
+      } finally {
+        setArtboardDialogOpen(false);
+      }
+    },
+    [refreshTree, focusArtboard],
+  );
+
+  const handleDuplicateArtboard = useCallback(
+    async (id: string) => {
+      try {
+        await window.kcreate.artboard.duplicate(id);
+        await refreshTree();
+      } catch (e) {
+        setStatusMessage(`duplicate artboard failed: ${errorMessage(e)}`);
+      }
+    },
+    [refreshTree],
+  );
+
+  const handleResizeArtboard = useCallback(
+    async (id: string, width: number, height: number) => {
+      try {
+        await window.kcreate.artboard.resize(id, width, height);
+        await refreshTree();
+      } catch (e) {
+        setStatusMessage(`resize artboard failed: ${errorMessage(e)}`);
+      }
+    },
+    [refreshTree],
+  );
+
+  const handleDeleteArtboard = useCallback(
+    async (id: string) => {
+      try {
+        await window.kcreate.document.deleteNode(id);
+        await refreshTree();
+      } catch (e) {
+        setStatusMessage(`delete artboard failed: ${errorMessage(e)}`);
+      }
+    },
+    [refreshTree],
+  );
+
+  const handleRenameArtboard = useCallback(
+    async (id: string, name: string) => {
+      try {
+        await window.kcreate.document.updateNode(id, { name });
+        await refreshTree();
+      } catch (e) {
+        setStatusMessage(`rename artboard failed: ${errorMessage(e)}`);
+      }
+    },
+    [refreshTree],
+  );
 
   // When the mode changes, snap to its default tool so the canvas
   // cursor and toolbar stay aligned.
@@ -628,6 +754,21 @@ export function EditorPage({
               }
             })();
           }}
+          artboards={artboards}
+          onRequestCreateArtboard={() => setArtboardDialogOpen(true)}
+          onFocusArtboard={focusArtboard}
+          onRenameArtboard={(id, name) => {
+            void handleRenameArtboard(id, name);
+          }}
+          onDuplicateArtboard={(id) => {
+            void handleDuplicateArtboard(id);
+          }}
+          onResizeArtboard={(id, w, h) => {
+            void handleResizeArtboard(id, w, h);
+          }}
+          onDeleteArtboard={(id) => {
+            void handleDeleteArtboard(id);
+          }}
         />
         <main
           style={{
@@ -709,6 +850,14 @@ export function EditorPage({
             : `${selectedIds.length} selected`}
         </span>
       </footer>
+      <ArtboardDialog
+        open={artboardDialogOpen}
+        presets={artboardPresets}
+        onCreate={(args) => {
+          void handleCreateArtboard(args);
+        }}
+        onClose={() => setArtboardDialogOpen(false)}
+      />
     </div>
   );
 }

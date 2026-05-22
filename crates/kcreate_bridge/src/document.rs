@@ -56,6 +56,8 @@ pub enum DocumentBridgeError {
     Svg(#[from] SvgDocumentExportError),
     #[error("invalid uuid {0:?}: {1}")]
     InvalidUuid(String, uuid::Error),
+    #[error("invalid bounds: width={width} height={height} (must be finite and positive)")]
+    InvalidBounds { width: f64, height: f64 },
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
     #[error(transparent)]
@@ -981,6 +983,202 @@ fn create_vector_layer(
     let _ = sync_scene_locked(&mut guard);
     drop(guard);
     Ok(id)
+}
+
+// -----------------------------------------------------------------------------
+// Artboards
+// -----------------------------------------------------------------------------
+
+/// Wire shape returned to the host by [`artboard_list`]. Mirrors
+/// `ArtboardInfo` in `apps/desktop/shared/scene.ts`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ArtboardInfo {
+    pub id: Uuid,
+    pub name: String,
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+    pub page_id: Uuid,
+}
+
+/// Create an artboard. If `page_id` is `None`, the artboard is
+/// attached to the first existing Page; if no Page exists, a new
+/// "Page 1" is created and used.
+///
+/// Records an undoable `artboard_create` operation and triggers a
+/// scene sync.
+pub fn artboard_create(
+    page_id: Option<Uuid>,
+    name: String,
+    width: f64,
+    height: f64,
+) -> Result<Uuid> {
+    if !(width.is_finite() && width > 0.0 && height.is_finite() && height > 0.0) {
+        return Err(DocumentBridgeError::InvalidBounds { width, height });
+    }
+    let mut guard = slot().lock();
+    let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
+
+    // Resolve target page.
+    let resolved_page = match page_id {
+        Some(p) => p,
+        None => match find_first_page(&ws.project.document) {
+            Some(p) => p,
+            None => ws.project.add_page("Page 1")?,
+        },
+    };
+
+    // Auto-position new artboards in a horizontal row 100px apart so
+    // they don't stack on top of each other when the user just clicks
+    // "New artboard" repeatedly.
+    let x = next_artboard_x(&ws.project.document, resolved_page);
+    let bounds = kcreate_core::node::Bounds::new(x, 0.0, width, height);
+    let id = ws
+        .project
+        .document
+        .create_artboard(resolved_page, &name, bounds)?;
+    ws.project.modified_at = Utc::now();
+    let snapshot = ws
+        .project
+        .document
+        .get_node(id)
+        .map_or(serde_json::Value::Null, |n| {
+            serde_json::to_value(n).unwrap_or(serde_json::Value::Null)
+        });
+    let op = Operation::new(
+        "user",
+        "artboard_create",
+        serde_json::Value::Null,
+        snapshot,
+        vec![id],
+    );
+    ws.project.execute_operation(op);
+    let _ = sync_scene_locked(&mut guard);
+    drop(guard);
+    Ok(id)
+}
+
+/// All artboards across all pages, sorted by their owning page id
+/// then `bounds.x` (the per-page left-to-right order chosen by
+/// [`DocumentGraph::list_artboards`]).
+pub fn artboard_list() -> Result<Vec<ArtboardInfo>> {
+    let guard = slot().lock();
+    let ws = guard.as_ref().ok_or(DocumentBridgeError::NoProject)?;
+    let mut pages: Vec<&Node> = ws
+        .project
+        .document
+        .iter()
+        .map(|(_, n)| n)
+        .filter(|n| n.node_type == NodeType::Page)
+        .collect();
+    pages.sort_by_key(|p| p.id);
+    let mut out = Vec::new();
+    for page in pages {
+        for ab in ws.project.document.list_artboards(page.id) {
+            out.push(ArtboardInfo {
+                id: ab.id,
+                name: ab.name.clone(),
+                x: ab.bounds.x,
+                y: ab.bounds.y,
+                width: ab.bounds.width,
+                height: ab.bounds.height,
+                page_id: page.id,
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// Deep-clone an artboard. Records an `artboard_duplicate` operation
+/// (the snapshot is the new root node only — undo deletes the clone
+/// subtree wholesale by removing the new root).
+pub fn artboard_duplicate(artboard_id: Uuid) -> Result<Uuid> {
+    let mut guard = slot().lock();
+    let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
+    let new_id = ws.project.document.duplicate_artboard(artboard_id)?;
+    ws.project.modified_at = Utc::now();
+    let snapshot = ws
+        .project
+        .document
+        .get_node(new_id)
+        .map_or(serde_json::Value::Null, |n| {
+            serde_json::to_value(n).unwrap_or(serde_json::Value::Null)
+        });
+    let op = Operation::new(
+        "user",
+        "artboard_duplicate",
+        serde_json::to_value(artboard_id).unwrap_or(serde_json::Value::Null),
+        snapshot,
+        vec![new_id],
+    );
+    ws.project.execute_operation(op);
+    let _ = sync_scene_locked(&mut guard);
+    drop(guard);
+    Ok(new_id)
+}
+
+/// Resize an artboard. The `(x, y)` corner is preserved; only
+/// `width` and `height` change. Records an undoable operation.
+pub fn artboard_resize(artboard_id: Uuid, width: f64, height: f64) -> Result<()> {
+    if !(width.is_finite() && width > 0.0 && height.is_finite() && height > 0.0) {
+        return Err(DocumentBridgeError::InvalidBounds { width, height });
+    }
+    let mut guard = slot().lock();
+    let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
+    let before = ws
+        .project
+        .document
+        .get_node(artboard_id)
+        .map(|n| serde_json::to_value(n.bounds).unwrap_or(serde_json::Value::Null))
+        .ok_or(DocumentBridgeError::NodeNotFound(artboard_id))?;
+    let current = ws
+        .project
+        .document
+        .get_node(artboard_id)
+        .ok_or(DocumentBridgeError::NodeNotFound(artboard_id))?
+        .bounds;
+    let new_bounds = kcreate_core::node::Bounds::new(current.x, current.y, width, height);
+    ws.project
+        .document
+        .resize_artboard(artboard_id, new_bounds)?;
+    ws.project.modified_at = Utc::now();
+    let after = serde_json::to_value(new_bounds)?;
+    let op = Operation::new("user", "artboard_resize", before, after, vec![artboard_id]);
+    ws.project.execute_operation(op);
+    let _ = sync_scene_locked(&mut guard);
+    drop(guard);
+    Ok(())
+}
+
+/// Return the built-in artboard preset catalogue.
+pub fn artboard_presets() -> Vec<kcreate_core::ArtboardPreset> {
+    kcreate_core::standard_presets()
+}
+
+fn find_first_page(doc: &DocumentGraph) -> Option<Uuid> {
+    let mut pages: Vec<&Node> = doc
+        .iter()
+        .map(|(_, n)| n)
+        .filter(|n| n.node_type == NodeType::Page)
+        .collect();
+    pages.sort_by_key(|p| p.id);
+    pages.first().map(|p| p.id)
+}
+
+fn next_artboard_x(doc: &DocumentGraph, page_id: Uuid) -> f64 {
+    let existing = doc.list_artboards(page_id);
+    if existing.is_empty() {
+        0.0
+    } else {
+        // Place to the right of the rightmost existing artboard with
+        // a 100-px gap.
+        existing
+            .iter()
+            .map(|n| n.bounds.x + n.bounds.width)
+            .fold(f64::NEG_INFINITY, f64::max)
+            + 100.0
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -2247,5 +2445,128 @@ mod tests {
         let err = export_preset_create("nope".into(), "bmp", 1.0).expect_err("bmp");
         assert!(matches!(err, DocumentBridgeError::InvalidNodeType(_)));
         project_close();
+    }
+
+    // ---- Artboard bridge tests ----
+
+    #[test]
+    #[serial]
+    fn artboard_create_attaches_to_first_page_when_unspecified() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("ab", dir.path()).expect("create");
+        let before = artboard_list().expect("baseline");
+        // The default project ships with one artboard already.
+        let baseline = before.len();
+        let id = artboard_create(None, "Hero".into(), 1440.0, 900.0).expect("create artboard");
+        let listed = artboard_list().expect("list");
+        assert_eq!(listed.len(), baseline + 1);
+        let info = listed.iter().find(|a| a.id == id).expect("hero");
+        assert_eq!(info.name, "Hero");
+        assert!((info.width - 1440.0).abs() < f64::EPSILON);
+        assert!((info.height - 900.0).abs() < f64::EPSILON);
+        // The page_id is the same for both default + new artboard
+        // (we attached to the only page).
+        let other_page = listed.iter().find(|a| a.id != id).expect("default");
+        assert_eq!(info.page_id, other_page.page_id);
+        project_close();
+    }
+
+    #[test]
+    #[serial]
+    fn artboard_create_rejects_invalid_bounds() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("ab2", dir.path()).expect("create");
+        let err = artboard_create(None, "Bad".into(), -1.0, 100.0).expect_err("negative w");
+        assert!(matches!(err, DocumentBridgeError::InvalidBounds { .. }));
+        let err = artboard_create(None, "Bad".into(), 1.0, f64::INFINITY).expect_err("inf h");
+        assert!(matches!(err, DocumentBridgeError::InvalidBounds { .. }));
+        let err = artboard_create(None, "Bad".into(), f64::NAN, 100.0).expect_err("nan w");
+        assert!(matches!(err, DocumentBridgeError::InvalidBounds { .. }));
+        project_close();
+    }
+
+    #[test]
+    #[serial]
+    fn artboard_create_no_project_errors() {
+        reset_for_tests();
+        let err = artboard_create(None, "x".into(), 10.0, 10.0).expect_err("no project");
+        assert!(matches!(err, DocumentBridgeError::NoProject));
+    }
+
+    #[test]
+    #[serial]
+    fn artboard_duplicate_offsets_and_renames() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("ab3", dir.path()).expect("create");
+        let id = artboard_create(None, "Hero".into(), 400.0, 300.0).expect("create");
+        let before = artboard_list().expect("list before");
+        let original = before.iter().find(|a| a.id == id).expect("original");
+        let original_x = original.x;
+        let dup = artboard_duplicate(id).expect("dup");
+        assert_ne!(dup, id);
+        let after = artboard_list().expect("list after");
+        let copy = after.iter().find(|a| a.id == dup).expect("copy");
+        // Width(400) + 100 gap = 500 to the right of the original.
+        assert!((copy.x - (original_x + 500.0)).abs() < f64::EPSILON);
+        assert!(copy.name.contains("copy"));
+        assert!(after.iter().any(|a| a.id == id), "original preserved");
+        project_close();
+    }
+
+    #[test]
+    #[serial]
+    fn artboard_resize_records_operation_and_preserves_corner() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("ab4", dir.path()).expect("create");
+        let id = artboard_create(None, "Hero".into(), 400.0, 300.0).expect("create");
+        let before_status = document_status().expect("status");
+        artboard_resize(id, 800.0, 600.0).expect("resize");
+        let after_status = document_status().expect("status");
+        assert!(
+            after_status.undo_depth > before_status.undo_depth,
+            "resize should be undoable"
+        );
+        let listed = artboard_list().expect("list");
+        let info = listed.iter().find(|a| a.id == id).expect("hero");
+        assert!((info.width - 800.0).abs() < f64::EPSILON);
+        assert!((info.height - 600.0).abs() < f64::EPSILON);
+        // (x, y) corner preserved.
+        assert!((info.y - 0.0).abs() < f64::EPSILON);
+        project_close();
+    }
+
+    #[test]
+    #[serial]
+    fn artboard_resize_rejects_invalid_bounds() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("ab5", dir.path()).expect("create");
+        let id = artboard_create(None, "Hero".into(), 400.0, 300.0).expect("create");
+        let err = artboard_resize(id, 0.0, 100.0).expect_err("zero w");
+        assert!(matches!(err, DocumentBridgeError::InvalidBounds { .. }));
+        project_close();
+    }
+
+    #[test]
+    #[serial]
+    fn artboard_presets_returns_built_in_catalogue() {
+        reset_for_tests();
+        let presets = artboard_presets();
+        // Built-in catalogue is non-empty and every entry has positive
+        // dimensions (the renderer treats <=0 as a no-op).
+        assert!(!presets.is_empty());
+        for p in &presets {
+            assert!(p.width > 0.0, "{} width must be > 0", p.name);
+            assert!(p.height > 0.0, "{} height must be > 0", p.name);
+        }
+        // The home-screen affordances depend on these named presets
+        // being present — keep them as a contract.
+        assert!(presets.iter().any(|p| p.name == "Desktop"));
+        assert!(presets.iter().any(|p| p.name == "Instagram Post"));
+        assert!(presets.iter().any(|p| p.name == "A4"));
     }
 }

@@ -535,6 +535,52 @@ export interface ExportPresetBridge {
   delete(presetId: string): Promise<boolean>;
 }
 
+/**
+ * Per-artboard summary returned by `window.kcreate.artboard.list()`.
+ * Matches `kcreate_bridge::document::ArtboardInfo`.
+ */
+export interface ArtboardInfo {
+  id: string;
+  name: string;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  pageId: string;
+}
+
+export type ArtboardPresetCategory =
+  | "web_desktop"
+  | "web_tablet"
+  | "web_mobile"
+  | "social_media"
+  | "print"
+  | "custom";
+
+/**
+ * One of the built-in artboard preset sizes surfaced in the New
+ * Artboard dialog and home-screen affordances.
+ */
+export interface ArtboardPreset {
+  name: string;
+  width: number;
+  height: number;
+  category: ArtboardPresetCategory;
+}
+
+export interface ArtboardBridge {
+  create(
+    pageId: string | null,
+    name: string,
+    width: number,
+    height: number,
+  ): Promise<string>;
+  list(): Promise<ArtboardInfo[]>;
+  duplicate(artboardId: string): Promise<string>;
+  resize(artboardId: string, width: number, height: number): Promise<void>;
+  presets(): Promise<ArtboardPreset[]>;
+}
+
 declare global {
   interface Window {
     kcreate: {
@@ -548,6 +594,7 @@ declare global {
       designTokens: DesignTokensBridge;
       brandKit: BrandKitBridge;
       exportPreset: ExportPresetBridge;
+      artboard: ArtboardBridge;
     };
   }
 }

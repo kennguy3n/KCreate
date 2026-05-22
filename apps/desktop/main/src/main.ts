@@ -967,6 +967,9 @@ function registerIpcHandlers(): void {
   ipcMain.handle("kcreate/export/batch/cancel", (_e, jobId: string) => {
     requireBridge().exportBatchCancel(jobId);
   });
+  ipcMain.handle("kcreate/export/batch/dismiss", (_e, jobId: string) =>
+    requireBridge().exportBatchDismiss(jobId),
+  );
   ipcMain.handle(
     "kcreate/ai/upscale",
     (_e, nodeId: string, scale: number) =>

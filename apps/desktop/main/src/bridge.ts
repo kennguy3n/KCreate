@@ -300,6 +300,7 @@ export interface Bridge {
   exportBatchStart(jobJson: string): string;
   exportBatchStatus(jobId: string): string;
   exportBatchCancel(jobId: string): void;
+  exportBatchDismiss(jobId: string): boolean;
   aiUpscale(nodeId: string, scale: number): string;
   aiExtractPalette(nodeId: string, maxColors: number): string;
   aiSmartSelect(

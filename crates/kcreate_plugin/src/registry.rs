@@ -31,12 +31,32 @@ struct EnabledFile {
     enabled: Vec<String>,
 }
 
+/// One entry in the [`PluginRegistry`] map.
+///
+/// We track the *actual filesystem directory* the manifest was
+/// loaded from in addition to the parsed manifest itself, because
+/// plugin authors can choose any subdirectory name — we don't force
+/// `<plugin_dir>/<manifest.id>/`. Reconstructing the path from
+/// `manifest.id` would silently break when the two diverge (manifest
+/// id `cool_plugin` shipped in a directory called `my-cool-plugin/`),
+/// causing [`PluginRegistry::entry_point_for`] to point at a
+/// non-existent file even though [`PluginRegistry::scan`] succeeded.
+/// Per Devin Review BUG_pr-review-job-e31d5461e1ff4359ad80d927af5d0b54_0001.
+#[derive(Debug)]
+struct PluginRecord {
+    /// Directory on disk this plugin was loaded from (parent of
+    /// `manifest.json`). Always a child of
+    /// [`PluginRegistry::plugin_dir`].
+    dir: PathBuf,
+    manifest: PluginManifest,
+}
+
 /// Plugin registry. Owns the canonical map of installed plugins and
 /// the on-disk enable/disable file.
 #[derive(Debug)]
 pub struct PluginRegistry {
     plugin_dir: PathBuf,
-    plugins: HashMap<String, PluginManifest>,
+    plugins: HashMap<String, PluginRecord>,
     enabled: HashMap<String, bool>,
 }
 
@@ -71,7 +91,13 @@ impl PluginRegistry {
             let dir = entry.path();
             match PluginManifest::load(&dir) {
                 Ok(m) => {
-                    self.plugins.insert(m.id.clone(), m);
+                    self.plugins.insert(
+                        m.id.clone(),
+                        PluginRecord {
+                            dir: dir.clone(),
+                            manifest: m,
+                        },
+                    );
                 }
                 Err(e) => log::warn!("kcreate_plugin: skipping {} ({e})", dir.display()),
             }
@@ -82,13 +108,13 @@ impl PluginRegistry {
 
     /// All known plugins (any state).
     pub fn list(&self) -> Vec<&PluginManifest> {
-        let mut v: Vec<&PluginManifest> = self.plugins.values().collect();
+        let mut v: Vec<&PluginManifest> = self.plugins.values().map(|r| &r.manifest).collect();
         v.sort_by(|a, b| a.id.cmp(&b.id));
         v
     }
 
     pub fn get(&self, id: &str) -> Option<&PluginManifest> {
-        self.plugins.get(id)
+        self.plugins.get(id).map(|r| &r.manifest)
     }
 
     pub fn is_enabled(&self, id: &str) -> bool {
@@ -116,10 +142,16 @@ impl PluginRegistry {
     }
 
     /// Resolve the path to a plugin's entry-point file.
+    ///
+    /// Uses the directory the manifest was *actually loaded from*,
+    /// not `plugin_dir.join(manifest.id)`. The two can differ when
+    /// the plugin ships under a directory name that doesn't match its
+    /// manifest id (e.g. `~/.kcreate/plugins/my-cool-plugin/` with a
+    /// manifest declaring `"id": "cool_plugin"`).
     pub fn entry_point_for(&self, id: &str) -> Option<PathBuf> {
         self.plugins
             .get(id)
-            .map(|m| self.plugin_dir.join(&m.id).join(&m.entry_point))
+            .map(|r| r.dir.join(&r.manifest.entry_point))
     }
 
     fn enabled_path(&self) -> PathBuf {
@@ -250,5 +282,37 @@ mod tests {
         reg.scan().unwrap();
         let p = reg.entry_point_for("demo").unwrap();
         assert!(p.ends_with("demo/p.wasm"));
+    }
+
+    /// Regression for Devin Review
+    /// BUG_pr-review-job-e31d5461e1ff4359ad80d927af5d0b54_0001 — when the
+    /// plugin's directory name differs from its manifest `id`,
+    /// `entry_point_for` must still resolve to the *real* directory on
+    /// disk, not `<plugin_dir>/<manifest.id>/...`.
+    #[test]
+    fn entry_point_for_uses_actual_directory_not_manifest_id() {
+        let dir = tempdir().unwrap();
+        // Directory is `my-cool-plugin/`, manifest declares `id =
+        // "cool_plugin"` — a mismatch the old code couldn't survive.
+        let plugin_dir = dir.path().join("my-cool-plugin");
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+        std::fs::write(
+            plugin_dir.join("manifest.json"),
+            r#"{
+                "id": "cool_plugin",
+                "name": "Cool",
+                "version": "0.0.1",
+                "type": "wasm",
+                "entry_point": "p.wasm"
+            }"#,
+        )
+        .unwrap();
+        std::fs::write(plugin_dir.join("p.wasm"), b"\0asm").unwrap();
+
+        let mut reg = PluginRegistry::new(dir.path().to_path_buf());
+        reg.scan().unwrap();
+        let resolved = reg.entry_point_for("cool_plugin").unwrap();
+        assert_eq!(resolved, plugin_dir.join("p.wasm"));
+        assert!(resolved.exists(), "resolved entry point must exist on disk");
     }
 }

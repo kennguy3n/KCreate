@@ -144,8 +144,21 @@ fn connected_components_of_interior(edges: &[u8], width: u32, height: u32) -> Ve
             if visited[idx] || edges[idx] != 0 {
                 continue;
             }
-            // BFS.
-            let mut stack: Vec<(u32, u32)> = vec![(x as u32, y as u32)];
+            // Flood fill. We mark `visited` *at enqueue time*, not at
+            // pop time, so each pixel is queued at most once. Marking
+            // at pop time would let the same pixel be queued up to 4
+            // times (once per neighbour that walks into it), pushing
+            // the queue size from O(region) to O(4 × region). On a
+            // 4K screenshot with a large uniform region that's the
+            // difference between ~66 MB and ~265 MB resident.
+            // Per Devin Review screenshot_to_layout BFS finding.
+            //
+            // Order is irrelevant for connected-component shape
+            // statistics, so we keep the (cheaper) LIFO `Vec` here
+            // rather than dragging in a `VecDeque`.
+            let seed_idx = y * w + x;
+            visited[seed_idx] = true;
+            let mut frontier: Vec<(u32, u32)> = vec![(x as u32, y as u32)];
             let mut stats = RegionStats {
                 min_x: x as u32,
                 min_y: y as u32,
@@ -153,31 +166,31 @@ fn connected_components_of_interior(edges: &[u8], width: u32, height: u32) -> Ve
                 max_y: y as u32,
                 area: 0,
             };
-            while let Some((cx, cy)) = stack.pop() {
-                let cidx = (cy as usize) * w + cx as usize;
-                if visited[cidx] {
-                    continue;
-                }
-                if edges[cidx] != 0 {
-                    continue;
-                }
-                visited[cidx] = true;
+            while let Some((cx, cy)) = frontier.pop() {
                 stats.area += 1;
                 stats.min_x = stats.min_x.min(cx);
                 stats.min_y = stats.min_y.min(cy);
                 stats.max_x = stats.max_x.max(cx);
                 stats.max_y = stats.max_y.max(cy);
+                let mut try_push = |nx: u32, ny: u32| {
+                    let nidx = (ny as usize) * w + nx as usize;
+                    if visited[nidx] || edges[nidx] != 0 {
+                        return;
+                    }
+                    visited[nidx] = true;
+                    frontier.push((nx, ny));
+                };
                 if cx > 0 {
-                    stack.push((cx - 1, cy));
+                    try_push(cx - 1, cy);
                 }
                 if cx + 1 < width {
-                    stack.push((cx + 1, cy));
+                    try_push(cx + 1, cy);
                 }
                 if cy > 0 {
-                    stack.push((cx, cy - 1));
+                    try_push(cx, cy - 1);
                 }
                 if cy + 1 < height {
-                    stack.push((cx, cy + 1));
+                    try_push(cx, cy + 1);
                 }
             }
             regions.push(stats);

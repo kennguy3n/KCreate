@@ -258,15 +258,16 @@ pub fn batch_status(job_id: &str) -> Result<BatchJobStatus> {
         }
     };
     if finished_now {
+        // Reap the worker thread now that we know it's done. We do
+        // *not* remove the handle from the global table — see
+        // [`batch_dismiss`] for why. Repeated polls after a terminal
+        // status are explicitly allowed and return the same terminal
+        // status idempotently. Per Devin Review
+        // BUG_pr-review-job-e31d5461e1ff4359ad80d927af5d0b54_0002.
         let join_handle = handle.join.lock().take();
         if let Some(j) = join_handle {
             let _ = j.join();
         }
-        // Drop the handle from the global table now that the caller has
-        // observed the terminal status. Holding it forever would leak the
-        // BatchResult (paths + error strings) for every export across the
-        // process lifetime.
-        batch_table().lock().remove(job_id);
     }
     Ok(status)
 }
@@ -277,6 +278,46 @@ pub fn batch_cancel(job_id: &str) -> Result<()> {
     })?;
     handle.cancel.cancel();
     Ok(())
+}
+
+/// Explicitly release the bookkeeping state for `job_id`.
+///
+/// The previous design removed the handle the *first* time a caller
+/// observed `finished: true` in [`batch_status`]. That made the
+/// status API one-shot: any second poll — including one already
+/// in-flight across the Electron IPC bridge when the terminal
+/// response was sent — failed with `unknown job <id>`. Naive UI
+/// polling loops (`setInterval` that only clears on receiving
+/// `finished` *and* observing it on the main thread) tripped over
+/// this.
+///
+/// Now the handle stays alive after completion; repeated
+/// [`batch_status`] calls return the same terminal payload
+/// idempotently. The UI is expected to call [`batch_dismiss`] once
+/// it has rendered the terminal status (or no longer cares). Memory
+/// growth is bounded by the number of batches the user actually
+/// starts in a session, not by polling frequency.
+///
+/// Dismissing an unknown job id is a no-op (so duplicate dismiss
+/// calls don't surface as errors). Returns `true` if a handle was
+/// actually dropped, `false` if the id was already gone.
+pub fn batch_dismiss(job_id: &str) -> Result<bool> {
+    let handle = batch_table().lock().remove(job_id);
+    if let Some(h) = handle {
+        // Join the worker thread if [`batch_status`] never observed
+        // the terminal status. This is a belt-and-braces measure
+        // for the case where the UI dismisses a job that's still
+        // mid-flight — the cancel flag is flipped so the worker
+        // will exit at its next checkpoint.
+        h.cancel.cancel();
+        let join_handle = h.join.lock().take();
+        if let Some(j) = join_handle {
+            let _ = j.join();
+        }
+        Ok(true)
+    } else {
+        Ok(false)
+    }
 }
 
 // -----------------------------------------------------------------------------

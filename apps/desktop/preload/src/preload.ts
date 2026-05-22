@@ -1069,6 +1069,12 @@ const batch: BatchBridge = {
   async cancel(jobId: string): Promise<void> {
     await ipcRenderer.invoke("kcreate/export/batch/cancel", jobId);
   },
+  async dismiss(jobId: string): Promise<boolean> {
+    return (await ipcRenderer.invoke(
+      "kcreate/export/batch/dismiss",
+      jobId,
+    )) as boolean;
+  },
 };
 
 const aiModel: AiModelBridge = {

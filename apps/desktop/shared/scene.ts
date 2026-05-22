@@ -1227,6 +1227,17 @@ export interface BatchBridge {
   start(job: BatchExportJob): Promise<string>;
   status(jobId: string): Promise<BatchStatus>;
   cancel(jobId: string): Promise<void>;
+  /**
+   * Release the bookkeeping state for `jobId`.
+   *
+   * `status()` is idempotent across terminal states — once a job
+   * reaches `finished: true`, every subsequent `status()` call
+   * returns the same terminal payload. The UI is expected to call
+   * `dismiss()` once it has rendered that payload to free the
+   * cached result. Dismissing an unknown id is a no-op; the return
+   * value is `true` when a handle was actually dropped.
+   */
+  dismiss(jobId: string): Promise<boolean>;
 }
 
 export interface ExtractedColor {

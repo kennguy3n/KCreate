@@ -1584,6 +1584,20 @@ pub fn export_batch_cancel(job_id: String) -> NapiResult<()> {
     phase2::batch_cancel(&job_id).map_err(map_doc_err)
 }
 
+/// Release the bookkeeping state for a finished batch-export job.
+///
+/// Repeated polls of `export_batch_status` after a job reaches a
+/// terminal state are explicitly allowed and return the same
+/// terminal payload — see the docs on [`phase2::batch_dismiss`] for
+/// why. The renderer is expected to call this once it has rendered
+/// the terminal status to free the cached `BatchResult`. Dismissing
+/// an unknown id is a no-op; the return value is `true` when a
+/// handle was actually dropped.
+#[napi]
+pub fn export_batch_dismiss(job_id: String) -> NapiResult<bool> {
+    phase2::batch_dismiss(&job_id).map_err(map_doc_err)
+}
+
 /// Lanczos3-upscale the raster layer at `node_id` by `scale`. A new
 /// RasterLayer node is inserted as a sibling; its id is returned.
 #[napi]

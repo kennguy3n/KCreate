@@ -325,11 +325,31 @@ export function CanvasHost(props: CanvasHostProps): JSX.Element {
   // because attaching a native surface requires the bridge to extract
   // the platform window handle from the main process and ask wgpu to
   // build a swapchain — neither of which is synchronous.
+  //
+  // Devin Review PR #5 ANALYSIS-0001 (commit 5c16b5c): if `switchNative`
+  // ever rejects (e.g. bridge compiled without `native_canvas`, no
+  // wgpu adapter for the window's surface, Wayland session not yet
+  // wired through), the host stays in `activeMode = "offscreen"` while
+  // `requestedMode = "native"`. Without a guard, every subsequent
+  // resize would re-fire the effect (`propWidth` / `propHeight` are in
+  // the deps array) and retry the same failing call — spamming
+  // `onNativeFallback` with the same error and re-running the wgpu
+  // surface-creation cost for nothing. `nativeRejectedForRef` records
+  // the `requestedMode` value that already failed so we short-circuit
+  // until the host itself picks a different preference (toggling back
+  // to "offscreen" and then to "native" clears the ref).
+  const nativeRejectedForRef = useRef<CanvasPresentationMode | null>(null);
   useEffect(() => {
     const bridge = window.kcreate?.renderer;
     if (!bridge) return undefined;
     const desired: CanvasPresentationMode = requestedMode ?? "offscreen";
     if (desired === activeMode) return undefined;
+    if (desired === "native" && nativeRejectedForRef.current === desired) {
+      // Already tried this exact request, host hasn't changed its
+      // mind. Don't retry; let the resize path drive the offscreen
+      // pipeline (which is already running).
+      return undefined;
+    }
 
     let cancelled = false;
     void (async (): Promise<void> => {
@@ -339,11 +359,15 @@ export function CanvasHost(props: CanvasHostProps): JSX.Element {
         const hPx = Math.max(1, Math.round(propHeight * dpr));
         try {
           await bridge.switchNative(wPx, hPx);
-          if (!cancelled) setActiveMode("native");
+          if (!cancelled) {
+            nativeRejectedForRef.current = null;
+            setActiveMode("native");
+          }
         } catch (err) {
           // Native path is unavailable — keep the offscreen loop
           // running and let the host clear its toggle.
           if (!cancelled) {
+            nativeRejectedForRef.current = desired;
             const reason =
               err instanceof Error
                 ? err.message
@@ -355,6 +379,11 @@ export function CanvasHost(props: CanvasHostProps): JSX.Element {
           }
         }
       } else {
+        // Switching away from native clears the rejection record so
+        // a subsequent flip back to "native" can try again (the host
+        // may have e.g. plugged in a GPU or restarted with the
+        // feature flag on).
+        nativeRejectedForRef.current = null;
         try {
           await bridge.switchOffscreen();
         } catch {

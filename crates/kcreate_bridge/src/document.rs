@@ -494,6 +494,45 @@ pub fn project_info() -> Option<ProjectInfo> {
     info
 }
 
+/// Returns true iff the open project is in its untouched, just-
+/// created state — no user operation has been recorded since
+/// `project_create` / `project_open` set up the workspace.
+///
+/// Definition: the [`OperationLog`](kcreate_core::operation::OperationLog)
+/// is empty. Every host-driven mutation runs through
+/// [`Project::execute_operation`], so an empty log is a strict
+/// "no user edits yet" signal. `project_create` only calls
+/// `Project::add_page("Page 1")` (which mutates the document graph
+/// directly without pushing onto the log) before handing the
+/// workspace back, so a freshly-created project reports `true`.
+///
+/// `project_open` restores the on-disk operation history into the
+/// in-memory log via [`OperationLog::restore_from`], so a project
+/// that was edited before save+close will report `false` on reopen
+/// (the user already touched it). A project that was created and
+/// saved without any edits is still untouched on reopen.
+///
+/// Used by the host UI (e.g. `EditorPage.tsx`) to decide whether
+/// to auto-open the TemplatePicker on the user's first switch to
+/// Layout mode. The previous TypeScript heuristic
+/// (`nodes.length === 2 && exactly 1 Page named "Page 1" && 1
+/// Artboard`) replicated the exact output of
+/// `Project::add_page("Page 1")` and would silently break if the
+/// Rust side ever renamed the default page or added a default
+/// layer — Devin Review PR #5 ANALYSIS-0006 (commit 5c16b5c)
+/// called this out as a maintenance hazard. Exposing the
+/// authoritative signal from the bridge keeps the source of
+/// truth on the side that owns it.
+///
+/// Returns [`DocumentBridgeError::NoProject`] when no project is
+/// open so the host can distinguish "no project" from "untouched
+/// project" without inspecting `project_info()` first.
+pub fn project_is_untouched() -> Result<bool> {
+    let guard = slot().lock();
+    let ws = guard.as_ref().ok_or(DocumentBridgeError::NoProject)?;
+    Ok(ws.project.operation_log.is_empty())
+}
+
 // -----------------------------------------------------------------------------
 // Design tokens / brand kits / export presets
 // -----------------------------------------------------------------------------
@@ -3581,6 +3620,108 @@ mod tests {
         assert!(!s2.can_undo);
         assert!(s2.can_redo);
 
+        project_close();
+    }
+
+    #[test]
+    #[serial]
+    fn project_is_untouched_no_project_open_errors() {
+        reset_for_tests();
+        let err = project_is_untouched().expect_err("no project");
+        assert!(matches!(err, DocumentBridgeError::NoProject));
+    }
+
+    #[test]
+    #[serial]
+    fn project_is_untouched_flips_after_any_operation() {
+        // Devin Review PR #5 ANALYSIS-0006 (commit 5c16b5c) replaced
+        // the TS-side `nodes.length === 2 && one Page named "Page 1"
+        // && one Artboard` heuristic with this bridge-driven signal.
+        // The contract: a freshly-created project reports `true`, and
+        // any host-recorded operation flips it to `false` and keeps it
+        // there for the rest of the session (undo does NOT restore
+        // untouched, because the redo cursor still has the op in it).
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("untouched", dir.path()).expect("create");
+        assert!(
+            project_is_untouched().expect("untouched after create"),
+            "project_create leaves operation_log empty",
+        );
+
+        document_record_operation(Operation::new(
+            "user",
+            "noop",
+            serde_json::Value::Null,
+            serde_json::Value::Null,
+            Vec::new(),
+        ))
+        .expect("record");
+        assert!(
+            !project_is_untouched().expect("touched after op"),
+            "recording an operation must mark the project as touched",
+        );
+
+        // Undo moves the log cursor but the entry is still in history;
+        // the project is no longer "untouched" by the spec.
+        document_undo().expect("undo");
+        assert!(
+            !project_is_untouched().expect("touched after undo"),
+            "undo does not restore an untouched project",
+        );
+
+        project_close();
+    }
+
+    #[test]
+    #[serial]
+    fn project_is_untouched_survives_save_close_reopen_when_clean() {
+        // A project that was created+saved without any user edits
+        // must still report `untouched=true` after a full
+        // close+reopen cycle. `project_open` restores the operation
+        // history from disk; an empty on-disk history stays empty in
+        // memory.
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("clean", dir.path()).expect("create");
+        project_save().expect("save");
+        project_close();
+
+        project_open(&dir.path().join("clean.kstudio")).expect("reopen");
+        assert!(
+            project_is_untouched().expect("untouched after clean reopen"),
+            "clean reopen must stay untouched",
+        );
+        project_close();
+    }
+
+    #[test]
+    #[serial]
+    fn project_is_untouched_reports_touched_after_save_close_reopen_when_dirty() {
+        // A project edited before save+close has its operation log
+        // persisted; reopen restores it, so `is_untouched` reports
+        // `false`. This is the contract the EditorPage relies on:
+        // re-opening a previously-edited project must NOT auto-pop
+        // the TemplatePicker.
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("dirty", dir.path()).expect("create");
+        document_record_operation(Operation::new(
+            "user",
+            "noop",
+            serde_json::Value::Null,
+            serde_json::Value::Null,
+            Vec::new(),
+        ))
+        .expect("record");
+        project_save().expect("save");
+        project_close();
+
+        project_open(&dir.path().join("dirty.kstudio")).expect("reopen");
+        assert!(
+            !project_is_untouched().expect("touched after dirty reopen"),
+            "reopen of a previously-edited project must report touched",
+        );
         project_close();
     }
 

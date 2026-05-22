@@ -115,6 +115,7 @@ export interface Bridge {
   projectSave(): void;
   projectClose(): void;
   projectGetInfo(): ProjectInfoSnake | null;
+  projectIsUntouched(): boolean;
   documentGetTree(): NodeInfoSnake[];
   documentInspectNode(nodeId: string): string;
   documentCreateNode(

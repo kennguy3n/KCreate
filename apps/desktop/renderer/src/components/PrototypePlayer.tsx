@@ -14,7 +14,7 @@
 // the user hits Escape, hits the "Exit" button, or the host clears
 // the prop.
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import type { ArtboardInfo, Interaction, NodeInfo } from "../../../shared/scene";
 import { colors, radius, spacing } from "../styles/tokens";
@@ -47,6 +47,16 @@ export function PrototypePlayer({
 }: PrototypePlayerProps): JSX.Element | null {
   const [current, setCurrent] = useState<string | null>(null);
   const [stack, setStack] = useState<string[]>([]);
+  // Mirror of `stack` for synchronous reads from event handlers. Lets
+  // `navigateBack` peek the current stack tail *without* sitting inside
+  // a `setStack` functional updater (which React requires to be pure;
+  // calling `setCurrent` from inside one was Devin Review PR #5 BUG-0001
+  // on commit 5c16b5c, and would double-fire under StrictMode's
+  // updater-purity probe).
+  const stackRef = useRef<string[]>([]);
+  useEffect(() => {
+    stackRef.current = stack;
+  }, [stack]);
   const [hotspots, setHotspots] = useState<Hotspot[]>([]);
   const [loading, setLoading] = useState<boolean>(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
@@ -163,13 +173,15 @@ export function PrototypePlayer({
   };
 
   const navigateBack = (): void => {
-    setStack((prev) => {
-      if (prev.length === 0) return prev;
-      const next = prev.slice(0, -1);
-      const last = prev[prev.length - 1];
-      if (last !== undefined) setCurrent(last);
-      return next;
-    });
+    // Read the current stack via the ref so both setters are called at
+    // the top level of the handler. The `setStack` updater below is now
+    // a pure `prev => prev.slice(0, -1)`, matching React's purity
+    // contract (and surviving StrictMode's double-invocation probe).
+    const snapshot = stackRef.current;
+    if (snapshot.length === 0) return;
+    const last = snapshot[snapshot.length - 1];
+    if (last !== undefined) setCurrent(last);
+    setStack((prev) => (prev.length === 0 ? prev : prev.slice(0, -1)));
   };
 
   const fireHotspot = (h: Hotspot): void => {

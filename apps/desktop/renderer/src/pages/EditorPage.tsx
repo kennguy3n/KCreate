@@ -170,42 +170,69 @@ export function EditorPage({
   }, [refreshTree]);
 
   // First-time-into-Layout prompt: when the user switches to Layout
-  // mode for the first time *on an untouched project*, pop the
-  // TemplatePicker. "Untouched" here means the project still has the
-  // exact shape `project_create` produces:
+  // mode for the first time on an untouched project, pop the
+  // TemplatePicker.
   //
-  //   1 Page named "Page 1" + 1 Artboard (child of the page), total 2
-  //   nodes.
+  // We ask the bridge (`document.isUntouched`) instead of inferring
+  // it from the document tree shape. The bridge's signal is
+  // `Project::operation_log.is_empty()` — every host-recorded
+  // mutation runs through `Project::execute_operation`, so an empty
+  // log is the strict, authoritative "no user edits yet" check. See
+  // `crates/kcreate_bridge/src/document.rs::project_is_untouched`.
   //
-  // See `crates/kcreate_bridge/src/document.rs::project_create` →
-  // `Project::add_page("Page 1")` which inserts both nodes.
-  //
-  // The previous heuristic checked `nodes.some(n => nodeType ===
-  // "Page")` which was always true after `project_create` (Devin
-  // Review PR #5 EditorPage finding — caught it as dead code). The
-  // fresh-state heuristic below restores the originally intended UX:
-  // auto-pop the picker on a clean project so the user can pick a
-  // template immediately, but skip it on a project they've already
-  // designed (any layers added, any rename, any extra page, any
-  // master page → the heuristic correctly says "not fresh").
+  // The previous implementation replicated `Project::add_page("Page
+  // 1")`'s exact output in TypeScript (`nodes.length === 2 && one
+  // Page named "Page 1" && one Artboard`). That was fragile: if the
+  // Rust side ever renamed the default page, added a default layer,
+  // or restructured the initial node graph, the heuristic would
+  // silently break and the picker would never auto-open (Devin
+  // Review PR #5 ANALYSIS-0006, commit 5c16b5c). Moving the
+  // detection to the bridge keeps the source of truth on the side
+  // that actually owns the project state.
   //
   // The user can re-open the picker any time via the "Templates"
   // button in the PageNavigator footer; this just controls the
   // automatic first-pop.
-  const isUntouchedDefaultProject = useMemo<boolean>(() => {
-    if (nodes.length !== 2) return false;
-    const pages = nodes.filter((n) => n.nodeType === "Page");
-    const artboards = nodes.filter((n) => n.nodeType === "Artboard");
-    if (pages.length !== 1 || artboards.length !== 1) return false;
-    const page = pages[0];
-    if (page === undefined || page.name !== "Page 1") return false;
-    return true;
-  }, [nodes]);
+  const [untouchedProbe, setUntouchedProbe] = useState<{
+    projectId: string;
+    isUntouched: boolean;
+  } | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    void (async (): Promise<void> => {
+      try {
+        const isUntouched = await window.kcreate.document.isUntouched();
+        if (!cancelled) {
+          setUntouchedProbe({ projectId: project.id, isUntouched });
+        }
+      } catch (e) {
+        // No project open, or bridge call rejected — fall back to
+        // "not untouched" so we don't surprise the user with a
+        // modal pop during a transient error state.
+        if (!cancelled) {
+          setUntouchedProbe({ projectId: project.id, isUntouched: false });
+          setStatusMessage(`isUntouched probe failed: ${errorMessage(e)}`);
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // We re-probe whenever the project identity changes or the tree
+    // refreshes (a tree refresh is the renderer's signal that a
+    // mutation just landed; the operation log will have grown if the
+    // user did anything). `nodes.length` is a stable identity-proxy
+    // for "tree shape changed" without depending on the full array
+    // reference (the same pattern PageNavigator uses for
+    // `refreshMasters`).
+  }, [project.id, nodes.length]);
 
   useEffect(() => {
     if (mode !== "layout") return;
     if (layoutPickerShownFor === project.id) return;
-    if (!isUntouchedDefaultProject) {
+    if (untouchedProbe === null) return;
+    if (untouchedProbe.projectId !== project.id) return;
+    if (!untouchedProbe.isUntouched) {
       // User already designed something — don't surprise them with a
       // modal they didn't ask for. Mark the sentinel anyway so the
       // logic doesn't re-evaluate.
@@ -214,7 +241,7 @@ export function EditorPage({
     }
     setTemplatePickerOpen(true);
     setLayoutPickerShownFor(project.id);
-  }, [mode, project.id, isUntouchedDefaultProject, layoutPickerShownFor]);
+  }, [mode, project.id, untouchedProbe, layoutPickerShownFor]);
 
   // Layout mode page selection helper — selects the page node so the
   // canvas pans/zooms to its bounds and the right panel shows its

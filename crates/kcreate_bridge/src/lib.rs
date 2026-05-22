@@ -476,6 +476,17 @@ pub fn project_get_info() -> Option<ProjectInfo> {
     document::project_info().map(Into::into)
 }
 
+/// Returns `true` iff the currently open project is untouched —
+/// i.e. its [`OperationLog`](kcreate_core::operation::OperationLog)
+/// is empty. The host uses this to drive first-time UX (e.g.
+/// auto-opening the TemplatePicker on the first switch to Layout
+/// mode) without replicating `project_create`'s exact node shape
+/// in TypeScript. Errors with `NoProject` if no project is open.
+#[napi]
+pub fn project_is_untouched() -> NapiResult<bool> {
+    document::project_is_untouched().map_err(map_doc_err)
+}
+
 /// Flat document tree.
 #[napi]
 pub fn document_get_tree() -> NapiResult<Vec<NodeInfo>> {

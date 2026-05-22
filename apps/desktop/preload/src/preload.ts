@@ -338,6 +338,11 @@ const document: DocumentBridge = {
     )) as ProjectInfoSnake | null;
     return raw ? projectFromSnake(raw) : null;
   },
+  async isUntouched(): Promise<boolean> {
+    return (await ipcRenderer.invoke(
+      "kcreate/project/isUntouched",
+    )) as boolean;
+  },
   async getDocumentTree(): Promise<NodeInfo[]> {
     const raw = (await ipcRenderer.invoke(
       "kcreate/document/getTree",

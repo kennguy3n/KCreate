@@ -329,6 +329,18 @@ export interface DocumentBridge {
   saveProject(): Promise<void>;
   closeProject(): Promise<void>;
   getProjectInfo(): Promise<ProjectInfo | null>;
+  /**
+   * Returns `true` iff the currently open project is in its
+   * untouched, just-created state — no host-recorded operation
+   * has been applied since `createProject` / `openProject`. The
+   * host UI uses this for first-time prompts (e.g. auto-opening
+   * the TemplatePicker on the first switch to Layout mode); see
+   * `apps/desktop/renderer/src/pages/EditorPage.tsx`. Rejects
+   * with `NoProject` if no project is open. Mirrors the bridge
+   * call `project_is_untouched` in
+   * `crates/kcreate_bridge/src/document.rs`.
+   */
+  isUntouched(): Promise<boolean>;
 
   getDocumentTree(): Promise<NodeInfo[]>;
   /**

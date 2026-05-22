@@ -449,6 +449,9 @@ function registerIpcHandlers(): void {
   ipcMain.handle("kcreate/project/getInfo", () =>
     requireBridge().projectGetInfo(),
   );
+  ipcMain.handle("kcreate/project/isUntouched", () =>
+    requireBridge().projectIsUntouched(),
+  );
 
   ipcMain.handle("kcreate/document/getTree", () =>
     requireBridge().documentGetTree(),

@@ -417,6 +417,18 @@ function registerIpcHandlers(): void {
   ipcMain.handle("kcreate/runtime/status", () =>
     requireBridge().runtimeStatus(),
   );
+  ipcMain.handle("kcreate/runtime/lowResourceMode/get", (): boolean =>
+    requireBridge().lowResourceModeGet(),
+  );
+  ipcMain.handle(
+    "kcreate/runtime/lowResourceMode/set",
+    (_e, enabled: boolean): void => {
+      requireBridge().lowResourceModeSet(enabled);
+    },
+  );
+  ipcMain.handle("kcreate/runtime/resourceLimits", (): string =>
+    requireBridge().resourceLimits(),
+  );
   // The OS temp dir is owned by the host (Node `os.tmpdir()`), not by
   // the Rust bridge — it's a process-environment concern, not a
   // rendering one. Surfacing it through the runtime bridge lets the

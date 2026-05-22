@@ -36,6 +36,7 @@ import type {
   ProjectInfo,
   RendererBridge,
   RendererInfo,
+  ResourceLimits,
   RuntimeBridge,
   RuntimeStatus,
   Scene,
@@ -321,7 +322,46 @@ const runtime: RuntimeBridge = {
       "kcreate/runtime/cleanupScratchProjects",
     )) as ScratchCleanupResult;
   },
+  async lowResourceModeGet(): Promise<boolean> {
+    return (await ipcRenderer.invoke(
+      "kcreate/runtime/lowResourceMode/get",
+    )) as boolean;
+  },
+  async lowResourceModeSet(enabled: boolean): Promise<void> {
+    await ipcRenderer.invoke(
+      "kcreate/runtime/lowResourceMode/set",
+      enabled,
+    );
+  },
+  async resourceLimits(): Promise<ResourceLimits> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/runtime/resourceLimits",
+    )) as string;
+    return resourceLimitsFromSnake(
+      JSON.parse(raw) as ResourceLimitsSnake,
+    );
+  },
 };
+
+type ResourceLimitsSnake = {
+  device_tier: string;
+  low_resource_mode: boolean;
+  effective_undo_depth: number;
+  effective_raster_cache_mb: number;
+  effective_max_model_mb: number;
+  gpu_rendering_allowed: boolean;
+};
+
+function resourceLimitsFromSnake(s: ResourceLimitsSnake): ResourceLimits {
+  return {
+    deviceTier: s.device_tier,
+    lowResourceMode: s.low_resource_mode,
+    effectiveUndoDepth: s.effective_undo_depth,
+    effectiveRasterCacheMb: s.effective_raster_cache_mb,
+    effectiveMaxModelMb: s.effective_max_model_mb,
+    gpuRenderingAllowed: s.gpu_rendering_allowed,
+  };
+}
 
 const exportApi: ExportBridge = {
   async svg(nodeIds: string[], options: SvgExportOptions): Promise<string> {

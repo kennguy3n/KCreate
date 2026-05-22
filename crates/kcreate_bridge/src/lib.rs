@@ -450,6 +450,29 @@ pub fn runtime_status() -> RuntimeStatus {
     document::runtime_status().into()
 }
 
+/// True iff low-resource mode is currently active.
+#[napi]
+pub fn low_resource_mode_get() -> bool {
+    document::low_resource_mode_get()
+}
+
+/// Toggle low-resource mode. Tier 0 hosts are pinned to `true`.
+#[napi]
+pub fn low_resource_mode_set(enabled: bool) {
+    document::low_resource_mode_set(enabled);
+}
+
+/// JSON snapshot of the currently-effective resource limits.
+///
+/// The JSON shape mirrors [`document::ResourceLimits`] verbatim
+/// (snake_case fields). Callers decode it on the TypeScript side.
+#[napi]
+pub fn resource_limits() -> NapiResult<String> {
+    let limits = document::resource_limits();
+    serde_json::to_string(&limits)
+        .map_err(|e| NapiError::from_reason(format!("resource_limits: {e}")))
+}
+
 /// Snapshot of the open document's editing state.
 ///
 /// Returns `None` when no project is open. Hosts call this after any

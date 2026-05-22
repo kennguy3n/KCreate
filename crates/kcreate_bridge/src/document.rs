@@ -260,8 +260,10 @@ pub fn project_create(name: &str, dir: &Path) -> Result<ProjectInfo> {
     // at the constructor (rather than mutating the log post-hoc) keeps
     // the depth invariant true for the lifetime of the project.
     let manifest = store.manifest();
-    let mut project =
-        Project::with_max_undo_depth(manifest.name.clone(), cached_runtime().max_undo_depth);
+    let mut project = Project::with_max_undo_depth(
+        manifest.name.clone(),
+        runtime_slot().lock().effective_undo_depth(),
+    );
     project.id = manifest.id;
     project.created_at = manifest.created_at;
     project.modified_at = manifest.modified_at;
@@ -311,8 +313,10 @@ pub fn project_open(dir: &Path) -> Result<ProjectInfo> {
     // Tier 3 box with 1024-deep log, reopened on a Tier 0 box with
     // 32-deep log) — `OperationLog::restore_from` enforces the cap
     // by dropping from the front to retain the most recent ops.
-    let mut project =
-        Project::with_max_undo_depth(manifest.name.clone(), cached_runtime().max_undo_depth);
+    let mut project = Project::with_max_undo_depth(
+        manifest.name.clone(),
+        runtime_slot().lock().effective_undo_depth(),
+    );
     project.id = manifest.id;
     project.created_at = manifest.created_at;
     project.modified_at = manifest.modified_at;
@@ -2113,16 +2117,13 @@ pub fn canvas_create_text(
 // Runtime status
 // -----------------------------------------------------------------------------
 
-/// Cached subset of [`RuntimeConfig::detect`] used to drive the
-/// [`Project`] undo-log budget.
-///
-/// We cache only the fields needed to size the operation log
-/// (`max_undo_depth`) plus the `runtime_status` shape — the full
-/// `RuntimeConfig` carries `PathBuf`s that don't `Clone` for free.
+/// Cached snapshot of the host system. We cache only the
+/// `runtime_status` shape; live tunables (undo depth, raster cache,
+/// low-resource mode) come from [`runtime_slot`] instead so they
+/// can move at runtime.
 #[derive(Debug, Clone)]
 struct CachedRuntime {
     status: RuntimeStatus,
-    max_undo_depth: usize,
 }
 
 fn cached_runtime() -> &'static CachedRuntime {
@@ -2137,7 +2138,6 @@ fn cached_runtime() -> &'static CachedRuntime {
                 platform: format!("{:?}", cfg.platform),
                 total_ram_mb: cfg.total_ram_mb,
             },
-            max_undo_depth: cfg.max_undo_depth,
         }
     })
 }
@@ -2150,6 +2150,68 @@ fn cached_runtime() -> &'static CachedRuntime {
 /// for the lifetime of the process.
 pub fn runtime_status() -> RuntimeStatus {
     cached_runtime().status.clone()
+}
+
+/// Process-global, mutable runtime config. Seeded from
+/// [`RuntimeConfig::detect`] on first access; subsequent writes (e.g.
+/// low-resource toggle) update this snapshot. The cached
+/// [`runtime_status`] shape stays immutable because the system probe
+/// itself (RAM, GPU detection, platform) does not change at runtime.
+fn runtime_slot() -> &'static parking_lot::Mutex<RuntimeConfig> {
+    static SLOT: OnceLock<parking_lot::Mutex<RuntimeConfig>> = OnceLock::new();
+    SLOT.get_or_init(|| parking_lot::Mutex::new(RuntimeConfig::detect()))
+}
+
+/// True iff low-resource mode is active.
+pub fn low_resource_mode_get() -> bool {
+    runtime_slot().lock().is_low_resource()
+}
+
+/// Manually toggle low-resource mode. On Tier 0 the flag is forced
+/// to remain `true` regardless of the request (see
+/// [`RuntimeConfig::set_low_resource`]). After flipping, the open
+/// project (if any) re-sizes its operation log to the new effective
+/// depth.
+pub fn low_resource_mode_set(enabled: bool) {
+    let new_depth = {
+        let mut cfg = runtime_slot().lock();
+        cfg.set_low_resource(enabled);
+        cfg.effective_undo_depth()
+    };
+    let mut guard = slot().lock();
+    if let Some(ws) = guard.as_mut() {
+        ws.project.operation_log.set_max_depth(new_depth);
+    }
+    drop(guard);
+}
+
+/// Resolved resource limits the host UI surfaces in Settings.
+///
+/// Each field is the result of the corresponding
+/// `RuntimeConfig::effective_*` getter at the call site — these can
+/// shift at runtime when the user toggles low-resource mode, so the
+/// host should re-fetch after [`low_resource_mode_set`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResourceLimits {
+    pub device_tier: String,
+    pub low_resource_mode: bool,
+    pub effective_undo_depth: usize,
+    pub effective_raster_cache_mb: u64,
+    pub effective_max_model_mb: u64,
+    pub gpu_rendering_allowed: bool,
+}
+
+/// Snapshot the currently-effective resource limits.
+pub fn resource_limits() -> ResourceLimits {
+    let cfg = runtime_slot().lock();
+    ResourceLimits {
+        device_tier: format!("{:?}", cfg.device_tier),
+        low_resource_mode: cfg.is_low_resource(),
+        effective_undo_depth: cfg.effective_undo_depth(),
+        effective_raster_cache_mb: cfg.effective_raster_cache_mb(),
+        effective_max_model_mb: cfg.effective_max_model_mb(),
+        gpu_rendering_allowed: cfg.gpu_rendering_allowed(),
+    }
 }
 
 /// Snapshot of the live document's editing state, used by the host UI
@@ -3695,6 +3757,58 @@ mod tests {
         assert_ne!(new_layer, comp_layer.id);
         // Sanity: tempdir kept alive until here.
         let _ = dir;
+        project_close();
+    }
+
+    /// Tier 0 hosts keep low-resource on regardless of the request,
+    /// and `resource_limits` reflects the live state every call.
+    #[test]
+    #[serial]
+    fn low_resource_mode_toggle_round_trip() {
+        let before = low_resource_mode_get();
+        let initial_limits = resource_limits();
+        low_resource_mode_set(true);
+        assert!(low_resource_mode_get());
+        let lr_limits = resource_limits();
+        assert!(lr_limits.low_resource_mode);
+        assert!(lr_limits.effective_undo_depth <= initial_limits.effective_undo_depth);
+
+        low_resource_mode_set(false);
+        // Either the original state, or pinned to true on Tier 0.
+        let final_limits = resource_limits();
+        if before {
+            assert!(low_resource_mode_get());
+            assert!(final_limits.low_resource_mode);
+        } else {
+            assert!(!low_resource_mode_get());
+            assert!(!final_limits.low_resource_mode);
+            assert_eq!(
+                final_limits.effective_undo_depth,
+                initial_limits.effective_undo_depth
+            );
+        }
+    }
+
+    /// Toggling low-resource mode while a project is open also
+    /// rebounds the live operation log.
+    #[test]
+    #[serial]
+    fn low_resource_mode_resizes_open_project_log() {
+        let dir = tempfile::tempdir().expect("temp");
+        project_close();
+        project_create("lrm", dir.path()).expect("create");
+        let before = low_resource_mode_get();
+        let before_depth = {
+            let g = slot().lock();
+            g.as_ref().unwrap().project.operation_log.max_depth()
+        };
+        low_resource_mode_set(true);
+        let lr_depth = {
+            let g = slot().lock();
+            g.as_ref().unwrap().project.operation_log.max_depth()
+        };
+        assert!(lr_depth <= before_depth, "{lr_depth} <= {before_depth}");
+        low_resource_mode_set(before);
         project_close();
     }
 }

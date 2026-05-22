@@ -21,8 +21,10 @@ import type {
   GridLayout,
   NodeInfo,
   ProjectInfo,
+  ResourceLimits,
   Scene,
 } from "../../../shared/scene";
+import { LowResourceBanner } from "../components/LowResourceBanner";
 import { colors, font, spacing } from "../styles/tokens";
 
 export interface EditorPageProps {
@@ -78,6 +80,9 @@ export function EditorPage({
   );
   const [artboardDialogOpen, setArtboardDialogOpen] = useState(false);
   const [components, setComponents] = useState<ComponentInfo[]>([]);
+  const [resourceLimits, setResourceLimits] = useState<ResourceLimits | null>(
+    null,
+  );
   const lastTickAtRef = useRef<number>(performance.now());
   // Drag-to-create / drag-to-move state. Storing in a ref keeps the
   // pointer handler stable while still tracking the current drag.
@@ -150,6 +155,31 @@ export function EditorPage({
   useEffect(() => {
     void refreshTree();
   }, [refreshTree]);
+
+  const refreshResourceLimits = useCallback(async () => {
+    try {
+      const limits = await window.kcreate.runtime.resourceLimits();
+      setResourceLimits(limits);
+    } catch (e) {
+      setStatusMessage(`resource limits failed: ${errorMessage(e)}`);
+    }
+  }, []);
+
+  const handleToggleLowResource = useCallback(
+    async (enabled: boolean) => {
+      try {
+        await window.kcreate.runtime.lowResourceModeSet(enabled);
+        await refreshResourceLimits();
+      } catch (e) {
+        setStatusMessage(`toggle low-resource failed: ${errorMessage(e)}`);
+      }
+    },
+    [refreshResourceLimits],
+  );
+
+  useEffect(() => {
+    void refreshResourceLimits();
+  }, [refreshResourceLimits]);
 
   // Load preset catalogue once. It's deterministic and the bridge
   // recomputes it on each call so caching once on mount is fine.
@@ -979,6 +1009,12 @@ export function EditorPage({
           />
         )}
       </div>
+      {resourceLimits ? (
+        <LowResourceBanner
+          limits={resourceLimits}
+          onToggle={handleToggleLowResource}
+        />
+      ) : null}
       <footer
         style={{
           padding: `${spacing.xs}px ${spacing.md}px`,

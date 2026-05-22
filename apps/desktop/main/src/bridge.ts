@@ -100,6 +100,9 @@ export interface Bridge {
   documentRedo(): string[] | null;
   documentStatus(): DocumentStatusSnake | null;
   runtimeStatus(): RuntimeStatusSnake;
+  lowResourceModeGet(): boolean;
+  lowResourceModeSet(enabled: boolean): void;
+  resourceLimits(): string;
   exportSvg(nodeIds: string[], optionsJson: string): string;
   exportPng(outputPath: string, optionsJson: string): number;
   exportPdf(outputPath: string, optionsJson: string): number;

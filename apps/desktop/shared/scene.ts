@@ -290,6 +290,22 @@ export interface ScratchCleanupResult {
   skippedOwned: number;
 }
 
+/**
+ * Resolved resource limits surfaced by `window.kcreate.runtime.resourceLimits()`.
+ * Mirrors `kcreate_bridge::document::ResourceLimits`.
+ *
+ * Values change when the user toggles low-resource mode, so callers
+ * should re-fetch after each toggle.
+ */
+export interface ResourceLimits {
+  deviceTier: string;
+  lowResourceMode: boolean;
+  effectiveUndoDepth: number;
+  effectiveRasterCacheMb: number;
+  effectiveMaxModelMb: number;
+  gpuRenderingAllowed: boolean;
+}
+
 /** Runtime / device probe. */
 export interface RuntimeBridge {
   status(): Promise<RuntimeStatus>;
@@ -309,6 +325,15 @@ export interface RuntimeBridge {
    * paths). Never throws; reports per-entry errors via the result.
    */
   cleanupScratchProjects(): Promise<ScratchCleanupResult>;
+  /** Current low-resource mode flag. */
+  lowResourceModeGet(): Promise<boolean>;
+  /**
+   * Set the low-resource mode flag. Tier 0 hosts ignore `false` and
+   * keep the flag set — see the Rust `RuntimeConfig::set_low_resource`.
+   */
+  lowResourceModeSet(enabled: boolean): Promise<void>;
+  /** Snapshot the resolved effective limits. */
+  resourceLimits(): Promise<ResourceLimits>;
 }
 
 /** PDF export options. `width_mm`/`height_mm` are the page size in mm. */

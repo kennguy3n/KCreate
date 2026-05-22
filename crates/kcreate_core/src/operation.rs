@@ -180,6 +180,33 @@ impl OperationLog {
         self.max_depth
     }
 
+    /// Set a new bound on the retained history depth. The value is
+    /// clamped to `>= 1`. If the new bound is smaller than the
+    /// current history length, the oldest entries are dropped (and
+    /// the position cursor is adjusted so it still points at the
+    /// "after the last applied op" slot it pointed at before, never
+    /// past the new end).
+    ///
+    /// This is the runtime-configuration knob that
+    /// `kcreate_core::config::RuntimeConfig` uses to honour tier
+    /// changes (e.g. enabling low-resource mode shrinks the undo
+    /// buffer to 32 entries on Tier 0).
+    pub fn set_max_depth(&mut self, new_max: usize) {
+        let new_max = new_max.max(1);
+        self.max_depth = new_max;
+        while self.history.len() > self.max_depth {
+            // Dropping the front of the history shifts every index
+            // down by one, so the cursor must shift too — but never
+            // below zero. After the loop the cursor still lands on
+            // "first un-applied slot" relative to the new history.
+            self.history.pop_front();
+            self.position = self.position.saturating_sub(1);
+        }
+        if self.position > self.history.len() {
+            self.position = self.history.len();
+        }
+    }
+
     #[must_use]
     pub const fn position(&self) -> usize {
         self.position

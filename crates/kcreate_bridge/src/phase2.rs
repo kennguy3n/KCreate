@@ -220,28 +220,43 @@ pub fn batch_status(job_id: &str) -> Result<BatchJobStatus> {
         DocumentBridgeError::Io(std::io::Error::other(format!("unknown job {job_id}")))
     })?;
     let progress = handle.progress.lock().clone();
-    let finished_now = handle.result.lock().is_some();
     let mut status = BatchJobStatus {
         job_id: job_id.to_string(),
         completed: progress.completed,
         total: progress.total,
         current_item: progress.current_item,
-        finished: finished_now,
+        finished: false,
         cancelled: false,
         succeeded: Vec::new(),
         failed: Vec::new(),
         duration_ms: 0,
     };
-    if let Some(r) = handle.result.lock().as_ref() {
-        status.succeeded = r
-            .succeeded
-            .iter()
-            .map(|p| p.display().to_string())
-            .collect();
-        status.failed.clone_from(&r.failed);
-        status.duration_ms = r.duration_ms;
-        status.cancelled = r.cancelled;
-    }
+    // Read `finished` and the result payload under a *single* lock
+    // acquisition. The original code took the lock twice — once for
+    // `result.lock().is_some()` and again for the `if let Some(r) =
+    // result.lock().as_ref()` extraction — which let the worker
+    // thread complete between the two reads and produced a status
+    // where `finished == false` but `succeeded` / `failed` /
+    // `duration_ms` were already populated (Devin Review 3289450816).
+    // Holding the lock for the whole snapshot makes that race
+    // impossible.
+    let finished_now = {
+        let guard = handle.result.lock();
+        if let Some(r) = guard.as_ref() {
+            status.succeeded = r
+                .succeeded
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect();
+            status.failed.clone_from(&r.failed);
+            status.duration_ms = r.duration_ms;
+            status.cancelled = r.cancelled;
+            status.finished = true;
+            true
+        } else {
+            false
+        }
+    };
     if finished_now {
         let join_handle = handle.join.lock().take();
         if let Some(j) = join_handle {
@@ -638,7 +653,10 @@ fn parse_grant(s: &str) -> Result<kcreate_mcp::PermissionGrant> {
         "once" => Ok(kcreate_mcp::PermissionGrant::Once),
         "always" => Ok(kcreate_mcp::PermissionGrant::Always),
         "denied" => Ok(kcreate_mcp::PermissionGrant::Denied),
-        other => Err(DocumentBridgeError::InvalidNodeType(other.to_string())),
+        other => Err(DocumentBridgeError::InvalidArgument {
+            argument: "grant".into(),
+            value: other.to_string(),
+        }),
     }
 }
 

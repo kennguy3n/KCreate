@@ -61,6 +61,7 @@ fn map_doc_err(e: DocumentBridgeError) -> NapiError {
     let status = match e {
         DocumentBridgeError::NoProject
         | DocumentBridgeError::InvalidNodeType(_)
+        | DocumentBridgeError::InvalidArgument { .. }
         | DocumentBridgeError::NodeNotFound(_)
         | DocumentBridgeError::ProjectDirExists(_)
         | DocumentBridgeError::InvalidUuid(_, _) => Status::InvalidArg,

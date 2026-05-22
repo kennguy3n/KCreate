@@ -1311,6 +1311,7 @@ name = "kcreate_plugin"
 version = "0.0.1"
 dependencies = [
  "log",
+ "parking_lot",
  "serde",
  "serde_json",
  "tempfile",

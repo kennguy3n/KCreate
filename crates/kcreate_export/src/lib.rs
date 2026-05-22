@@ -40,8 +40,8 @@ pub use icon_pack::{
     IconPackResult, IconSize, BUILT_IN_PLATFORMS,
 };
 pub use preflight::{
-    run_preflight, ColorSpaceTarget, PreflightCheck, PreflightIssue, PreflightOptions,
-    PreflightSeverity,
+    clear_cached_font_manager, run_preflight, ColorSpaceTarget, PreflightCheck, PreflightIssue,
+    PreflightOptions, PreflightSeverity,
 };
 pub use scene_metadata::{
     raster_image_meta, text_layer_meta, RasterImageMeta, TextLayerMeta, RASTER_IMAGE_METADATA_KEY,

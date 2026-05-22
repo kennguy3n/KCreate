@@ -3,7 +3,7 @@
 // preview detected regions, and (optionally) generate a layout
 // scaffold from the chosen subset.
 
-import { useCallback, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import type {
   ScreenshotElement,
@@ -31,6 +31,21 @@ export function ScreenshotToLayout({
   const [included, setIncluded] = useState<Set<number>>(new Set());
   const [busy, setBusy] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
+  // The object-URL the browser is currently holding a Blob reference
+  // through. We track it in a ref so onFile can revoke the previous one
+  // without closing over the live `image` state, and the unmount effect
+  // can revoke whatever's outstanding when the component goes away.
+  const objectUrlRef = useRef<string | null>(null);
+
+  useEffect(
+    () => () => {
+      if (objectUrlRef.current) {
+        URL.revokeObjectURL(objectUrlRef.current);
+        objectUrlRef.current = null;
+      }
+    },
+    [],
+  );
 
   const onFile = useCallback(
     async (file: File) => {
@@ -45,11 +60,18 @@ export function ScreenshotToLayout({
       canvas.height = img.naturalHeight;
       const ctx = canvas.getContext("2d");
       if (!ctx) {
+        URL.revokeObjectURL(url);
         onStatus?.("screenshot: no 2D context available.");
         return;
       }
       ctx.drawImage(img, 0, 0);
       const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+      // Replace the outstanding object URL before adopting the new one so
+      // the browser can release the previous Blob.
+      if (objectUrlRef.current) {
+        URL.revokeObjectURL(objectUrlRef.current);
+      }
+      objectUrlRef.current = url;
       setImage({
         pixels: imageData.data,
         width: canvas.width,

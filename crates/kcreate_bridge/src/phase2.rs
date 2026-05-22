@@ -235,6 +235,11 @@ pub fn batch_status(job_id: &str) -> Result<BatchJobStatus> {
         if let Some(j) = join_handle {
             let _ = j.join();
         }
+        // Drop the handle from the global table now that the caller has
+        // observed the terminal status. Holding it forever would leak the
+        // BatchResult (paths + error strings) for every export across the
+        // process lifetime.
+        batch_table().lock().remove(job_id);
     }
     Ok(status)
 }
@@ -530,10 +535,13 @@ pub fn plugin_execute(id: &str, function: &str, input_json: &str) -> Result<Stri
     let path = entry.ok_or_else(|| {
         DocumentBridgeError::Io(std::io::Error::other(format!("plugin {id} not found")))
     })?;
-    let bytes = std::fs::read(&path)?;
+    // `execute_path` keeps a `(path, mtime)`-keyed compiled-`Module`
+    // cache inside the runtime, so the steady-state hot path skips both
+    // the disk read and the wasmi compile. A rebuilt `.wasm` file is
+    // picked up automatically the next call because mtime moves.
     let rt = plugin_runtime();
     let out = rt
-        .execute(&bytes, function, input_json, 64)
+        .execute_path(&path, function, input_json, 64)
         .map_err(|e| DocumentBridgeError::Io(std::io::Error::other(e.to_string())))?;
     Ok(serde_json::to_string(&serde_json::json!({
         "output": out.output,
@@ -550,8 +558,15 @@ fn mcp_permission_store() -> &'static kcreate_mcp::McpPermissionStore {
     static S: OnceLock<kcreate_mcp::McpPermissionStore> = OnceLock::new();
     S.get_or_init(|| {
         let dir = mcp_permission_dir();
-        kcreate_mcp::McpPermissionStore::open(&dir)
-            .expect("kcreate_bridge: failed to open MCP permission store")
+        // `open_recoverable` quarantines a corrupt mcp_permissions.json
+        // and starts empty instead of panicking, so a partially-flushed
+        // or hand-edited file does not crash the Electron main process
+        // on the first MCP permission operation. An `Err` here only
+        // surfaces a hard I/O failure (e.g. dir not writable), which we
+        // do still treat as fatal — there is no sensible recovery for
+        // "cannot create the permissions directory at all".
+        kcreate_mcp::McpPermissionStore::open_recoverable(&dir)
+            .expect("kcreate_bridge: MCP permission directory not writable")
     })
 }
 

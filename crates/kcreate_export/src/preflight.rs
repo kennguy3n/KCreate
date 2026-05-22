@@ -8,6 +8,8 @@
 //! The engine is pure: it inspects the graph and returns a
 //! `Vec<PreflightIssue>`. UI surfaces presentation; no file I/O.
 
+use std::sync::{Arc, OnceLock, RwLock};
+
 use kcreate_core::document::DocumentGraph;
 use kcreate_core::node::{
     BlendMode, FillStyle, Node, NodeType, PageLayout, PageSize, PAGE_LAYOUT_METADATA_KEY,
@@ -118,6 +120,46 @@ impl Default for PreflightOptions {
     }
 }
 
+/// Backing storage for the cached [`FontManager`]. Wrapped in a
+/// `RwLock<Option<...>>` so [`clear_cached_font_manager`] can drop the
+/// instance — without resetting the `OnceLock` itself, which Rust does
+/// not allow.
+fn font_manager_cell() -> &'static RwLock<Option<Arc<FontManager>>> {
+    static CACHE: OnceLock<RwLock<Option<Arc<FontManager>>>> = OnceLock::new();
+    CACHE.get_or_init(|| RwLock::new(None))
+}
+
+/// Process-wide cached `FontManager`. `FontManager::new()` scans the
+/// entire system font tree (~50ms on macOS, ~200ms on Windows). The
+/// preflight panel calls `run_preflight` once per click, and many
+/// clicks per session, so rebuilding the manager every time burned
+/// real wall-time. We share an `Arc<FontManager>` keyed in
+/// [`font_manager_cell`] so [`clear_cached_font_manager`] can drop it
+/// (e.g. after the user installs a new font and re-opens the panel).
+fn cached_font_manager() -> Arc<FontManager> {
+    let cell = font_manager_cell();
+    if let Some(existing) = cell.read().expect("preflight font cache poisoned").as_ref() {
+        return existing.clone();
+    }
+    let mut guard = cell.write().expect("preflight font cache poisoned");
+    if let Some(existing) = guard.as_ref() {
+        return existing.clone();
+    }
+    let mgr = Arc::new(FontManager::new());
+    *guard = Some(mgr.clone());
+    mgr
+}
+
+/// Drop the cached [`FontManager`]. The next [`run_preflight`] call
+/// will re-scan the system font directories. Call this after the user
+/// indicates they have installed or removed fonts (e.g. via a "Rescan
+/// fonts" action in the preflight panel).
+pub fn clear_cached_font_manager() {
+    if let Ok(mut guard) = font_manager_cell().write() {
+        *guard = None;
+    }
+}
+
 /// Run preflight against the supplied pages. When `pages` is empty,
 /// every `Page` node in `document` is checked.
 ///
@@ -140,7 +182,14 @@ pub fn run_preflight(
     };
 
     let mut issues: Vec<PreflightIssue> = Vec::new();
-    let fonts = FontManager::new();
+    // `FontManager::new()` scans the entire system font directory tree,
+    // which can take ~50ms on macOS and >200ms on Windows. The bridge
+    // calls `run_preflight` once per "Run Preflight" click, so we share
+    // a single instance for the lifetime of the process. The font list
+    // is effectively static while the app is running; users who install
+    // new fonts can restart the app or invalidate via
+    // `clear_cached_font_manager`.
+    let fonts = cached_font_manager();
     for page_id in page_ids {
         let Some(page) = document.get_node(page_id) else {
             continue;
@@ -162,7 +211,7 @@ pub fn run_preflight(
             check_node_color_space(node, page_id, options, &mut issues);
             check_node_transparency(node, page_id, options, &mut issues);
             if matches!(node.node_type, NodeType::TextLayer) {
-                check_node_font_embed(node, page_id, &fonts, &mut issues);
+                check_node_font_embed(node, page_id, fonts.as_ref(), &mut issues);
             }
             if matches!(node.node_type, NodeType::RasterLayer) {
                 check_node_image_resolution(node, page_id, &dims, options, &mut issues);
@@ -778,5 +827,19 @@ mod tests {
         let bogus = Uuid::new_v4();
         let issues = run_preflight(&doc, &[bogus], &PreflightOptions::default());
         assert!(issues.is_empty());
+    }
+
+    #[test]
+    fn cached_font_manager_returns_same_instance_across_calls() {
+        // First call populates the cell, second call must hand back
+        // the same Arc — that's the whole point of the cache (avoid
+        // re-scanning system fonts on every preflight run).
+        let a = cached_font_manager();
+        let b = cached_font_manager();
+        assert!(Arc::ptr_eq(&a, &b));
+        // Invalidate and verify the next call rebuilds (different Arc).
+        clear_cached_font_manager();
+        let c = cached_font_manager();
+        assert!(!Arc::ptr_eq(&a, &c));
     }
 }

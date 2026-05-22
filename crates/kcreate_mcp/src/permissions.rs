@@ -69,6 +69,11 @@ pub struct McpPermissionStore {
 
 impl McpPermissionStore {
     /// Load (or create) a store at `dir/mcp_permissions.json`.
+    ///
+    /// Returns an error only for I/O failures (directory not writable,
+    /// permissions file not readable). JSON parse errors are NOT
+    /// considered fatal here — see [`McpPermissionStore::open_recoverable`]
+    /// for the recovery contract used by long-running bridge processes.
     pub fn open(dir: &Path) -> Result<Self, PermissionStoreError> {
         std::fs::create_dir_all(dir)?;
         let path = dir.join("mcp_permissions.json");
@@ -79,6 +84,52 @@ impl McpPermissionStore {
                 let file: StoredFile = serde_json::from_slice(&bytes)?;
                 for entry in file.entries {
                     map.insert((entry.client_id.clone(), entry.tool_name.clone()), entry);
+                }
+            }
+        }
+        Ok(Self {
+            path,
+            inner: RwLock::new(map),
+        })
+    }
+
+    /// Load a store at `dir/mcp_permissions.json`, recovering from a
+    /// corrupted JSON file by quarantining it and starting empty.
+    ///
+    /// Long-running processes (the kcreate_bridge `OnceLock` singleton)
+    /// should use this instead of [`McpPermissionStore::open`] because a
+    /// partially-flushed or hand-edited permissions file should not bring
+    /// down the entire Electron main process on the first MCP tool call.
+    ///
+    /// The corrupted file is renamed to `<path>.corrupt-<unix_ts>` so the
+    /// data is preserved for forensics; the new empty store is then
+    /// persisted to the original path on the first write.
+    ///
+    /// I/O failures (directory not writable, etc.) are still returned as
+    /// `Err` — there is no sensible recovery for those.
+    pub fn open_recoverable(dir: &Path) -> Result<Self, PermissionStoreError> {
+        std::fs::create_dir_all(dir)?;
+        let path = dir.join("mcp_permissions.json");
+        let mut map: HashMap<(String, String), McpPermission> = HashMap::new();
+        if path.exists() {
+            let bytes = std::fs::read(&path)?;
+            if !bytes.is_empty() {
+                match serde_json::from_slice::<StoredFile>(&bytes) {
+                    Ok(file) => {
+                        for entry in file.entries {
+                            map.insert((entry.client_id.clone(), entry.tool_name.clone()), entry);
+                        }
+                    }
+                    Err(_) => {
+                        let ts = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map_or(0, |d| d.as_secs());
+                        let quarantined = path.with_extension(format!("json.corrupt-{ts}"));
+                        // Best-effort rename — if it fails, we still proceed
+                        // with an empty in-memory store and the corrupt file
+                        // will be overwritten on the next flush.
+                        let _ = std::fs::rename(&path, &quarantined);
+                    }
                 }
             }
         }
@@ -268,6 +319,43 @@ mod tests {
         let store = McpPermissionStore::open(dir.path()).unwrap();
         assert!(store.check("ghost", "anything").is_none());
         assert!(!store.consume_if_once("ghost", "anything").unwrap());
+    }
+
+    #[test]
+    fn open_recoverable_quarantines_corrupt_file_and_starts_empty() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("mcp_permissions.json");
+        std::fs::write(&path, b"{ not valid json at all").unwrap();
+        // open_recoverable must NOT panic / error on a malformed file.
+        let store = McpPermissionStore::open_recoverable(dir.path()).unwrap();
+        assert!(store.list().is_empty());
+        // And the corrupt file must have been quarantined, not left in
+        // place under its original name (otherwise the next save would
+        // silently overwrite the user's potentially-recoverable data).
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().into_string().unwrap_or_default())
+            .collect();
+        assert!(
+            entries
+                .iter()
+                .any(|n| n.starts_with("mcp_permissions.") && n.contains(".corrupt-")),
+            "corrupt file should be renamed to *.corrupt-<ts>; got {entries:?}"
+        );
+        // Plain `open` would have errored on the same file.
+        assert!(McpPermissionStore::open(dir.path()).is_ok()); // dir is empty now
+    }
+
+    #[test]
+    fn open_rejects_corrupt_file() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("mcp_permissions.json");
+        std::fs::write(&path, b"{ also not valid").unwrap();
+        // Plain `open` keeps the strict failure semantics so callers
+        // that want hard-fail-on-corruption (e.g. tests, batch tools)
+        // still get the error.
+        assert!(McpPermissionStore::open(dir.path()).is_err());
     }
 
     #[test]

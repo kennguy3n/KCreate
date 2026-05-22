@@ -343,7 +343,12 @@ mod tests {
         }
         let (out, _, _) = upscale_lanczos(&pixels, 16, 1, 2.0).expect("upscale");
         // Alpha range in output should span roughly [0, 240].
-        let min = out.iter().step_by(4).skip(3).copied().min().unwrap_or(0);
+        // The alpha channel sits at byte indices 3, 7, 11, ... — i.e.
+        // `skip(3).step_by(4)`. Iterator adapters do NOT commute here:
+        // `step_by(4).skip(3)` first picks 0, 4, 8, ... (the R channel)
+        // then drops the first three of those, which yielded the R
+        // channel of pixel 3 onward and made this assertion meaningless.
+        let min = out.iter().skip(3).step_by(4).copied().min().unwrap_or(0);
         let max = out.iter().skip(3).step_by(4).copied().max().unwrap_or(0);
         assert!(
             i32::from(max) - i32::from(min) > 100,

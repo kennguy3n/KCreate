@@ -30,6 +30,13 @@ type ProjectInfoSnake = {
   modified_at: string;
 };
 
+type BoundsSnake = {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+};
+
 type NodeInfoSnake = {
   id: string;
   node_type: string;
@@ -38,6 +45,11 @@ type NodeInfoSnake = {
   name: string;
   visible: boolean;
   locked: boolean;
+  /// Axis-aligned bounds in document space, mirroring
+  /// `kcreate_core::Node::bounds`. Threaded through the napi wire
+  /// shape so the renderer can place hotspot rectangles without a
+  /// second IPC hop.
+  bounds: BoundsSnake;
 };
 
 type RuntimeStatusSnake = {
@@ -59,6 +71,7 @@ type DocumentStatusSnake = {
 export type {
   ProjectInfoSnake,
   NodeInfoSnake,
+  BoundsSnake,
   RuntimeStatusSnake,
   DocumentStatusSnake,
 };

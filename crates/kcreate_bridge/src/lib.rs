@@ -36,9 +36,9 @@ use napi_derive::napi;
 use uuid::Uuid;
 
 use crate::document::{
-    CreateNodeProps, DocumentBridgeError, NodeInfo as CoreNodeInfo,
-    PngExportRequest as CorePngRequest, ProjectInfo as CoreProjectInfo,
-    RuntimeStatus as CoreRuntimeStatus, UpdateNodeProps,
+    BoundsInfo as CoreBoundsInfo, CreateNodeProps, DocumentBridgeError,
+    NodeInfo as CoreNodeInfo, PngExportRequest as CorePngRequest,
+    ProjectInfo as CoreProjectInfo, RuntimeStatus as CoreRuntimeStatus, UpdateNodeProps,
 };
 use crate::state::{
     AcquiredFrame as CoreAcquiredFrame, BridgeError, RendererFrameInfo as CoreFrameInfo,
@@ -325,6 +325,32 @@ impl From<CoreProjectInfo> for ProjectInfo {
     }
 }
 
+/// Wire-format mirror of [`kcreate_core::Bounds`] / [`document::BoundsInfo`].
+///
+/// Kept as a flat `#[napi(object)]` shape so the host can read `bounds`
+/// from any `NodeInfo` without a second IPC hop. The four numbers
+/// represent the axis-aligned bounding box in document space (CSS-like
+/// `x, y, width, height` in document units / px).
+#[napi(object)]
+#[derive(Debug, Clone, Copy)]
+pub struct Bounds {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
+impl From<CoreBoundsInfo> for Bounds {
+    fn from(b: CoreBoundsInfo) -> Self {
+        Self {
+            x: b.x,
+            y: b.y,
+            width: b.width,
+            height: b.height,
+        }
+    }
+}
+
 #[napi(object)]
 #[derive(Debug, Clone)]
 pub struct NodeInfo {
@@ -335,6 +361,12 @@ pub struct NodeInfo {
     pub name: String,
     pub visible: bool,
     pub locked: bool,
+    /// Axis-aligned bounding box in document space. Mirrors
+    /// `kcreate_core::Node::bounds`. The host's PrototypePlayer
+    /// (Block A, Task 2) uses this to position hotspot rectangles on
+    /// top of the rendered artboard; previously the wire shape elided
+    /// `bounds`, so hotspots never appeared — see PR #5 fix.
+    pub bounds: Bounds,
 }
 
 impl From<CoreNodeInfo> for NodeInfo {
@@ -347,6 +379,7 @@ impl From<CoreNodeInfo> for NodeInfo {
             name: c.name,
             visible: c.visible,
             locked: c.locked,
+            bounds: c.bounds.into(),
         }
     }
 }

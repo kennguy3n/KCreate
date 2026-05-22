@@ -155,6 +155,13 @@ pub struct NodeInfo {
     pub name: String,
     pub visible: bool,
     pub locked: bool,
+    /// Axis-aligned bounds of the node in document space, mirroring
+    /// `kcreate_core::Node::bounds`. Previously elided from the
+    /// layer-panel wire shape; PrototypePlayer / hit-targeted UI need
+    /// it to render hotspot rectangles, so we ship the four numbers
+    /// directly (32 bytes per node is well under the cost of a second
+    /// round trip per node).
+    pub bounds: BoundsInfo,
     /// Present iff `node_type == "ComponentLayer"` and the node
     /// carries a parseable `component_instance` metadata payload.
     /// Renderer panels read this to drive the variant switcher.
@@ -166,6 +173,29 @@ pub struct NodeInfo {
     /// elided from the wire when empty to keep tree payloads small.
     #[serde(skip_serializing_if = "HashMap::is_empty", default)]
     pub metadata: HashMap<String, serde_json::Value>,
+}
+
+/// Wire-format mirror of [`kcreate_core::Bounds`]. Mirrored as a
+/// separate type so the napi-rs `#[napi(object)]` shape in
+/// `lib.rs::NodeInfo` can spell out the four fields directly — napi
+/// would otherwise have to learn about the core type.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct BoundsInfo {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
+impl From<kcreate_core::Bounds> for BoundsInfo {
+    fn from(b: kcreate_core::Bounds) -> Self {
+        Self {
+            x: b.x,
+            y: b.y,
+            width: b.width,
+            height: b.height,
+        }
+    }
 }
 
 impl From<&Node> for NodeInfo {
@@ -190,6 +220,7 @@ impl From<&Node> for NodeInfo {
             name: n.name.clone(),
             visible: n.visible,
             locked: n.locked,
+            bounds: n.bounds.into(),
             component_instance,
             metadata: n.metadata.clone(),
         }
@@ -597,11 +628,13 @@ pub fn document_get_tree() -> Result<Vec<NodeInfo>> {
 /// strokes, fonts, and text live).
 ///
 /// This is intentionally richer than [`document_get_tree`] — the
-/// layer-panel wire shape ([`NodeInfo`]) elides bounds / effects /
-/// transform to keep tree payloads small. LLM prompts for design-
-/// token extraction and accessibility audits need the visual data
-/// to produce useful output, so we walk the live `DocumentGraph`
-/// directly and serialise every visible property.
+/// layer-panel wire shape ([`NodeInfo`]) carries `bounds` (added so
+/// the PrototypePlayer can position hotspots without a second round
+/// trip per node) but still elides per-node `effects`, `transform`,
+/// `fills`, and the raw paint data to keep tree payloads small. LLM
+/// prompts for design-token extraction and accessibility audits need
+/// the full visual record to produce useful output, so we walk the
+/// live `DocumentGraph` directly and serialise every visible property.
 pub fn document_serialise_for_ai() -> Result<String> {
     let guard = slot().lock();
     let ws = guard.as_ref().ok_or(DocumentBridgeError::NoProject)?;
@@ -3350,6 +3383,53 @@ mod tests {
         document_delete_node(id).expect("delete");
         let tree = document_get_tree().expect("tree");
         assert!(tree.iter().all(|n| n.id != id));
+        project_close();
+    }
+
+    /// Regression test for PR #5 Devin Review BUG-0001: the
+    /// `NodeInfo` wire shape must carry `bounds` so the renderer's
+    /// PrototypePlayer can position hotspot rectangles. Previously
+    /// the field was elided and the player saw an empty hotspot
+    /// catalog regardless of how many interactions were attached.
+    #[test]
+    #[serial]
+    fn node_info_carries_bounds() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("bounds_wire", dir.path()).expect("create");
+        // `artboard_create` is the canonical bounds-setting entry
+        // point — `document_create_node` doesn't accept geometry, but
+        // the panel's hotspot picker only needs *some* node with
+        // non-zero bounds to drive the test.
+        let ab = artboard_create(None, "Hero".into(), 800.0, 600.0).expect("artboard");
+        let tree = document_get_tree().expect("tree");
+        let node = tree.iter().find(|n| n.id == ab).expect("present");
+        assert!(
+            (node.bounds.width - 800.0).abs() < f64::EPSILON,
+            "bounds.width should round-trip through the wire format"
+        );
+        assert!((node.bounds.height - 600.0).abs() < f64::EPSILON);
+        // Every other node in the tree (the default page, child
+        // layers, ...) must also carry a `bounds` field — even if
+        // its width/height are zero. This is the guarantee
+        // PrototypePlayer relies on.
+        for n in &tree {
+            // `n.bounds` is a value-type, so its mere existence is
+            // checked by the compiler; assert finiteness so we'd
+            // notice if some node accidentally received NaN.
+            assert!(n.bounds.x.is_finite());
+            assert!(n.bounds.y.is_finite());
+            assert!(n.bounds.width.is_finite());
+            assert!(n.bounds.height.is_finite());
+        }
+        // And it survives JSON round-tripping — napi-rs converts
+        // `#[napi(object)]` types using the same field-by-field
+        // shape, so a JSON round-trip is a faithful proxy.
+        let json = serde_json::to_string(node).expect("serialise");
+        assert!(json.contains("\"bounds\""));
+        assert!(json.contains("\"width\":800"));
+        let parsed: NodeInfo = serde_json::from_str(&json).expect("round-trip");
+        assert_eq!(parsed.bounds, node.bounds);
         project_close();
     }
 

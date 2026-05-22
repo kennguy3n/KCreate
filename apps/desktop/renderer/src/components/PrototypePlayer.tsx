@@ -51,14 +51,22 @@ export function PrototypePlayer({
   const [loading, setLoading] = useState<boolean>(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
-  // Reset on open with the requested or fallback artboard.
+  // Reset on open with the requested or fallback artboard. Depend on
+  // a stable string fingerprint of the artboards (first-id + length)
+  // instead of the array reference so the player doesn't reset itself
+  // mid-session when the parent rebuilds its artboards array but the
+  // identities are unchanged. We only need the first artboard for the
+  // fallback path, so keying off its id + the count is sufficient to
+  // detect "the catalog actually changed" without tracking every entry.
+  const firstArtboardId = artboards[0]?.id ?? null;
+  const artboardCount = artboards.length;
   useEffect(() => {
     if (!open) return;
-    const initial = startArtboardId ?? artboards[0]?.id ?? null;
+    const initial = startArtboardId ?? firstArtboardId ?? null;
     setCurrent(initial);
     setStack([]);
     setErrorMsg(initial ? null : "No artboards in project.");
-  }, [open, startArtboardId, artboards]);
+  }, [open, startArtboardId, firstArtboardId, artboardCount]);
 
   const currentArtboard = useMemo<ArtboardInfo | null>(
     () => artboards.find((a) => a.id === current) ?? null,
@@ -78,13 +86,20 @@ export function PrototypePlayer({
       const collected: Hotspot[] = [];
       for (const node of subtree) {
         const interactions = await window.kcreate.interaction.list(node.id);
+        if (interactions.length === 0) continue;
+        // `bounds` is now first-class on the wire shape — see the
+        // BoundsInfo addition in `kcreate_bridge::document::NodeInfo`.
+        // A zero-size box is still a valid bound (e.g. a freshly
+        // created group before layout), but it would never receive a
+        // click, so we drop it from the hotspot set to avoid
+        // rendering invisible overlays the user can't hit.
+        const b = node.bounds;
+        if (b.width <= 0 || b.height <= 0) continue;
         for (const it of interactions) {
-          const bounds = readBoundsFromMetadata(node);
-          if (!bounds) continue;
           collected.push({
             nodeId: node.id,
             interactionId: it.id,
-            bounds,
+            bounds: { x: b.x, y: b.y, width: b.width, height: b.height },
             action: it.action,
             trigger: it.trigger,
           });
@@ -120,10 +135,11 @@ export function PrototypePlayer({
     return () => {
       window.removeEventListener("keydown", onKey);
     };
-    // navigateBack is intentionally not a dep: it reads from state
-    // closures, and re-binding on every push would only matter if we
-    // were synchronously dispatching, which we aren't.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    // `navigateBack` reads from state via the functional `setStack`
+    // updater, so it doesn't need to be in the deps list — re-binding
+    // when only `stack.length` changes is sufficient to keep the key
+    // handler reading a current closure for the few non-state values
+    // it actually closes over.
   }, [open, onClose, stack.length]);
 
   const navigateTo = (artboardId: string): void => {
@@ -250,28 +266,6 @@ function collectSubtree(tree: NodeInfo[], rootId: string): NodeInfo[] {
     for (const c of node.children) stack.push(c);
   }
   return out;
-}
-
-function readBoundsFromMetadata(node: NodeInfo): {
-  x: number;
-  y: number;
-  width: number;
-  height: number;
-} | null {
-  const m = node.metadata;
-  if (!m || typeof m !== "object") return null;
-  const b = (m as { bounds?: unknown }).bounds;
-  if (!b || typeof b !== "object") return null;
-  const r = b as Record<string, unknown>;
-  if (
-    typeof r.x === "number" &&
-    typeof r.y === "number" &&
-    typeof r.width === "number" &&
-    typeof r.height === "number"
-  ) {
-    return { x: r.x, y: r.y, width: r.width, height: r.height };
-  }
-  return null;
 }
 
 function describeAction(

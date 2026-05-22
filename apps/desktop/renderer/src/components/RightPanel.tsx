@@ -61,6 +61,12 @@ export interface RightPanelProps {
   onSelectNode?: (nodeId: string) => void;
   /** Artboard options used by the Interaction panel's target picker. */
   artboards?: Array<{ id: string; name: string }>;
+  /**
+   * Full document tree, forwarded to the Interaction panel for the
+   * `scroll_to` target picker. Omitted in modes that don't show the
+   * Interaction tab.
+   */
+  tree?: NodeInfo[];
   /** Trigger after Interaction add/remove so the host can refresh state. */
   onInteractionsChanged?: () => void;
 }
@@ -74,19 +80,29 @@ export function RightPanel({
   onStatus,
   onSelectNode,
   artboards,
+  tree,
   onInteractionsChanged,
 }: RightPanelProps): JSX.Element {
   const showAccessibility = mode === "design" || mode === "inspect";
   const showInteraction = mode === "prototype";
-  const TABS: ReadonlyArray<{ id: RightPanelTab; label: string }> = [
-    ...BASE_TABS,
-    ...(showAccessibility
-      ? [{ id: "accessibility" as const, label: "Accessibility" }]
-      : []),
-    ...(showInteraction
-      ? [{ id: "interaction" as const, label: "Interaction" }]
-      : []),
-  ];
+  // Memoize so the tab strip array identity is stable as long as the
+  // mode-derived booleans don't change. Otherwise the spread allocates
+  // a fresh array (and new option object literals) on every render,
+  // breaking referential equality for any downstream memo.
+  const TABS = useMemo<
+    ReadonlyArray<{ id: RightPanelTab; label: string }>
+  >(
+    () => [
+      ...BASE_TABS,
+      ...(showAccessibility
+        ? [{ id: "accessibility" as const, label: "Accessibility" }]
+        : []),
+      ...(showInteraction
+        ? [{ id: "interaction" as const, label: "Interaction" }]
+        : []),
+    ],
+    [showAccessibility, showInteraction],
+  );
   const [tab, setTab] = useState<RightPanelTab>("properties");
   return (
     <aside
@@ -180,6 +196,7 @@ export function RightPanel({
           <InteractionPanel
             selected={selected}
             artboards={artboards ?? []}
+            tree={tree}
             onStatus={onStatus}
             onChanged={onInteractionsChanged}
           />

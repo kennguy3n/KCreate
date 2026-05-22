@@ -208,6 +208,20 @@ export interface ComponentInstanceInfo {
   overrides: Record<string, unknown>;
 }
 
+/**
+ * Axis-aligned bounding box in document space. Mirror of
+ * `kcreate_core::Bounds` / `kcreate_bridge::Bounds`. Carried on every
+ * `NodeInfo` so panels that need hit-target geometry (PrototypePlayer
+ * hotspots, layout indicators, overlay alignment) can read it without
+ * a second IPC hop.
+ */
+export interface Bounds {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
 export interface NodeInfo {
   id: string;
   nodeType: string;
@@ -216,6 +230,12 @@ export interface NodeInfo {
   name: string;
   visible: boolean;
   locked: boolean;
+  /**
+   * Bounds of the node in document space. Always present on every
+   * node (defaults to a zero-size box if the underlying layer has
+   * no explicit geometry — e.g. groups before layout solving).
+   */
+  bounds: Bounds;
   componentInstance?: ComponentInstanceInfo;
   /**
    * Free-form metadata bag mirroring `Node::metadata` on the Rust side.

@@ -1071,6 +1071,7 @@ export function EditorPage({
               void handleSelect(id);
             }}
             artboards={artboards.map((a) => ({ id: a.id, name: a.name }))}
+            tree={nodes}
             onInteractionsChanged={() => {
               void refreshTree();
             }}

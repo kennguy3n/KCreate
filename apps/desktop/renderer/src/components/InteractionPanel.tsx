@@ -22,6 +22,14 @@ import { colors, radius, spacing } from "../styles/tokens";
 export interface InteractionPanelProps {
   selected: NodeInfo | null;
   artboards: Array<{ id: string; name: string }>;
+  /**
+   * Full document tree, used by the `scroll_to` target picker. When
+   * empty (or omitted), the panel still lets the user add
+   * `navigate_to` / `open_overlay` / `close_overlay` / `back`
+   * interactions but disables `scroll_to` because there is no node
+   * catalog to pick from.
+   */
+  tree?: NodeInfo[];
   onStatus?: (msg: string | null) => void;
   /** Called after every successful add / remove. The host typically
    * refreshes the document tree so lightning-bolt indicators in the
@@ -48,6 +56,7 @@ const ACTION_KINDS: ReadonlyArray<{ id: ActionKind; label: string }> = [
 export function InteractionPanel({
   selected,
   artboards,
+  tree,
   onStatus,
   onChanged,
 }: InteractionPanelProps): JSX.Element {
@@ -74,17 +83,44 @@ export function InteractionPanel({
     void refresh();
   }, [refresh]);
 
-  // Default the target artboard to the first one whenever the action
-  // kind switches to one that needs an artboard.
+  // Pickable target nodes for `scroll_to`. Exclude the node the
+  // interaction is attached to (scrolling to yourself is a no-op) and
+  // anything without geometry. We don't filter to a specific node
+  // type because any visible layer is a legitimate scroll target —
+  // for example, scrolling to a `Section` group or to a heading text
+  // layer are both reasonable user intents.
+  const scrollTargets = (tree ?? []).filter(
+    (n) =>
+      n.id !== selected?.id &&
+      n.visible &&
+      n.bounds.width > 0 &&
+      n.bounds.height > 0,
+  );
+
+  // Reset the target id whenever the action kind changes so we don't
+  // accidentally carry a stale artboard id into a scroll_to action
+  // (or vice-versa). Then pre-populate with the first valid option
+  // for the new kind so the "Add" button can be clicked immediately.
   useEffect(() => {
-    if (
-      (actionKind === "navigate_to" || actionKind === "open_overlay") &&
-      targetId === ""
-    ) {
+    if (actionKind === "navigate_to" || actionKind === "open_overlay") {
       const first = artboards[0];
-      if (first) setTargetId(first.id);
+      // Snap to first artboard if the current id isn't a known
+      // artboard (e.g. the user just switched away from scroll_to).
+      const known = artboards.some((a) => a.id === targetId);
+      if (!known) setTargetId(first ? first.id : "");
+    } else if (actionKind === "scroll_to") {
+      const first = scrollTargets[0];
+      const known = scrollTargets.some((n) => n.id === targetId);
+      if (!known) setTargetId(first ? first.id : "");
+    } else if (targetId !== "") {
+      // close_overlay / back take no target.
+      setTargetId("");
     }
-  }, [actionKind, targetId, artboards]);
+    // scrollTargets is recomputed every render from props; keying off
+    // the underlying tree+selected ensures the effect runs again only
+    // when the picker contents actually change.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [actionKind, artboards, tree, selected?.id]);
 
   if (!selected) {
     return (
@@ -94,9 +130,11 @@ export function InteractionPanel({
     );
   }
 
-  const needsTarget = actionKind === "navigate_to" || actionKind === "open_overlay";
-  const canAdd =
-    !busy && (!needsTarget || (needsTarget && targetId !== ""));
+  const needsArtboardTarget =
+    actionKind === "navigate_to" || actionKind === "open_overlay";
+  const needsNodeTarget = actionKind === "scroll_to";
+  const needsTarget = needsArtboardTarget || needsNodeTarget;
+  const canAdd = !busy && (!needsTarget || targetId !== "");
 
   const handleAdd = async (): Promise<void> => {
     if (!canAdd) return;
@@ -202,7 +240,7 @@ export function InteractionPanel({
             ))}
           </select>
         </label>
-        {needsTarget ? (
+        {needsArtboardTarget ? (
           <label style={fieldStyle}>
             <span style={labelTextStyle}>Target artboard</span>
             <select
@@ -216,6 +254,26 @@ export function InteractionPanel({
                 artboards.map((a) => (
                   <option key={a.id} value={a.id}>
                     {a.name}
+                  </option>
+                ))
+              )}
+            </select>
+          </label>
+        ) : null}
+        {needsNodeTarget ? (
+          <label style={fieldStyle}>
+            <span style={labelTextStyle}>Target node</span>
+            <select
+              value={targetId}
+              onChange={(e) => setTargetId(e.target.value)}
+              style={selectStyle}
+            >
+              {scrollTargets.length === 0 ? (
+                <option value="">— no scrollable nodes —</option>
+              ) : (
+                scrollTargets.map((n) => (
+                  <option key={n.id} value={n.id}>
+                    {n.name || `${n.nodeType} ${n.id.slice(0, 8)}`}
                   </option>
                 ))
               )}

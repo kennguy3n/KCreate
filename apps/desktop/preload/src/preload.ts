@@ -211,6 +211,13 @@ type ProjectInfoSnake = {
   modified_at: string;
 };
 
+type BoundsSnake = {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+};
+
 type NodeInfoSnake = {
   id: string;
   node_type: string;
@@ -219,6 +226,11 @@ type NodeInfoSnake = {
   name: string;
   visible: boolean;
   locked: boolean;
+  /// Axis-aligned bounds in document space. Mirrors
+  /// `kcreate_core::Node::bounds`; the napi bridge carries it as
+  /// `bounds` directly on every NodeInfo so the renderer can render
+  /// hotspots / hit-test overlays without a second IPC round trip.
+  bounds: BoundsSnake;
   /// Already camelCased on the Rust side via #[serde(rename)]. We
   /// pass it through verbatim because the inner field names are
   /// also camelCased (definitionId / activeVariantId).
@@ -259,6 +271,12 @@ function nodeFromSnake(n: NodeInfoSnake): NodeInfo {
     name: n.name,
     visible: n.visible,
     locked: n.locked,
+    bounds: {
+      x: n.bounds.x,
+      y: n.bounds.y,
+      width: n.bounds.width,
+      height: n.bounds.height,
+    },
     ...(n.componentInstance ? { componentInstance: n.componentInstance } : {}),
     ...(n.metadata ? { metadata: n.metadata } : {}),
   };

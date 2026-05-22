@@ -47,8 +47,14 @@ pub fn upscale_lanczos(
     pixels: &[u8],
     width: u32,
     height: u32,
-    scale: f32,
+    scale: f64,
 ) -> Result<(Vec<u8>, u32, u32), UpscaleError> {
+    // `scale` is `f64` so values arriving from JavaScript (which only
+    // has `f64` numbers) survive the FFI boundary intact. Casting to
+    // `f32` at the bridge layer rounded values just above 1.0 down to
+    // exactly 1.0 and made the `> 1.0` validation below reject
+    // otherwise-legitimate inputs. Per Devin Review
+    // ANALYSIS_pr-review-job-0594c03f68c24589ba78a32926e3874f_0004.
     if width == 0 || height == 0 {
         return Err(UpscaleError::InvalidDimensions);
     }
@@ -63,8 +69,8 @@ pub fn upscale_lanczos(
         return Err(UpscaleError::InvalidScale(format!("{scale}")));
     }
 
-    let new_w_f = f64::from(width) * f64::from(scale);
-    let new_h_f = f64::from(height) * f64::from(scale);
+    let new_w_f = f64::from(width) * scale;
+    let new_h_f = f64::from(height) * scale;
     if !new_w_f.is_finite() || !new_h_f.is_finite() || new_w_f > f64::from(u32::MAX) {
         return Err(UpscaleError::Overflow);
     }
@@ -168,14 +174,20 @@ pub fn upscale_lanczos(
 fn build_taps(
     src_len: u32,
     dst_len: u32,
-    scale: f32,
+    scale: f64,
 ) -> Vec<(usize, [f32; KERNEL_SAMPLES_PER_TAP])> {
-    let inv_scale = 1.0 / scale;
+    // Compute kernel centers in `f64` so a `scale` of 1.0000001 isn't
+    // silently snapped to 1.0 before the inverse. The Lanczos kernel
+    // itself stays in `f32` — pixel weights don't need 53-bit
+    // mantissa precision. Per Devin Review
+    // ANALYSIS_pr-review-job-0594c03f68c24589ba78a32926e3874f_0004.
+    let inv_scale = 1.0_f64 / scale;
     let mut out = Vec::with_capacity(dst_len as usize);
     let src_last_idx = src_len.saturating_sub(1) as i32;
     for d in 0..dst_len {
-        let center = (d as f32 + 0.5) * inv_scale - 0.5;
-        let left = (center - LANCZOS_RADIUS).floor() as i32;
+        let center_f64 = (f64::from(d) + 0.5) * inv_scale - 0.5;
+        let center = center_f64 as f32;
+        let left = (center_f64 - f64::from(LANCZOS_RADIUS)).floor() as i32;
         // Anchor the tap window inside [0, src_len-KERNEL]; smaller
         // images still produce a valid window where indices repeat the
         // edge pixel.
@@ -260,7 +272,7 @@ mod tests {
             Err(UpscaleError::InvalidScale(_))
         ));
         assert!(matches!(
-            upscale_lanczos(&pixels, 2, 2, f32::NAN),
+            upscale_lanczos(&pixels, 2, 2, f64::NAN),
             Err(UpscaleError::InvalidScale(_))
         ));
     }

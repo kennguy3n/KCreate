@@ -1603,9 +1603,15 @@ pub fn export_batch_dismiss(job_id: String) -> NapiResult<bool> {
 #[napi]
 #[allow(clippy::needless_pass_by_value)]
 pub fn ai_upscale(node_id: String, scale: f64) -> NapiResult<String> {
+    // Pass `scale` through to the algorithm as `f64`. The previous
+    // `scale as f32` cast silently rounded values just above 1.0
+    // (e.g. `1.0000001_f64`) down to exactly `1.0_f32`, which the
+    // algorithm then rejected as out of range. JavaScript numbers
+    // are always `f64`, so preserving that precision across the FFI
+    // boundary is the right architectural fix. Per Devin Review
+    // ANALYSIS_pr-review-job-0594c03f68c24589ba78a32926e3874f_0004.
     let id = parse_uuid(&node_id)?;
-    let s = scale as f32;
-    phase2::ai_upscale(id, s)
+    phase2::ai_upscale(id, scale)
         .map(|u| u.to_string())
         .map_err(map_doc_err)
 }

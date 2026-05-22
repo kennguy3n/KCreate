@@ -340,7 +340,7 @@ fn ai_models_dir() -> PathBuf {
     PathBuf::from(home).join(".kcreate").join("models")
 }
 
-pub fn ai_upscale(node_id: Uuid, scale: f32) -> Result<Uuid> {
+pub fn ai_upscale(node_id: Uuid, scale: f64) -> Result<Uuid> {
     // Load encoded image and decode.
     let (encoded, parent) = with_workspace(|ws| {
         let node = ws

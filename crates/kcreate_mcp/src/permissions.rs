@@ -205,18 +205,51 @@ impl McpPermissionStore {
     /// execution. A `Once` grant is consumed by transitioning to
     /// `Denied`; the caller should refresh by calling `check` again
     /// for the next invocation.
+    ///
+    /// The read-modify-write — observing the `Once` grant and then
+    /// transitioning it to `Denied` — happens under a *single* write
+    /// lock acquisition. The previous implementation called
+    /// `self.check` (acquires the read lock, releases it) and then
+    /// `self.grant` (acquires the write lock), which left a window
+    /// where two concurrent invocations could each observe the same
+    /// `Once` grant and both succeed. The MCP server's `tiny_http`
+    /// accept loop is single-threaded so the race was not reachable
+    /// in practice, but a defence-in-depth atomic transition is the
+    /// right architecture for a permission gate. Per Devin Review
+    /// ANALYSIS_pr-review-job-0594c03f68c24589ba78a32926e3874f_0001.
     pub fn consume_if_once(
         &self,
         client_id: &str,
         tool_name: &str,
     ) -> Result<bool, PermissionStoreError> {
-        let entry = match self.check(client_id, tool_name) {
-            Some(e) => e,
-            None => return Ok(false),
+        let key = (client_id.to_string(), tool_name.to_string());
+        // Hold the write lock for the whole observe-and-transition.
+        // The persist() call below requires its own read lock for the
+        // sorted listing, so we explicitly release the write lock
+        // before calling persist() — but the in-memory transition is
+        // complete and visible to every subsequent reader by that
+        // point, so a racing `consume_if_once` will see `Denied`.
+        let (allowed, needs_persist) = {
+            let mut guard = self.inner.write();
+            let Some(entry) = guard.get(&key).cloned() else {
+                return Ok(false);
+            };
+            let allowed = entry.granted.allows();
+            if entry.granted == PermissionGrant::Once {
+                let demoted = McpPermission {
+                    client_id: entry.client_id,
+                    tool_name: entry.tool_name,
+                    granted: PermissionGrant::Denied,
+                    granted_at: Utc::now(),
+                };
+                guard.insert(key, demoted);
+                (allowed, true)
+            } else {
+                (allowed, false)
+            }
         };
-        let allowed = entry.granted.allows();
-        if entry.granted == PermissionGrant::Once {
-            self.grant(client_id, tool_name, PermissionGrant::Denied)?;
+        if needs_persist {
+            self.persist()?;
         }
         Ok(allowed)
     }

@@ -334,6 +334,14 @@ export interface RuntimeBridge {
   lowResourceModeSet(enabled: boolean): Promise<void>;
   /** Snapshot the resolved effective limits. */
   resourceLimits(): Promise<ResourceLimits>;
+  /**
+   * Write a UTF-8 text file at `path`. The host requires the path to
+   * be inside the OS temp directory returned by `tempDir()` — any
+   * other location is rejected — so the renderer can only land
+   * sidecar files (e.g. design-token JSON for a dev handoff) next to
+   * its other exports. Returns the number of bytes written.
+   */
+  writeTextFile(path: string, content: string): Promise<number>;
 }
 
 /** PDF export options. `width_mm`/`height_mm` are the page size in mm. */

@@ -24,6 +24,17 @@ pub enum FlexDirection {
 }
 
 /// Main-axis alignment.
+///
+/// Note on `SpaceBetween` / `SpaceEvenly`: unlike CSS
+/// `justify-content`, these variants **respect the `FlexLayout::spacing`
+/// gap as a floor** and only distribute the *remaining* free space.
+/// In CSS, `justify-content: space-between` ignores any `gap` and
+/// distributes all free space; our solver guarantees at least
+/// `spacing` pixels between siblings, then evenly fills whatever
+/// surplus is left. This is intentional — it lets a designer set a
+/// "minimum gap" and have alignment expand from there rather than
+/// collapse below it. Callers porting CSS values directly should set
+/// `spacing = 0` to get pure CSS semantics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum Alignment {

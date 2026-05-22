@@ -367,10 +367,16 @@ export function EditorPage({
 
   const layoutHandlers = useMemo(
     () => ({
+      // `setFlex` / `setGrid` only persist the layout config on the
+      // node; the visible child bounds change when `recompute` runs
+      // *next*. Skip the intermediate `refreshTree` here so a single
+      // user edit fires just two IPC round-trips (set → recompute)
+      // and one final tree fetch instead of four. RightPanel's
+      // FlexControls / GridControls always call `recompute` right
+      // after, which carries the refresh.
       setFlex: async (nodeId: string, config: FlexLayout) => {
         try {
           await window.kcreate.layout.setFlex(nodeId, config);
-          await refreshTree();
         } catch (e) {
           setStatusMessage(`set flex layout failed: ${errorMessage(e)}`);
         }
@@ -378,7 +384,6 @@ export function EditorPage({
       setGrid: async (nodeId: string, config: GridLayout) => {
         try {
           await window.kcreate.layout.setGrid(nodeId, config);
-          await refreshTree();
         } catch (e) {
           setStatusMessage(`set grid layout failed: ${errorMessage(e)}`);
         }
@@ -946,6 +951,7 @@ export function EditorPage({
           onComponentDetach={(id) => {
             void handleComponentDetach(id);
           }}
+          onDesignSystemStatus={setStatusMessage}
         />
         <main
           style={{

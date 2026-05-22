@@ -28,7 +28,8 @@ use std::str::FromStr;
 
 use kcreate_export::svg::SvgExportOptions;
 use kcreate_renderer::Rect;
-use napi::bindgen_prelude::{Buffer, Error as NapiError, Result as NapiResult, Status};
+use napi::bindgen_prelude::{AsyncTask, Buffer, Error as NapiError, Result as NapiResult, Status};
+use napi::{Env, Task};
 use napi_derive::napi;
 use uuid::Uuid;
 
@@ -503,55 +504,177 @@ pub fn llm_status() -> NapiResult<String> {
         .map_err(|e| NapiError::from_reason(format!("llm_status: {e}")))
 }
 
+// LLM chat/completion is a *blocking* HTTP round-trip to the local
+// llama-server (up to a 60 s timeout in `chat_completion_impl`).
+// Exposing it as a synchronous N-API function would block the
+// Electron main process event loop for the duration — window
+// dragging, menu clicks, and every other IPC queue would freeze.
+// We wrap each completion call in `AsyncTask`, which dispatches the
+// blocking work to N-API's libuv thread pool and resolves the
+// returned JS Promise once the worker finishes. The renderer
+// already awaits these results via `ipcRenderer.invoke`, so the
+// wire format doesn't change.
+//
+// We deliberately do NOT use a Tokio runtime here: `ureq` (the
+// llama-server client) is itself blocking, and a single-shot worker
+// task per request is simpler than threading an async runtime
+// through the LLM crate. If the LLM client ever switches to an
+// async HTTP library, these tasks can move to `Env::execute_tokio_future`.
+
+/// `napi::Task` for `llm_chat`. Owns the parsed messages so the
+/// blocking HTTP call can run on a worker thread.
+#[derive(Debug)]
+pub struct LlmChatTask {
+    messages: Vec<llm::LlmMessage>,
+    max_tokens: usize,
+    temperature: f32,
+}
+
+impl Task for LlmChatTask {
+    type Output = String;
+    type JsValue = String;
+
+    fn compute(&mut self) -> NapiResult<Self::Output> {
+        let reply = llm::llm_chat(
+            std::mem::take(&mut self.messages),
+            self.max_tokens,
+            self.temperature,
+        )
+        .map_err(map_llm_err)?;
+        serde_json::to_string(&reply)
+            .map_err(|e| NapiError::from_reason(format!("llm_chat encode: {e}")))
+    }
+
+    fn resolve(&mut self, _env: Env, output: Self::Output) -> NapiResult<Self::JsValue> {
+        Ok(output)
+    }
+}
+
 /// JSON-encoded chat completion. Input is a JSON array of
-/// `{role, content}` objects.
-#[napi]
-pub fn llm_chat(messages_json: String, max_tokens: u32, temperature: f64) -> NapiResult<String> {
+/// `{role, content}` objects. Resolves on a worker thread so the
+/// Electron main loop stays responsive while llama-server runs
+/// inference.
+#[napi(ts_return_type = "Promise<string>")]
+pub fn llm_chat(
+    messages_json: String,
+    max_tokens: u32,
+    temperature: f64,
+) -> NapiResult<AsyncTask<LlmChatTask>> {
     let messages: Vec<llm::LlmMessage> = serde_json::from_str(&messages_json)
         .map_err(|e| NapiError::new(Status::InvalidArg, format!("llm_chat messages: {e}")))?;
     #[allow(clippy::cast_possible_truncation)]
-    let reply =
-        llm::llm_chat(messages, max_tokens as usize, temperature as f32).map_err(map_llm_err)?;
-    serde_json::to_string(&reply)
-        .map_err(|e| NapiError::from_reason(format!("llm_chat encode: {e}")))
+    Ok(AsyncTask::new(LlmChatTask {
+        messages,
+        max_tokens: max_tokens as usize,
+        temperature: temperature as f32,
+    }))
+}
+
+/// `napi::Task` for `llm_suggest_for_selection`.
+#[derive(Debug)]
+pub struct LlmSuggestForSelectionTask;
+
+impl Task for LlmSuggestForSelectionTask {
+    type Output = String;
+    type JsValue = String;
+
+    fn compute(&mut self) -> NapiResult<Self::Output> {
+        let reply = llm::llm_suggest_for_selection().map_err(map_llm_err)?;
+        serde_json::to_string(&reply)
+            .map_err(|e| NapiError::from_reason(format!("llm_suggest encode: {e}")))
+    }
+
+    fn resolve(&mut self, _env: Env, output: Self::Output) -> NapiResult<Self::JsValue> {
+        Ok(output)
+    }
 }
 
 /// JSON-encoded "suggest improvements" output for the current
-/// selection or document.
-#[napi]
-pub fn llm_suggest_for_selection() -> NapiResult<String> {
-    let reply = llm::llm_suggest_for_selection().map_err(map_llm_err)?;
-    serde_json::to_string(&reply)
-        .map_err(|e| NapiError::from_reason(format!("llm_suggest encode: {e}")))
+/// selection or document. Runs on a worker thread.
+#[napi(ts_return_type = "Promise<string>")]
+pub fn llm_suggest_for_selection() -> AsyncTask<LlmSuggestForSelectionTask> {
+    AsyncTask::new(LlmSuggestForSelectionTask)
+}
+
+/// `napi::Task` for `ai_suggest_layer_names`.
+#[derive(Debug)]
+pub struct AiSuggestLayerNamesTask;
+
+impl Task for AiSuggestLayerNamesTask {
+    type Output = String;
+    type JsValue = String;
+
+    fn compute(&mut self) -> NapiResult<Self::Output> {
+        let res = llm::ai_suggest_layer_names().map_err(map_llm_err)?;
+        serde_json::to_string(&res)
+            .map_err(|e| NapiError::from_reason(format!("ai_suggest_layer_names encode: {e}")))
+    }
+
+    fn resolve(&mut self, _env: Env, output: Self::Output) -> NapiResult<Self::JsValue> {
+        Ok(output)
+    }
 }
 
 /// Ask the LLM to propose semantic names for every layer. Returns a
 /// JSON object: `{ suggestions: [[uuid, name], ...], raw_content,
-/// tokens_used, model }`.
-#[napi]
-pub fn ai_suggest_layer_names() -> NapiResult<String> {
-    let res = llm::ai_suggest_layer_names().map_err(map_llm_err)?;
-    serde_json::to_string(&res)
-        .map_err(|e| NapiError::from_reason(format!("ai_suggest_layer_names encode: {e}")))
+/// tokens_used, model }`. Runs on a worker thread.
+#[napi(ts_return_type = "Promise<string>")]
+pub fn ai_suggest_layer_names() -> AsyncTask<AiSuggestLayerNamesTask> {
+    AsyncTask::new(AiSuggestLayerNamesTask)
+}
+
+/// `napi::Task` for `ai_extract_design_tokens`.
+#[derive(Debug)]
+pub struct AiExtractDesignTokensTask;
+
+impl Task for AiExtractDesignTokensTask {
+    type Output = String;
+    type JsValue = String;
+
+    fn compute(&mut self) -> NapiResult<Self::Output> {
+        let res = llm::ai_extract_design_tokens().map_err(map_llm_err)?;
+        serde_json::to_string(&res)
+            .map_err(|e| NapiError::from_reason(format!("ai_extract_design_tokens encode: {e}")))
+    }
+
+    fn resolve(&mut self, _env: Env, output: Self::Output) -> NapiResult<Self::JsValue> {
+        Ok(output)
+    }
 }
 
 /// Ask the LLM to extract design tokens. Returns
 /// `{ json, tokens_used, model }` where `json` is the model's reply
-/// in the schema described by `build_design_token_prompt`.
-#[napi]
-pub fn ai_extract_design_tokens() -> NapiResult<String> {
-    let res = llm::ai_extract_design_tokens().map_err(map_llm_err)?;
-    serde_json::to_string(&res)
-        .map_err(|e| NapiError::from_reason(format!("ai_extract_design_tokens encode: {e}")))
+/// in the schema described by `build_design_token_prompt`. Runs on a
+/// worker thread.
+#[napi(ts_return_type = "Promise<string>")]
+pub fn ai_extract_design_tokens() -> AsyncTask<AiExtractDesignTokensTask> {
+    AsyncTask::new(AiExtractDesignTokensTask)
+}
+
+/// `napi::Task` for `ai_check_accessibility`.
+#[derive(Debug)]
+pub struct AiCheckAccessibilityTask;
+
+impl Task for AiCheckAccessibilityTask {
+    type Output = String;
+    type JsValue = String;
+
+    fn compute(&mut self) -> NapiResult<Self::Output> {
+        let res = llm::ai_check_accessibility().map_err(map_llm_err)?;
+        serde_json::to_string(&res)
+            .map_err(|e| NapiError::from_reason(format!("ai_check_accessibility encode: {e}")))
+    }
+
+    fn resolve(&mut self, _env: Env, output: Self::Output) -> NapiResult<Self::JsValue> {
+        Ok(output)
+    }
 }
 
 /// Ask the LLM to audit the document for accessibility issues.
-/// Returns `{ json, tokens_used, model }`.
-#[napi]
-pub fn ai_check_accessibility() -> NapiResult<String> {
-    let res = llm::ai_check_accessibility().map_err(map_llm_err)?;
-    serde_json::to_string(&res)
-        .map_err(|e| NapiError::from_reason(format!("ai_check_accessibility encode: {e}")))
+/// Returns `{ json, tokens_used, model }`. Runs on a worker thread.
+#[napi(ts_return_type = "Promise<string>")]
+pub fn ai_check_accessibility() -> AsyncTask<AiCheckAccessibilityTask> {
+    AsyncTask::new(AiCheckAccessibilityTask)
 }
 
 /// Snapshot of the open document's editing state.

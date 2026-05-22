@@ -260,32 +260,62 @@ function LayoutControls({
   if (node.nodeType !== "LayoutFrame") {
     return null;
   }
-  const [mode, setMode] = [
-    stored?.kind ?? "flex",
-    (next: "flex" | "grid") => {
-      // The bridge persists the layout config in the document
-      // *before* `recompute` reads it back to compute child bounds.
-      // Firing them concurrently lets `recompute` race the metadata
-      // write and snap children to the previous mode's geometry,
-      // which the user sees as a one-frame flicker on every mode
-      // switch. The same `await … await` pattern is used by the
-      // FlexControls / GridControls onCommit handlers below.
-      void (async () => {
-        if (next === "flex") {
-          await layout.setFlex(
-            node.id,
-            stored?.kind === "flex" ? stored.config : DEFAULT_FLEX,
-          );
-        } else {
-          await layout.setGrid(
-            node.id,
-            stored?.kind === "grid" ? stored.config : DEFAULT_GRID,
-          );
-        }
-        await layout.recompute(node.id);
-      })();
-    },
-  ] as const;
+  return <LayoutControlsForFrame node={node} stored={stored} layout={layout} />;
+}
+
+/**
+ * The actual flex/grid editor body. Pulled into its own component
+ * so we can host a real `useState` for the mode toggle. Using
+ * `useState` instead of a derived value makes the `SegmentedControl`
+ * react synchronously to the user's click instead of waiting for the
+ * bridge round-trip + `refreshTree` to repopulate `stored.kind`,
+ * which used to leave the active segment visually stuck on the
+ * previous mode until the document re-fetched.
+ */
+function LayoutControlsForFrame({
+  node,
+  stored,
+  layout,
+}: {
+  node: NodeInfo;
+  stored: ParsedLayout | null;
+  layout: LayoutHandlers;
+}): JSX.Element {
+  const storedKind: "flex" | "grid" = stored?.kind ?? "flex";
+  const [mode, setMode] = useState<"flex" | "grid">(storedKind);
+
+  // Sync the optimistic mode back to the persisted value when the
+  // document refresh lands. This also handles the case where a
+  // different surface (e.g. an undo) flips the mode underneath us.
+  useEffect(() => {
+    setMode(storedKind);
+  }, [storedKind]);
+
+  const onModeChange = (next: "flex" | "grid"): void => {
+    // Optimistic UI update first so the segmented control flips
+    // immediately. The bridge round-trip below catches up the
+    // persisted layout config and refreshes the tree.
+    setMode(next);
+    void (async () => {
+      // `setFlex` / `setGrid` persists the layout config in the
+      // document; `recompute` then reads it back to compute child
+      // bounds. Sequencing them with `await` (rather than firing
+      // both concurrently) avoids a one-frame flicker where
+      // `recompute` snaps children to the previous mode's geometry.
+      if (next === "flex") {
+        await layout.setFlex(
+          node.id,
+          stored?.kind === "flex" ? stored.config : DEFAULT_FLEX,
+        );
+      } else {
+        await layout.setGrid(
+          node.id,
+          stored?.kind === "grid" ? stored.config : DEFAULT_GRID,
+        );
+      }
+      await layout.recompute(node.id);
+    })();
+  };
   return (
     <>
       <hr style={hrStyle} />
@@ -299,7 +329,7 @@ function LayoutControls({
         <Field label="Layout mode">
           <SegmentedControl
             value={mode}
-            onChange={setMode}
+            onChange={onModeChange}
             options={[
               { value: "flex", label: "Flex" },
               { value: "grid", label: "Grid" },

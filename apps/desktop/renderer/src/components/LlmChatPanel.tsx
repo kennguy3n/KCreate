@@ -17,44 +17,48 @@ export interface LlmChatPanelProps {
 
 type Turn = LlmMessage & { id: string };
 
+// Quick-action kinds are dispatched to distinct bridge endpoints so
+// each button actually does what it advertises. The dedicated
+// endpoints (`ai.*`) carry the document context server-side; the
+// `custom_prompt` variant goes through `llm.chat` with the prompt
+// body below for actions that don't have a curated server prompt.
+type QuickActionKind =
+  | "suggest_for_selection"
+  | "layer_naming"
+  | "design_tokens"
+  | "accessibility"
+  | "custom_prompt";
+
 interface QuickAction {
+  kind: QuickActionKind;
   label: string;
-  prompt: string;
+  /** Used only when `kind === "custom_prompt"`. */
+  prompt?: string;
 }
 
 const QUICK_ACTIONS: QuickAction[] = [
   {
+    kind: "suggest_for_selection",
     label: "Suggest improvements for this design",
-    prompt:
-      "Suggest three concrete improvements to this design. " +
-      "Focus on layout, hierarchy and accessibility. " +
-      "Number each suggestion and keep them under one sentence.",
   },
   {
+    kind: "layer_naming",
     label: "Name my layers",
-    prompt:
-      "Propose better, semantic names for the layers in this document. " +
-      "Return a markdown list mapping old name → new name.",
   },
   {
+    kind: "design_tokens",
     label: "Extract design tokens",
-    prompt:
-      "List the colors, font sizes, and spacing values that appear " +
-      "consistent across this design. Return a JSON object with " +
-      "`colors`, `fontSizes`, and `spacing` arrays.",
   },
   {
+    kind: "custom_prompt",
     label: "Generate component variants",
     prompt:
       "For each component in this document, suggest 3 variant names " +
       "(e.g. Default, Hover, Disabled) and one-line behavior notes.",
   },
   {
+    kind: "accessibility",
     label: "Find accessibility issues",
-    prompt:
-      "Audit this design for accessibility issues — contrast, font " +
-      "size, tap target size, color-only meaning. Return findings as " +
-      "a numbered markdown list.",
   },
 ];
 
@@ -127,30 +131,78 @@ export function LlmChatPanel({ onStatus }: LlmChatPanelProps): JSX.Element {
     async (action: QuickAction) => {
       if (!ready || sending) return;
       onStatus(`LLM: ${action.label}…`);
+      setSending(true);
       try {
-        const reply = await window.kcreate.llm.suggestForSelection();
+        // Each kind has a distinct happy-path call so the action does
+        // what its label says. The fallback below catches the case
+        // where the dedicated endpoint returns an error (e.g. no
+        // project open, sidecar mid-restart) and replays via the
+        // generic chat endpoint so the user still sees a response.
+        let assistantContent: string;
+        let tokensUsed: number;
+        let modelName: string;
+        switch (action.kind) {
+          case "suggest_for_selection": {
+            const reply = await window.kcreate.llm.suggestForSelection();
+            assistantContent = reply.content;
+            tokensUsed = reply.tokens_used;
+            modelName = reply.model;
+            break;
+          }
+          case "layer_naming": {
+            const reply = await window.kcreate.ai.suggestLayerNames();
+            assistantContent = reply.raw_content;
+            tokensUsed = reply.tokens_used;
+            modelName = reply.model;
+            break;
+          }
+          case "design_tokens": {
+            const reply = await window.kcreate.ai.extractDesignTokens();
+            assistantContent = reply.json;
+            tokensUsed = reply.tokens_used;
+            modelName = reply.model;
+            break;
+          }
+          case "accessibility": {
+            const reply = await window.kcreate.ai.checkAccessibility();
+            assistantContent = reply.json;
+            tokensUsed = reply.tokens_used;
+            modelName = reply.model;
+            break;
+          }
+          case "custom_prompt": {
+            const prompt = action.prompt ?? action.label;
+            const reply = await window.kcreate.llm.chat(
+              [{ role: "user", content: prompt }],
+              512,
+              0.2,
+            );
+            assistantContent = reply.content;
+            tokensUsed = reply.tokens_used;
+            modelName = reply.model;
+            break;
+          }
+          default: {
+            // Exhaustiveness check: TS narrows `action.kind` to
+            // `never` here, so adding a new variant without a case
+            // branch becomes a compile error.
+            const exhaustive: never = action.kind;
+            throw new Error(`unhandled quick action: ${String(exhaustive)}`);
+          }
+        }
         setTurns((prev) => [
           ...prev,
           { id: cryptoId(), role: "user", content: action.label },
-          { id: cryptoId(), role: "assistant", content: reply.content },
+          { id: cryptoId(), role: "assistant", content: assistantContent },
         ]);
-        onStatus(`LLM: ${reply.tokens_used} tokens (${reply.model}).`);
+        onStatus(`LLM: ${tokensUsed} tokens (${modelName}).`);
       } catch (e) {
-        // If the curated server-side prompt doesn't apply, fall back
-        // to the raw chat with the action's prompt.
-        try {
-          await sendMessages(
-            [{ id: cryptoId(), role: "user", content: action.prompt }],
-            action.label,
-          );
-        } catch (inner) {
-          onStatus(
-            `LLM quick action failed: ${errMsg(inner)} (initial: ${errMsg(e)})`,
-          );
-        }
+        onStatus(`LLM quick action failed: ${errMsg(e)}`);
+      } finally {
+        setSending(false);
       }
     },
-    [onStatus, ready, sendMessages, sending],
+    [onStatus, ready, sending],
   );
 
   const composedTurns = useMemo(() => turns, [turns]);

@@ -7,9 +7,17 @@ import type {
 } from "../../../shared/scene";
 import { colors, radius, spacing } from "../styles/tokens";
 import { ArtboardPanel } from "./ArtboardPanel";
+import { BrandKitEditor } from "./BrandKitEditor";
 import { ComponentPanel } from "./ComponentPanel";
+import { DesignTokenEditor } from "./DesignTokenEditor";
 
-export type LeftPanelTab = "pages" | "artboards" | "layers" | "assets";
+export type LeftPanelTab =
+  | "pages"
+  | "artboards"
+  | "layers"
+  | "assets"
+  | "tokens"
+  | "brand";
 
 export interface LeftPanelProps {
   nodes: NodeInfo[];
@@ -41,6 +49,11 @@ export interface LeftPanelProps {
   onComponentAddVariant?: (componentId: string, name: string) => void;
   onComponentSwitchVariant?: (nodeId: string, variantId: string) => void;
   onComponentDetach?: (nodeId: string) => void;
+
+  // Design-system inputs (tokens + brand kits). Optional so callers
+  // that haven't wired these bridges yet keep working; both tabs
+  // render their own empty state when not present.
+  onDesignSystemStatus?: (msg: string | null) => void;
 }
 
 export function LeftPanel({
@@ -65,6 +78,7 @@ export function LeftPanel({
   onComponentAddVariant,
   onComponentSwitchVariant,
   onComponentDetach,
+  onDesignSystemStatus,
 }: LeftPanelProps): JSX.Element {
   const [tab, setTab] = useState<LeftPanelTab>("layers");
   return (
@@ -83,6 +97,8 @@ export function LeftPanel({
           { id: "artboards", label: "Artboards" },
           { id: "layers", label: "Layers" },
           { id: "assets", label: "Assets" },
+          { id: "tokens", label: "Tokens" },
+          { id: "brand", label: "Brand" },
         ]}
         active={tab}
         onChange={setTab}
@@ -157,6 +173,15 @@ export function LeftPanel({
             </EmptyHint>
           )
         ) : null}
+        {tab === "tokens" ? (
+          <DesignTokenEditor
+            selectedNodeId={selectedId}
+            onStatus={onDesignSystemStatus ?? noopStatus}
+          />
+        ) : null}
+        {tab === "brand" ? (
+          <BrandKitEditor onStatus={onDesignSystemStatus ?? noopStatus} />
+        ) : null}
       </div>
     </aside>
   );
@@ -170,6 +195,7 @@ const noopArg = (_: unknown): void => undefined;
 const noopName = (_: string): void => undefined;
 const noopRename = (_: string, __: string): void => undefined;
 const noopResize = (_: string, __: number, ___: number): void => undefined;
+const noopStatus = (_: string | null): void => undefined;
 
 function PanelTabs<T extends string>({
   tabs,

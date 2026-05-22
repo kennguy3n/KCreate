@@ -347,6 +347,13 @@ const runtime: RuntimeBridge = {
       JSON.parse(raw) as ResourceLimitsSnake,
     );
   },
+  async writeTextFile(target: string, content: string): Promise<number> {
+    return (await ipcRenderer.invoke(
+      "kcreate/runtime/writeTextFile",
+      target,
+      content,
+    )) as number;
+  },
 };
 
 type ResourceLimitsSnake = {

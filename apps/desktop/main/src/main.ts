@@ -441,6 +441,11 @@ function registerIpcHandlers(): void {
   ipcMain.handle("kcreate/llm/status", (): string =>
     requireBridge().llmStatus(),
   );
+  // Each LLM completion handler simply forwards the bridge's
+  // Promise. The bridge runs the blocking HTTP work on N-API's
+  // libuv thread pool (see `LlmChatTask` etc. in
+  // `crates/kcreate_bridge/src/lib.rs`), so the main loop stays
+  // responsive across the up-to-60-second llama-server timeout.
   ipcMain.handle(
     "kcreate/llm/chat",
     (
@@ -448,19 +453,19 @@ function registerIpcHandlers(): void {
       messagesJson: string,
       maxTokens: number,
       temperature: number,
-    ): string =>
+    ): Promise<string> =>
       requireBridge().llmChat(messagesJson, maxTokens, temperature),
   );
-  ipcMain.handle("kcreate/llm/suggest", (): string =>
+  ipcMain.handle("kcreate/llm/suggest", (): Promise<string> =>
     requireBridge().llmSuggestForSelection(),
   );
-  ipcMain.handle("kcreate/ai/suggestLayerNames", (): string =>
+  ipcMain.handle("kcreate/ai/suggestLayerNames", (): Promise<string> =>
     requireBridge().aiSuggestLayerNames(),
   );
-  ipcMain.handle("kcreate/ai/extractDesignTokens", (): string =>
+  ipcMain.handle("kcreate/ai/extractDesignTokens", (): Promise<string> =>
     requireBridge().aiExtractDesignTokens(),
   );
-  ipcMain.handle("kcreate/ai/checkAccessibility", (): string =>
+  ipcMain.handle("kcreate/ai/checkAccessibility", (): Promise<string> =>
     requireBridge().aiCheckAccessibility(),
   );
   // The OS temp dir is owned by the host (Node `os.tmpdir()`), not by
@@ -474,6 +479,29 @@ function registerIpcHandlers(): void {
   // renderer never picks the path/prefix.
   ipcMain.handle("kcreate/runtime/cleanupScratchProjects", () =>
     cleanupScratchProjects(),
+  );
+  // Sandboxed text-file sink used by the dev-handoff export preset
+  // and other renderer-side sidecars. The path is canonicalised
+  // against `os.tmpdir()` so the renderer can only write inside the
+  // OS temp directory (the same root `tempDir()` hands out). Any
+  // attempt to escape that root via `..` or an absolute prefix is
+  // rejected.
+  ipcMain.handle(
+    "kcreate/runtime/writeTextFile",
+    async (_e, target: string, content: string): Promise<number> => {
+      const tmp = path.resolve(os.tmpdir());
+      const resolved = path.resolve(target);
+      const rel = path.relative(tmp, resolved);
+      if (rel.startsWith("..") || path.isAbsolute(rel)) {
+        throw new Error(
+          `writeTextFile rejected: ${target} is outside ${tmp}`,
+        );
+      }
+      await fs.mkdir(path.dirname(resolved), { recursive: true });
+      const bytes = Buffer.byteLength(content, "utf8");
+      await fs.writeFile(resolved, content, "utf8");
+      return bytes;
+    },
   );
 
   ipcMain.handle(

@@ -80,7 +80,12 @@ pub fn layout_grid(
             cursor += row_gap;
         }
     }
-    let _ = inner_h; // grid doesn't currently constrain to inner_h; rows overflow.
+    // NB: `inner_h` is computed but intentionally unused — the
+    // current grid solver lets rows overflow the parent's content
+    // rect (cell height tracks the tallest natural child). When we
+    // add `auto-rows` / `grid-template-rows`, this will become the
+    // axis size we distribute against.
+    let _ = inner_h;
 
     let mut out: Vec<(Uuid, Bounds)> = Vec::with_capacity(children_sizes.len());
     for (i, (id, cw, ch)) in children_sizes.iter().enumerate() {
@@ -89,16 +94,13 @@ pub fn layout_grid(
         let cell_h = row_heights[row];
         let x = inner_x + (col as f64) * (cell_w + col_gap);
         let y = inner_y + row_origins[row];
-        // Children take the cell's full width but their natural
-        // height clipped to the row height (so a tall child in a
-        // short row doesn't extend past the row baseline).
-        let w = cw.min(cell_w).max(0.0).max(0.0);
+        // Children take at most the cell's width and the row's
+        // height — a tall child in a short row clips to the row
+        // baseline so adjacent rows don't overlap. Negative
+        // intrinsic sizes degrade to zero rather than wrapping.
+        let w = cw.min(cell_w).max(0.0);
         let h = ch.min(cell_h).max(0.0);
-        // Sizes default to cell extents when the child is at most
-        // cell-sized; if smaller, we still want to render at natural
-        // size — pick the larger of (natural, 0) capped at cell.
-        let _ = w;
-        out.push((*id, Bounds::new(x, y, cell_w.min(*cw).max(0.0), h)));
+        out.push((*id, Bounds::new(x, y, w, h)));
     }
     out
 }

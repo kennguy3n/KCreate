@@ -106,11 +106,19 @@ export interface Bridge {
   llmStart(modelPath: string): number;
   llmStop(): void;
   llmStatus(): string;
-  llmChat(messagesJson: string, maxTokens: number, temperature: number): string;
-  llmSuggestForSelection(): string;
-  aiSuggestLayerNames(): string;
-  aiExtractDesignTokens(): string;
-  aiCheckAccessibility(): string;
+  // LLM completion calls return Promises because the underlying
+  // `AsyncTask` runs the blocking HTTP round-trip on N-API's libuv
+  // thread pool instead of the Electron main loop. See the
+  // `LlmChatTask` family in `crates/kcreate_bridge/src/lib.rs`.
+  llmChat(
+    messagesJson: string,
+    maxTokens: number,
+    temperature: number,
+  ): Promise<string>;
+  llmSuggestForSelection(): Promise<string>;
+  aiSuggestLayerNames(): Promise<string>;
+  aiExtractDesignTokens(): Promise<string>;
+  aiCheckAccessibility(): Promise<string>;
   exportSvg(nodeIds: string[], optionsJson: string): string;
   exportPng(outputPath: string, optionsJson: string): number;
   exportPdf(outputPath: string, optionsJson: string): number;

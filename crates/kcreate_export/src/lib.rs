@@ -44,6 +44,6 @@ pub use preflight::{
     PreflightSeverity,
 };
 pub use scene_metadata::{
-    raster_image_meta, text_layer_meta, RasterImageMeta, TextLayerMeta,
-    RASTER_IMAGE_METADATA_KEY, TEXT_LAYER_METADATA_KEY, VECTOR_PATH_METADATA_KEY,
+    raster_image_meta, text_layer_meta, RasterImageMeta, TextLayerMeta, RASTER_IMAGE_METADATA_KEY,
+    TEXT_LAYER_METADATA_KEY, VECTOR_PATH_METADATA_KEY,
 };

@@ -222,7 +222,11 @@ mod tests {
                 .unwrap();
         }
         let store = McpPermissionStore::open(dir.path()).unwrap();
-        assert!(store.check("c1", "list_artboards").unwrap().granted.allows());
+        assert!(store
+            .check("c1", "list_artboards")
+            .unwrap()
+            .granted
+            .allows());
         assert!(!store.check("c2", "create_node").unwrap().granted.allows());
     }
 
@@ -270,12 +274,8 @@ mod tests {
     fn list_is_sorted() {
         let dir = tempdir().unwrap();
         let store = McpPermissionStore::open(dir.path()).unwrap();
-        store
-            .grant("z", "tool", PermissionGrant::Always)
-            .unwrap();
-        store
-            .grant("a", "tool", PermissionGrant::Always)
-            .unwrap();
+        store.grant("z", "tool", PermissionGrant::Always).unwrap();
+        store.grant("a", "tool", PermissionGrant::Always).unwrap();
         let v = store.list();
         assert_eq!(v[0].client_id, "a");
         assert_eq!(v[1].client_id, "z");

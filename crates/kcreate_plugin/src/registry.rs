@@ -73,10 +73,7 @@ impl PluginRegistry {
                 Ok(m) => {
                     self.plugins.insert(m.id.clone(), m);
                 }
-                Err(e) => log::warn!(
-                    "kcreate_plugin: skipping {} ({e})",
-                    dir.display()
-                ),
+                Err(e) => log::warn!("kcreate_plugin: skipping {} ({e})", dir.display()),
             }
         }
         self.load_enabled()?;

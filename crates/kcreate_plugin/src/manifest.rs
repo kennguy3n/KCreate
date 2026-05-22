@@ -154,7 +154,10 @@ mod tests {
         assert_eq!(m.description, "tests");
         assert_eq!(
             m.permissions,
-            vec![PluginPermission::ReadDocument, PluginPermission::WriteDocument]
+            vec![
+                PluginPermission::ReadDocument,
+                PluginPermission::WriteDocument
+            ]
         );
     }
 

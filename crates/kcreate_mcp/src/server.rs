@@ -225,7 +225,9 @@ pub fn is_running() -> bool {
 #[must_use]
 pub fn port() -> Option<u16> {
     let slot = global().lock();
-    slot.as_ref().filter(|s| s.is_running()).map(McpServer::port)
+    slot.as_ref()
+        .filter(|s| s.is_running())
+        .map(McpServer::port)
 }
 
 #[cfg(test)]

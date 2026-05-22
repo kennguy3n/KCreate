@@ -23,7 +23,9 @@ const KERNEL_SAMPLES_PER_TAP: usize = 6; // 2 * radius for radius == 3
 /// Errors from [`upscale_lanczos`].
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum UpscaleError {
-    #[error("invalid dimensions: width and height must be > 0 and pixels.len() == width * height * 4")]
+    #[error(
+        "invalid dimensions: width and height must be > 0 and pixels.len() == width * height * 4"
+    )]
     InvalidDimensions,
     #[error("invalid scale: {0}; must be > 1.0 and finite")]
     InvalidScale(String),
@@ -163,7 +165,11 @@ pub fn upscale_lanczos(
 /// the standard "clamp to edge" rule — out-of-range indices fold into
 /// the nearest valid pixel by accumulating their weight onto that
 /// pixel. Final weights are renormalised to sum to 1.0.
-fn build_taps(src_len: u32, dst_len: u32, scale: f32) -> Vec<(usize, [f32; KERNEL_SAMPLES_PER_TAP])> {
+fn build_taps(
+    src_len: u32,
+    dst_len: u32,
+    scale: f32,
+) -> Vec<(usize, [f32; KERNEL_SAMPLES_PER_TAP])> {
     let inv_scale = 1.0 / scale;
     let mut out = Vec::with_capacity(dst_len as usize);
     let src_last_idx = src_len.saturating_sub(1) as i32;
@@ -185,7 +191,9 @@ fn build_taps(src_len: u32, dst_len: u32, scale: f32) -> Vec<(usize, [f32; KERNE
             let dx = (virt as f32) - center;
             let w = lanczos(dx, LANCZOS_RADIUS);
             // Fold into the tap slot that holds the clamped pixel.
-            let tap_slot = clamped.saturating_sub(start).min(KERNEL_SAMPLES_PER_TAP - 1);
+            let tap_slot = clamped
+                .saturating_sub(start)
+                .min(KERNEL_SAMPLES_PER_TAP - 1);
             weights[tap_slot] += w;
             sum += w;
         }
@@ -337,6 +345,9 @@ mod tests {
         // Alpha range in output should span roughly [0, 240].
         let min = out.iter().step_by(4).skip(3).copied().min().unwrap_or(0);
         let max = out.iter().skip(3).step_by(4).copied().max().unwrap_or(0);
-        assert!(i32::from(max) - i32::from(min) > 100, "alpha spread should be wide");
+        assert!(
+            i32::from(max) - i32::from(min) > 100,
+            "alpha spread should be wide"
+        );
     }
 }

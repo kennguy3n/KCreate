@@ -403,7 +403,9 @@ fn fill_has_chromatic_rgb(fill: &FillStyle) -> bool {
                 kcreate_core::node::GradientKind::Linear { stops, .. }
                 | kcreate_core::node::GradientKind::Radial { stops, .. } => stops,
             };
-            stops.iter().any(|s| !is_grayscale(s.color.r, s.color.g, s.color.b))
+            stops
+                .iter()
+                .any(|s| !is_grayscale(s.color.r, s.color.g, s.color.b))
         }
     }
 }
@@ -449,23 +451,25 @@ fn check_node_transparency(
 /// Standard ISO and US sizes are accepted. Custom and presentation
 /// sizes produce info-level notes so the user can confirm they were
 /// intentional.
-fn check_page_size(
-    layout: Option<&PageLayout>,
-    page_id: Uuid,
-    issues: &mut Vec<PreflightIssue>,
-) {
+fn check_page_size(layout: Option<&PageLayout>, page_id: Uuid, issues: &mut Vec<PreflightIssue>) {
     let Some(layout) = layout else {
         issues.push(PreflightIssue {
             check: PreflightCheck::PageSize,
             severity: PreflightSeverity::Info,
-            message: "Page has no PageLayout metadata; preflight assumed 300 DPI for measurement.".to_string(),
+            message: "Page has no PageLayout metadata; preflight assumed 300 DPI for measurement."
+                .to_string(),
             affected_node_id: None,
             page_id: Some(page_id),
         });
         return;
     };
     match layout.page_size {
-        PageSize::A3 | PageSize::A4 | PageSize::A5 | PageSize::Letter | PageSize::Legal | PageSize::Tabloid => {}
+        PageSize::A3
+        | PageSize::A4
+        | PageSize::A5
+        | PageSize::Letter
+        | PageSize::Legal
+        | PageSize::Tabloid => {}
         PageSize::Presentation16x9 | PageSize::Presentation4x3 => {
             issues.push(PreflightIssue {
                 check: PreflightCheck::PageSize,
@@ -475,7 +479,10 @@ fn check_page_size(
                 page_id: Some(page_id),
             });
         }
-        PageSize::Custom { width_mm, height_mm } => {
+        PageSize::Custom {
+            width_mm,
+            height_mm,
+        } => {
             issues.push(PreflightIssue {
                 check: PreflightCheck::PageSize,
                 severity: PreflightSeverity::Warning,
@@ -492,10 +499,10 @@ fn check_page_size(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scene_metadata::TextLayerMeta;
     use kcreate_core::node::{
         Bounds, GradientKind, GradientStop, Node, NodeStyle, Point2D, RgbaColor,
     };
-    use crate::scene_metadata::TextLayerMeta;
     use serde_json::json;
 
     fn page_with_layout(doc: &mut DocumentGraph, layout: PageLayout, bounds: Bounds) -> Uuid {
@@ -508,7 +515,13 @@ mod tests {
         doc.insert_node(p).unwrap()
     }
 
-    fn child(doc: &mut DocumentGraph, parent: Uuid, node_type: NodeType, name: &str, bounds: Bounds) -> Uuid {
+    fn child(
+        doc: &mut DocumentGraph,
+        parent: Uuid,
+        node_type: NodeType,
+        name: &str,
+        bounds: Bounds,
+    ) -> Uuid {
         let mut n = Node::new(node_type, name);
         n.parent_id = Some(parent);
         n.bounds = bounds;
@@ -545,7 +558,9 @@ mod tests {
             Bounds::new(10.0, 100.0, 200.0, 200.0),
         );
         let issues = run_preflight(&doc, &[], &PreflightOptions::default());
-        assert!(issues.iter().any(|i| i.check == PreflightCheck::BleedMargin));
+        assert!(issues
+            .iter()
+            .any(|i| i.check == PreflightCheck::BleedMargin));
     }
 
     #[test]
@@ -561,7 +576,9 @@ mod tests {
             Bounds::new(200.0, 200.0, 800.0, 800.0),
         );
         let issues = run_preflight(&doc, &[], &PreflightOptions::default());
-        assert!(!issues.iter().any(|i| i.check == PreflightCheck::BleedMargin));
+        assert!(!issues
+            .iter()
+            .any(|i| i.check == PreflightCheck::BleedMargin));
     }
 
     #[test]
@@ -686,7 +703,9 @@ mod tests {
         node.opacity = 0.5;
         doc.insert_node(node).unwrap();
         let issues = run_preflight(&doc, &[], &PreflightOptions::default());
-        assert!(issues.iter().any(|i| i.check == PreflightCheck::Transparency));
+        assert!(issues
+            .iter()
+            .any(|i| i.check == PreflightCheck::Transparency));
     }
 
     #[test]
@@ -703,7 +722,9 @@ mod tests {
             ..PreflightOptions::default()
         };
         let issues = run_preflight(&doc, &[], &opts);
-        assert!(!issues.iter().any(|i| i.check == PreflightCheck::Transparency));
+        assert!(!issues
+            .iter()
+            .any(|i| i.check == PreflightCheck::Transparency));
     }
 
     #[test]
@@ -718,8 +739,9 @@ mod tests {
         );
         let _page = page_with_layout(&mut doc, layout, Bounds::new(0.0, 0.0, 1181.0, 2953.0));
         let issues = run_preflight(&doc, &[], &PreflightOptions::default());
-        assert!(issues.iter().any(|i| i.check == PreflightCheck::PageSize
-            && i.severity == PreflightSeverity::Warning));
+        assert!(issues.iter().any(
+            |i| i.check == PreflightCheck::PageSize && i.severity == PreflightSeverity::Warning
+        ));
     }
 
     #[test]
@@ -745,7 +767,9 @@ mod tests {
         let _p2 = page_with_layout(&mut doc, a4_layout(), a4_bounds());
         // Both pages run, both emit no errors.
         let issues = run_preflight(&doc, &[], &PreflightOptions::default());
-        assert!(issues.iter().all(|i| i.severity != PreflightSeverity::Error));
+        assert!(issues
+            .iter()
+            .all(|i| i.severity != PreflightSeverity::Error));
     }
 
     #[test]

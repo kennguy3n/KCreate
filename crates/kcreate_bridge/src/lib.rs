@@ -1656,11 +1656,7 @@ pub fn mcp_permission_list() -> NapiResult<String> {
 }
 
 #[napi]
-pub fn mcp_permission_grant(
-    client_id: String,
-    tool_name: String,
-    grant: String,
-) -> NapiResult<()> {
+pub fn mcp_permission_grant(client_id: String, tool_name: String, grant: String) -> NapiResult<()> {
     phase2::mcp_permission_grant(&client_id, &tool_name, &grant).map_err(map_doc_err)
 }
 

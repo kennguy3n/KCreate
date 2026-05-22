@@ -186,7 +186,9 @@ pub fn run_batch_parallel(
                 succeeded_lock.lock().push(job.output_dir.join(&name));
             }
             Err(e) => {
-                failed_lock.lock().push((name.clone(), format!("item {idx}: {e}")));
+                failed_lock
+                    .lock()
+                    .push((name.clone(), format!("item {idx}: {e}")));
             }
         }
         let new_completed = completed.fetch_add(1, Ordering::SeqCst) + 1;
@@ -371,7 +373,11 @@ mod tests {
         names.sort();
         assert_eq!(
             names,
-            vec!["a.svg".to_string(), "b.svg".to_string(), "c.svg".to_string()]
+            vec![
+                "a.svg".to_string(),
+                "b.svg".to_string(),
+                "c.svg".to_string()
+            ]
         );
     }
 

@@ -16,19 +16,24 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 /// Stable identifier strings for built-in / optional packs. Anything
-/// shipped inside `kcreate_ai` itself is `Builtin`; anything that
-/// requires an external file is `Onnx` or `Gguf`.
+/// shipped inside `kcreate_ai` itself is `BuiltIn`; anything that
+/// requires an external file is `Onnx` (ONNX weights loaded in-process)
+/// or `Sidecar` (weights loaded by the long-running LLM sidecar, e.g.
+/// GGUF). The variant names follow Rust convention; the serde wire
+/// format snake-cases them so the TypeScript layer sees
+/// `"built_in" | "onnx" | "sidecar"` — see
+/// `apps/desktop/shared/scene.ts::ModelPack`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ModelKind {
     /// Implemented in pure Rust inside `kcreate_ai`; nothing to
     /// download.
-    Builtin,
-    /// ONNX model loaded via the `ort` crate (gated behind the
-    /// `onnx_bg_removal` feature on the build that bundles it).
+    BuiltIn,
+    /// ONNX model loaded in-process via the `ort` crate (gated behind
+    /// the `onnx_bg_removal` feature on the build that bundles it).
     Onnx,
-    /// GGUF weights for the LLM sidecar.
-    Gguf,
+    /// Weights consumed by the LLM sidecar (currently GGUF / llama.cpp).
+    Sidecar,
 }
 
 /// Coarse category for the model-manager UI.
@@ -74,7 +79,7 @@ pub fn list_model_packs(models_dir: &Path) -> Vec<ModelPack> {
     static_packs()
         .into_iter()
         .map(|mut p| {
-            if p.kind == ModelKind::Builtin {
+            if p.kind == ModelKind::BuiltIn {
                 p.installed = true;
             } else if !p.file_path.is_empty() {
                 p.installed = models_dir.join(&p.file_path).exists();
@@ -117,7 +122,7 @@ fn static_packs() -> Vec<ModelPack> {
             id: "bg_remove_threshold".into(),
             name: "Background Removal — Threshold".into(),
             category: ModelPackCategory::Core,
-            kind: ModelKind::Builtin,
+            kind: ModelKind::BuiltIn,
             capabilities: vec!["bg_remove".into()],
             size_bytes: 0,
             file_path: String::new(),
@@ -127,7 +132,7 @@ fn static_packs() -> Vec<ModelPack> {
             id: "upscale_lanczos".into(),
             name: "Image Upscale — Lanczos3".into(),
             category: ModelPackCategory::Core,
-            kind: ModelKind::Builtin,
+            kind: ModelKind::BuiltIn,
             capabilities: vec!["upscale".into()],
             size_bytes: 0,
             file_path: String::new(),
@@ -137,7 +142,7 @@ fn static_packs() -> Vec<ModelPack> {
             id: "palette_kmeans".into(),
             name: "Palette Extraction — k-means".into(),
             category: ModelPackCategory::Core,
-            kind: ModelKind::Builtin,
+            kind: ModelKind::BuiltIn,
             capabilities: vec!["palette".into(), "design_tokens".into()],
             size_bytes: 0,
             file_path: String::new(),
@@ -147,7 +152,7 @@ fn static_packs() -> Vec<ModelPack> {
             id: "smart_select_flood".into(),
             name: "Smart Select — Flood Fill".into(),
             category: ModelPackCategory::Core,
-            kind: ModelKind::Builtin,
+            kind: ModelKind::BuiltIn,
             capabilities: vec!["smart_select".into()],
             size_bytes: 0,
             file_path: String::new(),
@@ -177,7 +182,7 @@ fn static_packs() -> Vec<ModelPack> {
             id: "screenshot_to_layout".into(),
             name: "Screenshot to Layout (edge+CCA)".into(),
             category: ModelPackCategory::DesignPro,
-            kind: ModelKind::Builtin,
+            kind: ModelKind::BuiltIn,
             capabilities: vec!["screenshot_to_layout".into()],
             size_bytes: 0,
             file_path: String::new(),
@@ -187,7 +192,7 @@ fn static_packs() -> Vec<ModelPack> {
             id: "llm_sidecar_3b".into(),
             name: "Design LLM — 3B Instruct (GGUF)".into(),
             category: ModelPackCategory::DesignPro,
-            kind: ModelKind::Gguf,
+            kind: ModelKind::Sidecar,
             capabilities: vec!["design_suggestions".into(), "layer_naming".into()],
             size_bytes: 2_000_000_000,
             file_path: "design_llm.gguf".into(),
@@ -219,7 +224,7 @@ mod tests {
     fn builtin_packs_are_always_installed() {
         let dir = tempfile::tempdir().unwrap();
         let packs = list_model_packs(dir.path());
-        for p in packs.iter().filter(|p| p.kind == ModelKind::Builtin) {
+        for p in packs.iter().filter(|p| p.kind == ModelKind::BuiltIn) {
             assert!(p.installed, "{} should be installed", p.id);
             assert!(p.file_path.is_empty());
             assert_eq!(p.size_bytes, 0);
@@ -264,5 +269,28 @@ mod tests {
         let raw = serde_json::to_string(&packs[0]).unwrap();
         let p: ModelPack = serde_json::from_str(&raw).unwrap();
         assert_eq!(p, packs[0]);
+    }
+
+    /// Wire-format lockstep: the strings on the wire must be exactly
+    /// `built_in` / `onnx` / `sidecar` so the TypeScript layer's
+    /// discriminated union (`apps/desktop/shared/scene.ts::ModelKind`)
+    /// stays in sync with the Rust serde encoding. If you rename a
+    /// variant, fix the TS type AND keep this test passing.
+    #[test]
+    fn model_kind_serde_matches_typescript_wire_format() {
+        assert_eq!(
+            serde_json::to_string(&ModelKind::BuiltIn).unwrap(),
+            "\"built_in\""
+        );
+        assert_eq!(serde_json::to_string(&ModelKind::Onnx).unwrap(), "\"onnx\"");
+        assert_eq!(
+            serde_json::to_string(&ModelKind::Sidecar).unwrap(),
+            "\"sidecar\""
+        );
+        // And round-trip back to the same variants.
+        let parsed: ModelKind = serde_json::from_str("\"built_in\"").unwrap();
+        assert_eq!(parsed, ModelKind::BuiltIn);
+        let parsed: ModelKind = serde_json::from_str("\"sidecar\"").unwrap();
+        assert_eq!(parsed, ModelKind::Sidecar);
     }
 }

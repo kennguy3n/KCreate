@@ -74,11 +74,8 @@ pub fn extract_palette(
     let k = max_colors.min(samples.len());
     let centroids_init = init_centroids(&samples, k);
     let (centroids, assignments) = run_kmeans(&samples, &centroids_init);
-    let mut clusters: Vec<(usize, [f32; 3])> = centroids
-        .iter()
-        .enumerate()
-        .map(|(i, c)| (i, *c))
-        .collect();
+    let mut clusters: Vec<(usize, [f32; 3])> =
+        centroids.iter().enumerate().map(|(i, c)| (i, *c)).collect();
     let mut counts = vec![0usize; clusters.len()];
     for &a in &assignments {
         counts[a] += 1;
@@ -97,7 +94,11 @@ pub fn extract_palette(
             ExtractedColor::from_rgb(r, g, b, freq)
         })
         .collect();
-    out.sort_by(|a, b| b.frequency.partial_cmp(&a.frequency).unwrap_or(std::cmp::Ordering::Equal));
+    out.sort_by(|a, b| {
+        b.frequency
+            .partial_cmp(&a.frequency)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     out
 }
 
@@ -106,8 +107,9 @@ pub fn extract_palette(
 fn downsample(pixels: &[u8], width: u32, height: u32) -> Vec<[f32; 3]> {
     let stride_x = width.div_ceil(SAMPLE_DIM_CAP).max(1);
     let stride_y = height.div_ceil(SAMPLE_DIM_CAP).max(1);
-    let mut out: Vec<[f32; 3]> =
-        Vec::with_capacity((width as usize / stride_x as usize + 1) * (height as usize / stride_y as usize + 1));
+    let mut out: Vec<[f32; 3]> = Vec::with_capacity(
+        (width as usize / stride_x as usize + 1) * (height as usize / stride_y as usize + 1),
+    );
     let mut y = 0u32;
     while y < height {
         let mut x = 0u32;

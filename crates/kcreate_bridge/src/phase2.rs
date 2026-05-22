@@ -21,8 +21,8 @@ use kcreate_export::batch::{
     run_batch_parallel, BatchCancel, BatchExportJob, BatchProgress, BatchResult,
 };
 use kcreate_export::icon_pack::{generate_icon_pack, IconPackPlatform};
-use kcreate_export::preflight::{run_preflight, PreflightIssue, PreflightOptions};
 use kcreate_export::pdf::RasterPixelCache;
+use kcreate_export::preflight::{run_preflight, PreflightIssue, PreflightOptions};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -49,9 +49,7 @@ pub fn preflight_run(req: &PreflightRequest) -> Result<Vec<PreflightIssue>> {
     let pages: Vec<Uuid> = req
         .page_ids
         .iter()
-        .map(|s| {
-            Uuid::parse_str(s).map_err(|e| DocumentBridgeError::InvalidUuid(s.clone(), e))
-        })
+        .map(|s| Uuid::parse_str(s).map_err(|e| DocumentBridgeError::InvalidUuid(s.clone(), e)))
         .collect::<Result<Vec<Uuid>>>()?;
     with_workspace(|ws| Ok(run_preflight(&ws.project.document, &pages, &req.options)))
 }
@@ -78,15 +76,19 @@ pub fn icon_pack_export(req: &IconPackRequest) -> Result<IconPackOutcome> {
     let ids: Vec<Uuid> = req
         .node_ids
         .iter()
-        .map(|s| {
-            Uuid::parse_str(s).map_err(|e| DocumentBridgeError::InvalidUuid(s.clone(), e))
-        })
+        .map(|s| Uuid::parse_str(s).map_err(|e| DocumentBridgeError::InvalidUuid(s.clone(), e)))
         .collect::<Result<Vec<Uuid>>>()?;
     let output_dir = PathBuf::from(&req.output_dir);
     let scene = current_scene_safe()?;
     let result = with_workspace(|ws| {
-        generate_icon_pack(&scene, &ws.project.document, &ids, &req.platforms, &output_dir)
-            .map_err(|e| DocumentBridgeError::Io(std::io::Error::other(e.to_string())))
+        generate_icon_pack(
+            &scene,
+            &ws.project.document,
+            &ids,
+            &req.platforms,
+            &output_dir,
+        )
+        .map_err(|e| DocumentBridgeError::Io(std::io::Error::other(e.to_string())))
     })?;
     std::fs::create_dir_all(&output_dir)?;
     let mut written: Vec<PathBuf> = Vec::with_capacity(result.files.len());
@@ -174,9 +176,10 @@ pub fn batch_start(job: BatchExportJob) -> Result<String> {
     let result_clone = result_slot.clone();
     let join = thread::spawn(move || {
         let p = progress_clone.clone();
-        let outcome = run_batch_parallel(&job, &doc, &rasters, cancel_clone.as_inner(), move |snap| {
-            *p.lock() = snap;
-        });
+        let outcome =
+            run_batch_parallel(&job, &doc, &rasters, cancel_clone.as_inner(), move |snap| {
+                *p.lock() = snap;
+            });
         match outcome {
             Ok(r) => *result_clone.lock() = Some(r),
             Err(e) => {
@@ -201,11 +204,9 @@ pub fn batch_start(job: BatchExportJob) -> Result<String> {
 }
 
 pub fn batch_status(job_id: &str) -> Result<BatchJobStatus> {
-    let handle = batch_table()
-        .lock()
-        .get(job_id)
-        .cloned()
-        .ok_or_else(|| DocumentBridgeError::Io(std::io::Error::other(format!("unknown job {job_id}"))))?;
+    let handle = batch_table().lock().get(job_id).cloned().ok_or_else(|| {
+        DocumentBridgeError::Io(std::io::Error::other(format!("unknown job {job_id}")))
+    })?;
     let progress = handle.progress.lock().clone();
     let finished_now = handle.result.lock().is_some();
     let mut status = BatchJobStatus {
@@ -220,7 +221,11 @@ pub fn batch_status(job_id: &str) -> Result<BatchJobStatus> {
         duration_ms: 0,
     };
     if let Some(r) = handle.result.lock().as_ref() {
-        status.succeeded = r.succeeded.iter().map(|p| p.display().to_string()).collect();
+        status.succeeded = r
+            .succeeded
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect();
         status.failed.clone_from(&r.failed);
         status.duration_ms = r.duration_ms;
         status.cancelled = r.cancelled;
@@ -235,11 +240,9 @@ pub fn batch_status(job_id: &str) -> Result<BatchJobStatus> {
 }
 
 pub fn batch_cancel(job_id: &str) -> Result<()> {
-    let handle = batch_table()
-        .lock()
-        .get(job_id)
-        .cloned()
-        .ok_or_else(|| DocumentBridgeError::Io(std::io::Error::other(format!("unknown job {job_id}"))))?;
+    let handle = batch_table().lock().get(job_id).cloned().ok_or_else(|| {
+        DocumentBridgeError::Io(std::io::Error::other(format!("unknown job {job_id}")))
+    })?;
     handle.cancel.cancel();
     Ok(())
 }
@@ -292,8 +295,9 @@ pub fn ai_upscale(node_id: Uuid, scale: f32) -> Result<Uuid> {
         Ok((bytes, node.parent_id))
     })?;
 
-    let img = image::load_from_memory(&encoded)
-        .map_err(|e| DocumentBridgeError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))?;
+    let img = image::load_from_memory(&encoded).map_err(|e| {
+        DocumentBridgeError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+    })?;
     let rgba = img.to_rgba8();
     let (width, height) = rgba.dimensions();
     let (out_pixels, ow, oh) = kcreate_ai::upscale_lanczos(rgba.as_raw(), width, height, scale)
@@ -353,15 +357,17 @@ pub fn ai_upscale(node_id: Uuid, scale: f32) -> Result<Uuid> {
         )
         .as_ai_generated();
         ws.project.execute_operation(op);
-        kcreate_ai::ActionLog::global().lock().append(kcreate_ai::AiAction {
-            id: Uuid::new_v4(),
-            timestamp: Utc::now(),
-            task_type: "upscale".into(),
-            model: "lanczos3".into(),
-            compute_device: "cpu".into(),
-            affected_nodes: vec![new_id, node_id],
-            confidence: None,
-        });
+        kcreate_ai::ActionLog::global()
+            .lock()
+            .append(kcreate_ai::AiAction {
+                id: Uuid::new_v4(),
+                timestamp: Utc::now(),
+                task_type: "upscale".into(),
+                model: "lanczos3".into(),
+                compute_device: "cpu".into(),
+                affected_nodes: vec![new_id, node_id],
+                confidence: None,
+            });
         ws.project.modified_at = Utc::now();
         Ok(new_id)
     })?;
@@ -394,8 +400,9 @@ pub fn ai_extract_palette(node_id: Uuid, max_colors: usize) -> Result<String> {
         let meta: crate::scene_sync::RasterImageMeta = serde_json::from_value(meta_value.clone())?;
         blob_load(ws, &meta.blob_hash)
     })?;
-    let img = image::load_from_memory(&encoded)
-        .map_err(|e| DocumentBridgeError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))?;
+    let img = image::load_from_memory(&encoded).map_err(|e| {
+        DocumentBridgeError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+    })?;
     let rgba = img.to_rgba8();
     let (w, h) = rgba.dimensions();
     let palette = kcreate_ai::extract_palette(rgba.as_raw(), w, h, max_colors);
@@ -427,8 +434,9 @@ pub fn ai_smart_select(node_id: Uuid, x: u32, y: u32, tolerance: f64) -> Result<
         let meta: crate::scene_sync::RasterImageMeta = serde_json::from_value(meta_value.clone())?;
         blob_load(ws, &meta.blob_hash)
     })?;
-    let img = image::load_from_memory(&encoded)
-        .map_err(|e| DocumentBridgeError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))?;
+    let img = image::load_from_memory(&encoded).map_err(|e| {
+        DocumentBridgeError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+    })?;
     let rgba = img.to_rgba8();
     let (w, h) = rgba.dimensions();
     let mask = kcreate_ai::smart_select(rgba.as_raw(), w, h, x, y, tolerance);
@@ -444,9 +452,9 @@ pub struct ScreenshotRequest {
 }
 
 pub fn ai_screenshot_to_layout(req: &ScreenshotRequest) -> Result<String> {
-    let pixels = B64
-        .decode(req.image_base64.as_bytes())
-        .map_err(|e| DocumentBridgeError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e)))?;
+    let pixels = B64.decode(req.image_base64.as_bytes()).map_err(|e| {
+        DocumentBridgeError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+    })?;
     let elements = kcreate_ai::analyze_screenshot_for_layout(&pixels, req.width, req.height);
     Ok(serde_json::to_string(&elements)?)
 }

@@ -97,7 +97,8 @@ fn to_grayscale(pixels: &[u8], width: u32, height: u32) -> Vec<u8> {
     let mut out = Vec::with_capacity((width as usize) * (height as usize));
     for chunk in pixels.chunks_exact(4) {
         // Rec.601.
-        let y = 0.299 * f32::from(chunk[0]) + 0.587 * f32::from(chunk[1]) + 0.114 * f32::from(chunk[2]);
+        let y =
+            0.299 * f32::from(chunk[0]) + 0.587 * f32::from(chunk[1]) + 0.114 * f32::from(chunk[2]);
         out.push(y.round().clamp(0.0, 255.0) as u8);
     }
     out
@@ -112,14 +113,8 @@ fn sobel(gray: &[u8], width: u32, height: u32) -> Vec<u8> {
             let g = |dy: i32, dx: i32| -> i32 {
                 i32::from(gray[((y as i32 + dy) as usize) * w + ((x as i32 + dx) as usize)])
             };
-            let gx = -g(-1, -1) - 2 * g(0, -1) - g(1, -1)
-                + g(-1, 1)
-                + 2 * g(0, 1)
-                + g(1, 1);
-            let gy = -g(-1, -1) - 2 * g(-1, 0) - g(-1, 1)
-                + g(1, -1)
-                + 2 * g(1, 0)
-                + g(1, 1);
+            let gx = -g(-1, -1) - 2 * g(0, -1) - g(1, -1) + g(-1, 1) + 2 * g(0, 1) + g(1, 1);
+            let gy = -g(-1, -1) - 2 * g(-1, 0) - g(-1, 1) + g(1, -1) + 2 * g(1, 0) + g(1, 1);
             let mag = (gx.abs() + gy.abs()).min(255);
             out[y * w + x] = if mag >= EDGE_THRESHOLD { 255 } else { 0 };
         }
@@ -329,7 +324,10 @@ mod tests {
         // is one big region).
         let pixels = solid(200, 200, [255, 255, 255, 255]);
         let elements = analyze_screenshot_for_layout(&pixels, 200, 200);
-        assert!(elements.len() <= 2, "expected at most a small number of regions");
+        assert!(
+            elements.len() <= 2,
+            "expected at most a small number of regions"
+        );
     }
 
     #[test]
@@ -345,9 +343,10 @@ mod tests {
         let elements = analyze_screenshot_for_layout(&pixels, 200, 200);
         // At least one element classified as header / navigation.
         assert!(
-            elements
-                .iter()
-                .any(|e| matches!(e.element_type, ElementType::Header | ElementType::Navigation)),
+            elements.iter().any(|e| matches!(
+                e.element_type,
+                ElementType::Header | ElementType::Navigation
+            )),
             "expected a header/navigation classification, got {:?}",
             elements.iter().map(|e| e.element_type).collect::<Vec<_>>()
         );

@@ -40,11 +40,7 @@ pub fn smart_select(
     if pixels[seed_idx + 3] == 0 {
         return vec![0u8; total];
     }
-    let seed = [
-        pixels[seed_idx],
-        pixels[seed_idx + 1],
-        pixels[seed_idx + 2],
-    ];
+    let seed = [pixels[seed_idx], pixels[seed_idx + 1], pixels[seed_idx + 2]];
     let max_dist = tol * MAX_RGB_DIST;
 
     let mut mask = vec![0u8; total];

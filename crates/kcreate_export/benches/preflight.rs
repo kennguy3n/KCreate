@@ -27,12 +27,7 @@ fn build_document(num_pages: usize) -> DocumentGraph {
         for j in 0..6 {
             let mut layer = Node::new(NodeType::VectorLayer, format!("layer {j}"));
             layer.parent_id = Some(page_id);
-            layer.bounds = Bounds::new(
-                100.0 + f64::from(j) * 50.0,
-                100.0,
-                400.0,
-                400.0,
-            );
+            layer.bounds = Bounds::new(100.0 + f64::from(j) * 50.0, 100.0, 400.0, 400.0);
             doc.insert_node(layer).unwrap();
         }
 

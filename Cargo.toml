@@ -9,6 +9,7 @@ members = [
     "crates/kcreate_export",
     "crates/kcreate_raster",
     "crates/kcreate_text",
+    "crates/kcreate_layout",
     "crates/kcreate_ai",
     "crates/kcreate_mcp",
     "crates/kcreate_tests",

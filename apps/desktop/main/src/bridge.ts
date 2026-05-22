@@ -194,6 +194,12 @@ export interface Bridge {
   componentAddVariant(componentId: string, name: string): string;
   componentSwitchVariant(nodeId: string, variantId: string): void;
   componentDetach(nodeId: string): void;
+
+  // Auto-layout (Phase 1, Block C)
+  layoutSetFlex(nodeId: string, layoutJson: string): void;
+  layoutSetGrid(nodeId: string, layoutJson: string): void;
+  layoutRecompute(nodeId: string): void;
+  layoutConvertToFrame(nodeId: string): void;
 }
 
 function bridgeBinaryPath(): string {

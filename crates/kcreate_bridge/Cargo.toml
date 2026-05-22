@@ -32,6 +32,7 @@ kcreate_ai = { path = "../kcreate_ai" }
 # checks the default-feature dep tree.
 kcreate_mcp = { path = "../kcreate_mcp", optional = true }
 kcreate_text = { path = "../kcreate_text" }
+kcreate_layout = { path = "../kcreate_layout" }
 napi.workspace = true
 napi-derive.workspace = true
 parking_lot.workspace = true

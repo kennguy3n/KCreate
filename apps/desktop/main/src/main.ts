@@ -682,6 +682,27 @@ function registerIpcHandlers(): void {
       requireBridge().componentDetach(nodeId);
     },
   );
+  ipcMain.handle(
+    "kcreate/layout/setFlex",
+    (_e, nodeId: string, layoutJson: string): void => {
+      requireBridge().layoutSetFlex(nodeId, layoutJson);
+    },
+  );
+  ipcMain.handle(
+    "kcreate/layout/setGrid",
+    (_e, nodeId: string, layoutJson: string): void => {
+      requireBridge().layoutSetGrid(nodeId, layoutJson);
+    },
+  );
+  ipcMain.handle("kcreate/layout/recompute", (_e, nodeId: string): void => {
+    requireBridge().layoutRecompute(nodeId);
+  });
+  ipcMain.handle(
+    "kcreate/layout/convertToFrame",
+    (_e, nodeId: string): void => {
+      requireBridge().layoutConvertToFrame(nodeId);
+    },
+  );
 }
 
 void app.whenReady().then(() => {

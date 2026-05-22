@@ -181,6 +181,12 @@ export interface NodeInfo {
   visible: boolean;
   locked: boolean;
   componentInstance?: ComponentInstanceInfo;
+  /**
+   * Free-form metadata bag mirroring `Node::metadata` on the Rust side.
+   * Elided when empty. Used by panels that need structured payloads
+   * (e.g. the auto-layout config under the `"layout"` key).
+   */
+  metadata?: Record<string, unknown>;
 }
 
 /**
@@ -620,6 +626,58 @@ export interface ComponentInfo {
   modifiedAt: string;
 }
 
+/**
+ * Padding (one f64 per edge). Mirrors `kcreate_layout::Padding`.
+ */
+export interface LayoutPadding {
+  top: number;
+  right: number;
+  bottom: number;
+  left: number;
+}
+
+/**
+ * Flex layout config. Field names mirror `kcreate_layout::FlexLayout`
+ * (snake_case in the wire JSON the bridge expects).
+ */
+export interface FlexLayout {
+  direction: "row" | "column";
+  spacing: number;
+  padding: LayoutPadding;
+  alignment:
+    | "start"
+    | "center"
+    | "end"
+    | "space_between"
+    | "space_evenly";
+  cross_alignment: "start" | "center" | "end" | "stretch";
+  wrap: boolean;
+}
+
+/**
+ * Grid layout config. Mirrors `kcreate_layout::GridLayout`.
+ */
+export interface GridLayout {
+  columns: number;
+  row_gap: number;
+  column_gap: number;
+  padding: LayoutPadding;
+}
+
+export interface LayoutBridge {
+  /** Write a flex config onto a `LayoutFrame` node. */
+  setFlex(nodeId: string, config: FlexLayout): Promise<void>;
+  /** Write a grid config onto a `LayoutFrame` node. */
+  setGrid(nodeId: string, config: GridLayout): Promise<void>;
+  /**
+   * Recompute child positions for the LayoutFrame from its stored
+   * config. No-op if the node has no layout metadata.
+   */
+  recompute(nodeId: string): Promise<void>;
+  /** Promote a `GroupLayer` to a `LayoutFrame` so it can carry layout config. */
+  convertToFrame(nodeId: string): Promise<void>;
+}
+
 export interface ComponentBridge {
   /**
    * Convert the given (sibling-flat) selection into a new component
@@ -661,6 +719,7 @@ declare global {
       exportPreset: ExportPresetBridge;
       artboard: ArtboardBridge;
       component: ComponentBridge;
+      layout: LayoutBridge;
     };
   }
 }

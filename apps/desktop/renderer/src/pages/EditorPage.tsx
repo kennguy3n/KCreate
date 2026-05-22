@@ -17,6 +17,8 @@ import type {
   ArtboardPreset,
   ComponentInfo,
   DocumentStatus,
+  FlexLayout,
+  GridLayout,
   NodeInfo,
   ProjectInfo,
   Scene,
@@ -330,6 +332,46 @@ export function EditorPage({
         setStatusMessage(`detach component failed: ${errorMessage(e)}`);
       }
     },
+    [refreshTree],
+  );
+
+  const layoutHandlers = useMemo(
+    () => ({
+      setFlex: async (nodeId: string, config: FlexLayout) => {
+        try {
+          await window.kcreate.layout.setFlex(nodeId, config);
+          await refreshTree();
+        } catch (e) {
+          setStatusMessage(`set flex layout failed: ${errorMessage(e)}`);
+        }
+      },
+      setGrid: async (nodeId: string, config: GridLayout) => {
+        try {
+          await window.kcreate.layout.setGrid(nodeId, config);
+          await refreshTree();
+        } catch (e) {
+          setStatusMessage(`set grid layout failed: ${errorMessage(e)}`);
+        }
+      },
+      recompute: async (nodeId: string) => {
+        try {
+          await window.kcreate.layout.recompute(nodeId);
+          await refreshTree();
+        } catch (e) {
+          setStatusMessage(`layout recompute failed: ${errorMessage(e)}`);
+        }
+      },
+      convertToFrame: async (nodeId: string) => {
+        try {
+          await window.kcreate.layout.convertToFrame(nodeId);
+          await refreshTree();
+        } catch (e) {
+          setStatusMessage(
+            `layout convert to frame failed: ${errorMessage(e)}`,
+          );
+        }
+      },
+    }),
     [refreshTree],
   );
 
@@ -933,6 +975,7 @@ export function EditorPage({
             onRequestExport={() => {
               void handleExport();
             }}
+            layout={layoutHandlers}
           />
         )}
       </div>

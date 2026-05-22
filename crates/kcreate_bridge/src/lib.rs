@@ -961,3 +961,40 @@ pub fn component_detach(node_id: String) -> NapiResult<()> {
     let nid = parse_uuid(&node_id)?;
     document::component_detach(nid).map_err(map_doc_err)
 }
+
+// -----------------------------------------------------------------------------
+// Auto-layout (Block C)
+// -----------------------------------------------------------------------------
+
+/// Write a `FlexLayout` config (JSON) onto the given LayoutFrame.
+#[napi]
+pub fn layout_set_flex(node_id: String, layout_json: String) -> NapiResult<()> {
+    let nid = parse_uuid(&node_id)?;
+    let cfg: kcreate_layout::FlexLayout = serde_json::from_str(&layout_json)
+        .map_err(|e| NapiError::from_reason(format!("layout json: {e}")))?;
+    document::layout_set_flex(nid, cfg).map_err(map_doc_err)
+}
+
+/// Write a `GridLayout` config (JSON) onto the given LayoutFrame.
+#[napi]
+pub fn layout_set_grid(node_id: String, layout_json: String) -> NapiResult<()> {
+    let nid = parse_uuid(&node_id)?;
+    let cfg: kcreate_layout::GridLayout = serde_json::from_str(&layout_json)
+        .map_err(|e| NapiError::from_reason(format!("layout json: {e}")))?;
+    document::layout_set_grid(nid, cfg).map_err(map_doc_err)
+}
+
+/// Recompute child positions for a LayoutFrame from its layout config.
+#[napi]
+pub fn layout_recompute(node_id: String) -> NapiResult<()> {
+    let nid = parse_uuid(&node_id)?;
+    document::layout_recompute(nid).map_err(map_doc_err)
+}
+
+/// Convert a GroupLayer node into a LayoutFrame so it can carry an
+/// auto-layout config. No-op for already-LayoutFrame nodes.
+#[napi]
+pub fn layout_convert_to_frame(node_id: String) -> NapiResult<()> {
+    let nid = parse_uuid(&node_id)?;
+    document::layout_convert_to_frame(nid).map_err(map_doc_err)
+}

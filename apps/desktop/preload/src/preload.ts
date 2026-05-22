@@ -16,6 +16,9 @@ import type {
   ComponentBridge,
   ComponentInfo,
   CreateNodeProps,
+  FlexLayout,
+  GridLayout,
+  LayoutBridge,
   DesignTokens,
   DesignTokensBridge,
   DocumentBridge,
@@ -161,6 +164,9 @@ type NodeInfoSnake = {
     activeVariantId: string;
     overrides: Record<string, unknown>;
   };
+  /// Free-form metadata mirror of `Node::metadata`. Omitted when
+  /// empty (Rust skips serializing empty maps).
+  metadata?: Record<string, unknown>;
 };
 
 type RuntimeStatusSnake = {
@@ -191,6 +197,7 @@ function nodeFromSnake(n: NodeInfoSnake): NodeInfo {
     visible: n.visible,
     locked: n.locked,
     ...(n.componentInstance ? { componentInstance: n.componentInstance } : {}),
+    ...(n.metadata ? { metadata: n.metadata } : {}),
   };
 }
 
@@ -649,6 +656,29 @@ const component: ComponentBridge = {
   },
 };
 
+const layout: LayoutBridge = {
+  async setFlex(nodeId: string, config: FlexLayout): Promise<void> {
+    await ipcRenderer.invoke(
+      "kcreate/layout/setFlex",
+      nodeId,
+      JSON.stringify(config),
+    );
+  },
+  async setGrid(nodeId: string, config: GridLayout): Promise<void> {
+    await ipcRenderer.invoke(
+      "kcreate/layout/setGrid",
+      nodeId,
+      JSON.stringify(config),
+    );
+  },
+  async recompute(nodeId: string): Promise<void> {
+    await ipcRenderer.invoke("kcreate/layout/recompute", nodeId);
+  },
+  async convertToFrame(nodeId: string): Promise<void> {
+    await ipcRenderer.invoke("kcreate/layout/convertToFrame", nodeId);
+  },
+};
+
 contextBridge.exposeInMainWorld("kcreate", {
   renderer,
   document,
@@ -662,4 +692,5 @@ contextBridge.exposeInMainWorld("kcreate", {
   exportPreset,
   artboard,
   component,
+  layout,
 });

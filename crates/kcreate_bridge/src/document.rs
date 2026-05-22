@@ -24,6 +24,7 @@ use kcreate_core::operation::Operation;
 use kcreate_core::project::{BrandKit, DesignTokens, ExportPreset, Project, ProjectError};
 use kcreate_export::png::{export_png, PngExportError, PngExportOptions};
 use kcreate_export::svg::{export_svg_from_document, SvgDocumentExportError, SvgExportOptions};
+use kcreate_layout::{layout_flex, layout_grid, FlexLayout, GridLayout};
 use kcreate_storage::project_io::{ProjectStore, ProjectStoreError};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -67,6 +68,10 @@ pub enum DocumentBridgeError {
     InvalidComponentInstance(Uuid, String),
     #[error("expected a ComponentLayer node, got {0:?}")]
     WrongComponentNodeType(NodeType),
+    #[error("expected a LayoutFrame node, got {0:?}")]
+    WrongLayoutNodeType(NodeType),
+    #[error("layout config on node {0} is malformed: {1}")]
+    InvalidLayoutConfig(Uuid, String),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
     #[error(transparent)]
@@ -155,6 +160,12 @@ pub struct NodeInfo {
     /// Renderer panels read this to drive the variant switcher.
     #[serde(rename = "componentInstance", skip_serializing_if = "Option::is_none")]
     pub component_instance: Option<ComponentInstanceInfo>,
+    /// Free-form metadata bag (cloned from the underlying Node).
+    /// Always emitted as an object so the host can read structured
+    /// payloads like `layout` without a second round-trip — but
+    /// elided from the wire when empty to keep tree payloads small.
+    #[serde(skip_serializing_if = "HashMap::is_empty", default)]
+    pub metadata: HashMap<String, serde_json::Value>,
 }
 
 impl From<&Node> for NodeInfo {
@@ -180,6 +191,7 @@ impl From<&Node> for NodeInfo {
             visible: n.visible,
             locked: n.locked,
             component_instance,
+            metadata: n.metadata.clone(),
         }
     }
 }
@@ -1742,6 +1754,185 @@ fn next_artboard_x(doc: &DocumentGraph, page_id: Uuid) -> f64 {
 }
 
 // -----------------------------------------------------------------------------
+// Auto-layout (Block C)
+// -----------------------------------------------------------------------------
+
+/// Metadata key that stores a `LayoutFrame`'s active layout config
+/// as a JSON-serialized [`LayoutConfig`] payload.
+pub const LAYOUT_CONFIG_METADATA_KEY: &str = "layout";
+
+/// Tagged config that lives on a `LayoutFrame`. The `mode` tag lets
+/// the bridge dispatch to the right solver on
+/// [`layout_recompute`].
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum LayoutConfig {
+    Flex(FlexLayout),
+    Grid(GridLayout),
+}
+
+/// Write a flex layout config onto the given `LayoutFrame` node. The
+/// child positions are *not* recomputed by this call — invoke
+/// [`layout_recompute`] explicitly when ready (the host typically
+/// debounces recompute requests).
+pub fn layout_set_flex(node_id: Uuid, layout: FlexLayout) -> Result<()> {
+    write_layout_metadata(node_id, LayoutConfig::Flex(layout), "layout_set_flex")
+}
+
+/// Write a grid layout config onto the given `LayoutFrame` node.
+pub fn layout_set_grid(node_id: Uuid, layout: GridLayout) -> Result<()> {
+    write_layout_metadata(node_id, LayoutConfig::Grid(layout), "layout_set_grid")
+}
+
+fn write_layout_metadata(node_id: Uuid, config: LayoutConfig, op_kind: &str) -> Result<()> {
+    let mut guard = slot().lock();
+    let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
+    let before;
+    let after;
+    {
+        let node = ws
+            .project
+            .document
+            .get_node_mut(node_id)
+            .ok_or(DocumentBridgeError::NodeNotFound(node_id))?;
+        if node.node_type != NodeType::LayoutFrame {
+            return Err(DocumentBridgeError::WrongLayoutNodeType(node.node_type));
+        }
+        before = serde_json::to_value(&*node)?;
+        node.metadata.insert(
+            LAYOUT_CONFIG_METADATA_KEY.to_string(),
+            serde_json::to_value(config)?,
+        );
+        node.touch();
+        after = serde_json::to_value(&*node)?;
+    }
+    let op = Operation::new("user", op_kind, before, after, vec![node_id]);
+    ws.project.execute_operation(op);
+    let _ = sync_scene_locked(&mut guard);
+    drop(guard);
+    Ok(())
+}
+
+/// Recompute child positions on a `LayoutFrame`. Reads the layout
+/// config from the node's metadata, gathers child intrinsic sizes
+/// from their current bounds, runs the solver, then writes the new
+/// bounds back as a single undoable operation.
+///
+/// If the node has no layout metadata this is a no-op (returns Ok).
+/// If the metadata is malformed we surface
+/// [`DocumentBridgeError::InvalidLayoutConfig`] so the caller can
+/// recover (e.g. by re-running `layout_set_flex`).
+pub fn layout_recompute(node_id: Uuid) -> Result<()> {
+    let mut guard = slot().lock();
+    let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
+
+    // Stage 1: read everything we need under the lock — config,
+    // parent bounds, and the child ids+sizes — in one borrow.
+    let (config, parent_bounds, child_inputs): (LayoutConfig, _, Vec<(Uuid, f64, f64)>) = {
+        let node = ws
+            .project
+            .document
+            .get_node(node_id)
+            .ok_or(DocumentBridgeError::NodeNotFound(node_id))?;
+        if node.node_type != NodeType::LayoutFrame {
+            return Err(DocumentBridgeError::WrongLayoutNodeType(node.node_type));
+        }
+        let raw = match node.metadata.get(LAYOUT_CONFIG_METADATA_KEY) {
+            Some(v) => v.clone(),
+            None => return Ok(()),
+        };
+        let config: LayoutConfig = serde_json::from_value(raw)
+            .map_err(|e| DocumentBridgeError::InvalidLayoutConfig(node_id, e.to_string()))?;
+        let parent_bounds = node.bounds;
+        let mut inputs = Vec::with_capacity(node.children.len());
+        for cid in &node.children {
+            if let Some(c) = ws.project.document.get_node(*cid) {
+                inputs.push((*cid, c.bounds.width, c.bounds.height));
+            }
+        }
+        (config, parent_bounds, inputs)
+    };
+
+    // Stage 2: run the pure solver (no document mutation).
+    let placements = match config {
+        LayoutConfig::Flex(f) => layout_flex(parent_bounds, &child_inputs, &f),
+        LayoutConfig::Grid(g) => layout_grid(parent_bounds, &child_inputs, &g),
+    };
+
+    // Stage 3: apply the placements. We capture before/after of the
+    // *parent* node so a single undo restores the whole layout to
+    // its previous state — children's previous bounds are encoded
+    // in the operation's before snapshot via the parent's snapshot
+    // plus the child snapshots we also capture.
+    let mut before_children: Vec<serde_json::Value> = Vec::with_capacity(placements.len());
+    let mut after_children: Vec<serde_json::Value> = Vec::with_capacity(placements.len());
+    let mut affected: Vec<Uuid> = Vec::with_capacity(placements.len() + 1);
+    affected.push(node_id);
+    for (cid, new_bounds) in placements {
+        let child = ws
+            .project
+            .document
+            .get_node_mut(cid)
+            .ok_or(DocumentBridgeError::NodeNotFound(cid))?;
+        before_children.push(serde_json::to_value(&*child)?);
+        child.bounds = new_bounds;
+        child.touch();
+        after_children.push(serde_json::to_value(&*child)?);
+        affected.push(cid);
+    }
+    let before = serde_json::json!({
+        "config": config,
+        "children": before_children,
+    });
+    let after = serde_json::json!({
+        "config": config,
+        "children": after_children,
+    });
+    let op = Operation::new("user", "layout_recompute", before, after, affected);
+    ws.project.execute_operation(op);
+    let _ = sync_scene_locked(&mut guard);
+    drop(guard);
+    Ok(())
+}
+
+/// Convert a `GroupLayer` into a `LayoutFrame` so it can carry an
+/// auto-layout config. No-op if the node is already a `LayoutFrame`;
+/// returns an error for any other node type.
+pub fn layout_convert_to_frame(node_id: Uuid) -> Result<()> {
+    let mut guard = slot().lock();
+    let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
+    let before;
+    let after;
+    {
+        let node = ws
+            .project
+            .document
+            .get_node_mut(node_id)
+            .ok_or(DocumentBridgeError::NodeNotFound(node_id))?;
+        match node.node_type {
+            NodeType::LayoutFrame => return Ok(()),
+            NodeType::GroupLayer => {}
+            other => return Err(DocumentBridgeError::WrongLayoutNodeType(other)),
+        }
+        before = serde_json::to_value(&*node)?;
+        node.node_type = NodeType::LayoutFrame;
+        node.touch();
+        after = serde_json::to_value(&*node)?;
+    }
+    let op = Operation::new(
+        "user",
+        "layout_convert_to_frame",
+        before,
+        after,
+        vec![node_id],
+    );
+    ws.project.execute_operation(op);
+    let _ = sync_scene_locked(&mut guard);
+    drop(guard);
+    Ok(())
+}
+
+// -----------------------------------------------------------------------------
 // Canvas node transform (move)
 // -----------------------------------------------------------------------------
 
@@ -3288,6 +3479,194 @@ mod tests {
             err,
             DocumentBridgeError::WrongComponentNodeType(_)
         ));
+        project_close();
+    }
+
+    // ---- Auto-layout bridge tests (Block C) ----
+
+    fn setup_layout_project() -> (tempfile::TempDir, Uuid, Vec<Uuid>) {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("layout", dir.path()).expect("create");
+        let ab = artboard_create(None, "Page".into(), 800.0, 600.0).expect("artboard");
+        // Add a GroupLayer that we'll convert into a LayoutFrame.
+        let frame = document_create_node(
+            "GroupLayer",
+            Some(ab),
+            &CreateNodeProps {
+                name: Some("Frame".into()),
+                ..Default::default()
+            },
+        )
+        .expect("frame");
+        // Children with explicit sizes (set by reaching into the
+        // workspace — `document_create_node` doesn't accept bounds).
+        let kids: Vec<Uuid> = (0..3)
+            .map(|i| {
+                let id = document_create_node(
+                    "VectorLayer",
+                    Some(frame),
+                    &CreateNodeProps {
+                        name: Some(format!("R{i}")),
+                        ..Default::default()
+                    },
+                )
+                .expect("child");
+                {
+                    let mut g = slot().lock();
+                    let ws = g.as_mut().expect("ws");
+                    let n = ws.project.document.get_node_mut(id).expect("node");
+                    n.bounds = kcreate_core::node::Bounds::new(0.0, 0.0, 50.0, 30.0);
+                }
+                id
+            })
+            .collect();
+        // Give the frame an explicit size.
+        {
+            let mut g = slot().lock();
+            let ws = g.as_mut().expect("ws");
+            let n = ws.project.document.get_node_mut(frame).expect("frame node");
+            n.bounds = kcreate_core::node::Bounds::new(0.0, 0.0, 400.0, 200.0);
+        }
+        (dir, frame, kids)
+    }
+
+    #[test]
+    #[serial]
+    fn layout_convert_to_frame_promotes_group_layer() {
+        let (_dir, frame, _kids) = setup_layout_project();
+        layout_convert_to_frame(frame).expect("convert");
+        let tree = document_get_tree().expect("tree");
+        let frame_node = tree.iter().find(|n| n.id == frame).expect("frame node");
+        assert_eq!(frame_node.node_type, "LayoutFrame");
+        project_close();
+    }
+
+    #[test]
+    #[serial]
+    fn layout_convert_to_frame_rejects_non_group() {
+        let (_dir, _frame, kids) = setup_layout_project();
+        let err = layout_convert_to_frame(kids[0]).expect_err("vector layer is not group");
+        assert!(matches!(err, DocumentBridgeError::WrongLayoutNodeType(_)));
+        project_close();
+    }
+
+    #[test]
+    #[serial]
+    fn layout_set_flex_and_recompute_packs_children_in_a_row() {
+        let (_dir, frame, kids) = setup_layout_project();
+        layout_convert_to_frame(frame).expect("convert");
+        let cfg = kcreate_layout::FlexLayout {
+            direction: kcreate_layout::FlexDirection::Row,
+            spacing: 10.0,
+            ..kcreate_layout::FlexLayout::default()
+        };
+        layout_set_flex(frame, cfg).expect("set flex");
+        layout_recompute(frame).expect("recompute");
+
+        // Each child is 50px wide with 10px spacing → 0, 60, 120.
+        let g = slot().lock();
+        let ws = g.as_ref().expect("ws");
+        let expected = [0.0, 60.0, 120.0];
+        for (i, kid) in kids.iter().enumerate() {
+            let n = ws.project.document.get_node(*kid).expect("kid");
+            assert!(
+                (n.bounds.x - expected[i]).abs() < 1e-6,
+                "kid {i} x = {} != {}",
+                n.bounds.x,
+                expected[i],
+            );
+            assert!((n.bounds.y - 0.0).abs() < 1e-6);
+        }
+        drop(g);
+        project_close();
+    }
+
+    #[test]
+    #[serial]
+    fn layout_set_grid_and_recompute_distributes_children_into_columns() {
+        let (_dir, frame, kids) = setup_layout_project();
+        layout_convert_to_frame(frame).expect("convert");
+        // 3 children, 2 columns, no gaps → cell_w = 200, items at x =
+        // 0, 200, 0; rows at y = 0, 0, 30.
+        let cfg = kcreate_layout::GridLayout {
+            columns: 2,
+            row_gap: 0.0,
+            column_gap: 0.0,
+            padding: kcreate_layout::Padding::default(),
+        };
+        layout_set_grid(frame, cfg).expect("set grid");
+        layout_recompute(frame).expect("recompute");
+
+        let g = slot().lock();
+        let ws = g.as_ref().expect("ws");
+        let n0 = ws.project.document.get_node(kids[0]).expect("n0");
+        let n1 = ws.project.document.get_node(kids[1]).expect("n1");
+        let n2 = ws.project.document.get_node(kids[2]).expect("n2");
+        assert!((n0.bounds.x - 0.0).abs() < 1e-6);
+        assert!((n1.bounds.x - 200.0).abs() < 1e-6);
+        assert!((n2.bounds.x - 0.0).abs() < 1e-6);
+        assert!((n0.bounds.y - 0.0).abs() < 1e-6);
+        assert!((n2.bounds.y - 30.0).abs() < 1e-6);
+        drop(g);
+        project_close();
+    }
+
+    #[test]
+    #[serial]
+    fn layout_recompute_without_config_is_noop() {
+        let (_dir, frame, kids) = setup_layout_project();
+        layout_convert_to_frame(frame).expect("convert");
+        layout_recompute(frame).expect("noop");
+        // Children's bounds unchanged.
+        let g = slot().lock();
+        let ws = g.as_ref().expect("ws");
+        for kid in &kids {
+            let n = ws.project.document.get_node(*kid).expect("kid");
+            assert_eq!(n.bounds.x, 0.0);
+            assert_eq!(n.bounds.y, 0.0);
+        }
+        drop(g);
+        project_close();
+    }
+
+    #[test]
+    #[serial]
+    fn layout_set_flex_rejects_non_layout_frame() {
+        let (_dir, _frame, kids) = setup_layout_project();
+        let err = layout_set_flex(kids[0], kcreate_layout::FlexLayout::default())
+            .expect_err("vector layer");
+        assert!(matches!(err, DocumentBridgeError::WrongLayoutNodeType(_)));
+        project_close();
+    }
+
+    #[test]
+    #[serial]
+    fn layout_config_survives_save_and_reopen() {
+        let (dir, frame, _kids) = setup_layout_project();
+        layout_convert_to_frame(frame).expect("convert");
+        let cfg = kcreate_layout::FlexLayout {
+            direction: kcreate_layout::FlexDirection::Column,
+            spacing: 4.0,
+            ..kcreate_layout::FlexLayout::default()
+        };
+        layout_set_flex(frame, cfg).expect("set");
+        let project_path = project_info().expect("info").path;
+        project_save().expect("save");
+        project_close();
+        project_open(&project_path).expect("reopen");
+        // The layout metadata should still be on the frame.
+        let g = slot().lock();
+        let ws = g.as_ref().expect("ws");
+        let node = ws.project.document.get_node(frame).expect("frame");
+        let stored = node
+            .metadata
+            .get(LAYOUT_CONFIG_METADATA_KEY)
+            .expect("layout metadata");
+        let parsed: LayoutConfig = serde_json::from_value(stored.clone()).expect("config");
+        assert!(matches!(parsed, LayoutConfig::Flex(_)));
+        drop(g);
+        let _ = dir;
         project_close();
     }
 

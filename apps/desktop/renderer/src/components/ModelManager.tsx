@@ -10,7 +10,12 @@
 
 import { useCallback, useEffect, useState } from "react";
 
-import type { LlmStatus, ResourceLimits } from "../../../shared/scene";
+import type {
+  LlmStatus,
+  ModelPack,
+  ModelPackCategory,
+  ResourceLimits,
+} from "../../../shared/scene";
 import { colors, radius, spacing } from "../styles/tokens";
 
 export interface ModelManagerProps {
@@ -22,15 +27,18 @@ export function ModelManager({ onStatus }: ModelManagerProps): JSX.Element {
   const [limits, setLimits] = useState<ResourceLimits | null>(null);
   const [modelPath, setModelPath] = useState("");
   const [busy, setBusy] = useState(false);
+  const [packs, setPacks] = useState<ModelPack[]>([]);
 
   const refresh = useCallback(async () => {
     try {
-      const [s, l] = await Promise.all([
+      const [s, l, p] = await Promise.all([
         window.kcreate.llm.status(),
         window.kcreate.runtime.resourceLimits(),
+        window.kcreate.aiModel.listModelPacks(),
       ]);
       setStatus(s);
       setLimits(l);
+      setPacks(p);
     } catch (e) {
       onStatus(`model status: ${errMsg(e)}`);
     }
@@ -154,7 +162,118 @@ export function ModelManager({ onStatus }: ModelManagerProps): JSX.Element {
         Phase 1 does not bundle a download catalog. The sidecar binds
         to <code style={monoStyle}>127.0.0.1</code> only.
       </p>
+
+      <ModelPacksSection packs={packs} />
     </section>
+  );
+}
+
+function ModelPacksSection({
+  packs,
+}: {
+  packs: ModelPack[];
+}): JSX.Element {
+  if (packs.length === 0) {
+    return (
+      <p style={noteStyle}>Loading model packs…</p>
+    );
+  }
+  const installed = packs.filter((p) => p.installed);
+  const available = packs.filter((p) => !p.installed);
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: spacing.sm }}>
+      <h4 style={{ margin: 0, fontSize: 12, fontWeight: 600 }}>Model packs</h4>
+      {installed.length > 0 ? (
+        <PackGroup label="Installed" packs={installed} />
+      ) : null}
+      {available.length > 0 ? (
+        <PackGroup label="Available" packs={available} />
+      ) : null}
+    </div>
+  );
+}
+
+function PackGroup({
+  label,
+  packs,
+}: {
+  label: string;
+  packs: ModelPack[];
+}): JSX.Element {
+  return (
+    <section style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+      <span style={{ fontSize: 10, color: colors.textMuted, fontWeight: 600, textTransform: "uppercase", letterSpacing: 0.4 }}>{label}</span>
+      {packs.map((p) => (
+        <PackCard key={p.id} pack={p} />
+      ))}
+    </section>
+  );
+}
+
+function PackCard({ pack }: { pack: ModelPack }): JSX.Element {
+  return (
+    <article
+      style={{
+        padding: spacing.sm,
+        border: `1px solid ${colors.border}`,
+        borderRadius: radius.card,
+        background: colors.bg,
+        display: "flex",
+        alignItems: "center",
+        gap: spacing.sm,
+      }}
+    >
+      <div style={{ flex: 1, minWidth: 0 }}>
+        <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+          <strong style={{ fontSize: 12 }}>{pack.name}</strong>
+          <CategoryPill category={pack.category} />
+        </div>
+        <div
+          style={{
+            fontSize: 10,
+            color: colors.textMuted,
+            overflow: "hidden",
+            textOverflow: "ellipsis",
+            whiteSpace: "nowrap",
+          }}
+        >
+          {pack.capabilities.join(", ") || "—"}
+        </div>
+      </div>
+      <span style={{ fontSize: 10, color: colors.textMuted }}>
+        {pack.kind === "built_in"
+          ? "built-in"
+          : `${(pack.size_bytes / 1024 / 1024).toFixed(0)} MB`}
+      </span>
+    </article>
+  );
+}
+
+function CategoryPill({
+  category,
+}: {
+  category: ModelPackCategory;
+}): JSX.Element {
+  const labels: Record<ModelPackCategory, string> = {
+    core: "core",
+    image_pro: "image",
+    design_pro: "design",
+    generation: "gen",
+  };
+  return (
+    <span
+      style={{
+        padding: "1px 6px",
+        background: colors.bgSoft,
+        color: colors.accent,
+        borderRadius: radius.pill,
+        fontSize: 9,
+        fontWeight: 600,
+        textTransform: "uppercase",
+      }}
+    >
+      {labels[category]}
+    </span>
   );
 }
 

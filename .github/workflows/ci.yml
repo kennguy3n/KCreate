@@ -60,6 +60,7 @@ jobs:
       - name: cargo bench (compile only)
         run: |
           cargo bench -p kcreate_renderer --no-run
+          cargo bench -p kcreate_export --no-run
           cargo bench -p kcreate_raster --no-run
           cargo bench -p kcreate_ai --no-run
           cargo bench -p kcreate_layout --no-run
@@ -107,6 +108,7 @@ jobs:
       - name: cargo bench (compile only)
         run: |
           cargo bench -p kcreate_renderer --no-run
+          cargo bench -p kcreate_export --no-run
           cargo bench -p kcreate_raster --no-run
           cargo bench -p kcreate_ai --no-run
           cargo bench -p kcreate_layout --no-run

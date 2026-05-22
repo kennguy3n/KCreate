@@ -10,6 +10,7 @@ import type {
 import { colors, radius, spacing } from "../styles/tokens";
 import { AccessibilityPanel } from "./AccessibilityPanel";
 import { InteractionPanel } from "./InteractionPanel";
+import { PreflightPanel } from "./PreflightPanel";
 
 export type RightPanelTab =
   | "properties"
@@ -19,7 +20,8 @@ export type RightPanelTab =
   | "inspect"
   | "history"
   | "accessibility"
-  | "interaction";
+  | "interaction"
+  | "preflight";
 
 /// Tabs shown by default. Some tabs (Accessibility, Interaction) only
 /// appear when the active editor mode calls for them — gated below.
@@ -85,6 +87,7 @@ export function RightPanel({
 }: RightPanelProps): JSX.Element {
   const showAccessibility = mode === "design" || mode === "inspect";
   const showInteraction = mode === "prototype";
+  const showPreflight = mode === "layout" || mode === "export";
   // Memoize so the tab strip array identity is stable as long as the
   // mode-derived booleans don't change. Otherwise the spread allocates
   // a fresh array (and new option object literals) on every render,
@@ -100,8 +103,11 @@ export function RightPanel({
       ...(showInteraction
         ? [{ id: "interaction" as const, label: "Interaction" }]
         : []),
+      ...(showPreflight
+        ? [{ id: "preflight" as const, label: "Preflight" }]
+        : []),
     ],
-    [showAccessibility, showInteraction],
+    [showAccessibility, showInteraction, showPreflight],
   );
   const [tab, setTab] = useState<RightPanelTab>("properties");
   return (
@@ -199,6 +205,12 @@ export function RightPanel({
             tree={tree}
             onStatus={onStatus}
             onChanged={onInteractionsChanged}
+          />
+        ) : null}
+        {tab === "preflight" && showPreflight ? (
+          <PreflightPanel
+            onStatus={onStatus}
+            onSelectNode={onSelectNode}
           />
         ) : null}
       </div>

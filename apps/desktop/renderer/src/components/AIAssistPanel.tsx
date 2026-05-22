@@ -16,7 +16,9 @@ import { useState } from "react";
 import type { NodeInfo } from "../../../shared/scene";
 import { colors, radius, spacing } from "../styles/tokens";
 import { LlmChatPanel } from "./LlmChatPanel";
+import { McpSettingsPanel } from "./McpSettingsPanel";
 import { ModelManager } from "./ModelManager";
+import { PluginManager } from "./PluginManager";
 
 export interface AIAssistPanelProps {
   selectedNode: NodeInfo | null;
@@ -154,9 +156,19 @@ export function AIAssistPanel({
 
       <ModelManager onStatus={onStatus} />
       <LlmChatPanel onStatus={onStatus} />
+      <hr style={separatorStyle} />
+      <PluginManager onStatus={onStatus} />
+      <hr style={separatorStyle} />
+      <McpSettingsPanel onStatus={onStatus} />
     </aside>
   );
 }
+
+const separatorStyle: React.CSSProperties = {
+  border: "none",
+  borderTop: "1px solid #E5E7EB",
+  margin: "16px 0 8px",
+};
 
 function KV({
   label,

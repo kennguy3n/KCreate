@@ -15,6 +15,7 @@ import type {
   WebpExportOptions,
 } from "../../../shared/scene";
 import { colors, radius, spacing } from "../styles/tokens";
+import { IconPackDialog } from "./IconPackDialog";
 
 // One leaf job inside a preset. Each leaf is a single `export.*` call.
 interface PresetJob {
@@ -129,6 +130,7 @@ export function ExportPanel({
   const [lossless, setLossless] = useState(true);
   const [tempDir, setTempDir] = useState<string>("");
   const [running, setRunning] = useState(false);
+  const [iconPackOpen, setIconPackOpen] = useState(false);
 
   // Resolve a writable directory for export targets. The renderer
   // doesn't have filesystem access — the main process exposes a
@@ -410,6 +412,37 @@ export function ExportPanel({
         Files write to <code style={monoStyle}>{tempDir || "…"}</code>.
         Phase 1 will add a native save-as dialog.
       </p>
+
+      <hr
+        style={{
+          border: "none",
+          borderTop: `1px solid ${colors.border}`,
+          margin: `${spacing.md}px 0 ${spacing.xs}px`,
+        }}
+      />
+      <h3 style={presetHeaderStyle}>Icon pack</h3>
+      <p style={hintStyle}>
+        Render the selected node(s) to web / iOS / Android / favicon
+        icon size grids.
+      </p>
+      <button
+        type="button"
+        onClick={() => setIconPackOpen(true)}
+        style={presetBtn(false)}
+      >
+        <span style={{ fontWeight: 600 }}>Generate icon pack…</span>
+        <span style={{ fontSize: 10, color: colors.textMuted }}>
+          Multi-platform sizes via kcreate_export::icon_pack
+        </span>
+      </button>
+
+      {iconPackOpen ? (
+        <IconPackDialog
+          nodeIds={[]}
+          onClose={() => setIconPackOpen(false)}
+          onStatus={onStatus}
+        />
+      ) : null}
     </aside>
   );
 }

@@ -586,6 +586,64 @@ pub fn document_get_tree() -> Result<Vec<NodeInfo>> {
     Ok(out)
 }
 
+/// Serialise the open document into a compact JSON payload designed
+/// for LLM prompts that need per-node visual properties (colors,
+/// fonts, bounds, opacity, effects, blend modes).
+///
+/// The shape is `{ "project": "...", "nodes": [ { ...full props... } ] }`
+/// where each node carries `id`, `type`, `name`, `parent_id`,
+/// `children`, `bounds`, `opacity`, `blend_mode`, `visible`,
+/// `locked`, `effects`, and the raw `metadata` bag (where fills,
+/// strokes, fonts, and text live).
+///
+/// This is intentionally richer than [`document_get_tree`] — the
+/// layer-panel wire shape ([`NodeInfo`]) elides bounds / effects /
+/// transform to keep tree payloads small. LLM prompts for design-
+/// token extraction and accessibility audits need the visual data
+/// to produce useful output, so we walk the live `DocumentGraph`
+/// directly and serialise every visible property.
+pub fn document_serialise_for_ai() -> Result<String> {
+    let guard = slot().lock();
+    let ws = guard.as_ref().ok_or(DocumentBridgeError::NoProject)?;
+    let mut nodes = Vec::with_capacity(ws.project.document.node_count());
+    for root in ws.project.document.root_ids() {
+        push_subtree_full(&ws.project.document, *root, &mut nodes);
+    }
+    let payload = serde_json::json!({
+        "project": ws.project.name,
+        "nodes": nodes,
+    });
+    drop(guard);
+    Ok(serde_json::to_string(&payload)?)
+}
+
+fn push_subtree_full(doc: &DocumentGraph, id: Uuid, out: &mut Vec<serde_json::Value>) {
+    if let Some(node) = doc.get_node(id) {
+        out.push(serde_json::json!({
+            "id": node.id,
+            "type": node_type_name(node.node_type),
+            "name": node.name,
+            "parent_id": node.parent_id,
+            "children": node.children,
+            "bounds": {
+                "x": node.bounds.x,
+                "y": node.bounds.y,
+                "width": node.bounds.width,
+                "height": node.bounds.height,
+            },
+            "opacity": node.opacity,
+            "blend_mode": format!("{:?}", node.blend_mode),
+            "visible": node.visible,
+            "locked": node.locked,
+            "effects": node.effects,
+            "metadata": node.metadata,
+        }));
+        for child in &node.children {
+            push_subtree_full(doc, *child, out);
+        }
+    }
+}
+
 /// Compute the three inspect-mode code outputs (CSS, Tailwind,
 /// React inline style) for the node with `id`. The output is the
 /// same `InspectCode` struct emitted by `kcreate_export::code_gen`
@@ -3827,5 +3885,50 @@ mod tests {
         assert!(lr_depth <= before_depth, "{lr_depth} <= {before_depth}");
         low_resource_mode_set(before);
         project_close();
+    }
+
+    /// Regression guard for the LLM AI-task design-token / accessibility
+    /// flow: the AI prompts must see per-node visual properties
+    /// (bounds, opacity, blend mode, effects, metadata) — not just a
+    /// summary of layer-type counts. If a future refactor inadvertently
+    /// elides any of these from the AI payload, the prompts would
+    /// silently degrade. We pin the shape here.
+    #[test]
+    #[serial]
+    fn document_serialise_for_ai_emits_visual_properties() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("ai-demo", dir.path()).expect("create");
+        let tree = document_get_tree().expect("tree");
+        let page_id = tree[0].id;
+        let json = document_serialise_for_ai().expect("serialise");
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid json");
+        assert_eq!(parsed["project"], "ai-demo");
+        let nodes = parsed["nodes"].as_array().expect("nodes array");
+        // page + default artboard are emitted; both carry bounds and
+        // an explicit visibility flag.
+        assert!(!nodes.is_empty());
+        for n in nodes {
+            assert!(n["id"].is_string());
+            assert!(n["type"].is_string());
+            assert!(n["bounds"]["width"].is_number());
+            assert!(n["bounds"]["height"].is_number());
+            assert!(n["opacity"].is_number());
+            assert!(n["blend_mode"].is_string());
+            assert!(n["visible"].is_boolean());
+            assert!(n["effects"].is_array());
+            assert!(n["metadata"].is_object());
+        }
+        // The first emitted node is the root page.
+        assert_eq!(nodes[0]["id"], serde_json::json!(page_id));
+        project_close();
+    }
+
+    #[test]
+    #[serial]
+    fn document_serialise_for_ai_errors_without_project() {
+        reset_for_tests();
+        let err = document_serialise_for_ai().expect_err("no project");
+        assert!(matches!(err, DocumentBridgeError::NoProject));
     }
 }

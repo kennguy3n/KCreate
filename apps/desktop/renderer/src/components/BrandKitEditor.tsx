@@ -45,17 +45,25 @@ export function BrandKitEditor({
   const [kits, setKits] = useState<BrandKit[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
 
+  // Reload does not depend on `activeId`: we resolve the initial
+  // selection inside the functional `setActiveId` updater so the
+  // closure stays stable. Depending on `activeId` would cause the
+  // first mount to refetch twice (initial list → setActiveId →
+  // reload identity changes → useEffect re-fires).
   const reload = useCallback(() => {
     void (async () => {
       try {
         const next = await window.kcreate.brandKit.list();
         setKits(next);
-        if (next.length > 0 && !activeId && next[0]) setActiveId(next[0].id);
+        if (next.length > 0 && next[0]) {
+          const first = next[0];
+          setActiveId((prev) => prev ?? first.id);
+        }
       } catch (e) {
         onStatus(`Brand kit: load failed (${errMsg(e)})`);
       }
     })();
-  }, [activeId, onStatus]);
+  }, [onStatus]);
 
   useEffect(() => {
     reload();

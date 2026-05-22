@@ -239,7 +239,10 @@ fn push_text_css(out: &mut String, node: &Node) {
         if let Some(line_height) = raw.get("line_height").and_then(serde_json::Value::as_f64) {
             let _ = writeln!(out, "line-height: {};", trim(line_height));
         }
-        if let Some(letter_spacing) = raw.get("letter_spacing").and_then(serde_json::Value::as_f64) {
+        if let Some(letter_spacing) = raw
+            .get("letter_spacing")
+            .and_then(serde_json::Value::as_f64)
+        {
             let _ = writeln!(out, "letter-spacing: {};", px(letter_spacing));
         }
     }
@@ -430,7 +433,10 @@ fn react_push_text(entries: &mut Vec<(String, String)>, node: &Node) {
         if let Some(line_height) = raw.get("line_height").and_then(serde_json::Value::as_f64) {
             entries.push(("lineHeight".into(), trim(line_height)));
         }
-        if let Some(letter_spacing) = raw.get("letter_spacing").and_then(serde_json::Value::as_f64) {
+        if let Some(letter_spacing) = raw
+            .get("letter_spacing")
+            .and_then(serde_json::Value::as_f64)
+        {
             entries.push(("letterSpacing".into(), jsx_px(letter_spacing)));
         }
     }

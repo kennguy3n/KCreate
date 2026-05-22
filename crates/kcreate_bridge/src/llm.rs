@@ -24,7 +24,7 @@ use kcreate_ai::{
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
-use crate::document::{document_get_tree, project_info, NodeInfo};
+use crate::document::{document_get_tree, document_serialise_for_ai, project_info, NodeInfo};
 
 /// All error cases visible across the bridge.
 #[derive(Debug, thiserror::Error)]
@@ -292,11 +292,18 @@ pub fn ai_suggest_layer_names() -> LlmBridgeResult<LayerNamingResult> {
 
 /// Ask the LLM to extract design tokens (colors, fonts, spacing) from
 /// the open document. Returns the raw JSON reply.
+///
+/// The prompt is fed the **full** document JSON (per-node bounds,
+/// opacity, blend mode, effects, and metadata — where fills,
+/// strokes, fonts, and text live) rather than the human-readable
+/// summary used elsewhere. Token extraction can only find recurring
+/// colors / fonts / spacing values if it can see them; the
+/// per-layer-type-count summary erases exactly that signal.
 pub fn ai_extract_design_tokens() -> LlmBridgeResult<LlmJsonResult> {
-    let info = project_info().ok_or(LlmBridgeError::NoProject)?;
-    let tree = document_get_tree().map_err(|e| LlmBridgeError::Invalid(e.to_string()))?;
-    let summary = summarise_document(&info.name, &tree);
-    let req = build_design_token_prompt(&summary);
+    let _ = project_info().ok_or(LlmBridgeError::NoProject)?;
+    let document_json =
+        document_serialise_for_ai().map_err(|e| LlmBridgeError::Invalid(e.to_string()))?;
+    let req = build_design_token_prompt(&document_json);
     let port = ready_port()?;
     let resp = chat_completion(port, &req)?;
     Ok(LlmJsonResult {
@@ -308,11 +315,17 @@ pub fn ai_extract_design_tokens() -> LlmBridgeResult<LlmJsonResult> {
 
 /// Ask the LLM to audit the open document for accessibility issues.
 /// Returns the raw JSON reply.
+///
+/// Same rationale as [`ai_extract_design_tokens`]: the accessibility
+/// prompt asks for contrast / tap-target / font-size findings that
+/// require the LLM to see actual node colors, sizes, and font
+/// metadata. The full document JSON carries the visual properties
+/// the prompt template expects.
 pub fn ai_check_accessibility() -> LlmBridgeResult<LlmJsonResult> {
-    let info = project_info().ok_or(LlmBridgeError::NoProject)?;
-    let tree = document_get_tree().map_err(|e| LlmBridgeError::Invalid(e.to_string()))?;
-    let summary = summarise_document(&info.name, &tree);
-    let req = build_accessibility_prompt(&summary);
+    let _ = project_info().ok_or(LlmBridgeError::NoProject)?;
+    let document_json =
+        document_serialise_for_ai().map_err(|e| LlmBridgeError::Invalid(e.to_string()))?;
+    let req = build_accessibility_prompt(&document_json);
     let port = ready_port()?;
     let resp = chat_completion(port, &req)?;
     Ok(LlmJsonResult {

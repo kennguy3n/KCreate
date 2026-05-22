@@ -278,9 +278,16 @@ fn run_onnx_u2net(
         .try_extract_tensor::<f32>()
         .map_err(|e| format!("ort extract: {e}"))?;
     // u²-net outputs `d0` first which is the final mask, normalised.
+    // Restrict the min/max scan to the `d0` plane: if a future model
+    // emits a multi-plane tensor (e.g. all of d0..d6 concatenated),
+    // including auxiliary planes in the range would compress the
+    // mask's dynamic range and silently degrade output. The mask is
+    // built from exactly `&raw[..plane]`, so that's the range we
+    // normalise against.
+    let mask_plane = &raw[..plane];
     let mut min = f32::INFINITY;
     let mut max = f32::NEG_INFINITY;
-    for &v in raw {
+    for &v in mask_plane {
         if v < min {
             min = v;
         }
@@ -290,7 +297,7 @@ fn run_onnx_u2net(
     }
     let range = (max - min).max(1e-6);
     let mut mask_lo = Vec::with_capacity(plane);
-    for &v in &raw[..plane] {
+    for &v in mask_plane {
         let normalised = ((v - min) / range).clamp(0.0, 1.0);
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let byte = (normalised * 255.0) as u8;

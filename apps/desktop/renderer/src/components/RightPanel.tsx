@@ -9,6 +9,7 @@ import type {
 } from "../../../shared/scene";
 import { colors, radius, spacing } from "../styles/tokens";
 import { AccessibilityPanel } from "./AccessibilityPanel";
+import { ColorSettingsPanel } from "./ColorSettingsPanel";
 import { InteractionPanel } from "./InteractionPanel";
 import { PreflightPanel } from "./PreflightPanel";
 
@@ -21,7 +22,8 @@ export type RightPanelTab =
   | "history"
   | "accessibility"
   | "interaction"
-  | "preflight";
+  | "preflight"
+  | "color";
 
 /// Tabs shown by default. Some tabs (Accessibility, Interaction) only
 /// appear when the active editor mode calls for them — gated below.
@@ -88,6 +90,12 @@ export function RightPanel({
   const showAccessibility = mode === "design" || mode === "inspect";
   const showInteraction = mode === "prototype";
   const showPreflight = mode === "layout" || mode === "export";
+  // Color management lives next to Preflight because the two share
+  // the print-bound mental model (working CMYK profile, soft-proof,
+  // gamut warning). It's also useful in design mode for picking
+  // wide-gamut RGB working spaces (Display P3, Adobe RGB).
+  const showColor =
+    mode === "layout" || mode === "export" || mode === "design";
   // Memoize so the tab strip array identity is stable as long as the
   // mode-derived booleans don't change. Otherwise the spread allocates
   // a fresh array (and new option object literals) on every render,
@@ -106,8 +114,9 @@ export function RightPanel({
       ...(showPreflight
         ? [{ id: "preflight" as const, label: "Preflight" }]
         : []),
+      ...(showColor ? [{ id: "color" as const, label: "Color" }] : []),
     ],
-    [showAccessibility, showInteraction, showPreflight],
+    [showAccessibility, showInteraction, showPreflight, showColor],
   );
   const [tab, setTab] = useState<RightPanelTab>("properties");
   return (
@@ -212,6 +221,9 @@ export function RightPanel({
             onStatus={onStatus}
             onSelectNode={onSelectNode}
           />
+        ) : null}
+        {tab === "color" && showColor ? (
+          <ColorSettingsPanel onStatus={onStatus} />
         ) : null}
       </div>
     </aside>

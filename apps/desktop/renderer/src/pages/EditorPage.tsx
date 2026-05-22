@@ -4,6 +4,7 @@ import { CanvasHost, type ViewportState } from "../components/CanvasHost";
 import { LeftPanel } from "../components/LeftPanel";
 import { PageNavigator } from "../components/PageNavigator";
 import { RightPanel } from "../components/RightPanel";
+import { SoftProofOverlay } from "../components/SoftProofOverlay";
 import { TemplatePicker } from "../components/TemplatePicker";
 import {
   TopBar,
@@ -1107,6 +1108,14 @@ export function EditorPage({
             onZoomToFit={onZoomToFit}
             cursor={cursor}
           />
+          {/*
+            Phase 2 soft-proof / gamut-warning overlay. Reads the
+            project's color settings via `window.kcreate.color` and
+            renders a CSS-filter wash on top of the canvas. Renders
+            nothing when both features are disabled, so the offscreen
+            wgpu path remains the source of truth for exports.
+          */}
+          <SoftProofOverlay />
           <div
             style={{
               position: "absolute",

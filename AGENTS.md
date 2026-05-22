@@ -14,25 +14,41 @@ KCreate/
 │   │                        no napi — safe to depend on anywhere)
 │   ├── kcreate_renderer/    pure Rust: offscreen wgpu pipeline + CPU
 │   │                        fallback (tiny-skia) + presenter
-│   ├── kcreate_bridge/      napi-rs cdylib (renderer + document + export
-│   │                        IPC). Logic in state.rs / document.rs;
-│   │                        lib.rs is a thin N-API marshalling layer
+│   ├── kcreate_bridge/      napi-rs cdylib (renderer + document + export +
+│   │                        phase2 IPC). Logic in state.rs / document.rs /
+│   │                        phase2.rs; lib.rs is a thin N-API marshalling
+│   │                        layer. native_canvas.rs lives behind the
+│   │                        `native_canvas` feature flag (only place in
+│   │                        the tree where `unsafe_code` is allowed).
 │   ├── kcreate_vector/      path math, boolean ops (i_overlay), SVG
 │   │                        import (usvg), SVG export, R-tree spatial
 │   │                        index (rstar)
 │   ├── kcreate_storage/     SQLite (rusqlite, bundled), content-addressed
 │   │                        BLAKE3 blob store, .kstudio/ project I/O
-│   ├── kcreate_export/      PNG / SVG / PDF / WebP / JPEG export, plus
-│   │                        batch export driver
+│   ├── kcreate_export/      PNG / SVG / PDF / WebP / JPEG export, batch
+│   │                        driver (parallel + async cancel), PDF
+│   │                        preflight, icon pack generator, inspect-mode
+│   │                        code-gen (CSS / Tailwind / React)
 │   ├── kcreate_raster/      tile engine, masks, adjustment layers (Phase 1)
 │   ├── kcreate_text/        font discovery (fontdb), shaping (rustybuzz),
 │   │                        outline walking (ttf-parser) → renderer paths
 │   ├── kcreate_ai/          local AI task router, action log, bg removal
 │   │                        (threshold + ONNX u2net), LLM sidecar lifecycle
-│   │                        (`llm_sidecar.rs`), loopback chat (`llm_chat.rs`)
+│   │                        (`llm_sidecar.rs`), loopback chat (`llm_chat.rs`),
+│   │                        Lanczos3 upscale, k-means palette extraction,
+│   │                        BFS flood-fill smart-select, model pack
+│   │                        registry, screenshot-to-layout (edge detect +
+│   │                        connected components + heuristics)
 │   ├── kcreate_layout/      pure flex + grid solvers (no DOM, no side effects)
 │   ├── kcreate_mcp/         loopback-only MCP server (tiny_http JSON-RPC,
-│   │                        3 tools: list_artboards, create_node, export_artboard)
+│   │                        3 tools: list_artboards, create_node, export_artboard;
+│   │                        gated by `permissions::McpPermissionStore` —
+│   │                        Once / Always / Denied, JSON on-disk)
+│   ├── kcreate_plugin/      WASM plugin sandbox (wasmi 0.42, deny-by-default
+│   │                        host ABI: kcreate_log, kcreate_get_input{,_len},
+│   │                        kcreate_set_output; page-count ResourceLimiter;
+│   │                        no FS / network / DOM access). manifest +
+│   │                        registry persist enabled state to JSON.
 │   └── kcreate_tests/       cross-crate integration tests (no library
 │                            surface — see tests/ subdir)
 ├── apps/
@@ -49,7 +65,7 @@ KCreate/
 └── .github/workflows/ci.yml fast lane (ubuntu + node) + gated cross-platform matrix (macos-13 + windows-2022, opt-in via `full-ci` label / `[full-ci]` in commit msg / push to main / workflow_dispatch). Every job has `timeout-minutes`.
 ```
 
-## Phase 0 contract
+## Architecture contract
 
 - Rust owns the **entire rendering pipeline** (scene graph → display list →
   GPU commands → readback) from day 1. The Electron renderer never runs
@@ -133,3 +149,29 @@ pnpm lint
 | Tweak the canvas presentation surface    | `apps/desktop/renderer/src/components/CanvasHost.tsx` |
 | Add a UI page / panel                    | `apps/desktop/renderer/src/pages/` or `components/` |
 | Cross-crate integration test             | `crates/kcreate_tests/tests/`                      |
+| Native canvas handle interpretation      | `crates/kcreate_bridge/src/native_canvas.rs`        |
+| Prototype interactions (core)            | `crates/kcreate_core/src/node.rs` (Interaction types) |
+| Prototype interactions (bridge)          | `crates/kcreate_bridge/src/document.rs` (`interaction_add/remove/list/list_batch`) |
+| Page layout / master pages               | `crates/kcreate_core/src/node.rs` (PageLayout types) + `crates/kcreate_core/src/project.rs` (templates) |
+| PageNavigator panel                      | `apps/desktop/renderer/src/components/PageNavigator.tsx` |
+| TemplatePicker panel                     | `apps/desktop/renderer/src/components/TemplatePicker.tsx` |
+| AccessibilityPanel                       | `apps/desktop/renderer/src/components/AccessibilityPanel.tsx` |
+| PrototypePlayer                          | `apps/desktop/renderer/src/components/PrototypePlayer.tsx` |
+| InteractionPanel                         | `apps/desktop/renderer/src/components/InteractionPanel.tsx` |
+| PDF preflight                            | `crates/kcreate_export/src/preflight.rs`           |
+| Icon pack generation                     | `crates/kcreate_export/src/icon_pack.rs`           |
+| Parallel batch + async cancel            | `crates/kcreate_export/src/batch.rs` (`run_batch_parallel`) |
+| AI upscale (Lanczos3)                    | `crates/kcreate_ai/src/upscale.rs`                 |
+| AI palette extraction (k-means)          | `crates/kcreate_ai/src/palette.rs`                 |
+| AI smart-select (BFS flood-fill)         | `crates/kcreate_ai/src/smart_select.rs`            |
+| AI model pack registry                   | `crates/kcreate_ai/src/model_registry.rs`          |
+| Screenshot-to-layout                     | `crates/kcreate_ai/src/screenshot_to_layout.rs`    |
+| Plugin manifest / registry               | `crates/kcreate_plugin/src/{manifest,registry}.rs` |
+| WASM plugin execution                    | `crates/kcreate_plugin/src/wasm_runtime.rs`        |
+| MCP permissions                          | `crates/kcreate_mcp/src/permissions.rs`            |
+| Phase 2 N-API marshalling                | thin wrapper in `kcreate_bridge/src/lib.rs`, logic in `phase2.rs` |
+| PreflightPanel                           | `apps/desktop/renderer/src/components/PreflightPanel.tsx` |
+| IconPackDialog                           | `apps/desktop/renderer/src/components/IconPackDialog.tsx` |
+| PluginManager                            | `apps/desktop/renderer/src/components/PluginManager.tsx` |
+| McpSettingsPanel                         | `apps/desktop/renderer/src/components/McpSettingsPanel.tsx` |
+| ScreenshotToLayout                       | `apps/desktop/renderer/src/components/ScreenshotToLayout.tsx` |

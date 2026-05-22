@@ -24,6 +24,12 @@ flowchart TB
         storage[kcreate_storage]
         vector[kcreate_vector]
         export[kcreate_export]
+        raster[kcreate_raster]
+        text[kcreate_text]
+        layout_rs[kcreate_layout]
+        ai_rs[kcreate_ai]
+        mcp_rs[kcreate_mcp]
+        plugin[kcreate_plugin]
     end
 
     subgraph ai[AI sidecar]
@@ -38,13 +44,18 @@ flowchart TB
     bridge --> renderer_rs
     bridge --> storage
     bridge --> export
+    bridge --> ai_rs
+    bridge --> layout_rs
+    bridge --> plugin
     core --> vector
     renderer_rs --> core
     storage --> core
     export --> core
     export --> renderer_rs
     export --> vector
+    mcp_rs --> core
     bridge -. spawn .-> ai
+    ai_rs -. spawn .-> ai
 ```
 
 ## 8. Process model
@@ -62,9 +73,11 @@ KCreate runs in up to five distinct processes:
    OpenAI-compatible `/v1/chat/completions` against `llama-server`).
    Lifecycle managed by `kcreate_ai::llm_sidecar::LlmSidecar`. Runs at
    a lower priority and is killable independently of the editor.
-5. **Optional MCP server** (Phase 1+) — local-loopback server that
-   exposes a permissioned set of editor tools to AI agents (Devin,
-   Claude, local agents).
+5. **MCP server** — local-loopback server (built, `kcreate_mcp`).
+   Exposes `list_artboards`, `create_node`, `export_artboard` via
+   JSON-RPC on `127.0.0.1:<port>`. Gated by an `McpPermissionStore`
+   (`kcreate_mcp::permissions`) which persists per-client / per-tool
+   grants (`Once` / `Always` / `Denied`) to JSON on disk.
 
 The renderer process never imports native code. The bridge cdylib lives
 in the Electron main process only.
@@ -250,11 +263,13 @@ Scene ──► invalidate ──► dirty region tracker
                                          Presenter (triple-buffered)
 ```
 
-### Raster tile engine (planned, Phase 1)
+### Raster tile engine
 
-Tiles of 256×256 (configurable). Memory budget driven by
+Implemented in `kcreate_raster::tile::TileGrid`. Tiles of 256×256
+(configurable). Memory budget driven by
 `RuntimeConfig::max_raster_cache_mb`. Tiles are produced lazily and
-cached LRU; pan only invalidates uncovered regions.
+cached LRU; pan only invalidates uncovered regions. Dirty-tile
+tracking for incremental updates.
 
 ### Vector engine
 
@@ -272,16 +287,20 @@ cached LRU; pan only invalidates uncovered regions.
   developer-friendly SVG with explicit `viewBox`, no superfluous
   groups, and compact path data.
 
-### Text engine (planned, Phase 1)
+### Text engine
 
-Font discovery via system APIs (`CoreText`, DirectWrite, FontConfig).
-Shaping with `rustybuzz`. Glyph atlas built lazily, GPU-uploaded once.
+Implemented in `kcreate_text`. Font discovery via `fontdb`
+(bitmap-only fonts skipped). Shaping with `rustybuzz`. Outline
+walking via `ttf-parser` produces `VectorPath` data fed directly into
+the renderer (`ObjectKind::Text`). Glyph atlas built lazily,
+GPU-uploaded once.
 
-### Layout engine (planned, Phase 1)
+### Layout engine
 
-Frame-level flex/grid. Constraint solver for responsive frames. Reuses
-the dirty-region tracker so a single token change repaints only the
-affected layers.
+Implemented in `kcreate_layout`. Pure-Rust flex + grid solvers. No
+DOM, no side effects — the solver consumes a `LayoutNode` tree and
+returns computed boxes. Reuses the renderer's dirty-region tracker
+so a single token change repaints only the affected layers.
 
 ### CPU / GPU support by platform
 
@@ -386,6 +405,146 @@ Permission model: every tool call surfaces a dialog the first time it
 is invoked from a new client; the user can grant once / always / deny.
 Granted permissions are scoped per project.
 
+## 16a. Prototype / interaction model
+
+Every node in `kcreate_core::node::Node` may carry zero or more
+`Interaction`s, each of which is an `(InteractionTrigger,
+InteractionAction)` pair:
+
+- `InteractionTrigger::{Click, Hover, Drag, AfterDelay(ms)}`
+- `InteractionAction::{NavigateToArtboard(uuid), OpenUrl(String),
+  Close, Toggle(uuid)}`
+
+The bridge exposes `interaction_add`, `interaction_remove`,
+`interaction_list`, and a batched `interaction_list_batch` (so
+`PrototypePlayer` can pre-warm every reachable artboard in one
+round-trip). The renderer treats interactions as inert metadata —
+only `PrototypePlayer.tsx` consumes them, overlaying the canvas in a
+fullscreen modal during prototype mode.
+
+## 16b. Layout Studio page model
+
+`kcreate_core` ships a print-aware page document model:
+
+- `PageLayout { size, orientation, margins, bleed_mm, master_id }`
+- `PageSize::{A4, A3, A5, Letter, Legal, Tabloid, Custom { w, h }}`
+- `PageOrientation::{Portrait, Landscape}`
+- `Margins { top, right, bottom, left }`
+
+Pages can reference a *master* page; the bridge functions
+`master_create / master_list / master_apply / master_detach`
+keep child pages aligned to the master's nodes until a child is
+explicitly detached. Three built-in templates ship in
+`kcreate_core::project::templates`: Pitch Deck, Proposal, Brochure.
+
+## 16c. Native canvas lifecycle
+
+The native canvas path lives in
+`kcreate_bridge/src/native_canvas.rs` behind the `native_canvas`
+feature flag. It is the only place in the tree where
+`#![allow(unsafe_code)]` is permitted (workspace lint denies it
+everywhere else). Window handles arrive as a typed
+`PlatformHandle::{AppKitWindow, Win32Window, XlibWindow,
+XcbWindow}`; Wayland is declined gracefully (no SHM-buffer path yet),
+falling back to the offscreen presenter.
+
+The Electron window's `close` event hooks into the bridge to switch
+the renderer back to offscreen mode before the window is destroyed,
+so the renderer never holds a dangling platform handle. Linux X11
+and XCB are supported; Linux Wayland declines to native and stays
+on the offscreen path.
+
+## 16d. PDF preflight pipeline
+
+`kcreate_export::preflight::run_preflight(document, pages, options)`
+runs six independent checks over a slice of pages:
+
+1. `BleedMargin` — content layers extending into the bleed zone
+   without explicit bleed extension produce a warning.
+2. `FontEmbed` — every `TextLayer` is resolved against the local
+   `fontdb`; missing fonts produce an error.
+3. `ImageResolution` — every `RasterLayer` is checked against
+   `target_dpi`; under-resolution produces a warning, severe
+   under-resolution an error.
+4. `ColorSpace` — RGB fills against a CMYK target produce a warning
+   (Phase 3 will add auto-conversion).
+5. `Transparency` — opacity / blend mode != Normal under a
+   non-transparency-aware target produces a warning.
+6. `PageSize` — non-standard `Custom` page sizes produce an info.
+
+Each check returns `PreflightIssue { check, severity, message,
+affected_node_id }`. The UI surfaces issues grouped by severity in
+`PreflightPanel`.
+
+## 16e. AI model pack registry
+
+`kcreate_ai::model_registry::list_model_packs()` returns a curated
+list of `ModelPack { id, name, category, kind, capabilities,
+size_bytes, file_path, installed }`. `category` is one of
+`Core`, `ImagePro`, `DesignPro`, `Generation`. `kind` is `BuiltIn`
+(zero-disk pure-Rust impl), `Onnx` (downloaded ONNX file), or
+`Sidecar` (LLM via the long-running sidecar process). Built-in
+packs (Lanczos upscale, k-means palette, threshold bg-removal, BFS
+smart-select) are always installed; ONNX / sidecar packs compute
+`installed` by probing the local `models_dir`. Phase 2 declares
+neural alternatives (ESRGAN, u2net, SAM); the actual download flow
+is deferred to Phase 3.
+
+## 16f. MCP permission store
+
+`kcreate_mcp::permissions::McpPermissionStore` keeps a
+`HashMap<(ClientId, ToolName), McpPermission>`. Each
+`McpPermission` carries one of
+`PermissionGrant::{Once, Always, Denied}` and a `DateTime<Utc>`.
+The server gates every tool call against the store; `Once` grants
+are consumed via `consume_if_once` after a successful call so the
+next request prompts again. The store persists to JSON on disk so
+grants survive restarts. The UI is `McpSettingsPanel.tsx`.
+
+## 16g. Screenshot-to-layout pipeline
+
+`kcreate_ai::screenshot_to_layout::analyze_screenshot_for_layout`:
+
+1. Convert RGBA8 → grayscale.
+2. Apply a Sobel operator → magnitude per pixel.
+3. Threshold edges.
+4. BFS connected-component labelling extracts bounding boxes.
+5. Classify each region by aspect-ratio + position heuristics
+   (wide+top = Header, wide+bottom = Footer, small+centred = Button,
+   …) into `ElementType::{Header, Navigation, Hero, TextBlock,
+   Image, Button, Card, Footer, Sidebar, Form, List}`.
+
+Output is `Vec<DetectedElement>`. Phase 3 will add an LLM
+refinement pass for ambiguous classifications.
+
+## 16h. Plugin crate architecture
+
+`kcreate_plugin` ships three sibling modules:
+
+- `manifest`: `PluginManifest { id, name, version, author,
+  description, plugin_type, entry_point, permissions }`,
+  `PluginType::{Wasm, JsPanel, Native}`,
+  `PluginPermission::{ReadDocument, WriteDocument, ReadAssets,
+  ExportFiles, NetworkAccess}` (network is denied by default).
+- `registry`: `PluginRegistry::scan(plugin_dir)` walks
+  `<plugin_dir>/*/manifest.json` and loads each manifest. Enable
+  state persists to `<plugin_dir>/.enabled.json`.
+- `wasm_runtime`: wraps a `wasmi::Engine`. Plugins compile to a
+  `Module` and execute under a deny-by-default sandbox
+  (`memory_limit_pages`, no FS, no network, no host imports beyond
+  the three intrinsics below). Host ABI:
+  * `kcreate_log(ptr, len)` — append to the plugin log buffer.
+  * `kcreate_get_input_len() -> u32`, `kcreate_get_input(ptr, len)
+    -> u32` — read the caller-supplied input JSON into plugin
+    memory.
+  * `kcreate_set_output(ptr, len)` — set the output JSON returned
+    to the caller.
+
+Bridge entry points: `plugin_list`, `plugin_enable`,
+`plugin_disable`, `plugin_execute(id, function, input_json)`. The
+Phase 2 wire format is intentionally JSON-only; a richer typed API
+(read_document, transform_path, …) lands in Phase 3.
+
 ## 17. Plugin types and runtime (Phase 2+)
 
 | Tier     | Runtime          | Capabilities                           | Trust                  |
@@ -419,20 +578,37 @@ Granted permissions are scoped per project.
 
 ```
 crates/
-├── kcreate_core/        # Shared types, node model, document graph, operation log, config
-├── kcreate_renderer/    # offscreen wgpu pipeline + CPU fallback + native surface  [EXISTS]
-├── kcreate_bridge/      # N-API cdylib (renderer + document + export IPC)    [EXISTS]
-├── kcreate_vector/      # Path math, boolean ops, SVG import/export, R-tree
-├── kcreate_storage/     # SQLite + content-addressed blob store + .kstudio I/O
-├── kcreate_export/      # PNG / SVG / PDF / WebP / JPEG export + batch + inspect code-gen
-├── kcreate_raster/      # tile engine, masks, adjustment layers              [EXISTS]
-├── kcreate_text/        # font discovery (fontdb), shaping (rustybuzz)       [EXISTS]
-├── kcreate_ai/          # task router, bg-removal (threshold + ONNX), LLM sidecar  [EXISTS]
-├── kcreate_layout/      # flex + grid solvers (pure, deterministic)          [EXISTS]
-└── kcreate_mcp/         # local-loopback MCP server (3 tools)                [EXISTS]
+├── kcreate_core/        # Shared types, node model, document graph, operation log, config  [EXISTS]
+├── kcreate_renderer/    # offscreen wgpu pipeline + CPU fallback + native surface          [EXISTS]
+├── kcreate_bridge/      # N-API cdylib (renderer + document + export + phase2 IPC).
+│                        # `native_canvas.rs` lives behind the `native_canvas` feature
+│                        # flag (only place in the tree where `unsafe_code` is allowed).
+│                        # `phase2.rs` houses every Phase 2 surface — preflight,
+│                        # icon pack, batch async, AI model packs, plugin runtime,
+│                        # MCP permission store, screenshot-to-layout — so `lib.rs`
+│                        # stays a thin N-API marshalling layer.                            [EXISTS]
+├── kcreate_vector/      # Path math, boolean ops, SVG import/export, R-tree                [EXISTS]
+├── kcreate_storage/     # SQLite + content-addressed blob store + .kstudio I/O             [EXISTS]
+├── kcreate_export/      # PNG / SVG / PDF / WebP / JPEG export, batch (parallel +
+│                        # async cancel via `Arc<AtomicBool>`), inspect code-gen,
+│                        # PDF preflight, icon pack generator                                [EXISTS]
+├── kcreate_raster/      # tile engine, masks, adjustment layers                            [EXISTS]
+├── kcreate_text/        # font discovery (fontdb), shaping (rustybuzz)                     [EXISTS]
+├── kcreate_ai/          # task router, bg-removal (threshold + ONNX u2net), LLM sidecar
+│                        # lifecycle (`llm_sidecar.rs`), loopback chat (`llm_chat.rs`),
+│                        # Lanczos3 upscale, k-means palette extraction, BFS flood-fill
+│                        # smart-select, model pack registry, screenshot-to-layout
+│                        # (edge detect + connected components + heuristic classifier)      [EXISTS]
+├── kcreate_layout/      # flex + grid solvers (pure, deterministic)                        [EXISTS]
+├── kcreate_mcp/         # local-loopback MCP server (3 tools) + `permissions::McpPermissionStore`
+│                        # (Once / Always / Denied, JSON on-disk persistence)               [EXISTS]
+└── kcreate_plugin/      # WASM plugin sandbox (wasmi 0.42, deny-by-default host ABI:
+                         # kcreate_log, kcreate_get_input{,_len}, kcreate_set_output;
+                         # page-count ResourceLimiter; no FS / network / DOM access).
+                         # Manifest + registry persist enabled state to JSON.               [EXISTS]
 ```
 
-Planned (Phase 2+):
+Planned (Phase 3+):
 
 ```
 crates/
@@ -469,6 +645,23 @@ crates/
 | Native surface foundation    | Built    | `crates/kcreate_renderer/src/native_surface.rs`      |
 | Artboard management          | Built    | `crates/kcreate_core/src/document.rs` (artboard fns) |
 | Component system             | Built    | `crates/kcreate_core/src/component.rs`               |
+| Prototype interactions       | Built    | `crates/kcreate_core/src/node.rs` + `crates/kcreate_bridge/src/document.rs` |
+| Layout Studio page model     | Built    | `crates/kcreate_core/src/{node,project}.rs`          |
+| Master pages                 | Built    | `crates/kcreate_bridge/src/document.rs`              |
+| Native canvas handle         | Built    | `crates/kcreate_bridge/src/native_canvas.rs`         |
+| Accessibility checker        | Built    | `apps/desktop/renderer/src/components/AccessibilityPanel.tsx` |
+| PDF preflight                | Built    | `crates/kcreate_export/src/preflight.rs`             |
+| Icon pack generator          | Built    | `crates/kcreate_export/src/icon_pack.rs`             |
+| Parallel batch + cancel      | Built    | `crates/kcreate_export/src/batch.rs` (`run_batch_parallel`) |
+| AI Lanczos upscale           | Built    | `crates/kcreate_ai/src/upscale.rs`                   |
+| AI k-means palette           | Built    | `crates/kcreate_ai/src/palette.rs`                   |
+| AI flood-fill smart-select   | Built    | `crates/kcreate_ai/src/smart_select.rs`              |
+| AI model pack registry       | Built    | `crates/kcreate_ai/src/model_registry.rs`            |
+| Screenshot-to-layout         | Built    | `crates/kcreate_ai/src/screenshot_to_layout.rs`      |
+| Plugin manifest / registry   | Built    | `crates/kcreate_plugin/src/{manifest,registry}.rs`   |
+| WASM plugin runtime          | Built    | `crates/kcreate_plugin/src/wasm_runtime.rs` (wasmi 0.42) |
+| MCP permission store         | Built    | `crates/kcreate_mcp/src/permissions.rs`              |
+| Phase 2 bridge surface       | Built    | `crates/kcreate_bridge/src/phase2.rs`                |
 
 ### Recommended Rust dependencies
 
@@ -481,7 +674,7 @@ Added in this phase:
 
 | Crate       | Purpose                                                                 |
 | ----------- | ----------------------------------------------------------------------- |
-| `chrono`    | Timestamps with timezone awareness for operation log.                   |
+| `chrono`    | Timestamps with timezone awareness for operation log and MCP permissions. |
 | `rusqlite`  | SQLite (bundled feature, statically linked).                            |
 | `blake3`    | Content-addressed hashing for the blob store.                           |
 | `kurbo`     | Path math (Bezier evaluation, derivatives, lengths).                    |
@@ -493,12 +686,17 @@ Added in this phase:
 | `ureq`      | Blocking HTTP client for the loopback LLM sidecar (`127.0.0.1` only).   |
 | `ort`       | ONNX Runtime bindings for u2net background-removal model.               |
 | `raw-window-handle` | Window-handle abstraction for the Phase 1 native swapchain surface. |
+| `rayon`     | Row-parallel Lanczos resampling, parallel batch export driver.          |
+| `printpdf`  | PDF generation for the Phase 0 export pipeline.                         |
+| `rustybuzz` | Text shaping for `kcreate_text`.                                        |
+| `fontdb`    | Font discovery for `kcreate_text` (bitmap-only fonts skipped).          |
+| `base64`    | Base64 round-trip for AI image bridges and screenshot-to-layout.        |
+| `tiny_http` | Loopback JSON-RPC for the MCP server.                                   |
+| `wasmi`     | Pure-Rust WASM runtime for the plugin sandbox (no LLVM, no system deps). |
 
-Planned for Phase 1+:
+Planned for Phase 3+:
 
 | Crate         | Purpose                              |
 | ------------- | ------------------------------------ |
-| `rayon`       | Data-parallel filter passes.         |
 | `resvg`       | Render SVG to raster for previews.   |
-| `lopdf` / `printpdf` | PDF read / write.             |
-| `rustybuzz`   | Text shaping.                        |
+| `lopdf`       | PDF *read* (we already ship `printpdf` for write). |

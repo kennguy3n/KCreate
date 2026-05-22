@@ -74,6 +74,16 @@ pub fn init(width: u32, height: u32) -> Result<RendererInfo> {
 }
 
 /// Shut down the renderer (no-op if not initialized).
+///
+/// Each `*slot().lock() = None;` statement is an acquire-then-drop:
+/// the lock guard's lifetime ends at the semicolon, so we never hold
+/// two of `{native_slot, slot, scene_slot}` at the same time here.
+/// The render path (which DOES co-hold multiple guards) acquires in
+/// the strict order `slot -> native_slot -> scene_slot`, and because
+/// shutdown holds zero of those simultaneously, the orders can't
+/// invert. Don't refactor this into a helper that takes all three
+/// guards at once without re-reading the deadlock analysis on the
+/// `Comment 54` thread of PR #5.
 pub fn shutdown() {
     #[cfg(feature = "native_canvas")]
     {

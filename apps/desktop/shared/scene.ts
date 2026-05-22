@@ -466,6 +466,64 @@ export interface McpBridge {
   isRunning(): Promise<boolean>;
 }
 
+/** Role of a chat message in the LLM conversation. */
+export type LlmRole = "system" | "user" | "assistant";
+
+/** One message in an LLM conversation. */
+export interface LlmMessage {
+  role: LlmRole;
+  content: string;
+}
+
+/** Reply payload returned by an LLM chat call. */
+export interface LlmReply {
+  content: string;
+  tokens_used: number;
+  model: string;
+}
+
+/**
+ * LLM sidecar status. The `state` field is a tagged union; only
+ * `ready` carries `model_name` / `context_size` / `port`, and only
+ * `error` carries `error`.
+ */
+export interface LlmStatus {
+  state: "stopped" | "starting" | "ready" | "error";
+  model_name: string | null;
+  context_size: number | null;
+  port: number | null;
+  error: string | null;
+}
+
+/**
+ * Bridge to the local LLM sidecar (`llama-server` from the
+ * `kennguy3n/llama.cpp` fork). All traffic stays on loopback
+ * (`127.0.0.1`) and the sidecar is opt-in — `start()` must be
+ * called before any chat operation succeeds.
+ */
+export interface LlmBridge {
+  /** Spawn the sidecar with the GGUF model at `modelPath`. */
+  start(modelPath: string): Promise<number>;
+  /** Stop the sidecar. Idempotent. */
+  stop(): Promise<void>;
+  /** Current sidecar status. */
+  status(): Promise<LlmStatus>;
+  /**
+   * Run a synchronous chat completion. Requires the sidecar to be
+   * `ready`; otherwise the promise rejects.
+   */
+  chat(
+    messages: LlmMessage[],
+    maxTokens: number,
+    temperature: number,
+  ): Promise<LlmReply>;
+  /**
+   * Run a context-aware "suggest improvements" prompt over the
+   * current selection (or whole document if nothing is selected).
+   */
+  suggestForSelection(): Promise<LlmReply>;
+}
+
 // -----------------------------------------------------------------------------
 // Design tokens / brand kits / export presets (Task 19)
 //
@@ -736,6 +794,7 @@ declare global {
       document: DocumentBridge;
       canvas: CanvasBridge;
       ai: AiBridge;
+      llm: LlmBridge;
       mcp: McpBridge;
       runtime: RuntimeBridge;
       export: ExportBridge;

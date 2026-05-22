@@ -18,6 +18,7 @@
 
 pub mod document;
 pub mod hit_test;
+pub mod llm;
 pub mod scene_sync;
 pub mod state;
 pub mod wire;
@@ -471,6 +472,57 @@ pub fn resource_limits() -> NapiResult<String> {
     let limits = document::resource_limits();
     serde_json::to_string(&limits)
         .map_err(|e| NapiError::from_reason(format!("resource_limits: {e}")))
+}
+
+// =============================================================================
+// LLM bridge
+// =============================================================================
+
+fn map_llm_err(e: llm::LlmBridgeError) -> NapiError {
+    NapiError::new(Status::GenericFailure, e.to_string())
+}
+
+/// Start the LLM sidecar pointed at `model_path`. Returns the
+/// loopback port on success.
+#[napi]
+pub fn llm_start(model_path: String) -> NapiResult<u32> {
+    let port = llm::llm_start(PathBuf::from(model_path)).map_err(map_llm_err)?;
+    Ok(u32::from(port))
+}
+
+/// Stop the LLM sidecar. Idempotent.
+#[napi]
+pub fn llm_stop() {
+    llm::llm_stop();
+}
+
+/// JSON-encoded sidecar status.
+#[napi]
+pub fn llm_status() -> NapiResult<String> {
+    serde_json::to_string(&llm::llm_status())
+        .map_err(|e| NapiError::from_reason(format!("llm_status: {e}")))
+}
+
+/// JSON-encoded chat completion. Input is a JSON array of
+/// `{role, content}` objects.
+#[napi]
+pub fn llm_chat(messages_json: String, max_tokens: u32, temperature: f64) -> NapiResult<String> {
+    let messages: Vec<llm::LlmMessage> = serde_json::from_str(&messages_json)
+        .map_err(|e| NapiError::new(Status::InvalidArg, format!("llm_chat messages: {e}")))?;
+    #[allow(clippy::cast_possible_truncation)]
+    let reply =
+        llm::llm_chat(messages, max_tokens as usize, temperature as f32).map_err(map_llm_err)?;
+    serde_json::to_string(&reply)
+        .map_err(|e| NapiError::from_reason(format!("llm_chat encode: {e}")))
+}
+
+/// JSON-encoded "suggest improvements" output for the current
+/// selection or document.
+#[napi]
+pub fn llm_suggest_for_selection() -> NapiResult<String> {
+    let reply = llm::llm_suggest_for_selection().map_err(map_llm_err)?;
+    serde_json::to_string(&reply)
+        .map_err(|e| NapiError::from_reason(format!("llm_suggest encode: {e}")))
 }
 
 /// Snapshot of the open document's editing state.

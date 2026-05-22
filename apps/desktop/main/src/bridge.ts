@@ -103,6 +103,11 @@ export interface Bridge {
   lowResourceModeGet(): boolean;
   lowResourceModeSet(enabled: boolean): void;
   resourceLimits(): string;
+  llmStart(modelPath: string): number;
+  llmStop(): void;
+  llmStatus(): string;
+  llmChat(messagesJson: string, maxTokens: number, temperature: number): string;
+  llmSuggestForSelection(): string;
   exportSvg(nodeIds: string[], optionsJson: string): string;
   exportPng(outputPath: string, optionsJson: string): number;
   exportPdf(outputPath: string, optionsJson: string): number;

@@ -29,6 +29,10 @@ import type {
   ExportPresetBridge,
   FrameInfo,
   JpegExportOptions,
+  LlmBridge,
+  LlmMessage,
+  LlmReply,
+  LlmStatus,
   McpBridge,
   NodeInfo,
   PdfExportOptions,
@@ -507,6 +511,39 @@ const ai: AiBridge = {
   },
 };
 
+const llm: LlmBridge = {
+  async start(modelPath: string): Promise<number> {
+    return (await ipcRenderer.invoke(
+      "kcreate/llm/start",
+      modelPath,
+    )) as number;
+  },
+  async stop(): Promise<void> {
+    await ipcRenderer.invoke("kcreate/llm/stop");
+  },
+  async status(): Promise<LlmStatus> {
+    const raw = (await ipcRenderer.invoke("kcreate/llm/status")) as string;
+    return JSON.parse(raw) as LlmStatus;
+  },
+  async chat(
+    messages: LlmMessage[],
+    maxTokens: number,
+    temperature: number,
+  ): Promise<LlmReply> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/llm/chat",
+      JSON.stringify(messages),
+      maxTokens,
+      temperature,
+    )) as string;
+    return JSON.parse(raw) as LlmReply;
+  },
+  async suggestForSelection(): Promise<LlmReply> {
+    const raw = (await ipcRenderer.invoke("kcreate/llm/suggest")) as string;
+    return JSON.parse(raw) as LlmReply;
+  },
+};
+
 const mcp: McpBridge = {
   async start(): Promise<number> {
     return (await ipcRenderer.invoke("kcreate/mcp/start")) as number;
@@ -724,6 +761,7 @@ contextBridge.exposeInMainWorld("kcreate", {
   document,
   canvas,
   ai,
+  llm,
   mcp,
   runtime,
   export: exportApi,

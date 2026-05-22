@@ -62,3 +62,8 @@ cpu-only = ["kcreate_renderer/cpu-only"]
 # default so the editing path stays free of networking libraries; the
 # Electron host enables this when packaging the release binary.
 mcp = ["dep:kcreate_mcp"]
+# Enable the LLM sidecar bridge (loopback-only HTTP to `llama-server`).
+# Off by default for the same reason as `mcp`: the editing-path
+# deny-list check runs without features, so default builds stay
+# network-free. The Electron host enables this for release binaries.
+llm = ["kcreate_ai/llm_sidecar"]

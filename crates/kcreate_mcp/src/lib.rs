@@ -18,10 +18,12 @@
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 
+pub mod permissions;
 pub mod protocol;
 pub mod server;
 pub mod tools;
 
+pub use permissions::{McpPermission, McpPermissionStore, PermissionGrant, PermissionStoreError};
 pub use protocol::{JsonRpcError, JsonRpcRequest, JsonRpcResponse};
 pub use server::{McpError, McpServer};
 pub use tools::{

@@ -291,6 +291,37 @@ export interface Bridge {
     newParent: string | undefined,
     index: number,
   ): void;
+
+  // Phase 2 — print preflight, icon pack, async batch, AI extras,
+  // plugin sandbox, MCP permission persistence.
+  preflightRun(requestJson: string): string;
+  exportIconPack(requestJson: string): string;
+  exportIconPackBuiltInPlatforms(): string;
+  exportBatchStart(jobJson: string): string;
+  exportBatchStatus(jobId: string): string;
+  exportBatchCancel(jobId: string): void;
+  aiUpscale(nodeId: string, scale: number): string;
+  aiExtractPalette(nodeId: string, maxColors: number): string;
+  aiSmartSelect(
+    nodeId: string,
+    x: number,
+    y: number,
+    tolerance: number,
+  ): string;
+  aiListModelPacks(): string;
+  aiScreenshotToLayout(requestJson: string): string;
+  pluginList(): string;
+  pluginEnable(id: string): void;
+  pluginDisable(id: string): void;
+  pluginExecute(id: string, function_: string, input: string): string;
+  mcpPermissionList(): string;
+  mcpPermissionGrant(
+    clientId: string,
+    toolName: string,
+    grant: string,
+  ): void;
+  mcpPermissionRevoke(clientId: string, toolName: string): void;
+  mcpStatus(): string;
 }
 
 function bridgeBinaryPath(): string {

@@ -1,28 +1,25 @@
 [package]
-name = "kcreate_mcp"
+name = "kcreate_plugin"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-description = "Local loopback MCP server (HTTP JSON-RPC) exposing three tools"
+description = "Sandboxed WASM plugin runtime for KCreate (wasmi-backed)"
 
 [lints]
 workspace = true
 
 [dependencies]
+wasmi.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-uuid.workspace = true
 log.workspace = true
-parking_lot.workspace = true
-tiny_http.workspace = true
-chrono.workspace = true
-kcreate_core = { path = "../kcreate_core" }
-kcreate_storage = { path = "../kcreate_storage" }
-kcreate_export = { path = "../kcreate_export" }
 
 [dev-dependencies]
 tempfile.workspace = true
+# `wat` is only used in tests to compile inline WAT modules into the
+# WASM bytes our runtime executes — production never depends on it.
+wat = "1"

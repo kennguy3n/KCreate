@@ -88,9 +88,9 @@ pub type Result<T> = std::result::Result<T, DocumentBridgeError>;
 
 /// Open project = in-memory state + on-disk store, plus the
 /// bookkeeping needed for incremental persistence.
-struct Workspace {
-    project: Project,
-    store: ProjectStore,
+pub(crate) struct Workspace {
+    pub(crate) project: Project,
+    pub(crate) store: ProjectStore,
     /// Set of operation ids already written to the on-disk store.
     ///
     /// Tracking by id (not by index) is the only correct option once
@@ -117,6 +117,66 @@ struct Workspace {
 fn slot() -> &'static Mutex<Option<Workspace>> {
     static WS: OnceLock<Mutex<Option<Workspace>>> = OnceLock::new();
     WS.get_or_init(|| Mutex::new(None))
+}
+
+/// Run `f` against the open workspace under a read-style lock. The
+/// caller closure must not call back into other workspace-locking
+/// functions or it will deadlock. Used by `phase2.rs` so that crate
+/// of bridge entry points doesn't need to know about [`Workspace`]'s
+/// private field layout.
+pub(crate) fn with_workspace<R>(f: impl FnOnce(&Workspace) -> Result<R>) -> Result<R> {
+    let guard = slot().lock();
+    let ws = guard.as_ref().ok_or(DocumentBridgeError::NoProject)?;
+    f(ws)
+}
+
+/// Mutable counterpart of [`with_workspace`]. The caller closure must
+/// not re-lock the workspace.
+pub(crate) fn with_workspace_mut<R>(f: impl FnOnce(&mut Workspace) -> Result<R>) -> Result<R> {
+    let mut guard = slot().lock();
+    let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
+    f(ws)
+}
+
+/// Load a blob by hash from the open workspace's content-addressed
+/// store. Pulled out so `phase2.rs` does not need to know about the
+/// `ProjectStore` API surface.
+pub(crate) fn blob_load(ws: &Workspace, hash: &str) -> Result<Vec<u8>> {
+    ws.store
+        .blobs()
+        .load(hash)
+        .map_err(|e| DocumentBridgeError::Io(std::io::Error::other(e.to_string())))
+}
+
+/// Sync the renderer scene from the current workspace. Used after
+/// `phase2.rs` mutates the document so the canvas updates immediately.
+/// Failures are logged but not propagated — the next renderer init +
+/// sync recovers the state, matching the pattern used elsewhere in
+/// this module.
+pub(crate) fn sync_scene_after_change() {
+    let mut guard = slot().lock();
+    let _ = sync_scene_locked(&mut guard);
+}
+
+/// Lock-free snapshot of the current renderer scene. Wraps
+/// [`crate::state::current_scene`] so `phase2.rs` does not need to
+/// reach into `state.rs` directly.
+pub(crate) fn current_scene_safe() -> Result<kcreate_renderer::Scene> {
+    Ok(crate::state::current_scene()?)
+}
+
+/// Loopback port of the running MCP server, if any. Used by
+/// `phase2.rs::mcp_status`.
+#[cfg(feature = "mcp")]
+#[must_use]
+pub fn mcp_port() -> Option<u32> {
+    kcreate_mcp::server::port().map(u32::from)
+}
+
+#[cfg(not(feature = "mcp"))]
+#[must_use]
+pub const fn mcp_port() -> Option<u32> {
+    None
 }
 
 /// Test-only helper to reset the singleton between serial tests.

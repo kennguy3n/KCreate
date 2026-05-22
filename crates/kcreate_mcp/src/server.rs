@@ -218,6 +218,16 @@ pub fn is_running() -> bool {
     slot.as_ref().is_some_and(McpServer::is_running)
 }
 
+/// Returns the loopback TCP port of the process-global MCP server,
+/// or `None` when it is not running. The McpSettingsPanel UI uses
+/// this so the user can see what port to point external MCP clients
+/// at without restarting the server.
+#[must_use]
+pub fn port() -> Option<u16> {
+    let slot = global().lock();
+    slot.as_ref().filter(|s| s.is_running()).map(McpServer::port)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

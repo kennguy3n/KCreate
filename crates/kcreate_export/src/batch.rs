@@ -93,7 +93,7 @@ pub enum BatchExportError {
 }
 
 /// Mid-run progress snapshot reported by [`run_batch_parallel`].
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[allow(clippy::derive_partial_eq_without_eq)]
 pub struct BatchProgress {
     pub completed: usize,

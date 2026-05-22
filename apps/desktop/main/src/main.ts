@@ -944,6 +944,84 @@ function registerIpcHandlers(): void {
       );
     },
   );
+
+  // ---------------------------------------------------------------------
+  // Phase 2 — preflight, icon pack, batch async, AI extras, plugins, MCP perms.
+  // ---------------------------------------------------------------------
+  ipcMain.handle("kcreate/preflight/run", (_e, requestJson: string) =>
+    requireBridge().preflightRun(requestJson),
+  );
+  ipcMain.handle(
+    "kcreate/export/iconPack",
+    (_e, requestJson: string) => requireBridge().exportIconPack(requestJson),
+  );
+  ipcMain.handle("kcreate/export/iconPack/builtInPlatforms", () =>
+    requireBridge().exportIconPackBuiltInPlatforms(),
+  );
+  ipcMain.handle("kcreate/export/batch/start", (_e, jobJson: string) =>
+    requireBridge().exportBatchStart(jobJson),
+  );
+  ipcMain.handle("kcreate/export/batch/status", (_e, jobId: string) =>
+    requireBridge().exportBatchStatus(jobId),
+  );
+  ipcMain.handle("kcreate/export/batch/cancel", (_e, jobId: string) => {
+    requireBridge().exportBatchCancel(jobId);
+  });
+  ipcMain.handle(
+    "kcreate/ai/upscale",
+    (_e, nodeId: string, scale: number) =>
+      requireBridge().aiUpscale(nodeId, scale),
+  );
+  ipcMain.handle(
+    "kcreate/ai/extractPalette",
+    (_e, nodeId: string, maxColors: number) =>
+      requireBridge().aiExtractPalette(nodeId, maxColors),
+  );
+  ipcMain.handle(
+    "kcreate/ai/smartSelect",
+    (_e, nodeId: string, x: number, y: number, tolerance: number) =>
+      requireBridge().aiSmartSelect(nodeId, x, y, tolerance),
+  );
+  ipcMain.handle("kcreate/ai/listModelPacks", () =>
+    requireBridge().aiListModelPacks(),
+  );
+  ipcMain.handle(
+    "kcreate/ai/screenshotToLayout",
+    (_e, requestJson: string) =>
+      requireBridge().aiScreenshotToLayout(requestJson),
+  );
+  ipcMain.handle("kcreate/plugin/list", () =>
+    requireBridge().pluginList(),
+  );
+  ipcMain.handle("kcreate/plugin/enable", (_e, id: string) => {
+    requireBridge().pluginEnable(id);
+  });
+  ipcMain.handle("kcreate/plugin/disable", (_e, id: string) => {
+    requireBridge().pluginDisable(id);
+  });
+  ipcMain.handle(
+    "kcreate/plugin/execute",
+    (_e, id: string, fn: string, input: string) =>
+      requireBridge().pluginExecute(id, fn, input),
+  );
+  ipcMain.handle("kcreate/mcp/permission/list", () =>
+    requireBridge().mcpPermissionList(),
+  );
+  ipcMain.handle(
+    "kcreate/mcp/permission/grant",
+    (_e, clientId: string, toolName: string, grant: string) => {
+      requireBridge().mcpPermissionGrant(clientId, toolName, grant);
+    },
+  );
+  ipcMain.handle(
+    "kcreate/mcp/permission/revoke",
+    (_e, clientId: string, toolName: string) => {
+      requireBridge().mcpPermissionRevoke(clientId, toolName);
+    },
+  );
+  ipcMain.handle("kcreate/mcp/status", () =>
+    requireBridge().mcpStatus(),
+  );
 }
 
 void app.whenReady().then(() => {

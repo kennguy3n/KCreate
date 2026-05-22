@@ -15,6 +15,7 @@ import { ArtboardDialog } from "../components/ArtboardDialog";
 import type {
   ArtboardInfo,
   ArtboardPreset,
+  ComponentInfo,
   DocumentStatus,
   NodeInfo,
   ProjectInfo,
@@ -74,6 +75,7 @@ export function EditorPage({
     [],
   );
   const [artboardDialogOpen, setArtboardDialogOpen] = useState(false);
+  const [components, setComponents] = useState<ComponentInfo[]>([]);
   const lastTickAtRef = useRef<number>(performance.now());
   // Drag-to-create / drag-to-move state. Storing in a ref keeps the
   // pointer handler stable while still tracking the current drag.
@@ -120,6 +122,15 @@ export function EditorPage({
     }
   }, []);
 
+  const refreshComponents = useCallback(async () => {
+    try {
+      const list = await window.kcreate.component.list();
+      setComponents(list);
+    } catch (e) {
+      setStatusMessage(`component list failed: ${errorMessage(e)}`);
+    }
+  }, []);
+
   const refreshTree = useCallback(async () => {
     try {
       const tree = await window.kcreate.document.getDocumentTree();
@@ -130,7 +141,8 @@ export function EditorPage({
     await refreshStatus();
     await refreshSelection();
     await refreshArtboards();
-  }, [refreshStatus, refreshSelection, refreshArtboards]);
+    await refreshComponents();
+  }, [refreshStatus, refreshSelection, refreshArtboards, refreshComponents]);
 
   // Initial load + on-mode-change resync.
   useEffect(() => {
@@ -240,6 +252,82 @@ export function EditorPage({
         await refreshTree();
       } catch (e) {
         setStatusMessage(`rename artboard failed: ${errorMessage(e)}`);
+      }
+    },
+    [refreshTree],
+  );
+
+  // Component lifecycle handlers. Each one mirrors a single bridge
+  // call and then refreshes both the tree and the component list so
+  // the panel stays in sync.
+  const handleComponentCreateFromSelection = useCallback(
+    async (name: string) => {
+      if (selectedIds.length === 0) {
+        setStatusMessage("select one or more sibling nodes first");
+        return;
+      }
+      try {
+        await window.kcreate.component.createFromSelection(selectedIds, name);
+        await refreshTree();
+      } catch (e) {
+        setStatusMessage(`create component failed: ${errorMessage(e)}`);
+      }
+    },
+    [selectedIds, refreshTree],
+  );
+
+  const handleComponentInstantiate = useCallback(
+    async (componentId: string) => {
+      // Default to the first artboard (or null = project root) so
+      // newly-placed instances land somewhere visible. (x, y) is the
+      // top-left of the new layer relative to that parent.
+      const parentId = artboards[0]?.id ?? null;
+      try {
+        await window.kcreate.component.instantiate(
+          componentId,
+          parentId,
+          80,
+          80,
+        );
+        await refreshTree();
+      } catch (e) {
+        setStatusMessage(`instantiate component failed: ${errorMessage(e)}`);
+      }
+    },
+    [artboards, refreshTree],
+  );
+
+  const handleComponentAddVariant = useCallback(
+    async (componentId: string, name: string) => {
+      try {
+        await window.kcreate.component.addVariant(componentId, name);
+        await refreshComponents();
+      } catch (e) {
+        setStatusMessage(`add variant failed: ${errorMessage(e)}`);
+      }
+    },
+    [refreshComponents],
+  );
+
+  const handleComponentSwitchVariant = useCallback(
+    async (nodeId: string, variantId: string) => {
+      try {
+        await window.kcreate.component.switchVariant(nodeId, variantId);
+        await refreshTree();
+      } catch (e) {
+        setStatusMessage(`switch variant failed: ${errorMessage(e)}`);
+      }
+    },
+    [refreshTree],
+  );
+
+  const handleComponentDetach = useCallback(
+    async (nodeId: string) => {
+      try {
+        await window.kcreate.component.detach(nodeId);
+        await refreshTree();
+      } catch (e) {
+        setStatusMessage(`detach component failed: ${errorMessage(e)}`);
       }
     },
     [refreshTree],
@@ -768,6 +856,23 @@ export function EditorPage({
           }}
           onDeleteArtboard={(id) => {
             void handleDeleteArtboard(id);
+          }}
+          selectedIds={selectedIds}
+          components={components}
+          onComponentCreateFromSelection={(name) => {
+            void handleComponentCreateFromSelection(name);
+          }}
+          onComponentInstantiate={(id) => {
+            void handleComponentInstantiate(id);
+          }}
+          onComponentAddVariant={(id, name) => {
+            void handleComponentAddVariant(id, name);
+          }}
+          onComponentSwitchVariant={(nodeId, variantId) => {
+            void handleComponentSwitchVariant(nodeId, variantId);
+          }}
+          onComponentDetach={(id) => {
+            void handleComponentDetach(id);
           }}
         />
         <main

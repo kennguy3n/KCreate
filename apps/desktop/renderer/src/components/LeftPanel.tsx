@@ -1,14 +1,20 @@
 import { useState } from "react";
 
-import type { ArtboardInfo, NodeInfo } from "../../../shared/scene";
+import type {
+  ArtboardInfo,
+  ComponentInfo,
+  NodeInfo,
+} from "../../../shared/scene";
 import { colors, radius, spacing } from "../styles/tokens";
 import { ArtboardPanel } from "./ArtboardPanel";
+import { ComponentPanel } from "./ComponentPanel";
 
 export type LeftPanelTab = "pages" | "artboards" | "layers" | "assets";
 
 export interface LeftPanelProps {
   nodes: NodeInfo[];
   selectedId: string | null;
+  selectedIds?: string[];
   onSelect: (id: string | null) => void;
   onToggleVisibility?: (id: string, visible: boolean) => void;
   onToggleLocked?: (id: string, locked: boolean) => void;
@@ -25,11 +31,22 @@ export interface LeftPanelProps {
   onDuplicateArtboard?: (id: string) => void;
   onResizeArtboard?: (id: string, width: number, height: number) => void;
   onDeleteArtboard?: (id: string) => void;
+
+  // Components-section inputs. Optional so existing callers that
+  // haven't wired the component bridge yet keep working (the assets
+  // tab just falls back to the empty hint).
+  components?: ComponentInfo[];
+  onComponentCreateFromSelection?: (name: string) => void;
+  onComponentInstantiate?: (componentId: string) => void;
+  onComponentAddVariant?: (componentId: string, name: string) => void;
+  onComponentSwitchVariant?: (nodeId: string, variantId: string) => void;
+  onComponentDetach?: (nodeId: string) => void;
 }
 
 export function LeftPanel({
   nodes,
   selectedId,
+  selectedIds,
   onSelect,
   onToggleVisibility,
   onToggleLocked,
@@ -42,6 +59,12 @@ export function LeftPanel({
   onDuplicateArtboard,
   onResizeArtboard,
   onDeleteArtboard,
+  components,
+  onComponentCreateFromSelection,
+  onComponentInstantiate,
+  onComponentAddVariant,
+  onComponentSwitchVariant,
+  onComponentDetach,
 }: LeftPanelProps): JSX.Element {
   const [tab, setTab] = useState<LeftPanelTab>("layers");
   return (
@@ -109,7 +132,30 @@ export function LeftPanel({
           />
         ) : null}
         {tab === "assets" ? (
-          <EmptyHint>Drop or import images, fonts, and palettes here.</EmptyHint>
+          components !== undefined ? (
+            <ComponentPanel
+              components={components}
+              selectedNodeIds={
+                selectedIds ?? (selectedId ? [selectedId] : [])
+              }
+              selectedNode={
+                selectedId
+                  ? (nodes.find((n) => n.id === selectedId) ?? null)
+                  : null
+              }
+              onCreateFromSelection={
+                onComponentCreateFromSelection ?? noopName
+              }
+              onInstantiate={onComponentInstantiate ?? noopArg}
+              onAddVariant={onComponentAddVariant ?? noopRename}
+              onSwitchVariant={onComponentSwitchVariant ?? noopRename}
+              onDetach={onComponentDetach ?? noopArg}
+            />
+          ) : (
+            <EmptyHint>
+              Drop or import images, fonts, and palettes here.
+            </EmptyHint>
+          )
         ) : null}
       </div>
     </aside>
@@ -121,6 +167,7 @@ export function LeftPanel({
 // no-op `+ New artboard` button and an empty list.
 const noop = (): void => undefined;
 const noopArg = (_: unknown): void => undefined;
+const noopName = (_: string): void => undefined;
 const noopRename = (_: string, __: string): void => undefined;
 const noopResize = (_: string, __: number, ___: number): void => undefined;
 

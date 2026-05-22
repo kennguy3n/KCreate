@@ -639,6 +639,49 @@ function registerIpcHandlers(): void {
   ipcMain.handle("kcreate/artboard/presets", () =>
     requireBridge().artboardPresets(),
   );
+
+  // Components (Block B).
+  ipcMain.handle(
+    "kcreate/component/createFromSelection",
+    (_e, nodeIds: string[], name: string): string =>
+      requireBridge().componentCreateFromSelection(nodeIds, name),
+  );
+  ipcMain.handle("kcreate/component/list", () =>
+    requireBridge().componentList(),
+  );
+  ipcMain.handle(
+    "kcreate/component/instantiate",
+    (
+      _e,
+      componentId: string,
+      parentId: string,
+      x: number,
+      y: number,
+    ): string =>
+      requireBridge().componentInstantiate(
+        componentId,
+        parentId.length > 0 ? parentId : null,
+        x,
+        y,
+      ),
+  );
+  ipcMain.handle(
+    "kcreate/component/addVariant",
+    (_e, componentId: string, name: string): string =>
+      requireBridge().componentAddVariant(componentId, name),
+  );
+  ipcMain.handle(
+    "kcreate/component/switchVariant",
+    (_e, nodeId: string, variantId: string): void => {
+      requireBridge().componentSwitchVariant(nodeId, variantId);
+    },
+  );
+  ipcMain.handle(
+    "kcreate/component/detach",
+    (_e, nodeId: string): void => {
+      requireBridge().componentDetach(nodeId);
+    },
+  );
 }
 
 void app.whenReady().then(() => {

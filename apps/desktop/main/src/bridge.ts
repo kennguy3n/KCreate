@@ -181,6 +181,19 @@ export interface Bridge {
   artboardDuplicate(artboardId: string): string;
   artboardResize(artboardId: string, width: number, height: number): void;
   artboardPresets(): string;
+
+  // Components (Phase 1, Block B)
+  componentCreateFromSelection(nodeIds: string[], name: string): string;
+  componentList(): string;
+  componentInstantiate(
+    componentId: string,
+    parentId: string | null,
+    x: number,
+    y: number,
+  ): string;
+  componentAddVariant(componentId: string, name: string): string;
+  componentSwitchVariant(nodeId: string, variantId: string): void;
+  componentDetach(nodeId: string): void;
 }
 
 function bridgeBinaryPath(): string {

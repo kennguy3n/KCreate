@@ -160,6 +160,18 @@ export interface ProjectInfo {
  * walking parent → children — it does not have to mirror the full
  * `kcreate_core::Node` payload.
  */
+/**
+ * Compact snapshot of a `ComponentInstance` payload. Present on a
+ * `NodeInfo` only when the node is a `ComponentLayer` carrying a
+ * parseable `component_instance` metadata blob. Mirrors
+ * `kcreate_bridge::document::ComponentInstanceInfo`.
+ */
+export interface ComponentInstanceInfo {
+  definitionId: string;
+  activeVariantId: string;
+  overrides: Record<string, unknown>;
+}
+
 export interface NodeInfo {
   id: string;
   nodeType: string;
@@ -168,6 +180,7 @@ export interface NodeInfo {
   name: string;
   visible: boolean;
   locked: boolean;
+  componentInstance?: ComponentInstanceInfo;
 }
 
 /**
@@ -581,6 +594,58 @@ export interface ArtboardBridge {
   presets(): Promise<ArtboardPreset[]>;
 }
 
+/**
+ * One named variant of a component. The `properties` bag is intentionally
+ * free-form JSON so callers can carry whatever metadata they need without
+ * us baking schema into the Rust types. Mirrors
+ * `kcreate_core::component::ComponentVariant`.
+ */
+export interface ComponentVariantInfo {
+  id: string;
+  name: string;
+  properties: Record<string, unknown>;
+}
+
+/**
+ * Per-component summary returned by `window.kcreate.component.list()`.
+ * Mirrors `kcreate_bridge::document::ComponentInfo`.
+ */
+export interface ComponentInfo {
+  id: string;
+  name: string;
+  description: string;
+  defaultVariantId: string;
+  variants: ComponentVariantInfo[];
+  createdAt: string;
+  modifiedAt: string;
+}
+
+export interface ComponentBridge {
+  /**
+   * Convert the given (sibling-flat) selection into a new component
+   * definition, swap the originals out for a single `ComponentLayer`
+   * instance, and return the new definition's id.
+   */
+  createFromSelection(nodeIds: string[], name: string): Promise<string>;
+  list(): Promise<ComponentInfo[]>;
+  /**
+   * Instantiate a stored definition. If `parentId` is null the new
+   * layer is added under the first artboard (or the project root if
+   * no artboards exist).
+   */
+  instantiate(
+    componentId: string,
+    parentId: string | null,
+    x: number,
+    y: number,
+  ): Promise<string>;
+  addVariant(componentId: string, name: string): Promise<string>;
+  /** Switch which variant a placed `ComponentLayer` displays. */
+  switchVariant(nodeId: string, variantId: string): Promise<void>;
+  /** Detach an instance — turns the `ComponentLayer` into a plain group. */
+  detach(nodeId: string): Promise<void>;
+}
+
 declare global {
   interface Window {
     kcreate: {
@@ -595,6 +660,7 @@ declare global {
       brandKit: BrandKitBridge;
       exportPreset: ExportPresetBridge;
       artboard: ArtboardBridge;
+      component: ComponentBridge;
     };
   }
 }

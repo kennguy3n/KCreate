@@ -14,6 +14,9 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use chrono::Utc;
+use kcreate_core::component::{
+    ComponentDefinition, ComponentInstance, ComponentVariant, COMPONENT_INSTANCE_METADATA_KEY,
+};
 use kcreate_core::config::RuntimeConfig;
 use kcreate_core::document::{DocumentError, DocumentGraph};
 use kcreate_core::node::{Node, NodeType};
@@ -58,6 +61,12 @@ pub enum DocumentBridgeError {
     InvalidUuid(String, uuid::Error),
     #[error("invalid bounds: width={width} height={height} (must be finite and positive)")]
     InvalidBounds { width: f64, height: f64 },
+    #[error("invalid component selection: {0}")]
+    InvalidComponentSelection(String),
+    #[error("component instance metadata on node {0} is malformed: {1}")]
+    InvalidComponentInstance(Uuid, String),
+    #[error("expected a ComponentLayer node, got {0:?}")]
+    WrongComponentNodeType(NodeType),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
     #[error(transparent)]
@@ -115,8 +124,24 @@ pub struct ProjectInfo {
     pub modified_at: String,
 }
 
+/// Compact snapshot of a [`ComponentInstance`] for the host's layer
+/// panel. `PartialEq` is intentionally not `Eq`: `overrides` carries
+/// `serde_json::Value` which can contain `f64` / `NaN`.
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ComponentInstanceInfo {
+    pub definition_id: Uuid,
+    pub active_variant_id: Uuid,
+    pub overrides: std::collections::HashMap<String, serde_json::Value>,
+}
+
 /// Snapshot of one node for the host's layer panel.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `PartialEq` is intentionally not `Eq` because
+/// [`ComponentInstanceInfo::overrides`] carries `serde_json::Value`.
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NodeInfo {
     pub id: Uuid,
     pub node_type: String,
@@ -125,10 +150,27 @@ pub struct NodeInfo {
     pub name: String,
     pub visible: bool,
     pub locked: bool,
+    /// Present iff `node_type == "ComponentLayer"` and the node
+    /// carries a parseable `component_instance` metadata payload.
+    /// Renderer panels read this to drive the variant switcher.
+    #[serde(rename = "componentInstance", skip_serializing_if = "Option::is_none")]
+    pub component_instance: Option<ComponentInstanceInfo>,
 }
 
 impl From<&Node> for NodeInfo {
     fn from(n: &Node) -> Self {
+        let component_instance = if matches!(n.node_type, NodeType::ComponentLayer) {
+            n.metadata
+                .get(COMPONENT_INSTANCE_METADATA_KEY)
+                .and_then(|v| serde_json::from_value::<ComponentInstance>(v.clone()).ok())
+                .map(|inst| ComponentInstanceInfo {
+                    definition_id: inst.definition_id,
+                    active_variant_id: inst.active_variant_id,
+                    overrides: inst.overrides,
+                })
+        } else {
+            None
+        };
         Self {
             id: n.id,
             node_type: node_type_name(n.node_type).to_string(),
@@ -137,6 +179,7 @@ impl From<&Node> for NodeInfo {
             name: n.name.clone(),
             visible: n.visible,
             locked: n.locked,
+            component_instance,
         }
     }
 }
@@ -265,6 +308,7 @@ pub fn project_open(dir: &Path) -> Result<ProjectInfo> {
     project.design_tokens = store.load_design_tokens()?;
     project.brand_kits = store.load_brand_kits()?;
     project.export_presets = store.load_export_presets()?;
+    project.components = store.load_components()?;
     // Restore the operation log from disk so undo survives close+reopen.
     let max_depth = project.operation_log.max_depth();
     let history = store.load_operations(max_depth)?;
@@ -343,6 +387,10 @@ pub fn project_save() -> Result<()> {
             ws.store.delete_export_preset(preset.id)?;
         }
     }
+    // Components: the in-memory map is the source of truth, so we
+    // bulk-replace on disk. This handles both upsert and delete in
+    // one round-trip; matches how `replace_components` is documented.
+    ws.store.replace_components(&ws.project.components)?;
 
     let current_ids: HashSet<Uuid> = ws.project.operation_log.iter().map(|op| op.id).collect();
     // Collect new ops first so we can satisfy the borrow checker (the
@@ -1154,6 +1202,518 @@ pub fn artboard_resize(artboard_id: Uuid, width: f64, height: f64) -> Result<()>
 /// Return the built-in artboard preset catalogue.
 pub fn artboard_presets() -> Vec<kcreate_core::ArtboardPreset> {
     kcreate_core::standard_presets()
+}
+
+// -----------------------------------------------------------------------------
+// Components
+// -----------------------------------------------------------------------------
+
+/// Wire shape returned by [`component_list`]. Mirrors `ComponentInfo`
+/// in `apps/desktop/shared/scene.ts`. We `rename_all = "camelCase"` so
+/// the renderer can `JSON.parse` directly without a key transform.
+///
+/// `PartialEq` is intentionally not `Eq`: the free-form
+/// `ComponentVariantInfo::properties` bag contains `serde_json::Value`
+/// which can carry `f64` / `NaN`, and `Eq` would lie about that.
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ComponentInfo {
+    pub id: Uuid,
+    pub name: String,
+    pub description: String,
+    pub default_variant_id: Uuid,
+    pub variants: Vec<ComponentVariantInfo>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub modified_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ComponentVariantInfo {
+    pub id: Uuid,
+    pub name: String,
+    pub properties: std::collections::HashMap<String, serde_json::Value>,
+}
+
+impl From<&ComponentDefinition> for ComponentInfo {
+    fn from(def: &ComponentDefinition) -> Self {
+        Self {
+            id: def.id,
+            name: def.name.clone(),
+            description: def.description.clone(),
+            default_variant_id: def.default_variant_id,
+            variants: def
+                .variants
+                .iter()
+                .map(|v| ComponentVariantInfo {
+                    id: v.id,
+                    name: v.name.clone(),
+                    properties: v.properties.clone(),
+                })
+                .collect(),
+            created_at: def.created_at,
+            modified_at: def.modified_at,
+        }
+    }
+}
+
+/// Convert a selection of nodes into a reusable component definition.
+///
+/// The selected nodes (and their descendants) are snapshotted into a
+/// new [`ComponentDefinition`]. A `NodeType::ComponentLayer` node is
+/// created in place of the selection, and the originals are
+/// reparented under that new layer (the selection becomes the first
+/// instance, with no extra clone needed).
+///
+/// Subsequent instances of the same component re-clone the snapshot
+/// stored on the definition.
+///
+/// Returns the new component's id. Records an undoable
+/// `component_create_from_selection` operation.
+pub fn component_create_from_selection(node_ids: Vec<Uuid>, name: String) -> Result<Uuid> {
+    if node_ids.is_empty() {
+        return Err(DocumentBridgeError::InvalidComponentSelection(
+            "selection is empty".into(),
+        ));
+    }
+    let mut guard = slot().lock();
+    let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
+
+    // Validate every selected node exists and share a common parent
+    // (UI selections are always sibling-flat — supporting cross-parent
+    // selections would require choosing a parent for the new layer,
+    // which is ambiguous).
+    let mut parents = HashSet::new();
+    for id in &node_ids {
+        let node = ws
+            .project
+            .document
+            .get_node(*id)
+            .ok_or(DocumentBridgeError::NodeNotFound(*id))?;
+        parents.insert(node.parent_id);
+    }
+    if parents.len() != 1 {
+        return Err(DocumentBridgeError::InvalidComponentSelection(
+            "all selected nodes must share the same parent".into(),
+        ));
+    }
+    let parent_id = parents
+        .into_iter()
+        .next()
+        .expect("checked single parent above");
+
+    // Compute the bounding rect of the selection so the new
+    // ComponentLayer wraps it sensibly.
+    let mut min_x = f64::INFINITY;
+    let mut min_y = f64::INFINITY;
+    let mut max_x = f64::NEG_INFINITY;
+    let mut max_y = f64::NEG_INFINITY;
+    for id in &node_ids {
+        let n = ws
+            .project
+            .document
+            .get_node(*id)
+            .ok_or(DocumentBridgeError::NodeNotFound(*id))?;
+        min_x = min_x.min(n.bounds.x);
+        min_y = min_y.min(n.bounds.y);
+        max_x = max_x.max(n.bounds.x + n.bounds.width);
+        max_y = max_y.max(n.bounds.y + n.bounds.height);
+    }
+    if !(min_x.is_finite() && min_y.is_finite() && max_x.is_finite() && max_y.is_finite()) {
+        return Err(DocumentBridgeError::InvalidComponentSelection(
+            "selection bounding box is degenerate".into(),
+        ));
+    }
+    let bounds = kcreate_core::node::Bounds::new(min_x, min_y, max_x - min_x, max_y - min_y);
+
+    // Build the definition. We deep-clone the source subtrees *into*
+    // the project graph temporarily, snapshot them as serialized
+    // payloads onto the definition, then leave the original nodes in
+    // place to become the first instance's children.
+    let mut definition = ComponentDefinition::new(&name);
+
+    // Snapshot the source subtrees by serializing each root node and
+    // its descendants. The bridge instantiates new copies from this
+    // payload via `instantiate_component_snapshot`.
+    let mut source_payloads = Vec::with_capacity(node_ids.len());
+    for id in &node_ids {
+        let mut subtree = Vec::new();
+        let all = std::iter::once(*id).chain(ws.project.document.descendants_of(*id));
+        for nid in all {
+            if let Some(n) = ws.project.document.get_node(nid) {
+                subtree.push(n.clone());
+            }
+        }
+        source_payloads.push(subtree);
+    }
+    let snapshot_json = serde_json::to_value(&source_payloads)?;
+
+    // Create the new ComponentLayer node where the selection was.
+    let mut layer = Node::new(NodeType::ComponentLayer, name);
+    layer.parent_id = parent_id;
+    layer.bounds = bounds;
+    let layer_id = ws.project.document.insert_node(layer)?;
+
+    // Reparent the original selection under the new ComponentLayer.
+    // Reparent operates child-by-child, preserving order.
+    for (i, id) in node_ids.iter().enumerate() {
+        ws.project.document.reparent_node(*id, Some(layer_id), i)?;
+    }
+
+    // Bake the instance metadata onto the new layer (so the first
+    // instance survives save/reopen even before any further edits).
+    let instance = ComponentInstance::new(&definition);
+    if let Some(layer_node) = ws.project.document.get_node_mut(layer_id) {
+        let v = serde_json::to_value(&instance)?;
+        layer_node
+            .metadata
+            .insert(COMPONENT_INSTANCE_METADATA_KEY.to_string(), v);
+        // Also stash the source snapshot on the definition so
+        // subsequent instantiations clone from a stable payload.
+        layer_node.touch();
+    }
+    definition.source_node_ids.extend(
+        source_payloads
+            .iter()
+            .filter_map(|s| s.first().map(|n| n.id)),
+    );
+    // Store the source snapshot in a definition-level metadata
+    // (variant 0 owns it under the conventional `source_snapshot` key).
+    if let Some(default) = definition.variant_mut(definition.default_variant_id) {
+        default
+            .properties
+            .insert("source_snapshot".to_string(), snapshot_json);
+    }
+    let component_id = ws.project.register_component(definition);
+
+    let snapshot_node = ws
+        .project
+        .document
+        .get_node(layer_id)
+        .map_or(serde_json::Value::Null, |n| {
+            serde_json::to_value(n).unwrap_or(serde_json::Value::Null)
+        });
+    let op = Operation::new(
+        "user",
+        "component_create_from_selection",
+        serde_json::to_value(&node_ids).unwrap_or(serde_json::Value::Null),
+        snapshot_node,
+        vec![layer_id],
+    );
+    ws.project.execute_operation(op);
+    let _ = sync_scene_locked(&mut guard);
+    drop(guard);
+    Ok(component_id)
+}
+
+/// List all registered components (sorted by name).
+pub fn component_list() -> Result<Vec<ComponentInfo>> {
+    let guard = slot().lock();
+    let ws = guard.as_ref().ok_or(DocumentBridgeError::NoProject)?;
+    Ok(ws
+        .project
+        .list_components()
+        .into_iter()
+        .map(ComponentInfo::from)
+        .collect())
+}
+
+/// Instantiate a component at `(x, y)` under `parent_id`. Returns the
+/// new `NodeType::ComponentLayer` node id.
+pub fn component_instantiate(
+    component_id: Uuid,
+    parent_id: Option<Uuid>,
+    x: f64,
+    y: f64,
+) -> Result<Uuid> {
+    if !(x.is_finite() && y.is_finite()) {
+        return Err(DocumentBridgeError::InvalidBounds {
+            width: x,
+            height: y,
+        });
+    }
+    let mut guard = slot().lock();
+    let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
+
+    // Snapshot the definition so we can release the borrow before
+    // mutating the document graph below. Definitions are small (a
+    // handful of variants + a JSON snapshot), so the clone is cheap.
+    let def = ws
+        .project
+        .get_component(component_id)
+        .cloned()
+        .ok_or_else(|| {
+            DocumentBridgeError::Project(ProjectError::ComponentNotFound(component_id))
+        })?;
+    let default_variant_id = def.default_variant_id;
+    let snapshot_value = def
+        .variant(default_variant_id)
+        .and_then(|v| v.properties.get("source_snapshot").cloned())
+        .ok_or_else(|| {
+            DocumentBridgeError::InvalidComponentSelection(
+                "component is missing its source snapshot".into(),
+            )
+        })?;
+    let source_payloads: Vec<Vec<Node>> =
+        serde_json::from_value(snapshot_value).map_err(DocumentBridgeError::Json)?;
+
+    // Compute the bounding rect of the source payload so the new
+    // ComponentLayer covers exactly its children.
+    let mut min_x = f64::INFINITY;
+    let mut min_y = f64::INFINITY;
+    let mut max_x = f64::NEG_INFINITY;
+    let mut max_y = f64::NEG_INFINITY;
+    for payload in &source_payloads {
+        if let Some(root) = payload.first() {
+            min_x = min_x.min(root.bounds.x);
+            min_y = min_y.min(root.bounds.y);
+            max_x = max_x.max(root.bounds.x + root.bounds.width);
+            max_y = max_y.max(root.bounds.y + root.bounds.height);
+        }
+    }
+    if !(min_x.is_finite() && min_y.is_finite() && max_x.is_finite() && max_y.is_finite()) {
+        return Err(DocumentBridgeError::InvalidComponentSelection(
+            "component snapshot is empty".into(),
+        ));
+    }
+    let width = max_x - min_x;
+    let height = max_y - min_y;
+
+    // Create the new ComponentLayer and reparent at (x, y).
+    let mut layer = Node::new(NodeType::ComponentLayer, &def.name);
+    layer.parent_id = parent_id;
+    layer.bounds = kcreate_core::node::Bounds::new(x, y, width, height);
+    let layer_id = ws.project.document.insert_node(layer)?;
+
+    // Deep-clone each source subtree into the document as children of
+    // the new layer. Children are reparented by writing the new
+    // parent_id and rebuilding the parent's children list as we go.
+    instantiate_component_snapshot(
+        &mut ws.project.document,
+        &source_payloads,
+        layer_id,
+        (x - min_x, y - min_y),
+    )?;
+
+    let instance = ComponentInstance {
+        definition_id: component_id,
+        active_variant_id: default_variant_id,
+        overrides: HashMap::new(),
+    };
+    if let Some(node) = ws.project.document.get_node_mut(layer_id) {
+        node.metadata.insert(
+            COMPONENT_INSTANCE_METADATA_KEY.to_string(),
+            serde_json::to_value(&instance)?,
+        );
+        node.touch();
+    }
+
+    let after_snapshot = ws
+        .project
+        .document
+        .get_node(layer_id)
+        .map_or(serde_json::Value::Null, |n| {
+            serde_json::to_value(n).unwrap_or(serde_json::Value::Null)
+        });
+    let op = Operation::new(
+        "user",
+        "component_instantiate",
+        serde_json::to_value(component_id).unwrap_or(serde_json::Value::Null),
+        after_snapshot,
+        vec![layer_id],
+    );
+    ws.project.execute_operation(op);
+    let _ = sync_scene_locked(&mut guard);
+    drop(guard);
+    Ok(layer_id)
+}
+
+/// Append a fresh variant to a component. Returns the new variant id.
+pub fn component_add_variant(component_id: Uuid, name: String) -> Result<Uuid> {
+    let mut guard = slot().lock();
+    let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
+    let vid = ws
+        .project
+        .add_component_variant(component_id, ComponentVariant::new(&name))?;
+    let op = Operation::new(
+        "user",
+        "component_add_variant",
+        serde_json::to_value(component_id).unwrap_or(serde_json::Value::Null),
+        serde_json::to_value(vid).unwrap_or(serde_json::Value::Null),
+        Vec::new(),
+    );
+    ws.project.execute_operation(op);
+    drop(guard);
+    Ok(vid)
+}
+
+/// Switch the active variant of a component instance node.
+pub fn component_switch_variant(node_id: Uuid, variant_id: Uuid) -> Result<()> {
+    let mut guard = slot().lock();
+    let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
+    // Validate the node is a ComponentLayer with valid instance
+    // metadata, and the variant belongs to its definition.
+    let (definition_id, before_value) = {
+        let node = ws
+            .project
+            .document
+            .get_node(node_id)
+            .ok_or(DocumentBridgeError::NodeNotFound(node_id))?;
+        if node.node_type != NodeType::ComponentLayer {
+            return Err(DocumentBridgeError::WrongComponentNodeType(node.node_type));
+        }
+        let value = node
+            .metadata
+            .get(COMPONENT_INSTANCE_METADATA_KEY)
+            .cloned()
+            .ok_or_else(|| {
+                DocumentBridgeError::InvalidComponentInstance(
+                    node_id,
+                    "node is missing component_instance metadata".into(),
+                )
+            })?;
+        let inst: ComponentInstance = serde_json::from_value(value.clone())
+            .map_err(|e| DocumentBridgeError::InvalidComponentInstance(node_id, e.to_string()))?;
+        (inst.definition_id, value)
+    };
+    let def = ws.project.get_component(definition_id).ok_or_else(|| {
+        DocumentBridgeError::Project(ProjectError::ComponentNotFound(definition_id))
+    })?;
+    if def.variant(variant_id).is_none() {
+        return Err(DocumentBridgeError::Project(ProjectError::Component(
+            kcreate_core::ComponentError::VariantNotFound(variant_id),
+        )));
+    }
+
+    // Write the new variant id.
+    let node = ws
+        .project
+        .document
+        .get_node_mut(node_id)
+        .ok_or(DocumentBridgeError::NodeNotFound(node_id))?;
+    let value = node
+        .metadata
+        .get_mut(COMPONENT_INSTANCE_METADATA_KEY)
+        .ok_or_else(|| {
+            DocumentBridgeError::InvalidComponentInstance(
+                node_id,
+                "node is missing component_instance metadata".into(),
+            )
+        })?;
+    let mut inst: ComponentInstance = serde_json::from_value(value.clone())
+        .map_err(|e| DocumentBridgeError::InvalidComponentInstance(node_id, e.to_string()))?;
+    inst.active_variant_id = variant_id;
+    *value = serde_json::to_value(&inst)?;
+    node.touch();
+
+    let after_value = node
+        .metadata
+        .get(COMPONENT_INSTANCE_METADATA_KEY)
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let op = Operation::new(
+        "user",
+        "component_switch_variant",
+        before_value,
+        after_value,
+        vec![node_id],
+    );
+    ws.project.execute_operation(op);
+    let _ = sync_scene_locked(&mut guard);
+    drop(guard);
+    Ok(())
+}
+
+/// Detach a component instance: removes the `component_instance`
+/// metadata and converts the ComponentLayer into a regular
+/// `NodeType::GroupLayer` so its children remain editable as plain
+/// nodes.
+pub fn component_detach(node_id: Uuid) -> Result<()> {
+    let mut guard = slot().lock();
+    let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
+    let before = ws
+        .project
+        .document
+        .get_node(node_id)
+        .map(|n| serde_json::to_value(n).unwrap_or(serde_json::Value::Null))
+        .ok_or(DocumentBridgeError::NodeNotFound(node_id))?;
+    let node = ws
+        .project
+        .document
+        .get_node_mut(node_id)
+        .ok_or(DocumentBridgeError::NodeNotFound(node_id))?;
+    if node.node_type != NodeType::ComponentLayer {
+        return Err(DocumentBridgeError::WrongComponentNodeType(node.node_type));
+    }
+    node.metadata.remove(COMPONENT_INSTANCE_METADATA_KEY);
+    node.node_type = NodeType::GroupLayer;
+    node.touch();
+    let after = serde_json::to_value(&*node)?;
+    let op = Operation::new("user", "component_detach", before, after, vec![node_id]);
+    ws.project.execute_operation(op);
+    let _ = sync_scene_locked(&mut guard);
+    drop(guard);
+    Ok(())
+}
+
+/// Deep-clone a previously snapshotted source payload into the
+/// document under `new_parent`, offset by `(dx, dy)` so the
+/// instance lands where the caller asked.
+///
+/// Each entry in `source_payloads` is a depth-first list of nodes
+/// (root + descendants in any order, as long as parent_ids resolve
+/// within the payload). The first node in each payload is the
+/// subtree root.
+fn instantiate_component_snapshot(
+    doc: &mut DocumentGraph,
+    source_payloads: &[Vec<Node>],
+    new_parent: Uuid,
+    offset: (f64, f64),
+) -> Result<Vec<Uuid>> {
+    let mut new_root_ids = Vec::with_capacity(source_payloads.len());
+    for payload in source_payloads {
+        if payload.is_empty() {
+            continue;
+        }
+        // Remap all old ids → fresh ones.
+        let mut id_map: HashMap<Uuid, Uuid> = HashMap::with_capacity(payload.len());
+        for n in payload {
+            id_map.insert(n.id, Uuid::new_v4());
+        }
+        let root_old_id = payload[0].id;
+
+        // Insert the root first (its parent is `new_parent`), then
+        // insert every descendant in payload order. Each descendant's
+        // parent_id has already been remapped to a node we previously
+        // inserted, so `insert_node` succeeds without
+        // `InvalidReparent`.
+        for (i, original) in payload.iter().enumerate() {
+            let mut copy = original.clone();
+            copy.id = id_map[&original.id];
+            copy.parent_id = if i == 0 {
+                Some(new_parent)
+            } else {
+                original
+                    .parent_id
+                    .and_then(|pid| id_map.get(&pid).copied())
+                    .or(Some(new_parent))
+            };
+            // Children get fixed up automatically by insert_node as
+            // each child is inserted; clear the snapshot's children
+            // list so we don't pre-populate stale ids.
+            copy.children.clear();
+            if i == 0 {
+                copy.bounds.x += offset.0;
+                copy.bounds.y += offset.1;
+            }
+            copy.version = 0;
+            doc.insert_node(copy)?;
+        }
+        new_root_ids.push(id_map[&root_old_id]);
+    }
+    Ok(new_root_ids)
 }
 
 fn find_first_page(doc: &DocumentGraph) -> Option<Uuid> {
@@ -2568,5 +3128,194 @@ mod tests {
         assert!(presets.iter().any(|p| p.name == "Desktop"));
         assert!(presets.iter().any(|p| p.name == "Instagram Post"));
         assert!(presets.iter().any(|p| p.name == "A4"));
+    }
+
+    // ---- Component bridge tests ----
+
+    fn setup_component_project() -> (tempfile::TempDir, Uuid, Vec<Uuid>) {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("comp", dir.path()).expect("create");
+        // Add an artboard with two sibling rects we can group.
+        let ab = artboard_create(None, "Page".into(), 800.0, 600.0).expect("artboard");
+        let a = document_create_node(
+            "VectorLayer",
+            Some(ab),
+            &CreateNodeProps {
+                name: Some("Rect A".into()),
+                ..Default::default()
+            },
+        )
+        .expect("a");
+        let b = document_create_node(
+            "VectorLayer",
+            Some(ab),
+            &CreateNodeProps {
+                name: Some("Rect B".into()),
+                ..Default::default()
+            },
+        )
+        .expect("b");
+        (dir, ab, vec![a, b])
+    }
+
+    #[test]
+    #[serial]
+    fn component_create_from_selection_wraps_in_layer_and_registers() {
+        let (_dir, ab, kids) = setup_component_project();
+        let comp_id = component_create_from_selection(kids.clone(), "Button".into())
+            .expect("create component");
+        let list = component_list().expect("list");
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].id, comp_id);
+        assert_eq!(list[0].name, "Button");
+        // Definition has at least the default variant.
+        assert!(!list[0].variants.is_empty());
+        // The original children should now live under a ComponentLayer
+        // which itself is a child of the artboard.
+        let tree = document_get_tree().expect("tree");
+        let comp_layer = tree
+            .iter()
+            .find(|n| n.node_type == "ComponentLayer")
+            .expect("component layer");
+        assert_eq!(comp_layer.parent_id, Some(ab));
+        let kid_a = tree.iter().find(|n| n.id == kids[0]).expect("kid a");
+        let kid_b = tree.iter().find(|n| n.id == kids[1]).expect("kid b");
+        assert_eq!(kid_a.parent_id, Some(comp_layer.id));
+        assert_eq!(kid_b.parent_id, Some(comp_layer.id));
+        project_close();
+    }
+
+    #[test]
+    #[serial]
+    fn component_create_from_empty_selection_errors() {
+        let (_dir, _ab, _kids) = setup_component_project();
+        let err = component_create_from_selection(Vec::new(), "Empty".into()).expect_err("empty");
+        assert!(matches!(
+            err,
+            DocumentBridgeError::InvalidComponentSelection(_)
+        ));
+        project_close();
+    }
+
+    #[test]
+    #[serial]
+    fn component_create_rejects_cross_parent_selection() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("comp_cross", dir.path()).expect("create");
+        let ab1 = artboard_create(None, "P1".into(), 400.0, 300.0).expect("ab1");
+        let ab2 = artboard_create(None, "P2".into(), 400.0, 300.0).expect("ab2");
+        let a =
+            document_create_node("VectorLayer", Some(ab1), &CreateNodeProps::default()).expect("a");
+        let b =
+            document_create_node("VectorLayer", Some(ab2), &CreateNodeProps::default()).expect("b");
+        let err = component_create_from_selection(vec![a, b], "Cross".into()).expect_err("cross");
+        assert!(matches!(
+            err,
+            DocumentBridgeError::InvalidComponentSelection(_)
+        ));
+        // Sanity: keep the borrow-checker happy.
+        let _ = dir;
+        project_close();
+    }
+
+    #[test]
+    #[serial]
+    fn component_instantiate_clones_under_parent() {
+        let (_dir, ab, kids) = setup_component_project();
+        let comp_id = component_create_from_selection(kids, "Card".into()).expect("create");
+        // Instantiate a second copy under the same artboard at (200,
+        // 50). The new node is a ComponentLayer with its own
+        // descendants, distinct from the first instance.
+        let new_layer = component_instantiate(comp_id, Some(ab), 200.0, 50.0).expect("instantiate");
+        let tree = document_get_tree().expect("tree");
+        let new_node = tree.iter().find(|n| n.id == new_layer).expect("new layer");
+        assert_eq!(new_node.node_type, "ComponentLayer");
+        assert_eq!(new_node.parent_id, Some(ab));
+        // New instance has its own children (the snapshot was
+        // re-cloned, not aliased).
+        let has_kids = tree.iter().any(|n| n.parent_id == Some(new_layer));
+        assert!(has_kids, "instance should have children");
+        project_close();
+    }
+
+    #[test]
+    #[serial]
+    fn component_add_and_switch_variant() {
+        let (_dir, _ab, kids) = setup_component_project();
+        let comp_id = component_create_from_selection(kids, "Button".into()).expect("create");
+        let variant_id = component_add_variant(comp_id, "Hover".into()).expect("add variant");
+        // Find the ComponentLayer node.
+        let tree = document_get_tree().expect("tree");
+        let comp_layer = tree
+            .iter()
+            .find(|n| n.node_type == "ComponentLayer")
+            .expect("component layer");
+        component_switch_variant(comp_layer.id, variant_id).expect("switch");
+        // The variant is persisted on the node metadata, so list shows
+        // the new variant.
+        let list = component_list().expect("list");
+        assert_eq!(list[0].variants.len(), 2);
+        assert!(list[0].variants.iter().any(|v| v.id == variant_id));
+        project_close();
+    }
+
+    #[test]
+    #[serial]
+    fn component_detach_converts_to_group_layer() {
+        let (_dir, _ab, kids) = setup_component_project();
+        let _comp_id = component_create_from_selection(kids, "Card".into()).expect("create");
+        let tree = document_get_tree().expect("tree");
+        let comp_layer = tree
+            .iter()
+            .find(|n| n.node_type == "ComponentLayer")
+            .expect("component layer");
+        component_detach(comp_layer.id).expect("detach");
+        let tree = document_get_tree().expect("tree");
+        let node = tree.iter().find(|n| n.id == comp_layer.id).expect("node");
+        assert_eq!(node.node_type, "GroupLayer");
+        project_close();
+    }
+
+    #[test]
+    #[serial]
+    fn component_detach_rejects_non_component_node() {
+        let (_dir, _ab, kids) = setup_component_project();
+        // `kids[0]` is a plain VectorLayer.
+        let err = component_detach(kids[0]).expect_err("not a component");
+        assert!(matches!(
+            err,
+            DocumentBridgeError::WrongComponentNodeType(_)
+        ));
+        project_close();
+    }
+
+    #[test]
+    #[serial]
+    fn component_survives_save_and_reopen() {
+        let (dir, _ab, kids) = setup_component_project();
+        let comp_id = component_create_from_selection(kids, "Button".into()).expect("create comp");
+        let project_path = project_info().expect("info").path;
+        project_save().expect("save");
+        project_close();
+        project_open(&project_path).expect("reopen");
+        let listed = component_list().expect("list");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, comp_id);
+        // Instantiate after reopen — should still work because the
+        // source snapshot was persisted with the definition.
+        let tree = document_get_tree().expect("tree");
+        let comp_layer = tree
+            .iter()
+            .find(|n| n.node_type == "ComponentLayer")
+            .expect("component layer");
+        let parent = comp_layer.parent_id;
+        let new_layer =
+            component_instantiate(comp_id, parent, 400.0, 50.0).expect("instantiate after reopen");
+        assert_ne!(new_layer, comp_layer.id);
+        // Sanity: tempdir kept alive until here.
+        let _ = dir;
+        project_close();
     }
 }

@@ -88,6 +88,12 @@ pub const MIGRATIONS: &[&str] = &[
         data TEXT NOT NULL,
         updated_at TEXT NOT NULL
     );",
+    // 10: components (one row per ComponentDefinition; id == ComponentDefinition::id)
+    r"CREATE TABLE IF NOT EXISTS components (
+        id TEXT PRIMARY KEY,
+        data TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    );",
 ];
 
 /// Schema-level errors. Wraps `rusqlite::Error` and adds a couple of

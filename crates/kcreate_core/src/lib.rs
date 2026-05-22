@@ -23,12 +23,17 @@
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 
+pub mod component;
 pub mod config;
 pub mod document;
 pub mod node;
 pub mod operation;
 pub mod project;
 
+pub use component::{
+    ComponentDefinition, ComponentError, ComponentInstance, ComponentVariant,
+    COMPONENT_INSTANCE_METADATA_KEY,
+};
 pub use config::{DeviceTier, Platform, RuntimeConfig};
 pub use document::{DocumentError, DocumentGraph};
 pub use node::{

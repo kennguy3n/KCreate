@@ -13,6 +13,8 @@ import type {
   BrandKit,
   BrandKitBridge,
   CanvasBridge,
+  ComponentBridge,
+  ComponentInfo,
   CreateNodeProps,
   DesignTokens,
   DesignTokensBridge,
@@ -151,6 +153,14 @@ type NodeInfoSnake = {
   name: string;
   visible: boolean;
   locked: boolean;
+  /// Already camelCased on the Rust side via #[serde(rename)]. We
+  /// pass it through verbatim because the inner field names are
+  /// also camelCased (definitionId / activeVariantId).
+  componentInstance?: {
+    definitionId: string;
+    activeVariantId: string;
+    overrides: Record<string, unknown>;
+  };
 };
 
 type RuntimeStatusSnake = {
@@ -180,6 +190,7 @@ function nodeFromSnake(n: NodeInfoSnake): NodeInfo {
     name: n.name,
     visible: n.visible,
     locked: n.locked,
+    ...(n.componentInstance ? { componentInstance: n.componentInstance } : {}),
   };
 }
 
@@ -593,6 +604,51 @@ const artboard: ArtboardBridge = {
   },
 };
 
+const component: ComponentBridge = {
+  async createFromSelection(nodeIds: string[], name: string): Promise<string> {
+    return (await ipcRenderer.invoke(
+      "kcreate/component/createFromSelection",
+      nodeIds,
+      name,
+    )) as string;
+  },
+  async list(): Promise<ComponentInfo[]> {
+    const raw = (await ipcRenderer.invoke("kcreate/component/list")) as string;
+    return JSON.parse(raw) as ComponentInfo[];
+  },
+  async instantiate(
+    componentId: string,
+    parentId: string | null,
+    x: number,
+    y: number,
+  ): Promise<string> {
+    return (await ipcRenderer.invoke(
+      "kcreate/component/instantiate",
+      componentId,
+      parentId ?? "",
+      x,
+      y,
+    )) as string;
+  },
+  async addVariant(componentId: string, name: string): Promise<string> {
+    return (await ipcRenderer.invoke(
+      "kcreate/component/addVariant",
+      componentId,
+      name,
+    )) as string;
+  },
+  async switchVariant(nodeId: string, variantId: string): Promise<void> {
+    await ipcRenderer.invoke(
+      "kcreate/component/switchVariant",
+      nodeId,
+      variantId,
+    );
+  },
+  async detach(nodeId: string): Promise<void> {
+    await ipcRenderer.invoke("kcreate/component/detach", nodeId);
+  },
+};
+
 contextBridge.exposeInMainWorld("kcreate", {
   renderer,
   document,
@@ -605,4 +661,5 @@ contextBridge.exposeInMainWorld("kcreate", {
   brandKit,
   exportPreset,
   artboard,
+  component,
 });

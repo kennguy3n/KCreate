@@ -892,3 +892,72 @@ pub fn artboard_presets() -> NapiResult<String> {
     let presets = document::artboard_presets();
     serde_json::to_string(&presets).map_err(|e| NapiError::from_reason(e.to_string()))
 }
+
+// -----------------------------------------------------------------------------
+// Components (Block B)
+// -----------------------------------------------------------------------------
+
+/// Convert a selection of nodes into a reusable component. Returns
+/// the new component's UUID.
+#[napi]
+pub fn component_create_from_selection(node_ids: Vec<String>, name: String) -> NapiResult<String> {
+    let mut parsed = Vec::with_capacity(node_ids.len());
+    for s in node_ids {
+        parsed.push(parse_uuid(&s)?);
+    }
+    document::component_create_from_selection(parsed, name)
+        .map(|id| id.to_string())
+        .map_err(map_doc_err)
+}
+
+/// List every registered component as a JSON array.
+#[napi]
+pub fn component_list() -> NapiResult<String> {
+    let list = document::component_list().map_err(map_doc_err)?;
+    serde_json::to_string(&list).map_err(|e| NapiError::from_reason(e.to_string()))
+}
+
+/// Instantiate a component at `(x, y)` under `parent_id`. Returns
+/// the new ComponentLayer node's UUID.
+#[napi]
+pub fn component_instantiate(
+    component_id: String,
+    parent_id: Option<String>,
+    x: f64,
+    y: f64,
+) -> NapiResult<String> {
+    let cid = parse_uuid(&component_id)?;
+    let parent = match parent_id {
+        Some(s) if !s.is_empty() => Some(parse_uuid(&s)?),
+        _ => None,
+    };
+    document::component_instantiate(cid, parent, x, y)
+        .map(|id| id.to_string())
+        .map_err(map_doc_err)
+}
+
+/// Append a fresh variant to a component. Returns the new variant's
+/// UUID.
+#[napi]
+pub fn component_add_variant(component_id: String, name: String) -> NapiResult<String> {
+    let cid = parse_uuid(&component_id)?;
+    document::component_add_variant(cid, name)
+        .map(|id| id.to_string())
+        .map_err(map_doc_err)
+}
+
+/// Switch the active variant of a component instance node.
+#[napi]
+pub fn component_switch_variant(node_id: String, variant_id: String) -> NapiResult<()> {
+    let nid = parse_uuid(&node_id)?;
+    let vid = parse_uuid(&variant_id)?;
+    document::component_switch_variant(nid, vid).map_err(map_doc_err)
+}
+
+/// Detach a component instance — converts the ComponentLayer into a
+/// regular GroupLayer.
+#[napi]
+pub fn component_detach(node_id: String) -> NapiResult<()> {
+    let nid = parse_uuid(&node_id)?;
+    document::component_detach(nid).map_err(map_doc_err)
+}

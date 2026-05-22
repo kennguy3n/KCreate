@@ -380,13 +380,41 @@ impl DocumentGraph {
         }
         let parent_id = source.parent_id;
         let width = source.bounds.width;
-        let dx = width + 100.0;
-        let dy = 0.0;
+        let original_name = source.name.clone();
+        let new_root = self.clone_subtree(artboard_id, parent_id)?;
+        // Offset by width + 100 (one-time gap) and rename root.
+        if let Some(root) = self.nodes.get_mut(&new_root) {
+            root.bounds.x += width + 100.0;
+            root.name = format!("{original_name} copy");
+            root.touch();
+        }
+        Ok(new_root)
+    }
 
-        // Snapshot the subtree before mutation so we can deep-clone
-        // without borrowing into `self.nodes`.
-        let subtree_ids: Vec<Uuid> = std::iter::once(artboard_id)
-            .chain(self.descendants_of(artboard_id))
+    /// Deep-clone the subtree rooted at `source_root` (including its
+    /// descendants) under `new_parent`. Returns the new root's id.
+    ///
+    /// All ids are regenerated so the clone is an independent identity
+    /// in the graph. `parent_id` pointers and `children` lists in the
+    /// cloned nodes are remapped to the new ids; `version` resets to
+    /// 0 and `created_at`/`updated_at` are bumped to "now" on every
+    /// cloned node.
+    ///
+    /// Returns [`DocumentError::NodeNotFound`] if `source_root` is
+    /// missing, or [`DocumentError::InvalidReparent`] if `new_parent`
+    /// doesn't exist.
+    pub fn clone_subtree(&mut self, source_root: Uuid, new_parent: Option<Uuid>) -> Result<Uuid> {
+        if !self.nodes.contains_key(&source_root) {
+            return Err(DocumentError::NodeNotFound(source_root));
+        }
+        if let Some(pid) = new_parent {
+            if !self.nodes.contains_key(&pid) {
+                return Err(DocumentError::InvalidReparent { target: pid });
+            }
+        }
+
+        let subtree_ids: Vec<Uuid> = std::iter::once(source_root)
+            .chain(self.descendants_of(source_root))
             .collect();
         let mut snapshots: HashMap<Uuid, Node> = HashMap::with_capacity(subtree_ids.len());
         for id in &subtree_ids {
@@ -395,60 +423,39 @@ impl DocumentGraph {
             }
         }
 
-        // Map old uuid → new uuid.
         let mut id_map: HashMap<Uuid, Uuid> = HashMap::with_capacity(subtree_ids.len());
         for id in &subtree_ids {
             id_map.insert(*id, Uuid::new_v4());
         }
+        let new_root = *id_map.get(&source_root).expect("just inserted");
 
-        let new_root = *id_map.get(&artboard_id).expect("just inserted");
-
-        // Insert the new subtree top-down so each insert sees its
-        // parent in `self.nodes`.
+        let now = chrono::Utc::now();
         for old_id in &subtree_ids {
             let original = &snapshots[old_id];
             let mut copy = original.clone();
             copy.id = id_map[old_id];
-            copy.parent_id = if *old_id == artboard_id {
-                parent_id
+            copy.parent_id = if *old_id == source_root {
+                new_parent
             } else {
                 original
                     .parent_id
                     .and_then(|pid| id_map.get(&pid).copied())
-                    .or(parent_id)
+                    .or(new_parent)
             };
-            // Remap children to new ids; clone preserves order.
             copy.children = original
                 .children
                 .iter()
                 .filter_map(|c| id_map.get(c).copied())
                 .collect();
-            if *old_id == artboard_id {
-                copy.bounds.x += dx;
-                copy.bounds.y += dy;
-                copy.name = format!("{} copy", original.name);
-            }
             copy.version = 0;
-            let now = chrono::Utc::now();
             copy.created_at = now;
             copy.updated_at = now;
 
-            // Insert manually so we don't double-link children (the
-            // children list is already populated above).
-            if let Some(pid) = copy.parent_id {
-                if !self.nodes.contains_key(&pid) {
-                    return Err(DocumentError::InvalidReparent { target: pid });
-                }
-            }
             let copy_id = copy.id;
             let copy_parent = copy.parent_id;
             self.nodes.insert(copy.id, copy);
             if let Some(pid) = copy_parent {
-                // Only link the *root* of the cloned subtree into its
-                // new parent — descendants are already linked through
-                // the remapped `children` field, so re-linking them
-                // would double-list them.
-                if *old_id == artboard_id {
+                if *old_id == source_root {
                     if let Some(parent) = self.nodes.get_mut(&pid) {
                         if !parent.children.contains(&copy_id) {
                             parent.children.push(copy_id);
@@ -460,7 +467,6 @@ impl DocumentGraph {
                 self.root_ids.push(copy_id);
             }
         }
-
         Ok(new_root)
     }
 

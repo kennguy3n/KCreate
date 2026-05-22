@@ -79,17 +79,17 @@ pub fn icon_pack_export(req: &IconPackRequest) -> Result<IconPackOutcome> {
         .map(|s| Uuid::parse_str(s).map_err(|e| DocumentBridgeError::InvalidUuid(s.clone(), e)))
         .collect::<Result<Vec<Uuid>>>()?;
     let output_dir = PathBuf::from(&req.output_dir);
+    // Snapshot the Scene and a cheap Clone of the DocumentGraph under
+    // the workspace lock, then release it before invoking the
+    // (potentially slow) renderer. A web + iOS + Android + favicon
+    // pack rasterises 30+ sizes, and holding the workspace mutex for
+    // the duration would block every other N-API call — including the
+    // renderer's per-frame snapshot — during the icon export. Per
+    // Devin Review 3289537901.
     let scene = current_scene_safe()?;
-    let result = with_workspace(|ws| {
-        generate_icon_pack(
-            &scene,
-            &ws.project.document,
-            &ids,
-            &req.platforms,
-            &output_dir,
-        )
-        .map_err(|e| DocumentBridgeError::Io(std::io::Error::other(e.to_string())))
-    })?;
+    let document = with_workspace(|ws| Ok(ws.project.document.clone()))?;
+    let result = generate_icon_pack(&scene, &document, &ids, &req.platforms, &output_dir)
+        .map_err(|e| DocumentBridgeError::Io(std::io::Error::other(e.to_string())))?;
     std::fs::create_dir_all(&output_dir)?;
     let mut written: Vec<PathBuf> = Vec::with_capacity(result.files.len());
     for (path, bytes) in result.files {

@@ -216,14 +216,24 @@ mod tests {
     fn list_returns_full_set() {
         let dir = tempfile::tempdir().unwrap();
         let packs = list_model_packs(dir.path());
-        assert_eq!(packs.len(), 8);
-        assert!(packs.iter().any(|p| p.id == "bg_remove_threshold"));
-        assert!(packs.iter().any(|p| p.id == "upscale_lanczos"));
-        assert!(packs.iter().any(|p| p.id == "palette_kmeans"));
-        assert!(packs.iter().any(|p| p.id == "smart_select_flood"));
-        assert!(packs.iter().any(|p| p.id == "bg_remove_u2net"));
-        assert!(packs.iter().any(|p| p.id == "upscale_esrgan"));
-        assert!(packs.iter().any(|p| p.id == "llm_sidecar_3b"));
+        // Lock the *full* canonical set of pack ids — every id in
+        // `static_packs()` must appear here exactly once. A bare
+        // `packs.len() == N` check would let a rename slip through
+        // (count stays the same, id silently changes), so we compare
+        // the sorted id vector instead. Per Devin Review 3289537741.
+        let mut got: Vec<String> = packs.into_iter().map(|p| p.id).collect();
+        got.sort();
+        let expected: Vec<&str> = vec![
+            "bg_remove_threshold",
+            "bg_remove_u2net",
+            "llm_sidecar_3b",
+            "palette_kmeans",
+            "screenshot_to_layout",
+            "smart_select_flood",
+            "upscale_esrgan",
+            "upscale_lanczos",
+        ];
+        assert_eq!(got, expected, "pack id set drifted from canonical list");
     }
 
     #[test]

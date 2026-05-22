@@ -8,7 +8,9 @@
 //! The engine is pure: it inspects the graph and returns a
 //! `Vec<PreflightIssue>`. UI surfaces presentation; no file I/O.
 
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, OnceLock};
+
+use parking_lot::RwLock;
 
 use kcreate_core::document::DocumentGraph;
 use kcreate_core::node::{
@@ -124,6 +126,15 @@ impl Default for PreflightOptions {
 /// `RwLock<Option<...>>` so [`clear_cached_font_manager`] can drop the
 /// instance — without resetting the `OnceLock` itself, which Rust does
 /// not allow.
+///
+/// Uses `parking_lot::RwLock`, not `std::sync::RwLock`. `parking_lot`
+/// does not poison on panic, which matters here because every other
+/// long-lived lock in the workspace (`document.rs::slot`,
+/// `phase2.rs::batch_table`, `wasm_runtime.rs::module_cache`, …)
+/// also uses `parking_lot`. Mixing the two would mean a panic inside
+/// `FontManager::new()` permanently bricks the preflight panel for
+/// the lifetime of the process even though the rest of the editor
+/// keeps running. Per Devin Review 3289344249.
 fn font_manager_cell() -> &'static RwLock<Option<Arc<FontManager>>> {
     static CACHE: OnceLock<RwLock<Option<Arc<FontManager>>>> = OnceLock::new();
     CACHE.get_or_init(|| RwLock::new(None))
@@ -138,10 +149,10 @@ fn font_manager_cell() -> &'static RwLock<Option<Arc<FontManager>>> {
 /// (e.g. after the user installs a new font and re-opens the panel).
 fn cached_font_manager() -> Arc<FontManager> {
     let cell = font_manager_cell();
-    if let Some(existing) = cell.read().expect("preflight font cache poisoned").as_ref() {
+    if let Some(existing) = cell.read().as_ref() {
         return existing.clone();
     }
-    let mut guard = cell.write().expect("preflight font cache poisoned");
+    let mut guard = cell.write();
     if let Some(existing) = guard.as_ref() {
         return existing.clone();
     }
@@ -155,9 +166,7 @@ fn cached_font_manager() -> Arc<FontManager> {
 /// indicates they have installed or removed fonts (e.g. via a "Rescan
 /// fonts" action in the preflight panel).
 pub fn clear_cached_font_manager() {
-    if let Ok(mut guard) = font_manager_cell().write() {
-        *guard = None;
-    }
+    *font_manager_cell().write() = None;
 }
 
 /// Run preflight against the supplied pages. When `pages` is empty,

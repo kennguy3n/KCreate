@@ -1536,6 +1536,16 @@ pub fn master_page_create(name: String, size: &str, orientation: &str) -> Result
     Ok(id)
 }
 
+/// Parse a `PageSizeId` wire string into the core enum.
+///
+/// The accepted forms here are *exactly* the strings serde emits for
+/// the `kcreate_core::PageSize` variants (see the `#[serde(rename =
+/// ...)]` attributes on the enum), which is also the `PageSizeId` type
+/// declared in `apps/desktop/shared/scene.ts`. The two sides are kept
+/// in lockstep per AGENTS.md Rule 4; this parser is the single point
+/// where TypeScript `PageSizeId` strings cross into Rust, so the
+/// vocabulary list must match the serde rename set 1:1 — no
+/// alternate spellings, no case folding.
 fn parse_page_size(s: &str) -> Result<kcreate_core::PageSize> {
     Ok(match s {
         "a3" => kcreate_core::PageSize::A3,
@@ -1544,8 +1554,8 @@ fn parse_page_size(s: &str) -> Result<kcreate_core::PageSize> {
         "letter" => kcreate_core::PageSize::Letter,
         "legal" => kcreate_core::PageSize::Legal,
         "tabloid" => kcreate_core::PageSize::Tabloid,
-        "presentation_16x9" | "presentation16x9" => kcreate_core::PageSize::Presentation16x9,
-        "presentation_4x3" | "presentation4x3" => kcreate_core::PageSize::Presentation4x3,
+        "presentation_16x9" => kcreate_core::PageSize::Presentation16x9,
+        "presentation_4x3" => kcreate_core::PageSize::Presentation4x3,
         other => return Err(DocumentBridgeError::InvalidNodeType(other.to_string())),
     })
 }
@@ -4829,5 +4839,63 @@ mod tests {
         let err = layout_template_apply(Uuid::nil()).expect_err("unknown");
         assert!(matches!(err, DocumentBridgeError::InvalidNodeType(_)));
         project_close();
+    }
+
+    /// Locks the `PageSizeId` wire vocabulary. The accepted strings
+    /// here must match the serde `#[rename]` set on
+    /// `kcreate_core::PageSize` *and* the `PageSizeId` union in
+    /// `apps/desktop/shared/scene.ts` exactly — no aliases. Catches
+    /// the dead-code re-introduction the Devin Review #20 finding
+    /// warned about.
+    #[test]
+    fn parse_page_size_accepts_canonical_wire_strings_only() {
+        // Canonical (serde-renamed) forms — all eight must round-trip.
+        for (wire, expected) in [
+            ("a3", kcreate_core::PageSize::A3),
+            ("a4", kcreate_core::PageSize::A4),
+            ("a5", kcreate_core::PageSize::A5),
+            ("letter", kcreate_core::PageSize::Letter),
+            ("legal", kcreate_core::PageSize::Legal),
+            ("tabloid", kcreate_core::PageSize::Tabloid),
+            (
+                "presentation_16x9",
+                kcreate_core::PageSize::Presentation16x9,
+            ),
+            ("presentation_4x3", kcreate_core::PageSize::Presentation4x3),
+        ] {
+            let parsed = parse_page_size(wire).unwrap_or_else(|e| {
+                panic!("parse_page_size({wire:?}) should succeed but got {e:?}")
+            });
+            assert_eq!(
+                parsed, expected,
+                "parse_page_size({wire:?}) returned the wrong variant",
+            );
+        }
+
+        // No-underscore forms must be rejected — they would compile
+        // here but never appear in the wire format (serde's
+        // snake_case rule doesn't insert `_` before digits, which is
+        // why the variants need an explicit `#[serde(rename)]` in
+        // core/src/node.rs). Accepting them would mask a wire-format
+        // drift between Rust and TS instead of surfacing it.
+        for bad in ["presentation16x9", "presentation4x3"] {
+            let err = parse_page_size(bad).expect_err("must reject no-underscore form");
+            match err {
+                DocumentBridgeError::InvalidNodeType(s) => assert_eq!(s, bad),
+                other => panic!("expected InvalidNodeType({bad:?}), got {other:?}"),
+            }
+        }
+
+        // Uppercase / mixed-case must also be rejected — wire format
+        // is case-sensitive on both sides.
+        for bad in ["A4", "Letter", "Presentation_16x9"] {
+            assert!(
+                matches!(
+                    parse_page_size(bad),
+                    Err(DocumentBridgeError::InvalidNodeType(_))
+                ),
+                "parse_page_size should reject case-folded form {bad:?}"
+            );
+        }
     }
 }

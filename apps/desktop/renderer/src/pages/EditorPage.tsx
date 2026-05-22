@@ -11,12 +11,21 @@ import {
 } from "../components/TopBar";
 import { AIAssistPanel } from "../components/AIAssistPanel";
 import { ExportPanel } from "../components/ExportPanel";
+import { ArtboardDialog } from "../components/ArtboardDialog";
+import { ResponsivePreview } from "../components/ResponsivePreview";
 import type {
+  ArtboardInfo,
+  ArtboardPreset,
+  ComponentInfo,
   DocumentStatus,
+  FlexLayout,
+  GridLayout,
   NodeInfo,
   ProjectInfo,
+  ResourceLimits,
   Scene,
 } from "../../../shared/scene";
+import { LowResourceBanner } from "../components/LowResourceBanner";
 import { colors, font, spacing } from "../styles/tokens";
 
 export interface EditorPageProps {
@@ -66,6 +75,15 @@ export function EditorPage({
   // sentinel today.
   const [scene] = useState<Scene>(EMPTY_SCENE);
   const [docStatus, setDocStatus] = useState<DocumentStatus | null>(null);
+  const [artboards, setArtboards] = useState<ArtboardInfo[]>([]);
+  const [artboardPresets, setArtboardPresets] = useState<ArtboardPreset[]>(
+    [],
+  );
+  const [artboardDialogOpen, setArtboardDialogOpen] = useState(false);
+  const [components, setComponents] = useState<ComponentInfo[]>([]);
+  const [resourceLimits, setResourceLimits] = useState<ResourceLimits | null>(
+    null,
+  );
   const lastTickAtRef = useRef<number>(performance.now());
   // Drag-to-create / drag-to-move state. Storing in a ref keeps the
   // pointer handler stable while still tracking the current drag.
@@ -103,6 +121,24 @@ export function EditorPage({
     }
   }, []);
 
+  const refreshArtboards = useCallback(async () => {
+    try {
+      const list = await window.kcreate.artboard.list();
+      setArtboards(list);
+    } catch (e) {
+      setStatusMessage(`artboard list failed: ${errorMessage(e)}`);
+    }
+  }, []);
+
+  const refreshComponents = useCallback(async () => {
+    try {
+      const list = await window.kcreate.component.list();
+      setComponents(list);
+    } catch (e) {
+      setStatusMessage(`component list failed: ${errorMessage(e)}`);
+    }
+  }, []);
+
   const refreshTree = useCallback(async () => {
     try {
       const tree = await window.kcreate.document.getDocumentTree();
@@ -112,12 +148,268 @@ export function EditorPage({
     }
     await refreshStatus();
     await refreshSelection();
-  }, [refreshStatus, refreshSelection]);
+    await refreshArtboards();
+    await refreshComponents();
+  }, [refreshStatus, refreshSelection, refreshArtboards, refreshComponents]);
 
   // Initial load + on-mode-change resync.
   useEffect(() => {
     void refreshTree();
   }, [refreshTree]);
+
+  const refreshResourceLimits = useCallback(async () => {
+    try {
+      const limits = await window.kcreate.runtime.resourceLimits();
+      setResourceLimits(limits);
+    } catch (e) {
+      setStatusMessage(`resource limits failed: ${errorMessage(e)}`);
+    }
+  }, []);
+
+  const handleToggleLowResource = useCallback(
+    async (enabled: boolean) => {
+      try {
+        await window.kcreate.runtime.lowResourceModeSet(enabled);
+        await refreshResourceLimits();
+      } catch (e) {
+        setStatusMessage(`toggle low-resource failed: ${errorMessage(e)}`);
+      }
+    },
+    [refreshResourceLimits],
+  );
+
+  useEffect(() => {
+    void refreshResourceLimits();
+  }, [refreshResourceLimits]);
+
+  // Load preset catalogue once. It's deterministic and the bridge
+  // recomputes it on each call so caching once on mount is fine.
+  useEffect(() => {
+    let cancelled = false;
+    void window.kcreate.artboard
+      .presets()
+      .then((p) => {
+        if (!cancelled) setArtboardPresets(p);
+      })
+      .catch((err: unknown) => {
+        if (!cancelled) {
+          setStatusMessage(`artboard presets failed: ${errorMessage(err)}`);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // Focus the canvas viewport on an artboard with ~10% margin.
+  // World→screen transform is `screen = world * zoom + pan`, so to
+  // center an artboard of bounds (x, y, w, h) we solve for pan such
+  // that the artboard center sits at the canvas center.
+  const focusArtboard = useCallback((a: ArtboardInfo) => {
+    const marginFactor = 0.9;
+    const zoom = Math.min(
+      (CANVAS_WIDTH * marginFactor) / Math.max(a.width, 1),
+      (CANVAS_HEIGHT * marginFactor) / Math.max(a.height, 1),
+    );
+    const centerWorldX = a.x + a.width / 2;
+    const centerWorldY = a.y + a.height / 2;
+    const panX = CANVAS_WIDTH / 2 - centerWorldX * zoom;
+    const panY = CANVAS_HEIGHT / 2 - centerWorldY * zoom;
+    setViewport({ panX, panY, zoom });
+    void window.kcreate.canvas.setSelection([a.id]).then(refreshSelection);
+  }, [refreshSelection]);
+
+  const handleCreateArtboard = useCallback(
+    async (args: { name: string; width: number; height: number }) => {
+      try {
+        const id = await window.kcreate.artboard.create(
+          null,
+          args.name,
+          args.width,
+          args.height,
+        );
+        await refreshTree();
+        const list = await window.kcreate.artboard.list();
+        setArtboards(list);
+        const created = list.find((a) => a.id === id);
+        if (created) focusArtboard(created);
+      } catch (e) {
+        setStatusMessage(`create artboard failed: ${errorMessage(e)}`);
+      } finally {
+        setArtboardDialogOpen(false);
+      }
+    },
+    [refreshTree, focusArtboard],
+  );
+
+  const handleDuplicateArtboard = useCallback(
+    async (id: string) => {
+      try {
+        await window.kcreate.artboard.duplicate(id);
+        await refreshTree();
+      } catch (e) {
+        setStatusMessage(`duplicate artboard failed: ${errorMessage(e)}`);
+      }
+    },
+    [refreshTree],
+  );
+
+  const handleResizeArtboard = useCallback(
+    async (id: string, width: number, height: number) => {
+      try {
+        await window.kcreate.artboard.resize(id, width, height);
+        await refreshTree();
+      } catch (e) {
+        setStatusMessage(`resize artboard failed: ${errorMessage(e)}`);
+      }
+    },
+    [refreshTree],
+  );
+
+  const handleDeleteArtboard = useCallback(
+    async (id: string) => {
+      try {
+        await window.kcreate.document.deleteNode(id);
+        await refreshTree();
+      } catch (e) {
+        setStatusMessage(`delete artboard failed: ${errorMessage(e)}`);
+      }
+    },
+    [refreshTree],
+  );
+
+  const handleRenameArtboard = useCallback(
+    async (id: string, name: string) => {
+      try {
+        await window.kcreate.document.updateNode(id, { name });
+        await refreshTree();
+      } catch (e) {
+        setStatusMessage(`rename artboard failed: ${errorMessage(e)}`);
+      }
+    },
+    [refreshTree],
+  );
+
+  // Component lifecycle handlers. Each one mirrors a single bridge
+  // call and then refreshes both the tree and the component list so
+  // the panel stays in sync.
+  const handleComponentCreateFromSelection = useCallback(
+    async (name: string) => {
+      if (selectedIds.length === 0) {
+        setStatusMessage("select one or more sibling nodes first");
+        return;
+      }
+      try {
+        await window.kcreate.component.createFromSelection(selectedIds, name);
+        await refreshTree();
+      } catch (e) {
+        setStatusMessage(`create component failed: ${errorMessage(e)}`);
+      }
+    },
+    [selectedIds, refreshTree],
+  );
+
+  const handleComponentInstantiate = useCallback(
+    async (componentId: string) => {
+      // Default to the first artboard (or null = project root) so
+      // newly-placed instances land somewhere visible. (x, y) is the
+      // top-left of the new layer relative to that parent.
+      const parentId = artboards[0]?.id ?? null;
+      try {
+        await window.kcreate.component.instantiate(
+          componentId,
+          parentId,
+          80,
+          80,
+        );
+        await refreshTree();
+      } catch (e) {
+        setStatusMessage(`instantiate component failed: ${errorMessage(e)}`);
+      }
+    },
+    [artboards, refreshTree],
+  );
+
+  const handleComponentAddVariant = useCallback(
+    async (componentId: string, name: string) => {
+      try {
+        await window.kcreate.component.addVariant(componentId, name);
+        await refreshComponents();
+      } catch (e) {
+        setStatusMessage(`add variant failed: ${errorMessage(e)}`);
+      }
+    },
+    [refreshComponents],
+  );
+
+  const handleComponentSwitchVariant = useCallback(
+    async (nodeId: string, variantId: string) => {
+      try {
+        await window.kcreate.component.switchVariant(nodeId, variantId);
+        await refreshTree();
+      } catch (e) {
+        setStatusMessage(`switch variant failed: ${errorMessage(e)}`);
+      }
+    },
+    [refreshTree],
+  );
+
+  const handleComponentDetach = useCallback(
+    async (nodeId: string) => {
+      try {
+        await window.kcreate.component.detach(nodeId);
+        await refreshTree();
+      } catch (e) {
+        setStatusMessage(`detach component failed: ${errorMessage(e)}`);
+      }
+    },
+    [refreshTree],
+  );
+
+  const layoutHandlers = useMemo(
+    () => ({
+      // `setFlex` / `setGrid` only persist the layout config on the
+      // node; the visible child bounds change when `recompute` runs
+      // *next*. Skip the intermediate `refreshTree` here so a single
+      // user edit fires just two IPC round-trips (set → recompute)
+      // and one final tree fetch instead of four. RightPanel's
+      // FlexControls / GridControls always call `recompute` right
+      // after, which carries the refresh.
+      setFlex: async (nodeId: string, config: FlexLayout) => {
+        try {
+          await window.kcreate.layout.setFlex(nodeId, config);
+        } catch (e) {
+          setStatusMessage(`set flex layout failed: ${errorMessage(e)}`);
+        }
+      },
+      setGrid: async (nodeId: string, config: GridLayout) => {
+        try {
+          await window.kcreate.layout.setGrid(nodeId, config);
+        } catch (e) {
+          setStatusMessage(`set grid layout failed: ${errorMessage(e)}`);
+        }
+      },
+      recompute: async (nodeId: string) => {
+        try {
+          await window.kcreate.layout.recompute(nodeId);
+          await refreshTree();
+        } catch (e) {
+          setStatusMessage(`layout recompute failed: ${errorMessage(e)}`);
+        }
+      },
+      convertToFrame: async (nodeId: string) => {
+        try {
+          await window.kcreate.layout.convertToFrame(nodeId);
+          await refreshTree();
+        } catch (e) {
+          setStatusMessage(
+            `layout convert to frame failed: ${errorMessage(e)}`,
+          );
+        }
+      },
+    }),
+    [refreshTree],
+  );
 
   // When the mode changes, snap to its default tool so the canvas
   // cursor and toolbar stay aligned.
@@ -628,6 +920,39 @@ export function EditorPage({
               }
             })();
           }}
+          artboards={artboards}
+          onRequestCreateArtboard={() => setArtboardDialogOpen(true)}
+          onFocusArtboard={focusArtboard}
+          onRenameArtboard={(id, name) => {
+            void handleRenameArtboard(id, name);
+          }}
+          onDuplicateArtboard={(id) => {
+            void handleDuplicateArtboard(id);
+          }}
+          onResizeArtboard={(id, w, h) => {
+            void handleResizeArtboard(id, w, h);
+          }}
+          onDeleteArtboard={(id) => {
+            void handleDeleteArtboard(id);
+          }}
+          selectedIds={selectedIds}
+          components={components}
+          onComponentCreateFromSelection={(name) => {
+            void handleComponentCreateFromSelection(name);
+          }}
+          onComponentInstantiate={(id) => {
+            void handleComponentInstantiate(id);
+          }}
+          onComponentAddVariant={(id, name) => {
+            void handleComponentAddVariant(id, name);
+          }}
+          onComponentSwitchVariant={(nodeId, variantId) => {
+            void handleComponentSwitchVariant(nodeId, variantId);
+          }}
+          onComponentDetach={(id) => {
+            void handleComponentDetach(id);
+          }}
+          onDesignSystemStatus={setStatusMessage}
         />
         <main
           style={{
@@ -662,6 +987,18 @@ export function EditorPage({
           >
             {fps} fps · {mode} · {tool} · {Math.round(viewport.zoom * 100)}%
           </div>
+          {mode === "prototype" ? (
+            <div
+              style={{
+                position: "absolute",
+                inset: 0,
+                background: "rgba(17, 24, 39, 0.92)",
+                overflow: "auto",
+              }}
+            >
+              <ResponsivePreview onStatus={setStatusMessage} />
+            </div>
+          ) : null}
         </main>
         {rightPanelFocus === "ai" ? (
           <AIAssistPanel
@@ -687,9 +1024,16 @@ export function EditorPage({
             onRequestExport={() => {
               void handleExport();
             }}
+            layout={layoutHandlers}
           />
         )}
       </div>
+      {resourceLimits ? (
+        <LowResourceBanner
+          limits={resourceLimits}
+          onToggle={handleToggleLowResource}
+        />
+      ) : null}
       <footer
         style={{
           padding: `${spacing.xs}px ${spacing.md}px`,
@@ -709,6 +1053,14 @@ export function EditorPage({
             : `${selectedIds.length} selected`}
         </span>
       </footer>
+      <ArtboardDialog
+        open={artboardDialogOpen}
+        presets={artboardPresets}
+        onCreate={(args) => {
+          void handleCreateArtboard(args);
+        }}
+        onClose={() => setArtboardDialogOpen(false)}
+      />
     </div>
   );
 }

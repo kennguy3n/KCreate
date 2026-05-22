@@ -15,6 +15,7 @@
 #![forbid(unsafe_op_in_unsafe_fn)]
 
 pub mod batch;
+pub mod code_gen;
 pub mod jpeg;
 pub mod pdf;
 pub mod png;
@@ -22,6 +23,7 @@ pub mod svg;
 pub mod webp;
 
 pub use batch::{run_batch, BatchExportError, BatchExportJob, BatchStatus, ExportItem};
+pub use code_gen::{inspect_node, node_to_css, node_to_react_style, node_to_tailwind, InspectCode};
 pub use jpeg::{export_jpeg, export_jpeg_to_bytes, JpegExportError, JpegExportOptions};
 pub use pdf::{
     export_pdf_from_document, PdfExportError, PdfExportOptions, RasterPixelCache, RasterPixels,

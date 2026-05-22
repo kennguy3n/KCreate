@@ -24,6 +24,29 @@ pub enum DeviceTier {
 }
 
 impl DeviceTier {
+    /// Maximum AI model size (MB) the tier will load. Tier 0 caps at
+    /// ~Q4 7B-sized models; higher tiers allow proportionally more.
+    #[must_use]
+    pub const fn default_max_model_mb(self) -> u64 {
+        match self {
+            Self::Tier0 => 1500,
+            Self::Tier1 => 4000,
+            Self::Tier2 => 8000,
+            Self::Tier3 => 16000,
+        }
+    }
+
+    /// Whether GPU-backed rendering is permitted on this tier. The
+    /// renderer's adapter request is still the authoritative check —
+    /// this returns the *intent* of the device-tier policy. Tier 0
+    /// stays on the CPU backend even if a GPU is technically
+    /// available because the discrete VRAM budget would starve
+    /// editing-side caches.
+    #[must_use]
+    pub const fn gpu_rendering_allowed(self) -> bool {
+        matches!(self, Self::Tier1 | Self::Tier2 | Self::Tier3)
+    }
+
     /// Derive a tier from RAM + GPU presence. Pure function; trivially
     /// testable.
     #[must_use]
@@ -138,8 +161,77 @@ pub struct RuntimeConfig {
     pub max_undo_depth: usize,
     pub tile_size: u32,
     pub max_raster_cache_mb: u64,
+    pub max_model_mb: u64,
     pub ai_models_dir: PathBuf,
     pub low_resource_mode: bool,
+}
+
+impl RuntimeConfig {
+    /// True when low-resource mode is active (Tier 0 implicitly, or
+    /// any tier that has had the flag flipped explicitly via
+    /// [`Self::set_low_resource`]).
+    #[must_use]
+    pub const fn is_low_resource(&self) -> bool {
+        self.low_resource_mode
+    }
+
+    /// Effective undo depth: the minimum of the configured depth and
+    /// the tier default. Low-resource mode further halves the
+    /// effective depth so the editing log stays bounded on tiny
+    /// devices.
+    #[must_use]
+    pub fn effective_undo_depth(&self) -> usize {
+        let base = self
+            .max_undo_depth
+            .min(self.device_tier.default_undo_depth());
+        if self.low_resource_mode {
+            (base / 2).max(8)
+        } else {
+            base
+        }
+    }
+
+    /// Effective raster cache budget in MB. Low-resource mode halves
+    /// the configured budget to leave headroom for the rest of the
+    /// host process.
+    #[must_use]
+    pub fn effective_raster_cache_mb(&self) -> u64 {
+        let base = self
+            .max_raster_cache_mb
+            .min(self.device_tier.default_raster_cache_mb());
+        if self.low_resource_mode {
+            (base / 2).max(16)
+        } else {
+            base
+        }
+    }
+
+    /// Effective maximum model size in MB.
+    #[must_use]
+    pub fn effective_max_model_mb(&self) -> u64 {
+        let base = self
+            .max_model_mb
+            .min(self.device_tier.default_max_model_mb());
+        if self.low_resource_mode {
+            (base * 2) / 3
+        } else {
+            base
+        }
+    }
+
+    /// GPU rendering is allowed when (a) the tier permits it, (b) a
+    /// GPU was detected, and (c) low-resource mode is off.
+    #[must_use]
+    pub const fn gpu_rendering_allowed(&self) -> bool {
+        self.gpu_available && self.device_tier.gpu_rendering_allowed() && !self.low_resource_mode
+    }
+
+    /// Flip the low-resource flag in place. Tier 0 always stays at
+    /// `true` regardless of the request because the tier defaults
+    /// require it.
+    pub fn set_low_resource(&mut self, enabled: bool) {
+        self.low_resource_mode = enabled || self.device_tier.defaults_to_low_resource();
+    }
 }
 
 impl RuntimeConfig {
@@ -172,6 +264,7 @@ impl RuntimeConfig {
         let device_tier = DeviceTier::from_system_info(&info);
         let max_undo_depth = device_tier.default_undo_depth();
         let max_raster_cache_mb = device_tier.default_raster_cache_mb();
+        let max_model_mb = device_tier.default_max_model_mb();
         let low_resource_mode = device_tier.defaults_to_low_resource();
         Self {
             platform,
@@ -182,6 +275,7 @@ impl RuntimeConfig {
             max_undo_depth,
             tile_size: 256,
             max_raster_cache_mb,
+            max_model_mb,
             ai_models_dir: default_ai_models_dir(),
             low_resource_mode,
         }
@@ -387,5 +481,70 @@ mod tests {
     fn current_platform_is_supported() {
         let p = Platform::current();
         let _ = format!("{p:?}");
+    }
+
+    #[test]
+    fn tier_max_model_monotonic() {
+        let m: Vec<u64> = [
+            DeviceTier::Tier0,
+            DeviceTier::Tier1,
+            DeviceTier::Tier2,
+            DeviceTier::Tier3,
+        ]
+        .into_iter()
+        .map(DeviceTier::default_max_model_mb)
+        .collect();
+        assert!(m.windows(2).all(|w| w[0] < w[1]));
+    }
+
+    #[test]
+    fn gpu_rendering_allowed_only_above_tier0() {
+        assert!(!DeviceTier::Tier0.gpu_rendering_allowed());
+        assert!(DeviceTier::Tier1.gpu_rendering_allowed());
+        assert!(DeviceTier::Tier2.gpu_rendering_allowed());
+        assert!(DeviceTier::Tier3.gpu_rendering_allowed());
+    }
+
+    fn cfg_for(ram_gb: u64, gpu: bool) -> RuntimeConfig {
+        RuntimeConfig::from_info(
+            SystemInfo {
+                total_ram_mb: ram_gb * 1024,
+                gpu_available: gpu,
+            },
+            None,
+        )
+    }
+
+    #[test]
+    fn effective_limits_respect_low_resource() {
+        let mut cfg = cfg_for(16, true); // Tier2, no LR
+        let undo_full = cfg.effective_undo_depth();
+        let raster_full = cfg.effective_raster_cache_mb();
+        let model_full = cfg.effective_max_model_mb();
+        assert!(cfg.gpu_rendering_allowed());
+        cfg.set_low_resource(true);
+        assert!(cfg.is_low_resource());
+        assert!(cfg.effective_undo_depth() < undo_full);
+        assert!(cfg.effective_raster_cache_mb() < raster_full);
+        assert!(cfg.effective_max_model_mb() < model_full);
+        assert!(!cfg.gpu_rendering_allowed());
+    }
+
+    #[test]
+    fn tier0_cannot_disable_low_resource() {
+        let mut cfg = cfg_for(4, false); // Tier0
+        assert!(cfg.is_low_resource());
+        cfg.set_low_resource(false);
+        // Tier0 is forced back into low-resource regardless.
+        assert!(cfg.is_low_resource());
+    }
+
+    #[test]
+    fn effective_undo_depth_clamps_to_floor() {
+        // Even with low-resource halving, the floor is 8.
+        let mut cfg = cfg_for(4, false);
+        assert_eq!(cfg.device_tier, DeviceTier::Tier0);
+        cfg.max_undo_depth = 4;
+        assert!(cfg.effective_undo_depth() >= 8);
     }
 }

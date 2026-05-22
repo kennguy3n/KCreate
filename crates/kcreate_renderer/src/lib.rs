@@ -17,6 +17,7 @@ pub mod cpu_backend;
 pub mod display_list;
 pub mod geometry;
 pub mod gpu;
+pub mod native_surface;
 pub mod pipeline;
 pub mod presenter;
 pub mod readback;
@@ -35,11 +36,53 @@ pub use cpu_backend::CpuBackend;
 pub use display_list::{DisplayCommand, DisplayList};
 pub use geometry::{Color, PathCommand, Point2, Rect, Stroke, Style, Vec2};
 pub use gpu::{GpuBackend, GpuTier};
+pub use native_surface::NativeSurface;
 pub use pipeline::Pipeline;
 pub use presenter::{FrameId, FrameLease, Presenter};
 pub use scene::{Object, ObjectId, ObjectKind, Scene};
 pub use spatial::SpatialIndex;
 pub use viewport::Viewport;
+
+/// Which presentation path the renderer is currently configured to
+/// use. Phase 0 is `Offscreen` everywhere; Phase 1 will switch
+/// platform-by-platform to `Native` as the Electron child-window
+/// embedding lands.
+///
+/// The pipeline, display list, viewport, and scene-graph layers
+/// are presentation-mode-agnostic — only the final "publish a
+/// frame" step differs:
+///
+/// - `Offscreen`: render into [`crate::surface::OffscreenSurface`],
+///   read pixels back to a CPU buffer, hand the buffer to the
+///   [`Presenter`], publish a [`FrameId`]. The host pulls the
+///   buffer over N-API + IPC and paints it on a 2D `<canvas>`.
+/// - `Native`: render into the swapchain texture acquired from a
+///   [`NativeSurface`], present directly. No readback, no IPC, no
+///   `putImageData`.
+///
+/// This enum carries the active surface (when `Native`) so the
+/// publish step can call `present_cpu_frame` on it. It is `Debug`
+/// (via the wrapped [`NativeSurface`]) so callers can include it
+/// in diagnostic logs.
+#[derive(Debug)]
+pub enum PresentationMode {
+    /// Offscreen rasterization + CPU readback, used by Phase 0
+    /// and any host that cannot accept a raw window handle (e.g.
+    /// Electron's web view before child-window embedding).
+    Offscreen,
+    /// Direct swapchain presentation against a real OS window.
+    /// The wrapped surface is owned by the renderer for the
+    /// duration of the editor session.
+    Native(Box<NativeSurface>),
+}
+
+impl PresentationMode {
+    /// `true` when this mode bypasses the CPU readback path.
+    #[must_use]
+    pub const fn is_native(&self) -> bool {
+        matches!(self, Self::Native(_))
+    }
+}
 
 /// Errors returned by the renderer.
 #[derive(Debug, Error)]
@@ -272,6 +315,98 @@ impl RenderContext {
         }
     }
 
+    /// Render the scene into the swapchain texture of the given
+    /// [`NativeSurface`] and present it. This is the Phase 1 fast
+    /// path that bypasses the offscreen → readback → IPC chain.
+    ///
+    /// The GPU backend must be active (Phase 1 swap path uses
+    /// `device` + `queue` from `GpuBackend`). On the CPU fallback,
+    /// returns `RendererError::Wgpu("native present requires GPU
+    /// backend")` because there's no device/queue to upload with.
+    ///
+    /// Like [`Self::render_frame`], this is a no-op when nothing is
+    /// dirty: it returns the previous [`FrameId`] without re-running
+    /// the pipeline or touching the swapchain.
+    pub fn render_frame_native(
+        &self,
+        scene: &Scene,
+        native_surface: &NativeSurface,
+    ) -> Result<FrameId> {
+        let dirty = {
+            let mut guard = self.dirty_region.lock();
+            guard.take()
+        };
+        let viewport = *self.viewport.lock();
+
+        if dirty.is_none() && self.sequence.load(Ordering::Acquire) > 0 {
+            return Ok(FrameId(self.sequence.load(Ordering::Acquire)));
+        }
+
+        let display_list = {
+            let mut pipeline = self.pipeline.lock();
+            pipeline.build_display_list(scene, &viewport, (self.width, self.height))
+        };
+
+        let frame_id = FrameId(self.next_frame_id.fetch_add(1, Ordering::AcqRel));
+        let mut staging = self.presenter.acquire_staging(self.width, self.height);
+
+        // Rasterize via the same path the offscreen mode uses — the
+        // GPU backend's current rasterizer is a CPU compositor, and
+        // the CPU backend obviously is too. Either way we get
+        // straight-alpha RGBA8 bytes back, which we then upload
+        // straight into the swapchain texture.
+        let render_result = self.backend.lock().render(
+            scene,
+            &viewport,
+            &display_list,
+            &mut staging,
+            (self.width, self.height),
+        );
+
+        match render_result {
+            Ok(()) => {
+                let publish_result = {
+                    let backend = self.backend.lock();
+                    match &*backend {
+                        BackendKind::Gpu(g) => {
+                            native_surface.present_cpu_frame(g.device(), g.queue(), &staging)
+                        }
+                        BackendKind::Cpu(_) => Err(RendererError::Wgpu(
+                            "native present requires GPU backend (CPU fallback in use)".into(),
+                        )),
+                    }
+                };
+                match publish_result {
+                    Ok(()) => {
+                        // Keep the presenter's staging recycling path
+                        // honest — we never actually published to the
+                        // presenter in native mode, so the buffer is
+                        // returned to the free list.
+                        self.presenter.recycle_staging(staging);
+                        self.sequence.store(frame_id.0, Ordering::Release);
+                        Ok(frame_id)
+                    }
+                    Err(e) => {
+                        if let Some(rect) = dirty {
+                            let mut g = self.dirty_region.lock();
+                            *g = Some(g.map_or(rect, |existing| existing.union(&rect)));
+                        }
+                        self.presenter.recycle_staging(staging);
+                        Err(e)
+                    }
+                }
+            }
+            Err(e) => {
+                if let Some(rect) = dirty {
+                    let mut g = self.dirty_region.lock();
+                    *g = Some(g.map_or(rect, |existing| existing.union(&rect)));
+                }
+                self.presenter.recycle_staging(staging);
+                Err(e)
+            }
+        }
+    }
+
     /// Borrow the pixels for the most recently published frame.
     ///
     /// The returned slice is RGBA8, row-major, of length `width * height * 4`.
@@ -462,5 +597,28 @@ mod tests {
         let region = ctx.dirty_region.lock().expect("dirty");
         assert_eq!(region.width, 64.0);
         assert_eq!(region.height, 64.0);
+    }
+
+    #[test]
+    fn presentation_mode_offscreen_reports_not_native() {
+        let mode = PresentationMode::Offscreen;
+        assert!(!mode.is_native());
+    }
+
+    /// `Offscreen` is the Phase 0 default — confirm that the
+    /// existing render loop reads as not-native and that the
+    /// renderer continues to produce frames via the readback path
+    /// when configured this way. We don't construct a `Native`
+    /// variant here because the `NativeSurface` constructor
+    /// requires a real OS window handle, which headless CI does
+    /// not have.
+    #[test]
+    fn offscreen_mode_continues_to_publish_frames() {
+        let mode = PresentationMode::Offscreen;
+        assert!(matches!(mode, PresentationMode::Offscreen));
+        let ctx = initialize(16, 16).expect("init");
+        let scene = Scene::new(Color::rgba(0.0, 0.0, 0.0, 1.0));
+        let frame = ctx.render_frame(&scene).expect("render");
+        assert!(ctx.get_frame_pixels(frame).is_some());
     }
 }

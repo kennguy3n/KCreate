@@ -383,6 +383,11 @@ function registerIpcHandlers(): void {
     requireBridge().documentGetTree(),
   );
   ipcMain.handle(
+    "kcreate/document/inspectNode",
+    (_e, nodeId: string): string =>
+      requireBridge().documentInspectNode(nodeId),
+  );
+  ipcMain.handle(
     "kcreate/document/createNode",
     (
       _e,
@@ -417,6 +422,57 @@ function registerIpcHandlers(): void {
   ipcMain.handle("kcreate/runtime/status", () =>
     requireBridge().runtimeStatus(),
   );
+  ipcMain.handle("kcreate/runtime/lowResourceMode/get", (): boolean =>
+    requireBridge().lowResourceModeGet(),
+  );
+  ipcMain.handle(
+    "kcreate/runtime/lowResourceMode/set",
+    (_e, enabled: boolean): void => {
+      requireBridge().lowResourceModeSet(enabled);
+    },
+  );
+  ipcMain.handle("kcreate/runtime/resourceLimits", (): string =>
+    requireBridge().resourceLimits(),
+  );
+
+  ipcMain.handle(
+    "kcreate/llm/start",
+    (_e, modelPath: string): number =>
+      requireBridge().llmStart(modelPath),
+  );
+  ipcMain.handle("kcreate/llm/stop", (): void => {
+    requireBridge().llmStop();
+  });
+  ipcMain.handle("kcreate/llm/status", (): string =>
+    requireBridge().llmStatus(),
+  );
+  // Each LLM completion handler simply forwards the bridge's
+  // Promise. The bridge runs the blocking HTTP work on N-API's
+  // libuv thread pool (see `LlmChatTask` etc. in
+  // `crates/kcreate_bridge/src/lib.rs`), so the main loop stays
+  // responsive across the up-to-60-second llama-server timeout.
+  ipcMain.handle(
+    "kcreate/llm/chat",
+    (
+      _e,
+      messagesJson: string,
+      maxTokens: number,
+      temperature: number,
+    ): Promise<string> =>
+      requireBridge().llmChat(messagesJson, maxTokens, temperature),
+  );
+  ipcMain.handle("kcreate/llm/suggest", (): Promise<string> =>
+    requireBridge().llmSuggestForSelection(),
+  );
+  ipcMain.handle("kcreate/ai/suggestLayerNames", (): Promise<string> =>
+    requireBridge().aiSuggestLayerNames(),
+  );
+  ipcMain.handle("kcreate/ai/extractDesignTokens", (): Promise<string> =>
+    requireBridge().aiExtractDesignTokens(),
+  );
+  ipcMain.handle("kcreate/ai/checkAccessibility", (): Promise<string> =>
+    requireBridge().aiCheckAccessibility(),
+  );
   // The OS temp dir is owned by the host (Node `os.tmpdir()`), not by
   // the Rust bridge — it's a process-environment concern, not a
   // rendering one. Surfacing it through the runtime bridge lets the
@@ -428,6 +484,29 @@ function registerIpcHandlers(): void {
   // renderer never picks the path/prefix.
   ipcMain.handle("kcreate/runtime/cleanupScratchProjects", () =>
     cleanupScratchProjects(),
+  );
+  // Sandboxed text-file sink used by the dev-handoff export preset
+  // and other renderer-side sidecars. The path is canonicalised
+  // against `os.tmpdir()` so the renderer can only write inside the
+  // OS temp directory (the same root `tempDir()` hands out). Any
+  // attempt to escape that root via `..` or an absolute prefix is
+  // rejected.
+  ipcMain.handle(
+    "kcreate/runtime/writeTextFile",
+    async (_e, target: string, content: string): Promise<number> => {
+      const tmp = path.resolve(os.tmpdir());
+      const resolved = path.resolve(target);
+      const rel = path.relative(tmp, resolved);
+      if (rel.startsWith("..") || path.isAbsolute(rel)) {
+        throw new Error(
+          `writeTextFile rejected: ${target} is outside ${tmp}`,
+        );
+      }
+      await fs.mkdir(path.dirname(resolved), { recursive: true });
+      const bytes = Buffer.byteLength(content, "utf8");
+      await fs.writeFile(resolved, content, "utf8");
+      return bytes;
+    },
   );
 
   ipcMain.handle(
@@ -604,6 +683,104 @@ function registerIpcHandlers(): void {
   );
   ipcMain.handle("kcreate/exportPreset/delete", (_e, presetId: string) =>
     requireBridge().exportPresetDelete(presetId),
+  );
+
+  ipcMain.handle(
+    "kcreate/artboard/create",
+    (
+      _e,
+      pageId: string,
+      name: string,
+      width: number,
+      height: number,
+    ): string =>
+      requireBridge().artboardCreate(
+        pageId.length > 0 ? pageId : null,
+        name,
+        width,
+        height,
+      ),
+  );
+  ipcMain.handle("kcreate/artboard/list", () =>
+    requireBridge().artboardList(),
+  );
+  ipcMain.handle(
+    "kcreate/artboard/duplicate",
+    (_e, artboardId: string): string =>
+      requireBridge().artboardDuplicate(artboardId),
+  );
+  ipcMain.handle(
+    "kcreate/artboard/resize",
+    (_e, artboardId: string, width: number, height: number): void => {
+      requireBridge().artboardResize(artboardId, width, height);
+    },
+  );
+  ipcMain.handle("kcreate/artboard/presets", () =>
+    requireBridge().artboardPresets(),
+  );
+
+  // Components (Block B).
+  ipcMain.handle(
+    "kcreate/component/createFromSelection",
+    (_e, nodeIds: string[], name: string): string =>
+      requireBridge().componentCreateFromSelection(nodeIds, name),
+  );
+  ipcMain.handle("kcreate/component/list", () =>
+    requireBridge().componentList(),
+  );
+  ipcMain.handle(
+    "kcreate/component/instantiate",
+    (
+      _e,
+      componentId: string,
+      parentId: string,
+      x: number,
+      y: number,
+    ): string =>
+      requireBridge().componentInstantiate(
+        componentId,
+        parentId.length > 0 ? parentId : null,
+        x,
+        y,
+      ),
+  );
+  ipcMain.handle(
+    "kcreate/component/addVariant",
+    (_e, componentId: string, name: string): string =>
+      requireBridge().componentAddVariant(componentId, name),
+  );
+  ipcMain.handle(
+    "kcreate/component/switchVariant",
+    (_e, nodeId: string, variantId: string): void => {
+      requireBridge().componentSwitchVariant(nodeId, variantId);
+    },
+  );
+  ipcMain.handle(
+    "kcreate/component/detach",
+    (_e, nodeId: string): void => {
+      requireBridge().componentDetach(nodeId);
+    },
+  );
+  ipcMain.handle(
+    "kcreate/layout/setFlex",
+    (_e, nodeId: string, layoutJson: string): void => {
+      requireBridge().layoutSetFlex(nodeId, layoutJson);
+    },
+  );
+  ipcMain.handle(
+    "kcreate/layout/setGrid",
+    (_e, nodeId: string, layoutJson: string): void => {
+      requireBridge().layoutSetGrid(nodeId, layoutJson);
+    },
+  );
+  ipcMain.handle("kcreate/layout/recompute", (_e, nodeId: string): void => {
+    requireBridge().layoutRecompute(nodeId);
+  });
+  ipcMain.handle(
+    "kcreate/layout/convertToFrame",
+    (_e, nodeId: string): void => {
+      requireBridge().layoutConvertToFrame(nodeId);
+    },
   );
 }
 

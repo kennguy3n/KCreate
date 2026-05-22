@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
+use crate::component::{ComponentDefinition, ComponentError};
 use crate::document::{DocumentError, DocumentGraph};
 use crate::node::{Bounds, Node, NodeType, RgbaColor};
 use crate::operation::{Operation, OperationLog};
@@ -18,10 +19,14 @@ use crate::operation::{Operation, OperationLog};
 pub enum ProjectError {
     #[error("document error: {0}")]
     Document(#[from] DocumentError),
+    #[error("component error: {0}")]
+    Component(#[from] ComponentError),
     #[error("brand kit {0} not found")]
     BrandKitNotFound(Uuid),
     #[error("export preset {0} not found")]
     ExportPresetNotFound(Uuid),
+    #[error("component {0} not found")]
+    ComponentNotFound(Uuid),
 }
 
 /// Reusable typography token (font + size + line height + tracking).
@@ -152,6 +157,11 @@ pub struct Project {
     pub design_tokens: DesignTokens,
     pub brand_kits: Vec<BrandKit>,
     pub export_presets: Vec<ExportPreset>,
+    /// Reusable component definitions registered with the project.
+    /// Stored as a map so lookups by id are O(1) and the wire format
+    /// is stable across re-saves (no ordering churn).
+    #[serde(default)]
+    pub components: HashMap<Uuid, ComponentDefinition>,
     pub created_at: DateTime<Utc>,
     pub modified_at: DateTime<Utc>,
 }
@@ -206,6 +216,7 @@ impl Project {
             design_tokens: DesignTokens::default(),
             brand_kits: Vec::new(),
             export_presets: Vec::new(),
+            components: HashMap::new(),
             created_at: now,
             modified_at: now,
         }
@@ -313,6 +324,66 @@ impl Project {
             .iter()
             .find(|p| p.id == id)
             .ok_or(ProjectError::ExportPresetNotFound(id))
+    }
+
+    /// Register a component definition. Returns the definition's id.
+    /// If a component with the same id already exists, it is
+    /// replaced (`HashMap::insert` semantics) — this is how the
+    /// bridge upserts edits made from the UI.
+    pub fn register_component(&mut self, definition: ComponentDefinition) -> Uuid {
+        let id = definition.id;
+        self.components.insert(id, definition);
+        self.touch_modified();
+        id
+    }
+
+    /// Look up a component by id.
+    #[must_use]
+    pub fn get_component(&self, id: Uuid) -> Option<&ComponentDefinition> {
+        self.components.get(&id)
+    }
+
+    /// Mutable look-up — bridge mutates variants and properties
+    /// through this handle.
+    pub fn get_component_mut(&mut self, id: Uuid) -> Option<&mut ComponentDefinition> {
+        self.components.get_mut(&id)
+    }
+
+    /// All registered components, sorted by name. The sort is for UI
+    /// determinism (component list) and is not part of the
+    /// persistence contract — saves still use the underlying HashMap.
+    #[must_use]
+    pub fn list_components(&self) -> Vec<&ComponentDefinition> {
+        let mut out: Vec<&ComponentDefinition> = self.components.values().collect();
+        out.sort_by(|a, b| a.name.cmp(&b.name).then(a.id.cmp(&b.id)));
+        out
+    }
+
+    /// Add a variant to an existing component.
+    pub fn add_component_variant(
+        &mut self,
+        component_id: Uuid,
+        variant: crate::component::ComponentVariant,
+    ) -> Result<Uuid, ProjectError> {
+        let comp = self
+            .components
+            .get_mut(&component_id)
+            .ok_or(ProjectError::ComponentNotFound(component_id))?;
+        let vid = comp.add_variant(variant);
+        self.touch_modified();
+        Ok(vid)
+    }
+
+    /// Remove a component. Existing `NodeType::ComponentLayer` nodes
+    /// referencing the deleted component become orphaned (they keep
+    /// their stored metadata but lookups via `get_component` will
+    /// fail); detach instances before deletion if that matters.
+    pub fn remove_component(&mut self, id: Uuid) -> Result<(), ProjectError> {
+        if self.components.remove(&id).is_none() {
+            return Err(ProjectError::ComponentNotFound(id));
+        }
+        self.touch_modified();
+        Ok(())
     }
 
     fn touch_modified(&mut self) {
@@ -470,5 +541,68 @@ mod tests {
         let p = Project::new("p");
         let err = p.brand_kit(Uuid::new_v4()).expect_err("missing");
         assert!(matches!(err, ProjectError::BrandKitNotFound(_)));
+    }
+
+    #[test]
+    fn register_and_list_components_sorted_by_name() {
+        use crate::component::ComponentDefinition;
+        let mut p = Project::new("p");
+        let banana = ComponentDefinition::new("Banana");
+        let apple = ComponentDefinition::new("Apple");
+        let banana_id = banana.id;
+        let apple_id = apple.id;
+        p.register_component(banana);
+        p.register_component(apple);
+        let listed = p.list_components();
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0].id, apple_id);
+        assert_eq!(listed[1].id, banana_id);
+    }
+
+    #[test]
+    fn add_component_variant_persists() {
+        use crate::component::{ComponentDefinition, ComponentVariant};
+        let mut p = Project::new("p");
+        let def = ComponentDefinition::new("Button");
+        let cid = p.register_component(def);
+        let vid = p
+            .add_component_variant(cid, ComponentVariant::new("Hover"))
+            .expect("variant");
+        let c = p.get_component(cid).expect("component");
+        assert_eq!(c.variants.len(), 2);
+        assert!(c.variant(vid).is_some());
+    }
+
+    #[test]
+    fn add_variant_to_missing_component_errors() {
+        use crate::component::ComponentVariant;
+        let mut p = Project::new("p");
+        let err = p
+            .add_component_variant(Uuid::new_v4(), ComponentVariant::new("Hover"))
+            .expect_err("missing");
+        assert!(matches!(err, ProjectError::ComponentNotFound(_)));
+    }
+
+    #[test]
+    fn remove_component_drops_definition() {
+        use crate::component::ComponentDefinition;
+        let mut p = Project::new("p");
+        let def = ComponentDefinition::new("Button");
+        let cid = p.register_component(def);
+        p.remove_component(cid).expect("remove");
+        assert!(p.get_component(cid).is_none());
+        let again = p.remove_component(cid).expect_err("already gone");
+        assert!(matches!(again, ProjectError::ComponentNotFound(_)));
+    }
+
+    #[test]
+    fn project_with_components_roundtrips_through_json() {
+        use crate::component::ComponentDefinition;
+        let mut p = Project::new("p");
+        let cid = p.register_component(ComponentDefinition::new("Button"));
+        let s = serde_json::to_string(&p).expect("serialize");
+        let back: Project = serde_json::from_str(&s).expect("deserialize");
+        assert_eq!(back.components.len(), 1);
+        assert!(back.get_component(cid).is_some());
     }
 }

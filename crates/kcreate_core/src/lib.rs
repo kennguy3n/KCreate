@@ -23,17 +23,23 @@
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 
+pub mod component;
 pub mod config;
 pub mod document;
 pub mod node;
 pub mod operation;
 pub mod project;
 
+pub use component::{
+    ComponentDefinition, ComponentError, ComponentInstance, ComponentVariant,
+    COMPONENT_INSTANCE_METADATA_KEY,
+};
 pub use config::{DeviceTier, Platform, RuntimeConfig};
 pub use document::{DocumentError, DocumentGraph};
 pub use node::{
-    BlendMode, Bounds, Constraint, Constraints, Effect, FillStyle, GradientKind, GradientStop,
-    Node, NodeStyle, NodeType, Point2D, RgbaColor, StrokeStyle, Transform2D,
+    standard_presets, ArtboardPreset, BlendMode, Bounds, Constraint, Constraints, Effect,
+    FillStyle, GradientKind, GradientStop, Node, NodeStyle, NodeType, Point2D, PresetCategory,
+    RgbaColor, StrokeStyle, Transform2D,
 };
 pub use operation::{Operation, OperationLog};
 pub use project::{

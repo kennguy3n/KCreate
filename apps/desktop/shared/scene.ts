@@ -160,6 +160,18 @@ export interface ProjectInfo {
  * walking parent → children — it does not have to mirror the full
  * `kcreate_core::Node` payload.
  */
+/**
+ * Compact snapshot of a `ComponentInstance` payload. Present on a
+ * `NodeInfo` only when the node is a `ComponentLayer` carrying a
+ * parseable `component_instance` metadata blob. Mirrors
+ * `kcreate_bridge::document::ComponentInstanceInfo`.
+ */
+export interface ComponentInstanceInfo {
+  definitionId: string;
+  activeVariantId: string;
+  overrides: Record<string, unknown>;
+}
+
 export interface NodeInfo {
   id: string;
   nodeType: string;
@@ -168,6 +180,13 @@ export interface NodeInfo {
   name: string;
   visible: boolean;
   locked: boolean;
+  componentInstance?: ComponentInstanceInfo;
+  /**
+   * Free-form metadata bag mirroring `Node::metadata` on the Rust side.
+   * Elided when empty. Used by panels that need structured payloads
+   * (e.g. the auto-layout config under the `"layout"` key).
+   */
+  metadata?: Record<string, unknown>;
 }
 
 /**
@@ -222,6 +241,27 @@ export interface DocumentStatus {
 }
 
 /**
+ * Mirror of `kcreate_export::code_gen::InspectCode`. Each field is
+ * a copy-paste-ready snippet describing one rendering target's
+ * style for the selected node.
+ *
+ * - `css`: rule body without selector or braces. Wrap in
+ *   `.my-button { ... }` at the call site.
+ * - `tailwind`: space-separated utility classes (uses arbitrary
+ *   values for non-standard sizes, e.g. `w-[123px]`).
+ * - `react_style` *(snake_case in transit, see `InspectCode`)*: a
+ *   JSX inline-style object literal — `{ width: 100, ... }`.
+ */
+export interface InspectCode {
+  css: string;
+  tailwind: string;
+  // Serde renames camelCase to snake_case for the wire — we expose
+  // the snake_case field directly to match the Rust struct.
+  // Callers should access `code.react_style`, not `reactStyle`.
+  react_style: string;
+}
+
+/**
  * Document + project lifecycle bridge. Exposed on
  * `window.kcreate.document`. All methods round-trip through the
  * Electron main process; the renderer never imports the native addon
@@ -235,6 +275,16 @@ export interface DocumentBridge {
   getProjectInfo(): Promise<ProjectInfo | null>;
 
   getDocumentTree(): Promise<NodeInfo[]>;
+  /**
+   * Inspect-mode code generation for a single node. Returns three
+   * handoff snippets (raw CSS rule body, Tailwind utility classes,
+   * React inline-style object literal) computed by
+   * `kcreate_export::code_gen`. The mapping is intentionally lossy
+   * — emitted code is a copy-paste starting point, not a
+   * pixel-perfect reproduction. See the rustdoc on
+   * `node_to_css` for details.
+   */
+  inspectNode(nodeId: string): Promise<InspectCode>;
   createNode(
     nodeType: string,
     parentId: string | null,
@@ -271,6 +321,22 @@ export interface ScratchCleanupResult {
   skippedOwned: number;
 }
 
+/**
+ * Resolved resource limits surfaced by `window.kcreate.runtime.resourceLimits()`.
+ * Mirrors `kcreate_bridge::document::ResourceLimits`.
+ *
+ * Values change when the user toggles low-resource mode, so callers
+ * should re-fetch after each toggle.
+ */
+export interface ResourceLimits {
+  deviceTier: string;
+  lowResourceMode: boolean;
+  effectiveUndoDepth: number;
+  effectiveRasterCacheMb: number;
+  effectiveMaxModelMb: number;
+  gpuRenderingAllowed: boolean;
+}
+
 /** Runtime / device probe. */
 export interface RuntimeBridge {
   status(): Promise<RuntimeStatus>;
@@ -290,6 +356,23 @@ export interface RuntimeBridge {
    * paths). Never throws; reports per-entry errors via the result.
    */
   cleanupScratchProjects(): Promise<ScratchCleanupResult>;
+  /** Current low-resource mode flag. */
+  lowResourceModeGet(): Promise<boolean>;
+  /**
+   * Set the low-resource mode flag. Tier 0 hosts ignore `false` and
+   * keep the flag set — see the Rust `RuntimeConfig::set_low_resource`.
+   */
+  lowResourceModeSet(enabled: boolean): Promise<void>;
+  /** Snapshot the resolved effective limits. */
+  resourceLimits(): Promise<ResourceLimits>;
+  /**
+   * Write a UTF-8 text file at `path`. The host requires the path to
+   * be inside the OS temp directory returned by `tempDir()` — any
+   * other location is rejected — so the renderer can only land
+   * sidecar files (e.g. design-token JSON for a dev handoff) next to
+   * its other exports. Returns the number of bytes written.
+   */
+  writeTextFile(path: string, content: string): Promise<number>;
 }
 
 /** PDF export options. `width_mm`/`height_mm` are the page size in mm. */
@@ -409,6 +492,41 @@ export interface CanvasBridge {
 export interface AiBridge {
   removeBackground(nodeId: string): Promise<string>;
   getActionLog(): Promise<string>;
+  /**
+   * Ask the LLM to propose semantic names for every layer. Requires
+   * the sidecar to be `ready`; rejects otherwise.
+   */
+  suggestLayerNames(): Promise<LayerNamingResult>;
+  /**
+   * Ask the LLM to extract design tokens (colors / fonts / spacing)
+   * from the open document. Requires the sidecar to be `ready`.
+   */
+  extractDesignTokens(): Promise<LlmJsonResult>;
+  /**
+   * Ask the LLM to audit the document for accessibility issues.
+   * Requires the sidecar to be `ready`.
+   */
+  checkAccessibility(): Promise<LlmJsonResult>;
+}
+
+/** Suggestions returned by `ai.suggestLayerNames`. */
+export interface LayerNamingResult {
+  /** Parsed `(id, new-name)` pairs. May be empty if the model's
+   * reply could not be parsed; in that case the UI should fall back
+   * to displaying `raw_content`. */
+  suggestions: Array<[string, string]>;
+  raw_content: string;
+  tokens_used: number;
+  model: string;
+}
+
+/** Free-form JSON reply returned by `ai.extractDesignTokens` and
+ * `ai.checkAccessibility`. The `json` field is the model's raw
+ * output in the schema described by the prompt builder. */
+export interface LlmJsonResult {
+  json: string;
+  tokens_used: number;
+  model: string;
 }
 
 /**
@@ -420,6 +538,64 @@ export interface McpBridge {
   start(): Promise<number>;
   stop(): Promise<void>;
   isRunning(): Promise<boolean>;
+}
+
+/** Role of a chat message in the LLM conversation. */
+export type LlmRole = "system" | "user" | "assistant";
+
+/** One message in an LLM conversation. */
+export interface LlmMessage {
+  role: LlmRole;
+  content: string;
+}
+
+/** Reply payload returned by an LLM chat call. */
+export interface LlmReply {
+  content: string;
+  tokens_used: number;
+  model: string;
+}
+
+/**
+ * LLM sidecar status. The `state` field is a tagged union; only
+ * `ready` carries `model_name` / `context_size` / `port`, and only
+ * `error` carries `error`.
+ */
+export interface LlmStatus {
+  state: "stopped" | "starting" | "ready" | "error";
+  model_name: string | null;
+  context_size: number | null;
+  port: number | null;
+  error: string | null;
+}
+
+/**
+ * Bridge to the local LLM sidecar (`llama-server` from the
+ * `kennguy3n/llama.cpp` fork). All traffic stays on loopback
+ * (`127.0.0.1`) and the sidecar is opt-in — `start()` must be
+ * called before any chat operation succeeds.
+ */
+export interface LlmBridge {
+  /** Spawn the sidecar with the GGUF model at `modelPath`. */
+  start(modelPath: string): Promise<number>;
+  /** Stop the sidecar. Idempotent. */
+  stop(): Promise<void>;
+  /** Current sidecar status. */
+  status(): Promise<LlmStatus>;
+  /**
+   * Run a synchronous chat completion. Requires the sidecar to be
+   * `ready`; otherwise the promise rejects.
+   */
+  chat(
+    messages: LlmMessage[],
+    maxTokens: number,
+    temperature: number,
+  ): Promise<LlmReply>;
+  /**
+   * Run a context-aware "suggest improvements" prompt over the
+   * current selection (or whole document if nothing is selected).
+   */
+  suggestForSelection(): Promise<LlmReply>;
 }
 
 // -----------------------------------------------------------------------------
@@ -535,6 +711,156 @@ export interface ExportPresetBridge {
   delete(presetId: string): Promise<boolean>;
 }
 
+/**
+ * Per-artboard summary returned by `window.kcreate.artboard.list()`.
+ * Matches `kcreate_bridge::document::ArtboardInfo`.
+ */
+export interface ArtboardInfo {
+  id: string;
+  name: string;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  pageId: string;
+}
+
+export type ArtboardPresetCategory =
+  | "web_desktop"
+  | "web_tablet"
+  | "web_mobile"
+  | "social_media"
+  | "print"
+  | "custom";
+
+/**
+ * One of the built-in artboard preset sizes surfaced in the New
+ * Artboard dialog and home-screen affordances.
+ */
+export interface ArtboardPreset {
+  name: string;
+  width: number;
+  height: number;
+  category: ArtboardPresetCategory;
+}
+
+export interface ArtboardBridge {
+  create(
+    pageId: string | null,
+    name: string,
+    width: number,
+    height: number,
+  ): Promise<string>;
+  list(): Promise<ArtboardInfo[]>;
+  duplicate(artboardId: string): Promise<string>;
+  resize(artboardId: string, width: number, height: number): Promise<void>;
+  presets(): Promise<ArtboardPreset[]>;
+}
+
+/**
+ * One named variant of a component. The `properties` bag is intentionally
+ * free-form JSON so callers can carry whatever metadata they need without
+ * us baking schema into the Rust types. Mirrors
+ * `kcreate_core::component::ComponentVariant`.
+ */
+export interface ComponentVariantInfo {
+  id: string;
+  name: string;
+  properties: Record<string, unknown>;
+}
+
+/**
+ * Per-component summary returned by `window.kcreate.component.list()`.
+ * Mirrors `kcreate_bridge::document::ComponentInfo`.
+ */
+export interface ComponentInfo {
+  id: string;
+  name: string;
+  description: string;
+  defaultVariantId: string;
+  variants: ComponentVariantInfo[];
+  createdAt: string;
+  modifiedAt: string;
+}
+
+/**
+ * Padding (one f64 per edge). Mirrors `kcreate_layout::Padding`.
+ */
+export interface LayoutPadding {
+  top: number;
+  right: number;
+  bottom: number;
+  left: number;
+}
+
+/**
+ * Flex layout config. Field names mirror `kcreate_layout::FlexLayout`
+ * (snake_case in the wire JSON the bridge expects).
+ */
+export interface FlexLayout {
+  direction: "row" | "column";
+  spacing: number;
+  padding: LayoutPadding;
+  alignment:
+    | "start"
+    | "center"
+    | "end"
+    | "space_between"
+    | "space_evenly";
+  cross_alignment: "start" | "center" | "end" | "stretch";
+  wrap: boolean;
+}
+
+/**
+ * Grid layout config. Mirrors `kcreate_layout::GridLayout`.
+ */
+export interface GridLayout {
+  columns: number;
+  row_gap: number;
+  column_gap: number;
+  padding: LayoutPadding;
+}
+
+export interface LayoutBridge {
+  /** Write a flex config onto a `LayoutFrame` node. */
+  setFlex(nodeId: string, config: FlexLayout): Promise<void>;
+  /** Write a grid config onto a `LayoutFrame` node. */
+  setGrid(nodeId: string, config: GridLayout): Promise<void>;
+  /**
+   * Recompute child positions for the LayoutFrame from its stored
+   * config. No-op if the node has no layout metadata.
+   */
+  recompute(nodeId: string): Promise<void>;
+  /** Promote a `GroupLayer` to a `LayoutFrame` so it can carry layout config. */
+  convertToFrame(nodeId: string): Promise<void>;
+}
+
+export interface ComponentBridge {
+  /**
+   * Convert the given (sibling-flat) selection into a new component
+   * definition, swap the originals out for a single `ComponentLayer`
+   * instance, and return the new definition's id.
+   */
+  createFromSelection(nodeIds: string[], name: string): Promise<string>;
+  list(): Promise<ComponentInfo[]>;
+  /**
+   * Instantiate a stored definition. If `parentId` is null the new
+   * layer is added under the first artboard (or the project root if
+   * no artboards exist).
+   */
+  instantiate(
+    componentId: string,
+    parentId: string | null,
+    x: number,
+    y: number,
+  ): Promise<string>;
+  addVariant(componentId: string, name: string): Promise<string>;
+  /** Switch which variant a placed `ComponentLayer` displays. */
+  switchVariant(nodeId: string, variantId: string): Promise<void>;
+  /** Detach an instance — turns the `ComponentLayer` into a plain group. */
+  detach(nodeId: string): Promise<void>;
+}
+
 declare global {
   interface Window {
     kcreate: {
@@ -542,12 +868,16 @@ declare global {
       document: DocumentBridge;
       canvas: CanvasBridge;
       ai: AiBridge;
+      llm: LlmBridge;
       mcp: McpBridge;
       runtime: RuntimeBridge;
       export: ExportBridge;
       designTokens: DesignTokensBridge;
       brandKit: BrandKitBridge;
       exportPreset: ExportPresetBridge;
+      artboard: ArtboardBridge;
+      component: ComponentBridge;
+      layout: LayoutBridge;
     };
   }
 }

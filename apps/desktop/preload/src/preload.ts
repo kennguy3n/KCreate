@@ -7,10 +7,18 @@ import { contextBridge, ipcRenderer } from "electron";
 import type {
   AcquiredFrame,
   AiBridge,
+  ArtboardBridge,
+  ArtboardInfo,
+  ArtboardPreset,
   BrandKit,
   BrandKitBridge,
   CanvasBridge,
+  ComponentBridge,
+  ComponentInfo,
   CreateNodeProps,
+  FlexLayout,
+  GridLayout,
+  LayoutBridge,
   DesignTokens,
   DesignTokensBridge,
   DocumentBridge,
@@ -20,7 +28,14 @@ import type {
   ExportPreset,
   ExportPresetBridge,
   FrameInfo,
+  InspectCode,
   JpegExportOptions,
+  LayerNamingResult,
+  LlmBridge,
+  LlmJsonResult,
+  LlmMessage,
+  LlmReply,
+  LlmStatus,
   McpBridge,
   NodeInfo,
   PdfExportOptions,
@@ -28,6 +43,7 @@ import type {
   ProjectInfo,
   RendererBridge,
   RendererInfo,
+  ResourceLimits,
   RuntimeBridge,
   RuntimeStatus,
   Scene,
@@ -148,6 +164,17 @@ type NodeInfoSnake = {
   name: string;
   visible: boolean;
   locked: boolean;
+  /// Already camelCased on the Rust side via #[serde(rename)]. We
+  /// pass it through verbatim because the inner field names are
+  /// also camelCased (definitionId / activeVariantId).
+  componentInstance?: {
+    definitionId: string;
+    activeVariantId: string;
+    overrides: Record<string, unknown>;
+  };
+  /// Free-form metadata mirror of `Node::metadata`. Omitted when
+  /// empty (Rust skips serializing empty maps).
+  metadata?: Record<string, unknown>;
 };
 
 type RuntimeStatusSnake = {
@@ -177,6 +204,8 @@ function nodeFromSnake(n: NodeInfoSnake): NodeInfo {
     name: n.name,
     visible: n.visible,
     locked: n.locked,
+    ...(n.componentInstance ? { componentInstance: n.componentInstance } : {}),
+    ...(n.metadata ? { metadata: n.metadata } : {}),
   };
 }
 
@@ -242,6 +271,13 @@ const document: DocumentBridge = {
     )) as NodeInfoSnake[];
     return raw.map(nodeFromSnake);
   },
+  async inspectNode(nodeId: string): Promise<InspectCode> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/document/inspectNode",
+      nodeId,
+    )) as string;
+    return JSON.parse(raw) as InspectCode;
+  },
   async createNode(
     nodeType: string,
     parentId: string | null,
@@ -300,7 +336,53 @@ const runtime: RuntimeBridge = {
       "kcreate/runtime/cleanupScratchProjects",
     )) as ScratchCleanupResult;
   },
+  async lowResourceModeGet(): Promise<boolean> {
+    return (await ipcRenderer.invoke(
+      "kcreate/runtime/lowResourceMode/get",
+    )) as boolean;
+  },
+  async lowResourceModeSet(enabled: boolean): Promise<void> {
+    await ipcRenderer.invoke(
+      "kcreate/runtime/lowResourceMode/set",
+      enabled,
+    );
+  },
+  async resourceLimits(): Promise<ResourceLimits> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/runtime/resourceLimits",
+    )) as string;
+    return resourceLimitsFromSnake(
+      JSON.parse(raw) as ResourceLimitsSnake,
+    );
+  },
+  async writeTextFile(target: string, content: string): Promise<number> {
+    return (await ipcRenderer.invoke(
+      "kcreate/runtime/writeTextFile",
+      target,
+      content,
+    )) as number;
+  },
 };
+
+type ResourceLimitsSnake = {
+  device_tier: string;
+  low_resource_mode: boolean;
+  effective_undo_depth: number;
+  effective_raster_cache_mb: number;
+  effective_max_model_mb: number;
+  gpu_rendering_allowed: boolean;
+};
+
+function resourceLimitsFromSnake(s: ResourceLimitsSnake): ResourceLimits {
+  return {
+    deviceTier: s.device_tier,
+    lowResourceMode: s.low_resource_mode,
+    effectiveUndoDepth: s.effective_undo_depth,
+    effectiveRasterCacheMb: s.effective_raster_cache_mb,
+    effectiveMaxModelMb: s.effective_max_model_mb,
+    gpuRenderingAllowed: s.gpu_rendering_allowed,
+  };
+}
 
 const exportApi: ExportBridge = {
   async svg(nodeIds: string[], options: SvgExportOptions): Promise<string> {
@@ -444,6 +526,57 @@ const ai: AiBridge = {
   async getActionLog(): Promise<string> {
     return (await ipcRenderer.invoke("kcreate/ai/getActionLog")) as string;
   },
+  async suggestLayerNames(): Promise<LayerNamingResult> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/ai/suggestLayerNames",
+    )) as string;
+    return JSON.parse(raw) as LayerNamingResult;
+  },
+  async extractDesignTokens(): Promise<LlmJsonResult> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/ai/extractDesignTokens",
+    )) as string;
+    return JSON.parse(raw) as LlmJsonResult;
+  },
+  async checkAccessibility(): Promise<LlmJsonResult> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/ai/checkAccessibility",
+    )) as string;
+    return JSON.parse(raw) as LlmJsonResult;
+  },
+};
+
+const llm: LlmBridge = {
+  async start(modelPath: string): Promise<number> {
+    return (await ipcRenderer.invoke(
+      "kcreate/llm/start",
+      modelPath,
+    )) as number;
+  },
+  async stop(): Promise<void> {
+    await ipcRenderer.invoke("kcreate/llm/stop");
+  },
+  async status(): Promise<LlmStatus> {
+    const raw = (await ipcRenderer.invoke("kcreate/llm/status")) as string;
+    return JSON.parse(raw) as LlmStatus;
+  },
+  async chat(
+    messages: LlmMessage[],
+    maxTokens: number,
+    temperature: number,
+  ): Promise<LlmReply> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/llm/chat",
+      JSON.stringify(messages),
+      maxTokens,
+      temperature,
+    )) as string;
+    return JSON.parse(raw) as LlmReply;
+  },
+  async suggestForSelection(): Promise<LlmReply> {
+    const raw = (await ipcRenderer.invoke("kcreate/llm/suggest")) as string;
+    return JSON.parse(raw) as LlmReply;
+  },
 };
 
 const mcp: McpBridge = {
@@ -522,15 +655,155 @@ const exportPreset: ExportPresetBridge = {
   },
 };
 
+type ArtboardInfoSnake = {
+  id: string;
+  name: string;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  page_id: string;
+};
+
+function artboardFromSnake(a: ArtboardInfoSnake): ArtboardInfo {
+  return {
+    id: a.id,
+    name: a.name,
+    x: a.x,
+    y: a.y,
+    width: a.width,
+    height: a.height,
+    pageId: a.page_id,
+  };
+}
+
+const artboard: ArtboardBridge = {
+  async create(
+    pageId: string | null,
+    name: string,
+    width: number,
+    height: number,
+  ): Promise<string> {
+    return (await ipcRenderer.invoke(
+      "kcreate/artboard/create",
+      pageId ?? "",
+      name,
+      width,
+      height,
+    )) as string;
+  },
+  async list(): Promise<ArtboardInfo[]> {
+    const raw = (await ipcRenderer.invoke("kcreate/artboard/list")) as string;
+    const parsed = JSON.parse(raw) as ArtboardInfoSnake[];
+    return parsed.map(artboardFromSnake);
+  },
+  async duplicate(artboardId: string): Promise<string> {
+    return (await ipcRenderer.invoke(
+      "kcreate/artboard/duplicate",
+      artboardId,
+    )) as string;
+  },
+  async resize(
+    artboardId: string,
+    width: number,
+    height: number,
+  ): Promise<void> {
+    await ipcRenderer.invoke(
+      "kcreate/artboard/resize",
+      artboardId,
+      width,
+      height,
+    );
+  },
+  async presets(): Promise<ArtboardPreset[]> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/artboard/presets",
+    )) as string;
+    return JSON.parse(raw) as ArtboardPreset[];
+  },
+};
+
+const component: ComponentBridge = {
+  async createFromSelection(nodeIds: string[], name: string): Promise<string> {
+    return (await ipcRenderer.invoke(
+      "kcreate/component/createFromSelection",
+      nodeIds,
+      name,
+    )) as string;
+  },
+  async list(): Promise<ComponentInfo[]> {
+    const raw = (await ipcRenderer.invoke("kcreate/component/list")) as string;
+    return JSON.parse(raw) as ComponentInfo[];
+  },
+  async instantiate(
+    componentId: string,
+    parentId: string | null,
+    x: number,
+    y: number,
+  ): Promise<string> {
+    return (await ipcRenderer.invoke(
+      "kcreate/component/instantiate",
+      componentId,
+      parentId ?? "",
+      x,
+      y,
+    )) as string;
+  },
+  async addVariant(componentId: string, name: string): Promise<string> {
+    return (await ipcRenderer.invoke(
+      "kcreate/component/addVariant",
+      componentId,
+      name,
+    )) as string;
+  },
+  async switchVariant(nodeId: string, variantId: string): Promise<void> {
+    await ipcRenderer.invoke(
+      "kcreate/component/switchVariant",
+      nodeId,
+      variantId,
+    );
+  },
+  async detach(nodeId: string): Promise<void> {
+    await ipcRenderer.invoke("kcreate/component/detach", nodeId);
+  },
+};
+
+const layout: LayoutBridge = {
+  async setFlex(nodeId: string, config: FlexLayout): Promise<void> {
+    await ipcRenderer.invoke(
+      "kcreate/layout/setFlex",
+      nodeId,
+      JSON.stringify(config),
+    );
+  },
+  async setGrid(nodeId: string, config: GridLayout): Promise<void> {
+    await ipcRenderer.invoke(
+      "kcreate/layout/setGrid",
+      nodeId,
+      JSON.stringify(config),
+    );
+  },
+  async recompute(nodeId: string): Promise<void> {
+    await ipcRenderer.invoke("kcreate/layout/recompute", nodeId);
+  },
+  async convertToFrame(nodeId: string): Promise<void> {
+    await ipcRenderer.invoke("kcreate/layout/convertToFrame", nodeId);
+  },
+};
+
 contextBridge.exposeInMainWorld("kcreate", {
   renderer,
   document,
   canvas,
   ai,
+  llm,
   mcp,
   runtime,
   export: exportApi,
   designTokens,
   brandKit,
   exportPreset,
+  artboard,
+  component,
+  layout,
 });

@@ -13,6 +13,7 @@ workspace = true
 
 [dependencies]
 wgpu.workspace = true
+raw-window-handle.workspace = true
 pollster.workspace = true
 bytemuck.workspace = true
 tiny-skia.workspace = true

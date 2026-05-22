@@ -89,6 +89,7 @@ export interface Bridge {
   projectClose(): void;
   projectGetInfo(): ProjectInfoSnake | null;
   documentGetTree(): NodeInfoSnake[];
+  documentInspectNode(nodeId: string): string;
   documentCreateNode(
     nodeType: string,
     parentId: string | null,
@@ -100,6 +101,25 @@ export interface Bridge {
   documentRedo(): string[] | null;
   documentStatus(): DocumentStatusSnake | null;
   runtimeStatus(): RuntimeStatusSnake;
+  lowResourceModeGet(): boolean;
+  lowResourceModeSet(enabled: boolean): void;
+  resourceLimits(): string;
+  llmStart(modelPath: string): number;
+  llmStop(): void;
+  llmStatus(): string;
+  // LLM completion calls return Promises because the underlying
+  // `AsyncTask` runs the blocking HTTP round-trip on N-API's libuv
+  // thread pool instead of the Electron main loop. See the
+  // `LlmChatTask` family in `crates/kcreate_bridge/src/lib.rs`.
+  llmChat(
+    messagesJson: string,
+    maxTokens: number,
+    temperature: number,
+  ): Promise<string>;
+  llmSuggestForSelection(): Promise<string>;
+  aiSuggestLayerNames(): Promise<string>;
+  aiExtractDesignTokens(): Promise<string>;
+  aiCheckAccessibility(): Promise<string>;
   exportSvg(nodeIds: string[], optionsJson: string): string;
   exportPng(outputPath: string, optionsJson: string): number;
   exportPdf(outputPath: string, optionsJson: string): number;
@@ -169,6 +189,37 @@ export interface Bridge {
   exportPresetCreate(name: string, format: string, scale: number): string;
   exportPresetList(): string;
   exportPresetDelete(presetId: string): boolean;
+
+  // Artboards (Phase 1, Block A)
+  artboardCreate(
+    pageId: string | null,
+    name: string,
+    width: number,
+    height: number,
+  ): string;
+  artboardList(): string;
+  artboardDuplicate(artboardId: string): string;
+  artboardResize(artboardId: string, width: number, height: number): void;
+  artboardPresets(): string;
+
+  // Components (Phase 1, Block B)
+  componentCreateFromSelection(nodeIds: string[], name: string): string;
+  componentList(): string;
+  componentInstantiate(
+    componentId: string,
+    parentId: string | null,
+    x: number,
+    y: number,
+  ): string;
+  componentAddVariant(componentId: string, name: string): string;
+  componentSwitchVariant(nodeId: string, variantId: string): void;
+  componentDetach(nodeId: string): void;
+
+  // Auto-layout (Phase 1, Block C)
+  layoutSetFlex(nodeId: string, layoutJson: string): void;
+  layoutSetGrid(nodeId: string, layoutJson: string): void;
+  layoutRecompute(nodeId: string): void;
+  layoutConvertToFrame(nodeId: string): void;
 }
 
 function bridgeBinaryPath(): string {

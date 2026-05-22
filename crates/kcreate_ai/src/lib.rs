@@ -10,8 +10,21 @@
 
 pub mod action_log;
 pub mod bg_remove;
+pub mod llm_chat;
+pub mod llm_sidecar;
 pub mod task_router;
 
 pub use action_log::{ActionLog, AiAction};
-pub use bg_remove::{remove_background, BgRemoveOptions};
-pub use task_router::{execute_task, AiError, AiResult, AiTask};
+pub use bg_remove::{
+    apply_alpha_mask, remove_background, remove_background_with_backend, BgRemovalBackend,
+    BgRemoveError, BgRemoveOptions,
+};
+pub use llm_chat::{
+    build_system_prompt, chat_completion, parse_completion, ChatError, ChatMessage, ChatRequest,
+    ChatResponse, ChatResult, ChatRole,
+};
+pub use llm_sidecar::{LlmSidecar, SidecarConfig, SidecarError, SidecarResult, SidecarStatus};
+pub use task_router::{
+    build_accessibility_prompt, build_design_token_prompt, build_layer_naming_prompt, execute_task,
+    parse_layer_naming_reply, AiError, AiResult, AiTask,
+};

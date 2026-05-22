@@ -27,8 +27,10 @@ KCreate/
 │   ├── kcreate_raster/      tile engine, masks, adjustment layers (Phase 1)
 │   ├── kcreate_text/        font discovery (fontdb), shaping (rustybuzz),
 │   │                        outline walking (ttf-parser) → renderer paths
-│   ├── kcreate_ai/          local AI task router, action log, threshold-v0
-│   │                        background removal (ONNX u2net swap-in for Phase 1)
+│   ├── kcreate_ai/          local AI task router, action log, bg removal
+│   │                        (threshold + ONNX u2net), LLM sidecar lifecycle
+│   │                        (`llm_sidecar.rs`), loopback chat (`llm_chat.rs`)
+│   ├── kcreate_layout/      pure flex + grid solvers (no DOM, no side effects)
 │   ├── kcreate_mcp/         loopback-only MCP server (tiny_http JSON-RPC,
 │   │                        3 tools: list_artboards, create_node, export_artboard)
 │   └── kcreate_tests/       cross-crate integration tests (no library
@@ -118,6 +120,11 @@ pnpm lint
 | Document→Scene translation               | `crates/kcreate_bridge/src/scene_sync.rs`          |
 | Canvas hit testing                       | `crates/kcreate_bridge/src/hit_test.rs`            |
 | AI action / task router                  | `crates/kcreate_ai/`                               |
+| Auto-layout computation                  | `crates/kcreate_layout/` (`flex.rs`, `grid.rs`)    |
+| LLM sidecar lifecycle                    | `crates/kcreate_ai/src/llm_sidecar.rs`             |
+| LLM chat (loopback HTTP)                 | `crates/kcreate_ai/src/llm_chat.rs`                |
+| Inspect mode code-gen (CSS/Tailwind/React) | `crates/kcreate_export/src/code_gen.rs`          |
+| Native surface (raw-window-handle)       | `crates/kcreate_renderer/src/native_surface.rs`    |
 | MCP tool                                 | `crates/kcreate_mcp/src/tools.rs`                  |
 | Add a new N-API export (renderer)        | thin wrapper in `kcreate_bridge/src/lib.rs`, logic in `state.rs`     |
 | Add a new N-API export (document/project)| thin wrapper in `kcreate_bridge/src/lib.rs`, logic in `document.rs`  |

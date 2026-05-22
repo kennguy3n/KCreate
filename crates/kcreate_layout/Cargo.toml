@@ -1,0 +1,19 @@
+[package]
+name = "kcreate_layout"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Pure-Rust flex + grid auto-layout solver for KCreate frames"
+
+[lints]
+workspace = true
+
+[dependencies]
+kcreate_core = { path = "../kcreate_core" }
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+thiserror.workspace = true
+uuid = { workspace = true, features = ["v4", "serde"] }

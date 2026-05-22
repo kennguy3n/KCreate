@@ -1,28 +1,84 @@
 import { useState } from "react";
 
-import type { NodeInfo } from "../../../shared/scene";
+import type {
+  ArtboardInfo,
+  ComponentInfo,
+  NodeInfo,
+} from "../../../shared/scene";
 import { colors, radius, spacing } from "../styles/tokens";
+import { ArtboardPanel } from "./ArtboardPanel";
+import { BrandKitEditor } from "./BrandKitEditor";
+import { ComponentPanel } from "./ComponentPanel";
+import { DesignTokenEditor } from "./DesignTokenEditor";
 
-export type LeftPanelTab = "pages" | "layers" | "assets";
+export type LeftPanelTab =
+  | "pages"
+  | "artboards"
+  | "layers"
+  | "assets"
+  | "tokens"
+  | "brand";
 
 export interface LeftPanelProps {
   nodes: NodeInfo[];
   selectedId: string | null;
+  selectedIds?: string[];
   onSelect: (id: string | null) => void;
   onToggleVisibility?: (id: string, visible: boolean) => void;
   onToggleLocked?: (id: string, locked: boolean) => void;
   onRename?: (id: string, name: string) => void;
   onDelete?: (id: string) => void;
+
+  // Artboard-tab inputs. Optional so existing callers that haven't
+  // wired the artboard bridge yet keep working (the tab just renders
+  // an empty state).
+  artboards?: ArtboardInfo[];
+  onRequestCreateArtboard?: () => void;
+  onFocusArtboard?: (artboard: ArtboardInfo) => void;
+  onRenameArtboard?: (id: string, name: string) => void;
+  onDuplicateArtboard?: (id: string) => void;
+  onResizeArtboard?: (id: string, width: number, height: number) => void;
+  onDeleteArtboard?: (id: string) => void;
+
+  // Components-section inputs. Optional so existing callers that
+  // haven't wired the component bridge yet keep working (the assets
+  // tab just falls back to the empty hint).
+  components?: ComponentInfo[];
+  onComponentCreateFromSelection?: (name: string) => void;
+  onComponentInstantiate?: (componentId: string) => void;
+  onComponentAddVariant?: (componentId: string, name: string) => void;
+  onComponentSwitchVariant?: (nodeId: string, variantId: string) => void;
+  onComponentDetach?: (nodeId: string) => void;
+
+  // Design-system inputs (tokens + brand kits). Optional so callers
+  // that haven't wired these bridges yet keep working; both tabs
+  // render their own empty state when not present.
+  onDesignSystemStatus?: (msg: string | null) => void;
 }
 
 export function LeftPanel({
   nodes,
   selectedId,
+  selectedIds,
   onSelect,
   onToggleVisibility,
   onToggleLocked,
   onRename,
   onDelete,
+  artboards,
+  onRequestCreateArtboard,
+  onFocusArtboard,
+  onRenameArtboard,
+  onDuplicateArtboard,
+  onResizeArtboard,
+  onDeleteArtboard,
+  components,
+  onComponentCreateFromSelection,
+  onComponentInstantiate,
+  onComponentAddVariant,
+  onComponentSwitchVariant,
+  onComponentDetach,
+  onDesignSystemStatus,
 }: LeftPanelProps): JSX.Element {
   const [tab, setTab] = useState<LeftPanelTab>("layers");
   return (
@@ -38,8 +94,11 @@ export function LeftPanel({
       <PanelTabs
         tabs={[
           { id: "pages", label: "Pages" },
+          { id: "artboards", label: "Artboards" },
           { id: "layers", label: "Layers" },
           { id: "assets", label: "Assets" },
+          { id: "tokens", label: "Tokens" },
+          { id: "brand", label: "Brand" },
         ]}
         active={tab}
         onChange={setTab}
@@ -63,6 +122,18 @@ export function LeftPanel({
             emptyHint="No pages yet."
           />
         ) : null}
+        {tab === "artboards" ? (
+          <ArtboardPanel
+            artboards={artboards ?? []}
+            selectedId={selectedId}
+            onRequestCreate={onRequestCreateArtboard ?? noop}
+            onFocusArtboard={onFocusArtboard ?? noopArg}
+            onRenameArtboard={onRenameArtboard ?? noopRename}
+            onDuplicateArtboard={onDuplicateArtboard ?? noopArg}
+            onResizeArtboard={onResizeArtboard ?? noopResize}
+            onDeleteArtboard={onDeleteArtboard ?? noopArg}
+          />
+        ) : null}
         {tab === "layers" ? (
           <NodeList
             nodes={nodes}
@@ -77,12 +148,54 @@ export function LeftPanel({
           />
         ) : null}
         {tab === "assets" ? (
-          <EmptyHint>Drop or import images, fonts, and palettes here.</EmptyHint>
+          components !== undefined ? (
+            <ComponentPanel
+              components={components}
+              selectedNodeIds={
+                selectedIds ?? (selectedId ? [selectedId] : [])
+              }
+              selectedNode={
+                selectedId
+                  ? (nodes.find((n) => n.id === selectedId) ?? null)
+                  : null
+              }
+              onCreateFromSelection={
+                onComponentCreateFromSelection ?? noopName
+              }
+              onInstantiate={onComponentInstantiate ?? noopArg}
+              onAddVariant={onComponentAddVariant ?? noopRename}
+              onSwitchVariant={onComponentSwitchVariant ?? noopRename}
+              onDetach={onComponentDetach ?? noopArg}
+            />
+          ) : (
+            <EmptyHint>
+              Drop or import images, fonts, and palettes here.
+            </EmptyHint>
+          )
+        ) : null}
+        {tab === "tokens" ? (
+          <DesignTokenEditor
+            selectedNodeId={selectedId}
+            onStatus={onDesignSystemStatus ?? noopStatus}
+          />
+        ) : null}
+        {tab === "brand" ? (
+          <BrandKitEditor onStatus={onDesignSystemStatus ?? noopStatus} />
         ) : null}
       </div>
     </aside>
   );
 }
+
+// Empty fallbacks so the panel doesn't need to null-check on every
+// click path. Hosts that don't wire the artboard bridge just see a
+// no-op `+ New artboard` button and an empty list.
+const noop = (): void => undefined;
+const noopArg = (_: unknown): void => undefined;
+const noopName = (_: string): void => undefined;
+const noopRename = (_: string, __: string): void => undefined;
+const noopResize = (_: string, __: number, ___: number): void => undefined;
+const noopStatus = (_: string | null): void => undefined;
 
 function PanelTabs<T extends string>({
   tabs,

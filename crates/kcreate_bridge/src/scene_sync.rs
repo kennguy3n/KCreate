@@ -15,8 +15,15 @@
 //!
 //! For Phase 0 the translator handles:
 //!
-//! * [`NodeType::Artboard`] → a background [`ObjectKind::Rect`]
-//!   filled with the artboard colour, drawn behind all children.
+//! * [`NodeType::Artboard`] → a soft drop-shadow rect behind the
+//!   artboard, a background [`ObjectKind::Rect`] filled with the
+//!   artboard colour, and a name label drawn above the top edge.
+//!   Descendants whose bounds fall entirely outside the artboard
+//!   clip rect are pruned from the scene (Figma/Penpot-style frame
+//!   clipping). TODO(Block A Task 3 follow-up): emit dashed spacing
+//!   guides between adjacent artboards while one is being
+//!   dragged/resized — requires gesture-state plumbing the bridge
+//!   doesn't yet expose, so it's deferred to a later task.
 //! * [`NodeType::VectorLayer`] with a `vector_path` metadata entry →
 //!   an [`ObjectKind::Path`] driven by the layer's [`VectorPath`].
 //! * [`NodeType::RasterLayer`] with a `raster_image` metadata entry →
@@ -76,27 +83,66 @@ pub const DEFAULT_CLEAR: Color = Color {
     a: 1.0,
 };
 
-/// First `ObjectId` value used for selection-highlight overlays.
-///
-/// Highlights are appended starting at [`u64::MAX`] and counting
-/// down, while document-backed objects come from a monotonic
-/// allocator starting at `1` and counting up (see
-/// [`SceneSync::next_id`]). The two ranges therefore never collide in
-/// practice: a project would need more than 2^63 live mappings before
-/// a real `ObjectId` could land at or above this threshold, which is
-/// physically impossible. Hit-testing uses the constant via
-/// [`is_selection_highlight_id`] so the exclusion is a guaranteed
-/// id-range check rather than a fragile style heuristic.
-pub const HIGHLIGHT_ID_THRESHOLD: u64 = u64::MAX / 2;
+/// Soft drop-shadow under each artboard. Matches the Figma/Penpot
+/// convention of a small offset + low alpha so multi-artboard pages
+/// read at a glance.
+const ARTBOARD_SHADOW: Color = Color {
+    r: 0.0,
+    g: 0.0,
+    b: 0.0,
+    a: 0.12,
+};
+/// Horizontal/vertical inflation of the shadow rect relative to the
+/// artboard. The shadow is offset down-right by this amount so it
+/// peeks out from under the artboard background.
+const ARTBOARD_SHADOW_OFFSET: f32 = 6.0;
+/// Pixel-grid distance between the artboard's top edge and the
+/// baseline of the name label drawn above it.
+const ARTBOARD_LABEL_GAP: f32 = 8.0;
+/// Default label colour for artboard names (KChat secondary text).
+const ARTBOARD_LABEL_COLOR: Color = Color {
+    r: 0.45,
+    g: 0.42,
+    b: 0.52,
+    a: 1.0,
+};
+/// Default label font (matches the renderer's text shaping default).
+const ARTBOARD_LABEL_FONT: &str = "Inter";
+/// Default label font size in document pixels.
+const ARTBOARD_LABEL_FONT_SIZE: f32 = 12.0;
 
-/// Returns whether the given `ObjectId` was allocated for a selection
-/// highlight overlay (as opposed to a document-backed object).
+/// First `ObjectId` value used for overlay objects (selection
+/// highlights, artboard shadow rects, artboard name labels — any
+/// scene object that isn't tied to a document UUID).
 ///
-/// Highlights live in the high `[HIGHLIGHT_ID_THRESHOLD, u64::MAX]`
-/// range; everything below that is a real document object.
+/// Overlays live in the high `[OVERLAY_ID_THRESHOLD, u64::MAX]`
+/// range, while document-backed objects come from a monotonic
+/// allocator starting at `1` and counting up (see
+/// [`SceneSync::next_id`]). The two ranges never collide in practice:
+/// a project would need more than 2^63 live mappings before a real
+/// `ObjectId` could land at or above this threshold, which is
+/// physically impossible. Hit-testing uses the constant via
+/// [`is_overlay_id`] so the exclusion is a guaranteed id-range check
+/// rather than a fragile style heuristic.
+pub const OVERLAY_ID_THRESHOLD: u64 = u64::MAX / 2;
+
+/// Legacy alias preserved for crates that imported the
+/// pre-Phase-1-Block-A name. New code should use
+/// [`OVERLAY_ID_THRESHOLD`].
+pub const HIGHLIGHT_ID_THRESHOLD: u64 = OVERLAY_ID_THRESHOLD;
+
+/// Returns whether the given `ObjectId` was allocated for an overlay
+/// object (selection highlight, artboard shadow, artboard label, …)
+/// rather than a document-backed node.
+#[must_use]
+pub const fn is_overlay_id(id: ObjectId) -> bool {
+    id.0 >= OVERLAY_ID_THRESHOLD
+}
+
+/// Legacy alias for [`is_overlay_id`] — see [`HIGHLIGHT_ID_THRESHOLD`].
 #[must_use]
 pub const fn is_selection_highlight_id(id: ObjectId) -> bool {
-    id.0 >= HIGHLIGHT_ID_THRESHOLD
+    is_overlay_id(id)
 }
 
 /// Bidirectional `Uuid` ⇄ `ObjectId` map plus a monotonic id allocator.
@@ -120,6 +166,15 @@ impl SceneSync {
             // ObjectId(0) is reserved as a sentinel for "no object".
             next_id: AtomicU64::new(1),
         }
+    }
+
+    fn next_overlay_id(state: &mut OverlayIdAllocator) -> ObjectId {
+        let id = ObjectId(state.next);
+        state.next = state.next.saturating_add(1);
+        // We start at OVERLAY_ID_THRESHOLD and count up; selection
+        // highlights count down from u64::MAX. The two streams meet at
+        // the midpoint of u64::MAX, which is unreachable in practice.
+        id
     }
 
     /// Stable lookup: which renderer object corresponds to this doc uuid?
@@ -205,6 +260,7 @@ impl SceneSync {
         let mut scene = Scene::new(DEFAULT_CLEAR);
         let mut z = 0_i32;
         let mut emitted_uuids: Vec<Uuid> = Vec::new();
+        let mut overlay = OverlayIdAllocator::new();
         for root in doc.root_ids() {
             self.visit(
                 doc,
@@ -213,6 +269,8 @@ impl SceneSync {
                 &mut scene,
                 &mut z,
                 &mut emitted_uuids,
+                &mut overlay,
+                None,
             );
         }
 
@@ -258,6 +316,7 @@ impl SceneSync {
         scene
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn visit(
         &mut self,
         doc: &DocumentGraph,
@@ -266,23 +325,51 @@ impl SceneSync {
         scene: &mut Scene,
         z: &mut i32,
         emitted: &mut Vec<Uuid>,
+        overlay: &mut OverlayIdAllocator,
+        clip: Option<kcreate_core::node::Bounds>,
     ) {
         let Some(node) = doc.get_node(id) else { return };
         if !node.visible {
             return;
         }
-        match node.node_type {
-            NodeType::Artboard => self.emit_artboard(node, scene, z, emitted),
-            NodeType::VectorLayer => self.emit_vector(node, scene, z, emitted),
-            NodeType::RasterLayer => self.emit_raster(node, scene, z, blob_store, emitted),
-            NodeType::TextLayer => self.emit_text(node, scene, z, emitted),
+        // Frame clipping: if a clip rect is in effect and this node's
+        // world bounds are entirely outside it, prune the node *and*
+        // its subtree from the scene. The clip never applies to the
+        // artboard itself (it sets its own clip for descendants).
+        if !matches!(node.node_type, NodeType::Artboard) {
+            if let Some(clip_rect) = clip {
+                let world = node_world_bounds(node);
+                if !bounds_overlap(&world, &clip_rect) {
+                    return;
+                }
+            }
+        }
+        let child_clip = match node.node_type {
+            NodeType::Artboard => {
+                self.emit_artboard(node, scene, z, emitted, overlay);
+                Some(node_world_bounds(node))
+            }
+            NodeType::VectorLayer => {
+                self.emit_vector(node, scene, z, emitted);
+                clip
+            }
+            NodeType::RasterLayer => {
+                self.emit_raster(node, scene, z, blob_store, emitted);
+                clip
+            }
+            NodeType::TextLayer => {
+                self.emit_text(node, scene, z, emitted);
+                clip
+            }
             NodeType::Page
             | NodeType::GroupLayer
             | NodeType::ComponentLayer
-            | NodeType::LayoutFrame => {}
-        }
+            | NodeType::LayoutFrame => clip,
+        };
         for child in &node.children {
-            self.visit(doc, *child, blob_store, scene, z, emitted);
+            self.visit(
+                doc, *child, blob_store, scene, z, emitted, overlay, child_clip,
+            );
         }
     }
 
@@ -292,11 +379,35 @@ impl SceneSync {
         scene: &mut Scene,
         z: &mut i32,
         emitted: &mut Vec<Uuid>,
+        overlay: &mut OverlayIdAllocator,
     ) {
+        let world = node_world_bounds(node);
+
+        // 1. Drop shadow under the artboard. Offset down-right by
+        //    `ARTBOARD_SHADOW_OFFSET`. Drawn first so it sits behind
+        //    everything that follows. Overlay id => not hit-testable.
+        let shadow = Object::new(
+            ObjectKind::Rect(Rect::new(
+                world.x as f32 + ARTBOARD_SHADOW_OFFSET,
+                world.y as f32 + ARTBOARD_SHADOW_OFFSET,
+                world.width as f32,
+                world.height as f32,
+            )),
+            Style {
+                fill: Some(ARTBOARD_SHADOW),
+                stroke: None,
+            },
+        )
+        .with_id(Self::next_overlay_id(overlay))
+        .with_z(*z);
+        scene.add_object(shadow);
+        *z += 1;
+
+        // 2. Artboard background rect — the hit-testable, document-
+        //    backed object the user can select and drag.
         let obj_id = self.allocate(node.id);
         self.record(node.id, obj_id);
         emitted.push(node.id);
-        let world = node_world_bounds(node);
         let fill = node_fill(node).unwrap_or(Color::rgba(1.0, 1.0, 1.0, 1.0));
         let style = Style {
             fill: Some(fill),
@@ -315,6 +426,29 @@ impl SceneSync {
         .with_z(*z);
         scene.add_object(obj);
         *z += 1;
+
+        // 3. Name label above the artboard. Overlay id so the user
+        //    can't accidentally select it. Skip when the artboard has
+        //    no name (avoid emitting an empty Text object).
+        if !node.name.is_empty() {
+            let label_origin = Point2::new(world.x as f32, world.y as f32 - ARTBOARD_LABEL_GAP);
+            let label = Object::new(
+                ObjectKind::Text {
+                    origin: label_origin,
+                    text: node.name.clone(),
+                    font_family: ARTBOARD_LABEL_FONT.to_string(),
+                    font_size: ARTBOARD_LABEL_FONT_SIZE,
+                },
+                Style {
+                    fill: Some(ARTBOARD_LABEL_COLOR),
+                    stroke: None,
+                },
+            )
+            .with_id(Self::next_overlay_id(overlay))
+            .with_z(*z);
+            scene.add_object(label);
+            *z += 1;
+        }
     }
 
     fn emit_vector(
@@ -498,6 +632,34 @@ fn vector_path_to_renderer(path: &VectorPath) -> Vec<PathCommand> {
     out
 }
 
+/// Counter for overlay (non-document) scene-object ids. Starts at
+/// [`OVERLAY_ID_THRESHOLD`] and counts upward; selection highlights
+/// count downward from `u64::MAX` so the two streams never collide
+/// in practice (they'd need to span ~2^63 ids first).
+#[derive(Debug)]
+struct OverlayIdAllocator {
+    next: u64,
+}
+
+impl OverlayIdAllocator {
+    fn new() -> Self {
+        Self {
+            next: OVERLAY_ID_THRESHOLD,
+        }
+    }
+}
+
+/// Axis-aligned bounding-rect intersection test in world units.
+/// Returns `false` when either rect has zero area along one axis on
+/// the same side of the other rect (i.e. fully outside).
+fn bounds_overlap(a: &kcreate_core::node::Bounds, b: &kcreate_core::node::Bounds) -> bool {
+    let a_right = a.x + a.width;
+    let a_bottom = a.y + a.height;
+    let b_right = b.x + b.width;
+    let b_bottom = b.y + b.height;
+    a.x < b_right && a_right > b.x && a.y < b_bottom && a_bottom > b.y
+}
+
 fn node_world_bounds(node: &Node) -> kcreate_core::node::Bounds {
     // Bounds are stored in local space; transform offset folds in
     // translation. Phase 0 doesn't support rotation in the renderer,
@@ -648,9 +810,9 @@ mod tests {
     }
 
     #[test]
-    fn artboard_becomes_background_rect() {
+    fn artboard_emits_shadow_background_and_label() {
         let mut doc = DocumentGraph::new();
-        let mut art = Node::new(NodeType::Artboard, "Page");
+        let mut art = Node::new(NodeType::Artboard, "Desktop");
         art.bounds = Bounds {
             x: 0.0,
             y: 0.0,
@@ -666,14 +828,131 @@ mod tests {
         let id = doc.insert_node(art).expect("art");
         let mut sync = SceneSync::new();
         let scene = sync.sync_document_to_scene(&doc, None, &[]);
-        assert_eq!(scene.objects.len(), 1);
-        let rect = match &scene.objects[0].kind {
-            ObjectKind::Rect(r) => *r,
-            other => panic!("expected rect, got {other:?}"),
+        // Shadow + background + label = 3 scene objects.
+        assert_eq!(scene.objects.len(), 3, "shadow + bg + label");
+
+        // Shadow is first and uses an overlay (non-document) id.
+        assert!(matches!(scene.objects[0].kind, ObjectKind::Rect(_)));
+        assert!(is_overlay_id(scene.objects[0].id));
+        // Background is second, hit-testable (document id), and the
+        // forward map points at it.
+        let bg = &scene.objects[1];
+        match &bg.kind {
+            ObjectKind::Rect(r) => {
+                assert_eq!(r.width, 100.0);
+                assert_eq!(r.height, 50.0);
+            }
+            other => panic!("expected background rect, got {other:?}"),
+        }
+        assert!(!is_overlay_id(bg.id));
+        let mapped = sync.object_id_for_uuid(id).expect("forward lookup");
+        assert_eq!(mapped, bg.id);
+
+        // Label is third: a Text overlay positioned above the
+        // artboard with the artboard name.
+        match &scene.objects[2].kind {
+            ObjectKind::Text { text, origin, .. } => {
+                assert_eq!(text, "Desktop");
+                assert!(origin.y < 0.0, "label should sit above top edge");
+            }
+            other => panic!("expected name label, got {other:?}"),
+        }
+        assert!(is_overlay_id(scene.objects[2].id));
+    }
+
+    #[test]
+    fn artboard_without_name_skips_label() {
+        let mut doc = DocumentGraph::new();
+        let mut art = Node::new(NodeType::Artboard, "");
+        art.bounds = Bounds {
+            x: 0.0,
+            y: 0.0,
+            width: 50.0,
+            height: 50.0,
         };
-        assert_eq!(rect.width, 100.0);
-        assert_eq!(rect.height, 50.0);
-        let _ = id; // mapping side-effect
+        doc.insert_node(art).expect("art");
+        let mut sync = SceneSync::new();
+        let scene = sync.sync_document_to_scene(&doc, None, &[]);
+        // Shadow + background only, no label.
+        assert_eq!(scene.objects.len(), 2);
+    }
+
+    #[test]
+    fn child_entirely_outside_artboard_is_clipped() {
+        let mut doc = DocumentGraph::new();
+        let mut art = Node::new(NodeType::Artboard, "Page");
+        art.bounds = Bounds {
+            x: 0.0,
+            y: 0.0,
+            width: 100.0,
+            height: 100.0,
+        };
+        let art_id = doc.insert_node(art).expect("art");
+
+        // Child INSIDE the artboard (intersects clip rect).
+        let path = unit_square_path();
+        let mut inside = vector_node(&path);
+        inside.bounds = Bounds {
+            x: 10.0,
+            y: 10.0,
+            width: 20.0,
+            height: 20.0,
+        };
+        let inside_id = doc.insert_node(inside).expect("inside");
+        doc.reparent_node(inside_id, Some(art_id), 0)
+            .expect("attach inside");
+
+        // Child fully OUTSIDE the artboard (right of it, no overlap).
+        let mut outside = vector_node(&path);
+        outside.bounds = Bounds {
+            x: 1000.0,
+            y: 1000.0,
+            width: 20.0,
+            height: 20.0,
+        };
+        let outside_id = doc.insert_node(outside).expect("outside");
+        doc.reparent_node(outside_id, Some(art_id), 1)
+            .expect("attach outside");
+
+        let mut sync = SceneSync::new();
+        let scene = sync.sync_document_to_scene(&doc, None, &[]);
+        // Shadow + bg + label + inside child = 4 (outside pruned).
+        assert_eq!(scene.objects.len(), 4);
+        // The pruned child must not have a mapping.
+        assert!(sync.object_id_for_uuid(outside_id).is_none());
+        // The inside child must.
+        assert!(sync.object_id_for_uuid(inside_id).is_some());
+    }
+
+    #[test]
+    fn bounds_overlap_reports_intersection_correctly() {
+        let a = Bounds {
+            x: 0.0,
+            y: 0.0,
+            width: 10.0,
+            height: 10.0,
+        };
+        let touches_corner = Bounds {
+            x: 9.0,
+            y: 9.0,
+            width: 5.0,
+            height: 5.0,
+        };
+        let just_outside = Bounds {
+            x: 10.0,
+            y: 0.0,
+            width: 5.0,
+            height: 5.0,
+        };
+        let far_away = Bounds {
+            x: 100.0,
+            y: 100.0,
+            width: 5.0,
+            height: 5.0,
+        };
+        assert!(bounds_overlap(&a, &touches_corner));
+        assert!(!bounds_overlap(&a, &just_outside));
+        assert!(!bounds_overlap(&a, &far_away));
     }
 
     #[test]

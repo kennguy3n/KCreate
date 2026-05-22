@@ -128,15 +128,16 @@ KCreate/
 │       ├── renderer/             React + Vite UI
 │       └── shared/               wire-format types
 ├── crates/
-│   ├── kcreate_core/             Shared types, node model, document graph, ops, config
-│   ├── kcreate_renderer/         Offscreen wgpu + tiny-skia fallback
+│   ├── kcreate_core/             Shared types, node model, document graph, ops, config, components
+│   ├── kcreate_renderer/         Offscreen wgpu + tiny-skia fallback + native swapchain surface
 │   ├── kcreate_bridge/           N-API bindings (cdylib)
 │   ├── kcreate_vector/           Path math, boolean ops, SVG, R-tree
 │   ├── kcreate_storage/          SQLite + BLAKE3 blobs + .kstudio I/O
-│   ├── kcreate_export/           PNG / SVG / PDF / WebP / JPEG export + batch
+│   ├── kcreate_export/           PNG / SVG / PDF / WebP / JPEG export + batch + inspect code-gen
 │   ├── kcreate_raster/           Tile engine, masks, adjustment layers
 │   ├── kcreate_text/             Font discovery (fontdb) + shaping (rustybuzz)
-│   ├── kcreate_ai/               Local AI task router + threshold-v0 bg-removal
+│   ├── kcreate_layout/           Pure flex + grid solvers
+│   ├── kcreate_ai/               Local AI task router + bg-removal (threshold + ONNX) + LLM sidecar
 │   ├── kcreate_mcp/              Loopback-only MCP server (3 tools)
 │   └── kcreate_tests/            Cross-crate integration tests
 ├── PROPOSAL.md                   Product specification

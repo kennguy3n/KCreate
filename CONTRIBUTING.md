@@ -35,6 +35,19 @@ rasterizer if no Vulkan adapter is available, so headless containers
 work too — the GPU deps are optional for tests but required for the
 desktop app.
 
+`kcreate_ai`'s ONNX background-removal backend pulls in `ort 2.x`,
+which downloads a prebuilt ONNX Runtime shared library on first
+compile (no extra apt packages needed). If you're on a fully offline
+runner, set `ORT_DYLIB_PATH` to a locally-staged copy. Tests that
+require an actual u2net model are marked `#[ignore]` and skip when
+the model file is absent — the threshold backend always runs and is
+the production fallback when no model is shipped.
+
+`kcreate_ai`'s LLM sidecar (`llm_sidecar.rs`) talks to an external
+`llama-server` over loopback (`127.0.0.1:<port>`). The sidecar
+binary is not bundled in CI; the sidecar lifecycle tests use a mock
+HTTP server so `cargo test` works without `llama-server` installed.
+
 ### macOS
 
 ```bash
@@ -65,6 +78,7 @@ cargo test --workspace --all-targets
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all --check
 cargo bench -p kcreate_renderer --no-run
+cargo bench -p kcreate_layout --no-run
 
 pnpm typecheck
 pnpm lint

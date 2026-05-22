@@ -18,6 +18,7 @@
 
 pub mod document;
 pub mod hit_test;
+pub mod llm;
 pub mod scene_sync;
 pub mod state;
 pub mod wire;
@@ -27,7 +28,8 @@ use std::str::FromStr;
 
 use kcreate_export::svg::SvgExportOptions;
 use kcreate_renderer::Rect;
-use napi::bindgen_prelude::{Buffer, Error as NapiError, Result as NapiResult, Status};
+use napi::bindgen_prelude::{AsyncTask, Buffer, Error as NapiError, Result as NapiResult, Status};
+use napi::{Env, Task};
 use napi_derive::napi;
 use uuid::Uuid;
 
@@ -384,6 +386,19 @@ pub fn document_get_tree() -> NapiResult<Vec<NodeInfo>> {
         .collect())
 }
 
+/// Compute the three inspect-mode code outputs (CSS, Tailwind, and
+/// React inline-style object literal) for `node_id`. Returns the
+/// JSON-encoded `InspectCode` struct so the renderer can decode it
+/// without bespoke type-mirroring.
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn document_inspect_node(node_id: String) -> NapiResult<String> {
+    let id = parse_uuid(&node_id)?;
+    let code = document::document_inspect_node(id).map_err(map_doc_err)?;
+    serde_json::to_string(&code)
+        .map_err(|e| NapiError::from_reason(format!("document_inspect_node encode: {e}")))
+}
+
 /// Create a new node. `props_json` is a JSON object with optional
 /// `name`, `visible`, `locked`, `metadata` fields. Returns the new id.
 #[napi]
@@ -448,6 +463,231 @@ pub fn document_redo() -> NapiResult<Option<Vec<String>>> {
 #[napi]
 pub fn runtime_status() -> RuntimeStatus {
     document::runtime_status().into()
+}
+
+/// True iff low-resource mode is currently active.
+#[napi]
+pub fn low_resource_mode_get() -> bool {
+    document::low_resource_mode_get()
+}
+
+/// Toggle low-resource mode. Tier 0 hosts are pinned to `true`.
+#[napi]
+pub fn low_resource_mode_set(enabled: bool) {
+    document::low_resource_mode_set(enabled);
+}
+
+/// JSON snapshot of the currently-effective resource limits.
+///
+/// The JSON shape mirrors [`document::ResourceLimits`] verbatim
+/// (snake_case fields). Callers decode it on the TypeScript side.
+#[napi]
+pub fn resource_limits() -> NapiResult<String> {
+    let limits = document::resource_limits();
+    serde_json::to_string(&limits)
+        .map_err(|e| NapiError::from_reason(format!("resource_limits: {e}")))
+}
+
+// =============================================================================
+// LLM bridge
+// =============================================================================
+
+fn map_llm_err(e: llm::LlmBridgeError) -> NapiError {
+    NapiError::new(Status::GenericFailure, e.to_string())
+}
+
+/// Start the LLM sidecar pointed at `model_path`. Returns the
+/// loopback port on success.
+#[napi]
+pub fn llm_start(model_path: String) -> NapiResult<u32> {
+    let port = llm::llm_start(PathBuf::from(model_path)).map_err(map_llm_err)?;
+    Ok(u32::from(port))
+}
+
+/// Stop the LLM sidecar. Idempotent.
+#[napi]
+pub fn llm_stop() {
+    llm::llm_stop();
+}
+
+/// JSON-encoded sidecar status.
+#[napi]
+pub fn llm_status() -> NapiResult<String> {
+    serde_json::to_string(&llm::llm_status())
+        .map_err(|e| NapiError::from_reason(format!("llm_status: {e}")))
+}
+
+// LLM chat/completion is a *blocking* HTTP round-trip to the local
+// llama-server (up to a 60 s timeout in `chat_completion_impl`).
+// Exposing it as a synchronous N-API function would block the
+// Electron main process event loop for the duration — window
+// dragging, menu clicks, and every other IPC queue would freeze.
+// We wrap each completion call in `AsyncTask`, which dispatches the
+// blocking work to N-API's libuv thread pool and resolves the
+// returned JS Promise once the worker finishes. The renderer
+// already awaits these results via `ipcRenderer.invoke`, so the
+// wire format doesn't change.
+//
+// We deliberately do NOT use a Tokio runtime here: `ureq` (the
+// llama-server client) is itself blocking, and a single-shot worker
+// task per request is simpler than threading an async runtime
+// through the LLM crate. If the LLM client ever switches to an
+// async HTTP library, these tasks can move to `Env::execute_tokio_future`.
+
+/// `napi::Task` for `llm_chat`. Owns the parsed messages so the
+/// blocking HTTP call can run on a worker thread.
+#[derive(Debug)]
+pub struct LlmChatTask {
+    messages: Vec<llm::LlmMessage>,
+    max_tokens: usize,
+    temperature: f32,
+}
+
+impl Task for LlmChatTask {
+    type Output = String;
+    type JsValue = String;
+
+    fn compute(&mut self) -> NapiResult<Self::Output> {
+        let reply = llm::llm_chat(
+            std::mem::take(&mut self.messages),
+            self.max_tokens,
+            self.temperature,
+        )
+        .map_err(map_llm_err)?;
+        serde_json::to_string(&reply)
+            .map_err(|e| NapiError::from_reason(format!("llm_chat encode: {e}")))
+    }
+
+    fn resolve(&mut self, _env: Env, output: Self::Output) -> NapiResult<Self::JsValue> {
+        Ok(output)
+    }
+}
+
+/// JSON-encoded chat completion. Input is a JSON array of
+/// `{role, content}` objects. Resolves on a worker thread so the
+/// Electron main loop stays responsive while llama-server runs
+/// inference.
+#[napi(ts_return_type = "Promise<string>")]
+pub fn llm_chat(
+    messages_json: String,
+    max_tokens: u32,
+    temperature: f64,
+) -> NapiResult<AsyncTask<LlmChatTask>> {
+    let messages: Vec<llm::LlmMessage> = serde_json::from_str(&messages_json)
+        .map_err(|e| NapiError::new(Status::InvalidArg, format!("llm_chat messages: {e}")))?;
+    #[allow(clippy::cast_possible_truncation)]
+    Ok(AsyncTask::new(LlmChatTask {
+        messages,
+        max_tokens: max_tokens as usize,
+        temperature: temperature as f32,
+    }))
+}
+
+/// `napi::Task` for `llm_suggest_for_selection`.
+#[derive(Debug)]
+pub struct LlmSuggestForSelectionTask;
+
+impl Task for LlmSuggestForSelectionTask {
+    type Output = String;
+    type JsValue = String;
+
+    fn compute(&mut self) -> NapiResult<Self::Output> {
+        let reply = llm::llm_suggest_for_selection().map_err(map_llm_err)?;
+        serde_json::to_string(&reply)
+            .map_err(|e| NapiError::from_reason(format!("llm_suggest encode: {e}")))
+    }
+
+    fn resolve(&mut self, _env: Env, output: Self::Output) -> NapiResult<Self::JsValue> {
+        Ok(output)
+    }
+}
+
+/// JSON-encoded "suggest improvements" output for the current
+/// selection or document. Runs on a worker thread.
+#[napi(ts_return_type = "Promise<string>")]
+pub fn llm_suggest_for_selection() -> AsyncTask<LlmSuggestForSelectionTask> {
+    AsyncTask::new(LlmSuggestForSelectionTask)
+}
+
+/// `napi::Task` for `ai_suggest_layer_names`.
+#[derive(Debug)]
+pub struct AiSuggestLayerNamesTask;
+
+impl Task for AiSuggestLayerNamesTask {
+    type Output = String;
+    type JsValue = String;
+
+    fn compute(&mut self) -> NapiResult<Self::Output> {
+        let res = llm::ai_suggest_layer_names().map_err(map_llm_err)?;
+        serde_json::to_string(&res)
+            .map_err(|e| NapiError::from_reason(format!("ai_suggest_layer_names encode: {e}")))
+    }
+
+    fn resolve(&mut self, _env: Env, output: Self::Output) -> NapiResult<Self::JsValue> {
+        Ok(output)
+    }
+}
+
+/// Ask the LLM to propose semantic names for every layer. Returns a
+/// JSON object: `{ suggestions: [[uuid, name], ...], raw_content,
+/// tokens_used, model }`. Runs on a worker thread.
+#[napi(ts_return_type = "Promise<string>")]
+pub fn ai_suggest_layer_names() -> AsyncTask<AiSuggestLayerNamesTask> {
+    AsyncTask::new(AiSuggestLayerNamesTask)
+}
+
+/// `napi::Task` for `ai_extract_design_tokens`.
+#[derive(Debug)]
+pub struct AiExtractDesignTokensTask;
+
+impl Task for AiExtractDesignTokensTask {
+    type Output = String;
+    type JsValue = String;
+
+    fn compute(&mut self) -> NapiResult<Self::Output> {
+        let res = llm::ai_extract_design_tokens().map_err(map_llm_err)?;
+        serde_json::to_string(&res)
+            .map_err(|e| NapiError::from_reason(format!("ai_extract_design_tokens encode: {e}")))
+    }
+
+    fn resolve(&mut self, _env: Env, output: Self::Output) -> NapiResult<Self::JsValue> {
+        Ok(output)
+    }
+}
+
+/// Ask the LLM to extract design tokens. Returns
+/// `{ json, tokens_used, model }` where `json` is the model's reply
+/// in the schema described by `build_design_token_prompt`. Runs on a
+/// worker thread.
+#[napi(ts_return_type = "Promise<string>")]
+pub fn ai_extract_design_tokens() -> AsyncTask<AiExtractDesignTokensTask> {
+    AsyncTask::new(AiExtractDesignTokensTask)
+}
+
+/// `napi::Task` for `ai_check_accessibility`.
+#[derive(Debug)]
+pub struct AiCheckAccessibilityTask;
+
+impl Task for AiCheckAccessibilityTask {
+    type Output = String;
+    type JsValue = String;
+
+    fn compute(&mut self) -> NapiResult<Self::Output> {
+        let res = llm::ai_check_accessibility().map_err(map_llm_err)?;
+        serde_json::to_string(&res)
+            .map_err(|e| NapiError::from_reason(format!("ai_check_accessibility encode: {e}")))
+    }
+
+    fn resolve(&mut self, _env: Env, output: Self::Output) -> NapiResult<Self::JsValue> {
+        Ok(output)
+    }
+}
+
+/// Ask the LLM to audit the document for accessibility issues.
+/// Returns `{ json, tokens_used, model }`. Runs on a worker thread.
+#[napi(ts_return_type = "Promise<string>")]
+pub fn ai_check_accessibility() -> AsyncTask<AiCheckAccessibilityTask> {
+    AsyncTask::new(AiCheckAccessibilityTask)
 }
 
 /// Snapshot of the open document's editing state.
@@ -836,4 +1076,165 @@ pub fn export_preset_list() -> NapiResult<String> {
 pub fn export_preset_delete(preset_id: String) -> NapiResult<bool> {
     let id = parse_uuid(&preset_id)?;
     document::export_preset_delete(id).map_err(map_doc_err)
+}
+
+// ---------------------------------------------------------------------------
+// Artboards
+// ---------------------------------------------------------------------------
+
+/// Create a new artboard. `page_id` may be `None`/empty to attach to
+/// (or create) the first Page in the project. Returns the new
+/// artboard's UUID.
+#[napi]
+pub fn artboard_create(
+    page_id: Option<String>,
+    name: String,
+    width: f64,
+    height: f64,
+) -> NapiResult<String> {
+    let parent = match page_id.as_deref() {
+        Some(s) if !s.is_empty() => Some(parse_uuid(s)?),
+        _ => None,
+    };
+    document::artboard_create(parent, name, width, height)
+        .map(|id| id.to_string())
+        .map_err(map_doc_err)
+}
+
+/// List every artboard in the project as a JSON array.
+#[napi]
+pub fn artboard_list() -> NapiResult<String> {
+    let infos = document::artboard_list().map_err(map_doc_err)?;
+    serde_json::to_string(&infos).map_err(|e| NapiError::from_reason(e.to_string()))
+}
+
+/// Deep-clone an artboard and all its descendants. Returns the new
+/// artboard's UUID.
+#[napi]
+pub fn artboard_duplicate(artboard_id: String) -> NapiResult<String> {
+    let id = parse_uuid(&artboard_id)?;
+    document::artboard_duplicate(id)
+        .map(|new_id| new_id.to_string())
+        .map_err(map_doc_err)
+}
+
+/// Resize the artboard's bounds (width/height). The (x, y) corner is
+/// preserved.
+#[napi]
+pub fn artboard_resize(artboard_id: String, width: f64, height: f64) -> NapiResult<()> {
+    let id = parse_uuid(&artboard_id)?;
+    document::artboard_resize(id, width, height).map_err(map_doc_err)
+}
+
+/// Return the built-in artboard preset catalogue as a JSON array.
+#[napi]
+pub fn artboard_presets() -> NapiResult<String> {
+    let presets = document::artboard_presets();
+    serde_json::to_string(&presets).map_err(|e| NapiError::from_reason(e.to_string()))
+}
+
+// -----------------------------------------------------------------------------
+// Components (Block B)
+// -----------------------------------------------------------------------------
+
+/// Convert a selection of nodes into a reusable component. Returns
+/// the new component's UUID.
+#[napi]
+pub fn component_create_from_selection(node_ids: Vec<String>, name: String) -> NapiResult<String> {
+    let mut parsed = Vec::with_capacity(node_ids.len());
+    for s in node_ids {
+        parsed.push(parse_uuid(&s)?);
+    }
+    document::component_create_from_selection(parsed, name)
+        .map(|id| id.to_string())
+        .map_err(map_doc_err)
+}
+
+/// List every registered component as a JSON array.
+#[napi]
+pub fn component_list() -> NapiResult<String> {
+    let list = document::component_list().map_err(map_doc_err)?;
+    serde_json::to_string(&list).map_err(|e| NapiError::from_reason(e.to_string()))
+}
+
+/// Instantiate a component at `(x, y)` under `parent_id`. Returns
+/// the new ComponentLayer node's UUID.
+#[napi]
+pub fn component_instantiate(
+    component_id: String,
+    parent_id: Option<String>,
+    x: f64,
+    y: f64,
+) -> NapiResult<String> {
+    let cid = parse_uuid(&component_id)?;
+    let parent = match parent_id {
+        Some(s) if !s.is_empty() => Some(parse_uuid(&s)?),
+        _ => None,
+    };
+    document::component_instantiate(cid, parent, x, y)
+        .map(|id| id.to_string())
+        .map_err(map_doc_err)
+}
+
+/// Append a fresh variant to a component. Returns the new variant's
+/// UUID.
+#[napi]
+pub fn component_add_variant(component_id: String, name: String) -> NapiResult<String> {
+    let cid = parse_uuid(&component_id)?;
+    document::component_add_variant(cid, name)
+        .map(|id| id.to_string())
+        .map_err(map_doc_err)
+}
+
+/// Switch the active variant of a component instance node.
+#[napi]
+pub fn component_switch_variant(node_id: String, variant_id: String) -> NapiResult<()> {
+    let nid = parse_uuid(&node_id)?;
+    let vid = parse_uuid(&variant_id)?;
+    document::component_switch_variant(nid, vid).map_err(map_doc_err)
+}
+
+/// Detach a component instance — converts the ComponentLayer into a
+/// regular GroupLayer.
+#[napi]
+pub fn component_detach(node_id: String) -> NapiResult<()> {
+    let nid = parse_uuid(&node_id)?;
+    document::component_detach(nid).map_err(map_doc_err)
+}
+
+// -----------------------------------------------------------------------------
+// Auto-layout (Block C)
+// -----------------------------------------------------------------------------
+
+/// Write a `FlexLayout` config (JSON) onto the given LayoutFrame.
+#[napi]
+pub fn layout_set_flex(node_id: String, layout_json: String) -> NapiResult<()> {
+    let nid = parse_uuid(&node_id)?;
+    let cfg: kcreate_layout::FlexLayout = serde_json::from_str(&layout_json)
+        .map_err(|e| NapiError::from_reason(format!("layout json: {e}")))?;
+    document::layout_set_flex(nid, cfg).map_err(map_doc_err)
+}
+
+/// Write a `GridLayout` config (JSON) onto the given LayoutFrame.
+#[napi]
+pub fn layout_set_grid(node_id: String, layout_json: String) -> NapiResult<()> {
+    let nid = parse_uuid(&node_id)?;
+    let cfg: kcreate_layout::GridLayout = serde_json::from_str(&layout_json)
+        .map_err(|e| NapiError::from_reason(format!("layout json: {e}")))?;
+    document::layout_set_grid(nid, cfg).map_err(map_doc_err)
+}
+
+/// Recompute child positions for a LayoutFrame from its layout config.
+#[napi]
+pub fn layout_recompute(node_id: String) -> NapiResult<()> {
+    let nid = parse_uuid(&node_id)?;
+    document::layout_recompute(nid).map_err(map_doc_err)
+}
+
+/// Convert a GroupLayer node into a LayoutFrame so it can carry an
+/// auto-layout config. No-op for already-LayoutFrame nodes.
+#[napi]
+pub fn layout_convert_to_frame(node_id: String) -> NapiResult<()> {
+    let nid = parse_uuid(&node_id)?;
+    document::layout_convert_to_frame(nid).map_err(map_doc_err)
 }

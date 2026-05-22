@@ -24,6 +24,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
+use kcreate_core::component::ComponentDefinition;
 use kcreate_core::document::{DocumentError, DocumentGraph};
 use kcreate_core::node::{Node, NodeType};
 use kcreate_core::operation::Operation;
@@ -471,6 +472,80 @@ impl ProjectStore {
         Ok(n)
     }
 
+    /// Persist a single component definition. Upsert keyed on
+    /// `ComponentDefinition::id`.
+    pub fn save_component(
+        &mut self,
+        component: &ComponentDefinition,
+    ) -> Result<(), ProjectStoreError> {
+        self.db.conn().execute(
+            "INSERT INTO components (id, data, updated_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT(id) DO UPDATE SET data = excluded.data, updated_at = excluded.updated_at",
+            params![
+                component.id.to_string(),
+                serde_json::to_string(component)?,
+                Utc::now().to_rfc3339(),
+            ],
+        )?;
+        self.touch_modified()?;
+        Ok(())
+    }
+
+    /// Bulk-persist a set of components. Rows missing from the input
+    /// are deleted (the in-memory map is the source of truth).
+    pub fn replace_components(
+        &mut self,
+        components: &std::collections::HashMap<Uuid, ComponentDefinition>,
+    ) -> Result<(), ProjectStoreError> {
+        let tx = self.db.conn_mut().transaction()?;
+        tx.execute("DELETE FROM components", [])?;
+        {
+            let mut stmt =
+                tx.prepare("INSERT INTO components (id, data, updated_at) VALUES (?1, ?2, ?3)")?;
+            for component in components.values() {
+                stmt.execute(params![
+                    component.id.to_string(),
+                    serde_json::to_string(component)?,
+                    Utc::now().to_rfc3339(),
+                ])?;
+            }
+        }
+        tx.commit()?;
+        self.touch_modified()?;
+        Ok(())
+    }
+
+    /// Load every component definition into the canonical in-memory
+    /// `HashMap` keyed by id.
+    pub fn load_components(
+        &self,
+    ) -> Result<std::collections::HashMap<Uuid, ComponentDefinition>, ProjectStoreError> {
+        let mut stmt = self
+            .db
+            .conn()
+            .prepare("SELECT data FROM components ORDER BY updated_at ASC")?;
+        let mut out = std::collections::HashMap::new();
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        for raw in rows {
+            let def: ComponentDefinition = serde_json::from_str(&raw?)?;
+            out.insert(def.id, def);
+        }
+        Ok(out)
+    }
+
+    /// Delete a component definition by id. Returns the number of
+    /// rows removed (0 or 1).
+    pub fn delete_component(&mut self, id: Uuid) -> Result<usize, ProjectStoreError> {
+        let n = self.db.conn().execute(
+            "DELETE FROM components WHERE id = ?1",
+            params![id.to_string()],
+        )?;
+        if n > 0 {
+            self.touch_modified()?;
+        }
+        Ok(n)
+    }
+
     /// Bump `modified_at` and persist.
     fn touch_modified(&mut self) -> Result<(), ProjectStoreError> {
         self.manifest.modified_at = Utc::now();
@@ -756,5 +831,50 @@ mod tests {
             .delete_export_preset(Uuid::new_v4())
             .expect("delete missing");
         assert_eq!(missing, 0);
+    }
+
+    #[test]
+    fn component_round_trip_and_replace() {
+        use kcreate_core::component::{ComponentDefinition, ComponentVariant};
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = dir.path().join("My.kstudio");
+        let mut store = ProjectStore::create(&p, "My").expect("create");
+
+        let mut def = ComponentDefinition::new("Button");
+        let _ = def.add_variant(ComponentVariant::new("Hover"));
+        let cid = def.id;
+        store.save_component(&def).expect("save");
+        let loaded = store.load_components().expect("load");
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded.get(&cid).expect("present").variants.len(), 2);
+
+        // replace_components mirrors the in-memory map and drops
+        // missing rows. Build a fresh map containing only a new
+        // definition, then verify the old one is gone.
+        let mut fresh = std::collections::HashMap::new();
+        let other = ComponentDefinition::new("Card");
+        let other_id = other.id;
+        fresh.insert(other.id, other);
+        store.replace_components(&fresh).expect("replace");
+        let after = store.load_components().expect("load after");
+        assert_eq!(after.len(), 1);
+        assert!(after.contains_key(&other_id));
+        assert!(!after.contains_key(&cid));
+
+        // Delete a missing id is a no-op.
+        let removed = store.delete_component(Uuid::new_v4()).expect("noop");
+        assert_eq!(removed, 0);
+        // Delete the real one and check.
+        let removed = store.delete_component(other_id).expect("delete");
+        assert_eq!(removed, 1);
+        let empty = store.load_components().expect("empty");
+        assert!(empty.is_empty());
+
+        // Round-trip through close+reopen.
+        store.save_component(&def).expect("save again");
+        drop(store);
+        let reopened = ProjectStore::open(&p).expect("reopen");
+        let loaded = reopened.load_components().expect("load after reopen");
+        assert!(loaded.contains_key(&cid));
     }
 }

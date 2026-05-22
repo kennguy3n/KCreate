@@ -15,6 +15,8 @@ import { useState } from "react";
 
 import type { NodeInfo } from "../../../shared/scene";
 import { colors, radius, spacing } from "../styles/tokens";
+import { LlmChatPanel } from "./LlmChatPanel";
+import { ModelManager } from "./ModelManager";
 
 export interface AIAssistPanelProps {
   selectedNode: NodeInfo | null;
@@ -68,6 +70,7 @@ export function AIAssistPanel({
         flexDirection: "column",
         padding: spacing.md,
         gap: spacing.sm,
+        overflowY: "auto",
       }}
     >
       <h2
@@ -148,6 +151,9 @@ export function AIAssistPanel({
         with <kbd>Ctrl/Cmd+Z</kbd> — the AI action is recorded in the
         operation log alongside vector edits.
       </p>
+
+      <ModelManager onStatus={onStatus} />
+      <LlmChatPanel onStatus={onStatus} />
     </aside>
   );
 }

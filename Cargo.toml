@@ -12,6 +12,7 @@ members = [
     "crates/kcreate_layout",
     "crates/kcreate_ai",
     "crates/kcreate_mcp",
+    "crates/kcreate_plugin",
     "crates/kcreate_tests",
 ]
 
@@ -137,6 +138,13 @@ base64 = "0.22"
 
 # Loopback-only HTTP server for the local MCP sidecar
 tiny_http = { version = "0.12", default-features = false }
+
+# WASM plugin sandbox runtime. `wasmi` is a pure-Rust interpreter — no
+# LLVM dependency, no native runtime download — so it compiles on every
+# CI platform without extra system deps. The plugin crate exposes a
+# minimal `kcreate_log` / `kcreate_get_input` / `kcreate_set_output`
+# host ABI; plugins have no filesystem or network access by design.
+wasmi = { version = "0.42", default-features = false, features = ["std"] }
 
 # System info probe for device tiering
 sys-info = "0.9"

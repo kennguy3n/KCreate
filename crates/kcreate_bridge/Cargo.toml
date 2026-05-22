@@ -33,6 +33,7 @@ kcreate_ai = { path = "../kcreate_ai" }
 kcreate_mcp = { path = "../kcreate_mcp", optional = true }
 kcreate_text = { path = "../kcreate_text" }
 kcreate_layout = { path = "../kcreate_layout" }
+kcreate_plugin = { path = "../kcreate_plugin" }
 napi.workspace = true
 napi-derive.workspace = true
 parking_lot.workspace = true

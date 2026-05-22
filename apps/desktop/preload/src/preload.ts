@@ -62,6 +62,27 @@ import type {
   SvgExportOptions,
   UpdateNodeProps,
   WebpExportOptions,
+  AiModelBridge,
+  BatchBridge,
+  BatchExportJob,
+  BatchStatus,
+  ExtractedColor,
+  IconPackBridge,
+  IconPackPlatform,
+  IconPackRequest,
+  McpPermission,
+  McpPermissionBridge,
+  McpPermissionGrant,
+  McpStatus,
+  ModelPack,
+  PluginBridge,
+  PluginExecuteResult,
+  PluginListEntry,
+  PreflightBridge,
+  PreflightIssue,
+  PreflightRequest,
+  ScreenshotElement,
+  ScreenshotRequest,
 } from "../../shared/scene";
 
 type FrameInfoSnake = {
@@ -1001,6 +1022,169 @@ const layoutStudio: LayoutStudioBridge = {
   },
 };
 
+// ---------------------------------------------------------------------------
+// Phase 2 — preflight, icon pack, batch async, AI extras, plugins, MCP perms.
+// ---------------------------------------------------------------------------
+
+const preflight: PreflightBridge = {
+  async run(request: PreflightRequest): Promise<PreflightIssue[]> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/preflight/run",
+      JSON.stringify(request),
+    )) as string;
+    return JSON.parse(raw) as PreflightIssue[];
+  },
+};
+
+const iconPack: IconPackBridge = {
+  async builtInPlatforms(): Promise<IconPackPlatform[]> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/export/iconPack/builtInPlatforms",
+    )) as string;
+    return JSON.parse(raw) as IconPackPlatform[];
+  },
+  async generate(request: IconPackRequest): Promise<string[]> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/export/iconPack",
+      JSON.stringify(request),
+    )) as string;
+    return JSON.parse(raw) as string[];
+  },
+};
+
+const batch: BatchBridge = {
+  async start(job: BatchExportJob): Promise<string> {
+    return (await ipcRenderer.invoke(
+      "kcreate/export/batch/start",
+      JSON.stringify(job),
+    )) as string;
+  },
+  async status(jobId: string): Promise<BatchStatus> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/export/batch/status",
+      jobId,
+    )) as string;
+    return JSON.parse(raw) as BatchStatus;
+  },
+  async cancel(jobId: string): Promise<void> {
+    await ipcRenderer.invoke("kcreate/export/batch/cancel", jobId);
+  },
+  async dismiss(jobId: string): Promise<boolean> {
+    return (await ipcRenderer.invoke(
+      "kcreate/export/batch/dismiss",
+      jobId,
+    )) as boolean;
+  },
+};
+
+const aiModel: AiModelBridge = {
+  async upscale(nodeId: string, scale: number): Promise<string> {
+    return (await ipcRenderer.invoke(
+      "kcreate/ai/upscale",
+      nodeId,
+      scale,
+    )) as string;
+  },
+  async extractPalette(
+    nodeId: string,
+    maxColors: number,
+  ): Promise<ExtractedColor[]> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/ai/extractPalette",
+      nodeId,
+      maxColors,
+    )) as string;
+    return JSON.parse(raw) as ExtractedColor[];
+  },
+  async smartSelect(
+    nodeId: string,
+    x: number,
+    y: number,
+    tolerance: number,
+  ): Promise<string> {
+    return (await ipcRenderer.invoke(
+      "kcreate/ai/smartSelect",
+      nodeId,
+      x,
+      y,
+      tolerance,
+    )) as string;
+  },
+  async listModelPacks(): Promise<ModelPack[]> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/ai/listModelPacks",
+    )) as string;
+    return JSON.parse(raw) as ModelPack[];
+  },
+  async screenshotToLayout(
+    request: ScreenshotRequest,
+  ): Promise<ScreenshotElement[]> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/ai/screenshotToLayout",
+      JSON.stringify(request),
+    )) as string;
+    return JSON.parse(raw) as ScreenshotElement[];
+  },
+};
+
+const plugin: PluginBridge = {
+  async list(): Promise<PluginListEntry[]> {
+    const raw = (await ipcRenderer.invoke("kcreate/plugin/list")) as string;
+    return JSON.parse(raw) as PluginListEntry[];
+  },
+  async enable(id: string): Promise<void> {
+    await ipcRenderer.invoke("kcreate/plugin/enable", id);
+  },
+  async disable(id: string): Promise<void> {
+    await ipcRenderer.invoke("kcreate/plugin/disable", id);
+  },
+  async execute(
+    id: string,
+    fn: string,
+    input: string,
+  ): Promise<PluginExecuteResult> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/plugin/execute",
+      id,
+      fn,
+      input,
+    )) as string;
+    return JSON.parse(raw) as PluginExecuteResult;
+  },
+};
+
+const mcpPermission: McpPermissionBridge = {
+  async list(): Promise<McpPermission[]> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/mcp/permission/list",
+    )) as string;
+    return JSON.parse(raw) as McpPermission[];
+  },
+  async grant(
+    clientId: string,
+    toolName: string,
+    grant: McpPermissionGrant,
+  ): Promise<void> {
+    await ipcRenderer.invoke(
+      "kcreate/mcp/permission/grant",
+      clientId,
+      toolName,
+      grant,
+    );
+  },
+  async revoke(clientId: string, toolName: string): Promise<void> {
+    await ipcRenderer.invoke(
+      "kcreate/mcp/permission/revoke",
+      clientId,
+      toolName,
+    );
+  },
+  async status(): Promise<McpStatus> {
+    const raw = (await ipcRenderer.invoke("kcreate/mcp/status")) as string;
+    return JSON.parse(raw) as McpStatus;
+  },
+};
+
 contextBridge.exposeInMainWorld("kcreate", {
   renderer,
   document,
@@ -1019,4 +1203,10 @@ contextBridge.exposeInMainWorld("kcreate", {
   interaction,
   masterPage,
   layoutStudio,
+  preflight,
+  iconPack,
+  batch,
+  aiModel,
+  plugin,
+  mcpPermission,
 });

@@ -44,6 +44,17 @@ pub enum DocumentBridgeError {
     ProjectDirExists(PathBuf),
     #[error("invalid node type: {0}")]
     InvalidNodeType(String),
+    /// Bridge call received a wire-format argument that doesn't parse
+    /// to any known value of the expected enum / vocabulary. Used for
+    /// every "string → enum" parser at the bridge boundary —
+    /// page size, page orientation, interaction trigger, export
+    /// format, MCP permission grant, etc. Distinct from
+    /// [`Self::InvalidNodeType`] which is specifically for node-type
+    /// mismatches; see Devin Review 3289450981 for the rationale
+    /// (semantic error message clarity when debugging failed N-API
+    /// calls).
+    #[error("invalid value for `{argument}`: {value}")]
+    InvalidArgument { argument: String, value: String },
     #[error("node not found: {0}")]
     NodeNotFound(Uuid),
     #[error(transparent)]
@@ -88,9 +99,9 @@ pub type Result<T> = std::result::Result<T, DocumentBridgeError>;
 
 /// Open project = in-memory state + on-disk store, plus the
 /// bookkeeping needed for incremental persistence.
-struct Workspace {
-    project: Project,
-    store: ProjectStore,
+pub(crate) struct Workspace {
+    pub(crate) project: Project,
+    pub(crate) store: ProjectStore,
     /// Set of operation ids already written to the on-disk store.
     ///
     /// Tracking by id (not by index) is the only correct option once
@@ -117,6 +128,88 @@ struct Workspace {
 fn slot() -> &'static Mutex<Option<Workspace>> {
     static WS: OnceLock<Mutex<Option<Workspace>>> = OnceLock::new();
     WS.get_or_init(|| Mutex::new(None))
+}
+
+/// Run `f` against the open workspace under a read-style lock. The
+/// caller closure must not call back into other workspace-locking
+/// functions or it will deadlock. Used by `phase2.rs` so that crate
+/// of bridge entry points doesn't need to know about [`Workspace`]'s
+/// private field layout.
+pub(crate) fn with_workspace<R>(f: impl FnOnce(&Workspace) -> Result<R>) -> Result<R> {
+    let guard = slot().lock();
+    let ws = guard.as_ref().ok_or(DocumentBridgeError::NoProject)?;
+    f(ws)
+}
+
+/// Mutable counterpart of [`with_workspace`]. The caller closure must
+/// not re-lock the workspace.
+pub(crate) fn with_workspace_mut<R>(f: impl FnOnce(&mut Workspace) -> Result<R>) -> Result<R> {
+    let mut guard = slot().lock();
+    let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
+    f(ws)
+}
+
+/// Load a blob by hash from the open workspace's content-addressed
+/// store. Pulled out so `phase2.rs` does not need to know about the
+/// `ProjectStore` API surface.
+pub(crate) fn blob_load(ws: &Workspace, hash: &str) -> Result<Vec<u8>> {
+    ws.store
+        .blobs()
+        .load(hash)
+        .map_err(|e| DocumentBridgeError::Io(std::io::Error::other(e.to_string())))
+}
+
+/// Sync the renderer scene from the current workspace. Used after
+/// `phase2.rs` mutates the document so the canvas updates immediately.
+/// Failures are logged but not propagated — the next renderer init +
+/// sync recovers the state, matching the pattern used elsewhere in
+/// this module.
+pub(crate) fn sync_scene_after_change() {
+    let mut guard = slot().lock();
+    let _ = sync_scene_locked(&mut guard);
+}
+
+/// Lock-free snapshot of the current renderer scene. Wraps
+/// [`crate::state::current_scene`] so `phase2.rs` does not need to
+/// reach into `state.rs` directly.
+pub(crate) fn current_scene_safe() -> Result<kcreate_renderer::Scene> {
+    Ok(crate::state::current_scene()?)
+}
+
+/// Loopback port of the running MCP server, if any. Used by
+/// `phase2.rs::mcp_status`.
+#[cfg(feature = "mcp")]
+#[must_use]
+pub fn mcp_port() -> Option<u32> {
+    kcreate_mcp::server::port().map(u32::from)
+}
+
+#[cfg(not(feature = "mcp"))]
+#[must_use]
+pub const fn mcp_port() -> Option<u32> {
+    None
+}
+
+/// Atomic `(running, port)` snapshot of the MCP server, taken under
+/// a single global-lock acquisition.
+///
+/// Composing [`mcp_is_running`] and [`mcp_port`] separately is a
+/// TOCTOU race: the server can be stopped between the two calls,
+/// producing a status response with `running: true` and `port: 0`.
+/// `phase2::mcp_status` uses this accessor instead so a single
+/// status response is internally consistent. Per Devin Review
+/// ANALYSIS_pr-review-job-790e7860e5c745e0bee13295709290f4_0001.
+#[cfg(feature = "mcp")]
+#[must_use]
+pub fn mcp_state() -> (bool, Option<u32>) {
+    let (running, port) = kcreate_mcp::server::state();
+    (running, port.map(u32::from))
+}
+
+#[cfg(not(feature = "mcp"))]
+#[must_use]
+pub const fn mcp_state() -> (bool, Option<u32>) {
+    (false, None)
 }
 
 /// Test-only helper to reset the singleton between serial tests.
@@ -642,7 +735,10 @@ fn parse_export_format(format: &str) -> Result<kcreate_core::project::ExportForm
         "pdf" => Ok(ExportFormat::Pdf),
         "webp" => Ok(ExportFormat::Webp),
         "jpeg" | "jpg" => Ok(ExportFormat::Jpeg),
-        other => Err(DocumentBridgeError::InvalidNodeType(other.to_string())),
+        other => Err(DocumentBridgeError::InvalidArgument {
+            argument: "format".into(),
+            value: other.to_string(),
+        }),
     }
 }
 
@@ -1388,7 +1484,12 @@ pub fn interaction_add(node_id: Uuid, trigger: &str, action_json: &str) -> Resul
         "click" => kcreate_core::InteractionTrigger::Click,
         "hover" => kcreate_core::InteractionTrigger::Hover,
         "press" => kcreate_core::InteractionTrigger::Press,
-        other => return Err(DocumentBridgeError::InvalidNodeType(other.to_string())),
+        other => {
+            return Err(DocumentBridgeError::InvalidArgument {
+                argument: "trigger".into(),
+                value: other.to_string(),
+            });
+        }
     };
     let action: kcreate_core::InteractionAction = serde_json::from_str(action_json)?;
     let interaction = kcreate_core::Interaction::new(trigger, action);
@@ -1554,7 +1655,12 @@ pub fn master_page_create(name: String, size: &str, orientation: &str) -> Result
     let orientation = match orientation {
         "portrait" => kcreate_core::PageOrientation::Portrait,
         "landscape" => kcreate_core::PageOrientation::Landscape,
-        other => return Err(DocumentBridgeError::InvalidNodeType(other.to_string())),
+        other => {
+            return Err(DocumentBridgeError::InvalidArgument {
+                argument: "orientation".into(),
+                value: other.to_string(),
+            });
+        }
     };
     let layout = kcreate_core::PageLayout::new(page_size, orientation);
     let mut guard = slot().lock();
@@ -1604,7 +1710,12 @@ fn parse_page_size(s: &str) -> Result<kcreate_core::PageSize> {
         "tabloid" => kcreate_core::PageSize::Tabloid,
         "presentation_16x9" => kcreate_core::PageSize::Presentation16x9,
         "presentation_4x3" => kcreate_core::PageSize::Presentation4x3,
-        other => return Err(DocumentBridgeError::InvalidNodeType(other.to_string())),
+        other => {
+            return Err(DocumentBridgeError::InvalidArgument {
+                argument: "size".into(),
+                value: other.to_string(),
+            });
+        }
     })
 }
 
@@ -1738,7 +1849,7 @@ pub fn layout_template_apply(template_id: Uuid) -> Result<Vec<Uuid>> {
 /// (A4 portrait, matching `Project::add_page`). When **both** are
 /// provided, the page bounds + `page_layout` metadata are set
 /// accordingly. Providing only one of the two is a caller bug and
-/// returns `DocumentBridgeError::InvalidNodeType` — silently ignoring
+/// returns `DocumentBridgeError::InvalidArgument` — silently ignoring
 /// the partial input would surprise the UI (it would think the page
 /// was created at the requested size but only orientation or only
 /// size made it through).
@@ -1750,14 +1861,16 @@ pub fn page_add(name: String, size: Option<&str>, orientation: Option<&str>) -> 
         (None, None) => None,
         (Some(s), Some(o)) => Some((s, o)),
         (Some(_), None) => {
-            return Err(DocumentBridgeError::InvalidNodeType(
-                "page_add: `size` provided without `orientation` (pass both or neither)".into(),
-            ));
+            return Err(DocumentBridgeError::InvalidArgument {
+                argument: "orientation".into(),
+                value: "<missing> (must be provided when `size` is set)".into(),
+            });
         }
         (None, Some(_)) => {
-            return Err(DocumentBridgeError::InvalidNodeType(
-                "page_add: `orientation` provided without `size` (pass both or neither)".into(),
-            ));
+            return Err(DocumentBridgeError::InvalidArgument {
+                argument: "size".into(),
+                value: "<missing> (must be provided when `orientation` is set)".into(),
+            });
         }
     };
     let mut guard = slot().lock();
@@ -1775,7 +1888,12 @@ pub fn page_add(name: String, size: Option<&str>, orientation: Option<&str>) -> 
             match orientation_tag {
                 "portrait" => kcreate_core::PageOrientation::Portrait,
                 "landscape" => kcreate_core::PageOrientation::Landscape,
-                other => return Err(DocumentBridgeError::InvalidNodeType(other.to_string())),
+                other => {
+                    return Err(DocumentBridgeError::InvalidArgument {
+                        argument: "orientation".into(),
+                        value: other.to_string(),
+                    });
+                }
             },
         );
         if let Some(node) = ws.project.document.get_node_mut(page_id) {
@@ -4103,7 +4221,13 @@ mod tests {
         let dir = tmpdir();
         project_create("ep2", dir.path()).expect("create");
         let err = export_preset_create("nope".into(), "bmp", 1.0).expect_err("bmp");
-        assert!(matches!(err, DocumentBridgeError::InvalidNodeType(_)));
+        assert!(
+            matches!(
+                err,
+                DocumentBridgeError::InvalidArgument { ref argument, .. } if argument == "format"
+            ),
+            "expected InvalidArgument {{ argument: 'format', .. }}, got {err:?}",
+        );
         project_close();
     }
 
@@ -4809,7 +4933,14 @@ mod tests {
         let page_id = document_get_tree().expect("tree")[0].id;
         let action = serde_json::json!({"kind": "back"}).to_string();
         let err = interaction_add(page_id, "long_press", &action).expect_err("unknown");
-        assert!(matches!(err, DocumentBridgeError::InvalidNodeType(_)));
+        assert!(
+            matches!(
+                err,
+                DocumentBridgeError::InvalidArgument { ref argument, ref value }
+                    if argument == "trigger" && value == "long_press"
+            ),
+            "expected InvalidArgument {{ argument: 'trigger', value: 'long_press' }}, got {err:?}",
+        );
         project_close();
     }
 
@@ -4848,15 +4979,21 @@ mod tests {
         // Size without orientation — rejected.
         let err = page_add("half-1".into(), Some("a4"), None).expect_err("missing orientation");
         assert!(
-            matches!(err, DocumentBridgeError::InvalidNodeType(ref m) if m.contains("orientation")),
-            "expected InvalidNodeType naming `orientation`, got {err:?}",
+            matches!(
+                err,
+                DocumentBridgeError::InvalidArgument { ref argument, .. } if argument == "orientation"
+            ),
+            "expected InvalidArgument {{ argument: 'orientation', .. }}, got {err:?}",
         );
 
         // Orientation without size — rejected.
         let err = page_add("half-2".into(), None, Some("portrait")).expect_err("missing size");
         assert!(
-            matches!(err, DocumentBridgeError::InvalidNodeType(ref m) if m.contains("size")),
-            "expected InvalidNodeType naming `size`, got {err:?}",
+            matches!(
+                err,
+                DocumentBridgeError::InvalidArgument { ref argument, .. } if argument == "size"
+            ),
+            "expected InvalidArgument {{ argument: 'size', .. }}, got {err:?}",
         );
 
         project_close();
@@ -4993,7 +5130,14 @@ mod tests {
         let dir = tmpdir();
         project_create("m2", dir.path()).expect("create");
         let err = master_page_create("bad".into(), "bogus", "portrait").expect_err("unknown size");
-        assert!(matches!(err, DocumentBridgeError::InvalidNodeType(_)));
+        assert!(
+            matches!(
+                err,
+                DocumentBridgeError::InvalidArgument { ref argument, ref value }
+                    if argument == "size" && value == "bogus"
+            ),
+            "expected InvalidArgument {{ argument: 'size', value: 'bogus' }}, got {err:?}",
+        );
         project_close();
     }
 
@@ -5067,8 +5211,11 @@ mod tests {
         for bad in ["presentation16x9", "presentation4x3"] {
             let err = parse_page_size(bad).expect_err("must reject no-underscore form");
             match err {
-                DocumentBridgeError::InvalidNodeType(s) => assert_eq!(s, bad),
-                other => panic!("expected InvalidNodeType({bad:?}), got {other:?}"),
+                DocumentBridgeError::InvalidArgument { argument, value } => {
+                    assert_eq!(argument, "size");
+                    assert_eq!(value, bad);
+                }
+                other => panic!("expected InvalidArgument {{ argument: 'size', value: {bad:?} }}, got {other:?}"),
             }
         }
 
@@ -5078,7 +5225,7 @@ mod tests {
             assert!(
                 matches!(
                     parse_page_size(bad),
-                    Err(DocumentBridgeError::InvalidNodeType(_))
+                    Err(DocumentBridgeError::InvalidArgument { ref argument, .. }) if argument == "size"
                 ),
                 "parse_page_size should reject case-folded form {bad:?}"
             );

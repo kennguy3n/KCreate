@@ -50,8 +50,14 @@ See [`PROPOSAL.md`](./PROPOSAL.md) for the full product spec.
 | GPU rendering        | wgpu (Metal / D3D12 / Vulkan / OpenGL)                       |
 | CPU rendering        | `tiny-skia` (real software rasterizer, not a placeholder)    |
 | Persistence          | SQLite + content-addressed blob store (BLAKE3)               |
-| Local AI             | `llama.cpp` / MLX / ONNX Runtime (sidecars; Phase 1+)        |
+| Local AI             | `llama.cpp` / MLX / ONNX Runtime (sidecars; built)           |
+| In-process AI        | Lanczos3 upscale, k-means palette, BFS smart-select, Sobel + CCA screenshot-to-layout |
 | Vector math          | `kurbo`, `i_overlay`, `rstar`                                |
+| Text                 | `fontdb` (discovery) + `rustybuzz` (shaping) + `ttf-parser` (outlines) |
+| Export               | `printpdf` (PDF write), `image` (PNG / JPEG / WebP)          |
+| Parallelism          | `rayon` (Lanczos rows, parallel batch export, palette downsample) |
+| Plugin sandbox       | `wasmi` 0.42 (pure Rust, no LLVM)                            |
+| MCP                  | `tiny_http` JSON-RPC over loopback                           |
 
 See [`ARCHITECTURE.md`](./ARCHITECTURE.md) for the technical design.
 
@@ -137,8 +143,12 @@ KCreate/
 │   ├── kcreate_raster/           Tile engine, masks, adjustment layers
 │   ├── kcreate_text/             Font discovery (fontdb) + shaping (rustybuzz)
 │   ├── kcreate_layout/           Pure flex + grid solvers
-│   ├── kcreate_ai/               Local AI task router + bg-removal (threshold + ONNX) + LLM sidecar
-│   ├── kcreate_mcp/              Loopback-only MCP server (3 tools)
+│   ├── kcreate_ai/               Local AI: bg-removal (threshold + ONNX u2net), LLM sidecar,
+│   │                              Lanczos upscale, k-means palette, BFS smart-select, model
+│   │                              pack registry, screenshot-to-layout
+│   ├── kcreate_mcp/              Loopback-only MCP server (3 tools) + permission store
+│   │                              (Once / Always / Denied)
+│   ├── kcreate_plugin/           WASM plugin sandbox (wasmi 0.42, deny-by-default host ABI)
 │   └── kcreate_tests/            Cross-crate integration tests
 ├── PROPOSAL.md                   Product specification
 ├── ARCHITECTURE.md               Technical architecture

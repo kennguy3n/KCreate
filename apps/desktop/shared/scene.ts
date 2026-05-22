@@ -1110,6 +1110,270 @@ export interface LayoutStudioBridge {
   ): Promise<void>;
 }
 
+// ---------------------------------------------------------------------------
+// Phase 2 — Preflight, Icon Pack, Batch Async, AI extras, Plugin sandbox,
+// MCP permission persistence, Screenshot-to-Layout.
+// ---------------------------------------------------------------------------
+
+export type PreflightSeverity = "error" | "warning" | "info";
+
+export type PreflightCheckId =
+  | "bleed_margin"
+  | "font_embed"
+  | "image_resolution"
+  | "color_space"
+  | "transparency"
+  | "page_size";
+
+export interface PreflightIssue {
+  check: PreflightCheckId;
+  severity: PreflightSeverity;
+  message: string;
+  affected_node_id: string | null;
+  page_id: string | null;
+}
+
+export type PreflightColorSpaceTarget = "cmyk" | "rgb";
+
+export interface PreflightOptions {
+  targetDpi: number;
+  requireBleedMm: number;
+  allowTransparency: boolean;
+  targetColorSpace: PreflightColorSpaceTarget;
+}
+
+export interface PreflightRequest {
+  pageIds: string[];
+  /** Options use snake_case wire keys (Rust struct uses camelCase rename — but its inner fields are camelCase too via `rename_all = "camelCase"`). */
+  options: PreflightOptions;
+}
+
+export interface PreflightBridge {
+  run(request: PreflightRequest): Promise<PreflightIssue[]>;
+}
+
+export type IconPlatformName = "web" | "ios" | "android" | "favicon";
+
+export type IconFormat = "png" | "svg" | "ico";
+
+export interface IconSize {
+  width: number;
+  height: number;
+  scale: number;
+  suffix: string;
+  format: IconFormat;
+}
+
+export interface IconPackPlatform {
+  name: IconPlatformName | string;
+  sizes: IconSize[];
+}
+
+export interface IconPackRequest {
+  nodeIds: string[];
+  platforms: IconPackPlatform[];
+  outputDir: string;
+}
+
+export interface IconPackBridge {
+  builtInPlatforms(): Promise<IconPackPlatform[]>;
+  generate(request: IconPackRequest): Promise<string[]>;
+}
+
+/**
+ * A single item in a batch export. Tagged by `format`: either an SVG
+ * render of selected nodes or a PDF render of the whole document.
+ */
+export type BatchExportItem =
+  | {
+      format: "svg";
+      filename: string;
+      node_ids: string[];
+      options: SvgExportOptions;
+    }
+  | { format: "pdf"; filename: string; options: PdfExportOptions };
+
+export type BatchLifecycleStatus =
+  | { status: "pending" }
+  | { status: "running"; completed: number; total: number }
+  | {
+      status: "done";
+      succeeded: number;
+      failed: number;
+      errors: string[];
+    }
+  | { status: "cancelled"; completed: number; total: number };
+
+export interface BatchExportJob {
+  id: string;
+  items: BatchExportItem[];
+  output_dir: string;
+  status: BatchLifecycleStatus;
+}
+
+export interface BatchStatus {
+  jobId: string;
+  completed: number;
+  total: number;
+  currentItem: string;
+  finished: boolean;
+  cancelled: boolean;
+  succeeded: string[];
+  failed: Array<[string, string]>;
+  durationMs: number;
+}
+
+export interface BatchBridge {
+  start(job: BatchExportJob): Promise<string>;
+  status(jobId: string): Promise<BatchStatus>;
+  cancel(jobId: string): Promise<void>;
+  /**
+   * Release the bookkeeping state for `jobId`.
+   *
+   * `status()` is idempotent across terminal states — once a job
+   * reaches `finished: true`, every subsequent `status()` call
+   * returns the same terminal payload. The UI is expected to call
+   * `dismiss()` once it has rendered that payload to free the
+   * cached result. Dismissing an unknown id is a no-op; the return
+   * value is `true` when a handle was actually dropped.
+   */
+  dismiss(jobId: string): Promise<boolean>;
+}
+
+export interface ExtractedColor {
+  r: number;
+  g: number;
+  b: number;
+  hex: string;
+  frequency: number;
+}
+
+export type ModelPackCategory = "core" | "image_pro" | "design_pro" | "generation";
+
+export type ModelKind = "built_in" | "onnx" | "sidecar";
+
+export interface ModelPack {
+  id: string;
+  name: string;
+  category: ModelPackCategory;
+  kind: ModelKind;
+  capabilities: string[];
+  sizeBytes: number;
+  filePath: string;
+  installed: boolean;
+}
+
+export type ScreenshotElementType =
+  | "header"
+  | "navigation"
+  | "hero"
+  | "text_block"
+  | "image"
+  | "button"
+  | "card"
+  | "footer"
+  | "sidebar"
+  | "form"
+  | "list";
+
+export interface ScreenshotElementBounds {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+export interface ScreenshotElement {
+  element_type: ScreenshotElementType;
+  bounds: ScreenshotElementBounds;
+  confidence: number;
+  suggested_name: string;
+}
+
+export interface ScreenshotRequest {
+  imageBase64: string;
+  width: number;
+  height: number;
+}
+
+export interface AiModelBridge {
+  upscale(nodeId: string, scale: number): Promise<string>;
+  extractPalette(nodeId: string, maxColors: number): Promise<ExtractedColor[]>;
+  smartSelect(
+    nodeId: string,
+    x: number,
+    y: number,
+    tolerance: number,
+  ): Promise<string>;
+  listModelPacks(): Promise<ModelPack[]>;
+  screenshotToLayout(request: ScreenshotRequest): Promise<ScreenshotElement[]>;
+}
+
+export type PluginType = "wasm" | "js_panel" | "native";
+
+export type PluginPermission =
+  | "read_document"
+  | "write_document"
+  | "read_assets"
+  | "export_files"
+  | "network_access";
+
+export interface PluginManifest {
+  id: string;
+  name: string;
+  version: string;
+  author: string;
+  description: string;
+  /** Renamed from `plugin_type` on the Rust side via `#[serde(rename = "type")]`. */
+  type: PluginType;
+  entry_point: string;
+  permissions: PluginPermission[];
+}
+
+/**
+ * Plugin list entry — the manifest fields are flattened to the
+ * top-level object on the wire (via `#[serde(flatten)]`), so the JSON
+ * has the manifest fields *and* `enabled` side-by-side.
+ */
+export type PluginListEntry = PluginManifest & { enabled: boolean };
+
+export interface PluginExecuteResult {
+  output: string;
+  logs: string[];
+}
+
+export interface PluginBridge {
+  list(): Promise<PluginListEntry[]>;
+  enable(id: string): Promise<void>;
+  disable(id: string): Promise<void>;
+  execute(id: string, fn: string, input: string): Promise<PluginExecuteResult>;
+}
+
+export type McpPermissionGrant = "once" | "always" | "denied";
+
+export interface McpPermission {
+  client_id: string;
+  tool_name: string;
+  granted: McpPermissionGrant;
+  granted_at: string;
+}
+
+export interface McpStatus {
+  running: boolean;
+  port: number;
+}
+
+export interface McpPermissionBridge {
+  list(): Promise<McpPermission[]>;
+  grant(
+    clientId: string,
+    toolName: string,
+    grant: McpPermissionGrant,
+  ): Promise<void>;
+  revoke(clientId: string, toolName: string): Promise<void>;
+  status(): Promise<McpStatus>;
+}
+
 declare global {
   interface Window {
     kcreate: {
@@ -1130,6 +1394,12 @@ declare global {
       interaction: InteractionBridge;
       masterPage: MasterPageBridge;
       layoutStudio: LayoutStudioBridge;
+      preflight: PreflightBridge;
+      iconPack: IconPackBridge;
+      batch: BatchBridge;
+      aiModel: AiModelBridge;
+      plugin: PluginBridge;
+      mcpPermission: McpPermissionBridge;
     };
   }
 }

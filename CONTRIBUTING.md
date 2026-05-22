@@ -78,11 +78,19 @@ cargo test --workspace --all-targets
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all --check
 cargo bench -p kcreate_renderer --no-run
+cargo bench -p kcreate_export --no-run
+cargo bench -p kcreate_raster --no-run
+cargo bench -p kcreate_ai --no-run
 cargo bench -p kcreate_layout --no-run
 
 pnpm typecheck
 pnpm lint
 ```
+
+`kcreate_plugin` uses the pure-Rust `wasmi` runtime, so it does not
+require LLVM or any system-level WASM toolchain. `cargo test
+-p kcreate_plugin` runs the sandbox + manifest tests with no extra
+setup beyond the workspace toolchain.
 
 Bridge tests share a process-global renderer singleton; they use the
 `serial_test` crate to run serialized.

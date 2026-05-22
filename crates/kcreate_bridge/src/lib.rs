@@ -21,6 +21,7 @@ pub mod hit_test;
 pub mod llm;
 #[cfg(feature = "native_canvas")]
 pub mod native_canvas;
+pub mod phase2;
 pub mod scene_sync;
 pub mod state;
 pub mod wire;
@@ -60,6 +61,7 @@ fn map_doc_err(e: DocumentBridgeError) -> NapiError {
     let status = match e {
         DocumentBridgeError::NoProject
         | DocumentBridgeError::InvalidNodeType(_)
+        | DocumentBridgeError::InvalidArgument { .. }
         | DocumentBridgeError::NodeNotFound(_)
         | DocumentBridgeError::ProjectDirExists(_)
         | DocumentBridgeError::InvalidUuid(_, _) => Status::InvalidArg,
@@ -1518,4 +1520,174 @@ pub fn document_reparent_node(
         _ => None,
     };
     document::document_reparent_node(nid, pid, index as usize).map_err(map_doc_err)
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2 — preflight, icon pack, parallel batch, AI model packs,
+// plugin sandbox, MCP permissions, screenshot-to-layout.
+// ---------------------------------------------------------------------------
+
+/// Run the print-readiness checks against the supplied pages. When
+/// `request_json` is empty the default options + every page are used.
+#[napi]
+pub fn preflight_run(request_json: String) -> NapiResult<String> {
+    let req: phase2::PreflightRequest = if request_json.trim().is_empty() {
+        phase2::PreflightRequest {
+            page_ids: Vec::new(),
+            options: kcreate_export::preflight::PreflightOptions::default(),
+        }
+    } else {
+        serde_json::from_str(&request_json)
+            .map_err(|e| NapiError::from_reason(format!("preflight: invalid JSON: {e}")))?
+    };
+    let issues = phase2::preflight_run(&req).map_err(map_doc_err)?;
+    serde_json::to_string(&issues).map_err(|e| NapiError::from_reason(e.to_string()))
+}
+
+/// Generate an icon pack for the given platforms and write the files
+/// to `output_dir`. Returns a JSON array of paths actually written.
+#[napi]
+pub fn export_icon_pack(request_json: String) -> NapiResult<String> {
+    let req: phase2::IconPackRequest = serde_json::from_str(&request_json)
+        .map_err(|e| NapiError::from_reason(format!("icon pack: invalid JSON: {e}")))?;
+    let outcome = phase2::icon_pack_export(&req).map_err(map_doc_err)?;
+    serde_json::to_string(&outcome.files).map_err(|e| NapiError::from_reason(e.to_string()))
+}
+
+/// Returns the built-in icon-pack platform presets (web / iOS /
+/// Android / favicon) as a JSON array — so the renderer's
+/// IconPackDialog can show them without hard-coding the size lists.
+#[napi]
+pub fn export_icon_pack_built_in_platforms() -> NapiResult<String> {
+    let platforms = kcreate_export::icon_pack::built_in_platforms();
+    serde_json::to_string(&platforms).map_err(|e| NapiError::from_reason(e.to_string()))
+}
+
+/// Start a parallel batch-export job and return its id. The job runs
+/// on a background thread; the renderer polls `export_batch_status`
+/// for progress and may call `export_batch_cancel` at any time.
+#[napi]
+pub fn export_batch_start(job_json: String) -> NapiResult<String> {
+    let job: kcreate_export::batch::BatchExportJob = serde_json::from_str(&job_json)
+        .map_err(|e| NapiError::from_reason(format!("batch: invalid JSON: {e}")))?;
+    phase2::batch_start(job).map_err(map_doc_err)
+}
+
+#[napi]
+pub fn export_batch_status(job_id: String) -> NapiResult<String> {
+    let status = phase2::batch_status(&job_id).map_err(map_doc_err)?;
+    serde_json::to_string(&status).map_err(|e| NapiError::from_reason(e.to_string()))
+}
+
+#[napi]
+pub fn export_batch_cancel(job_id: String) -> NapiResult<()> {
+    phase2::batch_cancel(&job_id).map_err(map_doc_err)
+}
+
+/// Release the bookkeeping state for a finished batch-export job.
+///
+/// Repeated polls of `export_batch_status` after a job reaches a
+/// terminal state are explicitly allowed and return the same
+/// terminal payload — see the docs on [`phase2::batch_dismiss`] for
+/// why. The renderer is expected to call this once it has rendered
+/// the terminal status to free the cached `BatchResult`. Dismissing
+/// an unknown id is a no-op; the return value is `true` when a
+/// handle was actually dropped.
+#[napi]
+pub fn export_batch_dismiss(job_id: String) -> NapiResult<bool> {
+    phase2::batch_dismiss(&job_id).map_err(map_doc_err)
+}
+
+/// Lanczos3-upscale the raster layer at `node_id` by `scale`. A new
+/// RasterLayer node is inserted as a sibling; its id is returned.
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn ai_upscale(node_id: String, scale: f64) -> NapiResult<String> {
+    // Pass `scale` through to the algorithm as `f64`. The previous
+    // `scale as f32` cast silently rounded values just above 1.0
+    // (e.g. `1.0000001_f64`) down to exactly `1.0_f32`, which the
+    // algorithm then rejected as out of range. JavaScript numbers
+    // are always `f64`, so preserving that precision across the FFI
+    // boundary is the right architectural fix. Per Devin Review
+    // ANALYSIS_pr-review-job-0594c03f68c24589ba78a32926e3874f_0004.
+    let id = parse_uuid(&node_id)?;
+    phase2::ai_upscale(id, scale)
+        .map(|u| u.to_string())
+        .map_err(map_doc_err)
+}
+
+/// Extract the dominant colors from a raster layer.
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn ai_extract_palette(node_id: String, max_colors: u32) -> NapiResult<String> {
+    let id = parse_uuid(&node_id)?;
+    phase2::ai_extract_palette(id, max_colors as usize).map_err(map_doc_err)
+}
+
+/// Smart-select flood fill. Returns a base64-encoded 1-byte mask
+/// where 255 means "in the selection".
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn ai_smart_select(node_id: String, x: u32, y: u32, tolerance: f64) -> NapiResult<String> {
+    let id = parse_uuid(&node_id)?;
+    phase2::ai_smart_select(id, x, y, tolerance).map_err(map_doc_err)
+}
+
+/// Return the registry of locally available / installable AI model
+/// packs.
+#[napi]
+pub fn ai_list_model_packs() -> NapiResult<String> {
+    phase2::ai_models_list().map_err(map_doc_err)
+}
+
+/// Run edge-detection + connected-component analysis over the
+/// supplied RGBA8 screenshot and return the detected UI regions.
+#[napi]
+pub fn ai_screenshot_to_layout(request_json: String) -> NapiResult<String> {
+    let req: phase2::ScreenshotRequest = serde_json::from_str(&request_json)
+        .map_err(|e| NapiError::from_reason(format!("screenshot: invalid JSON: {e}")))?;
+    phase2::ai_screenshot_to_layout(&req).map_err(map_doc_err)
+}
+
+/// List installed plugins with their enabled flag.
+#[napi]
+pub fn plugin_list() -> NapiResult<String> {
+    let list = phase2::plugin_list().map_err(map_doc_err)?;
+    serde_json::to_string(&list).map_err(|e| NapiError::from_reason(e.to_string()))
+}
+
+#[napi]
+pub fn plugin_enable(id: String) -> NapiResult<()> {
+    phase2::plugin_enable(&id).map_err(map_doc_err)
+}
+
+#[napi]
+pub fn plugin_disable(id: String) -> NapiResult<()> {
+    phase2::plugin_disable(&id).map_err(map_doc_err)
+}
+
+#[napi]
+pub fn plugin_execute(id: String, function: String, input: String) -> NapiResult<String> {
+    phase2::plugin_execute(&id, &function, &input).map_err(map_doc_err)
+}
+
+#[napi]
+pub fn mcp_permission_list() -> NapiResult<String> {
+    phase2::mcp_permission_list().map_err(map_doc_err)
+}
+
+#[napi]
+pub fn mcp_permission_grant(client_id: String, tool_name: String, grant: String) -> NapiResult<()> {
+    phase2::mcp_permission_grant(&client_id, &tool_name, &grant).map_err(map_doc_err)
+}
+
+#[napi]
+pub fn mcp_permission_revoke(client_id: String, tool_name: String) -> NapiResult<()> {
+    phase2::mcp_permission_revoke(&client_id, &tool_name).map_err(map_doc_err)
+}
+
+#[napi]
+pub fn mcp_status() -> NapiResult<String> {
+    let status = phase2::mcp_status();
+    serde_json::to_string(&status).map_err(|e| NapiError::from_reason(e.to_string()))
 }

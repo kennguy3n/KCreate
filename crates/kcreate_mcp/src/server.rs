@@ -218,6 +218,38 @@ pub fn is_running() -> bool {
     slot.as_ref().is_some_and(McpServer::is_running)
 }
 
+/// Returns the loopback TCP port of the process-global MCP server,
+/// or `None` when it is not running. The McpSettingsPanel UI uses
+/// this so the user can see what port to point external MCP clients
+/// at without restarting the server.
+#[must_use]
+pub fn port() -> Option<u16> {
+    let slot = global().lock();
+    slot.as_ref()
+        .filter(|s| s.is_running())
+        .map(McpServer::port)
+}
+
+/// Atomic snapshot of `(is_running, port)` taken under a single
+/// global-lock acquisition.
+///
+/// Calling [`is_running`] and [`port`] separately is a TOCTOU race:
+/// the server can be stopped between the two calls, producing a
+/// status response with `running: true` and `port: 0` that no caller
+/// expects to be possible. The McpSettingsPanel UI tolerates the
+/// inconsistency (it polls again on the next tick) but a single
+/// status response should still be self-consistent. Use this
+/// accessor whenever you need both fields. Per Devin Review
+/// ANALYSIS_pr-review-job-790e7860e5c745e0bee13295709290f4_0001.
+#[must_use]
+pub fn state() -> (bool, Option<u16>) {
+    let slot = global().lock();
+    match slot.as_ref() {
+        Some(s) if s.is_running() => (true, Some(s.port())),
+        _ => (false, None),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

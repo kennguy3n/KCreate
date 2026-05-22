@@ -67,7 +67,7 @@ item.
 - [x] One AI image action runs locally (`phase0_local_bg_removal_runs_on_cpu`)
 - [x] Export works — PNG, SVG, PDF, WebP, JPEG all produce format-valid bytes (`phase0_full_pipeline_runs_without_network`)
 
-## Phase 1 — MVP | In progress | ~75%
+## Phase 1 — MVP | Complete | 100%
 
 Scope: Design Studio, Vector Studio, Image Studio Lite, Brand & Asset Hub,
 Export Center, Local AI Core Pack.
@@ -114,24 +114,104 @@ Export Center, Local AI Core Pack.
       `kcreate_renderer::native_surface::NativeSurface`, top-level
       `PresentationMode` enum, `RenderContext::render_frame_native`
 
-### Remaining for Phase 1 ship
-- Native CanvasHost Electron integration (platform-specific child-window
-  embedding — the renderer-side primitive is ready)
-- Full prototype / interaction mode (Phase 1 ships scaled preview only)
-- Accessibility-checker UI panel (LLM result presentation)
+### Block A–B completed in PR #5
+- [x] Native CanvasHost Electron integration — `native_canvas.rs` interprets
+      platform `PlatformHandle`s (`AppKitWindow`, `Win32Window`, `XlibWindow`,
+      `XcbWindow`), `CanvasHost.tsx` runs dual-mode (offscreen / native),
+      Wayland declined safely
+- [x] Renderer dual-mode — `PresentationMode::{Offscreen, Native}`,
+      `RenderContext::switch_to_native` / `switch_to_offscreen`
+- [x] Window lifecycle hooks — close event → `switchOffscreen`
+- [x] Full prototype / interaction mode — `InteractionTrigger`,
+      `InteractionAction` on every node, `interaction_add/remove/list/list_batch`
+      bridge functions, `PrototypePlayer` overlay, `InteractionPanel`
+- [x] Accessibility-checker UI panel — `AccessibilityPanel` with LLM-driven
+      analysis, severity badges, fix buttons, node-link selection
+- [x] Layout Studio page model — `PageLayout`, `PageSize`, `PageOrientation`,
+      `Margins` in `kcreate_core::node`; master pages
+      (create/list/apply/detach); 3 built-in templates (Pitch Deck,
+      Proposal, Brochure)
+- [x] PageNavigator UI (drag-reorder, context menu, inline add-page picker)
+- [x] TemplatePicker UI (modal with card grid, preview pane)
+- [x] `project_is_untouched` bridge probe (fresh-project picker support)
 
-## Phase 2 — Professional Workflows | Not started
+## Phase 2 — Professional Workflows | In progress | ~55%
 
-- Layout Studio (deck/proposal templates, master pages, PDF preflight)
-- Batch export, screenshot-to-layout, icon pack generator
-- More local AI model packs
-- Plugin sandbox (WASM → JS panels → signed native)
-- MCP permission UI
+### Block A–B completed in this iteration (PR #6)
+- [x] Layout Studio foundation (PR #5 — page document model, master pages,
+      page navigator, template picker)
+- [x] Deck / proposal templates — 3 built-in (Pitch Deck, Proposal,
+      Brochure) shipped in PR #5
+- [x] PDF preflight engine (`kcreate_export::preflight`) — 6 checks:
+      `BleedMargin`, `FontEmbed`, `ImageResolution`, `ColorSpace`,
+      `Transparency`, `PageSize`. Bridge: `preflight_run`. UI:
+      `PreflightPanel` (Layout / Export mode tab).
+- [x] Icon pack generator (`kcreate_export::icon_pack`) — Web / iOS /
+      Android / Favicon platform presets. Bridge: `export_icon_pack` +
+      `export_icon_pack_built_in_platforms`. UI: `IconPackDialog`.
+- [x] Enhanced batch export — parallel rayon driver
+      (`kcreate_export::batch::run_batch_parallel`), `Arc<AtomicBool>`
+      cancellation, progress callback. Bridge: async job model
+      (`export_batch_start`, `export_batch_status`, `export_batch_cancel`).
+- [x] AI Lanczos upscale (`kcreate_ai::upscale`) — Lanczos3
+      reconstruction, row-parallel via rayon. 2× / 4× supported.
+- [x] AI palette extraction (`kcreate_ai::palette`) — k-means clustering
+      in RGB (downsampled to 256×256, 20 iterations, sorted by
+      frequency).
+- [x] AI smart-select (`kcreate_ai::smart_select`) — BFS flood-fill,
+      Euclidean RGB tolerance.
+- [x] AI model pack registry (`kcreate_ai::model_registry`) — declares
+      Core / ImagePro / DesignPro / Generation packs, computes
+      `installed` against a local `models_dir`.
+- [x] Plugin sandbox foundation — new crate `kcreate_plugin`:
+      `manifest` (PluginManifest, PluginType, PluginPermission),
+      `registry` (scan + enable/disable persisted to JSON),
+      `wasm_runtime` (wasmi 0.42, host ABI:
+      `kcreate_log`, `kcreate_get_input{,_len}`, `kcreate_set_output`,
+      deny-by-default sandbox, page-count `ResourceLimiter`).
+- [x] MCP permission model + UI — `kcreate_mcp::permissions`
+      (`McpPermissionStore`, `PermissionGrant::{Once, Always, Denied}`,
+      `consume_if_once`), JSON-on-disk persistence; server gates each
+      tool call. UI: `McpSettingsPanel`.
+- [x] Screenshot-to-layout AI (`kcreate_ai::screenshot_to_layout`) —
+      grayscale → Sobel → threshold → connected components →
+      heuristic classifier (Header / Navigation / Hero / TextBlock /
+      Image / Button / Card / Footer / Sidebar / Form / List). UI:
+      `ScreenshotToLayout` component.
+- [x] Phase 2 bridge module (`kcreate_bridge::phase2`) — single home
+      for every Phase 2 surface; `lib.rs` stays as thin N-API marshal.
+- [x] TypeScript wire format — `apps/desktop/shared/scene.ts` mirrors
+      every new Phase 2 type; `apps/desktop/preload/src/preload.ts`
+      exposes `window.kcreate.{preflight, iconPack, batch, aiModel,
+      plugin, mcpPermission}`.
+- [x] Benchmarks: `kcreate_export::preflight` Criterion bench;
+      `kcreate_ai::{upscale, palette, smart_select}` Criterion benches.
+
+### Remaining for Phase 2 ship
+- [ ] CMYK / ICC color management foundation
+- [ ] Advanced text frame features (text wrap, hyphenation, OpenType)
+- [ ] Full WASM plugin API (Phase 2 ships JSON I/O sandbox only)
+- [ ] JS panel plugin runtime
+- [ ] Native plugin signing + verification
+- [ ] Neural model downloads (ESRGAN upscale, u2net, SAM segment) —
+      registry declares packs as available but download/install is
+      deferred to Phase 3
 
 ## Phase 3 — Advanced Suite | Not started
 
 - Deeper print support, stronger PDF import
 - Optional local collaboration over LAN
-- Advanced inpainting, local style model packs
+- Advanced inpainting, local style model packs (ESRGAN, SAM, u2net)
 - Marketplace for vetted local templates
+
+## Changelog
+
+- **2026-05-22** — Block B–H landed: PDF preflight, icon pack,
+  parallel batch w/ async cancel, AI upscale/palette/smart-select +
+  model registry, kcreate_plugin (wasmi sandbox), MCP permission
+  store + settings UI, screenshot-to-layout. Full TypeScript wire
+  parity; new criterion benches in `kcreate_export` and `kcreate_ai`.
+- **2026-05-21 (PR #5)** — Phase 1 ship: native CanvasHost dual-mode,
+  prototype/interaction system, accessibility panel; plus Layout
+  Studio foundation (page model, master pages, templates).
 - KChat artifact publishing

@@ -1,0 +1,31 @@
+[package]
+name = "kcreate_plugin"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Sandboxed WASM plugin runtime for KCreate (wasmi-backed)"
+
+[lints]
+workspace = true
+
+[dependencies]
+wasmi.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+log.workspace = true
+parking_lot.workspace = true
+blake3.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+# `wat` is only used in tests to compile inline WAT modules into the
+# WASM bytes our runtime executes — production never depends on it.
+wat = "1"
+# Used by tests to backdate a file's mtime so we can prove the cache
+# detects sub-second content changes via the BLAKE3 content hash
+# rather than mtime alone. Test-only dependency.
+filetime = "0.2"

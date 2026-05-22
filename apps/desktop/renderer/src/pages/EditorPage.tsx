@@ -13,6 +13,7 @@ import { AIAssistPanel } from "../components/AIAssistPanel";
 import { ExportPanel } from "../components/ExportPanel";
 import { ArtboardDialog } from "../components/ArtboardDialog";
 import { ResponsivePreview } from "../components/ResponsivePreview";
+import { PrototypePlayer } from "../components/PrototypePlayer";
 import type {
   ArtboardInfo,
   ArtboardPreset,
@@ -76,6 +77,7 @@ export function EditorPage({
   const [scene] = useState<Scene>(EMPTY_SCENE);
   const [docStatus, setDocStatus] = useState<DocumentStatus | null>(null);
   const [artboards, setArtboards] = useState<ArtboardInfo[]>([]);
+  const [prototypePlaying, setPrototypePlaying] = useState<boolean>(false);
   const [artboardPresets, setArtboardPresets] = useState<ArtboardPreset[]>(
     [],
   );
@@ -994,11 +996,49 @@ export function EditorPage({
                 inset: 0,
                 background: "rgba(17, 24, 39, 0.92)",
                 overflow: "auto",
+                display: "flex",
+                flexDirection: "column",
               }}
             >
-              <ResponsivePreview onStatus={setStatusMessage} />
+              <div
+                style={{
+                  display: "flex",
+                  justifyContent: "flex-end",
+                  padding: spacing.sm,
+                  gap: spacing.sm,
+                }}
+              >
+                <button
+                  type="button"
+                  onClick={() => setPrototypePlaying(true)}
+                  style={{
+                    padding: "6px 14px",
+                    fontSize: 12,
+                    fontWeight: 600,
+                    background: colors.accent,
+                    color: colors.textInverse,
+                    border: `1px solid ${colors.accent}`,
+                    borderRadius: 9999,
+                    cursor: "pointer",
+                  }}
+                >
+                  ▶ Play
+                </button>
+              </div>
+              <div style={{ flex: 1, overflow: "auto" }}>
+                <ResponsivePreview onStatus={setStatusMessage} />
+              </div>
             </div>
           ) : null}
+          <PrototypePlayer
+            open={prototypePlaying}
+            tree={nodes}
+            artboards={artboards}
+            startArtboardId={
+              selected && selected.nodeType === "artboard" ? selected.id : null
+            }
+            onClose={() => setPrototypePlaying(false)}
+          />
         </main>
         {rightPanelFocus === "ai" ? (
           <AIAssistPanel
@@ -1025,6 +1065,15 @@ export function EditorPage({
               void handleExport();
             }}
             layout={layoutHandlers}
+            mode={mode}
+            onStatus={setStatusMessage}
+            onSelectNode={(id) => {
+              void handleSelect(id);
+            }}
+            artboards={artboards.map((a) => ({ id: a.id, name: a.name }))}
+            onInteractionsChanged={() => {
+              void refreshTree();
+            }}
           />
         )}
       </div>

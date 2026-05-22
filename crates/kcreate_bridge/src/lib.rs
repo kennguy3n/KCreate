@@ -19,6 +19,8 @@
 pub mod document;
 pub mod hit_test;
 pub mod llm;
+#[cfg(feature = "native_canvas")]
+pub mod native_canvas;
 pub mod scene_sync;
 pub mod state;
 pub mod wire;

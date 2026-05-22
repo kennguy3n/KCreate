@@ -978,6 +978,16 @@ export interface LayoutTemplate {
   description: string;
   category: TemplateCategory;
   pages: TemplatePageDef[];
+  /**
+   * Optional design-token bundle the template wants to apply to the
+   * project when instantiated (palette, typography ramp, etc.).
+   *
+   * Mirrors the `design_tokens: Option<DesignTokens>` field on
+   * `kcreate_core::project::LayoutTemplate`. Serialised as JSON `null`
+   * by serde when absent — kept in the TS shape for wire-format
+   * lockstep (AGENTS.md rule 4).
+   */
+  design_tokens: DesignTokens | null;
 }
 
 export interface MasterPageBridge {

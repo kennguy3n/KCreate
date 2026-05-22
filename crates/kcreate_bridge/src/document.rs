@@ -1470,6 +1470,11 @@ pub fn master_page_create(name: String, size: &str, orientation: &str) -> Result
         vec![id],
     );
     ws.project.execute_operation(op);
+    // Master page is a `NodeType::Page` inserted into the document graph
+    // (see `create_master_page` in `kcreate_core::Project`); the scene
+    // sync traverses Page nodes (`scene_sync.rs::emit_node`) so the
+    // renderer view must be refreshed.
+    let _ = sync_scene_locked(&mut guard);
     drop(guard);
     Ok(id)
 }
@@ -1504,16 +1509,37 @@ pub fn master_page_list() -> Result<Vec<MasterPageInfo>> {
 }
 
 /// Attach `master_page_id` to a content page.
+///
+/// Records `before` / `after` patches as the full `PageLayout` JSON on the
+/// content page so the operation log carries enough state for undo / redo
+/// (the master id alone is not sufficient — the page may not have had a
+/// layout at all before the call, and undo must restore that).
 pub fn master_page_apply(content_page_id: Uuid, master_page_id: Uuid) -> Result<()> {
     let mut guard = slot().lock();
     let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
+    let before = ws
+        .project
+        .document
+        .get_node(content_page_id)
+        .and_then(Node::page_layout)
+        .map_or(serde_json::Value::Null, |l| {
+            serde_json::to_value(&l).unwrap_or(serde_json::Value::Null)
+        });
     ws.project
         .apply_master_page(content_page_id, master_page_id)?;
+    let after = ws
+        .project
+        .document
+        .get_node(content_page_id)
+        .and_then(Node::page_layout)
+        .map_or(serde_json::Value::Null, |l| {
+            serde_json::to_value(&l).unwrap_or(serde_json::Value::Null)
+        });
     let op = Operation::new(
         "user",
         "master_page_apply",
-        serde_json::to_value(content_page_id)?,
-        serde_json::to_value(master_page_id)?,
+        before,
+        after,
         vec![content_page_id],
     );
     ws.project.execute_operation(op);
@@ -1522,15 +1548,36 @@ pub fn master_page_apply(content_page_id: Uuid, master_page_id: Uuid) -> Result<
 }
 
 /// Detach the master page reference from `content_page_id`.
+///
+/// Captures the full `PageLayout` on the content page before and after the
+/// detach so undo / redo can restore the previous `master_page_id` (which
+/// would otherwise be lost — the bridge does not keep a separate copy of
+/// page layouts).
 pub fn master_page_detach(content_page_id: Uuid) -> Result<()> {
     let mut guard = slot().lock();
     let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
+    let before = ws
+        .project
+        .document
+        .get_node(content_page_id)
+        .and_then(Node::page_layout)
+        .map_or(serde_json::Value::Null, |l| {
+            serde_json::to_value(&l).unwrap_or(serde_json::Value::Null)
+        });
     ws.project.detach_master_page(content_page_id)?;
+    let after = ws
+        .project
+        .document
+        .get_node(content_page_id)
+        .and_then(Node::page_layout)
+        .map_or(serde_json::Value::Null, |l| {
+            serde_json::to_value(&l).unwrap_or(serde_json::Value::Null)
+        });
     let op = Operation::new(
         "user",
         "master_page_detach",
-        serde_json::Value::Null,
-        serde_json::Value::Null,
+        before,
+        after,
         vec![content_page_id],
     );
     ws.project.execute_operation(op);
@@ -4335,6 +4382,60 @@ mod tests {
             .expect("get layout 2")
             .expect("present");
         assert!(layout.master_page_id.is_none());
+        project_close();
+    }
+
+    /// Regression: `master_page_apply` and `master_page_detach` must
+    /// record `before` / `after` operation patches containing the full
+    /// `PageLayout` on the content page (not the master id alone, not
+    /// `Null`). Without these, undo / redo cannot recover the previous
+    /// master attachment.
+    #[test]
+    #[serial]
+    fn master_page_apply_and_detach_capture_layout_patches() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("master-undo", dir.path()).expect("create");
+        let content_page = document_get_tree().expect("tree")[0].id;
+        let master = master_page_create("M".into(), "a4", "portrait").expect("create");
+
+        // After `master_page_apply`, the most recent op must carry the
+        // before / after layout (and `after.master_page_id` must match).
+        // The default Page created by `project_create` has no layout, so
+        // `before_patch` is JSON `null` and `after_patch` is a populated
+        // `PageLayout` with the master attached.
+        master_page_apply(content_page, master).expect("apply");
+        {
+            let guard = slot().lock();
+            let ws = guard.as_ref().expect("ws");
+            let op = ws.project.operation_log.last().expect("apply op");
+            assert_eq!(op.command, "master_page_apply");
+            assert!(
+                op.before_patch.is_null(),
+                "before_patch should be null when content page had no layout, \
+                 was: {}",
+                op.before_patch,
+            );
+            let after: kcreate_core::PageLayout =
+                serde_json::from_value(op.after_patch.clone()).expect("decode after");
+            assert_eq!(after.master_page_id, Some(master));
+        }
+
+        // After `master_page_detach`, the most recent op must have the
+        // master set in `before` and cleared in `after`.
+        master_page_detach(content_page).expect("detach");
+        {
+            let guard = slot().lock();
+            let ws = guard.as_ref().expect("ws");
+            let op = ws.project.operation_log.last().expect("detach op");
+            assert_eq!(op.command, "master_page_detach");
+            let before: kcreate_core::PageLayout =
+                serde_json::from_value(op.before_patch.clone()).expect("decode before");
+            assert_eq!(before.master_page_id, Some(master));
+            let after: kcreate_core::PageLayout =
+                serde_json::from_value(op.after_patch.clone()).expect("decode after");
+            assert!(after.master_page_id.is_none());
+        }
         project_close();
     }
 

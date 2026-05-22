@@ -618,9 +618,19 @@ pub enum PageSize {
     Letter,
     Legal,
     Tabloid,
-    /// 16:9 presentation slide (10×5.625 in @ 72dpi → 254×142.875 mm).
+    /// 16:9 presentation slide (5.625×10 in portrait → 142.875×254 mm).
+    ///
+    /// `dimensions_mm()` returns portrait `(width, height)` per the
+    /// [`PageSize`] contract — the typical 10×5.625 in landscape slide is
+    /// produced by combining this size with [`PageOrientation::Landscape`].
+    #[serde(rename = "presentation_16x9")]
     Presentation16x9,
-    /// 4:3 presentation slide (10×7.5 in → 254×190.5 mm).
+    /// 4:3 presentation slide (7.5×10 in portrait → 190.5×254 mm).
+    ///
+    /// `dimensions_mm()` returns portrait `(width, height)` per the
+    /// [`PageSize`] contract — the typical 10×7.5 in landscape slide is
+    /// produced by combining this size with [`PageOrientation::Landscape`].
+    #[serde(rename = "presentation_4x3")]
     Presentation4x3,
     /// Caller-supplied size in mm.
     Custom {
@@ -644,8 +654,8 @@ impl PageSize {
             Self::Letter => (8.5 * 25.4, 11.0 * 25.4),
             Self::Legal => (8.5 * 25.4, 14.0 * 25.4),
             Self::Tabloid => (11.0 * 25.4, 17.0 * 25.4),
-            Self::Presentation16x9 => (10.0 * 25.4, 5.625 * 25.4),
-            Self::Presentation4x3 => (10.0 * 25.4, 7.5 * 25.4),
+            Self::Presentation16x9 => (5.625 * 25.4, 10.0 * 25.4),
+            Self::Presentation4x3 => (7.5 * 25.4, 10.0 * 25.4),
             Self::Custom {
                 width_mm,
                 height_mm,
@@ -1152,6 +1162,58 @@ mod tests {
         assert_eq!(portrait.dimensions_mm(), (210.0, 297.0));
         let landscape = PageLayout::new(PageSize::A4, PageOrientation::Landscape);
         assert_eq!(landscape.dimensions_mm(), (297.0, 210.0));
+    }
+
+    /// Regression: `PageSize::dimensions_mm()` is documented to return
+    /// portrait `(width, height)` (width < height). The presentation
+    /// variants previously returned landscape values which made
+    /// `PageLayout::dimensions_mm` invert page bounds when combined
+    /// with `PageOrientation::Landscape` (and the Pitch Deck template
+    /// uses exactly that combination — see
+    /// `crates/kcreate_core/src/project.rs::builtin_layout_templates`).
+    #[test]
+    fn presentation_page_sizes_are_portrait() {
+        let (w16, h16) = PageSize::Presentation16x9.dimensions_mm();
+        assert!(w16 < h16, "16x9 portrait must be taller than wide");
+        assert!((w16 - 5.625 * 25.4).abs() < 1e-9);
+        assert!((h16 - 10.0 * 25.4).abs() < 1e-9);
+        let (w4, h4) = PageSize::Presentation4x3.dimensions_mm();
+        assert!(w4 < h4, "4x3 portrait must be taller than wide");
+        assert!((w4 - 7.5 * 25.4).abs() < 1e-9);
+        assert!((h4 - 10.0 * 25.4).abs() < 1e-9);
+    }
+
+    /// Combining a presentation page size with `Landscape` should give
+    /// the typical 10×(5.625|7.5) inch slide bounds — i.e. wider than
+    /// tall. This is what every built-in template expects.
+    #[test]
+    fn presentation_landscape_matches_slide_canvas() {
+        let layout =
+            PageLayout::new(PageSize::Presentation16x9, PageOrientation::Landscape);
+        let (w, h) = layout.dimensions_mm();
+        assert!(w > h, "16x9 landscape must be wider than tall");
+        assert!((w - 10.0 * 25.4).abs() < 1e-9);
+        assert!((h - 5.625 * 25.4).abs() < 1e-9);
+    }
+
+    /// Regression: `Presentation16x9` / `Presentation4x3` must serialise
+    /// with an underscore separator (`presentation_16x9`,
+    /// `presentation_4x3`) so the wire format matches the TypeScript
+    /// `PageSizeId` union in `apps/desktop/shared/scene.ts`. The default
+    /// `rename_all = "snake_case"` rule would drop the underscore before
+    /// digits, which is why an explicit `#[serde(rename = ...)]` is set
+    /// on each variant.
+    #[test]
+    fn presentation_page_sizes_serialize_with_underscore() {
+        let s16 = serde_json::to_string(&PageSize::Presentation16x9).expect("serialize");
+        assert_eq!(s16, r#"{"kind":"presentation_16x9"}"#);
+        let s4 = serde_json::to_string(&PageSize::Presentation4x3).expect("serialize");
+        assert_eq!(s4, r#"{"kind":"presentation_4x3"}"#);
+        // Round-trip both ways via JSON.
+        let back: PageSize = serde_json::from_str(&s16).expect("deserialize 16x9");
+        assert_eq!(back, PageSize::Presentation16x9);
+        let back: PageSize = serde_json::from_str(&s4).expect("deserialize 4x3");
+        assert_eq!(back, PageSize::Presentation4x3);
     }
 
     #[test]

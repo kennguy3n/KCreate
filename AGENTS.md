@@ -77,11 +77,20 @@ KCreate/
 - All crates compile and pass tests without a live Node runtime (we use
   `napi/dyn-symbols` so `cargo test` works in CI without Electron).
 - **Bridge layering.** All business logic lives in
-  `crates/kcreate_bridge/src/state.rs` (renderer) and
-  `crates/kcreate_bridge/src/document.rs` (project/document/export);
-  `src/lib.rs` is a thin N-API marshalling layer only. Bridge tests use
-  `serial_test` because the renderer and the project workspace are
-  both process-global singletons.
+  `crates/kcreate_bridge/src/state.rs` (renderer),
+  `crates/kcreate_bridge/src/document.rs` (project/document/export),
+  and `crates/kcreate_bridge/src/phase2.rs` (preflight, icon pack,
+  parallel batch, AI, plugin sandbox, MCP permissions,
+  screenshot-to-layout); `src/lib.rs` is a thin N-API marshalling
+  layer only. Bridge tests use `serial_test` because the renderer
+  and the project workspace are both process-global singletons.
+- **Workspace access.** `Workspace` fields are `pub(crate)` so other
+  bridge modules can compose new entry points without leaking the
+  type, but new code must go through `document::with_workspace` /
+  `document::with_workspace_mut` rather than touching `ws.project` /
+  `ws.store` directly. Those helpers own the locking discipline, the
+  scene-sync hook, and the operation-log invariants — bypassing them
+  silently breaks undo / persistence / native canvas dirty tracking.
 - **Local-first invariant.** No editing-path crate may pull in a
   networking library. `crates/kcreate_tests/tests/local_first.rs`
   enforces this against a deny-list — keep it green.

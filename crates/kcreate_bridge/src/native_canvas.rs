@@ -182,8 +182,9 @@ fn interpret_bytes(bytes: &[u8]) -> Result<PlatformHandle, NativeCanvasError> {
 
     use raw_window_handle::{Win32WindowHandle, WindowsDisplayHandle};
     let raw = read_isize(bytes, "windows")?;
-    let nz = NonZeroIsize::new(raw)
-        .ok_or(NativeCanvasError::NullHandle { platform: "windows" })?;
+    let nz = NonZeroIsize::new(raw).ok_or(NativeCanvasError::NullHandle {
+        platform: "windows",
+    })?;
     let window = RawWindowHandle::Win32(Win32WindowHandle::new(nz));
     let display = RawDisplayHandle::Windows(WindowsDisplayHandle::new());
     Ok(PlatformHandle {
@@ -209,9 +210,7 @@ fn interpret_bytes(bytes: &[u8]) -> Result<PlatformHandle, NativeCanvasError> {
     let session = std::env::var("XDG_SESSION_TYPE").unwrap_or_default();
     if session.eq_ignore_ascii_case("x11") {
         x11_handle(bytes)
-    } else if session.eq_ignore_ascii_case("wayland")
-        || (session.is_empty() && bytes.len() == 8)
-    {
+    } else if session.eq_ignore_ascii_case("wayland") || (session.is_empty() && bytes.len() == 8) {
         wayland_handle(bytes)
     } else {
         x11_handle(bytes)
@@ -266,8 +265,9 @@ fn wayland_handle(bytes: &[u8]) -> Result<PlatformHandle, NativeCanvasError> {
     // null" error if Electron handed us garbage, rather than the
     // less-actionable `WaylandNotYetSupported` after a length pass.
     let ptr = read_ptr(bytes, "wayland")?;
-    let _: NonNull<std::ffi::c_void> =
-        NonNull::new(ptr).ok_or(NativeCanvasError::NullHandle { platform: "wayland" })?;
+    let _: NonNull<std::ffi::c_void> = NonNull::new(ptr).ok_or(NativeCanvasError::NullHandle {
+        platform: "wayland",
+    })?;
     Err(NativeCanvasError::WaylandNotYetSupported)
 }
 
@@ -277,7 +277,10 @@ fn interpret_bytes(_bytes: &[u8]) -> Result<PlatformHandle, NativeCanvasError> {
 }
 
 #[allow(dead_code)]
-fn read_ptr(bytes: &[u8], platform: &'static str) -> Result<*mut std::ffi::c_void, NativeCanvasError> {
+fn read_ptr(
+    bytes: &[u8],
+    platform: &'static str,
+) -> Result<*mut std::ffi::c_void, NativeCanvasError> {
     if bytes.len() < 8 {
         return Err(NativeCanvasError::HandleTooShort {
             got: bytes.len(),

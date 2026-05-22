@@ -1093,7 +1093,7 @@ export function EditorPage({
             tree={nodes}
             artboards={artboards}
             startArtboardId={
-              selected && selected.nodeType === "artboard" ? selected.id : null
+              selected && selected.nodeType === "Artboard" ? selected.id : null
             }
             onClose={() => setPrototypePlaying(false)}
           />

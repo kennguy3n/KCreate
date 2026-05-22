@@ -109,7 +109,12 @@ export function PrototypePlayer({
           collected.push({
             nodeId: node.id,
             interactionId: it.id,
-            bounds: { x: b.x, y: b.y, width: b.width, height: b.height },
+            bounds: {
+              x: b.x - currentArtboard.x,
+              y: b.y - currentArtboard.y,
+              width: b.width,
+              height: b.height,
+            },
             action: it.action,
             trigger: it.trigger,
           });

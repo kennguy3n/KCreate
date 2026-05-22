@@ -269,9 +269,9 @@ export function parseAccessibilityReply(raw: string): AccessibilityIssue[] {
   const issues = (parsed as { issues?: unknown }).issues;
   if (!Array.isArray(issues)) return [];
   const out: AccessibilityIssue[] = [];
-  for (const raw of issues) {
-    if (typeof raw !== "object" || raw === null) continue;
-    const r = raw as Record<string, unknown>;
+  for (const entry of issues) {
+    if (typeof entry !== "object" || entry === null) continue;
+    const r = entry as Record<string, unknown>;
     const severity = normaliseSeverity(r.severity);
     const message = typeof r.message === "string" ? r.message.trim() : "";
     if (message === "") continue;

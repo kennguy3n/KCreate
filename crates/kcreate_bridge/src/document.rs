@@ -1676,13 +1676,32 @@ pub fn layout_template_apply(template_id: Uuid) -> Result<Vec<Uuid>> {
 /// new page id. Records an undoable `page_add` op.
 ///
 /// Optional `size` / `orientation` set the initial page layout. When
-/// omitted, the page is created at the workspace default (A4 portrait,
-/// matching `Project::add_page`).
-pub fn page_add(
-    name: String,
-    size: Option<&str>,
-    orientation: Option<&str>,
-) -> Result<Uuid> {
+/// **both** are omitted, the page is created at the workspace default
+/// (A4 portrait, matching `Project::add_page`). When **both** are
+/// provided, the page bounds + `page_layout` metadata are set
+/// accordingly. Providing only one of the two is a caller bug and
+/// returns `DocumentBridgeError::InvalidNodeType` — silently ignoring
+/// the partial input would surprise the UI (it would think the page
+/// was created at the requested size but only orientation or only
+/// size made it through).
+pub fn page_add(name: String, size: Option<&str>, orientation: Option<&str>) -> Result<Uuid> {
+    // Validate the (size, orientation) pair *before* mutating the
+    // workspace. Partial input is rejected with a descriptive error
+    // so the caller can see which half is missing.
+    let layout_args = match (size, orientation) {
+        (None, None) => None,
+        (Some(s), Some(o)) => Some((s, o)),
+        (Some(_), None) => {
+            return Err(DocumentBridgeError::InvalidNodeType(
+                "page_add: `size` provided without `orientation` (pass both or neither)".into(),
+            ));
+        }
+        (None, Some(_)) => {
+            return Err(DocumentBridgeError::InvalidNodeType(
+                "page_add: `orientation` provided without `size` (pass both or neither)".into(),
+            ));
+        }
+    };
     let mut guard = slot().lock();
     let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
     let page_id = ws.project.add_page(name)?;
@@ -1692,7 +1711,7 @@ pub fn page_add(
     // other way around). Setting the layout now resizes the page
     // bounds to the requested page size; the artboard inside keeps
     // its 1920x1080 default until the user resizes it.
-    if let (Some(size_tag), Some(orientation_tag)) = (size, orientation) {
+    if let Some((size_tag, orientation_tag)) = layout_args {
         let layout = kcreate_core::PageLayout::new(
             parse_page_size(size_tag)?,
             match orientation_tag {
@@ -1704,12 +1723,8 @@ pub fn page_add(
         if let Some(node) = ws.project.document.get_node_mut(page_id) {
             let (w_mm, h_mm) = layout.dimensions_mm();
             let px_per_mm = 96.0 / 25.4;
-            node.bounds = kcreate_core::node::Bounds::new(
-                0.0,
-                0.0,
-                w_mm * px_per_mm,
-                h_mm * px_per_mm,
-            );
+            node.bounds =
+                kcreate_core::node::Bounds::new(0.0, 0.0, w_mm * px_per_mm, h_mm * px_per_mm);
             node.set_page_layout(&layout);
         }
     }
@@ -1747,7 +1762,9 @@ pub fn page_duplicate(page_id: Uuid) -> Result<Uuid> {
         .get_node(page_id)
         .ok_or(DocumentBridgeError::NodeNotFound(page_id))?;
     if source.node_type != kcreate_core::NodeType::Page {
-        return Err(DocumentBridgeError::WrongComponentNodeType(source.node_type));
+        return Err(DocumentBridgeError::WrongComponentNodeType(
+            source.node_type,
+        ));
     }
     let new_id = ws.project.document.clone_subtree(page_id, None)?;
     if let Some(node) = ws.project.document.get_node_mut(new_id) {
@@ -1780,11 +1797,7 @@ pub fn page_duplicate(page_id: Uuid) -> Result<Uuid> {
 ///
 /// Records an undoable `document_reparent` op carrying the prior
 /// parent + index so the patch can be reversed.
-pub fn document_reparent_node(
-    node_id: Uuid,
-    new_parent: Option<Uuid>,
-    index: usize,
-) -> Result<()> {
+pub fn document_reparent_node(node_id: Uuid, new_parent: Option<Uuid>, index: usize) -> Result<()> {
     let mut guard = slot().lock();
     let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
     let (prior_parent, prior_index) = {
@@ -1821,13 +1834,7 @@ pub fn document_reparent_node(
         "parent_id": new_parent,
         "index": index,
     });
-    let op = Operation::new(
-        "user",
-        "document_reparent",
-        before,
-        after,
-        vec![node_id],
-    );
+    let op = Operation::new("user", "document_reparent", before, after, vec![node_id]);
     ws.project.execute_operation(op);
     ws.project.modified_at = Utc::now();
     let _ = sync_scene_locked(&mut guard);
@@ -4587,8 +4594,7 @@ mod tests {
         assert!(!batch.contains_key(&missing));
         let listed_a = batch.get(&page_a).cloned().unwrap_or_default();
         assert_eq!(listed_a.len(), 2);
-        let ids_set: std::collections::HashSet<Uuid> =
-            listed_a.iter().map(|i| i.id).collect();
+        let ids_set: std::collections::HashSet<Uuid> = listed_a.iter().map(|i| i.id).collect();
         assert!(ids_set.contains(&iid1));
         assert!(ids_set.contains(&iid2));
 
@@ -4627,6 +4633,41 @@ mod tests {
     }
 
     // ---- Page layout / master page / template bridge tests (Block B) ----
+
+    /// `page_add` accepts (None, None) or (Some, Some) but rejects
+    /// partial input — passing one of (size, orientation) without the
+    /// other would otherwise silently fall through to the workspace
+    /// default, which surprises the UI: it would render the page at
+    /// the requested size while metadata still claimed the default.
+    #[test]
+    #[serial]
+    fn page_add_rejects_partial_layout_input() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("partial", dir.path()).expect("create");
+
+        // No layout arguments — uses workspace default. OK.
+        let _default = page_add("plain".into(), None, None).expect("default");
+
+        // Both supplied — explicitly sized. OK.
+        let _sized = page_add("sized".into(), Some("a4"), Some("portrait")).expect("sized");
+
+        // Size without orientation — rejected.
+        let err = page_add("half-1".into(), Some("a4"), None).expect_err("missing orientation");
+        assert!(
+            matches!(err, DocumentBridgeError::InvalidNodeType(ref m) if m.contains("orientation")),
+            "expected InvalidNodeType naming `orientation`, got {err:?}",
+        );
+
+        // Orientation without size — rejected.
+        let err = page_add("half-2".into(), None, Some("portrait")).expect_err("missing size");
+        assert!(
+            matches!(err, DocumentBridgeError::InvalidNodeType(ref m) if m.contains("size")),
+            "expected InvalidNodeType naming `size`, got {err:?}",
+        );
+
+        project_close();
+    }
 
     #[test]
     #[serial]

@@ -36,9 +36,9 @@ use napi_derive::napi;
 use uuid::Uuid;
 
 use crate::document::{
-    BoundsInfo as CoreBoundsInfo, CreateNodeProps, DocumentBridgeError,
-    NodeInfo as CoreNodeInfo, PngExportRequest as CorePngRequest,
-    ProjectInfo as CoreProjectInfo, RuntimeStatus as CoreRuntimeStatus, UpdateNodeProps,
+    BoundsInfo as CoreBoundsInfo, CreateNodeProps, DocumentBridgeError, NodeInfo as CoreNodeInfo,
+    PngExportRequest as CorePngRequest, ProjectInfo as CoreProjectInfo,
+    RuntimeStatus as CoreRuntimeStatus, UpdateNodeProps,
 };
 use crate::state::{
     AcquiredFrame as CoreAcquiredFrame, BridgeError, RendererFrameInfo as CoreFrameInfo,
@@ -269,11 +269,7 @@ pub fn renderer_presentation_mode() -> String {
 /// error as a signal to remain in offscreen mode.
 #[napi]
 #[allow(clippy::needless_pass_by_value, unused_variables)]
-pub fn renderer_switch_native(
-    handle_bytes: Buffer,
-    width: u32,
-    height: u32,
-) -> NapiResult<String> {
+pub fn renderer_switch_native(handle_bytes: Buffer, width: u32, height: u32) -> NapiResult<String> {
     #[cfg(feature = "native_canvas")]
     {
         state::switch_native(handle_bytes.as_ref(), width, height).map_err(map_err)

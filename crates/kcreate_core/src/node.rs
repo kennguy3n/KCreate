@@ -1188,8 +1188,7 @@ mod tests {
     /// tall. This is what every built-in template expects.
     #[test]
     fn presentation_landscape_matches_slide_canvas() {
-        let layout =
-            PageLayout::new(PageSize::Presentation16x9, PageOrientation::Landscape);
+        let layout = PageLayout::new(PageSize::Presentation16x9, PageOrientation::Landscape);
         let (w, h) = layout.dimensions_mm();
         assert!(w > h, "16x9 landscape must be wider than tall");
         assert!((w - 10.0 * 25.4).abs() < 1e-9);

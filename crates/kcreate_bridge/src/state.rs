@@ -105,10 +105,36 @@ pub(crate) fn reset_for_tests() {
     *scene_slot().lock() = None;
 }
 
+/// Resize both the offscreen pipeline *and* (if attached) the native
+/// presentation surface in a single call.
+///
+/// The two outputs must stay in step: the renderer rasterises into
+/// the offscreen staging buffer at `(width, height)` and then either
+/// publishes via the presenter (offscreen mode) or uploads into the
+/// swapchain (native mode). If only the offscreen target were
+/// resized, native-mode frames would either get clipped (swapchain
+/// smaller than staging) or letterboxed with stale pixels
+/// (swapchain larger than staging). The host calls this once on
+/// every `<canvas>` size change and we fan it out internally.
+///
+/// On the CPU fallback the offscreen pipeline still resizes
+/// normally; a native surface cannot be attached on CPU-only
+/// renderers (see [`switch_native`]), so the native branch is
+/// a no-op in that case.
 pub fn resize(width: u32, height: u32) -> Result<()> {
     let mut guard = slot().lock();
     let ctx = guard.as_mut().ok_or(BridgeError::NotInitialized)?;
     ctx.resize(width, height)?;
+    // Keep an attached native swapchain in step. The `native_canvas`
+    // feature must be enabled for `native_slot` to exist; default
+    // builds skip this branch entirely.
+    #[cfg(feature = "native_canvas")]
+    {
+        let mut native = native_slot().lock();
+        if let Some(surface) = native.as_mut() {
+            ctx.resize_native_surface(surface, width, height)?;
+        }
+    }
     drop(guard);
     Ok(())
 }

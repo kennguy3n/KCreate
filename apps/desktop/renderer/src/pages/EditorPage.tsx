@@ -170,22 +170,51 @@ export function EditorPage({
   }, [refreshTree]);
 
   // First-time-into-Layout prompt: when the user switches to Layout
-  // mode and we haven't shown the TemplatePicker for this project yet
-  // (and the project currently has no pages), pop the picker.
-  // Subsequent entries into Layout mode leave the picker closed; the
-  // user re-opens it via the "Templates" button in the PageNavigator
-  // footer.
+  // mode for the first time *on an untouched project*, pop the
+  // TemplatePicker. "Untouched" here means the project still has the
+  // exact shape `project_create` produces:
+  //
+  //   1 Page named "Page 1" + 1 Artboard (child of the page), total 2
+  //   nodes.
+  //
+  // See `crates/kcreate_bridge/src/document.rs::project_create` →
+  // `Project::add_page("Page 1")` which inserts both nodes.
+  //
+  // The previous heuristic checked `nodes.some(n => nodeType ===
+  // "Page")` which was always true after `project_create` (Devin
+  // Review PR #5 EditorPage finding — caught it as dead code). The
+  // fresh-state heuristic below restores the originally intended UX:
+  // auto-pop the picker on a clean project so the user can pick a
+  // template immediately, but skip it on a project they've already
+  // designed (any layers added, any rename, any extra page, any
+  // master page → the heuristic correctly says "not fresh").
+  //
+  // The user can re-open the picker any time via the "Templates"
+  // button in the PageNavigator footer; this just controls the
+  // automatic first-pop.
+  const isUntouchedDefaultProject = useMemo<boolean>(() => {
+    if (nodes.length !== 2) return false;
+    const pages = nodes.filter((n) => n.nodeType === "Page");
+    const artboards = nodes.filter((n) => n.nodeType === "Artboard");
+    if (pages.length !== 1 || artboards.length !== 1) return false;
+    const page = pages[0];
+    if (page === undefined || page.name !== "Page 1") return false;
+    return true;
+  }, [nodes]);
+
   useEffect(() => {
     if (mode !== "layout") return;
     if (layoutPickerShownFor === project.id) return;
-    const hasPages = nodes.some((n) => n.nodeType === "Page");
-    if (hasPages) {
+    if (!isUntouchedDefaultProject) {
+      // User already designed something — don't surprise them with a
+      // modal they didn't ask for. Mark the sentinel anyway so the
+      // logic doesn't re-evaluate.
       setLayoutPickerShownFor(project.id);
       return;
     }
     setTemplatePickerOpen(true);
     setLayoutPickerShownFor(project.id);
-  }, [mode, project.id, nodes, layoutPickerShownFor]);
+  }, [mode, project.id, isUntouchedDefaultProject, layoutPickerShownFor]);
 
   // Layout mode page selection helper — selects the page node so the
   // canvas pans/zooms to its bounds and the right panel shows its

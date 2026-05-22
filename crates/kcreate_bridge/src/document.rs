@@ -66,10 +66,16 @@ pub enum DocumentBridgeError {
     InvalidComponentSelection(String),
     #[error("component instance metadata on node {0} is malformed: {1}")]
     InvalidComponentInstance(Uuid, String),
-    #[error("expected a ComponentLayer node, got {0:?}")]
-    WrongComponentNodeType(NodeType),
-    #[error("expected a LayoutFrame node, got {0:?}")]
-    WrongLayoutNodeType(NodeType),
+    /// Bridge call expected a particular `NodeType` (e.g. `Page`,
+    /// `ComponentLayer`, `LayoutFrame`) and the node was something
+    /// else. Generic across every "wrong kind" check; supersedes the
+    /// older per-variant `WrongComponentNodeType` /
+    /// `WrongLayoutNodeType` which were specific to the component
+    /// and layout subsystems and read confusingly when reused for
+    /// other node kinds (e.g. Page layout) per Devin Review
+    /// (PR #5, `page_set_layout` finding).
+    #[error("expected a {expected:?} node, got {got:?}")]
+    WrongNodeType { expected: NodeType, got: NodeType },
     #[error("layout config on node {0} is malformed: {1}")]
     InvalidLayoutConfig(Uuid, String),
     #[error("io: {0}")]
@@ -1462,7 +1468,10 @@ pub fn page_set_layout(page_id: Uuid, layout_json: &str) -> Result<()> {
             .get_node_mut(page_id)
             .ok_or(DocumentBridgeError::NodeNotFound(page_id))?;
         if node.node_type != kcreate_core::NodeType::Page {
-            return Err(DocumentBridgeError::WrongComponentNodeType(node.node_type));
+            return Err(DocumentBridgeError::WrongNodeType {
+                expected: NodeType::Page,
+                got: node.node_type,
+            });
         }
         before = node.page_layout().map_or(serde_json::Value::Null, |l| {
             serde_json::to_value(&l).unwrap_or(serde_json::Value::Null)
@@ -1772,9 +1781,10 @@ pub fn page_duplicate(page_id: Uuid) -> Result<Uuid> {
         .get_node(page_id)
         .ok_or(DocumentBridgeError::NodeNotFound(page_id))?;
     if source.node_type != kcreate_core::NodeType::Page {
-        return Err(DocumentBridgeError::WrongComponentNodeType(
-            source.node_type,
-        ));
+        return Err(DocumentBridgeError::WrongNodeType {
+            expected: NodeType::Page,
+            got: source.node_type,
+        });
     }
     let new_id = ws.project.document.clone_subtree(page_id, None)?;
     if let Some(node) = ws.project.document.get_node_mut(new_id) {
@@ -2210,7 +2220,10 @@ pub fn component_switch_variant(node_id: Uuid, variant_id: Uuid) -> Result<()> {
             .get_node(node_id)
             .ok_or(DocumentBridgeError::NodeNotFound(node_id))?;
         if node.node_type != NodeType::ComponentLayer {
-            return Err(DocumentBridgeError::WrongComponentNodeType(node.node_type));
+            return Err(DocumentBridgeError::WrongNodeType {
+                expected: NodeType::ComponentLayer,
+                got: node.node_type,
+            });
         }
         let value = node
             .metadata
@@ -2293,7 +2306,10 @@ pub fn component_detach(node_id: Uuid) -> Result<()> {
         .get_node_mut(node_id)
         .ok_or(DocumentBridgeError::NodeNotFound(node_id))?;
     if node.node_type != NodeType::ComponentLayer {
-        return Err(DocumentBridgeError::WrongComponentNodeType(node.node_type));
+        return Err(DocumentBridgeError::WrongNodeType {
+            expected: NodeType::ComponentLayer,
+            got: node.node_type,
+        });
     }
     node.metadata.remove(COMPONENT_INSTANCE_METADATA_KEY);
     node.node_type = NodeType::GroupLayer;
@@ -2432,7 +2448,10 @@ fn write_layout_metadata(node_id: Uuid, config: LayoutConfig, op_kind: &str) -> 
             .get_node_mut(node_id)
             .ok_or(DocumentBridgeError::NodeNotFound(node_id))?;
         if node.node_type != NodeType::LayoutFrame {
-            return Err(DocumentBridgeError::WrongLayoutNodeType(node.node_type));
+            return Err(DocumentBridgeError::WrongNodeType {
+                expected: NodeType::LayoutFrame,
+                got: node.node_type,
+            });
         }
         before = serde_json::to_value(&*node)?;
         node.metadata.insert(
@@ -2471,7 +2490,10 @@ pub fn layout_recompute(node_id: Uuid) -> Result<()> {
             .get_node(node_id)
             .ok_or(DocumentBridgeError::NodeNotFound(node_id))?;
         if node.node_type != NodeType::LayoutFrame {
-            return Err(DocumentBridgeError::WrongLayoutNodeType(node.node_type));
+            return Err(DocumentBridgeError::WrongNodeType {
+                expected: NodeType::LayoutFrame,
+                got: node.node_type,
+            });
         }
         let raw = match node.metadata.get(LAYOUT_CONFIG_METADATA_KEY) {
             Some(v) => v.clone(),
@@ -2548,7 +2570,12 @@ pub fn layout_convert_to_frame(node_id: Uuid) -> Result<()> {
         match node.node_type {
             NodeType::LayoutFrame => return Ok(()),
             NodeType::GroupLayer => {}
-            other => return Err(DocumentBridgeError::WrongLayoutNodeType(other)),
+            other => {
+                return Err(DocumentBridgeError::WrongNodeType {
+                    expected: NodeType::GroupLayer,
+                    got: other,
+                });
+            }
         }
         before = serde_json::to_value(&*node)?;
         node.node_type = NodeType::LayoutFrame;
@@ -4218,7 +4245,10 @@ mod tests {
         let err = component_detach(kids[0]).expect_err("not a component");
         assert!(matches!(
             err,
-            DocumentBridgeError::WrongComponentNodeType(_)
+            DocumentBridgeError::WrongNodeType {
+                expected: NodeType::ComponentLayer,
+                ..
+            }
         ));
         project_close();
     }
@@ -4288,7 +4318,13 @@ mod tests {
     fn layout_convert_to_frame_rejects_non_group() {
         let (_dir, _frame, kids) = setup_layout_project();
         let err = layout_convert_to_frame(kids[0]).expect_err("vector layer is not group");
-        assert!(matches!(err, DocumentBridgeError::WrongLayoutNodeType(_)));
+        assert!(matches!(
+            err,
+            DocumentBridgeError::WrongNodeType {
+                expected: NodeType::GroupLayer,
+                ..
+            }
+        ));
         project_close();
     }
 
@@ -4377,7 +4413,13 @@ mod tests {
         let (_dir, _frame, kids) = setup_layout_project();
         let err = layout_set_flex(kids[0], kcreate_layout::FlexLayout::default())
             .expect_err("vector layer");
-        assert!(matches!(err, DocumentBridgeError::WrongLayoutNodeType(_)));
+        assert!(matches!(
+            err,
+            DocumentBridgeError::WrongNodeType {
+                expected: NodeType::LayoutFrame,
+                ..
+            }
+        ));
         project_close();
     }
 
@@ -4712,7 +4754,10 @@ mod tests {
             page_set_layout(rect, &serde_json::to_string(&layout).unwrap()).expect_err("rect");
         assert!(matches!(
             err,
-            DocumentBridgeError::WrongComponentNodeType(_)
+            DocumentBridgeError::WrongNodeType {
+                expected: NodeType::Page,
+                ..
+            }
         ));
         project_close();
     }

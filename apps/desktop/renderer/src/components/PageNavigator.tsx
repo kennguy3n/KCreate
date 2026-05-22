@@ -17,7 +17,7 @@
 // the user can tell at a glance which pages are templates vs. real
 // canvas pages.
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import type {
   MasterPageInfo,
@@ -104,23 +104,29 @@ export function PageNavigator({
 
   // Resolve master pages independently — they don't always live in the
   // main `nodes` tree (the bridge keeps them flagged by metadata, and
-  // `list_master_pages` already sorts them by name for us).
-  const refreshMasters = async (): Promise<void> => {
+  // `list_master_pages` already sorts them by name for us). Wrapped in
+  // `useCallback` so the `useEffect` below closes over the latest
+  // `onStatus` prop on every render (matches the `refresh` pattern in
+  // `InteractionPanel.tsx`).
+  const refreshMasters = useCallback(async (): Promise<void> => {
     try {
       const list = await window.kcreate.masterPage.list();
       setMasters(list);
     } catch (e) {
       onStatus?.(`Master page list failed: ${errorMessage(e)}`);
     }
-  };
+  }, [onStatus]);
   useEffect(() => {
     void refreshMasters();
-    // We only refresh when the underlying tree changes shape — adding a
-    // master page or duplicating a page touches the tree, so a re-run on
-    // `nodes` is enough. Identity is intentional: see comment in
-    // `firstPageId` derivation below.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [nodes.length]);
+    // We refresh on tree-shape changes only: the master-page list
+    // only mutates when `nodes` gains or loses entries. Depending on
+    // `nodes` directly would re-fire on every per-node mutation (a
+    // rename, a bounds tweak, a metadata write — `refreshTree`
+    // rebuilds the whole array), which would thrash the master-page
+    // list for no observable change. `nodes.length` is the right
+    // identity-stable proxy for "the tree shape changed", and is
+    // accepted by ESLint as a primitive read.
+  }, [nodes.length, refreshMasters]);
 
   // Build page-card data from the document tree. A "Page" is any node
   // with nodeType === "Page" that is NOT flagged as a master. We mark
@@ -257,19 +263,73 @@ export function PageNavigator({
     dragRef.current = null;
     setDropTargetIndex(null);
     if (!draggedId) return;
-    // Compute the post-removal index. If we're moving down within the
-    // same list, the index in `contentPages` shrinks by one after we
-    // detach.
-    const oldIndex = contentPages.findIndex((p) => p.id === draggedId);
-    if (oldIndex < 0) return;
-    const adjusted = dropIndex > oldIndex ? dropIndex - 1 : dropIndex;
-    if (adjusted === oldIndex) return;
+    // The dropIndex / oldIndex we operate with here are
+    // *content-page-relative* (indices into the filtered `contentPages`
+    // array). The bridge's `reparentNode(id, null, index)`, however,
+    // inserts into the document's root_ids list — which also contains
+    // master pages (created via `master_page_create` → `insert_node`,
+    // see `crates/kcreate_core/src/project.rs::create_master_page`).
+    //
+    // If we passed the content-page-relative index straight to the
+    // bridge it would land in the wrong slot whenever any master page
+    // is interleaved with the content pages in root order. The bot's
+    // PageNavigator BUG-0001 (PR #5) caught this.
+    //
+    // Translation: build a list of *root-level Page node ids in
+    // root_ids order* from the document tree, identify the subset
+    // that is content-only, and map the content-pages-relative drop
+    // index back onto the root_ids-relative slot. Using `nodes`
+    // (which `document_get_tree` produces in `root_ids` order, see
+    // `crates/kcreate_bridge/src/document.rs::document_get_tree`) means
+    // we never have to round-trip another IPC call.
+    const masterIdSet = new Set(masters.map((m) => m.id));
+    const rootPageIds: string[] = [];
+    for (const n of nodes) {
+      if (n.parentId !== null) continue;
+      if (n.nodeType !== "Page") continue;
+      rootPageIds.push(n.id);
+    }
+
+    const oldContentIndex = contentPages.findIndex((p) => p.id === draggedId);
+    if (oldContentIndex < 0) return;
+    // Index in `contentPages` after the user drops. If they drag down
+    // past their own slot, `contentPages.splice(oldContentIndex, 1)`
+    // shifts everything below up by one — so the post-removal target
+    // is `dropIndex - 1`.
+    const newContentIndex =
+      dropIndex > oldContentIndex ? dropIndex - 1 : dropIndex;
+    if (newContentIndex === oldContentIndex) return;
+
+    // Map content-page-relative -> root-list-relative.
+    //
+    // The picture for the bridge is the root_ids list *after* the
+    // detach (the bridge always detaches first, then inserts). So we
+    // model the same: take root_ids order, drop the dragged id, then
+    // figure out where the bridge needs to insert so that the dragged
+    // id ends up at content position `newContentIndex` once the
+    // master pages are skipped.
+    const rootIdsAfterDetach = rootPageIds.filter((id) => id !== draggedId);
+    // Walk root_ids; count content pages we've passed; when we've
+    // passed `newContentIndex` of them, that's where the insert goes.
+    let rootInsertIndex = rootIdsAfterDetach.length;
+    let contentSeen = 0;
+    for (let i = 0; i < rootIdsAfterDetach.length; i += 1) {
+      const id = rootIdsAfterDetach[i];
+      if (id === undefined) continue;
+      if (masterIdSet.has(id)) continue;
+      if (contentSeen === newContentIndex) {
+        rootInsertIndex = i;
+        break;
+      }
+      contentSeen += 1;
+    }
+
     setBusy(true);
     try {
       await window.kcreate.layoutStudio.reparentNode(
         draggedId,
         null,
-        adjusted,
+        rootInsertIndex,
       );
       onChanged?.();
     } catch (e) {

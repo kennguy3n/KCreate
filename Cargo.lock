@@ -1403,6 +1403,7 @@ name = "kcreate_text"
 version = "0.0.1"
 dependencies = [
  "fontdb",
+ "kcreate_core",
  "log",
  "parking_lot",
  "rustybuzz",

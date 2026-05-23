@@ -1561,13 +1561,22 @@ pub fn text_frame_update(node_id: Uuid, options_json: &str) -> Result<()> {
 /// point exists so the inspector / debug overlay can show line
 /// outlines and overflow without owning a font manager in TS.
 ///
-/// Text is read from the node's `metadata["text"]` (string) and from
-/// the node's bounds. Style is read from `metadata["text_style"]`
-/// (mirroring the renderer's contract); missing fields fall back to
-/// `TextStyle::default()` so the UI never crashes on freshly created
-/// nodes that haven't had a style set yet.
+/// Text + font are read from the node's canonical
+/// [`kcreate_export::TextLayerMeta`] at the `TEXT_LAYER_METADATA_KEY`
+/// metadata slot — that is the same payload `scene_sync` reads to
+/// drive the renderer, so the layout inspector now sees exactly what
+/// the canvas sees. `line_height` defaults to 1.25 because
+/// `TextLayerMeta` does not yet carry it; if a caller wants a
+/// different leading they can override via the optional
+/// `metadata["text_style"]` slot (a `TextStyleWire` JSON object).
+///
+/// For backward compatibility with the older "bare string at
+/// metadata\[text\]" convention (still used by some bridge tests),
+/// the code falls back to reading the metadata value as a JSON string
+/// if it cannot be deserialised as a `TextLayerMeta`.
 pub fn text_layout_compute(node_id: Uuid) -> Result<String> {
     use kcreate_core::node::TextFrameOptions;
+    use kcreate_export::TextLayerMeta;
     use kcreate_text::{layout_paragraph, HyphenationPatterns, TextStyle, EN_US_PATTERNS};
 
     let (text, style, frame, bounds) = with_workspace(|ws| {
@@ -1582,18 +1591,46 @@ pub fn text_layout_compute(node_id: Uuid) -> Result<String> {
                 value: format!("node {node_id} is not a TextLayer"),
             });
         }
-        let text = node
-            .metadata
-            .get("text")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let style: TextStyle = node
+        // Resolve text + base font from the canonical TextLayerMeta
+        // slot. Fall back to the legacy bare-string convention if the
+        // value at `metadata["text"]` isn't a TextLayerMeta object —
+        // older tests still write a raw string there.
+        let raw_meta = node.metadata.get(crate::scene_sync::TEXT_LAYER_METADATA_KEY);
+        let (text, font_family, font_size) = match raw_meta {
+            Some(v) => match serde_json::from_value::<TextLayerMeta>(v.clone()) {
+                Ok(meta) => (meta.text, Some(meta.font_family), Some(meta.font_size)),
+                Err(_) => (
+                    v.as_str().unwrap_or("").to_string(),
+                    None::<String>,
+                    None::<f32>,
+                ),
+            },
+            None => (String::new(), None::<String>, None::<f32>),
+        };
+
+        // `metadata["text_style"]` is the optional override slot
+        // (line_height + any overrides on font_family / font_size).
+        let mut style: TextStyle = node
             .metadata
             .get("text_style")
             .and_then(|v| serde_json::from_value::<TextStyleWire>(v.clone()).ok())
             .map(TextStyle::from)
             .unwrap_or_default();
+        if let Some(family) = font_family {
+            // Only overwrite from TextLayerMeta if the override slot
+            // did not provide a non-default family. We treat the
+            // TextStyle default's family ("sans-serif") as "no
+            // override supplied".
+            if style.font_family == TextStyle::default().font_family {
+                style.font_family = family;
+            }
+        }
+        if let Some(size) = font_size {
+            if (style.font_size - TextStyle::default().font_size).abs() < f32::EPSILON {
+                style.font_size = size;
+            }
+        }
+
         let frame: TextFrameOptions = node.text_frame_options();
         Ok((text, style, frame, node.bounds))
     })?;

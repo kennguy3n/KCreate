@@ -10,7 +10,7 @@
 //     SHA-256-verifies (when a canonical hash is pinned) and
 //     atomically renames the file into `~/.kcreate/models/`.
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import type {
   LlmStatus,
@@ -39,6 +39,15 @@ export function ModelManager({ onStatus }: ModelManagerProps): JSX.Element {
   const [modelPath, setModelPath] = useState("");
   const [busy, setBusy] = useState(false);
   const [packs, setPacks] = useState<ModelPack[]>([]);
+  /// Synchronous reentry-guard against the small window where the
+  /// user double-clicks Install/Uninstall fast enough that React has
+  /// not yet committed the `busy=true` state into the DOM. The Rust
+  /// installer writes a `.tmp` file and renames atomically, so two
+  /// concurrent `installModelPack` calls would race on that
+  /// scratch file. The ref short-circuits the second call *before*
+  /// any IPC fires, eliminating the race in a way the React batching
+  /// scheduler cannot defeat.
+  const inFlightPackId = useRef<string | null>(null);
 
   const refresh = useCallback(async () => {
     try {
@@ -84,6 +93,14 @@ export function ModelManager({ onStatus }: ModelManagerProps): JSX.Element {
   const installPack = useCallback(
     async (pack: ModelPack) => {
       if (pack.kind === "built_in") return;
+      // Synchronous reentry-guard — see `inFlightPackId` docstring.
+      if (inFlightPackId.current !== null) {
+        onStatus(
+          `${pack.name}: another install/uninstall is already in flight; ignoring duplicate click.`,
+        );
+        return;
+      }
+      inFlightPackId.current = pack.id;
       setBusy(true);
       onStatus(`${pack.name}: pick the downloaded weights file…`);
       try {
@@ -110,6 +127,7 @@ export function ModelManager({ onStatus }: ModelManagerProps): JSX.Element {
       } catch (e) {
         onStatus(`${pack.name}: install failed: ${errMsg(e)}`);
       } finally {
+        inFlightPackId.current = null;
         setBusy(false);
       }
     },
@@ -119,6 +137,13 @@ export function ModelManager({ onStatus }: ModelManagerProps): JSX.Element {
   const uninstallPack = useCallback(
     async (pack: ModelPack) => {
       if (pack.kind === "built_in") return;
+      if (inFlightPackId.current !== null) {
+        onStatus(
+          `${pack.name}: another install/uninstall is already in flight; ignoring duplicate click.`,
+        );
+        return;
+      }
+      inFlightPackId.current = pack.id;
       setBusy(true);
       onStatus(`${pack.name}: removing…`);
       try {
@@ -128,6 +153,7 @@ export function ModelManager({ onStatus }: ModelManagerProps): JSX.Element {
       } catch (e) {
         onStatus(`${pack.name}: uninstall failed: ${errMsg(e)}`);
       } finally {
+        inFlightPackId.current = null;
         setBusy(false);
       }
     },

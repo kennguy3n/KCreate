@@ -291,13 +291,44 @@ fn read_info(doc: &Document) -> (Option<String>, Option<String>) {
     (read(b"Title"), read(b"Author"))
 }
 
-/// Read a page's MediaBox in PDF points. Returns `None` if the box
-/// is missing — the caller falls back to US Letter and emits a
+/// Read a page's MediaBox in PDF points, **following the inheritance
+/// chain** per PDF 1.7 §7.7.3.4. MediaBox (along with CropBox,
+/// Resources, and Rotate) is one of the four page attributes a page
+/// can inherit from any ancestor Pages node — many multi-page PDFs
+/// declare the MediaBox once on the root Pages object and rely on
+/// every page to inherit it, so reading only the page dict misses
+/// the box on the majority of real-world documents.
+///
+/// Returns `None` if the box is missing or malformed all the way up
+/// to the root — the caller falls back to US Letter and emits a
 /// warning. MediaBox is `[llx lly urx ury]`; the importer takes
 /// `width = urx - llx`, `height = ury - lly` so non-zero-origin
 /// MediaBoxes still produce correct page sizes.
 fn read_media_box(doc: &Document, page_id: ObjectId) -> Option<(f64, f64)> {
-    let dict = doc.get_dictionary(page_id).ok()?;
+    // Cap the parent walk so a deliberately-cyclic PDF can't cause an
+    // infinite loop. Real Page trees are shallow (≤ 10 levels even
+    // for huge documents), so 32 is comfortably above the worst case
+    // and still bounded.
+    let mut current_id = page_id;
+    for _ in 0..32 {
+        let Ok(dict) = doc.get_dictionary(current_id) else {
+            return None;
+        };
+        if let Some(box_) = media_box_from_dict(dict) {
+            return Some(box_);
+        }
+        match dict.get(b"Parent").and_then(Object::as_reference) {
+            Ok(parent_id) if parent_id != current_id => current_id = parent_id,
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// Pull a MediaBox tuple out of a single page-tree dict, without
+/// walking the parent chain. Returns `None` if the entry is missing,
+/// not a 4-element array of numbers, or has zero / negative size.
+fn media_box_from_dict(dict: &lopdf::Dictionary) -> Option<(f64, f64)> {
     let arr = dict.get(b"MediaBox").ok()?.as_array().ok()?;
     if arr.len() != 4 {
         return None;
@@ -450,13 +481,23 @@ fn decode_image_xobject(
     if filter_chain.is_empty()
         || filter_chain.iter().all(|f| f == "FlateDecode")
     {
-        let raw = stream
-            .decompressed_content()
-            .or_else(|_| Ok::<Vec<u8>, lopdf::Error>(stream.content.clone()))
-            .map_err(|_| PdfImportWarning::UnsupportedImageFilter {
+        // Decompress the Flate filter. If decompression fails (e.g.
+        // the stream is corrupt), surface it as an
+        // `UnsupportedImageFilter` so the user sees "Flate
+        // decompression failed" rather than the misleading
+        // `UnsupportedImageColorSpace` that the later byte-length
+        // check would otherwise produce. We do NOT fall back to the
+        // raw compressed bytes: that just feeds compressed data into
+        // the pixel-buffer path where every downstream check fails
+        // in a confusing way (see Devin Review finding "FlateDecode
+        // fallback silently passes compressed bytes as raw pixels"
+        // on PR #7).
+        let raw = stream.decompressed_content().map_err(|e| {
+            PdfImportWarning::UnsupportedImageFilter {
                 page_index,
-                filter_chain: filter_str.clone(),
-            })?;
+                filter_chain: format!("{filter_str} (decompression failed: {e})"),
+            }
+        })?;
         let color_space = dict
             .get(b"ColorSpace")
             .and_then(|o| match o {
@@ -713,6 +754,87 @@ mod tests {
         assert_eq!(
             ExtractedImageData::Png { bytes: vec![] }.mime_type(),
             "image/png"
+        );
+    }
+
+    /// Build a 2-page PDF where MediaBox lives only on the root
+    /// Pages node, not on the individual Page dicts. Real-world PDF
+    /// authoring tools commonly do this for uniformly-sized documents
+    /// (a single MediaBox on Pages is enough; per-page boxes would be
+    /// redundant). The importer must walk the Parent chain to find
+    /// it.
+    fn write_inherited_media_box_pdf() -> tempfile::NamedTempFile {
+        let mut doc = Document::with_version("1.7");
+        let pages_id = doc.new_object_id();
+        // Page dicts deliberately omit MediaBox so they must inherit
+        // it from the parent Pages node.
+        let empty_stream_a = doc.add_object(Object::Stream(Stream::new(
+            Dictionary::new(),
+            b"".to_vec(),
+        )));
+        let page_a = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "Resources" => dictionary! {},
+            "Contents" => empty_stream_a,
+        });
+        let empty_stream_b = doc.add_object(Object::Stream(Stream::new(
+            Dictionary::new(),
+            b"".to_vec(),
+        )));
+        let page_b = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "Resources" => dictionary! {},
+            "Contents" => empty_stream_b,
+        });
+        // MediaBox declared ONLY on the parent Pages node — A5 (420 × 595 pt).
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Kids" => vec![page_a.into(), page_b.into()],
+                "Count" => 2,
+                "MediaBox" => vec![0.into(), 0.into(), 420.into(), 595.into()],
+            }),
+        );
+        let catalog_id = doc.add_object(dictionary! {
+            "Type" => "Catalog",
+            "Pages" => pages_id,
+        });
+        doc.trailer.set("Root", catalog_id);
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        doc.save(tmp.path()).unwrap();
+        tmp
+    }
+
+    #[test]
+    fn import_resolves_inherited_media_box() {
+        let tmp = write_inherited_media_box_pdf();
+        let imported = import_pdf(tmp.path()).unwrap();
+        assert_eq!(imported.pages.len(), 2);
+        // Both pages must report A5 dimensions, not the US Letter
+        // fallback (612 × 792).
+        for (i, page) in imported.pages.iter().enumerate() {
+            assert!(
+                (page.width_pt - 420.0).abs() < 0.001,
+                "page {i} width: expected 420 pt (A5), got {}",
+                page.width_pt,
+            );
+            assert!(
+                (page.height_pt - 595.0).abs() < 0.001,
+                "page {i} height: expected 595 pt (A5), got {}",
+                page.height_pt,
+            );
+        }
+        // No MissingMediaBox warnings — we resolved through Parent.
+        assert!(
+            !imported
+                .warnings
+                .iter()
+                .any(|w| matches!(w, PdfImportWarning::MissingMediaBox { .. })),
+            "should not warn about missing MediaBox; inheritance resolves it",
         );
     }
 }

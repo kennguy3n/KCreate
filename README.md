@@ -148,7 +148,12 @@ KCreate/
 │   │                              pack registry, screenshot-to-layout
 │   ├── kcreate_mcp/              Loopback-only MCP server (3 tools) + permission store
 │   │                              (Once / Always / Denied)
-│   ├── kcreate_plugin/           WASM plugin sandbox (wasmi 0.42, deny-by-default host ABI)
+│   ├── kcreate_plugin/           WASM plugin sandbox (wasmi 0.42, deny-by-default host ABI;
+│   │                              Phase 2 extended ABI + Ed25519 manifest signing +
+│   │                              JS panel runtime)
+│   ├── kcreate_collab/           Phase 3 collaboration protocol foundation (peer identity,
+│   │                              Lamport clock, signed envelopes, conflict resolver,
+│   │                              project session). Kept OUT of editing-path deps.
 │   └── kcreate_tests/            Cross-crate integration tests
 ├── PROPOSAL.md                   Product specification
 ├── ARCHITECTURE.md               Technical architecture

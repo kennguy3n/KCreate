@@ -553,6 +553,79 @@ Phase 2 wire format is intentionally JSON-only; a richer typed API
 | JS panel | Electron sandbox | Side panels, prompts, simple tools     | Signed; restricted IPC.|
 | Native   | dynamic library  | Heavy lifting (image filters, codecs)  | Signed + user opt-in.  |
 
+## 17a. PDF import pipeline
+
+`kcreate_export::pdf_import` is the inbound counterpart to the
+`printpdf`-based exporter. It is intentionally **structural** — it
+does not run a content-stream interpreter — and maps the structured
+parts of a PDF onto KCreate's node graph 1:1:
+
+- **Page geometry.** Each PDF page becomes one `ImportedPdfPage`
+  carrying width/height in PDF points. `read_media_box` walks the
+  `/Parent` chain per PDF 1.7 §7.7.3.4 so inherited MediaBoxes
+  resolve correctly (capped to 32 hops to defeat cyclic page
+  trees). Falls back to US Letter with a `MissingMediaBox` warning
+  only when no ancestor declares the box.
+- **Embedded images.** Every `Image` XObject referenced by every
+  page's `Resources` is decoded:
+  - `DCTDecode` (JPEG) passes through verbatim as a JPEG blob.
+  - `FlateDecode` over an uncompressed pixel buffer is decoded
+    (DeviceRGB / DeviceGray / DeviceCMYK at 8 bpc) and re-encoded
+    as PNG. Other bpcs and unknown color spaces are surfaced as
+    `UnsupportedImageColorSpace`. Decompression failures are
+    surfaced as `UnsupportedImageFilter` with the lopdf error
+    embedded — never silently swallowed.
+- **Title / Author** are read from the PDF `Info` dictionary.
+
+Bridge: `import_pdf(path) -> ImportedProject`. The renderer uses
+this from the EditorPage "Import PDF" action; the importer is
+purely additive (creates a new project) and never mutates an
+existing one.
+
+## 17b. Collaboration protocol foundation (Phase 3, ships in PR #7)
+
+`kcreate_collab` is the *protocol-only* foundation for multi-peer
+editing. It is deliberately kept **outside the editing-path
+dependency tree** so a future transport (QUIC + mDNS discovery,
+WebRTC, etc.) can pull in network crates without contaminating the
+local-first invariant enforced by
+`crates/kcreate_tests/tests/local_first.rs`.
+
+Modules:
+
+- `peer` — `PeerId` (16-byte BLAKE3 short id, base64url
+  encoded; deterministic per Ed25519 keypair), `PeerFingerprint`
+  (8 × 4 uppercase hex groups, for the UI trust dialog),
+  `PeerIdentity` (public identity broadcast on the wire), `PeerKey`
+  (local-only signing-key handle, never serialised).
+- `clock` — `LamportClock`: 64-bit monotonic counter. `tick()`
+  increments before send; `observe(remote)` is `max(local, remote)
+  + 1` on receive. Panics on overflow (≈ 584 years at 1 ns / event).
+- `envelope` — `Envelope<T>` and `SignedPayload<T>`: Ed25519-signed
+  wrappers carrying `protocol_version`, `from`, `clock`, `nonce`,
+  `payload`, `signature`. PROTOCOL_VERSION = 1. Canonical signing
+  via deterministic JSON; `seal()` / `open()` detect tampering,
+  wrong keys, and version mismatch.
+- `message` — `Message` enum: `Hello`, `Welcome` (accept/reject
+  with reason), `OperationBroadcast` (real `kcreate_core::Operation`
+  payload, **not** a stub), `Presence` (cursor + selection),
+  `Heartbeat`, `Goodbye` (Normal / Kicked / Error).
+- `conflict` — `ConflictResolver` trait + `LastWriterWinsResolver`:
+  disjoint `affected_nodes()` sets → `KeepBoth`; otherwise compare
+  Lamport clocks, then break ties by larger peer-id.
+- `session` — `ProjectSession`: holds the local identity, project
+  id, clock, trusted-peers map, and per-peer replay window
+  (`recent_nonces: VecDeque`). Seals outgoing messages, ingests
+  envelope JSON, rejects untrusted peers / wrong project /
+  replayed nonces. `SessionConfig` caps the replay window (32 K
+  default) and the trusted-peer count (256 default).
+
+Tests: 42 unit tests across the six modules — peer-id determinism,
+fingerprint formatting, Lamport ordering preservation,
+seal/open round-trips, tampering detection, version mismatch,
+LWW tiebreaks across disjoint and overlapping affected-node sets,
+replay-window rejection, project-id scoping, peer cap.
+
 ## 18. Resource optimization
 
 - **Startup.** Lazy-load model packs; precompile no shaders we won't
@@ -602,17 +675,25 @@ crates/
 ├── kcreate_layout/      # flex + grid solvers (pure, deterministic)                        [EXISTS]
 ├── kcreate_mcp/         # local-loopback MCP server (3 tools) + `permissions::McpPermissionStore`
 │                        # (Once / Always / Denied, JSON on-disk persistence)               [EXISTS]
-└── kcreate_plugin/      # WASM plugin sandbox (wasmi 0.42, deny-by-default host ABI:
-                         # kcreate_log, kcreate_get_input{,_len}, kcreate_set_output;
-                         # page-count ResourceLimiter; no FS / network / DOM access).
-                         # Manifest + registry persist enabled state to JSON.               [EXISTS]
+├── kcreate_plugin/      # WASM plugin sandbox (wasmi 0.42, deny-by-default host ABI:
+│                        # kcreate_log, kcreate_get_input{,_len}, kcreate_set_output,
+│                        # plus the Phase 2 extended ABI: kcreate_read_document,
+│                        # kcreate_read_asset, kcreate_write_proposal). JS panel
+│                        # runtime and Ed25519 manifest signing also live here.              [EXISTS]
+└── kcreate_collab/      # Phase 3 collaboration protocol foundation (peer identity,
+                         # Lamport clock, signed envelopes, conflict resolver,
+                         # session w/ replay-window). Transport-agnostic, kept OUT
+                         # of the editing-path dependency tree.                              [EXISTS]
 ```
 
 Planned (Phase 3+):
 
 ```
 crates/
-└── kcreate_audit/       # operation log persistence, AI action audit
+├── kcreate_audit/       # operation log persistence, AI action audit
+└── kcreate_collab_net/  # actual transport (QUIC + mDNS) that imports kcreate_collab
+                         # — separate crate so the local-first sentinel keeps the
+                         # editing path network-free.
 ```
 
 ### What is built vs. planned

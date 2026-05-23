@@ -135,9 +135,9 @@ Export Center, Local AI Core Pack.
 - [x] TemplatePicker UI (modal with card grid, preview pane)
 - [x] `project_is_untouched` bridge probe (fresh-project picker support)
 
-## Phase 2 — Professional Workflows | In progress | ~55%
+## Phase 2 — Professional Workflows | Complete | 100%
 
-### Block A–B completed in this iteration (PR #6)
+### Block A–B completed in PR #6
 - [x] Layout Studio foundation (PR #5 — page document model, master pages,
       page navigator, template picker)
 - [x] Deck / proposal templates — 3 built-in (Pitch Deck, Proposal,
@@ -187,25 +187,70 @@ Export Center, Local AI Core Pack.
 - [x] Benchmarks: `kcreate_export::preflight` Criterion bench;
       `kcreate_ai::{upscale, palette, smart_select}` Criterion benches.
 
-### Remaining for Phase 2 ship
-- [ ] CMYK / ICC color management foundation
-- [ ] Advanced text frame features (text wrap, hyphenation, OpenType)
-- [ ] Full WASM plugin API (Phase 2 ships JSON I/O sandbox only)
-- [ ] JS panel plugin runtime
-- [ ] Native plugin signing + verification
-- [ ] Neural model downloads (ESRGAN upscale, u2net, SAM segment) —
-      registry declares packs as available but download/install is
-      deferred to Phase 3
+### Block A–I completed in this iteration (PR #7)
+- [x] **Block A** — CMYK / ICC color management foundation
+      (`kcreate_core::color`, `IccProfile`, soft-proof overlay,
+      `ColorSettingsPanel`).
+- [x] **Block B** — Advanced text frame: multi-column paragraph
+      layout, embedded en-US Liang hyphenation, OpenType feature
+      shaper (9 booleans + ss01–ss20), `TextFramePanel` +
+      `OpenTypePanel` UI.
+- [x] **Block C** — Extended WASM plugin ABI (`kcreate_read_document`,
+      `kcreate_read_asset`, `kcreate_write_proposal`) with permission
+      gating + `PluginContext` proposal model (validated, applied
+      as recorded operations — fully undoable). 3 reference plugins
+      (`hello`, `node_counter`, `auto_rename`).
+- [x] **Block D** — JS panel plugin runtime: sandboxed Electron
+      `WebContentsView` per plugin, strict CSP, isolated session
+      partition (`plugin-panel:<id>`), `window.kcreatePlugin.sendMessage`
+      preload, bridge mediates every panel message.
+- [x] **Block E** — Native plugin Ed25519 signing + verification
+      (`kcreate_plugin::signing`), manifest signature, `PluginManager`
+      shows trust status (Signed by trusted publisher / Unsigned).
+- [x] **Block F** — Neural model downloads: pick-file install flow
+      (user downloads weights out-of-band, points installer at
+      file; BLAKE3-canonicalised SHA-256 verify; atomic rename into
+      `~/.kcreate/models/`).
+- [x] **Block G** — PDF import (`kcreate_export::pdf_import`):
+      MediaBox geometry with full Pages-tree inheritance, JPEG
+      passthrough, Flate-uncompressed pixel-buffer → PNG
+      (DeviceRGB / DeviceGray / DeviceCMYK), Title/Author metadata,
+      `import_pdf` IPC, EditorPage "Import PDF" path.
+- [x] **Block H (Phase 3 foundation, Task 28)** — Collaboration
+      protocol types in `kcreate_collab` (peer identity, Lamport
+      clock, Ed25519-signed envelopes, Hello/Welcome/Op/Presence/
+      Heartbeat/Goodbye messages, LWW conflict resolver, project
+      session with replay-window + nonce management). Kept **out
+      of the editing-path dependency tree** so a future transport
+      can pull QUIC / mDNS without contaminating local-first.
+- [x] **Block I** — CI updates + documentation sync (this commit).
 
-## Phase 3 — Advanced Suite | Not started
+## Phase 3 — Advanced Suite | Foundation landed
 
-- Deeper print support, stronger PDF import
-- Optional local collaboration over LAN
-- Advanced inpainting, local style model packs (ESRGAN, SAM, u2net)
-- Marketplace for vetted local templates
+Protocol-level work shipped in Phase 2 PR #7 to keep the editing
+path stable while collab + advanced workflows are built out:
+
+- [x] Collaboration protocol types (`kcreate_collab`) — see Block H.
+- [ ] LAN transport (QUIC + mDNS discovery) — separate crate, isolated
+      from editing path.
+- [ ] Operational CRDT semantics on top of `Operation`.
+- [ ] Deeper print support (spot colors, overprint, trapping).
+- [ ] Advanced inpainting, local style model packs (ESRGAN, SAM,
+      u2net) — registry already declares them; install path lands
+      with the model download UI.
+- [ ] Marketplace for vetted local templates.
 
 ## Changelog
 
+- **2026-05-22 (PR #7)** — Phase 2 complete + Phase 3 foundation:
+  Block A (CMYK/ICC), Block B (advanced text + hyphenation +
+  OpenType), Block C (extended WASM ABI + proposal model), Block D
+  (JS panel sandbox), Block E (Ed25519 plugin signing), Block F
+  (neural model install), Block G (PDF import with inherited
+  MediaBox + Flate/JPEG image extraction), Block H (kcreate_collab
+  protocol types — peer identity, Lamport clock, signed envelopes,
+  LWW conflict resolver, replay-window session), Block I (this
+  doc + CI sync).
 - **2026-05-22** — Block B–H landed: PDF preflight, icon pack,
   parallel batch w/ async cancel, AI upscale/palette/smart-select +
   model registry, kcreate_plugin (wasmi sandbox), MCP permission

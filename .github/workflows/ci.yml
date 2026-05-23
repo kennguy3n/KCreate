@@ -57,6 +57,18 @@ jobs:
         run: cargo check --workspace --all-targets
       - name: cargo test
         run: cargo test --workspace --all-targets
+      # Hard gate the local-first invariant. `cargo test --workspace`
+      # already exercises this, but running it as a discrete step
+      # makes the failure mode unmistakable in the CI summary the day
+      # someone accidentally pulls a network crate into the editing
+      # path.
+      - name: local-first sentinel
+        run: cargo test -p kcreate_tests --test local_first
+      # Phase 3 foundation: kcreate_collab is intentionally isolated
+      # from the editing path. Run its tests in their own step so a
+      # protocol regression cannot hide behind other crates' output.
+      - name: collab protocol tests
+        run: cargo test -p kcreate_collab --all-targets
       - name: cargo bench (compile only)
         run: |
           cargo bench -p kcreate_renderer --no-run
@@ -105,6 +117,10 @@ jobs:
         run: cargo check --workspace --all-targets
       - name: cargo test
         run: cargo test --workspace --all-targets
+      - name: local-first sentinel
+        run: cargo test -p kcreate_tests --test local_first
+      - name: collab protocol tests
+        run: cargo test -p kcreate_collab --all-targets
       - name: cargo bench (compile only)
         run: |
           cargo bench -p kcreate_renderer --no-run

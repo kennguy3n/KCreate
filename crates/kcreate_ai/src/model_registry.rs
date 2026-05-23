@@ -419,7 +419,7 @@ pub fn install_model_pack(
         });
     }
 
-    fs::rename(&tmp, &dest).map_err(|e| InstallError::DestIo {
+    atomic_replace(&tmp, &dest).map_err(|e| InstallError::DestIo {
         path: dest.display().to_string(),
         source: e,
     })?;
@@ -452,6 +452,35 @@ pub fn uninstall_model_pack(pack_id: &str, models_dir: &Path) -> Result<(), Inst
             path: dest.display().to_string(),
             source: e,
         }),
+    }
+}
+
+/// Atomically replace `dest` with `src` across Unix and Windows.
+///
+/// On Unix, [`fs::rename`] already performs an atomic replace if `dest`
+/// exists. On Windows, the same call uses `MoveFileExW` with
+/// `MOVEFILE_REPLACE_EXISTING` since Rust 1.78, but it can still fail
+/// with [`io::ErrorKind::AlreadyExists`] in edge cases — for example
+/// when `dest` is held open by another process, or on older NTFS
+/// configurations exposed via mounted SMB shares.
+///
+/// The bot's flagged scenario ("the `.tmp` was cleaned up but the dest
+/// exists" on Windows during crash recovery) lands in exactly this
+/// fallback path. We resolve it by removing `dest` and retrying the
+/// rename. This is *not* atomic in the strict sense (there is a brief
+/// window where `dest` is missing), but the alternative — leaving the
+/// install in a broken state where the user can never re-install — is
+/// worse than a sub-millisecond race that only matters if another
+/// reader was already mid-load when the user clicked "install" on the
+/// same pack a second time.
+fn atomic_replace(src: &Path, dest: &Path) -> io::Result<()> {
+    match fs::rename(src, dest) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+            fs::remove_file(dest)?;
+            fs::rename(src, dest)
+        }
+        Err(e) => Err(e),
     }
 }
 
@@ -685,6 +714,36 @@ mod tests {
         .unwrap_err();
         assert!(matches!(err, InstallError::ChecksumMismatch { .. }));
         assert!(!models.join("u2net.onnx").exists());
+        assert!(!models.join("u2net.onnx.tmp").exists());
+    }
+
+    /// Re-installing on top of an existing file succeeds. On Unix
+    /// this just exercises `fs::rename`'s atomic-replace path; on
+    /// Windows it covers the fallback in [`atomic_replace`] for the
+    /// case where `fs::rename` would otherwise return
+    /// [`io::ErrorKind::AlreadyExists`]. Either way, the final byte
+    /// content must be the *new* source, not the stale destination
+    /// (Devin Review BUG / PR #7).
+    #[test]
+    fn install_replaces_existing_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let models = dir.path().join("models");
+
+        let src_old = dir.path().join("u2net-old.onnx");
+        fs::write(&src_old, b"stale-bytes").unwrap();
+        install_model_pack("bg_remove_u2net", &src_old, &models).unwrap();
+        assert_eq!(fs::read(models.join("u2net.onnx")).unwrap(), b"stale-bytes",);
+
+        // Re-install with new bytes on top of the existing file.
+        let src_new = dir.path().join("u2net-new.onnx");
+        fs::write(&src_new, b"fresh-bytes").unwrap();
+        let report = install_model_pack("bg_remove_u2net", &src_new, &models).unwrap();
+        assert_eq!(report.size_bytes, b"fresh-bytes".len() as u64);
+        assert_eq!(
+            fs::read(models.join("u2net.onnx")).unwrap(),
+            b"fresh-bytes",
+            "re-install must overwrite the destination atomically"
+        );
         assert!(!models.join("u2net.onnx.tmp").exists());
     }
 

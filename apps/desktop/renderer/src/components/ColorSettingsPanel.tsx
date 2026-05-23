@@ -84,8 +84,23 @@ export function ColorSettingsPanel({
     }
   }, []);
 
+  // Subscribe to push-broadcast settings changes so the panel stays in
+  // sync with the document state when another path mutates the
+  // settings — most importantly an undo / redo of a
+  // `color_settings_update` op (see
+  // `apps/desktop/main/src/main.ts::broadcastForCommand`). Without this
+  // subscription the panel would keep displaying the optimistic
+  // `setSettings(next)` value from `commit` even after the workspace
+  // reverted, matching the stale-dropdown bug Devin Review flagged on
+  // commit 7b207ed.
   useEffect(() => {
     void load();
+    const unsubscribe = window.kcreate.color.onSettingsChanged(() => {
+      void load();
+    });
+    return () => {
+      unsubscribe();
+    };
   }, [load]);
 
   const commit = useCallback(

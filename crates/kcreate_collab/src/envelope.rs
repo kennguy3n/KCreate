@@ -23,7 +23,7 @@
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
-use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
@@ -148,8 +148,16 @@ where
             .try_into()
             .map_err(|_| CollabError::BadSignatureLength)?;
         let sig = Signature::from_bytes(&sig_arr);
+        // `verify_strict` rejects malleable Ed25519 signatures (non-canonical
+        // `s` scalars, small-subgroup public-key components) per RFC 8032
+        // §5.1.7 and matches the verification used by the plugin trust
+        // store in `kcreate_plugin::trust`. The permissive `verify`
+        // would accept multiple valid signatures for the same message
+        // — which, even with our per-peer nonce replay window, weakens
+        // the documented security posture of the collab protocol
+        // (Devin Review BUG / PR #7).
         verifying_key
-            .verify(&signing_bytes, &sig)
+            .verify_strict(&signing_bytes, &sig)
             .map_err(|_| CollabError::SignatureMismatch)?;
         Ok(&self.payload)
     }
@@ -327,6 +335,59 @@ mod tests {
         // And signatures still verify after a JSON round-trip.
         let opened = back.open(&k.verifying_key()).unwrap();
         assert_eq!(opened.text, "round");
+    }
+
+    /// Ed25519 group order L = 2^252 + 27742317777372353535851937790883648493,
+    /// little-endian bytes (RFC 8032 §5.1). Used to construct a
+    /// malleable signature in [`malleable_signature_rejected_by_strict_verify`].
+    const ED25519_L_LE: [u8; 32] = [
+        0xed, 0xd3, 0xf5, 0x5c, 0x1a, 0x63, 0x12, 0x58, 0xd6, 0x9c, 0xf7, 0xa2, 0xde, 0xf9, 0xde,
+        0x14, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x10,
+    ];
+
+    /// Malleable Ed25519 signatures (s' = s + L, where L is the
+    /// curve's group order) must be rejected. RFC 8032 §5.1.7's
+    /// non-strict verification accepts both the canonical and the
+    /// malleated form; `verify_strict` (used here since the Devin
+    /// Review fix) requires `s < L` and so rejects the malleated
+    /// form. Pinning this test means a future refactor that switches
+    /// back to permissive `verify` will fail loudly instead of
+    /// silently weakening the protocol's authenticity guarantee
+    /// (Devin Review BUG / PR #7).
+    #[test]
+    fn malleable_signature_rejected_by_strict_verify() {
+        let k = key(60);
+        let env = Envelope::seal(
+            k.peer_id(),
+            LamportClock::from_raw(1),
+            [4u8; NONCE_BYTES],
+            Hello { text: "ok".into() },
+            k.signing_key(),
+        )
+        .unwrap();
+
+        // Decode signature; layout is R || s with each 32 bytes.
+        let mut sig_bytes = URL_SAFE_NO_PAD.decode(env.signature.as_bytes()).unwrap();
+        assert_eq!(sig_bytes.len(), 64);
+
+        // s' = s + L (mod 2^256). For canonical signatures s < L,
+        // so s + L < 2^253 ≪ 2^256, no carry out of byte 31.
+        let mut carry: u16 = 0;
+        for i in 0..32 {
+            let sum = u16::from(sig_bytes[32 + i]) + u16::from(ED25519_L_LE[i]) + carry;
+            sig_bytes[32 + i] = (sum & 0xff) as u8;
+            carry = sum >> 8;
+        }
+        assert_eq!(carry, 0, "s + L unexpectedly overflowed 256 bits");
+
+        let mut env_bad = env.clone();
+        env_bad.signature = URL_SAFE_NO_PAD.encode(&sig_bytes);
+        assert_ne!(env_bad.signature, env.signature);
+        assert!(matches!(
+            env_bad.open(&k.verifying_key()),
+            Err(CollabError::SignatureMismatch)
+        ));
     }
 
     #[test]

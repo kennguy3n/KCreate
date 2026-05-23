@@ -19,11 +19,25 @@ import type { SessionEvent, SessionLockEntry } from "../../../shared/scene";
  * matches the "no locks, nothing to grey out" UX.
  *
  * The hook subscribes to **every** session event but only acts on
- * the `locksChanged` variant. Cursor / presence updates are far
- * higher-volume than lock claims, but the renderer-side filter is
- * a single discriminator check (`ev.kind === "locksChanged"`) so
- * the overhead is negligible compared to keeping a dedicated
- * channel synced.
+ * the `locksChanged` / `peerJoined` / `peerLeft` variants. Cursor /
+ * presence updates are far higher-volume than lock claims, but the
+ * renderer-side filter is a single discriminator check so the
+ * overhead is negligible compared to keeping a dedicated channel
+ * synced.
+ *
+ * **Subscription lifecycle**: the effect uses `[]` deps and never
+ * re-subscribes. The initial `reload()` on mount fetches whatever
+ * state the bridge currently has, and the long-lived subscription
+ * picks up everything that changes after. This means the hook is
+ * **not** coupled to the session-start IPC handshake — even if the
+ * bridge never explicitly emitted a `locksChanged` event on join
+ * (it does, but this is defence-in-depth against a future change),
+ * the `peerJoined` events that fire during the welcome roster
+ * exchange would still trigger a refresh, so the lock roster
+ * always converges within one IPC round-trip of any peer-set
+ * change. The `[]` deps are deliberate: changing them would
+ * re-mount the subscription on every consumer render, which would
+ * be the actual bug.
  *
  * Returns the lock map and an `error` message that flips non-null
  * if the bridge call fails on either the initial fetch or a
@@ -88,6 +102,17 @@ export function useSessionLocks(): UseSessionLocksResult {
         // emit a `locksChanged` of its own, but we also re-fetch
         // here defensively in case the events arrive out of
         // order or one is dropped during teardown.
+        void reload();
+      } else if (ev.kind === "peerJoined") {
+        // Defence-in-depth against the hook's only implicit coupling
+        // with the bridge: if a future change ever stopped emitting
+        // `locksChanged` as part of the welcome handshake, refreshing
+        // on `peerJoined` guarantees that any locks the joining peer
+        // already holds (or that the local user holds in a host the
+        // peer is dialing into) propagate to the renderer within one
+        // IPC round-trip. The roster is a small read and lock claims
+        // are user-frequency, so the extra IPC on each join is
+        // negligible compared to the failure mode of stale state.
         void reload();
       }
     });

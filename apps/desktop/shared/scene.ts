@@ -222,6 +222,41 @@ export interface Bounds {
   height: number;
 }
 
+/**
+ * Wire-format names of `NodeType` variants that are containers (i.e.
+ * `NodeType::is_container() == true` on the Rust side, exposed via
+ * the bridge as `NodeInfo::nodeType`).
+ *
+ * **Lockstep contract**: this constant mirrors
+ * `kcreate_core::node::CONTAINER_NODE_WIRE_NAMES` in
+ * `crates/kcreate_core/src/node.rs`. If you change `is_container()`
+ * (or add/remove a `NodeType` variant) you must update three things
+ * together: (1) the Rust `is_container` exhaustive match, (2) the
+ * Rust `CONTAINER_NODE_WIRE_NAMES` constant, and (3) this TS
+ * constant. The Rust test `canonical_container_wire_names_match_expected_list`
+ * fires if (1) and (2) ever diverge; consumers of (3) in the renderer
+ * (e.g. `AIAssistPanel::LAYOUT_ASSIST_CONTAINER_TYPES`) import from
+ * here so there is exactly one TS-side source of truth.
+ */
+export const CONTAINER_NODE_TYPES: ReadonlyArray<string> = Object.freeze([
+  "Page",
+  "Artboard",
+  "GroupLayer",
+  "LayoutFrame",
+  "ComponentLayer",
+]);
+
+/**
+ * Convenience predicate: is the given wire-format node-type name a
+ * container? Backs the `AIAssistPanel` layout-suggest button-eligibility
+ * gate. Implementation is a tiny constant-time `Set` lookup so callers
+ * don't pay an `indexOf` per render.
+ */
+const CONTAINER_NODE_TYPE_SET = new Set<string>(CONTAINER_NODE_TYPES);
+export function isContainerNodeType(nodeType: string): boolean {
+  return CONTAINER_NODE_TYPE_SET.has(nodeType);
+}
+
 export interface NodeInfo {
   id: string;
   nodeType: string;

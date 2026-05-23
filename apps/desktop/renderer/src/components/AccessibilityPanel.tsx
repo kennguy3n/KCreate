@@ -308,12 +308,18 @@ function AltTextSection({
     try {
       await window.kcreate.aiModel.applyAltText(nodeId, draft);
       if (requestTokenRef.current !== token) return;
-      setExisting(draft.length === 0 ? null : draft);
+      // Use `.trim().length === 0` to match the button's enable
+      // contract (`disabled={... || draft.trim().length === 0}`).
+      // Treating whitespace-only as "cleared" keeps the "Currently
+      // set" banner from showing an effectively empty value, and
+      // means anyone who later wires a non-UI call path
+      // (e.g. an MCP-tool driven invocation) gets the same
+      // semantics as a button press.
+      const isEmpty = draft.trim().length === 0;
+      setExisting(isEmpty ? null : draft);
       setPhase("ready");
       onStatus?.(
-        draft.length === 0
-          ? "Alt-text cleared."
-          : "Alt-text applied to layer.",
+        isEmpty ? "Alt-text cleared." : "Alt-text applied to layer.",
       );
     } catch (e) {
       if (requestTokenRef.current !== token) return;

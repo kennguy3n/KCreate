@@ -13,7 +13,11 @@
 
 import { useEffect, useRef, useState } from "react";
 
-import type { LayoutSuggestion, NodeInfo } from "../../../shared/scene";
+import {
+  isContainerNodeType,
+  type LayoutSuggestion,
+  type NodeInfo,
+} from "../../../shared/scene";
 import { colors, radius, spacing } from "../styles/tokens";
 import { LlmChatPanel } from "./LlmChatPanel";
 import { McpSettingsPanel } from "./McpSettingsPanel";
@@ -174,25 +178,15 @@ const separatorStyle: React.CSSProperties = {
   margin: "16px 0 8px",
 };
 
-/**
- * Container node types eligible for layout-suggest. Hoisted to
- * module scope so the `Set` allocation happens once per process
- * rather than once per render — same pattern as `BASE_TABS` in
- * `RightPanel.tsx`. The values mirror the `NodeType` discriminants
- * the bridge serialises (`crates/kcreate_core/src/node.rs`) and
- * must stay in lockstep with `NodeType::is_container()` in that
- * file: every variant returning `true` from that method belongs
- * in this set so the renderer's surface area matches the bridge's
- * accepts-any-parent contract in `ai_layout_suggest_for_artboard`
- * (`crates/kcreate_bridge/src/phase2.rs`).
- */
-const LAYOUT_ASSIST_CONTAINER_TYPES: ReadonlySet<string> = new Set([
-  "Artboard",
-  "Page",
-  "GroupLayer",
-  "LayoutFrame",
-  "ComponentLayer",
-]);
+// Container-node-type predicate (`isContainerNodeType`) lives in
+// `apps/desktop/shared/scene.ts` so there is exactly one TS-side
+// source of truth, kept in lockstep with the Rust constant
+// `kcreate_core::node::CONTAINER_NODE_WIRE_NAMES` and the
+// `NodeType::is_container()` exhaustive match. The Rust test
+// `canonical_container_wire_names_match_expected_list` (in
+// `crates/kcreate_core/src/node.rs`) fires if anyone changes the
+// container classification without also updating the wire-name
+// constant the TS file mirrors.
 
 /**
  * Layout-suggest section. Visible whenever a container node
@@ -214,7 +208,7 @@ function LayoutAssistSection({
   onStatus: (msg: string | null) => void;
 }): JSX.Element {
   const isContainer =
-    selected !== null && LAYOUT_ASSIST_CONTAINER_TYPES.has(selected.nodeType);
+    selected !== null && isContainerNodeType(selected.nodeType);
   const nodeId = isContainer ? selected.id : null;
 
   type LayoutPhase = "idle" | "running" | "done" | "error";

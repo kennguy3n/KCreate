@@ -1193,7 +1193,9 @@ export type PreflightCheckId =
   | "color_space"
   | "transparency"
   | "page_size"
-  | "shading";
+  | "shading"
+  | "font_glyph_coverage"
+  | "total_ink_coverage";
 
 export interface PreflightIssue {
   check: PreflightCheckId;
@@ -1210,6 +1212,16 @@ export interface PreflightOptions {
   requireBleedMm: number;
   allowTransparency: boolean;
   targetColorSpace: PreflightColorSpaceTarget;
+  /**
+   * Total ink coverage cap as a fraction (1.0 = 100%, 3.0 = 300%).
+   * 300% is the GRACoL / SWOP commercial offset default; web /
+   * newsprint targets use lower caps (240% — 280%). When a CMYK
+   * fill's component sum exceeds this value, the preflight engine
+   * emits a `total_ink_coverage` warning. Defaults to 3.0 (300%)
+   * when omitted by older clients — the Rust side has
+   * `#[serde(default)]`.
+   */
+  targetTotalInkCoverage: number;
 }
 
 export interface PreflightRequest {

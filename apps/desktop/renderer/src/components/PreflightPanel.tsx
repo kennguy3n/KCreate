@@ -26,6 +26,7 @@ const DEFAULTS: PreflightOptions = {
   requireBleedMm: 3,
   allowTransparency: false,
   targetColorSpace: "cmyk",
+  targetTotalInkCoverage: 3,
 };
 
 export function PreflightPanel({
@@ -100,6 +101,15 @@ export function PreflightPanel({
           label="Allow transparency"
           checked={opts.allowTransparency}
           onChange={(v) => setOpts({ ...opts, allowTransparency: v })}
+        />
+        <NumberField
+          label="Max ink (%)"
+          value={Math.round(opts.targetTotalInkCoverage * 100)}
+          onChange={(v) =>
+            // Stored as a fraction; users think in percent. 300% =
+            // GRACoL / SWOP default; 240%-280% for web/newsprint.
+            setOpts({ ...opts, targetTotalInkCoverage: v / 100 })
+          }
         />
       </div>
       <button
@@ -366,6 +376,8 @@ function labelForCheck(id: string): string {
       return "Bleed margin";
     case "font_embed":
       return "Font embed";
+    case "font_glyph_coverage":
+      return "Font glyph coverage";
     case "image_resolution":
       return "Image resolution";
     case "color_space":
@@ -374,6 +386,10 @@ function labelForCheck(id: string): string {
       return "Transparency";
     case "page_size":
       return "Page size";
+    case "shading":
+      return "Shading pattern";
+    case "total_ink_coverage":
+      return "Total ink coverage";
     default:
       return id;
   }

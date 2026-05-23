@@ -306,15 +306,39 @@ function PropertiesPanel({
     }
   };
   return (
-    <div
+    // Use a native `<fieldset disabled>` rather than a `<div>` plus
+    // hand-threaded `disabled` props. HTML cascades `disabled` from a
+    // `<fieldset disabled>` to every native form element inside it
+    // (`<input>`, `<button>`, `<select>`, `<textarea>`) and prevents
+    // their click / focus / submit handlers from firing at the
+    // platform level — covering the sub-panels (`LayoutControls`,
+    // `TextFramePanel`, `OpenTypePanel`, `SegmentedControl`’s native
+    // `<button>`s) without us having to thread a `disabled` prop
+    // through three component hierarchies and forty inputs by hand.
+    // This is the architecturally correct way to express "this group
+    // of form controls is disabled" in HTML.
+    //
+    // The redundant explicit `disabled={disabled}` on Name / Visible
+    // / Locked below serves as defence-in-depth and lets each
+    // ToggleField paint its own greyed-out cursor / pointer-events
+    // CSS without relying on `fieldset[disabled]` styling. Browsers
+    // do not propagate styles through `fieldset[disabled]` — only
+    // the `disabled` attribute itself — so visual cues (cursor,
+    // pointer-events) still want the local prop.
+    <fieldset
+      disabled={disabled}
       style={{
         display: "flex",
         flexDirection: "column",
         gap: spacing.sm,
+        // Reset the browser's default `<fieldset>` chrome so the
+        // element renders identically to the `<div>` it replaces.
+        border: "none",
+        margin: 0,
+        padding: 0,
+        minInlineSize: 0,
         // Soften the whole properties body when a remote peer
-        // holds the lock on this node. Individual inputs are also
-        // `disabled` below — the opacity hint reinforces the
-        // status visually without needing to repaint every label.
+        // holds the lock on this node.
         opacity: disabled ? 0.55 : 1,
       }}
     >
@@ -367,7 +391,7 @@ function PropertiesPanel({
           <OpenTypePanel node={node} onStatus={onStatus} />
         </>
       ) : null}
-    </div>
+    </fieldset>
   );
 }
 
@@ -378,11 +402,22 @@ function PropertiesPanel({
 /// display name is not on the lock entry itself — the bridge
 /// surfaces it through the presence channel; the renderer can
 /// look it up via `useSessionPeers` in a later iteration) plus
-/// the acquisition timestamp. We deliberately do NOT block
-/// keyboard / pointer input on the surrounding panels — soft
-/// locks are advisory; the user can still override locally if
-/// they really need to. The greying + banner is the social
-/// signal.
+/// the acquisition timestamp.
+///
+/// **Lock semantics**: the lock is *advisory at the protocol
+/// layer* — the bridge accepts edit operations from any peer
+/// regardless of which one holds the lock, last-write-wins via
+/// the LWW resolver. The renderer-side UX, however, treats a
+/// remote lock as a strong UI signal: `PropertiesPanel` is
+/// rendered inside a `<fieldset disabled>` (see the comment on
+/// that element) so every native form control in the body is
+/// disabled at the browser level. The user can still override
+/// the lock by acting outside the right panel (e.g. dragging on
+/// the canvas, which the bridge will accept) — the soft signal
+/// is the greyed body + banner + per-input disabled state, not
+/// a hard block at the input layer. The acquisition timestamp
+/// also gives the user enough context to decide whether the
+/// lock is stale.
 function LockBanner({ lock }: { lock: SessionLockEntry }): JSX.Element {
   const acquired = formatAcquired(lock.acquiredAt);
   const holderLabel = shortenPeerId(lock.holderPeerId);

@@ -1,0 +1,10 @@
+{
+  "id": "auto-rename",
+  "name": "Auto Rename",
+  "version": "0.1.0",
+  "author": "kcreate",
+  "description": "Demonstrates kcreate_write_proposal. Submits a single update_node proposal renaming a hardcoded node. The placeholder UUID is the all-zero one, which doesn't resolve — so by default this plugin proves the host's rejection path (you'll see one rejected proposal in the output envelope). Replace the UUID in the .wat data section before recompiling to make it actually rename a node.",
+  "type": "wasm",
+  "entry_point": "auto_rename.wasm",
+  "permissions": ["read_document", "write_document"]
+}

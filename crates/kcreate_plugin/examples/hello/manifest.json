@@ -1,0 +1,10 @@
+{
+  "id": "hello",
+  "name": "Hello",
+  "version": "0.1.0",
+  "author": "kcreate",
+  "description": "Smallest possible KCreate plugin — logs a greeting and sets a fixed output. Uses only the basic ABI.",
+  "type": "wasm",
+  "entry_point": "hello.wasm",
+  "permissions": []
+}

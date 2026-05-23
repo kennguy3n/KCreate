@@ -1092,4 +1092,62 @@ mod tests {
             .expect_err("must fail to link kcreate_read_document");
         assert!(matches!(err, WasmPluginError::Wasm(_)));
     }
+
+    /// The reference plugins under `crates/kcreate_plugin/examples/`
+    /// are documentation, not stub fixtures — we verify they actually
+    /// parse, compile, and execute against the real runtime so the
+    /// README stays honest. If you edit a `.wat` and break the
+    /// runtime contract, this test catches it.
+    #[test]
+    fn example_hello_plugin_runs_against_runtime() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("examples/hello/hello.wat");
+        let wasm = wat::parse_file(&path).expect("example hello.wat must compile");
+        let rt = WasmPluginRuntime::new();
+        let out = rt.execute(&wasm, "run", "", 16).expect("execute");
+        assert_eq!(out.output, "hello-output");
+        assert!(out.logs.iter().any(|l| l == "Hello from WASM"));
+    }
+
+    #[test]
+    fn example_node_counter_plugin_links_under_context() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("examples/node_counter/node_counter.wat");
+        let wasm = wat::parse_file(&path).expect("example node_counter.wat must compile");
+        let rt = WasmPluginRuntime::new();
+        let doc = serde_json::json!({"root": null, "nodes": {}});
+        let ctx = PluginContext::empty("node-counter")
+            .with_snapshot(doc)
+            .grant(PluginPermission::ReadDocument);
+        let out = rt
+            .execute_with_context(&wasm, "run", "", 16, ctx)
+            .expect("execute_with_context");
+        // The list_nodes query against an empty doc yields the empty
+        // JSON array, which the host wrote into the output buffer.
+        assert_eq!(out.output, "[]");
+    }
+
+    #[test]
+    fn example_auto_rename_plugin_submits_proposal_with_write_perm() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("examples/auto_rename/auto_rename.wat");
+        let wasm = wat::parse_file(&path).expect("example auto_rename.wat must compile");
+        let rt = WasmPluginRuntime::new();
+        let doc = serde_json::json!({"root": null, "nodes": {}});
+        let ctx = PluginContext::empty("auto-rename")
+            .with_snapshot(doc)
+            .grant(PluginPermission::ReadDocument)
+            .grant(PluginPermission::WriteDocument);
+        let out = rt
+            .execute_with_context(&wasm, "run", "", 16, ctx)
+            .expect("execute_with_context");
+        assert_eq!(out.proposals.len(), 1, "exactly one proposal expected");
+        match &out.proposals[0] {
+            ProposedMutation::UpdateNode { node_id, .. } => {
+                // The placeholder UUID in the example is all zeros.
+                assert!(node_id.is_nil(), "expected placeholder UUID");
+            }
+            other => panic!("expected UpdateNode, got {other:?}"),
+        }
+    }
 }

@@ -556,6 +556,18 @@ fn plugin_runtime() -> &'static kcreate_plugin::WasmPluginRuntime {
     RT.get_or_init(kcreate_plugin::WasmPluginRuntime::new)
 }
 
+/// Re-seed the plugin registry from the current `plugin_dir()` so
+/// per-test directories take effect. The static `OnceLock` only
+/// initializes once per process; without this helper, the second
+/// `#[serial]` test that sets `KCREATE_PLUGIN_DIR` to a fresh path
+/// would silently keep scanning the first test's (now-dropped) temp
+/// directory. Only compiled in test builds.
+#[cfg(test)]
+pub(crate) fn reset_plugin_state_for_tests() {
+    let mut reg = plugin_registry().lock();
+    *reg = kcreate_plugin::PluginRegistry::new(plugin_dir());
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PluginListEntry {
@@ -624,6 +636,266 @@ pub fn plugin_execute(id: &str, function: &str, input_json: &str) -> Result<Stri
         "output": out.output,
         "logs": out.logs,
     }))?)
+}
+
+/// Outcome of validating + applying a single proposal. Returned to
+/// the renderer so the user can see which proposals took effect.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case", tag = "status")]
+pub enum ProposalOutcome {
+    /// Proposal validated and was applied as an operation. `node_id`
+    /// is the affected (or newly-created) node.
+    Applied { node_id: Uuid },
+    /// Proposal failed validation. `reason` explains why; the
+    /// document is unchanged.
+    Rejected { reason: String },
+}
+
+/// Plugin proposal pre-application, paired with its outcome. The
+/// renderer uses this to render a per-proposal status line.
+#[derive(Debug, Clone, Serialize)]
+pub struct ProposalReport {
+    #[serde(flatten)]
+    pub proposal: kcreate_plugin::ProposedMutation,
+    pub outcome: ProposalOutcome,
+}
+
+/// Execute a plugin under the Phase 2 extended host ABI (Block C
+/// Task 15).
+///
+/// Pipeline:
+///
+/// 1. Resolve the plugin entry point + manifest permissions under
+///    one registry lock.
+/// 2. Snapshot the document as JSON for `kcreate_read_document`
+///    queries.
+/// 3. Build an asset loader closure that re-enters
+///    [`with_workspace`] per blob read so concurrent edits can
+///    still proceed while the plugin runs.
+/// 4. Execute the plugin under [`kcreate_plugin::PluginContext`].
+/// 5. After the plugin returns, validate each proposal — checking
+///    node-id resolution and parent-id resolution — and apply
+///    accepted ones via [`crate::document::document_create_node`] /
+///    [`crate::document::document_update_node`] /
+///    [`crate::document::document_delete_node`] so they record
+///    operations and become undoable.
+/// 6. Return a JSON envelope:
+///    `{ "output": "...", "logs": [...], "proposals": [ ProposalReport, ... ] }`.
+///
+/// The basic ABI used by [`plugin_execute`] still works because the
+/// runtime simply skips the extended host functions when no
+/// `PluginContext` is supplied. Plugins that don't request any of
+/// `read_document` / `read_assets` / `write_document` in their
+/// manifest get an empty permission set here and behave identically
+/// to the legacy path.
+pub fn plugin_execute_with_context(
+    id: &str,
+    function: &str,
+    input_json: &str,
+) -> Result<String> {
+    let (entry, manifest, enabled) = {
+        let reg = plugin_registry().lock();
+        (
+            reg.entry_point_for(id),
+            reg.list().iter().find(|m| m.id == id).map(|m| (*m).clone()),
+            reg.is_enabled(id),
+        )
+    };
+    let path = entry.ok_or_else(|| {
+        DocumentBridgeError::Io(std::io::Error::other(format!("plugin {id} not found")))
+    })?;
+    let manifest = manifest.ok_or_else(|| {
+        // Defensive: `entry_point_for` returning `Some` while
+        // `list()` returns no matching manifest would be a registry
+        // bug, not a user-facing one — but we surface it cleanly
+        // rather than panicking inside the bridge.
+        DocumentBridgeError::Io(std::io::Error::other(format!(
+            "plugin {id} manifest missing"
+        )))
+    })?;
+    if !enabled {
+        return Err(DocumentBridgeError::Io(std::io::Error::other(format!(
+            "plugin {id} is not enabled"
+        ))));
+    }
+
+    // Snapshot the document for `kcreate_read_document`. We use the
+    // same shape as `document_serialise_for_ai` — a `{"project",
+    // "nodes":[...]}` envelope — so plugins see node properties
+    // exactly as the LLM-prompt path does.
+    let snapshot_json = crate::document::document_serialise_for_ai()?;
+    let snapshot: serde_json::Value = serde_json::from_str(&snapshot_json)?;
+
+    // Permissions from the manifest. The runtime denies any
+    // intrinsic that doesn't have a matching grant, so plugins that
+    // didn't declare a permission can't reach the gated functions.
+    let permissions: std::collections::HashSet<kcreate_plugin::PluginPermission> =
+        manifest.permissions.iter().copied().collect();
+
+    // Asset loader: each call re-acquires the workspace under
+    // `with_workspace` so we don't hold the lock during plugin
+    // execution. Errors become `None` from the plugin's perspective
+    // (matches `kcreate_read_asset`'s "asset not found" semantics).
+    let asset_loader: kcreate_plugin::AssetLoader = std::sync::Arc::new(|hash: &str| {
+        with_workspace(|ws| Ok(crate::document::blob_load(ws, hash)))
+            .ok()
+            .and_then(std::result::Result::ok)
+    });
+
+    let context = kcreate_plugin::PluginContext {
+        plugin_id: id.to_string(),
+        document_snapshot: snapshot,
+        asset_loader,
+        permissions,
+        proposals: Vec::new(),
+    };
+
+    let rt = plugin_runtime();
+    let out = rt
+        .execute_path_with_context(&path, function, input_json, 64, context)
+        .map_err(|e| DocumentBridgeError::Io(std::io::Error::other(e.to_string())))?;
+
+    let reports = apply_plugin_proposals(out.proposals);
+
+    Ok(serde_json::to_string(&serde_json::json!({
+        "output": out.output,
+        "logs": out.logs,
+        "proposals": reports,
+    }))?)
+}
+
+/// Validate and apply a batch of plugin proposals.
+///
+/// Per-proposal contract:
+/// * `CreateNode` — parent must resolve to an existing node (or be
+///   the root by leaving `parent_id` resolved to `None` after the
+///   lookup); `node_type` must be one of the strings accepted by
+///   [`crate::document::document_create_node`].
+/// * `UpdateNode` — `node_id` must resolve.
+/// * `DeleteNode` — `node_id` must resolve.
+///
+/// Each accepted proposal is applied through the existing
+/// `document_*` helpers so it records an operation and is undoable.
+/// Rejected proposals leave the document unchanged.
+fn apply_plugin_proposals(
+    proposals: Vec<kcreate_plugin::ProposedMutation>,
+) -> Vec<ProposalReport> {
+    proposals
+        .into_iter()
+        .map(|p| {
+            let outcome = apply_one_proposal(&p);
+            ProposalReport {
+                proposal: p,
+                outcome,
+            }
+        })
+        .collect()
+}
+
+fn apply_one_proposal(proposal: &kcreate_plugin::ProposedMutation) -> ProposalOutcome {
+    match proposal {
+        kcreate_plugin::ProposedMutation::CreateNode {
+            parent_id,
+            node_type,
+            props,
+        } => {
+            // Validate parent existence up front so we return a
+            // clean rejection rather than letting `document_create_node`
+            // fail later with a less specific error.
+            let parent_check = with_workspace(|ws| {
+                Ok(ws.project.document.get_node(*parent_id).is_some())
+            });
+            match parent_check {
+                Ok(true) => {}
+                Ok(false) => {
+                    return ProposalOutcome::Rejected {
+                        reason: format!("parent node {parent_id} not found"),
+                    }
+                }
+                Err(e) => {
+                    return ProposalOutcome::Rejected {
+                        reason: format!("workspace unavailable: {e}"),
+                    }
+                }
+            }
+            let create_props: crate::document::CreateNodeProps =
+                match serde_json::from_value(props.clone()) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        return ProposalOutcome::Rejected {
+                            reason: format!("invalid create props: {e}"),
+                        }
+                    }
+                };
+            match crate::document::document_create_node(
+                node_type,
+                Some(*parent_id),
+                &create_props,
+            ) {
+                Ok(new_id) => ProposalOutcome::Applied { node_id: new_id },
+                Err(e) => ProposalOutcome::Rejected {
+                    reason: format!("create failed: {e}"),
+                },
+            }
+        }
+        kcreate_plugin::ProposedMutation::UpdateNode { node_id, changes } => {
+            let exists = with_workspace(|ws| {
+                Ok(ws.project.document.get_node(*node_id).is_some())
+            });
+            match exists {
+                Ok(true) => {}
+                Ok(false) => {
+                    return ProposalOutcome::Rejected {
+                        reason: format!("node {node_id} not found"),
+                    }
+                }
+                Err(e) => {
+                    return ProposalOutcome::Rejected {
+                        reason: format!("workspace unavailable: {e}"),
+                    }
+                }
+            }
+            let update_props: crate::document::UpdateNodeProps =
+                match serde_json::from_value(changes.clone()) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        return ProposalOutcome::Rejected {
+                            reason: format!("invalid update changes: {e}"),
+                        }
+                    }
+                };
+            match crate::document::document_update_node(*node_id, &update_props) {
+                Ok(()) => ProposalOutcome::Applied { node_id: *node_id },
+                Err(e) => ProposalOutcome::Rejected {
+                    reason: format!("update failed: {e}"),
+                },
+            }
+        }
+        kcreate_plugin::ProposedMutation::DeleteNode { node_id } => {
+            let exists = with_workspace(|ws| {
+                Ok(ws.project.document.get_node(*node_id).is_some())
+            });
+            match exists {
+                Ok(true) => {}
+                Ok(false) => {
+                    return ProposalOutcome::Rejected {
+                        reason: format!("node {node_id} not found"),
+                    }
+                }
+                Err(e) => {
+                    return ProposalOutcome::Rejected {
+                        reason: format!("workspace unavailable: {e}"),
+                    }
+                }
+            }
+            match crate::document::document_delete_node(*node_id) {
+                Ok(()) => ProposalOutcome::Applied { node_id: *node_id },
+                Err(e) => ProposalOutcome::Rejected {
+                    reason: format!("delete failed: {e}"),
+                },
+            }
+        }
+    }
 }
 
 // -----------------------------------------------------------------------------

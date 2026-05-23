@@ -1671,6 +1671,20 @@ pub fn plugin_execute(id: String, function: String, input: String) -> NapiResult
     phase2::plugin_execute(&id, &function, &input).map_err(map_doc_err)
 }
 
+/// Phase 2 extended-ABI execution: builds a `PluginContext` with the
+/// current document snapshot, the project's blob store as asset loader,
+/// and the manifest's declared permissions, then validates and applies
+/// any proposals the plugin emits. Returns a JSON envelope `{output,
+/// logs, proposals}` (see `phase2::ProposalReport`).
+#[napi]
+pub fn plugin_execute_with_context(
+    id: String,
+    function: String,
+    input: String,
+) -> NapiResult<String> {
+    phase2::plugin_execute_with_context(&id, &function, &input).map_err(map_doc_err)
+}
+
 #[napi]
 pub fn mcp_permission_list() -> NapiResult<String> {
     phase2::mcp_permission_list().map_err(map_doc_err)

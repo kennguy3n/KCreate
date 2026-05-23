@@ -60,6 +60,10 @@ napi-build.workspace = true
 # mutate it must run serialized.
 serial_test = "3"
 tempfile.workspace = true
+# WAT plugin fixtures for the Phase 2 Block C plugin-context tests
+# (see `document.rs::tests::plugin_execute_with_context_*`). Pinned
+# to the same major as `kcreate_plugin` to keep wasmi compatibility.
+wat = "1"
 
 [features]
 default = []

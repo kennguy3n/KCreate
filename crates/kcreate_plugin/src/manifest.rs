@@ -28,7 +28,7 @@ pub enum PluginType {
 /// — every plugin is fully sandboxed regardless of what it asks for);
 /// the field exists so the manifest schema is stable and the UI can
 /// show the plugin's stated intent.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PluginPermission {
     ReadDocument,

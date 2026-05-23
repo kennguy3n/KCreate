@@ -11,10 +11,15 @@
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 
+pub mod context;
 pub mod manifest;
 pub mod registry;
 pub mod wasm_runtime;
 
+pub use context::{
+    resolve_document_query, AssetLoader, DocumentQuery, PluginContext, PluginProposal,
+    ProposedMutation,
+};
 pub use manifest::{PluginManifest, PluginPermission, PluginType};
 pub use registry::{PluginRegistry, RegistryError};
-pub use wasm_runtime::{WasmPluginError, WasmPluginRuntime};
+pub use wasm_runtime::{PluginOutput, WasmPluginError, WasmPluginRuntime};

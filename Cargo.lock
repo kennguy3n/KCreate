@@ -1251,6 +1251,7 @@ dependencies = [
  "tempfile",
  "thiserror 1.0.69",
  "uuid",
+ "wat",
 ]
 
 [[package]]
@@ -1329,6 +1330,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror 1.0.69",
+ "uuid",
  "wasmi",
  "wat",
 ]

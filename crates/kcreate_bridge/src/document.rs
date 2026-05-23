@@ -5636,4 +5636,279 @@ mod tests {
         );
         project_close();
     }
+
+    // ------------------------------------------------------------------
+    // Phase 2 Block C — plugin context bridge tests (Task 15)
+    // ------------------------------------------------------------------
+
+    /// Lay down a plugin directory at `dir/<id>/` with a manifest
+    /// declaring `permissions` and a `.wasm` blob produced from `wat`.
+    /// Returns the plugin id so tests can chain into the registry.
+    fn write_test_plugin(
+        dir: &std::path::Path,
+        id: &str,
+        wat_src: &str,
+        permissions: &[&str],
+    ) -> String {
+        let plugin_dir = dir.join(id);
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+        let wasm = wat::parse_str(wat_src).unwrap();
+        std::fs::write(plugin_dir.join("entry.wasm"), wasm).unwrap();
+        let manifest = serde_json::json!({
+            "id": id,
+            "name": id,
+            "version": "0.1.0",
+            "type": "wasm",
+            "entry_point": "entry.wasm",
+            "permissions": permissions,
+        });
+        std::fs::write(
+            plugin_dir.join("manifest.json"),
+            serde_json::to_string_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        id.to_string()
+    }
+
+    /// Plugin that calls `kcreate_read_document` with
+    /// `{"type":"list_nodes"}` so the host's output buffer contains
+    /// the response (the host function writes its own response).
+    const READ_DOC_WAT: &str = r#"
+        (module
+            (import "env" "kcreate_read_document"
+                (func $rd (param i32 i32) (result i32)))
+            (memory (export "memory") 1)
+            (data (i32.const 0) "{\"type\":\"list_nodes\"}")
+            (func (export "run")
+                i32.const 0  i32.const 21  call $rd  drop
+            )
+        )
+    "#;
+
+    /// Plugin that submits one `delete_node` proposal carrying a
+    /// specific UUID. The UUID is the placeholder
+    /// `00000000-0000-0000-0000-000000000000`; tests rewrite this
+    /// at runtime by setting an env var the WAT can't read. So we
+    /// instead use a UUID we will be supplying — for this test we
+    /// will create a node, capture its id, write a per-test
+    /// instance of the WAT with that id baked in, and run.
+    fn delete_proposal_wat(node_id: uuid::Uuid) -> String {
+        let payload = format!(
+            "{{\"type\":\"delete_node\",\"node_id\":\"{node_id}\"}}"
+        );
+        let len = payload.len();
+        // The WAT data section needs the inner double quotes escaped
+        // as `\"` so the WAT parser sees one string literal, not a
+        // sequence of broken strings.
+        let escaped: String = payload.replace('"', "\\\"");
+        format!(
+            r#"
+            (module
+                (import "env" "kcreate_write_proposal"
+                    (func $wp (param i32 i32) (result i32)))
+                (memory (export "memory") 1)
+                (data (i32.const 0) "{escaped}")
+                (func (export "run")
+                    i32.const 0  i32.const {len}  call $wp  drop
+                )
+            )
+            "#
+        )
+    }
+
+    /// Helper: bind the plugin registry to a per-test directory so
+    /// every test sees a fresh registry. `KCREATE_PLUGIN_DIR` is the
+    /// override the bridge respects.
+    struct PluginEnvGuard {
+        prev: Option<String>,
+    }
+    impl PluginEnvGuard {
+        fn new(dir: &std::path::Path) -> Self {
+            let prev = std::env::var("KCREATE_PLUGIN_DIR").ok();
+            // SAFETY: `set_var` is only unsafe in multi-threaded
+            // contexts because of UB if other threads read env
+            // concurrently. The bridge plugin tests are marked
+            // `#[serial]` precisely so this lifecycle is sound;
+            // we just need to wrap the call.
+            unsafe { std::env::set_var("KCREATE_PLUGIN_DIR", dir) };
+            // The plugin registry is a process-global `OnceLock`
+            // that captures `plugin_dir()` at first init — we have
+            // to explicitly reseed it so the test's tmpdir takes
+            // effect even when a previous test already triggered
+            // init under a different dir.
+            crate::phase2::reset_plugin_state_for_tests();
+            Self { prev }
+        }
+    }
+    impl Drop for PluginEnvGuard {
+        fn drop(&mut self) {
+            match &self.prev {
+                Some(v) => unsafe { std::env::set_var("KCREATE_PLUGIN_DIR", v) },
+                None => unsafe { std::env::remove_var("KCREATE_PLUGIN_DIR") },
+            }
+            // Re-seed back to whatever the (likely-absent) env now
+            // points at, so a stray test that doesn't use the guard
+            // can still rely on the registry being well-formed.
+            crate::phase2::reset_plugin_state_for_tests();
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn plugin_execute_with_context_reads_document_when_permitted() {
+        reset_for_tests();
+        let dir = tmpdir();
+        let plugin_dir = tmpdir();
+        let _guard = PluginEnvGuard::new(plugin_dir.path());
+
+        project_create("ctx", dir.path()).expect("create");
+        let id = write_test_plugin(plugin_dir.path(), "list-nodes", READ_DOC_WAT, &["read_document"]);
+        // `plugin_list` performs the registry scan; without it,
+        // `plugin_enable` can't find the freshly-written manifest.
+        crate::phase2::plugin_list().expect("list");
+        crate::phase2::plugin_enable(&id).expect("enable");
+
+        let out = crate::phase2::plugin_execute_with_context(&id, "run", "")
+            .expect("execute");
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let response: Vec<String> =
+            serde_json::from_str(parsed.get("output").and_then(|v| v.as_str()).unwrap())
+                .expect("response is a JSON array of ids");
+        // The default project has at least a Page + Artboard, so the
+        // node id list must be non-empty.
+        assert!(!response.is_empty(), "expected non-empty node id list");
+        project_close();
+    }
+
+    #[test]
+    #[serial]
+    fn plugin_execute_with_context_denies_without_permission() {
+        reset_for_tests();
+        let dir = tmpdir();
+        let plugin_dir = tmpdir();
+        let _guard = PluginEnvGuard::new(plugin_dir.path());
+
+        project_create("ctx", dir.path()).expect("create");
+        // No `read_document` permission declared.
+        let id = write_test_plugin(plugin_dir.path(), "list-nodes-deny", READ_DOC_WAT, &[]);
+        crate::phase2::plugin_list().expect("list");
+        crate::phase2::plugin_enable(&id).expect("enable");
+
+        let out = crate::phase2::plugin_execute_with_context(&id, "run", "")
+            .expect("execute");
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        // Output should be empty when the call was denied — the
+        // host writes nothing to the output buffer.
+        assert_eq!(
+            parsed.get("output").and_then(|v| v.as_str()).unwrap_or(""),
+            "",
+            "expected empty output on permission deny"
+        );
+        let logs = parsed
+            .get("logs")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            logs.iter()
+                .any(|l| l.as_str().is_some_and(|s| s.contains("denied (missing ReadDocument)"))),
+            "expected deny log line, got {logs:?}"
+        );
+        project_close();
+    }
+
+    #[test]
+    #[serial]
+    fn plugin_execute_with_context_applies_delete_proposal() {
+        reset_for_tests();
+        let dir = tmpdir();
+        let plugin_dir = tmpdir();
+        let _guard = PluginEnvGuard::new(plugin_dir.path());
+
+        project_create("ctx", dir.path()).expect("create");
+        // Create a node we will then ask the plugin to delete.
+        let target = document_create_node(
+            "VectorLayer",
+            None,
+            &CreateNodeProps {
+                name: Some("doomed".into()),
+                visible: None,
+                locked: None,
+                metadata: None,
+            },
+        )
+        .expect("create node");
+
+        let wat = delete_proposal_wat(target);
+        let id = write_test_plugin(
+            plugin_dir.path(),
+            "deleter",
+            &wat,
+            &["write_document"],
+        );
+        crate::phase2::plugin_list().expect("list");
+        crate::phase2::plugin_enable(&id).expect("enable");
+
+        let out = crate::phase2::plugin_execute_with_context(&id, "run", "")
+            .expect("execute");
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let reports = parsed
+            .get("proposals")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(reports.len(), 1, "expected one proposal report");
+        let status = reports[0]
+            .get("outcome")
+            .and_then(|o| o.get("status"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        assert_eq!(status, "applied", "expected applied, got {status}");
+        // Node should be gone from the document.
+        assert!(
+            with_workspace(|ws| Ok(ws.project.document.get_node(target).is_none()))
+                .unwrap(),
+            "node should be gone after applied delete proposal"
+        );
+        project_close();
+    }
+
+    #[test]
+    #[serial]
+    fn plugin_execute_with_context_rejects_delete_of_unknown_node() {
+        reset_for_tests();
+        let dir = tmpdir();
+        let plugin_dir = tmpdir();
+        let _guard = PluginEnvGuard::new(plugin_dir.path());
+
+        project_create("ctx", dir.path()).expect("create");
+        // UUID that doesn't resolve to any node.
+        let ghost = uuid::Uuid::new_v4();
+        let wat = delete_proposal_wat(ghost);
+        let id = write_test_plugin(
+            plugin_dir.path(),
+            "ghost-deleter",
+            &wat,
+            &["write_document"],
+        );
+        crate::phase2::plugin_list().expect("list");
+        crate::phase2::plugin_enable(&id).expect("enable");
+
+        let out = crate::phase2::plugin_execute_with_context(&id, "run", "")
+            .expect("execute");
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let reports = parsed
+            .get("proposals")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(reports.len(), 1);
+        let status = reports[0]
+            .get("outcome")
+            .and_then(|o| o.get("status"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        assert_eq!(status, "rejected", "expected rejected, got {status}");
+        project_close();
+    }
 }

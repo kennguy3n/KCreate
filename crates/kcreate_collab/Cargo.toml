@@ -12,6 +12,13 @@ publish = false
 [lints]
 workspace = true
 
+[features]
+# Exposes `InProcessKChatAuthority` to consumers (kcreate_tests) so
+# integration tests can drive the multiplayer pipeline end-to-end
+# against a deterministic in-process issuer key. **Never enable in
+# production builds.**
+test-support = []
+
 # Phase 3 foundation: types for optional LAN collaboration. This crate
 # is kept OUT of the editing-path dependency tree (see
 # `crates/kcreate_tests/tests/local_first.rs::editing_path_crates`) so

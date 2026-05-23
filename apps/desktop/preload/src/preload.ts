@@ -104,6 +104,9 @@ import type {
   SessionCursor,
   SessionEvent,
   SessionPeer,
+  KChatBridge,
+  KChatInstallRequest,
+  KChatMembershipStatus,
   SessionStartReport,
 } from "../../shared/scene";
 
@@ -1435,6 +1438,32 @@ const session: SessionBridge = {
   },
 };
 
+// ---------------------------------------------------------------------------
+// KChat group authority. See `KChatBridge` in shared/scene.ts for the
+// contract — multiplayer is locked until the future KChat client
+// invokes `install()` with a signed membership attestation.
+// ---------------------------------------------------------------------------
+
+const kchat: KChatBridge = {
+  async install(
+    request: KChatInstallRequest,
+  ): Promise<KChatMembershipStatus> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/kchat/install",
+      JSON.stringify(request),
+    )) as string;
+    return JSON.parse(raw) as KChatMembershipStatus;
+  },
+  async clear(): Promise<KChatMembershipStatus> {
+    const raw = (await ipcRenderer.invoke("kcreate/kchat/clear")) as string;
+    return JSON.parse(raw) as KChatMembershipStatus;
+  },
+  async status(): Promise<KChatMembershipStatus> {
+    const raw = (await ipcRenderer.invoke("kcreate/kchat/status")) as string;
+    return JSON.parse(raw) as KChatMembershipStatus;
+  },
+};
+
 const textFrame: TextFrameBridge = {
   async get(nodeId: string): Promise<TextFrameOptions> {
     const raw = (await ipcRenderer.invoke(
@@ -1504,4 +1533,5 @@ contextBridge.exposeInMainWorld("kcreate", {
   color,
   textFrame,
   session,
+  kchat,
 });

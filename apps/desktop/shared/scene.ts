@@ -1874,6 +1874,12 @@ export interface SessionBridge {
   /// can display a "share this with peers" UI. `seedB64` is the
   /// persistent Ed25519 seed (base64url, 32 bytes); supply the
   /// same value across sessions for stable peer identity.
+  ///
+  /// Rejects with `multiplayer is locked: not signed into a KChat
+  /// group` if no valid `KChatGroupAuthority` is installed via
+  /// `kchat.install()`. The KChat client is the only thing
+  /// authorised to call install — until it does, multiplayer is
+  /// hard-locked at the protocol layer.
   start(
     seedB64: string,
     displayName: string,
@@ -1885,6 +1891,9 @@ export interface SessionBridge {
   /// Dial a known peer. Use the fields from a discovered-peer
   /// `SessionEvent` (`peerId`, `publicKey`, `displayName`,
   /// `socketAddr`, `certFingerprint`) or from a pasted peer link.
+  ///
+  /// Rejects with the same KChat-gate error as `start` if the
+  /// renderer hasn't installed an authority yet.
   join(
     peerId: string,
     publicKey: string,
@@ -1901,6 +1910,10 @@ export interface SessionBridge {
   /// Broadcast the local user's presence to every connected peer.
   /// `cursor` is world-space coordinates; pass `null` when the
   /// pointer has left the canvas.
+  ///
+  /// Rejects with the KChat-gate error if no authority is
+  /// installed — presence beacons never leave the box outside a
+  /// KChat group.
   sendPresence(
     activePage: string | null,
     selection: string[],
@@ -1910,6 +1923,75 @@ export interface SessionBridge {
   /// leave / move their cursor. Returns an unsubscribe function.
   /// The renderer is responsible for filtering by kind.
   onEvent(callback: (event: SessionEvent) => void): () => void;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4 — KChat group authority (multiplayer gate).
+//
+// Mirrors the JSON shapes emitted by
+// `kcreate_bridge::collab::{KChatInstallRequest, KChatMembershipStatus}`.
+// Field names are `camelCase` because the Rust DTOs use
+// `#[serde(rename_all = "camelCase")]`.
+//
+// Architecture: every multiplayer entry point on `SessionBridge`
+// fails closed until `KChatBridge.install()` is called with a
+// valid Ed25519-signed membership attestation minted by a KChat
+// group server. The KChat client (out of tree, future work) is
+// the only thing authorised to call `install`. Until then the
+// renderer surfaces a "Collaboration is locked — sign into a
+// KChat group to enable multiplayer" CTA in place of the
+// start/join buttons.
+// ---------------------------------------------------------------------------
+
+export interface KChatInstallRequest {
+  /// 32-byte Ed25519 verifying key of the KChat group server (the
+  /// issuer trust root), URL-safe base64 (no padding).
+  issuerPublicKey: string;
+  /// Group identifier minted on the issuer side. URL-safe ASCII,
+  /// max 128 chars.
+  groupId: string;
+  /// Peer id (BLAKE3-derived from the peer's public key) of the
+  /// local user.
+  peerId: string;
+  /// 32-byte Ed25519 verifying key of the local user, URL-safe
+  /// base64 (no padding). Must match the peer key used for
+  /// `session.start`.
+  peerPublicKey: string;
+  /// Membership issuance time (ISO-8601).
+  issuedAt: string;
+  /// Membership expiry time (ISO-8601). KChat servers should mint
+  /// short-lived attestations (hours, not days).
+  expiresAt: string;
+  /// 64-byte Ed25519 signature, URL-safe base64 (no padding).
+  signature: string;
+}
+
+export interface KChatMembershipStatus {
+  /// True when no authority is installed, or the installed one is
+  /// expired / forged / bound to a different peer key. The
+  /// `PresencePanel` shows the locked CTA when this is `true`.
+  locked: boolean;
+  groupId: string | null;
+  peerId: string | null;
+  /// ISO-8601 expiry, or `null` when locked. The renderer can use
+  /// this to show a "renew soon" CTA when expiry is imminent.
+  expiresAt: string | null;
+}
+
+export interface KChatBridge {
+  /// Install a verified KChat group authority. The supplied
+  /// membership is re-verified on the Rust side before being
+  /// stored, so a malformed payload from a buggy KChat client
+  /// can't sneak past the gate.
+  install(request: KChatInstallRequest): Promise<KChatMembershipStatus>;
+  /// Clear the installed authority and re-lock multiplayer. Any
+  /// running collab session is left as-is (call `session.leave()`
+  /// first if you want to tear it down).
+  clear(): Promise<KChatMembershipStatus>;
+  /// Snapshot the current gate state. The `PresencePanel` polls
+  /// this on mount to decide between the locked CTA and the
+  /// live multiplayer UI.
+  status(): Promise<KChatMembershipStatus>;
 }
 
 declare global {
@@ -1942,6 +2024,7 @@ declare global {
       color: ColorBridge;
       textFrame: TextFrameBridge;
       session: SessionBridge;
+      kchat: KChatBridge;
     };
   }
 }

@@ -1907,7 +1907,8 @@ fn map_session_err(e: crate::collab::SessionBridgeError) -> NapiError {
     let status = match e {
         crate::collab::SessionBridgeError::InvalidArgument { .. }
         | crate::collab::SessionBridgeError::NotRunning
-        | crate::collab::SessionBridgeError::AlreadyRunning => Status::InvalidArg,
+        | crate::collab::SessionBridgeError::AlreadyRunning
+        | crate::collab::SessionBridgeError::NotInKChatGroup => Status::InvalidArg,
         _ => Status::GenericFailure,
     };
     NapiError::new(status, format!("kcreate_bridge: {e}"))
@@ -2035,6 +2036,64 @@ pub fn session_info() -> NapiResult<String> {
         NapiError::new(
             Status::GenericFailure,
             format!("kcreate_bridge: session_info serialize: {e}"),
+        )
+    })
+}
+
+/// Install (or refresh) the KChat group authority from a JSON
+/// `KChatInstallRequest`. Until this is called with a valid
+/// payload, every multiplayer entry point (`session_start`,
+/// `session_join`, `session_send_presence`) fails with
+/// `InvalidArg("multiplayer is locked: not signed into a KChat
+/// group")`.
+///
+/// Returns a JSON [`KChatMembershipStatus`] describing the new
+/// state on success.
+#[cfg(feature = "collab")]
+#[napi]
+pub fn kchat_install_authority(request_json: String) -> NapiResult<String> {
+    let req: crate::collab::KChatInstallRequest =
+        serde_json::from_str(&request_json).map_err(|e| {
+            NapiError::new(
+                Status::InvalidArg,
+                format!("kcreate_bridge: kchat_install_authority request: {e}"),
+            )
+        })?;
+    let status = crate::collab::kchat_install_authority(req).map_err(map_session_err)?;
+    serde_json::to_string(&status).map_err(|e| {
+        NapiError::new(
+            Status::GenericFailure,
+            format!("kcreate_bridge: kchat_install_authority serialize: {e}"),
+        )
+    })
+}
+
+/// Clear the installed KChat authority and re-lock multiplayer.
+/// Returns the new (locked) status as JSON.
+#[cfg(feature = "collab")]
+#[napi]
+pub fn kchat_clear_authority() -> NapiResult<String> {
+    let status = crate::collab::kchat_clear_authority();
+    serde_json::to_string(&status).map_err(|e| {
+        NapiError::new(
+            Status::GenericFailure,
+            format!("kcreate_bridge: kchat_clear_authority serialize: {e}"),
+        )
+    })
+}
+
+/// Snapshot the current KChat membership status. Returns a JSON
+/// [`KChatMembershipStatus`]. Renderer polls this on mount to
+/// decide whether to show the "sign into a KChat group" CTA or
+/// the live PresencePanel.
+#[cfg(feature = "collab")]
+#[napi]
+pub fn kchat_membership_status() -> NapiResult<String> {
+    let status = crate::collab::kchat_membership_status();
+    serde_json::to_string(&status).map_err(|e| {
+        NapiError::new(
+            Status::GenericFailure,
+            format!("kcreate_bridge: kchat_membership_status serialize: {e}"),
         )
     })
 }

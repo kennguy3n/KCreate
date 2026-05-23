@@ -27,14 +27,18 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use base64::engine::general_purpose::{STANDARD_NO_PAD, URL_SAFE_NO_PAD};
 use base64::Engine;
 use chrono::{DateTime, Utc};
+use ed25519_dalek::VerifyingKey;
 use kcreate_collab::message::Cursor;
-use kcreate_collab::{Message, PeerId, PeerIdentity, PeerKey, PresencePayload, SessionConfig};
+use kcreate_collab::{
+    no_kchat_authority, BoundKChatGroupAuthority, KChatAuthError, KChatGroupId, KChatMembership,
+    Message, PeerId, PeerIdentity, PeerKey, PresencePayload, SessionConfig, SharedKChatAuthority,
+};
 use kcreate_collab_transport::{HostOptions, InboundEvent, LanCollabHost};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -153,6 +157,18 @@ pub enum SessionBridgeError {
     Transport(#[from] kcreate_collab_transport::TransportError),
     #[error("collab protocol error: {0}")]
     Collab(#[from] kcreate_collab::CollabError),
+    /// Multiplayer is locked behind KChat group membership and no
+    /// valid membership has been installed yet. Renderer surfaces
+    /// this as the "sign into a KChat group" CTA instead of the
+    /// start/join buttons.
+    #[error("multiplayer is locked: not signed into a KChat group")]
+    NotInKChatGroup,
+    /// A `kchat_install_authority` call failed verification. The
+    /// renderer never normally reaches this path today (KChat
+    /// client doesn't exist yet), but if it ever does, the typed
+    /// error gives it a useful diagnostic.
+    #[error("KChat authority install failed: {0}")]
+    KChat(#[from] KChatAuthError),
 }
 
 pub type Result<T> = std::result::Result<T, SessionBridgeError>;
@@ -192,6 +208,20 @@ struct SessionState {
 fn slot() -> &'static Mutex<Option<SessionState>> {
     static S: OnceLock<Mutex<Option<SessionState>>> = OnceLock::new();
     S.get_or_init(|| Mutex::new(None))
+}
+
+/// Global slot for the KChat group authority. Until a future KChat
+/// client calls [`kchat_install_authority`] with a verified
+/// membership, this holds [`no_kchat_authority`] and every
+/// multiplayer entry point fails closed with
+/// [`SessionBridgeError::NotInKChatGroup`].
+///
+/// The slot lives independently of [`slot`] so a long-running
+/// session can refresh its attestation (e.g. before expiry) without
+/// tearing the QUIC endpoint down.
+fn kchat_slot() -> &'static Mutex<SharedKChatAuthority> {
+    static S: OnceLock<Mutex<SharedKChatAuthority>> = OnceLock::new();
+    S.get_or_init(|| Mutex::new(no_kchat_authority()))
 }
 
 /// Encode a 32-byte signing-key seed from a URL-safe base64 string.
@@ -404,6 +434,25 @@ pub fn session_start(
     let local_peer_id = local_key.peer_id();
     let local_public_key = local_key.identity(display_name).public_key;
 
+    // KChat gate: refuse to start unless the locally-installed
+    // authority has a current membership bound to *this* peer key.
+    // We re-verify the binding here (rather than just trusting the
+    // installed membership) because the renderer might call
+    // `session_start` with a different seed than the one the
+    // membership was minted for, and we also re-check the time
+    // window so an expired-while-the-app-was-asleep attestation
+    // doesn't sneak through.
+    let authority = kchat_authority_snapshot();
+    let membership = authority
+        .local_membership()
+        .ok_or(SessionBridgeError::NotInKChatGroup)?;
+    let trust_root = authority
+        .issuer_trust_root()
+        .ok_or(SessionBridgeError::NotInKChatGroup)?;
+    membership
+        .verify(&trust_root, &local_peer_id, &local_public_key, Utc::now())
+        .map_err(|_| SessionBridgeError::NotInKChatGroup)?;
+
     let runtime = Builder::new_multi_thread()
         .enable_all()
         .thread_name("kcreate-collab")
@@ -422,6 +471,7 @@ pub fn session_start(
         advertise_mdns,
         advertise_addrs: None,
         session_config: SessionConfig::default(),
+        kchat_authority: authority,
     };
     let host = runtime
         .block_on(tokio::time::timeout(OP_TIMEOUT, LanCollabHost::start(opts)))
@@ -507,6 +557,15 @@ pub fn session_join(
     socket_addr: &str,
     cert_fingerprint_b64: &str,
 ) -> Result<()> {
+    // KChat gate: refuse to dial any peer unless the local user is
+    // bound to a KChat group. The transport's Hello path would
+    // refuse to mint an attestation anyway, but failing fast here
+    // gives the renderer a typed error rather than a generic dial
+    // timeout.
+    if kchat_authority_snapshot().local_membership().is_none() {
+        return Err(SessionBridgeError::NotInKChatGroup);
+    }
+
     let identity = identity_from_wire(peer_id, public_key, display_name)?;
     let socket: SocketAddr = socket_addr.parse().map_err(|e: std::net::AddrParseError| {
         SessionBridgeError::InvalidArgument {
@@ -572,6 +631,11 @@ pub fn session_send_presence(
     selection: Vec<Uuid>,
     cursor: Option<SessionCursor>,
 ) -> Result<()> {
+    // KChat gate: presence beacons never leave the box unless the
+    // user is in a KChat group.
+    if kchat_authority_snapshot().local_membership().is_none() {
+        return Err(SessionBridgeError::NotInKChatGroup);
+    }
     let guard = slot().lock();
     let state = guard.as_ref().ok_or(SessionBridgeError::NotRunning)?;
     let host = state.host.clone();
@@ -644,14 +708,199 @@ impl From<SessionBridgeError> for DocumentBridgeError {
         match e {
             SessionBridgeError::NotRunning
             | SessionBridgeError::AlreadyRunning
-            | SessionBridgeError::InvalidArgument { .. } => Self::InvalidArgument {
+            | SessionBridgeError::InvalidArgument { .. }
+            | SessionBridgeError::NotInKChatGroup => Self::InvalidArgument {
                 argument: "session".to_string(),
                 value: e.to_string(),
             },
-            SessionBridgeError::Transport(_) | SessionBridgeError::Collab(_) => {
-                Self::Io(std::io::Error::other(e.to_string()))
-            }
+            SessionBridgeError::Transport(_)
+            | SessionBridgeError::Collab(_)
+            | SessionBridgeError::KChat(_) => Self::Io(std::io::Error::other(e.to_string())),
         }
+    }
+}
+
+/// Wire-format DTO describing the currently-installed KChat
+/// membership. Returned by [`kchat_membership_status`] so the
+/// renderer can render the appropriate panel state (locked / signed
+/// in / expiring soon).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KChatMembershipStatus {
+    /// True when a non-default authority is installed AND the
+    /// installed membership is currently valid (signature OK,
+    /// within `issued_at..expires_at`, peer binding matches).
+    pub locked: bool,
+    /// Group id from the installed membership, if any. `None` when
+    /// `locked == true`.
+    pub group_id: Option<String>,
+    /// Peer id derived from the installed membership, if any.
+    pub peer_id: Option<String>,
+    /// Membership expiry in RFC3339, if any. The renderer can show
+    /// a "renew soon" CTA when this is within e.g. 5 minutes of
+    /// `now`.
+    pub expires_at: Option<DateTime<Utc>>,
+}
+
+/// Wire-format DTO accepted by [`kchat_install_authority`]. All
+/// fields are URL-safe base64 (no padding) except for the time
+/// fields which are RFC3339.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KChatInstallRequest {
+    /// 32-byte Ed25519 verifying key of the KChat group server
+    /// (the issuer trust root). This is the public half of the
+    /// signing key the issuer used to mint the membership.
+    pub issuer_public_key: String,
+    /// Group identifier minted on the issuer side.
+    pub group_id: String,
+    /// Peer id (BLAKE3-derived) of the local user.
+    pub peer_id: String,
+    /// 32-byte Ed25519 verifying key of the local user. Must match
+    /// the peer key the bridge uses for `session_start`.
+    pub peer_public_key: String,
+    /// Membership issuance time.
+    pub issued_at: DateTime<Utc>,
+    /// Membership expiry time.
+    pub expires_at: DateTime<Utc>,
+    /// 64-byte Ed25519 signature over the canonical
+    /// `MembershipSigningView` of the other fields.
+    pub signature: String,
+}
+
+/// Snapshot the currently-installed KChat authority. Cheap clone of
+/// the inner `Arc<dyn KChatGroupAuthority>` so the caller releases
+/// the slot lock immediately and never holds it across N-API calls
+/// or async waits.
+fn kchat_authority_snapshot() -> SharedKChatAuthority {
+    kchat_slot().lock().clone()
+}
+
+fn decode_b64_url(input: &str, field: &'static str) -> Result<Vec<u8>> {
+    URL_SAFE_NO_PAD
+        .decode(input.trim_end_matches('='))
+        .map_err(|e| SessionBridgeError::InvalidArgument {
+            field,
+            message: e.to_string(),
+        })
+}
+
+fn decode_verifying_key(input: &str, field: &'static str) -> Result<VerifyingKey> {
+    let bytes = decode_b64_url(input, field)?;
+    if bytes.len() != 32 {
+        return Err(SessionBridgeError::InvalidArgument {
+            field,
+            message: format!("expected 32 bytes, got {}", bytes.len()),
+        });
+    }
+    let mut arr = [0u8; 32];
+    arr.copy_from_slice(&bytes);
+    VerifyingKey::from_bytes(&arr).map_err(|e| SessionBridgeError::InvalidArgument {
+        field,
+        message: e.to_string(),
+    })
+}
+
+/// Install (or refresh) the KChat group authority. Once a valid
+/// authority is installed, the multiplayer bridge unlocks. A
+/// subsequent `kchat_clear_authority` re-locks it.
+///
+/// The membership is verified locally — including signature, peer
+/// binding, and time window — before being installed, so a future
+/// KChat client crash or malicious request can't sneak past the
+/// gate by pushing a malformed attestation.
+pub fn kchat_install_authority(req: KChatInstallRequest) -> Result<KChatMembershipStatus> {
+    let issuer_vk = decode_verifying_key(&req.issuer_public_key, "issuerPublicKey")?;
+    // Defence-in-depth: the wire-format `peer_id` must derive from
+    // the supplied `peer_public_key`. This is also enforced by
+    // `KChatMembership::verify`, but failing fast here gives the
+    // renderer a precise field-level error.
+    let peer_vk = decode_verifying_key(&req.peer_public_key, "peerPublicKey")?;
+    let derived_peer_id = PeerId::from_verifying_key(&peer_vk);
+    if derived_peer_id.as_str() != req.peer_id {
+        return Err(SessionBridgeError::InvalidArgument {
+            field: "peerId",
+            message: "peerId does not derive from peerPublicKey".into(),
+        });
+    }
+    // Validate signature size up front (verify() also does this,
+    // but we want a typed field error).
+    let signature_bytes = decode_b64_url(&req.signature, "signature")?;
+    if signature_bytes.len() != 64 {
+        return Err(SessionBridgeError::InvalidArgument {
+            field: "signature",
+            message: format!("expected 64 bytes, got {}", signature_bytes.len()),
+        });
+    }
+
+    let group_id =
+        KChatGroupId::new(req.group_id).map_err(|e| SessionBridgeError::InvalidArgument {
+            field: "groupId",
+            message: e.to_string(),
+        })?;
+
+    // Build a wire-form `KChatMembership` directly from the DTO. We
+    // use the supplied base64 strings unchanged (they were already
+    // decoded above for validation) so the signing-view bytes are
+    // bitwise identical to what the KChat server produced.
+    let membership = KChatMembership {
+        group_id,
+        peer_id: derived_peer_id.clone(),
+        peer_public_key: req.peer_public_key.clone(),
+        issued_at: req.issued_at,
+        expires_at: req.expires_at,
+        issuer_public_key: req.issuer_public_key.clone(),
+        signature: req.signature.clone(),
+    };
+    let authority = BoundKChatGroupAuthority::install(
+        membership.clone(),
+        issuer_vk,
+        &derived_peer_id,
+        &req.peer_public_key,
+        Utc::now(),
+    )?;
+    let shared: SharedKChatAuthority = Arc::new(authority);
+    *kchat_slot().lock() = shared;
+
+    Ok(KChatMembershipStatus {
+        locked: false,
+        group_id: Some(membership.group_id.as_str().to_string()),
+        peer_id: Some(membership.peer_id().as_str().to_string()),
+        expires_at: Some(membership.expires_at),
+    })
+}
+
+/// Clear the installed authority and re-lock multiplayer. Any
+/// running session is left as-is (the QUIC endpoint stays alive
+/// until `session_leave`), but subsequent `session_start`,
+/// `session_join`, and `session_send_presence` calls will fail
+/// with [`SessionBridgeError::NotInKChatGroup`].
+pub fn kchat_clear_authority() -> KChatMembershipStatus {
+    *kchat_slot().lock() = no_kchat_authority();
+    KChatMembershipStatus {
+        locked: true,
+        group_id: None,
+        peer_id: None,
+        expires_at: None,
+    }
+}
+
+/// Report the current KChat gate state to the renderer.
+pub fn kchat_membership_status() -> KChatMembershipStatus {
+    let authority = kchat_authority_snapshot();
+    match authority.local_membership() {
+        Some(m) => KChatMembershipStatus {
+            locked: false,
+            group_id: Some(m.group_id.as_str().to_string()),
+            peer_id: Some(m.peer_id().as_str().to_string()),
+            expires_at: Some(m.expires_at),
+        },
+        None => KChatMembershipStatus {
+            locked: true,
+            group_id: None,
+            peer_id: None,
+            expires_at: None,
+        },
     }
 }
 
@@ -731,5 +980,200 @@ mod tests {
             let back: WelcomeStatus = serde_json::from_str(&s).unwrap();
             assert_eq!(status, back);
         }
+    }
+
+    // ====================================================================
+    // KChat group gate tests.
+    //
+    // These exercise the protocol-level multiplayer lock end-to-end at
+    // the bridge surface: `session_*` entry points must fail with
+    // `NotInKChatGroup` until a signed membership is installed via
+    // `kchat_install_authority`, and re-lock again when
+    // `kchat_clear_authority` is called.
+    //
+    // `kchat_slot` is a process-global singleton, so every test in
+    // this group is `#[serial]` and explicitly resets the slot in
+    // setup. Tests use raw `ed25519_dalek::SigningKey`s to play the
+    // role of the (still-to-be-built) KChat group server.
+    // ====================================================================
+    use ed25519_dalek::SigningKey;
+    use kcreate_collab::kchat::KChatMembership;
+    use serial_test::serial;
+
+    /// Reset the KChat slot to the default-deny state at the start
+    /// of every gate test. Sharing this helper avoids each test
+    /// silently inheriting state from a sibling.
+    fn reset_kchat_slot() {
+        *kchat_slot().lock() = no_kchat_authority();
+    }
+
+    /// Mint a fresh, valid `KChatInstallRequest` JSON payload bound
+    /// to the supplied local peer key and group. The issuer keypair
+    /// is generated per-call so each test gets a fresh trust root.
+    fn fresh_install_request_json(local_seed: [u8; 32], group: &str) -> (String, [u8; 32]) {
+        let issuer_seed = [0xAA; 32];
+        let issuer = SigningKey::from_bytes(&issuer_seed);
+        let local_key = PeerKey::from_seed(local_seed);
+        let local_identity = local_key.identity("local");
+        let now = Utc::now();
+        let expires = now + chrono::Duration::hours(1);
+        let issued = now - chrono::Duration::minutes(1);
+        let membership = KChatMembership::issue(
+            KChatGroupId::new(group).unwrap(),
+            local_identity.peer_id.clone(),
+            local_identity.public_key.clone(),
+            issued,
+            expires,
+            &issuer,
+        )
+        .unwrap();
+        let req = KChatInstallRequest {
+            issuer_public_key: membership.issuer_public_key.clone(),
+            group_id: membership.group_id.as_str().to_string(),
+            peer_id: membership.peer_id().as_str().to_string(),
+            peer_public_key: membership.peer_public_key.clone(),
+            issued_at: membership.issued_at,
+            expires_at: membership.expires_at,
+            signature: membership.signature.clone(),
+        };
+        (serde_json::to_string(&req).unwrap(), issuer_seed)
+    }
+
+    #[test]
+    #[serial]
+    fn default_kchat_status_is_locked() {
+        reset_kchat_slot();
+        let status = kchat_membership_status();
+        assert!(status.locked, "default authority should be locked");
+        assert!(status.group_id.is_none());
+        assert!(status.peer_id.is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn session_start_fails_when_locked() {
+        reset_kchat_slot();
+        let _ = session_leave();
+        let seed_b64 = URL_SAFE_NO_PAD.encode([7u8; 32]);
+        let err = session_start(&seed_b64, "ken", Uuid::new_v4(), false).unwrap_err();
+        assert!(
+            matches!(err, SessionBridgeError::NotInKChatGroup),
+            "expected NotInKChatGroup, got {err:?}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn session_join_fails_when_locked() {
+        reset_kchat_slot();
+        let _ = session_leave();
+        // The fixture peer values are well-formed but irrelevant —
+        // the gate fires before any of them are looked at.
+        let key = PeerKey::from_seed([8u8; 32]);
+        let identity = key.identity("Alice");
+        let err = session_join(
+            identity.peer_id.as_str(),
+            &identity.public_key,
+            &identity.display_name,
+            "127.0.0.1:65432",
+            &URL_SAFE_NO_PAD.encode([0u8; 32]),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, SessionBridgeError::NotInKChatGroup),
+            "expected NotInKChatGroup, got {err:?}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn session_send_presence_fails_when_locked() {
+        reset_kchat_slot();
+        let _ = session_leave();
+        let err = session_send_presence(None, Vec::new(), None).unwrap_err();
+        assert!(
+            matches!(err, SessionBridgeError::NotInKChatGroup),
+            "expected NotInKChatGroup, got {err:?}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn install_authority_unlocks_status_and_clear_relocks() {
+        reset_kchat_slot();
+        let (req_json, _) = fresh_install_request_json([9u8; 32], "studio-alpha");
+        let status_json =
+            kchat_install_authority(serde_json::from_str(&req_json).unwrap()).unwrap();
+        assert!(!status_json.locked, "install should unlock");
+        assert_eq!(status_json.group_id.as_deref(), Some("studio-alpha"));
+
+        let polled = kchat_membership_status();
+        assert!(!polled.locked, "status snapshot should match install");
+        assert_eq!(polled.group_id.as_deref(), Some("studio-alpha"));
+
+        let cleared = kchat_clear_authority();
+        assert!(cleared.locked, "clear should re-lock");
+        assert!(kchat_membership_status().locked);
+    }
+
+    #[test]
+    #[serial]
+    fn install_authority_rejects_forged_signature() {
+        reset_kchat_slot();
+        let (req_json, _) = fresh_install_request_json([10u8; 32], "studio-beta");
+        let mut req: KChatInstallRequest = serde_json::from_str(&req_json).unwrap();
+        // Flip a byte inside the base64 signature so verify_strict fails.
+        let mut sig_bytes = URL_SAFE_NO_PAD.decode(req.signature.as_bytes()).unwrap();
+        sig_bytes[0] ^= 0x01;
+        req.signature = URL_SAFE_NO_PAD.encode(sig_bytes);
+        let err = kchat_install_authority(req).unwrap_err();
+        assert!(
+            matches!(err, SessionBridgeError::KChat(_)),
+            "expected KChat verify failure, got {err:?}"
+        );
+        assert!(
+            kchat_membership_status().locked,
+            "failed install must leave the slot locked"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn install_authority_rejects_peer_id_not_matching_public_key() {
+        reset_kchat_slot();
+        let (req_json, _) = fresh_install_request_json([11u8; 32], "studio-gamma");
+        let mut req: KChatInstallRequest = serde_json::from_str(&req_json).unwrap();
+        // Replace the claimed peer id with a different valid one.
+        let other = PeerKey::from_seed([99u8; 32]).peer_id();
+        req.peer_id = other.as_str().to_string();
+        let err = kchat_install_authority(req).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                SessionBridgeError::InvalidArgument {
+                    field: "peerId",
+                    ..
+                }
+            ),
+            "expected InvalidArgument(peerId), got {err:?}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn install_then_session_start_with_wrong_seed_is_still_locked() {
+        reset_kchat_slot();
+        let _ = session_leave();
+        let (req_json, _) = fresh_install_request_json([12u8; 32], "studio-delta");
+        kchat_install_authority(serde_json::from_str(&req_json).unwrap()).unwrap();
+        // Try to start with a *different* seed than the membership
+        // was minted for. Even though the slot is "unlocked" by the
+        // status reporter, session_start re-verifies and bounces.
+        let other_seed_b64 = URL_SAFE_NO_PAD.encode([13u8; 32]);
+        let err = session_start(&other_seed_b64, "ken", Uuid::new_v4(), false).unwrap_err();
+        assert!(
+            matches!(err, SessionBridgeError::NotInKChatGroup),
+            "expected NotInKChatGroup, got {err:?}"
+        );
     }
 }

@@ -45,6 +45,7 @@
 pub mod clock;
 pub mod conflict;
 pub mod envelope;
+pub mod kchat;
 pub mod message;
 pub mod peer;
 pub mod session;
@@ -52,6 +53,10 @@ pub mod session;
 pub use clock::LamportClock;
 pub use conflict::{ConflictDecision, ConflictResolver, LastWriterWinsResolver};
 pub use envelope::{CollabError, Envelope, EnvelopeBytes, SignedPayload, PROTOCOL_VERSION};
+pub use kchat::{
+    no_kchat_authority, BoundKChatGroupAuthority, KChatAuthError, KChatGroupAuthority,
+    KChatGroupId, KChatMembership, NoKChatGroupAuthority, SharedKChatAuthority,
+};
 pub use message::{
     GoodbyeReason, HelloPayload, Message, OperationBroadcastPayload, PresencePayload,
     WelcomePayload, WelcomeStatus,

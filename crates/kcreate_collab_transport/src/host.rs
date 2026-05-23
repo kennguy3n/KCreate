@@ -25,8 +25,9 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use kcreate_collab::{
-    GoodbyeReason, HelloPayload, Message, OperationBroadcastPayload, PeerId, PeerIdentity, PeerKey,
-    PresencePayload, ProjectSession, SessionConfig, WelcomePayload, WelcomeStatus,
+    no_kchat_authority, GoodbyeReason, HelloPayload, Message, OperationBroadcastPayload, PeerId,
+    PeerIdentity, PeerKey, PresencePayload, ProjectSession, SessionConfig, SharedKChatAuthority,
+    WelcomePayload, WelcomeStatus,
 };
 use parking_lot::RwLock;
 use quinn::crypto::rustls::{QuicClientConfig, QuicServerConfig};
@@ -80,6 +81,12 @@ pub struct HostOptions {
     /// Optional override for the session config (replay window /
     /// peer cap). Defaults to [`SessionConfig::default`].
     pub session_config: SessionConfig,
+    /// KChat group authority that gates every Hello/Welcome
+    /// handshake. The default (`no_kchat_authority()`) fails closed
+    /// — `start()` will refuse to construct the host so multiplayer
+    /// stays locked. The bridge layer plugs in a real authority
+    /// only once the user has signed into a KChat group.
+    pub kchat_authority: SharedKChatAuthority,
 }
 
 impl HostOptions {
@@ -95,6 +102,13 @@ impl HostOptions {
             advertise_mdns: false,
             advertise_addrs: Some(vec![std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)]),
             session_config: SessionConfig::default(),
+            // Tests that don't care about the KChat gate use the
+            // default-deny authority and immediately get a typed
+            // `multiplayer locked` error from `start`. Tests that
+            // *do* care construct the loopback options and then
+            // overwrite `kchat_authority` with an
+            // `InProcessKChatAuthority` before calling `start`.
+            kchat_authority: no_kchat_authority(),
         }
     }
 }
@@ -218,12 +232,25 @@ impl LanCollabHost {
         let nonce_seed: [u8; 8] = blake3::hash(opts.project_id.as_bytes()).as_bytes()[..8]
             .try_into()
             .expect("blake3 hash is always >= 8 bytes");
-        let session = ProjectSession::new(
+        // Defence-in-depth gate at the transport boundary: if the
+        // local KChat authority has no membership, refuse to start
+        // the host outright. The session-level gate would catch the
+        // first Hello / Welcome attempt, but failing here keeps the
+        // QUIC endpoint from binding at all and gives the bridge a
+        // clean "multiplayer locked" report instead of a stalled
+        // handshake.
+        if opts.kchat_authority.local_membership().is_none() {
+            return Err(TransportError::UnsupportedAdvertisement(
+                "multiplayer is locked: not signed into a KChat group".into(),
+            ));
+        }
+        let session = ProjectSession::new_with_authority(
             opts.local_key,
             local_identity.display_name.clone(),
             opts.project_id,
             opts.session_config,
             nonce_seed,
+            opts.kchat_authority,
         );
 
         let (inbound_tx, _inbound_rx) = broadcast::channel(INBOUND_CHANNEL_CAPACITY);
@@ -576,6 +603,9 @@ impl LanCollabHost {
                                 "host is on project {}, joiner asked for {}",
                                 self.inner.project_id, payload.project_id
                             ),
+                            // Rejected welcomes deliberately do NOT carry an
+                            // attestation; `seal_message` only stamps accept paths.
+                            kchat_attestation: None,
                         };
                         let frame = {
                             let json = session.seal_message(Message::Welcome(welcome))?;
@@ -591,12 +621,15 @@ impl LanCollabHost {
                 }
                 _ => unreachable!("kind already checked"),
             }
-            // Accept.
+            // Accept. The session's `seal_message` will stamp in the
+            // host's KChat attestation, so the inline construction
+            // leaves it `None`.
             let welcome = WelcomePayload {
                 status: WelcomeStatus::Accepted,
                 host_identity: self.inner.local_identity.clone(),
                 host_clock: session.clock(),
                 reject_reason: String::new(),
+                kchat_attestation: None,
             };
             let frame = {
                 let json = session.seal_message(Message::Welcome(welcome))?;
@@ -626,6 +659,8 @@ impl LanCollabHost {
                 identity: self.inner.local_identity.clone(),
                 project_id: self.inner.project_id,
                 app_version: self.inner.app_version.clone(),
+                // Stamped in by `seal_message` from the local authority.
+                kchat_attestation: None,
             };
             let frame = {
                 let mut session = self.inner.session.lock().await;

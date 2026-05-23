@@ -1678,6 +1678,24 @@ function registerIpcHandlers(): void {
       );
     },
   );
+
+  // ---------------------------------------------------------------------
+  // KChat group authority. The renderer surfaces a "locked"
+  // PresencePanel until a future KChat client invokes
+  // `kchat.install()` with a valid signed membership attestation.
+  // Until then the bridge gate refuses every `session.*` call at the
+  // protocol layer — see
+  // `kcreate_bridge::collab::session_start/join/sendPresence`.
+  // ---------------------------------------------------------------------
+  ipcMain.handle("kcreate/kchat/install", (_e, requestJson: string) =>
+    requireBridge().kchatInstallAuthority(requestJson),
+  );
+  ipcMain.handle("kcreate/kchat/clear", () =>
+    requireBridge().kchatClearAuthority(),
+  );
+  ipcMain.handle("kcreate/kchat/status", () =>
+    requireBridge().kchatMembershipStatus(),
+  );
 }
 
 void app.whenReady().then(() => {

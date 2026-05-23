@@ -17,6 +17,7 @@ use kcreate_core::operation::Operation;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::kchat::KChatMembership;
 use crate::peer::PeerIdentity;
 
 /// One peer-to-peer message. Tagged via `serde`'s default external
@@ -60,6 +61,14 @@ pub enum Message {
 }
 
 /// Initial handshake payload sent by the joining peer.
+///
+/// Carries the joiner's [`KChatMembership`] attestation so the host
+/// can refuse the connection if (a) the joiner is not in the host's
+/// KChat group, or (b) the attestation is forged / expired. This is
+/// the protocol-level half of the KChat-gated multiplayer
+/// contract; the bridge layer enforces the same gate before even
+/// reaching this code, but the on-wire field exists so a future
+/// out-of-tree transport cannot bypass it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HelloPayload {
@@ -72,9 +81,24 @@ pub struct HelloPayload {
     /// human-readable display only; protocol gating is via
     /// [`crate::envelope::PROTOCOL_VERSION`].
     pub app_version: String,
+    /// Joiner's KChat group membership attestation. The host
+    /// verifies this against its own [`crate::KChatGroupAuthority`]
+    /// trust root + group; mismatches reject the handshake. Absent
+    /// when the joiner is not bound to a KChat group, in which case
+    /// the bridge refuses to construct a Hello in the first place
+    /// (defense-in-depth — the field is `Option` for compatibility
+    /// with the local-roundtrip tests that don't simulate KChat,
+    /// but `kcreate_collab_transport` always populates it).
+    #[serde(default)]
+    pub kchat_attestation: Option<KChatMembership>,
 }
 
 /// Response sent by the host peer.
+///
+/// Mirrors [`HelloPayload::kchat_attestation`] on the way back so
+/// the joiner can verify the host is in the same group. Without
+/// this mutual check, a malicious joiner could shake hands with a
+/// host outside its group by forging only the inbound half.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WelcomePayload {
@@ -91,6 +115,11 @@ pub struct WelcomePayload {
     /// On reject, a short human-readable reason. Empty on accept.
     #[serde(default)]
     pub reject_reason: String,
+    /// Host's own KChat group membership attestation. Joiner
+    /// verifies against its own trust root + group; mismatches
+    /// abort the session.
+    #[serde(default)]
+    pub kchat_attestation: Option<KChatMembership>,
 }
 
 /// Outcome of a [`Message::Hello`].
@@ -182,6 +211,7 @@ mod tests {
             identity: k.identity("Ken"),
             project_id: Uuid::nil(),
             app_version: "0.0.1+phase2".into(),
+            kchat_attestation: None,
         });
         let v: serde_json::Value = serde_json::to_value(&msg).unwrap();
         assert_eq!(v["kind"], "hello");
@@ -203,6 +233,7 @@ mod tests {
             host_identity: k.identity("Host"),
             host_clock: LamportClock::from_raw(42),
             reject_reason: String::new(),
+            kchat_attestation: None,
         });
         let s = serde_json::to_string(&msg).unwrap();
         let back: Message = serde_json::from_str(&s).unwrap();

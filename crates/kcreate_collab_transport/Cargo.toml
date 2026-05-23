@@ -54,3 +54,7 @@ blake3.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }
 chrono = { workspace = true, features = ["serde"] }
+# Pull the in-process KChat authority into the integration tests so
+# they can drive the multiplayer pipeline against a deterministic
+# issuer key without standing up a real KChat server.
+kcreate_collab = { path = "../kcreate_collab", features = ["test-support"] }

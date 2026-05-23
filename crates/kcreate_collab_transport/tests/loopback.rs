@@ -8,14 +8,22 @@
 //! production. The discovery layer is covered by its own unit tests
 //! in `src/discovery.rs`.
 
+use std::sync::Arc;
 use std::time::Duration;
 
-use kcreate_collab::{Message, PeerKey, PresencePayload};
+use kcreate_collab::kchat::InProcessKChatAuthority;
+use kcreate_collab::{KChatGroupId, Message, PeerKey, PresencePayload};
 use kcreate_collab_transport::{HostOptions, InboundEvent, LanCollabHost};
 use tokio::time::timeout;
 use uuid::Uuid;
 
 const RECV_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Shared in-process KChat issuer seed for the loopback test suite.
+/// All hosts started by `start_host` share this issuer + group so
+/// every Hello/Welcome attestation cross-verifies successfully.
+const TEST_ISSUER_SEED: [u8; 32] = [0xCA; 32];
+const TEST_GROUP_ID: &str = "loopback-group";
 
 fn fresh_key(seed_byte: u8) -> PeerKey {
     let mut seed = [0u8; 32];
@@ -26,7 +34,23 @@ fn fresh_key(seed_byte: u8) -> PeerKey {
 }
 
 async fn start_host(seed_byte: u8, display_name: &str, project_id: Uuid) -> LanCollabHost {
-    let opts = HostOptions::loopback(fresh_key(seed_byte), display_name.to_string(), project_id);
+    let key = fresh_key(seed_byte);
+    let identity = key.identity(display_name.to_string());
+    let issued = chrono::Utc::now() - chrono::Duration::minutes(1);
+    let expires = chrono::Utc::now() + chrono::Duration::hours(1);
+    let auth = Arc::new(
+        InProcessKChatAuthority::for_peer(
+            TEST_ISSUER_SEED,
+            KChatGroupId::new(TEST_GROUP_ID).unwrap(),
+            identity.peer_id,
+            identity.public_key,
+            issued,
+            expires,
+        )
+        .expect("issue in-process KChat membership"),
+    );
+    let mut opts = HostOptions::loopback(key, display_name.to_string(), project_id);
+    opts.kchat_authority = auth;
     LanCollabHost::start(opts)
         .await
         .expect("transport host should start on loopback")

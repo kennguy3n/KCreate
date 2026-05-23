@@ -388,6 +388,14 @@ export interface Bridge {
     cursorJson: string | null,
   ): void;
   sessionInfo(): string;
+  // KChat group authority — multiplayer gate. Until
+  // `kchatInstallAuthority` is called with a valid JSON
+  // `KChatInstallRequest`, every `session*` call rejects with
+  // `NotInKChatGroup`. The KChat client (out of tree) is the
+  // only thing authorised to install an authority.
+  kchatInstallAuthority(requestJson: string): string;
+  kchatClearAuthority(): string;
+  kchatMembershipStatus(): string;
   /// Re-publish the cached scene. Used by the session event tick
   /// to refresh remote-peer cursor overlays.
   documentRequestRender(): void;

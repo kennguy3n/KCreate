@@ -1742,6 +1742,28 @@ app.on("will-quit", (event) => {
         await removeScratchLockfile(ownedScratchPath);
         ownedScratchPath = null;
       }
+      // Tear down any live collab session BEFORE projectClose /
+      // rendererShutdown. The order matters:
+      //   1. Stop the event-tick timer so we don't race the bridge
+      //      drain against the leave path.
+      //   2. Call sessionLeave so peers receive a Goodbye on the
+      //      live QUIC connection (otherwise they wait ~30 s for the
+      //      QUIC idle timeout — see kcreate_collab_transport/host.rs)
+      //      and the runtime's mDNS responder is dropped cleanly.
+      //   3. Then close the project + shut the renderer down as
+      //      before.
+      // All three wrapped in try so a bug in the leave path can't
+      // block app quit. sessionLeave throws when no session is
+      // running, which is the common case (most users quit without
+      // a live session), so swallowing the throw is correct.
+      stopSessionEventTick();
+      if (bridge) {
+        try {
+          bridge.sessionLeave();
+        } catch {
+          // No session was running — nothing to leave.
+        }
+      }
       if (bridge) {
         // `projectClose` is sync and infallible (it just drops the
         // workspace slot). Wrap in try so a bug here never blocks

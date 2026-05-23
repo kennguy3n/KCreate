@@ -117,12 +117,28 @@ export function PresencePanel({
   const peersRef = useRef(peers);
   peersRef.current = peers;
   useEffect(() => {
-    const unsubscribe = window.kcreate.session.onEvent(async (ev) => {
-      await handleEvent(ev, {
+    // `onEvent` expects a synchronous `(SessionEvent) => void`
+    // callback. `handleEvent` is async (it awaits a bridge round
+    // trip for `peers()` updates), so wrapping it in an async arrow
+    // would silently fire-and-forget the returned promise — any
+    // future await that throws outside the inner try/catch becomes
+    // an unhandled rejection. Instead, kick the async work off with
+    // an explicit `.catch` so every rejection path is visible.
+    const unsubscribe = window.kcreate.session.onEvent((ev) => {
+      handleEvent(ev, {
         setPeers,
         setDiscovered,
         peersRef,
         onStatus,
+      }).catch((err) => {
+        // PresencePanel never blocks the user on a single bad event:
+        // log it for diagnostics, surface a status line, and let the
+        // next event try again. We don't `setError` here because
+        // `error` is reserved for actions the user just took
+        // (start/join/leave) — a background event failure shouldn't
+        // override that.
+        console.error("[PresencePanel] event handler failed:", err);
+        onStatus?.(`Session: event handler failed — ${errMsg(err)}`);
       });
     });
     return () => {

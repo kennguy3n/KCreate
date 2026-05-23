@@ -178,6 +178,24 @@ pub fn set_viewport(pan_x: f32, pan_y: f32, zoom: f32) -> Result<()> {
     Ok(())
 }
 
+/// Read the current viewport pixels-per-scene-unit zoom factor.
+///
+/// Used by `document::sync_scene_locked` to size remote-peer
+/// cursors in screen space (`append_presence_cursors` divides
+/// screen-pixel constants by this value so the on-screen cursor
+/// triangle is a constant size regardless of pan/zoom).
+///
+/// Returns `Ok(1.0)` when no renderer is attached so the caller can
+/// fall back to world-space sizing in headless contexts without a
+/// special-case branch.
+pub fn viewport_zoom() -> f32 {
+    let guard = slot().lock();
+    match guard.as_ref() {
+        Some(ctx) => ctx.viewport().zoom,
+        None => 1.0,
+    }
+}
+
 pub fn invalidate(region: Option<Rect>) -> Result<()> {
     let guard = slot().lock();
     let ctx = guard.as_ref().ok_or(BridgeError::NotInitialized)?;

@@ -113,19 +113,29 @@ const ARTBOARD_LABEL_FONT: &str = "Inter";
 /// Default label font size in document pixels.
 const ARTBOARD_LABEL_FONT_SIZE: f32 = 12.0;
 
-/// Width (world units) of the remote-peer cursor triangle. Sized
-/// to read clearly at 1.0 zoom without overlapping fine vector
-/// detail; the renderer scales it with the viewport like every
-/// other scene object.
+/// Width (in screen pixels) of the remote-peer cursor triangle.
+/// `append_presence_cursors` divides this by the current viewport
+/// zoom to produce a world-space size, so the on-screen triangle
+/// stays a constant size as the user pans / zooms — matching the
+/// Figma / Photoshop convention for remote cursors. Sized to read
+/// clearly without overlapping fine vector detail.
 const CURSOR_WIDTH: f32 = 14.0;
-/// Height (world units) of the remote-peer cursor triangle.
+/// Height (in screen pixels) of the remote-peer cursor triangle.
 const CURSOR_HEIGHT: f32 = 18.0;
-/// Gap between the cursor's bounding box and the name label.
+/// Gap (in screen pixels) between the cursor's bounding box and
+/// the name label.
 const CURSOR_LABEL_GAP: f32 = 2.0;
-/// Font size used for the cursor's display-name label. Slightly
-/// smaller than artboard labels because cursors stack up when
-/// multiple peers are in the same area.
+/// Font size (in screen pixels) used for the cursor's display-name
+/// label. Slightly smaller than artboard labels because cursors
+/// stack up when multiple peers are in the same area.
 const CURSOR_LABEL_FONT_SIZE: f32 = 10.0;
+/// Minimum viewport zoom factor used when scaling cursor geometry
+/// from screen-space pixels into world-space units. Cursors stop
+/// growing once the user has zoomed out beyond this point — at
+/// extreme zoom-outs a cursor proportionally inflated to stay
+/// 14 px wide would dwarf the document, which is worse UX than
+/// a cursor that disappears below the resolution floor.
+const CURSOR_MIN_VIEWPORT_ZOOM: f32 = 0.05;
 
 /// World-space cursor + label payload for a single remote peer.
 ///
@@ -185,11 +195,21 @@ pub const fn is_selection_highlight_id(id: ObjectId) -> bool {
 /// The id allocator is intentionally local to each [`SceneSync`] —
 /// it's not a process-global counter — so tests can construct
 /// independent sync instances and reason about deterministic ids.
+///
+/// `overlay_watermark` is the next overlay ID that
+/// [`append_presence_cursors`] should allocate from. It is reset
+/// to [`OVERLAY_ID_THRESHOLD`] at the start of every
+/// [`sync_document_to_scene`] call and advanced past every artboard
+/// overlay emitted during that call, so a follow-up
+/// `append_presence_cursors` continues the same upward stream
+/// rather than restarting at the threshold and colliding with the
+/// artboard overlays that just got emitted.
 #[derive(Debug, Default)]
 pub struct SceneSync {
     uuid_to_object_id: HashMap<Uuid, ObjectId>,
     object_id_to_uuid: HashMap<ObjectId, Uuid>,
     next_id: AtomicU64,
+    overlay_watermark: u64,
 }
 
 impl SceneSync {
@@ -200,6 +220,7 @@ impl SceneSync {
             object_id_to_uuid: HashMap::new(),
             // ObjectId(0) is reserved as a sentinel for "no object".
             next_id: AtomicU64::new(1),
+            overlay_watermark: OVERLAY_ID_THRESHOLD,
         }
     }
 
@@ -241,6 +262,7 @@ impl SceneSync {
         self.uuid_to_object_id.clear();
         self.object_id_to_uuid.clear();
         self.next_id.store(1, Ordering::Relaxed);
+        self.overlay_watermark = OVERLAY_ID_THRESHOLD;
     }
 
     fn allocate(&self, doc_id: Uuid) -> ObjectId {
@@ -295,6 +317,11 @@ impl SceneSync {
         let mut scene = Scene::new(DEFAULT_CLEAR);
         let mut z = 0_i32;
         let mut emitted_uuids: Vec<Uuid> = Vec::new();
+        // Reset every sync: `sync_document_to_scene` rebuilds the
+        // scene from scratch, so the previous watermark is stale.
+        // `append_presence_cursors` (called after this returns) will
+        // pick up the post-walk value and continue the same upward
+        // stream so cursor overlays do not collide with artboards.
         let mut overlay = OverlayIdAllocator::new();
         for root in doc.root_ids() {
             self.visit(
@@ -316,6 +343,12 @@ impl SceneSync {
         self.uuid_to_object_id.retain(|uuid, _| kept.contains(uuid));
         // Mirror the prune into the reverse map.
         self.object_id_to_uuid.retain(|_, uuid| kept.contains(uuid));
+
+        // Persist the watermark for follow-up overlay emitters
+        // (notably `append_presence_cursors`). Selection highlights
+        // count downward from `u64::MAX` so they don't participate in
+        // this watermark — see [`Self::append_presence_cursors`].
+        self.overlay_watermark = overlay.next;
 
         // Selection highlights go on top, sorted by document order so
         // overlapping selections paint deterministically.
@@ -366,26 +399,55 @@ impl SceneSync {
     ///
     /// The objects are emitted through the same scene-graph path as
     /// real document layers — they composite naturally with strokes,
-    /// fills, and effects, and they pan/zoom with the canvas because
-    /// the renderer applies viewport to all objects equally. Hit
-    /// testing is unaffected: the ids come from the overlay range
-    /// (high half of `u64`) so `is_overlay_id` returns true and
-    /// `hit_test` filters them out before reverse-z scanning.
+    /// fills, and effects. Hit testing is unaffected: the ids come
+    /// from the overlay range (high half of `u64`) so
+    /// `is_overlay_id` returns true and `hit_test` filters them out
+    /// before reverse-z scanning.
+    ///
+    /// `viewport_zoom` is the renderer's current pixels-per-scene-unit
+    /// scale. The cursor triangle, label gap, and label font size
+    /// are quoted in **screen pixels** ([`CURSOR_WIDTH`],
+    /// [`CURSOR_HEIGHT`], [`CURSOR_LABEL_FONT_SIZE`]) and divided by
+    /// the viewport zoom before being baked into the scene, so the
+    /// renderer ends up drawing them at a constant on-screen size
+    /// regardless of pan/zoom — matching the Figma / Photoshop
+    /// remote-cursor convention. `viewport_zoom` is clamped to
+    /// [`CURSOR_MIN_VIEWPORT_ZOOM`] to avoid runaway sizes at
+    /// extreme zoom-outs and to defend against any caller that
+    /// might pass `0.0` or a negative value.
+    ///
+    /// Cursor overlay IDs continue the same upward stream that
+    /// [`sync_document_to_scene`] used for artboard overlays (via
+    /// the persisted `overlay_watermark`), so cursor and artboard
+    /// overlays never collide in the high `[OVERLAY_ID_THRESHOLD,
+    /// u64::MAX]` range — even though both streams count upward
+    /// from the same base.
     pub fn append_presence_cursors(
         &mut self,
         scene: &mut Scene,
         cursors: &[PresenceCursor],
         starting_z: i32,
+        viewport_zoom: f32,
     ) {
         if cursors.is_empty() {
             return;
         }
-        let mut overlay = OverlayIdAllocator::new();
-        // Skip past the OBJECT-id range used by selection highlights
-        // earlier in this scene by relying on the OverlayIdAllocator
-        // starting from OVERLAY_ID_THRESHOLD upward — selection
-        // highlights count down from u64::MAX, so the two streams
-        // can't collide unless either side allocates ~2^63 ids.
+        // Continue the overlay-id stream where `sync_document_to_scene`
+        // left off (artboard shadows + labels emitted earlier in this
+        // scene). Restarting at `OVERLAY_ID_THRESHOLD` would collide
+        // with every artboard overlay in the scene; selection
+        // highlights are not at risk because they count *downward*
+        // from `u64::MAX`.
+        let mut overlay = OverlayIdAllocator::resuming(self.overlay_watermark);
+        // Convert screen-pixel constants to world units. Clamp to
+        // avoid div-by-zero on uninitialised viewports and runaway
+        // sizes at very small zooms (cursor that fills the canvas is
+        // worse UX than a cursor that vanishes below resolution).
+        let zoom = viewport_zoom.max(CURSOR_MIN_VIEWPORT_ZOOM);
+        let cursor_width_world = CURSOR_WIDTH / zoom;
+        let cursor_height_world = CURSOR_HEIGHT / zoom;
+        let cursor_label_gap_world = CURSOR_LABEL_GAP / zoom;
+        let cursor_label_font_size_world = CURSOR_LABEL_FONT_SIZE / zoom;
         let mut z = starting_z;
         for cursor in cursors {
             let color = peer_color(&cursor.peer_id);
@@ -397,12 +459,18 @@ impl SceneSync {
             // tesselate on the CPU backend.
             let path = vec![
                 PathCommand::MoveTo(Point2::new(cx, cy)),
-                PathCommand::LineTo(Point2::new(cx + CURSOR_WIDTH, cy + CURSOR_HEIGHT * 0.6)),
                 PathCommand::LineTo(Point2::new(
-                    cx + CURSOR_WIDTH * 0.45,
-                    cy + CURSOR_HEIGHT * 0.6,
+                    cx + cursor_width_world,
+                    cy + cursor_height_world * 0.6,
                 )),
-                PathCommand::LineTo(Point2::new(cx + CURSOR_WIDTH * 0.3, cy + CURSOR_HEIGHT)),
+                PathCommand::LineTo(Point2::new(
+                    cx + cursor_width_world * 0.45,
+                    cy + cursor_height_world * 0.6,
+                )),
+                PathCommand::LineTo(Point2::new(
+                    cx + cursor_width_world * 0.3,
+                    cy + cursor_height_world,
+                )),
                 PathCommand::Close,
             ];
             let cursor_style = Style {
@@ -422,8 +490,8 @@ impl SceneSync {
             // renderer happily wastes a glyph cache slot on.
             if !cursor.display_name.is_empty() {
                 let label_origin = Point2::new(
-                    cx + CURSOR_WIDTH + CURSOR_LABEL_GAP,
-                    cy + CURSOR_HEIGHT + CURSOR_LABEL_FONT_SIZE,
+                    cx + cursor_width_world + cursor_label_gap_world,
+                    cy + cursor_height_world + cursor_label_font_size_world,
                 );
                 let label_style = Style {
                     fill: Some(color),
@@ -435,7 +503,7 @@ impl SceneSync {
                         origin: label_origin,
                         text: cursor.display_name.clone(),
                         font_family: ARTBOARD_LABEL_FONT.to_string(),
-                        font_size: CURSOR_LABEL_FONT_SIZE,
+                        font_size: cursor_label_font_size_world,
                     },
                     label_style,
                 )
@@ -445,6 +513,10 @@ impl SceneSync {
                 z += 1;
             }
         }
+        // Persist the watermark so a follow-up cursor append (e.g. a
+        // second presence push in the same frame, hypothetically)
+        // continues the stream too.
+        self.overlay_watermark = overlay.next;
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -748,6 +820,14 @@ fn vector_path_to_renderer(path: &VectorPath) -> Vec<PathCommand> {
 /// [`OVERLAY_ID_THRESHOLD`] and counts upward; selection highlights
 /// count downward from `u64::MAX` so the two streams never collide
 /// in practice (they'd need to span ~2^63 ids first).
+///
+/// Two callers in `SceneSync` allocate from this upward stream
+/// during a single sync: `sync_document_to_scene` (artboard
+/// shadows + labels) and `append_presence_cursors` (remote-peer
+/// cursors). The second caller resumes from the first caller's
+/// post-walk watermark (`SceneSync::overlay_watermark`) so the two
+/// allocations share one contiguous range instead of restarting
+/// from `OVERLAY_ID_THRESHOLD` and colliding.
 #[derive(Debug)]
 struct OverlayIdAllocator {
     next: u64,
@@ -757,6 +837,19 @@ impl OverlayIdAllocator {
     fn new() -> Self {
         Self {
             next: OVERLAY_ID_THRESHOLD,
+        }
+    }
+
+    /// Resume the upward overlay stream from a previously-saved
+    /// watermark. Used by [`SceneSync::append_presence_cursors`]
+    /// to continue past the artboard overlay IDs emitted earlier in
+    /// the same sync. Values below [`OVERLAY_ID_THRESHOLD`] are
+    /// clamped up, so a caller that forgets to seed the watermark
+    /// from `sync_document_to_scene` still produces overlay-range
+    /// IDs rather than colliding with document-backed objects.
+    fn resuming(watermark: u64) -> Self {
+        Self {
+            next: watermark.max(OVERLAY_ID_THRESHOLD),
         }
     }
 }
@@ -1129,5 +1222,178 @@ mod tests {
         let scene = sync.sync_document_to_scene(&doc, None, &[]);
         let obj = &scene.objects[0];
         assert_eq!(obj.translation, (50.0, 75.0));
+    }
+
+    /// Regression: presence cursor overlay IDs must not collide with
+    /// artboard overlay IDs (both streams previously restarted at
+    /// `OVERLAY_ID_THRESHOLD`, so a scene with N artboard overlays
+    /// would emit N pairs of identical `ObjectId`s — one in the
+    /// artboard set, one in the cursor set).
+    #[test]
+    fn presence_cursor_ids_do_not_collide_with_artboard_overlays() {
+        let mut doc = DocumentGraph::new();
+        // Two named artboards, each contributing shadow + label = 4
+        // artboard overlays in total. (The artboard background itself
+        // gets a document-backed id, not an overlay id.)
+        for (i, name) in ["A", "B"].iter().enumerate() {
+            let mut art = Node::new(NodeType::Artboard, *name);
+            art.bounds = Bounds {
+                x: (i as f64) * 200.0,
+                y: 0.0,
+                width: 100.0,
+                height: 100.0,
+            };
+            doc.insert_node(art).expect("insert artboard");
+        }
+
+        let mut sync = SceneSync::new();
+        let mut scene = sync.sync_document_to_scene(&doc, None, &[]);
+
+        // Snapshot the overlay-id set emitted by the document walk.
+        let pre_cursor_overlay_ids: std::collections::HashSet<ObjectId> = scene
+            .objects
+            .iter()
+            .map(|o| o.id)
+            .filter(|id| is_overlay_id(*id))
+            .collect();
+        assert!(
+            !pre_cursor_overlay_ids.is_empty(),
+            "two named artboards should emit at least one overlay id each"
+        );
+
+        // Append two presence cursors with display names (each cursor
+        // emits a triangle + label = 2 overlay ids).
+        let cursors = vec![
+            PresenceCursor {
+                peer_id: "peer-1".into(),
+                display_name: "Alice".into(),
+                x: 10.0,
+                y: 10.0,
+            },
+            PresenceCursor {
+                peer_id: "peer-2".into(),
+                display_name: "Bob".into(),
+                x: 50.0,
+                y: 50.0,
+            },
+        ];
+        sync.append_presence_cursors(&mut scene, &cursors, 0, 1.0);
+
+        // Every overlay id in the final scene must be unique. The
+        // pre-cursor and post-cursor overlay sets must be disjoint.
+        let all_overlay_ids: Vec<ObjectId> = scene
+            .objects
+            .iter()
+            .map(|o| o.id)
+            .filter(|id| is_overlay_id(*id))
+            .collect();
+        let unique_overlay_ids: std::collections::HashSet<ObjectId> =
+            all_overlay_ids.iter().copied().collect();
+        assert_eq!(
+            all_overlay_ids.len(),
+            unique_overlay_ids.len(),
+            "overlay-id collision: artboard overlays and presence cursor overlays both restarted from the same base. ids = {all_overlay_ids:?}"
+        );
+
+        let post_cursor_overlay_ids: std::collections::HashSet<ObjectId> = unique_overlay_ids
+            .difference(&pre_cursor_overlay_ids)
+            .copied()
+            .collect();
+        assert_eq!(
+            post_cursor_overlay_ids.len(),
+            4,
+            "two cursors with names should emit 4 new overlay ids (triangle + label each)"
+        );
+        assert!(
+            pre_cursor_overlay_ids.is_disjoint(&post_cursor_overlay_ids),
+            "presence cursor ids must not overlap with artboard overlay ids"
+        );
+    }
+
+    /// Cursor geometry must be scaled by `1 / viewport_zoom` so it
+    /// stays a constant on-screen size as the user zooms.
+    #[test]
+    fn presence_cursor_geometry_scales_inversely_with_viewport_zoom() {
+        let mut sync = SceneSync::new();
+        let cursors = vec![PresenceCursor {
+            peer_id: "peer-1".into(),
+            display_name: "Alice".into(),
+            x: 0.0,
+            y: 0.0,
+        }];
+
+        let mut scene_1x = Scene::new(DEFAULT_CLEAR);
+        sync.append_presence_cursors(&mut scene_1x, &cursors, 0, 1.0);
+        let mut scene_2x = Scene::new(DEFAULT_CLEAR);
+        sync.append_presence_cursors(&mut scene_2x, &cursors, 0, 2.0);
+
+        // The triangle path's longest edge encodes the cursor width.
+        // At 2x zoom, the cursor should be half as wide in world
+        // units (so it stays the same on-screen pixel size).
+        let width_at = |scene: &Scene| match &scene.objects[0].kind {
+            ObjectKind::Path(cmds) => match cmds.get(1) {
+                Some(PathCommand::LineTo(p)) => p.x,
+                other => panic!("expected LineTo at index 1, got {other:?}"),
+            },
+            other => panic!("expected Path cursor, got {other:?}"),
+        };
+        let w1 = width_at(&scene_1x);
+        let w2 = width_at(&scene_2x);
+        assert!(
+            (w1 - 2.0 * w2).abs() < 1e-4,
+            "cursor at 2x zoom should be half the world-space width of cursor at 1x: w1 = {w1}, w2 = {w2}"
+        );
+
+        // The label's font_size should also scale inversely.
+        let font_at = |scene: &Scene| match &scene.objects[1].kind {
+            ObjectKind::Text { font_size, .. } => *font_size,
+            other => panic!("expected Text label, got {other:?}"),
+        };
+        let f1 = font_at(&scene_1x);
+        let f2 = font_at(&scene_2x);
+        assert!(
+            (f1 - 2.0 * f2).abs() < 1e-4,
+            "label font_size at 2x zoom should be half: f1 = {f1}, f2 = {f2}"
+        );
+    }
+
+    /// `append_presence_cursors` clamps very small / zero / negative
+    /// zooms to [`CURSOR_MIN_VIEWPORT_ZOOM`] so cursors don't explode
+    /// or blow up to NaN. Whether we pass 0.0 or a negative value,
+    /// the resulting cursor geometry must be finite and bounded.
+    #[test]
+    fn presence_cursor_clamps_pathological_viewport_zoom() {
+        let mut sync = SceneSync::new();
+        let cursors = vec![PresenceCursor {
+            peer_id: "peer-1".into(),
+            display_name: String::new(),
+            x: 0.0,
+            y: 0.0,
+        }];
+
+        for bad_zoom in [0.0, -1.0, f32::EPSILON / 1000.0] {
+            let mut scene = Scene::new(DEFAULT_CLEAR);
+            sync.append_presence_cursors(&mut scene, &cursors, 0, bad_zoom);
+            assert_eq!(scene.objects.len(), 1, "exactly one cursor triangle");
+            match &scene.objects[0].kind {
+                ObjectKind::Path(cmds) => {
+                    for cmd in cmds {
+                        if let PathCommand::LineTo(p) | PathCommand::MoveTo(p) = cmd {
+                            assert!(
+                                p.x.is_finite() && p.y.is_finite(),
+                                "cursor at zoom {bad_zoom} produced non-finite vertex {p:?}"
+                            );
+                            // CURSOR_WIDTH / CURSOR_MIN_VIEWPORT_ZOOM = 14 / 0.05 = 280
+                            assert!(
+                                p.x.abs() <= 400.0,
+                                "cursor at zoom {bad_zoom} produced runaway vertex x = {}",
+                                p.x
+                            );
+                        }
+                    }
+                }
+                other => panic!("expected path cursor, got {other:?}"),
+            }
+        }
     }
 }

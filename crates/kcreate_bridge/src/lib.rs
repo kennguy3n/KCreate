@@ -2025,6 +2025,22 @@ pub fn session_send_presence(
     crate::collab::session_send_presence(active, selection, cursor).map_err(map_session_err)
 }
 
+/// Block 7: read the running session's operation journal summary
+/// as a JSON `SessionJournalSummary`. KChat-gated; returns an
+/// error envelope if multiplayer is locked or no session is
+/// running.
+#[cfg(feature = "collab")]
+#[napi]
+pub fn session_journal_summary() -> NapiResult<String> {
+    let summary = crate::collab::session_journal_summary().map_err(map_session_err)?;
+    serde_json::to_string(&summary).map_err(|e| {
+        NapiError::new(
+            Status::GenericFailure,
+            format!("kcreate_bridge: session_journal_summary serialize: {e}"),
+        )
+    })
+}
+
 /// Read the cached `SessionStartReport` for the running session,
 /// or `null` if no session is running. Returns a JSON string so
 /// the renderer can deserialize directly into its TS type.

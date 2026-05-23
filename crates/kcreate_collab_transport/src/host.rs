@@ -859,5 +859,7 @@ fn message_kind(message: &Message) -> &'static str {
         Message::Presence(_) => "Presence",
         Message::Heartbeat => "Heartbeat",
         Message::Goodbye(_) => "Goodbye",
+        Message::ResumeRequest(_) => "ResumeRequest",
+        Message::ResumeBundle(_) => "ResumeBundle",
     }
 }

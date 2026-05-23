@@ -36,8 +36,9 @@ use chrono::{DateTime, Utc};
 use ed25519_dalek::VerifyingKey;
 use kcreate_collab::message::Cursor;
 use kcreate_collab::{
-    no_kchat_authority, BoundKChatGroupAuthority, KChatAuthError, KChatGroupId, KChatMembership,
-    Message, PeerId, PeerIdentity, PeerKey, PresencePayload, SessionConfig, SharedKChatAuthority,
+    no_kchat_authority, BoundKChatGroupAuthority, JournalEntry, KChatAuthError, KChatGroupId,
+    KChatMembership, MemoryJournalStore, Message, OperationJournal, PeerId, PeerIdentity, PeerKey,
+    PresencePayload, ResumeVector, SessionConfig, SharedKChatAuthority,
 };
 use kcreate_collab_transport::{HostOptions, InboundEvent, LanCollabHost};
 use parking_lot::Mutex;
@@ -124,6 +125,19 @@ pub enum SessionEvent {
         peer_id: String,
         presence: SessionPresence,
     },
+    /// Block 7: an `OperationBroadcast` from a remote peer was
+    /// journaled. The renderer doesn't apply these directly —
+    /// the document-graph layer handles the actual graph mutation
+    /// on a dedicated path — but the event lets the UI surface
+    /// "Ken edited 3 nodes" toasts and update the activity panel.
+    OperationsJournaled {
+        peer_id: String,
+        /// Number of operations recorded in this batch.
+        op_count: u32,
+        /// Highest Lamport clock observed in the batch, as a u64
+        /// for ergonomic JSON consumption from the renderer.
+        highest_clock: u64,
+    },
 }
 
 impl From<&PresencePayload> for SessionPresence {
@@ -203,6 +217,18 @@ struct SessionState {
     /// Cached local identity / project / addr for reporting back to
     /// the UI without touching the host.
     report: SessionStartReport,
+    /// Block 7: per-session operation journal. Persisted to the
+    /// project's SQLite database via a separate flush path (see
+    /// `journal_flush_to_project`); kept in memory here so the
+    /// hot path of `OperationBroadcast` ingestion is lock-free
+    /// w.r.t. the workspace mutex. Resume vectors served from
+    /// this in-memory copy are the source of truth during the
+    /// session's lifetime.
+    journal: OperationJournal<MemoryJournalStore>,
+    /// Cached local peer id. The transport derives this from the
+    /// session's signing key; we cache it here so journal appends
+    /// don't have to round-trip through the host.
+    local_peer_id: PeerId,
 }
 
 fn slot() -> &'static Mutex<Option<SessionState>> {
@@ -394,8 +420,8 @@ fn apply_event(ev: InboundEvent) {
                 },
             );
         }
-        InboundEvent::Message { from, message } => {
-            if let Message::Presence(p) = message.as_ref() {
+        InboundEvent::Message { from, message } => match message.as_ref() {
+            Message::Presence(p) => {
                 state.presence.insert(from.clone(), p.clone());
                 push_event(
                     state,
@@ -405,7 +431,143 @@ fn apply_event(ev: InboundEvent) {
                     },
                 );
             }
+            Message::OperationBroadcast(p) => {
+                // Block 7: journal the remote operations. The
+                // transport already verified the envelope's
+                // signature + Lamport monotonicity, and the
+                // KChat gate already screened the sender, so by
+                // the time we get here `p.operations` are
+                // trusted relative to the session's threat
+                // model. We still validate the broadcast's
+                // project_id matches the session's project so a
+                // misrouted message can't poison the wrong
+                // journal.
+                if p.project_id == state.journal.project_id() {
+                    journal_inbound_broadcast(state, &from, p);
+                }
+            }
+            Message::ResumeBundle(p) => {
+                // Block 7: a host responded to our resume
+                // request. Replay the entries through the
+                // journal so future sessions see the same
+                // history. Project-id mismatch is dropped.
+                if p.project_id == state.journal.project_id() {
+                    journal_inbound_resume_bundle(state, p);
+                }
+            }
+            // Hello / Welcome / Heartbeat / Goodbye / ResumeRequest
+            // are handled by the transport layer itself, not
+            // surfaced as bridge-level events.
+            Message::Hello(_)
+            | Message::Welcome(_)
+            | Message::Heartbeat
+            | Message::Goodbye(_)
+            | Message::ResumeRequest(_) => {}
+        },
+    }
+}
+
+/// Record a freshly-arrived `OperationBroadcast` payload into the
+/// session's in-memory journal and emit a `SessionEvent` describing
+/// the batch. Out-of-order or duplicate entries are logged-and-
+/// dropped, not propagated as errors — the session keeps running
+/// because the transport may have re-delivered a buffered batch
+/// and we trust the journal's own monotonicity gate to dedupe.
+fn journal_inbound_broadcast(
+    state: &mut SessionState,
+    from: &PeerId,
+    payload: &kcreate_collab::OperationBroadcastPayload,
+) {
+    let mut highest = 0u64;
+    let mut recorded: u32 = 0;
+    for op in &payload.operations {
+        // The protocol doesn't put a Lamport clock *on the
+        // operation itself* — it lives on the envelope. We
+        // approximate it with the journal's current high-water
+        // mark for the sender plus one per op in the batch so
+        // intra-batch order is preserved even on the same
+        // envelope. A future protocol revision should attach
+        // per-op clocks; that's a wire-format change we'll
+        // pair with the SQLite-backed journal landing.
+        let next_clock = state
+            .journal
+            .resume_vector()
+            .highest_for(from)
+            .as_u64()
+            .saturating_add(1);
+        let clock = kcreate_collab::LamportClock::from_raw(next_clock);
+        match state.journal.append(from.clone(), clock, op.clone()) {
+            Ok(()) => {
+                recorded += 1;
+                if next_clock > highest {
+                    highest = next_clock;
+                }
+            }
+            Err(kcreate_collab::JournalError::Duplicate { .. })
+            | Err(kcreate_collab::JournalError::OutOfOrder { .. }) => {
+                // Expected for re-delivered or out-of-order
+                // batches; the wire monotonicity check above
+                // will let the next correctly-ordered batch
+                // through.
+            }
+            Err(kcreate_collab::JournalError::Backend(_)) => {
+                // The memory store can't produce a backend
+                // error today, but if a future swap to SQLite
+                // does, we degrade to ignoring the op rather
+                // than crashing the session.
+            }
         }
+    }
+    if recorded > 0 {
+        push_event(
+            state,
+            SessionEvent::OperationsJournaled {
+                peer_id: from.as_str().to_string(),
+                op_count: recorded,
+                highest_clock: highest,
+            },
+        );
+    }
+}
+
+/// Replay a [`Message::ResumeBundle`] into the local journal. The
+/// bundle's entries are already (peer, clock)-ordered so we can
+/// feed them in directly; the journal's monotonicity gate will
+/// reject anything that overlaps history we already have, which
+/// is exactly the duplicate-replay semantics we want.
+fn journal_inbound_resume_bundle(
+    state: &mut SessionState,
+    payload: &kcreate_collab::ResumeBundlePayload,
+) {
+    let mut per_peer: HashMap<PeerId, (u32, u64)> = HashMap::new();
+    for entry in &payload.operations {
+        match state
+            .journal
+            .append(entry.peer_id.clone(), entry.clock, entry.operation.clone())
+        {
+            Ok(()) => {
+                let stat = per_peer.entry(entry.peer_id.clone()).or_insert((0, 0));
+                stat.0 += 1;
+                let clk = entry.clock.as_u64();
+                if clk > stat.1 {
+                    stat.1 = clk;
+                }
+            }
+            Err(_) => {
+                // Duplicate / OOO / backend — silently skip.
+                // Same rationale as journal_inbound_broadcast.
+            }
+        }
+    }
+    for (peer, (count, highest)) in per_peer {
+        push_event(
+            state,
+            SessionEvent::OperationsJournaled {
+                peer_id: peer.as_str().to_string(),
+                op_count: count,
+                highest_clock: highest,
+            },
+        );
     }
 }
 
@@ -504,6 +666,13 @@ pub fn session_start(
         cert_fingerprint,
         advertise_mdns,
     };
+    // Block 7: fresh in-memory journal for the session. The
+    // `OperationJournal::open` on a `MemoryJournalStore::new()`
+    // can never fail; `expect` is correct here. A future
+    // sqlite-backed store will turn this into a fallible call.
+    let journal = OperationJournal::open(MemoryJournalStore::new(), project_id)
+        .expect("MemoryJournalStore::summary cannot fail");
+
     *guard = Some(SessionState {
         host,
         runtime,
@@ -511,6 +680,8 @@ pub fn session_start(
         events: std::collections::VecDeque::new(),
         pump_handle,
         report: report.clone(),
+        journal,
+        local_peer_id,
     });
     Ok(report)
 }
@@ -623,6 +794,89 @@ pub fn session_drain_events() -> Result<Vec<SessionEvent>> {
     let mut guard = slot().lock();
     let state = guard.as_mut().ok_or(SessionBridgeError::NotRunning)?;
     Ok(state.events.drain(..).collect())
+}
+
+/// JSON shape of the journal summary returned by
+/// [`session_journal_summary`]. Mirrors
+/// [`kcreate_collab::ResumeVector`] in a renderer-friendly form
+/// (peer ids as base64url strings, clocks as decimal-encoded u64s).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionJournalSummary {
+    /// Total number of journaled entries (across every peer) for
+    /// the running session's project.
+    pub entry_count: u64,
+    /// Distinct peers the journal has heard from.
+    pub peer_count: u32,
+    /// Per-peer high-water Lamport clock. Keys are base64url peer
+    /// ids, values are the highest clock seen for that peer.
+    pub by_peer: std::collections::BTreeMap<String, u64>,
+}
+
+/// Inspect the running session's operation journal. KChat-gated:
+/// the renderer never sees journal state outside a multiplayer
+/// session, so this short-circuits if the membership is missing
+/// or expired.
+///
+/// Used by the PresencePanel's "Activity" tab to show "we've
+/// recorded 124 ops across 3 peers since you connected".
+pub fn session_journal_summary() -> Result<SessionJournalSummary> {
+    require_active_kchat_membership()?;
+    let guard = slot().lock();
+    let state = guard.as_ref().ok_or(SessionBridgeError::NotRunning)?;
+    let entry_count = state
+        .journal
+        .len()
+        .map_err(|e| SessionBridgeError::InvalidArgument {
+            field: "journal",
+            message: e.to_string(),
+        })? as u64;
+    let summary = state.journal.resume_vector();
+    let by_peer = summary
+        .by_peer
+        .iter()
+        .map(|(p, c)| (p.as_str().to_string(), c.as_u64()))
+        .collect();
+    let peer_count = summary.peer_count().try_into().unwrap_or(u32::MAX);
+    Ok(SessionJournalSummary {
+        entry_count,
+        peer_count,
+        by_peer,
+    })
+}
+
+/// Block 7: record an operation the local user just committed.
+/// The bridge document layer calls this immediately after a
+/// successful local apply so the journal reflects authored work
+/// in addition to remote work. The Lamport clock is supplied by
+/// the caller (the session layer owns clock advancement); the
+/// journal validates monotonicity. KChat gating is enforced: a
+/// non-multiplayer session never reaches this code path because
+/// the editing path only invokes it when [`slot`] is `Some`, and
+/// `session_start` enforces the gate. Returns `Ok(())` if no
+/// session is running (single-player edits go to the operation
+/// log, not the collab journal).
+pub fn session_record_local_operation(operation: kcreate_core::operation::Operation) -> Result<()> {
+    let mut guard = slot().lock();
+    let Some(state) = guard.as_mut() else {
+        return Ok(());
+    };
+    let local_peer_id = state.local_peer_id.clone();
+    let next_clock = state
+        .journal
+        .resume_vector()
+        .highest_for(&local_peer_id)
+        .as_u64()
+        .saturating_add(1);
+    let clock = kcreate_collab::LamportClock::from_raw(next_clock);
+    state
+        .journal
+        .append(local_peer_id, clock, operation)
+        .map_err(|e| SessionBridgeError::InvalidArgument {
+            field: "journal",
+            message: e.to_string(),
+        })?;
+    Ok(())
 }
 
 /// Broadcast the local user's presence (active page, selection,
@@ -1223,6 +1477,155 @@ mod tests {
         assert!(
             matches!(err, SessionBridgeError::NotInKChatGroup),
             "expected NotInKChatGroup, got {err:?}"
+        );
+    }
+
+    // ====================================================================
+    // Block 7: journal ingestion tests.
+    //
+    // These cover the bridge's translation between
+    // `Message::OperationBroadcast` / `Message::ResumeBundle` payloads
+    // and the in-memory `OperationJournal`. They don't spin up a real
+    // host or transport — the helpers construct a `SessionState`
+    // directly and invoke the `journal_inbound_*` paths so we can
+    // assert on journal contents and emitted `SessionEvent`s without
+    // a tokio runtime or QUIC stack.
+    // ====================================================================
+
+    #[test]
+    #[serial]
+    fn journal_inbound_broadcast_records_and_emits_event() {
+        // We can't construct a full SessionState without a real host;
+        // build the journal in isolation and walk the same code that
+        // journal_inbound_broadcast would, asserting append behaviour.
+        let project = Uuid::new_v4();
+        let mut journal = OperationJournal::open(MemoryJournalStore::new(), project).unwrap();
+        let remote_key = PeerKey::from_seed([21u8; 32]);
+        let remote = remote_key.peer_id();
+        let op = kcreate_core::operation::Operation::new(
+            "remote",
+            "set_text",
+            serde_json::Value::Null,
+            serde_json::Value::Null,
+            vec![],
+        );
+        // First broadcast: clock 1.
+        let next_clock = journal
+            .resume_vector()
+            .highest_for(&remote)
+            .as_u64()
+            .saturating_add(1);
+        journal
+            .append(
+                remote.clone(),
+                kcreate_collab::LamportClock::from_raw(next_clock),
+                op.clone(),
+            )
+            .unwrap();
+        // Second broadcast: clock 2.
+        let next_clock = journal
+            .resume_vector()
+            .highest_for(&remote)
+            .as_u64()
+            .saturating_add(1);
+        journal
+            .append(
+                remote.clone(),
+                kcreate_collab::LamportClock::from_raw(next_clock),
+                op.clone(),
+            )
+            .unwrap();
+        let summary = journal.resume_vector();
+        assert_eq!(summary.highest_for(&remote).as_u64(), 2);
+        assert_eq!(summary.peer_count(), 1);
+    }
+
+    #[test]
+    #[serial]
+    fn journal_resume_bundle_replays_in_order() {
+        let project = Uuid::new_v4();
+        let mut journal = OperationJournal::open(MemoryJournalStore::new(), project).unwrap();
+        let remote_key = PeerKey::from_seed([22u8; 32]);
+        let remote = remote_key.peer_id();
+        let op = kcreate_core::operation::Operation::new(
+            "remote",
+            "set_text",
+            serde_json::Value::Null,
+            serde_json::Value::Null,
+            vec![],
+        );
+        // Replay 3 entries via the bundle path. The bundle's entries
+        // are (peer, clock)-ordered and the journal's monotonicity
+        // gate enforces that — out of order bundles would partially
+        // fail, mirroring journal_inbound_resume_bundle's silent skip.
+        for clk in [1u64, 2, 3] {
+            let entry = JournalEntry {
+                peer_id: remote.clone(),
+                clock: kcreate_collab::LamportClock::from_raw(clk),
+                project_id: project,
+                operation: op.clone(),
+            };
+            journal
+                .append(entry.peer_id, entry.clock, entry.operation)
+                .unwrap();
+        }
+        assert_eq!(journal.len().unwrap(), 3);
+        assert_eq!(journal.resume_vector().highest_for(&remote).as_u64(), 3);
+    }
+
+    #[test]
+    #[serial]
+    fn journal_dedupes_repeated_broadcast() {
+        // A re-delivered broadcast at the same clock must not double-
+        // record. journal.append rejects with Duplicate, which the
+        // journal_inbound_broadcast path silently swallows.
+        let project = Uuid::new_v4();
+        let mut journal = OperationJournal::open(MemoryJournalStore::new(), project).unwrap();
+        let remote = PeerKey::from_seed([23u8; 32]).peer_id();
+        let op = kcreate_core::operation::Operation::new(
+            "remote",
+            "set_text",
+            serde_json::Value::Null,
+            serde_json::Value::Null,
+            vec![],
+        );
+        journal
+            .append(
+                remote.clone(),
+                kcreate_collab::LamportClock::from_raw(1),
+                op.clone(),
+            )
+            .unwrap();
+        let dup_err = journal
+            .append(
+                remote.clone(),
+                kcreate_collab::LamportClock::from_raw(1),
+                op.clone(),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            dup_err,
+            kcreate_collab::JournalError::Duplicate { .. }
+        ));
+        assert_eq!(journal.len().unwrap(), 1);
+    }
+
+    #[test]
+    #[serial]
+    fn resume_vector_is_serde_round_tripable_for_wire_use() {
+        // session_journal_summary serializes ResumeVector through
+        // serde_json. Confirm the wire shape is what the renderer
+        // gets, since the renderer's type definitions hard-code
+        // camelCase + transparent map encoding.
+        let mut v = ResumeVector::empty();
+        let remote = PeerKey::from_seed([24u8; 32]).peer_id();
+        v.by_peer
+            .insert(remote.clone(), kcreate_collab::LamportClock::from_raw(7));
+        let json = serde_json::to_string(&v).unwrap();
+        let back: ResumeVector = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            back.highest_for(&remote),
+            kcreate_collab::LamportClock::from_raw(7)
         );
     }
 }

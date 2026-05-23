@@ -1882,7 +1882,33 @@ export type SessionEvent =
       kind: "presenceUpdated";
       peerId: string;
       presence: SessionPresence;
+    }
+  | {
+      /// Block 7: a remote peer's `OperationBroadcast` was recorded
+      /// in the session journal. Emitted once per batch, after
+      /// every individual op has been validated for monotonicity
+      /// against the journal's per-peer high-water mark.
+      kind: "operationsJournaled";
+      peerId: string;
+      /// Number of operations recorded in this batch.
+      opCount: number;
+      /// Highest Lamport clock value observed in the batch.
+      highestClock: number;
     };
+
+/// Block 7: per-peer Lamport high-water marks for the journal
+/// scoped to the running session's project. Mirrors
+/// `kcreate_bridge::collab::SessionJournalSummary`.
+export interface SessionJournalSummary {
+  /// Total number of journaled entries across every peer.
+  entryCount: number;
+  /// Distinct peers the journal has heard from.
+  peerCount: number;
+  /// Per-peer high-water clock. Keys are base64url peer ids;
+  /// values are the highest Lamport clock the journal has
+  /// recorded for that peer.
+  byPeer: Record<string, number>;
+}
 
 export interface SessionBridge {
   /// Start a local collab session. Returns the local peer's
@@ -1923,6 +1949,12 @@ export interface SessionBridge {
   /// Read the cached local-identity report, or `null` if no
   /// session is running.
   info(): Promise<SessionStartReport | null>;
+  /// Block 7: read the running session's per-peer Lamport
+  /// high-water marks. KChat-gated: rejects with the standard
+  /// `not signed into a KChat group` error if no authority is
+  /// installed. Used by the PresencePanel's "Activity" tab to
+  /// surface "we've recorded N ops across M peers".
+  journalSummary(): Promise<SessionJournalSummary>;
   /// Broadcast the local user's presence to every connected peer.
   /// `cursor` is world-space coordinates; pass `null` when the
   /// pointer has left the canvas.

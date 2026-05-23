@@ -388,6 +388,9 @@ export interface Bridge {
     cursorJson: string | null,
   ): void;
   sessionInfo(): string;
+  // Block 7: operation journal summary. KChat-gated; returns a
+  // JSON `SessionJournalSummary` for the running session.
+  sessionJournalSummary(): string;
   // KChat group authority — multiplayer gate. Until
   // `kchatInstallAuthority` is called with a valid JSON
   // `KChatInstallRequest`, every `session*` call rejects with

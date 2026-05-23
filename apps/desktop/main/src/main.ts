@@ -1663,6 +1663,12 @@ function registerIpcHandlers(): void {
     requireBridge().sessionPeers(),
   );
   ipcMain.handle("kcreate/session/info", () => requireBridge().sessionInfo());
+  // Block 7: Operation journal summary. Returns the running session's
+  // per-peer Lamport high-water marks so the renderer can show the
+  // PresencePanel "Activity" tab without keeping a parallel JS copy.
+  ipcMain.handle("kcreate/session/journalSummary", () =>
+    requireBridge().sessionJournalSummary(),
+  );
   ipcMain.handle(
     "kcreate/session/sendPresence",
     (

@@ -17,6 +17,7 @@ use kcreate_core::operation::Operation;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::journal::{JournalEntry, ResumeVector};
 use crate::kchat::KChatMembership;
 use crate::peer::PeerIdentity;
 
@@ -58,6 +59,18 @@ pub enum Message {
     /// Sender is leaving the session. Receivers should drop the peer
     /// from their roster but keep applied operations.
     Goodbye(GoodbyeReason),
+    /// Block 7: a peer asks the host for every operation it's missing
+    /// since the supplied resume vector. Sent immediately after a
+    /// `Welcome::Accepted` on rejoin so the joiner can catch up on
+    /// history persisted since its last disconnect. The host
+    /// replies with a [`Message::ResumeBundle`] containing the
+    /// missing entries.
+    ResumeRequest(ResumeRequestPayload),
+    /// Block 7: host's reply to a [`Message::ResumeRequest`]. Carries
+    /// the journal entries the requester was missing, in
+    /// `(peer_id, clock)` order so applying them in receive order
+    /// produces the correct document state.
+    ResumeBundle(ResumeBundlePayload),
 }
 
 /// Initial handshake payload sent by the joining peer.
@@ -177,6 +190,36 @@ pub struct PresencePayload {
 pub struct Cursor {
     pub x: f64,
     pub y: f64,
+}
+
+/// Payload of [`Message::ResumeRequest`]. Sent by the joiner right
+/// after receiving a `Welcome::Accepted` on rejoin. The host uses the
+/// supplied vector to compute exactly which entries in its journal
+/// the joiner is missing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResumeRequestPayload {
+    /// Project the requester is asking about. Must match the
+    /// session's open project; mismatches drop.
+    pub project_id: Uuid,
+    /// What the requester has already seen. Empty for a fresh
+    /// joiner — equivalent to "send me everything".
+    pub since: ResumeVector,
+}
+
+/// Payload of [`Message::ResumeBundle`]. Host's reply to a
+/// [`Message::ResumeRequest`]. Carries the journal entries the
+/// requester didn't have, in `(peer_id, clock)` order; the requester
+/// appends them to its own journal in receive order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResumeBundlePayload {
+    /// Project the bundle belongs to. Receivers MUST drop if it
+    /// doesn't match their open project.
+    pub project_id: Uuid,
+    /// The missing operations, deterministically ordered. May be
+    /// empty if the requester was already up to date.
+    pub operations: Vec<JournalEntry>,
 }
 
 /// Why the sender is leaving.
@@ -299,6 +342,59 @@ mod tests {
             let s = serde_json::to_string(&msg).unwrap();
             let back: Message = serde_json::from_str(&s).unwrap();
             assert_eq!(back, msg);
+        }
+    }
+
+    #[test]
+    fn resume_request_round_trips() {
+        let project_id = Uuid::new_v4();
+        let mut since = ResumeVector::empty();
+        since
+            .by_peer
+            .insert(key(3).identity("X").peer_id, LamportClock::from_raw(99));
+        let msg = Message::ResumeRequest(ResumeRequestPayload {
+            project_id,
+            since: since.clone(),
+        });
+        let s = serde_json::to_string(&msg).unwrap();
+        let back: Message = serde_json::from_str(&s).unwrap();
+        match back {
+            Message::ResumeRequest(p) => {
+                assert_eq!(p.project_id, project_id);
+                assert_eq!(p.since, since);
+            }
+            _ => panic!("wrong variant after round-trip"),
+        }
+    }
+
+    #[test]
+    fn resume_bundle_round_trips() {
+        let project_id = Uuid::new_v4();
+        let op = Operation::new(
+            "user",
+            "set_fill",
+            json!({"color": "before"}),
+            json!({"color": "after"}),
+            vec![Uuid::nil()],
+        );
+        let entry = crate::journal::JournalEntry {
+            peer_id: key(4).identity("X").peer_id,
+            clock: LamportClock::from_raw(7),
+            project_id,
+            operation: op,
+        };
+        let msg = Message::ResumeBundle(ResumeBundlePayload {
+            project_id,
+            operations: vec![entry.clone()],
+        });
+        let s = serde_json::to_string(&msg).unwrap();
+        let back: Message = serde_json::from_str(&s).unwrap();
+        match back {
+            Message::ResumeBundle(p) => {
+                assert_eq!(p.project_id, project_id);
+                assert_eq!(p.operations, vec![entry]);
+            }
+            _ => panic!("wrong variant after round-trip"),
         }
     }
 }

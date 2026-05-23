@@ -103,6 +103,7 @@ import type {
   SessionBridge,
   SessionCursor,
   SessionEvent,
+  SessionJournalSummary,
   SessionPeer,
   KChatBridge,
   KChatInstallRequest,
@@ -1406,6 +1407,12 @@ const session: SessionBridge = {
   async info(): Promise<SessionStartReport | null> {
     const raw = (await ipcRenderer.invoke("kcreate/session/info")) as string;
     return JSON.parse(raw) as SessionStartReport | null;
+  },
+  async journalSummary(): Promise<SessionJournalSummary> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/session/journalSummary",
+    )) as string;
+    return JSON.parse(raw) as SessionJournalSummary;
   },
   async sendPresence(
     activePage: string | null,

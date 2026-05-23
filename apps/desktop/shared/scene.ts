@@ -297,6 +297,24 @@ export interface DocumentStatus {
 }
 
 /**
+ * Outcome of a successful `documentUndo` / `documentRedo` round-trip.
+ *
+ * Mirrors `crates/kcreate_bridge/src/document.rs::UndoRedoOutcome`.
+ * The `command` is the stable `Operation::command` string (e.g.
+ * `"color_settings_update"`, `"document_update_node"`) — the host
+ * uses it to gate per-operation broadcasts so an undo of an
+ * unrelated op (a `move_node`, say) doesn't fire the
+ * `kcreate/color/settings/changed` event and trigger a needless
+ * `SoftProofOverlay` re-render. `affectedNodes` is the list of node
+ * ids the operation touched, empty for non-graph ops like
+ * `color_settings_update`.
+ */
+export interface UndoRedoOutcome {
+  command: string;
+  affectedNodes: string[];
+}
+
+/**
  * Mirror of `kcreate_export::code_gen::InspectCode`. Each field is
  * a copy-paste-ready snippet describing one rendering target's
  * style for the selected node.
@@ -360,8 +378,8 @@ export interface DocumentBridge {
   ): Promise<string>;
   updateNode(nodeId: string, changes: UpdateNodeProps): Promise<void>;
   deleteNode(nodeId: string): Promise<void>;
-  undo(): Promise<string[] | null>;
-  redo(): Promise<string[] | null>;
+  undo(): Promise<UndoRedoOutcome | null>;
+  redo(): Promise<UndoRedoOutcome | null>;
 
   /**
    * Snapshot of the open document's editing state, or `null` if no

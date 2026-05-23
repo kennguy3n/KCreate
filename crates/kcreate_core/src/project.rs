@@ -424,6 +424,26 @@ impl Project {
         Some(op)
     }
 
+    /// Peek at the operation that the next [`Self::undo`] would return,
+    /// without moving the log cursor and without touching
+    /// `modified_at`. Returns a cloned [`Operation`] so the borrow on
+    /// `self.operation_log` is released immediately; callers typically
+    /// use this to apply `before_patch` against the live state and only
+    /// commit the cursor move via [`Self::undo`] on success.
+    #[must_use]
+    pub fn pending_undo(&self) -> Option<Operation> {
+        self.operation_log.peek_undo().cloned()
+    }
+
+    /// Peek at the operation that the next [`Self::redo`] would return,
+    /// without moving the log cursor and without touching
+    /// `modified_at`. See [`Self::pending_undo`] for the atomicity
+    /// rationale.
+    #[must_use]
+    pub fn pending_redo(&self) -> Option<Operation> {
+        self.operation_log.peek_redo().cloned()
+    }
+
     /// Add or replace a brand kit. Replaces by `id`.
     pub fn upsert_brand_kit(&mut self, kit: BrandKit) {
         if let Some(slot) = self.brand_kits.iter_mut().find(|k| k.id == kit.id) {

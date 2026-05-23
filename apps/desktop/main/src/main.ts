@@ -726,17 +726,37 @@ function registerIpcHandlers(): void {
   // `kcreate/document/undo` and `.../redo` may roll back / replay a
   // `color_settings_update` operation as of Phase 2 (the bridge owns
   // the dispatch — see `crates/kcreate_bridge/src/document.rs`'s
-  // `apply_inverse_patch`), so we re-broadcast `color/settings/changed`
-  // after each call. The renderer subscriber takes care of the
-  // (very cheap) round-trip to fetch the new state.
+  // `apply_inverse_patch`). The bridge now returns the rolled-back
+  // operation's `command` string alongside the affected node ids, so
+  // we gate the `color/settings/changed` broadcast on the command
+  // actually being one of the color-settings ops. This avoids an
+  // unnecessary React re-render on every unrelated undo / redo
+  // (e.g. a `move_node`) — flagged in Devin Review on commit 7b5d49a.
+  //
+  // Other operations the bridge may need to push-notify on in the
+  // future should slot into this dispatch table; keep the table
+  // explicit (not a string-prefix match) so we don't accidentally
+  // broadcast on a future op whose name happens to contain
+  // `color_settings`.
+  const broadcastForCommand = (command: string): void => {
+    switch (command) {
+      case "color_settings_update":
+        broadcastColorSettingsChanged();
+        break;
+      default:
+        // No-op: most ops affect node graph state only and the
+        // renderer's existing tree-refresh path handles them.
+        break;
+    }
+  };
   ipcMain.handle("kcreate/document/undo", () => {
     const result = requireBridge().documentUndo();
-    broadcastColorSettingsChanged();
+    if (result) broadcastForCommand(result.command);
     return result;
   });
   ipcMain.handle("kcreate/document/redo", () => {
     const result = requireBridge().documentRedo();
-    broadcastColorSettingsChanged();
+    if (result) broadcastForCommand(result.command);
     return result;
   });
   ipcMain.handle("kcreate/document/status", () =>

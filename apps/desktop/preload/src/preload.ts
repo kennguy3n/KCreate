@@ -34,6 +34,7 @@ import type {
   DesignTokensBridge,
   DocumentBridge,
   DocumentStatus,
+  UndoRedoOutcome,
   ExportBridge,
   ExportFormat,
   ExportPreset,
@@ -418,15 +419,15 @@ const document: DocumentBridge = {
   async deleteNode(nodeId: string): Promise<void> {
     await ipcRenderer.invoke("kcreate/document/deleteNode", nodeId);
   },
-  async undo(): Promise<string[] | null> {
+  async undo(): Promise<UndoRedoOutcome | null> {
     return (await ipcRenderer.invoke(
       "kcreate/document/undo",
-    )) as string[] | null;
+    )) as UndoRedoOutcome | null;
   },
-  async redo(): Promise<string[] | null> {
+  async redo(): Promise<UndoRedoOutcome | null> {
     return (await ipcRenderer.invoke(
       "kcreate/document/redo",
-    )) as string[] | null;
+    )) as UndoRedoOutcome | null;
   },
   async status(): Promise<DocumentStatus | null> {
     const raw = (await ipcRenderer.invoke(

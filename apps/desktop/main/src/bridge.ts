@@ -68,12 +68,26 @@ type DocumentStatusSnake = {
   redo_depth: number;
 };
 
+// Mirror of `crates/kcreate_bridge/src/lib.rs::UndoRedoOutcome`. The
+// N-API surface returns camelCase field names (`#[napi(object)]` emits
+// the field identifiers literally, and the Rust side is named in
+// snake_case → JS via napi's default camelCase rewrite). The `command`
+// field is the `Operation::command` string from
+// `crates/kcreate_core/src/operation.rs`; the host uses it to gate
+// per-operation broadcasts (e.g. `kcreate/color/settings/changed` only
+// fires for `color_settings_update`).
+type UndoRedoOutcomeSnake = {
+  command: string;
+  affectedNodes: string[];
+};
+
 export type {
   ProjectInfoSnake,
   NodeInfoSnake,
   BoundsSnake,
   RuntimeStatusSnake,
   DocumentStatusSnake,
+  UndoRedoOutcomeSnake,
 };
 
 export interface Bridge {
@@ -125,8 +139,8 @@ export interface Bridge {
   ): string;
   documentUpdateNode(nodeId: string, changesJson: string): void;
   documentDeleteNode(nodeId: string): void;
-  documentUndo(): string[] | null;
-  documentRedo(): string[] | null;
+  documentUndo(): UndoRedoOutcomeSnake | null;
+  documentRedo(): UndoRedoOutcomeSnake | null;
   documentStatus(): DocumentStatusSnake | null;
   runtimeStatus(): RuntimeStatusSnake;
   lowResourceModeGet(): boolean;

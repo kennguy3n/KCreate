@@ -980,8 +980,50 @@ pub fn document_record_operation(operation: Operation) -> Result<()> {
     Ok(())
 }
 
-/// Undo the most recent operation. Returns the affected node ids of
-/// the rolled-back operation, or `None` if the undo stack is empty.
+/// Outcome of a successful undo / redo.
+///
+/// Carries both the affected node ids (so the renderer can refresh the
+/// view) and the operation `command` string. The host uses `command`
+/// to gate side-effect broadcasts that are only meaningful for
+/// specific operation kinds — for example, `color_settings_update`
+/// fires `kcreate/color/settings/changed`, but a `move_node` does not.
+/// Returning the command at the bridge boundary keeps that gating
+/// logic in TypeScript next to the IPC channel it controls, instead
+/// of pushing every per-op broadcast into Rust.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct UndoRedoOutcome {
+    /// The `Operation::command` string from the operation that was
+    /// rolled back / re-applied. Stable wire identifier; e.g.
+    /// `"color_settings_update"`, `"text_frame_update"`,
+    /// `"document_update_node"`.
+    pub command: String,
+    /// The `Operation::affected_nodes` list. Empty for non-graph
+    /// operations (e.g. `color_settings_update`).
+    pub affected_nodes: Vec<Uuid>,
+}
+
+/// Undo the most recent operation.
+///
+/// Returns:
+/// * `Ok(Some(outcome))` when the undo stack is non-empty AND the
+///   inverse patch was applied successfully — `outcome.command` is the
+///   operation's command string, `outcome.affected_nodes` the impacted
+///   nodes.
+/// * `Ok(None)` when the undo stack is empty.
+/// * `Err(_)` when the inverse patch failed (e.g. corrupted log,
+///   missing node). The log cursor is **not** advanced in this case
+///   — the next `document_undo()` retries the same operation.
+///
+/// # Atomicity
+///
+/// The bridge peeks the pending operation via
+/// [`Project::pending_undo`] and applies `before_patch` against the
+/// workspace *first*; only on success does it call [`Project::undo`]
+/// to commit the cursor move. This prevents the split-brain state
+/// where the log cursor advances but the workspace patch fails,
+/// which would otherwise silently drop a user's undoable operation
+/// (Devin Review BUG / PR #7).
 ///
 /// For non-graph operations recorded by the Phase 2 panels
 /// ([`color_settings_update`], [`text_frame_update`],
@@ -996,40 +1038,58 @@ pub fn document_record_operation(operation: Operation) -> Result<()> {
 /// [`color_settings_update`]: crate::phase2::color_settings_update
 /// [`text_frame_update`]: crate::phase2::text_frame_update
 /// [`text_opentype_features_update`]: crate::phase2::text_opentype_features_update
-pub fn document_undo() -> Result<Option<Vec<Uuid>>> {
+pub fn document_undo() -> Result<Option<UndoRedoOutcome>> {
     let mut guard = slot().lock();
     let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
-    let op = ws.project.undo();
-    let affected = match op {
-        Some(op) => {
-            apply_inverse_patch(ws, &op)?;
-            Some(op.affected_nodes)
-        }
-        None => None,
+    let Some(op) = ws.project.pending_undo() else {
+        return Ok(None);
     };
+    // Apply the inverse patch FIRST. Only commit the cursor move
+    // if it succeeds — otherwise the log and workspace would split.
+    apply_inverse_patch(ws, &op)?;
+    let committed = ws
+        .project
+        .undo()
+        .expect("pending_undo returned Some, so undo cannot return None on the same lock");
     drop(guard);
-    Ok(affected)
+    Ok(Some(UndoRedoOutcome {
+        command: committed.command,
+        affected_nodes: committed.affected_nodes,
+    }))
 }
 
-/// Redo the next operation. Returns the affected node ids of the
-/// re-applied operation, or `None` if the redo stack is empty.
+/// Redo the next operation.
 ///
-/// Symmetric with [`document_undo`]: for Phase 2 non-graph operations
-/// the bridge re-applies `after_patch` to the workspace itself; for
-/// graph-mutating operations the host-driven contract still applies.
-pub fn document_redo() -> Result<Option<Vec<Uuid>>> {
+/// Returns:
+/// * `Ok(Some(outcome))` when the redo stack is non-empty AND the
+///   forward patch was applied successfully.
+/// * `Ok(None)` when the redo stack is empty.
+/// * `Err(_)` when the forward patch failed. The log cursor is **not**
+///   advanced in this case.
+///
+/// Atomicity is symmetric with [`document_undo`]: the bridge peeks via
+/// [`Project::pending_redo`], applies `after_patch` first, and only
+/// commits via [`Project::redo`] on success.
+///
+/// For Phase 2 non-graph operations the bridge re-applies
+/// `after_patch` to the workspace itself; for graph-mutating
+/// operations the host-driven contract still applies.
+pub fn document_redo() -> Result<Option<UndoRedoOutcome>> {
     let mut guard = slot().lock();
     let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
-    let op = ws.project.redo();
-    let affected = match op {
-        Some(op) => {
-            apply_forward_patch(ws, &op)?;
-            Some(op.affected_nodes)
-        }
-        None => None,
+    let Some(op) = ws.project.pending_redo() else {
+        return Ok(None);
     };
+    apply_forward_patch(ws, &op)?;
+    let committed = ws
+        .project
+        .redo()
+        .expect("pending_redo returned Some, so redo cannot return None on the same lock");
     drop(guard);
-    Ok(affected)
+    Ok(Some(UndoRedoOutcome {
+        command: committed.command,
+        affected_nodes: committed.affected_nodes,
+    }))
 }
 
 /// Walk `op.before_patch` into workspace state for the non-graph
@@ -5725,6 +5785,139 @@ mod tests {
             after_redo, updated,
             "document_redo must replay after_patch into ws.project.color_settings",
         );
+        project_close();
+    }
+
+    /// Pins the undo/redo atomicity contract.
+    ///
+    /// Before this fix, `document_undo` called `ws.project.undo()`
+    /// (which advanced the log cursor unconditionally) *before*
+    /// applying `before_patch`. If patch application then failed
+    /// (e.g. the JSON didn't deserialize into `ColorSettings`), the
+    /// cursor had moved but the workspace state still reflected the
+    /// pre-undo value — the operation was silently dropped from the
+    /// user's undoable history.
+    ///
+    /// We construct that scenario by recording an operation whose
+    /// `before_patch` is structurally malformed for its `command`
+    /// (a string where `ColorSettings` is expected), then assert:
+    /// 1. `document_undo` returns `Err`.
+    /// 2. `can_undo` is still true (the cursor did not advance).
+    /// 3. A fresh, well-formed op pushed *after* the failure remains
+    ///    undoable end-to-end (so the failure mode didn't poison
+    ///    the log).
+    #[test]
+    #[serial]
+    fn document_undo_does_not_advance_cursor_on_apply_failure() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("undo-atomicity", dir.path()).expect("create");
+
+        // Inject a poison op: command claims color_settings_update, but
+        // the before_patch is a bare string, which will fail to
+        // deserialize as `ColorSettings`.
+        let poison = Operation::new(
+            "user",
+            "color_settings_update",
+            serde_json::json!("not-a-color-settings-object"),
+            serde_json::json!("not-a-color-settings-object"),
+            Vec::new(),
+        );
+        document_record_operation(poison).expect("record poison op");
+
+        let before = document_status().expect("status before undo");
+        assert!(
+            before.can_undo,
+            "freshly-recorded op must be undoable in the log",
+        );
+
+        let err = document_undo().expect_err("poisoned undo must fail");
+        // The error originates from serde_json inside apply_patch.
+        assert!(
+            matches!(err, DocumentBridgeError::Json(_)),
+            "expected Json (serde) error, got: {err:?}",
+        );
+
+        let after_failed_undo = document_status().expect("status after failed undo");
+        assert!(
+            after_failed_undo.can_undo,
+            "failed undo must NOT advance the log cursor — the op must \
+             remain undoable so the user can retry / inspect / report",
+        );
+        assert_eq!(
+            after_failed_undo.undo_depth, before.undo_depth,
+            "undo depth must be unchanged after a failed undo",
+        );
+
+        // Subsequent well-formed ops still flow normally — the failure
+        // didn't corrupt the log. A `color_settings_update` push from
+        // the bridge entry point both mutates state and records.
+        let updated = kcreate_core::color::ColorSettings {
+            gamut_warning: true,
+            ..kcreate_core::color::ColorSettings::default()
+        };
+        crate::phase2::color_settings_update(&serde_json::to_string(&updated).unwrap())
+            .expect("color_settings_update after failed undo still works");
+
+        project_close();
+    }
+
+    /// Symmetric atomicity contract for `document_redo`.
+    ///
+    /// We push an op whose `before_patch` is a valid `ColorSettings`
+    /// but whose `after_patch` is structurally malformed. Undoing it
+    /// succeeds (valid `before_patch` → cursor moves backwards,
+    /// state reverts). Redoing it must then fail at the
+    /// `after_patch` apply step — and crucially, the redo cursor
+    /// must NOT advance, so the user can retry / inspect / report
+    /// instead of silently losing the operation.
+    #[test]
+    #[serial]
+    fn document_redo_does_not_advance_cursor_on_apply_failure() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("redo-atomicity", dir.path()).expect("create");
+
+        let valid_settings = kcreate_core::color::ColorSettings::default();
+        let poison = Operation::new(
+            "user",
+            "color_settings_update",
+            serde_json::to_value(&valid_settings).expect("serialize before_patch"),
+            // after_patch is intentionally not a ColorSettings shape.
+            serde_json::json!("not-a-color-settings-object"),
+            Vec::new(),
+        );
+        document_record_operation(poison).expect("record poison op");
+
+        // Undo succeeds because before_patch deserializes cleanly.
+        let undone = document_undo()
+            .expect("poison undo OK (before_patch is valid)")
+            .expect("an op was on the undo stack");
+        assert_eq!(undone.command, "color_settings_update");
+
+        let pre_redo = document_status().expect("status pre-redo");
+        assert!(
+            pre_redo.can_redo,
+            "after a successful undo the op must be on the redo stack",
+        );
+
+        let redo_err = document_redo().expect_err("poison redo must fail");
+        assert!(
+            matches!(redo_err, DocumentBridgeError::Json(_)),
+            "expected Json (serde) error from apply_forward_patch, got: {redo_err:?}",
+        );
+
+        let post_redo = document_status().expect("status post-failed-redo");
+        assert!(
+            post_redo.can_redo,
+            "failed redo must NOT advance the log cursor — the op \
+             must remain redoable so the user can retry / inspect",
+        );
+        assert_eq!(
+            post_redo.redo_depth, pre_redo.redo_depth,
+            "redo depth must be unchanged after a failed redo",
+        );
+
         project_close();
     }
 

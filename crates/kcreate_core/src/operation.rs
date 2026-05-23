@@ -125,6 +125,35 @@ impl OperationLog {
         op
     }
 
+    /// Look at the operation that *would* be undone by [`Self::undo`]
+    /// without moving the cursor. Returns `None` if the undo stack is
+    /// empty.
+    ///
+    /// Exposed so a caller that needs to apply `before_patch`
+    /// atomically (e.g. the bridge's host-side state replay) can
+    /// validate / apply the patch first and only commit the cursor
+    /// move via [`Self::undo`] on success. Without this, a failing
+    /// patch application leaves the log cursor and the host state
+    /// out of sync.
+    #[must_use]
+    pub fn peek_undo(&self) -> Option<&Operation> {
+        if self.position == 0 {
+            return None;
+        }
+        self.history.get(self.position - 1)
+    }
+
+    /// Look at the operation that *would* be re-applied by
+    /// [`Self::redo`] without moving the cursor. See [`Self::peek_undo`]
+    /// for the atomicity rationale.
+    #[must_use]
+    pub fn peek_redo(&self) -> Option<&Operation> {
+        if self.position >= self.history.len() {
+            return None;
+        }
+        self.history.get(self.position)
+    }
+
     #[must_use]
     pub const fn can_undo(&self) -> bool {
         self.position > 0

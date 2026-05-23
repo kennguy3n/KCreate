@@ -39,7 +39,7 @@ use uuid::Uuid;
 use crate::document::{
     BoundsInfo as CoreBoundsInfo, CreateNodeProps, DocumentBridgeError, NodeInfo as CoreNodeInfo,
     PngExportRequest as CorePngRequest, ProjectInfo as CoreProjectInfo,
-    RuntimeStatus as CoreRuntimeStatus, UpdateNodeProps,
+    RuntimeStatus as CoreRuntimeStatus, UndoRedoOutcome as CoreUndoRedoOutcome, UpdateNodeProps,
 };
 use crate::state::{
     AcquiredFrame as CoreAcquiredFrame, BridgeError, RendererFrameInfo as CoreFrameInfo,
@@ -558,18 +558,50 @@ pub fn document_delete_node(node_id: String) -> NapiResult<()> {
     document::document_delete_node(id).map_err(map_doc_err)
 }
 
+/// Wire-format mirror of [`document::UndoRedoOutcome`].
+///
+/// Both `command` and `affectedNodes` are returned on the same hop so
+/// the host can gate per-operation side-effects (e.g. the
+/// `kcreate/color/settings/changed` broadcast, which only needs to
+/// fire when `command == "color_settings_update"`) without a second
+/// IPC round-trip into Rust.
+#[napi(object)]
+#[derive(Debug, Clone)]
+pub struct UndoRedoOutcome {
+    /// Stable command string from `Operation::command`, e.g.
+    /// `"color_settings_update"` or `"document_update_node"`.
+    pub command: String,
+    /// `Operation::affected_nodes` serialized to strings. Empty for
+    /// non-graph operations like `color_settings_update`.
+    pub affected_nodes: Vec<String>,
+}
+
+impl From<CoreUndoRedoOutcome> for UndoRedoOutcome {
+    fn from(c: CoreUndoRedoOutcome) -> Self {
+        Self {
+            command: c.command,
+            affected_nodes: c
+                .affected_nodes
+                .into_iter()
+                .map(|u| u.to_string())
+                .collect(),
+        }
+    }
+}
+
 /// Undo last operation. Returns `null` when nothing to undo, otherwise
-/// the list of affected node ids.
+/// an `UndoRedoOutcome` carrying the operation's `command` and
+/// `affectedNodes`.
 #[napi]
-pub fn document_undo() -> NapiResult<Option<Vec<String>>> {
-    let ids = document::document_undo().map_err(map_doc_err)?;
-    Ok(ids.map(|v| v.into_iter().map(|u| u.to_string()).collect()))
+pub fn document_undo() -> NapiResult<Option<UndoRedoOutcome>> {
+    let outcome = document::document_undo().map_err(map_doc_err)?;
+    Ok(outcome.map(Into::into))
 }
 
 #[napi]
-pub fn document_redo() -> NapiResult<Option<Vec<String>>> {
-    let ids = document::document_redo().map_err(map_doc_err)?;
-    Ok(ids.map(|v| v.into_iter().map(|u| u.to_string()).collect()))
+pub fn document_redo() -> NapiResult<Option<UndoRedoOutcome>> {
+    let outcome = document::document_redo().map_err(map_doc_err)?;
+    Ok(outcome.map(Into::into))
 }
 
 /// Static runtime / device snapshot.

@@ -1907,7 +1907,8 @@ fn map_session_err(e: crate::collab::SessionBridgeError) -> NapiError {
     let status = match e {
         crate::collab::SessionBridgeError::InvalidArgument { .. }
         | crate::collab::SessionBridgeError::NotRunning
-        | crate::collab::SessionBridgeError::AlreadyRunning => Status::InvalidArg,
+        | crate::collab::SessionBridgeError::AlreadyRunning
+        | crate::collab::SessionBridgeError::NotInKChatGroup => Status::InvalidArg,
         _ => Status::GenericFailure,
     };
     NapiError::new(status, format!("kcreate_bridge: {e}"))
@@ -2024,6 +2025,71 @@ pub fn session_send_presence(
     crate::collab::session_send_presence(active, selection, cursor).map_err(map_session_err)
 }
 
+/// Block 7: read the running session's operation journal summary
+/// as a JSON `SessionJournalSummary`. KChat-gated; returns an
+/// error envelope if multiplayer is locked or no session is
+/// running.
+#[cfg(feature = "collab")]
+#[napi]
+pub fn session_journal_summary() -> NapiResult<String> {
+    let summary = crate::collab::session_journal_summary().map_err(map_session_err)?;
+    serde_json::to_string(&summary).map_err(|e| {
+        NapiError::new(
+            Status::GenericFailure,
+            format!("kcreate_bridge: session_journal_summary serialize: {e}"),
+        )
+    })
+}
+
+/// Block 8: snapshot of the advisory edit-lock roster. KChat-gated.
+/// Returns a JSON `Vec<SessionLockEntry>` so the renderer can
+/// deserialize directly into its TS type.
+#[cfg(feature = "collab")]
+#[napi]
+pub fn session_locks() -> NapiResult<String> {
+    let rows = crate::collab::session_locks().map_err(map_session_err)?;
+    serde_json::to_string(&rows).map_err(|e| {
+        NapiError::new(
+            Status::GenericFailure,
+            format!("kcreate_bridge: session_locks serialize: {e}"),
+        )
+    })
+}
+
+/// Block 8: claim advisory edit locks on the supplied node ids
+/// (parsed as a JSON `string[]` of UUIDs). KChat-gated; the local
+/// roster updates immediately and the change is broadcast to
+/// every connected peer. Returns the wall-clock `acquired_at`
+/// as an RFC3339 string so the renderer can show "locked X
+/// seconds ago" without a second IPC.
+#[cfg(feature = "collab")]
+#[napi]
+pub fn session_claim_locks(node_ids_json: String) -> NapiResult<String> {
+    let node_ids: Vec<Uuid> = serde_json::from_str(&node_ids_json).map_err(|e| {
+        NapiError::new(
+            Status::InvalidArg,
+            format!("kcreate_bridge: session_claim_locks parse node_ids: {e}"),
+        )
+    })?;
+    let acquired_at = crate::collab::session_claim_locks(node_ids).map_err(map_session_err)?;
+    Ok(acquired_at.to_rfc3339())
+}
+
+/// Block 8: release advisory edit locks. Empty node-id list means
+/// "release every lock the local peer currently holds".
+#[cfg(feature = "collab")]
+#[napi]
+pub fn session_release_locks(node_ids_json: String) -> NapiResult<()> {
+    let node_ids: Vec<Uuid> = serde_json::from_str(&node_ids_json).map_err(|e| {
+        NapiError::new(
+            Status::InvalidArg,
+            format!("kcreate_bridge: session_release_locks parse node_ids: {e}"),
+        )
+    })?;
+    crate::collab::session_release_locks(node_ids).map_err(map_session_err)?;
+    Ok(())
+}
+
 /// Read the cached `SessionStartReport` for the running session,
 /// or `null` if no session is running. Returns a JSON string so
 /// the renderer can deserialize directly into its TS type.
@@ -2035,6 +2101,64 @@ pub fn session_info() -> NapiResult<String> {
         NapiError::new(
             Status::GenericFailure,
             format!("kcreate_bridge: session_info serialize: {e}"),
+        )
+    })
+}
+
+/// Install (or refresh) the KChat group authority from a JSON
+/// `KChatInstallRequest`. Until this is called with a valid
+/// payload, every multiplayer entry point (`session_start`,
+/// `session_join`, `session_send_presence`) fails with
+/// `InvalidArg("multiplayer is locked: not signed into a KChat
+/// group")`.
+///
+/// Returns a JSON [`KChatMembershipStatus`] describing the new
+/// state on success.
+#[cfg(feature = "collab")]
+#[napi]
+pub fn kchat_install_authority(request_json: String) -> NapiResult<String> {
+    let req: crate::collab::KChatInstallRequest =
+        serde_json::from_str(&request_json).map_err(|e| {
+            NapiError::new(
+                Status::InvalidArg,
+                format!("kcreate_bridge: kchat_install_authority request: {e}"),
+            )
+        })?;
+    let status = crate::collab::kchat_install_authority(req).map_err(map_session_err)?;
+    serde_json::to_string(&status).map_err(|e| {
+        NapiError::new(
+            Status::GenericFailure,
+            format!("kcreate_bridge: kchat_install_authority serialize: {e}"),
+        )
+    })
+}
+
+/// Clear the installed KChat authority and re-lock multiplayer.
+/// Returns the new (locked) status as JSON.
+#[cfg(feature = "collab")]
+#[napi]
+pub fn kchat_clear_authority() -> NapiResult<String> {
+    let status = crate::collab::kchat_clear_authority();
+    serde_json::to_string(&status).map_err(|e| {
+        NapiError::new(
+            Status::GenericFailure,
+            format!("kcreate_bridge: kchat_clear_authority serialize: {e}"),
+        )
+    })
+}
+
+/// Snapshot the current KChat membership status. Returns a JSON
+/// [`KChatMembershipStatus`]. Renderer polls this on mount to
+/// decide whether to show the "sign into a KChat group" CTA or
+/// the live PresencePanel.
+#[cfg(feature = "collab")]
+#[napi]
+pub fn kchat_membership_status() -> NapiResult<String> {
+    let status = crate::collab::kchat_membership_status();
+    serde_json::to_string(&status).map_err(|e| {
+        NapiError::new(
+            Status::GenericFailure,
+            format!("kcreate_bridge: kchat_membership_status serialize: {e}"),
         )
     })
 }

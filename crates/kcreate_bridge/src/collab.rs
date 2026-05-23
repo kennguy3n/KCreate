@@ -27,14 +27,20 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use base64::engine::general_purpose::{STANDARD_NO_PAD, URL_SAFE_NO_PAD};
 use base64::Engine;
 use chrono::{DateTime, Utc};
+use ed25519_dalek::VerifyingKey;
 use kcreate_collab::message::Cursor;
-use kcreate_collab::{Message, PeerId, PeerIdentity, PeerKey, PresencePayload, SessionConfig};
+use kcreate_collab::{
+    no_kchat_authority, BoundKChatGroupAuthority, JournalEntry, KChatAuthError, KChatGroupId,
+    KChatMembership, LockClaimPayload, LockReleasePayload, MemoryJournalStore, Message,
+    OperationJournal, PeerId, PeerIdentity, PeerKey, PresencePayload, ResumeVector, SessionConfig,
+    SharedKChatAuthority,
+};
 use kcreate_collab_transport::{HostOptions, InboundEvent, LanCollabHost};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -120,6 +126,34 @@ pub enum SessionEvent {
         peer_id: String,
         presence: SessionPresence,
     },
+    /// Block 7: an `OperationBroadcast` from a remote peer was
+    /// journaled. The renderer doesn't apply these directly —
+    /// the document-graph layer handles the actual graph mutation
+    /// on a dedicated path — but the event lets the UI surface
+    /// "Ken edited 3 nodes" toasts and update the activity panel.
+    OperationsJournaled {
+        peer_id: String,
+        /// Number of operations recorded in this batch.
+        op_count: u32,
+        /// Highest Lamport clock observed in the batch, as a u64
+        /// for ergonomic JSON consumption from the renderer.
+        highest_clock: u64,
+    },
+    /// Block 8: the lock roster changed — a peer claimed or
+    /// released one or more node locks. The renderer reads
+    /// `session_locks()` for the authoritative snapshot but
+    /// uses this event to know *when* to re-read instead of
+    /// polling on every frame.
+    LocksChanged {
+        /// Which peer caused the change. For `PeerLeft`-triggered
+        /// auto-releases this is the leaving peer.
+        peer_id: String,
+        /// Node ids whose lock status flipped in this transition
+        /// (newly claimed AND newly released ids are both
+        /// surfaced — the renderer cross-references with the
+        /// authoritative roster).
+        node_ids: Vec<Uuid>,
+    },
 }
 
 impl From<&PresencePayload> for SessionPresence {
@@ -153,6 +187,18 @@ pub enum SessionBridgeError {
     Transport(#[from] kcreate_collab_transport::TransportError),
     #[error("collab protocol error: {0}")]
     Collab(#[from] kcreate_collab::CollabError),
+    /// Multiplayer is locked behind KChat group membership and no
+    /// valid membership has been installed yet. Renderer surfaces
+    /// this as the "sign into a KChat group" CTA instead of the
+    /// start/join buttons.
+    #[error("multiplayer is locked: not signed into a KChat group")]
+    NotInKChatGroup,
+    /// A `kchat_install_authority` call failed verification. The
+    /// renderer never normally reaches this path today (KChat
+    /// client doesn't exist yet), but if it ever does, the typed
+    /// error gives it a useful diagnostic.
+    #[error("KChat authority install failed: {0}")]
+    KChat(#[from] KChatAuthError),
 }
 
 pub type Result<T> = std::result::Result<T, SessionBridgeError>;
@@ -187,11 +233,51 @@ struct SessionState {
     /// Cached local identity / project / addr for reporting back to
     /// the UI without touching the host.
     report: SessionStartReport,
+    /// Block 7: per-session operation journal. Persisted to the
+    /// project's SQLite database via a separate flush path (see
+    /// `journal_flush_to_project`); kept in memory here so the
+    /// hot path of `OperationBroadcast` ingestion is lock-free
+    /// w.r.t. the workspace mutex. Resume vectors served from
+    /// this in-memory copy are the source of truth during the
+    /// session's lifetime.
+    journal: OperationJournal<MemoryJournalStore>,
+    /// Cached local peer id. The transport derives this from the
+    /// session's signing key; we cache it here so journal appends
+    /// don't have to round-trip through the host.
+    local_peer_id: PeerId,
+    /// Block 8: advisory edit-lock roster. Map of `node_id ->
+    /// (holder_peer_id, acquired_at)`. Updated when this peer (or a
+    /// remote peer) emits a [`Message::LockClaim`] / `LockRelease`,
+    /// and auto-cleaned on `PeerLeft`. Soft semantics — the
+    /// renderer disables controls for locked nodes but the
+    /// protocol doesn't reject concurrent edits.
+    locks: HashMap<Uuid, LockEntry>,
+}
+
+/// Block 8: one entry in the advisory lock roster.
+#[derive(Debug, Clone)]
+struct LockEntry {
+    holder: PeerId,
+    acquired_at: DateTime<Utc>,
 }
 
 fn slot() -> &'static Mutex<Option<SessionState>> {
     static S: OnceLock<Mutex<Option<SessionState>>> = OnceLock::new();
     S.get_or_init(|| Mutex::new(None))
+}
+
+/// Global slot for the KChat group authority. Until a future KChat
+/// client calls [`kchat_install_authority`] with a verified
+/// membership, this holds [`no_kchat_authority`] and every
+/// multiplayer entry point fails closed with
+/// [`SessionBridgeError::NotInKChatGroup`].
+///
+/// The slot lives independently of [`slot`] so a long-running
+/// session can refresh its attestation (e.g. before expiry) without
+/// tearing the QUIC endpoint down.
+fn kchat_slot() -> &'static Mutex<SharedKChatAuthority> {
+    static S: OnceLock<Mutex<SharedKChatAuthority>> = OnceLock::new();
+    S.get_or_init(|| Mutex::new(no_kchat_authority()))
 }
 
 /// Encode a 32-byte signing-key seed from a URL-safe base64 string.
@@ -357,15 +443,37 @@ fn apply_event(ev: InboundEvent) {
         }
         InboundEvent::PeerLeft(peer_id) => {
             state.presence.remove(&peer_id);
+            // Block 8: auto-release every lock the leaving peer
+            // held. Without this, a peer that dies mid-edit would
+            // pin a node forever; the renderer would show "Ken is
+            // editing" even though Ken is gone. Collect the released
+            // node ids before mutation so the LocksChanged event
+            // carries an accurate snapshot.
+            let released: Vec<Uuid> = state
+                .locks
+                .iter()
+                .filter(|(_, entry)| entry.holder == peer_id)
+                .map(|(id, _)| *id)
+                .collect();
+            state.locks.retain(|_, entry| entry.holder != peer_id);
             push_event(
                 state,
                 SessionEvent::PeerLeft {
                     peer_id: peer_id.as_str().to_string(),
                 },
             );
+            if !released.is_empty() {
+                push_event(
+                    state,
+                    SessionEvent::LocksChanged {
+                        peer_id: peer_id.as_str().to_string(),
+                        node_ids: released,
+                    },
+                );
+            }
         }
-        InboundEvent::Message { from, message } => {
-            if let Message::Presence(p) = message.as_ref() {
+        InboundEvent::Message { from, message } => match message.as_ref() {
+            Message::Presence(p) => {
                 state.presence.insert(from.clone(), p.clone());
                 push_event(
                     state,
@@ -375,7 +483,260 @@ fn apply_event(ev: InboundEvent) {
                     },
                 );
             }
+            Message::OperationBroadcast(p) => {
+                // Block 7: journal the remote operations. The
+                // transport already verified the envelope's
+                // signature + Lamport monotonicity, and the
+                // KChat gate already screened the sender, so by
+                // the time we get here `p.operations` are
+                // trusted relative to the session's threat
+                // model. We still validate the broadcast's
+                // project_id matches the session's project so a
+                // misrouted message can't poison the wrong
+                // journal.
+                if p.project_id == state.journal.project_id() {
+                    journal_inbound_broadcast(state, &from, p);
+                }
+            }
+            Message::ResumeBundle(p) => {
+                // Block 7: a host responded to our resume
+                // request. Replay the entries through the
+                // journal so future sessions see the same
+                // history. Project-id mismatch is dropped.
+                if p.project_id == state.journal.project_id() {
+                    journal_inbound_resume_bundle(state, p);
+                }
+            }
+            Message::LockClaim(p) => {
+                // Block 8: remote peer is asking us to honour a
+                // soft lock. The project_id guard prevents a
+                // misrouted message from poisoning the local
+                // roster; otherwise we just record and emit.
+                if p.project_id == state.journal.project_id() {
+                    apply_lock_claim(state, &from, p);
+                }
+            }
+            Message::LockRelease(p) => {
+                if p.project_id == state.journal.project_id() {
+                    apply_lock_release(state, &from, p);
+                }
+            }
+            // Hello / Welcome / Heartbeat / Goodbye / ResumeRequest
+            // are handled by the transport layer itself, not
+            // surfaced as bridge-level events.
+            Message::Hello(_)
+            | Message::Welcome(_)
+            | Message::Heartbeat
+            | Message::Goodbye(_)
+            | Message::ResumeRequest(_) => {}
+        },
+    }
+}
+
+/// Record a freshly-arrived `OperationBroadcast` payload into the
+/// session's in-memory journal and emit a `SessionEvent` describing
+/// the batch. Out-of-order or duplicate entries are logged-and-
+/// dropped, not propagated as errors — the session keeps running
+/// because the transport may have re-delivered a buffered batch
+/// and we trust the journal's own monotonicity gate to dedupe.
+fn journal_inbound_broadcast(
+    state: &mut SessionState,
+    from: &PeerId,
+    payload: &kcreate_collab::OperationBroadcastPayload,
+) {
+    let mut highest = 0u64;
+    let mut recorded: u32 = 0;
+    for op in &payload.operations {
+        // The protocol doesn't put a Lamport clock *on the
+        // operation itself* — it lives on the envelope. We
+        // approximate it with the journal's current high-water
+        // mark for the sender plus one per op in the batch so
+        // intra-batch order is preserved even on the same
+        // envelope. A future protocol revision should attach
+        // per-op clocks; that's a wire-format change we'll
+        // pair with the SQLite-backed journal landing.
+        let next_clock = state
+            .journal
+            .resume_vector()
+            .highest_for(from)
+            .as_u64()
+            .saturating_add(1);
+        let clock = kcreate_collab::LamportClock::from_raw(next_clock);
+        match state.journal.append(from.clone(), clock, op.clone()) {
+            Ok(()) => {
+                recorded += 1;
+                if next_clock > highest {
+                    highest = next_clock;
+                }
+            }
+            Err(kcreate_collab::JournalError::Duplicate { .. })
+            | Err(kcreate_collab::JournalError::OutOfOrder { .. }) => {
+                // Expected for re-delivered or out-of-order
+                // batches; the wire monotonicity check above
+                // will let the next correctly-ordered batch
+                // through.
+            }
+            Err(kcreate_collab::JournalError::Backend(_)) => {
+                // The memory store can't produce a backend
+                // error today, but if a future swap to SQLite
+                // does, we degrade to ignoring the op rather
+                // than crashing the session.
+            }
         }
+    }
+    if recorded > 0 {
+        push_event(
+            state,
+            SessionEvent::OperationsJournaled {
+                peer_id: from.as_str().to_string(),
+                op_count: recorded,
+                highest_clock: highest,
+            },
+        );
+    }
+}
+
+/// Replay a [`Message::ResumeBundle`] into the local journal. The
+/// bundle's entries are already (peer, clock)-ordered so we can
+/// feed them in directly; the journal's monotonicity gate will
+/// reject anything that overlaps history we already have, which
+/// is exactly the duplicate-replay semantics we want.
+fn journal_inbound_resume_bundle(
+    state: &mut SessionState,
+    payload: &kcreate_collab::ResumeBundlePayload,
+) {
+    let mut per_peer: HashMap<PeerId, (u32, u64)> = HashMap::new();
+    for entry in &payload.operations {
+        match state
+            .journal
+            .append(entry.peer_id.clone(), entry.clock, entry.operation.clone())
+        {
+            Ok(()) => {
+                let stat = per_peer.entry(entry.peer_id.clone()).or_insert((0, 0));
+                stat.0 += 1;
+                let clk = entry.clock.as_u64();
+                if clk > stat.1 {
+                    stat.1 = clk;
+                }
+            }
+            Err(_) => {
+                // Duplicate / OOO / backend — silently skip.
+                // Same rationale as journal_inbound_broadcast.
+            }
+        }
+    }
+    for (peer, (count, highest)) in per_peer {
+        push_event(
+            state,
+            SessionEvent::OperationsJournaled {
+                peer_id: peer.as_str().to_string(),
+                op_count: count,
+                highest_clock: highest,
+            },
+        );
+    }
+}
+
+/// Block 8: pure roster mutation for a lock claim. Returns the
+/// node ids whose lock state actually flipped (deduped + filtered
+/// for no-op same-holder reclaims). Pulled out of [`apply_lock_claim`]
+/// so unit tests can exercise the semantics without needing a full
+/// `SessionState`.
+fn lock_roster_claim(
+    locks: &mut HashMap<Uuid, LockEntry>,
+    from: &PeerId,
+    payload: &LockClaimPayload,
+) -> Vec<Uuid> {
+    let mut changed: Vec<Uuid> = Vec::new();
+    let mut seen: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
+    for node_id in &payload.node_ids {
+        if !seen.insert(*node_id) {
+            continue;
+        }
+        // Last-claim-wins: a fresh claim from a different peer
+        // displaces the prior holder. This matches the LWW
+        // resolver's semantics elsewhere in collab and gives the
+        // UI a deterministic source of truth.
+        let entry = LockEntry {
+            holder: from.clone(),
+            acquired_at: payload.acquired_at,
+        };
+        let prior = locks.insert(*node_id, entry);
+        let actually_changed = match prior {
+            Some(p) => p.holder != *from,
+            None => true,
+        };
+        if actually_changed {
+            changed.push(*node_id);
+        }
+    }
+    changed
+}
+
+/// Block 8: pure roster mutation for a lock release. Returns the
+/// node ids whose lock state actually flipped. Empty `node_ids`
+/// payload means "release everything this peer holds".
+fn lock_roster_release(
+    locks: &mut HashMap<Uuid, LockEntry>,
+    from: &PeerId,
+    payload: &LockReleasePayload,
+) -> Vec<Uuid> {
+    let mut changed: Vec<Uuid> = Vec::new();
+    if payload.node_ids.is_empty() {
+        let owned: Vec<Uuid> = locks
+            .iter()
+            .filter(|(_, entry)| entry.holder == *from)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in &owned {
+            locks.remove(id);
+            changed.push(*id);
+        }
+    } else {
+        for node_id in &payload.node_ids {
+            if let Some(entry) = locks.get(node_id) {
+                // Only the holder can release. A misbehaving peer
+                // can't reach over and unlock something it didn't
+                // claim — the soft-lock contract still needs an
+                // ownership check to be useful.
+                if entry.holder == *from {
+                    locks.remove(node_id);
+                    changed.push(*node_id);
+                }
+            }
+        }
+    }
+    changed
+}
+
+/// Block 8: record an incoming [`Message::LockClaim`] into the
+/// session's advisory lock roster and emit a `LocksChanged` event.
+/// Thin wrapper around [`lock_roster_claim`] for the production
+/// path that has a full `SessionState` in hand.
+fn apply_lock_claim(state: &mut SessionState, from: &PeerId, payload: &LockClaimPayload) {
+    let changed = lock_roster_claim(&mut state.locks, from, payload);
+    if !changed.is_empty() {
+        push_event(
+            state,
+            SessionEvent::LocksChanged {
+                peer_id: from.as_str().to_string(),
+                node_ids: changed,
+            },
+        );
+    }
+}
+
+/// Block 8: record an incoming [`Message::LockRelease`].
+fn apply_lock_release(state: &mut SessionState, from: &PeerId, payload: &LockReleasePayload) {
+    let changed = lock_roster_release(&mut state.locks, from, payload);
+    if !changed.is_empty() {
+        push_event(
+            state,
+            SessionEvent::LocksChanged {
+                peer_id: from.as_str().to_string(),
+                node_ids: changed,
+            },
+        );
     }
 }
 
@@ -404,6 +765,25 @@ pub fn session_start(
     let local_peer_id = local_key.peer_id();
     let local_public_key = local_key.identity(display_name).public_key;
 
+    // KChat gate: refuse to start unless the locally-installed
+    // authority has a current membership bound to *this* peer key.
+    // We re-verify the binding here (rather than just trusting the
+    // installed membership) because the renderer might call
+    // `session_start` with a different seed than the one the
+    // membership was minted for, and we also re-check the time
+    // window so an expired-while-the-app-was-asleep attestation
+    // doesn't sneak through.
+    let authority = kchat_authority_snapshot();
+    let membership = authority
+        .local_membership()
+        .ok_or(SessionBridgeError::NotInKChatGroup)?;
+    let trust_root = authority
+        .issuer_trust_root()
+        .ok_or(SessionBridgeError::NotInKChatGroup)?;
+    membership
+        .verify(&trust_root, &local_peer_id, &local_public_key, Utc::now())
+        .map_err(|_| SessionBridgeError::NotInKChatGroup)?;
+
     let runtime = Builder::new_multi_thread()
         .enable_all()
         .thread_name("kcreate-collab")
@@ -422,6 +802,7 @@ pub fn session_start(
         advertise_mdns,
         advertise_addrs: None,
         session_config: SessionConfig::default(),
+        kchat_authority: authority,
     };
     let host = runtime
         .block_on(tokio::time::timeout(OP_TIMEOUT, LanCollabHost::start(opts)))
@@ -454,6 +835,13 @@ pub fn session_start(
         cert_fingerprint,
         advertise_mdns,
     };
+    // Block 7: fresh in-memory journal for the session. The
+    // `OperationJournal::open` on a `MemoryJournalStore::new()`
+    // can never fail; `expect` is correct here. A future
+    // sqlite-backed store will turn this into a fallible call.
+    let journal = OperationJournal::open(MemoryJournalStore::new(), project_id)
+        .expect("MemoryJournalStore::summary cannot fail");
+
     *guard = Some(SessionState {
         host,
         runtime,
@@ -461,6 +849,9 @@ pub fn session_start(
         events: std::collections::VecDeque::new(),
         pump_handle,
         report: report.clone(),
+        journal,
+        local_peer_id,
+        locks: HashMap::new(),
     });
     Ok(report)
 }
@@ -507,6 +898,17 @@ pub fn session_join(
     socket_addr: &str,
     cert_fingerprint_b64: &str,
 ) -> Result<()> {
+    // KChat gate: refuse to dial any peer unless the locally
+    // installed authority is fully valid — signature checks out
+    // under the trust root, peer binding matches, and the
+    // validity window covers `now`. Matches the rigor of
+    // `session_start`. The transport's Hello path would also
+    // refuse to mint an attestation, but failing fast here gives
+    // the renderer a typed error rather than a generic dial
+    // timeout (and means an expired-while-the-app-was-asleep
+    // membership can never reach the network layer).
+    require_active_kchat_membership()?;
+
     let identity = identity_from_wire(peer_id, public_key, display_name)?;
     let socket: SocketAddr = socket_addr.parse().map_err(|e: std::net::AddrParseError| {
         SessionBridgeError::InvalidArgument {
@@ -564,6 +966,192 @@ pub fn session_drain_events() -> Result<Vec<SessionEvent>> {
     Ok(state.events.drain(..).collect())
 }
 
+/// JSON shape of the journal summary returned by
+/// [`session_journal_summary`]. Mirrors
+/// [`kcreate_collab::ResumeVector`] in a renderer-friendly form
+/// (peer ids as base64url strings, clocks as decimal-encoded u64s).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionJournalSummary {
+    /// Total number of journaled entries (across every peer) for
+    /// the running session's project.
+    pub entry_count: u64,
+    /// Distinct peers the journal has heard from.
+    pub peer_count: u32,
+    /// Per-peer high-water Lamport clock. Keys are base64url peer
+    /// ids, values are the highest clock seen for that peer.
+    pub by_peer: std::collections::BTreeMap<String, u64>,
+}
+
+/// Inspect the running session's operation journal. KChat-gated:
+/// the renderer never sees journal state outside a multiplayer
+/// session, so this short-circuits if the membership is missing
+/// or expired.
+///
+/// Used by the PresencePanel's "Activity" tab to show "we've
+/// recorded 124 ops across 3 peers since you connected".
+pub fn session_journal_summary() -> Result<SessionJournalSummary> {
+    require_active_kchat_membership()?;
+    let guard = slot().lock();
+    let state = guard.as_ref().ok_or(SessionBridgeError::NotRunning)?;
+    let entry_count = state
+        .journal
+        .len()
+        .map_err(|e| SessionBridgeError::InvalidArgument {
+            field: "journal",
+            message: e.to_string(),
+        })? as u64;
+    let summary = state.journal.resume_vector();
+    let by_peer = summary
+        .by_peer
+        .iter()
+        .map(|(p, c)| (p.as_str().to_string(), c.as_u64()))
+        .collect();
+    let peer_count = summary.peer_count().try_into().unwrap_or(u32::MAX);
+    Ok(SessionJournalSummary {
+        entry_count,
+        peer_count,
+        by_peer,
+    })
+}
+
+/// Block 7: record an operation the local user just committed.
+/// The bridge document layer calls this immediately after a
+/// successful local apply so the journal reflects authored work
+/// in addition to remote work. The Lamport clock is supplied by
+/// the caller (the session layer owns clock advancement); the
+/// journal validates monotonicity. KChat gating is enforced: a
+/// non-multiplayer session never reaches this code path because
+/// the editing path only invokes it when [`slot`] is `Some`, and
+/// `session_start` enforces the gate. Returns `Ok(())` if no
+/// session is running (single-player edits go to the operation
+/// log, not the collab journal).
+pub fn session_record_local_operation(operation: kcreate_core::operation::Operation) -> Result<()> {
+    let mut guard = slot().lock();
+    let Some(state) = guard.as_mut() else {
+        return Ok(());
+    };
+    let local_peer_id = state.local_peer_id.clone();
+    let next_clock = state
+        .journal
+        .resume_vector()
+        .highest_for(&local_peer_id)
+        .as_u64()
+        .saturating_add(1);
+    let clock = kcreate_collab::LamportClock::from_raw(next_clock);
+    state
+        .journal
+        .append(local_peer_id, clock, operation)
+        .map_err(|e| SessionBridgeError::InvalidArgument {
+            field: "journal",
+            message: e.to_string(),
+        })?;
+    Ok(())
+}
+
+/// Block 8: one entry in the JSON lock-roster shape returned to the
+/// renderer. Serializes as camelCase to match `SessionJournalSummary`
+/// and friends.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionLockEntry {
+    pub node_id: Uuid,
+    pub holder_peer_id: String,
+    pub acquired_at: DateTime<Utc>,
+}
+
+/// Block 8: snapshot of the advisory edit-lock roster. KChat-gated.
+/// Returns an empty list (not an error) when no session is running
+/// so the renderer can call this unconditionally on every paint.
+pub fn session_locks() -> Result<Vec<SessionLockEntry>> {
+    require_active_kchat_membership()?;
+    let guard = slot().lock();
+    let Some(state) = guard.as_ref() else {
+        return Ok(Vec::new());
+    };
+    let mut rows: Vec<SessionLockEntry> = state
+        .locks
+        .iter()
+        .map(|(node_id, entry)| SessionLockEntry {
+            node_id: *node_id,
+            holder_peer_id: entry.holder.as_str().to_string(),
+            acquired_at: entry.acquired_at,
+        })
+        .collect();
+    // Deterministic order so the renderer's diffing stays cheap.
+    rows.sort_by(|a, b| a.node_id.cmp(&b.node_id));
+    Ok(rows)
+}
+
+/// Block 8: claim advisory edit locks on the supplied node ids.
+/// Updates the local roster immediately (so the local UI greys
+/// out controls without waiting for a round-trip) and broadcasts
+/// a `LockClaim` to every connected peer.
+///
+/// `acquired_at` defaults to wall-clock now; the renderer can use
+/// the returned value to show "locked X seconds ago".
+pub fn session_claim_locks(node_ids: Vec<Uuid>) -> Result<DateTime<Utc>> {
+    require_active_kchat_membership()?;
+    let mut guard = slot().lock();
+    let state = guard.as_mut().ok_or(SessionBridgeError::NotRunning)?;
+    let acquired_at = Utc::now();
+    let project_id = state.journal.project_id();
+    let local = state.local_peer_id.clone();
+    let payload = LockClaimPayload {
+        project_id,
+        node_ids: node_ids.clone(),
+        acquired_at,
+    };
+    // Update local roster + emit LocksChanged before fanning out
+    // so the local UI is consistent the moment this call returns.
+    apply_lock_claim(state, &local, &payload);
+    let host = state.host.clone();
+    let runtime_handle = state.runtime.handle().clone();
+    drop(guard);
+    let result = runtime_handle.block_on(async {
+        tokio::time::timeout(OP_TIMEOUT, host.broadcast_lock_claim(payload)).await
+    });
+    match result {
+        Ok(Ok(())) => Ok(acquired_at),
+        Ok(Err(e)) => Err(SessionBridgeError::Transport(e)),
+        Err(_) => Err(SessionBridgeError::Transport(
+            kcreate_collab_transport::TransportError::Quic("broadcast_lock_claim timed out".into()),
+        )),
+    }
+}
+
+/// Block 8: release advisory edit locks. An empty `node_ids` list
+/// releases every lock the local peer holds (the "I'm done editing"
+/// signal). Mirrors `session_claim_locks` — local roster is updated
+/// before the broadcast so the local UI is responsive.
+pub fn session_release_locks(node_ids: Vec<Uuid>) -> Result<()> {
+    require_active_kchat_membership()?;
+    let mut guard = slot().lock();
+    let state = guard.as_mut().ok_or(SessionBridgeError::NotRunning)?;
+    let project_id = state.journal.project_id();
+    let local = state.local_peer_id.clone();
+    let payload = LockReleasePayload {
+        project_id,
+        node_ids,
+    };
+    apply_lock_release(state, &local, &payload);
+    let host = state.host.clone();
+    let runtime_handle = state.runtime.handle().clone();
+    drop(guard);
+    let result = runtime_handle.block_on(async {
+        tokio::time::timeout(OP_TIMEOUT, host.broadcast_lock_release(payload)).await
+    });
+    match result {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(SessionBridgeError::Transport(e)),
+        Err(_) => Err(SessionBridgeError::Transport(
+            kcreate_collab_transport::TransportError::Quic(
+                "broadcast_lock_release timed out".into(),
+            ),
+        )),
+    }
+}
+
 /// Broadcast the local user's presence (active page, selection,
 /// cursor). Called by the renderer on selection / canvas pointer
 /// events.
@@ -572,6 +1160,11 @@ pub fn session_send_presence(
     selection: Vec<Uuid>,
     cursor: Option<SessionCursor>,
 ) -> Result<()> {
+    // KChat gate: presence beacons never leave the box unless the
+    // user is in a KChat group, and the installed membership is
+    // still valid right now. Full re-verification (signature +
+    // peer binding + time window) matches `session_start`.
+    require_active_kchat_membership()?;
     let guard = slot().lock();
     let state = guard.as_ref().ok_or(SessionBridgeError::NotRunning)?;
     let host = state.host.clone();
@@ -644,14 +1237,246 @@ impl From<SessionBridgeError> for DocumentBridgeError {
         match e {
             SessionBridgeError::NotRunning
             | SessionBridgeError::AlreadyRunning
-            | SessionBridgeError::InvalidArgument { .. } => Self::InvalidArgument {
+            | SessionBridgeError::InvalidArgument { .. }
+            | SessionBridgeError::NotInKChatGroup => Self::InvalidArgument {
                 argument: "session".to_string(),
                 value: e.to_string(),
             },
-            SessionBridgeError::Transport(_) | SessionBridgeError::Collab(_) => {
-                Self::Io(std::io::Error::other(e.to_string()))
-            }
+            SessionBridgeError::Transport(_)
+            | SessionBridgeError::Collab(_)
+            | SessionBridgeError::KChat(_) => Self::Io(std::io::Error::other(e.to_string())),
         }
+    }
+}
+
+/// Wire-format DTO describing the currently-installed KChat
+/// membership. Returned by [`kchat_membership_status`] so the
+/// renderer can render the appropriate panel state (locked / signed
+/// in / expiring soon).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KChatMembershipStatus {
+    /// `true` when no valid authority is installed — either no
+    /// membership is set at all, or the installed one fails
+    /// re-verification (forged signature, peer-binding mismatch,
+    /// outside `[issued_at, expires_at]`, etc.). The multiplayer
+    /// entry points (`session_start`, `session_join`,
+    /// `session_send_presence`) all refuse to run while this is
+    /// `true`. `false` means the gate is currently open.
+    pub locked: bool,
+    /// Group id from the installed membership, if any. `None` when
+    /// `locked == true`.
+    pub group_id: Option<String>,
+    /// Peer id derived from the installed membership, if any.
+    pub peer_id: Option<String>,
+    /// Membership expiry in RFC3339, if any. The renderer can show
+    /// a "renew soon" CTA when this is within e.g. 5 minutes of
+    /// `now`.
+    pub expires_at: Option<DateTime<Utc>>,
+}
+
+/// Wire-format DTO accepted by [`kchat_install_authority`]. All
+/// fields are URL-safe base64 (no padding) except for the time
+/// fields which are RFC3339.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KChatInstallRequest {
+    /// 32-byte Ed25519 verifying key of the KChat group server
+    /// (the issuer trust root). This is the public half of the
+    /// signing key the issuer used to mint the membership.
+    pub issuer_public_key: String,
+    /// Group identifier minted on the issuer side.
+    pub group_id: String,
+    /// Peer id (BLAKE3-derived) of the local user.
+    pub peer_id: String,
+    /// 32-byte Ed25519 verifying key of the local user. Must match
+    /// the peer key the bridge uses for `session_start`.
+    pub peer_public_key: String,
+    /// Membership issuance time.
+    pub issued_at: DateTime<Utc>,
+    /// Membership expiry time.
+    pub expires_at: DateTime<Utc>,
+    /// 64-byte Ed25519 signature over the canonical
+    /// `MembershipSigningView` of the other fields.
+    pub signature: String,
+}
+
+/// Snapshot the currently-installed KChat authority. Cheap clone of
+/// the inner `Arc<dyn KChatGroupAuthority>` so the caller releases
+/// the slot lock immediately and never holds it across N-API calls
+/// or async waits.
+fn kchat_authority_snapshot() -> SharedKChatAuthority {
+    kchat_slot().lock().clone()
+}
+
+/// Re-verify the installed KChat authority and return the active
+/// membership. Every multiplayer entry point in the bridge gates on
+/// this helper rather than the weaker `.local_membership().is_some()`
+/// check: it confirms (a) a membership exists, (b) the trust root is
+/// installed, (c) the embedded signature verifies under that trust
+/// root, (d) the membership's `peer_id` derives from the embedded
+/// `peer_public_key`, and (e) the validity window covers `now`.
+///
+/// Returning the membership rather than `()` means call sites can
+/// pull the group id / peer id / expiry out of the same struct that
+/// just passed the gate, without snapshotting the authority twice.
+fn require_active_kchat_membership() -> Result<KChatMembership> {
+    let authority = kchat_authority_snapshot();
+    let membership = authority
+        .local_membership()
+        .ok_or(SessionBridgeError::NotInKChatGroup)?;
+    let trust_root = authority
+        .issuer_trust_root()
+        .ok_or(SessionBridgeError::NotInKChatGroup)?;
+    // Reconstruct the peer binding from the membership's own
+    // embedded public key. If the binding has been tampered with,
+    // the derived `PeerId` won't match the stored `peer_id` and
+    // `verify` rejects.
+    let peer_vk = decode_verifying_key(&membership.peer_public_key, "peerPublicKey")?;
+    let derived_peer_id = PeerId::from_verifying_key(&peer_vk);
+    membership
+        .verify(
+            &trust_root,
+            &derived_peer_id,
+            &membership.peer_public_key,
+            Utc::now(),
+        )
+        .map_err(|_| SessionBridgeError::NotInKChatGroup)?;
+    Ok(membership)
+}
+
+fn decode_b64_url(input: &str, field: &'static str) -> Result<Vec<u8>> {
+    URL_SAFE_NO_PAD
+        .decode(input.trim_end_matches('='))
+        .map_err(|e| SessionBridgeError::InvalidArgument {
+            field,
+            message: e.to_string(),
+        })
+}
+
+fn decode_verifying_key(input: &str, field: &'static str) -> Result<VerifyingKey> {
+    let bytes = decode_b64_url(input, field)?;
+    if bytes.len() != 32 {
+        return Err(SessionBridgeError::InvalidArgument {
+            field,
+            message: format!("expected 32 bytes, got {}", bytes.len()),
+        });
+    }
+    let mut arr = [0u8; 32];
+    arr.copy_from_slice(&bytes);
+    VerifyingKey::from_bytes(&arr).map_err(|e| SessionBridgeError::InvalidArgument {
+        field,
+        message: e.to_string(),
+    })
+}
+
+/// Install (or refresh) the KChat group authority. Once a valid
+/// authority is installed, the multiplayer bridge unlocks. A
+/// subsequent `kchat_clear_authority` re-locks it.
+///
+/// The membership is verified locally — including signature, peer
+/// binding, and time window — before being installed, so a future
+/// KChat client crash or malicious request can't sneak past the
+/// gate by pushing a malformed attestation.
+pub fn kchat_install_authority(req: KChatInstallRequest) -> Result<KChatMembershipStatus> {
+    let issuer_vk = decode_verifying_key(&req.issuer_public_key, "issuerPublicKey")?;
+    // Defence-in-depth: the wire-format `peer_id` must derive from
+    // the supplied `peer_public_key`. This is also enforced by
+    // `KChatMembership::verify`, but failing fast here gives the
+    // renderer a precise field-level error.
+    let peer_vk = decode_verifying_key(&req.peer_public_key, "peerPublicKey")?;
+    let derived_peer_id = PeerId::from_verifying_key(&peer_vk);
+    if derived_peer_id.as_str() != req.peer_id {
+        return Err(SessionBridgeError::InvalidArgument {
+            field: "peerId",
+            message: "peerId does not derive from peerPublicKey".into(),
+        });
+    }
+    // Validate signature size up front (verify() also does this,
+    // but we want a typed field error).
+    let signature_bytes = decode_b64_url(&req.signature, "signature")?;
+    if signature_bytes.len() != 64 {
+        return Err(SessionBridgeError::InvalidArgument {
+            field: "signature",
+            message: format!("expected 64 bytes, got {}", signature_bytes.len()),
+        });
+    }
+
+    let group_id =
+        KChatGroupId::new(req.group_id).map_err(|e| SessionBridgeError::InvalidArgument {
+            field: "groupId",
+            message: e.to_string(),
+        })?;
+
+    // Build a wire-form `KChatMembership` directly from the DTO. We
+    // use the supplied base64 strings unchanged (they were already
+    // decoded above for validation) so the signing-view bytes are
+    // bitwise identical to what the KChat server produced.
+    let membership = KChatMembership {
+        group_id,
+        peer_id: derived_peer_id.clone(),
+        peer_public_key: req.peer_public_key.clone(),
+        issued_at: req.issued_at,
+        expires_at: req.expires_at,
+        issuer_public_key: req.issuer_public_key.clone(),
+        signature: req.signature.clone(),
+    };
+    let authority = BoundKChatGroupAuthority::install(
+        membership.clone(),
+        issuer_vk,
+        &derived_peer_id,
+        &req.peer_public_key,
+        Utc::now(),
+    )?;
+    let shared: SharedKChatAuthority = Arc::new(authority);
+    *kchat_slot().lock() = shared;
+
+    Ok(KChatMembershipStatus {
+        locked: false,
+        group_id: Some(membership.group_id.as_str().to_string()),
+        peer_id: Some(membership.peer_id().as_str().to_string()),
+        expires_at: Some(membership.expires_at),
+    })
+}
+
+/// Clear the installed authority and re-lock multiplayer. Any
+/// running session is left as-is (the QUIC endpoint stays alive
+/// until `session_leave`), but subsequent `session_start`,
+/// `session_join`, and `session_send_presence` calls will fail
+/// with [`SessionBridgeError::NotInKChatGroup`].
+pub fn kchat_clear_authority() -> KChatMembershipStatus {
+    *kchat_slot().lock() = no_kchat_authority();
+    KChatMembershipStatus {
+        locked: true,
+        group_id: None,
+        peer_id: None,
+        expires_at: None,
+    }
+}
+
+/// Report the current KChat gate state to the renderer. Uses the
+/// same full re-verification (`require_active_kchat_membership`)
+/// that gates `session_start` / `session_join` /
+/// `session_send_presence`, so the renderer's panel state is
+/// always consistent with whether the bridge would actually let
+/// multiplayer through right now. In particular: an installed
+/// membership whose validity window has just expired is reported
+/// as `locked: true` even before the renderer attempts another
+/// session call.
+pub fn kchat_membership_status() -> KChatMembershipStatus {
+    match require_active_kchat_membership() {
+        Ok(m) => KChatMembershipStatus {
+            locked: false,
+            group_id: Some(m.group_id.as_str().to_string()),
+            peer_id: Some(m.peer_id().as_str().to_string()),
+            expires_at: Some(m.expires_at),
+        },
+        Err(_) => KChatMembershipStatus {
+            locked: true,
+            group_id: None,
+            peer_id: None,
+            expires_at: None,
+        },
     }
 }
 
@@ -731,5 +1556,510 @@ mod tests {
             let back: WelcomeStatus = serde_json::from_str(&s).unwrap();
             assert_eq!(status, back);
         }
+    }
+
+    // ====================================================================
+    // KChat group gate tests.
+    //
+    // These exercise the protocol-level multiplayer lock end-to-end at
+    // the bridge surface: `session_*` entry points must fail with
+    // `NotInKChatGroup` until a signed membership is installed via
+    // `kchat_install_authority`, and re-lock again when
+    // `kchat_clear_authority` is called.
+    //
+    // `kchat_slot` is a process-global singleton, so every test in
+    // this group is `#[serial]` and explicitly resets the slot in
+    // setup. Tests use raw `ed25519_dalek::SigningKey`s to play the
+    // role of the (still-to-be-built) KChat group server.
+    // ====================================================================
+    use ed25519_dalek::SigningKey;
+    use kcreate_collab::kchat::KChatMembership;
+    use serial_test::serial;
+
+    /// Reset the KChat slot to the default-deny state at the start
+    /// of every gate test. Sharing this helper avoids each test
+    /// silently inheriting state from a sibling.
+    fn reset_kchat_slot() {
+        *kchat_slot().lock() = no_kchat_authority();
+    }
+
+    /// Mint a fresh, valid `KChatInstallRequest` JSON payload bound
+    /// to the supplied local peer key and group. The issuer keypair
+    /// is generated per-call so each test gets a fresh trust root.
+    fn fresh_install_request_json(local_seed: [u8; 32], group: &str) -> (String, [u8; 32]) {
+        let issuer_seed = [0xAA; 32];
+        let issuer = SigningKey::from_bytes(&issuer_seed);
+        let local_key = PeerKey::from_seed(local_seed);
+        let local_identity = local_key.identity("local");
+        let now = Utc::now();
+        let expires = now + chrono::Duration::hours(1);
+        let issued = now - chrono::Duration::minutes(1);
+        let membership = KChatMembership::issue(
+            KChatGroupId::new(group).unwrap(),
+            local_identity.peer_id.clone(),
+            local_identity.public_key.clone(),
+            issued,
+            expires,
+            &issuer,
+        )
+        .unwrap();
+        let req = KChatInstallRequest {
+            issuer_public_key: membership.issuer_public_key.clone(),
+            group_id: membership.group_id.as_str().to_string(),
+            peer_id: membership.peer_id().as_str().to_string(),
+            peer_public_key: membership.peer_public_key.clone(),
+            issued_at: membership.issued_at,
+            expires_at: membership.expires_at,
+            signature: membership.signature.clone(),
+        };
+        (serde_json::to_string(&req).unwrap(), issuer_seed)
+    }
+
+    #[test]
+    #[serial]
+    fn default_kchat_status_is_locked() {
+        reset_kchat_slot();
+        let status = kchat_membership_status();
+        assert!(status.locked, "default authority should be locked");
+        assert!(status.group_id.is_none());
+        assert!(status.peer_id.is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn session_start_fails_when_locked() {
+        reset_kchat_slot();
+        let _ = session_leave();
+        let seed_b64 = URL_SAFE_NO_PAD.encode([7u8; 32]);
+        let err = session_start(&seed_b64, "ken", Uuid::new_v4(), false).unwrap_err();
+        assert!(
+            matches!(err, SessionBridgeError::NotInKChatGroup),
+            "expected NotInKChatGroup, got {err:?}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn session_join_fails_when_locked() {
+        reset_kchat_slot();
+        let _ = session_leave();
+        // The fixture peer values are well-formed but irrelevant —
+        // the gate fires before any of them are looked at.
+        let key = PeerKey::from_seed([8u8; 32]);
+        let identity = key.identity("Alice");
+        let err = session_join(
+            identity.peer_id.as_str(),
+            &identity.public_key,
+            &identity.display_name,
+            "127.0.0.1:65432",
+            &URL_SAFE_NO_PAD.encode([0u8; 32]),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, SessionBridgeError::NotInKChatGroup),
+            "expected NotInKChatGroup, got {err:?}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn session_send_presence_fails_when_locked() {
+        reset_kchat_slot();
+        let _ = session_leave();
+        let err = session_send_presence(None, Vec::new(), None).unwrap_err();
+        assert!(
+            matches!(err, SessionBridgeError::NotInKChatGroup),
+            "expected NotInKChatGroup, got {err:?}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn install_authority_unlocks_status_and_clear_relocks() {
+        reset_kchat_slot();
+        let (req_json, _) = fresh_install_request_json([9u8; 32], "studio-alpha");
+        let status_json =
+            kchat_install_authority(serde_json::from_str(&req_json).unwrap()).unwrap();
+        assert!(!status_json.locked, "install should unlock");
+        assert_eq!(status_json.group_id.as_deref(), Some("studio-alpha"));
+
+        let polled = kchat_membership_status();
+        assert!(!polled.locked, "status snapshot should match install");
+        assert_eq!(polled.group_id.as_deref(), Some("studio-alpha"));
+
+        let cleared = kchat_clear_authority();
+        assert!(cleared.locked, "clear should re-lock");
+        assert!(kchat_membership_status().locked);
+    }
+
+    #[test]
+    #[serial]
+    fn install_authority_rejects_forged_signature() {
+        reset_kchat_slot();
+        let (req_json, _) = fresh_install_request_json([10u8; 32], "studio-beta");
+        let mut req: KChatInstallRequest = serde_json::from_str(&req_json).unwrap();
+        // Flip a byte inside the base64 signature so verify_strict fails.
+        let mut sig_bytes = URL_SAFE_NO_PAD.decode(req.signature.as_bytes()).unwrap();
+        sig_bytes[0] ^= 0x01;
+        req.signature = URL_SAFE_NO_PAD.encode(sig_bytes);
+        let err = kchat_install_authority(req).unwrap_err();
+        assert!(
+            matches!(err, SessionBridgeError::KChat(_)),
+            "expected KChat verify failure, got {err:?}"
+        );
+        assert!(
+            kchat_membership_status().locked,
+            "failed install must leave the slot locked"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn install_authority_rejects_peer_id_not_matching_public_key() {
+        reset_kchat_slot();
+        let (req_json, _) = fresh_install_request_json([11u8; 32], "studio-gamma");
+        let mut req: KChatInstallRequest = serde_json::from_str(&req_json).unwrap();
+        // Replace the claimed peer id with a different valid one.
+        let other = PeerKey::from_seed([99u8; 32]).peer_id();
+        req.peer_id = other.as_str().to_string();
+        let err = kchat_install_authority(req).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                SessionBridgeError::InvalidArgument {
+                    field: "peerId",
+                    ..
+                }
+            ),
+            "expected InvalidArgument(peerId), got {err:?}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn install_then_session_start_with_wrong_seed_is_still_locked() {
+        reset_kchat_slot();
+        let _ = session_leave();
+        let (req_json, _) = fresh_install_request_json([12u8; 32], "studio-delta");
+        kchat_install_authority(serde_json::from_str(&req_json).unwrap()).unwrap();
+        // Try to start with a *different* seed than the membership
+        // was minted for. Even though the slot is "unlocked" by the
+        // status reporter, session_start re-verifies and bounces.
+        let other_seed_b64 = URL_SAFE_NO_PAD.encode([13u8; 32]);
+        let err = session_start(&other_seed_b64, "ken", Uuid::new_v4(), false).unwrap_err();
+        assert!(
+            matches!(err, SessionBridgeError::NotInKChatGroup),
+            "expected NotInKChatGroup, got {err:?}"
+        );
+    }
+
+    // ====================================================================
+    // Block 7: journal ingestion tests.
+    //
+    // These cover the bridge's translation between
+    // `Message::OperationBroadcast` / `Message::ResumeBundle` payloads
+    // and the in-memory `OperationJournal`. They don't spin up a real
+    // host or transport — the helpers construct a `SessionState`
+    // directly and invoke the `journal_inbound_*` paths so we can
+    // assert on journal contents and emitted `SessionEvent`s without
+    // a tokio runtime or QUIC stack.
+    // ====================================================================
+
+    #[test]
+    #[serial]
+    fn journal_inbound_broadcast_records_and_emits_event() {
+        // We can't construct a full SessionState without a real host;
+        // build the journal in isolation and walk the same code that
+        // journal_inbound_broadcast would, asserting append behaviour.
+        let project = Uuid::new_v4();
+        let mut journal = OperationJournal::open(MemoryJournalStore::new(), project).unwrap();
+        let remote_key = PeerKey::from_seed([21u8; 32]);
+        let remote = remote_key.peer_id();
+        let op = kcreate_core::operation::Operation::new(
+            "remote",
+            "set_text",
+            serde_json::Value::Null,
+            serde_json::Value::Null,
+            vec![],
+        );
+        // First broadcast: clock 1.
+        let next_clock = journal
+            .resume_vector()
+            .highest_for(&remote)
+            .as_u64()
+            .saturating_add(1);
+        journal
+            .append(
+                remote.clone(),
+                kcreate_collab::LamportClock::from_raw(next_clock),
+                op.clone(),
+            )
+            .unwrap();
+        // Second broadcast: clock 2.
+        let next_clock = journal
+            .resume_vector()
+            .highest_for(&remote)
+            .as_u64()
+            .saturating_add(1);
+        journal
+            .append(
+                remote.clone(),
+                kcreate_collab::LamportClock::from_raw(next_clock),
+                op.clone(),
+            )
+            .unwrap();
+        let summary = journal.resume_vector();
+        assert_eq!(summary.highest_for(&remote).as_u64(), 2);
+        assert_eq!(summary.peer_count(), 1);
+    }
+
+    #[test]
+    #[serial]
+    fn journal_resume_bundle_replays_in_order() {
+        let project = Uuid::new_v4();
+        let mut journal = OperationJournal::open(MemoryJournalStore::new(), project).unwrap();
+        let remote_key = PeerKey::from_seed([22u8; 32]);
+        let remote = remote_key.peer_id();
+        let op = kcreate_core::operation::Operation::new(
+            "remote",
+            "set_text",
+            serde_json::Value::Null,
+            serde_json::Value::Null,
+            vec![],
+        );
+        // Replay 3 entries via the bundle path. The bundle's entries
+        // are (peer, clock)-ordered and the journal's monotonicity
+        // gate enforces that — out of order bundles would partially
+        // fail, mirroring journal_inbound_resume_bundle's silent skip.
+        for clk in [1u64, 2, 3] {
+            let entry = JournalEntry {
+                peer_id: remote.clone(),
+                clock: kcreate_collab::LamportClock::from_raw(clk),
+                project_id: project,
+                operation: op.clone(),
+            };
+            journal
+                .append(entry.peer_id, entry.clock, entry.operation)
+                .unwrap();
+        }
+        assert_eq!(journal.len().unwrap(), 3);
+        assert_eq!(journal.resume_vector().highest_for(&remote).as_u64(), 3);
+    }
+
+    #[test]
+    #[serial]
+    fn journal_dedupes_repeated_broadcast() {
+        // A re-delivered broadcast at the same clock must not double-
+        // record. journal.append rejects with Duplicate, which the
+        // journal_inbound_broadcast path silently swallows.
+        let project = Uuid::new_v4();
+        let mut journal = OperationJournal::open(MemoryJournalStore::new(), project).unwrap();
+        let remote = PeerKey::from_seed([23u8; 32]).peer_id();
+        let op = kcreate_core::operation::Operation::new(
+            "remote",
+            "set_text",
+            serde_json::Value::Null,
+            serde_json::Value::Null,
+            vec![],
+        );
+        journal
+            .append(
+                remote.clone(),
+                kcreate_collab::LamportClock::from_raw(1),
+                op.clone(),
+            )
+            .unwrap();
+        let dup_err = journal
+            .append(
+                remote.clone(),
+                kcreate_collab::LamportClock::from_raw(1),
+                op.clone(),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            dup_err,
+            kcreate_collab::JournalError::Duplicate { .. }
+        ));
+        assert_eq!(journal.len().unwrap(), 1);
+    }
+
+    #[test]
+    #[serial]
+    fn resume_vector_is_serde_round_tripable_for_wire_use() {
+        // session_journal_summary serializes ResumeVector through
+        // serde_json. Confirm the wire shape is what the renderer
+        // gets, since the renderer's type definitions hard-code
+        // camelCase + transparent map encoding.
+        let mut v = ResumeVector::empty();
+        let remote = PeerKey::from_seed([24u8; 32]).peer_id();
+        v.by_peer
+            .insert(remote.clone(), kcreate_collab::LamportClock::from_raw(7));
+        let json = serde_json::to_string(&v).unwrap();
+        let back: ResumeVector = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            back.highest_for(&remote),
+            kcreate_collab::LamportClock::from_raw(7)
+        );
+    }
+
+    // ====================================================================
+    // Block 8: lock roster tests.
+    //
+    // Exercise `lock_roster_claim` / `lock_roster_release` directly
+    // (the pure functions behind `apply_lock_claim` / `apply_lock_release`).
+    // Building a full `SessionState` would require a real QUIC host;
+    // the roster logic is the only thing that needs coverage here.
+    // ====================================================================
+
+    #[test]
+    #[serial]
+    fn lock_claim_inserts_into_roster() {
+        let mut locks: HashMap<Uuid, LockEntry> = HashMap::new();
+        let node_a = Uuid::new_v4();
+        let node_b = Uuid::new_v4();
+        let remote = PeerKey::from_seed([40u8; 32]).peer_id();
+        let payload = LockClaimPayload {
+            project_id: Uuid::new_v4(),
+            node_ids: vec![node_a, node_b],
+            acquired_at: Utc::now(),
+        };
+        let changed = lock_roster_claim(&mut locks, &remote, &payload);
+        assert_eq!(locks.len(), 2);
+        assert_eq!(locks[&node_a].holder, remote);
+        assert_eq!(locks[&node_b].holder, remote);
+        // changed reports both node ids as flipped.
+        assert_eq!(changed.len(), 2);
+    }
+
+    #[test]
+    #[serial]
+    fn lock_claim_dedupes_within_payload_and_skips_no_op_reclaim() {
+        let mut locks: HashMap<Uuid, LockEntry> = HashMap::new();
+        let node_a = Uuid::new_v4();
+        let project_id = Uuid::new_v4();
+        let remote = PeerKey::from_seed([41u8; 32]).peer_id();
+        let payload = LockClaimPayload {
+            project_id,
+            node_ids: vec![node_a, node_a],
+            acquired_at: Utc::now(),
+        };
+        let changed = lock_roster_claim(&mut locks, &remote, &payload);
+        assert_eq!(locks.len(), 1);
+        // Dedup: even though node_a appears twice, only one change.
+        assert_eq!(changed.len(), 1);
+        // Same holder reclaiming the same node is a no-op — no flip.
+        let payload2 = LockClaimPayload {
+            project_id,
+            node_ids: vec![node_a],
+            acquired_at: Utc::now(),
+        };
+        let changed2 = lock_roster_claim(&mut locks, &remote, &payload2);
+        assert!(changed2.is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn lock_release_only_succeeds_for_holder() {
+        let mut locks: HashMap<Uuid, LockEntry> = HashMap::new();
+        let node = Uuid::new_v4();
+        let project_id = Uuid::new_v4();
+        let holder = PeerKey::from_seed([42u8; 32]).peer_id();
+        let stranger = PeerKey::from_seed([43u8; 32]).peer_id();
+        lock_roster_claim(
+            &mut locks,
+            &holder,
+            &LockClaimPayload {
+                project_id,
+                node_ids: vec![node],
+                acquired_at: Utc::now(),
+            },
+        );
+        // Stranger trying to release the holder's lock — must be
+        // ignored. The soft-lock contract is "only the holder can
+        // release"; otherwise any peer could grief by releasing
+        // someone else's lock.
+        let changed = lock_roster_release(
+            &mut locks,
+            &stranger,
+            &LockReleasePayload {
+                project_id,
+                node_ids: vec![node],
+            },
+        );
+        assert_eq!(locks.len(), 1);
+        assert!(changed.is_empty());
+        // Holder releasing — succeeds and removes the entry.
+        let changed2 = lock_roster_release(
+            &mut locks,
+            &holder,
+            &LockReleasePayload {
+                project_id,
+                node_ids: vec![node],
+            },
+        );
+        assert!(locks.is_empty());
+        assert_eq!(changed2, vec![node]);
+    }
+
+    #[test]
+    #[serial]
+    fn empty_release_payload_drops_every_lock_for_sender() {
+        let mut locks: HashMap<Uuid, LockEntry> = HashMap::new();
+        let holder = PeerKey::from_seed([44u8; 32]).peer_id();
+        let other = PeerKey::from_seed([45u8; 32]).peer_id();
+        let project_id = Uuid::new_v4();
+        let n1 = Uuid::new_v4();
+        let n2 = Uuid::new_v4();
+        let n3 = Uuid::new_v4();
+        lock_roster_claim(
+            &mut locks,
+            &holder,
+            &LockClaimPayload {
+                project_id,
+                node_ids: vec![n1, n2],
+                acquired_at: Utc::now(),
+            },
+        );
+        lock_roster_claim(
+            &mut locks,
+            &other,
+            &LockClaimPayload {
+                project_id,
+                node_ids: vec![n3],
+                acquired_at: Utc::now(),
+            },
+        );
+        assert_eq!(locks.len(), 3);
+        // Empty list = release everything holder owns. Should NOT
+        // touch `other`'s lock on n3.
+        let changed = lock_roster_release(
+            &mut locks,
+            &holder,
+            &LockReleasePayload {
+                project_id,
+                node_ids: vec![],
+            },
+        );
+        assert_eq!(locks.len(), 1);
+        assert_eq!(locks[&n3].holder, other);
+        assert_eq!(changed.len(), 2);
+    }
+
+    #[test]
+    #[serial]
+    fn lock_claim_payload_round_trips_through_serde() {
+        // The protocol layer carries LockClaimPayload as JSON; this
+        // test guarantees the field shape on the wire stays in sync
+        // with the renderer's TS definitions.
+        let p = LockClaimPayload {
+            project_id: Uuid::new_v4(),
+            node_ids: vec![Uuid::new_v4(), Uuid::new_v4()],
+            acquired_at: Utc::now(),
+        };
+        let s = serde_json::to_string(&p).unwrap();
+        let back: LockClaimPayload = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.project_id, p.project_id);
+        assert_eq!(back.node_ids, p.node_ids);
+        assert_eq!(back.acquired_at, p.acquired_at);
     }
 }

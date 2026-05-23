@@ -19,10 +19,12 @@
 
 use std::collections::{HashMap, VecDeque};
 
+use chrono::Utc;
 use uuid::Uuid;
 
 use crate::clock::LamportClock;
 use crate::envelope::{CollabError, Envelope, NONCE_BYTES};
+use crate::kchat::{KChatAuthError, NoKChatGroupAuthority, SharedKChatAuthority};
 use crate::message::Message;
 use crate::peer::{PeerId, PeerIdentity, PeerKey};
 
@@ -73,6 +75,14 @@ pub struct ProjectSession {
     /// provide the long-lived signing seed.
     nonce_counter: u64,
     nonce_prefix: [u8; 8],
+    /// KChat group authority consulted on every Hello/Welcome
+    /// boundary. The default (set by [`ProjectSession::new`]) is
+    /// [`NoKChatGroupAuthority`], which fails closed and locks
+    /// multiplayer. Callers wire in a real authority via
+    /// [`ProjectSession::with_kchat_authority`] (or
+    /// [`ProjectSession::new_with_authority`]) once the user signs
+    /// into a KChat group.
+    kchat_authority: SharedKChatAuthority,
 }
 
 impl std::fmt::Debug for ProjectSession {
@@ -101,6 +111,30 @@ impl ProjectSession {
         config: SessionConfig,
         nonce_seed: [u8; 8],
     ) -> Self {
+        Self::new_with_authority(
+            local_key,
+            display_name,
+            project_id,
+            config,
+            nonce_seed,
+            std::sync::Arc::new(NoKChatGroupAuthority),
+        )
+    }
+
+    /// Same as [`Self::new`] but with an explicit KChat group
+    /// authority. The transport / bridge calls this once it has
+    /// asked the (future) KChat client for a fresh attestation;
+    /// the test harnesses call it with an
+    /// [`crate::kchat::InProcessKChatAuthority`] driving a
+    /// deterministic issuer key.
+    pub fn new_with_authority(
+        local_key: PeerKey,
+        display_name: impl Into<String>,
+        project_id: Uuid,
+        config: SessionConfig,
+        nonce_seed: [u8; 8],
+        kchat_authority: SharedKChatAuthority,
+    ) -> Self {
         let local_identity = local_key.identity(display_name);
         Self {
             local_key,
@@ -111,7 +145,24 @@ impl ProjectSession {
             peers: HashMap::new(),
             nonce_counter: 0,
             nonce_prefix: nonce_seed,
+            kchat_authority,
         }
+    }
+
+    /// Swap the session's KChat authority. The caller normally
+    /// installs the real authority before the first Hello flies, but
+    /// the swap is supported so a long-running session can refresh
+    /// its attestation when one is close to expiry without tearing
+    /// down the transport.
+    pub fn set_kchat_authority(&mut self, authority: SharedKChatAuthority) {
+        self.kchat_authority = authority;
+    }
+
+    /// Borrow the current KChat authority. Useful for the bridge
+    /// surface that mirrors authority state to the UI lock CTA.
+    #[must_use]
+    pub fn kchat_authority(&self) -> &SharedKChatAuthority {
+        &self.kchat_authority
     }
 
     /// The local peer's public identity (cheap clone — the
@@ -181,7 +232,19 @@ impl ProjectSession {
     /// Seal a message into an envelope JSON string ready for the
     /// transport to send. The local Lamport clock is incremented
     /// once per call.
+    ///
+    /// KChat-gated handshakes: when `message` is a `Hello` or
+    /// `Welcome` whose `kchat_attestation` is `None`, the call
+    /// stamps the local authority's attestation into the payload.
+    /// If the authority has no local membership (default
+    /// `NoKChatGroupAuthority`) the call returns
+    /// [`SessionError::KChat`] — the bridge layer is expected to
+    /// surface this as the "multiplayer locked" CTA. A payload that
+    /// already carries an attestation (e.g. a transport that
+    /// constructed the handshake itself) passes through unchanged
+    /// so the seal step doesn't re-attest unnecessarily.
     pub fn seal_message(&mut self, message: Message) -> Result<String, SessionError> {
+        let message = self.attach_kchat_attestation(message)?;
         let clock = self.clock.tick();
         let nonce = self.next_nonce();
         let env = Envelope::seal(
@@ -193,6 +256,46 @@ impl ProjectSession {
         )
         .map_err(SessionError::Collab)?;
         serde_json::to_string(&env).map_err(|e| SessionError::Encode(e.to_string()))
+    }
+
+    /// Stamp the local KChat attestation onto a Hello/Welcome
+    /// payload, if the payload doesn't already carry one. Returns
+    /// the (possibly transformed) payload, or an error if the local
+    /// authority cannot mint an attestation.
+    ///
+    /// This is the canonical point where the bridge / transport
+    /// hooks into the multiplayer gate; every outbound handshake
+    /// flows through here.
+    fn attach_kchat_attestation(&self, message: Message) -> Result<Message, SessionError> {
+        match message {
+            Message::Hello(mut payload) => {
+                if payload.kchat_attestation.is_none() {
+                    payload.kchat_attestation = Some(self.require_local_membership()?);
+                }
+                Ok(Message::Hello(payload))
+            }
+            Message::Welcome(mut payload) => {
+                // Accepted welcomes must carry the host's
+                // attestation so the joiner can verify the group
+                // match. Rejected welcomes don't (and indeed must
+                // not — the host may be rejecting precisely
+                // *because* it has no KChat binding, and stalling
+                // here would surface as a timeout on the joiner).
+                if matches!(payload.status, crate::message::WelcomeStatus::Accepted)
+                    && payload.kchat_attestation.is_none()
+                {
+                    payload.kchat_attestation = Some(self.require_local_membership()?);
+                }
+                Ok(Message::Welcome(payload))
+            }
+            other => Ok(other),
+        }
+    }
+
+    fn require_local_membership(&self) -> Result<crate::kchat::KChatMembership, SessionError> {
+        self.kchat_authority
+            .local_membership()
+            .ok_or(SessionError::KChat(KChatAuthError::NoKChatBinding))
     }
 
     /// Parse and validate an envelope coming off the transport.
@@ -246,8 +349,42 @@ impl ProjectSession {
             }
         }
 
+        // KChat-gated handshake check. Hello and Welcome both carry
+        // a `kchat_attestation`; we verify it against the local
+        // authority's trust root + group before letting the message
+        // out of the session. Without this, a remote peer could
+        // hand us a valid Hello signed by their own (untrusted)
+        // issuer and we would happily admit them to the project.
+        self.verify_remote_kchat(&env.from, &env.payload)?;
+
         let _ = self.clock.observe(env.clock);
         Ok(env.payload)
+    }
+
+    /// Verify the KChat attestation embedded in an inbound Hello /
+    /// Welcome against the local authority's trust root + group.
+    /// Non-handshake messages pass through untouched.
+    fn verify_remote_kchat(&self, from: &PeerId, payload: &Message) -> Result<(), SessionError> {
+        let (attestation, expected_peer_public_key) = match payload {
+            Message::Hello(p) => (p.kchat_attestation.as_ref(), p.identity.public_key.as_str()),
+            Message::Welcome(p) => {
+                // The Welcome carries the *host's* identity, not
+                // the receiving peer's. The host's attestation must
+                // match the host's public key, so we cross-check
+                // against `p.host_identity.public_key` here, not
+                // `env.from`'s identity (they refer to the same
+                // peer, but we want the binding to be obvious).
+                (
+                    p.kchat_attestation.as_ref(),
+                    p.host_identity.public_key.as_str(),
+                )
+            }
+            _ => return Ok(()),
+        };
+        let attestation = attestation.ok_or(SessionError::KChat(KChatAuthError::NoKChatBinding))?;
+        self.kchat_authority
+            .verify_remote(from, expected_peer_public_key, attestation, Utc::now())
+            .map_err(SessionError::KChat)
     }
 
     fn next_nonce(&mut self) -> [u8; NONCE_BYTES] {
@@ -267,6 +404,10 @@ const fn message_project_id(msg: &Message) -> Option<Uuid> {
     match msg {
         Message::Hello(p) => Some(p.project_id),
         Message::OperationBroadcast(p) => Some(p.project_id),
+        Message::ResumeRequest(p) => Some(p.project_id),
+        Message::ResumeBundle(p) => Some(p.project_id),
+        Message::LockClaim(p) => Some(p.project_id),
+        Message::LockRelease(p) => Some(p.project_id),
         Message::Welcome(_) | Message::Presence(_) | Message::Heartbeat | Message::Goodbye(_) => {
             None
         }
@@ -301,24 +442,62 @@ pub enum SessionError {
     /// JSON decoding failed.
     #[error("envelope decode failed: {0}")]
     Decode(String),
+    /// The KChat group authority rejected an inbound or outbound
+    /// handshake — the local user is not signed into a KChat group,
+    /// the remote peer's attestation doesn't match the local trust
+    /// root or group, or the attestation is forged / expired. The
+    /// bridge surfaces this as the "multiplayer locked" CTA.
+    #[error("KChat gate rejected handshake: {0}")]
+    KChat(#[from] KChatAuthError),
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::kchat::{InProcessKChatAuthority, KChatGroupId};
     use crate::message::{
         GoodbyeReason, HelloPayload, OperationBroadcastPayload, PresencePayload, WelcomePayload,
         WelcomeStatus,
     };
     use kcreate_core::operation::Operation;
+    use std::sync::Arc;
+
+    /// Shared issuer seed used by every in-test KChat authority so
+    /// the same trust root is recognised by every session, while
+    /// the group id is varied per scenario to exercise cross-group
+    /// rejection paths.
+    const TEST_ISSUER_SEED: [u8; 32] = [0xAB; 32];
+
+    fn test_group() -> KChatGroupId {
+        KChatGroupId::new("test-group").unwrap()
+    }
+
+    fn make_authority(seed: u8, group: KChatGroupId) -> SharedKChatAuthority {
+        let key = PeerKey::from_seed([seed; 32]);
+        let identity = key.identity(format!("peer-{seed}"));
+        let issued = Utc::now() - chrono::Duration::minutes(1);
+        let expires = Utc::now() + chrono::Duration::hours(1);
+        Arc::new(
+            InProcessKChatAuthority::for_peer(
+                TEST_ISSUER_SEED,
+                group,
+                identity.peer_id,
+                identity.public_key,
+                issued,
+                expires,
+            )
+            .unwrap(),
+        )
+    }
 
     fn make_session(seed: u8, project: Uuid) -> ProjectSession {
-        ProjectSession::new(
+        ProjectSession::new_with_authority(
             PeerKey::from_seed([seed; 32]),
             format!("peer-{seed}"),
             project,
             SessionConfig::default(),
             [seed; 8],
+            make_authority(seed, test_group()),
         )
     }
 
@@ -340,11 +519,23 @@ mod tests {
             identity: a.local_identity().clone(),
             project_id: project,
             app_version: "0.0.1+phase2".into(),
+            kchat_attestation: None,
         });
         let env = a.seal_message(hello.clone()).unwrap();
         assert_eq!(a.clock().as_u64(), 1);
         let got = b.ingest_envelope_json(&env).unwrap();
-        assert_eq!(got, hello);
+        // The sealed message has the attestation stamped in by
+        // `seal_message`; the input had `None`. Compare the
+        // structural payload modulo the attestation field.
+        match (&got, &hello) {
+            (Message::Hello(got_p), Message::Hello(want_p)) => {
+                assert_eq!(got_p.identity, want_p.identity);
+                assert_eq!(got_p.project_id, want_p.project_id);
+                assert_eq!(got_p.app_version, want_p.app_version);
+                assert!(got_p.kchat_attestation.is_some());
+            }
+            _ => panic!("unexpected variant"),
+        }
         assert!(b.clock().as_u64() >= a.clock().as_u64());
     }
 
@@ -355,6 +546,7 @@ mod tests {
             identity: a.local_identity().clone(),
             project_id: project,
             app_version: "v".into(),
+            kchat_attestation: None,
         });
         let env = a.seal_message(msg).unwrap();
         b.ingest_envelope_json(&env).unwrap();
@@ -385,11 +577,76 @@ mod tests {
             identity: a.local_identity().clone(),
             project_id: foreign,
             app_version: "v".into(),
+            kchat_attestation: None,
         });
         let env = a.seal_message(msg).unwrap();
         let err = b.ingest_envelope_json(&env).unwrap_err();
         assert!(
             matches!(err, SessionError::WrongProject { .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn kchat_unbound_local_cannot_seal_hello() {
+        let project = Uuid::new_v4();
+        // Default session (NoKChatGroupAuthority) — multiplayer locked.
+        let mut a = ProjectSession::new(
+            PeerKey::from_seed([5; 32]),
+            "locked",
+            project,
+            SessionConfig::default(),
+            [5; 8],
+        );
+        let msg = Message::Hello(HelloPayload {
+            identity: a.local_identity().clone(),
+            project_id: project,
+            app_version: "v".into(),
+            kchat_attestation: None,
+        });
+        let err = a.seal_message(msg).unwrap_err();
+        assert!(
+            matches!(err, SessionError::KChat(KChatAuthError::NoKChatBinding)),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn kchat_cross_group_rejects_remote_hello() {
+        let project = Uuid::new_v4();
+        // A is in group "alpha".
+        let mut a = ProjectSession::new_with_authority(
+            PeerKey::from_seed([20; 32]),
+            "a",
+            project,
+            SessionConfig::default(),
+            [20; 8],
+            make_authority(20, KChatGroupId::new("alpha").unwrap()),
+        );
+        // B is in group "beta".
+        let mut b = ProjectSession::new_with_authority(
+            PeerKey::from_seed([21; 32]),
+            "b",
+            project,
+            SessionConfig::default(),
+            [21; 8],
+            make_authority(21, KChatGroupId::new("beta").unwrap()),
+        );
+        a.trust_peer(b.local_identity().clone()).unwrap();
+        b.trust_peer(a.local_identity().clone()).unwrap();
+        let msg = Message::Hello(HelloPayload {
+            identity: a.local_identity().clone(),
+            project_id: project,
+            app_version: "v".into(),
+            kchat_attestation: None,
+        });
+        let env = a.seal_message(msg).unwrap();
+        let err = b.ingest_envelope_json(&env).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                SessionError::KChat(KChatAuthError::GroupMismatch { .. })
+            ),
             "got {err:?}"
         );
     }
@@ -445,15 +702,27 @@ mod tests {
             Message::Goodbye(GoodbyeReason::Normal)
         );
 
-        // Welcome
+        // Welcome — the seal step stamps the attestation in, so
+        // compare structurally rather than by raw equality.
         let welcome = Message::Welcome(WelcomePayload {
             status: WelcomeStatus::Accepted,
             host_identity: a.local_identity().clone(),
             host_clock: a.clock(),
             reject_reason: String::new(),
+            kchat_attestation: None,
         });
         let env = a.seal_message(welcome.clone()).unwrap();
-        assert_eq!(b.ingest_envelope_json(&env).unwrap(), welcome);
+        let got = b.ingest_envelope_json(&env).unwrap();
+        match (&got, &welcome) {
+            (Message::Welcome(g), Message::Welcome(w)) => {
+                assert_eq!(g.status, w.status);
+                assert_eq!(g.host_identity, w.host_identity);
+                assert_eq!(g.host_clock, w.host_clock);
+                assert_eq!(g.reject_reason, w.reject_reason);
+                assert!(g.kchat_attestation.is_some());
+            }
+            _ => panic!("unexpected variant"),
+        }
     }
 
     #[test]
@@ -476,7 +745,7 @@ mod tests {
     #[test]
     fn trust_caps_at_max_peers() {
         let project = Uuid::new_v4();
-        let mut a = ProjectSession::new(
+        let mut a = ProjectSession::new_with_authority(
             PeerKey::from_seed([99u8; 32]),
             "host",
             project,
@@ -485,6 +754,7 @@ mod tests {
                 ..SessionConfig::default()
             },
             [0u8; 8],
+            make_authority(99, test_group()),
         );
         for seed in 0..2u8 {
             a.trust_peer(PeerKey::from_seed([seed; 32]).identity("p"))
@@ -515,6 +785,7 @@ mod tests {
             identity: a.local_identity().clone(),
             project_id: project,
             app_version: "v".into(),
+            kchat_attestation: None,
         });
         let env = a.seal_message(msg).unwrap();
         b.ingest_envelope_json(&env).unwrap();

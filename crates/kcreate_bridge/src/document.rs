@@ -3366,6 +3366,14 @@ pub struct PdfExportRequest {
     /// working space is set; otherwise RGB.
     #[serde(default)]
     pub color_mode: Option<String>,
+    /// CMYK rasterisation dithering algorithm: `"none"`,
+    /// `"floydSteinberg"` (default), or `"bayer8x8"`. Ignored when
+    /// `color_mode != "cmyk"`. Floyd-Steinberg matches the quality
+    /// expected of hero PDF artwork; `bayer8x8` is cheaper for
+    /// batch / thumbnail exports; `none` reproduces the Phase 2
+    /// byte-identical output.
+    #[serde(default)]
+    pub cmyk_dither: Option<String>,
 }
 
 /// Render the open document to PDF. Returns the number of bytes written.
@@ -3424,6 +3432,20 @@ pub fn export_pdf_file(output_path: &Path, options: &PdfExportRequest) -> Result
             }
         }
     };
+    let resolved_dither = match options.cmyk_dither.as_deref() {
+        Some("none" | "None") => kcreate_export::CmykDither::None,
+        Some("floydSteinberg" | "FloydSteinberg" | "floyd_steinberg") => {
+            kcreate_export::CmykDither::FloydSteinberg
+        }
+        Some("bayer8x8" | "Bayer8x8" | "bayer_8x8") => kcreate_export::CmykDither::Bayer8x8,
+        Some(other) => {
+            return Err(DocumentBridgeError::InvalidArgument {
+                argument: "cmyk_dither".into(),
+                value: other.to_string(),
+            });
+        }
+        None => kcreate_export::CmykDither::FloydSteinberg,
+    };
     let opts = kcreate_export::pdf::PdfExportOptions {
         width_mm: options.width_mm,
         height_mm: options.height_mm,
@@ -3432,6 +3454,7 @@ pub fn export_pdf_file(output_path: &Path, options: &PdfExportRequest) -> Result
             .clone()
             .unwrap_or_else(|| ws.project.name.clone()),
         color_mode: resolved_color_mode,
+        cmyk_dither: resolved_dither,
     };
     let bytes = kcreate_export::pdf::export_pdf_from_document(
         &ws.project.document,

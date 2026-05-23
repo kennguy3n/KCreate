@@ -13,6 +13,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import type {
+  KChatMembershipStatus,
   ProjectInfo,
   SessionEvent,
   SessionPeer,
@@ -70,6 +71,14 @@ export function PresencePanel({
   );
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  /// KChat group gate. Multiplayer is locked at the protocol layer
+  /// until a future KChat client installs a verified group
+  /// membership via `window.kcreate.kchat.install()`. `null`
+  /// during the initial mount; the renderer treats unknown as
+  /// locked (the conservative default).
+  const [kchatStatus, setKchatStatus] = useState<KChatMembershipStatus | null>(
+    null,
+  );
 
   // Persist seed/display name on change so a refresh doesn't reset
   // the peer identity (which would force every other peer to
@@ -91,16 +100,26 @@ export function PresencePanel({
   }, [displayName]);
 
   // Read the cached report on mount in case a session is already
-  // running (e.g. user navigated away and back).
+  // running (e.g. user navigated away and back). Also fetch the
+  // KChat gate state so the panel renders the locked CTA when
+  // multiplayer is unavailable.
   useEffect(() => {
     let cancelled = false;
     void (async () => {
       try {
-        const info = await window.kcreate.session.info();
-        if (!cancelled) setReport(info);
-        if (info && !cancelled) {
-          const list = await window.kcreate.session.peers();
-          if (!cancelled) setPeers(list);
+        const status = await window.kcreate.kchat.status();
+        if (!cancelled) setKchatStatus(status);
+        // Only attempt to read session state when the gate is
+        // unlocked — otherwise `session.info()` would still work
+        // (it's a read-only accessor) but the data is irrelevant
+        // because the user can't act on it.
+        if (!status.locked) {
+          const info = await window.kcreate.session.info();
+          if (!cancelled) setReport(info);
+          if (info && !cancelled) {
+            const list = await window.kcreate.session.peers();
+            if (!cancelled) setPeers(list);
+          }
         }
       } catch (e) {
         if (!cancelled) setError(errMsg(e));
@@ -214,6 +233,33 @@ export function PresencePanel({
   );
 
   const running = report !== null;
+  // `kchatStatus === null` is the initial mount before the status
+  // call resolves — treat it as locked so we don't briefly flash
+  // the multiplayer UI before the gate state arrives.
+  const multiplayerLocked = kchatStatus === null || kchatStatus.locked;
+
+  if (multiplayerLocked) {
+    return (
+      <div
+        style={{ display: "flex", flexDirection: "column", gap: spacing.md }}
+      >
+        <Section title="Collaboration">
+          <div style={hintStyle}>
+            <strong>Collaboration is locked.</strong>
+            <div style={{ marginTop: spacing.xs }}>
+              Sign in to a KChat group to enable multiplayer with the other
+              members. KChat membership is what gates host discovery, presence
+              broadcasts, and signed envelope verification — multiplayer
+              cannot be activated outside a KChat group.
+            </div>
+          </div>
+          {error !== null ? (
+            <div style={errorStyle}>{error}</div>
+          ) : null}
+        </Section>
+      </div>
+    );
+  }
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: spacing.md }}>

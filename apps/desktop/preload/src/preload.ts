@@ -103,7 +103,12 @@ import type {
   SessionBridge,
   SessionCursor,
   SessionEvent,
+  SessionJournalSummary,
+  SessionLockEntry,
   SessionPeer,
+  KChatBridge,
+  KChatInstallRequest,
+  KChatMembershipStatus,
   SessionStartReport,
 } from "../../shared/scene";
 
@@ -1404,6 +1409,28 @@ const session: SessionBridge = {
     const raw = (await ipcRenderer.invoke("kcreate/session/info")) as string;
     return JSON.parse(raw) as SessionStartReport | null;
   },
+  async journalSummary(): Promise<SessionJournalSummary> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/session/journalSummary",
+    )) as string;
+    return JSON.parse(raw) as SessionJournalSummary;
+  },
+  async locks(): Promise<SessionLockEntry[]> {
+    const raw = (await ipcRenderer.invoke("kcreate/session/locks")) as string;
+    return JSON.parse(raw) as SessionLockEntry[];
+  },
+  async claimLocks(nodeIds: string[]): Promise<string> {
+    return (await ipcRenderer.invoke(
+      "kcreate/session/claimLocks",
+      JSON.stringify(nodeIds),
+    )) as string;
+  },
+  async releaseLocks(nodeIds: string[]): Promise<void> {
+    await ipcRenderer.invoke(
+      "kcreate/session/releaseLocks",
+      JSON.stringify(nodeIds),
+    );
+  },
   async sendPresence(
     activePage: string | null,
     selection: string[],
@@ -1432,6 +1459,32 @@ const session: SessionBridge = {
     return () => {
       ipcRenderer.removeListener(channel, listener);
     };
+  },
+};
+
+// ---------------------------------------------------------------------------
+// KChat group authority. See `KChatBridge` in shared/scene.ts for the
+// contract — multiplayer is locked until the future KChat client
+// invokes `install()` with a signed membership attestation.
+// ---------------------------------------------------------------------------
+
+const kchat: KChatBridge = {
+  async install(
+    request: KChatInstallRequest,
+  ): Promise<KChatMembershipStatus> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/kchat/install",
+      JSON.stringify(request),
+    )) as string;
+    return JSON.parse(raw) as KChatMembershipStatus;
+  },
+  async clear(): Promise<KChatMembershipStatus> {
+    const raw = (await ipcRenderer.invoke("kcreate/kchat/clear")) as string;
+    return JSON.parse(raw) as KChatMembershipStatus;
+  },
+  async status(): Promise<KChatMembershipStatus> {
+    const raw = (await ipcRenderer.invoke("kcreate/kchat/status")) as string;
+    return JSON.parse(raw) as KChatMembershipStatus;
   },
 };
 
@@ -1504,4 +1557,5 @@ contextBridge.exposeInMainWorld("kcreate", {
   color,
   textFrame,
   session,
+  kchat,
 });

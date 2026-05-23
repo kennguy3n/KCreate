@@ -388,6 +388,25 @@ export interface Bridge {
     cursorJson: string | null,
   ): void;
   sessionInfo(): string;
+  // Block 7: operation journal summary. KChat-gated; returns a
+  // JSON `SessionJournalSummary` for the running session.
+  sessionJournalSummary(): string;
+  // Block 8: advisory edit-lock roster + claim/release. All three
+  // are KChat-gated; `sessionLocks` returns a JSON
+  // `Vec<SessionLockEntry>`. The claim variant returns the
+  // wall-clock RFC3339 timestamp of acquisition so the renderer
+  // can show "locked N seconds ago" without a second IPC.
+  sessionLocks(): string;
+  sessionClaimLocks(nodeIdsJson: string): string;
+  sessionReleaseLocks(nodeIdsJson: string): void;
+  // KChat group authority — multiplayer gate. Until
+  // `kchatInstallAuthority` is called with a valid JSON
+  // `KChatInstallRequest`, every `session*` call rejects with
+  // `NotInKChatGroup`. The KChat client (out of tree) is the
+  // only thing authorised to install an authority.
+  kchatInstallAuthority(requestJson: string): string;
+  kchatClearAuthority(): string;
+  kchatMembershipStatus(): string;
   /// Re-publish the cached scene. Used by the session event tick
   /// to refresh remote-peer cursor overlays.
   documentRequestRender(): void;

@@ -466,6 +466,22 @@ export interface PdfExportOptions {
   widthMm: number;
   heightMm: number;
   title: string;
+  /**
+   * Output device color space.
+   * - `"rgb"` (default): standard `/DeviceRGB`.
+   * - `"cmyk"`: `/DeviceCMYK` for print-bound output.
+   * - `"passThrough"`: leave colors in source space.
+   * When omitted the bridge picks CMYK iff a CMYK working space is set
+   * on the document's color settings, otherwise RGB.
+   */
+  colorMode?: "rgb" | "cmyk" | "passThrough";
+  /**
+   * CMYK rasterisation dithering. Ignored unless `colorMode === "cmyk"`.
+   * - `"floydSteinberg"` (default): error-diffusion; best quality.
+   * - `"bayer8x8"`: 8×8 ordered dither; parallelisable.
+   * - `"none"`: nearest-neighbour quantisation (Phase 2 baseline).
+   */
+  cmykDither?: "none" | "floydSteinberg" | "bayer8x8";
 }
 
 /** WebP export options. `quality` is 0..100; `lossless` overrides quality. */
@@ -1866,7 +1882,58 @@ export type SessionEvent =
       kind: "presenceUpdated";
       peerId: string;
       presence: SessionPresence;
+    }
+  | {
+      /// Block 7: a remote peer's `OperationBroadcast` was recorded
+      /// in the session journal. Emitted once per batch, after
+      /// every individual op has been validated for monotonicity
+      /// against the journal's per-peer high-water mark.
+      kind: "operationsJournaled";
+      peerId: string;
+      /// Number of operations recorded in this batch.
+      opCount: number;
+      /// Highest Lamport clock value observed in the batch.
+      highestClock: number;
+    }
+  | {
+      /// Block 8: the advisory edit-lock roster changed — a peer
+      /// claimed or released one or more node locks. The renderer
+      /// uses this event to know when to re-read
+      /// `session.locks()` rather than polling every frame.
+      kind: "locksChanged";
+      /// Which peer caused the change. For PeerLeft-triggered
+      /// auto-releases this is the leaving peer.
+      peerId: string;
+      /// Node ids whose lock state flipped. Cross-reference with
+      /// the authoritative `session.locks()` roster to determine
+      /// which entries are now claimed vs. released.
+      nodeIds: string[];
     };
+
+/// Block 7: per-peer Lamport high-water marks for the journal
+/// scoped to the running session's project. Mirrors
+/// `kcreate_bridge::collab::SessionJournalSummary`.
+export interface SessionJournalSummary {
+  /// Total number of journaled entries across every peer.
+  entryCount: number;
+  /// Distinct peers the journal has heard from.
+  peerCount: number;
+  /// Per-peer high-water clock. Keys are base64url peer ids;
+  /// values are the highest Lamport clock the journal has
+  /// recorded for that peer.
+  byPeer: Record<string, number>;
+}
+
+/// Block 8: one entry in the advisory edit-lock roster. Mirrors
+/// `kcreate_bridge::collab::SessionLockEntry`.
+export interface SessionLockEntry {
+  /// Node currently locked.
+  nodeId: string;
+  /// Peer id of the lock holder (base64url).
+  holderPeerId: string;
+  /// RFC3339 wall-clock time the holder acquired the lock.
+  acquiredAt: string;
+}
 
 export interface SessionBridge {
   /// Start a local collab session. Returns the local peer's
@@ -1874,6 +1941,12 @@ export interface SessionBridge {
   /// can display a "share this with peers" UI. `seedB64` is the
   /// persistent Ed25519 seed (base64url, 32 bytes); supply the
   /// same value across sessions for stable peer identity.
+  ///
+  /// Rejects with `multiplayer is locked: not signed into a KChat
+  /// group` if no valid `KChatGroupAuthority` is installed via
+  /// `kchat.install()`. The KChat client is the only thing
+  /// authorised to call install — until it does, multiplayer is
+  /// hard-locked at the protocol layer.
   start(
     seedB64: string,
     displayName: string,
@@ -1885,6 +1958,9 @@ export interface SessionBridge {
   /// Dial a known peer. Use the fields from a discovered-peer
   /// `SessionEvent` (`peerId`, `publicKey`, `displayName`,
   /// `socketAddr`, `certFingerprint`) or from a pasted peer link.
+  ///
+  /// Rejects with the same KChat-gate error as `start` if the
+  /// renderer hasn't installed an authority yet.
   join(
     peerId: string,
     publicKey: string,
@@ -1898,9 +1974,32 @@ export interface SessionBridge {
   /// Read the cached local-identity report, or `null` if no
   /// session is running.
   info(): Promise<SessionStartReport | null>;
+  /// Block 7: read the running session's per-peer Lamport
+  /// high-water marks. KChat-gated: rejects with the standard
+  /// `not signed into a KChat group` error if no authority is
+  /// installed. Used by the PresencePanel's "Activity" tab to
+  /// surface "we've recorded N ops across M peers".
+  journalSummary(): Promise<SessionJournalSummary>;
+  /// Block 8: read the advisory edit-lock roster. KChat-gated.
+  /// Returns an empty list when no session is running so the
+  /// renderer can call this unconditionally on every paint.
+  locks(): Promise<SessionLockEntry[]>;
+  /// Block 8: claim advisory edit locks on the supplied node ids.
+  /// KChat-gated. Updates the local roster immediately and
+  /// broadcasts the claim to every connected peer. Returns the
+  /// wall-clock acquisition timestamp as an RFC3339 string.
+  claimLocks(nodeIds: string[]): Promise<string>;
+  /// Block 8: release advisory edit locks. Empty `nodeIds` means
+  /// "release everything I currently hold" (the "I'm done editing"
+  /// signal).
+  releaseLocks(nodeIds: string[]): Promise<void>;
   /// Broadcast the local user's presence to every connected peer.
   /// `cursor` is world-space coordinates; pass `null` when the
   /// pointer has left the canvas.
+  ///
+  /// Rejects with the KChat-gate error if no authority is
+  /// installed — presence beacons never leave the box outside a
+  /// KChat group.
   sendPresence(
     activePage: string | null,
     selection: string[],
@@ -1910,6 +2009,75 @@ export interface SessionBridge {
   /// leave / move their cursor. Returns an unsubscribe function.
   /// The renderer is responsible for filtering by kind.
   onEvent(callback: (event: SessionEvent) => void): () => void;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 4 — KChat group authority (multiplayer gate).
+//
+// Mirrors the JSON shapes emitted by
+// `kcreate_bridge::collab::{KChatInstallRequest, KChatMembershipStatus}`.
+// Field names are `camelCase` because the Rust DTOs use
+// `#[serde(rename_all = "camelCase")]`.
+//
+// Architecture: every multiplayer entry point on `SessionBridge`
+// fails closed until `KChatBridge.install()` is called with a
+// valid Ed25519-signed membership attestation minted by a KChat
+// group server. The KChat client (out of tree, future work) is
+// the only thing authorised to call `install`. Until then the
+// renderer surfaces a "Collaboration is locked — sign into a
+// KChat group to enable multiplayer" CTA in place of the
+// start/join buttons.
+// ---------------------------------------------------------------------------
+
+export interface KChatInstallRequest {
+  /// 32-byte Ed25519 verifying key of the KChat group server (the
+  /// issuer trust root), URL-safe base64 (no padding).
+  issuerPublicKey: string;
+  /// Group identifier minted on the issuer side. URL-safe ASCII,
+  /// max 128 chars.
+  groupId: string;
+  /// Peer id (BLAKE3-derived from the peer's public key) of the
+  /// local user.
+  peerId: string;
+  /// 32-byte Ed25519 verifying key of the local user, URL-safe
+  /// base64 (no padding). Must match the peer key used for
+  /// `session.start`.
+  peerPublicKey: string;
+  /// Membership issuance time (ISO-8601).
+  issuedAt: string;
+  /// Membership expiry time (ISO-8601). KChat servers should mint
+  /// short-lived attestations (hours, not days).
+  expiresAt: string;
+  /// 64-byte Ed25519 signature, URL-safe base64 (no padding).
+  signature: string;
+}
+
+export interface KChatMembershipStatus {
+  /// True when no authority is installed, or the installed one is
+  /// expired / forged / bound to a different peer key. The
+  /// `PresencePanel` shows the locked CTA when this is `true`.
+  locked: boolean;
+  groupId: string | null;
+  peerId: string | null;
+  /// ISO-8601 expiry, or `null` when locked. The renderer can use
+  /// this to show a "renew soon" CTA when expiry is imminent.
+  expiresAt: string | null;
+}
+
+export interface KChatBridge {
+  /// Install a verified KChat group authority. The supplied
+  /// membership is re-verified on the Rust side before being
+  /// stored, so a malformed payload from a buggy KChat client
+  /// can't sneak past the gate.
+  install(request: KChatInstallRequest): Promise<KChatMembershipStatus>;
+  /// Clear the installed authority and re-lock multiplayer. Any
+  /// running collab session is left as-is (call `session.leave()`
+  /// first if you want to tear it down).
+  clear(): Promise<KChatMembershipStatus>;
+  /// Snapshot the current gate state. The `PresencePanel` polls
+  /// this on mount to decide between the locked CTA and the
+  /// live multiplayer UI.
+  status(): Promise<KChatMembershipStatus>;
 }
 
 declare global {
@@ -1942,6 +2110,7 @@ declare global {
       color: ColorBridge;
       textFrame: TextFrameBridge;
       session: SessionBridge;
+      kchat: KChatBridge;
     };
   }
 }

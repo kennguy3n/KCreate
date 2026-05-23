@@ -19,7 +19,11 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
+use crate::alt_text::{generate_alt_text, AltTextError, AltTextOptions, AltTextReport};
 use crate::bg_remove::{remove_background, BgRemoveError, BgRemoveOptions};
+use crate::layout_suggest::{
+    suggest_layout_grouping, LayoutNode, LayoutSuggestError, LayoutSuggestOptions, LayoutSuggestion,
+};
 use crate::llm_chat::{ChatMessage, ChatRequest, ChatRole};
 
 /// Errors from [`execute_task`].
@@ -27,6 +31,10 @@ use crate::llm_chat::{ChatMessage, ChatRequest, ChatRole};
 pub enum AiError {
     #[error(transparent)]
     BgRemove(#[from] BgRemoveError),
+    #[error(transparent)]
+    AltText(#[from] AltTextError),
+    #[error(transparent)]
+    LayoutSuggest(#[from] LayoutSuggestError),
     #[error("task `{0}` requires the LLM sidecar; route via kcreate_bridge::llm")]
     LlmRequired(&'static str),
     #[error("unsupported task: {0}")]
@@ -56,6 +64,16 @@ pub enum AiTask {
     /// missing alt text, and similar accessibility problems. Routed
     /// to the LLM sidecar.
     AccessibilityCheck { document_json: String },
+    /// Generate factual alt-text for a raster layer. Pure-algorithm
+    /// — runs entirely on the calling thread, no model dependency.
+    AltTextGeneration {
+        image_data: Vec<u8>,
+        width: u32,
+        height: u32,
+    },
+    /// Cluster the supplied nodes into proposed groups by proximity
+    /// + alignment. Pure-algorithm.
+    LayoutSuggestion { nodes: Vec<LayoutNode> },
 }
 
 /// One AI result. Discriminated externally so the bridge can decide
@@ -86,6 +104,12 @@ pub enum AiResult {
         /// JSON blob produced by the LLM in the schema described by
         /// [`build_accessibility_prompt`].
         issues_json: String,
+    },
+    AltTextGeneration {
+        report: AltTextReport,
+    },
+    LayoutSuggestion {
+        suggestions: Vec<LayoutSuggestion>,
     },
 }
 
@@ -125,6 +149,18 @@ pub fn execute_task(task: AiTask) -> Result<AiResult, AiError> {
             Err(AiError::LlmRequired("design_token_extraction"))
         }
         AiTask::AccessibilityCheck { .. } => Err(AiError::LlmRequired("accessibility_check")),
+        AiTask::AltTextGeneration {
+            image_data,
+            width,
+            height,
+        } => {
+            let report = generate_alt_text(&image_data, width, height, AltTextOptions::default())?;
+            Ok(AiResult::AltTextGeneration { report })
+        }
+        AiTask::LayoutSuggestion { nodes } => {
+            let suggestions = suggest_layout_grouping(&nodes, LayoutSuggestOptions::default())?;
+            Ok(AiResult::LayoutSuggestion { suggestions })
+        }
     }
 }
 
@@ -164,6 +200,7 @@ pub fn build_layer_naming_prompt(node_names: &[(Uuid, String)]) -> ChatRequest {
         ],
         max_tokens: 512,
         temperature: 0.2,
+        grammar: None,
     }
 }
 
@@ -196,6 +233,7 @@ pub fn build_design_token_prompt(document_json: &str) -> ChatRequest {
         ],
         max_tokens: 1024,
         temperature: 0.1,
+        grammar: None,
     }
 }
 
@@ -226,6 +264,7 @@ pub fn build_accessibility_prompt(document_json: &str) -> ChatRequest {
         ],
         max_tokens: 1024,
         temperature: 0.1,
+        grammar: None,
     }
 }
 
@@ -364,5 +403,54 @@ mod tests {
         assert!(parse_layer_naming_reply("not json").is_empty());
         assert!(parse_layer_naming_reply("{}").is_empty());
         assert!(parse_layer_naming_reply("{\"wrong\":\"shape\"}").is_empty());
+    }
+
+    #[test]
+    fn execute_alt_text_generation_routes_through_local_executor() {
+        let mut img = Vec::with_capacity(8 * 8 * 4);
+        for _ in 0..(8 * 8) {
+            img.extend_from_slice(&[60, 0, 0, 255]);
+        }
+        let result = execute_task(AiTask::AltTextGeneration {
+            image_data: img,
+            width: 8,
+            height: 8,
+        })
+        .expect("ok");
+        let AiResult::AltTextGeneration { report } = result else {
+            panic!("expected AltTextGeneration result");
+        };
+        assert!(report.text.starts_with("Dark"));
+        assert!(report.text.contains("reds and pinks"));
+    }
+
+    #[test]
+    fn execute_layout_suggestion_routes_through_local_executor() {
+        let nodes = vec![
+            LayoutNode {
+                id: Uuid::new_v4(),
+                bounds: crate::layout_suggest::Bounds {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 40.0,
+                    height: 40.0,
+                },
+            },
+            LayoutNode {
+                id: Uuid::new_v4(),
+                bounds: crate::layout_suggest::Bounds {
+                    x: 60.0,
+                    y: 0.0,
+                    width: 40.0,
+                    height: 40.0,
+                },
+            },
+        ];
+        let result = execute_task(AiTask::LayoutSuggestion { nodes }).expect("ok");
+        let AiResult::LayoutSuggestion { suggestions } = result else {
+            panic!("expected LayoutSuggestion result");
+        };
+        assert_eq!(suggestions.len(), 1);
+        assert_eq!(suggestions[0].member_ids.len(), 2);
     }
 }

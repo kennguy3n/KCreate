@@ -1663,6 +1663,27 @@ function registerIpcHandlers(): void {
     requireBridge().sessionPeers(),
   );
   ipcMain.handle("kcreate/session/info", () => requireBridge().sessionInfo());
+  // Block 7: Operation journal summary. Returns the running session's
+  // per-peer Lamport high-water marks so the renderer can show the
+  // PresencePanel "Activity" tab without keeping a parallel JS copy.
+  ipcMain.handle("kcreate/session/journalSummary", () =>
+    requireBridge().sessionJournalSummary(),
+  );
+  // Block 8: advisory edit-lock roster.
+  ipcMain.handle("kcreate/session/locks", () =>
+    requireBridge().sessionLocks(),
+  );
+  ipcMain.handle(
+    "kcreate/session/claimLocks",
+    (_e, nodeIdsJson: string) =>
+      requireBridge().sessionClaimLocks(nodeIdsJson),
+  );
+  ipcMain.handle(
+    "kcreate/session/releaseLocks",
+    (_e, nodeIdsJson: string) => {
+      requireBridge().sessionReleaseLocks(nodeIdsJson);
+    },
+  );
   ipcMain.handle(
     "kcreate/session/sendPresence",
     (
@@ -1677,6 +1698,24 @@ function registerIpcHandlers(): void {
         cursorJson,
       );
     },
+  );
+
+  // ---------------------------------------------------------------------
+  // KChat group authority. The renderer surfaces a "locked"
+  // PresencePanel until a future KChat client invokes
+  // `kchat.install()` with a valid signed membership attestation.
+  // Until then the bridge gate refuses every `session.*` call at the
+  // protocol layer — see
+  // `kcreate_bridge::collab::session_start/join/sendPresence`.
+  // ---------------------------------------------------------------------
+  ipcMain.handle("kcreate/kchat/install", (_e, requestJson: string) =>
+    requireBridge().kchatInstallAuthority(requestJson),
+  );
+  ipcMain.handle("kcreate/kchat/clear", () =>
+    requireBridge().kchatClearAuthority(),
+  );
+  ipcMain.handle("kcreate/kchat/status", () =>
+    requireBridge().kchatMembershipStatus(),
   );
 }
 

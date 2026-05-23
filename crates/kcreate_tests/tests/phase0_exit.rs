@@ -108,6 +108,7 @@ fn phase0_full_pipeline_runs_without_network() {
         height_mm: 297.0,
         title: "Phase 0 test".into(),
         color_mode: kcreate_export::pdf::PdfColorMode::default(),
+        cmyk_dither: kcreate_export::CmykDither::default(),
     };
     let rasters = RasterPixelCache::new();
     export_pdf_from_document(&doc, &pdf_opts, &rasters, &pdf_path).expect("pdf export");

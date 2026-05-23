@@ -13,8 +13,10 @@ use std::path::Path;
 use image::{GenericImageView, ImageFormat};
 use kcreate_core::color::{srgb_to_cmyk, Color};
 use kcreate_core::document::DocumentGraph;
-use kcreate_core::node::{FillStyle, Node, NodeType};
+use kcreate_core::node::{FillStyle, GradientKind, Node, NodeType, Point2D};
 use kcreate_vector::{PathPoint, PathSegment, VectorPath};
+use printpdf::lopdf::content::Operation as PdfOp;
+use printpdf::lopdf::Object as PdfObj;
 use printpdf::path::{PaintMode, WindingOrder};
 use printpdf::{
     Cmyk, ColorBits, ColorSpace, Image, ImageTransform, ImageXObject, Mm, PdfDocument,
@@ -24,7 +26,15 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
+use crate::cmyk_dither::{quantize_cmyk_image, CmykDither};
+use crate::pdf_shading::{
+    color_space_for_mode, inject_shadings, resolve_stop_color, GradientGeometry, PdfShadingError,
+    PendingShading, ShadingColorSpace,
+};
 pub use crate::scene_metadata::{RASTER_IMAGE_METADATA_KEY, VECTOR_PATH_METADATA_KEY};
+
+/// One PDF user-space point = 1/72 inch; 1 mm = 1/25.4 inch.
+const PT_PER_MM: f64 = 72.0 / 25.4;
 
 /// Target color space used when writing PDF color operators.
 ///
@@ -59,6 +69,15 @@ pub struct PdfExportOptions {
     /// Defaults to `Rgb` so callers that never opted into the
     /// Phase 2 CMYK pipeline keep producing byte-identical PDFs.
     pub color_mode: PdfColorMode,
+    /// Which dithering algorithm to apply when rasterising layers
+    /// down to 8-bit `/DeviceCMYK`. Only meaningful when
+    /// `color_mode == PdfColorMode::Cmyk`; ignored for `Rgb` and
+    /// `PassThrough`. Defaults to Floyd-Steinberg, matching what
+    /// every print shop expects for hero artwork. Callers running
+    /// thumbnail batches that want predictable parallelisable
+    /// output can opt into `Bayer8x8`; callers reproducing the
+    /// Phase 2 byte-identical output can set `None`.
+    pub cmyk_dither: CmykDither,
 }
 
 impl Default for PdfExportOptions {
@@ -68,77 +87,168 @@ impl Default for PdfExportOptions {
             height_mm: 297.0,
             title: "KCreate document".to_string(),
             color_mode: PdfColorMode::Rgb,
+            cmyk_dither: CmykDither::FloydSteinberg,
         }
     }
 }
 
-/// Resolve the authoritative fill color for a node, taking the
-/// optional [`NodeStyle::color_override`] into account.
+/// Resolved fill paint for one node. Solid fills are emitted via
+/// the original [`PdfLayerReference`] path; gradient fills are
+/// emitted as raw content-stream operators plus a deferred
+/// [`PendingShading`] that the post-processor materialises into a
+/// real PDF Shading dictionary.
+#[derive(Debug, Clone)]
+pub(crate) enum PdfPaint {
+    /// Nothing to paint — either the node has no fill, the fill
+    /// is fully transparent, or the gradient stops collapse to
+    /// nothing visible.
+    None,
+    /// Flat colour fill. Maps to the existing `set_fill_color` /
+    /// `add_polygon` path.
+    Solid(Color),
+    /// Gradient fill, ready to be emitted as a real PDF shading
+    /// pattern via post-processing.
+    Gradient(GradientPaint),
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct GradientPaint {
+    pub kind: PaintGradientKind,
+    /// Renderer-side stops, in their original colour space. The
+    /// emitter converts these into the [`ShadingColorSpace`]
+    /// before pushing into the [`PendingShading`].
+    pub stops: Vec<(f32, Color)>,
+    /// Colour space to record on the resulting shading dict.
+    pub color_space: ShadingColorSpace,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum PaintGradientKind {
+    /// Linear: straight line in node-local coordinates.
+    Linear { from: Point2D, to: Point2D },
+    /// Radial: concentric circles in node-local coordinates;
+    /// inner circle is collapsed to a point at `center`.
+    Radial { center: Point2D, radius: f64 },
+}
+
+/// Resolve the authoritative fill paint for a node. Combines the
+/// renderer-side `fill` and the export-time `color_override` in a
+/// way that respects the visibility contract documented on
+/// [`resolve_fill_color`]:
 ///
-/// The renderer always uses [`NodeStyle::fill`] as the source of
-/// truth for *whether* a node is painted (a `FillStyle::None` or a
-/// zero-alpha `Solid` produces no draw call). `color_override` only
-/// changes *what color* the fill is — it is an export-time color-
-/// space hint, not an "I am suddenly visible" toggle. The exporter
-/// must therefore key its visibility decision off `fill` and only
-/// substitute the override after that gate has passed; otherwise a
-/// node that was invisible on the canvas would silently appear in
-/// the printed PDF.
-///
-/// Returns `None` when the node has no visible fill, in which case
-/// the caller skips the fill operator entirely.
+/// * `Solid(rgba)` with `rgba.a == 0.0` is invisible regardless of
+///   any override.
+/// * `Gradient(_)` with no opaque stops AND no override is
+///   invisible — matches the renderer skipping the draw call.
+/// * `Gradient(_)` with at least one opaque stop is now a real
+///   PDF shading pattern in the requested colour space, instead
+///   of the Phase 2 fallback that flattened the gradient to a
+///   solid in the override's colour space.
+pub(crate) fn resolve_fill_paint(node: &Node, color_mode: PdfColorMode) -> PdfPaint {
+    let color_space = color_space_for_mode(color_mode);
+    match (&node.style.fill, &node.style.color_override) {
+        (FillStyle::None, _) => PdfPaint::None,
+        (FillStyle::Solid(rgba), _) if rgba.a <= 0.0 => PdfPaint::None,
+        (FillStyle::Solid(rgba), _) => {
+            // Override applies to solid fills exactly as before —
+            // see `resolve_fill_color` for the alpha-stitching
+            // rationale. We delegate to keep both paths in sync.
+            if let Some(over) = &node.style.color_override {
+                PdfPaint::Solid(merge_override_alpha(over.clone(), rgba.a))
+            } else {
+                PdfPaint::Solid(Color::Srgb {
+                    r: rgba.r,
+                    g: rgba.g,
+                    b: rgba.b,
+                    a: rgba.a,
+                })
+            }
+        }
+        (FillStyle::Gradient(kind), _) => {
+            let effective_alpha = gradient_effective_alpha(kind);
+            if effective_alpha <= 0.0 {
+                return PdfPaint::None;
+            }
+            let (geo, stops_src) = match kind {
+                GradientKind::Linear { from, to, stops } => (
+                    PaintGradientKind::Linear {
+                        from: *from,
+                        to: *to,
+                    },
+                    stops,
+                ),
+                GradientKind::Radial {
+                    center,
+                    radius,
+                    stops,
+                } => (
+                    PaintGradientKind::Radial {
+                        center: *center,
+                        radius: *radius,
+                    },
+                    stops,
+                ),
+            };
+            if stops_src.is_empty() {
+                return PdfPaint::None;
+            }
+            // If the user authored a `color_override`, treat it as
+            // a single-stop override: every stop's chroma becomes
+            // the override, with the source alpha preserved. This
+            // is conservative — it keeps the user's "I want this
+            // printed in CMYK" intent without losing the
+            // gradient's geometry. We could in principle adopt a
+            // more sophisticated mapping (e.g. shade between the
+            // override and white) once the editor exposes a UI to
+            // author multi-stop overrides; today the editor
+            // surfaces a single colour at most.
+            let stops = if let Some(over) = &node.style.color_override {
+                stops_src
+                    .iter()
+                    .map(|s| {
+                        (
+                            s.offset as f32,
+                            merge_override_alpha(over.clone(), s.color.a),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            } else {
+                stops_src
+                    .iter()
+                    .map(|s| {
+                        (
+                            s.offset as f32,
+                            Color::Srgb {
+                                r: s.color.r,
+                                g: s.color.g,
+                                b: s.color.b,
+                                a: s.color.a,
+                            },
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            };
+            PdfPaint::Gradient(GradientPaint {
+                kind: geo,
+                stops,
+                color_space,
+            })
+        }
+    }
+}
+
+/// Resolve the authoritative *solid* fill color for a node. Thin
+/// wrapper over [`resolve_fill_paint`] kept for tests that pre-date
+/// Phase 4's shading-pattern support — it returns `Some(color)`
+/// only when the resolved paint is a flat fill, and `None` for
+/// gradients (which are now emitted as real PDF shading patterns
+/// via the post-processor instead of flattened to a solid).
+#[cfg(test)]
 fn resolve_fill_color(node: &Node) -> Option<Color> {
-    // 1. Decide visibility purely from `fill`. This must match the
-    //    renderer's painted/not-painted decision exactly. The
-    //    `Gradient` arm is special: gradients cannot round-trip
-    //    through `DeviceCMYK` in printpdf 0.7 (no shading-pattern
-    //    API), so the historical behaviour was to drop them
-    //    entirely on export. Phase 2 PR #7 surfaced a hole in that
-    //    rule — a gradient with a `color_override` was being
-    //    silently dropped too, even though the override explicitly
-    //    states the intended print colour. We now treat that case
-    //    as "flat fill in the override's colour space" so the
-    //    print shop sees the user's intent.
-    let fill_alpha: f32 = match (&node.style.fill, &node.style.color_override) {
-        (FillStyle::Solid(rgba), _) if rgba.a > 0.0 => rgba.a,
-        // Gradient + override: use the gradient's effective alpha
-        // (max of all stop alphas; matches what the renderer would
-        // see as the "loudest" pixel in the gradient) and fall
-        // through to the override branch below.
-        (FillStyle::Gradient(kind), Some(_)) => gradient_effective_alpha(kind),
-        // Solid-with-zero-alpha, FillStyle::None, and Gradient-without-
-        // override all collapse to "nothing to export". The PDF would
-        // have no fill operator anyway, so we bail before allocating
-        // anything downstream.
-        (FillStyle::Solid(_) | FillStyle::None | FillStyle::Gradient(_), _) => return None,
-    };
-    if fill_alpha <= 0.0 {
-        return None;
+    match resolve_fill_paint(node, PdfColorMode::Rgb) {
+        PdfPaint::Solid(c) => Some(c),
+        PdfPaint::Gradient(_) | PdfPaint::None => None,
     }
-
-    // 2. Apply the override. The override is authored in its native
-    //    color space (CMYK, Lab, …) and is the canonical color value
-    //    for export. Its own alpha is preserved only when it is
-    //    strictly less than fully opaque — otherwise we keep the
-    //    `fill`'s alpha so partial-opacity from the renderer side
-    //    survives a CMYK override that defaulted to alpha=1.0.
-    if let Some(over) = &node.style.color_override {
-        return Some(merge_override_alpha(over.clone(), fill_alpha));
-    }
-
-    // 3. No override: pass the renderer's fill through as sRGB.
-    let FillStyle::Solid(rgba) = node.style.fill else {
-        // Unreachable because step 1 returned for every non-Solid
-        // variant, but kept exhaustive so a future variant doesn't
-        // silently fall through.
-        return None;
-    };
-    Some(Color::Srgb {
-        r: rgba.r,
-        g: rgba.g,
-        b: rgba.b,
-        a: rgba.a,
-    })
 }
 
 /// Walk the gradient's stops and return the largest alpha. We use
@@ -245,6 +355,8 @@ pub enum PdfExportError {
     Image(String),
     #[error("printpdf: {0}")]
     PrintPdf(String),
+    #[error("shading post-process: {0}")]
+    Shading(#[from] PdfShadingError),
 }
 
 pub type RasterPixelCache = HashMap<String, RasterPixels>;
@@ -289,6 +401,7 @@ pub fn export_pdf_from_document(
     let sx = options.width_mm / world_w.max(1.0);
     let sy = options.height_mm / world_h.max(1.0);
 
+    let mut pending_shadings: Vec<PendingShading> = Vec::new();
     walk_nodes(
         document,
         document.root_ids(),
@@ -300,13 +413,16 @@ pub fn export_pdf_from_document(
         sy,
         options.height_mm,
         options.color_mode,
+        options.cmyk_dither,
+        &mut pending_shadings,
     )?;
 
     let bytes = doc
         .save_to_bytes()
         .map_err(|e| PdfExportError::PrintPdf(e.to_string()))?;
-    fs::write(output_path, &bytes)?;
-    Ok(bytes.len())
+    let final_bytes = inject_shadings(bytes, &pending_shadings).map_err(PdfExportError::from)?;
+    fs::write(output_path, &final_bytes)?;
+    Ok(final_bytes.len())
 }
 
 const fn as_f32(value: f64) -> f32 {
@@ -332,6 +448,8 @@ fn walk_nodes(
     sy: f64,
     page_height_mm: f64,
     color_mode: PdfColorMode,
+    cmyk_dither: CmykDither,
+    pending_shadings: &mut Vec<PendingShading>,
 ) -> Result<(), PdfExportError> {
     for id in ids {
         let Some(node) = document.get_node(*id) else {
@@ -351,6 +469,7 @@ fn walk_nodes(
                     sy,
                     page_height_mm,
                     color_mode,
+                    pending_shadings,
                 )?;
             }
             NodeType::RasterLayer => {
@@ -364,6 +483,7 @@ fn walk_nodes(
                     sy,
                     page_height_mm,
                     color_mode,
+                    cmyk_dither,
                 )?;
             }
             _ => {}
@@ -379,6 +499,8 @@ fn walk_nodes(
             sy,
             page_height_mm,
             color_mode,
+            cmyk_dither,
+            pending_shadings,
         )?;
     }
     Ok(())
@@ -437,6 +559,7 @@ fn emit_vector(
     sy: f64,
     page_height_mm: f64,
     color_mode: PdfColorMode,
+    pending_shadings: &mut Vec<PendingShading>,
 ) -> Result<(), PdfExportError> {
     let Some(value) = node.metadata.get(VECTOR_PATH_METADATA_KEY) else {
         return Ok(());
@@ -444,32 +567,80 @@ fn emit_vector(
     let path: VectorPath = serde_json::from_value(value.clone())
         .map_err(|e| PdfExportError::InvalidVectorPath(node.id, e.to_string()))?;
 
-    let fill_color = resolve_fill_color(node);
-    let has_fill = fill_color.is_some();
+    let paint = resolve_fill_paint(node, color_mode);
 
-    // Build rings: each sub-path between `MoveTo` and `Close` is a
-    // ring of the polygon. Open sub-paths still become a single open
-    // ring — we let printpdf paint them with `Stroke`.
+    let rings = build_rings(
+        &path,
+        node.transform.tx,
+        node.transform.ty,
+        origin_x,
+        origin_y,
+        sx,
+        sy,
+        page_height_mm,
+    );
+    if rings.is_empty() {
+        return Ok(());
+    }
+
+    match paint {
+        PdfPaint::None => {
+            emit_solid_or_stroke(layer, rings, None, color_mode);
+        }
+        PdfPaint::Solid(c) => {
+            emit_solid_or_stroke(layer, rings, Some(c), color_mode);
+        }
+        PdfPaint::Gradient(g) => {
+            emit_gradient(
+                node,
+                layer,
+                &rings,
+                &g,
+                origin_x,
+                origin_y,
+                sx,
+                sy,
+                page_height_mm,
+                pending_shadings,
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Translate a [`VectorPath`] into printpdf's ring-of-points
+/// representation. Extracted so the gradient emit path can reuse
+/// the exact same coordinate-space arithmetic as the solid path.
+#[allow(clippy::too_many_arguments)]
+fn build_rings(
+    path: &VectorPath,
+    tx: f64,
+    ty: f64,
+    origin_x: f64,
+    origin_y: f64,
+    sx: f64,
+    sy: f64,
+    page_height_mm: f64,
+) -> Vec<Vec<(Point, bool)>> {
     let mut rings: Vec<Vec<(Point, bool)>> = Vec::new();
     let mut current: Vec<(Point, bool)> = Vec::new();
     let mut last = PathPoint::new(0.0, 0.0);
     let mut start = PathPoint::new(0.0, 0.0);
 
-    let push_point =
-        |buf: &mut Vec<(Point, bool)>, p: PathPoint, is_ctrl: bool, tx: f64, ty: f64| {
-            buf.push((
-                world_to_pdf(
-                    p.x + tx,
-                    p.y + ty,
-                    origin_x,
-                    origin_y,
-                    sx,
-                    sy,
-                    page_height_mm,
-                ),
-                is_ctrl,
-            ));
-        };
+    let push_point = |buf: &mut Vec<(Point, bool)>, p: PathPoint, is_ctrl: bool| {
+        buf.push((
+            world_to_pdf(
+                p.x + tx,
+                p.y + ty,
+                origin_x,
+                origin_y,
+                sx,
+                sy,
+                page_height_mm,
+            ),
+            is_ctrl,
+        ));
+    };
 
     for seg in &path.commands {
         match *seg {
@@ -477,12 +648,12 @@ fn emit_vector(
                 if !current.is_empty() {
                     rings.push(std::mem::take(&mut current));
                 }
-                push_point(&mut current, p, false, node.transform.tx, node.transform.ty);
+                push_point(&mut current, p, false);
                 last = p;
                 start = p;
             }
             PathSegment::LineTo(p) => {
-                push_point(&mut current, p, false, node.transform.tx, node.transform.ty);
+                push_point(&mut current, p, false);
                 last = p;
             }
             PathSegment::QuadTo { ctrl, end } => {
@@ -496,49 +667,19 @@ fn emit_vector(
                     TWO_THIRDS.mul_add(ctrl.x - end.x, end.x),
                     TWO_THIRDS.mul_add(ctrl.y - end.y, end.y),
                 );
-                push_point(&mut current, c1, true, node.transform.tx, node.transform.ty);
-                push_point(&mut current, c2, true, node.transform.tx, node.transform.ty);
-                push_point(
-                    &mut current,
-                    end,
-                    false,
-                    node.transform.tx,
-                    node.transform.ty,
-                );
+                push_point(&mut current, c1, true);
+                push_point(&mut current, c2, true);
+                push_point(&mut current, end, false);
                 last = end;
             }
             PathSegment::CubicTo { ctrl1, ctrl2, end } => {
-                push_point(
-                    &mut current,
-                    ctrl1,
-                    true,
-                    node.transform.tx,
-                    node.transform.ty,
-                );
-                push_point(
-                    &mut current,
-                    ctrl2,
-                    true,
-                    node.transform.tx,
-                    node.transform.ty,
-                );
-                push_point(
-                    &mut current,
-                    end,
-                    false,
-                    node.transform.tx,
-                    node.transform.ty,
-                );
+                push_point(&mut current, ctrl1, true);
+                push_point(&mut current, ctrl2, true);
+                push_point(&mut current, end, false);
                 last = end;
             }
             PathSegment::Close => {
-                push_point(
-                    &mut current,
-                    start,
-                    false,
-                    node.transform.tx,
-                    node.transform.ty,
-                );
+                push_point(&mut current, start, false);
                 rings.push(std::mem::take(&mut current));
                 last = start;
             }
@@ -547,16 +688,25 @@ fn emit_vector(
     if !current.is_empty() {
         rings.push(current);
     }
-    if rings.is_empty() {
-        return Ok(());
-    }
+    rings
+}
 
-    // Both fill and stroke colors must agree with `color_mode` so the
-    // generated content stream never mixes `rg` (DeviceRGB) and `K`
-    // (DeviceCMYK) operators. For stroke-only nodes, `fill_color` is
-    // `None` but `set_fill_color` still emits an operator, so the
-    // fallback color space must match the requested mode too —
-    // otherwise PDF/X validators flag the page as mixed-color-space.
+/// Emit a polygon via printpdf's high-level helper, choosing fill
+/// vs stroke based on whether a fill colour was resolved.
+fn emit_solid_or_stroke(
+    layer: &PdfLayerReference,
+    rings: Vec<Vec<(Point, bool)>>,
+    fill_color: Option<Color>,
+    color_mode: PdfColorMode,
+) {
+    let has_fill = fill_color.is_some();
+    // Both fill and stroke colors must agree with `color_mode` so
+    // the generated content stream never mixes `rg` (DeviceRGB)
+    // and `K` (DeviceCMYK) operators. For stroke-only nodes,
+    // `fill_color` is `None` but `set_fill_color` still emits an
+    // operator, so the fallback color space must match the
+    // requested mode too — otherwise PDF/X validators flag the
+    // page as mixed-color-space.
     let fill_pdf_color = fill_color.as_ref().map_or_else(
         || match color_mode {
             PdfColorMode::Cmyk => printpdf::Color::Cmyk(Cmyk::new(0.0, 0.0, 0.0, 0.0, None)),
@@ -585,7 +735,213 @@ fn emit_vector(
         winding_order: WindingOrder::NonZero,
     };
     layer.add_polygon(polygon);
-    Ok(())
+}
+
+/// Emit a gradient fill via raw PDF operators (`q ... W n /SH<n>
+/// sh Q`) and queue a [`PendingShading`] for post-processing. The
+/// `/SH<n>` resource name is intentionally dangling at this stage
+/// — `pdf_shading::inject_shadings` will register it on the page's
+/// `Resources/Shading` dict after `save_to_bytes`.
+#[allow(clippy::too_many_arguments)]
+fn emit_gradient(
+    node: &Node,
+    layer: &PdfLayerReference,
+    rings: &[Vec<(Point, bool)>],
+    paint: &GradientPaint,
+    origin_x: f64,
+    origin_y: f64,
+    sx: f64,
+    sy: f64,
+    page_height_mm: f64,
+    pending_shadings: &mut Vec<PendingShading>,
+) {
+    // q: save graphics state.
+    layer.add_operation(PdfOp::new("q", vec![]));
+    // Emit the clipping path. Each ring becomes a sub-path in the
+    // operator stream — `m` for moveto, `l` for lineto, `c` for
+    // cubicto, `h` to close.
+    emit_raw_path_operators(layer, rings);
+    // W n: intersect the current clip path with the path we just
+    // built (non-zero winding rule), then `n` (no-op) to avoid
+    // also painting it.
+    layer.add_operation(PdfOp::new("W", vec![]));
+    layer.add_operation(PdfOp::new("n", vec![]));
+
+    // Allocate a shading index and emit the `sh` operator pointing
+    // at the dangling `/SH<n>` name. The post-processor will add
+    // `/SH<n>` to the page's `Resources/Shading` dict.
+    let index = pending_shadings.len();
+    let name = format!("SH{index}");
+    layer.add_operation(PdfOp::new("sh", vec![PdfObj::Name(name.into_bytes())]));
+    // Q: restore graphics state (undoes the clipping).
+    layer.add_operation(PdfOp::new("Q", vec![]));
+
+    // Resolve the gradient stops into the target colour space and
+    // queue the pending shading. Coordinates are transformed from
+    // node-local → world → PDF user-space (points). printpdf's
+    // page coordinates are in millimetres internally but the
+    // content-stream `sh` operator and the `Coords` array on the
+    // Shading dict speak the page's default user-space unit
+    // (points) — so we convert here so the post-processor doesn't
+    // need to know anything about millimetres.
+    let resolved_stops = paint
+        .stops
+        .iter()
+        .map(|(offset, color)| {
+            let mut stop = resolve_stop_color(color, paint.color_space);
+            stop.offset = offset.clamp(0.0, 1.0);
+            stop
+        })
+        .collect::<Vec<_>>();
+
+    let geometry = match paint.kind {
+        PaintGradientKind::Linear { from, to } => {
+            let (x0_pt, y0_pt) = node_local_to_pt(
+                from,
+                node.transform.tx,
+                node.transform.ty,
+                origin_x,
+                origin_y,
+                sx,
+                sy,
+                page_height_mm,
+            );
+            let (x1_pt, y1_pt) = node_local_to_pt(
+                to,
+                node.transform.tx,
+                node.transform.ty,
+                origin_x,
+                origin_y,
+                sx,
+                sy,
+                page_height_mm,
+            );
+            GradientGeometry::Linear {
+                x0: x0_pt,
+                y0: y0_pt,
+                x1: x1_pt,
+                y1: y1_pt,
+            }
+        }
+        PaintGradientKind::Radial { center, radius } => {
+            let (cx_pt, cy_pt) = node_local_to_pt(
+                center,
+                node.transform.tx,
+                node.transform.ty,
+                origin_x,
+                origin_y,
+                sx,
+                sy,
+                page_height_mm,
+            );
+            // Radii are scalars; use the average of sx/sy so the
+            // radius scales proportionally with the page-space
+            // transform. Coordinate sx and sy are in mm/world-unit;
+            // we convert through points-per-mm.
+            let r_pt = (radius * ((sx + sy) * 0.5) * PT_PER_MM) as f32;
+            GradientGeometry::Radial {
+                cx0: cx_pt,
+                cy0: cy_pt,
+                r0: 0.0,
+                cx1: cx_pt,
+                cy1: cy_pt,
+                r1: r_pt.max(0.0),
+            }
+        }
+    };
+
+    pending_shadings.push(PendingShading {
+        page_index: 0,
+        index,
+        geometry,
+        stops: resolved_stops,
+        color_space: paint.color_space,
+    });
+}
+
+/// Emit the raw PDF path operators for `rings`. Each control-point
+/// `(Point, true)` is treated as a Bezier control point — three
+/// consecutive points (two control + one anchor) become a `c`
+/// operator. Anchor-to-anchor segments become `l`. The first
+/// point of a ring is `m`; the last (if equal to the first)
+/// becomes `h`.
+fn emit_raw_path_operators(layer: &PdfLayerReference, rings: &[Vec<(Point, bool)>]) {
+    for ring in rings {
+        if ring.is_empty() {
+            continue;
+        }
+        let (first, _) = ring[0];
+        let (fx, fy) = point_to_pt(first);
+        layer.add_operation(PdfOp::new("m", vec![PdfObj::Real(fx), PdfObj::Real(fy)]));
+        let mut i = 1;
+        while i < ring.len() {
+            // Cubic: anchor → ctrl, ctrl, anchor. If the next two
+            // points are control points, consume them along with
+            // the following anchor.
+            if i + 2 < ring.len() && ring[i].1 && ring[i + 1].1 && !ring[i + 2].1 {
+                let (c1x, c1y) = point_to_pt(ring[i].0);
+                let (c2x, c2y) = point_to_pt(ring[i + 1].0);
+                let (px, py) = point_to_pt(ring[i + 2].0);
+                layer.add_operation(PdfOp::new(
+                    "c",
+                    vec![
+                        PdfObj::Real(c1x),
+                        PdfObj::Real(c1y),
+                        PdfObj::Real(c2x),
+                        PdfObj::Real(c2y),
+                        PdfObj::Real(px),
+                        PdfObj::Real(py),
+                    ],
+                ));
+                i += 3;
+            } else {
+                let (px, py) = point_to_pt(ring[i].0);
+                layer.add_operation(PdfOp::new("l", vec![PdfObj::Real(px), PdfObj::Real(py)]));
+                i += 1;
+            }
+        }
+        // `h` closes the sub-path. Always emit it so the clip path
+        // is well-formed (PDF requires a closed sub-path to be
+        // included in a fill region).
+        layer.add_operation(PdfOp::new("h", vec![]));
+    }
+}
+
+/// Convert a printpdf `Point` (carrying millimetres) into raw PDF
+/// user-space points (1/72").
+fn point_to_pt(p: Point) -> (f32, f32) {
+    let x_mm: f32 = p.x.0;
+    let y_mm: f32 = p.y.0;
+    (
+        (f64::from(x_mm) * PT_PER_MM) as f32,
+        (f64::from(y_mm) * PT_PER_MM) as f32,
+    )
+}
+
+/// Transform a node-local [`Point2D`] into PDF user-space points,
+/// applying the same world → PDF transform as the path
+/// emitter. Returns `(x_pt, y_pt)`.
+#[allow(clippy::too_many_arguments)]
+fn node_local_to_pt(
+    p: Point2D,
+    tx: f64,
+    ty: f64,
+    origin_x: f64,
+    origin_y: f64,
+    sx: f64,
+    sy: f64,
+    page_height_mm: f64,
+) -> (f32, f32) {
+    let pt = world_to_pdf(
+        p.x + tx,
+        p.y + ty,
+        origin_x,
+        origin_y,
+        sx,
+        sy,
+        page_height_mm,
+    );
+    point_to_pt(pt)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -599,6 +955,7 @@ fn emit_raster(
     sy: f64,
     page_height_mm: f64,
     color_mode: PdfColorMode,
+    cmyk_dither: CmykDither,
 ) -> Result<(), PdfExportError> {
     #[derive(Deserialize)]
     struct Meta {
@@ -625,7 +982,9 @@ fn emit_raster(
     // the historical "PNG → load_from_memory → DynamicImage"
     // round-trip which yields a `/DeviceRGB` image.
     let pdf_image = match color_mode {
-        PdfColorMode::Cmyk => raster_to_cmyk_image(&pixels.rgba, pixels.width, pixels.height)?,
+        PdfColorMode::Cmyk => {
+            raster_to_cmyk_image(&pixels.rgba, pixels.width, pixels.height, cmyk_dither)?
+        }
         PdfColorMode::Rgb | PdfColorMode::PassThrough => {
             raster_to_rgb_image(&pixels.rgba, pixels.width, pixels.height)?
         }
@@ -697,7 +1056,12 @@ fn raster_to_rgb_image(rgba: &[u8], width: u32, height: u32) -> Result<Image, Pd
 /// transparency through to the print shop should keep the raster
 /// in RGB mode and let the RIP handle the CMYK conversion with a
 /// device-specific profile.
-fn raster_to_cmyk_image(rgba: &[u8], width: u32, height: u32) -> Result<Image, PdfExportError> {
+fn raster_to_cmyk_image(
+    rgba: &[u8],
+    width: u32,
+    height: u32,
+    dither: CmykDither,
+) -> Result<Image, PdfExportError> {
     let pixel_count = (width as usize)
         .checked_mul(height as usize)
         .ok_or_else(|| PdfExportError::Image("raster dimensions overflow usize".into()))?;
@@ -708,12 +1072,14 @@ fn raster_to_cmyk_image(rgba: &[u8], width: u32, height: u32) -> Result<Image, P
             pixel_count * 4
         )));
     }
+    let row_stride = (width as usize) * 4;
     let mut cmyk_bytes: Vec<u8> = Vec::with_capacity(pixel_count * 4);
-    for px in rgba.chunks_exact(4).take(pixel_count) {
-        let r = f32::from(px[0]) / 255.0;
-        let g = f32::from(px[1]) / 255.0;
-        let b = f32::from(px[2]) / 255.0;
-        let a = f32::from(px[3]) / 255.0;
+    quantize_cmyk_image(width, height, dither, &mut cmyk_bytes, |x, y| {
+        let idx = (y as usize) * row_stride + (x as usize) * 4;
+        let r = f32::from(rgba[idx]) / 255.0;
+        let g = f32::from(rgba[idx + 1]) / 255.0;
+        let b = f32::from(rgba[idx + 2]) / 255.0;
+        let a = f32::from(rgba[idx + 3]) / 255.0;
         // Matte against white paper: out = a * fg + (1 - a) * white.
         // White in linear sRGB is (1, 1, 1); blending in the gamma-
         // encoded sRGB space is technically incorrect, but it
@@ -722,12 +1088,12 @@ fn raster_to_cmyk_image(rgba: &[u8], width: u32, height: u32) -> Result<Image, P
         let r_m = a.mul_add(r, 1.0 - a);
         let g_m = a.mul_add(g, 1.0 - a);
         let b_m = a.mul_add(b, 1.0 - a);
-        let (c, m, y, k) = srgb_to_cmyk(r_m, g_m, b_m);
-        cmyk_bytes.push(quantize_u8(c));
-        cmyk_bytes.push(quantize_u8(m));
-        cmyk_bytes.push(quantize_u8(y));
-        cmyk_bytes.push(quantize_u8(k));
-    }
+        // srgb_to_cmyk returns a 4-tuple; the dither callback
+        // wants `[f32; 4]`. `<[f32; 4]>::from(tuple)` does the
+        // conversion without tripping clippy's
+        // `tuple_array_conversions` heuristic.
+        <[f32; 4]>::from(srgb_to_cmyk(r_m, g_m, b_m))
+    });
     let xobject = ImageXObject {
         width: Px(width as usize),
         height: Px(height as usize),
@@ -740,16 +1106,6 @@ fn raster_to_cmyk_image(rgba: &[u8], width: u32, height: u32) -> Result<Image, P
         clipping_bbox: None,
     };
     Ok(Image::from(xobject))
-}
-
-/// Quantise a `[0.0, 1.0]` float to a `[0, 255]` byte with
-/// clamp-to-finite semantics. NaN / infinity inputs map to 0,
-/// matching the rest of the export code.
-fn quantize_u8(v: f32) -> u8 {
-    if !v.is_finite() {
-        return 0;
-    }
-    (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8
 }
 
 fn world_to_pdf(
@@ -959,6 +1315,197 @@ mod tests {
     }
 
     // -------------------------------------------------------------
+    // Phase 4 Block 4 — end-to-end shading-pattern emission. These
+    // tests round-trip a gradient-bearing document through the
+    // exporter and assert that the resulting PDF contains real
+    // PDF /Shading dictionaries, a `sh` operator in the content
+    // stream, and the matching `/Shading` resource entry on the
+    // page. Both linear and radial gradients are covered.
+    // -------------------------------------------------------------
+
+    fn doc_with_linear_gradient_rect() -> DocumentGraph {
+        use kcreate_core::node::{GradientKind, GradientStop, Point2D, RgbaColor};
+        let mut doc = DocumentGraph::new();
+        let page = doc.insert_node(Node::new(NodeType::Page, "Page")).unwrap();
+        let rect = VectorPath::new(vec![
+            PathSegment::MoveTo(PathPoint::new(0.0, 0.0)),
+            PathSegment::LineTo(PathPoint::new(100.0, 0.0)),
+            PathSegment::LineTo(PathPoint::new(100.0, 100.0)),
+            PathSegment::LineTo(PathPoint::new(0.0, 100.0)),
+            PathSegment::Close,
+        ]);
+        let mut node = vector_node(&rect, 0.0, 0.0, 100.0, 100.0);
+        node.parent_id = Some(page);
+        node.style.fill = FillStyle::Gradient(GradientKind::Linear {
+            from: Point2D { x: 0.0, y: 0.0 },
+            to: Point2D { x: 100.0, y: 0.0 },
+            stops: vec![
+                GradientStop {
+                    offset: 0.0,
+                    color: RgbaColor::new(1.0, 0.0, 0.0, 1.0),
+                },
+                GradientStop {
+                    offset: 1.0,
+                    color: RgbaColor::new(0.0, 0.0, 1.0, 1.0),
+                },
+            ],
+        });
+        doc.insert_node(node).unwrap();
+        doc
+    }
+
+    #[test]
+    fn pdf_export_emits_real_axial_shading_for_linear_gradient() {
+        let doc = doc_with_linear_gradient_rect();
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let opts = PdfExportOptions::default();
+        let rasters = RasterPixelCache::new();
+        export_pdf_from_document(&doc, &opts, &rasters, tmp.path()).unwrap();
+        let written = std::fs::read(tmp.path()).unwrap();
+        // Look for the shading dict, the page-resource entry, and
+        // the `sh` operator in the content stream — all three must
+        // be present for a downstream PDF consumer to render the
+        // gradient.
+        let raw = String::from_utf8_lossy(&written);
+        assert!(
+            raw.contains("/ShadingType 2"),
+            "expected axial Type-2 shading dict in PDF"
+        );
+        assert!(
+            raw.contains("/SH0"),
+            "expected page resource entry /SH0 in PDF"
+        );
+        let stream = pdf_content_stream_text(&written);
+        assert!(
+            stream.contains("/SH0 sh") || stream.contains("/SH0\nsh"),
+            "expected `sh` operator referencing /SH0, got {stream:?}"
+        );
+    }
+
+    #[test]
+    fn pdf_export_emits_real_radial_shading_for_radial_gradient() {
+        use kcreate_core::node::{GradientKind, GradientStop, Point2D, RgbaColor};
+        let mut doc = DocumentGraph::new();
+        let page = doc.insert_node(Node::new(NodeType::Page, "Page")).unwrap();
+        let rect = VectorPath::new(vec![
+            PathSegment::MoveTo(PathPoint::new(0.0, 0.0)),
+            PathSegment::LineTo(PathPoint::new(100.0, 0.0)),
+            PathSegment::LineTo(PathPoint::new(100.0, 100.0)),
+            PathSegment::LineTo(PathPoint::new(0.0, 100.0)),
+            PathSegment::Close,
+        ]);
+        let mut node = vector_node(&rect, 0.0, 0.0, 100.0, 100.0);
+        node.parent_id = Some(page);
+        node.style.fill = FillStyle::Gradient(GradientKind::Radial {
+            center: Point2D { x: 50.0, y: 50.0 },
+            radius: 50.0,
+            stops: vec![
+                GradientStop {
+                    offset: 0.0,
+                    color: RgbaColor::new(1.0, 1.0, 1.0, 1.0),
+                },
+                GradientStop {
+                    offset: 1.0,
+                    color: RgbaColor::new(0.0, 0.0, 0.0, 1.0),
+                },
+            ],
+        });
+        doc.insert_node(node).unwrap();
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let opts = PdfExportOptions::default();
+        let rasters = RasterPixelCache::new();
+        export_pdf_from_document(&doc, &opts, &rasters, tmp.path()).unwrap();
+        let written = std::fs::read(tmp.path()).unwrap();
+        let raw = String::from_utf8_lossy(&written);
+        assert!(
+            raw.contains("/ShadingType 3"),
+            "expected radial Type-3 shading dict in PDF"
+        );
+        // Type-3 Coords arrays carry six numbers (x0 y0 r0 x1 y1 r1).
+        // The inner radius is collapsed to 0, so the array must
+        // start with `0` for r0 once we round the float to integer
+        // form in printpdf's canonical writer. We just check the
+        // dict shape is present in the file.
+        assert!(
+            raw.contains("/Coords"),
+            "expected /Coords entry in radial shading dict"
+        );
+    }
+
+    #[test]
+    fn pdf_export_routes_gradient_to_devicecmyk_when_color_mode_is_cmyk() {
+        let doc = doc_with_linear_gradient_rect();
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let opts = PdfExportOptions {
+            color_mode: PdfColorMode::Cmyk,
+            ..PdfExportOptions::default()
+        };
+        let rasters = RasterPixelCache::new();
+        export_pdf_from_document(&doc, &opts, &rasters, tmp.path()).unwrap();
+        let written = std::fs::read(tmp.path()).unwrap();
+        let raw = String::from_utf8_lossy(&written);
+        // lopdf serialises name tokens adjacently, e.g.
+        // `/ColorSpace/DeviceCMYK`, so we look for the concatenated
+        // form rather than a space-separated one.
+        assert!(
+            raw.contains("/ColorSpace/DeviceCMYK"),
+            "expected CMYK shading colour space in PDF (CMYK export mode)"
+        );
+    }
+
+    #[test]
+    fn pdf_export_multi_stop_gradient_uses_stitching_function() {
+        use kcreate_core::node::{GradientKind, GradientStop, Point2D, RgbaColor};
+        let mut doc = DocumentGraph::new();
+        let page = doc.insert_node(Node::new(NodeType::Page, "Page")).unwrap();
+        let rect = VectorPath::new(vec![
+            PathSegment::MoveTo(PathPoint::new(0.0, 0.0)),
+            PathSegment::LineTo(PathPoint::new(100.0, 0.0)),
+            PathSegment::LineTo(PathPoint::new(100.0, 100.0)),
+            PathSegment::LineTo(PathPoint::new(0.0, 100.0)),
+            PathSegment::Close,
+        ]);
+        let mut node = vector_node(&rect, 0.0, 0.0, 100.0, 100.0);
+        node.parent_id = Some(page);
+        node.style.fill = FillStyle::Gradient(GradientKind::Linear {
+            from: Point2D { x: 0.0, y: 0.0 },
+            to: Point2D { x: 100.0, y: 0.0 },
+            stops: vec![
+                GradientStop {
+                    offset: 0.0,
+                    color: RgbaColor::new(1.0, 0.0, 0.0, 1.0),
+                },
+                GradientStop {
+                    offset: 0.5,
+                    color: RgbaColor::new(0.0, 1.0, 0.0, 1.0),
+                },
+                GradientStop {
+                    offset: 1.0,
+                    color: RgbaColor::new(0.0, 0.0, 1.0, 1.0),
+                },
+            ],
+        });
+        doc.insert_node(node).unwrap();
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let opts = PdfExportOptions::default();
+        let rasters = RasterPixelCache::new();
+        export_pdf_from_document(&doc, &opts, &rasters, tmp.path()).unwrap();
+        let written = std::fs::read(tmp.path()).unwrap();
+        let raw = String::from_utf8_lossy(&written);
+        // Three stops means two Type-2 sub-functions stitched
+        // together by a Type-3 wrapper. Both function types must
+        // appear in the file.
+        assert!(
+            raw.contains("/FunctionType 2"),
+            "expected Type-2 exponential sub-function for adjacent-stop interpolation"
+        );
+        assert!(
+            raw.contains("/FunctionType 3"),
+            "expected Type-3 stitching function for >2 stops"
+        );
+    }
+
+    // -------------------------------------------------------------
     // `resolve_fill_color` — visibility precedence (regression for the
     // "override resurrects an invisible node" bug). The renderer's
     // `fill` is the single source of truth for whether a node is
@@ -1088,10 +1635,10 @@ mod tests {
     }
 
     #[test]
-    fn resolve_fill_drops_gradient_without_override() {
-        // The pre-PR behaviour, kept verbatim: a gradient without
-        // an explicit `color_override` is not exportable to PDF
-        // yet (no shading-pattern API in printpdf 0.7).
+    fn resolve_fill_paint_promotes_gradient_to_real_shading() {
+        // Phase 4 Block 4: gradients are no longer dropped or
+        // flattened — they resolve to `PdfPaint::Gradient(...)`
+        // and the post-processor emits a real PDF shading dict.
         use kcreate_core::node::{GradientKind, GradientStop, Point2D, RgbaColor};
         let node = vector_node_with_fill(FillStyle::Gradient(GradientKind::Linear {
             from: Point2D { x: 0.0, y: 0.0 },
@@ -1107,18 +1654,24 @@ mod tests {
                 },
             ],
         }));
-        assert!(
-            resolve_fill_color(&node).is_none(),
-            "gradient without override remains unsupported"
-        );
+        match resolve_fill_paint(&node, PdfColorMode::Rgb) {
+            PdfPaint::Gradient(g) => {
+                assert_eq!(g.stops.len(), 2);
+                assert!(matches!(g.color_space, ShadingColorSpace::DeviceRgb));
+            }
+            other => panic!("expected PdfPaint::Gradient, got {other:?}"),
+        }
+        // And the legacy solid-color resolver returns None so the
+        // exporter's solid-fill branch is skipped.
+        assert!(resolve_fill_color(&node).is_none());
     }
 
     #[test]
-    fn resolve_fill_uses_override_for_gradient_with_override() {
-        // Phase 2 PR #7 review finding #14: a gradient with a
-        // `color_override` was being silently dropped. Now we
-        // honour the override and emit a flat fill in that colour
-        // space, so the print shop sees the user's intent.
+    fn resolve_fill_paint_overrides_gradient_stop_chroma_with_override() {
+        // A gradient with a `color_override` keeps its geometry but
+        // every stop's chroma becomes the override's colour. Tests
+        // that the new shading-pattern path honours the user's
+        // print-colour intent without losing the gradient.
         use kcreate_core::node::{GradientKind, GradientStop, Point2D, RgbaColor};
         let mut node = vector_node_with_fill(FillStyle::Gradient(GradientKind::Linear {
             from: Point2D { x: 0.0, y: 0.0 },
@@ -1130,7 +1683,7 @@ mod tests {
                 },
                 GradientStop {
                     offset: 1.0,
-                    color: RgbaColor::new(0.0, 0.0, 1.0, 1.0),
+                    color: RgbaColor::new(0.0, 0.0, 1.0, 0.5),
                 },
             ],
         }));
@@ -1141,21 +1694,32 @@ mod tests {
             k: 0.05,
             a: 1.0,
         });
-        let resolved = resolve_fill_color(&node).expect("override resolves through gradient");
-        match resolved {
-            Color::Cmyk { c, m, y, k, a } => {
-                assert!((c - 0.5).abs() < 1e-6);
-                assert!((m - 0.25).abs() < 1e-6);
-                assert!((y - 0.1).abs() < 1e-6);
-                assert!((k - 0.05).abs() < 1e-6);
-                assert!((a - 1.0).abs() < 1e-6);
+        match resolve_fill_paint(&node, PdfColorMode::Cmyk) {
+            PdfPaint::Gradient(g) => {
+                assert_eq!(g.stops.len(), 2);
+                for (_, c) in &g.stops {
+                    match c {
+                        Color::Cmyk { c, m, y, k, .. } => {
+                            assert!((c - 0.5).abs() < 1e-6);
+                            assert!((m - 0.25).abs() < 1e-6);
+                            assert!((y - 0.1).abs() < 1e-6);
+                            assert!((k - 0.05).abs() < 1e-6);
+                        }
+                        other => panic!("expected Cmyk stop, got {other:?}"),
+                    }
+                }
+                // The renderer-side alpha 0.5 must survive on the
+                // second stop because the override defaulted to
+                // fully opaque.
+                assert!((g.stops[1].1.alpha() - 0.5).abs() < 1e-6);
+                assert!(matches!(g.color_space, ShadingColorSpace::DeviceCmyk));
             }
-            other => panic!("expected Cmyk, got {other:?}"),
+            other => panic!("expected PdfPaint::Gradient, got {other:?}"),
         }
     }
 
     #[test]
-    fn resolve_fill_drops_gradient_with_zero_alpha_stops_even_with_override() {
+    fn resolve_fill_paint_drops_gradient_with_zero_alpha_stops_even_with_override() {
         // A gradient whose stops are all fully transparent is
         // invisible on the canvas; the override does not change
         // that.
@@ -1182,7 +1746,7 @@ mod tests {
             a: 1.0,
         });
         assert!(
-            resolve_fill_color(&node).is_none(),
+            matches!(resolve_fill_paint(&node, PdfColorMode::Rgb), PdfPaint::None),
             "zero-alpha gradient must not become visible via override"
         );
     }
@@ -1268,11 +1832,12 @@ mod tests {
 
     #[test]
     fn raster_to_cmyk_image_red_converts_to_full_magenta_yellow() {
-        // sRGB red (255, 0, 0, 255) → CMYK (0, 1, 1, 0). The
-        // quantised CMYK byte stream should therefore be
-        // [0, 255, 255, 0] per pixel.
+        // sRGB red (255, 0, 0, 255) → CMYK (0, 1, 1, 0). Solid
+        // input has zero quantisation error so Floyd-Steinberg
+        // (the default) round-trips exactly to [0, 255, 255, 0].
         let buf = red_2x2_rgba();
-        let img = raster_to_cmyk_image(&buf, 2, 2).expect("conversion succeeds");
+        let img = raster_to_cmyk_image(&buf, 2, 2, CmykDither::FloydSteinberg)
+            .expect("conversion succeeds");
         assert!(
             matches!(img.image.color_space, ColorSpace::Cmyk),
             "expected ColorSpace::Cmyk, got {:?}",
@@ -1290,9 +1855,11 @@ mod tests {
     #[test]
     fn raster_to_cmyk_image_transparent_pixel_mattes_to_white() {
         // A fully transparent pixel mattes against white paper, which
-        // is zero ink in CMYK.
+        // is zero ink in CMYK. We disable dithering for this test so
+        // we get exact zeros (Bayer/Floyd would noise around 0 with
+        // sub-LSB perturbation).
         let buf = vec![255, 0, 0, 0, 0, 0, 0, 0];
-        let img = raster_to_cmyk_image(&buf, 2, 1).expect("conversion succeeds");
+        let img = raster_to_cmyk_image(&buf, 2, 1, CmykDither::None).expect("conversion succeeds");
         let pixels: Vec<&[u8]> = img.image.image_data.chunks_exact(4).collect();
         for px in &pixels {
             assert_eq!(px[..], [0, 0, 0, 0], "transparent → no ink");
@@ -1304,8 +1871,8 @@ mod tests {
         // 2×2 should be 16 bytes; pass 12 to ensure the bounds check
         // catches the underflow before the unchecked slice indexing.
         let buf = vec![0u8; 12];
-        let err =
-            raster_to_cmyk_image(&buf, 2, 2).expect_err("undersized buffer should be rejected");
+        let err = raster_to_cmyk_image(&buf, 2, 2, CmykDither::None)
+            .expect_err("undersized buffer should be rejected");
         match err {
             PdfExportError::Image(msg) => assert!(
                 msg.contains("expected at least"),
@@ -1316,13 +1883,39 @@ mod tests {
     }
 
     #[test]
-    fn quantize_u8_handles_finite_range_and_nan() {
-        assert_eq!(quantize_u8(0.0), 0);
-        assert_eq!(quantize_u8(1.0), 255);
-        assert_eq!(quantize_u8(0.5), 128);
-        assert_eq!(quantize_u8(-0.1), 0);
-        assert_eq!(quantize_u8(2.0), 255);
-        assert_eq!(quantize_u8(f32::NAN), 0);
-        assert_eq!(quantize_u8(f32::INFINITY), 0);
+    fn raster_to_cmyk_image_dither_choice_affects_gradient_output() {
+        // Build a 16×16 horizontal red→white gradient in sRGB,
+        // export with Floyd-Steinberg vs. Bayer vs. none. The
+        // three resulting byte streams must differ — otherwise
+        // the dither selection isn't actually being applied.
+        let w: u32 = 16;
+        let h: u32 = 16;
+        let mut buf = Vec::with_capacity((w * h * 4) as usize);
+        for _y in 0..h {
+            for x in 0..w {
+                let t = (x as f32) / ((w - 1) as f32);
+                buf.push((255.0 * (1.0 - t * 0.5)) as u8);
+                buf.push((255.0 * 0.5 * (1.0 - t)) as u8);
+                buf.push((255.0 * 0.5 * (1.0 - t)) as u8);
+                buf.push(255);
+            }
+        }
+        let none = raster_to_cmyk_image(&buf, w, h, CmykDither::None).expect("none succeeds");
+        let fs = raster_to_cmyk_image(&buf, w, h, CmykDither::FloydSteinberg)
+            .expect("floyd-steinberg succeeds");
+        let bayer = raster_to_cmyk_image(&buf, w, h, CmykDither::Bayer8x8).expect("bayer succeeds");
+        assert_ne!(
+            none.image.image_data, fs.image.image_data,
+            "Floyd-Steinberg should diverge from no-dither on gradient"
+        );
+        assert_ne!(
+            none.image.image_data, bayer.image.image_data,
+            "Bayer should diverge from no-dither on gradient"
+        );
+        // Both must still be the same length (no truncation).
+        let expected_len = (w * h * 4) as usize;
+        assert_eq!(none.image.image_data.len(), expected_len);
+        assert_eq!(fs.image.image_data.len(), expected_len);
+        assert_eq!(bayer.image.image_data.len(), expected_len);
     }
 }

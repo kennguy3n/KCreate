@@ -118,6 +118,40 @@ impl Color {
     }
 }
 
+/// Color-space taxonomy for [`IccProfile::Custom`].
+///
+/// The well-known [`IccProfile`] variants pin their own color space
+/// statically (sRGB / Adobe RGB / P3 are RGB, FOGRA39 / SWOP 2006 are
+/// CMYK). A `Custom` profile is just a blob hash + label — the runtime
+/// doesn't load the ICC bytes yet (Phase 3), so this enum lets the
+/// document author *declare* what color space the embedded profile
+/// represents. Downstream code (PDF export, soft-proof overlay,
+/// `IccProfile::is_cmyk`) keys off this declaration instead of
+/// special-casing only the well-known names.
+///
+/// Wire format is serde's default PascalCase unit-variant strings
+/// (`"Rgb"`, `"Cmyk"`, …). Mirrors `IccColorSpace` in
+/// `apps/desktop/shared/scene.ts`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum IccColorSpace {
+    /// Three-channel RGB (sRGB / Adobe RGB / Display P3 / wide-gamut
+    /// monitor profiles). The default for newly authored Custom
+    /// profiles so older project files (which omit the field) keep
+    /// the historical interpretation.
+    #[default]
+    Rgb,
+    /// Four-channel process CMYK (FOGRA39, SWOP, GRACoL, custom
+    /// press profiles). Setting this on a Custom profile is what
+    /// activates the CMYK PDF export pipeline and the soft-proof
+    /// CMYK simulation.
+    Cmyk,
+    /// Single-channel grayscale (DeviceGray, Dot Gain 20%, etc.).
+    Gray,
+    /// Profile-Connection-Space Lab — used as an intermediate by
+    /// some workflows and PDF/X output intents.
+    Lab,
+}
+
 /// ICC profile reference — either a well-known standard or a custom
 /// embedded profile.
 ///
@@ -128,9 +162,11 @@ impl Color {
 /// Wire format is serde's default **externally-tagged** PascalCase
 /// JSON: unit variants serialize as bare strings (`"SrgbIec61966"`,
 /// `"FogRa39"`, …) and the `Custom` variant as
-/// `{"Custom":{"name":"…","blob_hash":"…"}}`. This matches the
-/// `IccProfile` type in `apps/desktop/shared/scene.ts` and the
-/// lockstep contract in AGENTS.md §Rules §4.
+/// `{"Custom":{"name":"…","blob_hash":"…","color_space":"Rgb"}}`. This
+/// matches the `IccProfile` type in `apps/desktop/shared/scene.ts` and
+/// the lockstep contract in AGENTS.md §Rules §4. The `color_space`
+/// field is `#[serde(default)]` so projects written before the field
+/// existed still load (they get the historical `Rgb` interpretation).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum IccProfile {
     /// IEC 61966-2-1 sRGB. The default working space.
@@ -144,8 +180,16 @@ pub enum IccProfile {
     /// SWOP 2006 Coated #3 — US web offset CMYK.
     Swop2006,
     /// A custom profile embedded in the project; `blob_hash` is the
-    /// BLAKE3 hash of the `.icc` bytes in the asset store.
-    Custom { name: String, blob_hash: String },
+    /// BLAKE3 hash of the `.icc` bytes in the asset store, and
+    /// `color_space` declares which device space the profile targets
+    /// so [`IccProfile::is_cmyk`] and the PDF exporter can route it
+    /// correctly without having to parse the embedded ICC header.
+    Custom {
+        name: String,
+        blob_hash: String,
+        #[serde(default)]
+        color_space: IccColorSpace,
+    },
 }
 
 impl IccProfile {
@@ -163,9 +207,26 @@ impl IccProfile {
     }
 
     /// Whether this profile represents a CMYK working space.
+    ///
+    /// Returns `true` for the well-known process-CMYK profiles
+    /// (FOGRA39, SWOP 2006) **and** for any `Custom` profile the
+    /// author declared as [`IccColorSpace::Cmyk`]. The previous
+    /// implementation only matched on the two well-known names and
+    /// silently returned `false` for custom CMYK profiles, which
+    /// would have routed them through the RGB code path in any
+    /// future consumer keyed off `is_cmyk()`. Per Devin Review on
+    /// PR #7 (Phase 2 / color.rs:167).
     #[must_use]
     pub const fn is_cmyk(&self) -> bool {
-        matches!(self, Self::FogRa39 | Self::Swop2006)
+        matches!(
+            self,
+            Self::FogRa39
+                | Self::Swop2006
+                | Self::Custom {
+                    color_space: IccColorSpace::Cmyk,
+                    ..
+                }
+        )
     }
 }
 
@@ -650,6 +711,12 @@ mod tests {
             IccProfile::Custom {
                 name: "MyMonitor".into(),
                 blob_hash: "abcd".into(),
+                color_space: IccColorSpace::Rgb,
+            },
+            IccProfile::Custom {
+                name: "MyPress".into(),
+                blob_hash: "deadbeef".into(),
+                color_space: IccColorSpace::Cmyk,
             },
         ];
         for p in profiles {
@@ -657,6 +724,65 @@ mod tests {
             let back: IccProfile = serde_json::from_str(&s).unwrap();
             assert_eq!(p, back);
         }
+    }
+
+    #[test]
+    fn icc_profile_custom_color_space_defaults_when_absent() {
+        // Forward-compat: projects authored before the field existed
+        // must still load. Deserialise a Custom payload without the
+        // `color_space` field and verify it lands on `Rgb` (the
+        // historical interpretation).
+        let s = r#"{"Custom":{"name":"OldFile","blob_hash":"abc"}}"#;
+        let back: IccProfile = serde_json::from_str(s).unwrap();
+        match back {
+            IccProfile::Custom {
+                name,
+                blob_hash,
+                color_space,
+            } => {
+                assert_eq!(name, "OldFile");
+                assert_eq!(blob_hash, "abc");
+                assert_eq!(color_space, IccColorSpace::Rgb);
+            }
+            other => panic!("expected Custom, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn icc_profile_is_cmyk_matches_well_known_and_custom_cmyk() {
+        // Well-known CMYK presses.
+        assert!(IccProfile::FogRa39.is_cmyk());
+        assert!(IccProfile::Swop2006.is_cmyk());
+        // Well-known RGB / display profiles.
+        assert!(!IccProfile::SrgbIec61966.is_cmyk());
+        assert!(!IccProfile::AdobeRgb1998.is_cmyk());
+        assert!(!IccProfile::DisplayP3.is_cmyk());
+        // Custom profiles route off the declared color_space.
+        assert!(IccProfile::Custom {
+            name: "MyPress".into(),
+            blob_hash: "deadbeef".into(),
+            color_space: IccColorSpace::Cmyk,
+        }
+        .is_cmyk());
+        assert!(!IccProfile::Custom {
+            name: "MyMonitor".into(),
+            blob_hash: "feedface".into(),
+            color_space: IccColorSpace::Rgb,
+        }
+        .is_cmyk());
+        // Gray and Lab Custom profiles are not CMYK.
+        assert!(!IccProfile::Custom {
+            name: "DotGain20".into(),
+            blob_hash: "01".into(),
+            color_space: IccColorSpace::Gray,
+        }
+        .is_cmyk());
+        assert!(!IccProfile::Custom {
+            name: "PCS-Lab".into(),
+            blob_hash: "02".into(),
+            color_space: IccColorSpace::Lab,
+        }
+        .is_cmyk());
     }
 
     #[test]
@@ -811,10 +937,20 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&IccProfile::Custom {
                 name: "MyMonitor".into(),
-                blob_hash: "abcd".into()
+                blob_hash: "abcd".into(),
+                color_space: IccColorSpace::Rgb,
             })
             .unwrap(),
-            r#"{"Custom":{"name":"MyMonitor","blob_hash":"abcd"}}"#
+            r#"{"Custom":{"name":"MyMonitor","blob_hash":"abcd","color_space":"Rgb"}}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&IccProfile::Custom {
+                name: "MyPress".into(),
+                blob_hash: "deadbeef".into(),
+                color_space: IccColorSpace::Cmyk,
+            })
+            .unwrap(),
+            r#"{"Custom":{"name":"MyPress","blob_hash":"deadbeef","color_space":"Cmyk"}}"#
         );
     }
 

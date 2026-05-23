@@ -1312,18 +1312,16 @@ pub fn color_settings_get() -> Result<String> {
 /// `affected_nodes` is empty because color settings are document-wide
 /// (no specific node is mutated).
 ///
-/// **Undo contract.** This follows the host-driven model documented on
-/// [`kcreate_core::project::Project::undo`]: `document_undo` only
-/// moves the operation log cursor and returns the rolled-back
-/// operation to the caller. The renderer dispatcher is responsible
-/// for inspecting the returned `command` and re-applying the
-/// appropriate patch — for `"color_settings_update"`, that means
-/// deserialising `before_patch` and calling `color_settings_update`
-/// again with the previous-settings JSON. Without that wiring,
-/// `document_undo()` pops the operation but the in-memory color
-/// settings stay at the new value; this matches how every other
-/// non-graph operation in the bridge participates in undo today
-/// (`master_page_apply`, `color_settings_update`, etc.).
+/// **Undo contract.** Undo is real: `document_undo` deserialises
+/// `before_patch` and writes it back into `ws.project.color_settings`
+/// before returning, so after one undo the in-memory settings match
+/// the pre-update value (and `color_settings_get` returns the
+/// previous shape). Redo is symmetric via `after_patch`. The
+/// dispatch lives in `crate::document::apply_inverse_patch` /
+/// `apply_forward_patch` so the bridge owns the workspace-state
+/// reversal — the renderer just calls `window.kcreate.document.undo()`
+/// and refreshes; no command-specific knowledge required on the
+/// host side.
 pub fn color_settings_update(settings_json: &str) -> Result<()> {
     use kcreate_core::color::ColorSettings;
     let new_settings: ColorSettings = serde_json::from_str(settings_json)?;
@@ -1504,11 +1502,10 @@ pub fn text_frame_get(node_id: Uuid) -> Result<String> {
 /// The operation `command` is `"text_frame_update"`; `before_patch` /
 /// `after_patch` are the previous / new options JSON; `affected_nodes`
 /// contains the single node id so the renderer dispatcher can
-/// invalidate that node's cached layout. Like all phase-2 panel
-/// operations the actual undo wiring is host-driven: `document_undo`
-/// returns the popped operation and the renderer is expected to
-/// re-apply the `before_patch` via this function. The contract
-/// matches `color_settings_update`.
+/// invalidate that node's cached layout. Undo is real — see
+/// [`color_settings_update`] for the full contract; the bridge replays
+/// `before_patch` onto the node itself, so `document_undo` actually
+/// restores the previous `TextFrameOptions`.
 pub fn text_frame_update(node_id: Uuid, options_json: &str) -> Result<()> {
     use kcreate_core::node::TextFrameOptions;
     let new_options: TextFrameOptions = serde_json::from_str(options_json)?;

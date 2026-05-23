@@ -23,22 +23,28 @@ import { colors, radius, spacing } from "../styles/tokens";
 
 export interface SoftProofOverlayProps {
   /**
-   * Initial settings (optional). The overlay refetches on mount to
-   * stay in sync with `ColorSettingsPanel` edits coming through
-   * `window.kcreate.color`.
+   * Initial settings (optional). The overlay refetches on mount and
+   * then subscribes to `window.kcreate.color.onSettingsChanged` so
+   * edits from `ColorSettingsPanel` (and undo / redo of those edits)
+   * land on the overlay synchronously instead of waiting on a poll.
    */
   initial?: ColorSettings;
   /**
-   * Polling interval in ms. The Phase 2 bridge does not push
-   * settings changes, so the overlay polls on a slow cadence to
-   * pick up edits from the settings panel. Set to `0` to disable.
+   * Optional fallback polling interval in ms. The bridge ships a
+   * push channel for color-settings changes (the default code path),
+   * so this poll only fires if the push channel isn't available
+   * (e.g., a renderer fixture without the full preload). Default `0`
+   * disables polling entirely.
+   *
+   * Phase 2 originally polled at 2 s; the polling fallback is kept
+   * for tests and dev shells that mock out the IPC surface.
    */
   pollMs?: number;
 }
 
 export function SoftProofOverlay({
   initial,
-  pollMs = 2000,
+  pollMs = 0,
 }: SoftProofOverlayProps): JSX.Element | null {
   const [settings, setSettings] = useState<ColorSettings | null>(
     initial ?? null,
@@ -48,24 +54,34 @@ export function SoftProofOverlay({
     let alive = true;
     let timer: ReturnType<typeof setInterval> | null = null;
 
-    const tick = async () => {
+    const refresh = async () => {
       try {
         const next = await window.kcreate.color.getSettings();
         if (alive) setSettings(next);
       } catch {
-        // Bridge may not be ready before the first render; the next
-        // tick retries.
+        // Bridge may not be ready before the first render; the
+        // push channel will deliver the next change.
       }
     };
 
-    void tick();
+    void refresh();
+    // Push-channel subscription. The bridge fires this on direct
+    // settings updates AND on undo / redo of a color_settings_update
+    // op (see `apps/desktop/main/src/main.ts::broadcastColorSettingsChanged`).
+    const unsubscribe = window.kcreate.color.onSettingsChanged(() => {
+      void refresh();
+    });
+
+    // Optional poll fallback for renderer fixtures without the IPC
+    // surface. Default `pollMs=0` keeps this off in production.
     if (pollMs > 0) {
       timer = setInterval(() => {
-        void tick();
+        void refresh();
       }, pollMs);
     }
     return () => {
       alive = false;
+      unsubscribe();
       if (timer !== null) clearInterval(timer);
     };
   }, [pollMs]);

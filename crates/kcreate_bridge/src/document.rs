@@ -983,13 +983,30 @@ pub fn document_record_operation(operation: Operation) -> Result<()> {
 /// Undo the most recent operation. Returns the affected node ids of
 /// the rolled-back operation, or `None` if the undo stack is empty.
 ///
-/// Only moves the log cursor — the host applies `before_patch` to
-/// its in-memory state. See [`kcreate_core::project::Project::undo`]
-/// for the contract.
+/// For non-graph operations recorded by the Phase 2 panels
+/// ([`color_settings_update`], [`text_frame_update`],
+/// [`text_opentype_features_update`]) the bridge replays `before_patch`
+/// onto the workspace itself so the in-memory state actually reverts.
+/// For graph-mutating operations (node create / update / delete,
+/// reparent, …) the existing host-driven contract still applies — the
+/// renderer is expected to fold `before_patch` back into its view via
+/// the standard mutate-then-record entry points, mirroring the
+/// snapshot stored in [`kcreate_core::project::Project::undo`].
+///
+/// [`color_settings_update`]: crate::phase2::color_settings_update
+/// [`text_frame_update`]: crate::phase2::text_frame_update
+/// [`text_opentype_features_update`]: crate::phase2::text_opentype_features_update
 pub fn document_undo() -> Result<Option<Vec<Uuid>>> {
     let mut guard = slot().lock();
     let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
-    let affected = ws.project.undo().map(|op| op.affected_nodes);
+    let op = ws.project.undo();
+    let affected = match op {
+        Some(op) => {
+            apply_inverse_patch(ws, &op)?;
+            Some(op.affected_nodes)
+        }
+        None => None,
+    };
     drop(guard);
     Ok(affected)
 }
@@ -997,15 +1014,95 @@ pub fn document_undo() -> Result<Option<Vec<Uuid>>> {
 /// Redo the next operation. Returns the affected node ids of the
 /// re-applied operation, or `None` if the redo stack is empty.
 ///
-/// Only moves the log cursor — the host applies `after_patch` to its
-/// in-memory state. See [`kcreate_core::project::Project::undo`] for
-/// the contract.
+/// Symmetric with [`document_undo`]: for Phase 2 non-graph operations
+/// the bridge re-applies `after_patch` to the workspace itself; for
+/// graph-mutating operations the host-driven contract still applies.
 pub fn document_redo() -> Result<Option<Vec<Uuid>>> {
     let mut guard = slot().lock();
     let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
-    let affected = ws.project.redo().map(|op| op.affected_nodes);
+    let op = ws.project.redo();
+    let affected = match op {
+        Some(op) => {
+            apply_forward_patch(ws, &op)?;
+            Some(op.affected_nodes)
+        }
+        None => None,
+    };
     drop(guard);
     Ok(affected)
+}
+
+/// Walk `op.before_patch` into workspace state for the non-graph
+/// operations recorded by Phase 2 panels.
+///
+/// Returns `Ok(())` for every other command kind — graph mutations
+/// (`document_create_node` / `_update` / `_delete`, `document_reparent`,
+/// `canvas_move_node`, …) keep the legacy host-driven undo contract
+/// where the renderer is responsible for folding `before_patch` back
+/// into the view. We deliberately do not silently `Err` on unknown
+/// commands here so the cursor-only undo semantics that the rest of
+/// the workspace relies on continue to function.
+fn apply_inverse_patch(ws: &mut Workspace, op: &Operation) -> Result<()> {
+    apply_patch(ws, op, &op.before_patch)
+}
+
+/// Walk `op.after_patch` into workspace state for the non-graph
+/// operations recorded by Phase 2 panels. See [`apply_inverse_patch`]
+/// for the broader contract.
+fn apply_forward_patch(ws: &mut Workspace, op: &Operation) -> Result<()> {
+    apply_patch(ws, op, &op.after_patch)
+}
+
+fn apply_patch(ws: &mut Workspace, op: &Operation, patch: &serde_json::Value) -> Result<()> {
+    // `project.undo()` / `project.redo()` already bumped
+    // `modified_at` before we got here, so we don't need to touch it
+    // again — just walk the patch into the live state.
+    match op.command.as_str() {
+        "color_settings_update" => {
+            let settings: kcreate_core::color::ColorSettings =
+                serde_json::from_value(patch.clone())?;
+            ws.project.color_settings = settings;
+            Ok(())
+        }
+        "text_frame_update" => {
+            let id = op.affected_nodes.first().copied().ok_or_else(|| {
+                DocumentBridgeError::InvalidArgument {
+                    argument: "affected_nodes".into(),
+                    value: format!("text_frame_update operation {} has no affected node", op.id),
+                }
+            })?;
+            let options: kcreate_core::node::TextFrameOptions =
+                serde_json::from_value(patch.clone())?;
+            let node = ws
+                .project
+                .document
+                .get_node_mut(id)
+                .ok_or(DocumentBridgeError::NodeNotFound(id))?;
+            node.set_text_frame_options(&options);
+            Ok(())
+        }
+        "text_opentype_features_update" => {
+            let id = op.affected_nodes.first().copied().ok_or_else(|| {
+                DocumentBridgeError::InvalidArgument {
+                    argument: "affected_nodes".into(),
+                    value: format!(
+                        "text_opentype_features_update operation {} has no affected node",
+                        op.id
+                    ),
+                }
+            })?;
+            let features: kcreate_core::node::OpenTypeFeatures =
+                serde_json::from_value(patch.clone())?;
+            let node = ws
+                .project
+                .document
+                .get_node_mut(id)
+                .ok_or(DocumentBridgeError::NodeNotFound(id))?;
+            node.set_opentype_features(&features);
+            Ok(())
+        }
+        _ => Ok(()),
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -5578,6 +5675,148 @@ mod tests {
         let parsed_after: kcreate_core::node::OpenTypeFeatures =
             serde_json::from_str(&after).unwrap();
         assert_eq!(parsed_after, custom);
+        project_close();
+    }
+
+    /// Pins the Phase 2 undo contract for non-graph operations.
+    /// `color_settings_update` must actually be reversible end-to-end:
+    /// after one `document_undo` the in-memory `color_settings` must
+    /// match the pre-update value, and after a follow-up
+    /// `document_redo` it must come back to the post-update value.
+    /// Regressing this would silently re-introduce the "undoable
+    /// docstring lies" bug Devin Review flagged on PR #7.
+    #[test]
+    #[serial]
+    fn color_settings_update_undo_redo_round_trips_state() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("color-undo", dir.path()).expect("create");
+
+        let baseline = kcreate_core::color::ColorSettings::default();
+        let updated = kcreate_core::color::ColorSettings {
+            working_space_rgb: kcreate_core::color::IccProfile::AdobeRgb1998,
+            working_space_cmyk: Some(kcreate_core::color::IccProfile::FogRa39),
+            rendering_intent: kcreate_core::color::RenderingIntent::RelativeColorimetric,
+            soft_proof_profile: Some(kcreate_core::color::IccProfile::Swop2006),
+            gamut_warning: true,
+        };
+        crate::phase2::color_settings_update(&serde_json::to_string(&updated).unwrap())
+            .expect("update");
+
+        let after_update: kcreate_core::color::ColorSettings =
+            serde_json::from_str(&crate::phase2::color_settings_get().expect("get after update"))
+                .unwrap();
+        assert_eq!(after_update, updated);
+
+        document_undo().expect("undo");
+        let after_undo: kcreate_core::color::ColorSettings =
+            serde_json::from_str(&crate::phase2::color_settings_get().expect("get after undo"))
+                .unwrap();
+        assert_eq!(
+            after_undo, baseline,
+            "document_undo must replay before_patch into ws.project.color_settings",
+        );
+
+        document_redo().expect("redo");
+        let after_redo: kcreate_core::color::ColorSettings =
+            serde_json::from_str(&crate::phase2::color_settings_get().expect("get after redo"))
+                .unwrap();
+        assert_eq!(
+            after_redo, updated,
+            "document_redo must replay after_patch into ws.project.color_settings",
+        );
+        project_close();
+    }
+
+    /// Same end-to-end guarantee for `text_frame_update` — the bridge
+    /// must restore the previous `TextFrameOptions` on undo and replay
+    /// the new options on redo.
+    #[test]
+    #[serial]
+    fn text_frame_update_undo_redo_round_trips_state() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("tf-undo", dir.path()).expect("create");
+
+        let id = fresh_text_node_for_test("sans-serif");
+        let baseline = kcreate_core::node::TextFrameOptions::default();
+        let updated = kcreate_core::node::TextFrameOptions {
+            overflow: kcreate_core::node::TextOverflow::Ellipsis,
+            columns: 4,
+            column_gap: 8.0,
+            wrap_mode: kcreate_core::node::TextWrapMode::BoundingBox,
+            hyphenation: true,
+            hyphenation_language: "en-US".into(),
+            vertical_alignment: kcreate_core::node::VerticalAlign::Bottom,
+            inset: kcreate_core::node::FrameInsets {
+                top: 2.0,
+                right: 2.0,
+                bottom: 2.0,
+                left: 2.0,
+            },
+            auto_size: kcreate_core::node::TextAutoSize::HeightAuto,
+        };
+        crate::phase2::text_frame_update(id, &serde_json::to_string(&updated).unwrap())
+            .expect("update");
+
+        document_undo().expect("undo");
+        let after_undo: kcreate_core::node::TextFrameOptions =
+            serde_json::from_str(&crate::phase2::text_frame_get(id).expect("get after undo"))
+                .unwrap();
+        assert_eq!(
+            after_undo, baseline,
+            "document_undo must restore the previous TextFrameOptions on the node",
+        );
+
+        document_redo().expect("redo");
+        let after_redo: kcreate_core::node::TextFrameOptions =
+            serde_json::from_str(&crate::phase2::text_frame_get(id).expect("get after redo"))
+                .unwrap();
+        assert_eq!(
+            after_redo, updated,
+            "document_redo must replay the new TextFrameOptions onto the node",
+        );
+        project_close();
+    }
+
+    /// And `text_opentype_features_update` — same contract, third
+    /// Phase 2 panel-driven non-graph operation.
+    #[test]
+    #[serial]
+    fn text_opentype_features_update_undo_redo_round_trips_state() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("ot-undo", dir.path()).expect("create");
+
+        let id = fresh_text_node_for_test("sans-serif");
+        let baseline = kcreate_core::node::OpenTypeFeatures::default();
+        let updated = kcreate_core::node::OpenTypeFeatures {
+            ligatures: false,
+            contextual_alternates: true,
+            kerning: true,
+            small_caps: true,
+            old_style_figures: true,
+            tabular_figures: false,
+            stylistic_sets: vec![2, 5, 11],
+            fractions: true,
+            ordinals: true,
+        };
+        crate::phase2::text_opentype_features_update(id, &serde_json::to_string(&updated).unwrap())
+            .expect("update");
+
+        document_undo().expect("undo");
+        let after_undo: kcreate_core::node::OpenTypeFeatures = serde_json::from_str(
+            &crate::phase2::text_opentype_features_get(id).expect("get after undo"),
+        )
+        .unwrap();
+        assert_eq!(after_undo, baseline);
+
+        document_redo().expect("redo");
+        let after_redo: kcreate_core::node::OpenTypeFeatures = serde_json::from_str(
+            &crate::phase2::text_opentype_features_get(id).expect("get after redo"),
+        )
+        .unwrap();
+        assert_eq!(after_redo, updated);
         project_close();
     }
 

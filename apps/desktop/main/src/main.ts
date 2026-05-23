@@ -549,6 +549,23 @@ function pluginIdForSender(event: IpcMainInvokeEvent): string | null {
   return webContentsIdToPluginId.get(event.sender.id) ?? null;
 }
 
+/// Push-broadcast a "color settings changed" event to the main
+/// renderer. Phase 2 ships a single mainWindow but we still gate on
+/// destruction so a late-firing handler doesn't crash during quit.
+///
+/// We deliberately do NOT include the new settings payload — keeping
+/// the event content-free lets the renderer issue a single fresh
+/// `colorSettingsGet()` IPC, which is the same shape it would have
+/// fetched on mount, and avoids leaking the wire format into the IPC
+/// event channel (which has no schema enforcement). The fetch is
+/// effectively free: `color_settings_get` returns a cloned struct
+/// behind the workspace mutex.
+function broadcastColorSettingsChanged(): void {
+  const win = mainWindow;
+  if (!win || win.isDestroyed()) return;
+  win.webContents.send("kcreate/color/settings/changed");
+}
+
 function registerIpcHandlers(): void {
   ipcMain.handle("kcreate/renderer/init", (_e, width: number, height: number) =>
     requireBridge().rendererInit(width, height),
@@ -706,12 +723,22 @@ function registerIpcHandlers(): void {
       requireBridge().documentDeleteNode(nodeId);
     },
   );
-  ipcMain.handle("kcreate/document/undo", () =>
-    requireBridge().documentUndo(),
-  );
-  ipcMain.handle("kcreate/document/redo", () =>
-    requireBridge().documentRedo(),
-  );
+  // `kcreate/document/undo` and `.../redo` may roll back / replay a
+  // `color_settings_update` operation as of Phase 2 (the bridge owns
+  // the dispatch — see `crates/kcreate_bridge/src/document.rs`'s
+  // `apply_inverse_patch`), so we re-broadcast `color/settings/changed`
+  // after each call. The renderer subscriber takes care of the
+  // (very cheap) round-trip to fetch the new state.
+  ipcMain.handle("kcreate/document/undo", () => {
+    const result = requireBridge().documentUndo();
+    broadcastColorSettingsChanged();
+    return result;
+  });
+  ipcMain.handle("kcreate/document/redo", () => {
+    const result = requireBridge().documentRedo();
+    broadcastColorSettingsChanged();
+    return result;
+  });
   ipcMain.handle("kcreate/document/status", () =>
     requireBridge().documentStatus(),
   );
@@ -1383,6 +1410,12 @@ function registerIpcHandlers(): void {
     "kcreate/color/settings/update",
     (_e, settingsJson: string) => {
       requireBridge().colorSettingsUpdate(settingsJson);
+      // Push-notify so `SoftProofOverlay` (and any future
+      // color-aware UI) can react synchronously instead of waiting
+      // on a 2-second polling tick. See
+      // `apps/desktop/renderer/src/components/SoftProofOverlay.tsx`
+      // for the subscriber side.
+      broadcastColorSettingsChanged();
     },
   );
   ipcMain.handle(

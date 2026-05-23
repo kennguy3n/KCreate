@@ -1317,6 +1317,22 @@ const color: ColorBridge = {
     )) as string;
     return JSON.parse(raw) as ColorValue;
   },
+  /// Subscribe to the push channel that fires whenever
+  /// `color_settings_update`, `documentUndo`, or `documentRedo`
+  /// mutates `ws.project.color_settings`. The event is intentionally
+  /// payload-free — subscribers should call `getSettings()` to read
+  /// the new shape. Returns an unsubscribe function so callers can
+  /// detach in their effect cleanup.
+  onSettingsChanged(callback: () => void): () => void {
+    const channel = "kcreate/color/settings/changed";
+    const listener = (): void => {
+      callback();
+    };
+    ipcRenderer.on(channel, listener);
+    return () => {
+      ipcRenderer.removeListener(channel, listener);
+    };
+  },
 };
 
 // ---------------------------------------------------------------------------

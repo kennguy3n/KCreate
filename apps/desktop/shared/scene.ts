@@ -1604,17 +1604,34 @@ export interface McpPermissionBridge {
 // Phase 2 — Color management (CMYK / ICC foundation).
 // ---------------------------------------------------------------------------
 
+/// Color-space taxonomy for custom ICC profiles. Mirrors
+/// `kcreate_core::color::IccColorSpace`. Determines whether a
+/// `Custom` profile activates the CMYK export pipeline, the
+/// grayscale path, or stays in the RGB working space. Required so
+/// `IccProfile.is_cmyk` returns the right answer for custom press
+/// profiles instead of silently falling back to RGB.
+export type IccColorSpace = "Rgb" | "Cmyk" | "Gray" | "Lab";
+
 /// Well-known ICC profile identifiers + opt-in custom profile slot.
 /// Mirrors `kcreate_core::color::IccProfile`. Custom profiles store a
-/// human label and the BLAKE3 hash of the profile blob in the
-/// content-addressed asset store.
+/// human label, the BLAKE3 hash of the profile blob in the
+/// content-addressed asset store, and the device color space the
+/// profile targets. The `color_space` field is optional on the wire
+/// for forward-compat with projects authored before it existed; the
+/// Rust side defaults it to `Rgb`.
 export type IccProfile =
   | "SrgbIec61966"
   | "AdobeRgb1998"
   | "DisplayP3"
   | "FogRa39"
   | "Swop2006"
-  | { Custom: { name: string; blob_hash: string } };
+  | {
+      Custom: {
+        name: string;
+        blob_hash: string;
+        color_space?: IccColorSpace;
+      };
+    };
 
 /// Rendering intent for gamut mapping. Mirrors
 /// `kcreate_core::color::RenderingIntent`.
@@ -1658,11 +1675,22 @@ export interface ColorBridge {
   /// Read the document's current color settings.
   getSettings(): Promise<ColorSettings>;
   /// Replace the document's color settings. Records an undoable
-  /// `color_settings_update` operation.
+  /// `color_settings_update` operation; the bridge owns the
+  /// inverse-patch dispatch so `documentUndo()` actually restores
+  /// the previous settings (Phase 2 PR #7).
   updateSettings(settings: ColorSettings): Promise<void>;
   /// Convert a color value into the given color space. Cmyk → Cmyk
   /// short-circuits so authored K-channel data survives round trips.
   convert(color: ColorValue, toSpace: ColorSpaceName): Promise<ColorValue>;
+  /// Push-channel subscription that fires whenever
+  /// `ws.project.color_settings` mutates: direct updates and undo /
+  /// redo of a `color_settings_update` operation both notify here.
+  /// The callback receives no payload — call `getSettings()` to read
+  /// the new shape. Returns an unsubscribe function for effect
+  /// cleanup. Replaces the previous 2-second polling fallback that
+  /// `SoftProofOverlay` relied on before the bridge gained push
+  /// semantics.
+  onSettingsChanged(callback: () => void): () => void;
 }
 
 // ---------------------------------------------------------------------------

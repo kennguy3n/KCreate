@@ -27,6 +27,7 @@ pub mod color;
 pub mod component;
 pub mod config;
 pub mod document;
+pub mod icc;
 pub mod node;
 pub mod operation;
 pub mod project;
@@ -42,6 +43,7 @@ pub use component::{
 };
 pub use config::{DeviceTier, Platform, RuntimeConfig};
 pub use document::{DocumentError, DocumentGraph};
+pub use icc::{cmyk_to_srgb_profiled, convert_color, srgb_to_cmyk_profiled, ColorTransform};
 pub use node::{
     standard_presets, ArtboardPreset, BlendMode, Bounds, Constraint, Constraints, Effect,
     FillStyle, FrameInsets, GradientKind, GradientStop, Interaction, InteractionAction,

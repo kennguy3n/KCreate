@@ -1394,6 +1394,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "kcreate_collab"
+version = "0.0.1"
+dependencies = [
+ "base64",
+ "blake3",
+ "chrono",
+ "ed25519-dalek",
+ "kcreate_core",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "uuid",
+]
+
+[[package]]
 name = "kcreate_core"
 version = "0.0.1"
 dependencies = [

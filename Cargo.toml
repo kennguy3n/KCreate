@@ -13,6 +13,7 @@ members = [
     "crates/kcreate_ai",
     "crates/kcreate_mcp",
     "crates/kcreate_plugin",
+    "crates/kcreate_collab",
     "crates/kcreate_tests",
 ]
 

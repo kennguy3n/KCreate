@@ -34,7 +34,10 @@ pub use outline::{outline_glyph, OutlineCommand, OutlineError};
 pub use paragraph::{
     layout_paragraph, LayoutError, LayoutLine, ParagraphLayout, PositionedGlyph, TextStyle,
 };
-pub use shaper::{shape_text, ShapedGlyph, ShapedText, ShaperError};
+pub use shaper::{
+    opentype_features_to_buzz, shape_text, shape_text_with_features, shape_with_face,
+    shape_with_face_and_features, ShapedGlyph, ShapedText, ShaperError,
+};
 
 /// Combined error surface for the crate (re-exported for crates that
 /// don't care which sub-step failed, e.g. `kcreate_renderer`).

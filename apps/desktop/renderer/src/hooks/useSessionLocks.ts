@@ -68,14 +68,28 @@ export function useSessionLocks(): UseSessionLocksResult {
 
     const reload = async (): Promise<void> => {
       try {
+        // Fetch both halves of the snapshot before touching React
+        // state. React 18 only batches updates within the same
+        // microtask (between `await`s), so if we called
+        // `setSelfPeerId` immediately after the first await and
+        // `setAllLocks` after the second, a render landing between
+        // the two commits would observe the new peer id with the
+        // previous session's lock map — briefly mis-attributing
+        // peer-A's locks to peer-B during a session transition.
+        // Pulling both reads up-front and then issuing both setState
+        // calls adjacent (no `await` between them) lets React batch
+        // the commits, so callers always observe a consistent
+        // `(selfPeerId, allLocks)` pair.
         const info = await window.kcreate.session.info();
         if (cancelled) return;
-        setSelfPeerId(info?.peerId ?? null);
         // `session.locks()` is safe to call even when no session is
         // running — it returns `[]` rather than throwing.
         const entries = await window.kcreate.session.locks();
         if (cancelled) return;
-        setAllLocks(buildLockMap(entries));
+        const peerId = info?.peerId ?? null;
+        const lockMap = buildLockMap(entries);
+        setSelfPeerId(peerId);
+        setAllLocks(lockMap);
         setError(null);
       } catch (e) {
         if (!cancelled) {

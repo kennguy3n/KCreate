@@ -393,7 +393,7 @@ function AltTextSection({
             void generate();
           }}
           disabled={phase === "generating" || phase === "applying"}
-          style={primaryBtn(phase === "generating")}
+          style={primaryBtn(phase === "generating" || phase === "applying")}
           aria-label="Generate alt-text suggestion"
         >
           {phase === "generating" ? "Analyzing…" : "Generate alt-text"}
@@ -410,7 +410,9 @@ function AltTextSection({
               draft.trim().length === 0
             }
             style={primaryBtn(
-              phase === "applying" || draft.trim().length === 0,
+              phase === "applying" ||
+                phase === "generating" ||
+                draft.trim().length === 0,
             )}
             aria-label="Apply alt-text to selected image"
           >
@@ -425,7 +427,7 @@ function AltTextSection({
             }}
             disabled={phase === "applying" || phase === "generating"}
             style={{
-              ...primaryBtn(phase === "applying"),
+              ...primaryBtn(phase === "applying" || phase === "generating"),
               background: "transparent",
               color: colors.textMuted,
               border: `1px solid ${colors.border}`,

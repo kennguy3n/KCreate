@@ -19,6 +19,9 @@ thiserror.workspace = true
 log.workspace = true
 parking_lot.workspace = true
 blake3.workspace = true
+uuid.workspace = true
+ed25519-dalek.workspace = true
+base64.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

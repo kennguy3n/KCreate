@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Node Tree</title>
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self' file:; script-src 'self' file:; style-src 'self' file: 'unsafe-inline'; connect-src 'none'; object-src 'none'; base-uri 'self'; form-action 'none'"
+    />
+    <style>
+      :root {
+        color-scheme: dark;
+      }
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+        font-family:
+          system-ui,
+          -apple-system,
+          "Segoe UI",
+          sans-serif;
+        font-size: 12px;
+        background: #1e1e1e;
+        color: #d8d8d8;
+        height: 100%;
+      }
+      header {
+        padding: 10px 12px 6px;
+        font-weight: 600;
+        font-size: 11px;
+        text-transform: uppercase;
+        letter-spacing: 0.06em;
+        color: #8a8a8a;
+        border-bottom: 1px solid #2a2a2a;
+      }
+      main {
+        padding: 8px 12px 16px;
+        height: calc(100% - 38px);
+        overflow: auto;
+      }
+      ul {
+        list-style: none;
+        margin: 0;
+        padding: 0 0 0 12px;
+      }
+      li {
+        line-height: 1.5;
+      }
+      .id {
+        color: #6b8eff;
+        font-family: ui-monospace, "SF Mono", Consolas, monospace;
+        font-size: 11px;
+      }
+      .empty,
+      .error {
+        padding: 8px 0;
+        color: #8a8a8a;
+        font-style: italic;
+      }
+      .error {
+        color: #ff8a80;
+      }
+      button {
+        margin-top: 12px;
+        padding: 4px 10px;
+        background: #2d2d2d;
+        color: #d8d8d8;
+        border: 1px solid #3a3a3a;
+        border-radius: 4px;
+        cursor: pointer;
+      }
+      button:hover {
+        background: #3a3a3a;
+      }
+    </style>
+  </head>
+  <body>
+    <header>Node Tree</header>
+    <main>
+      <div id="tree" class="empty">loading…</div>
+      <button id="refresh" type="button">Refresh</button>
+    </main>
+    <script src="./panel.js"></script>
+  </body>
+</html>

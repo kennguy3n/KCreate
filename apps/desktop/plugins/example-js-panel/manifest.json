@@ -1,0 +1,18 @@
+{
+  "id": "example-js-panel",
+  "name": "Example JS Panel",
+  "version": "0.1.0",
+  "author": "kcreate",
+  "description": "Minimal sandboxed JS panel example. Mounts in the right sidebar, calls kcreate_read_document with a list_nodes query, and renders the result as a tree.",
+  "type": "js_panel",
+  "entry_point": "panel.html",
+  "permissions": ["read_document"],
+  "js_panel": {
+    "entry_html": "panel.html",
+    "panel_title": "Node Tree",
+    "panel_position": "right_sidebar",
+    "width": 320,
+    "height": 480,
+    "permissions": ["read_document"]
+  }
+}

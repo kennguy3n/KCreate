@@ -297,6 +297,24 @@ export interface DocumentStatus {
 }
 
 /**
+ * Outcome of a successful `documentUndo` / `documentRedo` round-trip.
+ *
+ * Mirrors `crates/kcreate_bridge/src/document.rs::UndoRedoOutcome`.
+ * The `command` is the stable `Operation::command` string (e.g.
+ * `"color_settings_update"`, `"document_update_node"`) — the host
+ * uses it to gate per-operation broadcasts so an undo of an
+ * unrelated op (a `move_node`, say) doesn't fire the
+ * `kcreate/color/settings/changed` event and trigger a needless
+ * `SoftProofOverlay` re-render. `affectedNodes` is the list of node
+ * ids the operation touched, empty for non-graph ops like
+ * `color_settings_update`.
+ */
+export interface UndoRedoOutcome {
+  command: string;
+  affectedNodes: string[];
+}
+
+/**
  * Mirror of `kcreate_export::code_gen::InspectCode`. Each field is
  * a copy-paste-ready snippet describing one rendering target's
  * style for the selected node.
@@ -360,8 +378,8 @@ export interface DocumentBridge {
   ): Promise<string>;
   updateNode(nodeId: string, changes: UpdateNodeProps): Promise<void>;
   deleteNode(nodeId: string): Promise<void>;
-  undo(): Promise<string[] | null>;
-  redo(): Promise<string[] | null>;
+  undo(): Promise<UndoRedoOutcome | null>;
+  redo(): Promise<UndoRedoOutcome | null>;
 
   /**
    * Snapshot of the open document's editing state, or `null` if no
@@ -1261,6 +1279,28 @@ export interface ModelPack {
   sizeBytes: number;
   filePath: string;
   installed: boolean;
+  /// Canonical out-of-band download URL. KCreate never fetches this
+  /// itself — the user downloads the weights and points the
+  /// installer at the file. Empty for built-in packs.
+  downloadUrl: string;
+  /// Hex-encoded SHA-256 of the canonical weights. Empty when the
+  /// registry hasn't pinned a hash yet — see the comment on the
+  /// Rust mirror at `crates/kcreate_ai/src/model_registry.rs`.
+  sha256: string;
+}
+
+/// Result of a successful `aiModel.install()` call. Mirrors
+/// `kcreate_ai::model_registry::InstallReport`.
+export interface ModelInstallReport {
+  packId: string;
+  /// Hex-encoded SHA-256 of the bytes actually written into
+  /// `models_dir`.
+  actualSha256: string;
+  /// `true` iff the registry carried a non-empty canonical hash and
+  /// it matched the source file. `false` means the file installed
+  /// but couldn't be cross-checked against a canonical hash.
+  verified: boolean;
+  sizeBytes: number;
 }
 
 export type ScreenshotElementType =
@@ -1306,7 +1346,51 @@ export interface AiModelBridge {
     tolerance: number,
   ): Promise<string>;
   listModelPacks(): Promise<ModelPack[]>;
+  /// Open the native file picker scoped to weights files and return
+  /// the chosen absolute path (or `null` if the user cancelled).
+  pickModelFile(): Promise<string | null>;
+  /// Install a model pack from a user-provided source file. The
+  /// install is atomic — partial writes never land in the models
+  /// directory.
+  installModelPack(
+    packId: string,
+    sourcePath: string,
+  ): Promise<ModelInstallReport>;
+  /// Uninstall a model pack by deleting its file. Idempotent.
+  uninstallModelPack(packId: string): Promise<void>;
   screenshotToLayout(request: ScreenshotRequest): Promise<ScreenshotElement[]>;
+}
+
+/// Result of [`PdfImportBridge.importPdf`] mirroring
+/// `kcreate_bridge::phase2::PdfImportReport`.
+export interface PdfImportReport {
+  /// `/Info /Title` from the PDF, if present.
+  title: string | null;
+  /// `/Info /Author` from the PDF, if present.
+  author: string | null;
+  /// New KCreate page ids in import order. The renderer can jump
+  /// to `pageIds[0]` to focus the first imported page.
+  pageIds: string[];
+  /// Successfully extracted image count across all pages.
+  imagesImported: number;
+  /// Skipped image count (unsupported filter / color space).
+  imagesSkipped: number;
+  /// Human-readable, non-fatal warnings the renderer should
+  /// surface (e.g. "Page 3: unsupported image filter (JPXDecode)").
+  warnings: string[];
+}
+
+/// Renderer-facing PDF import API. The picker is a thin wrapper
+/// over Electron's `dialog.showOpenDialog`, kept in the main
+/// process so renderer code never touches the filesystem directly.
+export interface PdfImportBridge {
+  /// Show an Electron file picker scoped to `.pdf` and return the
+  /// chosen absolute path, or `null` if the user cancelled.
+  pickFile(): Promise<string | null>;
+  /// Import the PDF at `filePath` into the current project. One
+  /// new Page per PDF page, with embedded images as RasterLayer
+  /// children and extracted text as a TextLayer per page.
+  importPdf(filePath: string): Promise<PdfImportReport>;
 }
 
 export type PluginType = "wasm" | "js_panel" | "native";
@@ -1318,6 +1402,25 @@ export type PluginPermission =
   | "export_files"
   | "network_access";
 
+export type PanelPosition =
+  | "right_sidebar"
+  | "bottom_panel"
+  | "floating_window";
+
+/**
+ * JS-panel-specific config carried alongside the standard manifest
+ * fields when `type === "js_panel"`. Required for that type; absent
+ * for WASM / native plugins.
+ */
+export interface JsPanelConfig {
+  entry_html: string;
+  panel_title: string;
+  panel_position: PanelPosition;
+  width: number;
+  height: number;
+  permissions: PluginPermission[];
+}
+
 export interface PluginManifest {
   id: string;
   name: string;
@@ -1328,25 +1431,166 @@ export interface PluginManifest {
   type: PluginType;
   entry_point: string;
   permissions: PluginPermission[];
+  /** Present only when `type === "js_panel"`. */
+  js_panel?: JsPanelConfig;
 }
+
+/**
+ * Outcome of the host's last verification of a plugin's optional
+ * `manifest.json.sig` sidecar. Mirrors
+ * `kcreate_plugin::SignatureStatus` (tagged union, snake_case
+ * variants).
+ *
+ * Invariant: only **non-native** plugins can carry `invalid` — the
+ * registry refuses to load native plugins in any state other than
+ * `verified`, so they will never appear with `invalid` or
+ * `unsigned` in `pluginList()` output.
+ */
+export type PluginSignatureStatus =
+  | { status: "unsigned" }
+  | { status: "verified"; key_id: string }
+  | { status: "invalid"; key_id: string; reason: string };
 
 /**
  * Plugin list entry — the manifest fields are flattened to the
  * top-level object on the wire (via `#[serde(flatten)]`), so the JSON
- * has the manifest fields *and* `enabled` side-by-side.
+ * has the manifest fields *and* `enabled` / `signature` side-by-side.
  */
-export type PluginListEntry = PluginManifest & { enabled: boolean };
+export type PluginListEntry = PluginManifest & {
+  enabled: boolean;
+  signature: PluginSignatureStatus;
+};
+
+/**
+ * A single trusted Ed25519 public key loaded from
+ * `~/.kcreate/plugins/trusted_keys.json`. The UI's
+ * "Trusted Authorities" list renders one row per entry.
+ */
+export interface TrustedKeyInfo {
+  /** Stable identifier the manifest sidecar references via `key_id`. */
+  keyId: string;
+  /** Free-form human label. */
+  comment: string;
+}
 
 export interface PluginExecuteResult {
   output: string;
   logs: string[];
 }
 
+/**
+ * Outcome of a single proposal validated and (when accepted) applied
+ * by `plugin_execute_with_context`. The `status` discriminator
+ * matches `phase2::ProposalOutcome`'s serde tag.
+ */
+export type PluginProposalReport =
+  | {
+      type: "create_node";
+      parent_id: string;
+      node_type: string;
+      props: unknown;
+      outcome: { status: "applied"; node_id: string } | { status: "rejected"; reason: string };
+    }
+  | {
+      type: "update_node";
+      node_id: string;
+      changes: unknown;
+      outcome: { status: "applied"; node_id: string } | { status: "rejected"; reason: string };
+    }
+  | {
+      type: "delete_node";
+      node_id: string;
+      outcome: { status: "applied"; node_id: string } | { status: "rejected"; reason: string };
+    };
+
+/**
+ * Extended-ABI execution result: same as the basic
+ * `PluginExecuteResult` but with the proposal outcomes the host
+ * applied.
+ */
+export interface PluginExecuteWithContextResult extends PluginExecuteResult {
+  proposals: PluginProposalReport[];
+}
+
+/**
+ * Description of an installed JS panel plugin returned by
+ * `plugin_js_list()`. The Electron host uses these to decide which
+ * sandboxed `BrowserView` instances to mount and where.
+ */
+export interface JsPanelInfo {
+  id: string;
+  name: string;
+  version: string;
+  config: JsPanelConfig;
+  enabled: boolean;
+}
+
+/**
+ * Single message ferried between a JS panel and the bridge. The
+ * `type` discriminator matches `kcreate_plugin::JsPanelMessage`.
+ */
+export type JsPanelMessage =
+  | { type: "read_document"; query: unknown }
+  | { type: "write_proposal"; proposal: unknown }
+  | { type: "log"; message: string };
+
+/**
+ * Outcome of a `JsPanelMessage`. The Electron host returns this to
+ * the panel via `postMessage` so the panel can update its UI.
+ */
+export type JsPanelMessageOutcome =
+  | { status: "ok"; result: unknown }
+  | { status: "denied"; permission: PluginPermission }
+  | { status: "invalid"; reason: string };
+
 export interface PluginBridge {
   list(): Promise<PluginListEntry[]>;
   enable(id: string): Promise<void>;
   disable(id: string): Promise<void>;
   execute(id: string, fn: string, input: string): Promise<PluginExecuteResult>;
+  /**
+   * Extended-ABI execution: builds a `PluginContext` with the current
+   * document snapshot and the plugin's manifest permissions, runs the
+   * plugin, then validates and applies any proposals it produced.
+   */
+  executeWithContext(
+    id: string,
+    fn: string,
+    input: string,
+  ): Promise<PluginExecuteWithContextResult>;
+  /** List installed JS panel plugins for the Electron host. */
+  jsList(): Promise<JsPanelInfo[]>;
+  /**
+   * Validate and dispatch a single message from a sandboxed JS panel.
+   * The Electron host calls this for every inbound `postMessage`.
+   */
+  jsMessage(pluginId: string, message: JsPanelMessage): Promise<JsPanelMessageOutcome>;
+  /**
+   * Ask the Electron host to mount a sandboxed `WebContentsView` for
+   * the named plugin. Bounds are in CSS pixels relative to the main
+   * window content area. If the panel is already mounted, the bounds
+   * are updated in place. Throws if the plugin id is unknown or not
+   * a `js_panel` plugin.
+   */
+  jsOpen(pluginId: string, bounds: { x: number; y: number; width: number; height: number }): Promise<void>;
+  /** Update the bounds of an already-mounted panel. No-op if not mounted. */
+  jsSetBounds(
+    pluginId: string,
+    bounds: { x: number; y: number; width: number; height: number },
+  ): Promise<void>;
+  /** Tear down the panel for `pluginId` if mounted; no-op otherwise. */
+  jsClose(pluginId: string): Promise<void>;
+  /**
+   * Snapshot of trusted plugin-signing public keys. The UI's
+   * "Trusted Authorities" list calls this on mount.
+   */
+  trustList(): Promise<TrustedKeyInfo[]>;
+  /**
+   * Re-read `trusted_keys.json` from disk and rescan plugins so any
+   * previously-rejected native plugin gets a second chance once a
+   * matching key is added.
+   */
+  trustReload(): Promise<void>;
 }
 
 export type McpPermissionGrant = "once" | "always" | "denied";
@@ -1374,6 +1618,190 @@ export interface McpPermissionBridge {
   status(): Promise<McpStatus>;
 }
 
+// ---------------------------------------------------------------------------
+// Phase 2 — Color management (CMYK / ICC foundation).
+// ---------------------------------------------------------------------------
+
+/// Color-space taxonomy for custom ICC profiles. Mirrors
+/// `kcreate_core::color::IccColorSpace`. Determines whether a
+/// `Custom` profile activates the CMYK export pipeline, the
+/// grayscale path, or stays in the RGB working space. Required so
+/// `IccProfile.is_cmyk` returns the right answer for custom press
+/// profiles instead of silently falling back to RGB.
+export type IccColorSpace = "Rgb" | "Cmyk" | "Gray" | "Lab";
+
+/// Well-known ICC profile identifiers + opt-in custom profile slot.
+/// Mirrors `kcreate_core::color::IccProfile`. Custom profiles store a
+/// human label, the BLAKE3 hash of the profile blob in the
+/// content-addressed asset store, and the device color space the
+/// profile targets. The `color_space` field is optional on the wire
+/// for forward-compat with projects authored before it existed; the
+/// Rust side defaults it to `Rgb`.
+export type IccProfile =
+  | "SrgbIec61966"
+  | "AdobeRgb1998"
+  | "DisplayP3"
+  | "FogRa39"
+  | "Swop2006"
+  | {
+      Custom: {
+        name: string;
+        blob_hash: string;
+        color_space?: IccColorSpace;
+      };
+    };
+
+/// Rendering intent for gamut mapping. Mirrors
+/// `kcreate_core::color::RenderingIntent`.
+export type RenderingIntent =
+  | "Perceptual"
+  | "RelativeColorimetric"
+  | "Saturation"
+  | "AbsoluteColorimetric";
+
+/// A color value in one of the supported color spaces. Mirrors
+/// `kcreate_core::color::Color`. The tagged-enum wire format is
+/// generated by `serde` so JSON looks like
+/// `{ "Srgb": { "r": 1, "g": 0, "b": 0, "a": 1 } }`.
+///
+/// Distinct from the legacy `Color` RGBA tuple used by the renderer's
+/// scene wire format (line 7); this richer enum is only for the Phase 2
+/// color-management bridge so it can preserve CMYK / Lab / HSL on the
+/// way to / from print export.
+export type ColorValue =
+  | { Srgb: { r: number; g: number; b: number; a: number } }
+  | { Cmyk: { c: number; m: number; y: number; k: number; a: number } }
+  | { Lab: { l: number; a_star: number; b_star: number; alpha: number } }
+  | { Hsl: { h: number; s: number; l: number; a: number } };
+
+/// Document-level color management settings. Mirrors
+/// `kcreate_core::color::ColorSettings`. `working_space_cmyk` of
+/// `null` means "no CMYK conversion until the user opts in"; setting
+/// it to `FogRa39` / `Swop2006` / a custom profile activates the
+/// CMYK PDF export pipeline.
+export interface ColorSettings {
+  working_space_rgb: IccProfile;
+  working_space_cmyk: IccProfile | null;
+  rendering_intent: RenderingIntent;
+  soft_proof_profile: IccProfile | null;
+  gamut_warning: boolean;
+}
+
+export type ColorSpaceName = "srgb" | "cmyk" | "lab" | "hsl";
+
+export interface ColorBridge {
+  /// Read the document's current color settings.
+  getSettings(): Promise<ColorSettings>;
+  /// Replace the document's color settings. Records an undoable
+  /// `color_settings_update` operation; the bridge owns the
+  /// inverse-patch dispatch so `documentUndo()` actually restores
+  /// the previous settings (Phase 2 PR #7).
+  updateSettings(settings: ColorSettings): Promise<void>;
+  /// Convert a color value into the given color space. Cmyk → Cmyk
+  /// short-circuits so authored K-channel data survives round trips.
+  convert(color: ColorValue, toSpace: ColorSpaceName): Promise<ColorValue>;
+  /// Push-channel subscription that fires whenever
+  /// `ws.project.color_settings` mutates: direct updates and undo /
+  /// redo of a `color_settings_update` operation both notify here.
+  /// The callback receives no payload — call `getSettings()` to read
+  /// the new shape. Returns an unsubscribe function for effect
+  /// cleanup. Replaces the previous 2-second polling fallback that
+  /// `SoftProofOverlay` relied on before the bridge gained push
+  /// semantics.
+  onSettingsChanged(callback: () => void): () => void;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2 — Text frame + OpenType (Block B Tasks 7, 10, 11).
+//
+// The wire format mirrors `kcreate_core::node::TextFrameOptions`,
+// `kcreate_core::node::OpenTypeFeatures` and the `TextLayoutWire` JSON
+// returned by `phase2::text_layout_compute`. Adding a field on either
+// side requires adding it here too — rule 4 of AGENTS.md.
+// ---------------------------------------------------------------------------
+
+// All four enums use `#[serde(rename_all = "snake_case")]` on the Rust
+// side, so the wire values are lowercase / underscore-separated.
+export type TextOverflow = "clip" | "ellipsis" | "overflow";
+export type TextWrapMode = "none" | "bounding_box" | "contour";
+export type VerticalAlign = "top" | "middle" | "bottom";
+export type TextAutoSize = "fixed" | "height_auto" | "width_and_height_auto";
+
+/// Per-side text-frame inset, in document units (points by default).
+export interface FrameInsets {
+  top: number;
+  right: number;
+  bottom: number;
+  left: number;
+}
+
+export interface TextFrameOptions {
+  overflow: TextOverflow;
+  columns: number;
+  column_gap: number;
+  wrap_mode: TextWrapMode;
+  hyphenation: boolean;
+  /// BCP-47 language tag, e.g. `"en-US"`, `"de-DE"`. Hyphenation
+  /// patterns ship for `en-US` only; other languages fall through
+  /// to no-hyphenation until additional `.pat` files are bundled.
+  hyphenation_language: string;
+  vertical_alignment: VerticalAlign;
+  inset: FrameInsets;
+  auto_size: TextAutoSize;
+}
+
+/// OpenType feature toggles. `stylistic_sets` is a sparse list of
+/// 1..=20 indices (ss01..=ss20); other indices are silently dropped
+/// by the Rust encoder. See `kcreate_text::opentype_features_to_buzz`.
+export interface OpenTypeFeatures {
+  ligatures: boolean;
+  contextual_alternates: boolean;
+  kerning: boolean;
+  small_caps: boolean;
+  old_style_figures: boolean;
+  tabular_figures: boolean;
+  stylistic_sets: number[];
+  fractions: boolean;
+  ordinals: boolean;
+}
+
+/// One line of a paragraph layout. Wire payload returned by
+/// `text_layout_compute`. The renderer doesn't redraw glyphs from
+/// this — it's strictly for the inspector / debug overlay (line
+/// boundaries, column boundaries, overflow indication).
+export interface TextLayoutLineWire {
+  originX: number;
+  baselineY: number;
+  width: number;
+  column: number;
+  glyphCount: number;
+}
+
+export interface TextLayoutWire {
+  lines: TextLayoutLineWire[];
+  overflow: boolean;
+  usedHeight: number;
+}
+
+export interface TextFrameBridge {
+  /// Read the text-frame options for a `TextLayer` node.
+  get(nodeId: string): Promise<TextFrameOptions>;
+  /// Replace the text-frame options. Records an undoable
+  /// `text_frame_update` operation.
+  update(nodeId: string, options: TextFrameOptions): Promise<void>;
+  /// Compute the paragraph layout (line origins, baselines, columns,
+  /// overflow flag) without recording an operation.
+  computeLayout(nodeId: string): Promise<TextLayoutWire>;
+  /// Read the OpenType feature toggles for a `TextLayer` node.
+  getOpenTypeFeatures(nodeId: string): Promise<OpenTypeFeatures>;
+  /// Replace the OpenType feature toggles. Records an undoable
+  /// `text_opentype_features_update` operation.
+  updateOpenTypeFeatures(
+    nodeId: string,
+    features: OpenTypeFeatures,
+  ): Promise<void>;
+}
+
 declare global {
   interface Window {
     kcreate: {
@@ -1398,8 +1826,11 @@ declare global {
       iconPack: IconPackBridge;
       batch: BatchBridge;
       aiModel: AiModelBridge;
+      pdfImport: PdfImportBridge;
       plugin: PluginBridge;
       mcpPermission: McpPermissionBridge;
+      color: ColorBridge;
+      textFrame: TextFrameBridge;
     };
   }
 }

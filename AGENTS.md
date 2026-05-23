@@ -46,9 +46,23 @@ KCreate/
 │   │                        Once / Always / Denied, JSON on-disk)
 │   ├── kcreate_plugin/      WASM plugin sandbox (wasmi 0.42, deny-by-default
 │   │                        host ABI: kcreate_log, kcreate_get_input{,_len},
-│   │                        kcreate_set_output; page-count ResourceLimiter;
-│   │                        no FS / network / DOM access). manifest +
-│   │                        registry persist enabled state to JSON.
+│   │                        kcreate_set_output, plus the Phase 2 extended
+│   │                        ABI: kcreate_read_document, kcreate_read_asset,
+│   │                        kcreate_write_proposal). Page-count
+│   │                        ResourceLimiter; no FS / network / DOM access.
+│   │                        Manifest + registry persist enabled state to
+│   │                        JSON. Ed25519 manifest signing + JS panel
+│   │                        runtime live here too (Phase 2 PR #7).
+│   ├── kcreate_collab/      Phase 3 collaboration protocol foundation
+│   │                        (peer identity, Lamport clock, Ed25519-signed
+│   │                        envelopes, Hello/Welcome/Op/Presence/Heartbeat/
+│   │                        Goodbye messages, LWW conflict resolver,
+│   │                        ProjectSession w/ per-peer nonce replay window).
+│   │                        Transport-agnostic; deliberately OUT of the
+│   │                        editing-path dependency tree so a future
+│   │                        transport (QUIC + mDNS) can pull in network
+│   │                        crates without breaking the local-first
+│   │                        sentinel.
 │   └── kcreate_tests/       cross-crate integration tests (no library
 │                            surface — see tests/ subdir)
 ├── apps/
@@ -177,6 +191,14 @@ pnpm lint
 | Screenshot-to-layout                     | `crates/kcreate_ai/src/screenshot_to_layout.rs`    |
 | Plugin manifest / registry               | `crates/kcreate_plugin/src/{manifest,registry}.rs` |
 | WASM plugin execution                    | `crates/kcreate_plugin/src/wasm_runtime.rs`        |
+| Plugin signing (Ed25519)                 | `crates/kcreate_plugin/src/trust.rs` (+ `PluginSignature` in `manifest.rs`) |
+| PDF import (Phase 2 PR #7)               | `crates/kcreate_export/src/pdf_import.rs`          |
+| Collaboration protocol — peer identity   | `crates/kcreate_collab/src/peer.rs`                |
+| Collaboration protocol — Lamport clock   | `crates/kcreate_collab/src/clock.rs`               |
+| Collaboration protocol — signed envelopes| `crates/kcreate_collab/src/envelope.rs`            |
+| Collaboration protocol — message variants| `crates/kcreate_collab/src/message.rs`             |
+| Collaboration protocol — conflict resolve| `crates/kcreate_collab/src/conflict.rs`            |
+| Collaboration protocol — session state   | `crates/kcreate_collab/src/session.rs`             |
 | MCP permissions                          | `crates/kcreate_mcp/src/permissions.rs`            |
 | Phase 2 N-API marshalling                | thin wrapper in `kcreate_bridge/src/lib.rs`, logic in `phase2.rs` |
 | PreflightPanel                           | `apps/desktop/renderer/src/components/PreflightPanel.tsx` |

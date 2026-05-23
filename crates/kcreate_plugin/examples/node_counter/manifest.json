@@ -1,0 +1,10 @@
+{
+  "id": "node-counter",
+  "name": "Node Counter",
+  "version": "0.1.0",
+  "author": "kcreate",
+  "description": "Demonstrates the extended ABI: calls kcreate_read_document with a list_nodes query and pipes the resulting JSON array through to the plugin output. The renderer is expected to JSON.parse(output).length to get the node count.",
+  "type": "wasm",
+  "entry_point": "node_counter.wasm",
+  "permissions": ["read_document"]
+}

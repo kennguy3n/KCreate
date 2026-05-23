@@ -455,6 +455,7 @@ pub fn project_open(dir: &Path) -> Result<ProjectInfo> {
     project.brand_kits = store.load_brand_kits()?;
     project.export_presets = store.load_export_presets()?;
     project.components = store.load_components()?;
+    project.color_settings = store.load_color_settings()?;
     // Restore the operation log from disk so undo survives close+reopen.
     let max_depth = project.operation_log.max_depth();
     let history = store.load_operations(max_depth)?;
@@ -510,6 +511,7 @@ pub fn project_save() -> Result<()> {
     // stable. Brand kits / presets are upserted by id; the design
     // tokens table holds a single row keyed on `'current'`.
     ws.store.save_design_tokens(&ws.project.design_tokens)?;
+    ws.store.save_color_settings(&ws.project.color_settings)?;
     for kit in &ws.project.brand_kits {
         ws.store.save_brand_kit(kit)?;
     }
@@ -978,32 +980,189 @@ pub fn document_record_operation(operation: Operation) -> Result<()> {
     Ok(())
 }
 
-/// Undo the most recent operation. Returns the affected node ids of
-/// the rolled-back operation, or `None` if the undo stack is empty.
+/// Outcome of a successful undo / redo.
 ///
-/// Only moves the log cursor — the host applies `before_patch` to
-/// its in-memory state. See [`kcreate_core::project::Project::undo`]
-/// for the contract.
-pub fn document_undo() -> Result<Option<Vec<Uuid>>> {
-    let mut guard = slot().lock();
-    let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
-    let affected = ws.project.undo().map(|op| op.affected_nodes);
-    drop(guard);
-    Ok(affected)
+/// Carries both the affected node ids (so the renderer can refresh the
+/// view) and the operation `command` string. The host uses `command`
+/// to gate side-effect broadcasts that are only meaningful for
+/// specific operation kinds — for example, `color_settings_update`
+/// fires `kcreate/color/settings/changed`, but a `move_node` does not.
+/// Returning the command at the bridge boundary keeps that gating
+/// logic in TypeScript next to the IPC channel it controls, instead
+/// of pushing every per-op broadcast into Rust.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct UndoRedoOutcome {
+    /// The `Operation::command` string from the operation that was
+    /// rolled back / re-applied. Stable wire identifier; e.g.
+    /// `"color_settings_update"`, `"text_frame_update"`,
+    /// `"document_update_node"`.
+    pub command: String,
+    /// The `Operation::affected_nodes` list. Empty for non-graph
+    /// operations (e.g. `color_settings_update`).
+    pub affected_nodes: Vec<Uuid>,
 }
 
-/// Redo the next operation. Returns the affected node ids of the
-/// re-applied operation, or `None` if the redo stack is empty.
+/// Undo the most recent operation.
 ///
-/// Only moves the log cursor — the host applies `after_patch` to its
-/// in-memory state. See [`kcreate_core::project::Project::undo`] for
-/// the contract.
-pub fn document_redo() -> Result<Option<Vec<Uuid>>> {
+/// Returns:
+/// * `Ok(Some(outcome))` when the undo stack is non-empty AND the
+///   inverse patch was applied successfully — `outcome.command` is the
+///   operation's command string, `outcome.affected_nodes` the impacted
+///   nodes.
+/// * `Ok(None)` when the undo stack is empty.
+/// * `Err(_)` when the inverse patch failed (e.g. corrupted log,
+///   missing node). The log cursor is **not** advanced in this case
+///   — the next `document_undo()` retries the same operation.
+///
+/// # Atomicity
+///
+/// The bridge peeks the pending operation via
+/// [`Project::pending_undo`] and applies `before_patch` against the
+/// workspace *first*; only on success does it call [`Project::undo`]
+/// to commit the cursor move. This prevents the split-brain state
+/// where the log cursor advances but the workspace patch fails,
+/// which would otherwise silently drop a user's undoable operation
+/// (Devin Review BUG / PR #7).
+///
+/// For non-graph operations recorded by the Phase 2 panels
+/// ([`color_settings_update`], [`text_frame_update`],
+/// [`text_opentype_features_update`]) the bridge replays `before_patch`
+/// onto the workspace itself so the in-memory state actually reverts.
+/// For graph-mutating operations (node create / update / delete,
+/// reparent, …) the existing host-driven contract still applies — the
+/// renderer is expected to fold `before_patch` back into its view via
+/// the standard mutate-then-record entry points, mirroring the
+/// snapshot stored in [`kcreate_core::project::Project::undo`].
+///
+/// [`color_settings_update`]: crate::phase2::color_settings_update
+/// [`text_frame_update`]: crate::phase2::text_frame_update
+/// [`text_opentype_features_update`]: crate::phase2::text_opentype_features_update
+pub fn document_undo() -> Result<Option<UndoRedoOutcome>> {
     let mut guard = slot().lock();
     let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
-    let affected = ws.project.redo().map(|op| op.affected_nodes);
+    let Some(op) = ws.project.pending_undo() else {
+        return Ok(None);
+    };
+    // Apply the inverse patch FIRST. Only commit the cursor move
+    // if it succeeds — otherwise the log and workspace would split.
+    apply_inverse_patch(ws, &op)?;
+    let committed = ws
+        .project
+        .undo()
+        .expect("pending_undo returned Some, so undo cannot return None on the same lock");
     drop(guard);
-    Ok(affected)
+    Ok(Some(UndoRedoOutcome {
+        command: committed.command,
+        affected_nodes: committed.affected_nodes,
+    }))
+}
+
+/// Redo the next operation.
+///
+/// Returns:
+/// * `Ok(Some(outcome))` when the redo stack is non-empty AND the
+///   forward patch was applied successfully.
+/// * `Ok(None)` when the redo stack is empty.
+/// * `Err(_)` when the forward patch failed. The log cursor is **not**
+///   advanced in this case.
+///
+/// Atomicity is symmetric with [`document_undo`]: the bridge peeks via
+/// [`Project::pending_redo`], applies `after_patch` first, and only
+/// commits via [`Project::redo`] on success.
+///
+/// For Phase 2 non-graph operations the bridge re-applies
+/// `after_patch` to the workspace itself; for graph-mutating
+/// operations the host-driven contract still applies.
+pub fn document_redo() -> Result<Option<UndoRedoOutcome>> {
+    let mut guard = slot().lock();
+    let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
+    let Some(op) = ws.project.pending_redo() else {
+        return Ok(None);
+    };
+    apply_forward_patch(ws, &op)?;
+    let committed = ws
+        .project
+        .redo()
+        .expect("pending_redo returned Some, so redo cannot return None on the same lock");
+    drop(guard);
+    Ok(Some(UndoRedoOutcome {
+        command: committed.command,
+        affected_nodes: committed.affected_nodes,
+    }))
+}
+
+/// Walk `op.before_patch` into workspace state for the non-graph
+/// operations recorded by Phase 2 panels.
+///
+/// Returns `Ok(())` for every other command kind — graph mutations
+/// (`document_create_node` / `_update` / `_delete`, `document_reparent`,
+/// `canvas_move_node`, …) keep the legacy host-driven undo contract
+/// where the renderer is responsible for folding `before_patch` back
+/// into the view. We deliberately do not silently `Err` on unknown
+/// commands here so the cursor-only undo semantics that the rest of
+/// the workspace relies on continue to function.
+fn apply_inverse_patch(ws: &mut Workspace, op: &Operation) -> Result<()> {
+    apply_patch(ws, op, &op.before_patch)
+}
+
+/// Walk `op.after_patch` into workspace state for the non-graph
+/// operations recorded by Phase 2 panels. See [`apply_inverse_patch`]
+/// for the broader contract.
+fn apply_forward_patch(ws: &mut Workspace, op: &Operation) -> Result<()> {
+    apply_patch(ws, op, &op.after_patch)
+}
+
+fn apply_patch(ws: &mut Workspace, op: &Operation, patch: &serde_json::Value) -> Result<()> {
+    // `project.undo()` / `project.redo()` already bumped
+    // `modified_at` before we got here, so we don't need to touch it
+    // again — just walk the patch into the live state.
+    match op.command.as_str() {
+        "color_settings_update" => {
+            let settings: kcreate_core::color::ColorSettings =
+                serde_json::from_value(patch.clone())?;
+            ws.project.color_settings = settings;
+            Ok(())
+        }
+        "text_frame_update" => {
+            let id = op.affected_nodes.first().copied().ok_or_else(|| {
+                DocumentBridgeError::InvalidArgument {
+                    argument: "affected_nodes".into(),
+                    value: format!("text_frame_update operation {} has no affected node", op.id),
+                }
+            })?;
+            let options: kcreate_core::node::TextFrameOptions =
+                serde_json::from_value(patch.clone())?;
+            let node = ws
+                .project
+                .document
+                .get_node_mut(id)
+                .ok_or(DocumentBridgeError::NodeNotFound(id))?;
+            node.set_text_frame_options(&options);
+            Ok(())
+        }
+        "text_opentype_features_update" => {
+            let id = op.affected_nodes.first().copied().ok_or_else(|| {
+                DocumentBridgeError::InvalidArgument {
+                    argument: "affected_nodes".into(),
+                    value: format!(
+                        "text_opentype_features_update operation {} has no affected node",
+                        op.id
+                    ),
+                }
+            })?;
+            let features: kcreate_core::node::OpenTypeFeatures =
+                serde_json::from_value(patch.clone())?;
+            let node = ws
+                .project
+                .document
+                .get_node_mut(id)
+                .ok_or(DocumentBridgeError::NodeNotFound(id))?;
+            node.set_opentype_features(&features);
+            Ok(())
+        }
+        _ => Ok(()),
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -3129,6 +3288,12 @@ pub struct PdfExportRequest {
     pub height_mm: f64,
     #[serde(default)]
     pub title: Option<String>,
+    /// Output color mode: `"rgb"` (default), `"cmyk"`, or
+    /// `"passThrough"`. When omitted, the document's
+    /// `color_settings.working_space_cmyk` chooses CMYK iff a CMYK
+    /// working space is set; otherwise RGB.
+    #[serde(default)]
+    pub color_mode: Option<String>,
 }
 
 /// Render the open document to PDF. Returns the number of bytes written.
@@ -3165,6 +3330,28 @@ pub fn export_pdf_file(output_path: &Path, options: &PdfExportRequest) -> Result
             rasters.insert(meta.blob_hash, pixels);
         }
     }
+    let resolved_color_mode = match options.color_mode.as_deref() {
+        Some("rgb" | "Rgb") => kcreate_export::pdf::PdfColorMode::Rgb,
+        Some("cmyk" | "Cmyk" | "CMYK") => kcreate_export::pdf::PdfColorMode::Cmyk,
+        Some("passThrough" | "pass_through" | "PassThrough") => {
+            kcreate_export::pdf::PdfColorMode::PassThrough
+        }
+        Some(other) => {
+            return Err(DocumentBridgeError::InvalidArgument {
+                argument: "color_mode".into(),
+                value: other.to_string(),
+            });
+        }
+        None => {
+            // Auto-pick from the document's color settings: a CMYK
+            // working space implies the user wants a print-bound PDF.
+            if ws.project.color_settings.working_space_cmyk.is_some() {
+                kcreate_export::pdf::PdfColorMode::Cmyk
+            } else {
+                kcreate_export::pdf::PdfColorMode::Rgb
+            }
+        }
+    };
     let opts = kcreate_export::pdf::PdfExportOptions {
         width_mm: options.width_mm,
         height_mm: options.height_mm,
@@ -3172,6 +3359,7 @@ pub fn export_pdf_file(output_path: &Path, options: &PdfExportRequest) -> Result
             .title
             .clone()
             .unwrap_or_else(|| ws.project.name.clone()),
+        color_mode: resolved_color_mode,
     };
     let bytes = kcreate_export::pdf::export_pdf_from_document(
         &ws.project.document,
@@ -5230,5 +5418,1080 @@ mod tests {
                 "parse_page_size should reject case-folded form {bad:?}"
             );
         }
+    }
+
+    // ---------------------------------------------------------------
+    // Phase 2 — color management bridge tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    #[serial]
+    fn color_settings_default_round_trips_through_get() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("cs", dir.path()).expect("create");
+
+        let raw = crate::phase2::color_settings_get().expect("get");
+        let parsed: kcreate_core::color::ColorSettings = serde_json::from_str(&raw).expect("parse");
+        assert_eq!(parsed, kcreate_core::color::ColorSettings::default());
+        project_close();
+    }
+
+    #[test]
+    #[serial]
+    fn color_settings_update_persists_across_close_reopen() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("cs", dir.path()).expect("create");
+
+        let new_settings = kcreate_core::color::ColorSettings {
+            working_space_rgb: kcreate_core::color::IccProfile::AdobeRgb1998,
+            working_space_cmyk: Some(kcreate_core::color::IccProfile::FogRa39),
+            rendering_intent: kcreate_core::color::RenderingIntent::RelativeColorimetric,
+            soft_proof_profile: Some(kcreate_core::color::IccProfile::Swop2006),
+            gamut_warning: true,
+        };
+        crate::phase2::color_settings_update(&serde_json::to_string(&new_settings).unwrap())
+            .expect("update");
+
+        project_save().expect("save");
+        project_close();
+        project_open(&dir.path().join("cs.kstudio")).expect("reopen");
+
+        let raw = crate::phase2::color_settings_get().expect("get after reopen");
+        let parsed: kcreate_core::color::ColorSettings =
+            serde_json::from_str(&raw).expect("parse after reopen");
+        assert_eq!(parsed, new_settings);
+        project_close();
+    }
+
+    #[test]
+    #[serial]
+    fn color_convert_srgb_to_cmyk_round_trip() {
+        reset_for_tests();
+        // Pure red sRGB → CMYK should pass through srgb_to_cmyk and
+        // come back with full magenta + yellow, zero cyan + black.
+        let red = kcreate_core::color::Color::Srgb {
+            r: 1.0,
+            g: 0.0,
+            b: 0.0,
+            a: 1.0,
+        };
+        let raw = crate::phase2::color_convert(&serde_json::to_string(&red).unwrap(), "cmyk")
+            .expect("convert");
+        let out: kcreate_core::color::Color = serde_json::from_str(&raw).expect("parse");
+        match out {
+            kcreate_core::color::Color::Cmyk { c, m, y, k, a } => {
+                assert!(c.abs() < 1e-5, "c should be 0, got {c}");
+                assert!((m - 1.0).abs() < 1e-5, "m should be 1, got {m}");
+                assert!((y - 1.0).abs() < 1e-5, "y should be 1, got {y}");
+                assert!(k.abs() < 1e-5, "k should be 0, got {k}");
+                assert!((a - 1.0).abs() < 1e-5);
+            }
+            other => panic!("expected Cmyk variant, got {other:?}"),
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn color_convert_preserves_authored_cmyk() {
+        // CMYK → CMYK must short-circuit so K-channel data survives.
+        // Round-tripping through sRGB would conflate (0, 0, 0, K=0.5)
+        // and (0.5, 0.5, 0.5, K=0) into the same RGB triplet, which
+        // is exactly what the print pipeline cannot tolerate.
+        let authored = kcreate_core::color::Color::Cmyk {
+            c: 0.1,
+            m: 0.2,
+            y: 0.3,
+            k: 0.5,
+            a: 1.0,
+        };
+        let raw = crate::phase2::color_convert(&serde_json::to_string(&authored).unwrap(), "cmyk")
+            .expect("convert");
+        let out: kcreate_core::color::Color = serde_json::from_str(&raw).expect("parse");
+        assert_eq!(out, authored);
+    }
+
+    #[test]
+    #[serial]
+    fn color_convert_preserves_authored_lab() {
+        // Lab → Lab must short-circuit because the sRGB connection
+        // space clamps each channel to `[0.0, 1.0]` in
+        // `xyz_d65_to_srgb`, which throws away out-of-gamut Lab values
+        // (think very saturated cyans, deep ProPhoto-only blues). The
+        // print and proofing pipelines rely on the original Lab
+        // triplet surviving the bridge.
+        let authored = kcreate_core::color::Color::Lab {
+            l: 50.0,
+            // Deliberately out-of-gamut for sRGB: this pushes
+            // `lab_to_srgb` past the [0,1] clamp on at least one
+            // channel.
+            a_star: 90.0,
+            b_star: -90.0,
+            alpha: 0.75,
+        };
+        let json = crate::phase2::color_convert(&serde_json::to_string(&authored).unwrap(), "lab")
+            .unwrap();
+        let out: kcreate_core::color::Color = serde_json::from_str(&json).unwrap();
+        assert_eq!(out, authored);
+    }
+
+    #[test]
+    #[serial]
+    fn color_convert_preserves_authored_hsl() {
+        // HSL → HSL must short-circuit because the round-trip through
+        // sRGB introduces float drift on the hue (atan2-style
+        // extraction) which compounds when the color picker
+        // re-converts on every keystroke.
+        let authored = kcreate_core::color::Color::Hsl {
+            h: 173.4,
+            s: 0.62,
+            l: 0.37,
+            a: 0.9,
+        };
+        let json = crate::phase2::color_convert(&serde_json::to_string(&authored).unwrap(), "hsl")
+            .unwrap();
+        let out: kcreate_core::color::Color = serde_json::from_str(&json).unwrap();
+        assert_eq!(out, authored);
+    }
+
+    #[test]
+    #[serial]
+    fn color_convert_preserves_authored_srgb() {
+        // sRGB → sRGB is the trivial identity; the test pins it so a
+        // future refactor doesn't accidentally re-route through the
+        // Lab/CMYK round-trip path and introduce drift.
+        let authored = kcreate_core::color::Color::Srgb {
+            r: 0.123,
+            g: 0.456,
+            b: 0.789,
+            a: 0.5,
+        };
+        let json = crate::phase2::color_convert(&serde_json::to_string(&authored).unwrap(), "srgb")
+            .unwrap();
+        let out: kcreate_core::color::Color = serde_json::from_str(&json).unwrap();
+        assert_eq!(out, authored);
+    }
+
+    #[test]
+    #[serial]
+    fn color_settings_get_returns_default_when_no_project() {
+        // Public contract on `color_settings_get`: the panel mounts
+        // before any project is loaded, so the function must return
+        // the `Default` JSON shape rather than a `NoProject` error.
+        reset_for_tests();
+        let json = crate::phase2::color_settings_get()
+            .expect("color_settings_get must succeed with no project loaded");
+        let settings: kcreate_core::color::ColorSettings = serde_json::from_str(&json).unwrap();
+        assert_eq!(settings, kcreate_core::color::ColorSettings::default());
+    }
+
+    #[test]
+    #[serial]
+    fn color_convert_rejects_unknown_space() {
+        let red = kcreate_core::color::Color::Srgb {
+            r: 1.0,
+            g: 0.0,
+            b: 0.0,
+            a: 1.0,
+        };
+        let err = crate::phase2::color_convert(&serde_json::to_string(&red).unwrap(), "yuv")
+            .expect_err("unknown space must error");
+        match err {
+            DocumentBridgeError::InvalidArgument { argument, value } => {
+                assert_eq!(argument, "to_space");
+                assert_eq!(value, "yuv");
+            }
+            other => panic!("expected InvalidArgument, got {other:?}"),
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // Phase 2 — text frame + OpenType bridge tests (Block B Task 11)
+    // ---------------------------------------------------------------
+
+    fn fresh_text_node_for_test(family: &str) -> Uuid {
+        canvas_create_text(None, 10.0, 10.0, "Hello".to_string(), family.into(), 16.0)
+            .expect("canvas_create_text")
+    }
+
+    #[test]
+    #[serial]
+    fn text_frame_get_returns_default_for_new_node() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("tf", dir.path()).expect("create");
+
+        let id = fresh_text_node_for_test("sans-serif");
+        let json = crate::phase2::text_frame_get(id).expect("get");
+        let options: kcreate_core::node::TextFrameOptions = serde_json::from_str(&json).unwrap();
+        assert_eq!(options, kcreate_core::node::TextFrameOptions::default());
+        project_close();
+    }
+
+    #[test]
+    #[serial]
+    fn text_frame_update_round_trips_and_records_operation() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("tf", dir.path()).expect("create");
+
+        let id = fresh_text_node_for_test("sans-serif");
+        let new_options = kcreate_core::node::TextFrameOptions {
+            overflow: kcreate_core::node::TextOverflow::Ellipsis,
+            columns: 3,
+            column_gap: 12.0,
+            wrap_mode: kcreate_core::node::TextWrapMode::BoundingBox,
+            hyphenation: true,
+            hyphenation_language: "en-US".into(),
+            vertical_alignment: kcreate_core::node::VerticalAlign::Middle,
+            inset: kcreate_core::node::FrameInsets {
+                top: 4.0,
+                right: 4.0,
+                bottom: 4.0,
+                left: 4.0,
+            },
+            auto_size: kcreate_core::node::TextAutoSize::HeightAuto,
+        };
+        crate::phase2::text_frame_update(id, &serde_json::to_string(&new_options).unwrap())
+            .expect("update");
+
+        let json = crate::phase2::text_frame_get(id).expect("get after update");
+        let parsed: kcreate_core::node::TextFrameOptions = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, new_options);
+
+        // The operation must have been recorded so an undo lands the
+        // node back on `TextFrameOptions::default()`.
+        let log_len = with_workspace(|ws| Ok(ws.project.operation_log.len())).unwrap();
+        assert!(
+            log_len >= 2,
+            "expected at least canvas_create_text + text_frame_update in the log, got {log_len}"
+        );
+        project_close();
+    }
+
+    #[test]
+    #[serial]
+    fn text_frame_update_rejects_non_text_node() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("tf", dir.path()).expect("create");
+
+        // Create a vector node (not a TextLayer) and verify the
+        // bridge rejects text-frame writes against it.
+        let rect_id = document_create_node(
+            "VectorLayer",
+            None,
+            &CreateNodeProps {
+                name: Some("rect".into()),
+                visible: None,
+                locked: None,
+                metadata: None,
+            },
+        )
+        .expect("create vector");
+
+        let err = crate::phase2::text_frame_update(
+            rect_id,
+            &serde_json::to_string(&kcreate_core::node::TextFrameOptions::default()).unwrap(),
+        )
+        .expect_err("non-text node must error");
+        assert!(
+            matches!(err, DocumentBridgeError::InvalidArgument { ref argument, .. } if argument == "node_id"),
+            "expected InvalidArgument(node_id), got {err:?}",
+        );
+        project_close();
+    }
+
+    #[test]
+    #[serial]
+    fn text_opentype_features_round_trip() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("tf", dir.path()).expect("create");
+
+        let id = fresh_text_node_for_test("sans-serif");
+
+        // Defaults first.
+        let json = crate::phase2::text_opentype_features_get(id).expect("get default");
+        let parsed: kcreate_core::node::OpenTypeFeatures = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, kcreate_core::node::OpenTypeFeatures::default());
+
+        // Round-trip a non-default set.
+        let custom = kcreate_core::node::OpenTypeFeatures {
+            ligatures: false,
+            contextual_alternates: true,
+            kerning: true,
+            small_caps: true,
+            old_style_figures: true,
+            tabular_figures: false,
+            stylistic_sets: vec![1, 7, 20],
+            fractions: true,
+            ordinals: false,
+        };
+        crate::phase2::text_opentype_features_update(id, &serde_json::to_string(&custom).unwrap())
+            .expect("update");
+        let after = crate::phase2::text_opentype_features_get(id).expect("get after");
+        let parsed_after: kcreate_core::node::OpenTypeFeatures =
+            serde_json::from_str(&after).unwrap();
+        assert_eq!(parsed_after, custom);
+        project_close();
+    }
+
+    /// Pins the Phase 2 undo contract for non-graph operations.
+    /// `color_settings_update` must actually be reversible end-to-end:
+    /// after one `document_undo` the in-memory `color_settings` must
+    /// match the pre-update value, and after a follow-up
+    /// `document_redo` it must come back to the post-update value.
+    /// Regressing this would silently re-introduce the "undoable
+    /// docstring lies" bug Devin Review flagged on PR #7.
+    #[test]
+    #[serial]
+    fn color_settings_update_undo_redo_round_trips_state() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("color-undo", dir.path()).expect("create");
+
+        let baseline = kcreate_core::color::ColorSettings::default();
+        let updated = kcreate_core::color::ColorSettings {
+            working_space_rgb: kcreate_core::color::IccProfile::AdobeRgb1998,
+            working_space_cmyk: Some(kcreate_core::color::IccProfile::FogRa39),
+            rendering_intent: kcreate_core::color::RenderingIntent::RelativeColorimetric,
+            soft_proof_profile: Some(kcreate_core::color::IccProfile::Swop2006),
+            gamut_warning: true,
+        };
+        crate::phase2::color_settings_update(&serde_json::to_string(&updated).unwrap())
+            .expect("update");
+
+        let after_update: kcreate_core::color::ColorSettings =
+            serde_json::from_str(&crate::phase2::color_settings_get().expect("get after update"))
+                .unwrap();
+        assert_eq!(after_update, updated);
+
+        document_undo().expect("undo");
+        let after_undo: kcreate_core::color::ColorSettings =
+            serde_json::from_str(&crate::phase2::color_settings_get().expect("get after undo"))
+                .unwrap();
+        assert_eq!(
+            after_undo, baseline,
+            "document_undo must replay before_patch into ws.project.color_settings",
+        );
+
+        document_redo().expect("redo");
+        let after_redo: kcreate_core::color::ColorSettings =
+            serde_json::from_str(&crate::phase2::color_settings_get().expect("get after redo"))
+                .unwrap();
+        assert_eq!(
+            after_redo, updated,
+            "document_redo must replay after_patch into ws.project.color_settings",
+        );
+        project_close();
+    }
+
+    /// Pins the undo/redo atomicity contract.
+    ///
+    /// Before this fix, `document_undo` called `ws.project.undo()`
+    /// (which advanced the log cursor unconditionally) *before*
+    /// applying `before_patch`. If patch application then failed
+    /// (e.g. the JSON didn't deserialize into `ColorSettings`), the
+    /// cursor had moved but the workspace state still reflected the
+    /// pre-undo value — the operation was silently dropped from the
+    /// user's undoable history.
+    ///
+    /// We construct that scenario by recording an operation whose
+    /// `before_patch` is structurally malformed for its `command`
+    /// (a string where `ColorSettings` is expected), then assert:
+    /// 1. `document_undo` returns `Err`.
+    /// 2. `can_undo` is still true (the cursor did not advance).
+    /// 3. A fresh, well-formed op pushed *after* the failure remains
+    ///    undoable end-to-end (so the failure mode didn't poison
+    ///    the log).
+    #[test]
+    #[serial]
+    fn document_undo_does_not_advance_cursor_on_apply_failure() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("undo-atomicity", dir.path()).expect("create");
+
+        // Inject a poison op: command claims color_settings_update, but
+        // the before_patch is a bare string, which will fail to
+        // deserialize as `ColorSettings`.
+        let poison = Operation::new(
+            "user",
+            "color_settings_update",
+            serde_json::json!("not-a-color-settings-object"),
+            serde_json::json!("not-a-color-settings-object"),
+            Vec::new(),
+        );
+        document_record_operation(poison).expect("record poison op");
+
+        let before = document_status().expect("status before undo");
+        assert!(
+            before.can_undo,
+            "freshly-recorded op must be undoable in the log",
+        );
+
+        let err = document_undo().expect_err("poisoned undo must fail");
+        // The error originates from serde_json inside apply_patch.
+        assert!(
+            matches!(err, DocumentBridgeError::Json(_)),
+            "expected Json (serde) error, got: {err:?}",
+        );
+
+        let after_failed_undo = document_status().expect("status after failed undo");
+        assert!(
+            after_failed_undo.can_undo,
+            "failed undo must NOT advance the log cursor — the op must \
+             remain undoable so the user can retry / inspect / report",
+        );
+        assert_eq!(
+            after_failed_undo.undo_depth, before.undo_depth,
+            "undo depth must be unchanged after a failed undo",
+        );
+
+        // Subsequent well-formed ops still flow normally — the failure
+        // didn't corrupt the log. A `color_settings_update` push from
+        // the bridge entry point both mutates state and records.
+        let updated = kcreate_core::color::ColorSettings {
+            gamut_warning: true,
+            ..kcreate_core::color::ColorSettings::default()
+        };
+        crate::phase2::color_settings_update(&serde_json::to_string(&updated).unwrap())
+            .expect("color_settings_update after failed undo still works");
+
+        project_close();
+    }
+
+    /// Symmetric atomicity contract for `document_redo`.
+    ///
+    /// We push an op whose `before_patch` is a valid `ColorSettings`
+    /// but whose `after_patch` is structurally malformed. Undoing it
+    /// succeeds (valid `before_patch` → cursor moves backwards,
+    /// state reverts). Redoing it must then fail at the
+    /// `after_patch` apply step — and crucially, the redo cursor
+    /// must NOT advance, so the user can retry / inspect / report
+    /// instead of silently losing the operation.
+    #[test]
+    #[serial]
+    fn document_redo_does_not_advance_cursor_on_apply_failure() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("redo-atomicity", dir.path()).expect("create");
+
+        let valid_settings = kcreate_core::color::ColorSettings::default();
+        let poison = Operation::new(
+            "user",
+            "color_settings_update",
+            serde_json::to_value(&valid_settings).expect("serialize before_patch"),
+            // after_patch is intentionally not a ColorSettings shape.
+            serde_json::json!("not-a-color-settings-object"),
+            Vec::new(),
+        );
+        document_record_operation(poison).expect("record poison op");
+
+        // Undo succeeds because before_patch deserializes cleanly.
+        let undone = document_undo()
+            .expect("poison undo OK (before_patch is valid)")
+            .expect("an op was on the undo stack");
+        assert_eq!(undone.command, "color_settings_update");
+
+        let pre_redo = document_status().expect("status pre-redo");
+        assert!(
+            pre_redo.can_redo,
+            "after a successful undo the op must be on the redo stack",
+        );
+
+        let redo_err = document_redo().expect_err("poison redo must fail");
+        assert!(
+            matches!(redo_err, DocumentBridgeError::Json(_)),
+            "expected Json (serde) error from apply_forward_patch, got: {redo_err:?}",
+        );
+
+        let post_redo = document_status().expect("status post-failed-redo");
+        assert!(
+            post_redo.can_redo,
+            "failed redo must NOT advance the log cursor — the op \
+             must remain redoable so the user can retry / inspect",
+        );
+        assert_eq!(
+            post_redo.redo_depth, pre_redo.redo_depth,
+            "redo depth must be unchanged after a failed redo",
+        );
+
+        project_close();
+    }
+
+    /// Same end-to-end guarantee for `text_frame_update` — the bridge
+    /// must restore the previous `TextFrameOptions` on undo and replay
+    /// the new options on redo.
+    #[test]
+    #[serial]
+    fn text_frame_update_undo_redo_round_trips_state() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("tf-undo", dir.path()).expect("create");
+
+        let id = fresh_text_node_for_test("sans-serif");
+        let baseline = kcreate_core::node::TextFrameOptions::default();
+        let updated = kcreate_core::node::TextFrameOptions {
+            overflow: kcreate_core::node::TextOverflow::Ellipsis,
+            columns: 4,
+            column_gap: 8.0,
+            wrap_mode: kcreate_core::node::TextWrapMode::BoundingBox,
+            hyphenation: true,
+            hyphenation_language: "en-US".into(),
+            vertical_alignment: kcreate_core::node::VerticalAlign::Bottom,
+            inset: kcreate_core::node::FrameInsets {
+                top: 2.0,
+                right: 2.0,
+                bottom: 2.0,
+                left: 2.0,
+            },
+            auto_size: kcreate_core::node::TextAutoSize::HeightAuto,
+        };
+        crate::phase2::text_frame_update(id, &serde_json::to_string(&updated).unwrap())
+            .expect("update");
+
+        document_undo().expect("undo");
+        let after_undo: kcreate_core::node::TextFrameOptions =
+            serde_json::from_str(&crate::phase2::text_frame_get(id).expect("get after undo"))
+                .unwrap();
+        assert_eq!(
+            after_undo, baseline,
+            "document_undo must restore the previous TextFrameOptions on the node",
+        );
+
+        document_redo().expect("redo");
+        let after_redo: kcreate_core::node::TextFrameOptions =
+            serde_json::from_str(&crate::phase2::text_frame_get(id).expect("get after redo"))
+                .unwrap();
+        assert_eq!(
+            after_redo, updated,
+            "document_redo must replay the new TextFrameOptions onto the node",
+        );
+        project_close();
+    }
+
+    /// And `text_opentype_features_update` — same contract, third
+    /// Phase 2 panel-driven non-graph operation.
+    #[test]
+    #[serial]
+    fn text_opentype_features_update_undo_redo_round_trips_state() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("ot-undo", dir.path()).expect("create");
+
+        let id = fresh_text_node_for_test("sans-serif");
+        let baseline = kcreate_core::node::OpenTypeFeatures::default();
+        let updated = kcreate_core::node::OpenTypeFeatures {
+            ligatures: false,
+            contextual_alternates: true,
+            kerning: true,
+            small_caps: true,
+            old_style_figures: true,
+            tabular_figures: false,
+            stylistic_sets: vec![2, 5, 11],
+            fractions: true,
+            ordinals: true,
+        };
+        crate::phase2::text_opentype_features_update(id, &serde_json::to_string(&updated).unwrap())
+            .expect("update");
+
+        document_undo().expect("undo");
+        let after_undo: kcreate_core::node::OpenTypeFeatures = serde_json::from_str(
+            &crate::phase2::text_opentype_features_get(id).expect("get after undo"),
+        )
+        .unwrap();
+        assert_eq!(after_undo, baseline);
+
+        document_redo().expect("redo");
+        let after_redo: kcreate_core::node::OpenTypeFeatures = serde_json::from_str(
+            &crate::phase2::text_opentype_features_get(id).expect("get after redo"),
+        )
+        .unwrap();
+        assert_eq!(after_redo, updated);
+        project_close();
+    }
+
+    #[test]
+    #[serial]
+    fn text_layout_compute_returns_overflow_when_height_is_tight() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("tf", dir.path()).expect("create");
+
+        let id = fresh_text_node_for_test("sans-serif");
+
+        // Tighten the frame so any non-trivial text overflows. The
+        // layout engine is the source of truth here; we only assert
+        // the JSON wire shape is parseable + the overflow flag is a
+        // bool, not whether overflow is `true` (depends on host font).
+        let tight = kcreate_core::node::TextFrameOptions {
+            columns: 1,
+            ..kcreate_core::node::TextFrameOptions::default()
+        };
+        crate::phase2::text_frame_update(id, &serde_json::to_string(&tight).unwrap())
+            .expect("frame update");
+
+        // Inject `metadata["text"]` = "long line" by mutating the node.
+        with_workspace_mut(|ws| {
+            let n = ws.project.document.get_node_mut(id).unwrap();
+            n.metadata.insert(
+                "text".to_string(),
+                serde_json::Value::String("supercalifragilistic".into()),
+            );
+            Ok(())
+        })
+        .unwrap();
+
+        let json = crate::phase2::text_layout_compute(id).expect("layout");
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(parsed.get("lines").is_some(), "missing `lines` field");
+        assert!(
+            parsed
+                .get("overflow")
+                .and_then(serde_json::Value::as_bool)
+                .is_some(),
+            "missing or non-bool `overflow` field"
+        );
+        assert!(
+            parsed
+                .get("usedHeight")
+                .and_then(serde_json::Value::as_f64)
+                .is_some(),
+            "missing `usedHeight` field"
+        );
+        project_close();
+    }
+
+    // ------------------------------------------------------------------
+    // Phase 2 Block C — plugin context bridge tests (Task 15)
+    // ------------------------------------------------------------------
+
+    /// Lay down a plugin directory at `dir/<id>/` with a manifest
+    /// declaring `permissions` and a `.wasm` blob produced from `wat`.
+    /// Returns the plugin id so tests can chain into the registry.
+    fn write_test_plugin(
+        dir: &std::path::Path,
+        id: &str,
+        wat_src: &str,
+        permissions: &[&str],
+    ) -> String {
+        let plugin_dir = dir.join(id);
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+        let wasm = wat::parse_str(wat_src).unwrap();
+        std::fs::write(plugin_dir.join("entry.wasm"), wasm).unwrap();
+        let manifest = serde_json::json!({
+            "id": id,
+            "name": id,
+            "version": "0.1.0",
+            "type": "wasm",
+            "entry_point": "entry.wasm",
+            "permissions": permissions,
+        });
+        std::fs::write(
+            plugin_dir.join("manifest.json"),
+            serde_json::to_string_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        id.to_string()
+    }
+
+    /// Plugin that calls `kcreate_read_document` with
+    /// `{"type":"list_nodes"}` so the host's output buffer contains
+    /// the response (the host function writes its own response).
+    const READ_DOC_WAT: &str = r#"
+        (module
+            (import "env" "kcreate_read_document"
+                (func $rd (param i32 i32) (result i32)))
+            (memory (export "memory") 1)
+            (data (i32.const 0) "{\"type\":\"list_nodes\"}")
+            (func (export "run")
+                i32.const 0  i32.const 21  call $rd  drop
+            )
+        )
+    "#;
+
+    /// Plugin that submits one `delete_node` proposal carrying a
+    /// specific UUID. The UUID is the placeholder
+    /// `00000000-0000-0000-0000-000000000000`; tests rewrite this
+    /// at runtime by setting an env var the WAT can't read. So we
+    /// instead use a UUID we will be supplying — for this test we
+    /// will create a node, capture its id, write a per-test
+    /// instance of the WAT with that id baked in, and run.
+    fn delete_proposal_wat(node_id: uuid::Uuid) -> String {
+        let payload = format!("{{\"type\":\"delete_node\",\"node_id\":\"{node_id}\"}}");
+        let len = payload.len();
+        // The WAT data section needs the inner double quotes escaped
+        // as `\"` so the WAT parser sees one string literal, not a
+        // sequence of broken strings.
+        let escaped: String = payload.replace('"', "\\\"");
+        format!(
+            r#"
+            (module
+                (import "env" "kcreate_write_proposal"
+                    (func $wp (param i32 i32) (result i32)))
+                (memory (export "memory") 1)
+                (data (i32.const 0) "{escaped}")
+                (func (export "run")
+                    i32.const 0  i32.const {len}  call $wp  drop
+                )
+            )
+            "#
+        )
+    }
+
+    /// Helper: bind the plugin registry to a per-test directory so
+    /// every test sees a fresh registry. `KCREATE_PLUGIN_DIR` is the
+    /// override the bridge respects.
+    struct PluginEnvGuard {
+        prev: Option<String>,
+    }
+    impl PluginEnvGuard {
+        fn new(dir: &std::path::Path) -> Self {
+            let prev = std::env::var("KCREATE_PLUGIN_DIR").ok();
+            // SAFETY: `set_var` is only unsafe in multi-threaded
+            // contexts because of UB if other threads read env
+            // concurrently. The bridge plugin tests are marked
+            // `#[serial]` precisely so this lifecycle is sound;
+            // we just need to wrap the call.
+            unsafe { std::env::set_var("KCREATE_PLUGIN_DIR", dir) };
+            // The plugin registry is a process-global `OnceLock`
+            // that captures `plugin_dir()` at first init — we have
+            // to explicitly reseed it so the test's tmpdir takes
+            // effect even when a previous test already triggered
+            // init under a different dir.
+            crate::phase2::reset_plugin_state_for_tests();
+            Self { prev }
+        }
+    }
+    impl Drop for PluginEnvGuard {
+        fn drop(&mut self) {
+            match &self.prev {
+                Some(v) => unsafe { std::env::set_var("KCREATE_PLUGIN_DIR", v) },
+                None => unsafe { std::env::remove_var("KCREATE_PLUGIN_DIR") },
+            }
+            // Re-seed back to whatever the (likely-absent) env now
+            // points at, so a stray test that doesn't use the guard
+            // can still rely on the registry being well-formed.
+            crate::phase2::reset_plugin_state_for_tests();
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn plugin_execute_with_context_reads_document_when_permitted() {
+        reset_for_tests();
+        let dir = tmpdir();
+        let plugin_dir = tmpdir();
+        let _guard = PluginEnvGuard::new(plugin_dir.path());
+
+        project_create("ctx", dir.path()).expect("create");
+        let id = write_test_plugin(
+            plugin_dir.path(),
+            "list-nodes",
+            READ_DOC_WAT,
+            &["read_document"],
+        );
+        // `plugin_list` performs the registry scan; without it,
+        // `plugin_enable` can't find the freshly-written manifest.
+        crate::phase2::plugin_list().expect("list");
+        crate::phase2::plugin_enable(&id).expect("enable");
+
+        let out = crate::phase2::plugin_execute_with_context(&id, "run", "").expect("execute");
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let response: Vec<String> =
+            serde_json::from_str(parsed.get("output").and_then(|v| v.as_str()).unwrap())
+                .expect("response is a JSON array of ids");
+        // The default project has at least a Page + Artboard, so the
+        // node id list must be non-empty.
+        assert!(!response.is_empty(), "expected non-empty node id list");
+        project_close();
+    }
+
+    #[test]
+    #[serial]
+    fn plugin_execute_with_context_denies_without_permission() {
+        reset_for_tests();
+        let dir = tmpdir();
+        let plugin_dir = tmpdir();
+        let _guard = PluginEnvGuard::new(plugin_dir.path());
+
+        project_create("ctx", dir.path()).expect("create");
+        // No `read_document` permission declared.
+        let id = write_test_plugin(plugin_dir.path(), "list-nodes-deny", READ_DOC_WAT, &[]);
+        crate::phase2::plugin_list().expect("list");
+        crate::phase2::plugin_enable(&id).expect("enable");
+
+        let out = crate::phase2::plugin_execute_with_context(&id, "run", "").expect("execute");
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        // Output should be empty when the call was denied — the
+        // host writes nothing to the output buffer.
+        assert_eq!(
+            parsed.get("output").and_then(|v| v.as_str()).unwrap_or(""),
+            "",
+            "expected empty output on permission deny"
+        );
+        let logs = parsed
+            .get("logs")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            logs.iter().any(|l| l
+                .as_str()
+                .is_some_and(|s| s.contains("denied (missing ReadDocument)"))),
+            "expected deny log line, got {logs:?}"
+        );
+        project_close();
+    }
+
+    #[test]
+    #[serial]
+    fn plugin_execute_with_context_applies_delete_proposal() {
+        reset_for_tests();
+        let dir = tmpdir();
+        let plugin_dir = tmpdir();
+        let _guard = PluginEnvGuard::new(plugin_dir.path());
+
+        project_create("ctx", dir.path()).expect("create");
+        // Create a node we will then ask the plugin to delete.
+        let target = document_create_node(
+            "VectorLayer",
+            None,
+            &CreateNodeProps {
+                name: Some("doomed".into()),
+                visible: None,
+                locked: None,
+                metadata: None,
+            },
+        )
+        .expect("create node");
+
+        let wat = delete_proposal_wat(target);
+        let id = write_test_plugin(plugin_dir.path(), "deleter", &wat, &["write_document"]);
+        crate::phase2::plugin_list().expect("list");
+        crate::phase2::plugin_enable(&id).expect("enable");
+
+        let out = crate::phase2::plugin_execute_with_context(&id, "run", "").expect("execute");
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let reports = parsed
+            .get("proposals")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(reports.len(), 1, "expected one proposal report");
+        let status = reports[0]
+            .get("outcome")
+            .and_then(|o| o.get("status"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        assert_eq!(status, "applied", "expected applied, got {status}");
+        // Node should be gone from the document.
+        assert!(
+            with_workspace(|ws| Ok(ws.project.document.get_node(target).is_none())).unwrap(),
+            "node should be gone after applied delete proposal"
+        );
+        project_close();
+    }
+
+    #[test]
+    #[serial]
+    fn plugin_execute_with_context_rejects_delete_of_unknown_node() {
+        reset_for_tests();
+        let dir = tmpdir();
+        let plugin_dir = tmpdir();
+        let _guard = PluginEnvGuard::new(plugin_dir.path());
+
+        project_create("ctx", dir.path()).expect("create");
+        // UUID that doesn't resolve to any node.
+        let ghost = uuid::Uuid::new_v4();
+        let wat = delete_proposal_wat(ghost);
+        let id = write_test_plugin(
+            plugin_dir.path(),
+            "ghost-deleter",
+            &wat,
+            &["write_document"],
+        );
+        crate::phase2::plugin_list().expect("list");
+        crate::phase2::plugin_enable(&id).expect("enable");
+
+        let out = crate::phase2::plugin_execute_with_context(&id, "run", "").expect("execute");
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let reports = parsed
+            .get("proposals")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(reports.len(), 1);
+        let status = reports[0]
+            .get("outcome")
+            .and_then(|o| o.get("status"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        assert_eq!(status, "rejected", "expected rejected, got {status}");
+        project_close();
+    }
+
+    // ------------------------------------------------------------------
+    // Phase 2 Block D — JS panel bridge tests (Task 18)
+    // ------------------------------------------------------------------
+
+    /// Lay down a JS panel plugin (manifest.json + entry_html stub)
+    /// under `dir/<id>/`.
+    fn write_test_js_panel(dir: &std::path::Path, id: &str, permissions: &[&str]) -> String {
+        let plugin_dir = dir.join(id);
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+        std::fs::write(
+            plugin_dir.join("panel.html"),
+            b"<!doctype html><html></html>",
+        )
+        .unwrap();
+        let manifest = serde_json::json!({
+            "id": id,
+            "name": id,
+            "version": "0.1.0",
+            "type": "js_panel",
+            "entry_point": "panel.html",
+            "permissions": permissions,
+            "js_panel": {
+                "entry_html": "panel.html",
+                "panel_title": "Test Panel",
+                "panel_position": "right_sidebar",
+                "width": 320,
+                "height": 480,
+                "permissions": permissions
+            }
+        });
+        std::fs::write(
+            plugin_dir.join("manifest.json"),
+            serde_json::to_string_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        id.to_string()
+    }
+
+    #[test]
+    #[serial]
+    fn plugin_js_list_returns_only_js_panel_plugins() {
+        let dir = tmpdir();
+        let plugin_dir = tmpdir();
+        let _guard = PluginEnvGuard::new(plugin_dir.path());
+
+        project_create("ctx", dir.path()).expect("create");
+        // One wasm plugin + one js_panel plugin.
+        let _wasm_id = write_test_plugin(
+            plugin_dir.path(),
+            "some-wasm",
+            READ_DOC_WAT,
+            &["read_document"],
+        );
+        let panel_id = write_test_js_panel(plugin_dir.path(), "some-panel", &["read_document"]);
+        // Force registry scan so newly-written manifests are visible.
+        crate::phase2::plugin_list().expect("list");
+
+        let list = crate::phase2::plugin_js_list().expect("js list");
+        let ids: Vec<&str> = list.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(ids, vec![panel_id.as_str()]);
+        assert_eq!(list[0].config.entry_html, "panel.html");
+        assert_eq!(list[0].config.width, 320);
+        project_close();
+    }
+
+    #[test]
+    #[serial]
+    fn plugin_js_message_read_document_requires_permission() {
+        let dir = tmpdir();
+        let plugin_dir = tmpdir();
+        let _guard = PluginEnvGuard::new(plugin_dir.path());
+
+        project_create("ctx", dir.path()).expect("create");
+        let panel_id = write_test_js_panel(plugin_dir.path(), "no-perm-panel", &[]);
+        crate::phase2::plugin_list().expect("list");
+        crate::phase2::plugin_enable(&panel_id).expect("enable");
+
+        let msg = serde_json::json!({
+            "type": "read_document",
+            "query": { "type": "list_nodes" }
+        })
+        .to_string();
+        let out = crate::phase2::plugin_js_message(&panel_id, &msg).expect("msg");
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(parsed["status"], "denied");
+        assert_eq!(parsed["permission"], "read_document");
+        project_close();
+    }
+
+    #[test]
+    #[serial]
+    fn plugin_js_message_read_document_succeeds_with_permission() {
+        let dir = tmpdir();
+        let plugin_dir = tmpdir();
+        let _guard = PluginEnvGuard::new(plugin_dir.path());
+
+        project_create("ctx", dir.path()).expect("create");
+        let panel_id = write_test_js_panel(plugin_dir.path(), "read-panel", &["read_document"]);
+        crate::phase2::plugin_list().expect("list");
+        crate::phase2::plugin_enable(&panel_id).expect("enable");
+
+        let msg = serde_json::json!({
+            "type": "read_document",
+            "query": { "type": "list_nodes" }
+        })
+        .to_string();
+        let out = crate::phase2::plugin_js_message(&panel_id, &msg).expect("msg");
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(parsed["status"], "ok", "expected ok, got {parsed}");
+        let result = parsed.get("result").expect("result");
+        assert!(result.is_array(), "list_nodes must produce a JSON array");
+        project_close();
+    }
+
+    #[test]
+    #[serial]
+    fn plugin_js_message_rejects_invalid_json() {
+        let dir = tmpdir();
+        let plugin_dir = tmpdir();
+        let _guard = PluginEnvGuard::new(plugin_dir.path());
+
+        project_create("ctx", dir.path()).expect("create");
+        let panel_id = write_test_js_panel(plugin_dir.path(), "invalid-panel", &[]);
+        crate::phase2::plugin_list().expect("list");
+        crate::phase2::plugin_enable(&panel_id).expect("enable");
+
+        let out = crate::phase2::plugin_js_message(&panel_id, "not json").expect("msg");
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(parsed["status"], "invalid");
+        project_close();
+    }
+
+    #[test]
+    #[serial]
+    fn plugin_js_message_rejects_non_js_panel_plugin() {
+        let dir = tmpdir();
+        let plugin_dir = tmpdir();
+        let _guard = PluginEnvGuard::new(plugin_dir.path());
+
+        project_create("ctx", dir.path()).expect("create");
+        let wasm_id = write_test_plugin(
+            plugin_dir.path(),
+            "wasm-not-panel",
+            READ_DOC_WAT,
+            &["read_document"],
+        );
+        crate::phase2::plugin_list().expect("list");
+        crate::phase2::plugin_enable(&wasm_id).expect("enable");
+
+        let msg = serde_json::json!({
+            "type": "log",
+            "message": "hi"
+        })
+        .to_string();
+        let out = crate::phase2::plugin_js_message(&wasm_id, &msg).expect("msg");
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(parsed["status"], "invalid");
+        let reason = parsed["reason"].as_str().unwrap_or("");
+        assert!(reason.contains("not a js_panel"), "got: {reason}");
+        project_close();
     }
 }

@@ -34,6 +34,7 @@ import type {
   DesignTokensBridge,
   DocumentBridge,
   DocumentStatus,
+  UndoRedoOutcome,
   ExportBridge,
   ExportFormat,
   ExportPreset,
@@ -74,15 +75,31 @@ import type {
   McpPermissionBridge,
   McpPermissionGrant,
   McpStatus,
+  ModelInstallReport,
   ModelPack,
+  PdfImportBridge,
+  PdfImportReport,
+  JsPanelInfo,
+  JsPanelMessage,
+  JsPanelMessageOutcome,
   PluginBridge,
   PluginExecuteResult,
+  PluginExecuteWithContextResult,
   PluginListEntry,
+  TrustedKeyInfo,
   PreflightBridge,
   PreflightIssue,
   PreflightRequest,
   ScreenshotElement,
   ScreenshotRequest,
+  ColorBridge,
+  ColorSettings,
+  ColorSpaceName,
+  ColorValue,
+  TextFrameBridge,
+  TextFrameOptions,
+  OpenTypeFeatures,
+  TextLayoutWire,
 } from "../../shared/scene";
 
 type FrameInfoSnake = {
@@ -402,15 +419,15 @@ const document: DocumentBridge = {
   async deleteNode(nodeId: string): Promise<void> {
     await ipcRenderer.invoke("kcreate/document/deleteNode", nodeId);
   },
-  async undo(): Promise<string[] | null> {
+  async undo(): Promise<UndoRedoOutcome | null> {
     return (await ipcRenderer.invoke(
       "kcreate/document/undo",
-    )) as string[] | null;
+    )) as UndoRedoOutcome | null;
   },
-  async redo(): Promise<string[] | null> {
+  async redo(): Promise<UndoRedoOutcome | null> {
     return (await ipcRenderer.invoke(
       "kcreate/document/redo",
-    )) as string[] | null;
+    )) as UndoRedoOutcome | null;
   },
   async status(): Promise<DocumentStatus | null> {
     const raw = (await ipcRenderer.invoke(
@@ -1116,6 +1133,25 @@ const aiModel: AiModelBridge = {
     )) as string;
     return JSON.parse(raw) as ModelPack[];
   },
+  async pickModelFile(): Promise<string | null> {
+    return (await ipcRenderer.invoke(
+      "kcreate/ai/pickModelFile",
+    )) as string | null;
+  },
+  async installModelPack(
+    packId: string,
+    sourcePath: string,
+  ): Promise<ModelInstallReport> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/ai/installModelPack",
+      packId,
+      sourcePath,
+    )) as string;
+    return JSON.parse(raw) as ModelInstallReport;
+  },
+  async uninstallModelPack(packId: string): Promise<void> {
+    await ipcRenderer.invoke("kcreate/ai/uninstallModelPack", packId);
+  },
   async screenshotToLayout(
     request: ScreenshotRequest,
   ): Promise<ScreenshotElement[]> {
@@ -1124,6 +1160,21 @@ const aiModel: AiModelBridge = {
       JSON.stringify(request),
     )) as string;
     return JSON.parse(raw) as ScreenshotElement[];
+  },
+};
+
+const pdfImport: PdfImportBridge = {
+  async pickFile(): Promise<string | null> {
+    return (await ipcRenderer.invoke(
+      "kcreate/pdf/pickFile",
+    )) as string | null;
+  },
+  async importPdf(filePath: string): Promise<PdfImportReport> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/pdf/import",
+      filePath,
+    )) as string;
+    return JSON.parse(raw) as PdfImportReport;
   },
 };
 
@@ -1150,6 +1201,60 @@ const plugin: PluginBridge = {
       input,
     )) as string;
     return JSON.parse(raw) as PluginExecuteResult;
+  },
+  async executeWithContext(
+    id: string,
+    fn: string,
+    input: string,
+  ): Promise<PluginExecuteWithContextResult> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/plugin/executeWithContext",
+      id,
+      fn,
+      input,
+    )) as string;
+    return JSON.parse(raw) as PluginExecuteWithContextResult;
+  },
+  async jsList(): Promise<JsPanelInfo[]> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/plugin/js/list",
+    )) as string;
+    return JSON.parse(raw) as JsPanelInfo[];
+  },
+  async jsMessage(
+    pluginId: string,
+    message: JsPanelMessage,
+  ): Promise<JsPanelMessageOutcome> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/plugin/js/message",
+      pluginId,
+      JSON.stringify(message),
+    )) as string;
+    return JSON.parse(raw) as JsPanelMessageOutcome;
+  },
+  async jsOpen(
+    pluginId: string,
+    bounds: { x: number; y: number; width: number; height: number },
+  ): Promise<void> {
+    await ipcRenderer.invoke("kcreate/plugin/js/open", pluginId, bounds);
+  },
+  async jsSetBounds(
+    pluginId: string,
+    bounds: { x: number; y: number; width: number; height: number },
+  ): Promise<void> {
+    await ipcRenderer.invoke("kcreate/plugin/js/setBounds", pluginId, bounds);
+  },
+  async jsClose(pluginId: string): Promise<void> {
+    await ipcRenderer.invoke("kcreate/plugin/js/close", pluginId);
+  },
+  async trustList(): Promise<TrustedKeyInfo[]> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/plugin/trust/list",
+    )) as string;
+    return JSON.parse(raw) as TrustedKeyInfo[];
+  },
+  async trustReload(): Promise<void> {
+    await ipcRenderer.invoke("kcreate/plugin/trust/reload");
   },
 };
 
@@ -1185,6 +1290,102 @@ const mcpPermission: McpPermissionBridge = {
   },
 };
 
+// ---------------------------------------------------------------------------
+// Phase 2 — Color management (CMYK / ICC foundation).
+// ---------------------------------------------------------------------------
+
+const color: ColorBridge = {
+  async getSettings(): Promise<ColorSettings> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/color/settings/get",
+    )) as string;
+    return JSON.parse(raw) as ColorSettings;
+  },
+  async updateSettings(settings: ColorSettings): Promise<void> {
+    await ipcRenderer.invoke(
+      "kcreate/color/settings/update",
+      JSON.stringify(settings),
+    );
+  },
+  async convert(
+    value: ColorValue,
+    toSpace: ColorSpaceName,
+  ): Promise<ColorValue> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/color/convert",
+      JSON.stringify(value),
+      toSpace,
+    )) as string;
+    return JSON.parse(raw) as ColorValue;
+  },
+  /// Subscribe to the push channel that fires whenever
+  /// `color_settings_update`, `documentUndo`, or `documentRedo`
+  /// mutates `ws.project.color_settings`. The event is intentionally
+  /// payload-free — subscribers should call `getSettings()` to read
+  /// the new shape. Returns an unsubscribe function so callers can
+  /// detach in their effect cleanup.
+  onSettingsChanged(callback: () => void): () => void {
+    const channel = "kcreate/color/settings/changed";
+    const listener = (): void => {
+      callback();
+    };
+    ipcRenderer.on(channel, listener);
+    return () => {
+      ipcRenderer.removeListener(channel, listener);
+    };
+  },
+};
+
+// ---------------------------------------------------------------------------
+// Phase 2 — Text frame + OpenType (Block B Task 11).
+//
+// The bridge always speaks JSON over IPC for these calls — the renderer
+// must `JSON.parse` the responses and `JSON.stringify` outgoing options
+// before invoking. Doing the (de)serialisation here keeps callers
+// uniform with the rest of the `window.kcreate.*` surface.
+// ---------------------------------------------------------------------------
+
+const textFrame: TextFrameBridge = {
+  async get(nodeId: string): Promise<TextFrameOptions> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/text/frame/get",
+      nodeId,
+    )) as string;
+    return JSON.parse(raw) as TextFrameOptions;
+  },
+  async update(nodeId: string, options: TextFrameOptions): Promise<void> {
+    await ipcRenderer.invoke(
+      "kcreate/text/frame/update",
+      nodeId,
+      JSON.stringify(options),
+    );
+  },
+  async computeLayout(nodeId: string): Promise<TextLayoutWire> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/text/layout/compute",
+      nodeId,
+    )) as string;
+    return JSON.parse(raw) as TextLayoutWire;
+  },
+  async getOpenTypeFeatures(nodeId: string): Promise<OpenTypeFeatures> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/text/opentype/get",
+      nodeId,
+    )) as string;
+    return JSON.parse(raw) as OpenTypeFeatures;
+  },
+  async updateOpenTypeFeatures(
+    nodeId: string,
+    features: OpenTypeFeatures,
+  ): Promise<void> {
+    await ipcRenderer.invoke(
+      "kcreate/text/opentype/update",
+      nodeId,
+      JSON.stringify(features),
+    );
+  },
+};
+
 contextBridge.exposeInMainWorld("kcreate", {
   renderer,
   document,
@@ -1207,6 +1408,9 @@ contextBridge.exposeInMainWorld("kcreate", {
   iconPack,
   batch,
   aiModel,
+  pdfImport,
   plugin,
   mcpPermission,
+  color,
+  textFrame,
 });

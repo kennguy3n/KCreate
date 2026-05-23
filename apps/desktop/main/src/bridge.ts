@@ -68,12 +68,26 @@ type DocumentStatusSnake = {
   redo_depth: number;
 };
 
+// Mirror of `crates/kcreate_bridge/src/lib.rs::UndoRedoOutcome`. The
+// N-API surface returns camelCase field names (`#[napi(object)]` emits
+// the field identifiers literally, and the Rust side is named in
+// snake_case → JS via napi's default camelCase rewrite). The `command`
+// field is the `Operation::command` string from
+// `crates/kcreate_core/src/operation.rs`; the host uses it to gate
+// per-operation broadcasts (e.g. `kcreate/color/settings/changed` only
+// fires for `color_settings_update`).
+type UndoRedoOutcomeSnake = {
+  command: string;
+  affectedNodes: string[];
+};
+
 export type {
   ProjectInfoSnake,
   NodeInfoSnake,
   BoundsSnake,
   RuntimeStatusSnake,
   DocumentStatusSnake,
+  UndoRedoOutcomeSnake,
 };
 
 export interface Bridge {
@@ -125,8 +139,8 @@ export interface Bridge {
   ): string;
   documentUpdateNode(nodeId: string, changesJson: string): void;
   documentDeleteNode(nodeId: string): void;
-  documentUndo(): string[] | null;
-  documentRedo(): string[] | null;
+  documentUndo(): UndoRedoOutcomeSnake | null;
+  documentRedo(): UndoRedoOutcomeSnake | null;
   documentStatus(): DocumentStatusSnake | null;
   runtimeStatus(): RuntimeStatusSnake;
   lowResourceModeGet(): boolean;
@@ -310,11 +324,23 @@ export interface Bridge {
     tolerance: number,
   ): string;
   aiListModelPacks(): string;
+  aiInstallModelPack(packId: string, sourcePath: string): string;
+  aiUninstallModelPack(packId: string): void;
+  pdfImport(filePath: string): string;
   aiScreenshotToLayout(requestJson: string): string;
   pluginList(): string;
   pluginEnable(id: string): void;
   pluginDisable(id: string): void;
   pluginExecute(id: string, function_: string, input: string): string;
+  pluginExecuteWithContext(
+    id: string,
+    function_: string,
+    input: string,
+  ): string;
+  pluginJsList(): string;
+  pluginJsMessage(pluginId: string, messageJson: string): string;
+  pluginTrustList(): string;
+  pluginTrustReload(): void;
   mcpPermissionList(): string;
   mcpPermissionGrant(
     clientId: string,
@@ -323,6 +349,16 @@ export interface Bridge {
   ): void;
   mcpPermissionRevoke(clientId: string, toolName: string): void;
   mcpStatus(): string;
+  // Phase 2 — color management (ICC / CMYK foundation).
+  colorSettingsGet(): string;
+  colorSettingsUpdate(settingsJson: string): void;
+  colorConvert(fromJson: string, toSpace: string): string;
+  // Phase 2 — text frame + OpenType (Block B Task 11).
+  textFrameGet(nodeId: string): string;
+  textFrameUpdate(nodeId: string, optionsJson: string): void;
+  textLayoutCompute(nodeId: string): string;
+  textOpentypeFeaturesGet(nodeId: string): string;
+  textOpentypeFeaturesUpdate(nodeId: string, featuresJson: string): void;
 }
 
 function bridgeBinaryPath(): string {

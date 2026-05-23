@@ -24,6 +24,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
+use kcreate_core::color::ColorSettings;
 use kcreate_core::component::ComponentDefinition;
 use kcreate_core::document::{DocumentError, DocumentGraph};
 use kcreate_core::node::{Node, NodeType};
@@ -426,6 +427,39 @@ impl ProjectStore {
         ) {
             Ok(s) => Ok(serde_json::from_str::<DesignTokens>(&s)?),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(DesignTokens::default()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Persist the singleton document-level color management
+    /// settings (working spaces, rendering intent, soft-proof). There
+    /// is exactly one row in this table; the `key` column is
+    /// `'current'`.
+    pub fn save_color_settings(
+        &mut self,
+        settings: &ColorSettings,
+    ) -> Result<(), ProjectStoreError> {
+        self.db.conn().execute(
+            "INSERT INTO color_settings (key, data, updated_at) VALUES ('current', ?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET data = excluded.data, updated_at = excluded.updated_at",
+            params![serde_json::to_string(settings)?, Utc::now().to_rfc3339()],
+        )?;
+        self.touch_modified()?;
+        Ok(())
+    }
+
+    /// Load the color settings. Returns `ColorSettings::default()`
+    /// (sRGB working space, no CMYK profile, perceptual intent) when
+    /// nothing has been persisted yet — older projects predating the
+    /// Phase 2 CMYK foundation transparently get the sRGB default.
+    pub fn load_color_settings(&self) -> Result<ColorSettings, ProjectStoreError> {
+        match self.db.conn().query_row(
+            "SELECT data FROM color_settings WHERE key = 'current'",
+            [],
+            |row| row.get::<_, String>(0),
+        ) {
+            Ok(s) => Ok(serde_json::from_str::<ColorSettings>(&s)?),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(ColorSettings::default()),
             Err(e) => Err(e.into()),
         }
     }

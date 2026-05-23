@@ -94,6 +94,16 @@ pub const MIGRATIONS: &[&str] = &[
         data TEXT NOT NULL,
         updated_at TEXT NOT NULL
     );",
+    // 11: color settings (single-row by convention; key='current').
+    //     Phase 2 CMYK / ICC color management foundation. The `data`
+    //     column stores a serialized `kcreate_core::color::ColorSettings`
+    //     JSON blob (working RGB / CMYK spaces, rendering intent,
+    //     soft-proof profile, gamut warning toggle).
+    r"CREATE TABLE IF NOT EXISTS color_settings (
+        key TEXT PRIMARY KEY,
+        data TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    );",
 ];
 
 /// Schema-level errors. Wraps `rusqlite::Error` and adds a couple of
@@ -230,6 +240,7 @@ mod tests {
             "ai_actions",
             "assets",
             "brand_kits",
+            "color_settings",
             "design_tokens",
             "export_presets",
             "nodes",

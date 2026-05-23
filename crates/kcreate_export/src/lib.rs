@@ -19,6 +19,7 @@ pub mod code_gen;
 pub mod icon_pack;
 pub mod jpeg;
 pub mod pdf;
+pub mod pdf_import;
 pub mod png;
 pub mod preflight;
 pub mod scene_metadata;
@@ -30,6 +31,9 @@ pub use code_gen::{inspect_node, node_to_css, node_to_react_style, node_to_tailw
 pub use jpeg::{export_jpeg, export_jpeg_to_bytes, JpegExportError, JpegExportOptions};
 pub use pdf::{
     export_pdf_from_document, PdfExportError, PdfExportOptions, RasterPixelCache, RasterPixels,
+};
+pub use pdf_import::{
+    import_pdf, ExtractedImage, ExtractedImageData, ImportedPdf, ImportedPdfPage, PdfImportError,
 };
 pub use png::{export_png, export_png_to_bytes, PngExportError, PngExportOptions};
 pub use svg::{export_svg_from_document, SvgDocumentExportError, SvgExportOptions};

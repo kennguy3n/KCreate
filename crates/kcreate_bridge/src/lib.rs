@@ -39,7 +39,7 @@ use uuid::Uuid;
 use crate::document::{
     BoundsInfo as CoreBoundsInfo, CreateNodeProps, DocumentBridgeError, NodeInfo as CoreNodeInfo,
     PngExportRequest as CorePngRequest, ProjectInfo as CoreProjectInfo,
-    RuntimeStatus as CoreRuntimeStatus, UpdateNodeProps,
+    RuntimeStatus as CoreRuntimeStatus, UndoRedoOutcome as CoreUndoRedoOutcome, UpdateNodeProps,
 };
 use crate::state::{
     AcquiredFrame as CoreAcquiredFrame, BridgeError, RendererFrameInfo as CoreFrameInfo,
@@ -558,18 +558,50 @@ pub fn document_delete_node(node_id: String) -> NapiResult<()> {
     document::document_delete_node(id).map_err(map_doc_err)
 }
 
+/// Wire-format mirror of [`document::UndoRedoOutcome`].
+///
+/// Both `command` and `affectedNodes` are returned on the same hop so
+/// the host can gate per-operation side-effects (e.g. the
+/// `kcreate/color/settings/changed` broadcast, which only needs to
+/// fire when `command == "color_settings_update"`) without a second
+/// IPC round-trip into Rust.
+#[napi(object)]
+#[derive(Debug, Clone)]
+pub struct UndoRedoOutcome {
+    /// Stable command string from `Operation::command`, e.g.
+    /// `"color_settings_update"` or `"document_update_node"`.
+    pub command: String,
+    /// `Operation::affected_nodes` serialized to strings. Empty for
+    /// non-graph operations like `color_settings_update`.
+    pub affected_nodes: Vec<String>,
+}
+
+impl From<CoreUndoRedoOutcome> for UndoRedoOutcome {
+    fn from(c: CoreUndoRedoOutcome) -> Self {
+        Self {
+            command: c.command,
+            affected_nodes: c
+                .affected_nodes
+                .into_iter()
+                .map(|u| u.to_string())
+                .collect(),
+        }
+    }
+}
+
 /// Undo last operation. Returns `null` when nothing to undo, otherwise
-/// the list of affected node ids.
+/// an `UndoRedoOutcome` carrying the operation's `command` and
+/// `affectedNodes`.
 #[napi]
-pub fn document_undo() -> NapiResult<Option<Vec<String>>> {
-    let ids = document::document_undo().map_err(map_doc_err)?;
-    Ok(ids.map(|v| v.into_iter().map(|u| u.to_string()).collect()))
+pub fn document_undo() -> NapiResult<Option<UndoRedoOutcome>> {
+    let outcome = document::document_undo().map_err(map_doc_err)?;
+    Ok(outcome.map(Into::into))
 }
 
 #[napi]
-pub fn document_redo() -> NapiResult<Option<Vec<String>>> {
-    let ids = document::document_redo().map_err(map_doc_err)?;
-    Ok(ids.map(|v| v.into_iter().map(|u| u.to_string()).collect()))
+pub fn document_redo() -> NapiResult<Option<UndoRedoOutcome>> {
+    let outcome = document::document_redo().map_err(map_doc_err)?;
+    Ok(outcome.map(Into::into))
 }
 
 /// Static runtime / device snapshot.
@@ -1640,6 +1672,35 @@ pub fn ai_list_model_packs() -> NapiResult<String> {
     phase2::ai_models_list().map_err(map_doc_err)
 }
 
+/// Install an optional model pack from a user-provided source path.
+/// `pack_id` must match a non-built-in entry in
+/// [`ai_list_model_packs`]; `source_path` is the absolute path to
+/// the weights file the user downloaded out of band (KCreate does
+/// not fetch from the network itself). Returns the
+/// [`kcreate_ai::InstallReport`] JSON describing the actual hash
+/// and the `verified` flag.
+#[napi]
+pub fn ai_install_model_pack(pack_id: String, source_path: String) -> NapiResult<String> {
+    phase2::ai_model_install(pack_id, source_path).map_err(map_doc_err)
+}
+
+/// Uninstall an optional model pack by deleting its file from the
+/// models directory. Idempotent — uninstalling an already-absent
+/// pack returns Ok.
+#[napi]
+pub fn ai_uninstall_model_pack(pack_id: String) -> NapiResult<()> {
+    phase2::ai_model_uninstall(pack_id).map_err(map_doc_err)
+}
+
+/// Import a PDF file at `file_path` into the current project: one
+/// Page per PDF page, embedded images become RasterLayer children,
+/// extracted text becomes a TextLayer per page. Returns JSON
+/// matching [`phase2::PdfImportReport`].
+#[napi]
+pub fn pdf_import(file_path: String) -> NapiResult<String> {
+    phase2::pdf_import(file_path).map_err(map_doc_err)
+}
+
 /// Run edge-detection + connected-component analysis over the
 /// supplied RGBA8 screenshot and return the detected UI regions.
 #[napi]
@@ -1666,9 +1727,61 @@ pub fn plugin_disable(id: String) -> NapiResult<()> {
     phase2::plugin_disable(&id).map_err(map_doc_err)
 }
 
+/// Snapshot of every Ed25519 public key in `trusted_keys.json`. The
+/// UI's "Trusted Authorities" list calls this on PluginManager mount
+/// so users can see which signing identities are currently allowed
+/// to register native plugins. Returns a JSON array of
+/// `{ keyId, comment }`.
+#[napi]
+pub fn plugin_trust_list() -> NapiResult<String> {
+    let list = phase2::plugin_trust_list().map_err(map_doc_err)?;
+    serde_json::to_string(&list).map_err(|e| NapiError::from_reason(e.to_string()))
+}
+
+/// Reload `trusted_keys.json` from disk and rescan plugins. Use this
+/// after the user adds a new trusted key out-of-band so previously-
+/// rejected native plugins get a second chance without restarting
+/// the host.
+#[napi]
+pub fn plugin_trust_reload() -> NapiResult<()> {
+    phase2::plugin_trust_reload().map_err(map_doc_err)
+}
+
 #[napi]
 pub fn plugin_execute(id: String, function: String, input: String) -> NapiResult<String> {
     phase2::plugin_execute(&id, &function, &input).map_err(map_doc_err)
+}
+
+/// Phase 2 extended-ABI execution: builds a `PluginContext` with the
+/// current document snapshot, the project's blob store as asset loader,
+/// and the manifest's declared permissions, then validates and applies
+/// any proposals the plugin emits. Returns a JSON envelope `{output,
+/// logs, proposals}` (see `phase2::ProposalReport`).
+#[napi]
+pub fn plugin_execute_with_context(
+    id: String,
+    function: String,
+    input: String,
+) -> NapiResult<String> {
+    phase2::plugin_execute_with_context(&id, &function, &input).map_err(map_doc_err)
+}
+
+/// List installed JS panel plugins. Returns a JSON array of
+/// `JsPanelInfo` so the Electron main process can decide which
+/// sandboxed `BrowserView` instances to mount.
+#[napi]
+pub fn plugin_js_list() -> NapiResult<String> {
+    let list = phase2::plugin_js_list().map_err(map_doc_err)?;
+    serde_json::to_string(&list).map_err(|e| NapiError::from_reason(e.to_string()))
+}
+
+/// Validate and dispatch a single message from a sandboxed JS panel.
+/// The Electron host calls this for every inbound `postMessage` from
+/// the panel's `<webview>` / `BrowserView`; the bridge enforces the
+/// permission gates and returns a `JsPanelMessageOutcome` JSON.
+#[napi]
+pub fn plugin_js_message(plugin_id: String, message_json: String) -> NapiResult<String> {
+    phase2::plugin_js_message(&plugin_id, &message_json).map_err(map_doc_err)
 }
 
 #[napi]
@@ -1690,4 +1803,79 @@ pub fn mcp_permission_revoke(client_id: String, tool_name: String) -> NapiResult
 pub fn mcp_status() -> NapiResult<String> {
     let status = phase2::mcp_status();
     serde_json::to_string(&status).map_err(|e| NapiError::from_reason(e.to_string()))
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2 — color management
+// ---------------------------------------------------------------------------
+
+/// Read the project's color management settings as JSON.
+#[napi]
+pub fn color_settings_get() -> NapiResult<String> {
+    phase2::color_settings_get().map_err(map_doc_err)
+}
+
+/// Replace the project's color management settings. `settings_json`
+/// must deserialize into `kcreate_core::color::ColorSettings`.
+/// Records an undoable `color_settings_update` operation.
+#[napi]
+pub fn color_settings_update(settings_json: String) -> NapiResult<()> {
+    phase2::color_settings_update(&settings_json).map_err(map_doc_err)
+}
+
+/// Convert a color value between color spaces. `to_space` is one of
+/// `"srgb"`, `"cmyk"`, `"lab"`, `"hsl"`. Returns the converted color
+/// as a JSON `kcreate_core::color::Color`.
+#[napi]
+pub fn color_convert(from_json: String, to_space: String) -> NapiResult<String> {
+    phase2::color_convert(&from_json, &to_space).map_err(map_doc_err)
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2 — text frame + OpenType (Block B Task 11)
+// ---------------------------------------------------------------------------
+
+/// Read the `TextFrameOptions` for a `TextLayer` node as JSON.
+///
+/// Returns the default options (single column, no hyphenation,
+/// clip overflow, top-aligned, no inset, fixed size) when the node
+/// has no `text_frame` metadata. Errors if the node id doesn't
+/// resolve or the node is not a `TextLayer`.
+#[napi]
+pub fn text_frame_get(node_id: String) -> NapiResult<String> {
+    let id = parse_uuid(&node_id)?;
+    phase2::text_frame_get(id).map_err(map_doc_err)
+}
+
+/// Replace the `TextFrameOptions` for a `TextLayer` node and record
+/// an undoable `text_frame_update` operation.
+#[napi]
+pub fn text_frame_update(node_id: String, options_json: String) -> NapiResult<()> {
+    let id = parse_uuid(&node_id)?;
+    phase2::text_frame_update(id, &options_json).map_err(map_doc_err)
+}
+
+/// Compute and return the paragraph layout for a `TextLayer` node
+/// as JSON (one entry per laid-out line with origin / baseline /
+/// width / column / glyph count plus an `overflow` flag and
+/// `usedHeight`). Pure read; does not record an operation.
+#[napi]
+pub fn text_layout_compute(node_id: String) -> NapiResult<String> {
+    let id = parse_uuid(&node_id)?;
+    phase2::text_layout_compute(id).map_err(map_doc_err)
+}
+
+/// Read the `OpenTypeFeatures` for a `TextLayer` node as JSON.
+#[napi]
+pub fn text_opentype_features_get(node_id: String) -> NapiResult<String> {
+    let id = parse_uuid(&node_id)?;
+    phase2::text_opentype_features_get(id).map_err(map_doc_err)
+}
+
+/// Replace the `OpenTypeFeatures` for a `TextLayer` node and record
+/// an undoable `text_opentype_features_update` operation.
+#[napi]
+pub fn text_opentype_features_update(node_id: String, features_json: String) -> NapiResult<()> {
+    let id = parse_uuid(&node_id)?;
+    phase2::text_opentype_features_update(id, &features_json).map_err(map_doc_err)
 }

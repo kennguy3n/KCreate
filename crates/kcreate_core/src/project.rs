@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
+use crate::color::ColorSettings;
 use crate::component::{ComponentDefinition, ComponentError};
 use crate::document::{DocumentError, DocumentGraph};
 use crate::node::{Bounds, Node, NodeType, RgbaColor};
@@ -162,6 +163,12 @@ pub struct Project {
     /// is stable across re-saves (no ordering churn).
     #[serde(default)]
     pub components: HashMap<Uuid, ComponentDefinition>,
+    /// Document-level color management settings (RGB / CMYK working
+    /// spaces, rendering intent, soft-proof). `#[serde(default)]` so
+    /// older project files still deserialize cleanly with sRGB
+    /// defaults.
+    #[serde(default)]
+    pub color_settings: ColorSettings,
     pub created_at: DateTime<Utc>,
     pub modified_at: DateTime<Utc>,
 }
@@ -217,6 +224,7 @@ impl Project {
             brand_kits: Vec::new(),
             export_presets: Vec::new(),
             components: HashMap::new(),
+            color_settings: ColorSettings::default(),
             created_at: now,
             modified_at: now,
         }
@@ -414,6 +422,26 @@ impl Project {
         let op = self.operation_log.redo()?.clone();
         self.touch_modified();
         Some(op)
+    }
+
+    /// Peek at the operation that the next [`Self::undo`] would return,
+    /// without moving the log cursor and without touching
+    /// `modified_at`. Returns a cloned [`Operation`] so the borrow on
+    /// `self.operation_log` is released immediately; callers typically
+    /// use this to apply `before_patch` against the live state and only
+    /// commit the cursor move via [`Self::undo`] on success.
+    #[must_use]
+    pub fn pending_undo(&self) -> Option<Operation> {
+        self.operation_log.peek_undo().cloned()
+    }
+
+    /// Peek at the operation that the next [`Self::redo`] would return,
+    /// without moving the log cursor and without touching
+    /// `modified_at`. See [`Self::pending_undo`] for the atomicity
+    /// rationale.
+    #[must_use]
+    pub fn pending_redo(&self) -> Option<Operation> {
+        self.operation_log.peek_redo().cloned()
     }
 
     /// Add or replace a brand kit. Replaces by `id`.

@@ -18,3 +18,8 @@ serde.workspace = true
 thiserror.workspace = true
 parking_lot.workspace = true
 log.workspace = true
+# `kcreate_text` consumes `Bounds`, `TextFrameOptions`, and
+# `OpenTypeFeatures` from `kcreate_core`. The reverse dependency does
+# not exist (`kcreate_core` is the shared types crate and depends on
+# nothing else in-tree), so this edge introduces no cycle.
+kcreate_core = { path = "../kcreate_core" }

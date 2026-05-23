@@ -1,14 +1,16 @@
 // ModelManager — local AI model lifecycle UI.
 //
-// Phase 1 surfaces:
+// Surfaces:
 //   - currently-loaded model (name, status, listening port, device tier)
 //   - effective max-model-size budget from RuntimeConfig
 //   - Start / Stop buttons, manual path input
-//
-// Download from a curated catalog is Phase 2; the user manually
-// points to a GGUF file for now.
+//   - per-pack Install / Uninstall (Phase 2): user downloads weights
+//     out-of-band from the canonical URL shown on each pack, then
+//     points the installer at the file. The Rust installer
+//     SHA-256-verifies (when a canonical hash is pinned) and
+//     atomically renames the file into `~/.kcreate/models/`.
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import type {
   LlmStatus,
@@ -22,12 +24,30 @@ export interface ModelManagerProps {
   onStatus: (msg: string | null) => void;
 }
 
+/// Install / uninstall a model pack. Lives on the parent so the
+/// PackCard can call into it via prop drilling without each card
+/// having to re-resolve `window.kcreate.aiModel`.
+interface PackActions {
+  busy: boolean;
+  install: (pack: ModelPack) => void;
+  uninstall: (pack: ModelPack) => void;
+}
+
 export function ModelManager({ onStatus }: ModelManagerProps): JSX.Element {
   const [status, setStatus] = useState<LlmStatus | null>(null);
   const [limits, setLimits] = useState<ResourceLimits | null>(null);
   const [modelPath, setModelPath] = useState("");
   const [busy, setBusy] = useState(false);
   const [packs, setPacks] = useState<ModelPack[]>([]);
+  /// Synchronous reentry-guard against the small window where the
+  /// user double-clicks Install/Uninstall fast enough that React has
+  /// not yet committed the `busy=true` state into the DOM. The Rust
+  /// installer writes a `.tmp` file and renames atomically, so two
+  /// concurrent `installModelPack` calls would race on that
+  /// scratch file. The ref short-circuits the second call *before*
+  /// any IPC fires, eliminating the race in a way the React batching
+  /// scheduler cannot defeat.
+  const inFlightPackId = useRef<string | null>(null);
 
   const refresh = useCallback(async () => {
     try {
@@ -69,6 +89,76 @@ export function ModelManager({ onStatus }: ModelManagerProps): JSX.Element {
       setBusy(false);
     }
   }, [modelPath, onStatus, refresh]);
+
+  const installPack = useCallback(
+    async (pack: ModelPack) => {
+      if (pack.kind === "built_in") return;
+      // Synchronous reentry-guard — see `inFlightPackId` docstring.
+      if (inFlightPackId.current !== null) {
+        onStatus(
+          `${pack.name}: another install/uninstall is already in flight; ignoring duplicate click.`,
+        );
+        return;
+      }
+      inFlightPackId.current = pack.id;
+      setBusy(true);
+      onStatus(`${pack.name}: pick the downloaded weights file…`);
+      try {
+        const source = await window.kcreate.aiModel.pickModelFile();
+        if (!source) {
+          onStatus(`${pack.name}: install cancelled.`);
+          return;
+        }
+        onStatus(`${pack.name}: verifying SHA-256…`);
+        const report = await window.kcreate.aiModel.installModelPack(
+          pack.id,
+          source,
+        );
+        if (report.verified) {
+          onStatus(
+            `${pack.name}: installed (verified, ${formatBytes(report.sizeBytes)}).`,
+          );
+        } else {
+          onStatus(
+            `${pack.name}: installed (UNVERIFIED — actual sha256 ${report.actualSha256.slice(0, 12)}…; registry has no pinned hash yet).`,
+          );
+        }
+        await refresh();
+      } catch (e) {
+        onStatus(`${pack.name}: install failed: ${errMsg(e)}`);
+      } finally {
+        inFlightPackId.current = null;
+        setBusy(false);
+      }
+    },
+    [onStatus, refresh],
+  );
+
+  const uninstallPack = useCallback(
+    async (pack: ModelPack) => {
+      if (pack.kind === "built_in") return;
+      if (inFlightPackId.current !== null) {
+        onStatus(
+          `${pack.name}: another install/uninstall is already in flight; ignoring duplicate click.`,
+        );
+        return;
+      }
+      inFlightPackId.current = pack.id;
+      setBusy(true);
+      onStatus(`${pack.name}: removing…`);
+      try {
+        await window.kcreate.aiModel.uninstallModelPack(pack.id);
+        onStatus(`${pack.name}: uninstalled.`);
+        await refresh();
+      } catch (e) {
+        onStatus(`${pack.name}: uninstall failed: ${errMsg(e)}`);
+      } finally {
+        inFlightPackId.current = null;
+        setBusy(false);
+      }
+    },
+    [onStatus, refresh],
+  );
 
   const handleStop = useCallback(async () => {
     setBusy(true);
@@ -163,15 +253,28 @@ export function ModelManager({ onStatus }: ModelManagerProps): JSX.Element {
         to <code style={monoStyle}>127.0.0.1</code> only.
       </p>
 
-      <ModelPacksSection packs={packs} />
+      <ModelPacksSection
+        packs={packs}
+        actions={{
+          busy,
+          install: (pack) => {
+            void installPack(pack);
+          },
+          uninstall: (pack) => {
+            void uninstallPack(pack);
+          },
+        }}
+      />
     </section>
   );
 }
 
 function ModelPacksSection({
   packs,
+  actions,
 }: {
   packs: ModelPack[];
+  actions: PackActions;
 }): JSX.Element {
   if (packs.length === 0) {
     return (
@@ -184,10 +287,10 @@ function ModelPacksSection({
     <div style={{ display: "flex", flexDirection: "column", gap: spacing.sm }}>
       <h4 style={{ margin: 0, fontSize: 12, fontWeight: 600 }}>Model packs</h4>
       {installed.length > 0 ? (
-        <PackGroup label="Installed" packs={installed} />
+        <PackGroup label="Installed" packs={installed} actions={actions} />
       ) : null}
       {available.length > 0 ? (
-        <PackGroup label="Available" packs={available} />
+        <PackGroup label="Available" packs={available} actions={actions} />
       ) : null}
     </div>
   );
@@ -196,21 +299,30 @@ function ModelPacksSection({
 function PackGroup({
   label,
   packs,
+  actions,
 }: {
   label: string;
   packs: ModelPack[];
+  actions: PackActions;
 }): JSX.Element {
   return (
     <section style={{ display: "flex", flexDirection: "column", gap: 4 }}>
       <span style={{ fontSize: 10, color: colors.textMuted, fontWeight: 600, textTransform: "uppercase", letterSpacing: 0.4 }}>{label}</span>
       {packs.map((p) => (
-        <PackCard key={p.id} pack={p} />
+        <PackCard key={p.id} pack={p} actions={actions} />
       ))}
     </section>
   );
 }
 
-function PackCard({ pack }: { pack: ModelPack }): JSX.Element {
+function PackCard({
+  pack,
+  actions,
+}: {
+  pack: ModelPack;
+  actions: PackActions;
+}): JSX.Element {
+  const optional = pack.kind !== "built_in";
   return (
     <article
       style={{
@@ -219,34 +331,110 @@ function PackCard({ pack }: { pack: ModelPack }): JSX.Element {
         borderRadius: radius.card,
         background: colors.bg,
         display: "flex",
-        alignItems: "center",
-        gap: spacing.sm,
+        flexDirection: "column",
+        gap: 4,
       }}
     >
-      <div style={{ flex: 1, minWidth: 0 }}>
-        <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
-          <strong style={{ fontSize: 12 }}>{pack.name}</strong>
-          <CategoryPill category={pack.category} />
+      <div style={{ display: "flex", alignItems: "center", gap: spacing.sm }}>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+            <strong style={{ fontSize: 12 }}>{pack.name}</strong>
+            <CategoryPill category={pack.category} />
+          </div>
+          <div
+            style={{
+              fontSize: 10,
+              color: colors.textMuted,
+              overflow: "hidden",
+              textOverflow: "ellipsis",
+              whiteSpace: "nowrap",
+            }}
+          >
+            {pack.capabilities.join(", ") || "—"}
+          </div>
         </div>
-        <div
+        <span style={{ fontSize: 10, color: colors.textMuted }}>
+          {pack.kind === "built_in"
+            ? "built-in"
+            : formatBytes(pack.sizeBytes)}
+        </span>
+        {optional ? (
+          pack.installed ? (
+            <button
+              type="button"
+              onClick={() => actions.uninstall(pack)}
+              disabled={actions.busy}
+              style={packSecondaryBtnStyle(actions.busy)}
+            >
+              Uninstall
+            </button>
+          ) : (
+            <button
+              type="button"
+              onClick={() => actions.install(pack)}
+              disabled={actions.busy || pack.downloadUrl === ""}
+              style={packPrimaryBtnStyle(actions.busy || pack.downloadUrl === "")}
+            >
+              Install…
+            </button>
+          )
+        ) : null}
+      </div>
+      {optional && pack.downloadUrl && !pack.installed ? (
+        <a
+          href={pack.downloadUrl}
+          target="_blank"
+          rel="noreferrer"
           style={{
             fontSize: 10,
-            color: colors.textMuted,
+            color: colors.accent,
             overflow: "hidden",
             textOverflow: "ellipsis",
             whiteSpace: "nowrap",
           }}
+          title={pack.downloadUrl}
         >
-          {pack.capabilities.join(", ") || "—"}
-        </div>
-      </div>
-      <span style={{ fontSize: 10, color: colors.textMuted }}>
-        {pack.kind === "built_in"
-          ? "built-in"
-          : `${(pack.sizeBytes / 1024 / 1024).toFixed(0)} MB`}
-      </span>
+          Download weights ↗
+        </a>
+      ) : null}
     </article>
   );
+}
+
+/// Format a byte count for display. `0` would otherwise render as
+/// "0 MB" which is misleading for built-in packs, so the caller is
+/// expected to avoid passing 0 here.
+function formatBytes(bytes: number): string {
+  if (bytes >= 1_000_000_000) return `${(bytes / 1_000_000_000).toFixed(1)} GB`;
+  if (bytes >= 1_000_000) return `${(bytes / 1_000_000).toFixed(0)} MB`;
+  if (bytes >= 1_000) return `${(bytes / 1_000).toFixed(0)} KB`;
+  return `${bytes} B`;
+}
+
+function packPrimaryBtnStyle(disabled: boolean): React.CSSProperties {
+  return {
+    padding: "3px 8px",
+    background: disabled ? colors.bgSoft : colors.accent,
+    color: disabled ? colors.textMuted : "white",
+    border: "none",
+    borderRadius: radius.pill,
+    cursor: disabled ? "default" : "pointer",
+    fontSize: 10,
+    fontWeight: 600,
+  };
+}
+
+function packSecondaryBtnStyle(disabled: boolean): React.CSSProperties {
+  return {
+    padding: "3px 8px",
+    background: "transparent",
+    color: disabled ? colors.textMuted : colors.text,
+    border: `1px solid ${colors.border}`,
+    borderRadius: radius.pill,
+    cursor: disabled ? "default" : "pointer",
+    fontSize: 10,
+    fontWeight: 600,
+  };
 }
 
 function CategoryPill({

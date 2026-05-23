@@ -23,6 +23,7 @@
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 
+pub mod color;
 pub mod component;
 pub mod config;
 pub mod document;
@@ -30,6 +31,11 @@ pub mod node;
 pub mod operation;
 pub mod project;
 
+pub use color::{
+    cmyk_to_srgb, color_distance_cie76, hsl_to_srgb, lab_to_srgb, linear_to_srgb, srgb_to_cmyk,
+    srgb_to_hsl, srgb_to_lab, srgb_to_linear, srgb_to_xyz_d65, xyz_d65_to_srgb, Color,
+    ColorSettings, IccProfile, RenderingIntent,
+};
 pub use component::{
     ComponentDefinition, ComponentError, ComponentInstance, ComponentVariant,
     COMPONENT_INSTANCE_METADATA_KEY,
@@ -38,10 +44,12 @@ pub use config::{DeviceTier, Platform, RuntimeConfig};
 pub use document::{DocumentError, DocumentGraph};
 pub use node::{
     standard_presets, ArtboardPreset, BlendMode, Bounds, Constraint, Constraints, Effect,
-    FillStyle, GradientKind, GradientStop, Interaction, InteractionAction, InteractionTrigger,
-    Margins, Node, NodeStyle, NodeType, PageLayout, PageOrientation, PageSize, Point2D,
-    PresetCategory, RgbaColor, StrokeStyle, Transform2D, INTERACTIONS_METADATA_KEY,
-    MASTER_PAGE_METADATA_KEY, PAGE_LAYOUT_METADATA_KEY,
+    FillStyle, FrameInsets, GradientKind, GradientStop, Interaction, InteractionAction,
+    InteractionTrigger, Margins, Node, NodeStyle, NodeType, OpenTypeFeatures, PageLayout,
+    PageOrientation, PageSize, Point2D, PresetCategory, RgbaColor, StrokeStyle, TextAutoSize,
+    TextFrameOptions, TextOverflow, TextWrapMode, Transform2D, VerticalAlign,
+    INTERACTIONS_METADATA_KEY, MASTER_PAGE_METADATA_KEY, OPENTYPE_FEATURES_METADATA_KEY,
+    PAGE_LAYOUT_METADATA_KEY, TEXT_FRAME_METADATA_KEY,
 };
 pub use operation::{Operation, OperationLog};
 pub use project::{

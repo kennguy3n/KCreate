@@ -1,0 +1,29 @@
+[package]
+name = "kcreate_collab"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "LAN collaboration protocol types for KCreate (Phase 3 foundation)"
+publish = false
+
+[lints]
+workspace = true
+
+# Phase 3 foundation: types for optional LAN collaboration. This crate
+# is kept OUT of the editing-path dependency tree (see
+# `crates/kcreate_tests/tests/local_first.rs::editing_path_crates`) so
+# adding networked transports later (mDNS discovery, QUIC, etc.)
+# cannot accidentally violate the local-first invariant.
+[dependencies]
+kcreate_core = { path = "../kcreate_core" }
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+thiserror.workspace = true
+uuid = { workspace = true, features = ["v4", "serde"] }
+ed25519-dalek.workspace = true
+blake3.workspace = true
+base64.workspace = true
+chrono = { workspace = true, features = ["serde"] }

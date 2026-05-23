@@ -30,7 +30,8 @@ pub use llm_chat::{
 };
 pub use llm_sidecar::{LlmSidecar, SidecarConfig, SidecarError, SidecarResult, SidecarStatus};
 pub use model_registry::{
-    is_installed, list_model_packs, pack_path, ModelKind, ModelPack, ModelPackCategory,
+    install_model_pack, is_installed, list_model_packs, pack_path, uninstall_model_pack,
+    InstallError, InstallReport, ModelKind, ModelPack, ModelPackCategory,
 };
 pub use palette::{extract_palette, ExtractedColor};
 pub use screenshot_to_layout::{

@@ -1261,6 +1261,28 @@ export interface ModelPack {
   sizeBytes: number;
   filePath: string;
   installed: boolean;
+  /// Canonical out-of-band download URL. KCreate never fetches this
+  /// itself — the user downloads the weights and points the
+  /// installer at the file. Empty for built-in packs.
+  downloadUrl: string;
+  /// Hex-encoded SHA-256 of the canonical weights. Empty when the
+  /// registry hasn't pinned a hash yet — see the comment on the
+  /// Rust mirror at `crates/kcreate_ai/src/model_registry.rs`.
+  sha256: string;
+}
+
+/// Result of a successful `aiModel.install()` call. Mirrors
+/// `kcreate_ai::model_registry::InstallReport`.
+export interface ModelInstallReport {
+  packId: string;
+  /// Hex-encoded SHA-256 of the bytes actually written into
+  /// `models_dir`.
+  actualSha256: string;
+  /// `true` iff the registry carried a non-empty canonical hash and
+  /// it matched the source file. `false` means the file installed
+  /// but couldn't be cross-checked against a canonical hash.
+  verified: boolean;
+  sizeBytes: number;
 }
 
 export type ScreenshotElementType =
@@ -1306,6 +1328,18 @@ export interface AiModelBridge {
     tolerance: number,
   ): Promise<string>;
   listModelPacks(): Promise<ModelPack[]>;
+  /// Open the native file picker scoped to weights files and return
+  /// the chosen absolute path (or `null` if the user cancelled).
+  pickModelFile(): Promise<string | null>;
+  /// Install a model pack from a user-provided source file. The
+  /// install is atomic — partial writes never land in the models
+  /// directory.
+  installModelPack(
+    packId: string,
+    sourcePath: string,
+  ): Promise<ModelInstallReport>;
+  /// Uninstall a model pack by deleting its file. Idempotent.
+  uninstallModelPack(packId: string): Promise<void>;
   screenshotToLayout(request: ScreenshotRequest): Promise<ScreenshotElement[]>;
 }
 

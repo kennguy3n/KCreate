@@ -5,6 +5,7 @@
 import {
   app,
   BrowserWindow,
+  dialog,
   ipcMain,
   WebContentsView,
   type IpcMainInvokeEvent,
@@ -1210,6 +1211,41 @@ function registerIpcHandlers(): void {
   ipcMain.handle("kcreate/ai/listModelPacks", () =>
     requireBridge().aiListModelPacks(),
   );
+  // `kcreate/ai/installModelPack` is a *trusted* main-process IPC:
+  // the renderer hands us the user-picked file path returned by the
+  // file-picker (`kcreate/ai/pickModelFile` below), and we pass it
+  // through to the Rust installer. The Rust side verifies SHA-256
+  // (if the registry has a pinned hash) and atomically renames the
+  // file into `models_dir` — we never have to deal with partial
+  // writes or hash drift in the IPC layer.
+  ipcMain.handle(
+    "kcreate/ai/installModelPack",
+    (_e, packId: string, sourcePath: string) =>
+      requireBridge().aiInstallModelPack(packId, sourcePath),
+  );
+  ipcMain.handle("kcreate/ai/uninstallModelPack", (_e, packId: string) => {
+    requireBridge().aiUninstallModelPack(packId);
+  });
+  // Native file picker scoped to weights files (ONNX / GGUF / a
+  // wildcard fallback so users can still install future formats
+  // without a code change). Returns the absolute path or `null` if
+  // the user cancelled. Done in the main process because Electron's
+  // `dialog` module is main-only — exposing it through the preload
+  // would be an unnecessary surface expansion.
+  ipcMain.handle("kcreate/ai/pickModelFile", async () => {
+    const win = mainWindow;
+    if (!win) return null;
+    const result = await dialog.showOpenDialog(win, {
+      title: "Select downloaded model weights",
+      properties: ["openFile"],
+      filters: [
+        { name: "Model weights", extensions: ["onnx", "gguf", "safetensors"] },
+        { name: "All files", extensions: ["*"] },
+      ],
+    });
+    if (result.canceled || result.filePaths.length === 0) return null;
+    return result.filePaths[0];
+  });
   ipcMain.handle(
     "kcreate/ai/screenshotToLayout",
     (_e, requestJson: string) =>

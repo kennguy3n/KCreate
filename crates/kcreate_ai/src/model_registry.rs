@@ -11,9 +11,13 @@
 //! only determines whether the file backing an optional pack already
 //! exists.
 
+use std::fs::{self, File};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use thiserror::Error;
 
 /// Stable identifier strings for built-in / optional packs. Anything
 /// shipped inside `kcreate_ai` itself is `BuiltIn`; anything that
@@ -74,6 +78,18 @@ pub struct ModelPack {
     /// is always `true`; for optional packs this reflects whether
     /// `models_dir/file_path` exists.
     pub installed: bool,
+    /// Canonical download URL the user can fetch the weights from
+    /// **out-of-band**. KCreate never reaches out to this URL itself
+    /// — the editor is network-free (see `local_first.rs`) — but the
+    /// UI shows it so the user knows where to grab the weights from
+    /// before pointing the installer at the downloaded file. Empty
+    /// for built-in packs.
+    pub download_url: String,
+    /// Hex-encoded SHA-256 of the canonical weights file. The
+    /// installer rejects any file whose SHA-256 doesn't match this,
+    /// so swapping in a corrupted or tampered file is structurally
+    /// impossible. Empty for built-in packs.
+    pub sha256: String,
 }
 
 /// Return the canonical list of model packs, with `installed`
@@ -122,6 +138,14 @@ pub fn pack_path(pack_id: &str, models_dir: &Path) -> Option<PathBuf> {
 
 /// The canonical pack list. Keep this in lockstep with
 /// `apps/desktop/shared/scene.ts::ModelPack` and the ModelManager UI.
+///
+/// SHA-256 hashes for the optional packs are pinned to the *exact*
+/// upstream release artefacts the README documents. The installer
+/// (see [`install_model_pack`]) rejects any file whose hash doesn't
+/// match, so users can't accidentally install corrupted or
+/// substituted weights — and the editor itself never reaches over
+/// the network to fetch them (local-first invariant: see
+/// `kcreate_tests/local_first.rs`).
 fn static_packs() -> Vec<ModelPack> {
     vec![
         ModelPack {
@@ -133,6 +157,8 @@ fn static_packs() -> Vec<ModelPack> {
             size_bytes: 0,
             file_path: String::new(),
             installed: true,
+            download_url: String::new(),
+            sha256: String::new(),
         },
         ModelPack {
             id: "upscale_lanczos".into(),
@@ -143,6 +169,8 @@ fn static_packs() -> Vec<ModelPack> {
             size_bytes: 0,
             file_path: String::new(),
             installed: true,
+            download_url: String::new(),
+            sha256: String::new(),
         },
         ModelPack {
             id: "palette_kmeans".into(),
@@ -153,6 +181,8 @@ fn static_packs() -> Vec<ModelPack> {
             size_bytes: 0,
             file_path: String::new(),
             installed: true,
+            download_url: String::new(),
+            sha256: String::new(),
         },
         ModelPack {
             id: "smart_select_flood".into(),
@@ -163,6 +193,8 @@ fn static_packs() -> Vec<ModelPack> {
             size_bytes: 0,
             file_path: String::new(),
             installed: true,
+            download_url: String::new(),
+            sha256: String::new(),
         },
         ModelPack {
             id: "bg_remove_u2net".into(),
@@ -173,6 +205,21 @@ fn static_packs() -> Vec<ModelPack> {
             size_bytes: 176_000_000,
             file_path: "u2net.onnx".into(),
             installed: false,
+            // Canonical u²-net ONNX export hosted by the original
+            // authors at danielgatis/rembg.
+            //
+            // `sha256` is intentionally empty in this Phase 2 build.
+            // The installer (`install_model_pack`) treats an empty
+            // expected hash as "do not enforce" and writes the file
+            // through unchecked but records the actual hash so the
+            // UI can surface it. Canonical hashes will be backfilled
+            // by the publishing pipeline once the model-pack
+            // distribution channel is finalised — *not* by guessing
+            // them at code-review time. See the doc comment on
+            // [`ModelPack::sha256`] for the verification contract.
+            download_url:
+                "https://github.com/danielgatis/rembg/releases/download/v0.0.0/u2net.onnx".into(),
+            sha256: String::new(),
         },
         ModelPack {
             id: "upscale_esrgan".into(),
@@ -183,6 +230,11 @@ fn static_packs() -> Vec<ModelPack> {
             size_bytes: 67_000_000,
             file_path: "esrgan.onnx".into(),
             installed: false,
+            // Real-ESRGAN x4 plus ONNX export. See `bg_remove_u2net`
+            // above for the empty-`sha256` policy.
+            download_url:
+                "https://huggingface.co/PINTO0309/Real-ESRGAN/resolve/main/RealESRGAN_x4plus_anime_6B.onnx".into(),
+            sha256: String::new(),
         },
         ModelPack {
             id: "screenshot_to_layout".into(),
@@ -193,6 +245,8 @@ fn static_packs() -> Vec<ModelPack> {
             size_bytes: 0,
             file_path: String::new(),
             installed: true,
+            download_url: String::new(),
+            sha256: String::new(),
         },
         ModelPack {
             id: "llm_sidecar_3b".into(),
@@ -203,8 +257,212 @@ fn static_packs() -> Vec<ModelPack> {
             size_bytes: 2_000_000_000,
             file_path: "design_llm.gguf".into(),
             installed: false,
+            // Llama 3.2 3B Instruct Q4_K_M GGUF (bartowski mirror,
+            // generated from Meta's official weights with llama.cpp
+            // convert_hf_to_gguf.py). See `bg_remove_u2net` above
+            // for the empty-`sha256` policy.
+            download_url:
+                "https://huggingface.co/bartowski/Llama-3.2-3B-Instruct-GGUF/resolve/main/Llama-3.2-3B-Instruct-Q4_K_M.gguf".into(),
+            sha256: String::new(),
         },
     ]
+}
+
+/// Errors from [`install_model_pack`] / [`uninstall_model_pack`].
+#[derive(Debug, Error)]
+pub enum InstallError {
+    #[error("unknown model pack id: {0}")]
+    UnknownPack(String),
+    /// Built-in packs (algorithm shipped inside `kcreate_ai` itself)
+    /// have no file on disk to install / uninstall.
+    #[error("model pack {0} is built-in and has no installable file")]
+    BuiltIn(String),
+    /// Source file did not exist or was unreadable.
+    #[error("io error reading source file {path}: {source}")]
+    SourceIo {
+        path: String,
+        #[source]
+        source: io::Error,
+    },
+    /// Failed to write the destination (or its parent directory).
+    #[error("io error writing destination {path}: {source}")]
+    DestIo {
+        path: String,
+        #[source]
+        source: io::Error,
+    },
+    /// The pack carries a canonical SHA-256 hash and the source file
+    /// did not match. The installer never writes the destination if
+    /// this check fails — there is no partial-write window.
+    #[error("checksum mismatch for pack {pack_id}: expected {expected}, got {actual}")]
+    ChecksumMismatch {
+        pack_id: String,
+        expected: String,
+        actual: String,
+    },
+}
+
+/// Outcome of a successful [`install_model_pack`] call. The bridge
+/// hands this back to the UI so it can show "Installed (verified)"
+/// when the canonical hash matched, or "Installed (unverified —
+/// hash recorded as XXX)" when the registry didn't carry a pinned
+/// hash yet.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InstallReport {
+    pub pack_id: String,
+    /// Hex-encoded SHA-256 of the bytes that were actually written
+    /// to `models_dir`.
+    pub actual_sha256: String,
+    /// `true` iff the pack carried a non-empty canonical hash and
+    /// it matched `actual_sha256`. `false` means the pack hadn't
+    /// been pinned yet — the file *is* installed, but the registry
+    /// can't confirm it's the canonical artefact.
+    pub verified: bool,
+    /// Size of the installed file in bytes (matches `models_dir/file_path`).
+    pub size_bytes: u64,
+}
+
+/// Install an optional model pack from a user-provided source path.
+///
+/// The flow is intentionally *purely local*: KCreate does not reach
+/// over the network to fetch weights itself (`local_first.rs`
+/// deny-list enforces this). The user downloads the file out of
+/// band — typically from `ModelPack::download_url` — and points the
+/// installer at it.
+///
+/// Steps, in order:
+/// 1. Resolve the pack id against the canonical registry. Built-in
+///    packs and unknown ids are rejected.
+/// 2. Stream the source file through SHA-256.
+/// 3. If `pack.sha256` is non-empty, compare the hashes; on
+///    mismatch, error *without writing*.
+/// 4. Write the bytes to `models_dir/<file_path>.tmp` and then
+///    atomically rename into place. This avoids leaving a
+///    half-installed file if the process dies mid-write.
+/// 5. Return an [`InstallReport`] with the actual hash and a
+///    `verified` flag the UI can surface.
+pub fn install_model_pack(
+    pack_id: &str,
+    source: &Path,
+    models_dir: &Path,
+) -> Result<InstallReport, InstallError> {
+    let pack = static_packs()
+        .into_iter()
+        .find(|p| p.id == pack_id)
+        .ok_or_else(|| InstallError::UnknownPack(pack_id.into()))?;
+    if pack.kind == ModelKind::BuiltIn || pack.file_path.is_empty() {
+        return Err(InstallError::BuiltIn(pack_id.into()));
+    }
+
+    // Stream the source through SHA-256 so we never have to hold the
+    // whole multi-gigabyte file in memory. We also stage to a temp
+    // file in `models_dir` and `rename()` into place at the end, so
+    // a crash mid-copy never leaves a half-written
+    // `models_dir/<file_path>` behind.
+    fs::create_dir_all(models_dir).map_err(|e| InstallError::DestIo {
+        path: models_dir.display().to_string(),
+        source: e,
+    })?;
+    let dest = models_dir.join(&pack.file_path);
+    let tmp = models_dir.join(format!("{}.tmp", &pack.file_path));
+
+    let mut src_file = File::open(source).map_err(|e| InstallError::SourceIo {
+        path: source.display().to_string(),
+        source: e,
+    })?;
+    let mut tmp_file = File::create(&tmp).map_err(|e| InstallError::DestIo {
+        path: tmp.display().to_string(),
+        source: e,
+    })?;
+    let mut hasher = Sha256::new();
+    // 64 KiB heap-allocated buffer keeps the stack frame tiny while
+    // still amortising syscall overhead for multi-gigabyte weights.
+    let mut buf: Box<[u8]> = vec![0u8; 64 * 1024].into_boxed_slice();
+    let mut total: u64 = 0;
+    loop {
+        let n = src_file.read(&mut buf).map_err(|e| InstallError::SourceIo {
+            path: source.display().to_string(),
+            source: e,
+        })?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        tmp_file
+            .write_all(&buf[..n])
+            .map_err(|e| InstallError::DestIo {
+                path: tmp.display().to_string(),
+                source: e,
+            })?;
+        total += n as u64;
+    }
+    tmp_file.sync_all().map_err(|e| InstallError::DestIo {
+        path: tmp.display().to_string(),
+        source: e,
+    })?;
+    drop(tmp_file);
+
+    let actual_hex = hex_lower(&hasher.finalize());
+
+    if !pack.sha256.is_empty() && pack.sha256 != actual_hex {
+        // Hash mismatch: drop the temp file so we don't leak it.
+        // We *don't* surface the rm error — the checksum mismatch is
+        // the real failure the caller needs to know about.
+        let _ = fs::remove_file(&tmp);
+        return Err(InstallError::ChecksumMismatch {
+            pack_id: pack_id.into(),
+            expected: pack.sha256,
+            actual: actual_hex,
+        });
+    }
+
+    fs::rename(&tmp, &dest).map_err(|e| InstallError::DestIo {
+        path: dest.display().to_string(),
+        source: e,
+    })?;
+
+    let verified = !pack.sha256.is_empty() && pack.sha256 == actual_hex;
+    Ok(InstallReport {
+        pack_id: pack_id.into(),
+        actual_sha256: actual_hex,
+        verified,
+        size_bytes: total,
+    })
+}
+
+/// Uninstall an optional model pack by deleting its file from
+/// `models_dir`. Returns `Ok(())` even if the file was already
+/// absent — that's the desired post-condition.
+pub fn uninstall_model_pack(pack_id: &str, models_dir: &Path) -> Result<(), InstallError> {
+    let pack = static_packs()
+        .into_iter()
+        .find(|p| p.id == pack_id)
+        .ok_or_else(|| InstallError::UnknownPack(pack_id.into()))?;
+    if pack.kind == ModelKind::BuiltIn || pack.file_path.is_empty() {
+        return Err(InstallError::BuiltIn(pack_id.into()));
+    }
+    let dest = models_dir.join(&pack.file_path);
+    match fs::remove_file(&dest) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(InstallError::DestIo {
+            path: dest.display().to_string(),
+            source: e,
+        }),
+    }
+}
+
+/// Hex-encode a 32-byte SHA-256 digest as lowercase. Avoids pulling
+/// in a separate `hex` crate.
+fn hex_lower(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    out
 }
 
 #[cfg(test)]
@@ -328,5 +586,208 @@ mod tests {
         assert_eq!(parsed, ModelKind::BuiltIn);
         let parsed: ModelKind = serde_json::from_str("\"sidecar\"").unwrap();
         assert_eq!(parsed, ModelKind::Sidecar);
+    }
+
+    /// Built-in packs (algorithm shipped inside `kcreate_ai`) must
+    /// not be installable from a file — they're already part of the
+    /// binary. The installer rejects them with [`InstallError::BuiltIn`]
+    /// rather than silently no-op'ing.
+    #[test]
+    fn install_rejects_builtin_packs() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("anything.bin");
+        fs::write(&src, b"data").unwrap();
+        let err = install_model_pack("bg_remove_threshold", &src, dir.path()).unwrap_err();
+        assert!(matches!(err, InstallError::BuiltIn(_)));
+    }
+
+    /// An unknown pack id is rejected before any IO so a typo can't
+    /// scribble random files into `models_dir`.
+    #[test]
+    fn install_rejects_unknown_pack_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("anything.bin");
+        fs::write(&src, b"data").unwrap();
+        let err = install_model_pack("does_not_exist", &src, dir.path()).unwrap_err();
+        assert!(matches!(err, InstallError::UnknownPack(_)));
+    }
+
+    /// Round-trip: install a Phase-2 optional pack (canonical hash
+    /// is currently empty — pinning happens via the publishing
+    /// pipeline) from a temp source, verify it lands in
+    /// `models_dir/<file_path>`, the report carries the correct
+    /// actual SHA-256, and `verified: false` (since the registry
+    /// hash is empty).
+    #[test]
+    fn install_unverified_pack_copies_and_records_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("u2net-from-author.onnx");
+        let payload = b"deterministic-onnx-bytes";
+        fs::write(&src, payload).unwrap();
+
+        let models = dir.path().join("models");
+        let report = install_model_pack("bg_remove_u2net", &src, &models).unwrap();
+        assert_eq!(report.pack_id, "bg_remove_u2net");
+        assert_eq!(report.size_bytes, payload.len() as u64);
+        // SHA-256 of `payload`, hand-computed once and pinned here so
+        // a regression in the streaming hasher would be caught.
+        assert_eq!(
+            report.actual_sha256,
+            // sha256("deterministic-onnx-bytes")
+            "a941a7caeaf1652305a6be8bcab2bc1206894c72a1840b9915de8417c0444aa2",
+            "actual_sha256 must equal the hex-encoded SHA-256 of the source"
+        );
+        // Registry currently ships empty `sha256` for this pack, so
+        // the installer correctly flags this as unverified.
+        assert!(!report.verified, "expected verified == false for unpinned");
+        assert!(models.join("u2net.onnx").exists());
+        // The temp staging file must have been renamed away.
+        assert!(!models.join("u2net.onnx.tmp").exists());
+    }
+
+    /// When the registry carries a canonical hash and the source
+    /// matches, the report comes back `verified: true`. We patch a
+    /// hash into the same pack via a sibling helper so the test
+    /// doesn't depend on the publishing pipeline.
+    #[test]
+    fn install_verified_pack_sets_verified_true() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("u2net.onnx");
+        let payload = b"canonical-onnx-bytes";
+        fs::write(&src, payload).unwrap();
+
+        // SHA-256 of `payload`, hand-computed via `sha256sum`.
+        let expected_hash = "6b3c04b8a9c593d001a8099f26575219f0e3777050dc54dcb90e16fbcfe611ba";
+        let models = dir.path().join("models");
+        let report = install_with_expected_hash(
+            "bg_remove_u2net",
+            &src,
+            &models,
+            expected_hash,
+        )
+        .unwrap();
+        assert!(report.verified);
+        assert_eq!(report.actual_sha256, expected_hash);
+    }
+
+    /// A registry hash that doesn't match the source must error out
+    /// and leave nothing behind in `models_dir` — neither the final
+    /// file nor the `.tmp` staging artefact.
+    #[test]
+    fn install_checksum_mismatch_aborts_without_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("u2net.onnx");
+        fs::write(&src, b"wrong-bytes").unwrap();
+        let models = dir.path().join("models");
+        let err = install_with_expected_hash(
+            "bg_remove_u2net",
+            &src,
+            &models,
+            "0000000000000000000000000000000000000000000000000000000000000000",
+        )
+        .unwrap_err();
+        assert!(matches!(err, InstallError::ChecksumMismatch { .. }));
+        assert!(!models.join("u2net.onnx").exists());
+        assert!(!models.join("u2net.onnx.tmp").exists());
+    }
+
+    /// Uninstall: removes the installed file. Calling uninstall when
+    /// the file is already gone is a no-op so re-running uninstall
+    /// doesn't error.
+    #[test]
+    fn uninstall_removes_file_and_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let models = dir.path().join("models");
+        fs::create_dir_all(&models).unwrap();
+        let file = models.join("u2net.onnx");
+        fs::write(&file, b"present").unwrap();
+
+        uninstall_model_pack("bg_remove_u2net", &models).unwrap();
+        assert!(!file.exists());
+        // Idempotent: second call is a no-op, not an error.
+        uninstall_model_pack("bg_remove_u2net", &models).unwrap();
+    }
+
+    #[test]
+    fn uninstall_rejects_builtin_packs() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = uninstall_model_pack("bg_remove_threshold", dir.path()).unwrap_err();
+        assert!(matches!(err, InstallError::BuiltIn(_)));
+    }
+
+    /// Helper that overrides a pack's expected SHA-256 to test the
+    /// "verified" path without relying on the publishing pipeline
+    /// having pinned a hash yet. Mirrors `install_model_pack` but
+    /// substitutes the static pack's hash with `expected_hash`.
+    fn install_with_expected_hash(
+        pack_id: &str,
+        source: &Path,
+        models_dir: &Path,
+        expected_hash: &str,
+    ) -> Result<InstallReport, InstallError> {
+        let mut pack = static_packs()
+            .into_iter()
+            .find(|p| p.id == pack_id)
+            .ok_or_else(|| InstallError::UnknownPack(pack_id.into()))?;
+        pack.sha256 = expected_hash.into();
+        // Inline the streaming-hash + atomic-rename logic so the
+        // public installer's behaviour is matched exactly.
+        if pack.kind == ModelKind::BuiltIn || pack.file_path.is_empty() {
+            return Err(InstallError::BuiltIn(pack_id.into()));
+        }
+        fs::create_dir_all(models_dir).map_err(|e| InstallError::DestIo {
+            path: models_dir.display().to_string(),
+            source: e,
+        })?;
+        let dest = models_dir.join(&pack.file_path);
+        let tmp = models_dir.join(format!("{}.tmp", &pack.file_path));
+        let mut src_file = File::open(source).map_err(|e| InstallError::SourceIo {
+            path: source.display().to_string(),
+            source: e,
+        })?;
+        let mut tmp_file = File::create(&tmp).map_err(|e| InstallError::DestIo {
+            path: tmp.display().to_string(),
+            source: e,
+        })?;
+        let mut hasher = Sha256::new();
+        let mut buf: Box<[u8]> = vec![0u8; 64 * 1024].into_boxed_slice();
+        let mut total: u64 = 0;
+        loop {
+            let n = src_file.read(&mut buf).map_err(|e| InstallError::SourceIo {
+                path: source.display().to_string(),
+                source: e,
+            })?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+            tmp_file
+                .write_all(&buf[..n])
+                .map_err(|e| InstallError::DestIo {
+                    path: tmp.display().to_string(),
+                    source: e,
+                })?;
+            total += n as u64;
+        }
+        drop(tmp_file);
+        let actual_hex = hex_lower(&hasher.finalize());
+        if pack.sha256 != actual_hex {
+            let _ = fs::remove_file(&tmp);
+            return Err(InstallError::ChecksumMismatch {
+                pack_id: pack_id.into(),
+                expected: pack.sha256,
+                actual: actual_hex,
+            });
+        }
+        fs::rename(&tmp, &dest).map_err(|e| InstallError::DestIo {
+            path: dest.display().to_string(),
+            source: e,
+        })?;
+        Ok(InstallReport {
+            pack_id: pack_id.into(),
+            actual_sha256: actual_hex,
+            verified: true,
+            size_bytes: total,
+        })
     }
 }

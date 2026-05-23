@@ -1640,6 +1640,26 @@ pub fn ai_list_model_packs() -> NapiResult<String> {
     phase2::ai_models_list().map_err(map_doc_err)
 }
 
+/// Install an optional model pack from a user-provided source path.
+/// `pack_id` must match a non-built-in entry in
+/// [`ai_list_model_packs`]; `source_path` is the absolute path to
+/// the weights file the user downloaded out of band (KCreate does
+/// not fetch from the network itself). Returns the
+/// [`kcreate_ai::InstallReport`] JSON describing the actual hash
+/// and the `verified` flag.
+#[napi]
+pub fn ai_install_model_pack(pack_id: String, source_path: String) -> NapiResult<String> {
+    phase2::ai_model_install(pack_id, source_path).map_err(map_doc_err)
+}
+
+/// Uninstall an optional model pack by deleting its file from the
+/// models directory. Idempotent — uninstalling an already-absent
+/// pack returns Ok.
+#[napi]
+pub fn ai_uninstall_model_pack(pack_id: String) -> NapiResult<()> {
+    phase2::ai_model_uninstall(pack_id).map_err(map_doc_err)
+}
+
 /// Run edge-detection + connected-component analysis over the
 /// supplied RGBA8 screenshot and return the detected UI regions.
 #[napi]

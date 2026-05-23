@@ -310,6 +310,8 @@ export interface Bridge {
     tolerance: number,
   ): string;
   aiListModelPacks(): string;
+  aiInstallModelPack(packId: string, sourcePath: string): string;
+  aiUninstallModelPack(packId: string): void;
   aiScreenshotToLayout(requestJson: string): string;
   pluginList(): string;
   pluginEnable(id: string): void;

@@ -330,6 +330,30 @@ pub fn ai_models_list() -> Result<String> {
     Ok(serde_json::to_string(&packs)?)
 }
 
+/// Install an optional model pack from a user-provided source path.
+/// The bridge passes through to [`kcreate_ai::install_model_pack`];
+/// the JSON return value is the full [`kcreate_ai::InstallReport`]
+/// so the UI can show the resulting hash + verified flag.
+pub fn ai_model_install(pack_id: String, source_path: String) -> Result<String> {
+    let dir = ai_models_dir();
+    let source = std::path::PathBuf::from(source_path);
+    let report = kcreate_ai::install_model_pack(&pack_id, &source, &dir).map_err(|e| {
+        DocumentBridgeError::Io(std::io::Error::other(e.to_string()))
+    })?;
+    Ok(serde_json::to_string(&report)?)
+}
+
+/// Uninstall an optional model pack by deleting its file from the
+/// models directory. Built-in packs are rejected — see
+/// [`kcreate_ai::uninstall_model_pack`].
+pub fn ai_model_uninstall(pack_id: String) -> Result<()> {
+    let dir = ai_models_dir();
+    kcreate_ai::uninstall_model_pack(&pack_id, &dir).map_err(|e| {
+        DocumentBridgeError::Io(std::io::Error::other(e.to_string()))
+    })?;
+    Ok(())
+}
+
 fn ai_models_dir() -> PathBuf {
     if let Ok(env) = std::env::var("KCREATE_MODELS_DIR") {
         return PathBuf::from(env);

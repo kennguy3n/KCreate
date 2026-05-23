@@ -23,6 +23,11 @@ kcreate_core = { path = "../kcreate_core" }
 log.workspace = true
 rayon.workspace = true
 base64.workspace = true
+# `sha2` is used by the model-pack installer (`install_model_pack`)
+# to verify the SHA-256 of weights files the user points at. Pure
+# Rust, no networking, no dynamic linking — safe to depend on from
+# the editing path.
+sha2 = "0.10"
 # `ureq` is the blocking HTTP client used by the LLM sidecar (Tasks
 # 16–18) to talk to `llama-server` over loopback (127.0.0.1). It is
 # gated behind the `llm_sidecar` feature so default builds — and the

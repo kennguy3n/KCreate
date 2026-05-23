@@ -74,6 +74,7 @@ import type {
   McpPermissionBridge,
   McpPermissionGrant,
   McpStatus,
+  ModelInstallReport,
   ModelPack,
   JsPanelInfo,
   JsPanelMessage,
@@ -1128,6 +1129,25 @@ const aiModel: AiModelBridge = {
       "kcreate/ai/listModelPacks",
     )) as string;
     return JSON.parse(raw) as ModelPack[];
+  },
+  async pickModelFile(): Promise<string | null> {
+    return (await ipcRenderer.invoke(
+      "kcreate/ai/pickModelFile",
+    )) as string | null;
+  },
+  async installModelPack(
+    packId: string,
+    sourcePath: string,
+  ): Promise<ModelInstallReport> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/ai/installModelPack",
+      packId,
+      sourcePath,
+    )) as string;
+    return JSON.parse(raw) as ModelInstallReport;
+  },
+  async uninstallModelPack(packId: string): Promise<void> {
+    await ipcRenderer.invoke("kcreate/ai/uninstallModelPack", packId);
   },
   async screenshotToLayout(
     request: ScreenshotRequest,

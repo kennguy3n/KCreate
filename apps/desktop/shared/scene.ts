@@ -1157,7 +1157,8 @@ export type PreflightCheckId =
   | "image_resolution"
   | "color_space"
   | "transparency"
-  | "page_size";
+  | "page_size"
+  | "shading";
 
 export interface PreflightIssue {
   check: PreflightCheckId;

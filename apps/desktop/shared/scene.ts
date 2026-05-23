@@ -2025,6 +2025,34 @@ export type SessionEvent =
       /// the authoritative `session.locks()` roster to determine
       /// which entries are now claimed vs. released.
       nodeIds: string[];
+    }
+  | {
+      /// Round 11: the local collab session just started. Emitted
+      /// synchronously by the bridge in `session_start` (mirrored
+      /// in `crates/kcreate_bridge/src/collab.rs::SessionEvent`)
+      /// so renderer hooks (`useSessionLocks`, the EditorPage
+      /// presence-broadcast effect) can re-key their state on
+      /// local-side lifecycle transitions — the existing
+      /// `peer*` events only fire for *remote* peers and would
+      /// never signal a fresh local session by themselves.
+      kind: "sessionStarted";
+      /// Base64url-encoded local peer id.
+      peerId: string;
+      /// Project the new session is bound to (UUID hyphenated).
+      projectId: string;
+    }
+  | {
+      /// Round 11: the local collab session just stopped. Synthesised
+      /// by `main.ts`'s `kcreate/session/leave` IPC handler after
+      /// the bridge returns the leaving peer id; the bridge itself
+      /// can't push the event through its regular queue because
+      /// that queue is dropped as part of the leave. Consumers
+      /// reset session-keyed dedup state (e.g. EditorPage's
+      /// presence-broadcast fingerprint, useSessionLocks's lock
+      /// roster cache) when they see this.
+      kind: "sessionLeft";
+      /// Base64url-encoded peer id of the session that just left.
+      peerId: string;
     };
 
 /// Block 7: per-peer Lamport high-water marks for the journal

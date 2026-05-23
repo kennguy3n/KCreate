@@ -146,6 +146,28 @@ export function useSessionLocks(): UseSessionLocksResult {
         // are user-frequency, so the extra IPC on each join is
         // negligible compared to the failure mode of stale state.
         void reload();
+      } else if (ev.kind === "sessionStarted") {
+        // Round 11: local-side lifecycle transition the existing
+        // `peer*` events never signal (those fire for remote peers
+        // only). Re-fetch so the roster + `selfPeerId` reflect the
+        // freshly-started session immediately — without this hop
+        // there's a window between `session_start` returning and
+        // the first remote `peerJoined` arriving where the hook
+        // still reports `selfPeerId = null` and any locks claimed
+        // locally during that window get mis-attributed to "remote"
+        // in `remoteLocks`.
+        void reload();
+      } else if (ev.kind === "sessionLeft") {
+        // Round 11: local `session.leave()` doesn't go through the
+        // bridge's regular event queue (the queue is dropped as part
+        // of the leave). `main.ts` synthesises this event on the
+        // same channel so we can drop the stale roster instead of
+        // leaving the `LockBanner` in `RightPanel` showing peers
+        // from the previous session. The `reload()` will observe
+        // `session.info()` returning `null` and `session.locks()`
+        // returning `[]`, committing `selfPeerId = null` and
+        // `allLocks = new Map()` together.
+        void reload();
       }
     });
 

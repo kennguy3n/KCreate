@@ -1974,10 +1974,14 @@ pub fn session_start(
 }
 
 /// Stop the running session (graceful Goodbye + endpoint close).
-/// Idempotent.
+/// Idempotent. Returns the leaving peer's base64url-encoded id if
+/// a session was actually running (so the orchestrator in
+/// `main.ts` can emit a synthetic `sessionLeft` event on the
+/// renderer's session-event channel), or `null` if the call was a
+/// no-op because no session was active.
 #[cfg(feature = "collab")]
 #[napi]
-pub fn session_leave() -> NapiResult<()> {
+pub fn session_leave() -> NapiResult<Option<String>> {
     crate::collab::session_leave().map_err(map_session_err)
 }
 

@@ -375,7 +375,16 @@ export interface Bridge {
     projectId: string,
     advertiseMdns: boolean,
   ): string;
-  sessionLeave(): void;
+  /**
+   * Returns the leaving peer's base64url-encoded id when a session was
+   * actually running, or `null` when the call was a no-op (no active
+   * session). `main.ts` forwards that id as a synthetic `sessionLeft`
+   * event on the renderer's session-event channel, so consumers like
+   * `useSessionLocks` and `EditorPage`'s presence-broadcast effect can
+   * react to local-side lifecycle transitions through the same channel
+   * they use for remote peer events.
+   */
+  sessionLeave(): string | null;
   sessionJoin(
     peerId: string,
     publicKey: string,

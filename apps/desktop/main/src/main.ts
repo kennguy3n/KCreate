@@ -1653,8 +1653,37 @@ function registerIpcHandlers(): void {
     },
   );
   ipcMain.handle("kcreate/session/leave", () => {
+    // Drain whatever events the bridge still has buffered before we
+    // tear down the session — anything queued between the last
+    // tick and now would otherwise be lost when the slot drops in
+    // sessionLeave(). After the leave succeeds we synthesise the
+    // `sessionLeft` event from the returned peer id, then stop the
+    // tick. Doing the tick-stop *after* the synthetic emit means
+    // we don't race a subsequent in-flight tick fetching events
+    // from a now-empty slot (the bridge's `session_drain_events`
+    // returns NotRunning post-leave, which the drain function
+    // swallows quietly, so this is defence-in-depth rather than
+    // strictly required).
+    drainSessionEvents();
+    const leftPeerId = requireBridge().sessionLeave();
+    if (leftPeerId !== null) {
+      const win = mainWindow;
+      if (win && !win.isDestroyed()) {
+        // Emit on the same `kcreate/session/event` channel every
+        // other session signal flows through so renderer consumers
+        // (useSessionLocks, EditorPage presence-broadcast effect,
+        // PresencePanel) see local-side teardown through their
+        // existing subscription without a separate code path. The
+        // wire shape matches `SessionEvent::SessionLeft` in
+        // `crates/kcreate_bridge/src/collab.rs`, which mirrors
+        // `shared/scene.ts::SessionEvent`.
+        win.webContents.send(
+          "kcreate/session/event",
+          JSON.stringify({ kind: "sessionLeft", peerId: leftPeerId }),
+        );
+      }
+    }
     stopSessionEventTick();
-    requireBridge().sessionLeave();
   });
   ipcMain.handle(
     "kcreate/session/join",
@@ -1811,6 +1840,20 @@ app.on("will-quit", (event) => {
       // block app quit. sessionLeave throws when no session is
       // running, which is the common case (most users quit without
       // a live session), so swallowing the throw is correct.
+      // Drain whatever events the bridge has buffered before we
+      // pull the slot from under it; the bridge can't push events
+      // through a queue it's about to drop. We don't bother
+      // synthesising a `sessionLeft` on this path — the renderer
+      // process is about to be destroyed alongside the main
+      // process, so any consumer state it would reset is going to
+      // disappear with the window. (The IPC handler path above
+      // *does* emit the synthetic event because the renderer
+      // continues running across a session leave.)
+      try {
+        drainSessionEvents();
+      } catch {
+        // best-effort
+      }
       stopSessionEventTick();
       if (bridge) {
         try {

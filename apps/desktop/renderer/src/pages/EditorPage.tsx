@@ -672,48 +672,51 @@ export function EditorPage({
   // to session B's peers. We use `peerId` as the lifecycle marker
   // because `SessionStartReport` doesn't expose a distinct session
   // id and the local peer identity is regenerated on every
-  // `session.start()` per the bridge contract. Refreshing on
-  // every `session.onEvent` event covers both local-side
-  // start/leave (which currently emit no dedicated event but do
-  // change `info()`'s return) and any remote-side transition
-  // worth re-broadcasting on.
+  // `session.start()` per the bridge contract.
+  //
+  // The state is driven directly from the bridge's session-event
+  // channel — `sessionStarted` (pushed by `session_start` itself)
+  // and `sessionLeft` (synthesised by `main.ts` after the bridge
+  // returns the leaving peer id) cover both local-side lifecycle
+  // transitions without a polling `session.info()` call. The
+  // initial mount still does one `session.info()` to handle the
+  // case where a session was already running before this component
+  // mounted (e.g. EditorPage was unmounted/remounted across a
+  // route change while the session kept going).
   const [activeSessionPeerId, setActiveSessionPeerId] = useState<
     string | null
   >(null);
   useEffect(() => {
     let cancelled = false;
-    const refresh = async (): Promise<void> => {
+    void (async () => {
       try {
         const info = await window.kcreate.session.info();
         if (!cancelled) setActiveSessionPeerId(info?.peerId ?? null);
       } catch {
         // Bridge transient (e.g. between projectClose and
-        // rendererShutdown); the next event will retry. We
-        // deliberately don't clear `activeSessionPeerId` here —
-        // a transient IPC failure shouldn't masquerade as a
-        // session end.
+        // rendererShutdown); we deliberately don't clear
+        // `activeSessionPeerId` here — a transient IPC failure
+        // shouldn't masquerade as a session end. The lifecycle
+        // events below are the authoritative change signal.
       }
-    };
-    void refresh();
-    // Filter to events that can plausibly change the active peer id.
-    // `presenceUpdated` and `operationsJournaled` are high-frequency
-    // remote-peer cursor / op traffic — calling `session.info()` on
-    // every one of those would burn an IPC round-trip per remote
-    // cursor move (and these can fire dozens of times a second in a
-    // busy session) for a value that only changes on local-side
-    // start/leave. We keep `peerJoined` / `peerLeft` as defensive
-    // signals (a remote-side rebind that lands as join/leave is
-    // worth re-reading info for) plus the `discovered` /
-    // `undiscovered` mDNS variants for completeness, all of which
-    // are user-frequency.
+    })();
+    // Event-driven lifecycle tracking. The bridge's `sessionStarted`
+    // / `sessionLeft` events fire exactly when the local peer id
+    // transitions, so we can set state directly from the event
+    // payload — no need to re-fetch via `session.info()`. This
+    // also closes the stale-state gap that the previous
+    // `peerJoined`/`peerLeft`-based refresh had: a local
+    // `session.leave()` emits no `peerLeft` (only remote peers
+    // emit those), and `session_start` returning to the renderer
+    // is not itself an event, so the only way to learn about
+    // local transitions used to be polling — which created the
+    // window where `useSessionLocks` and this effect's
+    // dedup-fingerprint disagreed on whether a session was live.
     const unsubscribe = window.kcreate.session.onEvent((ev) => {
-      if (
-        ev.kind === "peerJoined" ||
-        ev.kind === "peerLeft" ||
-        ev.kind === "discovered" ||
-        ev.kind === "undiscovered"
-      ) {
-        void refresh();
+      if (ev.kind === "sessionStarted") {
+        if (!cancelled) setActiveSessionPeerId(ev.peerId);
+      } else if (ev.kind === "sessionLeft") {
+        if (!cancelled) setActiveSessionPeerId(null);
       }
     });
     return () => {

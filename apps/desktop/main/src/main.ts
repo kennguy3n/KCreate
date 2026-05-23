@@ -1669,6 +1669,21 @@ function registerIpcHandlers(): void {
   ipcMain.handle("kcreate/session/journalSummary", () =>
     requireBridge().sessionJournalSummary(),
   );
+  // Block 8: advisory edit-lock roster.
+  ipcMain.handle("kcreate/session/locks", () =>
+    requireBridge().sessionLocks(),
+  );
+  ipcMain.handle(
+    "kcreate/session/claimLocks",
+    (_e, nodeIdsJson: string) =>
+      requireBridge().sessionClaimLocks(nodeIdsJson),
+  );
+  ipcMain.handle(
+    "kcreate/session/releaseLocks",
+    (_e, nodeIdsJson: string) => {
+      requireBridge().sessionReleaseLocks(nodeIdsJson);
+    },
+  );
   ipcMain.handle(
     "kcreate/session/sendPresence",
     (

@@ -2041,6 +2041,55 @@ pub fn session_journal_summary() -> NapiResult<String> {
     })
 }
 
+/// Block 8: snapshot of the advisory edit-lock roster. KChat-gated.
+/// Returns a JSON `Vec<SessionLockEntry>` so the renderer can
+/// deserialize directly into its TS type.
+#[cfg(feature = "collab")]
+#[napi]
+pub fn session_locks() -> NapiResult<String> {
+    let rows = crate::collab::session_locks().map_err(map_session_err)?;
+    serde_json::to_string(&rows).map_err(|e| {
+        NapiError::new(
+            Status::GenericFailure,
+            format!("kcreate_bridge: session_locks serialize: {e}"),
+        )
+    })
+}
+
+/// Block 8: claim advisory edit locks on the supplied node ids
+/// (parsed as a JSON `string[]` of UUIDs). KChat-gated; the local
+/// roster updates immediately and the change is broadcast to
+/// every connected peer. Returns the wall-clock `acquired_at`
+/// as an RFC3339 string so the renderer can show "locked X
+/// seconds ago" without a second IPC.
+#[cfg(feature = "collab")]
+#[napi]
+pub fn session_claim_locks(node_ids_json: String) -> NapiResult<String> {
+    let node_ids: Vec<Uuid> = serde_json::from_str(&node_ids_json).map_err(|e| {
+        NapiError::new(
+            Status::InvalidArg,
+            format!("kcreate_bridge: session_claim_locks parse node_ids: {e}"),
+        )
+    })?;
+    let acquired_at = crate::collab::session_claim_locks(node_ids).map_err(map_session_err)?;
+    Ok(acquired_at.to_rfc3339())
+}
+
+/// Block 8: release advisory edit locks. Empty node-id list means
+/// "release every lock the local peer currently holds".
+#[cfg(feature = "collab")]
+#[napi]
+pub fn session_release_locks(node_ids_json: String) -> NapiResult<()> {
+    let node_ids: Vec<Uuid> = serde_json::from_str(&node_ids_json).map_err(|e| {
+        NapiError::new(
+            Status::InvalidArg,
+            format!("kcreate_bridge: session_release_locks parse node_ids: {e}"),
+        )
+    })?;
+    crate::collab::session_release_locks(node_ids).map_err(map_session_err)?;
+    Ok(())
+}
+
 /// Read the cached `SessionStartReport` for the running session,
 /// or `null` if no session is running. Returns a JSON string so
 /// the renderer can deserialize directly into its TS type.

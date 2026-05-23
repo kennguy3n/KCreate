@@ -504,6 +504,23 @@ impl LanCollabHost {
         self.broadcast(Message::OperationBroadcast(payload)).await
     }
 
+    /// Block 8: sugar — fan out a `LockClaim` to every connected
+    /// peer. Receivers run the soft-lock contract on their side.
+    pub async fn broadcast_lock_claim(
+        &self,
+        payload: kcreate_collab::LockClaimPayload,
+    ) -> Result<(), TransportError> {
+        self.broadcast(Message::LockClaim(payload)).await
+    }
+
+    /// Block 8: sugar — fan out a `LockRelease`.
+    pub async fn broadcast_lock_release(
+        &self,
+        payload: kcreate_collab::LockReleasePayload,
+    ) -> Result<(), TransportError> {
+        self.broadcast(Message::LockRelease(payload)).await
+    }
+
     /// Send a graceful `Goodbye` to every peer and close the QUIC
     /// endpoint. Idempotent; calling twice is a no-op.
     pub async fn shutdown(self) {
@@ -861,5 +878,7 @@ fn message_kind(message: &Message) -> &'static str {
         Message::Goodbye(_) => "Goodbye",
         Message::ResumeRequest(_) => "ResumeRequest",
         Message::ResumeBundle(_) => "ResumeBundle",
+        Message::LockClaim(_) => "LockClaim",
+        Message::LockRelease(_) => "LockRelease",
     }
 }

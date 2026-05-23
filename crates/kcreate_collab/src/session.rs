@@ -406,6 +406,8 @@ const fn message_project_id(msg: &Message) -> Option<Uuid> {
         Message::OperationBroadcast(p) => Some(p.project_id),
         Message::ResumeRequest(p) => Some(p.project_id),
         Message::ResumeBundle(p) => Some(p.project_id),
+        Message::LockClaim(p) => Some(p.project_id),
+        Message::LockRelease(p) => Some(p.project_id),
         Message::Welcome(_) | Message::Presence(_) | Message::Heartbeat | Message::Goodbye(_) => {
             None
         }

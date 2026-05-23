@@ -1894,6 +1894,20 @@ export type SessionEvent =
       opCount: number;
       /// Highest Lamport clock value observed in the batch.
       highestClock: number;
+    }
+  | {
+      /// Block 8: the advisory edit-lock roster changed — a peer
+      /// claimed or released one or more node locks. The renderer
+      /// uses this event to know when to re-read
+      /// `session.locks()` rather than polling every frame.
+      kind: "locksChanged";
+      /// Which peer caused the change. For PeerLeft-triggered
+      /// auto-releases this is the leaving peer.
+      peerId: string;
+      /// Node ids whose lock state flipped. Cross-reference with
+      /// the authoritative `session.locks()` roster to determine
+      /// which entries are now claimed vs. released.
+      nodeIds: string[];
     };
 
 /// Block 7: per-peer Lamport high-water marks for the journal
@@ -1908,6 +1922,17 @@ export interface SessionJournalSummary {
   /// values are the highest Lamport clock the journal has
   /// recorded for that peer.
   byPeer: Record<string, number>;
+}
+
+/// Block 8: one entry in the advisory edit-lock roster. Mirrors
+/// `kcreate_bridge::collab::SessionLockEntry`.
+export interface SessionLockEntry {
+  /// Node currently locked.
+  nodeId: string;
+  /// Peer id of the lock holder (base64url).
+  holderPeerId: string;
+  /// RFC3339 wall-clock time the holder acquired the lock.
+  acquiredAt: string;
 }
 
 export interface SessionBridge {
@@ -1955,6 +1980,19 @@ export interface SessionBridge {
   /// installed. Used by the PresencePanel's "Activity" tab to
   /// surface "we've recorded N ops across M peers".
   journalSummary(): Promise<SessionJournalSummary>;
+  /// Block 8: read the advisory edit-lock roster. KChat-gated.
+  /// Returns an empty list when no session is running so the
+  /// renderer can call this unconditionally on every paint.
+  locks(): Promise<SessionLockEntry[]>;
+  /// Block 8: claim advisory edit locks on the supplied node ids.
+  /// KChat-gated. Updates the local roster immediately and
+  /// broadcasts the claim to every connected peer. Returns the
+  /// wall-clock acquisition timestamp as an RFC3339 string.
+  claimLocks(nodeIds: string[]): Promise<string>;
+  /// Block 8: release advisory edit locks. Empty `nodeIds` means
+  /// "release everything I currently hold" (the "I'm done editing"
+  /// signal).
+  releaseLocks(nodeIds: string[]): Promise<void>;
   /// Broadcast the local user's presence to every connected peer.
   /// `cursor` is world-space coordinates; pass `null` when the
   /// pointer has left the canvas.

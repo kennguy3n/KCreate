@@ -71,6 +71,18 @@ pub enum Message {
     /// `(peer_id, clock)` order so applying them in receive order
     /// produces the correct document state.
     ResumeBundle(ResumeBundlePayload),
+    /// Block 8: peer claims an exclusive soft-edit lock on a set of
+    /// node ids. The lock is *advisory* — receivers update their
+    /// roster and surface a "Ken is editing this text frame" UI,
+    /// but enforcement happens locally on each peer (the LWW
+    /// resolver is still the authoritative conflict path).
+    LockClaim(LockClaimPayload),
+    /// Block 8: peer releases previously-claimed locks. Receivers
+    /// drop the entries from their lock roster. The host also
+    /// auto-releases every lock a peer holds when that peer
+    /// disconnects (`PeerLeft`); this variant is the explicit
+    /// "I'm done editing" signal.
+    LockRelease(LockReleasePayload),
 }
 
 /// Initial handshake payload sent by the joining peer.
@@ -222,6 +234,49 @@ pub struct ResumeBundlePayload {
     pub operations: Vec<JournalEntry>,
 }
 
+/// Block 8: payload of [`Message::LockClaim`]. The sender wants to
+/// hold an advisory edit lock on the supplied node ids until it
+/// emits a matching [`Message::LockRelease`] (or disconnects).
+///
+/// Soft-lock semantics: receivers are expected to surface the
+/// "someone else is editing" UI (greyed-out controls, "locked by
+/// Ken" badge) and avoid emitting concurrent edits to the locked
+/// nodes, but they are not protocol-prevented from doing so —
+/// the LWW resolver remains the authoritative tiebreaker. The
+/// lock just lowers the probability of UX-hostile races on
+/// hot-zone nodes like text frames and table cells.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LockClaimPayload {
+    /// Project the locks apply to. Receivers MUST drop the
+    /// message if it doesn't match their open project.
+    pub project_id: Uuid,
+    /// Node ids the sender wants to lock. May be empty
+    /// (no-op) or contain duplicates (receivers must dedupe).
+    pub node_ids: Vec<Uuid>,
+    /// Wall-clock timestamp the sender attached. Receivers
+    /// use this as the lock's `acquired_at` for the UI; the
+    /// session layer's own clock is the protocol-level ordering
+    /// source. The renderer can display "Ken locked X 4s ago"
+    /// without round-tripping to the host.
+    pub acquired_at: DateTime<Utc>,
+}
+
+/// Block 8: payload of [`Message::LockRelease`]. Drops one or more
+/// previously-claimed locks. Receivers remove the entries from
+/// their lock roster and re-enable the corresponding controls.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LockReleasePayload {
+    /// Project the releases apply to. Receivers MUST drop if
+    /// mismatched.
+    pub project_id: Uuid,
+    /// Node ids to release. An empty list explicitly means
+    /// "release everything I hold" — receivers walk their
+    /// roster and drop every entry owned by the sender.
+    pub node_ids: Vec<Uuid>,
+}
+
 /// Why the sender is leaving.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind", content = "detail")]
@@ -362,6 +417,46 @@ mod tests {
             Message::ResumeRequest(p) => {
                 assert_eq!(p.project_id, project_id);
                 assert_eq!(p.since, since);
+            }
+            _ => panic!("wrong variant after round-trip"),
+        }
+    }
+
+    #[test]
+    fn lock_claim_round_trips() {
+        let project_id = Uuid::new_v4();
+        let node = Uuid::new_v4();
+        let now = Utc::now();
+        let msg = Message::LockClaim(LockClaimPayload {
+            project_id,
+            node_ids: vec![node],
+            acquired_at: now,
+        });
+        let s = serde_json::to_string(&msg).unwrap();
+        let back: Message = serde_json::from_str(&s).unwrap();
+        match back {
+            Message::LockClaim(p) => {
+                assert_eq!(p.project_id, project_id);
+                assert_eq!(p.node_ids, vec![node]);
+                assert_eq!(p.acquired_at, now);
+            }
+            _ => panic!("wrong variant after round-trip"),
+        }
+    }
+
+    #[test]
+    fn lock_release_round_trips() {
+        let project_id = Uuid::new_v4();
+        let msg = Message::LockRelease(LockReleasePayload {
+            project_id,
+            node_ids: vec![],
+        });
+        let s = serde_json::to_string(&msg).unwrap();
+        let back: Message = serde_json::from_str(&s).unwrap();
+        match back {
+            Message::LockRelease(p) => {
+                assert_eq!(p.project_id, project_id);
+                assert!(p.node_ids.is_empty());
             }
             _ => panic!("wrong variant after round-trip"),
         }

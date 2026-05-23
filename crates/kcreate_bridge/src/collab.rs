@@ -37,8 +37,9 @@ use ed25519_dalek::VerifyingKey;
 use kcreate_collab::message::Cursor;
 use kcreate_collab::{
     no_kchat_authority, BoundKChatGroupAuthority, JournalEntry, KChatAuthError, KChatGroupId,
-    KChatMembership, MemoryJournalStore, Message, OperationJournal, PeerId, PeerIdentity, PeerKey,
-    PresencePayload, ResumeVector, SessionConfig, SharedKChatAuthority,
+    KChatMembership, LockClaimPayload, LockReleasePayload, MemoryJournalStore, Message,
+    OperationJournal, PeerId, PeerIdentity, PeerKey, PresencePayload, ResumeVector, SessionConfig,
+    SharedKChatAuthority,
 };
 use kcreate_collab_transport::{HostOptions, InboundEvent, LanCollabHost};
 use parking_lot::Mutex;
@@ -138,6 +139,21 @@ pub enum SessionEvent {
         /// for ergonomic JSON consumption from the renderer.
         highest_clock: u64,
     },
+    /// Block 8: the lock roster changed — a peer claimed or
+    /// released one or more node locks. The renderer reads
+    /// `session_locks()` for the authoritative snapshot but
+    /// uses this event to know *when* to re-read instead of
+    /// polling on every frame.
+    LocksChanged {
+        /// Which peer caused the change. For `PeerLeft`-triggered
+        /// auto-releases this is the leaving peer.
+        peer_id: String,
+        /// Node ids whose lock status flipped in this transition
+        /// (newly claimed AND newly released ids are both
+        /// surfaced — the renderer cross-references with the
+        /// authoritative roster).
+        node_ids: Vec<Uuid>,
+    },
 }
 
 impl From<&PresencePayload> for SessionPresence {
@@ -229,6 +245,20 @@ struct SessionState {
     /// session's signing key; we cache it here so journal appends
     /// don't have to round-trip through the host.
     local_peer_id: PeerId,
+    /// Block 8: advisory edit-lock roster. Map of `node_id ->
+    /// (holder_peer_id, acquired_at)`. Updated when this peer (or a
+    /// remote peer) emits a [`Message::LockClaim`] / `LockRelease`,
+    /// and auto-cleaned on `PeerLeft`. Soft semantics — the
+    /// renderer disables controls for locked nodes but the
+    /// protocol doesn't reject concurrent edits.
+    locks: HashMap<Uuid, LockEntry>,
+}
+
+/// Block 8: one entry in the advisory lock roster.
+#[derive(Debug, Clone)]
+struct LockEntry {
+    holder: PeerId,
+    acquired_at: DateTime<Utc>,
 }
 
 fn slot() -> &'static Mutex<Option<SessionState>> {
@@ -413,12 +443,34 @@ fn apply_event(ev: InboundEvent) {
         }
         InboundEvent::PeerLeft(peer_id) => {
             state.presence.remove(&peer_id);
+            // Block 8: auto-release every lock the leaving peer
+            // held. Without this, a peer that dies mid-edit would
+            // pin a node forever; the renderer would show "Ken is
+            // editing" even though Ken is gone. Collect the released
+            // node ids before mutation so the LocksChanged event
+            // carries an accurate snapshot.
+            let released: Vec<Uuid> = state
+                .locks
+                .iter()
+                .filter(|(_, entry)| entry.holder == peer_id)
+                .map(|(id, _)| *id)
+                .collect();
+            state.locks.retain(|_, entry| entry.holder != peer_id);
             push_event(
                 state,
                 SessionEvent::PeerLeft {
                     peer_id: peer_id.as_str().to_string(),
                 },
             );
+            if !released.is_empty() {
+                push_event(
+                    state,
+                    SessionEvent::LocksChanged {
+                        peer_id: peer_id.as_str().to_string(),
+                        node_ids: released,
+                    },
+                );
+            }
         }
         InboundEvent::Message { from, message } => match message.as_ref() {
             Message::Presence(p) => {
@@ -453,6 +505,20 @@ fn apply_event(ev: InboundEvent) {
                 // history. Project-id mismatch is dropped.
                 if p.project_id == state.journal.project_id() {
                     journal_inbound_resume_bundle(state, p);
+                }
+            }
+            Message::LockClaim(p) => {
+                // Block 8: remote peer is asking us to honour a
+                // soft lock. The project_id guard prevents a
+                // misrouted message from poisoning the local
+                // roster; otherwise we just record and emit.
+                if p.project_id == state.journal.project_id() {
+                    apply_lock_claim(state, &from, p);
+                }
+            }
+            Message::LockRelease(p) => {
+                if p.project_id == state.journal.project_id() {
+                    apply_lock_release(state, &from, p);
                 }
             }
             // Hello / Welcome / Heartbeat / Goodbye / ResumeRequest
@@ -571,6 +637,109 @@ fn journal_inbound_resume_bundle(
     }
 }
 
+/// Block 8: pure roster mutation for a lock claim. Returns the
+/// node ids whose lock state actually flipped (deduped + filtered
+/// for no-op same-holder reclaims). Pulled out of [`apply_lock_claim`]
+/// so unit tests can exercise the semantics without needing a full
+/// `SessionState`.
+fn lock_roster_claim(
+    locks: &mut HashMap<Uuid, LockEntry>,
+    from: &PeerId,
+    payload: &LockClaimPayload,
+) -> Vec<Uuid> {
+    let mut changed: Vec<Uuid> = Vec::new();
+    let mut seen: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
+    for node_id in &payload.node_ids {
+        if !seen.insert(*node_id) {
+            continue;
+        }
+        // Last-claim-wins: a fresh claim from a different peer
+        // displaces the prior holder. This matches the LWW
+        // resolver's semantics elsewhere in collab and gives the
+        // UI a deterministic source of truth.
+        let entry = LockEntry {
+            holder: from.clone(),
+            acquired_at: payload.acquired_at,
+        };
+        let prior = locks.insert(*node_id, entry);
+        let actually_changed = match prior {
+            Some(p) => p.holder != *from,
+            None => true,
+        };
+        if actually_changed {
+            changed.push(*node_id);
+        }
+    }
+    changed
+}
+
+/// Block 8: pure roster mutation for a lock release. Returns the
+/// node ids whose lock state actually flipped. Empty `node_ids`
+/// payload means "release everything this peer holds".
+fn lock_roster_release(
+    locks: &mut HashMap<Uuid, LockEntry>,
+    from: &PeerId,
+    payload: &LockReleasePayload,
+) -> Vec<Uuid> {
+    let mut changed: Vec<Uuid> = Vec::new();
+    if payload.node_ids.is_empty() {
+        let owned: Vec<Uuid> = locks
+            .iter()
+            .filter(|(_, entry)| entry.holder == *from)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in &owned {
+            locks.remove(id);
+            changed.push(*id);
+        }
+    } else {
+        for node_id in &payload.node_ids {
+            if let Some(entry) = locks.get(node_id) {
+                // Only the holder can release. A misbehaving peer
+                // can't reach over and unlock something it didn't
+                // claim — the soft-lock contract still needs an
+                // ownership check to be useful.
+                if entry.holder == *from {
+                    locks.remove(node_id);
+                    changed.push(*node_id);
+                }
+            }
+        }
+    }
+    changed
+}
+
+/// Block 8: record an incoming [`Message::LockClaim`] into the
+/// session's advisory lock roster and emit a `LocksChanged` event.
+/// Thin wrapper around [`lock_roster_claim`] for the production
+/// path that has a full `SessionState` in hand.
+fn apply_lock_claim(state: &mut SessionState, from: &PeerId, payload: &LockClaimPayload) {
+    let changed = lock_roster_claim(&mut state.locks, from, payload);
+    if !changed.is_empty() {
+        push_event(
+            state,
+            SessionEvent::LocksChanged {
+                peer_id: from.as_str().to_string(),
+                node_ids: changed,
+            },
+        );
+    }
+}
+
+/// Block 8: record an incoming [`Message::LockRelease`].
+fn apply_lock_release(state: &mut SessionState, from: &PeerId, payload: &LockReleasePayload) {
+    let changed = lock_roster_release(&mut state.locks, from, payload);
+    if !changed.is_empty() {
+        push_event(
+            state,
+            SessionEvent::LocksChanged {
+                peer_id: from.as_str().to_string(),
+                node_ids: changed,
+            },
+        );
+    }
+}
+
 /// Start a collab session. The local identity is derived from the
 /// supplied 32-byte signing-key seed; the renderer persists this
 /// across sessions so the same machine always presents the same
@@ -682,6 +851,7 @@ pub fn session_start(
         report: report.clone(),
         journal,
         local_peer_id,
+        locks: HashMap::new(),
     });
     Ok(report)
 }
@@ -877,6 +1047,109 @@ pub fn session_record_local_operation(operation: kcreate_core::operation::Operat
             message: e.to_string(),
         })?;
     Ok(())
+}
+
+/// Block 8: one entry in the JSON lock-roster shape returned to the
+/// renderer. Serializes as camelCase to match `SessionJournalSummary`
+/// and friends.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionLockEntry {
+    pub node_id: Uuid,
+    pub holder_peer_id: String,
+    pub acquired_at: DateTime<Utc>,
+}
+
+/// Block 8: snapshot of the advisory edit-lock roster. KChat-gated.
+/// Returns an empty list (not an error) when no session is running
+/// so the renderer can call this unconditionally on every paint.
+pub fn session_locks() -> Result<Vec<SessionLockEntry>> {
+    require_active_kchat_membership()?;
+    let guard = slot().lock();
+    let Some(state) = guard.as_ref() else {
+        return Ok(Vec::new());
+    };
+    let mut rows: Vec<SessionLockEntry> = state
+        .locks
+        .iter()
+        .map(|(node_id, entry)| SessionLockEntry {
+            node_id: *node_id,
+            holder_peer_id: entry.holder.as_str().to_string(),
+            acquired_at: entry.acquired_at,
+        })
+        .collect();
+    // Deterministic order so the renderer's diffing stays cheap.
+    rows.sort_by(|a, b| a.node_id.cmp(&b.node_id));
+    Ok(rows)
+}
+
+/// Block 8: claim advisory edit locks on the supplied node ids.
+/// Updates the local roster immediately (so the local UI greys
+/// out controls without waiting for a round-trip) and broadcasts
+/// a `LockClaim` to every connected peer.
+///
+/// `acquired_at` defaults to wall-clock now; the renderer can use
+/// the returned value to show "locked X seconds ago".
+pub fn session_claim_locks(node_ids: Vec<Uuid>) -> Result<DateTime<Utc>> {
+    require_active_kchat_membership()?;
+    let mut guard = slot().lock();
+    let state = guard.as_mut().ok_or(SessionBridgeError::NotRunning)?;
+    let acquired_at = Utc::now();
+    let project_id = state.journal.project_id();
+    let local = state.local_peer_id.clone();
+    let payload = LockClaimPayload {
+        project_id,
+        node_ids: node_ids.clone(),
+        acquired_at,
+    };
+    // Update local roster + emit LocksChanged before fanning out
+    // so the local UI is consistent the moment this call returns.
+    apply_lock_claim(state, &local, &payload);
+    let host = state.host.clone();
+    let runtime_handle = state.runtime.handle().clone();
+    drop(guard);
+    let result = runtime_handle.block_on(async {
+        tokio::time::timeout(OP_TIMEOUT, host.broadcast_lock_claim(payload)).await
+    });
+    match result {
+        Ok(Ok(())) => Ok(acquired_at),
+        Ok(Err(e)) => Err(SessionBridgeError::Transport(e)),
+        Err(_) => Err(SessionBridgeError::Transport(
+            kcreate_collab_transport::TransportError::Quic("broadcast_lock_claim timed out".into()),
+        )),
+    }
+}
+
+/// Block 8: release advisory edit locks. An empty `node_ids` list
+/// releases every lock the local peer holds (the "I'm done editing"
+/// signal). Mirrors `session_claim_locks` — local roster is updated
+/// before the broadcast so the local UI is responsive.
+pub fn session_release_locks(node_ids: Vec<Uuid>) -> Result<()> {
+    require_active_kchat_membership()?;
+    let mut guard = slot().lock();
+    let state = guard.as_mut().ok_or(SessionBridgeError::NotRunning)?;
+    let project_id = state.journal.project_id();
+    let local = state.local_peer_id.clone();
+    let payload = LockReleasePayload {
+        project_id,
+        node_ids,
+    };
+    apply_lock_release(state, &local, &payload);
+    let host = state.host.clone();
+    let runtime_handle = state.runtime.handle().clone();
+    drop(guard);
+    let result = runtime_handle.block_on(async {
+        tokio::time::timeout(OP_TIMEOUT, host.broadcast_lock_release(payload)).await
+    });
+    match result {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(SessionBridgeError::Transport(e)),
+        Err(_) => Err(SessionBridgeError::Transport(
+            kcreate_collab_transport::TransportError::Quic(
+                "broadcast_lock_release timed out".into(),
+            ),
+        )),
+    }
 }
 
 /// Broadcast the local user's presence (active page, selection,
@@ -1627,5 +1900,166 @@ mod tests {
             back.highest_for(&remote),
             kcreate_collab::LamportClock::from_raw(7)
         );
+    }
+
+    // ====================================================================
+    // Block 8: lock roster tests.
+    //
+    // Exercise `lock_roster_claim` / `lock_roster_release` directly
+    // (the pure functions behind `apply_lock_claim` / `apply_lock_release`).
+    // Building a full `SessionState` would require a real QUIC host;
+    // the roster logic is the only thing that needs coverage here.
+    // ====================================================================
+
+    #[test]
+    #[serial]
+    fn lock_claim_inserts_into_roster() {
+        let mut locks: HashMap<Uuid, LockEntry> = HashMap::new();
+        let node_a = Uuid::new_v4();
+        let node_b = Uuid::new_v4();
+        let remote = PeerKey::from_seed([40u8; 32]).peer_id();
+        let payload = LockClaimPayload {
+            project_id: Uuid::new_v4(),
+            node_ids: vec![node_a, node_b],
+            acquired_at: Utc::now(),
+        };
+        let changed = lock_roster_claim(&mut locks, &remote, &payload);
+        assert_eq!(locks.len(), 2);
+        assert_eq!(locks[&node_a].holder, remote);
+        assert_eq!(locks[&node_b].holder, remote);
+        // changed reports both node ids as flipped.
+        assert_eq!(changed.len(), 2);
+    }
+
+    #[test]
+    #[serial]
+    fn lock_claim_dedupes_within_payload_and_skips_no_op_reclaim() {
+        let mut locks: HashMap<Uuid, LockEntry> = HashMap::new();
+        let node_a = Uuid::new_v4();
+        let project_id = Uuid::new_v4();
+        let remote = PeerKey::from_seed([41u8; 32]).peer_id();
+        let payload = LockClaimPayload {
+            project_id,
+            node_ids: vec![node_a, node_a],
+            acquired_at: Utc::now(),
+        };
+        let changed = lock_roster_claim(&mut locks, &remote, &payload);
+        assert_eq!(locks.len(), 1);
+        // Dedup: even though node_a appears twice, only one change.
+        assert_eq!(changed.len(), 1);
+        // Same holder reclaiming the same node is a no-op — no flip.
+        let payload2 = LockClaimPayload {
+            project_id,
+            node_ids: vec![node_a],
+            acquired_at: Utc::now(),
+        };
+        let changed2 = lock_roster_claim(&mut locks, &remote, &payload2);
+        assert!(changed2.is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn lock_release_only_succeeds_for_holder() {
+        let mut locks: HashMap<Uuid, LockEntry> = HashMap::new();
+        let node = Uuid::new_v4();
+        let project_id = Uuid::new_v4();
+        let holder = PeerKey::from_seed([42u8; 32]).peer_id();
+        let stranger = PeerKey::from_seed([43u8; 32]).peer_id();
+        lock_roster_claim(
+            &mut locks,
+            &holder,
+            &LockClaimPayload {
+                project_id,
+                node_ids: vec![node],
+                acquired_at: Utc::now(),
+            },
+        );
+        // Stranger trying to release the holder's lock — must be
+        // ignored. The soft-lock contract is "only the holder can
+        // release"; otherwise any peer could grief by releasing
+        // someone else's lock.
+        let changed = lock_roster_release(
+            &mut locks,
+            &stranger,
+            &LockReleasePayload {
+                project_id,
+                node_ids: vec![node],
+            },
+        );
+        assert_eq!(locks.len(), 1);
+        assert!(changed.is_empty());
+        // Holder releasing — succeeds and removes the entry.
+        let changed2 = lock_roster_release(
+            &mut locks,
+            &holder,
+            &LockReleasePayload {
+                project_id,
+                node_ids: vec![node],
+            },
+        );
+        assert!(locks.is_empty());
+        assert_eq!(changed2, vec![node]);
+    }
+
+    #[test]
+    #[serial]
+    fn empty_release_payload_drops_every_lock_for_sender() {
+        let mut locks: HashMap<Uuid, LockEntry> = HashMap::new();
+        let holder = PeerKey::from_seed([44u8; 32]).peer_id();
+        let other = PeerKey::from_seed([45u8; 32]).peer_id();
+        let project_id = Uuid::new_v4();
+        let n1 = Uuid::new_v4();
+        let n2 = Uuid::new_v4();
+        let n3 = Uuid::new_v4();
+        lock_roster_claim(
+            &mut locks,
+            &holder,
+            &LockClaimPayload {
+                project_id,
+                node_ids: vec![n1, n2],
+                acquired_at: Utc::now(),
+            },
+        );
+        lock_roster_claim(
+            &mut locks,
+            &other,
+            &LockClaimPayload {
+                project_id,
+                node_ids: vec![n3],
+                acquired_at: Utc::now(),
+            },
+        );
+        assert_eq!(locks.len(), 3);
+        // Empty list = release everything holder owns. Should NOT
+        // touch `other`'s lock on n3.
+        let changed = lock_roster_release(
+            &mut locks,
+            &holder,
+            &LockReleasePayload {
+                project_id,
+                node_ids: vec![],
+            },
+        );
+        assert_eq!(locks.len(), 1);
+        assert_eq!(locks[&n3].holder, other);
+        assert_eq!(changed.len(), 2);
+    }
+
+    #[test]
+    #[serial]
+    fn lock_claim_payload_round_trips_through_serde() {
+        // The protocol layer carries LockClaimPayload as JSON; this
+        // test guarantees the field shape on the wire stays in sync
+        // with the renderer's TS definitions.
+        let p = LockClaimPayload {
+            project_id: Uuid::new_v4(),
+            node_ids: vec![Uuid::new_v4(), Uuid::new_v4()],
+            acquired_at: Utc::now(),
+        };
+        let s = serde_json::to_string(&p).unwrap();
+        let back: LockClaimPayload = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.project_id, p.project_id);
+        assert_eq!(back.node_ids, p.node_ids);
+        assert_eq!(back.acquired_at, p.acquired_at);
     }
 }

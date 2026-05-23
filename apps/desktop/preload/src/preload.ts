@@ -104,6 +104,7 @@ import type {
   SessionCursor,
   SessionEvent,
   SessionJournalSummary,
+  SessionLockEntry,
   SessionPeer,
   KChatBridge,
   KChatInstallRequest,
@@ -1413,6 +1414,22 @@ const session: SessionBridge = {
       "kcreate/session/journalSummary",
     )) as string;
     return JSON.parse(raw) as SessionJournalSummary;
+  },
+  async locks(): Promise<SessionLockEntry[]> {
+    const raw = (await ipcRenderer.invoke("kcreate/session/locks")) as string;
+    return JSON.parse(raw) as SessionLockEntry[];
+  },
+  async claimLocks(nodeIds: string[]): Promise<string> {
+    return (await ipcRenderer.invoke(
+      "kcreate/session/claimLocks",
+      JSON.stringify(nodeIds),
+    )) as string;
+  },
+  async releaseLocks(nodeIds: string[]): Promise<void> {
+    await ipcRenderer.invoke(
+      "kcreate/session/releaseLocks",
+      JSON.stringify(nodeIds),
+    );
   },
   async sendPresence(
     activePage: string | null,

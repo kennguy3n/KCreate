@@ -695,8 +695,26 @@ export function EditorPage({
       }
     };
     void refresh();
-    const unsubscribe = window.kcreate.session.onEvent(() => {
-      void refresh();
+    // Filter to events that can plausibly change the active peer id.
+    // `presenceUpdated` and `operationsJournaled` are high-frequency
+    // remote-peer cursor / op traffic — calling `session.info()` on
+    // every one of those would burn an IPC round-trip per remote
+    // cursor move (and these can fire dozens of times a second in a
+    // busy session) for a value that only changes on local-side
+    // start/leave. We keep `peerJoined` / `peerLeft` as defensive
+    // signals (a remote-side rebind that lands as join/leave is
+    // worth re-reading info for) plus the `discovered` /
+    // `undiscovered` mDNS variants for completeness, all of which
+    // are user-frequency.
+    const unsubscribe = window.kcreate.session.onEvent((ev) => {
+      if (
+        ev.kind === "peerJoined" ||
+        ev.kind === "peerLeft" ||
+        ev.kind === "discovered" ||
+        ev.kind === "undiscovered"
+      ) {
+        void refresh();
+      }
     });
     return () => {
       cancelled = true;

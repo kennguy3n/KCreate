@@ -1210,21 +1210,7 @@ pub fn presence_cursors() -> Vec<(String, String, SessionCursor)> {
     let Some(state) = guard.as_ref() else {
         return Vec::new();
     };
-    let connected_lookup: HashMap<PeerId, String> = state
-        .host
-        .connected_peers()
-        .into_iter()
-        .map(|i| (i.peer_id, i.display_name))
-        .collect();
-    state
-        .presence
-        .iter()
-        .filter_map(|(peer_id, payload)| {
-            let display_name = connected_lookup.get(peer_id)?.clone();
-            let cursor = payload.cursor.map(|c| SessionCursor { x: c.x, y: c.y })?;
-            Some((peer_id.as_str().to_string(), display_name, cursor))
-        })
-        .collect()
+    presence_cursors_from_state(state)
 }
 
 /// Read-side accessor for `scene_sync` to paint remote-peer
@@ -1245,6 +1231,61 @@ pub fn presence_selections() -> Vec<(String, String, Vec<Uuid>)> {
     let Some(state) = guard.as_ref() else {
         return Vec::new();
     };
+    presence_selections_from_state(state)
+}
+
+/// Atomic per-frame snapshot of every remote-peer presence
+/// payload, with cursors and selections collected under a single
+/// `slot().lock()` acquisition.
+///
+/// `sync_scene_locked` previously called [`presence_selections`]
+/// and [`presence_cursors`] back-to-back, releasing and
+/// reacquiring the collab slot mutex between them. Each call
+/// took its own snapshot of `state.presence`, so an inbound
+/// presence apply that landed *between* the two reads could leave
+/// the scene with halos from snapshot N and cursors from snapshot
+/// N+1 in the same rendered frame. The TOCTOU was benign (worst
+/// case: one frame of mismatch before the next sync), but tying
+/// the two reads to a single lock acquisition removes the gap
+/// entirely without changing any caller behaviour.
+///
+/// The returned tuple mirrors the shape of the two single-purpose
+/// helpers so existing call sites can switch over without
+/// reshaping their downstream conversions.
+#[allow(clippy::type_complexity)]
+pub fn presence_snapshot() -> (
+    Vec<(String, String, Vec<Uuid>)>,
+    Vec<(String, String, SessionCursor)>,
+) {
+    let guard = slot().lock();
+    let Some(state) = guard.as_ref() else {
+        return (Vec::new(), Vec::new());
+    };
+    (
+        presence_selections_from_state(state),
+        presence_cursors_from_state(state),
+    )
+}
+
+fn presence_cursors_from_state(state: &SessionState) -> Vec<(String, String, SessionCursor)> {
+    let connected_lookup: HashMap<PeerId, String> = state
+        .host
+        .connected_peers()
+        .into_iter()
+        .map(|i| (i.peer_id, i.display_name))
+        .collect();
+    state
+        .presence
+        .iter()
+        .filter_map(|(peer_id, payload)| {
+            let display_name = connected_lookup.get(peer_id)?.clone();
+            let cursor = payload.cursor.map(|c| SessionCursor { x: c.x, y: c.y })?;
+            Some((peer_id.as_str().to_string(), display_name, cursor))
+        })
+        .collect()
+}
+
+fn presence_selections_from_state(state: &SessionState) -> Vec<(String, String, Vec<Uuid>)> {
     let connected_lookup: HashMap<PeerId, String> = state
         .host
         .connected_peers()

@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 
 import type { SessionEvent, SessionLockEntry } from "../../../shared/scene";
 
@@ -98,14 +98,24 @@ export function useSessionLocks(): UseSessionLocksResult {
     };
   }, []);
 
-  const remoteLocks =
-    selfPeerId === null
-      ? allLocks
-      : new Map(
-          Array.from(allLocks.entries()).filter(
-            ([, entry]) => entry.holderPeerId !== selfPeerId,
+  // Memoise the remote-only derivation so RightPanel (and any
+  // future consumers that subscribe to this hook) don't see a new
+  // `Map` reference on every render of an unrelated state change.
+  // The filter is O(n) in the number of active locks and the
+  // allocation is small, but recomputing it on every render still
+  // pollutes downstream `useEffect` dep arrays that key off
+  // `remoteLocks`.
+  const remoteLocks = useMemo(
+    () =>
+      selfPeerId === null
+        ? allLocks
+        : new Map(
+            Array.from(allLocks.entries()).filter(
+              ([, entry]) => entry.holderPeerId !== selfPeerId,
+            ),
           ),
-        );
+    [allLocks, selfPeerId],
+  );
 
   return { remoteLocks, allLocks, selfPeerId, error };
 }

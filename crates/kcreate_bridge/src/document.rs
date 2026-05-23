@@ -1268,7 +1268,14 @@ fn sync_scene_locked(guard: &mut parking_lot::MutexGuard<'_, Option<Workspace>>)
         // name was rendered (rect at z, label at z+1, cursor at z+1
         // → same z, paint order undefined).
         let halo_starting_z = i32::MAX / 2;
-        let selection_triples = crate::collab::presence_selections();
+        // Single atomic read of the presence state so halos and
+        // cursors painted in the same frame come from the same
+        // snapshot. The previous two-call shape released and
+        // reacquired `collab::slot()` between reads; an inbound
+        // presence apply that landed in that gap would leave the
+        // scene with halos from snapshot N and cursors from
+        // snapshot N+1 in one rendered frame.
+        let (selection_triples, cursor_triples) = crate::collab::presence_snapshot();
         let halo_next_z = if selection_triples.is_empty() {
             halo_starting_z
         } else {
@@ -1291,7 +1298,7 @@ fn sync_scene_locked(guard: &mut parking_lot::MutexGuard<'_, Option<Workspace>>)
             )
         };
 
-        let triples = crate::collab::presence_cursors();
+        let triples = cursor_triples;
         if !triples.is_empty() {
             let cursors: Vec<crate::scene_sync::PresenceCursor> = triples
                 .into_iter()

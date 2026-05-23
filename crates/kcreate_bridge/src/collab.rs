@@ -1210,7 +1210,8 @@ pub fn presence_cursors() -> Vec<(String, String, SessionCursor)> {
     let Some(state) = guard.as_ref() else {
         return Vec::new();
     };
-    presence_cursors_from_state(state)
+    let lookup = build_connected_lookup(state);
+    presence_cursors_from_state(state, &lookup)
 }
 
 /// Read-side accessor for `scene_sync` to paint remote-peer
@@ -1231,7 +1232,8 @@ pub fn presence_selections() -> Vec<(String, String, Vec<Uuid>)> {
     let Some(state) = guard.as_ref() else {
         return Vec::new();
     };
-    presence_selections_from_state(state)
+    let lookup = build_connected_lookup(state);
+    presence_selections_from_state(state, &lookup)
 }
 
 /// Atomic per-frame snapshot of every remote-peer presence
@@ -1261,19 +1263,32 @@ pub fn presence_snapshot() -> (
     let Some(state) = guard.as_ref() else {
         return (Vec::new(), Vec::new());
     };
+    // Build the connected-peers display-name lookup ONCE per snapshot
+    // and pass it down to both readers. The two readers iterate the
+    // same `state.presence` map and need the same `PeerId →
+    // display_name` lookup, so collapsing the two
+    // `state.host.connected_peers()` calls eliminates redundant
+    // O(P) work on every scene-sync tick (P = connected peer count).
+    let lookup = build_connected_lookup(state);
     (
-        presence_selections_from_state(state),
-        presence_cursors_from_state(state),
+        presence_selections_from_state(state, &lookup),
+        presence_cursors_from_state(state, &lookup),
     )
 }
 
-fn presence_cursors_from_state(state: &SessionState) -> Vec<(String, String, SessionCursor)> {
-    let connected_lookup: HashMap<PeerId, String> = state
+fn build_connected_lookup(state: &SessionState) -> HashMap<PeerId, String> {
+    state
         .host
         .connected_peers()
         .into_iter()
         .map(|i| (i.peer_id, i.display_name))
-        .collect();
+        .collect()
+}
+
+fn presence_cursors_from_state(
+    state: &SessionState,
+    connected_lookup: &HashMap<PeerId, String>,
+) -> Vec<(String, String, SessionCursor)> {
     state
         .presence
         .iter()
@@ -1285,13 +1300,10 @@ fn presence_cursors_from_state(state: &SessionState) -> Vec<(String, String, Ses
         .collect()
 }
 
-fn presence_selections_from_state(state: &SessionState) -> Vec<(String, String, Vec<Uuid>)> {
-    let connected_lookup: HashMap<PeerId, String> = state
-        .host
-        .connected_peers()
-        .into_iter()
-        .map(|i| (i.peer_id, i.display_name))
-        .collect();
+fn presence_selections_from_state(
+    state: &SessionState,
+    connected_lookup: &HashMap<PeerId, String>,
+) -> Vec<(String, String, Vec<Uuid>)> {
     state
         .presence
         .iter()

@@ -105,10 +105,24 @@ export function useSessionLocks(): UseSessionLocksResult {
   // allocation is small, but recomputing it on every render still
   // pollutes downstream `useEffect` dep arrays that key off
   // `remoteLocks`.
+  //
+  // When `selfPeerId === null` we return an empty map rather than
+  // passing `allLocks` through unfiltered. The JSDoc on
+  // `remoteLocks` contracts the result to "entries excluding ones
+  // we hold ourselves" — but `setSelfPeerId(null)` and
+  // `setAllLocks(...)` inside `reload()` are separated by an
+  // `await`, so a render landing between the two would otherwise
+  // see `selfPeerId = null` *and* the previous session's
+  // `allLocks` still populated, which would (a) violate the doc
+  // contract and (b) cause RightPanel to surface our *own* locks
+  // as a "locked by another peer" banner for one frame. Returning
+  // an empty map keeps the invariant honest no matter the order
+  // the two setState calls flush, and matches the "no session ⇒
+  // no remote peers" semantic the bridge enforces anyway.
   const remoteLocks = useMemo(
     () =>
       selfPeerId === null
-        ? allLocks
+        ? new Map<string, SessionLockEntry>()
         : new Map(
             Array.from(allLocks.entries()).filter(
               ([, entry]) => entry.holderPeerId !== selfPeerId,

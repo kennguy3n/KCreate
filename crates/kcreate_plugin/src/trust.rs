@@ -77,7 +77,9 @@ pub enum TrustError {
     Json(#[from] serde_json::Error),
     #[error("trust store: key '{0}' has invalid base64: {1}")]
     InvalidKeyEncoding(String, String),
-    #[error("trust store: key '{id}' has wrong public-key length: expected {expected}, got {actual}")]
+    #[error(
+        "trust store: key '{id}' has wrong public-key length: expected {expected}, got {actual}"
+    )]
     WrongKeyLength {
         id: String,
         expected: usize,
@@ -302,8 +304,8 @@ mod tests {
     #[test]
     fn duplicate_key_id_rejects() {
         let sk = signing_key_from_seed(8);
-        let err =
-            TrustStore::from_keys(vec![trusted_pair("dup", &sk), trusted_pair("dup", &sk)]).unwrap_err();
+        let err = TrustStore::from_keys(vec![trusted_pair("dup", &sk), trusted_pair("dup", &sk)])
+            .unwrap_err();
         assert!(matches!(err, TrustError::DuplicateKey(_)));
     }
 

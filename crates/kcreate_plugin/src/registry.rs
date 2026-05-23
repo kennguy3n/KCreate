@@ -29,9 +29,7 @@ pub enum RegistryError {
     Json(#[from] serde_json::Error),
     #[error("trust: {0}")]
     Trust(#[from] TrustError),
-    #[error(
-        "plugin {0}: native plugins must carry a manifest.json.sig signed by a trusted key"
-    )]
+    #[error("plugin {0}: native plugins must carry a manifest.json.sig signed by a trusted key")]
     UnsignedNativePlugin(String),
 }
 
@@ -719,10 +717,8 @@ mod tests {
         let trusted = SigningKey::from_bytes(&[4u8; 32]);
         // Plugin signs with `signer` but trust store only knows `trusted`.
         write_native_plugin_signed(dir.path(), "evil", "k1", &signer);
-        let mut reg = PluginRegistry::with_trust(
-            dir.path().to_path_buf(),
-            trusted_store("k1", &trusted),
-        );
+        let mut reg =
+            PluginRegistry::with_trust(dir.path().to_path_buf(), trusted_store("k1", &trusted));
         reg.scan().unwrap();
         assert!(
             reg.list().is_empty(),
@@ -790,10 +786,8 @@ mod tests {
         )
         .unwrap();
 
-        let mut reg = PluginRegistry::with_trust(
-            dir.path().to_path_buf(),
-            trusted_store("kw", &sk),
-        );
+        let mut reg =
+            PluginRegistry::with_trust(dir.path().to_path_buf(), trusted_store("kw", &sk));
         reg.scan().unwrap();
         match reg.signature_status_for("signed_wasm").unwrap() {
             SignatureStatus::Verified { key_id } => assert_eq!(key_id, "kw"),
@@ -830,10 +824,8 @@ mod tests {
             ),
         )
         .unwrap();
-        let mut reg = PluginRegistry::with_trust(
-            dir.path().to_path_buf(),
-            trusted_store("k", &trusted),
-        );
+        let mut reg =
+            PluginRegistry::with_trust(dir.path().to_path_buf(), trusted_store("k", &trusted));
         reg.scan().unwrap();
         match reg.signature_status_for("wasm_with_bad_sig").unwrap() {
             SignatureStatus::Invalid { key_id, .. } => assert_eq!(key_id, "k"),

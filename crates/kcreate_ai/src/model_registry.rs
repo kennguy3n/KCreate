@@ -381,10 +381,12 @@ pub fn install_model_pack(
     let mut buf: Box<[u8]> = vec![0u8; 64 * 1024].into_boxed_slice();
     let mut total: u64 = 0;
     loop {
-        let n = src_file.read(&mut buf).map_err(|e| InstallError::SourceIo {
-            path: source.display().to_string(),
-            source: e,
-        })?;
+        let n = src_file
+            .read(&mut buf)
+            .map_err(|e| InstallError::SourceIo {
+                path: source.display().to_string(),
+                source: e,
+            })?;
         if n == 0 {
             break;
         }
@@ -659,13 +661,8 @@ mod tests {
         // SHA-256 of `payload`, hand-computed via `sha256sum`.
         let expected_hash = "6b3c04b8a9c593d001a8099f26575219f0e3777050dc54dcb90e16fbcfe611ba";
         let models = dir.path().join("models");
-        let report = install_with_expected_hash(
-            "bg_remove_u2net",
-            &src,
-            &models,
-            expected_hash,
-        )
-        .unwrap();
+        let report =
+            install_with_expected_hash("bg_remove_u2net", &src, &models, expected_hash).unwrap();
         assert!(report.verified);
         assert_eq!(report.actual_sha256, expected_hash);
     }
@@ -753,10 +750,12 @@ mod tests {
         let mut buf: Box<[u8]> = vec![0u8; 64 * 1024].into_boxed_slice();
         let mut total: u64 = 0;
         loop {
-            let n = src_file.read(&mut buf).map_err(|e| InstallError::SourceIo {
-                path: source.display().to_string(),
-                source: e,
-            })?;
+            let n = src_file
+                .read(&mut buf)
+                .map_err(|e| InstallError::SourceIo {
+                    path: source.display().to_string(),
+                    source: e,
+                })?;
             if n == 0 {
                 break;
             }

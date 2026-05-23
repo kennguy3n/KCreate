@@ -22,7 +22,15 @@ use crate::peer::PeerIdentity;
 /// One peer-to-peer message. Tagged via `serde`'s default external
 /// tagging so the JSON encoding is `{ "Hello": { … } }`-style — easy
 /// to inspect in a packet capture, and unambiguous when extending.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// Note: this enum deliberately implements `PartialEq` but NOT `Eq`.
+/// One variant ([`Message::Presence`]) transitively carries `f64`
+/// cursor coordinates through [`PresencePayload::cursor`], and
+/// `f64` is not `Eq` (it has `NaN`). Adding a hand-rolled `impl Eq`
+/// would be technically unsound; the wire layer only ever needs
+/// `PartialEq` for round-trip tests and equality checks, so we
+/// stop there.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "data", rename_all = "snake_case")]
 pub enum Message {
     /// Sent once by the joining peer right after the transport
@@ -109,7 +117,9 @@ pub struct OperationBroadcastPayload {
 }
 
 /// Payload of [`Message::Presence`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// Not `Eq` because it transitively contains [`Cursor`] (`f64` fields).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PresencePayload {
     /// The page the peer is currently editing, or `None` if the peer
@@ -128,14 +138,17 @@ pub struct PresencePayload {
 /// Cursor position in document coordinates (px). Kept separate from
 /// presence so it's cheap to clone and so the renderer can diff it
 /// against the last seen cursor for repaint culling.
+///
+/// Intentionally NOT `Eq`: the coordinates are `f64`, and IEEE-754
+/// allows `NaN` which breaks reflexivity. The only consumers in the
+/// editing path are `assert_eq!` in tests and serde round-trips,
+/// both of which only need `PartialEq`.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Cursor {
     pub x: f64,
     pub y: f64,
 }
-
-impl Eq for Cursor {}
 
 /// Why the sender is leaving.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -172,7 +185,10 @@ mod tests {
         });
         let v: serde_json::Value = serde_json::to_value(&msg).unwrap();
         assert_eq!(v["kind"], "hello");
-        assert_eq!(v["data"]["projectId"], "00000000-0000-0000-0000-000000000000");
+        assert_eq!(
+            v["data"]["projectId"],
+            "00000000-0000-0000-0000-000000000000"
+        );
         assert_eq!(v["data"]["appVersion"], "0.0.1+phase2");
         assert_eq!(v["data"]["identity"]["displayName"], "Ken");
         let back: Message = serde_json::from_value(v).unwrap();

@@ -126,10 +126,7 @@ where
     /// Verify the envelope's signature against `verifying_key` and
     /// the protocol version. On success, return a borrowed view of
     /// the inner payload — the envelope itself is unchanged.
-    pub fn open<'a>(
-        &'a self,
-        verifying_key: &VerifyingKey,
-    ) -> Result<&'a T, CollabError> {
+    pub fn open<'a>(&'a self, verifying_key: &VerifyingKey) -> Result<&'a T, CollabError> {
         if self.protocol_version != PROTOCOL_VERSION {
             return Err(CollabError::ProtocolVersionMismatch {
                 expected: PROTOCOL_VERSION,
@@ -180,7 +177,9 @@ pub type EnvelopeBytes = Vec<u8>;
 /// struct laid out in declaration order with no embedded `Value`s of
 /// dynamic shape it's deterministic in practice. We pin the shape
 /// here to keep cross-peer signatures verifiable.
-fn canonical_signing_bytes<T: Serialize>(view: &SigningView<'_, T>) -> Result<Vec<u8>, CollabError> {
+fn canonical_signing_bytes<T: Serialize>(
+    view: &SigningView<'_, T>,
+) -> Result<Vec<u8>, CollabError> {
     serde_json::to_vec(view).map_err(|e| CollabError::Encode(e.to_string()))
 }
 
@@ -228,9 +227,7 @@ mod tests {
             k.peer_id(),
             LamportClock::from_raw(5),
             [9u8; NONCE_BYTES],
-            Hello {
-                text: "hi".into(),
-            },
+            Hello { text: "hi".into() },
             k.signing_key(),
         )
         .unwrap();
@@ -246,9 +243,7 @@ mod tests {
             k.peer_id(),
             LamportClock::from_raw(1),
             [1u8; NONCE_BYTES],
-            Hello {
-                text: "ok".into(),
-            },
+            Hello { text: "ok".into() },
             k.signing_key(),
         )
         .unwrap();
@@ -266,9 +261,7 @@ mod tests {
             k.peer_id(),
             LamportClock::from_raw(1),
             [1u8; NONCE_BYTES],
-            Hello {
-                text: "ok".into(),
-            },
+            Hello { text: "ok".into() },
             k.signing_key(),
         )
         .unwrap();
@@ -287,9 +280,7 @@ mod tests {
             a.peer_id(),
             LamportClock::from_raw(1),
             [2u8; NONCE_BYTES],
-            Hello {
-                text: "ok".into(),
-            },
+            Hello { text: "ok".into() },
             a.signing_key(),
         )
         .unwrap();
@@ -306,9 +297,7 @@ mod tests {
             k.peer_id(),
             LamportClock::from_raw(0),
             [0u8; NONCE_BYTES],
-            Hello {
-                text: "ok".into(),
-            },
+            Hello { text: "ok".into() },
             k.signing_key(),
         )
         .unwrap();
@@ -347,9 +336,7 @@ mod tests {
             k.peer_id(),
             LamportClock::from_raw(1),
             [0u8; NONCE_BYTES],
-            Hello {
-                text: "x".into(),
-            },
+            Hello { text: "x".into() },
             k.signing_key(),
         )
         .unwrap();
@@ -357,9 +344,7 @@ mod tests {
             k.peer_id(),
             LamportClock::from_raw(1),
             [1u8; NONCE_BYTES],
-            Hello {
-                text: "x".into(),
-            },
+            Hello { text: "x".into() },
             k.signing_key(),
         )
         .unwrap();

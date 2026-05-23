@@ -5275,8 +5275,7 @@ mod tests {
         project_create("cs", dir.path()).expect("create");
 
         let raw = crate::phase2::color_settings_get().expect("get");
-        let parsed: kcreate_core::color::ColorSettings =
-            serde_json::from_str(&raw).expect("parse");
+        let parsed: kcreate_core::color::ColorSettings = serde_json::from_str(&raw).expect("parse");
         assert_eq!(parsed, kcreate_core::color::ColorSettings::default());
         project_close();
     }
@@ -5350,9 +5349,8 @@ mod tests {
             k: 0.5,
             a: 1.0,
         };
-        let raw =
-            crate::phase2::color_convert(&serde_json::to_string(&authored).unwrap(), "cmyk")
-                .expect("convert");
+        let raw = crate::phase2::color_convert(&serde_json::to_string(&authored).unwrap(), "cmyk")
+            .expect("convert");
         let out: kcreate_core::color::Color = serde_json::from_str(&raw).expect("parse");
         assert_eq!(out, authored);
     }
@@ -5574,11 +5572,8 @@ mod tests {
             fractions: true,
             ordinals: false,
         };
-        crate::phase2::text_opentype_features_update(
-            id,
-            &serde_json::to_string(&custom).unwrap(),
-        )
-        .expect("update");
+        crate::phase2::text_opentype_features_update(id, &serde_json::to_string(&custom).unwrap())
+            .expect("update");
         let after = crate::phase2::text_opentype_features_get(id).expect("get after");
         let parsed_after: kcreate_core::node::OpenTypeFeatures =
             serde_json::from_str(&after).unwrap();
@@ -5693,9 +5688,7 @@ mod tests {
     /// will create a node, capture its id, write a per-test
     /// instance of the WAT with that id baked in, and run.
     fn delete_proposal_wat(node_id: uuid::Uuid) -> String {
-        let payload = format!(
-            "{{\"type\":\"delete_node\",\"node_id\":\"{node_id}\"}}"
-        );
+        let payload = format!("{{\"type\":\"delete_node\",\"node_id\":\"{node_id}\"}}");
         let len = payload.len();
         // The WAT data section needs the inner double quotes escaped
         // as `\"` so the WAT parser sees one string literal, not a
@@ -5762,14 +5755,18 @@ mod tests {
         let _guard = PluginEnvGuard::new(plugin_dir.path());
 
         project_create("ctx", dir.path()).expect("create");
-        let id = write_test_plugin(plugin_dir.path(), "list-nodes", READ_DOC_WAT, &["read_document"]);
+        let id = write_test_plugin(
+            plugin_dir.path(),
+            "list-nodes",
+            READ_DOC_WAT,
+            &["read_document"],
+        );
         // `plugin_list` performs the registry scan; without it,
         // `plugin_enable` can't find the freshly-written manifest.
         crate::phase2::plugin_list().expect("list");
         crate::phase2::plugin_enable(&id).expect("enable");
 
-        let out = crate::phase2::plugin_execute_with_context(&id, "run", "")
-            .expect("execute");
+        let out = crate::phase2::plugin_execute_with_context(&id, "run", "").expect("execute");
         let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
         let response: Vec<String> =
             serde_json::from_str(parsed.get("output").and_then(|v| v.as_str()).unwrap())
@@ -5794,8 +5791,7 @@ mod tests {
         crate::phase2::plugin_list().expect("list");
         crate::phase2::plugin_enable(&id).expect("enable");
 
-        let out = crate::phase2::plugin_execute_with_context(&id, "run", "")
-            .expect("execute");
+        let out = crate::phase2::plugin_execute_with_context(&id, "run", "").expect("execute");
         let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
         // Output should be empty when the call was denied — the
         // host writes nothing to the output buffer.
@@ -5810,8 +5806,9 @@ mod tests {
             .cloned()
             .unwrap_or_default();
         assert!(
-            logs.iter()
-                .any(|l| l.as_str().is_some_and(|s| s.contains("denied (missing ReadDocument)"))),
+            logs.iter().any(|l| l
+                .as_str()
+                .is_some_and(|s| s.contains("denied (missing ReadDocument)"))),
             "expected deny log line, got {logs:?}"
         );
         project_close();
@@ -5840,17 +5837,11 @@ mod tests {
         .expect("create node");
 
         let wat = delete_proposal_wat(target);
-        let id = write_test_plugin(
-            plugin_dir.path(),
-            "deleter",
-            &wat,
-            &["write_document"],
-        );
+        let id = write_test_plugin(plugin_dir.path(), "deleter", &wat, &["write_document"]);
         crate::phase2::plugin_list().expect("list");
         crate::phase2::plugin_enable(&id).expect("enable");
 
-        let out = crate::phase2::plugin_execute_with_context(&id, "run", "")
-            .expect("execute");
+        let out = crate::phase2::plugin_execute_with_context(&id, "run", "").expect("execute");
         let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
         let reports = parsed
             .get("proposals")
@@ -5866,8 +5857,7 @@ mod tests {
         assert_eq!(status, "applied", "expected applied, got {status}");
         // Node should be gone from the document.
         assert!(
-            with_workspace(|ws| Ok(ws.project.document.get_node(target).is_none()))
-                .unwrap(),
+            with_workspace(|ws| Ok(ws.project.document.get_node(target).is_none())).unwrap(),
             "node should be gone after applied delete proposal"
         );
         project_close();
@@ -5894,8 +5884,7 @@ mod tests {
         crate::phase2::plugin_list().expect("list");
         crate::phase2::plugin_enable(&id).expect("enable");
 
-        let out = crate::phase2::plugin_execute_with_context(&id, "run", "")
-            .expect("execute");
+        let out = crate::phase2::plugin_execute_with_context(&id, "run", "").expect("execute");
         let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
         let reports = parsed
             .get("proposals")
@@ -5918,14 +5907,14 @@ mod tests {
 
     /// Lay down a JS panel plugin (manifest.json + entry_html stub)
     /// under `dir/<id>/`.
-    fn write_test_js_panel(
-        dir: &std::path::Path,
-        id: &str,
-        permissions: &[&str],
-    ) -> String {
+    fn write_test_js_panel(dir: &std::path::Path, id: &str, permissions: &[&str]) -> String {
         let plugin_dir = dir.join(id);
         std::fs::create_dir_all(&plugin_dir).unwrap();
-        std::fs::write(plugin_dir.join("panel.html"), b"<!doctype html><html></html>").unwrap();
+        std::fs::write(
+            plugin_dir.join("panel.html"),
+            b"<!doctype html><html></html>",
+        )
+        .unwrap();
         let manifest = serde_json::json!({
             "id": id,
             "name": id,
@@ -6009,8 +5998,7 @@ mod tests {
         let _guard = PluginEnvGuard::new(plugin_dir.path());
 
         project_create("ctx", dir.path()).expect("create");
-        let panel_id =
-            write_test_js_panel(plugin_dir.path(), "read-panel", &["read_document"]);
+        let panel_id = write_test_js_panel(plugin_dir.path(), "read-panel", &["read_document"]);
         crate::phase2::plugin_list().expect("list");
         crate::phase2::plugin_enable(&panel_id).expect("enable");
 

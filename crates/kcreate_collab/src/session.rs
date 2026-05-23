@@ -149,8 +149,7 @@ impl ProjectSession {
     /// this from the trust UI after the user confirms the
     /// fingerprint match.
     pub fn trust_peer(&mut self, identity: PeerIdentity) -> Result<(), SessionError> {
-        if self.peers.len() >= self.config.max_peers
-            && !self.peers.contains_key(&identity.peer_id)
+        if self.peers.len() >= self.config.max_peers && !self.peers.contains_key(&identity.peer_id)
         {
             return Err(SessionError::TooManyPeers {
                 max: self.config.max_peers,
@@ -389,7 +388,10 @@ mod tests {
         });
         let env = a.seal_message(msg).unwrap();
         let err = b.ingest_envelope_json(&env).unwrap_err();
-        assert!(matches!(err, SessionError::WrongProject { .. }), "got {err:?}");
+        assert!(
+            matches!(err, SessionError::WrongProject { .. }),
+            "got {err:?}"
+        );
     }
 
     #[test]
@@ -435,7 +437,9 @@ mod tests {
         assert_eq!(b.ingest_envelope_json(&env).unwrap(), Message::Heartbeat);
 
         // Goodbye
-        let env = a.seal_message(Message::Goodbye(GoodbyeReason::Normal)).unwrap();
+        let env = a
+            .seal_message(Message::Goodbye(GoodbyeReason::Normal))
+            .unwrap();
         assert_eq!(
             b.ingest_envelope_json(&env).unwrap(),
             Message::Goodbye(GoodbyeReason::Normal)

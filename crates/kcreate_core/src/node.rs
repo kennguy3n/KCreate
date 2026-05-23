@@ -1686,9 +1686,7 @@ mod tests {
         let mut shape = Node::new(NodeType::VectorLayer, "Rect");
         shape.set_opentype_features(&features);
         assert_eq!(shape.opentype_features(), OpenTypeFeatures::default());
-        assert!(!shape
-            .metadata
-            .contains_key(OPENTYPE_FEATURES_METADATA_KEY));
+        assert!(!shape.metadata.contains_key(OPENTYPE_FEATURES_METADATA_KEY));
     }
 
     #[test]

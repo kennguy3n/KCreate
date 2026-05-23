@@ -457,18 +457,10 @@ fn fit_line<'a>(
                 if breaks.is_empty() {
                     false
                 } else {
-                    let hyphen_w: f64 = hyphen_shaped
-                        .glyphs
-                        .iter()
-                        .map(|g| g.x_advance)
-                        .sum();
-                    if let Some((end_glyph, byte_break, prefix_w)) = pick_hyphenation_split(
-                        text,
-                        shaped,
-                        &breaks,
-                        max_width,
-                        hyphen_w,
-                    ) {
+                    let hyphen_w: f64 = hyphen_shaped.glyphs.iter().map(|g| g.x_advance).sum();
+                    if let Some((end_glyph, byte_break, prefix_w)) =
+                        pick_hyphenation_split(text, shaped, &breaks, max_width, hyphen_w)
+                    {
                         entries.push(LineEntry::WordSlice { shaped, end_glyph });
                         width += prefix_w + hyphen_w;
                         tail = Some(text[byte_break..].to_string());
@@ -538,24 +530,11 @@ fn fit_line<'a>(
                         // Walk breaks from longest fitting prefix to
                         // shortest, looking for one that fits inside
                         // `max_width` once we account for the hyphen.
-                        let hyphen_w: f64 = hyphen_shaped
-                            .glyphs
-                            .iter()
-                            .map(|g| g.x_advance)
-                            .sum();
+                        let hyphen_w: f64 = hyphen_shaped.glyphs.iter().map(|g| g.x_advance).sum();
                         if let Some((end_glyph, byte_break, prefix_w)) =
-                            pick_hyphenation_split(
-                                text,
-                                shaped,
-                                &breaks,
-                                max_width,
-                                hyphen_w,
-                            )
+                            pick_hyphenation_split(text, shaped, &breaks, max_width, hyphen_w)
                         {
-                            entries.push(LineEntry::WordSlice {
-                                shaped,
-                                end_glyph,
-                            });
+                            entries.push(LineEntry::WordSlice { shaped, end_glyph });
                             width += prefix_w + hyphen_w;
                             // The tail re-enters the token stream as a
                             // fresh `Word` so the next line picks it
@@ -607,10 +586,7 @@ fn pick_hyphenation_split(
         if glyph_end == 0 || glyph_end >= shaped.glyphs.len() {
             continue;
         }
-        let prefix_w: f64 = shaped.glyphs[..glyph_end]
-            .iter()
-            .map(|g| g.x_advance)
-            .sum();
+        let prefix_w: f64 = shaped.glyphs[..glyph_end].iter().map(|g| g.x_advance).sum();
         if prefix_w + hyphen_w <= max_width {
             return Some((glyph_end, byte_break, prefix_w));
         }
@@ -688,8 +664,7 @@ mod tests {
 
     #[test]
     fn single_short_line_fits_in_one_column() {
-        let Ok(layout) =
-            layout_paragraph("Hi", &style(), &frame(), bounds(400.0, 200.0), None)
+        let Ok(layout) = layout_paragraph("Hi", &style(), &frame(), bounds(400.0, 200.0), None)
         else {
             return; // no fonts on this host
         };
@@ -751,12 +726,7 @@ mod tests {
             // Nothing to assert; treat as skipped.
             return;
         }
-        let max_col = layout
-            .lines
-            .iter()
-            .map(|l| l.column)
-            .max()
-            .unwrap_or(0);
+        let max_col = layout.lines.iter().map(|l| l.column).max().unwrap_or(0);
         assert!(
             max_col >= 1 || layout.overflow,
             "expected either a line on column 1 or `overflow=true`, got max_col={max_col} \
@@ -769,8 +739,7 @@ mod tests {
     #[test]
     fn overflow_flag_set_when_text_doesnt_fit() {
         let text = "Lorem ipsum dolor sit amet, consectetur adipiscing elit. ".repeat(20);
-        let Ok(layout) =
-            layout_paragraph(&text, &style(), &frame(), bounds(120.0, 40.0), None)
+        let Ok(layout) = layout_paragraph(&text, &style(), &frame(), bounds(120.0, 40.0), None)
         else {
             return;
         };
@@ -808,13 +777,9 @@ mod tests {
                     constellation imagination representation organization \
                     determination administration consideration"
             .to_string();
-        let Ok(layout) = layout_paragraph(
-            &text,
-            &style(),
-            &f,
-            bounds(60.0, 600.0),
-            Some(&patterns),
-        ) else {
+        let Ok(layout) =
+            layout_paragraph(&text, &style(), &f, bounds(60.0, 600.0), Some(&patterns))
+        else {
             return;
         };
         if layout.lines.is_empty() {

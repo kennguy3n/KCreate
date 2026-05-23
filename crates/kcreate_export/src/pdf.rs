@@ -520,19 +520,15 @@ fn emit_vector(
     // `None` but `set_fill_color` still emits an operator, so the
     // fallback color space must match the requested mode too —
     // otherwise PDF/X validators flag the page as mixed-color-space.
-    let fill_pdf_color = fill_color
-        .as_ref()
-        .map_or_else(
-            || match color_mode {
-                PdfColorMode::Cmyk => {
-                    printpdf::Color::Cmyk(Cmyk::new(0.0, 0.0, 0.0, 0.0, None))
-                }
-                PdfColorMode::Rgb | PdfColorMode::PassThrough => {
-                    printpdf::Color::Rgb(Rgb::new(0.0, 0.0, 0.0, None))
-                }
-            },
-            |c| color_to_printpdf(c, color_mode),
-        );
+    let fill_pdf_color = fill_color.as_ref().map_or_else(
+        || match color_mode {
+            PdfColorMode::Cmyk => printpdf::Color::Cmyk(Cmyk::new(0.0, 0.0, 0.0, 0.0, None)),
+            PdfColorMode::Rgb | PdfColorMode::PassThrough => {
+                printpdf::Color::Rgb(Rgb::new(0.0, 0.0, 0.0, None))
+            }
+        },
+        |c| color_to_printpdf(c, color_mode),
+    );
     let outline_pdf_color = match color_mode {
         PdfColorMode::Cmyk => printpdf::Color::Cmyk(Cmyk::new(0.0, 0.0, 0.0, 1.0, None)),
         PdfColorMode::Rgb | PdfColorMode::PassThrough => {

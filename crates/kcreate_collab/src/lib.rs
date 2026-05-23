@@ -54,7 +54,7 @@ pub use conflict::{ConflictDecision, ConflictResolver, LastWriterWinsResolver};
 pub use envelope::{CollabError, Envelope, EnvelopeBytes, SignedPayload, PROTOCOL_VERSION};
 pub use message::{
     GoodbyeReason, HelloPayload, Message, OperationBroadcastPayload, PresencePayload,
-    WelcomeStatus, WelcomePayload,
+    WelcomePayload, WelcomeStatus,
 };
 pub use peer::{PeerFingerprint, PeerId, PeerIdentity, PeerKey};
 pub use session::{ProjectSession, SessionConfig, SessionError};

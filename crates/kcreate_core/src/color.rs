@@ -451,10 +451,7 @@ fn hue_to_rgb(p: f32, q: f32, mut t: f32) -> f32 {
 /// Inputs are `(l, a*, b*)` Lab triplets, e.g. from
 /// [`srgb_to_lab`].
 #[must_use]
-pub fn color_distance_cie76(
-    lab1: (f32, f32, f32),
-    lab2: (f32, f32, f32),
-) -> f32 {
+pub fn color_distance_cie76(lab1: (f32, f32, f32), lab2: (f32, f32, f32)) -> f32 {
     let dl = lab1.0 - lab2.0;
     let da = lab1.1 - lab2.1;
     let db = lab1.2 - lab2.2;

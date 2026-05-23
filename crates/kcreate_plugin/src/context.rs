@@ -45,8 +45,7 @@ use crate::manifest::PluginPermission;
 ///
 /// `Arc` so multiple plugin executions can share the same asset
 /// resolver without cloning a (potentially large) closure state.
-pub type AssetLoader =
-    Arc<dyn Fn(&str) -> Option<Vec<u8>> + Send + Sync + 'static>;
+pub type AssetLoader = Arc<dyn Fn(&str) -> Option<Vec<u8>> + Send + Sync + 'static>;
 
 /// One concrete mutation the plugin wants to apply. These are
 /// validated by the host before being turned into recordable
@@ -124,7 +123,10 @@ impl std::fmt::Debug for PluginContext {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PluginContext")
             .field("plugin_id", &self.plugin_id)
-            .field("document_snapshot_len", &self.document_snapshot.to_string().len())
+            .field(
+                "document_snapshot_len",
+                &self.document_snapshot.to_string().len(),
+            )
             .field("permissions", &self.permissions)
             .field("proposals", &self.proposals)
             .finish_non_exhaustive()

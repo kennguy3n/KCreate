@@ -361,16 +361,35 @@ fn extract_page_images(
 
     // Walk every Resources dict that applies to this page — both
     // the inline one (if present) and the inherited ones via
-    // ObjectId references. The two never overlap by construction:
-    // `get_page_resources` returns the inline dict separately from
-    // any inherited dicts up the Pages tree.
+    // ObjectId references. `get_page_resources` returns the inline
+    // dict separately from any inherited dicts up the Pages tree;
+    // in well-formed PDFs the two don't overlap, but a hand-rolled
+    // (or buggy authoring tool's) document can legitimately reference
+    // the same XObject from both the inline `Resources/XObject` dict
+    // and one inherited from an ancestor `Pages` node. Dedup by
+    // `ObjectId` so a duplicate ref doesn't import the same image
+    // twice (wasted blob-store space + a confusing duplicate node).
     let mut xobject_refs = Vec::<ObjectId>::new();
+    let mut seen = std::collections::HashSet::<ObjectId>::new();
+    let mut push_ref = |id: ObjectId, sink: &mut Vec<ObjectId>| {
+        if seen.insert(id) {
+            sink.push(id);
+        }
+    };
     if let Some(res) = resources_inline {
-        collect_xobject_refs(res, &mut xobject_refs);
+        let mut local = Vec::new();
+        collect_xobject_refs(res, &mut local);
+        for id in local {
+            push_ref(id, &mut xobject_refs);
+        }
     }
     for res_id in resource_ids {
         if let Ok(res) = doc.get_dictionary(res_id) {
-            collect_xobject_refs(res, &mut xobject_refs);
+            let mut local = Vec::new();
+            collect_xobject_refs(res, &mut local);
+            for id in local {
+                push_ref(id, &mut xobject_refs);
+            }
         }
     }
 
@@ -462,7 +481,17 @@ fn decode_image_xobject(
     // DCTDecode == JPEG. The PDF stores the complete JPEG bitstream
     // in the stream content; we copy it out verbatim and the
     // renderer's blob store treats it as a normal JPEG.
-    if filter_chain.iter().any(|f| f == "DCTDecode") {
+    //
+    // This is only safe when DCTDecode is the *single* filter on
+    // the stream. PDF 1.7 §7.4.1 allows a filter chain like
+    // `[FlateDecode, DCTDecode]` where the on-disk bytes are
+    // Flate-compressed JPEG — passing those raw bytes off as a
+    // JPEG would hand the blob store garbage. For multi-filter
+    // chains we fall through to the "unsupported filter" warning
+    // path; supporting them properly requires running the
+    // preceding filters first and is deferred until a real PDF in
+    // the corpus needs it.
+    if filter_chain.len() == 1 && filter_chain[0] == "DCTDecode" {
         return Ok(Some(ExtractedImage {
             width,
             height,
@@ -478,9 +507,7 @@ fn decode_image_xobject(
     // determines bytes-per-pixel; we currently support DeviceRGB
     // (3 bpp), DeviceGray (1 bpp), and DeviceCMYK (we convert
     // CMYK -> RGB on the fly).
-    if filter_chain.is_empty()
-        || filter_chain.iter().all(|f| f == "FlateDecode")
-    {
+    if filter_chain.is_empty() || filter_chain.iter().all(|f| f == "FlateDecode") {
         // Decompress the Flate filter. If decompression fails (e.g.
         // the stream is corrupt), surface it as an
         // `UnsupportedImageFilter` so the user sees "Flate
@@ -507,8 +534,7 @@ fn decode_image_xobject(
             })
             .unwrap_or_default();
         let bpc = dict.get(b"BitsPerComponent").and_then(Object::as_i64).ok();
-        return encode_raw_to_png(&raw, width, height, &color_space, bpc, page_index)
-            .map(Some);
+        return encode_raw_to_png(&raw, width, height, &color_space, bpc, page_index).map(Some);
     }
 
     // Unsupported filter chain (JPXDecode, JBIG2Decode, CCITTFaxDecode,
@@ -552,10 +578,9 @@ fn encode_raw_to_png(
     let (color, normalised): (ColorType, Vec<u8>) = match color_space {
         b"DeviceGray" if raw.len() >= pixels => (ColorType::L8, raw[..pixels].to_vec()),
         b"DeviceRGB" if raw.len() >= pixels * 3 => (ColorType::Rgb8, raw[..pixels * 3].to_vec()),
-        b"DeviceCMYK" if raw.len() >= pixels * 4 => (
-            ColorType::Rgb8,
-            cmyk_to_rgb(&raw[..pixels * 4]),
-        ),
+        b"DeviceCMYK" if raw.len() >= pixels * 4 => {
+            (ColorType::Rgb8, cmyk_to_rgb(&raw[..pixels * 4]))
+        }
         other => {
             return Err(PdfImportWarning::UnsupportedImageColorSpace {
                 page_index,
@@ -576,9 +601,7 @@ fn encode_raw_to_png(
     )
     .map_err(|_| PdfImportWarning::UnsupportedImageColorSpace {
         page_index,
-        color_space: std::str::from_utf8(color_space)
-            .unwrap_or("?")
-            .to_string(),
+        color_space: std::str::from_utf8(color_space).unwrap_or("?").to_string(),
     })?;
 
     Ok(ExtractedImage {
@@ -635,8 +658,7 @@ mod tests {
         // with Filter = DCTDecode.
         let mut jpeg = Vec::<u8>::new();
         {
-            let img =
-                image::RgbImage::from_pixel(width, height, image::Rgb([255u8, 0u8, 0u8]));
+            let img = image::RgbImage::from_pixel(width, height, image::Rgb([255u8, 0u8, 0u8]));
             img.write_to(
                 &mut std::io::Cursor::new(&mut jpeg),
                 image::ImageFormat::Jpeg,
@@ -662,7 +684,10 @@ mod tests {
         let resources_id = doc.add_object(dictionary! {
             "XObject" => dictionary! { "Im0" => img_id },
         });
-        let content_stream = Stream::new(Dictionary::new(), b"q 612 0 0 792 0 0 cm /Im0 Do Q".to_vec());
+        let content_stream = Stream::new(
+            Dictionary::new(),
+            b"q 612 0 0 792 0 0 cm /Im0 Do Q".to_vec(),
+        );
         let content_id = doc.add_object(Object::Stream(content_stream));
         let page_id = doc.add_object(dictionary! {
             "Type" => "Page",
@@ -768,20 +793,16 @@ mod tests {
         let pages_id = doc.new_object_id();
         // Page dicts deliberately omit MediaBox so they must inherit
         // it from the parent Pages node.
-        let empty_stream_a = doc.add_object(Object::Stream(Stream::new(
-            Dictionary::new(),
-            b"".to_vec(),
-        )));
+        let empty_stream_a =
+            doc.add_object(Object::Stream(Stream::new(Dictionary::new(), b"".to_vec())));
         let page_a = doc.add_object(dictionary! {
             "Type" => "Page",
             "Parent" => pages_id,
             "Resources" => dictionary! {},
             "Contents" => empty_stream_a,
         });
-        let empty_stream_b = doc.add_object(Object::Stream(Stream::new(
-            Dictionary::new(),
-            b"".to_vec(),
-        )));
+        let empty_stream_b =
+            doc.add_object(Object::Stream(Stream::new(Dictionary::new(), b"".to_vec())));
         let page_b = doc.add_object(dictionary! {
             "Type" => "Page",
             "Parent" => pages_id,

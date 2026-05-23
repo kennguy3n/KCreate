@@ -191,7 +191,7 @@ pnpm lint
 | Screenshot-to-layout                     | `crates/kcreate_ai/src/screenshot_to_layout.rs`    |
 | Plugin manifest / registry               | `crates/kcreate_plugin/src/{manifest,registry}.rs` |
 | WASM plugin execution                    | `crates/kcreate_plugin/src/wasm_runtime.rs`        |
-| Plugin signing (Ed25519)                 | `crates/kcreate_plugin/src/signing.rs`             |
+| Plugin signing (Ed25519)                 | `crates/kcreate_plugin/src/trust.rs` (+ `PluginSignature` in `manifest.rs`) |
 | PDF import (Phase 2 PR #7)               | `crates/kcreate_export/src/pdf_import.rs`          |
 | Collaboration protocol — peer identity   | `crates/kcreate_collab/src/peer.rs`                |
 | Collaboration protocol — Lamport clock   | `crates/kcreate_collab/src/clock.rs`               |

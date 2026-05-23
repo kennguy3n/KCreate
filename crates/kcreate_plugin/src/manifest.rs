@@ -188,9 +188,7 @@ impl PluginManifest {
             // `file://`-loading anything outside the plugin sandbox.
             let html = plugin_dir.join(&cfg.entry_html);
             if !html.exists() {
-                return Err(ManifestError::EntryPointMissing(
-                    html.display().to_string(),
-                ));
+                return Err(ManifestError::EntryPointMissing(html.display().to_string()));
             }
             ensure_path_within(plugin_dir, &html)?;
         }
@@ -348,7 +346,11 @@ mod tests {
             }"#,
         )
         .unwrap();
-        std::fs::write(dir.path().join("panel.html"), b"<!doctype html><html></html>").unwrap();
+        std::fs::write(
+            dir.path().join("panel.html"),
+            b"<!doctype html><html></html>",
+        )
+        .unwrap();
         let m = PluginManifest::load(dir.path()).unwrap();
         assert_eq!(m.plugin_type, PluginType::JsPanel);
         let cfg = m.js_panel.as_ref().expect("js_panel must be present");
@@ -371,7 +373,11 @@ mod tests {
             }"#,
         )
         .unwrap();
-        std::fs::write(dir.path().join("panel.html"), b"<!doctype html><html></html>").unwrap();
+        std::fs::write(
+            dir.path().join("panel.html"),
+            b"<!doctype html><html></html>",
+        )
+        .unwrap();
         let err = PluginManifest::load(dir.path()).unwrap_err();
         assert!(matches!(err, ManifestError::MissingField("js_panel")));
     }
@@ -397,7 +403,11 @@ mod tests {
             }"#,
         )
         .unwrap();
-        std::fs::write(dir.path().join("panel.html"), b"<!doctype html><html></html>").unwrap();
+        std::fs::write(
+            dir.path().join("panel.html"),
+            b"<!doctype html><html></html>",
+        )
+        .unwrap();
         let err = PluginManifest::load(dir.path()).unwrap_err();
         assert!(matches!(err, ManifestError::EntryPointMissing(_)));
     }

@@ -295,11 +295,7 @@ mod tests {
             ..OpenTypeFeatures::default()
         };
         let buzz = opentype_features_to_buzz(&features);
-        let ss_tags: Vec<String> = buzz
-            .iter()
-            .skip(9)
-            .map(|f| tag_string(f.tag))
-            .collect();
+        let ss_tags: Vec<String> = buzz.iter().skip(9).map(|f| tag_string(f.tag)).collect();
         assert_eq!(ss_tags, vec!["ss05"]);
     }
 
@@ -336,11 +332,10 @@ mod tests {
         //   * the width is positive,
         // matching the existing `nonempty_string_produces_glyphs…`
         // contract.
-        let features =
-            opentype_features_to_buzz(&OpenTypeFeatures {
-                ligatures: false,
-                ..OpenTypeFeatures::default()
-            });
+        let features = opentype_features_to_buzz(&OpenTypeFeatures {
+            ligatures: false,
+            ..OpenTypeFeatures::default()
+        });
         if let Ok(s) = shape_text_with_features("offline", "sans-serif", 32.0, &features) {
             assert!(!s.glyphs.is_empty());
             assert!(s.width > 0.0);

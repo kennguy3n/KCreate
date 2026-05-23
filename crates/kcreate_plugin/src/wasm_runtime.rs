@@ -435,10 +435,7 @@ impl WasmPluginRuntime {
 
         let data = store.into_data();
         let output = String::from_utf8(data.output).map_err(|_| WasmPluginError::OutputNotUtf8)?;
-        let proposals = data
-            .context
-            .map(|c| c.proposals)
-            .unwrap_or_default();
+        let proposals = data.context.map(|c| c.proposals).unwrap_or_default();
         Ok(PluginOutput {
             output,
             logs: data.logs,
@@ -515,9 +512,7 @@ fn register_host_funcs(linker: &mut Linker<HostData>) -> Result<(), WasmPluginEr
 /// are only attached when the plugin runs under a [`PluginContext`];
 /// the basic / legacy execution path leaves them unlinked so old
 /// plugins that don't expect them aren't affected.
-fn register_extended_host_funcs(
-    linker: &mut Linker<HostData>,
-) -> Result<(), WasmPluginError> {
+fn register_extended_host_funcs(linker: &mut Linker<HostData>) -> Result<(), WasmPluginError> {
     linker.func_wrap(
         "env",
         "kcreate_read_document",
@@ -557,15 +552,20 @@ fn register_extended_host_funcs(
             let query: DocumentQuery = match serde_json::from_str(query_str) {
                 Ok(q) => q,
                 Err(e) => {
-                    caller.data_mut().logs.push(format!(
-                        "kcreate_read_document: invalid query json: {e}"
-                    ));
+                    caller
+                        .data_mut()
+                        .logs
+                        .push(format!("kcreate_read_document: invalid query json: {e}"));
                     return Ok(0);
                 }
             };
 
             let response = {
-                let ctx = caller.data().context.as_ref().expect("permitted implies context");
+                let ctx = caller
+                    .data()
+                    .context
+                    .as_ref()
+                    .expect("permitted implies context");
                 resolve_document_query(&ctx.document_snapshot, &query)
             };
             let response_bytes = match serde_json::to_vec(&response) {
@@ -626,8 +626,12 @@ fn register_extended_host_funcs(
                 .context
                 .as_ref()
                 .map(|c| c.asset_loader.clone());
-            let Some(loader) = loader_opt else { return Ok(0) };
-            let Some(bytes) = loader(&hash_str) else { return Ok(0) };
+            let Some(loader) = loader_opt else {
+                return Ok(0);
+            };
+            let Some(bytes) = loader(&hash_str) else {
+                return Ok(0);
+            };
 
             let buf_cap = usize_from_i32(buf_len)?;
             let to_write = bytes.len().min(buf_cap);
@@ -1006,7 +1010,11 @@ mod tests {
             .execute_with_context(&wasm, "run", "", 16, ctx)
             .expect("execute");
         // Output should be empty — the host wrote nothing on deny.
-        assert!(out.output.is_empty(), "expected empty output, got {:?}", out.output);
+        assert!(
+            out.output.is_empty(),
+            "expected empty output, got {:?}",
+            out.output
+        );
         assert!(out
             .logs
             .iter()
@@ -1100,8 +1108,8 @@ mod tests {
     /// runtime contract, this test catches it.
     #[test]
     fn example_hello_plugin_runs_against_runtime() {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("examples/hello/hello.wat");
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/hello/hello.wat");
         let wasm = wat::parse_file(&path).expect("example hello.wat must compile");
         let rt = WasmPluginRuntime::new();
         let out = rt.execute(&wasm, "run", "", 16).expect("execute");

@@ -340,9 +340,8 @@ pub fn ai_models_list() -> Result<String> {
 pub fn ai_model_install(pack_id: String, source_path: String) -> Result<String> {
     let dir = ai_models_dir();
     let source = std::path::PathBuf::from(source_path);
-    let report = kcreate_ai::install_model_pack(&pack_id, &source, &dir).map_err(|e| {
-        DocumentBridgeError::Io(std::io::Error::other(e.to_string()))
-    })?;
+    let report = kcreate_ai::install_model_pack(&pack_id, &source, &dir)
+        .map_err(|e| DocumentBridgeError::Io(std::io::Error::other(e.to_string())))?;
     Ok(serde_json::to_string(&report)?)
 }
 
@@ -351,9 +350,8 @@ pub fn ai_model_install(pack_id: String, source_path: String) -> Result<String> 
 /// [`kcreate_ai::uninstall_model_pack`].
 pub fn ai_model_uninstall(pack_id: String) -> Result<()> {
     let dir = ai_models_dir();
-    kcreate_ai::uninstall_model_pack(&pack_id, &dir).map_err(|e| {
-        DocumentBridgeError::Io(std::io::Error::other(e.to_string()))
-    })?;
+    kcreate_ai::uninstall_model_pack(&pack_id, &dir)
+        .map_err(|e| DocumentBridgeError::Io(std::io::Error::other(e.to_string())))?;
     Ok(())
 }
 
@@ -795,11 +793,7 @@ pub struct ProposalReport {
 /// `read_document` / `read_assets` / `write_document` in their
 /// manifest get an empty permission set here and behave identically
 /// to the legacy path.
-pub fn plugin_execute_with_context(
-    id: &str,
-    function: &str,
-    input_json: &str,
-) -> Result<String> {
+pub fn plugin_execute_with_context(id: &str, function: &str, input_json: &str) -> Result<String> {
     let (entry, manifest, enabled) = {
         let reg = plugin_registry().lock();
         (
@@ -933,7 +927,10 @@ fn plugin_js_message_inner(
     let (manifest, enabled) = {
         let reg = plugin_registry().lock();
         (
-            reg.list().iter().find(|m| m.id == plugin_id).map(|m| (*m).clone()),
+            reg.list()
+                .iter()
+                .find(|m| m.id == plugin_id)
+                .map(|m| (*m).clone()),
             reg.is_enabled(plugin_id),
         )
     };
@@ -1036,7 +1033,10 @@ fn plugin_js_message_inner(
             // Single-proposal apply, same code path WASM plugins go
             // through. Report flows back as the outcome's result.
             let reports = apply_plugin_proposals(vec![mutation]);
-            let report = reports.into_iter().next().expect("one proposal in, one report out");
+            let report = reports
+                .into_iter()
+                .next()
+                .expect("one proposal in, one report out");
             let value = serde_json::to_value(&report).unwrap_or(serde_json::Value::Null);
             kcreate_plugin::JsPanelMessageOutcome::Ok { result: value }
         }
@@ -1062,9 +1062,7 @@ fn plugin_js_message_inner(
 /// Each accepted proposal is applied through the existing
 /// `document_*` helpers so it records an operation and is undoable.
 /// Rejected proposals leave the document unchanged.
-fn apply_plugin_proposals(
-    proposals: Vec<kcreate_plugin::ProposedMutation>,
-) -> Vec<ProposalReport> {
+fn apply_plugin_proposals(proposals: Vec<kcreate_plugin::ProposedMutation>) -> Vec<ProposalReport> {
     proposals
         .into_iter()
         .map(|p| {
@@ -1087,9 +1085,8 @@ fn apply_one_proposal(proposal: &kcreate_plugin::ProposedMutation) -> ProposalOu
             // Validate parent existence up front so we return a
             // clean rejection rather than letting `document_create_node`
             // fail later with a less specific error.
-            let parent_check = with_workspace(|ws| {
-                Ok(ws.project.document.get_node(*parent_id).is_some())
-            });
+            let parent_check =
+                with_workspace(|ws| Ok(ws.project.document.get_node(*parent_id).is_some()));
             match parent_check {
                 Ok(true) => {}
                 Ok(false) => {
@@ -1112,11 +1109,8 @@ fn apply_one_proposal(proposal: &kcreate_plugin::ProposedMutation) -> ProposalOu
                         }
                     }
                 };
-            match crate::document::document_create_node(
-                node_type,
-                Some(*parent_id),
-                &create_props,
-            ) {
+            match crate::document::document_create_node(node_type, Some(*parent_id), &create_props)
+            {
                 Ok(new_id) => ProposalOutcome::Applied { node_id: new_id },
                 Err(e) => ProposalOutcome::Rejected {
                     reason: format!("create failed: {e}"),
@@ -1124,9 +1118,7 @@ fn apply_one_proposal(proposal: &kcreate_plugin::ProposedMutation) -> ProposalOu
             }
         }
         kcreate_plugin::ProposedMutation::UpdateNode { node_id, changes } => {
-            let exists = with_workspace(|ws| {
-                Ok(ws.project.document.get_node(*node_id).is_some())
-            });
+            let exists = with_workspace(|ws| Ok(ws.project.document.get_node(*node_id).is_some()));
             match exists {
                 Ok(true) => {}
                 Ok(false) => {
@@ -1157,9 +1149,7 @@ fn apply_one_proposal(proposal: &kcreate_plugin::ProposedMutation) -> ProposalOu
             }
         }
         kcreate_plugin::ProposedMutation::DeleteNode { node_id } => {
-            let exists = with_workspace(|ws| {
-                Ok(ws.project.document.get_node(*node_id).is_some())
-            });
+            let exists = with_workspace(|ws| Ok(ws.project.document.get_node(*node_id).is_some()));
             match exists {
                 Ok(true) => {}
                 Ok(false) => {
@@ -1436,12 +1426,7 @@ pub fn color_convert(from_json: &str, to_space: &str) -> Result<String> {
             }
         },
         "hsl" => match &from {
-            Color::Hsl {
-                h,
-                s,
-                l,
-                a: aa,
-            } => Color::Hsl {
+            Color::Hsl { h, s, l, a: aa } => Color::Hsl {
                 h: *h,
                 s: *s,
                 l: *l,
@@ -1595,7 +1580,9 @@ pub fn text_layout_compute(node_id: Uuid) -> Result<String> {
         // slot. Fall back to the legacy bare-string convention if the
         // value at `metadata["text"]` isn't a TextLayerMeta object —
         // older tests still write a raw string there.
-        let raw_meta = node.metadata.get(crate::scene_sync::TEXT_LAYER_METADATA_KEY);
+        let raw_meta = node
+            .metadata
+            .get(crate::scene_sync::TEXT_LAYER_METADATA_KEY);
         let (text, font_family, font_size) = match raw_meta {
             Some(v) => match serde_json::from_value::<TextLayerMeta>(v.clone()) {
                 Ok(meta) => (meta.text, Some(meta.font_family), Some(meta.font_size)),
@@ -1639,22 +1626,20 @@ pub fn text_layout_compute(node_id: Uuid) -> Result<String> {
     // Languages other than English fall through to `None` (no
     // hyphenation) until the project ships additional `.pat` files —
     // matches the Task 8 design.
-    let patterns: Option<HyphenationPatterns> = if frame.hyphenation
-        && frame
-            .hyphenation_language
-            .to_lowercase()
-            .starts_with("en")
-    {
-        Some(HyphenationPatterns::from_tex_patterns(EN_US_PATTERNS))
-    } else {
-        None
-    };
+    let patterns: Option<HyphenationPatterns> =
+        if frame.hyphenation && frame.hyphenation_language.to_lowercase().starts_with("en") {
+            Some(HyphenationPatterns::from_tex_patterns(EN_US_PATTERNS))
+        } else {
+            None
+        };
 
-    let layout = layout_paragraph(&text, &style, &frame, bounds, patterns.as_ref())
-    .map_err(|e| DocumentBridgeError::InvalidArgument {
-        argument: "layout".into(),
-        value: e.to_string(),
-    })?;
+    let layout =
+        layout_paragraph(&text, &style, &frame, bounds, patterns.as_ref()).map_err(|e| {
+            DocumentBridgeError::InvalidArgument {
+                argument: "layout".into(),
+                value: e.to_string(),
+            }
+        })?;
 
     let wire = TextLayoutWire {
         lines: layout
@@ -1823,11 +1808,7 @@ fn ingest_imported_pdf(imported: ImportedPdf) -> Result<PdfImportReport> {
     let mut page_ids = Vec::with_capacity(imported.pages.len());
     let mut images_imported = 0usize;
     let mut images_skipped = 0usize;
-    let mut warnings: Vec<String> = imported
-        .warnings
-        .iter()
-        .map(format_pdf_warning)
-        .collect();
+    let mut warnings: Vec<String> = imported.warnings.iter().map(format_pdf_warning).collect();
 
     for imported_page in imported.pages {
         images_skipped += imported_page.skipped_images;
@@ -1878,12 +1859,7 @@ fn ingest_imported_pdf(imported: ImportedPdf) -> Result<PdfImportReport> {
                 };
                 let mut node = Node::new(NodeType::RasterLayer, "Imported image");
                 node.parent_id = Some(new_page_id);
-                node.bounds = Bounds::new(
-                    0.0,
-                    0.0,
-                    f64::from(img.width),
-                    f64::from(img.height),
-                );
+                node.bounds = Bounds::new(0.0, 0.0, f64::from(img.width), f64::from(img.height));
                 node.metadata.insert(
                     crate::scene_sync::RASTER_IMAGE_METADATA_KEY.to_string(),
                     serde_json::to_value(&meta)?,

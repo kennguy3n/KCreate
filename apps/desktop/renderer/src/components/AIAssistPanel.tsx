@@ -179,18 +179,25 @@ const separatorStyle: React.CSSProperties = {
  * module scope so the `Set` allocation happens once per process
  * rather than once per render — same pattern as `BASE_TABS` in
  * `RightPanel.tsx`. The values mirror the `NodeType` discriminants
- * the bridge serialises (`crates/kcreate_core/src/node.rs`).
+ * the bridge serialises (`crates/kcreate_core/src/node.rs`) and
+ * must stay in lockstep with `NodeType::is_container()` in that
+ * file: every variant returning `true` from that method belongs
+ * in this set so the renderer's surface area matches the bridge's
+ * accepts-any-parent contract in `ai_layout_suggest_for_artboard`
+ * (`crates/kcreate_bridge/src/phase2.rs`).
  */
 const LAYOUT_ASSIST_CONTAINER_TYPES: ReadonlySet<string> = new Set([
   "Artboard",
   "Page",
   "GroupLayer",
   "LayoutFrame",
+  "ComponentLayer",
 ]);
 
 /**
  * Layout-suggest section. Visible whenever a container node
- * (Artboard, Page, GroupLayer, LayoutFrame) is selected; clicking
+ * (Artboard, Page, GroupLayer, LayoutFrame, ComponentLayer) is
+ * selected; clicking
  * "Suggest layout" runs the local DBSCAN-with-alignment clustering
  * heuristic in `kcreate_ai::layout_suggest` over the container's
  * direct visible children and renders a preview of each proposed

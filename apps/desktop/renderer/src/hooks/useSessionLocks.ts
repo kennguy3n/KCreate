@@ -230,12 +230,40 @@ function buildLockMap(
     // overwrite under last-claim-wins semantics), but be defensive
     // in case a future protocol revision relaxes that — keep the
     // most recent `acquiredAt` if duplicates ever appear.
+    //
+    // Compare via `Date.parse()` rather than lexicographic string
+    // comparison. The Rust side serialises `DateTime<Utc>` so today
+    // every value lands as a `Z`-suffixed RFC3339 string, where
+    // lexicographic ordering happens to coincide with chronological
+    // ordering. But that's an implicit coupling: a future protocol
+    // revision (or any peer that ever serialises with a non-`Z`
+    // offset, e.g. `+05:30`) would silently produce wrong results
+    // because `"2026-01-01T12:00:00+05:30"` is lexicographically
+    // greater than `"2026-01-01T12:00:00Z"` despite being earlier
+    // in absolute time. Parsing both sides through the same
+    // chronology-aware function eliminates that footgun. Bad input
+    // falls through to lexicographic — `NaN` comparisons are
+    // always false, so we keep the existing entry in that case
+    // (matching the "stale state is preferable to flashing empty"
+    // posture of the docstring).
     const existing = map.get(entry.nodeId);
-    if (!existing || entry.acquiredAt > existing.acquiredAt) {
+    if (!existing || acquiredAtIsNewer(entry.acquiredAt, existing.acquiredAt)) {
       map.set(entry.nodeId, entry);
     }
   }
   return map;
+}
+
+function acquiredAtIsNewer(candidate: string, existing: string): boolean {
+  const c = Date.parse(candidate);
+  const e = Date.parse(existing);
+  if (Number.isNaN(c) || Number.isNaN(e)) {
+    // Unparseable on either side; preserve the existing entry
+    // rather than guessing. The bridge contract is RFC3339 so this
+    // branch should be unreachable in practice.
+    return false;
+  }
+  return c > e;
 }
 
 function errorMessage(e: unknown): string {

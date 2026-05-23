@@ -245,8 +245,9 @@ function LayoutAssistSection({
           <span style={badgeStyle("ok")}>Local CPU</span>
         </div>
         <p style={paragraphStyle}>
-          Select an <b>Artboard</b>, <b>Page</b>, <b>Group</b>, or
-          <b> Frame</b> to suggest layout groupings for its children.
+          Select an <b>Artboard</b>, <b>Page</b>, <b>Group</b>,{" "}
+          <b>Frame</b>, or <b>Component</b> to suggest layout groupings for its
+          children.
         </p>
       </section>
     );

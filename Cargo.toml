@@ -14,6 +14,12 @@ members = [
     "crates/kcreate_mcp",
     "crates/kcreate_plugin",
     "crates/kcreate_collab",
+    # NOTE: kcreate_collab_transport is intentionally OUT of
+    # `kcreate_tests/tests/local_first.rs::editing_path_crates()` so it
+    # can pull QUIC / mDNS / rustls without breaking the local-first
+    # contract — the bridge depends on it only behind the `collab`
+    # feature flag.
+    "crates/kcreate_collab_transport",
     "crates/kcreate_tests",
 ]
 
@@ -157,6 +163,33 @@ wasmi = { version = "0.42", default-features = false, features = ["std"] }
 # everywhere so weak / malleable signatures are rejected. Used by the
 # trust store in `kcreate_plugin::trust`.
 ed25519-dalek = { version = "2.1", default-features = false, features = ["std", "fast"] }
+
+# Phase 3 LAN transport — these are intentionally pulled in only by
+# `kcreate_collab_transport` (and transitively, the bridge under the
+# `collab` feature). The editing-path crates never reach them, which is
+# what keeps the local-first sentinel green. quinn's `rustls-ring`
+# feature gives us a pure-Rust TLS stack with no OpenSSL link.
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring", "ring", "log"] }
+# rustls is brought in by quinn but we also use it directly for the
+# custom certificate verifier that pins peer certs to the SHA-256
+# fingerprint advertised in mDNS.
+rustls = { version = "0.23", default-features = false, features = ["std", "ring", "logging"] }
+rustls-pki-types = "1"
+# Ephemeral self-signed TLS certificates derived per session. The
+# Ed25519 peer identity remains the trust anchor; rcgen just provides
+# the TLS cert chain the QUIC stack requires.
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring", "pem"] }
+# Pure-Rust mDNS responder + browser. No system avahi/Bonjour deps.
+# 0.13 is the latest version supported by quinn 0.11's MSRV.
+mdns-sd = { version = "0.13", default-features = false }
+# Async runtime for the transport actor. Editing path stays sync —
+# this only enters the tree behind the `collab` feature.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util"] }
+# Logging shim used by tracing crates pulled in by quinn / rustls; we
+# already depend on `log` at the workspace level so this is a free dep.
+tracing = "0.1"
+# Custom server-cert verifier needs a small SHA-256 helper.
+sha2 = "0.10"
 
 # System info probe for device tiering
 sys-info = "0.9"

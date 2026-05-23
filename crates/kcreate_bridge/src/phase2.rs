@@ -745,12 +745,25 @@ pub fn color_settings_get() -> Result<String> {
 }
 
 /// Replace the project's [`ColorSettings`] with the supplied JSON
-/// blob and record an operation so the change participates in undo.
+/// blob and record an operation in the project's log.
 ///
-/// The operation `kind` is `"color_settings_update"`; `before_patch`
+/// The operation `command` is `"color_settings_update"`; `before_patch`
 /// is the previous settings JSON, `after_patch` is the new one, and
 /// `affected_nodes` is empty because color settings are document-wide
 /// (no specific node is mutated).
+///
+/// **Undo contract.** This follows the host-driven model documented on
+/// [`kcreate_core::project::Project::undo`]: `document_undo` only
+/// moves the operation log cursor and returns the rolled-back
+/// operation to the caller. The renderer dispatcher is responsible
+/// for inspecting the returned `command` and re-applying the
+/// appropriate patch — for `"color_settings_update"`, that means
+/// deserialising `before_patch` and calling `color_settings_update`
+/// again with the previous-settings JSON. Without that wiring,
+/// `document_undo()` pops the operation but the in-memory color
+/// settings stay at the new value; this matches how every other
+/// non-graph operation in the bridge participates in undo today
+/// (`master_page_apply`, `color_settings_update`, etc.).
 pub fn color_settings_update(settings_json: &str) -> Result<()> {
     use kcreate_core::color::ColorSettings;
     let new_settings: ColorSettings = serde_json::from_str(settings_json)?;

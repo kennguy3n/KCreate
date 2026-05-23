@@ -2247,11 +2247,18 @@ pub fn kchat_derive_local_identity(seed_b64: String) -> NapiResult<String> {
 /// }
 /// ```
 ///
-/// Only compiled when the bridge is built with `kchat-dev-issuer`.
-/// Production builds reject the call by returning a typed
-/// `KChatDevIssuerDisabled` error at the JS layer (the function
-/// itself is unconditionally exported so the IPC surface stays
-/// stable, but it short-circuits when the feature is off).
+/// Compiled into any bridge built with the `collab` feature (the
+/// only feature that gates the multiplayer N-API surface as a
+/// whole). The inner `crate::collab::kchat_dev_mint_membership_json`
+/// dispatches to either the real implementation (when the bridge
+/// is *also* built with `kchat-dev-issuer`) or a no-op shim that
+/// returns `KChatDevIssuerDisabled` (when it is not). This keeps
+/// the IPC surface stable across collab builds so renderers can
+/// probe via `kchat_dev_issuer_available()` and decide whether to
+/// surface the affordance, without conditionally importing the
+/// function. See `crates/kcreate_bridge/Cargo.toml` — the
+/// `kchat-dev-issuer` feature already implies `collab`, so
+/// double-gating here would be redundant.
 #[cfg(feature = "collab")]
 #[napi]
 pub fn kchat_dev_mint_membership(request_json: String) -> NapiResult<String> {

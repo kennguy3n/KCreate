@@ -2,7 +2,7 @@
 // document and surface issues grouped by severity (error / warning /
 // info). Bound to `window.kcreate.preflight` in `preload.ts`.
 
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 
 import type {
   PreflightColorSpaceTarget,
@@ -173,30 +173,65 @@ function NumberField({
 }: {
   label: string;
   value: number;
-  /** Optional inclusive lower bound. Set both the HTML `min`
-   * attribute (so browsers can surface spinner / validation UX) AND
-   * clamp the value before propagating, so out-of-range keystrokes
-   * don't silently disable downstream checks. */
+  /** Optional inclusive lower bound. Set as the HTML `min`
+   * attribute (so browsers can surface spinner / validation UX)
+   * and clamped at commit time (on blur / Enter), NOT on every
+   * keystroke. Per-keystroke clamping made it impossible to type
+   * values whose prefix was below `min` (e.g. typing "150" with
+   * `min=50` would clamp "1" to "50" mid-stroke). */
   min?: number;
-  /** Optional inclusive upper bound; mirrors `min`. */
+  /** Optional inclusive upper bound; mirrors `min` semantics. */
   max?: number;
   onChange: (v: number) => void;
 }): JSX.Element {
+  // Local string state so the user can type freely (including
+  // intermediate values whose prefix is out of range). The
+  // committed numeric `value` prop is the source of truth; this
+  // ref-driven mirror only matters while the input is focused.
+  const [draft, setDraft] = useState<string>(() => String(value));
+  // Re-sync the draft whenever the upstream value changes (e.g. a
+  // sibling control resets the options blob). Without this the
+  // input would freeze at the user's last keystroke.
+  useEffect(() => {
+    setDraft(String(value));
+  }, [value]);
+
+  const commit = useCallback(() => {
+    const n = Number(draft);
+    if (!Number.isFinite(n)) {
+      // Reject invalid input by snapping back to the committed
+      // value; do NOT call `onChange` with NaN.
+      setDraft(String(value));
+      return;
+    }
+    let clamped = n;
+    if (typeof min === "number") clamped = Math.max(min, clamped);
+    if (typeof max === "number") clamped = Math.min(max, clamped);
+    if (clamped !== n) {
+      // Reflect the clamp visually so the user knows the bound
+      // applied.
+      setDraft(String(clamped));
+    }
+    if (clamped !== value) {
+      onChange(clamped);
+    }
+  }, [draft, max, min, onChange, value]);
+
   return (
     <label style={{ display: "flex", flexDirection: "column", gap: 4 }}>
       <span style={{ fontSize: 11, color: colors.textMuted }}>{label}</span>
       <input
         type="number"
-        value={value}
+        value={draft}
         min={min}
         max={max}
-        onChange={(e) => {
-          const n = Number(e.target.value);
-          if (!Number.isFinite(n)) return;
-          let clamped = n;
-          if (typeof min === "number") clamped = Math.max(min, clamped);
-          if (typeof max === "number") clamped = Math.min(max, clamped);
-          onChange(clamped);
+        onChange={(e) => setDraft(e.target.value)}
+        onBlur={commit}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") {
+            commit();
+            (e.target as HTMLInputElement).blur();
+          }
         }}
         style={inputStyle}
       />

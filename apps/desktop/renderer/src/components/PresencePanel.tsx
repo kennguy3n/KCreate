@@ -625,6 +625,22 @@ function shortenFingerprint(fp: string): string {
 /// 32-byte random seed (base64url-no-pad) if none exists. Seed
 /// length matches Ed25519's `SECRET_KEY_LENGTH` and feeds
 /// `PeerKey::from_seed` on the Rust side.
+///
+/// When we generate a fresh seed (first launch), we write it to
+/// `localStorage` *synchronously before returning* so any sibling
+/// consumer that reads the same storage key in a mount effect can
+/// see it on the very first frame.
+///
+/// This matters because `PresencePanel` calls us from a `useState`
+/// initializer (synchronous, runs once on mount) but its own
+/// persistence `useEffect` runs *after* React has fired every
+/// child's mount effects. `KChatSignInPanel` reads
+/// `localStorage[SEED_STORAGE_KEY]` in its own mount effect; without
+/// eager persistence the child would see `null` on first launch and
+/// would not be able to derive the local peer identity until the
+/// user navigated away and back. Eager persistence in the
+/// generator collapses the race by maintaining the invariant
+/// "if the in-memory seed exists, the on-disk seed exists too".
 function loadOrGenerateSeed(): string {
   try {
     const existing = window.localStorage.getItem(SEED_STORAGE_KEY);
@@ -634,7 +650,17 @@ function loadOrGenerateSeed(): string {
   }
   const bytes = new Uint8Array(32);
   window.crypto.getRandomValues(bytes);
-  return base64UrlEncode(bytes);
+  const encoded = base64UrlEncode(bytes);
+  try {
+    window.localStorage.setItem(SEED_STORAGE_KEY, encoded);
+  } catch {
+    // Quota / private-mode / no-localStorage — return the generated
+    // seed anyway. The follow-up `useEffect` in `PresencePanel`
+    // attempts the same write and will surface a console warning if
+    // the second attempt fails too. Without persistence, identity
+    // rotates on every relaunch (degraded but not broken).
+  }
+  return encoded;
 }
 
 function loadOrInitDisplayName(): string {

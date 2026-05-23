@@ -21,7 +21,7 @@
 // user sees one UI surface for "am I in a group" and another for
 // "am I in a session", and the two don't conflict.
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 
 import type {
   KChatDevMintRequest,
@@ -470,17 +470,22 @@ function DevMintSection({
 /// stale) or when the wall-clock parse fails.
 function useExpiryCountdown(expiresAt: string | null): string | null {
   const [now, setNow] = useState<number>(() => Date.now());
-  // Stash the parsed deadline so we re-parse only when the input
-  // string changes. Date.parse() is not super expensive but
-  // running it once per render keystroke is wasteful.
-  const deadlineRef = useRef<number | null>(null);
+  // Parsed deadline lives in state, not a ref, so `useMemo`'s
+  // dependency list can honestly track it. (An earlier version
+  // stashed this in a `useRef`, which made the `useMemo`
+  // dependencies a lie — when `expiresAt` changed the memo
+  // wouldn't recompute until the next 1-second `now` tick.)
+  // `useMemo` instead of `useState` here would re-parse every
+  // render; `useEffect` ensures we only parse when the input
+  // string changes.
+  const [deadline, setDeadline] = useState<number | null>(null);
   useEffect(() => {
     if (expiresAt === null) {
-      deadlineRef.current = null;
+      setDeadline(null);
       return;
     }
     const t = Date.parse(expiresAt);
-    deadlineRef.current = Number.isFinite(t) ? t : null;
+    setDeadline(Number.isFinite(t) ? t : null);
   }, [expiresAt]);
 
   useEffect(() => {
@@ -490,11 +495,10 @@ function useExpiryCountdown(expiresAt: string | null): string | null {
   }, [expiresAt]);
 
   return useMemo(() => {
-    const deadline = deadlineRef.current;
     if (deadline === null) return null;
     const remaining = Math.max(0, deadline - now);
     return formatDuration(remaining);
-  }, [now]);
+  }, [deadline, now]);
 }
 
 function formatDuration(ms: number): string {

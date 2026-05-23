@@ -126,6 +126,11 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 # PDF export
 printpdf = { version = "0.7", default-features = false, features = ["embedded_images"] }
 
+# PDF import (Phase 3 foundation — pure Rust, no native deps,
+# already in the dep tree transitively via printpdf so this is a
+# zero-cost direct dep).
+lopdf = { version = "0.31", default-features = false, features = ["pom_parser"] }
+
 # Data-parallel iteration (used by raster tile ops + batch export)
 rayon = "1.10"
 

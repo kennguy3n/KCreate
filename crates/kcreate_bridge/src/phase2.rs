@@ -22,6 +22,9 @@ use kcreate_export::batch::{
 };
 use kcreate_export::icon_pack::{generate_icon_pack, IconPackPlatform};
 use kcreate_export::pdf::RasterPixelCache;
+use kcreate_export::pdf_import::{
+    import_pdf as pdf_import_run, ExtractedImageData, ImportedPdf, PdfImportError,
+};
 use kcreate_export::preflight::{run_preflight, PreflightIssue, PreflightOptions};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -1719,6 +1722,247 @@ pub fn text_opentype_features_update(node_id: Uuid, features_json: &str) -> Resu
     })?;
     sync_scene_after_change();
     Ok(())
+}
+
+// -----------------------------------------------------------------------------
+// PDF import (Phase 3 foundation — Tasks 26-27)
+// -----------------------------------------------------------------------------
+
+/// JSON-serialisable report returned to the renderer after a PDF
+/// import. The renderer uses this to show "Imported 4 pages
+/// (2 images skipped)" so the user knows what happened.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PdfImportReport {
+    /// Title field from the PDF's `/Info` dict, if present.
+    pub title: Option<String>,
+    /// Author field from the PDF's `/Info` dict, if present.
+    pub author: Option<String>,
+    /// Page ids of the newly-inserted KCreate pages, in import
+    /// order. The renderer can navigate to `pages[0]` immediately
+    /// after import.
+    pub page_ids: Vec<Uuid>,
+    /// Total images successfully extracted across all pages.
+    pub images_imported: usize,
+    /// Total images skipped (unsupported filter / color space).
+    pub images_skipped: usize,
+    /// Pages with empty content streams or unreadable MediaBoxes.
+    /// Surfaces as a non-blocking warning in the UI.
+    pub warnings: Vec<String>,
+}
+
+/// PDF point → screen-space pixel scale used by KCreate's page
+/// layout system. 1 pt = 1/72 in, KCreate scenes are at 96 dpi, so
+/// 1 pt = 96/72 px.
+const PT_TO_PX: f64 = 96.0 / 72.0;
+
+/// Import a PDF into the *current* project (one Page per PDF page).
+/// Each KCreate page is sized to the PDF page's MediaBox; embedded
+/// JPEG / Flate images become RasterLayer children; extracted text
+/// becomes a TextLayer per page (or is omitted if the page has no
+/// text).
+///
+/// Records one undoable operation per imported page, so the user can
+/// hit Undo to remove specific pages from the import or Cmd-Z several
+/// times to undo the whole batch.
+pub fn pdf_import(file_path: String) -> Result<String> {
+    let imported = pdf_import_run(&file_path).map_err(map_pdf_import_err)?;
+    let report = ingest_imported_pdf(imported)?;
+    Ok(serde_json::to_string(&report)?)
+}
+
+/// Translate a [`PdfImportError`] into the bridge error envelope. We
+/// preserve the kind in the message string so the renderer's error
+/// surface can show "PDF is encrypted" vs. "PDF has no pages"
+/// without re-defining the enum on the TS side.
+fn map_pdf_import_err(err: PdfImportError) -> DocumentBridgeError {
+    DocumentBridgeError::Io(std::io::Error::other(err.to_string()))
+}
+
+/// Take a freshly-parsed [`ImportedPdf`] and project it onto the
+/// current workspace's document. Returns a [`PdfImportReport`]
+/// summarising what landed.
+fn ingest_imported_pdf(imported: ImportedPdf) -> Result<PdfImportReport> {
+    let mut page_ids = Vec::with_capacity(imported.pages.len());
+    let mut images_imported = 0usize;
+    let mut images_skipped = 0usize;
+    let mut warnings: Vec<String> = imported
+        .warnings
+        .iter()
+        .map(format_pdf_warning)
+        .collect();
+
+    for imported_page in imported.pages {
+        images_skipped += imported_page.skipped_images;
+        let page_id = with_workspace_mut(|ws| {
+            let label = if imported_page.text.trim().is_empty() {
+                format!("PDF page {}", imported_page.index + 1)
+            } else {
+                let snippet: String = imported_page
+                    .text
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .chars()
+                    .take(32)
+                    .collect();
+                if snippet.is_empty() {
+                    format!("PDF page {}", imported_page.index + 1)
+                } else {
+                    format!("{} — page {}", snippet, imported_page.index + 1)
+                }
+            };
+
+            // Add the empty Page first so child nodes can hang off
+            // it. `Project::add_page` records its own op; we record
+            // the population step (images + text) as a separate op
+            // below so the user can undo "add page" and "fill page"
+            // independently.
+            let new_page_id = ws.project.add_page(label)?;
+
+            if let Some(page_node) = ws.project.document.get_node_mut(new_page_id) {
+                let width_px = imported_page.width_pt * PT_TO_PX;
+                let height_px = imported_page.height_pt * PT_TO_PX;
+                page_node.bounds = Bounds::new(0.0, 0.0, width_px, height_px);
+            }
+
+            // Embed images.
+            let mut created_node_ids = Vec::<Uuid>::new();
+            for img in &imported_page.images {
+                let blob = ws
+                    .store
+                    .blobs()
+                    .store(img.data.bytes(), img.data.mime_type())
+                    .map_err(|e| DocumentBridgeError::Io(std::io::Error::other(e.to_string())))?;
+                let meta = crate::scene_sync::RasterImageMeta {
+                    blob_hash: blob.hash,
+                    width: img.width,
+                    height: img.height,
+                };
+                let mut node = Node::new(NodeType::RasterLayer, "Imported image");
+                node.parent_id = Some(new_page_id);
+                node.bounds = Bounds::new(
+                    0.0,
+                    0.0,
+                    f64::from(img.width),
+                    f64::from(img.height),
+                );
+                node.metadata.insert(
+                    crate::scene_sync::RASTER_IMAGE_METADATA_KEY.to_string(),
+                    serde_json::to_value(&meta)?,
+                );
+                let id = ws.project.document.insert_node(node)?;
+                created_node_ids.push(id);
+            }
+
+            // Embed extracted text as a single TextLayer if the
+            // page had any.
+            let trimmed = imported_page.text.trim();
+            if !trimmed.is_empty() {
+                let meta = kcreate_export::TextLayerMeta {
+                    text: imported_page.text.clone(),
+                    font_family: "Helvetica".to_string(),
+                    font_size: 12.0,
+                };
+                let mut node = Node::new(NodeType::TextLayer, "Imported text");
+                node.parent_id = Some(new_page_id);
+                let (page_w, page_h) = (
+                    imported_page.width_pt * PT_TO_PX,
+                    imported_page.height_pt * PT_TO_PX,
+                );
+                // Default text block: full page width minus 1in
+                // margins on each side, top half of the page. The
+                // user is expected to re-flow this; we just give
+                // them something visible.
+                let margin = 96.0; // 1in @ 96dpi
+                node.bounds = Bounds::new(
+                    margin,
+                    margin,
+                    (page_w - margin * 2.0).max(96.0),
+                    (page_h / 2.0).max(96.0),
+                );
+                node.metadata.insert(
+                    crate::scene_sync::TEXT_LAYER_METADATA_KEY.to_string(),
+                    serde_json::to_value(&meta)?,
+                );
+                let id = ws.project.document.insert_node(node)?;
+                created_node_ids.push(id);
+            }
+
+            // Record one undoable op for the page-population step
+            // (images + text). The page itself was recorded by
+            // `add_page`.
+            if !created_node_ids.is_empty() {
+                let snapshot = serde_json::json!({
+                    "page_id": new_page_id,
+                    "node_count": created_node_ids.len(),
+                });
+                let op = Operation::new(
+                    "user",
+                    "pdf_import_populate_page",
+                    serde_json::Value::Null,
+                    snapshot,
+                    created_node_ids.clone(),
+                );
+                ws.project.execute_operation(op);
+            }
+            ws.project.modified_at = Utc::now();
+
+            images_imported += imported_page.images.len();
+            Ok(new_page_id)
+        })?;
+        page_ids.push(page_id);
+    }
+
+    sync_scene_after_change();
+
+    if page_ids.is_empty() {
+        warnings.push("PDF contained no importable pages".to_string());
+    }
+
+    Ok(PdfImportReport {
+        title: imported.title,
+        author: imported.author,
+        page_ids,
+        images_imported,
+        images_skipped,
+        warnings,
+    })
+}
+
+fn format_pdf_warning(w: &kcreate_export::pdf_import::PdfImportWarning) -> String {
+    use kcreate_export::pdf_import::PdfImportWarning as W;
+    match w {
+        W::UnsupportedImageFilter {
+            page_index,
+            filter_chain,
+        } => format!(
+            "Page {}: unsupported image filter ({})",
+            page_index + 1,
+            filter_chain
+        ),
+        W::UnsupportedImageColorSpace {
+            page_index,
+            color_space,
+        } => format!(
+            "Page {}: unsupported image color space ({})",
+            page_index + 1,
+            color_space
+        ),
+        W::MissingMediaBox { page_index } => format!(
+            "Page {}: missing MediaBox — defaulted to US Letter",
+            page_index + 1
+        ),
+    }
+}
+
+// Suppress unused-import warnings if the JPEG/PNG enum tag ever
+// becomes the only reference. `ExtractedImageData` is currently
+// only matched via its `bytes()`/`mime_type()` helpers above so
+// the explicit re-export from `lib.rs` still flows through.
+#[allow(dead_code)]
+fn _force_extracted_image_data_link(d: &ExtractedImageData) -> usize {
+    d.bytes().len()
 }
 
 // -----------------------------------------------------------------------------

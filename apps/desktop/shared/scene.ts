@@ -1343,6 +1343,38 @@ export interface AiModelBridge {
   screenshotToLayout(request: ScreenshotRequest): Promise<ScreenshotElement[]>;
 }
 
+/// Result of [`PdfImportBridge.importPdf`] mirroring
+/// `kcreate_bridge::phase2::PdfImportReport`.
+export interface PdfImportReport {
+  /// `/Info /Title` from the PDF, if present.
+  title: string | null;
+  /// `/Info /Author` from the PDF, if present.
+  author: string | null;
+  /// New KCreate page ids in import order. The renderer can jump
+  /// to `pageIds[0]` to focus the first imported page.
+  pageIds: string[];
+  /// Successfully extracted image count across all pages.
+  imagesImported: number;
+  /// Skipped image count (unsupported filter / color space).
+  imagesSkipped: number;
+  /// Human-readable, non-fatal warnings the renderer should
+  /// surface (e.g. "Page 3: unsupported image filter (JPXDecode)").
+  warnings: string[];
+}
+
+/// Renderer-facing PDF import API. The picker is a thin wrapper
+/// over Electron's `dialog.showOpenDialog`, kept in the main
+/// process so renderer code never touches the filesystem directly.
+export interface PdfImportBridge {
+  /// Show an Electron file picker scoped to `.pdf` and return the
+  /// chosen absolute path, or `null` if the user cancelled.
+  pickFile(): Promise<string | null>;
+  /// Import the PDF at `filePath` into the current project. One
+  /// new Page per PDF page, with embedded images as RasterLayer
+  /// children and extracted text as a TextLayer per page.
+  importPdf(filePath: string): Promise<PdfImportReport>;
+}
+
 export type PluginType = "wasm" | "js_panel" | "native";
 
 export type PluginPermission =
@@ -1748,6 +1780,7 @@ declare global {
       iconPack: IconPackBridge;
       batch: BatchBridge;
       aiModel: AiModelBridge;
+      pdfImport: PdfImportBridge;
       plugin: PluginBridge;
       mcpPermission: McpPermissionBridge;
       color: ColorBridge;

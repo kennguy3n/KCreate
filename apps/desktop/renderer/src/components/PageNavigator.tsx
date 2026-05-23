@@ -46,6 +46,12 @@ export interface PageNavigatorProps {
    * to support template instantiation in this surface.
    */
   onNewFromTemplate?: () => void;
+  /**
+   * Opens the host-owned PDF import flow (file picker + import).
+   * When omitted, the "Import PDF" button hides. Host owns the
+   * action because PDF import affects the global project state.
+   */
+  onImportPdf?: () => void;
 }
 
 type PageCardKind = "master" | "content";
@@ -83,6 +89,7 @@ export function PageNavigator({
   onStatus,
   onChanged,
   onNewFromTemplate,
+  onImportPdf,
 }: PageNavigatorProps): JSX.Element {
   const [masters, setMasters] = useState<MasterPageInfo[]>([]);
   const [busy, setBusy] = useState<boolean>(false);
@@ -533,6 +540,17 @@ export function PageNavigator({
                 title="Apply a built-in layout template"
               >
                 Templates
+              </button>
+            ) : null}
+            {onImportPdf ? (
+              <button
+                type="button"
+                onClick={onImportPdf}
+                disabled={busy}
+                style={secondaryButtonStyle}
+                title="Import a PDF — one new page per PDF page"
+              >
+                Import PDF
               </button>
             ) : null}
           </div>

@@ -1418,6 +1418,7 @@ dependencies = [
  "kcreate_text",
  "kcreate_vector",
  "log",
+ "lopdf",
  "parking_lot",
  "printpdf",
  "rayon",

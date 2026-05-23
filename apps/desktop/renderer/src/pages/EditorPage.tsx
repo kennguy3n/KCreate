@@ -1028,6 +1028,45 @@ export function EditorPage({
               void refreshTree();
             }}
             onNewFromTemplate={() => setTemplatePickerOpen(true)}
+            onImportPdf={() => {
+              void (async () => {
+                try {
+                  const path = await window.kcreate.pdfImport.pickFile();
+                  if (!path) return;
+                  setStatusMessage(`Importing ${path}…`);
+                  const report = await window.kcreate.pdfImport.importPdf(
+                    path,
+                  );
+                  await refreshTree();
+                  const pieces: string[] = [];
+                  pieces.push(
+                    `Imported ${report.pageIds.length} page${
+                      report.pageIds.length === 1 ? "" : "s"
+                    }`,
+                  );
+                  if (report.imagesImported > 0) {
+                    pieces.push(`${report.imagesImported} image${
+                      report.imagesImported === 1 ? "" : "s"
+                    }`);
+                  }
+                  if (report.imagesSkipped > 0) {
+                    pieces.push(`${report.imagesSkipped} image${
+                      report.imagesSkipped === 1 ? "" : "s"
+                    } skipped`);
+                  }
+                  setStatusMessage(pieces.join(", "));
+                  if (report.warnings.length > 0) {
+                    console.warn("PDF import warnings:", report.warnings);
+                  }
+                  const firstPageId = report.pageIds[0];
+                  if (firstPageId) {
+                    await handleSelectPage(firstPageId);
+                  }
+                } catch (e) {
+                  setStatusMessage(`PDF import failed: ${errorMessage(e)}`);
+                }
+              })();
+            }}
           />
         ) : null}
         <LeftPanel

@@ -1660,6 +1660,15 @@ pub fn ai_uninstall_model_pack(pack_id: String) -> NapiResult<()> {
     phase2::ai_model_uninstall(pack_id).map_err(map_doc_err)
 }
 
+/// Import a PDF file at `file_path` into the current project: one
+/// Page per PDF page, embedded images become RasterLayer children,
+/// extracted text becomes a TextLayer per page. Returns JSON
+/// matching [`phase2::PdfImportReport`].
+#[napi]
+pub fn pdf_import(file_path: String) -> NapiResult<String> {
+    phase2::pdf_import(file_path).map_err(map_doc_err)
+}
+
 /// Run edge-detection + connected-component analysis over the
 /// supplied RGBA8 screenshot and return the detected UI regions.
 #[napi]

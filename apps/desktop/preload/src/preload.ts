@@ -76,6 +76,8 @@ import type {
   McpStatus,
   ModelInstallReport,
   ModelPack,
+  PdfImportBridge,
+  PdfImportReport,
   JsPanelInfo,
   JsPanelMessage,
   JsPanelMessageOutcome,
@@ -1160,6 +1162,21 @@ const aiModel: AiModelBridge = {
   },
 };
 
+const pdfImport: PdfImportBridge = {
+  async pickFile(): Promise<string | null> {
+    return (await ipcRenderer.invoke(
+      "kcreate/pdf/pickFile",
+    )) as string | null;
+  },
+  async importPdf(filePath: string): Promise<PdfImportReport> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/pdf/import",
+      filePath,
+    )) as string;
+    return JSON.parse(raw) as PdfImportReport;
+  },
+};
+
 const plugin: PluginBridge = {
   async list(): Promise<PluginListEntry[]> {
     const raw = (await ipcRenderer.invoke("kcreate/plugin/list")) as string;
@@ -1374,6 +1391,7 @@ contextBridge.exposeInMainWorld("kcreate", {
   iconPack,
   batch,
   aiModel,
+  pdfImport,
   plugin,
   mcpPermission,
   color,

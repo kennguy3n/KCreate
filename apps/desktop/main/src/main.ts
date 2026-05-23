@@ -1246,6 +1246,29 @@ function registerIpcHandlers(): void {
     if (result.canceled || result.filePaths.length === 0) return null;
     return result.filePaths[0];
   });
+  // `kcreate/pdf/pickFile` opens an Electron-native file picker
+  // scoped to .pdf so the renderer can hand the resolved path to
+  // `kcreate/pdf/import`. We keep the picker in the main process
+  // (instead of the renderer) so the renderer never sees the
+  // underlying filesystem — the renderer only ever gets a single
+  // user-chosen path back.
+  ipcMain.handle("kcreate/pdf/pickFile", async () => {
+    const win = mainWindow;
+    if (!win) return null;
+    const result = await dialog.showOpenDialog(win, {
+      title: "Import PDF",
+      properties: ["openFile"],
+      filters: [
+        { name: "PDF", extensions: ["pdf"] },
+        { name: "All files", extensions: ["*"] },
+      ],
+    });
+    if (result.canceled || result.filePaths.length === 0) return null;
+    return result.filePaths[0];
+  });
+  ipcMain.handle("kcreate/pdf/import", (_e, filePath: string) =>
+    requireBridge().pdfImport(filePath),
+  );
   ipcMain.handle(
     "kcreate/ai/screenshotToLayout",
     (_e, requestJson: string) =>

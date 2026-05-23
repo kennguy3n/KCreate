@@ -1,0 +1,180 @@
+//! Multi-peer presence overlay micro-benchmarks (Phase 4 follow-up).
+//!
+//! Scene-sync is invoked on every collab tick — once per cursor /
+//! selection / lock event, plus periodically from the session-event
+//! pump — and the runtime cost of the two overlay-append paths
+//! (`append_presence_cursors` + `append_presence_selection_halos`)
+//! scales linearly in:
+//!
+//!     - the number of connected peers `P`
+//!     - the per-peer selection set size `N`
+//!     - the document node count `D` (for the halo path, because it
+//!       calls `doc.get_node(*node_id)` once per selected id, which
+//!       is O(1) on the underlying HashMap but still chases pointers
+//!       and inflates the constant factor)
+//!
+//! These benches synthesise a 1, 10, 50, and 100-peer roster against
+//! a 200-node document and time both the cursor and halo emit
+//! paths in isolation, so a regression on either shows up
+//! immediately without having to spin up a real collab session
+//! (which would carry quinn / rustls / tokio overhead irrelevant
+//! to the overlay-build cost we actually care about).
+
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use kcreate_bridge::scene_sync::{PresenceCursor, PresenceSelection, SceneSync};
+use kcreate_core::node::{Bounds, Node, NodeType};
+use kcreate_core::DocumentGraph;
+use kcreate_renderer::{Color, Scene};
+use uuid::Uuid;
+
+/// Peer-count axis. Picked so a regression in the *constant factor*
+/// shows up on the 1-peer point and a regression in the
+/// per-peer-cost shows up on the 100-peer point.
+const PEER_COUNTS: &[usize] = &[1, 10, 50, 100];
+
+/// How many node ids each peer "selects" in the benchmark. Real
+/// multi-select in KCreate is usually <10; the 20 here gives a
+/// little extra signal on the inner loop.
+const SELECTION_SET_SIZE: usize = 20;
+
+/// Number of vector nodes in the synthetic document. Each is given
+/// distinct world bounds so `node_world_bounds` produces a
+/// non-degenerate rect (the halo emit early-exits on invisible
+/// nodes, not on zero-area ones, so any positive bounds would do —
+/// but realistic spacing keeps the bench representative of the
+/// actual workload).
+const DOC_NODE_COUNT: usize = 200;
+
+fn build_document() -> (DocumentGraph, Vec<Uuid>) {
+    let mut doc = DocumentGraph::new();
+    let mut ids = Vec::with_capacity(DOC_NODE_COUNT);
+    for i in 0..DOC_NODE_COUNT {
+        let mut node = Node::new(NodeType::VectorLayer, format!("n{i}"));
+        // Spread nodes out so halo bounds don't all overlap on the
+        // origin. The exact layout doesn't matter for the bench;
+        // we just need each node's world bounds to differ.
+        let row = i / 20;
+        let col = i % 20;
+        node.bounds = Bounds {
+            x: (col as f64) * 50.0,
+            y: (row as f64) * 50.0,
+            width: 40.0,
+            height: 30.0,
+        };
+        let id = doc.insert_node(node).expect("insert vector node");
+        ids.push(id);
+    }
+    (doc, ids)
+}
+
+fn build_cursors(peer_count: usize) -> Vec<PresenceCursor> {
+    (0..peer_count)
+        .map(|i| PresenceCursor {
+            // Stable, unique peer id so `peer_color` derives a
+            // distinct hue for each.
+            peer_id: format!("peer-{i:04}"),
+            display_name: format!("Peer {i}"),
+            x: (i as f64) * 13.0,
+            y: (i as f64) * 17.0,
+        })
+        .collect()
+}
+
+fn build_selections(peer_count: usize, node_ids: &[Uuid]) -> Vec<PresenceSelection> {
+    (0..peer_count)
+        .map(|peer_idx| {
+            // Each peer "selects" `SELECTION_SET_SIZE` ids, rotated
+            // by their index so peers don't all halo the same
+            // 20 nodes (which would short-circuit the inner loop
+            // away from the realistic workload).
+            let mut ids = Vec::with_capacity(SELECTION_SET_SIZE);
+            for k in 0..SELECTION_SET_SIZE {
+                let idx = (peer_idx * 7 + k * 11) % node_ids.len();
+                ids.push(node_ids[idx]);
+            }
+            PresenceSelection {
+                peer_id: format!("peer-{peer_idx:04}"),
+                display_name: format!("Peer {peer_idx}"),
+                node_ids: ids,
+            }
+        })
+        .collect()
+}
+
+fn bench_presence_cursors(c: &mut Criterion) {
+    let mut group = c.benchmark_group("scene_sync_presence_cursors");
+    for &p in PEER_COUNTS {
+        let cursors = build_cursors(p);
+        // `cursors_emitted_per_iter` = each cursor emits 2 scene
+        // objects (triangle + label). Wire it into Throughput so
+        // criterion reports a per-cursor cost too.
+        group.throughput(Throughput::Elements(p as u64));
+        group.bench_with_input(BenchmarkId::from_parameter(p), &cursors, |b, cursors| {
+            b.iter(|| {
+                let mut sync = SceneSync::new();
+                let mut scene = Scene::new(Color::rgba(0.05, 0.05, 0.07, 1.0));
+                sync.append_presence_cursors(&mut scene, cursors, 0, 1.0);
+                criterion::black_box(scene.objects.len());
+            });
+        });
+    }
+    group.finish();
+}
+
+fn bench_presence_selection_halos(c: &mut Criterion) {
+    let (doc, node_ids) = build_document();
+    let mut group = c.benchmark_group("scene_sync_presence_selection_halos");
+    for &p in PEER_COUNTS {
+        let selections = build_selections(p, &node_ids);
+        // Each peer-selection emits up to `SELECTION_SET_SIZE`
+        // halos + 1 label, so the element count for throughput is
+        // peer × set so the per-halo cost is directly visible.
+        group.throughput(Throughput::Elements((p * SELECTION_SET_SIZE) as u64));
+        group.bench_with_input(BenchmarkId::from_parameter(p), &selections, |b, sel| {
+            b.iter(|| {
+                let mut sync = SceneSync::new();
+                let mut scene = Scene::new(Color::rgba(0.05, 0.05, 0.07, 1.0));
+                let _ = sync.append_presence_selection_halos(&mut scene, &doc, sel, 0, 1.0);
+                criterion::black_box(scene.objects.len());
+            });
+        });
+    }
+    group.finish();
+}
+
+fn bench_combined_presence_pipeline(c: &mut Criterion) {
+    // The real bridge tick always emits cursors AND halos in the
+    // same scene-sync, so the combined micro-bench measures the
+    // *actual* per-frame cost — including the watermark-resume
+    // handshake between the two append paths.
+    let (doc, node_ids) = build_document();
+    let mut group = c.benchmark_group("scene_sync_presence_combined");
+    for &p in PEER_COUNTS {
+        let cursors = build_cursors(p);
+        let selections = build_selections(p, &node_ids);
+        group.throughput(Throughput::Elements(p as u64));
+        group.bench_with_input(
+            BenchmarkId::from_parameter(p),
+            &(cursors, selections),
+            |b, (cursors, sel)| {
+                b.iter(|| {
+                    let mut sync = SceneSync::new();
+                    let mut scene = Scene::new(Color::rgba(0.05, 0.05, 0.07, 1.0));
+                    let next_z =
+                        sync.append_presence_selection_halos(&mut scene, &doc, sel, 0, 1.0);
+                    sync.append_presence_cursors(&mut scene, cursors, next_z, 1.0);
+                    criterion::black_box(scene.objects.len());
+                });
+            },
+        );
+    }
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_presence_cursors,
+    bench_presence_selection_halos,
+    bench_combined_presence_pipeline,
+);
+criterion_main!(benches);

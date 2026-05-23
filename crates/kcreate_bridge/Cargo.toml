@@ -90,6 +90,14 @@ tempfile.workspace = true
 # (see `document.rs::tests::plugin_execute_with_context_*`). Pinned
 # to the same major as `kcreate_plugin` to keep wasmi compatibility.
 wat = "1"
+# Criterion drives the scene-sync presence overlay micro-benchmarks
+# (`benches/scene_sync_multi_peer.rs`). Kept as a dev-dependency so
+# release builds of the bridge don't link it.
+criterion.workspace = true
+
+[[bench]]
+name = "scene_sync_multi_peer"
+harness = false
 
 [features]
 default = []

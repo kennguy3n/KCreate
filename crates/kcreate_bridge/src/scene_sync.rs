@@ -496,6 +496,14 @@ impl SceneSync {
         let cursor_height_world = CURSOR_HEIGHT / zoom;
         let cursor_label_gap_world = CURSOR_LABEL_GAP / zoom;
         let cursor_label_font_size_world = CURSOR_LABEL_FONT_SIZE / zoom;
+        // Stage every cursor + label object in a local buffer then
+        // hand the whole batch to `Scene::add_objects` so the scene
+        // sorts ONCE instead of once per push. With 100 peers that
+        // means a single O(N·log N) sort over the freshly-emitted
+        // 200-ish overlay objects instead of 200 sorts of a growing
+        // vec — an order-of-magnitude reduction in scene-sync cost
+        // for cursor-heavy collab sessions.
+        let mut emitted: Vec<Object> = Vec::with_capacity(cursors.len() * 2);
         let mut z = starting_z;
         for cursor in cursors {
             let color = peer_color(&cursor.peer_id);
@@ -526,10 +534,11 @@ impl SceneSync {
                 stroke: Some(Stroke::new(Color::rgba(1.0, 1.0, 1.0, 0.9), 1.0)),
             };
             let cursor_id = Self::next_overlay_id(&mut overlay);
-            let cursor_obj = Object::new(ObjectKind::Path(path), cursor_style)
-                .with_id(cursor_id)
-                .with_z(z);
-            scene.add_object(cursor_obj);
+            emitted.push(
+                Object::new(ObjectKind::Path(path), cursor_style)
+                    .with_id(cursor_id)
+                    .with_z(z),
+            );
             z += 1;
 
             // Name label below-right of the cursor tip. We emit the
@@ -546,21 +555,23 @@ impl SceneSync {
                     stroke: None,
                 };
                 let label_id = Self::next_overlay_id(&mut overlay);
-                let label_obj = Object::new(
-                    ObjectKind::Text {
-                        origin: label_origin,
-                        text: cursor.display_name.clone(),
-                        font_family: ARTBOARD_LABEL_FONT.to_string(),
-                        font_size: cursor_label_font_size_world,
-                    },
-                    label_style,
-                )
-                .with_id(label_id)
-                .with_z(z);
-                scene.add_object(label_obj);
+                emitted.push(
+                    Object::new(
+                        ObjectKind::Text {
+                            origin: label_origin,
+                            text: cursor.display_name.clone(),
+                            font_family: ARTBOARD_LABEL_FONT.to_string(),
+                            font_size: cursor_label_font_size_world,
+                        },
+                        label_style,
+                    )
+                    .with_id(label_id)
+                    .with_z(z),
+                );
                 z += 1;
             }
         }
+        scene.add_objects(emitted);
         // Persist the watermark so a follow-up cursor append (e.g. a
         // second presence push in the same frame, hypothetically)
         // continues the stream too.
@@ -624,6 +635,19 @@ impl SceneSync {
         let label_font_size_world = HALO_LABEL_FONT_SIZE / zoom;
         let label_offset_world = HALO_LABEL_OFFSET / zoom;
         let outset_world = HALO_OUTSET / zoom;
+        // Stage every halo + label in a local buffer then hand the
+        // whole batch to `Scene::add_objects` so the scene sorts
+        // ONCE instead of once per push. With 100 peers each
+        // halo'ing 20 nodes that's a single sort of ~2000 freshly
+        // emitted overlay objects instead of 2000 sorts of a growing
+        // vec — the scene-sync hot path for multi-peer collab
+        // sessions, so the saving is large. Capacity hint is an
+        // upper bound (label is emitted at most once per peer);
+        // overshooting wastes a few hundred bytes, undershooting
+        // forces a realloc mid-loop.
+        let label_budget = selections.len();
+        let halo_budget: usize = selections.iter().map(|s| s.node_ids.len()).sum();
+        let mut emitted: Vec<Object> = Vec::with_capacity(halo_budget + label_budget);
         let mut z = starting_z;
         for selection in selections {
             let base = peer_color(&selection.peer_id);
@@ -661,10 +685,11 @@ impl SceneSync {
                     stroke: Some(Stroke::new(stroke_color, stroke_width_world)),
                 };
                 let halo_id = Self::next_overlay_id(&mut overlay);
-                let halo_obj = Object::new(ObjectKind::Rect(rect), style)
-                    .with_id(halo_id)
-                    .with_z(z);
-                scene.add_object(halo_obj);
+                emitted.push(
+                    Object::new(ObjectKind::Rect(rect), style)
+                        .with_id(halo_id)
+                        .with_z(z),
+                );
                 z += 1;
 
                 // Peer-name pill at top-left of the first rendered
@@ -679,23 +704,25 @@ impl SceneSync {
                         stroke: None,
                     };
                     let label_id = Self::next_overlay_id(&mut overlay);
-                    let label_obj = Object::new(
-                        ObjectKind::Text {
-                            origin,
-                            text: selection.display_name.clone(),
-                            font_family: ARTBOARD_LABEL_FONT.to_string(),
-                            font_size: label_font_size_world,
-                        },
-                        label_style,
-                    )
-                    .with_id(label_id)
-                    .with_z(z);
-                    scene.add_object(label_obj);
+                    emitted.push(
+                        Object::new(
+                            ObjectKind::Text {
+                                origin,
+                                text: selection.display_name.clone(),
+                                font_family: ARTBOARD_LABEL_FONT.to_string(),
+                                font_size: label_font_size_world,
+                            },
+                            label_style,
+                        )
+                        .with_id(label_id)
+                        .with_z(z),
+                    );
                     z += 1;
                     label_emitted = true;
                 }
             }
         }
+        scene.add_objects(emitted);
         // Persist watermark so any follow-up overlay emitter in the
         // same sync (currently none, but future-proof) continues
         // the stream.

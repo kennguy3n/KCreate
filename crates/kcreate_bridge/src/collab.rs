@@ -1363,36 +1363,44 @@ fn presence_cursors_from_state(
     state: &SessionState,
     connected_lookup: &HashMap<PeerId, String>,
 ) -> Vec<(String, String, SessionCursor)> {
-    state
-        .presence
-        .iter()
-        .filter_map(|(peer_id, payload)| {
-            let display_name = connected_lookup.get(peer_id)?.clone();
-            let cursor = payload.cursor.map(|c| SessionCursor { x: c.x, y: c.y })?;
-            Some((peer_id.as_str().to_string(), display_name, cursor))
-        })
-        .collect()
+    // `state.presence.len()` is an upper bound (peers without an
+    // active cursor are filtered below) but it caps the worst-case
+    // realloc count at one. The hot path is N-peer collab, where N
+    // is in the tens of peers, so a small overshoot is cheaper than
+    // the geometric reallocs `.collect()` would otherwise do.
+    let mut out = Vec::with_capacity(state.presence.len());
+    for (peer_id, payload) in &state.presence {
+        let Some(display_name) = connected_lookup.get(peer_id) else {
+            continue;
+        };
+        let Some(cursor) = payload.cursor.map(|c| SessionCursor { x: c.x, y: c.y }) else {
+            continue;
+        };
+        out.push((peer_id.as_str().to_string(), display_name.clone(), cursor));
+    }
+    out
 }
 
 fn presence_selections_from_state(
     state: &SessionState,
     connected_lookup: &HashMap<PeerId, String>,
 ) -> Vec<(String, String, Vec<Uuid>)> {
-    state
-        .presence
-        .iter()
-        .filter_map(|(peer_id, payload)| {
-            if payload.selection.is_empty() {
-                return None;
-            }
-            let display_name = connected_lookup.get(peer_id)?.clone();
-            Some((
-                peer_id.as_str().to_string(),
-                display_name,
-                payload.selection.clone(),
-            ))
-        })
-        .collect()
+    // Same upper-bound rationale as `presence_cursors_from_state`.
+    let mut out = Vec::with_capacity(state.presence.len());
+    for (peer_id, payload) in &state.presence {
+        if payload.selection.is_empty() {
+            continue;
+        }
+        let Some(display_name) = connected_lookup.get(peer_id) else {
+            continue;
+        };
+        out.push((
+            peer_id.as_str().to_string(),
+            display_name.clone(),
+            payload.selection.clone(),
+        ));
+    }
+    out
 }
 
 // === Conversion to bridge error type so the N-API layer can use

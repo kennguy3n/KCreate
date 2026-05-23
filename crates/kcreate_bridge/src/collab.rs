@@ -557,14 +557,16 @@ pub fn session_join(
     socket_addr: &str,
     cert_fingerprint_b64: &str,
 ) -> Result<()> {
-    // KChat gate: refuse to dial any peer unless the local user is
-    // bound to a KChat group. The transport's Hello path would
-    // refuse to mint an attestation anyway, but failing fast here
-    // gives the renderer a typed error rather than a generic dial
-    // timeout.
-    if kchat_authority_snapshot().local_membership().is_none() {
-        return Err(SessionBridgeError::NotInKChatGroup);
-    }
+    // KChat gate: refuse to dial any peer unless the locally
+    // installed authority is fully valid — signature checks out
+    // under the trust root, peer binding matches, and the
+    // validity window covers `now`. Matches the rigor of
+    // `session_start`. The transport's Hello path would also
+    // refuse to mint an attestation, but failing fast here gives
+    // the renderer a typed error rather than a generic dial
+    // timeout (and means an expired-while-the-app-was-asleep
+    // membership can never reach the network layer).
+    require_active_kchat_membership()?;
 
     let identity = identity_from_wire(peer_id, public_key, display_name)?;
     let socket: SocketAddr = socket_addr.parse().map_err(|e: std::net::AddrParseError| {
@@ -632,10 +634,10 @@ pub fn session_send_presence(
     cursor: Option<SessionCursor>,
 ) -> Result<()> {
     // KChat gate: presence beacons never leave the box unless the
-    // user is in a KChat group.
-    if kchat_authority_snapshot().local_membership().is_none() {
-        return Err(SessionBridgeError::NotInKChatGroup);
-    }
+    // user is in a KChat group, and the installed membership is
+    // still valid right now. Full re-verification (signature +
+    // peer binding + time window) matches `session_start`.
+    require_active_kchat_membership()?;
     let guard = slot().lock();
     let state = guard.as_ref().ok_or(SessionBridgeError::NotRunning)?;
     let host = state.host.clone();
@@ -727,9 +729,13 @@ impl From<SessionBridgeError> for DocumentBridgeError {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct KChatMembershipStatus {
-    /// True when a non-default authority is installed AND the
-    /// installed membership is currently valid (signature OK,
-    /// within `issued_at..expires_at`, peer binding matches).
+    /// `true` when no valid authority is installed — either no
+    /// membership is set at all, or the installed one fails
+    /// re-verification (forged signature, peer-binding mismatch,
+    /// outside `[issued_at, expires_at]`, etc.). The multiplayer
+    /// entry points (`session_start`, `session_join`,
+    /// `session_send_presence`) all refuse to run while this is
+    /// `true`. `false` means the gate is currently open.
     pub locked: bool,
     /// Group id from the installed membership, if any. `None` when
     /// `locked == true`.
@@ -774,6 +780,42 @@ pub struct KChatInstallRequest {
 /// or async waits.
 fn kchat_authority_snapshot() -> SharedKChatAuthority {
     kchat_slot().lock().clone()
+}
+
+/// Re-verify the installed KChat authority and return the active
+/// membership. Every multiplayer entry point in the bridge gates on
+/// this helper rather than the weaker `.local_membership().is_some()`
+/// check: it confirms (a) a membership exists, (b) the trust root is
+/// installed, (c) the embedded signature verifies under that trust
+/// root, (d) the membership's `peer_id` derives from the embedded
+/// `peer_public_key`, and (e) the validity window covers `now`.
+///
+/// Returning the membership rather than `()` means call sites can
+/// pull the group id / peer id / expiry out of the same struct that
+/// just passed the gate, without snapshotting the authority twice.
+fn require_active_kchat_membership() -> Result<KChatMembership> {
+    let authority = kchat_authority_snapshot();
+    let membership = authority
+        .local_membership()
+        .ok_or(SessionBridgeError::NotInKChatGroup)?;
+    let trust_root = authority
+        .issuer_trust_root()
+        .ok_or(SessionBridgeError::NotInKChatGroup)?;
+    // Reconstruct the peer binding from the membership's own
+    // embedded public key. If the binding has been tampered with,
+    // the derived `PeerId` won't match the stored `peer_id` and
+    // `verify` rejects.
+    let peer_vk = decode_verifying_key(&membership.peer_public_key, "peerPublicKey")?;
+    let derived_peer_id = PeerId::from_verifying_key(&peer_vk);
+    membership
+        .verify(
+            &trust_root,
+            &derived_peer_id,
+            &membership.peer_public_key,
+            Utc::now(),
+        )
+        .map_err(|_| SessionBridgeError::NotInKChatGroup)?;
+    Ok(membership)
 }
 
 fn decode_b64_url(input: &str, field: &'static str) -> Result<Vec<u8>> {
@@ -885,17 +927,24 @@ pub fn kchat_clear_authority() -> KChatMembershipStatus {
     }
 }
 
-/// Report the current KChat gate state to the renderer.
+/// Report the current KChat gate state to the renderer. Uses the
+/// same full re-verification (`require_active_kchat_membership`)
+/// that gates `session_start` / `session_join` /
+/// `session_send_presence`, so the renderer's panel state is
+/// always consistent with whether the bridge would actually let
+/// multiplayer through right now. In particular: an installed
+/// membership whose validity window has just expired is reported
+/// as `locked: true` even before the renderer attempts another
+/// session call.
 pub fn kchat_membership_status() -> KChatMembershipStatus {
-    let authority = kchat_authority_snapshot();
-    match authority.local_membership() {
-        Some(m) => KChatMembershipStatus {
+    match require_active_kchat_membership() {
+        Ok(m) => KChatMembershipStatus {
             locked: false,
             group_id: Some(m.group_id.as_str().to_string()),
             peer_id: Some(m.peer_id().as_str().to_string()),
             expires_at: Some(m.expires_at),
         },
-        None => KChatMembershipStatus {
+        Err(_) => KChatMembershipStatus {
             locked: true,
             group_id: None,
             peer_id: None,

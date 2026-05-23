@@ -168,6 +168,9 @@ pub fn layout_paragraph(
     // keeps the line-fit loop O(words) instead of O(words * tries).
     let tokens = tokenize_with_breaks(text);
     let mut shaped_tokens: Vec<ShapedToken> = Vec::with_capacity(tokens.len());
+    // shaped_tokens is filled below but never mutated after that —
+    // hyphenation tails now ride in `pending_tail` instead of being
+    // spliced into this vector.
     for tok in tokens {
         match tok {
             Token::Word(w) => {
@@ -203,8 +206,16 @@ pub fn layout_paragraph(
     // each iteration either emits one line of text or moves to the
     // next column. Pure newlines emit an empty line at the current
     // height to preserve paragraph breaks.
+    //
+    // Hyphenation tails ride along in `pending_tail` instead of being
+    // spliced into `shaped_tokens`. There is at most one pending tail
+    // at any time (a single line can only end on one split), so an
+    // `Option` is the right shape — push/pop are O(1) and we avoid the
+    // O(n) shift `Vec::insert(cursor, ...)` would cost when a document
+    // has many long words.
     let mut cursor = 0usize;
-    while cursor < shaped_tokens.len() {
+    let mut pending_tail: Option<ShapedToken> = None;
+    while pending_tail.is_some() || cursor < shaped_tokens.len() {
         if column_used_h + line_height > content_h && column_used_h > 0.0 {
             current_column += 1;
             if current_column >= columns {
@@ -214,7 +225,15 @@ pub fn layout_paragraph(
             column_used_h = 0.0;
         }
 
+        // Take pending_tail by value so the borrow checker lets us
+        // re-assign `pending_tail` later in this iteration; `fit_line`
+        // only ever consumes the leading token (either by placing it
+        // whole, hyphenating it into a fresh tail, or force-placing
+        // it), so dropping the value after `fit_line` returns is
+        // always sound.
+        let leading_owned = pending_tail.take();
         let (line_tokens, advance, next_cursor, forced_break, tail) = fit_line(
+            leading_owned.as_ref(),
             &shaped_tokens,
             cursor,
             column_w,
@@ -292,19 +311,16 @@ pub fn layout_paragraph(
         last_used_h = column_used_h;
         cursor = next_cursor;
 
-        // Queue the hyphenated tail back onto the token stream so the
-        // next line picks it up. We re-shape because kerning depends
-        // on the surrounding context and a tail like "phenation" is
-        // not glyph-identical to the substring of the original word.
+        // Queue the hyphenated tail in the pending slot so the next
+        // line picks it up. We re-shape because kerning depends on
+        // the surrounding context and a tail like "phenation" is not
+        // glyph-identical to the substring of the original word.
         if let Some(tail_text) = tail {
             let tail_shaped = shape_text(&tail_text, &style.font_family, style.font_size)?;
-            shaped_tokens.insert(
-                cursor,
-                ShapedToken::Word {
-                    text: tail_text,
-                    shaped: tail_shaped,
-                },
-            );
+            pending_tail = Some(ShapedToken::Word {
+                text: tail_text,
+                shaped: tail_shaped,
+            });
         }
 
         // `forced_break` (hard `\n`) is implicitly handled by the
@@ -398,7 +414,17 @@ enum LineEntry<'a> {
 /// next call. This keeps `fit_line` referentially transparent (no
 /// borrowed-mut of the token vector) while letting the outer loop
 /// continue a long word across multiple lines.
+///
+/// `leading` is an optional out-of-band token that the outer loop
+/// hands to us when the previous line produced a hyphenation tail.
+/// It is processed first, before reading from `tokens[start..]`, so
+/// the outer loop can keep the tail in an `Option` instead of
+/// splicing it into `shaped_tokens` (which would be `O(n)` per
+/// hyphenation). The leading token is always a [`ShapedToken::Word`];
+/// hyphenation tails are by definition word fragments, never
+/// whitespace.
 fn fit_line<'a>(
+    leading: Option<&'a ShapedToken>,
     tokens: &'a [ShapedToken],
     start: usize,
     max_width: f64,
@@ -411,6 +437,61 @@ fn fit_line<'a>(
     let mut forced_break = false;
     let mut tail: Option<String> = None;
 
+    // ---- Phase 1: process the leading pending tail, if any. ----
+    //
+    // Mirrors the `Word` arm of the main loop but never advances
+    // `cursor` because the leading token lives outside `tokens`.
+    // Whitespace can never appear here — only oversize-word
+    // hyphenation produces tails.
+    if let Some(ShapedToken::Word { text, shaped }) = leading {
+        let word_w = shaped.width;
+        if word_w <= max_width {
+            entries.push(LineEntry::WordGlyphs(shaped));
+            width += word_w;
+            // Fall through to phase 2.
+        } else {
+            // Oversize leading on an empty line — same hyphenation
+            // dance as the in-loop case below.
+            let placed = if let Some(patterns) = patterns {
+                let breaks = patterns.hyphenate(text);
+                if breaks.is_empty() {
+                    false
+                } else {
+                    let hyphen_w: f64 = hyphen_shaped
+                        .glyphs
+                        .iter()
+                        .map(|g| g.x_advance)
+                        .sum();
+                    if let Some((end_glyph, byte_break, prefix_w)) = pick_hyphenation_split(
+                        text,
+                        shaped,
+                        &breaks,
+                        max_width,
+                        hyphen_w,
+                    ) {
+                        entries.push(LineEntry::WordSlice { shaped, end_glyph });
+                        width += prefix_w + hyphen_w;
+                        tail = Some(text[byte_break..].to_string());
+                        // The new tail goes back to the outer loop as
+                        // pending_tail for the next line; we stop now.
+                        return (entries, width, cursor, forced_break, tail);
+                    }
+                    false
+                }
+            } else {
+                false
+            };
+            if !placed {
+                // No usable split — force the word onto its own line;
+                // the renderer's overflow mode handles the overrun.
+                entries.push(LineEntry::WordGlyphs(shaped));
+                width += word_w;
+                return (entries, width, cursor, forced_break, tail);
+            }
+        }
+    }
+
+    // ---- Phase 2: walk `tokens[cursor..]` normally. ----
     while cursor < tokens.len() {
         match &tokens[cursor] {
             ShapedToken::Whitespace { raw, advance } => {
@@ -709,6 +790,54 @@ mod tests {
         // patterns are loaded. The function must not panic and must
         // still produce some layout.
         let _ = layout_paragraph("hyphenation", &style(), &f, bounds(200.0, 200.0), None);
+    }
+
+    #[test]
+    fn many_hyphenations_dont_corrupt_layout() {
+        // Stress the pending-tail path with a narrow column and a
+        // long string of multi-syllable words. Each line that
+        // hyphenates feeds a tail back through `pending_tail`, and
+        // the very next iteration consumes it. If the old
+        // `shaped_tokens.insert(cursor, tail)` regressed in (or
+        // someone broke the borrow on `pending_tail`), this test
+        // would either panic, infinite-loop, or produce zero lines.
+        let mut f = frame();
+        f.hyphenation = true;
+        let patterns = HyphenationPatterns::default();
+        let text = "hyphenation responsibility communication preservation \
+                    constellation imagination representation organization \
+                    determination administration consideration"
+            .to_string();
+        let Ok(layout) = layout_paragraph(
+            &text,
+            &style(),
+            &f,
+            bounds(60.0, 600.0),
+            Some(&patterns),
+        ) else {
+            return;
+        };
+        if layout.lines.is_empty() {
+            return; // no fonts on this host
+        }
+        // The corpus has 11 long words; in a 60px-wide column most of
+        // them are forced to hyphenate. We don't pin an exact line
+        // count (font availability shifts it) but we do pin that we
+        // produced a non-trivial number of lines and that no line is
+        // empty of glyphs (which would indicate the tail-handling
+        // regressed and produced a zero-glyph line).
+        assert!(
+            layout.lines.len() >= 4,
+            "expected ≥4 lines from heavy hyphenation, got {}",
+            layout.lines.len()
+        );
+        for line in &layout.lines {
+            assert!(
+                !line.glyphs.is_empty(),
+                "line at baseline {} has no glyphs — pending-tail path likely regressed",
+                line.baseline_y,
+            );
+        }
     }
 
     #[test]

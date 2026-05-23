@@ -1255,8 +1255,23 @@ fn sync_scene_locked(guard: &mut parking_lot::MutexGuard<'_, Option<Workspace>>)
         // "where they are right now" — selection halos are
         // contextual chrome. Both share the same upward overlay
         // id stream so they never collide.
+        //
+        // Pick a halo starting_z well below the document-content
+        // ceiling but high enough to clear local selection
+        // highlights. `sync_document_to_scene` bounds document z
+        // values by their order; selection highlights are appended
+        // after them. `i32::MAX / 2` is safely past both. We start
+        // halos at `i32::MAX / 2` and thread the post-emit z back
+        // out so cursors begin at whatever halo height was actually
+        // reached — a hard-coded gap (e.g. `+1`) would put cursors
+        // beneath halos as soon as a single peer with a display
+        // name was rendered (rect at z, label at z+1, cursor at z+1
+        // → same z, paint order undefined).
+        let halo_starting_z = i32::MAX / 2;
         let selection_triples = crate::collab::presence_selections();
-        if !selection_triples.is_empty() {
+        let halo_next_z = if selection_triples.is_empty() {
+            halo_starting_z
+        } else {
             let selections: Vec<crate::scene_sync::PresenceSelection> = selection_triples
                 .into_iter()
                 .map(
@@ -1271,10 +1286,10 @@ fn sync_scene_locked(guard: &mut parking_lot::MutexGuard<'_, Option<Workspace>>)
                 &mut scene,
                 &ws.project.document,
                 &selections,
-                i32::MAX / 2 - 1,
+                halo_starting_z,
                 viewport_zoom,
-            );
-        }
+            )
+        };
 
         let triples = crate::collab::presence_cursors();
         if !triples.is_empty() {
@@ -1289,16 +1304,15 @@ fn sync_scene_locked(guard: &mut parking_lot::MutexGuard<'_, Option<Workspace>>)
                     },
                 )
                 .collect();
-            // Layer cursors above the highest selection-highlight z.
-            // `sync_document_to_scene` returns objects with z values
-            // bounded by their document order; selection highlights
-            // are appended after them with z starting from that
-            // bound, so any z above `i32::MAX/2` will paint on top
-            // of everything else without risking overflow.
+            // Start cursors immediately above the highest halo z
+            // (or `halo_starting_z` when no halos were emitted).
+            // Saturating add so we never wrap to a negative z and
+            // sink cursors beneath everything if the halo path
+            // somehow burned through ~2 billion z slots.
             ws.scene_sync.append_presence_cursors(
                 &mut scene,
                 &cursors,
-                i32::MAX / 2,
+                halo_next_z.saturating_add(1),
                 viewport_zoom,
             );
         }

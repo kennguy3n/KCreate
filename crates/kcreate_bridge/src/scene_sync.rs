@@ -591,6 +591,18 @@ impl SceneSync {
     /// (e.g. a peer drags-and-drops a layer just as a third peer
     /// deletes it), and rendering halos around dangling ids would
     /// either misplace them at the origin or panic.
+    ///
+    /// Returns the *next* free z value after every halo + label has
+    /// been emitted. Callers that paint additional overlays on top
+    /// (e.g. presence cursors) MUST start from this returned value
+    /// rather than guessing a constant offset — with even one peer
+    /// selecting one node and providing a display name, two
+    /// objects are emitted at `starting_z` and `starting_z + 1`,
+    /// so a hard-coded gap of `1` would put the next overlay
+    /// stream *underneath* the halo label. Threading the watermark
+    /// out is the only way to guarantee cursors always paint above
+    /// halos no matter how many peers / selected nodes / labels
+    /// got emitted this frame.
     pub fn append_presence_selection_halos(
         &mut self,
         scene: &mut Scene,
@@ -598,9 +610,9 @@ impl SceneSync {
         selections: &[PresenceSelection],
         starting_z: i32,
         viewport_zoom: f32,
-    ) {
+    ) -> i32 {
         if selections.is_empty() {
-            return;
+            return starting_z;
         }
         // Continue the same upward overlay-id stream that
         // `sync_document_to_scene` / `append_presence_cursors`
@@ -616,6 +628,16 @@ impl SceneSync {
         for selection in selections {
             let base = peer_color(&selection.peer_id);
             let stroke_color = Color::rgba(base.r, base.g, base.b, HALO_STROKE_ALPHA);
+            // Anchor the peer-name label to the *first rendered*
+            // halo, not the first node id in the list. If the
+            // user's selection starts with an invisible or
+            // since-deleted node, the previous `== first()` guard
+            // would skip every halo before the visible one and
+            // then refuse to emit the label entirely (because the
+            // visible id no longer matches `first()`). A simple
+            // "emit once per peer" latch fixes that and keeps the
+            // one-label-per-peer invariant the test pins.
+            let mut label_emitted = false;
             for node_id in &selection.node_ids {
                 let Some(node) = doc.get_node(*node_id) else {
                     continue;
@@ -645,15 +667,9 @@ impl SceneSync {
                 scene.add_object(halo_obj);
                 z += 1;
 
-                // Peer-name pill at top-left. Only emitted on the
-                // first node of each peer's selection to avoid
-                // spamming the canvas with duplicate labels when a
-                // peer has many nodes selected — the label visually
-                // attaches to the first halo and the user can infer
-                // the rest are the same peer from the matching
-                // stroke colour.
-                if !selection.display_name.is_empty() && Some(node_id) == selection.node_ids.first()
-                {
+                // Peer-name pill at top-left of the first rendered
+                // halo (see `label_emitted` doc above).
+                if !selection.display_name.is_empty() && !label_emitted {
                     let origin = Point2::new(
                         (world.x - f64::from(outset_world)) as f32,
                         (world.y - f64::from(outset_world)) as f32 - label_offset_world,
@@ -676,6 +692,7 @@ impl SceneSync {
                     .with_z(z);
                     scene.add_object(label_obj);
                     z += 1;
+                    label_emitted = true;
                 }
             }
         }
@@ -683,6 +700,7 @@ impl SceneSync {
         // same sync (currently none, but future-proof) continues
         // the stream.
         self.overlay_watermark = overlay.next;
+        z
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1599,6 +1617,181 @@ mod tests {
             .filter(|o| matches!(o.kind, ObjectKind::Text { .. }))
             .count();
         assert_eq!(label_count, 1, "peer label should be emitted exactly once");
+    }
+
+    /// Regression test for the label-emission guard: if the first
+    /// id in a peer's `node_ids` list happens to be invisible or
+    /// missing from the document, the label must still attach to
+    /// the *first rendered* halo (not be silently dropped). The
+    /// earlier `Some(node_id) == selection.node_ids.first()` check
+    /// failed this case because the visible id never matched
+    /// `first()`.
+    #[test]
+    fn selection_halo_label_anchors_to_first_rendered_when_first_id_invisible() {
+        let mut doc = DocumentGraph::new();
+        let vp = unit_square_path();
+        let mut hidden = vector_node(&vp);
+        hidden.name = "hidden".into();
+        hidden.visible = false;
+        hidden.bounds = Bounds {
+            x: 0.0,
+            y: 0.0,
+            width: 10.0,
+            height: 10.0,
+        };
+        let mut visible = vector_node(&vp);
+        visible.name = "visible".into();
+        visible.bounds = Bounds {
+            x: 30.0,
+            y: 0.0,
+            width: 10.0,
+            height: 10.0,
+        };
+        let id_hidden = hidden.id;
+        let id_visible = visible.id;
+        doc.insert_node(hidden).expect("hidden");
+        doc.insert_node(visible).expect("visible");
+
+        let mut sync = SceneSync::new();
+        let mut scene = sync.sync_document_to_scene(&doc, None, &[]);
+        let pre_overlay_ids: std::collections::HashSet<ObjectId> = scene
+            .objects
+            .iter()
+            .map(|o| o.id)
+            .filter(|id| is_overlay_id(*id))
+            .collect();
+
+        let selections = vec![PresenceSelection {
+            peer_id: "peer-1".into(),
+            display_name: "Alice".into(),
+            // Hidden id FIRST, visible id second, dangling id last.
+            // The earlier guard would have dropped the label.
+            node_ids: vec![id_hidden, id_visible, Uuid::new_v4()],
+        }];
+        sync.append_presence_selection_halos(&mut scene, &doc, &selections, 0, 1.0);
+
+        let post_overlay_ids: std::collections::HashSet<ObjectId> = scene
+            .objects
+            .iter()
+            .map(|o| o.id)
+            .filter(|id| is_overlay_id(*id))
+            .collect();
+        let added: std::collections::HashSet<ObjectId> = post_overlay_ids
+            .difference(&pre_overlay_ids)
+            .copied()
+            .collect();
+        // 1 visible node → 1 halo rect + 1 label = 2 overlays.
+        assert_eq!(
+            added.len(),
+            2,
+            "expected 1 halo rect + 1 peer-name label, got {} new overlays",
+            added.len()
+        );
+        let label_count = scene
+            .objects
+            .iter()
+            .filter(|o| added.contains(&o.id))
+            .filter(|o| matches!(o.kind, ObjectKind::Text { .. }))
+            .count();
+        assert_eq!(
+            label_count, 1,
+            "peer label must still emit even when the first node id is invisible"
+        );
+    }
+
+    /// Halos must paint *below* presence cursors so the cursor
+    /// stays the most prominent indicator of "where the peer is
+    /// right now". The previous implementation used a hard-coded
+    /// `cursor_z = halo_z + 1` gap that broke as soon as halos
+    /// emitted more than one object — exactly the case when even a
+    /// single peer with a display name selects one node (rect at z,
+    /// label at z+1). The fix threads the post-halo z out of
+    /// `append_presence_selection_halos` so the caller can put
+    /// cursors strictly above whatever the halo path actually
+    /// produced.
+    #[test]
+    fn presence_cursor_z_is_strictly_above_every_halo_z() {
+        let mut doc = DocumentGraph::new();
+        let vp = unit_square_path();
+        let mut visible_a = vector_node(&vp);
+        visible_a.bounds = Bounds {
+            x: 0.0,
+            y: 0.0,
+            width: 10.0,
+            height: 10.0,
+        };
+        let mut visible_b = vector_node(&vp);
+        visible_b.bounds = Bounds {
+            x: 30.0,
+            y: 0.0,
+            width: 10.0,
+            height: 10.0,
+        };
+        let id_a = visible_a.id;
+        let id_b = visible_b.id;
+        doc.insert_node(visible_a).expect("a");
+        doc.insert_node(visible_b).expect("b");
+
+        let mut sync = SceneSync::new();
+        let mut scene = sync.sync_document_to_scene(&doc, None, &[]);
+        let pre_overlay_ids: std::collections::HashSet<ObjectId> = scene
+            .objects
+            .iter()
+            .map(|o| o.id)
+            .filter(|id| is_overlay_id(*id))
+            .collect();
+
+        let halo_starting_z = 1000;
+        let selections = vec![PresenceSelection {
+            peer_id: "peer-1".into(),
+            display_name: "Alice".into(),
+            node_ids: vec![id_a, id_b],
+        }];
+        let halo_next_z = sync.append_presence_selection_halos(
+            &mut scene,
+            &doc,
+            &selections,
+            halo_starting_z,
+            1.0,
+        );
+        // 2 halos + 1 label = 3 z slots consumed, so next free z
+        // must be `starting + 3`.
+        assert_eq!(
+            halo_next_z,
+            halo_starting_z + 3,
+            "halo should consume 3 z slots (2 rects + 1 label) and return next free"
+        );
+
+        let cursors = vec![PresenceCursor {
+            peer_id: "peer-1".into(),
+            display_name: "Alice".into(),
+            x: 5.0,
+            y: 5.0,
+        }];
+        sync.append_presence_cursors(&mut scene, &cursors, halo_next_z, 1.0);
+
+        let halo_max_z = scene
+            .objects
+            .iter()
+            .filter(|o| is_overlay_id(o.id) && !pre_overlay_ids.contains(&o.id))
+            // Halo rects + label live in the range [halo_starting_z, halo_next_z).
+            .filter(|o| o.z < halo_next_z)
+            .map(|o| o.z)
+            .max()
+            .expect("at least one halo emitted");
+        let cursor_min_z = scene
+            .objects
+            .iter()
+            .filter(|o| is_overlay_id(o.id) && !pre_overlay_ids.contains(&o.id))
+            // Cursor objects start at `halo_next_z`.
+            .filter(|o| o.z >= halo_next_z)
+            .map(|o| o.z)
+            .min()
+            .expect("at least one cursor object emitted");
+        assert!(
+            cursor_min_z > halo_max_z,
+            "cursor min z ({cursor_min_z}) must be strictly above halo max z ({halo_max_z})"
+        );
     }
 
     /// Halo overlay ids must continue the same upward stream that

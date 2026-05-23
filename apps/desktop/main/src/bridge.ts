@@ -359,6 +359,38 @@ export interface Bridge {
   textLayoutCompute(nodeId: string): string;
   textOpentypeFeaturesGet(nodeId: string): string;
   textOpentypeFeaturesUpdate(nodeId: string, featuresJson: string): void;
+  // Phase 3 — LAN collaboration session. All entry points are
+  // gated by the bridge crate's `collab` feature flag at compile
+  // time; when the bridge is built without the flag, calls into
+  // these functions will throw a "Method not implemented" napi
+  // error from the runtime resolver. Production builds for
+  // packaged apps must enable the feature; debug builds may opt
+  // out for faster turn-around on UI-only work.
+  sessionStart(
+    seedB64: string,
+    displayName: string,
+    projectId: string,
+    advertiseMdns: boolean,
+  ): string;
+  sessionLeave(): void;
+  sessionJoin(
+    peerId: string,
+    publicKey: string,
+    displayName: string,
+    socketAddr: string,
+    certFingerprintB64: string,
+  ): void;
+  sessionPeers(): string;
+  sessionDrainEvents(): string;
+  sessionSendPresence(
+    activePage: string | null,
+    selectionJson: string,
+    cursorJson: string | null,
+  ): void;
+  sessionInfo(): string;
+  /// Re-publish the cached scene. Used by the session event tick
+  /// to refresh remote-peer cursor overlays.
+  documentRequestRender(): void;
 }
 
 function bridgeBinaryPath(): string {

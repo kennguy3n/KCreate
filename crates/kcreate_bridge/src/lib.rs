@@ -16,6 +16,8 @@
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 
+#[cfg(feature = "collab")]
+pub mod collab;
 pub mod document;
 pub mod hit_test;
 pub mod llm;
@@ -959,6 +961,16 @@ pub fn document_sync_scene() -> NapiResult<()> {
     document::document_sync_scene().map_err(map_doc_err)
 }
 
+/// Force a re-publish of the current scene without taking a
+/// document lock for mutation. Used by the Phase 3 collab IPC
+/// tick to refresh remote-peer cursor overlays after presence
+/// updates arrive. Safe to call even when no project is loaded
+/// (returns `Ok` and does nothing).
+#[napi]
+pub fn document_request_render() -> NapiResult<()> {
+    document::document_request_render().map_err(map_doc_err)
+}
+
 /// Hit-test viewport-relative screen coordinates against the current
 /// scene. Returns the topmost selectable node's uuid as a string, or
 /// `null` when the cursor is over empty canvas.
@@ -1878,4 +1890,151 @@ pub fn text_opentype_features_get(node_id: String) -> NapiResult<String> {
 pub fn text_opentype_features_update(node_id: String, features_json: String) -> NapiResult<()> {
     let id = parse_uuid(&node_id)?;
     phase2::text_opentype_features_update(id, &features_json).map_err(map_doc_err)
+}
+
+// ---------------------------------------------------------------------------
+// Phase 3 — LAN collaboration session
+//
+// Gated by the `collab` feature so default builds keep the
+// editing path free of QUIC / mDNS / tokio dependencies. The
+// Electron host enables `collab` for release packaging; debug
+// builds default-on through the workspace `default-members` list.
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "collab")]
+#[allow(clippy::needless_pass_by_value)]
+fn map_session_err(e: crate::collab::SessionBridgeError) -> NapiError {
+    let status = match e {
+        crate::collab::SessionBridgeError::InvalidArgument { .. }
+        | crate::collab::SessionBridgeError::NotRunning
+        | crate::collab::SessionBridgeError::AlreadyRunning => Status::InvalidArg,
+        _ => Status::GenericFailure,
+    };
+    NapiError::new(status, format!("kcreate_bridge: {e}"))
+}
+
+/// Start a collab session. Returns a JSON [`SessionStartReport`].
+/// `seed_b64` is the 32-byte Ed25519 signing-key seed, base64url
+/// encoded (padded or unpadded both accepted). The renderer
+/// persists the seed across launches so the same machine
+/// presents a stable peer identity.
+#[cfg(feature = "collab")]
+#[napi]
+pub fn session_start(
+    seed_b64: String,
+    display_name: String,
+    project_id: String,
+    advertise_mdns: bool,
+) -> NapiResult<String> {
+    let pid = parse_uuid(&project_id)?;
+    let report = crate::collab::session_start(&seed_b64, &display_name, pid, advertise_mdns)
+        .map_err(map_session_err)?;
+    serde_json::to_string(&report).map_err(|e| {
+        NapiError::new(
+            Status::GenericFailure,
+            format!("kcreate_bridge: session_start serialize: {e}"),
+        )
+    })
+}
+
+/// Stop the running session (graceful Goodbye + endpoint close).
+/// Idempotent.
+#[cfg(feature = "collab")]
+#[napi]
+pub fn session_leave() -> NapiResult<()> {
+    crate::collab::session_leave().map_err(map_session_err)
+}
+
+/// Dial a known peer. All five fields come from the discovered
+/// peer roster or a pasted peer link.
+#[cfg(feature = "collab")]
+#[napi]
+pub fn session_join(
+    peer_id: String,
+    public_key: String,
+    display_name: String,
+    socket_addr: String,
+    cert_fingerprint_b64: String,
+) -> NapiResult<()> {
+    crate::collab::session_join(
+        &peer_id,
+        &public_key,
+        &display_name,
+        &socket_addr,
+        &cert_fingerprint_b64,
+    )
+    .map_err(map_session_err)
+}
+
+/// Return the current peer roster as JSON `Vec<SessionPeer>`.
+#[cfg(feature = "collab")]
+#[napi]
+pub fn session_peers() -> NapiResult<String> {
+    let peers = crate::collab::session_peers().map_err(map_session_err)?;
+    serde_json::to_string(&peers).map_err(|e| {
+        NapiError::new(
+            Status::GenericFailure,
+            format!("kcreate_bridge: session_peers serialize: {e}"),
+        )
+    })
+}
+
+/// Drain the buffered session events as JSON `Vec<SessionEvent>`.
+/// The Electron main process calls this on a tick.
+#[cfg(feature = "collab")]
+#[napi]
+pub fn session_drain_events() -> NapiResult<String> {
+    let events = crate::collab::session_drain_events().map_err(map_session_err)?;
+    serde_json::to_string(&events).map_err(|e| {
+        NapiError::new(
+            Status::GenericFailure,
+            format!("kcreate_bridge: session_drain_events serialize: {e}"),
+        )
+    })
+}
+
+/// Broadcast the local user's presence. `cursor_json` may be null
+/// or a JSON `{ "x": number, "y": number }`.
+#[cfg(feature = "collab")]
+#[napi]
+pub fn session_send_presence(
+    active_page: Option<String>,
+    selection_json: String,
+    cursor_json: Option<String>,
+) -> NapiResult<()> {
+    let active = match active_page {
+        Some(s) if !s.is_empty() => Some(parse_uuid(&s)?),
+        _ => None,
+    };
+    let selection: Vec<Uuid> = serde_json::from_str(&selection_json).map_err(|e| {
+        NapiError::new(
+            Status::InvalidArg,
+            format!("kcreate_bridge: session_send_presence selection: {e}"),
+        )
+    })?;
+    let cursor: Option<crate::collab::SessionCursor> = match cursor_json {
+        Some(s) => Some(serde_json::from_str(&s).map_err(|e| {
+            NapiError::new(
+                Status::InvalidArg,
+                format!("kcreate_bridge: session_send_presence cursor: {e}"),
+            )
+        })?),
+        None => None,
+    };
+    crate::collab::session_send_presence(active, selection, cursor).map_err(map_session_err)
+}
+
+/// Read the cached `SessionStartReport` for the running session,
+/// or `null` if no session is running. Returns a JSON string so
+/// the renderer can deserialize directly into its TS type.
+#[cfg(feature = "collab")]
+#[napi]
+pub fn session_info() -> NapiResult<String> {
+    let info = crate::collab::session_info();
+    serde_json::to_string(&info).map_err(|e| {
+        NapiError::new(
+            Status::GenericFailure,
+            format!("kcreate_bridge: session_info serialize: {e}"),
+        )
+    })
 }

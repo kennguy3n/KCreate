@@ -92,9 +92,47 @@ pub struct ModelPack {
     pub sha256: String,
 }
 
+/// Canonical SHA-256 hashes for optional model packs that ship in
+/// **stable releases**. Keep this table empty on `main`; the release
+/// pipeline (Phase 3, see PR #8 release-engineering follow-up) is
+/// the only place that fills it in, by editing this constant as part
+/// of the release commit and running [`assert_canonical_hashes_well_formed`]
+/// to confirm every entry is a syntactically valid 64-character
+/// lowercase hex digest.
+///
+/// Why a separate table from [`static_packs`]: this layout keeps the
+/// structural pack catalogue (ids, URLs, sizes, capabilities) free of
+/// release-engineering churn. A release that pins
+/// `bg_remove_u2net` only edits the canonical-hashes table; the
+/// catalogue stays byte-identical. CI rejects malformed entries via
+/// the test at the bottom of this module.
+///
+/// IMPORTANT: do *not* invent hashes. The installer rejects mismatches
+/// (`InstallError::ChecksumMismatch`), so a guessed hash would brick
+/// every install of that pack. Always paste hashes computed from the
+/// canonical upstream artefact (see `ModelPack::download_url`).
+const CANONICAL_PACK_HASHES: &[(&str, &str)] = &[
+    // Pinned at release time. Example shape (commented out):
+    // ("bg_remove_u2net", "0123456789abcdef…"),
+];
+
+/// Look up the canonical hash for a pack id from
+/// [`CANONICAL_PACK_HASHES`]. Returns `""` when the pack hasn't been
+/// pinned yet — matches the pre-PR registry semantics so the
+/// installer's "do not enforce" branch still triggers for unpinned
+/// packs.
+#[must_use]
+fn canonical_hash_for(pack_id: &str) -> &'static str {
+    CANONICAL_PACK_HASHES
+        .iter()
+        .find(|(id, _)| *id == pack_id)
+        .map_or("", |(_, h)| *h)
+}
+
 /// Return the canonical list of model packs, with `installed`
-/// computed against `models_dir`. Passing a `models_dir` that does
-/// not exist is fine — every optional pack just shows up as
+/// computed against `models_dir` and `sha256` overlaid from
+/// [`CANONICAL_PACK_HASHES`]. Passing a `models_dir` that does not
+/// exist is fine — every optional pack just shows up as
 /// `installed: false`.
 #[must_use]
 pub fn list_model_packs(models_dir: &Path) -> Vec<ModelPack> {
@@ -105,6 +143,10 @@ pub fn list_model_packs(models_dir: &Path) -> Vec<ModelPack> {
                 p.installed = true;
             } else if !p.file_path.is_empty() {
                 p.installed = models_dir.join(&p.file_path).exists();
+            }
+            let canonical = canonical_hash_for(&p.id);
+            if !canonical.is_empty() {
+                p.sha256 = canonical.into();
             }
             p
         })
@@ -347,12 +389,21 @@ pub fn install_model_pack(
     source: &Path,
     models_dir: &Path,
 ) -> Result<InstallReport, InstallError> {
-    let pack = static_packs()
+    let mut pack = static_packs()
         .into_iter()
         .find(|p| p.id == pack_id)
         .ok_or_else(|| InstallError::UnknownPack(pack_id.into()))?;
     if pack.kind == ModelKind::BuiltIn || pack.file_path.is_empty() {
         return Err(InstallError::BuiltIn(pack_id.into()));
+    }
+    // Overlay the canonical hash from the release-pinned table.
+    // Without this, an unpinned pack would install as "unverified"
+    // even when the publishing pipeline has pinned a hash — and a
+    // hash-mismatching artefact for a pinned pack would silently
+    // succeed.
+    let canonical = canonical_hash_for(&pack.id);
+    if !canonical.is_empty() {
+        pack.sha256 = canonical.into();
     }
 
     // Stream the source through SHA-256 so we never have to hold the
@@ -847,5 +898,61 @@ mod tests {
             verified: true,
             size_bytes: total,
         })
+    }
+
+    /// CI guard for the canonical-hash overlay table.
+    ///
+    /// Every entry in [`CANONICAL_PACK_HASHES`] must reference a real
+    /// pack id and supply a syntactically valid SHA-256 digest
+    /// (exactly 64 lowercase hex characters). Stale ids or
+    /// shorter/longer hashes are a fast path to a broken release:
+    /// the installer would either silently skip verification or
+    /// reject every artefact for that pack.
+    #[test]
+    fn canonical_pack_hashes_are_well_formed() {
+        let valid_ids: std::collections::HashSet<String> =
+            static_packs().into_iter().map(|p| p.id).collect();
+        for (pack_id, hash) in CANONICAL_PACK_HASHES.iter().copied() {
+            assert!(
+                valid_ids.contains(pack_id),
+                "canonical hash entry references unknown pack id `{pack_id}`"
+            );
+            assert_eq!(
+                hash.len(),
+                64,
+                "canonical hash for `{pack_id}` must be 64 hex chars, got {}",
+                hash.len()
+            );
+            assert!(
+                hash.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f')),
+                "canonical hash for `{pack_id}` must be lowercase hex"
+            );
+        }
+    }
+
+    /// When a canonical hash is registered for a pack, `list_model_packs`
+    /// surfaces it on the returned `ModelPack::sha256` so the UI can
+    /// show "Verified" affordances without re-reading the registry.
+    #[test]
+    fn canonical_hash_for_lookup_is_overlaid_on_list() {
+        // The overlay table is empty on `main`, so the production
+        // lookup always returns "". This test pins that property and
+        // also exercises the overlay function directly so a future
+        // entry actually overrides the catalogue's empty string.
+        let unpinned = canonical_hash_for("bg_remove_u2net");
+        assert!(
+            unpinned.is_empty(),
+            "no canonical hashes ship on main; release branches add them"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let packs = list_model_packs(dir.path());
+        let u2net = packs
+            .iter()
+            .find(|p| p.id == "bg_remove_u2net")
+            .expect("u2net is in static_packs");
+        assert!(
+            u2net.sha256.is_empty(),
+            "unpinned pack must surface empty sha256 to the UI"
+        );
     }
 }

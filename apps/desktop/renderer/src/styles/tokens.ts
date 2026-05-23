@@ -13,11 +13,22 @@ export const colors = {
   text: "#111827",
   textMuted: "#4B5563",
   textInverse: "#FFFFFF",
+  /// Used by the Phase 3 presence indicator for "peer is online
+  /// and has broadcast presence in the past few seconds".
+  success: "#16A34A",
+  /// Used by error banners and the "leave session" destructive
+  /// CTA in the PresencePanel.
+  danger: "#DC2626",
 } as const;
 
 export const radius = {
   card: 12,
   pill: 9999,
+  /// Small radius for inline form controls (inputs, tags).
+  sm: 4,
+  /// Medium radius for card-shaped panels nested inside a larger
+  /// container — e.g. the section blocks in `PresencePanel`.
+  md: 6,
 } as const;
 
 export const shadow = {

@@ -100,6 +100,11 @@ import type {
   TextFrameOptions,
   OpenTypeFeatures,
   TextLayoutWire,
+  SessionBridge,
+  SessionCursor,
+  SessionEvent,
+  SessionPeer,
+  SessionStartReport,
 } from "../../shared/scene";
 
 type FrameInfoSnake = {
@@ -1345,6 +1350,91 @@ const color: ColorBridge = {
 // uniform with the rest of the `window.kcreate.*` surface.
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Phase 3 — LAN collaboration session.
+//
+// All four IPC channels live behind `kcreate/session/...`. The main
+// process handles them in `apps/desktop/main/src/main.ts`. The
+// renderer subscribes to a single push channel
+// `kcreate/session/event` that fans out discovered / peerJoined /
+// peerLeft / presenceUpdated events; the main process polls the
+// bridge's bounded queue on a fixed tick and forwards each entry.
+// ---------------------------------------------------------------------------
+
+const session: SessionBridge = {
+  async start(
+    seedB64: string,
+    displayName: string,
+    projectId: string,
+    advertiseMdns: boolean,
+  ): Promise<SessionStartReport> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/session/start",
+      seedB64,
+      displayName,
+      projectId,
+      advertiseMdns,
+    )) as string;
+    return JSON.parse(raw) as SessionStartReport;
+  },
+  async leave(): Promise<void> {
+    await ipcRenderer.invoke("kcreate/session/leave");
+  },
+  async join(
+    peerId: string,
+    publicKey: string,
+    displayName: string,
+    socketAddr: string,
+    certFingerprintB64: string,
+  ): Promise<void> {
+    await ipcRenderer.invoke(
+      "kcreate/session/join",
+      peerId,
+      publicKey,
+      displayName,
+      socketAddr,
+      certFingerprintB64,
+    );
+  },
+  async peers(): Promise<SessionPeer[]> {
+    const raw = (await ipcRenderer.invoke("kcreate/session/peers")) as string;
+    return JSON.parse(raw) as SessionPeer[];
+  },
+  async info(): Promise<SessionStartReport | null> {
+    const raw = (await ipcRenderer.invoke("kcreate/session/info")) as string;
+    return JSON.parse(raw) as SessionStartReport | null;
+  },
+  async sendPresence(
+    activePage: string | null,
+    selection: string[],
+    cursor: SessionCursor | null,
+  ): Promise<void> {
+    await ipcRenderer.invoke(
+      "kcreate/session/sendPresence",
+      activePage,
+      JSON.stringify(selection),
+      cursor === null ? null : JSON.stringify(cursor),
+    );
+  },
+  onEvent(callback: (event: SessionEvent) => void): () => void {
+    const channel = "kcreate/session/event";
+    const listener = (_evt: unknown, payload: string): void => {
+      try {
+        const ev = JSON.parse(payload) as SessionEvent;
+        callback(ev);
+      } catch {
+        // Malformed event payload — swallow rather than crash the
+        // renderer. The main process logs the underlying bridge
+        // error before emitting.
+      }
+    };
+    ipcRenderer.on(channel, listener);
+    return () => {
+      ipcRenderer.removeListener(channel, listener);
+    };
+  },
+};
+
 const textFrame: TextFrameBridge = {
   async get(nodeId: string): Promise<TextFrameOptions> {
     const raw = (await ipcRenderer.invoke(
@@ -1413,4 +1503,5 @@ contextBridge.exposeInMainWorld("kcreate", {
   mcpPermission,
   color,
   textFrame,
+  session,
 });

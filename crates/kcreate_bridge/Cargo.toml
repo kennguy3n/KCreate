@@ -51,6 +51,25 @@ image.workspace = true
 # this crate at all, so default builds stay free of unsafe pointer
 # math.
 raw-window-handle = { workspace = true, optional = true }
+# Phase 3 LAN transport. Like `kcreate_mcp`, this is the *only* path
+# by which the bridge can pull a network stack — `kcreate_collab`
+# itself is transport-agnostic and stays in the editing path, but
+# `kcreate_collab_transport` carries quinn / rustls / mdns-sd /
+# tokio. Off by default; the local-first sentinel
+# (`crates/kcreate_tests/tests/local_first.rs`) keeps it that way.
+kcreate_collab = { path = "../kcreate_collab", optional = true }
+kcreate_collab_transport = { path = "../kcreate_collab_transport", optional = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time"], optional = true }
+# Used only behind the `collab` feature to decode an Ed25519 public
+# key from the wire-form base64url string into a `VerifyingKey` for
+# the peer-id derivation sanity check in `collab::identity_from_wire`.
+# Already in the editing-path tree via `kcreate_plugin`, so adding
+# the dependency here under a feature flag doesn't change the
+# default-feature graph the local-first sentinel walks.
+ed25519-dalek = { workspace = true, optional = true }
+# tracing is pulled in by quinn / rustls under the `collab` feature;
+# we use it directly for `tracing::warn!` in the pump task.
+tracing = { workspace = true, optional = true }
 
 [build-dependencies]
 napi-build.workspace = true
@@ -85,3 +104,9 @@ llm = ["kcreate_ai/llm_sidecar"]
 # Phase 0 / Phase 1 default build is `unsafe`-free; the Electron
 # host enables it when the user opts in via the settings toggle.
 native_canvas = ["dep:raw-window-handle"]
+# Enable the LAN collaboration transport (QUIC + mDNS) and the
+# `session_*` IPC surface that drives the Phase 3 presence UI. Off
+# by default so the local-first sentinel keeps quinn / rustls /
+# mdns-sd out of the editing-path dependency tree; the Electron
+# host enables this when packaging a release that ships collab.
+collab = ["dep:kcreate_collab", "dep:kcreate_collab_transport", "dep:tokio", "dep:ed25519-dalek", "dep:tracing"]

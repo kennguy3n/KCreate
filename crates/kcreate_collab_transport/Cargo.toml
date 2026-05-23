@@ -1,0 +1,56 @@
+[package]
+name = "kcreate_collab_transport"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "LAN transport (QUIC + mDNS) for the KCreate Phase 3 collaboration protocol"
+publish = false
+
+[lints]
+workspace = true
+
+# This crate is the Phase 3 LAN transport. It is intentionally NOT in
+# the editing-path dependency tree enforced by
+# `crates/kcreate_tests/tests/local_first.rs::editing_path_crates()`.
+# That isolation is the whole point: only this crate (and code that
+# explicitly opts in to it, e.g. the bridge under the `collab`
+# feature) gets to pull in quinn / rustls / mdns-sd / tokio.
+#
+# Trust anchor: every peer is identified by an Ed25519 public key
+# managed by `kcreate_collab::peer::PeerKey`. We layer QUIC's TLS
+# requirement on top of that anchor by:
+#   1. Generating an ephemeral self-signed TLS certificate at session
+#      start (via `rcgen`), unrelated to the Ed25519 identity.
+#   2. Advertising the cert's SHA-256 fingerprint in the mDNS TXT
+#      record alongside the peer fingerprint.
+#   3. Verifying the presented cert at dial time against the pinned
+#      fingerprint using a custom `rustls::client::ServerCertVerifier`.
+# This is the same "no PKI" pattern Tailscale / WireGuard use.
+[dependencies]
+kcreate_collab = { path = "../kcreate_collab" }
+kcreate_core = { path = "../kcreate_core" }
+quinn.workspace = true
+rustls.workspace = true
+rustls-pki-types.workspace = true
+rcgen.workspace = true
+mdns-sd.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+sha2.workspace = true
+uuid = { workspace = true, features = ["v4", "serde"] }
+parking_lot.workspace = true
+base64.workspace = true
+ed25519-dalek.workspace = true
+log.workspace = true
+blake3.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }
+chrono = { workspace = true, features = ["serde"] }

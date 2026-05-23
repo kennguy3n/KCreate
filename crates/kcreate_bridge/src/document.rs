@@ -1213,17 +1213,89 @@ fn sync_scene_locked(guard: &mut parking_lot::MutexGuard<'_, Option<Workspace>>)
     let Some(ws) = guard.as_mut() else {
         return Ok(());
     };
-    let scene = ws.scene_sync.sync_document_to_scene(
+    #[allow(unused_mut)]
+    let mut scene = ws.scene_sync.sync_document_to_scene(
         &ws.project.document,
         Some(ws.store.blobs()),
         &ws.selection,
     );
+    // Layer remote-peer cursors on top of the document.
+    //
+    // **Lock ordering invariant: workspace → collab.** This site is
+    // the only place the bridge acquires the collab slot while
+    // already holding the workspace mutex. The reverse order is
+    // forbidden by construction:
+    //   * `collab::session_start` / `session_drain_events` /
+    //     `session_peers` / `apply_event` take `collab::slot()` only
+    //     and never reach into the workspace.
+    //   * The transport pump task (`collab::pump_inbound`) also
+    //     touches only `collab::slot()` plus the host's internal
+    //     `RwLock`s — it never re-enters the bridge to touch the
+    //     workspace.
+    //   * Renderer republishes triggered by collab events
+    //     (`document_request_render`) re-enter this function from
+    //     scratch on a *fresh* lock acquisition (workspace → collab),
+    //     never collab → workspace.
+    // Any future contributor adding a callback from the collab pump
+    // *into* the workspace lock would violate this invariant and
+    // create a deadlock — please add the new path to the list above
+    // and update `collab::pump_inbound` if you really need it.
+    #[cfg(feature = "collab")]
+    {
+        let triples = crate::collab::presence_cursors();
+        if !triples.is_empty() {
+            let cursors: Vec<crate::scene_sync::PresenceCursor> = triples
+                .into_iter()
+                .map(
+                    |(peer_id, display_name, cursor)| crate::scene_sync::PresenceCursor {
+                        peer_id,
+                        display_name,
+                        x: cursor.x,
+                        y: cursor.y,
+                    },
+                )
+                .collect();
+            // Pull the renderer's current zoom so cursors render at
+            // a constant on-screen size regardless of pan/zoom. The
+            // call is safe to make under the workspace lock: the
+            // renderer slot has its own mutex (`state::slot()`) and
+            // we never hold the renderer slot before this point.
+            // Falls back to `1.0` in headless contexts.
+            let viewport_zoom = crate::state::viewport_zoom();
+            // Layer cursors above the highest selection-highlight z.
+            // `sync_document_to_scene` returns objects with z values
+            // bounded by their document order; selection highlights
+            // are appended after them with z starting from that
+            // bound, so any z above `i32::MAX/2` will paint on top
+            // of everything else without risking overflow.
+            ws.scene_sync.append_presence_cursors(
+                &mut scene,
+                &cursors,
+                i32::MAX / 2,
+                viewport_zoom,
+            );
+        }
+    }
     // Renderer not initialised is fine here: the host may be working
     // headlessly. Other render errors propagate.
     match crate::state::render_scene(scene) {
         Ok(_) | Err(crate::state::BridgeError::NotInitialized) => Ok(()),
         Err(e) => Err(DocumentBridgeError::Bridge(e)),
     }
+}
+
+/// Re-run [`sync_scene_locked`] without applying a document
+/// mutation. Used by the Phase 3 collab session to re-publish the
+/// scene whenever remote presence (cursors, joins, leaves)
+/// changes — the cursor overlay is appended inside
+/// `sync_scene_locked` so this is the same path the editor uses
+/// for selection changes.
+///
+/// `Ok(())` when no project is loaded, mirroring the rest of the
+/// "no-op when headless" surface of `sync_scene_locked`.
+pub fn document_request_render() -> Result<()> {
+    let mut guard = slot().lock();
+    sync_scene_locked(&mut guard)
 }
 
 // -----------------------------------------------------------------------------

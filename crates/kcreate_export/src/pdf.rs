@@ -17,7 +17,8 @@ use kcreate_core::node::{FillStyle, Node, NodeType};
 use kcreate_vector::{PathPoint, PathSegment, VectorPath};
 use printpdf::path::{PaintMode, WindingOrder};
 use printpdf::{
-    Cmyk, Image, ImageTransform, Mm, PdfDocument, PdfLayerReference, Point, Polygon, Rgb,
+    Cmyk, ColorBits, ColorSpace, Image, ImageTransform, ImageXObject, Mm, PdfDocument,
+    PdfLayerReference, Point, Polygon, Px, Rgb,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -88,11 +89,32 @@ impl Default for PdfExportOptions {
 /// the caller skips the fill operator entirely.
 fn resolve_fill_color(node: &Node) -> Option<Color> {
     // 1. Decide visibility purely from `fill`. This must match the
-    //    renderer's painted/not-painted decision exactly.
-    let fill_alpha = match node.style.fill {
-        FillStyle::Solid(rgba) if rgba.a > 0.0 => rgba.a,
-        FillStyle::Solid(_) | FillStyle::None | FillStyle::Gradient(_) => return None,
+    //    renderer's painted/not-painted decision exactly. The
+    //    `Gradient` arm is special: gradients cannot round-trip
+    //    through `DeviceCMYK` in printpdf 0.7 (no shading-pattern
+    //    API), so the historical behaviour was to drop them
+    //    entirely on export. Phase 2 PR #7 surfaced a hole in that
+    //    rule — a gradient with a `color_override` was being
+    //    silently dropped too, even though the override explicitly
+    //    states the intended print colour. We now treat that case
+    //    as "flat fill in the override's colour space" so the
+    //    print shop sees the user's intent.
+    let fill_alpha: f32 = match (&node.style.fill, &node.style.color_override) {
+        (FillStyle::Solid(rgba), _) if rgba.a > 0.0 => rgba.a,
+        // Gradient + override: use the gradient's effective alpha
+        // (max of all stop alphas; matches what the renderer would
+        // see as the "loudest" pixel in the gradient) and fall
+        // through to the override branch below.
+        (FillStyle::Gradient(kind), Some(_)) => gradient_effective_alpha(kind),
+        // Solid-with-zero-alpha, FillStyle::None, and Gradient-without-
+        // override all collapse to "nothing to export". The PDF would
+        // have no fill operator anyway, so we bail before allocating
+        // anything downstream.
+        (FillStyle::Solid(_) | FillStyle::None | FillStyle::Gradient(_), _) => return None,
     };
+    if fill_alpha <= 0.0 {
+        return None;
+    }
 
     // 2. Apply the override. The override is authored in its native
     //    color space (CMYK, Lab, …) and is the canonical color value
@@ -117,6 +139,20 @@ fn resolve_fill_color(node: &Node) -> Option<Color> {
         b: rgba.b,
         a: rgba.a,
     })
+}
+
+/// Walk the gradient's stops and return the largest alpha. We use
+/// the max (not the mean) so a gradient with a single fully-opaque
+/// stop and several zero-alpha ones is still treated as visible —
+/// the renderer would paint the opaque region too. Returns `0.0`
+/// for an empty stops vector (defensive — `GradientKind` doesn't
+/// enforce non-empty in the type system).
+fn gradient_effective_alpha(kind: &kcreate_core::node::GradientKind) -> f32 {
+    use kcreate_core::node::GradientKind;
+    let stops = match kind {
+        GradientKind::Linear { stops, .. } | GradientKind::Radial { stops, .. } => stops,
+    };
+    stops.iter().map(|s| s.color.a).fold(0.0_f32, f32::max)
 }
 
 /// Stitch a renderer-side fill alpha onto an export-time
@@ -327,6 +363,7 @@ fn walk_nodes(
                     sx,
                     sy,
                     page_height_mm,
+                    color_mode,
                 )?;
             }
             _ => {}
@@ -561,6 +598,7 @@ fn emit_raster(
     sx: f64,
     sy: f64,
     page_height_mm: f64,
+    color_mode: PdfColorMode,
 ) -> Result<(), PdfExportError> {
     #[derive(Deserialize)]
     struct Meta {
@@ -579,25 +617,19 @@ fn emit_raster(
         return Ok(());
     };
 
-    // Re-encode to PNG so printpdf can decode through its `image`
-    // re-export without needing the original mime type.
-    let mut png_bytes: Vec<u8> = Vec::new();
-    {
-        let mut cursor = std::io::Cursor::new(&mut png_bytes);
-        image::write_buffer_with_format(
-            &mut cursor,
-            &pixels.rgba,
-            pixels.width,
-            pixels.height,
-            image::ColorType::Rgba8,
-            ImageFormat::Png,
-        )
-        .map_err(|e| PdfExportError::Image(e.to_string()))?;
-    }
-
-    let dyn_img = printpdf::image_crate::load_from_memory(&png_bytes)
-        .map_err(|e| PdfExportError::Image(e.to_string()))?;
-    let pdf_image = Image::from_dynamic_image(&dyn_img);
+    // Build a printpdf `Image` (= `ImageXObject` wrapper) in the
+    // device color space requested by the caller. CMYK mode runs
+    // the pixel buffer through `srgb_to_cmyk` and embeds the
+    // result as a `ColorSpace::Cmyk` image so a print shop sees
+    // `/DeviceCMYK` in the resulting PDF; the other modes keep
+    // the historical "PNG → load_from_memory → DynamicImage"
+    // round-trip which yields a `/DeviceRGB` image.
+    let pdf_image = match color_mode {
+        PdfColorMode::Cmyk => raster_to_cmyk_image(&pixels.rgba, pixels.width, pixels.height)?,
+        PdfColorMode::Rgb | PdfColorMode::PassThrough => {
+            raster_to_rgb_image(&pixels.rgba, pixels.width, pixels.height)?
+        }
+    };
 
     let dpi = 300.0_f32;
     let world_x = node.bounds.x + node.transform.tx;
@@ -627,6 +659,97 @@ fn emit_raster(
     };
     pdf_image.add_to_layer(layer.clone(), transform);
     Ok(())
+}
+
+/// Build a printpdf `Image` from an RGBA pixel buffer, embedded as
+/// `/DeviceRGB`. The pixel buffer is re-encoded to PNG so
+/// printpdf can decode it through its `image_crate` re-export.
+fn raster_to_rgb_image(rgba: &[u8], width: u32, height: u32) -> Result<Image, PdfExportError> {
+    let mut png_bytes: Vec<u8> = Vec::new();
+    {
+        let mut cursor = std::io::Cursor::new(&mut png_bytes);
+        image::write_buffer_with_format(
+            &mut cursor,
+            rgba,
+            width,
+            height,
+            image::ColorType::Rgba8,
+            ImageFormat::Png,
+        )
+        .map_err(|e| PdfExportError::Image(e.to_string()))?;
+    }
+    let dyn_img = printpdf::image_crate::load_from_memory(&png_bytes)
+        .map_err(|e| PdfExportError::Image(e.to_string()))?;
+    Ok(Image::from_dynamic_image(&dyn_img))
+}
+
+/// Build a printpdf `Image` from an RGBA pixel buffer, embedded as
+/// `/DeviceCMYK`. Each input pixel is converted from sRGB to CMYK
+/// via [`kcreate_core::color::srgb_to_cmyk`]; transparency is
+/// matted against a white paper background ("straight alpha over
+/// white") because PDF's `/DeviceCMYK` color space has no native
+/// alpha channel and a soft mask would still be interpreted as a
+/// transparency group against whatever is below the image on the
+/// page (typically white paper anyway).
+///
+/// This is a lossy conversion — the alpha channel is permanently
+/// folded into the CMYK values. Callers who need to preserve
+/// transparency through to the print shop should keep the raster
+/// in RGB mode and let the RIP handle the CMYK conversion with a
+/// device-specific profile.
+fn raster_to_cmyk_image(rgba: &[u8], width: u32, height: u32) -> Result<Image, PdfExportError> {
+    let pixel_count = (width as usize)
+        .checked_mul(height as usize)
+        .ok_or_else(|| PdfExportError::Image("raster dimensions overflow usize".into()))?;
+    if rgba.len() < pixel_count * 4 {
+        return Err(PdfExportError::Image(format!(
+            "raster buffer is {} bytes; expected at least {} (4 * w * h)",
+            rgba.len(),
+            pixel_count * 4
+        )));
+    }
+    let mut cmyk_bytes: Vec<u8> = Vec::with_capacity(pixel_count * 4);
+    for px in rgba.chunks_exact(4).take(pixel_count) {
+        let r = f32::from(px[0]) / 255.0;
+        let g = f32::from(px[1]) / 255.0;
+        let b = f32::from(px[2]) / 255.0;
+        let a = f32::from(px[3]) / 255.0;
+        // Matte against white paper: out = a * fg + (1 - a) * white.
+        // White in linear sRGB is (1, 1, 1); blending in the gamma-
+        // encoded sRGB space is technically incorrect, but it
+        // matches what every printer driver on the planet does and
+        // avoids a full sRGB→linear→matte→sRGB round-trip per pixel.
+        let r_m = a.mul_add(r, 1.0 - a);
+        let g_m = a.mul_add(g, 1.0 - a);
+        let b_m = a.mul_add(b, 1.0 - a);
+        let (c, m, y, k) = srgb_to_cmyk(r_m, g_m, b_m);
+        cmyk_bytes.push(quantize_u8(c));
+        cmyk_bytes.push(quantize_u8(m));
+        cmyk_bytes.push(quantize_u8(y));
+        cmyk_bytes.push(quantize_u8(k));
+    }
+    let xobject = ImageXObject {
+        width: Px(width as usize),
+        height: Px(height as usize),
+        color_space: ColorSpace::Cmyk,
+        bits_per_component: ColorBits::Bit8,
+        interpolate: true,
+        image_data: cmyk_bytes,
+        image_filter: None,
+        smask: None,
+        clipping_bbox: None,
+    };
+    Ok(Image::from(xobject))
+}
+
+/// Quantise a `[0.0, 1.0]` float to a `[0, 255]` byte with
+/// clamp-to-finite semantics. NaN / infinity inputs map to 0,
+/// matching the rest of the export code.
+fn quantize_u8(v: f32) -> u8 {
+    if !v.is_finite() {
+        return 0;
+    }
+    (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8
 }
 
 fn world_to_pdf(
@@ -962,5 +1085,244 @@ mod tests {
         });
         let resolved = resolve_fill_color(&node).expect("visible fill resolves");
         assert!((resolved.alpha() - 0.25).abs() < 1e-6);
+    }
+
+    #[test]
+    fn resolve_fill_drops_gradient_without_override() {
+        // The pre-PR behaviour, kept verbatim: a gradient without
+        // an explicit `color_override` is not exportable to PDF
+        // yet (no shading-pattern API in printpdf 0.7).
+        use kcreate_core::node::{GradientKind, GradientStop, Point2D, RgbaColor};
+        let node = vector_node_with_fill(FillStyle::Gradient(GradientKind::Linear {
+            from: Point2D { x: 0.0, y: 0.0 },
+            to: Point2D { x: 1.0, y: 0.0 },
+            stops: vec![
+                GradientStop {
+                    offset: 0.0,
+                    color: RgbaColor::new(1.0, 0.0, 0.0, 1.0),
+                },
+                GradientStop {
+                    offset: 1.0,
+                    color: RgbaColor::new(0.0, 0.0, 1.0, 1.0),
+                },
+            ],
+        }));
+        assert!(
+            resolve_fill_color(&node).is_none(),
+            "gradient without override remains unsupported"
+        );
+    }
+
+    #[test]
+    fn resolve_fill_uses_override_for_gradient_with_override() {
+        // Phase 2 PR #7 review finding #14: a gradient with a
+        // `color_override` was being silently dropped. Now we
+        // honour the override and emit a flat fill in that colour
+        // space, so the print shop sees the user's intent.
+        use kcreate_core::node::{GradientKind, GradientStop, Point2D, RgbaColor};
+        let mut node = vector_node_with_fill(FillStyle::Gradient(GradientKind::Linear {
+            from: Point2D { x: 0.0, y: 0.0 },
+            to: Point2D { x: 1.0, y: 0.0 },
+            stops: vec![
+                GradientStop {
+                    offset: 0.0,
+                    color: RgbaColor::new(1.0, 0.0, 0.0, 1.0),
+                },
+                GradientStop {
+                    offset: 1.0,
+                    color: RgbaColor::new(0.0, 0.0, 1.0, 1.0),
+                },
+            ],
+        }));
+        node.style.color_override = Some(Color::Cmyk {
+            c: 0.5,
+            m: 0.25,
+            y: 0.1,
+            k: 0.05,
+            a: 1.0,
+        });
+        let resolved = resolve_fill_color(&node).expect("override resolves through gradient");
+        match resolved {
+            Color::Cmyk { c, m, y, k, a } => {
+                assert!((c - 0.5).abs() < 1e-6);
+                assert!((m - 0.25).abs() < 1e-6);
+                assert!((y - 0.1).abs() < 1e-6);
+                assert!((k - 0.05).abs() < 1e-6);
+                assert!((a - 1.0).abs() < 1e-6);
+            }
+            other => panic!("expected Cmyk, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_fill_drops_gradient_with_zero_alpha_stops_even_with_override() {
+        // A gradient whose stops are all fully transparent is
+        // invisible on the canvas; the override does not change
+        // that.
+        use kcreate_core::node::{GradientKind, GradientStop, Point2D, RgbaColor};
+        let mut node = vector_node_with_fill(FillStyle::Gradient(GradientKind::Linear {
+            from: Point2D { x: 0.0, y: 0.0 },
+            to: Point2D { x: 1.0, y: 0.0 },
+            stops: vec![
+                GradientStop {
+                    offset: 0.0,
+                    color: RgbaColor::new(1.0, 0.0, 0.0, 0.0),
+                },
+                GradientStop {
+                    offset: 1.0,
+                    color: RgbaColor::new(0.0, 0.0, 1.0, 0.0),
+                },
+            ],
+        }));
+        node.style.color_override = Some(Color::Cmyk {
+            c: 0.5,
+            m: 0.25,
+            y: 0.1,
+            k: 0.05,
+            a: 1.0,
+        });
+        assert!(
+            resolve_fill_color(&node).is_none(),
+            "zero-alpha gradient must not become visible via override"
+        );
+    }
+
+    /// 2×2 red-square RGBA buffer for the raster-mode tests.
+    fn red_2x2_rgba() -> Vec<u8> {
+        let mut buf = Vec::with_capacity(2 * 2 * 4);
+        for _ in 0..(2 * 2) {
+            buf.extend_from_slice(&[255, 0, 0, 255]);
+        }
+        buf
+    }
+
+    fn doc_with_raster_blob() -> (DocumentGraph, RasterPixelCache) {
+        let mut doc = DocumentGraph::new();
+        let page = doc.insert_node(Node::new(NodeType::Page, "Page")).unwrap();
+        let mut node = Node::new(NodeType::RasterLayer, "raster");
+        node.parent_id = Some(page);
+        node.bounds = Bounds {
+            x: 0.0,
+            y: 0.0,
+            width: 100.0,
+            height: 100.0,
+        };
+        node.metadata.insert(
+            RASTER_IMAGE_METADATA_KEY.to_string(),
+            serde_json::json!({
+                "blob_hash": "deadbeef",
+                "width": 2,
+                "height": 2,
+            }),
+        );
+        doc.insert_node(node).unwrap();
+        let mut cache = RasterPixelCache::new();
+        cache.insert(
+            "deadbeef".to_string(),
+            RasterPixels {
+                width: 2,
+                height: 2,
+                rgba: red_2x2_rgba(),
+            },
+        );
+        (doc, cache)
+    }
+
+    #[test]
+    fn pdf_export_rgb_mode_embeds_raster_as_devicergb() {
+        let (doc, rasters) = doc_with_raster_blob();
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let opts = PdfExportOptions::default();
+        export_pdf_from_document(&doc, &opts, &rasters, tmp.path()).unwrap();
+        let written = std::fs::read(tmp.path()).unwrap();
+        // The image XObject's color space is part of the structural
+        // dictionary, not the content stream, so we scrub the raw
+        // PDF bytes for the `/DeviceRGB` token.
+        let blob = String::from_utf8_lossy(&written);
+        assert!(
+            blob.contains("/DeviceRGB"),
+            "RGB mode must embed raster as /DeviceRGB"
+        );
+        assert!(
+            !blob.contains("/DeviceCMYK"),
+            "RGB mode must NOT embed raster as /DeviceCMYK; got {blob:?}"
+        );
+    }
+
+    #[test]
+    fn pdf_export_cmyk_mode_embeds_raster_as_devicecmyk() {
+        let (doc, rasters) = doc_with_raster_blob();
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let opts = PdfExportOptions {
+            color_mode: PdfColorMode::Cmyk,
+            ..PdfExportOptions::default()
+        };
+        export_pdf_from_document(&doc, &opts, &rasters, tmp.path()).unwrap();
+        let written = std::fs::read(tmp.path()).unwrap();
+        let blob = String::from_utf8_lossy(&written);
+        assert!(
+            blob.contains("/DeviceCMYK"),
+            "CMYK mode must embed raster as /DeviceCMYK"
+        );
+    }
+
+    #[test]
+    fn raster_to_cmyk_image_red_converts_to_full_magenta_yellow() {
+        // sRGB red (255, 0, 0, 255) → CMYK (0, 1, 1, 0). The
+        // quantised CMYK byte stream should therefore be
+        // [0, 255, 255, 0] per pixel.
+        let buf = red_2x2_rgba();
+        let img = raster_to_cmyk_image(&buf, 2, 2).expect("conversion succeeds");
+        assert!(
+            matches!(img.image.color_space, ColorSpace::Cmyk),
+            "expected ColorSpace::Cmyk, got {:?}",
+            img.image.color_space
+        );
+        assert_eq!(img.image.image_data.len(), 2 * 2 * 4);
+        for chunk in img.image.image_data.chunks_exact(4) {
+            assert_eq!(chunk[0], 0, "C channel for red should be 0");
+            assert_eq!(chunk[1], 255, "M channel for red should be 255");
+            assert_eq!(chunk[2], 255, "Y channel for red should be 255");
+            assert_eq!(chunk[3], 0, "K channel for red should be 0");
+        }
+    }
+
+    #[test]
+    fn raster_to_cmyk_image_transparent_pixel_mattes_to_white() {
+        // A fully transparent pixel mattes against white paper, which
+        // is zero ink in CMYK.
+        let buf = vec![255, 0, 0, 0, 0, 0, 0, 0];
+        let img = raster_to_cmyk_image(&buf, 2, 1).expect("conversion succeeds");
+        let pixels: Vec<&[u8]> = img.image.image_data.chunks_exact(4).collect();
+        for px in &pixels {
+            assert_eq!(px[..], [0, 0, 0, 0], "transparent → no ink");
+        }
+    }
+
+    #[test]
+    fn raster_to_cmyk_image_rejects_buffer_too_short() {
+        // 2×2 should be 16 bytes; pass 12 to ensure the bounds check
+        // catches the underflow before the unchecked slice indexing.
+        let buf = vec![0u8; 12];
+        let err =
+            raster_to_cmyk_image(&buf, 2, 2).expect_err("undersized buffer should be rejected");
+        match err {
+            PdfExportError::Image(msg) => assert!(
+                msg.contains("expected at least"),
+                "unexpected message: {msg}"
+            ),
+            other => panic!("expected Image error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn quantize_u8_handles_finite_range_and_nan() {
+        assert_eq!(quantize_u8(0.0), 0);
+        assert_eq!(quantize_u8(1.0), 255);
+        assert_eq!(quantize_u8(0.5), 128);
+        assert_eq!(quantize_u8(-0.1), 0);
+        assert_eq!(quantize_u8(2.0), 255);
+        assert_eq!(quantize_u8(f32::NAN), 0);
+        assert_eq!(quantize_u8(f32::INFINITY), 0);
     }
 }

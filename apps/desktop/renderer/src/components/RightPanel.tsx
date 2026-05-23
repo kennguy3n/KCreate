@@ -5,6 +5,7 @@ import type {
   GridLayout,
   InspectCode,
   NodeInfo,
+  ProjectInfo,
   UpdateNodeProps,
 } from "../../../shared/scene";
 import { colors, radius, spacing } from "../styles/tokens";
@@ -13,6 +14,7 @@ import { ColorSettingsPanel } from "./ColorSettingsPanel";
 import { InteractionPanel } from "./InteractionPanel";
 import { OpenTypePanel } from "./OpenTypePanel";
 import { PreflightPanel } from "./PreflightPanel";
+import { PresencePanel } from "./PresencePanel";
 import { TextFramePanel } from "./TextFramePanel";
 
 export type RightPanelTab =
@@ -25,7 +27,8 @@ export type RightPanelTab =
   | "accessibility"
   | "interaction"
   | "preflight"
-  | "color";
+  | "color"
+  | "presence";
 
 /// Tabs shown by default. Some tabs (Accessibility, Interaction) only
 /// appear when the active editor mode calls for them — gated below.
@@ -75,6 +78,12 @@ export interface RightPanelProps {
   tree?: NodeInfo[];
   /** Trigger after Interaction add/remove so the host can refresh state. */
   onInteractionsChanged?: () => void;
+  /**
+   * Active project, used by the Phase 3 Presence tab. When `null`,
+   * the Presence tab still shows (the user can edit display name)
+   * but the "Start session" button is disabled.
+   */
+  project?: ProjectInfo | null;
 }
 
 export function RightPanel({
@@ -88,6 +97,7 @@ export function RightPanel({
   artboards,
   tree,
   onInteractionsChanged,
+  project,
 }: RightPanelProps): JSX.Element {
   const showAccessibility = mode === "design" || mode === "inspect";
   const showInteraction = mode === "prototype";
@@ -117,6 +127,7 @@ export function RightPanel({
         ? [{ id: "preflight" as const, label: "Preflight" }]
         : []),
       ...(showColor ? [{ id: "color" as const, label: "Color" }] : []),
+      { id: "presence" as const, label: "Presence" },
     ],
     [showAccessibility, showInteraction, showPreflight, showColor],
   );
@@ -227,6 +238,9 @@ export function RightPanel({
         ) : null}
         {tab === "color" && showColor ? (
           <ColorSettingsPanel onStatus={onStatus} />
+        ) : null}
+        {tab === "presence" ? (
+          <PresencePanel project={project ?? null} onStatus={onStatus} />
         ) : null}
       </div>
     </aside>

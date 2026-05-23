@@ -11,6 +11,7 @@ import {
   type IpcMainInvokeEvent,
 } from "electron";
 import * as fs from "node:fs/promises";
+import { realpathSync } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
@@ -416,7 +417,37 @@ function resolveJsPanelEntry(pluginId: string): string | null {
   }
   const entry = list.find((p) => p.id === pluginId);
   if (!entry) return null;
-  return path.join(pluginRoot(), pluginId, entry.config.entry_html);
+  // The Rust manifest validator already runs `ensure_path_within` on
+  // `entry_html` at registration time (see
+  // `crates/kcreate_plugin/src/manifest.rs::validate_against_dir`),
+  // so a path-traversal `entry_html` would have been rejected before
+  // the plugin was ever listed here. We re-check with a `realpath`
+  // containment test for defence-in-depth: if the on-disk plugin
+  // directory was tampered with between registration and now (e.g.
+  // someone symlinked the panel.html to /etc/passwd while the editor
+  // was running), we still refuse to `file://`-load anything outside
+  // the plugin root.
+  const candidate = path.join(pluginRoot(), pluginId, entry.config.entry_html);
+  const pluginDirAbs = path.resolve(pluginRoot(), pluginId);
+  let resolvedCandidate: string;
+  let resolvedRoot: string;
+  try {
+    resolvedCandidate = realpathSync(candidate);
+    resolvedRoot = realpathSync(pluginDirAbs);
+  } catch {
+    // Either the file or the plugin directory doesn't exist; refuse
+    // to load. Returning `null` propagates as "plugin not found" up
+    // to `openJsPanel`, which is the right user-facing error.
+    return null;
+  }
+  // `relative` returns "" or a non-`..`-prefixed string when the
+  // candidate is inside the root; anything else means the symlink
+  // walk escaped the plugin sandbox.
+  const rel = path.relative(resolvedRoot, resolvedCandidate);
+  if (rel.startsWith("..") || path.isAbsolute(rel)) {
+    return null;
+  }
+  return resolvedCandidate;
 }
 
 function destroyJsPanel(pluginId: string): void {
@@ -549,6 +580,19 @@ function pluginIdForSender(event: IpcMainInvokeEvent): string | null {
   return webContentsIdToPluginId.get(event.sender.id) ?? null;
 }
 
+/// Returns `true` iff the IPC sender is the main editor renderer
+/// (i.e. our top-level BrowserWindow). Used as a defence-in-depth
+/// guard on the *trusted* JS-panel IPC channels: even though the
+/// main renderer is the only one with `window.kcreate.*` exposed,
+/// a sandbox-bypass in some future Electron release should not be
+/// able to call into `pluginJsMessage` on behalf of another plugin
+/// from inside a panel's WebContents.
+function isMainRendererSender(event: IpcMainInvokeEvent): boolean {
+  const win = mainWindow;
+  if (!win || win.isDestroyed()) return false;
+  return event.sender.id === win.webContents.id;
+}
+
 /// Push-broadcast a "color settings changed" event to the main
 /// renderer. Phase 2 ships a single mainWindow but we still gate on
 /// destruction so a late-firing handler doesn't crash during quit.
@@ -564,6 +608,82 @@ function broadcastColorSettingsChanged(): void {
   const win = mainWindow;
   if (!win || win.isDestroyed()) return;
   win.webContents.send("kcreate/color/settings/changed");
+}
+
+/// Period (ms) for the Phase 3 collab event-drain timer. Balances
+/// "remote cursors feel responsive" (smaller is better) against
+/// "we don't waste a workspace lock + IPC round-trip when nothing
+/// is happening" (larger is better). 50ms gives 20Hz cursor
+/// updates, which matches WebSocket-based collab tools (Figma /
+/// Miro use 30–60Hz).
+const SESSION_EVENT_TICK_MS = 50;
+
+/// Process-wide handle for the session event-drain timer. `null`
+/// when no session is running; rest of the code reads `null` as
+/// "tick is stopped" and avoids the bridge call entirely.
+let sessionEventTickHandle: NodeJS.Timeout | null = null;
+
+function startSessionEventTick(): void {
+  if (sessionEventTickHandle !== null) return;
+  sessionEventTickHandle = setInterval(() => {
+    drainSessionEvents();
+  }, SESSION_EVENT_TICK_MS);
+  // Unref so the timer never holds Electron in the event loop on
+  // its own — quit() should not have to remember to stop it.
+  sessionEventTickHandle.unref();
+}
+
+function stopSessionEventTick(): void {
+  if (sessionEventTickHandle === null) return;
+  clearInterval(sessionEventTickHandle);
+  sessionEventTickHandle = null;
+}
+
+/// Drain pending session events from the bridge and forward each
+/// entry to the renderer. If any event is a presence/peer update,
+/// re-publish the scene so the cursor overlay refreshes
+/// (`sync_scene_locked` in the bridge appends remote cursors to
+/// every scene it builds).
+///
+/// Quiet on error: the most likely failures are "no session is
+/// running" (race with `session_leave`) and "bridge not yet
+/// loaded" — both safe to ignore at tick rate.
+function drainSessionEvents(): void {
+  const win = mainWindow;
+  if (!win || win.isDestroyed()) return;
+  let payload: string;
+  try {
+    payload = requireBridge().sessionDrainEvents();
+  } catch {
+    // Session was torn down between ticks; nothing to forward.
+    return;
+  }
+  let parsed: Array<{ kind: string }>;
+  try {
+    parsed = JSON.parse(payload) as Array<{ kind: string }>;
+  } catch {
+    return;
+  }
+  if (parsed.length === 0) return;
+  let needsRender = false;
+  for (const ev of parsed) {
+    win.webContents.send("kcreate/session/event", JSON.stringify(ev));
+    if (
+      ev.kind === "presenceUpdated" ||
+      ev.kind === "peerLeft" ||
+      ev.kind === "peerJoined"
+    ) {
+      needsRender = true;
+    }
+  }
+  if (needsRender) {
+    try {
+      requireBridge().documentRequestRender();
+    } catch {
+      // No project loaded yet, or renderer not initialised. Both
+      // are no-ops as far as the cursor overlay is concerned.
+    }
+  }
 }
 
 function registerIpcHandlers(): void {
@@ -1351,12 +1471,12 @@ function registerIpcHandlers(): void {
   });
   // `kcreate/plugin/js/message` is the *trusted* JS-panel IPC: the
   // caller passes `(pluginId, messageJson)` directly and we forward
-  // both to the bridge without sender validation. This is intentional
-  // — only the main renderer's preload owns the `window.kcreate.plugin.jsMessage`
-  // surface, and the main renderer already has full bridge access
-  // (it can call `pluginExecuteWithContext`, mutate the document,
-  // etc.), so demanding sender validation here would be defence-in-
-  // depth-against-yourself.
+  // both to the bridge. Only the main editor renderer is allowed to
+  // call it — defence-in-depth against a sandbox-bypass in a JS panel
+  // WebContents that might otherwise claim to be any pluginId. The
+  // main renderer already has full bridge access (it can call
+  // `pluginExecuteWithContext`, mutate the document, etc.), so the
+  // check here is purely a sender-attestation gate.
   //
   // The *untrusted* path — messages originating from inside a sandboxed
   // panel — goes through `kcreate/plugin/js/panel/send` below, which
@@ -1364,8 +1484,20 @@ function registerIpcHandlers(): void {
   // another plugin even if it tampers with its own postMessage payload.
   ipcMain.handle(
     "kcreate/plugin/js/message",
-    (_e, pluginId: string, messageJson: string) =>
-      requireBridge().pluginJsMessage(pluginId, messageJson),
+    (event: IpcMainInvokeEvent, pluginId: string, messageJson: string) => {
+      if (!isMainRendererSender(event)) {
+        // A JS panel's preload should never reach this channel; if it
+        // does, the panel is either misconfigured or attempting to
+        // impersonate the main renderer. Return a `status: invalid`
+        // envelope rather than throw — that matches the panel/send
+        // contract on the renderer side.
+        return JSON.stringify({
+          status: "invalid",
+          reason: "channel is only callable from the main editor renderer",
+        });
+      }
+      return requireBridge().pluginJsMessage(pluginId, messageJson);
+    },
   );
   ipcMain.handle(
     "kcreate/plugin/js/open",
@@ -1468,6 +1600,84 @@ function registerIpcHandlers(): void {
       requireBridge().textOpentypeFeaturesUpdate(nodeId, featuresJson);
     },
   );
+
+  // ---------------------------------------------------------------------
+  // Phase 3 — LAN collaboration session
+  //
+  // The bridge exposes seven entry points
+  // (`session_{start,leave,join,peers,drain_events,send_presence,info}`)
+  // plus `document_request_render` for the cursor-overlay refresh
+  // path. The main process plumbs them all through `kcreate/session/*`
+  // channels; the renderer subscribes to a single push channel
+  // (`kcreate/session/event`) for live updates.
+  //
+  // We start a 50ms timer when the first `start` succeeds and stop
+  // it on `leave`. The timer polls `sessionDrainEvents`, fans the
+  // resulting JSON event array out to the renderer, and — if any
+  // entry is a presence update — re-publishes the scene so remote
+  // cursors animate without waiting for a local document mutation.
+  // ---------------------------------------------------------------------
+  ipcMain.handle(
+    "kcreate/session/start",
+    (
+      _e,
+      seedB64: string,
+      displayName: string,
+      projectId: string,
+      advertiseMdns: boolean,
+    ) => {
+      const report = requireBridge().sessionStart(
+        seedB64,
+        displayName,
+        projectId,
+        advertiseMdns,
+      );
+      startSessionEventTick();
+      return report;
+    },
+  );
+  ipcMain.handle("kcreate/session/leave", () => {
+    stopSessionEventTick();
+    requireBridge().sessionLeave();
+  });
+  ipcMain.handle(
+    "kcreate/session/join",
+    (
+      _e,
+      peerId: string,
+      publicKey: string,
+      displayName: string,
+      socketAddr: string,
+      certFingerprintB64: string,
+    ) => {
+      requireBridge().sessionJoin(
+        peerId,
+        publicKey,
+        displayName,
+        socketAddr,
+        certFingerprintB64,
+      );
+    },
+  );
+  ipcMain.handle("kcreate/session/peers", () =>
+    requireBridge().sessionPeers(),
+  );
+  ipcMain.handle("kcreate/session/info", () => requireBridge().sessionInfo());
+  ipcMain.handle(
+    "kcreate/session/sendPresence",
+    (
+      _e,
+      activePage: string | null,
+      selectionJson: string,
+      cursorJson: string | null,
+    ) => {
+      requireBridge().sessionSendPresence(
+        activePage,
+        selectionJson,
+        cursorJson,
+      );
+    },
+  );
 }
 
 void app.whenReady().then(() => {
@@ -1531,6 +1741,28 @@ app.on("will-quit", (event) => {
       if (ownedScratchPath !== null) {
         await removeScratchLockfile(ownedScratchPath);
         ownedScratchPath = null;
+      }
+      // Tear down any live collab session BEFORE projectClose /
+      // rendererShutdown. The order matters:
+      //   1. Stop the event-tick timer so we don't race the bridge
+      //      drain against the leave path.
+      //   2. Call sessionLeave so peers receive a Goodbye on the
+      //      live QUIC connection (otherwise they wait ~30 s for the
+      //      QUIC idle timeout — see kcreate_collab_transport/host.rs)
+      //      and the runtime's mDNS responder is dropped cleanly.
+      //   3. Then close the project + shut the renderer down as
+      //      before.
+      // All three wrapped in try so a bug in the leave path can't
+      // block app quit. sessionLeave throws when no session is
+      // running, which is the common case (most users quit without
+      // a live session), so swallowing the throw is correct.
+      stopSessionEventTick();
+      if (bridge) {
+        try {
+          bridge.sessionLeave();
+        } catch {
+          // No session was running — nothing to leave.
+        }
       }
       if (bridge) {
         // `projectClose` is sync and infallible (it just drops the

@@ -1802,6 +1802,116 @@ export interface TextFrameBridge {
   ): Promise<void>;
 }
 
+// ---------------------------------------------------------------------------
+// Phase 3 — LAN collaboration session.
+//
+// Mirrors the JSON shapes emitted by
+// `kcreate_bridge::collab::{SessionStartReport, SessionPeer,
+// SessionPresence, SessionCursor, SessionEvent}`. Field names are
+// `camelCase` because the Rust DTOs use `#[serde(rename_all =
+// "camelCase")]`. The `SessionEvent` discriminator follows
+// `#[serde(tag = "kind", rename_all = "camelCase")]` so the
+// `kind` field is the discriminator.
+// ---------------------------------------------------------------------------
+
+export interface SessionStartReport {
+  peerId: string;
+  publicKey: string;
+  displayName: string;
+  projectId: string;
+  localAddr: string;
+  certFingerprint: string;
+  advertiseMdns: boolean;
+}
+
+export interface SessionCursor {
+  x: number;
+  y: number;
+}
+
+export interface SessionPresence {
+  activePage: string | null;
+  selection: string[];
+  cursor: SessionCursor | null;
+  /// ISO-8601 datetime.
+  sentAt: string;
+}
+
+export interface SessionPeer {
+  peerId: string;
+  publicKey: string;
+  displayName: string;
+  presence: SessionPresence | null;
+}
+
+export type SessionEvent =
+  | {
+      kind: "discovered";
+      peerId: string;
+      publicKey: string;
+      displayName: string;
+      projectId: string;
+      socketAddr: string;
+      certFingerprint: string;
+    }
+  | { kind: "undiscovered"; peerId: string }
+  | {
+      kind: "peerJoined";
+      peerId: string;
+      publicKey: string;
+      displayName: string;
+    }
+  | { kind: "peerLeft"; peerId: string }
+  | {
+      kind: "presenceUpdated";
+      peerId: string;
+      presence: SessionPresence;
+    };
+
+export interface SessionBridge {
+  /// Start a local collab session. Returns the local peer's
+  /// identity + bind address + cert fingerprint so the renderer
+  /// can display a "share this with peers" UI. `seedB64` is the
+  /// persistent Ed25519 seed (base64url, 32 bytes); supply the
+  /// same value across sessions for stable peer identity.
+  start(
+    seedB64: string,
+    displayName: string,
+    projectId: string,
+    advertiseMdns: boolean,
+  ): Promise<SessionStartReport>;
+  /// Stop the running session. Idempotent.
+  leave(): Promise<void>;
+  /// Dial a known peer. Use the fields from a discovered-peer
+  /// `SessionEvent` (`peerId`, `publicKey`, `displayName`,
+  /// `socketAddr`, `certFingerprint`) or from a pasted peer link.
+  join(
+    peerId: string,
+    publicKey: string,
+    displayName: string,
+    socketAddr: string,
+    certFingerprintB64: string,
+  ): Promise<void>;
+  /// Snapshot of currently-connected peers + their latest
+  /// presence (cursor / selection / active page).
+  peers(): Promise<SessionPeer[]>;
+  /// Read the cached local-identity report, or `null` if no
+  /// session is running.
+  info(): Promise<SessionStartReport | null>;
+  /// Broadcast the local user's presence to every connected peer.
+  /// `cursor` is world-space coordinates; pass `null` when the
+  /// pointer has left the canvas.
+  sendPresence(
+    activePage: string | null,
+    selection: string[],
+    cursor: SessionCursor | null,
+  ): Promise<void>;
+  /// Subscribe to the push channel that fires when peers join /
+  /// leave / move their cursor. Returns an unsubscribe function.
+  /// The renderer is responsible for filtering by kind.
+  onEvent(callback: (event: SessionEvent) => void): () => void;
+}
+
 declare global {
   interface Window {
     kcreate: {
@@ -1831,6 +1941,7 @@ declare global {
       mcpPermission: McpPermissionBridge;
       color: ColorBridge;
       textFrame: TextFrameBridge;
+      session: SessionBridge;
     };
   }
 }

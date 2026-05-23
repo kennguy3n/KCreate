@@ -1256,6 +1256,7 @@ export function EditorPage({
             onInteractionsChanged={() => {
               void refreshTree();
             }}
+            project={project}
           />
         )}
       </div>

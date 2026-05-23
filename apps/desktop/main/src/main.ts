@@ -11,6 +11,7 @@ import {
   type IpcMainInvokeEvent,
 } from "electron";
 import * as fs from "node:fs/promises";
+import { realpathSync } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
@@ -416,7 +417,37 @@ function resolveJsPanelEntry(pluginId: string): string | null {
   }
   const entry = list.find((p) => p.id === pluginId);
   if (!entry) return null;
-  return path.join(pluginRoot(), pluginId, entry.config.entry_html);
+  // The Rust manifest validator already runs `ensure_path_within` on
+  // `entry_html` at registration time (see
+  // `crates/kcreate_plugin/src/manifest.rs::validate_against_dir`),
+  // so a path-traversal `entry_html` would have been rejected before
+  // the plugin was ever listed here. We re-check with a `realpath`
+  // containment test for defence-in-depth: if the on-disk plugin
+  // directory was tampered with between registration and now (e.g.
+  // someone symlinked the panel.html to /etc/passwd while the editor
+  // was running), we still refuse to `file://`-load anything outside
+  // the plugin root.
+  const candidate = path.join(pluginRoot(), pluginId, entry.config.entry_html);
+  const pluginDirAbs = path.resolve(pluginRoot(), pluginId);
+  let resolvedCandidate: string;
+  let resolvedRoot: string;
+  try {
+    resolvedCandidate = realpathSync(candidate);
+    resolvedRoot = realpathSync(pluginDirAbs);
+  } catch {
+    // Either the file or the plugin directory doesn't exist; refuse
+    // to load. Returning `null` propagates as "plugin not found" up
+    // to `openJsPanel`, which is the right user-facing error.
+    return null;
+  }
+  // `relative` returns "" or a non-`..`-prefixed string when the
+  // candidate is inside the root; anything else means the symlink
+  // walk escaped the plugin sandbox.
+  const rel = path.relative(resolvedRoot, resolvedCandidate);
+  if (rel.startsWith("..") || path.isAbsolute(rel)) {
+    return null;
+  }
+  return resolvedCandidate;
 }
 
 function destroyJsPanel(pluginId: string): void {
@@ -547,6 +578,19 @@ function openJsPanel(pluginId: string, bounds: JsPanelBounds): void {
 /// WebContents and should be rejected.
 function pluginIdForSender(event: IpcMainInvokeEvent): string | null {
   return webContentsIdToPluginId.get(event.sender.id) ?? null;
+}
+
+/// Returns `true` iff the IPC sender is the main editor renderer
+/// (i.e. our top-level BrowserWindow). Used as a defence-in-depth
+/// guard on the *trusted* JS-panel IPC channels: even though the
+/// main renderer is the only one with `window.kcreate.*` exposed,
+/// a sandbox-bypass in some future Electron release should not be
+/// able to call into `pluginJsMessage` on behalf of another plugin
+/// from inside a panel's WebContents.
+function isMainRendererSender(event: IpcMainInvokeEvent): boolean {
+  const win = mainWindow;
+  if (!win || win.isDestroyed()) return false;
+  return event.sender.id === win.webContents.id;
 }
 
 /// Push-broadcast a "color settings changed" event to the main
@@ -1427,12 +1471,12 @@ function registerIpcHandlers(): void {
   });
   // `kcreate/plugin/js/message` is the *trusted* JS-panel IPC: the
   // caller passes `(pluginId, messageJson)` directly and we forward
-  // both to the bridge without sender validation. This is intentional
-  // — only the main renderer's preload owns the `window.kcreate.plugin.jsMessage`
-  // surface, and the main renderer already has full bridge access
-  // (it can call `pluginExecuteWithContext`, mutate the document,
-  // etc.), so demanding sender validation here would be defence-in-
-  // depth-against-yourself.
+  // both to the bridge. Only the main editor renderer is allowed to
+  // call it — defence-in-depth against a sandbox-bypass in a JS panel
+  // WebContents that might otherwise claim to be any pluginId. The
+  // main renderer already has full bridge access (it can call
+  // `pluginExecuteWithContext`, mutate the document, etc.), so the
+  // check here is purely a sender-attestation gate.
   //
   // The *untrusted* path — messages originating from inside a sandboxed
   // panel — goes through `kcreate/plugin/js/panel/send` below, which
@@ -1440,8 +1484,20 @@ function registerIpcHandlers(): void {
   // another plugin even if it tampers with its own postMessage payload.
   ipcMain.handle(
     "kcreate/plugin/js/message",
-    (_e, pluginId: string, messageJson: string) =>
-      requireBridge().pluginJsMessage(pluginId, messageJson),
+    (event: IpcMainInvokeEvent, pluginId: string, messageJson: string) => {
+      if (!isMainRendererSender(event)) {
+        // A JS panel's preload should never reach this channel; if it
+        // does, the panel is either misconfigured or attempting to
+        // impersonate the main renderer. Return a `status: invalid`
+        // envelope rather than throw — that matches the panel/send
+        // contract on the renderer side.
+        return JSON.stringify({
+          status: "invalid",
+          reason: "channel is only callable from the main editor renderer",
+        });
+      }
+      return requireBridge().pluginJsMessage(pluginId, messageJson);
+    },
   );
   ipcMain.handle(
     "kcreate/plugin/js/open",

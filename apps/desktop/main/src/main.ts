@@ -1043,6 +1043,31 @@ function registerIpcHandlers(): void {
     (_e, fromJson: string, toSpace: string) =>
       requireBridge().colorConvert(fromJson, toSpace),
   );
+
+  // ---------------------------------------------------------------------
+  // Phase 2 — text frame + OpenType (Block B Task 11)
+  // ---------------------------------------------------------------------
+  ipcMain.handle("kcreate/text/frame/get", (_e, nodeId: string) =>
+    requireBridge().textFrameGet(nodeId),
+  );
+  ipcMain.handle(
+    "kcreate/text/frame/update",
+    (_e, nodeId: string, optionsJson: string) => {
+      requireBridge().textFrameUpdate(nodeId, optionsJson);
+    },
+  );
+  ipcMain.handle("kcreate/text/layout/compute", (_e, nodeId: string) =>
+    requireBridge().textLayoutCompute(nodeId),
+  );
+  ipcMain.handle("kcreate/text/opentype/get", (_e, nodeId: string) =>
+    requireBridge().textOpentypeFeaturesGet(nodeId),
+  );
+  ipcMain.handle(
+    "kcreate/text/opentype/update",
+    (_e, nodeId: string, featuresJson: string) => {
+      requireBridge().textOpentypeFeaturesUpdate(nodeId, featuresJson);
+    },
+  );
 }
 
 void app.whenReady().then(() => {

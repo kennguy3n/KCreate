@@ -327,6 +327,12 @@ export interface Bridge {
   colorSettingsGet(): string;
   colorSettingsUpdate(settingsJson: string): void;
   colorConvert(fromJson: string, toSpace: string): string;
+  // Phase 2 — text frame + OpenType (Block B Task 11).
+  textFrameGet(nodeId: string): string;
+  textFrameUpdate(nodeId: string, optionsJson: string): void;
+  textLayoutCompute(nodeId: string): string;
+  textOpentypeFeaturesGet(nodeId: string): string;
+  textOpentypeFeaturesUpdate(nodeId: string, featuresJson: string): void;
 }
 
 function bridgeBinaryPath(): string {

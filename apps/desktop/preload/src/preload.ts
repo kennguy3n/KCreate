@@ -87,6 +87,10 @@ import type {
   ColorSettings,
   ColorSpaceName,
   ColorValue,
+  TextFrameBridge,
+  TextFrameOptions,
+  OpenTypeFeatures,
+  TextLayoutWire,
 } from "../../shared/scene";
 
 type FrameInfoSnake = {
@@ -1219,6 +1223,56 @@ const color: ColorBridge = {
   },
 };
 
+// ---------------------------------------------------------------------------
+// Phase 2 — Text frame + OpenType (Block B Task 11).
+//
+// The bridge always speaks JSON over IPC for these calls — the renderer
+// must `JSON.parse` the responses and `JSON.stringify` outgoing options
+// before invoking. Doing the (de)serialisation here keeps callers
+// uniform with the rest of the `window.kcreate.*` surface.
+// ---------------------------------------------------------------------------
+
+const textFrame: TextFrameBridge = {
+  async get(nodeId: string): Promise<TextFrameOptions> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/text/frame/get",
+      nodeId,
+    )) as string;
+    return JSON.parse(raw) as TextFrameOptions;
+  },
+  async update(nodeId: string, options: TextFrameOptions): Promise<void> {
+    await ipcRenderer.invoke(
+      "kcreate/text/frame/update",
+      nodeId,
+      JSON.stringify(options),
+    );
+  },
+  async computeLayout(nodeId: string): Promise<TextLayoutWire> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/text/layout/compute",
+      nodeId,
+    )) as string;
+    return JSON.parse(raw) as TextLayoutWire;
+  },
+  async getOpenTypeFeatures(nodeId: string): Promise<OpenTypeFeatures> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/text/opentype/get",
+      nodeId,
+    )) as string;
+    return JSON.parse(raw) as OpenTypeFeatures;
+  },
+  async updateOpenTypeFeatures(
+    nodeId: string,
+    features: OpenTypeFeatures,
+  ): Promise<void> {
+    await ipcRenderer.invoke(
+      "kcreate/text/opentype/update",
+      nodeId,
+      JSON.stringify(features),
+    );
+  },
+};
+
 contextBridge.exposeInMainWorld("kcreate", {
   renderer,
   document,
@@ -1244,4 +1298,5 @@ contextBridge.exposeInMainWorld("kcreate", {
   plugin,
   mcpPermission,
   color,
+  textFrame,
 });

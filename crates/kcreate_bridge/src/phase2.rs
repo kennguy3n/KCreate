@@ -906,6 +906,268 @@ pub fn color_convert(from_json: &str, to_space: &str) -> Result<String> {
 }
 
 // -----------------------------------------------------------------------------
+// Text frame + OpenType bridge (Phase 2, Block B Task 11)
+// -----------------------------------------------------------------------------
+
+/// JSON describing the precomputed paragraph layout for a text node.
+/// Returned by [`text_layout_compute`] so the inspector / debug view
+/// can render line outlines and column boundaries without re-running
+/// the layout engine in TypeScript.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TextLayoutLineWire {
+    pub origin_x: f64,
+    pub baseline_y: f64,
+    pub width: f64,
+    pub column: u32,
+    pub glyph_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TextLayoutWire {
+    pub lines: Vec<TextLayoutLineWire>,
+    pub overflow: bool,
+    pub used_height: f64,
+}
+
+/// Read the `TextFrameOptions` metadata for a `TextLayer` node and
+/// return it as JSON. Returns the `Default` JSON (single column,
+/// no hyphenation, clip overflow, top-aligned, no inset, fixed
+/// size) when the node has no `text_frame` metadata yet — this is
+/// the documented behaviour of [`Node::text_frame_options`] and lets
+/// the UI mount the panel without needing to special-case freshly
+/// created text nodes.
+pub fn text_frame_get(node_id: Uuid) -> Result<String> {
+    let options = with_workspace(|ws| {
+        let node = ws
+            .project
+            .document
+            .get_node(node_id)
+            .ok_or(DocumentBridgeError::NodeNotFound(node_id))?;
+        if node.node_type != NodeType::TextLayer {
+            return Err(DocumentBridgeError::InvalidArgument {
+                argument: "node_id".into(),
+                value: format!("node {node_id} is not a TextLayer"),
+            });
+        }
+        Ok(node.text_frame_options())
+    })?;
+    Ok(serde_json::to_string(&options)?)
+}
+
+/// Replace the `TextFrameOptions` metadata for a `TextLayer` node and
+/// record an operation in the project's log.
+///
+/// The operation `command` is `"text_frame_update"`; `before_patch` /
+/// `after_patch` are the previous / new options JSON; `affected_nodes`
+/// contains the single node id so the renderer dispatcher can
+/// invalidate that node's cached layout. Like all phase-2 panel
+/// operations the actual undo wiring is host-driven: `document_undo`
+/// returns the popped operation and the renderer is expected to
+/// re-apply the `before_patch` via this function. The contract
+/// matches `color_settings_update`.
+pub fn text_frame_update(node_id: Uuid, options_json: &str) -> Result<()> {
+    use kcreate_core::node::TextFrameOptions;
+    let new_options: TextFrameOptions = serde_json::from_str(options_json)?;
+    with_workspace_mut(|ws| {
+        let node = ws
+            .project
+            .document
+            .get_node(node_id)
+            .ok_or(DocumentBridgeError::NodeNotFound(node_id))?;
+        if node.node_type != NodeType::TextLayer {
+            return Err(DocumentBridgeError::InvalidArgument {
+                argument: "node_id".into(),
+                value: format!("node {node_id} is not a TextLayer"),
+            });
+        }
+        let before = serde_json::to_value(node.text_frame_options())?;
+        let after = serde_json::to_value(&new_options)?;
+        let node_mut = ws
+            .project
+            .document
+            .get_node_mut(node_id)
+            .ok_or(DocumentBridgeError::NodeNotFound(node_id))?;
+        node_mut.set_text_frame_options(&new_options);
+        let op = Operation::new("user", "text_frame_update", before, after, vec![node_id]);
+        ws.project.execute_operation(op);
+        Ok(())
+    })?;
+    sync_scene_after_change();
+    Ok(())
+}
+
+/// Compute the paragraph layout for a `TextLayer` node and return a
+/// JSON wire-format describing each line. The renderer uses
+/// [`kcreate_text::layout_paragraph`] for actual drawing; this entry
+/// point exists so the inspector / debug overlay can show line
+/// outlines and overflow without owning a font manager in TS.
+///
+/// Text is read from the node's `metadata["text"]` (string) and from
+/// the node's bounds. Style is read from `metadata["text_style"]`
+/// (mirroring the renderer's contract); missing fields fall back to
+/// `TextStyle::default()` so the UI never crashes on freshly created
+/// nodes that haven't had a style set yet.
+pub fn text_layout_compute(node_id: Uuid) -> Result<String> {
+    use kcreate_core::node::TextFrameOptions;
+    use kcreate_text::{layout_paragraph, HyphenationPatterns, TextStyle, EN_US_PATTERNS};
+
+    let (text, style, frame, bounds) = with_workspace(|ws| {
+        let node = ws
+            .project
+            .document
+            .get_node(node_id)
+            .ok_or(DocumentBridgeError::NodeNotFound(node_id))?;
+        if node.node_type != NodeType::TextLayer {
+            return Err(DocumentBridgeError::InvalidArgument {
+                argument: "node_id".into(),
+                value: format!("node {node_id} is not a TextLayer"),
+            });
+        }
+        let text = node
+            .metadata
+            .get("text")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let style: TextStyle = node
+            .metadata
+            .get("text_style")
+            .and_then(|v| serde_json::from_value::<TextStyleWire>(v.clone()).ok())
+            .map(TextStyle::from)
+            .unwrap_or_default();
+        let frame: TextFrameOptions = node.text_frame_options();
+        Ok((text, style, frame, node.bounds))
+    })?;
+
+    // Hyphenation patterns: only English ships embedded today.
+    // Languages other than English fall through to `None` (no
+    // hyphenation) until the project ships additional `.pat` files —
+    // matches the Task 8 design.
+    let patterns: Option<HyphenationPatterns> = if frame.hyphenation
+        && frame
+            .hyphenation_language
+            .to_lowercase()
+            .starts_with("en")
+    {
+        Some(HyphenationPatterns::from_tex_patterns(EN_US_PATTERNS))
+    } else {
+        None
+    };
+
+    let layout = layout_paragraph(&text, &style, &frame, bounds, patterns.as_ref())
+    .map_err(|e| DocumentBridgeError::InvalidArgument {
+        argument: "layout".into(),
+        value: e.to_string(),
+    })?;
+
+    let wire = TextLayoutWire {
+        lines: layout
+            .lines
+            .iter()
+            .map(|l| TextLayoutLineWire {
+                origin_x: l.origin_x,
+                baseline_y: l.baseline_y,
+                width: l.width,
+                column: l.column,
+                glyph_count: l.glyphs.len(),
+            })
+            .collect(),
+        overflow: layout.overflow,
+        used_height: layout.used_height,
+    };
+    Ok(serde_json::to_string(&wire)?)
+}
+
+/// Wire format for the renderer-side `TextStyle` carried in the
+/// `metadata["text_style"]` field. Mirrors
+/// [`kcreate_text::paragraph::TextStyle`] one-for-one but is owned
+/// here because the bridge crate is the wire-format boundary
+/// (rule 4 of AGENTS.md). Adding a field on either side requires
+/// adding it here too plus a test in `document.rs`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TextStyleWire {
+    font_family: String,
+    font_size: f32,
+    line_height: f64,
+}
+
+impl From<TextStyleWire> for kcreate_text::TextStyle {
+    fn from(w: TextStyleWire) -> Self {
+        Self {
+            font_family: w.font_family,
+            font_size: w.font_size,
+            line_height: w.line_height,
+        }
+    }
+}
+
+/// Read the `OpenTypeFeatures` metadata for a `TextLayer` node and
+/// return it as JSON. Returns the `Default` JSON (ligatures +
+/// contextual_alternates + kerning on, everything else off, no
+/// stylistic sets) when the node has no `opentype_features`
+/// metadata yet.
+pub fn text_opentype_features_get(node_id: Uuid) -> Result<String> {
+    let features = with_workspace(|ws| {
+        let node = ws
+            .project
+            .document
+            .get_node(node_id)
+            .ok_or(DocumentBridgeError::NodeNotFound(node_id))?;
+        if node.node_type != NodeType::TextLayer {
+            return Err(DocumentBridgeError::InvalidArgument {
+                argument: "node_id".into(),
+                value: format!("node {node_id} is not a TextLayer"),
+            });
+        }
+        Ok(node.opentype_features())
+    })?;
+    Ok(serde_json::to_string(&features)?)
+}
+
+/// Replace the `OpenTypeFeatures` metadata for a `TextLayer` node and
+/// record an operation. `command` is `"text_opentype_features_update"`;
+/// undo / scene-sync semantics mirror [`text_frame_update`].
+pub fn text_opentype_features_update(node_id: Uuid, features_json: &str) -> Result<()> {
+    use kcreate_core::node::OpenTypeFeatures;
+    let new_features: OpenTypeFeatures = serde_json::from_str(features_json)?;
+    with_workspace_mut(|ws| {
+        let node = ws
+            .project
+            .document
+            .get_node(node_id)
+            .ok_or(DocumentBridgeError::NodeNotFound(node_id))?;
+        if node.node_type != NodeType::TextLayer {
+            return Err(DocumentBridgeError::InvalidArgument {
+                argument: "node_id".into(),
+                value: format!("node {node_id} is not a TextLayer"),
+            });
+        }
+        let before = serde_json::to_value(node.opentype_features())?;
+        let after = serde_json::to_value(&new_features)?;
+        let node_mut = ws
+            .project
+            .document
+            .get_node_mut(node_id)
+            .ok_or(DocumentBridgeError::NodeNotFound(node_id))?;
+        node_mut.set_opentype_features(&new_features);
+        let op = Operation::new(
+            "user",
+            "text_opentype_features_update",
+            before,
+            after,
+            vec![node_id],
+        );
+        ws.project.execute_operation(op);
+        Ok(())
+    })?;
+    sync_scene_after_change();
+    Ok(())
+}
+
+// -----------------------------------------------------------------------------
 // Avoid unused warnings on disabled features
 // -----------------------------------------------------------------------------
 

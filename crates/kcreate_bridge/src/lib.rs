@@ -1717,3 +1717,52 @@ pub fn color_settings_update(settings_json: String) -> NapiResult<()> {
 pub fn color_convert(from_json: String, to_space: String) -> NapiResult<String> {
     phase2::color_convert(&from_json, &to_space).map_err(map_doc_err)
 }
+
+// ---------------------------------------------------------------------------
+// Phase 2 — text frame + OpenType (Block B Task 11)
+// ---------------------------------------------------------------------------
+
+/// Read the `TextFrameOptions` for a `TextLayer` node as JSON.
+///
+/// Returns the default options (single column, no hyphenation,
+/// clip overflow, top-aligned, no inset, fixed size) when the node
+/// has no `text_frame` metadata. Errors if the node id doesn't
+/// resolve or the node is not a `TextLayer`.
+#[napi]
+pub fn text_frame_get(node_id: String) -> NapiResult<String> {
+    let id = parse_uuid(&node_id)?;
+    phase2::text_frame_get(id).map_err(map_doc_err)
+}
+
+/// Replace the `TextFrameOptions` for a `TextLayer` node and record
+/// an undoable `text_frame_update` operation.
+#[napi]
+pub fn text_frame_update(node_id: String, options_json: String) -> NapiResult<()> {
+    let id = parse_uuid(&node_id)?;
+    phase2::text_frame_update(id, &options_json).map_err(map_doc_err)
+}
+
+/// Compute and return the paragraph layout for a `TextLayer` node
+/// as JSON (one entry per laid-out line with origin / baseline /
+/// width / column / glyph count plus an `overflow` flag and
+/// `usedHeight`). Pure read; does not record an operation.
+#[napi]
+pub fn text_layout_compute(node_id: String) -> NapiResult<String> {
+    let id = parse_uuid(&node_id)?;
+    phase2::text_layout_compute(id).map_err(map_doc_err)
+}
+
+/// Read the `OpenTypeFeatures` for a `TextLayer` node as JSON.
+#[napi]
+pub fn text_opentype_features_get(node_id: String) -> NapiResult<String> {
+    let id = parse_uuid(&node_id)?;
+    phase2::text_opentype_features_get(id).map_err(map_doc_err)
+}
+
+/// Replace the `OpenTypeFeatures` for a `TextLayer` node and record
+/// an undoable `text_opentype_features_update` operation.
+#[napi]
+pub fn text_opentype_features_update(node_id: String, features_json: String) -> NapiResult<()> {
+    let id = parse_uuid(&node_id)?;
+    phase2::text_opentype_features_update(id, &features_json).map_err(map_doc_err)
+}

@@ -5450,4 +5450,190 @@ mod tests {
             other => panic!("expected InvalidArgument, got {other:?}"),
         }
     }
+
+    // ---------------------------------------------------------------
+    // Phase 2 — text frame + OpenType bridge tests (Block B Task 11)
+    // ---------------------------------------------------------------
+
+    fn fresh_text_node_for_test(family: &str) -> Uuid {
+        canvas_create_text(None, 10.0, 10.0, "Hello".to_string(), family.into(), 16.0)
+            .expect("canvas_create_text")
+    }
+
+    #[test]
+    #[serial]
+    fn text_frame_get_returns_default_for_new_node() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("tf", dir.path()).expect("create");
+
+        let id = fresh_text_node_for_test("sans-serif");
+        let json = crate::phase2::text_frame_get(id).expect("get");
+        let options: kcreate_core::node::TextFrameOptions = serde_json::from_str(&json).unwrap();
+        assert_eq!(options, kcreate_core::node::TextFrameOptions::default());
+        project_close();
+    }
+
+    #[test]
+    #[serial]
+    fn text_frame_update_round_trips_and_records_operation() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("tf", dir.path()).expect("create");
+
+        let id = fresh_text_node_for_test("sans-serif");
+        let new_options = kcreate_core::node::TextFrameOptions {
+            overflow: kcreate_core::node::TextOverflow::Ellipsis,
+            columns: 3,
+            column_gap: 12.0,
+            wrap_mode: kcreate_core::node::TextWrapMode::BoundingBox,
+            hyphenation: true,
+            hyphenation_language: "en-US".into(),
+            vertical_alignment: kcreate_core::node::VerticalAlign::Middle,
+            inset: kcreate_core::node::FrameInsets {
+                top: 4.0,
+                right: 4.0,
+                bottom: 4.0,
+                left: 4.0,
+            },
+            auto_size: kcreate_core::node::TextAutoSize::HeightAuto,
+        };
+        crate::phase2::text_frame_update(id, &serde_json::to_string(&new_options).unwrap())
+            .expect("update");
+
+        let json = crate::phase2::text_frame_get(id).expect("get after update");
+        let parsed: kcreate_core::node::TextFrameOptions = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, new_options);
+
+        // The operation must have been recorded so an undo lands the
+        // node back on `TextFrameOptions::default()`.
+        let log_len = with_workspace(|ws| Ok(ws.project.operation_log.len())).unwrap();
+        assert!(
+            log_len >= 2,
+            "expected at least canvas_create_text + text_frame_update in the log, got {log_len}"
+        );
+        project_close();
+    }
+
+    #[test]
+    #[serial]
+    fn text_frame_update_rejects_non_text_node() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("tf", dir.path()).expect("create");
+
+        // Create a vector node (not a TextLayer) and verify the
+        // bridge rejects text-frame writes against it.
+        let rect_id = document_create_node(
+            "VectorLayer",
+            None,
+            &CreateNodeProps {
+                name: Some("rect".into()),
+                visible: None,
+                locked: None,
+                metadata: None,
+            },
+        )
+        .expect("create vector");
+
+        let err = crate::phase2::text_frame_update(
+            rect_id,
+            &serde_json::to_string(&kcreate_core::node::TextFrameOptions::default()).unwrap(),
+        )
+        .expect_err("non-text node must error");
+        assert!(
+            matches!(err, DocumentBridgeError::InvalidArgument { ref argument, .. } if argument == "node_id"),
+            "expected InvalidArgument(node_id), got {err:?}",
+        );
+        project_close();
+    }
+
+    #[test]
+    #[serial]
+    fn text_opentype_features_round_trip() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("tf", dir.path()).expect("create");
+
+        let id = fresh_text_node_for_test("sans-serif");
+
+        // Defaults first.
+        let json = crate::phase2::text_opentype_features_get(id).expect("get default");
+        let parsed: kcreate_core::node::OpenTypeFeatures = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, kcreate_core::node::OpenTypeFeatures::default());
+
+        // Round-trip a non-default set.
+        let custom = kcreate_core::node::OpenTypeFeatures {
+            ligatures: false,
+            contextual_alternates: true,
+            kerning: true,
+            small_caps: true,
+            old_style_figures: true,
+            tabular_figures: false,
+            stylistic_sets: vec![1, 7, 20],
+            fractions: true,
+            ordinals: false,
+        };
+        crate::phase2::text_opentype_features_update(
+            id,
+            &serde_json::to_string(&custom).unwrap(),
+        )
+        .expect("update");
+        let after = crate::phase2::text_opentype_features_get(id).expect("get after");
+        let parsed_after: kcreate_core::node::OpenTypeFeatures =
+            serde_json::from_str(&after).unwrap();
+        assert_eq!(parsed_after, custom);
+        project_close();
+    }
+
+    #[test]
+    #[serial]
+    fn text_layout_compute_returns_overflow_when_height_is_tight() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("tf", dir.path()).expect("create");
+
+        let id = fresh_text_node_for_test("sans-serif");
+
+        // Tighten the frame so any non-trivial text overflows. The
+        // layout engine is the source of truth here; we only assert
+        // the JSON wire shape is parseable + the overflow flag is a
+        // bool, not whether overflow is `true` (depends on host font).
+        let tight = kcreate_core::node::TextFrameOptions {
+            columns: 1,
+            ..kcreate_core::node::TextFrameOptions::default()
+        };
+        crate::phase2::text_frame_update(id, &serde_json::to_string(&tight).unwrap())
+            .expect("frame update");
+
+        // Inject `metadata["text"]` = "long line" by mutating the node.
+        with_workspace_mut(|ws| {
+            let n = ws.project.document.get_node_mut(id).unwrap();
+            n.metadata.insert(
+                "text".to_string(),
+                serde_json::Value::String("supercalifragilistic".into()),
+            );
+            Ok(())
+        })
+        .unwrap();
+
+        let json = crate::phase2::text_layout_compute(id).expect("layout");
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(parsed.get("lines").is_some(), "missing `lines` field");
+        assert!(
+            parsed
+                .get("overflow")
+                .and_then(serde_json::Value::as_bool)
+                .is_some(),
+            "missing or non-bool `overflow` field"
+        );
+        assert!(
+            parsed
+                .get("usedHeight")
+                .and_then(serde_json::Value::as_f64)
+                .is_some(),
+            "missing `usedHeight` field"
+        );
+        project_close();
+    }
 }

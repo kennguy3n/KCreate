@@ -1439,6 +1439,97 @@ export interface ColorBridge {
   convert(color: ColorValue, toSpace: ColorSpaceName): Promise<ColorValue>;
 }
 
+// ---------------------------------------------------------------------------
+// Phase 2 — Text frame + OpenType (Block B Tasks 7, 10, 11).
+//
+// The wire format mirrors `kcreate_core::node::TextFrameOptions`,
+// `kcreate_core::node::OpenTypeFeatures` and the `TextLayoutWire` JSON
+// returned by `phase2::text_layout_compute`. Adding a field on either
+// side requires adding it here too — rule 4 of AGENTS.md.
+// ---------------------------------------------------------------------------
+
+// All four enums use `#[serde(rename_all = "snake_case")]` on the Rust
+// side, so the wire values are lowercase / underscore-separated.
+export type TextOverflow = "clip" | "ellipsis" | "overflow";
+export type TextWrapMode = "none" | "bounding_box" | "contour";
+export type VerticalAlign = "top" | "middle" | "bottom";
+export type TextAutoSize = "fixed" | "height_auto" | "width_and_height_auto";
+
+/// Per-side text-frame inset, in document units (points by default).
+export interface FrameInsets {
+  top: number;
+  right: number;
+  bottom: number;
+  left: number;
+}
+
+export interface TextFrameOptions {
+  overflow: TextOverflow;
+  columns: number;
+  column_gap: number;
+  wrap_mode: TextWrapMode;
+  hyphenation: boolean;
+  /// BCP-47 language tag, e.g. `"en-US"`, `"de-DE"`. Hyphenation
+  /// patterns ship for `en-US` only; other languages fall through
+  /// to no-hyphenation until additional `.pat` files are bundled.
+  hyphenation_language: string;
+  vertical_alignment: VerticalAlign;
+  inset: FrameInsets;
+  auto_size: TextAutoSize;
+}
+
+/// OpenType feature toggles. `stylistic_sets` is a sparse list of
+/// 1..=20 indices (ss01..=ss20); other indices are silently dropped
+/// by the Rust encoder. See `kcreate_text::opentype_features_to_buzz`.
+export interface OpenTypeFeatures {
+  ligatures: boolean;
+  contextual_alternates: boolean;
+  kerning: boolean;
+  small_caps: boolean;
+  old_style_figures: boolean;
+  tabular_figures: boolean;
+  stylistic_sets: number[];
+  fractions: boolean;
+  ordinals: boolean;
+}
+
+/// One line of a paragraph layout. Wire payload returned by
+/// `text_layout_compute`. The renderer doesn't redraw glyphs from
+/// this — it's strictly for the inspector / debug overlay (line
+/// boundaries, column boundaries, overflow indication).
+export interface TextLayoutLineWire {
+  originX: number;
+  baselineY: number;
+  width: number;
+  column: number;
+  glyphCount: number;
+}
+
+export interface TextLayoutWire {
+  lines: TextLayoutLineWire[];
+  overflow: boolean;
+  usedHeight: number;
+}
+
+export interface TextFrameBridge {
+  /// Read the text-frame options for a `TextLayer` node.
+  get(nodeId: string): Promise<TextFrameOptions>;
+  /// Replace the text-frame options. Records an undoable
+  /// `text_frame_update` operation.
+  update(nodeId: string, options: TextFrameOptions): Promise<void>;
+  /// Compute the paragraph layout (line origins, baselines, columns,
+  /// overflow flag) without recording an operation.
+  computeLayout(nodeId: string): Promise<TextLayoutWire>;
+  /// Read the OpenType feature toggles for a `TextLayer` node.
+  getOpenTypeFeatures(nodeId: string): Promise<OpenTypeFeatures>;
+  /// Replace the OpenType feature toggles. Records an undoable
+  /// `text_opentype_features_update` operation.
+  updateOpenTypeFeatures(
+    nodeId: string,
+    features: OpenTypeFeatures,
+  ): Promise<void>;
+}
+
 declare global {
   interface Window {
     kcreate: {
@@ -1466,6 +1557,7 @@ declare global {
       plugin: PluginBridge;
       mcpPermission: McpPermissionBridge;
       color: ColorBridge;
+      textFrame: TextFrameBridge;
     };
   }
 }

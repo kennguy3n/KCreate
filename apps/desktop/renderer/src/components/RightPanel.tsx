@@ -11,7 +11,9 @@ import { colors, radius, spacing } from "../styles/tokens";
 import { AccessibilityPanel } from "./AccessibilityPanel";
 import { ColorSettingsPanel } from "./ColorSettingsPanel";
 import { InteractionPanel } from "./InteractionPanel";
+import { OpenTypePanel } from "./OpenTypePanel";
 import { PreflightPanel } from "./PreflightPanel";
+import { TextFramePanel } from "./TextFramePanel";
 
 export type RightPanelTab =
   | "properties"
@@ -174,6 +176,7 @@ export function RightPanel({
             node={selected}
             onChange={onChange}
             layout={layout}
+            onStatus={onStatus}
           />
         ) : null}
         {tab === "effects" ? (
@@ -234,10 +237,12 @@ function PropertiesPanel({
   node,
   onChange,
   layout,
+  onStatus,
 }: {
   node: NodeInfo | null;
   onChange?: (changes: UpdateNodeProps) => void;
   layout?: LayoutHandlers;
+  onStatus?: (msg: string | null) => void;
 }): JSX.Element {
   // We keep a local draft of the editable name so the user can type
   // freely without firing a bridge call on every keystroke. The
@@ -303,6 +308,14 @@ function PropertiesPanel({
         <Readonly>{node.children.length}</Readonly>
       </Field>
       {layout ? <LayoutControls node={node} layout={layout} /> : null}
+      {node.nodeType === "TextLayer" ? (
+        <>
+          <hr style={hrStyle} />
+          <TextFramePanel node={node} onStatus={onStatus} />
+          <hr style={hrStyle} />
+          <OpenTypePanel node={node} onStatus={onStatus} />
+        </>
+      ) : null}
     </div>
   );
 }

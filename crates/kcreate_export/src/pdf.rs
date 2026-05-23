@@ -72,24 +72,93 @@ impl Default for PdfExportOptions {
 }
 
 /// Resolve the authoritative fill color for a node, taking the
-/// optional [`NodeStyle::color_override`] into account. Returns
-/// `None` when the node has no fill (or fill alpha 0), in which
-/// case the caller should skip the fill operator entirely.
+/// optional [`NodeStyle::color_override`] into account.
+///
+/// The renderer always uses [`NodeStyle::fill`] as the source of
+/// truth for *whether* a node is painted (a `FillStyle::None` or a
+/// zero-alpha `Solid` produces no draw call). `color_override` only
+/// changes *what color* the fill is — it is an export-time color-
+/// space hint, not an "I am suddenly visible" toggle. The exporter
+/// must therefore key its visibility decision off `fill` and only
+/// substitute the override after that gate has passed; otherwise a
+/// node that was invisible on the canvas would silently appear in
+/// the printed PDF.
+///
+/// Returns `None` when the node has no visible fill, in which case
+/// the caller skips the fill operator entirely.
 fn resolve_fill_color(node: &Node) -> Option<Color> {
+    // 1. Decide visibility purely from `fill`. This must match the
+    //    renderer's painted/not-painted decision exactly.
+    let fill_alpha = match node.style.fill {
+        FillStyle::Solid(rgba) if rgba.a > 0.0 => rgba.a,
+        FillStyle::Solid(_) | FillStyle::None | FillStyle::Gradient(_) => return None,
+    };
+
+    // 2. Apply the override. The override is authored in its native
+    //    color space (CMYK, Lab, …) and is the canonical color value
+    //    for export. Its own alpha is preserved only when it is
+    //    strictly less than fully opaque — otherwise we keep the
+    //    `fill`'s alpha so partial-opacity from the renderer side
+    //    survives a CMYK override that defaulted to alpha=1.0.
     if let Some(over) = &node.style.color_override {
-        // The override carries its own alpha; we still respect the
-        // RGBA `fill`'s alpha if the override is opaque-by-default
-        // because alpha lives on the renderer-side fill in Phase 2.
-        return Some(over.clone());
+        return Some(merge_override_alpha(over.clone(), fill_alpha));
     }
-    match node.style.fill {
-        FillStyle::Solid(rgba) if rgba.a > 0.0 => Some(Color::Srgb {
-            r: rgba.r,
-            g: rgba.g,
-            b: rgba.b,
-            a: rgba.a,
-        }),
-        FillStyle::Solid(_) | FillStyle::None | FillStyle::Gradient(_) => None,
+
+    // 3. No override: pass the renderer's fill through as sRGB.
+    let FillStyle::Solid(rgba) = node.style.fill else {
+        // Unreachable because step 1 returned for every non-Solid
+        // variant, but kept exhaustive so a future variant doesn't
+        // silently fall through.
+        return None;
+    };
+    Some(Color::Srgb {
+        r: rgba.r,
+        g: rgba.g,
+        b: rgba.b,
+        a: rgba.a,
+    })
+}
+
+/// Stitch a renderer-side fill alpha onto an export-time
+/// `color_override`. If the override explicitly authored a
+/// less-than-opaque alpha we trust it; otherwise we use the
+/// renderer's value so changes the user made to the visual fill
+/// alpha still take effect in the exported PDF.
+fn merge_override_alpha(over: Color, fill_alpha: f32) -> Color {
+    let override_alpha = over.alpha();
+    let final_alpha = if override_alpha < 1.0 {
+        override_alpha
+    } else {
+        fill_alpha
+    };
+    match over {
+        Color::Srgb { r, g, b, .. } => Color::Srgb {
+            r,
+            g,
+            b,
+            a: final_alpha,
+        },
+        Color::Cmyk { c, m, y, k, .. } => Color::Cmyk {
+            c,
+            m,
+            y,
+            k,
+            a: final_alpha,
+        },
+        Color::Lab {
+            l, a_star, b_star, ..
+        } => Color::Lab {
+            l,
+            a_star,
+            b_star,
+            alpha: final_alpha,
+        },
+        Color::Hsl { h, s, l, .. } => Color::Hsl {
+            h,
+            s,
+            l,
+            a: final_alpha,
+        },
     }
 }
 
@@ -750,5 +819,134 @@ mod tests {
             stream.contains("1 0 0 0 k") || stream.contains("1.00 0.00 0.00 0.00 k"),
             "expected cyan-only CMYK coefficients, got {stream:?}"
         );
+    }
+
+    // -------------------------------------------------------------
+    // `resolve_fill_color` — visibility precedence (regression for the
+    // "override resurrects an invisible node" bug). The renderer's
+    // `fill` is the single source of truth for whether a node is
+    // painted; the override only changes *what color* gets emitted.
+    // -------------------------------------------------------------
+
+    fn vector_node_with_fill(fill: FillStyle) -> Node {
+        let rect = VectorPath::new(vec![
+            PathSegment::MoveTo(PathPoint::new(0.0, 0.0)),
+            PathSegment::LineTo(PathPoint::new(10.0, 0.0)),
+            PathSegment::LineTo(PathPoint::new(10.0, 10.0)),
+            PathSegment::LineTo(PathPoint::new(0.0, 10.0)),
+            PathSegment::Close,
+        ]);
+        let mut node = vector_node(&rect, 0.0, 0.0, 10.0, 10.0);
+        node.style.fill = fill;
+        node
+    }
+
+    #[test]
+    fn resolve_fill_returns_none_for_fillstyle_none_even_with_override() {
+        let mut node = vector_node_with_fill(FillStyle::None);
+        node.style.color_override = Some(Color::Cmyk {
+            c: 1.0,
+            m: 0.0,
+            y: 0.0,
+            k: 0.0,
+            a: 1.0,
+        });
+        assert!(
+            resolve_fill_color(&node).is_none(),
+            "`color_override` must not resurrect a `FillStyle::None` node"
+        );
+    }
+
+    #[test]
+    fn resolve_fill_returns_none_for_zero_alpha_fill_even_with_override() {
+        let mut node = vector_node_with_fill(FillStyle::Solid(kcreate_core::node::RgbaColor {
+            r: 1.0,
+            g: 0.0,
+            b: 0.0,
+            a: 0.0,
+        }));
+        node.style.color_override = Some(Color::Cmyk {
+            c: 1.0,
+            m: 0.0,
+            y: 0.0,
+            k: 0.0,
+            a: 1.0,
+        });
+        assert!(
+            resolve_fill_color(&node).is_none(),
+            "`color_override` must not resurrect a zero-alpha fill"
+        );
+    }
+
+    #[test]
+    fn resolve_fill_substitutes_override_when_fill_is_visible() {
+        let mut node = vector_node_with_fill(FillStyle::Solid(kcreate_core::node::RgbaColor {
+            r: 1.0,
+            g: 0.0,
+            b: 0.0,
+            a: 1.0,
+        }));
+        node.style.color_override = Some(Color::Cmyk {
+            c: 1.0,
+            m: 0.0,
+            y: 0.0,
+            k: 0.0,
+            a: 1.0,
+        });
+        let resolved = resolve_fill_color(&node).expect("visible fill resolves");
+        match resolved {
+            Color::Cmyk { c, m, y, k, .. } => {
+                assert!((c - 1.0).abs() < 1e-6);
+                assert!(m.abs() < 1e-6);
+                assert!(y.abs() < 1e-6);
+                assert!(k.abs() < 1e-6);
+            }
+            other => panic!("expected CMYK override, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_fill_keeps_fill_alpha_when_override_is_opaque() {
+        // If the renderer made the node 50% transparent and the user
+        // authored a CMYK override that defaulted to alpha=1.0, the
+        // exporter must honor the renderer's alpha — otherwise the
+        // PDF would render fully opaque while the canvas showed
+        // semi-transparent.
+        let mut node = vector_node_with_fill(FillStyle::Solid(kcreate_core::node::RgbaColor {
+            r: 1.0,
+            g: 0.0,
+            b: 0.0,
+            a: 0.5,
+        }));
+        node.style.color_override = Some(Color::Cmyk {
+            c: 1.0,
+            m: 0.0,
+            y: 0.0,
+            k: 0.0,
+            a: 1.0,
+        });
+        let resolved = resolve_fill_color(&node).expect("visible fill resolves");
+        assert!((resolved.alpha() - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn resolve_fill_keeps_override_alpha_when_authored() {
+        // Conversely, if the override carries its own < 1.0 alpha the
+        // author meant it — don't overwrite with the renderer side.
+        let mut node = vector_node_with_fill(FillStyle::Solid(kcreate_core::node::RgbaColor {
+            r: 1.0,
+            g: 0.0,
+            b: 0.0,
+            a: 1.0,
+        }));
+        node.style.color_override = Some(Color::Cmyk {
+            c: 1.0,
+            m: 0.0,
+            y: 0.0,
+            k: 0.0,
+            a: 0.25,
+        });
+        let resolved = resolve_fill_color(&node).expect("visible fill resolves");
+        assert!((resolved.alpha() - 0.25).abs() < 1e-6);
     }
 }

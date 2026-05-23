@@ -5359,6 +5359,80 @@ mod tests {
 
     #[test]
     #[serial]
+    fn color_convert_preserves_authored_lab() {
+        // Lab → Lab must short-circuit because the sRGB connection
+        // space clamps each channel to `[0.0, 1.0]` in
+        // `xyz_d65_to_srgb`, which throws away out-of-gamut Lab values
+        // (think very saturated cyans, deep ProPhoto-only blues). The
+        // print and proofing pipelines rely on the original Lab
+        // triplet surviving the bridge.
+        let authored = kcreate_core::color::Color::Lab {
+            l: 50.0,
+            // Deliberately out-of-gamut for sRGB: this pushes
+            // `lab_to_srgb` past the [0,1] clamp on at least one
+            // channel.
+            a_star: 90.0,
+            b_star: -90.0,
+            alpha: 0.75,
+        };
+        let json = crate::phase2::color_convert(&serde_json::to_string(&authored).unwrap(), "lab")
+            .unwrap();
+        let out: kcreate_core::color::Color = serde_json::from_str(&json).unwrap();
+        assert_eq!(out, authored);
+    }
+
+    #[test]
+    #[serial]
+    fn color_convert_preserves_authored_hsl() {
+        // HSL → HSL must short-circuit because the round-trip through
+        // sRGB introduces float drift on the hue (atan2-style
+        // extraction) which compounds when the color picker
+        // re-converts on every keystroke.
+        let authored = kcreate_core::color::Color::Hsl {
+            h: 173.4,
+            s: 0.62,
+            l: 0.37,
+            a: 0.9,
+        };
+        let json = crate::phase2::color_convert(&serde_json::to_string(&authored).unwrap(), "hsl")
+            .unwrap();
+        let out: kcreate_core::color::Color = serde_json::from_str(&json).unwrap();
+        assert_eq!(out, authored);
+    }
+
+    #[test]
+    #[serial]
+    fn color_convert_preserves_authored_srgb() {
+        // sRGB → sRGB is the trivial identity; the test pins it so a
+        // future refactor doesn't accidentally re-route through the
+        // Lab/CMYK round-trip path and introduce drift.
+        let authored = kcreate_core::color::Color::Srgb {
+            r: 0.123,
+            g: 0.456,
+            b: 0.789,
+            a: 0.5,
+        };
+        let json = crate::phase2::color_convert(&serde_json::to_string(&authored).unwrap(), "srgb")
+            .unwrap();
+        let out: kcreate_core::color::Color = serde_json::from_str(&json).unwrap();
+        assert_eq!(out, authored);
+    }
+
+    #[test]
+    #[serial]
+    fn color_settings_get_returns_default_when_no_project() {
+        // Public contract on `color_settings_get`: the panel mounts
+        // before any project is loaded, so the function must return
+        // the `Default` JSON shape rather than a `NoProject` error.
+        reset_for_tests();
+        let json = crate::phase2::color_settings_get()
+            .expect("color_settings_get must succeed with no project loaded");
+        let settings: kcreate_core::color::ColorSettings = serde_json::from_str(&json).unwrap();
+        assert_eq!(settings, kcreate_core::color::ColorSettings::default());
+    }
+
+    #[test]
+    #[serial]
     fn color_convert_rejects_unknown_space() {
         let red = kcreate_core::color::Color::Srgb {
             r: 1.0,

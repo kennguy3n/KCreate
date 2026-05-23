@@ -739,8 +739,21 @@ pub fn mcp_status() -> McpStatus {
 /// `Default` (sRGB, no CMYK profile, perceptual intent) when no
 /// project is currently loaded, so the renderer/UI can always render
 /// the panel without crashing.
+///
+/// The fall-back is part of the public contract — the
+/// `ColorSettingsPanel` mounts at app start, before any project is
+/// opened, and needs a stable JSON shape to populate its controls.
 pub fn color_settings_get() -> Result<String> {
-    let settings = with_workspace(|ws| Ok(ws.project.color_settings.clone()))?;
+    use kcreate_core::color::ColorSettings;
+    let settings = match with_workspace(|ws| Ok(ws.project.color_settings.clone())) {
+        Ok(settings) => settings,
+        // Match the docstring contract: no project ⇒ default settings,
+        // not an error. The panel renders identically whether or not a
+        // project is loaded, and `color_settings_update` will refuse
+        // the write (via `with_workspace_mut`) until one is.
+        Err(DocumentBridgeError::NoProject) => ColorSettings::default(),
+        Err(err) => return Err(err),
+    };
     Ok(serde_json::to_string(&settings)?)
 }
 
@@ -800,12 +813,37 @@ pub fn color_convert(from_json: &str, to_space: &str) -> Result<String> {
     // space for every variant; the per-space helpers below only need
     // the sRGB triplet plus the alpha that came with the source.
     let (r, g, b, a) = from.to_srgb();
+    // Identity short-circuits for every variant. Round-tripping
+    // through the sRGB connection space is *lossy*:
+    //
+    // * CMYK → CMYK loses K-channel information (CSS Color Module
+    //   Level 4 §13).
+    // * Lab → Lab loses out-of-gamut values because
+    //   `xyz_d65_to_srgb` clamps each channel to `[0.0, 1.0]`.
+    // * HSL → HSL is technically lossless for in-gamut sRGB, but the
+    //   atan2-style hue extraction in `srgb_to_hsl` introduces tiny
+    //   rounding drift on every round-trip that accumulates if the
+    //   color picker re-converts on every keystroke.
+    //
+    // Returning the input unchanged when the target matches its native
+    // space keeps `color_convert` idempotent and matches the
+    // `color_convert_preserves_authored_*` test contract.
     let converted = match to_space {
-        "srgb" => Color::Srgb { r, g, b, a },
+        "srgb" => match &from {
+            Color::Srgb {
+                r: rr,
+                g: gg,
+                b: bb,
+                a: aa,
+            } => Color::Srgb {
+                r: *rr,
+                g: *gg,
+                b: *bb,
+                a: *aa,
+            },
+            _ => Color::Srgb { r, g, b, a },
+        },
         "cmyk" => match &from {
-            // Preserve authored CMYK exactly — round-tripping through
-            // sRGB throws away K-channel information that the print
-            // pipeline depends on (CSS Color Module Level 4 §13).
             Color::Cmyk { c, m, y, k, a } => Color::Cmyk {
                 c: *c,
                 m: *m,
@@ -818,19 +856,45 @@ pub fn color_convert(from_json: &str, to_space: &str) -> Result<String> {
                 Color::Cmyk { c, m, y, k, a }
             }
         },
-        "lab" => {
-            let (l, a_star, b_star) = srgb_to_lab(r, g, b);
+        "lab" => match &from {
             Color::Lab {
                 l,
                 a_star,
                 b_star,
-                alpha: a,
+                alpha,
+            } => Color::Lab {
+                l: *l,
+                a_star: *a_star,
+                b_star: *b_star,
+                alpha: *alpha,
+            },
+            _ => {
+                let (l, a_star, b_star) = srgb_to_lab(r, g, b);
+                Color::Lab {
+                    l,
+                    a_star,
+                    b_star,
+                    alpha: a,
+                }
             }
-        }
-        "hsl" => {
-            let (h, s, l) = srgb_to_hsl(r, g, b);
-            Color::Hsl { h, s, l, a }
-        }
+        },
+        "hsl" => match &from {
+            Color::Hsl {
+                h,
+                s,
+                l,
+                a: aa,
+            } => Color::Hsl {
+                h: *h,
+                s: *s,
+                l: *l,
+                a: *aa,
+            },
+            _ => {
+                let (h, s, l) = srgb_to_hsl(r, g, b);
+                Color::Hsl { h, s, l, a }
+            }
+        },
         other => {
             return Err(DocumentBridgeError::InvalidArgument {
                 argument: "to_space".into(),

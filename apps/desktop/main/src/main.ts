@@ -1243,6 +1243,19 @@ function registerIpcHandlers(): void {
   ipcMain.handle("kcreate/plugin/trust/reload", () => {
     requireBridge().pluginTrustReload();
   });
+  // `kcreate/plugin/js/message` is the *trusted* JS-panel IPC: the
+  // caller passes `(pluginId, messageJson)` directly and we forward
+  // both to the bridge without sender validation. This is intentional
+  // — only the main renderer's preload owns the `window.kcreate.plugin.jsMessage`
+  // surface, and the main renderer already has full bridge access
+  // (it can call `pluginExecuteWithContext`, mutate the document,
+  // etc.), so demanding sender validation here would be defence-in-
+  // depth-against-yourself.
+  //
+  // The *untrusted* path — messages originating from inside a sandboxed
+  // panel — goes through `kcreate/plugin/js/panel/send` below, which
+  // looks up `pluginIdForSender(event)` so the panel can't impersonate
+  // another plugin even if it tampers with its own postMessage payload.
   ipcMain.handle(
     "kcreate/plugin/js/message",
     (_e, pluginId: string, messageJson: string) =>

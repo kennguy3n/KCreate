@@ -55,6 +55,13 @@ pub struct PluginManifest {
     pub entry_point: String,
     #[serde(default)]
     pub permissions: Vec<PluginPermission>,
+    /// JS-panel-specific config; required when `plugin_type` is
+    /// `JsPanel` and ignored otherwise. Stored on the manifest itself
+    /// (rather than a sidecar file) so the registry only has to read
+    /// one JSON file per plugin and so panel authors don't have to
+    /// keep two files in sync.
+    #[serde(default, rename = "js_panel", skip_serializing_if = "Option::is_none")]
+    pub js_panel: Option<crate::js_panel::JsPanelConfig>,
 }
 
 /// Errors from manifest IO / parsing.
@@ -99,6 +106,24 @@ impl PluginManifest {
             return Err(ManifestError::EntryPointMissing(
                 entry.display().to_string(),
             ));
+        }
+        if self.plugin_type == PluginType::JsPanel {
+            let Some(cfg) = &self.js_panel else {
+                return Err(ManifestError::MissingField("js_panel"));
+            };
+            if cfg.entry_html.is_empty() {
+                return Err(ManifestError::MissingField("js_panel.entry_html"));
+            }
+            // The js_panel.entry_html file must also exist on disk so
+            // the Electron host can `file://`-load it. We check that
+            // here rather than letting the Electron main process
+            // discover a 404 at panel-open time.
+            let html = plugin_dir.join(&cfg.entry_html);
+            if !html.exists() {
+                return Err(ManifestError::EntryPointMissing(
+                    html.display().to_string(),
+                ));
+            }
         }
         Ok(())
     }
@@ -204,5 +229,82 @@ mod tests {
         std::fs::write(dir.path().join("manifest.json"), b"not json").unwrap();
         let err = PluginManifest::load(dir.path()).unwrap_err();
         assert!(matches!(err, ManifestError::Json(_)));
+    }
+
+    #[test]
+    fn parses_js_panel_manifest() {
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("manifest.json"),
+            r#"{
+                "id": "panel",
+                "name": "Panel",
+                "version": "0.1.0",
+                "type": "js_panel",
+                "entry_point": "panel.html",
+                "permissions": ["read_document"],
+                "js_panel": {
+                    "entry_html": "panel.html",
+                    "panel_title": "Panel",
+                    "panel_position": "right_sidebar",
+                    "width": 320,
+                    "height": 480,
+                    "permissions": ["read_document"]
+                }
+            }"#,
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("panel.html"), b"<!doctype html><html></html>").unwrap();
+        let m = PluginManifest::load(dir.path()).unwrap();
+        assert_eq!(m.plugin_type, PluginType::JsPanel);
+        let cfg = m.js_panel.as_ref().expect("js_panel must be present");
+        assert_eq!(cfg.entry_html, "panel.html");
+        assert_eq!(cfg.width, 320);
+        assert!(cfg.has(PluginPermission::ReadDocument));
+    }
+
+    #[test]
+    fn rejects_js_panel_without_config() {
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("manifest.json"),
+            r#"{
+                "id": "panel",
+                "name": "Panel",
+                "version": "0.1.0",
+                "type": "js_panel",
+                "entry_point": "panel.html"
+            }"#,
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("panel.html"), b"<!doctype html><html></html>").unwrap();
+        let err = PluginManifest::load(dir.path()).unwrap_err();
+        assert!(matches!(err, ManifestError::MissingField("js_panel")));
+    }
+
+    #[test]
+    fn rejects_js_panel_with_missing_html() {
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("manifest.json"),
+            r#"{
+                "id": "panel",
+                "name": "Panel",
+                "version": "0.1.0",
+                "type": "js_panel",
+                "entry_point": "panel.html",
+                "js_panel": {
+                    "entry_html": "ghost.html",
+                    "panel_title": "Panel",
+                    "panel_position": "right_sidebar",
+                    "width": 320,
+                    "height": 480
+                }
+            }"#,
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("panel.html"), b"<!doctype html><html></html>").unwrap();
+        let err = PluginManifest::load(dir.path()).unwrap_err();
+        assert!(matches!(err, ManifestError::EntryPointMissing(_)));
     }
 }

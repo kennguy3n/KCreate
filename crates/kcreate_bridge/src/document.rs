@@ -5911,4 +5911,167 @@ mod tests {
         assert_eq!(status, "rejected", "expected rejected, got {status}");
         project_close();
     }
+
+    // ------------------------------------------------------------------
+    // Phase 2 Block D — JS panel bridge tests (Task 18)
+    // ------------------------------------------------------------------
+
+    /// Lay down a JS panel plugin (manifest.json + entry_html stub)
+    /// under `dir/<id>/`.
+    fn write_test_js_panel(
+        dir: &std::path::Path,
+        id: &str,
+        permissions: &[&str],
+    ) -> String {
+        let plugin_dir = dir.join(id);
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+        std::fs::write(plugin_dir.join("panel.html"), b"<!doctype html><html></html>").unwrap();
+        let manifest = serde_json::json!({
+            "id": id,
+            "name": id,
+            "version": "0.1.0",
+            "type": "js_panel",
+            "entry_point": "panel.html",
+            "permissions": permissions,
+            "js_panel": {
+                "entry_html": "panel.html",
+                "panel_title": "Test Panel",
+                "panel_position": "right_sidebar",
+                "width": 320,
+                "height": 480,
+                "permissions": permissions
+            }
+        });
+        std::fs::write(
+            plugin_dir.join("manifest.json"),
+            serde_json::to_string_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        id.to_string()
+    }
+
+    #[test]
+    #[serial]
+    fn plugin_js_list_returns_only_js_panel_plugins() {
+        let dir = tmpdir();
+        let plugin_dir = tmpdir();
+        let _guard = PluginEnvGuard::new(plugin_dir.path());
+
+        project_create("ctx", dir.path()).expect("create");
+        // One wasm plugin + one js_panel plugin.
+        let _wasm_id = write_test_plugin(
+            plugin_dir.path(),
+            "some-wasm",
+            READ_DOC_WAT,
+            &["read_document"],
+        );
+        let panel_id = write_test_js_panel(plugin_dir.path(), "some-panel", &["read_document"]);
+        // Force registry scan so newly-written manifests are visible.
+        crate::phase2::plugin_list().expect("list");
+
+        let list = crate::phase2::plugin_js_list().expect("js list");
+        let ids: Vec<&str> = list.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(ids, vec![panel_id.as_str()]);
+        assert_eq!(list[0].config.entry_html, "panel.html");
+        assert_eq!(list[0].config.width, 320);
+        project_close();
+    }
+
+    #[test]
+    #[serial]
+    fn plugin_js_message_read_document_requires_permission() {
+        let dir = tmpdir();
+        let plugin_dir = tmpdir();
+        let _guard = PluginEnvGuard::new(plugin_dir.path());
+
+        project_create("ctx", dir.path()).expect("create");
+        let panel_id = write_test_js_panel(plugin_dir.path(), "no-perm-panel", &[]);
+        crate::phase2::plugin_list().expect("list");
+        crate::phase2::plugin_enable(&panel_id).expect("enable");
+
+        let msg = serde_json::json!({
+            "type": "read_document",
+            "query": { "type": "list_nodes" }
+        })
+        .to_string();
+        let out = crate::phase2::plugin_js_message(&panel_id, &msg).expect("msg");
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(parsed["status"], "denied");
+        assert_eq!(parsed["permission"], "read_document");
+        project_close();
+    }
+
+    #[test]
+    #[serial]
+    fn plugin_js_message_read_document_succeeds_with_permission() {
+        let dir = tmpdir();
+        let plugin_dir = tmpdir();
+        let _guard = PluginEnvGuard::new(plugin_dir.path());
+
+        project_create("ctx", dir.path()).expect("create");
+        let panel_id =
+            write_test_js_panel(plugin_dir.path(), "read-panel", &["read_document"]);
+        crate::phase2::plugin_list().expect("list");
+        crate::phase2::plugin_enable(&panel_id).expect("enable");
+
+        let msg = serde_json::json!({
+            "type": "read_document",
+            "query": { "type": "list_nodes" }
+        })
+        .to_string();
+        let out = crate::phase2::plugin_js_message(&panel_id, &msg).expect("msg");
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(parsed["status"], "ok", "expected ok, got {parsed}");
+        let result = parsed.get("result").expect("result");
+        assert!(result.is_array(), "list_nodes must produce a JSON array");
+        project_close();
+    }
+
+    #[test]
+    #[serial]
+    fn plugin_js_message_rejects_invalid_json() {
+        let dir = tmpdir();
+        let plugin_dir = tmpdir();
+        let _guard = PluginEnvGuard::new(plugin_dir.path());
+
+        project_create("ctx", dir.path()).expect("create");
+        let panel_id = write_test_js_panel(plugin_dir.path(), "invalid-panel", &[]);
+        crate::phase2::plugin_list().expect("list");
+        crate::phase2::plugin_enable(&panel_id).expect("enable");
+
+        let out = crate::phase2::plugin_js_message(&panel_id, "not json").expect("msg");
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(parsed["status"], "invalid");
+        project_close();
+    }
+
+    #[test]
+    #[serial]
+    fn plugin_js_message_rejects_non_js_panel_plugin() {
+        let dir = tmpdir();
+        let plugin_dir = tmpdir();
+        let _guard = PluginEnvGuard::new(plugin_dir.path());
+
+        project_create("ctx", dir.path()).expect("create");
+        let wasm_id = write_test_plugin(
+            plugin_dir.path(),
+            "wasm-not-panel",
+            READ_DOC_WAT,
+            &["read_document"],
+        );
+        crate::phase2::plugin_list().expect("list");
+        crate::phase2::plugin_enable(&wasm_id).expect("enable");
+
+        let msg = serde_json::json!({
+            "type": "log",
+            "message": "hi"
+        })
+        .to_string();
+        let out = crate::phase2::plugin_js_message(&wasm_id, &msg).expect("msg");
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(parsed["status"], "invalid");
+        let reason = parsed["reason"].as_str().unwrap_or("");
+        assert!(reason.contains("not a js_panel"), "got: {reason}");
+        project_close();
+    }
 }

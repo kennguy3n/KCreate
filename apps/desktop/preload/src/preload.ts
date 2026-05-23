@@ -75,8 +75,12 @@ import type {
   McpPermissionGrant,
   McpStatus,
   ModelPack,
+  JsPanelInfo,
+  JsPanelMessage,
+  JsPanelMessageOutcome,
   PluginBridge,
   PluginExecuteResult,
+  PluginExecuteWithContextResult,
   PluginListEntry,
   PreflightBridge,
   PreflightIssue,
@@ -1158,6 +1162,51 @@ const plugin: PluginBridge = {
       input,
     )) as string;
     return JSON.parse(raw) as PluginExecuteResult;
+  },
+  async executeWithContext(
+    id: string,
+    fn: string,
+    input: string,
+  ): Promise<PluginExecuteWithContextResult> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/plugin/executeWithContext",
+      id,
+      fn,
+      input,
+    )) as string;
+    return JSON.parse(raw) as PluginExecuteWithContextResult;
+  },
+  async jsList(): Promise<JsPanelInfo[]> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/plugin/js/list",
+    )) as string;
+    return JSON.parse(raw) as JsPanelInfo[];
+  },
+  async jsMessage(
+    pluginId: string,
+    message: JsPanelMessage,
+  ): Promise<JsPanelMessageOutcome> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/plugin/js/message",
+      pluginId,
+      JSON.stringify(message),
+    )) as string;
+    return JSON.parse(raw) as JsPanelMessageOutcome;
+  },
+  async jsOpen(
+    pluginId: string,
+    bounds: { x: number; y: number; width: number; height: number },
+  ): Promise<void> {
+    await ipcRenderer.invoke("kcreate/plugin/js/open", pluginId, bounds);
+  },
+  async jsSetBounds(
+    pluginId: string,
+    bounds: { x: number; y: number; width: number; height: number },
+  ): Promise<void> {
+    await ipcRenderer.invoke("kcreate/plugin/js/setBounds", pluginId, bounds);
+  },
+  async jsClose(pluginId: string): Promise<void> {
+    await ipcRenderer.invoke("kcreate/plugin/js/close", pluginId);
   },
 };
 

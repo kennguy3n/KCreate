@@ -315,6 +315,13 @@ export interface Bridge {
   pluginEnable(id: string): void;
   pluginDisable(id: string): void;
   pluginExecute(id: string, function_: string, input: string): string;
+  pluginExecuteWithContext(
+    id: string,
+    function_: string,
+    input: string,
+  ): string;
+  pluginJsList(): string;
+  pluginJsMessage(pluginId: string, messageJson: string): string;
   mcpPermissionList(): string;
   mcpPermissionGrant(
     clientId: string,

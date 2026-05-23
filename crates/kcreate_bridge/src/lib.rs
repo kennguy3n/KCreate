@@ -1685,6 +1685,24 @@ pub fn plugin_execute_with_context(
     phase2::plugin_execute_with_context(&id, &function, &input).map_err(map_doc_err)
 }
 
+/// List installed JS panel plugins. Returns a JSON array of
+/// `JsPanelInfo` so the Electron main process can decide which
+/// sandboxed `BrowserView` instances to mount.
+#[napi]
+pub fn plugin_js_list() -> NapiResult<String> {
+    let list = phase2::plugin_js_list().map_err(map_doc_err)?;
+    serde_json::to_string(&list).map_err(|e| NapiError::from_reason(e.to_string()))
+}
+
+/// Validate and dispatch a single message from a sandboxed JS panel.
+/// The Electron host calls this for every inbound `postMessage` from
+/// the panel's `<webview>` / `BrowserView`; the bridge enforces the
+/// permission gates and returns a `JsPanelMessageOutcome` JSON.
+#[napi]
+pub fn plugin_js_message(plugin_id: String, message_json: String) -> NapiResult<String> {
+    phase2::plugin_js_message(&plugin_id, &message_json).map_err(map_doc_err)
+}
+
 #[napi]
 pub fn mcp_permission_list() -> NapiResult<String> {
     phase2::mcp_permission_list().map_err(map_doc_err)

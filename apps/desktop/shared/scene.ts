@@ -1318,6 +1318,25 @@ export type PluginPermission =
   | "export_files"
   | "network_access";
 
+export type PanelPosition =
+  | "right_sidebar"
+  | "bottom_panel"
+  | "floating_window";
+
+/**
+ * JS-panel-specific config carried alongside the standard manifest
+ * fields when `type === "js_panel"`. Required for that type; absent
+ * for WASM / native plugins.
+ */
+export interface JsPanelConfig {
+  entry_html: string;
+  panel_title: string;
+  panel_position: PanelPosition;
+  width: number;
+  height: number;
+  permissions: PluginPermission[];
+}
+
 export interface PluginManifest {
   id: string;
   name: string;
@@ -1328,6 +1347,8 @@ export interface PluginManifest {
   type: PluginType;
   entry_point: string;
   permissions: PluginPermission[];
+  /** Present only when `type === "js_panel"`. */
+  js_panel?: JsPanelConfig;
 }
 
 /**
@@ -1342,11 +1363,108 @@ export interface PluginExecuteResult {
   logs: string[];
 }
 
+/**
+ * Outcome of a single proposal validated and (when accepted) applied
+ * by `plugin_execute_with_context`. The `status` discriminator
+ * matches `phase2::ProposalOutcome`'s serde tag.
+ */
+export type PluginProposalReport =
+  | {
+      type: "create_node";
+      parent_id: string;
+      node_type: string;
+      props: unknown;
+      outcome: { status: "applied"; node_id: string } | { status: "rejected"; reason: string };
+    }
+  | {
+      type: "update_node";
+      node_id: string;
+      changes: unknown;
+      outcome: { status: "applied"; node_id: string } | { status: "rejected"; reason: string };
+    }
+  | {
+      type: "delete_node";
+      node_id: string;
+      outcome: { status: "applied"; node_id: string } | { status: "rejected"; reason: string };
+    };
+
+/**
+ * Extended-ABI execution result: same as the basic
+ * `PluginExecuteResult` but with the proposal outcomes the host
+ * applied.
+ */
+export interface PluginExecuteWithContextResult extends PluginExecuteResult {
+  proposals: PluginProposalReport[];
+}
+
+/**
+ * Description of an installed JS panel plugin returned by
+ * `plugin_js_list()`. The Electron host uses these to decide which
+ * sandboxed `BrowserView` instances to mount and where.
+ */
+export interface JsPanelInfo {
+  id: string;
+  name: string;
+  version: string;
+  config: JsPanelConfig;
+  enabled: boolean;
+}
+
+/**
+ * Single message ferried between a JS panel and the bridge. The
+ * `type` discriminator matches `kcreate_plugin::JsPanelMessage`.
+ */
+export type JsPanelMessage =
+  | { type: "read_document"; query: unknown }
+  | { type: "write_proposal"; proposal: unknown }
+  | { type: "log"; message: string };
+
+/**
+ * Outcome of a `JsPanelMessage`. The Electron host returns this to
+ * the panel via `postMessage` so the panel can update its UI.
+ */
+export type JsPanelMessageOutcome =
+  | { status: "ok"; result: unknown }
+  | { status: "denied"; permission: PluginPermission }
+  | { status: "invalid"; reason: string };
+
 export interface PluginBridge {
   list(): Promise<PluginListEntry[]>;
   enable(id: string): Promise<void>;
   disable(id: string): Promise<void>;
   execute(id: string, fn: string, input: string): Promise<PluginExecuteResult>;
+  /**
+   * Extended-ABI execution: builds a `PluginContext` with the current
+   * document snapshot and the plugin's manifest permissions, runs the
+   * plugin, then validates and applies any proposals it produced.
+   */
+  executeWithContext(
+    id: string,
+    fn: string,
+    input: string,
+  ): Promise<PluginExecuteWithContextResult>;
+  /** List installed JS panel plugins for the Electron host. */
+  jsList(): Promise<JsPanelInfo[]>;
+  /**
+   * Validate and dispatch a single message from a sandboxed JS panel.
+   * The Electron host calls this for every inbound `postMessage`.
+   */
+  jsMessage(pluginId: string, message: JsPanelMessage): Promise<JsPanelMessageOutcome>;
+  /**
+   * Ask the Electron host to mount a sandboxed `WebContentsView` for
+   * the named plugin. Bounds are in CSS pixels relative to the main
+   * window content area. If the panel is already mounted, the bounds
+   * are updated in place. Throws if the plugin id is unknown or not
+   * a `js_panel` plugin.
+   */
+  jsOpen(pluginId: string, bounds: { x: number; y: number; width: number; height: number }): Promise<void>;
+  /** Update the bounds of an already-mounted panel. No-op if not mounted. */
+  jsSetBounds(
+    pluginId: string,
+    bounds: { x: number; y: number; width: number; height: number },
+  ): Promise<void>;
+  /** Tear down the panel for `pluginId` if mounted; no-op otherwise. */
+  jsClose(pluginId: string): Promise<void>;
 }
 
 export type McpPermissionGrant = "once" | "always" | "denied";

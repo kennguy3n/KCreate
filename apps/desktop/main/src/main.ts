@@ -2,7 +2,13 @@
 // renderer-side IPC handlers that proxy to the Rust kcreate_bridge
 // native addon.
 
-import { app, BrowserWindow, ipcMain } from "electron";
+import {
+  app,
+  BrowserWindow,
+  ipcMain,
+  WebContentsView,
+  type IpcMainInvokeEvent,
+} from "electron";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -324,6 +330,200 @@ function createWindow(): BrowserWindow {
     if (mainWindow === win) mainWindow = null;
   });
   return win;
+}
+
+// ---------------------------------------------------------------------
+// JS panel plugin lifecycle.
+//
+// Each enabled `js_panel` plugin gets at most one sandboxed
+// `WebContentsView` attached to the main window. The renderer asks
+// the host to mount / unmount / resize panels through
+// `kcreate/plugin/js/open` / `close` / `setBounds`. Messages from
+// the panel itself come in on `kcreate/plugin/js/panel/send`, which
+// the plugin preload (`plugin-preload.ts`) wires under
+// `window.kcreatePlugin.sendMessage`.
+//
+// The host is the gate: it knows which WebContents belongs to which
+// plugin, so even though the plugin can post anything from inside
+// its sandbox, the bridge always sees a trusted `(pluginId,
+// messageJson)` pair.
+//
+// Security stance for every panel view:
+//   * `sandbox: true`           — chromium sandbox is on
+//   * `contextIsolation: true`  — plugin can't reach the host
+//   * `nodeIntegration: false`  — no Node.js APIs in the panel
+//   * `preload`                 — `plugin-preload.js` only
+//   * `webSecurity: true`       — same-origin policy stays on
+//   * CSP                       — set on every loaded page (see below)
+// ---------------------------------------------------------------------
+
+/// Pixel bounds passed in by the renderer when (re-)mounting a panel.
+interface JsPanelBounds {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+/// A single mounted JS panel.
+interface MountedJsPanel {
+  pluginId: string;
+  view: WebContentsView;
+  /// `WebContents.id` — used by the panel-send IPC handler to match
+  /// inbound messages from the panel back to its plugin id without
+  /// trusting the panel itself.
+  webContentsId: number;
+}
+
+const mountedJsPanels = new Map<string, MountedJsPanel>();
+const webContentsIdToPluginId = new Map<number, string>();
+
+function jsPanelPreloadPath(): string {
+  return path.join(__dirname, "plugin-preload.js");
+}
+
+/// Resolve a plugin's directory and entry HTML path. The bridge
+/// returns the list with `entry_html` relative to the plugin dir
+/// (per `crates/kcreate_plugin/src/js_panel.rs` schema). We honour
+/// `KCREATE_PLUGIN_DIR` for parity with the Rust side; otherwise
+/// fall back to `~/.kcreate/plugins`.
+function pluginRoot(): string {
+  const fromEnv = process.env["KCREATE_PLUGIN_DIR"];
+  if (fromEnv) return fromEnv;
+  const home = process.env["HOME"] ?? process.env["USERPROFILE"] ?? ".";
+  return path.join(home, ".kcreate", "plugins");
+}
+
+interface JsPanelInfoFromBridge {
+  id: string;
+  config: { entry_html: string };
+}
+
+function resolveJsPanelEntry(pluginId: string): string | null {
+  if (!bridge) return null;
+  let listJson: string;
+  try {
+    listJson = bridge.pluginJsList();
+  } catch {
+    return null;
+  }
+  let list: JsPanelInfoFromBridge[];
+  try {
+    list = JSON.parse(listJson) as JsPanelInfoFromBridge[];
+  } catch {
+    return null;
+  }
+  const entry = list.find((p) => p.id === pluginId);
+  if (!entry) return null;
+  return path.join(pluginRoot(), pluginId, entry.config.entry_html);
+}
+
+function destroyJsPanel(pluginId: string): void {
+  const mounted = mountedJsPanels.get(pluginId);
+  if (!mounted) return;
+  mountedJsPanels.delete(pluginId);
+  webContentsIdToPluginId.delete(mounted.webContentsId);
+  if (mainWindow) {
+    try {
+      mainWindow.contentView.removeChildView(mounted.view);
+    } catch {
+      // The window may already have torn down; ignore.
+    }
+  }
+  // `WebContents.destroy()` is the only way to truly free a view; the
+  // alternative (`view.webContents.close()`) leaves the renderer
+  // process alive until the parent window closes. Use `close()` if
+  // `destroy()` isn't available on the current Electron version.
+  const wc = mounted.view.webContents as unknown as {
+    destroy?: () => void;
+    close?: () => void;
+  };
+  if (typeof wc.destroy === "function") {
+    wc.destroy();
+  } else if (typeof wc.close === "function") {
+    wc.close();
+  }
+}
+
+/// Tear down every mounted JS panel. Called on `will-quit` so the
+/// child processes don't outlive the editor.
+function destroyAllJsPanels(): void {
+  for (const id of Array.from(mountedJsPanels.keys())) {
+    destroyJsPanel(id);
+  }
+}
+
+function openJsPanel(pluginId: string, bounds: JsPanelBounds): void {
+  if (!mainWindow) {
+    throw new Error(
+      "kcreate/plugin/js/open: main window has not been created yet",
+    );
+  }
+  const entry = resolveJsPanelEntry(pluginId);
+  if (!entry) {
+    throw new Error(
+      `kcreate/plugin/js/open: plugin ${pluginId} is not a known js_panel plugin`,
+    );
+  }
+  // If already mounted, just reposition.
+  const existing = mountedJsPanels.get(pluginId);
+  if (existing) {
+    existing.view.setBounds(bounds);
+    return;
+  }
+
+  const view = new WebContentsView({
+    webPreferences: {
+      preload: jsPanelPreloadPath(),
+      sandbox: true,
+      contextIsolation: true,
+      nodeIntegration: false,
+      webSecurity: true,
+      // Disable everything we don't need. The panel speaks to the host
+      // through the preload only.
+      allowRunningInsecureContent: false,
+      experimentalFeatures: false,
+      // Plugin pages are local files; we don't need devtools open by
+      // default in production.
+    },
+  });
+  view.setBounds(bounds);
+  // Inject a strict CSP via the protocol header before load. Phase 2
+  // bans the panel from making any network requests: `default-src
+  // 'self' file:; connect-src 'none'`. The plugin's HTML can still
+  // pull in sibling JS/CSS via `file://` because both are on the same
+  // local origin.
+  view.webContents.session.webRequest.onHeadersReceived(
+    { urls: ["file://*/*"] },
+    (details, callback) => {
+      const headers = { ...details.responseHeaders };
+      headers["Content-Security-Policy"] = [
+        "default-src 'self' file:; " +
+          "script-src 'self' file:; " +
+          "style-src 'self' file: 'unsafe-inline'; " +
+          "connect-src 'none'; " +
+          "object-src 'none'; " +
+          "base-uri 'self'; " +
+          "form-action 'none'",
+      ];
+      callback({ responseHeaders: headers });
+    },
+  );
+
+  const webContentsId = view.webContents.id;
+  webContentsIdToPluginId.set(webContentsId, pluginId);
+  mountedJsPanels.set(pluginId, { pluginId, view, webContentsId });
+
+  mainWindow.contentView.addChildView(view);
+  void view.webContents.loadFile(entry);
+}
+
+/// Resolve the plugin id for an IPC sender. Returns `null` for
+/// senders that aren't an enrolled JS panel — those are spoofed
+/// `panel/send` messages from the main renderer or some other
+/// WebContents and should be rejected.
+function pluginIdForSender(event: IpcMainInvokeEvent): string | null {
+  return webContentsIdToPluginId.get(event.sender.id) ?? null;
 }
 
 function registerIpcHandlers(): void {
@@ -1007,6 +1207,53 @@ function registerIpcHandlers(): void {
     (_e, id: string, fn: string, input: string) =>
       requireBridge().pluginExecute(id, fn, input),
   );
+  ipcMain.handle(
+    "kcreate/plugin/executeWithContext",
+    (_e, id: string, fn: string, input: string) =>
+      requireBridge().pluginExecuteWithContext(id, fn, input),
+  );
+  ipcMain.handle("kcreate/plugin/js/list", () =>
+    requireBridge().pluginJsList(),
+  );
+  ipcMain.handle(
+    "kcreate/plugin/js/message",
+    (_e, pluginId: string, messageJson: string) =>
+      requireBridge().pluginJsMessage(pluginId, messageJson),
+  );
+  ipcMain.handle(
+    "kcreate/plugin/js/open",
+    (_e, pluginId: string, bounds: JsPanelBounds) => {
+      openJsPanel(pluginId, bounds);
+    },
+  );
+  ipcMain.handle("kcreate/plugin/js/close", (_e, pluginId: string) => {
+    destroyJsPanel(pluginId);
+  });
+  ipcMain.handle(
+    "kcreate/plugin/js/setBounds",
+    (_e, pluginId: string, bounds: JsPanelBounds) => {
+      const mounted = mountedJsPanels.get(pluginId);
+      if (!mounted) return;
+      mounted.view.setBounds(bounds);
+    },
+  );
+  // The panel's preload calls this. We trust the sender's WebContents
+  // id (because the host stamped it when the panel was mounted), but
+  // NOT any pluginId the panel might claim. A message from a
+  // non-panel sender is silently dropped — it's a spoofing attempt.
+  ipcMain.handle(
+    "kcreate/plugin/js/panel/send",
+    (event: IpcMainInvokeEvent, messageJson: string) => {
+      const pluginId = pluginIdForSender(event);
+      if (!pluginId) {
+        return JSON.stringify({
+          status: "invalid",
+          reason: "sender is not a registered JS panel",
+        });
+      }
+      return requireBridge().pluginJsMessage(pluginId, messageJson);
+    },
+  );
   ipcMain.handle("kcreate/mcp/permission/list", () =>
     requireBridge().mcpPermissionList(),
   );
@@ -1117,6 +1364,11 @@ app.on("will-quit", (event) => {
   event.preventDefault();
   void (async () => {
     try {
+      // Tear down sandboxed JS panel views first so their child
+      // processes don't outlive the bridge. They don't own any
+      // shared resources, so destruction is safe to do before the
+      // workspace cleanup.
+      destroyAllJsPanels();
       // Drop the lockfile *first* so our own scratch dir becomes
       // eligible for the sweep two lines below. Doing this before
       // `projectClose` is intentional: the bridge releases the

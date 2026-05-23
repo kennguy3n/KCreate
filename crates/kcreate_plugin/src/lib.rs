@@ -12,6 +12,7 @@
 #![forbid(unsafe_op_in_unsafe_fn)]
 
 pub mod context;
+pub mod js_panel;
 pub mod manifest;
 pub mod registry;
 pub mod wasm_runtime;
@@ -19,6 +20,9 @@ pub mod wasm_runtime;
 pub use context::{
     resolve_document_query, AssetLoader, DocumentQuery, PluginContext, PluginProposal,
     ProposedMutation,
+};
+pub use js_panel::{
+    JsPanelConfig, JsPanelInfo, JsPanelMessage, JsPanelMessageOutcome, PanelPosition,
 };
 pub use manifest::{PluginManifest, PluginPermission, PluginType};
 pub use registry::{PluginRegistry, RegistryError};

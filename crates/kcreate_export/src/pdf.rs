@@ -172,7 +172,13 @@ fn merge_override_alpha(over: Color, fill_alpha: f32) -> Color {
 ///   stays CMYK, everything else falls back to sRGB.
 /// - `Rgb` mode (the default) collapses every input to `DeviceRGB`.
 fn color_to_printpdf(c: &Color, mode: PdfColorMode) -> printpdf::Color {
-    let (r, g, b, _a) = c.to_srgb();
+    // The CMYK passthrough arm forwards authored CMYK values verbatim
+    // and does not need the sRGB conversion at all — calling
+    // `to_srgb()` unconditionally would burn four float multiplies per
+    // node on every CMYK-heavy export for no benefit. The helper below
+    // computes the sRGB triplet lazily so only the arms that need it
+    // pay for it.
+    let to_srgb = || c.to_srgb();
     match (mode, c) {
         // Both `Cmyk` mode and `PassThrough` mode preserve authored
         // CMYK exactly so we can route them through the same arm.
@@ -180,10 +186,12 @@ fn color_to_printpdf(c: &Color, mode: PdfColorMode) -> printpdf::Color {
             printpdf::Color::Cmyk(Cmyk::new(*c, *m, *y, *k, None))
         }
         (PdfColorMode::Cmyk, _) => {
+            let (r, g, b, _a) = to_srgb();
             let (cc, mm, yy, kk) = srgb_to_cmyk(r, g, b);
             printpdf::Color::Cmyk(Cmyk::new(cc, mm, yy, kk, None))
         }
         (PdfColorMode::PassThrough | PdfColorMode::Rgb, _) => {
+            let (r, g, b, _a) = to_srgb();
             printpdf::Color::Rgb(Rgb::new(r, g, b, None))
         }
     }
@@ -506,15 +514,25 @@ fn emit_vector(
         return Ok(());
     }
 
+    // Both fill and stroke colors must agree with `color_mode` so the
+    // generated content stream never mixes `rg` (DeviceRGB) and `K`
+    // (DeviceCMYK) operators. For stroke-only nodes, `fill_color` is
+    // `None` but `set_fill_color` still emits an operator, so the
+    // fallback color space must match the requested mode too —
+    // otherwise PDF/X validators flag the page as mixed-color-space.
     let fill_pdf_color = fill_color
         .as_ref()
         .map_or_else(
-            || printpdf::Color::Rgb(Rgb::new(0.0, 0.0, 0.0, None)),
+            || match color_mode {
+                PdfColorMode::Cmyk => {
+                    printpdf::Color::Cmyk(Cmyk::new(0.0, 0.0, 0.0, 0.0, None))
+                }
+                PdfColorMode::Rgb | PdfColorMode::PassThrough => {
+                    printpdf::Color::Rgb(Rgb::new(0.0, 0.0, 0.0, None))
+                }
+            },
             |c| color_to_printpdf(c, color_mode),
         );
-    // Stroke (outline) matches the requested color mode so we never
-    // mix `rg` and `K` operators in the same content stream when the
-    // caller asked for pure DeviceCMYK output.
     let outline_pdf_color = match color_mode {
         PdfColorMode::Cmyk => printpdf::Color::Cmyk(Cmyk::new(0.0, 0.0, 0.0, 1.0, None)),
         PdfColorMode::Rgb | PdfColorMode::PassThrough => {

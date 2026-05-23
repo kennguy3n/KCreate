@@ -764,6 +764,184 @@ pub fn plugin_execute_with_context(
     }))?)
 }
 
+/// List installed JS panel plugins along with their panel configs.
+///
+/// Used by the Electron main process: on startup (and after every
+/// `plugin_list` rescan) it queries this to decide which sandboxed
+/// `BrowserView` instances to mount and where. WASM and native
+/// plugins are filtered out — the host needs them for execution but
+/// not for panel allocation.
+pub fn plugin_js_list() -> Result<Vec<kcreate_plugin::JsPanelInfo>> {
+    let reg = plugin_registry().lock();
+    Ok(reg
+        .list()
+        .into_iter()
+        .filter_map(|m| {
+            if m.plugin_type != kcreate_plugin::PluginType::JsPanel {
+                return None;
+            }
+            let cfg = m.js_panel.clone()?;
+            Some(kcreate_plugin::JsPanelInfo {
+                id: m.id.clone(),
+                name: m.name.clone(),
+                version: m.version.clone(),
+                config: cfg,
+                enabled: reg.is_enabled(&m.id),
+            })
+        })
+        .collect())
+}
+
+/// Validate a single message ferried from a JS panel and (when the
+/// message is a mutating one) apply its side effects.
+///
+/// The Electron host (`apps/desktop/main/src/main.ts`) is the gate:
+/// when a panel calls `window.kcreatePlugin.sendMessage(type, payload)`,
+/// the main process forwards `(plugin_id, message)` into this
+/// function before the panel sees any response. The bridge:
+///
+/// 1. Looks the plugin up; refuses if missing, not a JS panel, or
+///    disabled.
+/// 2. Checks the panel's declared permissions against the message
+///    type. A panel that didn't declare `read_document` cannot send
+///    a `read_document` message and will get a `Denied { permission }`
+///    outcome back.
+/// 3. For `read_document`, resolves the query against a fresh
+///    snapshot.
+/// 4. For `write_proposal`, validates and applies the proposal as a
+///    recorded operation (same code path as the WASM plugin proposal
+///    apply).
+/// 5. For `log`, attaches the message to the host log buffer (the
+///    Electron host can forward it to the dev console).
+pub fn plugin_js_message(plugin_id: &str, message_json: &str) -> Result<String> {
+    let outcome = plugin_js_message_inner(plugin_id, message_json);
+    Ok(serde_json::to_string(&outcome)?)
+}
+
+fn plugin_js_message_inner(
+    plugin_id: &str,
+    message_json: &str,
+) -> kcreate_plugin::JsPanelMessageOutcome {
+    // 1. Resolve manifest + enabled status under a single lock.
+    let (manifest, enabled) = {
+        let reg = plugin_registry().lock();
+        (
+            reg.list().iter().find(|m| m.id == plugin_id).map(|m| (*m).clone()),
+            reg.is_enabled(plugin_id),
+        )
+    };
+    let manifest = match manifest {
+        Some(m) => m,
+        None => {
+            return kcreate_plugin::JsPanelMessageOutcome::Invalid {
+                reason: format!("plugin {plugin_id} not found"),
+            }
+        }
+    };
+    if manifest.plugin_type != kcreate_plugin::PluginType::JsPanel {
+        return kcreate_plugin::JsPanelMessageOutcome::Invalid {
+            reason: format!("plugin {plugin_id} is not a js_panel plugin"),
+        };
+    }
+    if !enabled {
+        return kcreate_plugin::JsPanelMessageOutcome::Invalid {
+            reason: format!("plugin {plugin_id} is not enabled"),
+        };
+    }
+    let cfg = match manifest.js_panel.as_ref() {
+        Some(c) => c.clone(),
+        None => {
+            return kcreate_plugin::JsPanelMessageOutcome::Invalid {
+                reason: format!("plugin {plugin_id} missing js_panel config"),
+            }
+        }
+    };
+
+    // 2. Parse the message.
+    let msg: kcreate_plugin::JsPanelMessage = match serde_json::from_str(message_json) {
+        Ok(m) => m,
+        Err(e) => {
+            return kcreate_plugin::JsPanelMessageOutcome::Invalid {
+                reason: format!("malformed message: {e}"),
+            }
+        }
+    };
+
+    // 3. Dispatch with permission gating.
+    match msg {
+        kcreate_plugin::JsPanelMessage::ReadDocument { query } => {
+            if !cfg.has(kcreate_plugin::PluginPermission::ReadDocument) {
+                log::warn!(
+                    "kcreate.plugin.js[{plugin_id}]: read_document denied (missing ReadDocument)"
+                );
+                return kcreate_plugin::JsPanelMessageOutcome::Denied {
+                    permission: kcreate_plugin::PluginPermission::ReadDocument,
+                };
+            }
+            // Parse the query against the same DocumentQuery enum the
+            // WASM ABI uses so JS panels and WASM plugins speak the
+            // same dialect.
+            let parsed: kcreate_plugin::DocumentQuery = match serde_json::from_value(query) {
+                Ok(q) => q,
+                Err(e) => {
+                    return kcreate_plugin::JsPanelMessageOutcome::Invalid {
+                        reason: format!("invalid query: {e}"),
+                    }
+                }
+            };
+            let snapshot_json = match crate::document::document_serialise_for_ai() {
+                Ok(s) => s,
+                Err(e) => {
+                    return kcreate_plugin::JsPanelMessageOutcome::Invalid {
+                        reason: format!("snapshot failed: {e}"),
+                    }
+                }
+            };
+            let snapshot: serde_json::Value = match serde_json::from_str(&snapshot_json) {
+                Ok(v) => v,
+                Err(e) => {
+                    return kcreate_plugin::JsPanelMessageOutcome::Invalid {
+                        reason: format!("snapshot parse failed: {e}"),
+                    }
+                }
+            };
+            let result = kcreate_plugin::resolve_document_query(&snapshot, &parsed);
+            kcreate_plugin::JsPanelMessageOutcome::Ok { result }
+        }
+        kcreate_plugin::JsPanelMessage::WriteProposal { proposal } => {
+            if !cfg.has(kcreate_plugin::PluginPermission::WriteDocument) {
+                log::warn!(
+                    "kcreate.plugin.js[{plugin_id}]: write_proposal denied (missing WriteDocument)"
+                );
+                return kcreate_plugin::JsPanelMessageOutcome::Denied {
+                    permission: kcreate_plugin::PluginPermission::WriteDocument,
+                };
+            }
+            let mutation: kcreate_plugin::ProposedMutation = match serde_json::from_value(proposal)
+            {
+                Ok(m) => m,
+                Err(e) => {
+                    return kcreate_plugin::JsPanelMessageOutcome::Invalid {
+                        reason: format!("invalid proposal: {e}"),
+                    }
+                }
+            };
+            // Single-proposal apply, same code path WASM plugins go
+            // through. Report flows back as the outcome's result.
+            let reports = apply_plugin_proposals(vec![mutation]);
+            let report = reports.into_iter().next().expect("one proposal in, one report out");
+            let value = serde_json::to_value(&report).unwrap_or(serde_json::Value::Null);
+            kcreate_plugin::JsPanelMessageOutcome::Ok { result: value }
+        }
+        kcreate_plugin::JsPanelMessage::Log { message } => {
+            log::info!("kcreate.plugin.js[{plugin_id}]: {message}");
+            kcreate_plugin::JsPanelMessageOutcome::Ok {
+                result: serde_json::Value::Null,
+            }
+        }
+    }
+}
+
 /// Validate and apply a batch of plugin proposals.
 ///
 /// Per-proposal contract:

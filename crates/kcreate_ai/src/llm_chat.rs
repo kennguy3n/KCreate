@@ -60,23 +60,58 @@ impl ChatMessage {
 /// Chat completion request. The host is expected to pre-truncate
 /// `messages` if the context window is tight; the sidecar will
 /// reject oversize prompts.
+///
+/// `grammar` is the llama.cpp-specific GBNF extension. When set,
+/// the server constrains the model's output to match the supplied
+/// grammar; in KCreate this is how we ship guaranteed-valid
+/// tool-call JSON (see [`crate::tool_call`]).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ChatRequest {
     pub messages: Vec<ChatMessage>,
     pub max_tokens: usize,
     pub temperature: f32,
+    /// Optional GBNF grammar string. `None` => unconstrained
+    /// completion (omitted from the JSON request); `Some(g)` =>
+    /// llama.cpp constrains tokens to the grammar.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grammar: Option<String>,
 }
 
 impl ChatRequest {
     /// Build a request with sensible defaults (max 512 tokens, t=0.2
-    /// for design-tooling-style outputs).
+    /// for design-tooling-style outputs, no grammar).
     #[must_use]
     pub fn from_messages(messages: Vec<ChatMessage>) -> Self {
         Self {
             messages,
             max_tokens: 512,
             temperature: 0.2,
+            grammar: None,
         }
+    }
+
+    /// Attach a GBNF grammar to the request. Builder-style so
+    /// `ChatRequest::from_messages(...).with_grammar(g)` reads
+    /// naturally at the call site.
+    #[must_use]
+    pub fn with_grammar(mut self, grammar: impl Into<String>) -> Self {
+        self.grammar = Some(grammar.into());
+        self
+    }
+
+    /// Lower the temperature so the output is more deterministic
+    /// (handy for tool-call requests where we want stable JSON).
+    #[must_use]
+    pub fn with_temperature(mut self, temperature: f32) -> Self {
+        self.temperature = temperature;
+        self
+    }
+
+    /// Cap the response token budget.
+    #[must_use]
+    pub fn with_max_tokens(mut self, max_tokens: usize) -> Self {
+        self.max_tokens = max_tokens;
+        self
     }
 }
 
@@ -183,6 +218,93 @@ pub fn build_system_prompt(document_summary: &str) -> ChatMessage {
     ))
 }
 
+/// Build a system prompt that lists the tools the assistant may
+/// invoke. Used in conjunction with [`request_tool_call`]; the
+/// generated GBNF grammar guarantees the *shape* of the response,
+/// while this prompt teaches the model the *semantics* of each tool.
+#[must_use]
+pub fn build_tool_call_system_prompt(
+    document_summary: &str,
+    registry: &crate::tool_call::ToolCallRegistry,
+) -> ChatMessage {
+    let mut lines = String::from(
+        "You are KCreate's local design assistant. You run fully offline on the \
+         user's machine. Respond with EXACTLY ONE JSON object selecting the most \
+         appropriate tool from the list below. Do not include any text outside the \
+         JSON object. The JSON must have the shape \
+         {\"tool\":\"<name>\",\"arguments\":{...}}.\n\nAvailable tools:\n",
+    );
+    for t in registry.tools() {
+        lines.push_str("- ");
+        lines.push_str(&t.name);
+        lines.push_str(": ");
+        lines.push_str(&t.description);
+        lines.push('\n');
+        if !t.parameters.is_empty() {
+            lines.push_str("  Parameters:\n");
+            for p in &t.parameters {
+                lines.push_str("    - ");
+                lines.push_str(&p.name);
+                lines.push_str(" (");
+                lines.push_str(match p.kind {
+                    crate::tool_call::ToolParamType::String => "string",
+                    crate::tool_call::ToolParamType::Integer => "integer",
+                    crate::tool_call::ToolParamType::Number => "number",
+                    crate::tool_call::ToolParamType::Boolean => "boolean",
+                    crate::tool_call::ToolParamType::Enum => "enum",
+                });
+                if p.required {
+                    lines.push_str(", required");
+                } else {
+                    lines.push_str(", optional");
+                }
+                lines.push_str("): ");
+                lines.push_str(&p.description);
+                if p.kind == crate::tool_call::ToolParamType::Enum {
+                    lines.push_str(" Allowed values: ");
+                    for (i, v) in p.enum_values.iter().enumerate() {
+                        if i > 0 {
+                            lines.push_str(", ");
+                        }
+                        lines.push('"');
+                        lines.push_str(v);
+                        lines.push('"');
+                    }
+                    lines.push('.');
+                }
+                lines.push('\n');
+            }
+        }
+    }
+    lines.push_str("\nProject context:\n");
+    lines.push_str(document_summary);
+    lines.push('\n');
+    ChatMessage::system(lines)
+}
+
+/// Drive a tool-call completion against the sidecar.
+///
+/// 1. Generates a GBNF grammar from `registry` and attaches it to
+///    `request`.
+/// 2. Sends the chat completion.
+/// 3. Parses + validates the response against `registry`.
+///
+/// The caller is responsible for putting an instructive
+/// `build_tool_call_system_prompt(...)` message at the front of
+/// `request.messages` so the model knows which tools exist and what
+/// each parameter means.
+pub fn request_tool_call(
+    port: u16,
+    mut request: ChatRequest,
+    registry: &crate::tool_call::ToolCallRegistry,
+) -> ChatResult<crate::tool_call::ToolCall> {
+    let grammar = crate::tool_call::gbnf_for_registry(registry);
+    request.grammar = Some(grammar);
+    let response = chat_completion(port, &request)?;
+    let call = crate::tool_call::parse_tool_call_response(&response.content, registry)?;
+    Ok(call)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -236,6 +358,126 @@ mod tests {
     fn system_prompt_includes_summary() {
         let p = build_system_prompt("artboards: Home, About");
         assert!(p.content.contains("artboards: Home, About"));
+    }
+
+    #[test]
+    fn tool_call_system_prompt_lists_every_tool() {
+        let registry = crate::tool_call::default_design_registry();
+        let p = build_tool_call_system_prompt("artboards: Home", &registry);
+        for t in registry.tools() {
+            assert!(
+                p.content.contains(&t.name),
+                "system prompt should list tool {:?}; got:\n{}",
+                t.name,
+                p.content
+            );
+        }
+        assert!(p.content.contains("artboards: Home"));
+    }
+
+    #[test]
+    fn request_with_grammar_serialises_grammar_field() {
+        let r = ChatRequest::from_messages(vec![ChatMessage::user("hi")])
+            .with_grammar("root ::= \"{}\"\n")
+            .with_temperature(0.0)
+            .with_max_tokens(64);
+        let s = serde_json::to_string(&r).expect("json");
+        assert!(s.contains("\"grammar\":\"root ::= "));
+        assert!(s.contains("\"max_tokens\":64"));
+    }
+
+    #[test]
+    fn request_without_grammar_omits_grammar_field() {
+        let r = ChatRequest::from_messages(vec![ChatMessage::user("hi")]);
+        let s = serde_json::to_string(&r).expect("json");
+        assert!(!s.contains("grammar"), "JSON should omit grammar: {s}");
+    }
+
+    /// End-to-end loopback test that drives `request_tool_call`
+    /// against a mock llama-server. Verifies the grammar gets sent
+    /// AND the response is parsed back into a typed `ToolCall`.
+    #[cfg(feature = "llm_sidecar")]
+    #[test]
+    fn request_tool_call_round_trip_against_mock() {
+        let server = tiny_http::Server::http("127.0.0.1:0").expect("mock server");
+        let port = server.server_addr().to_ip().expect("ip").port();
+        let registry = crate::tool_call::default_design_registry();
+        let handle = std::thread::spawn(move || {
+            let mut req = server.incoming_requests().next().expect("req");
+            // Read the request body so we can assert the grammar
+            // is being forwarded to the server.
+            let mut body = String::new();
+            std::io::Read::read_to_string(&mut req.as_reader(), &mut body).expect("read body");
+            assert!(
+                body.contains("\"grammar\""),
+                "grammar missing from request: {body}"
+            );
+            assert!(
+                body.contains("create_artboard"),
+                "tool name missing from grammar: {body}"
+            );
+            let resp_body = serde_json::json!({
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": "{\"tool\":\"create_artboard\",\"arguments\":{\"name\":\"Landing\",\"width\":1920,\"height\":1080}}",
+                    },
+                }],
+                "usage": {"total_tokens": 42},
+                "model": "mock",
+            })
+            .to_string();
+            let resp = tiny_http::Response::from_string(resp_body).with_header(
+                "content-type: application/json"
+                    .parse::<tiny_http::Header>()
+                    .expect("hdr"),
+            );
+            let _ = req.respond(resp);
+        });
+
+        let chat_req = ChatRequest::from_messages(vec![
+            build_tool_call_system_prompt("", &registry),
+            ChatMessage::user("create a 1920×1080 artboard named Landing"),
+        ]);
+        let call = request_tool_call(port, chat_req, &registry).expect("tool call");
+        assert_eq!(call.tool, "create_artboard");
+        assert_eq!(call.arg_str("name"), Some("Landing"));
+        assert_eq!(call.arg_i64("width"), Some(1920));
+        assert_eq!(call.arg_i64("height"), Some(1080));
+        let _ = handle.join();
+    }
+
+    /// Verifies the chat path surfaces a typed parse error when the
+    /// model emits a syntactically-valid but semantically-wrong
+    /// response (right shape, missing required parameter).
+    #[cfg(feature = "llm_sidecar")]
+    #[test]
+    fn request_tool_call_surfaces_missing_param_error() {
+        let server = tiny_http::Server::http("127.0.0.1:0").expect("mock server");
+        let port = server.server_addr().to_ip().expect("ip").port();
+        let registry = crate::tool_call::default_design_registry();
+        let handle = std::thread::spawn(move || {
+            let req = server.incoming_requests().next().expect("req");
+            let resp_body = serde_json::json!({
+                "choices": [{"message": {"role": "assistant", "content":
+                    "{\"tool\":\"create_artboard\",\"arguments\":{\"name\":\"A\",\"width\":100}}"}}],
+                "model": "mock",
+            })
+            .to_string();
+            let resp = tiny_http::Response::from_string(resp_body).with_header(
+                "content-type: application/json"
+                    .parse::<tiny_http::Header>()
+                    .expect("hdr"),
+            );
+            let _ = req.respond(resp);
+        });
+        let chat_req = ChatRequest::from_messages(vec![ChatMessage::user("hi")]);
+        let err = request_tool_call(port, chat_req, &registry).expect_err("missing");
+        assert!(
+            matches!(err, ChatError::Decode(ref m) if m.contains("missing required parameter")),
+            "expected typed decode error, got {err:?}"
+        );
+        let _ = handle.join();
     }
 
     #[cfg(not(feature = "llm_sidecar"))]

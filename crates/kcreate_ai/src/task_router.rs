@@ -164,6 +164,7 @@ pub fn build_layer_naming_prompt(node_names: &[(Uuid, String)]) -> ChatRequest {
         ],
         max_tokens: 512,
         temperature: 0.2,
+        grammar: None,
     }
 }
 
@@ -196,6 +197,7 @@ pub fn build_design_token_prompt(document_json: &str) -> ChatRequest {
         ],
         max_tokens: 1024,
         temperature: 0.1,
+        grammar: None,
     }
 }
 
@@ -226,6 +228,7 @@ pub fn build_accessibility_prompt(document_json: &str) -> ChatRequest {
         ],
         max_tokens: 1024,
         temperature: 0.1,
+        grammar: None,
     }
 }
 

@@ -210,6 +210,7 @@ pub fn llm_chat(
         messages: converted,
         max_tokens,
         temperature,
+        grammar: None,
     };
     let resp = chat_completion(port, &req)?;
     Ok(resp.into())

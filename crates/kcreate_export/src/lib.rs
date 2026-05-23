@@ -15,6 +15,7 @@
 #![forbid(unsafe_op_in_unsafe_fn)]
 
 pub mod batch;
+pub mod cmyk_dither;
 pub mod code_gen;
 pub mod icon_pack;
 pub mod jpeg;
@@ -28,6 +29,7 @@ pub mod svg;
 pub mod webp;
 
 pub use batch::{run_batch, BatchExportError, BatchExportJob, BatchStatus, ExportItem};
+pub use cmyk_dither::{quantize_cmyk_image, CmykDither, CmykPixel};
 pub use code_gen::{inspect_node, node_to_css, node_to_react_style, node_to_tailwind, InspectCode};
 pub use jpeg::{export_jpeg, export_jpeg_to_bytes, JpegExportError, JpegExportOptions};
 pub use pdf::{

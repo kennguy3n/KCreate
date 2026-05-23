@@ -466,6 +466,22 @@ export interface PdfExportOptions {
   widthMm: number;
   heightMm: number;
   title: string;
+  /**
+   * Output device color space.
+   * - `"rgb"` (default): standard `/DeviceRGB`.
+   * - `"cmyk"`: `/DeviceCMYK` for print-bound output.
+   * - `"passThrough"`: leave colors in source space.
+   * When omitted the bridge picks CMYK iff a CMYK working space is set
+   * on the document's color settings, otherwise RGB.
+   */
+  colorMode?: "rgb" | "cmyk" | "passThrough";
+  /**
+   * CMYK rasterisation dithering. Ignored unless `colorMode === "cmyk"`.
+   * - `"floydSteinberg"` (default): error-diffusion; best quality.
+   * - `"bayer8x8"`: 8×8 ordered dither; parallelisable.
+   * - `"none"`: nearest-neighbour quantisation (Phase 2 baseline).
+   */
+  cmykDither?: "none" | "floydSteinberg" | "bayer8x8";
 }
 
 /** WebP export options. `quality` is 0..100; `lossless` overrides quality. */

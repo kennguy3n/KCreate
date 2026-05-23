@@ -26,6 +26,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
+use crate::cmyk_dither::{quantize_cmyk_image, CmykDither};
 use crate::pdf_shading::{
     color_space_for_mode, inject_shadings, resolve_stop_color, GradientGeometry, PdfShadingError,
     PendingShading, ShadingColorSpace,
@@ -68,6 +69,15 @@ pub struct PdfExportOptions {
     /// Defaults to `Rgb` so callers that never opted into the
     /// Phase 2 CMYK pipeline keep producing byte-identical PDFs.
     pub color_mode: PdfColorMode,
+    /// Which dithering algorithm to apply when rasterising layers
+    /// down to 8-bit `/DeviceCMYK`. Only meaningful when
+    /// `color_mode == PdfColorMode::Cmyk`; ignored for `Rgb` and
+    /// `PassThrough`. Defaults to Floyd-Steinberg, matching what
+    /// every print shop expects for hero artwork. Callers running
+    /// thumbnail batches that want predictable parallelisable
+    /// output can opt into `Bayer8x8`; callers reproducing the
+    /// Phase 2 byte-identical output can set `None`.
+    pub cmyk_dither: CmykDither,
 }
 
 impl Default for PdfExportOptions {
@@ -77,6 +87,7 @@ impl Default for PdfExportOptions {
             height_mm: 297.0,
             title: "KCreate document".to_string(),
             color_mode: PdfColorMode::Rgb,
+            cmyk_dither: CmykDither::FloydSteinberg,
         }
     }
 }
@@ -402,6 +413,7 @@ pub fn export_pdf_from_document(
         sy,
         options.height_mm,
         options.color_mode,
+        options.cmyk_dither,
         &mut pending_shadings,
     )?;
 
@@ -436,6 +448,7 @@ fn walk_nodes(
     sy: f64,
     page_height_mm: f64,
     color_mode: PdfColorMode,
+    cmyk_dither: CmykDither,
     pending_shadings: &mut Vec<PendingShading>,
 ) -> Result<(), PdfExportError> {
     for id in ids {
@@ -470,6 +483,7 @@ fn walk_nodes(
                     sy,
                     page_height_mm,
                     color_mode,
+                    cmyk_dither,
                 )?;
             }
             _ => {}
@@ -485,6 +499,7 @@ fn walk_nodes(
             sy,
             page_height_mm,
             color_mode,
+            cmyk_dither,
             pending_shadings,
         )?;
     }
@@ -940,6 +955,7 @@ fn emit_raster(
     sy: f64,
     page_height_mm: f64,
     color_mode: PdfColorMode,
+    cmyk_dither: CmykDither,
 ) -> Result<(), PdfExportError> {
     #[derive(Deserialize)]
     struct Meta {
@@ -966,7 +982,9 @@ fn emit_raster(
     // the historical "PNG → load_from_memory → DynamicImage"
     // round-trip which yields a `/DeviceRGB` image.
     let pdf_image = match color_mode {
-        PdfColorMode::Cmyk => raster_to_cmyk_image(&pixels.rgba, pixels.width, pixels.height)?,
+        PdfColorMode::Cmyk => {
+            raster_to_cmyk_image(&pixels.rgba, pixels.width, pixels.height, cmyk_dither)?
+        }
         PdfColorMode::Rgb | PdfColorMode::PassThrough => {
             raster_to_rgb_image(&pixels.rgba, pixels.width, pixels.height)?
         }
@@ -1038,7 +1056,12 @@ fn raster_to_rgb_image(rgba: &[u8], width: u32, height: u32) -> Result<Image, Pd
 /// transparency through to the print shop should keep the raster
 /// in RGB mode and let the RIP handle the CMYK conversion with a
 /// device-specific profile.
-fn raster_to_cmyk_image(rgba: &[u8], width: u32, height: u32) -> Result<Image, PdfExportError> {
+fn raster_to_cmyk_image(
+    rgba: &[u8],
+    width: u32,
+    height: u32,
+    dither: CmykDither,
+) -> Result<Image, PdfExportError> {
     let pixel_count = (width as usize)
         .checked_mul(height as usize)
         .ok_or_else(|| PdfExportError::Image("raster dimensions overflow usize".into()))?;
@@ -1049,12 +1072,14 @@ fn raster_to_cmyk_image(rgba: &[u8], width: u32, height: u32) -> Result<Image, P
             pixel_count * 4
         )));
     }
+    let row_stride = (width as usize) * 4;
     let mut cmyk_bytes: Vec<u8> = Vec::with_capacity(pixel_count * 4);
-    for px in rgba.chunks_exact(4).take(pixel_count) {
-        let r = f32::from(px[0]) / 255.0;
-        let g = f32::from(px[1]) / 255.0;
-        let b = f32::from(px[2]) / 255.0;
-        let a = f32::from(px[3]) / 255.0;
+    quantize_cmyk_image(width, height, dither, &mut cmyk_bytes, |x, y| {
+        let idx = (y as usize) * row_stride + (x as usize) * 4;
+        let r = f32::from(rgba[idx]) / 255.0;
+        let g = f32::from(rgba[idx + 1]) / 255.0;
+        let b = f32::from(rgba[idx + 2]) / 255.0;
+        let a = f32::from(rgba[idx + 3]) / 255.0;
         // Matte against white paper: out = a * fg + (1 - a) * white.
         // White in linear sRGB is (1, 1, 1); blending in the gamma-
         // encoded sRGB space is technically incorrect, but it
@@ -1063,12 +1088,12 @@ fn raster_to_cmyk_image(rgba: &[u8], width: u32, height: u32) -> Result<Image, P
         let r_m = a.mul_add(r, 1.0 - a);
         let g_m = a.mul_add(g, 1.0 - a);
         let b_m = a.mul_add(b, 1.0 - a);
-        let (c, m, y, k) = srgb_to_cmyk(r_m, g_m, b_m);
-        cmyk_bytes.push(quantize_u8(c));
-        cmyk_bytes.push(quantize_u8(m));
-        cmyk_bytes.push(quantize_u8(y));
-        cmyk_bytes.push(quantize_u8(k));
-    }
+        // srgb_to_cmyk returns a 4-tuple; the dither callback
+        // wants `[f32; 4]`. `<[f32; 4]>::from(tuple)` does the
+        // conversion without tripping clippy's
+        // `tuple_array_conversions` heuristic.
+        <[f32; 4]>::from(srgb_to_cmyk(r_m, g_m, b_m))
+    });
     let xobject = ImageXObject {
         width: Px(width as usize),
         height: Px(height as usize),
@@ -1081,16 +1106,6 @@ fn raster_to_cmyk_image(rgba: &[u8], width: u32, height: u32) -> Result<Image, P
         clipping_bbox: None,
     };
     Ok(Image::from(xobject))
-}
-
-/// Quantise a `[0.0, 1.0]` float to a `[0, 255]` byte with
-/// clamp-to-finite semantics. NaN / infinity inputs map to 0,
-/// matching the rest of the export code.
-fn quantize_u8(v: f32) -> u8 {
-    if !v.is_finite() {
-        return 0;
-    }
-    (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8
 }
 
 fn world_to_pdf(
@@ -1817,11 +1832,12 @@ mod tests {
 
     #[test]
     fn raster_to_cmyk_image_red_converts_to_full_magenta_yellow() {
-        // sRGB red (255, 0, 0, 255) → CMYK (0, 1, 1, 0). The
-        // quantised CMYK byte stream should therefore be
-        // [0, 255, 255, 0] per pixel.
+        // sRGB red (255, 0, 0, 255) → CMYK (0, 1, 1, 0). Solid
+        // input has zero quantisation error so Floyd-Steinberg
+        // (the default) round-trips exactly to [0, 255, 255, 0].
         let buf = red_2x2_rgba();
-        let img = raster_to_cmyk_image(&buf, 2, 2).expect("conversion succeeds");
+        let img = raster_to_cmyk_image(&buf, 2, 2, CmykDither::FloydSteinberg)
+            .expect("conversion succeeds");
         assert!(
             matches!(img.image.color_space, ColorSpace::Cmyk),
             "expected ColorSpace::Cmyk, got {:?}",
@@ -1839,9 +1855,11 @@ mod tests {
     #[test]
     fn raster_to_cmyk_image_transparent_pixel_mattes_to_white() {
         // A fully transparent pixel mattes against white paper, which
-        // is zero ink in CMYK.
+        // is zero ink in CMYK. We disable dithering for this test so
+        // we get exact zeros (Bayer/Floyd would noise around 0 with
+        // sub-LSB perturbation).
         let buf = vec![255, 0, 0, 0, 0, 0, 0, 0];
-        let img = raster_to_cmyk_image(&buf, 2, 1).expect("conversion succeeds");
+        let img = raster_to_cmyk_image(&buf, 2, 1, CmykDither::None).expect("conversion succeeds");
         let pixels: Vec<&[u8]> = img.image.image_data.chunks_exact(4).collect();
         for px in &pixels {
             assert_eq!(px[..], [0, 0, 0, 0], "transparent → no ink");
@@ -1853,8 +1871,8 @@ mod tests {
         // 2×2 should be 16 bytes; pass 12 to ensure the bounds check
         // catches the underflow before the unchecked slice indexing.
         let buf = vec![0u8; 12];
-        let err =
-            raster_to_cmyk_image(&buf, 2, 2).expect_err("undersized buffer should be rejected");
+        let err = raster_to_cmyk_image(&buf, 2, 2, CmykDither::None)
+            .expect_err("undersized buffer should be rejected");
         match err {
             PdfExportError::Image(msg) => assert!(
                 msg.contains("expected at least"),
@@ -1865,13 +1883,39 @@ mod tests {
     }
 
     #[test]
-    fn quantize_u8_handles_finite_range_and_nan() {
-        assert_eq!(quantize_u8(0.0), 0);
-        assert_eq!(quantize_u8(1.0), 255);
-        assert_eq!(quantize_u8(0.5), 128);
-        assert_eq!(quantize_u8(-0.1), 0);
-        assert_eq!(quantize_u8(2.0), 255);
-        assert_eq!(quantize_u8(f32::NAN), 0);
-        assert_eq!(quantize_u8(f32::INFINITY), 0);
+    fn raster_to_cmyk_image_dither_choice_affects_gradient_output() {
+        // Build a 16×16 horizontal red→white gradient in sRGB,
+        // export with Floyd-Steinberg vs. Bayer vs. none. The
+        // three resulting byte streams must differ — otherwise
+        // the dither selection isn't actually being applied.
+        let w: u32 = 16;
+        let h: u32 = 16;
+        let mut buf = Vec::with_capacity((w * h * 4) as usize);
+        for _y in 0..h {
+            for x in 0..w {
+                let t = (x as f32) / ((w - 1) as f32);
+                buf.push((255.0 * (1.0 - t * 0.5)) as u8);
+                buf.push((255.0 * 0.5 * (1.0 - t)) as u8);
+                buf.push((255.0 * 0.5 * (1.0 - t)) as u8);
+                buf.push(255);
+            }
+        }
+        let none = raster_to_cmyk_image(&buf, w, h, CmykDither::None).expect("none succeeds");
+        let fs = raster_to_cmyk_image(&buf, w, h, CmykDither::FloydSteinberg)
+            .expect("floyd-steinberg succeeds");
+        let bayer = raster_to_cmyk_image(&buf, w, h, CmykDither::Bayer8x8).expect("bayer succeeds");
+        assert_ne!(
+            none.image.image_data, fs.image.image_data,
+            "Floyd-Steinberg should diverge from no-dither on gradient"
+        );
+        assert_ne!(
+            none.image.image_data, bayer.image.image_data,
+            "Bayer should diverge from no-dither on gradient"
+        );
+        // Both must still be the same length (no truncation).
+        let expected_len = (w * h * 4) as usize;
+        assert_eq!(none.image.image_data.len(), expected_len);
+        assert_eq!(fs.image.image_data.len(), expected_len);
+        assert_eq!(bayer.image.image_data.len(), expected_len);
     }
 }

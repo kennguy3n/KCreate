@@ -566,6 +566,82 @@ function broadcastColorSettingsChanged(): void {
   win.webContents.send("kcreate/color/settings/changed");
 }
 
+/// Period (ms) for the Phase 3 collab event-drain timer. Balances
+/// "remote cursors feel responsive" (smaller is better) against
+/// "we don't waste a workspace lock + IPC round-trip when nothing
+/// is happening" (larger is better). 50ms gives 20Hz cursor
+/// updates, which matches WebSocket-based collab tools (Figma /
+/// Miro use 30–60Hz).
+const SESSION_EVENT_TICK_MS = 50;
+
+/// Process-wide handle for the session event-drain timer. `null`
+/// when no session is running; rest of the code reads `null` as
+/// "tick is stopped" and avoids the bridge call entirely.
+let sessionEventTickHandle: NodeJS.Timeout | null = null;
+
+function startSessionEventTick(): void {
+  if (sessionEventTickHandle !== null) return;
+  sessionEventTickHandle = setInterval(() => {
+    drainSessionEvents();
+  }, SESSION_EVENT_TICK_MS);
+  // Unref so the timer never holds Electron in the event loop on
+  // its own — quit() should not have to remember to stop it.
+  sessionEventTickHandle.unref();
+}
+
+function stopSessionEventTick(): void {
+  if (sessionEventTickHandle === null) return;
+  clearInterval(sessionEventTickHandle);
+  sessionEventTickHandle = null;
+}
+
+/// Drain pending session events from the bridge and forward each
+/// entry to the renderer. If any event is a presence/peer update,
+/// re-publish the scene so the cursor overlay refreshes
+/// (`sync_scene_locked` in the bridge appends remote cursors to
+/// every scene it builds).
+///
+/// Quiet on error: the most likely failures are "no session is
+/// running" (race with `session_leave`) and "bridge not yet
+/// loaded" — both safe to ignore at tick rate.
+function drainSessionEvents(): void {
+  const win = mainWindow;
+  if (!win || win.isDestroyed()) return;
+  let payload: string;
+  try {
+    payload = requireBridge().sessionDrainEvents();
+  } catch {
+    // Session was torn down between ticks; nothing to forward.
+    return;
+  }
+  let parsed: Array<{ kind: string }>;
+  try {
+    parsed = JSON.parse(payload) as Array<{ kind: string }>;
+  } catch {
+    return;
+  }
+  if (parsed.length === 0) return;
+  let needsRender = false;
+  for (const ev of parsed) {
+    win.webContents.send("kcreate/session/event", JSON.stringify(ev));
+    if (
+      ev.kind === "presenceUpdated" ||
+      ev.kind === "peerLeft" ||
+      ev.kind === "peerJoined"
+    ) {
+      needsRender = true;
+    }
+  }
+  if (needsRender) {
+    try {
+      requireBridge().documentRequestRender();
+    } catch {
+      // No project loaded yet, or renderer not initialised. Both
+      // are no-ops as far as the cursor overlay is concerned.
+    }
+  }
+}
+
 function registerIpcHandlers(): void {
   ipcMain.handle("kcreate/renderer/init", (_e, width: number, height: number) =>
     requireBridge().rendererInit(width, height),
@@ -1466,6 +1542,84 @@ function registerIpcHandlers(): void {
     "kcreate/text/opentype/update",
     (_e, nodeId: string, featuresJson: string) => {
       requireBridge().textOpentypeFeaturesUpdate(nodeId, featuresJson);
+    },
+  );
+
+  // ---------------------------------------------------------------------
+  // Phase 3 — LAN collaboration session
+  //
+  // The bridge exposes seven entry points
+  // (`session_{start,leave,join,peers,drain_events,send_presence,info}`)
+  // plus `document_request_render` for the cursor-overlay refresh
+  // path. The main process plumbs them all through `kcreate/session/*`
+  // channels; the renderer subscribes to a single push channel
+  // (`kcreate/session/event`) for live updates.
+  //
+  // We start a 50ms timer when the first `start` succeeds and stop
+  // it on `leave`. The timer polls `sessionDrainEvents`, fans the
+  // resulting JSON event array out to the renderer, and — if any
+  // entry is a presence update — re-publishes the scene so remote
+  // cursors animate without waiting for a local document mutation.
+  // ---------------------------------------------------------------------
+  ipcMain.handle(
+    "kcreate/session/start",
+    (
+      _e,
+      seedB64: string,
+      displayName: string,
+      projectId: string,
+      advertiseMdns: boolean,
+    ) => {
+      const report = requireBridge().sessionStart(
+        seedB64,
+        displayName,
+        projectId,
+        advertiseMdns,
+      );
+      startSessionEventTick();
+      return report;
+    },
+  );
+  ipcMain.handle("kcreate/session/leave", () => {
+    stopSessionEventTick();
+    requireBridge().sessionLeave();
+  });
+  ipcMain.handle(
+    "kcreate/session/join",
+    (
+      _e,
+      peerId: string,
+      publicKey: string,
+      displayName: string,
+      socketAddr: string,
+      certFingerprintB64: string,
+    ) => {
+      requireBridge().sessionJoin(
+        peerId,
+        publicKey,
+        displayName,
+        socketAddr,
+        certFingerprintB64,
+      );
+    },
+  );
+  ipcMain.handle("kcreate/session/peers", () =>
+    requireBridge().sessionPeers(),
+  );
+  ipcMain.handle("kcreate/session/info", () => requireBridge().sessionInfo());
+  ipcMain.handle(
+    "kcreate/session/sendPresence",
+    (
+      _e,
+      activePage: string | null,
+      selectionJson: string,
+      cursorJson: string | null,
+    ) => {
+      requireBridge().sessionSendPresence(
+        activePage,
+        selectionJson,
+        cursorJson,
+      );
     },
   );
 }

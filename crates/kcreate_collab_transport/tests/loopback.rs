@@ -60,11 +60,16 @@ async fn two_peers_handshake_and_appear_in_each_others_rosters() {
     let bob_peer_id = bob.local_identity().peer_id;
     let alice_peer_id = alice.local_identity().peer_id;
     assert!(
-        alice.connected_peer_ids().into_iter().any(|p| p == bob_peer_id),
+        alice
+            .connected_peer_ids()
+            .into_iter()
+            .any(|p| p == bob_peer_id),
         "alice should see bob"
     );
     assert!(
-        bob.connected_peer_ids().into_iter().any(|p| p == alice_peer_id),
+        bob.connected_peer_ids()
+            .into_iter()
+            .any(|p| p == alice_peer_id),
         "bob should see alice"
     );
 

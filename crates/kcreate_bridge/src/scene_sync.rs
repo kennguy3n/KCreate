@@ -113,6 +113,39 @@ const ARTBOARD_LABEL_FONT: &str = "Inter";
 /// Default label font size in document pixels.
 const ARTBOARD_LABEL_FONT_SIZE: f32 = 12.0;
 
+/// Width (world units) of the remote-peer cursor triangle. Sized
+/// to read clearly at 1.0 zoom without overlapping fine vector
+/// detail; the renderer scales it with the viewport like every
+/// other scene object.
+const CURSOR_WIDTH: f32 = 14.0;
+/// Height (world units) of the remote-peer cursor triangle.
+const CURSOR_HEIGHT: f32 = 18.0;
+/// Gap between the cursor's bounding box and the name label.
+const CURSOR_LABEL_GAP: f32 = 2.0;
+/// Font size used for the cursor's display-name label. Slightly
+/// smaller than artboard labels because cursors stack up when
+/// multiple peers are in the same area.
+const CURSOR_LABEL_FONT_SIZE: f32 = 10.0;
+
+/// World-space cursor + label payload for a single remote peer.
+///
+/// Lives at the bridge layer (not in `kcreate_renderer`) so the
+/// renderer stays oblivious to collaboration concepts. The bridge
+/// translates an authoritative collab presence map into a list of
+/// these and hands them to [`SceneSync::append_presence_cursors`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct PresenceCursor {
+    /// Opaque peer identifier; used as the seed for the
+    /// deterministic per-peer cursor colour.
+    pub peer_id: String,
+    /// Human-readable name painted next to the cursor. May be
+    /// empty (in which case the label is suppressed).
+    pub display_name: String,
+    /// Cursor position in document world coordinates.
+    pub x: f64,
+    pub y: f64,
+}
+
 /// First `ObjectId` value used for overlay objects (selection
 /// highlights, artboard shadow rects, artboard name labels — any
 /// scene object that isn't tied to a document UUID).
@@ -316,6 +349,102 @@ impl SceneSync {
         }
 
         scene
+    }
+
+    /// Append remote-peer cursor overlays to an existing scene, in
+    /// addition to whatever selection highlights / artboard chrome
+    /// `sync_document_to_scene` already laid down.
+    ///
+    /// Each cursor renders as:
+    ///
+    /// 1. A small filled triangle (`Path`) pointing up-left at the
+    ///    cursor's world-space `(x, y)`, with a deterministic
+    ///    peer-specific colour derived from the peer id hash.
+    /// 2. A short label (`Text`) carrying the peer's display name,
+    ///    painted just below-right of the triangle so the cursor
+    ///    glyph itself doesn't occlude it.
+    ///
+    /// The objects are emitted through the same scene-graph path as
+    /// real document layers — they composite naturally with strokes,
+    /// fills, and effects, and they pan/zoom with the canvas because
+    /// the renderer applies viewport to all objects equally. Hit
+    /// testing is unaffected: the ids come from the overlay range
+    /// (high half of `u64`) so `is_overlay_id` returns true and
+    /// `hit_test` filters them out before reverse-z scanning.
+    pub fn append_presence_cursors(
+        &mut self,
+        scene: &mut Scene,
+        cursors: &[PresenceCursor],
+        starting_z: i32,
+    ) {
+        if cursors.is_empty() {
+            return;
+        }
+        let mut overlay = OverlayIdAllocator::new();
+        // Skip past the OBJECT-id range used by selection highlights
+        // earlier in this scene by relying on the OverlayIdAllocator
+        // starting from OVERLAY_ID_THRESHOLD upward — selection
+        // highlights count down from u64::MAX, so the two streams
+        // can't collide unless either side allocates ~2^63 ids.
+        let mut z = starting_z;
+        for cursor in cursors {
+            let color = peer_color(&cursor.peer_id);
+            let (cx, cy) = (cursor.x as f32, cursor.y as f32);
+
+            // Triangle outline (filled): an 8-vertex teardrop pointer
+            // is overkill for a remote cursor; a 3-point isoceles
+            // triangle reads instantly and costs almost nothing to
+            // tesselate on the CPU backend.
+            let path = vec![
+                PathCommand::MoveTo(Point2::new(cx, cy)),
+                PathCommand::LineTo(Point2::new(cx + CURSOR_WIDTH, cy + CURSOR_HEIGHT * 0.6)),
+                PathCommand::LineTo(Point2::new(
+                    cx + CURSOR_WIDTH * 0.45,
+                    cy + CURSOR_HEIGHT * 0.6,
+                )),
+                PathCommand::LineTo(Point2::new(cx + CURSOR_WIDTH * 0.3, cy + CURSOR_HEIGHT)),
+                PathCommand::Close,
+            ];
+            let cursor_style = Style {
+                fill: Some(color),
+                stroke: Some(Stroke::new(Color::rgba(1.0, 1.0, 1.0, 0.9), 1.0)),
+            };
+            let cursor_id = Self::next_overlay_id(&mut overlay);
+            let cursor_obj = Object::new(ObjectKind::Path(path), cursor_style)
+                .with_id(cursor_id)
+                .with_z(z);
+            scene.add_object(cursor_obj);
+            z += 1;
+
+            // Name label below-right of the cursor tip. We emit the
+            // text only when a non-empty display_name is set; otherwise
+            // the bridge would render an empty Text node which the
+            // renderer happily wastes a glyph cache slot on.
+            if !cursor.display_name.is_empty() {
+                let label_origin = Point2::new(
+                    cx + CURSOR_WIDTH + CURSOR_LABEL_GAP,
+                    cy + CURSOR_HEIGHT + CURSOR_LABEL_FONT_SIZE,
+                );
+                let label_style = Style {
+                    fill: Some(color),
+                    stroke: None,
+                };
+                let label_id = Self::next_overlay_id(&mut overlay);
+                let label_obj = Object::new(
+                    ObjectKind::Text {
+                        origin: label_origin,
+                        text: cursor.display_name.clone(),
+                        font_family: ARTBOARD_LABEL_FONT.to_string(),
+                        font_size: CURSOR_LABEL_FONT_SIZE,
+                    },
+                    label_style,
+                )
+                .with_id(label_id)
+                .with_z(z);
+                scene.add_object(label_obj);
+                z += 1;
+            }
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -667,6 +796,50 @@ const fn node_fill(node: &Node) -> Option<Color> {
         }
         kcreate_core::node::FillStyle::None | kcreate_core::node::FillStyle::Gradient(_) => None,
     }
+}
+
+/// Deterministic per-peer colour for the presence cursor + label.
+///
+/// We hash the peer id (a base64url string in production) and pick
+/// an HSL hue from the result; saturation and lightness are
+/// fixed so every peer gets a saturated mid-tone that contrasts
+/// against both white and dark canvas backgrounds. The mapping is
+/// stable across sessions because it's a pure function of the
+/// peer id — peers don't need to negotiate colours.
+fn peer_color(peer_id: &str) -> Color {
+    // Cheap, deterministic, non-cryptographic — same family as the
+    // hash used in `kcreate_renderer::scene::next_id`. Wrapping is
+    // intentional (we want the same colour every time we hash the
+    // same string).
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in peer_id.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    let hue = (hash % 360) as f32; // [0, 360)
+    let saturation = 0.65;
+    let lightness = 0.5;
+    let (r, g, b) = hsl_to_rgb(hue, saturation, lightness);
+    Color::rgba(r, g, b, 1.0)
+}
+
+fn hsl_to_rgb(h: f32, s: f32, l: f32) -> (f32, f32, f32) {
+    if s == 0.0 {
+        return (l, l, l);
+    }
+    let c = (1.0 - (2.0 * l - 1.0).abs()) * s;
+    let h_prime = h / 60.0;
+    let x = c * (1.0 - (h_prime % 2.0 - 1.0).abs());
+    let (r1, g1, b1) = match h_prime as i32 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    let m = l - c / 2.0;
+    (r1 + m, g1 + m, b1 + m)
 }
 
 fn node_style(node: &Node) -> Style {

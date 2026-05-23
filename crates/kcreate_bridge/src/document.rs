@@ -1213,17 +1213,63 @@ fn sync_scene_locked(guard: &mut parking_lot::MutexGuard<'_, Option<Workspace>>)
     let Some(ws) = guard.as_mut() else {
         return Ok(());
     };
-    let scene = ws.scene_sync.sync_document_to_scene(
+    #[allow(unused_mut)]
+    let mut scene = ws.scene_sync.sync_document_to_scene(
         &ws.project.document,
         Some(ws.store.blobs()),
         &ws.selection,
     );
+    // Layer remote-peer cursors on top of the document. The collab
+    // module reads from a process-local mutex (the same one
+    // `session_*` writes to) so it does not need the workspace
+    // lock; we hold the workspace lock here for the scene sync,
+    // and the collab lock is a separate lock — see
+    // `collab::pump_inbound` for the ordering rationale.
+    #[cfg(feature = "collab")]
+    {
+        let triples = crate::collab::presence_cursors();
+        if !triples.is_empty() {
+            let cursors: Vec<crate::scene_sync::PresenceCursor> = triples
+                .into_iter()
+                .map(
+                    |(peer_id, display_name, cursor)| crate::scene_sync::PresenceCursor {
+                        peer_id,
+                        display_name,
+                        x: cursor.x,
+                        y: cursor.y,
+                    },
+                )
+                .collect();
+            // Layer cursors above the highest selection-highlight z.
+            // `sync_document_to_scene` returns objects with z values
+            // bounded by their document order; selection highlights
+            // are appended after them with z starting from that
+            // bound, so any z above `i32::MAX/2` will paint on top
+            // of everything else without risking overflow.
+            ws.scene_sync
+                .append_presence_cursors(&mut scene, &cursors, i32::MAX / 2);
+        }
+    }
     // Renderer not initialised is fine here: the host may be working
     // headlessly. Other render errors propagate.
     match crate::state::render_scene(scene) {
         Ok(_) | Err(crate::state::BridgeError::NotInitialized) => Ok(()),
         Err(e) => Err(DocumentBridgeError::Bridge(e)),
     }
+}
+
+/// Re-run [`sync_scene_locked`] without applying a document
+/// mutation. Used by the Phase 3 collab session to re-publish the
+/// scene whenever remote presence (cursors, joins, leaves)
+/// changes — the cursor overlay is appended inside
+/// `sync_scene_locked` so this is the same path the editor uses
+/// for selection changes.
+///
+/// `Ok(())` when no project is loaded, mirroring the rest of the
+/// "no-op when headless" surface of `sync_scene_locked`.
+pub fn document_request_render() -> Result<()> {
+    let mut guard = slot().lock();
+    sync_scene_locked(&mut guard)
 }
 
 // -----------------------------------------------------------------------------

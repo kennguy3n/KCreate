@@ -565,6 +565,194 @@ pub const PAGE_LAYOUT_METADATA_KEY: &str = "page_layout";
 /// (template inherited by content pages).
 pub const MASTER_PAGE_METADATA_KEY: &str = "is_master";
 
+/// Metadata key used on a `TextLayer` node to store its
+/// [`TextFrameOptions`] (multi-column, hyphenation, overflow, etc).
+pub const TEXT_FRAME_METADATA_KEY: &str = "text_frame";
+
+/// Metadata key used on a `TextLayer` node to store its
+/// [`OpenTypeFeatures`] (ligatures, kerning, stylistic sets, etc).
+pub const OPENTYPE_FEATURES_METADATA_KEY: &str = "opentype_features";
+
+/// Per-side inset (top / right / bottom / left) in pixels. Used by
+/// [`TextFrameOptions::inset`] to pad text away from the frame
+/// bounds — the layout engine subtracts these from the frame
+/// before splitting into columns.
+///
+/// Distinct from [`Margins`] (line ~900), which carries page
+/// margins in *millimetres*; text-frame insets are in renderer
+/// pixels because the paragraph engine works in shaped-glyph
+/// coordinates.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
+#[allow(clippy::derive_partial_eq_without_eq)] // f64 fields
+pub struct FrameInsets {
+    pub top: f64,
+    pub right: f64,
+    pub bottom: f64,
+    pub left: f64,
+}
+
+impl FrameInsets {
+    /// Construct a uniform inset on all four sides.
+    #[must_use]
+    pub const fn uniform(value: f64) -> Self {
+        Self {
+            top: value,
+            right: value,
+            bottom: value,
+            left: value,
+        }
+    }
+}
+
+/// What to do when text doesn't fit in the frame.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TextOverflow {
+    /// Clip overflowing lines (default).
+    #[default]
+    Clip,
+    /// Replace the last visible line's tail with a horizontal ellipsis.
+    Ellipsis,
+    /// Render overflowing lines outside the frame bounds.
+    Overflow,
+}
+
+/// How a text frame's content wraps around its bounds.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TextWrapMode {
+    /// No wrapping — single line, may overflow horizontally.
+    None,
+    /// Wrap at the frame's bounding box (default).
+    #[default]
+    BoundingBox,
+    /// Wrap around a non-rectangular contour (Phase 3 — currently
+    /// treated as `BoundingBox`; the field is here so wire format
+    /// doesn't change when the renderer learns contour wrapping).
+    Contour,
+}
+
+/// Vertical anchor for text inside its frame.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VerticalAlign {
+    #[default]
+    Top,
+    Middle,
+    Bottom,
+}
+
+/// How a text frame resizes itself as its content changes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TextAutoSize {
+    /// Frame stays the user-defined width and height (default).
+    #[default]
+    Fixed,
+    /// Height grows to fit the content; width is fixed.
+    HeightAuto,
+    /// Both width and height grow to fit the content.
+    WidthAndHeightAuto,
+}
+
+/// Per-text-layer frame options: multi-column, hyphenation,
+/// overflow handling, vertical alignment, inset, auto-size.
+///
+/// Persisted on `TextLayer::metadata` under
+/// [`TEXT_FRAME_METADATA_KEY`]. The layout engine in
+/// `kcreate_text::paragraph` consumes this struct when shaping
+/// runs of text against a frame's bounds.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[allow(clippy::derive_partial_eq_without_eq)] // f64 column_gap
+pub struct TextFrameOptions {
+    pub overflow: TextOverflow,
+    /// Number of columns to split the frame into. Clamped to `1..=8`
+    /// by the layout engine; we store the raw value here so writers
+    /// can round-trip ill-formed input without losing it.
+    pub columns: u32,
+    /// Gap between columns in pixels.
+    pub column_gap: f64,
+    pub wrap_mode: TextWrapMode,
+    /// When `true`, the line breaker may insert soft hyphens at
+    /// pattern-matched positions in the active language.
+    pub hyphenation: bool,
+    /// BCP-47 language tag (e.g. `"en-US"`, `"de-DE"`). The shaper
+    /// uses this to pick a hyphenation pattern set.
+    pub hyphenation_language: String,
+    pub vertical_alignment: VerticalAlign,
+    /// Pixel inset on each side. Subtracted from the frame's bounds
+    /// before splitting into columns and laying out lines.
+    pub inset: FrameInsets,
+    pub auto_size: TextAutoSize,
+}
+
+impl Default for TextFrameOptions {
+    fn default() -> Self {
+        Self {
+            overflow: TextOverflow::default(),
+            columns: 1,
+            column_gap: 12.0,
+            wrap_mode: TextWrapMode::default(),
+            hyphenation: false,
+            hyphenation_language: String::from("en-US"),
+            vertical_alignment: VerticalAlign::default(),
+            inset: FrameInsets::default(),
+            auto_size: TextAutoSize::default(),
+        }
+    }
+}
+
+/// Per-text-layer OpenType feature toggles. Mirrors a small subset
+/// of the OT feature tag space — the same flags surface in every
+/// professional layout tool. Persisted on `TextLayer::metadata`
+/// under [`OPENTYPE_FEATURES_METADATA_KEY`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+// Each field maps 1:1 to an OpenType feature tag (`liga`, `kern`,
+// `smcp`, …). Refactoring into a state machine would obscure that
+// mapping and force a wire-format break; the layout panel reads each
+// flag independently.
+#[allow(clippy::struct_excessive_bools)]
+pub struct OpenTypeFeatures {
+    /// `liga` + `clig` — standard and contextual ligatures.
+    pub ligatures: bool,
+    /// `calt` — contextual alternates.
+    pub contextual_alternates: bool,
+    /// `kern` — pair-kerning.
+    pub kerning: bool,
+    /// `smcp` — small caps.
+    pub small_caps: bool,
+    /// `onum` — old-style figures.
+    pub old_style_figures: bool,
+    /// `tnum` — tabular figures (fixed-width digits).
+    pub tabular_figures: bool,
+    /// `ss01`..=`ss20` — list of enabled stylistic sets.
+    /// Each value is the set index (`1` → `ss01`). Values outside
+    /// `1..=20` are ignored by the shaper.
+    pub stylistic_sets: Vec<u8>,
+    /// `frac` — fractions (e.g. `1/2` → ½).
+    pub fractions: bool,
+    /// `ordn` — ordinals (e.g. `1st` superscripted).
+    pub ordinals: bool,
+}
+
+impl Default for OpenTypeFeatures {
+    fn default() -> Self {
+        // Sensible OT defaults: ligatures and kerning ON, everything
+        // else OFF. This matches Word / InDesign / Figma defaults.
+        Self {
+            ligatures: true,
+            contextual_alternates: true,
+            kerning: true,
+            small_caps: false,
+            old_style_figures: false,
+            tabular_figures: false,
+            stylistic_sets: Vec::new(),
+            fractions: false,
+            ordinals: false,
+        }
+    }
+}
+
 /// What triggers an [`Interaction`] in prototype playback.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -888,6 +1076,63 @@ impl Node {
             MASTER_PAGE_METADATA_KEY.to_string(),
             serde_json::Value::Bool(master),
         );
+        self.touch();
+    }
+
+    /// Decode the node's [`TextFrameOptions`]. Returns
+    /// [`TextFrameOptions::default`] when the metadata key is absent
+    /// or the payload is malformed — readers always get a usable
+    /// frame description.
+    ///
+    /// No-op on non-`TextLayer` nodes (returns the default).
+    #[must_use]
+    pub fn text_frame_options(&self) -> TextFrameOptions {
+        if self.node_type != NodeType::TextLayer {
+            return TextFrameOptions::default();
+        }
+        self.metadata
+            .get(TEXT_FRAME_METADATA_KEY)
+            .and_then(|v| serde_json::from_value::<TextFrameOptions>(v.clone()).ok())
+            .unwrap_or_default()
+    }
+
+    /// Persist [`TextFrameOptions`] onto a `TextLayer` node. No-op
+    /// on other node types so the wire format stays clean.
+    pub fn set_text_frame_options(&mut self, options: &TextFrameOptions) {
+        if self.node_type != NodeType::TextLayer {
+            return;
+        }
+        let value = serde_json::to_value(options).unwrap_or(serde_json::Value::Null);
+        self.metadata
+            .insert(TEXT_FRAME_METADATA_KEY.to_string(), value);
+        self.touch();
+    }
+
+    /// Decode the node's [`OpenTypeFeatures`]. Returns the
+    /// `Default` value (ligatures + kerning on, everything else
+    /// off) when the metadata key is absent or malformed.
+    ///
+    /// No-op on non-`TextLayer` nodes (returns the default).
+    #[must_use]
+    pub fn opentype_features(&self) -> OpenTypeFeatures {
+        if self.node_type != NodeType::TextLayer {
+            return OpenTypeFeatures::default();
+        }
+        self.metadata
+            .get(OPENTYPE_FEATURES_METADATA_KEY)
+            .and_then(|v| serde_json::from_value::<OpenTypeFeatures>(v.clone()).ok())
+            .unwrap_or_default()
+    }
+
+    /// Persist [`OpenTypeFeatures`] onto a `TextLayer` node. No-op
+    /// on other node types.
+    pub fn set_opentype_features(&mut self, features: &OpenTypeFeatures) {
+        if self.node_type != NodeType::TextLayer {
+            return;
+        }
+        let value = serde_json::to_value(features).unwrap_or(serde_json::Value::Null);
+        self.metadata
+            .insert(OPENTYPE_FEATURES_METADATA_KEY.to_string(), value);
         self.touch();
     }
 }
@@ -1310,5 +1555,148 @@ mod tests {
     fn page_orientation_serializes_snake_case() {
         let s = serde_json::to_string(&PageOrientation::Landscape).expect("serialize");
         assert_eq!(s, r#""landscape""#);
+    }
+
+    #[test]
+    fn text_frame_options_default_is_single_column_clip() {
+        let opts = TextFrameOptions::default();
+        assert_eq!(opts.overflow, TextOverflow::Clip);
+        assert_eq!(opts.columns, 1);
+        assert!(!opts.hyphenation);
+        assert_eq!(opts.vertical_alignment, VerticalAlign::Top);
+        assert_eq!(opts.auto_size, TextAutoSize::Fixed);
+        assert_eq!(opts.hyphenation_language, "en-US");
+    }
+
+    #[test]
+    fn text_frame_options_round_trips_through_json() {
+        let opts = TextFrameOptions {
+            overflow: TextOverflow::Ellipsis,
+            columns: 3,
+            column_gap: 24.0,
+            wrap_mode: TextWrapMode::BoundingBox,
+            hyphenation: true,
+            hyphenation_language: String::from("de-DE"),
+            vertical_alignment: VerticalAlign::Middle,
+            inset: FrameInsets {
+                top: 8.0,
+                right: 12.0,
+                bottom: 8.0,
+                left: 12.0,
+            },
+            auto_size: TextAutoSize::HeightAuto,
+        };
+        let json = serde_json::to_string(&opts).expect("serialize");
+        let back: TextFrameOptions = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, opts);
+    }
+
+    #[test]
+    fn text_frame_options_enums_serialize_snake_case() {
+        // Catch wire format regressions before they reach the
+        // TypeScript side — `shared/scene.ts` mirrors these strings
+        // verbatim.
+        assert_eq!(
+            serde_json::to_string(&TextOverflow::Ellipsis).expect("serialize"),
+            r#""ellipsis""#,
+        );
+        assert_eq!(
+            serde_json::to_string(&TextWrapMode::BoundingBox).expect("serialize"),
+            r#""bounding_box""#,
+        );
+        assert_eq!(
+            serde_json::to_string(&VerticalAlign::Bottom).expect("serialize"),
+            r#""bottom""#,
+        );
+        assert_eq!(
+            serde_json::to_string(&TextAutoSize::WidthAndHeightAuto).expect("serialize"),
+            r#""width_and_height_auto""#,
+        );
+    }
+
+    #[test]
+    fn opentype_features_default_has_ligatures_and_kerning_on() {
+        let f = OpenTypeFeatures::default();
+        assert!(f.ligatures);
+        assert!(f.contextual_alternates);
+        assert!(f.kerning);
+        assert!(!f.small_caps);
+        assert!(!f.old_style_figures);
+        assert!(!f.tabular_figures);
+        assert!(f.stylistic_sets.is_empty());
+        assert!(!f.fractions);
+        assert!(!f.ordinals);
+    }
+
+    #[test]
+    fn opentype_features_round_trip_through_json() {
+        let features = OpenTypeFeatures {
+            ligatures: false,
+            contextual_alternates: false,
+            kerning: true,
+            small_caps: true,
+            old_style_figures: true,
+            tabular_figures: false,
+            stylistic_sets: vec![1, 4, 17],
+            fractions: true,
+            ordinals: false,
+        };
+        let json = serde_json::to_string(&features).expect("serialize");
+        let back: OpenTypeFeatures = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, features);
+    }
+
+    #[test]
+    fn node_text_frame_round_trip_via_metadata() {
+        let mut text = Node::new(NodeType::TextLayer, "Body");
+        // Default before any set call.
+        assert_eq!(text.text_frame_options(), TextFrameOptions::default());
+
+        let opts = TextFrameOptions {
+            columns: 2,
+            column_gap: 18.0,
+            hyphenation: true,
+            hyphenation_language: String::from("en-GB"),
+            ..TextFrameOptions::default()
+        };
+        text.set_text_frame_options(&opts);
+        assert_eq!(text.text_frame_options(), opts);
+
+        // No-op on non-TextLayer nodes — the wire format must not
+        // contain spurious text-frame metadata on shapes.
+        let mut shape = Node::new(NodeType::VectorLayer, "Rect");
+        shape.set_text_frame_options(&opts);
+        assert_eq!(shape.text_frame_options(), TextFrameOptions::default());
+        assert!(!shape.metadata.contains_key(TEXT_FRAME_METADATA_KEY));
+    }
+
+    #[test]
+    fn node_opentype_features_round_trip_via_metadata() {
+        let mut text = Node::new(NodeType::TextLayer, "Title");
+        assert_eq!(text.opentype_features(), OpenTypeFeatures::default());
+
+        let features = OpenTypeFeatures {
+            small_caps: true,
+            stylistic_sets: vec![1, 2, 5],
+            ..OpenTypeFeatures::default()
+        };
+        text.set_opentype_features(&features);
+        assert_eq!(text.opentype_features(), features);
+
+        let mut shape = Node::new(NodeType::VectorLayer, "Rect");
+        shape.set_opentype_features(&features);
+        assert_eq!(shape.opentype_features(), OpenTypeFeatures::default());
+        assert!(!shape
+            .metadata
+            .contains_key(OPENTYPE_FEATURES_METADATA_KEY));
+    }
+
+    #[test]
+    fn frame_insets_uniform_sets_all_sides() {
+        let insets = FrameInsets::uniform(7.5);
+        assert!((insets.top - 7.5).abs() < f64::EPSILON);
+        assert!((insets.right - 7.5).abs() < f64::EPSILON);
+        assert!((insets.bottom - 7.5).abs() < f64::EPSILON);
+        assert!((insets.left - 7.5).abs() < f64::EPSILON);
     }
 }

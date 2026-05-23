@@ -32,8 +32,12 @@ use serde::{Deserialize, Serialize};
 /// [`Color::to_srgb`]; export pipelines (PDF / icc-tagged PNG) keep
 /// the value in its native space until the very last step so a CMYK
 /// fill stays CMYK on disk.
+///
+/// Wire format is serde's default **externally-tagged** PascalCase
+/// JSON (e.g. `{"Srgb":{"r":1.0,"g":0.0,"b":0.0,"a":1.0}}`). This
+/// matches the `ColorValue` type in `apps/desktop/shared/scene.ts`
+/// and the lockstep contract in AGENTS.md §Rules §4.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "space", rename_all = "snake_case")]
 pub enum Color {
     /// IEC 61966-2-1 sRGB. Channels in `[0.0, 1.0]`.
     Srgb { r: f32, g: f32, b: f32, a: f32 },
@@ -121,8 +125,13 @@ impl Color {
 /// this enum exists so documents can serialise their intent and
 /// downstream tools (e.g. PDF/X-3 export) know which output intent to
 /// embed.
+/// Wire format is serde's default **externally-tagged** PascalCase
+/// JSON: unit variants serialize as bare strings (`"SrgbIec61966"`,
+/// `"FogRa39"`, …) and the `Custom` variant as
+/// `{"Custom":{"name":"…","blob_hash":"…"}}`. This matches the
+/// `IccProfile` type in `apps/desktop/shared/scene.ts` and the
+/// lockstep contract in AGENTS.md §Rules §4.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum IccProfile {
     /// IEC 61966-2-1 sRGB. The default working space.
     SrgbIec61966,
@@ -166,8 +175,12 @@ impl IccProfile {
 /// simulation uses [`RenderingIntent::Perceptual`] as the default; the
 /// PDF exporter writes the chosen intent into the output intent
 /// dictionary.
+///
+/// Wire format is serde's default **PascalCase** unit-variant strings
+/// (e.g. `"Perceptual"`, `"RelativeColorimetric"`). This matches the
+/// `RenderingIntent` type in `apps/desktop/shared/scene.ts` and the
+/// lockstep contract in AGENTS.md §Rules §4.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
 pub enum RenderingIntent {
     #[default]
     Perceptual,
@@ -413,14 +426,21 @@ fn hue_to_rgb(p: f32, q: f32, mut t: f32) -> f32 {
     if t > 1.0 {
         t -= 1.0;
     }
+    // Standard HSL→RGB sextant interpolation: `p + (q-p) * 6 * f(t)`.
+    // The earlier `6.0.mul_add(q - p, p) * t + p - p` expansion was
+    // algebraically wrong (the `+ p - p` cancelled the addend, leaving
+    // `(6q - 5p) * t` instead of `p + (q-p)*6t`), so non-saturated
+    // colors with `s < 1` produced visibly incorrect RGB. The current
+    // form keeps a single fused multiply–add per branch and matches
+    // the CSS Color Module Level 4 reference.
     if t < 1.0 / 6.0 {
-        return 6.0_f32.mul_add(q - p, p) * t + p - p;
+        return (q - p).mul_add(6.0 * t, p);
     }
     if t < 1.0 / 2.0 {
         return q;
     }
     if t < 2.0 / 3.0 {
-        return 6.0_f32.mul_add(q - p, p) * (2.0 / 3.0 - t) + p - p;
+        return (q - p).mul_add(6.0 * (2.0 / 3.0 - t), p);
     }
     p
 }
@@ -711,5 +731,113 @@ mod tests {
         let c = Color::cmyk(0.1, 0.2, 0.3, 0.4);
         assert!(c.is_device_cmyk());
         assert!(!Color::srgb(0.1, 0.2, 0.3).is_device_cmyk());
+    }
+
+    #[test]
+    fn hsl_unsaturated_orange_first_sextant() {
+        // Regression for the earlier `(6q-5p)*t` bug in `hue_to_rgb`.
+        // HSL(30, 0.5, 0.5) lives in the first sextant with `s < 1`,
+        // which is the exact path that produced wrong RGB values when
+        // the addend cancelled. CSS Color reference: hsl(30 50% 50%)
+        // == rgb(191, 128, 64) == (0.75, 0.5, 0.25).
+        let (r, g, b) = hsl_to_srgb(30.0, 0.5, 0.5);
+        approx_eps(r, 0.75, 0.01);
+        approx_eps(g, 0.5, 0.01);
+        approx_eps(b, 0.25, 0.01);
+    }
+
+    #[test]
+    fn hsl_unsaturated_teal_third_sextant() {
+        // Same bug, third-sextant branch. CSS: hsl(210 50% 50%) ==
+        // rgb(64, 128, 191) == (0.25, 0.5, 0.75).
+        let (r, g, b) = hsl_to_srgb(210.0, 0.5, 0.5);
+        approx_eps(r, 0.25, 0.01);
+        approx_eps(g, 0.5, 0.01);
+        approx_eps(b, 0.75, 0.01);
+    }
+
+    #[test]
+    fn hsl_round_trip_pastel_purple() {
+        // A muted lavender — non-trivial `s`, non-0.5 `l`. Round-trip
+        // through sRGB should be stable to within ~1%.
+        let (r0, g0, b0) = hsl_to_srgb(280.0, 0.4, 0.7);
+        let (h, s, l) = srgb_to_hsl(r0, g0, b0);
+        let (r1, g1, b1) = hsl_to_srgb(h, s, l);
+        approx_eps(r1, r0, 0.01);
+        approx_eps(g1, g0, 0.01);
+        approx_eps(b1, b0, 0.01);
+    }
+
+    // ----- wire format lockstep (AGENTS.md §Rules §4) -----
+    //
+    // The TypeScript types in `apps/desktop/shared/scene.ts`
+    // (`ColorValue`, `IccProfile`, `RenderingIntent`) declare the
+    // canonical wire format for the renderer-side bridge. These tests
+    // pin the Rust serde output to that contract so the lockstep can't
+    // silently drift via someone re-adding a `#[serde(tag = ...)]`
+    // annotation.
+
+    #[test]
+    fn color_wire_format_is_externally_tagged_pascal_case() {
+        let json = serde_json::to_string(&Color::Srgb {
+            r: 1.0,
+            g: 0.0,
+            b: 0.0,
+            a: 1.0,
+        })
+        .unwrap();
+        assert_eq!(json, r#"{"Srgb":{"r":1.0,"g":0.0,"b":0.0,"a":1.0}}"#);
+        let json = serde_json::to_string(&Color::Cmyk {
+            c: 0.0,
+            m: 1.0,
+            y: 1.0,
+            k: 0.0,
+            a: 1.0,
+        })
+        .unwrap();
+        assert_eq!(
+            json,
+            r#"{"Cmyk":{"c":0.0,"m":1.0,"y":1.0,"k":0.0,"a":1.0}}"#
+        );
+    }
+
+    #[test]
+    fn icc_profile_unit_variants_serialize_as_bare_pascal_strings() {
+        assert_eq!(
+            serde_json::to_string(&IccProfile::SrgbIec61966).unwrap(),
+            "\"SrgbIec61966\""
+        );
+        assert_eq!(
+            serde_json::to_string(&IccProfile::FogRa39).unwrap(),
+            "\"FogRa39\""
+        );
+        assert_eq!(
+            serde_json::to_string(&IccProfile::Custom {
+                name: "MyMonitor".into(),
+                blob_hash: "abcd".into()
+            })
+            .unwrap(),
+            r#"{"Custom":{"name":"MyMonitor","blob_hash":"abcd"}}"#
+        );
+    }
+
+    #[test]
+    fn rendering_intent_serializes_as_pascal_case_strings() {
+        assert_eq!(
+            serde_json::to_string(&RenderingIntent::Perceptual).unwrap(),
+            "\"Perceptual\""
+        );
+        assert_eq!(
+            serde_json::to_string(&RenderingIntent::RelativeColorimetric).unwrap(),
+            "\"RelativeColorimetric\""
+        );
+        assert_eq!(
+            serde_json::to_string(&RenderingIntent::Saturation).unwrap(),
+            "\"Saturation\""
+        );
+        assert_eq!(
+            serde_json::to_string(&RenderingIntent::AbsoluteColorimetric).unwrap(),
+            "\"AbsoluteColorimetric\""
+        );
     }
 }

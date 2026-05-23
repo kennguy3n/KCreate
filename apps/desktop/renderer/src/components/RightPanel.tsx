@@ -6,8 +6,10 @@ import type {
   InspectCode,
   NodeInfo,
   ProjectInfo,
+  SessionLockEntry,
   UpdateNodeProps,
 } from "../../../shared/scene";
+import { useSessionLocks } from "../hooks/useSessionLocks";
 import { colors, radius, spacing } from "../styles/tokens";
 import { AccessibilityPanel } from "./AccessibilityPanel";
 import { ColorSettingsPanel } from "./ColorSettingsPanel";
@@ -132,6 +134,14 @@ export function RightPanel({
     [showAccessibility, showInteraction, showPreflight, showColor],
   );
   const [tab, setTab] = useState<RightPanelTab>("properties");
+  // Subscribe to the advisory edit-lock roster so panels can grey
+  // out controls (and the right-panel header can render a "Locked
+  // by …" pill) when the current selection is held by a remote
+  // peer. The hook handles the initial fetch + event subscription
+  // + cleanup; outside a session it yields an empty map.
+  const { remoteLocks } = useSessionLocks();
+  const selectedRemoteLock: SessionLockEntry | null =
+    selected !== null ? remoteLocks.get(selected.id) ?? null : null;
   return (
     <aside
       style={{
@@ -182,12 +192,16 @@ export function RightPanel({
           color: colors.text,
         }}
       >
+        {selectedRemoteLock !== null ? (
+          <LockBanner lock={selectedRemoteLock} />
+        ) : null}
         {tab === "properties" ? (
           <PropertiesPanel
             node={selected}
             onChange={onChange}
             layout={layout}
             onStatus={onStatus}
+            disabled={selectedRemoteLock !== null}
           />
         ) : null}
         {tab === "effects" ? (
@@ -252,11 +266,25 @@ function PropertiesPanel({
   onChange,
   layout,
   onStatus,
+  disabled = false,
 }: {
   node: NodeInfo | null;
   onChange?: (changes: UpdateNodeProps) => void;
   layout?: LayoutHandlers;
   onStatus?: (msg: string | null) => void;
+  /**
+   * Block 8 lock-aware UI: when `true`, every editable control in
+   * the panel is rendered in a disabled (greyed-out) state. The
+   * caller (`RightPanel`) sets this when the selected node is
+   * held by a remote peer's advisory edit lock.
+   *
+   * We don't suppress `onChange` itself — that would be a
+   * defence-in-depth duplicate of the input-level `disabled`
+   * attribute, and would also lose us the click-to-focus behaviour
+   * users expect even on read-only fields. `disabled` is
+   * authoritative.
+   */
+  disabled?: boolean;
 }): JSX.Element {
   // We keep a local draft of the editable name so the user can type
   // freely without firing a bridge call on every keystroke. The
@@ -282,6 +310,11 @@ function PropertiesPanel({
         display: "flex",
         flexDirection: "column",
         gap: spacing.sm,
+        // Soften the whole properties body when a remote peer
+        // holds the lock on this node. Individual inputs are also
+        // `disabled` below — the opacity hint reinforces the
+        // status visually without needing to repaint every label.
+        opacity: disabled ? 0.55 : 1,
       }}
     >
       <Field label="Name">
@@ -294,6 +327,7 @@ function PropertiesPanel({
             if (e.key === "Escape") setDraftName(node.name);
           }}
           style={textInputStyle}
+          disabled={disabled}
         />
       </Field>
       <Row>
@@ -301,11 +335,13 @@ function PropertiesPanel({
           label="Visible"
           value={node.visible}
           onChange={(v) => onChange?.({ visible: v })}
+          disabled={disabled}
         />
         <ToggleField
           label="Locked"
           value={node.locked}
           onChange={(v) => onChange?.({ locked: v })}
+          disabled={disabled}
         />
       </Row>
       <hr style={hrStyle} />
@@ -332,6 +368,64 @@ function PropertiesPanel({
       ) : null}
     </div>
   );
+}
+
+/// Banner pinned to the top of the right panel when the selected
+/// node is currently held by a remote peer's advisory edit lock.
+///
+/// The pill renders the holder's peer id (the human-readable
+/// display name is not on the lock entry itself — the bridge
+/// surfaces it through the presence channel; the renderer can
+/// look it up via `useSessionPeers` in a later iteration) plus
+/// the acquisition timestamp. We deliberately do NOT block
+/// keyboard / pointer input on the surrounding panels — soft
+/// locks are advisory; the user can still override locally if
+/// they really need to. The greying + banner is the social
+/// signal.
+function LockBanner({ lock }: { lock: SessionLockEntry }): JSX.Element {
+  const acquired = formatAcquired(lock.acquiredAt);
+  const holderLabel = shortenPeerId(lock.holderPeerId);
+  return (
+    <div
+      role="status"
+      aria-live="polite"
+      style={{
+        background: "#fff7e6",
+        border: "1px solid #f5c97c",
+        color: "#8a5a00",
+        borderRadius: radius.sm,
+        padding: `${spacing.xs}px ${spacing.sm}px`,
+        marginBottom: spacing.sm,
+        fontSize: 11,
+        lineHeight: 1.35,
+      }}
+    >
+      <div style={{ fontWeight: 600 }}>Locked by {holderLabel}</div>
+      <div style={{ color: "#a17600" }}>since {acquired}</div>
+    </div>
+  );
+}
+
+function formatAcquired(rfc3339: string): string {
+  // Best-effort: RFC3339 parses through Date; if it ever fails (a
+  // pathological peer payload) fall back to the raw string so the
+  // banner still renders something rather than crashing.
+  const parsed = new Date(rfc3339);
+  if (Number.isNaN(parsed.getTime())) return rfc3339;
+  return parsed.toLocaleTimeString([], {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  });
+}
+
+function shortenPeerId(peerId: string): string {
+  // Peer ids are base64url-encoded 32-byte Ed25519 public keys —
+  // long, ugly, and not human-friendly. Show the first 6 chars so
+  // the banner stays readable; the full id is available in the
+  // PresencePanel roster for cross-referencing.
+  if (peerId.length <= 8) return peerId;
+  return `peer ${peerId.slice(0, 6)}…`;
 }
 
 const DEFAULT_FLEX: FlexLayout = {
@@ -957,10 +1051,12 @@ function ToggleField({
   label,
   value,
   onChange,
+  disabled = false,
 }: {
   label: string;
   value: boolean;
   onChange: (v: boolean) => void;
+  disabled?: boolean;
 }): JSX.Element {
   return (
     <label
@@ -970,13 +1066,14 @@ function ToggleField({
         gap: 6,
         fontSize: 12,
         color: colors.text,
-        cursor: "pointer",
+        cursor: disabled ? "not-allowed" : "pointer",
       }}
     >
       <input
         type="checkbox"
         checked={value}
         onChange={(e) => onChange(e.target.checked)}
+        disabled={disabled}
       />
       {label}
     </label>

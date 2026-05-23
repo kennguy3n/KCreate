@@ -662,6 +662,42 @@ export function EditorPage({
     };
   }, [nodes]);
 
+  // Broadcast the local user's selection (and currently `null` for
+  // cursor / active page until a future change wires those up) to
+  // every connected peer whenever the selection set changes. The
+  // bridge gate-checks KChat membership before serialising the
+  // beacon — outside a KChat group the `sendPresence` call rejects
+  // with a typed `not in KChat group` error which we silently
+  // swallow here (the bridge is the source of truth for "is
+  // multiplayer enabled right now"; the renderer doesn't need to
+  // duplicate that state machine).
+  //
+  // We only attempt the broadcast when `session.info()` returns
+  // non-null (i.e. a session is running). This is purely a
+  // micro-optimisation — without it the renderer would call
+  // `sendPresence` on every selection change and get the
+  // KChat-gate rejection back, which is harmless but pollutes the
+  // bridge's structured log.
+  useEffect(() => {
+    let cancelled = false;
+    const broadcast = async (): Promise<void> => {
+      try {
+        const info = await window.kcreate.session.info();
+        if (cancelled || info === null) return;
+        await window.kcreate.session.sendPresence(null, selectedIds, null);
+      } catch {
+        // Either the gate is closed (no KChat group) or the
+        // session was just torn down — either way, drop the
+        // broadcast silently. Selection changes are local-first;
+        // the absence of a beacon doesn't break the editor.
+      }
+    };
+    void broadcast();
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedIds]);
+
   // Keyboard shortcuts. Scoped to the editor page; the canvas itself
   // is non-focusable so window-level listeners are the right place.
   useEffect(() => {

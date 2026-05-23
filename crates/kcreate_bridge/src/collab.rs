@@ -1227,6 +1227,47 @@ pub fn presence_cursors() -> Vec<(String, String, SessionCursor)> {
         .collect()
 }
 
+/// Read-side accessor for `scene_sync` to paint remote-peer
+/// selection halos. Returns `(peer_id, display_name, node_ids)`
+/// triples for every connected peer whose latest presence carries
+/// a non-empty `selection: Vec<Uuid>`. Peers with empty selections
+/// are filtered so the renderer doesn't get a spurious "empty
+/// halo group" entry.
+///
+/// Same mirror of `state.presence` as [`presence_cursors`]; the
+/// two are kept separate so the bridge can short-circuit either
+/// loop independently when the corresponding rendering pass is
+/// disabled.
+#[allow(dead_code)] // exported so future call sites (presentation
+                    // mode, export preview pane) can reuse it.
+pub fn presence_selections() -> Vec<(String, String, Vec<Uuid>)> {
+    let guard = slot().lock();
+    let Some(state) = guard.as_ref() else {
+        return Vec::new();
+    };
+    let connected_lookup: HashMap<PeerId, String> = state
+        .host
+        .connected_peers()
+        .into_iter()
+        .map(|i| (i.peer_id, i.display_name))
+        .collect();
+    state
+        .presence
+        .iter()
+        .filter_map(|(peer_id, payload)| {
+            if payload.selection.is_empty() {
+                return None;
+            }
+            let display_name = connected_lookup.get(peer_id)?.clone();
+            Some((
+                peer_id.as_str().to_string(),
+                display_name,
+                payload.selection.clone(),
+            ))
+        })
+        .collect()
+}
+
 // === Conversion to bridge error type so the N-API layer can use
 // `map_doc_err`'s status enum without inventing a separate
 // `map_session_err`. The session-bridge errors map cleanly:

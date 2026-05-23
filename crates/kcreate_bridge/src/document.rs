@@ -1242,6 +1242,40 @@ fn sync_scene_locked(guard: &mut parking_lot::MutexGuard<'_, Option<Workspace>>)
     // and update `collab::pump_inbound` if you really need it.
     #[cfg(feature = "collab")]
     {
+        // Pull the renderer's current zoom once for cursors *and*
+        // halos so both overlays share the same zoom-aware screen
+        // sizing. Safe to call under the workspace lock: the
+        // renderer slot has its own mutex (`state::slot()`) and we
+        // never hold the renderer slot before this point. Falls
+        // back to `1.0` in headless contexts.
+        let viewport_zoom = crate::state::viewport_zoom();
+
+        // Layer remote-peer selection halos below cursors so a
+        // peer's cursor stays the most prominent indicator of
+        // "where they are right now" — selection halos are
+        // contextual chrome. Both share the same upward overlay
+        // id stream so they never collide.
+        let selection_triples = crate::collab::presence_selections();
+        if !selection_triples.is_empty() {
+            let selections: Vec<crate::scene_sync::PresenceSelection> = selection_triples
+                .into_iter()
+                .map(
+                    |(peer_id, display_name, node_ids)| crate::scene_sync::PresenceSelection {
+                        peer_id,
+                        display_name,
+                        node_ids,
+                    },
+                )
+                .collect();
+            ws.scene_sync.append_presence_selection_halos(
+                &mut scene,
+                &ws.project.document,
+                &selections,
+                i32::MAX / 2 - 1,
+                viewport_zoom,
+            );
+        }
+
         let triples = crate::collab::presence_cursors();
         if !triples.is_empty() {
             let cursors: Vec<crate::scene_sync::PresenceCursor> = triples
@@ -1255,13 +1289,6 @@ fn sync_scene_locked(guard: &mut parking_lot::MutexGuard<'_, Option<Workspace>>)
                     },
                 )
                 .collect();
-            // Pull the renderer's current zoom so cursors render at
-            // a constant on-screen size regardless of pan/zoom. The
-            // call is safe to make under the workspace lock: the
-            // renderer slot has its own mutex (`state::slot()`) and
-            // we never hold the renderer slot before this point.
-            // Falls back to `1.0` in headless contexts.
-            let viewport_zoom = crate::state::viewport_zoom();
             // Layer cursors above the highest selection-highlight z.
             // `sync_document_to_scene` returns objects with z values
             // bounded by their document order; selection highlights

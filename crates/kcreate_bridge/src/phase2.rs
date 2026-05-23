@@ -558,6 +558,184 @@ pub fn ai_screenshot_to_layout(req: &ScreenshotRequest) -> Result<String> {
 }
 
 // -----------------------------------------------------------------------------
+// AI inference: alt-text + layout-suggest (Phase 4 Block B)
+// -----------------------------------------------------------------------------
+
+/// Run the local alt-text heuristic against the raster layer
+/// identified by `node_id` and return the resulting
+/// [`kcreate_ai::AltTextReport`] as JSON.
+///
+/// This call is read-only — it does NOT write the generated label
+/// onto the node. The renderer surfaces the result inline with an
+/// "Apply" button that calls [`ai_apply_alt_text`] to persist it.
+/// Splitting analysis from persistence lets the user reject a
+/// generated description without polluting the document history
+/// with an apply-then-undo operation.
+pub fn ai_alt_text_for_node(node_id: Uuid) -> Result<String> {
+    let encoded = with_workspace(|ws| {
+        let node = ws
+            .project
+            .document
+            .get_node(node_id)
+            .ok_or(DocumentBridgeError::NodeNotFound(node_id))?;
+        if !matches!(node.node_type, NodeType::RasterLayer) {
+            return Err(DocumentBridgeError::InvalidNodeType(format!(
+                "{:?}",
+                node.node_type
+            )));
+        }
+        let meta_value = node
+            .metadata
+            .get(crate::scene_sync::RASTER_IMAGE_METADATA_KEY)
+            .ok_or_else(|| {
+                DocumentBridgeError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "raster layer missing image metadata",
+                ))
+            })?;
+        let meta: crate::scene_sync::RasterImageMeta = serde_json::from_value(meta_value.clone())?;
+        blob_load(ws, &meta.blob_hash)
+    })?;
+    let img = image::load_from_memory(&encoded).map_err(|e| {
+        DocumentBridgeError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+    })?;
+    let rgba = img.to_rgba8();
+    let (w, h) = rgba.dimensions();
+    let report =
+        kcreate_ai::generate_alt_text(rgba.as_raw(), w, h, kcreate_ai::AltTextOptions::default())
+            .map_err(|e| {
+            DocumentBridgeError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+        })?;
+    Ok(serde_json::to_string(&report)?)
+}
+
+/// Persist an alt-text label onto a node. Records an operation in
+/// the project's operation log so the change participates in undo
+/// / redo and shows up in the action history.
+///
+/// An empty `text` clears the alt-text metadata key entirely
+/// (matching [`kcreate_core::node::Node::set_alt_text`]'s
+/// "empty == missing" semantic), so the user can revert to
+/// "no alt text" without leaving a tombstone behind.
+pub fn ai_apply_alt_text(node_id: Uuid, text: String) -> Result<()> {
+    with_workspace_mut(|ws| {
+        let before = ws
+            .project
+            .document
+            .get_node(node_id)
+            .map(|n| serde_json::to_value(n).unwrap_or(serde_json::Value::Null))
+            .ok_or(DocumentBridgeError::NodeNotFound(node_id))?;
+        let node = ws
+            .project
+            .document
+            .get_node_mut(node_id)
+            .ok_or(DocumentBridgeError::NodeNotFound(node_id))?;
+        node.set_alt_text(&text);
+        let after = ws
+            .project
+            .document
+            .get_node(node_id)
+            .map_or(serde_json::Value::Null, |n| {
+                serde_json::to_value(n).unwrap_or(serde_json::Value::Null)
+            });
+        let op = Operation::new("ai", "ai_apply_alt_text", before, after, vec![node_id])
+            .as_ai_generated();
+        ws.project.execute_operation(op);
+        kcreate_ai::ActionLog::global()
+            .lock()
+            .append(kcreate_ai::AiAction {
+                id: Uuid::new_v4(),
+                timestamp: Utc::now(),
+                task_type: "alt_text_apply".into(),
+                model: "alt-text-heuristic-v0".into(),
+                compute_device: "cpu".into(),
+                affected_nodes: vec![node_id],
+                confidence: None,
+            });
+        ws.project.modified_at = Utc::now();
+        Ok(())
+    })?;
+    sync_scene_after_change();
+    Ok(())
+}
+
+/// Run the layout-suggest heuristic over the direct children of
+/// the artboard / frame / page identified by `artboard_id` and
+/// return the suggestions as JSON.
+///
+/// Only direct children with non-zero bounds are considered. The
+/// caller's responsibility is to choose a parent node — passing a
+/// leaf raster layer for example returns an empty suggestion list
+/// rather than an error so the UI can render a "nothing to
+/// suggest" state without special-casing the call.
+///
+/// Like [`ai_alt_text_for_node`], this is read-only — the renderer
+/// previews suggestions before any apply step. A future Phase 4
+/// follow-up will add `ai_apply_layout_suggestion` to actually
+/// promote a suggestion into a real LayoutFrame.
+pub fn ai_layout_suggest_for_artboard(artboard_id: Uuid) -> Result<String> {
+    let nodes = with_workspace(|ws| {
+        let parent = ws
+            .project
+            .document
+            .get_node(artboard_id)
+            .ok_or(DocumentBridgeError::NodeNotFound(artboard_id))?;
+        let child_ids: Vec<Uuid> = parent.children.clone();
+        let mut out: Vec<kcreate_ai::LayoutNode> = Vec::with_capacity(child_ids.len());
+        for child_id in child_ids {
+            // A node that vanished between the parent-fetch and
+            // here would be a graph-integrity bug; surface it
+            // rather than silently dropping the child.
+            let child = ws
+                .project
+                .document
+                .get_node(child_id)
+                .ok_or(DocumentBridgeError::NodeNotFound(child_id))?;
+            if !child.visible {
+                continue;
+            }
+            let b = child.bounds;
+            if b.width <= 0.0 || b.height <= 0.0 {
+                continue;
+            }
+            out.push(kcreate_ai::LayoutNode {
+                id: child_id,
+                bounds: kcreate_ai::LayoutBounds {
+                    x: b.x as f32,
+                    y: b.y as f32,
+                    width: b.width as f32,
+                    height: b.height as f32,
+                },
+            });
+        }
+        Ok::<_, DocumentBridgeError>(out)
+    })?;
+    // `suggest_layout_grouping` requires at least 2 nodes — return
+    // an empty list rather than propagating the error so the UI
+    // can render a clean "nothing to suggest" state.
+    if nodes.len() < 2 {
+        return Ok("[]".to_string());
+    }
+    let suggestions =
+        kcreate_ai::suggest_layout_grouping(&nodes, kcreate_ai::LayoutSuggestOptions::default())
+            .map_err(|e| {
+                DocumentBridgeError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+            })?;
+    kcreate_ai::ActionLog::global()
+        .lock()
+        .append(kcreate_ai::AiAction {
+            id: Uuid::new_v4(),
+            timestamp: Utc::now(),
+            task_type: "layout_suggest".into(),
+            model: "layout-heuristic-v0".into(),
+            compute_device: "cpu".into(),
+            affected_nodes: vec![artboard_id],
+            confidence: None,
+        });
+    Ok(serde_json::to_string(&suggestions)?)
+}
+
+// -----------------------------------------------------------------------------
 // Plugin sandbox
 // -----------------------------------------------------------------------------
 
@@ -1983,4 +2161,387 @@ fn _force_extracted_image_data_link(d: &ExtractedImageData) -> usize {
 fn _suppress_unused_atomic() {
     let _ = AtomicBool::new(false);
     let _ = Ordering::SeqCst;
+}
+
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
+
+#[cfg(test)]
+mod ai_inference_tests {
+    use super::*;
+    use crate::document::{project_close, project_create, reset_for_tests};
+    use kcreate_ai::AltTextReport;
+    use kcreate_ai::LayoutSuggestion;
+    use serial_test::serial;
+
+    /// Encode a small RGBA8 buffer as PNG so `image::load_from_memory`
+    /// in `ai_alt_text_for_node` can decode it.
+    fn rgba_png(width: u32, height: u32, fill: [u8; 4]) -> Vec<u8> {
+        let pixel_count = (width as usize) * (height as usize);
+        let mut rgba = Vec::with_capacity(pixel_count * 4);
+        for _ in 0..pixel_count {
+            rgba.extend_from_slice(&fill);
+        }
+        let mut png: Vec<u8> = Vec::new();
+        let mut cursor = std::io::Cursor::new(&mut png);
+        image::write_buffer_with_format(
+            &mut cursor,
+            &rgba,
+            width,
+            height,
+            image::ColorType::Rgba8,
+            image::ImageFormat::Png,
+        )
+        .expect("png encode");
+        png
+    }
+
+    /// Insert a raster node with `pixels` bytes (already PNG-encoded)
+    /// directly into the open workspace, bypassing the file-system
+    /// `document_import_image` path so tests don't have to write a
+    /// PNG to disk just to read it back.
+    fn insert_test_raster(png: &[u8], width: u32, height: u32, parent: Option<Uuid>) -> Uuid {
+        with_workspace_mut(|ws| {
+            let blob = ws
+                .store
+                .blobs()
+                .store(png, "image/png")
+                .map_err(|e| DocumentBridgeError::Io(std::io::Error::other(e.to_string())))?;
+            let meta = crate::scene_sync::RasterImageMeta {
+                blob_hash: blob.hash,
+                width,
+                height,
+            };
+            let mut node = Node::new(NodeType::RasterLayer, "Test raster");
+            node.parent_id = parent;
+            node.bounds = Bounds {
+                x: 0.0,
+                y: 0.0,
+                width: f64::from(width),
+                height: f64::from(height),
+            };
+            node.metadata.insert(
+                crate::scene_sync::RASTER_IMAGE_METADATA_KEY.to_string(),
+                serde_json::to_value(&meta)?,
+            );
+            let id = ws.project.document.insert_node(node)?;
+            Ok::<_, DocumentBridgeError>(id)
+        })
+        .expect("insert raster")
+    }
+
+    fn tmpdir() -> tempfile::TempDir {
+        tempfile::tempdir().expect("tempdir")
+    }
+
+    /// `ai_alt_text_for_node` decodes the raster, runs the alt-text
+    /// heuristic, and returns the full `AltTextReport` as JSON. The
+    /// document is read-only — no operation is recorded, no
+    /// metadata is mutated.
+    #[test]
+    #[serial]
+    fn alt_text_for_node_returns_report_without_mutating_document() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("alt-text", dir.path()).expect("project");
+        // A bright, fully-saturated red raster is enough to drive a
+        // deterministic palette + brightness classification through
+        // the alt-text heuristic.
+        let png = rgba_png(16, 16, [240, 20, 20, 255]);
+        let raster_id = insert_test_raster(&png, 16, 16, None);
+
+        // Snapshot the node version before the analysis.
+        let version_before = with_workspace(|ws| {
+            Ok::<u64, DocumentBridgeError>(
+                ws.project
+                    .document
+                    .get_node(raster_id)
+                    .expect("node")
+                    .version,
+            )
+        })
+        .unwrap();
+
+        let json = ai_alt_text_for_node(raster_id).expect("alt-text");
+        let report: AltTextReport = serde_json::from_str(&json).expect("decode");
+        // The heuristic always emits some text; the palette must be
+        // non-empty because we asked for at least one color.
+        assert!(!report.text.is_empty(), "text must be non-empty");
+        assert!(
+            !report.palette.is_empty(),
+            "palette must contain at least one color"
+        );
+        // Bright red → high saturation, mid-brightness, low edge
+        // density (uniform fill).
+        assert!(
+            report.saturation > 0.5,
+            "saturation must reflect the strong red fill (got {})",
+            report.saturation
+        );
+        assert!(
+            report.edge_density < 0.05,
+            "uniform fill has near-zero edges (got {})",
+            report.edge_density
+        );
+
+        let version_after = with_workspace(|ws| {
+            Ok::<u64, DocumentBridgeError>(
+                ws.project
+                    .document
+                    .get_node(raster_id)
+                    .expect("node")
+                    .version,
+            )
+        })
+        .unwrap();
+        assert_eq!(
+            version_before, version_after,
+            "analysis-only call must NOT touch the document"
+        );
+        assert!(
+            with_workspace(|ws| Ok::<bool, DocumentBridgeError>(
+                ws.project
+                    .document
+                    .get_node(raster_id)
+                    .expect("node")
+                    .alt_text()
+                    .is_none()
+            ))
+            .unwrap(),
+            "analysis-only call must NOT write alt_text metadata"
+        );
+        project_close();
+    }
+
+    /// `ai_apply_alt_text` writes the label, records an op, and the
+    /// `Node::alt_text()` accessor returns the new string. Passing
+    /// an empty string clears the entry per the documented
+    /// `empty == missing` semantic.
+    #[test]
+    #[serial]
+    fn apply_alt_text_writes_then_clears_round_trip() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("apply-alt", dir.path()).expect("project");
+        let png = rgba_png(4, 4, [128, 128, 128, 255]);
+        let raster_id = insert_test_raster(&png, 4, 4, None);
+
+        // Write.
+        ai_apply_alt_text(raster_id, "A neutral grey square".to_string()).expect("apply");
+        let stored = with_workspace(|ws| {
+            Ok::<Option<String>, DocumentBridgeError>(
+                ws.project
+                    .document
+                    .get_node(raster_id)
+                    .expect("node")
+                    .alt_text()
+                    .map(str::to_string),
+            )
+        })
+        .unwrap();
+        assert_eq!(stored.as_deref(), Some("A neutral grey square"));
+
+        // Clear with empty string.
+        ai_apply_alt_text(raster_id, String::new()).expect("clear");
+        let stored = with_workspace(|ws| {
+            Ok::<Option<String>, DocumentBridgeError>(
+                ws.project
+                    .document
+                    .get_node(raster_id)
+                    .expect("node")
+                    .alt_text()
+                    .map(str::to_string),
+            )
+        })
+        .unwrap();
+        assert_eq!(
+            stored, None,
+            "passing empty string must clear the metadata entry entirely"
+        );
+        project_close();
+    }
+
+    /// `ai_alt_text_for_node` rejects a non-raster node so the
+    /// renderer doesn't have to defend the call surface for
+    /// vector / text / group / page nodes that have no pixels.
+    #[test]
+    #[serial]
+    fn alt_text_rejects_non_raster_nodes() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("non-raster", dir.path()).expect("project");
+        let group_id = with_workspace_mut(|ws| {
+            let mut node = Node::new(NodeType::GroupLayer, "Group");
+            node.bounds = Bounds {
+                x: 0.0,
+                y: 0.0,
+                width: 100.0,
+                height: 100.0,
+            };
+            Ok::<Uuid, DocumentBridgeError>(ws.project.document.insert_node(node)?)
+        })
+        .expect("insert group");
+        let err = ai_alt_text_for_node(group_id).expect_err("must reject");
+        assert!(
+            matches!(err, DocumentBridgeError::InvalidNodeType(_)),
+            "non-raster node must produce InvalidNodeType (got {err:?})"
+        );
+        project_close();
+    }
+
+    /// `ai_layout_suggest_for_artboard` clusters children by
+    /// proximity and returns at least one suggestion when the input
+    /// is a clear visual row. The candidate count drives a real
+    /// algorithm call; we don't fabricate suggestions.
+    #[test]
+    #[serial]
+    fn layout_suggest_groups_visually_aligned_row() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("layout", dir.path()).expect("project");
+
+        // Build an artboard with three small squares laid out in a
+        // perfectly aligned horizontal row.
+        let artboard_id = with_workspace_mut(|ws| {
+            let mut art = Node::new(NodeType::Artboard, "Frame");
+            art.bounds = Bounds {
+                x: 0.0,
+                y: 0.0,
+                width: 800.0,
+                height: 200.0,
+            };
+            let id = ws.project.document.insert_node(art)?;
+            for (i, x) in [10.0, 60.0, 110.0].iter().enumerate() {
+                let mut child = Node::new(NodeType::VectorLayer, format!("Box {i}"));
+                child.parent_id = Some(id);
+                child.bounds = Bounds {
+                    x: *x,
+                    y: 50.0,
+                    width: 40.0,
+                    height: 40.0,
+                };
+                ws.project.document.insert_node(child)?;
+            }
+            Ok::<Uuid, DocumentBridgeError>(id)
+        })
+        .expect("artboard");
+
+        let json = ai_layout_suggest_for_artboard(artboard_id).expect("suggest");
+        let suggestions: Vec<LayoutSuggestion> = serde_json::from_str(&json).expect("decode");
+        assert!(
+            !suggestions.is_empty(),
+            "an aligned row must produce at least one suggestion"
+        );
+        // The largest suggestion must cover all three boxes.
+        let cover = suggestions
+            .iter()
+            .map(|s| s.member_ids.len())
+            .max()
+            .unwrap();
+        assert_eq!(cover, 3, "top suggestion must cluster all three boxes");
+        project_close();
+    }
+
+    /// `ai_layout_suggest_for_artboard` returns `[]` instead of an
+    /// error when the artboard has fewer than two eligible
+    /// children — the algorithm requires ≥2 candidates, but the UI
+    /// must be able to call the bridge unconditionally on
+    /// selection without a special case for "0 or 1 child".
+    #[test]
+    #[serial]
+    fn layout_suggest_returns_empty_array_for_too_few_children() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("layout-empty", dir.path()).expect("project");
+        let empty_artboard_id = with_workspace_mut(|ws| {
+            let mut art = Node::new(NodeType::Artboard, "Empty");
+            art.bounds = Bounds {
+                x: 0.0,
+                y: 0.0,
+                width: 100.0,
+                height: 100.0,
+            };
+            Ok::<Uuid, DocumentBridgeError>(ws.project.document.insert_node(art)?)
+        })
+        .expect("artboard");
+
+        let json = ai_layout_suggest_for_artboard(empty_artboard_id).expect("suggest");
+        assert_eq!(
+            json, "[]",
+            "empty artboard must serialise as the literal empty array, not an error"
+        );
+        project_close();
+    }
+
+    /// `ai_layout_suggest_for_artboard` skips invisible and
+    /// degenerate-bounds children so accidentally-hidden helper
+    /// layers don't pollute the suggestion set.
+    #[test]
+    #[serial]
+    fn layout_suggest_skips_invisible_and_degenerate_children() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("layout-filter", dir.path()).expect("project");
+        let artboard_id = with_workspace_mut(|ws| {
+            let mut art = Node::new(NodeType::Artboard, "Frame");
+            art.bounds = Bounds {
+                x: 0.0,
+                y: 0.0,
+                width: 400.0,
+                height: 200.0,
+            };
+            let id = ws.project.document.insert_node(art)?;
+            // Two visible nodes that should make it through.
+            for (i, x) in [10.0, 60.0].iter().enumerate() {
+                let mut child = Node::new(NodeType::VectorLayer, format!("Visible {i}"));
+                child.parent_id = Some(id);
+                child.bounds = Bounds {
+                    x: *x,
+                    y: 50.0,
+                    width: 40.0,
+                    height: 40.0,
+                };
+                ws.project.document.insert_node(child)?;
+            }
+            // Invisible — must be filtered out before the heuristic.
+            let mut hidden = Node::new(NodeType::VectorLayer, "Hidden");
+            hidden.parent_id = Some(id);
+            hidden.bounds = Bounds {
+                x: 200.0,
+                y: 50.0,
+                width: 40.0,
+                height: 40.0,
+            };
+            hidden.visible = false;
+            ws.project.document.insert_node(hidden)?;
+            // Degenerate bounds (zero width) — must also be filtered.
+            let mut degen = Node::new(NodeType::VectorLayer, "Degenerate");
+            degen.parent_id = Some(id);
+            degen.bounds = Bounds {
+                x: 300.0,
+                y: 50.0,
+                width: 0.0,
+                height: 40.0,
+            };
+            ws.project.document.insert_node(degen)?;
+            Ok::<Uuid, DocumentBridgeError>(id)
+        })
+        .expect("artboard");
+
+        let json = ai_layout_suggest_for_artboard(artboard_id).expect("suggest");
+        let suggestions: Vec<LayoutSuggestion> = serde_json::from_str(&json).expect("decode");
+        // With only the two visible non-degenerate boxes, the
+        // top suggestion clusters exactly those two.
+        let cover = suggestions
+            .iter()
+            .map(|s| s.member_ids.len())
+            .max()
+            .unwrap_or(0);
+        assert_eq!(
+            cover, 2,
+            "filtering must leave exactly two clusterable children"
+        );
+        project_close();
+    }
 }

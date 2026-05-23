@@ -11,10 +11,20 @@
 // All work runs locally on the user's machine — no network calls.
 // When the LLM sidecar is not ready (no model loaded), the panel
 // surfaces a clear empty/error state with a link to the Model Manager.
+//
+// Phase 4 follow-up Block B adds an inline, raster-scoped
+// "Generate alt-text" affordance driven by the local
+// brightness/contrast/saturation/edge-density heuristic in
+// `kcreate_ai::alt_text`. The heuristic runs entirely in Rust — no
+// LLM, no network — so it's always available regardless of model
+// pack state. The two paths complement each other: the
+// document-level LLM audit catches *what's missing* (no alt text
+// at all on a raster); the per-node heuristic gives the user a
+// factual default they can accept or edit.
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 
-import type { LlmJsonResult } from "../../../shared/scene";
+import type { AltTextReport, LlmJsonResult, NodeInfo } from "../../../shared/scene";
 import { colors, radius, spacing } from "../styles/tokens";
 
 export type AccessibilitySeverity = "info" | "warn" | "error";
@@ -36,6 +46,12 @@ export interface AccessibilityPanelProps {
   onSelectNode?: (nodeId: string) => void;
   /** Surfaces panel status to the host's status bar. */
   onStatus?: (msg: string | null) => void;
+  /**
+   * Currently-selected node — drives the inline "Generate
+   * alt-text" affordance when it's a raster layer. `null` (or
+   * non-raster) collapses the per-node section gracefully.
+   */
+  selected?: NodeInfo | null;
 }
 
 type Phase = "ready" | "running" | "done" | "error";
@@ -43,6 +59,7 @@ type Phase = "ready" | "running" | "done" | "error";
 export function AccessibilityPanel({
   onSelectNode,
   onStatus,
+  selected,
 }: AccessibilityPanelProps): JSX.Element {
   const [phase, setPhase] = useState<Phase>("ready");
   const [issues, setIssues] = useState<AccessibilityIssue[]>([]);
@@ -190,7 +207,277 @@ export function AccessibilityPanel({
           processing local
         </p>
       ) : null}
+
+      <AltTextSection selected={selected ?? null} onStatus={onStatus} />
     </aside>
+  );
+}
+
+/**
+ * Per-node alt-text section. Visible whenever a raster layer is
+ * selected; renders a "Generate alt-text" button that runs the
+ * local heuristic in Rust and shows the result inline. The user
+ * can edit the text before clicking "Apply", or "Clear" to
+ * remove an existing label.
+ *
+ * The component holds its own state (rather than lifting to the
+ * parent) so cycling between layers doesn't lose an unsaved
+ * draft mid-way through editing — the per-node `nodeId` key in
+ * the `useEffect` resets state cleanly when the selection
+ * changes.
+ */
+function AltTextSection({
+  selected,
+  onStatus,
+}: {
+  selected: NodeInfo | null;
+  onStatus?: (msg: string | null) => void;
+}): JSX.Element {
+  const isRaster =
+    selected !== null && selected.nodeType === "RasterLayer";
+  const nodeId = isRaster ? selected.id : null;
+
+  type AltPhase = "idle" | "generating" | "ready" | "applying" | "error";
+  const [phase, setPhase] = useState<AltPhase>("idle");
+  const [report, setReport] = useState<AltTextReport | null>(null);
+  const [draft, setDraft] = useState<string>("");
+  const [existing, setExisting] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  // Reset state on selection change so the user doesn't see stale
+  // analysis when they click a different raster.
+  useEffect(() => {
+    setPhase("idle");
+    setReport(null);
+    setDraft("");
+    setError(null);
+    // Fetch the currently-persisted alt-text so the user can see
+    // what (if anything) is already on the node before generating.
+    // We read it from the node's metadata via a lightweight bridge
+    // call — `getNode` already returns the metadata blob, but the
+    // `NodeInfo` surface drops it for size reasons. Until that's
+    // exposed, derive from the document tree on the next refresh
+    // by leaving `existing` `null` here.
+    setExisting(null);
+  }, [nodeId]);
+
+  if (!isRaster || nodeId === null) {
+    return <></>;
+  }
+
+  const generate = async (): Promise<void> => {
+    setPhase("generating");
+    setError(null);
+    onStatus?.("Generating alt-text locally…");
+    try {
+      const r = await window.kcreate.aiModel.altTextForNode(nodeId);
+      setReport(r);
+      setDraft(r.text);
+      setPhase("ready");
+      onStatus?.("Alt-text suggestion ready. Edit and Apply when satisfied.");
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      setError(msg);
+      setPhase("error");
+      onStatus?.(`Alt-text failed: ${msg}`);
+    }
+  };
+
+  const apply = async (): Promise<void> => {
+    setPhase("applying");
+    setError(null);
+    try {
+      await window.kcreate.aiModel.applyAltText(nodeId, draft);
+      setExisting(draft.length === 0 ? null : draft);
+      setPhase("ready");
+      onStatus?.(
+        draft.length === 0
+          ? "Alt-text cleared."
+          : "Alt-text applied to layer.",
+      );
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      setError(msg);
+      setPhase("error");
+      onStatus?.(`Apply alt-text failed: ${msg}`);
+    }
+  };
+
+  const clear = async (): Promise<void> => {
+    setPhase("applying");
+    setError(null);
+    try {
+      await window.kcreate.aiModel.applyAltText(nodeId, "");
+      setDraft("");
+      setReport(null);
+      setExisting(null);
+      setPhase("idle");
+      onStatus?.("Alt-text cleared.");
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      setError(msg);
+      setPhase("error");
+      onStatus?.(`Clear alt-text failed: ${msg}`);
+    }
+  };
+
+  return (
+    <section
+      style={{
+        marginTop: spacing.md,
+        paddingTop: spacing.sm,
+        borderTop: `1px solid ${colors.border}`,
+        display: "flex",
+        flexDirection: "column",
+        gap: spacing.xs,
+      }}
+      aria-label="Alt-text for selected image"
+    >
+      <h3
+        style={{
+          margin: 0,
+          fontSize: 12,
+          fontWeight: 600,
+          color: colors.text,
+        }}
+      >
+        Image description
+      </h3>
+      <p style={paragraphStyle}>
+        Generates a factual alt-text suggestion from the raster&apos;s
+        pixels using a local heuristic — no model required.
+      </p>
+
+      {existing !== null ? (
+        <div
+          style={{
+            ...statusStripStyle("ok"),
+            background: "rgba(34,197,94,0.08)",
+            color: "#16a34a",
+            border: "1px solid #16a34a",
+          }}
+        >
+          Currently set: <em>{existing}</em>
+        </div>
+      ) : null}
+
+      <div style={{ display: "flex", gap: spacing.xs, flexWrap: "wrap" }}>
+        <button
+          type="button"
+          onClick={() => {
+            void generate();
+          }}
+          disabled={phase === "generating" || phase === "applying"}
+          style={primaryBtn(phase === "generating")}
+          aria-label="Generate alt-text suggestion"
+        >
+          {phase === "generating" ? "Analyzing…" : "Generate alt-text"}
+        </button>
+        {report !== null ? (
+          <button
+            type="button"
+            onClick={() => {
+              void apply();
+            }}
+            disabled={
+              phase === "applying" ||
+              phase === "generating" ||
+              draft.trim().length === 0
+            }
+            style={primaryBtn(
+              phase === "applying" || draft.trim().length === 0,
+            )}
+            aria-label="Apply alt-text to selected image"
+          >
+            {phase === "applying" ? "Applying…" : "Apply"}
+          </button>
+        ) : null}
+        {existing !== null || report !== null ? (
+          <button
+            type="button"
+            onClick={() => {
+              void clear();
+            }}
+            disabled={phase === "applying" || phase === "generating"}
+            style={{
+              ...primaryBtn(phase === "applying"),
+              background: "transparent",
+              color: colors.textMuted,
+              border: `1px solid ${colors.border}`,
+            }}
+            aria-label="Clear alt-text on selected image"
+          >
+            Clear
+          </button>
+        ) : null}
+      </div>
+
+      {report !== null ? (
+        <>
+          <textarea
+            value={draft}
+            onChange={(e) => setDraft(e.target.value)}
+            rows={3}
+            style={{
+              width: "100%",
+              fontSize: 12,
+              padding: spacing.xs,
+              border: `1px solid ${colors.border}`,
+              borderRadius: radius.card / 2,
+              background: colors.bg,
+              color: colors.text,
+              resize: "vertical",
+              fontFamily: "inherit",
+            }}
+            aria-label="Editable alt-text draft"
+          />
+          <div
+            style={{
+              display: "flex",
+              gap: spacing.xs,
+              flexWrap: "wrap",
+              fontSize: 11,
+              color: colors.textMuted,
+            }}
+          >
+            <span>
+              brightness {report.brightness.toFixed(2)}
+            </span>
+            <span>contrast {report.contrast.toFixed(2)}</span>
+            <span>saturation {report.saturation.toFixed(2)}</span>
+            <span>edges {report.edge_density.toFixed(2)}</span>
+          </div>
+          {report.palette.length > 0 ? (
+            <div
+              style={{
+                display: "flex",
+                gap: 4,
+                marginTop: 2,
+              }}
+              aria-label="Dominant colours"
+            >
+              {report.palette.slice(0, 6).map((c, idx) => (
+                <span
+                  key={`palette-${idx}`}
+                  title={`rgb(${c.r}, ${c.g}, ${c.b})`}
+                  style={{
+                    width: 16,
+                    height: 16,
+                    background: `rgb(${c.r}, ${c.g}, ${c.b})`,
+                    border: `1px solid ${colors.border}`,
+                    borderRadius: 4,
+                  }}
+                />
+              ))}
+            </div>
+          ) : null}
+        </>
+      ) : null}
+
+      {phase === "error" && error !== null ? (
+        <div style={statusStripStyle("err")}>{error}</div>
+      ) : null}
+    </section>
   );
 }
 

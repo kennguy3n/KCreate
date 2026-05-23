@@ -1441,6 +1441,22 @@ function registerIpcHandlers(): void {
     (_e, requestJson: string) =>
       requireBridge().aiScreenshotToLayout(requestJson),
   );
+  ipcMain.handle(
+    "kcreate/ai/altTextForNode",
+    (_e, nodeId: string) =>
+      requireBridge().aiAltTextForNode(nodeId),
+  );
+  ipcMain.handle(
+    "kcreate/ai/applyAltText",
+    (_e, nodeId: string, text: string) => {
+      requireBridge().aiApplyAltText(nodeId, text);
+    },
+  );
+  ipcMain.handle(
+    "kcreate/ai/layoutSuggestForArtboard",
+    (_e, artboardId: string) =>
+      requireBridge().aiLayoutSuggestForArtboard(artboardId),
+  );
   ipcMain.handle("kcreate/plugin/list", () =>
     requireBridge().pluginList(),
   );

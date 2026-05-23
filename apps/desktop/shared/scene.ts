@@ -1352,6 +1352,73 @@ export interface ScreenshotRequest {
   height: number;
 }
 
+/// Result of `kcreate_ai::generate_alt_text` — the heuristic
+/// alt-text generator. The `text` field is the recommended
+/// human-readable description; the structured fields are exposed
+/// so the renderer can render a richer preview UI without
+/// re-running the analysis.
+export interface AltTextReport {
+  text: string;
+  /// Mean luminance in 0.0..1.0 (Rec. 709 weights). Drives the
+  /// "Dark / Balanced / Bright" word in the generated sentence.
+  brightness: number;
+  /// Stddev of luminance in 0.0..1.0. Drives the
+  /// "low-contrast / balanced / high-contrast" word.
+  contrast: number;
+  /// Mean saturation in 0.0..1.0 (HSV). Drives the
+  /// "muted / balanced / vivid" word.
+  saturation: number;
+  /// Sobel edge density in 0.0..1.0. Above ~0.18 the description
+  /// switches from "flat graphic" to "photographic detail".
+  edge_density: number;
+  /// Top-N dominant colors via k-means.
+  palette: ExtractedColor[];
+}
+
+/// Axis-aligned bounding box returned by
+/// `kcreate_ai::layout_suggest::Bounds`. `x`/`y` are the top-left
+/// corner. Distinct from [`ScreenshotElementBounds`] only to
+/// signal which Rust type it mirrors.
+export interface LayoutBounds {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+/// Detected dominant orientation of a cluster. Mirrors
+/// `kcreate_ai::layout_suggest::LayoutOrientation` (snake_case).
+export type LayoutOrientation = "row" | "column" | "grid" | "cloud";
+
+/// Detected alignment edge within a cluster. Mirrors
+/// `kcreate_ai::layout_suggest::LayoutAlignment` (snake_case).
+export type LayoutAlignment =
+  | "left"
+  | "right"
+  | "top"
+  | "bottom"
+  | "center_horizontal"
+  | "center_vertical";
+
+/// One proposed group from `kcreate_ai::suggest_layout_grouping`.
+/// The renderer previews each suggestion before any apply step;
+/// a future `applyLayoutSuggestion` call will promote a chosen
+/// suggestion into a real `LayoutFrame`.
+export interface LayoutSuggestion {
+  /// Human-readable label (e.g. "Row of 3", "Vertical stack").
+  name: string;
+  /// Axis-aligned bounding box covering every member node.
+  bounds: LayoutBounds;
+  /// Node ids that belong in the proposed group.
+  member_ids: string[];
+  /// Detected dominant orientation. Drives a row vs. column
+  /// preview affordance in the UI.
+  orientation: LayoutOrientation;
+  /// Detected alignment edge within the group, or `null` when the
+  /// cluster doesn't read as aligned on any single edge.
+  alignment: LayoutAlignment | null;
+}
+
 export interface AiModelBridge {
   upscale(nodeId: string, scale: number): Promise<string>;
   extractPalette(nodeId: string, maxColors: number): Promise<ExtractedColor[]>;
@@ -1375,6 +1442,20 @@ export interface AiModelBridge {
   /// Uninstall a model pack by deleting its file. Idempotent.
   uninstallModelPack(packId: string): Promise<void>;
   screenshotToLayout(request: ScreenshotRequest): Promise<ScreenshotElement[]>;
+  /// Run the local alt-text heuristic against a raster layer.
+  /// Read-only: does NOT persist anything to the document — call
+  /// [`AiModelBridge.applyAltText`] to commit the chosen string.
+  altTextForNode(nodeId: string): Promise<AltTextReport>;
+  /// Persist an alt-text label onto `nodeId`. Records an
+  /// undo/redo-able operation in the document log. An empty
+  /// string clears the metadata entry entirely.
+  applyAltText(nodeId: string, text: string): Promise<void>;
+  /// Run the layout-suggest heuristic over the direct (visible,
+  /// non-degenerate) children of `artboardId`. Returns an empty
+  /// list when fewer than two candidates remain, rather than an
+  /// error — so the UI can render a "nothing to suggest" state
+  /// without special-casing the call.
+  layoutSuggestForArtboard(artboardId: string): Promise<LayoutSuggestion[]>;
 }
 
 /// Result of [`PdfImportBridge.importPdf`] mirroring

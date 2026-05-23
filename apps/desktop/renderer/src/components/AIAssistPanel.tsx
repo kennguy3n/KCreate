@@ -11,9 +11,9 @@
 // always surface compute device, model name, and "Network: None" so
 // the user can reason about the action before applying it.
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 
-import type { NodeInfo } from "../../../shared/scene";
+import type { LayoutSuggestion, NodeInfo } from "../../../shared/scene";
 import { colors, radius, spacing } from "../styles/tokens";
 import { LlmChatPanel } from "./LlmChatPanel";
 import { McpSettingsPanel } from "./McpSettingsPanel";
@@ -154,6 +154,10 @@ export function AIAssistPanel({
         operation log alongside vector edits.
       </p>
 
+      <hr style={separatorStyle} />
+      <LayoutAssistSection selected={selectedNode} onStatus={onStatus} />
+      <hr style={separatorStyle} />
+
       <ModelManager onStatus={onStatus} />
       <LlmChatPanel onStatus={onStatus} />
       <hr style={separatorStyle} />
@@ -169,6 +173,172 @@ const separatorStyle: React.CSSProperties = {
   borderTop: "1px solid #E5E7EB",
   margin: "16px 0 8px",
 };
+
+/**
+ * Layout-suggest section. Visible whenever a container node
+ * (Artboard, Page, GroupLayer, LayoutFrame) is selected; clicking
+ * "Suggest layout" runs the local DBSCAN-with-alignment clustering
+ * heuristic in `kcreate_ai::layout_suggest` over the container's
+ * direct visible children and renders a preview of each proposed
+ * group. The apply step is intentionally not wired yet — Phase 4
+ * follow-up Block B exposes the analysis surface and the
+ * preview-only UX so the user can iterate on the algorithm
+ * before any LayoutFrame mutation lands.
+ */
+function LayoutAssistSection({
+  selected,
+  onStatus,
+}: {
+  selected: NodeInfo | null;
+  onStatus: (msg: string | null) => void;
+}): JSX.Element {
+  const containerTypes = new Set([
+    "Artboard",
+    "Page",
+    "GroupLayer",
+    "LayoutFrame",
+  ]);
+  const isContainer =
+    selected !== null && containerTypes.has(selected.nodeType);
+  const nodeId = isContainer ? selected.id : null;
+
+  type LayoutPhase = "idle" | "running" | "done" | "error";
+  const [phase, setPhase] = useState<LayoutPhase>("idle");
+  const [suggestions, setSuggestions] = useState<LayoutSuggestion[]>([]);
+  const [error, setError] = useState<string | null>(null);
+
+  // Reset state when the selection changes so we don't show stale
+  // suggestions from a previous artboard.
+  useEffect(() => {
+    setPhase("idle");
+    setSuggestions([]);
+    setError(null);
+  }, [nodeId]);
+
+  if (!isContainer || nodeId === null) {
+    return (
+      <section style={cardStyle}>
+        <div style={cardHeaderStyle}>
+          <strong>Layout assist</strong>
+          <span style={badgeStyle("ok")}>Local CPU</span>
+        </div>
+        <p style={paragraphStyle}>
+          Select an <b>Artboard</b>, <b>Page</b>, <b>Group</b>, or
+          <b> Frame</b> to suggest layout groupings for its children.
+        </p>
+      </section>
+    );
+  }
+
+  const run = async (): Promise<void> => {
+    setPhase("running");
+    setError(null);
+    onStatus("Suggesting layout groupings locally…");
+    try {
+      const r = await window.kcreate.aiModel.layoutSuggestForArtboard(nodeId);
+      setSuggestions(r);
+      setPhase("done");
+      onStatus(
+        r.length === 0
+          ? "Layout assist: no groupings found."
+          : `Layout assist: ${r.length} suggestion${r.length === 1 ? "" : "s"}.`,
+      );
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      setError(msg);
+      setPhase("error");
+      onStatus(`Layout assist failed: ${msg}`);
+    }
+  };
+
+  return (
+    <section style={cardStyle}>
+      <div style={cardHeaderStyle}>
+        <strong>Layout assist</strong>
+        <span style={badgeStyle("ok")}>Local CPU</span>
+      </div>
+      <p style={paragraphStyle}>
+        Clusters the direct visible children of{" "}
+        <b>{selected?.name}</b> by proximity and edge alignment.
+        Preview-only — no nodes are moved.
+      </p>
+      <button
+        type="button"
+        onClick={() => {
+          void run();
+        }}
+        disabled={phase === "running"}
+        style={primaryBtn(phase === "running")}
+        aria-label="Suggest layout groupings"
+      >
+        {phase === "running" ? "Analyzing…" : "Suggest layout"}
+      </button>
+      {phase === "done" && suggestions.length === 0 ? (
+        <div style={statusStripStyle("ok")}>
+          No clusters detected. (Need at least two aligned children.)
+        </div>
+      ) : null}
+      {phase === "error" && error !== null ? (
+        <div style={statusStripStyle("err")}>{error}</div>
+      ) : null}
+      {suggestions.length > 0 ? (
+        <ul
+          style={{
+            listStyle: "none",
+            margin: 0,
+            padding: 0,
+            display: "flex",
+            flexDirection: "column",
+            gap: spacing.xs,
+          }}
+          aria-label="Layout suggestions"
+        >
+          {suggestions.map((s, idx) => (
+            <li
+              key={`layout-${idx}`}
+              style={{
+                background: colors.bg,
+                border: `1px solid ${colors.border}`,
+                borderRadius: radius.card / 2,
+                padding: spacing.xs,
+                display: "flex",
+                flexDirection: "column",
+                gap: 2,
+                fontSize: 11,
+              }}
+            >
+              <div
+                style={{
+                  display: "flex",
+                  justifyContent: "space-between",
+                  gap: spacing.xs,
+                }}
+              >
+                <strong style={{ color: colors.text }}>{s.name}</strong>
+                <span
+                  style={{
+                    color: colors.textMuted,
+                    fontVariantNumeric: "tabular-nums",
+                  }}
+                >
+                  {s.member_ids.length}{" "}
+                  {s.member_ids.length === 1 ? "node" : "nodes"}
+                </span>
+              </div>
+              <div style={{ color: colors.textMuted }}>
+                {s.orientation}
+                {s.alignment ? ` · ${s.alignment.replace("_", " ")}` : ""}
+                {" · "}
+                {Math.round(s.bounds.width)}×{Math.round(s.bounds.height)} at{" "}
+                ({Math.round(s.bounds.x)}, {Math.round(s.bounds.y)})
+              </div>
+            </li>
+          ))}
+        </ul>
+      ) : null}
+    </section>
+  );
+}
 
 function KV({
   label,

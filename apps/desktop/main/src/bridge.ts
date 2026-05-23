@@ -328,6 +328,9 @@ export interface Bridge {
   aiUninstallModelPack(packId: string): void;
   pdfImport(filePath: string): string;
   aiScreenshotToLayout(requestJson: string): string;
+  aiAltTextForNode(nodeId: string): string;
+  aiApplyAltText(nodeId: string, text: string): void;
+  aiLayoutSuggestForArtboard(artboardId: string): string;
   pluginList(): string;
   pluginEnable(id: string): void;
   pluginDisable(id: string): void;

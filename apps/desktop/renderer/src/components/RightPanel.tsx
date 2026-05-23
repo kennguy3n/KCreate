@@ -233,6 +233,7 @@ export function RightPanel({
           <AccessibilityPanel
             onSelectNode={onSelectNode}
             onStatus={onStatus}
+            selected={selected}
           />
         ) : null}
         {tab === "interaction" && showInteraction ? (

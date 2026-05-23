@@ -573,6 +573,18 @@ pub const TEXT_FRAME_METADATA_KEY: &str = "text_frame";
 /// [`OpenTypeFeatures`] (ligatures, kerning, stylistic sets, etc).
 pub const OPENTYPE_FEATURES_METADATA_KEY: &str = "opentype_features";
 
+/// Metadata key used on any node (typically a `RasterLayer`) to
+/// store a human-readable accessibility description ("alt text").
+///
+/// Phase 4 wiring writes this from the AccessibilityPanel's
+/// "Generate alt-text" button via the local alt-text heuristic in
+/// `kcreate_ai::generate_alt_text`. PDF export already reads from
+/// the metadata key to populate the PDF/UA structure tree; keeping
+/// it as a stable string here means a future schema bump can
+/// promote it to a first-class field on `Node` without breaking
+/// existing `.kstudio` projects on disk.
+pub const ALT_TEXT_METADATA_KEY: &str = "alt_text";
+
 /// Per-side inset (top / right / bottom / left) in pixels. Used by
 /// [`TextFrameOptions::inset`] to pad text away from the frame
 /// bounds — the layout engine subtracts these from the frame
@@ -1076,6 +1088,39 @@ impl Node {
             MASTER_PAGE_METADATA_KEY.to_string(),
             serde_json::Value::Bool(master),
         );
+        self.touch();
+    }
+
+    /// Read the node's accessibility alt-text label, if any.
+    ///
+    /// Returns `None` when the metadata key is absent, when the
+    /// stored value isn't a string, or when the string is empty.
+    /// Callers should treat an empty / missing label as "no alt
+    /// text" — PDF export uses that to decide whether the node
+    /// needs to be tagged as `/Artifact` (decorative) or as a
+    /// regular `/Figure` with a `/Alt` entry.
+    #[must_use]
+    pub fn alt_text(&self) -> Option<&str> {
+        self.metadata
+            .get(ALT_TEXT_METADATA_KEY)
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+    }
+
+    /// Set the node's accessibility alt-text label. Passing an
+    /// empty string clears the metadata entry entirely, matching
+    /// `alt_text()`'s "empty == missing" semantic so a round-trip
+    /// of `clear → save → load` doesn't leak an empty value back
+    /// into the persisted project.
+    pub fn set_alt_text(&mut self, text: &str) {
+        if text.is_empty() {
+            self.metadata.remove(ALT_TEXT_METADATA_KEY);
+        } else {
+            self.metadata.insert(
+                ALT_TEXT_METADATA_KEY.to_string(),
+                serde_json::Value::String(text.to_string()),
+            );
+        }
         self.touch();
     }
 

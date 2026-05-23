@@ -15,6 +15,7 @@ import { useEffect, useRef, useState } from "react";
 
 import {
   isContainerNodeType,
+  type ExtractedColor,
   type LayoutSuggestion,
   type NodeInfo,
 } from "../../../shared/scene";
@@ -160,6 +161,10 @@ export function AIAssistPanel({
 
       <hr style={separatorStyle} />
       <LayoutAssistSection selected={selectedNode} onStatus={onStatus} />
+      <hr style={separatorStyle} />
+      <PaletteSection selected={selectedNode} onStatus={onStatus} />
+      <hr style={separatorStyle} />
+      <SmartSelectSection selected={selectedNode} onStatus={onStatus} />
       <hr style={separatorStyle} />
 
       <ModelManager onStatus={onStatus} />
@@ -377,6 +382,599 @@ function LayoutAssistSection({
     </section>
   );
 }
+
+/**
+ * Reads the intrinsic raster dimensions from a `NodeInfo.metadata`
+ * payload, returning `null` when the node isn't a RasterLayer or the
+ * metadata key is absent / malformed. The shape comes from
+ * `kcreate_export::scene_metadata::RasterImageMeta` (mirrored by the
+ * `raster_image` metadata key); the renderer just reads it — the
+ * authoritative source remains the document.
+ *
+ * Kept as a single helper so future renderer surfaces that depend on
+ * intrinsic raster size (palette, smart-select, OCR, …) all read it
+ * the same way and don't drift on the wire-shape contract.
+ */
+function rasterIntrinsicSize(
+  node: NodeInfo | null,
+): { width: number; height: number } | null {
+  if (node === null || node.nodeType !== "RasterLayer") return null;
+  const raw = node.metadata?.["raster_image"];
+  if (raw === undefined || raw === null || typeof raw !== "object") return null;
+  const meta = raw as { width?: unknown; height?: unknown };
+  const w = typeof meta.width === "number" ? meta.width : null;
+  const h = typeof meta.height === "number" ? meta.height : null;
+  if (w === null || h === null || w <= 0 || h <= 0) return null;
+  return { width: w, height: h };
+}
+
+/**
+ * Palette extraction. Visible whenever a `RasterLayer` is selected;
+ * clicking "Extract palette" runs `kcreate_ai::extract_palette` (a
+ * pure-Rust k-means pass over the raster's RGBA pixels) and renders
+ * the top-N dominant colors with their frequency share of the
+ * image. Each swatch is clickable — that copies the hex value to the
+ * clipboard so the user can paste it into the fill picker (or
+ * anywhere else a hex is accepted).
+ *
+ * Apply-as-fill is deliberately out of scope for this iteration:
+ * `kcreate_bridge` exposes no mutator for `node.style.fill` yet
+ * (the existing `updateNode` IPC only accepts name/visible/locked/
+ * metadata). Wiring "apply this swatch as the document accent" or
+ * "as the selected layer's fill" needs a new bridge surface first —
+ * see Block C / Block D for that follow-up. Until then, the
+ * clipboard-handoff matches the affordance every existing color
+ * inspector in the app uses (ColorSettingsPanel, hex inputs, etc.).
+ */
+function PaletteSection({
+  selected,
+  onStatus,
+}: {
+  selected: NodeInfo | null;
+  onStatus: (msg: string | null) => void;
+}): JSX.Element {
+  const isRaster = selected !== null && selected.nodeType === "RasterLayer";
+  const nodeId = isRaster ? selected.id : null;
+  const intrinsic = rasterIntrinsicSize(selected);
+
+  type PalettePhase = "idle" | "running" | "done" | "error";
+  const [phase, setPhase] = useState<PalettePhase>("idle");
+  const [maxColors, setMaxColors] = useState(6);
+  const [palette, setPalette] = useState<ExtractedColor[]>([]);
+  const [error, setError] = useState<string | null>(null);
+  // Per-section request token — same rationale as LayoutAssistSection
+  // above (re-running while a previous call is in flight must drop
+  // the stale result rather than overwrite the fresh one).
+  const requestTokenRef = useRef(0);
+
+  useEffect(() => {
+    setPhase("idle");
+    setPalette([]);
+    setError(null);
+    requestTokenRef.current += 1;
+  }, [nodeId]);
+
+  if (!isRaster || nodeId === null) {
+    return (
+      <section style={cardStyle}>
+        <div style={cardHeaderStyle}>
+          <strong>Palette extraction</strong>
+          <span style={badgeStyle("ok")}>Local CPU</span>
+        </div>
+        <p style={paragraphStyle}>
+          Select a <b>RasterLayer</b> to extract its dominant colors
+          via local k-means clustering.
+        </p>
+      </section>
+    );
+  }
+
+  const run = async (): Promise<void> => {
+    requestTokenRef.current += 1;
+    const token = requestTokenRef.current;
+    setPhase("running");
+    setError(null);
+    onStatus(
+      `Extracting up to ${maxColors} colors from ${selected?.name} locally…`,
+    );
+    try {
+      const colorsOut = await window.kcreate.aiModel.extractPalette(
+        nodeId,
+        maxColors,
+      );
+      if (requestTokenRef.current !== token) return;
+      setPalette(colorsOut);
+      setPhase("done");
+      onStatus(
+        colorsOut.length === 0
+          ? "Palette: no colors found (empty raster)."
+          : `Palette: ${colorsOut.length} dominant color${colorsOut.length === 1 ? "" : "s"}.`,
+      );
+    } catch (e) {
+      if (requestTokenRef.current !== token) return;
+      const msg = e instanceof Error ? e.message : String(e);
+      setError(msg);
+      setPhase("error");
+      onStatus(`Palette failed: ${msg}`);
+    }
+  };
+
+  const copyHex = async (hex: string): Promise<void> => {
+    try {
+      await navigator.clipboard.writeText(hex);
+      onStatus(`Copied ${hex} to clipboard.`);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      onStatus(`Copy failed: ${msg}`);
+    }
+  };
+
+  return (
+    <section style={cardStyle}>
+      <div style={cardHeaderStyle}>
+        <strong>Palette extraction</strong>
+        <span style={badgeStyle("ok")}>Local CPU</span>
+      </div>
+      <p style={paragraphStyle}>
+        K-means over <b>{selected?.name}</b>
+        {intrinsic ? ` (${intrinsic.width}×${intrinsic.height} px)` : ""}.
+        Click any swatch to copy its hex to the clipboard.
+      </p>
+      <div
+        style={{
+          display: "flex",
+          gap: spacing.xs,
+          alignItems: "center",
+          fontSize: 11,
+          color: colors.textMuted,
+        }}
+      >
+        <label htmlFor="palette-max-colors">Max colors</label>
+        <input
+          id="palette-max-colors"
+          type="number"
+          min={2}
+          max={12}
+          value={maxColors}
+          onChange={(e) => {
+            const next = Number.parseInt(e.target.value, 10);
+            // Clamp to the k-means bounds the Rust side will accept
+            // (Phase 2 cap = 12, floor = 2). Out-of-range values
+            // would still trip the Rust validator but pinging the
+            // sidecar for an arithmetic error is wasteful when we
+            // can short-circuit here.
+            if (Number.isFinite(next)) {
+              setMaxColors(Math.min(12, Math.max(2, next)));
+            }
+          }}
+          disabled={phase === "running"}
+          style={{
+            width: 48,
+            padding: "2px 6px",
+            border: `1px solid ${colors.border}`,
+            borderRadius: radius.card / 2,
+            fontSize: 11,
+            background: colors.bg,
+            color: colors.text,
+          }}
+        />
+        <button
+          type="button"
+          onClick={() => {
+            void run();
+          }}
+          disabled={phase === "running"}
+          style={primaryBtn(phase === "running")}
+          aria-label="Extract palette"
+        >
+          {phase === "running" ? "Extracting…" : "Extract palette"}
+        </button>
+      </div>
+      {phase === "error" && error !== null ? (
+        <div style={statusStripStyle("err")}>{error}</div>
+      ) : null}
+      {phase === "done" && palette.length === 0 ? (
+        <div style={statusStripStyle("ok")}>
+          No colors found. (Raster is empty or fully transparent.)
+        </div>
+      ) : null}
+      {palette.length > 0 ? (
+        <ul
+          style={{
+            listStyle: "none",
+            margin: 0,
+            padding: 0,
+            display: "flex",
+            flexDirection: "column",
+            gap: spacing.xs,
+          }}
+          aria-label="Extracted palette"
+        >
+          {palette.map((c, idx) => (
+            <li
+              key={`palette-${idx}-${c.hex}`}
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: spacing.xs,
+              }}
+            >
+              <button
+                type="button"
+                onClick={() => {
+                  void copyHex(c.hex);
+                }}
+                aria-label={`Copy ${c.hex} to clipboard`}
+                style={{
+                  flex: 1,
+                  display: "flex",
+                  alignItems: "center",
+                  gap: spacing.sm,
+                  padding: spacing.xs,
+                  background: colors.bg,
+                  border: `1px solid ${colors.border}`,
+                  borderRadius: radius.card / 2,
+                  cursor: "pointer",
+                  textAlign: "left",
+                  color: colors.text,
+                  fontSize: 11,
+                }}
+              >
+                <span
+                  style={{
+                    width: 24,
+                    height: 24,
+                    background: c.hex,
+                    border: `1px solid ${colors.border}`,
+                    borderRadius: radius.card / 2,
+                    flexShrink: 0,
+                  }}
+                  aria-hidden
+                />
+                <span style={monoStyle}>{c.hex}</span>
+                <span
+                  style={{
+                    marginLeft: "auto",
+                    color: colors.textMuted,
+                    fontVariantNumeric: "tabular-nums",
+                  }}
+                >
+                  {(c.frequency * 100).toFixed(1)}%
+                </span>
+              </button>
+            </li>
+          ))}
+        </ul>
+      ) : null}
+    </section>
+  );
+}
+
+/**
+ * Smart selection. Visible whenever a `RasterLayer` is selected.
+ *
+ * Calls `kcreate_ai::smart_select` (a BFS flood-fill over the
+ * raster's RGBA pixels, gated on the Euclidean colour distance from
+ * the seed pixel). The user supplies a seed (x, y) in the raster's
+ * intrinsic pixel coordinate space and a tolerance in [0.0, 1.0]
+ * (0 = exact-colour match, 1 = match everything).
+ *
+ * The mask is returned as base64 of a `width × height` packed
+ * grayscale buffer (0 = excluded, 255 = included). We render it
+ * directly to a small `<canvas>` for preview. Materialising the
+ * mask as a new RasterMaskLayer is a follow-up — it needs a
+ * mutator surface on the bridge that doesn't exist yet (parallels
+ * the palette → fill plumbing gap described on PaletteSection).
+ *
+ * The clamp on (x, y) to the raster's intrinsic dimensions is
+ * authoritative on the Rust side; we apply the same clamp here so
+ * the user gets immediate feedback on out-of-bounds inputs without
+ * a bridge round trip.
+ */
+function SmartSelectSection({
+  selected,
+  onStatus,
+}: {
+  selected: NodeInfo | null;
+  onStatus: (msg: string | null) => void;
+}): JSX.Element {
+  const isRaster = selected !== null && selected.nodeType === "RasterLayer";
+  const nodeId = isRaster ? selected.id : null;
+  const intrinsic = rasterIntrinsicSize(selected);
+
+  type SmartPhase = "idle" | "running" | "done" | "error";
+  const [phase, setPhase] = useState<SmartPhase>("idle");
+  const [seedX, setSeedX] = useState(0);
+  const [seedY, setSeedY] = useState(0);
+  const [tolerance, setTolerance] = useState(0.1);
+  const [maskInfo, setMaskInfo] = useState<{
+    base64: string;
+    width: number;
+    height: number;
+    selectedPixels: number;
+  } | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  // Per-section request token — same rationale as the other AI
+  // sections; a re-run while one is in flight must drop the stale
+  // result rather than overwrite the fresh one.
+  const requestTokenRef = useRef(0);
+
+  // Reset state and re-centre the seed on the new raster when the
+  // selection changes. Centring is a useful default — most raster
+  // subjects sit roughly in the middle, and the user can drag the
+  // seed from there.
+  //
+  // We depend on the primitive width/height pair rather than the
+  // `intrinsic` object itself because `rasterIntrinsicSize` returns
+  // a fresh object on every render — using it in the dep list would
+  // re-fire the effect on every parent re-render. The primitive
+  // pair carries the only state we actually care about.
+  const intrinsicWidth = intrinsic?.width ?? null;
+  const intrinsicHeight = intrinsic?.height ?? null;
+  useEffect(() => {
+    setPhase("idle");
+    setMaskInfo(null);
+    setError(null);
+    requestTokenRef.current += 1;
+    if (intrinsicWidth !== null && intrinsicHeight !== null) {
+      setSeedX(Math.floor(intrinsicWidth / 2));
+      setSeedY(Math.floor(intrinsicHeight / 2));
+    } else {
+      setSeedX(0);
+      setSeedY(0);
+    }
+  }, [nodeId, intrinsicWidth, intrinsicHeight]);
+
+  // Repaint the mask preview whenever the result lands. Done in an
+  // effect (not inline) so React commits the <canvas> before we
+  // touch its 2D context — pre-commit canvas access can null-ref on
+  // first render.
+  useEffect(() => {
+    if (maskInfo === null) return;
+    const canvas = canvasRef.current;
+    if (canvas === null) return;
+    const ctx = canvas.getContext("2d");
+    if (ctx === null) return;
+    // Decode base64 → bytes; one mask byte per pixel.
+    let bytes: Uint8Array;
+    try {
+      const bin = atob(maskInfo.base64);
+      bytes = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i += 1) bytes[i] = bin.charCodeAt(i);
+    } catch {
+      return;
+    }
+    canvas.width = maskInfo.width;
+    canvas.height = maskInfo.height;
+    const image = ctx.createImageData(maskInfo.width, maskInfo.height);
+    // The Rust mask is one byte per pixel (0 or 255). We expand to
+    // RGBA with the mask value as the alpha channel and a vivid
+    // accent as the RGB so the selection reads at a glance.
+    for (let i = 0; i < bytes.length; i += 1) {
+      const v = bytes[i] ?? 0;
+      const o = i * 4;
+      image.data[o + 0] = 124; // accent R
+      image.data[o + 1] = 58; // accent G
+      image.data[o + 2] = 237; // accent B
+      image.data[o + 3] = v;
+    }
+    ctx.putImageData(image, 0, 0);
+  }, [maskInfo]);
+
+  if (!isRaster || nodeId === null) {
+    return (
+      <section style={cardStyle}>
+        <div style={cardHeaderStyle}>
+          <strong>Smart selection</strong>
+          <span style={badgeStyle("ok")}>Local CPU</span>
+        </div>
+        <p style={paragraphStyle}>
+          Select a <b>RasterLayer</b> to build a flood-fill selection
+          mask from a seed pixel.
+        </p>
+      </section>
+    );
+  }
+
+  if (intrinsic === null) {
+    // Real edge case — a RasterLayer with no `raster_image` metadata
+    // is broken on the document side. We surface it as a useful
+    // diagnostic rather than silently no-op, because the AI call
+    // would otherwise fail with a less actionable Io error.
+    return (
+      <section style={cardStyle}>
+        <div style={cardHeaderStyle}>
+          <strong>Smart selection</strong>
+          <span style={badgeStyle("err")}>No raster metadata</span>
+        </div>
+        <p style={paragraphStyle}>
+          <b>{selected?.name}</b> is missing intrinsic-size metadata.
+          Re-import or replace the raster to enable smart-select.
+        </p>
+      </section>
+    );
+  }
+
+  const run = async (): Promise<void> => {
+    requestTokenRef.current += 1;
+    const token = requestTokenRef.current;
+    setPhase("running");
+    setError(null);
+    onStatus(
+      `Building selection mask from (${seedX}, ${seedY}) with tolerance ${tolerance.toFixed(2)}…`,
+    );
+    try {
+      const base64 = await window.kcreate.aiModel.smartSelect(
+        nodeId,
+        seedX,
+        seedY,
+        tolerance,
+      );
+      if (requestTokenRef.current !== token) return;
+      // Count selected pixels for the status strip. Reusing the
+      // decode pass that the preview effect runs would couple the
+      // two concerns; this is a cheap O(n) pass on a buffer the
+      // browser already holds, run once.
+      const bin = atob(base64);
+      let selectedPixels = 0;
+      for (let i = 0; i < bin.length; i += 1) {
+        if (bin.charCodeAt(i) > 0) selectedPixels += 1;
+      }
+      setMaskInfo({
+        base64,
+        width: intrinsic.width,
+        height: intrinsic.height,
+        selectedPixels,
+      });
+      setPhase("done");
+      const total = intrinsic.width * intrinsic.height;
+      const pct = total === 0 ? 0 : (selectedPixels / total) * 100;
+      onStatus(
+        `Smart selection: ${selectedPixels.toLocaleString()} / ${total.toLocaleString()} px (${pct.toFixed(1)}%).`,
+      );
+    } catch (e) {
+      if (requestTokenRef.current !== token) return;
+      const msg = e instanceof Error ? e.message : String(e);
+      setError(msg);
+      setPhase("error");
+      onStatus(`Smart selection failed: ${msg}`);
+    }
+  };
+
+  return (
+    <section style={cardStyle}>
+      <div style={cardHeaderStyle}>
+        <strong>Smart selection</strong>
+        <span style={badgeStyle("ok")}>Local CPU</span>
+      </div>
+      <p style={paragraphStyle}>
+        BFS flood-fill over <b>{selected?.name}</b> ({intrinsic.width}×
+        {intrinsic.height} px). Pick a seed pixel and a colour-distance
+        tolerance.
+      </p>
+      <div
+        style={{
+          display: "grid",
+          gridTemplateColumns: "auto 1fr",
+          gap: "4px 6px",
+          fontSize: 11,
+          color: colors.textMuted,
+          alignItems: "center",
+        }}
+      >
+        <label htmlFor="smart-x">Seed X (px)</label>
+        <input
+          id="smart-x"
+          type="number"
+          min={0}
+          max={intrinsic.width - 1}
+          value={seedX}
+          onChange={(e) => {
+            const next = Number.parseInt(e.target.value, 10);
+            if (Number.isFinite(next)) {
+              setSeedX(Math.min(intrinsic.width - 1, Math.max(0, next)));
+            }
+          }}
+          disabled={phase === "running"}
+          style={numberInputStyle}
+        />
+        <label htmlFor="smart-y">Seed Y (px)</label>
+        <input
+          id="smart-y"
+          type="number"
+          min={0}
+          max={intrinsic.height - 1}
+          value={seedY}
+          onChange={(e) => {
+            const next = Number.parseInt(e.target.value, 10);
+            if (Number.isFinite(next)) {
+              setSeedY(Math.min(intrinsic.height - 1, Math.max(0, next)));
+            }
+          }}
+          disabled={phase === "running"}
+          style={numberInputStyle}
+        />
+        <label htmlFor="smart-tol">Tolerance</label>
+        <input
+          id="smart-tol"
+          type="number"
+          min={0}
+          max={1}
+          step={0.01}
+          value={tolerance}
+          onChange={(e) => {
+            const next = Number.parseFloat(e.target.value);
+            if (Number.isFinite(next)) {
+              setTolerance(Math.min(1, Math.max(0, next)));
+            }
+          }}
+          disabled={phase === "running"}
+          style={numberInputStyle}
+        />
+      </div>
+      <button
+        type="button"
+        onClick={() => {
+          void run();
+        }}
+        disabled={phase === "running"}
+        style={primaryBtn(phase === "running")}
+        aria-label="Build selection mask"
+      >
+        {phase === "running" ? "Selecting…" : "Build selection mask"}
+      </button>
+      {phase === "error" && error !== null ? (
+        <div style={statusStripStyle("err")}>{error}</div>
+      ) : null}
+      {maskInfo !== null ? (
+        <div
+          style={{
+            display: "flex",
+            flexDirection: "column",
+            gap: spacing.xs,
+            alignItems: "center",
+          }}
+        >
+          <canvas
+            ref={canvasRef}
+            aria-label="Selection mask preview"
+            style={{
+              maxWidth: "100%",
+              maxHeight: 160,
+              imageRendering: "pixelated",
+              background:
+                "repeating-conic-gradient(#e5e7eb 0% 25%, transparent 0% 50%) 50% / 12px 12px",
+              border: `1px solid ${colors.border}`,
+              borderRadius: radius.card / 2,
+            }}
+          />
+          <span style={{ fontSize: 10, color: colors.textMuted }}>
+            {maskInfo.selectedPixels.toLocaleString()} px selected of{" "}
+            {(maskInfo.width * maskInfo.height).toLocaleString()} (
+            {maskInfo.width * maskInfo.height === 0
+              ? "0.0"
+              : (
+                  (maskInfo.selectedPixels /
+                    (maskInfo.width * maskInfo.height)) *
+                  100
+                ).toFixed(1)}
+            %)
+          </span>
+        </div>
+      ) : null}
+    </section>
+  );
+}
+
+const numberInputStyle: React.CSSProperties = {
+  padding: "2px 6px",
+  border: `1px solid ${colors.border}`,
+  borderRadius: radius.card / 2,
+  fontSize: 11,
+  background: colors.bg,
+  color: colors.text,
+};
 
 function KV({
   label,

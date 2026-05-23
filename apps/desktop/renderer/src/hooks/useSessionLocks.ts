@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 import type { SessionEvent, SessionLockEntry } from "../../../shared/scene";
 
@@ -63,36 +63,54 @@ export function useSessionLocks(): UseSessionLocksResult {
   const [selfPeerId, setSelfPeerId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
+  // Monotonic token guarding against out-of-order `reload()`
+  // completions. The bridge IPC is in-process and sub-millisecond, so
+  // realistically two events arriving back-to-back will resolve in
+  // FIFO order — but JavaScript's task scheduler makes no guarantee
+  // about that, and a high-volume `locksChanged` burst on a busy
+  // session could in principle let an earlier `reload()` resolve
+  // after a later one and silently overwrite the fresh roster with
+  // stale data. Same idea as `AltTextSection`'s `requestTokenRef` and
+  // `EditorPage`'s presence-broadcast guard, applied to the hook's
+  // event-driven re-fetch loop: every invocation captures a token,
+  // and only commits its result if the token is still the latest one
+  // at completion time. Stale completions are dropped on the floor
+  // (matching the docstring's "stale state is preferable to flashing
+  // empty" — but only when the stale snapshot is *older* than what we
+  // already have, never *newer*).
+  const reloadTokenRef = useRef(0);
+
   useEffect(() => {
     let cancelled = false;
 
     const reload = async (): Promise<void> => {
+      reloadTokenRef.current += 1;
+      const token = reloadTokenRef.current;
       try {
         // Fetch both halves of the snapshot before touching React
         // state. React 18 only batches updates within the same
-        // microtask (between `await`s), so if we called
-        // `setSelfPeerId` immediately after the first await and
-        // `setAllLocks` after the second, a render landing between
-        // the two commits would observe the new peer id with the
-        // previous session's lock map — briefly mis-attributing
-        // peer-A's locks to peer-B during a session transition.
-        // Pulling both reads up-front and then issuing both setState
-        // calls adjacent (no `await` between them) lets React batch
-        // the commits, so callers always observe a consistent
-        // `(selfPeerId, allLocks)` pair.
+        // microtask (between `await`s), so if we issued both
+        // setState calls with `await`s between them, a render
+        // landing between the two commits would observe the new
+        // peer id with the previous session's lock map — briefly
+        // mis-attributing peer-A's locks to peer-B during a
+        // session transition. Pulling both reads up-front and then
+        // issuing both setState calls adjacent (no `await` between
+        // them) lets React batch the commits, so callers always
+        // observe a consistent `(selfPeerId, allLocks)` pair.
         const info = await window.kcreate.session.info();
-        if (cancelled) return;
+        if (cancelled || reloadTokenRef.current !== token) return;
         // `session.locks()` is safe to call even when no session is
         // running — it returns `[]` rather than throwing.
         const entries = await window.kcreate.session.locks();
-        if (cancelled) return;
+        if (cancelled || reloadTokenRef.current !== token) return;
         const peerId = info?.peerId ?? null;
         const lockMap = buildLockMap(entries);
         setSelfPeerId(peerId);
         setAllLocks(lockMap);
         setError(null);
       } catch (e) {
-        if (!cancelled) {
+        if (!cancelled && reloadTokenRef.current === token) {
           setError(errorMessage(e));
         }
       }
@@ -148,16 +166,24 @@ export function useSessionLocks(): UseSessionLocksResult {
   // When `selfPeerId === null` we return an empty map rather than
   // passing `allLocks` through unfiltered. The JSDoc on
   // `remoteLocks` contracts the result to "entries excluding ones
-  // we hold ourselves" — but `setSelfPeerId(null)` and
-  // `setAllLocks(...)` inside `reload()` are separated by an
-  // `await`, so a render landing between the two would otherwise
-  // see `selfPeerId = null` *and* the previous session's
-  // `allLocks` still populated, which would (a) violate the doc
-  // contract and (b) cause RightPanel to surface our *own* locks
-  // as a "locked by another peer" banner for one frame. Returning
-  // an empty map keeps the invariant honest no matter the order
-  // the two setState calls flush, and matches the "no session ⇒
-  // no remote peers" semantic the bridge enforces anyway.
+  // we hold ourselves" — and although `reload()` now commits both
+  // setState calls adjacent (so within a single `reload()` the
+  // `(selfPeerId, allLocks)` pair is always consistent), two
+  // *separate* sources could still land in inconsistent order:
+  // - the initial mount `reload()` resets `selfPeerId` to null
+  //   between sessions while `allLocks` may briefly retain the
+  //   previous session's entries until the next `setAllLocks`
+  //   commit lands;
+  // - a future contributor could add another setter that touches
+  //   only one of the two fields, breaking the within-`reload()`
+  //   batching invariant.
+  // In either case, returning an empty map keeps the invariant
+  // honest: without this guard, every lock entry would pass the
+  // `holderPeerId !== selfPeerId` filter (since `null !== anyId`)
+  // and the user's own locks would briefly surface as remote
+  // "locked by …" banners. Matches the "no session ⇒ no remote
+  // peers" semantic the bridge enforces anyway, so the guard has
+  // no observable downside.
   const remoteLocks = useMemo(
     () =>
       selfPeerId === null

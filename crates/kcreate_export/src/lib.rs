@@ -20,6 +20,7 @@ pub mod icon_pack;
 pub mod jpeg;
 pub mod pdf;
 pub mod pdf_import;
+pub mod pdf_shading;
 pub mod png;
 pub mod preflight;
 pub mod scene_metadata;

@@ -222,6 +222,41 @@ export interface Bounds {
   height: number;
 }
 
+/**
+ * Wire-format names of `NodeType` variants that are containers (i.e.
+ * `NodeType::is_container() == true` on the Rust side, exposed via
+ * the bridge as `NodeInfo::nodeType`).
+ *
+ * **Lockstep contract**: this constant mirrors
+ * `kcreate_core::node::CONTAINER_NODE_WIRE_NAMES` in
+ * `crates/kcreate_core/src/node.rs`. If you change `is_container()`
+ * (or add/remove a `NodeType` variant) you must update three things
+ * together: (1) the Rust `is_container` exhaustive match, (2) the
+ * Rust `CONTAINER_NODE_WIRE_NAMES` constant, and (3) this TS
+ * constant. The Rust test `canonical_container_wire_names_match_expected_list`
+ * fires if (1) and (2) ever diverge; consumers of (3) in the renderer
+ * (e.g. `AIAssistPanel::LAYOUT_ASSIST_CONTAINER_TYPES`) import from
+ * here so there is exactly one TS-side source of truth.
+ */
+export const CONTAINER_NODE_TYPES: ReadonlyArray<string> = Object.freeze([
+  "Page",
+  "Artboard",
+  "GroupLayer",
+  "LayoutFrame",
+  "ComponentLayer",
+]);
+
+/**
+ * Convenience predicate: is the given wire-format node-type name a
+ * container? Backs the `AIAssistPanel` layout-suggest button-eligibility
+ * gate. Implementation is a tiny constant-time `Set` lookup so callers
+ * don't pay an `indexOf` per render.
+ */
+const CONTAINER_NODE_TYPE_SET = new Set<string>(CONTAINER_NODE_TYPES);
+export function isContainerNodeType(nodeType: string): boolean {
+  return CONTAINER_NODE_TYPE_SET.has(nodeType);
+}
+
 export interface NodeInfo {
   id: string;
   nodeType: string;
@@ -1157,7 +1192,8 @@ export type PreflightCheckId =
   | "image_resolution"
   | "color_space"
   | "transparency"
-  | "page_size";
+  | "page_size"
+  | "shading";
 
 export interface PreflightIssue {
   check: PreflightCheckId;
@@ -1352,6 +1388,73 @@ export interface ScreenshotRequest {
   height: number;
 }
 
+/// Result of `kcreate_ai::generate_alt_text` — the heuristic
+/// alt-text generator. The `text` field is the recommended
+/// human-readable description; the structured fields are exposed
+/// so the renderer can render a richer preview UI without
+/// re-running the analysis.
+export interface AltTextReport {
+  text: string;
+  /// Mean luminance in 0.0..1.0 (Rec. 709 weights). Drives the
+  /// "Dark / Balanced / Bright" word in the generated sentence.
+  brightness: number;
+  /// Stddev of luminance in 0.0..1.0. Drives the
+  /// "low-contrast / balanced / high-contrast" word.
+  contrast: number;
+  /// Mean saturation in 0.0..1.0 (HSV). Drives the
+  /// "muted / balanced / vivid" word.
+  saturation: number;
+  /// Sobel edge density in 0.0..1.0. Above ~0.18 the description
+  /// switches from "flat graphic" to "photographic detail".
+  edge_density: number;
+  /// Top-N dominant colors via k-means.
+  palette: ExtractedColor[];
+}
+
+/// Axis-aligned bounding box returned by
+/// `kcreate_ai::layout_suggest::Bounds`. `x`/`y` are the top-left
+/// corner. Distinct from [`ScreenshotElementBounds`] only to
+/// signal which Rust type it mirrors.
+export interface LayoutBounds {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+/// Detected dominant orientation of a cluster. Mirrors
+/// `kcreate_ai::layout_suggest::LayoutOrientation` (snake_case).
+export type LayoutOrientation = "row" | "column" | "grid" | "cloud";
+
+/// Detected alignment edge within a cluster. Mirrors
+/// `kcreate_ai::layout_suggest::LayoutAlignment` (snake_case).
+export type LayoutAlignment =
+  | "left"
+  | "right"
+  | "top"
+  | "bottom"
+  | "center_horizontal"
+  | "center_vertical";
+
+/// One proposed group from `kcreate_ai::suggest_layout_grouping`.
+/// The renderer previews each suggestion before any apply step;
+/// a future `applyLayoutSuggestion` call will promote a chosen
+/// suggestion into a real `LayoutFrame`.
+export interface LayoutSuggestion {
+  /// Human-readable label (e.g. "Row of 3", "Vertical stack").
+  name: string;
+  /// Axis-aligned bounding box covering every member node.
+  bounds: LayoutBounds;
+  /// Node ids that belong in the proposed group.
+  member_ids: string[];
+  /// Detected dominant orientation. Drives a row vs. column
+  /// preview affordance in the UI.
+  orientation: LayoutOrientation;
+  /// Detected alignment edge within the group, or `null` when the
+  /// cluster doesn't read as aligned on any single edge.
+  alignment: LayoutAlignment | null;
+}
+
 export interface AiModelBridge {
   upscale(nodeId: string, scale: number): Promise<string>;
   extractPalette(nodeId: string, maxColors: number): Promise<ExtractedColor[]>;
@@ -1375,6 +1478,20 @@ export interface AiModelBridge {
   /// Uninstall a model pack by deleting its file. Idempotent.
   uninstallModelPack(packId: string): Promise<void>;
   screenshotToLayout(request: ScreenshotRequest): Promise<ScreenshotElement[]>;
+  /// Run the local alt-text heuristic against a raster layer.
+  /// Read-only: does NOT persist anything to the document — call
+  /// [`AiModelBridge.applyAltText`] to commit the chosen string.
+  altTextForNode(nodeId: string): Promise<AltTextReport>;
+  /// Persist an alt-text label onto `nodeId`. Records an
+  /// undo/redo-able operation in the document log. An empty
+  /// string clears the metadata entry entirely.
+  applyAltText(nodeId: string, text: string): Promise<void>;
+  /// Run the layout-suggest heuristic over the direct (visible,
+  /// non-degenerate) children of `artboardId`. Returns an empty
+  /// list when fewer than two candidates remain, rather than an
+  /// error — so the UI can render a "nothing to suggest" state
+  /// without special-casing the call.
+  layoutSuggestForArtboard(artboardId: string): Promise<LayoutSuggestion[]>;
 }
 
 /// Result of [`PdfImportBridge.importPdf`] mirroring
@@ -1908,6 +2025,34 @@ export type SessionEvent =
       /// the authoritative `session.locks()` roster to determine
       /// which entries are now claimed vs. released.
       nodeIds: string[];
+    }
+  | {
+      /// Round 11: the local collab session just started. Emitted
+      /// synchronously by the bridge in `session_start` (mirrored
+      /// in `crates/kcreate_bridge/src/collab.rs::SessionEvent`)
+      /// so renderer hooks (`useSessionLocks`, the EditorPage
+      /// presence-broadcast effect) can re-key their state on
+      /// local-side lifecycle transitions — the existing
+      /// `peer*` events only fire for *remote* peers and would
+      /// never signal a fresh local session by themselves.
+      kind: "sessionStarted";
+      /// Base64url-encoded local peer id.
+      peerId: string;
+      /// Project the new session is bound to (UUID hyphenated).
+      projectId: string;
+    }
+  | {
+      /// Round 11: the local collab session just stopped. Synthesised
+      /// by `main.ts`'s `kcreate/session/leave` IPC handler after
+      /// the bridge returns the leaving peer id; the bridge itself
+      /// can't push the event through its regular queue because
+      /// that queue is dropped as part of the leave. Consumers
+      /// reset session-keyed dedup state (e.g. EditorPage's
+      /// presence-broadcast fingerprint, useSessionLocks's lock
+      /// roster cache) when they see this.
+      kind: "sessionLeft";
+      /// Base64url-encoded peer id of the session that just left.
+      peerId: string;
     };
 
 /// Block 7: per-peer Lamport high-water marks for the journal

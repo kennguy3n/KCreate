@@ -56,6 +56,14 @@ pub enum PreflightCheck {
     ColorSpace,
     Transparency,
     PageSize,
+    /// Gradient / PDF shading-pattern validity. Covers issues that
+    /// would either crash the Phase 2 / Phase 4 PDF shading
+    /// injector (`kcreate_export::pdf_shading::inject_shadings`) or
+    /// produce a wrong-looking export: too-few stops, unsorted /
+    /// out-of-range offsets, identical-color degenerate stops, and
+    /// CMYK overrides on an RGB-only export target (which the
+    /// injector silently flattens to DeviceRGB).
+    Shading,
 }
 
 impl PreflightCheck {
@@ -69,6 +77,7 @@ impl PreflightCheck {
             Self::ColorSpace => "color_space",
             Self::Transparency => "transparency",
             Self::PageSize => "page_size",
+            Self::Shading => "shading",
         }
     }
 }
@@ -219,6 +228,7 @@ pub fn run_preflight(
             check_node_for_bleed(node, page_id, &dims, options, &mut issues);
             check_node_color_space(node, page_id, options, &mut issues);
             check_node_transparency(node, page_id, options, &mut issues);
+            check_node_shading(node, page_id, options, &mut issues);
             if matches!(node.node_type, NodeType::TextLayer) {
                 check_node_font_embed(node, page_id, fonts.as_ref(), &mut issues);
             }
@@ -511,6 +521,190 @@ fn fill_has_chromatic_rgb(fill: &FillStyle) -> bool {
 fn is_grayscale(r: f32, g: f32, b: f32) -> bool {
     let tolerance = 0.01_f32;
     (r - g).abs() < tolerance && (g - b).abs() < tolerance
+}
+
+/// Shading-pattern check.
+///
+/// PR #9 introduced real PDF Type 2/3 shading patterns for gradient
+/// fills (see `kcreate_export::pdf_shading`). The injector enforces
+/// hard invariants at write time: `TooFewStops` (< 2) and
+/// `PageOutOfRange` are both surfaced as `PdfShadingError` and abort
+/// the export. This check catches the *fixable* subset
+/// (insufficient stops, malformed offsets, degenerate identical
+/// stops) at preflight time so the user sees the issue in the
+/// PreflightPanel instead of as a cryptic export-time failure.
+///
+/// It also flags soft issues that the injector handles silently but
+/// where the user's intent gets lost: a CMYK `color_override` on a
+/// Gradient is flattened to DeviceRGB when the export target is
+/// RGB-only, so we warn the user rather than letting them export an
+/// RGB PDF and wonder why their print proof looks off.
+fn check_node_shading(
+    node: &Node,
+    page_id: Uuid,
+    options: &PreflightOptions,
+    issues: &mut Vec<PreflightIssue>,
+) {
+    let FillStyle::Gradient(gradient) = &node.style.fill else {
+        return;
+    };
+    let (stops, kind_label) = match gradient {
+        kcreate_core::node::GradientKind::Linear { stops, .. } => (stops, "linear"),
+        kcreate_core::node::GradientKind::Radial { stops, .. } => (stops, "radial"),
+    };
+
+    // Hard-stop: too few stops. PDF Type 2/3 functions require
+    // ≥ 2 stops; the injector errors out otherwise so the export
+    // wouldn't even produce a file. Severity is `Error` to match
+    // the export-blocking severity used elsewhere.
+    if stops.len() < 2 {
+        issues.push(PreflightIssue {
+            check: PreflightCheck::Shading,
+            severity: PreflightSeverity::Error,
+            message: format!(
+                "Layer '{name}' has a {kind} gradient with only {n} stop(s); PDF shading patterns require at least 2 stops.",
+                name = node.name,
+                kind = kind_label,
+                n = stops.len(),
+            ),
+            affected_node_id: Some(node.id),
+            page_id: Some(page_id),
+        });
+        // No further per-stop checks are meaningful when the stop
+        // count is below the minimum — bail to keep the issue
+        // list focused.
+        return;
+    }
+
+    // Offsets must be in `[0, 1]`. The injector's stitching
+    // function builds piecewise sub-functions over `[t_i, t_{i+1}]`
+    // and a stop with offset outside that range produces a
+    // physically wrong domain when the dict is parsed by a PDF
+    // viewer (Acrobat clamps but Preview / Skia do not).
+    for stop in stops {
+        if !(0.0..=1.0).contains(&stop.offset) {
+            issues.push(PreflightIssue {
+                check: PreflightCheck::Shading,
+                severity: PreflightSeverity::Error,
+                message: format!(
+                    "Layer '{name}' has a {kind} gradient stop at offset {off:.3}; PDF shading offsets must be in [0, 1].",
+                    name = node.name,
+                    kind = kind_label,
+                    off = stop.offset,
+                ),
+                affected_node_id: Some(node.id),
+                page_id: Some(page_id),
+            });
+        }
+    }
+
+    // Strictly-ascending offsets. The stitching-function bounds
+    // array (`Bounds`) requires the inner stop offsets to be
+    // strictly ascending; the injector slices `&shading.stops[1..n-1]`
+    // and writes those offsets verbatim. Out-of-order or equal
+    // offsets break the function lookup in real viewers.
+    let mut prev = stops[0].offset;
+    for stop in stops.iter().skip(1) {
+        if stop.offset <= prev {
+            issues.push(PreflightIssue {
+                check: PreflightCheck::Shading,
+                severity: PreflightSeverity::Error,
+                message: format!(
+                    "Layer '{name}' has out-of-order gradient stops ({prev:.3} ≥ {next:.3}); PDF shading requires strictly-ascending offsets.",
+                    name = node.name,
+                    prev = prev,
+                    next = stop.offset,
+                ),
+                affected_node_id: Some(node.id),
+                page_id: Some(page_id),
+            });
+            // Don't update `prev` past a violating stop so we keep
+            // the violation framed against the last-valid offset.
+            continue;
+        }
+        prev = stop.offset;
+    }
+
+    // Endpoints. A well-formed gradient places stops at `0.0` and
+    // `1.0` so the shading covers the full domain. Stops that
+    // start at e.g. `0.2` produce undefined behaviour in the
+    // injector's Domain[0 1] when the function is evaluated below
+    // the first stop. Soft-warn so the user can choose to extend
+    // the stops or accept the clamping behaviour.
+    let endpoint_tolerance = 1e-6_f64;
+    let first = stops[0].offset;
+    let last = stops[stops.len() - 1].offset;
+    if (first - 0.0).abs() > endpoint_tolerance {
+        issues.push(PreflightIssue {
+            check: PreflightCheck::Shading,
+            severity: PreflightSeverity::Warning,
+            message: format!(
+                "Layer '{name}' gradient starts at offset {first:.3}; consider adding a stop at 0.0 — PDF viewers clamp the function below the first stop, which can produce a visible band.",
+                name = node.name,
+            ),
+            affected_node_id: Some(node.id),
+            page_id: Some(page_id),
+        });
+    }
+    if (last - 1.0).abs() > endpoint_tolerance {
+        issues.push(PreflightIssue {
+            check: PreflightCheck::Shading,
+            severity: PreflightSeverity::Warning,
+            message: format!(
+                "Layer '{name}' gradient ends at offset {last:.3}; consider adding a stop at 1.0 — PDF viewers clamp the function above the last stop, which can produce a visible band.",
+                name = node.name,
+            ),
+            affected_node_id: Some(node.id),
+            page_id: Some(page_id),
+        });
+    }
+
+    // Degenerate: every stop has the same colour. The injector
+    // emits a wrapper shading + N-1 sub-functions for what could
+    // be a single Solid fill. Not wrong, but a Warning so the
+    // user can simplify.
+    let first_color = stops[0].color;
+    let all_same = stops.iter().all(|s| {
+        (s.color.r - first_color.r).abs() < 0.005
+            && (s.color.g - first_color.g).abs() < 0.005
+            && (s.color.b - first_color.b).abs() < 0.005
+            && (s.color.a - first_color.a).abs() < 0.005
+    });
+    if all_same {
+        issues.push(PreflightIssue {
+            check: PreflightCheck::Shading,
+            severity: PreflightSeverity::Warning,
+            message: format!(
+                "Layer '{name}' has a {kind} gradient where every stop is the same colour; consider a solid fill instead — the export will still emit a PDF shading dict, which bloats the file with no visible difference.",
+                name = node.name,
+                kind = kind_label,
+            ),
+            affected_node_id: Some(node.id),
+            page_id: Some(page_id),
+        });
+    }
+
+    // CMYK override on RGB-only export. `pdf_shading::color_space_for_mode`
+    // collapses Cmyk colour overrides on Gradient fills to DeviceRGB
+    // whenever the target colour space is RGB. The injector does this
+    // silently; the user only sees the issue at print time. Surface it
+    // here as an Info note (RGB-only is a deliberate choice for screen
+    // export, so it's not a Warning — but the user should know the
+    // CMYK is being thrown away).
+    if matches!(options.target_color_space, ColorSpaceTarget::Rgb) {
+        if let Some(kcreate_core::color::Color::Cmyk { .. }) = &node.style.color_override {
+            issues.push(PreflightIssue {
+                check: PreflightCheck::Shading,
+                severity: PreflightSeverity::Info,
+                message: format!(
+                    "Layer '{name}' has a CMYK colour override on a gradient fill but the export target is RGB; the override will be flattened to DeviceRGB at export time.",
+                    name = node.name,
+                ),
+                affected_node_id: Some(node.id),
+                page_id: Some(page_id),
+            });
+        }
+    }
 }
 
 /// Transparency check.
@@ -915,6 +1109,307 @@ mod tests {
         let bogus = Uuid::new_v4();
         let issues = run_preflight(&doc, &[bogus], &PreflightOptions::default());
         assert!(issues.is_empty());
+    }
+
+    /// Helper: insert a VectorLayer with a gradient fill and return
+    /// the layer id. The page is A4 portrait sized exactly to a4_bounds.
+    /// `stops` is taken verbatim — pass in whatever the test needs to
+    /// exercise (too-few, out-of-order, out-of-range, etc.).
+    fn gradient_node(
+        doc: &mut DocumentGraph,
+        page: Uuid,
+        name: &str,
+        stops: Vec<GradientStop>,
+    ) -> Uuid {
+        let mut n = Node::new(NodeType::VectorLayer, name);
+        n.parent_id = Some(page);
+        // Place well inside the page so other checks (bleed,
+        // transparency) don't add issues that swamp our assertions.
+        n.bounds = Bounds::new(500.0, 500.0, 400.0, 400.0);
+        n.style = NodeStyle {
+            fill: FillStyle::Gradient(GradientKind::Linear {
+                from: Point2D::new(0.0, 0.0),
+                to: Point2D::new(100.0, 0.0),
+                stops,
+            }),
+            ..NodeStyle::default()
+        };
+        doc.insert_node(n).unwrap()
+    }
+
+    #[test]
+    fn shading_check_rejects_single_stop_gradient() {
+        let mut doc = DocumentGraph::new();
+        let page = page_with_layout(&mut doc, a4_layout(), a4_bounds());
+        let id = gradient_node(
+            &mut doc,
+            page,
+            "lonely",
+            vec![GradientStop {
+                offset: 0.5,
+                color: RgbaColor::new(0.5, 0.5, 0.5, 1.0),
+            }],
+        );
+        let issues = run_preflight(&doc, &[], &PreflightOptions::default());
+        let shading: Vec<_> = issues
+            .iter()
+            .filter(|i| i.check == PreflightCheck::Shading)
+            .collect();
+        assert_eq!(shading.len(), 1, "single-stop gradient must emit 1 issue");
+        assert_eq!(shading[0].severity, PreflightSeverity::Error);
+        assert_eq!(shading[0].affected_node_id, Some(id));
+        // The injector's `TooFewStops` error fires below 2; the
+        // preflight message must clearly attribute it to the layer.
+        assert!(
+            shading[0].message.contains("lonely"),
+            "message must name the layer: {}",
+            shading[0].message
+        );
+    }
+
+    #[test]
+    fn shading_check_rejects_stops_out_of_range() {
+        let mut doc = DocumentGraph::new();
+        let page = page_with_layout(&mut doc, a4_layout(), a4_bounds());
+        let _id = gradient_node(
+            &mut doc,
+            page,
+            "range",
+            vec![
+                GradientStop {
+                    offset: -0.1,
+                    color: RgbaColor::new(0.0, 0.0, 0.0, 1.0),
+                },
+                GradientStop {
+                    offset: 1.3,
+                    color: RgbaColor::new(1.0, 1.0, 1.0, 1.0),
+                },
+            ],
+        );
+        let issues = run_preflight(&doc, &[], &PreflightOptions::default());
+        let range_errors: Vec<_> = issues
+            .iter()
+            .filter(|i| {
+                i.check == PreflightCheck::Shading
+                    && i.severity == PreflightSeverity::Error
+                    && i.message.contains("must be in [0, 1]")
+            })
+            .collect();
+        assert_eq!(
+            range_errors.len(),
+            2,
+            "expected one offset-out-of-range issue per bad stop, got {}",
+            range_errors.len()
+        );
+    }
+
+    #[test]
+    fn shading_check_rejects_out_of_order_offsets() {
+        let mut doc = DocumentGraph::new();
+        let page = page_with_layout(&mut doc, a4_layout(), a4_bounds());
+        let _id = gradient_node(
+            &mut doc,
+            page,
+            "unsorted",
+            vec![
+                GradientStop {
+                    offset: 0.0,
+                    color: RgbaColor::new(0.0, 0.0, 0.0, 1.0),
+                },
+                GradientStop {
+                    offset: 0.7,
+                    color: RgbaColor::new(0.3, 0.3, 0.3, 1.0),
+                },
+                // Goes backwards — would corrupt the stitching
+                // function's `Bounds` array if it reached the
+                // injector.
+                GradientStop {
+                    offset: 0.4,
+                    color: RgbaColor::new(0.6, 0.6, 0.6, 1.0),
+                },
+                GradientStop {
+                    offset: 1.0,
+                    color: RgbaColor::new(1.0, 1.0, 1.0, 1.0),
+                },
+            ],
+        );
+        let issues = run_preflight(&doc, &[], &PreflightOptions::default());
+        let order_errors: Vec<_> = issues
+            .iter()
+            .filter(|i| {
+                i.check == PreflightCheck::Shading
+                    && i.severity == PreflightSeverity::Error
+                    && i.message.contains("out-of-order")
+            })
+            .collect();
+        assert_eq!(
+            order_errors.len(),
+            1,
+            "expected exactly one out-of-order issue, got {}",
+            order_errors.len()
+        );
+    }
+
+    #[test]
+    fn shading_check_warns_on_missing_endpoint_stops() {
+        let mut doc = DocumentGraph::new();
+        let page = page_with_layout(&mut doc, a4_layout(), a4_bounds());
+        let _id = gradient_node(
+            &mut doc,
+            page,
+            "no-endpoints",
+            vec![
+                GradientStop {
+                    offset: 0.2,
+                    color: RgbaColor::new(0.1, 0.2, 0.3, 1.0),
+                },
+                GradientStop {
+                    offset: 0.8,
+                    color: RgbaColor::new(0.9, 0.8, 0.7, 1.0),
+                },
+            ],
+        );
+        let issues = run_preflight(&doc, &[], &PreflightOptions::default());
+        let endpoint_warnings: Vec<_> = issues
+            .iter()
+            .filter(|i| {
+                i.check == PreflightCheck::Shading && i.severity == PreflightSeverity::Warning
+            })
+            .collect();
+        // 1 warning for missing 0.0 endpoint + 1 for missing 1.0 endpoint.
+        assert_eq!(
+            endpoint_warnings.len(),
+            2,
+            "expected 2 endpoint warnings, got {}",
+            endpoint_warnings.len()
+        );
+    }
+
+    #[test]
+    fn shading_check_warns_on_all_identical_stops() {
+        let mut doc = DocumentGraph::new();
+        let page = page_with_layout(&mut doc, a4_layout(), a4_bounds());
+        let _id = gradient_node(
+            &mut doc,
+            page,
+            "degenerate",
+            vec![
+                GradientStop {
+                    offset: 0.0,
+                    color: RgbaColor::new(0.5, 0.5, 0.5, 1.0),
+                },
+                GradientStop {
+                    offset: 0.5,
+                    color: RgbaColor::new(0.5, 0.5, 0.5, 1.0),
+                },
+                GradientStop {
+                    offset: 1.0,
+                    color: RgbaColor::new(0.5, 0.5, 0.5, 1.0),
+                },
+            ],
+        );
+        let issues = run_preflight(&doc, &[], &PreflightOptions::default());
+        let degenerate_warnings: Vec<_> = issues
+            .iter()
+            .filter(|i| {
+                i.check == PreflightCheck::Shading
+                    && i.severity == PreflightSeverity::Warning
+                    && i.message.contains("same colour")
+            })
+            .collect();
+        assert_eq!(
+            degenerate_warnings.len(),
+            1,
+            "expected exactly 1 'same colour' warning, got {}",
+            degenerate_warnings.len()
+        );
+    }
+
+    #[test]
+    fn shading_check_info_on_cmyk_override_with_rgb_target() {
+        let mut doc = DocumentGraph::new();
+        let page = page_with_layout(&mut doc, a4_layout(), a4_bounds());
+        let mut n = Node::new(NodeType::VectorLayer, "cmyk-on-rgb");
+        n.parent_id = Some(page);
+        n.bounds = Bounds::new(500.0, 500.0, 400.0, 400.0);
+        n.style = NodeStyle {
+            fill: FillStyle::Gradient(GradientKind::Linear {
+                from: Point2D::new(0.0, 0.0),
+                to: Point2D::new(100.0, 0.0),
+                stops: vec![
+                    GradientStop {
+                        offset: 0.0,
+                        color: RgbaColor::new(0.0, 0.0, 0.0, 1.0),
+                    },
+                    GradientStop {
+                        offset: 1.0,
+                        color: RgbaColor::new(1.0, 1.0, 1.0, 1.0),
+                    },
+                ],
+            }),
+            color_override: Some(kcreate_core::color::Color::Cmyk {
+                c: 0.5,
+                m: 0.2,
+                y: 0.0,
+                k: 0.1,
+                a: 1.0,
+            }),
+            ..NodeStyle::default()
+        };
+        doc.insert_node(n).unwrap();
+        let opts = PreflightOptions {
+            target_color_space: ColorSpaceTarget::Rgb,
+            ..PreflightOptions::default()
+        };
+        let issues = run_preflight(&doc, &[], &opts);
+        let info: Vec<_> = issues
+            .iter()
+            .filter(|i| {
+                i.check == PreflightCheck::Shading
+                    && i.severity == PreflightSeverity::Info
+                    && i.message.contains("flattened to DeviceRGB")
+            })
+            .collect();
+        assert_eq!(
+            info.len(),
+            1,
+            "expected exactly 1 cmyk-on-rgb info note, got {}",
+            info.len()
+        );
+    }
+
+    #[test]
+    fn shading_check_well_formed_gradient_emits_no_issues() {
+        let mut doc = DocumentGraph::new();
+        let page = page_with_layout(&mut doc, a4_layout(), a4_bounds());
+        let _id = gradient_node(
+            &mut doc,
+            page,
+            "ok",
+            vec![
+                GradientStop {
+                    offset: 0.0,
+                    color: RgbaColor::new(0.1, 0.1, 0.1, 1.0),
+                },
+                GradientStop {
+                    offset: 0.5,
+                    color: RgbaColor::new(0.5, 0.5, 0.5, 1.0),
+                },
+                GradientStop {
+                    offset: 1.0,
+                    color: RgbaColor::new(0.9, 0.9, 0.9, 1.0),
+                },
+            ],
+        );
+        let issues = run_preflight(&doc, &[], &PreflightOptions::default());
+        let shading_issues: Vec<_> = issues
+            .iter()
+            .filter(|i| i.check == PreflightCheck::Shading)
+            .collect();
+        assert!(
+            shading_issues.is_empty(),
+            "well-formed gradient should emit no shading issues, got: {shading_issues:?}"
+        );
     }
 
     #[test]

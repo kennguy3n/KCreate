@@ -64,10 +64,12 @@ import type {
   UpdateNodeProps,
   WebpExportOptions,
   AiModelBridge,
+  AltTextReport,
   BatchBridge,
   BatchExportJob,
   BatchStatus,
   ExtractedColor,
+  LayoutSuggestion,
   IconPackBridge,
   IconPackPlatform,
   IconPackRequest,
@@ -1170,6 +1172,25 @@ const aiModel: AiModelBridge = {
       JSON.stringify(request),
     )) as string;
     return JSON.parse(raw) as ScreenshotElement[];
+  },
+  async altTextForNode(nodeId: string): Promise<AltTextReport> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/ai/altTextForNode",
+      nodeId,
+    )) as string;
+    return JSON.parse(raw) as AltTextReport;
+  },
+  async applyAltText(nodeId: string, text: string): Promise<void> {
+    await ipcRenderer.invoke("kcreate/ai/applyAltText", nodeId, text);
+  },
+  async layoutSuggestForArtboard(
+    artboardId: string,
+  ): Promise<LayoutSuggestion[]> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/ai/layoutSuggestForArtboard",
+      artboardId,
+    )) as string;
+    return JSON.parse(raw) as LayoutSuggestion[];
   },
 };
 

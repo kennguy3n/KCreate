@@ -1242,7 +1242,63 @@ fn sync_scene_locked(guard: &mut parking_lot::MutexGuard<'_, Option<Workspace>>)
     // and update `collab::pump_inbound` if you really need it.
     #[cfg(feature = "collab")]
     {
-        let triples = crate::collab::presence_cursors();
+        // Pull the renderer's current zoom once for cursors *and*
+        // halos so both overlays share the same zoom-aware screen
+        // sizing. Safe to call under the workspace lock: the
+        // renderer slot has its own mutex (`state::slot()`) and we
+        // never hold the renderer slot before this point. Falls
+        // back to `1.0` in headless contexts.
+        let viewport_zoom = crate::state::viewport_zoom();
+
+        // Layer remote-peer selection halos below cursors so a
+        // peer's cursor stays the most prominent indicator of
+        // "where they are right now" — selection halos are
+        // contextual chrome. Both share the same upward overlay
+        // id stream so they never collide.
+        //
+        // Pick a halo starting_z well below the document-content
+        // ceiling but high enough to clear local selection
+        // highlights. `sync_document_to_scene` bounds document z
+        // values by their order; selection highlights are appended
+        // after them. `i32::MAX / 2` is safely past both. We start
+        // halos at `i32::MAX / 2` and thread the post-emit z back
+        // out so cursors begin at whatever halo height was actually
+        // reached — a hard-coded gap (e.g. `+1`) would put cursors
+        // beneath halos as soon as a single peer with a display
+        // name was rendered (rect at z, label at z+1, cursor at z+1
+        // → same z, paint order undefined).
+        let halo_starting_z = i32::MAX / 2;
+        // Single atomic read of the presence state so halos and
+        // cursors painted in the same frame come from the same
+        // snapshot. The previous two-call shape released and
+        // reacquired `collab::slot()` between reads; an inbound
+        // presence apply that landed in that gap would leave the
+        // scene with halos from snapshot N and cursors from
+        // snapshot N+1 in one rendered frame.
+        let (selection_triples, cursor_triples) = crate::collab::presence_snapshot();
+        let halo_next_z = if selection_triples.is_empty() {
+            halo_starting_z
+        } else {
+            let selections: Vec<crate::scene_sync::PresenceSelection> = selection_triples
+                .into_iter()
+                .map(
+                    |(peer_id, display_name, node_ids)| crate::scene_sync::PresenceSelection {
+                        peer_id,
+                        display_name,
+                        node_ids,
+                    },
+                )
+                .collect();
+            ws.scene_sync.append_presence_selection_halos(
+                &mut scene,
+                &ws.project.document,
+                &selections,
+                halo_starting_z,
+                viewport_zoom,
+            )
+        };
+
+        let triples = cursor_triples;
         if !triples.is_empty() {
             let cursors: Vec<crate::scene_sync::PresenceCursor> = triples
                 .into_iter()
@@ -1255,25 +1311,17 @@ fn sync_scene_locked(guard: &mut parking_lot::MutexGuard<'_, Option<Workspace>>)
                     },
                 )
                 .collect();
-            // Pull the renderer's current zoom so cursors render at
-            // a constant on-screen size regardless of pan/zoom. The
-            // call is safe to make under the workspace lock: the
-            // renderer slot has its own mutex (`state::slot()`) and
-            // we never hold the renderer slot before this point.
-            // Falls back to `1.0` in headless contexts.
-            let viewport_zoom = crate::state::viewport_zoom();
-            // Layer cursors above the highest selection-highlight z.
-            // `sync_document_to_scene` returns objects with z values
-            // bounded by their document order; selection highlights
-            // are appended after them with z starting from that
-            // bound, so any z above `i32::MAX/2` will paint on top
-            // of everything else without risking overflow.
-            ws.scene_sync.append_presence_cursors(
-                &mut scene,
-                &cursors,
-                i32::MAX / 2,
-                viewport_zoom,
-            );
+            // `append_presence_selection_halos` returns the
+            // *next free* z (post-emit watermark), per its doc
+            // contract — pass it directly so cursors land on the
+            // first unused slot above the topmost halo. Adding +1
+            // here would leave a gap that's harmless on i32 but
+            // misrepresents the threading contract the function
+            // documents. When no halos were emitted, the watermark
+            // equals `halo_starting_z` so cursors still get a
+            // valid base z.
+            ws.scene_sync
+                .append_presence_cursors(&mut scene, &cursors, halo_next_z, viewport_zoom);
         }
     }
     // Renderer not initialised is fine here: the host may be working

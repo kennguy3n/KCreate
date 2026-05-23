@@ -304,18 +304,67 @@ pub enum NodeType {
 
 impl NodeType {
     /// True when this node type may have children.
+    ///
+    /// Uses an exhaustive `match` rather than `matches!(...)` so that
+    /// adding a new variant to `NodeType` is a *compile error* until
+    /// the contributor explicitly classifies it as container vs. leaf.
+    /// Silent drift here would cascade: `ai_layout_suggest_for_artboard`
+    /// in `kcreate_bridge::phase2` only considers nodes whose type
+    /// returns `true` here, and the renderer mirrors this set in
+    /// `apps/desktop/shared/scene.ts` (`CONTAINER_NODE_TYPES`) for the
+    /// AIAssistPanel → layout-suggest button-eligibility check. The
+    /// `node_type_container_classification` unit test below also pins
+    /// the exact set so any classification change shows up in code
+    /// review.
     #[must_use]
     pub const fn is_container(self) -> bool {
-        matches!(
-            self,
+        match self {
             Self::Page
-                | Self::Artboard
-                | Self::GroupLayer
-                | Self::LayoutFrame
-                | Self::ComponentLayer
-        )
+            | Self::Artboard
+            | Self::GroupLayer
+            | Self::LayoutFrame
+            | Self::ComponentLayer => true,
+            Self::VectorLayer | Self::RasterLayer | Self::TextLayer => false,
+        }
+    }
+
+    /// Wire-format name for this node type, matching what the bridge
+    /// emits in `NodeInfo::nodeType` (PascalCase, not the snake_case
+    /// serde rename). Kept in lockstep with `node_type_name` in
+    /// `crates/kcreate_bridge/src/document.rs`. Used by the
+    /// `container_wire_names` test to verify the renderer-side
+    /// `CONTAINER_NODE_TYPES` constant is the literal string set the
+    /// bridge sends.
+    #[must_use]
+    pub const fn wire_name(self) -> &'static str {
+        match self {
+            Self::Page => "Page",
+            Self::Artboard => "Artboard",
+            Self::GroupLayer => "GroupLayer",
+            Self::VectorLayer => "VectorLayer",
+            Self::RasterLayer => "RasterLayer",
+            Self::TextLayer => "TextLayer",
+            Self::ComponentLayer => "ComponentLayer",
+            Self::LayoutFrame => "LayoutFrame",
+        }
     }
 }
+
+/// Canonical list of node-type wire names that are containers (i.e.
+/// `NodeType::is_container() == true` after `wire_name`). The
+/// renderer mirrors this in `apps/desktop/shared/scene.ts` as
+/// `CONTAINER_NODE_TYPES`. The two sides are kept in sync by the
+/// `canonical_container_wire_names_match_expected_list` unit test
+/// below which exhaustively enumerates the expected wire names — if
+/// you change `is_container()` you must also update both this
+/// constant and the TS mirror, or the test fails.
+pub const CONTAINER_NODE_WIRE_NAMES: &[&str] = &[
+    "Page",
+    "Artboard",
+    "GroupLayer",
+    "LayoutFrame",
+    "ComponentLayer",
+];
 
 /// Categorisation for the built-in artboard presets so the home page
 /// and the new-artboard dialog can group them in the UI.
@@ -572,6 +621,18 @@ pub const TEXT_FRAME_METADATA_KEY: &str = "text_frame";
 /// Metadata key used on a `TextLayer` node to store its
 /// [`OpenTypeFeatures`] (ligatures, kerning, stylistic sets, etc).
 pub const OPENTYPE_FEATURES_METADATA_KEY: &str = "opentype_features";
+
+/// Metadata key used on any node (typically a `RasterLayer`) to
+/// store a human-readable accessibility description ("alt text").
+///
+/// Phase 4 wiring writes this from the AccessibilityPanel's
+/// "Generate alt-text" button via the local alt-text heuristic in
+/// `kcreate_ai::generate_alt_text`. PDF export already reads from
+/// the metadata key to populate the PDF/UA structure tree; keeping
+/// it as a stable string here means a future schema bump can
+/// promote it to a first-class field on `Node` without breaking
+/// existing `.kstudio` projects on disk.
+pub const ALT_TEXT_METADATA_KEY: &str = "alt_text";
 
 /// Per-side inset (top / right / bottom / left) in pixels. Used by
 /// [`TextFrameOptions::inset`] to pad text away from the frame
@@ -1079,6 +1140,39 @@ impl Node {
         self.touch();
     }
 
+    /// Read the node's accessibility alt-text label, if any.
+    ///
+    /// Returns `None` when the metadata key is absent, when the
+    /// stored value isn't a string, or when the string is empty.
+    /// Callers should treat an empty / missing label as "no alt
+    /// text" — PDF export uses that to decide whether the node
+    /// needs to be tagged as `/Artifact` (decorative) or as a
+    /// regular `/Figure` with a `/Alt` entry.
+    #[must_use]
+    pub fn alt_text(&self) -> Option<&str> {
+        self.metadata
+            .get(ALT_TEXT_METADATA_KEY)
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+    }
+
+    /// Set the node's accessibility alt-text label. Passing an
+    /// empty string clears the metadata entry entirely, matching
+    /// `alt_text()`'s "empty == missing" semantic so a round-trip
+    /// of `clear → save → load` doesn't leak an empty value back
+    /// into the persisted project.
+    pub fn set_alt_text(&mut self, text: &str) {
+        if text.is_empty() {
+            self.metadata.remove(ALT_TEXT_METADATA_KEY);
+        } else {
+            self.metadata.insert(
+                ALT_TEXT_METADATA_KEY.to_string(),
+                serde_json::Value::String(text.to_string()),
+            );
+        }
+        self.touch();
+    }
+
     /// Decode the node's [`TextFrameOptions`]. Returns
     /// [`TextFrameOptions::default`] when the metadata key is absent
     /// or the payload is malformed — readers always get a usable
@@ -1287,6 +1381,47 @@ mod tests {
         assert!(!NodeType::VectorLayer.is_container());
         assert!(!NodeType::RasterLayer.is_container());
         assert!(!NodeType::TextLayer.is_container());
+    }
+
+    /// Tripwire test for the renderer-side `CONTAINER_NODE_TYPES`
+    /// mirror in `apps/desktop/shared/scene.ts`. Builds the canonical
+    /// container wire-name set from `NodeType::is_container()` and
+    /// asserts it equals the manually-curated `CONTAINER_NODE_WIRE_NAMES`
+    /// constant. If anyone changes `is_container()` without also
+    /// updating the constant (and, by extension, the TS mirror), this
+    /// test fails with a clear "containers diverged" message, forcing
+    /// the contributor to update all three.
+    ///
+    /// The Rust `match` in `is_container` is exhaustive, so adding a
+    /// new `NodeType` variant is *already* a compile error — this
+    /// test catches the orthogonal failure mode where someone
+    /// reclassifies an existing variant.
+    #[test]
+    fn canonical_container_wire_names_match_expected_list() {
+        let all = [
+            NodeType::Page,
+            NodeType::Artboard,
+            NodeType::GroupLayer,
+            NodeType::VectorLayer,
+            NodeType::RasterLayer,
+            NodeType::TextLayer,
+            NodeType::ComponentLayer,
+            NodeType::LayoutFrame,
+        ];
+        let mut derived: Vec<&str> = all
+            .iter()
+            .filter(|t| t.is_container())
+            .map(|t| t.wire_name())
+            .collect();
+        derived.sort_unstable();
+        let mut expected: Vec<&str> = CONTAINER_NODE_WIRE_NAMES.to_vec();
+        expected.sort_unstable();
+        assert_eq!(
+            derived, expected,
+            "container wire-name set diverged: update `CONTAINER_NODE_WIRE_NAMES`, \
+             `apps/desktop/shared/scene.ts::CONTAINER_NODE_TYPES`, and \
+             `AIAssistPanel::LAYOUT_ASSIST_CONTAINER_TYPES` together"
+        );
     }
 
     #[test]

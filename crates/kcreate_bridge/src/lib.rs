@@ -1722,6 +1722,41 @@ pub fn ai_screenshot_to_layout(request_json: String) -> NapiResult<String> {
     phase2::ai_screenshot_to_layout(&req).map_err(map_doc_err)
 }
 
+/// Run the local alt-text heuristic against a raster layer.
+/// Returns the [`kcreate_ai::AltTextReport`] as JSON (text +
+/// brightness + contrast + saturation + edge density + palette).
+/// Read-only: does NOT persist anything to the document; call
+/// [`ai_apply_alt_text`] to commit the chosen text.
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn ai_alt_text_for_node(node_id: String) -> NapiResult<String> {
+    let id = parse_uuid(&node_id)?;
+    phase2::ai_alt_text_for_node(id).map_err(map_doc_err)
+}
+
+/// Persist an alt-text label onto `node_id`. Records an
+/// undo/redo-able operation in the document log. An empty `text`
+/// clears the metadata key entirely.
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn ai_apply_alt_text(node_id: String, text: String) -> NapiResult<()> {
+    let id = parse_uuid(&node_id)?;
+    phase2::ai_apply_alt_text(id, text).map_err(map_doc_err)
+}
+
+/// Run the layout-suggest heuristic over the direct (visible,
+/// non-degenerate) children of `artboard_id`. Returns a JSON
+/// array of [`kcreate_ai::LayoutSuggestion`]. Returns an empty
+/// `[]` rather than an error when fewer than two candidates
+/// remain, so the UI can render a "nothing to suggest" state
+/// without special-casing the call.
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn ai_layout_suggest_for_artboard(artboard_id: String) -> NapiResult<String> {
+    let id = parse_uuid(&artboard_id)?;
+    phase2::ai_layout_suggest_for_artboard(id).map_err(map_doc_err)
+}
+
 /// List installed plugins with their enabled flag.
 #[napi]
 pub fn plugin_list() -> NapiResult<String> {
@@ -1939,10 +1974,14 @@ pub fn session_start(
 }
 
 /// Stop the running session (graceful Goodbye + endpoint close).
-/// Idempotent.
+/// Idempotent. Returns the leaving peer's base64url-encoded id if
+/// a session was actually running (so the orchestrator in
+/// `main.ts` can emit a synthetic `sessionLeft` event on the
+/// renderer's session-event channel), or `null` if the call was a
+/// no-op because no session was active.
 #[cfg(feature = "collab")]
 #[napi]
-pub fn session_leave() -> NapiResult<()> {
+pub fn session_leave() -> NapiResult<Option<String>> {
     crate::collab::session_leave().map_err(map_session_err)
 }
 

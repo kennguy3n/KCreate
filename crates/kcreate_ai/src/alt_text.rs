@@ -413,6 +413,85 @@ mod tests {
         );
     }
 
+    /// Tripwire: pins the JSON wire format `AltTextReport`
+    /// serialises to. The renderer-side TS mirror at
+    /// `apps/desktop/shared/scene.ts::AltTextReport` expects
+    /// `snake_case` field names (no `rename_all = "camelCase"` on
+    /// the Rust struct), and any future contributor who adds a
+    /// `#[serde(rename_all)]` attribute — or renames / adds /
+    /// removes a field — without updating the TS mirror would
+    /// silently break the IPC contract: `phase2.rs` serialises
+    /// this struct via `serde_json::to_string`, and the renderer
+    /// `JSON.parse`s the result into a typed `AltTextReport`,
+    /// with no automatic case translation in between.
+    ///
+    /// AGENTS.md rule 4 (wire-format lockstep) is the parent
+    /// invariant; this test enforces it for the alt-text surface
+    /// in the same way that
+    /// `session_event_variants_serialise_to_renderer_camel_case_wire_format`
+    /// enforces it for the `SessionEvent` enum.
+    #[test]
+    fn alt_text_report_serialises_to_renderer_wire_format() {
+        let report = AltTextReport {
+            text: "Bright photograph dominated by reds and pinks".to_string(),
+            brightness: 0.75,
+            contrast: 0.22,
+            saturation: 0.5,
+            edge_density: 0.18,
+            palette: vec![ExtractedColor {
+                r: 255,
+                g: 0,
+                b: 0,
+                hex: "#FF0000".to_string(),
+                frequency: 0.42,
+            }],
+        };
+        let v = serde_json::to_value(&report).expect("serialise");
+        let obj = v.as_object().expect("AltTextReport must be a JSON object");
+        // Exhaustive shape — assert every expected key is present
+        // and the unexpected snake-cased aliases are NOT present
+        // (defence against accidentally adding a `rename_all`).
+        for expected in [
+            "text",
+            "brightness",
+            "contrast",
+            "saturation",
+            "edge_density",
+            "palette",
+        ] {
+            assert!(
+                obj.contains_key(expected),
+                "AltTextReport missing wire-format field {expected:?}; got {obj:?}",
+            );
+        }
+        // The renderer's TS type uses `edge_density`, so the
+        // camelCase variant must NOT appear; if a future change
+        // adds `#[serde(rename_all = "camelCase")]` this assertion
+        // fires and the contributor is forced to update
+        // `shared/scene.ts` in the same commit.
+        assert!(
+            !obj.contains_key("edgeDensity"),
+            "AltTextReport leaked camelCase wire field; shared/scene.ts expects snake_case",
+        );
+        // Field values round-trip correctly.
+        assert_eq!(obj["text"], "Bright photograph dominated by reds and pinks");
+        assert_eq!(obj["edge_density"], f64::from(0.18_f32));
+        // Nested palette must remain snake_case too — ExtractedColor
+        // has its own wire-format contract that the renderer reads
+        // verbatim (`r`, `g`, `b`, `hex`, `frequency`).
+        let palette = obj["palette"].as_array().expect("palette array");
+        assert_eq!(palette.len(), 1);
+        let color = palette[0].as_object().expect("color object");
+        for expected in ["r", "g", "b", "hex", "frequency"] {
+            assert!(
+                color.contains_key(expected),
+                "ExtractedColor missing wire-format field {expected:?}; got {color:?}",
+            );
+        }
+        assert_eq!(color["hex"], "#FF0000");
+        assert_eq!(color["frequency"], f64::from(0.42_f32));
+    }
+
     #[test]
     fn hue_family_buckets_canonical_corners() {
         assert_eq!(hue_family(255, 0, 0), "reds and pinks");

@@ -544,4 +544,101 @@ mod tests {
         let s = suggest_layout_grouping(&nodes, LayoutSuggestOptions::default()).expect("ok");
         assert_eq!(s[0].member_ids, vec![a, b]);
     }
+
+    /// Tripwire: pins the JSON wire format `LayoutSuggestion`,
+    /// `LayoutOrientation`, `LayoutAlignment`, and `Bounds`
+    /// serialise to. The renderer-side TS mirrors at
+    /// `apps/desktop/shared/scene.ts::LayoutSuggestion`,
+    /// `LayoutOrientation`, `LayoutAlignment`, `LayoutBounds`
+    /// expect snake_case for struct fields (no `rename_all` on the
+    /// struct) and snake_case discriminants for the enums
+    /// (`rename_all = "snake_case"`). A future contributor who
+    /// adds, removes, renames, or recases a field without updating
+    /// the TS mirror would silently break the IPC contract:
+    /// `phase2.rs` serialises this struct via
+    /// `serde_json::to_string` and the renderer `JSON.parse`s it
+    /// into the typed `LayoutSuggestion[]` returned from
+    /// `window.kcreate.aiModel.layoutSuggestForArtboard(...)`,
+    /// with no automatic case translation in between.
+    ///
+    /// AGENTS.md rule 4 (wire-format lockstep) is the parent
+    /// invariant; this test enforces it for the layout-suggest
+    /// surface analogous to the `SessionEvent` tripwire in
+    /// `crates/kcreate_bridge/src/collab.rs`.
+    #[test]
+    fn layout_suggestion_serialises_to_renderer_wire_format() {
+        let a = Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
+        let b = Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap();
+        let s = LayoutSuggestion {
+            name: "Row of 2".to_string(),
+            bounds: Bounds {
+                x: 1.0,
+                y: 2.0,
+                width: 30.0,
+                height: 10.0,
+            },
+            member_ids: vec![a, b],
+            orientation: LayoutOrientation::Row,
+            alignment: Some(LayoutAlignment::CenterHorizontal),
+        };
+        let v = serde_json::to_value(&s).expect("serialise");
+        let obj = v
+            .as_object()
+            .expect("LayoutSuggestion must be a JSON object");
+        for expected in ["name", "bounds", "member_ids", "orientation", "alignment"] {
+            assert!(
+                obj.contains_key(expected),
+                "LayoutSuggestion missing wire-format field {expected:?}; got {obj:?}",
+            );
+        }
+        // Defence against a future `rename_all = "camelCase"`:
+        // both fields below would surface if someone added one,
+        // and both are absent under the current snake_case
+        // contract.
+        assert!(
+            !obj.contains_key("memberIds"),
+            "LayoutSuggestion leaked camelCase wire field; shared/scene.ts expects snake_case",
+        );
+        // Enum discriminants must round-trip as snake_case
+        // strings; the TS mirror declares them as literal union
+        // members (`"row" | "column" | "grid" | "cloud"` and
+        // `"left" | ... | "center_horizontal" | "center_vertical"`).
+        assert_eq!(obj["orientation"], "row");
+        assert_eq!(obj["alignment"], "center_horizontal");
+        // Nested Bounds wire format mirrors `LayoutBounds` on the
+        // TS side — `x`, `y`, `width`, `height`.
+        let bounds = obj["bounds"].as_object().expect("bounds object");
+        for expected in ["x", "y", "width", "height"] {
+            assert!(
+                bounds.contains_key(expected),
+                "Bounds missing wire-format field {expected:?}; got {bounds:?}",
+            );
+        }
+        // `member_ids` round-trips as a flat array of stringified
+        // UUIDs (serde_uuid's default — no `with_braces` or
+        // `as_simple`).
+        let members = obj["member_ids"].as_array().expect("member_ids array");
+        assert_eq!(members.len(), 2);
+        assert_eq!(members[0], a.to_string());
+        assert_eq!(members[1], b.to_string());
+        // `alignment: None` must serialise as JSON `null`, not be
+        // omitted — the TS mirror types this field as
+        // `LayoutAlignment | null` so an absent field would
+        // become `undefined` and fail strict typechecks.
+        let s_none = LayoutSuggestion {
+            name: "Cloud".to_string(),
+            bounds: Bounds {
+                x: 0.0,
+                y: 0.0,
+                width: 0.0,
+                height: 0.0,
+            },
+            member_ids: vec![],
+            orientation: LayoutOrientation::Cloud,
+            alignment: None,
+        };
+        let v_none = serde_json::to_value(&s_none).expect("serialise none");
+        assert_eq!(v_none["alignment"], serde_json::Value::Null);
+        assert_eq!(v_none["orientation"], "cloud");
+    }
 }

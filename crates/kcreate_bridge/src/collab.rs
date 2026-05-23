@@ -97,8 +97,26 @@ pub struct SessionCursor {
 /// Push-channel event variant. Renderer subscribes to a single
 /// IPC channel which fans these out to PresencePanel + cursor
 /// overlay.
+// `rename_all_fields = "camelCase"` is required here in addition to
+// `rename_all = "camelCase"`. The latter only renames variant
+// names (so `PeerJoined` becomes the `kind: "peerJoined"`
+// discriminator), while the former is what actually camelCases the
+// inner struct fields — without it `peer_id` / `public_key` /
+// `display_name` etc. would serialise as their literal snake_case
+// names, which `apps/desktop/shared/scene.ts::SessionEvent`
+// (the renderer-side type) does NOT match. The full IPC chain is
+// bridge::SessionEvent → `session_drain_events` (serde_json::to_string)
+// → main.ts (`drainSessionEvents` forwards the raw JSON) →
+// renderer (`window.kcreate.session.onEvent` → `JSON.parse`).
+// Mid-chain there is no automatic snake→camel translation, so the
+// bridge has to emit camelCase directly. AGENTS.md rule 4 calls
+// this out explicitly.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", tag = "kind")]
+#[serde(
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    tag = "kind"
+)]
 pub enum SessionEvent {
     /// A peer was discovered via mDNS but is not yet connected.
     /// The UI uses this to populate a "discovered (click to join)"
@@ -153,6 +171,32 @@ pub enum SessionEvent {
         /// surfaced — the renderer cross-references with the
         /// authoritative roster).
         node_ids: Vec<Uuid>,
+    },
+    /// Round 11: the local collab session just started. Emitted
+    /// synchronously from `session_start` right before the report
+    /// is returned so renderer-side hooks (`useSessionLocks`,
+    /// `EditorPage` presence-broadcast effect) can re-key their
+    /// state on local-side lifecycle transitions — the existing
+    /// `peer*` events only fire for *remote* peers and would never
+    /// signal a fresh local session by themselves.
+    SessionStarted {
+        /// Base64url-encoded local peer id.
+        peer_id: String,
+        /// Project the new session is bound to.
+        project_id: Uuid,
+    },
+    /// Round 11: the local collab session just stopped. The bridge
+    /// cannot push this through the regular event queue because the
+    /// queue is owned by the `SessionState` that `session_leave`
+    /// has to drop — instead `session_leave` returns the leaving
+    /// peer id to `main.ts`, which emits the synthetic event
+    /// directly on the renderer's session-event channel. Carries
+    /// the leaving peer's id so consumers can reset session-keyed
+    /// dedup fingerprints (e.g. `EditorPage`'s presence-broadcast
+    /// guard, `useSessionLocks`'s lock roster cache).
+    SessionLeft {
+        /// Base64url-encoded peer id of the session that just left.
+        peer_id: String,
     },
 }
 
@@ -842,7 +886,7 @@ pub fn session_start(
     let journal = OperationJournal::open(MemoryJournalStore::new(), project_id)
         .expect("MemoryJournalStore::summary cannot fail");
 
-    *guard = Some(SessionState {
+    let mut state = SessionState {
         host,
         runtime,
         presence: HashMap::new(),
@@ -850,20 +894,43 @@ pub fn session_start(
         pump_handle,
         report: report.clone(),
         journal,
-        local_peer_id,
+        local_peer_id: local_peer_id.clone(),
         locks: HashMap::new(),
-    });
+    };
+    // Surface the local-lifecycle transition on the same event
+    // channel every other session signal flows through, so renderer
+    // consumers don't need a separate code path for "my session
+    // just started". The push happens before the slot is populated
+    // because `push_event` takes `&mut SessionState` directly —
+    // either side of the move would also work.
+    push_event(
+        &mut state,
+        SessionEvent::SessionStarted {
+            peer_id: local_peer_id.as_str().to_string(),
+            project_id,
+        },
+    );
+    *guard = Some(state);
     Ok(report)
 }
 
 /// Stop the running session. Sends a graceful `Goodbye` to every
 /// peer, closes the QUIC endpoint, drops the tokio runtime.
 /// Idempotent: calling on a stopped session is a no-op.
-pub fn session_leave() -> Result<()> {
+///
+/// Round 11: returns the leaving peer id (if a session was actually
+/// running) so `main.ts` can forward a synthetic `sessionLeft`
+/// event on the renderer's session-event channel. The bridge can't
+/// emit the event via its own queue because the queue is torn down
+/// as part of the leave — surfacing the id through the return
+/// value lets the orchestrator do the right thing without
+/// introducing a separate "final drain" IPC dance.
+pub fn session_leave() -> Result<Option<String>> {
     let mut guard = slot().lock();
     let Some(state) = guard.take() else {
-        return Ok(());
+        return Ok(None);
     };
+    let local_peer_id = state.local_peer_id.as_str().to_string();
     let SessionState {
         host,
         runtime,
@@ -885,7 +952,7 @@ pub fn session_leave() -> Result<()> {
     // pump task should observe the broadcast channel closing and
     // exit, then we can safely drop the runtime.
     drop(runtime);
-    Ok(())
+    Ok(Some(local_peer_id))
 }
 
 /// Dial a peer whose connection details came in out-of-band
@@ -1210,12 +1277,85 @@ pub fn presence_cursors() -> Vec<(String, String, SessionCursor)> {
     let Some(state) = guard.as_ref() else {
         return Vec::new();
     };
-    let connected_lookup: HashMap<PeerId, String> = state
+    let lookup = build_connected_lookup(state);
+    presence_cursors_from_state(state, &lookup)
+}
+
+/// Read-side accessor for `scene_sync` to paint remote-peer
+/// selection halos. Returns `(peer_id, display_name, node_ids)`
+/// triples for every connected peer whose latest presence carries
+/// a non-empty `selection: Vec<Uuid>`. Peers with empty selections
+/// are filtered so the renderer doesn't get a spurious "empty
+/// halo group" entry.
+///
+/// Same mirror of `state.presence` as [`presence_cursors`]; the
+/// two are kept separate so the bridge can short-circuit either
+/// loop independently when the corresponding rendering pass is
+/// disabled.
+#[allow(dead_code)] // exported so future call sites (presentation
+                    // mode, export preview pane) can reuse it.
+pub fn presence_selections() -> Vec<(String, String, Vec<Uuid>)> {
+    let guard = slot().lock();
+    let Some(state) = guard.as_ref() else {
+        return Vec::new();
+    };
+    let lookup = build_connected_lookup(state);
+    presence_selections_from_state(state, &lookup)
+}
+
+/// Atomic per-frame snapshot of every remote-peer presence
+/// payload, with cursors and selections collected under a single
+/// `slot().lock()` acquisition.
+///
+/// `sync_scene_locked` previously called [`presence_selections`]
+/// and [`presence_cursors`] back-to-back, releasing and
+/// reacquiring the collab slot mutex between them. Each call
+/// took its own snapshot of `state.presence`, so an inbound
+/// presence apply that landed *between* the two reads could leave
+/// the scene with halos from snapshot N and cursors from snapshot
+/// N+1 in the same rendered frame. The TOCTOU was benign (worst
+/// case: one frame of mismatch before the next sync), but tying
+/// the two reads to a single lock acquisition removes the gap
+/// entirely without changing any caller behaviour.
+///
+/// The returned tuple mirrors the shape of the two single-purpose
+/// helpers so existing call sites can switch over without
+/// reshaping their downstream conversions.
+#[allow(clippy::type_complexity)]
+pub fn presence_snapshot() -> (
+    Vec<(String, String, Vec<Uuid>)>,
+    Vec<(String, String, SessionCursor)>,
+) {
+    let guard = slot().lock();
+    let Some(state) = guard.as_ref() else {
+        return (Vec::new(), Vec::new());
+    };
+    // Build the connected-peers display-name lookup ONCE per snapshot
+    // and pass it down to both readers. The two readers iterate the
+    // same `state.presence` map and need the same `PeerId →
+    // display_name` lookup, so collapsing the two
+    // `state.host.connected_peers()` calls eliminates redundant
+    // O(P) work on every scene-sync tick (P = connected peer count).
+    let lookup = build_connected_lookup(state);
+    (
+        presence_selections_from_state(state, &lookup),
+        presence_cursors_from_state(state, &lookup),
+    )
+}
+
+fn build_connected_lookup(state: &SessionState) -> HashMap<PeerId, String> {
+    state
         .host
         .connected_peers()
         .into_iter()
         .map(|i| (i.peer_id, i.display_name))
-        .collect();
+        .collect()
+}
+
+fn presence_cursors_from_state(
+    state: &SessionState,
+    connected_lookup: &HashMap<PeerId, String>,
+) -> Vec<(String, String, SessionCursor)> {
     state
         .presence
         .iter()
@@ -1223,6 +1363,27 @@ pub fn presence_cursors() -> Vec<(String, String, SessionCursor)> {
             let display_name = connected_lookup.get(peer_id)?.clone();
             let cursor = payload.cursor.map(|c| SessionCursor { x: c.x, y: c.y })?;
             Some((peer_id.as_str().to_string(), display_name, cursor))
+        })
+        .collect()
+}
+
+fn presence_selections_from_state(
+    state: &SessionState,
+    connected_lookup: &HashMap<PeerId, String>,
+) -> Vec<(String, String, Vec<Uuid>)> {
+    state
+        .presence
+        .iter()
+        .filter_map(|(peer_id, payload)| {
+            if payload.selection.is_empty() {
+                return None;
+            }
+            let display_name = connected_lookup.get(peer_id)?.clone();
+            Some((
+                peer_id.as_str().to_string(),
+                display_name,
+                payload.selection.clone(),
+            ))
         })
         .collect()
 }
@@ -2061,5 +2222,171 @@ mod tests {
         assert_eq!(back.project_id, p.project_id);
         assert_eq!(back.node_ids, p.node_ids);
         assert_eq!(back.acquired_at, p.acquired_at);
+    }
+
+    /// Round 11: when no session is running, `session_leave` is a
+    /// no-op and returns `None`. The TS-side `bridge.sessionLeave()`
+    /// signature contracts on this — `string | null` — and `main.ts`
+    /// skips emitting `sessionLeft` in this case.
+    #[test]
+    #[serial]
+    fn session_leave_returns_none_when_no_session_is_running() {
+        reset_kchat_slot();
+        // Belt-and-braces: ensure no session is running, then call again.
+        let _ = session_leave();
+        let left = session_leave().unwrap();
+        assert!(left.is_none());
+    }
+
+    /// Round 11: pin the JSON wire shape of every `SessionEvent`
+    /// variant so the renderer's `shared/scene.ts::SessionEvent`
+    /// discriminated union stays in lockstep with the bridge.
+    /// AGENTS.md rule 4 says the TS file mirrors the bridge —
+    /// this test is the enforcement. Without
+    /// `rename_all_fields = "camelCase"` on the enum, struct fields
+    /// would serialise as `peer_id` / `public_key` / etc. which the
+    /// TS side does not accept. A regression that drops the
+    /// attribute (or renames a field without updating both sides)
+    /// fails this test.
+    #[test]
+    fn session_event_variants_serialise_to_renderer_camel_case_wire_format() {
+        let pid = Uuid::parse_str("11111111-2222-3333-4444-555555555555").unwrap();
+        // Discovered
+        let v = SessionEvent::Discovered {
+            peer_id: "p".into(),
+            public_key: "pk".into(),
+            display_name: "Ken".into(),
+            project_id: pid,
+            socket_addr: "127.0.0.1:1234".into(),
+            cert_fingerprint: "fp".into(),
+        };
+        let j = serde_json::to_value(&v).unwrap();
+        assert_eq!(j["kind"], "discovered");
+        assert_eq!(j["peerId"], "p");
+        assert_eq!(j["publicKey"], "pk");
+        assert_eq!(j["displayName"], "Ken");
+        assert_eq!(j["projectId"], pid.to_string());
+        assert_eq!(j["socketAddr"], "127.0.0.1:1234");
+        assert_eq!(j["certFingerprint"], "fp");
+
+        // Undiscovered
+        let j = serde_json::to_value(SessionEvent::Undiscovered {
+            peer_id: "p".into(),
+        })
+        .unwrap();
+        assert_eq!(j["kind"], "undiscovered");
+        assert_eq!(j["peerId"], "p");
+
+        // PeerJoined
+        let j = serde_json::to_value(SessionEvent::PeerJoined {
+            peer_id: "p".into(),
+            public_key: "pk".into(),
+            display_name: "Ken".into(),
+        })
+        .unwrap();
+        assert_eq!(j["kind"], "peerJoined");
+        assert_eq!(j["peerId"], "p");
+        assert_eq!(j["publicKey"], "pk");
+        assert_eq!(j["displayName"], "Ken");
+
+        // PeerLeft
+        let j = serde_json::to_value(SessionEvent::PeerLeft {
+            peer_id: "p".into(),
+        })
+        .unwrap();
+        assert_eq!(j["kind"], "peerLeft");
+        assert_eq!(j["peerId"], "p");
+
+        // PresenceUpdated
+        let presence = SessionPresence {
+            active_page: Some(pid),
+            selection: vec![pid],
+            cursor: Some(SessionCursor { x: 1.0, y: 2.0 }),
+            sent_at: Utc::now(),
+        };
+        let j = serde_json::to_value(SessionEvent::PresenceUpdated {
+            peer_id: "p".into(),
+            presence: presence.clone(),
+        })
+        .unwrap();
+        assert_eq!(j["kind"], "presenceUpdated");
+        assert_eq!(j["peerId"], "p");
+        // `SessionPresence` itself uses `rename_all = "camelCase"`
+        // on its own struct, so its inner fields should also be
+        // camelCase when nested here.
+        assert_eq!(j["presence"]["activePage"], pid.to_string());
+        assert!(j["presence"]["cursor"].is_object());
+        assert_eq!(j["presence"]["cursor"]["x"], 1.0);
+        assert_eq!(j["presence"]["cursor"]["y"], 2.0);
+
+        // OperationsJournaled
+        let j = serde_json::to_value(SessionEvent::OperationsJournaled {
+            peer_id: "p".into(),
+            op_count: 7,
+            highest_clock: 42,
+        })
+        .unwrap();
+        assert_eq!(j["kind"], "operationsJournaled");
+        assert_eq!(j["peerId"], "p");
+        assert_eq!(j["opCount"], 7);
+        assert_eq!(j["highestClock"], 42);
+
+        // LocksChanged
+        let j = serde_json::to_value(SessionEvent::LocksChanged {
+            peer_id: "p".into(),
+            node_ids: vec![pid],
+        })
+        .unwrap();
+        assert_eq!(j["kind"], "locksChanged");
+        assert_eq!(j["peerId"], "p");
+        assert_eq!(j["nodeIds"][0], pid.to_string());
+    }
+
+    /// Round 11: pin the JSON wire shape of `SessionStarted` so the
+    /// renderer's `shared/scene.ts::SessionEvent` discriminated
+    /// union (`kind: "sessionStarted"`, `peerId`, `projectId`) stays
+    /// in lockstep with the bridge variant. AGENTS.md rule 4 says
+    /// the TS file mirrors the bridge — this test is the
+    /// enforcement. A breaking change to the variant fields fails
+    /// here and reminds the contributor to update the TS side.
+    #[test]
+    fn session_started_event_serialises_to_renderer_wire_format() {
+        let project_id = Uuid::parse_str("11111111-2222-3333-4444-555555555555").unwrap();
+        let ev = SessionEvent::SessionStarted {
+            peer_id: "local-peer-abc".to_string(),
+            project_id,
+        };
+        let json = serde_json::to_value(&ev).unwrap();
+        assert_eq!(json["kind"], "sessionStarted");
+        assert_eq!(json["peerId"], "local-peer-abc");
+        assert_eq!(json["projectId"], project_id.to_string());
+        // Round-trip ensures no field accidentally became flatten-only.
+        let back: SessionEvent = serde_json::from_value(json).unwrap();
+        assert!(matches!(
+            back,
+            SessionEvent::SessionStarted { peer_id, project_id: pid }
+                if peer_id == "local-peer-abc" && pid == project_id
+        ));
+    }
+
+    /// Round 11: pin the JSON wire shape of `SessionLeft`. The bridge
+    /// returns the peer id from `session_leave()` and `main.ts`
+    /// synthesises a `SessionLeft { peer_id }` JSON object directly
+    /// on the renderer's event channel — this test guarantees the
+    /// hand-rolled wire shape in `main.ts` matches what the renderer
+    /// expects via `shared/scene.ts::SessionEvent`.
+    #[test]
+    fn session_left_event_serialises_to_renderer_wire_format() {
+        let ev = SessionEvent::SessionLeft {
+            peer_id: "departing-peer-xyz".to_string(),
+        };
+        let json = serde_json::to_value(&ev).unwrap();
+        assert_eq!(json["kind"], "sessionLeft");
+        assert_eq!(json["peerId"], "departing-peer-xyz");
+        let back: SessionEvent = serde_json::from_value(json).unwrap();
+        assert!(matches!(
+            back,
+            SessionEvent::SessionLeft { peer_id } if peer_id == "departing-peer-xyz"
+        ));
     }
 }

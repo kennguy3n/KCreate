@@ -11,9 +11,13 @@
 // always surface compute device, model name, and "Network: None" so
 // the user can reason about the action before applying it.
 
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
-import type { NodeInfo } from "../../../shared/scene";
+import {
+  isContainerNodeType,
+  type LayoutSuggestion,
+  type NodeInfo,
+} from "../../../shared/scene";
 import { colors, radius, spacing } from "../styles/tokens";
 import { LlmChatPanel } from "./LlmChatPanel";
 import { McpSettingsPanel } from "./McpSettingsPanel";
@@ -154,6 +158,10 @@ export function AIAssistPanel({
         operation log alongside vector edits.
       </p>
 
+      <hr style={separatorStyle} />
+      <LayoutAssistSection selected={selectedNode} onStatus={onStatus} />
+      <hr style={separatorStyle} />
+
       <ModelManager onStatus={onStatus} />
       <LlmChatPanel onStatus={onStatus} />
       <hr style={separatorStyle} />
@@ -169,6 +177,206 @@ const separatorStyle: React.CSSProperties = {
   borderTop: "1px solid #E5E7EB",
   margin: "16px 0 8px",
 };
+
+// Container-node-type predicate (`isContainerNodeType`) lives in
+// `apps/desktop/shared/scene.ts` so there is exactly one TS-side
+// source of truth, kept in lockstep with the Rust constant
+// `kcreate_core::node::CONTAINER_NODE_WIRE_NAMES` and the
+// `NodeType::is_container()` exhaustive match. The Rust test
+// `canonical_container_wire_names_match_expected_list` (in
+// `crates/kcreate_core/src/node.rs`) fires if anyone changes the
+// container classification without also updating the wire-name
+// constant the TS file mirrors.
+
+/**
+ * Layout-suggest section. Visible whenever a container node
+ * (Artboard, Page, GroupLayer, LayoutFrame, ComponentLayer) is
+ * selected; clicking
+ * "Suggest layout" runs the local DBSCAN-with-alignment clustering
+ * heuristic in `kcreate_ai::layout_suggest` over the container's
+ * direct visible children and renders a preview of each proposed
+ * group. The apply step is intentionally not wired yet — Phase 4
+ * follow-up Block B exposes the analysis surface and the
+ * preview-only UX so the user can iterate on the algorithm
+ * before any LayoutFrame mutation lands.
+ */
+function LayoutAssistSection({
+  selected,
+  onStatus,
+}: {
+  selected: NodeInfo | null;
+  onStatus: (msg: string | null) => void;
+}): JSX.Element {
+  const isContainer =
+    selected !== null && isContainerNodeType(selected.nodeType);
+  const nodeId = isContainer ? selected.id : null;
+
+  type LayoutPhase = "idle" | "running" | "done" | "error";
+  const [phase, setPhase] = useState<LayoutPhase>("idle");
+  const [suggestions, setSuggestions] = useState<LayoutSuggestion[]>([]);
+  const [error, setError] = useState<string | null>(null);
+  // Monotonic per-section request token. Each `run()` invocation
+  // bumps the counter and captures the new value; the async result
+  // is only applied if the captured token still matches at completion
+  // time. This pattern matches the `cancelled` flag used by
+  // `useSessionLocks` and the EditorPage presence broadcast, but is
+  // adapted to button-triggered async (where we don't have a
+  // useEffect-style cleanup hook). A bare `cancelled` flag is
+  // insufficient because a *second* in-flight `run()` would set its
+  // own flag and never have it flipped — the request-token approach
+  // generalises cleanly to N concurrent calls.
+  const requestTokenRef = useRef(0);
+
+  // Reset state and invalidate any in-flight `run()` when the
+  // selection changes — the previous result, if it still arrives,
+  // would be attributed to the wrong artboard.
+  useEffect(() => {
+    setPhase("idle");
+    setSuggestions([]);
+    setError(null);
+    requestTokenRef.current += 1;
+  }, [nodeId]);
+
+  if (!isContainer || nodeId === null) {
+    return (
+      <section style={cardStyle}>
+        <div style={cardHeaderStyle}>
+          <strong>Layout assist</strong>
+          <span style={badgeStyle("ok")}>Local CPU</span>
+        </div>
+        <p style={paragraphStyle}>
+          Select an <b>Artboard</b>, <b>Page</b>, <b>Group</b>,{" "}
+          <b>Frame</b>, or <b>Component</b> to suggest layout groupings for its
+          children.
+        </p>
+      </section>
+    );
+  }
+
+  const run = async (): Promise<void> => {
+    requestTokenRef.current += 1;
+    const token = requestTokenRef.current;
+    setPhase("running");
+    setError(null);
+    onStatus("Suggesting layout groupings locally…");
+    try {
+      const r = await window.kcreate.aiModel.layoutSuggestForArtboard(nodeId);
+      if (requestTokenRef.current !== token) {
+        // Selection changed, or a newer `run()` started, while this
+        // call was in flight — drop the result silently rather than
+        // overwrite the freshly-reset state with stale clustering
+        // output from a previous artboard.
+        return;
+      }
+      setSuggestions(r);
+      setPhase("done");
+      onStatus(
+        r.length === 0
+          ? "Layout assist: no groupings found."
+          : `Layout assist: ${r.length} suggestion${r.length === 1 ? "" : "s"}.`,
+      );
+    } catch (e) {
+      if (requestTokenRef.current !== token) {
+        // Same rationale as the success path — a stale error from a
+        // superseded request would surface as a misleading red
+        // banner on the now-correct selection.
+        return;
+      }
+      const msg = e instanceof Error ? e.message : String(e);
+      setError(msg);
+      setPhase("error");
+      onStatus(`Layout assist failed: ${msg}`);
+    }
+  };
+
+  return (
+    <section style={cardStyle}>
+      <div style={cardHeaderStyle}>
+        <strong>Layout assist</strong>
+        <span style={badgeStyle("ok")}>Local CPU</span>
+      </div>
+      <p style={paragraphStyle}>
+        Clusters the direct visible children of{" "}
+        <b>{selected?.name}</b> by proximity and edge alignment.
+        Preview-only — no nodes are moved.
+      </p>
+      <button
+        type="button"
+        onClick={() => {
+          void run();
+        }}
+        disabled={phase === "running"}
+        style={primaryBtn(phase === "running")}
+        aria-label="Suggest layout groupings"
+      >
+        {phase === "running" ? "Analyzing…" : "Suggest layout"}
+      </button>
+      {phase === "done" && suggestions.length === 0 ? (
+        <div style={statusStripStyle("ok")}>
+          No clusters detected. (Need at least two aligned children.)
+        </div>
+      ) : null}
+      {phase === "error" && error !== null ? (
+        <div style={statusStripStyle("err")}>{error}</div>
+      ) : null}
+      {suggestions.length > 0 ? (
+        <ul
+          style={{
+            listStyle: "none",
+            margin: 0,
+            padding: 0,
+            display: "flex",
+            flexDirection: "column",
+            gap: spacing.xs,
+          }}
+          aria-label="Layout suggestions"
+        >
+          {suggestions.map((s, idx) => (
+            <li
+              key={`layout-${idx}`}
+              style={{
+                background: colors.bg,
+                border: `1px solid ${colors.border}`,
+                borderRadius: radius.card / 2,
+                padding: spacing.xs,
+                display: "flex",
+                flexDirection: "column",
+                gap: 2,
+                fontSize: 11,
+              }}
+            >
+              <div
+                style={{
+                  display: "flex",
+                  justifyContent: "space-between",
+                  gap: spacing.xs,
+                }}
+              >
+                <strong style={{ color: colors.text }}>{s.name}</strong>
+                <span
+                  style={{
+                    color: colors.textMuted,
+                    fontVariantNumeric: "tabular-nums",
+                  }}
+                >
+                  {s.member_ids.length}{" "}
+                  {s.member_ids.length === 1 ? "node" : "nodes"}
+                </span>
+              </div>
+              <div style={{ color: colors.textMuted }}>
+                {s.orientation}
+                {s.alignment ? ` · ${s.alignment.replace("_", " ")}` : ""}
+                {" · "}
+                {Math.round(s.bounds.width)}×{Math.round(s.bounds.height)} at{" "}
+                ({Math.round(s.bounds.x)}, {Math.round(s.bounds.y)})
+              </div>
+            </li>
+          ))}
+        </ul>
+      ) : null}
+    </section>
+  );
+}
 
 function KV({
   label,

@@ -662,6 +662,145 @@ export function EditorPage({
     };
   }, [nodes]);
 
+  // Track the active collab session's local peer id as state so
+  // the presence-broadcast effect below can re-fire when a session
+  // starts or stops. Without this signal, a peer-id transition
+  // (e.g. user leaves session A, joins session B) wouldn't trigger
+  // the broadcast effect because `selectedIds` may not have
+  // changed across the transition, and the fingerprint-dedup ref
+  // would silently swallow what should be the *first* broadcast
+  // to session B's peers. We use `peerId` as the lifecycle marker
+  // because `SessionStartReport` doesn't expose a distinct session
+  // id and the local peer identity is regenerated on every
+  // `session.start()` per the bridge contract.
+  //
+  // The state is driven directly from the bridge's session-event
+  // channel — `sessionStarted` (pushed by `session_start` itself)
+  // and `sessionLeft` (synthesised by `main.ts` after the bridge
+  // returns the leaving peer id) cover both local-side lifecycle
+  // transitions without a polling `session.info()` call. The
+  // initial mount still does one `session.info()` to handle the
+  // case where a session was already running before this component
+  // mounted (e.g. EditorPage was unmounted/remounted across a
+  // route change while the session kept going).
+  const [activeSessionPeerId, setActiveSessionPeerId] = useState<
+    string | null
+  >(null);
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const info = await window.kcreate.session.info();
+        if (!cancelled) setActiveSessionPeerId(info?.peerId ?? null);
+      } catch {
+        // Bridge transient (e.g. between projectClose and
+        // rendererShutdown); we deliberately don't clear
+        // `activeSessionPeerId` here — a transient IPC failure
+        // shouldn't masquerade as a session end. The lifecycle
+        // events below are the authoritative change signal.
+      }
+    })();
+    // Event-driven lifecycle tracking. The bridge's `sessionStarted`
+    // / `sessionLeft` events fire exactly when the local peer id
+    // transitions, so we can set state directly from the event
+    // payload — no need to re-fetch via `session.info()`. This
+    // also closes the stale-state gap that the previous
+    // `peerJoined`/`peerLeft`-based refresh had: a local
+    // `session.leave()` emits no `peerLeft` (only remote peers
+    // emit those), and `session_start` returning to the renderer
+    // is not itself an event, so the only way to learn about
+    // local transitions used to be polling — which created the
+    // window where `useSessionLocks` and this effect's
+    // dedup-fingerprint disagreed on whether a session was live.
+    const unsubscribe = window.kcreate.session.onEvent((ev) => {
+      if (ev.kind === "sessionStarted") {
+        if (!cancelled) setActiveSessionPeerId(ev.peerId);
+      } else if (ev.kind === "sessionLeft") {
+        if (!cancelled) setActiveSessionPeerId(null);
+      }
+    });
+    return () => {
+      cancelled = true;
+      unsubscribe();
+    };
+  }, []);
+
+  // Broadcast the local user's selection (and currently `null` for
+  // cursor / active page until a future change wires those up) to
+  // every connected peer whenever the selection set actually
+  // changes. The bridge gate-checks KChat membership before
+  // serialising the beacon — outside a KChat group the
+  // `sendPresence` call rejects with a typed `not in KChat group`
+  // error which we silently swallow here (the bridge is the source
+  // of truth for "is multiplayer enabled right now"; the renderer
+  // doesn't need to duplicate that state machine).
+  //
+  // We only attempt the broadcast when a session is running
+  // (`activeSessionPeerId !== null`). This is purely a
+  // micro-optimisation — without it the renderer would call
+  // `sendPresence` on every selection change and get the
+  // KChat-gate rejection back, which is harmless but pollutes the
+  // bridge's structured log.
+  //
+  // The `useEffect` dep array fires on every referentially-new
+  // `selectedIds` array, including no-op renders that reuse the
+  // same content (React's setState always produces a new array
+  // reference). Without a value-level guard, every selection-related
+  // re-render — including the implicit one on initial mount when
+  // `selectedIds === []` — triggers an IPC round trip. The
+  // ref-based dedup below collapses that to one IPC *per actual
+  // content change*. We store the canonicalised string form of the
+  // sorted id list because (a) it ignores selection order (which
+  // the bridge already normalises) and (b) string equality is O(n)
+  // on a short list, cheap relative to an IPC hop.
+  //
+  // Including `activeSessionPeerId` in the deps + resetting the
+  // fingerprint ref whenever the peer id transitions ensures that
+  // the *first* selection broadcast to a freshly-started session
+  // always fires, even if the user's selection set is identical to
+  // what they had in the previous session — without this, session B
+  // would never learn the user's current selection until they
+  // clicked something different. The session-ref tracks the value
+  // we last keyed the fingerprint against so we only reset on
+  // genuine peer-id transitions, not on every effect re-run.
+  const lastBroadcastSelectionRef = useRef<string | null>(null);
+  const lastBroadcastSessionRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (lastBroadcastSessionRef.current !== activeSessionPeerId) {
+      lastBroadcastSelectionRef.current = null;
+      lastBroadcastSessionRef.current = activeSessionPeerId;
+    }
+    if (activeSessionPeerId === null) {
+      return undefined;
+    }
+    const fingerprint = [...selectedIds].sort().join("\u001f");
+    if (lastBroadcastSelectionRef.current === fingerprint) {
+      return undefined;
+    }
+    let cancelled = false;
+    const broadcast = async (): Promise<void> => {
+      try {
+        await window.kcreate.session.sendPresence(null, selectedIds, null);
+        if (!cancelled) {
+          // Only record the fingerprint after a successful broadcast,
+          // so if the IPC fails (or the session is offline) we'll
+          // retry the same selection on the next render rather than
+          // pinning a never-delivered value.
+          lastBroadcastSelectionRef.current = fingerprint;
+        }
+      } catch {
+        // Either the gate is closed (no KChat group) or the
+        // session was just torn down — either way, drop the
+        // broadcast silently. Selection changes are local-first;
+        // the absence of a beacon doesn't break the editor.
+      }
+    };
+    void broadcast();
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedIds, activeSessionPeerId]);
+
   // Keyboard shortcuts. Scoped to the editor page; the canvas itself
   // is non-focusable so window-level listeners are the right place.
   useEffect(() => {

@@ -7,7 +7,9 @@ import { useCallback, useEffect, useState } from "react";
 import type {
   PluginListEntry,
   PluginPermission,
+  PluginSignatureStatus,
   PluginType,
+  TrustedKeyInfo,
 } from "../../../shared/scene";
 import { colors, radius, spacing } from "../styles/tokens";
 
@@ -17,16 +19,38 @@ export interface PluginManagerProps {
 
 export function PluginManager({ onStatus }: PluginManagerProps): JSX.Element {
   const [items, setItems] = useState<PluginListEntry[]>([]);
+  const [trustedKeys, setTrustedKeys] = useState<TrustedKeyInfo[]>([]);
   const [busy, setBusy] = useState(false);
 
   const refresh = useCallback(async () => {
     try {
-      const list = await window.kcreate.plugin.list();
+      const [list, trusted] = await Promise.all([
+        window.kcreate.plugin.list(),
+        window.kcreate.plugin.trustList(),
+      ]);
       setItems(list);
+      setTrustedKeys(
+        [...trusted].sort((a, b) => a.keyId.localeCompare(b.keyId)),
+      );
     } catch (e) {
       onStatus?.(`plugins: ${errMsg(e)}`);
     }
   }, [onStatus]);
+
+  const reloadTrust = useCallback(async () => {
+    setBusy(true);
+    try {
+      await window.kcreate.plugin.trustReload();
+      await refresh();
+      onStatus?.(
+        "trust store reloaded — plugins rescanned against trusted_keys.json",
+      );
+    } catch (e) {
+      onStatus?.(`trust reload failed: ${errMsg(e)}`);
+    } finally {
+      setBusy(false);
+    }
+  }, [onStatus, refresh]);
 
   useEffect(() => {
     void refresh();
@@ -114,7 +138,110 @@ export function PluginManager({ onStatus }: PluginManagerProps): JSX.Element {
           ))}
         </ul>
       )}
+      <TrustedAuthorities
+        keys={trustedKeys}
+        busy={busy}
+        onReload={() => {
+          void reloadTrust();
+        }}
+      />
     </div>
+  );
+}
+
+/// "Trusted Authorities" — list of Ed25519 public keys allowed to
+/// sign native plugins. Native plugins are rejected at registry-scan
+/// time unless they carry a `manifest.json.sig` signed by one of
+/// these keys; sandboxed (WASM / js_panel) plugins load regardless
+/// but surface their signature status next to each entry.
+function TrustedAuthorities({
+  keys,
+  busy,
+  onReload,
+}: {
+  keys: TrustedKeyInfo[];
+  busy: boolean;
+  onReload: () => void;
+}): JSX.Element {
+  return (
+    <section
+      style={{
+        display: "flex",
+        flexDirection: "column",
+        gap: spacing.sm,
+        padding: spacing.md,
+        border: `1px solid ${colors.border}`,
+        borderRadius: radius.card,
+        background: colors.bgSoft,
+      }}
+    >
+      <header
+        style={{ display: "flex", alignItems: "center", gap: spacing.sm }}
+      >
+        <h3 style={{ margin: 0, fontSize: 12, fontWeight: 600 }}>
+          Trusted authorities
+        </h3>
+        <button
+          type="button"
+          onClick={onReload}
+          disabled={busy}
+          style={{
+            marginLeft: "auto",
+            padding: "4px 10px",
+            background: "transparent",
+            border: `1px solid ${colors.border}`,
+            borderRadius: radius.pill,
+            cursor: busy ? "default" : "pointer",
+            fontSize: 11,
+            color: colors.textMuted,
+          }}
+        >
+          Reload
+        </button>
+      </header>
+      {keys.length === 0 ? (
+        <p style={{ margin: 0, fontSize: 11, color: colors.textMuted }}>
+          No trusted Ed25519 keys are installed. Native plugins are blocked
+          until you add at least one key to{" "}
+          <code>~/.kcreate/plugins/trusted_keys.json</code> and click Reload.
+        </p>
+      ) : (
+        <ul
+          style={{
+            margin: 0,
+            padding: 0,
+            listStyle: "none",
+            display: "flex",
+            flexDirection: "column",
+            gap: 4,
+          }}
+        >
+          {keys.map((k) => (
+            <li
+              key={k.keyId}
+              style={{
+                display: "flex",
+                alignItems: "baseline",
+                gap: spacing.sm,
+                fontSize: 11,
+              }}
+            >
+              <code
+                style={{
+                  fontFamily: "monospace",
+                  color: colors.text,
+                }}
+              >
+                {k.keyId}
+              </code>
+              {k.comment ? (
+                <span style={{ color: colors.textMuted }}>{k.comment}</span>
+              ) : null}
+            </li>
+          ))}
+        </ul>
+      )}
+    </section>
   );
 }
 
@@ -146,6 +273,7 @@ function PluginCard({
           {item.name}
         </h3>
         <TypePill type={item.type} />
+        <SignaturePill signature={item.signature} />
         <span style={{ fontSize: 11, color: colors.textMuted }}>
           v{item.version}
         </span>
@@ -215,6 +343,68 @@ function TypePill({ type }: { type: PluginType }): JSX.Element {
       {label}
     </span>
   );
+}
+
+function SignaturePill({
+  signature,
+}: {
+  signature: PluginSignatureStatus;
+}): JSX.Element {
+  const { label, bg, fg, title } = signaturePresentation(signature);
+  return (
+    <span
+      title={title}
+      style={{
+        padding: "1px 6px",
+        background: bg,
+        color: fg,
+        borderRadius: radius.pill,
+        fontSize: 10,
+        fontWeight: 600,
+        textTransform: "uppercase",
+        letterSpacing: 0.3,
+      }}
+    >
+      {label}
+    </span>
+  );
+}
+
+/// Visual presentation for the four signature states. Verified is
+/// the only "green"; Invalid is red so the user can't miss it on
+/// sandboxed (WASM / js_panel) plugins that loaded *despite* a bad
+/// signature.
+function signaturePresentation(signature: PluginSignatureStatus): {
+  label: string;
+  bg: string;
+  fg: string;
+  title: string;
+} {
+  switch (signature.status) {
+    case "verified":
+      return {
+        label: "Signed",
+        bg: "#16A34A22",
+        fg: "#16A34A",
+        title: `Signed by trusted key "${signature.key_id}"`,
+      };
+    case "invalid":
+      return {
+        label: "Bad sig",
+        bg: "#DC262622",
+        fg: "#DC2626",
+        title: `Signature failed verification (key "${signature.key_id}"): ${signature.reason}`,
+      };
+    case "unsigned":
+    default:
+      return {
+        label: "Unsigned",
+        bg: colors.bgSoft,
+        fg: colors.textMuted,
+        title:
+          "No manifest.json.sig sidecar — native plugins are blocked, sandboxed plugins load anyway.",
+      };
+  }
 }
 
 function PermissionPill({

@@ -472,8 +472,26 @@ function openJsPanel(pluginId: string, bounds: JsPanelBounds): void {
     return;
   }
 
+  // Each panel gets its own ephemeral (non-`persist:`) session partition.
+  //
+  // Without this, every `WebContentsView` shares Electron's default
+  // session — the same one the main renderer uses to load its own
+  // `file://` HTML. Registering `webRequest.onHeadersReceived` on the
+  // default session would inject the panel's strict CSP
+  // (`connect-src 'none'`, `form-action 'none'`, …) into *every*
+  // `file://` response in the process, breaking the main app shell.
+  // It would also leave only the last-mounted panel's handler in
+  // place, because `onHeadersReceived` is single-listener-per-session.
+  //
+  // The partition string is non-`persist:` on purpose: panel sessions
+  // are wiped on app exit so a plugin can never persist cookies /
+  // localStorage / IndexedDB across launches. The `pluginId` segment
+  // gives each plugin its own isolated session so plugins can't read
+  // each other's web storage either.
+  const partition = `plugin-panel:${pluginId}`;
   const view = new WebContentsView({
     webPreferences: {
+      partition,
       preload: jsPanelPreloadPath(),
       sandbox: true,
       contextIsolation: true,
@@ -493,6 +511,10 @@ function openJsPanel(pluginId: string, bounds: JsPanelBounds): void {
   // 'self' file:; connect-src 'none'`. The plugin's HTML can still
   // pull in sibling JS/CSS via `file://` because both are on the same
   // local origin.
+  //
+  // The handler is registered on the panel's *own* session (set by
+  // `partition` above), not on `session.defaultSession`, so it
+  // applies only to this panel's `file://` loads.
   view.webContents.session.webRequest.onHeadersReceived(
     { urls: ["file://*/*"] },
     (details, callback) => {
@@ -1215,6 +1237,12 @@ function registerIpcHandlers(): void {
   ipcMain.handle("kcreate/plugin/js/list", () =>
     requireBridge().pluginJsList(),
   );
+  ipcMain.handle("kcreate/plugin/trust/list", () =>
+    requireBridge().pluginTrustList(),
+  );
+  ipcMain.handle("kcreate/plugin/trust/reload", () => {
+    requireBridge().pluginTrustReload();
+  });
   ipcMain.handle(
     "kcreate/plugin/js/message",
     (_e, pluginId: string, messageJson: string) =>

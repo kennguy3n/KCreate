@@ -1352,11 +1352,42 @@ export interface PluginManifest {
 }
 
 /**
+ * Outcome of the host's last verification of a plugin's optional
+ * `manifest.json.sig` sidecar. Mirrors
+ * `kcreate_plugin::SignatureStatus` (tagged union, snake_case
+ * variants).
+ *
+ * Invariant: only **non-native** plugins can carry `invalid` — the
+ * registry refuses to load native plugins in any state other than
+ * `verified`, so they will never appear with `invalid` or
+ * `unsigned` in `pluginList()` output.
+ */
+export type PluginSignatureStatus =
+  | { status: "unsigned" }
+  | { status: "verified"; key_id: string }
+  | { status: "invalid"; key_id: string; reason: string };
+
+/**
  * Plugin list entry — the manifest fields are flattened to the
  * top-level object on the wire (via `#[serde(flatten)]`), so the JSON
- * has the manifest fields *and* `enabled` side-by-side.
+ * has the manifest fields *and* `enabled` / `signature` side-by-side.
  */
-export type PluginListEntry = PluginManifest & { enabled: boolean };
+export type PluginListEntry = PluginManifest & {
+  enabled: boolean;
+  signature: PluginSignatureStatus;
+};
+
+/**
+ * A single trusted Ed25519 public key loaded from
+ * `~/.kcreate/plugins/trusted_keys.json`. The UI's
+ * "Trusted Authorities" list renders one row per entry.
+ */
+export interface TrustedKeyInfo {
+  /** Stable identifier the manifest sidecar references via `key_id`. */
+  keyId: string;
+  /** Free-form human label. */
+  comment: string;
+}
 
 export interface PluginExecuteResult {
   output: string;
@@ -1465,6 +1496,17 @@ export interface PluginBridge {
   ): Promise<void>;
   /** Tear down the panel for `pluginId` if mounted; no-op otherwise. */
   jsClose(pluginId: string): Promise<void>;
+  /**
+   * Snapshot of trusted plugin-signing public keys. The UI's
+   * "Trusted Authorities" list calls this on mount.
+   */
+  trustList(): Promise<TrustedKeyInfo[]>;
+  /**
+   * Re-read `trusted_keys.json` from disk and rescan plugins so any
+   * previously-rejected native plugin gets a second chance once a
+   * matching key is added.
+   */
+  trustReload(): Promise<void>;
 }
 
 export type McpPermissionGrant = "once" | "always" | "denied";

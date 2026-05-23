@@ -82,6 +82,7 @@ import type {
   PluginExecuteResult,
   PluginExecuteWithContextResult,
   PluginListEntry,
+  TrustedKeyInfo,
   PreflightBridge,
   PreflightIssue,
   PreflightRequest,
@@ -1207,6 +1208,15 @@ const plugin: PluginBridge = {
   },
   async jsClose(pluginId: string): Promise<void> {
     await ipcRenderer.invoke("kcreate/plugin/js/close", pluginId);
+  },
+  async trustList(): Promise<TrustedKeyInfo[]> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/plugin/trust/list",
+    )) as string;
+    return JSON.parse(raw) as TrustedKeyInfo[];
+  },
+  async trustReload(): Promise<void> {
+    await ipcRenderer.invoke("kcreate/plugin/trust/reload");
   },
 };
 

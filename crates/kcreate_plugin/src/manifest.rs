@@ -64,6 +64,43 @@ pub struct PluginManifest {
     pub js_panel: Option<crate::js_panel::JsPanelConfig>,
 }
 
+/// On-disk shape of `manifest.json.sig`. The sidecar carries the
+/// `key_id` (which the trust store maps to a public key) and the
+/// raw Ed25519 signature over the *bytes of `manifest.json`*. The
+/// signed message is the file bytes verbatim — no canonical-JSON
+/// re-serialisation, no field omission games. This makes the
+/// "what got signed" agreement bit-exact across signing tools and
+/// JSON libraries. See [`crate::trust`] for the verification entry
+/// point.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginSignature {
+    pub key_id: String,
+    /// Base64-URL (no padding) of the 64-byte Ed25519 signature.
+    pub signature_b64: String,
+}
+
+impl PluginSignature {
+    /// Load `manifest.json.sig` from a plugin directory. Returns
+    /// `Ok(None)` if the sidecar file does not exist (unsigned
+    /// plugin); the caller's policy (e.g. "native plugins must be
+    /// signed") decides what to do with that.
+    pub fn load_optional(plugin_dir: &Path) -> Result<Option<Self>, ManifestError> {
+        let sig_path = plugin_dir.join("manifest.json.sig");
+        if !sig_path.exists() {
+            return Ok(None);
+        }
+        let bytes = std::fs::read(&sig_path)?;
+        let sig: Self = serde_json::from_slice(&bytes)?;
+        if sig.key_id.is_empty() {
+            return Err(ManifestError::MissingField("signature.key_id"));
+        }
+        if sig.signature_b64.is_empty() {
+            return Err(ManifestError::MissingField("signature.signature_b64"));
+        }
+        Ok(Some(sig))
+    }
+}
+
 /// Errors from manifest IO / parsing.
 #[derive(Debug, Error)]
 pub enum ManifestError {
@@ -75,17 +112,39 @@ pub enum ManifestError {
     MissingField(&'static str),
     #[error("manifest entry-point file not found: {0}")]
     EntryPointMissing(String),
+    /// A manifest path (e.g. `entry_point`, `js_panel.entry_html`)
+    /// resolved *outside* the plugin directory after symlink and `..`
+    /// canonicalisation. This is treated as a hard load failure so a
+    /// malicious manifest can never trick the Electron host into
+    /// `file://`-loading `/etc/passwd` or any other host file by
+    /// crafting a path like `../../../../../etc/passwd`.
+    #[error("manifest path {referenced} escapes plugin directory {plugin_dir}")]
+    PathEscape {
+        referenced: String,
+        plugin_dir: String,
+    },
 }
 
 impl PluginManifest {
     /// Load a manifest from a directory. Looks for `manifest.json` and
     /// verifies the entry-point file exists.
     pub fn load(plugin_dir: &Path) -> Result<Self, ManifestError> {
+        Self::load_with_raw(plugin_dir).map(|(m, _)| m)
+    }
+
+    /// Same as [`Self::load`] but also returns the raw bytes of
+    /// `manifest.json` as they were read off disk. The registry uses
+    /// this to verify the optional `manifest.json.sig` sidecar
+    /// without re-reading the file — and, crucially, to verify
+    /// against the *exact bytes* the signer signed, with no
+    /// canonical-JSON re-serialisation step between disk and
+    /// verification.
+    pub fn load_with_raw(plugin_dir: &Path) -> Result<(Self, Vec<u8>), ManifestError> {
         let manifest_path = plugin_dir.join("manifest.json");
         let bytes = std::fs::read(&manifest_path)?;
         let manifest: Self = serde_json::from_slice(&bytes)?;
         manifest.validate(plugin_dir)?;
-        Ok(manifest)
+        Ok((manifest, bytes))
     }
 
     fn validate(&self, plugin_dir: &Path) -> Result<(), ManifestError> {
@@ -101,12 +160,19 @@ impl PluginManifest {
         if self.entry_point.is_empty() {
             return Err(ManifestError::MissingField("entry_point"));
         }
+        // `entry_point` must (a) exist on disk and (b) resolve to a
+        // path *inside* `plugin_dir` after symlink + `..`
+        // canonicalisation. A manifest carrying
+        // `"entry_point": "../../../../../etc/passwd"` would otherwise
+        // be readable by the WASM loader (or, worse, file://-loadable
+        // by Electron in the js_panel case below).
         let entry = plugin_dir.join(&self.entry_point);
         if !entry.exists() {
             return Err(ManifestError::EntryPointMissing(
                 entry.display().to_string(),
             ));
         }
+        ensure_path_within(plugin_dir, &entry)?;
         if self.plugin_type == PluginType::JsPanel {
             let Some(cfg) = &self.js_panel else {
                 return Err(ManifestError::MissingField("js_panel"));
@@ -117,15 +183,43 @@ impl PluginManifest {
             // The js_panel.entry_html file must also exist on disk so
             // the Electron host can `file://`-load it. We check that
             // here rather than letting the Electron main process
-            // discover a 404 at panel-open time.
+            // discover a 404 at panel-open time. We *also* check
+            // containment so the host can never be tricked into
+            // `file://`-loading anything outside the plugin sandbox.
             let html = plugin_dir.join(&cfg.entry_html);
             if !html.exists() {
                 return Err(ManifestError::EntryPointMissing(
                     html.display().to_string(),
                 ));
             }
+            ensure_path_within(plugin_dir, &html)?;
         }
         Ok(())
+    }
+}
+
+/// Returns `Ok(())` iff `candidate` resolves to a path inside
+/// `plugin_dir` after both sides are run through
+/// [`std::fs::canonicalize`]. Canonicalisation walks every symlink
+/// and collapses every `..` so a manifest cannot escape via either
+/// trick.
+///
+/// Both paths are required to be canonicalisable — i.e. they must
+/// already exist on disk. The callers above check existence first,
+/// so this is always true in practice; if either canonicalisation
+/// fails we propagate the underlying `io::Error` rather than
+/// invent a `PathEscape`, because the user can't act on a phantom
+/// containment violation.
+fn ensure_path_within(plugin_dir: &Path, candidate: &Path) -> Result<(), ManifestError> {
+    let root = std::fs::canonicalize(plugin_dir)?;
+    let resolved = std::fs::canonicalize(candidate)?;
+    if resolved.starts_with(&root) {
+        Ok(())
+    } else {
+        Err(ManifestError::PathEscape {
+            referenced: resolved.display().to_string(),
+            plugin_dir: root.display().to_string(),
+        })
     }
 }
 
@@ -306,5 +400,84 @@ mod tests {
         std::fs::write(dir.path().join("panel.html"), b"<!doctype html><html></html>").unwrap();
         let err = PluginManifest::load(dir.path()).unwrap_err();
         assert!(matches!(err, ManifestError::EntryPointMissing(_)));
+    }
+
+    /// A manifest whose `entry_point` escapes the plugin directory via
+    /// `..` traversal must be rejected with [`ManifestError::PathEscape`],
+    /// not silently followed. We materialise a real file outside the
+    /// plugin dir (`escape.wasm` in the temp root) and point
+    /// `entry_point` at it through `..` so `Path::exists()` returns
+    /// `true` and only the containment check can stop the load.
+    #[test]
+    fn rejects_entry_point_path_traversal_escape() {
+        let outer = tempdir().unwrap();
+        let plugin_dir = outer.path().join("plugin");
+        std::fs::create_dir(&plugin_dir).unwrap();
+        // The "escape target" — a file that exists *outside* the
+        // plugin directory.
+        std::fs::write(outer.path().join("escape.wasm"), b"\0asm").unwrap();
+        std::fs::write(
+            plugin_dir.join("manifest.json"),
+            r#"{
+                "id": "evil",
+                "name": "Evil",
+                "version": "0.1.0",
+                "type": "wasm",
+                "entry_point": "../escape.wasm"
+            }"#,
+        )
+        .unwrap();
+        let err = PluginManifest::load(&plugin_dir).unwrap_err();
+        assert!(
+            matches!(err, ManifestError::PathEscape { .. }),
+            "expected PathEscape, got {err:?}",
+        );
+    }
+
+    /// Same containment guarantee for `js_panel.entry_html`, which is
+    /// the higher-risk case — the Electron host `file://`-loads it
+    /// into a sandboxed WebContentsView, so a successful traversal
+    /// would let a malicious manifest display arbitrary host files
+    /// inside the editor.
+    #[test]
+    fn rejects_js_panel_entry_html_path_traversal_escape() {
+        let outer = tempdir().unwrap();
+        let plugin_dir = outer.path().join("plugin");
+        std::fs::create_dir(&plugin_dir).unwrap();
+        std::fs::write(
+            outer.path().join("secrets.html"),
+            b"<!doctype html><html><body>secret</body></html>",
+        )
+        .unwrap();
+        std::fs::write(
+            plugin_dir.join("manifest.json"),
+            r#"{
+                "id": "evil-panel",
+                "name": "Evil Panel",
+                "version": "0.1.0",
+                "type": "js_panel",
+                "entry_point": "panel.html",
+                "js_panel": {
+                    "entry_html": "../secrets.html",
+                    "panel_title": "Evil",
+                    "panel_position": "right_sidebar",
+                    "width": 320,
+                    "height": 480
+                }
+            }"#,
+        )
+        .unwrap();
+        // entry_point still has to exist inside the plugin dir so we
+        // reach the js_panel check.
+        std::fs::write(
+            plugin_dir.join("panel.html"),
+            b"<!doctype html><html></html>",
+        )
+        .unwrap();
+        let err = PluginManifest::load(&plugin_dir).unwrap_err();
+        assert!(
+            matches!(err, ManifestError::PathEscape { .. }),
+            "expected PathEscape, got {err:?}",
+        );
     }
 }

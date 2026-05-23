@@ -146,6 +146,12 @@ tiny_http = { version = "0.12", default-features = false }
 # host ABI; plugins have no filesystem or network access by design.
 wasmi = { version = "0.42", default-features = false, features = ["std"] }
 
+# Ed25519 signature verification for native plugins. Pure-Rust (no
+# OpenSSL), constant-time crypto by construction; we use `verify_strict`
+# everywhere so weak / malleable signatures are rejected. Used by the
+# trust store in `kcreate_plugin::trust`.
+ed25519-dalek = { version = "2.1", default-features = false, features = ["std", "fast"] }
+
 # System info probe for device tiering
 sys-info = "0.9"
 

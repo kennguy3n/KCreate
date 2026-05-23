@@ -322,6 +322,8 @@ export interface Bridge {
   ): string;
   pluginJsList(): string;
   pluginJsMessage(pluginId: string, messageJson: string): string;
+  pluginTrustList(): string;
+  pluginTrustReload(): void;
   mcpPermissionList(): string;
   mcpPermissionGrant(
     clientId: string,

@@ -1666,6 +1666,26 @@ pub fn plugin_disable(id: String) -> NapiResult<()> {
     phase2::plugin_disable(&id).map_err(map_doc_err)
 }
 
+/// Snapshot of every Ed25519 public key in `trusted_keys.json`. The
+/// UI's "Trusted Authorities" list calls this on PluginManager mount
+/// so users can see which signing identities are currently allowed
+/// to register native plugins. Returns a JSON array of
+/// `{ keyId, comment }`.
+#[napi]
+pub fn plugin_trust_list() -> NapiResult<String> {
+    let list = phase2::plugin_trust_list().map_err(map_doc_err)?;
+    serde_json::to_string(&list).map_err(|e| NapiError::from_reason(e.to_string()))
+}
+
+/// Reload `trusted_keys.json` from disk and rescan plugins. Use this
+/// after the user adds a new trusted key out-of-band so previously-
+/// rejected native plugins get a second chance without restarting
+/// the host.
+#[napi]
+pub fn plugin_trust_reload() -> NapiResult<()> {
+    phase2::plugin_trust_reload().map_err(map_doc_err)
+}
+
 #[napi]
 pub fn plugin_execute(id: String, function: String, input: String) -> NapiResult<String> {
     phase2::plugin_execute(&id, &function, &input).map_err(map_doc_err)

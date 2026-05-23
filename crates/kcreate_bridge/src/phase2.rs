@@ -538,7 +538,12 @@ pub fn ai_screenshot_to_layout(req: &ScreenshotRequest) -> Result<String> {
 
 fn plugin_registry() -> &'static Mutex<kcreate_plugin::PluginRegistry> {
     static R: OnceLock<Mutex<kcreate_plugin::PluginRegistry>> = OnceLock::new();
-    R.get_or_init(|| Mutex::new(kcreate_plugin::PluginRegistry::new(plugin_dir())))
+    R.get_or_init(|| {
+        Mutex::new(kcreate_plugin::PluginRegistry::with_trust(
+            plugin_dir(),
+            load_trust_store(),
+        ))
+    })
 }
 
 fn plugin_dir() -> PathBuf {
@@ -549,6 +554,35 @@ fn plugin_dir() -> PathBuf {
         .or_else(|_| std::env::var("USERPROFILE"))
         .unwrap_or_else(|_| ".".to_string());
     PathBuf::from(home).join(".kcreate").join("plugins")
+}
+
+/// Where the host stores the trusted plugin-signing public keys.
+/// Sits alongside the plugin directory so a user can move both with
+/// one `KCREATE_PLUGIN_DIR` override.
+fn trust_store_path() -> PathBuf {
+    plugin_dir().join("trusted_keys.json")
+}
+
+/// Load the trust store from `trusted_keys.json` if it exists, or
+/// return an empty store otherwise. A malformed file is logged and
+/// treated as empty — it must never prevent the bridge from starting,
+/// since `plugin_list` (and the rest of the host) need to keep
+/// working even for users who never set up the file.
+fn load_trust_store() -> kcreate_plugin::TrustStore {
+    let path = trust_store_path();
+    if !path.exists() {
+        return kcreate_plugin::TrustStore::default();
+    }
+    match kcreate_plugin::TrustStore::load_from_path(&path) {
+        Ok(store) => store,
+        Err(e) => {
+            log::warn!(
+                "kcreate_bridge: trust store at {} could not be loaded ({e}); proceeding with no trusted keys",
+                path.display(),
+            );
+            kcreate_plugin::TrustStore::default()
+        }
+    }
 }
 
 fn plugin_runtime() -> &'static kcreate_plugin::WasmPluginRuntime {
@@ -565,7 +599,7 @@ fn plugin_runtime() -> &'static kcreate_plugin::WasmPluginRuntime {
 #[cfg(test)]
 pub(crate) fn reset_plugin_state_for_tests() {
     let mut reg = plugin_registry().lock();
-    *reg = kcreate_plugin::PluginRegistry::new(plugin_dir());
+    *reg = kcreate_plugin::PluginRegistry::with_trust(plugin_dir(), load_trust_store());
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -574,6 +608,17 @@ pub struct PluginListEntry {
     #[serde(flatten)]
     pub manifest: kcreate_plugin::PluginManifest,
     pub enabled: bool,
+    /// Outcome of the last signature-sidecar verification for this
+    /// plugin. Always present; `unsigned` for plugins that ship
+    /// without `manifest.json.sig`.
+    pub signature: kcreate_plugin::SignatureStatus,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TrustedKeyInfo {
+    pub key_id: String,
+    pub comment: String,
 }
 
 pub fn plugin_list() -> Result<Vec<PluginListEntry>> {
@@ -585,9 +630,44 @@ pub fn plugin_list() -> Result<Vec<PluginListEntry>> {
         .into_iter()
         .map(|m| PluginListEntry {
             enabled: reg.is_enabled(&m.id),
+            signature: reg
+                .signature_status_for(&m.id)
+                .cloned()
+                .unwrap_or(kcreate_plugin::SignatureStatus::Unsigned),
             manifest: m.clone(),
         })
         .collect())
+}
+
+/// Snapshot of every trusted Ed25519 public key the host knows about.
+/// Surfaced to the UI's "Trusted Authorities" list so users can see
+/// who is allowed to sign plugins they install. Order is unspecified
+/// (the trust store is a `HashMap` under the hood); the UI sorts
+/// alphabetically by `keyId`.
+pub fn plugin_trust_list() -> Result<Vec<TrustedKeyInfo>> {
+    let reg = plugin_registry().lock();
+    Ok(reg
+        .trust_store()
+        .entries()
+        .map(|(id, comment)| TrustedKeyInfo {
+            key_id: id.to_string(),
+            comment: comment.to_string(),
+        })
+        .collect())
+}
+
+/// Re-read `trusted_keys.json` and rescan plugins so previously-
+/// rejected native plugins (or `Invalid`-status sandboxed plugins)
+/// get a second chance once the user adds the missing key. Exposed
+/// as a bridge call so the UI can offer a "Reload trusted keys"
+/// button without restarting the host.
+pub fn plugin_trust_reload() -> Result<()> {
+    let new_store = load_trust_store();
+    let mut reg = plugin_registry().lock();
+    reg.set_trust_store(new_store);
+    reg.scan()
+        .map_err(|e| DocumentBridgeError::Io(std::io::Error::other(e.to_string())))?;
+    Ok(())
 }
 
 pub fn plugin_enable(id: &str) -> Result<()> {

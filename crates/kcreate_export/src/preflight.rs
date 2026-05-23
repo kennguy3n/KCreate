@@ -793,22 +793,41 @@ fn check_node_shading(
 
 /// Total ink coverage (TIC) check.
 ///
-/// Sums the CMYK components for every flat CMYK fill source on the
-/// node and warns when the sum exceeds the per-options cap. Two
-/// inputs feed the check:
-///   1. `style.color_override` when it's a `Color::Cmyk` — the user
-///      has authored an explicit CMYK fill, so we measure it
-///      directly without going through the sRGB approximation.
-///   2. `style.fill` — `Solid` and `Gradient` variants. RGB stops /
-///      RGB solids are passed through `srgb_to_cmyk` so we measure
-///      the ink the export pipeline will actually lay down on press.
-///      `FillStyle::None` is skipped (no ink).
+/// Sums the CMYK components for the *paint that will actually be laid
+/// down on press* and warns when the sum exceeds the per-options cap.
 ///
-/// Gradient stops are checked individually; the worst offender
-/// surfaces with its offset so the user can locate it.
+/// The override-vs-fill precedence here mirrors
+/// `pdf::resolve_fill_paint` exactly:
 ///
-/// The check is gated on `target_color_space == Cmyk`. On an
-/// RGB-only export target there is no press to dry, so TIC is moot.
+/// - If `style.color_override` is `Some(_)`, that override replaces the
+///   fill at export time. We measure the override: `Color::Cmyk`
+///   components are summed directly (authored as CMYK, no conversion
+///   error); `Color::Srgb` / `Color::Hsl` / `Color::Lab` are routed
+///   through `to_srgb()` → `srgb_to_cmyk` (the same path the PDF
+///   exporter takes for non-CMYK overrides). The underlying
+///   `style.fill` is **not** inspected in this branch because the
+///   export pipeline never emits it — flagging it would surface a
+///   false positive for ink that physically isn't on the page.
+/// - If `style.color_override` is `None`, we walk `style.fill`:
+///   `Solid` → `srgb_to_cmyk` once; `Gradient` → per stop with
+///   worst-offender reporting (a gradient with N over-cap stops is
+///   one design issue, not N).
+///
+/// The check is gated on `target_color_space == Cmyk`. On an RGB-only
+/// export target there is no press to dry, so TIC is moot.
+///
+/// Range notes worth surfacing for future maintainers: the naive
+/// `srgb_to_cmyk` in `kcreate_core::color` produces components whose
+/// sum is bounded above by 3.0 (300%). At the default
+/// `target_total_ink_coverage` of 3.0 with strict `>` comparison,
+/// sRGB-sourced fills can never trip the check — by construction.
+/// That's correct: with the naive conversion no sRGB color can
+/// produce more than 300% on the press, so the warning would be
+/// vacuous. The check is still meaningful for (a) explicit CMYK
+/// overrides authored above the cap, and (b) users targeting tighter
+/// caps (e.g. 240% for newsprint, 280% for web offset). When Phase 3
+/// ICC profile chains land, sRGB sources will be able to legitimately
+/// exceed 300%, and this check will activate without further work.
 fn check_node_total_ink_coverage(
     node: &Node,
     page_id: Uuid,
@@ -826,22 +845,27 @@ fn check_node_total_ink_coverage(
         return;
     }
 
-    // 1. Direct CMYK override — measured as authored, no conversion.
-    if let Some(kcreate_core::color::Color::Cmyk { c, m, y, k, .. }) = &node.style.color_override {
-        let sum = f64::from(*c) + f64::from(*m) + f64::from(*y) + f64::from(*k);
+    // 1. Override path. Any override variant replaces the fill at
+    // export time; inspect ONLY the override here, never fall through
+    // to the fill (see resolve_fill_paint in pdf.rs).
+    if let Some(over) = &node.style.color_override {
+        let sum = override_ink_sum(over);
         if sum > cap {
-            push_tic_issue(node, page_id, sum, cap, "CMYK color override", None, issues);
-            // The override takes precedence over the underlying fill
-            // at export time, so don't double-report on the same
-            // node when both are over-cap. The user fixes the
-            // override and moves on.
-            return;
+            let source = match over {
+                kcreate_core::color::Color::Cmyk { .. } => "CMYK color override",
+                kcreate_core::color::Color::Srgb { .. } => {
+                    "sRGB color override (converted to CMYK)"
+                }
+                kcreate_core::color::Color::Hsl { .. } => "HSL color override (converted to CMYK)",
+                kcreate_core::color::Color::Lab { .. } => "Lab color override (converted to CMYK)",
+            };
+            push_tic_issue(node, page_id, sum, cap, source, None, issues);
         }
+        return;
     }
 
-    // 2. Underlying fill (Solid / Gradient). The override path above
-    // already returned if it tripped, so we only get here when the
-    // override is absent or in-range.
+    // 2. Underlying fill. Only reachable when no override exists — i.e.
+    // the fill is what the export pipeline will actually emit.
     match &node.style.fill {
         FillStyle::None => {}
         FillStyle::Solid(c) => {
@@ -881,10 +905,38 @@ fn check_node_total_ink_coverage(
     }
 }
 
+/// Sum of CMYK components for an override color, in `[0, 4]`.
+///
+/// `Color::Cmyk` is read out directly (authored in target space, no
+/// conversion needed). Every other variant routes through
+/// `to_srgb()` → `srgb_to_cmyk()`, which is precisely the path
+/// `pdf::resolve_fill_paint` uses for non-CMYK overrides. Keeping the
+/// two helpers in lockstep is the whole point of pulling the check
+/// out — if the exporter ever switches to a different conversion for
+/// non-CMYK overrides, this helper has to follow.
+fn override_ink_sum(over: &kcreate_core::color::Color) -> f64 {
+    match over {
+        kcreate_core::color::Color::Cmyk { c, m, y, k, .. } => {
+            f64::from(*c) + f64::from(*m) + f64::from(*y) + f64::from(*k)
+        }
+        _ => {
+            let (r, g, b, _alpha) = over.to_srgb();
+            let (c, m, y, k) = kcreate_core::color::srgb_to_cmyk(r, g, b);
+            f64::from(c) + f64::from(m) + f64::from(y) + f64::from(k)
+        }
+    }
+}
+
 /// Sum of CMYK components for a single solid RGBA fill, in `[0, 4]`.
 /// Always goes through `srgb_to_cmyk` for the same reason the
 /// `ColorSpace` check does — that's what the export pipeline applies,
 /// so it's the ink the press will actually see.
+///
+/// Note: the naive `srgb_to_cmyk` produces components bounded by
+/// `4 - (r+g+b)/max(r,g,b) - max(r,g,b)`, which approaches but never
+/// reaches 3.0 (300%). With the default 300% cap and strict `>`,
+/// this function can never trip the TIC check on its own — see the
+/// extended note on `check_node_total_ink_coverage`.
 fn solid_color_ink_sum(color: &kcreate_core::node::RgbaColor) -> f64 {
     let (c, m, y, k) = kcreate_core::color::srgb_to_cmyk(color.r, color.g, color.b);
     f64::from(c) + f64::from(m) + f64::from(y) + f64::from(k)
@@ -1786,6 +1838,131 @@ mod tests {
             tic[0].message.contains("gradient stop "),
             "expected stop-index in message, got: {}",
             tic[0].message,
+        );
+    }
+
+    #[test]
+    fn tic_check_ignores_fill_when_under_cap_cmyk_override_replaces_it() {
+        // Regression: previously the fall-through path checked
+        // style.fill even when an under-cap CMYK override was present,
+        // producing a false positive for ink the press will never see
+        // (the override replaces the fill at export time per
+        // pdf::resolve_fill_paint).
+        //
+        // We engineer this exactly: under-cap CMYK override + a fill
+        // that WOULD trip the TIC check on its own at a tight cap.
+        let mut doc = DocumentGraph::new();
+        let page = page_with_layout(&mut doc, a4_layout(), a4_bounds());
+        let mut n = Node::new(NodeType::VectorLayer, "override + heavy fill");
+        n.parent_id = Some(page);
+        n.bounds = Bounds::new(0.0, 0.0, 200.0, 200.0);
+        // Override: 100% ink (well under the 150% cap below). This
+        // is what the press will actually see.
+        n.style.color_override = Some(kcreate_core::color::Color::Cmyk {
+            c: 0.25,
+            m: 0.25,
+            y: 0.25,
+            k: 0.25,
+            a: 1.0,
+        });
+        // Fill: would convert to ~290% CMYK via srgb_to_cmyk — would
+        // trip TIC at a tight cap if anyone checked it. We make that
+        // assumption explicit by using a tight cap.
+        n.style.fill = FillStyle::Solid(RgbaColor::new(1.0, 0.0, 0.0, 1.0));
+        doc.insert_node(n).unwrap();
+        let opts = PreflightOptions {
+            target_total_ink_coverage: 1.5, // 150% — under override, would trip the fill
+            ..PreflightOptions::default()
+        };
+        let issues = run_preflight(&doc, &[], &opts);
+        let tic: Vec<&PreflightIssue> = issues
+            .iter()
+            .filter(|i| i.check == PreflightCheck::TotalInkCoverage)
+            .collect();
+        assert!(
+            tic.is_empty(),
+            "under-cap override hides the fill from the press; TIC must not fire on the fill, got: {tic:?}"
+        );
+    }
+
+    #[test]
+    fn tic_check_uses_srgb_override_after_cmyk_conversion() {
+        // Regression: previously the override path matched only
+        // Color::Cmyk; sRGB / Hsl / Lab overrides fell through and
+        // the check inspected the underlying fill instead of the
+        // override. The exporter converts non-CMYK overrides via
+        // srgb_to_cmyk (see resolve_fill_paint), so the override is
+        // what hits the press — we must measure it.
+        let mut doc = DocumentGraph::new();
+        let page = page_with_layout(&mut doc, a4_layout(), a4_bounds());
+        let mut n = Node::new(NodeType::VectorLayer, "srgb override");
+        n.parent_id = Some(page);
+        n.bounds = Bounds::new(0.0, 0.0, 200.0, 200.0);
+        // Pure red sRGB → srgb_to_cmyk: c=0, m=1, y=1, k=0 → 200%.
+        n.style.color_override = Some(kcreate_core::color::Color::Srgb {
+            r: 1.0,
+            g: 0.0,
+            b: 0.0,
+            a: 1.0,
+        });
+        // No fill — proves the new code reads the override directly.
+        n.style.fill = FillStyle::None;
+        doc.insert_node(n).unwrap();
+        // Tight cap so the 200% override is over-cap.
+        let opts = PreflightOptions {
+            target_total_ink_coverage: 1.5,
+            ..PreflightOptions::default()
+        };
+        let issues = run_preflight(&doc, &[], &opts);
+        let tic: Vec<&PreflightIssue> = issues
+            .iter()
+            .filter(|i| i.check == PreflightCheck::TotalInkCoverage)
+            .collect();
+        assert_eq!(
+            tic.len(),
+            1,
+            "sRGB override (converted) over-cap must produce one TIC warning, got: {tic:?}"
+        );
+        assert!(
+            tic[0].message.contains("sRGB color override"),
+            "expected sRGB-source label, got: {}",
+            tic[0].message,
+        );
+    }
+
+    #[test]
+    fn tic_check_skips_fill_when_under_cap_srgb_override_replaces_it() {
+        // Mirror of the CMYK case but for sRGB overrides — under-cap
+        // sRGB override must hide the fill from TIC.
+        let mut doc = DocumentGraph::new();
+        let page = page_with_layout(&mut doc, a4_layout(), a4_bounds());
+        let mut n = Node::new(NodeType::VectorLayer, "light srgb override");
+        n.parent_id = Some(page);
+        n.bounds = Bounds::new(0.0, 0.0, 200.0, 200.0);
+        // Light gray → srgb_to_cmyk yields tiny components: max≈0.9,
+        // k≈0.1, c=m=y=0. Total ~10% — far under any cap.
+        n.style.color_override = Some(kcreate_core::color::Color::Srgb {
+            r: 0.9,
+            g: 0.9,
+            b: 0.9,
+            a: 1.0,
+        });
+        // Fill: red would be ~200% via srgb_to_cmyk. Would trip a
+        // 150% cap if the fall-through bug were present.
+        n.style.fill = FillStyle::Solid(RgbaColor::new(1.0, 0.0, 0.0, 1.0));
+        doc.insert_node(n).unwrap();
+        let opts = PreflightOptions {
+            target_total_ink_coverage: 1.5,
+            ..PreflightOptions::default()
+        };
+        let issues = run_preflight(&doc, &[], &opts);
+        let tic: Vec<&PreflightIssue> = issues
+            .iter()
+            .filter(|i| i.check == PreflightCheck::TotalInkCoverage)
+            .collect();
+        assert!(
+            tic.is_empty(),
+            "under-cap sRGB override hides the fill; TIC must not fire on the fill, got: {tic:?}"
         );
     }
 

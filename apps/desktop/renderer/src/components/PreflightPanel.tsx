@@ -105,9 +105,17 @@ export function PreflightPanel({
         <NumberField
           label="Max ink (%)"
           value={Math.round(opts.targetTotalInkCoverage * 100)}
+          min={50}
+          max={500}
           onChange={(v) =>
             // Stored as a fraction; users think in percent. 300% =
             // GRACoL / SWOP default; 240%-280% for web/newsprint.
+            // Clamped client-side to [50, 500]%: under 50% would
+            // silently disable the check (the Rust validator drops
+            // <= 0 caps with no feedback), and over 500% is far
+            // outside any documented press tolerance. The bounds
+            // are advisory — the user can still type freely and the
+            // clamp resolves on commit.
             setOpts({ ...opts, targetTotalInkCoverage: v / 100 })
           }
         />
@@ -159,10 +167,19 @@ export function PreflightPanel({
 function NumberField({
   label,
   value,
+  min,
+  max,
   onChange,
 }: {
   label: string;
   value: number;
+  /** Optional inclusive lower bound. Set both the HTML `min`
+   * attribute (so browsers can surface spinner / validation UX) AND
+   * clamp the value before propagating, so out-of-range keystrokes
+   * don't silently disable downstream checks. */
+  min?: number;
+  /** Optional inclusive upper bound; mirrors `min`. */
+  max?: number;
   onChange: (v: number) => void;
 }): JSX.Element {
   return (
@@ -171,9 +188,15 @@ function NumberField({
       <input
         type="number"
         value={value}
+        min={min}
+        max={max}
         onChange={(e) => {
           const n = Number(e.target.value);
-          if (Number.isFinite(n)) onChange(n);
+          if (!Number.isFinite(n)) return;
+          let clamped = n;
+          if (typeof min === "number") clamped = Math.max(min, clamped);
+          if (typeof max === "number") clamped = Math.min(max, clamped);
+          onChange(clamped);
         }}
         style={inputStyle}
       />

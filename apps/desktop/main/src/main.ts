@@ -1762,6 +1762,40 @@ function registerIpcHandlers(): void {
   ipcMain.handle("kcreate/kchat/status", () =>
     requireBridge().kchatMembershipStatus(),
   );
+  ipcMain.handle(
+    "kcreate/kchat/derive-local-identity",
+    (_e, seedB64: string) => requireBridge().kchatDeriveLocalIdentity(seedB64),
+  );
+  // Dev-only mint endpoints. Both probes return false / throw a
+  // typed error on production bridges (the function is either
+  // absent from the bridge binary entirely, or the feature-gated
+  // shim returns `KChatDevIssuerDisabled`). The renderer treats
+  // `available === false` as "hide the affordance".
+  ipcMain.handle("kcreate/kchat/dev-issuer-available", () => {
+    const fn = requireBridge().kchatDevIssuerAvailable;
+    if (typeof fn !== "function") return false;
+    try {
+      return fn();
+    } catch {
+      // A throwing probe means the function exists but the bridge
+      // is in some unexpected state. Treat the same as "off" so
+      // the UI doesn't offer an affordance that won't work.
+      return false;
+    }
+  });
+  ipcMain.handle(
+    "kcreate/kchat/dev-mint-membership",
+    (_e, requestJson: string) => {
+      const fn = requireBridge().kchatDevMintMembership;
+      if (typeof fn !== "function") {
+        throw new Error(
+          "kchat: dev issuer not enabled in this build " +
+            "(rebuild kcreate_bridge with --features kchat-dev-issuer)",
+        );
+      }
+      return fn(requestJson);
+    },
+  );
 }
 
 void app.whenReady().then(() => {

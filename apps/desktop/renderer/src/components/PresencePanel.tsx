@@ -20,6 +20,7 @@ import type {
   SessionStartReport,
 } from "../../../shared/scene";
 import { colors, radius, spacing } from "../styles/tokens";
+import { KChatSignInPanel } from "./KChatSignInPanel";
 
 /// LocalStorage key for the persistent Ed25519 seed. The renderer
 /// generates one on first use (32 cryptographically-random bytes,
@@ -253,16 +254,24 @@ export function PresencePanel({
               cannot be activated outside a KChat group.
             </div>
           </div>
-          {error !== null ? (
-            <div style={errorStyle}>{error}</div>
-          ) : null}
+          {error !== null ? <div style={errorStyle}>{error}</div> : null}
         </Section>
+        <KChatSignInPanel
+          status={kchatStatus}
+          onStatusChange={setKchatStatus}
+          onStatus={onStatus}
+        />
       </div>
     );
   }
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: spacing.md }}>
+      <KChatSignInPanel
+        status={kchatStatus}
+        onStatusChange={setKchatStatus}
+        onStatus={onStatus}
+      />
       <Section title="Local identity">
         <Field label="Display name">
           <input

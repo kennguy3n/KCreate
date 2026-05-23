@@ -1,0 +1,34 @@
+[package]
+name = "kcreate_kchat"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "KChat group membership issuer + verifier helpers (dev tooling for KCreate multiplayer gate)"
+publish = false
+
+[lints]
+workspace = true
+
+# Pure-crypto wrapper around `kcreate_collab::kchat` for dev-side
+# attestation issuance. **No networking**, no KChat client. The real
+# KChat product mints attestations out-of-tree and signs them with
+# its own keypair; this crate exists so KCreate developers can mint
+# test attestations locally (under the bridge's
+# `kchat-dev-issuer` feature flag) without needing a live KChat
+# server.
+#
+# Kept out of the editing-path tree (see
+# `crates/kcreate_tests/tests/local_first.rs::editing_path_crates`)
+# the same way `kcreate_collab` is — symmetric with where the
+# issuer logic was already gated.
+[dependencies]
+kcreate_collab = { path = "../kcreate_collab" }
+ed25519-dalek.workspace = true
+chrono = { workspace = true, features = ["serde"] }
+thiserror.workspace = true
+base64.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true

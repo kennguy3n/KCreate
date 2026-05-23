@@ -2221,6 +2221,40 @@ export interface KChatMembershipStatus {
   expiresAt: string | null;
 }
 
+/// Dev-only payload accepted by the optional
+/// `KChatBridge.devMintMembership` endpoint. The mint runs against
+/// a deterministic in-process Ed25519 issuer derived from
+/// `issuerSeed`. Same seed produces the same trust root across
+/// runs (intended — useful for reproducible local-LAN dev sessions).
+///
+/// **Never wire this into production builds.** The bridge gates
+/// the underlying N-API export behind the `kchat-dev-issuer` cargo
+/// feature, off by default; the preload IPC handler resolves to a
+/// "not enabled" error in that case.
+export interface KChatDevMintRequest {
+  /// 32-byte Ed25519 seed used to derive the dev issuer, URL-safe
+  /// base64 (no padding).
+  issuerSeed: string;
+  /// Group identifier. Same shape as `KChatInstallRequest.groupId`.
+  groupId: string;
+  /// 32-byte Ed25519 verifying key of the local peer, URL-safe
+  /// base64 (no padding). Typically the persistent seed-derived
+  /// public key the PresencePanel already stores.
+  peerPublicKey: string;
+  /// Membership validity, in seconds. Capped at 365 days by the
+  /// `kcreate_kchat::MAX_DEV_VALIDITY` constant on the Rust side.
+  validForSeconds: number;
+}
+
+/// Result of [`KChatBridge.deriveLocalIdentity`]. Mirrors
+/// `kcreate_bridge::collab::KChatLocalIdentity`.
+export interface KChatLocalIdentity {
+  /// BLAKE3-derived peer id (URL-safe base64, no padding).
+  peerId: string;
+  /// 32-byte Ed25519 verifying key (URL-safe base64, no padding).
+  peerPublicKey: string;
+}
+
 export interface KChatBridge {
   /// Install a verified KChat group authority. The supplied
   /// membership is re-verified on the Rust side before being
@@ -2235,6 +2269,23 @@ export interface KChatBridge {
   /// this on mount to decide between the locked CTA and the
   /// live multiplayer UI.
   status(): Promise<KChatMembershipStatus>;
+  /// Derive the local peer's (peerId, peerPublicKey) from the
+  /// persistent Ed25519 seed. The sign-in panel uses this to
+  /// pre-fill the membership-binding fields — the renderer
+  /// doesn't have a native Ed25519 implementation, so the
+  /// derivation has to happen on the Rust side.
+  deriveLocalIdentity(seedB64: string): Promise<KChatLocalIdentity>;
+  /// Probe whether the bridge was built with the dev issuer
+  /// feature enabled. Returns `false` on production bridges. The
+  /// renderer uses this to decide whether to surface the "Mint
+  /// dev membership" affordance in the sign-in panel — production
+  /// builds should not see any dev-only UI.
+  devIssuerAvailable(): Promise<boolean>;
+  /// Dev-only: mint a fresh KChat attestation locally and return
+  /// a [`KChatInstallRequest`] the caller can pass right back into
+  /// [`install`]. Rejects with a typed error when the bridge is
+  /// built without `kchat-dev-issuer`.
+  devMintMembership(request: KChatDevMintRequest): Promise<KChatInstallRequest>;
 }
 
 declare global {

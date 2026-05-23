@@ -109,7 +109,9 @@ import type {
   SessionLockEntry,
   SessionPeer,
   KChatBridge,
+  KChatDevMintRequest,
   KChatInstallRequest,
+  KChatLocalIdentity,
   KChatMembershipStatus,
   SessionStartReport,
 } from "../../shared/scene";
@@ -1506,6 +1508,29 @@ const kchat: KChatBridge = {
   async status(): Promise<KChatMembershipStatus> {
     const raw = (await ipcRenderer.invoke("kcreate/kchat/status")) as string;
     return JSON.parse(raw) as KChatMembershipStatus;
+  },
+  async deriveLocalIdentity(seedB64: string): Promise<KChatLocalIdentity> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/kchat/derive-local-identity",
+      seedB64,
+    )) as string;
+    return JSON.parse(raw) as KChatLocalIdentity;
+  },
+  async devIssuerAvailable(): Promise<boolean> {
+    // The handler always returns boolean; in production builds it
+    // returns false because the bridge function is absent.
+    return (await ipcRenderer.invoke(
+      "kcreate/kchat/dev-issuer-available",
+    )) as boolean;
+  },
+  async devMintMembership(
+    request: KChatDevMintRequest,
+  ): Promise<KChatInstallRequest> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/kchat/dev-mint-membership",
+      JSON.stringify(request),
+    )) as string;
+    return JSON.parse(raw) as KChatInstallRequest;
   },
 };
 

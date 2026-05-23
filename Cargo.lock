@@ -1471,6 +1471,7 @@ dependencies = [
  "kcreate_collab_transport",
  "kcreate_core",
  "kcreate_export",
+ "kcreate_kchat",
  "kcreate_layout",
  "kcreate_mcp",
  "kcreate_plugin",
@@ -1571,6 +1572,19 @@ dependencies = [
  "tempfile",
  "thiserror 1.0.69",
  "uuid",
+]
+
+[[package]]
+name = "kcreate_kchat"
+version = "0.0.1"
+dependencies = [
+ "base64",
+ "chrono",
+ "ed25519-dalek",
+ "kcreate_collab",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
 ]
 
 [[package]]

@@ -243,6 +243,13 @@ pub enum SessionBridgeError {
     /// error gives it a useful diagnostic.
     #[error("KChat authority install failed: {0}")]
     KChat(#[from] KChatAuthError),
+    /// The bridge was built without `kchat-dev-issuer`, so the
+    /// dev mint endpoint is unavailable. Returned by
+    /// `kchat_dev_mint_membership_json` in production builds so
+    /// the renderer can present a clean "this build doesn't
+    /// include the dev issuer" message instead of a generic error.
+    #[error("KChat dev issuer is not enabled in this build")]
+    KChatDevIssuerDisabled,
 }
 
 pub type Result<T> = std::result::Result<T, SessionBridgeError>;
@@ -1399,7 +1406,8 @@ impl From<SessionBridgeError> for DocumentBridgeError {
             SessionBridgeError::NotRunning
             | SessionBridgeError::AlreadyRunning
             | SessionBridgeError::InvalidArgument { .. }
-            | SessionBridgeError::NotInKChatGroup => Self::InvalidArgument {
+            | SessionBridgeError::NotInKChatGroup
+            | SessionBridgeError::KChatDevIssuerDisabled => Self::InvalidArgument {
                 argument: "session".to_string(),
                 value: e.to_string(),
             },
@@ -1639,6 +1647,148 @@ pub fn kchat_membership_status() -> KChatMembershipStatus {
             expires_at: None,
         },
     }
+}
+
+/// Wire-format DTO accepted by the dev-only `kchat_dev_mint_membership`
+/// entry point. Matches the JSON shape documented in the N-API
+/// export's doc comment.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KChatDevMintRequest {
+    /// 32-byte Ed25519 seed used to derive the dev issuer. Same
+    /// seed produces the same issuer trust root across runs.
+    pub issuer_seed: String,
+    /// URL-safe ASCII group identifier.
+    pub group_id: String,
+    /// 32-byte Ed25519 verifying key of the local peer (the
+    /// PresencePanel's persistent identity), URL-safe base64
+    /// (no padding).
+    pub peer_public_key: String,
+    /// Membership validity, in seconds. Capped at 365 days by
+    /// `kcreate_kchat::MAX_DEV_VALIDITY`.
+    pub valid_for_seconds: u32,
+}
+
+/// Dev-only: mint a fresh attestation locally and return the
+/// JSON-encoded [`KChatInstallRequest`]. Compiled only when the
+/// bridge is built with `kchat-dev-issuer`. In other builds the
+/// non-cfg shim below returns `KChatDevIssuerDisabled` so the
+/// renderer can render a clean diagnostic.
+#[cfg(feature = "kchat-dev-issuer")]
+pub fn kchat_dev_mint_membership_json(request_json: &str) -> Result<String> {
+    let req: KChatDevMintRequest =
+        serde_json::from_str(request_json).map_err(|e| SessionBridgeError::InvalidArgument {
+            field: "kchatDevMintRequest",
+            message: e.to_string(),
+        })?;
+
+    let seed_bytes = decode_b64_url(&req.issuer_seed, "issuerSeed").map_err(|e| match e {
+        SessionBridgeError::InvalidArgument { message, .. } => {
+            SessionBridgeError::InvalidArgument {
+                field: "issuerSeed",
+                message,
+            }
+        }
+        other => other,
+    })?;
+    if seed_bytes.len() != 32 {
+        return Err(SessionBridgeError::InvalidArgument {
+            field: "issuerSeed",
+            message: format!("expected 32 bytes, got {}", seed_bytes.len()),
+        });
+    }
+    let mut seed_arr = [0u8; 32];
+    seed_arr.copy_from_slice(&seed_bytes);
+
+    let issuer = kcreate_kchat::DevIssuer::from_seed(seed_arr);
+    let install = issuer
+        .mint_install_request_for_peer(
+            &req.group_id,
+            &req.peer_public_key,
+            std::time::Duration::from_secs(u64::from(req.valid_for_seconds)),
+        )
+        .map_err(|e| match e {
+            kcreate_kchat::DevIssuerError::InvalidGroupId(inner) => {
+                SessionBridgeError::InvalidArgument {
+                    field: "groupId",
+                    message: inner.to_string(),
+                }
+            }
+            kcreate_kchat::DevIssuerError::InvalidPeerSeed => SessionBridgeError::InvalidArgument {
+                field: "peerPublicKey",
+                message: "must be a 32-byte URL-safe-base64 Ed25519 verifying key".into(),
+            },
+            kcreate_kchat::DevIssuerError::InvalidValidity => SessionBridgeError::InvalidArgument {
+                field: "validForSeconds",
+                message: "must be > 0 and <= 365 days".into(),
+            },
+            kcreate_kchat::DevIssuerError::Issue(inner) => SessionBridgeError::KChat(inner),
+        })?;
+
+    // The `DevInstallRequest` shape mirrors `KChatInstallRequest`
+    // exactly (see the wire-lockstep test below). Round-trip through
+    // serde rather than constructing a `KChatInstallRequest` here so
+    // any future field added on the bridge side without mirroring
+    // it on `kcreate_kchat::DevInstallRequest` fails loudly at
+    // deserialise time.
+    let install_request: KChatInstallRequest =
+        serde_json::from_str(&serde_json::to_string(&install).map_err(|e| {
+            SessionBridgeError::InvalidArgument {
+                field: "kchatDevMintRequest",
+                message: e.to_string(),
+            }
+        })?)
+        .map_err(|e| SessionBridgeError::InvalidArgument {
+            field: "kchatDevMintRequest",
+            message: format!("dev install request shape mismatch: {e}"),
+        })?;
+
+    serde_json::to_string(&install_request).map_err(|e| SessionBridgeError::InvalidArgument {
+        field: "kchatDevMintRequest",
+        message: e.to_string(),
+    })
+}
+
+/// Production-build shim. Always returns the typed
+/// `KChatDevIssuerDisabled` error so the renderer can show "this
+/// build doesn't include the dev issuer". Kept symmetrical with the
+/// feature-gated impl so the N-API surface is stable across builds.
+#[cfg(not(feature = "kchat-dev-issuer"))]
+#[allow(dead_code)]
+pub fn kchat_dev_mint_membership_json(_request_json: &str) -> Result<String> {
+    Err(SessionBridgeError::KChatDevIssuerDisabled)
+}
+
+/// Local-peer-identity probe. Derives the BLAKE3 peer id +
+/// URL-safe-base64 verifying key for the supplied seed without
+/// starting a collab session. The sign-in flow needs this before
+/// a session exists (the membership attestation is bound to the
+/// peer's public key, and the user shouldn't have to start a
+/// session — which would itself be rejected by the gate — just to
+/// learn what to put on the issuer side).
+///
+/// Returns a JSON `KChatLocalIdentity` payload.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KChatLocalIdentity {
+    pub peer_id: String,
+    pub peer_public_key: String,
+}
+
+/// Derive the local KChat peer identity from a persistent seed.
+/// Pure crypto — no networking, no global state — so it lives in
+/// the `collab`-gated module only because it needs `ed25519-dalek`
+/// which is itself behind the `collab` feature.
+pub fn kchat_derive_local_identity(seed_b64: &str) -> Result<KChatLocalIdentity> {
+    let seed = decode_seed(seed_b64)?;
+    let signing = ed25519_dalek::SigningKey::from_bytes(&seed);
+    let vk = signing.verifying_key();
+    let peer_id = PeerId::from_verifying_key(&vk);
+    let peer_public_key = URL_SAFE_NO_PAD.encode(vk.as_bytes());
+    Ok(KChatLocalIdentity {
+        peer_id: peer_id.as_str().to_string(),
+        peer_public_key,
+    })
 }
 
 #[cfg(test)]

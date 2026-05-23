@@ -419,6 +419,19 @@ export interface Bridge {
   kchatInstallAuthority(requestJson: string): string;
   kchatClearAuthority(): string;
   kchatMembershipStatus(): string;
+  // Pure-crypto helper: derive the local peer's (peerId,
+  // peerPublicKey) from the persistent Ed25519 seed. The sign-in
+  // panel needs this to pre-fill the membership-binding fields
+  // without pulling an Ed25519 implementation into the renderer.
+  kchatDeriveLocalIdentity(seedB64: string): string;
+  // Dev-only: probe + mint endpoints exposed only when the bridge
+  // was built with the `kchat-dev-issuer` feature. The probe
+  // (`kchatDevIssuerAvailable`) is always present; the mint
+  // function may be undefined on production bridges. The renderer
+  // uses the probe to decide whether to surface the "Mint dev
+  // membership" affordance in the KChat sign-in panel.
+  kchatDevIssuerAvailable?(): boolean;
+  kchatDevMintMembership?(requestJson: string): string;
   /// Re-publish the cached scene. Used by the session event tick
   /// to refresh remote-peer cursor overlays.
   documentRequestRender(): void;

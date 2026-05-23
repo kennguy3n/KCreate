@@ -20,6 +20,13 @@ members = [
     # contract — the bridge depends on it only behind the `collab`
     # feature flag.
     "crates/kcreate_collab_transport",
+    # KChat membership issuer (dev tooling). Like
+    # `kcreate_collab_transport`, this is OUT of
+    # `kcreate_tests/tests/local_first.rs::editing_path_crates()` —
+    # it depends on `kcreate_collab` for the wire-format types and
+    # is only pulled into the bridge under the off-by-default
+    # `kchat-dev-issuer` feature.
+    "crates/kcreate_kchat",
     "crates/kcreate_tests",
 ]
 

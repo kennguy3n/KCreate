@@ -1943,7 +1943,8 @@ fn map_session_err(e: crate::collab::SessionBridgeError) -> NapiError {
         crate::collab::SessionBridgeError::InvalidArgument { .. }
         | crate::collab::SessionBridgeError::NotRunning
         | crate::collab::SessionBridgeError::AlreadyRunning
-        | crate::collab::SessionBridgeError::NotInKChatGroup => Status::InvalidArg,
+        | crate::collab::SessionBridgeError::NotInKChatGroup
+        | crate::collab::SessionBridgeError::KChatDevIssuerDisabled => Status::InvalidArg,
         _ => Status::GenericFailure,
     };
     NapiError::new(status, format!("kcreate_bridge: {e}"))
@@ -2200,4 +2201,59 @@ pub fn kchat_membership_status() -> NapiResult<String> {
             format!("kcreate_bridge: kchat_membership_status serialize: {e}"),
         )
     })
+}
+
+/// Probe whether the bridge was built with the `kchat-dev-issuer`
+/// feature. Always callable; returns `false` when the feature is
+/// off so the renderer can decide whether to surface the dev-only
+/// "Mint dev membership" affordance.
+#[napi]
+pub fn kchat_dev_issuer_available() -> bool {
+    cfg!(feature = "kchat-dev-issuer")
+}
+
+/// Derive the local KChat peer identity from a persistent seed.
+/// Returns a JSON `KChatLocalIdentity` (`peerId`, `peerPublicKey`).
+/// Used by the sign-in panel to pre-fill the public key field
+/// (which the user otherwise can't compute without a crypto
+/// library in the renderer).
+#[cfg(feature = "collab")]
+#[napi]
+pub fn kchat_derive_local_identity(seed_b64: String) -> NapiResult<String> {
+    let identity =
+        crate::collab::kchat_derive_local_identity(&seed_b64).map_err(map_session_err)?;
+    serde_json::to_string(&identity).map_err(|e| {
+        NapiError::new(
+            Status::GenericFailure,
+            format!("kcreate_bridge: kchat_derive_local_identity serialize: {e}"),
+        )
+    })
+}
+
+/// Dev-only: mint a fresh KChat membership attestation against a
+/// deterministic in-process issuer. Returns a JSON
+/// [`KChatInstallRequest`] the renderer can pass straight back
+/// into [`kchat_install_authority`] without going through any
+/// out-of-tree KChat server.
+///
+/// The request payload is a JSON `KChatDevMintRequest`:
+///
+/// ```json
+/// {
+///   "issuerSeed":      "base64url 32 bytes (deterministic; same seed → same issuer)",
+///   "groupId":         "url-safe ASCII group id",
+///   "peerPublicKey":   "base64url 32 bytes (local peer Ed25519 verifying key)",
+///   "validForSeconds": 3600
+/// }
+/// ```
+///
+/// Only compiled when the bridge is built with `kchat-dev-issuer`.
+/// Production builds reject the call by returning a typed
+/// `KChatDevIssuerDisabled` error at the JS layer (the function
+/// itself is unconditionally exported so the IPC surface stays
+/// stable, but it short-circuits when the feature is off).
+#[cfg(feature = "collab")]
+#[napi]
+pub fn kchat_dev_mint_membership(request_json: String) -> NapiResult<String> {
+    crate::collab::kchat_dev_mint_membership_json(&request_json).map_err(map_session_err)
 }

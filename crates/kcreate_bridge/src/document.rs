@@ -1304,17 +1304,17 @@ fn sync_scene_locked(guard: &mut parking_lot::MutexGuard<'_, Option<Workspace>>)
                     },
                 )
                 .collect();
-            // Start cursors immediately above the highest halo z
-            // (or `halo_starting_z` when no halos were emitted).
-            // Saturating add so we never wrap to a negative z and
-            // sink cursors beneath everything if the halo path
-            // somehow burned through ~2 billion z slots.
-            ws.scene_sync.append_presence_cursors(
-                &mut scene,
-                &cursors,
-                halo_next_z.saturating_add(1),
-                viewport_zoom,
-            );
+            // `append_presence_selection_halos` returns the
+            // *next free* z (post-emit watermark), per its doc
+            // contract — pass it directly so cursors land on the
+            // first unused slot above the topmost halo. Adding +1
+            // here would leave a gap that's harmless on i32 but
+            // misrepresents the threading contract the function
+            // documents. When no halos were emitted, the watermark
+            // equals `halo_starting_z` so cursors still get a
+            // valid base z.
+            ws.scene_sync
+                .append_presence_cursors(&mut scene, &cursors, halo_next_z, viewport_zoom);
         }
     }
     // Renderer not initialised is fine here: the host may be working

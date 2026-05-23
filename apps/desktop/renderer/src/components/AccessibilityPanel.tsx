@@ -22,7 +22,7 @@
 // at all on a raster); the per-node heuristic gives the user a
 // factual default they can accept or edit.
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 import type { AltTextReport, LlmJsonResult, NodeInfo } from "../../../shared/scene";
 import { colors, radius, spacing } from "../styles/tokens";
@@ -244,13 +244,26 @@ function AltTextSection({
   const [existing, setExisting] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
-  // Reset state on selection change so the user doesn't see stale
-  // analysis when they click a different raster.
+  // Monotonic per-section request token. Each async button handler
+  // captures the current value and only commits its result if the
+  // token still matches at completion time. Selection changes and
+  // any subsequent `generate` / `apply` / `clear` invocation bump
+  // the counter, so a stale alt-text suggestion from the previous
+  // raster can never overwrite freshly-reset state on the newly
+  // selected one. Same idea as `useSessionLocks`'s `cancelled` flag
+  // and EditorPage's presence-broadcast guard, generalised to
+  // multiple concurrent button-triggered calls.
+  const requestTokenRef = useRef(0);
+
+  // Reset state and invalidate any in-flight async on selection
+  // change so the user doesn't see stale analysis when they click a
+  // different raster.
   useEffect(() => {
     setPhase("idle");
     setReport(null);
     setDraft("");
     setError(null);
+    requestTokenRef.current += 1;
     // Fetch the currently-persisted alt-text so the user can see
     // what (if anything) is already on the node before generating.
     // We read it from the node's metadata via a lightweight bridge
@@ -266,16 +279,20 @@ function AltTextSection({
   }
 
   const generate = async (): Promise<void> => {
+    requestTokenRef.current += 1;
+    const token = requestTokenRef.current;
     setPhase("generating");
     setError(null);
     onStatus?.("Generating alt-text locally…");
     try {
       const r = await window.kcreate.aiModel.altTextForNode(nodeId);
+      if (requestTokenRef.current !== token) return;
       setReport(r);
       setDraft(r.text);
       setPhase("ready");
       onStatus?.("Alt-text suggestion ready. Edit and Apply when satisfied.");
     } catch (e) {
+      if (requestTokenRef.current !== token) return;
       const msg = e instanceof Error ? e.message : String(e);
       setError(msg);
       setPhase("error");
@@ -284,10 +301,13 @@ function AltTextSection({
   };
 
   const apply = async (): Promise<void> => {
+    requestTokenRef.current += 1;
+    const token = requestTokenRef.current;
     setPhase("applying");
     setError(null);
     try {
       await window.kcreate.aiModel.applyAltText(nodeId, draft);
+      if (requestTokenRef.current !== token) return;
       setExisting(draft.length === 0 ? null : draft);
       setPhase("ready");
       onStatus?.(
@@ -296,6 +316,7 @@ function AltTextSection({
           : "Alt-text applied to layer.",
       );
     } catch (e) {
+      if (requestTokenRef.current !== token) return;
       const msg = e instanceof Error ? e.message : String(e);
       setError(msg);
       setPhase("error");
@@ -304,16 +325,20 @@ function AltTextSection({
   };
 
   const clear = async (): Promise<void> => {
+    requestTokenRef.current += 1;
+    const token = requestTokenRef.current;
     setPhase("applying");
     setError(null);
     try {
       await window.kcreate.aiModel.applyAltText(nodeId, "");
+      if (requestTokenRef.current !== token) return;
       setDraft("");
       setReport(null);
       setExisting(null);
       setPhase("idle");
       onStatus?.("Alt-text cleared.");
     } catch (e) {
+      if (requestTokenRef.current !== token) return;
       const msg = e instanceof Error ? e.message : String(e);
       setError(msg);
       setPhase("error");

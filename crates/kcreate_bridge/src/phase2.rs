@@ -694,6 +694,16 @@ pub fn ai_layout_suggest_for_artboard(artboard_id: Uuid) -> Result<String> {
             if !child.visible {
                 continue;
             }
+            // Compose world-space bounds the same way every other
+            // layout-consuming surface in the bridge does (see
+            // `scene_sync::node_world_bounds`): local `bounds` plus
+            // the node's `transform.{tx,ty}`. `canvas_move_node` and
+            // friends only mutate the transform — leaving local
+            // `bounds` untouched — so reading `bounds` alone gives
+            // the clustering algorithm pre-move positions and the
+            // returned `LayoutSuggestion` bounds end up
+            // visually-correct-looking but pointing at where the
+            // user *used* to drag the layer, not where it is now.
             let b = child.bounds;
             if b.width <= 0.0 || b.height <= 0.0 {
                 continue;
@@ -701,8 +711,8 @@ pub fn ai_layout_suggest_for_artboard(artboard_id: Uuid) -> Result<String> {
             out.push(kcreate_ai::LayoutNode {
                 id: child_id,
                 bounds: kcreate_ai::LayoutBounds {
-                    x: b.x as f32,
-                    y: b.y as f32,
+                    x: (b.x + child.transform.tx) as f32,
+                    y: (b.y + child.transform.ty) as f32,
                     width: b.width as f32,
                     height: b.height as f32,
                 },

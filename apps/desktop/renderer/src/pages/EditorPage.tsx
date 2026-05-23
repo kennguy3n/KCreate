@@ -664,13 +664,13 @@ export function EditorPage({
 
   // Broadcast the local user's selection (and currently `null` for
   // cursor / active page until a future change wires those up) to
-  // every connected peer whenever the selection set changes. The
-  // bridge gate-checks KChat membership before serialising the
-  // beacon — outside a KChat group the `sendPresence` call rejects
-  // with a typed `not in KChat group` error which we silently
-  // swallow here (the bridge is the source of truth for "is
-  // multiplayer enabled right now"; the renderer doesn't need to
-  // duplicate that state machine).
+  // every connected peer whenever the selection set actually
+  // changes. The bridge gate-checks KChat membership before
+  // serialising the beacon — outside a KChat group the
+  // `sendPresence` call rejects with a typed `not in KChat group`
+  // error which we silently swallow here (the bridge is the source
+  // of truth for "is multiplayer enabled right now"; the renderer
+  // doesn't need to duplicate that state machine).
   //
   // We only attempt the broadcast when `session.info()` returns
   // non-null (i.e. a session is running). This is purely a
@@ -678,13 +678,37 @@ export function EditorPage({
   // `sendPresence` on every selection change and get the
   // KChat-gate rejection back, which is harmless but pollutes the
   // bridge's structured log.
+  //
+  // The `useEffect` dep array fires on every referentially-new
+  // `selectedIds` array, including no-op renders that reuse the
+  // same content (React's setState always produces a new array
+  // reference). Without a value-level guard, every selection-related
+  // re-render — including the implicit one on initial mount when
+  // `selectedIds === []` — triggers two N-API round trips. The
+  // ref-based dedup below collapses that to one IPC pair *per
+  // actual content change*. We store the canonicalised string form
+  // of the sorted id list because (a) it ignores selection order
+  // (which the bridge already normalises) and (b) string equality
+  // is O(n) on a short list, cheap relative to two IPC hops.
+  const lastBroadcastSelectionRef = useRef<string | null>(null);
   useEffect(() => {
+    const fingerprint = [...selectedIds].sort().join("\u001f");
+    if (lastBroadcastSelectionRef.current === fingerprint) {
+      return undefined;
+    }
     let cancelled = false;
     const broadcast = async (): Promise<void> => {
       try {
         const info = await window.kcreate.session.info();
         if (cancelled || info === null) return;
         await window.kcreate.session.sendPresence(null, selectedIds, null);
+        if (!cancelled) {
+          // Only record the fingerprint after a successful broadcast,
+          // so if the IPC fails (or the session is offline) we'll
+          // retry the same selection on the next render rather than
+          // pinning a never-delivered value.
+          lastBroadcastSelectionRef.current = fingerprint;
+        }
       } catch {
         // Either the gate is closed (no KChat group) or the
         // session was just torn down — either way, drop the

@@ -11,7 +11,7 @@
 // always surface compute device, model name, and "Network: None" so
 // the user can reason about the action before applying it.
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import type { LayoutSuggestion, NodeInfo } from "../../../shared/scene";
 import { colors, radius, spacing } from "../styles/tokens";
@@ -175,6 +175,20 @@ const separatorStyle: React.CSSProperties = {
 };
 
 /**
+ * Container node types eligible for layout-suggest. Hoisted to
+ * module scope so the `Set` allocation happens once per process
+ * rather than once per render — same pattern as `BASE_TABS` in
+ * `RightPanel.tsx`. The values mirror the `NodeType` discriminants
+ * the bridge serialises (`crates/kcreate_core/src/node.rs`).
+ */
+const LAYOUT_ASSIST_CONTAINER_TYPES: ReadonlySet<string> = new Set([
+  "Artboard",
+  "Page",
+  "GroupLayer",
+  "LayoutFrame",
+]);
+
+/**
  * Layout-suggest section. Visible whenever a container node
  * (Artboard, Page, GroupLayer, LayoutFrame) is selected; clicking
  * "Suggest layout" runs the local DBSCAN-with-alignment clustering
@@ -192,27 +206,34 @@ function LayoutAssistSection({
   selected: NodeInfo | null;
   onStatus: (msg: string | null) => void;
 }): JSX.Element {
-  const containerTypes = new Set([
-    "Artboard",
-    "Page",
-    "GroupLayer",
-    "LayoutFrame",
-  ]);
   const isContainer =
-    selected !== null && containerTypes.has(selected.nodeType);
+    selected !== null && LAYOUT_ASSIST_CONTAINER_TYPES.has(selected.nodeType);
   const nodeId = isContainer ? selected.id : null;
 
   type LayoutPhase = "idle" | "running" | "done" | "error";
   const [phase, setPhase] = useState<LayoutPhase>("idle");
   const [suggestions, setSuggestions] = useState<LayoutSuggestion[]>([]);
   const [error, setError] = useState<string | null>(null);
+  // Monotonic per-section request token. Each `run()` invocation
+  // bumps the counter and captures the new value; the async result
+  // is only applied if the captured token still matches at completion
+  // time. This pattern matches the `cancelled` flag used by
+  // `useSessionLocks` and the EditorPage presence broadcast, but is
+  // adapted to button-triggered async (where we don't have a
+  // useEffect-style cleanup hook). A bare `cancelled` flag is
+  // insufficient because a *second* in-flight `run()` would set its
+  // own flag and never have it flipped — the request-token approach
+  // generalises cleanly to N concurrent calls.
+  const requestTokenRef = useRef(0);
 
-  // Reset state when the selection changes so we don't show stale
-  // suggestions from a previous artboard.
+  // Reset state and invalidate any in-flight `run()` when the
+  // selection changes — the previous result, if it still arrives,
+  // would be attributed to the wrong artboard.
   useEffect(() => {
     setPhase("idle");
     setSuggestions([]);
     setError(null);
+    requestTokenRef.current += 1;
   }, [nodeId]);
 
   if (!isContainer || nodeId === null) {
@@ -231,11 +252,20 @@ function LayoutAssistSection({
   }
 
   const run = async (): Promise<void> => {
+    requestTokenRef.current += 1;
+    const token = requestTokenRef.current;
     setPhase("running");
     setError(null);
     onStatus("Suggesting layout groupings locally…");
     try {
       const r = await window.kcreate.aiModel.layoutSuggestForArtboard(nodeId);
+      if (requestTokenRef.current !== token) {
+        // Selection changed, or a newer `run()` started, while this
+        // call was in flight — drop the result silently rather than
+        // overwrite the freshly-reset state with stale clustering
+        // output from a previous artboard.
+        return;
+      }
       setSuggestions(r);
       setPhase("done");
       onStatus(
@@ -244,6 +274,12 @@ function LayoutAssistSection({
           : `Layout assist: ${r.length} suggestion${r.length === 1 ? "" : "s"}.`,
       );
     } catch (e) {
+      if (requestTokenRef.current !== token) {
+        // Same rationale as the success path — a stale error from a
+        // superseded request would surface as a misleading red
+        // banner on the now-correct selection.
+        return;
+      }
       const msg = e instanceof Error ? e.message : String(e);
       setError(msg);
       setPhase("error");

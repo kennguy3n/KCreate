@@ -25,6 +25,7 @@ use kcreate_bridge::scene_sync::{PresenceCursor, PresenceSelection, SceneSync};
 use kcreate_core::node::{Bounds, Node, NodeType};
 use kcreate_core::DocumentGraph;
 use kcreate_renderer::{Color, Scene};
+use kcreate_vector::path::{PathPoint, PathSegment, VectorPath};
 use uuid::Uuid;
 
 /// Peer-count axis. Picked so a regression in the *constant factor*
@@ -171,10 +172,74 @@ fn bench_combined_presence_pipeline(c: &mut Criterion) {
     group.finish();
 }
 
+/// Document node-count axis for the dense `sync_document_to_scene`
+/// bench. Picked so the per-insert sort cost (which used to
+/// dominate via the per-call `Scene::add_object` re-sort) shows up
+/// at the 1000-node point.
+const DOC_NODE_COUNTS: &[usize] = &[50, 200, 1000];
+
+fn build_document_of_size(node_count: usize) -> DocumentGraph {
+    let mut doc = DocumentGraph::new();
+    for i in 0..node_count {
+        let mut node = Node::new(NodeType::VectorLayer, format!("n{i}"));
+        let row = i / 20;
+        let col = i % 20;
+        node.bounds = Bounds {
+            x: (col as f64) * 50.0,
+            y: (row as f64) * 50.0,
+            width: 40.0,
+            height: 30.0,
+        };
+        // Inject a minimal VectorPath metadata blob so `emit_vector`
+        // actually emits an object (without it the node is skipped
+        // and the bench measures only the walk, not the insert).
+        // Build the real `VectorPath` and round-trip through serde
+        // so we don't have to hand-author the tagged-enum JSON shape.
+        let path = VectorPath::new(vec![
+            PathSegment::MoveTo(PathPoint::new(0.0, 0.0)),
+            PathSegment::LineTo(PathPoint::new(40.0, 0.0)),
+            PathSegment::LineTo(PathPoint::new(40.0, 30.0)),
+            PathSegment::LineTo(PathPoint::new(0.0, 30.0)),
+            PathSegment::Close,
+        ]);
+        node.metadata.insert(
+            "vector_path".to_string(),
+            serde_json::to_value(&path).expect("serialise vector path for bench"),
+        );
+        doc.insert_node(node).expect("insert vector node");
+    }
+    doc
+}
+
+fn bench_sync_document_dense(c: &mut Criterion) {
+    // Times the `sync_document_to_scene` hot path on documents of
+    // increasing node count. Block B of the post-PR-#11 follow-ups
+    // converted the recursive emit walk from per-node
+    // `Scene::add_object` (O(N²·log N) via the re-sort on each
+    // insert) to a single batched `add_objects` at the end of the
+    // walk (O(N·log N)). This bench is the regression guard: if
+    // anyone re-introduces a per-insert sort, the 1000-node point
+    // pops loudly.
+    let mut group = c.benchmark_group("scene_sync_document_dense");
+    for &count in DOC_NODE_COUNTS {
+        let doc = build_document_of_size(count);
+        group.throughput(Throughput::Elements(count as u64));
+        group.bench_with_input(BenchmarkId::from_parameter(count), &doc, |b, doc| {
+            b.iter(|| {
+                let mut sync = SceneSync::new();
+                let scene = sync.sync_document_to_scene(doc, None, &[]);
+                criterion::black_box(scene.objects.len());
+            });
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_presence_cursors,
     bench_presence_selection_halos,
     bench_combined_presence_pipeline,
+    bench_sync_document_dense,
 );
 criterion_main!(benches);

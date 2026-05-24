@@ -363,6 +363,17 @@ impl SceneSync {
         }
 
         let mut scene = Scene::new(DEFAULT_CLEAR);
+        // Accumulate every object emitted during the recursive walk
+        // into a single Vec, then push them into the scene in one
+        // `add_objects` call below. Calling `Scene::add_object` per
+        // emitted node is O(N²·log N) because each push triggers a
+        // re-sort of the growing vec (see `Scene::add_object`); a
+        // single batched `add_objects` collapses that to one
+        // O(N·log N) stable sort at the end. Pre-allocate to roughly
+        // the document's node count so dense scenes don't realloc
+        // their way up through the powers-of-two on every push;
+        // `node_count()` is cheap (HashMap len).
+        let mut staged: Vec<Object> = Vec::with_capacity(doc.node_count());
         let mut z = 0_i32;
         let mut emitted_uuids: Vec<Uuid> = Vec::new();
         // Reset every sync: `sync_document_to_scene` rebuilds the
@@ -376,7 +387,7 @@ impl SceneSync {
                 doc,
                 *root,
                 blob_store,
-                &mut scene,
+                &mut staged,
                 &mut z,
                 &mut emitted_uuids,
                 &mut overlay,
@@ -399,7 +410,11 @@ impl SceneSync {
         self.overlay_watermark = overlay.next;
 
         // Selection highlights go on top, sorted by document order so
-        // overlapping selections paint deterministically.
+        // overlapping selections paint deterministically. Accumulated
+        // into the same `staged` vec so the final `add_objects` call
+        // sorts everything together — highlights have monotonically
+        // increasing `z` values from the post-walk watermark, so the
+        // sort places them last regardless.
         let mut highlight_id = u64::MAX;
         for sel_uuid in selection {
             let Some(node) = doc.get_node(*sel_uuid) else {
@@ -424,10 +439,14 @@ impl SceneSync {
             )
             .with_id(ObjectId(highlight_id))
             .with_z(z);
-            scene.add_object(highlight);
+            staged.push(highlight);
             z += 1;
             highlight_id = highlight_id.saturating_sub(1);
         }
+
+        // Single batched insert + sort. See the `Vec::with_capacity`
+        // comment above for the perf rationale.
+        scene.add_objects(staged);
 
         scene
     }
@@ -736,7 +755,7 @@ impl SceneSync {
         doc: &DocumentGraph,
         id: Uuid,
         blob_store: Option<&BlobStore>,
-        scene: &mut Scene,
+        objects: &mut Vec<Object>,
         z: &mut i32,
         emitted: &mut Vec<Uuid>,
         overlay: &mut OverlayIdAllocator,
@@ -760,19 +779,19 @@ impl SceneSync {
         }
         let child_clip = match node.node_type {
             NodeType::Artboard => {
-                self.emit_artboard(node, scene, z, emitted, overlay);
+                self.emit_artboard(node, objects, z, emitted, overlay);
                 Some(node_world_bounds(node))
             }
             NodeType::VectorLayer => {
-                self.emit_vector(node, scene, z, emitted);
+                self.emit_vector(node, objects, z, emitted);
                 clip
             }
             NodeType::RasterLayer => {
-                self.emit_raster(node, scene, z, blob_store, emitted);
+                self.emit_raster(node, objects, z, blob_store, emitted);
                 clip
             }
             NodeType::TextLayer => {
-                self.emit_text(node, scene, z, emitted);
+                self.emit_text(node, objects, z, emitted);
                 clip
             }
             NodeType::Page
@@ -782,7 +801,7 @@ impl SceneSync {
         };
         for child in &node.children {
             self.visit(
-                doc, *child, blob_store, scene, z, emitted, overlay, child_clip,
+                doc, *child, blob_store, objects, z, emitted, overlay, child_clip,
             );
         }
     }
@@ -790,7 +809,7 @@ impl SceneSync {
     fn emit_artboard(
         &mut self,
         node: &Node,
-        scene: &mut Scene,
+        objects: &mut Vec<Object>,
         z: &mut i32,
         emitted: &mut Vec<Uuid>,
         overlay: &mut OverlayIdAllocator,
@@ -814,7 +833,7 @@ impl SceneSync {
         )
         .with_id(Self::next_overlay_id(overlay))
         .with_z(*z);
-        scene.add_object(shadow);
+        objects.push(shadow);
         *z += 1;
 
         // 2. Artboard background rect — the hit-testable, document-
@@ -838,7 +857,7 @@ impl SceneSync {
         )
         .with_id(obj_id)
         .with_z(*z);
-        scene.add_object(obj);
+        objects.push(obj);
         *z += 1;
 
         // 3. Name label above the artboard. Overlay id so the user
@@ -860,7 +879,7 @@ impl SceneSync {
             )
             .with_id(Self::next_overlay_id(overlay))
             .with_z(*z);
-            scene.add_object(label);
+            objects.push(label);
             *z += 1;
         }
     }
@@ -868,7 +887,7 @@ impl SceneSync {
     fn emit_vector(
         &mut self,
         node: &Node,
-        scene: &mut Scene,
+        objects: &mut Vec<Object>,
         z: &mut i32,
         emitted: &mut Vec<Uuid>,
     ) {
@@ -889,14 +908,14 @@ impl SceneSync {
             .with_id(obj_id)
             .with_translation(tx as f32, ty as f32)
             .with_z(*z);
-        scene.add_object(obj);
+        objects.push(obj);
         *z += 1;
     }
 
     fn emit_raster(
         &mut self,
         node: &Node,
-        scene: &mut Scene,
+        objects: &mut Vec<Object>,
         z: &mut i32,
         blob_store: Option<&BlobStore>,
         emitted: &mut Vec<Uuid>,
@@ -937,11 +956,17 @@ impl SceneSync {
             }
         };
         let obj = Object::new(kind, style).with_id(obj_id).with_z(*z);
-        scene.add_object(obj);
+        objects.push(obj);
         *z += 1;
     }
 
-    fn emit_text(&mut self, node: &Node, scene: &mut Scene, z: &mut i32, emitted: &mut Vec<Uuid>) {
+    fn emit_text(
+        &mut self,
+        node: &Node,
+        objects: &mut Vec<Object>,
+        z: &mut i32,
+        emitted: &mut Vec<Uuid>,
+    ) {
         let Some(meta) = node
             .metadata
             .get(TEXT_LAYER_METADATA_KEY)
@@ -965,7 +990,7 @@ impl SceneSync {
         )
         .with_id(obj_id)
         .with_z(*z);
-        scene.add_object(obj);
+        objects.push(obj);
         *z += 1;
     }
 }

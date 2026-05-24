@@ -841,13 +841,10 @@ export interface LlmBridge {
 // hands the renderer a JSON string verbatim.
 // -----------------------------------------------------------------------------
 
-/** RGBA in [0, 1] — same as `kcreate_core::node::RgbaColor`. */
-export interface RgbaColor {
-  r: number;
-  g: number;
-  b: number;
-  a: number;
-}
+// `RgbaColor` is declared once above near the `FillStyle` mirror; the
+// design-tokens section reuses that single declaration so a future
+// schema change (e.g. wide-gamut floats, alpha-premultiplied semantics)
+// only needs to be threaded through one place.
 
 /** Typography token mirroring `kcreate_core::project::TypographyToken`. */
 export interface TypographyToken {

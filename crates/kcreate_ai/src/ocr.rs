@@ -231,6 +231,19 @@ impl Component {
 /// connected ink blob. The flood-fill is iterative (an explicit
 /// stack) rather than recursive so we don't blow the call stack on
 /// large inputs.
+///
+/// **Memory complexity.** Peak heap is `O(width * height)`:
+/// the `visited` bitmap is `width * height` bytes, and the
+/// worst-case explicit stack also grows to `width * height` entries
+/// (8 bytes each on 64-bit targets) when a single connected blob
+/// spans the entire raster. That's the price of a 4-connected
+/// flood-fill without scan-line compression — acceptable for the
+/// intended inputs (UI screenshots, document scans, on-canvas
+/// rasters up to a few megapixels). Callers that need to operate
+/// on very large all-dark images should pre-tile or downsample;
+/// adding a `max_component_pixels` early-bailout here would
+/// silently truncate large legitimate blobs into wrong bboxes,
+/// which is a worse failure mode than the memory pressure.
 fn label_components(mask: &[u8], width: u32, height: u32) -> Vec<Component> {
     let w = width as usize;
     let h = height as usize;

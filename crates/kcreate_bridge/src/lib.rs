@@ -2473,6 +2473,17 @@ pub fn vision_status() -> NapiResult<String> {
 // the libuv worker finishes. The renderer was already `await`-ing
 // these calls, so the JS-visible contract doesn't change — we just
 // stop freezing the UI while the model thinks.
+//
+// Wire shape: pixel arguments use `napi::bindgen_prelude::Buffer`
+// (zero-copy on the way in from a Node `Buffer`). The previous
+// shape was `Vec<u8>`, which forced TypeScript callers to
+// `Array.from(buffer)` — a ~4 M-element JS array allocation per
+// 1024×1024 frame plus a per-element copy through the JSON-ish
+// V8 boundary. A `Buffer` parameter binds straight to the
+// underlying `ArrayBuffer`, so the only copy happens once when we
+// snapshot the bytes into the `Task` (the `Buffer` can't outlive
+// the call — it holds a JS reference that's invalid on the libuv
+// worker thread).
 
 /// Describe a raw RGBA image. Returns the model's text answer.
 #[derive(Debug)]
@@ -2499,13 +2510,13 @@ impl Task for VisionDescribeImageTask {
 
 #[napi(ts_return_type = "Promise<string>")]
 pub fn vision_describe_image(
-    rgba: Vec<u8>,
+    rgba: Buffer,
     width: u32,
     height: u32,
     user_prompt: String,
 ) -> AsyncTask<VisionDescribeImageTask> {
     AsyncTask::new(VisionDescribeImageTask {
-        rgba,
+        rgba: rgba.to_vec(),
         width,
         height,
         user_prompt,
@@ -2568,12 +2579,12 @@ impl Task for VisionGenerateAltTextTask {
 
 #[napi(ts_return_type = "Promise<string>")]
 pub fn vision_generate_alt_text(
-    rgba: Vec<u8>,
+    rgba: Buffer,
     width: u32,
     height: u32,
 ) -> AsyncTask<VisionGenerateAltTextTask> {
     AsyncTask::new(VisionGenerateAltTextTask {
-        rgba,
+        rgba: rgba.to_vec(),
         width,
         height,
     })
@@ -2631,12 +2642,12 @@ impl Task for VisionAnalyzeDesignTask {
 
 #[napi(ts_return_type = "Promise<string>")]
 pub fn vision_analyze_design(
-    rgba: Vec<u8>,
+    rgba: Buffer,
     width: u32,
     height: u32,
 ) -> AsyncTask<VisionAnalyzeDesignTask> {
     AsyncTask::new(VisionAnalyzeDesignTask {
-        rgba,
+        rgba: rgba.to_vec(),
         width,
         height,
     })
@@ -2669,12 +2680,12 @@ impl Task for AiExtractBrandFromImageTask {
 
 #[napi(ts_return_type = "Promise<string>")]
 pub fn ai_extract_brand_from_image(
-    rgba: Vec<u8>,
+    rgba: Buffer,
     width: u32,
     height: u32,
 ) -> AsyncTask<AiExtractBrandFromImageTask> {
     AsyncTask::new(AiExtractBrandFromImageTask {
-        rgba,
+        rgba: rgba.to_vec(),
         width,
         height,
     })
@@ -2695,13 +2706,9 @@ impl Task for AiSuggestCropTask {
     type JsValue = String;
 
     fn compute(&mut self) -> NapiResult<Self::Output> {
-        let res = phase4::vision_suggest_crop(
-            &self.rgba,
-            self.width,
-            self.height,
-            self.aspect_ratio,
-        )
-        .map_err(map_phase4_err)?;
+        let res =
+            phase4::vision_suggest_crop(&self.rgba, self.width, self.height, self.aspect_ratio)
+                .map_err(map_phase4_err)?;
         serde_json::to_string(&res)
             .map_err(|e| NapiError::from_reason(format!("ai_suggest_crop: {e}")))
     }
@@ -2713,7 +2720,7 @@ impl Task for AiSuggestCropTask {
 
 #[napi(ts_return_type = "Promise<string>")]
 pub fn ai_suggest_crop(
-    rgba: Vec<u8>,
+    rgba: Buffer,
     width: u32,
     height: u32,
     aspect_ratio: f64,
@@ -2725,7 +2732,7 @@ pub fn ai_suggest_crop(
         None
     };
     AsyncTask::new(AiSuggestCropTask {
-        rgba,
+        rgba: rgba.to_vec(),
         width,
         height,
         aspect_ratio: aspect,
@@ -2759,12 +2766,12 @@ impl Task for AiSuggestDesignTokensTask {
 
 #[napi(ts_return_type = "Promise<string>")]
 pub fn ai_suggest_design_tokens(
-    rgba: Vec<u8>,
+    rgba: Buffer,
     width: u32,
     height: u32,
 ) -> AsyncTask<AiSuggestDesignTokensTask> {
     AsyncTask::new(AiSuggestDesignTokensTask {
-        rgba,
+        rgba: rgba.to_vec(),
         width,
         height,
     })
@@ -2795,13 +2802,9 @@ impl Task for AiDescribeStyleTask {
 }
 
 #[napi(ts_return_type = "Promise<string>")]
-pub fn ai_describe_style(
-    rgba: Vec<u8>,
-    width: u32,
-    height: u32,
-) -> AsyncTask<AiDescribeStyleTask> {
+pub fn ai_describe_style(rgba: Buffer, width: u32, height: u32) -> AsyncTask<AiDescribeStyleTask> {
     AsyncTask::new(AiDescribeStyleTask {
-        rgba,
+        rgba: rgba.to_vec(),
         width,
         height,
     })

@@ -973,7 +973,7 @@ function registerIpcHandlers(): void {
       userPrompt: string,
     ): Promise<string> =>
       requireBridge().visionDescribeImage(
-        Array.from(rgba),
+        rgba,
         width,
         height,
         userPrompt,
@@ -987,7 +987,7 @@ function registerIpcHandlers(): void {
   ipcMain.handle(
     "kcreate/vision/generateAltText",
     (_e, rgba: Buffer, width: number, height: number): Promise<string> =>
-      requireBridge().visionGenerateAltText(Array.from(rgba), width, height),
+      requireBridge().visionGenerateAltText(rgba, width, height),
   );
   ipcMain.handle(
     "kcreate/vision/generateAltTextForNode",
@@ -997,12 +997,12 @@ function registerIpcHandlers(): void {
   ipcMain.handle(
     "kcreate/vision/analyzeDesign",
     (_e, rgba: Buffer, width: number, height: number): Promise<string> =>
-      requireBridge().visionAnalyzeDesign(Array.from(rgba), width, height),
+      requireBridge().visionAnalyzeDesign(rgba, width, height),
   );
   ipcMain.handle(
     "kcreate/ai/extractBrandFromImage",
     (_e, rgba: Buffer, width: number, height: number): Promise<string> =>
-      requireBridge().aiExtractBrandFromImage(Array.from(rgba), width, height),
+      requireBridge().aiExtractBrandFromImage(rgba, width, height),
   );
   ipcMain.handle(
     "kcreate/ai/suggestCrop",
@@ -1014,7 +1014,7 @@ function registerIpcHandlers(): void {
       aspectRatio: number,
     ): Promise<string> =>
       requireBridge().aiSuggestCrop(
-        Array.from(rgba),
+        rgba,
         width,
         height,
         aspectRatio,
@@ -1023,12 +1023,12 @@ function registerIpcHandlers(): void {
   ipcMain.handle(
     "kcreate/ai/suggestDesignTokens",
     (_e, rgba: Buffer, width: number, height: number): Promise<string> =>
-      requireBridge().aiSuggestDesignTokens(Array.from(rgba), width, height),
+      requireBridge().aiSuggestDesignTokens(rgba, width, height),
   );
   ipcMain.handle(
     "kcreate/ai/describeStyle",
     (_e, rgba: Buffer, width: number, height: number): Promise<string> =>
-      requireBridge().aiDescribeStyle(Array.from(rgba), width, height),
+      requireBridge().aiDescribeStyle(rgba, width, height),
   );
   ipcMain.handle("kcreate/vision/recommendedPack", (): string =>
     requireBridge().visionRecommendedPack(),
@@ -1166,7 +1166,7 @@ function registerIpcHandlers(): void {
   ipcMain.handle(
     "kcreate/document/importImageBytes",
     (_e, parentId: string | null, bytes: Buffer) =>
-      requireBridge().documentImportImageBytes(parentId, Array.from(bytes)),
+      requireBridge().documentImportImageBytes(parentId, bytes),
   );
   ipcMain.handle(
     "kcreate/canvas/createRect",

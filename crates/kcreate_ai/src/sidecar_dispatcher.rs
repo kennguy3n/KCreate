@@ -268,7 +268,7 @@ mod tests {
     fn mlx_pack_on_apple_silicon_with_mlx_picks_mlx() {
         let dir = tempfile::tempdir().unwrap();
         let plan = plan_dispatch(
-            "vision_qwen35_4b_mlx",
+            "vision_qwen25vl_7b_mlx",
             dir.path(),
             Platform::MacOsAppleSilicon,
             /* mlx_available = */ true,
@@ -276,7 +276,7 @@ mod tests {
         .unwrap();
         assert_eq!(plan.runtime, SidecarRuntime::MlxLm);
         assert_eq!(plan.reason, DispatchReason::MlxNative);
-        assert_eq!(plan.resolved_pack_id, "vision_qwen35_4b_mlx");
+        assert_eq!(plan.resolved_pack_id, "vision_qwen25vl_7b_mlx");
         // MLX runtime does NOT need a separate mmproj — MLX packs
         // ship the projector inside the model directory.
         assert!(plan.mmproj_path.is_none());
@@ -288,7 +288,7 @@ mod tests {
     fn mlx_pack_on_linux_falls_back_to_llama_server() {
         let dir = tempfile::tempdir().unwrap();
         let plan = plan_dispatch(
-            "vision_qwen35_4b_mlx",
+            "vision_qwen25vl_7b_mlx",
             dir.path(),
             Platform::LinuxX64,
             /* mlx_available = */ false,
@@ -296,14 +296,14 @@ mod tests {
         .unwrap();
         assert_eq!(plan.runtime, SidecarRuntime::LlamaServer);
         assert_eq!(plan.reason, DispatchReason::MlxUnavailableFallback);
-        assert_eq!(plan.resolved_pack_id, "vision_qwen35_4b");
+        assert_eq!(plan.resolved_pack_id, "vision_qwen25vl_7b");
         // Llama-server vision DOES require a mmproj file.
         assert!(plan.mmproj_path.is_some());
         assert!(plan
             .mmproj_path
             .as_ref()
             .unwrap()
-            .ends_with("qwen2.5-vl-4b-mmproj-f16.gguf"));
+            .ends_with("mmproj-qwen2.5-vl-7b-instruct-f16.gguf"));
     }
 
     /// On Apple Silicon WITHOUT MLX installed, the dispatcher must

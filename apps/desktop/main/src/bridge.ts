@@ -184,41 +184,41 @@ export interface Bridge {
   // runs (cold-load + inference can take 5–30 s). Each call resolves
   // a JS `Promise<string>` once the worker thread finishes.
   visionDescribeImage(
-    rgba: number[],
+    rgba: Buffer,
     width: number,
     height: number,
     userPrompt: string,
   ): Promise<string>;
   visionDescribeNode(nodeId: string, userPrompt: string): Promise<string>;
   visionGenerateAltText(
-    rgba: number[],
+    rgba: Buffer,
     width: number,
     height: number,
   ): Promise<string>;
   visionGenerateAltTextForNode(nodeId: string): Promise<string>;
   visionAnalyzeDesign(
-    rgba: number[],
+    rgba: Buffer,
     width: number,
     height: number,
   ): Promise<string>;
   aiExtractBrandFromImage(
-    rgba: number[],
+    rgba: Buffer,
     width: number,
     height: number,
   ): Promise<string>;
   aiSuggestCrop(
-    rgba: number[],
+    rgba: Buffer,
     width: number,
     height: number,
     aspectRatio: number,
   ): Promise<string>;
   aiSuggestDesignTokens(
-    rgba: number[],
+    rgba: Buffer,
     width: number,
     height: number,
   ): Promise<string>;
   aiDescribeStyle(
-    rgba: number[],
+    rgba: Buffer,
     width: number,
     height: number,
   ): Promise<string>;
@@ -257,7 +257,7 @@ export interface Bridge {
   documentGetSelection(): string[];
   documentClearSelection(): void;
   documentImportImage(parentId: string | null, filePath: string): string;
-  documentImportImageBytes(parentId: string | null, bytes: number[]): string;
+  documentImportImageBytes(parentId: string | null, bytes: Buffer): string;
   canvasCreateRect(
     parentId: string | null,
     x: number,

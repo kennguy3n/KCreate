@@ -279,16 +279,25 @@ export function ModelManager({ onStatus }: ModelManagerProps): JSX.Element {
 /// - Vision packs that exceed `visionModelMaxMb` are still shown
 ///   but their install action is disabled — the user sees what's
 ///   available on a beefier tier without being able to install a
-///   pack that would never load.
+///   pack that would never load. We compare in **binary MB**
+///   (1024 × 1024) to match the Rust-side cap unit
+///   (`crates/kcreate_bridge/src/phase4.rs::vision_listable_packs`)
+///   — using decimal MB here would diverge by ~2.4% and could
+///   produce edge-case disagreements at tier boundaries.
 /// - MLX-suffixed packs are filtered out on non-Apple-Silicon
-///   platforms by inspecting the device tier string (which
-///   includes the platform name in its `Debug` form).
+///   platforms by inspecting `limits.platform` (the `Debug` form of
+///   the host `Platform` enum). Earlier code looked at
+///   `limits.deviceTier`, but that string only encodes the
+///   performance class (`Tier0`/`Tier1`/…) and never contains
+///   platform info — so every MLX pack was incorrectly hidden on
+///   Apple Silicon too.
+const BINARY_MB = 1024 * 1024;
 function filterPacksForTier(
   packs: ModelPack[],
   limits: ResourceLimits | null,
 ): { visible: ModelPack[]; disabledIds: Set<string> } {
   if (!limits) return { visible: packs, disabledIds: new Set() };
-  const isAppleSilicon = limits.deviceTier
+  const isAppleSilicon = limits.platform
     .toLowerCase()
     .includes("applesilicon");
   const disabled = new Set<string>();
@@ -300,7 +309,7 @@ function filterPacksForTier(
       return false;
     }
     if (p.category === "vision") {
-      const sizeMb = p.sizeBytes / 1_000_000;
+      const sizeMb = p.sizeBytes / BINARY_MB;
       if (sizeMb > limits.visionModelMaxMb) {
         disabled.add(p.id);
       }

@@ -380,8 +380,8 @@ fn static_packs() -> Vec<ModelPack> {
             sha256: String::new(),
         },
         ModelPack {
-            id: "vision_qwen35_4b".into(),
-            name: "Vision (GPU) — Qwen2.5-VL 4B Instruct".into(),
+            id: "vision_qwen25vl_7b".into(),
+            name: "Vision (GPU) — Qwen2.5-VL 7B Instruct".into(),
             category: ModelPackCategory::Vision,
             kind: ModelKind::Sidecar,
             capabilities: vec![
@@ -392,21 +392,21 @@ fn static_packs() -> Vec<ModelPack> {
                 "smart_crop".into(),
                 "style_describe".into(),
             ],
-            size_bytes: 2_500_000_000,
-            file_path: "qwen2.5-vl-4b-q4_k_m.gguf".into(),
+            size_bytes: 4_700_000_000,
+            file_path: "qwen2.5-vl-7b-instruct-q4_k_m.gguf".into(),
             installed: false,
             download_url:
                 "https://huggingface.co/ggml-org/Qwen2.5-VL-7B-Instruct-GGUF/resolve/main/Qwen2.5-VL-7B-Instruct-Q4_K_M.gguf".into(),
             sha256: String::new(),
         },
         ModelPack {
-            id: "vision_qwen35_4b_mmproj".into(),
-            name: "Vision (GPU) — Qwen2.5-VL 4B mmproj".into(),
+            id: "vision_qwen25vl_7b_mmproj".into(),
+            name: "Vision (GPU) — Qwen2.5-VL 7B mmproj (F16)".into(),
             category: ModelPackCategory::Vision,
             kind: ModelKind::Sidecar,
             capabilities: vec!["mmproj".into()],
-            size_bytes: 420_000_000,
-            file_path: "qwen2.5-vl-4b-mmproj-f16.gguf".into(),
+            size_bytes: 1_350_000_000,
+            file_path: "mmproj-qwen2.5-vl-7b-instruct-f16.gguf".into(),
             installed: false,
             download_url:
                 "https://huggingface.co/ggml-org/Qwen2.5-VL-7B-Instruct-GGUF/resolve/main/mmproj-Qwen2.5-VL-7B-Instruct-F16.gguf".into(),
@@ -436,8 +436,8 @@ fn static_packs() -> Vec<ModelPack> {
             sha256: String::new(),
         },
         ModelPack {
-            id: "vision_qwen35_4b_mlx".into(),
-            name: "Vision (Apple Silicon) — Qwen2.5-VL 4B MLX 4bit".into(),
+            id: "vision_qwen25vl_7b_mlx".into(),
+            name: "Vision (Apple Silicon) — Qwen2.5-VL 7B Instruct MLX 4bit".into(),
             category: ModelPackCategory::Vision,
             kind: ModelKind::Sidecar,
             capabilities: vec![
@@ -449,7 +449,7 @@ fn static_packs() -> Vec<ModelPack> {
                 "style_describe".into(),
                 "mlx".into(),
             ],
-            size_bytes: 2_700_000_000,
+            size_bytes: 4_300_000_000,
             file_path: "mlx-community__Qwen2.5-VL-7B-Instruct-4bit".into(),
             installed: false,
             download_url:
@@ -500,7 +500,7 @@ fn static_packs() -> Vec<ModelPack> {
 pub fn mmproj_for(pack_id: &str) -> Option<&'static str> {
     match pack_id {
         "vision_smolvlm2_256m" => Some("vision_smolvlm2_256m_mmproj"),
-        "vision_qwen35_4b" => Some("vision_qwen35_4b_mmproj"),
+        "vision_qwen25vl_7b" => Some("vision_qwen25vl_7b_mmproj"),
         _ => None,
     }
 }
@@ -520,7 +520,7 @@ pub fn mmproj_for(pack_id: &str) -> Option<&'static str> {
 pub fn gguf_fallback_for_mlx_pack(pack_id: &str) -> Option<&'static str> {
     match pack_id {
         "vision_smolvlm_256m_mlx" => Some("vision_smolvlm2_256m"),
-        "vision_qwen35_4b_mlx" => Some("vision_qwen35_4b"),
+        "vision_qwen25vl_7b_mlx" => Some("vision_qwen25vl_7b"),
         "image_gen_flux_klein_mlx" => Some("image_gen_flux_klein_4b"),
         _ => None,
     }
@@ -551,8 +551,8 @@ pub fn recommended_vision_pack(
     Some(match (tier, is_apple_silicon) {
         (Tier0 | Tier1, true) => "vision_smolvlm_256m_mlx",
         (Tier0 | Tier1, false) => "vision_smolvlm2_256m",
-        (Tier2 | Tier3, true) => "vision_qwen35_4b_mlx",
-        (Tier2 | Tier3, false) => "vision_qwen35_4b",
+        (Tier2 | Tier3, true) => "vision_qwen25vl_7b_mlx",
+        (Tier2 | Tier3, false) => "vision_qwen25vl_7b",
     })
 }
 
@@ -853,9 +853,9 @@ mod tests {
             "smart_select_flood",
             "upscale_esrgan",
             "upscale_lanczos",
-            "vision_qwen35_4b",
-            "vision_qwen35_4b_mlx",
-            "vision_qwen35_4b_mmproj",
+            "vision_qwen25vl_7b",
+            "vision_qwen25vl_7b_mlx",
+            "vision_qwen25vl_7b_mmproj",
             "vision_smolvlm2_256m",
             "vision_smolvlm2_256m_mmproj",
             "vision_smolvlm_256m_mlx",
@@ -1293,7 +1293,7 @@ mod tests {
             .into_iter()
             .map(|p| p.id)
             .collect();
-        for parent in ["vision_smolvlm2_256m", "vision_qwen35_4b"] {
+        for parent in ["vision_smolvlm2_256m", "vision_qwen25vl_7b"] {
             let mmproj_id =
                 mmproj_for(parent).unwrap_or_else(|| panic!("mmproj_for({parent}) returned None"));
             assert!(

@@ -533,6 +533,7 @@ const runtime: RuntimeBridge = {
 
 type ResourceLimitsSnake = {
   device_tier: string;
+  platform: string;
   low_resource_mode: boolean;
   effective_undo_depth: number;
   effective_raster_cache_mb: number;
@@ -552,6 +553,7 @@ function resourceLimitsFromSnake(s: ResourceLimitsSnake): ResourceLimits {
     gpuRenderingAllowed: s.gpu_rendering_allowed,
     imageGenerationAllowed: s.image_generation_allowed,
     visionModelMaxMb: s.vision_model_max_mb,
+    platform: s.platform,
   };
 }
 

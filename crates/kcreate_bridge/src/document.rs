@@ -3401,6 +3401,13 @@ pub struct ResourceLimits {
     /// SmolVLM. UI uses this to ghost out vision packs that
     /// exceed the per-tier ceiling.
     pub vision_model_max_mb: u64,
+    /// `Debug` form of [`Platform`] for the host machine
+    /// (`"MacOsAppleSilicon"`, `"Linux"`, `"Windows"`, …). The
+    /// Model Manager uses this to decide whether to show MLX-format
+    /// packs; `device_tier` alone is insufficient because it only
+    /// encodes the performance class (`Tier0`/`Tier1`/…), never
+    /// the platform.
+    pub platform: String,
 }
 
 /// Snapshot the currently-effective resource limits.
@@ -3415,6 +3422,7 @@ pub fn resource_limits() -> ResourceLimits {
         gpu_rendering_allowed: cfg.gpu_rendering_allowed(),
         image_generation_allowed: cfg.image_generation_allowed(),
         vision_model_max_mb: cfg.device_tier.vision_model_max_mb(),
+        platform: format!("{:?}", cfg.platform),
     }
 }
 

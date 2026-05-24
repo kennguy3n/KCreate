@@ -237,8 +237,8 @@ Tier 2+ with a GPU.
   - `SidecarConfig.mmproj_path` end-to-end with disk validation,
     extra-argv plumbing, and tests.
   - Static registry entries for `vision_smolvlm2_256m`,
-    `vision_qwen35_4b`, their `_mmproj` companions, and MLX
-    variants (`vision_smolvlm_256m_mlx`, `vision_qwen35_4b_mlx`).
+    `vision_qwen25vl_7b`, their `_mmproj` companions, and MLX
+    variants (`vision_smolvlm_256m_mlx`, `vision_qwen25vl_7b_mlx`).
     `ModelPackCategory::Vision` shipped to `scene.ts`.
   - `MlxSidecar` (`crates/kcreate_ai/src/mlx_sidecar.rs`) mirrors
     `LlmSidecar` over `python3 -m mlx_lm.server`, with availability

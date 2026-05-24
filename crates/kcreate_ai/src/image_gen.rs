@@ -3,7 +3,9 @@
 //! This module spawns and supervises a Python subprocess that runs
 //! a minimal diffusers-based HTTP server (see
 //! `tools/kcreate_diffusion/server.py`). The server binds loopback
-//! only, exposes a `/health` probe and a
+//! only, exposes a `/health` liveness probe, a `/ready` readiness
+//! probe (200 once the diffusion pipeline finishes loading; 503
+//! while still loading; 500 on load failure), and a
 //! `POST /v1/images/generations` endpoint that accepts
 //!
 //! ```json
@@ -115,9 +117,14 @@ impl ImageGenSidecar {
         self.status.lock().is_ready()
     }
 
-    /// Spawn the Python child process and start probing `/health`.
+    /// Spawn the Python child process and start probing `/ready`.
     /// Returns the listening port immediately; the caller observes
-    /// `Ready`/`Error` by polling [`Self::status`].
+    /// `Ready`/`Error` by polling [`Self::status`]. We poll
+    /// `/ready` (not `/health`) so the sidecar only transitions to
+    /// `Ready` once the diffusion pipeline has finished loading —
+    /// otherwise the first generate call would block 30-60 s on a
+    /// silent torch import while the UI showed a green "ready"
+    /// dot.
     pub fn start(&mut self) -> SidecarResult<u16> {
         {
             let s = self.status.lock();
@@ -247,7 +254,7 @@ fn health_worker(
             *status.lock() = SidecarStatus::Stopped;
             return;
         }
-        if probe_health(port) {
+        if probe_ready(port) {
             ready = true;
             break;
         }
@@ -305,17 +312,27 @@ fn validate_model(model: &Path) -> SidecarResult<()> {
     Ok(())
 }
 
+/// Probe the diffusion server's `/ready` endpoint. Returns `true`
+/// only when the pipeline has finished loading (200). `503` (still
+/// loading) and `500` (load error) both return `false` so the
+/// health worker keeps polling until the deadline or success.
+///
+/// When `llm_sidecar` isn't compiled in we can't actually parse
+/// HTTP responses, so we fall back to a TCP-connect probe — that's
+/// only used by unit tests that mock out the supervisor anyway.
 #[cfg(feature = "llm_sidecar")]
-fn probe_health(port: u16) -> bool {
-    let url = format!("http://127.0.0.1:{port}/health");
+fn probe_ready(port: u16) -> bool {
+    let url = format!("http://127.0.0.1:{port}/ready");
     match ureq::get(&url).timeout(Duration::from_secs(2)).call() {
         Ok(resp) => resp.status() == 200,
+        // ureq surfaces 4xx/5xx as `Err(Status)`; only 200 counts
+        // as "pipeline loaded".
         Err(_) => false,
     }
 }
 
 #[cfg(not(feature = "llm_sidecar"))]
-fn probe_health(port: u16) -> bool {
+fn probe_ready(port: u16) -> bool {
     use std::net::{SocketAddr, TcpStream};
     TcpStream::connect_timeout(
         &SocketAddr::from(([127, 0, 0, 1], port)),

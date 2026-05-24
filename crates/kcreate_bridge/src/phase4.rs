@@ -362,11 +362,7 @@ pub fn vision_analyze_design(rgba: &[u8], width: u32, height: u32) -> Phase4Resu
 }
 
 /// Brand extraction (Task 16).
-pub fn vision_extract_brand(
-    rgba: &[u8],
-    width: u32,
-    height: u32,
-) -> Phase4Result<BrandExtraction> {
+pub fn vision_extract_brand(rgba: &[u8], width: u32, height: u32) -> Phase4Result<BrandExtraction> {
     let port = vision_ready_port()?;
     extract_brand_from_image(port, rgba, width, height).map_err(Phase4BridgeError::Vision)
 }

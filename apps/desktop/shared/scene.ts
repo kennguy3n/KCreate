@@ -576,7 +576,18 @@ export interface ResourceLimits {
   /// from `effectiveMaxModelMb` because the vision sidecar runs in
   /// a separate process from the text LLM and tier 0/1 can afford
   /// a 180 MB SmolVLM even though they can't afford a 4 GB LLM.
+  ///
+  /// Unit: **binary MB** (mebibytes, 1024 × 1024 B). Matches the
+  /// Rust side (`kcreate_bridge::phase4::vision_listable_packs` /
+  /// `model_registry`) so a pack's `sizeBytes / (1024*1024)` can
+  /// be compared directly to this cap. Decimal-MB callers will
+  /// disagree by ~2.4% near tier boundaries.
   visionModelMaxMb: number;
+  /// `Debug` form of the host `Platform` enum
+  /// (`"MacOsAppleSilicon"`, `"Linux"`, `"Windows"`, …). The
+  /// ModelManager uses this — NOT `deviceTier` — to gate MLX-only
+  /// packs onto Apple Silicon.
+  platform: string;
 }
 
 /** Runtime / device probe. */

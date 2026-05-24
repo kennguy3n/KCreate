@@ -271,6 +271,21 @@ export interface NodeInfo {
    * no explicit geometry — e.g. groups before layout solving).
    */
   bounds: Bounds;
+  /**
+   * Monotonically-increasing revision counter sourced from
+   * `kcreate_core::node::Node::version`. Bumped on every mutation
+   * (including undo/redo and future collab events). Panels that
+   * hydrate node-scoped data the `NodeInfo` payload deliberately
+   * doesn't carry (`FillSection`'s `style.fill`,
+   * `TextFramePanel`'s `text_frame_options`, `OpenTypePanel`'s
+   * OpenType features) must key their fetch effect on
+   * `[node.id, node.version]` so the effect refires after
+   * undo/redo / remote-peer edits even when `node.id` is stable.
+   * Typed as `number` (not `bigint`) because `Node::version` bumps
+   * once per mutation and stays well below 2^53 in practice — see
+   * the matching `version: f64` comment on the napi `NodeInfo`.
+   */
+  version: number;
   componentInstance?: ComponentInstanceInfo;
   /**
    * Free-form metadata bag mirroring `Node::metadata` on the Rust side.
@@ -299,8 +314,94 @@ export interface CreateNodeProps {
   metadata?: Record<string, unknown>;
 }
 
-/** Optional changes accepted by `updateNode`. Only present fields are applied. */
-export type UpdateNodeProps = CreateNodeProps;
+/**
+ * RGBA colour with channels in `[0.0, 1.0]`. Mirrors
+ * `kcreate_core::node::RgbaColor`.
+ */
+export interface RgbaColor {
+  r: number;
+  g: number;
+  b: number;
+  a: number;
+}
+
+/**
+ * A single stop in a gradient. Mirrors
+ * `kcreate_core::node::GradientStop`.
+ */
+export interface GradientStop {
+  offset: number;
+  color: RgbaColor;
+}
+
+/**
+ * 2D point. Mirrors `kcreate_core::node::Point2D`.
+ */
+export interface Point2D {
+  x: number;
+  y: number;
+}
+
+/**
+ * Fill style for a node. Discriminated union tagged on `kind`
+ * (snake-cased), mirroring `kcreate_core::node::FillStyle`. The
+ * serde encoding is *internally-tagged*: newtype variants flatten
+ * the inner type's fields into the same JSON object rather than
+ * nesting them under a `"value"` key, so the wire shape is e.g.:
+ *
+ *   - `{"kind": "none"}`
+ *   - `{"kind": "solid", "r": 0.5, "g": 0.25, "b": 0.75, "a": 1.0}`
+ *   - `{"kind": "gradient", "shape": "linear", "from": {...},
+ *      "to": {...}, "stops": [...]}`
+ *   - `{"kind": "gradient", "shape": "radial", "center": {...},
+ *      "radius": 0.5, "stops": [...]}`
+ *
+ * The `shape` discriminator on `"gradient"` is from the inner
+ * `GradientKind` enum, which uses its own `#[serde(tag = "shape")]`.
+ * The two tags don't collide because they live on independent
+ * Rust enums; serde flattens them into one object at the JSON
+ * level.
+ *
+ * The `FillSection` (right panel, properties tab) reads/writes
+ * this shape via `kcreate.document.nodeFill` and the new `fill`
+ * field on `UpdateNodeProps`.
+ */
+export type FillStyle =
+  | { kind: "none" }
+  | ({ kind: "solid" } & RgbaColor)
+  | ({ kind: "gradient" } & GradientKind);
+
+/**
+ * Variant of `FillStyle::Gradient`. Tagged on `shape`,
+ * snake-cased. Mirrors `kcreate_core::node::GradientKind`. The
+ * payload fields are flattened alongside the parent `FillStyle`'s
+ * `kind` field when this is the inner variant of `FillStyle`.
+ */
+export type GradientKind =
+  | {
+      shape: "linear";
+      from: Point2D;
+      to: Point2D;
+      stops: GradientStop[];
+    }
+  | {
+      shape: "radial";
+      center: Point2D;
+      radius: number;
+      stops: GradientStop[];
+    };
+
+/**
+ * Optional changes accepted by `updateNode`. Only present fields
+ * are applied.
+ *
+ * `fill` is decoupled from `metadata` so the FillEditor doesn't
+ * have to know that the fill lives on `node.style.fill` rather
+ * than `node.metadata`. The bridge owns that layering detail.
+ */
+export interface UpdateNodeProps extends CreateNodeProps {
+  fill?: FillStyle;
+}
 
 /** SVG export options. `0` for width/height means "fit to content". */
 export interface SvgExportOptions {
@@ -412,6 +513,16 @@ export interface DocumentBridge {
     props: CreateNodeProps,
   ): Promise<string>;
   updateNode(nodeId: string, changes: UpdateNodeProps): Promise<void>;
+  /**
+   * Read the current `FillStyle` for a node, or `null` when the
+   * node id is not in the open document. Used by the `FillSection`
+   * panel to populate its editor on selection change. Writes go
+   * back through {@link updateNode} with the new `fill` field on
+   * `UpdateNodeProps` — there's no separate setter because the
+   * existing channel already takes care of the operation log,
+   * scene re-sync, and persistence.
+   */
+  nodeFill(nodeId: string): Promise<FillStyle | null>;
   deleteNode(nodeId: string): Promise<void>;
   undo(): Promise<UndoRedoOutcome | null>;
   redo(): Promise<UndoRedoOutcome | null>;
@@ -745,13 +856,10 @@ export interface LlmBridge {
 // hands the renderer a JSON string verbatim.
 // -----------------------------------------------------------------------------
 
-/** RGBA in [0, 1] — same as `kcreate_core::node::RgbaColor`. */
-export interface RgbaColor {
-  r: number;
-  g: number;
-  b: number;
-  a: number;
-}
+// `RgbaColor` is declared once above near the `FillStyle` mirror; the
+// design-tokens section reuses that single declaration so a future
+// schema change (e.g. wide-gamut floats, alpha-premultiplied semantics)
+// only needs to be threaded through one place.
 
 /** Typography token mirroring `kcreate_core::project::TypographyToken`. */
 export interface TypographyToken {
@@ -1195,7 +1303,8 @@ export type PreflightCheckId =
   | "page_size"
   | "shading"
   | "font_glyph_coverage"
-  | "total_ink_coverage";
+  | "total_ink_coverage"
+  | "bleed_area_empty";
 
 export interface PreflightIssue {
   check: PreflightCheckId;
@@ -1209,7 +1318,29 @@ export type PreflightColorSpaceTarget = "cmyk" | "rgb";
 
 export interface PreflightOptions {
   targetDpi: number;
+  /**
+   * Hard minimum DPI for raster images — anything below this is
+   * an `image_resolution` Error ("unrecoverable"), anything between
+   * the floor and `targetDpi` is a Warning, anything above is
+   * silent. When `0` (the default), the floor is inferred from
+   * `targetColorSpace`: 150 DPI for `cmyk` (press soft-proof
+   * minimum), 72 DPI for `rgb` (screen baseline). Set explicitly
+   * to override (e.g. 240 for a high-end commercial run, 96 for
+   * low-res draft proofs). Use `0` rather than `null` so the
+   * Rust-side `serde_json` round-trip stays simple (the Rust
+   * struct uses `0.0` as the deny-by-default sentinel because
+   * non-finite floats are not JSON-encodable).
+   */
+  imageDpiFloor: number;
   requireBleedMm: number;
+  /**
+   * Whether to raise a `bleed_area_empty` warning per uncovered
+   * side on artboards configured with bleed. Useful to turn off
+   * for documents containing a mix of press + screen artboards
+   * where the screen-only pages would otherwise generate noise.
+   * Defaults to `true`.
+   */
+  checkBleedAreaCoverage: boolean;
   allowTransparency: boolean;
   targetColorSpace: PreflightColorSpaceTarget;
   /**
@@ -1504,6 +1635,94 @@ export interface AiModelBridge {
   /// error — so the UI can render a "nothing to suggest" state
   /// without special-casing the call.
   layoutSuggestForArtboard(artboardId: string): Promise<LayoutSuggestion[]>;
+  /// Run the text-region detector against a raster layer. Returns
+  /// the detected regions in raster-pixel space (top-left origin),
+  /// in reading order. Pass `null` for `options` to use the
+  /// detector defaults from
+  /// `kcreate_ai::DetectTextRegionsOptions::default()`.
+  ///
+  /// Read-only: does NOT modify the document. To insert a region
+  /// as a TextLayer, call
+  /// [`AiModelBridge.insertTextLayerForRegion`].
+  detectTextRegions(
+    nodeId: string,
+    options?: DetectTextRegionsOptions | null,
+  ): Promise<TextRegion[]>;
+  /// Create a new `TextLayer` sibling of the source raster
+  /// positioned over the detected region. The region's pixel-space
+  /// coordinates are mapped into document space using the raster's
+  /// `bounds` + intrinsic dimensions. Returns the new node id.
+  ///
+  /// The created TextLayer carries an `ai_insert_text_layer`
+  /// operation in the undo log + an entry in the AI action log
+  /// (`task_type: "ocr_insert_text_layer"`).
+  insertTextLayerForRegion(
+    request: InsertTextLayerForRegionRequest,
+  ): Promise<string>;
+}
+
+/// A detected text-like region in a raster image, mirroring
+/// `kcreate_ai::ocr::TextRegion`. Coordinates are in raster-pixel
+/// space (top-left origin) matching the raster's intrinsic
+/// dimensions, not document space.
+///
+/// `glyphCount` is the count of connected components merged into
+/// the line; `estimatedCharCount` is `width / avg_glyph_advance`
+/// (rounded up, floored at `glyphCount`). Both are heuristic hints
+/// for the renderer — the detector does NOT perform character
+/// recognition.
+export interface TextRegion {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  glyphCount: number;
+  estimatedCharCount: number;
+}
+
+/// Detector parameters, mirroring
+/// `kcreate_ai::ocr::DetectTextRegionsOptions`. All fields optional
+/// on the wire — omitted fields fall back to defaults on the Rust
+/// side via `#[serde(default)]`.
+export interface DetectTextRegionsOptions {
+  /// Luminance threshold (0–255). Pixels at or below are "ink".
+  luminanceThreshold?: number;
+  /// Minimum component size in pixels.
+  minComponentPixels?: number;
+  /// Maximum component size as a fraction of the image area.
+  maxComponentFraction?: number;
+  /// Vertical overlap fraction required to merge two components
+  /// into one line.
+  lineOverlapRatio?: number;
+  /// Horizontal gap allowance (× cap-height) within one line.
+  lineGapRatio?: number;
+  /// Hard cap on input image area, in pixels (`width * height`).
+  /// Larger inputs are rejected on the Rust side with a typed
+  /// error rather than fed into the O(W*H)-memory flood-fill.
+  /// Omit to use the Rust default (16 million pixels, enough for
+  /// any reasonable 4K screenshot).
+  maxImagePixels?: number;
+}
+
+/// Renderer → bridge request to materialise a detected text region
+/// as a new TextLayer. Mirrors
+/// `kcreate_bridge::phase2::InsertTextLayerForRegionRequest`.
+export interface InsertTextLayerForRegionRequest {
+  /// Source raster the region was detected on. The new TextLayer
+  /// is inserted as a sibling under the same parent.
+  rasterNodeId: string;
+  /// Region in raster-pixel space (top-left origin). Carries the
+  /// glyph / char counts from the detector unchanged.
+  region: TextRegion;
+  /// Initial text content. Empty by default — the user typically
+  /// types the recognised text after insertion since the detector
+  /// reports bboxes, not characters.
+  text?: string;
+  /// Override the font family. Empty / omitted = bridge default.
+  fontFamily?: string;
+  /// Override the font size. Omitted = bridge estimates from the
+  /// region's height in document space.
+  fontSize?: number;
 }
 
 /// Result of [`PdfImportBridge.importPdf`] mirroring
@@ -2219,6 +2438,46 @@ export interface KChatMembershipStatus {
   /// ISO-8601 expiry, or `null` when locked. The renderer can use
   /// this to show a "renew soon" CTA when expiry is imminent.
   expiresAt: string | null;
+  /// 32-byte Ed25519 verifying key of the issuer that minted the
+  /// active membership (URL-safe base64, no padding). `null` when
+  /// `locked` is true. Renderer surfaces this on a "Issued by …"
+  /// line below the group / expiry summary.
+  issuerPublicKey?: string | null;
+  /// Human-readable label of the matching trusted-issuer entry
+  /// (if any). `null` when locked, when the issuer is not on the
+  /// allowlist (`issuerTrusted` is `false`), or when the allowlist
+  /// is empty (no labels to attach). The renderer falls back to a
+  /// truncated `issuerPublicKey` for display in those cases.
+  issuerLabel?: string | null;
+  /// `true` iff the issuer is listed in the configured allowlist
+  /// OR the allowlist is empty (backward-compat: empty list means
+  /// "accept any issuer"). The renderer renders a distinct
+  /// "Untrusted issuer — test only" badge when this is `false`.
+  issuerTrusted?: boolean;
+}
+
+/// One entry in the KChat trusted-issuer allowlist. Mirrors
+/// `kcreate_bridge::collab::TrustedIssuer`. The allowlist is
+/// loaded from disk at app start (via
+/// `KChatBridge.setTrustStorePath`) and mutated via
+/// `addTrustedIssuer` / `removeTrustedIssuer`. An empty list
+/// preserves the pre-Block-E behaviour of "accept any issuer" so
+/// the dev-mint flow keeps working out of the box.
+export interface TrustedIssuer {
+  /// 32-byte Ed25519 verifying key of the issuer, URL-safe base64
+  /// (no padding). Padding is stripped on the way in so a user
+  /// pasting a padded key from a KChat admin dashboard still
+  /// matches install requests, which always arrive unpadded.
+  issuerPublicKey: string;
+  /// Human-readable label shown in the sign-in panel and on the
+  /// "Issued by" line of the membership-status summary. Max 128
+  /// characters; non-empty.
+  label: string;
+  /// ISO-8601 timestamp at which the entry was added or last
+  /// updated. Reset to "now" by `addTrustedIssuer` even when the
+  /// caller supplies an older timestamp — this prevents a buggy
+  /// renderer from back-dating the addition.
+  addedAt: string;
 }
 
 /// Dev-only payload accepted by the optional
@@ -2286,6 +2545,28 @@ export interface KChatBridge {
   /// [`install`]. Rejects with a typed error when the bridge is
   /// built without `kchat-dev-issuer`.
   devMintMembership(request: KChatDevMintRequest): Promise<KChatInstallRequest>;
+  /// Point the trust-store at a JSON file on disk. The Electron
+  /// main process calls this once at app start with
+  /// `<userData>/kchat_trust.json`. The file is created lazily on
+  /// first add; missing-file is treated as "empty allowlist". The
+  /// current allowlist (after reading the file, if any) is
+  /// returned. Idempotent — safe to call multiple times.
+  setTrustStorePath(path: string): Promise<TrustedIssuer[]>;
+  /// Snapshot the current trusted-issuer allowlist.
+  trustedIssuers(): Promise<TrustedIssuer[]>;
+  /// Add (or update) a trusted issuer. If an entry with the same
+  /// `issuerPublicKey` already exists, its label and timestamp
+  /// are replaced — same call is the "edit label" path. The
+  /// returned list is the post-add snapshot. Persisted to the
+  /// configured trust-store file (if any) via an atomic
+  /// temp-file-then-rename.
+  addTrustedIssuer(issuer: TrustedIssuer): Promise<TrustedIssuer[]>;
+  /// Remove the entry with the given `issuerPublicKey`. No-op if
+  /// no matching entry exists (returns the unchanged list). When
+  /// the last entry is removed, the bridge collapses back to
+  /// "accept any issuer" (`issuerTrusted` becomes `true` for any
+  /// active membership).
+  removeTrustedIssuer(issuerPublicKey: string): Promise<TrustedIssuer[]>;
 }
 
 declare global {

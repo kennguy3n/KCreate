@@ -39,6 +39,7 @@ import type {
   ExportFormat,
   ExportPreset,
   ExportPresetBridge,
+  FillStyle,
   FrameInfo,
   InspectCode,
   JpegExportOptions,
@@ -94,6 +95,9 @@ import type {
   PreflightRequest,
   ScreenshotElement,
   ScreenshotRequest,
+  TextRegion,
+  DetectTextRegionsOptions,
+  InsertTextLayerForRegionRequest,
   ColorBridge,
   ColorSettings,
   ColorSpaceName,
@@ -114,6 +118,7 @@ import type {
   KChatLocalIdentity,
   KChatMembershipStatus,
   SessionStartReport,
+  TrustedIssuer,
 } from "../../shared/scene";
 
 type FrameInfoSnake = {
@@ -283,6 +288,12 @@ type NodeInfoSnake = {
   /// `bounds` directly on every NodeInfo so the renderer can render
   /// hotspots / hit-test overlays without a second IPC round trip.
   bounds: BoundsSnake;
+  /// Monotonically-increasing revision counter. Mirrors
+  /// `kcreate_core::node::Node::version` and is carried verbatim
+  /// over the bridge as `version` (not `node_version`) — used by
+  /// renderer panels as a dependency-array signal so their hydrate
+  /// effects refire after undo/redo / collab edits on the same node.
+  version: number;
   /// Already camelCased on the Rust side via #[serde(rename)]. We
   /// pass it through verbatim because the inner field names are
   /// also camelCased (definitionId / activeVariantId).
@@ -329,6 +340,7 @@ function nodeFromSnake(n: NodeInfoSnake): NodeInfo {
       width: n.bounds.width,
       height: n.bounds.height,
     },
+    version: n.version,
     ...(n.componentInstance ? { componentInstance: n.componentInstance } : {}),
     ...(n.metadata ? { metadata: n.metadata } : {}),
   };
@@ -429,6 +441,22 @@ const document: DocumentBridge = {
       nodeId,
       JSON.stringify(changes),
     );
+  },
+  async nodeFill(nodeId: string): Promise<FillStyle | null> {
+    // The Rust bridge returns a JSON-string-encoded `FillStyle`
+    // (or `null` for unknown ids) so its tagged-enum shape survives
+    // the napi-rs boundary intact. Parse here so renderer callers
+    // see the typed shape, not a raw string. A parse failure
+    // bubbles up; we don't try to recover because a malformed
+    // payload is a wire-format bug, not a recoverable user error.
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/document/nodeFill",
+      nodeId,
+    )) as string | null;
+    if (raw === null) {
+      return null;
+    }
+    return JSON.parse(raw) as FillStyle;
   },
   async deleteNode(nodeId: string): Promise<void> {
     await ipcRenderer.invoke("kcreate/document/deleteNode", nodeId);
@@ -1141,6 +1169,28 @@ const aiModel: AiModelBridge = {
       tolerance,
     )) as string;
   },
+  async detectTextRegions(
+    nodeId: string,
+    options?: DetectTextRegionsOptions | null,
+  ): Promise<TextRegion[]> {
+    const optsJson = options === undefined || options === null
+      ? "null"
+      : JSON.stringify(options);
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/ai/detectTextRegions",
+      nodeId,
+      optsJson,
+    )) as string;
+    return JSON.parse(raw) as TextRegion[];
+  },
+  async insertTextLayerForRegion(
+    request: InsertTextLayerForRegionRequest,
+  ): Promise<string> {
+    return (await ipcRenderer.invoke(
+      "kcreate/ai/insertTextLayerForRegion",
+      JSON.stringify(request),
+    )) as string;
+  },
   async listModelPacks(): Promise<ModelPack[]> {
     const raw = (await ipcRenderer.invoke(
       "kcreate/ai/listModelPacks",
@@ -1531,6 +1581,35 @@ const kchat: KChatBridge = {
       JSON.stringify(request),
     )) as string;
     return JSON.parse(raw) as KChatInstallRequest;
+  },
+  async setTrustStorePath(p: string): Promise<TrustedIssuer[]> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/kchat/set-trust-store-path",
+      p,
+    )) as string;
+    return JSON.parse(raw) as TrustedIssuer[];
+  },
+  async trustedIssuers(): Promise<TrustedIssuer[]> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/kchat/trusted-issuers",
+    )) as string;
+    return JSON.parse(raw) as TrustedIssuer[];
+  },
+  async addTrustedIssuer(issuer: TrustedIssuer): Promise<TrustedIssuer[]> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/kchat/add-trusted-issuer",
+      JSON.stringify(issuer),
+    )) as string;
+    return JSON.parse(raw) as TrustedIssuer[];
+  },
+  async removeTrustedIssuer(
+    issuerPublicKey: string,
+  ): Promise<TrustedIssuer[]> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/kchat/remove-trusted-issuer",
+      issuerPublicKey,
+    )) as string;
+    return JSON.parse(raw) as TrustedIssuer[];
   },
 };
 

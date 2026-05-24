@@ -367,9 +367,25 @@ pub struct NodeInfo {
     /// top of the rendered artboard; previously the wire shape elided
     /// `bounds`, so hotspots never appeared — see PR #5 fix.
     pub bounds: Bounds,
+    /// Monotonically-increasing revision counter. Mirrors
+    /// `kcreate_core::node::Node::version`. Used by renderer panels
+    /// (`FillSection`, `TextFramePanel`, `OpenTypePanel`) as a
+    /// dependency-array signal so their hydrate `useEffect` refires
+    /// after undo/redo / collab edits on the same node id. Carried as
+    /// `f64` because JS `number` (IEEE-754 double) can faithfully
+    /// represent every integer up to 2^53 — `version` increments
+    /// once per mutation so even a million edits per second for 100
+    /// years stays well within range. Using `BigInt` would force
+    /// every renderer panel onto `Number(node.version)` conversions
+    /// and break the existing `NodeInfo: { version: number }` shape.
+    pub version: f64,
 }
 
 impl From<CoreNodeInfo> for NodeInfo {
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "u64 → f64 is exact for values ≤ 2^53; Node::version bumps once per mutation so any realistic editing session stays well under that bound"
+    )]
     fn from(c: CoreNodeInfo) -> Self {
         Self {
             id: c.id.to_string(),
@@ -380,6 +396,7 @@ impl From<CoreNodeInfo> for NodeInfo {
             visible: c.visible,
             locked: c.locked,
             bounds: c.bounds.into(),
+            version: c.version as f64,
         }
     }
 }
@@ -538,7 +555,10 @@ pub fn document_create_node(
 }
 
 /// Update a node in place. `changes_json` is a JSON object with
-/// optional `name`, `visible`, `locked`, `metadata` fields.
+/// optional `name`, `visible`, `locked`, `metadata`, and `fill`
+/// fields. The `fill` field, when present, is the `kind`-tagged
+/// JSON shape of [`kcreate_core::node::FillStyle`] — see
+/// [`crate::document::UpdateNodeProps::fill`] for the contract.
 #[napi]
 #[allow(clippy::needless_pass_by_value)]
 pub fn document_update_node(node_id: String, changes_json: String) -> NapiResult<()> {
@@ -550,6 +570,23 @@ pub fn document_update_node(node_id: String, changes_json: String) -> NapiResult
         )
     })?;
     document::document_update_node(id, &changes).map_err(map_doc_err)
+}
+
+/// Read the current `FillStyle` for a node, returned as a serialised
+/// JSON string. Returns `null` when the node id is not in the
+/// document. The renderer-side `FillSection` panel uses this to
+/// populate its form on selection change; edits go back through
+/// [`document_update_node`] with the new `fill` field.
+///
+/// String-typed rather than typed because `FillStyle` is a
+/// tagged-enum (`kind` discriminator) that napi-rs can't faithfully
+/// mirror without a hand-rolled wire-format struct per variant — and
+/// the renderer needs the round-trippable JSON shape anyway.
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn document_node_fill(node_id: String) -> NapiResult<Option<String>> {
+    let id = parse_uuid(&node_id)?;
+    document::document_node_fill(id).map_err(map_doc_err)
 }
 
 /// Remove a node and its descendants.
@@ -1677,6 +1714,31 @@ pub fn ai_smart_select(node_id: String, x: u32, y: u32, tolerance: f64) -> NapiR
     phase2::ai_smart_select(id, x, y, tolerance).map_err(map_doc_err)
 }
 
+/// Detect text-like regions in the raster layer identified by
+/// `node_id`. Returns the JSON-serialised `Vec<TextRegion>` from
+/// `kcreate_ai::ocr::detect_text_regions`. `options_json` accepts
+/// `"null"` or `""` to use detector defaults; otherwise must
+/// deserialise to `kcreate_ai::DetectTextRegionsOptions`.
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn ai_detect_text_regions(node_id: String, options_json: String) -> NapiResult<String> {
+    let id = parse_uuid(&node_id)?;
+    phase2::ai_detect_text_regions(id, &options_json).map_err(map_doc_err)
+}
+
+/// Materialise a detected text region as a new `TextLayer` sibling
+/// of the source raster. `request_json` must deserialise to
+/// `phase2::InsertTextLayerForRegionRequest`. Returns the new
+/// node id (UUID).
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn ai_insert_text_layer_for_region(request_json: String) -> NapiResult<String> {
+    let req: phase2::InsertTextLayerForRegionRequest = serde_json::from_str(&request_json)
+        .map_err(|e| napi::Error::from_reason(format!("invalid request: {e}")))?;
+    let id = phase2::ai_insert_text_layer_for_region(&req).map_err(map_doc_err)?;
+    Ok(id.to_string())
+}
+
 /// Return the registry of locally available / installable AI model
 /// packs.
 #[napi]
@@ -2226,6 +2288,85 @@ pub fn kchat_derive_local_identity(seed_b64: String) -> NapiResult<String> {
         NapiError::new(
             Status::GenericFailure,
             format!("kcreate_bridge: kchat_derive_local_identity serialize: {e}"),
+        )
+    })
+}
+
+/// Configure the on-disk path for the KChat trusted-issuer
+/// allowlist. The Electron main process should call this once at
+/// startup with `<userData>/kchat_trust.json`. Reads the file at
+/// the supplied path (or starts with an empty list if missing)
+/// and replaces the in-memory store. Subsequent
+/// `kchat_add_trusted_issuer` / `kchat_remove_trusted_issuer`
+/// calls atomically persist back to this path.
+///
+/// Returns the current list as a JSON `TrustedIssuer[]`.
+#[cfg(feature = "collab")]
+#[napi]
+pub fn kchat_set_trust_store_path(path: String) -> NapiResult<String> {
+    let issuers = crate::collab::kchat_set_trust_store_path(std::path::PathBuf::from(path))
+        .map_err(map_session_err)?;
+    serde_json::to_string(&issuers).map_err(|e| {
+        NapiError::new(
+            Status::GenericFailure,
+            format!("kcreate_bridge: kchat_set_trust_store_path serialize: {e}"),
+        )
+    })
+}
+
+/// Return the current trusted-issuer allowlist as a JSON
+/// `TrustedIssuer[]`. Cheap clone of the in-memory list; never
+/// reads from disk (the on-disk list is loaded by
+/// `kchat_set_trust_store_path`).
+#[cfg(feature = "collab")]
+#[napi]
+pub fn kchat_trusted_issuers() -> NapiResult<String> {
+    let issuers = crate::collab::kchat_list_trusted_issuers();
+    serde_json::to_string(&issuers).map_err(|e| {
+        NapiError::new(
+            Status::GenericFailure,
+            format!("kcreate_bridge: kchat_trusted_issuers serialize: {e}"),
+        )
+    })
+}
+
+/// Add (or update) a trusted issuer. `issuer_json` deserialises
+/// to `TrustedIssuer { issuer_public_key, label, added_at? }`. If
+/// an entry with the same `issuer_public_key` exists, its label
+/// and timestamp are replaced — so the renderer can re-call this
+/// to rename an entry. Persists to the configured path. Returns
+/// the updated list.
+#[cfg(feature = "collab")]
+#[napi]
+pub fn kchat_add_trusted_issuer(issuer_json: String) -> NapiResult<String> {
+    let issuer: crate::collab::TrustedIssuer = serde_json::from_str(&issuer_json).map_err(|e| {
+        NapiError::new(
+            Status::InvalidArg,
+            format!("kcreate_bridge: kchat_add_trusted_issuer request: {e}"),
+        )
+    })?;
+    let updated = crate::collab::kchat_add_trusted_issuer(issuer).map_err(map_session_err)?;
+    serde_json::to_string(&updated).map_err(|e| {
+        NapiError::new(
+            Status::GenericFailure,
+            format!("kcreate_bridge: kchat_add_trusted_issuer serialize: {e}"),
+        )
+    })
+}
+
+/// Remove a trusted issuer by its `issuer_public_key`. No-ops when
+/// no matching entry exists. Persists to the configured path.
+/// Returns the updated list. Removing the last entry collapses
+/// the allowlist back to "accept any issuer" mode.
+#[cfg(feature = "collab")]
+#[napi]
+pub fn kchat_remove_trusted_issuer(issuer_public_key: String) -> NapiResult<String> {
+    let updated =
+        crate::collab::kchat_remove_trusted_issuer(&issuer_public_key).map_err(map_session_err)?;
+    serde_json::to_string(&updated).map_err(|e| {
+        NapiError::new(
+            Status::GenericFailure,
+            format!("kcreate_bridge: kchat_remove_trusted_issuer serialize: {e}"),
         )
     })
 }

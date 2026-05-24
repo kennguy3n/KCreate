@@ -18,6 +18,7 @@ import {
   type ExtractedColor,
   type LayoutSuggestion,
   type NodeInfo,
+  type TextRegion,
 } from "../../../shared/scene";
 import { colors, radius, spacing } from "../styles/tokens";
 import { LlmChatPanel } from "./LlmChatPanel";
@@ -165,6 +166,12 @@ export function AIAssistPanel({
       <PaletteSection selected={selectedNode} onStatus={onStatus} />
       <hr style={separatorStyle} />
       <SmartSelectSection selected={selectedNode} onStatus={onStatus} />
+      <hr style={separatorStyle} />
+      <OcrSection
+        selected={selectedNode}
+        onStatus={onStatus}
+        onApplied={onApplied}
+      />
       <hr style={separatorStyle} />
 
       <ModelManager onStatus={onStatus} />
@@ -991,6 +998,223 @@ const numberInputStyle: React.CSSProperties = {
   background: colors.bg,
   color: colors.text,
 };
+
+/**
+ * Text-region detection section. Visible whenever a `RasterLayer`
+ * is selected — runs the local CV detector
+ * (`kcreate_ai::ocr::detect_text_regions`) and renders each
+ * detected region as a row with an "Insert as text layer" button.
+ *
+ * The detector is honest about its scope: it reports text-shaped
+ * bboxes, not characters. Clicking insert materialises a new
+ * `TextLayer` sibling of the source raster positioned over the
+ * region; the user types the actual recognised text into the
+ * layer after insertion.
+ *
+ * State machine mirrors the other AI sections:
+ *
+ *   idle → running → (done | error) → idle (on new selection)
+ *
+ * Each detect run gets a fresh request token (same pattern as
+ * `LayoutAssistSection` and `SmartSelectSection`) so a re-detect
+ * during an in-flight call drops the stale result rather than
+ * overwriting the fresh one.
+ */
+function OcrSection({
+  selected,
+  onStatus,
+  onApplied,
+}: {
+  selected: NodeInfo | null;
+  onStatus: (msg: string | null) => void;
+  onApplied: () => void;
+}): JSX.Element {
+  const isRaster = selected !== null && selected.nodeType === "RasterLayer";
+  const nodeId = isRaster ? selected.id : null;
+
+  type OcrPhase = "idle" | "running" | "done" | "error";
+  const [phase, setPhase] = useState<OcrPhase>("idle");
+  const [regions, setRegions] = useState<TextRegion[]>([]);
+  const [error, setError] = useState<string | null>(null);
+  // Per-row insert phase: tracks which region is currently being
+  // materialised so we can disable its button (and only its
+  // button) while the bridge call is in flight. Keyed by region
+  // index because the bbox tuple isn't a stable identity across
+  // re-detect runs.
+  const [insertingIndex, setInsertingIndex] = useState<number | null>(null);
+  // Request-token guard — see LayoutAssistSection for the full
+  // rationale; the same pattern applies here.
+  const requestTokenRef = useRef(0);
+
+  // Reset on selection change.
+  useEffect(() => {
+    setPhase("idle");
+    setRegions([]);
+    setError(null);
+    setInsertingIndex(null);
+    requestTokenRef.current += 1;
+  }, [nodeId]);
+
+  if (!isRaster || nodeId === null) {
+    return (
+      <section style={cardStyle}>
+        <div style={cardHeaderStyle}>
+          <strong>Text region detection</strong>
+          <span style={badgeStyle("ok")}>Local CPU</span>
+        </div>
+        <p style={paragraphStyle}>
+          Select a <b>RasterLayer</b> to detect text-shaped regions
+          and insert each one as a new text layer at the detected
+          bbox.
+        </p>
+      </section>
+    );
+  }
+
+  const run = async (): Promise<void> => {
+    requestTokenRef.current += 1;
+    const token = requestTokenRef.current;
+    setPhase("running");
+    setError(null);
+    setRegions([]);
+    onStatus("Scanning raster for text-shaped regions…");
+    try {
+      const detected = await window.kcreate.aiModel.detectTextRegions(nodeId);
+      if (requestTokenRef.current !== token) return;
+      setRegions(detected);
+      setPhase("done");
+      onStatus(
+        detected.length === 0
+          ? "No text-shaped regions detected."
+          : `Detected ${detected.length} text region${detected.length === 1 ? "" : "s"}.`,
+      );
+    } catch (e) {
+      if (requestTokenRef.current !== token) return;
+      const msg = e instanceof Error ? e.message : String(e);
+      setError(msg);
+      setPhase("error");
+      onStatus(`Text-region detection failed: ${msg}`);
+    }
+  };
+
+  const insertRegion = async (region: TextRegion, idx: number): Promise<void> => {
+    setInsertingIndex(idx);
+    onStatus(
+      `Inserting text layer over region ${idx + 1} of ${regions.length}…`,
+    );
+    try {
+      await window.kcreate.aiModel.insertTextLayerForRegion({
+        rasterNodeId: nodeId,
+        region,
+      });
+      onStatus(
+        `Text layer inserted for region ${idx + 1}. Type the recognised text into the new layer.`,
+      );
+      onApplied();
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      onStatus(`Text-layer insert failed: ${msg}`);
+    } finally {
+      setInsertingIndex(null);
+    }
+  };
+
+  return (
+    <section style={cardStyle}>
+      <div style={cardHeaderStyle}>
+        <strong>Text region detection</strong>
+        <span style={badgeStyle("ok")}>Local CPU</span>
+      </div>
+      <p style={paragraphStyle}>
+        Detector reports text-shaped bboxes — character recognition
+        is not part of this pass. Each row is one detected line; the
+        inserted <b>TextLayer</b> sits over the region with the
+        estimated font size and an empty text body for you to type
+        into.
+      </p>
+      <button
+        type="button"
+        onClick={() => {
+          void run();
+        }}
+        disabled={phase === "running"}
+        style={primaryBtn(phase === "running")}
+        aria-label="Detect text regions"
+      >
+        {phase === "running" ? "Detecting…" : "Detect text regions"}
+      </button>
+      {phase === "error" && error !== null ? (
+        <div style={statusStripStyle("err")}>{error}</div>
+      ) : null}
+      {phase === "done" && regions.length === 0 ? (
+        <div style={statusStripStyle("ok")}>
+          No text-shaped regions found. Try adjusting the source
+          raster&apos;s contrast — the default detector threshold
+          targets dark-on-light screenshots.
+        </div>
+      ) : null}
+      {regions.length > 0 ? (
+        <ul
+          style={{
+            margin: 0,
+            padding: 0,
+            listStyle: "none",
+            display: "flex",
+            flexDirection: "column",
+            gap: 4,
+          }}
+        >
+          {regions.map((r, idx) => {
+            const inserting = insertingIndex === idx;
+            // The detector emits at most a few dozen lines per
+            // image and we drive the row list off the detector
+            // output, which is a snapshot we hold for the lifetime
+            // of this `done` phase — `regions` doesn't reorder, so
+            // the array index is a stable key. Same reasoning as
+            // the gradient stop list in RightPanel's FillSection.
+            return (
+              <li
+                key={idx}
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 6,
+                  fontSize: 11,
+                  background: colors.bg,
+                  border: `1px solid ${colors.border}`,
+                  borderRadius: radius.card / 2,
+                  padding: "4px 6px",
+                }}
+              >
+                <span
+                  style={{
+                    flex: 1,
+                    fontFamily: monoStyle.fontFamily,
+                    color: colors.text,
+                  }}
+                  title={`region ${idx + 1}: ${r.width}×${r.height} px @ (${r.x}, ${r.y}); glyphs=${r.glyphCount}, est chars=${r.estimatedCharCount}`}
+                >
+                  {`${r.width}×${r.height} @ (${r.x}, ${r.y}) · ${r.glyphCount} glyphs · ~${r.estimatedCharCount} chars`}
+                </span>
+                <button
+                  type="button"
+                  onClick={() => {
+                    void insertRegion(r, idx);
+                  }}
+                  disabled={insertingIndex !== null}
+                  style={secondaryBtn(insertingIndex !== null)}
+                  aria-label={`Insert text layer for region ${idx + 1}`}
+                >
+                  {inserting ? "Inserting…" : "Insert text layer"}
+                </button>
+              </li>
+            );
+          })}
+        </ul>
+      ) : null}
+    </section>
+  );
+}
 
 function KV({
   label,

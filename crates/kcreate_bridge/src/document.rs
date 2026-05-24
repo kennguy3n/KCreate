@@ -261,6 +261,20 @@ pub struct NodeInfo {
     /// directly (32 bytes per node is well under the cost of a second
     /// round trip per node).
     pub bounds: BoundsInfo,
+    /// Monotonically-increasing revision counter sourced from
+    /// `kcreate_core::node::Node::version`. Bumped on every `touch()`
+    /// (i.e. on every mutation, from any source: bridge API calls,
+    /// undo/redo, future collab events). Renderer panels that hydrate
+    /// node-scoped data the `NodeInfo` payload deliberately doesn't
+    /// carry (`FillSection`'s `style.fill`, `TextFramePanel`'s
+    /// `text_frame_options`, `OpenTypePanel`'s OpenType features)
+    /// key their fetch effect on `[node.id, node.version]` so the
+    /// effect refires after undo/redo / remote-peer edits even when
+    /// `node.id` is stable. Carried over the bridge as `u64` and
+    /// truncated to `f64` at the napi boundary — `version` increments
+    /// once per mutation so even a million mutations per second for
+    /// 100 years stays well below 2^53.
+    pub version: u64,
     /// Present iff `node_type == "ComponentLayer"` and the node
     /// carries a parseable `component_instance` metadata payload.
     /// Renderer panels read this to drive the variant switcher.
@@ -320,6 +334,7 @@ impl From<&Node> for NodeInfo {
             visible: n.visible,
             locked: n.locked,
             bounds: n.bounds.into(),
+            version: n.version,
             component_instance,
             metadata: n.metadata.clone(),
         }
@@ -909,6 +924,18 @@ pub struct UpdateNodeProps {
     pub locked: Option<bool>,
     #[serde(default)]
     pub metadata: Option<HashMap<String, serde_json::Value>>,
+    /// Optional override for the node's fill style. When `Some`, the
+    /// node's `style.fill` is replaced wholesale (i.e. switching from
+    /// `Solid` to `Gradient` or vice versa is supported by sending the
+    /// new variant). The renderer-side `FillSection` panel uses this
+    /// to commit user edits in the colour / gradient stop editors.
+    ///
+    /// Decoupled from `metadata` so the FillEditor doesn't have to
+    /// know that fill lives on `node.style` vs `node.metadata` —
+    /// the bridge owns that layering detail. Mirrors `FillStyle` 1:1
+    /// via the `kind`-tagged enum serde produces.
+    #[serde(default)]
+    pub fill: Option<kcreate_core::node::FillStyle>,
 }
 
 /// Apply an in-place update to a node.
@@ -936,11 +963,39 @@ pub fn document_update_node(id: Uuid, changes: &UpdateNodeProps) -> Result<()> {
     if let Some(meta) = &changes.metadata {
         node.metadata.clone_from(meta);
     }
+    if let Some(fill) = &changes.fill {
+        node.style.fill = fill.clone();
+    }
     node.touch();
     ws.project.modified_at = Utc::now();
     let _ = sync_scene_locked(&mut guard);
     drop(guard);
     Ok(())
+}
+
+/// Read the current `FillStyle` for a node, serialised as a JSON
+/// string. Returns `None` when the node id is not in the document.
+///
+/// Renderer-side companion to [`document_update_node`]'s new `fill`
+/// field: `FillSection` calls this on selection change to populate
+/// its form, then writes back through `document_update_node`. Lives
+/// here rather than getting hoisted onto `NodeInfo` because the
+/// tree-listing path (`document_list_nodes` / PageNavigator) doesn't
+/// need fill data for every node and pre-serialising the enum would
+/// inflate every tree payload.
+pub fn document_node_fill(id: Uuid) -> Result<Option<String>> {
+    let guard = slot().lock();
+    let ws = guard.as_ref().ok_or(DocumentBridgeError::NoProject)?;
+    let Some(node) = ws.project.document.get_node(id) else {
+        return Ok(None);
+    };
+    // Goes through `From<serde_json::Error>` on the error variant.
+    // FillStyle is a Serialize-derived plain enum, so this is
+    // infallible in practice — but unwrapping would lose us the
+    // structured error type if a future variant adds a Map-keyed
+    // value or other tag that serde-json can't represent.
+    let json = serde_json::to_string(&node.style.fill)?;
+    Ok(Some(json))
 }
 
 /// Remove a node and all its descendants.
@@ -4207,6 +4262,112 @@ mod tests {
         project_close();
     }
 
+    /// Wire-format lockstep test for the `fill` field added to
+    /// `UpdateNodeProps`. Deserialises every `FillStyle` variant
+    /// from the JSON shape the renderer emits, applies it through
+    /// `document_update_node`, and then reads it back through
+    /// `document_node_fill` (the renderer's read path). Catches
+    /// drift in either direction.
+    ///
+    /// The renderer-side TypeScript types are in
+    /// `apps/desktop/shared/scene.ts`; the wire shape we test
+    /// here matches the variants documented in `FillStyle`'s
+    /// docstring there.
+    #[test]
+    #[serial]
+    fn update_node_fill_wire_format_round_trip() {
+        use kcreate_core::node::FillStyle;
+
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("fill_wire", dir.path()).expect("create");
+        let page_id = document_get_tree().expect("tree")[0].id;
+        let id = document_create_node(
+            "VectorLayer",
+            Some(page_id),
+            &CreateNodeProps {
+                name: Some("Rect".to_string()),
+                ..Default::default()
+            },
+        )
+        .expect("create");
+
+        // 1) Renderer sends a Solid fill: `{kind:"solid", r,g,b,a}`.
+        let solid_json = r#"{
+            "fill": { "kind": "solid", "r": 0.25, "g": 0.5, "b": 0.75, "a": 1.0 }
+        }"#;
+        let solid: UpdateNodeProps = serde_json::from_str(solid_json).expect("parse solid update");
+        document_update_node(id, &solid).expect("apply solid");
+
+        let read = document_node_fill(id)
+            .expect("read solid")
+            .expect("present");
+        let parsed: FillStyle = serde_json::from_str(&read).expect("parse fill");
+        match parsed {
+            FillStyle::Solid(rgba) => {
+                // RgbaColor channels are f32 in the document graph
+                // (renderer-bound); the wire format is JSON numbers
+                // (f64). Use the wider epsilon to tolerate the
+                // f64 → f32 narrowing on parse.
+                assert!((rgba.r - 0.25).abs() < f32::EPSILON);
+                assert!((rgba.g - 0.5).abs() < f32::EPSILON);
+                assert!((rgba.b - 0.75).abs() < f32::EPSILON);
+                assert!((rgba.a - 1.0).abs() < f32::EPSILON);
+            }
+            other => panic!("expected Solid, got {other:?}"),
+        }
+
+        // 2) Renderer sends a Linear gradient: the outer `kind` is
+        //    "gradient" and the inner `shape` is "linear"; serde
+        //    flattens the inner enum's fields into the outer object.
+        let linear_json = r#"{
+            "fill": {
+                "kind": "gradient",
+                "shape": "linear",
+                "from": { "x": 0.0, "y": 0.0 },
+                "to":   { "x": 1.0, "y": 0.0 },
+                "stops": [
+                    { "offset": 0.0, "color": { "r": 1.0, "g": 0.0, "b": 0.0, "a": 1.0 } },
+                    { "offset": 1.0, "color": { "r": 0.0, "g": 0.0, "b": 1.0, "a": 1.0 } }
+                ]
+            }
+        }"#;
+        let linear: UpdateNodeProps =
+            serde_json::from_str(linear_json).expect("parse linear update");
+        document_update_node(id, &linear).expect("apply linear");
+
+        let read = document_node_fill(id)
+            .expect("read gradient")
+            .expect("present");
+        let parsed: FillStyle = serde_json::from_str(&read).expect("parse fill");
+        match parsed {
+            FillStyle::Gradient(kcreate_core::node::GradientKind::Linear { stops, .. }) => {
+                assert_eq!(stops.len(), 2, "two stops in the round-tripped fill");
+                assert!((stops[0].offset - 0.0).abs() < f64::EPSILON);
+                assert!((stops[1].offset - 1.0).abs() < f64::EPSILON);
+            }
+            other => panic!("expected Linear gradient, got {other:?}"),
+        }
+
+        // 3) Renderer sends `None` to clear the fill.
+        let none_json = r#"{ "fill": { "kind": "none" } }"#;
+        let none: UpdateNodeProps = serde_json::from_str(none_json).expect("parse none update");
+        document_update_node(id, &none).expect("apply none");
+
+        let read = document_node_fill(id).expect("read none").expect("present");
+        let parsed: FillStyle = serde_json::from_str(&read).expect("parse fill");
+        assert!(matches!(parsed, FillStyle::None));
+
+        // 4) Unknown node id → `Ok(None)`.
+        let unknown = Uuid::new_v4();
+        assert!(
+            document_node_fill(unknown).expect("read unknown").is_none(),
+            "unknown node id should yield Ok(None), not a hard error"
+        );
+
+        project_close();
+    }
+
     /// Regression test for PR #5 Devin Review BUG-0001: the
     /// `NodeInfo` wire shape must carry `bounds` so the renderer's
     /// PrototypePlayer can position hotspot rectangles. Previously
@@ -4251,6 +4412,65 @@ mod tests {
         assert!(json.contains("\"width\":800"));
         let parsed: NodeInfo = serde_json::from_str(&json).expect("round-trip");
         assert_eq!(parsed.bounds, node.bounds);
+        project_close();
+    }
+
+    /// Pins the `NodeInfo::version` wire-format contract. The field
+    /// is the dependency-array signal that lets renderer panels
+    /// (`FillSection`, `TextFramePanel`, `OpenTypePanel`) refire
+    /// their hydrate `useEffect` after undo/redo / collab mutations
+    /// on the same selected node id. If this assertion ever stops
+    /// holding — i.e. mutating a node via `document_update_node`
+    /// stops bumping the wire-format `version` — every panel that
+    /// keys on `[node.id, node.version]` silently goes stale and
+    /// the user's next commit clobbers the just-mutated state.
+    #[test]
+    #[serial]
+    fn node_info_version_bumps_on_update() {
+        use kcreate_core::node::{FillStyle, RgbaColor};
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("version_wire", dir.path()).expect("create");
+        let id = document_create_node("VectorLayer", None, &CreateNodeProps::default())
+            .expect("create node");
+        let v0 = document_get_tree()
+            .expect("tree")
+            .iter()
+            .find(|n| n.id == id)
+            .expect("present")
+            .version;
+        let changes = UpdateNodeProps {
+            fill: Some(FillStyle::Solid(RgbaColor {
+                r: 1.0,
+                g: 0.0,
+                b: 0.0,
+                a: 1.0,
+            })),
+            ..UpdateNodeProps::default()
+        };
+        document_update_node(id, &changes).expect("update fill");
+        let v1 = document_get_tree()
+            .expect("tree")
+            .iter()
+            .find(|n| n.id == id)
+            .expect("present")
+            .version;
+        assert!(
+            v1 > v0,
+            "node.version must strictly increase after document_update_node; v0={v0}, v1={v1}"
+        );
+        // And it survives JSON round-tripping under serde
+        // (mirroring the napi-rs `#[napi(object)]` field-by-field
+        // shape).
+        let node = document_get_tree()
+            .expect("tree")
+            .into_iter()
+            .find(|n| n.id == id)
+            .expect("present");
+        let json = serde_json::to_string(&node).expect("serialise");
+        assert!(json.contains("\"version\""));
+        let parsed: NodeInfo = serde_json::from_str(&json).expect("round-trip");
+        assert_eq!(parsed.version, node.version);
         project_close();
     }
 

@@ -1,11 +1,15 @@
 import { useEffect, useMemo, useState } from "react";
 
 import type {
+  FillStyle,
   FlexLayout,
+  GradientStop,
   GridLayout,
   InspectCode,
   NodeInfo,
+  Point2D,
   ProjectInfo,
+  RgbaColor,
   SessionLockEntry,
   UpdateNodeProps,
 } from "../../../shared/scene";
@@ -383,6 +387,23 @@ function PropertiesPanel({
         <Readonly>{node.children.length}</Readonly>
       </Field>
       {layout ? <LayoutControls node={node} layout={layout} /> : null}
+      {/*
+       * FillSection only renders for node types whose paint
+       * pipeline actually honours `style.fill`. Today that's
+       * `VectorLayer` — see `scene_sync.rs::node_fill`. Future
+       * node types that gain fill support should be added here
+       * (and to the gradient renderer; today the renderer paints
+       * gradients only after we expand it). Keeping the gate
+       * here rather than inside `FillSection` means we don't
+       * render an "always disabled" panel on raster / text
+       * layers where fill simply doesn't apply.
+       */}
+      {node.nodeType === "VectorLayer" ? (
+        <>
+          <hr style={hrStyle} />
+          <FillSection node={node} onChange={onChange} disabled={disabled} />
+        </>
+      ) : null}
       {node.nodeType === "TextLayer" ? (
         <>
           <hr style={hrStyle} />
@@ -479,6 +500,844 @@ const DEFAULT_GRID: GridLayout = {
   column_gap: 8,
   padding: { top: 0, right: 0, bottom: 0, left: 0 },
 };
+
+/**
+ * Per-node fill editor. Wraps the existing `style.fill` field on
+ * the document graph; reads via `kcreate.document.nodeFill(id)`
+ * and writes via `updateNode({ fill: ... })` (the `fill` field on
+ * `UpdateNodeProps` mirrors `kcreate_core::node::FillStyle`
+ * verbatim — see `apps/desktop/shared/scene.ts::FillStyle`).
+ *
+ * Three modes: `none`, `solid`, `gradient`. Solid edits surface
+ * an HTML5 colour picker + an alpha slider; gradient edits surface
+ * a list of stops with offset + colour, plus add / remove
+ * controls and a linear / radial shape toggle. Because the
+ * containing `PropertiesPanel` already wraps the whole body in a
+ * `<fieldset disabled>` (see the comment near the fieldset open),
+ * every native `<input>` / `<button>` here inherits the disabled
+ * cascade — but we ALSO take a `disabled` prop and gate the
+ * gradient-stop drag handles + add/remove buttons explicitly. The
+ * stop drag handles are styled `<div>`s, not `<input>`s, so they
+ * sit outside the HTML5 disabled cascade and need the explicit
+ * gate to stay correct under remote locks.
+ *
+ * State management: a local React state holds the editable
+ * `FillStyle`; we hydrate it from the bridge on selection change
+ * via `kcreate.document.nodeFill`. Every edit is committed
+ * immediately to the bridge (no draft / commit step) because
+ * the colour picker and the offset slider are continuous inputs
+ * — buffering would feel laggy. The operation log dedup in
+ * `kcreate_core::operation::OperationLog` collapses adjacent
+ * `document_update_node` ops on the same node into one undo step,
+ * so the resulting history is still ergonomic.
+ */
+function FillSection({
+  node,
+  onChange,
+  disabled,
+}: {
+  node: NodeInfo;
+  onChange?: (changes: UpdateNodeProps) => void;
+  disabled: boolean;
+}): JSX.Element {
+  // Hydration state as a discriminated union rather than `FillStyle | null`
+  // so the "still fetching" and "fetch failed" cases are
+  // distinguishable. The previous `null`-as-both-loading-and-error
+  // shape stranded the panel on "Loading…" forever if the bridge
+  // ever returned an error for a stable selection (bot finding on
+  // RightPanel.tsx:580 — see PR #12 Devin Review thread).
+  type HydrateState =
+    | { status: "loading" }
+    | { status: "loaded"; fill: FillStyle | null }
+    | { status: "error"; error: string };
+  const [state, setState] = useState<HydrateState>({ status: "loading" });
+  // `retryToken` exists so the user can request a re-hydrate from
+  // the error UI without us having to invalidate `node.version` /
+  // `node.id` to force the effect.
+  const [retryToken, setRetryToken] = useState(0);
+  // Dependency is `[node.id, node.version, retryToken]`: id changes
+  // on selection, `version` increments every time the node is
+  // mutated anywhere (bridge writes, undo/redo, future collab
+  // events), and `retryToken` lets the error UI re-arm. Previously
+  // the effect keyed only on `node.id`, so undo/redo on the same
+  // selected node never refired the fetch and the panel showed
+  // pre-undo data — see PR #12 Devin Review thread on
+  // RightPanel.tsx:549.
+  //
+  // Stale-while-revalidate: we deliberately do NOT reset the local
+  // state to `loading` on every refire. If we already have a
+  // `loaded` fill, keep showing it while the new fetch is in flight;
+  // only fall back to the spinner when we have nothing better to
+  // show (i.e. on the very first hydrate, or after an `error`). This
+  // closes the brief "Loading…" flash after undo/redo that the bot
+  // flagged on RightPanel.tsx:566 — the optimistic-commit case
+  // (`commit()` already wrote into `loaded`) and the undo/redo case
+  // (the new value is on its way) are now visually identical.
+  useEffect(() => {
+    let cancelled = false;
+    setState((prev) =>
+      prev.status === "loaded" ? prev : { status: "loading" },
+    );
+    void (async () => {
+      try {
+        const next = await window.kcreate.document.nodeFill(node.id);
+        if (cancelled) {
+          return;
+        }
+        setState({ status: "loaded", fill: next });
+      } catch (err) {
+        if (cancelled) {
+          return;
+        }
+        setState({
+          status: "error",
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [node.id, node.version, retryToken]);
+
+  const commit = (next: FillStyle): void => {
+    setState({ status: "loaded", fill: next });
+    onChange?.({ fill: next });
+  };
+
+  if (state.status === "loading") {
+    return (
+      <div style={{ display: "flex", flexDirection: "column", gap: spacing.xs }}>
+        <SectionLabel>Fill</SectionLabel>
+        <Hint>Loading…</Hint>
+      </div>
+    );
+  }
+
+  if (state.status === "error") {
+    return (
+      <div style={{ display: "flex", flexDirection: "column", gap: spacing.xs }}>
+        <SectionLabel>Fill</SectionLabel>
+        <Hint>Couldn’t load fill: {state.error}</Hint>
+        <button
+          type="button"
+          onClick={() => setRetryToken((n) => n + 1)}
+          disabled={disabled}
+        >
+          Retry
+        </button>
+      </div>
+    );
+  }
+
+  const fill = state.fill;
+  if (fill === null) {
+    return (
+      <div style={{ display: "flex", flexDirection: "column", gap: spacing.xs }}>
+        <SectionLabel>Fill</SectionLabel>
+        <Hint>This node does not support fills.</Hint>
+      </div>
+    );
+  }
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: spacing.xs }}>
+      <SectionLabel>Fill</SectionLabel>
+      <FillKindPicker fill={fill} onCommit={commit} />
+      {fill.kind === "solid" ? (
+        <SolidFillEditor fill={fill} onCommit={commit} />
+      ) : null}
+      {fill.kind === "gradient" ? (
+        <GradientFillEditor fill={fill} onCommit={commit} disabled={disabled} />
+      ) : null}
+    </div>
+  );
+}
+
+/// Header label for a section inside PropertiesPanel.
+function SectionLabel({ children }: { children: React.ReactNode }): JSX.Element {
+  return (
+    <span
+      style={{
+        fontSize: 11,
+        fontWeight: 600,
+        color: colors.textMuted,
+        textTransform: "uppercase",
+        letterSpacing: "0.04em",
+      }}
+    >
+      {children}
+    </span>
+  );
+}
+
+/// Three-way kind picker: None / Solid / Gradient. Switching to
+/// solid / gradient seeds a reasonable default — pure black for
+/// solid, a two-stop white → black linear gradient for gradient —
+/// so the canvas reflects the user's intent immediately rather
+/// than rendering nothing until they pick a colour.
+function FillKindPicker({
+  fill,
+  onCommit,
+}: {
+  fill: FillStyle;
+  onCommit: (next: FillStyle) => void;
+}): JSX.Element {
+  const options: Array<{ kind: FillStyle["kind"]; label: string }> = [
+    { kind: "none", label: "None" },
+    { kind: "solid", label: "Solid" },
+    { kind: "gradient", label: "Gradient" },
+  ];
+  return (
+    <div style={{ display: "flex", gap: 4 }}>
+      {options.map((opt) => {
+        const active = fill.kind === opt.kind;
+        return (
+          <button
+            key={opt.kind}
+            type="button"
+            onClick={() => {
+              if (active) {
+                return;
+              }
+              onCommit(seedFillForKind(opt.kind, fill));
+            }}
+            style={{
+              flex: 1,
+              padding: "4px 6px",
+              fontSize: 11,
+              fontWeight: 500,
+              background: active ? colors.accent : colors.bgSoft,
+              color: active ? colors.textInverse : colors.text,
+              border: `1px solid ${active ? colors.accent : colors.border}`,
+              borderRadius: 4,
+              cursor: "pointer",
+            }}
+          >
+            {opt.label}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+/// Build a sensible default `FillStyle` for a newly-picked kind.
+/// We preserve the existing solid colour when switching solid →
+/// gradient (using it as the gradient's first stop) and the first
+/// gradient stop's colour when switching gradient → solid so the
+/// transition isn't jarring.
+function seedFillForKind(
+  kind: FillStyle["kind"],
+  current: FillStyle,
+): FillStyle {
+  switch (kind) {
+    case "none":
+      return { kind: "none" };
+    case "solid": {
+      const c = pickColorFromFill(current) ?? RGBA_BLACK;
+      return { kind: "solid", ...c };
+    }
+    case "gradient": {
+      const c = pickColorFromFill(current) ?? RGBA_BLACK;
+      return {
+        kind: "gradient",
+        shape: "linear",
+        from: { x: 0, y: 0 },
+        to: { x: 1, y: 0 },
+        stops: [
+          { offset: 0, color: c },
+          { offset: 1, color: RGBA_WHITE },
+        ],
+      };
+    }
+  }
+}
+
+function pickColorFromFill(fill: FillStyle): RgbaColor | null {
+  if (fill.kind === "solid") {
+    return { r: fill.r, g: fill.g, b: fill.b, a: fill.a };
+  }
+  if (fill.kind === "gradient") {
+    const first = fill.stops[0];
+    if (first !== undefined) {
+      return first.color;
+    }
+  }
+  return null;
+}
+
+const RGBA_BLACK: RgbaColor = { r: 0, g: 0, b: 0, a: 1 };
+const RGBA_WHITE: RgbaColor = { r: 1, g: 1, b: 1, a: 1 };
+
+/// Solid fill editor: HTML5 colour picker (RGB) + alpha slider
+/// (HTML5 doesn't have a native alpha-aware picker; the OS pickers
+/// throw away alpha when round-tripped through `<input type="color">`).
+function SolidFillEditor({
+  fill,
+  onCommit,
+}: {
+  fill: Extract<FillStyle, { kind: "solid" }>;
+  onCommit: (next: FillStyle) => void;
+}): JSX.Element {
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+      <Row>
+        <Field label="Colour">
+          <input
+            type="color"
+            value={rgbaToHex(fill)}
+            onChange={(e) => {
+              const c = hexToRgba(e.target.value, fill.a);
+              onCommit({ kind: "solid", ...c });
+            }}
+            style={{
+              ...textInputStyle,
+              padding: 0,
+              height: 28,
+              cursor: "pointer",
+            }}
+          />
+        </Field>
+        <Field label={`Alpha (${(fill.a * 100).toFixed(0)}%)`}>
+          <input
+            type="range"
+            min={0}
+            max={1}
+            step={0.01}
+            value={fill.a}
+            onChange={(e) => {
+              const a = Number.parseFloat(e.target.value);
+              onCommit({ kind: "solid", r: fill.r, g: fill.g, b: fill.b, a });
+            }}
+          />
+        </Field>
+      </Row>
+    </div>
+  );
+}
+
+/// Gradient editor: shape picker, stop list, add / remove buttons.
+///
+/// The `disabled` prop is honoured here even though the parent
+/// `<fieldset disabled>` already cascades to every native `<input>`
+/// / `<button>`. We keep the explicit gate for two reasons:
+///
+/// 1. The stop offset slider is a continuous input that could be
+///    fired programmatically (e.g. from a future "snap to even
+///    offsets" affordance) without going through a click. The
+///    explicit `disabled` here protects the commit path from a
+///    non-user-driven mutation reaching the bridge.
+/// 2. The "Add stop" / "Remove stop" buttons render with a
+///    distinct affordance (greyed-out + cursor: not-allowed) so
+///    a remote peer holding the lock is unambiguous; the
+///    fieldset-disabled cursor change alone is subtle.
+function GradientFillEditor({
+  fill,
+  onCommit,
+  disabled,
+}: {
+  fill: Extract<FillStyle, { kind: "gradient" }>;
+  onCommit: (next: FillStyle) => void;
+  disabled: boolean;
+}): JSX.Element {
+  const shape: "linear" | "radial" = fill.shape;
+  const setShape = (next: "linear" | "radial"): void => {
+    if (next === shape) {
+      return;
+    }
+    // Switching shape preserves the stops but resets the
+    // geometry to a sensible default for the new shape — a
+    // diagonal linear sweep or a centred radial blob — because
+    // converting the existing geometry between the two
+    // parameterisations doesn't have an obvious right answer.
+    if (next === "linear") {
+      onCommit({
+        kind: "gradient",
+        shape: "linear",
+        from: { x: 0, y: 0 },
+        to: { x: 1, y: 0 },
+        stops: fill.stops,
+      });
+    } else {
+      onCommit({
+        kind: "gradient",
+        shape: "radial",
+        center: { x: 0.5, y: 0.5 },
+        radius: 0.5,
+        stops: fill.stops,
+      });
+    }
+  };
+
+  const setStops = (stops: GradientStop[]): void => {
+    const sorted = [...stops].sort((a, b) => a.offset - b.offset);
+    if (fill.shape === "linear") {
+      onCommit({
+        kind: "gradient",
+        shape: "linear",
+        from: fill.from,
+        to: fill.to,
+        stops: sorted,
+      });
+    } else {
+      onCommit({
+        kind: "gradient",
+        shape: "radial",
+        center: fill.center,
+        radius: fill.radius,
+        stops: sorted,
+      });
+    }
+  };
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: spacing.xs }}>
+      {/*
+       * Honest UX: the scene-sync layer's `node_fill` in
+       * `crates/kcreate_bridge/src/scene_sync.rs` returns `None`
+       * for `FillStyle::Gradient` today, so a vector layer with a
+       * gradient fill renders as invisible on the canvas (we
+       * intentionally don't fall back to "solid first stop" because
+       * that would silently misrepresent the saved gradient).
+       * Authoring still works — the gradient persists in the
+       * document graph and on disk — but users would otherwise see
+       * the shape disappear when they pick a gradient. Surface
+       * that explicitly here rather than leaving them to discover
+       * it by surprise. Will be removed once the renderer's
+       * gradient-expander path lands.
+       */}
+      <div style={gradientRenderNoticeStyle}>
+        Gradient fills are saved correctly but not yet painted on the
+        canvas. The shape will appear invisible here until the
+        gradient renderer lands; export and persistence are
+        unaffected.
+      </div>
+      <Row>
+        <button
+          type="button"
+          onClick={() => setShape("linear")}
+          disabled={disabled}
+          style={{
+            flex: 1,
+            padding: "4px 6px",
+            fontSize: 11,
+            background: shape === "linear" ? colors.accent : colors.bgSoft,
+            color: shape === "linear" ? colors.textInverse : colors.text,
+            border: `1px solid ${shape === "linear" ? colors.accent : colors.border}`,
+            borderRadius: 4,
+            cursor: disabled ? "not-allowed" : "pointer",
+          }}
+        >
+          Linear
+        </button>
+        <button
+          type="button"
+          onClick={() => setShape("radial")}
+          disabled={disabled}
+          style={{
+            flex: 1,
+            padding: "4px 6px",
+            fontSize: 11,
+            background: shape === "radial" ? colors.accent : colors.bgSoft,
+            color: shape === "radial" ? colors.textInverse : colors.text,
+            border: `1px solid ${shape === "radial" ? colors.accent : colors.border}`,
+            borderRadius: 4,
+            cursor: disabled ? "not-allowed" : "pointer",
+          }}
+        >
+          Radial
+        </button>
+      </Row>
+      {fill.shape === "linear" ? (
+        <LinearGradientEndpoints
+          from={fill.from}
+          to={fill.to}
+          onCommit={(from, to) =>
+            onCommit({
+              kind: "gradient",
+              shape: "linear",
+              from,
+              to,
+              stops: fill.stops,
+            })
+          }
+        />
+      ) : (
+        <RadialGradientGeometry
+          center={fill.center}
+          gradientRadius={fill.radius}
+          onCommit={(center, radius) =>
+            onCommit({
+              kind: "gradient",
+              shape: "radial",
+              center,
+              radius,
+              stops: fill.stops,
+            })
+          }
+        />
+      )}
+      <SectionLabel>Stops</SectionLabel>
+      <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+        {fill.stops.map((stop, idx) => (
+          <GradientStopEditor
+            // Stops are identified positionally; sorting/insertion
+            // shuffles the array, and offsets aren't unique (two
+            // stops can share an offset). Using the index as the
+            // key is fine because the component body is stateless
+            // — the only state lives on the controlled inputs
+            // which are re-driven by props on every render.
+            key={idx}
+            stop={stop}
+            disabled={disabled}
+            onCommit={(next) => {
+              const stops = fill.stops.slice();
+              stops[idx] = next;
+              setStops(stops);
+            }}
+            onRemove={
+              fill.stops.length > 2
+                ? () => {
+                    const stops = fill.stops.slice();
+                    stops.splice(idx, 1);
+                    setStops(stops);
+                  }
+                : null
+            }
+          />
+        ))}
+      </div>
+      <button
+        type="button"
+        onClick={() => {
+          // New stop is inserted at the midpoint of the LARGEST
+          // current gap between adjacent stops. This matches the
+          // standard pattern across design tools (Figma, Adobe XD,
+          // Sketch) and avoids the Zeno's-paradox clustering toward
+          // offset 1.0 that "midpoint between last two stops"
+          // produces on repeated clicks. Colour linearly interpolates
+          // between the gap's endpoints so the new stop sits on the
+          // existing ramp rather than introducing a discontinuity.
+          //
+          // Edge cases:
+          // - Empty / single-stop input shouldn't reach here (we
+          //   always seed two stops), but if it does, fall back to
+          //   offset 0.5 + black.
+          // - Already-sorted input is guaranteed by `setStops`
+          //   sorting on commit, so we can walk adjacent pairs.
+          let widestStart = fill.stops[0];
+          let widestEnd = fill.stops[fill.stops.length - 1];
+          let widestGap = -1;
+          for (let i = 0; i < fill.stops.length - 1; i++) {
+            const a = fill.stops[i];
+            const b = fill.stops[i + 1];
+            if (a === undefined || b === undefined) {
+              continue;
+            }
+            const gap = b.offset - a.offset;
+            if (gap > widestGap) {
+              widestGap = gap;
+              widestStart = a;
+              widestEnd = b;
+            }
+          }
+          const offset =
+            widestStart !== undefined && widestEnd !== undefined
+              ? (widestStart.offset + widestEnd.offset) / 2
+              : 0.5;
+          const color =
+            widestStart !== undefined && widestEnd !== undefined
+              ? {
+                  r: (widestStart.color.r + widestEnd.color.r) / 2,
+                  g: (widestStart.color.g + widestEnd.color.g) / 2,
+                  b: (widestStart.color.b + widestEnd.color.b) / 2,
+                  a: (widestStart.color.a + widestEnd.color.a) / 2,
+                }
+              : RGBA_BLACK;
+          setStops([...fill.stops, { offset, color }]);
+        }}
+        disabled={disabled}
+        style={{
+          ...buttonStyle,
+          opacity: disabled ? 0.55 : 1,
+          cursor: disabled ? "not-allowed" : "pointer",
+        }}
+      >
+        Add stop
+      </button>
+    </div>
+  );
+}
+
+/// Single gradient stop row: offset slider + colour picker +
+/// alpha slider + remove button. Disabled gate sits on every
+/// control individually for defence-in-depth (see the gate doc
+/// on `GradientFillEditor`).
+function GradientStopEditor({
+  stop,
+  disabled,
+  onCommit,
+  onRemove,
+}: {
+  stop: GradientStop;
+  disabled: boolean;
+  onCommit: (next: GradientStop) => void;
+  /// `null` when the stop cannot be removed — we enforce a
+  /// minimum of two stops so the gradient is never degenerate.
+  /// Passing a callback unconditionally and disabling the button
+  /// at the wrong moment would surface a clickable-but-no-op
+  /// button to the user; gating at the prop level is cleaner.
+  onRemove: (() => void) | null;
+}): JSX.Element {
+  return (
+    <div
+      style={{
+        display: "flex",
+        gap: 6,
+        alignItems: "center",
+        padding: "4px",
+        background: colors.bgSoft,
+        border: `1px solid ${colors.border}`,
+        borderRadius: 4,
+      }}
+    >
+      <input
+        type="color"
+        value={rgbaToHex(stop.color)}
+        onChange={(e) =>
+          onCommit({
+            offset: stop.offset,
+            color: hexToRgba(e.target.value, stop.color.a),
+          })
+        }
+        disabled={disabled}
+        style={{
+          width: 28,
+          height: 24,
+          border: "none",
+          background: "transparent",
+          padding: 0,
+          cursor: disabled ? "not-allowed" : "pointer",
+        }}
+      />
+      <input
+        type="range"
+        min={0}
+        max={1}
+        step={0.001}
+        value={stop.offset}
+        onChange={(e) =>
+          onCommit({
+            offset: Number.parseFloat(e.target.value),
+            color: stop.color,
+          })
+        }
+        disabled={disabled}
+        style={{ flex: 1, cursor: disabled ? "not-allowed" : "pointer" }}
+        aria-label="Stop offset"
+      />
+      <span
+        style={{
+          fontSize: 10,
+          color: colors.textMuted,
+          minWidth: 32,
+          textAlign: "right",
+          fontVariantNumeric: "tabular-nums",
+        }}
+      >
+        {(stop.offset * 100).toFixed(0)}%
+      </span>
+      <button
+        type="button"
+        onClick={() => onRemove?.()}
+        disabled={disabled || onRemove === null}
+        style={{
+          padding: "2px 6px",
+          fontSize: 11,
+          background: "transparent",
+          color: colors.textMuted,
+          border: `1px solid ${colors.border}`,
+          borderRadius: 4,
+          cursor:
+            disabled || onRemove === null ? "not-allowed" : "pointer",
+        }}
+        aria-label="Remove stop"
+        title={onRemove === null ? "A gradient needs at least two stops" : "Remove stop"}
+      >
+        ×
+      </button>
+    </div>
+  );
+}
+
+/// Two-point linear gradient geometry editor. Coordinates are in
+/// the node-relative `[0, 1]` square that the renderer's
+/// `node_fill` will map back to the node bounds.
+function LinearGradientEndpoints({
+  from,
+  to,
+  onCommit,
+}: {
+  from: Point2D;
+  to: Point2D;
+  onCommit: (from: Point2D, to: Point2D) => void;
+}): JSX.Element {
+  return (
+    <Row>
+      <Field label="From">
+        <Row>
+          <NumberStub
+            value={from.x}
+            onChange={(v) => onCommit({ x: v, y: from.y }, to)}
+            ariaLabel="From X"
+          />
+          <NumberStub
+            value={from.y}
+            onChange={(v) => onCommit({ x: from.x, y: v }, to)}
+            ariaLabel="From Y"
+          />
+        </Row>
+      </Field>
+      <Field label="To">
+        <Row>
+          <NumberStub
+            value={to.x}
+            onChange={(v) => onCommit(from, { x: v, y: to.y })}
+            ariaLabel="To X"
+          />
+          <NumberStub
+            value={to.y}
+            onChange={(v) => onCommit(from, { x: to.x, y: v })}
+            ariaLabel="To Y"
+          />
+        </Row>
+      </Field>
+    </Row>
+  );
+}
+
+/// Centre + radius radial gradient geometry editor. Like
+/// `LinearGradientEndpoints`, coordinates are normalised to the
+/// node bounds.
+///
+/// Prop is named `gradientRadius` rather than `radius` to avoid
+/// shadowing the file-level `radius` styling token imported from
+/// `../styles/tokens` (used elsewhere in this file for
+/// `borderRadius: radius.pill` etc). The component body doesn't
+/// reach for the token, but the rename keeps future editors from
+/// being surprised when they try to use it inside this function.
+function RadialGradientGeometry({
+  center,
+  gradientRadius,
+  onCommit,
+}: {
+  center: Point2D;
+  gradientRadius: number;
+  onCommit: (center: Point2D, radius: number) => void;
+}): JSX.Element {
+  return (
+    <Row>
+      <Field label="Centre">
+        <Row>
+          <NumberStub
+            value={center.x}
+            onChange={(v) => onCommit({ x: v, y: center.y }, gradientRadius)}
+            ariaLabel="Centre X"
+          />
+          <NumberStub
+            value={center.y}
+            onChange={(v) => onCommit({ x: center.x, y: v }, gradientRadius)}
+            ariaLabel="Centre Y"
+          />
+        </Row>
+      </Field>
+      <Field label="Radius">
+        <NumberStub
+          value={gradientRadius}
+          onChange={(v) => onCommit(center, v)}
+          ariaLabel="Radius"
+        />
+      </Field>
+    </Row>
+  );
+}
+
+/// Compact number input for gradient geometry. Non-finite inputs
+/// (Infinity / NaN) are ignored because they don't round-trip
+/// through JSON — the editor cannot author a value that the
+/// bridge can't persist (see the f64 sentinel knowledge note).
+function NumberStub({
+  value,
+  onChange,
+  ariaLabel,
+}: {
+  value: number;
+  onChange: (v: number) => void;
+  ariaLabel: string;
+}): JSX.Element {
+  return (
+    <input
+      type="number"
+      step={0.01}
+      value={value}
+      aria-label={ariaLabel}
+      onChange={(e) => {
+        const next = Number.parseFloat(e.target.value);
+        if (Number.isFinite(next)) {
+          onChange(next);
+        }
+      }}
+      style={{ ...textInputStyle, width: "100%" }}
+    />
+  );
+}
+
+/// HTML5 colour picker speaks `#rrggbb`. RGBA in our `FillStyle`
+/// is floats in `[0, 1]` — clamp before quantising so an
+/// out-of-range value (shouldn't happen from the bridge, but
+/// defends against future code paths) produces a valid hex.
+function rgbaToHex(c: RgbaColor): string {
+  const r = clamp01(c.r);
+  const g = clamp01(c.g);
+  const b = clamp01(c.b);
+  const to = (n: number): string =>
+    Math.round(n * 255).toString(16).padStart(2, "0");
+  return `#${to(r)}${to(g)}${to(b)}`;
+}
+
+function hexToRgba(hex: string, a: number): RgbaColor {
+  // Accept `#rgb` or `#rrggbb`. Anything else returns black.
+  const m = /^#?([0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/.exec(hex);
+  const v = m?.[1];
+  if (v === undefined) {
+    return { r: 0, g: 0, b: 0, a };
+  }
+  if (v.length === 3) {
+    const r = v[0] ?? "0";
+    const g = v[1] ?? "0";
+    const b = v[2] ?? "0";
+    return {
+      r: Number.parseInt(r + r, 16) / 255,
+      g: Number.parseInt(g + g, 16) / 255,
+      b: Number.parseInt(b + b, 16) / 255,
+      a,
+    };
+  }
+  return {
+    r: Number.parseInt(v.slice(0, 2), 16) / 255,
+    g: Number.parseInt(v.slice(2, 4), 16) / 255,
+    b: Number.parseInt(v.slice(4, 6), 16) / 255,
+    a,
+  };
+}
+
+function clamp01(n: number): number {
+  if (!Number.isFinite(n)) {
+    return 0;
+  }
+  return Math.min(1, Math.max(0, n));
+}
 
 /**
  * Per-node layout config picker. Visible when:
@@ -1153,6 +2012,21 @@ const hrStyle: React.CSSProperties = {
   border: "none",
   borderTop: `1px solid ${colors.border}`,
   margin: `${spacing.xs}px 0`,
+};
+
+/// Inline notice surfaced inside the gradient editor explaining that
+/// gradient fills currently round-trip to disk but don't render on
+/// canvas. Styled as a soft warning (yellow accent) rather than an
+/// error because authoring is fully functional — only the live
+/// preview is missing.
+const gradientRenderNoticeStyle: React.CSSProperties = {
+  fontSize: 11,
+  lineHeight: 1.4,
+  padding: "6px 8px",
+  background: "rgba(255, 196, 0, 0.12)",
+  border: "1px solid rgba(255, 196, 0, 0.45)",
+  color: colors.text,
+  borderRadius: 4,
 };
 
 function ExportTabContent({

@@ -837,6 +837,17 @@ function registerIpcHandlers(): void {
       requireBridge().documentUpdateNode(nodeId, changesJson);
     },
   );
+  // FillSection (PropertiesPanel, right panel) calls this on
+  // selection change to populate its form with the node's current
+  // FillStyle. Writes go back through the existing
+  // `kcreate/document/updateNode` channel with the new `fill` field
+  // — no separate setter, the existing channel already touches the
+  // operation log and triggers a scene re-sync. The JSON string is
+  // round-trip-stable with `FillStyle` in `apps/desktop/shared/scene.ts`.
+  ipcMain.handle(
+    "kcreate/document/nodeFill",
+    (_e, nodeId: string) => requireBridge().documentNodeFill(nodeId),
+  );
   ipcMain.handle(
     "kcreate/document/deleteNode",
     (_e, nodeId: string) => {
@@ -1375,6 +1386,16 @@ function registerIpcHandlers(): void {
     (_e, nodeId: string, x: number, y: number, tolerance: number) =>
       requireBridge().aiSmartSelect(nodeId, x, y, tolerance),
   );
+  ipcMain.handle(
+    "kcreate/ai/detectTextRegions",
+    (_e, nodeId: string, optionsJson: string) =>
+      requireBridge().aiDetectTextRegions(nodeId, optionsJson),
+  );
+  ipcMain.handle(
+    "kcreate/ai/insertTextLayerForRegion",
+    (_e, requestJson: string) =>
+      requireBridge().aiInsertTextLayerForRegion(requestJson),
+  );
   ipcMain.handle("kcreate/ai/listModelPacks", () =>
     requireBridge().aiListModelPacks(),
   );
@@ -1796,6 +1817,65 @@ function registerIpcHandlers(): void {
       return fn(requestJson);
     },
   );
+  // Trusted-issuer allowlist for distinguishing real KChat
+  // installs from dev-mint installs. The bridge starts with an
+  // empty list (= "accept any issuer", preserving the dev flow),
+  // gets pointed at the persistent JSON file at startup (see
+  // `whenReady` below), and exposes add/remove/list to the
+  // renderer's KChatSignInPanel.
+  ipcMain.handle(
+    "kcreate/kchat/set-trust-store-path",
+    (_e, p: string) => requireBridge().kchatSetTrustStorePath(p),
+  );
+  ipcMain.handle("kcreate/kchat/trusted-issuers", () =>
+    requireBridge().kchatTrustedIssuers(),
+  );
+  ipcMain.handle(
+    "kcreate/kchat/add-trusted-issuer",
+    (_e, issuerJson: string) =>
+      requireBridge().kchatAddTrustedIssuer(issuerJson),
+  );
+  ipcMain.handle(
+    "kcreate/kchat/remove-trusted-issuer",
+    (_e, issuerPublicKey: string) =>
+      requireBridge().kchatRemoveTrustedIssuer(issuerPublicKey),
+  );
+}
+
+/// Point the KChat trust-store at the per-user JSON file under
+/// the Electron `userData` directory and surface any I/O failure
+/// to the main-process log. We deliberately swallow errors here
+/// rather than crashing the app — a missing file is treated as
+/// "empty allowlist" on the Rust side, and any deeper I/O issue
+/// (permissions, corrupt JSON) is non-fatal to the editor. The
+/// renderer surfaces a banner if subsequent add/remove calls
+/// fail to persist. Idempotent: safe to call multiple times.
+///
+/// `kchatSetTrustStorePath` is gated behind the `collab` Cargo
+/// feature in `kcreate_bridge`. Every shipped desktop artifact
+/// builds with `collab` enabled, so in practice the function is
+/// always present — but we probe with `typeof fn !== "function"`
+/// before calling so non-collab developer builds don't generate
+/// a spurious "function is not a function" stack trace at every
+/// startup. Mirrors the pattern used for `kchatDevIssuerAvailable`
+/// (`registerIpcHandlers` above).
+function initializeKChatTrustStore(): void {
+  const fn = requireBridge().kchatSetTrustStorePath;
+  if (typeof fn !== "function") {
+    // Non-collab build: the trust-store ABI isn't compiled in.
+    // The bridge's add/remove/list endpoints will also be absent,
+    // and the renderer's KChatSignInPanel won't be able to call
+    // them — but that's the expected non-collab state. Silent
+    // return rather than logging so we don't spam the console
+    // every startup.
+    return;
+  }
+  try {
+    const trustFile = path.join(app.getPath("userData"), "kchat_trust.json");
+    fn.call(requireBridge(), trustFile);
+  } catch (err) {
+    console.error("kchat: failed to initialise trust store on disk", err);
+  }
 }
 
 void app.whenReady().then(() => {
@@ -1803,6 +1883,11 @@ void app.whenReady().then(() => {
   // can hit `requireBridge()`. See the comment above `let bridge`.
   bridge = loadBridge();
   registerIpcHandlers();
+  // Wire the KChat trust-store at `<userData>/kchat_trust.json`.
+  // Must run AFTER the bridge is loaded (it dispatches an N-API
+  // call) but BEFORE any renderer window opens (so the first
+  // `kchat.status()` poll already sees the loaded allowlist).
+  initializeKChatTrustStore();
   createWindow();
 
   app.on("activate", () => {

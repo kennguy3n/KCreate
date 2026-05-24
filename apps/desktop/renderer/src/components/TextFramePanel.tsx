@@ -81,9 +81,16 @@ export function TextFramePanel({
     [],
   );
 
+  // Dependency on `node.version` (not just `node.id`) so undo/redo
+  // and collab edits on the same selected node refire the hydrate
+  // path. Without it, the panel would silently show pre-undo state
+  // and the user's next commit would clobber the just-undone fields
+  // — see PR #12 Devin Review thread on RightPanel.tsx:549 (same
+  // architectural gap was filed against TextFramePanel and
+  // OpenTypePanel in parallel; this is the uniform fix).
   useEffect(() => {
     void load(node.id);
-  }, [load, node.id]);
+  }, [load, node.id, node.version]);
 
   const commit = useCallback(
     async (next: TextFrameOptions) => {

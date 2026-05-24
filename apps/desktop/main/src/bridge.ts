@@ -138,6 +138,19 @@ export interface Bridge {
     propsJson: string,
   ): string;
   documentUpdateNode(nodeId: string, changesJson: string): void;
+  /**
+   * Read the current `FillStyle` for a node, serialised as a JSON
+   * string. Returns `null` when the node id is unknown. Renderer
+   * `FillSection` uses this on selection change to populate the
+   * fill editor. The shape mirrors `kcreate_core::node::FillStyle`
+   * 1:1 via its `#[serde(tag = "kind", rename_all = "snake_case")]`
+   * tagged enum — see `FillStyle` in `apps/desktop/shared/scene.ts`.
+   *
+   * String-typed at the N-API boundary because napi-rs can't mirror
+   * a tagged enum without a wire struct per variant; the renderer
+   * gets the round-trippable JSON shape directly.
+   */
+  documentNodeFill(nodeId: string): string | null;
   documentDeleteNode(nodeId: string): void;
   documentUndo(): UndoRedoOutcomeSnake | null;
   documentRedo(): UndoRedoOutcomeSnake | null;
@@ -323,6 +336,8 @@ export interface Bridge {
     y: number,
     tolerance: number,
   ): string;
+  aiDetectTextRegions(nodeId: string, optionsJson: string): string;
+  aiInsertTextLayerForRegion(requestJson: string): string;
   aiListModelPacks(): string;
   aiInstallModelPack(packId: string, sourcePath: string): string;
   aiUninstallModelPack(packId: string): void;
@@ -432,6 +447,18 @@ export interface Bridge {
   // membership" affordance in the KChat sign-in panel.
   kchatDevIssuerAvailable?(): boolean;
   kchatDevMintMembership?(requestJson: string): string;
+  // Trusted-issuer allowlist for distinguishing real KChat
+  // installs (server-minted) from dev-mint installs (in-process
+  // issuer). Empty list = "accept any issuer" (backward-compat
+  // with the dev flow). Non-empty = installs must match a listed
+  // pubkey or the gate stays locked. `kchatSetTrustStorePath`
+  // points the bridge at a JSON file on disk; subsequent
+  // add/remove calls are persisted via atomic temp-file-rename so
+  // changes survive an app restart.
+  kchatSetTrustStorePath(path: string): string;
+  kchatTrustedIssuers(): string;
+  kchatAddTrustedIssuer(issuerJson: string): string;
+  kchatRemoveTrustedIssuer(issuerPublicKey: string): string;
   /// Re-publish the cached scene. Used by the session event tick
   /// to refresh remote-peer cursor overlays.
   documentRequestRender(): void;

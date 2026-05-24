@@ -23,7 +23,12 @@ export interface PreflightPanelProps {
 
 const DEFAULTS: PreflightOptions = {
   targetDpi: 300,
+  // 0 = infer floor from `targetColorSpace` (150 for cmyk, 72 for
+  // rgb). Matches the Rust-side deny-by-default sentinel; any
+  // non-zero value overrides the inference.
+  imageDpiFloor: 0,
   requireBleedMm: 3,
+  checkBleedAreaCoverage: true,
   allowTransparency: false,
   targetColorSpace: "cmyk",
   targetTotalInkCoverage: 3,
@@ -79,9 +84,21 @@ export function PreflightPanel({
           onChange={(v) => setOpts({ ...opts, targetDpi: v })}
         />
         <NumberField
+          label={`DPI floor${opts.imageDpiFloor === 0 ? " (auto)" : ""}`}
+          value={opts.imageDpiFloor}
+          min={0}
+          max={1200}
+          onChange={(v) => setOpts({ ...opts, imageDpiFloor: v })}
+        />
+        <NumberField
           label="Bleed (mm)"
           value={opts.requireBleedMm}
           onChange={(v) => setOpts({ ...opts, requireBleedMm: v })}
+        />
+        <CheckboxField
+          label="Warn on missing bleed coverage"
+          checked={opts.checkBleedAreaCoverage}
+          onChange={(v) => setOpts({ ...opts, checkBleedAreaCoverage: v })}
         />
         <SelectField
           label="Color space"

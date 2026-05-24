@@ -558,6 +558,252 @@ pub fn ai_screenshot_to_layout(req: &ScreenshotRequest) -> Result<String> {
 }
 
 // -----------------------------------------------------------------------------
+// Text-region detection + insert-as-text-layer (Phase 4 Block D)
+// -----------------------------------------------------------------------------
+
+/// Run the local text-region detector against the raster layer
+/// identified by `node_id` and return the resulting
+/// `Vec<TextRegion>` as JSON. Read-only — no graph mutation.
+///
+/// The detector lives in `kcreate_ai::ocr::detect_text_regions`;
+/// see the module-level doc there for the algorithm. Coordinates
+/// in the returned regions are in raster-pixel space; the
+/// renderer maps them into document space using the raster
+/// layer's `bounds` + intrinsic dimensions before previewing /
+/// inserting.
+///
+/// `options_json` is the JSON form of [`OcrDetectOptions`] (a
+/// `camelCase` mirror of `kcreate_ai::DetectTextRegionsOptions`);
+/// pass `null` from the renderer to use defaults. We accept JSON
+/// rather than threading every field through the N-API signature
+/// so the wire surface stays compact as the option set grows.
+pub fn ai_detect_text_regions(node_id: Uuid, options_json: &str) -> Result<String> {
+    let options: kcreate_ai::DetectTextRegionsOptions =
+        if options_json.trim().is_empty() || options_json.trim() == "null" {
+            kcreate_ai::DetectTextRegionsOptions::default()
+        } else {
+            serde_json::from_str(options_json)?
+        };
+    let encoded = with_workspace(|ws| {
+        let node = ws
+            .project
+            .document
+            .get_node(node_id)
+            .ok_or(DocumentBridgeError::NodeNotFound(node_id))?;
+        if !matches!(node.node_type, NodeType::RasterLayer) {
+            return Err(DocumentBridgeError::InvalidNodeType(format!(
+                "{:?}",
+                node.node_type
+            )));
+        }
+        let meta_value = node
+            .metadata
+            .get(crate::scene_sync::RASTER_IMAGE_METADATA_KEY)
+            .ok_or_else(|| {
+                DocumentBridgeError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "raster layer missing image metadata",
+                ))
+            })?;
+        let meta: crate::scene_sync::RasterImageMeta = serde_json::from_value(meta_value.clone())?;
+        blob_load(ws, &meta.blob_hash)
+    })?;
+    let img = image::load_from_memory(&encoded).map_err(|e| {
+        DocumentBridgeError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+    })?;
+    let rgba = img.to_rgba8();
+    let (w, h) = rgba.dimensions();
+    let regions = kcreate_ai::detect_text_regions(rgba.as_raw(), w, h, options).map_err(|e| {
+        DocumentBridgeError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+    })?;
+    Ok(serde_json::to_string(&regions)?)
+}
+
+/// Renderer → bridge request to materialise a detected text region
+/// as a new `TextLayer`. The region is supplied in raster-pixel
+/// space (matching the wire shape returned by
+/// [`ai_detect_text_regions`]); the bridge maps it into document
+/// space using the source raster's bounds.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct InsertTextLayerForRegionRequest {
+    /// Raster layer the region was detected on. Determines the
+    /// parent + the source bounds for coordinate mapping.
+    pub raster_node_id: Uuid,
+    /// Region in raster-pixel space. Identical wire shape to
+    /// [`kcreate_ai::TextRegion`] for round-trip ergonomics.
+    pub region: TextRegionInsert,
+    /// Initial text content. May be empty — the user typically
+    /// types the recognised text after insertion since the
+    /// detector reports bboxes, not characters.
+    #[serde(default)]
+    pub text: String,
+    /// Override the renderer-side font family. Defaults to the
+    /// project's default sans-serif when empty / omitted.
+    #[serde(default)]
+    pub font_family: Option<String>,
+    /// Override the heuristic font size. When `None`, the bridge
+    /// uses the region's `height * font_size_height_ratio` (see
+    /// the constant below).
+    #[serde(default)]
+    pub font_size: Option<f32>,
+}
+
+/// Wire shape for a single region in a
+/// [`InsertTextLayerForRegionRequest`]. Mirrors
+/// [`kcreate_ai::TextRegion`] field-by-field so the renderer can
+/// pass the detector's output through unchanged. We don't reuse
+/// `TextRegion` directly because the detector's struct doesn't
+/// derive `Deserialize` for camelCase by default (its serde
+/// rename rule applies to serialise + deserialise symmetrically,
+/// so this is actually redundant — but the explicit mirror also
+/// gives us `#[serde(deny_unknown_fields)]` which we want on the
+/// bridge surface and don't on the detector struct).
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct TextRegionInsert {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+    #[serde(default)]
+    pub glyph_count: u32,
+    #[serde(default)]
+    pub estimated_char_count: u32,
+}
+
+/// Heuristic ratio: an upper-case glyph fills roughly 70% of the
+/// detected line's bbox vertically (the rest is ascender + descender
+/// padding). Empirical sweet-spot — too low and the inserted text
+/// shrinks below the raster glyphs; too high and ascenders clip the
+/// next line when the user types multi-line text.
+const FONT_SIZE_HEIGHT_RATIO: f32 = 0.75;
+
+/// Materialise a detected text region as a new `TextLayer` sibling
+/// of the source raster.
+///
+/// Returns the new node id. Records an `ai_insert_text_layer` op in
+/// the project log + an AI action so the operation is undoable and
+/// attributable in the action log.
+pub fn ai_insert_text_layer_for_region(req: &InsertTextLayerForRegionRequest) -> Result<Uuid> {
+    let raster_node_id = req.raster_node_id;
+    let region = req.region;
+    let new_id = with_workspace_mut(|ws| {
+        let raster = ws
+            .project
+            .document
+            .get_node(raster_node_id)
+            .ok_or(DocumentBridgeError::NodeNotFound(raster_node_id))?;
+        if !matches!(raster.node_type, NodeType::RasterLayer) {
+            return Err(DocumentBridgeError::InvalidNodeType(format!(
+                "{:?}",
+                raster.node_type
+            )));
+        }
+        let parent = raster.parent_id;
+        let raster_bounds = raster.bounds;
+        let meta_value = raster
+            .metadata
+            .get(crate::scene_sync::RASTER_IMAGE_METADATA_KEY)
+            .ok_or_else(|| {
+                DocumentBridgeError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "raster layer missing image metadata",
+                ))
+            })?;
+        let raster_meta: crate::scene_sync::RasterImageMeta =
+            serde_json::from_value(meta_value.clone())?;
+        if raster_meta.width == 0 || raster_meta.height == 0 {
+            return Err(DocumentBridgeError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "raster layer reports zero intrinsic dimensions",
+            )));
+        }
+        // Map raster-pixel space → document space. Linear scale by
+        // the raster bounds / intrinsic pixel size; raster pixel
+        // (0,0) maps to (bounds.x, bounds.y), pixel (w, h) maps to
+        // (bounds.x + bounds.width, bounds.y + bounds.height).
+        let sx = raster_bounds.width / f64::from(raster_meta.width);
+        let sy = raster_bounds.height / f64::from(raster_meta.height);
+        let doc_x = raster_bounds.x + f64::from(region.x) * sx;
+        let doc_y = raster_bounds.y + f64::from(region.y) * sy;
+        let doc_w = f64::from(region.width) * sx;
+        let doc_h = f64::from(region.height) * sy;
+
+        // Pick the font size — caller-supplied if present,
+        // otherwise estimated from the region's height. The
+        // estimate uses the average of sx/sy because line height
+        // in document space is `region.height * sy`; falling back
+        // to a fixed 16pt when the resulting estimate isn't finite.
+        let font_size = req.font_size.unwrap_or_else(|| {
+            let h_doc = (f64::from(region.height) * sy) as f32;
+            let candidate = h_doc * FONT_SIZE_HEIGHT_RATIO;
+            if candidate.is_finite() && candidate > 0.0 {
+                candidate
+            } else {
+                16.0
+            }
+        });
+        let font_family = req
+            .font_family
+            .clone()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| "Sans".to_string());
+
+        let mut new_node = Node::new(NodeType::TextLayer, "Detected text");
+        new_node.parent_id = parent;
+        new_node.bounds = kcreate_core::node::Bounds {
+            x: doc_x,
+            y: doc_y,
+            width: doc_w,
+            height: doc_h,
+        };
+        let text_meta = kcreate_export::scene_metadata::TextLayerMeta {
+            text: req.text.clone(),
+            font_family,
+            font_size,
+        };
+        new_node.metadata.insert(
+            kcreate_export::scene_metadata::TEXT_LAYER_METADATA_KEY.to_string(),
+            serde_json::to_value(&text_meta)?,
+        );
+        let new_id = ws.project.document.insert_node(new_node)?;
+
+        let snapshot = ws
+            .project
+            .document
+            .get_node(new_id)
+            .map_or(serde_json::Value::Null, |n| {
+                serde_json::to_value(n).unwrap_or(serde_json::Value::Null)
+            });
+        let op = Operation::new(
+            "ai",
+            "ai_insert_text_layer",
+            serde_json::Value::Null,
+            snapshot,
+            vec![new_id, raster_node_id],
+        )
+        .as_ai_generated();
+        ws.project.execute_operation(op);
+        kcreate_ai::ActionLog::global()
+            .lock()
+            .append(kcreate_ai::AiAction {
+                id: Uuid::new_v4(),
+                timestamp: Utc::now(),
+                task_type: "ocr_insert_text_layer".into(),
+                model: "ocr-heuristic-v0".into(),
+                compute_device: "cpu".into(),
+                affected_nodes: vec![new_id, raster_node_id],
+                confidence: None,
+            });
+        ws.project.modified_at = Utc::now();
+        Ok(new_id)
+    })?;
+    sync_scene_after_change();
+    Ok(new_id)
+}
+
+// -----------------------------------------------------------------------------
 // AI inference: alt-text + layout-suggest (Phase 4 Block B)
 // -----------------------------------------------------------------------------
 
@@ -2552,6 +2798,281 @@ mod ai_inference_tests {
             cover, 2,
             "filtering must leave exactly two clusterable children"
         );
+        project_close();
+    }
+
+    // -----------------------------------------------------------------
+    // Text-region detection + insert-as-text-layer (Phase 4 Block D)
+    // -----------------------------------------------------------------
+
+    /// Build a PNG raster of `width × height` with a black bar
+    /// drawn in the rect `(x..x+w, y..y+h)`. The detector treats
+    /// dark pixels as ink, so the bar materialises as a single
+    /// text-shaped region. Useful for exercising both detection
+    /// and the raster→document coordinate mapping in the
+    /// insert-text-layer path.
+    fn rgba_png_with_bar(width: u32, height: u32, bar: (u32, u32, u32, u32)) -> Vec<u8> {
+        let pixel_count = (width as usize) * (height as usize);
+        let mut rgba = vec![255u8; pixel_count * 4]; // white background
+                                                     // Re-set alpha to 255 explicitly for the rgba layout (the
+                                                     // initial `255` fills R/G/B too which is what we want for
+                                                     // white — alpha follows naturally).
+        let (bx, by, bw, bh) = bar;
+        for ry in by..(by + bh).min(height) {
+            for rx in bx..(bx + bw).min(width) {
+                let o = ((ry as usize) * (width as usize) + (rx as usize)) * 4;
+                rgba[o] = 0;
+                rgba[o + 1] = 0;
+                rgba[o + 2] = 0;
+                rgba[o + 3] = 255;
+            }
+        }
+        let mut png: Vec<u8> = Vec::new();
+        let mut cursor = std::io::Cursor::new(&mut png);
+        image::write_buffer_with_format(
+            &mut cursor,
+            &rgba,
+            width,
+            height,
+            image::ColorType::Rgba8,
+            image::ImageFormat::Png,
+        )
+        .expect("png encode");
+        png
+    }
+
+    /// `TextRegion` round-trips through serde with the exact wire
+    /// shape the TypeScript mirror expects (camelCase keys).
+    /// Pins the public wire format — if anyone re-renames or
+    /// drops a field, this test breaks at `cargo test` time
+    /// rather than failing silently in the renderer.
+    #[test]
+    fn text_region_serialises_to_camelcase_wire_format() {
+        let region = kcreate_ai::TextRegion {
+            x: 4,
+            y: 5,
+            width: 60,
+            height: 12,
+            glyph_count: 9,
+            estimated_char_count: 11,
+        };
+        let json = serde_json::to_string(&region).expect("encode");
+        let v: serde_json::Value = serde_json::from_str(&json).expect("re-decode");
+        assert_eq!(v["x"], 4);
+        assert_eq!(v["y"], 5);
+        assert_eq!(v["width"], 60);
+        assert_eq!(v["height"], 12);
+        assert_eq!(v["glyphCount"], 9);
+        assert_eq!(v["estimatedCharCount"], 11);
+        // Round-trip back through the detector struct.
+        let back: kcreate_ai::TextRegion = serde_json::from_str(&json).expect("decode");
+        assert_eq!(back.x, 4);
+        assert_eq!(back.glyph_count, 9);
+        assert_eq!(back.estimated_char_count, 11);
+    }
+
+    /// The renderer-facing `InsertTextLayerForRegionRequest`
+    /// accepts the JSON shape declared in
+    /// `apps/desktop/shared/scene.ts::InsertTextLayerForRegionRequest`
+    /// — including the optional `text` / `fontFamily` / `fontSize`
+    /// fields with snake_case Rust names. `deny_unknown_fields`
+    /// prevents accidental rename drift.
+    #[test]
+    fn insert_text_layer_request_accepts_camelcase_optional_fields() {
+        let raster_id = Uuid::new_v4();
+        let wire = serde_json::json!({
+            "rasterNodeId": raster_id.to_string(),
+            "region": {
+                "x": 4,
+                "y": 5,
+                "width": 60,
+                "height": 12,
+                "glyphCount": 9,
+                "estimatedCharCount": 11,
+            },
+            "text": "Hello",
+            "fontFamily": "Inter",
+            "fontSize": 14.0,
+        });
+        let req: InsertTextLayerForRegionRequest = serde_json::from_value(wire).expect("decode");
+        assert_eq!(req.raster_node_id, raster_id);
+        assert_eq!(req.region.glyph_count, 9);
+        assert_eq!(req.region.estimated_char_count, 11);
+        assert_eq!(req.text, "Hello");
+        assert_eq!(req.font_family.as_deref(), Some("Inter"));
+        assert!((req.font_size.expect("size") - 14.0).abs() < 1e-6);
+
+        // Optional fields really are optional — omit text / font*.
+        let minimal = serde_json::json!({
+            "rasterNodeId": Uuid::new_v4().to_string(),
+            "region": {
+                "x": 0, "y": 0, "width": 1, "height": 1,
+            },
+        });
+        let minimal_req: InsertTextLayerForRegionRequest =
+            serde_json::from_value(minimal).expect("decode minimal");
+        assert!(minimal_req.text.is_empty());
+        assert!(minimal_req.font_family.is_none());
+        assert!(minimal_req.font_size.is_none());
+
+        // Unknown field at top level — `deny_unknown_fields` rejects
+        // it so we catch wire-format drift at compile / test time.
+        let stray = serde_json::json!({
+            "rasterNodeId": Uuid::new_v4().to_string(),
+            "region": {"x": 0, "y": 0, "width": 1, "height": 1},
+            "stray": true,
+        });
+        assert!(
+            serde_json::from_value::<InsertTextLayerForRegionRequest>(stray).is_err(),
+            "unknown top-level field must be rejected"
+        );
+    }
+
+    /// End-to-end: detect regions on a synthetic raster, then
+    /// materialise the first one as a TextLayer. Verifies:
+    ///   - the detector finds the single ink rectangle we drew,
+    ///   - the new node is a `TextLayer` parented under the
+    ///     raster's parent (root in this test),
+    ///   - the bounds round-trip the raster→document mapping
+    ///     correctly (raster is 100×40, bar at (10, 5, 60, 12)
+    ///     with raster bounds (x=200, y=300, w=100, h=40)),
+    ///   - the new node carries text-layer metadata with the
+    ///     heuristic font size derived from the region height.
+    #[test]
+    #[serial]
+    fn detect_then_insert_text_layer_maps_coordinates_to_doc_space() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("ocr", dir.path()).expect("project");
+        let png = rgba_png_with_bar(100, 40, (10, 5, 60, 12));
+        // Insert the raster with non-trivial bounds so the
+        // mapping isn't accidentally an identity transform.
+        let raster_id = with_workspace_mut(|ws| {
+            let blob = ws
+                .store
+                .blobs()
+                .store(&png, "image/png")
+                .map_err(|e| DocumentBridgeError::Io(std::io::Error::other(e.to_string())))?;
+            let meta = crate::scene_sync::RasterImageMeta {
+                blob_hash: blob.hash,
+                width: 100,
+                height: 40,
+            };
+            let mut node = Node::new(NodeType::RasterLayer, "Bar raster");
+            node.parent_id = None;
+            node.bounds = Bounds {
+                x: 200.0,
+                y: 300.0,
+                width: 100.0,
+                height: 40.0,
+            };
+            node.metadata.insert(
+                crate::scene_sync::RASTER_IMAGE_METADATA_KEY.to_string(),
+                serde_json::to_value(&meta)?,
+            );
+            Ok::<Uuid, DocumentBridgeError>(ws.project.document.insert_node(node)?)
+        })
+        .expect("raster");
+
+        let json = ai_detect_text_regions(raster_id, "null").expect("detect");
+        let regions: Vec<kcreate_ai::TextRegion> =
+            serde_json::from_str(&json).expect("decode regions");
+        assert!(
+            !regions.is_empty(),
+            "detector must find the synthetic ink bar; got 0 regions"
+        );
+        // Pick the largest by area — robust against the detector
+        // emitting one or two adjacent regions for noisy edges.
+        let region = regions
+            .iter()
+            .max_by_key(|r| r.width * r.height)
+            .copied()
+            .expect("region");
+        // The detector reports the bar bbox (give or take the
+        // half-pixel padding inside the heuristic).
+        assert!(region.width >= 50 && region.width <= 70);
+        assert!(region.height >= 8 && region.height <= 16);
+
+        let req = InsertTextLayerForRegionRequest {
+            raster_node_id: raster_id,
+            region: TextRegionInsert {
+                x: region.x,
+                y: region.y,
+                width: region.width,
+                height: region.height,
+                glyph_count: region.glyph_count,
+                estimated_char_count: region.estimated_char_count,
+            },
+            text: String::new(),
+            font_family: None,
+            font_size: None,
+        };
+        let new_id = ai_insert_text_layer_for_region(&req).expect("insert");
+
+        let (parent_id, bounds, text_meta_value) = with_workspace(|ws| {
+            let n = ws.project.document.get_node(new_id).expect("new node");
+            assert!(matches!(n.node_type, NodeType::TextLayer));
+            let m = n
+                .metadata
+                .get(kcreate_export::scene_metadata::TEXT_LAYER_METADATA_KEY)
+                .expect("text-layer metadata")
+                .clone();
+            Ok::<_, DocumentBridgeError>((n.parent_id, n.bounds, m))
+        })
+        .unwrap();
+        assert_eq!(parent_id, None, "new layer is a sibling of the raster");
+
+        // Raster bounds = (200, 300, 100, 40); raster intrinsic =
+        // 100 × 40 → identity scale on x, identity scale on y
+        // (because the raster's bounds size equals its intrinsic
+        // size here). Region (~10, ~5, ~60, ~12) maps to doc
+        // (~210, ~305, ~60, ~12).
+        assert!((bounds.x - 210.0).abs() < 5.0, "x ≈ 210, got {}", bounds.x);
+        assert!((bounds.y - 305.0).abs() < 5.0, "y ≈ 305, got {}", bounds.y);
+        assert!(
+            bounds.width >= 50.0 && bounds.width <= 70.0,
+            "width ≈ 60, got {}",
+            bounds.width
+        );
+        assert!(
+            bounds.height >= 8.0 && bounds.height <= 16.0,
+            "height ≈ 12, got {}",
+            bounds.height
+        );
+
+        let text_meta: kcreate_export::scene_metadata::TextLayerMeta =
+            serde_json::from_value(text_meta_value).expect("text meta");
+        assert!(
+            text_meta.text.is_empty(),
+            "default text is empty — user types after insertion"
+        );
+        // Font size comes from region.height * sy * 0.75 where
+        // sy = 1.0 here. region.height ~12 → font_size ~9.
+        assert!(
+            text_meta.font_size > 0.0 && text_meta.font_size < 30.0,
+            "font size in plausible range, got {}",
+            text_meta.font_size
+        );
+
+        // Insert must record an operation with `ai_insert_text_layer`
+        // for undo + the AI action log; the latter we don't assert
+        // here because ActionLog is process-global and we don't
+        // want to introduce inter-test coupling on its contents.
+        let op_kinds: Vec<String> = with_workspace(|ws| {
+            Ok::<Vec<String>, DocumentBridgeError>(
+                ws.project
+                    .operation_log
+                    .iter()
+                    .map(|o| o.command.clone())
+                    .collect(),
+            )
+        })
+        .unwrap();
+        assert!(
+            op_kinds.iter().any(|k| k == "ai_insert_text_layer"),
+            "op log must contain ai_insert_text_layer; got {op_kinds:?}",
+        );
+
         project_close();
     }
 }

@@ -291,6 +291,27 @@ fn static_packs() -> Vec<ModelPack> {
             sha256: String::new(),
         },
         ModelPack {
+            // Phase 4 follow-up Block D — text-region detector
+            // backing the "Insert as text layer" affordance in
+            // AIAssistPanel. BuiltIn because the detector is pure
+            // CV (threshold + connected components + line
+            // grouping) and ships with the editor — no weights,
+            // no download. A future high-accuracy OCR (ONNX or
+            // Tesseract WASM) would land here as a separate pack
+            // with the same `ocr` capability so the dispatcher
+            // can prefer it when installed.
+            id: "ocr_heuristic".into(),
+            name: "Text Region Detection — Heuristic".into(),
+            category: ModelPackCategory::Core,
+            kind: ModelKind::BuiltIn,
+            capabilities: vec!["ocr".into()],
+            size_bytes: 0,
+            file_path: String::new(),
+            installed: true,
+            download_url: String::new(),
+            sha256: String::new(),
+        },
+        ModelPack {
             id: "llm_sidecar_3b".into(),
             name: "Design LLM — 3B Instruct (GGUF)".into(),
             category: ModelPackCategory::DesignPro,
@@ -567,6 +588,7 @@ mod tests {
             "bg_remove_threshold",
             "bg_remove_u2net",
             "llm_sidecar_3b",
+            "ocr_heuristic",
             "palette_kmeans",
             "screenshot_to_layout",
             "smart_select_flood",

@@ -336,6 +336,8 @@ export interface Bridge {
     y: number,
     tolerance: number,
   ): string;
+  aiDetectTextRegions(nodeId: string, optionsJson: string): string;
+  aiInsertTextLayerForRegion(requestJson: string): string;
   aiListModelPacks(): string;
   aiInstallModelPack(packId: string, sourcePath: string): string;
   aiUninstallModelPack(packId: string): void;

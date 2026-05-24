@@ -1623,6 +1623,88 @@ export interface AiModelBridge {
   /// error — so the UI can render a "nothing to suggest" state
   /// without special-casing the call.
   layoutSuggestForArtboard(artboardId: string): Promise<LayoutSuggestion[]>;
+  /// Run the text-region detector against a raster layer. Returns
+  /// the detected regions in raster-pixel space (top-left origin),
+  /// in reading order. Pass `null` for `options` to use the
+  /// detector defaults from
+  /// `kcreate_ai::DetectTextRegionsOptions::default()`.
+  ///
+  /// Read-only: does NOT modify the document. To insert a region
+  /// as a TextLayer, call
+  /// [`AiModelBridge.insertTextLayerForRegion`].
+  detectTextRegions(
+    nodeId: string,
+    options?: DetectTextRegionsOptions | null,
+  ): Promise<TextRegion[]>;
+  /// Create a new `TextLayer` sibling of the source raster
+  /// positioned over the detected region. The region's pixel-space
+  /// coordinates are mapped into document space using the raster's
+  /// `bounds` + intrinsic dimensions. Returns the new node id.
+  ///
+  /// The created TextLayer carries an `ai_insert_text_layer`
+  /// operation in the undo log + an entry in the AI action log
+  /// (`task_type: "ocr_insert_text_layer"`).
+  insertTextLayerForRegion(
+    request: InsertTextLayerForRegionRequest,
+  ): Promise<string>;
+}
+
+/// A detected text-like region in a raster image, mirroring
+/// `kcreate_ai::ocr::TextRegion`. Coordinates are in raster-pixel
+/// space (top-left origin) matching the raster's intrinsic
+/// dimensions, not document space.
+///
+/// `glyphCount` is the count of connected components merged into
+/// the line; `estimatedCharCount` is `width / avg_glyph_advance`
+/// (rounded up, floored at `glyphCount`). Both are heuristic hints
+/// for the renderer — the detector does NOT perform character
+/// recognition.
+export interface TextRegion {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  glyphCount: number;
+  estimatedCharCount: number;
+}
+
+/// Detector parameters, mirroring
+/// `kcreate_ai::ocr::DetectTextRegionsOptions`. All fields optional
+/// on the wire — omitted fields fall back to defaults on the Rust
+/// side via `#[serde(default)]`.
+export interface DetectTextRegionsOptions {
+  /// Luminance threshold (0–255). Pixels at or below are "ink".
+  luminanceThreshold?: number;
+  /// Minimum component size in pixels.
+  minComponentPixels?: number;
+  /// Maximum component size as a fraction of the image area.
+  maxComponentFraction?: number;
+  /// Vertical overlap fraction required to merge two components
+  /// into one line.
+  lineOverlapRatio?: number;
+  /// Horizontal gap allowance (× cap-height) within one line.
+  lineGapRatio?: number;
+}
+
+/// Renderer → bridge request to materialise a detected text region
+/// as a new TextLayer. Mirrors
+/// `kcreate_bridge::phase2::InsertTextLayerForRegionRequest`.
+export interface InsertTextLayerForRegionRequest {
+  /// Source raster the region was detected on. The new TextLayer
+  /// is inserted as a sibling under the same parent.
+  rasterNodeId: string;
+  /// Region in raster-pixel space (top-left origin). Carries the
+  /// glyph / char counts from the detector unchanged.
+  region: TextRegion;
+  /// Initial text content. Empty by default — the user typically
+  /// types the recognised text after insertion since the detector
+  /// reports bboxes, not characters.
+  text?: string;
+  /// Override the font family. Empty / omitted = bridge default.
+  fontFamily?: string;
+  /// Override the font size. Omitted = bridge estimates from the
+  /// region's height in document space.
+  fontSize?: number;
 }
 
 /// Result of [`PdfImportBridge.importPdf`] mirroring

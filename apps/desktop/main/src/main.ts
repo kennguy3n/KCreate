@@ -1386,6 +1386,16 @@ function registerIpcHandlers(): void {
     (_e, nodeId: string, x: number, y: number, tolerance: number) =>
       requireBridge().aiSmartSelect(nodeId, x, y, tolerance),
   );
+  ipcMain.handle(
+    "kcreate/ai/detectTextRegions",
+    (_e, nodeId: string, optionsJson: string) =>
+      requireBridge().aiDetectTextRegions(nodeId, optionsJson),
+  );
+  ipcMain.handle(
+    "kcreate/ai/insertTextLayerForRegion",
+    (_e, requestJson: string) =>
+      requireBridge().aiInsertTextLayerForRegion(requestJson),
+  );
   ipcMain.handle("kcreate/ai/listModelPacks", () =>
     requireBridge().aiListModelPacks(),
   );

@@ -15,6 +15,7 @@ pub mod layout_suggest;
 pub mod llm_chat;
 pub mod llm_sidecar;
 pub mod model_registry;
+pub mod ocr;
 pub mod palette;
 pub mod screenshot_to_layout;
 pub mod smart_select;
@@ -41,6 +42,7 @@ pub use model_registry::{
     install_model_pack, is_installed, list_model_packs, pack_path, uninstall_model_pack,
     InstallError, InstallReport, ModelKind, ModelPack, ModelPackCategory,
 };
+pub use ocr::{detect_text_regions, DetectTextRegionsOptions, OcrError, TextRegion};
 pub use palette::{extract_palette, ExtractedColor};
 pub use screenshot_to_layout::{
     analyze_screenshot_for_layout, Bounds as ScreenshotBounds, DetectedElement, ElementType,

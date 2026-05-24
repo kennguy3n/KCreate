@@ -95,6 +95,9 @@ import type {
   PreflightRequest,
   ScreenshotElement,
   ScreenshotRequest,
+  TextRegion,
+  DetectTextRegionsOptions,
+  InsertTextLayerForRegionRequest,
   ColorBridge,
   ColorSettings,
   ColorSpaceName,
@@ -1156,6 +1159,28 @@ const aiModel: AiModelBridge = {
       x,
       y,
       tolerance,
+    )) as string;
+  },
+  async detectTextRegions(
+    nodeId: string,
+    options?: DetectTextRegionsOptions | null,
+  ): Promise<TextRegion[]> {
+    const optsJson = options === undefined || options === null
+      ? "null"
+      : JSON.stringify(options);
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/ai/detectTextRegions",
+      nodeId,
+      optsJson,
+    )) as string;
+    return JSON.parse(raw) as TextRegion[];
+  },
+  async insertTextLayerForRegion(
+    request: InsertTextLayerForRegionRequest,
+  ): Promise<string> {
+    return (await ipcRenderer.invoke(
+      "kcreate/ai/insertTextLayerForRegion",
+      JSON.stringify(request),
     )) as string;
   },
   async listModelPacks(): Promise<ModelPack[]> {

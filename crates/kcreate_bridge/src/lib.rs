@@ -1697,6 +1697,31 @@ pub fn ai_smart_select(node_id: String, x: u32, y: u32, tolerance: f64) -> NapiR
     phase2::ai_smart_select(id, x, y, tolerance).map_err(map_doc_err)
 }
 
+/// Detect text-like regions in the raster layer identified by
+/// `node_id`. Returns the JSON-serialised `Vec<TextRegion>` from
+/// `kcreate_ai::ocr::detect_text_regions`. `options_json` accepts
+/// `"null"` or `""` to use detector defaults; otherwise must
+/// deserialise to `kcreate_ai::DetectTextRegionsOptions`.
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn ai_detect_text_regions(node_id: String, options_json: String) -> NapiResult<String> {
+    let id = parse_uuid(&node_id)?;
+    phase2::ai_detect_text_regions(id, &options_json).map_err(map_doc_err)
+}
+
+/// Materialise a detected text region as a new `TextLayer` sibling
+/// of the source raster. `request_json` must deserialise to
+/// `phase2::InsertTextLayerForRegionRequest`. Returns the new
+/// node id (UUID).
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn ai_insert_text_layer_for_region(request_json: String) -> NapiResult<String> {
+    let req: phase2::InsertTextLayerForRegionRequest = serde_json::from_str(&request_json)
+        .map_err(|e| napi::Error::from_reason(format!("invalid request: {e}")))?;
+    let id = phase2::ai_insert_text_layer_for_region(&req).map_err(map_doc_err)?;
+    Ok(id.to_string())
+}
+
 /// Return the registry of locally available / installable AI model
 /// packs.
 #[napi]

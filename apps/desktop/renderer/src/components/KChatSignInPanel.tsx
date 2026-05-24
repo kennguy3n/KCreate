@@ -142,6 +142,13 @@ export function KChatSignInPanel({
         setTrustedIssuers(next);
       } catch (e) {
         setTrustedIssuersError(errMsg(e));
+        // Re-throw so the form component (TrustedIssuersSection)
+        // can distinguish success from failure and preserve the
+        // user's typed inputs after a validation/bridge rejection.
+        // The error itself is already surfaced through
+        // `trustedIssuersError` above, so the form's catch branch
+        // is bodyless.
+        throw e;
       }
     },
     [],
@@ -550,8 +557,16 @@ function TrustedIssuersSection({
         issuerPublicKey: pendingPk.trim(),
         label: pendingLabel.trim(),
       });
+      // Only clear inputs on success. `onAdd` re-throws on bridge /
+      // validation failure so the user keeps their typed pubkey and
+      // label and can fix the issue (e.g. a typo in the base64
+      // string) without re-pasting from scratch.
       setPendingPk("");
       setPendingLabel("");
+    } catch {
+      // Intentional: the error is already surfaced via
+      // `trustedIssuersError` by the parent. Swallow here so the
+      // promise doesn't trigger an unhandled-rejection warning.
     } finally {
       setAdding(false);
     }

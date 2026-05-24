@@ -152,10 +152,28 @@ impl FontManager {
     /// — the first occurrence of each missing codepoint is preserved
     /// so a UI can render a representative sample).
     ///
-    /// The check uses the same resolution policy as `resolve_face`
-    /// (exact family → generic fallback → outline-capable face) so
-    /// the result reflects what would actually print, not what the
-    /// raw fontdb query would return.
+    /// The check uses the same resolution policy as
+    /// [`resolve_face`](Self::resolve_face) (exact family → generic
+    /// fallback → outline-capable face) so the result reflects what
+    /// would actually print, not what the raw fontdb query would
+    /// return. This is currently equivalent to `Query { families:
+    /// [Name(family)], weight: NORMAL, style: Normal, stretch: NORMAL
+    /// }` because the editing-path text pipeline
+    /// (`kcreate_text::paragraph::TextStyle`) only carries
+    /// `font_family` / `font_size` / `line_height` — there is no
+    /// weight or style in the actually-rendered text style, so
+    /// probing Regular matches the face the renderer / exporter
+    /// will pick.
+    ///
+    /// **Future-proofing note**: when `TextStyle` grows weight /
+    /// style fields (i.e. a text layer can be authored as Bold or
+    /// Italic in a way that affects which face the renderer picks),
+    /// both `resolve_face` and `missing_glyphs` will need to grow a
+    /// matching query parameter so the coverage probe stays
+    /// aligned with the rendered face. Doing it now would make
+    /// `missing_glyphs` "more accurate" than the renderer, which is
+    /// the wrong direction — the check is intentionally pinned to
+    /// what the renderer actually does.
     ///
     /// Returns `Err(FontManagerError::NotFound)` when no face at all
     /// can be resolved for `family`. The caller normally pairs this

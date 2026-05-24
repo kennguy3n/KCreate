@@ -747,6 +747,22 @@ function SmartSelectSection({
     }
     canvas.width = maskInfo.width;
     canvas.height = maskInfo.height;
+    // Defensive guard: the Rust mask is one byte per pixel, so
+    // `bytes.length` must exactly match `width * height`. Bail out
+    // and clear the canvas if it doesn't — `Uint8ClampedArray`
+    // silently ignores out-of-bounds writes, so a size mismatch
+    // would otherwise render a truncated preview with uninitialized
+    // transparent pixels for the missing region. Mismatches imply
+    // a bridge / backend bug, so we render nothing rather than a
+    // visually-plausible-but-wrong mask.
+    const expectedLen = maskInfo.width * maskInfo.height;
+    if (bytes.length !== expectedLen) {
+      ctx.clearRect(0, 0, maskInfo.width, maskInfo.height);
+      console.warn(
+        `kcreate: smart-select mask size mismatch — got ${bytes.length} bytes, expected ${expectedLen} (${maskInfo.width}×${maskInfo.height})`,
+      );
+      return;
+    }
     const image = ctx.createImageData(maskInfo.width, maskInfo.height);
     // The Rust mask is one byte per pixel (0 or 255). We expand to
     // RGBA with the mask value as the alpha channel and a vivid

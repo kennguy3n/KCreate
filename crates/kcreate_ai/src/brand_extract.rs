@@ -202,9 +202,7 @@ mod tests {
         for (name, grammar) in grammars {
             let bytes = grammar.as_bytes();
             for (i, &b) in bytes.iter().enumerate() {
-                let is_bounded = b == b'{'
-                    && i + 1 < bytes.len()
-                    && bytes[i + 1].is_ascii_digit();
+                let is_bounded = b == b'{' && i + 1 < bytes.len() && bytes[i + 1].is_ascii_digit();
                 assert!(
                     !is_bounded,
                     "{name} uses bounded repetition near byte {i}: `{snippet}` — \

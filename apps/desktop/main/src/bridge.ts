@@ -447,6 +447,18 @@ export interface Bridge {
   // membership" affordance in the KChat sign-in panel.
   kchatDevIssuerAvailable?(): boolean;
   kchatDevMintMembership?(requestJson: string): string;
+  // Trusted-issuer allowlist for distinguishing real KChat
+  // installs (server-minted) from dev-mint installs (in-process
+  // issuer). Empty list = "accept any issuer" (backward-compat
+  // with the dev flow). Non-empty = installs must match a listed
+  // pubkey or the gate stays locked. `kchatSetTrustStorePath`
+  // points the bridge at a JSON file on disk; subsequent
+  // add/remove calls are persisted via atomic temp-file-rename so
+  // changes survive an app restart.
+  kchatSetTrustStorePath(path: string): string;
+  kchatTrustedIssuers(): string;
+  kchatAddTrustedIssuer(issuerJson: string): string;
+  kchatRemoveTrustedIssuer(issuerPublicKey: string): string;
   /// Re-publish the cached scene. Used by the session event tick
   /// to refresh remote-peer cursor overlays.
   documentRequestRender(): void;

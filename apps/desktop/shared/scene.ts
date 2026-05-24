@@ -2420,6 +2420,46 @@ export interface KChatMembershipStatus {
   /// ISO-8601 expiry, or `null` when locked. The renderer can use
   /// this to show a "renew soon" CTA when expiry is imminent.
   expiresAt: string | null;
+  /// 32-byte Ed25519 verifying key of the issuer that minted the
+  /// active membership (URL-safe base64, no padding). `null` when
+  /// `locked` is true. Renderer surfaces this on a "Issued by …"
+  /// line below the group / expiry summary.
+  issuerPublicKey?: string | null;
+  /// Human-readable label of the matching trusted-issuer entry
+  /// (if any). `null` when locked, when the issuer is not on the
+  /// allowlist (`issuerTrusted` is `false`), or when the allowlist
+  /// is empty (no labels to attach). The renderer falls back to a
+  /// truncated `issuerPublicKey` for display in those cases.
+  issuerLabel?: string | null;
+  /// `true` iff the issuer is listed in the configured allowlist
+  /// OR the allowlist is empty (backward-compat: empty list means
+  /// "accept any issuer"). The renderer renders a distinct
+  /// "Untrusted issuer — test only" badge when this is `false`.
+  issuerTrusted?: boolean;
+}
+
+/// One entry in the KChat trusted-issuer allowlist. Mirrors
+/// `kcreate_bridge::collab::TrustedIssuer`. The allowlist is
+/// loaded from disk at app start (via
+/// `KChatBridge.setTrustStorePath`) and mutated via
+/// `addTrustedIssuer` / `removeTrustedIssuer`. An empty list
+/// preserves the pre-Block-E behaviour of "accept any issuer" so
+/// the dev-mint flow keeps working out of the box.
+export interface TrustedIssuer {
+  /// 32-byte Ed25519 verifying key of the issuer, URL-safe base64
+  /// (no padding). Padding is stripped on the way in so a user
+  /// pasting a padded key from a KChat admin dashboard still
+  /// matches install requests, which always arrive unpadded.
+  issuerPublicKey: string;
+  /// Human-readable label shown in the sign-in panel and on the
+  /// "Issued by" line of the membership-status summary. Max 128
+  /// characters; non-empty.
+  label: string;
+  /// ISO-8601 timestamp at which the entry was added or last
+  /// updated. Reset to "now" by `addTrustedIssuer` even when the
+  /// caller supplies an older timestamp — this prevents a buggy
+  /// renderer from back-dating the addition.
+  addedAt: string;
 }
 
 /// Dev-only payload accepted by the optional
@@ -2487,6 +2527,28 @@ export interface KChatBridge {
   /// [`install`]. Rejects with a typed error when the bridge is
   /// built without `kchat-dev-issuer`.
   devMintMembership(request: KChatDevMintRequest): Promise<KChatInstallRequest>;
+  /// Point the trust-store at a JSON file on disk. The Electron
+  /// main process calls this once at app start with
+  /// `<userData>/kchat_trust.json`. The file is created lazily on
+  /// first add; missing-file is treated as "empty allowlist". The
+  /// current allowlist (after reading the file, if any) is
+  /// returned. Idempotent — safe to call multiple times.
+  setTrustStorePath(path: string): Promise<TrustedIssuer[]>;
+  /// Snapshot the current trusted-issuer allowlist.
+  trustedIssuers(): Promise<TrustedIssuer[]>;
+  /// Add (or update) a trusted issuer. If an entry with the same
+  /// `issuerPublicKey` already exists, its label and timestamp
+  /// are replaced — same call is the "edit label" path. The
+  /// returned list is the post-add snapshot. Persisted to the
+  /// configured trust-store file (if any) via an atomic
+  /// temp-file-then-rename.
+  addTrustedIssuer(issuer: TrustedIssuer): Promise<TrustedIssuer[]>;
+  /// Remove the entry with the given `issuerPublicKey`. No-op if
+  /// no matching entry exists (returns the unchanged list). When
+  /// the last entry is removed, the bridge collapses back to
+  /// "accept any issuer" (`issuerTrusted` becomes `true` for any
+  /// active membership).
+  removeTrustedIssuer(issuerPublicKey: string): Promise<TrustedIssuer[]>;
 }
 
 declare global {

@@ -28,6 +28,7 @@ import type {
   KChatInstallRequest,
   KChatLocalIdentity,
   KChatMembershipStatus,
+  TrustedIssuer,
 } from "../../../shared/scene";
 import { colors, radius, spacing } from "../styles/tokens";
 
@@ -100,6 +101,64 @@ export function KChatSignInPanel({
       cancelled = true;
     };
   }, []);
+
+  // Live trusted-issuer allowlist. Loaded once on mount; mutated
+  // in place by the add/remove flows below so the panel re-renders
+  // without an extra bridge round-trip. An empty list means the
+  // bridge accepts any issuer (backward-compat with the dev flow),
+  // which we surface explicitly in the management section so the
+  // user understands the trust posture.
+  const [trustedIssuers, setTrustedIssuers] = useState<TrustedIssuer[]>([]);
+  const [trustedIssuersError, setTrustedIssuersError] = useState<string | null>(
+    null,
+  );
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const list = await window.kcreate.kchat.trustedIssuers();
+        if (!cancelled) setTrustedIssuers(list);
+      } catch (e) {
+        if (!cancelled) setTrustedIssuersError(errMsg(e));
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const handleAddTrustedIssuer = useCallback(
+    async (input: { issuerPublicKey: string; label: string }): Promise<void> => {
+      setTrustedIssuersError(null);
+      try {
+        // `addedAt` is canonicalised on the Rust side regardless
+        // of what we send, but the schema requires the field so
+        // we provide "now".
+        const next = await window.kcreate.kchat.addTrustedIssuer({
+          issuerPublicKey: input.issuerPublicKey,
+          label: input.label,
+          addedAt: new Date().toISOString(),
+        });
+        setTrustedIssuers(next);
+      } catch (e) {
+        setTrustedIssuersError(errMsg(e));
+      }
+    },
+    [],
+  );
+  const handleRemoveTrustedIssuer = useCallback(
+    async (issuerPublicKey: string): Promise<void> => {
+      setTrustedIssuersError(null);
+      try {
+        const next =
+          await window.kcreate.kchat.removeTrustedIssuer(issuerPublicKey);
+        setTrustedIssuers(next);
+      } catch (e) {
+        setTrustedIssuersError(errMsg(e));
+      }
+    },
+    [],
+  );
 
   // Derive the local peer identity from the persistent seed.
   // Needed for the dev mint path (to bind the attestation to this
@@ -268,6 +327,10 @@ export function KChatSignInPanel({
         onClear={handleClear}
         busy={busy}
         error={error}
+        trustedIssuers={trustedIssuers}
+        trustedIssuersError={trustedIssuersError}
+        onAddTrustedIssuer={handleAddTrustedIssuer}
+        onRemoveTrustedIssuer={handleRemoveTrustedIssuer}
       />
     );
   }
@@ -335,6 +398,13 @@ export function KChatSignInPanel({
       ) : null}
 
       {error !== null ? <div style={errorStyle}>{error}</div> : null}
+
+      <TrustedIssuersSection
+        issuers={trustedIssuers}
+        error={trustedIssuersError}
+        onAdd={handleAddTrustedIssuer}
+        onRemove={handleRemoveTrustedIssuer}
+      />
     </section>
   );
 }
@@ -344,13 +414,38 @@ function SignedInView({
   onClear,
   busy,
   error,
+  trustedIssuers,
+  trustedIssuersError,
+  onAddTrustedIssuer,
+  onRemoveTrustedIssuer,
 }: {
   status: KChatMembershipStatus;
   onClear: () => void;
   busy: boolean;
   error: string | null;
+  trustedIssuers: TrustedIssuer[];
+  trustedIssuersError: string | null;
+  onAddTrustedIssuer: (input: {
+    issuerPublicKey: string;
+    label: string;
+  }) => Promise<void>;
+  onRemoveTrustedIssuer: (issuerPublicKey: string) => Promise<void>;
 }): JSX.Element {
   const expiresInLabel = useExpiryCountdown(status.expiresAt);
+  // Renderer surface for the trust posture of the active install.
+  // The Rust side fills `issuerPublicKey` whenever the gate is
+  // open; `issuerLabel` is populated only when the issuer matched
+  // a trusted-issuer entry; `issuerTrusted` is `true` when the
+  // allowlist is empty (accept-any) OR the issuer matched.
+  const issuerPk = status.issuerPublicKey ?? null;
+  const issuerLabel = status.issuerLabel ?? null;
+  const issuerTrusted = status.issuerTrusted ?? true;
+  // Empty allowlist semantics: when the list is empty, every
+  // install is "trusted" by default. Differentiate the "truly
+  // pinned" UI (badge: Trusted) from the "accept-any" UI (badge:
+  // Accept any — not pinned). The renderer copy is explicit so
+  // the user understands the trust posture without reading code.
+  const allowlistEmpty = trustedIssuers.length === 0;
   return (
     <section style={sectionStyle}>
       <h3 style={sectionTitleStyle}>KChat group</h3>
@@ -372,6 +467,37 @@ function SignedInView({
             <span style={hintStyle}> · {expiresInLabel}</span>
           ) : null}
         </dd>
+        <dt style={dtStyle}>Issued by</dt>
+        <dd style={ddStyle}>
+          {issuerPk !== null ? (
+            <>
+              <code style={codeStyle}>
+                {issuerLabel !== null
+                  ? issuerLabel
+                  : truncateMiddle(issuerPk, 12)}
+              </code>
+              <span style={hintStyle}> · </span>
+              {issuerTrusted ? (
+                allowlistEmpty ? (
+                  <span style={infoBadgeStyle}>Accept any — not pinned</span>
+                ) : (
+                  <span style={trustedBadgeStyle}>Trusted</span>
+                )
+              ) : (
+                <span style={untrustedBadgeStyle}>
+                  Untrusted — test only
+                </span>
+              )}
+              {issuerLabel === null && issuerPk !== null ? (
+                <div style={hintStyle}>
+                  <code style={codeStyle}>{issuerPk}</code>
+                </div>
+              ) : null}
+            </>
+          ) : (
+            <span style={hintStyle}>(unknown)</span>
+          )}
+        </dd>
       </dl>
       <div style={buttonRowStyle}>
         <button
@@ -384,8 +510,142 @@ function SignedInView({
         </button>
       </div>
       {error !== null ? <div style={errorStyle}>{error}</div> : null}
+
+      <TrustedIssuersSection
+        issuers={trustedIssuers}
+        error={trustedIssuersError}
+        onAdd={onAddTrustedIssuer}
+        onRemove={onRemoveTrustedIssuer}
+      />
     </section>
   );
+}
+
+/// Trusted-issuer allowlist management. Visible in both the
+/// locked and signed-in views so an admin can pre-pin a real
+/// KChat issuer before pasting the first attestation OR retire a
+/// compromised issuer without signing out first. An empty list
+/// is the "accept any issuer" default — explicit in the empty
+/// state so the user knows what trust posture they have.
+function TrustedIssuersSection({
+  issuers,
+  error,
+  onAdd,
+  onRemove,
+}: {
+  issuers: TrustedIssuer[];
+  error: string | null;
+  onAdd: (input: { issuerPublicKey: string; label: string }) => Promise<void>;
+  onRemove: (issuerPublicKey: string) => Promise<void>;
+}): JSX.Element {
+  const [pendingPk, setPendingPk] = useState("");
+  const [pendingLabel, setPendingLabel] = useState("");
+  const [adding, setAdding] = useState(false);
+  const canAdd =
+    pendingPk.trim().length > 0 && pendingLabel.trim().length > 0 && !adding;
+  const handleSubmit = useCallback(async (): Promise<void> => {
+    setAdding(true);
+    try {
+      await onAdd({
+        issuerPublicKey: pendingPk.trim(),
+        label: pendingLabel.trim(),
+      });
+      setPendingPk("");
+      setPendingLabel("");
+    } finally {
+      setAdding(false);
+    }
+  }, [onAdd, pendingLabel, pendingPk]);
+  return (
+    <div style={trustSectionStyle}>
+      <div style={devHeaderStyle}>
+        <strong>Trusted KChat issuers</strong>
+        {issuers.length === 0 ? (
+          <span style={infoBadgeStyle}>Accept any (empty)</span>
+        ) : (
+          <span style={trustedBadgeStyle}>
+            {issuers.length} pinned
+          </span>
+        )}
+      </div>
+      <p style={hintStyle}>
+        Pin one or more issuer public keys to require that
+        installed memberships come from a known KChat server.
+        Leave the list empty to accept any issuer (useful for
+        dev / lab work). Persisted under{" "}
+        <code style={codeStyle}>kchat_trust.json</code> in the
+        Electron user-data directory.
+      </p>
+      {issuers.length > 0 ? (
+        <ul style={trustListStyle}>
+          {issuers.map((issuer) => (
+            <li key={issuer.issuerPublicKey} style={trustListItemStyle}>
+              <div style={trustListItemBodyStyle}>
+                <strong>{issuer.label}</strong>
+                <code style={codeStyle}>{issuer.issuerPublicKey}</code>
+                <span style={hintStyle}>added {issuer.addedAt}</span>
+              </div>
+              <button
+                type="button"
+                onClick={() => {
+                  void onRemove(issuer.issuerPublicKey);
+                }}
+                style={secondaryButtonStyle(false)}
+              >
+                Remove
+              </button>
+            </li>
+          ))}
+        </ul>
+      ) : null}
+      <label style={labelStyle}>
+        <span style={labelTextStyle}>Issuer public key</span>
+        <input
+          type="text"
+          value={pendingPk}
+          onChange={(e) => setPendingPk(e.target.value)}
+          placeholder="URL-safe base64 (no padding required)"
+          spellCheck={false}
+          style={inputStyle}
+          disabled={adding}
+        />
+      </label>
+      <label style={labelStyle}>
+        <span style={labelTextStyle}>Label</span>
+        <input
+          type="text"
+          value={pendingLabel}
+          onChange={(e) => setPendingLabel(e.target.value)}
+          placeholder="e.g. KChat Production"
+          spellCheck={false}
+          style={inputStyle}
+          disabled={adding}
+        />
+      </label>
+      <div style={buttonRowStyle}>
+        <button
+          type="button"
+          onClick={() => {
+            void handleSubmit();
+          }}
+          disabled={!canAdd}
+          style={primaryButtonStyle(!canAdd)}
+        >
+          {adding ? "Adding…" : "Add trusted issuer"}
+        </button>
+      </div>
+      {error !== null ? <div style={errorStyle}>{error}</div> : null}
+    </div>
+  );
+}
+
+/// Visually shorten a long base64 key for the "Issued by" line
+/// while keeping enough characters at either end to be
+/// recognisable. We only use this when no human-readable label
+/// is available. The full pubkey is still shown verbatim below.
+function truncateMiddle(s: string, keep: number): string {
+  if (s.length <= keep * 2 + 1) return s;
+  return `${s.slice(0, keep)}…${s.slice(-keep)}`;
 }
 
 function DevMintSection({
@@ -708,6 +968,77 @@ const badgeStyle: React.CSSProperties = {
   borderRadius: radius.pill,
   background: colors.danger,
   color: "#fff",
+};
+
+/// Provenance badges shown on the "Issued by" line in
+/// SignedInView. Three distinct visual treatments so the user can
+/// tell at a glance whether the install is pinned, accept-any, or
+/// untrusted-but-installed (test-only).
+const trustedBadgeStyle: React.CSSProperties = {
+  fontSize: 10,
+  textTransform: "uppercase",
+  letterSpacing: 0.4,
+  padding: "1px 6px",
+  borderRadius: radius.pill,
+  background: colors.accent,
+  color: "#fff",
+};
+
+const untrustedBadgeStyle: React.CSSProperties = {
+  fontSize: 10,
+  textTransform: "uppercase",
+  letterSpacing: 0.4,
+  padding: "1px 6px",
+  borderRadius: radius.pill,
+  background: colors.danger,
+  color: "#fff",
+};
+
+const infoBadgeStyle: React.CSSProperties = {
+  fontSize: 10,
+  textTransform: "uppercase",
+  letterSpacing: 0.4,
+  padding: "1px 6px",
+  borderRadius: radius.pill,
+  background: colors.border,
+  color: colors.text,
+};
+
+const trustSectionStyle: React.CSSProperties = {
+  display: "flex",
+  flexDirection: "column",
+  gap: spacing.sm,
+  padding: spacing.sm,
+  border: `1px solid ${colors.border}`,
+  borderRadius: radius.sm,
+  background: colors.bg,
+};
+
+const trustListStyle: React.CSSProperties = {
+  display: "flex",
+  flexDirection: "column",
+  gap: spacing.xs,
+  margin: 0,
+  padding: 0,
+  listStyle: "none",
+};
+
+const trustListItemStyle: React.CSSProperties = {
+  display: "flex",
+  gap: spacing.sm,
+  alignItems: "flex-start",
+  padding: spacing.xs,
+  border: `1px solid ${colors.border}`,
+  borderRadius: radius.sm,
+  background: colors.bgSoft,
+};
+
+const trustListItemBodyStyle: React.CSSProperties = {
+  display: "flex",
+  flex: 1,
+  flexDirection: "column",
+  gap: 2,
+  minWidth: 0,
 };
 
 const dlStyle: React.CSSProperties = {

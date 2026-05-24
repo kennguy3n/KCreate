@@ -1817,6 +1817,46 @@ function registerIpcHandlers(): void {
       return fn(requestJson);
     },
   );
+  // Trusted-issuer allowlist for distinguishing real KChat
+  // installs from dev-mint installs. The bridge starts with an
+  // empty list (= "accept any issuer", preserving the dev flow),
+  // gets pointed at the persistent JSON file at startup (see
+  // `whenReady` below), and exposes add/remove/list to the
+  // renderer's KChatSignInPanel.
+  ipcMain.handle(
+    "kcreate/kchat/set-trust-store-path",
+    (_e, p: string) => requireBridge().kchatSetTrustStorePath(p),
+  );
+  ipcMain.handle("kcreate/kchat/trusted-issuers", () =>
+    requireBridge().kchatTrustedIssuers(),
+  );
+  ipcMain.handle(
+    "kcreate/kchat/add-trusted-issuer",
+    (_e, issuerJson: string) =>
+      requireBridge().kchatAddTrustedIssuer(issuerJson),
+  );
+  ipcMain.handle(
+    "kcreate/kchat/remove-trusted-issuer",
+    (_e, issuerPublicKey: string) =>
+      requireBridge().kchatRemoveTrustedIssuer(issuerPublicKey),
+  );
+}
+
+/// Point the KChat trust-store at the per-user JSON file under
+/// the Electron `userData` directory and surface any I/O failure
+/// to the main-process log. We deliberately swallow errors here
+/// rather than crashing the app — a missing file is treated as
+/// "empty allowlist" on the Rust side, and any deeper I/O issue
+/// (permissions, corrupt JSON) is non-fatal to the editor. The
+/// renderer surfaces a banner if subsequent add/remove calls
+/// fail to persist. Idempotent: safe to call multiple times.
+function initializeKChatTrustStore(): void {
+  try {
+    const trustFile = path.join(app.getPath("userData"), "kchat_trust.json");
+    requireBridge().kchatSetTrustStorePath(trustFile);
+  } catch (err) {
+    console.error("kchat: failed to initialise trust store on disk", err);
+  }
 }
 
 void app.whenReady().then(() => {
@@ -1824,6 +1864,11 @@ void app.whenReady().then(() => {
   // can hit `requireBridge()`. See the comment above `let bridge`.
   bridge = loadBridge();
   registerIpcHandlers();
+  // Wire the KChat trust-store at `<userData>/kchat_trust.json`.
+  // Must run AFTER the bridge is loaded (it dispatches an N-API
+  // call) but BEFORE any renderer window opens (so the first
+  // `kchat.status()` poll already sees the loaded allowlist).
+  initializeKChatTrustStore();
   createWindow();
 
   app.on("activate", () => {

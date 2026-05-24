@@ -2275,6 +2275,85 @@ pub fn kchat_derive_local_identity(seed_b64: String) -> NapiResult<String> {
     })
 }
 
+/// Configure the on-disk path for the KChat trusted-issuer
+/// allowlist. The Electron main process should call this once at
+/// startup with `<userData>/kchat_trust.json`. Reads the file at
+/// the supplied path (or starts with an empty list if missing)
+/// and replaces the in-memory store. Subsequent
+/// `kchat_add_trusted_issuer` / `kchat_remove_trusted_issuer`
+/// calls atomically persist back to this path.
+///
+/// Returns the current list as a JSON `TrustedIssuer[]`.
+#[cfg(feature = "collab")]
+#[napi]
+pub fn kchat_set_trust_store_path(path: String) -> NapiResult<String> {
+    let issuers = crate::collab::kchat_set_trust_store_path(std::path::PathBuf::from(path))
+        .map_err(map_session_err)?;
+    serde_json::to_string(&issuers).map_err(|e| {
+        NapiError::new(
+            Status::GenericFailure,
+            format!("kcreate_bridge: kchat_set_trust_store_path serialize: {e}"),
+        )
+    })
+}
+
+/// Return the current trusted-issuer allowlist as a JSON
+/// `TrustedIssuer[]`. Cheap clone of the in-memory list; never
+/// reads from disk (the on-disk list is loaded by
+/// `kchat_set_trust_store_path`).
+#[cfg(feature = "collab")]
+#[napi]
+pub fn kchat_trusted_issuers() -> NapiResult<String> {
+    let issuers = crate::collab::kchat_list_trusted_issuers();
+    serde_json::to_string(&issuers).map_err(|e| {
+        NapiError::new(
+            Status::GenericFailure,
+            format!("kcreate_bridge: kchat_trusted_issuers serialize: {e}"),
+        )
+    })
+}
+
+/// Add (or update) a trusted issuer. `issuer_json` deserialises
+/// to `TrustedIssuer { issuer_public_key, label, added_at? }`. If
+/// an entry with the same `issuer_public_key` exists, its label
+/// and timestamp are replaced — so the renderer can re-call this
+/// to rename an entry. Persists to the configured path. Returns
+/// the updated list.
+#[cfg(feature = "collab")]
+#[napi]
+pub fn kchat_add_trusted_issuer(issuer_json: String) -> NapiResult<String> {
+    let issuer: crate::collab::TrustedIssuer = serde_json::from_str(&issuer_json).map_err(|e| {
+        NapiError::new(
+            Status::InvalidArg,
+            format!("kcreate_bridge: kchat_add_trusted_issuer request: {e}"),
+        )
+    })?;
+    let updated = crate::collab::kchat_add_trusted_issuer(issuer).map_err(map_session_err)?;
+    serde_json::to_string(&updated).map_err(|e| {
+        NapiError::new(
+            Status::GenericFailure,
+            format!("kcreate_bridge: kchat_add_trusted_issuer serialize: {e}"),
+        )
+    })
+}
+
+/// Remove a trusted issuer by its `issuer_public_key`. No-ops when
+/// no matching entry exists. Persists to the configured path.
+/// Returns the updated list. Removing the last entry collapses
+/// the allowlist back to "accept any issuer" mode.
+#[cfg(feature = "collab")]
+#[napi]
+pub fn kchat_remove_trusted_issuer(issuer_public_key: String) -> NapiResult<String> {
+    let updated =
+        crate::collab::kchat_remove_trusted_issuer(&issuer_public_key).map_err(map_session_err)?;
+    serde_json::to_string(&updated).map_err(|e| {
+        NapiError::new(
+            Status::GenericFailure,
+            format!("kcreate_bridge: kchat_remove_trusted_issuer serialize: {e}"),
+        )
+    })
+}
+
 /// Dev-only: mint a fresh KChat membership attestation against a
 /// deterministic in-process issuer. Returns a JSON
 /// [`KChatInstallRequest`] the renderer can pass straight back

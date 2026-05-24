@@ -118,6 +118,7 @@ import type {
   KChatLocalIdentity,
   KChatMembershipStatus,
   SessionStartReport,
+  TrustedIssuer,
 } from "../../shared/scene";
 
 type FrameInfoSnake = {
@@ -1573,6 +1574,35 @@ const kchat: KChatBridge = {
       JSON.stringify(request),
     )) as string;
     return JSON.parse(raw) as KChatInstallRequest;
+  },
+  async setTrustStorePath(p: string): Promise<TrustedIssuer[]> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/kchat/set-trust-store-path",
+      p,
+    )) as string;
+    return JSON.parse(raw) as TrustedIssuer[];
+  },
+  async trustedIssuers(): Promise<TrustedIssuer[]> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/kchat/trusted-issuers",
+    )) as string;
+    return JSON.parse(raw) as TrustedIssuer[];
+  },
+  async addTrustedIssuer(issuer: TrustedIssuer): Promise<TrustedIssuer[]> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/kchat/add-trusted-issuer",
+      JSON.stringify(issuer),
+    )) as string;
+    return JSON.parse(raw) as TrustedIssuer[];
+  },
+  async removeTrustedIssuer(
+    issuerPublicKey: string,
+  ): Promise<TrustedIssuer[]> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/kchat/remove-trusted-issuer",
+      issuerPublicKey,
+    )) as string;
+    return JSON.parse(raw) as TrustedIssuer[];
   },
 };
 

@@ -27,6 +27,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -250,6 +251,22 @@ pub enum SessionBridgeError {
     /// include the dev issuer" message instead of a generic error.
     #[error("KChat dev issuer is not enabled in this build")]
     KChatDevIssuerDisabled,
+    /// The install request's `issuer_public_key` is not on the
+    /// configured trusted-issuer allowlist. Block E gate — only
+    /// fires when the allowlist is non-empty; an empty allowlist
+    /// preserves the pre-Block-E "accept any issuer" behaviour
+    /// that the dev-mint surface depends on.
+    #[error(
+        "KChat issuer {issuer_public_key} is not on the trusted-issuer allowlist; \
+         add it via `kchat_add_trusted_issuer` or clear the allowlist to accept any issuer"
+    )]
+    IssuerNotTrusted { issuer_public_key: String },
+    /// Persisting the trust store to disk failed. The in-memory
+    /// state is still mutated, but subsequent sessions will not
+    /// see the change. Renderer surfaces this so the user knows
+    /// their add/remove won't survive an app restart.
+    #[error("KChat trust store I/O: {0}")]
+    TrustStoreIo(String),
 }
 
 pub type Result<T> = std::result::Result<T, SessionBridgeError>;
@@ -1415,13 +1432,15 @@ impl From<SessionBridgeError> for DocumentBridgeError {
             | SessionBridgeError::AlreadyRunning
             | SessionBridgeError::InvalidArgument { .. }
             | SessionBridgeError::NotInKChatGroup
-            | SessionBridgeError::KChatDevIssuerDisabled => Self::InvalidArgument {
+            | SessionBridgeError::KChatDevIssuerDisabled
+            | SessionBridgeError::IssuerNotTrusted { .. } => Self::InvalidArgument {
                 argument: "session".to_string(),
                 value: e.to_string(),
             },
             SessionBridgeError::Transport(_)
             | SessionBridgeError::Collab(_)
-            | SessionBridgeError::KChat(_) => Self::Io(std::io::Error::other(e.to_string())),
+            | SessionBridgeError::KChat(_)
+            | SessionBridgeError::TrustStoreIo(_) => Self::Io(std::io::Error::other(e.to_string())),
         }
     }
 }
@@ -1450,6 +1469,30 @@ pub struct KChatMembershipStatus {
     /// a "renew soon" CTA when this is within e.g. 5 minutes of
     /// `now`.
     pub expires_at: Option<DateTime<Utc>>,
+    /// 32-byte Ed25519 verifying key of the issuer that minted the
+    /// active membership (URL-safe base64, no padding). `None`
+    /// when locked. Surfaced so the renderer can render an "issued
+    /// by …" line without having to round-trip back through the
+    /// install request.
+    #[serde(default)]
+    pub issuer_public_key: Option<String>,
+    /// Human-readable label of the trusted-issuer entry that
+    /// matched the active membership's issuer key, if any. `None`
+    /// when locked OR when the issuer is not on the allowlist
+    /// (in which case `issuer_trusted == false`). Set from
+    /// [`TrustedIssuer::label`].
+    #[serde(default)]
+    pub issuer_label: Option<String>,
+    /// `true` iff the active membership's issuer is on the
+    /// configured trusted-issuer allowlist, OR the allowlist is
+    /// empty (which preserves the pre-Block-E "accept any issuer"
+    /// behaviour for the dev-mint flow). The renderer renders a
+    /// distinct badge for `false` ("untrusted issuer — test only")
+    /// so a real KChat sign-in is visually distinguishable from a
+    /// dev-mint sign-in even when the dev key isn't on the list.
+    /// `false` when locked.
+    #[serde(default)]
+    pub issuer_trusted: bool,
 }
 
 /// Wire-format DTO accepted by [`kchat_install_authority`]. All
@@ -1547,6 +1590,284 @@ fn decode_verifying_key(input: &str, field: &'static str) -> Result<VerifyingKey
     })
 }
 
+// -----------------------------------------------------------------
+// KChat trusted-issuer allowlist (Block E)
+// -----------------------------------------------------------------
+
+/// One entry on the trusted-issuer allowlist. The bridge accepts
+/// install requests whose `issuer_public_key` is on the list (when
+/// the list is non-empty); a real KChat group's issuer is pinned
+/// here once and then every subsequent attestation from that group
+/// verifies without further user action.
+///
+/// Wire format mirrors `apps/desktop/shared/scene.ts::TrustedIssuer`;
+/// fields are camelCase via `#[serde(rename_all = "camelCase")]`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TrustedIssuer {
+    /// 32-byte Ed25519 verifying key, URL-safe base64 (no padding).
+    /// Pinned exactly — the install path does a bitwise string
+    /// compare rather than re-decoding because both sides of the
+    /// comparison have already been validated as 32-byte b64url.
+    pub issuer_public_key: String,
+    /// User-supplied human-readable label. "KChat Production",
+    /// "Studio Internal", "Dev Sandbox", etc. Capped at 128 chars
+    /// at the bridge level so a misbehaving renderer can't blow
+    /// the trust file size.
+    pub label: String,
+    /// When the issuer was added. Serialised as RFC3339; auto-set
+    /// to `Utc::now()` by [`kchat_add_trusted_issuer`].
+    pub added_at: DateTime<Utc>,
+}
+
+/// Maximum number of characters allowed for [`TrustedIssuer::label`].
+/// Chosen to comfortably hold a friendly identifier without giving
+/// a misbehaving renderer the ability to bloat the trust file.
+const TRUSTED_ISSUER_LABEL_CAP: usize = 128;
+
+/// In-memory + on-disk representation of the trusted-issuer
+/// allowlist. The file format is the serialised JSON of this
+/// struct so future schema additions (e.g. expiry, revocation
+/// reason) can stay backward-compatible via `#[serde(default)]`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct TrustStore {
+    #[serde(default)]
+    issuers: Vec<TrustedIssuer>,
+}
+
+/// Global slot for the in-memory trust store. Loaded lazily from
+/// the configured path on first read after [`kchat_set_trust_store_path`]
+/// is called. Empty by default — preserves the pre-Block-E
+/// "accept any issuer" behaviour for unconfigured installs (which
+/// is what the dev-mint surface relies on).
+fn trust_store_slot() -> &'static Mutex<TrustStore> {
+    static S: OnceLock<Mutex<TrustStore>> = OnceLock::new();
+    S.get_or_init(|| Mutex::new(TrustStore::default()))
+}
+
+/// Global slot for the configured on-disk path of the trust store.
+/// `None` means "memory-only" — adds and removes work but don't
+/// survive across processes. Set by the Electron main process at
+/// startup via [`kchat_set_trust_store_path`].
+fn trust_store_path_slot() -> &'static Mutex<Option<PathBuf>> {
+    static S: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
+    S.get_or_init(|| Mutex::new(None))
+}
+
+/// Read the file at `path`. A missing file is not an error — the
+/// trust store is initialised empty on first run.
+fn read_trust_store_file(path: &Path) -> Result<TrustStore> {
+    match std::fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes).map_err(|e| {
+            SessionBridgeError::TrustStoreIo(format!("parse {}: {e}", path.display()))
+        }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(TrustStore::default()),
+        Err(e) => Err(SessionBridgeError::TrustStoreIo(format!(
+            "read {}: {e}",
+            path.display()
+        ))),
+    }
+}
+
+/// Atomically write `store` to `path`. Uses the standard
+/// write-to-temp-then-rename pattern so a crash mid-write never
+/// leaves a half-truncated trust file on disk.
+fn write_trust_store_file(path: &Path, store: &TrustStore) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                SessionBridgeError::TrustStoreIo(format!("create dir {}: {e}", parent.display()))
+            })?;
+        }
+    }
+    let mut tmp = path.to_path_buf();
+    let file_name = path
+        .file_name()
+        .map(|s| s.to_os_string())
+        .unwrap_or_else(|| std::ffi::OsString::from("kchat_trust.json"));
+    let mut tmp_name = file_name;
+    tmp_name.push(".tmp");
+    tmp.set_file_name(tmp_name);
+    let bytes = serde_json::to_vec_pretty(store)
+        .map_err(|e| SessionBridgeError::TrustStoreIo(format!("encode {}: {e}", path.display())))?;
+    std::fs::write(&tmp, &bytes)
+        .map_err(|e| SessionBridgeError::TrustStoreIo(format!("write {}: {e}", tmp.display())))?;
+    std::fs::rename(&tmp, path).map_err(|e| {
+        SessionBridgeError::TrustStoreIo(format!(
+            "rename {} -> {}: {e}",
+            tmp.display(),
+            path.display()
+        ))
+    })?;
+    Ok(())
+}
+
+/// Configure the on-disk path for the trusted-issuer allowlist.
+/// Reads the file at `path` (or starts with an empty list if
+/// missing) and replaces the in-memory store with the contents.
+/// Subsequent `kchat_add_trusted_issuer` / `kchat_remove_trusted_issuer`
+/// calls atomically persist back to `path`.
+///
+/// The Electron main process calls this once at startup with
+/// `<userData>/kchat_trust.json` (see `apps/desktop/main/src/main.ts`).
+pub fn kchat_set_trust_store_path(path: PathBuf) -> Result<Vec<TrustedIssuer>> {
+    let store = read_trust_store_file(&path)?;
+    let issuers = store.issuers.clone();
+    *trust_store_slot().lock() = store;
+    *trust_store_path_slot().lock() = Some(path);
+    Ok(issuers)
+}
+
+/// Snapshot of the current trusted-issuer list. Cheap clone; the
+/// caller holds no locks across N-API boundaries.
+pub fn kchat_list_trusted_issuers() -> Vec<TrustedIssuer> {
+    trust_store_slot().lock().issuers.clone()
+}
+
+/// Validate + normalise an incoming `TrustedIssuer` payload from
+/// the renderer. Rejects non-32-byte keys, empty / whitespace-only
+/// labels, and labels over [`TRUSTED_ISSUER_LABEL_CAP`].
+fn validate_trusted_issuer(input: &TrustedIssuer) -> Result<TrustedIssuer> {
+    // Re-decode the public key so we reject malformed entries
+    // at the bridge boundary rather than at install time.
+    decode_verifying_key(&input.issuer_public_key, "issuerPublicKey")?;
+    let label = input.label.trim();
+    if label.is_empty() {
+        return Err(SessionBridgeError::InvalidArgument {
+            field: "label",
+            message: "label must be non-empty".into(),
+        });
+    }
+    if label.chars().count() > TRUSTED_ISSUER_LABEL_CAP {
+        return Err(SessionBridgeError::InvalidArgument {
+            field: "label",
+            message: format!("label must be at most {TRUSTED_ISSUER_LABEL_CAP} characters"),
+        });
+    }
+    Ok(TrustedIssuer {
+        issuer_public_key: input.issuer_public_key.clone(),
+        label: label.to_string(),
+        added_at: input.added_at,
+    })
+}
+
+/// Add (or update) a trusted issuer. If an entry with the same
+/// `issuer_public_key` already exists, its label and timestamp are
+/// replaced — so the renderer's "Edit label" flow can re-call this
+/// with the new label without a separate update path. Returns the
+/// updated list.
+pub fn kchat_add_trusted_issuer(input: TrustedIssuer) -> Result<Vec<TrustedIssuer>> {
+    let normalised = validate_trusted_issuer(&TrustedIssuer {
+        issuer_public_key: input.issuer_public_key.trim_end_matches('=').to_string(),
+        label: input.label,
+        added_at: input.added_at,
+    })?;
+    let entry = TrustedIssuer {
+        issuer_public_key: normalised.issuer_public_key,
+        label: normalised.label,
+        // Always overwrite the timestamp with `now`; a renderer
+        // that supplies an old timestamp would otherwise be able
+        // to back-date an addition.
+        added_at: Utc::now(),
+    };
+    let snapshot = {
+        let mut guard = trust_store_slot().lock();
+        if let Some(existing) = guard
+            .issuers
+            .iter_mut()
+            .find(|i| i.issuer_public_key == entry.issuer_public_key)
+        {
+            existing.label = entry.label.clone();
+            existing.added_at = entry.added_at;
+        } else {
+            guard.issuers.push(entry);
+        }
+        guard.clone()
+    };
+    if let Some(path) = trust_store_path_slot().lock().clone() {
+        write_trust_store_file(&path, &snapshot)?;
+    }
+    Ok(snapshot.issuers)
+}
+
+/// Remove a trusted issuer by its `issuer_public_key`. Returns the
+/// updated list. Removing the last entry collapses the allowlist
+/// back to "accept any issuer" mode — explicit by design, so a
+/// user clearing their list never ends up locked out of dev-mint
+/// without realising why.
+pub fn kchat_remove_trusted_issuer(issuer_public_key: &str) -> Result<Vec<TrustedIssuer>> {
+    let key = issuer_public_key.trim_end_matches('=').to_string();
+    let snapshot = {
+        let mut guard = trust_store_slot().lock();
+        guard.issuers.retain(|i| i.issuer_public_key != key);
+        guard.clone()
+    };
+    if let Some(path) = trust_store_path_slot().lock().clone() {
+        write_trust_store_file(&path, &snapshot)?;
+    }
+    Ok(snapshot.issuers)
+}
+
+/// Look up a trusted-issuer entry by public key. Used by the
+/// status builders to populate `issuer_label` / `issuer_trusted`
+/// on a signed-in `KChatMembershipStatus`. Returns `None` if the
+/// allowlist is empty (the pre-Block-E "accept any issuer" state)
+/// AND if the issuer is not listed; the two are disambiguated by
+/// the caller via `trusted_issuer_list_is_empty`.
+fn trusted_issuer_lookup(issuer_public_key: &str) -> Option<TrustedIssuer> {
+    let normalised = issuer_public_key.trim_end_matches('=');
+    trust_store_slot()
+        .lock()
+        .issuers
+        .iter()
+        .find(|i| i.issuer_public_key == normalised)
+        .cloned()
+}
+
+/// Returns `true` when no trusted issuers are configured. Treated
+/// as "accept any issuer" by the install path for backwards-compat
+/// with the dev-mint flow; treated as `issuer_trusted = true` by
+/// `kchat_membership_status` since the renderer has explicitly opted
+/// out of pinning.
+fn trusted_issuer_list_is_empty() -> bool {
+    trust_store_slot().lock().issuers.is_empty()
+}
+
+/// Build the membership-status DTO for an installed membership,
+/// populating the Block-E provenance fields (`issuer_public_key`,
+/// `issuer_label`, `issuer_trusted`). Centralised so install/
+/// status paths can't drift.
+fn membership_status_for(membership: &KChatMembership) -> KChatMembershipStatus {
+    let issuer_pk = membership.issuer_public_key.clone();
+    let trusted_entry = trusted_issuer_lookup(&issuer_pk);
+    let allowlist_empty = trusted_issuer_list_is_empty();
+    let issuer_trusted = trusted_entry.is_some() || allowlist_empty;
+    KChatMembershipStatus {
+        locked: false,
+        group_id: Some(membership.group_id.as_str().to_string()),
+        peer_id: Some(membership.peer_id().as_str().to_string()),
+        expires_at: Some(membership.expires_at),
+        issuer_public_key: Some(issuer_pk),
+        issuer_label: trusted_entry.map(|t| t.label),
+        issuer_trusted,
+    }
+}
+
+/// Build the membership-status DTO for the locked state. Centralised
+/// alongside `membership_status_for` so the two builders stay
+/// symmetric.
+fn locked_membership_status() -> KChatMembershipStatus {
+    KChatMembershipStatus {
+        locked: true,
+        group_id: None,
+        peer_id: None,
+        expires_at: None,
+        issuer_public_key: None,
+        issuer_label: None,
+        issuer_trusted: false,
+    }
+}
+
 /// Install (or refresh) the KChat group authority. Once a valid
 /// authority is installed, the multiplayer bridge unlocks. A
 /// subsequent `kchat_clear_authority` re-locks it.
@@ -1555,6 +1876,11 @@ fn decode_verifying_key(input: &str, field: &'static str) -> Result<VerifyingKey
 /// binding, and time window — before being installed, so a future
 /// KChat client crash or malicious request can't sneak past the
 /// gate by pushing a malformed attestation.
+///
+/// Block E: when the trusted-issuer allowlist is non-empty, the
+/// request's `issuer_public_key` must be listed; otherwise the
+/// install is rejected with `IssuerNotTrusted`. An empty allowlist
+/// accepts any issuer (back-compat with the dev-mint flow).
 pub fn kchat_install_authority(req: KChatInstallRequest) -> Result<KChatMembershipStatus> {
     let issuer_vk = decode_verifying_key(&req.issuer_public_key, "issuerPublicKey")?;
     // Defence-in-depth: the wire-format `peer_id` must derive from
@@ -1577,6 +1903,20 @@ pub fn kchat_install_authority(req: KChatInstallRequest) -> Result<KChatMembersh
             field: "signature",
             message: format!("expected 64 bytes, got {}", signature_bytes.len()),
         });
+    }
+
+    // Block E gate: consult the trusted-issuer allowlist if it is
+    // configured. The allowlist check uses a normalised string
+    // compare (after stripping any trailing `=` padding) so a
+    // renderer that sends padded base64 still matches the stored
+    // unpadded form.
+    if !trusted_issuer_list_is_empty() {
+        let normalised = req.issuer_public_key.trim_end_matches('=').to_string();
+        if trusted_issuer_lookup(&normalised).is_none() {
+            return Err(SessionBridgeError::IssuerNotTrusted {
+                issuer_public_key: normalised,
+            });
+        }
     }
 
     let group_id =
@@ -1608,12 +1948,7 @@ pub fn kchat_install_authority(req: KChatInstallRequest) -> Result<KChatMembersh
     let shared: SharedKChatAuthority = Arc::new(authority);
     *kchat_slot().lock() = shared;
 
-    Ok(KChatMembershipStatus {
-        locked: false,
-        group_id: Some(membership.group_id.as_str().to_string()),
-        peer_id: Some(membership.peer_id().as_str().to_string()),
-        expires_at: Some(membership.expires_at),
-    })
+    Ok(membership_status_for(&membership))
 }
 
 /// Clear the installed authority and re-lock multiplayer. Any
@@ -1623,12 +1958,7 @@ pub fn kchat_install_authority(req: KChatInstallRequest) -> Result<KChatMembersh
 /// with [`SessionBridgeError::NotInKChatGroup`].
 pub fn kchat_clear_authority() -> KChatMembershipStatus {
     *kchat_slot().lock() = no_kchat_authority();
-    KChatMembershipStatus {
-        locked: true,
-        group_id: None,
-        peer_id: None,
-        expires_at: None,
-    }
+    locked_membership_status()
 }
 
 /// Report the current KChat gate state to the renderer. Uses the
@@ -1642,18 +1972,8 @@ pub fn kchat_clear_authority() -> KChatMembershipStatus {
 /// session call.
 pub fn kchat_membership_status() -> KChatMembershipStatus {
     match require_active_kchat_membership() {
-        Ok(m) => KChatMembershipStatus {
-            locked: false,
-            group_id: Some(m.group_id.as_str().to_string()),
-            peer_id: Some(m.peer_id().as_str().to_string()),
-            expires_at: Some(m.expires_at),
-        },
-        Err(_) => KChatMembershipStatus {
-            locked: true,
-            group_id: None,
-            peer_id: None,
-            expires_at: None,
-        },
+        Ok(m) => membership_status_for(&m),
+        Err(_) => locked_membership_status(),
     }
 }
 
@@ -1900,6 +2220,11 @@ mod tests {
     /// silently inheriting state from a sibling.
     fn reset_kchat_slot() {
         *kchat_slot().lock() = no_kchat_authority();
+        // Block E also adds the trusted-issuer allowlist as a
+        // process-global singleton. Reset both so a sibling test
+        // that left state behind can't taint this one.
+        *trust_store_slot().lock() = TrustStore::default();
+        *trust_store_path_slot().lock() = None;
     }
 
     /// Mint a fresh, valid `KChatInstallRequest` JSON payload bound
@@ -2150,6 +2475,274 @@ mod tests {
         let status = kchat_install_authority(bridge_install).expect("install should succeed");
         assert!(!status.locked, "wire-lockstep install must unlock the gate");
         assert_eq!(status.group_id.as_deref(), Some("lockstep.group"));
+    }
+
+    // ====================================================================
+    // Block E: KChat trusted-issuer allowlist.
+    //
+    // The bridge maintains a list of pinned issuer public keys. When
+    // the list is non-empty, `kchat_install_authority` must reject
+    // install requests whose `issuer_public_key` is not on the list.
+    // When the list is empty, the install path accepts any issuer
+    // (back-compat with the dev-mint flow).
+    //
+    // The list is persisted to disk so a real KChat install survives
+    // across sessions without the user having to re-add the pin.
+    // ====================================================================
+
+    /// Extract the issuer pubkey from a freshly-minted install
+    /// request — used by trust-store tests so they can pre-populate
+    /// the allowlist with the exact key the next install will use.
+    fn issuer_pubkey_from_request(req_json: &str) -> String {
+        let req: KChatInstallRequest = serde_json::from_str(req_json).unwrap();
+        req.issuer_public_key
+    }
+
+    #[test]
+    #[serial]
+    fn trust_store_empty_by_default_status_reports_trusted() {
+        reset_kchat_slot();
+        let (req_json, _) = fresh_install_request_json([21u8; 32], "studio-trust-empty");
+        let status = kchat_install_authority(serde_json::from_str(&req_json).unwrap()).unwrap();
+        assert!(!status.locked);
+        assert!(
+            status.issuer_trusted,
+            "empty allowlist must report issuer_trusted = true (back-compat)"
+        );
+        // Issuer label is None because no entry was added; the
+        // "trusted because list is empty" state has no label.
+        assert!(status.issuer_label.is_none());
+        assert!(status.issuer_public_key.is_some());
+    }
+
+    #[test]
+    #[serial]
+    fn trust_store_install_rejects_issuer_not_on_allowlist() {
+        reset_kchat_slot();
+        // Add a *different* issuer to the allowlist so the upcoming
+        // install request's issuer is NOT on the list.
+        let other_issuer = SigningKey::from_bytes(&[0x42; 32]);
+        let other_pubkey = URL_SAFE_NO_PAD.encode(other_issuer.verifying_key().as_bytes());
+        kchat_add_trusted_issuer(TrustedIssuer {
+            issuer_public_key: other_pubkey,
+            label: "Some Other Issuer".into(),
+            added_at: Utc::now(),
+        })
+        .unwrap();
+
+        let (req_json, _) = fresh_install_request_json([22u8; 32], "studio-trust-reject");
+        let req: KChatInstallRequest = serde_json::from_str(&req_json).unwrap();
+        let err = kchat_install_authority(req).unwrap_err();
+        match err {
+            SessionBridgeError::IssuerNotTrusted { issuer_public_key } => {
+                assert_eq!(
+                    issuer_public_key,
+                    issuer_pubkey_from_request(&req_json)
+                        .trim_end_matches('=')
+                        .to_string()
+                );
+            }
+            other => panic!("expected IssuerNotTrusted, got {other:?}"),
+        }
+        assert!(
+            kchat_membership_status().locked,
+            "rejected install must leave the slot locked"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn trust_store_install_accepts_listed_issuer_and_attaches_label() {
+        reset_kchat_slot();
+        let (req_json, _) = fresh_install_request_json([23u8; 32], "studio-trust-accept");
+        let issuer_pubkey = issuer_pubkey_from_request(&req_json);
+        kchat_add_trusted_issuer(TrustedIssuer {
+            issuer_public_key: issuer_pubkey.clone(),
+            label: "Studio KChat".into(),
+            added_at: Utc::now(),
+        })
+        .unwrap();
+
+        let status = kchat_install_authority(serde_json::from_str(&req_json).unwrap()).unwrap();
+        assert!(!status.locked, "listed issuer must install");
+        assert!(status.issuer_trusted, "listed issuer must report trusted");
+        assert_eq!(status.issuer_label.as_deref(), Some("Studio KChat"));
+        assert_eq!(
+            status.issuer_public_key.as_deref(),
+            Some(issuer_pubkey.as_str())
+        );
+
+        // Snapshot read through the polling status path must report
+        // the same provenance fields — otherwise the renderer would
+        // see "trusted" right after sign-in but "untrusted" on next
+        // poll.
+        let polled = kchat_membership_status();
+        assert!(polled.issuer_trusted);
+        assert_eq!(polled.issuer_label.as_deref(), Some("Studio KChat"));
+    }
+
+    #[test]
+    #[serial]
+    fn trust_store_add_overwrites_label_for_same_pubkey() {
+        reset_kchat_slot();
+        let issuer = SigningKey::from_bytes(&[0x55; 32]);
+        let pk = URL_SAFE_NO_PAD.encode(issuer.verifying_key().as_bytes());
+        kchat_add_trusted_issuer(TrustedIssuer {
+            issuer_public_key: pk.clone(),
+            label: "Old Label".into(),
+            added_at: Utc::now(),
+        })
+        .unwrap();
+        let updated = kchat_add_trusted_issuer(TrustedIssuer {
+            issuer_public_key: pk.clone(),
+            label: "New Label".into(),
+            added_at: Utc::now(),
+        })
+        .unwrap();
+        assert_eq!(updated.len(), 1, "duplicate pubkey must not double-add");
+        assert_eq!(updated[0].label, "New Label");
+    }
+
+    #[test]
+    #[serial]
+    fn trust_store_remove_collapses_back_to_accept_any() {
+        reset_kchat_slot();
+        let issuer = SigningKey::from_bytes(&[0x66; 32]);
+        let pk = URL_SAFE_NO_PAD.encode(issuer.verifying_key().as_bytes());
+        kchat_add_trusted_issuer(TrustedIssuer {
+            issuer_public_key: pk.clone(),
+            label: "Temporary".into(),
+            added_at: Utc::now(),
+        })
+        .unwrap();
+        assert!(!trusted_issuer_list_is_empty());
+        let after = kchat_remove_trusted_issuer(&pk).unwrap();
+        assert!(after.is_empty());
+        assert!(trusted_issuer_list_is_empty());
+
+        // Now a fresh install with a totally different issuer must
+        // succeed because the allowlist is empty again.
+        let (req_json, _) = fresh_install_request_json([24u8; 32], "studio-trust-collapse");
+        let status = kchat_install_authority(serde_json::from_str(&req_json).unwrap()).unwrap();
+        assert!(!status.locked);
+        assert!(status.issuer_trusted, "empty allowlist reports trusted");
+    }
+
+    #[test]
+    #[serial]
+    fn trust_store_rejects_invalid_label_and_pubkey() {
+        reset_kchat_slot();
+        let issuer = SigningKey::from_bytes(&[0x77; 32]);
+        let pk = URL_SAFE_NO_PAD.encode(issuer.verifying_key().as_bytes());
+        // Empty label after trim.
+        let err = kchat_add_trusted_issuer(TrustedIssuer {
+            issuer_public_key: pk.clone(),
+            label: "   ".into(),
+            added_at: Utc::now(),
+        })
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            SessionBridgeError::InvalidArgument { field: "label", .. }
+        ));
+        // Label too long.
+        let long = "x".repeat(TRUSTED_ISSUER_LABEL_CAP + 1);
+        let err = kchat_add_trusted_issuer(TrustedIssuer {
+            issuer_public_key: pk.clone(),
+            label: long,
+            added_at: Utc::now(),
+        })
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            SessionBridgeError::InvalidArgument { field: "label", .. }
+        ));
+        // Malformed pubkey.
+        let err = kchat_add_trusted_issuer(TrustedIssuer {
+            issuer_public_key: "not-base64".into(),
+            label: "Bad".into(),
+            added_at: Utc::now(),
+        })
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            SessionBridgeError::InvalidArgument {
+                field: "issuerPublicKey",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    #[serial]
+    fn trust_store_persists_across_set_path_calls() {
+        reset_kchat_slot();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("kchat_trust.json");
+
+        // First "session": configure path, add issuer, write to disk.
+        let initial = kchat_set_trust_store_path(path.clone()).unwrap();
+        assert!(initial.is_empty(), "fresh file starts empty");
+        let issuer = SigningKey::from_bytes(&[0x88; 32]);
+        let pk = URL_SAFE_NO_PAD.encode(issuer.verifying_key().as_bytes());
+        kchat_add_trusted_issuer(TrustedIssuer {
+            issuer_public_key: pk.clone(),
+            label: "Persisted Studio".into(),
+            added_at: Utc::now(),
+        })
+        .unwrap();
+
+        // Simulate a fresh process: blow away the in-memory slot,
+        // then re-set the path. The list must reload from disk.
+        *trust_store_slot().lock() = TrustStore::default();
+        *trust_store_path_slot().lock() = None;
+        let reloaded = kchat_set_trust_store_path(path.clone()).unwrap();
+        assert_eq!(reloaded.len(), 1, "reload must restore the issuer");
+        assert_eq!(reloaded[0].issuer_public_key, pk);
+        assert_eq!(reloaded[0].label, "Persisted Studio");
+    }
+
+    #[test]
+    #[serial]
+    fn trust_store_add_with_padded_pubkey_normalises_to_unpadded() {
+        // A user pasting an issuer public key from a KChat admin
+        // dashboard may include trailing `=` padding. The
+        // allowlist normalises on insert (strips trailing `=`) so a
+        // later install request — which the KChat server always
+        // emits as URL-safe-base64 with no padding — still matches.
+        //
+        // Note: we can't symmetrically accept *padded* install
+        // requests because the membership signature is computed
+        // over a signing view that contains the issuer public key
+        // string verbatim. Padding it on the install side would
+        // change the signed bytes and the membership would fail
+        // verification (which is the correct behaviour — the
+        // bridge must not mutate signed payload material). The
+        // normalisation lives on the user-typed list entry only.
+        reset_kchat_slot();
+        let (req_json, _) = fresh_install_request_json([25u8; 32], "studio-padding");
+        let issuer_pubkey = issuer_pubkey_from_request(&req_json);
+        let unpadded = issuer_pubkey.trim_end_matches('=').to_string();
+        let padding_needed = (4 - (unpadded.len() % 4)) % 4;
+        let padded = format!("{}{}", unpadded, "=".repeat(padding_needed));
+        let listed = kchat_add_trusted_issuer(TrustedIssuer {
+            issuer_public_key: padded.clone(),
+            label: "User-pasted Padded".into(),
+            added_at: Utc::now(),
+        })
+        .unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(
+            listed[0].issuer_public_key, unpadded,
+            "add path must strip trailing `=` so install (which always sends unpadded) matches"
+        );
+
+        // The unpadded install request (canonical form from the
+        // issuer) must now match.
+        let status = kchat_install_authority(serde_json::from_str(&req_json).unwrap()).unwrap();
+        assert!(!status.locked);
+        assert!(status.issuer_trusted);
+        assert_eq!(status.issuer_label.as_deref(), Some("User-pasted Padded"));
     }
 
     // ====================================================================

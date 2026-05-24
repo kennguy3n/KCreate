@@ -2893,6 +2893,18 @@ impl Task for ImageGenGenerateTask {
 /// Generate an image. Returns JSON-encoded
 /// [`phase4::GeneratedImagePayload`] (PNG bytes as base64). Runs on
 /// a worker thread; resolves a JS `Promise<string>`.
+///
+/// Seed handling: N-API surfaces this parameter as TS `number | null`,
+/// which arrives in Rust as `Option<i64>`. Diffusion seeds are
+/// unsigned (the Python server passes them straight into
+/// `torch.Generator().manual_seed`, which accepts any non-negative
+/// integer). The renderer's input handler already strips non-digits
+/// so it can't *generate* a negative seed, but we reject any negative
+/// value explicitly here rather than silently abs-valuing — a direct
+/// IPC caller (plugins, scripted tests) passing `seed: -1` got
+/// `seed = 1` under the previous `i64::unsigned_abs` mapping, which
+/// is a lossy silent transform on a public bridge function. Fail
+/// loudly instead so the divergence is surfaced at the call site.
 #[napi(ts_return_type = "Promise<string>")]
 pub fn image_gen_generate(
     prompt: String,
@@ -2900,15 +2912,23 @@ pub fn image_gen_generate(
     height: u32,
     steps: u32,
     seed: Option<i64>,
-) -> AsyncTask<ImageGenGenerateTask> {
-    let seed = seed.map(i64::unsigned_abs);
-    AsyncTask::new(ImageGenGenerateTask {
+) -> NapiResult<AsyncTask<ImageGenGenerateTask>> {
+    let seed = match seed {
+        None => None,
+        Some(s) if s >= 0 => Some(s as u64),
+        Some(s) => {
+            return Err(NapiError::from_reason(format!(
+                "image_gen_generate: seed must be a non-negative integer, got {s}"
+            )));
+        }
+    };
+    Ok(AsyncTask::new(ImageGenGenerateTask {
         prompt,
         width,
         height,
         steps,
         seed,
-    })
+    }))
 }
 
 /// Is image generation allowed at all on this device? Mirrors

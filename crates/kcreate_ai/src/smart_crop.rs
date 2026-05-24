@@ -88,9 +88,21 @@ pub fn suggest_crop(
 }
 
 /// Parse a JSON string into [`CropSuggestion`].
+///
+/// Confidence is clamped to `[0.0, 1.0]` after parsing for the same
+/// reason `screenshot_to_layout::apply_refinement` clamps its
+/// confidence value: the [`CROP_GRAMMAR`] `number` rule is
+/// `("0" frac? | "1" frac?)`, which accepts e.g. `1.9999` as a valid
+/// production. Downstream UI code (`ImageGenPanel`, `CropOverlay`)
+/// renders confidence as a `0–100%` bar; an unclamped `1.5` would
+/// render as `150%` which is nonsense. The rectangle coordinates
+/// `x/y/w/h` are clamped separately at pixel-conversion time in
+/// [`CropSuggestion::to_pixels`].
 pub fn parse_crop_suggestion(json: &str) -> VisionChatResult<CropSuggestion> {
-    serde_json::from_str::<CropSuggestion>(json)
-        .map_err(|e| VisionChatError::Chat(crate::llm_chat::ChatError::Decode(e.to_string())))
+    let mut suggestion: CropSuggestion = serde_json::from_str(json)
+        .map_err(|e| VisionChatError::Chat(crate::llm_chat::ChatError::Decode(e.to_string())))?;
+    suggestion.confidence = suggestion.confidence.clamp(0.0, 1.0);
+    Ok(suggestion)
 }
 
 const SYSTEM_PROMPT: &str = "You are an image-cropping assistant. \
@@ -160,6 +172,30 @@ mod tests {
         assert_eq!(y, 99);
         assert_eq!(w, 100);
         assert_eq!(h, 1);
+    }
+
+    /// Devin Review portability concern (`CROP_GRAMMAR` number rule
+    /// accepts `1.9999`): the parser must clamp confidence to
+    /// `[0.0, 1.0]` so downstream UI (`ImageGenPanel`'s confidence
+    /// bar) doesn't render `199%`. Mirrors the same invariant that
+    /// `screenshot_to_layout::apply_refinement` already pins.
+    #[test]
+    fn parse_clamps_out_of_range_confidence() {
+        let above = r#"{"x":0.1,"y":0.2,"w":0.6,"h":0.4,"confidence":1.9999}"#;
+        let c = parse_crop_suggestion(above).unwrap();
+        assert!(
+            (c.confidence - 1.0).abs() < 1e-6,
+            "confidence > 1 must clamp to 1.0, got {}",
+            c.confidence
+        );
+
+        let below = r#"{"x":0.1,"y":0.2,"w":0.6,"h":0.4,"confidence":-0.5}"#;
+        let c = parse_crop_suggestion(below).unwrap();
+        assert!(
+            c.confidence.abs() < 1e-6,
+            "confidence < 0 must clamp to 0.0, got {}",
+            c.confidence
+        );
     }
 
     #[test]

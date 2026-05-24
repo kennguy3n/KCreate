@@ -177,13 +177,32 @@ pub fn plan_dispatch(
         (SidecarRuntime::LlamaServer, DispatchReason::LlamaServer)
     };
 
+    // mmproj resolution must be all-or-nothing: if the registry says a
+    // vision pack needs a projector companion (`mmproj_for` returns
+    // `Some(...)`) but the companion isn't in `static_packs()`, the
+    // previous `and_then(...).map(...)` chain silently dropped the
+    // mmproj path and llama-server would start *without* `--mmproj` —
+    // degrading to text-only inference and producing a baffling
+    // "vision model returns gibberish on images" bug downstream
+    // instead of a loud error here. The `mmproj_for_targets_resolve_to_real_packs`
+    // test in `model_registry.rs` already pins this invariant on
+    // every static pack, but treat a registry edit that breaks the
+    // invariant as a hard error at dispatch time too, so the failure
+    // surfaces at `vision_start` instead of as a quality regression
+    // hours later.
     let mmproj_path = if runtime == SidecarRuntime::LlamaServer {
-        mmproj_for(&resolved_id).and_then(|m_id| {
-            packs
-                .iter()
-                .find(|p| p.id == m_id)
-                .map(|p| models_dir.join(&p.file_path))
-        })
+        match mmproj_for(&resolved_id) {
+            None => None,
+            Some(m_id) => {
+                let companion = packs.iter().find(|p| p.id == m_id).ok_or_else(|| {
+                    SidecarError::ModelMissing(PathBuf::from(format!(
+                        "{m_id} (mmproj companion declared by registry for `{resolved_id}` \
+                         but missing from `static_packs()`)"
+                    )))
+                })?;
+                Some(models_dir.join(&companion.file_path))
+            }
+        }
     } else {
         None
     };

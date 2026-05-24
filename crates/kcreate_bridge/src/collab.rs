@@ -2072,6 +2072,86 @@ mod tests {
         );
     }
 
+    /// Wire-format lockstep between `kcreate_kchat::DevInstallRequest`
+    /// (the dev issuer output) and `KChatInstallRequest` (the bridge
+    /// install entry point's input).
+    ///
+    /// `kchat_dev_mint_membership_json` round-trips through serde
+    /// rather than copying fields by hand, with the rationale (in
+    /// the inline comment at the round-trip site) that the round-
+    /// trip itself is a wire-shape guard: if either struct grows
+    /// or renames a field, the deserialise step fails loudly.
+    /// This test pins that guarantee — it would catch any future
+    /// drift between the two structs at `cargo test` time rather
+    /// than at runtime when a user clicks "Mint dev membership".
+    ///
+    /// Three guarantees pinned here:
+    ///   1. A minted `DevInstallRequest` JSON parses cleanly as
+    ///      `KChatInstallRequest` (no missing required fields, no
+    ///      type mismatches, no unknown-tag rejection).
+    ///   2. Every field round-trips byte-for-byte through the
+    ///      bridge type — no value is silently coerced.
+    ///   3. The reverse direction (KChatInstallRequest JSON →
+    ///      DevInstallRequest) also round-trips, so we'd also
+    ///      catch the case where one side grows a field that the
+    ///      other side then ignores (which would let mismatched
+    ///      data flow through `kchat_dev_mint_membership_json`).
+    #[cfg(feature = "kchat-dev-issuer")]
+    #[test]
+    #[serial]
+    fn dev_install_request_matches_bridge_install_request_wire_format() {
+        let issuer = kcreate_kchat::DevIssuer::from_seed([0x7E; 32]);
+        let peer_seed = [0x11; 32];
+        let peer_vk = ed25519_dalek::SigningKey::from_bytes(&peer_seed).verifying_key();
+        let peer_pk_b64 = URL_SAFE_NO_PAD.encode(peer_vk.as_bytes());
+        let dev_install = issuer
+            .mint_install_request_for_peer(
+                "lockstep.group",
+                &peer_pk_b64,
+                std::time::Duration::from_secs(60 * 60),
+            )
+            .expect("mint should succeed for valid inputs");
+
+        // Forward direction — DevInstallRequest JSON parses as
+        // KChatInstallRequest with every field identical.
+        let dev_json = serde_json::to_string(&dev_install).expect("dev serialise");
+        let bridge_install: KChatInstallRequest =
+            serde_json::from_str(&dev_json).expect("dev json should parse as bridge install");
+        assert_eq!(
+            dev_install.issuer_public_key,
+            bridge_install.issuer_public_key
+        );
+        assert_eq!(dev_install.group_id, bridge_install.group_id);
+        assert_eq!(dev_install.peer_id, bridge_install.peer_id);
+        assert_eq!(dev_install.peer_public_key, bridge_install.peer_public_key);
+        assert_eq!(dev_install.issued_at, bridge_install.issued_at);
+        assert_eq!(dev_install.expires_at, bridge_install.expires_at);
+        assert_eq!(dev_install.signature, bridge_install.signature);
+
+        // Reverse direction — KChatInstallRequest JSON parses as
+        // DevInstallRequest. Catches the case where the bridge type
+        // grows a field that the dev type omits.
+        let bridge_json = serde_json::to_string(&bridge_install).expect("bridge serialise");
+        let round_trip: kcreate_kchat::DevInstallRequest =
+            serde_json::from_str(&bridge_json).expect("bridge json should parse as dev install");
+        assert_eq!(round_trip.issuer_public_key, dev_install.issuer_public_key);
+        assert_eq!(round_trip.group_id, dev_install.group_id);
+        assert_eq!(round_trip.peer_id, dev_install.peer_id);
+        assert_eq!(round_trip.peer_public_key, dev_install.peer_public_key);
+        assert_eq!(round_trip.issued_at, dev_install.issued_at);
+        assert_eq!(round_trip.expires_at, dev_install.expires_at);
+        assert_eq!(round_trip.signature, dev_install.signature);
+
+        // The minted install request must also actually install
+        // cleanly — proves we're not just round-tripping JSON that
+        // both sides happen to accept but which would be rejected by
+        // the gate verifier.
+        reset_kchat_slot();
+        let status = kchat_install_authority(bridge_install).expect("install should succeed");
+        assert!(!status.locked, "wire-lockstep install must unlock the gate");
+        assert_eq!(status.group_id.as_deref(), Some("lockstep.group"));
+    }
+
     // ====================================================================
     // Block 7: journal ingestion tests.
     //

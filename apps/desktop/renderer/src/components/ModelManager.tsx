@@ -255,6 +255,7 @@ export function ModelManager({ onStatus }: ModelManagerProps): JSX.Element {
 
       <ModelPacksSection
         packs={packs}
+        limits={limits}
         actions={{
           busy,
           install: (pack) => {
@@ -269,11 +270,72 @@ export function ModelManager({ onStatus }: ModelManagerProps): JSX.Element {
   );
 }
 
+/// Apply the Phase 4 tier gates to the visible pack list.
+///
+/// - Generation packs are **hard-gated** on
+///   `imageGenerationAllowed`: when the tier+GPU combination
+///   forbids it, those packs are filtered out completely (PROPOSAL
+///   §7 "hard gate, not a soft one").
+/// - Vision packs that exceed `visionModelMaxMb` are still shown
+///   but their install action is disabled — the user sees what's
+///   available on a beefier tier without being able to install a
+///   pack that would never load. We compare in **binary MB**
+///   (1024 × 1024) to match the Rust-side cap unit
+///   (`crates/kcreate_bridge/src/phase4.rs::vision_listable_packs`)
+///   — using decimal MB here would diverge by ~2.4% and could
+///   produce edge-case disagreements at tier boundaries.
+/// - MLX-suffixed packs are filtered out on non-Apple-Silicon
+///   platforms by inspecting `limits.platform` (the `Debug` form of
+///   the host `Platform` enum). Earlier code looked at
+///   `limits.deviceTier`, but that string only encodes the
+///   performance class (`Tier0`/`Tier1`/…) and never contains
+///   platform info — so every MLX pack was incorrectly hidden on
+///   Apple Silicon too.
+const BINARY_MB = 1024 * 1024;
+function filterPacksForTier(
+  packs: ModelPack[],
+  limits: ResourceLimits | null,
+): { visible: ModelPack[]; disabledIds: Set<string> } {
+  if (!limits) return { visible: packs, disabledIds: new Set() };
+  const isAppleSilicon = limits.platform
+    .toLowerCase()
+    .includes("applesilicon");
+  const disabled = new Set<string>();
+  const visible = packs.filter((p) => {
+    if (p.category === "generation" && !limits.imageGenerationAllowed) {
+      return false;
+    }
+    if (p.id.endsWith("_mlx") && !isAppleSilicon) {
+      return false;
+    }
+    if (p.category === "vision") {
+      // Use `Math.floor` so this matches the Rust side's `u64`
+      // integer division exactly (see
+      // `crates/kcreate_bridge/src/phase4.rs::vision_listable_packs`
+      // — `p.size_bytes / (1024 * 1024)`). JS `/` is float64
+      // division, so without `floor` a pack whose byte count
+      // floats to e.g. 500.0005 MB would be disabled here but
+      // accepted by the Rust filter — a wire-format-lockstep
+      // (AGENTS.md §4) divergence at tier boundaries. Today's
+      // packs are well below their caps so the float vs int
+      // delta is unreachable, but we pin the contract now.
+      const sizeMb = Math.floor(p.sizeBytes / BINARY_MB);
+      if (sizeMb > limits.visionModelMaxMb) {
+        disabled.add(p.id);
+      }
+    }
+    return true;
+  });
+  return { visible, disabledIds: disabled };
+}
+
 function ModelPacksSection({
   packs,
+  limits,
   actions,
 }: {
   packs: ModelPack[];
+  limits: ResourceLimits | null;
   actions: PackActions;
 }): JSX.Element {
   if (packs.length === 0) {
@@ -281,16 +343,27 @@ function ModelPacksSection({
       <p style={noteStyle}>Loading model packs…</p>
     );
   }
-  const installed = packs.filter((p) => p.installed);
-  const available = packs.filter((p) => !p.installed);
+  const { visible, disabledIds } = filterPacksForTier(packs, limits);
+  const installed = visible.filter((p) => p.installed);
+  const available = visible.filter((p) => !p.installed);
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: spacing.sm }}>
       <h4 style={{ margin: 0, fontSize: 12, fontWeight: 600 }}>Model packs</h4>
       {installed.length > 0 ? (
-        <PackGroup label="Installed" packs={installed} actions={actions} />
+        <PackGroup
+          label="Installed"
+          packs={installed}
+          actions={actions}
+          disabledIds={disabledIds}
+        />
       ) : null}
       {available.length > 0 ? (
-        <PackGroup label="Available" packs={available} actions={actions} />
+        <PackGroup
+          label="Available"
+          packs={available}
+          actions={actions}
+          disabledIds={disabledIds}
+        />
       ) : null}
     </div>
   );
@@ -300,16 +373,23 @@ function PackGroup({
   label,
   packs,
   actions,
+  disabledIds,
 }: {
   label: string;
   packs: ModelPack[];
   actions: PackActions;
+  disabledIds: Set<string>;
 }): JSX.Element {
   return (
     <section style={{ display: "flex", flexDirection: "column", gap: 4 }}>
       <span style={{ fontSize: 10, color: colors.textMuted, fontWeight: 600, textTransform: "uppercase", letterSpacing: 0.4 }}>{label}</span>
       {packs.map((p) => (
-        <PackCard key={p.id} pack={p} actions={actions} />
+        <PackCard
+          key={p.id}
+          pack={p}
+          actions={actions}
+          tierBlocked={disabledIds.has(p.id)}
+        />
       ))}
     </section>
   );
@@ -318,11 +398,15 @@ function PackGroup({
 function PackCard({
   pack,
   actions,
+  tierBlocked,
 }: {
   pack: ModelPack;
   actions: PackActions;
+  tierBlocked: boolean;
 }): JSX.Element {
   const optional = pack.kind !== "built_in";
+  const installBlocked =
+    actions.busy || pack.downloadUrl === "" || tierBlocked;
   return (
     <article
       style={{
@@ -372,10 +456,16 @@ function PackCard({
             <button
               type="button"
               onClick={() => actions.install(pack)}
-              disabled={actions.busy || pack.downloadUrl === ""}
-              style={packPrimaryBtnStyle(actions.busy || pack.downloadUrl === "")}
+              disabled={installBlocked}
+              style={packPrimaryBtnStyle(installBlocked)}
+              title={
+                tierBlocked
+                  ? "Exceeds this machine's vision-model size cap. " +
+                    "Upgrade hardware or pick a smaller pack."
+                  : undefined
+              }
             >
-              Install…
+              {tierBlocked ? "Tier locked" : "Install…"}
             </button>
           )
         ) : null}
@@ -446,6 +536,7 @@ function CategoryPill({
     core: "core",
     image_pro: "image",
     design_pro: "design",
+    vision: "vision",
     generation: "gen",
   };
   return (

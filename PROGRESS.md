@@ -225,6 +225,81 @@ Export Center, Local AI Core Pack.
       can pull QUIC / mDNS without contaminating local-first.
 - [x] **Block I** — CI updates + documentation sync (this commit).
 
+## Phase 4 — Vision & Generation AI | In flight
+
+Local multimodal inference layer that pairs llama.cpp's GGUF +
+mmproj loading with an Apple-Silicon MLX side path, plus a fully
+gated FLUX image-generation sidecar. Vision is *soft-gated* (every
+tier can run SmolVLM2-256M); image generation is *hard-gated* to
+Tier 2+ with a GPU.
+
+- [x] **Block A — Vision Understanding Infrastructure** (Tasks 1–6).
+  - `SidecarConfig.mmproj_path` end-to-end with disk validation,
+    extra-argv plumbing, and tests.
+  - Static registry entries for `vision_smolvlm2_256m`,
+    `vision_qwen25vl_7b`, their `_mmproj` companions, and MLX
+    variants (`vision_smolvlm_256m_mlx`, `vision_qwen25vl_7b_mlx`).
+    `ModelPackCategory::Vision` shipped to `scene.ts`.
+  - `MlxSidecar` (`crates/kcreate_ai/src/mlx_sidecar.rs`) mirrors
+    `LlmSidecar` over `python3 -m mlx_lm.server`, with availability
+    probe and graceful fallback on non-Apple platforms.
+  - `ChatContent`/`ContentPart` multimodal wire format
+    (`crates/kcreate_ai/src/llm_chat.rs`) — text-only messages
+    still serialise as plain strings (back-compat), vision
+    messages emit OpenAI-style `image_url` data URIs.
+  - Vision bridge: `vision_describe_image`,
+    `vision_generate_alt_text`, `vision_analyze_design` in
+    `crates/kcreate_bridge/src/phase4.rs`; preload + scene types
+    mirrored in TypeScript.
+  - `VisionAssistSection` UI in the AI Assist panel.
+- [x] **Block B — Image Generation Infrastructure** (Tasks 7–12).
+  - `ImageGenSidecar` (`crates/kcreate_ai/src/image_gen.rs`) spawns
+    `python3 -m kcreate_diffusion.server` on a loopback port. Hard
+    gate: only runnable when `RuntimeConfig::image_generation_allowed()`.
+  - Registry entries `image_gen_flux_klein_4b` and
+    `image_gen_flux_klein_mlx`, category `Generation`.
+  - Generation client + bridge IPC (`image_gen_start`,
+    `image_gen_status`, `image_gen_stop`, `image_gen_generate`),
+    plus an in-memory `document_import_image_bytes` to avoid temp
+    files for generated PNGs.
+  - `tools/kcreate_diffusion/` minimal Python package
+    (`server.py`, `requirements.txt`, README).
+  - `ImageGenPanel` UI (Tier 2+ only).
+- [x] **Block C — Top 10 Vision Features** (Tasks 13–20).
+  - Design critique (`crates/kcreate_ai/src/design_critique.rs`).
+  - Alt-text VLM upgrade in `crates/kcreate_bridge/src/phase2.rs`
+    (statistics still produced, VLM caption swapped in when ready).
+  - `screenshot_to_layout::refine_with_vlm()` + `REFINE_GRAMMAR`.
+  - Brand extraction (`brand_extract.rs`) with GBNF.
+  - Smart layer naming in `task_router::build_layer_naming_prompt`
+    (thumbnail when VLM ready, text-only otherwise).
+  - Content-aware crop (`smart_crop.rs`) + GBNF.
+  - Design tokens (`design_tokens_vlm.rs`) + GBNF.
+  - Style description (`style_describe.rs`) + GBNF.
+- [x] **Block D — Tier Gating & Resource Management** (Tasks 21–24).
+  - `DeviceTier::vision_model_allowed`, `vision_model_max_mb`,
+    `image_generation_allowed`, `RuntimeConfig::image_generation_allowed`.
+  - `recommended_vision_pack` / `recommended_llm_pack` /
+    `recommended_image_gen_pack`.
+  - `SidecarDispatcher` routes MLX vs llama-server per platform +
+    pack id, with `gguf_fallback_for_mlx_pack` for graceful fall-back
+    when MLX is unavailable.
+  - Model Manager UI filters generation packs on tier, MLX packs
+    on platform, and disables Install for vision packs that exceed
+    the tier's `vision_model_max_mb`.
+- [x] **Block E — Tests** (Tasks 25–27).
+  - `crates/kcreate_tests/tests/vision_sidecar.rs` — multimodal
+    serialisation, mock-server round-trips, grammar forwarding,
+    empty-request rejection, MLX off-platform probe.
+  - `crates/kcreate_tests/tests/image_gen_gating.rs` — tier matrix
+    (Tier 0/1 forbidden, Tier 2+ requires GPU, vision soft-gated,
+    `vision_model_max_mb` monotonic, registry advertises generation
+    packs).
+  - Registry completeness tests in `model_registry.rs` cover every
+    new pack id, category, and capability.
+- [x] **Block F — Documentation** (Tasks 28–30).
+  - This section + ARCHITECTURE.md §16i/j/k + README "Local AI" row.
+
 ## Phase 3 — Advanced Suite | Foundation landed
 
 Protocol-level work shipped in Phase 2 PR #7 to keep the editing
@@ -242,6 +317,14 @@ path stable while collab + advanced workflows are built out:
 
 ## Changelog
 
+- **2026-05-24** — Phase 4 ship: vision (Qwen2.5-VL + SmolVLM2 over
+  llama.cpp / MLX, mmproj + multimodal chat shape), image generation
+  (FLUX.2-Klein-4B via `tools/kcreate_diffusion/`, hard-gated to
+  Tier 2 + GPU), Top-10 vision actions (alt-text VLM, design
+  critique, screenshot refinement, brand / palette / spacing
+  extraction, content-aware crop, design-token + style description,
+  smart layer naming), tier-aware Model Manager filtering, vision
+  + image-gen integration tests, docs sync.
 - **2026-05-22 (PR #7)** — Phase 2 complete + Phase 3 foundation:
   Block A (CMYK/ICC), Block B (advanced text + hyphenation +
   OpenType), Block C (extended WASM ABI + proposal model), Block D

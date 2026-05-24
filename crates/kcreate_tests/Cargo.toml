@@ -15,7 +15,12 @@ description = "Cross-crate integration tests for the KCreate workspace."
 path = "src/lib.rs"
 
 [dev-dependencies]
-kcreate_ai = { path = "../kcreate_ai" }
+# `llm_sidecar` brings in `ureq` for the loopback HTTP client used by
+# the Phase 1/3/4 sidecars. The deny-list test
+# (`tests/local_first.rs`) checks the editing-path crates with
+# default features only, so enabling it for the integration tests
+# does not weaken the invariant.
+kcreate_ai = { path = "../kcreate_ai", features = ["llm_sidecar"] }
 kcreate_core = { path = "../kcreate_core" }
 kcreate_export = { path = "../kcreate_export" }
 kcreate_mcp = { path = "../kcreate_mcp" }
@@ -24,7 +29,9 @@ kcreate_storage = { path = "../kcreate_storage" }
 kcreate_vector = { path = "../kcreate_vector" }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
+tiny_http = "0.12"
 uuid = { workspace = true }
+base64 = { workspace = true }
 
 [lints]
 workspace = true

@@ -295,6 +295,182 @@ const fn element_name(kind: ElementType) -> &'static str {
     }
 }
 
+/// Errors from [`refine_with_vlm`]. Distinguish "the VLM call
+/// itself failed" from "the response didn't parse" so the caller
+/// (bridge layer) can decide whether to retry or fall back to the
+/// heuristic output.
+#[derive(Debug, thiserror::Error)]
+pub enum RefineError {
+    /// Underlying VLM chat call failed (network / sidecar error).
+    #[error("vlm chat failed: {0}")]
+    Vlm(String),
+    /// VLM responded, but the JSON didn't match the expected shape.
+    #[error("vlm response did not parse: {0}")]
+    Parse(String),
+}
+
+/// GBNF grammar pinning the VLM to emit a JSON list of element
+/// reclassifications, one per heuristically-detected region. Each
+/// entry constrains `element_type` to the known [`ElementType`]
+/// variants (so a hallucinated `"sidebar_left"` can never make it
+/// through) and confidence to a finite `[0.0, 1.0]` float.
+///
+/// Note: GBNF's grammar engine doesn't enforce numeric ranges, but
+/// pinning the variant strings already drops the rate of garbage
+/// outputs by an order of magnitude vs. raw chat. The Rust
+/// post-processor (`apply_refinement`) clamps confidence to
+/// `[0.0, 1.0]` and discards out-of-range values.
+pub const REFINE_GRAMMAR: &str = r#"
+root ::= refinement
+refinement ::= "{" ws "\"refined\":" ws array ws "}" ws
+array ::= "[" ws (entry (ws "," ws entry)*)? ws "]"
+entry ::= "{" ws
+    "\"element_type\":" ws kind ws "," ws
+    "\"suggested_name\":" ws string ws "," ws
+    "\"confidence\":" ws number ws
+    "}"
+kind ::= "\"header\"" | "\"navigation\"" | "\"hero\"" | "\"text_block\""
+       | "\"image\"" | "\"button\"" | "\"card\"" | "\"footer\""
+       | "\"sidebar\"" | "\"form\"" | "\"list\""
+string ::= "\"" ([^"\\\x00-\x1f] | "\\" ["\\bfnrt/])* "\""
+number ::= "-"? ("0" | [1-9][0-9]*) ("." [0-9]+)?
+ws ::= ([ \t\n\r])*
+"#;
+
+/// Wire shape of the per-element refinement entry the VLM returns.
+/// Public so integration tests can construct one directly.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RefineEntry {
+    pub element_type: ElementType,
+    pub suggested_name: String,
+    pub confidence: f32,
+}
+
+#[cfg(feature = "llm_sidecar")]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RefinePayload {
+    refined: Vec<RefineEntry>,
+}
+
+/// Apply a VLM refinement response to the heuristic results. Matches
+/// entries positionally — the VLM is told to emit exactly one entry
+/// per detected element in the same reading order, so this is a
+/// straight zip. Anything longer than the input is silently
+/// truncated; anything shorter leaves the trailing elements as the
+/// heuristic produced them. Confidence is clamped to `[0.0, 1.0]`
+/// so a hallucinated `5.0` doesn't poison downstream UI.
+#[must_use]
+pub fn apply_refinement(
+    mut elements: Vec<DetectedElement>,
+    refinement: Vec<RefineEntry>,
+) -> Vec<DetectedElement> {
+    for (el, ref_entry) in elements.iter_mut().zip(refinement) {
+        el.element_type = ref_entry.element_type;
+        let trimmed = ref_entry.suggested_name.trim();
+        if !trimmed.is_empty() {
+            el.suggested_name = trimmed.to_string();
+        }
+        el.confidence = ref_entry.confidence.clamp(0.0, 1.0);
+    }
+    elements
+}
+
+/// Build the user prompt for VLM refinement. The prompt lists the
+/// heuristic's tentative classifications so the VLM can correct
+/// them rather than re-detect from scratch — this is a far easier
+/// task for a 256M-parameter VLM than full region proposal.
+#[must_use]
+pub fn build_refine_prompt(elements: &[DetectedElement]) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::from(
+        "I detected the following regions in the image. For each one, \
+        confirm or correct its classification, a short snake_case name, \
+        and a confidence in [0.0, 1.0]. Reply with strict JSON matching \
+        the schema. Element types must be one of: header, navigation, \
+        hero, text_block, image, button, card, footer, sidebar, form, \
+        list.\n\nRegions:\n",
+    );
+    for (i, el) in elements.iter().enumerate() {
+        let _ = writeln!(
+            s,
+            "  {i}. type={:?} bounds=({:.0},{:.0},{:.0},{:.0}) name={:?}",
+            el.element_type,
+            el.bounds.x,
+            el.bounds.y,
+            el.bounds.width,
+            el.bounds.height,
+            el.suggested_name,
+        );
+    }
+    s
+}
+
+/// Refine [`analyze_screenshot_for_layout`]'s output by sending the
+/// screenshot + the heuristic classifications to a VLM. The VLM is
+/// asked to confirm-or-correct each region's `element_type`,
+/// `suggested_name`, and `confidence`, constrained to the known
+/// element-type vocabulary via [`REFINE_GRAMMAR`].
+///
+/// Falls back gracefully: on any VLM error the heuristic results
+/// are returned unchanged — the caller never sees a hard failure.
+/// This matches the "soft enhancement" contract documented in
+/// ARCHITECTURE.md §16g (Phase 3 LLM refinement pass).
+///
+/// `pixels` is the original RGBA8 screenshot (used by the VLM to
+/// look at the actual image content), `elements` is the heuristic
+/// output from [`analyze_screenshot_for_layout`].
+#[cfg(feature = "llm_sidecar")]
+pub fn refine_with_vlm(
+    port: u16,
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+    elements: Vec<DetectedElement>,
+) -> Vec<DetectedElement> {
+    if elements.is_empty() {
+        return elements;
+    }
+    let sys = "You are a UI region classifier. Given a screenshot and a \
+        list of heuristically-detected regions, return a JSON object \
+        with a `refined` array containing exactly one entry per input \
+        region, in the same order. Each entry has `element_type` (one \
+        of the allowed variants), `suggested_name` (snake_case), and \
+        `confidence` ([0.0, 1.0]).";
+    let user = build_refine_prompt(&elements);
+    let response = match crate::vision_chat::describe_image_with_grammar(
+        port,
+        sys,
+        &user,
+        pixels,
+        width,
+        height,
+        REFINE_GRAMMAR,
+        1024,
+    ) {
+        Ok(s) => s,
+        Err(_) => return elements,
+    };
+    match serde_json::from_str::<RefinePayload>(&response) {
+        Ok(payload) => apply_refinement(elements, payload.refined),
+        Err(_) => elements,
+    }
+}
+
+/// `llm_sidecar`-feature-off shim. The VLM dependency lives behind
+/// the same feature flag as the rest of the sidecar code so the
+/// crate still compiles on platforms that can't run a VLM (e.g.
+/// running the unit tests without `ureq` linked in).
+#[cfg(not(feature = "llm_sidecar"))]
+pub fn refine_with_vlm(
+    _port: u16,
+    _pixels: &[u8],
+    _width: u32,
+    _height: u32,
+    elements: Vec<DetectedElement>,
+) -> Vec<DetectedElement> {
+    elements
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

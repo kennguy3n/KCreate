@@ -175,6 +175,69 @@ export interface Bridge {
   aiSuggestLayerNames(): Promise<string>;
   aiExtractDesignTokens(): Promise<string>;
   aiCheckAccessibility(): Promise<string>;
+  // Phase 4: vision sidecar.
+  visionStart(packId: string): number;
+  visionStop(): void;
+  visionStatus(): string;
+  // Vision inference is wrapped in N-API `AsyncTask` on the Rust
+  // side so the Electron main process doesn't freeze while the VLM
+  // runs (cold-load + inference can take 5–30 s). Each call resolves
+  // a JS `Promise<string>` once the worker thread finishes.
+  visionDescribeImage(
+    rgba: Buffer,
+    width: number,
+    height: number,
+    userPrompt: string,
+  ): Promise<string>;
+  visionDescribeNode(nodeId: string, userPrompt: string): Promise<string>;
+  visionGenerateAltText(
+    rgba: Buffer,
+    width: number,
+    height: number,
+  ): Promise<string>;
+  visionGenerateAltTextForNode(nodeId: string): Promise<string>;
+  visionAnalyzeDesign(
+    rgba: Buffer,
+    width: number,
+    height: number,
+  ): Promise<string>;
+  aiExtractBrandFromImage(
+    rgba: Buffer,
+    width: number,
+    height: number,
+  ): Promise<string>;
+  aiSuggestCrop(
+    rgba: Buffer,
+    width: number,
+    height: number,
+    aspectRatio: number,
+  ): Promise<string>;
+  aiSuggestDesignTokens(
+    rgba: Buffer,
+    width: number,
+    height: number,
+  ): Promise<string>;
+  aiDescribeStyle(
+    rgba: Buffer,
+    width: number,
+    height: number,
+  ): Promise<string>;
+  visionRecommendedPack(): string;
+  visionMmprojFor(packId: string): string;
+  visionListablePacks(): string[];
+  // Phase 4: image generation sidecar.
+  imageGenStart(packId: string): number;
+  imageGenStop(): void;
+  imageGenStatus(): string;
+  imageGenGenerate(
+    prompt: string,
+    width: number,
+    height: number,
+    steps: number,
+    seed: number | null,
+  ): Promise<string>;
+  imageGenAllowed(): boolean;
+  imageGenRecommendedPack(): string;
   exportSvg(nodeIds: string[], optionsJson: string): string;
   exportPng(outputPath: string, optionsJson: string): number;
   exportPdf(outputPath: string, optionsJson: string): number;
@@ -194,6 +257,7 @@ export interface Bridge {
   documentGetSelection(): string[];
   documentClearSelection(): void;
   documentImportImage(parentId: string | null, filePath: string): string;
+  documentImportImageBytes(parentId: string | null, bytes: Buffer): string;
   canvasCreateRect(
     parentId: string | null,
     x: number,

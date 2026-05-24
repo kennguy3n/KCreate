@@ -24,7 +24,7 @@ use crate::bg_remove::{remove_background, BgRemoveError, BgRemoveOptions};
 use crate::layout_suggest::{
     suggest_layout_grouping, LayoutNode, LayoutSuggestError, LayoutSuggestOptions, LayoutSuggestion,
 };
-use crate::llm_chat::{ChatMessage, ChatRequest, ChatRole};
+use crate::llm_chat::{ChatMessage, ChatRequest};
 
 /// Errors from [`execute_task`].
 #[derive(Debug, Error)]
@@ -187,18 +187,117 @@ pub fn build_layer_naming_prompt(node_names: &[(Uuid, String)]) -> ChatRequest {
     );
     ChatRequest {
         messages: vec![
-            ChatMessage {
-                role: ChatRole::System,
-                content: "You are a UI design assistant that renames layers \
-                          to be semantic and concise. Output JSON only."
-                    .to_string(),
-            },
-            ChatMessage {
-                role: ChatRole::User,
-                content: user_body,
-            },
+            ChatMessage::system(
+                "You are a UI design assistant that renames layers \
+                 to be semantic and concise. Output JSON only.",
+            ),
+            ChatMessage::user(user_body),
         ],
         max_tokens: 512,
+        temperature: 0.2,
+        grammar: None,
+    }
+}
+
+/// A single layer thumbnail input for [`build_vlm_layer_naming_prompt`].
+/// The bridge layer composes one of these per selected layer by
+/// rendering the layer offscreen into RGBA8 at a thumbnail
+/// resolution (typically 256x256). Confidence in the heuristic
+/// name is bundled so the VLM can choose to keep it when the
+/// thumbnail isn't informative enough.
+#[derive(Debug, Clone)]
+pub struct LayerThumbnail {
+    pub node_id: Uuid,
+    pub current_name: String,
+    pub rgba: Vec<u8>,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// Build a [`ChatRequest`] that asks a VLM (vision-language model)
+/// to rename layers using their rendered thumbnails as context.
+/// Each layer's pixels are encoded as a separate `image_url`
+/// content part, intermixed with text snippets that identify the
+/// layer's UUID — this matches the OpenAI vision API's tolerance
+/// for interleaved text + image content in a single user message.
+///
+/// The VLM response shape is identical to
+/// [`build_layer_naming_prompt`]'s, so [`parse_layer_naming_reply`]
+/// can parse either output. This keeps the bridge layer's apply
+/// path agnostic of which model produced the suggestions.
+#[must_use]
+pub fn build_vlm_layer_naming_prompt(thumbnails: &[LayerThumbnail]) -> ChatRequest {
+    use crate::llm_chat::{ChatContent, ContentPart};
+    use base64::engine::general_purpose::STANDARD as B64;
+    use base64::Engine;
+
+    // Heading text part. Then for each layer: a text part naming
+    // the UUID + current name, followed by an image part.
+    let mut parts: Vec<ContentPart> = Vec::with_capacity(thumbnails.len() * 2 + 2);
+    parts.push(ContentPart::Text {
+        text: "Rename these layers based on their rendered thumbnails. \
+            For each one, suggest a concise (max 24 chars, kebab- or \
+            PascalCase) semantic name that describes the layer's \
+            role. If the thumbnail isn't informative, keep the \
+            current name. Output JSON only.\n\nLayers:\n"
+            .to_string(),
+    });
+    for thumb in thumbnails {
+        parts.push(ContentPart::Text {
+            text: format!(
+                "Layer {id}: current name \"{name}\". Thumbnail:",
+                id = thumb.node_id,
+                name = thumb.current_name,
+            ),
+        });
+        // Encode RGBA → PNG → base64 inline. The VLM expects a
+        // data URI; PNG is the lingua franca that every VLM
+        // implementation knows how to decode.
+        let mut png: Vec<u8> = Vec::new();
+        if let Some(buf) = image::ImageBuffer::<image::Rgba<u8>, _>::from_raw(
+            thumb.width,
+            thumb.height,
+            thumb.rgba.clone(),
+        ) {
+            let mut cursor = std::io::Cursor::new(&mut png);
+            // PNG encoding can fail only on I/O errors, which an
+            // in-memory buffer never produces. Drop the result so
+            // we don't blow up the prompt construction; a missing
+            // image just degrades to a text-only entry for that
+            // layer, which the VLM handles by keeping the current
+            // name.
+            let _ =
+                image::DynamicImage::ImageRgba8(buf).write_to(&mut cursor, image::ImageFormat::Png);
+        }
+        if !png.is_empty() {
+            parts.push(ContentPart::ImageBase64 {
+                media_type: "image/png".into(),
+                data: B64.encode(&png),
+            });
+        }
+    }
+    parts.push(ContentPart::Text {
+        text: "\nReturn this exact shape:\n\
+            {\"names\":{\"<uuid>\":\"<new-name>\", ...}}\n"
+            .to_string(),
+    });
+
+    ChatRequest {
+        messages: vec![
+            ChatMessage {
+                role: crate::llm_chat::ChatRole::System,
+                content: ChatContent::Text(
+                    "You are a UI design assistant that renames layers \
+                    based on their rendered appearance. Output JSON only."
+                        .to_string(),
+                ),
+            },
+            ChatMessage {
+                role: crate::llm_chat::ChatRole::User,
+                content: ChatContent::Multimodal(parts),
+            },
+        ],
+        max_tokens: 1024,
         temperature: 0.2,
         grammar: None,
     }
@@ -219,17 +318,12 @@ pub fn build_design_token_prompt(document_json: &str) -> ChatRequest {
     );
     ChatRequest {
         messages: vec![
-            ChatMessage {
-                role: ChatRole::System,
-                content: "You are a design-system extraction assistant. \
-                          Identify recurring colors, fonts, and spacing \
-                          values. Output JSON only."
-                    .to_string(),
-            },
-            ChatMessage {
-                role: ChatRole::User,
-                content: user_body,
-            },
+            ChatMessage::system(
+                "You are a design-system extraction assistant. \
+                 Identify recurring colors, fonts, and spacing \
+                 values. Output JSON only.",
+            ),
+            ChatMessage::user(user_body),
         ],
         max_tokens: 1024,
         temperature: 0.1,
@@ -250,17 +344,12 @@ pub fn build_accessibility_prompt(document_json: &str) -> ChatRequest {
     );
     ChatRequest {
         messages: vec![
-            ChatMessage {
-                role: ChatRole::System,
-                content: "You are an accessibility auditor. Flag WCAG AA \
-                          contrast failures, undersized tap targets, \
-                          missing alt text. Output JSON only."
-                    .to_string(),
-            },
-            ChatMessage {
-                role: ChatRole::User,
-                content: user_body,
-            },
+            ChatMessage::system(
+                "You are an accessibility auditor. Flag WCAG AA \
+                 contrast failures, undersized tap targets, \
+                 missing alt text. Output JSON only.",
+            ),
+            ChatMessage::user(user_body),
         ],
         max_tokens: 1024,
         temperature: 0.1,
@@ -357,17 +446,18 @@ mod tests {
             (b, "Rectangle 5".to_string()),
         ]);
         assert_eq!(req.messages.len(), 2);
-        assert!(req.messages[1].content.contains(&a.to_string()));
-        assert!(req.messages[1].content.contains(&b.to_string()));
-        assert!(req.messages[1].content.contains("Group 1"));
-        assert!(req.messages[1].content.contains("Rectangle 5"));
+        let user = req.messages[1].content.as_text();
+        assert!(user.contains(&a.to_string()));
+        assert!(user.contains(&b.to_string()));
+        assert!(user.contains("Group 1"));
+        assert!(user.contains("Rectangle 5"));
         assert!(req.temperature <= 0.5);
     }
 
     #[test]
     fn design_token_prompt_embeds_document_and_schema() {
         let req = build_design_token_prompt("{\"sample\":true}");
-        let user = &req.messages[1].content;
+        let user = req.messages[1].content.as_text();
         assert!(user.contains("colors"));
         assert!(user.contains("fonts"));
         assert!(user.contains("spacing"));
@@ -377,7 +467,7 @@ mod tests {
     #[test]
     fn accessibility_prompt_lists_audit_dimensions() {
         let req = build_accessibility_prompt("{}");
-        let user = &req.messages[1].content;
+        let user = req.messages[1].content.as_text();
         assert!(user.contains("contrast"));
         assert!(user.contains("tap target"));
         assert!(user.contains("alt text"));

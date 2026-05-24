@@ -514,8 +514,10 @@ grants survive restarts. The UI is `McpSettingsPanel.tsx`.
    …) into `ElementType::{Header, Navigation, Hero, TextBlock,
    Image, Button, Card, Footer, Sidebar, Form, List}`.
 
-Output is `Vec<DetectedElement>`. Phase 3 will add an LLM
-refinement pass for ambiguous classifications.
+Output is `Vec<DetectedElement>`. The Phase 4 VLM pass lives in
+the same module as `refine_with_vlm` (16i) and is wired through
+the AIAssist panel; the Rust pipeline returns the heuristic result
+unchanged when no VLM is available.
 
 ## 16h. Plugin crate architecture
 
@@ -544,6 +546,92 @@ Bridge entry points: `plugin_list`, `plugin_enable`,
 `plugin_disable`, `plugin_execute(id, function, input_json)`. The
 Phase 2 wire format is intentionally JSON-only; a richer typed API
 (read_document, transform_path, …) lands in Phase 3.
+
+## 16i. Vision model integration (Phase 4)
+
+The vision path reuses the existing loopback-HTTP sidecar pattern
+(see `llm_sidecar.rs`) but extends it in three ways:
+
+1. **mmproj loading.** `SidecarConfig.mmproj_path: Option<PathBuf>`
+   is validated against the filesystem and appended as
+   `--mmproj <path>` to the llama-server argv. The
+   `vision_*_mmproj` registry entries hold the same SHA256 +
+   download URL plumbing as the main weights so a model
+   downloader can fetch both halves and the sidecar refuses to
+   start if either file is missing.
+2. **Multimodal chat shape.** `ChatMessage.content` is no longer
+   `String`; it is a `ChatContent` enum with `Text(String)` and
+   `Multimodal(Vec<ContentPart>)` variants. `ContentPart` carries
+   either a `text` chunk or an `image_url` chunk that serialises
+   into the OpenAI vision-API shape with a `data:` URI containing
+   a base64-encoded PNG. Text-only messages keep their plain
+   `"content": "string"` serialisation for backward compatibility
+   — every existing chat caller (Phase 1 LLM, Phase 3 task router)
+   continues to work unchanged.
+3. **Bridge surface.** `crates/kcreate_bridge/src/phase4.rs`
+   exposes `vision_start(pack_id)`, `vision_stop`,
+   `vision_status`, `vision_describe_image`,
+   `vision_generate_alt_text`, `vision_analyze_design` — plus the
+   higher-level features built on top (`vision_refine_layout`,
+   `vision_extract_brand`, `vision_suggest_crop`,
+   `vision_suggest_design_tokens`, `vision_describe_style`,
+   `vision_layer_name_for_node`). Each higher-level call uses
+   GBNF (`*::GRAMMAR`) so the VLM's reply is constrained to the
+   exact JSON shape Rust expects to parse.
+
+Vision sidecars are *soft-gated*: every tier is allowed to start
+one, but the Model Manager caps the per-tier installable model
+size at `DeviceTier::vision_model_max_mb` (Tier 0: 500 MB; Tier
+1: 2 GB; Tier 2: 5 GB; Tier 3: 8 GB). Tier 0 + 1 default to
+SmolVLM2-256M; Tier 2 + 3 default to Qwen2.5-VL-4B.
+
+## 16j. Image generation pipeline (Phase 4)
+
+Image generation is a *hard-gated* feature: when
+`RuntimeConfig::image_generation_allowed()` is false (Tier < 2,
+or no GPU detected), the UI removes the panel entirely and the
+bridge refuses to spawn the sidecar. The pipeline itself:
+
+1. `ImageGenSidecar` (`crates/kcreate_ai/src/image_gen.rs`) spawns
+   `python3 -m kcreate_diffusion.server --model <path>
+   --port <port>` on a loopback port. The companion package lives
+   in `tools/kcreate_diffusion/` and wraps `diffusers` so the bulk
+   of the inference code is upstream.
+2. `image_gen_generate(prompt, width, height, steps, seed)` posts
+   to `/v1/images/generations`; the response is a base64-encoded
+   PNG which the bridge decodes and forwards to the renderer.
+3. The renderer applies the Ask → Preview → Apply loop: the
+   preview is a floating overlay, and Apply imports the bytes
+   via `document_import_image_bytes` (MIME-sniffed, blob-stored
+   under the same content-addressed BLAKE3 path used by
+   imported assets). No temp files are written.
+
+Two registry entries ship in this phase:
+`image_gen_flux_klein_4b` (GGUF, llama.cpp via the diffusion
+sidecar) and `image_gen_flux_klein_mlx` (Apple Silicon).
+
+## 16k. MLX sidecar (Apple Silicon)
+
+`crates/kcreate_ai/src/mlx_sidecar.rs` is a structural mirror of
+`LlmSidecar` that spawns `python3 -m mlx_lm.server` instead of
+`llama-server`. It is only used on Apple Silicon, and only when
+`probe_mlx_available()` (which caches a `python3 -c "import
+mlx_lm"` probe) returns `true`. On every other platform — and on
+Apple Silicon when MLX is not installed — `SidecarDispatcher`
+transparently falls back to the GGUF/llama-server pack returned
+by `model_registry::gguf_fallback_for_mlx_pack` so the user never
+sees an MLX-only failure.
+
+### CPU / GPU support by platform
+
+| Platform           | Renderer (Phase 1)   | LLM (Phase 3)    | Vision (Phase 4)              | Image Gen (Phase 4)         |
+| ------------------ | -------------------- | ---------------- | ----------------------------- | --------------------------- |
+| macOS (Apple Si)   | wgpu / Metal         | llama-server     | llama-server **or** MLX `mlx_lm` | FLUX.2-Klein-4B GGUF or MLX |
+| macOS (Intel)      | wgpu / Metal         | llama-server     | llama-server                  | Disabled (no GPU tier)      |
+| Windows            | wgpu / DX12          | llama-server     | llama-server                  | FLUX.2-Klein-4B GGUF (Tier 2+) |
+| Linux (NVIDIA)     | wgpu / Vulkan        | llama-server     | llama-server                  | FLUX.2-Klein-4B GGUF (Tier 2+) |
+| Linux (other GPU)  | wgpu / Vulkan        | llama-server     | llama-server                  | Disabled (CPU diffusion ≠ usable) |
+| CPU fallback       | tiny-skia            | llama-server CPU | SmolVLM2-256M (CPU)           | Disabled                    |
 
 ## 17. Plugin types and runtime (Phase 2+)
 

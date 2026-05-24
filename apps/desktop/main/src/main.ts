@@ -948,6 +948,125 @@ function registerIpcHandlers(): void {
   ipcMain.handle("kcreate/ai/checkAccessibility", (): Promise<string> =>
     requireBridge().aiCheckAccessibility(),
   );
+  // ----- Phase 4: vision sidecar -----
+  ipcMain.handle("kcreate/vision/start", (_e, packId: string): number =>
+    requireBridge().visionStart(packId),
+  );
+  ipcMain.handle("kcreate/vision/stop", (): void => {
+    requireBridge().visionStop();
+  });
+  ipcMain.handle("kcreate/vision/status", (): string =>
+    requireBridge().visionStatus(),
+  );
+  // Phase 4 vision inference handlers — Rust returns a JS Promise via
+  // N-API `AsyncTask`, so each handler just returns the promise and
+  // `ipcMain.handle` awaits it before serializing the reply to the
+  // renderer. The main process event loop stays responsive during
+  // the underlying VLM round-trip.
+  ipcMain.handle(
+    "kcreate/vision/describeImage",
+    (
+      _e,
+      rgba: Buffer,
+      width: number,
+      height: number,
+      userPrompt: string,
+    ): Promise<string> =>
+      requireBridge().visionDescribeImage(
+        rgba,
+        width,
+        height,
+        userPrompt,
+      ),
+  );
+  ipcMain.handle(
+    "kcreate/vision/describeNode",
+    (_e, nodeId: string, userPrompt: string): Promise<string> =>
+      requireBridge().visionDescribeNode(nodeId, userPrompt),
+  );
+  ipcMain.handle(
+    "kcreate/vision/generateAltText",
+    (_e, rgba: Buffer, width: number, height: number): Promise<string> =>
+      requireBridge().visionGenerateAltText(rgba, width, height),
+  );
+  ipcMain.handle(
+    "kcreate/vision/generateAltTextForNode",
+    (_e, nodeId: string): Promise<string> =>
+      requireBridge().visionGenerateAltTextForNode(nodeId),
+  );
+  ipcMain.handle(
+    "kcreate/vision/analyzeDesign",
+    (_e, rgba: Buffer, width: number, height: number): Promise<string> =>
+      requireBridge().visionAnalyzeDesign(rgba, width, height),
+  );
+  ipcMain.handle(
+    "kcreate/ai/extractBrandFromImage",
+    (_e, rgba: Buffer, width: number, height: number): Promise<string> =>
+      requireBridge().aiExtractBrandFromImage(rgba, width, height),
+  );
+  ipcMain.handle(
+    "kcreate/ai/suggestCrop",
+    (
+      _e,
+      rgba: Buffer,
+      width: number,
+      height: number,
+      aspectRatio: number,
+    ): Promise<string> =>
+      requireBridge().aiSuggestCrop(
+        rgba,
+        width,
+        height,
+        aspectRatio,
+      ),
+  );
+  ipcMain.handle(
+    "kcreate/ai/suggestDesignTokens",
+    (_e, rgba: Buffer, width: number, height: number): Promise<string> =>
+      requireBridge().aiSuggestDesignTokens(rgba, width, height),
+  );
+  ipcMain.handle(
+    "kcreate/ai/describeStyle",
+    (_e, rgba: Buffer, width: number, height: number): Promise<string> =>
+      requireBridge().aiDescribeStyle(rgba, width, height),
+  );
+  ipcMain.handle("kcreate/vision/recommendedPack", (): string =>
+    requireBridge().visionRecommendedPack(),
+  );
+  ipcMain.handle("kcreate/vision/mmprojFor", (_e, packId: string): string =>
+    requireBridge().visionMmprojFor(packId),
+  );
+  ipcMain.handle("kcreate/vision/listablePacks", (): string[] =>
+    requireBridge().visionListablePacks(),
+  );
+  // ----- Phase 4: image generation sidecar -----
+  ipcMain.handle("kcreate/imageGen/start", (_e, packId: string): number =>
+    requireBridge().imageGenStart(packId),
+  );
+  ipcMain.handle("kcreate/imageGen/stop", (): void => {
+    requireBridge().imageGenStop();
+  });
+  ipcMain.handle("kcreate/imageGen/status", (): string =>
+    requireBridge().imageGenStatus(),
+  );
+  ipcMain.handle(
+    "kcreate/imageGen/generate",
+    (
+      _e,
+      prompt: string,
+      width: number,
+      height: number,
+      steps: number,
+      seed: number | null,
+    ): Promise<string> =>
+      requireBridge().imageGenGenerate(prompt, width, height, steps, seed),
+  );
+  ipcMain.handle("kcreate/imageGen/allowed", (): boolean =>
+    requireBridge().imageGenAllowed(),
+  );
+  ipcMain.handle("kcreate/imageGen/recommendedPack", (): string =>
+    requireBridge().imageGenRecommendedPack(),
+  );
   // The OS temp dir is owned by the host (Node `os.tmpdir()`), not by
   // the Rust bridge — it's a process-environment concern, not a
   // rendering one. Surfacing it through the runtime bridge lets the
@@ -1043,6 +1162,11 @@ function registerIpcHandlers(): void {
     "kcreate/document/importImage",
     (_e, parentId: string | null, filePath: string) =>
       requireBridge().documentImportImage(parentId, filePath),
+  );
+  ipcMain.handle(
+    "kcreate/document/importImageBytes",
+    (_e, parentId: string | null, bytes: Buffer) =>
+      requireBridge().documentImportImageBytes(parentId, bytes),
   );
   ipcMain.handle(
     "kcreate/canvas/createRect",

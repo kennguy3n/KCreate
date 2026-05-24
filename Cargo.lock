@@ -1689,6 +1689,7 @@ dependencies = [
 name = "kcreate_tests"
 version = "0.0.1"
 dependencies = [
+ "base64",
  "kcreate_ai",
  "kcreate_core",
  "kcreate_export",
@@ -1698,6 +1699,7 @@ dependencies = [
  "kcreate_vector",
  "serde_json",
  "tempfile",
+ "tiny_http",
  "uuid",
 ]
 

@@ -49,6 +49,15 @@ import type {
   LlmMessage,
   LlmReply,
   LlmStatus,
+  VisionBridge,
+  VisionStatus,
+  BrandExtraction,
+  CropSuggestion,
+  DesignTokenSuggestion,
+  StyleDescription,
+  ImageGenBridge,
+  ImageGenStatus,
+  GeneratedImage,
   McpBridge,
   NodeInfo,
   PdfExportOptions,
@@ -524,11 +533,14 @@ const runtime: RuntimeBridge = {
 
 type ResourceLimitsSnake = {
   device_tier: string;
+  platform: string;
   low_resource_mode: boolean;
   effective_undo_depth: number;
   effective_raster_cache_mb: number;
   effective_max_model_mb: number;
   gpu_rendering_allowed: boolean;
+  image_generation_allowed: boolean;
+  vision_model_max_mb: number;
 };
 
 function resourceLimitsFromSnake(s: ResourceLimitsSnake): ResourceLimits {
@@ -539,6 +551,9 @@ function resourceLimitsFromSnake(s: ResourceLimitsSnake): ResourceLimits {
     effectiveRasterCacheMb: s.effective_raster_cache_mb,
     effectiveMaxModelMb: s.effective_max_model_mb,
     gpuRenderingAllowed: s.gpu_rendering_allowed,
+    imageGenerationAllowed: s.image_generation_allowed,
+    visionModelMaxMb: s.vision_model_max_mb,
+    platform: s.platform,
   };
 }
 
@@ -621,6 +636,16 @@ const canvas: CanvasBridge = {
       filePath,
     )) as string;
   },
+  async importImageBytes(
+    parentId: string | null,
+    bytes: Uint8Array,
+  ): Promise<string> {
+    return (await ipcRenderer.invoke(
+      "kcreate/document/importImageBytes",
+      parentId,
+      Buffer.from(bytes),
+    )) as string;
+  },
   async createRect(parentId, x, y, w, h): Promise<string> {
     return (await ipcRenderer.invoke(
       "kcreate/canvas/createRect",
@@ -701,6 +726,188 @@ const ai: AiBridge = {
       "kcreate/ai/checkAccessibility",
     )) as string;
     return JSON.parse(raw) as LlmJsonResult;
+  },
+};
+
+const vision: VisionBridge = {
+  async start(packId: string): Promise<number> {
+    return (await ipcRenderer.invoke(
+      "kcreate/vision/start",
+      packId,
+    )) as number;
+  },
+  async stop(): Promise<void> {
+    await ipcRenderer.invoke("kcreate/vision/stop");
+  },
+  async status(): Promise<VisionStatus> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/vision/status",
+    )) as string;
+    return JSON.parse(raw) as VisionStatus;
+  },
+  async describeImage(
+    rgba: Uint8Array,
+    width: number,
+    height: number,
+    userPrompt: string,
+  ): Promise<string> {
+    return (await ipcRenderer.invoke(
+      "kcreate/vision/describeImage",
+      Buffer.from(rgba),
+      width,
+      height,
+      userPrompt,
+    )) as string;
+  },
+  async describeNode(nodeId: string, userPrompt: string): Promise<string> {
+    return (await ipcRenderer.invoke(
+      "kcreate/vision/describeNode",
+      nodeId,
+      userPrompt,
+    )) as string;
+  },
+  async generateAltText(
+    rgba: Uint8Array,
+    width: number,
+    height: number,
+  ): Promise<string> {
+    return (await ipcRenderer.invoke(
+      "kcreate/vision/generateAltText",
+      Buffer.from(rgba),
+      width,
+      height,
+    )) as string;
+  },
+  async generateAltTextForNode(nodeId: string): Promise<string> {
+    return (await ipcRenderer.invoke(
+      "kcreate/vision/generateAltTextForNode",
+      nodeId,
+    )) as string;
+  },
+  async analyzeDesign(
+    rgba: Uint8Array,
+    width: number,
+    height: number,
+  ): Promise<string> {
+    return (await ipcRenderer.invoke(
+      "kcreate/vision/analyzeDesign",
+      Buffer.from(rgba),
+      width,
+      height,
+    )) as string;
+  },
+  async extractBrand(
+    rgba: Uint8Array,
+    width: number,
+    height: number,
+  ): Promise<BrandExtraction> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/ai/extractBrandFromImage",
+      Buffer.from(rgba),
+      width,
+      height,
+    )) as string;
+    return JSON.parse(raw) as BrandExtraction;
+  },
+  async suggestCrop(
+    rgba: Uint8Array,
+    width: number,
+    height: number,
+    aspectRatio: number,
+  ): Promise<CropSuggestion> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/ai/suggestCrop",
+      Buffer.from(rgba),
+      width,
+      height,
+      aspectRatio,
+    )) as string;
+    return JSON.parse(raw) as CropSuggestion;
+  },
+  async suggestDesignTokens(
+    rgba: Uint8Array,
+    width: number,
+    height: number,
+  ): Promise<DesignTokenSuggestion> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/ai/suggestDesignTokens",
+      Buffer.from(rgba),
+      width,
+      height,
+    )) as string;
+    return JSON.parse(raw) as DesignTokenSuggestion;
+  },
+  async describeStyle(
+    rgba: Uint8Array,
+    width: number,
+    height: number,
+  ): Promise<StyleDescription> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/ai/describeStyle",
+      Buffer.from(rgba),
+      width,
+      height,
+    )) as string;
+    return JSON.parse(raw) as StyleDescription;
+  },
+  async recommendedPack(): Promise<string> {
+    return (await ipcRenderer.invoke(
+      "kcreate/vision/recommendedPack",
+    )) as string;
+  },
+  async mmprojFor(packId: string): Promise<string> {
+    return (await ipcRenderer.invoke(
+      "kcreate/vision/mmprojFor",
+      packId,
+    )) as string;
+  },
+  async listablePacks(): Promise<string[]> {
+    return (await ipcRenderer.invoke(
+      "kcreate/vision/listablePacks",
+    )) as string[];
+  },
+};
+
+const imageGen: ImageGenBridge = {
+  async start(packId: string): Promise<number> {
+    return (await ipcRenderer.invoke(
+      "kcreate/imageGen/start",
+      packId,
+    )) as number;
+  },
+  async stop(): Promise<void> {
+    await ipcRenderer.invoke("kcreate/imageGen/stop");
+  },
+  async status(): Promise<ImageGenStatus> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/imageGen/status",
+    )) as string;
+    return JSON.parse(raw) as ImageGenStatus;
+  },
+  async generate(
+    prompt: string,
+    width: number,
+    height: number,
+    steps: number,
+    seed: number | null,
+  ): Promise<GeneratedImage> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/imageGen/generate",
+      prompt,
+      width,
+      height,
+      steps,
+      seed,
+    )) as string;
+    return JSON.parse(raw) as GeneratedImage;
+  },
+  async allowed(): Promise<boolean> {
+    return (await ipcRenderer.invoke("kcreate/imageGen/allowed")) as boolean;
+  },
+  async recommendedPack(): Promise<string> {
+    return (await ipcRenderer.invoke(
+      "kcreate/imageGen/recommendedPack",
+    )) as string;
   },
 };
 
@@ -1660,6 +1867,8 @@ contextBridge.exposeInMainWorld("kcreate", {
   canvas,
   ai,
   llm,
+  vision,
+  imageGen,
   mcp,
   runtime,
   export: exportApi,

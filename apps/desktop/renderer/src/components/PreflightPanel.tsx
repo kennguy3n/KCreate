@@ -2,7 +2,7 @@
 // document and surface issues grouped by severity (error / warning /
 // info). Bound to `window.kcreate.preflight` in `preload.ts`.
 
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 
 import type {
   PreflightColorSpaceTarget,
@@ -26,6 +26,7 @@ const DEFAULTS: PreflightOptions = {
   requireBleedMm: 3,
   allowTransparency: false,
   targetColorSpace: "cmyk",
+  targetTotalInkCoverage: 3,
 };
 
 export function PreflightPanel({
@@ -101,6 +102,23 @@ export function PreflightPanel({
           checked={opts.allowTransparency}
           onChange={(v) => setOpts({ ...opts, allowTransparency: v })}
         />
+        <NumberField
+          label="Max ink (%)"
+          value={Math.round(opts.targetTotalInkCoverage * 100)}
+          min={50}
+          max={500}
+          onChange={(v) =>
+            // Stored as a fraction; users think in percent. 300% =
+            // GRACoL / SWOP default; 240%-280% for web/newsprint.
+            // Clamped client-side to [50, 500]%: under 50% would
+            // silently disable the check (the Rust validator drops
+            // <= 0 caps with no feedback), and over 500% is far
+            // outside any documented press tolerance. The bounds
+            // are advisory — the user can still type freely and the
+            // clamp resolves on commit.
+            setOpts({ ...opts, targetTotalInkCoverage: v / 100 })
+          }
+        />
       </div>
       <button
         type="button"
@@ -149,21 +167,71 @@ export function PreflightPanel({
 function NumberField({
   label,
   value,
+  min,
+  max,
   onChange,
 }: {
   label: string;
   value: number;
+  /** Optional inclusive lower bound. Set as the HTML `min`
+   * attribute (so browsers can surface spinner / validation UX)
+   * and clamped at commit time (on blur / Enter), NOT on every
+   * keystroke. Per-keystroke clamping made it impossible to type
+   * values whose prefix was below `min` (e.g. typing "150" with
+   * `min=50` would clamp "1" to "50" mid-stroke). */
+  min?: number;
+  /** Optional inclusive upper bound; mirrors `min` semantics. */
+  max?: number;
   onChange: (v: number) => void;
 }): JSX.Element {
+  // Local string state so the user can type freely (including
+  // intermediate values whose prefix is out of range). The
+  // committed numeric `value` prop is the source of truth; this
+  // ref-driven mirror only matters while the input is focused.
+  const [draft, setDraft] = useState<string>(() => String(value));
+  // Re-sync the draft whenever the upstream value changes (e.g. a
+  // sibling control resets the options blob). Without this the
+  // input would freeze at the user's last keystroke.
+  useEffect(() => {
+    setDraft(String(value));
+  }, [value]);
+
+  const commit = useCallback(() => {
+    const n = Number(draft);
+    if (!Number.isFinite(n)) {
+      // Reject invalid input by snapping back to the committed
+      // value; do NOT call `onChange` with NaN.
+      setDraft(String(value));
+      return;
+    }
+    let clamped = n;
+    if (typeof min === "number") clamped = Math.max(min, clamped);
+    if (typeof max === "number") clamped = Math.min(max, clamped);
+    if (clamped !== n) {
+      // Reflect the clamp visually so the user knows the bound
+      // applied.
+      setDraft(String(clamped));
+    }
+    if (clamped !== value) {
+      onChange(clamped);
+    }
+  }, [draft, max, min, onChange, value]);
+
   return (
     <label style={{ display: "flex", flexDirection: "column", gap: 4 }}>
       <span style={{ fontSize: 11, color: colors.textMuted }}>{label}</span>
       <input
         type="number"
-        value={value}
-        onChange={(e) => {
-          const n = Number(e.target.value);
-          if (Number.isFinite(n)) onChange(n);
+        value={draft}
+        min={min}
+        max={max}
+        onChange={(e) => setDraft(e.target.value)}
+        onBlur={commit}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") {
+            commit();
+            (e.target as HTMLInputElement).blur();
+          }
         }}
         style={inputStyle}
       />
@@ -366,6 +434,8 @@ function labelForCheck(id: string): string {
       return "Bleed margin";
     case "font_embed":
       return "Font embed";
+    case "font_glyph_coverage":
+      return "Font glyph coverage";
     case "image_resolution":
       return "Image resolution";
     case "color_space":
@@ -374,6 +444,10 @@ function labelForCheck(id: string): string {
       return "Transparency";
     case "page_size":
       return "Page size";
+    case "shading":
+      return "Shading pattern";
+    case "total_ink_coverage":
+      return "Total ink coverage";
     default:
       return id;
   }

@@ -59,6 +59,13 @@ raw-window-handle = { workspace = true, optional = true }
 # (`crates/kcreate_tests/tests/local_first.rs`) keeps it that way.
 kcreate_collab = { path = "../kcreate_collab", optional = true }
 kcreate_collab_transport = { path = "../kcreate_collab_transport", optional = true }
+# Dev-only KChat membership issuer. Pulled in ONLY behind the
+# `kchat-dev-issuer` feature (off by default). When enabled the
+# bridge exposes a `kchat_dev_mint_membership` N-API entry point
+# that lets the renderer mint a test attestation locally. Never
+# enable in production builds — minting your own attestation
+# subverts the multiplayer trust root.
+kcreate_kchat = { path = "../kcreate_kchat", optional = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time"], optional = true }
 # Used only behind the `collab` feature to decode an Ed25519 public
 # key from the wire-form base64url string into a `VerifyingKey` for
@@ -83,6 +90,14 @@ tempfile.workspace = true
 # (see `document.rs::tests::plugin_execute_with_context_*`). Pinned
 # to the same major as `kcreate_plugin` to keep wasmi compatibility.
 wat = "1"
+# Criterion drives the scene-sync presence overlay micro-benchmarks
+# (`benches/scene_sync_multi_peer.rs`). Kept as a dev-dependency so
+# release builds of the bridge don't link it.
+criterion.workspace = true
+
+[[bench]]
+name = "scene_sync_multi_peer"
+harness = false
 
 [features]
 default = []
@@ -110,3 +125,9 @@ native_canvas = ["dep:raw-window-handle"]
 # mdns-sd out of the editing-path dependency tree; the Electron
 # host enables this when packaging a release that ships collab.
 collab = ["dep:kcreate_collab", "dep:kcreate_collab_transport", "dep:tokio", "dep:ed25519-dalek", "dep:tracing"]
+# Enable the dev-only KChat membership issuer N-API surface. Implies
+# `collab` (since the install path runs through the collab gate).
+# Off by default; non-dev builds must NOT enable this — minting a
+# membership locally bypasses the trust root the real KChat product
+# pins to its own keypair.
+kchat-dev-issuer = ["collab", "dep:kcreate_kchat"]

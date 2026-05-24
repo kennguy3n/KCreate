@@ -64,6 +64,21 @@ pub enum PreflightCheck {
     /// CMYK overrides on an RGB-only export target (which the
     /// injector silently flattens to DeviceRGB).
     Shading,
+    /// Per-codepoint glyph-coverage check for `TextLayer` nodes.
+    /// The `FontEmbed` check only verifies the *family* resolves;
+    /// this one verifies the resolved face actually carries glyphs
+    /// for every codepoint in the rendered text. A font that
+    /// resolves but lacks (say) the apostrophe codepoint will
+    /// silently substitute `.notdef` (a hollow rectangle) at print
+    /// time — exactly the kind of "looks fine on screen, broken on
+    /// the proof" failure preflight exists to catch.
+    FontGlyphCoverage,
+    /// Total ink coverage (TIC) check for CMYK fills + CMYK
+    /// gradients. The default cap is 300% (GRACoL / SWOP commercial
+    /// offset) — exceeding it causes drying / blocking issues on
+    /// press. Configurable via
+    /// [`PreflightOptions::target_total_ink_coverage`].
+    TotalInkCoverage,
 }
 
 impl PreflightCheck {
@@ -78,6 +93,8 @@ impl PreflightCheck {
             Self::Transparency => "transparency",
             Self::PageSize => "page_size",
             Self::Shading => "shading",
+            Self::FontGlyphCoverage => "font_glyph_coverage",
+            Self::TotalInkCoverage => "total_ink_coverage",
         }
     }
 }
@@ -118,6 +135,12 @@ pub struct PreflightOptions {
     pub allow_transparency: bool,
     /// Color space the output is being prepared for.
     pub target_color_space: ColorSpaceTarget,
+    /// Total ink coverage cap as a fraction (1.0 = 100%, 3.0 = 300%).
+    /// 300% is the GRACoL / SWOP commercial offset default; web /
+    /// newsprint targets use lower caps (240% — 280%). The check
+    /// fires when a CMYK fill's component sum exceeds this value;
+    /// gradient stops are checked individually.
+    pub target_total_ink_coverage: f64,
 }
 
 impl Default for PreflightOptions {
@@ -127,6 +150,7 @@ impl Default for PreflightOptions {
             require_bleed_mm: 3.0,
             allow_transparency: false,
             target_color_space: ColorSpaceTarget::Cmyk,
+            target_total_ink_coverage: 3.0,
         }
     }
 }
@@ -229,6 +253,7 @@ pub fn run_preflight(
             check_node_color_space(node, page_id, options, &mut issues);
             check_node_transparency(node, page_id, options, &mut issues);
             check_node_shading(node, page_id, options, &mut issues);
+            check_node_total_ink_coverage(node, page_id, options, &mut issues);
             if matches!(node.node_type, NodeType::TextLayer) {
                 check_node_font_embed(node, page_id, fonts.as_ref(), &mut issues);
             }
@@ -380,11 +405,24 @@ fn is_content_layer(node_type: NodeType) -> bool {
     )
 }
 
-/// Font-embed check.
+/// Font-embed + glyph-coverage check.
 ///
-/// Verifies every `TextLayer`'s `font_family` resolves in the local
-/// fontdb (system fonts). Missing fonts would be silently substituted
-/// at print time.
+/// Two-tier check:
+///   1. **`FontEmbed` (Error)** — the `font_family` must resolve in
+///      the local fontdb. A missing family means the print pipeline
+///      will silently substitute a fallback face and produce wrong
+///      letterforms on the proof.
+///   2. **`FontGlyphCoverage` (Warning)** — when the family *does*
+///      resolve, probe the resolved face for every codepoint in the
+///      rendered text. Any codepoint without a glyph (`None` or
+///      `.notdef`) surfaces as a warning so the user knows the
+///      character will print as a hollow rectangle.
+///
+/// The two checks are stacked rather than mutually exclusive: a
+/// resolved-but-incomplete font still produces an `Error` for the
+/// missing family (it doesn't), only a `Warning` per missing glyph.
+/// This matches the severity ladder used elsewhere — errors block
+/// export, warnings inform.
 fn check_node_font_embed(
     node: &Node,
     page_id: Uuid,
@@ -406,7 +444,53 @@ fn check_node_font_embed(
             affected_node_id: Some(node.id),
             page_id: Some(page_id),
         });
+        // Coverage probing would just return another NotFound, so
+        // skip — the export-blocking `FontEmbed` error is the
+        // actionable signal for the user.
+        return;
     }
+    // The family resolves; check glyph coverage. We deliberately
+    // ignore the `Err(NotFound)` branch here — `find_family` already
+    // returned a non-empty list, so the only way `missing_glyphs`
+    // can fail is `FaceData` (unreadable face bytes), which is
+    // not a preflight-actionable error.
+    let Ok(missing) = fonts.missing_glyphs(&meta.font_family, &meta.text) else {
+        return;
+    };
+    if missing.is_empty() {
+        return;
+    }
+    // Emit ONE issue per text layer rather than one per missing
+    // codepoint. A document that uses an em-dash, a curly apostrophe,
+    // and a degree sign in a font that has none of them would
+    // otherwise generate 3 issues that all say "fix this font",
+    // burying every other issue in the panel. The message lists up
+    // to 6 representative codepoints so the user can copy-paste
+    // them into a font lookup; the full count goes in the prefix.
+    let preview_cap = 6;
+    let preview: String = missing
+        .iter()
+        .take(preview_cap)
+        .map(|ch| format!("U+{:04X} '{ch}'", u32::from(*ch)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let suffix = if missing.len() > preview_cap {
+        format!(", … (+{} more)", missing.len() - preview_cap)
+    } else {
+        String::new()
+    };
+    issues.push(PreflightIssue {
+        check: PreflightCheck::FontGlyphCoverage,
+        severity: PreflightSeverity::Warning,
+        message: format!(
+            "Text layer '{name}' uses {n} codepoint(s) the font '{family}' has no glyph for ({preview}{suffix}). These will print as `.notdef` (hollow rectangle).",
+            name = node.name,
+            family = meta.font_family,
+            n = missing.len(),
+        ),
+        affected_node_id: Some(node.id),
+        page_id: Some(page_id),
+    });
 }
 
 /// Image resolution check.
@@ -705,6 +789,181 @@ fn check_node_shading(
             });
         }
     }
+}
+
+/// Total ink coverage (TIC) check.
+///
+/// Sums the CMYK components for the *paint that will actually be laid
+/// down on press* and warns when the sum exceeds the per-options cap.
+///
+/// The override-vs-fill precedence here mirrors
+/// `pdf::resolve_fill_paint` exactly:
+///
+/// - If `style.color_override` is `Some(_)`, that override replaces the
+///   fill at export time. We measure the override: `Color::Cmyk`
+///   components are summed directly (authored as CMYK, no conversion
+///   error); `Color::Srgb` / `Color::Hsl` / `Color::Lab` are routed
+///   through `to_srgb()` → `srgb_to_cmyk` (the same path the PDF
+///   exporter takes for non-CMYK overrides). The underlying
+///   `style.fill` is **not** inspected in this branch because the
+///   export pipeline never emits it — flagging it would surface a
+///   false positive for ink that physically isn't on the page.
+/// - If `style.color_override` is `None`, we walk `style.fill`:
+///   `Solid` → `srgb_to_cmyk` once; `Gradient` → per stop with
+///   worst-offender reporting (a gradient with N over-cap stops is
+///   one design issue, not N).
+///
+/// The check is gated on `target_color_space == Cmyk`. On an RGB-only
+/// export target there is no press to dry, so TIC is moot.
+///
+/// Range notes worth surfacing for future maintainers: the naive
+/// `srgb_to_cmyk` in `kcreate_core::color` produces components whose
+/// sum is bounded above by 3.0 (300%). At the default
+/// `target_total_ink_coverage` of 3.0 with strict `>` comparison,
+/// sRGB-sourced fills can never trip the check — by construction.
+/// That's correct: with the naive conversion no sRGB color can
+/// produce more than 300% on the press, so the warning would be
+/// vacuous. The check is still meaningful for (a) explicit CMYK
+/// overrides authored above the cap, and (b) users targeting tighter
+/// caps (e.g. 240% for newsprint, 280% for web offset). When Phase 3
+/// ICC profile chains land, sRGB sources will be able to legitimately
+/// exceed 300%, and this check will activate without further work.
+fn check_node_total_ink_coverage(
+    node: &Node,
+    page_id: Uuid,
+    options: &PreflightOptions,
+    issues: &mut Vec<PreflightIssue>,
+) {
+    if !matches!(options.target_color_space, ColorSpaceTarget::Cmyk) {
+        return;
+    }
+    if !is_content_layer(node.node_type) {
+        return;
+    }
+    let cap = options.target_total_ink_coverage;
+    if !cap.is_finite() || cap <= 0.0 {
+        return;
+    }
+
+    // 1. Override path. Any override variant replaces the fill at
+    // export time; inspect ONLY the override here, never fall through
+    // to the fill (see resolve_fill_paint in pdf.rs).
+    if let Some(over) = &node.style.color_override {
+        let sum = override_ink_sum(over);
+        if sum > cap {
+            let source = match over {
+                kcreate_core::color::Color::Cmyk { .. } => "CMYK color override",
+                kcreate_core::color::Color::Srgb { .. } => {
+                    "sRGB color override (converted to CMYK)"
+                }
+                kcreate_core::color::Color::Hsl { .. } => "HSL color override (converted to CMYK)",
+                kcreate_core::color::Color::Lab { .. } => "Lab color override (converted to CMYK)",
+            };
+            push_tic_issue(node, page_id, sum, cap, source, None, issues);
+        }
+        return;
+    }
+
+    // 2. Underlying fill. Only reachable when no override exists — i.e.
+    // the fill is what the export pipeline will actually emit.
+    match &node.style.fill {
+        FillStyle::None => {}
+        FillStyle::Solid(c) => {
+            let sum = solid_color_ink_sum(c);
+            if sum > cap {
+                push_tic_issue(node, page_id, sum, cap, "solid fill", None, issues);
+            }
+        }
+        FillStyle::Gradient(gradient) => {
+            let stops = match gradient {
+                kcreate_core::node::GradientKind::Linear { stops, .. }
+                | kcreate_core::node::GradientKind::Radial { stops, .. } => stops,
+            };
+            // Walk every stop; report the highest offender to keep
+            // the panel readable. A gradient with 10 over-cap stops
+            // is a single design issue, not 10 separate ones.
+            let mut worst: Option<(usize, f64)> = None;
+            for (idx, stop) in stops.iter().enumerate() {
+                let sum = solid_color_ink_sum(&stop.color);
+                if sum > cap && worst.is_none_or(|(_, best)| sum > best) {
+                    worst = Some((idx, sum));
+                }
+            }
+            if let Some((idx, sum)) = worst {
+                let location = format!("gradient stop {idx}");
+                push_tic_issue(
+                    node,
+                    page_id,
+                    sum,
+                    cap,
+                    "gradient fill",
+                    Some(location),
+                    issues,
+                );
+            }
+        }
+    }
+}
+
+/// Sum of CMYK components for an override color, in `[0, 4]`.
+///
+/// `Color::Cmyk` is read out directly (authored in target space, no
+/// conversion needed). Every other variant routes through
+/// `to_srgb()` → `srgb_to_cmyk()`, which is precisely the path
+/// `pdf::resolve_fill_paint` uses for non-CMYK overrides. Keeping the
+/// two helpers in lockstep is the whole point of pulling the check
+/// out — if the exporter ever switches to a different conversion for
+/// non-CMYK overrides, this helper has to follow.
+fn override_ink_sum(over: &kcreate_core::color::Color) -> f64 {
+    match over {
+        kcreate_core::color::Color::Cmyk { c, m, y, k, .. } => {
+            f64::from(*c) + f64::from(*m) + f64::from(*y) + f64::from(*k)
+        }
+        _ => {
+            let (r, g, b, _alpha) = over.to_srgb();
+            let (c, m, y, k) = kcreate_core::color::srgb_to_cmyk(r, g, b);
+            f64::from(c) + f64::from(m) + f64::from(y) + f64::from(k)
+        }
+    }
+}
+
+/// Sum of CMYK components for a single solid RGBA fill, in `[0, 4]`.
+/// Always goes through `srgb_to_cmyk` for the same reason the
+/// `ColorSpace` check does — that's what the export pipeline applies,
+/// so it's the ink the press will actually see.
+///
+/// Note: the naive `srgb_to_cmyk` produces components bounded by
+/// `4 - (r+g+b)/max(r,g,b) - max(r,g,b)`, which approaches but never
+/// reaches 3.0 (300%). With the default 300% cap and strict `>`,
+/// this function can never trip the TIC check on its own — see the
+/// extended note on `check_node_total_ink_coverage`.
+fn solid_color_ink_sum(color: &kcreate_core::node::RgbaColor) -> f64 {
+    let (c, m, y, k) = kcreate_core::color::srgb_to_cmyk(color.r, color.g, color.b);
+    f64::from(c) + f64::from(m) + f64::from(y) + f64::from(k)
+}
+
+fn push_tic_issue(
+    node: &Node,
+    page_id: Uuid,
+    sum: f64,
+    cap: f64,
+    source_label: &str,
+    location: Option<String>,
+    issues: &mut Vec<PreflightIssue>,
+) {
+    let sum_pct = sum * 100.0;
+    let cap_pct = cap * 100.0;
+    let location_suffix = location.map(|l| format!(" ({l})")).unwrap_or_default();
+    issues.push(PreflightIssue {
+        check: PreflightCheck::TotalInkCoverage,
+        severity: PreflightSeverity::Warning,
+        message: format!(
+            "Layer '{name}' {source_label}{location_suffix} totals {sum_pct:.0}% ink, exceeding the {cap_pct:.0}% cap. Press operators reject jobs over this limit due to drying and blocking.",
+            name = node.name,
+        ),
+        affected_node_id: Some(node.id),
+        page_id: Some(page_id),
+    });
 }
 
 /// Transparency check.
@@ -1424,5 +1683,345 @@ mod tests {
         clear_cached_font_manager();
         let c = cached_font_manager();
         assert!(!Arc::ptr_eq(&a, &c));
+    }
+
+    #[test]
+    fn tic_check_flags_cmyk_override_over_cap() {
+        // CMYK override summing to 320% (= 3.2) is over the 300%
+        // default cap → must produce a TotalInkCoverage warning.
+        let mut doc = DocumentGraph::new();
+        let page = page_with_layout(&mut doc, a4_layout(), a4_bounds());
+        let mut n = Node::new(NodeType::VectorLayer, "heavy ink");
+        n.parent_id = Some(page);
+        n.bounds = Bounds::new(0.0, 0.0, 200.0, 200.0);
+        n.style.color_override = Some(kcreate_core::color::Color::Cmyk {
+            c: 0.9,
+            m: 0.9,
+            y: 0.9,
+            k: 0.5,
+            a: 1.0,
+        });
+        doc.insert_node(n).unwrap();
+        let issues = run_preflight(&doc, &[], &PreflightOptions::default());
+        let tic: Vec<&PreflightIssue> = issues
+            .iter()
+            .filter(|i| i.check == PreflightCheck::TotalInkCoverage)
+            .collect();
+        assert_eq!(tic.len(), 1, "expected one TIC warning, got {tic:?}");
+        assert!(tic[0].message.contains("320%"), "msg: {}", tic[0].message);
+    }
+
+    #[test]
+    fn tic_check_ignores_under_cap_cmyk() {
+        // 250% ink — under the 300% default cap.
+        let mut doc = DocumentGraph::new();
+        let page = page_with_layout(&mut doc, a4_layout(), a4_bounds());
+        let mut n = Node::new(NodeType::VectorLayer, "fine ink");
+        n.parent_id = Some(page);
+        n.bounds = Bounds::new(0.0, 0.0, 200.0, 200.0);
+        n.style.color_override = Some(kcreate_core::color::Color::Cmyk {
+            c: 0.8,
+            m: 0.8,
+            y: 0.5,
+            k: 0.4,
+            a: 1.0,
+        });
+        doc.insert_node(n).unwrap();
+        let issues = run_preflight(&doc, &[], &PreflightOptions::default());
+        assert!(
+            !issues
+                .iter()
+                .any(|i| i.check == PreflightCheck::TotalInkCoverage),
+            "under-cap fill must not trip TIC, got: {issues:?}"
+        );
+    }
+
+    #[test]
+    fn tic_check_skipped_for_rgb_target() {
+        // Same over-cap CMYK as the positive test, but the export
+        // target is RGB — no press, no TIC concern.
+        let mut doc = DocumentGraph::new();
+        let page = page_with_layout(&mut doc, a4_layout(), a4_bounds());
+        let mut n = Node::new(NodeType::VectorLayer, "heavy ink");
+        n.parent_id = Some(page);
+        n.bounds = Bounds::new(0.0, 0.0, 200.0, 200.0);
+        n.style.color_override = Some(kcreate_core::color::Color::Cmyk {
+            c: 0.9,
+            m: 0.9,
+            y: 0.9,
+            k: 0.5,
+            a: 1.0,
+        });
+        doc.insert_node(n).unwrap();
+        let opts = PreflightOptions {
+            target_color_space: ColorSpaceTarget::Rgb,
+            ..PreflightOptions::default()
+        };
+        let issues = run_preflight(&doc, &[], &opts);
+        assert!(
+            !issues
+                .iter()
+                .any(|i| i.check == PreflightCheck::TotalInkCoverage),
+            "RGB target must skip TIC check entirely"
+        );
+    }
+
+    #[test]
+    fn tic_check_reports_worst_gradient_stop() {
+        // Three stops; the middle one is over-cap. Test that exactly
+        // one issue surfaces and that the message points to the
+        // worst-offending stop index.
+        let mut doc = DocumentGraph::new();
+        let page = page_with_layout(&mut doc, a4_layout(), a4_bounds());
+        let mut n = Node::new(NodeType::VectorLayer, "gradient bg");
+        n.parent_id = Some(page);
+        n.bounds = Bounds::new(0.0, 0.0, 200.0, 200.0);
+        // Pure black sRGB → (0, 0, 0, 1) CMYK = 100% ink (fine).
+        // Pure cyan-magenta-yellow mix (deep brown) → very high
+        // total ink. Easiest way to engineer an over-cap stop in
+        // sRGB space: (0.05, 0.05, 0.05) → produces (~0, ~0, ~0,
+        // ~0.95) CMYK ≈ 95% ink (under). Need a more saturated
+        // dark colour. Use (0.02, 0.05, 0.10) → ((0.10-0.02)/0.10
+        // = 0.8 c, (0.10-0.05)/0.10 = 0.5 m, 0 y, 0.90 k) = 220%
+        // (still under). To engineer over-cap reliably, use a
+        // small RGB triple where one channel is very dark: (0.0,
+        // 0.0, 0.10) → c=1.0, m=1.0, y=0.0, k=0.90 = 290%. We
+        // want over-cap — push k by using (0.0, 0.0, 0.05):
+        //   k = 1 - 0.05 = 0.95
+        //   c = (1 - 0 - 0.95) / 0.05 = 1.0
+        //   m = (1 - 0 - 0.95) / 0.05 = 1.0
+        //   y = (1 - 0.05 - 0.95) / 0.05 = 0.0
+        // = 1.0 + 1.0 + 0 + 0.95 = 295% — still under. Use
+        // (0.005, 0.005, 0.02): k=0.98, c≈0.77, m≈0.77, y≈0 ≈
+        // 252% — under. The clean way is just to express the
+        // over-cap stop directly in CMYK via `color_override`,
+        // but `RgbaColor` is sRGB-only. Instead, we use a custom
+        // cap of 100% so any non-trivial chromatic fill trips.
+        let red = RgbaColor::new(1.0, 0.0, 0.0, 1.0);
+        let dark = RgbaColor::new(0.0, 0.05, 0.05, 1.0);
+        let blue = RgbaColor::new(0.0, 0.0, 1.0, 1.0);
+        n.style.fill = FillStyle::Gradient(GradientKind::Linear {
+            from: Point2D::new(0.0, 0.0),
+            to: Point2D::new(1.0, 0.0),
+            stops: vec![
+                GradientStop {
+                    offset: 0.0,
+                    color: red,
+                },
+                GradientStop {
+                    offset: 0.5,
+                    color: dark,
+                },
+                GradientStop {
+                    offset: 1.0,
+                    color: blue,
+                },
+            ],
+        });
+        doc.insert_node(n).unwrap();
+        // 100% cap: every chromatic stop is over.
+        let opts = PreflightOptions {
+            target_total_ink_coverage: 1.0,
+            ..PreflightOptions::default()
+        };
+        let issues = run_preflight(&doc, &[], &opts);
+        let tic: Vec<&PreflightIssue> = issues
+            .iter()
+            .filter(|i| i.check == PreflightCheck::TotalInkCoverage)
+            .collect();
+        assert_eq!(
+            tic.len(),
+            1,
+            "exactly one TIC warning per gradient (worst-offender semantics), got {tic:?}"
+        );
+        assert!(
+            tic[0].message.contains("gradient stop "),
+            "expected stop-index in message, got: {}",
+            tic[0].message,
+        );
+    }
+
+    #[test]
+    fn tic_check_ignores_fill_when_under_cap_cmyk_override_replaces_it() {
+        // Regression: previously the fall-through path checked
+        // style.fill even when an under-cap CMYK override was present,
+        // producing a false positive for ink the press will never see
+        // (the override replaces the fill at export time per
+        // pdf::resolve_fill_paint).
+        //
+        // We engineer this exactly: under-cap CMYK override + a fill
+        // that WOULD trip the TIC check on its own at a tight cap.
+        let mut doc = DocumentGraph::new();
+        let page = page_with_layout(&mut doc, a4_layout(), a4_bounds());
+        let mut n = Node::new(NodeType::VectorLayer, "override + heavy fill");
+        n.parent_id = Some(page);
+        n.bounds = Bounds::new(0.0, 0.0, 200.0, 200.0);
+        // Override: 100% ink (well under the 150% cap below). This
+        // is what the press will actually see.
+        n.style.color_override = Some(kcreate_core::color::Color::Cmyk {
+            c: 0.25,
+            m: 0.25,
+            y: 0.25,
+            k: 0.25,
+            a: 1.0,
+        });
+        // Fill: would convert to ~290% CMYK via srgb_to_cmyk — would
+        // trip TIC at a tight cap if anyone checked it. We make that
+        // assumption explicit by using a tight cap.
+        n.style.fill = FillStyle::Solid(RgbaColor::new(1.0, 0.0, 0.0, 1.0));
+        doc.insert_node(n).unwrap();
+        let opts = PreflightOptions {
+            target_total_ink_coverage: 1.5, // 150% — under override, would trip the fill
+            ..PreflightOptions::default()
+        };
+        let issues = run_preflight(&doc, &[], &opts);
+        let tic: Vec<&PreflightIssue> = issues
+            .iter()
+            .filter(|i| i.check == PreflightCheck::TotalInkCoverage)
+            .collect();
+        assert!(
+            tic.is_empty(),
+            "under-cap override hides the fill from the press; TIC must not fire on the fill, got: {tic:?}"
+        );
+    }
+
+    #[test]
+    fn tic_check_uses_srgb_override_after_cmyk_conversion() {
+        // Regression: previously the override path matched only
+        // Color::Cmyk; sRGB / Hsl / Lab overrides fell through and
+        // the check inspected the underlying fill instead of the
+        // override. The exporter converts non-CMYK overrides via
+        // srgb_to_cmyk (see resolve_fill_paint), so the override is
+        // what hits the press — we must measure it.
+        let mut doc = DocumentGraph::new();
+        let page = page_with_layout(&mut doc, a4_layout(), a4_bounds());
+        let mut n = Node::new(NodeType::VectorLayer, "srgb override");
+        n.parent_id = Some(page);
+        n.bounds = Bounds::new(0.0, 0.0, 200.0, 200.0);
+        // Pure red sRGB → srgb_to_cmyk: c=0, m=1, y=1, k=0 → 200%.
+        n.style.color_override = Some(kcreate_core::color::Color::Srgb {
+            r: 1.0,
+            g: 0.0,
+            b: 0.0,
+            a: 1.0,
+        });
+        // No fill — proves the new code reads the override directly.
+        n.style.fill = FillStyle::None;
+        doc.insert_node(n).unwrap();
+        // Tight cap so the 200% override is over-cap.
+        let opts = PreflightOptions {
+            target_total_ink_coverage: 1.5,
+            ..PreflightOptions::default()
+        };
+        let issues = run_preflight(&doc, &[], &opts);
+        let tic: Vec<&PreflightIssue> = issues
+            .iter()
+            .filter(|i| i.check == PreflightCheck::TotalInkCoverage)
+            .collect();
+        assert_eq!(
+            tic.len(),
+            1,
+            "sRGB override (converted) over-cap must produce one TIC warning, got: {tic:?}"
+        );
+        assert!(
+            tic[0].message.contains("sRGB color override"),
+            "expected sRGB-source label, got: {}",
+            tic[0].message,
+        );
+    }
+
+    #[test]
+    fn tic_check_skips_fill_when_under_cap_srgb_override_replaces_it() {
+        // Mirror of the CMYK case but for sRGB overrides — under-cap
+        // sRGB override must hide the fill from TIC.
+        let mut doc = DocumentGraph::new();
+        let page = page_with_layout(&mut doc, a4_layout(), a4_bounds());
+        let mut n = Node::new(NodeType::VectorLayer, "light srgb override");
+        n.parent_id = Some(page);
+        n.bounds = Bounds::new(0.0, 0.0, 200.0, 200.0);
+        // Light gray → srgb_to_cmyk yields tiny components: max≈0.9,
+        // k≈0.1, c=m=y=0. Total ~10% — far under any cap.
+        n.style.color_override = Some(kcreate_core::color::Color::Srgb {
+            r: 0.9,
+            g: 0.9,
+            b: 0.9,
+            a: 1.0,
+        });
+        // Fill: red would be ~200% via srgb_to_cmyk. Would trip a
+        // 150% cap if the fall-through bug were present.
+        n.style.fill = FillStyle::Solid(RgbaColor::new(1.0, 0.0, 0.0, 1.0));
+        doc.insert_node(n).unwrap();
+        let opts = PreflightOptions {
+            target_total_ink_coverage: 1.5,
+            ..PreflightOptions::default()
+        };
+        let issues = run_preflight(&doc, &[], &opts);
+        let tic: Vec<&PreflightIssue> = issues
+            .iter()
+            .filter(|i| i.check == PreflightCheck::TotalInkCoverage)
+            .collect();
+        assert!(
+            tic.is_empty(),
+            "under-cap sRGB override hides the fill; TIC must not fire on the fill, got: {tic:?}"
+        );
+    }
+
+    #[test]
+    fn font_glyph_coverage_emits_no_issue_for_unresolvable_family() {
+        // When the family doesn't resolve at all, the existing
+        // FontEmbed check fires; the glyph-coverage probe must NOT
+        // additionally surface a phantom warning.
+        let mut doc = DocumentGraph::new();
+        let page = page_with_layout(&mut doc, a4_layout(), a4_bounds());
+        let mut n = Node::new(NodeType::TextLayer, "headline");
+        n.parent_id = Some(page);
+        n.bounds = Bounds::new(0.0, 0.0, 200.0, 200.0);
+        n.metadata.insert(
+            TEXT_LAYER_METADATA_KEY.to_string(),
+            serde_json::to_value(TextLayerMeta {
+                text: "Hello".to_string(),
+                font_family: "___definitely_not_a_real_font_family___".to_string(),
+                font_size: 24.0,
+            })
+            .unwrap(),
+        );
+        doc.insert_node(n).unwrap();
+        let issues = run_preflight(&doc, &[], &PreflightOptions::default());
+        assert!(
+            issues.iter().any(|i| i.check == PreflightCheck::FontEmbed),
+            "missing family must trip FontEmbed, got: {issues:?}",
+        );
+        assert!(
+            !issues
+                .iter()
+                .any(|i| i.check == PreflightCheck::FontGlyphCoverage),
+            "missing family must NOT trip a phantom glyph-coverage warning, got: {issues:?}",
+        );
+    }
+
+    #[test]
+    fn preflight_options_serde_round_trip_includes_new_tic_field() {
+        // Wire-format pin: the new target_total_ink_coverage field
+        // must serialise to camelCase and round-trip cleanly so the
+        // bridge → renderer IPC stays in lockstep with TypeScript.
+        let opts = PreflightOptions::default();
+        let json = serde_json::to_string(&opts).expect("serialise default");
+        assert!(
+            json.contains("\"targetTotalInkCoverage\":3.0"),
+            "expected camelCase TIC field, got: {json}",
+        );
+        let round: PreflightOptions = serde_json::from_str(&json).expect("round-trip");
+        assert_eq!(round.target_total_ink_coverage, 3.0);
+
+        // Unknown / missing field must fall back to the default
+        // (Serde's `#[serde(default)]` on the struct).
+        let legacy = r#"{
+            "targetDpi": 300.0,
+            "requireBleedMm": 3.0,
+            "allowTransparency": false,
+            "targetColorSpace": "cmyk"
+        }"#;
+        let parsed: PreflightOptions = serde_json::from_str(legacy).expect("legacy parse");
+        assert_eq!(parsed.target_total_ink_coverage, 3.0);
     }
 }

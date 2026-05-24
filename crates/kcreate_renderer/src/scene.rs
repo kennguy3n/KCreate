@@ -152,6 +152,33 @@ impl Scene {
         id
     }
 
+    /// Push every object from `objs` into the scene, sorting by `z`
+    /// only **once** at the end.
+    ///
+    /// Equivalent to calling [`add_object`] in a loop, but avoids
+    /// the per-insert `sort_by_key` scan. Multi-peer presence
+    /// overlays (cursors + selection halos) routinely add hundreds
+    /// of objects per scene-sync; with `add_object` each insertion
+    /// re-sorts the entire growing `objects` vec, making the loop
+    /// O(N²·log N) on N inserts. Batching collapses that to a
+    /// single O(N·log N) sort. Internally still uses a stable sort
+    /// so objects with equal `z` preserve insertion order
+    /// (`sort_by_key` is stable on contiguous slices).
+    ///
+    /// The same z-order invariant `add_object` upholds is
+    /// preserved: after this call, `self.objects` is sorted by `z`
+    /// ascending (the CPU + GPU backends walk it back-to-front
+    /// and rely on that ordering).
+    ///
+    /// [`add_object`]: Self::add_object
+    pub fn add_objects<I: IntoIterator<Item = Object>>(&mut self, objs: I) {
+        let before = self.objects.len();
+        self.objects.extend(objs);
+        if self.objects.len() != before {
+            self.objects.sort_by_key(|o| o.z);
+        }
+    }
+
     /// Combined bounds of every visible object (None if the scene is empty).
     pub fn world_bounds(&self) -> Option<Rect> {
         self.objects
@@ -284,6 +311,39 @@ mod tests {
             scene.objects.iter().map(|o| o.z).collect::<Vec<_>>(),
             vec![1, 3, 5]
         );
+    }
+
+    #[test]
+    fn add_objects_sorts_once_and_preserves_z_invariant() {
+        let mut scene = Scene::new(Color::TRANSPARENT);
+        let mk = |z: i32| {
+            Object::new(
+                ObjectKind::Rect(Rect::new(0.0, 0.0, 1.0, 1.0)),
+                Style::filled(Color::rgba(1.0, 0.0, 0.0, 1.0)),
+            )
+            .with_z(z)
+        };
+        // Out-of-order batch — extend then single sort must produce
+        // the same z ordering `add_object` would have, no matter the
+        // insertion order.
+        scene.add_objects([mk(5), mk(1), mk(3), mk(2), mk(4)]);
+        assert_eq!(
+            scene.objects.iter().map(|o| o.z).collect::<Vec<_>>(),
+            vec![1, 2, 3, 4, 5]
+        );
+        // Subsequent batch merges with the existing sorted prefix.
+        scene.add_objects([mk(0), mk(6)]);
+        assert_eq!(
+            scene.objects.iter().map(|o| o.z).collect::<Vec<_>>(),
+            vec![0, 1, 2, 3, 4, 5, 6]
+        );
+    }
+
+    #[test]
+    fn add_objects_empty_batch_is_noop() {
+        let mut scene = Scene::new(Color::TRANSPARENT);
+        scene.add_objects(std::iter::empty());
+        assert!(scene.objects.is_empty());
     }
 
     #[test]

@@ -243,6 +243,13 @@ pub enum SessionBridgeError {
     /// error gives it a useful diagnostic.
     #[error("KChat authority install failed: {0}")]
     KChat(#[from] KChatAuthError),
+    /// The bridge was built without `kchat-dev-issuer`, so the
+    /// dev mint endpoint is unavailable. Returned by
+    /// `kchat_dev_mint_membership_json` in production builds so
+    /// the renderer can present a clean "this build doesn't
+    /// include the dev issuer" message instead of a generic error.
+    #[error("KChat dev issuer is not enabled in this build")]
+    KChatDevIssuerDisabled,
 }
 
 pub type Result<T> = std::result::Result<T, SessionBridgeError>;
@@ -1356,36 +1363,44 @@ fn presence_cursors_from_state(
     state: &SessionState,
     connected_lookup: &HashMap<PeerId, String>,
 ) -> Vec<(String, String, SessionCursor)> {
-    state
-        .presence
-        .iter()
-        .filter_map(|(peer_id, payload)| {
-            let display_name = connected_lookup.get(peer_id)?.clone();
-            let cursor = payload.cursor.map(|c| SessionCursor { x: c.x, y: c.y })?;
-            Some((peer_id.as_str().to_string(), display_name, cursor))
-        })
-        .collect()
+    // `state.presence.len()` is an upper bound (peers without an
+    // active cursor are filtered below) but it caps the worst-case
+    // realloc count at one. The hot path is N-peer collab, where N
+    // is in the tens of peers, so a small overshoot is cheaper than
+    // the geometric reallocs `.collect()` would otherwise do.
+    let mut out = Vec::with_capacity(state.presence.len());
+    for (peer_id, payload) in &state.presence {
+        let Some(display_name) = connected_lookup.get(peer_id) else {
+            continue;
+        };
+        let Some(cursor) = payload.cursor.map(|c| SessionCursor { x: c.x, y: c.y }) else {
+            continue;
+        };
+        out.push((peer_id.as_str().to_string(), display_name.clone(), cursor));
+    }
+    out
 }
 
 fn presence_selections_from_state(
     state: &SessionState,
     connected_lookup: &HashMap<PeerId, String>,
 ) -> Vec<(String, String, Vec<Uuid>)> {
-    state
-        .presence
-        .iter()
-        .filter_map(|(peer_id, payload)| {
-            if payload.selection.is_empty() {
-                return None;
-            }
-            let display_name = connected_lookup.get(peer_id)?.clone();
-            Some((
-                peer_id.as_str().to_string(),
-                display_name,
-                payload.selection.clone(),
-            ))
-        })
-        .collect()
+    // Same upper-bound rationale as `presence_cursors_from_state`.
+    let mut out = Vec::with_capacity(state.presence.len());
+    for (peer_id, payload) in &state.presence {
+        if payload.selection.is_empty() {
+            continue;
+        }
+        let Some(display_name) = connected_lookup.get(peer_id) else {
+            continue;
+        };
+        out.push((
+            peer_id.as_str().to_string(),
+            display_name.clone(),
+            payload.selection.clone(),
+        ));
+    }
+    out
 }
 
 // === Conversion to bridge error type so the N-API layer can use
@@ -1399,7 +1414,8 @@ impl From<SessionBridgeError> for DocumentBridgeError {
             SessionBridgeError::NotRunning
             | SessionBridgeError::AlreadyRunning
             | SessionBridgeError::InvalidArgument { .. }
-            | SessionBridgeError::NotInKChatGroup => Self::InvalidArgument {
+            | SessionBridgeError::NotInKChatGroup
+            | SessionBridgeError::KChatDevIssuerDisabled => Self::InvalidArgument {
                 argument: "session".to_string(),
                 value: e.to_string(),
             },
@@ -1639,6 +1655,148 @@ pub fn kchat_membership_status() -> KChatMembershipStatus {
             expires_at: None,
         },
     }
+}
+
+/// Wire-format DTO accepted by the dev-only `kchat_dev_mint_membership`
+/// entry point. Matches the JSON shape documented in the N-API
+/// export's doc comment.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KChatDevMintRequest {
+    /// 32-byte Ed25519 seed used to derive the dev issuer. Same
+    /// seed produces the same issuer trust root across runs.
+    pub issuer_seed: String,
+    /// URL-safe ASCII group identifier.
+    pub group_id: String,
+    /// 32-byte Ed25519 verifying key of the local peer (the
+    /// PresencePanel's persistent identity), URL-safe base64
+    /// (no padding).
+    pub peer_public_key: String,
+    /// Membership validity, in seconds. Capped at 365 days by
+    /// `kcreate_kchat::MAX_DEV_VALIDITY`.
+    pub valid_for_seconds: u32,
+}
+
+/// Dev-only: mint a fresh attestation locally and return the
+/// JSON-encoded [`KChatInstallRequest`]. Compiled only when the
+/// bridge is built with `kchat-dev-issuer`. In other builds the
+/// non-cfg shim below returns `KChatDevIssuerDisabled` so the
+/// renderer can render a clean diagnostic.
+#[cfg(feature = "kchat-dev-issuer")]
+pub fn kchat_dev_mint_membership_json(request_json: &str) -> Result<String> {
+    let req: KChatDevMintRequest =
+        serde_json::from_str(request_json).map_err(|e| SessionBridgeError::InvalidArgument {
+            field: "kchatDevMintRequest",
+            message: e.to_string(),
+        })?;
+
+    let seed_bytes = decode_b64_url(&req.issuer_seed, "issuerSeed").map_err(|e| match e {
+        SessionBridgeError::InvalidArgument { message, .. } => {
+            SessionBridgeError::InvalidArgument {
+                field: "issuerSeed",
+                message,
+            }
+        }
+        other => other,
+    })?;
+    if seed_bytes.len() != 32 {
+        return Err(SessionBridgeError::InvalidArgument {
+            field: "issuerSeed",
+            message: format!("expected 32 bytes, got {}", seed_bytes.len()),
+        });
+    }
+    let mut seed_arr = [0u8; 32];
+    seed_arr.copy_from_slice(&seed_bytes);
+
+    let issuer = kcreate_kchat::DevIssuer::from_seed(seed_arr);
+    let install = issuer
+        .mint_install_request_for_peer(
+            &req.group_id,
+            &req.peer_public_key,
+            std::time::Duration::from_secs(u64::from(req.valid_for_seconds)),
+        )
+        .map_err(|e| match e {
+            kcreate_kchat::DevIssuerError::InvalidGroupId(inner) => {
+                SessionBridgeError::InvalidArgument {
+                    field: "groupId",
+                    message: inner.to_string(),
+                }
+            }
+            kcreate_kchat::DevIssuerError::InvalidPeerSeed => SessionBridgeError::InvalidArgument {
+                field: "peerPublicKey",
+                message: "must be a 32-byte URL-safe-base64 Ed25519 verifying key".into(),
+            },
+            kcreate_kchat::DevIssuerError::InvalidValidity => SessionBridgeError::InvalidArgument {
+                field: "validForSeconds",
+                message: "must be > 0 and <= 365 days".into(),
+            },
+            kcreate_kchat::DevIssuerError::Issue(inner) => SessionBridgeError::KChat(inner),
+        })?;
+
+    // The `DevInstallRequest` shape mirrors `KChatInstallRequest`
+    // exactly (see the wire-lockstep test below). Round-trip through
+    // serde rather than constructing a `KChatInstallRequest` here so
+    // any future field added on the bridge side without mirroring
+    // it on `kcreate_kchat::DevInstallRequest` fails loudly at
+    // deserialise time.
+    let install_request: KChatInstallRequest =
+        serde_json::from_str(&serde_json::to_string(&install).map_err(|e| {
+            SessionBridgeError::InvalidArgument {
+                field: "kchatDevMintRequest",
+                message: e.to_string(),
+            }
+        })?)
+        .map_err(|e| SessionBridgeError::InvalidArgument {
+            field: "kchatDevMintRequest",
+            message: format!("dev install request shape mismatch: {e}"),
+        })?;
+
+    serde_json::to_string(&install_request).map_err(|e| SessionBridgeError::InvalidArgument {
+        field: "kchatDevMintRequest",
+        message: e.to_string(),
+    })
+}
+
+/// Production-build shim. Always returns the typed
+/// `KChatDevIssuerDisabled` error so the renderer can show "this
+/// build doesn't include the dev issuer". Kept symmetrical with the
+/// feature-gated impl so the N-API surface is stable across builds.
+#[cfg(not(feature = "kchat-dev-issuer"))]
+#[allow(dead_code)]
+pub fn kchat_dev_mint_membership_json(_request_json: &str) -> Result<String> {
+    Err(SessionBridgeError::KChatDevIssuerDisabled)
+}
+
+/// Local-peer-identity probe. Derives the BLAKE3 peer id +
+/// URL-safe-base64 verifying key for the supplied seed without
+/// starting a collab session. The sign-in flow needs this before
+/// a session exists (the membership attestation is bound to the
+/// peer's public key, and the user shouldn't have to start a
+/// session — which would itself be rejected by the gate — just to
+/// learn what to put on the issuer side).
+///
+/// Returns a JSON `KChatLocalIdentity` payload.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KChatLocalIdentity {
+    pub peer_id: String,
+    pub peer_public_key: String,
+}
+
+/// Derive the local KChat peer identity from a persistent seed.
+/// Pure crypto — no networking, no global state — so it lives in
+/// the `collab`-gated module only because it needs `ed25519-dalek`
+/// which is itself behind the `collab` feature.
+pub fn kchat_derive_local_identity(seed_b64: &str) -> Result<KChatLocalIdentity> {
+    let seed = decode_seed(seed_b64)?;
+    let signing = ed25519_dalek::SigningKey::from_bytes(&seed);
+    let vk = signing.verifying_key();
+    let peer_id = PeerId::from_verifying_key(&vk);
+    let peer_public_key = URL_SAFE_NO_PAD.encode(vk.as_bytes());
+    Ok(KChatLocalIdentity {
+        peer_id: peer_id.as_str().to_string(),
+        peer_public_key,
+    })
 }
 
 #[cfg(test)]
@@ -1912,6 +2070,86 @@ mod tests {
             matches!(err, SessionBridgeError::NotInKChatGroup),
             "expected NotInKChatGroup, got {err:?}"
         );
+    }
+
+    /// Wire-format lockstep between `kcreate_kchat::DevInstallRequest`
+    /// (the dev issuer output) and `KChatInstallRequest` (the bridge
+    /// install entry point's input).
+    ///
+    /// `kchat_dev_mint_membership_json` round-trips through serde
+    /// rather than copying fields by hand, with the rationale (in
+    /// the inline comment at the round-trip site) that the round-
+    /// trip itself is a wire-shape guard: if either struct grows
+    /// or renames a field, the deserialise step fails loudly.
+    /// This test pins that guarantee — it would catch any future
+    /// drift between the two structs at `cargo test` time rather
+    /// than at runtime when a user clicks "Mint dev membership".
+    ///
+    /// Three guarantees pinned here:
+    ///   1. A minted `DevInstallRequest` JSON parses cleanly as
+    ///      `KChatInstallRequest` (no missing required fields, no
+    ///      type mismatches, no unknown-tag rejection).
+    ///   2. Every field round-trips byte-for-byte through the
+    ///      bridge type — no value is silently coerced.
+    ///   3. The reverse direction (KChatInstallRequest JSON →
+    ///      DevInstallRequest) also round-trips, so we'd also
+    ///      catch the case where one side grows a field that the
+    ///      other side then ignores (which would let mismatched
+    ///      data flow through `kchat_dev_mint_membership_json`).
+    #[cfg(feature = "kchat-dev-issuer")]
+    #[test]
+    #[serial]
+    fn dev_install_request_matches_bridge_install_request_wire_format() {
+        let issuer = kcreate_kchat::DevIssuer::from_seed([0x7E; 32]);
+        let peer_seed = [0x11; 32];
+        let peer_vk = ed25519_dalek::SigningKey::from_bytes(&peer_seed).verifying_key();
+        let peer_pk_b64 = URL_SAFE_NO_PAD.encode(peer_vk.as_bytes());
+        let dev_install = issuer
+            .mint_install_request_for_peer(
+                "lockstep.group",
+                &peer_pk_b64,
+                std::time::Duration::from_secs(60 * 60),
+            )
+            .expect("mint should succeed for valid inputs");
+
+        // Forward direction — DevInstallRequest JSON parses as
+        // KChatInstallRequest with every field identical.
+        let dev_json = serde_json::to_string(&dev_install).expect("dev serialise");
+        let bridge_install: KChatInstallRequest =
+            serde_json::from_str(&dev_json).expect("dev json should parse as bridge install");
+        assert_eq!(
+            dev_install.issuer_public_key,
+            bridge_install.issuer_public_key
+        );
+        assert_eq!(dev_install.group_id, bridge_install.group_id);
+        assert_eq!(dev_install.peer_id, bridge_install.peer_id);
+        assert_eq!(dev_install.peer_public_key, bridge_install.peer_public_key);
+        assert_eq!(dev_install.issued_at, bridge_install.issued_at);
+        assert_eq!(dev_install.expires_at, bridge_install.expires_at);
+        assert_eq!(dev_install.signature, bridge_install.signature);
+
+        // Reverse direction — KChatInstallRequest JSON parses as
+        // DevInstallRequest. Catches the case where the bridge type
+        // grows a field that the dev type omits.
+        let bridge_json = serde_json::to_string(&bridge_install).expect("bridge serialise");
+        let round_trip: kcreate_kchat::DevInstallRequest =
+            serde_json::from_str(&bridge_json).expect("bridge json should parse as dev install");
+        assert_eq!(round_trip.issuer_public_key, dev_install.issuer_public_key);
+        assert_eq!(round_trip.group_id, dev_install.group_id);
+        assert_eq!(round_trip.peer_id, dev_install.peer_id);
+        assert_eq!(round_trip.peer_public_key, dev_install.peer_public_key);
+        assert_eq!(round_trip.issued_at, dev_install.issued_at);
+        assert_eq!(round_trip.expires_at, dev_install.expires_at);
+        assert_eq!(round_trip.signature, dev_install.signature);
+
+        // The minted install request must also actually install
+        // cleanly — proves we're not just round-tripping JSON that
+        // both sides happen to accept but which would be rejected by
+        // the gate verifier.
+        reset_kchat_slot();
+        let status = kchat_install_authority(bridge_install).expect("install should succeed");
+        assert!(!status.locked, "wire-lockstep install must unlock the gate");
+        assert_eq!(status.group_id.as_deref(), Some("lockstep.group"));
     }
 
     // ====================================================================

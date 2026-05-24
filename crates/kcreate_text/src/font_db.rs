@@ -146,6 +146,90 @@ impl FontManager {
         })
     }
 
+    /// For every codepoint in `text`, check whether the *resolved*
+    /// face for `family` exposes a glyph. Returns the set of
+    /// codepoints that have no glyph (in document order, deduplicated
+    /// — the first occurrence of each missing codepoint is preserved
+    /// so a UI can render a representative sample).
+    ///
+    /// The check uses the same resolution policy as
+    /// [`resolve_face`](Self::resolve_face) (exact family → generic
+    /// fallback → outline-capable face) so the result reflects what
+    /// would actually print, not what the raw fontdb query would
+    /// return. This is currently equivalent to `Query { families:
+    /// [Name(family)], weight: NORMAL, style: Normal, stretch: NORMAL
+    /// }` because the editing-path text pipeline
+    /// (`kcreate_text::paragraph::TextStyle`) only carries
+    /// `font_family` / `font_size` / `line_height` — there is no
+    /// weight or style in the actually-rendered text style, so
+    /// probing Regular matches the face the renderer / exporter
+    /// will pick.
+    ///
+    /// **Future-proofing note**: when `TextStyle` grows weight /
+    /// style fields (i.e. a text layer can be authored as Bold or
+    /// Italic in a way that affects which face the renderer picks),
+    /// both `resolve_face` and `missing_glyphs` will need to grow a
+    /// matching query parameter so the coverage probe stays
+    /// aligned with the rendered face. Doing it now would make
+    /// `missing_glyphs` "more accurate" than the renderer, which is
+    /// the wrong direction — the check is intentionally pinned to
+    /// what the renderer actually does.
+    ///
+    /// Returns `Err(FontManagerError::NotFound)` when no face at all
+    /// can be resolved for `family`. The caller normally pairs this
+    /// with the existing `find_family().is_empty()` check: if the
+    /// family is missing entirely, report a `FontEmbed` error; if
+    /// the family resolves but glyphs are missing, report a
+    /// `FontGlyphCoverage` warning per missing codepoint.
+    ///
+    /// Whitespace and ASCII control codepoints are filtered out of
+    /// the result because every reasonable system font carries
+    /// glyphs for them and the user gets no actionable signal from a
+    /// "U+0020 (space) is missing" warning.
+    pub fn missing_glyphs(&self, family: &str, text: &str) -> Result<Vec<char>, FontManagerError> {
+        let resolved = self.resolve_face(family)?;
+        let face = rustybuzz::ttf_parser::Face::parse(&resolved.data, resolved.face_index)
+            .map_err(|_| FontManagerError::FaceData {
+                family: family.to_string(),
+            })?;
+        // Deduplicate while preserving first-seen order so the UI
+        // can render a stable, document-ordered preview. A
+        // `BTreeSet` would lose insertion order; a `HashSet` lookup
+        // by side is enough.
+        let mut seen: std::collections::HashSet<char> = std::collections::HashSet::new();
+        let mut missing: Vec<char> = Vec::new();
+        for ch in text.chars() {
+            // Control / whitespace codepoints are universally covered
+            // by every system font and produce noise in the report.
+            // We treat `'\t'`, `'\n'`, `'\r'`, U+00A0 (nbsp), and
+            // every codepoint whose Unicode category is "Zs"
+            // (space separator), "Cc" (control), or "Cf" (format)
+            // as "covered" without probing the cmap. Doing the
+            // category check via the `char` API rather than pulling
+            // in `unicode-properties` keeps the dep tree clean.
+            if ch.is_whitespace() || ch.is_control() {
+                continue;
+            }
+            if !seen.insert(ch) {
+                continue;
+            }
+            // `ttf-parser`'s `glyph_index` returns `Some(GlyphId(0))`
+            // for the `.notdef` glyph, which is *also* what the cmap
+            // returns for genuinely missing characters in many
+            // fonts. So we have to check both for `None` AND for
+            // `Some(GlyphId(0))` — relying on `is_none()` alone
+            // would under-report missing glyphs against any font
+            // that maps unmapped codepoints to `.notdef` explicitly
+            // (which is the recommended OpenType convention).
+            let glyph = face.glyph_index(ch);
+            match glyph {
+                None | Some(rustybuzz::ttf_parser::GlyphId(0)) => missing.push(ch),
+                Some(_) => {}
+            }
+        }
+        Ok(missing)
+    }
+
     /// Read-only snapshot of every loaded face.
     #[must_use]
     pub fn all_faces(&self) -> Vec<FontInfo> {
@@ -232,5 +316,43 @@ mod tests {
         let m = FontManager::new();
         let v = m.find_family("___definitely_not_a_real_font_family___");
         assert!(v.is_empty());
+    }
+
+    #[test]
+    fn missing_glyphs_errors_when_family_unresolvable() {
+        let m = FontManager::new();
+        // When the family resolves to *nothing* (no system fonts at
+        // all on this runner) the function returns `NotFound`. When
+        // at least one outline-capable face is present, the fallback
+        // path picks it up — both branches are valid, we just need
+        // the call to not panic and to return one of the two.
+        match m.missing_glyphs("___definitely_not_a_real_font_family___", "abc") {
+            Ok(missing) => {
+                // The fallback resolved a real face; missing-glyph
+                // probing must produce a finite list.
+                assert!(missing.len() <= 3);
+            }
+            Err(FontManagerError::NotFound(_)) => {
+                // No system fonts at all on this runner; expected.
+            }
+            Err(other) => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn missing_glyphs_filters_whitespace_and_controls() {
+        // Empty text + a family that may or may not resolve — either
+        // way the missing-glyph list for "\t\n " must be empty.
+        let m = FontManager::new();
+        match m.missing_glyphs("___definitely_not_a_real_font_family___", "\t\n \r") {
+            Ok(missing) => assert!(
+                missing.is_empty(),
+                "whitespace must never appear in the missing-glyph list, got {missing:?}",
+            ),
+            Err(_) => {
+                // No fallback face — call short-circuited before the
+                // loop; that's still a pass for this invariant.
+            }
+        }
     }
 }

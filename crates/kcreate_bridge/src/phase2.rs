@@ -355,7 +355,7 @@ pub fn ai_model_uninstall(pack_id: String) -> Result<()> {
     Ok(())
 }
 
-fn ai_models_dir() -> PathBuf {
+pub(crate) fn ai_models_dir() -> PathBuf {
     if let Ok(env) = std::env::var("KCREATE_MODELS_DIR") {
         return PathBuf::from(env);
     }
@@ -847,11 +847,26 @@ pub fn ai_alt_text_for_node(node_id: Uuid) -> Result<String> {
     })?;
     let rgba = img.to_rgba8();
     let (w, h) = rgba.dimensions();
-    let report =
+    let mut report =
         kcreate_ai::generate_alt_text(rgba.as_raw(), w, h, kcreate_ai::AltTextOptions::default())
             .map_err(|e| {
             DocumentBridgeError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
         })?;
+    // Task 14: if a VLM sidecar is ready, prefer its caption. The
+    // heuristic statistics (brightness / contrast / palette / edge
+    // density) stay accurate, so we keep them for the UI's chips —
+    // we only swap out the `text` string for one written by the
+    // VLM, which is far more semantically grounded ("portrait of a
+    // woman wearing a red coat against a brick wall") than what
+    // statistics alone can describe ("Bright photographic image
+    // dominated by warm reds…"). On any VLM failure, the heuristic
+    // text is kept verbatim — degraded gracefully, never errored.
+    if let Ok(text) = crate::phase4::vision_generate_alt_text(rgba.as_raw().clone(), w, h) {
+        let trimmed = text.trim();
+        if !trimmed.is_empty() {
+            report.text = trimmed.to_string();
+        }
+    }
     Ok(serde_json::to_string(&report)?)
 }
 

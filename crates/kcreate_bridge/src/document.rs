@@ -3136,18 +3136,39 @@ pub fn canvas_move_node(node_id: Uuid, dx: f64, dy: f64) -> Result<()> {
 /// at scene-sync time.
 pub fn document_import_image(parent_id: Option<Uuid>, file_path: &Path) -> Result<Uuid> {
     let bytes = std::fs::read(file_path)?;
-    let img = image::load_from_memory(&bytes).map_err(|e| {
+    let mime_type = mime_for_path(file_path);
+    document_import_image_bytes_inner(parent_id, &bytes, mime_type)
+}
+
+/// In-memory variant of [`document_import_image`]. The image bytes
+/// must be in a format the `image` crate can decode (PNG, JPEG,
+/// WebP, etc.). The MIME type is sniffed from the magic bytes
+/// rather than a file extension, since the caller (typically the
+/// Phase 4 image-gen sidecar) produces a raw payload with no
+/// filesystem identity. Same operation-log semantics as
+/// [`document_import_image`] — recorded as `document_import_image`
+/// so undo/redo and the action history don't need a new op kind.
+pub fn document_import_image_bytes(parent_id: Option<Uuid>, bytes: &[u8]) -> Result<Uuid> {
+    let mime_type = mime_for_bytes(bytes);
+    document_import_image_bytes_inner(parent_id, bytes, mime_type)
+}
+
+fn document_import_image_bytes_inner(
+    parent_id: Option<Uuid>,
+    bytes: &[u8],
+    mime_type: &'static str,
+) -> Result<Uuid> {
+    let img = image::load_from_memory(bytes).map_err(|e| {
         DocumentBridgeError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
     })?;
     let rgba = img.to_rgba8();
     let (width, height) = rgba.dimensions();
-    let mime_type = mime_for_path(file_path);
     let mut guard = slot().lock();
     let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
     let blob = ws
         .store
         .blobs()
-        .store(&bytes, mime_type)
+        .store(bytes, mime_type)
         .map_err(|e| DocumentBridgeError::Io(std::io::Error::other(e.to_string())))?;
     let meta = crate::scene_sync::RasterImageMeta {
         blob_hash: blob.hash,
@@ -3186,6 +3207,26 @@ pub fn document_import_image(parent_id: Option<Uuid>, file_path: &Path) -> Resul
     let _ = sync_scene_locked(&mut guard);
     drop(guard);
     Ok(id)
+}
+
+/// Sniff a MIME type from the file's leading magic bytes. We only
+/// recognise the formats the `image` crate already decodes (and
+/// that callers actually feed us); anything else is reported as
+/// `application/octet-stream` so the blob still stores correctly,
+/// even though scene-sync will refuse to decode it later. This
+/// matches the file-path-based [`mime_for_path`] in coverage.
+fn mime_for_bytes(bytes: &[u8]) -> &'static str {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        "image/png"
+    } else if bytes.starts_with(b"\xFF\xD8\xFF") {
+        "image/jpeg"
+    } else if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        "image/webp"
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        "image/gif"
+    } else {
+        "application/octet-stream"
+    }
 }
 
 fn mime_for_path(path: &Path) -> &'static str {
@@ -3349,6 +3390,17 @@ pub struct ResourceLimits {
     pub effective_raster_cache_mb: u64,
     pub effective_max_model_mb: u64,
     pub gpu_rendering_allowed: bool,
+    /// Phase 4 hard gate: `true` iff this machine's tier + GPU
+    /// combination permits running the FLUX image-generation
+    /// sidecar. UI consumers MUST hide all image-gen affordances
+    /// when this is `false` — not just disable them.
+    pub image_generation_allowed: bool,
+    /// Phase 4 cap on vision-model file size in MB. Independent
+    /// of `effective_max_model_mb` because a Tier 0 box that
+    /// can't load a 4 GB text LLM can comfortably load a 180 MB
+    /// SmolVLM. UI uses this to ghost out vision packs that
+    /// exceed the per-tier ceiling.
+    pub vision_model_max_mb: u64,
 }
 
 /// Snapshot the currently-effective resource limits.
@@ -3361,6 +3413,8 @@ pub fn resource_limits() -> ResourceLimits {
         effective_raster_cache_mb: cfg.effective_raster_cache_mb(),
         effective_max_model_mb: cfg.effective_max_model_mb(),
         gpu_rendering_allowed: cfg.gpu_rendering_allowed(),
+        image_generation_allowed: cfg.image_generation_allowed(),
+        vision_model_max_mb: cfg.device_tier.vision_model_max_mb(),
     }
 }
 

@@ -567,6 +567,16 @@ export interface ResourceLimits {
   effectiveRasterCacheMb: number;
   effectiveMaxModelMb: number;
   gpuRenderingAllowed: boolean;
+  /// Phase 4 hard gate: when `false`, the renderer MUST NOT show
+  /// any image-generation UI at all (no Generate button, no
+  /// generation packs in the model manager, no menu entries).
+  /// Combines tier ≥ 2 AND GPU availability.
+  imageGenerationAllowed: boolean;
+  /// Phase 4 per-tier ceiling on vision-model size in MB. Separate
+  /// from `effectiveMaxModelMb` because the vision sidecar runs in
+  /// a separate process from the text LLM and tier 0/1 can afford
+  /// a 180 MB SmolVLM even though they can't afford a 4 GB LLM.
+  visionModelMaxMb: number;
 }
 
 /** Runtime / device probe. */
@@ -698,6 +708,14 @@ export interface CanvasBridge {
   importImage(
     parentId: string | null,
     filePath: string,
+  ): Promise<string>;
+  /// In-memory variant of [`importImage`] that takes raw encoded
+  /// bytes (PNG / JPEG / WebP). Used by the Phase 4 image-gen flow
+  /// to insert generated PNGs without round-tripping through a
+  /// temp file.
+  importImageBytes(
+    parentId: string | null,
+    bytes: Uint8Array,
   ): Promise<string>;
   createRect(
     parentId: string | null,
@@ -1461,7 +1479,12 @@ export interface ExtractedColor {
   frequency: number;
 }
 
-export type ModelPackCategory = "core" | "image_pro" | "design_pro" | "generation";
+export type ModelPackCategory =
+  | "core"
+  | "image_pro"
+  | "design_pro"
+  | "vision"
+  | "generation";
 
 export type ModelKind = "built_in" | "onnx" | "sidecar";
 
@@ -2569,6 +2592,145 @@ export interface KChatBridge {
   removeTrustedIssuer(issuerPublicKey: string): Promise<TrustedIssuer[]>;
 }
 
+// -----------------------------------------------------------------------------
+// Phase 4 — Vision & Image Generation
+// -----------------------------------------------------------------------------
+
+/** Mirror of `kcreate_bridge::phase4::VisionStatusInfo`. */
+export interface VisionStatus {
+  state: "stopped" | "starting" | "ready" | "error";
+  runtime: "llama_server" | "mlx_lm" | null;
+  port: number | null;
+  modelName: string | null;
+  error: string | null;
+}
+
+/** Mirror of `kcreate_ai::brand_extract::BrandExtraction`. */
+export interface BrandExtraction {
+  colors: string[];
+  fonts: string[];
+  spacing: number[];
+}
+
+/** Mirror of `kcreate_ai::smart_crop::CropSuggestion`. */
+export interface CropSuggestion {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  confidence: number;
+}
+
+/** Mirror of `kcreate_ai::design_tokens_vlm::DesignTokenSuggestion`. */
+export interface DesignTokenSuggestion {
+  spacing: number[];
+  colors: string[];
+  typography: string[];
+}
+
+/** Mirror of `kcreate_ai::style_describe::StyleDescription`. */
+export interface StyleDescription {
+  summary: string;
+  colorMood: string[];
+  typography: string[];
+  layout: string[];
+}
+
+/** Mirror of `kcreate_bridge::phase4::ImageGenStatusInfo`. */
+export interface ImageGenStatus {
+  state: "stopped" | "starting" | "ready" | "error";
+  port: number | null;
+  error: string | null;
+  /** Hard gate: when false, the renderer must not show the panel. */
+  allowed: boolean;
+}
+
+/** Mirror of `kcreate_bridge::phase4::GeneratedImagePayload`. */
+export interface GeneratedImage {
+  width: number;
+  height: number;
+  pngB64: string;
+}
+
+/**
+ * Vision (VLM) bridge. Runs a multimodal sidecar (llama-server with
+ * an mmproj projector, or `python3 -m mlx_lm.server` on Apple
+ * Silicon) on loopback and exposes describe / alt-text / critique
+ * operations. Soft-gated: available on every tier, but the
+ * dispatcher picks model size by `RuntimeConfig`.
+ */
+export interface VisionBridge {
+  start(packId: string): Promise<number>;
+  stop(): Promise<void>;
+  status(): Promise<VisionStatus>;
+  describeImage(
+    rgba: Uint8Array,
+    width: number,
+    height: number,
+    userPrompt: string,
+  ): Promise<string>;
+  describeNode(nodeId: string, userPrompt: string): Promise<string>;
+  generateAltText(
+    rgba: Uint8Array,
+    width: number,
+    height: number,
+  ): Promise<string>;
+  generateAltTextForNode(nodeId: string): Promise<string>;
+  analyzeDesign(
+    rgba: Uint8Array,
+    width: number,
+    height: number,
+  ): Promise<string>;
+  extractBrand(
+    rgba: Uint8Array,
+    width: number,
+    height: number,
+  ): Promise<BrandExtraction>;
+  suggestCrop(
+    rgba: Uint8Array,
+    width: number,
+    height: number,
+    aspectRatio: number,
+  ): Promise<CropSuggestion>;
+  suggestDesignTokens(
+    rgba: Uint8Array,
+    width: number,
+    height: number,
+  ): Promise<DesignTokenSuggestion>;
+  describeStyle(
+    rgba: Uint8Array,
+    width: number,
+    height: number,
+  ): Promise<StyleDescription>;
+  /** Recommended pack id for the current device, or `""`. */
+  recommendedPack(): Promise<string>;
+  /** mmproj companion pack id for a vision pack, or `""`. */
+  mmprojFor(packId: string): Promise<string>;
+  /** Pack ids the UI is allowed to show in the vision section. */
+  listablePacks(): Promise<string[]>;
+}
+
+/**
+ * Image-generation bridge. Hard-gated on Tier 2+ with GPU; the
+ * `allowed` flag in [`ImageGenStatus`] mirrors
+ * `RuntimeConfig::image_generation_allowed`. The renderer must drop
+ * the entire panel — not just disable it — when `allowed === false`.
+ */
+export interface ImageGenBridge {
+  start(packId: string): Promise<number>;
+  stop(): Promise<void>;
+  status(): Promise<ImageGenStatus>;
+  generate(
+    prompt: string,
+    width: number,
+    height: number,
+    steps: number,
+    seed: number | null,
+  ): Promise<GeneratedImage>;
+  allowed(): Promise<boolean>;
+  recommendedPack(): Promise<string>;
+}
+
 declare global {
   interface Window {
     kcreate: {
@@ -2577,6 +2739,8 @@ declare global {
       canvas: CanvasBridge;
       ai: AiBridge;
       llm: LlmBridge;
+      vision: VisionBridge;
+      imageGen: ImageGenBridge;
       mcp: McpBridge;
       runtime: RuntimeBridge;
       export: ExportBridge;

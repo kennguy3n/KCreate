@@ -24,17 +24,241 @@ pub enum ChatRole {
     Assistant,
 }
 
-/// One message in a chat conversation.
+/// One part of a multimodal chat message. Mirrors the OpenAI vision
+/// API content-part shapes:
+///
+/// ```json
+/// {"type":"text","text":"..."}
+/// {"type":"image_url","image_url":{"url":"data:image/png;base64,..."}}
+/// ```
+///
+/// Wire format is opaque to the rest of the workspace — the bridge
+/// only ever constructs `ContentPart::Text` and `ContentPart::ImageBase64`
+/// and trusts the serde impl below to produce the canonical form.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ContentPart {
+    /// Plain text part. Multiple text parts are allowed and are
+    /// concatenated by the model.
+    Text { text: String },
+    /// Base64-encoded inline image. `media_type` is the image MIME
+    /// type (`image/png`, `image/jpeg`, `image/webp`); `data` is the
+    /// raw base64 string with no `data:` prefix. The serializer
+    /// emits the OpenAI-compatible `image_url` wrapper that
+    /// llama-server with `--mmproj` understands.
+    ImageBase64 { media_type: String, data: String },
+}
+
+/// Content payload for a chat message. Backward-compatible with the
+/// pre-vision wire format: `Text(...)` serializes to `"content":
+/// "string"` exactly as before, so existing text-only callers keep
+/// working without changes.
+///
+/// `Multimodal(parts)` serializes to `"content": [...]` per the
+/// OpenAI vision spec. The deserializer accepts either shape and
+/// chooses the right variant.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChatContent {
+    /// Plain-text message. Most assistant/system/text-user messages
+    /// land here.
+    Text(String),
+    /// Sequence of content parts (text interleaved with images).
+    /// Produced by the vision bridge functions when the user asks
+    /// the VLM to describe an image.
+    Multimodal(Vec<ContentPart>),
+}
+
+impl ChatContent {
+    /// Read-only view of the message as plain text. For
+    /// `Multimodal`, returns all `Text` parts joined with newlines —
+    /// images are skipped. Returns an empty string when the message
+    /// has no text parts at all.
+    ///
+    /// Used by the LLM tool-call parser and tests that only care
+    /// about the textual portion of the message.
+    #[must_use]
+    pub fn as_text(&self) -> String {
+        match self {
+            Self::Text(s) => s.clone(),
+            Self::Multimodal(parts) => parts
+                .iter()
+                .filter_map(|p| match p {
+                    ContentPart::Text { text } => Some(text.as_str()),
+                    ContentPart::ImageBase64 { .. } => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+        }
+    }
+
+    /// `true` iff this content payload carries any image parts. The
+    /// host uses this to decide whether the sidecar needs `--mmproj`
+    /// loaded before sending.
+    #[must_use]
+    pub fn has_images(&self) -> bool {
+        match self {
+            Self::Text(_) => false,
+            Self::Multimodal(parts) => parts
+                .iter()
+                .any(|p| matches!(p, ContentPart::ImageBase64 { .. })),
+        }
+    }
+
+    /// Construct a multimodal message from a prompt and a single
+    /// base64-encoded image. The image is appended after the text
+    /// part so the VLM sees the prompt first, which matches the
+    /// OpenAI / SmolVLM convention.
+    #[must_use]
+    pub fn text_with_image(
+        text: impl Into<String>,
+        media_type: impl Into<String>,
+        base64_data: impl Into<String>,
+    ) -> Self {
+        Self::Multimodal(vec![
+            ContentPart::Text { text: text.into() },
+            ContentPart::ImageBase64 {
+                media_type: media_type.into(),
+                data: base64_data.into(),
+            },
+        ])
+    }
+}
+
+impl From<String> for ChatContent {
+    fn from(s: String) -> Self {
+        Self::Text(s)
+    }
+}
+
+impl From<&str> for ChatContent {
+    fn from(s: &str) -> Self {
+        Self::Text(s.to_string())
+    }
+}
+
+/// Serialize as either a bare string (text-only, backward-compatible)
+/// or an array of content parts (multimodal). The OpenAI vision API
+/// accepts both shapes; the bare-string form is what every Phase 2
+/// caller expects on the wire.
+impl Serialize for ChatContent {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeSeq;
+        match self {
+            Self::Text(s) => serializer.serialize_str(s),
+            Self::Multimodal(parts) => {
+                let mut seq = serializer.serialize_seq(Some(parts.len()))?;
+                for part in parts {
+                    seq.serialize_element(&ContentPartWire::from(part))?;
+                }
+                seq.end()
+            }
+        }
+    }
+}
+
+/// Deserialize from either a bare string or an array of content
+/// parts. We accept whichever shape the model / tests produce.
+impl<'de> Deserialize<'de> for ChatContent {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let v = serde_json::Value::deserialize(deserializer)?;
+        match v {
+            serde_json::Value::String(s) => Ok(Self::Text(s)),
+            serde_json::Value::Array(arr) => {
+                let mut parts = Vec::with_capacity(arr.len());
+                for part in arr {
+                    let wire: ContentPartWire =
+                        serde_json::from_value(part).map_err(serde::de::Error::custom)?;
+                    parts.push(wire.into_core());
+                }
+                Ok(Self::Multimodal(parts))
+            }
+            other => Err(serde::de::Error::custom(format!(
+                "expected string or array for chat content, got {other}"
+            ))),
+        }
+    }
+}
+
+/// Wire shape mirroring the OpenAI vision content-part schema. The
+/// `tag = "type"` discriminator selects `Text` vs `ImageUrl`, and
+/// `ImageUrl` nests a `url` field that we encode as a `data:` URI
+/// because `llama-server` (and OpenAI) accept either an HTTP URL or
+/// a data URI there — and local-first means we always emit data
+/// URIs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum ContentPartWire {
+    Text { text: String },
+    ImageUrl { image_url: ImageUrlWire },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ImageUrlWire {
+    url: String,
+}
+
+impl ContentPartWire {
+    fn from(part: &ContentPart) -> Self {
+        match part {
+            ContentPart::Text { text } => Self::Text { text: text.clone() },
+            ContentPart::ImageBase64 { media_type, data } => Self::ImageUrl {
+                image_url: ImageUrlWire {
+                    url: format!("data:{media_type};base64,{data}"),
+                },
+            },
+        }
+    }
+
+    fn into_core(self) -> ContentPart {
+        match self {
+            Self::Text { text } => ContentPart::Text { text },
+            Self::ImageUrl { image_url } => {
+                // Try to parse `data:<media>;base64,<payload>`; fall
+                // back to a non-base64 image_url by recording the
+                // URL as the data field and `image/url` as the
+                // media_type. The fallback never happens for local
+                // images we produce ourselves but is here so a
+                // round-trip through serde of an HTTP image_url
+                // doesn't panic.
+                let url = image_url.url;
+                if let Some(rest) = url.strip_prefix("data:") {
+                    if let Some((media, payload)) = rest.split_once(";base64,") {
+                        return ContentPart::ImageBase64 {
+                            media_type: media.to_string(),
+                            data: payload.to_string(),
+                        };
+                    }
+                }
+                ContentPart::ImageBase64 {
+                    media_type: "image/url".to_string(),
+                    data: url,
+                }
+            }
+        }
+    }
+}
+
+/// One message in a chat conversation. `content` is now a
+/// [`ChatContent`] enum so vision messages can carry inline images;
+/// text-only messages still serialize to the historical `"content":
+/// "string"` shape, so the wire format is fully backward-compatible.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ChatMessage {
     pub role: ChatRole,
-    pub content: String,
+    pub content: ChatContent,
 }
 
 impl ChatMessage {
     /// Convenience constructor: `system`/`user`/`assistant` shorthand.
+    /// `content` accepts anything that converts into `ChatContent`,
+    /// which covers `String`, `&str`, and `ChatContent` itself.
     #[must_use]
-    pub fn new(role: ChatRole, content: impl Into<String>) -> Self {
+    pub fn new(role: ChatRole, content: impl Into<ChatContent>) -> Self {
         Self {
             role,
             content: content.into(),
@@ -42,18 +266,33 @@ impl ChatMessage {
     }
 
     #[must_use]
-    pub fn system(content: impl Into<String>) -> Self {
+    pub fn system(content: impl Into<ChatContent>) -> Self {
         Self::new(ChatRole::System, content)
     }
 
     #[must_use]
-    pub fn user(content: impl Into<String>) -> Self {
+    pub fn user(content: impl Into<ChatContent>) -> Self {
         Self::new(ChatRole::User, content)
     }
 
     #[must_use]
-    pub fn assistant(content: impl Into<String>) -> Self {
+    pub fn assistant(content: impl Into<ChatContent>) -> Self {
         Self::new(ChatRole::Assistant, content)
+    }
+
+    /// Construct a multimodal user message: prompt text followed by
+    /// one inline base64 image. The image is sent inline so the
+    /// editor stays local-first (no asset URLs leak onto the wire).
+    #[must_use]
+    pub fn user_with_image(
+        text: impl Into<String>,
+        media_type: impl Into<String>,
+        base64_data: impl Into<String>,
+    ) -> Self {
+        Self::new(
+            ChatRole::User,
+            ChatContent::text_with_image(text, media_type, base64_data),
+        )
     }
 }
 
@@ -354,25 +593,119 @@ mod tests {
         assert!(s.contains("\"user\""));
     }
 
+    /// Text-only messages MUST serialize with `content` as a bare
+    /// string (not an array of `{type:"text"...}`) — this is the
+    /// historical wire shape that Phase 2 LLM tests, mock servers,
+    /// and llama-server itself depend on. Breaking this is a silent
+    /// API break.
+    #[test]
+    fn text_content_serializes_as_bare_string() {
+        let m = ChatMessage::user("hello world");
+        let s = serde_json::to_string(&m).expect("json");
+        // The shape must be `"content":"hello world"`, not an array.
+        assert!(
+            s.contains("\"content\":\"hello world\""),
+            "expected bare-string content, got: {s}",
+        );
+        assert!(
+            !s.contains('['),
+            "text-only content must not serialize as an array: {s}",
+        );
+    }
+
+    /// Multimodal messages MUST serialize as the OpenAI vision-API
+    /// content-parts array, with `type:"text"` and `type:"image_url"`
+    /// discriminators and the image inlined as a `data:` URI.
+    #[test]
+    fn multimodal_content_serializes_as_openai_parts() {
+        let m = ChatMessage::user_with_image(
+            "describe this image",
+            "image/png",
+            "iVBORw0KGgo=", // tiny base64 stub
+        );
+        let s = serde_json::to_string(&m).expect("json");
+        let v: serde_json::Value = serde_json::from_str(&s).expect("re-parse");
+        let parts = v
+            .get("content")
+            .and_then(|c| c.as_array())
+            .expect("content must be array for multimodal message");
+        assert_eq!(parts.len(), 2, "expected text + image part, got: {s}");
+        assert_eq!(parts[0]["type"], "text");
+        assert_eq!(parts[0]["text"], "describe this image");
+        assert_eq!(parts[1]["type"], "image_url");
+        let url = parts[1]["image_url"]["url"]
+            .as_str()
+            .expect("image_url.url must be a string");
+        assert_eq!(url, "data:image/png;base64,iVBORw0KGgo=");
+    }
+
+    /// Round-trip: deserialize either wire shape back into the same
+    /// `ChatContent` variant. Asserts both directions because the
+    /// deserializer is the contract for accepting LLM-side echoes
+    /// of vision messages (some VLMs roundtrip the user message in
+    /// the response).
+    #[test]
+    fn chat_content_round_trips_both_shapes() {
+        let text = ChatMessage::user("hello");
+        let parsed: ChatMessage =
+            serde_json::from_str(&serde_json::to_string(&text).unwrap()).unwrap();
+        assert_eq!(parsed, text);
+        assert!(matches!(parsed.content, ChatContent::Text(_)));
+
+        let multi = ChatMessage::user_with_image("look", "image/jpeg", "abc=");
+        let parsed: ChatMessage =
+            serde_json::from_str(&serde_json::to_string(&multi).unwrap()).unwrap();
+        assert_eq!(parsed, multi);
+        assert!(matches!(parsed.content, ChatContent::Multimodal(_)));
+        assert!(parsed.content.has_images());
+    }
+
+    /// `ChatContent::as_text` must concatenate the text parts of a
+    /// multimodal message so callers that just want the user's
+    /// prompt back can keep using a plain `&str` view.
+    #[test]
+    fn chat_content_as_text_collects_text_parts() {
+        let m = ChatContent::Multimodal(vec![
+            ContentPart::Text {
+                text: "first line".to_string(),
+            },
+            ContentPart::ImageBase64 {
+                media_type: "image/png".to_string(),
+                data: "x".to_string(),
+            },
+            ContentPart::Text {
+                text: "second line".to_string(),
+            },
+        ]);
+        let t = m.as_text();
+        assert!(t.contains("first line"));
+        assert!(t.contains("second line"));
+        assert!(
+            !t.contains('x'),
+            "image bytes must not leak into the text view"
+        );
+    }
+
     #[test]
     fn system_prompt_includes_summary() {
         let p = build_system_prompt("artboards: Home, About");
-        assert!(p.content.contains("artboards: Home, About"));
+        assert!(p.content.as_text().contains("artboards: Home, About"));
     }
 
     #[test]
     fn tool_call_system_prompt_lists_every_tool() {
         let registry = crate::tool_call::default_design_registry();
         let p = build_tool_call_system_prompt("artboards: Home", &registry);
+        let text = p.content.as_text();
         for t in registry.tools() {
             assert!(
-                p.content.contains(&t.name),
+                text.contains(&t.name),
                 "system prompt should list tool {:?}; got:\n{}",
                 t.name,
-                p.content
+                text
             );
         }
-        assert!(p.content.contains("artboards: Home"));
+        assert!(text.contains("artboards: Home"));
     }
 
     #[test]

@@ -21,10 +21,12 @@ import {
   type TextRegion,
 } from "../../../shared/scene";
 import { colors, radius, spacing } from "../styles/tokens";
+import { ImageGenPanel } from "./ImageGenPanel";
 import { LlmChatPanel } from "./LlmChatPanel";
 import { McpSettingsPanel } from "./McpSettingsPanel";
 import { ModelManager } from "./ModelManager";
 import { PluginManager } from "./PluginManager";
+import { VisionAssistSection } from "./VisionAssistSection";
 
 export interface AIAssistPanelProps {
   selectedNode: NodeInfo | null;
@@ -172,6 +174,14 @@ export function AIAssistPanel({
         onStatus={onStatus}
         onApplied={onApplied}
       />
+      <hr style={separatorStyle} />
+      <VisionAssistSection
+        selected={selectedNode}
+        onStatus={onStatus}
+        onApplied={onApplied}
+      />
+      <hr style={separatorStyle} />
+      <ImageGenPanel onStatus={onStatus} onApplied={onApplied} />
       <hr style={separatorStyle} />
 
       <ModelManager onStatus={onStatus} />

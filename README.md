@@ -50,8 +50,9 @@ See [`PROPOSAL.md`](./PROPOSAL.md) for the full product spec.
 | GPU rendering        | wgpu (Metal / D3D12 / Vulkan / OpenGL)                       |
 | CPU rendering        | `tiny-skia` (real software rasterizer, not a placeholder)    |
 | Persistence          | SQLite + content-addressed blob store (BLAKE3)               |
-| Local AI             | `llama.cpp` / MLX / ONNX Runtime (sidecars; built)           |
-| In-process AI        | Lanczos3 upscale, k-means palette, BFS smart-select, Sobel + CCA screenshot-to-layout |
+| Local AI             | `llama.cpp` (LLM + Vision-LLM + FLUX image-gen) / MLX (Apple Silicon) / ONNX Runtime (loopback sidecars; never network) |
+| In-process AI        | Lanczos3 upscale, k-means palette, BFS smart-select, Sobel + CCA screenshot-to-layout, alt-text statistics |
+| Vision actions       | design critique, alt-text, brand / palette / spacing extraction, content-aware crop, design-token + style description, smart layer naming (all GBNF-constrained) |
 | Vector math          | `kurbo`, `i_overlay`, `rstar`                                |
 | Text                 | `fontdb` (discovery) + `rustybuzz` (shaping) + `ttf-parser` (outlines) |
 | Export               | `printpdf` (PDF write), `image` (PNG / JPEG / WebP)          |
@@ -145,7 +146,9 @@ KCreate/
 │   ├── kcreate_layout/           Pure flex + grid solvers
 │   ├── kcreate_ai/               Local AI: bg-removal (threshold + ONNX u2net), LLM sidecar,
 │   │                              Lanczos upscale, k-means palette, BFS smart-select, model
-│   │                              pack registry, screenshot-to-layout
+│   │                              pack registry, screenshot-to-layout, multimodal chat,
+│   │                              vision sidecar + MLX sidecar dispatcher, FLUX image-gen
+│   │                              sidecar, design critique / brand / crop / token / style
 │   ├── kcreate_mcp/              Loopback-only MCP server (3 tools) + permission store
 │   │                              (Once / Always / Denied)
 │   ├── kcreate_plugin/           WASM plugin sandbox (wasmi 0.42, deny-by-default host ABI;
@@ -155,6 +158,9 @@ KCreate/
 │   │                              Lamport clock, signed envelopes, conflict resolver,
 │   │                              project session). Kept OUT of editing-path deps.
 │   └── kcreate_tests/            Cross-crate integration tests
+├── tools/
+│   └── kcreate_diffusion/        Loopback Python diffusion sidecar (FLUX.2-Klein-4B,
+│                                  diffusers; spawned by `image_gen.rs`, never networked)
 ├── PROPOSAL.md                   Product specification
 ├── ARCHITECTURE.md               Technical architecture
 ├── PROGRESS.md                   Phase tracking

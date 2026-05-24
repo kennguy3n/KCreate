@@ -11,17 +11,26 @@
 pub mod action_log;
 pub mod alt_text;
 pub mod bg_remove;
+pub mod brand_extract;
+pub mod design_critique;
+pub mod design_tokens_vlm;
+pub mod image_gen;
 pub mod layout_suggest;
 pub mod llm_chat;
 pub mod llm_sidecar;
+pub mod mlx_sidecar;
 pub mod model_registry;
 pub mod ocr;
 pub mod palette;
 pub mod screenshot_to_layout;
+pub mod sidecar_dispatcher;
+pub mod smart_crop;
 pub mod smart_select;
+pub mod style_describe;
 pub mod task_router;
 pub mod tool_call;
 pub mod upscale;
+pub mod vision_chat;
 
 pub use action_log::{ActionLog, AiAction};
 pub use alt_text::{generate_alt_text, AltTextError, AltTextOptions, AltTextReport};
@@ -35,12 +44,15 @@ pub use layout_suggest::{
 };
 pub use llm_chat::{
     build_system_prompt, build_tool_call_system_prompt, chat_completion, parse_completion,
-    request_tool_call, ChatError, ChatMessage, ChatRequest, ChatResponse, ChatResult, ChatRole,
+    request_tool_call, ChatContent, ChatError, ChatMessage, ChatRequest, ChatResponse, ChatResult,
+    ChatRole, ContentPart,
 };
 pub use llm_sidecar::{LlmSidecar, SidecarConfig, SidecarError, SidecarResult, SidecarStatus};
+pub use mlx_sidecar::{probe_mlx_available, MlxSidecar, MlxSidecarConfig};
 pub use model_registry::{
-    install_model_pack, is_installed, list_model_packs, pack_path, uninstall_model_pack,
-    InstallError, InstallReport, ModelKind, ModelPack, ModelPackCategory,
+    install_model_pack, is_installed, list_model_packs, mmproj_for, pack_path,
+    recommended_generation_pack, recommended_llm_pack, recommended_vision_pack,
+    uninstall_model_pack, InstallError, InstallReport, ModelKind, ModelPack, ModelPackCategory,
 };
 pub use ocr::{detect_text_regions, DetectTextRegionsOptions, OcrError, TextRegion};
 pub use palette::{extract_palette, ExtractedColor};

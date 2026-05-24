@@ -66,6 +66,14 @@ pub enum SidecarError {
     /// The configured model file does not exist on disk.
     #[error("model file not found: {0}")]
     ModelMissing(PathBuf),
+    /// The configured multimodal projector file does not exist on disk.
+    /// Vision models in llama.cpp require a paired `mmproj` file
+    /// alongside the GGUF weights — `--mmproj <path>` is mandatory
+    /// when serving a VLM, and an early-exit failure here is
+    /// preferable to letting llama-server explode in its own error
+    /// path after the spawn has already produced a child PID.
+    #[error("mmproj file not found: {0}")]
+    MmprojMissing(PathBuf),
     /// The model file is larger than the configured tier ceiling
     /// (e.g. RuntimeConfig::effective_max_model_mb()).
     #[error("model size {model_mb} MB exceeds limit {limit_mb} MB")]
@@ -138,6 +146,19 @@ pub struct SidecarConfig {
     /// Extra args appended to the llama-server invocation. Useful for
     /// `--n-gpu-layers`, `--threads`, etc.
     pub extra_args: Vec<String>,
+    /// Optional path to the multimodal projector (mmproj) file that
+    /// pairs with a vision-language GGUF. llama.cpp's `llama-server`
+    /// accepts `--mmproj <path>` to load the projector weights that
+    /// translate image tokens into the model's embedding space; this
+    /// is what makes Qwen-VL / LLaVA / SmolVLM-style models accept
+    /// `image_url` content parts on the OpenAI-compatible chat API.
+    ///
+    /// `None` keeps the sidecar text-only (the historical Phase 2
+    /// behaviour); `Some(path)` enables vision and is validated for
+    /// existence at start time, with a typed
+    /// [`SidecarError::MmprojMissing`] error so misconfiguration
+    /// surfaces in the UI instead of a confusing health-timeout.
+    pub mmproj_path: Option<PathBuf>,
 }
 
 impl SidecarConfig {
@@ -151,7 +172,18 @@ impl SidecarConfig {
             context_size: 4096,
             health_timeout: DEFAULT_HEALTH_TIMEOUT,
             extra_args: Vec::new(),
+            mmproj_path: None,
         }
+    }
+
+    /// Builder-style: attach a multimodal projector file to enable
+    /// vision (`--mmproj <path>` on the llama-server invocation).
+    ///
+    /// Pass `None` to leave the sidecar text-only.
+    #[must_use]
+    pub fn with_mmproj(mut self, mmproj_path: Option<PathBuf>) -> Self {
+        self.mmproj_path = mmproj_path;
+        self
     }
 }
 
@@ -238,6 +270,14 @@ impl LlmSidecar {
                 message: e.to_string(),
             };
             return Err(e);
+        }
+        if let Some(mmproj) = self.config.mmproj_path.as_deref() {
+            if let Err(e) = validate_mmproj(mmproj) {
+                *self.status.lock() = SidecarStatus::Error {
+                    message: e.to_string(),
+                };
+                return Err(e);
+            }
         }
         let port = match pick_loopback_port() {
             Ok(p) => p,
@@ -327,14 +367,22 @@ fn spawn_child(config: &SidecarConfig, port: u16) -> SidecarResult<Child> {
         "-c",
         &config.context_size.to_string(),
     ]);
+    if let Some(mmproj) = config.mmproj_path.as_deref() {
+        // `--mmproj <path>` is the llama.cpp flag for the multimodal
+        // projector (CLIP/SmolVLM/etc.). Passing it switches the
+        // server into vision mode and lets it accept `image_url`
+        // content parts on the OpenAI-compatible chat API.
+        cmd.arg("--mmproj").arg(mmproj);
+    }
     for arg in &config.extra_args {
         cmd.arg(arg);
     }
     cmd.stdout(Stdio::null()).stderr(Stdio::piped());
     log::debug!(
-        "spawning llama-server: {} --port {}",
+        "spawning llama-server: {} --port {} mmproj={:?}",
         config.binary.display(),
         port,
+        config.mmproj_path,
     );
     cmd.spawn().map_err(SidecarError::Spawn)
 }
@@ -425,6 +473,46 @@ fn validate_model(model: &Path, max_mb: u64) -> SidecarResult<()> {
         });
     }
     Ok(())
+}
+
+/// Verify the multimodal projector file is present on disk. We
+/// deliberately do not check its size against `max_model_mb` —
+/// mmproj files are CLIP-style projectors (a few hundred MB at
+/// most) and the tier ceiling is about the weights footprint, not
+/// the projector footprint.
+fn validate_mmproj(mmproj: &Path) -> SidecarResult<()> {
+    std::fs::metadata(mmproj)
+        .map(|_| ())
+        .map_err(|_| SidecarError::MmprojMissing(mmproj.to_path_buf()))
+}
+
+/// Build the argv vector llama-server would receive, *without*
+/// spawning the child. Exposed for tests (so `mmproj_args_are_forwarded`
+/// can assert the precise CLI shape without running a binary) and for
+/// debug logging. Returns argv as a `Vec<String>` rather than
+/// `Vec<OsString>` to keep the assertion shape ergonomic; non-UTF-8
+/// paths are rendered with `to_string_lossy` so the function never
+/// panics.
+#[must_use]
+pub fn build_argv(config: &SidecarConfig, port: u16) -> Vec<String> {
+    let mut argv = vec![
+        "--model".to_string(),
+        config.model_path.to_string_lossy().into_owned(),
+        "--host".to_string(),
+        "127.0.0.1".to_string(),
+        "--port".to_string(),
+        port.to_string(),
+        "-c".to_string(),
+        config.context_size.to_string(),
+    ];
+    if let Some(mmproj) = config.mmproj_path.as_deref() {
+        argv.push("--mmproj".to_string());
+        argv.push(mmproj.to_string_lossy().into_owned());
+    }
+    for arg in &config.extra_args {
+        argv.push(arg.clone());
+    }
+    argv
 }
 
 /// Poll `http://127.0.0.1:{port}/health` until it returns "ok" or
@@ -530,6 +618,7 @@ mod tests {
             context_size: 2048,
             health_timeout: Duration::from_millis(50),
             extra_args: vec![],
+            mmproj_path: None,
         };
         let mut s = LlmSidecar::new(cfg);
         let err = s.start().expect_err("missing model");
@@ -549,6 +638,7 @@ mod tests {
             context_size: 2048,
             health_timeout: Duration::from_millis(50),
             extra_args: vec![],
+            mmproj_path: None,
         };
         let mut s = LlmSidecar::new(cfg);
         let err = s.start().expect_err("bad binary");
@@ -580,5 +670,89 @@ mod tests {
         wait_for_health(port, Duration::from_secs(2)).expect("ready");
         // Drop the server thread by letting it go out of scope at end.
         let _ = handle;
+    }
+
+    /// When `mmproj_path` is `None`, `build_argv` must omit the
+    /// `--mmproj` flag entirely — passing it with no path would be
+    /// rejected by llama-server, and passing an empty value would
+    /// produce a confusing "file not found: " error in the child
+    /// process logs.
+    #[test]
+    fn mmproj_omitted_when_none() {
+        let cfg = SidecarConfig::new(PathBuf::from("/tmp/m.gguf"));
+        let argv = build_argv(&cfg, 12345);
+        assert!(
+            !argv.iter().any(|a| a == "--mmproj"),
+            "argv must not contain --mmproj when mmproj_path is None: {argv:?}",
+        );
+    }
+
+    /// When `mmproj_path` is `Some(path)`, `build_argv` must include
+    /// `--mmproj <path>` as two consecutive argv entries, in that
+    /// order, with the path preserved verbatim.
+    #[test]
+    fn mmproj_args_are_forwarded() {
+        let cfg = SidecarConfig::new(PathBuf::from("/tmp/m.gguf"))
+            .with_mmproj(Some(PathBuf::from("/tmp/mmproj-clip.gguf")));
+        let argv = build_argv(&cfg, 12345);
+        let pos = argv
+            .iter()
+            .position(|a| a == "--mmproj")
+            .expect("argv must contain --mmproj");
+        assert_eq!(
+            argv.get(pos + 1).map(String::as_str),
+            Some("/tmp/mmproj-clip.gguf"),
+            "argv must have the mmproj path immediately after --mmproj: {argv:?}",
+        );
+    }
+
+    /// `start()` must surface a typed `MmprojMissing` error when the
+    /// configured mmproj path does not exist, *before* spawning the
+    /// child. We exercise this with a real model file (so the
+    /// `validate_model` check passes) and a bogus mmproj path.
+    #[test]
+    fn start_with_missing_mmproj_transitions_to_error() {
+        let dir = tempfile::tempdir().expect("temp");
+        let model = dir.path().join("m.gguf");
+        std::fs::write(&model, b"0").expect("write");
+        let cfg =
+            SidecarConfig::new(model).with_mmproj(Some(PathBuf::from("/no/such/mmproj.gguf")));
+        let mut s = LlmSidecar::new(cfg);
+        let err = s.start().expect_err("missing mmproj");
+        assert!(
+            matches!(err, SidecarError::MmprojMissing(_)),
+            "expected MmprojMissing, got {err:?}"
+        );
+        assert!(matches!(s.status(), SidecarStatus::Error { .. }));
+    }
+
+    /// When mmproj exists on disk, `start()` proceeds past the
+    /// validate phase. We can't actually spawn llama-server in CI,
+    /// so we point at a non-existent binary and assert the next
+    /// failure mode is `Spawn` (which proves the mmproj validation
+    /// passed). This is a guard against accidentally short-circuiting
+    /// past the mmproj check.
+    #[test]
+    fn start_with_present_mmproj_passes_validation() {
+        let dir = tempfile::tempdir().expect("temp");
+        let model = dir.path().join("m.gguf");
+        let mmproj = dir.path().join("mmproj.gguf");
+        std::fs::write(&model, b"0").expect("write model");
+        std::fs::write(&mmproj, b"0").expect("write mmproj");
+        let cfg = SidecarConfig {
+            binary: PathBuf::from("/this/binary/does/not/exist"),
+            model_path: model,
+            max_model_mb: u64::MAX,
+            context_size: 2048,
+            health_timeout: Duration::from_millis(50),
+            extra_args: vec![],
+            mmproj_path: Some(mmproj),
+        };
+        let mut s = LlmSidecar::new(cfg);
+        let err = s.start().expect_err("bad binary");
+        assert!(
+            matches!(err, SidecarError::Spawn(_)),
+            "expected Spawn (mmproj must have validated), got {err:?}",
+        );
     }
 }

@@ -139,7 +139,7 @@ impl From<ChatResponse> for LlmReply {
 
 /// Process-global sidecar handle. Wrapped in `Option` because the
 /// sidecar must be constructed with a model path the host supplies.
-fn slot() -> &'static Mutex<Option<LlmSidecar>> {
+pub(crate) fn slot() -> &'static Mutex<Option<LlmSidecar>> {
     static SLOT: OnceLock<Mutex<Option<LlmSidecar>>> = OnceLock::new();
     SLOT.get_or_init(|| Mutex::new(None))
 }
@@ -233,7 +233,7 @@ pub fn llm_suggest_for_selection() -> LlmBridgeResult<LlmReply> {
     let req = vec![
         LlmMessage {
             role: "system".into(),
-            content: build_system_prompt(&summary).content,
+            content: build_system_prompt(&summary).content.as_text(),
         },
         LlmMessage {
             role: "user".into(),
@@ -338,7 +338,7 @@ pub fn ai_check_accessibility() -> LlmBridgeResult<LlmJsonResult> {
 
 /// Look up the sidecar's listening port, failing fast with `NotReady`
 /// if the sidecar isn't `Ready`.
-fn ready_port() -> LlmBridgeResult<u16> {
+pub(crate) fn ready_port() -> LlmBridgeResult<u16> {
     let guard = slot().lock();
     guard
         .as_ref()

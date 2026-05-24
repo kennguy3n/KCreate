@@ -175,6 +175,53 @@ export interface Bridge {
   aiSuggestLayerNames(): Promise<string>;
   aiExtractDesignTokens(): Promise<string>;
   aiCheckAccessibility(): Promise<string>;
+  // Phase 4: vision sidecar.
+  visionStart(packId: string): number;
+  visionStop(): void;
+  visionStatus(): string;
+  visionDescribeImage(
+    rgba: number[],
+    width: number,
+    height: number,
+    userPrompt: string,
+  ): string;
+  visionDescribeNode(nodeId: string, userPrompt: string): string;
+  visionGenerateAltText(rgba: number[], width: number, height: number): string;
+  visionGenerateAltTextForNode(nodeId: string): string;
+  visionAnalyzeDesign(rgba: number[], width: number, height: number): string;
+  aiExtractBrandFromImage(
+    rgba: number[],
+    width: number,
+    height: number,
+  ): string;
+  aiSuggestCrop(
+    rgba: number[],
+    width: number,
+    height: number,
+    aspectRatio: number,
+  ): string;
+  aiSuggestDesignTokens(
+    rgba: number[],
+    width: number,
+    height: number,
+  ): string;
+  aiDescribeStyle(rgba: number[], width: number, height: number): string;
+  visionRecommendedPack(): string;
+  visionMmprojFor(packId: string): string;
+  visionListablePacks(): string[];
+  // Phase 4: image generation sidecar.
+  imageGenStart(packId: string): number;
+  imageGenStop(): void;
+  imageGenStatus(): string;
+  imageGenGenerate(
+    prompt: string,
+    width: number,
+    height: number,
+    steps: number,
+    seed: number | null,
+  ): string;
+  imageGenAllowed(): boolean;
+  imageGenRecommendedPack(): string;
   exportSvg(nodeIds: string[], optionsJson: string): string;
   exportPng(outputPath: string, optionsJson: string): number;
   exportPdf(outputPath: string, optionsJson: string): number;
@@ -194,6 +241,7 @@ export interface Bridge {
   documentGetSelection(): string[];
   documentClearSelection(): void;
   documentImportImage(parentId: string | null, filePath: string): string;
+  documentImportImageBytes(parentId: string | null, bytes: number[]): string;
   canvasCreateRect(
     parentId: string | null,
     x: number,

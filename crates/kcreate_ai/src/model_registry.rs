@@ -51,7 +51,13 @@ pub enum ModelPackCategory {
     ImagePro,
     /// Design-pro packs: LLM-driven design suggestions.
     DesignPro,
-    /// Generation packs: diffusion (opt-in).
+    /// Vision packs: multimodal (VLM) models that consume images and
+    /// emit text — alt-text, design critique, screenshot
+    /// classification, brand extraction, smart-crop, style
+    /// description. Loaded through the same sidecar lifecycle as
+    /// text-only LLMs but always paired with an mmproj file.
+    Vision,
+    /// Generation packs: diffusion (opt-in, Tier 2+ with GPU only).
     Generation,
 }
 
@@ -328,7 +334,258 @@ fn static_packs() -> Vec<ModelPack> {
                 "https://huggingface.co/bartowski/Llama-3.2-3B-Instruct-GGUF/resolve/main/Llama-3.2-3B-Instruct-Q4_K_M.gguf".into(),
             sha256: String::new(),
         },
+        // ---- Phase 4 vision packs (GGUF + mmproj) ----
+        //
+        // Each vision pack consists of TWO file entries — the model
+        // weights (`*-q4_k_m.gguf`) and the companion multimodal
+        // projector (`*-mmproj.gguf`). The sidecar driver loads
+        // both via `--model` and `--mmproj` (see
+        // `SidecarConfig::mmproj_path`). The UI shows the model
+        // entry; the mmproj entry is installed in lockstep but
+        // hidden from the primary listing via the `mmproj`
+        // capability marker.
+        ModelPack {
+            id: "vision_smolvlm2_256m".into(),
+            name: "Vision (CPU) — SmolVLM2-256M Instruct".into(),
+            category: ModelPackCategory::Vision,
+            kind: ModelKind::Sidecar,
+            capabilities: vec!["vision".into(), "alt_text".into()],
+            // ~180 MB Q4_K_S weights. Runs on CPU with reasonable
+            // latency on every supported tier (including Tier 0
+            // laptops), which is why this is the default vision
+            // recommendation for Tier 0/1 in
+            // `recommended_vision_pack`.
+            size_bytes: 180_000_000,
+            file_path: "smolvlm2-256m-q4_k_s.gguf".into(),
+            installed: false,
+            download_url:
+                "https://huggingface.co/ggml-org/SmolVLM-256M-Instruct-GGUF/resolve/main/SmolVLM-256M-Instruct-Q4_K_S.gguf".into(),
+            sha256: String::new(),
+        },
+        ModelPack {
+            id: "vision_smolvlm2_256m_mmproj".into(),
+            name: "Vision (CPU) — SmolVLM2-256M mmproj".into(),
+            category: ModelPackCategory::Vision,
+            kind: ModelKind::Sidecar,
+            // `mmproj` is the capability marker the dispatcher uses
+            // to skip projector entries when enumerating models for
+            // the chat selector — projector files are never loaded
+            // on their own, only alongside the paired weights.
+            capabilities: vec!["mmproj".into()],
+            size_bytes: 90_000_000,
+            file_path: "smolvlm2-256m-mmproj-f16.gguf".into(),
+            installed: false,
+            download_url:
+                "https://huggingface.co/ggml-org/SmolVLM-256M-Instruct-GGUF/resolve/main/mmproj-SmolVLM-256M-Instruct-F16.gguf".into(),
+            sha256: String::new(),
+        },
+        ModelPack {
+            id: "vision_qwen35_4b".into(),
+            name: "Vision (GPU) — Qwen2.5-VL 4B Instruct".into(),
+            category: ModelPackCategory::Vision,
+            kind: ModelKind::Sidecar,
+            capabilities: vec![
+                "vision".into(),
+                "design_critique".into(),
+                "alt_text".into(),
+                "brand_extract".into(),
+                "smart_crop".into(),
+                "style_describe".into(),
+            ],
+            size_bytes: 2_500_000_000,
+            file_path: "qwen2.5-vl-4b-q4_k_m.gguf".into(),
+            installed: false,
+            download_url:
+                "https://huggingface.co/ggml-org/Qwen2.5-VL-7B-Instruct-GGUF/resolve/main/Qwen2.5-VL-7B-Instruct-Q4_K_M.gguf".into(),
+            sha256: String::new(),
+        },
+        ModelPack {
+            id: "vision_qwen35_4b_mmproj".into(),
+            name: "Vision (GPU) — Qwen2.5-VL 4B mmproj".into(),
+            category: ModelPackCategory::Vision,
+            kind: ModelKind::Sidecar,
+            capabilities: vec!["mmproj".into()],
+            size_bytes: 420_000_000,
+            file_path: "qwen2.5-vl-4b-mmproj-f16.gguf".into(),
+            installed: false,
+            download_url:
+                "https://huggingface.co/ggml-org/Qwen2.5-VL-7B-Instruct-GGUF/resolve/main/mmproj-Qwen2.5-VL-7B-Instruct-F16.gguf".into(),
+            sha256: String::new(),
+        },
+        // ---- MLX (Apple Silicon) vision packs ----
+        //
+        // These are model *directories*, not single GGUF files; the
+        // MLX sidecar resolves the path as either a local folder or
+        // a Hugging Face `mlx-community/...` slug at runtime (see
+        // `mlx_sidecar::validate_model_dir`). `file_path` is the
+        // canonical local directory name we expect under
+        // `models_dir/`, so the installer can resolve a folder once
+        // the user has fetched it (e.g. via `huggingface-cli
+        // download`).
+        ModelPack {
+            id: "vision_smolvlm_256m_mlx".into(),
+            name: "Vision (Apple Silicon) — SmolVLM-256M MLX 4bit".into(),
+            category: ModelPackCategory::Vision,
+            kind: ModelKind::Sidecar,
+            capabilities: vec!["vision".into(), "alt_text".into(), "mlx".into()],
+            size_bytes: 200_000_000,
+            file_path: "mlx-community__SmolVLM-256M-Instruct-4bit".into(),
+            installed: false,
+            download_url:
+                "https://huggingface.co/mlx-community/SmolVLM-256M-Instruct-4bit".into(),
+            sha256: String::new(),
+        },
+        ModelPack {
+            id: "vision_qwen35_4b_mlx".into(),
+            name: "Vision (Apple Silicon) — Qwen2.5-VL 4B MLX 4bit".into(),
+            category: ModelPackCategory::Vision,
+            kind: ModelKind::Sidecar,
+            capabilities: vec![
+                "vision".into(),
+                "design_critique".into(),
+                "alt_text".into(),
+                "brand_extract".into(),
+                "smart_crop".into(),
+                "style_describe".into(),
+                "mlx".into(),
+            ],
+            size_bytes: 2_700_000_000,
+            file_path: "mlx-community__Qwen2.5-VL-7B-Instruct-4bit".into(),
+            installed: false,
+            download_url:
+                "https://huggingface.co/mlx-community/Qwen2.5-VL-7B-Instruct-4bit".into(),
+            sha256: String::new(),
+        },
+        // ---- Phase 4 image generation packs (FLUX) ----
+        //
+        // Generation models are loaded by an entirely separate
+        // sidecar (`crate::image_gen::ImageGenSidecar`) running a
+        // small Python diffusers server — *not* llama-server. They
+        // are gated to Tier 2+ with GPU; the UI hides them on lower
+        // tiers (see `DeviceTier::image_generation_allowed`).
+        ModelPack {
+            id: "image_gen_flux_klein_4b".into(),
+            name: "Image Generation — FLUX Klein 4B (GGUF)".into(),
+            category: ModelPackCategory::Generation,
+            kind: ModelKind::Sidecar,
+            capabilities: vec!["image_generation".into()],
+            size_bytes: 2_500_000_000,
+            file_path: "flux-2-klein-4b-Q4_0.gguf".into(),
+            installed: false,
+            download_url:
+                "https://huggingface.co/themindstudio/FLUX-Klein-4B-GGUF/resolve/main/flux-klein-4b-Q4_0.gguf".into(),
+            sha256: String::new(),
+        },
+        ModelPack {
+            id: "image_gen_flux_klein_mlx".into(),
+            name: "Image Generation (Apple Silicon) — FLUX Klein 4B MLX 4bit".into(),
+            category: ModelPackCategory::Generation,
+            kind: ModelKind::Sidecar,
+            capabilities: vec!["image_generation".into(), "mlx".into()],
+            size_bytes: 2_700_000_000,
+            file_path: "mlx-community__flux2-klein-4b-mlx-4bit".into(),
+            installed: false,
+            download_url:
+                "https://huggingface.co/themindstudio/flux2-klein-4b-mlx-4bit".into(),
+            sha256: String::new(),
+        },
     ]
+}
+
+/// Return the canonical mmproj pack id that pairs with `pack_id`, or
+/// `None` if `pack_id` is not a vision model (or is itself the
+/// mmproj entry). The sidecar dispatcher uses this to resolve both
+/// files when starting a vision sidecar.
+#[must_use]
+pub fn mmproj_for(pack_id: &str) -> Option<&'static str> {
+    match pack_id {
+        "vision_smolvlm2_256m" => Some("vision_smolvlm2_256m_mmproj"),
+        "vision_qwen35_4b" => Some("vision_qwen35_4b_mmproj"),
+        _ => None,
+    }
+}
+
+/// Return the canonical GGUF/llama-server pack id to fall back to
+/// when an MLX pack is requested but MLX is unavailable (e.g. the
+/// host is not Apple Silicon, or `python3 -m mlx_lm` is not
+/// installed). Returns `None` if `pack_id` is not an MLX pack or
+/// has no GGUF equivalent.
+///
+/// We use an explicit map rather than `trim_end_matches("_mlx")`
+/// because the GGUF and MLX builds are sometimes named slightly
+/// differently in their upstream repos. SmolVLM2-256M (GGUF) and
+/// SmolVLM-256M-Instruct (MLX), for example, differ by more than
+/// the `_mlx` suffix.
+#[must_use]
+pub fn gguf_fallback_for_mlx_pack(pack_id: &str) -> Option<&'static str> {
+    match pack_id {
+        "vision_smolvlm_256m_mlx" => Some("vision_smolvlm2_256m"),
+        "vision_qwen35_4b_mlx" => Some("vision_qwen35_4b"),
+        "image_gen_flux_klein_mlx" => Some("image_gen_flux_klein_4b"),
+        _ => None,
+    }
+}
+
+/// Recommend a vision pack for the given (tier, platform). Returns
+/// the canonical pack id the model-manager UI should highlight as
+/// "best for this machine". The policy:
+///
+/// - On Apple Silicon, prefer MLX-format vision packs (MLX is
+///   meaningfully faster than llama.cpp Metal for VLMs at the time
+///   of writing).
+/// - Tier 0 / 1: SmolVLM-256M — runs comfortably on CPU.
+/// - Tier 2 / 3: Qwen2.5-VL — the larger model is worth the cost.
+///
+/// Returns `None` only when the tier does not allow vision at all,
+/// which is currently never (see [`DeviceTier::vision_model_allowed`]).
+#[must_use]
+pub fn recommended_vision_pack(
+    tier: kcreate_core::config::DeviceTier,
+    platform: kcreate_core::config::Platform,
+) -> Option<&'static str> {
+    use kcreate_core::config::DeviceTier::{Tier0, Tier1, Tier2, Tier3};
+    if !tier.vision_model_allowed() {
+        return None;
+    }
+    let is_apple_silicon = matches!(platform, kcreate_core::config::Platform::MacOsAppleSilicon);
+    Some(match (tier, is_apple_silicon) {
+        (Tier0 | Tier1, true) => "vision_smolvlm_256m_mlx",
+        (Tier0 | Tier1, false) => "vision_smolvlm2_256m",
+        (Tier2 | Tier3, true) => "vision_qwen35_4b_mlx",
+        (Tier2 | Tier3, false) => "vision_qwen35_4b",
+    })
+}
+
+/// Recommend a text LLM pack. The current 3B Llama 3.2 ships across
+/// every supported tier (Tier 0 runs it slowly but functionally);
+/// future tier-specific variants land here. Returns `None` only if
+/// the tier opts out entirely.
+#[must_use]
+pub fn recommended_llm_pack(
+    _tier: kcreate_core::config::DeviceTier,
+    _platform: kcreate_core::config::Platform,
+) -> Option<&'static str> {
+    Some("llm_sidecar_3b")
+}
+
+/// Recommend an image-generation pack, or `None` when the device
+/// is below the Tier 2 + GPU gate. The model-manager UI calls this
+/// AFTER checking [`kcreate_core::config::RuntimeConfig::image_generation_allowed`];
+/// the function also returns `None` for sub-Tier-2 devices as a
+/// belt-and-braces check.
+#[must_use]
+pub fn recommended_generation_pack(
+    tier: kcreate_core::config::DeviceTier,
+    platform: kcreate_core::config::Platform,
+) -> Option<&'static str> {
+    if !tier.image_generation_allowed() {
+        return None;
+    }
+    if matches!(platform, kcreate_core::config::Platform::MacOsAppleSilicon) {
+        Some("image_gen_flux_klein_mlx")
+    } else {
+        Some("image_gen_flux_klein_4b")
+    }
 }
 
 /// Errors from [`install_model_pack`] / [`uninstall_model_pack`].
@@ -587,6 +844,8 @@ mod tests {
         let expected: Vec<&str> = vec![
             "bg_remove_threshold",
             "bg_remove_u2net",
+            "image_gen_flux_klein_4b",
+            "image_gen_flux_klein_mlx",
             "llm_sidecar_3b",
             "ocr_heuristic",
             "palette_kmeans",
@@ -594,6 +853,12 @@ mod tests {
             "smart_select_flood",
             "upscale_esrgan",
             "upscale_lanczos",
+            "vision_qwen35_4b",
+            "vision_qwen35_4b_mlx",
+            "vision_qwen35_4b_mmproj",
+            "vision_smolvlm2_256m",
+            "vision_smolvlm2_256m_mmproj",
+            "vision_smolvlm_256m_mlx",
         ];
         assert_eq!(got, expected, "pack id set drifted from canonical list");
     }
@@ -975,6 +1240,176 @@ mod tests {
         assert!(
             u2net.sha256.is_empty(),
             "unpinned pack must surface empty sha256 to the UI"
+        );
+    }
+
+    // ---- Phase 4 model-registry completeness tests (Task 27) ----
+
+    /// Every vision pack must declare the `vision` capability OR be
+    /// the mmproj companion (capability marker `mmproj`). Catches a
+    /// future contributor adding a vision model without the
+    /// capability tag the dispatcher uses to enumerate VLMs.
+    #[test]
+    fn vision_packs_declare_vision_or_mmproj_capability() {
+        let dir = tempfile::tempdir().unwrap();
+        for p in list_model_packs(dir.path())
+            .into_iter()
+            .filter(|p| p.category == ModelPackCategory::Vision)
+        {
+            assert!(
+                p.capabilities
+                    .iter()
+                    .any(|c| c == "vision" || c == "mmproj"),
+                "vision-category pack {} must declare `vision` or `mmproj`",
+                p.id,
+            );
+        }
+    }
+
+    /// Generation packs must declare the `image_generation` capability
+    /// so the diffusion sidecar selector can find them.
+    #[test]
+    fn generation_packs_declare_image_generation_capability() {
+        let dir = tempfile::tempdir().unwrap();
+        for p in list_model_packs(dir.path())
+            .into_iter()
+            .filter(|p| p.category == ModelPackCategory::Generation)
+        {
+            assert!(
+                p.capabilities.iter().any(|c| c == "image_generation"),
+                "generation pack {} must declare `image_generation`",
+                p.id,
+            );
+        }
+    }
+
+    /// `mmproj_for` must resolve to a pack id that exists in
+    /// `static_packs()`. Otherwise the sidecar dispatcher would
+    /// silently fail to find the projector file.
+    #[test]
+    fn mmproj_for_targets_resolve_to_real_packs() {
+        let dir = tempfile::tempdir().unwrap();
+        let ids: Vec<String> = list_model_packs(dir.path())
+            .into_iter()
+            .map(|p| p.id)
+            .collect();
+        for parent in ["vision_smolvlm2_256m", "vision_qwen35_4b"] {
+            let mmproj_id =
+                mmproj_for(parent).unwrap_or_else(|| panic!("mmproj_for({parent}) returned None"));
+            assert!(
+                ids.iter().any(|i| i == mmproj_id),
+                "mmproj pack id {mmproj_id} (for {parent}) is not in static_packs",
+            );
+        }
+    }
+
+    /// Tier-pack size policy: every vision pack must fit within
+    /// `vision_model_max_mb` for the tier that recommends it. If
+    /// `recommended_vision_pack` returns a pack that exceeds the
+    /// tier ceiling, the install button would always be disabled —
+    /// a UX regression worth catching at compile-test time.
+    #[test]
+    fn recommended_vision_pack_fits_under_tier_cap() {
+        use kcreate_core::config::{DeviceTier, Platform};
+        let dir = tempfile::tempdir().unwrap();
+        let packs = list_model_packs(dir.path());
+        for tier in [
+            DeviceTier::Tier0,
+            DeviceTier::Tier1,
+            DeviceTier::Tier2,
+            DeviceTier::Tier3,
+        ] {
+            for platform in [Platform::LinuxX64, Platform::MacOsAppleSilicon] {
+                let Some(id) = recommended_vision_pack(tier, platform) else {
+                    continue;
+                };
+                let pack = packs
+                    .iter()
+                    .find(|p| p.id == id)
+                    .unwrap_or_else(|| panic!("recommended pack {id} not in registry"));
+                let pack_mb = pack.size_bytes / (1024 * 1024);
+                let cap_mb = tier.vision_model_max_mb();
+                assert!(
+                    pack_mb <= cap_mb,
+                    "{id} ({pack_mb} MB) exceeds {tier:?} cap {cap_mb} MB on {platform:?}",
+                );
+            }
+        }
+    }
+
+    /// `recommended_generation_pack` must return `None` for any
+    /// tier that doesn't allow image generation. UI hard-gating
+    /// depends on this — a regression would surface generation
+    /// affordances on Tier 0 / 1 machines.
+    #[test]
+    fn recommended_generation_pack_respects_hard_gate() {
+        use kcreate_core::config::{DeviceTier, Platform};
+        assert_eq!(
+            recommended_generation_pack(DeviceTier::Tier0, Platform::LinuxX64),
+            None
+        );
+        assert_eq!(
+            recommended_generation_pack(DeviceTier::Tier1, Platform::LinuxX64),
+            None
+        );
+        assert_eq!(
+            recommended_generation_pack(DeviceTier::Tier1, Platform::MacOsAppleSilicon),
+            None
+        );
+        assert!(recommended_generation_pack(DeviceTier::Tier2, Platform::LinuxX64).is_some());
+        assert!(recommended_generation_pack(DeviceTier::Tier3, Platform::LinuxX64).is_some());
+    }
+
+    /// MLX recommendations must only fire on Apple Silicon — the
+    /// MLX runtime is x86-incompatible and the dispatcher would
+    /// reject it. Any drift here would produce a "nothing happens"
+    /// UX when a Linux user clicks "install recommended."
+    #[test]
+    fn mlx_recommendations_only_on_apple_silicon() {
+        use kcreate_core::config::{DeviceTier, Platform};
+        for tier in [
+            DeviceTier::Tier0,
+            DeviceTier::Tier1,
+            DeviceTier::Tier2,
+            DeviceTier::Tier3,
+        ] {
+            let linux = recommended_vision_pack(tier, Platform::LinuxX64).unwrap();
+            assert!(
+                !linux.ends_with("_mlx"),
+                "Linux must not recommend an MLX pack: tier={tier:?} got {linux}",
+            );
+            let mac = recommended_vision_pack(tier, Platform::MacOsAppleSilicon).unwrap();
+            assert!(
+                mac.ends_with("_mlx"),
+                "Apple Silicon must recommend an MLX pack: tier={tier:?} got {mac}",
+            );
+        }
+    }
+
+    /// `ModelPackCategory` wire format must stay in sync with
+    /// `apps/desktop/shared/scene.ts`'s union. Every variant has to
+    /// serialize to the snake_case string the TS layer expects.
+    #[test]
+    fn category_serde_matches_typescript_wire_format() {
+        assert_eq!(
+            serde_json::to_string(&ModelPackCategory::Vision).unwrap(),
+            "\"vision\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ModelPackCategory::Generation).unwrap(),
+            "\"generation\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ModelPackCategory::Core).unwrap(),
+            "\"core\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ModelPackCategory::ImagePro).unwrap(),
+            "\"image_pro\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ModelPackCategory::DesignPro).unwrap(),
+            "\"design_pro\""
         );
     }
 }

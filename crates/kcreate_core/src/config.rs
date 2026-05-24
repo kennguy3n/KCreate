@@ -90,6 +90,44 @@ impl DeviceTier {
             Self::Tier3 => 4096,
         }
     }
+
+    /// Whether the tier may run a vision (multimodal) model at all.
+    /// We allow vision on every tier because the smallest VLM we
+    /// ship (SmolVLM-256M Q4) runs on a 4 GB Tier 0 laptop —
+    /// `vision_model_max_mb` is the real knob; this method is the
+    /// hard gate. Always `true` today, kept as a method so future
+    /// tier additions (e.g. an embedded-device tier) can opt out.
+    #[must_use]
+    pub const fn vision_model_allowed(self) -> bool {
+        true
+    }
+
+    /// Maximum vision-model size (MB) the tier will load. The
+    /// vision ceilings are independent of the text-LLM ceilings
+    /// (`default_max_model_mb`) because VLMs are typically smaller
+    /// per-param than equivalent text models and benefit more from
+    /// streaming inference. Tier 0 caps at 500 MB so SmolVLM
+    /// (~180 MB) fits but a 4-bit 4B VLM (~2.5 GB) doesn't.
+    #[must_use]
+    pub const fn vision_model_max_mb(self) -> u64 {
+        match self {
+            Self::Tier0 => 500,
+            Self::Tier1 => 2_000,
+            Self::Tier2 => 5_000,
+            Self::Tier3 => 8_000,
+        }
+    }
+
+    /// Whether the tier may load a diffusion (image generation)
+    /// model. Diffusion is a HARD gate at Tier 2+ — the UI must
+    /// hide the generation panel entirely below this tier, not just
+    /// disable it. Note this is the *tier-only* part of the policy;
+    /// the full check (`RuntimeConfig::image_generation_allowed`)
+    /// additionally requires `gpu_available`.
+    #[must_use]
+    pub const fn image_generation_allowed(self) -> bool {
+        matches!(self, Self::Tier2 | Self::Tier3)
+    }
 }
 
 /// Operating system + CPU architecture combination `KCreate` supports.
@@ -224,6 +262,42 @@ impl RuntimeConfig {
     #[must_use]
     pub const fn gpu_rendering_allowed(&self) -> bool {
         self.gpu_available && self.device_tier.gpu_rendering_allowed() && !self.low_resource_mode
+    }
+
+    /// Image generation (diffusion) is allowed when the tier permits
+    /// it AND a GPU is available AND low-resource mode is off. This
+    /// is the hard gate the UI consults to decide whether to render
+    /// the image-generation panel at all — Tier 0 / 1 users (and
+    /// Tier 2 users without GPU) must not see the panel.
+    ///
+    /// Local-first: this method never reaches over the network; the
+    /// answer is derived from the cached `RuntimeConfig` only.
+    #[must_use]
+    pub const fn image_generation_allowed(&self) -> bool {
+        self.gpu_available && self.device_tier.image_generation_allowed() && !self.low_resource_mode
+    }
+
+    /// Whether a vision model may run on this host. Currently
+    /// equivalent to `DeviceTier::vision_model_allowed` but routed
+    /// through `RuntimeConfig` so future overrides (e.g. a global
+    /// "no AI features" preference) can land here without touching
+    /// the tier policy.
+    #[must_use]
+    pub const fn vision_model_allowed(&self) -> bool {
+        self.device_tier.vision_model_allowed()
+    }
+
+    /// Effective vision-model size ceiling (MB). Distinct from
+    /// `effective_max_model_mb` because vision models have their
+    /// own per-tier table. Low-resource mode halves the budget.
+    #[must_use]
+    pub fn effective_vision_model_mb(&self) -> u64 {
+        let base = self.device_tier.vision_model_max_mb();
+        if self.low_resource_mode {
+            (base / 2).max(128)
+        } else {
+            base
+        }
     }
 
     /// Flip the low-resource flag in place. Tier 0 always stays at
@@ -546,5 +620,104 @@ mod tests {
         assert_eq!(cfg.device_tier, DeviceTier::Tier0);
         cfg.max_undo_depth = 4;
         assert!(cfg.effective_undo_depth() >= 8);
+    }
+
+    /// Image generation is a HARD gate: Tier 0 / Tier 1 must never
+    /// return `true`, and Tier 2 returns `true` only with a GPU.
+    /// This is the contract the renderer UI relies on to hide the
+    /// generation panel entirely below the gate (not just disable
+    /// it), so a regression here would silently surface generation
+    /// affordances on under-spec'd machines.
+    #[test]
+    fn image_generation_allowed_tier_matrix() {
+        // Tier 0 (4 GB, no GPU): never allowed.
+        let t0 = cfg_for(4, false);
+        assert_eq!(t0.device_tier, DeviceTier::Tier0);
+        assert!(!t0.image_generation_allowed());
+        assert!(!t0.device_tier.image_generation_allowed());
+
+        // Tier 1 (8 GB, no GPU): never allowed (no GPU on this build).
+        let t1_no_gpu = cfg_for(8, false);
+        assert_eq!(t1_no_gpu.device_tier, DeviceTier::Tier1);
+        assert!(!t1_no_gpu.image_generation_allowed());
+        assert!(!t1_no_gpu.device_tier.image_generation_allowed());
+
+        // Tier 1 (8 GB, with GPU): tier still says no.
+        let t1_gpu = cfg_for(8, true);
+        assert_eq!(t1_gpu.device_tier, DeviceTier::Tier1);
+        assert!(!t1_gpu.image_generation_allowed());
+        assert!(!t1_gpu.device_tier.image_generation_allowed());
+
+        // Tier 2 (16 GB, GPU): allowed.
+        let t2_gpu = cfg_for(16, true);
+        assert_eq!(t2_gpu.device_tier, DeviceTier::Tier2);
+        assert!(t2_gpu.image_generation_allowed());
+        assert!(t2_gpu.device_tier.image_generation_allowed());
+
+        // Tier 2 -> downgraded to Tier 1 without GPU is what
+        // `from_system_info` does, so we can't construct a "Tier 2
+        // without GPU" via cfg_for. The unit test below covers the
+        // tier-level guard directly.
+
+        // Tier 3 (32 GB, GPU): allowed.
+        let t3 = cfg_for(32, true);
+        assert_eq!(t3.device_tier, DeviceTier::Tier3);
+        assert!(t3.image_generation_allowed());
+    }
+
+    /// The tier-level `image_generation_allowed` must remain
+    /// independent of GPU availability so callers can layer the
+    /// GPU check in `RuntimeConfig` separately. If a future tier
+    /// matrix needs to opt out of generation regardless of GPU,
+    /// this is the single place to do it.
+    #[test]
+    fn image_generation_tier_gate_ignores_gpu() {
+        assert!(!DeviceTier::Tier0.image_generation_allowed());
+        assert!(!DeviceTier::Tier1.image_generation_allowed());
+        assert!(DeviceTier::Tier2.image_generation_allowed());
+        assert!(DeviceTier::Tier3.image_generation_allowed());
+    }
+
+    /// Low-resource mode + a Tier 2 box must still hide image
+    /// generation: low-resource is a user-controlled override and
+    /// the surrounding policy treats it as "I do not want heavy AI
+    /// running right now."
+    #[test]
+    fn image_generation_blocked_in_low_resource_mode() {
+        let mut cfg = cfg_for(16, true);
+        assert_eq!(cfg.device_tier, DeviceTier::Tier2);
+        assert!(cfg.image_generation_allowed());
+        cfg.set_low_resource(true);
+        assert!(!cfg.image_generation_allowed());
+    }
+
+    /// Vision is available on every tier — the workload differs
+    /// (SmolVLM on Tier 0, Qwen-VL on Tier 2+) but the gate is
+    /// always open.
+    #[test]
+    fn vision_allowed_on_every_tier() {
+        for t in [
+            DeviceTier::Tier0,
+            DeviceTier::Tier1,
+            DeviceTier::Tier2,
+            DeviceTier::Tier3,
+        ] {
+            assert!(t.vision_model_allowed(), "{t:?} should allow vision");
+            assert!(t.vision_model_max_mb() >= 180, "{t:?} must fit SmolVLM");
+        }
+    }
+
+    /// Vision-model ceilings must be monotonic across tiers — a
+    /// regression that made Tier 1 smaller than Tier 0 would be a
+    /// silent policy bug.
+    #[test]
+    fn vision_model_caps_are_monotonic() {
+        let t0 = DeviceTier::Tier0.vision_model_max_mb();
+        let t1 = DeviceTier::Tier1.vision_model_max_mb();
+        let t2 = DeviceTier::Tier2.vision_model_max_mb();
+        let t3 = DeviceTier::Tier3.vision_model_max_mb();
+        assert!(t0 <= t1);
+        assert!(t1 <= t2);
+        assert!(t2 <= t3);
     }
 }

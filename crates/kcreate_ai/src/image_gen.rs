@@ -425,8 +425,16 @@ pub fn generate_image(port: u16, req: &ImageGenRequest) -> ImageGenResult<Genera
         .set("Content-Type", "application/json")
         .send_string(&body)
         .map_err(map_ureq_error)?;
-    if resp.status() != 200 {
-        let status = resp.status();
+    // ureq 2.x surfaces 4xx/5xx as `Err(ureq::Error::Status)` so
+    // reaching `Ok(resp)` already guarantees a 2xx — but the
+    // diffusion server could in principle return `201 Created` or
+    // a `204 No Content` on a future endpoint shape, and a strict
+    // `== 200` check would then swallow the response body as an
+    // empty JSON parse error. Accept any 2xx instead; treat the
+    // (presently unreachable) non-2xx success codes as protocol
+    // errors with the status preserved.
+    let status = resp.status();
+    if !(200..300).contains(&status) {
         let body = resp.into_string().unwrap_or_default();
         return Err(ImageGenError::Status { status, body });
     }

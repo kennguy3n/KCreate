@@ -77,20 +77,32 @@ const USER_PROMPT: &str = "Extract a brand profile from this image as \
 /// GBNF grammar for the brand-extraction JSON shape. Constrains the
 /// VLM so the response is guaranteed-parseable JSON of the form:
 /// `{"colors":["#xxxxxx"...],"fonts":["..."...],"spacing":[12.0,...]}`.
+///
+/// Portability note: the grammar deliberately avoids `{N,M}`
+/// bounded repetition. llama.cpp's `grammar-parser.cpp` has
+/// supported it for a long time, but other GBNF consumers
+/// (`mlx-lm.server`, some forks, and any future sidecar that
+/// implements its own parser) only guarantee `*`, `+`, and `?`.
+/// Array length caps are expressed as a chain of optional groups
+/// (`(ws "," ws item)?` repeated N-1 times) which is exactly
+/// equivalent to `(ws "," ws item){0,N-1}` and works on every
+/// known grammar parser. String length caps are dropped in favour
+/// of `max_tokens` on the chat request (set per-call site so the
+/// VLM can't generate runaway strings).
 pub const BRAND_EXTRACTION_GRAMMAR: &str = r##"
 root ::= "{" ws "\"colors\"" ws ":" ws color-array ws "," ws
          "\"fonts\"" ws ":" ws string-array ws "," ws
          "\"spacing\"" ws ":" ws number-array ws "}"
 
-color-array  ::= "[" ws (color (ws "," ws color){0,5})? ws "]"
+color-array  ::= "[" ws (color (ws "," ws color)? (ws "," ws color)? (ws "," ws color)? (ws "," ws color)? (ws "," ws color)?)? ws "]"
 color        ::= "\"#" hex hex hex hex hex hex "\""
 hex          ::= [0-9a-f]
 
-string-array ::= "[" ws (string (ws "," ws string){0,3})? ws "]"
-string       ::= "\"" ([^"\\] | "\\" .){1,64} "\""
+string-array ::= "[" ws (string (ws "," ws string)? (ws "," ws string)? (ws "," ws string)?)? ws "]"
+string       ::= "\"" ([^"\\] | "\\" .)+ "\""
 
-number-array ::= "[" ws (number (ws "," ws number){0,5})? ws "]"
-number       ::= "-"? ("0" | [1-9] [0-9]{0,3}) ("." [0-9]{1,2})?
+number-array ::= "[" ws (number (ws "," ws number)? (ws "," ws number)? (ws "," ws number)? (ws "," ws number)? (ws "," ws number)?)? ws "]"
+number       ::= "-"? ("0" | [1-9] [0-9]? [0-9]? [0-9]?) ("." [0-9] [0-9]?)?
 
 ws ::= [ \t\n]*
 "##;
@@ -154,5 +166,53 @@ mod tests {
         assert!(s.contains("\"colors\""));
         assert!(s.contains("\"fonts\""));
         assert!(s.contains("\"spacing\""));
+    }
+
+    /// Portability: none of the VLM-facing grammars may use `{N}`,
+    /// `{N,}`, or `{N,M}` bounded repetition. llama.cpp supports
+    /// it, but other GBNF consumers (mlx-lm.server, third-party
+    /// forks, and any future sidecar that brings its own parser)
+    /// only guarantee `*`, `+`, and `?`. Past Devin Review feedback
+    /// flagged the previous `{0,N}` syntax as portability-brittle;
+    /// this test pins the contract so a future grammar edit that
+    /// reintroduces bounded repetition fails CI instead of failing
+    /// silently when a user runs an older sidecar build.
+    #[test]
+    fn vlm_grammars_avoid_bounded_repetition() {
+        // (name, grammar) pairs for every VLM-facing GBNF in the
+        // crate. Keep this list in sync with the modules that
+        // declare a `pub const *_GRAMMAR`.
+        let grammars: &[(&str, &str)] = &[
+            ("BRAND_EXTRACTION_GRAMMAR", BRAND_EXTRACTION_GRAMMAR),
+            (
+                "DESIGN_TOKEN_GRAMMAR",
+                crate::design_tokens_vlm::DESIGN_TOKEN_GRAMMAR,
+            ),
+            ("CROP_GRAMMAR", crate::smart_crop::CROP_GRAMMAR),
+            ("STYLE_GRAMMAR", crate::style_describe::STYLE_GRAMMAR),
+            (
+                "REFINE_GRAMMAR",
+                crate::screenshot_to_layout::REFINE_GRAMMAR,
+            ),
+        ];
+        // Hand-rolled scan instead of a regex dep: matches `{N`,
+        // `{N,`, and `{N,M}` (the three forms of bounded
+        // repetition). False positives are tolerable here — the
+        // grammars never legitimately need `{`.
+        for (name, grammar) in grammars {
+            let bytes = grammar.as_bytes();
+            for (i, &b) in bytes.iter().enumerate() {
+                let is_bounded = b == b'{'
+                    && i + 1 < bytes.len()
+                    && bytes[i + 1].is_ascii_digit();
+                assert!(
+                    !is_bounded,
+                    "{name} uses bounded repetition near byte {i}: `{snippet}` — \
+                     use `*`, `+`, or `?` chains instead (see the \
+                     portability note on `BRAND_EXTRACTION_GRAMMAR`)",
+                    snippet = &grammar[i.saturating_sub(8)..(i + 8).min(grammar.len())],
+                );
+            }
+        }
     }
 }

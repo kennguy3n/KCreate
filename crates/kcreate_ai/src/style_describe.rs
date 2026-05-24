@@ -66,14 +66,20 @@ const USER_PROMPT: &str = "Describe this image's style as JSON with: \
     (adjectives), layout (adjectives).";
 
 /// GBNF grammar — accepts the 4-field [`StyleDescription`] shape.
+///
+/// Portability note: see `brand_extract::BRAND_EXTRACTION_GRAMMAR`
+/// — the 4-tag arrays use a 3-tail optional chain instead of
+/// `{0,3}` bounded repetition, and string length is bounded by
+/// `max_tokens` on the chat request rather than by `{1,200}` in
+/// the grammar so the grammar parses on every known GBNF consumer.
 pub const STYLE_GRAMMAR: &str = r#"
 root        ::= "{" ws "\"summary\"" ws ":" ws string ws "," ws
                 "\"colorMood\"" ws ":" ws tag-array ws "," ws
                 "\"typography\"" ws ":" ws tag-array ws "," ws
                 "\"layout\"" ws ":" ws tag-array ws "}"
 
-tag-array   ::= "[" ws (string (ws "," ws string){0,3})? ws "]"
-string      ::= "\"" ([^"\\] | "\\" .){1,200} "\""
+tag-array   ::= "[" ws (string (ws "," ws string)? (ws "," ws string)? (ws "," ws string)?)? ws "]"
+string      ::= "\"" ([^"\\] | "\\" .)+ "\""
 ws          ::= [ \t\n]*
 "#;
 

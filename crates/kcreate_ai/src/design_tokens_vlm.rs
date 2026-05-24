@@ -67,20 +67,27 @@ const USER_PROMPT: &str = "Suggest a design-token set as JSON with: \
     typography (size/leading labels, largest first).";
 
 /// GBNF grammar for the [`DesignTokenSuggestion`] JSON shape.
+///
+/// Portability note: see `brand_extract::BRAND_EXTRACTION_GRAMMAR`
+/// — array length caps use `(item)?` chains instead of `{0,N}`
+/// bounded repetition so the grammar parses on every known GBNF
+/// consumer. The 8-item arrays (1 head + 7 tails) cap each list
+/// at 8 entries, matching the previous `(ws "," ws item){0,7}`
+/// behaviour exactly.
 pub const DESIGN_TOKEN_GRAMMAR: &str = r##"
 root          ::= "{" ws "\"spacing\"" ws ":" ws number-array ws "," ws
                   "\"colors\"" ws ":" ws color-array ws "," ws
                   "\"typography\"" ws ":" ws string-array ws "}"
 
-number-array  ::= "[" ws (number (ws "," ws number){0,7})? ws "]"
-number        ::= "-"? ("0" | [1-9] [0-9]{0,3}) ("." [0-9]{1,2})?
+number-array  ::= "[" ws (number (ws "," ws number)? (ws "," ws number)? (ws "," ws number)? (ws "," ws number)? (ws "," ws number)? (ws "," ws number)? (ws "," ws number)?)? ws "]"
+number        ::= "-"? ("0" | [1-9] [0-9]? [0-9]? [0-9]?) ("." [0-9] [0-9]?)?
 
-color-array   ::= "[" ws (color (ws "," ws color){0,7})? ws "]"
+color-array   ::= "[" ws (color (ws "," ws color)? (ws "," ws color)? (ws "," ws color)? (ws "," ws color)? (ws "," ws color)? (ws "," ws color)? (ws "," ws color)?)? ws "]"
 color         ::= "\"#" hex hex hex hex hex hex "\""
 hex           ::= [0-9a-f]
 
-string-array  ::= "[" ws (string (ws "," ws string){0,7})? ws "]"
-string        ::= "\"" ([^"\\] | "\\" .){1,40} "\""
+string-array  ::= "[" ws (string (ws "," ws string)? (ws "," ws string)? (ws "," ws string)? (ws "," ws string)? (ws "," ws string)? (ws "," ws string)? (ws "," ws string)?)? ws "]"
+string        ::= "\"" ([^"\\] | "\\" .)+ "\""
 
 ws            ::= [ \t\n]*
 "##;

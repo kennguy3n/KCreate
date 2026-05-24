@@ -99,6 +99,12 @@ const SYSTEM_PROMPT: &str = "You are an image-cropping assistant. \
 
 /// GBNF grammar that constrains the VLM's reply to a JSON object
 /// of the [`CropSuggestion`] shape.
+///
+/// Portability note: see `brand_extract::BRAND_EXTRACTION_GRAMMAR`
+/// — bounded repetition `[0-9]{1,4}` is replaced with an explicit
+/// optional-digit chain so the grammar parses on every known GBNF
+/// consumer (including parsers that only implement `*`, `+`, and
+/// `?`).
 pub const CROP_GRAMMAR: &str = r#"
 root       ::= "{" ws "\"x\"" ws ":" ws number ws "," ws
                "\"y\"" ws ":" ws number ws "," ws
@@ -106,7 +112,8 @@ root       ::= "{" ws "\"x\"" ws ":" ws number ws "," ws
                "\"h\"" ws ":" ws number ws "," ws
                "\"confidence\"" ws ":" ws number ws "}"
 
-number ::= ("0" ("." [0-9]{1,4})? | "1" ("." [0-9]{1,4})?)
+number ::= ("0" frac? | "1" frac?)
+frac   ::= "." [0-9] [0-9]? [0-9]? [0-9]?
 ws     ::= [ \t\n]*
 "#;
 

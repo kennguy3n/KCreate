@@ -756,4 +756,51 @@ mod tests {
             let _ = format!("{r:?}");
         }
     }
+
+    /// Wire-format lockstep (AGENTS.md §4): `GeneratedImagePayload`
+    /// must serialise its `png_b64` field as `pngB64`, matching the
+    /// TypeScript mirror `GeneratedImage.pngB64` in
+    /// `apps/desktop/shared/scene.ts` and the `ImageGenPanel.tsx`
+    /// `result.pngB64` access. If a future Rust edit drops the
+    /// `#[serde(rename_all = "camelCase")]` attribute or renames
+    /// the field, the renderer would silently see `undefined` and
+    /// crash inside `atob(undefined)` at runtime. This test pins
+    /// the contract so the breakage is caught at `cargo test` time.
+    #[test]
+    fn generated_image_payload_wire_format_is_camelcase() {
+        let payload = GeneratedImagePayload {
+            width: 512,
+            height: 512,
+            png_b64: "iVBORw0KGgo=".to_string(),
+        };
+        let json = serde_json::to_string(&payload).unwrap();
+        // Positive: every field must surface under its camelCase
+        // wire name.
+        assert!(
+            json.contains("\"pngB64\":\"iVBORw0KGgo=\""),
+            "expected `pngB64` in wire JSON, got: {json}"
+        );
+        assert!(
+            json.contains("\"width\":512"),
+            "expected `width` in wire JSON, got: {json}"
+        );
+        assert!(
+            json.contains("\"height\":512"),
+            "expected `height` in wire JSON, got: {json}"
+        );
+        // Negative: the Rust-side `snake_case` field name must
+        // NOT appear on the wire. A regression that drops the
+        // rename attribute would leak `png_b64` here.
+        assert!(
+            !json.contains("png_b64"),
+            "snake_case field name leaked to the wire: {json}"
+        );
+        // Round-trip: re-parse the JSON and confirm every field
+        // survives — guards against a future asymmetric rename
+        // (e.g. someone sets `rename` only on serialize).
+        let back: GeneratedImagePayload = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.width, 512);
+        assert_eq!(back.height, 512);
+        assert_eq!(back.png_b64, "iVBORw0KGgo=");
+    }
 }

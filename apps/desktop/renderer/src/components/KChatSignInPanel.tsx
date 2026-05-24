@@ -548,6 +548,44 @@ function TrustedIssuersSection({
   const [pendingPk, setPendingPk] = useState("");
   const [pendingLabel, setPendingLabel] = useState("");
   const [adding, setAdding] = useState(false);
+  // Per-issuer in-flight set for Remove. Rust serialises the actual
+  // mutations behind the trust-store mutex, so multiple removes
+  // converge correctly even without this guard — but spamming Remove
+  // would otherwise let the user fire N parallel bridge calls and
+  // see intermediate states flash through the list as each one
+  // resolves. Tracking pending removals per-pubkey lets us disable
+  // just the matching button (so the user can still remove a
+  // different issuer while one is in flight) instead of locking the
+  // whole section.
+  const [removingPks, setRemovingPks] = useState<ReadonlySet<string>>(
+    () => new Set(),
+  );
+  const handleRemove = useCallback(
+    async (issuerPublicKey: string): Promise<void> => {
+      setRemovingPks((prev) => {
+        const next = new Set(prev);
+        next.add(issuerPublicKey);
+        return next;
+      });
+      try {
+        await onRemove(issuerPublicKey);
+      } catch {
+        // Same swallow rationale as `handleSubmit`: the parent
+        // surfaces the error via `trustedIssuersError` and we just
+        // want to release the per-row in-flight flag.
+      } finally {
+        setRemovingPks((prev) => {
+          if (!prev.has(issuerPublicKey)) {
+            return prev;
+          }
+          const next = new Set(prev);
+          next.delete(issuerPublicKey);
+          return next;
+        });
+      }
+    },
+    [onRemove],
+  );
   const canAdd =
     pendingPk.trim().length > 0 && pendingLabel.trim().length > 0 && !adding;
   const handleSubmit = useCallback(async (): Promise<void> => {
@@ -593,24 +631,28 @@ function TrustedIssuersSection({
       </p>
       {issuers.length > 0 ? (
         <ul style={trustListStyle}>
-          {issuers.map((issuer) => (
-            <li key={issuer.issuerPublicKey} style={trustListItemStyle}>
-              <div style={trustListItemBodyStyle}>
-                <strong>{issuer.label}</strong>
-                <code style={codeStyle}>{issuer.issuerPublicKey}</code>
-                <span style={hintStyle}>added {issuer.addedAt}</span>
-              </div>
-              <button
-                type="button"
-                onClick={() => {
-                  void onRemove(issuer.issuerPublicKey);
-                }}
-                style={secondaryButtonStyle(false)}
-              >
-                Remove
-              </button>
-            </li>
-          ))}
+          {issuers.map((issuer) => {
+            const isRemoving = removingPks.has(issuer.issuerPublicKey);
+            return (
+              <li key={issuer.issuerPublicKey} style={trustListItemStyle}>
+                <div style={trustListItemBodyStyle}>
+                  <strong>{issuer.label}</strong>
+                  <code style={codeStyle}>{issuer.issuerPublicKey}</code>
+                  <span style={hintStyle}>added {issuer.addedAt}</span>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => {
+                    void handleRemove(issuer.issuerPublicKey);
+                  }}
+                  disabled={isRemoving}
+                  style={secondaryButtonStyle(isRemoving)}
+                >
+                  {isRemoving ? "Removing…" : "Remove"}
+                </button>
+              </li>
+            );
+          })}
         </ul>
       ) : null}
       <label style={labelStyle}>

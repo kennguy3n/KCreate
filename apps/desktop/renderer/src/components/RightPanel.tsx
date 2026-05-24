@@ -563,9 +563,21 @@ function FillSection({
   // selected node never refired the fetch and the panel showed
   // pre-undo data — see PR #12 Devin Review thread on
   // RightPanel.tsx:549.
+  //
+  // Stale-while-revalidate: we deliberately do NOT reset the local
+  // state to `loading` on every refire. If we already have a
+  // `loaded` fill, keep showing it while the new fetch is in flight;
+  // only fall back to the spinner when we have nothing better to
+  // show (i.e. on the very first hydrate, or after an `error`). This
+  // closes the brief "Loading…" flash after undo/redo that the bot
+  // flagged on RightPanel.tsx:566 — the optimistic-commit case
+  // (`commit()` already wrote into `loaded`) and the undo/redo case
+  // (the new value is on its way) are now visually identical.
   useEffect(() => {
     let cancelled = false;
-    setState({ status: "loading" });
+    setState((prev) =>
+      prev.status === "loaded" ? prev : { status: "loading" },
+    );
     void (async () => {
       try {
         const next = await window.kcreate.document.nodeFill(node.id);

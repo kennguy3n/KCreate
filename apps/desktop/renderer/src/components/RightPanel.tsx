@@ -912,7 +912,7 @@ function GradientFillEditor({
       ) : (
         <RadialGradientGeometry
           center={fill.center}
-          radius={fill.radius}
+          gradientRadius={fill.radius}
           onCommit={(center, radius) =>
             onCommit({
               kind: "gradient",
@@ -1166,13 +1166,20 @@ function LinearGradientEndpoints({
 /// Centre + radius radial gradient geometry editor. Like
 /// `LinearGradientEndpoints`, coordinates are normalised to the
 /// node bounds.
+///
+/// Prop is named `gradientRadius` rather than `radius` to avoid
+/// shadowing the file-level `radius` styling token imported from
+/// `../styles/tokens` (used elsewhere in this file for
+/// `borderRadius: radius.pill` etc). The component body doesn't
+/// reach for the token, but the rename keeps future editors from
+/// being surprised when they try to use it inside this function.
 function RadialGradientGeometry({
   center,
-  radius,
+  gradientRadius,
   onCommit,
 }: {
   center: Point2D;
-  radius: number;
+  gradientRadius: number;
   onCommit: (center: Point2D, radius: number) => void;
 }): JSX.Element {
   return (
@@ -1181,19 +1188,19 @@ function RadialGradientGeometry({
         <Row>
           <NumberStub
             value={center.x}
-            onChange={(v) => onCommit({ x: v, y: center.y }, radius)}
+            onChange={(v) => onCommit({ x: v, y: center.y }, gradientRadius)}
             ariaLabel="Centre X"
           />
           <NumberStub
             value={center.y}
-            onChange={(v) => onCommit({ x: center.x, y: v }, radius)}
+            onChange={(v) => onCommit({ x: center.x, y: v }, gradientRadius)}
             ariaLabel="Centre Y"
           />
         </Row>
       </Field>
       <Field label="Radius">
         <NumberStub
-          value={radius}
+          value={gradientRadius}
           onChange={(v) => onCommit(center, v)}
           ariaLabel="Radius"
         />

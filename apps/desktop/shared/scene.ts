@@ -1195,7 +1195,8 @@ export type PreflightCheckId =
   | "page_size"
   | "shading"
   | "font_glyph_coverage"
-  | "total_ink_coverage";
+  | "total_ink_coverage"
+  | "bleed_area_empty";
 
 export interface PreflightIssue {
   check: PreflightCheckId;
@@ -1209,7 +1210,29 @@ export type PreflightColorSpaceTarget = "cmyk" | "rgb";
 
 export interface PreflightOptions {
   targetDpi: number;
+  /**
+   * Hard minimum DPI for raster images — anything below this is
+   * an `image_resolution` Error ("unrecoverable"), anything between
+   * the floor and `targetDpi` is a Warning, anything above is
+   * silent. When `0` (the default), the floor is inferred from
+   * `targetColorSpace`: 150 DPI for `cmyk` (press soft-proof
+   * minimum), 72 DPI for `rgb` (screen baseline). Set explicitly
+   * to override (e.g. 240 for a high-end commercial run, 96 for
+   * low-res draft proofs). Use `0` rather than `null` so the
+   * Rust-side `serde_json` round-trip stays simple (the Rust
+   * struct uses `0.0` as the deny-by-default sentinel because
+   * non-finite floats are not JSON-encodable).
+   */
+  imageDpiFloor: number;
   requireBleedMm: number;
+  /**
+   * Whether to raise a `bleed_area_empty` warning per uncovered
+   * side on artboards configured with bleed. Useful to turn off
+   * for documents containing a mix of press + screen artboards
+   * where the screen-only pages would otherwise generate noise.
+   * Defaults to `true`.
+   */
+  checkBleedAreaCoverage: boolean;
   allowTransparency: boolean;
   targetColorSpace: PreflightColorSpaceTarget;
   /**

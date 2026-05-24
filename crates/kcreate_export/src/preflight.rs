@@ -79,6 +79,17 @@ pub enum PreflightCheck {
     /// press. Configurable via
     /// [`PreflightOptions::target_total_ink_coverage`].
     TotalInkCoverage,
+    /// One of the four sides of an artboard with bleed configured
+    /// has no content covering the bleed strip. The print will
+    /// expose a white border on that side if the trim drifts. Fires
+    /// once per uncovered side (so a corner element that bleeds
+    /// only the top-left can still produce two issues for the
+    /// uncovered right and bottom sides). Distinct from
+    /// [`PreflightCheck::BleedMargin`]: that one is about a layer
+    /// touching the bleed zone *without* extending past the page
+    /// edge; this one is about the bleed strip having no covering
+    /// layer at all.
+    BleedAreaEmpty,
 }
 
 impl PreflightCheck {
@@ -95,6 +106,7 @@ impl PreflightCheck {
             Self::Shading => "shading",
             Self::FontGlyphCoverage => "font_glyph_coverage",
             Self::TotalInkCoverage => "total_ink_coverage",
+            Self::BleedAreaEmpty => "bleed_area_empty",
         }
     }
 }
@@ -127,10 +139,32 @@ pub enum ColorSpaceTarget {
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[serde(default, rename_all = "camelCase")]
 pub struct PreflightOptions {
-    /// Target resolution in dots per inch for raster images.
+    /// Ideal resolution in dots per inch for raster images. Rasters
+    /// at-or-above this DPI produce no issue; rasters between
+    /// [`image_dpi_floor`](Self::image_dpi_floor) and this value
+    /// produce a `Warning`; rasters below the floor produce an
+    /// `Error`.
     pub target_dpi: f64,
+    /// Hard minimum DPI for raster images. Anything below this is
+    /// considered unrecoverable for the current target and surfaces
+    /// as an `Error`. When `0.0` (the default), the floor is
+    /// inferred from [`target_color_space`](Self::target_color_space):
+    /// 150 DPI for `Cmyk` (a softproof on press still reads at 150;
+    /// below it visibly pixelates), 72 DPI for `Rgb` (anything
+    /// below is sub-screen-resolution). An explicit non-zero value
+    /// overrides the inference — e.g. set 240 for a high-end
+    /// commercial run, or 96 for low-res draft proofs.
+    pub image_dpi_floor: f64,
     /// Required bleed in millimetres beyond the page edge.
     pub require_bleed_mm: f64,
+    /// Whether to raise a `BleedAreaEmpty` issue for artboards
+    /// configured with bleed that have sides with no covering
+    /// content. Default `true` for press targets, but kept as a
+    /// toggle for users authoring screen-only artboards inside a
+    /// document with bleed (e.g. a landing-page mock alongside
+    /// brochure pages — the screen-only page shouldn't generate
+    /// noise about missing bleed coverage).
+    pub check_bleed_area_coverage: bool,
     /// Whether transparent / non-Normal blend layers are acceptable.
     pub allow_transparency: bool,
     /// Color space the output is being prepared for.
@@ -143,11 +177,44 @@ pub struct PreflightOptions {
     pub target_total_ink_coverage: f64,
 }
 
+impl PreflightOptions {
+    /// Resolve the effective image DPI floor used for the current
+    /// target. When [`image_dpi_floor`](Self::image_dpi_floor) is
+    /// 0.0 (the deny-by-default sentinel that means "infer"),
+    /// derives the floor from `target_color_space`. Otherwise
+    /// passes through the explicit value. Centralised here so the
+    /// check function and the UI hint stay in sync.
+    #[must_use]
+    pub fn effective_image_dpi_floor(&self) -> f64 {
+        if self.image_dpi_floor > 0.0 {
+            return self.image_dpi_floor;
+        }
+        match self.target_color_space {
+            // 150 DPI is the conventional "press soft-proof minimum":
+            // anything below visibly pixelates at viewing distance on
+            // a halftoned offset proof, and most short-run digital
+            // presses can't pull useful detail below it either.
+            ColorSpaceTarget::Cmyk => 150.0,
+            // 72 DPI is the historical screen DPI baseline. Below
+            // it, images render at sub-pixel resolution on any
+            // modern display and would have to be upscaled at
+            // export time anyway.
+            ColorSpaceTarget::Rgb => 72.0,
+        }
+    }
+}
+
 impl Default for PreflightOptions {
     fn default() -> Self {
         Self {
             target_dpi: 300.0,
+            // 0.0 = infer floor from target. Use a finite sentinel
+            // rather than `f64::NAN` / `f64::INFINITY` because the
+            // struct serialises to JSON across the bridge and
+            // non-finite floats break `serde_json::to_string`.
+            image_dpi_floor: 0.0,
             require_bleed_mm: 3.0,
+            check_bleed_area_coverage: true,
             allow_transparency: false,
             target_color_space: ColorSpaceTarget::Cmyk,
             target_total_ink_coverage: 3.0,
@@ -261,6 +328,17 @@ pub fn run_preflight(
                 check_node_image_resolution(node, page_id, &dims, options, &mut issues);
             }
         }
+        // Page-scoped check: runs once per page rather than per-node
+        // because the question ("is the bleed strip on side X covered
+        // by any content?") is a fold over all descendants.
+        check_page_bleed_area_coverage(
+            document,
+            page_id,
+            &dims,
+            &descendants,
+            options,
+            &mut issues,
+        );
     }
     issues
 }
@@ -496,8 +574,21 @@ fn check_node_font_embed(
 /// Image resolution check.
 ///
 /// Computes the effective DPI of each raster layer from its pixel
-/// dimensions and rendered size on the page, flagging anything below
-/// `target_dpi`.
+/// dimensions and rendered size on the page, comparing against both
+/// the [`PreflightOptions::target_dpi`] (ideal) and the
+/// [`PreflightOptions::image_dpi_floor`] (acceptable minimum,
+/// inferred from the target color space when 0.0). Severity ladder:
+///
+/// - `effective_dpi < floor`           → `Error`   (unrecoverable)
+/// - `floor <= effective_dpi < target` → `Warning` (soft proof OK,
+///   may visibly soften)
+/// - `effective_dpi >= target`         → silent (ideal)
+///
+/// Single issue per raster: severity is derived from the worst tier
+/// the layer falls into, so a layer at 100 DPI on a CMYK target with
+/// the default 150 floor emits one `Error`, not an `Error` + a
+/// `Warning`. The message includes both thresholds so the user
+/// understands the ladder.
 fn check_node_image_resolution(
     node: &Node,
     page_id: Uuid,
@@ -519,18 +610,130 @@ fn check_node_image_resolution(
     let dpi_x = f64::from(meta.width) / (display_w_mm / MM_PER_INCH);
     let dpi_y = f64::from(meta.height) / (display_h_mm / MM_PER_INCH);
     let effective_dpi = dpi_x.min(dpi_y);
-    if effective_dpi + 0.5 < options.target_dpi {
+    let floor = options.effective_image_dpi_floor();
+    // Half-DPI epsilon so a raster at exactly the target / floor
+    // (down to rounding) doesn't trip the check; matches the legacy
+    // single-threshold behaviour from before the floor was added.
+    let target = options.target_dpi;
+    if effective_dpi + 0.5 < floor {
         issues.push(PreflightIssue {
             check: PreflightCheck::ImageResolution,
             severity: PreflightSeverity::Error,
             message: format!(
-                "Raster layer '{name}' is {effective_dpi:.0} DPI (target {target:.0}). Use a larger source image or shrink the layer.",
+                "Raster layer '{name}' is {effective_dpi:.0} DPI, below the {floor:.0} DPI floor for this target (ideal {target:.0}). Use a larger source image or shrink the layer.",
                 name = node.name,
-                target = options.target_dpi,
             ),
             affected_node_id: Some(node.id),
             page_id: Some(page_id),
         });
+    } else if effective_dpi + 0.5 < target {
+        issues.push(PreflightIssue {
+            check: PreflightCheck::ImageResolution,
+            severity: PreflightSeverity::Warning,
+            message: format!(
+                "Raster layer '{name}' is {effective_dpi:.0} DPI, between the {floor:.0} DPI floor and the {target:.0} DPI ideal. The layer will print but may visibly soften.",
+                name = node.name,
+            ),
+            affected_node_id: Some(node.id),
+            page_id: Some(page_id),
+        });
+    }
+}
+
+/// Bleed-area coverage check.
+///
+/// For each artboard with a configured bleed, scan all content
+/// layers and ask: does *any* layer cover the bleed strip on the
+/// left / right / top / bottom side? A bleed strip is considered
+/// covered when at least one content layer's bounds extend from
+/// outside the outer bleed edge across the trim line, i.e. for the
+/// left side: `bounds.x <= -bleed_px + tolerance` AND
+/// `bounds.x + bounds.width >= -tolerance`. Uncovered sides emit a
+/// `Warning`. Empty pages (no content layers) are silent — the
+/// missing-bleed warning would be noise on a fresh document.
+///
+/// The check is page-scoped (one fold over descendants) rather than
+/// node-scoped because the question is about coverage gaps, not
+/// individual layer geometry. A separate `BleedMargin` check
+/// (`check_node_for_bleed`) covers the inverse case: a layer that
+/// touches the bleed zone but doesn't extend past the page edge.
+fn check_page_bleed_area_coverage(
+    document: &DocumentGraph,
+    page_id: Uuid,
+    dims: &PageDimensions,
+    descendants: &[Uuid],
+    options: &PreflightOptions,
+    issues: &mut Vec<PreflightIssue>,
+) {
+    // Half-pixel tolerance so a layer authored to land exactly on
+    // the outer bleed edge (i.e. `x = -bleed_px`) counts as covering
+    // the strip. Without it a layer placed by snapping to the bleed
+    // guide would still trip the warning, which would defeat the
+    // purpose.
+    const TOL: f64 = 0.5;
+
+    if !options.check_bleed_area_coverage {
+        return;
+    }
+    if dims.px_per_mm <= 0.0 || options.require_bleed_mm <= 0.0 {
+        return;
+    }
+    let bleed_px = options.require_bleed_mm * dims.px_per_mm;
+
+    let mut content_layers: Vec<&Node> = Vec::new();
+    for id in descendants {
+        let Some(node) = document.get_node(*id) else {
+            continue;
+        };
+        if is_content_layer(node.node_type) {
+            content_layers.push(node);
+        }
+    }
+    if content_layers.is_empty() {
+        return;
+    }
+
+    // For each side: does any content layer cover the entire bleed
+    // strip on that side? A layer "covers" the left bleed when its
+    // left edge sits at-or-past the outer bleed line (within TOL)
+    // AND its right edge crosses the trim line (within TOL). Mirror
+    // logic for the other three sides; the right / bottom variants
+    // additionally bound the inner edge so a layer that ONLY lives
+    // in the right-bleed strip but starts past the page edge still
+    // counts as covering.
+    let left_covered = content_layers
+        .iter()
+        .any(|n| n.bounds.x <= -bleed_px + TOL && n.bounds.x + n.bounds.width >= -TOL);
+    let right_covered = content_layers.iter().any(|n| {
+        n.bounds.x + n.bounds.width >= dims.width_px + bleed_px - TOL
+            && n.bounds.x <= dims.width_px + TOL
+    });
+    let top_covered = content_layers
+        .iter()
+        .any(|n| n.bounds.y <= -bleed_px + TOL && n.bounds.y + n.bounds.height >= -TOL);
+    let bottom_covered = content_layers.iter().any(|n| {
+        n.bounds.y + n.bounds.height >= dims.height_px + bleed_px - TOL
+            && n.bounds.y <= dims.height_px + TOL
+    });
+
+    for (covered, side) in [
+        (left_covered, "left"),
+        (right_covered, "right"),
+        (top_covered, "top"),
+        (bottom_covered, "bottom"),
+    ] {
+        if !covered {
+            issues.push(PreflightIssue {
+                check: PreflightCheck::BleedAreaEmpty,
+                severity: PreflightSeverity::Warning,
+                message: format!(
+                    "No content covers the {side} bleed strip ({bleed_mm:.1} mm). Trim drift will expose a white border on the {side} edge.",
+                    bleed_mm = options.require_bleed_mm,
+                ),
+                affected_node_id: None,
+                page_id: Some(page_id),
+            });
+        }
     }
 }
 
@@ -2023,5 +2226,272 @@ mod tests {
         }"#;
         let parsed: PreflightOptions = serde_json::from_str(legacy).expect("legacy parse");
         assert_eq!(parsed.target_total_ink_coverage, 3.0);
+    }
+
+    #[test]
+    fn preflight_options_serde_round_trip_includes_new_dpi_floor_and_bleed_coverage_fields() {
+        // Wire-format pin (AGENTS.md rule 4): the new fields added
+        // for Block A must survive the JSON round-trip the bridge
+        // does between the renderer and the preflight engine.
+        let opts = PreflightOptions::default();
+        let json = serde_json::to_string(&opts).expect("serialise default");
+        assert!(
+            json.contains("\"imageDpiFloor\":0.0"),
+            "expected camelCase imageDpiFloor field with sentinel 0.0, got: {json}",
+        );
+        assert!(
+            json.contains("\"checkBleedAreaCoverage\":true"),
+            "expected camelCase checkBleedAreaCoverage field defaulting to true, got: {json}",
+        );
+        let round: PreflightOptions = serde_json::from_str(&json).expect("round-trip");
+        assert_eq!(round.image_dpi_floor, 0.0);
+        assert!(round.check_bleed_area_coverage);
+
+        // Legacy payload missing the new fields must accept them as
+        // the defaults (serde `#[serde(default)]` on the struct).
+        // This keeps older clients producing valid requests.
+        let legacy = r#"{
+            "targetDpi": 300.0,
+            "requireBleedMm": 3.0,
+            "allowTransparency": false,
+            "targetColorSpace": "cmyk",
+            "targetTotalInkCoverage": 3.0
+        }"#;
+        let parsed: PreflightOptions = serde_json::from_str(legacy).expect("legacy parse");
+        assert_eq!(parsed.image_dpi_floor, 0.0);
+        assert!(parsed.check_bleed_area_coverage);
+    }
+
+    #[test]
+    fn effective_image_dpi_floor_infers_from_target_color_space() {
+        let cmyk = PreflightOptions::default();
+        assert_eq!(cmyk.effective_image_dpi_floor(), 150.0);
+        let rgb = PreflightOptions {
+            target_color_space: ColorSpaceTarget::Rgb,
+            ..PreflightOptions::default()
+        };
+        assert_eq!(rgb.effective_image_dpi_floor(), 72.0);
+        let explicit = PreflightOptions {
+            image_dpi_floor: 240.0,
+            ..PreflightOptions::default()
+        };
+        assert_eq!(explicit.effective_image_dpi_floor(), 240.0);
+    }
+
+    #[test]
+    fn medium_dpi_raster_emits_warning_not_error() {
+        // A raster between the floor (150 for CMYK default) and the
+        // target (300 default) should now Warn instead of Error.
+        // Set up the page so the effective DPI lands in this band.
+        let mut doc = DocumentGraph::new();
+        let page = page_with_layout(&mut doc, a4_layout(), a4_bounds());
+        let mut raster = Node::new(NodeType::RasterLayer, "softish");
+        raster.parent_id = Some(page);
+        // A4 portrait at 2480×3508 px ≈ 11.81 px/mm. Display the
+        // image at half page width: 1240 px wide ≈ 105 mm. A source
+        // of 825×1168 px gives 825 / (105 / 25.4) ≈ 200 DPI — between
+        // the 150 floor and the 300 target.
+        raster.bounds = Bounds::new(0.0, 0.0, 1240.0, 1754.0);
+        raster.metadata.insert(
+            RASTER_IMAGE_METADATA_KEY.to_string(),
+            json!({"blob_hash": "deadbeef", "width": 825, "height": 1168}),
+        );
+        doc.insert_node(raster).unwrap();
+        let issues = run_preflight(&doc, &[], &PreflightOptions::default());
+        let r = issues
+            .iter()
+            .find(|i| i.check == PreflightCheck::ImageResolution)
+            .expect("image resolution issue expected for sub-target DPI");
+        assert_eq!(
+            r.severity,
+            PreflightSeverity::Warning,
+            "200 DPI on CMYK target (floor 150, ideal 300) must be Warning, not Error, got: {r:?}",
+        );
+    }
+
+    #[test]
+    fn raster_above_target_dpi_emits_no_issue() {
+        let mut doc = DocumentGraph::new();
+        let page = page_with_layout(&mut doc, a4_layout(), a4_bounds());
+        let mut raster = Node::new(NodeType::RasterLayer, "sharp");
+        raster.parent_id = Some(page);
+        // 100×100 mm display, 1200×1200 px source → 304 DPI, above
+        // the 300 default target.
+        raster.bounds = Bounds::new(0.0, 0.0, 1181.0, 1181.0);
+        raster.metadata.insert(
+            RASTER_IMAGE_METADATA_KEY.to_string(),
+            json!({"blob_hash": "feedcafe", "width": 1200, "height": 1200}),
+        );
+        doc.insert_node(raster).unwrap();
+        let issues = run_preflight(&doc, &[], &PreflightOptions::default());
+        assert!(
+            !issues
+                .iter()
+                .any(|i| i.check == PreflightCheck::ImageResolution),
+            "above-target DPI must be silent, got: {issues:?}",
+        );
+    }
+
+    #[test]
+    fn explicit_image_dpi_floor_overrides_target_inference() {
+        // Drop the floor to 50 on a CMYK target; a ~100-DPI raster
+        // that would normally be an Error (below the 150 default
+        // floor) should now be a Warning.
+        let mut doc = DocumentGraph::new();
+        let page = page_with_layout(&mut doc, a4_layout(), a4_bounds());
+        let mut raster = Node::new(NodeType::RasterLayer, "low");
+        raster.parent_id = Some(page);
+        raster.bounds = Bounds::new(0.0, 0.0, 2480.0, 3508.0);
+        // Source 850×1200 on full A4 → ~103 DPI in both axes (limited
+        // by the smaller-DPI axis as `dpi.min`). Between the 50
+        // floor and the 300 target → Warning.
+        raster.metadata.insert(
+            RASTER_IMAGE_METADATA_KEY.to_string(),
+            json!({"blob_hash": "abc", "width": 850, "height": 1200}),
+        );
+        doc.insert_node(raster).unwrap();
+        let opts = PreflightOptions {
+            image_dpi_floor: 50.0,
+            ..PreflightOptions::default()
+        };
+        let issues = run_preflight(&doc, &[], &opts);
+        let r = issues
+            .iter()
+            .find(|i| i.check == PreflightCheck::ImageResolution)
+            .expect("image resolution issue");
+        assert_eq!(
+            r.severity,
+            PreflightSeverity::Warning,
+            "explicit floor 50 on CMYK should demote a ~100-DPI raster to Warning, got: {r:?}",
+        );
+    }
+
+    #[test]
+    fn bleed_area_empty_warns_per_uncovered_side() {
+        // Page with bleed configured, single small content layer
+        // that doesn't reach any edge. All four sides should warn.
+        let mut doc = DocumentGraph::new();
+        let page = page_with_layout(&mut doc, a4_layout(), a4_bounds());
+        let mut node = Node::new(NodeType::VectorLayer, "centered");
+        node.parent_id = Some(page);
+        // Place a 100×100 rect smack in the middle of A4 (~2480×3508).
+        node.bounds = Bounds::new(1190.0, 1700.0, 100.0, 100.0);
+        doc.insert_node(node).unwrap();
+        let issues = run_preflight(&doc, &[], &PreflightOptions::default());
+        let bleed_area: Vec<&PreflightIssue> = issues
+            .iter()
+            .filter(|i| i.check == PreflightCheck::BleedAreaEmpty)
+            .collect();
+        assert_eq!(
+            bleed_area.len(),
+            4,
+            "centered tiny rect on A4 with 3mm bleed should warn for all 4 sides, got: {bleed_area:?}",
+        );
+        for side in ["left", "right", "top", "bottom"] {
+            assert!(
+                bleed_area.iter().any(|i| i.message.contains(side)),
+                "expected a warning mentioning the {side} edge, got: {bleed_area:?}",
+            );
+        }
+        for i in &bleed_area {
+            assert_eq!(i.severity, PreflightSeverity::Warning);
+            assert!(i.affected_node_id.is_none());
+        }
+    }
+
+    #[test]
+    fn bleed_area_empty_silent_when_full_bleed_background_covers_all_sides() {
+        // A full-bleed background that extends past all four edges
+        // (the canonical setup for a brochure or postcard) should
+        // produce zero BleedAreaEmpty issues, even though there are
+        // smaller centered layers that don't reach the edges.
+        let mut doc = DocumentGraph::new();
+        let page = page_with_layout(&mut doc, a4_layout(), a4_bounds());
+        let bleed_px = 3.0 * (FALLBACK_PRINT_DPI / MM_PER_INCH);
+        let mut bg = Node::new(NodeType::VectorLayer, "full-bleed bg");
+        bg.parent_id = Some(page);
+        bg.bounds = Bounds::new(
+            -bleed_px,
+            -bleed_px,
+            2480.0 + 2.0 * bleed_px,
+            3508.0 + 2.0 * bleed_px,
+        );
+        doc.insert_node(bg).unwrap();
+        let mut centered = Node::new(NodeType::VectorLayer, "centered");
+        centered.parent_id = Some(page);
+        centered.bounds = Bounds::new(1190.0, 1700.0, 100.0, 100.0);
+        doc.insert_node(centered).unwrap();
+        let issues = run_preflight(&doc, &[], &PreflightOptions::default());
+        assert!(
+            !issues
+                .iter()
+                .any(|i| i.check == PreflightCheck::BleedAreaEmpty),
+            "full-bleed bg must satisfy all 4 sides, got: {issues:?}",
+        );
+    }
+
+    #[test]
+    fn bleed_area_empty_warns_only_for_uncovered_sides() {
+        // A layer that extends past the top + left page edges should
+        // satisfy those two sides; the right + bottom should still
+        // warn.
+        let mut doc = DocumentGraph::new();
+        let page = page_with_layout(&mut doc, a4_layout(), a4_bounds());
+        let bleed_px = 3.0 * (FALLBACK_PRINT_DPI / MM_PER_INCH);
+        let mut corner = Node::new(NodeType::VectorLayer, "top-left");
+        corner.parent_id = Some(page);
+        corner.bounds = Bounds::new(-bleed_px, -bleed_px, 1000.0, 1000.0);
+        doc.insert_node(corner).unwrap();
+        let issues = run_preflight(&doc, &[], &PreflightOptions::default());
+        let bleed_area: Vec<&PreflightIssue> = issues
+            .iter()
+            .filter(|i| i.check == PreflightCheck::BleedAreaEmpty)
+            .collect();
+        assert_eq!(
+            bleed_area.len(),
+            2,
+            "top-left corner bleed should leave right + bottom uncovered, got: {bleed_area:?}",
+        );
+        assert!(bleed_area.iter().any(|i| i.message.contains("right")));
+        assert!(bleed_area.iter().any(|i| i.message.contains("bottom")));
+    }
+
+    #[test]
+    fn bleed_area_empty_silent_when_page_has_no_content() {
+        // Fresh document with a page but no content layers — the
+        // bleed-area check should stay silent (the document is
+        // empty; the missing bleed is noise).
+        let mut doc = DocumentGraph::new();
+        page_with_layout(&mut doc, a4_layout(), a4_bounds());
+        let issues = run_preflight(&doc, &[], &PreflightOptions::default());
+        assert!(
+            !issues
+                .iter()
+                .any(|i| i.check == PreflightCheck::BleedAreaEmpty),
+            "empty page must not surface bleed-area-empty issues, got: {issues:?}",
+        );
+    }
+
+    #[test]
+    fn bleed_area_empty_silent_when_toggle_off() {
+        // Same setup as the all-four-uncovered test, but the toggle
+        // is off — no BleedAreaEmpty issues should appear.
+        let mut doc = DocumentGraph::new();
+        let page = page_with_layout(&mut doc, a4_layout(), a4_bounds());
+        let mut node = Node::new(NodeType::VectorLayer, "centered");
+        node.parent_id = Some(page);
+        node.bounds = Bounds::new(1190.0, 1700.0, 100.0, 100.0);
+        doc.insert_node(node).unwrap();
+        let opts = PreflightOptions {
+            check_bleed_area_coverage: false,
+            ..PreflightOptions::default()
+        };
+        let issues = run_preflight(&doc, &[], &opts);
+        assert!(
+            !issues
+                .iter()
+                .any(|i| i.check == PreflightCheck::BleedAreaEmpty),
+            "toggle off must suppress all bleed-area-empty warnings, got: {issues:?}",
+        );
     }
 }

@@ -261,6 +261,20 @@ pub struct NodeInfo {
     /// directly (32 bytes per node is well under the cost of a second
     /// round trip per node).
     pub bounds: BoundsInfo,
+    /// Monotonically-increasing revision counter sourced from
+    /// `kcreate_core::node::Node::version`. Bumped on every `touch()`
+    /// (i.e. on every mutation, from any source: bridge API calls,
+    /// undo/redo, future collab events). Renderer panels that hydrate
+    /// node-scoped data the `NodeInfo` payload deliberately doesn't
+    /// carry (`FillSection`'s `style.fill`, `TextFramePanel`'s
+    /// `text_frame_options`, `OpenTypePanel`'s OpenType features)
+    /// key their fetch effect on `[node.id, node.version]` so the
+    /// effect refires after undo/redo / remote-peer edits even when
+    /// `node.id` is stable. Carried over the bridge as `u64` and
+    /// truncated to `f64` at the napi boundary — `version` increments
+    /// once per mutation so even a million mutations per second for
+    /// 100 years stays well below 2^53.
+    pub version: u64,
     /// Present iff `node_type == "ComponentLayer"` and the node
     /// carries a parseable `component_instance` metadata payload.
     /// Renderer panels read this to drive the variant switcher.
@@ -320,6 +334,7 @@ impl From<&Node> for NodeInfo {
             visible: n.visible,
             locked: n.locked,
             bounds: n.bounds.into(),
+            version: n.version,
             component_instance,
             metadata: n.metadata.clone(),
         }
@@ -4397,6 +4412,65 @@ mod tests {
         assert!(json.contains("\"width\":800"));
         let parsed: NodeInfo = serde_json::from_str(&json).expect("round-trip");
         assert_eq!(parsed.bounds, node.bounds);
+        project_close();
+    }
+
+    /// Pins the `NodeInfo::version` wire-format contract. The field
+    /// is the dependency-array signal that lets renderer panels
+    /// (`FillSection`, `TextFramePanel`, `OpenTypePanel`) refire
+    /// their hydrate `useEffect` after undo/redo / collab mutations
+    /// on the same selected node id. If this assertion ever stops
+    /// holding — i.e. mutating a node via `document_update_node`
+    /// stops bumping the wire-format `version` — every panel that
+    /// keys on `[node.id, node.version]` silently goes stale and
+    /// the user's next commit clobbers the just-mutated state.
+    #[test]
+    #[serial]
+    fn node_info_version_bumps_on_update() {
+        use kcreate_core::node::{FillStyle, RgbaColor};
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("version_wire", dir.path()).expect("create");
+        let id = document_create_node("VectorLayer", None, &CreateNodeProps::default())
+            .expect("create node");
+        let v0 = document_get_tree()
+            .expect("tree")
+            .iter()
+            .find(|n| n.id == id)
+            .expect("present")
+            .version;
+        let changes = UpdateNodeProps {
+            fill: Some(FillStyle::Solid(RgbaColor {
+                r: 1.0,
+                g: 0.0,
+                b: 0.0,
+                a: 1.0,
+            })),
+            ..UpdateNodeProps::default()
+        };
+        document_update_node(id, &changes).expect("update fill");
+        let v1 = document_get_tree()
+            .expect("tree")
+            .iter()
+            .find(|n| n.id == id)
+            .expect("present")
+            .version;
+        assert!(
+            v1 > v0,
+            "node.version must strictly increase after document_update_node; v0={v0}, v1={v1}"
+        );
+        // And it survives JSON round-tripping under serde
+        // (mirroring the napi-rs `#[napi(object)]` field-by-field
+        // shape).
+        let node = document_get_tree()
+            .expect("tree")
+            .into_iter()
+            .find(|n| n.id == id)
+            .expect("present");
+        let json = serde_json::to_string(&node).expect("serialise");
+        assert!(json.contains("\"version\""));
+        let parsed: NodeInfo = serde_json::from_str(&json).expect("round-trip");
+        assert_eq!(parsed.version, node.version);
         project_close();
     }
 

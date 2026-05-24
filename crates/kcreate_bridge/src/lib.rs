@@ -367,9 +367,25 @@ pub struct NodeInfo {
     /// top of the rendered artboard; previously the wire shape elided
     /// `bounds`, so hotspots never appeared — see PR #5 fix.
     pub bounds: Bounds,
+    /// Monotonically-increasing revision counter. Mirrors
+    /// `kcreate_core::node::Node::version`. Used by renderer panels
+    /// (`FillSection`, `TextFramePanel`, `OpenTypePanel`) as a
+    /// dependency-array signal so their hydrate `useEffect` refires
+    /// after undo/redo / collab edits on the same node id. Carried as
+    /// `f64` because JS `number` (IEEE-754 double) can faithfully
+    /// represent every integer up to 2^53 — `version` increments
+    /// once per mutation so even a million edits per second for 100
+    /// years stays well within range. Using `BigInt` would force
+    /// every renderer panel onto `Number(node.version)` conversions
+    /// and break the existing `NodeInfo: { version: number }` shape.
+    pub version: f64,
 }
 
 impl From<CoreNodeInfo> for NodeInfo {
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "u64 → f64 is exact for values ≤ 2^53; Node::version bumps once per mutation so any realistic editing session stays well under that bound"
+    )]
     fn from(c: CoreNodeInfo) -> Self {
         Self {
             id: c.id.to_string(),
@@ -380,6 +396,7 @@ impl From<CoreNodeInfo> for NodeInfo {
             visible: c.visible,
             locked: c.locked,
             bounds: c.bounds.into(),
+            version: c.version as f64,
         }
     }
 }

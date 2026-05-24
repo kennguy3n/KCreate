@@ -61,9 +61,15 @@ export function OpenTypePanel({
     }
   }, []);
 
+  // Dependency on `node.version` (not just `node.id`) so undo/redo
+  // and collab edits on the same selected node refire the hydrate
+  // path. See `TextFramePanel` and `FillSection` for the matching
+  // pattern — PR #12 Devin Review filed this gap once against
+  // `FillSection`, but the same shape exists across every bridge-
+  // hydrating panel, so we fix it uniformly.
   useEffect(() => {
     void load(node.id);
-  }, [load, node.id]);
+  }, [load, node.id, node.version]);
 
   const commit = useCallback(
     async (next: OpenTypeFeatures) => {

@@ -288,6 +288,12 @@ type NodeInfoSnake = {
   /// `bounds` directly on every NodeInfo so the renderer can render
   /// hotspots / hit-test overlays without a second IPC round trip.
   bounds: BoundsSnake;
+  /// Monotonically-increasing revision counter. Mirrors
+  /// `kcreate_core::node::Node::version` and is carried verbatim
+  /// over the bridge as `version` (not `node_version`) — used by
+  /// renderer panels as a dependency-array signal so their hydrate
+  /// effects refire after undo/redo / collab edits on the same node.
+  version: number;
   /// Already camelCased on the Rust side via #[serde(rename)]. We
   /// pass it through verbatim because the inner field names are
   /// also camelCased (definitionId / activeVariantId).
@@ -334,6 +340,7 @@ function nodeFromSnake(n: NodeInfoSnake): NodeInfo {
       width: n.bounds.width,
       height: n.bounds.height,
     },
+    version: n.version,
     ...(n.componentInstance ? { componentInstance: n.componentInstance } : {}),
     ...(n.metadata ? { metadata: n.metadata } : {}),
   };

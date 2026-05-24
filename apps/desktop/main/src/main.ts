@@ -1850,10 +1850,29 @@ function registerIpcHandlers(): void {
 /// (permissions, corrupt JSON) is non-fatal to the editor. The
 /// renderer surfaces a banner if subsequent add/remove calls
 /// fail to persist. Idempotent: safe to call multiple times.
+///
+/// `kchatSetTrustStorePath` is gated behind the `collab` Cargo
+/// feature in `kcreate_bridge`. Every shipped desktop artifact
+/// builds with `collab` enabled, so in practice the function is
+/// always present — but we probe with `typeof fn !== "function"`
+/// before calling so non-collab developer builds don't generate
+/// a spurious "function is not a function" stack trace at every
+/// startup. Mirrors the pattern used for `kchatDevIssuerAvailable`
+/// (`registerIpcHandlers` above).
 function initializeKChatTrustStore(): void {
+  const fn = requireBridge().kchatSetTrustStorePath;
+  if (typeof fn !== "function") {
+    // Non-collab build: the trust-store ABI isn't compiled in.
+    // The bridge's add/remove/list endpoints will also be absent,
+    // and the renderer's KChatSignInPanel won't be able to call
+    // them — but that's the expected non-collab state. Silent
+    // return rather than logging so we don't spam the console
+    // every startup.
+    return;
+  }
   try {
     const trustFile = path.join(app.getPath("userData"), "kchat_trust.json");
-    requireBridge().kchatSetTrustStorePath(trustFile);
+    fn.call(requireBridge(), trustFile);
   } catch (err) {
     console.error("kchat: failed to initialise trust store on disk", err);
   }

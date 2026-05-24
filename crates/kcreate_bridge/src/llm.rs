@@ -401,6 +401,9 @@ mod tests {
                 width: 0.0,
                 height: 0.0,
             },
+            // Fresh-node version — the prompt builder ignores it; we
+            // just need the field populated to satisfy the struct.
+            version: 0,
             component_instance: None,
             metadata: std::collections::HashMap::new(),
         }

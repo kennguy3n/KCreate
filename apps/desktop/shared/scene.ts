@@ -271,6 +271,21 @@ export interface NodeInfo {
    * no explicit geometry — e.g. groups before layout solving).
    */
   bounds: Bounds;
+  /**
+   * Monotonically-increasing revision counter sourced from
+   * `kcreate_core::node::Node::version`. Bumped on every mutation
+   * (including undo/redo and future collab events). Panels that
+   * hydrate node-scoped data the `NodeInfo` payload deliberately
+   * doesn't carry (`FillSection`'s `style.fill`,
+   * `TextFramePanel`'s `text_frame_options`, `OpenTypePanel`'s
+   * OpenType features) must key their fetch effect on
+   * `[node.id, node.version]` so the effect refires after
+   * undo/redo / remote-peer edits even when `node.id` is stable.
+   * Typed as `number` (not `bigint`) because `Node::version` bumps
+   * once per mutation and stays well below 2^53 in practice — see
+   * the matching `version: f64` comment on the napi `NodeInfo`.
+   */
+  version: number;
   componentInstance?: ComponentInstanceInfo;
   /**
    * Free-form metadata bag mirroring `Node::metadata` on the Rust side.
@@ -1681,6 +1696,12 @@ export interface DetectTextRegionsOptions {
   lineOverlapRatio?: number;
   /// Horizontal gap allowance (× cap-height) within one line.
   lineGapRatio?: number;
+  /// Hard cap on input image area, in pixels (`width * height`).
+  /// Larger inputs are rejected on the Rust side with a typed
+  /// error rather than fed into the O(W*H)-memory flood-fill.
+  /// Omit to use the Rust default (16 million pixels, enough for
+  /// any reasonable 4K screenshot).
+  maxImagePixels?: number;
 }
 
 /// Renderer → bridge request to materialise a detected text region

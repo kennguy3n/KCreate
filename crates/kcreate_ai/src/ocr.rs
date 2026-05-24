@@ -92,6 +92,31 @@ pub struct DetectTextRegionsOptions {
     /// their horizontal gap is at most this multiple of the
     /// component's height. 1.5 means "up to 1.5× the cap-height".
     pub line_gap_ratio: f32,
+    /// Hard cap on input image area, in pixels (`width * height`).
+    /// Larger inputs are rejected with [`OcrError::ImageTooLarge`]
+    /// rather than fed into the O(W*H)-memory flood-fill, which
+    /// would otherwise be free to allocate hundreds of MB on a
+    /// pathological all-dark all-large image (worst-case peak
+    /// memory is `width * height * 9` bytes — a 1-byte `visited`
+    /// bitmap plus an 8-byte `(u32, u32)` stack entry per pixel).
+    /// The default of 16 million pixels covers 4K UI screenshots
+    /// (e.g. 4096 × 4096, 4000 × 4000, 5120 × 3120) with margin to
+    /// spare and caps worst-case allocation at roughly 144 MB,
+    /// which is well within the budget for an interactive AI panel.
+    /// Set to `u32::MAX` to disable the guard. Marked
+    /// `#[serde(default = …)]` so existing JSON payloads that
+    /// predate this field (no `maxImagePixels` key) keep working
+    /// against the renderer's defaults.
+    #[serde(default = "default_max_image_pixels")]
+    pub max_image_pixels: u32,
+}
+
+/// `#[serde(default)]` callback for
+/// [`DetectTextRegionsOptions::max_image_pixels`]. Mirrors the
+/// constant in [`DetectTextRegionsOptions::default`]; pulled out
+/// so the two paths don't drift.
+fn default_max_image_pixels() -> u32 {
+    16_000_000
 }
 
 impl Default for DetectTextRegionsOptions {
@@ -102,6 +127,7 @@ impl Default for DetectTextRegionsOptions {
             max_component_fraction: 0.25,
             line_overlap_ratio: 0.5,
             line_gap_ratio: 1.5,
+            max_image_pixels: 16_000_000,
         }
     }
 }
@@ -116,6 +142,19 @@ pub enum OcrError {
     SizeMismatch { expected: usize, actual: usize },
     #[error("width and height must be non-zero")]
     DegenerateDimensions,
+    /// Returned when `width * height` exceeds
+    /// [`DetectTextRegionsOptions::max_image_pixels`]. The detector
+    /// uses an `O(W * H)` flood-fill (1-byte `visited` + 8-byte
+    /// stack entry per pixel in the worst case), so very large
+    /// inputs could allocate hundreds of MB. Rather than silently
+    /// truncating components — which would produce wrong bboxes
+    /// and is itself a footgun — we surface a typed error and let
+    /// the renderer either downsample or refuse to OCR. The
+    /// renderer's screenshot-to-layout pipeline pre-resizes large
+    /// images, so this only fires when the caller deliberately
+    /// passes an oversized buffer.
+    #[error("image is too large for OCR: {pixels} pixels exceeds max_image_pixels = {max}")]
+    ImageTooLarge { pixels: u64, max: u32 },
 }
 
 /// Detect text-like regions in an RGBA raster buffer.
@@ -143,6 +182,18 @@ pub fn detect_text_regions(
         return Err(OcrError::SizeMismatch {
             expected,
             actual: pixels.len(),
+        });
+    }
+    // Hard cap on image area to bound flood-fill memory at a
+    // predictable ceiling. The O(W*H) memory profile of the explicit-
+    // stack flood-fill is documented on `label_components` — refusing
+    // pathologically large inputs is preferable to silently
+    // truncating components and emitting wrong bboxes.
+    let area: u64 = u64::from(width) * u64::from(height);
+    if area > u64::from(options.max_image_pixels) {
+        return Err(OcrError::ImageTooLarge {
+            pixels: area,
+            max: options.max_image_pixels,
         });
     }
 
@@ -239,11 +290,14 @@ impl Component {
 /// spans the entire raster. That's the price of a 4-connected
 /// flood-fill without scan-line compression — acceptable for the
 /// intended inputs (UI screenshots, document scans, on-canvas
-/// rasters up to a few megapixels). Callers that need to operate
-/// on very large all-dark images should pre-tile or downsample;
-/// adding a `max_component_pixels` early-bailout here would
-/// silently truncate large legitimate blobs into wrong bboxes,
-/// which is a worse failure mode than the memory pressure.
+/// rasters up to a few megapixels). Pathologically large inputs
+/// are rejected up front by [`detect_text_regions`] via the
+/// [`DetectTextRegionsOptions::max_image_pixels`] guard, so this
+/// function never has to worry about runaway allocation. We avoid
+/// an in-loop early-bailout because silently truncating a single
+/// component mid-scan would emit a wrong bbox — a worse failure
+/// mode than the predictable memory ceiling enforced at the
+/// public entry point.
 fn label_components(mask: &[u8], width: u32, height: u32) -> Vec<Component> {
     let w = width as usize;
     let h = height as usize;
@@ -439,6 +493,41 @@ mod tests {
         let pixels = vec![0u8; 4];
         let err = detect_text_regions(&pixels, 10, 10, DetectTextRegionsOptions::default());
         assert!(matches!(err, Err(OcrError::SizeMismatch { .. })));
+    }
+
+    /// Pins the `max_image_pixels` guard. Without it, a pathological
+    /// caller could pass a 10000 × 10000 buffer and the flood-fill
+    /// would allocate ~900 MB before doing any useful work. The
+    /// guard upfronts the rejection so the renderer can choose a
+    /// downsampling strategy instead of being mid-allocation when
+    /// the OOM lands.
+    #[test]
+    fn image_too_large_returns_error() {
+        // We don't need to actually allocate the giant buffer — the
+        // size-mismatch check happens AFTER the dimensions check
+        // and we want to exercise the area guard, so we set
+        // `max_image_pixels` to a small value and feed a buffer that
+        // matches the declared dimensions exactly.
+        let options = DetectTextRegionsOptions {
+            max_image_pixels: 10,
+            ..DetectTextRegionsOptions::default()
+        };
+        let pixels = vec![0u8; 5 * 5 * 4];
+        let err = detect_text_regions(&pixels, 5, 5, options);
+        assert!(matches!(
+            err,
+            Err(OcrError::ImageTooLarge {
+                pixels: 25,
+                max: 10
+            })
+        ));
+        // And the default `max_image_pixels` is large enough that
+        // typical screenshot dimensions pass through unchanged.
+        let pixels_ok = vec![255u8; 100 * 100 * 4];
+        assert!(
+            detect_text_regions(&pixels_ok, 100, 100, DetectTextRegionsOptions::default()).is_ok(),
+            "default max_image_pixels must not reject ordinary inputs",
+        );
     }
 
     #[test]

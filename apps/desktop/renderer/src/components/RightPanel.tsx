@@ -540,48 +540,90 @@ function FillSection({
   onChange?: (changes: UpdateNodeProps) => void;
   disabled: boolean;
 }): JSX.Element {
-  const [fill, setFill] = useState<FillStyle | null>(null);
-  // `nodeIdRef` would be cleaner but we re-fire on every node id
-  // change anyway, and the effect's dep list guarantees we don't
-  // race a stale id into setFill — the inflight promise's
-  // resolution is gated on the id matching the currently-rendered
-  // node via the local `cancelled` flag captured at effect entry.
+  // Hydration state as a discriminated union rather than `FillStyle | null`
+  // so the "still fetching" and "fetch failed" cases are
+  // distinguishable. The previous `null`-as-both-loading-and-error
+  // shape stranded the panel on "Loading…" forever if the bridge
+  // ever returned an error for a stable selection (bot finding on
+  // RightPanel.tsx:580 — see PR #12 Devin Review thread).
+  type HydrateState =
+    | { status: "loading" }
+    | { status: "loaded"; fill: FillStyle | null }
+    | { status: "error"; error: string };
+  const [state, setState] = useState<HydrateState>({ status: "loading" });
+  // `retryToken` exists so the user can request a re-hydrate from
+  // the error UI without us having to invalidate `node.version` /
+  // `node.id` to force the effect.
+  const [retryToken, setRetryToken] = useState(0);
+  // Dependency is `[node.id, node.version, retryToken]`: id changes
+  // on selection, `version` increments every time the node is
+  // mutated anywhere (bridge writes, undo/redo, future collab
+  // events), and `retryToken` lets the error UI re-arm. Previously
+  // the effect keyed only on `node.id`, so undo/redo on the same
+  // selected node never refired the fetch and the panel showed
+  // pre-undo data — see PR #12 Devin Review thread on
+  // RightPanel.tsx:549.
   useEffect(() => {
     let cancelled = false;
+    setState({ status: "loading" });
     void (async () => {
       try {
         const next = await window.kcreate.document.nodeFill(node.id);
         if (cancelled) {
           return;
         }
-        setFill(next);
-      } catch {
-        // Bridge error (no project / unknown id) leaves the editor
-        // in its "loading" state. Surfacing a toast here would be
-        // noisy because the most common cause is racing a project
-        // close — the panel will simply re-hydrate when a new
-        // project opens and a new selection lands.
+        setState({ status: "loaded", fill: next });
+      } catch (err) {
         if (cancelled) {
           return;
         }
-        setFill(null);
+        setState({
+          status: "error",
+          error: err instanceof Error ? err.message : String(err),
+        });
       }
     })();
     return () => {
       cancelled = true;
     };
-  }, [node.id]);
+  }, [node.id, node.version, retryToken]);
 
   const commit = (next: FillStyle): void => {
-    setFill(next);
+    setState({ status: "loaded", fill: next });
     onChange?.({ fill: next });
   };
 
-  if (fill === null) {
+  if (state.status === "loading") {
     return (
       <div style={{ display: "flex", flexDirection: "column", gap: spacing.xs }}>
         <SectionLabel>Fill</SectionLabel>
         <Hint>Loading…</Hint>
+      </div>
+    );
+  }
+
+  if (state.status === "error") {
+    return (
+      <div style={{ display: "flex", flexDirection: "column", gap: spacing.xs }}>
+        <SectionLabel>Fill</SectionLabel>
+        <Hint>Couldn’t load fill: {state.error}</Hint>
+        <button
+          type="button"
+          onClick={() => setRetryToken((n) => n + 1)}
+          disabled={disabled}
+        >
+          Retry
+        </button>
+      </div>
+    );
+  }
+
+  const fill = state.fill;
+  if (fill === null) {
+    return (
+      <div style={{ display: "flex", flexDirection: "column", gap: spacing.xs }}>
+        <SectionLabel>Fill</SectionLabel>
+        <Hint>This node does not support fills.</Hint>
       </div>
     );
   }

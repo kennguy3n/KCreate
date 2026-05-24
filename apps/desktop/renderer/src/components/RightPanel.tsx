@@ -839,6 +839,26 @@ function GradientFillEditor({
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: spacing.xs }}>
+      {/*
+       * Honest UX: the scene-sync layer's `node_fill` in
+       * `crates/kcreate_bridge/src/scene_sync.rs` returns `None`
+       * for `FillStyle::Gradient` today, so a vector layer with a
+       * gradient fill renders as invisible on the canvas (we
+       * intentionally don't fall back to "solid first stop" because
+       * that would silently misrepresent the saved gradient).
+       * Authoring still works — the gradient persists in the
+       * document graph and on disk — but users would otherwise see
+       * the shape disappear when they pick a gradient. Surface
+       * that explicitly here rather than leaving them to discover
+       * it by surprise. Will be removed once the renderer's
+       * gradient-expander path lands.
+       */}
+      <div style={gradientRenderNoticeStyle}>
+        Gradient fills are saved correctly but not yet painted on the
+        canvas. The shape will appear invisible here until the
+        gradient renderer lands; export and persistence are
+        unaffected.
+      </div>
       <Row>
         <button
           type="button"
@@ -937,18 +957,50 @@ function GradientFillEditor({
       <button
         type="button"
         onClick={() => {
-          // New stop is inserted at the midpoint between the
-          // last two stops (or at 0.5 if the list is empty —
-          // shouldn't happen since we always seed two). Colour
-          // copies the last stop so the user sees a continuous
-          // ramp rather than a sudden discontinuity.
-          const last = fill.stops[fill.stops.length - 1];
-          const second = fill.stops[fill.stops.length - 2];
+          // New stop is inserted at the midpoint of the LARGEST
+          // current gap between adjacent stops. This matches the
+          // standard pattern across design tools (Figma, Adobe XD,
+          // Sketch) and avoids the Zeno's-paradox clustering toward
+          // offset 1.0 that "midpoint between last two stops"
+          // produces on repeated clicks. Colour linearly interpolates
+          // between the gap's endpoints so the new stop sits on the
+          // existing ramp rather than introducing a discontinuity.
+          //
+          // Edge cases:
+          // - Empty / single-stop input shouldn't reach here (we
+          //   always seed two stops), but if it does, fall back to
+          //   offset 0.5 + black.
+          // - Already-sorted input is guaranteed by `setStops`
+          //   sorting on commit, so we can walk adjacent pairs.
+          let widestStart = fill.stops[0];
+          let widestEnd = fill.stops[fill.stops.length - 1];
+          let widestGap = -1;
+          for (let i = 0; i < fill.stops.length - 1; i++) {
+            const a = fill.stops[i];
+            const b = fill.stops[i + 1];
+            if (a === undefined || b === undefined) {
+              continue;
+            }
+            const gap = b.offset - a.offset;
+            if (gap > widestGap) {
+              widestGap = gap;
+              widestStart = a;
+              widestEnd = b;
+            }
+          }
           const offset =
-            second !== undefined && last !== undefined
-              ? (second.offset + last.offset) / 2
+            widestStart !== undefined && widestEnd !== undefined
+              ? (widestStart.offset + widestEnd.offset) / 2
               : 0.5;
-          const color = last?.color ?? RGBA_BLACK;
+          const color =
+            widestStart !== undefined && widestEnd !== undefined
+              ? {
+                  r: (widestStart.color.r + widestEnd.color.r) / 2,
+                  g: (widestStart.color.g + widestEnd.color.g) / 2,
+                  b: (widestStart.color.b + widestEnd.color.b) / 2,
+                  a: (widestStart.color.a + widestEnd.color.a) / 2,
+                }
+              : RGBA_BLACK;
           setStops([...fill.stops, { offset, color }]);
         }}
         disabled={disabled}
@@ -1899,6 +1951,21 @@ const hrStyle: React.CSSProperties = {
   border: "none",
   borderTop: `1px solid ${colors.border}`,
   margin: `${spacing.xs}px 0`,
+};
+
+/// Inline notice surfaced inside the gradient editor explaining that
+/// gradient fills currently round-trip to disk but don't render on
+/// canvas. Styled as a soft warning (yellow accent) rather than an
+/// error because authoring is fully functional — only the live
+/// preview is missing.
+const gradientRenderNoticeStyle: React.CSSProperties = {
+  fontSize: 11,
+  lineHeight: 1.4,
+  padding: "6px 8px",
+  background: "rgba(255, 196, 0, 0.12)",
+  border: "1px solid rgba(255, 196, 0, 0.45)",
+  color: colors.text,
+  borderRadius: 4,
 };
 
 function ExportTabContent({

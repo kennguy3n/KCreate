@@ -182,24 +182,49 @@ impl PreflightOptions {
     /// target. When [`image_dpi_floor`](Self::image_dpi_floor) is
     /// 0.0 (the deny-by-default sentinel that means "infer"),
     /// derives the floor from `target_color_space`. Otherwise
-    /// passes through the explicit value. Centralised here so the
-    /// check function and the UI hint stay in sync.
+    /// passes through the explicit value, **clamped to at most
+    /// `target_dpi`** so a misconfigured floor (e.g. 400 floor with
+    /// 300 target) doesn't produce the surprising "above target but
+    /// still flagged as Error" severity ladder. The floor MUST be
+    /// `<= target_dpi` for the ladder to be coherent:
+    ///
+    /// - `effective_dpi < floor`          → Error   (unrecoverable)
+    /// - `floor <= effective_dpi < target` → Warning (soft-proof OK)
+    /// - `effective_dpi >= target`         → silent
+    ///
+    /// Without the clamp, a floor above the target collapses the
+    /// Warning band to empty AND turns above-target-but-below-floor
+    /// rasters into spurious Errors. Centralised here so the check
+    /// function and the UI hint stay in sync.
     #[must_use]
     pub fn effective_image_dpi_floor(&self) -> f64 {
-        if self.image_dpi_floor > 0.0 {
-            return self.image_dpi_floor;
-        }
-        match self.target_color_space {
-            // 150 DPI is the conventional "press soft-proof minimum":
-            // anything below visibly pixelates at viewing distance on
-            // a halftoned offset proof, and most short-run digital
-            // presses can't pull useful detail below it either.
-            ColorSpaceTarget::Cmyk => 150.0,
-            // 72 DPI is the historical screen DPI baseline. Below
-            // it, images render at sub-pixel resolution on any
-            // modern display and would have to be upscaled at
-            // export time anyway.
-            ColorSpaceTarget::Rgb => 72.0,
+        let raw = if self.image_dpi_floor > 0.0 {
+            self.image_dpi_floor
+        } else {
+            match self.target_color_space {
+                // 150 DPI is the conventional "press soft-proof minimum":
+                // anything below visibly pixelates at viewing distance on
+                // a halftoned offset proof, and most short-run digital
+                // presses can't pull useful detail below it either.
+                ColorSpaceTarget::Cmyk => 150.0,
+                // 72 DPI is the historical screen DPI baseline. Below
+                // it, images render at sub-pixel resolution on any
+                // modern display and would have to be upscaled at
+                // export time anyway.
+                ColorSpaceTarget::Rgb => 72.0,
+            }
+        };
+        // Clamp to target_dpi. The inferred floors (150 / 72) sit
+        // well below the 300 default target, so the clamp is a
+        // no-op for the inferred path; it only kicks in when the
+        // user supplies an explicit floor that exceeds target_dpi.
+        // We use `>` rather than `>=` so a deliberately-collapsed
+        // ladder (floor == target — "every below-target raster is
+        // an Error") still works.
+        if self.target_dpi > 0.0 && raw > self.target_dpi {
+            self.target_dpi
+        } else {
+            raw
         }
     }
 }
@@ -2276,6 +2301,43 @@ mod tests {
             ..PreflightOptions::default()
         };
         assert_eq!(explicit.effective_image_dpi_floor(), 240.0);
+    }
+
+    #[test]
+    fn effective_image_dpi_floor_clamps_to_target_dpi() {
+        // Misconfigured: floor (400) above target (300). Without the
+        // clamp, rasters between 300 and 400 DPI would be flagged
+        // Error despite being above the "ideal" target — collapsing
+        // the Warning band and producing the surprising "above
+        // target but still Error" severity ladder.
+        let misconfigured = PreflightOptions {
+            image_dpi_floor: 400.0,
+            target_dpi: 300.0,
+            ..PreflightOptions::default()
+        };
+        assert_eq!(misconfigured.effective_image_dpi_floor(), 300.0);
+
+        // Equal floor == target is allowed (deliberate "every
+        // below-target raster is an Error" ladder).
+        let collapsed = PreflightOptions {
+            image_dpi_floor: 300.0,
+            target_dpi: 300.0,
+            ..PreflightOptions::default()
+        };
+        assert_eq!(collapsed.effective_image_dpi_floor(), 300.0);
+
+        // Floor below target passes through unchanged.
+        let normal = PreflightOptions {
+            image_dpi_floor: 150.0,
+            target_dpi: 300.0,
+            ..PreflightOptions::default()
+        };
+        assert_eq!(normal.effective_image_dpi_floor(), 150.0);
+
+        // Inferred floor (150 / 72) is always well below default
+        // target (300), so the clamp is a no-op for inferred paths.
+        let inferred = PreflightOptions::default();
+        assert_eq!(inferred.effective_image_dpi_floor(), 150.0);
     }
 
     #[test]

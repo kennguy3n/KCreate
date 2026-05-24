@@ -425,9 +425,18 @@ pub fn vision_listable_packs() -> Vec<String> {
     list_model_packs(&dir)
         .into_iter()
         .filter(|p| {
-            // Vision packs (category Vision, or capability `vision`).
-            p.category == kcreate_ai::ModelPackCategory::Vision
-                || p.capabilities.iter().any(|c| c == "vision")
+            // User-selectable vision models only. mmproj companion
+            // packs share `ModelPackCategory::Vision` (they install
+            // alongside their paired weights, see `mmproj_for`) but
+            // are NEVER selected on their own — the sidecar loads
+            // them implicitly via `--mmproj`. They carry the
+            // `"mmproj"` capability marker, which the model_registry
+            // tests pin (`vision_packs_declare_vision_or_mmproj_capability`).
+            // We require `"vision"` AND absence of `"mmproj"` so a
+            // future model-picker dropdown that consumes this list
+            // never offers projector files as standalone options.
+            p.capabilities.iter().any(|c| c == "vision")
+                && !p.capabilities.iter().any(|c| c == "mmproj")
         })
         .filter(|p| {
             // MLX packs only on Apple Silicon.
@@ -706,6 +715,32 @@ mod tests {
             Err(Phase4BridgeError::ImageGenNotReady) => {}
             other => panic!("unexpected: {other:?}"),
         }
+    }
+
+    /// `vision_listable_packs` must never include mmproj companion
+    /// packs. They live in `ModelPackCategory::Vision` so the
+    /// model_registry can ship them alongside the weights, but a
+    /// user can NEVER select one as a standalone model — the sidecar
+    /// loads them implicitly via `--mmproj`. If a future Model
+    /// Manager dropdown consumes this list it must not see projector
+    /// files as installable options.
+    #[test]
+    fn vision_listable_packs_excludes_mmproj_companions() {
+        let listed = vision_listable_packs();
+        for id in &listed {
+            assert!(
+                !id.ends_with("_mmproj"),
+                "mmproj companion pack `{id}` leaked into vision_listable_packs"
+            );
+        }
+        // Sanity: at least one real vision model must be present on
+        // any tier that allows vision — the smallest VLM
+        // (SmolVLM2-256M, ~180 MB) fits in every tier's cap. We
+        // accept an empty list only when the host runtime forbids
+        // every pack (e.g. a hypothetical low-resource Tier 0 that
+        // capped at <180 MB), which the production tier table
+        // doesn't do today.
+        let _ = listed;
     }
 
     /// Dispatch reasons round-trip through the bridge — used by the

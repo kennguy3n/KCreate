@@ -309,7 +309,17 @@ function filterPacksForTier(
       return false;
     }
     if (p.category === "vision") {
-      const sizeMb = p.sizeBytes / BINARY_MB;
+      // Use `Math.floor` so this matches the Rust side's `u64`
+      // integer division exactly (see
+      // `crates/kcreate_bridge/src/phase4.rs::vision_listable_packs`
+      // — `p.size_bytes / (1024 * 1024)`). JS `/` is float64
+      // division, so without `floor` a pack whose byte count
+      // floats to e.g. 500.0005 MB would be disabled here but
+      // accepted by the Rust filter — a wire-format-lockstep
+      // (AGENTS.md §4) divergence at tier boundaries. Today's
+      // packs are well below their caps so the float vs int
+      // delta is unreachable, but we pin the contract now.
+      const sizeMb = Math.floor(p.sizeBytes / BINARY_MB);
       if (sizeMb > limits.visionModelMaxMb) {
         disabled.add(p.id);
       }

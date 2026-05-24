@@ -138,6 +138,19 @@ export interface Bridge {
     propsJson: string,
   ): string;
   documentUpdateNode(nodeId: string, changesJson: string): void;
+  /**
+   * Read the current `FillStyle` for a node, serialised as a JSON
+   * string. Returns `null` when the node id is unknown. Renderer
+   * `FillSection` uses this on selection change to populate the
+   * fill editor. The shape mirrors `kcreate_core::node::FillStyle`
+   * 1:1 via its `#[serde(tag = "kind", rename_all = "snake_case")]`
+   * tagged enum — see `FillStyle` in `apps/desktop/shared/scene.ts`.
+   *
+   * String-typed at the N-API boundary because napi-rs can't mirror
+   * a tagged enum without a wire struct per variant; the renderer
+   * gets the round-trippable JSON shape directly.
+   */
+  documentNodeFill(nodeId: string): string | null;
   documentDeleteNode(nodeId: string): void;
   documentUndo(): UndoRedoOutcomeSnake | null;
   documentRedo(): UndoRedoOutcomeSnake | null;

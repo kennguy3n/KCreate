@@ -837,6 +837,17 @@ function registerIpcHandlers(): void {
       requireBridge().documentUpdateNode(nodeId, changesJson);
     },
   );
+  // FillSection (PropertiesPanel, right panel) calls this on
+  // selection change to populate its form with the node's current
+  // FillStyle. Writes go back through the existing
+  // `kcreate/document/updateNode` channel with the new `fill` field
+  // — no separate setter, the existing channel already touches the
+  // operation log and triggers a scene re-sync. The JSON string is
+  // round-trip-stable with `FillStyle` in `apps/desktop/shared/scene.ts`.
+  ipcMain.handle(
+    "kcreate/document/nodeFill",
+    (_e, nodeId: string) => requireBridge().documentNodeFill(nodeId),
+  );
   ipcMain.handle(
     "kcreate/document/deleteNode",
     (_e, nodeId: string) => {

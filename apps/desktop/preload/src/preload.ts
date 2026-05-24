@@ -39,6 +39,7 @@ import type {
   ExportFormat,
   ExportPreset,
   ExportPresetBridge,
+  FillStyle,
   FrameInfo,
   InspectCode,
   JpegExportOptions,
@@ -429,6 +430,22 @@ const document: DocumentBridge = {
       nodeId,
       JSON.stringify(changes),
     );
+  },
+  async nodeFill(nodeId: string): Promise<FillStyle | null> {
+    // The Rust bridge returns a JSON-string-encoded `FillStyle`
+    // (or `null` for unknown ids) so its tagged-enum shape survives
+    // the napi-rs boundary intact. Parse here so renderer callers
+    // see the typed shape, not a raw string. A parse failure
+    // bubbles up; we don't try to recover because a malformed
+    // payload is a wire-format bug, not a recoverable user error.
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/document/nodeFill",
+      nodeId,
+    )) as string | null;
+    if (raw === null) {
+      return null;
+    }
+    return JSON.parse(raw) as FillStyle;
   },
   async deleteNode(nodeId: string): Promise<void> {
     await ipcRenderer.invoke("kcreate/document/deleteNode", nodeId);

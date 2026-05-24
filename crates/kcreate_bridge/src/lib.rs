@@ -538,7 +538,10 @@ pub fn document_create_node(
 }
 
 /// Update a node in place. `changes_json` is a JSON object with
-/// optional `name`, `visible`, `locked`, `metadata` fields.
+/// optional `name`, `visible`, `locked`, `metadata`, and `fill`
+/// fields. The `fill` field, when present, is the `kind`-tagged
+/// JSON shape of [`kcreate_core::node::FillStyle`] — see
+/// [`crate::document::UpdateNodeProps::fill`] for the contract.
 #[napi]
 #[allow(clippy::needless_pass_by_value)]
 pub fn document_update_node(node_id: String, changes_json: String) -> NapiResult<()> {
@@ -550,6 +553,23 @@ pub fn document_update_node(node_id: String, changes_json: String) -> NapiResult
         )
     })?;
     document::document_update_node(id, &changes).map_err(map_doc_err)
+}
+
+/// Read the current `FillStyle` for a node, returned as a serialised
+/// JSON string. Returns `null` when the node id is not in the
+/// document. The renderer-side `FillSection` panel uses this to
+/// populate its form on selection change; edits go back through
+/// [`document_update_node`] with the new `fill` field.
+///
+/// String-typed rather than typed because `FillStyle` is a
+/// tagged-enum (`kind` discriminator) that napi-rs can't faithfully
+/// mirror without a hand-rolled wire-format struct per variant — and
+/// the renderer needs the round-trippable JSON shape anyway.
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn document_node_fill(node_id: String) -> NapiResult<Option<String>> {
+    let id = parse_uuid(&node_id)?;
+    document::document_node_fill(id).map_err(map_doc_err)
 }
 
 /// Remove a node and its descendants.

@@ -299,8 +299,94 @@ export interface CreateNodeProps {
   metadata?: Record<string, unknown>;
 }
 
-/** Optional changes accepted by `updateNode`. Only present fields are applied. */
-export type UpdateNodeProps = CreateNodeProps;
+/**
+ * RGBA colour with channels in `[0.0, 1.0]`. Mirrors
+ * `kcreate_core::node::RgbaColor`.
+ */
+export interface RgbaColor {
+  r: number;
+  g: number;
+  b: number;
+  a: number;
+}
+
+/**
+ * A single stop in a gradient. Mirrors
+ * `kcreate_core::node::GradientStop`.
+ */
+export interface GradientStop {
+  offset: number;
+  color: RgbaColor;
+}
+
+/**
+ * 2D point. Mirrors `kcreate_core::node::Point2D`.
+ */
+export interface Point2D {
+  x: number;
+  y: number;
+}
+
+/**
+ * Fill style for a node. Discriminated union tagged on `kind`
+ * (snake-cased), mirroring `kcreate_core::node::FillStyle`. The
+ * serde encoding is *internally-tagged*: newtype variants flatten
+ * the inner type's fields into the same JSON object rather than
+ * nesting them under a `"value"` key, so the wire shape is e.g.:
+ *
+ *   - `{"kind": "none"}`
+ *   - `{"kind": "solid", "r": 0.5, "g": 0.25, "b": 0.75, "a": 1.0}`
+ *   - `{"kind": "gradient", "shape": "linear", "from": {...},
+ *      "to": {...}, "stops": [...]}`
+ *   - `{"kind": "gradient", "shape": "radial", "center": {...},
+ *      "radius": 0.5, "stops": [...]}`
+ *
+ * The `shape` discriminator on `"gradient"` is from the inner
+ * `GradientKind` enum, which uses its own `#[serde(tag = "shape")]`.
+ * The two tags don't collide because they live on independent
+ * Rust enums; serde flattens them into one object at the JSON
+ * level.
+ *
+ * The `FillSection` (right panel, properties tab) reads/writes
+ * this shape via `kcreate.document.nodeFill` and the new `fill`
+ * field on `UpdateNodeProps`.
+ */
+export type FillStyle =
+  | { kind: "none" }
+  | ({ kind: "solid" } & RgbaColor)
+  | ({ kind: "gradient" } & GradientKind);
+
+/**
+ * Variant of `FillStyle::Gradient`. Tagged on `shape`,
+ * snake-cased. Mirrors `kcreate_core::node::GradientKind`. The
+ * payload fields are flattened alongside the parent `FillStyle`'s
+ * `kind` field when this is the inner variant of `FillStyle`.
+ */
+export type GradientKind =
+  | {
+      shape: "linear";
+      from: Point2D;
+      to: Point2D;
+      stops: GradientStop[];
+    }
+  | {
+      shape: "radial";
+      center: Point2D;
+      radius: number;
+      stops: GradientStop[];
+    };
+
+/**
+ * Optional changes accepted by `updateNode`. Only present fields
+ * are applied.
+ *
+ * `fill` is decoupled from `metadata` so the FillEditor doesn't
+ * have to know that the fill lives on `node.style.fill` rather
+ * than `node.metadata`. The bridge owns that layering detail.
+ */
+export interface UpdateNodeProps extends CreateNodeProps {
+  fill?: FillStyle;
+}
 
 /** SVG export options. `0` for width/height means "fit to content". */
 export interface SvgExportOptions {
@@ -412,6 +498,16 @@ export interface DocumentBridge {
     props: CreateNodeProps,
   ): Promise<string>;
   updateNode(nodeId: string, changes: UpdateNodeProps): Promise<void>;
+  /**
+   * Read the current `FillStyle` for a node, or `null` when the
+   * node id is not in the open document. Used by the `FillSection`
+   * panel to populate its editor on selection change. Writes go
+   * back through {@link updateNode} with the new `fill` field on
+   * `UpdateNodeProps` — there's no separate setter because the
+   * existing channel already takes care of the operation log,
+   * scene re-sync, and persistence.
+   */
+  nodeFill(nodeId: string): Promise<FillStyle | null>;
   deleteNode(nodeId: string): Promise<void>;
   undo(): Promise<UndoRedoOutcome | null>;
   redo(): Promise<UndoRedoOutcome | null>;

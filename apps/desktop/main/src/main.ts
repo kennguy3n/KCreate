@@ -958,6 +958,11 @@ function registerIpcHandlers(): void {
   ipcMain.handle("kcreate/vision/status", (): string =>
     requireBridge().visionStatus(),
   );
+  // Phase 4 vision inference handlers — Rust returns a JS Promise via
+  // N-API `AsyncTask`, so each handler just returns the promise and
+  // `ipcMain.handle` awaits it before serializing the reply to the
+  // renderer. The main process event loop stays responsive during
+  // the underlying VLM round-trip.
   ipcMain.handle(
     "kcreate/vision/describeImage",
     (
@@ -966,7 +971,7 @@ function registerIpcHandlers(): void {
       width: number,
       height: number,
       userPrompt: string,
-    ): string =>
+    ): Promise<string> =>
       requireBridge().visionDescribeImage(
         Array.from(rgba),
         width,
@@ -976,27 +981,27 @@ function registerIpcHandlers(): void {
   );
   ipcMain.handle(
     "kcreate/vision/describeNode",
-    (_e, nodeId: string, userPrompt: string): string =>
+    (_e, nodeId: string, userPrompt: string): Promise<string> =>
       requireBridge().visionDescribeNode(nodeId, userPrompt),
   );
   ipcMain.handle(
     "kcreate/vision/generateAltText",
-    (_e, rgba: Buffer, width: number, height: number): string =>
+    (_e, rgba: Buffer, width: number, height: number): Promise<string> =>
       requireBridge().visionGenerateAltText(Array.from(rgba), width, height),
   );
   ipcMain.handle(
     "kcreate/vision/generateAltTextForNode",
-    (_e, nodeId: string): string =>
+    (_e, nodeId: string): Promise<string> =>
       requireBridge().visionGenerateAltTextForNode(nodeId),
   );
   ipcMain.handle(
     "kcreate/vision/analyzeDesign",
-    (_e, rgba: Buffer, width: number, height: number): string =>
+    (_e, rgba: Buffer, width: number, height: number): Promise<string> =>
       requireBridge().visionAnalyzeDesign(Array.from(rgba), width, height),
   );
   ipcMain.handle(
     "kcreate/ai/extractBrandFromImage",
-    (_e, rgba: Buffer, width: number, height: number): string =>
+    (_e, rgba: Buffer, width: number, height: number): Promise<string> =>
       requireBridge().aiExtractBrandFromImage(Array.from(rgba), width, height),
   );
   ipcMain.handle(
@@ -1007,7 +1012,7 @@ function registerIpcHandlers(): void {
       width: number,
       height: number,
       aspectRatio: number,
-    ): string =>
+    ): Promise<string> =>
       requireBridge().aiSuggestCrop(
         Array.from(rgba),
         width,
@@ -1017,12 +1022,12 @@ function registerIpcHandlers(): void {
   );
   ipcMain.handle(
     "kcreate/ai/suggestDesignTokens",
-    (_e, rgba: Buffer, width: number, height: number): string =>
+    (_e, rgba: Buffer, width: number, height: number): Promise<string> =>
       requireBridge().aiSuggestDesignTokens(Array.from(rgba), width, height),
   );
   ipcMain.handle(
     "kcreate/ai/describeStyle",
-    (_e, rgba: Buffer, width: number, height: number): string =>
+    (_e, rgba: Buffer, width: number, height: number): Promise<string> =>
       requireBridge().aiDescribeStyle(Array.from(rgba), width, height),
   );
   ipcMain.handle("kcreate/vision/recommendedPack", (): string =>
@@ -1053,7 +1058,7 @@ function registerIpcHandlers(): void {
       height: number,
       steps: number,
       seed: number | null,
-    ): string =>
+    ): Promise<string> =>
       requireBridge().imageGenGenerate(prompt, width, height, steps, seed),
   );
   ipcMain.handle("kcreate/imageGen/allowed", (): boolean =>

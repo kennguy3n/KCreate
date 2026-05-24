@@ -179,33 +179,49 @@ export interface Bridge {
   visionStart(packId: string): number;
   visionStop(): void;
   visionStatus(): string;
+  // Vision inference is wrapped in N-API `AsyncTask` on the Rust
+  // side so the Electron main process doesn't freeze while the VLM
+  // runs (cold-load + inference can take 5–30 s). Each call resolves
+  // a JS `Promise<string>` once the worker thread finishes.
   visionDescribeImage(
     rgba: number[],
     width: number,
     height: number,
     userPrompt: string,
-  ): string;
-  visionDescribeNode(nodeId: string, userPrompt: string): string;
-  visionGenerateAltText(rgba: number[], width: number, height: number): string;
-  visionGenerateAltTextForNode(nodeId: string): string;
-  visionAnalyzeDesign(rgba: number[], width: number, height: number): string;
+  ): Promise<string>;
+  visionDescribeNode(nodeId: string, userPrompt: string): Promise<string>;
+  visionGenerateAltText(
+    rgba: number[],
+    width: number,
+    height: number,
+  ): Promise<string>;
+  visionGenerateAltTextForNode(nodeId: string): Promise<string>;
+  visionAnalyzeDesign(
+    rgba: number[],
+    width: number,
+    height: number,
+  ): Promise<string>;
   aiExtractBrandFromImage(
     rgba: number[],
     width: number,
     height: number,
-  ): string;
+  ): Promise<string>;
   aiSuggestCrop(
     rgba: number[],
     width: number,
     height: number,
     aspectRatio: number,
-  ): string;
+  ): Promise<string>;
   aiSuggestDesignTokens(
     rgba: number[],
     width: number,
     height: number,
-  ): string;
-  aiDescribeStyle(rgba: number[], width: number, height: number): string;
+  ): Promise<string>;
+  aiDescribeStyle(
+    rgba: number[],
+    width: number,
+    height: number,
+  ): Promise<string>;
   visionRecommendedPack(): string;
   visionMmprojFor(packId: string): string;
   visionListablePacks(): string[];
@@ -219,7 +235,7 @@ export interface Bridge {
     height: number,
     steps: number,
     seed: number | null,
-  ): string;
+  ): Promise<string>;
   imageGenAllowed(): boolean;
   imageGenRecommendedPack(): string;
   exportSvg(nodeIds: string[], optionsJson: string): string;

@@ -861,7 +861,7 @@ pub fn ai_alt_text_for_node(node_id: Uuid) -> Result<String> {
     // statistics alone can describe ("Bright photographic image
     // dominated by warm reds…"). On any VLM failure, the heuristic
     // text is kept verbatim — degraded gracefully, never errored.
-    if let Ok(text) = crate::phase4::vision_generate_alt_text(rgba.as_raw().clone(), w, h) {
+    if let Ok(text) = crate::phase4::vision_generate_alt_text(rgba.as_raw(), w, h) {
         let trimmed = text.trim();
         if !trimmed.is_empty() {
             report.text = trimmed.to_string();

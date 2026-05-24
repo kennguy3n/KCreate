@@ -2462,94 +2462,349 @@ pub fn vision_status() -> NapiResult<String> {
         .map_err(|e| NapiError::from_reason(format!("vision_status: {e}")))
 }
 
+// ----- Vision inference (AsyncTask) -----
+//
+// Every VLM / diffusion HTTP round-trip below can take 5–30+
+// seconds (cold model load, prompt processing on CPU). Running them
+// on the Electron main thread freezes the window for the duration,
+// which is what the LLM chat task wrappers above already avoid. We
+// mirror that pattern: each `pub fn` constructs a `Task`, returns
+// `AsyncTask<...>`, and N-API resolves the JS `Promise<string>` once
+// the libuv worker finishes. The renderer was already `await`-ing
+// these calls, so the JS-visible contract doesn't change — we just
+// stop freezing the UI while the model thinks.
+
 /// Describe a raw RGBA image. Returns the model's text answer.
-#[napi]
-#[allow(clippy::needless_pass_by_value)]
+#[derive(Debug)]
+pub struct VisionDescribeImageTask {
+    rgba: Vec<u8>,
+    width: u32,
+    height: u32,
+    user_prompt: String,
+}
+
+impl Task for VisionDescribeImageTask {
+    type Output = String;
+    type JsValue = String;
+
+    fn compute(&mut self) -> NapiResult<Self::Output> {
+        phase4::vision_describe_image(&self.rgba, self.width, self.height, &self.user_prompt)
+            .map_err(map_phase4_err)
+    }
+
+    fn resolve(&mut self, _env: Env, output: Self::Output) -> NapiResult<Self::JsValue> {
+        Ok(output)
+    }
+}
+
+#[napi(ts_return_type = "Promise<string>")]
 pub fn vision_describe_image(
     rgba: Vec<u8>,
     width: u32,
     height: u32,
     user_prompt: String,
-) -> NapiResult<String> {
-    phase4::vision_describe_image(rgba, width, height, user_prompt).map_err(map_phase4_err)
+) -> AsyncTask<VisionDescribeImageTask> {
+    AsyncTask::new(VisionDescribeImageTask {
+        rgba,
+        width,
+        height,
+        user_prompt,
+    })
 }
 
 /// Describe the image stored on a raster layer node.
-#[napi]
-#[allow(clippy::needless_pass_by_value)]
-pub fn vision_describe_node(node_id: String, user_prompt: String) -> NapiResult<String> {
+#[derive(Debug)]
+pub struct VisionDescribeNodeTask {
+    node_id: Uuid,
+    user_prompt: String,
+}
+
+impl Task for VisionDescribeNodeTask {
+    type Output = String;
+    type JsValue = String;
+
+    fn compute(&mut self) -> NapiResult<Self::Output> {
+        phase4::vision_describe_node(self.node_id, &self.user_prompt).map_err(map_phase4_err)
+    }
+
+    fn resolve(&mut self, _env: Env, output: Self::Output) -> NapiResult<Self::JsValue> {
+        Ok(output)
+    }
+}
+
+#[napi(ts_return_type = "Promise<string>")]
+pub fn vision_describe_node(
+    node_id: String,
+    user_prompt: String,
+) -> NapiResult<AsyncTask<VisionDescribeNodeTask>> {
     let id = parse_uuid(&node_id)?;
-    phase4::vision_describe_node(id, user_prompt).map_err(map_phase4_err)
+    Ok(AsyncTask::new(VisionDescribeNodeTask {
+        node_id: id,
+        user_prompt,
+    }))
 }
 
 /// Generate alt-text for a raw RGBA image.
-#[napi]
-#[allow(clippy::needless_pass_by_value)]
-pub fn vision_generate_alt_text(rgba: Vec<u8>, width: u32, height: u32) -> NapiResult<String> {
-    phase4::vision_generate_alt_text(rgba, width, height).map_err(map_phase4_err)
+#[derive(Debug)]
+pub struct VisionGenerateAltTextTask {
+    rgba: Vec<u8>,
+    width: u32,
+    height: u32,
+}
+
+impl Task for VisionGenerateAltTextTask {
+    type Output = String;
+    type JsValue = String;
+
+    fn compute(&mut self) -> NapiResult<Self::Output> {
+        phase4::vision_generate_alt_text(&self.rgba, self.width, self.height)
+            .map_err(map_phase4_err)
+    }
+
+    fn resolve(&mut self, _env: Env, output: Self::Output) -> NapiResult<Self::JsValue> {
+        Ok(output)
+    }
+}
+
+#[napi(ts_return_type = "Promise<string>")]
+pub fn vision_generate_alt_text(
+    rgba: Vec<u8>,
+    width: u32,
+    height: u32,
+) -> AsyncTask<VisionGenerateAltTextTask> {
+    AsyncTask::new(VisionGenerateAltTextTask {
+        rgba,
+        width,
+        height,
+    })
 }
 
 /// Generate alt-text for a document raster node, using the VLM.
-#[napi]
-#[allow(clippy::needless_pass_by_value)]
-pub fn vision_generate_alt_text_for_node(node_id: String) -> NapiResult<String> {
+#[derive(Debug)]
+pub struct VisionGenerateAltTextForNodeTask {
+    node_id: Uuid,
+}
+
+impl Task for VisionGenerateAltTextForNodeTask {
+    type Output = String;
+    type JsValue = String;
+
+    fn compute(&mut self) -> NapiResult<Self::Output> {
+        phase4::vision_generate_alt_text_for_node(self.node_id).map_err(map_phase4_err)
+    }
+
+    fn resolve(&mut self, _env: Env, output: Self::Output) -> NapiResult<Self::JsValue> {
+        Ok(output)
+    }
+}
+
+#[napi(ts_return_type = "Promise<string>")]
+pub fn vision_generate_alt_text_for_node(
+    node_id: String,
+) -> NapiResult<AsyncTask<VisionGenerateAltTextForNodeTask>> {
     let id = parse_uuid(&node_id)?;
-    phase4::vision_generate_alt_text_for_node(id).map_err(map_phase4_err)
+    Ok(AsyncTask::new(VisionGenerateAltTextForNodeTask {
+        node_id: id,
+    }))
 }
 
 /// Run a design critique on the given RGBA snapshot.
-#[napi]
-#[allow(clippy::needless_pass_by_value)]
-pub fn vision_analyze_design(rgba: Vec<u8>, width: u32, height: u32) -> NapiResult<String> {
-    phase4::vision_analyze_design(rgba, width, height).map_err(map_phase4_err)
+#[derive(Debug)]
+pub struct VisionAnalyzeDesignTask {
+    rgba: Vec<u8>,
+    width: u32,
+    height: u32,
+}
+
+impl Task for VisionAnalyzeDesignTask {
+    type Output = String;
+    type JsValue = String;
+
+    fn compute(&mut self) -> NapiResult<Self::Output> {
+        phase4::vision_analyze_design(&self.rgba, self.width, self.height).map_err(map_phase4_err)
+    }
+
+    fn resolve(&mut self, _env: Env, output: Self::Output) -> NapiResult<Self::JsValue> {
+        Ok(output)
+    }
+}
+
+#[napi(ts_return_type = "Promise<string>")]
+pub fn vision_analyze_design(
+    rgba: Vec<u8>,
+    width: u32,
+    height: u32,
+) -> AsyncTask<VisionAnalyzeDesignTask> {
+    AsyncTask::new(VisionAnalyzeDesignTask {
+        rgba,
+        width,
+        height,
+    })
 }
 
 /// Extract a brand profile from a reference image. Returns JSON-
 /// encoded [`kcreate_ai::brand_extract::BrandExtraction`].
-#[napi]
-#[allow(clippy::needless_pass_by_value)]
-pub fn ai_extract_brand_from_image(rgba: Vec<u8>, width: u32, height: u32) -> NapiResult<String> {
-    let res = phase4::vision_extract_brand(rgba, width, height).map_err(map_phase4_err)?;
-    serde_json::to_string(&res)
-        .map_err(|e| NapiError::from_reason(format!("ai_extract_brand: {e}")))
+#[derive(Debug)]
+pub struct AiExtractBrandFromImageTask {
+    rgba: Vec<u8>,
+    width: u32,
+    height: u32,
+}
+
+impl Task for AiExtractBrandFromImageTask {
+    type Output = String;
+    type JsValue = String;
+
+    fn compute(&mut self) -> NapiResult<Self::Output> {
+        let res = phase4::vision_extract_brand(&self.rgba, self.width, self.height)
+            .map_err(map_phase4_err)?;
+        serde_json::to_string(&res)
+            .map_err(|e| NapiError::from_reason(format!("ai_extract_brand: {e}")))
+    }
+
+    fn resolve(&mut self, _env: Env, output: Self::Output) -> NapiResult<Self::JsValue> {
+        Ok(output)
+    }
+}
+
+#[napi(ts_return_type = "Promise<string>")]
+pub fn ai_extract_brand_from_image(
+    rgba: Vec<u8>,
+    width: u32,
+    height: u32,
+) -> AsyncTask<AiExtractBrandFromImageTask> {
+    AsyncTask::new(AiExtractBrandFromImageTask {
+        rgba,
+        width,
+        height,
+    })
 }
 
 /// Suggest a content-aware crop. `aspect_ratio` is the desired
 /// width/height ratio; pass `0` to let the VLM choose.
-#[napi]
-#[allow(clippy::needless_pass_by_value)]
+#[derive(Debug)]
+pub struct AiSuggestCropTask {
+    rgba: Vec<u8>,
+    width: u32,
+    height: u32,
+    aspect_ratio: Option<f32>,
+}
+
+impl Task for AiSuggestCropTask {
+    type Output = String;
+    type JsValue = String;
+
+    fn compute(&mut self) -> NapiResult<Self::Output> {
+        let res = phase4::vision_suggest_crop(
+            &self.rgba,
+            self.width,
+            self.height,
+            self.aspect_ratio,
+        )
+        .map_err(map_phase4_err)?;
+        serde_json::to_string(&res)
+            .map_err(|e| NapiError::from_reason(format!("ai_suggest_crop: {e}")))
+    }
+
+    fn resolve(&mut self, _env: Env, output: Self::Output) -> NapiResult<Self::JsValue> {
+        Ok(output)
+    }
+}
+
+#[napi(ts_return_type = "Promise<string>")]
 pub fn ai_suggest_crop(
     rgba: Vec<u8>,
     width: u32,
     height: u32,
     aspect_ratio: f64,
-) -> NapiResult<String> {
+) -> AsyncTask<AiSuggestCropTask> {
+    #[allow(clippy::cast_possible_truncation)]
     let aspect = if aspect_ratio > 0.0 {
         Some(aspect_ratio as f32)
     } else {
         None
     };
-    let res = phase4::vision_suggest_crop(rgba, width, height, aspect).map_err(map_phase4_err)?;
-    serde_json::to_string(&res).map_err(|e| NapiError::from_reason(format!("ai_suggest_crop: {e}")))
+    AsyncTask::new(AiSuggestCropTask {
+        rgba,
+        width,
+        height,
+        aspect_ratio: aspect,
+    })
 }
 
 /// Suggest a starter design-token set (spacing, colors, typography)
 /// for the given artboard snapshot.
-#[napi]
-#[allow(clippy::needless_pass_by_value)]
-pub fn ai_suggest_design_tokens(rgba: Vec<u8>, width: u32, height: u32) -> NapiResult<String> {
-    let res = phase4::vision_suggest_design_tokens(rgba, width, height).map_err(map_phase4_err)?;
-    serde_json::to_string(&res)
-        .map_err(|e| NapiError::from_reason(format!("ai_suggest_design_tokens: {e}")))
+#[derive(Debug)]
+pub struct AiSuggestDesignTokensTask {
+    rgba: Vec<u8>,
+    width: u32,
+    height: u32,
+}
+
+impl Task for AiSuggestDesignTokensTask {
+    type Output = String;
+    type JsValue = String;
+
+    fn compute(&mut self) -> NapiResult<Self::Output> {
+        let res = phase4::vision_suggest_design_tokens(&self.rgba, self.width, self.height)
+            .map_err(map_phase4_err)?;
+        serde_json::to_string(&res)
+            .map_err(|e| NapiError::from_reason(format!("ai_suggest_design_tokens: {e}")))
+    }
+
+    fn resolve(&mut self, _env: Env, output: Self::Output) -> NapiResult<Self::JsValue> {
+        Ok(output)
+    }
+}
+
+#[napi(ts_return_type = "Promise<string>")]
+pub fn ai_suggest_design_tokens(
+    rgba: Vec<u8>,
+    width: u32,
+    height: u32,
+) -> AsyncTask<AiSuggestDesignTokensTask> {
+    AsyncTask::new(AiSuggestDesignTokensTask {
+        rgba,
+        width,
+        height,
+    })
 }
 
 /// Describe the visual style of an image.
-#[napi]
-#[allow(clippy::needless_pass_by_value)]
-pub fn ai_describe_style(rgba: Vec<u8>, width: u32, height: u32) -> NapiResult<String> {
-    let res = phase4::vision_describe_style(rgba, width, height).map_err(map_phase4_err)?;
-    serde_json::to_string(&res)
-        .map_err(|e| NapiError::from_reason(format!("ai_describe_style: {e}")))
+#[derive(Debug)]
+pub struct AiDescribeStyleTask {
+    rgba: Vec<u8>,
+    width: u32,
+    height: u32,
+}
+
+impl Task for AiDescribeStyleTask {
+    type Output = String;
+    type JsValue = String;
+
+    fn compute(&mut self) -> NapiResult<Self::Output> {
+        let res = phase4::vision_describe_style(&self.rgba, self.width, self.height)
+            .map_err(map_phase4_err)?;
+        serde_json::to_string(&res)
+            .map_err(|e| NapiError::from_reason(format!("ai_describe_style: {e}")))
+    }
+
+    fn resolve(&mut self, _env: Env, output: Self::Output) -> NapiResult<Self::JsValue> {
+        Ok(output)
+    }
+}
+
+#[napi(ts_return_type = "Promise<string>")]
+pub fn ai_describe_style(
+    rgba: Vec<u8>,
+    width: u32,
+    height: u32,
+) -> AsyncTask<AiDescribeStyleTask> {
+    AsyncTask::new(AiDescribeStyleTask {
+        rgba,
+        width,
+        height,
+    })
 }
 
 /// Recommended vision pack for the current device tier + platform.
@@ -2598,22 +2853,59 @@ pub fn image_gen_status() -> NapiResult<String> {
         .map_err(|e| NapiError::from_reason(format!("image_gen_status: {e}")))
 }
 
+/// `napi::Task` for `image_gen_generate`. FLUX diffusion runs for
+/// tens of seconds even on a Tier-2 GPU; the main process must stay
+/// responsive while it does.
+#[derive(Debug)]
+pub struct ImageGenGenerateTask {
+    prompt: String,
+    width: u32,
+    height: u32,
+    steps: u32,
+    seed: Option<u64>,
+}
+
+impl Task for ImageGenGenerateTask {
+    type Output = String;
+    type JsValue = String;
+
+    fn compute(&mut self) -> NapiResult<Self::Output> {
+        let out = phase4::image_gen_generate(
+            std::mem::take(&mut self.prompt),
+            self.width,
+            self.height,
+            self.steps,
+            self.seed,
+        )
+        .map_err(map_phase4_err)?;
+        serde_json::to_string(&out)
+            .map_err(|e| NapiError::from_reason(format!("image_gen_generate: {e}")))
+    }
+
+    fn resolve(&mut self, _env: Env, output: Self::Output) -> NapiResult<Self::JsValue> {
+        Ok(output)
+    }
+}
+
 /// Generate an image. Returns JSON-encoded
-/// [`phase4::GeneratedImagePayload`] (PNG bytes as base64).
-#[napi]
-#[allow(clippy::needless_pass_by_value)]
+/// [`phase4::GeneratedImagePayload`] (PNG bytes as base64). Runs on
+/// a worker thread; resolves a JS `Promise<string>`.
+#[napi(ts_return_type = "Promise<string>")]
 pub fn image_gen_generate(
     prompt: String,
     width: u32,
     height: u32,
     steps: u32,
     seed: Option<i64>,
-) -> NapiResult<String> {
+) -> AsyncTask<ImageGenGenerateTask> {
     let seed = seed.map(i64::unsigned_abs);
-    let out =
-        phase4::image_gen_generate(prompt, width, height, steps, seed).map_err(map_phase4_err)?;
-    serde_json::to_string(&out)
-        .map_err(|e| NapiError::from_reason(format!("image_gen_generate: {e}")))
+    AsyncTask::new(ImageGenGenerateTask {
+        prompt,
+        width,
+        height,
+        steps,
+        seed,
+    })
 }
 
 /// Is image generation allowed at all on this device? Mirrors

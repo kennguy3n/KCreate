@@ -582,6 +582,12 @@ export interface ResourceLimits {
   /// `model_registry`) so a pack's `sizeBytes / (1024*1024)` can
   /// be compared directly to this cap. Decimal-MB callers will
   /// disagree by ~2.4% near tier boundaries.
+  ///
+  /// This is the **effective** cap (i.e. halved when
+  /// `lowResourceMode` is true), so it always agrees with what
+  /// `vision_listable_packs` and `spawn_vision` will actually
+  /// enforce on the Rust side. Do NOT apply your own
+  /// low-resource halving on top — that would double-discount.
   visionModelMaxMb: number;
   /// `Debug` form of the host `Platform` enum
   /// (`"MacOsAppleSilicon"`, `"Linux"`, `"Windows"`, …). The

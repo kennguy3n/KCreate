@@ -3421,7 +3421,14 @@ pub fn resource_limits() -> ResourceLimits {
         effective_max_model_mb: cfg.effective_max_model_mb(),
         gpu_rendering_allowed: cfg.gpu_rendering_allowed(),
         image_generation_allowed: cfg.image_generation_allowed(),
-        vision_model_max_mb: cfg.device_tier.vision_model_max_mb(),
+        // Use `effective_vision_model_mb` so the UI matches what
+        // `phase4::vision_listable_packs` and `phase4::spawn_vision`
+        // actually enforce. The raw `device_tier.vision_model_max_mb`
+        // ignores `is_low_resource`, which halves the budget — so
+        // surfacing the tier-only cap would make the Model Manager
+        // show packs as installable that the Rust side will then
+        // reject at sidecar-start time.
+        vision_model_max_mb: cfg.effective_vision_model_mb(),
         platform: format!("{:?}", cfg.platform),
     }
 }

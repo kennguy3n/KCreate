@@ -43,12 +43,7 @@ pub fn gaussian_kernel_1d(radius: f32) -> Vec<f32> {
     k
 }
 
-fn convolve_horizontal(
-    src: &[u8],
-    width: usize,
-    height: usize,
-    kernel: &[f32],
-) -> Vec<u8> {
+fn convolve_horizontal(src: &[u8], width: usize, height: usize, kernel: &[f32]) -> Vec<u8> {
     let r = (kernel.len() / 2) as i64;
     let stride = width * 4;
     let mut out = vec![0u8; stride * height];
@@ -76,12 +71,7 @@ fn convolve_horizontal(
     out
 }
 
-fn convolve_vertical(
-    src: &[u8],
-    width: usize,
-    height: usize,
-    kernel: &[f32],
-) -> Vec<u8> {
+fn convolve_vertical(src: &[u8], width: usize, height: usize, kernel: &[f32]) -> Vec<u8> {
     let r = (kernel.len() / 2) as i64;
     let stride = width * 4;
     let mut out = vec![0u8; stride * height];
@@ -400,7 +390,13 @@ mod tests {
         // brighten — that's the textbook unsharp halo.
         let before_edge = after[7 * 4];
         let after_edge = after[8 * 4];
-        assert!(before_edge <= 50, "expected darkening before edge, got {before_edge}");
-        assert!(after_edge >= 200, "expected brightening after edge, got {after_edge}");
+        assert!(
+            before_edge <= 50,
+            "expected darkening before edge, got {before_edge}"
+        );
+        assert!(
+            after_edge >= 200,
+            "expected brightening after edge, got {after_edge}"
+        );
     }
 }

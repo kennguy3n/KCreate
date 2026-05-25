@@ -227,8 +227,8 @@ impl TileGrid {
     /// Returns `[0, 0, 0, 0]` for unallocated sparse tiles.
     #[must_use]
     pub fn read_pixel_clamped(&self, x: i64, y: i64) -> [u8; 4] {
-        let cx = x.clamp(0, self.width as i64 - 1) as u32;
-        let cy = y.clamp(0, self.height as i64 - 1) as u32;
+        let cx = x.clamp(0, i64::from(self.width) - 1) as u32;
+        let cy = y.clamp(0, i64::from(self.height) - 1) as u32;
         let col = cx / self.tile_size;
         let row = cy / self.tile_size;
         let idx = (row as usize) * (self.cols as usize) + (col as usize);

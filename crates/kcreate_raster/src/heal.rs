@@ -68,10 +68,10 @@ pub fn heal(grid: &mut TileGrid, src_x: u32, src_y: u32, dst_x: u32, dst_y: u32,
     let r = radius as f32;
     let r2 = r * r;
     // Luminance offset = mean(dst ring) - mean(src ring).
-    let src_lum = ring_mean_luminance(grid, src_x as i64, src_y as i64, r, r + 2.0);
-    let dst_lum = ring_mean_luminance(grid, dst_x as i64, dst_y as i64, r, r + 2.0);
+    let src_lum = ring_mean_luminance(grid, i64::from(src_x), i64::from(src_y), r, r + 2.0);
+    let dst_lum = ring_mean_luminance(grid, i64::from(dst_x), i64::from(dst_y), r, r + 2.0);
     let lum_offset = dst_lum - src_lum;
-    let r_i = radius as i64;
+    let r_i = i64::from(radius);
     // Read all source pixels up front so the destination writes can't
     // disturb the source patch when source and destination overlap.
     let mut samples: Vec<(i64, i64, [u8; 4])> = Vec::new();
@@ -81,7 +81,7 @@ pub fn heal(grid: &mut TileGrid, src_x: u32, src_y: u32, dst_x: u32, dst_y: u32,
             if d2 > r2 {
                 continue;
             }
-            let sp = grid.read_pixel_clamped(src_x as i64 + dx, src_y as i64 + dy);
+            let sp = grid.read_pixel_clamped(i64::from(src_x) + dx, i64::from(src_y) + dy);
             samples.push((dx, dy, sp));
         }
     }
@@ -91,9 +91,9 @@ pub fn heal(grid: &mut TileGrid, src_x: u32, src_y: u32, dst_x: u32, dst_y: u32,
         // Cosine-squared falloff: 1.0 at centre, 0.0 at the disc edge.
         let t = (d / r).clamp(0.0, 1.0);
         let alpha = (1.0 - t).powi(2);
-        let nx = dst_x as i64 + dx;
-        let ny = dst_y as i64 + dy;
-        if nx < 0 || ny < 0 || nx >= grid.width as i64 || ny >= grid.height as i64 {
+        let nx = i64::from(dst_x) + dx;
+        let ny = i64::from(dst_y) + dy;
+        if nx < 0 || ny < 0 || nx >= i64::from(grid.width) || ny >= i64::from(grid.height) {
             continue;
         }
         let existing = grid.read_pixel_clamped(nx, ny);
@@ -150,12 +150,7 @@ mod tests {
         let mut buf = Vec::with_capacity(32 * 32 * 4);
         for y in 0..32u32 {
             for x in 0..32u32 {
-                buf.extend_from_slice(&[
-                    (x * 8) as u8,
-                    (y * 8) as u8,
-                    50,
-                    255,
-                ]);
+                buf.extend_from_slice(&[(x * 8) as u8, (y * 8) as u8, 50, 255]);
             }
         }
         let mut g = TileGrid::from_image(&buf, 32, 32, 16).expect("grid");

@@ -131,8 +131,7 @@ impl Color {
     pub fn alpha(&self) -> f32 {
         match *self {
             Self::Srgb { a, .. } | Self::Cmyk { a, .. } | Self::Hsl { a, .. } => a,
-            Self::Lab { alpha, .. } => alpha,
-            Self::Spot { alpha, .. } => alpha,
+            Self::Lab { alpha, .. } | Self::Spot { alpha, .. } => alpha,
         }
     }
 

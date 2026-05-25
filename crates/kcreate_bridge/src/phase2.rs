@@ -25,7 +25,7 @@ use kcreate_export::pdf::RasterPixelCache;
 use kcreate_export::pdf_import::{
     import_pdf as pdf_import_run, ExtractedImageData, ImportedPdf, PdfImportError,
 };
-use kcreate_export::preflight::{run_preflight, PreflightIssue, PreflightOptions};
+use kcreate_export::preflight::{run_preflight_with_spots, PreflightIssue, PreflightOptions};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -54,7 +54,14 @@ pub fn preflight_run(req: &PreflightRequest) -> Result<Vec<PreflightIssue>> {
         .iter()
         .map(|s| Uuid::parse_str(s).map_err(|e| DocumentBridgeError::InvalidUuid(s.clone(), e)))
         .collect::<Result<Vec<Uuid>>>()?;
-    with_workspace(|ws| Ok(run_preflight(&ws.project.document, &pages, &req.options)))
+    with_workspace(|ws| {
+        Ok(run_preflight_with_spots(
+            &ws.project.document,
+            &pages,
+            &req.options,
+            &ws.project.spot_color_library,
+        ))
+    })
 }
 
 // -----------------------------------------------------------------------------

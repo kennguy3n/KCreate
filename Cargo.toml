@@ -148,6 +148,10 @@ lopdf = { version = "0.31", default-features = false, features = ["pom_parser"] 
 # Data-parallel iteration (used by raster tile ops + batch export)
 rayon = "1.10"
 
+# ZIP archive read/write for the `.kbrand` portable brand kit format
+# (manifest.json + fonts/ + logos/). Pure Rust, no native deps.
+zip = { version = "2.2", default-features = false, features = ["deflate"] }
+
 # Font discovery + text shaping (Phase 1 text crate)
 fontdb = { version = "0.22", default-features = false, features = ["std", "memmap", "fs"] }
 rustybuzz = "0.18"

@@ -50,7 +50,7 @@ pub fn sample_profile(profile: &[(f64, f64)], t: f64, default: f64) -> f64 {
 fn segment_normal(a: Point, b: Point) -> (f64, f64) {
     let dx = b.x - a.x;
     let dy = b.y - a.y;
-    let len = (dx * dx + dy * dy).sqrt();
+    let len = dx.hypot(dy);
     if len < f64::EPSILON {
         return (0.0, 0.0);
     }
@@ -85,7 +85,9 @@ pub fn expand_variable_stroke(
             }
             current.push(p);
         }
-        kurbo::PathEl::LineTo(p) => current.push(p),
+        kurbo::PathEl::LineTo(p)
+        | kurbo::PathEl::QuadTo(_, p)
+        | kurbo::PathEl::CurveTo(_, _, p) => current.push(p),
         kurbo::PathEl::ClosePath => {
             if let Some(first) = current.first().copied() {
                 if let Some(last) = current.last() {
@@ -98,7 +100,6 @@ pub fn expand_variable_stroke(
                 polylines.push(std::mem::take(&mut current));
             }
         }
-        kurbo::PathEl::QuadTo(_, p) | kurbo::PathEl::CurveTo(_, _, p) => current.push(p),
     });
     if current.len() > 1 {
         polylines.push(current);
@@ -117,7 +118,7 @@ pub fn expand_variable_stroke(
         for w in poly.windows(2) {
             let dx = w[1].x - w[0].x;
             let dy = w[1].y - w[0].y;
-            total += (dx * dx + dy * dy).sqrt();
+            total += dx.hypot(dy);
             cumlen.push(total);
         }
         if total < f64::EPSILON {
@@ -141,7 +142,7 @@ pub fn expand_variable_stroke(
             };
             let mut nx = (nx_in + nx_out) * 0.5;
             let mut ny = (ny_in + ny_out) * 0.5;
-            let n_len = (nx * nx + ny * ny).sqrt();
+            let n_len = nx.hypot(ny);
             if n_len > f64::EPSILON {
                 nx /= n_len;
                 ny /= n_len;

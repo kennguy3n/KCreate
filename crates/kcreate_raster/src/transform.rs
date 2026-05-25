@@ -24,8 +24,7 @@ pub fn crop(grid: &TileGrid, x: u32, y: u32, w: u32, h: u32) -> TileGrid {
     if x0 >= x1 || y0 >= y1 {
         // Degenerate crop: return a 1×1 transparent grid so callers
         // can always rely on a fresh `TileGrid` coming back.
-        return TileGrid::new(1, 1, grid.tile_size.max(1))
-            .expect("1x1 tile grid is always valid");
+        return TileGrid::new(1, 1, grid.tile_size.max(1)).expect("1x1 tile grid is always valid");
     }
     let out_w = x1 - x0;
     let out_h = y1 - y0;
@@ -162,12 +161,7 @@ pub fn rotate(grid: &TileGrid, angle_deg: f32) -> TileGrid {
     // Compute the rotated bounding box.
     let w_f = w as f32;
     let h_f = h as f32;
-    let corners = [
-        (0.0f32, 0.0f32),
-        (w_f, 0.0),
-        (0.0, h_f),
-        (w_f, h_f),
-    ];
+    let corners = [(0.0f32, 0.0f32), (w_f, 0.0), (0.0, h_f), (w_f, h_f)];
     let mut min_x = f32::INFINITY;
     let mut max_x = f32::NEG_INFINITY;
     let mut min_y = f32::INFINITY;

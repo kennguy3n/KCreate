@@ -27,14 +27,14 @@ fn flatten_to_polyline(path: &VectorPath) -> Vec<Vec<Point>> {
             }
             current.push(p);
         }
-        kurbo::PathEl::LineTo(p) => current.push(p),
+        kurbo::PathEl::LineTo(p)
+        | kurbo::PathEl::QuadTo(_, p)
+        | kurbo::PathEl::CurveTo(_, _, p) => current.push(p),
         kurbo::PathEl::ClosePath => {
             if let Some(first) = current.first().copied() {
-                if current
-                    .last()
-                    .map(|last| (last.x - first.x).abs() > 1e-9 || (last.y - first.y).abs() > 1e-9)
-                    .unwrap_or(false)
-                {
+                if current.last().is_some_and(|last| {
+                    (last.x - first.x).abs() > 1e-9 || (last.y - first.y).abs() > 1e-9
+                }) {
                     current.push(first);
                 }
             }
@@ -42,7 +42,6 @@ fn flatten_to_polyline(path: &VectorPath) -> Vec<Vec<Point>> {
                 polylines.push(std::mem::take(&mut current));
             }
         }
-        kurbo::PathEl::QuadTo(_, p) | kurbo::PathEl::CurveTo(_, _, p) => current.push(p),
     });
     if current.len() > 1 {
         polylines.push(current);
@@ -78,10 +77,7 @@ fn polylines_to_vector(polylines: &[Vec<Point>], closed: bool, fill_rule: FillRu
 #[must_use]
 pub fn simplify(path: &VectorPath, tolerance: f64) -> VectorPath {
     let polylines = flatten_to_polyline(path);
-    let simplified: Vec<Vec<Point>> = polylines
-        .iter()
-        .map(|poly| rdp(poly, tolerance))
-        .collect();
+    let simplified: Vec<Vec<Point>> = polylines.iter().map(|poly| rdp(poly, tolerance)).collect();
     polylines_to_vector(&simplified, path.closed, path.fill_rule)
 }
 
@@ -108,8 +104,8 @@ fn rdp_recursive(points: &[Point], lo: usize, hi: usize, tolerance: f64, keep: &
     let b = points[hi];
     let mut max_d = 0.0f64;
     let mut max_i = lo;
-    for i in (lo + 1)..hi {
-        let d = perpendicular_distance(points[i], a, b);
+    for (i, p) in points.iter().enumerate().take(hi).skip(lo + 1) {
+        let d = perpendicular_distance(*p, a, b);
         if d > max_d {
             max_d = d;
             max_i = i;
@@ -127,13 +123,13 @@ fn perpendicular_distance(p: Point, a: Point, b: Point) -> f64 {
     let dy = b.y - a.y;
     let len_sq = dx * dx + dy * dy;
     if len_sq < f64::EPSILON {
-        return ((p.x - a.x).powi(2) + (p.y - a.y).powi(2)).sqrt();
+        return (p.x - a.x).hypot(p.y - a.y);
     }
     let t = ((p.x - a.x) * dx + (p.y - a.y) * dy) / len_sq;
     let t = t.clamp(0.0, 1.0);
     let cx = a.x + t * dx;
     let cy = a.y + t * dy;
-    ((p.x - cx).powi(2) + (p.y - cy).powi(2)).sqrt()
+    (p.x - cx).hypot(p.y - cy)
 }
 
 /// Chaikin's corner-cutting smoothing.
@@ -204,7 +200,7 @@ pub fn offset(path: &VectorPath, distance: f64) -> VectorPath {
 fn segment_normal(a: Point, b: Point) -> (f64, f64) {
     let dx = b.x - a.x;
     let dy = b.y - a.y;
-    let len = (dx * dx + dy * dy).sqrt();
+    let len = dx.hypot(dy);
     if len < f64::EPSILON {
         return (0.0, 0.0);
     }
@@ -242,7 +238,7 @@ fn offset_polyline(points: &[Point], distance: f64, closed: bool) -> Vec<Point> 
         let ny = (ny_in + ny_out) * 0.5;
         // Re-normalise (miter shortens when corners are sharp; this
         // keeps offsets perpendicular at the joint).
-        let len = (nx * nx + ny * ny).sqrt();
+        let len = nx.hypot(ny);
         let (nxr, nyr) = if len < f64::EPSILON {
             (nx_out, ny_out)
         } else {

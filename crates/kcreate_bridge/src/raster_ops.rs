@@ -243,12 +243,11 @@ pub fn apply_levels(node_id: Uuid, black_point: f32, white_point: f32, gamma: f3
 /// Apply a Curves adjustment defined by `(input, output)` control points.
 pub fn apply_curves(node_id: Uuid, points: Vec<(f32, f32)>) -> Result<()> {
     let mut pixels = load_layer_pixels(node_id)?;
-    let curve_points: Vec<CurvePoint> =
-        points.iter().map(|(t, v)| CurvePoint::new(*t, *v)).collect();
-    apply_adjustments_in_place(
-        &mut pixels.rgba,
-        &[AdjustmentLayer::Curves(curve_points)],
-    );
+    let curve_points: Vec<CurvePoint> = points
+        .iter()
+        .map(|(t, v)| CurvePoint::new(*t, *v))
+        .collect();
+    apply_adjustments_in_place(&mut pixels.rgba, &[AdjustmentLayer::Curves(curve_points)]);
     replace_layer_pixels(
         node_id,
         pixels.rgba,
@@ -472,12 +471,11 @@ pub fn preview_filter(node_id: Uuid, filter: PreviewFilter) -> Result<(Vec<u8>, 
             (pixels.rgba, pixels.width, pixels.height)
         }
         PreviewFilter::Curves { points } => {
-            let curve_points: Vec<CurvePoint> =
-                points.iter().map(|(t, v)| CurvePoint::new(*t, *v)).collect();
-            apply_adjustments_in_place(
-                &mut pixels.rgba,
-                &[AdjustmentLayer::Curves(curve_points)],
-            );
+            let curve_points: Vec<CurvePoint> = points
+                .iter()
+                .map(|(t, v)| CurvePoint::new(*t, *v))
+                .collect();
+            apply_adjustments_in_place(&mut pixels.rgba, &[AdjustmentLayer::Curves(curve_points)]);
             (pixels.rgba, pixels.width, pixels.height)
         }
         PreviewFilter::Blur { radius, kind } => {

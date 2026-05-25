@@ -19,6 +19,15 @@ fn sample_seg(seg: PathSeg, t: f64) -> Point {
     seg.eval(t)
 }
 
+fn push_point(current: &mut Vec<PathSegment>, point: Point, force_move: bool) {
+    let pp = PathPoint::new(point.x, point.y);
+    if force_move || current.is_empty() {
+        current.push(PathSegment::MoveTo(pp));
+    } else {
+        current.push(PathSegment::LineTo(pp));
+    }
+}
+
 /// Walk the path by arc length, emitting sub-paths whose visible /
 /// hidden state alternates according to `pattern`. `offset` shifts
 /// the start of the pattern along the curve (a typical SVG-style
@@ -45,7 +54,12 @@ pub fn dash(path: &VectorPath, pattern: &[f64], offset: f64) -> Vec<VectorPath> 
     // pieces of the pattern before starting the walk.
     let mut remaining_in_dash = pattern[0].max(0.0);
     let mut to_skip = offset.rem_euclid(pattern.iter().filter(|p| **p > 0.0).sum::<f64>().max(1.0));
-    while to_skip > 0.0 {
+    // We're walking arc length in floats by design; this loop's
+    // termination is bounded by the number of pattern phases, not by
+    // an exact float comparison. `f64::EPSILON` is a guard, not a
+    // pixel-equality test.
+    #[allow(clippy::while_float)]
+    while to_skip > f64::EPSILON {
         if remaining_in_dash > to_skip {
             remaining_in_dash -= to_skip;
             to_skip = 0.0;
@@ -54,15 +68,6 @@ pub fn dash(path: &VectorPath, pattern: &[f64], offset: f64) -> Vec<VectorPath> 
             pattern_idx = (pattern_idx + 1) % pattern.len();
             visible = !visible;
             remaining_in_dash = pattern[pattern_idx].max(0.0);
-        }
-    }
-
-    fn push_point(current: &mut Vec<PathSegment>, point: Point, force_move: bool) {
-        let pp = PathPoint::new(point.x, point.y);
-        if force_move || current.is_empty() {
-            current.push(PathSegment::MoveTo(pp));
-        } else {
-            current.push(PathSegment::LineTo(pp));
         }
     }
 
@@ -76,7 +81,8 @@ pub fn dash(path: &VectorPath, pattern: &[f64], offset: f64) -> Vec<VectorPath> 
             let was_empty = current.is_empty();
             push_point(&mut current, sample_seg(seg, 0.0), was_empty);
         }
-        while consumed < seg_len {
+        #[allow(clippy::while_float)]
+        while seg_len - consumed > f64::EPSILON {
             let step = remaining_in_dash.min(seg_len - consumed);
             consumed += step;
             remaining_in_dash -= step;
@@ -174,8 +180,8 @@ pub fn round_corners(path: &VectorPath, radius: f64) -> VectorPath {
             let in_y = p1.y - p0.y;
             let out_x = p2.x - p1.x;
             let out_y = p2.y - p1.y;
-            let in_len = (in_x * in_x + in_y * in_y).sqrt();
-            let out_len = (out_x * out_x + out_y * out_y).sqrt();
+            let in_len = in_x.hypot(in_y);
+            let out_len = out_x.hypot(out_y);
             if in_len < f64::EPSILON || out_len < f64::EPSILON {
                 new_commands.push(PathSegment::LineTo(p1));
                 prev = p1;

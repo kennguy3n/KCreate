@@ -1225,9 +1225,8 @@ pub fn raster_apply_levels(
 #[allow(clippy::needless_pass_by_value)]
 pub fn raster_apply_curves(node_id: String, points_json: String) -> NapiResult<()> {
     let id = parse_uuid(&node_id)?;
-    let parsed: Vec<(f32, f32)> = serde_json::from_str(&points_json).map_err(|e| {
-        NapiError::from_reason(format!("invalid curves points JSON: {}", e))
-    })?;
+    let parsed: Vec<(f32, f32)> = serde_json::from_str(&points_json)
+        .map_err(|e| NapiError::from_reason(format!("invalid curves points JSON: {e}")))?;
     raster_ops::apply_curves(id, parsed).map_err(map_doc_err)
 }
 
@@ -1323,7 +1322,7 @@ pub fn raster_heal(
 pub fn raster_preview_filter(node_id: String, filter_json: String) -> NapiResult<Buffer> {
     let id = parse_uuid(&node_id)?;
     let filter: raster_ops::PreviewFilter = serde_json::from_str(&filter_json)
-        .map_err(|e| NapiError::from_reason(format!("invalid filter JSON: {}", e)))?;
+        .map_err(|e| NapiError::from_reason(format!("invalid filter JSON: {e}")))?;
     let (bytes, _w, _h) = raster_ops::preview_filter(id, filter).map_err(map_doc_err)?;
     Ok(bytes.into())
 }

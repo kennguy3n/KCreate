@@ -452,10 +452,8 @@ mod tests {
     #[test]
     fn curves_identity_preserves_pixels() {
         let mut px = [42u8, 84, 127, 255];
-        let curves = AdjustmentLayer::Curves(vec![
-            CurvePoint::new(0.0, 0.0),
-            CurvePoint::new(1.0, 1.0),
-        ]);
+        let curves =
+            AdjustmentLayer::Curves(vec![CurvePoint::new(0.0, 0.0), CurvePoint::new(1.0, 1.0)]);
         assert!(curves.is_identity());
         curves.apply_pixel(&mut px);
         assert_eq!(px, [42, 84, 127, 255]);
@@ -464,11 +462,8 @@ mod tests {
     #[test]
     fn curves_inversion_inverts_midtones() {
         let mut px = [64u8, 64, 64, 255];
-        AdjustmentLayer::Curves(vec![
-            CurvePoint::new(0.0, 1.0),
-            CurvePoint::new(1.0, 0.0),
-        ])
-        .apply_pixel(&mut px);
+        AdjustmentLayer::Curves(vec![CurvePoint::new(0.0, 1.0), CurvePoint::new(1.0, 0.0)])
+            .apply_pixel(&mut px);
         // Linear inversion of 64 → 191.
         assert_eq!(px[0], 191);
     }

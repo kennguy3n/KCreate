@@ -151,6 +151,8 @@ export interface Bridge {
    * gets the round-trippable JSON shape directly.
    */
   documentNodeFill(nodeId: string): string | null;
+  documentNodeExtraFills(nodeId: string): string | null;
+  documentNodeExtraStrokes(nodeId: string): string | null;
   documentDeleteNode(nodeId: string): void;
   documentUndo(): UndoRedoOutcomeSnake | null;
   documentRedo(): UndoRedoOutcomeSnake | null;
@@ -490,6 +492,57 @@ export interface Bridge {
     radius: number,
   ): void;
   rasterPreviewFilter(nodeId: string, filterJson: string): Buffer;
+  // Phase 5 — vector path operations + non-destructive effects
+  // (Block C Tasks 15, 16, 18). All mutate the VectorLayer's
+  // stored geometry (simplify / smooth / offset) or its NodeStyle
+  // (set stroke profile, push / clear path effect) and record an
+  // undoable `Operation`. Bridge enforces argument validation
+  // (finite numbers, profile.t in [0,1], dash pattern non-empty).
+  vectorSimplify(nodeId: string, tolerance: number): void;
+  vectorSmooth(nodeId: string, iterations: number): void;
+  vectorOffset(nodeId: string, distance: number): void;
+  vectorSetStrokeProfile(nodeId: string, profileJson: string): void;
+  vectorApplyPathEffect(nodeId: string, effectJson: string): void;
+  vectorClearPathEffects(nodeId: string): void;
+  // Phase 5 — text frame linking + wrap (Block D Tasks 19/20).
+  textFrameLink(aId: string, bId: string): void;
+  textFrameUnlink(nodeId: string): void;
+  textFrameSetWrap(nodeId: string, modeJson: string): void;
+  // Phase 5 — slices (Block D Task 22). `sliceList` and
+  // `sliceExportAll` return JSON arrays; on the export path the
+  // returned `SliceResult[]` carries one entry per slice with the
+  // file path (or per-slice error message).
+  sliceCreate(
+    name: string,
+    x: number,
+    y: number,
+    w: number,
+    h: number,
+    format: string,
+    scale: number,
+  ): string;
+  sliceUpdate(sliceId: string, changesJson: string): void;
+  sliceDelete(sliceId: string): boolean;
+  sliceList(): string;
+  sliceExportAll(outputDir: string): string;
+  // Phase 5 — `.kbrand` import/export (Block D Task 21). Asset
+  // blobs (fonts / logos) are persisted into the project's asset
+  // table when importing; exporting walks the brand kit's
+  // referenced asset ids and bundles the underlying bytes.
+  brandKitExport(kitId: string, outputPath: string): void;
+  brandKitImport(filePath: string): string;
+  // Phase 5 — spot color / overprint shortcuts (Block D Task 23).
+  // `colorAddSpot` is a spec-shaped alias for `colorSpotUpsert`
+  // (no `displayName` / `libraryReference`); `nodeSetOverprint`
+  // toggles `NodeStyle::overprint` on any node.
+  colorAddSpot(
+    name: string,
+    c: number,
+    m: number,
+    y: number,
+    k: number,
+  ): void;
+  nodeSetOverprint(nodeId: string, enabled: boolean): void;
   // Phase 2 — text frame + OpenType (Block B Task 11).
   textFrameGet(nodeId: string): string;
   textFrameUpdate(nodeId: string, optionsJson: string): void;

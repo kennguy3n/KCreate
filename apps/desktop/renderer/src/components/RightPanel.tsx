@@ -657,8 +657,245 @@ function FillSection({
       {fill.kind === "gradient" ? (
         <GradientFillEditor fill={fill} onCommit={commit} disabled={disabled} />
       ) : null}
+      <ExtraFillsList
+        nodeId={node.id}
+        nodeVersion={node.version}
+        onChange={onChange}
+        disabled={disabled}
+      />
     </div>
   );
+}
+
+/**
+ * Phase 5 Block C Task 17 — multi-fill stack editor.
+ *
+ * Lists `node.style.extra_fills` (fills layered above the primary
+ * `fill` in render order). The user can append a new solid fill,
+ * remove an existing one, reorder via Move Up / Move Down, and edit
+ * each row via an inline `SolidFillEditor` (gradient stays read-only
+ * for now — the renderer already paints gradient extras correctly,
+ * but the gradient editor needs a smaller variant before we surface
+ * it inline; see RightPanel.tsx:842).
+ *
+ * Writes go through the same `updateNode` path as the primary fill
+ * by sending `extra_fills` on `UpdateNodeProps`. The bridge replaces
+ * the whole list and records an undoable operation so reorder and
+ * remove are individually undoable.
+ */
+function ExtraFillsList({
+  nodeId,
+  nodeVersion,
+  onChange,
+  disabled,
+}: {
+  nodeId: string;
+  nodeVersion: number;
+  onChange?: (changes: UpdateNodeProps) => void;
+  disabled: boolean;
+}): JSX.Element | null {
+  const [extras, setExtras] = useState<FillStyle[] | null>(null);
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const next = await window.kcreate.document.nodeExtraFills(nodeId);
+        if (!cancelled) {
+          setExtras(next ?? []);
+        }
+      } catch {
+        if (!cancelled) {
+          setExtras([]);
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [nodeId, nodeVersion]);
+
+  if (extras === null) {
+    return null;
+  }
+
+  const commitList = (next: FillStyle[]): void => {
+    setExtras(next);
+    onChange?.({ extra_fills: next });
+  };
+  const append = (): void => {
+    commitList([...extras, { kind: "solid", ...RGBA_BLACK }]);
+  };
+  const removeAt = (idx: number): void => {
+    commitList(extras.filter((_, i) => i !== idx));
+  };
+  const moveUp = (idx: number): void => {
+    if (idx <= 0) {
+      return;
+    }
+    const next = [...extras];
+    const a = next[idx - 1];
+    const b = next[idx];
+    if (a === undefined || b === undefined) {
+      return;
+    }
+    next[idx - 1] = b;
+    next[idx] = a;
+    commitList(next);
+  };
+  const moveDown = (idx: number): void => {
+    if (idx < 0 || idx >= extras.length - 1) {
+      return;
+    }
+    const next = [...extras];
+    const a = next[idx];
+    const b = next[idx + 1];
+    if (a === undefined || b === undefined) {
+      return;
+    }
+    next[idx] = b;
+    next[idx + 1] = a;
+    commitList(next);
+  };
+  const replaceAt = (idx: number, value: FillStyle): void => {
+    const next = [...extras];
+    next[idx] = value;
+    commitList(next);
+  };
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: spacing.xs }}>
+      <SectionLabel>Extra fills</SectionLabel>
+      {extras.length === 0 ? (
+        <Hint>None.</Hint>
+      ) : (
+        extras.map((entry, idx) => (
+          <ExtraFillRow
+            key={idx}
+            index={idx}
+            total={extras.length}
+            fill={entry}
+            disabled={disabled}
+            onChange={(next) => replaceAt(idx, next)}
+            onRemove={() => removeAt(idx)}
+            onMoveUp={() => moveUp(idx)}
+            onMoveDown={() => moveDown(idx)}
+          />
+        ))
+      )}
+      <button
+        type="button"
+        onClick={append}
+        disabled={disabled}
+        style={{
+          fontSize: 11,
+          padding: "4px 6px",
+          background: colors.bgSoft,
+          color: colors.text,
+          border: `1px solid ${colors.border}`,
+          borderRadius: 4,
+          cursor: disabled ? "not-allowed" : "pointer",
+          opacity: disabled ? 0.6 : 1,
+        }}
+      >
+        + Add fill
+      </button>
+    </div>
+  );
+}
+
+function ExtraFillRow({
+  index,
+  total,
+  fill,
+  disabled,
+  onChange,
+  onRemove,
+  onMoveUp,
+  onMoveDown,
+}: {
+  index: number;
+  total: number;
+  fill: FillStyle;
+  disabled: boolean;
+  onChange: (next: FillStyle) => void;
+  onRemove: () => void;
+  onMoveUp: () => void;
+  onMoveDown: () => void;
+}): JSX.Element {
+  return (
+    <div
+      style={{
+        display: "flex",
+        flexDirection: "column",
+        gap: spacing.xs,
+        padding: spacing.xs,
+        background: colors.bgSoft,
+        border: `1px solid ${colors.border}`,
+        borderRadius: 4,
+      }}
+    >
+      <div
+        style={{
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "space-between",
+          gap: 4,
+        }}
+      >
+        <span style={{ fontSize: 11, color: colors.textMuted }}>
+          {`#${index + 1} / ${total}`} · {fill.kind}
+        </span>
+        <div style={{ display: "flex", gap: 4 }}>
+          <button
+            type="button"
+            onClick={onMoveUp}
+            disabled={disabled || index === 0}
+            title="Move up"
+            style={extraFillIconButtonStyle(disabled || index === 0)}
+          >
+            ↑
+          </button>
+          <button
+            type="button"
+            onClick={onMoveDown}
+            disabled={disabled || index === total - 1}
+            title="Move down"
+            style={extraFillIconButtonStyle(disabled || index === total - 1)}
+          >
+            ↓
+          </button>
+          <button
+            type="button"
+            onClick={onRemove}
+            disabled={disabled}
+            title="Remove"
+            style={extraFillIconButtonStyle(disabled)}
+          >
+            ✕
+          </button>
+        </div>
+      </div>
+      <FillKindPicker fill={fill} onCommit={onChange} />
+      {fill.kind === "solid" ? (
+        <SolidFillEditor fill={fill} onCommit={onChange} />
+      ) : null}
+    </div>
+  );
+}
+
+function extraFillIconButtonStyle(disabled: boolean): React.CSSProperties {
+  return {
+    fontSize: 11,
+    width: 22,
+    height: 22,
+    padding: 0,
+    background: "transparent",
+    color: colors.text,
+    border: `1px solid ${colors.border}`,
+    borderRadius: 4,
+    cursor: disabled ? "not-allowed" : "pointer",
+    opacity: disabled ? 0.5 : 1,
+  };
 }
 
 /// Header label for a section inside PropertiesPanel.

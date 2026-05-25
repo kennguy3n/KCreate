@@ -21,7 +21,9 @@ use kcreate_core::config::RuntimeConfig;
 use kcreate_core::document::{DocumentError, DocumentGraph};
 use kcreate_core::node::{Node, NodeType};
 use kcreate_core::operation::Operation;
-use kcreate_core::project::{BrandKit, DesignTokens, ExportPreset, Project, ProjectError};
+use kcreate_core::project::{
+    BrandKit, DesignTokens, ExportFormat, ExportPreset, Project, ProjectError, Slice,
+};
 use kcreate_export::png::{export_png, PngExportError, PngExportOptions};
 use kcreate_export::svg::{export_svg_from_document, SvgDocumentExportError, SvgExportOptions};
 use kcreate_layout::{layout_flex, layout_grid, FlexLayout, GridLayout};
@@ -1087,6 +1089,32 @@ pub fn document_node_fill(id: Uuid) -> Result<Option<String>> {
     // structured error type if a future variant adds a Map-keyed
     // value or other tag that serde-json can't represent.
     let json = serde_json::to_string(&node.style.fill)?;
+    Ok(Some(json))
+}
+
+/// Read the node's `extra_fills` stack as a JSON array. Returns
+/// `None` when the node id is unknown so the renderer can
+/// distinguish "no extras yet" (empty array) from "node not
+/// found" (null). Phase 5 Block C Task 17.
+pub fn document_node_extra_fills(id: Uuid) -> Result<Option<String>> {
+    let guard = slot().lock();
+    let ws = guard.as_ref().ok_or(DocumentBridgeError::NoProject)?;
+    let Some(node) = ws.project.document.get_node(id) else {
+        return Ok(None);
+    };
+    let json = serde_json::to_string(&node.style.extra_fills)?;
+    Ok(Some(json))
+}
+
+/// Read the node's `extra_strokes` stack as a JSON array. Returns
+/// `None` when the node id is unknown. Phase 5 Block C Task 17.
+pub fn document_node_extra_strokes(id: Uuid) -> Result<Option<String>> {
+    let guard = slot().lock();
+    let ws = guard.as_ref().ok_or(DocumentBridgeError::NoProject)?;
+    let Some(node) = ws.project.document.get_node(id) else {
+        return Ok(None);
+    };
+    let json = serde_json::to_string(&node.style.extra_strokes)?;
     Ok(Some(json))
 }
 
@@ -4193,6 +4221,604 @@ fn default_name_for(t: NodeType) -> String {
     }
 }
 
+// -----------------------------------------------------------------------------
+// Phase 5 — text frame linking + wrap (Block D Tasks 19/20)
+// -----------------------------------------------------------------------------
+
+/// Link two `TextLayer` nodes so overflow from `a_id` spills into
+/// `b_id`. Both nodes must exist and be `TextLayer`. Linking a
+/// frame to itself, or creating a cycle through the chain, is
+/// rejected. Recorded as an undoable `text_frame_link` operation.
+pub fn text_frame_link(a_id: Uuid, b_id: Uuid) -> Result<()> {
+    if a_id == b_id {
+        return Err(DocumentBridgeError::InvalidArgument {
+            argument: "next_frame_id".into(),
+            value: format!("cannot link {a_id} to itself"),
+        });
+    }
+    let mut guard = slot().lock();
+    let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
+
+    // Validate target exists and is a text layer.
+    let target = ws
+        .project
+        .document
+        .get_node(b_id)
+        .ok_or(DocumentBridgeError::NodeNotFound(b_id))?;
+    if !matches!(target.node_type, NodeType::TextLayer) {
+        return Err(DocumentBridgeError::InvalidNodeType(format!(
+            "{:?}",
+            target.node_type
+        )));
+    }
+
+    // Cycle check: walk `b`'s chain forward; if we ever land back at
+    // `a`, refuse the link.
+    let mut cursor = Some(b_id);
+    let mut steps = 0usize;
+    while let Some(cur) = cursor {
+        if cur == a_id {
+            return Err(DocumentBridgeError::InvalidArgument {
+                argument: "next_frame_id".into(),
+                value: format!("linking {a_id} -> {b_id} would create a cycle"),
+            });
+        }
+        steps += 1;
+        if steps > 4096 {
+            return Err(DocumentBridgeError::InvalidArgument {
+                argument: "next_frame_id".into(),
+                value: "existing frame chain exceeds 4096 hops (likely corrupt)".into(),
+            });
+        }
+        let next = ws.project.document.get_node(cur).and_then(|n| {
+            if matches!(n.node_type, NodeType::TextLayer) {
+                n.text_frame_options().next_frame_id
+            } else {
+                None
+            }
+        });
+        cursor = next;
+    }
+
+    let before_snapshot = ws
+        .project
+        .document
+        .get_node(a_id)
+        .map_or(serde_json::Value::Null, |n| {
+            serde_json::to_value(n).unwrap_or(serde_json::Value::Null)
+        });
+
+    {
+        let a = ws
+            .project
+            .document
+            .get_node_mut(a_id)
+            .ok_or(DocumentBridgeError::NodeNotFound(a_id))?;
+        if !matches!(a.node_type, NodeType::TextLayer) {
+            return Err(DocumentBridgeError::InvalidNodeType(format!(
+                "{:?}",
+                a.node_type
+            )));
+        }
+        let mut opts = a.text_frame_options();
+        opts.next_frame_id = Some(b_id);
+        a.set_text_frame_options(&opts);
+    }
+
+    let after_snapshot = ws
+        .project
+        .document
+        .get_node(a_id)
+        .map_or(serde_json::Value::Null, |n| {
+            serde_json::to_value(n).unwrap_or(serde_json::Value::Null)
+        });
+
+    let op = Operation::new(
+        "user",
+        "text_frame_link",
+        serde_json::json!({
+            "before": before_snapshot,
+            "params": { "from": a_id, "to": b_id },
+        }),
+        after_snapshot,
+        vec![a_id, b_id],
+    );
+    ws.project.execute_operation(op);
+    ws.project.modified_at = Utc::now();
+    let _ = sync_scene_locked(&mut guard);
+    Ok(())
+}
+
+/// Break the link out of `id` (sets `next_frame_id` to `None`).
+/// No-op on frames that aren't currently linked.
+pub fn text_frame_unlink(id: Uuid) -> Result<()> {
+    let mut guard = slot().lock();
+    let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
+    let node = ws
+        .project
+        .document
+        .get_node(id)
+        .ok_or(DocumentBridgeError::NodeNotFound(id))?;
+    if !matches!(node.node_type, NodeType::TextLayer) {
+        return Err(DocumentBridgeError::InvalidNodeType(format!(
+            "{:?}",
+            node.node_type
+        )));
+    }
+    if node.text_frame_options().next_frame_id.is_none() {
+        return Ok(());
+    }
+
+    let before_snapshot = serde_json::to_value(node).unwrap_or(serde_json::Value::Null);
+
+    {
+        let node_mut = ws
+            .project
+            .document
+            .get_node_mut(id)
+            .ok_or(DocumentBridgeError::NodeNotFound(id))?;
+        let mut opts = node_mut.text_frame_options();
+        opts.next_frame_id = None;
+        node_mut.set_text_frame_options(&opts);
+    }
+
+    let after_snapshot = ws
+        .project
+        .document
+        .get_node(id)
+        .map_or(serde_json::Value::Null, |n| {
+            serde_json::to_value(n).unwrap_or(serde_json::Value::Null)
+        });
+
+    let op = Operation::new(
+        "user",
+        "text_frame_unlink",
+        before_snapshot,
+        after_snapshot,
+        vec![id],
+    );
+    ws.project.execute_operation(op);
+    ws.project.modified_at = Utc::now();
+    let _ = sync_scene_locked(&mut guard);
+    Ok(())
+}
+
+/// Replace a TextLayer's wrap mode. `mode_json` is a JSON string
+/// matching [`kcreate_core::node::TextWrapMode`]
+/// (`"none" | "bounding_box" | "contour"`).
+pub fn text_frame_set_wrap(id: Uuid, mode_json: &str) -> Result<()> {
+    let mode: kcreate_core::node::TextWrapMode =
+        serde_json::from_str(mode_json).map_err(DocumentBridgeError::Json)?;
+    let mut guard = slot().lock();
+    let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
+
+    let node = ws
+        .project
+        .document
+        .get_node(id)
+        .ok_or(DocumentBridgeError::NodeNotFound(id))?;
+    if !matches!(node.node_type, NodeType::TextLayer) {
+        return Err(DocumentBridgeError::InvalidNodeType(format!(
+            "{:?}",
+            node.node_type
+        )));
+    }
+
+    let before_snapshot = serde_json::to_value(node).unwrap_or(serde_json::Value::Null);
+
+    {
+        let node_mut = ws
+            .project
+            .document
+            .get_node_mut(id)
+            .ok_or(DocumentBridgeError::NodeNotFound(id))?;
+        let mut opts = node_mut.text_frame_options();
+        opts.wrap_mode = mode;
+        node_mut.set_text_frame_options(&opts);
+    }
+
+    let after_snapshot = ws
+        .project
+        .document
+        .get_node(id)
+        .map_or(serde_json::Value::Null, |n| {
+            serde_json::to_value(n).unwrap_or(serde_json::Value::Null)
+        });
+
+    let op = Operation::new(
+        "user",
+        "text_frame_set_wrap",
+        before_snapshot,
+        after_snapshot,
+        vec![id],
+    );
+    ws.project.execute_operation(op);
+    ws.project.modified_at = Utc::now();
+    let _ = sync_scene_locked(&mut guard);
+    Ok(())
+}
+
+// -----------------------------------------------------------------------------
+// Phase 5 — slices (Block D Task 22)
+// -----------------------------------------------------------------------------
+
+/// Create a new slice at `bounds` and append it to the project.
+/// Returns the slice's id.
+pub fn slice_create(
+    name: String,
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+    format: &str,
+    scale: f32,
+) -> Result<Uuid> {
+    if !x.is_finite() || !y.is_finite() || !w.is_finite() || !h.is_finite() || w <= 0.0 || h <= 0.0
+    {
+        return Err(DocumentBridgeError::InvalidBounds {
+            width: w,
+            height: h,
+        });
+    }
+    if !scale.is_finite() || scale <= 0.0 {
+        return Err(DocumentBridgeError::InvalidArgument {
+            argument: "scale".into(),
+            value: format!("{scale} (must be finite and positive)"),
+        });
+    }
+    let fmt = parse_export_format(format)?;
+    let bounds = kcreate_core::Bounds::new(x, y, w, h);
+    let slice = Slice::new(name, bounds, fmt, scale);
+    let id = slice.id;
+
+    let mut guard = slot().lock();
+    let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
+    let before = serde_json::to_value(&ws.project.slices).unwrap_or(serde_json::Value::Null);
+    ws.project.slices.push(slice);
+    let after = serde_json::to_value(&ws.project.slices).unwrap_or(serde_json::Value::Null);
+    let op = Operation::new("user", "slice_create", before, after, Vec::<Uuid>::new());
+    ws.project.execute_operation(op);
+    ws.project.modified_at = Utc::now();
+    drop(guard);
+    Ok(id)
+}
+
+/// Patch fields on an existing slice. `changes_json` is a JSON
+/// object with optional `name`, `bounds` (`{x,y,width,height}`),
+/// `format` (`"png" | "svg" | "pdf" | "webp" | "jpeg"`), and
+/// `scale` fields. Other fields on the slice are preserved.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct SliceUpdateProps {
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub bounds: Option<BoundsInfo>,
+    #[serde(default)]
+    pub format: Option<String>,
+    #[serde(default)]
+    pub scale: Option<f32>,
+}
+
+pub fn slice_update(id: Uuid, changes: SliceUpdateProps) -> Result<()> {
+    let mut guard = slot().lock();
+    let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
+    let idx = ws
+        .project
+        .slices
+        .iter()
+        .position(|s| s.id == id)
+        .ok_or(DocumentBridgeError::NodeNotFound(id))?;
+    let before = serde_json::to_value(&ws.project.slices[idx]).unwrap_or(serde_json::Value::Null);
+
+    if let Some(name) = changes.name {
+        ws.project.slices[idx].name = name;
+    }
+    if let Some(b) = changes.bounds {
+        if !b.width.is_finite() || !b.height.is_finite() || b.width <= 0.0 || b.height <= 0.0 {
+            return Err(DocumentBridgeError::InvalidBounds {
+                width: b.width,
+                height: b.height,
+            });
+        }
+        ws.project.slices[idx].bounds = kcreate_core::Bounds::new(b.x, b.y, b.width, b.height);
+    }
+    if let Some(fmt_str) = changes.format {
+        let fmt = parse_export_format(&fmt_str)?;
+        ws.project.slices[idx].format = fmt;
+        ws.project.slices[idx].suffix = match fmt {
+            ExportFormat::Png => ".png".into(),
+            ExportFormat::Svg => ".svg".into(),
+            ExportFormat::Pdf => ".pdf".into(),
+            ExportFormat::Webp => ".webp".into(),
+            ExportFormat::Jpeg => ".jpg".into(),
+        };
+    }
+    if let Some(s) = changes.scale {
+        if !s.is_finite() || s <= 0.0 {
+            return Err(DocumentBridgeError::InvalidArgument {
+                argument: "scale".into(),
+                value: format!("{s} (must be finite and positive)"),
+            });
+        }
+        ws.project.slices[idx].scale = s;
+    }
+
+    let after = serde_json::to_value(&ws.project.slices[idx]).unwrap_or(serde_json::Value::Null);
+    let op = Operation::new("user", "slice_update", before, after, Vec::<Uuid>::new());
+    ws.project.execute_operation(op);
+    ws.project.modified_at = Utc::now();
+    drop(guard);
+    Ok(())
+}
+
+/// Remove a slice by id. Returns true when something was removed.
+pub fn slice_delete(id: Uuid) -> Result<bool> {
+    let mut guard = slot().lock();
+    let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
+    let before = serde_json::to_value(&ws.project.slices).unwrap_or(serde_json::Value::Null);
+    let before_len = ws.project.slices.len();
+    ws.project.slices.retain(|s| s.id != id);
+    let removed = ws.project.slices.len() != before_len;
+    if removed {
+        let after = serde_json::to_value(&ws.project.slices).unwrap_or(serde_json::Value::Null);
+        let op = Operation::new("user", "slice_delete", before, after, Vec::<Uuid>::new());
+        ws.project.execute_operation(op);
+        ws.project.modified_at = Utc::now();
+    }
+    Ok(removed)
+}
+
+/// List every slice in the project, in insertion order.
+pub fn slice_list() -> Result<Vec<Slice>> {
+    let guard = slot().lock();
+    let ws = guard.as_ref().ok_or(DocumentBridgeError::NoProject)?;
+    Ok(ws.project.slices.clone())
+}
+
+/// Render every slice to a separate file in `output_dir`. Returns
+/// one entry per slice describing the path (or per-slice error).
+/// Top-level errors (`output_dir` is not a directory, etc.) are
+/// promoted to a `DocumentBridgeError::Io`.
+pub fn slice_export_all(output_dir: &Path) -> Result<Vec<kcreate_export::slice::SliceResult>> {
+    let scene = crate::state::current_scene()
+        .map_err(|e| DocumentBridgeError::Io(std::io::Error::other(e.to_string())))?;
+    let slices = {
+        let guard = slot().lock();
+        let ws = guard.as_ref().ok_or(DocumentBridgeError::NoProject)?;
+        ws.project.slices.clone()
+    };
+    kcreate_export::slice::export_slices(&scene, &slices, output_dir)
+        .map_err(|e| DocumentBridgeError::Io(std::io::Error::other(e.to_string())))
+}
+
+// -----------------------------------------------------------------------------
+// Phase 5 — .kbrand import/export (Block D Task 21)
+// -----------------------------------------------------------------------------
+
+fn font_asset_key(font: &kcreate_core::project::FontRef) -> String {
+    let mut sanitised = String::with_capacity(font.family.len());
+    for ch in font.family.chars() {
+        if ch.is_ascii_alphanumeric() {
+            sanitised.push(ch);
+        } else {
+            sanitised.push('_');
+        }
+    }
+    format!(
+        "{sanitised}-{}{}",
+        font.weight,
+        if font.italic { "-italic" } else { "" }
+    )
+}
+
+/// Resolve a font archive path to its IANA MIME type. The match is
+/// case-insensitive against the file extension.
+fn font_mime_for(path: &str) -> &'static str {
+    let ext = std::path::Path::new(path)
+        .extension()
+        .and_then(std::ffi::OsStr::to_str)
+        .map(str::to_ascii_lowercase);
+    match ext.as_deref() {
+        Some("ttf") => "font/ttf",
+        Some("otf") => "font/otf",
+        Some("woff") => "font/woff",
+        Some("woff2") => "font/woff2",
+        _ => "application/octet-stream",
+    }
+}
+
+/// Resolve a logo archive path to its IANA MIME type. The match is
+/// case-insensitive against the file extension.
+fn logo_mime_for(path: &str) -> &'static str {
+    let ext = std::path::Path::new(path)
+        .extension()
+        .and_then(std::ffi::OsStr::to_str)
+        .map(str::to_ascii_lowercase);
+    match ext.as_deref() {
+        Some("png") => "image/png",
+        Some("jpg" | "jpeg") => "image/jpeg",
+        Some("webp") => "image/webp",
+        Some("svg") => "image/svg+xml",
+        _ => "application/octet-stream",
+    }
+}
+
+/// Serialize a brand kit (plus its referenced font / logo blobs)
+/// into a `.kbrand` archive at `output_path`. The bridge resolves
+/// each referenced blob via the project's `assets` table — fonts
+/// without an `embedded_asset_id` are recorded by family name in
+/// the manifest but contribute no archive entry.
+pub fn brand_kit_export(kit_id: Uuid, output_path: &Path) -> Result<()> {
+    let (kit, font_assets, logo_assets) = {
+        let guard = slot().lock();
+        let ws = guard.as_ref().ok_or(DocumentBridgeError::NoProject)?;
+        let kit = ws
+            .project
+            .brand_kits
+            .iter()
+            .find(|k| k.id == kit_id)
+            .cloned()
+            .ok_or(DocumentBridgeError::NodeNotFound(kit_id))?;
+
+        let mut fonts: std::collections::HashMap<String, Vec<u8>> =
+            std::collections::HashMap::new();
+        for font in &kit.fonts {
+            if let Some(asset_id) = font.embedded_asset_id {
+                if let Some(bytes) = ws.store.load_asset(asset_id)? {
+                    fonts.insert(font_asset_key(font), bytes);
+                }
+            }
+        }
+        let mut logos: std::collections::HashMap<String, Vec<u8>> =
+            std::collections::HashMap::new();
+        if let Some(logo_id) = kit.logo_asset_id {
+            if let Some(bytes) = ws.store.load_asset(logo_id)? {
+                logos.insert("primary".into(), bytes);
+            }
+        }
+        (kit, fonts, logos)
+    };
+
+    kcreate_export::kbrand::export_brand_kit(&kit, &font_assets, &logo_assets, output_path)
+        .map_err(|e| DocumentBridgeError::Io(std::io::Error::other(e.to_string())))?;
+    Ok(())
+}
+
+/// Import a `.kbrand` archive: persist every embedded font / logo
+/// asset under fresh ids in the project's asset table, build a
+/// new [`BrandKit`] from the manifest, and append it. Returns the
+/// new kit's id.
+pub fn brand_kit_import(file_path: &Path) -> Result<Uuid> {
+    let bundle = kcreate_export::kbrand::import_brand_kit(file_path)
+        .map_err(|e| DocumentBridgeError::Io(std::io::Error::other(e.to_string())))?;
+
+    let mut guard = slot().lock();
+    let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
+
+    // Stage 1: walk the manifest and turn each archive-relative
+    // asset path into a project-asset Uuid by storing the bytes.
+    let mut font_asset_ids: std::collections::HashMap<String, Uuid> =
+        std::collections::HashMap::new();
+    for font in &bundle.manifest.fonts {
+        let Some(archive_path) = &font.archive_path else {
+            continue;
+        };
+        let Some(bytes) = bundle.assets.get(archive_path) else {
+            continue;
+        };
+        let mime = font_mime_for(archive_path);
+        let id = Uuid::new_v4();
+        ws.store.store_asset_with_id(id, bytes, mime)?;
+        font_asset_ids.insert(archive_path.clone(), id);
+    }
+    let logo_asset_id = bundle.manifest.logos.first().and_then(|logo| {
+        let bytes = bundle.assets.get(&logo.archive_path)?;
+        let mime = logo_mime_for(&logo.archive_path);
+        let id = Uuid::new_v4();
+        ws.store.store_asset_with_id(id, bytes, mime).ok()?;
+        Some(id)
+    });
+
+    // Stage 2: build a BrandKit whose font/logo references point at
+    // the freshly-stored asset ids.
+    let mut kit = bundle.into_brand_kit();
+    kit.logo_asset_id = logo_asset_id;
+    for font in &mut kit.fonts {
+        // Re-derive the archive path the same way `export_brand_kit`
+        // does to look up our stored id.
+        let key = font_asset_key(font);
+        for ext in ["ttf", "otf"] {
+            let archive_path = format!("fonts/{key}.{ext}");
+            if let Some(id) = font_asset_ids.get(&archive_path) {
+                font.embedded_asset_id = Some(*id);
+                break;
+            }
+        }
+    }
+    let new_id = kit.id;
+    ws.project.brand_kits.push(kit);
+    ws.project.modified_at = Utc::now();
+    drop(guard);
+    Ok(new_id)
+}
+
+// -----------------------------------------------------------------------------
+// Phase 5 — spot color / overprint convenience entry points (Block D Task 23)
+// -----------------------------------------------------------------------------
+
+/// Spec-shaped alias for `color_spot_upsert`: inserts a spot color
+/// keyed by `name`, with the canonical CMYK fallback. The display
+/// name defaults to `name` (writers that need a separate display
+/// name should keep using `color_spot_upsert` directly).
+pub fn color_add_spot(name: String, c: f32, m: f32, y: f32, k: f32) -> Result<()> {
+    use kcreate_core::color::SpotColorDef;
+    let mut guard = slot().lock();
+    let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
+    let before = serde_json::to_value(&ws.project.spot_color_library)?;
+    let def = SpotColorDef {
+        display_name: name.clone(),
+        fallback_cmyk: (c, m, y, k),
+        library_reference: None,
+    };
+    ws.project.spot_color_library.insert(name, def);
+    let after = serde_json::to_value(&ws.project.spot_color_library)?;
+    let op = Operation::new(
+        "user",
+        "spot_color_upsert",
+        before,
+        after,
+        Vec::<Uuid>::new(),
+    );
+    ws.project.execute_operation(op);
+    ws.project.modified_at = Utc::now();
+    let _ = sync_scene_locked(&mut guard);
+    Ok(())
+}
+
+/// Toggle a node's overprint flag. Recorded as an undoable
+/// `node_set_overprint` operation. `node_id` must reference any
+/// node (overprint is a style flag, not node-type-specific).
+pub fn node_set_overprint(id: Uuid, enabled: bool) -> Result<()> {
+    let mut guard = slot().lock();
+    let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
+    let before_snapshot = ws
+        .project
+        .document
+        .get_node(id)
+        .map(|n| serde_json::to_value(n).unwrap_or(serde_json::Value::Null))
+        .ok_or(DocumentBridgeError::NodeNotFound(id))?;
+
+    {
+        let node = ws
+            .project
+            .document
+            .get_node_mut(id)
+            .ok_or(DocumentBridgeError::NodeNotFound(id))?;
+        node.style.overprint = enabled;
+    }
+
+    let after_snapshot = ws
+        .project
+        .document
+        .get_node(id)
+        .map_or(serde_json::Value::Null, |n| {
+            serde_json::to_value(n).unwrap_or(serde_json::Value::Null)
+        });
+
+    let op = Operation::new(
+        "user",
+        "node_set_overprint",
+        before_snapshot,
+        after_snapshot,
+        vec![id],
+    );
+    ws.project.execute_operation(op);
+    ws.project.modified_at = Utc::now();
+    let _ = sync_scene_locked(&mut guard);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6239,6 +6865,7 @@ mod tests {
                 left: 4.0,
             },
             auto_size: kcreate_core::node::TextAutoSize::HeightAuto,
+            next_frame_id: None,
         };
         crate::phase2::text_frame_update(id, &serde_json::to_string(&new_options).unwrap())
             .expect("update");
@@ -6535,6 +7162,7 @@ mod tests {
                 left: 2.0,
             },
             auto_size: kcreate_core::node::TextAutoSize::HeightAuto,
+            next_frame_id: None,
         };
         crate::phase2::text_frame_update(id, &serde_json::to_string(&updated).unwrap())
             .expect("update");

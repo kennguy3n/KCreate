@@ -31,6 +31,7 @@ use kcreate_core::node::{Node, NodeType};
 use kcreate_core::operation::Operation;
 use kcreate_core::project::{BrandKit, DesignTokens, ExportPreset};
 use rusqlite::params;
+use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
@@ -345,12 +346,26 @@ impl ProjectStore {
 
     /// Store an asset binary and record it in the `assets` table.
     pub fn store_asset(&mut self, data: &[u8], mime: &str) -> Result<BlobRef, ProjectStoreError> {
+        self.store_asset_with_id(Uuid::new_v4(), data, mime)
+    }
+
+    /// Store an asset binary under a caller-supplied id. Used by
+    /// `.kbrand` import to thread the kit's referenced asset ids
+    /// through unchanged. `INSERT OR REPLACE` so re-importing the
+    /// same kit twice updates the existing rows instead of
+    /// duplicating them.
+    pub fn store_asset_with_id(
+        &mut self,
+        id: Uuid,
+        data: &[u8],
+        mime: &str,
+    ) -> Result<BlobRef, ProjectStoreError> {
         let blob = self.blobs.store(data, mime)?;
         self.db.conn().execute(
             "INSERT OR REPLACE INTO assets (id, hash, mime_type, size_bytes, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
-                Uuid::new_v4().to_string(),
+                id.to_string(),
                 blob.hash,
                 blob.mime_type,
                 blob.size as i64,
@@ -358,6 +373,25 @@ impl ProjectStore {
             ],
         )?;
         Ok(blob)
+    }
+
+    /// Load an asset's raw bytes by id. Returns `Ok(None)` when the
+    /// id isn't in the assets table (vs. an I/O error when the
+    /// referenced blob hash is missing from the blob store).
+    pub fn load_asset(&self, id: Uuid) -> Result<Option<Vec<u8>>, ProjectStoreError> {
+        let hash: Option<String> = self
+            .db
+            .conn()
+            .query_row(
+                "SELECT hash FROM assets WHERE id = ?1",
+                params![id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match hash {
+            Some(h) => Ok(Some(self.blobs.load(&h)?)),
+            None => Ok(None),
+        }
     }
 
     /// Persist a brand kit. `id` matches `BrandKit::id`, so this is a

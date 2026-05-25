@@ -43,7 +43,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use kcreate_core::document::DocumentGraph;
-use kcreate_core::node::{Node, NodeType};
+use kcreate_core::node::{Node, NodeType, PathEffect};
 use kcreate_renderer::{
     Color, Object, ObjectId, ObjectKind, PathCommand, Point2, Rect, Scene, Stroke, Style,
 };
@@ -898,18 +898,40 @@ impl SceneSync {
         else {
             return;
         };
-        let obj_id = self.allocate(node.id);
-        self.record(node.id, obj_id);
-        emitted.push(node.id);
-        let commands = vector_path_to_renderer(&path);
+        // Phase 5 Block C Task 18 — apply the non-destructive path
+        // effect chain stored on the node's style. Each effect is
+        // applied in order; `Dash` expands to multiple sub-paths so
+        // it must be emitted last (otherwise downstream effects would
+        // see only the first sub-path).
+        let effects: &[PathEffect] = &node.style.path_effects;
         let style = node_style(node);
         let (tx, ty) = node_translation(node);
-        let obj = Object::new(ObjectKind::Path(commands), style)
-            .with_id(obj_id)
-            .with_translation(tx as f32, ty as f32)
-            .with_z(*z);
-        objects.push(obj);
-        *z += 1;
+        let paths = apply_path_effects(path, effects);
+        emitted.push(node.id);
+        let mut first = true;
+        for sub in paths {
+            let obj_id = if first {
+                let id = self.allocate(node.id);
+                self.record(node.id, id);
+                first = false;
+                id
+            } else {
+                self.allocate(node.id)
+            };
+            let commands = vector_path_to_renderer(&sub);
+            let obj = Object::new(ObjectKind::Path(commands), style)
+                .with_id(obj_id)
+                .with_translation(tx as f32, ty as f32)
+                .with_z(*z);
+            objects.push(obj);
+            *z += 1;
+        }
+        // If the chain produced zero sub-paths (e.g. a degenerate
+        // dash result), still record a placeholder allocation so the
+        // hit-test reverse map can find the node.
+        if first {
+            let _ = self.allocate(node.id);
+        }
     }
 
     fn emit_raster(
@@ -1016,6 +1038,44 @@ fn resolve_raster_image(
         });
     }
     Some((meta.width, meta.height, bytes))
+}
+
+/// Apply every [`PathEffect`] in `effects` to `path`, returning the
+/// resulting sub-paths in render order. Effects are applied in chain
+/// order; `Dash` is the only effect that can produce multiple sub-
+/// paths, so when present it is always the final effect in the
+/// pipeline (the inputs to it would otherwise be lost). An empty
+/// effect list passes the original path through untouched.
+fn apply_path_effects(mut path: VectorPath, effects: &[PathEffect]) -> Vec<VectorPath> {
+    if effects.is_empty() {
+        return vec![path];
+    }
+    // Apply every non-dash effect first; record the dash effect
+    // (if any) so we can fan out at the end.
+    let mut pending_dash: Option<&PathEffect> = None;
+    for effect in effects {
+        match effect {
+            PathEffect::RoundCorners { radius } => {
+                if radius.is_finite() && *radius > 0.0 {
+                    path = kcreate_vector::round_corners(&path, *radius);
+                }
+            }
+            PathEffect::Dash { .. } => {
+                // Defer until after every other effect; if multiple
+                // dash effects are stacked, the last one wins.
+                pending_dash = Some(effect);
+            }
+        }
+    }
+    if let Some(PathEffect::Dash { pattern, offset }) = pending_dash {
+        if !pattern.is_empty() {
+            let subpaths = kcreate_vector::dash(&path, pattern, *offset);
+            if !subpaths.is_empty() {
+                return subpaths;
+            }
+        }
+    }
+    vec![path]
 }
 
 /// Convert a [`VectorPath`] into the renderer's [`PathCommand`]

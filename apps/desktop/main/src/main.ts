@@ -849,6 +849,14 @@ function registerIpcHandlers(): void {
     (_e, nodeId: string) => requireBridge().documentNodeFill(nodeId),
   );
   ipcMain.handle(
+    "kcreate/document/nodeExtraFills",
+    (_e, nodeId: string) => requireBridge().documentNodeExtraFills(nodeId),
+  );
+  ipcMain.handle(
+    "kcreate/document/nodeExtraStrokes",
+    (_e, nodeId: string) => requireBridge().documentNodeExtraStrokes(nodeId),
+  );
+  ipcMain.handle(
     "kcreate/document/deleteNode",
     (_e, nodeId: string) => {
       requireBridge().documentDeleteNode(nodeId);
@@ -1849,6 +1857,129 @@ function registerIpcHandlers(): void {
     "kcreate/raster/preview",
     (_e, nodeId: string, filterJson: string) =>
       requireBridge().rasterPreviewFilter(nodeId, filterJson),
+  );
+
+  // ---------------------------------------------------------------------
+  // Phase 5 — vector path operations + non-destructive effects.
+  // (Block C Tasks 15, 16, 18.) All mutating; see Rust-side
+  // `vector_ops.rs` for argument validation rules.
+  // ---------------------------------------------------------------------
+  ipcMain.handle(
+    "kcreate/vector/simplify",
+    (_e, nodeId: string, tolerance: number) => {
+      requireBridge().vectorSimplify(nodeId, tolerance);
+    },
+  );
+  ipcMain.handle(
+    "kcreate/vector/smooth",
+    (_e, nodeId: string, iterations: number) => {
+      requireBridge().vectorSmooth(nodeId, iterations);
+    },
+  );
+  ipcMain.handle(
+    "kcreate/vector/offset",
+    (_e, nodeId: string, distance: number) => {
+      requireBridge().vectorOffset(nodeId, distance);
+    },
+  );
+  ipcMain.handle(
+    "kcreate/vector/strokeProfile/set",
+    (_e, nodeId: string, profileJson: string) => {
+      requireBridge().vectorSetStrokeProfile(nodeId, profileJson);
+    },
+  );
+  ipcMain.handle(
+    "kcreate/vector/pathEffect/apply",
+    (_e, nodeId: string, effectJson: string) => {
+      requireBridge().vectorApplyPathEffect(nodeId, effectJson);
+    },
+  );
+  ipcMain.handle(
+    "kcreate/vector/pathEffect/clear",
+    (_e, nodeId: string) => {
+      requireBridge().vectorClearPathEffects(nodeId);
+    },
+  );
+
+  // ---------------------------------------------------------------------
+  // Phase 5 — text frame linking + wrap (Block D Tasks 19/20).
+  // ---------------------------------------------------------------------
+  ipcMain.handle(
+    "kcreate/text/frame/link",
+    (_e, aId: string, bId: string) => {
+      requireBridge().textFrameLink(aId, bId);
+    },
+  );
+  ipcMain.handle(
+    "kcreate/text/frame/unlink",
+    (_e, nodeId: string) => {
+      requireBridge().textFrameUnlink(nodeId);
+    },
+  );
+  ipcMain.handle(
+    "kcreate/text/frame/wrap/set",
+    (_e, nodeId: string, modeJson: string) => {
+      requireBridge().textFrameSetWrap(nodeId, modeJson);
+    },
+  );
+
+  // ---------------------------------------------------------------------
+  // Phase 5 — slices (Block D Task 22).
+  // ---------------------------------------------------------------------
+  ipcMain.handle(
+    "kcreate/slice/create",
+    (
+      _e,
+      name: string,
+      x: number,
+      y: number,
+      w: number,
+      h: number,
+      format: string,
+      scale: number,
+    ) => requireBridge().sliceCreate(name, x, y, w, h, format, scale),
+  );
+  ipcMain.handle(
+    "kcreate/slice/update",
+    (_e, sliceId: string, changesJson: string) => {
+      requireBridge().sliceUpdate(sliceId, changesJson);
+    },
+  );
+  ipcMain.handle("kcreate/slice/delete", (_e, sliceId: string) =>
+    requireBridge().sliceDelete(sliceId),
+  );
+  ipcMain.handle("kcreate/slice/list", () => requireBridge().sliceList());
+  ipcMain.handle("kcreate/slice/exportAll", (_e, outputDir: string) =>
+    requireBridge().sliceExportAll(outputDir),
+  );
+
+  // ---------------------------------------------------------------------
+  // Phase 5 — `.kbrand` import/export (Block D Task 21).
+  // ---------------------------------------------------------------------
+  ipcMain.handle(
+    "kcreate/brandKit/export",
+    (_e, kitId: string, outputPath: string) => {
+      requireBridge().brandKitExport(kitId, outputPath);
+    },
+  );
+  ipcMain.handle("kcreate/brandKit/import", (_e, filePath: string) =>
+    requireBridge().brandKitImport(filePath),
+  );
+
+  // ---------------------------------------------------------------------
+  // Phase 5 — spot color / overprint shortcuts (Block D Task 23).
+  // ---------------------------------------------------------------------
+  ipcMain.handle(
+    "kcreate/color/spot/add",
+    (_e, name: string, c: number, m: number, y: number, k: number) => {
+      requireBridge().colorAddSpot(name, c, m, y, k);
+    },
+  );
+  ipcMain.handle(
+    "kcreate/node/overprint/set",
+    (_e, nodeId: string, enabled: boolean) => {
+      requireBridge().nodeSetOverprint(nodeId, enabled);
+    },
   );
 
   // ---------------------------------------------------------------------

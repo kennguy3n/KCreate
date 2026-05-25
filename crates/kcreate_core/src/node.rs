@@ -593,6 +593,36 @@ pub struct NodeStyle {
     /// the underlying colour plates. Default `false` (knockout).
     #[serde(default, skip_serializing_if = "is_false")]
     pub overprint: bool,
+    /// Non-destructive path effects applied at render time. The
+    /// stored vector geometry (in `node.metadata[VECTOR_PATH]`) is
+    /// the *original* path; the renderer applies this chain in
+    /// order before emitting display-list objects. `dash` produces
+    /// one Object per sub-path; `round_corners` rewrites the path.
+    /// Empty by default. Serde-`default` keeps Phase-1..Phase-4
+    /// documents loading unchanged.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub path_effects: Vec<PathEffect>,
+}
+
+/// A non-destructive path effect. Stored on
+/// [`NodeStyle::path_effects`]; the renderer applies the effect
+/// chain (in order) before emitting display-list objects. Undo
+/// reverts to the unmodified original path because the geometry
+/// itself is never rewritten — only this list changes.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PathEffect {
+    /// Dash the path. `pattern` is alternating on/off lengths in
+    /// world units (`[on, off, on, off, …]`); `offset` shifts the
+    /// pattern's start along the path.
+    Dash {
+        pattern: Vec<f64>,
+        #[serde(default)]
+        offset: f64,
+    },
+    /// Replace sharp corners with circular arcs of the given radius
+    /// (world units).
+    RoundCorners { radius: f64 },
 }
 
 #[allow(clippy::trivially_copy_pass_by_ref)]
@@ -611,6 +641,7 @@ impl Default for NodeStyle {
             extra_strokes: Vec::new(),
             stroke_width_profile: None,
             overprint: false,
+            path_effects: Vec::new(),
         }
     }
 }
@@ -801,6 +832,13 @@ pub struct TextFrameOptions {
     /// before splitting into columns and laying out lines.
     pub inset: FrameInsets,
     pub auto_size: TextAutoSize,
+    /// Next frame in a linked text-flow chain. `None` terminates the
+    /// chain. The [`kcreate_text::flow`] engine walks this chain in
+    /// order, distributing shaped text across frames; overflow from
+    /// this frame spills into the linked frame. Phase-1..Phase-4
+    /// projects deserialize without this field via `serde(default)`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_frame_id: Option<Uuid>,
 }
 
 impl Default for TextFrameOptions {
@@ -815,6 +853,7 @@ impl Default for TextFrameOptions {
             vertical_alignment: VerticalAlign::default(),
             inset: FrameInsets::default(),
             auto_size: TextAutoSize::default(),
+            next_frame_id: None,
         }
     }
 }
@@ -1776,6 +1815,7 @@ mod tests {
                 left: 12.0,
             },
             auto_size: TextAutoSize::HeightAuto,
+            next_frame_id: None,
         };
         let json = serde_json::to_string(&opts).expect("serialize");
         let back: TextFrameOptions = serde_json::from_str(&json).expect("deserialize");

@@ -435,7 +435,24 @@ foundations.
 
 ## Changelog
 
-- **2026-05-25 (this PR)** — Phase 5 ship: Image Studio filters
+- **2026-05-25 (Phase 5 follow-up)** — Phase 5 bridge gap closure:
+  full bridge wiring for the path-effect chain
+  (`vector_apply_path_effect` / `vector_clear_path_effects` →
+  `apply_path_effects` in `scene_sync.rs`, applied in render
+  order with `Dash` always last), text frame linking
+  (`text_frame_link` / `text_frame_unlink` /
+  `text_frame_set_wrap`), slice CRUD + parallel export
+  (`slice_create` / `slice_update` / `slice_delete` /
+  `slice_list` / `slice_export_all`), `.kbrand` round-trip
+  (`brand_kit_export` / `brand_kit_import` resolving asset blobs
+  through `ProjectStore::store_asset_with_id` /
+  `ProjectStore::load_asset`), spot-color convenience entries
+  (`color_add_spot`, `node_set_overprint`), and the multi-fill /
+  multi-stroke stack editor (RightPanel `ExtraFillsList` with
+  add / remove / reorder backed by
+  `document_node_extra_fills` / `document_node_extra_strokes`
+  readers + `UpdateNodeProps.extra_fills` / `extra_strokes`).
+- **2026-05-25 (PR #14)** — Phase 5 ship: Image Studio filters
   (Levels, Curves, Gaussian / Box blur, Unsharp mask, Crop /
   Rotate / Flip, Healing brush + raster_ops bridge + FiltersPanel
   UI), Vector Studio (snap engine + smart-guides overlay, simplify

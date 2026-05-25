@@ -1738,6 +1738,120 @@ function registerIpcHandlers(): void {
   );
 
   // ---------------------------------------------------------------------
+  // Phase 5 — spot color library (Block D Task 23). Each call mutates
+  // the project's `SpotColorLibrary` through an undoable operation;
+  // the renderer hydrates its swatch panel via `kcreate/color/spot/list`.
+  // ---------------------------------------------------------------------
+  ipcMain.handle("kcreate/color/spot/upsert", (_e, wireJson: string) => {
+    requireBridge().colorSpotUpsert(wireJson);
+  });
+  ipcMain.handle("kcreate/color/spot/remove", (_e, name: string) =>
+    requireBridge().colorSpotRemove(name),
+  );
+  ipcMain.handle("kcreate/color/spot/list", () =>
+    requireBridge().colorSpotList(),
+  );
+
+  // ---------------------------------------------------------------------
+  // Phase 5 — smart-guides snap engine (Block C Task 13). The
+  // `CanvasHost` calls this on every drag-move event and applies the
+  // returned delta + renders the guide list as a dashed overlay.
+  // ---------------------------------------------------------------------
+  ipcMain.handle(
+    "kcreate/canvas/snap",
+    (
+      _e,
+      movingId: string | null,
+      candidateX: number,
+      candidateY: number,
+      candidateW: number,
+      candidateH: number,
+      threshold: number,
+    ) =>
+      requireBridge().canvasSnap(
+        movingId,
+        candidateX,
+        candidateY,
+        candidateW,
+        candidateH,
+        threshold,
+      ),
+  );
+
+  // ---------------------------------------------------------------------
+  // Phase 5 — raster filters (Block B Task 11). Live preview goes
+  // through `kcreate/raster/preview` (non-destructive); the rest are
+  // undoable commits.
+  // ---------------------------------------------------------------------
+  ipcMain.handle(
+    "kcreate/raster/apply/levels",
+    (_e, nodeId: string, black: number, white: number, gamma: number) => {
+      requireBridge().rasterApplyLevels(nodeId, black, white, gamma);
+    },
+  );
+  ipcMain.handle(
+    "kcreate/raster/apply/curves",
+    (_e, nodeId: string, pointsJson: string) => {
+      requireBridge().rasterApplyCurves(nodeId, pointsJson);
+    },
+  );
+  ipcMain.handle(
+    "kcreate/raster/apply/blur",
+    (_e, nodeId: string, radius: number, kind: string) => {
+      requireBridge().rasterApplyBlur(nodeId, radius, kind);
+    },
+  );
+  ipcMain.handle(
+    "kcreate/raster/apply/sharpen",
+    (
+      _e,
+      nodeId: string,
+      radius: number,
+      amount: number,
+      threshold: number,
+    ) => {
+      requireBridge().rasterApplySharpen(nodeId, radius, amount, threshold);
+    },
+  );
+  ipcMain.handle(
+    "kcreate/raster/crop",
+    (_e, nodeId: string, x: number, y: number, w: number, h: number) => {
+      requireBridge().rasterCrop(nodeId, x, y, w, h);
+    },
+  );
+  ipcMain.handle(
+    "kcreate/raster/rotate",
+    (_e, nodeId: string, angleDeg: number) => {
+      requireBridge().rasterRotate(nodeId, angleDeg);
+    },
+  );
+  ipcMain.handle(
+    "kcreate/raster/flip",
+    (_e, nodeId: string, direction: string) => {
+      requireBridge().rasterFlip(nodeId, direction);
+    },
+  );
+  ipcMain.handle(
+    "kcreate/raster/heal",
+    (
+      _e,
+      nodeId: string,
+      srcX: number,
+      srcY: number,
+      dstX: number,
+      dstY: number,
+      radius: number,
+    ) => {
+      requireBridge().rasterHeal(nodeId, srcX, srcY, dstX, dstY, radius);
+    },
+  );
+  ipcMain.handle(
+    "kcreate/raster/preview",
+    (_e, nodeId: string, filterJson: string) =>
+      requireBridge().rasterPreviewFilter(nodeId, filterJson),
+  );
+
+  // ---------------------------------------------------------------------
   // Phase 2 — text frame + OpenType (Block B Task 11)
   // ---------------------------------------------------------------------
   ipcMain.handle("kcreate/text/frame/get", (_e, nodeId: string) =>

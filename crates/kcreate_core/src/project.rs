@@ -169,9 +169,67 @@ pub struct Project {
     /// defaults.
     #[serde(default)]
     pub color_settings: ColorSettings,
+    /// Named regions of the canvas registered for batched export.
+    /// Each slice carries its own format / scale / suffix and
+    /// renders independently. `#[serde(default)]` so Phase 1–4
+    /// projects deserialize without the field.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub slices: Vec<Slice>,
+    /// Spot-ink library indexed by canonical spot name. Used by
+    /// preflight (`PreflightCheck::SpotColorMissing`) and the PDF
+    /// export pipeline (real separation plates). Defaults to an
+    /// empty library so Phase 1–4 projects still deserialize.
+    #[serde(default, skip_serializing_if = "SpotColorLibrary::is_empty")]
+    pub spot_color_library: SpotColorLibrary,
     pub created_at: DateTime<Utc>,
     pub modified_at: DateTime<Utc>,
 }
+
+/// A named rectangular region of the canvas registered for export.
+/// Each slice renders independently with its own format / scale /
+/// suffix. Slices are stored at the project level — they survive
+/// undo of the *contents* under them, but slice creation / deletion
+/// is itself an undoable [`crate::operation::Operation`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Slice {
+    pub id: Uuid,
+    pub name: String,
+    pub bounds: crate::Bounds,
+    pub format: ExportFormat,
+    pub scale: f32,
+    /// File extension to use (with leading dot), e.g. `.png`.
+    /// Filled in from `format` when constructed via [`Slice::new`].
+    pub suffix: String,
+}
+
+impl Slice {
+    /// Construct a new slice with a fresh uuid.
+    #[must_use]
+    pub fn new(
+        name: impl Into<String>,
+        bounds: crate::Bounds,
+        format: ExportFormat,
+        scale: f32,
+    ) -> Self {
+        let suffix = match format {
+            ExportFormat::Png => ".png".to_string(),
+            ExportFormat::Svg => ".svg".to_string(),
+            ExportFormat::Pdf => ".pdf".to_string(),
+            ExportFormat::Webp => ".webp".to_string(),
+            ExportFormat::Jpeg => ".jpg".to_string(),
+        };
+        Self {
+            id: Uuid::new_v4(),
+            name: name.into(),
+            bounds,
+            format,
+            scale,
+            suffix,
+        }
+    }
+}
+
+pub use crate::color::SpotColorLibrary;
 
 impl Project {
     /// Create a new, empty project with the default 256-deep undo log.
@@ -225,6 +283,8 @@ impl Project {
             export_presets: Vec::new(),
             components: HashMap::new(),
             color_settings: ColorSettings::default(),
+            slices: Vec::new(),
+            spot_color_library: SpotColorLibrary::default(),
             created_at: now,
             modified_at: now,
         }

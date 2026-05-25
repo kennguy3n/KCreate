@@ -12,6 +12,7 @@ use std::sync::{Arc, OnceLock};
 
 use parking_lot::RwLock;
 
+use kcreate_core::color::{Color, SpotColorLibrary};
 use kcreate_core::document::DocumentGraph;
 use kcreate_core::node::{
     BlendMode, FillStyle, Node, NodeType, PageLayout, PageSize, PAGE_LAYOUT_METADATA_KEY,
@@ -90,6 +91,13 @@ pub enum PreflightCheck {
     /// edge; this one is about the bleed strip having no covering
     /// layer at all.
     BleedAreaEmpty,
+    /// A node uses a spot ink (`Color::Spot { name, .. }`) that is
+    /// not registered in the project's [`SpotColorLibrary`]. The
+    /// PDF exporter will fall back to the inline CMYK approximation,
+    /// but the press operator won't know which separation plate to
+    /// use — typically a costly mistake. Surfaces as a `Warning` so
+    /// the run still completes.
+    SpotColorMissing,
 }
 
 impl PreflightCheck {
@@ -107,6 +115,7 @@ impl PreflightCheck {
             Self::FontGlyphCoverage => "font_glyph_coverage",
             Self::TotalInkCoverage => "total_ink_coverage",
             Self::BleedAreaEmpty => "bleed_area_empty",
+            Self::SpotColorMissing => "spot_color_missing",
         }
     }
 }
@@ -305,6 +314,24 @@ pub fn run_preflight(
     pages: &[Uuid],
     options: &PreflightOptions,
 ) -> Vec<PreflightIssue> {
+    run_preflight_with_spots(document, pages, options, &SpotColorLibrary::default())
+}
+
+/// Full Phase-5 preflight entry point that also validates spot inks.
+///
+/// Equivalent to [`run_preflight`] except that any `Color::Spot`
+/// reference on a node whose `name` is not registered in `spots`
+/// surfaces as [`PreflightCheck::SpotColorMissing`]. The PDF
+/// exporter still falls back to the colour's inline CMYK
+/// approximation, but the press operator won't know which
+/// separation plate to apply — a costly mistake we want to flag.
+#[must_use]
+pub fn run_preflight_with_spots(
+    document: &DocumentGraph,
+    pages: &[Uuid],
+    options: &PreflightOptions,
+    spots: &SpotColorLibrary,
+) -> Vec<PreflightIssue> {
     let page_ids = if pages.is_empty() {
         document
             .iter()
@@ -346,6 +373,7 @@ pub fn run_preflight(
             check_node_transparency(node, page_id, options, &mut issues);
             check_node_shading(node, page_id, options, &mut issues);
             check_node_total_ink_coverage(node, page_id, options, &mut issues);
+            check_node_spot_color(node, page_id, spots, &mut issues);
             if matches!(node.node_type, NodeType::TextLayer) {
                 check_node_font_embed(node, page_id, fonts.as_ref(), &mut issues);
             }
@@ -803,7 +831,11 @@ fn node_needs_cmyk_conversion(node: &Node) -> bool {
     // as a chromatic RGB fill for the purposes of this check.
     if let Some(over) = &node.style.color_override {
         return match over {
-            kcreate_core::color::Color::Cmyk { .. } => false,
+            // Spot inks are already CMYK-routed via their fallback,
+            // so no further sRGB→CMYK approximation is involved.
+            kcreate_core::color::Color::Cmyk { .. } | kcreate_core::color::Color::Spot { .. } => {
+                false
+            }
             kcreate_core::color::Color::Srgb { r, g, b, .. } => !is_grayscale(*r, *g, *b),
             kcreate_core::color::Color::Hsl { s, .. } => *s > 0.01,
             kcreate_core::color::Color::Lab { a_star, b_star, .. } => {
@@ -1086,6 +1118,9 @@ fn check_node_total_ink_coverage(
                 }
                 kcreate_core::color::Color::Hsl { .. } => "HSL color override (converted to CMYK)",
                 kcreate_core::color::Color::Lab { .. } => "Lab color override (converted to CMYK)",
+                kcreate_core::color::Color::Spot { .. } => {
+                    "spot color override (via CMYK fallback)"
+                }
             };
             push_tic_issue(node, page_id, sum, cap, source, None, issues);
         }
@@ -1131,6 +1166,42 @@ fn check_node_total_ink_coverage(
             }
         }
     }
+}
+
+/// Check whether a node's authoritative colour references a spot ink
+/// (`Color::Spot { name, .. }`) that is registered in the project's
+/// [`SpotColorLibrary`]. Unregistered spots can still print via the
+/// inline CMYK fallback baked into the colour, but the press operator
+/// loses the separation-plate identity — a costly mistake at proof
+/// time. Surfaces a Warning so the run still completes.
+fn check_node_spot_color(
+    node: &Node,
+    page_id: Uuid,
+    spots: &SpotColorLibrary,
+    issues: &mut Vec<PreflightIssue>,
+) {
+    if !is_content_layer(node.node_type) {
+        return;
+    }
+    let Some(over) = &node.style.color_override else {
+        return;
+    };
+    let Color::Spot { name, .. } = over else {
+        return;
+    };
+    if spots.get(name).is_some() {
+        return;
+    }
+    issues.push(PreflightIssue {
+        check: PreflightCheck::SpotColorMissing,
+        severity: PreflightSeverity::Warning,
+        message: format!(
+            "node references spot ink \"{name}\" which is not registered in the project's spot color library; \
+             PDF export will fall back to the inline CMYK approximation"
+        ),
+        affected_node_id: Some(node.id),
+        page_id: Some(page_id),
+    });
 }
 
 /// Sum of CMYK components for an override color, in `[0, 4]`.

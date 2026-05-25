@@ -59,6 +59,9 @@ See [`PROPOSAL.md`](./PROPOSAL.md) for the full product spec.
 | Parallelism          | `rayon` (Lanczos rows, parallel batch export, palette downsample) |
 | Plugin sandbox       | `wasmi` 0.42 (pure Rust, no LLVM)                            |
 | MCP                  | `tiny_http` JSON-RPC over loopback                           |
+| LAN collaboration    | `quinn` (QUIC) + `mdns-sd` (mDNS-SD) + `rustls` (TLS) + `tokio` (async runtime; opt-in via `collab` feature on `kcreate_bridge`) |
+| Collaboration protocol | Ed25519-signed envelopes, Lamport clocks, LWW conflict resolution, append-only operation journal |
+| Brand kit format     | `.kbrand` ZIP archive: `manifest.json` + `fonts/` (TTF/OTF) + `logos/` (PNG/SVG/JPEG) |
 
 See [`ARCHITECTURE.md`](./ARCHITECTURE.md) for the technical design.
 
@@ -102,6 +105,19 @@ cargo check --workspace --all-targets
 pnpm build           # builds main + preload + renderer
 cargo build --workspace
 ```
+
+To build with LAN collaboration support (QUIC + mDNS transport), add
+the `collab` feature flag on `kcreate_bridge`:
+
+```bash
+cargo build --workspace --features kcreate_bridge/collab
+```
+
+This pulls `quinn`, `rustls`, `mdns-sd`, and `tokio` into the bridge
+but still keeps the editing path crates network-free (the
+`crates/kcreate_tests/tests/local_first.rs` deny-list enforces this).
+The `kchat-dev-issuer` feature flag enables the dev-side KChat
+membership issuer for integration tests.
 
 ### Test
 
@@ -157,6 +173,12 @@ KCreate/
 │   ├── kcreate_collab/           Phase 3 collaboration protocol foundation (peer identity,
 │   │                              Lamport clock, signed envelopes, conflict resolver,
 │   │                              project session). Kept OUT of editing-path deps.
+│   ├── kcreate_collab_transport/ QUIC + mDNS LAN transport (peer discovery, ephemeral
+│   │                              cert pinning). Only networked crate; opt-in via
+│   │                              `collab` feature on kcreate_bridge.
+│   ├── kcreate_kchat/            Dev-side KChat group-membership issuer (test attestations
+│   │                              against deterministic Ed25519 keys). Behind
+│   │                              `kchat-dev-issuer` feature flag.
 │   └── kcreate_tests/            Cross-crate integration tests
 ├── tools/
 │   └── kcreate_diffusion/        Loopback Python diffusion sidecar (FLUX.2-Klein-4B,

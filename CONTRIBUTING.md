@@ -30,6 +30,11 @@ sudo apt-get install -y --no-install-recommends \
 enumerate system fonts. Without it, font discovery falls back to the
 bundled-only set.
 
+On Linux, install Vulkan drivers (`mesa-vulkan-drivers`, included in
+the `apt-get` line above) for GPU-accelerated AI inference. Without
+them the runtime classifies the device as CPU-only (Tier 0 or 1),
+which limits AI model sizes and disables image generation.
+
 The `kcreate_renderer` crate falls back to its `tiny-skia` CPU
 rasterizer if no Vulkan adapter is available, so headless containers
 work too — the GPU deps are optional for tests but required for the
@@ -82,6 +87,7 @@ cargo bench -p kcreate_export --no-run
 cargo bench -p kcreate_raster --no-run
 cargo bench -p kcreate_ai --no-run
 cargo bench -p kcreate_layout --no-run
+cargo bench -p kcreate_bridge --no-run    # scene_sync benches (PR #12)
 
 pnpm typecheck
 pnpm lint
@@ -94,6 +100,17 @@ setup beyond the workspace toolchain.
 
 Bridge tests share a process-global renderer singleton; they use the
 `serial_test` crate to run serialized.
+
+The Phase 4 vision sidecar (`kcreate_ai::vision_chat`) and the FLUX
+image-generation sidecar (`kcreate_ai::image_gen` + `tools/kcreate_diffusion`)
+optionally spawn Python subprocesses (`mlx_lm.server` on Apple
+Silicon, `python -m kcreate_diffusion.server` everywhere else). These
+are not required for building or testing — they enhance the runtime
+AI experience. Without them the bridge still loads and the relevant
+tier of model packs is reported as unavailable rather than failing.
+LAN collaboration is opt-in via `--features kcreate_bridge/collab`
+and `kcreate_bridge/kchat-dev-issuer`; both pull `quinn`, `rustls`,
+`mdns-sd`, and `tokio` from the workspace deps.
 
 ## Code style
 

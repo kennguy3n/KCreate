@@ -221,6 +221,54 @@ impl TileGrid {
         Ok(grid)
     }
 
+    /// Read a single RGBA pixel at `(x, y)` with clamping at the
+    /// grid edges. Used by separable filters that need to read past
+    /// the source bounds without allocating an explicit padding ring.
+    /// Returns `[0, 0, 0, 0]` for unallocated sparse tiles.
+    #[must_use]
+    pub fn read_pixel_clamped(&self, x: i64, y: i64) -> [u8; 4] {
+        let cx = x.clamp(0, i64::from(self.width) - 1) as u32;
+        let cy = y.clamp(0, i64::from(self.height) - 1) as u32;
+        let col = cx / self.tile_size;
+        let row = cy / self.tile_size;
+        let idx = (row as usize) * (self.cols as usize) + (col as usize);
+        let Some(tile) = self.tiles.get(idx).and_then(|t| t.as_ref()) else {
+            return [0, 0, 0, 0];
+        };
+        let tx = (cx - col * self.tile_size) as usize;
+        let ty = (cy - row * self.tile_size) as usize;
+        let off = (ty * self.tile_size as usize + tx) * 4;
+        [
+            tile.pixels[off],
+            tile.pixels[off + 1],
+            tile.pixels[off + 2],
+            tile.pixels[off + 3],
+        ]
+    }
+
+    /// Write a single RGBA pixel at `(x, y)`. Out-of-bounds writes are
+    /// silently dropped. The owning tile is lazily allocated and
+    /// marked dirty.
+    pub fn write_pixel(&mut self, x: u32, y: u32, rgba: [u8; 4]) {
+        if x >= self.width || y >= self.height {
+            return;
+        }
+        let tile_size = self.tile_size;
+        let col = x / tile_size;
+        let row = y / tile_size;
+        let Ok(tile) = self.get_tile_mut(col, row) else {
+            return;
+        };
+        let tx = (x - col * tile_size) as usize;
+        let ty = (y - row * tile_size) as usize;
+        let off = (ty * tile_size as usize + tx) * 4;
+        tile.pixels[off] = rgba[0];
+        tile.pixels[off + 1] = rgba[1];
+        tile.pixels[off + 2] = rgba[2];
+        tile.pixels[off + 3] = rgba[3];
+        tile.dirty = true;
+    }
+
     /// Flatten back into a single RGBA8 buffer.
     #[must_use]
     pub fn to_image(&self) -> Vec<u8> {

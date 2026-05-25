@@ -19,12 +19,14 @@ pub mod cmyk_dither;
 pub mod code_gen;
 pub mod icon_pack;
 pub mod jpeg;
+pub mod kbrand;
 pub mod pdf;
 pub mod pdf_import;
 pub mod pdf_shading;
 pub mod png;
 pub mod preflight;
 pub mod scene_metadata;
+pub mod slice;
 pub mod svg;
 pub mod webp;
 

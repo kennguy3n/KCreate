@@ -125,7 +125,7 @@ pub(crate) struct Workspace {
     selection: Vec<Uuid>,
 }
 
-fn slot() -> &'static Mutex<Option<Workspace>> {
+pub(crate) fn slot() -> &'static Mutex<Option<Workspace>> {
     static WS: OnceLock<Mutex<Option<Workspace>>> = OnceLock::new();
     WS.get_or_init(|| Mutex::new(None))
 }
@@ -936,6 +936,84 @@ pub struct UpdateNodeProps {
     /// via the `kind`-tagged enum serde produces.
     #[serde(default)]
     pub fill: Option<kcreate_core::node::FillStyle>,
+    /// Replace the node's `extra_fills` (additional fills stacked
+    /// above the primary `fill`). `Some(empty)` clears them.
+    #[serde(default)]
+    pub extra_fills: Option<Vec<kcreate_core::node::FillStyle>>,
+    /// Replace the node's primary `stroke`. Tri-state: `NoOp` leaves
+    /// the existing stroke untouched, `Clear` removes it entirely,
+    /// `Set(s)` replaces it. See [`FieldUpdate`] for serde semantics —
+    /// an absent JSON field is `NoOp`, `null` is `Clear`, and any
+    /// other value is `Set`.
+    #[serde(default, deserialize_with = "deserialize_field_update_stroke")]
+    pub stroke: FieldUpdate<kcreate_core::node::StrokeStyle>,
+    /// Replace the node's `extra_strokes`.
+    #[serde(default)]
+    pub extra_strokes: Option<Vec<kcreate_core::node::StrokeStyle>>,
+    /// Replace the variable-stroke-width profile. `Clear` removes the
+    /// profile (uniform width); `Set(profile)` installs the new one.
+    #[serde(default, deserialize_with = "deserialize_field_update_profile")]
+    pub stroke_width_profile: FieldUpdate<Vec<(f64, f64)>>,
+    /// Toggle the overprint flag.
+    #[serde(default)]
+    pub overprint: Option<bool>,
+}
+
+/// Three-way update for an optional field. Serde sees JSON `null` as
+/// `Clear`, an absent field as `NoOp`, and any value as `Set(v)`. We
+/// can't represent that with `Option<Option<T>>` without tripping the
+/// `clippy::option_option` lint, and a custom enum reads better at
+/// the call site (`match changes.stroke { Clear => ..., ... }`).
+#[derive(Debug, Clone, Default)]
+pub enum FieldUpdate<T> {
+    /// JSON field absent — leave existing value untouched.
+    #[default]
+    NoOp,
+    /// JSON field is `null` — clear existing value.
+    Clear,
+    /// JSON field is a value — replace existing value with it.
+    Set(T),
+}
+
+impl<T> FieldUpdate<T> {
+    /// Apply this update to an `Option<T>` slot on a target struct.
+    /// `NoOp` leaves the slot alone; `Clear` sets it to `None`;
+    /// `Set(v)` replaces it with `Some(v)`.
+    pub fn apply(self, slot: &mut Option<T>) {
+        match self {
+            Self::NoOp => {}
+            Self::Clear => *slot = None,
+            Self::Set(v) => *slot = Some(v),
+        }
+    }
+}
+
+fn deserialize_field_update_stroke<'de, D>(
+    deserializer: D,
+) -> std::result::Result<FieldUpdate<kcreate_core::node::StrokeStyle>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+    let opt = Option::<kcreate_core::node::StrokeStyle>::deserialize(deserializer)?;
+    Ok(match opt {
+        Some(v) => FieldUpdate::Set(v),
+        None => FieldUpdate::Clear,
+    })
+}
+
+fn deserialize_field_update_profile<'de, D>(
+    deserializer: D,
+) -> std::result::Result<FieldUpdate<Vec<(f64, f64)>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+    let opt = Option::<Vec<(f64, f64)>>::deserialize(deserializer)?;
+    Ok(match opt {
+        Some(v) => FieldUpdate::Set(v),
+        None => FieldUpdate::Clear,
+    })
 }
 
 /// Apply an in-place update to a node.
@@ -965,6 +1043,20 @@ pub fn document_update_node(id: Uuid, changes: &UpdateNodeProps) -> Result<()> {
     }
     if let Some(fill) = &changes.fill {
         node.style.fill = fill.clone();
+    }
+    if let Some(extra_fills) = &changes.extra_fills {
+        node.style.extra_fills.clone_from(extra_fills);
+    }
+    changes.stroke.clone().apply(&mut node.style.stroke);
+    if let Some(extra_strokes) = &changes.extra_strokes {
+        node.style.extra_strokes.clone_from(extra_strokes);
+    }
+    changes
+        .stroke_width_profile
+        .clone()
+        .apply(&mut node.style.stroke_width_profile);
+    if let Some(overprint) = changes.overprint {
+        node.style.overprint = overprint;
     }
     node.touch();
     ws.project.modified_at = Utc::now();
@@ -1264,7 +1356,9 @@ pub fn document_sync_scene() -> Result<()> {
 /// observes the canonical order). As long as both invariants hold,
 /// there is no path that can deadlock by acquiring them in opposite
 /// orders.
-fn sync_scene_locked(guard: &mut parking_lot::MutexGuard<'_, Option<Workspace>>) -> Result<()> {
+pub(crate) fn sync_scene_locked(
+    guard: &mut parking_lot::MutexGuard<'_, Option<Workspace>>,
+) -> Result<()> {
     let Some(ws) = guard.as_mut() else {
         return Ok(());
     };
@@ -1478,6 +1572,67 @@ pub fn canvas_hit_test(
     let hit = crate::hit_test::hit_test(&ws.scene_sync, &scene, screen_x, screen_y, vp);
     drop(guard);
     Ok(hit)
+}
+
+/// Build a [`kcreate_vector::snap::SnapEngine`] over every visible
+/// node *except* `moving_id` (the node currently being dragged),
+/// query it with the candidate world bounds, and return the snap
+/// delta + guide lines as a JSON string.
+///
+/// Returns `Ok(None)` when no project is open. Returns an empty
+/// [`SnapResult`] (`dx=0, dy=0, guides=[]`) when no targets are
+/// within the threshold — callers should treat that as "no snap"
+/// without special-casing it.
+///
+/// Guides are returned in world-space coordinates; the canvas
+/// overlay is responsible for mapping them through the viewport
+/// transform before drawing.
+pub fn canvas_snap(
+    moving_id: Option<Uuid>,
+    candidate_x: f64,
+    candidate_y: f64,
+    candidate_w: f64,
+    candidate_h: f64,
+    threshold: f64,
+) -> Result<Option<kcreate_vector::snap::SnapResult>> {
+    let guard = slot().lock();
+    let Some(ws) = guard.as_ref() else {
+        return Ok(None);
+    };
+    let mut targets: Vec<kcreate_vector::snap::SnapTarget> = Vec::new();
+    for (id, node) in ws.project.document.iter() {
+        if !node.visible || node.locked {
+            continue;
+        }
+        if Some(*id) == moving_id {
+            continue;
+        }
+        let world = kcreate_core::node::Bounds {
+            x: node.bounds.x + node.transform.tx,
+            y: node.bounds.y + node.transform.ty,
+            width: node.bounds.width,
+            height: node.bounds.height,
+        };
+        if world.width <= 0.0 || world.height <= 0.0 {
+            continue;
+        }
+        targets.push(kcreate_vector::snap::SnapTarget::from_bounds(
+            world.x,
+            world.y,
+            world.width,
+            world.height,
+        ));
+    }
+    let engine = kcreate_vector::snap::SnapEngine::new(targets);
+    let result = engine.snap(
+        candidate_x,
+        candidate_y,
+        candidate_w,
+        candidate_h,
+        threshold,
+    );
+    drop(guard);
+    Ok(Some(result))
 }
 
 // -----------------------------------------------------------------------------

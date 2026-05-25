@@ -22,11 +22,13 @@
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 
+pub mod flow;
 pub mod font_db;
 pub mod hyphenation;
 pub mod outline;
 pub mod paragraph;
 pub mod shaper;
+pub mod wrap;
 
 pub use font_db::{FontInfo, FontManager, FontManagerError};
 pub use hyphenation::{HyphenationPatterns, EN_US_PATTERNS};

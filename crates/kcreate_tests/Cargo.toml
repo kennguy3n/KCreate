@@ -24,8 +24,10 @@ kcreate_ai = { path = "../kcreate_ai", features = ["llm_sidecar"] }
 kcreate_core = { path = "../kcreate_core" }
 kcreate_export = { path = "../kcreate_export" }
 kcreate_mcp = { path = "../kcreate_mcp" }
+kcreate_raster = { path = "../kcreate_raster" }
 kcreate_renderer = { path = "../kcreate_renderer" }
 kcreate_storage = { path = "../kcreate_storage" }
+kcreate_text = { path = "../kcreate_text" }
 kcreate_vector = { path = "../kcreate_vector" }
 serde_json = { workspace = true }
 tempfile = { workspace = true }

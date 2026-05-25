@@ -225,13 +225,58 @@ Export Center, Local AI Core Pack.
       can pull QUIC / mDNS without contaminating local-first.
 - [x] **Block I** — CI updates + documentation sync (this commit).
 
-## Phase 4 — Vision & Generation AI | In flight
+## Phase 3 — Advanced Suite | Foundation landed + LAN transport | ~40%
 
-Local multimodal inference layer that pairs llama.cpp's GGUF +
-mmproj loading with an Apple-Silicon MLX side path, plus a fully
-gated FLUX image-generation sidecar. Vision is *soft-gated* (every
-tier can run SmolVLM2-256M); image generation is *hard-gated* to
-Tier 2+ with a GPU.
+Protocol-level work shipped in Phase 2 PR #7 and the LAN transport
+shipped in PR #10 (`kcreate_collab_transport` + bridge session
+management) — the collab feature is opt-in on `kcreate_bridge` and
+stays out of the editing-path dependency tree so the local-first
+sentinel stays green.
+
+- [x] Collaboration protocol types (`kcreate_collab`) — see Phase 2 Block H.
+- [x] LAN transport (QUIC + mDNS discovery) — `kcreate_collab_transport`
+      crate. `LanCollabHost` runs a QUIC endpoint and an mDNS-SD
+      responder behind ephemeral self-signed certs pinned via SHA-256
+      fingerprint from `kcreate_collab` peer identity. `PeerDiscovery`
+      browses the same service; `CertBundle` generates rcgen certs;
+      `wire.rs` codecs frame envelopes onto the QUIC streams. Bridge
+      `collab.rs` owns `SessionState` + the tokio multi-thread runtime
+      and exposes `collab_*` N-API entry points.
+- [x] KChat dev issuer (`kcreate_kchat`) — deterministic Ed25519
+      key derivation + signed-attestation minting against KChat groups,
+      used by the integration tests + the `kchat-dev-issuer` bridge
+      feature flag and the renderer `KChatSignInPanel`.
+- [x] Operation journal (`kcreate_collab::journal`) — append-only
+      log used by the session bridge for resync.
+- [x] Renderer improvements — radial / linear gradient scene objects
+      (`kcreate_renderer::scene::ObjectKind::{LinearGradient,
+      RadialGradient}`) with renderer-side stop interpolation.
+- [x] AI inference UX end-to-end — alt-text + layout-suggest wired
+      through `kcreate_bridge::phase4` and the AIAssistPanel /
+      VisionAssistSection components.
+- [x] PDF preflight extensions — shading-pattern validity check,
+      per-codepoint font glyph coverage, total ink coverage (TIC),
+      bleed-area-content check, DPI floor.
+- [x] Scene-sync multi-peer micro-benches + batched insert
+      (`crates/kcreate_bridge/benches/scene_sync_*.rs`,
+      `Scene::add_objects` batch entry).
+- [x] Lock-aware FillSection (solid + gradient editor) — preserves
+      in-flight edits across remote scene updates.
+- [x] OCR text-region detection → text-layer creation
+      (`kcreate_ai::ocr` + bridge `ocr_*` entry points).
+- [x] KChat trusted-issuer allowlist — `TrustedIssuersSection` UI
+      surface, allowlist stored in the project, gated through the
+      bridge.
+- [ ] Operational CRDT semantics on top of `Operation`.
+- [ ] Deeper print support (full spot-color libraries, overprint
+      tables, trapping) — Phase 5 land foundation (`Color::Spot`,
+      `Overprint` flag, `SpotColorMissing` preflight check).
+- [ ] Advanced inpainting, local style model packs (ESRGAN, SAM,
+      u2net) — registry already declares them; install path lands
+      with the model download UI.
+- [ ] Marketplace for vetted local templates.
+
+## Phase 4 — Vision & Generation AI | Complete | 100%
 
 - [x] **Block A — Vision Understanding Infrastructure** (Tasks 1–6).
   - `SidecarConfig.mmproj_path` end-to-end with disk validation,
@@ -300,23 +345,124 @@ Tier 2+ with a GPU.
 - [x] **Block F — Documentation** (Tasks 28–30).
   - This section + ARCHITECTURE.md §16i/j/k + README "Local AI" row.
 
-## Phase 3 — Advanced Suite | Foundation landed
+## Phase 5 — Image Studio Filters + Vector Studio + Layout Studio + Brand Hub | Complete | 100%
 
-Protocol-level work shipped in Phase 2 PR #7 to keep the editing
-path stable while collab + advanced workflows are built out:
+The filter / vector / layout / brand-hub gap-filler pass. Adds the
+missing professional editing primitives on top of the Phase 1-2
+foundations.
 
-- [x] Collaboration protocol types (`kcreate_collab`) — see Block H.
-- [ ] LAN transport (QUIC + mDNS discovery) — separate crate, isolated
-      from editing path.
-- [ ] Operational CRDT semantics on top of `Operation`.
-- [ ] Deeper print support (spot colors, overprint, trapping).
-- [ ] Advanced inpainting, local style model packs (ESRGAN, SAM,
-      u2net) — registry already declares them; install path lands
-      with the model download UI.
-- [ ] Marketplace for vetted local templates.
+### Block B — Image Studio filters
+- [x] Levels + Curves adjustment layers
+      (`kcreate_raster::layer::AdjustmentLayer::{Levels, Curves}`).
+      Levels: black/white point + gamma. Curves: piecewise cubic
+      Hermite interpolation over `(x, y)` control points. Both
+      run row-parallel via rayon.
+- [x] Gaussian + box blur (`kcreate_raster::filters::{gaussian_blur,
+      box_blur}`). Separable two-pass Gaussian (horizontal +
+      vertical, rayon-parallel). Three-pass sliding-window box blur
+      approximates Gaussian in O(1) per pixel.
+- [x] Unsharp mask sharpen (`kcreate_raster::filters::unsharp_mask`).
+- [x] Crop / rotate / flip (`kcreate_raster::transform::{crop,
+      rotate, flip_h, flip_v}`). Rotation uses bilinear
+      interpolation, row-parallel.
+- [x] Healing brush (`kcreate_raster::heal::heal`) — gradient-domain
+      luminance shift + alpha-feathered disc blend.
+- [x] Raster operations bridge (`kcreate_bridge::raster_ops`) — N-API
+      surface for all filters + preview path; records undoable
+      `Operation`s.
+- [x] Filters UI panel (`apps/desktop/renderer/src/components/FiltersPanel.tsx`)
+      — debounced live preview via `rasterOps.previewFilter`, Apply
+      commit through the corresponding `applyXxx` bridge function,
+      tabbed Levels / Curves / Blur / Sharpen / Transform sections,
+      interactive SVG curve editor with click-to-add / right-click-to-
+      remove. Mounted from `RightPanel` whenever a `RasterLayer` is
+      selected. Follows the Ask → Preview → Apply → Undo loop.
+
+### Block C — Vector Studio features
+- [x] Snapping + smart guides (`kcreate_vector::snap`) — sorted-edge
+      snap engine, per-axis snap, artboard edge + midpoint snapping.
+- [x] Smart-guides UI overlay in `EditorPage` — a transparent SVG
+      sits above the canvas, projects world-space `SnapGuide` lines
+      through the active viewport, and renders them as 1 px dashed
+      magenta lines. The drag handler in `EditorPage.onCanvasPointer`
+      calls `canvasSnap.query()` on every pointermove with the
+      candidate world bounds, applies the returned delta to the
+      cumulative drag offset, and clears the overlay on pointerup.
+      Snap threshold is 6 world units (tight enough to feel
+      deliberate, forgiving on high-DPI displays).
+- [x] Path simplify / smooth / offset
+      (`kcreate_vector::simplify::{simplify, smooth, offset}`).
+      Simplify is Ramer–Douglas–Peucker; smooth is Chaikin
+      subdivision; offset uses parallel curve construction via kurbo.
+- [x] Variable stroke width — `NodeStyle::stroke_width_profile`
+      + `kcreate_vector::stroke::expand_variable_stroke` produces a
+      filled outline from a centerline + width profile.
+- [x] Multi-fill / multi-stroke per node — `NodeStyle::extra_fills` +
+      `NodeStyle::extra_strokes` (legacy single `fill` / `stroke` stay
+      first, additional layers stack on top with serde-default empty
+      vectors so old projects open unchanged). The bridge update path
+      (`document_update_node` + new `UpdateNodeProps::{extra_fills,
+      stroke, extra_strokes, stroke_width_profile, overprint}`) uses
+      a typed `FieldUpdate<T>` enum so JSON `null` clears a field and
+      an absent JSON key leaves it untouched — callers can patch the
+      three-state `stroke` slot through the same path. The reorderable
+      `RightPanel.FillSection` editor remains a UX-polish follow-up
+      now that the full bridge surface is in place.
+- [x] Path effects (`kcreate_vector::path_effects::{dash,
+      round_corners}`) — dash splits the path into sub-paths by
+      arc-length walk; round-corners replaces sharp angles with
+      circular arcs.
+
+### Block D — Layout Studio + Brand Hub
+- [x] Text flow across linked frames (`kcreate_text::flow`).
+- [x] Image-text wraps (`kcreate_text::wrap`).
+- [x] `.kbrand` brand-kit import / export
+      (`kcreate_export::kbrand`) — ZIP archive with `manifest.json`,
+      `fonts/`, `logos/`. Round-trips brand kit, tokens, embedded
+      fonts, and binary logos.
+- [x] Slice export with named regions
+      (`kcreate_export::slice`) — per-slice format / scale,
+      parallel rayon export.
+- [x] Spot colors + overprint foundation
+      (`kcreate_core::color::{Color::Spot, SpotColorLibrary,
+      Overprint}`) + `PreflightCheck::SpotColorMissing`.
+
+### Block E — Tests
+- [x] `crates/kcreate_tests/tests/raster_filters.rs`
+- [x] `crates/kcreate_tests/tests/vector_ops.rs`
+- [x] `crates/kcreate_tests/tests/text_flow.rs`
+- [x] `crates/kcreate_tests/tests/print_workflow.rs`
 
 ## Changelog
 
+- **2026-05-25 (this PR)** — Phase 5 ship: Image Studio filters
+  (Levels, Curves, Gaussian / Box blur, Unsharp mask, Crop /
+  Rotate / Flip, Healing brush + raster_ops bridge + FiltersPanel
+  UI), Vector Studio (snap engine + smart-guides overlay, simplify
+  / smooth / offset, variable stroke profile, multi-fill /
+  multi-stroke per node, dash + round-corners path effects),
+  Layout Studio + Brand Hub (linked-frame text flow, image-text
+  wraps, `.kbrand` round-trip, slice export, `Color::Spot` +
+  `Overprint` + `SpotColorMissing` preflight), full cross-crate
+  integration tests in `kcreate_tests`, comprehensive docs sync
+  (PROGRESS / ARCHITECTURE / README / AGENTS / CONTRIBUTING).
+- **2026-05-25 (PR #12)** — Phase 4 follow-ups: PDF preflight
+  DPI floor + bleed-area content checks, scene_sync batch
+  optimisation, lock-aware FillSection (solid + gradient editor),
+  OCR text-region detection → text-layer creation flow, KChat
+  trusted-issuer allowlist surface.
+- **2026-05-25 (PR #11)** — Devin Review follow-up fixes
+  (NumberField clamp, NodeInfo version probe, FillSection hydrate,
+  trust-store probe, OCR area guard, mask-size guard +
+  missing_glyphs docstring, seed-race + countdown, wire-format
+  `DevInstallRequest`↔`KChatInstallRequest` lockstep).
+- **2026-05-25 (PR #10)** — Renderer + AI inference + collab
+  transport: radial / linear gradient scene objects, AI inference
+  UX end-to-end (alt-text + layout-suggest), PDF preflight
+  revision (shading patterns, glyph coverage, total ink coverage),
+  scene-sync multi-peer micro-benchmarks + batched insert, KChat
+  client integration (`kcreate_kchat` crate + dev-mint IPC +
+  `KChatSignInPanel`).
 - **2026-05-24** — Phase 4 ship: vision (Qwen2.5-VL + SmolVLM2 over
   llama.cpp / MLX, mmproj + multimodal chat shape), image generation
   (FLUX.2-Klein-4B via `tools/kcreate_diffusion/`, hard-gated to

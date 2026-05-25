@@ -21,6 +21,7 @@ kcreate_renderer = { path = "../kcreate_renderer" }
 kcreate_core = { path = "../kcreate_core" }
 kcreate_storage = { path = "../kcreate_storage" }
 kcreate_export = { path = "../kcreate_export" }
+kcreate_raster = { path = "../kcreate_raster" }
 kcreate_vector = { path = "../kcreate_vector" }
 kcreate_ai = { path = "../kcreate_ai" }
 # The MCP server is the *only* component of the editing-side runtime
@@ -45,6 +46,7 @@ uuid = { workspace = true, features = ["v4", "serde"] }
 chrono = { workspace = true, features = ["serde"] }
 base64.workspace = true
 image.workspace = true
+rayon.workspace = true
 # Used only behind the `native_canvas` feature to interpret raw
 # window handle bytes (NSView* / HWND / XID / wl_surface*) ferried
 # from the Electron main process. The default build does not link

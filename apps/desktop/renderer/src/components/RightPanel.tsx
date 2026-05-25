@@ -21,6 +21,7 @@ import { InteractionPanel } from "./InteractionPanel";
 import { OpenTypePanel } from "./OpenTypePanel";
 import { PreflightPanel } from "./PreflightPanel";
 import { PresencePanel } from "./PresencePanel";
+import { FiltersPanel } from "./FiltersPanel";
 import { TextFramePanel } from "./TextFramePanel";
 
 export type RightPanelTab =
@@ -410,6 +411,12 @@ function PropertiesPanel({
           <TextFramePanel node={node} onStatus={onStatus} />
           <hr style={hrStyle} />
           <OpenTypePanel node={node} onStatus={onStatus} />
+        </>
+      ) : null}
+      {node.nodeType === "RasterLayer" ? (
+        <>
+          <hr style={hrStyle} />
+          <FiltersPanel node={node} onStatus={onStatus} />
         </>
       ) : null}
     </fieldset>

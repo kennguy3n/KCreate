@@ -111,6 +111,13 @@ import type {
   ColorSettings,
   ColorSpaceName,
   ColorValue,
+  SpotColorWire,
+  CanvasSnapBridge,
+  SnapResult,
+  RasterOpsBridge,
+  RasterBlurKind,
+  RasterFlipDirection,
+  RasterPreviewFilter,
   TextFrameBridge,
   TextFrameOptions,
   OpenTypeFeatures,
@@ -1624,6 +1631,167 @@ const color: ColorBridge = {
       ipcRenderer.removeListener(channel, listener);
     };
   },
+  async upsertSpot(spot: SpotColorWire): Promise<void> {
+    await ipcRenderer.invoke(
+      "kcreate/color/spot/upsert",
+      JSON.stringify(spot),
+    );
+  },
+  async removeSpot(name: string): Promise<boolean> {
+    return (await ipcRenderer.invoke(
+      "kcreate/color/spot/remove",
+      name,
+    )) as boolean;
+  },
+  async listSpots(): Promise<SpotColorWire[]> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/color/spot/list",
+    )) as string;
+    return JSON.parse(raw) as SpotColorWire[];
+  },
+};
+
+// ---------------------------------------------------------------------------
+// Phase 5 — smart-guides snap engine (Block C Task 13/14). The
+// `CanvasHost` calls this on every drag-move event; the implementation
+// is intentionally a one-shot RPC (no long-lived stream) so that pan /
+// zoom changes between drags don't accumulate stale state on the
+// renderer side.
+// ---------------------------------------------------------------------------
+
+const canvasSnap: CanvasSnapBridge = {
+  async query(
+    movingId: string | null,
+    candidateX: number,
+    candidateY: number,
+    candidateW: number,
+    candidateH: number,
+    threshold: number,
+  ): Promise<SnapResult | null> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/canvas/snap",
+      movingId,
+      candidateX,
+      candidateY,
+      candidateW,
+      candidateH,
+      threshold,
+    )) as string | null;
+    if (raw === null) {
+      return null;
+    }
+    return JSON.parse(raw) as SnapResult;
+  },
+};
+
+// ---------------------------------------------------------------------------
+// Phase 5 — raster filters (Block B Task 11). `applyXxx` / `crop` /
+// `rotate` / `flip` / `heal` commit through the bridge (each records
+// an undoable Operation); `previewFilter` is non-destructive and
+// returns the post-filter RGBA bytes for live preview.
+// ---------------------------------------------------------------------------
+
+const rasterOps: RasterOpsBridge = {
+  async applyLevels(
+    nodeId: string,
+    black: number,
+    white: number,
+    gamma: number,
+  ): Promise<void> {
+    await ipcRenderer.invoke(
+      "kcreate/raster/apply/levels",
+      nodeId,
+      black,
+      white,
+      gamma,
+    );
+  },
+  async applyCurves(
+    nodeId: string,
+    points: [number, number][],
+  ): Promise<void> {
+    await ipcRenderer.invoke(
+      "kcreate/raster/apply/curves",
+      nodeId,
+      JSON.stringify(points),
+    );
+  },
+  async applyBlur(
+    nodeId: string,
+    radius: number,
+    kind: RasterBlurKind,
+  ): Promise<void> {
+    await ipcRenderer.invoke(
+      "kcreate/raster/apply/blur",
+      nodeId,
+      radius,
+      kind,
+    );
+  },
+  async applySharpen(
+    nodeId: string,
+    radius: number,
+    amount: number,
+    threshold: number,
+  ): Promise<void> {
+    await ipcRenderer.invoke(
+      "kcreate/raster/apply/sharpen",
+      nodeId,
+      radius,
+      amount,
+      threshold,
+    );
+  },
+  async crop(
+    nodeId: string,
+    x: number,
+    y: number,
+    w: number,
+    h: number,
+  ): Promise<void> {
+    await ipcRenderer.invoke("kcreate/raster/crop", nodeId, x, y, w, h);
+  },
+  async rotate(nodeId: string, angleDeg: number): Promise<void> {
+    await ipcRenderer.invoke("kcreate/raster/rotate", nodeId, angleDeg);
+  },
+  async flip(
+    nodeId: string,
+    direction: RasterFlipDirection,
+  ): Promise<void> {
+    await ipcRenderer.invoke("kcreate/raster/flip", nodeId, direction);
+  },
+  async heal(
+    nodeId: string,
+    srcX: number,
+    srcY: number,
+    dstX: number,
+    dstY: number,
+    radius: number,
+  ): Promise<void> {
+    await ipcRenderer.invoke(
+      "kcreate/raster/heal",
+      nodeId,
+      srcX,
+      srcY,
+      dstX,
+      dstY,
+      radius,
+    );
+  },
+  async previewFilter(
+    nodeId: string,
+    filter: RasterPreviewFilter,
+  ): Promise<Uint8Array> {
+    const buf = (await ipcRenderer.invoke(
+      "kcreate/raster/preview",
+      nodeId,
+      JSON.stringify(filter),
+    )) as Buffer | Uint8Array;
+    // Electron transfers Buffer over IPC. Normalise to Uint8Array
+    // so renderer-side `canvas.getContext('2d').putImageData` can
+    // wrap it in `ImageData` without a copy.
+    return buf instanceof Uint8Array ? buf : new Uint8Array(buf);
+  },
 };
 
 // ---------------------------------------------------------------------------
@@ -1889,6 +2057,8 @@ contextBridge.exposeInMainWorld("kcreate", {
   plugin,
   mcpPermission,
   color,
+  canvasSnap,
+  rasterOps,
   textFrame,
   session,
   kchat,

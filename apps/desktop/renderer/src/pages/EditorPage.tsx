@@ -28,6 +28,7 @@ import type {
   ProjectInfo,
   ResourceLimits,
   Scene,
+  SnapGuide,
 } from "../../../shared/scene";
 import { LowResourceBanner } from "../components/LowResourceBanner";
 import { colors, font, spacing } from "../styles/tokens";
@@ -45,6 +46,11 @@ const CANVAS_WIDTH = 1024;
 const CANVAS_HEIGHT = 640;
 
 const DEFAULT_VIEWPORT: ViewportState = { panX: 0, panY: 0, zoom: 1 };
+
+/// Snap threshold in world units. 6 px @ zoom=1 keeps snaps tight
+/// enough to feel deliberate but forgiving on a 4K display where the
+/// cursor is travelling at high pixel velocity.
+const SNAP_THRESHOLD_WORLD = 6;
 
 /// Empty scene used while we haven't yet pulled one from the bridge.
 const EMPTY_SCENE: Scene = {
@@ -68,6 +74,10 @@ export function EditorPage({
   const [tool, setTool] = useState<ToolId>("select");
   const [nodes, setNodes] = useState<NodeInfo[]>([]);
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
+  // Active smart-guides for the in-flight drag, in world space.
+  // Cleared on pointerup. Rendered as an SVG overlay positioned
+  // above the canvas (see the `<svg>` in the canvas pane below).
+  const [snapGuides, setSnapGuides] = useState<SnapGuide[]>([]);
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
   const [fps, setFps] = useState<number>(0);
   const [viewport, setViewport] = useState<ViewportState>(DEFAULT_VIEWPORT);
@@ -126,6 +136,17 @@ export function EditorPage({
     cumulativeDx: number;
     cumulativeDy: number;
   } | null>(null);
+
+  /// `nodes` mirror used inside the canvas pointer handler. The
+  /// handler is wrapped in `useCallback` and we deliberately do NOT
+  /// add `nodes` to its deps array (re-creating the callback on every
+  /// node mutation would cancel any in-flight drag). The ref is the
+  /// idiomatic React workaround for "read latest value inside a
+  /// stable callback".
+  const nodesRef = useRef<NodeInfo[]>(nodes);
+  useEffect(() => {
+    nodesRef.current = nodes;
+  }, [nodes]);
 
   const selectedId: string | null =
     selectedIds.length === 1 ? (selectedIds[0] ?? null) : null;
@@ -986,6 +1007,44 @@ export function EditorPage({
           drag.lastWorldY = wy;
           drag.cumulativeDx += dx;
           drag.cumulativeDy += dy;
+          // Smart-guides: query the snap engine for the candidate
+          // world-space bounds and apply the returned delta to the
+          // *cumulative* offset (so the next pointermove keeps
+          // working off the snapped position). The bridge call is
+          // cheap (O(log n) per axis after the sorted-edge build);
+          // we still fire it on every move because the engine is
+          // built from-scratch each time — the dragged node's bounds
+          // are dirty otherwise.
+          const movingNode = nodesRef.current.find(
+            (n) => n.id === drag.movingNodeId,
+          );
+          if (movingNode) {
+            const candX =
+              movingNode.bounds.x + drag.cumulativeDx;
+            const candY =
+              movingNode.bounds.y + drag.cumulativeDy;
+            void (async () => {
+              try {
+                const snap = await window.kcreate.canvasSnap.query(
+                  movingNode.id,
+                  candX,
+                  candY,
+                  movingNode.bounds.width,
+                  movingNode.bounds.height,
+                  SNAP_THRESHOLD_WORLD,
+                );
+                if (!snap) return;
+                if (snap.dx !== 0 || snap.dy !== 0) {
+                  drag.cumulativeDx += snap.dx;
+                  drag.cumulativeDy += snap.dy;
+                }
+                setSnapGuides(snap.guides);
+              } catch {
+                // Snap is purely advisory — failures shouldn't
+                // abort the drag. Silently swallow.
+              }
+            })();
+          }
           // Don't fire a bridge call for every micro-pixel of cursor
           // motion — only push the accumulated delta on pointerup. This
           // keeps undo entries coarse (one drag = one op) and avoids
@@ -1008,6 +1067,9 @@ export function EditorPage({
           // capture might already be released
         }
         dragStateRef.current = null;
+        // Clear smart-guides — the drag is done, so any displayed
+        // guide lines belong to a stale candidate position.
+        setSnapGuides([]);
         if (drag.kind === "move" && drag.movingNodeId) {
           if (drag.cumulativeDx !== 0 || drag.cumulativeDy !== 0) {
             void (async () => {
@@ -1287,6 +1349,20 @@ export function EditorPage({
             cursor={cursor}
           />
           {/*
+            Phase 5 Block C Task 14 — smart-guides overlay. World-space
+            guides from the snap engine are projected through the
+            current viewport (`screen = world * zoom + pan`) and
+            rendered as 1px dashed magenta lines. The overlay sits on
+            top of the canvas but is `pointer-events: none` so it
+            doesn't intercept clicks. Cleared on pointerup.
+          */}
+          <SnapGuidesOverlay
+            guides={snapGuides}
+            viewport={viewport}
+            width={CANVAS_WIDTH}
+            height={CANVAS_HEIGHT}
+          />
+          {/*
             Phase 2 soft-proof / gamut-warning overlay. Reads the
             project's color settings via `window.kcreate.color` and
             renders a CSS-filter wash on top of the canvas. Renders
@@ -1452,4 +1528,74 @@ export function EditorPage({
 
 function errorMessage(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
+}
+
+interface SnapGuidesOverlayProps {
+  guides: SnapGuide[];
+  viewport: ViewportState;
+  width: number;
+  height: number;
+}
+
+/// Phase 5 Block C Task 14. Projects world-space `SnapGuide` lines
+/// through the canvas viewport (`screen = world * zoom + pan`) and
+/// renders them as a 1 px dashed magenta line plus a small distance
+/// label at the midpoint. Pointer events are disabled so the overlay
+/// can sit above the canvas without intercepting drags.
+function SnapGuidesOverlay({
+  guides,
+  viewport,
+  width,
+  height,
+}: SnapGuidesOverlayProps): JSX.Element | null {
+  if (guides.length === 0) {
+    return null;
+  }
+  return (
+    <svg
+      width={width}
+      height={height}
+      style={{
+        position: "absolute",
+        top: 0,
+        left: 0,
+        pointerEvents: "none",
+      }}
+    >
+      {guides.map((g, i) => {
+        if (g.axis === "Vertical") {
+          const x = g.position * viewport.zoom + viewport.panX;
+          const y1 = g.from * viewport.zoom + viewport.panY;
+          const y2 = g.to * viewport.zoom + viewport.panY;
+          return (
+            <line
+              key={`v-${i}`}
+              x1={x}
+              y1={y1}
+              x2={x}
+              y2={y2}
+              stroke="#ff00ff"
+              strokeWidth={1}
+              strokeDasharray="4 2"
+            />
+          );
+        }
+        const y = g.position * viewport.zoom + viewport.panY;
+        const x1 = g.from * viewport.zoom + viewport.panX;
+        const x2 = g.to * viewport.zoom + viewport.panX;
+        return (
+          <line
+            key={`h-${i}`}
+            x1={x1}
+            y1={y}
+            x2={x2}
+            y2={y}
+            stroke="#ff00ff"
+            strokeWidth={1}
+            strokeDasharray="4 2"
+          />
+        );
+      })}
+    </svg>
+  );
 }

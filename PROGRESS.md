@@ -345,7 +345,7 @@ sentinel stays green.
 - [x] **Block F — Documentation** (Tasks 28–30).
   - This section + ARCHITECTURE.md §16i/j/k + README "Local AI" row.
 
-## Phase 5 — Image Studio Filters + Vector Studio + Layout Studio + Brand Hub | In flight
+## Phase 5 — Image Studio Filters + Vector Studio + Layout Studio + Brand Hub | Complete | 100%
 
 The filter / vector / layout / brand-hub gap-filler pass. Adds the
 missing professional editing primitives on top of the Phase 1-2
@@ -371,13 +371,25 @@ foundations.
       surface for all filters + preview path; records undoable
       `Operation`s.
 - [x] Filters UI panel (`apps/desktop/renderer/src/components/FiltersPanel.tsx`)
-      with debounced live preview and Apply commit.
+      — debounced live preview via `rasterOps.previewFilter`, Apply
+      commit through the corresponding `applyXxx` bridge function,
+      tabbed Levels / Curves / Blur / Sharpen / Transform sections,
+      interactive SVG curve editor with click-to-add / right-click-to-
+      remove. Mounted from `RightPanel` whenever a `RasterLayer` is
+      selected. Follows the Ask → Preview → Apply → Undo loop.
 
 ### Block C — Vector Studio features
 - [x] Snapping + smart guides (`kcreate_vector::snap`) — sorted-edge
       snap engine, per-axis snap, artboard edge + midpoint snapping.
-- [x] Smart-guides UI overlay in `CanvasHost` (dashed magenta lines
-      + distance labels).
+- [x] Smart-guides UI overlay in `EditorPage` — a transparent SVG
+      sits above the canvas, projects world-space `SnapGuide` lines
+      through the active viewport, and renders them as 1 px dashed
+      magenta lines. The drag handler in `EditorPage.onCanvasPointer`
+      calls `canvasSnap.query()` on every pointermove with the
+      candidate world bounds, applies the returned delta to the
+      cumulative drag offset, and clears the overlay on pointerup.
+      Snap threshold is 6 world units (tight enough to feel
+      deliberate, forgiving on high-DPI displays).
 - [x] Path simplify / smooth / offset
       (`kcreate_vector::simplify::{simplify, smooth, offset}`).
       Simplify is Ramer–Douglas–Peucker; smooth is Chaikin
@@ -385,10 +397,17 @@ foundations.
 - [x] Variable stroke width — `NodeStyle::stroke_width_profile`
       + `kcreate_vector::stroke::expand_variable_stroke` produces a
       filled outline from a centerline + width profile.
-- [x] Multi-fill / multi-stroke per node — `NodeStyle::fills` +
-      `NodeStyle::strokes` (legacy `fill` / `stroke` deserialize as
-      single-element vectors). Scene-sync emits one display-list
-      object per fill / stroke.
+- [x] Multi-fill / multi-stroke per node — `NodeStyle::extra_fills` +
+      `NodeStyle::extra_strokes` (legacy single `fill` / `stroke` stay
+      first, additional layers stack on top with serde-default empty
+      vectors so old projects open unchanged). The bridge update path
+      (`document_update_node` + new `UpdateNodeProps::{extra_fills,
+      stroke, extra_strokes, stroke_width_profile, overprint}`) uses
+      a typed `FieldUpdate<T>` enum so JSON `null` clears a field and
+      an absent JSON key leaves it untouched — callers can patch the
+      three-state `stroke` slot through the same path. The reorderable
+      `RightPanel.FillSection` editor remains a UX-polish follow-up
+      now that the full bridge surface is in place.
 - [x] Path effects (`kcreate_vector::path_effects::{dash,
       round_corners}`) — dash splits the path into sub-paths by
       arc-length walk; round-corners replaces sharp angles with

@@ -1027,6 +1027,44 @@ pub fn canvas_hit_test(
     Ok(hit.map(|u| u.to_string()))
 }
 
+/// Query the snap engine for an in-flight drag. `moving_id` is the
+/// node currently being dragged (so the engine skips its own edges);
+/// `candidate_*` are the candidate world-space bounds; `threshold`
+/// is the maximum snap distance in world units.
+///
+/// Returns a JSON-encoded [`kcreate_vector::snap::SnapResult`] —
+/// `{ dx, dy, guides }` — or `null` when no project is open.
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn canvas_snap(
+    moving_id: Option<String>,
+    candidate_x: f64,
+    candidate_y: f64,
+    candidate_w: f64,
+    candidate_h: f64,
+    threshold: f64,
+) -> NapiResult<Option<String>> {
+    let parsed_id = match moving_id {
+        Some(s) => Some(parse_uuid(&s)?),
+        None => None,
+    };
+    let result = document::canvas_snap(
+        parsed_id,
+        candidate_x,
+        candidate_y,
+        candidate_w,
+        candidate_h,
+        threshold,
+    )
+    .map_err(map_doc_err)?;
+    match result {
+        Some(r) => Ok(Some(serde_json::to_string(&r).map_err(|e| {
+            NapiError::from_reason(format!("snap result serialise: {e}"))
+        })?)),
+        None => Ok(None),
+    }
+}
+
 /// Replace the document selection. Unknown node ids are silently dropped.
 #[napi]
 #[allow(clippy::needless_pass_by_value)]
@@ -2089,6 +2127,31 @@ pub fn color_settings_update(settings_json: String) -> NapiResult<()> {
 #[napi]
 pub fn color_convert(from_json: String, to_space: String) -> NapiResult<String> {
     phase2::color_convert(&from_json, &to_space).map_err(map_doc_err)
+}
+
+/// Insert or replace a spot colour in the document's
+/// `SpotColorLibrary`. `wire_json` is a [`phase2::SpotColorWire`].
+/// Records an undoable `spot_color_upsert` operation.
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn color_spot_upsert(wire_json: String) -> NapiResult<()> {
+    phase2::color_spot_upsert(&wire_json).map_err(map_doc_err)
+}
+
+/// Remove a spot colour by name. Returns `false` when the name was
+/// not present in the library (no operation recorded), `true` after a
+/// successful undoable `spot_color_remove`.
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn color_spot_remove(name: String) -> NapiResult<bool> {
+    phase2::color_spot_remove(&name).map_err(map_doc_err)
+}
+
+/// List every spot colour in the document as a JSON array of
+/// [`phase2::SpotColorWire`].
+#[napi]
+pub fn color_spot_list() -> NapiResult<String> {
+    phase2::color_spot_list().map_err(map_doc_err)
 }
 
 // ---------------------------------------------------------------------------

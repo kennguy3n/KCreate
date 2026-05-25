@@ -1902,6 +1902,98 @@ pub fn color_convert(from_json: &str, to_space: &str) -> Result<String> {
 }
 
 // -----------------------------------------------------------------------------
+// Spot color library (Phase 5, Block D Task 23)
+// -----------------------------------------------------------------------------
+
+/// Wire shape for spot CRUD. Mirrors `SpotColorDef` 1:1 plus the
+/// `name` lookup key.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SpotColorWire {
+    pub name: String,
+    pub display_name: String,
+    pub fallback_cmyk: (f32, f32, f32, f32),
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub library_reference: Option<String>,
+}
+
+/// Insert or replace a spot colour in the project's
+/// `SpotColorLibrary`. Records a `spot_color_upsert` operation on
+/// the project log so undo reverses the change.
+pub fn color_spot_upsert(wire_json: &str) -> Result<()> {
+    use kcreate_core::color::SpotColorDef;
+    let wire: SpotColorWire = serde_json::from_str(wire_json)?;
+    with_workspace_mut(|ws| {
+        let before = serde_json::to_value(&ws.project.spot_color_library)?;
+        let def = SpotColorDef {
+            display_name: wire.display_name.clone(),
+            fallback_cmyk: wire.fallback_cmyk,
+            library_reference: wire.library_reference.clone(),
+        };
+        ws.project.spot_color_library.insert(wire.name.clone(), def);
+        let after = serde_json::to_value(&ws.project.spot_color_library)?;
+        let op = Operation::new(
+            "user",
+            "spot_color_upsert",
+            before,
+            after,
+            Vec::<Uuid>::new(),
+        );
+        ws.project.execute_operation(op);
+        Ok(())
+    })?;
+    sync_scene_after_change();
+    Ok(())
+}
+
+/// Remove a spot colour by name. Returns `false` (and records no
+/// operation) when the name was not in the library — this matches
+/// `BTreeMap::remove` semantics and lets the renderer round-trip the
+/// "delete then re-add" affordance without a second IPC.
+pub fn color_spot_remove(name: &str) -> Result<bool> {
+    let mut removed = false;
+    with_workspace_mut(|ws| {
+        let before = serde_json::to_value(&ws.project.spot_color_library)?;
+        removed = ws.project.spot_color_library.entries.remove(name).is_some();
+        if removed {
+            let after = serde_json::to_value(&ws.project.spot_color_library)?;
+            let op = Operation::new(
+                "user",
+                "spot_color_remove",
+                before,
+                after,
+                Vec::<Uuid>::new(),
+            );
+            ws.project.execute_operation(op);
+        }
+        Ok(())
+    })?;
+    if removed {
+        sync_scene_after_change();
+    }
+    Ok(removed)
+}
+
+/// Enumerate the spot library as a JSON array of [`SpotColorWire`].
+pub fn color_spot_list() -> Result<String> {
+    let entries = with_workspace(|ws| {
+        Ok(ws
+            .project
+            .spot_color_library
+            .iter()
+            .map(|(name, def)| SpotColorWire {
+                name: name.clone(),
+                display_name: def.display_name.clone(),
+                fallback_cmyk: def.fallback_cmyk,
+                library_reference: def.library_reference.clone(),
+            })
+            .collect::<Vec<_>>())
+    })
+    .unwrap_or_default();
+    Ok(serde_json::to_string(&entries)?)
+}
+
+// -----------------------------------------------------------------------------
 // Text frame + OpenType bridge (Phase 2, Block B Task 11)
 // -----------------------------------------------------------------------------
 

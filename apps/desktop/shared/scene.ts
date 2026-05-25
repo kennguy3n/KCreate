@@ -2113,6 +2113,138 @@ export interface ColorBridge {
   /// `SoftProofOverlay` relied on before the bridge gained push
   /// semantics.
   onSettingsChanged(callback: () => void): () => void;
+  /// Insert or replace a spot color in the project's
+  /// `SpotColorLibrary` (Phase 5 Block D Task 23). Records an
+  /// undoable `spot_color_upsert` operation.
+  upsertSpot(spot: SpotColorWire): Promise<void>;
+  /// Remove a spot color by name. Resolves to `false` when the
+  /// name was not in the library.
+  removeSpot(name: string): Promise<boolean>;
+  /// List every spot color in the document.
+  listSpots(): Promise<SpotColorWire[]>;
+}
+
+/// Wire shape for the spot color CRUD endpoints. Mirrors
+/// `kcreate_bridge::phase2::SpotColorWire` 1:1.
+export interface SpotColorWire {
+  name: string;
+  displayName: string;
+  /// Tuple `(c, m, y, k)` in `[0, 1]`.
+  fallbackCmyk: [number, number, number, number];
+  libraryReference?: string;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 5 — smart-guides snap engine (Block C Task 13/14).
+//
+// Mirrors `kcreate_vector::snap::{SnapResult, SnapGuide, Axis}`.
+// ---------------------------------------------------------------------------
+
+export type SnapAxis = "Horizontal" | "Vertical";
+
+export interface SnapGuide {
+  axis: SnapAxis;
+  position: number;
+  from: number;
+  to: number;
+}
+
+export interface SnapResult {
+  dx: number;
+  dy: number;
+  guides: SnapGuide[];
+}
+
+export interface CanvasSnapBridge {
+  /// Query the snap engine for an in-flight drag. Returns `null` when
+  /// no project is open (e.g. the user opened the editor before any
+  /// project loaded). Returns `{ dx: 0, dy: 0, guides: [] }` when no
+  /// targets are within `threshold` — callers should treat that as
+  /// "no snap" without special-casing it.
+  query(
+    movingId: string | null,
+    candidateX: number,
+    candidateY: number,
+    candidateW: number,
+    candidateH: number,
+    threshold: number,
+  ): Promise<SnapResult | null>;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 5 — raster filters (Block B Task 11).
+//
+// Mirrors the discriminated union accepted by
+// `kcreate_bridge::raster_ops::PreviewFilter`. The renderer-side
+// `FiltersPanel` builds these objects directly from slider state and
+// passes them to `rasterOps.previewFilter`.
+// ---------------------------------------------------------------------------
+
+export type RasterBlurKind = "gaussian" | "box";
+export type RasterFlipDirection = "horizontal" | "vertical";
+
+/// Mirrors `kcreate_bridge::raster_ops::PreviewFilter` 1:1. The `type`
+/// tag discriminates the variant; field names are snake_case to match
+/// the Rust serde shape — DO NOT rename to camelCase or the bridge
+/// will fail to deserialise.
+export type RasterPreviewFilter =
+  | {
+      type: "levels";
+      black_point: number;
+      white_point: number;
+      gamma: number;
+    }
+  | { type: "curves"; points: [number, number][] }
+  | { type: "blur"; radius: number; kind: RasterBlurKind }
+  | {
+      type: "sharpen";
+      radius: number;
+      amount: number;
+      threshold: number;
+    };
+
+export interface RasterOpsBridge {
+  applyLevels(
+    nodeId: string,
+    black: number,
+    white: number,
+    gamma: number,
+  ): Promise<void>;
+  applyCurves(nodeId: string, points: [number, number][]): Promise<void>;
+  applyBlur(
+    nodeId: string,
+    radius: number,
+    kind: RasterBlurKind,
+  ): Promise<void>;
+  applySharpen(
+    nodeId: string,
+    radius: number,
+    amount: number,
+    threshold: number,
+  ): Promise<void>;
+  crop(
+    nodeId: string,
+    x: number,
+    y: number,
+    w: number,
+    h: number,
+  ): Promise<void>;
+  rotate(nodeId: string, angleDeg: number): Promise<void>;
+  flip(nodeId: string, direction: RasterFlipDirection): Promise<void>;
+  heal(
+    nodeId: string,
+    srcX: number,
+    srcY: number,
+    dstX: number,
+    dstY: number,
+    radius: number,
+  ): Promise<void>;
+  /// Non-destructive preview. Returns the post-filter RGBA buffer as
+  /// a `Uint8Array` (already detached from the underlying `Buffer`).
+  previewFilter(
+    nodeId: string,
+    filter: RasterPreviewFilter,
+  ): Promise<Uint8Array>;
 }
 
 // ---------------------------------------------------------------------------
@@ -2778,6 +2910,8 @@ declare global {
       plugin: PluginBridge;
       mcpPermission: McpPermissionBridge;
       color: ColorBridge;
+      canvasSnap: CanvasSnapBridge;
+      rasterOps: RasterOpsBridge;
       textFrame: TextFrameBridge;
       session: SessionBridge;
       kchat: KChatBridge;

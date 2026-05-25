@@ -435,6 +435,61 @@ export interface Bridge {
   colorSettingsGet(): string;
   colorSettingsUpdate(settingsJson: string): void;
   colorConvert(fromJson: string, toSpace: string): string;
+  // Phase 5 — spot color library (Block D Task 23). The wire shape
+  // mirrors `phase2::SpotColorWire` 1:1 (`name`, `displayName`,
+  // `fallbackCmyk`, optional `libraryReference`). Every mutation
+  // records an undoable operation on the project log.
+  colorSpotUpsert(wireJson: string): void;
+  colorSpotRemove(name: string): boolean;
+  colorSpotList(): string;
+  // Phase 5 — smart-guides snap engine (Block C Task 13/14). Returns
+  // a JSON `SnapResult { dx, dy, guides }` or `null` when no project
+  // is loaded. `movingId` is the dragged node so its own edges are
+  // excluded from the candidate edge set.
+  canvasSnap(
+    movingId: string | null,
+    candidateX: number,
+    candidateY: number,
+    candidateW: number,
+    candidateH: number,
+    threshold: number,
+  ): string | null;
+  // Phase 5 — raster filters (Block B Task 11). All mutate the
+  // RasterLayer node's tile grid in place and record an undoable
+  // `Operation` with `ai_generated: false`. `rasterPreviewFilter`
+  // returns the post-filter RGBA buffer without committing.
+  rasterApplyLevels(
+    nodeId: string,
+    black: number,
+    white: number,
+    gamma: number,
+  ): void;
+  rasterApplyCurves(nodeId: string, pointsJson: string): void;
+  rasterApplyBlur(nodeId: string, radius: number, kind: string): void;
+  rasterApplySharpen(
+    nodeId: string,
+    radius: number,
+    amount: number,
+    threshold: number,
+  ): void;
+  rasterCrop(
+    nodeId: string,
+    x: number,
+    y: number,
+    w: number,
+    h: number,
+  ): void;
+  rasterRotate(nodeId: string, angleDeg: number): void;
+  rasterFlip(nodeId: string, direction: string): void;
+  rasterHeal(
+    nodeId: string,
+    srcX: number,
+    srcY: number,
+    dstX: number,
+    dstY: number,
+    radius: number,
+  ): void;
+  rasterPreviewFilter(nodeId: string, filterJson: string): Buffer;
   // Phase 2 — text frame + OpenType (Block B Task 11).
   textFrameGet(nodeId: string): string;
   textFrameUpdate(nodeId: string, optionsJson: string): void;

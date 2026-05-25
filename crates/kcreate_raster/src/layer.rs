@@ -37,6 +37,21 @@ pub struct Mask {
     pub inverted: bool,
 }
 
+/// A `(t, v)` control point on a Curves curve. Both axes lie in
+/// `[0.0, 1.0]` for an RGB intensity remap.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub struct CurvePoint {
+    pub t: f32,
+    pub v: f32,
+}
+
+impl CurvePoint {
+    #[must_use]
+    pub const fn new(t: f32, v: f32) -> Self {
+        Self { t, v }
+    }
+}
+
 /// One adjustment stage in a layer's adjustment stack.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum AdjustmentLayer {
@@ -53,19 +68,33 @@ pub enum AdjustmentLayer {
         saturation: f32,
         lightness: f32,
     },
+    /// Levels adjustment: remaps an input value `v \in [0, 1]` to
+    /// `(clamp((v - black) / (white - black), 0, 1))^(1 / gamma)`.
+    /// `black=0`, `white=1`, `gamma=1` is the identity transform.
+    Levels {
+        black_point: f32,
+        white_point: f32,
+        gamma: f32,
+    },
+    /// Curves adjustment: piecewise cubic Hermite interpolation over
+    /// a sorted list of `(t, v)` control points. Identity is
+    /// `[(0, 0), (1, 1)]`. Applied per-channel to RGB.
+    Curves(Vec<CurvePoint>),
 }
 
 impl AdjustmentLayer {
     /// Apply the adjustment in place to an RGBA8 pixel.
     pub fn apply_pixel(&self, rgba: &mut [u8; 4]) {
-        match *self {
+        match self {
             Self::Brightness(delta) => {
+                let delta = *delta;
                 for c in rgba.iter_mut().take(3) {
                     let v = f32::from(*c) / 255.0 + delta;
                     *c = (v.clamp(0.0, 1.0) * 255.0).round() as u8;
                 }
             }
             Self::Contrast(factor) => {
+                let factor = *factor;
                 for c in rgba.iter_mut().take(3) {
                     let v = (f32::from(*c) / 255.0 - 0.5).mul_add(factor, 0.5);
                     *c = (v.clamp(0.0, 1.0) * 255.0).round() as u8;
@@ -76,10 +105,153 @@ impl AdjustmentLayer {
                 saturation,
                 lightness,
             } => {
-                apply_hsl(rgba, hue, saturation, lightness);
+                apply_hsl(rgba, *hue, *saturation, *lightness);
+            }
+            Self::Levels {
+                black_point,
+                white_point,
+                gamma,
+            } => {
+                let black = (*black_point).clamp(0.0, 1.0);
+                // White must be strictly greater than black; if the
+                // user inverts them, swap so the math still has a
+                // sensible range.
+                let white_raw = (*white_point).clamp(0.0, 1.0);
+                let (black, white) = if white_raw > black {
+                    (black, white_raw)
+                } else {
+                    // Degenerate range: avoid divide-by-zero by
+                    // expanding by an epsilon. The result still
+                    // produces a hard step at `black`.
+                    (black.min(white_raw), black.max(white_raw) + f32::EPSILON)
+                };
+                // Gamma must be positive; clamp at a small floor so a
+                // user-supplied zero or negative gamma does not blow
+                // up the pow.
+                let gamma = (*gamma).max(0.01);
+                let inv_gamma = 1.0 / gamma;
+                for c in rgba.iter_mut().take(3) {
+                    let v = f32::from(*c) / 255.0;
+                    let normalised = ((v - black) / (white - black)).clamp(0.0, 1.0);
+                    let curved = normalised.powf(inv_gamma);
+                    *c = (curved.clamp(0.0, 1.0) * 255.0).round() as u8;
+                }
+            }
+            Self::Curves(points) => {
+                if points.len() < 2 {
+                    return;
+                }
+                for c in rgba.iter_mut().take(3) {
+                    let v = f32::from(*c) / 255.0;
+                    let mapped = eval_cubic_hermite(points, v);
+                    *c = (mapped.clamp(0.0, 1.0) * 255.0).round() as u8;
+                }
             }
         }
     }
+
+    /// Returns `true` when this stage is the mathematical identity
+    /// for every RGB pixel. Used to skip work in render fast paths.
+    #[must_use]
+    pub fn is_identity(&self) -> bool {
+        match self {
+            Self::Brightness(delta) => delta.abs() < f32::EPSILON,
+            Self::Contrast(factor) => (*factor - 1.0).abs() < f32::EPSILON,
+            Self::HueSaturation {
+                hue,
+                saturation,
+                lightness,
+            } => {
+                hue.abs() < f32::EPSILON
+                    && (*saturation - 1.0).abs() < f32::EPSILON
+                    && lightness.abs() < f32::EPSILON
+            }
+            Self::Levels {
+                black_point,
+                white_point,
+                gamma,
+            } => {
+                black_point.abs() < f32::EPSILON
+                    && (*white_point - 1.0).abs() < f32::EPSILON
+                    && (*gamma - 1.0).abs() < f32::EPSILON
+            }
+            Self::Curves(points) => {
+                points.len() == 2
+                    && (points[0].t - 0.0).abs() < f32::EPSILON
+                    && (points[0].v - 0.0).abs() < f32::EPSILON
+                    && (points[1].t - 1.0).abs() < f32::EPSILON
+                    && (points[1].v - 1.0).abs() < f32::EPSILON
+            }
+        }
+    }
+}
+
+/// Evaluate a piecewise cubic Hermite curve over a sorted list of
+/// `(t, v)` control points at `t = x`.
+///
+/// Uses monotone-bounded Catmull–Rom tangents (i.e. averaged secants
+/// at interior knots, one-sided secants at endpoints). This keeps
+/// the curve smooth without overshooting the way a naive Catmull–Rom
+/// can on near-vertical sections — important for an adjustment
+/// curve where overshoot manifests as clipped highlights / crushed
+/// shadows.
+fn eval_cubic_hermite(points: &[CurvePoint], x: f32) -> f32 {
+    // Caller is responsible for `points.len() >= 2`.
+    debug_assert!(points.len() >= 2);
+    // Endpoint extrapolation: clamp to the first / last value.
+    if x <= points[0].t {
+        return points[0].v;
+    }
+    if x >= points[points.len() - 1].t {
+        return points[points.len() - 1].v;
+    }
+    // Linear search is fine — the typical control-point set is 2–8
+    // points so a binary search costs more than it saves.
+    let mut idx = 0usize;
+    for i in 0..points.len() - 1 {
+        if x >= points[i].t && x <= points[i + 1].t {
+            idx = i;
+            break;
+        }
+    }
+    let p0 = points[idx];
+    let p1 = points[idx + 1];
+    let dt = p1.t - p0.t;
+    if dt.abs() < f32::EPSILON {
+        return p1.v;
+    }
+    // Tangents at the segment endpoints.
+    let m0 = if idx == 0 {
+        (p1.v - p0.v) / dt
+    } else {
+        let prev = points[idx - 1];
+        let dt_prev = p1.t - prev.t;
+        if dt_prev.abs() < f32::EPSILON {
+            (p1.v - p0.v) / dt
+        } else {
+            (p1.v - prev.v) / dt_prev
+        }
+    };
+    let m1 = if idx + 2 >= points.len() {
+        (p1.v - p0.v) / dt
+    } else {
+        let next = points[idx + 2];
+        let dt_next = next.t - p0.t;
+        if dt_next.abs() < f32::EPSILON {
+            (p1.v - p0.v) / dt
+        } else {
+            (next.v - p0.v) / dt_next
+        }
+    };
+    // Hermite basis evaluation.
+    let s = (x - p0.t) / dt;
+    let s2 = s * s;
+    let s3 = s2 * s;
+    let h00 = 2.0 * s3 - 3.0 * s2 + 1.0;
+    let h10 = s3 - 2.0 * s2 + s;
+    let h01 = -2.0 * s3 + 3.0 * s2;
+    let h11 = s3 - s2;
+    h00 * p0.v + h10 * dt * m0 + h01 * p1.v + h11 * dt * m1
 }
 
 /// A raster layer: tile grid + optional masks + ordered adjustments.
@@ -227,6 +399,94 @@ mod tests {
             inverted: false,
         };
         assert!(layer.add_mask(small_mask).is_err());
+    }
+
+    #[test]
+    fn levels_identity_preserves_pixels() {
+        let mut px = [100u8, 150, 200, 255];
+        let levels = AdjustmentLayer::Levels {
+            black_point: 0.0,
+            white_point: 1.0,
+            gamma: 1.0,
+        };
+        assert!(levels.is_identity());
+        levels.apply_pixel(&mut px);
+        assert_eq!(px, [100, 150, 200, 255]);
+    }
+
+    #[test]
+    fn levels_black_white_clamp_extends_dynamic_range() {
+        // Pixel value 64 with black=64, white=192 → normalised 0.0
+        let mut dark = [64u8, 64, 64, 255];
+        AdjustmentLayer::Levels {
+            black_point: 64.0 / 255.0,
+            white_point: 192.0 / 255.0,
+            gamma: 1.0,
+        }
+        .apply_pixel(&mut dark);
+        assert_eq!(dark[0], 0);
+        // Pixel value 192 with the same range → normalised 1.0
+        let mut bright = [192u8, 192, 192, 255];
+        AdjustmentLayer::Levels {
+            black_point: 64.0 / 255.0,
+            white_point: 192.0 / 255.0,
+            gamma: 1.0,
+        }
+        .apply_pixel(&mut bright);
+        assert_eq!(bright[0], 255);
+    }
+
+    #[test]
+    fn levels_gamma_darkens_midtones() {
+        let mut mid = [128u8, 128, 128, 255];
+        AdjustmentLayer::Levels {
+            black_point: 0.0,
+            white_point: 1.0,
+            gamma: 0.5,
+        }
+        .apply_pixel(&mut mid);
+        // gamma 0.5 → inv_gamma 2.0 → 0.502^2 ≈ 0.252 → ~64.
+        assert!(mid[0] < 80);
+    }
+
+    #[test]
+    fn curves_identity_preserves_pixels() {
+        let mut px = [42u8, 84, 127, 255];
+        let curves = AdjustmentLayer::Curves(vec![
+            CurvePoint::new(0.0, 0.0),
+            CurvePoint::new(1.0, 1.0),
+        ]);
+        assert!(curves.is_identity());
+        curves.apply_pixel(&mut px);
+        assert_eq!(px, [42, 84, 127, 255]);
+    }
+
+    #[test]
+    fn curves_inversion_inverts_midtones() {
+        let mut px = [64u8, 64, 64, 255];
+        AdjustmentLayer::Curves(vec![
+            CurvePoint::new(0.0, 1.0),
+            CurvePoint::new(1.0, 0.0),
+        ])
+        .apply_pixel(&mut px);
+        // Linear inversion of 64 → 191.
+        assert_eq!(px[0], 191);
+    }
+
+    #[test]
+    fn curves_smooth_lift_is_monotone() {
+        let curve = AdjustmentLayer::Curves(vec![
+            CurvePoint::new(0.0, 0.0),
+            CurvePoint::new(0.5, 0.65),
+            CurvePoint::new(1.0, 1.0),
+        ]);
+        let mut prev = 0u8;
+        for v in 0..=255u8 {
+            let mut px = [v, v, v, 255];
+            curve.apply_pixel(&mut px);
+            assert!(px[0] >= prev, "curve must be monotone at v={v}");
+            prev = px[0];
+        }
     }
 
     #[test]

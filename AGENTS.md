@@ -63,8 +63,19 @@ KCreate/
 │   │                        transport (QUIC + mDNS) can pull in network
 │   │                        crates without breaking the local-first
 │   │                        sentinel.
+│   ├── kcreate_collab_transport/ QUIC + mDNS LAN transport. `LanCollabHost`,
+│   │                        `PeerDiscovery`, `CertBundle`, frame wire codec.
+│   │                        Only networked crate in the workspace; opt-in
+│   │                        via `collab` feature on kcreate_bridge.
+│   ├── kcreate_kchat/       Dev-side KChat group-membership issuer.
+│   │                        Deterministic Ed25519 derivation + signed-
+│   │                        attestation minting. Behind `kchat-dev-issuer`
+│   │                        feature flag on kcreate_bridge.
 │   └── kcreate_tests/       cross-crate integration tests (no library
 │                            surface — see tests/ subdir)
+├── tools/
+│   └── kcreate_diffusion/   loopback Python FLUX sidecar spawned by
+│                            kcreate_ai::image_gen — never networked.
 ├── apps/
 │   └── desktop/             Electron shell (main + preload + React renderer)
 │       ├── main/            main process (loads bridge.node via process.dlopen)
@@ -108,6 +119,12 @@ KCreate/
 - **Local-first invariant.** No editing-path crate may pull in a
   networking library. `crates/kcreate_tests/tests/local_first.rs`
   enforces this against a deny-list — keep it green.
+- **Collab feature isolation.** The `collab` feature on
+  `kcreate_bridge` is the only path that pulls networking (`quinn`,
+  `rustls`, `mdns-sd`, `tokio`). It is opt-in and does not affect
+  the local-first sentinel because `kcreate_collab_transport` is
+  excluded from the editing-path closure in `local_first.rs`.
+  Similarly, `kchat-dev-issuer` gates `kcreate_kchat`.
 
 ## Rules
 
@@ -206,3 +223,35 @@ pnpm lint
 | PluginManager                            | `apps/desktop/renderer/src/components/PluginManager.tsx` |
 | McpSettingsPanel                         | `apps/desktop/renderer/src/components/McpSettingsPanel.tsx` |
 | ScreenshotToLayout                       | `apps/desktop/renderer/src/components/ScreenshotToLayout.tsx` |
+| Vision sidecar (VLM)                     | `crates/kcreate_ai/src/{vision_chat,mlx_sidecar,sidecar_dispatcher}.rs` |
+| Image generation sidecar                 | `crates/kcreate_ai/src/image_gen.rs` |
+| Brand / crop / tokens / style / critique | `crates/kcreate_ai/src/{brand_extract,smart_crop,design_tokens_vlm,style_describe,design_critique}.rs` |
+| OCR text-region detection                | `crates/kcreate_ai/src/ocr.rs` |
+| VisionAssistSection                      | `apps/desktop/renderer/src/components/VisionAssistSection.tsx` |
+| ImageGenPanel                            | `apps/desktop/renderer/src/components/ImageGenPanel.tsx` |
+| KChatSignInPanel                         | `apps/desktop/renderer/src/components/KChatSignInPanel.tsx` |
+| PresencePanel                            | `apps/desktop/renderer/src/components/PresencePanel.tsx` |
+| LAN transport host                       | `crates/kcreate_collab_transport/src/host.rs` |
+| Peer discovery (mDNS)                    | `crates/kcreate_collab_transport/src/discovery.rs` |
+| Transport wire codec                     | `crates/kcreate_collab_transport/src/wire.rs` |
+| Transport TLS cert bundle                | `crates/kcreate_collab_transport/src/cert.rs` |
+| Session bridge                           | `crates/kcreate_bridge/src/collab.rs` |
+| Diffusion sidecar                        | `tools/kcreate_diffusion/server.py` |
+| Phase 4 bridge surface                   | `crates/kcreate_bridge/src/phase4.rs` |
+| LLM bridge (lifecycle + chat)            | `crates/kcreate_bridge/src/llm.rs` |
+| Operation journal                        | `crates/kcreate_collab/src/journal.rs` |
+| KChat authority types                    | `crates/kcreate_collab/src/kchat.rs` |
+| KChat dev issuer                         | `crates/kcreate_kchat/src/lib.rs` |
+| Raster filters (blur / sharpen / heal)   | `crates/kcreate_raster/src/{filters,heal}.rs` |
+| Raster transforms (crop / rotate / flip) | `crates/kcreate_raster/src/transform.rs` |
+| Raster ops bridge surface                | `crates/kcreate_bridge/src/raster_ops.rs` |
+| FiltersPanel UI                          | `apps/desktop/renderer/src/components/FiltersPanel.tsx` |
+| Vector snap engine                       | `crates/kcreate_vector/src/snap.rs` |
+| Path simplify / smooth / offset          | `crates/kcreate_vector/src/simplify.rs` |
+| Variable stroke expansion                | `crates/kcreate_vector/src/stroke.rs` |
+| Path effects (dash, round corners)       | `crates/kcreate_vector/src/path_effects.rs` |
+| Text flow across linked frames           | `crates/kcreate_text/src/flow.rs` |
+| Image-text wraps                         | `crates/kcreate_text/src/wrap.rs` |
+| `.kbrand` import / export                | `crates/kcreate_export/src/kbrand.rs` |
+| Slice export                             | `crates/kcreate_export/src/slice.rs` |
+| Spot colors / overprint / preflight      | `crates/kcreate_core/src/color.rs` + `crates/kcreate_export/src/preflight.rs` |

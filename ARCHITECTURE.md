@@ -30,11 +30,18 @@ flowchart TB
         ai_rs[kcreate_ai]
         mcp_rs[kcreate_mcp]
         plugin[kcreate_plugin]
+        collab[kcreate_collab]
+    end
+
+    subgraph network[Network — opt-in via `collab` feature]
+        collab_transport[kcreate_collab_transport<br/>QUIC + mDNS]
+        kchat[kcreate_kchat<br/>dev issuer]
     end
 
     subgraph ai[AI sidecar]
         llama[llama.cpp / MLX]
         onnx[ONNX Runtime]
+        diffusion[kcreate_diffusion<br/>FLUX Python sidecar]
     end
 
     renderer <--> preload
@@ -47,6 +54,10 @@ flowchart TB
     bridge --> ai_rs
     bridge --> layout_rs
     bridge --> plugin
+    bridge -. collab feature .-> collab_transport
+    bridge -. kchat-dev-issuer .-> kchat
+    collab_transport --> collab
+    kchat --> collab
     core --> vector
     renderer_rs --> core
     storage --> core
@@ -56,6 +67,7 @@ flowchart TB
     mcp_rs --> core
     bridge -. spawn .-> ai
     ai_rs -. spawn .-> ai
+    ai_rs -. spawn .-> diffusion
 ```
 
 ## 8. Process model
@@ -78,6 +90,18 @@ KCreate runs in up to five distinct processes:
    JSON-RPC on `127.0.0.1:<port>`. Gated by an `McpPermissionStore`
    (`kcreate_mcp::permissions`) which persists per-client / per-tool
    grants (`Once` / `Always` / `Denied`) to JSON on disk.
+6. **LAN collaboration transport** — tokio-based QUIC endpoint +
+   mDNS responder, spawned inside `kcreate_bridge::collab` when the
+   `collab` feature is enabled. Runs in a dedicated tokio
+   multi-thread runtime so the editing path stays sync. Each peer
+   advertises an ephemeral self-signed TLS certificate over mDNS-SD;
+   peer trust is anchored to the Ed25519 identity exposed by
+   `kcreate_collab::peer::PeerId` and pinned via SHA-256 fingerprint.
+   Communication with the editing path uses broadcast / mpsc
+   channels owned by `SessionState`; the editing path never sees a
+   socket directly. The diffusion sidecar process listed under (4)
+   is `tools/kcreate_diffusion/server.py` — a loopback FLUX
+   inference daemon spawned by `kcreate_ai::image_gen`.
 
 The renderer process never imports native code. The bridge cdylib lives
 in the Electron main process only.
@@ -735,6 +759,99 @@ replay-window rejection, project-id scoping, peer cap.
 - AI actions are logged locally and visible in the History panel.
 - MCP server is bound to loopback only.
 
+## Phase 5 — Image Studio filters, Vector Studio features, Layout / Brand Hub
+
+This section describes the editing-primitive expansions added in Phase 5.
+
+### Raster filter pipeline
+
+- `kcreate_raster::layer::AdjustmentLayer` gains `Levels` and `Curves`
+  variants. `Levels` maps a pixel value through
+  `(v - black) / (white - black)` and then applies the gamma curve
+  `v^(1/gamma)`, clamping to `[0, 1]`. `Curves` evaluates a
+  piecewise cubic Hermite curve (monotone-bounded tangents) over the
+  user's `(t, v)` control points. Both run row-parallel through
+  `RasterLayer::render_rgba` via rayon.
+- `kcreate_raster::filters::gaussian_blur` is a separable two-pass
+  Gaussian: horizontal row-parallel, then vertical column-parallel.
+  `kcreate_raster::filters::box_blur` is the three-pass sliding-window
+  approximation used for cheap large-radius blurs. Both materialise
+  tile boundaries through `TileGrid::read_pixel_clamped` so the
+  output is identical regardless of tile alignment.
+- `kcreate_raster::filters::unsharp_mask` is `blur + signed delta +
+  threshold-gated add`, the textbook unsharp-mask implementation.
+- `kcreate_raster::transform::{crop, rotate, flip_h, flip_v}` cover
+  the geometric transforms. `rotate` uses bilinear sampling and is
+  row-parallel.
+- `kcreate_raster::heal::heal` implements a single-disc healing
+  brush: copies a disc of pixels from source to destination, adjusts
+  for the difference in surrounding mean luminance, and uses an
+  alpha-feathered radial falloff at the disc boundary.
+- `kcreate_bridge::raster_ops` exposes each filter as a recorded
+  `Operation` plus a non-destructive `raster_preview_filter` entry
+  point used by the UI for sub-100ms previews.
+
+### Vector snap + path operations
+
+- `kcreate_vector::snap::SnapEngine` builds a sorted edge list from
+  the bounds of visible nodes (plus optional artboard edges) and
+  resolves the smallest delta that brings a candidate `Bounds` onto
+  a neighbouring edge or midpoint. It returns the delta and a list
+  of `SnapGuide` segments suitable for the renderer overlay.
+- `kcreate_vector::simplify::{simplify, smooth, offset}` implement
+  Ramer–Douglas–Peucker simplification, Chaikin corner-cutting
+  smoothing, and parallel offset (insets / outsets via kurbo's
+  segment-level perpendicular offset).
+- `kcreate_vector::stroke::expand_variable_stroke` converts a
+  centerline path plus a `(t, width)` profile into a filled outline
+  by offsetting each side and joining at the endpoints.
+- `NodeStyle` gains `stroke_width_profile`, `fills: Vec<FillStyle>`,
+  and `strokes: Vec<StrokeStyle>`. The legacy `fill` / `stroke`
+  fields stay on the struct for backward-compatible deserialisation:
+  on load, if `fills` / `strokes` are empty and the legacy fields
+  contain values, those values populate the vectors.
+- `kcreate_vector::path_effects::{dash, round_corners}` walks the
+  path by arc length to emit dashed sub-paths and replaces sharp
+  corners with circular arcs of a given radius.
+
+### Text flow engine
+
+- `kcreate_text::flow::TextFlowEngine` distributes shaped text
+  across an ordered list of frames. When a frame overflows the
+  remainder flows to the next frame in the chain. `next_frame_id`
+  on a `TextLayer` node tracks the chain.
+- `kcreate_text::wrap::WrapObstacle` describes a rectangular
+  obstacle plus margin / wrap-mode. The flow engine splits each
+  candidate line into sub-runs that avoid overlapping obstacles.
+
+### `.kbrand` format
+
+- `kcreate_export::kbrand::{export_brand_kit, import_brand_kit}`
+  read/write a ZIP archive containing `manifest.json` (the
+  serialised `BrandKit`), a `fonts/` directory of TTF/OTF blobs,
+  and a `logos/` directory of PNG/SVG/JPEG blobs. The importer
+  validates magic bytes before mounting fonts into the live
+  `FontManager`.
+
+### Slice export
+
+- `kcreate_export::slice::{Slice, export_slices}` define named
+  rectangular regions on the document with their own format /
+  scale settings. Export is parallelised through rayon.
+
+### Spot colors + overprint
+
+- `kcreate_core::color::Color::Spot { name, fallback_cmyk, tint,
+  alpha }` lets a fill keep its named Pantone reference until the
+  PDF exporter resolves it (or falls back to CMYK).
+- `kcreate_core::color::SpotColorLibrary` lives on the document and
+  maps spot names to their declared CMYK fallbacks.
+- `kcreate_core::node::Overprint` carried on `FillStyle` /
+  `StrokeStyle` extensions encodes the PDF / Scribus overprint flag.
+- `kcreate_export::preflight::PreflightCheck::SpotColorMissing`
+  warns when a `Color::Spot` is used but no matching entry exists
+  in the library.
+
 ## Crate architecture
 
 ```
@@ -768,20 +885,34 @@ crates/
 │                        # plus the Phase 2 extended ABI: kcreate_read_document,
 │                        # kcreate_read_asset, kcreate_write_proposal). JS panel
 │                        # runtime and Ed25519 manifest signing also live here.              [EXISTS]
-└── kcreate_collab/      # Phase 3 collaboration protocol foundation (peer identity,
-                         # Lamport clock, signed envelopes, conflict resolver,
-                         # session w/ replay-window). Transport-agnostic, kept OUT
-                         # of the editing-path dependency tree.                              [EXISTS]
+├── kcreate_collab/      # Phase 3 collaboration protocol foundation (peer identity,
+│                        # Lamport clock, signed envelopes, conflict resolver,
+│                        # session w/ replay-window). Transport-agnostic, kept OUT
+│                        # of the editing-path dependency tree.                              [EXISTS]
+├── kcreate_collab_transport/ # QUIC + mDNS LAN transport (peer discovery,
+│                        # ephemeral cert pinning, frame codec). Only
+│                        # networked crate; opted-in via `collab` feature
+│                        # on `kcreate_bridge`.                                               [EXISTS]
+└── kcreate_kchat/       # Dev-side KChat group membership issuer.
+                         # Mints test attestations against deterministic
+                         # Ed25519 keys. Behind the `kchat-dev-issuer`
+                         # bridge feature flag.                                              [EXISTS]
 ```
 
-Planned (Phase 3+):
+Also shipped under `tools/`:
+
+```
+tools/
+└── kcreate_diffusion/   # Loopback Python diffusion sidecar (FLUX.2-Klein-4B,
+                         # via huggingface diffusers; spawned by
+                         # `kcreate_ai::image_gen`, never networked).                       [EXISTS]
+```
+
+Planned (Phase 5+):
 
 ```
 crates/
-├── kcreate_audit/       # operation log persistence, AI action audit
-└── kcreate_collab_net/  # actual transport (QUIC + mDNS) that imports kcreate_collab
-                         # — separate crate so the local-first sentinel keeps the
-                         # editing path network-free.
+└── kcreate_audit/       # operation log persistence, AI action audit
 ```
 
 ### What is built vs. planned
@@ -831,6 +962,32 @@ crates/
 | WASM plugin runtime          | Built    | `crates/kcreate_plugin/src/wasm_runtime.rs` (wasmi 0.42) |
 | MCP permission store         | Built    | `crates/kcreate_mcp/src/permissions.rs`              |
 | Phase 2 bridge surface       | Built    | `crates/kcreate_bridge/src/phase2.rs`                |
+| Phase 4 bridge (vision + gen)| Built    | `crates/kcreate_bridge/src/phase4.rs`                |
+| LLM bridge (lifecycle)       | Built    | `crates/kcreate_bridge/src/llm.rs`                   |
+| Collab bridge (session mgmt) | Built    | `crates/kcreate_bridge/src/collab.rs`                |
+| LAN collab transport (QUIC + mDNS) | Built | `crates/kcreate_collab_transport/src/{cert,discovery,host,wire}.rs` |
+| KChat dev issuer             | Built    | `crates/kcreate_kchat/src/lib.rs`                    |
+| Fill editor (solid + gradient) | Built  | `apps/desktop/renderer/src/components/RightPanel.tsx` (FillSection) |
+| OCR text-region detection    | Built    | `crates/kcreate_ai/src/ocr.rs`                       |
+| Vision sidecar (VLM)         | Built    | `crates/kcreate_ai/src/{vision_chat,mlx_sidecar,sidecar_dispatcher}.rs` |
+| Image generation sidecar     | Built    | `crates/kcreate_ai/src/image_gen.rs`                 |
+| Design critique / brand / crop / tokens / style | Built | `crates/kcreate_ai/src/{design_critique,brand_extract,smart_crop,design_tokens_vlm,style_describe}.rs` |
+| Operation journal            | Built    | `crates/kcreate_collab/src/journal.rs`               |
+| Diffusion Python sidecar     | Built    | `tools/kcreate_diffusion/server.py`                  |
+| Raster filter pipeline (Levels / Curves / blur / sharpen / crop / rotate / flip / heal) | Built (Phase 5) | `crates/kcreate_raster/src/{layer,filters,transform,heal}.rs` |
+| Raster ops bridge            | Built (Phase 5) | `crates/kcreate_bridge/src/raster_ops.rs`     |
+| Filters UI panel             | Built (Phase 5) | `apps/desktop/renderer/src/components/FiltersPanel.tsx` |
+| Vector snap engine (smart guides) | Built (Phase 5) | `crates/kcreate_vector/src/snap.rs`     |
+| Path simplify / smooth / offset | Built (Phase 5) | `crates/kcreate_vector/src/simplify.rs`  |
+| Variable stroke width        | Built (Phase 5) | `crates/kcreate_vector/src/stroke.rs` + `kcreate_core::NodeStyle::stroke_width_profile` |
+| Multi-fill / multi-stroke    | Built (Phase 5) | `kcreate_core::NodeStyle::{fills, strokes}` (back-compat aliases) |
+| Path effects (dash / round corners) | Built (Phase 5) | `crates/kcreate_vector/src/path_effects.rs` |
+| Text flow across linked frames | Built (Phase 5) | `crates/kcreate_text/src/flow.rs`         |
+| Image-text wraps             | Built (Phase 5) | `crates/kcreate_text/src/wrap.rs`             |
+| `.kbrand` import / export    | Built (Phase 5) | `crates/kcreate_export/src/kbrand.rs`         |
+| Slice export                 | Built (Phase 5) | `crates/kcreate_export/src/slice.rs`          |
+| Spot colors + overprint      | Built (Phase 5) | `kcreate_core::color::{Color::Spot, SpotColorLibrary, Overprint}` |
+| Spot color missing preflight | Built (Phase 5) | `crates/kcreate_export/src/preflight.rs` (`PreflightCheck::SpotColorMissing`) |
 
 ### Recommended Rust dependencies
 
@@ -862,10 +1019,18 @@ Added in this phase:
 | `base64`    | Base64 round-trip for AI image bridges and screenshot-to-layout.        |
 | `tiny_http` | Loopback JSON-RPC for the MCP server.                                   |
 | `wasmi`     | Pure-Rust WASM runtime for the plugin sandbox (no LLVM, no system deps). |
+| `quinn`     | QUIC endpoint for the LAN collab transport.                              |
+| `rustls`    | Pure-Rust TLS underneath quinn; ephemeral certs pinned to peer Ed25519.  |
+| `rcgen`     | Self-signed cert chain generation for the transport handshake.           |
+| `mdns-sd`   | Pure-Rust mDNS-SD responder + browser for peer discovery.                |
+| `tokio`     | Async runtime for the transport actor (editing path stays sync).         |
+| `ed25519-dalek` | Peer identity signing for collab envelopes + plugin manifests.       |
+| `chrono`    | Timestamps with timezone awareness (operation log, MCP permissions).     |
+| `lopdf`     | PDF *read* for the Phase 3 PDF-import path.                              |
+| `zip`       | `.kbrand` archive read/write (Phase 5).                                  |
 
-Planned for Phase 3+:
+Planned for Phase 5+:
 
 | Crate         | Purpose                              |
 | ------------- | ------------------------------------ |
 | `resvg`       | Render SVG to raster for previews.   |
-| `lopdf`       | PDF *read* (we already ship `printpdf` for write). |

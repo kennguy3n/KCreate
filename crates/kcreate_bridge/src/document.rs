@@ -125,7 +125,7 @@ pub(crate) struct Workspace {
     selection: Vec<Uuid>,
 }
 
-fn slot() -> &'static Mutex<Option<Workspace>> {
+pub(crate) fn slot() -> &'static Mutex<Option<Workspace>> {
     static WS: OnceLock<Mutex<Option<Workspace>>> = OnceLock::new();
     WS.get_or_init(|| Mutex::new(None))
 }
@@ -1264,7 +1264,9 @@ pub fn document_sync_scene() -> Result<()> {
 /// observes the canonical order). As long as both invariants hold,
 /// there is no path that can deadlock by acquiring them in opposite
 /// orders.
-fn sync_scene_locked(guard: &mut parking_lot::MutexGuard<'_, Option<Workspace>>) -> Result<()> {
+pub(crate) fn sync_scene_locked(
+    guard: &mut parking_lot::MutexGuard<'_, Option<Workspace>>,
+) -> Result<()> {
     let Some(ws) = guard.as_mut() else {
         return Ok(());
     };

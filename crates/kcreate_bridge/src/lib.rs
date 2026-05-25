@@ -25,6 +25,7 @@ pub mod llm;
 pub mod native_canvas;
 pub mod phase2;
 pub mod phase4;
+pub mod raster_ops;
 pub mod scene_sync;
 pub mod state;
 pub mod wire;
@@ -1194,6 +1195,137 @@ pub fn ai_remove_background(node_id: String) -> NapiResult<String> {
 #[napi]
 pub fn ai_get_action_log() -> NapiResult<String> {
     document::ai_get_action_log().map_err(map_doc_err)
+}
+
+// -----------------------------------------------------------------------------
+// Phase 5 — raster filter / transform / heal operations.
+// All logic lives in `raster_ops.rs`; these are thin N-API marshalling
+// wrappers. Every call records an undoable `Operation` with
+// `ai_generated: false` (these are user edits, not AI suggestions).
+// -----------------------------------------------------------------------------
+
+/// Apply a Levels adjustment to a raster layer (in place).
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn raster_apply_levels(
+    node_id: String,
+    black_point: f64,
+    white_point: f64,
+    gamma: f64,
+) -> NapiResult<()> {
+    let id = parse_uuid(&node_id)?;
+    raster_ops::apply_levels(id, black_point as f32, white_point as f32, gamma as f32)
+        .map_err(map_doc_err)
+}
+
+/// Apply a Curves adjustment defined by `(input, output)` control
+/// points. `points_json` is a JSON array of `[[x, y], ...]` floats in
+/// `[0.0, 1.0]`.
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn raster_apply_curves(node_id: String, points_json: String) -> NapiResult<()> {
+    let id = parse_uuid(&node_id)?;
+    let parsed: Vec<(f32, f32)> = serde_json::from_str(&points_json).map_err(|e| {
+        NapiError::from_reason(format!("invalid curves points JSON: {}", e))
+    })?;
+    raster_ops::apply_curves(id, parsed).map_err(map_doc_err)
+}
+
+/// Apply a blur filter. `kind` is `"gaussian"` or `"box"`.
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn raster_apply_blur(node_id: String, radius: f64, kind: String) -> NapiResult<()> {
+    let id = parse_uuid(&node_id)?;
+    let kind = match kind.as_str() {
+        "gaussian" => raster_ops::BlurKind::Gaussian,
+        "box" => raster_ops::BlurKind::Box,
+        other => {
+            return Err(NapiError::from_reason(format!(
+                "unknown blur kind '{other}', expected 'gaussian' or 'box'"
+            )));
+        }
+    };
+    raster_ops::apply_blur(id, radius as f32, kind).map_err(map_doc_err)
+}
+
+/// Apply an unsharp-mask sharpen.
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn raster_apply_sharpen(
+    node_id: String,
+    radius: f64,
+    amount: f64,
+    threshold: u32,
+) -> NapiResult<()> {
+    let id = parse_uuid(&node_id)?;
+    let threshold_byte = u8::try_from(threshold.min(u32::from(u8::MAX))).unwrap_or(u8::MAX);
+    raster_ops::apply_sharpen(id, radius as f32, amount as f32, threshold_byte).map_err(map_doc_err)
+}
+
+/// Crop a raster layer in source-pixel coordinates.
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn raster_crop(node_id: String, x: u32, y: u32, w: u32, h: u32) -> NapiResult<()> {
+    let id = parse_uuid(&node_id)?;
+    raster_ops::crop(id, x, y, w, h).map_err(map_doc_err)
+}
+
+/// Rotate a raster layer by `angle_deg` degrees (positive = clockwise).
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn raster_rotate(node_id: String, angle_deg: f64) -> NapiResult<()> {
+    let id = parse_uuid(&node_id)?;
+    raster_ops::rotate(id, angle_deg as f32).map_err(map_doc_err)
+}
+
+/// Flip a raster layer. `direction` is `"horizontal"` or `"vertical"`.
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn raster_flip(node_id: String, direction: String) -> NapiResult<()> {
+    let id = parse_uuid(&node_id)?;
+    let dir = match direction.as_str() {
+        "horizontal" => raster_ops::FlipDirection::Horizontal,
+        "vertical" => raster_ops::FlipDirection::Vertical,
+        other => {
+            return Err(NapiError::from_reason(format!(
+                "unknown flip direction '{other}', expected 'horizontal' or 'vertical'"
+            )));
+        }
+    };
+    raster_ops::flip(id, dir).map_err(map_doc_err)
+}
+
+/// Heal a disc from `(src_x, src_y)` over `(dst_x, dst_y)` with the
+/// given radius. All coordinates are source-pixel.
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn raster_heal(
+    node_id: String,
+    src_x: u32,
+    src_y: u32,
+    dst_x: u32,
+    dst_y: u32,
+    radius: u32,
+) -> NapiResult<()> {
+    let id = parse_uuid(&node_id)?;
+    raster_ops::heal(id, src_x, src_y, dst_x, dst_y, radius).map_err(map_doc_err)
+}
+
+/// Non-destructive filter preview. `filter_json` is a JSON object
+/// matching the `PreviewFilter` discriminated union; returns a
+/// Buffer of RGBA bytes in row-major order, packed against
+/// `(width, height)` returned via a separate IPC frame info call.
+/// The caller is expected to know the dimensions match the source
+/// layer (current behaviour: every Phase-5 preview preserves
+/// dimensions — crop / rotate / flip are commit-only).
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn raster_preview_filter(node_id: String, filter_json: String) -> NapiResult<Buffer> {
+    let id = parse_uuid(&node_id)?;
+    let filter: raster_ops::PreviewFilter = serde_json::from_str(&filter_json)
+        .map_err(|e| NapiError::from_reason(format!("invalid filter JSON: {}", e)))?;
+    let (bytes, _w, _h) = raster_ops::preview_filter(id, filter).map_err(map_doc_err)?;
+    Ok(bytes.into())
 }
 
 /// Start the local MCP server on loopback. Returns the bound port.

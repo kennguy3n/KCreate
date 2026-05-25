@@ -561,7 +561,12 @@ impl Default for StrokeStyle {
 /// behaving exactly as before.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NodeStyle {
+    /// Primary (bottom-most) fill. Render order: `fill` first, then
+    /// `extra_fills` in order. Phase-1 documents only have this
+    /// field, so it's the migration anchor for multi-fill support.
     pub fill: FillStyle,
+    /// Primary stroke. Render order: `stroke` first, then
+    /// `extra_strokes` in order.
     pub stroke: Option<StrokeStyle>,
     pub corner_radius: f64,
     /// Optional non-sRGB authoritative color for this node. When
@@ -570,6 +575,29 @@ pub struct NodeStyle {
     /// "the renderer's `fill` is canonical".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub color_override: Option<crate::color::Color>,
+    /// Additional fills layered above the primary `fill`. Empty by
+    /// default — Phase-5 multi-fill support. Serde-`default` ensures
+    /// existing Phase-1..Phase-4 documents load unchanged.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_fills: Vec<FillStyle>,
+    /// Additional strokes layered above the primary `stroke`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_strokes: Vec<StrokeStyle>,
+    /// Variable stroke-width profile applied to the primary stroke
+    /// when expanding to a filled outline. `(t, width)` pairs along
+    /// the path parameter `t ∈ [0, 1]`. `None` means uniform width.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stroke_width_profile: Option<Vec<(f64, f64)>>,
+    /// Overprint flag: when `true`, the print pipeline emits this
+    /// node with its source-color preserved instead of knocking out
+    /// the underlying colour plates. Default `false` (knockout).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub overprint: bool,
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_false(v: &bool) -> bool {
+    !*v
 }
 
 impl Default for NodeStyle {
@@ -579,7 +607,35 @@ impl Default for NodeStyle {
             stroke: None,
             corner_radius: 0.0,
             color_override: None,
+            extra_fills: Vec::new(),
+            extra_strokes: Vec::new(),
+            stroke_width_profile: None,
+            overprint: false,
         }
+    }
+}
+
+impl NodeStyle {
+    /// Iterate every fill in render order (primary first, then extras).
+    pub fn iter_fills(&self) -> impl Iterator<Item = &FillStyle> {
+        std::iter::once(&self.fill).chain(self.extra_fills.iter())
+    }
+
+    /// Iterate every stroke in render order.
+    pub fn iter_strokes(&self) -> impl Iterator<Item = &StrokeStyle> {
+        self.stroke.iter().chain(self.extra_strokes.iter())
+    }
+
+    /// All fills as a `Vec` (allocates; useful for the bridge layer).
+    #[must_use]
+    pub fn all_fills(&self) -> Vec<FillStyle> {
+        self.iter_fills().cloned().collect()
+    }
+
+    /// All strokes as a `Vec`.
+    #[must_use]
+    pub fn all_strokes(&self) -> Vec<StrokeStyle> {
+        self.iter_strokes().cloned().collect()
     }
 }
 

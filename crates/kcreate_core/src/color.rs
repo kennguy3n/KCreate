@@ -60,6 +60,17 @@ pub enum Color {
     /// HSL — hue in degrees `[0, 360)`, saturation and lightness in
     /// `[0.0, 1.0]`.
     Hsl { h: f32, s: f32, l: f32, a: f32 },
+    /// Named spot ink (Pantone, Toyo, custom). The `fallback_cmyk`
+    /// tuple is the screen / RGB-tagged-PDF approximation; the spot
+    /// name is what the print pipeline uses to emit a separation
+    /// plate. `tint` in `[0.0, 1.0]` scales the ink load (so a 50 %
+    /// tint of a spot is the same plate at half coverage).
+    Spot {
+        name: String,
+        fallback_cmyk: (f32, f32, f32, f32),
+        tint: f32,
+        alpha: f32,
+    },
 }
 
 impl Color {
@@ -98,24 +109,148 @@ impl Color {
                 let (r, g, b) = hsl_to_srgb(h, s, l);
                 (r, g, b, a)
             }
+            Self::Spot {
+                fallback_cmyk: (c, m, y, k),
+                tint,
+                alpha,
+                ..
+            } => {
+                // Spot tints scale the ink load before the screen-CMYK
+                // approximation. The result is the soft-proof
+                // preview; the export pipeline uses the spot name to
+                // emit a real separation plate.
+                let tinted = (c * tint, m * tint, y * tint, k * tint);
+                let (r, g, b) = cmyk_to_srgb(tinted.0, tinted.1, tinted.2, tinted.3);
+                (r, g, b, alpha)
+            }
         }
     }
 
     /// Alpha channel in `[0.0, 1.0]`, regardless of space.
     #[must_use]
-    pub const fn alpha(&self) -> f32 {
+    pub fn alpha(&self) -> f32 {
         match *self {
             Self::Srgb { a, .. } | Self::Cmyk { a, .. } | Self::Hsl { a, .. } => a,
             Self::Lab { alpha, .. } => alpha,
+            Self::Spot { alpha, .. } => alpha,
         }
     }
 
     /// Whether this color is stored in a non-sRGB device space (CMYK).
     /// Used by the PDF exporter to decide between `rg` / `k` operators.
+    /// Spot inks are CMYK-routed because they fall back to a CMYK
+    /// approximation when a separation plate is unavailable.
     #[must_use]
-    pub const fn is_device_cmyk(&self) -> bool {
-        matches!(self, Self::Cmyk { .. })
+    pub fn is_device_cmyk(&self) -> bool {
+        matches!(self, Self::Cmyk { .. } | Self::Spot { .. })
     }
+
+    /// Total per-pixel ink coverage for preflight checks. Returns
+    /// `0..=400 %` (1.0 per process plate * 4 plates). Spot inks
+    /// contribute their `tint` × their fallback-CMYK sum, since the
+    /// preflight model doesn't yet know if the press will emit them
+    /// as separations or composite. The PDF exporter applies a more
+    /// accurate model when a `SpotColorLibrary` is available.
+    #[must_use]
+    pub fn total_ink_coverage(&self) -> f32 {
+        match self {
+            Self::Cmyk { c, m, y, k, .. } => c + m + y + k,
+            Self::Spot {
+                fallback_cmyk: (c, m, y, k),
+                tint,
+                ..
+            } => (c + m + y + k) * tint,
+            _ => {
+                let (r, g, b, _) = self.to_srgb();
+                // Convert preview to CMYK via the same naive
+                // transform we use elsewhere for non-CMYK fills.
+                let (c, m, y, k) = srgb_to_cmyk(r, g, b);
+                c + m + y + k
+            }
+        }
+    }
+}
+
+/// Library of named spot inks declared on a document.
+///
+/// Each entry is `name -> SpotColorDef` so the PDF exporter and the
+/// preflight engine can look up the canonical CMYK fallback + display
+/// name regardless of which fill referenced the spot. Documents are
+/// expected to register every spot they use up-front; preflight
+/// flags any [`Color::Spot`] whose `name` is missing from the
+/// library.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SpotColorLibrary {
+    pub entries: std::collections::BTreeMap<String, SpotColorDef>,
+}
+
+/// One spot ink in a [`SpotColorLibrary`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SpotColorDef {
+    /// Display name (e.g. `"Pantone 185 C"`).
+    pub display_name: String,
+    /// CMYK fallback used when the press cannot render a separation.
+    pub fallback_cmyk: (f32, f32, f32, f32),
+    /// Optional Pantone / Toyo / custom reference code for the swatch
+    /// library identifier. `None` means the spot is anonymous /
+    /// document-local.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub library_reference: Option<String>,
+}
+
+impl SpotColorLibrary {
+    /// Build an empty library.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register a spot ink under `name`. Replaces an existing entry.
+    pub fn insert(&mut self, name: impl Into<String>, def: SpotColorDef) {
+        self.entries.insert(name.into(), def);
+    }
+
+    /// Look up a spot ink by name.
+    #[must_use]
+    pub fn get(&self, name: &str) -> Option<&SpotColorDef> {
+        self.entries.get(name)
+    }
+
+    /// Number of spot inks defined.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// `true` when no spots are defined.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Iterate `(name, def)` pairs in alphabetical order.
+    pub fn iter(&self) -> impl Iterator<Item = (&String, &SpotColorDef)> {
+        self.entries.iter()
+    }
+}
+
+/// Total ink coverage for a colour resolved against a spot library.
+///
+/// For [`Color::Spot`], this looks up the library entry to use the
+/// document-declared CMYK fallback (which may differ from the inline
+/// `fallback_cmyk` on the colour, e.g. when the spot was re-tinted at
+/// the document level after the fill was authored). Falls back to
+/// the colour's own `total_ink_coverage` if the spot isn't in the
+/// library.
+#[must_use]
+pub fn total_ink_coverage_with_spots(color: &Color, spots: &SpotColorLibrary) -> f32 {
+    if let Color::Spot { name, tint, .. } = color {
+        if let Some(def) = spots.get(name) {
+            let (c, m, y, k) = def.fallback_cmyk;
+            return (c + m + y + k) * tint;
+        }
+    }
+    color.total_ink_coverage()
 }
 
 /// Color-space taxonomy for [`IccProfile::Custom`].

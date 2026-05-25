@@ -305,6 +305,17 @@ fn merge_override_alpha(over: Color, fill_alpha: f32) -> Color {
             l,
             a: final_alpha,
         },
+        Color::Spot {
+            name,
+            fallback_cmyk,
+            tint,
+            ..
+        } => Color::Spot {
+            name,
+            fallback_cmyk,
+            tint,
+            alpha: final_alpha,
+        },
     }
 }
 

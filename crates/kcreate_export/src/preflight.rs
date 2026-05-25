@@ -809,6 +809,9 @@ fn node_needs_cmyk_conversion(node: &Node) -> bool {
             kcreate_core::color::Color::Lab { a_star, b_star, .. } => {
                 a_star.abs() > 1.0 || b_star.abs() > 1.0
             }
+            // Spot inks are already CMYK-routed via their fallback,
+            // so no further sRGB→CMYK approximation is involved.
+            kcreate_core::color::Color::Spot { .. } => false,
         };
     }
     fill_has_chromatic_rgb(&node.style.fill)
@@ -1086,6 +1089,9 @@ fn check_node_total_ink_coverage(
                 }
                 kcreate_core::color::Color::Hsl { .. } => "HSL color override (converted to CMYK)",
                 kcreate_core::color::Color::Lab { .. } => "Lab color override (converted to CMYK)",
+                kcreate_core::color::Color::Spot { .. } => {
+                    "spot color override (via CMYK fallback)"
+                }
             };
             push_tic_issue(node, page_id, sum, cap, source, None, issues);
         }

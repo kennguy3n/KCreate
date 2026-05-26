@@ -143,12 +143,7 @@ pub fn export_brand_kit<S: std::hash::BuildHasher>(
     // Validate and emit fonts.
     let mut font_entries = Vec::with_capacity(kit.fonts.len());
     for font in &kit.fonts {
-        let name_key = format!(
-            "{}-{}{}",
-            sanitize_name(&font.family),
-            font.weight,
-            if font.italic { "-italic" } else { "" }
-        );
+        let name_key = font_archive_basename(&font.family, font.weight, font.italic);
         let archive_path = if let Some(bytes) = font_assets.get(&name_key) {
             let ext = guess_font_extension(bytes).ok_or_else(|| KbrandError::InvalidFontAsset {
                 path: name_key.clone(),
@@ -271,6 +266,22 @@ fn read_archive_file<R: Read + Seek>(
     let mut buf = Vec::with_capacity(entry.size() as usize);
     entry.read_to_end(&mut buf)?;
     Ok(buf)
+}
+
+/// Canonical archive-relative basename for a font's bytes in a
+/// `.kbrand` archive (without the file extension). Exposed so the
+/// bridge can populate the `font_assets` map passed to
+/// [`export_brand_kit`] with the exact same keys this writer
+/// expects — keeping the two sides in lockstep regardless of how
+/// `sanitize_name` evolves.
+#[must_use]
+pub fn font_archive_basename(family: &str, weight: u16, italic: bool) -> String {
+    format!(
+        "{}-{}{}",
+        sanitize_name(family),
+        weight,
+        if italic { "-italic" } else { "" }
+    )
 }
 
 /// Replace characters that are awkward inside ZIP archive paths with

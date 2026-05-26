@@ -4596,22 +4596,6 @@ pub fn slice_export_all(output_dir: &Path) -> Result<Vec<kcreate_export::slice::
 // Phase 5 — .kbrand import/export (Block D Task 21)
 // -----------------------------------------------------------------------------
 
-fn font_asset_key(font: &kcreate_core::project::FontRef) -> String {
-    let mut sanitised = String::with_capacity(font.family.len());
-    for ch in font.family.chars() {
-        if ch.is_ascii_alphanumeric() {
-            sanitised.push(ch);
-        } else {
-            sanitised.push('_');
-        }
-    }
-    format!(
-        "{sanitised}-{}{}",
-        font.weight,
-        if font.italic { "-italic" } else { "" }
-    )
-}
-
 /// Resolve a font archive path to its IANA MIME type. The match is
 /// case-insensitive against the file extension.
 fn font_mime_for(path: &str) -> &'static str {
@@ -4661,12 +4645,23 @@ pub fn brand_kit_export(kit_id: Uuid, output_path: &Path) -> Result<()> {
             .cloned()
             .ok_or(DocumentBridgeError::NodeNotFound(kit_id))?;
 
+        // Build the font-asset map keyed exactly the way kbrand's
+        // `export_brand_kit` looks them up — i.e. through
+        // `kcreate_export::kbrand::font_archive_basename`. Otherwise
+        // any family containing non-alphanumeric characters
+        // (e.g. "Source-Sans-Pro") would fail the lookup and silently
+        // drop the font bytes from the archive.
         let mut fonts: std::collections::HashMap<String, Vec<u8>> =
             std::collections::HashMap::new();
         for font in &kit.fonts {
             if let Some(asset_id) = font.embedded_asset_id {
                 if let Some(bytes) = ws.store.load_asset(asset_id)? {
-                    fonts.insert(font_asset_key(font), bytes);
+                    let key = kcreate_export::kbrand::font_archive_basename(
+                        &font.family,
+                        font.weight,
+                        font.italic,
+                    );
+                    fonts.insert(key, bytes);
                 }
             }
         }
@@ -4698,19 +4693,27 @@ pub fn brand_kit_import(file_path: &Path) -> Result<Uuid> {
 
     // Stage 1: walk the manifest and turn each archive-relative
     // asset path into a project-asset Uuid by storing the bytes.
+    // We also snapshot each font's `archive_path` in declaration
+    // order so Stage 2 can recover the link without reconstructing
+    // the path (and inheriting kbrand.rs's sanitisation rules).
+    let mut font_archive_paths: Vec<Option<String>> =
+        Vec::with_capacity(bundle.manifest.fonts.len());
     let mut font_asset_ids: std::collections::HashMap<String, Uuid> =
         std::collections::HashMap::new();
     for font in &bundle.manifest.fonts {
         let Some(archive_path) = &font.archive_path else {
+            font_archive_paths.push(None);
             continue;
         };
         let Some(bytes) = bundle.assets.get(archive_path) else {
+            font_archive_paths.push(None);
             continue;
         };
         let mime = font_mime_for(archive_path);
         let id = Uuid::new_v4();
         ws.store.store_asset_with_id(id, bytes, mime)?;
         font_asset_ids.insert(archive_path.clone(), id);
+        font_archive_paths.push(Some(archive_path.clone()));
     }
     let logo_asset_id = bundle.manifest.logos.first().and_then(|logo| {
         let bytes = bundle.assets.get(&logo.archive_path)?;
@@ -4721,19 +4724,17 @@ pub fn brand_kit_import(file_path: &Path) -> Result<Uuid> {
     });
 
     // Stage 2: build a BrandKit whose font/logo references point at
-    // the freshly-stored asset ids.
+    // the freshly-stored asset ids. `KbrandBundle::into_brand_kit`
+    // preserves the manifest's font order, so we can recover each
+    // archive_path by index.
     let mut kit = bundle.into_brand_kit();
     kit.logo_asset_id = logo_asset_id;
-    for font in &mut kit.fonts {
-        // Re-derive the archive path the same way `export_brand_kit`
-        // does to look up our stored id.
-        let key = font_asset_key(font);
-        for ext in ["ttf", "otf"] {
-            let archive_path = format!("fonts/{key}.{ext}");
-            if let Some(id) = font_asset_ids.get(&archive_path) {
-                font.embedded_asset_id = Some(*id);
-                break;
-            }
+    for (idx, font) in kit.fonts.iter_mut().enumerate() {
+        let Some(Some(archive_path)) = font_archive_paths.get(idx) else {
+            continue;
+        };
+        if let Some(id) = font_asset_ids.get(archive_path) {
+            font.embedded_asset_id = Some(*id);
         }
     }
     let new_id = kit.id;

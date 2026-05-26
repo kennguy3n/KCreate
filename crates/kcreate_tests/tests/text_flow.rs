@@ -163,6 +163,57 @@ fn kbrand_round_trip_preserves_all_tokens() {
 }
 
 #[test]
+fn kbrand_font_family_with_hyphens_round_trips() {
+    // Regression for the font_asset_key vs sanitize_name mismatch
+    // that silently dropped any family containing non-alphanumeric
+    // characters (e.g. "Source-Sans-Pro") from the archive.
+    let mut kit = BrandKit::new("Hyphen-Test");
+    kit.fonts.push(FontRef {
+        family: "Source-Sans-Pro".into(),
+        weight: 400,
+        italic: false,
+        embedded_asset_id: None,
+    });
+    kit.fonts.push(FontRef {
+        family: "Noto Sans JP".into(),
+        weight: 700,
+        italic: true,
+        embedded_asset_id: None,
+    });
+
+    let mut fonts: HashMap<String, Vec<u8>> = HashMap::new();
+    let mut otf_a = b"OTTO".to_vec();
+    otf_a.extend_from_slice(&[0u8; 64]);
+    fonts.insert(
+        kcreate_export::kbrand::font_archive_basename("Source-Sans-Pro", 400, false),
+        otf_a,
+    );
+    let mut otf_b = b"OTTO".to_vec();
+    otf_b.extend_from_slice(&[0u8; 64]);
+    fonts.insert(
+        kcreate_export::kbrand::font_archive_basename("Noto Sans JP", 700, true),
+        otf_b,
+    );
+
+    let logos: HashMap<String, Vec<u8>> = HashMap::new();
+    let tmp = tempfile::NamedTempFile::new().expect("temp");
+    export_brand_kit(&kit, &fonts, &logos, tmp.path()).expect("export");
+    let bundle = import_brand_kit(tmp.path()).expect("import");
+
+    // Both fonts must round-trip with archive paths populated.
+    assert_eq!(bundle.manifest.fonts.len(), 2);
+    for entry in &bundle.manifest.fonts {
+        assert!(
+            entry.archive_path.is_some(),
+            "font {} weight={} italic={} dropped from archive",
+            entry.family,
+            entry.weight,
+            entry.italic
+        );
+    }
+}
+
+#[test]
 fn kbrand_with_invalid_font_is_rejected() {
     let mut kit = BrandKit::new("Bad");
     kit.fonts.push(FontRef {

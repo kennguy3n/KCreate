@@ -927,10 +927,14 @@ impl SceneSync {
             *z += 1;
         }
         // If the chain produced zero sub-paths (e.g. a degenerate
-        // dash result), still record a placeholder allocation so the
-        // hit-test reverse map can find the node.
+        // dash result), still register a placeholder mapping so the
+        // hit-test reverse map can resolve the node. `allocate`
+        // alone only mints an `ObjectId`; the bidirectional
+        // `uuid_to_object_id` / `object_id_to_uuid` tables are only
+        // populated by `record`, which is what hit-testing reads.
         if first {
-            let _ = self.allocate(node.id);
+            let id = self.allocate(node.id);
+            self.record(node.id, id);
         }
     }
 

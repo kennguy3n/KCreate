@@ -2370,6 +2370,23 @@ pub fn color_spot_list() -> NapiResult<String> {
     phase2::color_spot_list().map_err(map_doc_err)
 }
 
+/// Parse a Pantone-style JSON catalogue and merge its entries into
+/// the project's `SpotColorLibrary`. Returns a JSON
+/// [`phase2::SpotCatalogLoadReport`] with `{added, overwritten, parsed}`.
+///
+/// The catalog supports two shapes (see
+/// [`kcreate_core::color::SpotColorLibrary::from_json_catalog`]):
+/// * Wrapped: `{ "entries": [{ "id": "...", "cmyk": [...] }, ...] }`
+/// * Bare map: `{ "swatch-id": { "cmyk": [...] }, ... }`
+///
+/// Recorded as a single undoable `spot_color_load_catalog` operation.
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn color_spot_load_catalog(raw_json: String) -> NapiResult<String> {
+    let report = phase2::color_spot_load_catalog(&raw_json).map_err(map_doc_err)?;
+    serde_json::to_string(&report).map_err(|e| napi::Error::from_reason(e.to_string()))
+}
+
 // ---------------------------------------------------------------------------
 // Phase 2 — text frame + OpenType (Block B Task 11)
 // ---------------------------------------------------------------------------

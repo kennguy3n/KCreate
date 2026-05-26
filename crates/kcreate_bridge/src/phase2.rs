@@ -1974,6 +1974,80 @@ pub fn color_spot_remove(name: &str) -> Result<bool> {
     Ok(removed)
 }
 
+/// Report of a `color_spot_load_catalog` call.
+///
+/// Mirrors `SpotCatalogLoadReportWire` in `apps/desktop/shared/scene.ts`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SpotCatalogLoadReport {
+    /// Number of swatches in the parsed catalogue that were not
+    /// previously in the project library (newly inserted).
+    pub added: usize,
+    /// Number of swatches that overwrote an existing entry with the
+    /// same `name` (the merge policy is "last-loaded wins").
+    pub overwritten: usize,
+    /// Total entries the catalogue contained after parsing. Will be
+    /// less than the raw entry count when malformed entries were
+    /// dropped (e.g. wrong-length CMYK arrays).
+    pub parsed: usize,
+}
+
+/// Load a Pantone-style JSON catalogue and merge its entries into
+/// the project's `SpotColorLibrary`. Returns a structured report of
+/// added vs overwritten swatches.
+///
+/// The merge is recorded as a single undoable
+/// `spot_color_load_catalog` operation so users can undo a bulk
+/// import in one keystroke (vs once per swatch when they would have
+/// added them with `color_spot_upsert`).
+///
+/// `raw_json` is the file contents as a UTF-8 string; the renderer
+/// is responsible for reading the file off disk because the bridge
+/// doesn't have native-file-dialog access on its own.
+pub fn color_spot_load_catalog(raw_json: &str) -> Result<SpotCatalogLoadReport> {
+    use kcreate_core::color::SpotColorLibrary;
+    let parsed = SpotColorLibrary::from_json_catalog(raw_json).map_err(|e| {
+        DocumentBridgeError::InvalidArgument {
+            argument: "spot_catalog".into(),
+            value: e.to_string(),
+        }
+    })?;
+    let parsed_count = parsed.len();
+    let mut report = SpotCatalogLoadReport {
+        added: 0,
+        overwritten: 0,
+        parsed: parsed_count,
+    };
+    if parsed_count == 0 {
+        return Ok(report);
+    }
+    with_workspace_mut(|ws| {
+        let before = serde_json::to_value(&ws.project.spot_color_library)?;
+        for (name, def) in parsed.iter() {
+            if ws.project.spot_color_library.get(name).is_some() {
+                report.overwritten += 1;
+            } else {
+                report.added += 1;
+            }
+            ws.project
+                .spot_color_library
+                .insert(name.clone(), def.clone());
+        }
+        let after = serde_json::to_value(&ws.project.spot_color_library)?;
+        let op = Operation::new(
+            "user",
+            "spot_color_load_catalog",
+            before,
+            after,
+            Vec::<Uuid>::new(),
+        );
+        ws.project.execute_operation(op);
+        Ok(())
+    })?;
+    sync_scene_after_change();
+    Ok(report)
+}
+
 /// Enumerate the spot library as a JSON array of [`SpotColorWire`].
 pub fn color_spot_list() -> Result<String> {
     let entries = with_workspace(|ws| {

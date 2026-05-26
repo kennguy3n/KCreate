@@ -2156,6 +2156,20 @@ export interface ColorBridge {
   removeSpot(name: string): Promise<boolean>;
   /// List every spot color in the document.
   listSpots(): Promise<SpotColorWire[]>;
+  /// Parse a Pantone-style JSON catalogue and merge every swatch into
+  /// the project's `SpotColorLibrary`. `rawJson` is the full UTF-8
+  /// catalogue contents (the renderer reads the file from disk via
+  /// the native open-file dialog and passes the string here). The
+  /// catalogue can be either:
+  ///
+  /// * `{ "name": "...", "entries": [{ "id": "PANTONE 185 C", "cmyk": [..4 floats..] }, ...] }`
+  /// * a bare map `{ "PANTONE 185 C": { "cmyk": [..] }, "PANTONE 354 C": [..] }`
+  ///
+  /// CMYK channels outside `[0, 1]` are clamped; malformed entries
+  /// (wrong-length arrays, non-finite numbers) are dropped without
+  /// failing the rest of the load. Returns a structured report.
+  /// Recorded as a single undoable `spot_color_load_catalog` op.
+  loadCatalog(rawJson: string): Promise<SpotCatalogLoadReportWire>;
   /// Spec-shaped convenience wrapper for `upsertSpot` (Phase 5
   /// Block D Task 23). Equivalent to upsertSpot with
   /// `displayName = name`, no `libraryReference`.
@@ -2179,6 +2193,18 @@ export interface SpotColorWire {
   /// Tuple `(c, m, y, k)` in `[0, 1]`.
   fallbackCmyk: [number, number, number, number];
   libraryReference?: string;
+}
+
+/// Result of [`ColorBridge.loadCatalog`]. Mirrors
+/// `kcreate_bridge::phase2::SpotCatalogLoadReport` 1:1.
+export interface SpotCatalogLoadReportWire {
+  /// Swatches newly inserted into the project library.
+  added: number;
+  /// Swatches that overwrote an existing entry of the same `name`.
+  overwritten: number;
+  /// Total entries the catalogue contained after parsing. Less than
+  /// the raw entry count when malformed entries were dropped.
+  parsed: number;
 }
 
 // ---------------------------------------------------------------------------

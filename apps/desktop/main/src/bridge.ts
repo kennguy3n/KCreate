@@ -444,6 +444,12 @@ export interface Bridge {
   colorSpotUpsert(wireJson: string): void;
   colorSpotRemove(name: string): boolean;
   colorSpotList(): string;
+  // Phase 3 — Pantone-style JSON catalogue loader. Parses `rawJson`
+  // via `kcreate_core::color::SpotColorLibrary::from_json_catalog`
+  // and merges it into the project's library. Returns a JSON
+  // `SpotCatalogLoadReportWire { added, overwritten, parsed }`.
+  // Recorded as a single undoable `spot_color_load_catalog` op.
+  colorSpotLoadCatalog(rawJson: string): string;
   // Phase 5 — smart-guides snap engine (Block C Task 13/14). Returns
   // a JSON `SnapResult { dx, dy, guides }` or `null` when no project
   // is loaded. `movingId` is the dragged node so its own edges are

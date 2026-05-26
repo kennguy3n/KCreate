@@ -1714,6 +1714,7 @@ version = "0.0.1"
 dependencies = [
  "base64",
  "kcreate_ai",
+ "kcreate_collab",
  "kcreate_core",
  "kcreate_export",
  "kcreate_mcp",

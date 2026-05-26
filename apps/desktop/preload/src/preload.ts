@@ -113,6 +113,7 @@ import type {
   ColorSpaceName,
   ColorValue,
   SpotColorWire,
+  SpotCatalogLoadReportWire,
   CanvasSnapBridge,
   SnapResult,
   RasterOpsBridge,
@@ -1686,6 +1687,13 @@ const color: ColorBridge = {
       "kcreate/color/spot/list",
     )) as string;
     return JSON.parse(raw) as SpotColorWire[];
+  },
+  async loadCatalog(rawJson: string): Promise<SpotCatalogLoadReportWire> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/color/spot/load-catalog",
+      rawJson,
+    )) as string;
+    return JSON.parse(raw) as SpotCatalogLoadReportWire;
   },
   async addSpot(
     name: string,

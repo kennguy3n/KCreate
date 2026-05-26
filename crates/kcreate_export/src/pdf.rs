@@ -594,6 +594,18 @@ fn emit_vector(
         return Ok(());
     }
 
+    // Phase 5/6 overprint metadata: when the author has flagged the
+    // node as overprinting, push an ExtGState that sets both OP and op
+    // before painting and pop it after via q/Q so the rest of the page
+    // continues to knockout. Doing it per-node keeps the resource
+    // dict small (one ExtGState per overprinting node) and keeps the
+    // knockout default fully isolated.
+    let overprint_active = node.style.overprint;
+    if overprint_active {
+        layer.save_graphics_state();
+        layer.set_overprint_fill(true);
+        layer.set_overprint_stroke(true);
+    }
     match paint {
         PdfPaint::None => {
             emit_solid_or_stroke(layer, rings, None, color_mode);
@@ -615,6 +627,9 @@ fn emit_vector(
                 pending_shadings,
             );
         }
+    }
+    if overprint_active {
+        layer.restore_graphics_state();
     }
     Ok(())
 }

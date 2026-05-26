@@ -1759,6 +1759,10 @@ function registerIpcHandlers(): void {
   ipcMain.handle("kcreate/color/spot/list", () =>
     requireBridge().colorSpotList(),
   );
+  ipcMain.handle(
+    "kcreate/color/spot/load-catalog",
+    (_e, rawJson: string) => requireBridge().colorSpotLoadCatalog(rawJson),
+  );
 
   // ---------------------------------------------------------------------
   // Phase 5 — smart-guides snap engine (Block C Task 13). The

@@ -231,6 +231,199 @@ impl SpotColorLibrary {
     pub fn iter(&self) -> impl Iterator<Item = (&String, &SpotColorDef)> {
         self.entries.iter()
     }
+
+    /// Merge entries from `other` into this library. Existing entries
+    /// with the same `name` are overwritten. Used by the Phase-3
+    /// catalog system when a project loads multiple named libraries
+    /// (e.g. Pantone Solid Coated + Pantone Solid Uncoated) — the
+    /// last one wins for any colliding swatch names.
+    pub fn merge(&mut self, other: Self) {
+        for (name, def) in other.entries {
+            self.entries.insert(name, def);
+        }
+    }
+
+    /// Parse a Pantone-style JSON catalog.
+    ///
+    /// The expected shape is one of:
+    ///
+    /// ```json
+    /// {
+    ///   "name": "Pantone Solid Coated",
+    ///   "entries": [
+    ///     {
+    ///       "id": "PANTONE 185 C",
+    ///       "display_name": "Pantone 185 C",
+    ///       "cmyk": [0.0, 1.0, 0.84, 0.0]
+    ///     },
+    ///     ...
+    ///   ]
+    /// }
+    /// ```
+    ///
+    /// or a bare object map:
+    ///
+    /// ```json
+    /// {
+    ///   "PANTONE 185 C": { "display_name": "Pantone 185 C", "cmyk": [0.0, 1.0, 0.84, 0.0] },
+    ///   ...
+    /// }
+    /// ```
+    ///
+    /// The bare map form is convenient for hand-authored small
+    /// catalogues; the wrapped form is what we ship for the canonical
+    /// libraries because it carries metadata (catalogue name) the UI
+    /// surfaces. `library_reference` defaults to the entry id when
+    /// not explicitly set.
+    ///
+    /// CMYK channels are clamped to `[0.0, 1.0]`. Entries with an
+    /// invalid CMYK array (wrong length, non-finite values) are
+    /// skipped rather than failing the whole catalogue — a single
+    /// corrupted swatch should not lock the user out of all the
+    /// others.
+    pub fn from_json_catalog(raw: &str) -> Result<Self, SpotCatalogError> {
+        let value: serde_json::Value =
+            serde_json::from_str(raw).map_err(|e| SpotCatalogError::Parse(e.to_string()))?;
+        let mut out = Self::default();
+        match value {
+            serde_json::Value::Object(map) => {
+                if let Some(entries) = map.get("entries").and_then(|v| v.as_array()) {
+                    for entry in entries {
+                        if let Some((name, def)) = parse_catalog_entry_object(entry) {
+                            out.entries.insert(name, def);
+                        }
+                    }
+                } else {
+                    // Bare map form. The map key IS the swatch id —
+                    // entries may omit `id` entirely and only carry
+                    // `display_name` + `cmyk`, or even just a bare
+                    // 4-element CMYK array.
+                    for (name, entry) in map {
+                        // Skip top-level metadata fields a catalogue
+                        // may carry alongside swatches (e.g. "name",
+                        // "description", "library_reference"). These
+                        // are strings, not entry objects.
+                        if entry.is_string() || entry.is_null() {
+                            continue;
+                        }
+                        if let Some(def) = parse_bare_entry(&name, &entry) {
+                            out.entries.insert(name, def);
+                        }
+                    }
+                }
+            }
+            _ => return Err(SpotCatalogError::Shape),
+        }
+        Ok(out)
+    }
+}
+
+/// Failure modes for [`SpotColorLibrary::from_json_catalog`].
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum SpotCatalogError {
+    /// `serde_json` couldn't parse the input as JSON.
+    #[error("invalid JSON: {0}")]
+    Parse(String),
+    /// The JSON parsed but doesn't have the expected `{entries: [...]}`
+    /// or bare-object shape.
+    #[error("expected `{{ entries: [...] }}` or a bare object map of `name -> entry`")]
+    Shape,
+}
+
+/// Parse one entry from the bare-map form of a Pantone catalogue.
+///
+/// The key `name` is already known (it's the JSON object key), so
+/// the entry value may either be:
+///
+/// * a 4-element JSON array `[c, m, y, k]` — only the CMYK fallback,
+/// * a JSON object `{ "display_name"?: ..., "cmyk"?: [..] }` — full
+///   inline definition. The `id` field is not required in this form;
+///   if present it's ignored in favour of the map key, which keeps
+///   `lib.get(key)` lookups working.
+///
+/// Returns `None` for anything else (so the caller can drop the
+/// malformed entry without poisoning the rest of the library).
+fn parse_bare_entry(name: &str, entry: &serde_json::Value) -> Option<SpotColorDef> {
+    if let Some(cmyk) = parse_bare_cmyk_array(entry) {
+        return Some(SpotColorDef {
+            display_name: name.to_string(),
+            fallback_cmyk: cmyk,
+            library_reference: Some(name.to_string()),
+        });
+    }
+    let obj = entry.as_object()?;
+    let cmyk = obj
+        .get("cmyk")
+        .or_else(|| obj.get("fallback_cmyk"))
+        .or_else(|| obj.get("fallbackCmyk"))
+        .and_then(parse_bare_cmyk_array)?;
+    let display_name = obj
+        .get("display_name")
+        .and_then(|v| v.as_str())
+        .or_else(|| obj.get("displayName").and_then(|v| v.as_str()))
+        .unwrap_or(name)
+        .to_string();
+    let library_reference = obj
+        .get("library_reference")
+        .or_else(|| obj.get("libraryReference"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .or_else(|| Some(name.to_string()));
+    Some(SpotColorDef {
+        display_name,
+        fallback_cmyk: cmyk,
+        library_reference,
+    })
+}
+
+fn parse_catalog_entry_object(entry: &serde_json::Value) -> Option<(String, SpotColorDef)> {
+    let obj = entry.as_object()?;
+    let id = obj
+        .get("id")
+        .and_then(|v| v.as_str())
+        .or_else(|| obj.get("name").and_then(|v| v.as_str()))?
+        .to_string();
+    let display_name = obj
+        .get("display_name")
+        .and_then(|v| v.as_str())
+        .or_else(|| obj.get("displayName").and_then(|v| v.as_str()))
+        .unwrap_or(id.as_str())
+        .to_string();
+    let cmyk = obj
+        .get("cmyk")
+        .or_else(|| obj.get("fallback_cmyk"))
+        .or_else(|| obj.get("fallbackCmyk"))
+        .and_then(parse_bare_cmyk_array)?;
+    let library_reference = obj
+        .get("library_reference")
+        .or_else(|| obj.get("libraryReference"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .or_else(|| Some(id.clone()));
+    Some((
+        id,
+        SpotColorDef {
+            display_name,
+            fallback_cmyk: cmyk,
+            library_reference,
+        },
+    ))
+}
+
+fn parse_bare_cmyk_array(value: &serde_json::Value) -> Option<(f32, f32, f32, f32)> {
+    let arr = value.as_array()?;
+    if arr.len() != 4 {
+        return None;
+    }
+    let mut out = [0.0f32; 4];
+    for (i, v) in arr.iter().enumerate() {
+        let n = v.as_f64()?;
+        if !n.is_finite() {
+            return None;
+        }
+        out[i] = (n as f32).clamp(0.0, 1.0);
+    }
+    Some(out.into())
 }
 
 /// Total ink coverage for a colour resolved against a spot library.

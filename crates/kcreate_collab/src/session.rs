@@ -23,10 +23,14 @@ use chrono::Utc;
 use uuid::Uuid;
 
 use crate::clock::LamportClock;
+use crate::conflict::OperationContext;
+use crate::crdt::{CrdtDecision, CrdtResolver};
 use crate::envelope::{CollabError, Envelope, NONCE_BYTES};
 use crate::kchat::{KChatAuthError, NoKChatGroupAuthority, SharedKChatAuthority};
 use crate::message::Message;
 use crate::peer::{PeerId, PeerIdentity, PeerKey};
+
+use kcreate_core::operation::Operation;
 
 /// Configuration knobs for a [`ProjectSession`]. Defaults are sane
 /// for the LAN-on-a-few-peers regime KCreate targets.
@@ -393,6 +397,46 @@ impl ProjectSession {
         self.nonce_counter = self.nonce_counter.wrapping_add(1);
         nonce[8..].copy_from_slice(&self.nonce_counter.to_be_bytes());
         nonce
+    }
+
+    /// Resolve a concurrent local-vs-remote pair using the operational
+    /// CRDT layer ([`CrdtResolver`]).
+    ///
+    /// The remote peer must already be in the roster (i.e. trusted via
+    /// [`Self::trust_peer`]); the local peer is implicit from the
+    /// session. `remote_clock` is the Lamport clock the remote
+    /// operation was sent at — typically the clock the transport
+    /// pulled off `env.clock` for the broadcasting envelope.
+    ///
+    /// Returns a [`CrdtDecision`] the bridge can apply atomically.
+    /// For the `Merge` variant the bridge replaces both ops with the
+    /// synthesised operation; for `KeepBoth` it applies both in order;
+    /// for `KeepLocal` / `KeepRemote` it discards the loser.
+    pub fn resolve_crdt(
+        &self,
+        local_op: &Operation,
+        remote_op: &Operation,
+        remote_peer: &PeerId,
+        remote_clock: LamportClock,
+    ) -> CrdtDecision {
+        let local_clock = self
+            .peers
+            .values()
+            .map(|state| state.last_clock)
+            .max()
+            .unwrap_or_else(|| self.clock())
+            .max(self.clock());
+        let local = OperationContext {
+            op: local_op,
+            clock: local_clock,
+            author: &self.local_identity.peer_id,
+        };
+        let remote = OperationContext {
+            op: remote_op,
+            clock: remote_clock,
+            author: remote_peer,
+        };
+        CrdtResolver.resolve_crdt(local, remote)
     }
 }
 

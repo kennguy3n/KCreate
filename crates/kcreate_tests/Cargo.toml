@@ -21,6 +21,7 @@ path = "src/lib.rs"
 # default features only, so enabling it for the integration tests
 # does not weaken the invariant.
 kcreate_ai = { path = "../kcreate_ai", features = ["llm_sidecar"] }
+kcreate_collab = { path = "../kcreate_collab" }
 kcreate_core = { path = "../kcreate_core" }
 kcreate_export = { path = "../kcreate_export" }
 kcreate_mcp = { path = "../kcreate_mcp" }

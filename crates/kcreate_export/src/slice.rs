@@ -35,7 +35,8 @@ use crate::webp::{export_webp_to_bytes, WebpExportError, WebpExportOptions};
 /// on success; on failure the `error` field carries a copy of the
 /// underlying error message so callers can show it in the UI without
 /// holding onto the typed error.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SliceResult {
     pub slice_id: uuid::Uuid,
     pub name: String,

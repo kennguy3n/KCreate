@@ -531,12 +531,54 @@ pub enum FillStyle {
     Gradient(GradientKind),
 }
 
-/// How a node is stroked.
+/// End-cap shape for an open stroked path. Mirrors the SVG / Canvas
+/// stroke-linecap concept. `Butt` (default) terminates the line
+/// flush at the endpoint; `Round` adds a half-disc cap of radius
+/// `width / 2`; `Square` extends a half-`width` square past the
+/// endpoint. The TS wire mirror is `"butt" | "round" | "square"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LineCap {
+    #[default]
+    Butt,
+    Round,
+    Square,
+}
+
+/// Join style at a stroked-path corner. Mirrors SVG / Canvas
+/// stroke-linejoin. `Miter` (default) extends the outer edges to a
+/// sharp point; `Round` joins with a circular arc; `Bevel` fills
+/// the corner with a flat triangle. The TS wire mirror is
+/// `"miter" | "round" | "bevel"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LineJoin {
+    #[default]
+    Miter,
+    Round,
+    Bevel,
+}
+
+/// How a node is stroked. Wire format mirrors
+/// `apps/desktop/shared/scene.ts::StrokeStyleWire`.
+///
+/// `cap`, `join`, and `dash` are all `#[serde(default)]` so the
+/// TS wire side can omit them (the optional fields in
+/// `StrokeStyleWire`) without triggering a deserialization error.
+/// Existing serialized projects from before Phase 5 also load
+/// cleanly — they predate cap/join entirely and the field defaults
+/// (`Butt`, `Miter`, empty dash) preserve their previous
+/// rendering exactly.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StrokeStyle {
     pub color: RgbaColor,
     pub width: f64,
+    #[serde(default)]
     pub dash: Vec<f64>,
+    #[serde(default)]
+    pub cap: LineCap,
+    #[serde(default)]
+    pub join: LineJoin,
 }
 
 impl Default for StrokeStyle {
@@ -545,6 +587,8 @@ impl Default for StrokeStyle {
             color: RgbaColor::BLACK,
             width: 1.0,
             dash: Vec::new(),
+            cap: LineCap::default(),
+            join: LineJoin::default(),
         }
     }
 }
@@ -593,6 +637,36 @@ pub struct NodeStyle {
     /// the underlying colour plates. Default `false` (knockout).
     #[serde(default, skip_serializing_if = "is_false")]
     pub overprint: bool,
+    /// Non-destructive path effects applied at render time. The
+    /// stored vector geometry (in `node.metadata[VECTOR_PATH]`) is
+    /// the *original* path; the renderer applies this chain in
+    /// order before emitting display-list objects. `dash` produces
+    /// one Object per sub-path; `round_corners` rewrites the path.
+    /// Empty by default. Serde-`default` keeps Phase-1..Phase-4
+    /// documents loading unchanged.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub path_effects: Vec<PathEffect>,
+}
+
+/// A non-destructive path effect. Stored on
+/// [`NodeStyle::path_effects`]; the renderer applies the effect
+/// chain (in order) before emitting display-list objects. Undo
+/// reverts to the unmodified original path because the geometry
+/// itself is never rewritten — only this list changes.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PathEffect {
+    /// Dash the path. `pattern` is alternating on/off lengths in
+    /// world units (`[on, off, on, off, …]`); `offset` shifts the
+    /// pattern's start along the path.
+    Dash {
+        pattern: Vec<f64>,
+        #[serde(default)]
+        offset: f64,
+    },
+    /// Replace sharp corners with circular arcs of the given radius
+    /// (world units).
+    RoundCorners { radius: f64 },
 }
 
 #[allow(clippy::trivially_copy_pass_by_ref)]
@@ -611,6 +685,7 @@ impl Default for NodeStyle {
             extra_strokes: Vec::new(),
             stroke_width_profile: None,
             overprint: false,
+            path_effects: Vec::new(),
         }
     }
 }
@@ -801,6 +876,13 @@ pub struct TextFrameOptions {
     /// before splitting into columns and laying out lines.
     pub inset: FrameInsets,
     pub auto_size: TextAutoSize,
+    /// Next frame in a linked text-flow chain. `None` terminates the
+    /// chain. The [`kcreate_text::flow`] engine walks this chain in
+    /// order, distributing shaped text across frames; overflow from
+    /// this frame spills into the linked frame. Phase-1..Phase-4
+    /// projects deserialize without this field via `serde(default)`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_frame_id: Option<Uuid>,
 }
 
 impl Default for TextFrameOptions {
@@ -815,6 +897,7 @@ impl Default for TextFrameOptions {
             vertical_alignment: VerticalAlign::default(),
             inset: FrameInsets::default(),
             auto_size: TextAutoSize::default(),
+            next_frame_id: None,
         }
     }
 }
@@ -1776,6 +1859,7 @@ mod tests {
                 left: 12.0,
             },
             auto_size: TextAutoSize::HeightAuto,
+            next_frame_id: None,
         };
         let json = serde_json::to_string(&opts).expect("serialize");
         let back: TextFrameOptions = serde_json::from_str(&json).expect("deserialize");

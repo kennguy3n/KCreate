@@ -28,6 +28,7 @@ pub mod phase4;
 pub mod raster_ops;
 pub mod scene_sync;
 pub mod state;
+pub mod vector_ops;
 pub mod wire;
 
 use std::path::PathBuf;
@@ -589,6 +590,23 @@ pub fn document_update_node(node_id: String, changes_json: String) -> NapiResult
 pub fn document_node_fill(node_id: String) -> NapiResult<Option<String>> {
     let id = parse_uuid(&node_id)?;
     document::document_node_fill(id).map_err(map_doc_err)
+}
+
+/// Read the node's `extra_fills` stack as a JSON array. Returns
+/// `None` when the node id is unknown.
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn document_node_extra_fills(node_id: String) -> NapiResult<Option<String>> {
+    let id = parse_uuid(&node_id)?;
+    document::document_node_extra_fills(id).map_err(map_doc_err)
+}
+
+/// Read the node's `extra_strokes` stack as a JSON array.
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn document_node_extra_strokes(node_id: String) -> NapiResult<Option<String>> {
+    let id = parse_uuid(&node_id)?;
+    document::document_node_extra_strokes(id).map_err(map_doc_err)
 }
 
 /// Remove a node and its descendants.
@@ -1363,6 +1381,204 @@ pub fn raster_preview_filter(node_id: String, filter_json: String) -> NapiResult
         .map_err(|e| NapiError::from_reason(format!("invalid filter JSON: {e}")))?;
     let (bytes, _w, _h) = raster_ops::preview_filter(id, filter).map_err(map_doc_err)?;
     Ok(bytes.into())
+}
+
+// -----------------------------------------------------------------------------
+// Phase 5 — vector path operations + non-destructive effects.
+// All logic lives in `vector_ops.rs`; these are thin N-API marshallers.
+// -----------------------------------------------------------------------------
+
+/// Apply Ramer-Douglas-Peucker simplification to the vector node's path.
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn vector_simplify(node_id: String, tolerance: f64) -> NapiResult<()> {
+    let id = parse_uuid(&node_id)?;
+    vector_ops::simplify(id, tolerance).map_err(map_doc_err)
+}
+
+/// Apply Chaikin corner-cutting smoothing `iterations` times.
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn vector_smooth(node_id: String, iterations: u32) -> NapiResult<()> {
+    let id = parse_uuid(&node_id)?;
+    vector_ops::smooth(id, iterations).map_err(map_doc_err)
+}
+
+/// Apply a parallel offset (`distance` in world units).
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn vector_offset(node_id: String, distance: f64) -> NapiResult<()> {
+    let id = parse_uuid(&node_id)?;
+    vector_ops::offset(id, distance).map_err(map_doc_err)
+}
+
+/// Install a variable stroke-width profile on the node's primary
+/// stroke. `profile_json` is a JSON array of `[t, width]` pairs
+/// with `t` in `[0,1]`; `null` clears the profile.
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn vector_set_stroke_profile(node_id: String, profile_json: String) -> NapiResult<()> {
+    let id = parse_uuid(&node_id)?;
+    let parsed: Option<Vec<(f64, f64)>> = serde_json::from_str(&profile_json)
+        .map_err(|e| NapiError::from_reason(format!("invalid stroke-profile JSON: {e}")))?;
+    vector_ops::set_stroke_profile(id, parsed).map_err(map_doc_err)
+}
+
+/// Push a `PathEffect` (Dash | RoundCorners) onto the node's
+/// non-destructive effect chain. `effect_json` is a JSON object
+/// using the `kind` discriminator.
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn vector_apply_path_effect(node_id: String, effect_json: String) -> NapiResult<()> {
+    let id = parse_uuid(&node_id)?;
+    let effect: kcreate_core::node::PathEffect = serde_json::from_str(&effect_json)
+        .map_err(|e| NapiError::from_reason(format!("invalid path-effect JSON: {e}")))?;
+    vector_ops::apply_path_effect(id, effect).map_err(map_doc_err)
+}
+
+/// Remove every path effect from the node.
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn vector_clear_path_effects(node_id: String) -> NapiResult<()> {
+    let id = parse_uuid(&node_id)?;
+    vector_ops::clear_path_effects(id).map_err(map_doc_err)
+}
+
+// -----------------------------------------------------------------------------
+// Phase 5 — text frame linking + wrap (Block D Tasks 19/20).
+// -----------------------------------------------------------------------------
+
+/// Link frame `a_id` so its overflow spills into `b_id`. Both
+/// must reference text-layer nodes; self-link and cycle creation
+/// are rejected.
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn text_frame_link(a_id: String, b_id: String) -> NapiResult<()> {
+    let a = parse_uuid(&a_id)?;
+    let b = parse_uuid(&b_id)?;
+    document::text_frame_link(a, b).map_err(map_doc_err)
+}
+
+/// Break the link out of `node_id` (sets `next_frame_id` to `None`).
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn text_frame_unlink(node_id: String) -> NapiResult<()> {
+    let id = parse_uuid(&node_id)?;
+    document::text_frame_unlink(id).map_err(map_doc_err)
+}
+
+/// Replace the text frame's wrap mode. `mode_json` is one of
+/// `"none" | "bounding_box" | "contour"` (matching
+/// [`TextWrapMode`]).
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn text_frame_set_wrap(node_id: String, mode_json: String) -> NapiResult<()> {
+    let id = parse_uuid(&node_id)?;
+    document::text_frame_set_wrap(id, &mode_json).map_err(map_doc_err)
+}
+
+// -----------------------------------------------------------------------------
+// Phase 5 — slices (Block D Task 22).
+// -----------------------------------------------------------------------------
+
+/// Append a new slice to the project's slice list. Returns the
+/// slice's UUID. `format` is `"png" | "svg" | "pdf" | "webp" | "jpeg"`.
+#[napi]
+#[allow(clippy::too_many_arguments, clippy::needless_pass_by_value)]
+pub fn slice_create(
+    name: String,
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+    format: String,
+    scale: f64,
+) -> NapiResult<String> {
+    let id =
+        document::slice_create(name, x, y, w, h, &format, scale as f32).map_err(map_doc_err)?;
+    Ok(id.to_string())
+}
+
+/// Patch fields on a slice. `changes_json` is a JSON object with
+/// optional `name`, `bounds`, `format`, `scale` keys.
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn slice_update(slice_id: String, changes_json: String) -> NapiResult<()> {
+    let id = parse_uuid(&slice_id)?;
+    let parsed: document::SliceUpdateProps = serde_json::from_str(&changes_json)
+        .map_err(|e| NapiError::from_reason(format!("invalid slice update JSON: {e}")))?;
+    document::slice_update(id, parsed).map_err(map_doc_err)
+}
+
+/// Remove a slice by id. Returns true when something was removed.
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn slice_delete(slice_id: String) -> NapiResult<bool> {
+    let id = parse_uuid(&slice_id)?;
+    document::slice_delete(id).map_err(map_doc_err)
+}
+
+/// Enumerate every slice as a JSON array.
+#[napi]
+pub fn slice_list() -> NapiResult<String> {
+    let slices = document::slice_list().map_err(map_doc_err)?;
+    serde_json::to_string(&slices).map_err(|e| NapiError::from_reason(e.to_string()))
+}
+
+/// Render every slice into `output_dir` (created if missing).
+/// Returns a JSON array of per-slice `SliceResult` records.
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn slice_export_all(output_dir: String) -> NapiResult<String> {
+    let results =
+        document::slice_export_all(std::path::Path::new(&output_dir)).map_err(map_doc_err)?;
+    serde_json::to_string(&results).map_err(|e| NapiError::from_reason(e.to_string()))
+}
+
+// -----------------------------------------------------------------------------
+// Phase 5 — .kbrand import/export (Block D Task 21).
+// -----------------------------------------------------------------------------
+
+/// Serialize the brand kit identified by `kit_id` to a `.kbrand`
+/// archive at `output_path`. Referenced font / logo blobs are
+/// resolved through the project's asset table.
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn brand_kit_export(kit_id: String, output_path: String) -> NapiResult<()> {
+    let id = parse_uuid(&kit_id)?;
+    document::brand_kit_export(id, std::path::Path::new(&output_path)).map_err(map_doc_err)
+}
+
+/// Import a `.kbrand` archive. Embedded fonts / logos are
+/// inserted into the project's asset table under fresh ids; a new
+/// `BrandKit` referencing those assets is appended. Returns the
+/// new kit's UUID.
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn brand_kit_import(file_path: String) -> NapiResult<String> {
+    let id = document::brand_kit_import(std::path::Path::new(&file_path)).map_err(map_doc_err)?;
+    Ok(id.to_string())
+}
+
+// -----------------------------------------------------------------------------
+// Phase 5 — spot colors + overprint convenience (Block D Task 23).
+// -----------------------------------------------------------------------------
+
+/// Spec-shaped wrapper for `color_spot_upsert`: inserts a spot
+/// color with name + CMYK fallback. Display name defaults to
+/// `name`.
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn color_add_spot(name: String, c: f64, m: f64, y: f64, k: f64) -> NapiResult<()> {
+    document::color_add_spot(name, c as f32, m as f32, y as f32, k as f32).map_err(map_doc_err)
+}
+
+/// Toggle a node's overprint flag.
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn node_set_overprint(node_id: String, enabled: bool) -> NapiResult<()> {
+    let id = parse_uuid(&node_id)?;
+    document::node_set_overprint(id, enabled).map_err(map_doc_err)
 }
 
 /// Start the local MCP server on loopback. Returns the bound port.

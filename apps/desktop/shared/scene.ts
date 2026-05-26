@@ -401,6 +401,24 @@ export type GradientKind =
  */
 export interface UpdateNodeProps extends CreateNodeProps {
   fill?: FillStyle;
+  /// Phase 5 Block C Task 17 — additional fills layered on top of
+  /// the primary `fill`. Sending `[]` clears the list; omitting
+  /// the field leaves it untouched.
+  extra_fills?: FillStyle[];
+  /// Phase 5 Block C Task 17 — additional strokes layered above
+  /// the primary stroke.
+  extra_strokes?: StrokeStyleWire[];
+  /// Phase 5 Block D Task 23 — toggle the overprint flag.
+  overprint?: boolean;
+}
+
+/// Wire shape for a stroke. Mirrors `kcreate_core::node::StrokeStyle`.
+export interface StrokeStyleWire {
+  color: RgbaColor;
+  width: number;
+  cap?: "butt" | "round" | "square";
+  join?: "miter" | "round" | "bevel";
+  dash?: number[];
 }
 
 /** SVG export options. `0` for width/height means "fit to content". */
@@ -523,6 +541,13 @@ export interface DocumentBridge {
    * scene re-sync, and persistence.
    */
   nodeFill(nodeId: string): Promise<FillStyle | null>;
+  /// Phase 5 Block C Task 17. Read the node's `extra_fills`
+  /// stack. Returns `null` only when the id is unknown; an empty
+  /// array means "no extras yet".
+  nodeExtraFills(nodeId: string): Promise<FillStyle[] | null>;
+  /// Phase 5 Block C Task 17. Read the node's `extra_strokes`
+  /// stack.
+  nodeExtraStrokes(nodeId: string): Promise<StrokeStyleWire[] | null>;
   deleteNode(nodeId: string): Promise<void>;
   undo(): Promise<UndoRedoOutcome | null>;
   redo(): Promise<UndoRedoOutcome | null>;
@@ -979,6 +1004,15 @@ export interface BrandKitBridge {
   update(kit: BrandKit): Promise<void>;
   list(): Promise<BrandKit[]>;
   delete(kitId: string): Promise<boolean>;
+  /// Phase 5 Block D Task 21. Serialize the brand kit (plus its
+  /// referenced font / logo blobs) into a `.kbrand` ZIP archive at
+  /// `outputPath`.
+  export(kitId: string, outputPath: string): Promise<void>;
+  /// Import a `.kbrand` archive. Embedded font / logo blobs are
+  /// stored in the project's asset table under fresh ids; a new
+  /// `BrandKit` referencing those assets is appended. Returns the
+  /// new kit's id.
+  import(filePath: string): Promise<string>;
 }
 
 /**
@@ -2122,6 +2156,19 @@ export interface ColorBridge {
   removeSpot(name: string): Promise<boolean>;
   /// List every spot color in the document.
   listSpots(): Promise<SpotColorWire[]>;
+  /// Spec-shaped convenience wrapper for `upsertSpot` (Phase 5
+  /// Block D Task 23). Equivalent to upsertSpot with
+  /// `displayName = name`, no `libraryReference`.
+  addSpot(
+    name: string,
+    c: number,
+    m: number,
+    y: number,
+    k: number,
+  ): Promise<void>;
+  /// Toggle `NodeStyle::overprint` on any node. Records an
+  /// undoable `node_set_overprint` operation.
+  setNodeOverprint(nodeId: string, enabled: boolean): Promise<void>;
 }
 
 /// Wire shape for the spot color CRUD endpoints. Mirrors
@@ -2284,6 +2331,10 @@ export interface TextFrameOptions {
   vertical_alignment: VerticalAlign;
   inset: FrameInsets;
   auto_size: TextAutoSize;
+  /// Phase 5 Block D Task 19. When set, overflow text from this
+  /// frame spills into the linked TextLayer at `next_frame_id`.
+  /// `null` (or absent on legacy projects) terminates the chain.
+  next_frame_id?: string | null;
 }
 
 /// OpenType feature toggles. `stylistic_sets` is a sparse list of
@@ -2336,6 +2387,101 @@ export interface TextFrameBridge {
     nodeId: string,
     features: OpenTypeFeatures,
   ): Promise<void>;
+  /// Phase 5 Block D Task 19. Link `aId`'s overflow to spill into
+  /// `bId`. Both must be TextLayer nodes. The bridge rejects
+  /// self-links and cycle creation; the call resolves once the
+  /// undoable `text_frame_link` operation lands.
+  link(aId: string, bId: string): Promise<void>;
+  /// Break the link out of `nodeId`. No-op if `nodeId` is not
+  /// currently linked.
+  unlink(nodeId: string): Promise<void>;
+  /// Replace the text frame's wrap mode (Phase 5 Block D Task 20).
+  setWrap(nodeId: string, mode: TextWrapMode): Promise<void>;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 5 — vector path operations (Block C Tasks 15, 16, 18).
+//
+// Every call mutates the document and records an undoable Operation.
+// The simplify / smooth / offset variants rewrite the stored
+// `VectorPath`; `setStrokeProfile`, `applyPathEffect`, and
+// `clearPathEffects` mutate the node's `NodeStyle` so the renderer
+// applies the effect chain at draw time without losing the original
+// geometry.
+// ---------------------------------------------------------------------------
+
+/// JSON-friendly path-effect discriminator. Mirrors
+/// `kcreate_core::node::PathEffect` (`#[serde(tag = "kind",
+/// rename_all = "snake_case")]`).
+export type PathEffectWire =
+  | { kind: "dash"; pattern: number[]; offset?: number }
+  | { kind: "round_corners"; radius: number };
+
+/// `[t, width]` control-point pairs. `t ∈ [0, 1]` along the path
+/// parameter; `width` is in world units.
+export type StrokeWidthProfile = Array<[number, number]>;
+
+export interface VectorOpsBridge {
+  /// Ramer-Douglas-Peucker simplification.
+  simplify(nodeId: string, tolerance: number): Promise<void>;
+  /// Chaikin corner-cutting smoothing.
+  smooth(nodeId: string, iterations: number): Promise<void>;
+  /// Parallel offset; positive = outward for closed paths.
+  offset(nodeId: string, distance: number): Promise<void>;
+  /// Install a variable stroke-width profile (`null` clears it).
+  setStrokeProfile(
+    nodeId: string,
+    profile: StrokeWidthProfile | null,
+  ): Promise<void>;
+  /// Push a non-destructive path effect onto the node's chain.
+  applyPathEffect(nodeId: string, effect: PathEffectWire): Promise<void>;
+  /// Remove every path effect from the node.
+  clearPathEffects(nodeId: string): Promise<void>;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 5 — slices (Block D Task 22). Mirrors
+// `kcreate_core::project::Slice` + `kcreate_export::slice::SliceResult`.
+// ---------------------------------------------------------------------------
+
+export interface SliceWire {
+  id: string;
+  name: string;
+  bounds: { x: number; y: number; width: number; height: number };
+  format: ExportFormat;
+  scale: number;
+  suffix: string;
+}
+
+export interface SliceResultWire {
+  sliceId: string;
+  name: string;
+  path?: string | null;
+  bytesWritten: number;
+  error?: string | null;
+}
+
+export interface SliceUpdateProps {
+  name?: string;
+  bounds?: { x: number; y: number; width: number; height: number };
+  format?: ExportFormat;
+  scale?: number;
+}
+
+export interface SliceBridge {
+  create(
+    name: string,
+    x: number,
+    y: number,
+    w: number,
+    h: number,
+    format: ExportFormat,
+    scale: number,
+  ): Promise<string>;
+  update(sliceId: string, changes: SliceUpdateProps): Promise<void>;
+  delete(sliceId: string): Promise<boolean>;
+  list(): Promise<SliceWire[]>;
+  exportAll(outputDir: string): Promise<SliceResultWire[]>;
 }
 
 // ---------------------------------------------------------------------------
@@ -2913,6 +3059,8 @@ declare global {
       canvasSnap: CanvasSnapBridge;
       rasterOps: RasterOpsBridge;
       textFrame: TextFrameBridge;
+      vectorOps: VectorOpsBridge;
+      slice: SliceBridge;
       session: SessionBridge;
       kchat: KChatBridge;
     };

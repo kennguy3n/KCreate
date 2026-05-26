@@ -40,6 +40,7 @@ import type {
   ExportPreset,
   ExportPresetBridge,
   FillStyle,
+  StrokeStyleWire,
   FrameInfo,
   InspectCode,
   JpegExportOptions,
@@ -120,8 +121,16 @@ import type {
   RasterPreviewFilter,
   TextFrameBridge,
   TextFrameOptions,
+  TextWrapMode,
   OpenTypeFeatures,
   TextLayoutWire,
+  VectorOpsBridge,
+  StrokeWidthProfile,
+  PathEffectWire,
+  SliceBridge,
+  SliceWire,
+  SliceResultWire,
+  SliceUpdateProps,
   SessionBridge,
   SessionCursor,
   SessionEvent,
@@ -473,6 +482,26 @@ const document: DocumentBridge = {
       return null;
     }
     return JSON.parse(raw) as FillStyle;
+  },
+  async nodeExtraFills(nodeId: string): Promise<FillStyle[] | null> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/document/nodeExtraFills",
+      nodeId,
+    )) as string | null;
+    if (raw === null) {
+      return null;
+    }
+    return JSON.parse(raw) as FillStyle[];
+  },
+  async nodeExtraStrokes(nodeId: string): Promise<StrokeStyleWire[] | null> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/document/nodeExtraStrokes",
+      nodeId,
+    )) as string | null;
+    if (raw === null) {
+      return null;
+    }
+    return JSON.parse(raw) as StrokeStyleWire[];
   },
   async deleteNode(nodeId: string): Promise<void> {
     await ipcRenderer.invoke("kcreate/document/deleteNode", nodeId);
@@ -997,6 +1026,15 @@ const brandKit: BrandKitBridge = {
       "kcreate/brandKit/delete",
       kitId,
     )) as boolean;
+  },
+  async export(kitId: string, outputPath: string): Promise<void> {
+    await ipcRenderer.invoke("kcreate/brandKit/export", kitId, outputPath);
+  },
+  async import(filePath: string): Promise<string> {
+    return (await ipcRenderer.invoke(
+      "kcreate/brandKit/import",
+      filePath,
+    )) as string;
   },
 };
 
@@ -1649,6 +1687,22 @@ const color: ColorBridge = {
     )) as string;
     return JSON.parse(raw) as SpotColorWire[];
   },
+  async addSpot(
+    name: string,
+    c: number,
+    m: number,
+    y: number,
+    k: number,
+  ): Promise<void> {
+    await ipcRenderer.invoke("kcreate/color/spot/add", name, c, m, y, k);
+  },
+  async setNodeOverprint(nodeId: string, enabled: boolean): Promise<void> {
+    await ipcRenderer.invoke(
+      "kcreate/node/overprint/set",
+      nodeId,
+      enabled,
+    );
+  },
 };
 
 // ---------------------------------------------------------------------------
@@ -2027,6 +2081,112 @@ const textFrame: TextFrameBridge = {
       JSON.stringify(features),
     );
   },
+  async link(aId: string, bId: string): Promise<void> {
+    await ipcRenderer.invoke("kcreate/text/frame/link", aId, bId);
+  },
+  async unlink(nodeId: string): Promise<void> {
+    await ipcRenderer.invoke("kcreate/text/frame/unlink", nodeId);
+  },
+  async setWrap(nodeId: string, mode: TextWrapMode): Promise<void> {
+    // The Rust side expects the JSON-encoded enum value, e.g.
+    // `"none"`, `"bounding_box"`, `"contour"`. JSON.stringify
+    // wraps the string literal in double quotes for us.
+    await ipcRenderer.invoke(
+      "kcreate/text/frame/wrap/set",
+      nodeId,
+      JSON.stringify(mode),
+    );
+  },
+};
+
+// ---------------------------------------------------------------------------
+// Phase 5 — vector path operations (Block C Tasks 15, 16, 18).
+// ---------------------------------------------------------------------------
+
+const vectorOps: VectorOpsBridge = {
+  async simplify(nodeId: string, tolerance: number): Promise<void> {
+    await ipcRenderer.invoke("kcreate/vector/simplify", nodeId, tolerance);
+  },
+  async smooth(nodeId: string, iterations: number): Promise<void> {
+    await ipcRenderer.invoke("kcreate/vector/smooth", nodeId, iterations);
+  },
+  async offset(nodeId: string, distance: number): Promise<void> {
+    await ipcRenderer.invoke("kcreate/vector/offset", nodeId, distance);
+  },
+  async setStrokeProfile(
+    nodeId: string,
+    profile: StrokeWidthProfile | null,
+  ): Promise<void> {
+    await ipcRenderer.invoke(
+      "kcreate/vector/strokeProfile/set",
+      nodeId,
+      JSON.stringify(profile),
+    );
+  },
+  async applyPathEffect(
+    nodeId: string,
+    effect: PathEffectWire,
+  ): Promise<void> {
+    await ipcRenderer.invoke(
+      "kcreate/vector/pathEffect/apply",
+      nodeId,
+      JSON.stringify(effect),
+    );
+  },
+  async clearPathEffects(nodeId: string): Promise<void> {
+    await ipcRenderer.invoke("kcreate/vector/pathEffect/clear", nodeId);
+  },
+};
+
+// ---------------------------------------------------------------------------
+// Phase 5 — slices (Block D Task 22).
+// ---------------------------------------------------------------------------
+
+const slice: SliceBridge = {
+  async create(
+    name: string,
+    x: number,
+    y: number,
+    w: number,
+    h: number,
+    format: ExportFormat,
+    scale: number,
+  ): Promise<string> {
+    return (await ipcRenderer.invoke(
+      "kcreate/slice/create",
+      name,
+      x,
+      y,
+      w,
+      h,
+      format,
+      scale,
+    )) as string;
+  },
+  async update(sliceId: string, changes: SliceUpdateProps): Promise<void> {
+    await ipcRenderer.invoke(
+      "kcreate/slice/update",
+      sliceId,
+      JSON.stringify(changes),
+    );
+  },
+  async delete(sliceId: string): Promise<boolean> {
+    return (await ipcRenderer.invoke(
+      "kcreate/slice/delete",
+      sliceId,
+    )) as boolean;
+  },
+  async list(): Promise<SliceWire[]> {
+    const raw = (await ipcRenderer.invoke("kcreate/slice/list")) as string;
+    return JSON.parse(raw) as SliceWire[];
+  },
+  async exportAll(outputDir: string): Promise<SliceResultWire[]> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/slice/exportAll",
+      outputDir,
+    )) as string;
+    return JSON.parse(raw) as SliceResultWire[];
+  },
 };
 
 contextBridge.exposeInMainWorld("kcreate", {
@@ -2060,6 +2220,8 @@ contextBridge.exposeInMainWorld("kcreate", {
   canvasSnap,
   rasterOps,
   textFrame,
+  vectorOps,
+  slice,
   session,
   kchat,
 });

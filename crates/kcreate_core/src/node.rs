@@ -531,12 +531,54 @@ pub enum FillStyle {
     Gradient(GradientKind),
 }
 
-/// How a node is stroked.
+/// End-cap shape for an open stroked path. Mirrors the SVG / Canvas
+/// stroke-linecap concept. `Butt` (default) terminates the line
+/// flush at the endpoint; `Round` adds a half-disc cap of radius
+/// `width / 2`; `Square` extends a half-`width` square past the
+/// endpoint. The TS wire mirror is `"butt" | "round" | "square"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LineCap {
+    #[default]
+    Butt,
+    Round,
+    Square,
+}
+
+/// Join style at a stroked-path corner. Mirrors SVG / Canvas
+/// stroke-linejoin. `Miter` (default) extends the outer edges to a
+/// sharp point; `Round` joins with a circular arc; `Bevel` fills
+/// the corner with a flat triangle. The TS wire mirror is
+/// `"miter" | "round" | "bevel"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LineJoin {
+    #[default]
+    Miter,
+    Round,
+    Bevel,
+}
+
+/// How a node is stroked. Wire format mirrors
+/// `apps/desktop/shared/scene.ts::StrokeStyleWire`.
+///
+/// `cap`, `join`, and `dash` are all `#[serde(default)]` so the
+/// TS wire side can omit them (the optional fields in
+/// `StrokeStyleWire`) without triggering a deserialization error.
+/// Existing serialized projects from before Phase 5 also load
+/// cleanly — they predate cap/join entirely and the field defaults
+/// (`Butt`, `Miter`, empty dash) preserve their previous
+/// rendering exactly.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StrokeStyle {
     pub color: RgbaColor,
     pub width: f64,
+    #[serde(default)]
     pub dash: Vec<f64>,
+    #[serde(default)]
+    pub cap: LineCap,
+    #[serde(default)]
+    pub join: LineJoin,
 }
 
 impl Default for StrokeStyle {
@@ -545,6 +587,8 @@ impl Default for StrokeStyle {
             color: RgbaColor::BLACK,
             width: 1.0,
             dash: Vec::new(),
+            cap: LineCap::default(),
+            join: LineJoin::default(),
         }
     }
 }

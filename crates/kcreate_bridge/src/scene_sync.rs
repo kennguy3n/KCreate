@@ -325,6 +325,24 @@ impl SceneSync {
         self.object_id_to_uuid.insert(obj_id, doc_id);
     }
 
+    /// Mint a *fresh* `ObjectId` for an auxiliary scene `Object` that
+    /// belongs to `parent_doc_id` but should have a distinct renderer
+    /// identity (e.g. each sub-path produced by a dash path effect).
+    ///
+    /// Unlike [`allocate`], this never returns an existing id —
+    /// callers expect a brand-new value so the scene's `Vec<Object>`
+    /// can carry several entries for the same node without sharing
+    /// an `ObjectId`. The reverse map is populated so hit-tests on
+    /// any sub-id resolve back to the parent node uuid; the forward
+    /// map is left alone so `object_id_for_uuid(parent_doc_id)`
+    /// continues to point at the *primary* id recorded by the
+    /// first sub-path's `record` call.
+    fn allocate_sub_object_id(&mut self, parent_doc_id: Uuid) -> ObjectId {
+        let id = ObjectId(self.next_id.fetch_add(1, Ordering::Relaxed));
+        self.object_id_to_uuid.insert(id, parent_doc_id);
+        id
+    }
+
     /// Translate the document graph into a fresh renderer [`Scene`].
     ///
     /// This rebuilds the scene from scratch every call. That is
@@ -910,13 +928,20 @@ impl SceneSync {
         emitted.push(node.id);
         let mut first = true;
         for sub in paths {
+            // The first sub-path gets the node's *primary*
+            // `ObjectId` (idempotent — re-uses the existing mapping
+            // on re-sync). Every additional sub-path gets a fresh
+            // id so the scene's `Vec<Object>` never holds two
+            // entries with the same id. The reverse map is still
+            // populated for the sub-ids so hit-tests on any of
+            // them resolve back to `node.id`.
             let obj_id = if first {
                 let id = self.allocate(node.id);
                 self.record(node.id, id);
                 first = false;
                 id
             } else {
-                self.allocate(node.id)
+                self.allocate_sub_object_id(node.id)
             };
             let commands = vector_path_to_renderer(&sub);
             let obj = Object::new(ObjectKind::Path(commands), style)
@@ -2063,5 +2088,64 @@ mod tests {
                 other => panic!("expected path cursor, got {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn dash_subpaths_receive_unique_object_ids() {
+        // Regression for Devin Review BUG_..._0002: each sub-path
+        // produced by a Dash path effect must carry a distinct
+        // `ObjectId` so the scene's `Vec<Object>` doesn't end up
+        // with several entries sharing one id (which would break
+        // any future per-object incremental scene patching).
+        // Every sub-id must still reverse-lookup to the parent
+        // node uuid, so hit-testing keeps working unchanged.
+        use kcreate_core::node::PathEffect;
+
+        let mut doc = DocumentGraph::new();
+        // 100-unit horizontal line, dashed 10-on/10-off → multiple
+        // sub-paths (kcreate_vector::dash exact count tested
+        // independently; we just need "more than 1").
+        let path = VectorPath::new(vec![
+            PathSegment::MoveTo(PathPoint::new(0.0, 0.0)),
+            PathSegment::LineTo(PathPoint::new(100.0, 0.0)),
+        ]);
+        let mut node = vector_node(&path);
+        node.style.path_effects.push(PathEffect::Dash {
+            pattern: vec![10.0, 10.0],
+            offset: 0.0,
+        });
+        let id = doc.insert_node(node).expect("insert");
+
+        let mut sync = SceneSync::new();
+        let scene = sync.sync_document_to_scene(&doc, None, &[]);
+
+        assert!(
+            scene.objects.len() >= 2,
+            "dash effect must emit at least 2 sub-path objects, got {}",
+            scene.objects.len()
+        );
+        let mut seen: std::collections::HashSet<ObjectId> =
+            std::collections::HashSet::with_capacity(scene.objects.len());
+        for obj in &scene.objects {
+            assert!(
+                seen.insert(obj.id),
+                "dash sub-path ObjectId {:?} appeared twice in the scene",
+                obj.id
+            );
+            // Every sub-id must reverse-lookup to the parent node.
+            let parent = sync.uuid_for_object_id(obj.id).expect("reverse map");
+            assert_eq!(
+                parent, id,
+                "sub-path id {:?} did not reverse-map back to parent node",
+                obj.id,
+            );
+        }
+        // The forward map still points at exactly one primary id,
+        // which must be one of the emitted object ids.
+        let primary = sync.object_id_for_uuid(id).expect("forward map");
+        assert!(
+            seen.contains(&primary),
+            "primary ObjectId {primary:?} was not one of the emitted sub-path ids",
+        );
     }
 }

@@ -4501,6 +4501,36 @@ pub struct SliceUpdateProps {
 }
 
 pub fn slice_update(id: Uuid, changes: SliceUpdateProps) -> Result<()> {
+    // Validate-then-apply: every input is checked and pre-parsed
+    // before we touch `ws.project.slices`, so a partial failure
+    // (e.g. valid `name` + invalid `bounds`) cannot leave the
+    // workspace dirtied without an `Operation` recorded — which
+    // would corrupt the undo log.
+    let validated_bounds = if let Some(b) = &changes.bounds {
+        if !b.width.is_finite() || !b.height.is_finite() || b.width <= 0.0 || b.height <= 0.0 {
+            return Err(DocumentBridgeError::InvalidBounds {
+                width: b.width,
+                height: b.height,
+            });
+        }
+        Some(kcreate_core::Bounds::new(b.x, b.y, b.width, b.height))
+    } else {
+        None
+    };
+    let validated_format = if let Some(fmt_str) = &changes.format {
+        Some(parse_export_format(fmt_str)?)
+    } else {
+        None
+    };
+    if let Some(s) = changes.scale {
+        if !s.is_finite() || s <= 0.0 {
+            return Err(DocumentBridgeError::InvalidArgument {
+                argument: "scale".into(),
+                value: format!("{s} (must be finite and positive)"),
+            });
+        }
+    }
+
     let mut guard = slot().lock();
     let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
     let idx = ws
@@ -4514,17 +4544,10 @@ pub fn slice_update(id: Uuid, changes: SliceUpdateProps) -> Result<()> {
     if let Some(name) = changes.name {
         ws.project.slices[idx].name = name;
     }
-    if let Some(b) = changes.bounds {
-        if !b.width.is_finite() || !b.height.is_finite() || b.width <= 0.0 || b.height <= 0.0 {
-            return Err(DocumentBridgeError::InvalidBounds {
-                width: b.width,
-                height: b.height,
-            });
-        }
-        ws.project.slices[idx].bounds = kcreate_core::Bounds::new(b.x, b.y, b.width, b.height);
+    if let Some(bounds) = validated_bounds {
+        ws.project.slices[idx].bounds = bounds;
     }
-    if let Some(fmt_str) = changes.format {
-        let fmt = parse_export_format(&fmt_str)?;
+    if let Some(fmt) = validated_format {
         ws.project.slices[idx].format = fmt;
         ws.project.slices[idx].suffix = match fmt {
             ExportFormat::Png => ".png".into(),
@@ -4535,12 +4558,6 @@ pub fn slice_update(id: Uuid, changes: SliceUpdateProps) -> Result<()> {
         };
     }
     if let Some(s) = changes.scale {
-        if !s.is_finite() || s <= 0.0 {
-            return Err(DocumentBridgeError::InvalidArgument {
-                argument: "scale".into(),
-                value: format!("{s} (must be finite and positive)"),
-            });
-        }
         ws.project.slices[idx].scale = s;
     }
 
@@ -7709,5 +7726,117 @@ mod tests {
         let reason = parsed["reason"].as_str().unwrap_or("");
         assert!(reason.contains("not a js_panel"), "got: {reason}");
         project_close();
+    }
+
+    #[test]
+    #[serial]
+    fn slice_update_validates_inputs_before_mutating_state() {
+        // Regression for Devin Review BUG_..._0001: a partial
+        // failure (e.g. valid `name` + invalid `bounds`) must
+        // leave the slice byte-for-byte unchanged and record no
+        // `Operation`. Otherwise an undoable edit would silently
+        // dirty the workspace.
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("slices", dir.path()).expect("create");
+
+        let id = slice_create("shipping".into(), 10.0, 20.0, 300.0, 150.0, "png", 1.0)
+            .expect("create slice");
+
+        // Snapshot the slice + the project's undo depth.
+        let before_slice = slice_list().expect("list")[0].clone();
+        let undo_depth_before = document_status().expect("status").undo_depth;
+
+        // Send a payload whose name is valid but whose bounds are
+        // illegal (width = -1). `slice_update` must return an
+        // error and must NOT have written the new name.
+        let bad = SliceUpdateProps {
+            name: Some("renamed".into()),
+            bounds: Some(BoundsInfo {
+                x: 0.0,
+                y: 0.0,
+                width: -1.0,
+                height: 100.0,
+            }),
+            format: None,
+            scale: None,
+        };
+        let err = slice_update(id, bad).expect_err("must reject negative width");
+        assert!(
+            matches!(err, DocumentBridgeError::InvalidBounds { .. }),
+            "expected InvalidBounds, got {err:?}"
+        );
+
+        let after_slice = slice_list().expect("list")[0].clone();
+        assert_eq!(
+            after_slice.name, before_slice.name,
+            "name must not have been written when bounds validation failed",
+        );
+        assert_eq!(
+            after_slice.bounds, before_slice.bounds,
+            "bounds must not have changed",
+        );
+        let undo_depth_after = document_status().expect("status").undo_depth;
+        assert_eq!(
+            undo_depth_after, undo_depth_before,
+            "no Operation should have been recorded for the failed update",
+        );
+
+        // The same payload with a bad scale (but valid bounds and
+        // valid name) must also reject without mutating.
+        let bad_scale = SliceUpdateProps {
+            name: Some("also_renamed".into()),
+            bounds: Some(BoundsInfo {
+                x: 5.0,
+                y: 5.0,
+                width: 100.0,
+                height: 100.0,
+            }),
+            format: Some("png".into()),
+            scale: Some(0.0),
+        };
+        let err = slice_update(id, bad_scale).expect_err("must reject zero scale");
+        assert!(
+            matches!(err, DocumentBridgeError::InvalidArgument { .. }),
+            "expected InvalidArgument, got {err:?}"
+        );
+        let still = slice_list().expect("list")[0].clone();
+        assert_eq!(still.name, before_slice.name);
+        assert_eq!(still.bounds, before_slice.bounds);
+        assert_eq!(still.scale, before_slice.scale);
+
+        project_close();
+    }
+
+    #[test]
+    fn stroke_style_deserializes_with_omitted_cap_join_dash() {
+        // Regression for Devin Review ANALYSIS_..._0002: the TS
+        // `StrokeStyleWire` declares `cap`, `join`, and `dash` as
+        // optional. Rust's `StrokeStyle` must accept payloads that
+        // omit any of them, falling back to `LineCap::Butt`,
+        // `LineJoin::Miter`, and an empty dash array.
+        use kcreate_core::node::{LineCap, LineJoin, StrokeStyle};
+
+        // Minimum payload — only the two required fields.
+        let json = r#"{ "color": { "r": 0.0, "g": 0.0, "b": 0.0, "a": 1.0 }, "width": 2.5 }"#;
+        let s: StrokeStyle = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(s.width, 2.5);
+        assert!(s.dash.is_empty());
+        assert_eq!(s.cap, LineCap::Butt);
+        assert_eq!(s.join, LineJoin::Miter);
+
+        // Full payload with `"round"` cap and `"bevel"` join — the
+        // TS wire's lowercase strings must round-trip.
+        let json = r#"{
+            "color": { "r": 0.0, "g": 0.0, "b": 0.0, "a": 1.0 },
+            "width": 1.0,
+            "dash": [4.0, 2.0],
+            "cap": "round",
+            "join": "bevel"
+        }"#;
+        let s: StrokeStyle = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(s.cap, LineCap::Round);
+        assert_eq!(s.join, LineJoin::Bevel);
+        assert_eq!(s.dash, vec![4.0, 2.0]);
     }
 }

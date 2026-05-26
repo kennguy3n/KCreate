@@ -267,6 +267,8 @@ mod tests {
             },
             width: 1.0,
             dash: Vec::new(),
+            cap: kcreate_core::node::LineCap::default(),
+            join: kcreate_core::node::LineJoin::default(),
         });
         node.metadata.insert(
             crate::scene_sync::VECTOR_PATH_METADATA_KEY.to_string(),

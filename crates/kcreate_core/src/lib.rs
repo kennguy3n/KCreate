@@ -47,9 +47,9 @@ pub use icc::{cmyk_to_srgb_profiled, convert_color, srgb_to_cmyk_profiled, Color
 pub use node::{
     standard_presets, ArtboardPreset, BlendMode, Bounds, Constraint, Constraints, Effect,
     FillStyle, FrameInsets, GradientKind, GradientStop, Interaction, InteractionAction,
-    InteractionTrigger, Margins, Node, NodeStyle, NodeType, OpenTypeFeatures, PageLayout,
-    PageOrientation, PageSize, Point2D, PresetCategory, RgbaColor, StrokeStyle, TextAutoSize,
-    TextFrameOptions, TextOverflow, TextWrapMode, Transform2D, VerticalAlign,
+    InteractionTrigger, LineCap, LineJoin, Margins, Node, NodeStyle, NodeType, OpenTypeFeatures,
+    PageLayout, PageOrientation, PageSize, Point2D, PresetCategory, RgbaColor, StrokeStyle,
+    TextAutoSize, TextFrameOptions, TextOverflow, TextWrapMode, Transform2D, VerticalAlign,
     INTERACTIONS_METADATA_KEY, MASTER_PAGE_METADATA_KEY, OPENTYPE_FEATURES_METADATA_KEY,
     PAGE_LAYOUT_METADATA_KEY, TEXT_FRAME_METADATA_KEY,
 };

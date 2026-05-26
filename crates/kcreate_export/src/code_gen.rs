@@ -611,6 +611,8 @@ mod tests {
             },
             width: 2.0,
             dash: Vec::new(),
+            cap: kcreate_core::node::LineCap::default(),
+            join: kcreate_core::node::LineJoin::default(),
         });
         n.style.corner_radius = 4.0;
         n

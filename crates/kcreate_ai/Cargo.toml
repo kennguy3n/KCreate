@@ -71,3 +71,9 @@ llm_sidecar = ["dep:ureq"]
 # Enables the u²-net ONNX background-removal backend. Pulls `ort`,
 # which bundles the ONNX Runtime native binary at build time.
 onnx_bg_removal = ["dep:ort"]
+# Enables the Real-ESRGAN x4 ONNX upscale backend. Shares the `ort`
+# native runtime with `onnx_bg_removal`; can be enabled independently.
+onnx_upscale = ["dep:ort"]
+# Enables the SAM (Segment-Anything) ONNX segmentation backend. Shares
+# the `ort` runtime with the other ONNX features.
+onnx_segment = ["dep:ort"]

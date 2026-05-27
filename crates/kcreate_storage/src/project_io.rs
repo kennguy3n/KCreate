@@ -179,6 +179,22 @@ impl ProjectStore {
         &self.blobs
     }
 
+    /// Path to the project's thumbnails directory
+    /// (`<project>/.kstudio/thumbnails/`). Created by [`Self::create`]
+    /// and re-checked by [`Self::open`]; the directory is guaranteed
+    /// to exist for the lifetime of the store.
+    #[must_use]
+    pub fn thumbnails_dir(&self) -> PathBuf {
+        self.project_dir.join("thumbnails")
+    }
+
+    /// Path to the project's general-purpose cache directory
+    /// (`<project>/.kstudio/cache/`). Safe to delete at any time.
+    #[must_use]
+    pub fn cache_dir(&self) -> PathBuf {
+        self.project_dir.join("cache")
+    }
+
     /// Persist the full document graph. Replaces all existing nodes.
     /// For incremental saves use [`Self::save_node`] /
     /// [`Self::delete_node`].
@@ -238,8 +254,8 @@ impl ProjectStore {
     pub fn save_operation(&mut self, op: &Operation) -> Result<(), ProjectStoreError> {
         self.db.conn().execute(
             "INSERT OR REPLACE INTO operations
-             (id, timestamp, actor, command, before_patch, after_patch, affected_nodes, ai_generated)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+             (id, timestamp, actor, command, before_patch, after_patch, affected_nodes, ai_generated, group_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 op.id.to_string(),
                 op.timestamp.to_rfc3339(),
@@ -249,6 +265,7 @@ impl ProjectStore {
                 serde_json::to_string(&op.after_patch)?,
                 serde_json::to_string(&op.affected_nodes)?,
                 i64::from(op.ai_generated),
+                op.group_id.as_ref().map(uuid::Uuid::to_string),
             ],
         )?;
         Ok(())
@@ -265,9 +282,9 @@ impl ProjectStore {
     /// `OperationLog` push order callers expect.
     pub fn load_operations(&self, limit: usize) -> Result<Vec<Operation>, ProjectStoreError> {
         let mut stmt = self.db.conn().prepare(
-            "SELECT id, timestamp, actor, command, before_patch, after_patch, affected_nodes, ai_generated
+            "SELECT id, timestamp, actor, command, before_patch, after_patch, affected_nodes, ai_generated, group_id
              FROM (
-               SELECT id, timestamp, actor, command, before_patch, after_patch, affected_nodes, ai_generated
+               SELECT id, timestamp, actor, command, before_patch, after_patch, affected_nodes, ai_generated, group_id
                FROM operations
                ORDER BY timestamp DESC
                LIMIT ?1
@@ -284,10 +301,17 @@ impl ProjectStore {
                 let after: String = row.get(5)?;
                 let affected: String = row.get(6)?;
                 let ai: i64 = row.get(7)?;
-                Ok((id, ts, actor, command, before, after, affected, ai))
+                let group_id: Option<String> = row.get(8)?;
+                Ok((
+                    id, ts, actor, command, before, after, affected, ai, group_id,
+                ))
             })?
             .map(|raw| -> Result<Operation, ProjectStoreError> {
-                let (id, ts, actor, command, before, after, affected, ai) = raw?;
+                let (id, ts, actor, command, before, after, affected, ai, group_id) = raw?;
+                let group_id = match group_id {
+                    Some(s) => Some(Uuid::parse_str(&s)?),
+                    None => None,
+                };
                 Ok(Operation {
                     id: Uuid::parse_str(&id)?,
                     timestamp: chrono::DateTime::parse_from_rfc3339(&ts)
@@ -299,6 +323,7 @@ impl ProjectStore {
                     after_patch: serde_json::from_str(&after)?,
                     affected_nodes: serde_json::from_str(&affected)?,
                     ai_generated: ai != 0,
+                    group_id,
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;

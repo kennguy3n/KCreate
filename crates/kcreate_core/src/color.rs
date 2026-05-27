@@ -231,6 +231,294 @@ impl SpotColorLibrary {
     pub fn iter(&self) -> impl Iterator<Item = (&String, &SpotColorDef)> {
         self.entries.iter()
     }
+
+    /// Merge entries from `other` into this library. Existing entries
+    /// with the same `name` are overwritten. Used by the Phase-3
+    /// catalog system when a project loads multiple named libraries
+    /// (e.g. Pantone Solid Coated + Pantone Solid Uncoated) — the
+    /// last one wins for any colliding swatch names.
+    pub fn merge(&mut self, other: Self) {
+        for (name, def) in other.entries {
+            self.entries.insert(name, def);
+        }
+    }
+
+    /// Parse a Pantone-style JSON catalog.
+    ///
+    /// The expected shape is one of:
+    ///
+    /// ```json
+    /// {
+    ///   "name": "Pantone Solid Coated",
+    ///   "entries": [
+    ///     {
+    ///       "id": "PANTONE 185 C",
+    ///       "display_name": "Pantone 185 C",
+    ///       "cmyk": [0.0, 1.0, 0.84, 0.0]
+    ///     },
+    ///     ...
+    ///   ]
+    /// }
+    /// ```
+    ///
+    /// or a bare object map:
+    ///
+    /// ```json
+    /// {
+    ///   "PANTONE 185 C": { "display_name": "Pantone 185 C", "cmyk": [0.0, 1.0, 0.84, 0.0] },
+    ///   ...
+    /// }
+    /// ```
+    ///
+    /// The bare map form is convenient for hand-authored small
+    /// catalogues; the wrapped form is what we ship for the canonical
+    /// libraries because it carries metadata (catalogue name) the UI
+    /// surfaces. `library_reference` defaults to the entry id when
+    /// not explicitly set.
+    ///
+    /// CMYK channels are clamped to `[0.0, 1.0]`. Entries with an
+    /// invalid CMYK array (wrong length, non-finite values) are
+    /// skipped rather than failing the whole catalogue — a single
+    /// corrupted swatch should not lock the user out of all the
+    /// others.
+    ///
+    /// This convenience returns just the parsed library; callers that
+    /// need to surface diagnostics (how many raw entries, how many
+    /// were dropped as malformed, how many collided by id) should use
+    /// [`Self::from_json_catalog_with_report`] instead. The bridge's
+    /// `color_spot_load_catalog` uses the reporting variant so the UI
+    /// can show users exactly what happened when a load drops or
+    /// dedups entries (Devin Review ANALYSIS_0005 on PR #16).
+    pub fn from_json_catalog(raw: &str) -> Result<Self, SpotCatalogError> {
+        Self::from_json_catalog_with_report(raw).map(|(lib, _)| lib)
+    }
+
+    /// Parse a Pantone-style JSON catalogue and report parse-time
+    /// counts alongside the resulting library.
+    ///
+    /// See [`Self::from_json_catalog`] for the supported input shapes
+    /// and validation rules. The returned [`CatalogParseStats`]
+    /// distinguishes three reasons the library may carry fewer
+    /// entries than the raw JSON contained:
+    ///
+    /// * `malformed` — the entry failed structural validation
+    ///   (missing `id`, wrong-length / non-finite CMYK, not an object
+    ///   in the bare-map form, etc.).
+    /// * `duplicates_in_catalog` — two or more entries shared the
+    ///   same `name`/`id` and only the last one survives (the merge
+    ///   policy is last-write-wins, consistent with `merge()`).
+    /// * `parsed` — the final dedup'd, well-formed count actually
+    ///   loaded into the library.
+    ///
+    /// `raw_entries = parsed + duplicates_in_catalog + malformed`
+    /// holds by construction, so the caller can recover the original
+    /// catalogue size without parsing again.
+    pub fn from_json_catalog_with_report(
+        raw: &str,
+    ) -> Result<(Self, CatalogParseStats), SpotCatalogError> {
+        let value: serde_json::Value =
+            serde_json::from_str(raw).map_err(|e| SpotCatalogError::Parse(e.to_string()))?;
+        let mut out = Self::default();
+        let mut stats = CatalogParseStats::default();
+        match value {
+            serde_json::Value::Object(map) => {
+                if let Some(entries) = map.get("entries").and_then(|v| v.as_array()) {
+                    for entry in entries {
+                        stats.raw_entries += 1;
+                        if let Some((name, def)) = parse_catalog_entry_object(entry) {
+                            if out.entries.insert(name, def).is_some() {
+                                stats.duplicates_in_catalog += 1;
+                            }
+                        } else {
+                            stats.malformed += 1;
+                        }
+                    }
+                } else {
+                    // Bare map form. The map key IS the swatch id —
+                    // entries may omit `id` entirely and only carry
+                    // `display_name` + `cmyk`, or even just a bare
+                    // 4-element CMYK array. JSON object keys are
+                    // already unique at the parser level (serde_json
+                    // keeps only the last value for repeated keys),
+                    // so `duplicates_in_catalog` is structurally zero
+                    // for this shape — the only way to lose entries
+                    // is structural malformation.
+                    for (name, entry) in map {
+                        // Skip top-level metadata fields a catalogue
+                        // may carry alongside swatches (e.g. "name",
+                        // "description", "library_reference",
+                        // "version": 2, "options": {...}). Anything
+                        // that doesn't structurally look like a
+                        // swatch entry is metadata, not malformed —
+                        // counting it would inflate raw_entries and
+                        // malformed simultaneously.
+                        if !is_bare_entry_shape(&entry) {
+                            continue;
+                        }
+                        stats.raw_entries += 1;
+                        if let Some(def) = parse_bare_entry(&name, &entry) {
+                            if out.entries.insert(name, def).is_some() {
+                                stats.duplicates_in_catalog += 1;
+                            }
+                        } else {
+                            stats.malformed += 1;
+                        }
+                    }
+                }
+            }
+            _ => return Err(SpotCatalogError::Shape),
+        }
+        stats.parsed = out.entries.len();
+        Ok((out, stats))
+    }
+}
+
+/// Diagnostic counts produced by
+/// [`SpotColorLibrary::from_json_catalog_with_report`]. Field
+/// semantics are documented on that method; the invariant
+/// `raw_entries == parsed + duplicates_in_catalog + malformed`
+/// always holds.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CatalogParseStats {
+    /// Total entries encountered in the catalogue before filtering.
+    pub raw_entries: usize,
+    /// Well-formed entries that survived into the library.
+    pub parsed: usize,
+    /// Well-formed entries that collided on `name` with an earlier
+    /// well-formed entry from the same catalogue; the later entry
+    /// overwrote the earlier one (last-write-wins).
+    pub duplicates_in_catalog: usize,
+    /// Entries dropped as malformed (wrong-length CMYK, non-finite
+    /// values, missing `id` in the wrapped form, etc.).
+    pub malformed: usize,
+}
+
+/// Failure modes for [`SpotColorLibrary::from_json_catalog`].
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum SpotCatalogError {
+    /// `serde_json` couldn't parse the input as JSON.
+    #[error("invalid JSON: {0}")]
+    Parse(String),
+    /// The JSON parsed but doesn't have the expected `{entries: [...]}`
+    /// or bare-object shape.
+    #[error("expected `{{ entries: [...] }}` or a bare object map of `name -> entry`")]
+    Shape,
+}
+
+/// Parse one entry from the bare-map form of a Pantone catalogue.
+///
+/// The key `name` is already known (it's the JSON object key), so
+/// the entry value may either be:
+///
+/// * a 4-element JSON array `[c, m, y, k]` — only the CMYK fallback,
+/// * a JSON object `{ "display_name"?: ..., "cmyk"?: [..] }` — full
+///   inline definition. The `id` field is not required in this form;
+///   if present it's ignored in favour of the map key, which keeps
+///   `lib.get(key)` lookups working.
+///
+/// Returns `None` for anything else (so the caller can drop the
+/// malformed entry without poisoning the rest of the library).
+/// Returns `true` if `v` looks structurally like a swatch entry in
+/// the bare-map catalog shape — either a 4-element JSON array (a
+/// bare CMYK tuple) or a JSON object that carries a `cmyk` /
+/// `fallback_cmyk` / `fallbackCmyk` key. Anything else (numbers,
+/// booleans, strings, objects without those keys) is treated as
+/// catalog-level metadata and excluded from `raw_entries` /
+/// `malformed` so the diagnostic counts only reflect actual
+/// swatch entries the user submitted for parsing.
+fn is_bare_entry_shape(v: &serde_json::Value) -> bool {
+    match v {
+        serde_json::Value::Array(arr) => arr.len() == 4,
+        serde_json::Value::Object(obj) => {
+            obj.contains_key("cmyk")
+                || obj.contains_key("fallback_cmyk")
+                || obj.contains_key("fallbackCmyk")
+        }
+        _ => false,
+    }
+}
+
+fn parse_bare_entry(name: &str, entry: &serde_json::Value) -> Option<SpotColorDef> {
+    if let Some(cmyk) = parse_bare_cmyk_array(entry) {
+        return Some(SpotColorDef {
+            display_name: name.to_string(),
+            fallback_cmyk: cmyk,
+            library_reference: Some(name.to_string()),
+        });
+    }
+    let obj = entry.as_object()?;
+    let cmyk = obj
+        .get("cmyk")
+        .or_else(|| obj.get("fallback_cmyk"))
+        .or_else(|| obj.get("fallbackCmyk"))
+        .and_then(parse_bare_cmyk_array)?;
+    let display_name = obj
+        .get("display_name")
+        .and_then(|v| v.as_str())
+        .or_else(|| obj.get("displayName").and_then(|v| v.as_str()))
+        .unwrap_or(name)
+        .to_string();
+    let library_reference = obj
+        .get("library_reference")
+        .or_else(|| obj.get("libraryReference"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .or_else(|| Some(name.to_string()));
+    Some(SpotColorDef {
+        display_name,
+        fallback_cmyk: cmyk,
+        library_reference,
+    })
+}
+
+fn parse_catalog_entry_object(entry: &serde_json::Value) -> Option<(String, SpotColorDef)> {
+    let obj = entry.as_object()?;
+    let id = obj
+        .get("id")
+        .and_then(|v| v.as_str())
+        .or_else(|| obj.get("name").and_then(|v| v.as_str()))?
+        .to_string();
+    let display_name = obj
+        .get("display_name")
+        .and_then(|v| v.as_str())
+        .or_else(|| obj.get("displayName").and_then(|v| v.as_str()))
+        .unwrap_or(id.as_str())
+        .to_string();
+    let cmyk = obj
+        .get("cmyk")
+        .or_else(|| obj.get("fallback_cmyk"))
+        .or_else(|| obj.get("fallbackCmyk"))
+        .and_then(parse_bare_cmyk_array)?;
+    let library_reference = obj
+        .get("library_reference")
+        .or_else(|| obj.get("libraryReference"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .or_else(|| Some(id.clone()));
+    Some((
+        id,
+        SpotColorDef {
+            display_name,
+            fallback_cmyk: cmyk,
+            library_reference,
+        },
+    ))
+}
+
+fn parse_bare_cmyk_array(value: &serde_json::Value) -> Option<(f32, f32, f32, f32)> {
+    let arr = value.as_array()?;
+    if arr.len() != 4 {
+        return None;
+    }
+    let mut out = [0.0f32; 4];
+    for (i, v) in arr.iter().enumerate() {
+        let n = v.as_f64()?;
+        if !n.is_finite() {
+            return None;
+        }
+        out[i] = (n as f32).clamp(0.0, 1.0);
+    }
+    Some(out.into())
 }
 
 /// Total ink coverage for a colour resolved against a spot library.
@@ -1086,6 +1374,58 @@ mod tests {
             .unwrap(),
             r#"{"Custom":{"name":"MyPress","blob_hash":"deadbeef","color_space":"Cmyk"}}"#
         );
+    }
+
+    #[test]
+    fn bare_map_skips_non_entry_shapes_from_raw_count() {
+        // Metadata fields (string, number, bool, object without
+        // `cmyk`, arrays of wrong length) must be excluded from
+        // `raw_entries` so the diagnostic counts only reflect
+        // actual swatch entries the user submitted for parsing.
+        let raw = r#"{
+            "name": "Custom Catalogue",
+            "version": 2,
+            "active": true,
+            "options": { "preferLab": true },
+            "tags": ["pantone", "solid"],
+            "PANTONE 185 C": { "cmyk": [0, 1, 0.84, 0] },
+            "PANTONE Black C": [0, 0, 0, 1]
+        }"#;
+        let (lib, stats) = SpotColorLibrary::from_json_catalog_with_report(raw).unwrap();
+        assert_eq!(
+            stats.raw_entries, 2,
+            "only the 2 swatch entries should count"
+        );
+        assert_eq!(stats.parsed, 2);
+        assert_eq!(stats.malformed, 0);
+        assert_eq!(stats.duplicates_in_catalog, 0);
+        assert!(lib.get("PANTONE 185 C").is_some());
+        assert!(lib.get("PANTONE Black C").is_some());
+        assert!(lib.get("name").is_none());
+        assert!(lib.get("version").is_none());
+    }
+
+    #[test]
+    fn bare_map_malformed_entry_still_counted() {
+        // Shape looks like an entry (4-elem array, or object with
+        // `cmyk`) but the values are invalid (NaN, wrong length
+        // inside the cmyk field). These should count as both
+        // `raw_entries` and `malformed`.
+        let raw = r#"{
+            "Bad Array Length": [0, 1, 0.5],
+            "Bad Array Values": [0, 1, "foo", 0],
+            "Bad Object CMYK": { "cmyk": [0, 1, 0.5] },
+            "Good Entry": [0, 0.5, 1, 0]
+        }"#;
+        let (lib, stats) = SpotColorLibrary::from_json_catalog_with_report(raw).unwrap();
+        // "Bad Array Length" has len()==3 → fails is_bare_entry_shape,
+        // counted as metadata (skip). The other two are entry-shaped
+        // but unparseable.
+        assert_eq!(stats.raw_entries, 3);
+        assert_eq!(stats.malformed, 2);
+        assert_eq!(stats.parsed, 1);
+        assert_eq!(stats.duplicates_in_catalog, 0);
+        assert!(lib.get("Good Entry").is_some());
     }
 
     #[test]

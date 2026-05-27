@@ -6,6 +6,7 @@ import { PageNavigator } from "../components/PageNavigator";
 import { RightPanel } from "../components/RightPanel";
 import { SoftProofOverlay } from "../components/SoftProofOverlay";
 import { TemplatePicker } from "../components/TemplatePicker";
+import { KeyboardShortcutsPanel } from "../components/KeyboardShortcutsPanel";
 import {
   TopBar,
   type EditorMode,
@@ -31,6 +32,8 @@ import type {
   SnapGuide,
 } from "../../../shared/scene";
 import { LowResourceBanner } from "../components/LowResourceBanner";
+import { useShortcuts } from "../shortcuts/useShortcuts";
+import type { ShortcutHandlers } from "../shortcuts/useShortcuts";
 import { colors, font, spacing } from "../styles/tokens";
 
 export interface EditorPageProps {
@@ -44,6 +47,15 @@ export type ToolId = "select" | "rect" | "ellipse" | "line" | "text";
 
 const CANVAS_WIDTH = 1024;
 const CANVAS_HEIGHT = 640;
+
+// Envelope header prefixed to the OS clipboard payload by `handleCopy`
+// and stripped by `handlePaste`. Lets the paste path distinguish a
+// KCreate node payload from arbitrary text the user might already
+// have on the clipboard (the header is plain ASCII so a stray paste
+// into a plain-text editor still produces a readable JSON document).
+// Kept at module scope so it isn't recreated on every render — the
+// component body only ever reads it.
+const CLIPBOARD_ENVELOPE_HEADER = "kcreate:clipboard/v1\n";
 
 const DEFAULT_VIEWPORT: ViewportState = { panX: 0, panY: 0, zoom: 1 };
 
@@ -114,6 +126,52 @@ export function EditorPage({
   // project id so re-opening a project skips the picker, but switching
   // projects within one session re-prompts.
   const [templatePickerOpen, setTemplatePickerOpen] = useState<boolean>(false);
+  const [shortcutsPanelOpen, setShortcutsPanelOpen] = useState<boolean>(false);
+  // Phase 6 Task 21-22: hold-to-pan state. `panActive` is true while
+  // the user is holding the bound Space key. We use a state (not just
+  // a ref) so the canvas cursor flips to `grab`/`grabbing` while the
+  // gesture is armed, and we mirror it into `panActiveRef` so the
+  // pointer handler (whose closure is stable across re-renders) can
+  // observe the latest value without depending on it. The keydown
+  // dispatch is gated on `event.repeat` so OS auto-repeat doesn't
+  // re-arm the gesture every frame.
+  const [panActive, setPanActive] = useState<boolean>(false);
+  const panActiveRef = useRef<boolean>(false);
+  useEffect(() => {
+    panActiveRef.current = panActive;
+  }, [panActive]);
+
+  // Defense-in-depth disarm: the hold-to-pan gesture is normally
+  // cleared by the bound keyup, but a user can lose Space-as-keyup
+  // entirely if focus leaves the document mid-hold — alt-tab to
+  // another app, click into a system dialog, drag a file from
+  // outside the window, etc. The keyup never reaches us in those
+  // cases, so we listen for window `blur` and the document's
+  // `visibilitychange` (fires on tab-switch and OS lock-screen) and
+  // clear the gesture proactively. Gated on `panActiveRef.current`
+  // so we don't fire a no-op state update on every focus change.
+  useEffect(() => {
+    const clearPan = (): void => {
+      if (panActiveRef.current) {
+        setPanActive(false);
+      }
+    };
+    const onVisibilityChange = (): void => {
+      if (typeof document !== "undefined" && document.hidden) {
+        clearPan();
+      }
+    };
+    window.addEventListener("blur", clearPan);
+    if (typeof document !== "undefined") {
+      document.addEventListener("visibilitychange", onVisibilityChange);
+    }
+    return () => {
+      window.removeEventListener("blur", clearPan);
+      if (typeof document !== "undefined") {
+        document.removeEventListener("visibilitychange", onVisibilityChange);
+      }
+    };
+  }, []);
   const [layoutPickerShownFor, setLayoutPickerShownFor] = useState<string | null>(
     null,
   );
@@ -122,10 +180,18 @@ export function EditorPage({
     null,
   );
   const lastTickAtRef = useRef<number>(performance.now());
-  // Drag-to-create / drag-to-move state. Storing in a ref keeps the
-  // pointer handler stable while still tracking the current drag.
+  // Drag-to-create / drag-to-move / hold-to-pan state. Storing in a
+  // ref keeps the pointer handler stable while still tracking the
+  // current drag. The `"pan"` kind reuses the same record because
+  // the pointer state-machine (pointerdown / pointermove / pointerup
+  // routing) is identical — only the per-move side effect differs
+  // (translate viewport vs. translate selected node vs. accumulate
+  // creation rect). `lastWorldX`/`lastWorldY` carry *screen* pixels
+  // for pan drags (not world coords) so we can compute panX/panY
+  // deltas without round-tripping through the inverse viewport
+  // transform on every frame.
   const dragStateRef = useRef<{
-    kind: "create" | "move";
+    kind: "create" | "move" | "pan";
     tool: ToolId;
     pointerId: number;
     startWorldX: number;
@@ -137,16 +203,42 @@ export function EditorPage({
     cumulativeDy: number;
   } | null>(null);
 
-  /// `nodes` mirror used inside the canvas pointer handler. The
-  /// handler is wrapped in `useCallback` and we deliberately do NOT
-  /// add `nodes` to its deps array (re-creating the callback on every
-  /// node mutation would cancel any in-flight drag). The ref is the
-  /// idiomatic React workaround for "read latest value inside a
-  /// stable callback".
+  // Phase 6 Tasks 25-26: latest world-space cursor sample. Paste uses
+  // it to position the new subtree near the cursor; we update on every
+  // pointer event (not just down/up) so a stationary cursor over the
+  // canvas still drives a sensible paste origin.
+  const lastCursorWorldRef = useRef<{ x: number; y: number } | null>(null);
+
+  /// `nodes`, `selectedIds`, and `artboards` mirrors used inside
+  /// callbacks that must stay reference-stable. We deliberately do
+  /// NOT add the corresponding state to those callbacks' deps —
+  /// re-creating the callback on every node / selection / artboard
+  /// mutation either cancels an in-flight drag (pointer handler) or
+  /// causes the `useShortcuts` window-listener pair to detach and
+  /// re-attach on every keystroke-relevant state change (clipboard
+  /// handlers). The refs are the idiomatic React workaround for
+  /// "read latest value inside a stable callback".
+  ///
+  /// The listener-churn case is the hot one: without these refs,
+  /// `handleCopy` and `handlePaste` would depend on `nodes` (and
+  /// `selectedIds`, `artboards`), so `shortcutHandlers` would rebuild
+  /// on every node mutation, which in turn drives `useShortcuts`'s
+  /// `useEffect` to detach+attach `keydown` and `keyup` on `window`.
+  /// During a 60fps drag-to-move this fires ~60 times per second
+  /// for no functional reason — every dispatch reads the current
+  /// state via the refs anyway.
   const nodesRef = useRef<NodeInfo[]>(nodes);
   useEffect(() => {
     nodesRef.current = nodes;
   }, [nodes]);
+  const selectedIdsRef = useRef<string[]>(selectedIds);
+  useEffect(() => {
+    selectedIdsRef.current = selectedIds;
+  }, [selectedIds]);
+  const artboardsRef = useRef<ArtboardInfo[]>(artboards);
+  useEffect(() => {
+    artboardsRef.current = artboards;
+  }, [artboards]);
 
   const selectedId: string | null =
     selectedIds.length === 1 ? (selectedIds[0] ?? null) : null;
@@ -619,6 +711,279 @@ export function EditorPage({
     }
   }, []);
 
+  // ------------------------------------------------------------------
+  // Phase 6 Tasks 25-26 — node clipboard.
+  //
+  // Copy:   serialise the current selection through the Rust bridge
+  //         (Page/Artboard ids are filtered out defensively), wrap the
+  //         result in the `CLIPBOARD_ENVELOPE_HEADER` envelope so
+  //         paste can distinguish a KCreate payload from arbitrary
+  //         text the user may have on the OS clipboard, then push to
+  //         `navigator.clipboard`.
+  //
+  // Paste:  read the OS clipboard, validate the envelope, infer the
+  //         destination artboard (artboard owning the first selected
+  //         node, falling back to the first artboard on the active
+  //         page), compute an offset so the top-left of the first
+  //         pasted root lands at the cursor (or at +20,+20 when the
+  //         cursor hasn't been over the canvas yet), and refresh the
+  //         tree / selection so the user sees + can immediately drag
+  //         the pasted nodes.
+  // ------------------------------------------------------------------
+
+  // `handleCopy` reads `selectedIds` and `nodes` via refs so its
+  // identity stays stable across node / selection mutations. This
+  // keeps the `shortcutHandlers` memo (and therefore the
+  // `useShortcuts` window listeners) from churning on every drag
+  // frame — see the `nodesRef` doc comment above.
+  const handleCopy = useCallback(async () => {
+    const selectionSnapshot = selectedIdsRef.current;
+    const nodesSnapshot = nodesRef.current;
+    if (selectionSnapshot.length === 0) return;
+    try {
+      // Filter selected ids that are themselves Pages / Artboards.
+      // The bridge filters defensively too, but doing it here avoids a
+      // surprising "you copied something but the clipboard is empty"
+      // when the user has only top-level container ids selected.
+      const eligible = selectionSnapshot.filter((id) => {
+        const n = nodesSnapshot.find((node) => node.id === id);
+        if (!n) return false;
+        return n.nodeType !== "Page" && n.nodeType !== "Artboard";
+      });
+      if (eligible.length === 0) {
+        setStatusMessage(
+          "nothing copyable in selection (pages and artboards are copied via duplicate)",
+        );
+        return;
+      }
+      const payload = await window.kcreate.clipboard.copy(eligible);
+      const enveloped = CLIPBOARD_ENVELOPE_HEADER + payload;
+      if (typeof navigator !== "undefined" && navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(enveloped);
+      } else {
+        // Headless / pre-Electron-ready boot: stash on window so a
+        // subsequent paste in the same session still works. We never
+        // surface this fallback to the user — it's a defensive belt.
+        (window as unknown as { __kcreateClipboard?: string }).__kcreateClipboard =
+          enveloped;
+      }
+      setStatusMessage(`copied ${eligible.length} node(s)`);
+    } catch (e) {
+      setStatusMessage(`copy failed: ${errorMessage(e)}`);
+    }
+  }, []);
+
+  // `handlePaste` reads `selectedIds`, `nodes`, and `artboards`
+  // via refs for the same listener-churn reason as `handleCopy`.
+  // `refreshTree` is itself reference-stable (its deps closure over
+  // only `setNodes`-class setters which React guarantees stable),
+  // so it can stay in the deps array.
+  const handlePaste = useCallback(async () => {
+    try {
+      const selectionSnapshot = selectedIdsRef.current;
+      const nodesSnapshot = nodesRef.current;
+      const artboardsSnapshot = artboardsRef.current;
+      let enveloped: string | undefined;
+      if (typeof navigator !== "undefined" && navigator.clipboard?.readText) {
+        try {
+          enveloped = await navigator.clipboard.readText();
+        } catch {
+          // Read can throw if the document isn't focused; fall back to
+          // the in-session stash below.
+        }
+      }
+      if (!enveloped) {
+        enveloped = (window as unknown as { __kcreateClipboard?: string })
+          .__kcreateClipboard;
+      }
+      if (!enveloped || !enveloped.startsWith(CLIPBOARD_ENVELOPE_HEADER)) {
+        setStatusMessage("clipboard is empty or not a KCreate payload");
+        return;
+      }
+      const payload = enveloped.slice(CLIPBOARD_ENVELOPE_HEADER.length);
+
+      // Resolve target artboard: the artboard owning the first
+      // selection if any, otherwise the first artboard on the page.
+      let targetArtboard: string | null = null;
+      if (selectionSnapshot.length > 0) {
+        const first = nodesSnapshot.find((n) => n.id === selectionSnapshot[0]);
+        // Walk up to find an Artboard ancestor.
+        let cursor: NodeInfo | undefined = first;
+        while (cursor && cursor.nodeType !== "Artboard") {
+          cursor = cursor.parentId
+            ? nodesSnapshot.find((n) => n.id === cursor!.parentId)
+            : undefined;
+        }
+        if (cursor && cursor.nodeType === "Artboard") {
+          targetArtboard = cursor.id;
+        }
+      }
+      if (!targetArtboard) {
+        targetArtboard = artboardsSnapshot[0]?.id ?? null;
+      }
+      if (!targetArtboard) {
+        setStatusMessage("no artboard to paste into");
+        return;
+      }
+
+      // Compute (offset_x, offset_y) so the first pasted root lands
+      // at the cursor (or at +20,+20 when we have no cursor sample).
+      let offsetX = 20;
+      let offsetY = 20;
+      try {
+        const parsed = JSON.parse(payload) as {
+          subtrees?: { nodes?: { bounds?: { x?: number; y?: number } }[] }[];
+        };
+        const firstRoot = parsed.subtrees?.[0]?.nodes?.[0]?.bounds;
+        const cursorWorld = lastCursorWorldRef.current;
+        if (
+          firstRoot &&
+          typeof firstRoot.x === "number" &&
+          typeof firstRoot.y === "number" &&
+          cursorWorld
+        ) {
+          offsetX = cursorWorld.x - firstRoot.x;
+          offsetY = cursorWorld.y - firstRoot.y;
+        }
+      } catch {
+        // Malformed payload — let the bridge surface the real error
+        // when paste runs. We keep the (+20,+20) fallback so the user
+        // still gets visible feedback if Rust accepts it.
+      }
+
+      const newRoots = await window.kcreate.clipboard.paste(
+        payload,
+        targetArtboard,
+        offsetX,
+        offsetY,
+      );
+      await refreshTree();
+      if (newRoots.length > 0) {
+        await window.kcreate.canvas.setSelection(newRoots);
+        setSelectedIds(newRoots);
+      }
+      setStatusMessage(`pasted ${newRoots.length} node(s)`);
+    } catch (e) {
+      setStatusMessage(`paste failed: ${errorMessage(e)}`);
+    }
+  }, [refreshTree]);
+
+  // ------------------------------------------------------------------
+  // Phase 6 Task 25 — drag-and-drop from the OS file manager.
+  //
+  // We accept the three formats that have a clean bridge entry point:
+  //   * raster images (PNG / JPEG / WebP / GIF) → canvas.importImage
+  //     (path) or canvas.importImageBytes (sandboxed File only)
+  //   * SVG                                     → canvas.importImage
+  //     (delegates to the SVG path; the bridge's `document_import_image`
+  //     sniffs the magic and routes to the SVG ingest path)
+  //   * PDF                                     → pdfImport.importPdf
+  // Anything else falls through with a status message rather than a
+  // silent no-op.
+  //
+  // Electron's File objects carry an absolute `path`; the bridge takes
+  // file paths so we route through `importImage` directly when path
+  // is present. As a defensive fallback (e.g., when a non-Electron
+  // dev build is hosting the renderer), we read the bytes and call
+  // `importImageBytes` instead — that one accepts raster only.
+  // ------------------------------------------------------------------
+
+  const handleCanvasDragOver = useCallback(
+    (e: React.DragEvent<HTMLElement>): void => {
+      if (e.dataTransfer.types.includes("Files")) {
+        e.preventDefault();
+        // Set the drop effect so the OS shows the "copy" cursor.
+        e.dataTransfer.dropEffect = "copy";
+      }
+    },
+    [],
+  );
+
+  const handleCanvasDrop = useCallback(
+    (e: React.DragEvent<HTMLElement>): void => {
+      if (!e.dataTransfer.files || e.dataTransfer.files.length === 0) return;
+      e.preventDefault();
+      const target = artboards[0]?.id ?? null;
+      if (!target) {
+        setStatusMessage("no artboard available — drop ignored");
+        return;
+      }
+      const files = Array.from(e.dataTransfer.files);
+      void (async () => {
+        let imported = 0;
+        const errors: string[] = [];
+        for (const f of files) {
+          // Electron's File exposes an absolute path. Bare-browser File
+          // does not — fall back to `arrayBuffer` + importImageBytes.
+          const path = (f as unknown as { path?: string }).path;
+          try {
+            const lower = f.name.toLowerCase();
+            if (lower.endsWith(".pdf")) {
+              if (!path) {
+                errors.push(`${f.name}: PDF import requires a file path`);
+                continue;
+              }
+              await window.kcreate.pdfImport.importPdf(path);
+              imported += 1;
+              continue;
+            }
+            if (
+              path &&
+              (lower.endsWith(".png") ||
+                lower.endsWith(".jpg") ||
+                lower.endsWith(".jpeg") ||
+                lower.endsWith(".webp") ||
+                lower.endsWith(".gif") ||
+                lower.endsWith(".svg"))
+            ) {
+              await window.kcreate.canvas.importImage(target, path);
+              imported += 1;
+              continue;
+            }
+            if (
+              lower.endsWith(".png") ||
+              lower.endsWith(".jpg") ||
+              lower.endsWith(".jpeg") ||
+              lower.endsWith(".webp") ||
+              lower.endsWith(".gif")
+            ) {
+              const buf = await f.arrayBuffer();
+              await window.kcreate.canvas.importImageBytes(
+                target,
+                new Uint8Array(buf),
+              );
+              imported += 1;
+              continue;
+            }
+            // SVG cannot go through importImageBytes because the
+            // vector importer (usvg in kcreate_vector) requires a
+            // filesystem path for relative-href resolution. Drop a
+            // helpful message so the user knows to save and reopen
+            // (or run in Electron) instead of silently failing.
+            if (lower.endsWith(".svg")) {
+              errors.push(
+                `${f.name}: SVG drag-drop requires a file path (save the file and use File \u2192 Import, or use the Electron build)`,
+              );
+              continue;
+            }
+            errors.push(`${f.name}: unsupported file type`);
+          } catch (err) {
+            errors.push(`${f.name}: ${errorMessage(err)}`);
+          }
+        }
+        await refreshTree();
+        if (errors.length === 0) {
+          setStatusMessage(`imported ${imported} file(s)`);
+        } else {
+          setStatusMessage(
+            `imported ${imported} file(s); ${errors.length} failed: ${errors.join("; ")}`,
+          );
+        }
+      })();
+    },
+    [artboards, refreshTree],
+  );
+
   const handleSelect = useCallback(
     async (id: string | null) => {
       try {
@@ -822,87 +1187,111 @@ export function EditorPage({
     };
   }, [selectedIds, activeSessionPeerId]);
 
-  // Keyboard shortcuts. Scoped to the editor page; the canvas itself
-  // is non-focusable so window-level listeners are the right place.
-  useEffect(() => {
-    const onKeyDown = (e: KeyboardEvent): void => {
-      // Skip shortcuts when the user is typing in an input/textarea —
-      // otherwise hitting "R" inside a name field would silently switch
-      // tools.
-      const target = e.target as HTMLElement | null;
-      const tag = target?.tagName?.toLowerCase();
-      const isEditable =
-        tag === "input" ||
-        tag === "textarea" ||
-        tag === "select" ||
-        (target?.isContentEditable ?? false);
-      if (isEditable) return;
-
-      const mod = e.ctrlKey || e.metaKey;
-      // Undo / redo
-      if (mod && !e.shiftKey && e.key.toLowerCase() === "z") {
+  // Keyboard shortcuts. Routed through the user-overridable
+  // registry (`src/shortcuts/registry.ts`). Tool-switch actions are
+  // gated by the active mode so e.g. "R" in a mode that doesn't
+  // expose the rectangle tool stays a no-op instead of switching
+  // to a tool that isn't in the palette.
+  const tryTool = useCallback(
+    (next: ToolId, e: KeyboardEvent) => {
+      const tools = toolsForMode(mode);
+      if (!tools.includes(next)) return;
+      e.preventDefault();
+      setTool(next);
+    },
+    [mode],
+  );
+  const shortcutHandlers = useMemo<ShortcutHandlers>(
+    () => ({
+      undo: (e) => {
         e.preventDefault();
         void handleUndo();
-        return;
-      }
-      if (
-        (mod && e.shiftKey && e.key.toLowerCase() === "z") ||
-        (mod && e.key.toLowerCase() === "y")
-      ) {
+      },
+      redo: (e) => {
         e.preventDefault();
         void handleRedo();
-        return;
-      }
-      // Select all
-      if (mod && e.key.toLowerCase() === "a") {
+      },
+      redoAlt: (e) => {
+        e.preventDefault();
+        void handleRedo();
+      },
+      selectAll: (e) => {
         e.preventDefault();
         void handleSelectAll();
-        return;
-      }
-      // Delete selection
-      if ((e.key === "Delete" || e.key === "Backspace") && !mod) {
+      },
+      deleteSelection: (e) => {
         e.preventDefault();
         void handleDeleteSelected();
-        return;
-      }
-      // Escape — drop selection
-      if (e.key === "Escape") {
+      },
+      // macOS regression fix: Backspace is the physical "delete"
+      // key on Apple keyboards. We dispatch through the same
+      // handler so a future change to deletion semantics only has
+      // one call site to update.
+      deleteSelectionAlt: (e) => {
+        e.preventDefault();
+        void handleDeleteSelected();
+      },
+      clearSelection: (e) => {
         e.preventDefault();
         void handleClearSelection();
-        return;
-      }
-      // Tool switches. Only single-key, no modifiers.
-      if (!mod && !e.altKey && !e.shiftKey && e.key.length === 1) {
-        const k = e.key.toLowerCase();
-        const tools = toolsForMode(mode);
-        const next: ToolId | null =
-          k === "v"
-            ? "select"
-            : k === "r"
-              ? "rect"
-              : k === "e"
-                ? "ellipse"
-                : k === "l"
-                  ? "line"
-                  : k === "t"
-                    ? "text"
-                    : null;
-        if (next && tools.includes(next)) {
+      },
+      toolSelect: (e) => tryTool("select", e),
+      toolRect: (e) => tryTool("rect", e),
+      toolEllipse: (e) => tryTool("ellipse", e),
+      toolLine: (e) => tryTool("line", e),
+      toolText: (e) => tryTool("text", e),
+      // Hold-to-pan: object-form handler so `useShortcuts`
+      // dispatches both phases. `event.repeat` guards against OS
+      // auto-repeat re-arming the gesture every frame, and we
+      // preventDefault on keydown so Space doesn't scroll the page
+      // through any host-page handler that survived our event
+      // gating. Keyup unconditionally disarms — if a third party
+      // (e.g. losing window focus) leaves us armed, the next Space
+      // press will re-arm and the next release will clear it.
+      togglePan: {
+        onKeyDown: (e) => {
+          if (e.repeat) return;
           e.preventDefault();
-          setTool(next);
-        }
-      }
-    };
-    window.addEventListener("keydown", onKeyDown);
-    return () => window.removeEventListener("keydown", onKeyDown);
-  }, [
-    handleUndo,
-    handleRedo,
-    handleSelectAll,
-    handleDeleteSelected,
-    handleClearSelection,
-    mode,
-  ]);
+          setPanActive(true);
+        },
+        onKeyUp: (e) => {
+          e.preventDefault();
+          setPanActive(false);
+        },
+      },
+      // Switching to Export mode swaps the right panel to the
+      // ExportPanel via `defaultPanelForMode` — that's the same
+      // surface the TopBar's "Export" mode tab opens, so the
+      // shortcut and the UI button stay lockstep.
+      openExport: (e) => {
+        e.preventDefault();
+        setMode("export");
+      },
+      openShortcutsPanel: (e) => {
+        e.preventDefault();
+        setShortcutsPanelOpen((open) => !open);
+      },
+      copy: (e) => {
+        e.preventDefault();
+        void handleCopy();
+      },
+      paste: (e) => {
+        e.preventDefault();
+        void handlePaste();
+      },
+    }),
+    [
+      handleUndo,
+      handleRedo,
+      handleSelectAll,
+      handleDeleteSelected,
+      handleClearSelection,
+      handleCopy,
+      handlePaste,
+      tryTool,
+    ],
+  );
+  useShortcuts(shortcutHandlers);
 
   // Map screen→world. The renderer reads pan/zoom directly so the same
   // formula is used both for the wheel-zoom anchor (inside CanvasHost)
@@ -931,6 +1320,9 @@ export function EditorPage({
       const sx = e.clientX - rect.left;
       const sy = e.clientY - rect.top;
       const { x: wx, y: wy } = screenToWorld(sx, sy);
+      // Phase 6 Tasks 25-26: latest world-space cursor sample drives
+      // paste-at-cursor.
+      lastCursorWorldRef.current = { x: wx, y: wy };
       // Capture the viewport snapshot at pointer-down time. The Rust
       // hit-test wants screen coordinates plus the viewport so it can
       // run the screen→world transform once — if we pre-transformed
@@ -939,6 +1331,29 @@ export function EditorPage({
       const vp = viewport;
 
       if (e.type === "pointerdown") {
+        // Hold-to-pan beats every tool — if the user is holding the
+        // pan key, treat the drag as a viewport translation instead
+        // of hit-testing or creating geometry. We commit the
+        // viewport delta on every pointermove (no batching) because
+        // pan is a transient visual effect; there's no op-log
+        // entry, so we don't worry about coarsening like we do for
+        // node moves.
+        if (panActiveRef.current) {
+          canvasEl.setPointerCapture(pointerId);
+          dragStateRef.current = {
+            kind: "pan",
+            tool,
+            pointerId,
+            startWorldX: sx,
+            startWorldY: sy,
+            lastWorldX: sx,
+            lastWorldY: sy,
+            movingNodeId: null,
+            cumulativeDx: 0,
+            cumulativeDy: 0,
+          };
+          return;
+        }
         if (tool === "select") {
           // Click-to-select: hit-test, then either start a move drag or
           // clear selection. The bridge does the screen→world transform
@@ -1000,6 +1415,23 @@ export function EditorPage({
       if (e.type === "pointermove") {
         const drag = dragStateRef.current;
         if (!drag || drag.pointerId !== e.pointerId) return;
+        if (drag.kind === "pan") {
+          // Translate the viewport by the screen-space delta since
+          // the last sample. We work in screen pixels (not world
+          // units) on purpose: panning *is* the screen→world
+          // translation we'd otherwise compute, so re-deriving it
+          // would just be `delta_screen / zoom * zoom = delta_screen`.
+          const dx = sx - drag.lastWorldX;
+          const dy = sy - drag.lastWorldY;
+          drag.lastWorldX = sx;
+          drag.lastWorldY = sy;
+          setViewport((v) => ({
+            ...v,
+            panX: v.panX + dx,
+            panY: v.panY + dy,
+          }));
+          return;
+        }
         if (drag.kind === "move" && drag.movingNodeId) {
           const dx = wx - drag.lastWorldX;
           const dy = wy - drag.lastWorldY;
@@ -1070,6 +1502,13 @@ export function EditorPage({
         // Clear smart-guides — the drag is done, so any displayed
         // guide lines belong to a stale candidate position.
         setSnapGuides([]);
+        if (drag.kind === "pan") {
+          // Pan drags don't write to the op log or touch the
+          // document — there's nothing to commit on release. The
+          // viewport has already been mutated incrementally on each
+          // pointermove sample.
+          return;
+        }
         if (drag.kind === "move" && drag.movingNodeId) {
           if (drag.cumulativeDx !== 0 || drag.cumulativeDy !== 0) {
             void (async () => {
@@ -1176,7 +1615,17 @@ export function EditorPage({
   // Image mode focuses on AI Assist; Export mode focuses on Export
   // presets; everything else lands on the properties inspector.
   const rightPanelFocus = defaultPanelForMode(mode);
-  const cursor = TOOL_CURSORS[tool];
+  // Hold-to-pan flips the canvas cursor to `grab` while armed and
+  // `grabbing` while the pan drag is in flight. `grabbing` is keyed
+  // off the live drag-state ref (not panActive) so a release of the
+  // pointer button without releasing the key drops back to `grab`
+  // immediately. Falls back to the per-tool cursor when the gesture
+  // isn't armed.
+  const cursor = panActive
+    ? dragStateRef.current?.kind === "pan"
+      ? "grabbing"
+      : "grab"
+    : TOOL_CURSORS[tool];
 
   return (
     <div
@@ -1295,6 +1744,30 @@ export function EditorPage({
               }
             })();
           }}
+          onSelectMany={(ids) => {
+            void (async () => {
+              try {
+                await window.kcreate.canvas.setSelection(ids);
+                await refreshSelection();
+              } catch (err) {
+                setStatusMessage(
+                  `select group failed: ${errorMessage(err)}`,
+                );
+              }
+            })();
+          }}
+          onSetLayerColor={(id, color) => {
+            void (async () => {
+              try {
+                await window.kcreate.document.setLayerColor(id, color);
+                await refreshTree();
+              } catch (err) {
+                setStatusMessage(
+                  `set layer colour failed: ${errorMessage(err)}`,
+                );
+              }
+            })();
+          }}
           artboards={artboards}
           onRequestCreateArtboard={() => setArtboardDialogOpen(true)}
           onFocusArtboard={focusArtboard}
@@ -1330,6 +1803,8 @@ export function EditorPage({
           onDesignSystemStatus={setStatusMessage}
         />
         <main
+          onDragOver={handleCanvasDragOver}
+          onDrop={handleCanvasDrop}
           style={{
             position: "relative",
             background: colors.bgCanvas,
@@ -1522,6 +1997,40 @@ export function EditorPage({
         }}
         onStatus={setStatusMessage}
       />
+      {shortcutsPanelOpen ? (
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-label="Keyboard shortcuts"
+          onClick={(e) => {
+            if (e.target === e.currentTarget) {
+              setShortcutsPanelOpen(false);
+            }
+          }}
+          style={{
+            position: "fixed",
+            inset: 0,
+            background: "rgba(17, 24, 39, 0.45)",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            zIndex: 50,
+          }}
+        >
+          <div
+            style={{
+              width: "min(720px, 90vw)",
+              maxHeight: "80vh",
+              overflowY: "auto",
+              background: colors.bg,
+              borderRadius: 12,
+              boxShadow: "0 12px 32px rgba(0, 0, 0, 0.24)",
+            }}
+          >
+            <KeyboardShortcutsPanel onStatus={setStatusMessage} />
+          </div>
+        </div>
+      ) : null}
     </div>
   );
 }

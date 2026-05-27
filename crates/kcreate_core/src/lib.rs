@@ -28,14 +28,15 @@ pub mod component;
 pub mod config;
 pub mod document;
 pub mod icc;
+pub mod marketplace;
 pub mod node;
 pub mod operation;
 pub mod project;
 
 pub use color::{
     cmyk_to_srgb, color_distance_cie76, hsl_to_srgb, lab_to_srgb, linear_to_srgb, srgb_to_cmyk,
-    srgb_to_hsl, srgb_to_lab, srgb_to_linear, srgb_to_xyz_d65, xyz_d65_to_srgb, Color,
-    ColorSettings, IccProfile, RenderingIntent,
+    srgb_to_hsl, srgb_to_lab, srgb_to_linear, srgb_to_xyz_d65, xyz_d65_to_srgb, CatalogParseStats,
+    Color, ColorSettings, IccProfile, RenderingIntent,
 };
 pub use component::{
     ComponentDefinition, ComponentError, ComponentInstance, ComponentVariant,
@@ -44,6 +45,7 @@ pub use component::{
 pub use config::{DeviceTier, Platform, RuntimeConfig};
 pub use document::{DocumentError, DocumentGraph};
 pub use icc::{cmyk_to_srgb_profiled, convert_color, srgb_to_cmyk_profiled, ColorTransform};
+pub use marketplace::{LocalMarketplace, MarketplaceError, TemplateManifest, TemplateSource};
 pub use node::{
     standard_presets, ArtboardPreset, BlendMode, Bounds, Constraint, Constraints, Effect,
     FillStyle, FrameInsets, GradientKind, GradientStop, Interaction, InteractionAction,

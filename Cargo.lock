@@ -1479,15 +1479,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "kcreate_audit"
+version = "0.0.1"
+dependencies = [
+ "chrono",
+ "kcreate_core",
+ "log",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "uuid",
+]
+
+[[package]]
 name = "kcreate_bridge"
 version = "0.0.1"
 dependencies = [
  "base64",
+ "blake3",
  "chrono",
  "criterion",
  "ed25519-dalek",
  "image 0.25.10",
  "kcreate_ai",
+ "kcreate_audit",
  "kcreate_collab",
  "kcreate_collab_transport",
  "kcreate_core",
@@ -1517,6 +1534,7 @@ dependencies = [
  "tracing",
  "uuid",
  "wat",
+ "zip",
 ]
 
 [[package]]
@@ -1570,6 +1588,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sys-info",
+ "tempfile",
  "thiserror 1.0.69",
  "uuid",
 ]
@@ -1713,7 +1732,10 @@ name = "kcreate_tests"
 version = "0.0.1"
 dependencies = [
  "base64",
+ "chrono",
  "kcreate_ai",
+ "kcreate_audit",
+ "kcreate_collab",
  "kcreate_core",
  "kcreate_export",
  "kcreate_mcp",

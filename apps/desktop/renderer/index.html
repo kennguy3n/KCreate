@@ -8,15 +8,90 @@
       :root {
         --kc-accent: #7C3AED;
         --kc-accent-hover: #6D28D9;
+        /* Low-alpha accent tint used as soft chip / pill backgrounds
+           (PluginManager WASM tag, ScreenshotToLayout drop zone).
+           Replaces the prior `${colors.accent}22` template-string
+           concat, which silently produced an invalid CSS value
+           because `colors.accent` is itself a `var(--kc-accent)`
+           reference, not a hex literal. Channel-baked alphas keep the
+           theme switch transparent. */
+        --kc-accent-bg-soft: rgba(124, 58, 237, 0.13);
+        /* Mid-alpha accent halo used as focus ring / selection
+           outline (TemplatePicker selected card). Replaces
+           `${colors.accent}33`. */
+        --kc-accent-ring: rgba(124, 58, 237, 0.20);
         --kc-bg: #FFFFFF;
         --kc-bg-soft: #F5F3FF;
         --kc-bg-canvas: #1e1e1e;
         --kc-border: #E5E7EB;
         --kc-text: #111827;
         --kc-text-muted: #4B5563;
+        --kc-text-inverse: #FFFFFF;
+        --kc-success: #16A34A;
+        --kc-danger: #DC2626;
+        --kc-danger-bg: #FEE2E2;
+        --kc-danger-bg-soft: rgba(220, 38, 38, 0.08);
+        /* Mid-alpha danger border used to outline destructive
+           callout cards (McpSettingsPanel "MCP off" notice).
+           Replaces `${colors.danger}44`. */
+        --kc-danger-border: rgba(220, 38, 38, 0.27);
+        /* High-alpha danger pill used as a translucent overlay so
+           the underlying canvas / prototype content bleeds through
+           (PrototypePlayer error toast). Intentionally not the same
+           as `--kc-danger`, which is fully opaque — the overlay
+           contract requires showing what's behind the pill so the
+           user can still read the canvas while the error is up. */
+        --kc-danger-overlay: rgba(220, 38, 38, 0.85);
+        --kc-warn: #D97706;
+        --kc-warn-bg: #FEF3C7;
+        --kc-warn-bg-soft: rgba(217, 119, 6, 0.12);
+        --kc-info: #2563EB;
+        --kc-info-bg: #DBEAFE;
         --kc-shadow: 0 1px 3px rgba(0, 0, 0, 0.08);
+        --kc-shadow-hover: 0 4px 12px rgba(124, 58, 237, 0.18);
         --kc-radius: 12px;
         --kc-radius-pill: 9999px;
+        color-scheme: light;
+      }
+      /* Phase 6 Tasks 23-24: dark theme override. The
+         `ThemeProvider` writes `data-theme="dark"` to the root
+         element when the user toggles dark mode; every CSS variable
+         the renderer reads from is redefined here so existing
+         `var(--kc-*)` references just work without code changes. */
+      :root[data-theme="dark"] {
+        --kc-accent: #7C3AED;
+        --kc-accent-hover: #6D28D9;
+        /* Dark-mode accent tints. Slightly higher alpha than light
+           mode so the tint stays legible against the darker
+           substrate; the accent hue itself is unchanged. */
+        --kc-accent-bg-soft: rgba(124, 58, 237, 0.22);
+        --kc-accent-ring: rgba(124, 58, 237, 0.35);
+        --kc-bg: #1F2937;
+        --kc-bg-soft: #374151;
+        --kc-bg-canvas: #111827;
+        --kc-border: #4B5563;
+        --kc-text: #F9FAFB;
+        --kc-text-muted: #9CA3AF;
+        --kc-text-inverse: #111827;
+        --kc-success: #22C55E;
+        --kc-danger: #EF4444;
+        --kc-danger-bg: rgba(239, 68, 68, 0.18);
+        --kc-danger-bg-soft: rgba(239, 68, 68, 0.10);
+        /* Dark-mode danger border uses the dark `--kc-danger` hue
+           (#EF4444) at a comparable alpha to the light variant. */
+        --kc-danger-border: rgba(239, 68, 68, 0.40);
+        /* Dark-mode error pill overlay: same 0.85 alpha contract as
+           light mode, swapped to the brighter `#EF4444` hue so the
+           pill stays legible against the darker canvas substrate. */
+        --kc-danger-overlay: rgba(239, 68, 68, 0.85);
+        --kc-warn: #FBBF24;
+        --kc-warn-bg: rgba(251, 191, 36, 0.18);
+        --kc-warn-bg-soft: rgba(251, 191, 36, 0.10);
+        --kc-info: #60A5FA;
+        --kc-info-bg: rgba(96, 165, 250, 0.18);
+        --kc-shadow: 0 1px 3px rgba(0, 0, 0, 0.45);
+        --kc-shadow-hover: 0 4px 12px rgba(124, 58, 237, 0.45);
+        color-scheme: dark;
       }
       html, body {
         margin: 0;

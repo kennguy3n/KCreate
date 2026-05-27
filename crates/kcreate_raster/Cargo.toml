@@ -25,3 +25,7 @@ criterion.workspace = true
 [[bench]]
 name = "tile_ops"
 harness = false
+
+[[bench]]
+name = "raster_open_64mp"
+harness = false

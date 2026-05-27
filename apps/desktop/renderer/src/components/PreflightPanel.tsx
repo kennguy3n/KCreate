@@ -433,9 +433,9 @@ const inputStyle = {
 } as const;
 
 function severityColor(s: string): string {
-  if (s === "error") return "#DC2626";
-  if (s === "warning") return "#D97706";
-  if (s === "info") return "#2563EB";
+  if (s === "error") return colors.danger;
+  if (s === "warning") return colors.warn;
+  if (s === "info") return colors.info;
   return colors.textMuted;
 }
 
@@ -457,6 +457,10 @@ function labelForCheck(id: string): string {
       return "Image resolution";
     case "color_space":
       return "Color space";
+    case "overprint_table":
+      return "Overprint table";
+    case "trapping":
+      return "Trapping";
     case "transparency":
       return "Transparency";
     case "page_size":
@@ -465,6 +469,10 @@ function labelForCheck(id: string): string {
       return "Shading pattern";
     case "total_ink_coverage":
       return "Total ink coverage";
+    case "bleed_area_empty":
+      return "Bleed area empty";
+    case "spot_color_missing":
+      return "Spot color missing";
     default:
       return id;
   }

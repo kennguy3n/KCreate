@@ -1,0 +1,16 @@
+{
+  "name": "Pantone Solid Coated (Subset)",
+  "library_reference": "PANTONE Solid Coated",
+  "description": "Canonical subset of Pantone Solid Coated swatches used by the KCreate preflight integration tests. CMYK fallback values are sourced from the Pantone Color Bridge Guide (Coated) publicly documented conversions and clamped to [0,1].",
+  "entries": [
+    { "id": "PANTONE Yellow C",        "display_name": "Pantone Yellow C",        "cmyk": [0.00, 0.00, 1.00, 0.00] },
+    { "id": "PANTONE 185 C",           "display_name": "Pantone 185 C",           "cmyk": [0.00, 0.91, 0.76, 0.00] },
+    { "id": "PANTONE Reflex Blue C",   "display_name": "Pantone Reflex Blue C",   "cmyk": [1.00, 0.72, 0.00, 0.06] },
+    { "id": "PANTONE 2945 C",          "display_name": "Pantone 2945 C",          "cmyk": [1.00, 0.55, 0.00, 0.10] },
+    { "id": "PANTONE Warm Red C",      "display_name": "Pantone Warm Red C",      "cmyk": [0.00, 0.78, 0.78, 0.00] },
+    { "id": "PANTONE Cool Gray 9 C",   "display_name": "Pantone Cool Gray 9 C",   "cmyk": [0.30, 0.22, 0.17, 0.57] },
+    { "id": "PANTONE 354 C",           "display_name": "Pantone 354 C",           "cmyk": [0.85, 0.00, 1.00, 0.00] },
+    { "id": "PANTONE Process Black C", "display_name": "Pantone Process Black C", "cmyk": [0.00, 0.00, 0.00, 1.00] },
+    { "id": "PANTONE 877 C",           "display_name": "Pantone 877 C (Silver)",  "cmyk": [0.00, 0.00, 0.00, 0.45], "library_reference": "PANTONE Metallic Coated" }
+  ]
+}

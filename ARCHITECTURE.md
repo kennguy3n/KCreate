@@ -893,10 +893,16 @@ crates/
 │                        # ephemeral cert pinning, frame codec). Only
 │                        # networked crate; opted-in via `collab` feature
 │                        # on `kcreate_bridge`.                                               [EXISTS]
-└── kcreate_kchat/       # Dev-side KChat group membership issuer.
-                         # Mints test attestations against deterministic
-                         # Ed25519 keys. Behind the `kchat-dev-issuer`
-                         # bridge feature flag.                                              [EXISTS]
+├── kcreate_kchat/       # Dev-side KChat group membership issuer.
+│                        # Mints test attestations against deterministic
+│                        # Ed25519 keys. Behind the `kchat-dev-issuer`
+│                        # bridge feature flag.                                              [EXISTS]
+└── kcreate_audit/       # Phase 6 audit trail: append-only operation +
+                         # AI-action log persisted to a SEPARATE SQLite
+                         # database from the project DB. Structured
+                         # queries by date / action / node, surfaced
+                         # through `kcreate_bridge::audit` and the
+                         # renderer `AuditPanel.tsx`.                                        [EXISTS]
 ```
 
 Also shipped under `tools/`:
@@ -908,12 +914,11 @@ tools/
                          # `kcreate_ai::image_gen`, never networked).                       [EXISTS]
 ```
 
-Planned (Phase 5+):
-
-```
-crates/
-└── kcreate_audit/       # operation log persistence, AI action audit
-```
+`kcreate_audit` shipped as part of Phase 6 (PR #16) and is wired into
+the rest of the workspace via `kcreate_bridge::audit`. It writes to a
+**separate** SQLite database from the project DB (so audit history
+survives `project_close` and project deletion) and exposes
+structured queries by date / action / node.
 
 ### What is built vs. planned
 
@@ -988,6 +993,26 @@ crates/
 | Slice export                 | Built (Phase 5) | `crates/kcreate_export/src/slice.rs`          |
 | Spot colors + overprint      | Built (Phase 5) | `kcreate_core::color::{Color::Spot, SpotColorLibrary, Overprint}` |
 | Spot color missing preflight | Built (Phase 5) | `crates/kcreate_export/src/preflight.rs` (`PreflightCheck::SpotColorMissing`) |
+| Operational CRDT layer       | Built (Phase 3 / PR #16) | `crates/kcreate_collab/src/crdt.rs` (`OpKind`, per-field merge, move tie-break, delete-wins) |
+| Spot color JSON catalog loader | Built (Phase 3 / PR #16) | `kcreate_core::color::SpotColorLibrary::load_catalog` |
+| Overprint table + trapping preflight | Built (Phase 3 / PR #16) | `crates/kcreate_export/src/preflight.rs` (`PreflightCheck::Overprint`, `Trapping`) |
+| PDF overprint ExtGState      | Built (Phase 3 / PR #16) | `crates/kcreate_export/src/pdf.rs` |
+| Spot color library panel     | Built (Phase 3 / PR #16) | `apps/desktop/renderer/src/components/SpotColorLibraryPanel.tsx` |
+| Model pack installer + hash gate | Built (Phase 3 / PR #16) | `crates/kcreate_ai/src/model_registry.rs` (`install_model_pack`) |
+| ESRGAN ONNX upscale backend  | Built (Phase 3 / PR #16) | `crates/kcreate_ai/src/upscale.rs` (ONNX path) |
+| SAM segmentation             | Built (Phase 3 / PR #16) | `crates/kcreate_ai/src/segment.rs` |
+| Local template marketplace   | Built (Phase 3 / PR #16) | `crates/kcreate_core/src/marketplace.rs` + `apps/desktop/renderer/src/components/TemplateMarketplace.tsx` |
+| Audit trail crate            | Built (Phase 6 / PR #16) | `crates/kcreate_audit/src/{event,store}.rs` (separate SQLite DB) |
+| Audit bridge + panel         | Built (Phase 6 / PR #16) | `crates/kcreate_bridge/src/audit.rs` + `apps/desktop/renderer/src/components/AuditPanel.tsx` |
+| Undo grouping + atomic rollback | Built (Phase 6 / PR #16) | `crates/kcreate_bridge/src/document.rs` (`ApplyPatchSnapshot`, `APPLY_PATCH_COMMANDS`) |
+| Lazy thumbnail generation    | Built (Phase 6 / PR #16) | `crates/kcreate_bridge/src/thumbnails.rs` (coalescing background pre-warm, content-hash cache) |
+| Figma + Sketch importers     | Built (Phase 6 / PR #16) | `crates/kcreate_export/src/{figma_import,sketch_import}.rs` |
+| Keyboard shortcut registry   | Built (Phase 6 / PR #16) | `apps/desktop/renderer/src/shortcuts/{registry,useShortcuts}.ts` + `KeyboardShortcutsPanel.tsx` |
+| Theme system (CSS-variable driven) | Built (Phase 6 / PR #16) | `apps/desktop/renderer/index.html` (`:root[data-theme="dark"]`) + `src/styles/{tokens.ts,ThemeProvider.tsx}` |
+| Drag-and-drop + clipboard    | Built (Phase 6 / PR #16) | `apps/desktop/renderer/src/pages/EditorPage.tsx` + `crates/kcreate_bridge/src/document.rs` (`clipboard_paste` op) |
+| Layer panel search + tagging | Built (Phase 6 / PR #16) | `apps/desktop/renderer/src/components/LayerPanel.tsx` + `layer_color_set` op |
+| E2E workflow tests           | Built (Phase 6 / PR #16) | `crates/kcreate_tests/tests/e2e_workflow.rs` |
+| Acceptance-criteria benchmarks | Built (Phase 6 / PR #16) | `crates/kcreate_export/benches/batch_50_assets.rs` + `crates/kcreate_renderer/benches/{cold_start,viewport_pan,raster_open_64mp}.rs` |
 
 ### Recommended Rust dependencies
 

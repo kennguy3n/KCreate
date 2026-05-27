@@ -324,11 +324,11 @@ function StatusBadge({ status }: { status: LlmStatus | null }): JSX.Element {
   const state = status?.state ?? "stopped";
   const color =
     state === "ready"
-      ? "#0F766E"
+      ? colors.success
       : state === "starting"
         ? colors.accent
         : state === "error"
-          ? "#DC2626"
+          ? colors.danger
           : colors.textMuted;
   return (
     <span

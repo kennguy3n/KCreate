@@ -466,7 +466,7 @@ const mutedText: React.CSSProperties = {
 };
 
 const errorText: React.CSSProperties = {
-  color: "#DC2626",
+  color: colors.danger,
   fontSize: 12,
   margin: 0,
 };

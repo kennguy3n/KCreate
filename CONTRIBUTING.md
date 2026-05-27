@@ -40,6 +40,14 @@ rasterizer if no Vulkan adapter is available, so headless containers
 work too — the GPU deps are optional for tests but required for the
 desktop app.
 
+**Wayland note.** Wayland sessions are declined gracefully — when the
+compositor refuses a window surface (no XDG / X11 bridge available)
+the renderer transparently falls back to the offscreen presenter and
+the canvas still paints via the `putImageData` IPC path. X11 (`xcb`)
+is the recommended display server for the desktop app on Linux; see
+ARCHITECTURE.md §Renderer Native Surface for the platform-handle
+matrix.
+
 `kcreate_ai`'s ONNX background-removal backend pulls in `ort 2.x`,
 which downloads a prebuilt ONNX Runtime shared library on first
 compile (no extra apt packages needed). If you're on a fully offline
@@ -82,9 +90,9 @@ pnpm build         # main + preload + renderer
 cargo test --workspace --all-targets
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all --check
-cargo bench -p kcreate_renderer --no-run
-cargo bench -p kcreate_export --no-run
-cargo bench -p kcreate_raster --no-run
+cargo bench -p kcreate_renderer --no-run  # cold_start + viewport_pan acceptance benches (PR #16)
+cargo bench -p kcreate_export --no-run    # batch_50_assets acceptance bench (PR #16)
+cargo bench -p kcreate_raster --no-run    # raster_open_64mp acceptance bench (PR #16)
 cargo bench -p kcreate_ai --no-run
 cargo bench -p kcreate_layout --no-run
 cargo bench -p kcreate_bridge --no-run    # scene_sync benches (PR #12)

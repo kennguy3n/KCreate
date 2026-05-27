@@ -16,6 +16,7 @@
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 
+pub mod audit;
 #[cfg(feature = "collab")]
 pub mod collab;
 pub mod document;
@@ -28,6 +29,7 @@ pub mod phase4;
 pub mod raster_ops;
 pub mod scene_sync;
 pub mod state;
+pub mod thumbnails;
 pub mod vector_ops;
 pub mod wire;
 
@@ -63,13 +65,25 @@ fn map_err(e: BridgeError) -> NapiError {
 
 #[allow(clippy::needless_pass_by_value)]
 fn map_doc_err(e: DocumentBridgeError) -> NapiError {
-    let status = match e {
+    let status = match &e {
         DocumentBridgeError::NoProject
         | DocumentBridgeError::InvalidNodeType(_)
         | DocumentBridgeError::InvalidArgument { .. }
         | DocumentBridgeError::NodeNotFound(_)
         | DocumentBridgeError::ProjectDirExists(_)
         | DocumentBridgeError::InvalidUuid(_, _) => Status::InvalidArg,
+        // Marketplace errors that come from a user-supplied template
+        // path / id are user-correctable (bad path, wrong id, duplicate
+        // install) — surface as InvalidArg so the renderer can show
+        // them inline next to the offending control. Underlying IO
+        // failures (disk full, permission denied) stay GenericFailure.
+        DocumentBridgeError::Marketplace(me) => match me {
+            kcreate_core::MarketplaceError::DirectoryNotFound(_)
+            | kcreate_core::MarketplaceError::ManifestParse { .. }
+            | kcreate_core::MarketplaceError::TemplateNotFound(_)
+            | kcreate_core::MarketplaceError::AlreadyInstalled(_) => Status::InvalidArg,
+            kcreate_core::MarketplaceError::Io(_) => Status::GenericFailure,
+        },
         _ => Status::GenericFailure,
     };
     NapiError::new(status, format!("kcreate_bridge: {e}"))
@@ -661,6 +675,207 @@ pub fn document_undo() -> NapiResult<Option<UndoRedoOutcome>> {
 pub fn document_redo() -> NapiResult<Option<UndoRedoOutcome>> {
     let outcome = document::document_redo().map_err(map_doc_err)?;
     Ok(outcome.map(Into::into))
+}
+
+/// Group-aware undo. Consumes the entire contiguous run of ops
+/// that share a `group_id` (or one op if ungrouped). Returns a
+/// summary outcome describing the user-facing operation.
+#[napi]
+pub fn document_undo_group() -> NapiResult<Option<UndoRedoOutcome>> {
+    let outcome = document::document_undo_group().map_err(map_doc_err)?;
+    Ok(outcome.map(Into::into))
+}
+
+/// Group-aware redo. Symmetric with [`document_undo_group`].
+#[napi]
+pub fn document_redo_group() -> NapiResult<Option<UndoRedoOutcome>> {
+    let outcome = document::document_redo_group().map_err(map_doc_err)?;
+    Ok(outcome.map(Into::into))
+}
+
+/// Wire-format mirror of [`document::DiscardedBranchSummary`].
+#[napi(object)]
+#[derive(Debug, Clone)]
+pub struct DiscardedBranchSummary {
+    /// Position in the timeline this branch attaches to.
+    pub anchor_position: u32,
+    /// Number of operations the branch contains.
+    pub op_count: u32,
+    /// ISO-8601 UTC timestamp the branch was discarded at.
+    pub discarded_at_iso: String,
+    /// Stable command string of the first op in the branch.
+    pub first_command: String,
+}
+
+impl From<document::DiscardedBranchSummary> for DiscardedBranchSummary {
+    fn from(c: document::DiscardedBranchSummary) -> Self {
+        Self {
+            anchor_position: u32::try_from(c.anchor_position).unwrap_or(u32::MAX),
+            op_count: u32::try_from(c.op_count).unwrap_or(u32::MAX),
+            discarded_at_iso: c.discarded_at_iso,
+            first_command: c.first_command,
+        }
+    }
+}
+
+/// List all discarded redo branches in the current project,
+/// newest-first. Returns an empty list when no branches are
+/// retained or no project is loaded.
+#[napi]
+pub fn document_list_discarded_branches() -> NapiResult<Vec<DiscardedBranchSummary>> {
+    let bs = document::document_list_discarded_branches().map_err(map_doc_err)?;
+    Ok(bs.into_iter().map(Into::into).collect())
+}
+
+/// Restore the discarded branch at `indexFromBack` (0 = newest).
+/// Returns `true` on success, `false` if the index is out of
+/// range or the branch's anchor is stale.
+#[napi]
+pub fn document_restore_discarded_branch(index_from_back: u32) -> NapiResult<bool> {
+    document::document_restore_discarded_branch(index_from_back as usize).map_err(map_doc_err)
+}
+
+// =============================================================================
+// Thumbnail cache + recent-projects bridge
+// =============================================================================
+
+/// Wire-format mirror of [`thumbnails::ThumbnailBytes`].
+///
+/// `bytesBase64` is sent as a `String` rather than a `Buffer` so the
+/// HomePage can assemble a `data:` URL on the JS side without
+/// re-allocating. The encoding is always standard base64 (no URL-safe
+/// alphabet); decoders that need raw bytes can call `atob` once.
+#[napi(object)]
+#[derive(Debug, Clone)]
+pub struct ThumbnailBytes {
+    pub width: u32,
+    pub height: u32,
+    pub mime: String,
+    pub byte_size: f64,
+    pub bytes_base64: String,
+    pub content_hash: String,
+}
+
+impl From<thumbnails::ThumbnailBytes> for ThumbnailBytes {
+    fn from(t: thumbnails::ThumbnailBytes) -> Self {
+        Self {
+            width: t.width,
+            height: t.height,
+            mime: t.mime,
+            byte_size: t.byte_size as f64,
+            bytes_base64: t.bytes_base64,
+            content_hash: t.content_hash,
+        }
+    }
+}
+
+/// Wire-format mirror of [`thumbnails::RecentProjectCoverInfo`].
+#[napi(object)]
+#[derive(Debug, Clone)]
+pub struct RecentProjectCoverInfo {
+    pub width: u32,
+    pub height: u32,
+    pub mime: String,
+    pub byte_size: f64,
+    pub content_hash: String,
+}
+
+impl From<thumbnails::RecentProjectCoverInfo> for RecentProjectCoverInfo {
+    fn from(c: thumbnails::RecentProjectCoverInfo) -> Self {
+        Self {
+            width: c.width,
+            height: c.height,
+            mime: c.mime,
+            byte_size: c.byte_size as f64,
+            content_hash: c.content_hash,
+        }
+    }
+}
+
+/// Wire-format mirror of [`thumbnails::RecentProjectInfo`].
+///
+/// The `path` is emitted as a platform-native string (Linux/macOS:
+/// UTF-8; Windows: lossy-UTF-8 of the wide path). `projectId` carries
+/// the manifest UUID as a hex string so JS can do string-equality
+/// matches against `ProjectInfo.id`.
+#[napi(object)]
+#[derive(Debug, Clone)]
+pub struct RecentProjectInfo {
+    pub path: String,
+    pub name: String,
+    pub project_id: String,
+    pub modified_at: String,
+    pub last_opened_at: String,
+    pub cover: Option<RecentProjectCoverInfo>,
+}
+
+impl From<thumbnails::RecentProjectInfo> for RecentProjectInfo {
+    fn from(r: thumbnails::RecentProjectInfo) -> Self {
+        Self {
+            path: r.path.display().to_string(),
+            name: r.name,
+            project_id: r.project_id.to_string(),
+            modified_at: r.modified_at,
+            last_opened_at: r.last_opened_at,
+            cover: r.cover.map(Into::into),
+        }
+    }
+}
+
+/// Ensure the currently open project has a cover thumbnail on disk
+/// and return it. On a cache hit no rendering is performed. `maxDimPx`
+/// is the long-edge target in pixels; `0` means "use the default
+/// (`thumbnails::DEFAULT_THUMBNAIL_MAX_DIM_PX`)".
+#[napi]
+pub fn thumbnail_for_cover(max_dim_px: u32) -> NapiResult<ThumbnailBytes> {
+    thumbnails::ensure_cover_thumbnail(max_dim_px)
+        .map(Into::into)
+        .map_err(map_doc_err)
+}
+
+/// Ensure the given page's thumbnail is cached and return it. Errors
+/// with `NoProject` when no project is open, `NodeNotFound` when the
+/// page id is unknown, or `InvalidArgument` when the id refers to a
+/// non-Page node.
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn thumbnail_for_page(page_id: String, max_dim_px: u32) -> NapiResult<ThumbnailBytes> {
+    let id = parse_uuid(&page_id)?;
+    thumbnails::ensure_page_thumbnail(id, max_dim_px)
+        .map(Into::into)
+        .map_err(map_doc_err)
+}
+
+/// Spawn a background worker to pre-warm every page's thumbnail for
+/// the currently open project. Returns immediately. Becomes a no-op
+/// when low-resource mode is active.
+#[napi]
+pub fn thumbnail_prepare_background(max_dim_px: u32) -> NapiResult<()> {
+    thumbnails::prepare_thumbnails_background(max_dim_px).map_err(map_doc_err)
+}
+
+/// Snapshot the persistent recent-projects list (most-recent-first).
+/// Entries whose `.kstudio` directory has since been removed are
+/// pruned lazily. Each entry carries best-effort cover-thumbnail
+/// metadata so the HomePage can size `<img>` tags before fetching
+/// bytes.
+#[napi]
+pub fn recent_projects_list() -> Vec<RecentProjectInfo> {
+    thumbnails::recent_projects_list()
+        .into_iter()
+        .map(Into::into)
+        .collect()
+}
+
+/// Read the cached cover-thumbnail bytes for a project on the
+/// recent-projects list *without* opening the project. Returns `null`
+/// when no cover is cached for that path.
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn recent_project_cover_bytes(project_dir: String) -> NapiResult<Option<ThumbnailBytes>> {
+    thumbnails::recent_project_cover_bytes(&PathBuf::from(project_dir))
+        .map(|o| o.map(Into::into))
+        .map_err(map_doc_err)
 }
 
 /// Static runtime / device snapshot.
@@ -1967,6 +2182,102 @@ pub fn layout_template_apply(template_id: String) -> NapiResult<String> {
     serde_json::to_string(&strs).map_err(|e| NapiError::from_reason(e.to_string()))
 }
 
+/// List installed local templates. Returns a JSON array of
+/// `TemplateManifest` entries, sorted by name. Optional `category`
+/// (snake_case `TemplateCategory` discriminant such as `"pitch_deck"`)
+/// or `query` (case-insensitive substring matched against name, tag,
+/// or description) narrow the results — providing both with the
+/// query non-empty applies the query and ignores the category, which
+/// matches the renderer's "search box overrides category filter" UX.
+#[napi]
+pub fn template_list(category: Option<String>, query: Option<String>) -> NapiResult<String> {
+    let cat = match category.as_deref().filter(|s| !s.is_empty()) {
+        Some(s) => Some(
+            serde_json::from_str::<kcreate_core::TemplateCategory>(&format!("\"{s}\"")).map_err(
+                |e| {
+                    NapiError::new(
+                        Status::InvalidArg,
+                        format!("template_list: invalid category {s:?}: {e}"),
+                    )
+                },
+            )?,
+        ),
+        None => None,
+    };
+    let q = query.as_deref().filter(|s| !s.is_empty());
+    let report = phase2::template_list(cat, q).map_err(map_doc_err)?;
+    serde_json::to_string(&report).map_err(|e| NapiError::from_reason(e.to_string()))
+}
+
+/// Install a local template from a `.ktemplate/` source folder.
+/// Copies the directory into the marketplace root and returns the
+/// installed `TemplateManifest` as JSON.
+#[napi]
+pub fn template_install_local(source_path: String) -> NapiResult<String> {
+    let manifest = phase2::template_install_local(&source_path).map_err(map_doc_err)?;
+    serde_json::to_string(&manifest).map_err(|e| NapiError::from_reason(e.to_string()))
+}
+
+/// Remove an installed local template by id. Deletes the
+/// `.ktemplate/` folder on disk.
+#[napi]
+pub fn template_remove(template_id: String) -> NapiResult<()> {
+    let id = parse_uuid(&template_id)?;
+    phase2::template_remove(id).map_err(map_doc_err)
+}
+
+// ---------------------------------------------------------------------------
+// Phase 6 — Audit log (Tasks 13–14)
+// ---------------------------------------------------------------------------
+
+/// Record an audit event. `event_json` is a JSON-serialised
+/// `AuditEvent` from the renderer (or from the bridge itself for
+/// side-effect recording). Returns the event's UUID as a string.
+#[napi]
+pub fn audit_record(event_json: String) -> NapiResult<String> {
+    let event: kcreate_audit::AuditEvent = serde_json::from_str(&event_json)
+        .map_err(|e| NapiError::from_reason(format!("audit_record: {e}")))?;
+    let id = audit::audit_record(&event).map_err(map_doc_err)?;
+    Ok(id.to_string())
+}
+
+/// Query the audit log. `query_json` is a JSON-serialised
+/// `AuditQuery`. Returns a JSON string containing
+/// `{ events: AuditEvent[], total: number }`.
+#[napi]
+pub fn audit_query(query_json: String) -> NapiResult<String> {
+    let filter: kcreate_audit::AuditQuery = serde_json::from_str(&query_json)
+        .map_err(|e| NapiError::from_reason(format!("audit_query: {e}")))?;
+    let report = audit::audit_query(&filter).map_err(map_doc_err)?;
+    serde_json::to_string(&report).map_err(|e| NapiError::from_reason(e.to_string()))
+}
+
+/// Return the total number of audit rows.
+#[napi]
+pub fn audit_count() -> NapiResult<f64> {
+    let count = audit::audit_count().map_err(map_doc_err)?;
+    Ok(count as f64)
+}
+
+/// Delete audit rows strictly older than `cutoff_iso` (RFC 3339).
+/// Returns the number of rows removed.
+#[napi]
+pub fn audit_purge(cutoff_iso: String) -> NapiResult<f64> {
+    let cutoff = chrono::DateTime::parse_from_rfc3339(&cutoff_iso)
+        .map_err(|e| NapiError::from_reason(format!("audit_purge: invalid timestamp: {e}")))?
+        .with_timezone(&chrono::Utc);
+    let removed = audit::audit_purge_before(cutoff).map_err(map_doc_err)?;
+    Ok(removed as f64)
+}
+
+/// Return the filesystem path of the current audit database.
+#[napi]
+pub fn audit_path() -> NapiResult<String> {
+    Ok(audit::audit_path())
+}
+
+// ---------------------------------------------------------------------------
+
 /// Add a new content page to the open project. `size` and
 /// `orientation` are optional; omit both to use the workspace default.
 /// Returns the new page id as a string.
@@ -2006,6 +2317,53 @@ pub fn document_reparent_node(
         _ => None,
     };
     document::document_reparent_node(nid, pid, index as usize).map_err(map_doc_err)
+}
+
+/// Phase 6 Task 25-26: serialise the supplied node ids (with their
+/// descendants) into a portable clipboard payload string. The
+/// renderer/main process stores this on the OS clipboard so paste
+/// works across windows.
+#[napi]
+pub fn document_clipboard_copy(node_ids: Vec<String>) -> NapiResult<String> {
+    let mut uuids = Vec::with_capacity(node_ids.len());
+    for s in node_ids {
+        uuids.push(parse_uuid(&s)?);
+    }
+    document::document_clipboard_copy(&uuids).map_err(map_doc_err)
+}
+
+/// Phase 6 Task 25-26: deserialise a clipboard payload and insert
+/// each subtree under `target_parent_id` (or root-level when
+/// omitted). The top-level root of every subtree is offset by
+/// (`offset_x`, `offset_y`) so paste at the cursor doesn't
+/// perfectly overlap the original.
+#[napi]
+pub fn document_clipboard_paste(
+    payload: String,
+    target_parent_id: Option<String>,
+    offset_x: f64,
+    offset_y: f64,
+) -> NapiResult<Vec<String>> {
+    let pid = match target_parent_id {
+        Some(s) if !s.is_empty() => Some(parse_uuid(&s)?),
+        _ => None,
+    };
+    document::document_clipboard_paste(&payload, pid, offset_x, offset_y)
+        .map(|ids| ids.into_iter().map(|i| i.to_string()).collect())
+        .map_err(map_doc_err)
+}
+
+/// Phase 6 Tasks 27-28: set or clear the layer-colour tag on a node.
+/// `color = None` (or an empty/whitespace string) clears the tag. The
+/// new `version` is returned as `f64` because napi's BigInt path is
+/// noisy on the renderer side and `Node::version` stays well below
+/// 2^53 in practice.
+#[napi]
+pub fn document_set_layer_color(node_id: String, color: Option<String>) -> NapiResult<f64> {
+    let id = parse_uuid(&node_id)?;
+    document::document_set_layer_color(id, color)
+        .map(|v| v as f64)
+        .map_err(map_doc_err)
 }
 
 // ---------------------------------------------------------------------------
@@ -2119,6 +2477,60 @@ pub fn ai_smart_select(node_id: String, x: u32, y: u32, tolerance: f64) -> NapiR
     phase2::ai_smart_select(id, x, y, tolerance).map_err(map_doc_err)
 }
 
+/// Backend-selectable upscale. `backend` is the serde representation
+/// of [`kcreate_ai::UpscaleBackend`] (`"lanczos3"` / `"esrgan"`).
+/// `model_path` is required for ONNX backends; pass an empty string
+/// to omit. Returns a JSON [`phase2::UpscaleWithBackendReport`].
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn ai_upscale_with_backend(
+    node_id: String,
+    scale: f64,
+    backend: String,
+    model_path: String,
+) -> NapiResult<String> {
+    let id = parse_uuid(&node_id)?;
+    let path = if model_path.is_empty() {
+        None
+    } else {
+        Some(model_path.as_str())
+    };
+    phase2::ai_upscale_with_backend(id, scale, &backend, path).map_err(map_doc_err)
+}
+
+/// Point-prompt segmentation. `backend` is the serde representation
+/// of [`kcreate_ai::SegmentBackend`] (`"edge_aware"` / `"sam"`).
+/// `model_path` is required for ONNX backends; pass an empty string
+/// to omit. Returns a JSON [`phase2::SegmentReport`].
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn ai_segment(
+    node_id: String,
+    point_x: u32,
+    point_y: u32,
+    tolerance: f64,
+    edge_threshold: f64,
+    backend: String,
+    model_path: String,
+) -> NapiResult<String> {
+    let id = parse_uuid(&node_id)?;
+    let path = if model_path.is_empty() {
+        None
+    } else {
+        Some(model_path.as_str())
+    };
+    phase2::ai_segment(
+        id,
+        point_x,
+        point_y,
+        tolerance,
+        edge_threshold,
+        &backend,
+        path,
+    )
+    .map_err(map_doc_err)
+}
+
 /// Detect text-like regions in the raster layer identified by
 /// `node_id`. Returns the JSON-serialised `Vec<TextRegion>` from
 /// `kcreate_ai::ocr::detect_text_regions`. `options_json` accepts
@@ -2178,6 +2590,24 @@ pub fn ai_uninstall_model_pack(pack_id: String) -> NapiResult<()> {
 #[napi]
 pub fn pdf_import(file_path: String) -> NapiResult<String> {
     phase2::pdf_import(file_path).map_err(map_doc_err)
+}
+
+/// Import a Figma JSON file at `file_path` into the current project.
+/// One Page per Figma canvas, one Artboard per frame/component, and
+/// `VectorLayer`/`TextLayer`/`RasterLayer` children per leaf node.
+/// Returns JSON matching [`phase2::FigmaImportReport`].
+#[napi]
+pub fn figma_import(file_path: String) -> NapiResult<String> {
+    phase2::figma_import(file_path).map_err(map_doc_err)
+}
+
+/// Import a `.sketch` ZIP file at `file_path` into the current
+/// project. Same shape as [`figma_import`] but Sketch carries pixel
+/// bytes inline, so RasterLayer children are populated with real
+/// blobs. Returns JSON matching [`phase2::SketchImportReport`].
+#[napi]
+pub fn sketch_import(file_path: String) -> NapiResult<String> {
+    phase2::sketch_import(file_path).map_err(map_doc_err)
 }
 
 /// Run edge-detection + connected-component analysis over the
@@ -2368,6 +2798,23 @@ pub fn color_spot_remove(name: String) -> NapiResult<bool> {
 #[napi]
 pub fn color_spot_list() -> NapiResult<String> {
     phase2::color_spot_list().map_err(map_doc_err)
+}
+
+/// Parse a Pantone-style JSON catalogue and merge its entries into
+/// the project's `SpotColorLibrary`. Returns a JSON
+/// [`phase2::SpotCatalogLoadReport`] with `{added, overwritten, parsed}`.
+///
+/// The catalog supports two shapes (see
+/// [`kcreate_core::color::SpotColorLibrary::from_json_catalog`]):
+/// * Wrapped: `{ "entries": [{ "id": "...", "cmyk": [...] }, ...] }`
+/// * Bare map: `{ "swatch-id": { "cmyk": [...] }, ... }`
+///
+/// Recorded as a single undoable `spot_color_load_catalog` operation.
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn color_spot_load_catalog(raw_json: String) -> NapiResult<String> {
+    let report = phase2::color_spot_load_catalog(&raw_json).map_err(map_doc_err)?;
+    serde_json::to_string(&report).map_err(|e| napi::Error::from_reason(e.to_string()))
 }
 
 // ---------------------------------------------------------------------------

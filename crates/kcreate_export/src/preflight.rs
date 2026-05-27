@@ -98,6 +98,22 @@ pub enum PreflightCheck {
     /// use — typically a costly mistake. Surfaces as a `Warning` so
     /// the run still completes.
     SpotColorMissing,
+    /// `NodeStyle::overprint = true` on a fill that would produce an
+    /// unexpected mix on press. Pure-K, dark-ink, and spot inks
+    /// overprint cleanly; light tints (especially RGB-derived
+    /// fallbacks) blended onto a separate ink plate routinely
+    /// surprise authors. Fires as an `Info` because overprint is a
+    /// deliberate authoring choice, just one whose result is easy
+    /// to misread on screen.
+    OverprintTable,
+    /// Two abutting fills on adjacent / overlapping nodes that don't
+    /// share an ink (no shared CMYK plate, no shared spot). Press
+    /// mis-registration of as little as 0.1 mm reveals paper white
+    /// between them; a trap (small overlap) hides it. Fires when
+    /// the node geometry visibly abuts another node with a
+    /// non-shared ink AND neither node carries an explicit trap
+    /// (`overprint = true` on the lighter of the two).
+    Trapping,
 }
 
 impl PreflightCheck {
@@ -116,6 +132,8 @@ impl PreflightCheck {
             Self::TotalInkCoverage => "total_ink_coverage",
             Self::BleedAreaEmpty => "bleed_area_empty",
             Self::SpotColorMissing => "spot_color_missing",
+            Self::OverprintTable => "overprint_table",
+            Self::Trapping => "trapping",
         }
     }
 }
@@ -374,6 +392,7 @@ pub fn run_preflight_with_spots(
             check_node_shading(node, page_id, options, &mut issues);
             check_node_total_ink_coverage(node, page_id, options, &mut issues);
             check_node_spot_color(node, page_id, spots, &mut issues);
+            check_node_overprint_table(node, page_id, spots, &mut issues);
             if matches!(node.node_type, NodeType::TextLayer) {
                 check_node_font_embed(node, page_id, fonts.as_ref(), &mut issues);
             }
@@ -392,6 +411,7 @@ pub fn run_preflight_with_spots(
             options,
             &mut issues,
         );
+        check_page_trapping(document, page_id, &descendants, spots, &mut issues);
     }
     issues
 }
@@ -1202,6 +1222,369 @@ fn check_node_spot_color(
         affected_node_id: Some(node.id),
         page_id: Some(page_id),
     });
+}
+
+/// Overprint-table check.
+///
+/// Overprinting a fill onto an underlying ink only produces a
+/// predictable result when at least one of the following is true:
+///
+/// * The fill is a **spot ink** (overprints onto its own separation
+///   plate cleanly — the whole point of declaring it spot).
+/// * The fill is **pure K** or a near-black mix (K ≥ 70%): the
+///   black plate is dense enough that the underlying inks are
+///   visually invisible.
+/// * The fill is **dense CMYK** (sum of CMYK ≥ 220%): the result
+///   on press is dominated by the heavier ink and the surprise is
+///   minimal.
+///
+/// Anything else (light tints, RGB-derived fallbacks, transparent
+/// fills) overprinting onto a coloured background routinely surprises
+/// authors because the on-screen knockout preview masks the actual
+/// ink mix. We surface this as Info — it's a deliberate authoring
+/// choice we don't want to *block*, just verify.
+fn check_node_overprint_table(
+    node: &Node,
+    page_id: Uuid,
+    spots: &SpotColorLibrary,
+    issues: &mut Vec<PreflightIssue>,
+) {
+    if !is_content_layer(node.node_type) {
+        return;
+    }
+    if !node.style.overprint {
+        return;
+    }
+    let signature = node_ink_signature(node, spots);
+    if signature.is_safe_to_overprint() {
+        return;
+    }
+    issues.push(PreflightIssue {
+        check: PreflightCheck::OverprintTable,
+        severity: PreflightSeverity::Info,
+        message: format!(
+            "Layer '{name}' is set to overprint, but its fill ({summary}) will produce an unpredictable mix on press. Reserve overprint for spot inks or dense black/near-black fills.",
+            name = node.name,
+            summary = signature.summary(),
+        ),
+        affected_node_id: Some(node.id),
+        page_id: Some(page_id),
+    });
+}
+
+/// Page-scoped trapping check.
+///
+/// Walks every pair of content layers on a page. A pair triggers the
+/// check when:
+///
+/// 1. Their bounding boxes are within 1 page-pixel of each other on
+///    at least one shared edge (i.e. they visibly abut — overlapping
+///    is fine, but a one-pixel gap between two adjacent fills is the
+///    classic mis-registration risk).
+/// 2. Their ink signatures share no plate (no common CMYK channel
+///    above the threshold, and no shared spot ink).
+/// 3. Neither carries `style.overprint = true` (an explicit trap).
+///
+/// The 1-pixel tolerance matches what offset presses actually shift
+/// by on the worst-case run; press shops typically request a 0.1 mm
+/// trap (about 1 px at 300 DPI).
+fn check_page_trapping(
+    document: &DocumentGraph,
+    page_id: Uuid,
+    descendants: &[Uuid],
+    spots: &SpotColorLibrary,
+    issues: &mut Vec<PreflightIssue>,
+) {
+    // Gather the participating nodes once, with their ink signatures.
+    let candidates: Vec<(&Node, InkSignature)> = descendants
+        .iter()
+        .filter_map(|id| document.get_node(*id))
+        .filter(|n| is_content_layer(n.node_type))
+        .filter(|n| n.bounds.width > 0.0 && n.bounds.height > 0.0)
+        .map(|n| (n, node_ink_signature(n, spots)))
+        .collect();
+
+    // Pairwise scan. Each pair is reported at most once: only when
+    // i < j AND neither side is set to overprint.
+    let mut seen = std::collections::HashSet::<(Uuid, Uuid)>::new();
+    for i in 0..candidates.len() {
+        for j in (i + 1)..candidates.len() {
+            let (node_a, sig_a) = (candidates[i].0, &candidates[i].1);
+            let (node_b, sig_b) = (candidates[j].0, &candidates[j].1);
+            if node_a.style.overprint || node_b.style.overprint {
+                continue;
+            }
+            if !bounds_abut(&node_a.bounds, &node_b.bounds) {
+                continue;
+            }
+            if sig_a.shares_any_ink_with(sig_b) {
+                continue;
+            }
+            let key = if node_a.id < node_b.id {
+                (node_a.id, node_b.id)
+            } else {
+                (node_b.id, node_a.id)
+            };
+            if !seen.insert(key) {
+                continue;
+            }
+            issues.push(PreflightIssue {
+                check: PreflightCheck::Trapping,
+                severity: PreflightSeverity::Warning,
+                message: format!(
+                    "Layers '{a}' and '{b}' abut with non-shared inks ({sa} vs {sb}). Add a trap (a small overprint band) on the lighter of the two to hide press mis-registration.",
+                    a = node_a.name,
+                    b = node_b.name,
+                    sa = sig_a.summary(),
+                    sb = sig_b.summary(),
+                ),
+                affected_node_id: Some(node_a.id),
+                page_id: Some(page_id),
+            });
+        }
+    }
+}
+
+/// Coarse classification of a node's ink load — used by the overprint
+/// and trapping checks. Records which CMYK plates carry a non-trivial
+/// load (≥ 5%) plus any spot inks the node references.
+#[derive(Debug, Clone, Default)]
+struct InkSignature {
+    /// `(C, M, Y, K)` fractions in `[0, 1]`, summed across primary +
+    /// extra fills.
+    cmyk: (f32, f32, f32, f32),
+    /// Spot names this node references.
+    spots: Vec<String>,
+    /// `true` when the node's fill is fully transparent (Fill::None
+    /// or `alpha == 0`). Treated as inkless.
+    transparent: bool,
+}
+
+/// Coverage threshold above which a CMYK channel is considered to be
+/// carrying a "real" ink load for the purposes of overprint /
+/// trapping classification. Set just above sensor noise so a
+/// nominally pure-cyan fill ((1.0, 0.0, 0.0, 0.0)) reads as
+/// inkless on M / Y / K, but a 6% tint reads as carrying that
+/// plate.
+const INK_PLATE_FLOOR: f32 = 0.05;
+
+impl InkSignature {
+    /// `true` when at least one plate or spot ink is shared with `other`.
+    fn shares_any_ink_with(&self, other: &Self) -> bool {
+        if self.transparent || other.transparent {
+            return true;
+        }
+        let plate_shared = (self.cmyk.0 >= INK_PLATE_FLOOR && other.cmyk.0 >= INK_PLATE_FLOOR)
+            || (self.cmyk.1 >= INK_PLATE_FLOOR && other.cmyk.1 >= INK_PLATE_FLOOR)
+            || (self.cmyk.2 >= INK_PLATE_FLOOR && other.cmyk.2 >= INK_PLATE_FLOOR)
+            || (self.cmyk.3 >= INK_PLATE_FLOOR && other.cmyk.3 >= INK_PLATE_FLOOR);
+        let spot_shared = self.spots.iter().any(|s| other.spots.contains(s));
+        plate_shared || spot_shared
+    }
+
+    /// `true` when the ink load is safe to mark as overprint:
+    /// dense black, dense CMYK, or any spot ink.
+    fn is_safe_to_overprint(&self) -> bool {
+        if !self.spots.is_empty() {
+            return true;
+        }
+        if self.cmyk.3 >= 0.70 {
+            return true;
+        }
+        let sum = self.cmyk.0 + self.cmyk.1 + self.cmyk.2 + self.cmyk.3;
+        sum >= 2.20
+    }
+
+    /// Short human-readable summary for issue messages.
+    fn summary(&self) -> String {
+        if self.transparent {
+            return "transparent".into();
+        }
+        let mut parts = Vec::new();
+        if self.cmyk.0 >= 0.05 {
+            parts.push(format!("C{:.0}", self.cmyk.0 * 100.0));
+        }
+        if self.cmyk.1 >= 0.05 {
+            parts.push(format!("M{:.0}", self.cmyk.1 * 100.0));
+        }
+        if self.cmyk.2 >= 0.05 {
+            parts.push(format!("Y{:.0}", self.cmyk.2 * 100.0));
+        }
+        if self.cmyk.3 >= 0.05 {
+            parts.push(format!("K{:.0}", self.cmyk.3 * 100.0));
+        }
+        for s in &self.spots {
+            parts.push(format!("spot:{s}"));
+        }
+        if parts.is_empty() {
+            "white/paper".into()
+        } else {
+            parts.join(" ")
+        }
+    }
+}
+
+fn node_ink_signature(node: &Node, spots: &SpotColorLibrary) -> InkSignature {
+    use kcreate_core::node::FillStyle;
+    let mut sig = InkSignature::default();
+    let mut had_any_fill = false;
+
+    if let Some(over) = &node.style.color_override {
+        if accumulate_color_signature(over, spots, &mut sig) {
+            had_any_fill = true;
+        }
+    } else {
+        for fill in node.style.iter_fills() {
+            match fill {
+                FillStyle::None => {}
+                FillStyle::Solid(rgba) => {
+                    if rgba.a < 0.001 {
+                        continue;
+                    }
+                    had_any_fill = true;
+                    let (c, m, y, k) = kcreate_core::color::srgb_to_cmyk(rgba.r, rgba.g, rgba.b);
+                    sig.cmyk.0 += c;
+                    sig.cmyk.1 += m;
+                    sig.cmyk.2 += y;
+                    sig.cmyk.3 += k;
+                }
+                FillStyle::Gradient(_) => {
+                    // Gradients participate in the trapping check
+                    // through a deliberate simplification: we credit a
+                    // flat ~20% K (a "neutral mid-grey approximation")
+                    // rather than walking every gradient stop on every
+                    // pairwise comparison. The cost reason matters —
+                    // the trapping check is already O(n²) over a
+                    // page's content nodes (see check_trapping) and
+                    // walking stops here would multiply the per-pair
+                    // cost by the stop count. The trade-off:
+                    //
+                    // * Worst case: a pure C→M (or C→Y, M→Y) gradient
+                    //   abutting a similar non-K fill — both sides
+                    //   register the same 20% K plate, share that
+                    //   single plate in the trapping comparison, and
+                    //   the check is suppressed even though on press
+                    //   the two would mis-register. This is a false
+                    //   *negative*: the user misses a warning they
+                    //   could have acted on.
+                    // * Best case: a K-heavy gradient (any darkening
+                    //   ramp through black) registers correctly.
+                    //
+                    // We prefer false negatives over false positives
+                    // here — preflight panels lose user trust quickly
+                    // if they cry wolf, and the printer's own preflight
+                    // catches anything that slips through. The Phase 6
+                    // benchmark suite (Tasks 29–30) is the trigger for
+                    // revisiting this: if pairwise comparison cost
+                    // dominates a real workload, the right fix is to
+                    // precompute a `GradientInkSummary { dominant,
+                    // plates_present, mean_density }` once when the
+                    // gradient is set and stash it on the node, so the
+                    // trapping check stays O(n) per pair (bitmask
+                    // intersection) regardless of stop count.
+                    //
+                    // The shading check (check_node_shading) already
+                    // validates gradient banding more strictly, so the
+                    // user still gets per-gradient feedback there —
+                    // this approximation only weakens the *trapping*
+                    // signal, not the gradient-quality one.
+                    had_any_fill = true;
+                    sig.cmyk.3 += 0.20;
+                }
+            }
+        }
+    }
+
+    if !had_any_fill {
+        sig.transparent = true;
+    }
+
+    // Clamp accumulated channels to [0, 1] so subsequent comparisons
+    // behave predictably even on multi-fill stacks.
+    sig.cmyk.0 = sig.cmyk.0.clamp(0.0, 1.0);
+    sig.cmyk.1 = sig.cmyk.1.clamp(0.0, 1.0);
+    sig.cmyk.2 = sig.cmyk.2.clamp(0.0, 1.0);
+    sig.cmyk.3 = sig.cmyk.3.clamp(0.0, 1.0);
+    sig
+}
+
+/// Accumulate ink from `color` into `sig`. Returns `true` when the
+/// colour carried a non-trivial alpha and actually contributed ink.
+fn accumulate_color_signature(
+    color: &kcreate_core::color::Color,
+    spots: &SpotColorLibrary,
+    sig: &mut InkSignature,
+) -> bool {
+    match color {
+        kcreate_core::color::Color::Cmyk { c, m, y, k, a } => {
+            if *a < 0.001 {
+                return false;
+            }
+            sig.cmyk.0 += c;
+            sig.cmyk.1 += m;
+            sig.cmyk.2 += y;
+            sig.cmyk.3 += k;
+            true
+        }
+        kcreate_core::color::Color::Spot {
+            name,
+            fallback_cmyk,
+            tint,
+            alpha,
+        } => {
+            if *alpha < 0.001 {
+                return false;
+            }
+            sig.spots.push(name.clone());
+            let (c, m, y, k) = spots
+                .get(name)
+                .map_or(*fallback_cmyk, |def| def.fallback_cmyk);
+            sig.cmyk.0 += c * tint;
+            sig.cmyk.1 += m * tint;
+            sig.cmyk.2 += y * tint;
+            sig.cmyk.3 += k * tint;
+            true
+        }
+        _ => {
+            let (r, g, b, a) = color.to_srgb();
+            if a < 0.001 {
+                return false;
+            }
+            let (c, m, y, k) = kcreate_core::color::srgb_to_cmyk(r, g, b);
+            sig.cmyk.0 += c;
+            sig.cmyk.1 += m;
+            sig.cmyk.2 += y;
+            sig.cmyk.3 += k;
+            true
+        }
+    }
+}
+
+/// `true` when two bounds visibly abut: either they overlap, or
+/// at least one shared edge is within 1 page pixel of the other.
+fn bounds_abut(a: &kcreate_core::node::Bounds, b: &kcreate_core::node::Bounds) -> bool {
+    const TOL: f64 = 1.0;
+    let a_left = a.x;
+    let a_right = a.x + a.width;
+    let a_top = a.y;
+    let a_bottom = a.y + a.height;
+    let b_left = b.x;
+    let b_right = b.x + b.width;
+    let b_top = b.y;
+    let b_bottom = b.y + b.height;
+
+    // Reject obviously disjoint pairs (separated by more than TOL on
+    // any axis).
+    if a_right + TOL < b_left || b_right + TOL < a_left {
+        return false;
+    }
+    if a_bottom + TOL < b_top || b_bottom + TOL < a_top {
+        return false;
+    }
+    // At this point the projections overlap (or touch) on both axes —
+    // the rectangles either intersect or share an edge within
+    // tolerance.
+    true
 }
 
 /// Sum of CMYK components for an override color, in `[0, 4]`.

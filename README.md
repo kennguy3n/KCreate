@@ -65,11 +65,15 @@ See [`PROPOSAL.md`](./PROPOSAL.md) for the full product spec.
 
 See [`ARCHITECTURE.md`](./ARCHITECTURE.md) for the technical design.
 
-## Platforms
+## Supported platforms
 
-- macOS (Intel and Apple Silicon)
-- Windows (x64)
-- Linux (x64 and arm64)
+| Platform | Architectures | Notes |
+| --- | --- | --- |
+| macOS  | Intel + Apple Silicon | Metal backend on wgpu; MLX vision/image-gen sidecars available on Apple Silicon. |
+| Windows | x64 | D3D12 backend on wgpu. |
+| Linux  | x64 + arm64 | Vulkan backend on wgpu (mesa ≥ 22 or proprietary drivers). `fontconfig` is required at runtime for system-font discovery; the build script vendors `fontconfig-sys`. **Wayland support: graceful fallback** — if the compositor refuses a window surface (no XDG/X11 bridge), the renderer transparently switches to its offscreen path so the canvas still renders. X11 (`xcb`) is the recommended display server for end users. |
+
+CI runs the test suite on all three platforms (`.github/workflows/ci.yml`).
 
 ## Design system
 

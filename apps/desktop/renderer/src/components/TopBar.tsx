@@ -1,3 +1,4 @@
+import { useTheme } from "../styles/ThemeProvider";
 import { colors, font, radius, spacing } from "../styles/tokens";
 import type { ToolId } from "../pages/EditorPage";
 
@@ -96,6 +97,7 @@ export function TopBar(props: TopBarProps): JSX.Element {
     onBackHome,
   } = props;
   const tools = toolsForMode(mode);
+  const { themeId, toggle: toggleTheme } = useTheme();
   return (
     <header
       style={{
@@ -180,6 +182,19 @@ export function TopBar(props: TopBarProps): JSX.Element {
         style={pillButton(false, !canRedo)}
       >
         Redo
+      </button>
+      <button
+        type="button"
+        onClick={toggleTheme}
+        style={pillButton(false)}
+        aria-label={
+          themeId === "dark"
+            ? "Switch to light theme"
+            : "Switch to dark theme"
+        }
+        title={`Theme: ${themeId === "dark" ? "Dark" : "Light"}`}
+      >
+        {themeId === "dark" ? "\u263C" : "\u263D"}
       </button>
       <button type="button" onClick={onExport} style={pillButton(true)}>
         Export

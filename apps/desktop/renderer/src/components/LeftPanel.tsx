@@ -19,15 +19,42 @@ export type LeftPanelTab =
   | "tokens"
   | "brand";
 
+// Phase 6 Tasks 27-28 — layer colour palette. Canonical lowercase
+// keys match `kcreate_bridge::document::canonicalise_layer_color`
+// (whitespace + case-folded), so the Rust side accepts them
+// verbatim. The swatch values are the actual hex codes the LayerPanel
+// renders on the tag pill.
+export const LAYER_COLOR_PALETTE: ReadonlyArray<{ key: string; swatch: string }> = [
+  { key: "red", swatch: "#EF4444" },
+  { key: "orange", swatch: "#F97316" },
+  { key: "yellow", swatch: "#F59E0B" },
+  { key: "green", swatch: "#10B981" },
+  { key: "blue", swatch: "#3B82F6" },
+  { key: "violet", swatch: "#7C3AED" },
+  { key: "gray", swatch: "#6B7280" },
+];
+
+const LAYER_COLOR_LOOKUP: Record<string, string> = Object.fromEntries(
+  LAYER_COLOR_PALETTE.map((p) => [p.key, p.swatch]),
+);
+
 export interface LeftPanelProps {
   nodes: NodeInfo[];
   selectedId: string | null;
   selectedIds?: string[];
   onSelect: (id: string | null) => void;
+  onSelectMany?: (ids: string[]) => void;
   onToggleVisibility?: (id: string, visible: boolean) => void;
   onToggleLocked?: (id: string, locked: boolean) => void;
   onRename?: (id: string, name: string) => void;
   onDelete?: (id: string) => void;
+  /**
+   * Phase 6 Tasks 27-28 — install (or clear, when `color` is null)
+   * a layer-colour tag on the given node. The host wires this to
+   * `window.kcreate.setLayerColor` so the colour swatch participates
+   * in undo/redo via the `layer_color_set` op.
+   */
+  onSetLayerColor?: (id: string, color: string | null) => void;
 
   // Artboard-tab inputs. Optional so existing callers that haven't
   // wired the artboard bridge yet keep working (the tab just renders
@@ -61,10 +88,12 @@ export function LeftPanel({
   selectedId,
   selectedIds,
   onSelect,
+  onSelectMany,
   onToggleVisibility,
   onToggleLocked,
   onRename,
   onDelete,
+  onSetLayerColor,
   artboards,
   onRequestCreateArtboard,
   onFocusArtboard,
@@ -81,6 +110,10 @@ export function LeftPanel({
   onDesignSystemStatus,
 }: LeftPanelProps): JSX.Element {
   const [tab, setTab] = useState<LeftPanelTab>("layers");
+  // Phase 6 Tasks 27-28 — case-insensitive name filter for the
+  // layers tab. Empty string means "show everything". Kept local to
+  // LeftPanel so other tabs aren't filtered by the layer query.
+  const [layerQuery, setLayerQuery] = useState("");
   return (
     <aside
       style={{
@@ -135,16 +168,18 @@ export function LeftPanel({
           />
         ) : null}
         {tab === "layers" ? (
-          <NodeList
+          <LayerTabContent
             nodes={nodes}
             selectedId={selectedId}
+            query={layerQuery}
+            onQueryChange={setLayerQuery}
             onSelect={onSelect}
+            onSelectMany={onSelectMany ?? noopMany}
             onToggleVisibility={onToggleVisibility}
             onToggleLocked={onToggleLocked}
             onRename={onRename}
             onDelete={onDelete}
-            emptyHint="No layers yet."
-            showHierarchy
+            onSetLayerColor={onSetLayerColor ?? noopLayerColor}
           />
         ) : null}
         {tab === "assets" ? (
@@ -196,6 +231,159 @@ const noopName = (_: string): void => undefined;
 const noopRename = (_: string, __: string): void => undefined;
 const noopResize = (_: string, __: number, ___: number): void => undefined;
 const noopStatus = (_: string | null): void => undefined;
+const noopMany = (_: string[]): void => undefined;
+const noopLayerColor = (_: string, __: string | null): void => undefined;
+
+/// Phase 6 Tasks 27-28 — layers-tab content: search filter +
+/// "select all of type" controls + the NodeList itself. Pulled out
+/// so the layers tab can hold its own state (the search query, the
+/// type filter, the colour-tag popover) without re-rendering every
+/// other tab.
+function LayerTabContent({
+  nodes,
+  selectedId,
+  query,
+  onQueryChange,
+  onSelect,
+  onSelectMany,
+  onToggleVisibility,
+  onToggleLocked,
+  onRename,
+  onDelete,
+  onSetLayerColor,
+}: {
+  nodes: NodeInfo[];
+  selectedId: string | null;
+  query: string;
+  onQueryChange: (q: string) => void;
+  onSelect: (id: string | null) => void;
+  onSelectMany: (ids: string[]) => void;
+  onToggleVisibility?: (id: string, visible: boolean) => void;
+  onToggleLocked?: (id: string, locked: boolean) => void;
+  onRename?: (id: string, name: string) => void;
+  onDelete?: (id: string) => void;
+  onSetLayerColor: (id: string, color: string | null) => void;
+}): JSX.Element {
+  // The query matches case-insensitively against the node name AND
+  // its installed colour-tag key, so "red" surfaces every red-tagged
+  // layer regardless of name.
+  const needle = query.trim().toLowerCase();
+  const filtered = needle
+    ? nodes.filter((n) => {
+        if (n.name.toLowerCase().includes(needle)) return true;
+        const tag = layerColorOf(n);
+        return tag !== null && tag.toLowerCase().includes(needle);
+      })
+    : nodes;
+
+  // Distinct node types present in the (unfiltered) tree, in stable
+  // order, for the "select all of type" dropdown.
+  const types: string[] = [];
+  for (const n of nodes) {
+    if (!types.includes(n.nodeType)) types.push(n.nodeType);
+  }
+
+  const handleSelectAllOfType = (t: string): void => {
+    const ids = nodes.filter((n) => n.nodeType === t).map((n) => n.id);
+    if (ids.length > 0) onSelectMany(ids);
+  };
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: spacing.sm }}>
+      <div
+        style={{
+          display: "flex",
+          gap: 4,
+          alignItems: "center",
+          padding: `0 ${spacing.xs}px`,
+        }}
+      >
+        <input
+          type="search"
+          value={query}
+          onChange={(e) => onQueryChange(e.target.value)}
+          placeholder="Filter layers (name or colour)"
+          aria-label="Filter layers"
+          style={{
+            flex: 1,
+            background: colors.bg,
+            color: colors.text,
+            border: `1px solid ${colors.border}`,
+            borderRadius: radius.card / 2,
+            padding: "4px 8px",
+            fontSize: 12,
+          }}
+        />
+        {query.length > 0 ? (
+          <button
+            type="button"
+            aria-label="Clear filter"
+            title="Clear filter"
+            onClick={() => onQueryChange("")}
+            style={iconButton(true)}
+          >
+            ×
+          </button>
+        ) : null}
+      </div>
+      {types.length > 1 ? (
+        <div
+          style={{
+            display: "flex",
+            flexWrap: "wrap",
+            gap: 4,
+            padding: `0 ${spacing.xs}px`,
+          }}
+        >
+          {types.map((t) => (
+            <button
+              key={t}
+              type="button"
+              onClick={() => handleSelectAllOfType(t)}
+              title={`Select every ${t}`}
+              style={{
+                fontSize: 10,
+                padding: "2px 6px",
+                background: colors.bgSoft,
+                color: colors.textMuted,
+                border: `1px solid ${colors.border}`,
+                borderRadius: 3,
+                cursor: "pointer",
+              }}
+            >
+              All {t}
+            </button>
+          ))}
+        </div>
+      ) : null}
+      <NodeList
+        nodes={filtered}
+        selectedId={selectedId}
+        onSelect={onSelect}
+        onToggleVisibility={onToggleVisibility}
+        onToggleLocked={onToggleLocked}
+        onRename={onRename}
+        onDelete={onDelete}
+        onSetLayerColor={onSetLayerColor}
+        emptyHint={
+          needle.length > 0
+            ? `No layers matching '${query}'.`
+            : "No layers yet."
+        }
+        showHierarchy={needle.length === 0}
+      />
+    </div>
+  );
+}
+
+/// Read the canonical colour-tag key off `Node::metadata.layerColor`.
+/// Returns `null` when the tag is missing or the metadata field
+/// isn't a string (defensive; the Rust side only writes strings).
+function layerColorOf(n: NodeInfo): string | null {
+  const raw = n.metadata?.["layerColor"];
+  if (typeof raw === "string" && raw.length > 0) return raw;
+  return null;
+}
 
 function PanelTabs<T extends string>({
   tabs,
@@ -251,6 +439,7 @@ function NodeList({
   onToggleLocked,
   onRename,
   onDelete,
+  onSetLayerColor,
   emptyHint,
   showHierarchy = false,
 }: {
@@ -261,11 +450,15 @@ function NodeList({
   onToggleLocked?: (id: string, locked: boolean) => void;
   onRename?: (id: string, name: string) => void;
   onDelete?: (id: string) => void;
+  onSetLayerColor?: (id: string, color: string | null) => void;
   emptyHint: string;
   showHierarchy?: boolean;
 }): JSX.Element {
   const [renamingId, setRenamingId] = useState<string | null>(null);
   const [draftName, setDraftName] = useState("");
+  // Which row is currently showing its colour-tag popover. Only one
+  // popover at a time so a click outside the row dismisses it.
+  const [colorPopoverId, setColorPopoverId] = useState<string | null>(null);
 
   if (nodes.length === 0) {
     return <EmptyHint>{emptyHint}</EmptyHint>;
@@ -401,6 +594,19 @@ function NodeList({
                   {n.name}
                 </span>
               )}
+              {onSetLayerColor ? (
+                <ColorTagControl
+                  current={layerColorOf(n)}
+                  open={colorPopoverId === n.id}
+                  onToggle={() =>
+                    setColorPopoverId((id) => (id === n.id ? null : n.id))
+                  }
+                  onPick={(key) => {
+                    onSetLayerColor(n.id, key);
+                    setColorPopoverId(null);
+                  }}
+                />
+              ) : null}
               {onDelete ? (
                 <button
                   type="button"
@@ -420,6 +626,106 @@ function NodeList({
         );
       })}
     </ul>
+  );
+}
+
+/// Compact dot-button + popover for installing / clearing a
+/// layer-colour tag. The dot reads the current tag; clicking it
+/// toggles a small palette popover. Picking a swatch calls
+/// `onPick(key)`; picking the "clear" tile calls `onPick(null)`.
+function ColorTagControl({
+  current,
+  open,
+  onToggle,
+  onPick,
+}: {
+  current: string | null;
+  open: boolean;
+  onToggle: () => void;
+  onPick: (key: string | null) => void;
+}): JSX.Element {
+  const swatch =
+    current && LAYER_COLOR_LOOKUP[current]
+      ? LAYER_COLOR_LOOKUP[current]
+      : null;
+  return (
+    <div style={{ position: "relative" }} onClick={(e) => e.stopPropagation()}>
+      <button
+        type="button"
+        aria-label={current ? `Layer tag: ${current}` : "Tag layer"}
+        title={current ? `Tag: ${current} (click to change)` : "Tag layer"}
+        onClick={onToggle}
+        style={{
+          width: 14,
+          height: 14,
+          borderRadius: "50%",
+          border: `1px solid ${swatch ? swatch : colors.border}`,
+          background: swatch ?? "transparent",
+          cursor: "pointer",
+          padding: 0,
+        }}
+      />
+      {open ? (
+        <div
+          role="menu"
+          style={{
+            position: "absolute",
+            top: 18,
+            right: 0,
+            zIndex: 10,
+            display: "flex",
+            gap: 4,
+            padding: 6,
+            background: colors.bgSoft,
+            border: `1px solid ${colors.border}`,
+            borderRadius: 4,
+            boxShadow: "0 4px 12px rgba(0, 0, 0, 0.2)",
+          }}
+        >
+          {LAYER_COLOR_PALETTE.map((p) => (
+            <button
+              key={p.key}
+              type="button"
+              aria-label={`Tag ${p.key}`}
+              title={p.key}
+              onClick={() => onPick(p.key)}
+              style={{
+                width: 14,
+                height: 14,
+                borderRadius: "50%",
+                border:
+                  current === p.key
+                    ? `2px solid ${colors.text}`
+                    : `1px solid ${colors.border}`,
+                background: p.swatch,
+                cursor: "pointer",
+                padding: 0,
+              }}
+            />
+          ))}
+          <button
+            type="button"
+            aria-label="Clear tag"
+            title="Clear tag"
+            onClick={() => onPick(null)}
+            style={{
+              width: 14,
+              height: 14,
+              borderRadius: "50%",
+              border: `1px dashed ${colors.border}`,
+              background: "transparent",
+              color: colors.textMuted,
+              fontSize: 9,
+              lineHeight: "12px",
+              cursor: "pointer",
+              padding: 0,
+            }}
+          >
+            ×
+          </button>
+        </div>
+      ) : null}
+    </div>
   );
 }
 

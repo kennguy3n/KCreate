@@ -81,6 +81,62 @@ type UndoRedoOutcomeSnake = {
   affectedNodes: string[];
 };
 
+// Mirror of `crates/kcreate_bridge/src/lib.rs::DiscardedBranchSummary`.
+// `anchor_position` is the timeline index where the branch would
+// re-attach if restored — UI surfaces it so users can identify which
+// undo state a branch was captured from. `op_count` is the size of
+// the discarded redo tail (typically 1–N for a single user action,
+// or a full group for grouped operations). `discarded_at_iso` is
+// RFC 3339 UTC for sort-most-recent-first display. `first_command`
+// is the `Operation::command` of the first op in the branch so the
+// UI can show a one-line preview (e.g. "Recover: artboard_create").
+type DiscardedBranchSummarySnake = {
+  anchorPosition: number;
+  opCount: number;
+  discardedAtIso: string;
+  firstCommand: string;
+};
+
+// Thumbnail cache + recent-projects bridge (PR #16, Tasks 17-18).
+//
+// `ThumbnailBytesSnake` mirrors `kcreate_bridge::lib::ThumbnailBytes`.
+// `byteSize` is exposed as `number` rather than `BigInt` because every
+// byte count we care about (PNG thumbnail at <=2048px on the long
+// edge) fits comfortably in JS's safe integer range, and `BigInt`
+// would force every renderer call site onto `Number(b.byteSize)`
+// conversions for `<img>` sizing math.
+type ThumbnailBytesSnake = {
+  width: number;
+  height: number;
+  mime: string;
+  byteSize: number;
+  bytesBase64: string;
+  contentHash: string;
+};
+
+// `RecentProjectCoverInfoSnake` — cover-thumbnail metadata only.
+// Paired with `thumbnailForCover` / `recentProjectCoverBytes` to
+// fetch the actual pixel bytes.
+type RecentProjectCoverInfoSnake = {
+  width: number;
+  height: number;
+  mime: string;
+  byteSize: number;
+  contentHash: string;
+};
+
+// `RecentProjectInfoSnake` — one entry on the recent-projects list.
+// `path` is the absolute path to the `.kstudio` directory; `projectId`
+// is the manifest UUID as a hex string.
+type RecentProjectInfoSnake = {
+  path: string;
+  name: string;
+  projectId: string;
+  modifiedAt: string;
+  lastOpenedAt: string;
+  cover: RecentProjectCoverInfoSnake | null;
+};
+
 export type {
   ProjectInfoSnake,
   NodeInfoSnake,
@@ -88,6 +144,10 @@ export type {
   RuntimeStatusSnake,
   DocumentStatusSnake,
   UndoRedoOutcomeSnake,
+  DiscardedBranchSummarySnake,
+  ThumbnailBytesSnake,
+  RecentProjectCoverInfoSnake,
+  RecentProjectInfoSnake,
 };
 
 export interface Bridge {
@@ -154,8 +214,79 @@ export interface Bridge {
   documentNodeExtraFills(nodeId: string): string | null;
   documentNodeExtraStrokes(nodeId: string): string | null;
   documentDeleteNode(nodeId: string): void;
+  /**
+   * Phase 6 Tasks 27-28 — layer colour tags. `color` is either a
+   * non-empty colour key (canonical lowercase, e.g. `"red"`,
+   * `"blue"`, `"yellow"`) to install, or `null` / `undefined` to
+   * clear the tag. The bridge canonicalises whitespace + case and
+   * records an undoable `layer_color_set` op; returns the node's
+   * post-mutation `version` so renderer reads can be invalidated
+   * without a full `getTree`. Errors on unknown nodes.
+   */
+  documentSetLayerColor(nodeId: string, color?: string | null): number;
   documentUndo(): UndoRedoOutcomeSnake | null;
   documentRedo(): UndoRedoOutcomeSnake | null;
+  /**
+   * Group-aware undo. Consumes the entire contiguous run of ops at
+   * the head of the undo stack that share the same `group_id` (a
+   * `drag-move-50-times` sequence undoes as one user action). Falls
+   * back to single-op undo when the head op carries no `group_id`.
+   * The atomicity is enforced inside `kcreate_bridge::document`:
+   * peek-the-pending-group, apply every `before_patch`, only then
+   * commit the cursor move — so a partial failure leaves the stack
+   * untouched and the next call retries the same group. Returns
+   * `null` when no project is loaded or the stack is empty.
+   */
+  documentUndoGroup(): UndoRedoOutcomeSnake | null;
+  /**
+   * Symmetric with [`documentUndoGroup`] — re-applies the entire
+   * contiguous run at the head of the redo stack that share a
+   * `group_id`.
+   */
+  documentRedoGroup(): UndoRedoOutcomeSnake | null;
+  /**
+   * Newest-first list of redo tails that were dropped because the
+   * user pushed a new op after undoing some history. Each entry is a
+   * `DiscardedBranchSummarySnake`; the renderer's branch panel uses
+   * them to offer "recover branch" affordances. Bounded by the
+   * project's `OperationLog::max_branches` (16 by default — see
+   * `crates/kcreate_core/src/operation.rs::default_max_branches`).
+   * Returns `[]` when no project is loaded or no branches exist.
+   */
+  documentListDiscardedBranches(): DiscardedBranchSummarySnake[];
+  /**
+   * Restore the discarded branch at `indexFromBack` (0 = newest, as
+   * listed by [`documentListDiscardedBranches`]). Returns `true` on
+   * success, `false` if the index is out of range OR the branch's
+   * `anchor_position` no longer matches the current undo cursor
+   * (i.e. the user did more work after the branch was captured and
+   * the branch would attach to the wrong place). On success the
+   * restored ops appear at the head of the redo stack and the user
+   * can press Redo / Ctrl+Y to re-apply them in order.
+   */
+  documentRestoreDiscardedBranch(indexFromBack: number): boolean;
+
+  // Phase 6 — Tasks 17-18: lazy thumbnail cache + recent-projects.
+  //
+  // `thumbnailForCover` / `thumbnailForPage` produce cached PNG bytes
+  // for the currently open project. On a cache hit they return
+  // immediately without invoking the renderer. `maxDimPx === 0` means
+  // "use the default" (320 px on the long edge — see
+  // `kcreate_bridge::thumbnails::DEFAULT_THUMBNAIL_MAX_DIM_PX`).
+  thumbnailForCover(maxDimPx: number): ThumbnailBytesSnake;
+  thumbnailForPage(pageId: string, maxDimPx: number): ThumbnailBytesSnake;
+  // Kick off a background worker that warms every page's thumbnail.
+  // Returns immediately. Becomes a no-op under low-resource mode.
+  thumbnailPrepareBackground(maxDimPx: number): void;
+  // Snapshot the persistent recent-projects list (most-recent-first).
+  // Entries whose `.kstudio` directory no longer exists are pruned
+  // lazily. Each entry carries best-effort cover-thumbnail metadata.
+  recentProjectsList(): RecentProjectInfoSnake[];
+  // Fetch the cached cover bytes for a project on the recent list
+  // *without* opening the project. Returns `null` when no cover is
+  // cached for that path.
+  recentProjectCoverBytes(projectDir: string): ThumbnailBytesSnake | null;
+
   documentStatus(): DocumentStatusSnake | null;
   runtimeStatus(): RuntimeStatusSnake;
   lowResourceModeGet(): boolean;
@@ -373,6 +504,17 @@ export interface Bridge {
   masterPageDetach(contentPageId: string): void;
   layoutTemplateList(): string;
   layoutTemplateApply(templateId: string): string;
+  templateList(category: string | undefined, query: string | undefined): string;
+  templateInstallLocal(sourcePath: string): string;
+  templateRemove(templateId: string): void;
+
+  // Phase 6 — audit log
+  auditRecord(eventJson: string): string;
+  auditQuery(queryJson: string): string;
+  auditCount(): number;
+  auditPurge(cutoffIso: string): number;
+  auditPath(): string;
+
   pageAdd(
     name: string,
     size?: string,
@@ -384,6 +526,15 @@ export interface Bridge {
     newParent: string | undefined,
     index: number,
   ): void;
+
+  // Phase 6 Tasks 25-26 — node clipboard.
+  documentClipboardCopy(nodeIds: string[]): string;
+  documentClipboardPaste(
+    payload: string,
+    targetParentId: string | undefined,
+    offsetX: number,
+    offsetY: number,
+  ): string[];
 
   // Phase 2 — print preflight, icon pack, async batch, AI extras,
   // plugin sandbox, MCP permission persistence.
@@ -402,12 +553,33 @@ export interface Bridge {
     y: number,
     tolerance: number,
   ): string;
+  // Phase 3 Tasks 9-10 — backend-selectable upscale + point-prompt
+  // segmentation. Both backends accept the serde representation of
+  // `kcreate_ai::{UpscaleBackend, SegmentBackend}` as a plain string.
+  // `modelPath` may be `""` to omit; ONNX backends require a path.
+  aiUpscaleWithBackend(
+    nodeId: string,
+    scale: number,
+    backend: string,
+    modelPath: string,
+  ): string;
+  aiSegment(
+    nodeId: string,
+    pointX: number,
+    pointY: number,
+    tolerance: number,
+    edgeThreshold: number,
+    backend: string,
+    modelPath: string,
+  ): string;
   aiDetectTextRegions(nodeId: string, optionsJson: string): string;
   aiInsertTextLayerForRegion(requestJson: string): string;
   aiListModelPacks(): string;
   aiInstallModelPack(packId: string, sourcePath: string): string;
   aiUninstallModelPack(packId: string): void;
   pdfImport(filePath: string): string;
+  figmaImport(filePath: string): string;
+  sketchImport(filePath: string): string;
   aiScreenshotToLayout(requestJson: string): string;
   aiAltTextForNode(nodeId: string): string;
   aiApplyAltText(nodeId: string, text: string): void;
@@ -444,6 +616,12 @@ export interface Bridge {
   colorSpotUpsert(wireJson: string): void;
   colorSpotRemove(name: string): boolean;
   colorSpotList(): string;
+  // Phase 3 — Pantone-style JSON catalogue loader. Parses `rawJson`
+  // via `kcreate_core::color::SpotColorLibrary::from_json_catalog`
+  // and merges it into the project's library. Returns a JSON
+  // `SpotCatalogLoadReportWire { added, overwritten, parsed }`.
+  // Recorded as a single undoable `spot_color_load_catalog` op.
+  colorSpotLoadCatalog(rawJson: string): string;
   // Phase 5 — smart-guides snap engine (Block C Task 13/14). Returns
   // a JSON `SnapResult { dx, dy, guides }` or `null` when no project
   // is loaded. `movingId` is the dragged node so its own edges are

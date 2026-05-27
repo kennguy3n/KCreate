@@ -1,24 +1,72 @@
 // KChat design tokens. Mirrored here as TypeScript constants so
 // components can compose inline styles without dragging in a CSS-in-JS
-// library. Keep these in lockstep with the `:root` block in
-// `index.html`.
+// library. The colour values are CSS-variable references; the
+// concrete palette is defined in `index.html`'s `:root` and
+// `:root[data-theme="dark"]` blocks and switched at runtime by
+// `ThemeProvider` setting the `data-theme` attribute.
+//
+// This indirection means *every* `style={{ color: colors.text }}`
+// pattern in the renderer automatically participates in light/dark
+// theming without any per-component refactor — the browser
+// re-evaluates `var(...)` whenever the cascade changes.
 
 export const colors = {
-  accent: "#7C3AED",
-  accentHover: "#6D28D9",
-  bg: "#FFFFFF",
-  bgSoft: "#F5F3FF",
-  bgCanvas: "#1e1e1e",
-  border: "#E5E7EB",
-  text: "#111827",
-  textMuted: "#4B5563",
-  textInverse: "#FFFFFF",
+  accent: "var(--kc-accent)",
+  accentHover: "var(--kc-accent-hover)",
+  /// Low-alpha accent tint for soft chip / pill backgrounds
+  /// (PluginManager WASM tag, ScreenshotToLayout drop zone). Use
+  /// this instead of template-string concat of `accent` + a hex
+  /// alpha suffix — `accent` is a `var(...)` reference, not a hex
+  /// literal, so `${colors.accent}22` produces invalid CSS at
+  /// runtime. The token carries the alpha baked into the channel
+  /// space so dark mode can re-balance the tint without touching
+  /// every call site.
+  accentBgSoft: "var(--kc-accent-bg-soft)",
+  /// Mid-alpha accent halo for focus rings / selection outlines
+  /// (TemplatePicker selected card). Same indirection rationale as
+  /// `accentBgSoft`.
+  accentRing: "var(--kc-accent-ring)",
+  bg: "var(--kc-bg)",
+  bgSoft: "var(--kc-bg-soft)",
+  bgCanvas: "var(--kc-bg-canvas)",
+  border: "var(--kc-border)",
+  text: "var(--kc-text)",
+  textMuted: "var(--kc-text-muted)",
+  textInverse: "var(--kc-text-inverse)",
   /// Used by the Phase 3 presence indicator for "peer is online
   /// and has broadcast presence in the past few seconds".
-  success: "#16A34A",
+  success: "var(--kc-success)",
   /// Used by error banners and the "leave session" destructive
   /// CTA in the PresencePanel.
-  danger: "#DC2626",
+  danger: "var(--kc-danger)",
+  /// Solid background tint for destructive states (e.g. failed-load
+  /// banners in AuditPanel / TemplateMarketplace). Auto-flips for
+  /// dark mode via the override in index.html.
+  dangerBg: "var(--kc-danger-bg)",
+  /// Lower-alpha background tint for destructive accents inside
+  /// dense panels (chip/badge backgrounds in PluginManager,
+  /// ModelManager, AIAssistPanel).
+  dangerBgSoft: "var(--kc-danger-bg-soft)",
+  /// Mid-alpha danger border for destructive callout cards
+  /// (McpSettingsPanel "MCP off" notice). Same indirection
+  /// rationale as `accentBgSoft`.
+  dangerBorder: "var(--kc-danger-border)",
+  /// High-alpha (0.85) translucent danger overlay for floating
+  /// error toasts where the underlying content must remain
+  /// partly visible — currently the PrototypePlayer error pill.
+  /// **Do not** substitute `colors.danger` here: `danger` is
+  /// fully opaque, which hides the prototype content the user
+  /// is trying to debug. The 0.85 alpha is baked into the CSS
+  /// variable so dark mode adjusts the underlying hue without
+  /// per-component changes.
+  dangerOverlay: "var(--kc-danger-overlay)",
+  /// Warning accent (preflight warnings, plugin permission badges).
+  warn: "var(--kc-warn)",
+  warnBg: "var(--kc-warn-bg)",
+  warnBgSoft: "var(--kc-warn-bg-soft)",
+  /// Info accent (preflight info findings).
+  info: "var(--kc-info)",
+  infoBg: "var(--kc-info-bg)",
 } as const;
 
 export const radius = {
@@ -31,9 +79,13 @@ export const radius = {
   md: 6,
 } as const;
 
+// Shadow tokens are CSS variable references so they automatically pick
+// up the dark-mode override defined in index.html (`--kc-shadow` and
+// `--kc-shadow-hover` are redefined under `:root[data-theme="dark"]`
+// with stronger alphas to match the darker substrate).
 export const shadow = {
-  card: "0 1px 3px rgba(0, 0, 0, 0.08)",
-  cardHover: "0 4px 12px rgba(124, 58, 237, 0.18)",
+  card: "var(--kc-shadow)",
+  cardHover: "var(--kc-shadow-hover)",
 } as const;
 
 export const spacing = {

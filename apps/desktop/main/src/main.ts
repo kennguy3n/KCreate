@@ -862,6 +862,15 @@ function registerIpcHandlers(): void {
       requireBridge().documentDeleteNode(nodeId);
     },
   );
+  // Phase 6 Tasks 27-28 — layer-colour tag. `color` is either a
+  // colour key string (canonicalised by the Rust side) or `null` to
+  // clear. Returns the node's post-mutation `version` so renderer
+  // listeners can re-key effects without a full tree refresh.
+  ipcMain.handle(
+    "kcreate/document/setLayerColor",
+    (_e, nodeId: string, color: string | null) =>
+      requireBridge().documentSetLayerColor(nodeId, color),
+  );
   // `kcreate/document/undo` and `.../redo` may roll back / replay a
   // `color_settings_update` operation as of Phase 2 (the bridge owns
   // the dispatch — see `crates/kcreate_bridge/src/document.rs`'s
@@ -898,6 +907,24 @@ function registerIpcHandlers(): void {
     if (result) broadcastForCommand(result.command);
     return result;
   });
+  ipcMain.handle("kcreate/document/undoGroup", () => {
+    const result = requireBridge().documentUndoGroup();
+    if (result) broadcastForCommand(result.command);
+    return result;
+  });
+  ipcMain.handle("kcreate/document/redoGroup", () => {
+    const result = requireBridge().documentRedoGroup();
+    if (result) broadcastForCommand(result.command);
+    return result;
+  });
+  ipcMain.handle("kcreate/document/listDiscardedBranches", () =>
+    requireBridge().documentListDiscardedBranches(),
+  );
+  ipcMain.handle(
+    "kcreate/document/restoreDiscardedBranch",
+    (_e, indexFromBack: number): boolean =>
+      requireBridge().documentRestoreDiscardedBranch(indexFromBack),
+  );
   ipcMain.handle("kcreate/document/status", () =>
     requireBridge().documentStatus(),
   );
@@ -1450,6 +1477,87 @@ function registerIpcHandlers(): void {
     (_e, templateId: string): string =>
       requireBridge().layoutTemplateApply(templateId),
   );
+
+  // Local template marketplace (Phase 3 — Tasks 11-12). The
+  // renderer's TemplateMarketplace panel calls list/install/remove
+  // here; the bridge persists installs by copying the .ktemplate
+  // folder into ~/.kcreate/templates/ (configurable via the
+  // KCREATE_TEMPLATE_DIR env var the bridge reads). `category` and
+  // `query` are nullable on the IPC side so the renderer can omit
+  // them; we normalise null → undefined for the napi signature.
+  ipcMain.handle(
+    "kcreate/template/list",
+    (_e, category: string | null, query: string | null): string =>
+      requireBridge().templateList(
+        category ?? undefined,
+        query ?? undefined,
+      ),
+  );
+  ipcMain.handle(
+    "kcreate/template/installLocal",
+    (_e, sourcePath: string): string =>
+      requireBridge().templateInstallLocal(sourcePath),
+  );
+  ipcMain.handle(
+    "kcreate/template/remove",
+    (_e, templateId: string): void => {
+      requireBridge().templateRemove(templateId);
+    },
+  );
+  // Phase 6 — Audit log (Tasks 13–14)
+  ipcMain.handle(
+    "kcreate/audit/record",
+    (_e, eventJson: string): string =>
+      requireBridge().auditRecord(eventJson),
+  );
+  ipcMain.handle(
+    "kcreate/audit/query",
+    (_e, queryJson: string): string =>
+      requireBridge().auditQuery(queryJson),
+  );
+  ipcMain.handle(
+    "kcreate/audit/count",
+    (): number => requireBridge().auditCount(),
+  );
+  ipcMain.handle(
+    "kcreate/audit/purge",
+    (_e, cutoffIso: string): number =>
+      requireBridge().auditPurge(cutoffIso),
+  );
+  ipcMain.handle(
+    "kcreate/audit/path",
+    (): string => requireBridge().auditPath(),
+  );
+
+  // Phase 6 — Tasks 17-18: lazy thumbnail cache + recent-projects.
+  // All five handlers go through `requireBridge()` (which throws on
+  // the no-bridge path) so the renderer always sees a meaningful
+  // error rather than a `TypeError: undefined.thumbnailForCover`.
+  ipcMain.handle(
+    "kcreate/thumbnail/forCover",
+    (_e, maxDimPx: number) => requireBridge().thumbnailForCover(maxDimPx),
+  );
+  ipcMain.handle(
+    "kcreate/thumbnail/forPage",
+    (_e, pageId: string, maxDimPx: number) =>
+      requireBridge().thumbnailForPage(pageId, maxDimPx),
+  );
+  ipcMain.handle(
+    "kcreate/thumbnail/prepareBackground",
+    (_e, maxDimPx: number): void => {
+      requireBridge().thumbnailPrepareBackground(maxDimPx);
+    },
+  );
+  ipcMain.handle(
+    "kcreate/recent/list",
+    () => requireBridge().recentProjectsList(),
+  );
+  ipcMain.handle(
+    "kcreate/recent/coverBytes",
+    (_e, projectDir: string) =>
+      requireBridge().recentProjectCoverBytes(projectDir),
+  );
+
   ipcMain.handle(
     "kcreate/page/add",
     (
@@ -1476,6 +1584,33 @@ function registerIpcHandlers(): void {
         index,
       );
     },
+  );
+  // -------------------------------------------------------------------
+  // Phase 6 Tasks 25-26 — node clipboard. Renderer marshals the OS
+  // clipboard text; this IPC just serialises selected node ids into a
+  // portable JSON payload (copy) and instantiates fresh nodes from a
+  // payload (paste).
+  // -------------------------------------------------------------------
+  ipcMain.handle(
+    "kcreate/clipboard/copy",
+    (_e, nodeIds: string[]): string =>
+      requireBridge().documentClipboardCopy(nodeIds),
+  );
+  ipcMain.handle(
+    "kcreate/clipboard/paste",
+    (
+      _e,
+      payload: string,
+      targetParentId: string | null | undefined,
+      offsetX: number,
+      offsetY: number,
+    ): string[] =>
+      requireBridge().documentClipboardPaste(
+        payload,
+        targetParentId ?? undefined,
+        offsetX,
+        offsetY,
+      ),
   );
 
   // ---------------------------------------------------------------------
@@ -1517,6 +1652,39 @@ function registerIpcHandlers(): void {
     "kcreate/ai/smartSelect",
     (_e, nodeId: string, x: number, y: number, tolerance: number) =>
       requireBridge().aiSmartSelect(nodeId, x, y, tolerance),
+  );
+  ipcMain.handle(
+    "kcreate/ai/upscaleWithBackend",
+    (
+      _e,
+      nodeId: string,
+      scale: number,
+      backend: string,
+      modelPath: string,
+    ) =>
+      requireBridge().aiUpscaleWithBackend(nodeId, scale, backend, modelPath),
+  );
+  ipcMain.handle(
+    "kcreate/ai/segment",
+    (
+      _e,
+      nodeId: string,
+      pointX: number,
+      pointY: number,
+      tolerance: number,
+      edgeThreshold: number,
+      backend: string,
+      modelPath: string,
+    ) =>
+      requireBridge().aiSegment(
+        nodeId,
+        pointX,
+        pointY,
+        tolerance,
+        edgeThreshold,
+        backend,
+        modelPath,
+      ),
   );
   ipcMain.handle(
     "kcreate/ai/detectTextRegions",
@@ -1588,6 +1756,53 @@ function registerIpcHandlers(): void {
   });
   ipcMain.handle("kcreate/pdf/import", (_e, filePath: string) =>
     requireBridge().pdfImport(filePath),
+  );
+  // `kcreate/figma/pickFile` mirrors the PDF picker exactly: keep
+  // the OS dialog in the main process so the renderer never sees
+  // the filesystem. The Rust side (`crates/kcreate_export/src/
+  // figma_import.rs`) only understands UTF-8 JSON, so the filter is
+  // scoped to `.json`. Figma exports come in two shapes (the REST
+  // API dump `.json` and the official `figma export-json` plugin's
+  // `.fig.json`) — both are matched by the single `.json`
+  // extension entry. The legacy `.fig` binary container is
+  // *not* a JSON export and would deterministically fail
+  // `serde_json::from_slice` in the importer, so including it in
+  // the filter only misleads users about what's supported.
+  ipcMain.handle("kcreate/figma/pickFile", async () => {
+    const win = mainWindow;
+    if (!win) return null;
+    const result = await dialog.showOpenDialog(win, {
+      title: "Import Figma JSON",
+      properties: ["openFile"],
+      filters: [
+        { name: "Figma JSON (*.json, *.fig.json)", extensions: ["json"] },
+        { name: "All files", extensions: ["*"] },
+      ],
+    });
+    if (result.canceled || result.filePaths.length === 0) return null;
+    return result.filePaths[0];
+  });
+  ipcMain.handle("kcreate/figma/import", (_e, filePath: string) =>
+    requireBridge().figmaImport(filePath),
+  );
+  // `kcreate/sketch/pickFile` — scoped to `.sketch` (Sketch's ZIP
+  // archive container).
+  ipcMain.handle("kcreate/sketch/pickFile", async () => {
+    const win = mainWindow;
+    if (!win) return null;
+    const result = await dialog.showOpenDialog(win, {
+      title: "Import Sketch file",
+      properties: ["openFile"],
+      filters: [
+        { name: "Sketch", extensions: ["sketch"] },
+        { name: "All files", extensions: ["*"] },
+      ],
+    });
+    if (result.canceled || result.filePaths.length === 0) return null;
+    return result.filePaths[0];
+  });
+  ipcMain.handle("kcreate/sketch/import", (_e, filePath: string) =>
+    requireBridge().sketchImport(filePath),
   );
   ipcMain.handle(
     "kcreate/ai/screenshotToLayout",
@@ -1758,6 +1973,10 @@ function registerIpcHandlers(): void {
   );
   ipcMain.handle("kcreate/color/spot/list", () =>
     requireBridge().colorSpotList(),
+  );
+  ipcMain.handle(
+    "kcreate/color/spot/load-catalog",
+    (_e, rawJson: string) => requireBridge().colorSpotLoadCatalog(rawJson),
   );
 
   // ---------------------------------------------------------------------

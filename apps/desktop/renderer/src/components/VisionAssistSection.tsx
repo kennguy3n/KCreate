@@ -296,7 +296,7 @@ function badgeStyle(kind: "ok" | "warn"): React.CSSProperties {
     padding: "2px 6px",
     borderRadius: radius.pill,
     background:
-      kind === "ok" ? "rgba(124,58,237,0.15)" : "rgba(220,38,38,0.10)",
+      kind === "ok" ? "rgba(124,58,237,0.15)" : colors.dangerBgSoft,
     color: kind === "ok" ? colors.accent : colors.danger,
     textTransform: "uppercase",
     letterSpacing: 0.4,
@@ -337,7 +337,7 @@ function statusStripStyle(kind: "ok" | "err"): React.CSSProperties {
     fontSize: 11,
     borderRadius: radius.md,
     background:
-      kind === "ok" ? "rgba(124,58,237,0.08)" : "rgba(220,38,38,0.08)",
+      kind === "ok" ? "rgba(124,58,237,0.08)" : colors.dangerBgSoft,
     color: kind === "ok" ? colors.accent : colors.danger,
     border: `1px solid ${kind === "ok" ? colors.accent : colors.danger}`,
   };

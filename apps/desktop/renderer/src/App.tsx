@@ -58,6 +58,22 @@ export function App(): JSX.Element {
     });
   }, []);
 
+  // Open a project from the HomePage's Recent grid. The bridge's
+  // `projectOpen` does the heavy lifting (workspace mount, scene
+  // sync, audit + recent-list update). Failures route to the error
+  // surface identically to the scratch-project path.
+  const handleOpenProject = useCallback(async (projectDir: string) => {
+    try {
+      const project = await window.kcreate.document.openProject(projectDir);
+      setRoute({ kind: "editor", project });
+    } catch (e) {
+      setRoute({
+        kind: "error",
+        message: e instanceof Error ? e.message : String(e),
+      });
+    }
+  }, []);
+
   if (route.kind === "editor") {
     return (
       <EditorPage project={route.project} onBackHome={handleBackHome} />
@@ -79,7 +95,12 @@ export function App(): JSX.Element {
       </div>
     );
   }
-  return <HomePage onOpenEditor={handleOpenEditor} />;
+  return (
+    <HomePage
+      onOpenEditor={handleOpenEditor}
+      onOpenProject={(p) => void handleOpenProject(p)}
+    />
+  );
 }
 
 async function openScratchProject(): Promise<ProjectInfo> {

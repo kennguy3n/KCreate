@@ -469,6 +469,30 @@ export interface UndoRedoOutcome {
 }
 
 /**
+ * Summary of a discarded redo tail, surfaced to the renderer so the
+ * branch panel can offer "recover branch" affordances. Mirrors
+ * `crates/kcreate_bridge/src/document.rs::DiscardedBranchSummary`.
+ *
+ * - `anchorPosition`: the timeline cursor index this branch would
+ *   re-attach to if restored. Stale anchors (the user did more work
+ *   after the branch was captured) cause
+ *   {@link DocumentBridge.restoreDiscardedBranch} to return `false`.
+ * - `opCount`: number of ops in the discarded tail. For grouped
+ *   compound operations this is the size of the group.
+ * - `discardedAtIso`: RFC 3339 UTC timestamp; the panel sorts
+ *   most-recent-first using this field.
+ * - `firstCommand`: stable `Operation::command` of the first op in
+ *   the discarded tail. Used as a one-line preview ("Recover:
+ *   artboard_create").
+ */
+export interface DiscardedBranchSummary {
+  anchorPosition: number;
+  opCount: number;
+  discardedAtIso: string;
+  firstCommand: string;
+}
+
+/**
  * Mirror of `kcreate_export::code_gen::InspectCode`. Each field is
  * a copy-paste-ready snippet describing one rendering target's
  * style for the selected node.
@@ -549,8 +573,47 @@ export interface DocumentBridge {
   /// stack.
   nodeExtraStrokes(nodeId: string): Promise<StrokeStyleWire[] | null>;
   deleteNode(nodeId: string): Promise<void>;
+  /**
+   * Phase 6 Tasks 27-28 — install or clear a layer-colour tag on
+   * `nodeId`. Pass a non-empty string to install (the bridge
+   * canonicalises whitespace + case before storing under
+   * `Node::metadata["layerColor"]`); pass `null` to clear. Returns
+   * the node's new `version` so renderer-side effects keyed on
+   * `[id, version]` re-fire without a full `getTree()` round-trip.
+   */
+  setLayerColor(nodeId: string, color: string | null): Promise<number>;
   undo(): Promise<UndoRedoOutcome | null>;
   redo(): Promise<UndoRedoOutcome | null>;
+  /**
+   * Group-aware undo (Phase 6 Task 15). Consumes the entire
+   * contiguous run of ops at the head of the undo stack that share
+   * the same `group_id` — a `drag-to-move` sequence recorded as 50
+   * `canvas_move_node` ops with the same group id undoes as a single
+   * user action. Falls back to single-op undo when the head op
+   * carries no group id. Resolves to `null` when no project is
+   * loaded or the stack is empty. Mirrors `document_undo_group` on
+   * the Rust bridge — see `crates/kcreate_bridge/src/document.rs`.
+   */
+  undoGroup(): Promise<UndoRedoOutcome | null>;
+  /** Symmetric with {@link undoGroup}. */
+  redoGroup(): Promise<UndoRedoOutcome | null>;
+  /**
+   * Newest-first list of redo tails that were dropped because the
+   * user pushed a new op after undoing some history (Phase 6
+   * Task 16). The branch panel uses this list to offer "recover
+   * branch" UX. Bounded by `OperationLog::max_branches` (16 by
+   * default).
+   */
+  listDiscardedBranches(): Promise<DiscardedBranchSummary[]>;
+  /**
+   * Restore the discarded branch at `indexFromBack` (0 = newest, as
+   * listed by {@link listDiscardedBranches}). Returns `true` on
+   * success, `false` if the index is out of range OR the branch's
+   * `anchorPosition` no longer matches the current undo cursor.
+   * Restored ops appear at the head of the redo stack — the user
+   * presses Redo / Ctrl+Y to replay them.
+   */
+  restoreDiscardedBranch(indexFromBack: number): Promise<boolean>;
 
   /**
    * Snapshot of the open document's editing state, or `null` if no
@@ -1357,23 +1420,268 @@ export interface LayoutStudioBridge {
 }
 
 // ---------------------------------------------------------------------------
+// Phase 3 — Local template marketplace (Tasks 11-12).
+//
+// Mirrors `kcreate_core::marketplace::{TemplateSource, TemplateManifest,
+// MarketplaceError}`. The renderer's TemplateMarketplace panel calls
+// `window.kcreate.templateMarketplace.{list,installLocal,remove}` to
+// surface the contents of `~/.kcreate/templates/` (or whichever
+// directory is pointed to by the `KCREATE_TEMPLATE_DIR` env var the
+// bridge respects).
+// ---------------------------------------------------------------------------
+
+/**
+ * Mirror of `kcreate_core::marketplace::TemplateSource` —
+ * tagged-union with a single Phase 3 variant for local-on-disk
+ * templates. A future remote-marketplace variant would live here
+ * alongside `Local`.
+ */
+export type TemplateSource = {
+  type: "local";
+  /** Absolute path of the `.ktemplate/` folder on the user's disk. */
+  path: string;
+};
+
+/**
+ * Manifest of an installed template, mirrors
+ * `kcreate_core::marketplace::TemplateManifest`. Wire-format lockstep
+ * (AGENTS.md rule 4).
+ */
+export interface TemplateManifest {
+  id: string;
+  name: string;
+  description: string;
+  category: TemplateCategory;
+  tags: string[];
+  /** Relative path to a thumbnail image inside the template folder. */
+  thumbnail: string | null;
+  page_count: number;
+  author: string | null;
+  version: string;
+  source: TemplateSource | null;
+}
+
+/** Mirror of `kcreate_bridge::phase2::TemplateListReport`. */
+export interface TemplateListReport {
+  templates: TemplateManifest[];
+}
+
+export interface TemplateMarketplaceBridge {
+  /**
+   * List installed templates from the marketplace directory.
+   * `category` filters by `TemplateCategory` discriminant;
+   * `query` filters by case-insensitive substring against name,
+   * tag, or description. When both are supplied, the renderer's
+   * convention is that a non-empty query overrides the category
+   * (search bar dominates).
+   */
+  list(
+    category?: TemplateCategory,
+    query?: string,
+  ): Promise<TemplateListReport>;
+  /**
+   * Install a `.ktemplate/` folder from `sourcePath` into the
+   * marketplace root (copies the directory). Returns the installed
+   * manifest. Rejects with `Status::InvalidArg` if the source has no
+   * valid manifest or the same id is already installed.
+   */
+  installLocal(sourcePath: string): Promise<TemplateManifest>;
+  /**
+   * Remove an installed template by id — deletes the `.ktemplate/`
+   * folder on disk. Rejects with `Status::InvalidArg` for an
+   * unknown id.
+   */
+  remove(templateId: string): Promise<void>;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 6 — Audit log (Tasks 13–14)
+// ---------------------------------------------------------------------------
+
+/** Discriminator for `AuditEventKind`. */
+export type AuditEventKindTag =
+  | "operation"
+  | "ai_action"
+  | "project"
+  | "other";
+
+/** Condensed operation record inside an audit event. */
+export interface AuditOperationRecord {
+  op_id: string;
+  command: string;
+  ai_generated: boolean;
+}
+
+/** Project lifecycle action payload. */
+export type AuditProjectAction =
+  | { action: "open"; path: string }
+  | { action: "close" }
+  | { action: "save" }
+  | { action: "export"; format: string; destination: string };
+
+/** Discriminated union matching `kcreate_audit::AuditEventKind`. */
+export type AuditEventKind =
+  | { type: "operation" } & AuditOperationRecord
+  | {
+      type: "ai_action";
+      action_type: string;
+      model: string;
+      compute_device: string;
+      prompt: string | null;
+    }
+  | { type: "project" } & AuditProjectAction
+  | { type: "other"; label: string; payload: unknown };
+
+/** One row from the audit log. */
+export interface AuditEvent {
+  id: string;
+  timestamp: string;
+  actor: string;
+  project_id: string | null;
+  affected_nodes: string[];
+  kind: AuditEventKind;
+}
+
+/** Filter for `audit.query()`. All fields optional — empty = match all. */
+export interface AuditQuery {
+  since?: string;
+  until?: string;
+  kind?: AuditEventKindTag;
+  project_id?: string;
+  affected_node?: string;
+  limit?: number;
+}
+
+/** Result of `audit.query()`. */
+export interface AuditQueryReport {
+  events: AuditEvent[];
+  total: number;
+}
+
+export interface AuditBridge {
+  /** Record an audit event. Returns the event's UUID. */
+  record(event: AuditEvent): Promise<string>;
+  /** Query the audit log. */
+  query(filter: AuditQuery): Promise<AuditQueryReport>;
+  /** Total row count in the audit log. */
+  count(): Promise<number>;
+  /** Delete rows older than `cutoffIso` (RFC 3339). Returns rows removed. */
+  purge(cutoffIso: string): Promise<number>;
+  /** Filesystem path of the current audit database. */
+  path(): Promise<string>;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 6 — Tasks 17-18: Lazy thumbnail cache + recent-projects.
+//
+// The N-API surface lives in `kcreate_bridge::lib::{thumbnail_for_cover,
+// thumbnail_for_page, thumbnail_prepare_background, recent_projects_list,
+// recent_project_cover_bytes}`; the wire types below mirror the
+// corresponding `#[napi(object)]` structs (`ThumbnailBytes`,
+// `RecentProjectInfo`, `RecentProjectCoverInfo`).
+//
+// `bytesBase64` is a standard (non-URL-safe) base64-encoded PNG. The
+// HomePage assembles `data:${mime};base64,${bytesBase64}` and pins it
+// as the `src` on an `<img>` so React can rely on browser-native
+// decoding + caching without a `Blob`/`createObjectURL` round-trip
+// (which would leak across HMR reloads).
+// ---------------------------------------------------------------------------
+
+export interface ThumbnailBytes {
+  width: number;
+  height: number;
+  mime: string;
+  byteSize: number;
+  bytesBase64: string;
+  /** BLAKE3 hex content hash of the encoded bytes. */
+  contentHash: string;
+}
+
+/** Cover-thumbnail metadata (no pixel bytes — see `recentProjectCoverBytes`). */
+export interface RecentProjectCoverInfo {
+  width: number;
+  height: number;
+  mime: string;
+  byteSize: number;
+  contentHash: string;
+}
+
+/** One entry on the persistent recent-projects roster. */
+export interface RecentProjectInfo {
+  /** Absolute path to the `.kstudio` directory. */
+  path: string;
+  /** Display name from the project manifest. */
+  name: string;
+  /** Manifest UUID as a hex string. Matches `ProjectInfo.id`. */
+  projectId: string;
+  /** RFC 3339 UTC of the last project mutation. */
+  modifiedAt: string;
+  /** RFC 3339 UTC of the most recent open / create through the bridge. */
+  lastOpenedAt: string;
+  /** Best-effort cover-thumbnail metadata. `null` when none is cached. */
+  cover: RecentProjectCoverInfo | null;
+}
+
+export interface ThumbnailBridge {
+  /**
+   * Ensure the current project has a cover thumbnail on disk and
+   * return its bytes. On a cache hit no rendering is performed.
+   * `maxDimPx === 0` means "use the default" (320 px on the long
+   * edge — see `kcreate_bridge::thumbnails::DEFAULT_THUMBNAIL_MAX_DIM_PX`).
+   * Errors with `NoProject` when no project is open.
+   */
+  forCover(maxDimPx: number): Promise<ThumbnailBytes>;
+  /**
+   * Same shape as `forCover`, but for a specific page node id.
+   * Errors with `NodeNotFound` for unknown ids or `InvalidArgument`
+   * when the id refers to a non-Page node.
+   */
+  forPage(pageId: string, maxDimPx: number): Promise<ThumbnailBytes>;
+  /**
+   * Spawn a background worker that pre-warms every page's thumbnail.
+   * Returns immediately. Becomes a no-op when low-resource mode is
+   * active (per ARCHITECTURE.md §14: "skip speculative thumbnails").
+   */
+  prepareBackground(maxDimPx: number): Promise<void>;
+}
+
+export interface RecentProjectsBridge {
+  /** Snapshot the persistent recent-projects list (most-recent-first). */
+  list(): Promise<RecentProjectInfo[]>;
+  /**
+   * Read the cached cover bytes for a project on the recent list
+   * *without* opening the project. Returns `null` when no cover is
+   * cached for that path (e.g. the user has never opened the project
+   * since the cache was introduced).
+   */
+  coverBytes(projectDir: string): Promise<ThumbnailBytes | null>;
+}
+
+// ---------------------------------------------------------------------------
 // Phase 2 — Preflight, Icon Pack, Batch Async, AI extras, Plugin sandbox,
 // MCP permission persistence, Screenshot-to-Layout.
 // ---------------------------------------------------------------------------
 
 export type PreflightSeverity = "error" | "warning" | "info";
 
+// AGENTS.md rule 4: must mirror `kcreate_export::preflight::PreflightCheck`
+// 1:1. Every variant in the Rust enum's `as_str()` (preflight.rs:124-137)
+// must appear here, otherwise the renderer's switch statements lose
+// exhaustiveness.
 export type PreflightCheckId =
   | "bleed_margin"
   | "font_embed"
   | "image_resolution"
   | "color_space"
+  | "overprint_table"
+  | "trapping"
   | "transparency"
   | "page_size"
   | "shading"
   | "font_glyph_coverage"
   | "total_ink_coverage"
-  | "bleed_area_empty";
+  | "bleed_area_empty"
+  | "spot_color_missing";
 
 export interface PreflightIssue {
   check: PreflightCheckId;
@@ -1672,6 +1980,36 @@ export interface LayoutSuggestion {
   alignment: LayoutAlignment | null;
 }
 
+/// Serde-rendered name for `kcreate_ai::UpscaleBackend`. The string
+/// is passed through to the bridge verbatim and parsed there; keep
+/// in sync with the Rust enum if a new variant is added.
+export type UpscaleBackendWire = "lanczos3" | "esrgan";
+
+/// Serde-rendered name for `kcreate_ai::SegmentBackend`.
+export type SegmentBackendWire = "edge_aware" | "sam";
+
+/// Wire mirror of `kcreate_bridge::phase2::UpscaleWithBackendReport`.
+export interface UpscaleWithBackendReportWire {
+  /// The id of the newly inserted RasterLayer node.
+  newNodeId: string;
+  /// The backend that produced the result. Matches the request.
+  backend: UpscaleBackendWire;
+  outputWidth: number;
+  outputHeight: number;
+}
+
+/// Wire mirror of `kcreate_bridge::phase2::SegmentReport`. The mask
+/// is base64-encoded so the IPC channel stays a string-only wire.
+export interface SegmentReportWire {
+  backend: SegmentBackendWire;
+  width: number;
+  height: number;
+  /// `width * height` bytes, `255` = foreground, `0` = background.
+  maskBase64: string;
+  area: number;
+  confidence: number;
+}
+
 export interface AiModelBridge {
   upscale(nodeId: string, scale: number): Promise<string>;
   extractPalette(nodeId: string, maxColors: number): Promise<ExtractedColor[]>;
@@ -1681,6 +2019,30 @@ export interface AiModelBridge {
     y: number,
     tolerance: number,
   ): Promise<string>;
+  /// Backend-selectable upscale. `backend = "lanczos3"` is built-in
+  /// and always available; `backend = "esrgan"` requires the
+  /// `onnx_upscale` Cargo feature on the kcreate_ai build and a
+  /// valid model file path (typically resolved via
+  /// `listModelPacks()` then the installed pack's `file_path`).
+  upscaleWithBackend(
+    nodeId: string,
+    scale: number,
+    backend: UpscaleBackendWire,
+    modelPath: string,
+  ): Promise<UpscaleWithBackendReportWire>;
+  /// Point-prompt segmentation. The built-in `edge_aware` backend
+  /// runs a real CIE-Lab + Sobel-edge-aware flood fill — no model
+  /// required. `backend = "sam"` selects the SAM ONNX path, which
+  /// requires the `onnx_segment` feature and a model file.
+  segment(
+    nodeId: string,
+    pointX: number,
+    pointY: number,
+    tolerance: number,
+    edgeThreshold: number,
+    backend: SegmentBackendWire,
+    modelPath: string,
+  ): Promise<SegmentReportWire>;
   listModelPacks(): Promise<ModelPack[]>;
   /// Open the native file picker scoped to weights files and return
   /// the chosen absolute path (or `null` if the user cancelled).
@@ -1829,6 +2191,58 @@ export interface PdfImportBridge {
   /// new Page per PDF page, with embedded images as RasterLayer
   /// children and extracted text as a TextLayer per page.
   importPdf(filePath: string): Promise<PdfImportReport>;
+}
+
+// AGENTS.md rule 4: must mirror `kcreate_bridge::phase2::FigmaImportReport`
+// 1:1. Camel-case keys are produced by serde
+// `#[serde(rename_all = "camelCase")]` on the Rust struct.
+export interface FigmaImportReport {
+  /// `document.name` from the Figma export, if present.
+  documentName: string | null;
+  /// New KCreate page ids in import order.
+  pageIds: string[];
+  /// Total child nodes (artboards, vectors, text, raster) created
+  /// across all imported pages.
+  nodesImported: number;
+  /// Nodes the importer dropped (unsupported types, no geometry,
+  /// shapeless image refs).
+  nodesSkipped: number;
+  /// Human-readable, non-fatal warnings.
+  warnings: string[];
+}
+
+// AGENTS.md rule 4: must mirror `kcreate_bridge::phase2::SketchImportReport`
+// 1:1.
+export interface SketchImportReport {
+  /// `metadata.name` from `document.json` when present.
+  documentName: string | null;
+  /// New KCreate page ids in import order.
+  pageIds: string[];
+  /// Total child nodes successfully created.
+  nodesImported: number;
+  /// Dropped nodes (unsupported classes, missing image refs).
+  nodesSkipped: number;
+  /// Human-readable, non-fatal warnings.
+  warnings: string[];
+}
+
+/// Renderer-facing Figma JSON import API. Symmetric with
+/// [`PdfImportBridge`] — pickFile keeps the OS picker in the main
+/// process, importFigma runs the Rust importer + ingest pass.
+export interface FigmaImportBridge {
+  /// Show an Electron file picker scoped to `.json` /
+  /// `.fig.json` and return the chosen absolute path.
+  pickFile(): Promise<string | null>;
+  /// Import the Figma JSON at `filePath` into the current project.
+  importFigma(filePath: string): Promise<FigmaImportReport>;
+}
+
+/// Renderer-facing `.sketch` import API.
+export interface SketchImportBridge {
+  /// Show an Electron file picker scoped to `.sketch`.
+  pickFile(): Promise<string | null>;
+  /// Import the Sketch archive at `filePath` into the current project.
+  importSketch(filePath: string): Promise<SketchImportReport>;
 }
 
 export type PluginType = "wasm" | "js_panel" | "native";
@@ -2156,6 +2570,20 @@ export interface ColorBridge {
   removeSpot(name: string): Promise<boolean>;
   /// List every spot color in the document.
   listSpots(): Promise<SpotColorWire[]>;
+  /// Parse a Pantone-style JSON catalogue and merge every swatch into
+  /// the project's `SpotColorLibrary`. `rawJson` is the full UTF-8
+  /// catalogue contents (the renderer reads the file from disk via
+  /// the native open-file dialog and passes the string here). The
+  /// catalogue can be either:
+  ///
+  /// * `{ "name": "...", "entries": [{ "id": "PANTONE 185 C", "cmyk": [..4 floats..] }, ...] }`
+  /// * a bare map `{ "PANTONE 185 C": { "cmyk": [..] }, "PANTONE 354 C": [..] }`
+  ///
+  /// CMYK channels outside `[0, 1]` are clamped; malformed entries
+  /// (wrong-length arrays, non-finite numbers) are dropped without
+  /// failing the rest of the load. Returns a structured report.
+  /// Recorded as a single undoable `spot_color_load_catalog` op.
+  loadCatalog(rawJson: string): Promise<SpotCatalogLoadReportWire>;
   /// Spec-shaped convenience wrapper for `upsertSpot` (Phase 5
   /// Block D Task 23). Equivalent to upsertSpot with
   /// `displayName = name`, no `libraryReference`.
@@ -2179,6 +2607,35 @@ export interface SpotColorWire {
   /// Tuple `(c, m, y, k)` in `[0, 1]`.
   fallbackCmyk: [number, number, number, number];
   libraryReference?: string;
+}
+
+/// Result of [`ColorBridge.loadCatalog`]. Mirrors
+/// `kcreate_bridge::phase2::SpotCatalogLoadReport` 1:1.
+///
+/// The four catalogue-level counters satisfy
+/// `rawEntries == parsed + duplicatesInCatalog + malformed`, so the
+/// renderer can show users exactly why a load dropped or dedup'd
+/// entries instead of presenting only the surviving `parsed` count
+/// (Devin Review ANALYSIS_0005 on PR #16).
+export interface SpotCatalogLoadReportWire {
+  /// Total entries in the catalogue file before any validation /
+  /// dedup. Mirrors `CatalogParseStats::raw_entries`.
+  rawEntries: number;
+  /// Entries that survived parsing and were merged into the project
+  /// library.
+  parsed: number;
+  /// Entries dropped because they collided on `name`/`id` with an
+  /// earlier well-formed entry in the same catalogue (last-write-
+  /// wins). Always `0` for the bare-map shape (JSON object keys are
+  /// unique at the parser level).
+  duplicatesInCatalog: number;
+  /// Entries dropped as malformed (wrong-length CMYK, non-finite
+  /// values, missing `id` in the wrapped form, etc.).
+  malformed: number;
+  /// Swatches newly inserted into the project library.
+  added: number;
+  /// Swatches that overwrote an existing entry of the same `name`.
+  overwritten: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -3026,6 +3483,45 @@ export interface ImageGenBridge {
   recommendedPack(): Promise<string>;
 }
 
+/**
+ * Phase 6 Tasks 25-26 — node clipboard.
+ *
+ * Mirrors `kcreate_bridge::document::{document_clipboard_copy,
+ * document_clipboard_paste}`. The renderer drives Ctrl+C / Ctrl+V
+ * through this surface: copy returns a self-contained JSON payload
+ * the main process stashes on the OS clipboard, paste accepts that
+ * payload back and instantiates fresh nodes (new ids, optional
+ * cursor-offset, recorded as an undoable `clipboard_paste`
+ * operation).
+ *
+ * The payload format is opaque to the renderer — Rust pins
+ * `version: 1` and rejects future versions explicitly so a future
+ * schema bump can't silently drop data.
+ */
+export interface ClipboardBridge {
+  /**
+   * Serialise `nodeIds` (each with their descendants) into a portable
+   * JSON payload. Page and Artboard ids are filtered out defensively —
+   * those have dedicated `page_duplicate` / `artboard_*` ops and must
+   * not flow through the generic clipboard.
+   */
+  copy(nodeIds: string[]): Promise<string>;
+  /**
+   * Deserialise `payload` and insert each subtree under
+   * `targetParentId` (or document root when `null`). Every id is
+   * regenerated so the paste is independent of the source nodes;
+   * each subtree's top-level root is offset by (`offsetX`, `offsetY`)
+   * so paste-at-cursor doesn't perfectly overlap the original.
+   * Returns the new root ids in source order.
+   */
+  paste(
+    payload: string,
+    targetParentId: string | null,
+    offsetX: number,
+    offsetY: number,
+  ): Promise<string[]>;
+}
+
 declare global {
   interface Window {
     kcreate: {
@@ -3048,11 +3544,17 @@ declare global {
       interaction: InteractionBridge;
       masterPage: MasterPageBridge;
       layoutStudio: LayoutStudioBridge;
+      templateMarketplace: TemplateMarketplaceBridge;
+      audit: AuditBridge;
+      thumbnail: ThumbnailBridge;
+      recentProjects: RecentProjectsBridge;
       preflight: PreflightBridge;
       iconPack: IconPackBridge;
       batch: BatchBridge;
       aiModel: AiModelBridge;
       pdfImport: PdfImportBridge;
+      figmaImport: FigmaImportBridge;
+      sketchImport: SketchImportBridge;
       plugin: PluginBridge;
       mcpPermission: McpPermissionBridge;
       color: ColorBridge;
@@ -3063,6 +3565,7 @@ declare global {
       slice: SliceBridge;
       session: SessionBridge;
       kchat: KChatBridge;
+      clipboard: ClipboardBridge;
     };
   }
 }

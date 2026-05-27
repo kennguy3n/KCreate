@@ -1280,8 +1280,8 @@ const kvValueStyle: React.CSSProperties = {
 
 function badgeStyle(kind: "ok" | "err"): React.CSSProperties {
   return {
-    background: kind === "ok" ? "rgba(124,58,237,0.15)" : "rgba(220,38,38,0.15)",
-    color: kind === "ok" ? colors.accent : "#dc2626",
+    background: kind === "ok" ? "rgba(124,58,237,0.15)" : colors.dangerBg,
+    color: kind === "ok" ? colors.accent : colors.danger,
     fontSize: 10,
     fontWeight: 600,
     padding: "2px 6px",
@@ -1297,9 +1297,9 @@ function statusStripStyle(kind: "ok" | "err"): React.CSSProperties {
     fontSize: 11,
     borderRadius: radius.card / 2,
     background:
-      kind === "ok" ? "rgba(124,58,237,0.08)" : "rgba(220,38,38,0.08)",
-    color: kind === "ok" ? colors.accent : "#dc2626",
-    border: `1px solid ${kind === "ok" ? colors.accent : "#dc2626"}`,
+      kind === "ok" ? "rgba(124,58,237,0.08)" : colors.dangerBgSoft,
+    color: kind === "ok" ? colors.accent : colors.danger,
+    border: `1px solid ${kind === "ok" ? colors.accent : colors.danger}`,
   };
 }
 

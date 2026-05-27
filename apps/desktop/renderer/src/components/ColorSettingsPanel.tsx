@@ -341,6 +341,6 @@ function errMsg(e: unknown): string {
 }
 
 function severityColor(s: "error"): string {
-  if (s === "error") return "#DC2626";
+  if (s === "error") return colors.danger;
   return colors.textMuted;
 }

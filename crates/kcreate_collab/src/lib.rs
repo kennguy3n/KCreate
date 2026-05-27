@@ -29,21 +29,25 @@
 //!   operations colliding with local edits, with deterministic peer-id
 //!   tie-breaking and pluggable [`conflict::ConflictResolver`] trait
 //!   for future strategies.
+//! * [`crdt`] — operational-CRDT layer on top of `Operation`: classifies
+//!   commands into delete / tree-move / property-update / create
+//!   buckets, merges concurrent disjoint-key property edits into a
+//!   single synthesised op, treats deletes as wins-over-edits, and
+//!   resolves concurrent tree moves with Lamport + peer-id tiebreak.
+//!   The transport layer asks the session to apply the resulting
+//!   [`crdt::CrdtDecision`] atomically.
 //!
 //! What this crate intentionally does **not** provide:
 //!
 //! * Any network I/O. The Phase 3 transport (mDNS discovery, QUIC,
 //!   Noise pre-shared-key handshake) is a separate crate that will
 //!   layer on top of these types.
-//! * Any CRDT semantics. KCreate's [`kcreate_core::operation::Operation`]
-//!   already records before/after JSON patches per command; ordering
-//!   plus LWW is sufficient for the user-facing "two designers on the
-//!   same LAN editing the same document" experience.
 //! * Any UI surface. The Phase 3 collaboration panel will hang off the
 //!   bridge layer like every other UI in KCreate.
 
 pub mod clock;
 pub mod conflict;
+pub mod crdt;
 pub mod envelope;
 pub mod journal;
 pub mod kchat;
@@ -53,6 +57,7 @@ pub mod session;
 
 pub use clock::LamportClock;
 pub use conflict::{ConflictDecision, ConflictResolver, LastWriterWinsResolver};
+pub use crdt::{classify as classify_operation, CrdtDecision, CrdtResolver, OperationCategory};
 pub use envelope::{CollabError, Envelope, EnvelopeBytes, SignedPayload, PROTOCOL_VERSION};
 pub use journal::{
     JournalEntry, JournalError, JournalStore, MemoryJournalStore, OperationJournal, ResumeVector,

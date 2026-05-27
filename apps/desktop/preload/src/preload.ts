@@ -8,6 +8,14 @@ import type {
   AcquiredFrame,
   AiBridge,
   ArtboardBridge,
+  AuditBridge,
+  AuditEvent,
+  AuditQuery,
+  AuditQueryReport,
+  ThumbnailBridge,
+  ThumbnailBytes,
+  RecentProjectsBridge,
+  RecentProjectInfo,
   ArtboardInfo,
   ArtboardPreset,
   BrandKit,
@@ -25,6 +33,10 @@ import type {
   LayoutBridge,
   LayoutStudioBridge,
   LayoutTemplate,
+  TemplateCategory,
+  TemplateListReport,
+  TemplateManifest,
+  TemplateMarketplaceBridge,
   MasterPageBridge,
   MasterPageInfo,
   PageLayout,
@@ -32,6 +44,7 @@ import type {
   PageSizeId,
   DesignTokens,
   DesignTokensBridge,
+  DiscardedBranchSummary,
   DocumentBridge,
   DocumentStatus,
   UndoRedoOutcome,
@@ -76,6 +89,10 @@ import type {
   WebpExportOptions,
   AiModelBridge,
   AltTextReport,
+  UpscaleBackendWire,
+  UpscaleWithBackendReportWire,
+  SegmentBackendWire,
+  SegmentReportWire,
   BatchBridge,
   BatchExportJob,
   BatchStatus,
@@ -92,6 +109,10 @@ import type {
   ModelPack,
   PdfImportBridge,
   PdfImportReport,
+  FigmaImportBridge,
+  FigmaImportReport,
+  SketchImportBridge,
+  SketchImportReport,
   JsPanelInfo,
   JsPanelMessage,
   JsPanelMessageOutcome,
@@ -113,6 +134,7 @@ import type {
   ColorSpaceName,
   ColorValue,
   SpotColorWire,
+  SpotCatalogLoadReportWire,
   CanvasSnapBridge,
   SnapResult,
   RasterOpsBridge,
@@ -144,6 +166,7 @@ import type {
   KChatMembershipStatus,
   SessionStartReport,
   TrustedIssuer,
+  ClipboardBridge,
 } from "../../shared/scene";
 
 type FrameInfoSnake = {
@@ -506,6 +529,16 @@ const document: DocumentBridge = {
   async deleteNode(nodeId: string): Promise<void> {
     await ipcRenderer.invoke("kcreate/document/deleteNode", nodeId);
   },
+  async setLayerColor(
+    nodeId: string,
+    color: string | null,
+  ): Promise<number> {
+    return (await ipcRenderer.invoke(
+      "kcreate/document/setLayerColor",
+      nodeId,
+      color,
+    )) as number;
+  },
   async undo(): Promise<UndoRedoOutcome | null> {
     return (await ipcRenderer.invoke(
       "kcreate/document/undo",
@@ -515,6 +548,27 @@ const document: DocumentBridge = {
     return (await ipcRenderer.invoke(
       "kcreate/document/redo",
     )) as UndoRedoOutcome | null;
+  },
+  async undoGroup(): Promise<UndoRedoOutcome | null> {
+    return (await ipcRenderer.invoke(
+      "kcreate/document/undoGroup",
+    )) as UndoRedoOutcome | null;
+  },
+  async redoGroup(): Promise<UndoRedoOutcome | null> {
+    return (await ipcRenderer.invoke(
+      "kcreate/document/redoGroup",
+    )) as UndoRedoOutcome | null;
+  },
+  async listDiscardedBranches(): Promise<DiscardedBranchSummary[]> {
+    return (await ipcRenderer.invoke(
+      "kcreate/document/listDiscardedBranches",
+    )) as DiscardedBranchSummary[];
+  },
+  async restoreDiscardedBranch(indexFromBack: number): Promise<boolean> {
+    return (await ipcRenderer.invoke(
+      "kcreate/document/restoreDiscardedBranch",
+      indexFromBack,
+    )) as boolean;
   },
   async status(): Promise<DocumentStatus | null> {
     const raw = (await ipcRenderer.invoke(
@@ -1334,6 +1388,103 @@ const layoutStudio: LayoutStudioBridge = {
 };
 
 // ---------------------------------------------------------------------------
+// Phase 3 — local template marketplace (Tasks 11-12).
+// ---------------------------------------------------------------------------
+
+const templateMarketplace: TemplateMarketplaceBridge = {
+  async list(
+    category?: TemplateCategory,
+    query?: string,
+  ): Promise<TemplateListReport> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/template/list",
+      category ?? null,
+      query ?? null,
+    )) as string;
+    return JSON.parse(raw) as TemplateListReport;
+  },
+  async installLocal(sourcePath: string): Promise<TemplateManifest> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/template/installLocal",
+      sourcePath,
+    )) as string;
+    return JSON.parse(raw) as TemplateManifest;
+  },
+  async remove(templateId: string): Promise<void> {
+    await ipcRenderer.invoke("kcreate/template/remove", templateId);
+  },
+};
+
+// ---------------------------------------------------------------------------
+// Phase 6 — Audit log (Tasks 13–14)
+// ---------------------------------------------------------------------------
+
+const audit: AuditBridge = {
+  async record(event: AuditEvent): Promise<string> {
+    return (await ipcRenderer.invoke(
+      "kcreate/audit/record",
+      JSON.stringify(event),
+    )) as string;
+  },
+  async query(filter: AuditQuery): Promise<AuditQueryReport> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/audit/query",
+      JSON.stringify(filter),
+    )) as string;
+    return JSON.parse(raw) as AuditQueryReport;
+  },
+  async count(): Promise<number> {
+    return (await ipcRenderer.invoke("kcreate/audit/count")) as number;
+  },
+  async purge(cutoffIso: string): Promise<number> {
+    return (await ipcRenderer.invoke(
+      "kcreate/audit/purge",
+      cutoffIso,
+    )) as number;
+  },
+  async path(): Promise<string> {
+    return (await ipcRenderer.invoke("kcreate/audit/path")) as string;
+  },
+};
+
+// ---------------------------------------------------------------------------
+// Phase 6 — Tasks 17-18: lazy thumbnail cache + recent-projects.
+// ---------------------------------------------------------------------------
+
+const thumbnail: ThumbnailBridge = {
+  async forCover(maxDimPx: number): Promise<ThumbnailBytes> {
+    return (await ipcRenderer.invoke(
+      "kcreate/thumbnail/forCover",
+      maxDimPx,
+    )) as ThumbnailBytes;
+  },
+  async forPage(pageId: string, maxDimPx: number): Promise<ThumbnailBytes> {
+    return (await ipcRenderer.invoke(
+      "kcreate/thumbnail/forPage",
+      pageId,
+      maxDimPx,
+    )) as ThumbnailBytes;
+  },
+  async prepareBackground(maxDimPx: number): Promise<void> {
+    await ipcRenderer.invoke("kcreate/thumbnail/prepareBackground", maxDimPx);
+  },
+};
+
+const recentProjects: RecentProjectsBridge = {
+  async list(): Promise<RecentProjectInfo[]> {
+    return (await ipcRenderer.invoke(
+      "kcreate/recent/list",
+    )) as RecentProjectInfo[];
+  },
+  async coverBytes(projectDir: string): Promise<ThumbnailBytes | null> {
+    return (await ipcRenderer.invoke(
+      "kcreate/recent/coverBytes",
+      projectDir,
+    )) as ThumbnailBytes | null;
+  },
+};
+
+// ---------------------------------------------------------------------------
 // Phase 2 — preflight, icon pack, batch async, AI extras, plugins, MCP perms.
 // ---------------------------------------------------------------------------
 
@@ -1420,6 +1571,42 @@ const aiModel: AiModelBridge = {
       y,
       tolerance,
     )) as string;
+  },
+  async upscaleWithBackend(
+    nodeId: string,
+    scale: number,
+    backend: UpscaleBackendWire,
+    modelPath: string,
+  ): Promise<UpscaleWithBackendReportWire> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/ai/upscaleWithBackend",
+      nodeId,
+      scale,
+      backend,
+      modelPath,
+    )) as string;
+    return JSON.parse(raw) as UpscaleWithBackendReportWire;
+  },
+  async segment(
+    nodeId: string,
+    pointX: number,
+    pointY: number,
+    tolerance: number,
+    edgeThreshold: number,
+    backend: SegmentBackendWire,
+    modelPath: string,
+  ): Promise<SegmentReportWire> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/ai/segment",
+      nodeId,
+      pointX,
+      pointY,
+      tolerance,
+      edgeThreshold,
+      backend,
+      modelPath,
+    )) as string;
+    return JSON.parse(raw) as SegmentReportWire;
   },
   async detectTextRegions(
     nodeId: string,
@@ -1510,6 +1697,36 @@ const pdfImport: PdfImportBridge = {
       filePath,
     )) as string;
     return JSON.parse(raw) as PdfImportReport;
+  },
+};
+
+const figmaImport: FigmaImportBridge = {
+  async pickFile(): Promise<string | null> {
+    return (await ipcRenderer.invoke(
+      "kcreate/figma/pickFile",
+    )) as string | null;
+  },
+  async importFigma(filePath: string): Promise<FigmaImportReport> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/figma/import",
+      filePath,
+    )) as string;
+    return JSON.parse(raw) as FigmaImportReport;
+  },
+};
+
+const sketchImport: SketchImportBridge = {
+  async pickFile(): Promise<string | null> {
+    return (await ipcRenderer.invoke(
+      "kcreate/sketch/pickFile",
+    )) as string | null;
+  },
+  async importSketch(filePath: string): Promise<SketchImportReport> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/sketch/import",
+      filePath,
+    )) as string;
+    return JSON.parse(raw) as SketchImportReport;
   },
 };
 
@@ -1686,6 +1903,13 @@ const color: ColorBridge = {
       "kcreate/color/spot/list",
     )) as string;
     return JSON.parse(raw) as SpotColorWire[];
+  },
+  async loadCatalog(rawJson: string): Promise<SpotCatalogLoadReportWire> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/color/spot/load-catalog",
+      rawJson,
+    )) as string;
+    return JSON.parse(raw) as SpotCatalogLoadReportWire;
   },
   async addSpot(
     name: string,
@@ -2189,6 +2413,34 @@ const slice: SliceBridge = {
   },
 };
 
+// ---------------------------------------------------------------------------
+// Phase 6 Tasks 25-26 — node clipboard bridge. See `ClipboardBridge` in
+// shared/scene.ts for the contract.
+// ---------------------------------------------------------------------------
+
+const clipboard: ClipboardBridge = {
+  async copy(nodeIds: string[]): Promise<string> {
+    return (await ipcRenderer.invoke(
+      "kcreate/clipboard/copy",
+      nodeIds,
+    )) as string;
+  },
+  async paste(
+    payload: string,
+    targetParentId: string | null,
+    offsetX: number,
+    offsetY: number,
+  ): Promise<string[]> {
+    return (await ipcRenderer.invoke(
+      "kcreate/clipboard/paste",
+      payload,
+      targetParentId,
+      offsetX,
+      offsetY,
+    )) as string[];
+  },
+};
+
 contextBridge.exposeInMainWorld("kcreate", {
   renderer,
   document,
@@ -2209,11 +2461,17 @@ contextBridge.exposeInMainWorld("kcreate", {
   interaction,
   masterPage,
   layoutStudio,
+  templateMarketplace,
+  audit,
+  thumbnail,
+  recentProjects,
   preflight,
   iconPack,
   batch,
   aiModel,
   pdfImport,
+  figmaImport,
+  sketchImport,
   plugin,
   mcpPermission,
   color,
@@ -2224,4 +2482,5 @@ contextBridge.exposeInMainWorld("kcreate", {
   slice,
   session,
   kchat,
+  clipboard,
 });

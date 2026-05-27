@@ -262,7 +262,7 @@ function TemplateCard({
         ...cardStyle,
         borderColor: selected ? colors.accent : colors.border,
         boxShadow: selected
-          ? `0 0 0 2px ${colors.accent}33`
+          ? `0 0 0 2px ${colors.accentRing}`
           : "none",
       }}
     >

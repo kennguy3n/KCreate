@@ -26,6 +26,7 @@ const KIND_OPTIONS: { value: AuditEventKindTag | ""; label: string }[] = [
   { value: "operation", label: "Operations" },
   { value: "ai_action", label: "AI actions" },
   { value: "project", label: "Project lifecycle" },
+  { value: "collab", label: "Collaboration" },
   { value: "other", label: "Other" },
 ];
 
@@ -44,8 +45,33 @@ function kindLabel(kind: AuditEventKind): string {
       return `AI: ${kind.action_type}`;
     case "project":
       return `Project: ${kind.action}`;
+    case "collab":
+      return collabActionLabel(kind);
     case "other":
       return kind.label;
+  }
+}
+
+function collabActionLabel(kind: Extract<AuditEventKind, { type: "collab" }>): string {
+  switch (kind.action) {
+    case "session_started":
+      return kind.community_id
+        ? `Collab: started (${kind.community_id})`
+        : "Collab: started";
+    case "session_left":
+      return "Collab: left";
+    case "peer_joined":
+      return `Collab: ${kind.display_name} joined`;
+    case "peer_left":
+      return `Collab: ${kind.peer_id.slice(0, 8)}… left`;
+    case "peer_kicked":
+      return `Collab: ${kind.peer_id.slice(0, 8)}… kicked (${kind.reason})`;
+    case "operation_received":
+      return `Collab: ${kind.peer_id.slice(0, 8)}… sent ${kind.op_count} ops`;
+    case "conflict_resolved":
+      return `Collab: conflict on ${kind.node_id.slice(0, 8)}…`;
+    case "kchat_backend_status":
+      return `KChat backend: ${kind.status}`;
   }
 }
 

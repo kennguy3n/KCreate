@@ -1503,6 +1503,7 @@ export type AuditEventKindTag =
   | "operation"
   | "ai_action"
   | "project"
+  | "collab"
   | "other";
 
 /** Condensed operation record inside an audit event. */
@@ -1519,6 +1520,26 @@ export type AuditProjectAction =
   | { action: "save" }
   | { action: "export"; format: string; destination: string };
 
+/**
+ * Phase 7 (Task 20): collaboration session action payload mirroring
+ * `kcreate_audit::event::CollabAction`. Each variant maps to a
+ * single bridge-level transition (session start, peer kick, …) so
+ * the renderer can render specific human-readable strings.
+ *
+ * Field names are snake_case to match the Rust struct's serde
+ * output (the enum carries `#[serde(rename_all = "snake_case")]`
+ * which renames both variant names and field names).
+ */
+export type AuditCollabAction =
+  | { action: "session_started"; community_id: string | null }
+  | { action: "session_left" }
+  | { action: "peer_joined"; peer_id: string; display_name: string }
+  | { action: "peer_left"; peer_id: string }
+  | { action: "peer_kicked"; peer_id: string; reason: string }
+  | { action: "operation_received"; peer_id: string; op_count: number }
+  | { action: "conflict_resolved"; node_id: string }
+  | { action: "kchat_backend_status"; status: string };
+
 /** Discriminated union matching `kcreate_audit::AuditEventKind`. */
 export type AuditEventKind =
   | { type: "operation" } & AuditOperationRecord
@@ -1530,6 +1551,7 @@ export type AuditEventKind =
       prompt: string | null;
     }
   | { type: "project" } & AuditProjectAction
+  | { type: "collab" } & AuditCollabAction
   | { type: "other"; label: string; payload: unknown };
 
 /** One row from the audit log. */
@@ -3059,7 +3081,175 @@ export type SessionEvent =
       kind: "sessionLeft";
       /// Base64url-encoded peer id of the session that just left.
       peerId: string;
+    }
+  | {
+      /// Phase 7 (Task 8): a peer was evicted from the session
+      /// because their KChat community membership was revoked.
+      kind: "peerKicked";
+      peerId: string;
+      reason: string;
+    }
+  | {
+      /// Phase 7 (Task 11): a peer's collaboration permission
+      /// changed (e.g. the host downgraded them to viewer).
+      kind: "permissionChanged";
+      peerId: string;
+      permission: CollabPermission;
+    }
+  | {
+      /// Phase 7 (Task 15): the local late-join replay finished —
+      /// a remote host sent us a `ResumeBundle` and the journal
+      /// has been brought up to date. Consumers (EditorPage,
+      /// PresencePanel) use this to dismiss the "syncing…"
+      /// indicator and surface the post-resume document state.
+      kind: "resumeApplied";
+      /// Peer id of the host that supplied the bundle.
+      fromPeerId: string;
+      /// Number of operations from the bundle that were appended
+      /// to the local journal. May be smaller than the bundle's
+      /// operation count because the journal silently dedupes
+      /// entries we have already seen.
+      appliedCount: number;
+    }
+  | {
+      /// Phase 7 (Task 16): the CRDT conflict resolver tiebroke a
+      /// concurrent edit. Renderer surfaces this as a brief
+      /// `ConflictToast` when `loserPeerId` matches the local
+      /// session peer id — "Your edit to X was overridden by Y".
+      kind: "conflictResolved";
+      /// Node whose value the resolver had to tiebreak (UUID).
+      nodeId: string;
+      /// Peer whose write the resolver kept.
+      winnerPeerId: string;
+      /// Peer whose write the resolver discarded. The renderer
+      /// only toasts when this equals the local peer id.
+      loserPeerId: string;
+      /// Free-form field path of the resolved value (e.g.
+      /// `"transform.x"`, `"fill.color"`).
+      field: string;
+    }
+  | {
+      /// Phase 7 (Task 17): a remote peer broadcast an undo (or
+      /// redo) inverse-operation batch. The operations were
+      /// already journaled via `operationsJournaled`; this event
+      /// only carries the "show 'Ken undid …' in the activity
+      /// feed" intent so the renderer can distinguish a fresh
+      /// edit from an undo.
+      kind: "undoBroadcast";
+      /// Peer id that produced the undo.
+      peerId: string;
+      /// Number of inverse operations in the batch (>= 1). Used
+      /// by the activity feed so the toast pluralizes correctly.
+      opCount: number;
+    }
+  | {
+      /// Phase 7 (Task 19): a fresh session key has been scheduled.
+      /// The renderer can surface a "rotating session keys…" toast
+      /// while peers acknowledge.
+      kind: "keyRotationScheduled";
+      /// Incrementing epoch number; matches the value passed into
+      /// later `keyRotationCompleted` events so the renderer can
+      /// correlate the two.
+      epoch: number;
+      /// New cert fingerprint (base64url, BLAKE3 of the SPKI bytes).
+      newCertFingerprint: string;
+      /// Wall-clock millisecond timestamp by which peers must ack
+      /// the rotation or be disconnected.
+      deadlineUnixMs: number;
+    }
+  | {
+      /// Phase 7 (Task 19): the grace window for a key rotation
+      /// elapsed. Acknowledged peers stay connected; missing peers
+      /// have already been kicked with reason `key-rotation-timeout`.
+      kind: "keyRotationCompleted";
+      epoch: number;
+      ackedPeerIds: string[];
+      droppedPeerIds: string[];
+    }
+  | {
+      /// Phase 7 (Task 22): a peer exceeded its per-second
+      /// operations/presence budget. The renderer surfaces this
+      /// as a non-blocking toast — repeated overflows escalate
+      /// to a `peerKicked` event with reason `rate-limit-exceeded`.
+      kind: "rateLimitWarning";
+      peerId: string;
+      /// Which counter was breached: `operations` or `presence`.
+      metric: string;
+      /// Number of consecutive rolling 1-second windows the peer
+      /// has been continuously over budget. Named `_windows`
+      /// (not `_seconds`) because the counter measures **windows**,
+      /// not wall-clock seconds — keeps the unit explicit if the
+      /// window width is ever retuned. Drives the warn → kick
+      /// escalation threshold
+      /// (`SessionConfig::rate_limit_disconnect_after`).
+      consecutiveOverflowWindows: number;
+    }
+  | {
+      /// Phase 7 (Task 21): a peer was rejected (or kicked) because
+      /// the project ACL doesn't authorise them and the active
+      /// session isn't relying on community gating to admit them.
+      /// The renderer uses this to log the denial in the audit feed
+      /// and to refresh the connected-peers list.
+      kind: "aclRejected";
+      peerId: string;
+      reason: string;
+    }
+  | {
+      /// Phase 7 (Task 23): a remote peer offered to share an
+      /// encrypted clipboard payload with us. The renderer shows
+      /// an accept/reject prompt; choosing accept resolves to the
+      /// plaintext via `session.acceptClipboardOffer(offerId)`,
+      /// reject simply discards the offer via
+      /// `session.rejectClipboardOffer(offerId)`.
+      kind: "clipboardShareOffered";
+      fromPeerId: string;
+      /// Short, human-readable preview the sender attached. Never
+      /// rendered as HTML — display it as plain text.
+      previewLabel: string;
+      /// Opaque identifier used by `acceptClipboardOffer` /
+      /// `rejectClipboardOffer`.
+      offerId: string;
     };
+
+/// Phase 7 (Task 21): permission level for a single entry in the
+/// project ACL. Mirrors `kcreate_collab::AclPermission`.
+export type AclPermission = "editor" | "viewer";
+
+/// Phase 7 (Task 21): ACL enforcement mode. Mirrors
+/// `kcreate_collab::AclMode`.
+///
+/// - `open`: ACL is advisory; peers not listed are still admitted
+///   (used when community gating is the primary authorisation).
+/// - `enforce`: ACL is the gate; peers must be either in the ACL
+///   or in the active community (when community gating is on).
+export type AclMode = "open" | "enforce";
+
+/// Phase 7 (Task 21): one row in the project ACL. Mirrors
+/// `kcreate_collab::AclEntry`.
+export interface AclEntry {
+  /// Base64url Ed25519 public key.
+  publicKey: string;
+  /// Free-form name shown in the ACL panel.
+  displayName: string;
+  permission: AclPermission;
+}
+
+/// Phase 7 (Task 21): persisted project ACL. Stored as
+/// `<project_dir>/acl.json`. Mirrors `kcreate_collab::ProjectAcl`.
+export interface ProjectAcl {
+  mode: AclMode;
+  entries: AclEntry[];
+}
+
+/// Phase 7 (Task 23): inbound pending clipboard offer surfaced by
+/// `session.pendingClipboardOffers()`. The renderer renders one row
+/// per entry and calls `acceptClipboardOffer` / `rejectClipboardOffer`
+/// when the user picks an action.
+export interface PendingClipboardOffer {
+  offerId: string;
+  fromPeerId: string;
+  previewLabel: string;
+}
 
 /// Block 7: per-peer Lamport high-water marks for the journal
 /// scoped to the running session's project. Mirrors
@@ -3103,6 +3293,23 @@ export interface SessionBridge {
     displayName: string,
     projectId: string,
     advertiseMdns: boolean,
+    /// Phase 7 (Task 7): optional KChat community id used to scope
+    /// mDNS auto-discovery. When set, two KCreate peers on the
+    /// same LAN only auto-connect when they're members of the
+    /// same KChat community. Must match the currently-installed
+    /// `KChatMembership.groupId`; mismatches reject with an
+    /// `invalid argument "communityId"` error from the bridge.
+    /// `null` (or omitted) preserves pre-Phase-7 behaviour.
+    communityId?: string | null,
+    /// Phase 7 (Task 21): absolute path to the open project's
+    /// `.kstudio/` directory. When supplied the bridge loads
+    /// `<dir>/acl.json` at session start and persists ACL changes
+    /// back to that file via `session.acl.set` so peer-allowlist
+    /// edits survive process restart. Pass `ProjectInfo.path`.
+    /// `null` (or omitted) keeps the ACL in-memory only — useful
+    /// for ad-hoc sessions or test harnesses that don't have a
+    /// project on disk.
+    projectDir?: string | null,
   ): Promise<SessionStartReport>;
   /// Stop the running session. Idempotent.
   leave(): Promise<void>;
@@ -3160,6 +3367,90 @@ export interface SessionBridge {
   /// leave / move their cursor. Returns an unsubscribe function.
   /// The renderer is responsible for filtering by kind.
   onEvent(callback: (event: SessionEvent) => void): () => void;
+  /// Phase 7 (Task 8): forcibly disconnect a connected peer.
+  kickPeer(peerId: string, reason: string): Promise<void>;
+  /// Phase 7 (Task 11): set a peer's collaboration permission.
+  setPeerPermission(
+    peerId: string,
+    permission: CollabPermission,
+  ): Promise<void>;
+  /// Phase 7 (Task 11): snapshot of the local peer's permission.
+  localPermission(): Promise<CollabPermission>;
+  /// Phase 7 (Task 15): ask the supplied peer for a `ResumeBundle`
+  /// covering everything we're missing relative to our local
+  /// resume vector. Used by late joiners to backfill journal
+  /// history that predates their `join()`. The result arrives
+  /// asynchronously as a `ResumeApplied` session event; this call
+  /// only fires the request. KChat-gated.
+  requestResume(peerId: string): Promise<void>;
+  /// Phase 7 (Task 21): snapshot of the active session's ACL. `null`
+  /// when no session is running.
+  acl(): Promise<ProjectAcl | null>;
+  /// Phase 7 (Task 21): replace the active session's ACL. The new
+  /// policy is persisted to `<project_dir>/acl.json` and applied
+  /// immediately — connected peers that no longer meet the policy
+  /// are kicked with reason `acl-rejected`.
+  setAcl(acl: ProjectAcl): Promise<void>;
+  /// Phase 7 (Task 19): force an immediate session-key rotation.
+  /// Returns the new epoch number. `graceMs` is the wall-clock
+  /// window peers have to ack the rotation; non-acking peers are
+  /// disconnected with `key-rotation-timeout`. The rotation result
+  /// arrives asynchronously as a `keyRotationCompleted` event.
+  rotateKeys(graceMs: number): Promise<number>;
+  /// Phase 7 (Task 19): current rotation epoch (0 at session start;
+  /// bumped on every successful rotation). `null` when no session
+  /// is running.
+  keyEpoch(): Promise<number | null>;
+  /// Phase 7 (Task 23): encrypt `plaintext` for `peerId` and send
+  /// it as an inbound `ClipboardShare` offer. Returns the generated
+  /// offer id; the recipient eventually responds by accepting or
+  /// rejecting through their own bridge.
+  shareClipboard(
+    peerId: string,
+    plaintext: Uint8Array,
+    previewLabel: string,
+  ): Promise<string>;
+  /// Phase 7 (Task 23): decrypt and dequeue an inbound clipboard
+  /// offer matching `offerId`. Returns the plaintext bytes.
+  acceptClipboardOffer(offerId: string): Promise<Uint8Array>;
+  /// Phase 7 (Task 23): discard an inbound clipboard offer without
+  /// decrypting it. Idempotent — unknown ids are a no-op.
+  rejectClipboardOffer(offerId: string): Promise<void>;
+  /// Phase 7 (Task 23): snapshot of inbound clipboard offers that
+  /// haven't yet been accepted or rejected.
+  pendingClipboardOffers(): Promise<PendingClipboardOffer[]>;
+  /// Phase 7 (Task 25): queue one local-authored operation into the
+  /// outbound throttle buffer. The bridge accumulates ops until
+  /// the configured flush interval elapses or the max-ops cap is
+  /// hit, then broadcasts the whole batch in a single envelope.
+  /// `operation` is a JSON-serializable `Operation` value — the
+  /// preload stringifies it and the Rust bridge parses it. Typed
+  /// `unknown` rather than the Rust `Operation` shape because the
+  /// renderer does not currently model operations; future work
+  /// will tighten the type once a renderer-side mutation builder
+  /// exists.
+  queueOperation(operation: unknown): Promise<void>;
+  /// Phase 7 (Task 25): drain the pending op batch and broadcast
+  /// it immediately. Returns the number of ops that were flushed
+  /// (0 if the queue was empty). Call this at the end of a drag
+  /// interaction so the final state lands on the wire without
+  /// waiting for the throttle deadline.
+  flushPendingOperations(): Promise<number>;
+  /// Phase 7 (Task 25): check the pending batch against the
+  /// configured flush interval and broadcast it if the deadline
+  /// has expired. Call once per event tick. Returns the number of
+  /// ops flushed on this tick (0 when no flush was due). Cheap
+  /// when the queue is empty.
+  tickOutboundBatch(): Promise<number>;
+  /// Phase 7 (Task 27): set the list of pages the local peer is
+  /// currently viewing. Remote presence updates and conflict
+  /// toasts for pages outside this set are suppressed from the
+  /// renderer event stream to reduce overlay churn in multi-page
+  /// documents. Operations still journal across the whole project
+  /// so document consistency is preserved. Pass `[]` to revert to
+  /// "interested in everything" (useful for the export preview
+  /// pane or a presentation mode that needs every event).
+  setActivePages(pageIds: string[]): Promise<void>;
 }
 
 // ---------------------------------------------------------------------------
@@ -3344,6 +3635,208 @@ export interface KChatBridge {
   removeTrustedIssuer(issuerPublicKey: string): Promise<TrustedIssuer[]>;
 }
 
+// ---------------------------------------------------------------------------
+// Phase 7 — KChat backend (HTTPS REST).
+//
+// Mirrors `kcreate_kchat_client` wire-format types and the bridge
+// surface in `kcreate_bridge::kchat_backend`. The REST client
+// signs in to the same KChat / Mattermost backend
+// `uney-chat-desktop` uses. A separate `.kcz` companion
+// extension ships inside KChat Desktop (`apps/kchat-extension/`)
+// and surfaces recent KCreate projects + share invites via the
+// host's procedures registry — it does NOT proxy this bridge;
+// both apps independently talk to the same backend.
+// ---------------------------------------------------------------------------
+
+/// Local-user identity reported by `kchat.identity.get`. Mirrors
+/// `kcreate_kchat_client::KChatIdentity`.
+export interface KChatIdentity {
+  /// Human-readable display name.
+  displayName: string;
+  /// XMPP bare JID (e.g. `alice@kchat.com`) used by
+  /// `uney-chat-desktop` as the primary user identifier.
+  jid: string;
+  /// Ed25519 public key, URL-safe base64 (no padding). KCreate
+  /// uses this to bind multiplayer attestations to the local
+  /// peer.
+  publicKey: string;
+  /// BLAKE3 hash of the Ed25519 public key, URL-safe base64
+  /// (no padding) — same `PeerId` shape KCreate uses across the
+  /// collab stack.
+  peerId: string;
+}
+
+/// Status snapshot returned by `KChatBackendBridge.{connect,
+/// disconnect, status}`. Mirrors
+/// `kcreate_bridge::kchat_backend::KChatBackendStatus`.
+export interface KChatBackendStatus {
+  connected: boolean;
+  /// HTTPS base URL the client is signed in to. `null` when not
+  /// signed in.
+  baseUrl: string | null;
+  /// Identity returned by the login response. `null` until the
+  /// renderer signs in.
+  identity: KChatIdentity | null;
+}
+
+/// Sign-in request body the renderer hands to
+/// `KChatBackendBridge.connect`. Mirrors
+/// `kcreate_bridge::kchat_backend::KChatBackendSignInRequest`.
+export interface KChatBackendSignInRequest {
+  /// HTTPS base URL of the KChat / Mattermost backend. The Rust
+  /// client refuses anything but `https://` in production builds.
+  baseUrl: string;
+  /// Login id (XMPP bare JID for KChat; username or email for
+  /// Mattermost — the backend disambiguates).
+  loginId: string;
+  /// Password / OAuth bearer token (treated opaquely).
+  password: string;
+  /// Optional TOTP code when the user has 2FA enabled.
+  totp?: string;
+}
+
+/// A community reported by `kchat.communities.list`. Mirrors
+/// `kcreate_kchat_client::KChatCommunity`.
+export interface KChatCommunity {
+  id: string;
+  name: string;
+  description: string | null;
+  memberCount: number;
+  /// Local user's role in the community. Drives the collab
+  /// permission model in Block B (owner/admin → Editor with
+  /// kick rights; member → Editor or Viewer depending on host
+  /// downgrades).
+  role: "owner" | "admin" | "member";
+}
+
+/// A community member reported by `kchat.communities.getMembers`.
+/// Mirrors `kcreate_kchat_client::KChatCommunityMember`.
+export interface KChatCommunityMember {
+  jid: string;
+  displayName: string;
+  publicKey: string;
+  peerId: string;
+  role: "owner" | "admin" | "member";
+}
+
+/// A conversation/channel within a community. Mirrors
+/// `kcreate_kchat_client::KChatConversation`.
+export interface KChatConversation {
+  id: string;
+  name: string;
+  communityId: string;
+  conversationType: "channel" | "direct";
+}
+
+/// Invite-card payload posted to a KChat conversation by
+/// `KChatBackendBridge.shareToConversation`. Mirrors
+/// `kcreate_bridge::kchat_backend::KChatShareInvite`.
+export interface KChatShareInvite {
+  /// KCreate project id the invite points to (UUID).
+  projectId: string;
+  /// Human-readable project name.
+  projectName: string;
+  /// Owning peer id (BLAKE3 hash of owner Ed25519 key).
+  ownerPeerId: string;
+  /// Owner Ed25519 public key, URL-safe base64 (no padding).
+  ownerPublicKey: string;
+  /// Owner display name as shown by KCreate.
+  ownerDisplayName: string;
+  /// SHA-256 of the owner QUIC TLS leaf cert, URL-safe base64.
+  certFingerprint: string;
+  /// Owner QUIC socket address (`<ip>:<port>`).
+  ownerSocketAddr: string;
+  /// Community the invite is gated on. Joiner must be a member.
+  communityId: string;
+  /// Conversation the invite is posted to.
+  conversationId: string;
+}
+
+/// Result of `KChatBackendBridge.shareToConversation`. Mirrors
+/// `kcreate_kchat_client::PostMessageResponse`.
+export interface KChatPostMessageResult {
+  messageId: string;
+  /// RFC3339 UTC timestamp the server stamped on the message.
+  postedAt: string;
+}
+
+/// Phase 7 (Task 10): result of accepting a share-document invite.
+/// Mirrors `kcreate_bridge::kchat_backend::KChatAcceptedInvite`.
+export interface KChatAcceptedInvite {
+  projectId: string;
+  projectName: string;
+  ownerPeerId: string;
+  ownerDisplayName: string;
+  communityId: string;
+  conversationId: string;
+}
+
+/// Phase 7 (Task 8): result of a roster-sync tick.
+/// Mirrors `kcreate_bridge::kchat_backend::KChatRosterSyncResult`.
+export interface KChatRosterSyncResult {
+  /// How many members the KChat backend reported on this tick.
+  polledMembers: number;
+  /// Peer ids that were evicted because they were no longer in the
+  /// community roster.
+  kicked: string[];
+}
+
+/// Phase 7 (Task 11): collaboration permission for a session peer.
+/// Mirrors `kcreate_bridge::collab::CollabPermission`.
+export type CollabPermission = "editor" | "viewer";
+
+/// Phase 7 KChat **backend** bridge surface. Every method other
+/// than `available` is optional because non-`kchat-backend` builds
+/// do not link the underlying N-API exports; the renderer probes
+/// via `available()` and falls back to the paste-attestation flow
+/// when the answer is `false`.
+export interface KChatBackendBridge {
+  /// Capability probe — `true` when the bridge was compiled with
+  /// the `kchat-backend` feature flag.
+  available(): Promise<boolean>;
+  /// Sign in to a KChat / Mattermost backend. Tears down any prior
+  /// session + installed authority before installing the new
+  /// client so a stale membership doesn't outlive the sign-in it
+  /// was minted from.
+  connect(request: KChatBackendSignInRequest): Promise<KChatBackendStatus>;
+  /// Sign out (idempotent). Also clears any KChat authority
+  /// installed by `selectCommunity` so a stale membership doesn't
+  /// outlive the sign-in it was minted from.
+  disconnect(): Promise<KChatBackendStatus>;
+  /// Snapshot the current sign-in state + cached identity.
+  status(): Promise<KChatBackendStatus>;
+  /// List the communities the local user belongs to.
+  listCommunities(): Promise<KChatCommunity[]>;
+  /// Pick a community and install its attestation as the active
+  /// KChat authority. Returns the same `KChatMembershipStatus`
+  /// shape as `KChatBridge.install`.
+  selectCommunity(communityId: string): Promise<KChatMembershipStatus>;
+  /// Return the member roster (with roles) for the given
+  /// community. Used by Block B's roster-sync tick + the
+  /// community-role-based permissions model.
+  getCommunityMembers(communityId: string): Promise<KChatCommunityMember[]>;
+  /// Return the conversations/channels in the given community.
+  listConversations(communityId: string): Promise<KChatConversation[]>;
+  /// Post a document-share invite into a KChat conversation. The
+  /// payload is tagged `kcreate.invite.v1` so KChat Desktop
+  /// renders it as a rich card.
+  shareToConversation(
+    conversationId: string,
+    invite: KChatShareInvite,
+  ): Promise<KChatPostMessageResult>;
+  /// Phase 7 (Task 10): accept a share-document invite received
+  /// through a KChat conversation. Validates community match +
+  /// sender membership and dials the owner via `session.join()`.
+  acceptInvite(inviteJson: string): Promise<KChatAcceptedInvite>;
+  /// Phase 7 (Task 8): roster-sync tick — polls the KChat backend
+  /// for the latest community members, reconciles against the
+  /// active session (kicks revoked peers, refreshes role ->
+  /// permission).
+  syncCommunityRoster(
+    communityId: string,
+  ): Promise<KChatRosterSyncResult>;
+}
+
 // -----------------------------------------------------------------------------
 // Phase 4 — Vision & Image Generation
 // -----------------------------------------------------------------------------
@@ -3498,6 +3991,26 @@ export interface ImageGenBridge {
  * `version: 1` and rejects future versions explicitly so a future
  * schema bump can't silently drop data.
  */
+/**
+ * Phase 7 (Block E) — `kcreate://` deeplink listener exposed by the
+ * preload bridge. The main process registers the protocol via
+ * `app.setAsDefaultProtocolClient("kcreate")` and forwards every
+ * accepted URL to the renderer through the
+ * `kcreate/deeplink/received` IPC channel; `InvitePanel.tsx`
+ * subscribes here so a share-card click in KChat Desktop auto-fills
+ * + accepts the invite when KCreate is already running.
+ */
+export interface DeeplinkBridge {
+  /**
+   * Register a callback that fires whenever a `kcreate://...` URL is
+   * dispatched by the OS shell. Returns an `unsubscribe` function;
+   * call it in a `useEffect` cleanup to detach the listener when
+   * the panel unmounts. Idempotent on the host side — repeated
+   * subscriptions each get their own slot on the IPC channel.
+   */
+  onUrl(callback: (url: string) => void): () => void;
+}
+
 export interface ClipboardBridge {
   /**
    * Serialise `nodeIds` (each with their descendants) into a portable
@@ -3565,6 +4078,8 @@ declare global {
       slice: SliceBridge;
       session: SessionBridge;
       kchat: KChatBridge;
+      kchatBackend: KChatBackendBridge;
+      deeplink: DeeplinkBridge;
       clipboard: ClipboardBridge;
     };
   }

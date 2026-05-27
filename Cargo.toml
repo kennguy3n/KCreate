@@ -28,6 +28,13 @@ members = [
     # is only pulled into the bridge under the off-by-default
     # `kchat-dev-issuer` feature.
     "crates/kcreate_kchat",
+    # Phase 7 KChat backend REST client. Like
+    # `kcreate_collab_transport` and `kcreate_kchat`, this is OUT
+    # of `kcreate_tests/tests/local_first.rs::editing_path_crates`
+    # — it links `reqwest`/`rustls` to talk to the shared KChat /
+    # Mattermost backend over HTTPS and is only pulled into the
+    # bridge under the off-by-default `kchat-backend` feature flag.
+    "crates/kcreate_kchat_client",
     "crates/kcreate_tests",
 ]
 
@@ -173,8 +180,26 @@ wasmi = { version = "0.42", default-features = false, features = ["std"] }
 # Ed25519 signature verification for native plugins. Pure-Rust (no
 # OpenSSL), constant-time crypto by construction; we use `verify_strict`
 # everywhere so weak / malleable signatures are rejected. Used by the
-# trust store in `kcreate_plugin::trust`.
-ed25519-dalek = { version = "2.1", default-features = false, features = ["std", "fast"] }
+# trust store in `kcreate_plugin::trust`. Phase 7 (Task 23) also uses
+# this with `hazmat` to derive X25519 key-agreement keys from the
+# long-lived Ed25519 identity keys.
+ed25519-dalek = { version = "2.1", default-features = false, features = ["std", "fast", "hazmat"] }
+# Phase 7 (Task 23): low-level Edwards / Montgomery operations used
+# to derive an X25519 public key from a long-lived Ed25519 identity
+# (the standard birationally-equivalent point map). Already an
+# `ed25519-dalek` dependency so this is a zero-cost direct dep.
+curve25519-dalek = { version = "4", default-features = false, features = ["alloc", "zeroize", "digest"] }
+# Phase 7 (Task 23): AEAD used for secure clipboard sharing between
+# peers. Pure-Rust (RustCrypto), no OpenSSL. The X25519 shared
+# secret derived from the peers' Ed25519 identity keys is fed
+# through BLAKE3 (already in the tree) to produce the ChaCha20
+# key + nonce material.
+chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
+# Phase 7 (Task 23): OS RNG for fresh ChaCha20-Poly1305 nonces on
+# the clipboard-share send path. Already in the dep tree
+# transitively via curve25519-dalek; pulling it in directly keeps
+# the call site auditable.
+getrandom = "0.2"
 
 # Phase 3 LAN transport — these are intentionally pulled in only by
 # `kcreate_collab_transport` (and transitively, the bridge under the
@@ -202,6 +227,22 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"
 tracing = "0.1"
 # Custom server-cert verifier needs a small SHA-256 helper.
 sha2 = "0.10"
+
+# Phase 7 (Option C pivot): REST client for the shared KChat /
+# Mattermost backend. Only enters the editing-path closure walked by
+# `local_first.rs` if some editing-path crate accidentally takes a
+# dependency on `kcreate_kchat_client` outside the off-by-default
+# `kchat-backend` feature flag — which the deny-list test would
+# catch immediately.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream", "gzip", "deflate"] }
+# Test-only in-process HTTP server that mirrors the future KChat
+# backend REST contract. Used as a dev-dependency only — never
+# enters any production binary. See
+# `crates/kcreate_kchat_client/src/fixture.rs`.
+axum = { version = "0.7", default-features = false, features = ["http1", "json", "tokio", "tracing", "query"] }
+# URL parsing for the REST client (validates scheme + host before
+# every request, refuses `http://` outside the test fixture).
+url = "2"
 
 # System info probe for device tiering
 sys-info = "0.9"

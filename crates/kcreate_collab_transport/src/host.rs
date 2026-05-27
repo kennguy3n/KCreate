@@ -87,6 +87,14 @@ pub struct HostOptions {
     /// stays locked. The bridge layer plugs in a real authority
     /// only once the user has signed into a KChat group.
     pub kchat_authority: SharedKChatAuthority,
+    /// Phase 7: optional KChat community id used to scope mDNS
+    /// auto-discovery. When set, the local mDNS advertisement
+    /// publishes the community id in the TXT record and the browse
+    /// loop only surfaces peers advertising the same community.
+    /// Independent of the KChat *attestation* gate — the gate
+    /// always runs in [`ProjectSession::trust_peer`]; this field is
+    /// purely a UX filter for the discovery roster.
+    pub community_id: Option<String>,
 }
 
 impl HostOptions {
@@ -109,6 +117,7 @@ impl HostOptions {
             // overwrite `kchat_authority` with an
             // `InProcessKChatAuthority` before calling `start`.
             kchat_authority: no_kchat_authority(),
+            community_id: None,
         }
     }
 }
@@ -121,7 +130,7 @@ pub enum InboundEvent {
     /// mDNS resolved a new peer. The UI shows a "Connect"
     /// confirmation prompt; if the user clicks through, the bridge
     /// calls [`LanCollabHost::dial_discovered_peer`].
-    Discovered(DiscoveredPeer),
+    Discovered(Box<DiscoveredPeer>),
     /// A peer left the LAN (mDNS unregistration). Already-connected
     /// peers stay until the QUIC connection closes; this only signals
     /// removal from the discoverable roster.
@@ -187,6 +196,11 @@ struct HostInner {
     /// Application version string echoed in `Hello` for forensic
     /// display.
     app_version: String,
+    /// Phase 7 (Task 22): copy of the [`SessionConfig`] used to
+    /// seed `ProjectSession`. The bridge needs to read knobs like
+    /// `rate_limit_disconnect_after` outside the session lock to
+    /// decide whether a rate-limit overflow warrants a kick.
+    session_config: SessionConfig,
 }
 
 /// State per connected peer.
@@ -244,6 +258,7 @@ impl LanCollabHost {
                 "multiplayer is locked: not signed into a KChat group".into(),
             ));
         }
+        let session_config = opts.session_config.clone();
         let session = ProjectSession::new_with_authority(
             opts.local_key,
             local_identity.display_name.clone(),
@@ -269,6 +284,7 @@ impl LanCollabHost {
             inbound_tx,
             shutdown_tx,
             app_version: env!("CARGO_PKG_VERSION").to_string(),
+            session_config,
         });
 
         let host = Self { inner };
@@ -282,6 +298,7 @@ impl LanCollabHost {
                 cert_fingerprint_b64: host.inner.cert.cert_fingerprint_b64(),
                 advertise: opts.advertise_mdns,
                 advertise_addrs: opts.advertise_addrs,
+                community_id: opts.community_id,
             };
             let discovery = Arc::new(PeerDiscovery::start(cfg)?);
             // Bridge discovery events into the inbound channel.
@@ -496,6 +513,56 @@ impl LanCollabHost {
         self.broadcast(Message::Presence(payload)).await
     }
 
+    /// Phase 7 (Task 8): gracefully disconnect a specific peer. Sends
+    /// a directed `Goodbye(reason)` so the peer's pump task observes
+    /// a clean shutdown (rather than a raw QUIC close), then closes
+    /// the underlying connection on our side and removes the peer
+    /// from the local roster. Idempotent \u2014 calling on an
+    /// unknown / already-disconnected peer is a no-op.
+    ///
+    /// Used by the bridge's roster-sync poller to evict peers whose
+    /// KChat community membership was revoked.
+    pub async fn disconnect_peer(
+        &self,
+        peer_id: &PeerId,
+        reason: GoodbyeReason,
+    ) -> Result<(), TransportError> {
+        // Best-effort directed Goodbye. We don't fail the disconnect
+        // if the peer is unreachable \u2014 the goal is to remove them
+        // from our session even if the network path is broken.
+        let send_result = self.send_to(peer_id, Message::Goodbye(reason)).await;
+
+        let removed = self.inner.peers.write().remove(peer_id);
+        let was_connected = removed.is_some();
+        if let Some(slot) = removed {
+            // Use a non-zero error code so the peer can distinguish
+            // "host shutdown" (code 0) from "host kicked us"
+            // (code 1) in their close-reason logs.
+            slot.connection.close(1u32.into(), b"kicked");
+            // Tell the local session state to forget this peer's
+            // replay window + nonces so the same peer can rejoin
+            // later under a fresh handshake.
+            self.inner.session.lock().await.forget_peer(peer_id);
+            // Surface a synthetic PeerLeft on the inbound channel so
+            // the bridge observes the eviction through the normal
+            // event path (otherwise the pump only sees PeerLeft for
+            // peers that exit on their own).
+            let _ = self
+                .inner
+                .inbound_tx
+                .send(InboundEvent::PeerLeft(peer_id.clone()));
+        }
+        // Surface the directed-send failure if the peer was still
+        // in the roster but the send failed mid-flight. When the
+        // peer was never in the roster, the send error is expected
+        // and we return Ok.
+        if was_connected {
+            send_result
+        } else {
+            Ok(())
+        }
+    }
+
     /// Sugar: build + broadcast a batch of operations.
     pub async fn broadcast_operations(
         &self,
@@ -519,6 +586,68 @@ impl LanCollabHost {
         payload: kcreate_collab::LockReleasePayload,
     ) -> Result<(), TransportError> {
         self.broadcast(Message::LockRelease(payload)).await
+    }
+
+    /// Phase 7 (Task 22): record one inbound metered event from a
+    /// peer and return the budget decision. Callers (the bridge's
+    /// inbound pump) feed this on every `OperationBroadcast` /
+    /// `Presence` ingest; the returned decision drives the
+    /// `RateLimitWarning` event and (after sustained abuse) a
+    /// forced `disconnect_peer` call.
+    pub async fn record_rate_event(
+        &self,
+        peer_id: &PeerId,
+        kind: kcreate_collab::RateLimitKind,
+        now: std::time::Instant,
+    ) -> kcreate_collab::RateBudgetDecision {
+        let mut session = self.inner.session.lock().await;
+        session.record_rate_event(peer_id, kind, now)
+    }
+
+    /// Phase 7 (Task 22): the host-side
+    /// [`SessionConfig::rate_limit_disconnect_after`] knob, exposed
+    /// for the bridge so the inbound pump can decide whether a
+    /// peer over budget should be kicked or only warned.
+    pub fn rate_limit_disconnect_after(&self) -> u32 {
+        self.inner.session_config.rate_limit_disconnect_after
+    }
+
+    /// Phase 7 (Task 19): record a peer's [`Message::KeyRotationAck`].
+    /// Returns `true` if the peer was in the trust roster.
+    pub async fn record_key_rotation_ack(&self, peer_id: &PeerId, epoch: u64) -> bool {
+        let mut session = self.inner.session.lock().await;
+        session.record_key_rotation_ack(peer_id, epoch)
+    }
+
+    /// Phase 7 (Task 19): return all peers that haven't acked
+    /// `current_epoch`. The bridge uses this after the rotation
+    /// grace window has elapsed to disconnect non-compliant peers.
+    pub async fn peers_missing_key_rotation(&self, current_epoch: u64) -> Vec<PeerId> {
+        let session = self.inner.session.lock().await;
+        session.peers_missing_key_rotation(current_epoch)
+    }
+
+    /// Phase 7 (Task 19): fan a [`Message::KeyRotation`] out to
+    /// every connected peer. Receivers reply with
+    /// [`Message::KeyRotationAck`]; the bridge's inbound pump
+    /// pipes those into [`Self::record_key_rotation_ack`].
+    pub async fn broadcast_key_rotation(
+        &self,
+        payload: kcreate_collab::KeyRotationPayload,
+    ) -> Result<(), TransportError> {
+        self.broadcast(Message::KeyRotation(payload)).await
+    }
+
+    /// Phase 7 (Task 23): send an encrypted clipboard payload to
+    /// the named peer. Errors mirror `send_to` — the recipient is
+    /// looked up by peer id.
+    pub async fn send_clipboard_share(
+        &self,
+        peer_id: &PeerId,
+        payload: kcreate_collab::ClipboardSharePayload,
+    ) -> Result<(), TransportError> {
+        self.send_to(peer_id, Message::ClipboardShare(payload))
+            .await
     }
 
     /// Send a graceful `Goodbye` to every peer and close the QUIC
@@ -880,5 +1009,8 @@ fn message_kind(message: &Message) -> &'static str {
         Message::ResumeBundle(_) => "ResumeBundle",
         Message::LockClaim(_) => "LockClaim",
         Message::LockRelease(_) => "LockRelease",
+        Message::KeyRotation(_) => "KeyRotation",
+        Message::KeyRotationAck(_) => "KeyRotationAck",
+        Message::ClipboardShare(_) => "ClipboardShare",
     }
 }

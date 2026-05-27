@@ -76,6 +76,13 @@ kcreate_collab_transport = { path = "../kcreate_collab_transport", optional = tr
 # enable in production builds — minting your own attestation
 # subverts the multiplayer trust root.
 kcreate_kchat = { path = "../kcreate_kchat", optional = true }
+# Phase 7 KChat backend REST client. Pulled in ONLY behind the
+# `kchat-backend` feature flag (off by default). The client speaks
+# HTTPS REST to the shared KChat / Mattermost backend
+# uney-chat-desktop also uses. Because it links `reqwest` it must
+# stay out of the default editing-path closure walked by
+# `local_first.rs`.
+kcreate_kchat_client = { path = "../kcreate_kchat_client", optional = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time"], optional = true }
 # Used only behind the `collab` feature to decode an Ed25519 public
 # key from the wire-form base64url string into a `VerifyingKey` for
@@ -84,6 +91,10 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "ti
 # the dependency here under a feature flag doesn't change the
 # default-feature graph the local-first sentinel walks.
 ed25519-dalek = { workspace = true, optional = true }
+# Phase 7 (Task 23): OS RNG for fresh ChaCha20-Poly1305 nonces on
+# the clipboard-share send path. Only used under the `collab`
+# feature.
+getrandom = { workspace = true, optional = true }
 # tracing is pulled in by quinn / rustls under the `collab` feature;
 # we use it directly for `tracing::warn!` in the pump task.
 tracing = { workspace = true, optional = true }
@@ -115,6 +126,17 @@ zip = { workspace = true }
 name = "scene_sync_multi_peer"
 harness = false
 
+# Phase 7 (Task 28): collab performance benchmarks. Requires the
+# `collab` feature so the bench can pull in `kcreate_collab` /
+# `ed25519-dalek` for journal + envelope construction. The bench
+# never touches the QUIC transport — the cost we care about is in
+# the editing-path crates (journal, CRDT, signing, serialisation),
+# all of which are network-free.
+[[bench]]
+name = "collab_perf"
+harness = false
+required-features = ["collab"]
+
 [features]
 default = []
 # Mirror the renderer's CPU-only feature flag for headless N-API builds.
@@ -140,10 +162,18 @@ native_canvas = ["dep:raw-window-handle"]
 # by default so the local-first sentinel keeps quinn / rustls /
 # mdns-sd out of the editing-path dependency tree; the Electron
 # host enables this when packaging a release that ships collab.
-collab = ["dep:kcreate_collab", "dep:kcreate_collab_transport", "dep:tokio", "dep:ed25519-dalek", "dep:tracing"]
+collab = ["dep:kcreate_collab", "dep:kcreate_collab_transport", "dep:tokio", "dep:ed25519-dalek", "dep:getrandom", "dep:tracing"]
 # Enable the dev-only KChat membership issuer N-API surface. Implies
 # `collab` (since the install path runs through the collab gate).
 # Off by default; non-dev builds must NOT enable this — minting a
 # membership locally bypasses the trust root the real KChat product
 # pins to its own keypair.
 kchat-dev-issuer = ["collab", "dep:kcreate_kchat"]
+# Phase 7: enable the real KChat backend REST client. Implies
+# `collab` (the bridge installs the wire attestation into the collab
+# gate). Off by default; non-collab builds must NOT enable this. The
+# crate it pulls in (`kcreate_kchat_client`) links `reqwest`
+# (HTTPS only in production, plain HTTP only inside the in-process
+# test fixture) — never on the editing path — and is excluded from
+# the closure walked by `local_first.rs`.
+kchat-backend = ["collab", "dep:kcreate_kchat_client"]

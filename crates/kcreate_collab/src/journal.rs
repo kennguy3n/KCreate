@@ -425,6 +425,7 @@ mod tests {
             affected_nodes: Vec::new(),
             ai_generated: false,
             group_id: None,
+            is_undo: false,
         }
     }
 

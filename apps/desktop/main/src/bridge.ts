@@ -739,6 +739,25 @@ export interface Bridge {
     displayName: string,
     projectId: string,
     advertiseMdns: boolean,
+    /**
+     * Phase 7 (Task 7): optional KChat community id. When set, the
+     * session's mDNS advertisement is tagged with the community
+     * so two KCreate peers on the same LAN only auto-discover each
+     * other when they belong to the same KChat community. Must
+     * match the currently-installed KChat membership's group id;
+     * mismatches throw a typed `kcreate_bridge: invalid argument
+     * "communityId"` error from the Rust side.
+     */
+    communityId: string | null,
+    /**
+     * Phase 7 (Task 21): absolute path to the open project's
+     * `.kstudio/` directory. When supplied the bridge loads
+     * `<dir>/acl.json` at session start and persists every ACL
+     * mutation back to that file so peer-allowlist edits survive
+     * process restart. `null` keeps the ACL purely in-memory —
+     * appropriate for ad-hoc sessions without a project on disk.
+     */
+    projectDir: string | null,
   ): string;
   /**
    * Returns the leaving peer's base64url-encoded id when a session was
@@ -809,6 +828,83 @@ export interface Bridge {
   kchatTrustedIssuers(): string;
   kchatAddTrustedIssuer(issuerJson: string): string;
   kchatRemoveTrustedIssuer(issuerPublicKey: string): string;
+  // Phase 7 — KChat backend (HTTPS REST). All entry points are
+  // gated on the `kchat-backend` feature flag (which implies
+  // `collab`); `kchatBackendAvailable` is always present as a
+  // capability probe. `kchatBackendConnect/Disconnect/Status`
+  // return JSON `KChatBackendStatus`; `kchatBackendListCommunities`
+  // returns JSON `KChatCommunity[]`;
+  // `kchatBackendSelectCommunity` returns a JSON
+  // `KChatMembershipStatus` (same shape as `kchatInstallAuthority`
+  // — replaces the dev-mint flow);
+  // `kchatBackendShareToConversation` returns a JSON
+  // `KChatPostMessageResult`.
+  kchatBackendAvailable(): boolean;
+  // `kchatBackendConnect` accepts a JSON-encoded
+  // `KChatBackendSignInRequest` (`{ baseUrl, loginId, password, totp? }`).
+  kchatBackendConnect?(requestJson: string): string;
+  kchatBackendDisconnect?(): string;
+  kchatBackendStatus?(): string;
+  kchatBackendListCommunities?(): string;
+  kchatBackendSelectCommunity?(communityId: string): string;
+  kchatBackendGetCommunityMembers?(communityId: string): string;
+  kchatBackendListConversations?(communityId: string): string;
+  kchatBackendShareToConversation?(conversationId: string, inviteJson: string): string;
+  // Phase 7 (Task 10): accept a document-share invite.
+  kchatBackendAcceptInvite?(inviteJson: string): string;
+  // Phase 7 (Task 8): roster-sync tick.
+  kchatBackendSyncCommunityRoster?(communityId: string): string;
+  // Phase 7 (Task 8): kick a connected peer.
+  sessionKickPeer(peerId: string, reason: string): void;
+  // Phase 7 (Task 15): ask a connected host to backfill journal
+  // entries we are missing relative to our local ResumeVector.
+  sessionRequestResume(peerId: string): void;
+  // Phase 7 (Task 11): set a peer's permission.
+  sessionSetPeerPermission(peerId: string, permission: string): void;
+  // Phase 7 (Task 11): local permission snapshot.
+  sessionLocalPermission(): string;
+  // Phase 7 (Task 21): ACL snapshot / replace. `sessionAclGet`
+  // returns the JSON-serialised `ProjectAcl` or `null` when no
+  // session is running; `sessionAclSet` takes the same shape.
+  sessionAclGet(): string | null;
+  sessionAclSet(aclJson: string): void;
+  // Phase 7 (Task 19): force a session-key rotation; returns the
+  // new epoch. `sessionKeyEpoch` reports the current epoch (or
+  // `null` when idle).
+  sessionRotateKeys(graceMs: number): number;
+  sessionKeyEpoch(): number | null;
+  // Phase 7 (Task 23): encrypted clipboard sharing primitives.
+  // The local signing key lives on the bridge — there's no seed
+  // round-trip in either direction.
+  sessionClipboardShare(
+    peerId: string,
+    plaintext: Buffer,
+    previewLabel: string,
+  ): string;
+  sessionClipboardAccept(offerId: string): Buffer;
+  sessionClipboardReject(offerId: string): void;
+  sessionPendingClipboardOffers(): string;
+  /// Phase 7 (Task 25): queue one local-authored operation into the
+  /// outbound throttle buffer. The bridge flushes the buffer in a
+  /// single broadcast when the configured interval elapses or the
+  /// max-ops cap is hit.
+  sessionQueueOperation(opJson: string): void;
+  /// Phase 7 (Task 25): drain the pending op batch right now,
+  /// returning the number of ops flushed (0 if the queue was
+  /// empty). Used at the end of a drag interaction so the final
+  /// state lands on the wire without waiting for the timer.
+  sessionFlushPendingOperations(): number;
+  /// Phase 7 (Task 25): check whether the pending batch's timer has
+  /// expired and broadcast it if so. Called every event tick.
+  /// Returns the number of ops flushed on this tick (0 when no
+  /// flush was due). Cheap when the queue is empty.
+  sessionTickOutboundBatch(): number;
+  /// Phase 7 (Task 27): set the list of pages the local peer is
+  /// currently viewing. Remote presence updates for other pages
+  /// are suppressed from the renderer event stream to reduce
+  /// overlay churn. Operations still journal across the whole
+  /// document. Pass `"[]"` to revert to "interested in everything".
+  sessionSetActivePages(pageIdsJson: string): void;
   /// Re-publish the cached scene. Used by the session event tick
   /// to refresh remote-peer cursor overlays.
   documentRequestRender(): void;

@@ -33,7 +33,7 @@ use crate::peer::{PeerId, PeerKeyError};
 /// Current on-the-wire protocol version. Bump this whenever the
 /// envelope shape, payload variants, or signing canonicalisation
 /// changes.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// 16 bytes of replay-protection nonce. The session layer remembers
 /// a sliding window of recently-seen nonces per peer.
@@ -211,6 +211,13 @@ pub enum CollabError {
     Encode(String),
     #[error(transparent)]
     PeerKey(#[from] PeerKeyError),
+    /// Phase 7 (Task 8): a base64-encoded peer id, public key, or
+    /// nonce supplied across the bridge boundary failed to decode
+    /// to the expected byte length. Used by the [`PeerId::from_str`]
+    /// impl so the bridge can surface a typed error instead of a
+    /// generic `String` parse failure.
+    #[error("invalid encoding: {0}")]
+    InvalidEncoding(String),
 }
 
 #[cfg(test)]

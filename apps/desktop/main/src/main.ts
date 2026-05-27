@@ -2250,12 +2250,26 @@ function registerIpcHandlers(): void {
       displayName: string,
       projectId: string,
       advertiseMdns: boolean,
+      // Phase 7 (Task 7): optional community gate. Defaults to
+      // `null` so legacy renderer callers that don't pass the
+      // argument still work unchanged.
+      communityId: string | null = null,
+      // Phase 7 (Task 21): absolute path to the open project's
+      // `.kstudio/` directory. When supplied the bridge loads
+      // `<dir>/acl.json` at session start and persists every ACL
+      // mutation back to that file so peer-allowlist edits
+      // survive process restart. Defaults to `null` so legacy
+      // renderer callers that don't pass the argument still work
+      // unchanged (ACL stays in-memory only).
+      projectDir: string | null = null,
     ) => {
       const report = requireBridge().sessionStart(
         seedB64,
         displayName,
         projectId,
         advertiseMdns,
+        communityId,
+        projectDir,
       );
       startSessionEventTick();
       return report;
@@ -2428,6 +2442,324 @@ function registerIpcHandlers(): void {
     (_e, issuerPublicKey: string) =>
       requireBridge().kchatRemoveTrustedIssuer(issuerPublicKey),
   );
+
+  // -------------------------------------------------------------------
+  // Phase 7 — KChat backend (HTTPS REST). All entry points except
+  // the `available` probe are optional on the bridge: a non-collab
+  // or non-`kchat-backend` build simply doesn't link them, and the
+  // handlers below return a typed error so the renderer can fall
+  // back to the paste-attestation flow. Channels follow the
+  // `kcreate/kchat-backend/*` namespace per Option C spec.
+  // -------------------------------------------------------------------
+  ipcMain.handle("kcreate/kchat-backend/available", () => {
+    const fn = requireBridge().kchatBackendAvailable;
+    if (typeof fn !== "function") return false;
+    try {
+      return fn();
+    } catch {
+      return false;
+    }
+  });
+  // Helper: resolve an optional `kchat-backend` bridge function or
+  // throw a typed error. Keeps each handler one line below.
+  const requireKChatBackend = <K extends keyof Bridge>(method: K): Bridge[K] => {
+    const fn = requireBridge()[method];
+    if (typeof fn !== "function") {
+      throw new Error(
+        `kchat-backend: ${String(method)} not available in this build ` +
+          "(rebuild kcreate_bridge with --features kchat-backend)",
+      );
+    }
+    return fn;
+  };
+  ipcMain.handle(
+    "kcreate/kchat-backend/connect",
+    (_e, requestJson: string) =>
+      (
+        requireKChatBackend("kchatBackendConnect") as (
+          requestJson: string,
+        ) => string
+      )(requestJson),
+  );
+  ipcMain.handle("kcreate/kchat-backend/disconnect", () =>
+    (requireKChatBackend("kchatBackendDisconnect") as () => string)(),
+  );
+  ipcMain.handle("kcreate/kchat-backend/status", () =>
+    (requireKChatBackend("kchatBackendStatus") as () => string)(),
+  );
+  ipcMain.handle("kcreate/kchat-backend/list-communities", () =>
+    (requireKChatBackend("kchatBackendListCommunities") as () => string)(),
+  );
+  ipcMain.handle(
+    "kcreate/kchat-backend/select-community",
+    (_e, communityId: string) =>
+      (
+        requireKChatBackend("kchatBackendSelectCommunity") as (
+          id: string,
+        ) => string
+      )(communityId),
+  );
+  ipcMain.handle(
+    "kcreate/kchat-backend/get-community-members",
+    (_e, communityId: string) =>
+      (
+        requireKChatBackend("kchatBackendGetCommunityMembers") as (
+          id: string,
+        ) => string
+      )(communityId),
+  );
+  ipcMain.handle(
+    "kcreate/kchat-backend/list-conversations",
+    (_e, communityId: string) =>
+      (
+        requireKChatBackend("kchatBackendListConversations") as (
+          id: string,
+        ) => string
+      )(communityId),
+  );
+  ipcMain.handle(
+    "kcreate/kchat-backend/share-to-conversation",
+    (_e, conversationId: string, inviteJson: string) =>
+      (
+        requireKChatBackend("kchatBackendShareToConversation") as (
+          c: string,
+          i: string,
+        ) => string
+      )(conversationId, inviteJson),
+  );
+
+  // Phase 7 (Task 10): accept invite.
+  ipcMain.handle(
+    "kcreate/kchat-backend/accept-invite",
+    (_e, inviteJson: string) =>
+      (
+        requireKChatBackend("kchatBackendAcceptInvite") as (
+          j: string,
+        ) => string
+      )(inviteJson),
+  );
+
+  // Phase 7 (Task 8): roster-sync tick.
+  ipcMain.handle(
+    "kcreate/kchat-backend/sync-community-roster",
+    (_e, communityId: string) =>
+      (
+        requireKChatBackend("kchatBackendSyncCommunityRoster") as (
+          c: string,
+        ) => string
+      )(communityId),
+  );
+
+  // Phase 7 (Task 8): kick a connected peer.
+  ipcMain.handle(
+    "kcreate/session/kick-peer",
+    (_e, peerId: string, reason: string) =>
+      requireBridge().sessionKickPeer(peerId, reason),
+  );
+
+  // Phase 7 (Task 15): ask a connected host to backfill journal
+  // entries we are missing relative to our local ResumeVector.
+  ipcMain.handle(
+    "kcreate/session/request-resume",
+    (_e, peerId: string) => requireBridge().sessionRequestResume(peerId),
+  );
+
+  // Phase 7 (Task 11): set peer permission.
+  ipcMain.handle(
+    "kcreate/session/set-peer-permission",
+    (_e, peerId: string, permission: string) =>
+      requireBridge().sessionSetPeerPermission(peerId, permission),
+  );
+
+  // Phase 7 (Task 11): local permission snapshot.
+  ipcMain.handle("kcreate/session/local-permission", () =>
+    requireBridge().sessionLocalPermission(),
+  );
+
+  // Phase 7 (Task 21): ACL snapshot / replace.
+  ipcMain.handle("kcreate/session/acl-get", () =>
+    requireBridge().sessionAclGet(),
+  );
+  ipcMain.handle("kcreate/session/acl-set", (_e, aclJson: string) =>
+    requireBridge().sessionAclSet(aclJson),
+  );
+
+  // Phase 7 (Task 19): force a key rotation / read the current epoch.
+  ipcMain.handle("kcreate/session/rotate-keys", (_e, graceMs: number) =>
+    requireBridge().sessionRotateKeys(graceMs),
+  );
+  ipcMain.handle("kcreate/session/key-epoch", () =>
+    requireBridge().sessionKeyEpoch(),
+  );
+
+  // Phase 7 (Task 23): encrypted clipboard sharing. The bridge
+  // holds the local signing key from session_start — no seed
+  // travels back through IPC.
+  ipcMain.handle(
+    "kcreate/session/clipboard-share",
+    (_e, peerId: string, plaintext: Buffer, previewLabel: string) =>
+      requireBridge().sessionClipboardShare(peerId, plaintext, previewLabel),
+  );
+  ipcMain.handle(
+    "kcreate/session/clipboard-accept",
+    (_e, offerId: string) => requireBridge().sessionClipboardAccept(offerId),
+  );
+  ipcMain.handle("kcreate/session/clipboard-reject", (_e, offerId: string) =>
+    requireBridge().sessionClipboardReject(offerId),
+  );
+  ipcMain.handle("kcreate/session/pending-clipboard-offers", () =>
+    requireBridge().sessionPendingClipboardOffers(),
+  );
+  // Phase 7 (Task 25): outbound op throttle wiring. The renderer
+  // calls `queue-operation` on every local mutation,
+  // `tick-outbound-batch` on the same cadence as the event drain
+  // (so the bridge can flush when the 50 ms timer expires without
+  // renderer bookkeeping), and `flush-pending-operations` at the
+  // end of a drag interaction. Channel names use kebab-case to
+  // match the rest of the `kcreate/session/*` IPC surface
+  // (`request-resume`, `cert-fingerprint`, `pending-clipboard-offers`,
+  // etc.).
+  ipcMain.handle("kcreate/session/queue-operation", (_e, opJson: string) =>
+    requireBridge().sessionQueueOperation(opJson),
+  );
+  ipcMain.handle("kcreate/session/flush-pending-operations", () =>
+    requireBridge().sessionFlushPendingOperations(),
+  );
+  ipcMain.handle("kcreate/session/tick-outbound-batch", () =>
+    requireBridge().sessionTickOutboundBatch(),
+  );
+  // Phase 7 (Task 27): selective sync — tell the bridge which
+  // pages the local peer is currently viewing. Presence updates
+  // and conflict toasts for off-screen pages are suppressed from
+  // the renderer event stream; operations are still journaled.
+  ipcMain.handle("kcreate/session/set-active-pages", (_e, pageIdsJson: string) =>
+    requireBridge().sessionSetActivePages(pageIdsJson),
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Phase 7 — `kcreate://` deeplink scheme.
+//
+// The companion `.kcz` extension in `apps/kchat-extension/` builds
+// `kcreate://join?payload=<base64url(invite_json)>` URLs that KChat
+// Desktop fires through the OS shell. We:
+//
+//   1. Register `kcreate` as a custom protocol so the OS routes it
+//      to KCreate even when KCreate is closed.
+//   2. Hold a single-instance lock so a second OS-spawned KCreate
+//      process forwards the deeplink to the running instance via
+//      the `second-instance` event (Windows + Linux). macOS hands
+//      the URL through the dedicated `open-url` event instead.
+//   3. Scan `process.argv` on first launch (Windows + Linux only —
+//      on macOS the argv path is empty for deeplinks).
+//   4. Buffer URLs that arrive before the renderer is ready and
+//      flush them once `did-finish-load` fires, so a cold-start
+//      deeplink isn't lost between the OS hand-off and the React
+//      tree mounting.
+//   5. Forward every accepted URL to the renderer through the
+//      `kcreate/deeplink/received` IPC channel; the renderer side
+//      lives in `InvitePanel.tsx` (Phase 7 Task 10).
+//
+// Only `kcreate://` URLs are accepted. Any other scheme that lands
+// here is dropped to keep the deeplink surface tight.
+// ---------------------------------------------------------------------------
+
+const DEEPLINK_SCHEME = "kcreate";
+const DEEPLINK_CHANNEL = "kcreate/deeplink/received";
+
+// Hard cap the cold-start deeplink buffer so a renderer that
+// crashes mid-load (or a `did-finish-load` event that never fires)
+// can't drive unbounded memory growth if the OS keeps handing us
+// new `kcreate://` URLs through the protocol activation path. Once
+// the cap is hit we drop the *oldest* pending URL on each push so
+// the most recent invite wins — a stale invite is less useful than
+// the one the user clicked five seconds ago.
+const MAX_PENDING_DEEPLINKS = 50;
+const pendingDeeplinks: string[] = [];
+
+function pushPendingDeeplink(url: string): void {
+  if (pendingDeeplinks.length >= MAX_PENDING_DEEPLINKS) {
+    pendingDeeplinks.shift();
+  }
+  pendingDeeplinks.push(url);
+}
+
+function isKcreateUrl(value: string): boolean {
+  // We accept both `kcreate://...` and (rarely-seen on Windows
+  // shells) `kcreate:...` so the renderer doesn't have to guess.
+  return value.startsWith(`${DEEPLINK_SCHEME}://`) || value.startsWith(`${DEEPLINK_SCHEME}:`);
+}
+
+function extractDeeplinksFromArgv(argv: readonly string[]): string[] {
+  return argv.filter(isKcreateUrl);
+}
+
+function dispatchDeeplink(url: string): void {
+  if (!isKcreateUrl(url)) {
+    return;
+  }
+  const win = mainWindow;
+  if (!win || win.webContents.isLoading() || win.webContents.isDestroyed()) {
+    // Buffer until the renderer is ready. A cold-start deeplink
+    // path lands here when the OS launches us straight from the
+    // protocol hand-off. The buffer is capped so a stuck renderer
+    // doesn't trigger unbounded memory growth.
+    pushPendingDeeplink(url);
+    return;
+  }
+  try {
+    win.webContents.send(DEEPLINK_CHANNEL, url);
+    // Bring the window forward so a one-click deeplink lands the
+    // user on the join UI without an extra Alt-Tab.
+    if (win.isMinimized()) {
+      win.restore();
+    }
+    win.focus();
+  } catch (err) {
+    console.error("kcreate: failed to dispatch deeplink", url, err);
+  }
+}
+
+function flushPendingDeeplinks(): void {
+  const win = mainWindow;
+  if (!win || win.webContents.isDestroyed()) {
+    return;
+  }
+  while (pendingDeeplinks.length > 0) {
+    const url = pendingDeeplinks.shift()!;
+    try {
+      win.webContents.send(DEEPLINK_CHANNEL, url);
+    } catch (err) {
+      console.error("kcreate: failed to flush deeplink", url, err);
+    }
+  }
+}
+
+function registerProtocolHandler(): void {
+  // `setAsDefaultProtocolClient` returns false if the OS refuses
+  // (e.g. another app is registered and the user hasn't approved
+  // the switch). That's not fatal — KCreate still works without
+  // the deeplink path — so we just log and move on.
+  let ok: boolean;
+  if (process.platform === "win32" && process.defaultApp) {
+    // During `electron .` dev runs the entry-point script is
+    // argv[1]; pass it through so the spawned secondary instance
+    // can find our app code.
+    const script = process.argv[1];
+    ok =
+      typeof script === "string"
+        ? app.setAsDefaultProtocolClient(DEEPLINK_SCHEME, process.execPath, [
+            path.resolve(script),
+          ])
+        : app.setAsDefaultProtocolClient(DEEPLINK_SCHEME);
+  } else {
+    ok = app.setAsDefaultProtocolClient(DEEPLINK_SCHEME);
+  }
+  if (!ok) {
+    console.warn(
+      `kcreate: failed to register ${DEEPLINK_SCHEME}:// protocol (already registered by another app?)`,
+    );
+  }
 }
 
 /// Point the KChat trust-store at the per-user JSON file under
@@ -2466,24 +2798,90 @@ function initializeKChatTrustStore(): void {
   }
 }
 
-void app.whenReady().then(() => {
-  // Load the native bridge synchronously, before any window/IPC traffic
-  // can hit `requireBridge()`. See the comment above `let bridge`.
-  bridge = loadBridge();
-  registerIpcHandlers();
-  // Wire the KChat trust-store at `<userData>/kchat_trust.json`.
-  // Must run AFTER the bridge is loaded (it dispatches an N-API
-  // call) but BEFORE any renderer window opens (so the first
-  // `kchat.status()` poll already sees the loaded allowlist).
-  initializeKChatTrustStore();
-  createWindow();
-
-  app.on("activate", () => {
-    if (BrowserWindow.getAllWindows().length === 0) {
-      createWindow();
+// Acquire the single-instance lock BEFORE `app.whenReady`. When a
+// user clicks a `kcreate://` deeplink while KCreate is already
+// running the OS spawns a fresh KCreate process; that second
+// process bails out here and the running primary instance picks
+// up the deeplink via the `second-instance` event below.
+if (!app.requestSingleInstanceLock()) {
+  app.quit();
+} else {
+  app.on("second-instance", (_event, argv) => {
+    // Windows / Linux: the deeplink URL is the last argv entry of
+    // the secondary instance. Forward whatever we find to the
+    // renderer (the helper drops non-`kcreate:` strings).
+    for (const url of extractDeeplinksFromArgv(argv)) {
+      dispatchDeeplink(url);
+    }
+    // Focus + restore even when argv carried no URL, so a second
+    // launch (e.g. user double-clicking the dock icon) still
+    // brings the existing window forward.
+    const win = mainWindow;
+    if (win) {
+      if (win.isMinimized()) win.restore();
+      win.focus();
     }
   });
-});
+
+  // macOS hands deeplinks through the dedicated `open-url` event
+  // rather than argv. The event can fire before `whenReady` — we
+  // still buffer the URL through `dispatchDeeplink` (which routes
+  // to `pendingDeeplinks` when the window doesn't exist yet) so a
+  // cold-start deeplink isn't lost.
+  app.on("open-url", (event, url) => {
+    event.preventDefault();
+    dispatchDeeplink(url);
+  });
+
+  void app.whenReady().then(() => {
+    // Load the native bridge synchronously, before any window/IPC traffic
+    // can hit `requireBridge()`. See the comment above `let bridge`.
+    bridge = loadBridge();
+    registerIpcHandlers();
+    // Wire the KChat trust-store at `<userData>/kchat_trust.json`.
+    // Must run AFTER the bridge is loaded (it dispatches an N-API
+    // call) but BEFORE any renderer window opens (so the first
+    // `kchat.status()` poll already sees the loaded allowlist).
+    initializeKChatTrustStore();
+    // Register the `kcreate://` protocol AFTER the lock is held
+    // and BEFORE the window is created so any URL that happens to
+    // be sitting in argv from a cold-start path is picked up by
+    // the buffer below.
+    registerProtocolHandler();
+    const win = createWindow();
+    // Drain any deeplinks that arrived before the window mounted
+    // (cold-start path: OS spawns us straight from the protocol
+    // hand-off, the URL is in argv, and the renderer needs the
+    // payload as soon as the React tree mounts).
+    win.webContents.once("did-finish-load", () => {
+      flushPendingDeeplinks();
+    });
+    // Cold-start argv scan (Windows / Linux only — macOS routes
+    // through `open-url` and the argv list is empty for deeplink
+    // launches). The first hit goes into `pendingDeeplinks` and is
+    // flushed by the `did-finish-load` hook above.
+    for (const url of extractDeeplinksFromArgv(process.argv)) {
+      dispatchDeeplink(url);
+    }
+
+    app.on("activate", () => {
+      if (BrowserWindow.getAllWindows().length === 0) {
+        // Mirror the cold-start flush wiring above so any deeplinks
+        // that arrived while every window was closed (macOS: user
+        // closed the last window, then clicked a `kcreate://` link
+        // in KChat Desktop; the `open-url` listener buffered the
+        // URL into `pendingDeeplinks`) are drained as soon as the
+        // re-created renderer finishes loading. Without this hook
+        // the buffered URLs sit in memory forever and the share
+        // invite is silently lost.
+        const reopened = createWindow();
+        reopened.webContents.once("did-finish-load", () => {
+          flushPendingDeeplinks();
+        });
+      }
+    });
+  });
+}
 
 app.on("window-all-closed", () => {
   if (process.platform !== "darwin") {

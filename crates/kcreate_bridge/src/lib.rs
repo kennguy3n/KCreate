@@ -21,6 +21,8 @@ pub mod audit;
 pub mod collab;
 pub mod document;
 pub mod hit_test;
+#[cfg(feature = "kchat-backend")]
+pub mod kchat_backend;
 pub mod llm;
 #[cfg(feature = "native_canvas")]
 pub mod native_canvas;
@@ -2901,10 +2903,25 @@ pub fn session_start(
     display_name: String,
     project_id: String,
     advertise_mdns: bool,
+    // Phase 7 (Task 7): optional KChat community id to bind the
+    // session to. When set, mDNS discovery filters peers by
+    // community so two KCreate instances on the same LAN that
+    // belong to different KChat communities don't auto-connect.
+    // Must match the currently-installed KChat membership's
+    // group id; mismatches return `SessionBridgeError::InvalidArgument`.
+    community_id: Option<String>,
+    // Phase 7 (Task 21): optional path to the project's `.kstudio/`
+    // directory. When present the bridge loads `<dir>/acl.json` at
+    // session start and persists ACL changes back to that file.
+    // Omitted for ad-hoc sessions (no project on disk) — the ACL
+    // is still tracked in memory but changes are not persisted.
+    project_dir: Option<String>,
 ) -> NapiResult<String> {
     let pid = parse_uuid(&project_id)?;
-    let report = crate::collab::session_start(&seed_b64, &display_name, pid, advertise_mdns)
-        .map_err(map_session_err)?;
+    let dir = project_dir.map(std::path::PathBuf::from);
+    let report =
+        crate::collab::session_start(&seed_b64, &display_name, pid, advertise_mdns, community_id, dir)
+            .map_err(map_session_err)?;
     serde_json::to_string(&report).map_err(|e| {
         NapiError::new(
             Status::GenericFailure,
@@ -3002,6 +3019,67 @@ pub fn session_send_presence(
         None => None,
     };
     crate::collab::session_send_presence(active, selection, cursor).map_err(map_session_err)
+}
+
+/// Phase 7 (Task 25): queue one operation into the outbound batch
+/// accumulator. The bridge buffers ops and flushes them in a
+/// single `OperationBroadcast` envelope when either the throttle
+/// deadline (`batch_flush_interval_ms`, 50 ms default) elapses or
+/// the buffer hits `batch_flush_max_ops` (200 default). `op_json`
+/// is a JSON-encoded `Operation` (same wire format used by the
+/// document module's local-record path).
+#[cfg(feature = "collab")]
+#[napi]
+pub fn session_queue_operation(op_json: String) -> NapiResult<()> {
+    let op: kcreate_core::operation::Operation = serde_json::from_str(&op_json).map_err(|e| {
+        NapiError::new(
+            Status::InvalidArg,
+            format!("kcreate_bridge: session_queue_operation parse: {e}"),
+        )
+    })?;
+    crate::collab::session_queue_operation(op).map_err(map_session_err)
+}
+
+/// Phase 7 (Task 25): immediately drain the pending op batch and
+/// broadcast it. Called by the renderer at the end of a drag
+/// interaction so the final state lands on the wire without
+/// waiting for the throttle deadline. Returns the number of ops
+/// that were flushed (0 if the queue was empty).
+#[cfg(feature = "collab")]
+#[napi]
+pub fn session_flush_pending_operations() -> NapiResult<u32> {
+    crate::collab::session_flush_pending_operations().map_err(map_session_err)
+}
+
+/// Phase 7 (Task 25): check the pending op batch against the
+/// configured flush interval and broadcast it if the deadline has
+/// elapsed. Called by the renderer event-tick on the same cadence
+/// as `session_drain_events`. Cheap when no ops are queued
+/// (single lock + early return). Returns the number of ops
+/// flushed (0 if no flush was due).
+#[cfg(feature = "collab")]
+#[napi]
+pub fn session_tick_outbound_batch() -> NapiResult<u32> {
+    crate::collab::session_tick_outbound_batch().map_err(map_session_err)
+}
+
+/// Phase 7 (Task 27): set the list of pages the local peer is
+/// currently viewing. Remote presence updates for pages outside
+/// this set are suppressed from the renderer event stream to
+/// reduce overlay churn in multi-page documents. Operations
+/// continue to be journaled across the whole project so document
+/// consistency is preserved. Pass an empty array (`"[]"`) to
+/// revert to "interested in everything".
+#[cfg(feature = "collab")]
+#[napi]
+pub fn session_set_active_pages(page_ids_json: String) -> NapiResult<()> {
+    let page_ids: Vec<Uuid> = serde_json::from_str(&page_ids_json).map_err(|e| {
+        NapiError::new(
+            Status::InvalidArg,
+            format!("kcreate_bridge: session_set_active_pages parse: {e}"),
+        )
+    })?;
+    crate::collab::session_set_active_pages(page_ids).map_err(map_session_err)
 }
 
 /// Block 7: read the running session's operation journal summary
@@ -3281,6 +3359,353 @@ pub fn kchat_remove_trusted_issuer(issuer_public_key: String) -> NapiResult<Stri
 #[napi]
 pub fn kchat_dev_mint_membership(request_json: String) -> NapiResult<String> {
     crate::collab::kchat_dev_mint_membership_json(&request_json).map_err(map_session_err)
+}
+
+// =============================================================================
+// Phase 7 — KChat backend (HTTPS REST)
+// =============================================================================
+//
+// Thin N-API wrappers around `kchat_backend.rs`. The logic lives
+// in that module; this layer marshals JSON strings. Every entry
+// point is gated on the `kchat-backend` feature flag (which
+// implies `collab` — see Cargo.toml) so non-collab builds don't
+// even see the symbols. All wire-format types are mirrored in
+// `apps/desktop/shared/scene.ts`.
+
+#[cfg(feature = "kchat-backend")]
+#[allow(clippy::needless_pass_by_value)]
+fn map_kchat_backend_err(e: crate::kchat_backend::KChatBackendBridgeError) -> NapiError {
+    let status = match e {
+        crate::kchat_backend::KChatBackendBridgeError::NotConnected => Status::InvalidArg,
+        _ => Status::GenericFailure,
+    };
+    NapiError::new(status, e.to_string())
+}
+
+/// Sign in to a KChat / Mattermost backend. `request_json` is a
+/// JSON-encoded [`crate::kchat_backend::KChatBackendSignInRequest`]
+/// (`{ baseUrl, loginId, password, totp? }`). Returns the new
+/// status as JSON [`crate::kchat_backend::KChatBackendStatus`].
+#[cfg(feature = "kchat-backend")]
+#[napi]
+pub fn kchat_backend_connect(request_json: String) -> NapiResult<String> {
+    let request: crate::kchat_backend::KChatBackendSignInRequest =
+        serde_json::from_str(&request_json).map_err(|e| {
+            NapiError::from_reason(format!(
+                "kchat_backend_connect: invalid sign-in request: {e}"
+            ))
+        })?;
+    let status = crate::kchat_backend::kchat_backend_connect(request)
+        .map_err(map_kchat_backend_err)?;
+    serde_json::to_string(&status)
+        .map_err(|e| NapiError::from_reason(format!("kchat_backend_connect: {e}")))
+}
+
+/// Sign out of the KChat backend. Idempotent. Clears the active
+/// authority + tokens.
+#[cfg(feature = "kchat-backend")]
+#[napi]
+pub fn kchat_backend_disconnect() -> NapiResult<String> {
+    let status =
+        crate::kchat_backend::kchat_backend_disconnect().map_err(map_kchat_backend_err)?;
+    serde_json::to_string(&status)
+        .map_err(|e| NapiError::from_reason(format!("kchat_backend_disconnect: {e}")))
+}
+
+/// Snapshot the current KChat backend sign-in status.
+#[cfg(feature = "kchat-backend")]
+#[napi]
+pub fn kchat_backend_status() -> NapiResult<String> {
+    let status = crate::kchat_backend::kchat_backend_status().map_err(map_kchat_backend_err)?;
+    serde_json::to_string(&status)
+        .map_err(|e| NapiError::from_reason(format!("kchat_backend_status: {e}")))
+}
+
+/// Return the list of communities the local user belongs to as JSON
+/// `KChatCommunity[]`.
+#[cfg(feature = "kchat-backend")]
+#[napi]
+pub fn kchat_backend_list_communities() -> NapiResult<String> {
+    let communities =
+        crate::kchat_backend::kchat_backend_list_communities().map_err(map_kchat_backend_err)?;
+    serde_json::to_string(&communities)
+        .map_err(|e| NapiError::from_reason(format!("kchat_backend_list_communities: {e}")))
+}
+
+/// Select a community: install its attestation as the active KChat
+/// authority and return the resulting [`KChatMembershipStatus`] as
+/// JSON. Replaces the dev-mint flow for production builds.
+#[cfg(feature = "kchat-backend")]
+#[napi]
+pub fn kchat_backend_select_community(community_id: String) -> NapiResult<String> {
+    let status = crate::kchat_backend::kchat_backend_select_community(&community_id)
+        .map_err(map_kchat_backend_err)?;
+    serde_json::to_string(&status)
+        .map_err(|e| NapiError::from_reason(format!("kchat_backend_select_community: {e}")))
+}
+
+/// Return the member list (with roles) for the given community as
+/// JSON `KChatCommunityMember[]`.
+#[cfg(feature = "kchat-backend")]
+#[napi]
+pub fn kchat_backend_get_community_members(community_id: String) -> NapiResult<String> {
+    let members = crate::kchat_backend::kchat_backend_get_community_members(&community_id)
+        .map_err(map_kchat_backend_err)?;
+    serde_json::to_string(&members)
+        .map_err(|e| NapiError::from_reason(format!("kchat_backend_get_community_members: {e}")))
+}
+
+/// Return the list of conversations/channels in the given community
+/// as JSON `KChatConversation[]`.
+#[cfg(feature = "kchat-backend")]
+#[napi]
+pub fn kchat_backend_list_conversations(community_id: String) -> NapiResult<String> {
+    let conversations = crate::kchat_backend::kchat_backend_list_conversations(&community_id)
+        .map_err(map_kchat_backend_err)?;
+    serde_json::to_string(&conversations)
+        .map_err(|e| NapiError::from_reason(format!("kchat_backend_list_conversations: {e}")))
+}
+
+/// Share a document-invite payload to a KChat conversation. The
+/// `invite_json` argument is a JSON-encoded
+/// [`crate::kchat_backend::KChatShareInvite`]. Returns the
+/// JSON-encoded [`kcreate_kchat_client::PostMessageResponse`].
+#[cfg(feature = "kchat-backend")]
+#[napi]
+pub fn kchat_backend_share_to_conversation(
+    conversation_id: String,
+    invite_json: String,
+) -> NapiResult<String> {
+    let invite: crate::kchat_backend::KChatShareInvite = serde_json::from_str(&invite_json)
+        .map_err(|e| {
+            NapiError::from_reason(format!(
+                "kchat_backend_share_to_conversation: invalid invite: {e}"
+            ))
+        })?;
+    let result =
+        crate::kchat_backend::kchat_backend_share_to_conversation(&conversation_id, invite)
+            .map_err(map_kchat_backend_err)?;
+    serde_json::to_string(&result)
+        .map_err(|e| NapiError::from_reason(format!("kchat_backend_share_to_conversation: {e}")))
+}
+
+/// Phase 7 (Task 10): accept a share-document invite received via
+/// a KChat conversation. `invite_json` is the raw JSON card.
+/// Validates community match + sender membership, then dials the
+/// owner via `session_join`.
+#[cfg(feature = "kchat-backend")]
+#[napi]
+pub fn kchat_backend_accept_invite(invite_json: String) -> NapiResult<String> {
+    let result = crate::kchat_backend::kchat_backend_accept_invite(&invite_json)
+        .map_err(map_kchat_backend_err)?;
+    serde_json::to_string(&result)
+        .map_err(|e| NapiError::from_reason(format!("kchat_backend_accept_invite: {e}")))
+}
+
+/// Phase 7 (Task 8): tick the roster-sync poller. Reads the current
+/// community members from the KChat backend, reconciles against
+/// the active collab session (kicks revoked peers, refreshes role
+/// -> permission mappings), and returns a summary.
+#[cfg(feature = "kchat-backend")]
+#[napi]
+pub fn kchat_backend_sync_community_roster(community_id: String) -> NapiResult<String> {
+    let result = crate::kchat_backend::kchat_backend_sync_community_roster(&community_id)
+        .map_err(map_kchat_backend_err)?;
+    serde_json::to_string(&result)
+        .map_err(|e| NapiError::from_reason(format!("kchat_backend_sync_community_roster: {e}")))
+}
+
+/// Phase 7 (Task 11): set a connected peer's collaboration
+/// permission. Exposed so the host admin can downgrade a member
+/// to Viewer from the renderer's presence panel context menu.
+#[cfg(feature = "collab")]
+#[napi]
+pub fn session_set_peer_permission(peer_id: String, permission: String) -> NapiResult<()> {
+    let perm = match permission.as_str() {
+        "editor" => crate::collab::CollabPermission::Editor,
+        "viewer" => crate::collab::CollabPermission::Viewer,
+        _ => {
+            return Err(NapiError::new(
+                Status::InvalidArg,
+                format!("unknown permission: {permission}; expected \"editor\" or \"viewer\""),
+            ))
+        }
+    };
+    crate::collab::session_set_peer_permission(&peer_id, perm).map_err(map_session_err)
+}
+
+/// Phase 7 (Task 11): snapshot of the local peer's permission.
+#[cfg(feature = "collab")]
+#[napi]
+pub fn session_local_permission() -> String {
+    match crate::collab::session_local_permission() {
+        crate::collab::CollabPermission::Editor => "editor".to_string(),
+        crate::collab::CollabPermission::Viewer => "viewer".to_string(),
+    }
+}
+
+/// Phase 7 (Task 8): kick a connected peer. Used by the admin
+/// context menu in the presence panel.
+#[cfg(feature = "collab")]
+#[napi]
+pub fn session_kick_peer(peer_id: String, reason: String) -> NapiResult<()> {
+    crate::collab::session_kick_peer(&peer_id, &reason).map_err(map_session_err)
+}
+
+/// Phase 7 (Task 15): ask a connected host to backfill any journal
+/// entries we're missing. The reply arrives asynchronously via the
+/// `kcreate/session/event` channel as a `SessionEvent::ResumeApplied`
+/// once the host's `ResumeBundle` has been replayed locally.
+///
+/// Renderers call this right after `session_join` finishes so a
+/// late joiner gets the running document history without forcing
+/// the host to restart their session.
+#[cfg(feature = "collab")]
+#[napi]
+pub fn session_request_resume(peer_id: String) -> NapiResult<()> {
+    crate::collab::session_request_resume(&peer_id).map_err(map_session_err)
+}
+
+// ---------- Phase 7 (Tasks 19/21/23) collab security entry points ----------
+
+/// Phase 7 (Task 21): return the active session's ACL as a JSON
+/// string. `null` is returned when no session is running. The
+/// renderer's `AccessControlPanel.tsx` deserialises this into the
+/// matching `ProjectAcl` TypeScript type.
+#[cfg(feature = "collab")]
+#[napi]
+pub fn session_acl_get() -> NapiResult<Option<String>> {
+    match crate::collab::session_acl_get() {
+        None => Ok(None),
+        Some(acl) => serde_json::to_string(&acl).map(Some).map_err(|e| {
+            NapiError::new(
+                Status::GenericFailure,
+                format!("kcreate_bridge: session_acl_get serialize: {e}"),
+            )
+        }),
+    }
+}
+
+/// Phase 7 (Task 21): replace the active session's ACL with the
+/// JSON-serialised `ProjectAcl` payload. The change is persisted
+/// to `<project_dir>/acl.json` (when the session was started with a
+/// project_dir) and applied immediately — already-connected peers
+/// that no longer meet the new policy are kicked with reason
+/// `acl-rejected` and a matching `SessionEvent::AclRejected` is
+/// emitted.
+#[cfg(feature = "collab")]
+#[napi]
+pub fn session_acl_set(acl_json: String) -> NapiResult<()> {
+    let acl: kcreate_collab::ProjectAcl = serde_json::from_str(&acl_json).map_err(|e| {
+        NapiError::new(
+            Status::InvalidArg,
+            format!("kcreate_bridge: session_acl_set deserialize: {e}"),
+        )
+    })?;
+    crate::collab::session_acl_set(acl).map_err(map_session_err)
+}
+
+/// Phase 7 (Task 19): force an immediate session-key rotation.
+/// Returns the new epoch number. `grace_ms` is the wall-clock
+/// window peers have to ack the rotation; non-acking peers are
+/// disconnected with `key-rotation-timeout`.
+#[cfg(feature = "collab")]
+#[napi]
+pub fn session_rotate_keys(grace_ms: u32) -> NapiResult<u32> {
+    let grace = std::time::Duration::from_millis(u64::from(grace_ms));
+    let epoch = crate::collab::session_rotate_keys(grace).map_err(map_session_err)?;
+    Ok(u32::try_from(epoch).unwrap_or(u32::MAX))
+}
+
+/// Phase 7 (Task 19): current key-rotation epoch (0 at session
+/// start; bumped by every `session_rotate_keys` call). `null` when
+/// no session is running.
+#[cfg(feature = "collab")]
+#[napi]
+pub fn session_key_epoch() -> Option<u32> {
+    crate::collab::session_key_epoch().map(|e| u32::try_from(e).unwrap_or(u32::MAX))
+}
+
+/// Phase 7 (Task 23): encrypt the supplied plaintext for
+/// `peer_id` and send it as a `ClipboardShare` message. Returns
+/// the generated offer id so the renderer can correlate accept /
+/// reject decisions back to the original UI affordance. The local
+/// signing key is held by the bridge — there's no need (and no
+/// safe way) to pass the seed in from the renderer.
+#[cfg(feature = "collab")]
+#[napi]
+pub fn session_clipboard_share(
+    peer_id: String,
+    plaintext: napi::bindgen_prelude::Buffer,
+    preview_label: String,
+) -> NapiResult<String> {
+    crate::collab::session_clipboard_share(&peer_id, &plaintext, &preview_label)
+        .map_err(map_session_err)
+}
+
+/// Phase 7 (Task 23): decrypt a queued inbound clipboard offer and
+/// return the plaintext bytes. The offer is removed from the
+/// pending queue regardless of decryption outcome.
+#[cfg(feature = "collab")]
+#[napi]
+pub fn session_clipboard_accept(
+    offer_id: String,
+) -> NapiResult<napi::bindgen_prelude::Buffer> {
+    let bytes = crate::collab::session_clipboard_accept(&offer_id)
+        .map_err(map_session_err)?;
+    Ok(bytes.into())
+}
+
+/// Phase 7 (Task 23): discard a queued inbound clipboard offer
+/// without decrypting. Idempotent — unknown ids are a no-op.
+#[cfg(feature = "collab")]
+#[napi]
+pub fn session_clipboard_reject(offer_id: String) -> NapiResult<()> {
+    crate::collab::session_clipboard_reject(&offer_id).map_err(map_session_err)
+}
+
+/// Wire-format snapshot of a single pending clipboard offer. Used
+/// only by [`session_pending_clipboard_offers`] below — held at
+/// module scope (rather than nested in the function) so clippy's
+/// `items_after_statements` lint stays happy.
+#[cfg(feature = "collab")]
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WireClipboardOffer {
+    offer_id: String,
+    from_peer_id: String,
+    preview_label: String,
+}
+
+/// Phase 7 (Task 23): JSON-encoded snapshot of pending clipboard
+/// offers. Schema: `Array<{ offerId, fromPeerId, previewLabel }>`.
+/// The renderer renders an accept/reject prompt for each entry.
+#[cfg(feature = "collab")]
+#[napi]
+pub fn session_pending_clipboard_offers() -> NapiResult<String> {
+    let entries = crate::collab::session_pending_clipboard_offers();
+    let wire: Vec<WireClipboardOffer> = entries
+        .into_iter()
+        .map(|(offer_id, from_peer_id, preview_label)| WireClipboardOffer {
+            offer_id,
+            from_peer_id,
+            preview_label,
+        })
+        .collect();
+    serde_json::to_string(&wire).map_err(|e| {
+        NapiError::new(
+            Status::GenericFailure,
+            format!("kcreate_bridge: session_pending_clipboard_offers serialize: {e}"),
+        )
+    })
+}
+
+/// Capability probe — `true` when the bridge was compiled with the
+/// `kchat-backend` feature flag. Mirrors `kchat_dev_issuer_available`
+/// for symmetry.
+#[napi]
+pub fn kchat_backend_available() -> bool {
+    cfg!(feature = "kchat-backend")
 }
 
 // =============================================================================

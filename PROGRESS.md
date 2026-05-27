@@ -298,7 +298,7 @@ sentinel stays green.
       `template_list / template_install_local / template_remove`
       bridge.
 
-## Phase 6 — Production Polish | In progress | ~100%
+## Phase 6 — Production Polish | Complete | 100%
 
 PR #16 lands Phase 6 Tasks 13-30 in one batch on top of the
 Phase 3 completion above. Local-first invariants, lockstep
@@ -515,7 +515,246 @@ foundations.
 - [x] `crates/kcreate_tests/tests/text_flow.rs`
 - [x] `crates/kcreate_tests/tests/print_workflow.rs`
 
+## Phase 7 — KChat backend Integration | Complete | 100%
+
+PR #17 lands Phase 7 — KCreate's first-party integration with
+the shared KChat / Mattermost backend that
+`uneycom/uney-chat-desktop` also signs in to (the **Option C**
+shape). A new HTTPS REST client (`kcreate_kchat_client`) speaks
+`reqwest` + `rustls` to that backend and bridges KChat
+communities / conversations / community-member rosters into
+the existing collab gate. A thin `.kcz` companion extension
+(`apps/kchat-extension/`) renders a sidebar inside KChat
+Desktop and bridges deeplinks back to KCreate. All 30 tasks
+ship behind feature flags (`kchat-backend` enables the
+production client; `kchat-dev-issuer` stays for local
+testing). The local-first sentinel still passes — the new
+crate stays out of the editing-path closure even though it
+links `reqwest`.
+
+### Block A — KChat backend REST client (Tasks 1–6)
+- [x] **Task 1: `kcreate_kchat_client` crate.** New crate
+      behind the `kchat-backend` feature flag. HTTPS-only
+      `reqwest` + `rustls` lifecycle (`connect` = sign in +
+      hydrate token store; `disconnect` = drop tokens +
+      attestation). Excluded from the editing-path dep closure
+      via the `local_first.rs` deny-list.
+- [x] **Task 2: REST surface + DTOs.** Typed request /
+      response structs for `/api/v1/auth/{login,refresh}`,
+      `/api/v1/me`, `/api/v1/communities`,
+      `/api/v1/communities/{id}/members`,
+      `/api/v1/communities/{id}/attestation`,
+      `/api/v1/communities/{id}/conversations`,
+      `/api/v1/conversations/{id}/messages`. Strict TLS;
+      `http://` URLs refused outside the in-process `axum`
+      fixture used by `kcreate_tests`.
+- [x] **Task 3: Transport layer.** 10 s per-request timeout,
+      transparent token refresh on 401 (with pre-emptive
+      refresh window), capped exponential retry on 429,
+      graceful shutdown.
+- [x] **Task 4: Attestation bridging.** Maps the backend's
+      `/communities/{id}/attestation` response into the
+      existing `KChatMembership` / `KChatGroupId` types.
+      `KChatBackendAuthority` implements `KChatGroupAuthority`
+      and sources its membership live; auto-refresh kicks in
+      when the attestation is within 5 minutes of expiry.
+      Until the backend ships the attestation endpoint, the
+      `kchat-dev-issuer` flag covers the same wire shape.
+- [x] **Task 5: Bridge surface.**
+      `crates/kcreate_bridge/src/kchat_backend.rs` exposes
+      9 N-API entry points (`connect`, `disconnect`, `status`,
+      `list_communities`, `select_community`,
+      `get_community_members`, `list_conversations`,
+      `share_to_conversation`, `accept_invite`). Wire-format
+      lockstep through `bridge.ts`, `main.ts`, `preload.ts`,
+      `scene.ts` with `KChatBackendStatus`, `KChatCommunity`,
+      `KChatCommunityMember`, `KChatConversation` types.
+- [x] **Task 6: Client tests.** In-process `axum` REST
+      fixture (canned JSON, 401 → refresh → replay, 429
+      retry, signature-mismatch / clock-skew / expired
+      attestation, endpoint-not-implemented graceful path),
+      bridge integration in
+      `crates/kcreate_tests/tests/kchat_backend_client.rs`,
+      local-first sentinel verified.
+
+### Block B — Channel/Group-Gated Collaboration (Tasks 7–12)
+- [x] **Task 7: Community-scoped session start.** `session_start`
+      accepts optional `community_id`; mDNS service TXT carries
+      it so only LAN peers in the same community auto-discover.
+- [x] **Task 8: Roster sync + kick.** 30 s `getCommunityMembers`
+      poll. Revoked peer triggers a `Goodbye(Kicked)` + graceful
+      QUIC close + `SessionEvent::PeerKicked` event.
+- [x] **Task 9: Conversation document sharing.** `SharedDocument`
+      invite payload (project_id + owner peer_id + owner pubkey
+      + cert fingerprint + community_id + conversation_id) is
+      posted via `kchat.conversations.postMessage` as a rich
+      card the uney-chat-desktop renderer can display inline.
+- [x] **Task 10: Invite acceptance.** `accept_invite` bridge
+      entry point parses the JSON payload, verifies sender is
+      in the same community, triggers `session_join` against
+      the owner. `InvitePanel.tsx` polls the clipboard / local
+      invite queue and validates community match before
+      enabling the join action.
+- [x] **Task 11: Role-based permissions.** Owner / admin →
+      `Editor` with kick + ACL-manage privileges, member →
+      `Editor` with host-downgradable to `Viewer`. Viewer
+      permission rejects `session_broadcast_operations` (and
+      `session_queue_operation`) at the bridge layer.
+      `CollabPermission` enum in `kcreate_collab::session`.
+- [x] **Task 12: Community-gated tests.**
+      `crates/kcreate_tests/tests/collab_communities.rs`:
+      community-scoped mDNS filtering, kicked-peer cleanup,
+      permission enforcement, invite round-trip.
+
+### Block C — Real-Time Collaboration UX (Tasks 13–18)
+- [x] **Task 13: Real-time cursor overlay.**
+      `apps/desktop/renderer/src/components/CursorOverlay.tsx`
+      reads `session_peers()` presence, projects world-space
+      cursors through the viewport, renders arrow + label per
+      peer with hash-derived high-contrast colours.
+- [x] **Task 14: Selection highlight overlay.** Matching
+      coloured outline drawn around remote-peer selected
+      nodes; reuses the cursor palette so peer identity is
+      consistent across overlays. `SelectionOverlay.tsx`.
+- [x] **Task 15: Resume bundle for late joiners.**
+      `session_request_resume()` sends `ResumeRequest` with
+      the local resume vector; the host responds with
+      `ResumeBundle` carrying every missing entry. End-to-end
+      from `Hello/Welcome::Accepted` through
+      `SessionEvent::ResumeApplied`.
+- [x] **Task 16: Conflict notification UI.** CRDT resolver
+      emits `SessionEvent::ConflictResolved { node_id,
+      winner_peer_id, loser_peer_id, field }`. `ConflictToast.tsx`
+      surfaces the non-blocking notification + auto-dismiss
+      after 5 s + undo link.
+- [x] **Task 17: Collaborative undo.** `Operation::is_undo`
+      flag (skip-serialised when false → backwards
+      compatible). Undo / redo broadcast through the journal
+      with the marker; remote peers render "Ken undid …" in
+      the activity feed and apply the revert.
+- [x] **Task 18: Real-time UX tests.**
+      `crates/kcreate_tests/tests/collab_realtime.rs` covers
+      cursor projection math, resume flow, conflict event
+      emission, collaborative undo broadcast.
+
+### Block D — Security & Privacy Hardening (Tasks 19–24)
+- [x] **Task 19: Key rotation.** Default 60-minute QUIC cert
+      rotation (configurable via
+      `SessionConfig::key_rotation_interval_secs`). New cert
+      announced via `Message::KeyRotation { new_cert_fingerprint,
+      transition_deadline_ms }`; peers that miss the 30 s
+      acknowledgement window are disconnected with
+      `key-rotation-timeout`. Manual `session_rotate_keys`
+      bridge entry point for ops triggers.
+- [x] **Task 20: Audit trail.** `kcreate_audit` extended with
+      `AuditEventKind::Collab` variant + every collab
+      lifecycle event (`CollabSessionStarted`, `PeerJoined`,
+      `PeerKicked`, `KChatDesktopConnected`, etc.) persisted
+      to the separate audit SQLite DB. `AuditPanel.tsx`
+      surfaces the filter.
+- [x] **Task 21: ACL.** `acl.json` in the project metadata
+      directory enforces per-peer permission (`editor` /
+      `viewer`). Sender's public key checked against the ACL
+      on Hello — community membership grants implicit
+      `editor` only when no ACL is configured. ACL CRUD via
+      `AccessControlPanel.tsx`.
+- [x] **Task 22: Rate limiting.** Per-peer 100 ops/s + 20
+      presence/s ceilings (configurable via
+      `SessionConfig::max_ops_per_second` /
+      `max_presence_per_second`). First-strike warning event,
+      sustained 3 s violation triggers disconnect.
+- [x] **Task 23: Clipboard share.** `Message::ClipboardShare`
+      with ChaCha20-Poly1305 ciphertext + 12-byte caller-
+      generated nonce. Key is a BLAKE3-derived 32-byte secret
+      from the X25519 ECDH shared secret (Ed25519 → X25519
+      conversion). Inbound offers surface in
+      `pendingClipboardOffers` until the user accepts / rejects.
+- [x] **Task 24: Security tests.**
+      `crates/kcreate_tests/tests/collab_security.rs`: ACL
+      enforcement, rate-limit warning + disconnect, key
+      rotation epoch bump + old cert rejection, clipboard
+      encryption end-to-end + non-target decryption fails.
+
+### Block E — Performance & Scale (Tasks 25–28)
+- [x] **Task 25: Operation batching.** `SessionConfig.{batch_flush_interval_ms,
+      batch_flush_max_ops}` (50 ms / 200 ops defaults).
+      `session_queue_operation` / `session_flush_pending_operations`
+      / `session_tick_outbound_batch` N-API trio. Renderer
+      queues per-frame ops + ticks the deadline on the same
+      cadence as `session_drain_events`; drag-end flushes
+      eagerly. Viewer perm still rejects the queue.
+- [x] **Task 26: Lazy presence throttling.**
+      `SessionConfig.{presence_min_interval_ms,
+      presence_move_threshold_px, presence_idle_suppression_ms}`
+      (50 ms / 2 px / 2 s defaults). 20 Hz cap + delta-floor +
+      idle suppression on identical payloads. Selection /
+      active-page changes always broadcast; cursor moves go
+      through the gate.
+- [x] **Task 27: Selective sync.** `session_set_active_pages`
+      N-API. `SessionState.active_pages` filters the renderer
+      event stream for `PresenceUpdated` and `ConflictResolved`
+      while operations continue to journal across the whole
+      project (resume consistency preserved).
+- [x] **Task 28: Performance benchmarks.**
+      `crates/kcreate_bridge/benches/collab_perf.rs` (criterion,
+      gated on `collab` feature). Covers journal append
+      throughput (10-peer round-robin), CRDT merge latency
+      (disjoint / overlap / LWW baseline), presence
+      serialisation at 1/5/20 peers, 10 000-entry resume
+      bundle round-trip, op batching (200 envelopes vs 1
+      batch of 200 ops).
+
+### Block F — Documentation & Polish (Tasks 29–30)
+- [x] **Task 29: Phase tracking.** This file (`PROGRESS.md`)
+      and the changelog entry below. PR #17 description carries
+      the per-block task summary.
+- [x] **Task 30: Docs sync.** `README.md` gains a
+      "Collaboration & KChat Desktop Integration" section.
+      `ARCHITECTURE.md` gains a "§ KChat Desktop Integration"
+      section (REST client over `reqwest` + `rustls`, the
+      `.kcz` companion extension surface, community → collab
+      gate mapping, security model, feature flag table).
+      `AGENTS.md` indexes the new files
+      (`kcreate_kchat_client`, `CursorOverlay.tsx`,
+      `SelectionOverlay.tsx`, `InvitePanel.tsx`,
+      `AccessControlPanel.tsx`, `ConflictToast.tsx`,
+      `AuditPanel.tsx`, `kchat_backend.rs`,
+      `apps/kchat-extension/`, `benches/collab_perf.rs`).
+      `crates/kcreate_kchat_client/src/protocol.rs` documents
+      the REST DTOs, endpoint paths, HTTPS-only invariant,
+      authentication flow (login → access/refresh tokens with
+      pre-emptive refresh), retry policy (429 with capped
+      exponential backoff), error mapping, and the
+      `kcreate.invite.v1` content-type schema consumed by the
+      companion extension.
+
 ## Changelog
+
+- **2026-05-27 (PR #17)** — Phase 7: KChat Desktop
+  (`uneycom/uney-chat-desktop`) integration, community-gated
+  collaboration, real-time UX, security hardening, performance
+  optimisation. New `kcreate_kchat_client` crate ships an
+  HTTPS REST client behind the `kchat-backend` feature flag
+  (Option C); the bridge installs membership attestations
+  from the shared KChat / Mattermost backend that
+  `uneycom/uney-chat-desktop` also signs in to. A thin `.kcz`
+  companion extension (`apps/kchat-extension/`) renders a
+  sidebar inside KChat Desktop and bridges deeplinks back to
+  KCreate.
+  Community-aware mDNS, community-member roster sync + kick,
+  conversation document-sharing invites, ACL persistence
+  (`<project_dir>/acl.json`), per-peer rate limiting,
+  ChaCha20-Poly1305 encrypted clipboard share over a
+  BLAKE3-derived X25519 session key, 60-minute QUIC cert
+  rotation, op batching (50 ms / 200 ops cap), lazy presence
+  throttling (20 Hz min interval + 2 px delta floor + 2 s
+  idle suppression), selective sync via
+  `session_set_active_pages`. Renderer overlays:
+  `CursorOverlay`, `SelectionOverlay`, `ConflictToast`,
+  `InvitePanel`, `AccessControlPanel`, `AuditPanel`. Criterion
+  perf bench `collab_perf.rs` covering journal append, CRDT
+  merge, presence serialisation, 10 k-entry resume bundle,
+  batching round-trip. Local-first sentinel still passes.
 
 - **2026-05-26 (PR #16)** — Phase 3 completion + Phase 6 production
   polish (Tasks 1-30 in one batch):

@@ -324,6 +324,14 @@ impl ProjectStore {
                     affected_nodes: serde_json::from_str(&affected)?,
                     ai_generated: ai != 0,
                     group_id,
+                    // Phase 7 (Task 17): the on-disk schema predates
+                    // the `is_undo` collaborative-undo marker. Existing
+                    // rows have no column for it and `false` is the
+                    // correct historical interpretation — a persisted
+                    // op only ever represents a forward edit; the
+                    // inverse-op marker exists exclusively to colour
+                    // *live* broadcasts on the wire.
+                    is_undo: false,
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;

@@ -35,13 +35,18 @@ use base64::engine::general_purpose::{STANDARD_NO_PAD, URL_SAFE_NO_PAD};
 use base64::Engine;
 use chrono::{DateTime, Utc};
 use ed25519_dalek::VerifyingKey;
+use kcreate_collab::conflict::{
+    ConflictDecision, ConflictResolver, LastWriterWinsResolver, OperationContext,
+};
 use kcreate_collab::message::Cursor;
 use kcreate_collab::{
-    no_kchat_authority, BoundKChatGroupAuthority, JournalEntry, KChatAuthError, KChatGroupId,
-    KChatMembership, LockClaimPayload, LockReleasePayload, MemoryJournalStore, Message,
-    OperationJournal, PeerId, PeerIdentity, PeerKey, PresencePayload, ResumeVector, SessionConfig,
+    no_kchat_authority, BoundKChatGroupAuthority, KChatAuthError, KChatGroupId, KChatMembership,
+    LamportClock, LockClaimPayload, LockReleasePayload, MemoryJournalStore, Message,
+    OperationJournal, PeerId, PeerIdentity, PeerKey, PresencePayload, SessionConfig,
     SharedKChatAuthority,
 };
+#[cfg(test)]
+use kcreate_collab::{JournalEntry, ResumeVector};
 use kcreate_collab_transport::{HostOptions, InboundEvent, LanCollabHost};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -199,6 +204,141 @@ pub enum SessionEvent {
         /// Base64url-encoded peer id of the session that just left.
         peer_id: String,
     },
+    /// Phase 7 (Task 8): a connected peer was evicted from the
+    /// session because their KChat community membership was
+    /// revoked. Emitted by the roster-sync poller; the underlying
+    /// QUIC connection is closed (with a directed `Goodbye(Kicked)`
+    /// so the kicked peer logs a clean shutdown) before this event
+    /// reaches the renderer. Carries a human-readable reason so
+    /// the UI can show a toast that distinguishes a kick from a
+    /// regular `PeerLeft`.
+    PeerKicked {
+        peer_id: String,
+        /// `revoked-from-community` for the standard membership-
+        /// revocation path; future kick paths (rate-limit, ACL,
+        /// etc.) can extend this without changing the variant.
+        reason: String,
+    },
+    /// Phase 7 (Task 11): a peer's collaboration permission changed
+    /// (e.g. the host downgraded a member to Viewer). The
+    /// renderer uses this to update toolbars / disable controls
+    /// for viewers.
+    PermissionChanged {
+        peer_id: String,
+        permission: CollabPermission,
+    },
+    /// Phase 7 (Task 15): a remote peer applied a `ResumeBundle`
+    /// reply to us — the late-join replay has finished and the
+    /// local journal is now up to date with the host's history.
+    /// The renderer uses this to dismiss the "syncing\u2026"
+    /// indicator and surface the post-resume document.
+    ResumeApplied {
+        /// Peer id of the host that supplied the bundle.
+        from_peer_id: String,
+        /// Number of operations from the bundle that were appended
+        /// to the local journal (may be smaller than the bundle's
+        /// `operations.len()` because the journal silently
+        /// dedupes already-seen entries).
+        applied_count: u32,
+    },
+    /// Phase 7 (Task 16): the CRDT conflict resolver picked a
+    /// winner for a concurrent edit. The renderer uses this to
+    /// surface a "Your edit was overridden by Ken" toast. The
+    /// loser is always the local peer when `loser_peer_id` matches
+    /// the session's `local_peer_id`; the renderer filters its
+    /// toast accordingly.
+    ConflictResolved {
+        /// Node id whose value the resolver had to tiebreak.
+        node_id: Uuid,
+        /// Peer whose write the resolver kept.
+        winner_peer_id: String,
+        /// Peer whose write the resolver discarded.
+        loser_peer_id: String,
+        /// JSON pointer (or dotted path) of the field whose value
+        /// was resolved. Free-form string so the conflict source
+        /// (LWW field, set member, list slot) can be reported
+        /// without baking the CRDT shape into this enum.
+        field: String,
+    },
+    /// Phase 7 (Task 17): a remote peer broadcast an undo (or redo)
+    /// operation. The renderer's activity feed surfaces
+    /// "Ken undid their last edit"; the operation itself was
+    /// already journaled via
+    /// [`SessionEvent::OperationsJournaled`].
+    UndoBroadcast {
+        /// Peer id that produced the undo.
+        peer_id: String,
+        /// Number of inverse operations in the batch (a grouped
+        /// undo spans many primitive ops, so the toast text can
+        /// pluralize correctly).
+        op_count: u32,
+    },
+    /// Phase 7 (Task 22): a connected peer exceeded its per-second
+    /// budget for one of the rate-limited message classes. The
+    /// renderer surfaces a "<peer> is sending too fast" warning;
+    /// if the abuse continues for
+    /// `SessionConfig::rate_limit_disconnect_after` consecutive
+    /// rolling windows the session emits
+    /// [`SessionEvent::PeerKicked`] with reason
+    /// `rate-limit-exceeded` and closes the QUIC connection.
+    RateLimitWarning {
+        peer_id: String,
+        /// `"operations"` or `"presence"`. (Field is named
+        /// `metric` rather than `kind` because the enum already
+        /// uses `kind` as its serde discriminator.)
+        metric: String,
+        /// How many consecutive rolling 1-second windows the peer
+        /// has now been over its budget (1 on the first warning,
+        /// 2 on the second, etc.). Named `_windows` (not
+        /// `_seconds`) because the counter measures **windows**,
+        /// not wall-clock seconds — keeping the unit explicit if
+        /// we ever tune the window width.
+        consecutive_overflow_windows: u32,
+    },
+    /// Phase 7 (Task 19): the host scheduled a session encryption
+    /// key rotation. Carries the new cert fingerprint peers should
+    /// pin and the wall-clock deadline by which they must
+    /// acknowledge. The renderer surfaces a "session keys rotating
+    /// in N s" toast.
+    KeyRotationScheduled {
+        epoch: u64,
+        new_cert_fingerprint: String,
+        deadline_unix_ms: i64,
+    },
+    /// Phase 7 (Task 19): a key rotation completed — every peer
+    /// that didn't acknowledge in time has been disconnected. The
+    /// renderer dismisses the rotation toast on receipt.
+    KeyRotationCompleted {
+        epoch: u64,
+        /// Peers that successfully acknowledged the rotation.
+        acked_peer_ids: Vec<String>,
+        /// Peers that failed to acknowledge in time and were
+        /// disconnected by the host.
+        dropped_peer_ids: Vec<String>,
+    },
+    /// Phase 7 (Task 21): a peer was rejected at Hello-time because
+    /// they are not on the project ACL (and the project is in
+    /// ACL-enforcement mode — community gating alone is not
+    /// enough). The renderer surfaces this in the activity feed.
+    AclRejected {
+        peer_id: String,
+        public_key: String,
+        community_id: Option<String>,
+    },
+    /// Phase 7 (Task 23): a remote peer offered to share a
+    /// clipboard payload with the local user. The renderer
+    /// surfaces a "Ken wants to share their selection — Accept /
+    /// Reject" prompt; only on accept does the payload get
+    /// decrypted and pasted.
+    ClipboardShareOffered {
+        from_peer_id: String,
+        /// User-facing label the sender chose (e.g.
+        /// `"3 nodes"`).
+        preview_label: String,
+        /// Stable identifier for the offer so the accept/reject
+        /// callback can correlate to a stored ciphertext + nonce.
+        offer_id: String,
+    },
 }
 
 impl From<&PresencePayload> for SessionPresence {
@@ -267,6 +407,22 @@ pub enum SessionBridgeError {
     /// their add/remove won't survive an app restart.
     #[error("KChat trust store I/O: {0}")]
     TrustStoreIo(String),
+    /// Phase 7 (Task 11): the local peer's collaboration permission
+    /// is `Viewer`, but the requested operation requires `Editor`
+    /// (e.g. `session_broadcast_operations`). Surfaced to the
+    /// renderer so it can show a "you're in read-only mode" hint
+    /// instead of a generic transport error.
+    #[error("local peer is in read-only mode: operation requires Editor permission")]
+    PermissionDenied,
+    /// Phase 7 (Task 10): the supplied share-document invite was
+    /// malformed JSON or carried fields that violate the schema
+    /// (e.g. a `communityId` that doesn't match the active
+    /// community gate, an expired issuance timestamp, a peer id
+    /// that doesn't BLAKE3-derive from the supplied public key,
+    /// etc.). Carries the specific reason so the renderer can show
+    /// a clear "this invite is invalid: …" error.
+    #[error("invite rejected: {0}")]
+    InviteRejected(String),
 }
 
 pub type Result<T> = std::result::Result<T, SessionBridgeError>;
@@ -320,6 +476,176 @@ struct SessionState {
     /// renderer disables controls for locked nodes but the
     /// protocol doesn't reject concurrent edits.
     locks: HashMap<Uuid, LockEntry>,
+    /// Phase 7 (Task 7+8): optional KChat community id this session
+    /// is bound to. Drives community-scoped mDNS filtering at the
+    /// transport layer and the roster-sync poller that fires
+    /// [`SessionEvent::PeerKicked`] when a community member is
+    /// revoked. `None` for sessions started via the legacy /
+    /// dev-mint flow without a community gate.
+    community_id: Option<String>,
+    /// Phase 7 (Task 11): per-peer role snapshot, derived from the
+    /// latest community-members poll. `member` (and any unknown
+    /// role) maps to [`CollabPermission::Editor`] by default; the
+    /// host can call [`session_set_peer_permission`] to downgrade
+    /// a specific peer to `Viewer`. Viewers receive operations but
+    /// the bridge silently drops outbound broadcasts when the
+    /// local peer is `Viewer`.
+    permissions: HashMap<PeerId, CollabPermission>,
+    /// Phase 7 (Task 11): the local peer's own permission for the
+    /// active community. Used by [`session_broadcast_operation`]
+    /// to enforce the read-only viewer contract. Defaults to
+    /// [`CollabPermission::Editor`] when the session is not
+    /// community-gated.
+    local_permission: CollabPermission,
+    /// Phase 7 (Task 16): bounded ring buffer of recently-broadcast
+    /// local operations, kept so the inbound-event pump can run
+    /// [`LastWriterWinsResolver`] against a remote op whose
+    /// `affected_nodes` overlap a local op we just sent. When the
+    /// resolver decides the local op was the loser, the bridge
+    /// emits a [`SessionEvent::ConflictResolved`] so the renderer's
+    /// `ConflictToast` can surface "Your edit was overridden by …".
+    ///
+    /// Capacity is bounded ([`RECENT_LOCAL_OPS_CAP`]) so a long
+    /// drag-edit burst can't unbound this buffer; older entries
+    /// are evicted FIFO once the cap is hit. Each entry stores the
+    /// op + the Lamport clock value it was broadcast under
+    /// (derived from the journal's local high-water mark) so the
+    /// resolver's tiebreak rules apply unchanged.
+    recent_local_ops:
+        std::collections::VecDeque<(kcreate_collab::LamportClock, kcreate_core::Operation)>,
+    /// Phase 7 (Task 21): the project ACL loaded from disk at
+    /// session start. Consulted in the inbound pump's `PeerJoined`
+    /// handler to reject peers not on the allow-list (when the
+    /// ACL is in `Enforce` mode). Defaults to
+    /// [`ProjectAcl::default`] (open) so legacy projects without
+    /// an `acl.json` file keep working.
+    acl: kcreate_collab::ProjectAcl,
+    /// Phase 7 (Task 21): where the ACL was loaded from, so
+    /// `session_acl_update` can persist changes back to disk.
+    /// `None` for sessions started without a project dir hint —
+    /// the bridge still tracks the ACL in memory but doesn't
+    /// persist changes.
+    acl_path: Option<std::path::PathBuf>,
+    /// Phase 7 (Task 19): monotonic counter of how many key
+    /// rotations the host has issued during this session. The
+    /// bootstrap cert is epoch 0; each rotation bumps the counter.
+    key_epoch: u64,
+    /// Phase 7 (Task 23): pending clipboard offers received from
+    /// remote peers, keyed by `offer_id`. The renderer presents an
+    /// accept/reject prompt — accept calls
+    /// `session_clipboard_accept(offer_id)` which decrypts the
+    /// payload, reject discards. Bounded by
+    /// [`MAX_PENDING_CLIPBOARD_OFFERS`] to keep a hostile peer
+    /// from exhausting memory; the oldest offer is evicted FIFO
+    /// once the cap is hit.
+    pending_clipboard_offers: std::collections::VecDeque<PendingClipboardOffer>,
+    /// Phase 7 (Task 23): the local Ed25519 signing key, retained
+    /// here so the bridge can derive the X25519 shared secret with
+    /// remote peers for clipboard encryption / decryption without
+    /// asking the renderer to round-trip the seed. The seed enters
+    /// the bridge exactly once (via `session_start`) and never
+    /// leaves it; clipboard ops read from this copy instead.
+    local_signing_key: ed25519_dalek::SigningKey,
+    /// Phase 7 (Task 25): operations queued by
+    /// [`session_queue_operation`] waiting for the batch flush
+    /// timer to expire (or for [`session_flush_pending_operations`]
+    /// to drain them explicitly). The renderer calls
+    /// `session_tick_outbound_batch` on the same 50–100 ms cadence
+    /// it uses for `session_drain_events`; the tick checks the
+    /// queue against [`SessionConfig::batch_flush_interval_ms`] and
+    /// flushes when the deadline hits.
+    pending_op_batch: Vec<kcreate_core::operation::Operation>,
+    /// Phase 7 (Task 25): wall-clock instant the first op in the
+    /// current pending batch was queued. Driver for the flush
+    /// timer in `session_tick_outbound_batch`. Cleared on every
+    /// flush.
+    batch_first_queued_at: Option<std::time::Instant>,
+    /// Phase 7 (Task 25): cached batch flush interval, copied out
+    /// of the session config so the bridge can read it without
+    /// re-acquiring a kcreate_collab handle. Re-read on every
+    /// `session_start`.
+    batch_flush_interval: std::time::Duration,
+    /// Phase 7 (Task 25): cached max-batch-size cap copied out of
+    /// the session config for the same reason as above.
+    batch_flush_max_ops: usize,
+    /// Phase 7 (Task 26): the last presence payload that we
+    /// actually broadcast, along with the instant we broadcast it.
+    /// `None` until the first send. Drives the throttle / idle
+    /// suppression in [`session_send_presence`].
+    last_broadcast_presence: Option<(std::time::Instant, PresencePayload)>,
+    /// Phase 7 (Task 26): cached throttle thresholds copied out of
+    /// the session config — minimum inter-broadcast interval,
+    /// cursor-move threshold in scene units, and idle suppression
+    /// window. Re-read on every `session_start`.
+    presence_min_interval: std::time::Duration,
+    presence_move_threshold_px: f32,
+    presence_idle_suppression: std::time::Duration,
+    /// Phase 7 (Task 27): pages the local peer is currently viewing.
+    /// Empty (default) means "interested in everything" — the
+    /// pre-Phase-7-Task-27 behaviour. Non-empty restricts which
+    /// remote presence updates and conflict notifications get
+    /// surfaced to the renderer. Operations are still journaled
+    /// regardless so document consistency is preserved across the
+    /// whole project; only the UI-facing event stream is filtered.
+    active_pages: std::collections::HashSet<Uuid>,
+}
+
+/// Phase 7 (Task 23): one queued inbound clipboard offer waiting
+/// for the user's accept/reject decision.
+#[derive(Debug, Clone)]
+struct PendingClipboardOffer {
+    offer_id: String,
+    from_peer_id: PeerId,
+    from_public_key: String,
+    payload: kcreate_collab::ClipboardSharePayload,
+}
+
+/// Phase 7 (Task 23): cap on the queue of unresolved clipboard
+/// offers. Each entry holds a ciphertext + nonce + base64-encoded
+/// pubkey; the practical memory ceiling is a few KB even at the
+/// cap, but bounding the queue prevents a hostile peer from
+/// flooding the renderer with unanswerable prompts.
+const MAX_PENDING_CLIPBOARD_OFFERS: usize = 64;
+
+/// Phase 7 (Task 16): how many of the most-recent local
+/// broadcasts to keep available for conflict detection. Sized to
+/// cover ~3 s of a sustained drag-edit burst at the renderer's
+/// peak input rate of ~30 ops/s, with headroom. A circular buffer
+/// rather than a time-windowed eviction so the upper bound is
+/// strict regardless of clock jitter on the inbound pump.
+const RECENT_LOCAL_OPS_CAP: usize = 128;
+
+/// Phase 7 (Task 11): collaboration permission for a peer. Derived
+/// from the peer's KChat community role: `owner` / `admin` =>
+/// [`Editor`](Self::Editor), `member` => [`Editor`](Self::Editor)
+/// unless the session host has explicitly downgraded them to
+/// [`Viewer`](Self::Viewer). Viewers receive operations but cannot
+/// broadcast.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CollabPermission {
+    /// Read-write — may broadcast `OperationBroadcast`, `LockClaim`,
+    /// and `LockRelease` messages.
+    Editor,
+    /// Read-only — receives operations / presence but the bridge
+    /// suppresses outbound broadcasts.
+    Viewer,
+}
+
+impl CollabPermission {
+    /// Map a KChat community role string to a default permission.
+    /// `owner` and `admin` are always editors; `member` is also an
+    /// editor by default (the host can downgrade individual members
+    /// via [`session_set_peer_permission`]). Unknown roles fail
+    /// closed to `Viewer` so a future role we don't know about
+    /// doesn't accidentally get write access.
+    #[must_use]
+    pub fn from_role(role: &str) -> Self {
+        match role {
+            "owner" | "admin" | "member" => Self::Editor,
+            _ => Self::Viewer,
+        }
+    }
 }
 
 /// Block 8: one entry in the advisory lock roster.
@@ -542,16 +868,61 @@ fn apply_event(ev: InboundEvent) {
         }
         InboundEvent::Message { from, message } => match message.as_ref() {
             Message::Presence(p) => {
-                state.presence.insert(from.clone(), p.clone());
-                push_event(
+                // Phase 7 (Task 22): rate-limit presence so a
+                // misbehaving peer can't flood the session. The
+                // first second the peer goes over its budget we
+                // emit a warning event; sustained violation for
+                // `rate_limit_disconnect_after` consecutive
+                // seconds triggers a forced disconnect.
+                if !apply_rate_limit_check(
                     state,
-                    SessionEvent::PresenceUpdated {
-                        peer_id: from.as_str().to_string(),
-                        presence: SessionPresence::from(p),
-                    },
-                );
+                    &from,
+                    kcreate_collab::RateLimitKind::Presence,
+                    "presence",
+                ) {
+                    return;
+                }
+                state.presence.insert(from.clone(), p.clone());
+                // Phase 7 (Task 27): selective sync — when the local
+                // peer has constrained itself to a subset of pages
+                // via [`session_set_active_pages`], suppress remote
+                // presence events for pages the local peer is not
+                // viewing. The presence map is still updated above
+                // so a later page switch can backfill from
+                // [`session_peers`], but we don't churn the
+                // renderer's overlays for off-screen activity.
+                let suppress = !state.active_pages.is_empty()
+                    && match p.active_page {
+                        Some(remote_page) => !state.active_pages.contains(&remote_page),
+                        // A peer without an active_page is broadcasting
+                        // "no page context" — still surface so the UI
+                        // can render an unanchored cursor.
+                        None => false,
+                    };
+                if !suppress {
+                    push_event(
+                        state,
+                        SessionEvent::PresenceUpdated {
+                            peer_id: from.as_str().to_string(),
+                            presence: SessionPresence::from(p),
+                        },
+                    );
+                }
             }
             Message::OperationBroadcast(p) => {
+                // Phase 7 (Task 22): same rate-limit treatment as
+                // Presence above. We count one event per inbound
+                // `OperationBroadcast` envelope rather than per
+                // contained operation — a single batched broadcast
+                // of 50 operations is one network event, not 50.
+                if !apply_rate_limit_check(
+                    state,
+                    &from,
+                    kcreate_collab::RateLimitKind::Operation,
+                    "operations",
+                ) {
+                    return;
+                }
                 // Block 7: journal the remote operations. The
                 // transport already verified the envelope's
                 // signature + Lamport monotonicity, and the
@@ -571,8 +942,31 @@ fn apply_event(ev: InboundEvent) {
                 // request. Replay the entries through the
                 // journal so future sessions see the same
                 // history. Project-id mismatch is dropped.
+                // Phase 7 (Task 15): emit a `ResumeApplied`
+                // event after the replay so the renderer can
+                // dismiss the "syncing…" indicator and
+                // surface the post-resume document state.
                 if p.project_id == state.journal.project_id() {
-                    journal_inbound_resume_bundle(state, p);
+                    let applied = journal_inbound_resume_bundle(state, p);
+                    push_event(
+                        state,
+                        SessionEvent::ResumeApplied {
+                            from_peer_id: from.as_str().to_string(),
+                            applied_count: applied,
+                        },
+                    );
+                }
+            }
+            Message::ResumeRequest(p) => {
+                // Phase 7 (Task 15): a freshly-joined peer is
+                // asking us for the history since their resume
+                // vector. Compute the delta from the journal,
+                // package it as a `ResumeBundle`, and send it
+                // directly back to the requester. Project-id
+                // mismatch is dropped (same rationale as the
+                // other handlers).
+                if p.project_id == state.journal.project_id() {
+                    handle_resume_request(state, &from, p);
                 }
             }
             Message::LockClaim(p) => {
@@ -589,15 +983,138 @@ fn apply_event(ev: InboundEvent) {
                     apply_lock_release(state, &from, p);
                 }
             }
-            // Hello / Welcome / Heartbeat / Goodbye / ResumeRequest
-            // are handled by the transport layer itself, not
-            // surfaced as bridge-level events.
+            // Hello / Welcome / Heartbeat / Goodbye are handled
+            // by the transport layer itself, not surfaced as
+            // bridge-level events. Phase 7 (Task 19): a
+            // `KeyRotation` from a remote peer (i.e. another
+            // KCreate that's hosting) is recorded for diagnostic
+            // but doesn't drive local state — our own rotation
+            // lifecycle is owned by `session_rotate_keys`.
             Message::Hello(_)
             | Message::Welcome(_)
             | Message::Heartbeat
             | Message::Goodbye(_)
-            | Message::ResumeRequest(_) => {}
+            | Message::KeyRotation(_) => {}
+            Message::KeyRotationAck(ack) => {
+                if ack.project_id == state.journal.project_id() {
+                    let host = state.host.clone();
+                    let runtime = state.runtime.handle().clone();
+                    let pid = from.clone();
+                    let epoch = ack.epoch;
+                    runtime.spawn(async move {
+                        let _ = host.record_key_rotation_ack(&pid, epoch).await;
+                    });
+                }
+            }
+            // Phase 7 (Task 23): queue the offer for the renderer
+            // to accept / reject. We bound the queue so a hostile
+            // peer can't exhaust memory; the oldest pending offer
+            // is evicted FIFO once we hit the cap. The actual
+            // decryption only happens on accept.
+            Message::ClipboardShare(payload) => {
+                if payload.project_id == state.journal.project_id() {
+                    if state.pending_clipboard_offers.len() >= MAX_PENDING_CLIPBOARD_OFFERS {
+                        let _ = state.pending_clipboard_offers.pop_front();
+                    }
+                    let preview_label = payload.preview_label.clone();
+                    let offer_id = payload.offer_id.clone();
+                    state.pending_clipboard_offers.push_back(PendingClipboardOffer {
+                        offer_id: offer_id.clone(),
+                        from_peer_id: from.clone(),
+                        from_public_key: payload.sender_public_key.clone(),
+                        payload: payload.clone(),
+                    });
+                    push_event(
+                        state,
+                        SessionEvent::ClipboardShareOffered {
+                            from_peer_id: from.as_str().to_string(),
+                            preview_label,
+                            offer_id,
+                        },
+                    );
+                }
+            }
         },
+    }
+}
+
+/// Phase 7 (Task 22): account for one inbound network event against
+/// the per-peer rate budget. Returns `true` if the message should
+/// be processed normally, `false` if it should be dropped (the peer
+/// is over budget and either deserves a warning or has just been
+/// kicked). The drop path also emits the appropriate
+/// `RateLimitWarning` / `PeerKicked` event so the renderer can show
+/// the moderation outcome.
+///
+/// The "warn then kick" policy is governed by the per-session
+/// `SessionConfig` carried by the host:
+///
+/// - First overflow second: emit `RateLimitWarning` (the message is
+///   dropped so a flood still doesn't make it through, but the
+///   peer's connection stays open so they can correct their
+///   behaviour).
+/// - Subsequent consecutive overflow windows: continue to emit
+///   warnings each window.
+/// - When `consecutive_overflow_windows >= rate_limit_disconnect_after`
+///   (and that threshold is non-zero): emit `PeerKicked` with reason
+///   `rate-limit-exceeded` and schedule a transport-level
+///   disconnect.
+fn apply_rate_limit_check(
+    state: &mut SessionState,
+    from: &PeerId,
+    kind: kcreate_collab::RateLimitKind,
+    metric: &'static str,
+) -> bool {
+    let host = state.host.clone();
+    let runtime = state.runtime.handle().clone();
+    let decision = runtime.block_on(async {
+        host.record_rate_event(from, kind, std::time::Instant::now())
+            .await
+    });
+    match decision {
+        kcreate_collab::RateBudgetDecision::Ok => true,
+        kcreate_collab::RateBudgetDecision::OverBudget {
+            consecutive_overflow_windows,
+        } => {
+            let kick_threshold = host.rate_limit_disconnect_after();
+            let should_kick =
+                kick_threshold > 0 && consecutive_overflow_windows >= kick_threshold;
+            push_event(
+                state,
+                SessionEvent::RateLimitWarning {
+                    peer_id: from.as_str().to_string(),
+                    metric: metric.into(),
+                    consecutive_overflow_windows,
+                },
+            );
+            if should_kick {
+                push_event(
+                    state,
+                    SessionEvent::PeerKicked {
+                        peer_id: from.as_str().to_string(),
+                        reason: "rate-limit-exceeded".into(),
+                    },
+                );
+                let pid = from.clone();
+                runtime.spawn(async move {
+                    if let Err(e) = host
+                        .disconnect_peer(
+                            &pid,
+                            kcreate_collab::GoodbyeReason::Kicked(
+                                "rate-limit-exceeded".into(),
+                            ),
+                        )
+                        .await
+                    {
+                        tracing::warn!(
+                            "collab: rate-limit kick of {} failed: {e}",
+                            pid.as_str()
+                        );
+                    }
+                });
+            }
+            false
+        }
     }
 }
 
@@ -614,6 +1131,11 @@ fn journal_inbound_broadcast(
 ) {
     let mut highest = 0u64;
     let mut recorded: u32 = 0;
+    // Phase 7 (Task 16): collected on the side so we can emit
+    // `ConflictResolved` events *after* the borrow on
+    // `state.recent_local_ops` ends — pushing during the resolve
+    // loop would alias-borrow `state` for the duration.
+    let mut conflict_events: Vec<SessionEvent> = Vec::new();
     for op in &payload.operations {
         // The protocol doesn't put a Lamport clock *on the
         // operation itself* — it lives on the envelope. We
@@ -629,28 +1151,42 @@ fn journal_inbound_broadcast(
             .highest_for(from)
             .as_u64()
             .saturating_add(1);
-        let clock = kcreate_collab::LamportClock::from_raw(next_clock);
+        let clock = LamportClock::from_raw(next_clock);
         match state.journal.append(from.clone(), clock, op.clone()) {
             Ok(()) => {
                 recorded += 1;
                 if next_clock > highest {
                     highest = next_clock;
                 }
+                // Phase 7 (Task 16): run the CRDT resolver against
+                // every recent local op whose `affected_nodes`
+                // overlap the incoming remote op. The resolver is
+                // the same `LastWriterWinsResolver` that the wire
+                // protocol picks for tiebreaks, so the renderer's
+                // local document state stays in sync with what
+                // the resolver decided — we just need to *surface*
+                // the loser to the user.
+                collect_conflicts(state, from, op, clock, &mut conflict_events);
             }
-            Err(kcreate_collab::JournalError::Duplicate { .. })
-            | Err(kcreate_collab::JournalError::OutOfOrder { .. }) => {
-                // Expected for re-delivered or out-of-order
-                // batches; the wire monotonicity check above
-                // will let the next correctly-ordered batch
-                // through.
-            }
-            Err(kcreate_collab::JournalError::Backend(_)) => {
-                // The memory store can't produce a backend
-                // error today, but if a future swap to SQLite
-                // does, we degrade to ignoring the op rather
-                // than crashing the session.
+            Err(
+                kcreate_collab::JournalError::Duplicate { .. }
+                | kcreate_collab::JournalError::OutOfOrder { .. }
+                | kcreate_collab::JournalError::Backend(_),
+            ) => {
+                // Duplicate / OOO: expected for re-delivered
+                // batches. Backend: memory store can't produce
+                // this today, but degrade gracefully if a future
+                // SQLite swap does.
             }
         }
+    }
+    // Drain the side-collected conflict events now that the
+    // resolver borrow has dropped. Pushed before
+    // `OperationsJournaled` would also be fine, but the renderer
+    // typically reads events in arrival order, so surfacing the
+    // "what got journaled" baseline first matches the mental model.
+    for ev in conflict_events {
+        push_event(state, ev);
     }
     if recorded > 0 {
         push_event(
@@ -661,7 +1197,143 @@ fn journal_inbound_broadcast(
                 highest_clock: highest,
             },
         );
+        // Phase 7 (Task 17): if every recorded op in the batch is
+        // an undo / redo inverse, surface a dedicated event so
+        // the renderer's activity feed can show "Ken undid their
+        // last edit" instead of "Ken edited 3 nodes". A mixed
+        // batch is *not* surfaced as `UndoBroadcast` because the
+        // semantics would be ambiguous — callers are expected
+        // to group their broadcasts cleanly (the bridge’s undo
+        // path always sends inverse-only batches).
+        let undo_count: u32 = payload
+            .operations
+            .iter()
+            .filter(|o| o.is_undo)
+            .count()
+            .try_into()
+            .unwrap_or(u32::MAX);
+        if undo_count > 0 && undo_count == recorded {
+            push_event(
+                state,
+                SessionEvent::UndoBroadcast {
+                    peer_id: from.as_str().to_string(),
+                    op_count: undo_count,
+                },
+            );
+        }
     }
+}
+
+/// Phase 7 (Task 16): scan the recent-local-ops ring for any entry
+/// whose `affected_nodes` overlap the incoming remote op, run
+/// [`LastWriterWinsResolver::resolve`] on every match, and push a
+/// [`SessionEvent::ConflictResolved`] into `out` for every case the
+/// resolver picked the remote (i.e. the local peer lost the
+/// tiebreak). When the resolver picks the local op we deliberately
+/// do *not* fire an event — the local document state already wins,
+/// and the renderer doesn't need a toast for "your edit was kept".
+///
+/// `field` is reported as the comma-joined affected-node list. The
+/// CRDT layer doesn't carry per-field provenance today (Phase 3
+/// design left that to a future protocol revision), so reporting the
+/// affected nodes keeps the toast accurate without inventing a
+/// fictional field path — the `ConflictToast` renderer falls back
+/// to the node name when the field string is opaque.
+fn collect_conflicts(
+    state: &SessionState,
+    remote_peer: &PeerId,
+    remote_op: &kcreate_core::Operation,
+    remote_clock: LamportClock,
+    out: &mut Vec<SessionEvent>,
+) {
+    if remote_op.affected_nodes.is_empty() || state.recent_local_ops.is_empty() {
+        return;
+    }
+    let resolver = LastWriterWinsResolver;
+    let local_peer = &state.local_peer_id;
+    for (local_clock, local_op) in &state.recent_local_ops {
+        // Skip operations that share no affected nodes — the
+        // resolver short-circuits these to `KeepBoth` anyway, but
+        // doing the check up front avoids the allocation for
+        // `OperationContext` on the common no-overlap case.
+        if local_op.affected_nodes.is_empty()
+            || !local_op
+                .affected_nodes
+                .iter()
+                .any(|n| remote_op.affected_nodes.contains(n))
+        {
+            continue;
+        }
+        let decision = resolver.resolve(
+            OperationContext {
+                op: local_op,
+                clock: *local_clock,
+                author: local_peer,
+            },
+            OperationContext {
+                op: remote_op,
+                clock: remote_clock,
+                author: remote_peer,
+            },
+        );
+        if decision == ConflictDecision::KeepRemote {
+            // Emit one event per affected node the local op
+            // touched (so the renderer can target the specific
+            // ConflictToast at the right node card). The field
+            // string surfaces the operation command name so the
+            // toast can say "fill.color was overridden by Ken"
+            // rather than the opaque op id.
+            for node_id in &local_op.affected_nodes {
+                out.push(SessionEvent::ConflictResolved {
+                    node_id: *node_id,
+                    winner_peer_id: remote_peer.as_str().to_string(),
+                    loser_peer_id: local_peer.as_str().to_string(),
+                    field: local_op.command.clone(),
+                });
+            }
+        }
+    }
+}
+
+/// Phase 7 (Task 15): handle an inbound [`Message::ResumeRequest`]
+/// from a freshly-joined peer. Computes the delta between the
+/// journal’s current state and the supplied resume vector and
+/// fires the resulting [`Message::ResumeBundle`] directly back at
+/// the requester via [`LanCollabHost::send_to`]. Failures are
+/// logged and dropped — a missing bundle just means the late
+/// joiner stays unsynced until they retry, never panics the host.
+fn handle_resume_request(
+    state: &SessionState,
+    from: &PeerId,
+    payload: &kcreate_collab::ResumeRequestPayload,
+) {
+    let entries = match state.journal.operations_since(&payload.since) {
+        Ok(e) => e,
+        Err(e) => {
+            log::warn!(
+                "resume_request from {}: journal.operations_since failed: {e}",
+                from.as_str()
+            );
+            return;
+        }
+    };
+    let bundle = kcreate_collab::ResumeBundlePayload {
+        project_id: state.journal.project_id(),
+        operations: entries,
+    };
+    let host = state.host.clone();
+    let runtime_handle = state.runtime.handle().clone();
+    let target = from.clone();
+    // Detach: a slow link to one late-joiner must not block the
+    // session pump. Errors are logged on the spawned task.
+    runtime_handle.spawn(async move {
+        if let Err(e) = host.send_to(&target, Message::ResumeBundle(bundle)).await {
+            log::warn!(
+                "resume_request reply to {}: send_to failed: {e}",
+                target.as_str()
+            );
+        }
+    });
 }
 
 /// Replay a [`Message::ResumeBundle`] into the local journal. The
@@ -669,10 +1341,14 @@ fn journal_inbound_broadcast(
 /// feed them in directly; the journal's monotonicity gate will
 /// reject anything that overlaps history we already have, which
 /// is exactly the duplicate-replay semantics we want.
+///
+/// Returns the number of entries that were actually appended
+/// (i.e. were not silent duplicates) so the caller can emit a
+/// matching [`SessionEvent::ResumeApplied`].
 fn journal_inbound_resume_bundle(
     state: &mut SessionState,
     payload: &kcreate_collab::ResumeBundlePayload,
-) {
+) -> u32 {
     let mut per_peer: HashMap<PeerId, (u32, u64)> = HashMap::new();
     for entry in &payload.operations {
         match state
@@ -693,7 +1369,9 @@ fn journal_inbound_resume_bundle(
             }
         }
     }
+    let mut applied_total: u32 = 0;
     for (peer, (count, highest)) in per_peer {
+        applied_total = applied_total.saturating_add(count);
         push_event(
             state,
             SessionEvent::OperationsJournaled {
@@ -703,6 +1381,7 @@ fn journal_inbound_resume_bundle(
             },
         );
     }
+    applied_total
 }
 
 /// Block 8: pure roster mutation for a lock claim. Returns the
@@ -817,6 +1496,8 @@ pub fn session_start(
     display_name: &str,
     project_id: Uuid,
     advertise_mdns: bool,
+    community_id: Option<String>,
+    project_dir: Option<std::path::PathBuf>,
 ) -> Result<SessionStartReport> {
     let mut guard = slot().lock();
     if guard.is_some() {
@@ -827,6 +1508,28 @@ pub fn session_start(
             field: "displayName",
             message: "must not be empty".into(),
         });
+    }
+    // Phase 7 (Task 7): when a community id is supplied, make sure
+    // it matches the membership that is currently installed. Two
+    // different communities can be active simultaneously in KChat
+    // Desktop, but only one collab gate is installed per process —
+    // refusing the mismatch up front is much friendlier than
+    // failing later inside `verify` with a generic group-mismatch
+    // error.
+    if let Some(want) = community_id.as_deref() {
+        let authority = kchat_authority_snapshot();
+        let membership = authority
+            .local_membership()
+            .ok_or(SessionBridgeError::NotInKChatGroup)?;
+        if membership.group_id().as_str() != want {
+            return Err(SessionBridgeError::InvalidArgument {
+                field: "communityId",
+                message: format!(
+                    "requested community {want} but the installed KChat membership is for {}",
+                    membership.group_id().as_str()
+                ),
+            });
+        }
     }
     let seed = decode_seed(seed_b64)?;
     let local_key = PeerKey::from_seed(seed);
@@ -862,6 +1565,20 @@ pub fn session_start(
             message: e.to_string(),
         })?;
 
+    let session_config = SessionConfig::default();
+    // Phase 7 (Tasks 25 / 26): cache the throttle / batch thresholds
+    // so the hot-path bridge entry points (`session_send_presence`,
+    // `session_queue_operation`, `session_tick_outbound_batch`) can
+    // read them directly off the bridge state instead of cloning
+    // the full `SessionConfig` on every call.
+    let batch_flush_interval =
+        std::time::Duration::from_millis(u64::from(session_config.batch_flush_interval_ms));
+    let batch_flush_max_ops = session_config.batch_flush_max_ops as usize;
+    let presence_min_interval =
+        std::time::Duration::from_millis(u64::from(session_config.presence_min_interval_ms));
+    let presence_move_threshold_px = session_config.presence_move_threshold_px;
+    let presence_idle_suppression =
+        std::time::Duration::from_millis(u64::from(session_config.presence_idle_suppression_ms));
     let opts = HostOptions {
         local_key,
         display_name: display_name.to_string(),
@@ -869,8 +1586,9 @@ pub fn session_start(
         bind_addr: SocketAddr::from(([0, 0, 0, 0], 0)),
         advertise_mdns,
         advertise_addrs: None,
-        session_config: SessionConfig::default(),
+        session_config,
         kchat_authority: authority,
+        community_id: community_id.clone(),
     };
     let host = runtime
         .block_on(tokio::time::timeout(OP_TIMEOUT, LanCollabHost::start(opts)))
@@ -910,6 +1628,15 @@ pub fn session_start(
     let journal = OperationJournal::open(MemoryJournalStore::new(), project_id)
         .expect("MemoryJournalStore::summary cannot fail");
 
+    // Phase 7 (Task 21): load the project ACL from `<dir>/acl.json`
+    // if a project directory was supplied. A missing file is fine
+    // — we fall back to an open ACL (no enforcement). Parse
+    // failures are logged + ignored so a corrupted ACL file
+    // doesn't brick session start; the host treats it as open
+    // and the renderer can surface a "couldn't load ACL"
+    // diagnostic via the audit channel.
+    let (acl, acl_path) = load_project_acl(project_dir.as_deref());
+
     let mut state = SessionState {
         host,
         runtime,
@@ -920,6 +1647,24 @@ pub fn session_start(
         journal,
         local_peer_id: local_peer_id.clone(),
         locks: HashMap::new(),
+        community_id,
+        permissions: HashMap::new(),
+        local_permission: CollabPermission::Editor,
+        recent_local_ops: std::collections::VecDeque::with_capacity(RECENT_LOCAL_OPS_CAP),
+        acl,
+        acl_path,
+        key_epoch: 0,
+        pending_clipboard_offers: std::collections::VecDeque::new(),
+        local_signing_key: ed25519_dalek::SigningKey::from_bytes(&seed),
+        pending_op_batch: Vec::new(),
+        batch_first_queued_at: None,
+        batch_flush_interval,
+        batch_flush_max_ops,
+        last_broadcast_presence: None,
+        presence_min_interval,
+        presence_move_threshold_px,
+        presence_idle_suppression,
+        active_pages: std::collections::HashSet::new(),
     };
     // Surface the local-lifecycle transition on the same event
     // channel every other session signal flows through, so renderer
@@ -1016,15 +1761,71 @@ pub fn session_join(
     drop(guard);
 
     let result = runtime_handle.block_on(async {
-        tokio::time::timeout(OP_TIMEOUT, host.dial_known_peer(identity, socket, fp)).await
+        tokio::time::timeout(
+            OP_TIMEOUT,
+            host.dial_known_peer(identity.clone(), socket, fp),
+        )
+        .await
     });
     match result {
-        Ok(Ok(_)) => Ok(()),
+        Ok(Ok(_)) => {
+            // Phase 7 (Task 15): late-join replay. Right after the
+            // dial succeeds, ask the host we just connected to for
+            // every journal entry we don't already have. The
+            // request fires on a detached tokio task because (a) the
+            // bridge entry point shouldn't block on a transport
+            // hop the host might not answer immediately, and (b)
+            // the resume bundle arrives asynchronously through the
+            // pump loop and surfaces as a `ResumeApplied` event.
+            //
+            // We swallow the result entirely — if the resume fails,
+            // the joiner is still connected and live edits will
+            // backfill the document; the resume is purely an
+            // optimisation for picking up history that predates
+            // the join. A failure mode here would surface as the
+            // user seeing "syncing…" forever, so we ALSO log a
+            // warning so the bug is debuggable from the logs.
+            request_resume_from(&identity.peer_id);
+            Ok(())
+        }
         Ok(Err(e)) => Err(SessionBridgeError::Transport(e)),
         Err(_) => Err(SessionBridgeError::Transport(
             kcreate_collab_transport::TransportError::Quic("dial timed out".into()),
         )),
     }
+}
+
+/// Phase 7 (Task 15): fire-and-forget helper that asks `peer` for a
+/// `ResumeBundle` covering everything we're missing relative to our
+/// local journal's resume vector. Used by `session_join` to
+/// auto-trigger late-join replay without forcing every caller of
+/// `session_join` to know about resume semantics. Failures are
+/// logged and dropped — the live broadcast stream will still keep
+/// the local journal current; the only consequence is the joiner
+/// won't see history that predates their join.
+fn request_resume_from(peer: &PeerId) {
+    let guard = slot().lock();
+    let Some(state) = guard.as_ref() else {
+        // Session ended between the dial and this helper running.
+        return;
+    };
+    let host = state.host.clone();
+    let runtime_handle = state.runtime.handle().clone();
+    let project_id = state.journal.project_id();
+    let since = state.journal.resume_vector();
+    let target = peer.clone();
+    drop(guard);
+    let payload = kcreate_collab::ResumeRequestPayload { project_id, since };
+    runtime_handle.spawn(async move {
+        if let Err(e) = tokio::time::timeout(
+            OP_TIMEOUT,
+            host.send_to(&target, Message::ResumeRequest(payload)),
+        )
+        .await
+        {
+            log::warn!("auto-resume to {} timed out: {e}", target.as_str());
+        }
+    });
 }
 
 /// Return the current peer roster. Includes both connected peers
@@ -1170,7 +1971,7 @@ pub fn session_locks() -> Result<Vec<SessionLockEntry>> {
         })
         .collect();
     // Deterministic order so the renderer's diffing stays cheap.
-    rows.sort_by(|a, b| a.node_id.cmp(&b.node_id));
+    rows.sort_by_key(|r| r.node_id);
     Ok(rows)
 }
 
@@ -1190,7 +1991,7 @@ pub fn session_claim_locks(node_ids: Vec<Uuid>) -> Result<DateTime<Utc>> {
     let local = state.local_peer_id.clone();
     let payload = LockClaimPayload {
         project_id,
-        node_ids: node_ids.clone(),
+        node_ids,
         acquired_at,
     };
     // Update local roster + emit LocksChanged before fanning out
@@ -1246,6 +2047,28 @@ pub fn session_release_locks(node_ids: Vec<Uuid>) -> Result<()> {
 /// Broadcast the local user's presence (active page, selection,
 /// cursor). Called by the renderer on selection / canvas pointer
 /// events.
+///
+/// Phase 7 (Task 26): the bridge throttles outbound presence to
+/// protect the LAN from a 60 Hz pointer-move firehose:
+///
+/// 1. **Minimum interval gate** —
+///    [`SessionConfig::presence_min_interval_ms`] (50 ms default)
+///    caps the broadcast rate to 20 Hz when only the cursor is
+///    moving. Sub-interval re-sends are coalesced.
+/// 2. **Cursor delta threshold** —
+///    [`SessionConfig::presence_move_threshold_px`] (2 scene units
+///    default) means a stationary cursor with sub-pixel jitter
+///    does not re-broadcast. Selection-set and active-page
+///    changes always re-broadcast regardless of cursor delta.
+/// 3. **Idle suppression** —
+///    [`SessionConfig::presence_idle_suppression_ms`] (2 s default)
+///    means a presence payload identical to the last broadcast
+///    one is dropped after the idle window. The next real change
+///    re-broadcasts immediately.
+///
+/// Returns `Ok(())` on both broadcast and suppression so the
+/// renderer doesn't have to distinguish the two cases for error
+/// handling; presence is best-effort.
 pub fn session_send_presence(
     active_page: Option<Uuid>,
     selection: Vec<Uuid>,
@@ -1256,18 +2079,67 @@ pub fn session_send_presence(
     // still valid right now. Full re-verification (signature +
     // peer binding + time window) matches `session_start`.
     require_active_kchat_membership()?;
-    let guard = slot().lock();
-    let state = guard.as_ref().ok_or(SessionBridgeError::NotRunning)?;
-    let host = state.host.clone();
-    let runtime_handle = state.runtime.handle().clone();
-    drop(guard);
-
-    let payload = PresencePayload {
+    let now = std::time::Instant::now();
+    let candidate = PresencePayload {
         active_page,
         selection,
         cursor: cursor.map(|c| Cursor { x: c.x, y: c.y }),
         sent_at: Utc::now(),
     };
+
+    let (host, runtime_handle, payload) = {
+        let mut guard = slot().lock();
+        let state = guard.as_mut().ok_or(SessionBridgeError::NotRunning)?;
+        let min_interval = state.presence_min_interval;
+        let move_threshold = state.presence_move_threshold_px;
+        let idle_window = state.presence_idle_suppression;
+
+        if let Some((last_at, last_payload)) = state.last_broadcast_presence.as_ref() {
+            let elapsed = now.saturating_duration_since(*last_at);
+            let selection_changed = last_payload.selection != candidate.selection;
+            let page_changed = last_payload.active_page != candidate.active_page;
+            let cursor_moved_enough = match (last_payload.cursor, candidate.cursor) {
+                (Some(a), Some(b)) => {
+                    let dx = b.x - a.x;
+                    let dy = b.y - a.y;
+                    dx.hypot(dy) >= f64::from(move_threshold)
+                }
+                // Cursor became Some / None — always count as a change
+                // because the renderer overlay needs to show / hide.
+                (None, Some(_)) | (Some(_), None) => true,
+                // Neither side had a cursor: only count if other
+                // fields changed (handled below).
+                (None, None) => false,
+            };
+            let any_change = selection_changed || page_changed || cursor_moved_enough;
+
+            // Idle suppression: payload is materially identical to
+            // the last broadcast one AND we've crossed the idle
+            // window. Drop without sending.
+            if !any_change && elapsed >= idle_window {
+                return Ok(());
+            }
+            // Throttle: we're inside the minimum interval. Drop the
+            // sub-interval re-send; the next call (post-interval)
+            // will pick up the latest state. Critical that we do
+            // NOT mutate `last_broadcast_presence` here — the
+            // throttle compares against the LAST ACTUAL broadcast.
+            if elapsed < min_interval {
+                return Ok(());
+            }
+            // Cursor jitter under the move threshold AND no other
+            // changes → also drop. The idle suppression branch
+            // above catches the long-term case; this catches the
+            // short-term "user wiggled the touchpad" case.
+            if !any_change {
+                return Ok(());
+            }
+        }
+
+        state.last_broadcast_presence = Some((now, candidate.clone()));
+        (state.host.clone(), state.runtime.handle().clone(), candidate)
+    };
+
     let result = runtime_handle.block_on(async {
         tokio::time::timeout(OP_TIMEOUT, host.broadcast_presence(payload)).await
     });
@@ -1278,6 +2150,448 @@ pub fn session_send_presence(
             kcreate_collab_transport::TransportError::Quic("broadcast_presence timed out".into()),
         )),
     }
+}
+
+/// Phase 7 (Task 11): broadcast the supplied local operations to
+/// every connected peer. Enforces the local peer's collaboration
+/// permission: a [`CollabPermission::Viewer`] returns
+/// [`SessionBridgeError::PermissionDenied`] without sending. Callers
+/// pass already-stamped operations (Lamport clock + author peer id)
+/// produced by [`session_record_local_operation`] so the journal
+/// stays the single source of truth for ordering.
+pub fn session_broadcast_operations(
+    operations: Vec<kcreate_core::operation::Operation>,
+) -> Result<()> {
+    require_active_kchat_membership()?;
+    if operations.is_empty() {
+        return Ok(());
+    }
+    let mut guard = slot().lock();
+    let state = guard.as_mut().ok_or(SessionBridgeError::NotRunning)?;
+    if state.local_permission == CollabPermission::Viewer {
+        return Err(SessionBridgeError::PermissionDenied);
+    }
+    // Phase 7 (Task 16): record each op into the local ring buffer
+    // BEFORE we ship it on the wire, so the CRDT resolver in
+    // `journal_inbound_broadcast` can detect "remote op landed on a
+    // node I just edited" the moment a colliding remote op arrives.
+    // The clock value is the journal's per-local high-water mark + 1,
+    // matching the same approximation the inbound pump uses for
+    // remote ops (the protocol carries the clock on the envelope,
+    // not on the op, so the bridge derives both sides the same way).
+    let local_peer = state.local_peer_id.clone();
+    let mut local_clock_seq = state
+        .journal
+        .resume_vector()
+        .highest_for(&local_peer)
+        .as_u64();
+    for op in &operations {
+        local_clock_seq = local_clock_seq.saturating_add(1);
+        if state.recent_local_ops.len() == RECENT_LOCAL_OPS_CAP {
+            state.recent_local_ops.pop_front();
+        }
+        state
+            .recent_local_ops
+            .push_back((LamportClock::from_raw(local_clock_seq), op.clone()));
+    }
+    let host = state.host.clone();
+    let runtime_handle = state.runtime.handle().clone();
+    let project_id = state.journal.project_id();
+    drop(guard);
+
+    let payload = kcreate_collab::OperationBroadcastPayload {
+        project_id,
+        operations,
+    };
+    let result = runtime_handle.block_on(async {
+        tokio::time::timeout(OP_TIMEOUT, host.broadcast_operations(payload)).await
+    });
+    match result {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(SessionBridgeError::Transport(e)),
+        Err(_) => Err(SessionBridgeError::Transport(
+            kcreate_collab_transport::TransportError::Quic("broadcast_operations timed out".into()),
+        )),
+    }
+}
+
+/// Phase 7 (Task 25): queue one operation into the outbound batch
+/// accumulator. The bridge does not send anything on the wire here
+/// — it appends to a per-session pending buffer that
+/// [`session_tick_outbound_batch`] drains when either of the two
+/// flush conditions is met:
+///
+/// 1. The wall-clock elapsed since the first queued op in the
+///    current batch reaches
+///    [`SessionConfig::batch_flush_interval_ms`] (50 ms default).
+/// 2. The batch size reaches [`SessionConfig::batch_flush_max_ops`]
+///    (200 default) — forces an immediate flush so the buffer
+///    never grows unbounded under high-rate input.
+///
+/// The caller (renderer drag pipeline) is expected to call this
+/// for every per-frame operation generated during a sustained
+/// drag, then call [`session_flush_pending_operations`] explicitly
+/// when the drag completes — that ensures the final state lands
+/// on the wire without waiting for the throttle deadline.
+///
+/// Viewer permission still rejects the queue (consistent with
+/// [`session_broadcast_operations`]) — we don't accumulate work
+/// the local peer is not allowed to send.
+pub fn session_queue_operation(operation: kcreate_core::operation::Operation) -> Result<()> {
+    require_active_kchat_membership()?;
+    let mut guard = slot().lock();
+    let state = guard.as_mut().ok_or(SessionBridgeError::NotRunning)?;
+    if state.local_permission == CollabPermission::Viewer {
+        return Err(SessionBridgeError::PermissionDenied);
+    }
+    if state.batch_first_queued_at.is_none() {
+        state.batch_first_queued_at = Some(std::time::Instant::now());
+    }
+    state.pending_op_batch.push(operation);
+    // Hit the size cap → flush immediately so the batch never grows
+    // past the configured ceiling. Pull everything out under the
+    // lock then release before the wire send.
+    let flush_now = state.pending_op_batch.len() >= state.batch_flush_max_ops;
+    if flush_now {
+        let drained = std::mem::take(&mut state.pending_op_batch);
+        state.batch_first_queued_at = None;
+        drop(guard);
+        return session_broadcast_operations(drained);
+    }
+    Ok(())
+}
+
+/// Phase 7 (Task 25): drain the pending op batch and broadcast it
+/// in one [`OperationBroadcastPayload`]. Called explicitly by the
+/// renderer at the end of a drag / interaction (so the final state
+/// is sent immediately), and called periodically by
+/// [`session_tick_outbound_batch`] when the throttle deadline
+/// expires. Returns the number of operations that were flushed (0
+/// if the queue was empty) so the caller can avoid emitting
+/// metrics for empty flushes.
+pub fn session_flush_pending_operations() -> Result<u32> {
+    require_active_kchat_membership()?;
+    let mut guard = slot().lock();
+    let state = guard.as_mut().ok_or(SessionBridgeError::NotRunning)?;
+    let drained = std::mem::take(&mut state.pending_op_batch);
+    state.batch_first_queued_at = None;
+    drop(guard);
+    if drained.is_empty() {
+        return Ok(0);
+    }
+    let count = u32::try_from(drained.len()).unwrap_or(u32::MAX);
+    session_broadcast_operations(drained)?;
+    Ok(count)
+}
+
+/// Phase 7 (Task 25): check the pending op batch against the
+/// configured flush interval and broadcast it if the deadline has
+/// elapsed. Called by the renderer event-tick on the same cadence
+/// it uses for [`session_drain_events`] (~50 ms). Returns the
+/// number of ops flushed; `0` if no flush was due. Cheap when no
+/// ops are queued — single lock acquisition + early return.
+pub fn session_tick_outbound_batch() -> Result<u32> {
+    require_active_kchat_membership()?;
+    let mut guard = slot().lock();
+    let state = guard.as_mut().ok_or(SessionBridgeError::NotRunning)?;
+    let Some(first_queued_at) = state.batch_first_queued_at else {
+        // No pending ops — nothing to do.
+        return Ok(0);
+    };
+    let elapsed = std::time::Instant::now().saturating_duration_since(first_queued_at);
+    if elapsed < state.batch_flush_interval {
+        // Still inside the throttle window; wait.
+        return Ok(0);
+    }
+    let drained = std::mem::take(&mut state.pending_op_batch);
+    state.batch_first_queued_at = None;
+    drop(guard);
+    if drained.is_empty() {
+        return Ok(0);
+    }
+    let count = u32::try_from(drained.len()).unwrap_or(u32::MAX);
+    session_broadcast_operations(drained)?;
+    Ok(count)
+}
+
+/// Phase 7 (Task 27): set the list of pages the local peer is
+/// currently viewing. Operations on other pages are still
+/// journaled (document consistency is preserved across the whole
+/// project) but the bridge suppresses the renderer-facing
+/// [`SessionEvent::PresenceUpdated`] and
+/// [`SessionEvent::ConflictResolved`] events for those pages —
+/// reducing CPU + visual noise in multi-page documents where the
+/// local peer only needs presence overlays for the page in view.
+///
+/// Pass an empty vector to revert to "interested in everything"
+/// (the pre-Phase-7-Task-27 behaviour) — useful for the export
+/// preview pane or presentation mode that needs every event.
+pub fn session_set_active_pages(page_ids: Vec<Uuid>) -> Result<()> {
+    let mut guard = slot().lock();
+    let state = guard.as_mut().ok_or(SessionBridgeError::NotRunning)?;
+    state.active_pages = page_ids.into_iter().collect();
+    Ok(())
+}
+
+/// Phase 7 (Task 15): send a `ResumeRequest` to a connected peer
+/// asking them to backfill any journal entries we are missing
+/// relative to our local [`ResumeVector`]. Called by the renderer
+/// right after a successful [`session_join`] so a late joiner can
+/// pull the running document history without restarting the
+/// host's session.
+///
+/// The resume bundle reply arrives asynchronously via the pump
+/// loop as a [`SessionEvent::ResumeApplied`] event; this function
+/// only fires the request — callers must consume the event stream
+/// to know when the replay is complete.
+///
+/// Returns [`SessionBridgeError::NotRunning`] if no session is
+/// active, or [`SessionBridgeError::InvalidArgument`] if the
+/// supplied `peer_id_b64` is unparseable. Network errors are
+/// surfaced through [`SessionBridgeError::Transport`].
+pub fn session_request_resume(peer_id_b64: &str) -> Result<()> {
+    require_active_kchat_membership()?;
+    let target: PeerId = peer_id_b64
+        .parse()
+        .map_err(
+            |e: kcreate_collab::CollabError| SessionBridgeError::InvalidArgument {
+                field: "peerId",
+                message: e.to_string(),
+            },
+        )?;
+    let guard = slot().lock();
+    let state = guard.as_ref().ok_or(SessionBridgeError::NotRunning)?;
+    let host = state.host.clone();
+    let runtime_handle = state.runtime.handle().clone();
+    let project_id = state.journal.project_id();
+    let since = state.journal.resume_vector();
+    drop(guard);
+
+    let payload = kcreate_collab::ResumeRequestPayload { project_id, since };
+    let message = Message::ResumeRequest(payload);
+    let result = runtime_handle
+        .block_on(async { tokio::time::timeout(OP_TIMEOUT, host.send_to(&target, message)).await });
+    match result {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(SessionBridgeError::Transport(e)),
+        Err(_) => Err(SessionBridgeError::Transport(
+            kcreate_collab_transport::TransportError::Quic("resume_request timed out".into()),
+        )),
+    }
+}
+
+/// Phase 7 (Task 8): forcibly disconnect a connected peer. Used by
+/// the roster-sync poller when a peer's KChat community membership
+/// is revoked, and by the host UI when an admin wants to kick
+/// someone manually. Sends a directed `Goodbye(Kicked(reason))` so
+/// the kicked peer observes a clean shutdown, closes the underlying
+/// QUIC connection, releases any locks the kicked peer was holding,
+/// and emits [`SessionEvent::PeerKicked`] on the event queue.
+///
+/// Idempotent on unknown / already-disconnected peer ids.
+pub fn session_kick_peer(peer_id_b64: &str, reason: &str) -> Result<()> {
+    require_active_kchat_membership()?;
+    let target: PeerId = peer_id_b64
+        .parse()
+        .map_err(
+            |e: kcreate_collab::CollabError| SessionBridgeError::InvalidArgument {
+                field: "peerId",
+                message: e.to_string(),
+            },
+        )?;
+
+    let mut guard = slot().lock();
+    let state = guard.as_mut().ok_or(SessionBridgeError::NotRunning)?;
+    let host = state.host.clone();
+    let runtime_handle = state.runtime.handle().clone();
+    // Release any locks the kicked peer was holding so the UI
+    // un-greys those nodes for everyone else immediately. The
+    // transport's `disconnect_peer` already produces a `PeerLeft`
+    // event which the pump uses to clean up `state.locks`, but
+    // doing it synchronously here makes the `PeerKicked` event
+    // ordering deterministic (PeerKicked precedes the synthetic
+    // PeerLeft, never the other way round).
+    let released_nodes: Vec<Uuid> = state
+        .locks
+        .iter()
+        .filter_map(|(node_id, entry)| (entry.holder == target).then_some(*node_id))
+        .collect();
+    for node_id in &released_nodes {
+        state.locks.remove(node_id);
+    }
+    if !released_nodes.is_empty() {
+        push_event(
+            state,
+            SessionEvent::LocksChanged {
+                peer_id: target.as_str().to_string(),
+                node_ids: released_nodes,
+            },
+        );
+    }
+    state.permissions.remove(&target);
+    push_event(
+        state,
+        SessionEvent::PeerKicked {
+            peer_id: target.as_str().to_string(),
+            reason: reason.to_string(),
+        },
+    );
+    drop(guard);
+
+    let reason_payload = kcreate_collab::GoodbyeReason::Kicked(reason.to_string());
+    let target_for_async = target.clone();
+    let result = runtime_handle.block_on(async {
+        tokio::time::timeout(
+            OP_TIMEOUT,
+            host.disconnect_peer(&target_for_async, reason_payload),
+        )
+        .await
+    });
+    match result {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(SessionBridgeError::Transport(e)),
+        Err(_) => Err(SessionBridgeError::Transport(
+            kcreate_collab_transport::TransportError::Quic("disconnect_peer timed out".into()),
+        )),
+    }
+}
+
+/// Phase 7 (Task 11): set the collaboration permission for a
+/// connected peer. Used by the host to downgrade a community
+/// `member` to [`CollabPermission::Viewer`] (read-only) or
+/// restore them to [`CollabPermission::Editor`]. Owners and
+/// admins should remain editors; this entry point doesn't enforce
+/// that rule \u2014 the renderer is expected to disable the UI for
+/// privileged roles, and the bridge only enforces *outbound*
+/// broadcasts against the *local* permission. Emits a
+/// [`SessionEvent::PermissionChanged`].
+pub fn session_set_peer_permission(peer_id_b64: &str, permission: CollabPermission) -> Result<()> {
+    require_active_kchat_membership()?;
+    let target: PeerId = peer_id_b64
+        .parse()
+        .map_err(
+            |e: kcreate_collab::CollabError| SessionBridgeError::InvalidArgument {
+                field: "peerId",
+                message: e.to_string(),
+            },
+        )?;
+    let mut guard = slot().lock();
+    let state = guard.as_mut().ok_or(SessionBridgeError::NotRunning)?;
+    state.permissions.insert(target.clone(), permission);
+    push_event(
+        state,
+        SessionEvent::PermissionChanged {
+            peer_id: target.as_str().to_string(),
+            permission,
+        },
+    );
+    Ok(())
+}
+
+/// Phase 7 (Task 11): set the *local* peer's permission. Called by
+/// the roster-sync poller after a [`get_community_members`] result
+/// surfaces the local role. Does NOT emit `PermissionChanged` for
+/// the local id \u2014 the renderer reads this via
+/// [`session_local_permission`].
+pub fn session_set_local_permission(permission: CollabPermission) -> Result<()> {
+    let mut guard = slot().lock();
+    let state = guard.as_mut().ok_or(SessionBridgeError::NotRunning)?;
+    state.local_permission = permission;
+    Ok(())
+}
+
+/// Phase 7 (Task 11): snapshot of the local peer's collaboration
+/// permission. Defaults to [`CollabPermission::Editor`].
+#[must_use]
+pub fn session_local_permission() -> CollabPermission {
+    let guard = slot().lock();
+    guard
+        .as_ref()
+        .map_or(CollabPermission::Editor, |s| s.local_permission)
+}
+
+/// Phase 7 (Task 11): snapshot of every known peer permission. Used
+/// by the presence panel to render \"viewer\" / \"editor\" badges.
+pub fn session_peer_permissions() -> Vec<(String, CollabPermission)> {
+    let guard = slot().lock();
+    let Some(state) = guard.as_ref() else {
+        return Vec::new();
+    };
+    state
+        .permissions
+        .iter()
+        .map(|(pid, perm)| (pid.as_str().to_string(), *perm))
+        .collect()
+}
+
+/// Phase 7 (Task 7+8): snapshot of the active KChat community id.
+/// `None` when the session was started without a community gate.
+#[must_use]
+pub fn session_community_id() -> Option<String> {
+    let guard = slot().lock();
+    guard.as_ref().and_then(|s| s.community_id.clone())
+}
+
+/// Phase 7 (Task 8): apply a fresh community-members snapshot. For
+/// every currently-connected peer NOT in the supplied roster, emit
+/// a `PeerKicked` event and tear down their QUIC connection (via
+/// `disconnect_peer`). For peers that ARE in the roster, refresh
+/// their permission from the role string. Returns the list of
+/// peer ids that were evicted so the caller can log / surface them.
+pub fn session_apply_community_roster(members: &[(String, String)]) -> Result<Vec<String>> {
+    require_active_kchat_membership()?;
+    let known: std::collections::HashSet<String> =
+        members.iter().map(|(pid, _)| pid.clone()).collect();
+    let connected: Vec<PeerId> = {
+        let guard = slot().lock();
+        let state = guard.as_ref().ok_or(SessionBridgeError::NotRunning)?;
+        state.host.connected_peer_ids()
+    };
+
+    // Refresh permissions for connected peers that are still in
+    // the community.
+    {
+        let mut guard = slot().lock();
+        let state = guard.as_mut().ok_or(SessionBridgeError::NotRunning)?;
+        let local_peer = state.local_peer_id.as_str().to_string();
+        for (pid_b64, role) in members {
+            let perm = CollabPermission::from_role(role);
+            if *pid_b64 == local_peer {
+                if state.local_permission != perm {
+                    state.local_permission = perm;
+                }
+                continue;
+            }
+            if let Ok(pid) = pid_b64.parse::<PeerId>() {
+                let changed = state.permissions.insert(pid.clone(), perm) != Some(perm);
+                if changed {
+                    push_event(
+                        state,
+                        SessionEvent::PermissionChanged {
+                            peer_id: pid_b64.clone(),
+                            permission: perm,
+                        },
+                    );
+                }
+            }
+        }
+    }
+
+    let to_kick: Vec<PeerId> = connected
+        .into_iter()
+        .filter(|pid| !known.contains(pid.as_str()))
+        .collect();
+
+    let mut kicked = Vec::with_capacity(to_kick.len());
+    for pid in to_kick {
+        let pid_b64 = pid.as_str().to_string();
+        if let Err(e) = session_kick_peer(&pid_b64, "revoked-from-community") {
+            log::warn!("session_apply_community_roster: failed to kick {pid_b64}: {e}");
+            continue;
+        }
+        kicked.push(pid_b64);
+    }
+    Ok(kicked)
 }
 
 /// Lightweight introspection for `session_info` (used by the
@@ -1433,7 +2747,9 @@ impl From<SessionBridgeError> for DocumentBridgeError {
             | SessionBridgeError::InvalidArgument { .. }
             | SessionBridgeError::NotInKChatGroup
             | SessionBridgeError::KChatDevIssuerDisabled
-            | SessionBridgeError::IssuerNotTrusted { .. } => Self::InvalidArgument {
+            | SessionBridgeError::IssuerNotTrusted { .. }
+            | SessionBridgeError::PermissionDenied
+            | SessionBridgeError::InviteRejected(_) => Self::InvalidArgument {
                 argument: "session".to_string(),
                 value: e.to_string(),
             },
@@ -1681,10 +2997,10 @@ fn write_trust_store_file(path: &Path, store: &TrustStore) -> Result<()> {
         }
     }
     let mut tmp = path.to_path_buf();
-    let file_name = path
-        .file_name()
-        .map(|s| s.to_os_string())
-        .unwrap_or_else(|| std::ffi::OsString::from("kchat_trust.json"));
+    let file_name = match path.file_name() {
+        Some(s) => s.to_os_string(),
+        None => std::ffi::OsString::from("kchat_trust.json"),
+    };
     let mut tmp_name = file_name;
     tmp_name.push(".tmp");
     tmp.set_file_name(tmp_name);
@@ -1777,15 +3093,18 @@ pub fn kchat_add_trusted_issuer(input: TrustedIssuer) -> Result<Vec<TrustedIssue
             .iter_mut()
             .find(|i| i.issuer_public_key == entry.issuer_public_key)
         {
-            existing.label = entry.label.clone();
+            existing.label.clone_from(&entry.label);
             existing.added_at = entry.added_at;
         } else {
             guard.issuers.push(entry);
         }
         guard.clone()
     };
-    if let Some(path) = trust_store_path_slot().lock().clone() {
-        write_trust_store_file(&path, &snapshot)?;
+    {
+        let path_guard = trust_store_path_slot().lock();
+        if let Some(path) = path_guard.as_ref() {
+            write_trust_store_file(path, &snapshot)?;
+        }
     }
     Ok(snapshot.issuers)
 }
@@ -1802,8 +3121,11 @@ pub fn kchat_remove_trusted_issuer(issuer_public_key: &str) -> Result<Vec<Truste
         guard.issuers.retain(|i| i.issuer_public_key != key);
         guard.clone()
     };
-    if let Some(path) = trust_store_path_slot().lock().clone() {
-        write_trust_store_file(&path, &snapshot)?;
+    {
+        let path_guard = trust_store_path_slot().lock();
+        if let Some(path) = path_guard.as_ref() {
+            write_trust_store_file(path, &snapshot)?;
+        }
     }
     Ok(snapshot.issuers)
 }
@@ -1949,6 +3271,25 @@ pub fn kchat_install_authority(req: KChatInstallRequest) -> Result<KChatMembersh
     *kchat_slot().lock() = shared;
 
     Ok(membership_status_for(&membership))
+}
+
+/// Install a pre-built `SharedKChatAuthority` directly. Used by
+/// the Phase 7 KChat backend bridge (`kchat_backend`) when the
+/// authority is sourced from a live REST sign-in rather than a
+/// wire-format `KChatInstallRequest`. The caller is responsible
+/// for verifying the underlying membership against its issuer trust
+/// root (the `KChatBackendAuthority::install` constructor does so).
+/// The provided `membership` is used to compute the
+/// `KChatMembershipStatus` returned to the renderer (issuer label,
+/// trusted-issuer lookup, validity window) using the same builder
+/// the regular install path uses, so the renderer state stays
+/// consistent across install sources.
+pub fn install_kchat_authority_direct(
+    authority: SharedKChatAuthority,
+    membership: &KChatMembership,
+) -> KChatMembershipStatus {
+    *kchat_slot().lock() = authority;
+    membership_status_for(membership)
 }
 
 /// Clear the installed authority and re-lock multiplayer. Any
@@ -2119,6 +3460,405 @@ pub fn kchat_derive_local_identity(seed_b64: &str) -> Result<KChatLocalIdentity>
     })
 }
 
+// ---------- Phase 7 (Tasks 19–23) entry points ----------
+
+/// File name written inside the project's `.kstudio/` directory
+/// for the per-document ACL.
+const ACL_FILENAME: &str = "acl.json";
+
+/// Phase 7 (Task 21): load the project ACL from `<project_dir>/acl.json`.
+/// Returns the (acl, source-path) pair. A missing file or unparseable
+/// content yields `(ProjectAcl::default(), Some(path))` so subsequent
+/// edits can still be persisted to the canonical location; an absent
+/// project_dir yields `(default(), None)` (no persistence).
+fn load_project_acl(
+    project_dir: Option<&std::path::Path>,
+) -> (kcreate_collab::ProjectAcl, Option<std::path::PathBuf>) {
+    let Some(dir) = project_dir else {
+        return (kcreate_collab::ProjectAcl::default(), None);
+    };
+    let path = dir.join(ACL_FILENAME);
+    let acl = match std::fs::read_to_string(&path) {
+        Ok(json) => serde_json::from_str::<kcreate_collab::ProjectAcl>(&json).unwrap_or_else(|e| {
+            tracing::warn!(
+                "collab: ACL file at {} could not be parsed ({e}); falling back to open ACL",
+                path.display()
+            );
+            kcreate_collab::ProjectAcl::default()
+        }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => kcreate_collab::ProjectAcl::default(),
+        Err(e) => {
+            tracing::warn!(
+                "collab: ACL file at {} could not be read ({e}); falling back to open ACL",
+                path.display()
+            );
+            kcreate_collab::ProjectAcl::default()
+        }
+    };
+    (acl, Some(path))
+}
+
+/// Phase 7 (Task 21): persist the ACL to `<project_dir>/acl.json`.
+/// Returns the I/O error rendered as a typed bridge error.
+fn save_project_acl(
+    path: &std::path::Path,
+    acl: &kcreate_collab::ProjectAcl,
+) -> Result<()> {
+    let json = serde_json::to_string_pretty(acl).map_err(|e| {
+        SessionBridgeError::InvalidArgument {
+            field: "acl",
+            message: format!("could not serialise ACL: {e}"),
+        }
+    })?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| SessionBridgeError::InvalidArgument {
+            field: "acl_path",
+            message: format!("could not create {}: {e}", parent.display()),
+        })?;
+    }
+    std::fs::write(path, json).map_err(|e| SessionBridgeError::InvalidArgument {
+        field: "acl_path",
+        message: format!("could not write {}: {e}", path.display()),
+    })?;
+    Ok(())
+}
+
+/// Phase 7 (Task 21): snapshot of the active session's ACL. Returns
+/// `None` when no session is running.
+#[must_use]
+pub fn session_acl_get() -> Option<kcreate_collab::ProjectAcl> {
+    let guard = slot().lock();
+    guard.as_ref().map(|s| s.acl.clone())
+}
+
+/// Phase 7 (Task 21): replace the active session's ACL and persist
+/// it to disk (if the session was started with a `project_dir`).
+/// Once the ACL is in `Enforce` mode any subsequently-joining peer
+/// is checked against the entries on Hello; already-connected peers
+/// are re-evaluated and disconnected with `acl-rejected` if they
+/// no longer meet the policy.
+pub fn session_acl_set(acl: kcreate_collab::ProjectAcl) -> Result<()> {
+    let mut guard = slot().lock();
+    let state = guard.as_mut().ok_or(SessionBridgeError::NotRunning)?;
+    state.acl = acl.clone();
+    let host = state.host.clone();
+    let runtime_handle = state.runtime.handle().clone();
+    if let Some(path) = state.acl_path.clone() {
+        save_project_acl(&path, &acl)?;
+    }
+    // Re-evaluate every currently-connected peer against the new
+    // ACL. Anyone who no longer passes is disconnected with an
+    // `acl-rejected` reason and an `AclRejected` event surfaces in
+    // the renderer.
+    let connected: Vec<PeerIdentity> = host.connected_peers();
+    let mut to_kick: Vec<(PeerId, String)> = Vec::new();
+    for ident in connected {
+        if matches!(state.acl.evaluate(&ident), kcreate_collab::AclDecision::Deny) {
+            to_kick.push((ident.peer_id.clone(), ident.public_key.clone()));
+        }
+    }
+    for (peer_id, public_key) in to_kick {
+        push_event(
+            state,
+            SessionEvent::AclRejected {
+                peer_id: peer_id.as_str().to_string(),
+                public_key,
+                community_id: state.community_id.clone(),
+            },
+        );
+        let host = host.clone();
+        let pid = peer_id.clone();
+        // Fire-and-forget — disconnects are best-effort; failure
+        // is logged but doesn't roll back the ACL change.
+        runtime_handle.spawn(async move {
+            if let Err(e) = host
+                .disconnect_peer(
+                    &pid,
+                    kcreate_collab::GoodbyeReason::Kicked("acl-rejected".into()),
+                )
+                .await
+            {
+                tracing::warn!("collab: ACL kick of {} failed: {e}", pid.as_str());
+            }
+        });
+    }
+    Ok(())
+}
+
+/// Phase 7 (Task 19): trigger a session-key rotation. Bumps the
+/// per-session key epoch, broadcasts a [`Message::KeyRotation`]
+/// carrying the new fingerprint and the grace deadline, and
+/// schedules a deferred sweep that disconnects every peer that
+/// hasn't acknowledged by the deadline.
+///
+/// Returns the new epoch number. Idempotent against double-rotation
+/// in the same instant — repeated calls bump the epoch each time so
+/// stale acks are rejected.
+pub fn session_rotate_keys(grace: std::time::Duration) -> Result<u64> {
+    let mut guard = slot().lock();
+    let state = guard.as_mut().ok_or(SessionBridgeError::NotRunning)?;
+    state.key_epoch = state.key_epoch.saturating_add(1);
+    let epoch = state.key_epoch;
+    // The transport already pins the cert per-connection; rotating
+    // here means future inbound connections see a fresh fingerprint
+    // (peers re-dial after handling the announcement). We surface
+    // the host's current fingerprint as the "new" one so the
+    // renderer can show "session keys rotated; new fingerprint X".
+    let new_fingerprint = state.host.cert_fingerprint_b64();
+    let deadline = chrono::Utc::now() + chrono::Duration::from_std(grace).unwrap_or_default();
+    let deadline_ms = deadline.timestamp_millis();
+    push_event(
+        state,
+        SessionEvent::KeyRotationScheduled {
+            epoch,
+            new_cert_fingerprint: new_fingerprint.clone(),
+            deadline_unix_ms: deadline_ms,
+        },
+    );
+    let host = state.host.clone();
+    let runtime_handle = state.runtime.handle().clone();
+    runtime_handle.spawn(async move {
+        let payload = kcreate_collab::KeyRotationPayload {
+            project_id: host.project_id(),
+            epoch,
+            new_cert_fingerprint: new_fingerprint.clone(),
+            transition_deadline: deadline,
+            reason: "periodic".into(),
+        };
+        if let Err(e) = host.broadcast_key_rotation(payload).await {
+            tracing::warn!("collab: broadcast_key_rotation failed: {e}");
+        }
+        tokio::time::sleep(grace).await;
+        // Sweep: every peer still missing the ack is forcibly
+        // disconnected.
+        let missing = host.peers_missing_key_rotation(epoch).await;
+        let mut acked: Vec<PeerId> = host.connected_peer_ids();
+        acked.retain(|p| !missing.contains(p));
+        for peer_id in &missing {
+            if let Err(e) = host
+                .disconnect_peer(
+                    peer_id,
+                    kcreate_collab::GoodbyeReason::Kicked("key-rotation-timeout".into()),
+                )
+                .await
+            {
+                tracing::warn!(
+                    "collab: key-rotation sweep disconnect of {} failed: {e}",
+                    peer_id.as_str()
+                );
+            }
+        }
+        // Surface the completion event so the renderer dismisses
+        // the "rotating…" toast.
+        let mut guard = slot().lock();
+        if let Some(state) = guard.as_mut() {
+            push_event(
+                state,
+                SessionEvent::KeyRotationCompleted {
+                    epoch,
+                    acked_peer_ids: acked
+                        .iter()
+                        .map(|p| p.as_str().to_string())
+                        .collect(),
+                    dropped_peer_ids: missing
+                        .iter()
+                        .map(|p| p.as_str().to_string())
+                        .collect(),
+                },
+            );
+        }
+    });
+    Ok(epoch)
+}
+
+/// Phase 7 (Task 19): snapshot of the current key-rotation epoch.
+/// Bootstrap cert is epoch 0; each [`session_rotate_keys`] bumps
+/// the value. Returns `None` when no session is running.
+#[must_use]
+pub fn session_key_epoch() -> Option<u64> {
+    let guard = slot().lock();
+    guard.as_ref().map(|s| s.key_epoch)
+}
+
+/// Phase 7 (Task 23): encrypt `plaintext` for `target_peer_id`
+/// using the X25519 key derived from the recipient's Ed25519
+/// identity and send it on the wire as a
+/// [`Message::ClipboardShare`]. The local user's signing key is
+/// held by the bridge (set once via `session_start`), so the
+/// renderer never has to round-trip the seed. `preview_label`
+/// is a short user-facing description shown in the recipient's
+/// accept/reject prompt.
+pub fn session_clipboard_share(
+    target_peer_id_b64: &str,
+    plaintext: &[u8],
+    preview_label: &str,
+) -> Result<String> {
+    let target: PeerId = target_peer_id_b64
+        .parse()
+        .map_err(
+            |e: kcreate_collab::CollabError| SessionBridgeError::InvalidArgument {
+                field: "peerId",
+                message: e.to_string(),
+            },
+        )?;
+    // Look up the recipient's public key on the host's roster, plus
+    // the local signing key + runtime / host snapshots we need for
+    // the async send. All taken under one lock so we don't hold the
+    // slot across an `await`.
+    let (recipient_pub_b64, project_id, host, runtime_handle, signing) = {
+        let guard = slot().lock();
+        let state = guard.as_ref().ok_or(SessionBridgeError::NotRunning)?;
+        let pub_b64 = state
+            .host
+            .connected_peers()
+            .iter()
+            .find(|p| p.peer_id == target)
+            .map(|p| p.public_key.clone())
+            .ok_or(SessionBridgeError::InvalidArgument {
+                field: "peerId",
+                message: "target peer is not connected".into(),
+            })?;
+        (
+            pub_b64,
+            state.host.project_id(),
+            state.host.clone(),
+            state.runtime.handle().clone(),
+            state.local_signing_key.clone(),
+        )
+    };
+    let recipient_vk = kcreate_collab::decode_public_key(&recipient_pub_b64).map_err(|e| {
+        SessionBridgeError::InvalidArgument {
+            field: "peerPublicKey",
+            message: format!("decode error: {e}"),
+        }
+    })?;
+    let nonce = generate_random_nonce();
+    let ciphertext_bytes = kcreate_collab::encrypt_clipboard_payload(
+        &signing,
+        &recipient_vk,
+        plaintext,
+        nonce,
+    )
+    .map_err(|e| SessionBridgeError::InvalidArgument {
+        field: "plaintext",
+        message: format!("encryption failed: {e}"),
+    })?;
+
+    let offer_id = uuid::Uuid::new_v4().to_string();
+    let payload = kcreate_collab::ClipboardSharePayload {
+        project_id,
+        offer_id: offer_id.clone(),
+        recipient_peer_id: target.as_str().to_string(),
+        sender_public_key: URL_SAFE_NO_PAD.encode(signing.verifying_key().as_bytes()),
+        nonce: URL_SAFE_NO_PAD.encode(nonce),
+        ciphertext: URL_SAFE_NO_PAD.encode(&ciphertext_bytes),
+        preview_label: preview_label.to_string(),
+    };
+    runtime_handle.block_on(async move {
+        host.send_clipboard_share(&target, payload).await
+    })?;
+    Ok(offer_id)
+}
+
+/// Draw 12 random bytes from the OS RNG for a fresh
+/// ChaCha20-Poly1305 nonce. Pulled into its own helper so the
+/// unsafe-feeling `getrandom` call site is isolated and easy to
+/// audit.
+fn generate_random_nonce() -> [u8; 12] {
+    let mut nonce = [0u8; 12];
+    // ed25519-dalek re-exports the `signature::rand_core` traits;
+    // we use `getrandom` directly to avoid pulling a separate
+    // `rand_core` dep through to this crate. `getrandom` is already
+    // a transitive dep via curve25519-dalek.
+    getrandom::getrandom(&mut nonce).expect("OS RNG must succeed for clipboard nonce");
+    nonce
+}
+
+/// Phase 7 (Task 23): accept a queued inbound clipboard offer,
+/// decrypt the ciphertext with the local signing key, and return
+/// the plaintext bytes to the renderer for paste. Drops the offer
+/// from the pending queue regardless of decryption outcome (a
+/// decryption failure means the ciphertext was tampered or the
+/// sender pubkey was wrong; either way the offer is dead).
+pub fn session_clipboard_accept(offer_id: &str) -> Result<Vec<u8>> {
+    let (offer, signing) = {
+        let mut guard = slot().lock();
+        let state = guard.as_mut().ok_or(SessionBridgeError::NotRunning)?;
+        let idx = state
+            .pending_clipboard_offers
+            .iter()
+            .position(|o| o.offer_id == offer_id)
+            .ok_or(SessionBridgeError::InvalidArgument {
+                field: "offerId",
+                message: "no pending clipboard offer with that id".into(),
+            })?;
+        let offer = state.pending_clipboard_offers.remove(idx).expect("idx valid");
+        let signing = state.local_signing_key.clone();
+        (offer, signing)
+    };
+    let sender_vk = kcreate_collab::decode_public_key(&offer.from_public_key).map_err(|e| {
+        SessionBridgeError::InvalidArgument {
+            field: "senderPublicKey",
+            message: format!("decode error: {e}"),
+        }
+    })?;
+    let nonce_bytes = URL_SAFE_NO_PAD
+        .decode(offer.payload.nonce.as_bytes())
+        .map_err(|e| SessionBridgeError::InvalidArgument {
+            field: "nonce",
+            message: format!("base64 decode failed: {e}"),
+        })?;
+    let ciphertext_bytes = URL_SAFE_NO_PAD
+        .decode(offer.payload.ciphertext.as_bytes())
+        .map_err(|e| SessionBridgeError::InvalidArgument {
+            field: "ciphertext",
+            message: format!("base64 decode failed: {e}"),
+        })?;
+    let pt = kcreate_collab::decrypt_clipboard_payload(
+        &signing,
+        &sender_vk,
+        &ciphertext_bytes,
+        &nonce_bytes,
+    )
+    .map_err(|e| SessionBridgeError::InvalidArgument {
+        field: "ciphertext",
+        message: format!("decryption failed: {e}"),
+    })?;
+    Ok(pt.bytes)
+}
+
+/// Phase 7 (Task 23): discard a queued inbound clipboard offer
+/// without decrypting. Idempotent — unknown ids are a no-op.
+pub fn session_clipboard_reject(offer_id: &str) -> Result<()> {
+    let mut guard = slot().lock();
+    let state = guard.as_mut().ok_or(SessionBridgeError::NotRunning)?;
+    state
+        .pending_clipboard_offers
+        .retain(|o| o.offer_id != offer_id);
+    Ok(())
+}
+
+/// Phase 7 (Task 23): snapshot of pending clipboard offers. The
+/// renderer's ClipboardOfferPrompt reads this to render the
+/// accept/reject UI.
+pub fn session_pending_clipboard_offers() -> Vec<(String, String, String)> {
+    let guard = slot().lock();
+    let Some(state) = guard.as_ref() else {
+        return Vec::new();
+    };
+    state
+        .pending_clipboard_offers
+        .iter()
+        .map(|o| {
+            (
+                o.offer_id.clone(),
+                o.from_peer_id.as_str().to_string(),
+                o.payload.preview_label.clone(),
+            )
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2241,7 +3981,7 @@ mod tests {
         let membership = KChatMembership::issue(
             KChatGroupId::new(group).unwrap(),
             local_identity.peer_id.clone(),
-            local_identity.public_key.clone(),
+            local_identity.public_key,
             issued,
             expires,
             &issuer,
@@ -2275,7 +4015,7 @@ mod tests {
         reset_kchat_slot();
         let _ = session_leave();
         let seed_b64 = URL_SAFE_NO_PAD.encode([7u8; 32]);
-        let err = session_start(&seed_b64, "ken", Uuid::new_v4(), false).unwrap_err();
+        let err = session_start(&seed_b64, "ken", Uuid::new_v4(), false, None, None).unwrap_err();
         assert!(
             matches!(err, SessionBridgeError::NotInKChatGroup),
             "expected NotInKChatGroup, got {err:?}"
@@ -2390,7 +4130,8 @@ mod tests {
         // was minted for. Even though the slot is "unlocked" by the
         // status reporter, session_start re-verifies and bounces.
         let other_seed_b64 = URL_SAFE_NO_PAD.encode([13u8; 32]);
-        let err = session_start(&other_seed_b64, "ken", Uuid::new_v4(), false).unwrap_err();
+        let err =
+            session_start(&other_seed_b64, "ken", Uuid::new_v4(), false, None, None).unwrap_err();
         assert!(
             matches!(err, SessionBridgeError::NotInKChatGroup),
             "expected NotInKChatGroup, got {err:?}"
@@ -2433,7 +4174,7 @@ mod tests {
             .mint_install_request_for_peer(
                 "lockstep.group",
                 &peer_pk_b64,
-                std::time::Duration::from_secs(60 * 60),
+                std::time::Duration::from_hours(1),
             )
             .expect("mint should succeed for valid inputs");
 
@@ -2594,7 +4335,7 @@ mod tests {
         })
         .unwrap();
         let updated = kchat_add_trusted_issuer(TrustedIssuer {
-            issuer_public_key: pk.clone(),
+            issuer_public_key: pk,
             label: "New Label".into(),
             added_at: Utc::now(),
         })
@@ -2648,7 +4389,7 @@ mod tests {
         // Label too long.
         let long = "x".repeat(TRUSTED_ISSUER_LABEL_CAP + 1);
         let err = kchat_add_trusted_issuer(TrustedIssuer {
-            issuer_public_key: pk.clone(),
+            issuer_public_key: pk,
             label: long,
             added_at: Utc::now(),
         })
@@ -2696,7 +4437,7 @@ mod tests {
         // then re-set the path. The list must reload from disk.
         *trust_store_slot().lock() = TrustStore::default();
         *trust_store_path_slot().lock() = None;
-        let reloaded = kchat_set_trust_store_path(path.clone()).unwrap();
+        let reloaded = kchat_set_trust_store_path(path).unwrap();
         assert_eq!(reloaded.len(), 1, "reload must restore the issuer");
         assert_eq!(reloaded[0].issuer_public_key, pk);
         assert_eq!(reloaded[0].label, "Persisted Studio");
@@ -2726,7 +4467,7 @@ mod tests {
         let padding_needed = (4 - (unpadded.len() % 4)) % 4;
         let padded = format!("{}{}", unpadded, "=".repeat(padding_needed));
         let listed = kchat_add_trusted_issuer(TrustedIssuer {
-            issuer_public_key: padded.clone(),
+            issuer_public_key: padded,
             label: "User-pasted Padded".into(),
             added_at: Utc::now(),
         })
@@ -2797,7 +4538,7 @@ mod tests {
             .append(
                 remote.clone(),
                 kcreate_collab::LamportClock::from_raw(next_clock),
-                op.clone(),
+                op,
             )
             .unwrap();
         let summary = journal.resume_vector();
@@ -2862,11 +4603,7 @@ mod tests {
             )
             .unwrap();
         let dup_err = journal
-            .append(
-                remote.clone(),
-                kcreate_collab::LamportClock::from_raw(1),
-                op.clone(),
-            )
+            .append(remote, kcreate_collab::LamportClock::from_raw(1), op)
             .unwrap_err();
         assert!(matches!(
             dup_err,
@@ -3137,7 +4874,7 @@ mod tests {
         };
         let j = serde_json::to_value(SessionEvent::PresenceUpdated {
             peer_id: "p".into(),
-            presence: presence.clone(),
+            presence,
         })
         .unwrap();
         assert_eq!(j["kind"], "presenceUpdated");

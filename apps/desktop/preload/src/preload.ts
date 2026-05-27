@@ -159,14 +159,28 @@ import type {
   SessionJournalSummary,
   SessionLockEntry,
   SessionPeer,
+  ProjectAcl,
+  PendingClipboardOffer,
   KChatBridge,
+  KChatCommunity,
+  KChatCommunityMember,
+  KChatConversation,
+  KChatBackendBridge,
+  KChatBackendSignInRequest,
+  KChatBackendStatus,
   KChatDevMintRequest,
   KChatInstallRequest,
   KChatLocalIdentity,
   KChatMembershipStatus,
+  KChatPostMessageResult,
+  KChatShareInvite,
+  KChatAcceptedInvite,
+  KChatRosterSyncResult,
+  CollabPermission,
   SessionStartReport,
   TrustedIssuer,
   ClipboardBridge,
+  DeeplinkBridge,
 } from "../../shared/scene";
 
 type FrameInfoSnake = {
@@ -2098,6 +2112,13 @@ const session: SessionBridge = {
     displayName: string,
     projectId: string,
     advertiseMdns: boolean,
+    // Phase 7 (Task 7): optional community gate. `null` (or omitted)
+    // = no community scoping; matches pre-Phase-7 behaviour.
+    communityId: string | null = null,
+    // Phase 7 (Task 21): optional `.kstudio/` directory path so the
+    // bridge persists ACL mutations to `<dir>/acl.json`. `null` (or
+    // omitted) keeps the ACL in memory only.
+    projectDir: string | null = null,
   ): Promise<SessionStartReport> {
     const raw = (await ipcRenderer.invoke(
       "kcreate/session/start",
@@ -2105,6 +2126,8 @@ const session: SessionBridge = {
       displayName,
       projectId,
       advertiseMdns,
+      communityId,
+      projectDir,
     )) as string;
     return JSON.parse(raw) as SessionStartReport;
   },
@@ -2186,6 +2209,110 @@ const session: SessionBridge = {
       ipcRenderer.removeListener(channel, listener);
     };
   },
+  async kickPeer(peerId: string, reason: string): Promise<void> {
+    await ipcRenderer.invoke(
+      "kcreate/session/kick-peer",
+      peerId,
+      reason,
+    );
+  },
+  async requestResume(peerId: string): Promise<void> {
+    await ipcRenderer.invoke("kcreate/session/request-resume", peerId);
+  },
+  async setPeerPermission(
+    peerId: string,
+    permission: CollabPermission,
+  ): Promise<void> {
+    await ipcRenderer.invoke(
+      "kcreate/session/set-peer-permission",
+      peerId,
+      permission,
+    );
+  },
+  async localPermission(): Promise<CollabPermission> {
+    return (await ipcRenderer.invoke(
+      "kcreate/session/local-permission",
+    )) as CollabPermission;
+  },
+  async acl(): Promise<ProjectAcl | null> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/session/acl-get",
+    )) as string | null;
+    return raw === null ? null : (JSON.parse(raw) as ProjectAcl);
+  },
+  async setAcl(acl: ProjectAcl): Promise<void> {
+    await ipcRenderer.invoke(
+      "kcreate/session/acl-set",
+      JSON.stringify(acl),
+    );
+  },
+  async rotateKeys(graceMs: number): Promise<number> {
+    return (await ipcRenderer.invoke(
+      "kcreate/session/rotate-keys",
+      graceMs,
+    )) as number;
+  },
+  async keyEpoch(): Promise<number | null> {
+    return (await ipcRenderer.invoke(
+      "kcreate/session/key-epoch",
+    )) as number | null;
+  },
+  async shareClipboard(
+    peerId: string,
+    plaintext: Uint8Array,
+    previewLabel: string,
+  ): Promise<string> {
+    // The bridge keeps the local signing key on its side after
+    // `session_start`, so the renderer never has to handle the
+    // seed for clipboard sharing.
+    return (await ipcRenderer.invoke(
+      "kcreate/session/clipboard-share",
+      peerId,
+      Buffer.from(plaintext),
+      previewLabel,
+    )) as string;
+  },
+  async acceptClipboardOffer(offerId: string): Promise<Uint8Array> {
+    const buf = (await ipcRenderer.invoke(
+      "kcreate/session/clipboard-accept",
+      offerId,
+    )) as Buffer;
+    return new Uint8Array(buf);
+  },
+  async rejectClipboardOffer(offerId: string): Promise<void> {
+    await ipcRenderer.invoke(
+      "kcreate/session/clipboard-reject",
+      offerId,
+    );
+  },
+  async pendingClipboardOffers(): Promise<PendingClipboardOffer[]> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/session/pending-clipboard-offers",
+    )) as string;
+    return JSON.parse(raw) as PendingClipboardOffer[];
+  },
+  async queueOperation(operation: unknown): Promise<void> {
+    await ipcRenderer.invoke(
+      "kcreate/session/queue-operation",
+      JSON.stringify(operation),
+    );
+  },
+  async flushPendingOperations(): Promise<number> {
+    return (await ipcRenderer.invoke(
+      "kcreate/session/flush-pending-operations",
+    )) as number;
+  },
+  async tickOutboundBatch(): Promise<number> {
+    return (await ipcRenderer.invoke(
+      "kcreate/session/tick-outbound-batch",
+    )) as number;
+  },
+  async setActivePages(pageIds: string[]): Promise<void> {
+    await ipcRenderer.invoke(
+      "kcreate/session/set-active-pages",
+      JSON.stringify(pageIds),
+    );
+  },
 };
 
 // ---------------------------------------------------------------------------
@@ -2263,6 +2390,167 @@ const kchat: KChatBridge = {
       issuerPublicKey,
     )) as string;
     return JSON.parse(raw) as TrustedIssuer[];
+  },
+};
+
+// ---------------------------------------------------------------------------
+// Phase 7 — KChat backend (HTTPS REST) bridge. Mirrors the Rust
+// surface in `kcreate_bridge::kchat_backend`. Every wire call is a
+// thin JSON-string passthrough; the IPC handler in `main.ts`
+// returns a typed error if the bridge wasn't built with
+// `kchat-backend`.
+// ---------------------------------------------------------------------------
+
+const kchatBackend: KChatBackendBridge = {
+  async available(): Promise<boolean> {
+    return (await ipcRenderer.invoke(
+      "kcreate/kchat-backend/available",
+    )) as boolean;
+  },
+  async connect(
+    request: KChatBackendSignInRequest,
+  ): Promise<KChatBackendStatus> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/kchat-backend/connect",
+      JSON.stringify(request),
+    )) as string;
+    return JSON.parse(raw) as KChatBackendStatus;
+  },
+  async disconnect(): Promise<KChatBackendStatus> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/kchat-backend/disconnect",
+    )) as string;
+    return JSON.parse(raw) as KChatBackendStatus;
+  },
+  async status(): Promise<KChatBackendStatus> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/kchat-backend/status",
+    )) as string;
+    return JSON.parse(raw) as KChatBackendStatus;
+  },
+  async listCommunities(): Promise<KChatCommunity[]> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/kchat-backend/list-communities",
+    )) as string;
+    return JSON.parse(raw) as KChatCommunity[];
+  },
+  async selectCommunity(communityId: string): Promise<KChatMembershipStatus> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/kchat-backend/select-community",
+      communityId,
+    )) as string;
+    return JSON.parse(raw) as KChatMembershipStatus;
+  },
+  async getCommunityMembers(
+    communityId: string,
+  ): Promise<KChatCommunityMember[]> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/kchat-backend/get-community-members",
+      communityId,
+    )) as string;
+    return JSON.parse(raw) as KChatCommunityMember[];
+  },
+  async listConversations(communityId: string): Promise<KChatConversation[]> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/kchat-backend/list-conversations",
+      communityId,
+    )) as string;
+    return JSON.parse(raw) as KChatConversation[];
+  },
+  async shareToConversation(
+    conversationId: string,
+    invite: KChatShareInvite,
+  ): Promise<KChatPostMessageResult> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/kchat-backend/share-to-conversation",
+      conversationId,
+      JSON.stringify(invite),
+    )) as string;
+    return JSON.parse(raw) as KChatPostMessageResult;
+  },
+  async acceptInvite(inviteJson: string): Promise<KChatAcceptedInvite> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/kchat-backend/accept-invite",
+      inviteJson,
+    )) as string;
+    return JSON.parse(raw) as KChatAcceptedInvite;
+  },
+  async syncCommunityRoster(
+    communityId: string,
+  ): Promise<KChatRosterSyncResult> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/kchat-backend/sync-community-roster",
+      communityId,
+    )) as string;
+    return JSON.parse(raw) as KChatRosterSyncResult;
+  },
+};
+
+// Phase 7 (Task E): `kcreate://` deeplink listener. The main
+// process forwards every accepted deeplink URL on
+// `kcreate/deeplink/received`; the renderer subscribes through
+// this bridge so `InvitePanel.tsx` (and any future panel that
+// wants to react to share-invite deeplinks) can auto-paste an
+// invite payload that arrived through a KChat Desktop share card.
+//
+// Cold-start race: `main.ts` flushes the pending-deeplink queue
+// on `did-finish-load`, but that fires before the React tree has
+// mounted and registered `onUrl`. To make sure a deeplink fired
+// in that millisecond window isn't lost, we register an IPC
+// listener here (at preload load time, before the renderer's JS
+// bundle runs) and buffer URLs until at least one consumer
+// subscribes. The buffer is capped to mirror the main-side cap so
+// a renderer stuck before mount can't drive unbounded memory
+// growth.
+//
+// Subscriber model: we keep a Set<callback> rather than a single
+// slot so a future second panel (e.g. an audit-log feed that also
+// records deeplink arrivals) can subscribe without silently
+// stealing URLs from the first subscriber. Each URL is fanned out
+// to every registered listener.
+const DEEPLINK_CHANNEL = "kcreate/deeplink/received";
+const DEEPLINK_BUFFER_CAP = 50;
+const pendingDeeplinks: string[] = [];
+const deeplinkSubscribers = new Set<(url: string) => void>();
+
+ipcRenderer.on(DEEPLINK_CHANNEL, (_evt: unknown, url: unknown): void => {
+  if (typeof url !== "string") {
+    return;
+  }
+  if (deeplinkSubscribers.size > 0) {
+    // Snapshot the subscriber set before iterating so a listener
+    // that unsubscribes itself during the callback doesn't mutate
+    // the live set mid-iteration.
+    const snapshot = Array.from(deeplinkSubscribers);
+    for (const subscriber of snapshot) {
+      subscriber(url);
+    }
+    return;
+  }
+  if (pendingDeeplinks.length >= DEEPLINK_BUFFER_CAP) {
+    pendingDeeplinks.shift();
+  }
+  pendingDeeplinks.push(url);
+});
+
+const deeplink: DeeplinkBridge = {
+  onUrl(callback: (url: string) => void): () => void {
+    deeplinkSubscribers.add(callback);
+    // Drain any URLs that arrived before any consumer was ready,
+    // in arrival order so the first subscriber observes them
+    // deterministically. Subsequent subscribers that join later
+    // miss the drain — they only see URLs that arrive after they
+    // register, which matches the "subscribe once at mount" usage
+    // pattern from `InvitePanel.tsx`.
+    if (pendingDeeplinks.length > 0) {
+      const drained = pendingDeeplinks.splice(0);
+      for (const url of drained) {
+        callback(url);
+      }
+    }
+    return () => {
+      deeplinkSubscribers.delete(callback);
+    };
   },
 };
 
@@ -2482,5 +2770,7 @@ contextBridge.exposeInMainWorld("kcreate", {
   slice,
   session,
   kchat,
+  kchatBackend,
+  deeplink,
   clipboard,
 });

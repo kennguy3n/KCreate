@@ -56,6 +56,16 @@ pub struct Operation {
     /// [`OperationLog::undo_group`]). `None` means "undo independently".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group_id: Option<Uuid>,
+    /// Phase 7 (Task 17): collaborative-undo marker. `true` when the
+    /// operation is the inverse of a prior op being replayed because
+    /// the local user (or a remote peer) hit Undo / Redo. Remote
+    /// receivers use this to render a "Ken undid …" activity-feed
+    /// entry instead of treating the op as a fresh edit.
+    ///
+    /// Defaults to `false` and is `skip_serializing_if` so existing
+    /// persisted operations deserialize unchanged.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub is_undo: bool,
 }
 
 impl Operation {
@@ -79,6 +89,7 @@ impl Operation {
             affected_nodes,
             ai_generated: false,
             group_id: None,
+            is_undo: false,
         }
     }
 
@@ -87,6 +98,16 @@ impl Operation {
     #[must_use]
     pub const fn as_ai_generated(mut self) -> Self {
         self.ai_generated = true;
+        self
+    }
+
+    /// Phase 7 (Task 17): tag this operation as a collaborative undo
+    /// inverse. Set on the inverse op produced by the undo/redo
+    /// pipeline before it is broadcast so remote peers can render
+    /// "Ken undid …" instead of "Ken edited …".
+    #[must_use]
+    pub const fn as_undo(mut self) -> Self {
+        self.is_undo = true;
         self
     }
 

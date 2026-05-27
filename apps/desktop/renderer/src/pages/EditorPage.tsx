@@ -1,9 +1,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { CanvasHost, type ViewportState } from "../components/CanvasHost";
+import { ConflictToast } from "../components/ConflictToast";
+import { CursorOverlay } from "../components/CursorOverlay";
 import { LeftPanel } from "../components/LeftPanel";
 import { PageNavigator } from "../components/PageNavigator";
 import { RightPanel } from "../components/RightPanel";
+import { SelectionOverlay } from "../components/SelectionOverlay";
 import { SoftProofOverlay } from "../components/SoftProofOverlay";
 import { TemplatePicker } from "../components/TemplatePicker";
 import { KeyboardShortcutsPanel } from "../components/KeyboardShortcutsPanel";
@@ -1837,6 +1840,40 @@ export function EditorPage({
             width={CANVAS_WIDTH}
             height={CANVAS_HEIGHT}
           />
+          {/*
+            Phase 7 Task 14 — remote-peer selection outlines. Coloured
+            dashed rectangles around every node that any remote peer
+            has currently selected. Same peer-colour assignment as the
+            cursor overlay so it's obvious who's editing what. Renders
+            nothing when no remote selection is live.
+          */}
+          <SelectionOverlay
+            width={CANVAS_WIDTH}
+            height={CANVAS_HEIGHT}
+            viewport={viewport}
+            nodes={nodes}
+          />
+          {/*
+            Phase 7 Task 13 — remote-peer cursors. Coloured arrows +
+            display-name pills at each remote peer's last-broadcast
+            world position, projected through the local viewport.
+            Same peer-colour palette as SelectionOverlay so the two
+            overlays agree visually. Renders nothing in solo mode.
+          */}
+          <CursorOverlay
+            width={CANVAS_WIDTH}
+            height={CANVAS_HEIGHT}
+            viewport={viewport}
+          />
+          {/*
+            Phase 7 Task 16 — conflict resolution toast. Listens for
+            `conflictResolved` session events and surfaces a brief
+            "<peer> overrode your edit" toast in the bottom-right
+            when the local peer was the loser. Clicking the toast
+            triggers a local undo so the user can quickly revert.
+            Self-contained — owns its own subscription + roster.
+          */}
+          <ConflictToast nodes={nodes} />
           {/*
             Phase 2 soft-proof / gamut-warning overlay. Reads the
             project's color settings via `window.kcreate.color` and

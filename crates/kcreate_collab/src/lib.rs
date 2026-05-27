@@ -45,6 +45,8 @@
 //! * Any UI surface. The Phase 3 collaboration panel will hang off the
 //!   bridge layer like every other UI in KCreate.
 
+pub mod acl;
+pub mod clipboard;
 pub mod clock;
 pub mod conflict;
 pub mod crdt;
@@ -67,9 +69,16 @@ pub use kchat::{
     KChatGroupId, KChatMembership, NoKChatGroupAuthority, SharedKChatAuthority,
 };
 pub use message::{
-    GoodbyeReason, HelloPayload, LockClaimPayload, LockReleasePayload, Message,
-    OperationBroadcastPayload, PresencePayload, ResumeBundlePayload, ResumeRequestPayload,
-    WelcomePayload, WelcomeStatus,
+    ClipboardSharePayload, GoodbyeReason, HelloPayload, KeyRotationAckPayload, KeyRotationPayload,
+    LockClaimPayload, LockReleasePayload, Message, OperationBroadcastPayload, PresencePayload,
+    ResumeBundlePayload, ResumeRequestPayload, WelcomePayload, WelcomeStatus,
 };
-pub use peer::{PeerFingerprint, PeerId, PeerIdentity, PeerKey};
-pub use session::{ProjectSession, SessionConfig, SessionError};
+pub use acl::{AclDecision, AclEntry, AclMode, AclPermission, ProjectAcl};
+pub use clipboard::{
+    decrypt_clipboard_payload, derive_x25519_from_ed25519_public, encrypt_clipboard_payload,
+    ClipboardCryptoError, ClipboardPlaintext,
+};
+pub use peer::{decode_public_key, PeerFingerprint, PeerId, PeerIdentity, PeerKey};
+pub use session::{
+    ProjectSession, RateBudgetDecision, RateLimitKind, SessionConfig, SessionError,
+};

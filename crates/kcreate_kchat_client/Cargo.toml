@@ -1,0 +1,71 @@
+[package]
+name = "kcreate_kchat_client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "REST client for the shared KChat / Mattermost backend used by KCreate to source community membership attestations"
+publish = false
+
+[lints]
+workspace = true
+
+# Phase 7 (Option C pivot): KChat backend REST client.
+#
+# After ken's architectural correction, the integration model is
+# NOT a local Unix socket / named pipe between KCreate and
+# `uney-chat-desktop`. The correct model is:
+#
+#   - KCreate runs as a standalone process.
+#   - It speaks REST/HTTPS to the SAME backend that KChat Desktop
+#     speaks to (shared identity, communities, attestations).
+#   - A separate thin `.kcz` companion extension (`apps/kchat-extension/`)
+#     contributes a sidebar inside KChat Desktop and consumes host
+#     procedures — but it does NOT proxy the KChat REST API.
+#
+# This crate therefore links `reqwest` (rustls-tls) — a networking
+# library. To preserve the local-first contract:
+#
+#   - The bridge depends on this crate only behind the off-by-default
+#     `kchat-backend` feature flag, just like the previous socket
+#     client. The deny-list test in
+#     `crates/kcreate_tests/tests/local_first.rs` therefore still
+#     passes for the default build.
+#   - The fixture / test path runs against an in-process `axum`
+#     server bound to `127.0.0.1` — never the public internet —
+#     so the test suite stays hermetic.
+[dependencies]
+kcreate_collab = { path = "../kcreate_collab" }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "sync", "time"] }
+reqwest = { workspace = true }
+url = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+base64 = { workspace = true }
+chrono = { workspace = true, features = ["serde"] }
+ed25519-dalek = { workspace = true }
+uuid = { workspace = true, features = ["v4", "serde"] }
+parking_lot = { workspace = true }
+# Behind the `test-fixture` feature: the in-process axum-backed
+# reference server used by tests (both this crate's `tests/*.rs`
+# integration suite and the cross-crate suite in
+# `crates/kcreate_tests`). Never enters a production binary
+# because the bridge depends on this crate without enabling the
+# feature.
+axum = { workspace = true, optional = true }
+
+[features]
+default = []
+# Enable the in-process REST fixture server. Test-only — pulls in
+# `axum`. Both this crate's own tests and `kcreate_tests` enable
+# this in their dev-dependencies.
+test-fixture = ["dep:axum"]
+
+[dev-dependencies]
+kcreate_kchat_client = { path = ".", features = ["test-fixture"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time", "net"] }
+tempfile = { workspace = true }

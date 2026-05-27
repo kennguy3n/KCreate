@@ -44,6 +44,62 @@ pub struct SessionConfig {
     /// memory bounded against a hostile peer announcing thousands of
     /// fake identities.
     pub max_peers: usize,
+    /// Phase 7 (Task 19): how often the host rotates the QUIC
+    /// session encryption certificate (forward secrecy). Set to
+    /// `None` to disable rotation. Default 60 minutes.
+    pub key_rotation_interval: Option<std::time::Duration>,
+    /// Phase 7 (Task 19): how long peers have to acknowledge a
+    /// [`crate::message::Message::KeyRotation`] before the host
+    /// disconnects them. Default 30 seconds.
+    pub key_rotation_grace: std::time::Duration,
+    /// Phase 7 (Task 22): maximum number of
+    /// [`crate::message::Message::OperationBroadcast`] envelopes a
+    /// single peer may send per rolling 1-second window. Default 100.
+    pub max_ops_per_second: u32,
+    /// Phase 7 (Task 22): maximum number of
+    /// [`crate::message::Message::Presence`] envelopes a single peer
+    /// may send per rolling 1-second window. Default 20.
+    pub max_presence_per_second: u32,
+    /// Phase 7 (Task 22): how many consecutive 1-second windows a
+    /// peer must remain over its budget before the host forcibly
+    /// disconnects them. Default 3 (i.e. ~3 seconds sustained
+    /// abuse). Set to `0` to disable the disconnect path and only
+    /// emit warnings.
+    pub rate_limit_disconnect_after: u32,
+    /// Phase 7 (Task 25): how long the bridge accumulates outbound
+    /// operations before flushing a single
+    /// [`crate::message::Message::OperationBroadcast`] batch on the
+    /// wire. The accumulator drains immediately when it reaches
+    /// [`SessionConfig::batch_flush_max_ops`] regardless of the
+    /// timer. Set to `0` to disable batching (every queued op
+    /// flushes immediately). Default 50 ms — chosen so a 60 Hz
+    /// drag interaction produces ~3 ops per batch, slashing
+    /// per-packet overhead without adding user-perceivable lag.
+    pub batch_flush_interval_ms: u32,
+    /// Phase 7 (Task 25): hard cap on operations per flushed batch.
+    /// Protects against unbounded queue growth when a script
+    /// generates ops faster than the flush interval can drain.
+    /// Default 200 (i.e. ~4 s of full-speed drag at 60 Hz with
+    /// the default interval). Exceeding the cap forces an
+    /// immediate flush so the batch never grows beyond it.
+    pub batch_flush_max_ops: u32,
+    /// Phase 7 (Task 26): minimum interval between consecutive
+    /// presence broadcasts when the cursor / selection actually
+    /// changed. Below this, repeat broadcasts are suppressed even
+    /// if the cursor moved. Default 50 ms (20 Hz cap).
+    pub presence_min_interval_ms: u32,
+    /// Phase 7 (Task 26): minimum cursor delta (in scene units) that
+    /// counts as a "move" for throttling purposes. Sub-pixel jitter
+    /// from a touchpad doesn't trigger a re-broadcast. Default
+    /// `2.0`. Selection-set or active-page changes always
+    /// re-broadcast regardless of this threshold.
+    pub presence_move_threshold_px: f32,
+    /// Phase 7 (Task 26): after this long without any presence
+    /// change (no cursor move, no selection change, no page
+    /// change), the bridge stops broadcasting presence until the
+    /// next change. Saves bandwidth on idle peers staring at the
+    /// canvas. Default 2 s.
+    pub presence_idle_suppression_ms: u32,
 }
 
 impl Default for SessionConfig {
@@ -51,6 +107,16 @@ impl Default for SessionConfig {
         Self {
             replay_window: 32_000,
             max_peers: 256,
+            key_rotation_interval: Some(std::time::Duration::from_hours(1)),
+            key_rotation_grace: std::time::Duration::from_secs(30),
+            max_ops_per_second: 100,
+            max_presence_per_second: 20,
+            rate_limit_disconnect_after: 3,
+            batch_flush_interval_ms: 50,
+            batch_flush_max_ops: 200,
+            presence_min_interval_ms: 50,
+            presence_move_threshold_px: 2.0,
+            presence_idle_suppression_ms: 2_000,
         }
     }
 }
@@ -61,6 +127,107 @@ struct PeerState {
     identity: PeerIdentity,
     last_clock: LamportClock,
     recent_nonces: VecDeque<[u8; NONCE_BYTES]>,
+    /// Phase 7 (Task 22): per-peer rate-limit counters. One bucket
+    /// per metered message class (operations, presence). The
+    /// buckets are checked + advanced on every inbound envelope of
+    /// the matching class.
+    ops_budget: RateBudget,
+    presence_budget: RateBudget,
+    /// Phase 7 (Task 19): which key rotation epoch the peer has
+    /// acknowledged. `0` means the peer hasn't acked any rotation
+    /// yet (i.e. they're still on the bootstrap cert). The host
+    /// compares this against [`ProjectSession::current_key_epoch`]
+    /// to decide whether the peer has missed the current rotation
+    /// deadline.
+    acked_key_epoch: u64,
+}
+
+/// Phase 7 (Task 22): rolling 1-second rate budget for a single
+/// metered message class.
+///
+/// `count` is the number of events observed in the window starting
+/// at `window_start`. When a new event arrives more than 1 second
+/// after `window_start`, the window slides forward (count resets to
+/// 1, `window_start` becomes the event time, and the
+/// `consecutive_overflow_windows` counter advances or resets based
+/// on whether the just-closed window exceeded the budget).
+#[derive(Debug, Clone, Copy)]
+struct RateBudget {
+    window_start: std::time::Instant,
+    count: u32,
+    /// How many consecutive rolling windows this peer has been
+    /// over the configured budget. Each window is currently 1
+    /// second wide; the counter measures **windows**, not
+    /// wall-clock seconds, so the field is named accordingly to
+    /// keep the unit honest if we ever tune the window size. Reset
+    /// to 0 the first time a closing window comes in under the
+    /// cap. The session evicts the peer once this hits the
+    /// configured threshold.
+    consecutive_overflow_windows: u32,
+}
+
+impl RateBudget {
+    fn new(now: std::time::Instant) -> Self {
+        Self {
+            window_start: now,
+            count: 0,
+            consecutive_overflow_windows: 0,
+        }
+    }
+
+    /// Record one event at `now`. Returns
+    /// [`RateBudgetDecision::Ok`] if the peer is inside its budget,
+    /// [`RateBudgetDecision::OverBudget`] (with the consecutive
+    /// overflow streak) if the peer is over.
+    fn record(&mut self, now: std::time::Instant, limit: u32) -> RateBudgetDecision {
+        let window = std::time::Duration::from_secs(1);
+        if now.saturating_duration_since(self.window_start) >= window {
+            // The previous window closed. Decide whether to grow
+            // or reset the consecutive-overflow streak based on
+            // whether the just-closed window exceeded the cap.
+            if self.count > limit {
+                self.consecutive_overflow_windows =
+                    self.consecutive_overflow_windows.saturating_add(1);
+            } else {
+                self.consecutive_overflow_windows = 0;
+            }
+            self.window_start = now;
+            self.count = 0;
+        }
+        self.count = self.count.saturating_add(1);
+        if self.count > limit {
+            RateBudgetDecision::OverBudget {
+                // `saturating_add` mirrors the in-place update
+                // above so a long-running peer that pegs the
+                // counter at `u32::MAX` doesn't wrap to 0 and
+                // suddenly look healthy.
+                consecutive_overflow_windows: self.consecutive_overflow_windows.saturating_add(1),
+            }
+        } else {
+            RateBudgetDecision::Ok
+        }
+    }
+}
+
+/// Result of recording one event against a [`RateBudget`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RateBudgetDecision {
+    /// Inside the budget.
+    Ok,
+    /// Outside the budget. The host should emit a warning event;
+    /// if `consecutive_overflow_windows >=
+    /// SessionConfig::rate_limit_disconnect_after`, the host should
+    /// forcibly disconnect the peer.
+    OverBudget { consecutive_overflow_windows: u32 },
+}
+
+/// Phase 7 (Task 22): kind of message a rate-limit check is being
+/// performed for. Returned alongside the budget decision so the
+/// bridge can route warnings into the right SessionEvent variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RateLimitKind {
+    Operation,
+    Presence,
 }
 
 /// A collaboration session for one project. Holds the local key,
@@ -218,14 +385,73 @@ impl ProjectSession {
         if derived != identity.peer_id {
             return Err(SessionError::PeerIdMismatch);
         }
+        let now = std::time::Instant::now();
         self.peers
             .entry(identity.peer_id.clone())
             .or_insert_with(|| PeerState {
                 identity,
                 last_clock: LamportClock::default(),
                 recent_nonces: VecDeque::with_capacity(self.config.replay_window.min(64)),
+                ops_budget: RateBudget::new(now),
+                presence_budget: RateBudget::new(now),
+                acked_key_epoch: 0,
             });
         Ok(())
+    }
+
+    /// Phase 7 (Task 22): record one inbound metered event from a
+    /// peer and return the budget decision so the caller can decide
+    /// whether to emit a warning or disconnect. The caller passes
+    /// the metric class so the right per-peer counter is touched.
+    ///
+    /// Returns [`RateBudgetDecision::Ok`] if the peer isn't in the
+    /// trust roster (the caller will already have rejected the
+    /// envelope upstream — we don't want to introduce a side-effect
+    /// that creates a peer entry from a rate-check).
+    pub fn record_rate_event(
+        &mut self,
+        peer_id: &PeerId,
+        kind: RateLimitKind,
+        now: std::time::Instant,
+    ) -> RateBudgetDecision {
+        let Some(state) = self.peers.get_mut(peer_id) else {
+            return RateBudgetDecision::Ok;
+        };
+        let (limit, budget) = match kind {
+            RateLimitKind::Operation => (self.config.max_ops_per_second, &mut state.ops_budget),
+            RateLimitKind::Presence => {
+                (self.config.max_presence_per_second, &mut state.presence_budget)
+            }
+        };
+        budget.record(now, limit)
+    }
+
+    /// Phase 7 (Task 19): record that a peer acknowledged the given
+    /// key rotation epoch. Returns `true` if the peer was known
+    /// (the ack was recorded), `false` if not.
+    pub fn record_key_rotation_ack(&mut self, peer_id: &PeerId, epoch: u64) -> bool {
+        if let Some(state) = self.peers.get_mut(peer_id) {
+            // Acks are monotonic — peers may not roll back to an
+            // older epoch.
+            if epoch > state.acked_key_epoch {
+                state.acked_key_epoch = epoch;
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Phase 7 (Task 19): return all peers whose `acked_key_epoch`
+    /// is behind `current_epoch`. The host calls this once the
+    /// key-rotation grace window has elapsed; every peer in the
+    /// returned set is disconnected for failing the rotation.
+    pub fn peers_missing_key_rotation(&self, current_epoch: u64) -> Vec<PeerId> {
+        self.peers
+            .iter()
+            .filter(|(_, state)| state.acked_key_epoch < current_epoch)
+            .map(|(id, _)| id.clone())
+            .collect()
     }
 
     /// Drop a peer from the roster (e.g. on Goodbye).
@@ -452,6 +678,9 @@ const fn message_project_id(msg: &Message) -> Option<Uuid> {
         Message::ResumeBundle(p) => Some(p.project_id),
         Message::LockClaim(p) => Some(p.project_id),
         Message::LockRelease(p) => Some(p.project_id),
+        Message::KeyRotation(p) => Some(p.project_id),
+        Message::KeyRotationAck(p) => Some(p.project_id),
+        Message::ClipboardShare(p) => Some(p.project_id),
         Message::Welcome(_) | Message::Presence(_) | Message::Heartbeat | Message::Goodbye(_) => {
             None
         }
@@ -838,5 +1067,205 @@ mod tests {
         // replay) — we tested replay above; this tests the cleanup.
         let err = b.ingest_envelope_json(&env).unwrap_err();
         assert!(matches!(err, SessionError::UntrustedPeer(_)), "got {err:?}");
+    }
+
+    // Phase 7 (Task 22) — rate-limit enforcement.
+
+    #[test]
+    fn rate_limit_under_budget_returns_ok() {
+        let (mut a, _b, _project) = pair();
+        let peer_id = a
+            .peer_identities()
+            .next()
+            .expect("trusted peer exists")
+            .peer_id
+            .clone();
+        let now = std::time::Instant::now();
+        // Default cap is 100 ops/s — five events should fit
+        // comfortably and never produce an overflow.
+        for i in 0..5 {
+            let dec = a.record_rate_event(
+                &peer_id,
+                RateLimitKind::Operation,
+                now + std::time::Duration::from_millis(i * 10),
+            );
+            assert_eq!(dec, RateBudgetDecision::Ok, "event {i} unexpectedly over budget");
+        }
+    }
+
+    #[test]
+    fn rate_limit_overflow_escalates_consecutive_seconds() {
+        let config = SessionConfig {
+            max_ops_per_second: 2,
+            ..SessionConfig::default()
+        };
+        let project = Uuid::new_v4();
+        let mut a = ProjectSession::new_with_authority(
+            PeerKey::from_seed([31; 32]),
+            "alice",
+            project,
+            config,
+            [31; 8],
+            make_authority(31, test_group()),
+        );
+        let b_ident = PeerKey::from_seed([32; 32]).identity("bob");
+        let peer_id = b_ident.peer_id.clone();
+        a.trust_peer(b_ident).unwrap();
+
+        // Second 0: budget is 2 — first three events should produce
+        // OK, OK, OverBudget(1).
+        let t0 = std::time::Instant::now();
+        assert_eq!(
+            a.record_rate_event(&peer_id, RateLimitKind::Operation, t0),
+            RateBudgetDecision::Ok
+        );
+        assert_eq!(
+            a.record_rate_event(&peer_id, RateLimitKind::Operation, t0),
+            RateBudgetDecision::Ok
+        );
+        assert_eq!(
+            a.record_rate_event(&peer_id, RateLimitKind::Operation, t0),
+            RateBudgetDecision::OverBudget {
+                consecutive_overflow_windows: 1
+            }
+        );
+
+        // Second 1: rolling window resets, two events fit, third
+        // overflows — streak should be 2 now.
+        let t1 = t0 + std::time::Duration::from_secs(1);
+        for _ in 0..2 {
+            assert_eq!(
+                a.record_rate_event(&peer_id, RateLimitKind::Operation, t1),
+                RateBudgetDecision::Ok
+            );
+        }
+        assert_eq!(
+            a.record_rate_event(&peer_id, RateLimitKind::Operation, t1),
+            RateBudgetDecision::OverBudget {
+                consecutive_overflow_windows: 2
+            }
+        );
+
+        // Second 2: peer behaves — only one event in the whole
+        // window, which is under the cap. When second 3 opens with
+        // a fresh event the just-closed window-2 had count=1 (under
+        // limit) so the streak resets to 0.
+        let t2 = t0 + std::time::Duration::from_secs(2);
+        assert_eq!(
+            a.record_rate_event(&peer_id, RateLimitKind::Operation, t2),
+            RateBudgetDecision::Ok
+        );
+        let t3 = t0 + std::time::Duration::from_secs(3);
+        // First event of second 3 closes second 2 (count=1 ≤ 2)
+        // and resets the streak to 0 — so a fresh overflow now
+        // reports consecutive_overflow_windows == 1.
+        for _ in 0..2 {
+            assert_eq!(
+                a.record_rate_event(&peer_id, RateLimitKind::Operation, t3),
+                RateBudgetDecision::Ok
+            );
+        }
+        assert_eq!(
+            a.record_rate_event(&peer_id, RateLimitKind::Operation, t3),
+            RateBudgetDecision::OverBudget {
+                consecutive_overflow_windows: 1
+            }
+        );
+    }
+
+    #[test]
+    fn rate_limit_presence_and_ops_use_independent_budgets() {
+        let config = SessionConfig {
+            max_ops_per_second: 1,
+            max_presence_per_second: 1,
+            ..SessionConfig::default()
+        };
+        let project = Uuid::new_v4();
+        let mut a = ProjectSession::new_with_authority(
+            PeerKey::from_seed([41; 32]),
+            "alice",
+            project,
+            config,
+            [41; 8],
+            make_authority(41, test_group()),
+        );
+        let b_ident = PeerKey::from_seed([42; 32]).identity("bob");
+        let peer_id = b_ident.peer_id.clone();
+        a.trust_peer(b_ident).unwrap();
+
+        let t = std::time::Instant::now();
+        // Burn the ops budget first.
+        assert_eq!(
+            a.record_rate_event(&peer_id, RateLimitKind::Operation, t),
+            RateBudgetDecision::Ok
+        );
+        assert_eq!(
+            a.record_rate_event(&peer_id, RateLimitKind::Operation, t),
+            RateBudgetDecision::OverBudget {
+                consecutive_overflow_windows: 1
+            }
+        );
+        // Presence budget should still be fresh — independent of
+        // operations.
+        assert_eq!(
+            a.record_rate_event(&peer_id, RateLimitKind::Presence, t),
+            RateBudgetDecision::Ok
+        );
+    }
+
+    #[test]
+    fn rate_limit_unknown_peer_is_a_noop() {
+        let (mut a, _b, _project) = pair();
+        let bogus = PeerKey::from_seed([99; 32]).identity("ghost").peer_id;
+        // The peer was never trusted; record_rate_event should not
+        // create a side-effect entry, and the decision should be
+        // OK so the caller's upstream rejection drives the response.
+        assert_eq!(
+            a.record_rate_event(&bogus, RateLimitKind::Operation, std::time::Instant::now()),
+            RateBudgetDecision::Ok
+        );
+    }
+
+    // Phase 7 (Task 19) — key-rotation ack tracking.
+
+    #[test]
+    fn key_rotation_ack_marks_peer_acknowledged() {
+        let (mut a, _b, _project) = pair();
+        let peer_id = a
+            .peer_identities()
+            .next()
+            .expect("trusted peer exists")
+            .peer_id
+            .clone();
+        // Before any ack the peer is on epoch 0 and missing every
+        // future epoch.
+        assert_eq!(a.peers_missing_key_rotation(1), vec![peer_id.clone()]);
+        assert!(a.record_key_rotation_ack(&peer_id, 1));
+        assert!(a.peers_missing_key_rotation(1).is_empty());
+    }
+
+    #[test]
+    fn key_rotation_ack_is_monotonic() {
+        let (mut a, _b, _project) = pair();
+        let peer_id = a
+            .peer_identities()
+            .next()
+            .expect("trusted peer exists")
+            .peer_id
+            .clone();
+        assert!(a.record_key_rotation_ack(&peer_id, 5));
+        // Trying to "ack" an older epoch is ignored — the peer is
+        // still considered up to epoch 5.
+        assert!(a.record_key_rotation_ack(&peer_id, 3));
+        assert!(a.peers_missing_key_rotation(5).is_empty());
+        // But epoch 6 is still outstanding.
+        assert_eq!(a.peers_missing_key_rotation(6), vec![peer_id]);
+    }
+
+    #[test]
+    fn key_rotation_ack_for_unknown_peer_returns_false() {
+        let (mut a, _b, _project) = pair();
+        let bogus = PeerKey::from_seed([77; 32]).identity("ghost").peer_id;
+        assert!(!a.record_key_rotation_ack(&bogus, 1));
     }
 }

@@ -87,6 +87,14 @@ pub struct HostOptions {
     /// stays locked. The bridge layer plugs in a real authority
     /// only once the user has signed into a KChat group.
     pub kchat_authority: SharedKChatAuthority,
+    /// Phase 7: optional KChat community id used to scope mDNS
+    /// auto-discovery. When set, the local mDNS advertisement
+    /// publishes the community id in the TXT record and the browse
+    /// loop only surfaces peers advertising the same community.
+    /// Independent of the KChat *attestation* gate — the gate
+    /// always runs in [`ProjectSession::trust_peer`]; this field is
+    /// purely a UX filter for the discovery roster.
+    pub community_id: Option<String>,
 }
 
 impl HostOptions {
@@ -109,6 +117,7 @@ impl HostOptions {
             // overwrite `kchat_authority` with an
             // `InProcessKChatAuthority` before calling `start`.
             kchat_authority: no_kchat_authority(),
+            community_id: None,
         }
     }
 }
@@ -121,7 +130,7 @@ pub enum InboundEvent {
     /// mDNS resolved a new peer. The UI shows a "Connect"
     /// confirmation prompt; if the user clicks through, the bridge
     /// calls [`LanCollabHost::dial_discovered_peer`].
-    Discovered(DiscoveredPeer),
+    Discovered(Box<DiscoveredPeer>),
     /// A peer left the LAN (mDNS unregistration). Already-connected
     /// peers stay until the QUIC connection closes; this only signals
     /// removal from the discoverable roster.
@@ -282,6 +291,7 @@ impl LanCollabHost {
                 cert_fingerprint_b64: host.inner.cert.cert_fingerprint_b64(),
                 advertise: opts.advertise_mdns,
                 advertise_addrs: opts.advertise_addrs,
+                community_id: opts.community_id,
             };
             let discovery = Arc::new(PeerDiscovery::start(cfg)?);
             // Bridge discovery events into the inbound channel.
@@ -494,6 +504,56 @@ impl LanCollabHost {
     /// Sugar: build + broadcast a `Presence` payload.
     pub async fn broadcast_presence(&self, payload: PresencePayload) -> Result<(), TransportError> {
         self.broadcast(Message::Presence(payload)).await
+    }
+
+    /// Phase 7 (Task 8): gracefully disconnect a specific peer. Sends
+    /// a directed `Goodbye(reason)` so the peer's pump task observes
+    /// a clean shutdown (rather than a raw QUIC close), then closes
+    /// the underlying connection on our side and removes the peer
+    /// from the local roster. Idempotent \u2014 calling on an
+    /// unknown / already-disconnected peer is a no-op.
+    ///
+    /// Used by the bridge's roster-sync poller to evict peers whose
+    /// KChat community membership was revoked.
+    pub async fn disconnect_peer(
+        &self,
+        peer_id: &PeerId,
+        reason: GoodbyeReason,
+    ) -> Result<(), TransportError> {
+        // Best-effort directed Goodbye. We don't fail the disconnect
+        // if the peer is unreachable \u2014 the goal is to remove them
+        // from our session even if the network path is broken.
+        let send_result = self.send_to(peer_id, Message::Goodbye(reason)).await;
+
+        let removed = self.inner.peers.write().remove(peer_id);
+        let was_connected = removed.is_some();
+        if let Some(slot) = removed {
+            // Use a non-zero error code so the peer can distinguish
+            // "host shutdown" (code 0) from "host kicked us"
+            // (code 1) in their close-reason logs.
+            slot.connection.close(1u32.into(), b"kicked");
+            // Tell the local session state to forget this peer's
+            // replay window + nonces so the same peer can rejoin
+            // later under a fresh handshake.
+            self.inner.session.lock().await.forget_peer(peer_id);
+            // Surface a synthetic PeerLeft on the inbound channel so
+            // the bridge observes the eviction through the normal
+            // event path (otherwise the pump only sees PeerLeft for
+            // peers that exit on their own).
+            let _ = self
+                .inner
+                .inbound_tx
+                .send(InboundEvent::PeerLeft(peer_id.clone()));
+        }
+        // Surface the directed-send failure if the peer was still
+        // in the roster but the send failed mid-flight. When the
+        // peer was never in the roster, the send error is expected
+        // and we return Ok.
+        if was_connected {
+            send_result
+        } else {
+            Ok(())
+        }
     }
 
     /// Sugar: build + broadcast a batch of operations.

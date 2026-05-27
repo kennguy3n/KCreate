@@ -739,6 +739,16 @@ export interface Bridge {
     displayName: string,
     projectId: string,
     advertiseMdns: boolean,
+    /**
+     * Phase 7 (Task 7): optional KChat community id. When set, the
+     * session's mDNS advertisement is tagged with the community
+     * so two KCreate peers on the same LAN only auto-discover each
+     * other when they belong to the same KChat community. Must
+     * match the currently-installed KChat membership's group id;
+     * mismatches throw a typed `kcreate_bridge: invalid argument
+     * "communityId"` error from the Rust side.
+     */
+    communityId: string | null,
   ): string;
   /**
    * Returns the leaving peer's base64url-encoded id when a session was
@@ -828,6 +838,16 @@ export interface Bridge {
   kchatDesktopGetCommunityMembers?(communityId: string): string;
   kchatDesktopListConversations?(communityId: string): string;
   kchatDesktopShareToConversation?(conversationId: string, inviteJson: string): string;
+  // Phase 7 (Task 10): accept a document-share invite.
+  kchatDesktopAcceptInvite?(inviteJson: string): string;
+  // Phase 7 (Task 8): roster-sync tick.
+  kchatDesktopSyncCommunityRoster?(communityId: string): string;
+  // Phase 7 (Task 8): kick a connected peer.
+  sessionKickPeer(peerId: string, reason: string): void;
+  // Phase 7 (Task 11): set a peer's permission.
+  sessionSetPeerPermission(peerId: string, permission: string): void;
+  // Phase 7 (Task 11): local permission snapshot.
+  sessionLocalPermission(): string;
   /// Re-publish the cached scene. Used by the session event tick
   /// to refresh remote-peer cursor overlays.
   documentRequestRender(): void;

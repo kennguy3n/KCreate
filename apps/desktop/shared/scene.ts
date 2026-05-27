@@ -3059,6 +3059,20 @@ export type SessionEvent =
       kind: "sessionLeft";
       /// Base64url-encoded peer id of the session that just left.
       peerId: string;
+    }
+  | {
+      /// Phase 7 (Task 8): a peer was evicted from the session
+      /// because their KChat community membership was revoked.
+      kind: "peerKicked";
+      peerId: string;
+      reason: string;
+    }
+  | {
+      /// Phase 7 (Task 11): a peer's collaboration permission
+      /// changed (e.g. the host downgraded them to viewer).
+      kind: "permissionChanged";
+      peerId: string;
+      permission: CollabPermission;
     };
 
 /// Block 7: per-peer Lamport high-water marks for the journal
@@ -3103,6 +3117,14 @@ export interface SessionBridge {
     displayName: string,
     projectId: string,
     advertiseMdns: boolean,
+    /// Phase 7 (Task 7): optional KChat community id used to scope
+    /// mDNS auto-discovery. When set, two KCreate peers on the
+    /// same LAN only auto-connect when they're members of the
+    /// same KChat community. Must match the currently-installed
+    /// `KChatMembership.groupId`; mismatches reject with an
+    /// `invalid argument "communityId"` error from the bridge.
+    /// `null` (or omitted) preserves pre-Phase-7 behaviour.
+    communityId?: string | null,
   ): Promise<SessionStartReport>;
   /// Stop the running session. Idempotent.
   leave(): Promise<void>;
@@ -3160,6 +3182,15 @@ export interface SessionBridge {
   /// leave / move their cursor. Returns an unsubscribe function.
   /// The renderer is responsible for filtering by kind.
   onEvent(callback: (event: SessionEvent) => void): () => void;
+  /// Phase 7 (Task 8): forcibly disconnect a connected peer.
+  kickPeer(peerId: string, reason: string): Promise<void>;
+  /// Phase 7 (Task 11): set a peer's collaboration permission.
+  setPeerPermission(
+    peerId: string,
+    permission: CollabPermission,
+  ): Promise<void>;
+  /// Phase 7 (Task 11): snapshot of the local peer's permission.
+  localPermission(): Promise<CollabPermission>;
 }
 
 // ---------------------------------------------------------------------------
@@ -3419,7 +3450,7 @@ export interface KChatConversation {
   id: string;
   name: string;
   communityId: string;
-  type: "channel" | "direct";
+  conversationType: "channel" | "direct";
 }
 
 /// Invite-card payload posted to a KChat conversation by
@@ -3453,6 +3484,31 @@ export interface KChatPostMessageResult {
   /// RFC3339 UTC timestamp the server stamped on the message.
   postedAt: string;
 }
+
+/// Phase 7 (Task 10): result of accepting a share-document invite.
+/// Mirrors `kcreate_bridge::kchat_desktop::KChatAcceptedInvite`.
+export interface KChatAcceptedInvite {
+  projectId: string;
+  projectName: string;
+  ownerPeerId: string;
+  ownerDisplayName: string;
+  communityId: string;
+  conversationId: string;
+}
+
+/// Phase 7 (Task 8): result of a roster-sync tick.
+/// Mirrors `kcreate_bridge::kchat_desktop::KChatRosterSyncResult`.
+export interface KChatRosterSyncResult {
+  /// How many members KChat Desktop reported on this tick.
+  polledMembers: number;
+  /// Peer ids that were evicted because they were no longer in the
+  /// community roster.
+  kicked: string[];
+}
+
+/// Phase 7 (Task 11): collaboration permission for a session peer.
+/// Mirrors `kcreate_bridge::collab::CollabPermission`.
+export type CollabPermission = "editor" | "viewer";
 
 /// Phase 7 KChat Desktop bridge surface. Every method other than
 /// `available` is optional because non-`kchat-desktop` builds do
@@ -3492,6 +3548,16 @@ export interface KChatDesktopBridge {
     conversationId: string,
     invite: KChatShareInvite,
   ): Promise<KChatPostMessageResult>;
+  /// Phase 7 (Task 10): accept a share-document invite received
+  /// through a KChat conversation. Validates community match +
+  /// sender membership and dials the owner via `session.join()`.
+  acceptInvite(inviteJson: string): Promise<KChatAcceptedInvite>;
+  /// Phase 7 (Task 8): roster-sync tick — polls KChat Desktop for
+  /// the latest community members, reconciles against the active
+  /// session (kicks revoked peers, refreshes role -> permission).
+  syncCommunityRoster(
+    communityId: string,
+  ): Promise<KChatRosterSyncResult>;
 }
 
 // -----------------------------------------------------------------------------

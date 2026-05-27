@@ -43,7 +43,7 @@ pub use protocol::{
     CommunityEvent, CommunityEventKind, ErrorCode, InviteCardPayload, KChatCommunity,
     KChatCommunityMember, KChatConversation, KChatConversationType, KChatIdentity, KChatRole,
     MembershipAttestation, PostMessageParams, PostMessageResult, INVITE_CONTENT_TYPE,
-    PROTOCOL_VERSION,
+    INVITE_SCHEMA_VERSION, PROTOCOL_VERSION,
 };
 pub use transport::Transport;
 

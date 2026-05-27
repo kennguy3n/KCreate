@@ -79,6 +79,13 @@ pub struct DiscoveredPeer {
     /// [`TRANSPORT_PROTOCOL_VERSION`] because we reject any other in
     /// [`parse_discovered`].
     pub proto_version: u32,
+    /// Phase 7: optional KChat community identifier (`cm` TXT key).
+    /// When set, two peers only auto-discover each other when the
+    /// community matches — enabling multiple KCreate instances on
+    /// the same LAN to form separate collaboration circles per
+    /// KChat community. `None` for peers advertised outside of a
+    /// community gate (legacy / dev-mint flow).
+    pub community_id: Option<String>,
 }
 
 /// Discovery events surfaced to the host actor. `Resolved` is what
@@ -88,7 +95,7 @@ pub struct DiscoveredPeer {
 pub enum DiscoveryEvent {
     /// A peer has been fully resolved (TXT + address). The only
     /// variant the UI shows directly.
-    Resolved(DiscoveredPeer),
+    Resolved(Box<DiscoveredPeer>),
     /// A previously-resolved peer was removed (left the LAN).
     Removed(PeerId),
 }
@@ -142,6 +149,14 @@ pub struct DiscoveryConfig {
     /// (`enable_addr_auto`). Tests on the loopback use this to
     /// override to `127.0.0.1` so the daemon doesn't fail to bind.
     pub advertise_addrs: Option<Vec<IpAddr>>,
+    /// Phase 7: optional KChat community id. When `Some`, the value
+    /// is published in the `cm` TXT record AND the browse loop
+    /// filters out resolved peers whose community id is missing or
+    /// different (so two co-located KCreate instances bound to
+    /// different KChat communities form separate collab circles).
+    /// When `None`, the discovery layer behaves exactly as it did
+    /// before Phase 7 — every parseable peer is surfaced.
+    pub community_id: Option<String>,
 }
 
 impl PeerDiscovery {
@@ -163,6 +178,12 @@ impl PeerDiscovery {
         txt.insert("cf".into(), cfg.cert_fingerprint_b64.clone());
         txt.insert("pj".into(), cfg.project_id.to_string());
         txt.insert("nm".into(), cfg.identity.display_name.clone());
+        // `cm` (community) — only emitted when the host is bound to
+        // a KChat community. Receivers tolerate its absence so
+        // pre-Phase-7 peers stay discoverable on the same LAN.
+        if let Some(cm) = cfg.community_id.as_deref() {
+            txt.insert("cm".into(), cm.to_string());
+        }
 
         let instance_name = encode_instance_name(&cfg.identity.peer_id);
 
@@ -216,6 +237,10 @@ impl PeerDiscovery {
         let own_peer_id_for_struct = cfg.identity.peer_id.clone();
         let own_peer_id_for_thread = cfg.identity.peer_id;
         let resolved_clone = resolved.clone();
+        // The community filter is captured by the bridge thread so
+        // each browse hit can be compared against our local
+        // community without re-locking the [`DiscoveryConfig`].
+        let community_filter = cfg.community_id;
 
         // The mDNS daemon delivers events on its own flume channel
         // (sync, not tokio). We bridge that into our tokio broadcast
@@ -238,11 +263,34 @@ impl PeerDiscovery {
                                     if peer.peer_id == own_peer_id_for_thread {
                                         continue;
                                     }
+                                    // Phase 7 community gate: when we
+                                    // are bound to a community,
+                                    // suppress peers that don't
+                                    // advertise the same community.
+                                    // Peers without a community in
+                                    // their TXT are also filtered
+                                    // out — mixing gated and
+                                    // un-gated peers on the same
+                                    // LAN would break the contract
+                                    // that all members of a session
+                                    // pass the same group gate.
+                                    if let Some(expected) = community_filter.as_deref() {
+                                        if peer.community_id.as_deref() != Some(expected) {
+                                            log::debug!(
+                                                "suppressing peer {} — community {:?} ≠ local {:?}",
+                                                peer.peer_id.as_str(),
+                                                peer.community_id,
+                                                expected,
+                                            );
+                                            continue;
+                                        }
+                                    }
                                     resolved_clone.write().insert(
                                         info.get_fullname().to_string(),
                                         peer.peer_id.clone(),
                                     );
-                                    let _ = events_tx_clone.send(DiscoveryEvent::Resolved(peer));
+                                    let _ = events_tx_clone
+                                        .send(DiscoveryEvent::Resolved(Box::new(peer)));
                                 }
                                 Err(e) => {
                                     log::debug!(
@@ -374,6 +422,11 @@ fn parse_discovered(info: &ServiceInfo) -> Result<DiscoveredPeer, TransportError
     let project_id = Uuid::parse_str(pj_str).map_err(|e| {
         TransportError::UnsupportedAdvertisement(format!("invalid project uuid: {e}"))
     })?;
+    // `cm` is optional — absence means the peer is not gated by a
+    // KChat community (pre-Phase-7 binaries or dev-mint flows).
+    let community_id = info
+        .get_property_val_str("cm")
+        .map(std::string::ToString::to_string);
 
     // Prefer IPv4 if available — it's more common and easier to
     // reason about for loopback / NAT cases. Fall back to any
@@ -400,6 +453,7 @@ fn parse_discovered(info: &ServiceInfo) -> Result<DiscoveredPeer, TransportError
         socket_addr,
         cert_fingerprint,
         proto_version,
+        community_id,
     })
 }
 

@@ -1752,9 +1752,11 @@ version = "0.0.1"
 dependencies = [
  "base64",
  "chrono",
+ "ed25519-dalek",
  "kcreate_ai",
  "kcreate_audit",
  "kcreate_collab",
+ "kcreate_collab_transport",
  "kcreate_core",
  "kcreate_export",
  "kcreate_kchat_client",

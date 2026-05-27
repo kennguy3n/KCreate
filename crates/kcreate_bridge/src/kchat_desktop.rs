@@ -113,7 +113,7 @@ impl KChatShareInvite {
     /// the schema version + issuance timestamp.
     fn into_card(self) -> kcreate_kchat_client::InviteCardPayload {
         kcreate_kchat_client::InviteCardPayload {
-            schema_version: 1,
+            schema_version: kcreate_kchat_client::INVITE_SCHEMA_VERSION,
             project_id: self.project_id,
             project_name: self.project_name,
             owner_peer_id: self.owner_peer_id,
@@ -218,6 +218,7 @@ pub fn kchat_desktop_disconnect() -> Result<KChatDesktopStatus, KChatDesktopBrid
         rt.block_on(client.disconnect());
     }
     *authority_slot().lock() = None;
+    crate::collab::kchat_clear_authority();
     Ok(KChatDesktopStatus {
         connected: false,
         socket_path: None,
@@ -351,6 +352,144 @@ pub fn kchat_desktop_share_to_conversation(
         content_type: Some(kcreate_kchat_client::INVITE_CONTENT_TYPE.to_string()),
     };
     Ok(rt.block_on(client.post_message(params))?)
+}
+
+/// Phase 7 (Task 8): roster-sync tick. Reads the current community
+/// members from KChat Desktop, then asks the collab bridge to
+/// reconcile the set against connected peers (kicks anyone not in
+/// the roster, refreshes role -> permission mappings). Returns the
+/// list of peer ids that were evicted on this tick so the caller
+/// can log / surface them.
+///
+/// Renderer drives this on a fixed cadence (every 30s, see
+/// `apps/desktop/main/src/main.ts::kchatRosterSyncTick`). The
+/// bridge is the single owner of "what does the LAN session
+/// currently look like", so the renderer never has to reach
+/// directly into `session_kick_peer`.
+pub fn kchat_desktop_sync_community_roster(
+    community_id: &str,
+) -> Result<KChatRosterSyncResult, KChatDesktopBridgeError> {
+    let client = require_client()?;
+    let rt = runtime()?;
+    let members = rt.block_on(client.get_members(community_id))?;
+    // `session_apply_community_roster` expects (peer_id_b64, role)
+    // pairs. KChat Desktop returns the role as a lowercase
+    // string ("owner" / "admin" / "member") which maps directly
+    // through `CollabPermission::from_role`.
+    let pairs: Vec<(String, String)> = members
+        .iter()
+        .map(|m| (m.peer_id.clone(), m.role.as_str().to_string()))
+        .collect();
+    let kicked = crate::collab::session_apply_community_roster(&pairs)
+        .map_err(|e| KChatDesktopBridgeError::Attestation(e.to_string()))?;
+    Ok(KChatRosterSyncResult {
+        polled_members: members.len(),
+        kicked,
+    })
+}
+
+/// Phase 7 (Task 10): accept a share-document invite the user
+/// received through a KChat Desktop conversation. Parses the
+/// invite JSON, verifies the invite's community matches the
+/// active session's community (defence-in-depth -- the collab
+/// gate would otherwise reject the dial), and triggers
+/// [`crate::collab::session_join`] to dial the owner peer.
+///
+/// Returns the dialed peer's identity on success so the renderer
+/// can show a "joined Ken's project" toast.
+pub fn kchat_desktop_accept_invite(
+    invite_json: &str,
+) -> Result<KChatAcceptedInvite, KChatDesktopBridgeError> {
+    let card: kcreate_kchat_client::InviteCardPayload =
+        serde_json::from_str(invite_json).map_err(|e| {
+            KChatDesktopBridgeError::Attestation(format!("invite is not valid JSON: {e}"))
+        })?;
+
+    // The invite must declare the same schema version the bridge
+    // was built against -- otherwise the field set might be
+    // missing pieces (e.g. a future schema adds `mls_group_epoch`
+    // and we'd silently dial without verifying it).
+    if card.schema_version != kcreate_kchat_client::INVITE_SCHEMA_VERSION {
+        return Err(KChatDesktopBridgeError::Attestation(format!(
+            "invite schema_version {} is not supported (bridge expects {})",
+            card.schema_version,
+            kcreate_kchat_client::INVITE_SCHEMA_VERSION,
+        )));
+    }
+
+    // Community match. If the local bridge doesn't have a community
+    // active, defer to the collab gate -- `session_join` will
+    // reject the dial if the installed membership doesn't match
+    // the owner's peer binding.
+    if let Some(local_community) = crate::collab::session_community_id() {
+        if local_community != card.community_id {
+            return Err(KChatDesktopBridgeError::Attestation(format!(
+                "invite is for community {} but the local session is bound to {local_community}",
+                card.community_id,
+            )));
+        }
+    }
+
+    // Cross-check: the sender must still be a member of the
+    // community advertised in the invite. This guards against the
+    // case where someone forwards an old invite after the sender
+    // was revoked.
+    let client = require_client()?;
+    let rt = runtime()?;
+    let members = rt.block_on(client.get_members(&card.community_id))?;
+    if !members.iter().any(|m| m.peer_id == card.owner_peer_id) {
+        return Err(KChatDesktopBridgeError::Attestation(format!(
+            "invite owner {} is not (or no longer) a member of community {}",
+            card.owner_peer_id, card.community_id,
+        )));
+    }
+
+    // Dial through the regular session_join path. We don't pass an
+    // explicit cert fingerprint -- the bridge expects it as a
+    // separate argument to enforce binding at the QUIC handshake.
+    crate::collab::session_join(
+        &card.owner_peer_id,
+        &card.owner_public_key,
+        &card.owner_display_name,
+        &card.owner_socket_addr,
+        &card.cert_fingerprint,
+    )
+    .map_err(|e| KChatDesktopBridgeError::Attestation(e.to_string()))?;
+
+    Ok(KChatAcceptedInvite {
+        project_id: card.project_id,
+        project_name: card.project_name,
+        owner_peer_id: card.owner_peer_id,
+        owner_display_name: card.owner_display_name,
+        community_id: card.community_id,
+        conversation_id: card.conversation_id,
+    })
+}
+
+/// Wire-format DTO for [`kchat_desktop_sync_community_roster`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KChatRosterSyncResult {
+    /// How many members KChat Desktop reported for the community on
+    /// this tick. Useful for the audit trail (Phase 7 Task 20).
+    pub polled_members: usize,
+    /// Peer ids the bridge evicted from the session because they
+    /// were no longer in the roster. Empty when no eviction was
+    /// necessary.
+    pub kicked: Vec<String>,
+}
+
+/// Wire-format DTO returned by [`kchat_desktop_accept_invite`] on
+/// the happy path.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KChatAcceptedInvite {
+    pub project_id: uuid::Uuid,
+    pub project_name: String,
+    pub owner_peer_id: String,
+    pub owner_display_name: String,
+    pub community_id: String,
+    pub conversation_id: String,
 }
 
 /// Snapshot the active KChat Desktop authority. Used by Block B's

@@ -54,6 +54,33 @@ impl std::fmt::Display for PeerId {
     }
 }
 
+impl std::str::FromStr for PeerId {
+    type Err = crate::CollabError;
+
+    /// Parse a peer id from its base64url-no-pad rendering (the
+    /// exact wire format produced by [`PeerId::as_str`]). Used by
+    /// the bridge layer when the renderer hands a peer id back
+    /// across the IPC boundary as an opaque string -- e.g.
+    /// `session_kick_peer(peer_id)` or
+    /// `session_set_peer_permission(peer_id, perm)`.
+    ///
+    /// Validates that the input decodes to exactly
+    /// [`PEER_ID_BYTES`] bytes so a typo can't spoof a different
+    /// peer id by accident.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let raw = URL_SAFE_NO_PAD
+            .decode(s.as_bytes())
+            .map_err(|e| crate::CollabError::InvalidEncoding(format!("peerId base64: {e}")))?;
+        if raw.len() != PEER_ID_BYTES {
+            return Err(crate::CollabError::InvalidEncoding(format!(
+                "peerId is {} bytes after base64 decode, expected {PEER_ID_BYTES}",
+                raw.len()
+            )));
+        }
+        Ok(Self(s.to_string()))
+    }
+}
+
 /// Long-form, human-presentable rendering of a peer's public key.
 /// Designed to be displayed in the trust UI alongside the display
 /// name, in groups of four uppercase hex digits separated by spaces,

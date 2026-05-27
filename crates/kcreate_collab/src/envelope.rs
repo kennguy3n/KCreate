@@ -211,6 +211,13 @@ pub enum CollabError {
     Encode(String),
     #[error(transparent)]
     PeerKey(#[from] PeerKeyError),
+    /// Phase 7 (Task 8): a base64-encoded peer id, public key, or
+    /// nonce supplied across the bridge boundary failed to decode
+    /// to the expected byte length. Used by the [`PeerId::from_str`]
+    /// impl so the bridge can surface a typed error instead of a
+    /// generic `String` parse failure.
+    #[error("invalid encoding: {0}")]
+    InvalidEncoding(String),
 }
 
 #[cfg(test)]

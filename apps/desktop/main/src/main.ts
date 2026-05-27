@@ -2250,12 +2250,17 @@ function registerIpcHandlers(): void {
       displayName: string,
       projectId: string,
       advertiseMdns: boolean,
+      // Phase 7 (Task 7): optional community gate. Defaults to
+      // `null` so legacy renderer callers that don't pass the
+      // argument still work unchanged.
+      communityId: string | null = null,
     ) => {
       const report = requireBridge().sessionStart(
         seedB64,
         displayName,
         projectId,
         advertiseMdns,
+        communityId,
       );
       startSessionEventTick();
       return report;
@@ -2506,6 +2511,47 @@ function registerIpcHandlers(): void {
           i: string,
         ) => string
       )(conversationId, inviteJson),
+  );
+
+  // Phase 7 (Task 10): accept invite.
+  ipcMain.handle(
+    "kcreate/kchat-desktop/accept-invite",
+    (_e, inviteJson: string) =>
+      (
+        requireKChatDesktop("kchatDesktopAcceptInvite") as (
+          j: string,
+        ) => string
+      )(inviteJson),
+  );
+
+  // Phase 7 (Task 8): roster-sync tick.
+  ipcMain.handle(
+    "kcreate/kchat-desktop/sync-community-roster",
+    (_e, communityId: string) =>
+      (
+        requireKChatDesktop("kchatDesktopSyncCommunityRoster") as (
+          c: string,
+        ) => string
+      )(communityId),
+  );
+
+  // Phase 7 (Task 8): kick a connected peer.
+  ipcMain.handle(
+    "kcreate/session/kick-peer",
+    (_e, peerId: string, reason: string) =>
+      requireBridge().sessionKickPeer(peerId, reason),
+  );
+
+  // Phase 7 (Task 11): set peer permission.
+  ipcMain.handle(
+    "kcreate/session/set-peer-permission",
+    (_e, peerId: string, permission: string) =>
+      requireBridge().sessionSetPeerPermission(peerId, permission),
+  );
+
+  // Phase 7 (Task 11): local permission snapshot.
+  ipcMain.handle("kcreate/session/local-permission", () =>
+    requireBridge().sessionLocalPermission(),
   );
 }
 

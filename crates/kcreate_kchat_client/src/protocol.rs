@@ -195,6 +195,21 @@ pub enum KChatRole {
     Member,
 }
 
+impl KChatRole {
+    /// Lowercase string form matching the serde serialization. Used
+    /// by the bridge to map roles through
+    /// [`CollabPermission::from_role`](crate::CollabPermission) on
+    /// the `collab` side.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Owner => "owner",
+            Self::Admin => "admin",
+            Self::Member => "member",
+        }
+    }
+}
+
 /// `kchat.communities.getMembers` params.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -321,6 +336,14 @@ pub struct PostMessageResult {
 /// uney-chat-desktop renders these as rich cards via the extension
 /// platform's content-renderer registry.
 pub const INVITE_CONTENT_TYPE: &str = "kcreate.invite.v1";
+
+/// Schema version stamped into [`InviteCardPayload::schema_version`]
+/// when minting a fresh invite. The bridge rejects accept-invite
+/// calls whose payload declares a different version so a future
+/// schema bump (e.g. adding `mls_group_epoch` or `expires_at`)
+/// can't be silently consumed by an older binary that would skip
+/// the new fields.
+pub const INVITE_SCHEMA_VERSION: u32 = 1;
 
 /// Schema for the KCreate document-share invite payload. The same
 /// JSON shape is consumed by the renderer's `InvitePanel.tsx`

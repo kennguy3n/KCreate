@@ -2903,10 +2903,18 @@ pub fn session_start(
     display_name: String,
     project_id: String,
     advertise_mdns: bool,
+    // Phase 7 (Task 7): optional KChat community id to bind the
+    // session to. When set, mDNS discovery filters peers by
+    // community so two KCreate instances on the same LAN that
+    // belong to different KChat communities don't auto-connect.
+    // Must match the currently-installed KChat membership's
+    // group id; mismatches return `SessionBridgeError::InvalidArgument`.
+    community_id: Option<String>,
 ) -> NapiResult<String> {
     let pid = parse_uuid(&project_id)?;
-    let report = crate::collab::session_start(&seed_b64, &display_name, pid, advertise_mdns)
-        .map_err(map_session_err)?;
+    let report =
+        crate::collab::session_start(&seed_b64, &display_name, pid, advertise_mdns, community_id)
+            .map_err(map_session_err)?;
     serde_json::to_string(&report).map_err(|e| {
         NapiError::new(
             Status::GenericFailure,
@@ -3400,6 +3408,69 @@ pub fn kchat_desktop_share_to_conversation(
             .map_err(map_kchat_desktop_err)?;
     serde_json::to_string(&result)
         .map_err(|e| NapiError::from_reason(format!("kchat_desktop_share_to_conversation: {e}")))
+}
+
+/// Phase 7 (Task 10): accept a share-document invite received via
+/// KChat Desktop. `invite_json` is the raw JSON card from the
+/// conversation message. Validates community match + sender
+/// membership, then dials the owner via `session_join`.
+#[cfg(feature = "kchat-desktop")]
+#[napi]
+pub fn kchat_desktop_accept_invite(invite_json: String) -> NapiResult<String> {
+    let result = crate::kchat_desktop::kchat_desktop_accept_invite(&invite_json)
+        .map_err(map_kchat_desktop_err)?;
+    serde_json::to_string(&result)
+        .map_err(|e| NapiError::from_reason(format!("kchat_desktop_accept_invite: {e}")))
+}
+
+/// Phase 7 (Task 8): tick the roster-sync poller. Reads the current
+/// community members from KChat Desktop, reconciles against the
+/// active collab session (kicks revoked peers, refreshes role ->
+/// permission mappings), and returns a summary.
+#[cfg(feature = "kchat-desktop")]
+#[napi]
+pub fn kchat_desktop_sync_community_roster(community_id: String) -> NapiResult<String> {
+    let result = crate::kchat_desktop::kchat_desktop_sync_community_roster(&community_id)
+        .map_err(map_kchat_desktop_err)?;
+    serde_json::to_string(&result)
+        .map_err(|e| NapiError::from_reason(format!("kchat_desktop_sync_community_roster: {e}")))
+}
+
+/// Phase 7 (Task 11): set a connected peer's collaboration
+/// permission. Exposed so the host admin can downgrade a member
+/// to Viewer from the renderer's presence panel context menu.
+#[cfg(feature = "collab")]
+#[napi]
+pub fn session_set_peer_permission(peer_id: String, permission: String) -> NapiResult<()> {
+    let perm = match permission.as_str() {
+        "editor" => crate::collab::CollabPermission::Editor,
+        "viewer" => crate::collab::CollabPermission::Viewer,
+        _ => {
+            return Err(NapiError::new(
+                Status::InvalidArg,
+                format!("unknown permission: {permission}; expected \"editor\" or \"viewer\""),
+            ))
+        }
+    };
+    crate::collab::session_set_peer_permission(&peer_id, perm).map_err(map_session_err)
+}
+
+/// Phase 7 (Task 11): snapshot of the local peer's permission.
+#[cfg(feature = "collab")]
+#[napi]
+pub fn session_local_permission() -> String {
+    match crate::collab::session_local_permission() {
+        crate::collab::CollabPermission::Editor => "editor".to_string(),
+        crate::collab::CollabPermission::Viewer => "viewer".to_string(),
+    }
+}
+
+/// Phase 7 (Task 8): kick a connected peer. Used by the admin
+/// context menu in the presence panel.
+#[cfg(feature = "collab")]
+#[napi]
+pub fn session_kick_peer(peer_id: String, reason: String) -> NapiResult<()> {
+    crate::collab::session_kick_peer(&peer_id, &reason).map_err(map_session_err)
 }
 
 /// Capability probe — `true` when the bridge was compiled with the

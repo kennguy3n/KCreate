@@ -210,7 +210,7 @@ async fn notifications_are_forwarded_to_subscribers() {
         .expect("event arrived")
         .expect("not lagged");
     assert_eq!(event.community_id, "comm-test");
-    matches!(event.event, CommunityEventKind::MemberLeft { .. });
+    assert!(matches!(event.event, CommunityEventKind::MemberLeft { .. }));
     handle.shutdown().await;
 }
 
@@ -234,5 +234,5 @@ async fn call_returns_timeout_when_server_silent() {
     )
     .await
     .expect("client returned");
-    matches!(res, Err(crate::ClientError::Timeout(_)));
+    assert!(matches!(res, Err(crate::ClientError::Timeout(_))));
 }

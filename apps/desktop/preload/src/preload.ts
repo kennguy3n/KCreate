@@ -171,6 +171,9 @@ import type {
   KChatMembershipStatus,
   KChatPostMessageResult,
   KChatShareInvite,
+  KChatAcceptedInvite,
+  KChatRosterSyncResult,
+  CollabPermission,
   SessionStartReport,
   TrustedIssuer,
   ClipboardBridge,
@@ -2105,6 +2108,9 @@ const session: SessionBridge = {
     displayName: string,
     projectId: string,
     advertiseMdns: boolean,
+    // Phase 7 (Task 7): optional community gate. `null` (or omitted)
+    // = no community scoping; matches pre-Phase-7 behaviour.
+    communityId: string | null = null,
   ): Promise<SessionStartReport> {
     const raw = (await ipcRenderer.invoke(
       "kcreate/session/start",
@@ -2112,6 +2118,7 @@ const session: SessionBridge = {
       displayName,
       projectId,
       advertiseMdns,
+      communityId,
     )) as string;
     return JSON.parse(raw) as SessionStartReport;
   },
@@ -2192,6 +2199,28 @@ const session: SessionBridge = {
     return () => {
       ipcRenderer.removeListener(channel, listener);
     };
+  },
+  async kickPeer(peerId: string, reason: string): Promise<void> {
+    await ipcRenderer.invoke(
+      "kcreate/session/kick-peer",
+      peerId,
+      reason,
+    );
+  },
+  async setPeerPermission(
+    peerId: string,
+    permission: CollabPermission,
+  ): Promise<void> {
+    await ipcRenderer.invoke(
+      "kcreate/session/set-peer-permission",
+      peerId,
+      permission,
+    );
+  },
+  async localPermission(): Promise<CollabPermission> {
+    return (await ipcRenderer.invoke(
+      "kcreate/session/local-permission",
+    )) as CollabPermission;
   },
 };
 
@@ -2343,6 +2372,22 @@ const kchatDesktop: KChatDesktopBridge = {
       JSON.stringify(invite),
     )) as string;
     return JSON.parse(raw) as KChatPostMessageResult;
+  },
+  async acceptInvite(inviteJson: string): Promise<KChatAcceptedInvite> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/kchat-desktop/accept-invite",
+      inviteJson,
+    )) as string;
+    return JSON.parse(raw) as KChatAcceptedInvite;
+  },
+  async syncCommunityRoster(
+    communityId: string,
+  ): Promise<KChatRosterSyncResult> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/kchat-desktop/sync-community-roster",
+      communityId,
+    )) as string;
+    return JSON.parse(raw) as KChatRosterSyncResult;
   },
 };
 

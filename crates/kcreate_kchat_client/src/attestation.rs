@@ -333,6 +333,6 @@ mod tests {
             signature: "z".into(),
         };
         let err = membership_from_attestation(att).unwrap_err();
-        matches!(err, ClientError::AttestationInvalid(_));
+        assert!(matches!(err, ClientError::AttestationInvalid(_)));
     }
 }

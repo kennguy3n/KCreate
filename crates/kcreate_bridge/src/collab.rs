@@ -37,11 +37,12 @@ use chrono::{DateTime, Utc};
 use ed25519_dalek::VerifyingKey;
 use kcreate_collab::message::Cursor;
 use kcreate_collab::{
-    no_kchat_authority, BoundKChatGroupAuthority, JournalEntry, KChatAuthError, KChatGroupId,
-    KChatMembership, LockClaimPayload, LockReleasePayload, MemoryJournalStore, Message,
-    OperationJournal, PeerId, PeerIdentity, PeerKey, PresencePayload, ResumeVector, SessionConfig,
-    SharedKChatAuthority,
+    no_kchat_authority, BoundKChatGroupAuthority, KChatAuthError, KChatGroupId, KChatMembership,
+    LockClaimPayload, LockReleasePayload, MemoryJournalStore, Message, OperationJournal, PeerId,
+    PeerIdentity, PeerKey, PresencePayload, SessionConfig, SharedKChatAuthority,
 };
+#[cfg(test)]
+use kcreate_collab::{JournalEntry, ResumeVector};
 use kcreate_collab_transport::{HostOptions, InboundEvent, LanCollabHost};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -199,6 +200,29 @@ pub enum SessionEvent {
         /// Base64url-encoded peer id of the session that just left.
         peer_id: String,
     },
+    /// Phase 7 (Task 8): a connected peer was evicted from the
+    /// session because their KChat community membership was
+    /// revoked. Emitted by the roster-sync poller; the underlying
+    /// QUIC connection is closed (with a directed `Goodbye(Kicked)`
+    /// so the kicked peer logs a clean shutdown) before this event
+    /// reaches the renderer. Carries a human-readable reason so
+    /// the UI can show a toast that distinguishes a kick from a
+    /// regular `PeerLeft`.
+    PeerKicked {
+        peer_id: String,
+        /// `revoked-from-community` for the standard membership-
+        /// revocation path; future kick paths (rate-limit, ACL,
+        /// etc.) can extend this without changing the variant.
+        reason: String,
+    },
+    /// Phase 7 (Task 11): a peer's collaboration permission changed
+    /// (e.g. the host downgraded a member to Viewer). The
+    /// renderer uses this to update toolbars / disable controls
+    /// for viewers.
+    PermissionChanged {
+        peer_id: String,
+        permission: CollabPermission,
+    },
 }
 
 impl From<&PresencePayload> for SessionPresence {
@@ -267,6 +291,22 @@ pub enum SessionBridgeError {
     /// their add/remove won't survive an app restart.
     #[error("KChat trust store I/O: {0}")]
     TrustStoreIo(String),
+    /// Phase 7 (Task 11): the local peer's collaboration permission
+    /// is `Viewer`, but the requested operation requires `Editor`
+    /// (e.g. `session_broadcast_operations`). Surfaced to the
+    /// renderer so it can show a "you're in read-only mode" hint
+    /// instead of a generic transport error.
+    #[error("local peer is in read-only mode: operation requires Editor permission")]
+    PermissionDenied,
+    /// Phase 7 (Task 10): the supplied share-document invite was
+    /// malformed JSON or carried fields that violate the schema
+    /// (e.g. a `communityId` that doesn't match the active
+    /// community gate, an expired issuance timestamp, a peer id
+    /// that doesn't BLAKE3-derive from the supplied public key,
+    /// etc.). Carries the specific reason so the renderer can show
+    /// a clear "this invite is invalid: …" error.
+    #[error("invite rejected: {0}")]
+    InviteRejected(String),
 }
 
 pub type Result<T> = std::result::Result<T, SessionBridgeError>;
@@ -320,6 +360,60 @@ struct SessionState {
     /// renderer disables controls for locked nodes but the
     /// protocol doesn't reject concurrent edits.
     locks: HashMap<Uuid, LockEntry>,
+    /// Phase 7 (Task 7+8): optional KChat community id this session
+    /// is bound to. Drives community-scoped mDNS filtering at the
+    /// transport layer and the roster-sync poller that fires
+    /// [`SessionEvent::PeerKicked`] when a community member is
+    /// revoked. `None` for sessions started via the legacy /
+    /// dev-mint flow without a community gate.
+    community_id: Option<String>,
+    /// Phase 7 (Task 11): per-peer role snapshot, derived from the
+    /// latest community-members poll. `member` (and any unknown
+    /// role) maps to [`CollabPermission::Editor`] by default; the
+    /// host can call [`session_set_peer_permission`] to downgrade
+    /// a specific peer to `Viewer`. Viewers receive operations but
+    /// the bridge silently drops outbound broadcasts when the
+    /// local peer is `Viewer`.
+    permissions: HashMap<PeerId, CollabPermission>,
+    /// Phase 7 (Task 11): the local peer's own permission for the
+    /// active community. Used by [`session_broadcast_operation`]
+    /// to enforce the read-only viewer contract. Defaults to
+    /// [`CollabPermission::Editor`] when the session is not
+    /// community-gated.
+    local_permission: CollabPermission,
+}
+
+/// Phase 7 (Task 11): collaboration permission for a peer. Derived
+/// from the peer's KChat community role: `owner` / `admin` =>
+/// [`Editor`](Self::Editor), `member` => [`Editor`](Self::Editor)
+/// unless the session host has explicitly downgraded them to
+/// [`Viewer`](Self::Viewer). Viewers receive operations but cannot
+/// broadcast.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CollabPermission {
+    /// Read-write — may broadcast `OperationBroadcast`, `LockClaim`,
+    /// and `LockRelease` messages.
+    Editor,
+    /// Read-only — receives operations / presence but the bridge
+    /// suppresses outbound broadcasts.
+    Viewer,
+}
+
+impl CollabPermission {
+    /// Map a KChat community role string to a default permission.
+    /// `owner` and `admin` are always editors; `member` is also an
+    /// editor by default (the host can downgrade individual members
+    /// via [`session_set_peer_permission`]). Unknown roles fail
+    /// closed to `Viewer` so a future role we don't know about
+    /// doesn't accidentally get write access.
+    #[must_use]
+    pub fn from_role(role: &str) -> Self {
+        match role {
+            "owner" | "admin" | "member" => Self::Editor,
+            _ => Self::Viewer,
+        }
+    }
 }
 
 /// Block 8: one entry in the advisory lock roster.
@@ -637,18 +731,15 @@ fn journal_inbound_broadcast(
                     highest = next_clock;
                 }
             }
-            Err(kcreate_collab::JournalError::Duplicate { .. })
-            | Err(kcreate_collab::JournalError::OutOfOrder { .. }) => {
-                // Expected for re-delivered or out-of-order
-                // batches; the wire monotonicity check above
-                // will let the next correctly-ordered batch
-                // through.
-            }
-            Err(kcreate_collab::JournalError::Backend(_)) => {
-                // The memory store can't produce a backend
-                // error today, but if a future swap to SQLite
-                // does, we degrade to ignoring the op rather
-                // than crashing the session.
+            Err(
+                kcreate_collab::JournalError::Duplicate { .. }
+                | kcreate_collab::JournalError::OutOfOrder { .. }
+                | kcreate_collab::JournalError::Backend(_),
+            ) => {
+                // Duplicate / OOO: expected for re-delivered
+                // batches. Backend: memory store can't produce
+                // this today, but degrade gracefully if a future
+                // SQLite swap does.
             }
         }
     }
@@ -817,6 +908,7 @@ pub fn session_start(
     display_name: &str,
     project_id: Uuid,
     advertise_mdns: bool,
+    community_id: Option<String>,
 ) -> Result<SessionStartReport> {
     let mut guard = slot().lock();
     if guard.is_some() {
@@ -827,6 +919,28 @@ pub fn session_start(
             field: "displayName",
             message: "must not be empty".into(),
         });
+    }
+    // Phase 7 (Task 7): when a community id is supplied, make sure
+    // it matches the membership that is currently installed. Two
+    // different communities can be active simultaneously in KChat
+    // Desktop, but only one collab gate is installed per process —
+    // refusing the mismatch up front is much friendlier than
+    // failing later inside `verify` with a generic group-mismatch
+    // error.
+    if let Some(want) = community_id.as_deref() {
+        let authority = kchat_authority_snapshot();
+        let membership = authority
+            .local_membership()
+            .ok_or(SessionBridgeError::NotInKChatGroup)?;
+        if membership.group_id().as_str() != want {
+            return Err(SessionBridgeError::InvalidArgument {
+                field: "communityId",
+                message: format!(
+                    "requested community {want} but the installed KChat membership is for {}",
+                    membership.group_id().as_str()
+                ),
+            });
+        }
     }
     let seed = decode_seed(seed_b64)?;
     let local_key = PeerKey::from_seed(seed);
@@ -871,6 +985,7 @@ pub fn session_start(
         advertise_addrs: None,
         session_config: SessionConfig::default(),
         kchat_authority: authority,
+        community_id: community_id.clone(),
     };
     let host = runtime
         .block_on(tokio::time::timeout(OP_TIMEOUT, LanCollabHost::start(opts)))
@@ -920,6 +1035,9 @@ pub fn session_start(
         journal,
         local_peer_id: local_peer_id.clone(),
         locks: HashMap::new(),
+        community_id,
+        permissions: HashMap::new(),
+        local_permission: CollabPermission::Editor,
     };
     // Surface the local-lifecycle transition on the same event
     // channel every other session signal flows through, so renderer
@@ -1170,7 +1288,7 @@ pub fn session_locks() -> Result<Vec<SessionLockEntry>> {
         })
         .collect();
     // Deterministic order so the renderer's diffing stays cheap.
-    rows.sort_by(|a, b| a.node_id.cmp(&b.node_id));
+    rows.sort_by_key(|r| r.node_id);
     Ok(rows)
 }
 
@@ -1190,7 +1308,7 @@ pub fn session_claim_locks(node_ids: Vec<Uuid>) -> Result<DateTime<Utc>> {
     let local = state.local_peer_id.clone();
     let payload = LockClaimPayload {
         project_id,
-        node_ids: node_ids.clone(),
+        node_ids,
         acquired_at,
     };
     // Update local roster + emit LocksChanged before fanning out
@@ -1278,6 +1396,260 @@ pub fn session_send_presence(
             kcreate_collab_transport::TransportError::Quic("broadcast_presence timed out".into()),
         )),
     }
+}
+
+/// Phase 7 (Task 11): broadcast the supplied local operations to
+/// every connected peer. Enforces the local peer's collaboration
+/// permission: a [`CollabPermission::Viewer`] returns
+/// [`SessionBridgeError::PermissionDenied`] without sending. Callers
+/// pass already-stamped operations (Lamport clock + author peer id)
+/// produced by [`session_record_local_operation`] so the journal
+/// stays the single source of truth for ordering.
+pub fn session_broadcast_operations(
+    operations: Vec<kcreate_core::operation::Operation>,
+) -> Result<()> {
+    require_active_kchat_membership()?;
+    if operations.is_empty() {
+        return Ok(());
+    }
+    let guard = slot().lock();
+    let state = guard.as_ref().ok_or(SessionBridgeError::NotRunning)?;
+    if state.local_permission == CollabPermission::Viewer {
+        return Err(SessionBridgeError::PermissionDenied);
+    }
+    let host = state.host.clone();
+    let runtime_handle = state.runtime.handle().clone();
+    let project_id = state.journal.project_id();
+    drop(guard);
+
+    let payload = kcreate_collab::OperationBroadcastPayload {
+        project_id,
+        operations,
+    };
+    let result = runtime_handle.block_on(async {
+        tokio::time::timeout(OP_TIMEOUT, host.broadcast_operations(payload)).await
+    });
+    match result {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(SessionBridgeError::Transport(e)),
+        Err(_) => Err(SessionBridgeError::Transport(
+            kcreate_collab_transport::TransportError::Quic("broadcast_operations timed out".into()),
+        )),
+    }
+}
+
+/// Phase 7 (Task 8): forcibly disconnect a connected peer. Used by
+/// the roster-sync poller when a peer's KChat community membership
+/// is revoked, and by the host UI when an admin wants to kick
+/// someone manually. Sends a directed `Goodbye(Kicked(reason))` so
+/// the kicked peer observes a clean shutdown, closes the underlying
+/// QUIC connection, releases any locks the kicked peer was holding,
+/// and emits [`SessionEvent::PeerKicked`] on the event queue.
+///
+/// Idempotent on unknown / already-disconnected peer ids.
+pub fn session_kick_peer(peer_id_b64: &str, reason: &str) -> Result<()> {
+    require_active_kchat_membership()?;
+    let target: PeerId = peer_id_b64
+        .parse()
+        .map_err(
+            |e: kcreate_collab::CollabError| SessionBridgeError::InvalidArgument {
+                field: "peerId",
+                message: e.to_string(),
+            },
+        )?;
+
+    let mut guard = slot().lock();
+    let state = guard.as_mut().ok_or(SessionBridgeError::NotRunning)?;
+    let host = state.host.clone();
+    let runtime_handle = state.runtime.handle().clone();
+    // Release any locks the kicked peer was holding so the UI
+    // un-greys those nodes for everyone else immediately. The
+    // transport's `disconnect_peer` already produces a `PeerLeft`
+    // event which the pump uses to clean up `state.locks`, but
+    // doing it synchronously here makes the `PeerKicked` event
+    // ordering deterministic (PeerKicked precedes the synthetic
+    // PeerLeft, never the other way round).
+    let released_nodes: Vec<Uuid> = state
+        .locks
+        .iter()
+        .filter_map(|(node_id, entry)| (entry.holder == target).then_some(*node_id))
+        .collect();
+    for node_id in &released_nodes {
+        state.locks.remove(node_id);
+    }
+    if !released_nodes.is_empty() {
+        push_event(
+            state,
+            SessionEvent::LocksChanged {
+                peer_id: target.as_str().to_string(),
+                node_ids: released_nodes,
+            },
+        );
+    }
+    state.permissions.remove(&target);
+    push_event(
+        state,
+        SessionEvent::PeerKicked {
+            peer_id: target.as_str().to_string(),
+            reason: reason.to_string(),
+        },
+    );
+    drop(guard);
+
+    let reason_payload = kcreate_collab::GoodbyeReason::Kicked(reason.to_string());
+    let target_for_async = target.clone();
+    let result = runtime_handle.block_on(async {
+        tokio::time::timeout(
+            OP_TIMEOUT,
+            host.disconnect_peer(&target_for_async, reason_payload),
+        )
+        .await
+    });
+    match result {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(SessionBridgeError::Transport(e)),
+        Err(_) => Err(SessionBridgeError::Transport(
+            kcreate_collab_transport::TransportError::Quic("disconnect_peer timed out".into()),
+        )),
+    }
+}
+
+/// Phase 7 (Task 11): set the collaboration permission for a
+/// connected peer. Used by the host to downgrade a community
+/// `member` to [`CollabPermission::Viewer`] (read-only) or
+/// restore them to [`CollabPermission::Editor`]. Owners and
+/// admins should remain editors; this entry point doesn't enforce
+/// that rule \u2014 the renderer is expected to disable the UI for
+/// privileged roles, and the bridge only enforces *outbound*
+/// broadcasts against the *local* permission. Emits a
+/// [`SessionEvent::PermissionChanged`].
+pub fn session_set_peer_permission(peer_id_b64: &str, permission: CollabPermission) -> Result<()> {
+    require_active_kchat_membership()?;
+    let target: PeerId = peer_id_b64
+        .parse()
+        .map_err(
+            |e: kcreate_collab::CollabError| SessionBridgeError::InvalidArgument {
+                field: "peerId",
+                message: e.to_string(),
+            },
+        )?;
+    let mut guard = slot().lock();
+    let state = guard.as_mut().ok_or(SessionBridgeError::NotRunning)?;
+    state.permissions.insert(target.clone(), permission);
+    push_event(
+        state,
+        SessionEvent::PermissionChanged {
+            peer_id: target.as_str().to_string(),
+            permission,
+        },
+    );
+    Ok(())
+}
+
+/// Phase 7 (Task 11): set the *local* peer's permission. Called by
+/// the roster-sync poller after a [`get_community_members`] result
+/// surfaces the local role. Does NOT emit `PermissionChanged` for
+/// the local id \u2014 the renderer reads this via
+/// [`session_local_permission`].
+pub fn session_set_local_permission(permission: CollabPermission) -> Result<()> {
+    let mut guard = slot().lock();
+    let state = guard.as_mut().ok_or(SessionBridgeError::NotRunning)?;
+    state.local_permission = permission;
+    Ok(())
+}
+
+/// Phase 7 (Task 11): snapshot of the local peer's collaboration
+/// permission. Defaults to [`CollabPermission::Editor`].
+#[must_use]
+pub fn session_local_permission() -> CollabPermission {
+    let guard = slot().lock();
+    guard
+        .as_ref()
+        .map_or(CollabPermission::Editor, |s| s.local_permission)
+}
+
+/// Phase 7 (Task 11): snapshot of every known peer permission. Used
+/// by the presence panel to render \"viewer\" / \"editor\" badges.
+pub fn session_peer_permissions() -> Vec<(String, CollabPermission)> {
+    let guard = slot().lock();
+    let Some(state) = guard.as_ref() else {
+        return Vec::new();
+    };
+    state
+        .permissions
+        .iter()
+        .map(|(pid, perm)| (pid.as_str().to_string(), *perm))
+        .collect()
+}
+
+/// Phase 7 (Task 7+8): snapshot of the active KChat community id.
+/// `None` when the session was started without a community gate.
+#[must_use]
+pub fn session_community_id() -> Option<String> {
+    let guard = slot().lock();
+    guard.as_ref().and_then(|s| s.community_id.clone())
+}
+
+/// Phase 7 (Task 8): apply a fresh community-members snapshot. For
+/// every currently-connected peer NOT in the supplied roster, emit
+/// a `PeerKicked` event and tear down their QUIC connection (via
+/// `disconnect_peer`). For peers that ARE in the roster, refresh
+/// their permission from the role string. Returns the list of
+/// peer ids that were evicted so the caller can log / surface them.
+pub fn session_apply_community_roster(members: &[(String, String)]) -> Result<Vec<String>> {
+    require_active_kchat_membership()?;
+    let known: std::collections::HashSet<String> =
+        members.iter().map(|(pid, _)| pid.clone()).collect();
+    let connected: Vec<PeerId> = {
+        let guard = slot().lock();
+        let state = guard.as_ref().ok_or(SessionBridgeError::NotRunning)?;
+        state.host.connected_peer_ids()
+    };
+
+    // Refresh permissions for connected peers that are still in
+    // the community.
+    {
+        let mut guard = slot().lock();
+        let state = guard.as_mut().ok_or(SessionBridgeError::NotRunning)?;
+        let local_peer = state.local_peer_id.as_str().to_string();
+        for (pid_b64, role) in members {
+            let perm = CollabPermission::from_role(role);
+            if *pid_b64 == local_peer {
+                if state.local_permission != perm {
+                    state.local_permission = perm;
+                }
+                continue;
+            }
+            if let Ok(pid) = pid_b64.parse::<PeerId>() {
+                let changed = state.permissions.insert(pid.clone(), perm) != Some(perm);
+                if changed {
+                    push_event(
+                        state,
+                        SessionEvent::PermissionChanged {
+                            peer_id: pid_b64.clone(),
+                            permission: perm,
+                        },
+                    );
+                }
+            }
+        }
+    }
+
+    let to_kick: Vec<PeerId> = connected
+        .into_iter()
+        .filter(|pid| !known.contains(pid.as_str()))
+        .collect();
+
+    let mut kicked = Vec::with_capacity(to_kick.len());
+    for pid in to_kick {
+        let pid_b64 = pid.as_str().to_string();
+        if let Err(e) = session_kick_peer(&pid_b64, "revoked-from-community") {
+            log::warn!("session_apply_community_roster: failed to kick {pid_b64}: {e}");
+            continue;
+        }
+        kicked.push(pid_b64);
+    }
+    Ok(kicked)
 }
 
 /// Lightweight introspection for `session_info` (used by the
@@ -1433,7 +1805,9 @@ impl From<SessionBridgeError> for DocumentBridgeError {
             | SessionBridgeError::InvalidArgument { .. }
             | SessionBridgeError::NotInKChatGroup
             | SessionBridgeError::KChatDevIssuerDisabled
-            | SessionBridgeError::IssuerNotTrusted { .. } => Self::InvalidArgument {
+            | SessionBridgeError::IssuerNotTrusted { .. }
+            | SessionBridgeError::PermissionDenied
+            | SessionBridgeError::InviteRejected(_) => Self::InvalidArgument {
                 argument: "session".to_string(),
                 value: e.to_string(),
             },
@@ -1681,10 +2055,10 @@ fn write_trust_store_file(path: &Path, store: &TrustStore) -> Result<()> {
         }
     }
     let mut tmp = path.to_path_buf();
-    let file_name = path
-        .file_name()
-        .map(|s| s.to_os_string())
-        .unwrap_or_else(|| std::ffi::OsString::from("kchat_trust.json"));
+    let file_name = match path.file_name() {
+        Some(s) => s.to_os_string(),
+        None => std::ffi::OsString::from("kchat_trust.json"),
+    };
     let mut tmp_name = file_name;
     tmp_name.push(".tmp");
     tmp.set_file_name(tmp_name);
@@ -1777,15 +2151,18 @@ pub fn kchat_add_trusted_issuer(input: TrustedIssuer) -> Result<Vec<TrustedIssue
             .iter_mut()
             .find(|i| i.issuer_public_key == entry.issuer_public_key)
         {
-            existing.label = entry.label.clone();
+            existing.label.clone_from(&entry.label);
             existing.added_at = entry.added_at;
         } else {
             guard.issuers.push(entry);
         }
         guard.clone()
     };
-    if let Some(path) = trust_store_path_slot().lock().clone() {
-        write_trust_store_file(&path, &snapshot)?;
+    {
+        let path_guard = trust_store_path_slot().lock();
+        if let Some(path) = path_guard.as_ref() {
+            write_trust_store_file(path, &snapshot)?;
+        }
     }
     Ok(snapshot.issuers)
 }
@@ -1802,8 +2179,11 @@ pub fn kchat_remove_trusted_issuer(issuer_public_key: &str) -> Result<Vec<Truste
         guard.issuers.retain(|i| i.issuer_public_key != key);
         guard.clone()
     };
-    if let Some(path) = trust_store_path_slot().lock().clone() {
-        write_trust_store_file(&path, &snapshot)?;
+    {
+        let path_guard = trust_store_path_slot().lock();
+        if let Some(path) = path_guard.as_ref() {
+            write_trust_store_file(path, &snapshot)?;
+        }
     }
     Ok(snapshot.issuers)
 }
@@ -2260,7 +2640,7 @@ mod tests {
         let membership = KChatMembership::issue(
             KChatGroupId::new(group).unwrap(),
             local_identity.peer_id.clone(),
-            local_identity.public_key.clone(),
+            local_identity.public_key,
             issued,
             expires,
             &issuer,
@@ -2294,7 +2674,7 @@ mod tests {
         reset_kchat_slot();
         let _ = session_leave();
         let seed_b64 = URL_SAFE_NO_PAD.encode([7u8; 32]);
-        let err = session_start(&seed_b64, "ken", Uuid::new_v4(), false).unwrap_err();
+        let err = session_start(&seed_b64, "ken", Uuid::new_v4(), false, None).unwrap_err();
         assert!(
             matches!(err, SessionBridgeError::NotInKChatGroup),
             "expected NotInKChatGroup, got {err:?}"
@@ -2409,7 +2789,7 @@ mod tests {
         // was minted for. Even though the slot is "unlocked" by the
         // status reporter, session_start re-verifies and bounces.
         let other_seed_b64 = URL_SAFE_NO_PAD.encode([13u8; 32]);
-        let err = session_start(&other_seed_b64, "ken", Uuid::new_v4(), false).unwrap_err();
+        let err = session_start(&other_seed_b64, "ken", Uuid::new_v4(), false, None).unwrap_err();
         assert!(
             matches!(err, SessionBridgeError::NotInKChatGroup),
             "expected NotInKChatGroup, got {err:?}"
@@ -2613,7 +2993,7 @@ mod tests {
         })
         .unwrap();
         let updated = kchat_add_trusted_issuer(TrustedIssuer {
-            issuer_public_key: pk.clone(),
+            issuer_public_key: pk,
             label: "New Label".into(),
             added_at: Utc::now(),
         })
@@ -2667,7 +3047,7 @@ mod tests {
         // Label too long.
         let long = "x".repeat(TRUSTED_ISSUER_LABEL_CAP + 1);
         let err = kchat_add_trusted_issuer(TrustedIssuer {
-            issuer_public_key: pk.clone(),
+            issuer_public_key: pk,
             label: long,
             added_at: Utc::now(),
         })
@@ -2715,7 +3095,7 @@ mod tests {
         // then re-set the path. The list must reload from disk.
         *trust_store_slot().lock() = TrustStore::default();
         *trust_store_path_slot().lock() = None;
-        let reloaded = kchat_set_trust_store_path(path.clone()).unwrap();
+        let reloaded = kchat_set_trust_store_path(path).unwrap();
         assert_eq!(reloaded.len(), 1, "reload must restore the issuer");
         assert_eq!(reloaded[0].issuer_public_key, pk);
         assert_eq!(reloaded[0].label, "Persisted Studio");
@@ -2745,7 +3125,7 @@ mod tests {
         let padding_needed = (4 - (unpadded.len() % 4)) % 4;
         let padded = format!("{}{}", unpadded, "=".repeat(padding_needed));
         let listed = kchat_add_trusted_issuer(TrustedIssuer {
-            issuer_public_key: padded.clone(),
+            issuer_public_key: padded,
             label: "User-pasted Padded".into(),
             added_at: Utc::now(),
         })
@@ -2816,7 +3196,7 @@ mod tests {
             .append(
                 remote.clone(),
                 kcreate_collab::LamportClock::from_raw(next_clock),
-                op.clone(),
+                op,
             )
             .unwrap();
         let summary = journal.resume_vector();
@@ -2882,9 +3262,9 @@ mod tests {
             .unwrap();
         let dup_err = journal
             .append(
-                remote.clone(),
+                remote,
                 kcreate_collab::LamportClock::from_raw(1),
-                op.clone(),
+                op,
             )
             .unwrap_err();
         assert!(matches!(
@@ -3156,7 +3536,7 @@ mod tests {
         };
         let j = serde_json::to_value(SessionEvent::PresenceUpdated {
             peer_id: "p".into(),
-            presence: presence.clone(),
+            presence,
         })
         .unwrap();
         assert_eq!(j["kind"], "presenceUpdated");

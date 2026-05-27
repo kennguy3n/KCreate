@@ -1759,9 +1759,15 @@ function registerIpcHandlers(): void {
   );
   // `kcreate/figma/pickFile` mirrors the PDF picker exactly: keep
   // the OS dialog in the main process so the renderer never sees
-  // the filesystem. Figma exports come in two shapes (the REST API
-  // dump `.json` and the official `figma export-json` plugin's
-  // `.fig.json`) so we accept both extensions.
+  // the filesystem. The Rust side (`crates/kcreate_export/src/
+  // figma_import.rs`) only understands UTF-8 JSON, so the filter is
+  // scoped to `.json`. Figma exports come in two shapes (the REST
+  // API dump `.json` and the official `figma export-json` plugin's
+  // `.fig.json`) — both are matched by the single `.json`
+  // extension entry. The legacy `.fig` binary container is
+  // *not* a JSON export and would deterministically fail
+  // `serde_json::from_slice` in the importer, so including it in
+  // the filter only misleads users about what's supported.
   ipcMain.handle("kcreate/figma/pickFile", async () => {
     const win = mainWindow;
     if (!win) return null;
@@ -1769,7 +1775,7 @@ function registerIpcHandlers(): void {
       title: "Import Figma JSON",
       properties: ["openFile"],
       filters: [
-        { name: "Figma JSON", extensions: ["json", "fig"] },
+        { name: "Figma JSON (*.json, *.fig.json)", extensions: ["json"] },
         { name: "All files", extensions: ["*"] },
       ],
     });

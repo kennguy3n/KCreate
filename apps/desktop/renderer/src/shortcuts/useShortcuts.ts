@@ -17,9 +17,36 @@ import {
   shortcutSubscribe,
 } from "./registry";
 
-export type ShortcutHandlers = Partial<
-  Record<ActionId, (event: KeyboardEvent) => void>
->;
+/// One bound handler. Most actions are one-shots — a single
+/// function fired on keydown. Hold-style actions (currently just
+/// `togglePan`) need to observe key release as well, so they pass
+/// an object whose `onKeyDown` / `onKeyUp` are dispatched on the
+/// matching DOM event. Either field may be omitted; an object
+/// with only `onKeyUp` is valid (rare, but useful for actions that
+/// arm on press elsewhere and disarm on release).
+export type ShortcutHandler =
+  | ((event: KeyboardEvent) => void)
+  | {
+      readonly onKeyDown?: (event: KeyboardEvent) => void;
+      readonly onKeyUp?: (event: KeyboardEvent) => void;
+    };
+
+export type ShortcutHandlers = Partial<Record<ActionId, ShortcutHandler>>;
+
+function resolveHandler(
+  handler: ShortcutHandler | undefined,
+  phase: "down" | "up",
+): ((event: KeyboardEvent) => void) | null {
+  if (!handler) return null;
+  if (typeof handler === "function") {
+    // Bare functions are keydown-only — they exist to preserve the
+    // pre-hold-style handler shape every action used before
+    // togglePan was wired. Returning `null` on keyup keeps the
+    // listener short-circuit cheap.
+    return phase === "down" ? handler : null;
+  }
+  return phase === "down" ? handler.onKeyDown ?? null : handler.onKeyUp ?? null;
+}
 
 /// Subscribe to the live snapshot of bindings. Use this in the
 /// shortcut panel and anywhere you need to render bindings live.
@@ -63,13 +90,20 @@ export function useShortcuts(
   const bindings = useShortcutBindings();
 
   useEffect(() => {
-    const onKeyDown = (event: KeyboardEvent): void => {
+    const dispatch = (event: KeyboardEvent, phase: "down" | "up"): void => {
       if (!enabled) return;
 
       // Skip when the user is typing in a form field. Otherwise
       // pressing "R" inside a name input would silently switch
       // tools. We deliberately keep this check inside the
       // listener so a freshly-focused input is honoured immediately.
+      //
+      // The form-field gate must apply to both phases — if it
+      // didn't, releasing Space inside a text input would still
+      // fire `togglePan.onKeyUp` and disarm the gesture even though
+      // the matching keydown was skipped. Keeping it symmetric
+      // preserves the "shortcuts never interfere with typing"
+      // contract on both sides of the gesture.
       const target = event.target as HTMLElement | null;
       const tag = target?.tagName?.toLowerCase();
       const isEditable =
@@ -88,13 +122,19 @@ export function useShortcuts(
         const binding = bindings[id];
         if (!binding) continue;
         if (!matchesBinding(event, binding)) continue;
-        const handler = handlers[id];
-        if (!handler) continue;
-        handler(event);
+        const fn = resolveHandler(handlers[id], phase);
+        if (!fn) continue;
+        fn(event);
         return;
       }
     };
+    const onKeyDown = (event: KeyboardEvent): void => dispatch(event, "down");
+    const onKeyUp = (event: KeyboardEvent): void => dispatch(event, "up");
     window.addEventListener("keydown", onKeyDown);
-    return () => window.removeEventListener("keydown", onKeyDown);
+    window.addEventListener("keyup", onKeyUp);
+    return () => {
+      window.removeEventListener("keydown", onKeyDown);
+      window.removeEventListener("keyup", onKeyUp);
+    };
   }, [handlers, bindings, enabled]);
 }

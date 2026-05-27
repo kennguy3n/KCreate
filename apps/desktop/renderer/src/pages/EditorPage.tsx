@@ -127,6 +127,19 @@ export function EditorPage({
   // projects within one session re-prompts.
   const [templatePickerOpen, setTemplatePickerOpen] = useState<boolean>(false);
   const [shortcutsPanelOpen, setShortcutsPanelOpen] = useState<boolean>(false);
+  // Phase 6 Task 21-22: hold-to-pan state. `panActive` is true while
+  // the user is holding the bound Space key. We use a state (not just
+  // a ref) so the canvas cursor flips to `grab`/`grabbing` while the
+  // gesture is armed, and we mirror it into `panActiveRef` so the
+  // pointer handler (whose closure is stable across re-renders) can
+  // observe the latest value without depending on it. The keydown
+  // dispatch is gated on `event.repeat` so OS auto-repeat doesn't
+  // re-arm the gesture every frame.
+  const [panActive, setPanActive] = useState<boolean>(false);
+  const panActiveRef = useRef<boolean>(false);
+  useEffect(() => {
+    panActiveRef.current = panActive;
+  }, [panActive]);
   const [layoutPickerShownFor, setLayoutPickerShownFor] = useState<string | null>(
     null,
   );
@@ -135,10 +148,18 @@ export function EditorPage({
     null,
   );
   const lastTickAtRef = useRef<number>(performance.now());
-  // Drag-to-create / drag-to-move state. Storing in a ref keeps the
-  // pointer handler stable while still tracking the current drag.
+  // Drag-to-create / drag-to-move / hold-to-pan state. Storing in a
+  // ref keeps the pointer handler stable while still tracking the
+  // current drag. The `"pan"` kind reuses the same record because
+  // the pointer state-machine (pointerdown / pointermove / pointerup
+  // routing) is identical — only the per-move side effect differs
+  // (translate viewport vs. translate selected node vs. accumulate
+  // creation rect). `lastWorldX`/`lastWorldY` carry *screen* pixels
+  // for pan drags (not world coords) so we can compute panX/panY
+  // deltas without round-tripping through the inverse viewport
+  // transform on every frame.
   const dragStateRef = useRef<{
-    kind: "create" | "move";
+    kind: "create" | "move" | "pan";
     tool: ToolId;
     pointerId: number;
     startWorldX: number;
@@ -1135,6 +1156,14 @@ export function EditorPage({
         e.preventDefault();
         void handleDeleteSelected();
       },
+      // macOS regression fix: Backspace is the physical "delete"
+      // key on Apple keyboards. We dispatch through the same
+      // handler so a future change to deletion semantics only has
+      // one call site to update.
+      deleteSelectionAlt: (e) => {
+        e.preventDefault();
+        void handleDeleteSelected();
+      },
       clearSelection: (e) => {
         e.preventDefault();
         void handleClearSelection();
@@ -1144,6 +1173,33 @@ export function EditorPage({
       toolEllipse: (e) => tryTool("ellipse", e),
       toolLine: (e) => tryTool("line", e),
       toolText: (e) => tryTool("text", e),
+      // Hold-to-pan: object-form handler so `useShortcuts`
+      // dispatches both phases. `event.repeat` guards against OS
+      // auto-repeat re-arming the gesture every frame, and we
+      // preventDefault on keydown so Space doesn't scroll the page
+      // through any host-page handler that survived our event
+      // gating. Keyup unconditionally disarms — if a third party
+      // (e.g. losing window focus) leaves us armed, the next Space
+      // press will re-arm and the next release will clear it.
+      togglePan: {
+        onKeyDown: (e) => {
+          if (e.repeat) return;
+          e.preventDefault();
+          setPanActive(true);
+        },
+        onKeyUp: (e) => {
+          e.preventDefault();
+          setPanActive(false);
+        },
+      },
+      // Switching to Export mode swaps the right panel to the
+      // ExportPanel via `defaultPanelForMode` — that's the same
+      // surface the TopBar's "Export" mode tab opens, so the
+      // shortcut and the UI button stay lockstep.
+      openExport: (e) => {
+        e.preventDefault();
+        setMode("export");
+      },
       openShortcutsPanel: (e) => {
         e.preventDefault();
         setShortcutsPanelOpen((open) => !open);
@@ -1208,6 +1264,29 @@ export function EditorPage({
       const vp = viewport;
 
       if (e.type === "pointerdown") {
+        // Hold-to-pan beats every tool — if the user is holding the
+        // pan key, treat the drag as a viewport translation instead
+        // of hit-testing or creating geometry. We commit the
+        // viewport delta on every pointermove (no batching) because
+        // pan is a transient visual effect; there's no op-log
+        // entry, so we don't worry about coarsening like we do for
+        // node moves.
+        if (panActiveRef.current) {
+          canvasEl.setPointerCapture(pointerId);
+          dragStateRef.current = {
+            kind: "pan",
+            tool,
+            pointerId,
+            startWorldX: sx,
+            startWorldY: sy,
+            lastWorldX: sx,
+            lastWorldY: sy,
+            movingNodeId: null,
+            cumulativeDx: 0,
+            cumulativeDy: 0,
+          };
+          return;
+        }
         if (tool === "select") {
           // Click-to-select: hit-test, then either start a move drag or
           // clear selection. The bridge does the screen→world transform
@@ -1269,6 +1348,23 @@ export function EditorPage({
       if (e.type === "pointermove") {
         const drag = dragStateRef.current;
         if (!drag || drag.pointerId !== e.pointerId) return;
+        if (drag.kind === "pan") {
+          // Translate the viewport by the screen-space delta since
+          // the last sample. We work in screen pixels (not world
+          // units) on purpose: panning *is* the screen→world
+          // translation we'd otherwise compute, so re-deriving it
+          // would just be `delta_screen / zoom * zoom = delta_screen`.
+          const dx = sx - drag.lastWorldX;
+          const dy = sy - drag.lastWorldY;
+          drag.lastWorldX = sx;
+          drag.lastWorldY = sy;
+          setViewport((v) => ({
+            ...v,
+            panX: v.panX + dx,
+            panY: v.panY + dy,
+          }));
+          return;
+        }
         if (drag.kind === "move" && drag.movingNodeId) {
           const dx = wx - drag.lastWorldX;
           const dy = wy - drag.lastWorldY;
@@ -1339,6 +1435,13 @@ export function EditorPage({
         // Clear smart-guides — the drag is done, so any displayed
         // guide lines belong to a stale candidate position.
         setSnapGuides([]);
+        if (drag.kind === "pan") {
+          // Pan drags don't write to the op log or touch the
+          // document — there's nothing to commit on release. The
+          // viewport has already been mutated incrementally on each
+          // pointermove sample.
+          return;
+        }
         if (drag.kind === "move" && drag.movingNodeId) {
           if (drag.cumulativeDx !== 0 || drag.cumulativeDy !== 0) {
             void (async () => {
@@ -1445,7 +1548,17 @@ export function EditorPage({
   // Image mode focuses on AI Assist; Export mode focuses on Export
   // presets; everything else lands on the properties inspector.
   const rightPanelFocus = defaultPanelForMode(mode);
-  const cursor = TOOL_CURSORS[tool];
+  // Hold-to-pan flips the canvas cursor to `grab` while armed and
+  // `grabbing` while the pan drag is in flight. `grabbing` is keyed
+  // off the live drag-state ref (not panActive) so a release of the
+  // pointer button without releasing the key drops back to `grab`
+  // immediately. Falls back to the per-tool cursor when the gesture
+  // isn't armed.
+  const cursor = panActive
+    ? dragStateRef.current?.kind === "pan"
+      ? "grabbing"
+      : "grab"
+    : TOOL_CURSORS[tool];
 
   return (
     <div

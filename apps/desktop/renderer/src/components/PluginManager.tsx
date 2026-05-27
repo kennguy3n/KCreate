@@ -331,7 +331,7 @@ function TypePill({ type }: { type: PluginType }): JSX.Element {
     <span
       style={{
         padding: "1px 6px",
-        background: isWasm ? `${colors.accent}22` : colors.bgSoft,
+        background: isWasm ? colors.accentBgSoft : colors.bgSoft,
         color: isWasm ? colors.accent : colors.textMuted,
         borderRadius: radius.pill,
         fontSize: 10,

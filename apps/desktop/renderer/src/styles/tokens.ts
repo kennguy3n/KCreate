@@ -13,6 +13,19 @@
 export const colors = {
   accent: "var(--kc-accent)",
   accentHover: "var(--kc-accent-hover)",
+  /// Low-alpha accent tint for soft chip / pill backgrounds
+  /// (PluginManager WASM tag, ScreenshotToLayout drop zone). Use
+  /// this instead of template-string concat of `accent` + a hex
+  /// alpha suffix — `accent` is a `var(...)` reference, not a hex
+  /// literal, so `${colors.accent}22` produces invalid CSS at
+  /// runtime. The token carries the alpha baked into the channel
+  /// space so dark mode can re-balance the tint without touching
+  /// every call site.
+  accentBgSoft: "var(--kc-accent-bg-soft)",
+  /// Mid-alpha accent halo for focus rings / selection outlines
+  /// (TemplatePicker selected card). Same indirection rationale as
+  /// `accentBgSoft`.
+  accentRing: "var(--kc-accent-ring)",
   bg: "var(--kc-bg)",
   bgSoft: "var(--kc-bg-soft)",
   bgCanvas: "var(--kc-bg-canvas)",
@@ -34,6 +47,10 @@ export const colors = {
   /// dense panels (chip/badge backgrounds in PluginManager,
   /// ModelManager, AIAssistPanel).
   dangerBgSoft: "var(--kc-danger-bg-soft)",
+  /// Mid-alpha danger border for destructive callout cards
+  /// (McpSettingsPanel "MCP off" notice). Same indirection
+  /// rationale as `accentBgSoft`.
+  dangerBorder: "var(--kc-danger-border)",
   /// Warning accent (preflight warnings, plugin permission badges).
   warn: "var(--kc-warn)",
   warnBg: "var(--kc-warn-bg)",

@@ -32,6 +32,7 @@ export type ActionId =
   | "redoAlt"
   | "selectAll"
   | "deleteSelection"
+  | "deleteSelectionAlt"
   | "clearSelection"
   | "toolSelect"
   | "toolRect"
@@ -81,6 +82,18 @@ export const DEFAULT_BINDINGS: Record<ActionId, ShortcutBinding> = {
   redoAlt: { key: "y", mod: true, shift: false, alt: false },
   selectAll: { key: "a", mod: true, shift: false, alt: false },
   deleteSelection: { key: "Delete", mod: false, shift: false, alt: false },
+  // macOS regression fix: Apple keyboards send `Backspace` from the
+  // physical "delete" key, so a registry that bound only `Delete`
+  // silently broke deletion on every Mac. Same handler as
+  // `deleteSelection`, separate action so the panel can show /
+  // rebind it independently and the contract "one action = one
+  // binding" stays intact.
+  deleteSelectionAlt: {
+    key: "Backspace",
+    mod: false,
+    shift: false,
+    alt: false,
+  },
   clearSelection: { key: "Escape", mod: false, shift: false, alt: false },
   toolSelect: { key: "v", mod: false, shift: false, alt: false },
   toolRect: { key: "r", mod: false, shift: false, alt: false },
@@ -122,6 +135,12 @@ export const ACTION_META: Record<ActionId, ActionMeta> = {
     label: "Delete selection",
     category: "editing",
     description: "Remove the selected nodes.",
+  },
+  deleteSelectionAlt: {
+    label: "Delete selection (Backspace)",
+    category: "editing",
+    description:
+      "macOS-friendly alternative to Delete; runs the same handler as Delete selection.",
   },
   clearSelection: {
     label: "Clear selection",

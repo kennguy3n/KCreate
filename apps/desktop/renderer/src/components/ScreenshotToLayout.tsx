@@ -290,7 +290,7 @@ function TypePill({ type }: { type: ScreenshotElementType }): JSX.Element {
     <span
       style={{
         padding: "1px 6px",
-        background: `${colors.accent}22`,
+        background: colors.accentBgSoft,
         color: colors.accent,
         borderRadius: radius.pill,
         fontSize: 10,

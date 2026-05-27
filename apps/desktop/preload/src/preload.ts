@@ -109,6 +109,10 @@ import type {
   ModelPack,
   PdfImportBridge,
   PdfImportReport,
+  FigmaImportBridge,
+  FigmaImportReport,
+  SketchImportBridge,
+  SketchImportReport,
   JsPanelInfo,
   JsPanelMessage,
   JsPanelMessageOutcome,
@@ -1685,6 +1689,36 @@ const pdfImport: PdfImportBridge = {
   },
 };
 
+const figmaImport: FigmaImportBridge = {
+  async pickFile(): Promise<string | null> {
+    return (await ipcRenderer.invoke(
+      "kcreate/figma/pickFile",
+    )) as string | null;
+  },
+  async importFigma(filePath: string): Promise<FigmaImportReport> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/figma/import",
+      filePath,
+    )) as string;
+    return JSON.parse(raw) as FigmaImportReport;
+  },
+};
+
+const sketchImport: SketchImportBridge = {
+  async pickFile(): Promise<string | null> {
+    return (await ipcRenderer.invoke(
+      "kcreate/sketch/pickFile",
+    )) as string | null;
+  },
+  async importSketch(filePath: string): Promise<SketchImportReport> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/sketch/import",
+      filePath,
+    )) as string;
+    return JSON.parse(raw) as SketchImportReport;
+  },
+};
+
 const plugin: PluginBridge = {
   async list(): Promise<PluginListEntry[]> {
     const raw = (await ipcRenderer.invoke("kcreate/plugin/list")) as string;
@@ -2397,6 +2431,8 @@ contextBridge.exposeInMainWorld("kcreate", {
   batch,
   aiModel,
   pdfImport,
+  figmaImport,
+  sketchImport,
   plugin,
   mcpPermission,
   color,

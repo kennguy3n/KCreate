@@ -17,6 +17,7 @@
 pub mod batch;
 pub mod cmyk_dither;
 pub mod code_gen;
+pub mod figma_import;
 pub mod icon_pack;
 pub mod jpeg;
 pub mod kbrand;
@@ -26,6 +27,7 @@ pub mod pdf_shading;
 pub mod png;
 pub mod preflight;
 pub mod scene_metadata;
+pub mod sketch_import;
 pub mod slice;
 pub mod svg;
 pub mod webp;
@@ -33,6 +35,10 @@ pub mod webp;
 pub use batch::{run_batch, BatchExportError, BatchExportJob, BatchStatus, ExportItem};
 pub use cmyk_dither::{quantize_cmyk_image, CmykDither, CmykPixel};
 pub use code_gen::{inspect_node, node_to_css, node_to_react_style, node_to_tailwind, InspectCode};
+pub use figma_import::{
+    import_figma, parse_figma_value, FigmaImportError, FigmaImportWarning, ImportedBounds,
+    ImportedFigma, ImportedFigmaArtboard, ImportedFigmaNode, ImportedFigmaPage,
+};
 pub use jpeg::{export_jpeg, export_jpeg_to_bytes, JpegExportError, JpegExportOptions};
 pub use pdf::{
     export_pdf_from_document, PdfExportError, PdfExportOptions, RasterPixelCache, RasterPixels,
@@ -41,6 +47,10 @@ pub use pdf_import::{
     import_pdf, ExtractedImage, ExtractedImageData, ImportedPdf, ImportedPdfPage, PdfImportError,
 };
 pub use png::{export_png, export_png_to_bytes, PngExportError, PngExportOptions};
+pub use sketch_import::{
+    import_sketch, parse_sketch_zip, ImportedSketch, ImportedSketchArtboard, ImportedSketchNode,
+    ImportedSketchPage, SketchImportError, SketchImportWarning,
+};
 pub use svg::{export_svg_from_document, SvgDocumentExportError, SvgExportOptions};
 pub use webp::{export_webp, export_webp_to_bytes, WebpExportError, WebpExportOptions};
 

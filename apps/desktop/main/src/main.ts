@@ -1721,6 +1721,47 @@ function registerIpcHandlers(): void {
   ipcMain.handle("kcreate/pdf/import", (_e, filePath: string) =>
     requireBridge().pdfImport(filePath),
   );
+  // `kcreate/figma/pickFile` mirrors the PDF picker exactly: keep
+  // the OS dialog in the main process so the renderer never sees
+  // the filesystem. Figma exports come in two shapes (the REST API
+  // dump `.json` and the official `figma export-json` plugin's
+  // `.fig.json`) so we accept both extensions.
+  ipcMain.handle("kcreate/figma/pickFile", async () => {
+    const win = mainWindow;
+    if (!win) return null;
+    const result = await dialog.showOpenDialog(win, {
+      title: "Import Figma JSON",
+      properties: ["openFile"],
+      filters: [
+        { name: "Figma JSON", extensions: ["json", "fig"] },
+        { name: "All files", extensions: ["*"] },
+      ],
+    });
+    if (result.canceled || result.filePaths.length === 0) return null;
+    return result.filePaths[0];
+  });
+  ipcMain.handle("kcreate/figma/import", (_e, filePath: string) =>
+    requireBridge().figmaImport(filePath),
+  );
+  // `kcreate/sketch/pickFile` — scoped to `.sketch` (Sketch's ZIP
+  // archive container).
+  ipcMain.handle("kcreate/sketch/pickFile", async () => {
+    const win = mainWindow;
+    if (!win) return null;
+    const result = await dialog.showOpenDialog(win, {
+      title: "Import Sketch file",
+      properties: ["openFile"],
+      filters: [
+        { name: "Sketch", extensions: ["sketch"] },
+        { name: "All files", extensions: ["*"] },
+      ],
+    });
+    if (result.canceled || result.filePaths.length === 0) return null;
+    return result.filePaths[0];
+  });
+  ipcMain.handle("kcreate/sketch/import", (_e, filePath: string) =>
+    requireBridge().sketchImport(filePath),
+  );
   ipcMain.handle(
     "kcreate/ai/screenshotToLayout",
     (_e, requestJson: string) =>

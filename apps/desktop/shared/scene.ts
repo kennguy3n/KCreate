@@ -1655,6 +1655,10 @@ export interface RecentProjectsBridge {
 
 export type PreflightSeverity = "error" | "warning" | "info";
 
+// AGENTS.md rule 4: must mirror `kcreate_export::preflight::PreflightCheck`
+// 1:1. Every variant in the Rust enum's `as_str()` (preflight.rs:124-137)
+// must appear here, otherwise the renderer's switch statements lose
+// exhaustiveness.
 export type PreflightCheckId =
   | "bleed_margin"
   | "font_embed"
@@ -1667,7 +1671,8 @@ export type PreflightCheckId =
   | "shading"
   | "font_glyph_coverage"
   | "total_ink_coverage"
-  | "bleed_area_empty";
+  | "bleed_area_empty"
+  | "spot_color_missing";
 
 export interface PreflightIssue {
   check: PreflightCheckId;
@@ -2177,6 +2182,58 @@ export interface PdfImportBridge {
   /// new Page per PDF page, with embedded images as RasterLayer
   /// children and extracted text as a TextLayer per page.
   importPdf(filePath: string): Promise<PdfImportReport>;
+}
+
+// AGENTS.md rule 4: must mirror `kcreate_bridge::phase2::FigmaImportReport`
+// 1:1. Camel-case keys are produced by serde
+// `#[serde(rename_all = "camelCase")]` on the Rust struct.
+export interface FigmaImportReport {
+  /// `document.name` from the Figma export, if present.
+  documentName: string | null;
+  /// New KCreate page ids in import order.
+  pageIds: string[];
+  /// Total child nodes (artboards, vectors, text, raster) created
+  /// across all imported pages.
+  nodesImported: number;
+  /// Nodes the importer dropped (unsupported types, no geometry,
+  /// shapeless image refs).
+  nodesSkipped: number;
+  /// Human-readable, non-fatal warnings.
+  warnings: string[];
+}
+
+// AGENTS.md rule 4: must mirror `kcreate_bridge::phase2::SketchImportReport`
+// 1:1.
+export interface SketchImportReport {
+  /// `metadata.name` from `document.json` when present.
+  documentName: string | null;
+  /// New KCreate page ids in import order.
+  pageIds: string[];
+  /// Total child nodes successfully created.
+  nodesImported: number;
+  /// Dropped nodes (unsupported classes, missing image refs).
+  nodesSkipped: number;
+  /// Human-readable, non-fatal warnings.
+  warnings: string[];
+}
+
+/// Renderer-facing Figma JSON import API. Symmetric with
+/// [`PdfImportBridge`] — pickFile keeps the OS picker in the main
+/// process, importFigma runs the Rust importer + ingest pass.
+export interface FigmaImportBridge {
+  /// Show an Electron file picker scoped to `.json` /
+  /// `.fig.json` and return the chosen absolute path.
+  pickFile(): Promise<string | null>;
+  /// Import the Figma JSON at `filePath` into the current project.
+  importFigma(filePath: string): Promise<FigmaImportReport>;
+}
+
+/// Renderer-facing `.sketch` import API.
+export interface SketchImportBridge {
+  /// Show an Electron file picker scoped to `.sketch`.
+  pickFile(): Promise<string | null>;
+  /// Import the Sketch archive at `filePath` into the current project.
+  importSketch(filePath: string): Promise<SketchImportReport>;
 }
 
 export type PluginType = "wasm" | "js_panel" | "native";
@@ -3448,6 +3505,8 @@ declare global {
       batch: BatchBridge;
       aiModel: AiModelBridge;
       pdfImport: PdfImportBridge;
+      figmaImport: FigmaImportBridge;
+      sketchImport: SketchImportBridge;
       plugin: PluginBridge;
       mcpPermission: McpPermissionBridge;
       color: ColorBridge;

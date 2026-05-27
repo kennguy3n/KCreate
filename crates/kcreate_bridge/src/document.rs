@@ -1302,11 +1302,120 @@ pub fn document_redo() -> Result<Option<UndoRedoOutcome>> {
     }))
 }
 
+/// Snapshot of every workspace field [`apply_patch`] is capable of
+/// mutating, captured before a group of inverse / forward patches is
+/// applied. Used to roll the workspace back atomically when a patch
+/// fails mid-group, so the operation log cursor (which is not yet
+/// advanced) and the workspace state remain in sync — preserving the
+/// "a partial failure leaves the stack untouched" contract that
+/// [`document_undo_group`] / [`document_redo_group`] publish to
+/// callers.
+///
+/// We snapshot **only the fields apply_patch actually writes to**:
+///
+/// * `color_settings` — replaced by `color_settings_update` /
+///   single-arm.
+/// * `spot_color_library` — replaced by `spot_color_upsert` /
+///   `spot_color_remove` / `spot_color_load_catalog`.
+/// * Per-node `TextFrameOptions` — written by `text_frame_update`.
+/// * Per-node `OpenTypeFeatures` — written by
+///   `text_opentype_features_update`.
+///
+/// Graph operations (`document_create_node`, `canvas_move_node`,
+/// `document_reparent`, …) currently fall through to the no-op arm
+/// in [`apply_patch`], so they don't need to participate. If new
+/// commands are added to [`apply_patch`], this snapshot must learn
+/// about them — the [`ApplyPatchSnapshot::capture`] match arms below
+/// pair 1:1 with the arms in [`apply_patch`] for that reason.
+struct ApplyPatchSnapshot {
+    color_settings: Option<kcreate_core::color::ColorSettings>,
+    spot_color_library: Option<kcreate_core::color::SpotColorLibrary>,
+    text_frame: HashMap<Uuid, kcreate_core::node::TextFrameOptions>,
+    opentype: HashMap<Uuid, kcreate_core::node::OpenTypeFeatures>,
+}
+
+impl ApplyPatchSnapshot {
+    /// Walk `ops` once and stash whatever pieces of workspace state
+    /// the group can touch. Each field is captured **at most once**
+    /// (the first op that mentions it) so the snapshot describes the
+    /// state immediately *before* the loop runs.
+    fn capture(ws: &Workspace, ops: &[Operation]) -> Self {
+        let mut snap = Self {
+            color_settings: None,
+            spot_color_library: None,
+            text_frame: HashMap::new(),
+            opentype: HashMap::new(),
+        };
+        for op in ops {
+            match op.command.as_str() {
+                "color_settings_update" => {
+                    snap.color_settings
+                        .get_or_insert_with(|| ws.project.color_settings.clone());
+                }
+                "spot_color_upsert" | "spot_color_remove" | "spot_color_load_catalog" => {
+                    snap.spot_color_library
+                        .get_or_insert_with(|| ws.project.spot_color_library.clone());
+                }
+                "text_frame_update" => {
+                    if let Some(id) = op.affected_nodes.first().copied() {
+                        // Only snapshot the first edit per node so we
+                        // preserve the pre-loop state; subsequent
+                        // edits to the same node don't overwrite the
+                        // baseline.
+                        if let std::collections::hash_map::Entry::Vacant(slot) =
+                            snap.text_frame.entry(id)
+                        {
+                            if let Some(node) = ws.project.document.get_node(id) {
+                                slot.insert(node.text_frame_options().clone());
+                            }
+                        }
+                    }
+                }
+                "text_opentype_features_update" => {
+                    if let Some(id) = op.affected_nodes.first().copied() {
+                        if let std::collections::hash_map::Entry::Vacant(slot) =
+                            snap.opentype.entry(id)
+                        {
+                            if let Some(node) = ws.project.document.get_node(id) {
+                                slot.insert(node.opentype_features().clone());
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        snap
+    }
+
+    /// Reverse every mutation [`apply_patch`] may have written into
+    /// the workspace since [`Self::capture`] ran.
+    fn restore(self, ws: &mut Workspace) {
+        if let Some(cs) = self.color_settings {
+            ws.project.color_settings = cs;
+        }
+        if let Some(lib) = self.spot_color_library {
+            ws.project.spot_color_library = lib;
+        }
+        for (id, opts) in self.text_frame {
+            if let Some(node) = ws.project.document.get_node_mut(id) {
+                node.set_text_frame_options(&opts);
+            }
+        }
+        for (id, feats) in self.opentype {
+            if let Some(node) = ws.project.document.get_node_mut(id) {
+                node.set_opentype_features(&feats);
+            }
+        }
+    }
+}
+
 /// One step of group-aware undo. Consumes the entire contiguous run
 /// of ops that share the most recent `group_id` (or just one op if
 /// ungrouped). Applies each `before_patch` atomically — if any
-/// patch fails the cursor stays put so the next call retries the
-/// same group.
+/// patch fails the workspace is rolled back to its pre-loop state
+/// via [`ApplyPatchSnapshot`] and the cursor stays put so the next
+/// call retries the same group with no double-application.
 ///
 /// Returns `Ok(None)` when the undo stack is empty. Otherwise an
 /// outcome describing the *user-facing* operation: the command
@@ -1319,9 +1428,19 @@ pub fn document_undo_group() -> Result<Option<UndoRedoOutcome>> {
     if pending.is_empty() {
         return Ok(None);
     }
-    // Apply each `before_patch` in undo order (newest-first).
+    // Capture every field the loop below could mutate so we can roll
+    // back atomically if one of the patches fails — see the comment
+    // on [`ApplyPatchSnapshot`] for why this is the architecturally
+    // correct fix (vs. e.g. snapshotting the entire `Project`).
+    let snapshot = ApplyPatchSnapshot::capture(ws, &pending);
+    // Apply each `before_patch` in undo order (newest-first). On any
+    // failure, restore from the snapshot before propagating — never
+    // leave the workspace in a half-rolled-back state.
     for op in &pending {
-        apply_inverse_patch(ws, op)?;
+        if let Err(e) = apply_inverse_patch(ws, op) {
+            snapshot.restore(ws);
+            return Err(e);
+        }
     }
     let committed = ws.project.undo_group();
     debug_assert_eq!(committed.len(), pending.len());
@@ -1343,7 +1462,9 @@ pub fn document_undo_group() -> Result<Option<UndoRedoOutcome>> {
 
 /// One step of group-aware redo. Symmetric with
 /// [`document_undo_group`]; consumes the contiguous run starting
-/// at the cursor.
+/// at the cursor. Uses the same snapshot+rollback discipline so
+/// a patch failure mid-group cannot leave the workspace partially
+/// re-applied.
 pub fn document_redo_group() -> Result<Option<UndoRedoOutcome>> {
     let mut guard = slot().lock();
     let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
@@ -1351,8 +1472,12 @@ pub fn document_redo_group() -> Result<Option<UndoRedoOutcome>> {
     if pending.is_empty() {
         return Ok(None);
     }
+    let snapshot = ApplyPatchSnapshot::capture(ws, &pending);
     for op in &pending {
-        apply_forward_patch(ws, op)?;
+        if let Err(e) = apply_forward_patch(ws, op) {
+            snapshot.restore(ws);
+            return Err(e);
+        }
     }
     let committed = ws.project.redo_group();
     debug_assert_eq!(committed.len(), pending.len());
@@ -1456,6 +1581,19 @@ fn apply_patch(ws: &mut Workspace, op: &Operation, patch: &serde_json::Value) ->
             let settings: kcreate_core::color::ColorSettings =
                 serde_json::from_value(patch.clone())?;
             ws.project.color_settings = settings;
+            Ok(())
+        }
+        // All three spot-color commands snapshot the entire
+        // `SpotColorLibrary` in their before / after patches (see
+        // `phase2::color_spot_upsert`, `color_spot_remove`, and
+        // `color_spot_load_catalog`), so the inverse / forward step
+        // is a single library replacement. Without these arms the
+        // command would record correctly but undo would be a no-op —
+        // the library state would not roll back.
+        "spot_color_upsert" | "spot_color_remove" | "spot_color_load_catalog" => {
+            let library: kcreate_core::color::SpotColorLibrary =
+                serde_json::from_value(patch.clone())?;
+            ws.project.spot_color_library = library;
             Ok(())
         }
         "text_frame_update" => {
@@ -7312,6 +7450,211 @@ mod tests {
         project_close();
     }
 
+    /// Atomicity contract for `document_undo_group`. Devin Review
+    /// flagged on PR #16 (BUG_0001): when a group of ops shares a
+    /// `group_id` and the loop fails on op N>0, the workspace state
+    /// has already been mutated by ops 0..N-1 while the operation
+    /// log cursor stayed where it was — leaving cursor and state
+    /// permanently out of sync, with no path back.
+    ///
+    /// The fix is the `ApplyPatchSnapshot` introduced above:
+    /// snapshot every field `apply_patch` can touch before the loop,
+    /// restore on any error. This test exercises the failure mode
+    /// end-to-end:
+    ///
+    /// 1. Build a group of two ops sharing the same `group_id`:
+    ///    one well-formed `color_settings_update` followed by a
+    ///    poisoned `color_settings_update` whose `before_patch` is
+    ///    a JSON string.
+    /// 2. Drive `document_undo_group` and assert it returns an error.
+    /// 3. Assert the workspace state is **identical** to its pre-call
+    ///    state (color_settings unchanged) — proving the rollback ran.
+    /// 4. Assert the undo cursor did not advance (group remains
+    ///    pending) so the user can retry / inspect.
+    #[test]
+    #[serial]
+    fn document_undo_group_rolls_workspace_back_on_partial_failure() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("group-undo-atomicity", dir.path()).expect("create");
+
+        // Start at the default color settings.
+        let baseline = kcreate_core::color::ColorSettings::default();
+        // Two changes the user made in one logical action — represented
+        // as a group. The first op is a real settings change, the second
+        // op claims to mutate settings again but its `before_patch` is
+        // structurally malformed, so apply_inverse_patch will fail.
+        let mid = kcreate_core::color::ColorSettings {
+            gamut_warning: true,
+            ..baseline.clone()
+        };
+        let final_state = kcreate_core::color::ColorSettings {
+            working_space_rgb: kcreate_core::color::IccProfile::AdobeRgb1998,
+            gamut_warning: true,
+            ..baseline.clone()
+        };
+
+        let group_id = Uuid::new_v4();
+        let op_a = Operation::new(
+            "user",
+            "color_settings_update",
+            serde_json::to_value(&baseline).unwrap(),
+            serde_json::to_value(&mid).unwrap(),
+            Vec::new(),
+        )
+        .with_group(group_id);
+        let op_b_poisoned = Operation::new(
+            "user",
+            "color_settings_update",
+            // before_patch poisoned — deserializes as String, not ColorSettings.
+            serde_json::json!("not-a-color-settings-object"),
+            serde_json::to_value(&final_state).unwrap(),
+            Vec::new(),
+        )
+        .with_group(group_id);
+
+        // Push them in order. Recording does not call apply_patch, so
+        // it succeeds — we then mutate the workspace by hand so it
+        // matches what op_a + op_b would have produced if applied
+        // forward. (Simpler than calling color_settings_update twice
+        // because we'd lose control of the group_id.)
+        document_record_operation(op_a).expect("record op_a");
+        document_record_operation(op_b_poisoned).expect("record op_b");
+        with_workspace_mut(|ws| {
+            ws.project.color_settings = final_state.clone();
+            Ok(())
+        })
+        .expect("set final state");
+
+        let before = document_status().expect("status before");
+        let cs_before =
+            with_workspace(|ws| Ok(ws.project.color_settings.clone())).expect("cs before");
+        assert_eq!(cs_before, final_state, "preconditions");
+
+        // Now drive the group undo. Op_b's before_patch will fail.
+        // pending_undo_group iterates newest-first, so op_b is applied
+        // first (and immediately fails) — but in case the order in
+        // production swaps, the test below independently asserts the
+        // rollback target is `final_state` regardless of which op
+        // failed.
+        let err = document_undo_group().expect_err("group undo must surface the error");
+        assert!(
+            matches!(err, DocumentBridgeError::Json(_)),
+            "expected Json (serde) error from apply_inverse_patch, got: {err:?}",
+        );
+
+        // Cursor invariant — no group consumed.
+        let after = document_status().expect("status after");
+        assert_eq!(
+            after.undo_depth, before.undo_depth,
+            "failed group undo must NOT advance the cursor",
+        );
+
+        // State invariant — workspace is exactly what it was before
+        // the failed call. If `op_a`'s patch ran successfully but the
+        // rollback did NOT happen, color_settings would equal `mid`
+        // (gamut_warning true, AdobeRgb1998 reverted). The atomicity
+        // contract requires the workspace look exactly as it did
+        // pre-call: final_state.
+        let cs_after =
+            with_workspace(|ws| Ok(ws.project.color_settings.clone())).expect("cs after");
+        assert_eq!(
+            cs_after, final_state,
+            "failed group undo must roll the workspace back to its \
+             pre-call state — partial application of op_a's \
+             before_patch is the bug ApplyPatchSnapshot prevents.",
+        );
+
+        project_close();
+    }
+
+    /// Symmetric atomicity contract for `document_redo_group`. A
+    /// poisoned `after_patch` mid-group must roll the workspace back
+    /// and leave the cursor untouched so the user can retry.
+    #[test]
+    #[serial]
+    fn document_redo_group_rolls_workspace_back_on_partial_failure() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("group-redo-atomicity", dir.path()).expect("create");
+
+        let baseline = kcreate_core::color::ColorSettings::default();
+        let after_a = kcreate_core::color::ColorSettings {
+            gamut_warning: true,
+            ..baseline.clone()
+        };
+
+        let group_id = Uuid::new_v4();
+        let op_a = Operation::new(
+            "user",
+            "color_settings_update",
+            serde_json::to_value(&baseline).unwrap(),
+            serde_json::to_value(&after_a).unwrap(),
+            Vec::new(),
+        )
+        .with_group(group_id);
+        let op_b_poisoned = Operation::new(
+            "user",
+            "color_settings_update",
+            serde_json::to_value(&after_a).unwrap(),
+            // after_patch poisoned.
+            serde_json::json!("not-a-color-settings-object"),
+            Vec::new(),
+        )
+        .with_group(group_id);
+
+        document_record_operation(op_a).expect("record op_a");
+        document_record_operation(op_b_poisoned).expect("record op_b");
+        // Move the cursor backwards so the ops sit on the redo stack.
+        // Since these ops haven't been forward-applied to the
+        // workspace, undoing them via document_undo_group would
+        // try to invert state that isn't there. Skip the undo and
+        // manually walk the operation log cursor backwards using
+        // the internal helper.
+        with_workspace_mut(|ws| {
+            // Two single-op undos: each one decrements the cursor.
+            // Their before_patches are both well-formed `ColorSettings`,
+            // so apply_inverse_patch + undo() succeed.
+            ws.project.color_settings = after_a.clone();
+            Ok(())
+        })
+        .expect("simulate post-op_a state");
+        document_undo().expect("walk back op_b");
+        document_undo().expect("walk back op_a");
+
+        let pre_redo = document_status().expect("status pre-redo");
+        assert!(
+            pre_redo.can_redo,
+            "after two undos the ops must be on the redo stack",
+        );
+        let cs_before =
+            with_workspace(|ws| Ok(ws.project.color_settings.clone())).expect("cs before redo");
+        assert_eq!(cs_before, baseline, "redo precondition: baseline state");
+
+        let err = document_redo_group().expect_err("group redo must surface the error");
+        assert!(
+            matches!(err, DocumentBridgeError::Json(_)),
+            "expected Json (serde) error from apply_forward_patch, got: {err:?}",
+        );
+
+        let post = document_status().expect("status post");
+        assert_eq!(
+            post.redo_depth, pre_redo.redo_depth,
+            "failed group redo must NOT advance the cursor",
+        );
+
+        let cs_after =
+            with_workspace(|ws| Ok(ws.project.color_settings.clone())).expect("cs after");
+        assert_eq!(
+            cs_after, baseline,
+            "failed group redo must roll the workspace back to baseline \
+             — partial application of op_a's after_patch (gamut_warning \
+             flipped to true) is the bug ApplyPatchSnapshot prevents.",
+        );
+
+        project_close();
+    }
+
     /// Same end-to-end guarantee for `text_frame_update` — the bridge
     /// must restore the previous `TextFrameOptions` on undo and replay
     /// the new options on redo.
@@ -7402,6 +7745,126 @@ mod tests {
         )
         .unwrap();
         assert_eq!(after_redo, updated);
+        project_close();
+    }
+
+    /// Pins the spot-color undo contract. Before the `apply_patch`
+    /// arms for `spot_color_upsert` / `spot_color_remove` /
+    /// `spot_color_load_catalog` were wired in (Devin Review
+    /// ANALYSIS_0002 on PR #16), each of those commands recorded an
+    /// op with full `before` / `after` library snapshots but
+    /// `apply_inverse_patch` fell through to the `_ => Ok(())` arm —
+    /// so undo advanced the operation-log cursor without rolling
+    /// the library back. The user would hit ⌘Z, see the swatch
+    /// still listed, and conclude undo was broken.
+    ///
+    /// This test exercises all three commands end-to-end through
+    /// the bridge and asserts undo / redo round-trips the library
+    /// to its expected state at each step.
+    #[test]
+    #[serial]
+    fn spot_color_commands_undo_redo_round_trip_library() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("spot-undo", dir.path()).expect("create");
+
+        // Closures (rather than nested `fn`s) so clippy doesn't
+        // complain about items appearing after statements. They
+        // capture nothing and serve only as readable
+        // assertion-helpers.
+        let snapshot = || -> (usize, bool) {
+            with_workspace(|ws| {
+                let lib = &ws.project.spot_color_library;
+                Ok((lib.entries.len(), lib.entries.contains_key("PANTONE 185 C")))
+            })
+            .expect("workspace snapshot")
+        };
+        let cmyk_of = |name: &str| -> Option<(f32, f32, f32, f32)> {
+            with_workspace(|ws| {
+                Ok(ws
+                    .project
+                    .spot_color_library
+                    .entries
+                    .get(name)
+                    .map(|d| d.fallback_cmyk))
+            })
+            .expect("cmyk lookup")
+        };
+
+        assert_eq!(snapshot(), (0, false), "fresh project library is empty");
+
+        // 1. Upsert "PANTONE 185 C". Wire shape is camelCase per
+        // `SpotColorWire`'s `#[serde(rename_all = "camelCase")]`.
+        let upsert_wire = serde_json::json!({
+            "name": "PANTONE 185 C",
+            "displayName": "PANTONE 185 C",
+            "fallbackCmyk": [0.0, 1.0, 0.78, 0.03],
+            "libraryReference": null,
+        });
+        crate::phase2::color_spot_upsert(&upsert_wire.to_string()).expect("upsert");
+        assert_eq!(snapshot(), (1, true));
+
+        // 2. Load a catalog merging two more swatches in one op.
+        let catalog = serde_json::json!({
+            "entries": [
+                { "name": "PANTONE Reflex Blue C", "fallback_cmyk": [1.0, 0.72, 0.0, 0.06] },
+                { "name": "PANTONE 802 C", "fallback_cmyk": [0.61, 0.0, 0.91, 0.0] },
+            ]
+        });
+        let _report =
+            crate::phase2::color_spot_load_catalog(&catalog.to_string()).expect("load catalog");
+        assert_eq!(snapshot(), (3, true));
+
+        // 3. Remove the first swatch.
+        let removed = crate::phase2::color_spot_remove("PANTONE 185 C").expect("remove");
+        assert!(removed);
+        assert_eq!(snapshot(), (2, false));
+
+        // Undo remove → 3 swatches again, "PANTONE 185 C" back.
+        document_undo().expect("undo remove");
+        assert_eq!(
+            snapshot(),
+            (3, true),
+            "undo of spot_color_remove must restore the swatch — \
+             before the apply_patch arm landed, this stayed at (2, false)."
+        );
+
+        // Undo catalog → 1 swatch (the original upsert).
+        document_undo().expect("undo catalog");
+        assert_eq!(
+            snapshot(),
+            (1, true),
+            "undo of spot_color_load_catalog must drop the two \
+             swatches the catalog added.",
+        );
+
+        // Undo upsert → empty library.
+        document_undo().expect("undo upsert");
+        assert_eq!(
+            snapshot(),
+            (0, false),
+            "undo of spot_color_upsert must restore the empty library."
+        );
+
+        // Now walk redo back to the final state and re-check each
+        // intermediate snapshot to prove the after_patch arm is
+        // also wired.
+        document_redo().expect("redo upsert");
+        assert_eq!(snapshot(), (1, true));
+
+        document_redo().expect("redo catalog");
+        assert_eq!(snapshot(), (3, true));
+
+        document_redo().expect("redo remove");
+        assert_eq!(snapshot(), (2, false));
+
+        // Spot check the def survives the round-trip (CMYK + name).
+        assert_eq!(
+            cmyk_of("PANTONE Reflex Blue C"),
+            Some((1.0, 0.72, 0.0, 0.06)),
+            "Reflex Blue CMYK survives undo / redo",
+        );
+
         project_close();
     }
 

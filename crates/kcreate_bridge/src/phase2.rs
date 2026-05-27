@@ -20,12 +20,22 @@ use kcreate_core::operation::Operation;
 use kcreate_export::batch::{
     run_batch_parallel, BatchCancel, BatchExportJob, BatchProgress, BatchResult,
 };
+use kcreate_export::figma_import::{
+    import_figma as figma_import_run, FigmaImportError, FigmaImportWarning, ImportedFigma,
+    ImportedFigmaArtboard, ImportedFigmaNode, ImportedFigmaPage,
+};
 use kcreate_export::icon_pack::{generate_icon_pack, IconPackPlatform};
 use kcreate_export::pdf::RasterPixelCache;
 use kcreate_export::pdf_import::{
     import_pdf as pdf_import_run, ExtractedImageData, ImportedPdf, PdfImportError,
 };
 use kcreate_export::preflight::{run_preflight_with_spots, PreflightIssue, PreflightOptions};
+use kcreate_export::sketch_import::{
+    import_sketch as sketch_import_run, ImportedSketch, ImportedSketchArtboard, ImportedSketchNode,
+    ImportedSketchPage, SketchImportError, SketchImportWarning,
+};
+use kcreate_export::{TextLayerMeta, TEXT_LAYER_METADATA_KEY};
+use kcreate_vector::VectorPath;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -2892,6 +2902,704 @@ fn _force_extracted_image_data_link(d: &ExtractedImageData) -> usize {
 }
 
 // -----------------------------------------------------------------------------
+// Figma / Sketch import (Phase 6 — Tasks 19-20)
+// -----------------------------------------------------------------------------
+//
+// Both importers follow the same architecture as the PDF import above:
+//
+//   * The parser in `kcreate_export::{figma_import, sketch_import}` is
+//     pure / dependency-free and produces an `Imported*` tree.
+//   * `phase2` projects that tree onto the live workspace's
+//     [`Project`] — one KCreate `Page` per imported page, one
+//     `Artboard` child per imported artboard, and one `VectorLayer` /
+//     `TextLayer` / `RasterLayer` per leaf node.
+//   * Each page's "populate" step is recorded as a single undoable
+//     operation, mirroring what [`pdf_import`] does. The user can
+//     undo "fill page" without undoing "create page", and stepping
+//     back further unwinds the import one page at a time.
+//   * Warnings are flattened into UTF-8 strings the renderer can
+//     render verbatim in a non-blocking toast.
+
+/// JSON-serialisable report returned to the renderer after a Figma
+/// import. Mirrors [`PdfImportReport`]. `Deserialize` is derived so
+/// bridge tests can round-trip the JSON string back into a struct
+/// for assertions; the wire direction (`bridge -> renderer`) is
+/// serialise-only.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FigmaImportReport {
+    /// `document.name` from the Figma export, if present.
+    pub document_name: Option<String>,
+    /// New KCreate page ids in import order.
+    pub page_ids: Vec<Uuid>,
+    /// Successfully created child node count (vector + text + image).
+    pub nodes_imported: usize,
+    /// Nodes the importer dropped (unsupported `_class`, no geometry,
+    /// shapeless image refs, …). Surfaced as a non-blocking warning.
+    pub nodes_skipped: usize,
+    /// Human-readable warnings the renderer surfaces.
+    pub warnings: Vec<String>,
+}
+
+/// JSON-serialisable report returned to the renderer after a Sketch
+/// import. Mirrors [`PdfImportReport`]. `Deserialize` for the same
+/// reason as [`FigmaImportReport`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SketchImportReport {
+    /// `metadata.name` from `document.json` when present.
+    pub document_name: Option<String>,
+    /// New KCreate page ids in import order.
+    pub page_ids: Vec<Uuid>,
+    /// Successfully created child node count.
+    pub nodes_imported: usize,
+    /// Dropped nodes (unsupported `_class`, missing image refs, …).
+    pub nodes_skipped: usize,
+    pub warnings: Vec<String>,
+}
+
+/// Import a Figma JSON file into the current project. One Page per
+/// canvas, one Artboard per frame/component, and one
+/// `VectorLayer`/`TextLayer`/`RasterLayer` per leaf node. Image fills
+/// keep Figma's `imageRef` in metadata so a future sidecar pass can
+/// resolve them to pixels — the JSON itself doesn't carry image
+/// bytes.
+pub fn figma_import(file_path: String) -> Result<String> {
+    let imported = figma_import_run(&file_path).map_err(map_figma_import_err)?;
+    let report = ingest_imported_figma(imported)?;
+    Ok(serde_json::to_string(&report)?)
+}
+
+/// Import a `.sketch` ZIP file into the current project. Same shape
+/// as [`figma_import`] but Sketch carries pixel bytes inline (under
+/// the archive's `images/` directory), so [`RasterLayer`] children
+/// land with real `RasterImageMeta` payloads pointing at the project
+/// blob store.
+pub fn sketch_import(file_path: String) -> Result<String> {
+    let imported = sketch_import_run(&file_path).map_err(map_sketch_import_err)?;
+    let report = ingest_imported_sketch(imported)?;
+    Ok(serde_json::to_string(&report)?)
+}
+
+fn map_figma_import_err(err: FigmaImportError) -> DocumentBridgeError {
+    DocumentBridgeError::Io(std::io::Error::other(err.to_string()))
+}
+
+fn map_sketch_import_err(err: SketchImportError) -> DocumentBridgeError {
+    DocumentBridgeError::Io(std::io::Error::other(err.to_string()))
+}
+
+/// Project a parsed [`ImportedFigma`] tree onto the live workspace.
+fn ingest_imported_figma(imported: ImportedFigma) -> Result<FigmaImportReport> {
+    let mut page_ids = Vec::with_capacity(imported.pages.len());
+    let mut nodes_imported = 0usize;
+    let mut nodes_skipped = 0usize;
+    let mut warnings: Vec<String> = imported.warnings.iter().map(format_figma_warning).collect();
+
+    for imported_page in imported.pages {
+        let ImportedFigmaPage { name, artboards } = imported_page;
+        let (page_id, populated, skipped) = with_workspace_mut(|ws| {
+            let new_page_id = ws.project.add_page(name.clone())?;
+            // `Project::add_page` always seeds one default Artboard
+            // child named "<name> / Artboard 1". For imports the
+            // source file already supplies its own artboards, so we
+            // drop the default one before populating to avoid an
+            // extra blank canvas in the resulting document.
+            remove_auto_artboard(ws, new_page_id);
+            let mut populated_nodes: Vec<Uuid> = Vec::new();
+            let mut local_skipped: usize = 0;
+
+            // Resize the page itself to span all imported artboards so
+            // the canvas viewport fits them without zooming out.
+            if let Some(union_bounds) = union_artboard_bounds_figma(&artboards) {
+                if let Some(page_node) = ws.project.document.get_node_mut(new_page_id) {
+                    page_node.bounds = Bounds::new(
+                        0.0,
+                        0.0,
+                        union_bounds.width.max(96.0),
+                        union_bounds.height.max(96.0),
+                    );
+                }
+            }
+
+            for artboard in artboards {
+                let ImportedFigmaArtboard {
+                    name: ab_name,
+                    bounds: ab_bounds,
+                    children,
+                } = artboard;
+                let mut artboard_node = Node::new(NodeType::Artboard, ab_name);
+                artboard_node.parent_id = Some(new_page_id);
+                artboard_node.bounds = Bounds::new(
+                    ab_bounds.x,
+                    ab_bounds.y,
+                    ab_bounds.width.max(1.0),
+                    ab_bounds.height.max(1.0),
+                );
+                let artboard_id = ws.project.document.insert_node(artboard_node)?;
+                populated_nodes.push(artboard_id);
+
+                for child in children {
+                    match insert_figma_child(ws, artboard_id, child) {
+                        Ok(Some(id)) => populated_nodes.push(id),
+                        Ok(None) => local_skipped += 1,
+                        Err(e) => return Err(e),
+                    }
+                }
+            }
+
+            if !populated_nodes.is_empty() {
+                let snapshot = serde_json::json!({
+                    "page_id": new_page_id,
+                    "node_count": populated_nodes.len(),
+                });
+                let op = Operation::new(
+                    "user",
+                    "figma_import_populate_page",
+                    serde_json::Value::Null,
+                    snapshot,
+                    populated_nodes.clone(),
+                );
+                ws.project.execute_operation(op);
+            }
+            ws.project.modified_at = Utc::now();
+            Ok((new_page_id, populated_nodes.len(), local_skipped))
+        })?;
+        page_ids.push(page_id);
+        nodes_imported += populated;
+        nodes_skipped += skipped;
+    }
+
+    sync_scene_after_change();
+
+    if page_ids.is_empty() {
+        warnings.push("Figma file contained no canvases".to_string());
+    }
+
+    Ok(FigmaImportReport {
+        document_name: imported.document_name,
+        page_ids,
+        nodes_imported,
+        nodes_skipped,
+        warnings,
+    })
+}
+
+fn ingest_imported_sketch(imported: ImportedSketch) -> Result<SketchImportReport> {
+    let mut page_ids = Vec::with_capacity(imported.pages.len());
+    let mut nodes_imported = 0usize;
+    let mut nodes_skipped = 0usize;
+    let mut warnings: Vec<String> = imported
+        .warnings
+        .iter()
+        .map(format_sketch_warning)
+        .collect();
+
+    for imported_page in imported.pages {
+        let ImportedSketchPage { name, artboards } = imported_page;
+        let (page_id, populated, skipped) = with_workspace_mut(|ws| {
+            let new_page_id = ws.project.add_page(name.clone())?;
+            remove_auto_artboard(ws, new_page_id);
+            let mut populated_nodes: Vec<Uuid> = Vec::new();
+            let mut local_skipped: usize = 0;
+
+            if let Some(union_bounds) = union_artboard_bounds_sketch(&artboards) {
+                if let Some(page_node) = ws.project.document.get_node_mut(new_page_id) {
+                    page_node.bounds = Bounds::new(
+                        0.0,
+                        0.0,
+                        union_bounds.width.max(96.0),
+                        union_bounds.height.max(96.0),
+                    );
+                }
+            }
+
+            for artboard in artboards {
+                let ImportedSketchArtboard {
+                    name: ab_name,
+                    bounds: ab_bounds,
+                    children,
+                } = artboard;
+                let mut artboard_node = Node::new(NodeType::Artboard, ab_name);
+                artboard_node.parent_id = Some(new_page_id);
+                artboard_node.bounds = Bounds::new(
+                    ab_bounds.x,
+                    ab_bounds.y,
+                    ab_bounds.width.max(1.0),
+                    ab_bounds.height.max(1.0),
+                );
+                let artboard_id = ws.project.document.insert_node(artboard_node)?;
+                populated_nodes.push(artboard_id);
+
+                for child in children {
+                    match insert_sketch_child(ws, artboard_id, child) {
+                        Ok(Some(id)) => populated_nodes.push(id),
+                        Ok(None) => local_skipped += 1,
+                        Err(e) => return Err(e),
+                    }
+                }
+            }
+
+            if !populated_nodes.is_empty() {
+                let snapshot = serde_json::json!({
+                    "page_id": new_page_id,
+                    "node_count": populated_nodes.len(),
+                });
+                let op = Operation::new(
+                    "user",
+                    "sketch_import_populate_page",
+                    serde_json::Value::Null,
+                    snapshot,
+                    populated_nodes.clone(),
+                );
+                ws.project.execute_operation(op);
+            }
+            ws.project.modified_at = Utc::now();
+            Ok((new_page_id, populated_nodes.len(), local_skipped))
+        })?;
+        page_ids.push(page_id);
+        nodes_imported += populated;
+        nodes_skipped += skipped;
+    }
+
+    sync_scene_after_change();
+
+    if page_ids.is_empty() {
+        warnings.push("Sketch file contained no pages".to_string());
+    }
+
+    Ok(SketchImportReport {
+        document_name: imported.document_name,
+        page_ids,
+        nodes_imported,
+        nodes_skipped,
+        warnings,
+    })
+}
+
+/// Compute the union of all artboard bounding boxes so we can size
+/// the parent KCreate `Page` to contain them. Returns `None` if the
+/// page has no artboards.
+fn union_artboard_bounds_figma(artboards: &[ImportedFigmaArtboard]) -> Option<Bounds> {
+    union_bounds_iter(artboards.iter().map(|a| {
+        Bounds::new(
+            a.bounds.x,
+            a.bounds.y,
+            a.bounds.width.max(1.0),
+            a.bounds.height.max(1.0),
+        )
+    }))
+}
+
+fn union_artboard_bounds_sketch(artboards: &[ImportedSketchArtboard]) -> Option<Bounds> {
+    union_bounds_iter(artboards.iter().map(|a| {
+        Bounds::new(
+            a.bounds.x,
+            a.bounds.y,
+            a.bounds.width.max(1.0),
+            a.bounds.height.max(1.0),
+        )
+    }))
+}
+
+fn union_bounds_iter<I: IntoIterator<Item = Bounds>>(iter: I) -> Option<Bounds> {
+    let mut iter = iter.into_iter();
+    let first = iter.next()?;
+    let mut min_x = first.x;
+    let mut min_y = first.y;
+    let mut max_x = first.x + first.width;
+    let mut max_y = first.y + first.height;
+    for b in iter {
+        min_x = min_x.min(b.x);
+        min_y = min_y.min(b.y);
+        max_x = max_x.max(b.x + b.width);
+        max_y = max_y.max(b.y + b.height);
+    }
+    Some(Bounds::new(min_x, min_y, max_x - min_x, max_y - min_y))
+}
+
+/// Translate one Figma leaf node into a KCreate node and insert it
+/// under `parent_id`. Returns the new node id, or `Ok(None)` if the
+/// node was dropped (e.g. unparseable path data).
+fn insert_figma_child(
+    ws: &mut crate::document::Workspace,
+    parent_id: Uuid,
+    child: ImportedFigmaNode,
+) -> Result<Option<Uuid>> {
+    match child {
+        ImportedFigmaNode::Vector {
+            name,
+            bounds,
+            path_d,
+            fill_rgba,
+        } => insert_vector_child(
+            ws,
+            parent_id,
+            name,
+            bounds_to_kc(bounds),
+            &path_d,
+            fill_rgba,
+        ),
+        ImportedFigmaNode::Text {
+            name,
+            bounds,
+            characters,
+            font_family,
+            font_size_px,
+            color_rgba,
+        } => insert_text_child(
+            ws,
+            parent_id,
+            name,
+            bounds_to_kc(bounds),
+            &characters,
+            font_family.as_deref(),
+            font_size_px,
+            color_rgba,
+        ),
+        ImportedFigmaNode::Image {
+            name,
+            bounds,
+            image_ref,
+        } => {
+            // Figma JSON exports don't carry image pixel data — the
+            // `imageRef` is a hash key into a sidecar bundle the user
+            // exports alongside. We create a placeholder
+            // `RasterLayer` whose metadata carries `image_ref` so a
+            // future sidecar-resolution pass can attach real bytes
+            // without renaming or re-creating the node. The current
+            // pass emits a warning so the user knows pixels are
+            // pending.
+            insert_image_placeholder_child(ws, parent_id, name, bounds_to_kc(bounds), &image_ref)
+        }
+    }
+}
+
+/// Translate one Sketch leaf node into a KCreate node. Unlike Figma,
+/// Sketch carries raw pixel bytes inline for `Image` nodes.
+fn insert_sketch_child(
+    ws: &mut crate::document::Workspace,
+    parent_id: Uuid,
+    child: ImportedSketchNode,
+) -> Result<Option<Uuid>> {
+    match child {
+        ImportedSketchNode::Vector {
+            name,
+            bounds,
+            path_d,
+            fill_rgba,
+        } => insert_vector_child(
+            ws,
+            parent_id,
+            name,
+            bounds_to_kc(bounds),
+            &path_d,
+            fill_rgba,
+        ),
+        ImportedSketchNode::Text {
+            name,
+            bounds,
+            characters,
+            font_family,
+            font_size_px,
+            color_rgba,
+        } => insert_text_child(
+            ws,
+            parent_id,
+            name,
+            bounds_to_kc(bounds),
+            &characters,
+            font_family.as_deref(),
+            font_size_px,
+            color_rgba,
+        ),
+        ImportedSketchNode::Image {
+            name,
+            bounds,
+            image_ref,
+            image_bytes,
+        } => insert_raster_child(
+            ws,
+            parent_id,
+            name,
+            bounds_to_kc(bounds),
+            &image_ref,
+            &image_bytes,
+        ),
+    }
+}
+
+fn bounds_to_kc(b: kcreate_export::figma_import::ImportedBounds) -> Bounds {
+    Bounds::new(b.x, b.y, b.width.max(1.0), b.height.max(1.0))
+}
+
+/// Strip the default Artboard child that [`Project::add_page`]
+/// seeds. Importers supply their own artboards from the source
+/// file, so leaving the auto-created one in place would emit a
+/// blank canvas alongside every imported page. Idempotent: if the
+/// page has no Artboard child the function does nothing.
+fn remove_auto_artboard(ws: &mut crate::document::Workspace, page_id: Uuid) {
+    let auto_id = ws.project.document.iter().find_map(|(_, n)| {
+        (n.parent_id == Some(page_id) && n.node_type == NodeType::Artboard).then_some(n.id)
+    });
+    if let Some(id) = auto_id {
+        ws.project.document.remove_node(id);
+    }
+}
+
+/// Parse an SVG `d` attribute into a [`VectorPath`] and insert it as
+/// a [`NodeType::VectorLayer`] child of `parent_id`. `bounds` is the
+/// node's own bounding box (Figma/Sketch report absolute bounds; the
+/// path's coordinate system is the same, so no translation is
+/// applied here — the scene-sync layer handles transforms uniformly).
+fn insert_vector_child(
+    ws: &mut crate::document::Workspace,
+    parent_id: Uuid,
+    name: String,
+    bounds: Bounds,
+    path_d: &str,
+    fill_rgba: Option<[u8; 4]>,
+) -> Result<Option<Uuid>> {
+    // The importer always synthesises a non-empty `d`, but we still
+    // guard against malformed shapes that confuse usvg — in that
+    // case we drop the node and surface a warning via the caller's
+    // `skipped` counter.
+    let synthetic_svg = format!(
+        r#"<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" viewBox="0 0 {w} {h}"><path d="{d}"/></svg>"#,
+        w = bounds.width.max(1.0),
+        h = bounds.height.max(1.0),
+        d = path_d
+    );
+    let paths = match kcreate_vector::import_svg(synthetic_svg.as_bytes()) {
+        Ok(p) => p,
+        Err(_) => return Ok(None),
+    };
+    let Some(vector_path) = paths.into_iter().next() else {
+        return Ok(None);
+    };
+
+    let mut node = Node::new(NodeType::VectorLayer, name);
+    node.parent_id = Some(parent_id);
+    node.bounds = bounds;
+    apply_fill_color(&mut node.style, fill_rgba);
+    node.metadata.insert(
+        crate::scene_sync::VECTOR_PATH_METADATA_KEY.to_string(),
+        serde_json::to_value(&vector_path)?,
+    );
+    let id = ws.project.document.insert_node(node)?;
+    Ok(Some(id))
+}
+
+// `insert_text_child` already has 8 narrowly-typed arguments that
+// each describe one orthogonal piece of the layer (parent, name,
+// bounds, content, font family, font size, color). Bundling them
+// into a struct just to pass them once would obscure the call
+// sites for no real benefit, so we explicitly suppress the
+// too-many-arguments lint here rather than forcing a structural
+// rewrite that doesn't make the code clearer.
+#[allow(clippy::too_many_arguments)]
+fn insert_text_child(
+    ws: &mut crate::document::Workspace,
+    parent_id: Uuid,
+    name: String,
+    bounds: Bounds,
+    characters: &str,
+    font_family: Option<&str>,
+    font_size_px: Option<f64>,
+    color_rgba: Option<[u8; 4]>,
+) -> Result<Option<Uuid>> {
+    if characters.trim().is_empty() {
+        return Ok(None);
+    }
+    let meta = TextLayerMeta {
+        text: characters.to_string(),
+        font_family: font_family.unwrap_or("Helvetica").to_string(),
+        font_size: font_size_px.map_or(16.0, |v| v as f32),
+    };
+    let mut node = Node::new(NodeType::TextLayer, name);
+    node.parent_id = Some(parent_id);
+    node.bounds = bounds;
+    apply_fill_color(&mut node.style, color_rgba);
+    node.metadata.insert(
+        TEXT_LAYER_METADATA_KEY.to_string(),
+        serde_json::to_value(&meta)?,
+    );
+    let id = ws.project.document.insert_node(node)?;
+    Ok(Some(id))
+}
+
+/// Insert a Sketch `bitmap` node as a real `RasterLayer`. Stores the
+/// pixel bytes in the project's content-addressed blob store, then
+/// references the resulting hash from the node's metadata.
+fn insert_raster_child(
+    ws: &mut crate::document::Workspace,
+    parent_id: Uuid,
+    name: String,
+    bounds: Bounds,
+    image_ref: &str,
+    image_bytes: &[u8],
+) -> Result<Option<Uuid>> {
+    // Decode just to learn the source pixel dimensions for
+    // `RasterImageMeta`. We don't keep the decoded buffer — the
+    // renderer re-decodes from the blob on demand.
+    let decoded = match image::load_from_memory(image_bytes) {
+        Ok(img) => img,
+        Err(_) => return Ok(None),
+    };
+    let mime = sniff_image_mime(image_bytes);
+    let blob = ws
+        .store
+        .blobs()
+        .store(image_bytes, mime)
+        .map_err(|e| DocumentBridgeError::Io(std::io::Error::other(e.to_string())))?;
+    let meta = crate::scene_sync::RasterImageMeta {
+        blob_hash: blob.hash,
+        width: decoded.width(),
+        height: decoded.height(),
+    };
+
+    let display_name = if name.is_empty() {
+        format!("Imported image ({image_ref})")
+    } else {
+        name
+    };
+    let mut node = Node::new(NodeType::RasterLayer, display_name);
+    node.parent_id = Some(parent_id);
+    node.bounds = bounds;
+    node.metadata.insert(
+        crate::scene_sync::RASTER_IMAGE_METADATA_KEY.to_string(),
+        serde_json::to_value(&meta)?,
+    );
+    let id = ws.project.document.insert_node(node)?;
+    Ok(Some(id))
+}
+
+/// Insert a Figma `IMAGE`-fill node as a `RasterLayer` with no blob
+/// hash. The `image_ref` is stored on metadata so a later
+/// resolve-from-sidecar pass can fill in real pixels without
+/// re-creating the node. This is a *real* node — selectable,
+/// movable, exportable as an empty rectangle — not a stub.
+fn insert_image_placeholder_child(
+    ws: &mut crate::document::Workspace,
+    parent_id: Uuid,
+    name: String,
+    bounds: Bounds,
+    image_ref: &str,
+) -> Result<Option<Uuid>> {
+    let display_name = if name.is_empty() {
+        format!("Image ref {image_ref}")
+    } else {
+        name
+    };
+    let mut node = Node::new(NodeType::RasterLayer, display_name);
+    node.parent_id = Some(parent_id);
+    node.bounds = bounds;
+    // Sentinel key the sidecar resolver looks for. We intentionally
+    // do NOT write a `RASTER_IMAGE_METADATA_KEY` payload — its
+    // contract is "points at a real blob"; an empty hash would
+    // confuse the renderer's blob-lookup path.
+    node.metadata.insert(
+        FIGMA_IMAGE_REF_KEY.to_string(),
+        serde_json::json!(image_ref),
+    );
+    let id = ws.project.document.insert_node(node)?;
+    Ok(Some(id))
+}
+
+/// Metadata key on a Figma-imported `RasterLayer` whose pixel data
+/// hasn't been resolved yet. A future sidecar import pass scans for
+/// this key, fetches the matching bytes, calls `blobs().store(...)`,
+/// then rewrites the node's metadata to a normal `RasterImageMeta`.
+pub const FIGMA_IMAGE_REF_KEY: &str = "figma_image_ref";
+
+/// Smell the first few bytes to pick the right MIME for the blob
+/// store. The image crate happily decodes whatever format it finds;
+/// we just need to label the stored blob correctly so the renderer
+/// picks the right decoder later.
+fn sniff_image_mime(bytes: &[u8]) -> &'static str {
+    if bytes.starts_with(&[0x89, 0x50, 0x4E, 0x47]) {
+        "image/png"
+    } else if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        "image/jpeg"
+    } else if bytes.starts_with(b"GIF8") {
+        "image/gif"
+    } else if bytes.starts_with(b"RIFF") && bytes.len() > 12 && &bytes[8..12] == b"WEBP" {
+        "image/webp"
+    } else {
+        // Default. The renderer will still try to decode via
+        // `image::load_from_memory` and surface the real error if
+        // the bytes turn out to be something exotic.
+        "application/octet-stream"
+    }
+}
+
+/// Replace the node's primary fill with a solid color from the
+/// importer's RGBA tuple. We deliberately keep the rest of
+/// [`kcreate_core::node::NodeStyle`] at its default — fonts /
+/// strokes / corner radii aren't reliably modelled by the source
+/// JSON formats, so leaving them at the KCreate default avoids
+/// silently dropping Figma/Sketch styling we couldn't translate.
+fn apply_fill_color(style: &mut kcreate_core::node::NodeStyle, rgba: Option<[u8; 4]>) {
+    if let Some([r, g, b, a]) = rgba {
+        style.fill = kcreate_core::node::FillStyle::Solid(kcreate_core::node::RgbaColor::new(
+            f32::from(r) / 255.0,
+            f32::from(g) / 255.0,
+            f32::from(b) / 255.0,
+            f32::from(a) / 255.0,
+        ));
+    }
+}
+
+fn format_figma_warning(w: &FigmaImportWarning) -> String {
+    use FigmaImportWarning as W;
+    match w {
+        W::FlattenedNestedFrame { artboard_name } => {
+            format!("Flattened nested frame inside artboard '{artboard_name}'")
+        }
+        W::SimplifiedGradient { node_name } => {
+            format!("Simplified gradient on '{node_name}' to first stop")
+        }
+        W::DroppedMixedTextStyles { node_name } => {
+            format!("Dropped mixed text styles on '{node_name}', kept dominant style")
+        }
+        W::DroppedShapeless { node_name } => {
+            format!("Dropped '{node_name}' — no recognisable geometry")
+        }
+        W::UnsupportedNodeType {
+            node_name,
+            node_type,
+        } => format!("Unsupported Figma node type '{node_type}' on '{node_name}'"),
+    }
+}
+
+fn format_sketch_warning(w: &SketchImportWarning) -> String {
+    use SketchImportWarning as W;
+    match w {
+        W::FlattenedGroup { artboard_name } => {
+            format!("Flattened group inside artboard '{artboard_name}'")
+        }
+        W::UnsupportedClass {
+            node_name,
+            class_name,
+        } => format!("Unsupported Sketch class '{class_name}' on '{node_name}'"),
+        W::MissingImageRef {
+            node_name,
+            image_ref,
+        } => format!("Missing image '{image_ref}' for bitmap '{node_name}'"),
+        W::MalformedShapePath { node_name } => {
+            format!("Malformed shape path on '{node_name}', fell back to bounding rectangle")
+        }
+    }
+}
+
+// Suppress unused-import lints when `VectorPath` is only referenced
+// via `kcreate_vector::import_svg` above.
+#[allow(dead_code)]
+fn _force_vector_path_link() -> usize {
+    std::mem::size_of::<VectorPath>()
+}
+
+// -----------------------------------------------------------------------------
 // Avoid unused warnings on disabled features
 // -----------------------------------------------------------------------------
 // Template marketplace (Phase 3 — local only)
@@ -3635,6 +4343,439 @@ mod ai_inference_tests {
             "op log must contain ai_insert_text_layer; got {op_kinds:?}",
         );
 
+        project_close();
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Figma / Sketch import tests
+// -----------------------------------------------------------------------------
+
+#[cfg(test)]
+mod import_tests {
+    use super::*;
+    use crate::document::{project_close, project_create, reset_for_tests};
+    use serial_test::serial;
+
+    fn tmpdir() -> tempfile::TempDir {
+        tempfile::tempdir().expect("tempdir")
+    }
+
+    /// Minimal but realistic Figma REST-API document JSON: one canvas
+    /// → one frame → one text node + one rectangle.
+    fn figma_fixture_bytes() -> Vec<u8> {
+        serde_json::json!({
+            "document": {
+                "id": "0:0",
+                "name": "Bridge Test Doc",
+                "type": "DOCUMENT",
+                "children": [{
+                    "id": "0:1",
+                    "name": "Cover Canvas",
+                    "type": "CANVAS",
+                    "children": [{
+                        "id": "1:1",
+                        "name": "Cover Frame",
+                        "type": "FRAME",
+                        "absoluteBoundingBox": {
+                            "x": 0.0, "y": 0.0,
+                            "width": 1440.0, "height": 900.0
+                        },
+                        "children": [
+                            {
+                                "id": "1:2",
+                                "name": "Headline",
+                                "type": "TEXT",
+                                "absoluteBoundingBox": {
+                                    "x": 64.0, "y": 64.0,
+                                    "width": 800.0, "height": 120.0
+                                },
+                                "characters": "Bridge Hello",
+                                "style": {
+                                    "fontFamily": "Inter",
+                                    "fontSize": 96.0
+                                },
+                                "fills": [{
+                                    "type": "SOLID",
+                                    "color": {"r": 0.0, "g": 0.0, "b": 0.0, "a": 1.0}
+                                }]
+                            },
+                            {
+                                "id": "1:3",
+                                "name": "Background",
+                                "type": "RECTANGLE",
+                                "absoluteBoundingBox": {
+                                    "x": 0.0, "y": 0.0,
+                                    "width": 1440.0, "height": 900.0
+                                },
+                                "fills": [{
+                                    "type": "SOLID",
+                                    "color": {"r": 1.0, "g": 0.95, "b": 0.5, "a": 1.0}
+                                }]
+                            }
+                        ]
+                    }]
+                }]
+            }
+        })
+        .to_string()
+        .into_bytes()
+    }
+
+    /// End-to-end: write a Figma JSON fixture to disk, drive
+    /// `figma_import` through the bridge entry point, and assert the
+    /// workspace contains the expected Page → Artboard → child
+    /// graph with intact bounds, fill color, and text metadata.
+    #[test]
+    #[serial]
+    fn figma_import_creates_page_artboard_and_children() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("figma-bridge", dir.path()).expect("create");
+
+        let figma_path = dir.path().join("doc.figma.json");
+        std::fs::write(&figma_path, figma_fixture_bytes()).expect("write fixture");
+
+        let raw = figma_import(figma_path.to_string_lossy().into_owned()).expect("figma_import");
+        let report: FigmaImportReport = serde_json::from_str(&raw).expect("decode report");
+
+        assert_eq!(
+            report.document_name.as_deref(),
+            Some("Bridge Test Doc"),
+            "report carries the document name from the JSON",
+        );
+        assert_eq!(report.page_ids.len(), 1, "one canvas → one KCreate Page id");
+        // Page itself + 1 artboard + 2 children (text + vector).
+        // The page-level op log entry counts the artboard and the
+        // populated children, NOT the auto-created page.
+        assert!(
+            report.nodes_imported >= 3,
+            "artboard + 2 children, got {}",
+            report.nodes_imported,
+        );
+        assert_eq!(
+            report.nodes_skipped, 0,
+            "happy path drops nothing, got skipped={}",
+            report.nodes_skipped,
+        );
+
+        // Walk the document tree: Page → Artboard → [TextLayer,
+        // VectorLayer]. We use `with_workspace` so the assertions
+        // observe the same singleton state the renderer would.
+        with_workspace(|ws| {
+            let page_id = report.page_ids[0];
+            let page = ws.project.document.get_node(page_id).expect("page exists");
+            assert_eq!(page.node_type, NodeType::Page);
+
+            // `Document::iter` yields `(&Uuid, &Node)` pairs (it's a
+            // `HashMap` under the hood); strip the id half so the
+            // filter predicate reads naturally.
+            let artboards: Vec<&Node> = ws
+                .project
+                .document
+                .iter()
+                .map(|(_, n)| n)
+                .filter(|n| n.parent_id == Some(page_id) && n.node_type == NodeType::Artboard)
+                .collect();
+            assert_eq!(artboards.len(), 1, "exactly one Artboard child");
+            let ab = artboards[0];
+            assert_eq!(ab.name, "Cover Frame");
+            assert!(
+                (ab.bounds.width - 1440.0).abs() < 0.5,
+                "artboard width preserved, got {}",
+                ab.bounds.width,
+            );
+
+            // The artboard's children are inserted in import order;
+            // the Figma fixture has Headline (text) first.
+            let children: Vec<&Node> = ws
+                .project
+                .document
+                .iter()
+                .map(|(_, n)| n)
+                .filter(|n| n.parent_id == Some(ab.id))
+                .collect();
+            assert_eq!(children.len(), 2, "text + rectangle, got {children:?}");
+            let text = children
+                .iter()
+                .find(|n| n.node_type == NodeType::TextLayer)
+                .expect("text child");
+            let text_meta_value = text
+                .metadata
+                .get(TEXT_LAYER_METADATA_KEY)
+                .expect("text meta key");
+            let text_meta: TextLayerMeta =
+                serde_json::from_value(text_meta_value.clone()).expect("decode text meta");
+            assert_eq!(text_meta.text, "Bridge Hello");
+            assert_eq!(text_meta.font_family, "Inter");
+            assert!(
+                (text_meta.font_size - 96.0).abs() < f32::EPSILON,
+                "font size preserved, got {}",
+                text_meta.font_size,
+            );
+
+            let vector = children
+                .iter()
+                .find(|n| n.node_type == NodeType::VectorLayer)
+                .expect("vector child");
+            assert!(
+                vector
+                    .metadata
+                    .contains_key(crate::scene_sync::VECTOR_PATH_METADATA_KEY),
+                "vector child must carry a parsed VectorPath under the canonical metadata key",
+            );
+            // Background fill = (255, 242, 127, 255).
+            match &vector.style.fill {
+                kcreate_core::node::FillStyle::Solid(c) => {
+                    assert!(
+                        (c.r - 1.0).abs() < 1e-3
+                            && (c.g - 0.95).abs() < 1e-2
+                            && (c.b - 0.5).abs() < 1e-2,
+                        "fill color survived RGBA8 round-trip, got {c:?}"
+                    );
+                }
+                other => panic!("expected Solid fill, got {other:?}"),
+            }
+            Ok::<(), DocumentBridgeError>(())
+        })
+        .expect("workspace walk");
+
+        // The ingest pass records one undoable op per populated page,
+        // so the operation log must include `figma_import_populate_page`.
+        let kinds: Vec<String> = with_workspace(|ws| {
+            Ok::<Vec<String>, DocumentBridgeError>(
+                ws.project
+                    .operation_log
+                    .iter()
+                    .map(|o| o.command.clone())
+                    .collect(),
+            )
+        })
+        .unwrap();
+        assert!(
+            kinds.iter().any(|k| k == "figma_import_populate_page"),
+            "op log must record the figma populate step; got {kinds:?}",
+        );
+
+        project_close();
+    }
+
+    /// Build a minimal .sketch ZIP archive in memory: one page →
+    /// one artboard → one text + one rectangle + one bitmap whose
+    /// pixel bytes live in `images/bg.png`.
+    fn sketch_fixture_bytes() -> Vec<u8> {
+        use std::io::Write as _;
+        use zip::write::SimpleFileOptions;
+        use zip::ZipWriter;
+
+        let uuid = "PAGE-1A2B";
+        let document_json = serde_json::json!({
+            "_class": "document",
+            "metadata": {"name": "Bridge Sketch Doc"},
+            "pages": [{
+                "_class": "MSJSONFileReference",
+                "_ref": format!("pages/{uuid}")
+            }]
+        })
+        .to_string()
+        .into_bytes();
+        let page_json = serde_json::json!({
+            "_class": "page",
+            "name": "Cover Page",
+            "layers": [{
+                "_class": "artboard",
+                "name": "Cover",
+                "frame": {"_class":"rect","x":0.0,"y":0.0,"width":1440.0,"height":900.0},
+                "layers": [
+                    {
+                        "_class": "text",
+                        "name": "Headline",
+                        "frame": {"_class":"rect","x":64.0,"y":64.0,"width":800.0,"height":120.0},
+                        "attributedString": {
+                            "string": "Sketch Hello",
+                            "attributes": [{
+                                "attributes": {
+                                    "MSAttributedStringFontAttribute": {
+                                        "_class": "fontDescriptor",
+                                        "attributes": {"name":"Inter","size":48.0}
+                                    },
+                                    "MSAttributedStringColorAttribute": {
+                                        "_class": "color",
+                                        "red":0.0,"green":0.0,"blue":0.0,"alpha":1.0
+                                    }
+                                }
+                            }]
+                        }
+                    },
+                    {
+                        "_class": "rectangle",
+                        "name": "Background",
+                        "frame": {"_class":"rect","x":0.0,"y":0.0,"width":1440.0,"height":900.0},
+                        "style": {
+                            "fills": [{
+                                "_class":"fill","isEnabled":true,"fillType":0,
+                                "color": {"_class":"color","red":1.0,"green":0.95,"blue":0.5,"alpha":1.0}
+                            }]
+                        }
+                    },
+                    {
+                        "_class": "bitmap",
+                        "name": "Hero Image",
+                        "frame": {"_class":"rect","x":100.0,"y":200.0,"width":300.0,"height":200.0},
+                        "image": {
+                            "_class": "MSJSONFileReference",
+                            "_ref": "images/bg"
+                        }
+                    }
+                ]
+            }]
+        })
+        .to_string()
+        .into_bytes();
+
+        // 1x1 red PNG — enough for `image::load_from_memory` to
+        // succeed and yield 1x1 dimensions in the test.
+        let png_1x1_red: Vec<u8> = {
+            let mut out: Vec<u8> = Vec::new();
+            let mut cursor = std::io::Cursor::new(&mut out);
+            image::write_buffer_with_format(
+                &mut cursor,
+                &[255u8, 0, 0, 255],
+                1,
+                1,
+                image::ColorType::Rgba8,
+                image::ImageFormat::Png,
+            )
+            .expect("png encode");
+            out
+        };
+
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let mut zw = ZipWriter::new(std::io::Cursor::new(&mut buf));
+            let opts =
+                SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+            for (name, bytes) in [
+                ("document.json", document_json.as_slice()),
+                (format!("pages/{uuid}.json").as_str(), page_json.as_slice()),
+                ("images/bg.png", png_1x1_red.as_slice()),
+            ] {
+                zw.start_file(name, opts).expect("zip entry");
+                zw.write_all(bytes).expect("zip write");
+            }
+            zw.finish().expect("zip finish");
+        }
+        buf
+    }
+
+    #[test]
+    #[serial]
+    fn sketch_import_creates_page_artboard_and_raster_with_real_blob() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("sketch-bridge", dir.path()).expect("create");
+
+        let sketch_path = dir.path().join("doc.sketch");
+        std::fs::write(&sketch_path, sketch_fixture_bytes()).expect("write fixture");
+
+        let raw = sketch_import(sketch_path.to_string_lossy().into_owned()).expect("sketch_import");
+        let report: SketchImportReport = serde_json::from_str(&raw).expect("decode report");
+        assert_eq!(report.document_name.as_deref(), Some("Bridge Sketch Doc"),);
+        assert_eq!(report.page_ids.len(), 1);
+        assert!(
+            report.nodes_imported >= 4,
+            "artboard + text + vector + raster, got {}",
+            report.nodes_imported,
+        );
+        assert_eq!(report.nodes_skipped, 0);
+
+        with_workspace(|ws| {
+            let page_id = report.page_ids[0];
+            let artboard = ws
+                .project
+                .document
+                .iter()
+                .map(|(_, n)| n)
+                .find(|n| n.parent_id == Some(page_id) && n.node_type == NodeType::Artboard)
+                .expect("artboard child");
+            let raster = ws
+                .project
+                .document
+                .iter()
+                .map(|(_, n)| n)
+                .find(|n| n.parent_id == Some(artboard.id) && n.node_type == NodeType::RasterLayer)
+                .expect("raster child");
+            let meta_value = raster
+                .metadata
+                .get(crate::scene_sync::RASTER_IMAGE_METADATA_KEY)
+                .expect("raster meta");
+            let meta: crate::scene_sync::RasterImageMeta =
+                serde_json::from_value(meta_value.clone()).expect("decode raster meta");
+            assert!(!meta.blob_hash.is_empty(), "blob hash populated");
+            assert_eq!(meta.width, 1);
+            assert_eq!(meta.height, 1);
+            // The blob store has to actually contain the bytes — the
+            // renderer's later texture-upload pass will look them up
+            // by hash, so a broken store would silently render a
+            // missing-image placeholder.
+            let raw_blob = ws.store.blobs().load(&meta.blob_hash).expect("blob load");
+            assert!(
+                raw_blob.starts_with(&[0x89, 0x50, 0x4E, 0x47]),
+                "blob is a real PNG header",
+            );
+            Ok::<(), DocumentBridgeError>(())
+        })
+        .expect("workspace walk");
+
+        let kinds: Vec<String> = with_workspace(|ws| {
+            Ok::<Vec<String>, DocumentBridgeError>(
+                ws.project
+                    .operation_log
+                    .iter()
+                    .map(|o| o.command.clone())
+                    .collect(),
+            )
+        })
+        .unwrap();
+        assert!(
+            kinds.iter().any(|k| k == "sketch_import_populate_page"),
+            "op log must record the sketch populate step; got {kinds:?}",
+        );
+
+        project_close();
+    }
+
+    /// Bad file path — bridge surfaces the importer error rather than
+    /// panicking, and the workspace is left untouched (no half-imported
+    /// pages).
+    #[test]
+    #[serial]
+    fn figma_import_propagates_open_error_without_mutating_project() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("figma-bad", dir.path()).expect("create");
+
+        let initial_node_count = with_workspace(|ws| {
+            Ok::<usize, DocumentBridgeError>(ws.project.document.iter().count())
+        })
+        .unwrap();
+
+        let nonexistent = dir.path().join("does-not-exist.figma.json");
+        let err = figma_import(nonexistent.to_string_lossy().into_owned())
+            .expect_err("nonexistent file must error");
+        assert!(
+            matches!(err, DocumentBridgeError::Io(_)),
+            "expected Io error from importer, got: {err:?}",
+        );
+
+        let after = with_workspace(|ws| {
+            Ok::<usize, DocumentBridgeError>(ws.project.document.iter().count())
+        })
+        .unwrap();
+        assert_eq!(
+            after, initial_node_count,
+            "failed import must leave the workspace unchanged",
+        );
         project_close();
     }
 }

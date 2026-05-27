@@ -571,18 +571,23 @@ function formatRelativeIso(iso: string): string {
   const minute = 60_000;
   const hour = 60 * minute;
   const day = 24 * hour;
+  // `Math.floor` (not `Math.round`) so each bucket stays strictly
+  // within its label range: 59m → "59m ago", 60m → "1h ago" (we've
+  // already advanced into the next bucket via `deltaMs < hour`),
+  // never the visually-wrong "60m ago". Same reasoning for the hour
+  // → day and day → week boundaries.
   if (deltaMs < minute) return "just now";
   if (deltaMs < hour) {
-    const m = Math.round(deltaMs / minute);
+    const m = Math.floor(deltaMs / minute);
     return `${m}m ago`;
   }
   if (deltaMs < day) {
-    const h = Math.round(deltaMs / hour);
+    const h = Math.floor(deltaMs / hour);
     return `${h}h ago`;
   }
   if (deltaMs < 7 * day) {
-    const d = Math.round(deltaMs / day);
-    return d === 1 ? "yesterday" : `${d}d ago`;
+    const d = Math.floor(deltaMs / day);
+    return d <= 1 ? "yesterday" : `${d}d ago`;
   }
   return new Date(ts).toLocaleDateString();
 }

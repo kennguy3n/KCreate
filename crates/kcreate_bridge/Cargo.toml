@@ -104,6 +104,12 @@ wat = "1"
 # (`benches/scene_sync_multi_peer.rs`). Kept as a dev-dependency so
 # release builds of the bridge don't link it.
 criterion.workspace = true
+# Phase 6 Task 19-20: the Sketch importer bridge tests construct a
+# minimal `.sketch` archive in memory (document.json + pages/<uuid>.json
+# + images/<png>) so the round-trip exercises the real ZIP-backed
+# parser path. Already a workspace dep via `kcreate_export`, so this
+# only widens its visibility into the bridge's dev-deps.
+zip = { workspace = true }
 
 [[bench]]
 name = "scene_sync_multi_peer"

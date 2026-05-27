@@ -2545,6 +2545,24 @@ pub fn pdf_import(file_path: String) -> NapiResult<String> {
     phase2::pdf_import(file_path).map_err(map_doc_err)
 }
 
+/// Import a Figma JSON file at `file_path` into the current project.
+/// One Page per Figma canvas, one Artboard per frame/component, and
+/// `VectorLayer`/`TextLayer`/`RasterLayer` children per leaf node.
+/// Returns JSON matching [`phase2::FigmaImportReport`].
+#[napi]
+pub fn figma_import(file_path: String) -> NapiResult<String> {
+    phase2::figma_import(file_path).map_err(map_doc_err)
+}
+
+/// Import a `.sketch` ZIP file at `file_path` into the current
+/// project. Same shape as [`figma_import`] but Sketch carries pixel
+/// bytes inline, so RasterLayer children are populated with real
+/// blobs. Returns JSON matching [`phase2::SketchImportReport`].
+#[napi]
+pub fn sketch_import(file_path: String) -> NapiResult<String> {
+    phase2::sketch_import(file_path).map_err(map_doc_err)
+}
+
 /// Run edge-detection + connected-component analysis over the
 /// supplied RGBA8 screenshot and return the detected UI regions.
 #[napi]

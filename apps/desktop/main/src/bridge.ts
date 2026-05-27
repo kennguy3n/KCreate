@@ -559,6 +559,8 @@ export interface Bridge {
   aiInstallModelPack(packId: string, sourcePath: string): string;
   aiUninstallModelPack(packId: string): void;
   pdfImport(filePath: string): string;
+  figmaImport(filePath: string): string;
+  sketchImport(filePath: string): string;
   aiScreenshotToLayout(requestJson: string): string;
   aiAltTextForNode(nodeId: string): string;
   aiApplyAltText(nodeId: string, text: string): void;

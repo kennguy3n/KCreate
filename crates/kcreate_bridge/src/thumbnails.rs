@@ -354,23 +354,22 @@ fn peek_cover_meta(project_dir: &Path) -> Option<RecentProjectCoverInfo> {
 /// edge.
 pub fn ensure_cover_thumbnail(max_dim_px: u32) -> Result<ThumbnailBytes> {
     let dim = sanitize_dim(max_dim_px);
-    let (target, full_doc_hash) = {
-        let guard = workspace_slot().lock();
-        let ws = guard.as_ref().ok_or(DocumentBridgeError::NoProject)?;
+    // Atomic snapshot: hash + target + scene are all derived from
+    // the **same** workspace lock window. See `ensure_thumbnail_for`
+    // for why this matters.
+    ensure_thumbnail_for(COVER_KEY, dim, |ws| {
         let hash = document_content_hash(ws);
         let target = pick_cover_target(ws);
-        (target, hash)
-    };
-    ensure_thumbnail_for(COVER_KEY, &full_doc_hash, target, dim)
+        let scene = build_scene_for_target(ws, target);
+        Ok((hash, target, scene))
+    })
 }
 
 /// Ensure a specific page thumbnail exists; return it. Errors out if
 /// `page_id` doesn't refer to a Page node in the open project.
 pub fn ensure_page_thumbnail(page_id: Uuid, max_dim_px: u32) -> Result<ThumbnailBytes> {
     let dim = sanitize_dim(max_dim_px);
-    let (target, hash) = {
-        let guard = workspace_slot().lock();
-        let ws = guard.as_ref().ok_or(DocumentBridgeError::NoProject)?;
+    ensure_thumbnail_for(page_id, dim, move |ws| {
         let node = ws
             .project
             .document
@@ -387,9 +386,9 @@ pub fn ensure_page_thumbnail(page_id: Uuid, max_dim_px: u32) -> Result<Thumbnail
             bounds: node.bounds,
             background: None,
         };
-        (target, hash)
-    };
-    ensure_thumbnail_for(page_id, &hash, target, dim)
+        let scene = build_scene_for_target(ws, target);
+        Ok((hash, target, scene))
+    })
 }
 
 /// Kick off a background thread that pre-warms every page's
@@ -436,32 +435,62 @@ struct ThumbnailTarget {
     background: Option<Color>,
 }
 
-fn ensure_thumbnail_for(
-    key: Uuid,
-    content_hash: &str,
-    target: ThumbnailTarget,
-    max_dim_px: u32,
-) -> Result<ThumbnailBytes> {
-    // Cache hit fast path.
-    if let Some(cached) = cache_lookup(key, content_hash)? {
-        return Ok(ThumbnailBytes::from_cached(cached));
-    }
-    // Build the scene under the workspace lock, then drop the lock
-    // before the (potentially slow) render+encode step.
-    let scene = {
+/// Drive a cache-or-render decision for `key` using a single
+/// workspace-lock window to capture **both** the content hash and the
+/// renderable scene. This is the atomicity contract Devin Review
+/// flagged on PR #16 (ANALYSIS_0001): if the hash were computed in one
+/// lock window and the scene in another, a concurrent mutation between
+/// them would store thumbnail bytes keyed by a hash that no longer
+/// describes the document — every subsequent lookup at that hash would
+/// return a stale picture.
+///
+/// The closure `prepare` runs while we hold the workspace lock and
+/// must derive the hash, target bounds, and the scene from the **same
+/// snapshot of `ws`**. We then:
+///
+/// 1. Check the cache under that same lock for a hit on `(key, hash)`.
+///    A hit returns immediately without rendering.
+/// 2. Drop the lock and run the (potentially slow) GPU/CPU render +
+///    PNG encode off-lock, so the UI thread is never blocked by the
+///    render itself.
+/// 3. Re-acquire the lock briefly to commit the rendered bytes back
+///    to the cache, keyed by the snapshot hash. Because the bytes
+///    were rendered from the snapshot the hash describes, the cache
+///    invariant ("bytes at hash H depict the document at hash H")
+///    holds even if the document has since mutated — the next
+///    thumbnail request will see the new hash → miss → re-render.
+fn ensure_thumbnail_for<F>(key: Uuid, max_dim_px: u32, prepare: F) -> Result<ThumbnailBytes>
+where
+    F: FnOnce(&mut Workspace) -> Result<(String, ThumbnailTarget, Scene)>,
+{
+    // Step 1 — single lock window: derive hash + target + scene, and
+    // short-circuit on a cache hit. Note the cache is on disk under
+    // `ws.store.thumbnails_dir()`, so we must hold the lock long
+    // enough to safely open it; the open is cheap (sled-style hash
+    // map) so this doesn't materially block the UI thread.
+    let (content_hash, target, scene) = {
         let mut guard = workspace_slot().lock();
         let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
-        build_scene_for_target(ws, target)
+        let cache = ThumbnailCache::open(ws.store.thumbnails_dir()).map_err(thumb_err)?;
+        let (hash, target, scene) = prepare(ws)?;
+        if let Some(cached) = cache.lookup(key, &hash).map_err(thumb_err)? {
+            return Ok(ThumbnailBytes::from_cached(cached));
+        }
+        (hash, target, scene)
     };
 
+    // Step 2 — off-lock render + encode. This is the slow part
+    // (wgpu submit, readback, PNG encode) and must NOT hold the
+    // workspace lock so other bridge calls (editing, save, close)
+    // can run in parallel.
     let (bytes, width, height) =
         render_scene_to_png(&scene, target.bounds, max_dim_px, target.background)?;
 
-    // Re-acquire to commit. If the project was closed between drop
-    // and reacquire, just drop the rendered bytes — the next request
-    // will re-render. (Avoids touching the cache for a project we no
-    // longer own.)
-    cache_store(key, content_hash, &bytes, width, height)?;
+    // Step 3 — re-acquire only to commit the cache row. If the
+    // project was closed between step 2 and step 3, just drop the
+    // rendered bytes — the next request will re-render. (Avoids
+    // touching the cache for a project we no longer own.)
+    cache_store(key, &content_hash, &bytes, width, height)?;
 
     Ok(ThumbnailBytes {
         width,
@@ -469,15 +498,8 @@ fn ensure_thumbnail_for(
         mime: ThumbnailEncoding::Png.mime().to_string(),
         byte_size: bytes.len() as u64,
         bytes_base64: encode_base64(&bytes),
-        content_hash: content_hash.to_string(),
+        content_hash,
     })
-}
-
-fn cache_lookup(key: Uuid, content_hash: &str) -> Result<Option<CachedThumbnail>> {
-    let guard = workspace_slot().lock();
-    let ws = guard.as_ref().ok_or(DocumentBridgeError::NoProject)?;
-    let cache = ThumbnailCache::open(ws.store.thumbnails_dir()).map_err(thumb_err)?;
-    cache.lookup(key, content_hash).map_err(thumb_err)
 }
 
 fn cache_store(key: Uuid, content_hash: &str, bytes: &[u8], width: u32, height: u32) -> Result<()> {

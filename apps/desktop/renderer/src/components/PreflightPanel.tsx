@@ -471,6 +471,8 @@ function labelForCheck(id: string): string {
       return "Total ink coverage";
     case "bleed_area_empty":
       return "Bleed area empty";
+    case "spot_color_missing":
+      return "Spot color missing";
     default:
       return id;
   }

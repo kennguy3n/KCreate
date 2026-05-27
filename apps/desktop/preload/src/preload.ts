@@ -2489,28 +2489,42 @@ const kchatBackend: KChatBackendBridge = {
 // Phase 7 (Task E): `kcreate://` deeplink listener. The main
 // process forwards every accepted deeplink URL on
 // `kcreate/deeplink/received`; the renderer subscribes through
-// this bridge so `InvitePanel.tsx` can auto-paste an invite
-// payload that arrived through a KChat Desktop share card.
+// this bridge so `InvitePanel.tsx` (and any future panel that
+// wants to react to share-invite deeplinks) can auto-paste an
+// invite payload that arrived through a KChat Desktop share card.
 //
 // Cold-start race: `main.ts` flushes the pending-deeplink queue
 // on `did-finish-load`, but that fires before the React tree has
 // mounted and registered `onUrl`. To make sure a deeplink fired
 // in that millisecond window isn't lost, we register an IPC
 // listener here (at preload load time, before the renderer's JS
-// bundle runs) and buffer URLs until the consumer subscribes. The
-// buffer is capped to mirror the main-side cap so a renderer
-// stuck before mount can't drive unbounded memory growth.
+// bundle runs) and buffer URLs until at least one consumer
+// subscribes. The buffer is capped to mirror the main-side cap so
+// a renderer stuck before mount can't drive unbounded memory
+// growth.
+//
+// Subscriber model: we keep a Set<callback> rather than a single
+// slot so a future second panel (e.g. an audit-log feed that also
+// records deeplink arrivals) can subscribe without silently
+// stealing URLs from the first subscriber. Each URL is fanned out
+// to every registered listener.
 const DEEPLINK_CHANNEL = "kcreate/deeplink/received";
 const DEEPLINK_BUFFER_CAP = 50;
 const pendingDeeplinks: string[] = [];
-let deeplinkCallback: ((url: string) => void) | null = null;
+const deeplinkSubscribers = new Set<(url: string) => void>();
 
 ipcRenderer.on(DEEPLINK_CHANNEL, (_evt: unknown, url: unknown): void => {
   if (typeof url !== "string") {
     return;
   }
-  if (deeplinkCallback) {
-    deeplinkCallback(url);
+  if (deeplinkSubscribers.size > 0) {
+    // Snapshot the subscriber set before iterating so a listener
+    // that unsubscribes itself during the callback doesn't mutate
+    // the live set mid-iteration.
+    const snapshot = Array.from(deeplinkSubscribers);
+    for (const subscriber of snapshot) {
+      subscriber(url);
+    }
     return;
   }
   if (pendingDeeplinks.length >= DEEPLINK_BUFFER_CAP) {
@@ -2521,9 +2535,13 @@ ipcRenderer.on(DEEPLINK_CHANNEL, (_evt: unknown, url: unknown): void => {
 
 const deeplink: DeeplinkBridge = {
   onUrl(callback: (url: string) => void): () => void {
-    deeplinkCallback = callback;
-    // Drain any URLs that arrived before the renderer was ready
-    // in arrival order so the consumer observes them deterministically.
+    deeplinkSubscribers.add(callback);
+    // Drain any URLs that arrived before any consumer was ready,
+    // in arrival order so the first subscriber observes them
+    // deterministically. Subsequent subscribers that join later
+    // miss the drain — they only see URLs that arrive after they
+    // register, which matches the "subscribe once at mount" usage
+    // pattern from `InvitePanel.tsx`.
     if (pendingDeeplinks.length > 0) {
       const drained = pendingDeeplinks.splice(0);
       for (const url of drained) {
@@ -2531,9 +2549,7 @@ const deeplink: DeeplinkBridge = {
       }
     }
     return () => {
-      if (deeplinkCallback === callback) {
-        deeplinkCallback = null;
-      }
+      deeplinkSubscribers.delete(callback);
     };
   },
 };

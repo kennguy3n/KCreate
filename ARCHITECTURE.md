@@ -764,7 +764,7 @@ green. The only consumer is `kcreate_bridge` under the
 
 The full route catalogue lives in
 [`crates/kcreate_kchat_client/src/rest.rs`](./crates/kcreate_kchat_client/src/rest.rs)
-and the typed DTOs are in `crates/kcreate_kchat_client/src/dto.rs`.
+and the typed DTOs are in `crates/kcreate_kchat_client/src/protocol.rs`.
 At a glance:
 
 | Route                                                        | Method | Purpose                                              |

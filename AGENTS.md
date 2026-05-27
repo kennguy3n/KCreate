@@ -71,6 +71,12 @@ KCreate/
 │   │                        Deterministic Ed25519 derivation + signed-
 │   │                        attestation minting. Behind `kchat-dev-issuer`
 │   │                        feature flag on kcreate_bridge.
+│   ├── kcreate_audit/       Phase 6 audit trail: append-only operation +
+│   │                        AI-action log persisted to a SEPARATE SQLite
+│   │                        DB from the project DB (so audit history
+│   │                        survives project close / delete). Structured
+│   │                        queries by date / action / node, surfaced via
+│   │                        `kcreate_bridge::audit` + `AuditPanel.tsx`.
 │   └── kcreate_tests/       cross-crate integration tests (no library
 │                            surface — see tests/ subdir)
 ├── tools/
@@ -255,3 +261,28 @@ pnpm lint
 | `.kbrand` import / export                | `crates/kcreate_export/src/kbrand.rs` |
 | Slice export                             | `crates/kcreate_export/src/slice.rs` |
 | Spot colors / overprint / preflight      | `crates/kcreate_core/src/color.rs` + `crates/kcreate_export/src/preflight.rs` |
+| Operational CRDT layer                   | `crates/kcreate_collab/src/crdt.rs` |
+| Pantone spot-color catalog loader        | `crates/kcreate_core/src/color.rs` (`SpotColorLibrary::load_catalog`) |
+| Overprint table + trapping preflight     | `crates/kcreate_export/src/preflight.rs` (`PreflightCheck::{Overprint,Trapping}`) |
+| Model pack installer + hash gate         | `crates/kcreate_ai/src/model_registry.rs` (`install_model_pack`) |
+| ESRGAN ONNX upscale                      | `crates/kcreate_ai/src/upscale.rs` (ONNX backend) |
+| SAM segmentation                         | `crates/kcreate_ai/src/segment.rs` |
+| Local template marketplace               | `crates/kcreate_core/src/marketplace.rs` |
+| TemplateMarketplace UI                   | `apps/desktop/renderer/src/components/TemplateMarketplace.tsx` |
+| SpotColorLibraryPanel                    | `apps/desktop/renderer/src/components/SpotColorLibraryPanel.tsx` |
+| Audit event types                        | `crates/kcreate_audit/src/event.rs` |
+| Audit SQLite store                       | `crates/kcreate_audit/src/store.rs` |
+| Audit bridge surface                     | `crates/kcreate_bridge/src/audit.rs` |
+| AuditPanel UI                            | `apps/desktop/renderer/src/components/AuditPanel.tsx` |
+| Group undo / redo + atomic rollback      | `crates/kcreate_bridge/src/document.rs` (`ApplyPatchSnapshot`, `APPLY_PATCH_COMMANDS`) |
+| Lazy thumbnail generation                | `crates/kcreate_bridge/src/thumbnails.rs` |
+| Figma JSON importer                      | `crates/kcreate_export/src/figma_import.rs` |
+| Sketch JSON importer                     | `crates/kcreate_export/src/sketch_import.rs` |
+| Keyboard shortcut registry               | `apps/desktop/renderer/src/shortcuts/{registry,useShortcuts}.ts` |
+| KeyboardShortcutsPanel                   | `apps/desktop/renderer/src/components/KeyboardShortcutsPanel.tsx` |
+| Theme system (CSS-variable driven)       | `apps/desktop/renderer/index.html` (`:root[data-theme="dark"]`) + `src/styles/{tokens.ts,ThemeProvider.tsx}` |
+| Drag-and-drop (OS file manager)          | `apps/desktop/renderer/src/pages/EditorPage.tsx` (dropzone handlers) |
+| Clipboard paste op                       | `crates/kcreate_bridge/src/document.rs` (`clipboard_paste`) |
+| Layer panel search + tagging             | `apps/desktop/renderer/src/components/LayerPanel.tsx` + `layer_color_set` op |
+| E2E workflow tests                       | `crates/kcreate_tests/tests/e2e_workflow.rs` |
+| Acceptance-criteria benches              | `crates/kcreate_export/benches/batch_50_assets.rs`, `crates/kcreate_renderer/benches/{cold_start,viewport_pan,raster_open_64mp}.rs` |

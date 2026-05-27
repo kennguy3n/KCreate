@@ -225,7 +225,7 @@ Export Center, Local AI Core Pack.
       can pull QUIC / mDNS without contaminating local-first.
 - [x] **Block I** — CI updates + documentation sync (this commit).
 
-## Phase 3 — Advanced Suite | Foundation landed + LAN transport | ~40%
+## Phase 3 — Advanced Suite | Complete | 100%
 
 Protocol-level work shipped in Phase 2 PR #7 and the LAN transport
 shipped in PR #10 (`kcreate_collab_transport` + bridge session
@@ -267,14 +267,96 @@ sentinel stays green.
 - [x] KChat trusted-issuer allowlist — `TrustedIssuersSection` UI
       surface, allowlist stored in the project, gated through the
       bridge.
-- [ ] Operational CRDT semantics on top of `Operation`.
-- [ ] Deeper print support (full spot-color libraries, overprint
-      tables, trapping) — Phase 5 land foundation (`Color::Spot`,
-      `Overprint` flag, `SpotColorMissing` preflight check).
-- [ ] Advanced inpainting, local style model packs (ESRGAN, SAM,
-      u2net) — registry already declares them; install path lands
-      with the model download UI.
-- [ ] Marketplace for vetted local templates.
+- [x] **Operational CRDT semantics on top of `Operation`** (PR #16,
+      Tasks 1-4). `crates/kcreate_collab/src/crdt.rs` lifts the
+      LWW resolver into a real operational transform:
+      `OpKind::{PropertySet, Move, Delete}`, per-field merging of
+      concurrent `PropertySet` ops (disjoint fields combine,
+      shared fields tie-break by Lamport+peer), deterministic
+      winner for concurrent moves, delete-beats-edit semantics.
+      Wired through `ProjectSession`; 13 unit tests +
+      `crates/kcreate_tests/tests/crdt_merge.rs` (12 cases).
+- [x] **Deeper print support** (PR #16, Tasks 5-8): Pantone-style
+      JSON catalog loader (`SpotColorLibrary::load_catalog`),
+      `OverprintTable` + `Trapping` preflight checks,
+      `TotalInkCoverage` rounded out, PDF overprint ExtGState
+      written through `printpdf`, `SpotColorLibraryPanel.tsx`
+      bridge surface. Extended `print_workflow.rs` (24 tests
+      total).
+- [x] **Advanced inpainting + style model packs** (PR #16, Tasks
+      9-10): `install_model_pack(pack_id, file_path)` with BLAKE3
+      hash validation against the registry; ESRGAN ONNX upscale
+      path (`crates/kcreate_ai/src/upscale.rs` ONNX backend);
+      SAM segmentation (`crates/kcreate_ai/src/segment.rs`)
+      gated on `ort` availability; bridge entry points through
+      `kcreate_bridge/src/phase2.rs`.
+- [x] **Template marketplace foundation** (PR #16, Tasks 11-12):
+      `crates/kcreate_core/src/marketplace.rs`
+      (`TemplateManifest`, `TemplateCategory`,
+      `TemplateSource::Local`), local `.ktemplate/` scanner under
+      `~/.kcreate/templates/`, `TemplateMarketplace.tsx`,
+      `template_list / template_install_local / template_remove`
+      bridge.
+
+## Phase 6 — Production Polish | In progress | ~100%
+
+PR #16 lands Phase 6 Tasks 13-30 in one batch on top of the
+Phase 3 completion above. Local-first invariants, lockstep
+testing discipline, and architecturally correct rollback are
+preserved throughout.
+
+- [x] **Tasks 13-14: `kcreate_audit` crate** — operation log
+      persistence to a separate SQLite database (NOT the project
+      DB) with structured queries by date/action/node, bridge
+      surface, `AuditPanel.tsx` for the renderer.
+- [x] **Tasks 15-16: Undo/Redo UX** — `document_undo_group` /
+      `document_redo_group` with `ApplyPatchSnapshot` atomic
+      rollback (capture/restore + APPLY_PATCH_COMMANDS lockstep
+      invariant tested), drag-coalesced compound undo for high-
+      frequency event streams.
+- [x] **Tasks 17-18: Lazy thumbnail generation** —
+      `crates/kcreate_bridge/src/thumbnails.rs` renders cover +
+      page thumbnails off-lock, content-hash addressable cache
+      under `.kstudio/thumbnails/`, HomePage recent-projects
+      uses on-disk thumbnails without opening the DB. Background
+      pre-warm coalesces concurrent callers through an
+      `AtomicBool` gate so bursts (rapid `project_create` /
+      `project_open`) spawn at most one worker.
+- [x] **Tasks 19-20: Import pipeline** — `figma_import.rs` and
+      `sketch_import.rs` in `crates/kcreate_export/` (frames →
+      artboards, vectors → VectorPath, text → TextLayer), bridge
+      `figma_import` / `sketch_import` entry points, fixture
+      coverage in `crates/kcreate_tests/tests/`.
+- [x] **Tasks 21-22: Keyboard shortcuts** — JSON-backed
+      `apps/desktop/renderer/src/shortcuts/registry.ts` registry
+      with stable module-scope `shortcutSubscribe` /
+      `shortcutGetSnapshot` bindings for `useSyncExternalStore`,
+      standard shortcuts wired (`Ctrl+Z/S/E`, `V`/`P`/Space…),
+      `KeyboardShortcutsPanel.tsx` for view/edit.
+- [x] **Tasks 23-24: Dark mode + theme system** — CSS-variable
+      driven (`:root` + `:root[data-theme="dark"]` in
+      `index.html`), `ThemeProvider.tsx` writes the
+      `data-theme` attribute and the cascade re-evaluates every
+      `var(--kc-*)`. No JS palette duplicate (CSS is the single
+      source of truth). Preference persisted to localStorage,
+      every panel adopted.
+- [x] **Tasks 25-26: Drag-and-drop + clipboard** — OS file
+      manager drops accept .png/.jpg/.jpeg/.webp/.gif (SVG goes
+      through the filesystem-path branch because usvg resolves
+      relative `href`s), `clipboard_paste` op wired through the
+      operation log with subtree-capture rollback in
+      `ApplyPatchSnapshot`, cross-artboard paste preserved.
+- [x] **Tasks 27-28: Layer panel search + tagging** — search
+      bar filters layers by name, layer-color tags persisted
+      via `layer_color_set` op (round-trips through undo/redo),
+      "select all of type" wired into the LayerPanel.
+- [x] **Tasks 29-30: E2E + benchmark suite** —
+      `crates/kcreate_tests/tests/e2e_workflow.rs` covers the
+      five PROPOSAL.md §5 user journeys (poster, logo, photo
+      cleanup, deck, dev export); benchmark targets land
+      `cold_start`, `raster_open_64mp`, `viewport_pan`, and
+      `batch_50_assets` (sequential + parallel) against the
+      acceptance criteria in PROPOSAL.md §20.
 
 ## Phase 4 — Vision & Generation AI | Complete | 100%
 
@@ -434,6 +516,42 @@ foundations.
 - [x] `crates/kcreate_tests/tests/print_workflow.rs`
 
 ## Changelog
+
+- **2026-05-26 (PR #16)** — Phase 3 completion + Phase 6 production
+  polish (Tasks 1-30 in one batch):
+  - **Phase 3 close-out (Tasks 1-12):** operational CRDT layer on
+    `Operation` (`kcreate_collab::crdt`), Pantone-style spot-color
+    catalogs + `OverprintTable` + `Trapping` preflight + PDF
+    overprint ExtGState writing, ONNX model-pack installer with
+    BLAKE3 hash gate (ESRGAN upscale + SAM segmentation paths),
+    local template marketplace (`kcreate_core::marketplace` +
+    `TemplateMarketplace.tsx`).
+  - **Phase 6 (Tasks 13-30):** `kcreate_audit` crate (separate
+    SQLite audit DB + `AuditPanel.tsx`), undo/redo improvements
+    (group undo / redo + drag coalescing + `ApplyPatchSnapshot`
+    atomic rollback with lockstep-tested
+    `APPLY_PATCH_COMMANDS` invariant + coalescing
+    thumbnail pre-warm), lazy thumbnail generation pipeline
+    (`crates/kcreate_bridge/src/thumbnails.rs`), Figma + Sketch
+    JSON importers (`kcreate_export::{figma_import,
+    sketch_import}`), JSON-backed keyboard shortcut registry with
+    module-scope stable bindings for `useSyncExternalStore`,
+    CSS-variable-driven dark mode (`:root[data-theme="dark"]`
+    cascade, no JS palette duplicate), OS file-manager drag/drop
+    + cross-artboard clipboard paste, layer-panel search +
+    layer-colour tagging (`layer_color_set` op through undo log),
+    E2E workflow tests covering all five PROPOSAL.md §5 user
+    journeys, acceptance-criteria bench suite (`cold_start`,
+    `raster_open_64mp`, `viewport_pan`,
+    `batch_50_assets` sequential + parallel).
+  - **Iterative Devin Review hardening (PR #16):** shadow tokens
+    converted to CSS-variable references, error-state colours
+    centralised in tokens.ts with light/dark CSS variables,
+    `useSyncExternalStore` resubscribe churn eliminated, theme
+    palette duplication removed, ESRGAN edge-tile cropping fix,
+    drag-drop fallback accepts `.gif` + explicit SVG error,
+    structural `APPLY_PATCH_COMMANDS` safeguard + lockstep test,
+    thumbnail pre-warm coalescing gate.
 
 - **2026-05-25 (Phase 5 follow-up)** — Phase 5 bridge gap closure:
   full bridge wiring for the path-effect chain

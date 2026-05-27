@@ -71,6 +71,17 @@ KCreate/
 │   │                        Deterministic Ed25519 derivation + signed-
 │   │                        attestation minting. Behind `kchat-dev-issuer`
 │   │                        feature flag on kcreate_bridge.
+│   ├── kcreate_kchat_client/ Phase 7 production KChat Desktop local-
+│   │                        IPC client. JSON-RPC 2.0 over Unix
+│   │                        domain socket (~/.kchat/kcreate.sock)
+│   │                        or Windows named pipe
+│   │                        (\\.\pipe\kchat-kcreate). Sources signed
+│   │                        membership attestations from a running
+│   │                        uney-chat-desktop instance. Behind
+│   │                        `kchat-desktop` feature flag on
+│   │                        kcreate_bridge; kept OUT of the editing-
+│   │                        path dep tree (local-first sentinel
+│   │                        still green).
 │   ├── kcreate_audit/       Phase 6 audit trail: append-only operation +
 │   │                        AI-action log persisted to a SEPARATE SQLite
 │   │                        DB from the project DB (so audit history
@@ -286,3 +297,16 @@ pnpm lint
 | Layer panel search + tagging             | `apps/desktop/renderer/src/components/LayerPanel.tsx` + `layer_color_set` op |
 | E2E workflow tests                       | `crates/kcreate_tests/tests/e2e_workflow.rs` |
 | Acceptance-criteria benches              | `crates/kcreate_export/benches/batch_50_assets.rs`, `crates/kcreate_renderer/benches/{cold_start,viewport_pan,raster_open_64mp}.rs` |
+| KChat Desktop IPC client (transport)     | `crates/kcreate_kchat_client/src/transport.rs` |
+| KChat Desktop IPC client (protocol)      | `crates/kcreate_kchat_client/src/protocol.rs` (+ `protocol_spec.md`) |
+| KChat Desktop attestation bridging       | `crates/kcreate_kchat_client/src/attestation.rs` |
+| KChat Desktop bridge surface (N-API)     | `crates/kcreate_bridge/src/kchat_desktop.rs` |
+| Document ACL                             | `crates/kcreate_collab/src/acl.rs` |
+| Clipboard share (X25519 + ChaCha20)      | `crates/kcreate_collab/src/clipboard.rs` |
+| AccessControlPanel UI                    | `apps/desktop/renderer/src/components/AccessControlPanel.tsx` |
+| CursorOverlay UI                         | `apps/desktop/renderer/src/components/CursorOverlay.tsx` |
+| SelectionOverlay UI                      | `apps/desktop/renderer/src/components/SelectionOverlay.tsx` |
+| InvitePanel UI                           | `apps/desktop/renderer/src/components/InvitePanel.tsx` |
+| ConflictToast UI                         | `apps/desktop/renderer/src/components/ConflictToast.tsx` |
+| Collab audit events                      | `crates/kcreate_audit/src/event.rs` (`AuditEventKind::Collab*`) |
+| Collab perf benchmarks                   | `crates/kcreate_bridge/benches/collab_perf.rs` (criterion, `collab` feature) |

@@ -60,7 +60,8 @@ See [`PROPOSAL.md`](./PROPOSAL.md) for the full product spec.
 | Plugin sandbox       | `wasmi` 0.42 (pure Rust, no LLVM)                            |
 | MCP                  | `tiny_http` JSON-RPC over loopback                           |
 | LAN collaboration    | `quinn` (QUIC) + `mdns-sd` (mDNS-SD) + `rustls` (TLS) + `tokio` (async runtime; opt-in via `collab` feature on `kcreate_bridge`) |
-| Collaboration protocol | Ed25519-signed envelopes, Lamport clocks, LWW conflict resolution, append-only operation journal |
+| Collaboration protocol | Ed25519-signed envelopes, Lamport clocks, LWW + operational CRDT conflict resolution, append-only operation journal, 60-min QUIC cert rotation, per-peer rate limits, ChaCha20-Poly1305 encrypted clipboard share over BLAKE3-derived X25519 session keys |
+| KChat Desktop integration | `kcreate_kchat_client`: JSON-RPC 2.0 over Unix domain socket / Windows named pipe to a running `uneycom/uney-chat-desktop` instance; community-gated sessions + member roster sync + conversation-based document sharing (opt-in via `kchat-desktop` feature on `kcreate_bridge`) |
 | Brand kit format     | `.kbrand` ZIP archive: `manifest.json` + `fonts/` (TTF/OTF) + `logos/` (PNG/SVG/JPEG) |
 
 See [`ARCHITECTURE.md`](./ARCHITECTURE.md) for the technical design.
@@ -120,8 +121,24 @@ cargo build --workspace --features kcreate_bridge/collab
 This pulls `quinn`, `rustls`, `mdns-sd`, and `tokio` into the bridge
 but still keeps the editing path crates network-free (the
 `crates/kcreate_tests/tests/local_first.rs` deny-list enforces this).
-The `kchat-dev-issuer` feature flag enables the dev-side KChat
-membership issuer for integration tests.
+
+To additionally enable the real KChat Desktop integration (sources
+membership attestations from a running `uneycom/uney-chat-desktop`
+instance over local IPC), enable `kchat-desktop` as well:
+
+```bash
+cargo build --workspace --features kcreate_bridge/kchat-desktop
+```
+
+`kchat-desktop` implies `collab`. The dev-only `kchat-dev-issuer`
+flag — used by the integration tests to mint test attestations
+without a running uney-chat-desktop — remains available.
+
+Run the Phase 7 collab performance benchmarks (criterion):
+
+```bash
+cargo bench -p kcreate_bridge --features collab --bench collab_perf
+```
 
 ### Test
 
@@ -183,6 +200,13 @@ KCreate/
 │   ├── kcreate_kchat/            Dev-side KChat group-membership issuer (test attestations
 │   │                              against deterministic Ed25519 keys). Behind
 │   │                              `kchat-dev-issuer` feature flag.
+│   ├── kcreate_kchat_client/     Phase 7 local-IPC client for the real KChat Desktop
+│   │                              (`uneycom/uney-chat-desktop`). JSON-RPC 2.0 over Unix
+│   │                              socket / named pipe — never the internet. Behind the
+│   │                              `kchat-desktop` feature flag on kcreate_bridge.
+│   ├── kcreate_audit/            Append-only audit trail for operations + AI actions +
+│   │                              collab lifecycle events. Separate SQLite DB so audit
+│   │                              history survives project close/delete.
 │   └── kcreate_tests/            Cross-crate integration tests
 ├── tools/
 │   └── kcreate_diffusion/        Loopback Python diffusion sidecar (FLUX.2-Klein-4B,
@@ -197,6 +221,67 @@ KCreate/
 ├── package.json                  pnpm root
 └── .github/workflows/ci.yml      CI (Linux + macOS + Windows)
 ```
+
+## Collaboration & KChat Desktop integration
+
+Phase 7 connects KCreate's LAN collaboration stack to the real
+KChat Desktop client (`uneycom/uney-chat-desktop`) running on
+the same machine. The integration is opt-in through the
+`kchat-desktop` feature flag on `kcreate_bridge` and stays
+local-first end-to-end — the editing-path closure walked by
+`crates/kcreate_tests/tests/local_first.rs` is still
+network-free; the IPC client links `tokio::net::UnixStream`
+(Unix) / `tokio::net::windows::named_pipe` (Windows) and never
+the internet.
+
+### What it adds
+
+- **Community-gated sessions.** A KCreate collab session is
+  bound to a uney-chat-desktop community. LAN peers in
+  different communities cannot discover each other via mDNS
+  (the community id is folded into the service TXT record).
+- **Real-time peers.** Coloured cursor + selection overlays
+  show every connected peer in the current viewport. Conflict
+  resolution surfaces a non-blocking toast with an undo link.
+  Late joiners receive the full operation journal via a
+  `ResumeBundle` so the document state converges immediately.
+- **Document sharing through KChat conversations.** "Share
+  document" posts a rich invite card (project id + owner
+  identity + cert fingerprint + community id) into a channel.
+  Recipients accept the invite and KCreate dials the owner
+  peer directly over QUIC.
+- **Role-based permissions.** Community owner/admin → editor
+  with kick + ACL-manage privileges. Community member →
+  editor (host-downgradable to viewer). Viewer = read-only.
+- **Security hardening.** 60-minute QUIC cert rotation,
+  per-peer rate limits (100 ops/s + 20 presence/s),
+  ChaCha20-Poly1305 encrypted clipboard share over a
+  BLAKE3-derived X25519 session key, per-project ACL
+  (`<project_dir>/acl.json`), full audit trail in the
+  `kcreate_audit` separate-DB store.
+- **Performance.** 50 ms / 200-op outbound batching, 20 Hz
+  presence throttling with a 2 px delta floor and 2 s idle
+  suppression, selective per-page sync for multi-page docs.
+
+### Quick start
+
+Start two KCreate instances on the same LAN with the
+`kchat-desktop` feature enabled and a running
+uney-chat-desktop on each machine. The bridge auto-detects
+the local socket at `~/.kchat/kcreate.sock` (Unix) /
+`\\.\pipe\kchat-kcreate` (Windows) and asks the user to pick
+one of their communities; selecting a community installs the
+KChat-signed attestation in the collab gate and unlocks every
+multiplayer entry point.
+
+The IPC protocol that KCreate speaks to uney-chat-desktop is
+documented end-to-end in
+[`crates/kcreate_kchat_client/src/protocol_spec.md`](./crates/kcreate_kchat_client/src/protocol_spec.md);
+this is the contract the uney-chat-desktop team implements on
+the server side.
+
+See [`ARCHITECTURE.md` § KChat Desktop Integration](./ARCHITECTURE.md)
+for the design.
 
 ## License
 

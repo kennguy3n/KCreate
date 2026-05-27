@@ -127,6 +127,17 @@ zip = { workspace = true }
 name = "scene_sync_multi_peer"
 harness = false
 
+# Phase 7 (Task 28): collab performance benchmarks. Requires the
+# `collab` feature so the bench can pull in `kcreate_collab` /
+# `ed25519-dalek` for journal + envelope construction. The bench
+# never touches the QUIC transport — the cost we care about is in
+# the editing-path crates (journal, CRDT, signing, serialisation),
+# all of which are network-free.
+[[bench]]
+name = "collab_perf"
+harness = false
+required-features = ["collab"]
+
 [features]
 default = []
 # Mirror the renderer's CPU-only feature flag for headless N-API builds.

@@ -738,6 +738,166 @@ seal/open round-trips, tampering detection, version mismatch,
 LWW tiebreaks across disjoint and overlapping affected-node sets,
 replay-window rejection, project-id scoping, peer cap.
 
+## 17c. KChat Desktop integration (Phase 7, ships in PR #17)
+
+`kcreate_kchat_client` is the **local-IPC client** that lets KCreate
+source membership attestations from a running KChat Desktop
+(`uneycom/uney-chat-desktop`) instance instead of a dev-mint
+issuer. It speaks a JSON-RPC 2.0 protocol — newline-delimited
+frames over a Unix domain socket (`~/.kchat/kcreate.sock` on
+macOS/Linux) or a Windows named pipe (`\\.\pipe\kchat-kcreate`).
+Like `kcreate_collab_transport`, the crate is kept **out of the
+editing-path dependency tree** so the local-first sentinel
+(`crates/kcreate_tests/tests/local_first.rs`) stays green; the
+only consumer is `kcreate_bridge` under the `kchat-desktop`
+feature flag.
+
+### Local IPC protocol
+
+The full method catalogue is documented in
+[`crates/kcreate_kchat_client/src/protocol_spec.md`](./crates/kcreate_kchat_client/src/protocol_spec.md).
+At a glance:
+
+| Method                              | Direction | Purpose                                             |
+| ----------------------------------- | --------- | --------------------------------------------------- |
+| `kchat.identity.get`                | request   | Local user JID + Ed25519 public key + display name. |
+| `kchat.communities.list`            | request   | All communities the user belongs to.                |
+| `kchat.communities.getMembers`      | request   | Roster + role for one community.                    |
+| `kchat.communities.getMembership`   | request   | Signed `KChatMembership` attestation.               |
+| `kchat.conversations.list`          | request   | Channels in a community.                            |
+| `kchat.conversations.postMessage`   | request   | Post a rich card (e.g. document-share invite).      |
+| `kchat.events.subscribe`            | request   | Open a server-initiated notification stream.        |
+| `kchat.events.notification`         | notify    | Streamed roster / presence changes (server → KCreate). |
+
+Connection lifecycle: 5 s connect timeout, 10 s per-request
+timeout, exponential reconnect (1 → 2 → 4 → … → 30 s),
+graceful shutdown. Frame multiplexing uses JSON-RPC id-based
+correlation.
+
+### Community → collaboration gate mapping
+
+`KChatDesktopAuthority` (in
+`crates/kcreate_kchat_client/src/attestation.rs`) implements the
+existing `KChatGroupAuthority` trait but sources its membership
+live: when the bridge calls `kchat_desktop_select_community`, the
+client requests `kchat.communities.getMembership`, validates the
+returned signature against the issuer's published key, and
+installs the attestation in the collab gate. Auto-refresh kicks
+in when the attestation is within 5 minutes of expiry so a
+long-running session never has to interrupt the user with a
+re-auth prompt.
+
+The community id flows downstream:
+
+- `session_start` accepts the community id and the mDNS service
+  TXT record (`community=<id>`) so two KCreate instances on
+  different communities cannot LAN-discover each other.
+- The roster-sync background task (30 s `getMembers` poll)
+  notices when a peer has been revoked from the community and
+  emits `SessionEvent::PeerKicked` + `Goodbye(Kicked)` on the
+  affected QUIC connection.
+- Community-member role (`owner` / `admin` / `member`) maps
+  to `CollabPermission::{Editor, Viewer}` via the
+  bridge-layer policy in
+  `crates/kcreate_bridge/src/collab.rs` — viewers fail the
+  `session_queue_operation` / `session_broadcast_operations`
+  N-API surface so they cannot author edits even if the
+  renderer asks them to.
+
+### Bridge surface
+
+`crates/kcreate_bridge/src/kchat_desktop.rs` exposes the
+following N-API entry points, all wired through `bridge.ts`,
+`main.ts`, `preload.ts`, `scene.ts` (wire-format lockstep):
+
+```
+kchat_desktop_connect()            -> attempt local socket connect
+kchat_desktop_disconnect()         -> tear down + clear attestation
+kchat_desktop_status()             -> connection state + identity
+kchat_desktop_list_communities()
+kchat_desktop_select_community(id) -> install signed attestation
+kchat_desktop_get_community_members(id)
+kchat_desktop_list_conversations(community_id)
+kchat_desktop_share_to_conversation(conversation_id, invite_json)
+kchat_desktop_accept_invite(invite_json) -> dial owner peer
+```
+
+### Security model
+
+- **Attestation verification.** Every attestation is verified
+  against the issuer's Ed25519 key (returned in the protocol's
+  `IdentityResponse`) before the bridge will install it. Replay
+  protection comes from the existing
+  `KChatMembership::expires_at` window and the per-peer nonce
+  ring in `ProjectSession`.
+- **Document ACL.** Each `.kstudio/` project carries an
+  `acl.json` enumerating allowed peer public keys + permission.
+  ACL match is sufficient on its own; community membership is
+  also sufficient. Unknown peers in neither set are rejected
+  with `Welcome(Reject, "not authorized")`. CRUD via
+  `AccessControlPanel.tsx`.
+- **Rate limiting.** Per-peer token buckets enforce 100 ops/s
+  + 20 presence/s defaults (configurable via
+  `SessionConfig::{max_ops_per_second, max_presence_per_second}`).
+  First strike → `SessionEvent::RateLimitWarning`; sustained 3 s
+  violation → forced disconnect.
+- **Key rotation.** 60 min default QUIC cert rotation via
+  `Message::KeyRotation { new_cert_fingerprint, transition_deadline_ms }`.
+  Peers that miss the 30 s acknowledgement window are disconnected
+  with `key-rotation-timeout`.
+- **Clipboard share.** `Message::ClipboardShare` carries
+  ChaCha20-Poly1305 ciphertext over a BLAKE3-derived X25519
+  session key (Ed25519 identity keys are converted with
+  `curve25519_dalek::scalar::Scalar::clamp_integer`). Nonces are
+  caller-generated 12-byte random arrays; offers surface in
+  `pendingClipboardOffers` until the user accepts.
+- **Audit trail.** `kcreate_audit` persists every collab
+  lifecycle event (`AuditEventKind::Collab` variants) to a
+  **separate** SQLite database so audit history outlives
+  project close.
+
+### Performance
+
+The Phase 7 bridge tightens the wire under load:
+
+- **Operation batching.** `session_queue_operation` /
+  `session_flush_pending_operations` /
+  `session_tick_outbound_batch`. Defaults: 50 ms flush
+  interval, 200 ops max per batch
+  (`SessionConfig::{batch_flush_interval_ms,
+  batch_flush_max_ops}`). The renderer queues ops on every
+  local mutation and ticks the timer on the same cadence as
+  `session_drain_events`; drag-end flushes eagerly.
+- **Lazy presence throttling.** `SessionConfig::{presence_min_interval_ms,
+  presence_move_threshold_px, presence_idle_suppression_ms}`
+  defaults to 50 ms / 2 px / 2 000 ms. Selection or
+  active-page changes always broadcast; cursor moves go
+  through the gate.
+- **Selective sync.** `session_set_active_pages` filters the
+  renderer event stream so off-page presence updates and
+  conflict toasts are suppressed; operations still journal
+  across the whole project so document consistency is
+  preserved.
+- **Benchmarks.**
+  `crates/kcreate_bridge/benches/collab_perf.rs` (criterion,
+  gated on `collab`). Covers journal append throughput, CRDT
+  merge latency (disjoint vs overlap vs LWW baseline),
+  presence serialisation at 1 / 5 / 20 peers, 10 000-entry
+  resume bundle, op batching round-trip (200 envelopes vs 1
+  batch of 200 ops).
+
+### Feature-flag table
+
+| Flag                | Pulls in                              | Default | Use case                                          |
+| ------------------- | ------------------------------------- | ------- | ------------------------------------------------- |
+| `collab`            | `kcreate_collab` + `kcreate_collab_transport` + `quinn` + `rustls` + `mdns-sd` + `tokio` | off | LAN QUIC + mDNS transport for multi-peer editing.       |
+| `kchat-dev-issuer`  | `kcreate_kchat` (implies `collab`)    | off     | Local dev / integration tests: mint a test KChat attestation against a deterministic key. |
+| `kchat-desktop`     | `kcreate_kchat_client` (implies `collab`) | off | Production: source attestation from a running KChat Desktop over local IPC. |
+
+Both `kchat-*` flags are mutually compatible — a Phase 7 build
+typically enables `kchat-desktop` (production attestation) and
+keeps `kchat-dev-issuer` for the integration test crate.
+
 ## 18. Resource optimization
 
 - **Startup.** Lazy-load model packs; precompile no shaders we won't
@@ -897,12 +1057,23 @@ crates/
 │                        # Mints test attestations against deterministic
 │                        # Ed25519 keys. Behind the `kchat-dev-issuer`
 │                        # bridge feature flag.                                              [EXISTS]
+├── kcreate_kchat_client/ # Phase 7 production KChat Desktop local-IPC
+│                        # client. JSON-RPC 2.0 over Unix domain socket
+│                        # (~/.kchat/kcreate.sock) or Windows named
+│                        # pipe (\\.\pipe\kchat-kcreate). Pulled in by
+│                        # `kcreate_bridge` only when the
+│                        # `kchat-desktop` feature is enabled; kept out
+│                        # of the editing-path dep tree (local-first
+│                        # sentinel still green).                                            [EXISTS]
 └── kcreate_audit/       # Phase 6 audit trail: append-only operation +
                          # AI-action log persisted to a SEPARATE SQLite
                          # database from the project DB. Structured
                          # queries by date / action / node, surfaced
                          # through `kcreate_bridge::audit` and the
-                         # renderer `AuditPanel.tsx`.                                        [EXISTS]
+                         # renderer `AuditPanel.tsx`. Phase 7 added
+                         # collab lifecycle events (peer join/leave/
+                         # kick, conflict resolved, KChat connect/
+                         # disconnect) to the same store.                                    [EXISTS]
 ```
 
 Also shipped under `tools/`:

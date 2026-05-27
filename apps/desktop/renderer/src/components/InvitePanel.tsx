@@ -43,6 +43,64 @@ interface InvitePayload {
   issuedAt: string;
 }
 
+/**
+ * Decode a `kcreate://join?payload=<base64url(invite_json)>` URL
+ * into the raw invite JSON, suitable for stuffing into the panel's
+ * textarea (the standard validation effect picks it up from there).
+ *
+ * Returns `null` for any non-`kcreate://join` URL or any URL whose
+ * payload is missing / not base64url / not valid JSON. We
+ * deliberately don't surface a parse error to the user here — a
+ * stray click on a malformed link shouldn't yank focus to the
+ * panel with an error message; the panel only reacts when there's
+ * an actual invite to act on.
+ *
+ * Mirrors `buildJoinDeeplink` in
+ * `apps/kchat-extension/src/store.ts` — keep both sides in sync if
+ * the URL grammar changes.
+ */
+function decodeJoinDeeplink(url: string): string | null {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return null;
+  }
+  if (parsed.protocol !== "kcreate:") return null;
+  // `new URL("kcreate://join?...")` puts "join" in `hostname`, but
+  // a few Windows shell variations route the whole tail into
+  // `pathname` with no hostname — accept both.
+  const route = parsed.hostname || parsed.pathname.replace(/^\/+/u, "");
+  if (route !== "join") return null;
+  const payloadParam = parsed.searchParams.get("payload");
+  if (!payloadParam) return null;
+  // base64url -> base64 -> bytes -> UTF-8 string.
+  const padded =
+    payloadParam.replaceAll("-", "+").replaceAll("_", "/") +
+    "=".repeat((4 - (payloadParam.length % 4)) % 4);
+  let json: string;
+  try {
+    // `atob` decodes base64 to a byte-string; we then re-decode
+    // that as UTF-8 so non-ASCII characters in the payload survive
+    // (e.g. an owner display name with accents).
+    const binary = atob(padded);
+    const bytes = Uint8Array.from(binary, (c) => c.charCodeAt(0));
+    json = new TextDecoder("utf-8").decode(bytes);
+  } catch {
+    return null;
+  }
+  // Sanity-check that the decoded blob is JSON before handing it
+  // off to the panel. A non-JSON payload would just bounce off the
+  // textarea validator, but failing here keeps the visible error
+  // bracketed to the panel.
+  try {
+    JSON.parse(json);
+  } catch {
+    return null;
+  }
+  return json;
+}
+
 function tryParseInvite(raw: string): InvitePayload | null {
   try {
     const obj = JSON.parse(raw) as Record<string, unknown>;
@@ -113,6 +171,23 @@ export function InvitePanel({ membership, onJoined }: InvitePanelProps) {
     setError(null);
     setPending(parsed);
   }, [raw, membership.groupId]);
+
+  // Phase 7 (Block E): when KChat Desktop fires a
+  // `kcreate://join?payload=<base64url(json)>` deeplink the main
+  // process forwards it on `kcreate/deeplink/received`. Decode the
+  // payload and stuff it into the raw textarea — the validation
+  // effect above takes care of the rest. The community mismatch
+  // check still fires, and accept-on-click is left to the user so
+  // they retain a confirmation step before dialling the host.
+  useEffect(() => {
+    const unsubscribe = window.kcreate.deeplink.onUrl((url) => {
+      const decoded = decodeJoinDeeplink(url);
+      if (decoded !== null) {
+        setRaw(decoded);
+      }
+    });
+    return unsubscribe;
+  }, []);
 
   const handleAccept = useCallback(async () => {
     if (!raw.trim()) return;

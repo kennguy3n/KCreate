@@ -61,7 +61,7 @@ See [`PROPOSAL.md`](./PROPOSAL.md) for the full product spec.
 | MCP                  | `tiny_http` JSON-RPC over loopback                           |
 | LAN collaboration    | `quinn` (QUIC) + `mdns-sd` (mDNS-SD) + `rustls` (TLS) + `tokio` (async runtime; opt-in via `collab` feature on `kcreate_bridge`) |
 | Collaboration protocol | Ed25519-signed envelopes, Lamport clocks, LWW + operational CRDT conflict resolution, append-only operation journal, 60-min QUIC cert rotation, per-peer rate limits, ChaCha20-Poly1305 encrypted clipboard share over BLAKE3-derived X25519 session keys |
-| KChat Desktop integration | `kcreate_kchat_client`: JSON-RPC 2.0 over Unix domain socket / Windows named pipe to a running `uneycom/uney-chat-desktop` instance; community-gated sessions + member roster sync + conversation-based document sharing (opt-in via `kchat-desktop` feature on `kcreate_bridge`) |
+| KChat backend integration | `kcreate_kchat_client`: HTTPS REST (`reqwest` + `rustls`) to the shared KChat / Mattermost backend that `uneycom/uney-chat-desktop` also signs in to; community-gated sessions + member roster sync + conversation-based document sharing (opt-in via `kchat-backend` feature on `kcreate_bridge`). A thin `.kcz` companion extension (`apps/kchat-extension/`) renders a sidebar inside KChat Desktop and bridges deeplinks back to KCreate. |
 | Brand kit format     | `.kbrand` ZIP archive: `manifest.json` + `fonts/` (TTF/OTF) + `logos/` (PNG/SVG/JPEG) |
 
 See [`ARCHITECTURE.md`](./ARCHITECTURE.md) for the technical design.
@@ -122,17 +122,18 @@ This pulls `quinn`, `rustls`, `mdns-sd`, and `tokio` into the bridge
 but still keeps the editing path crates network-free (the
 `crates/kcreate_tests/tests/local_first.rs` deny-list enforces this).
 
-To additionally enable the real KChat Desktop integration (sources
-membership attestations from a running `uneycom/uney-chat-desktop`
-instance over local IPC), enable `kchat-desktop` as well:
+To additionally enable the real KChat backend integration
+(sources membership attestations over HTTPS REST from the shared
+KChat / Mattermost backend that `uneycom/uney-chat-desktop` also
+signs in to), enable `kchat-backend` as well:
 
 ```bash
-cargo build --workspace --features kcreate_bridge/kchat-desktop
+cargo build --workspace --features kcreate_bridge/kchat-backend
 ```
 
-`kchat-desktop` implies `collab`. The dev-only `kchat-dev-issuer`
+`kchat-backend` implies `collab`. The dev-only `kchat-dev-issuer`
 flag — used by the integration tests to mint test attestations
-without a running uney-chat-desktop — remains available.
+without standing up a real backend — remains available.
 
 Run the Phase 7 collab performance benchmarks (criterion):
 
@@ -200,10 +201,13 @@ KCreate/
 │   ├── kcreate_kchat/            Dev-side KChat group-membership issuer (test attestations
 │   │                              against deterministic Ed25519 keys). Behind
 │   │                              `kchat-dev-issuer` feature flag.
-│   ├── kcreate_kchat_client/     Phase 7 local-IPC client for the real KChat Desktop
-│   │                              (`uneycom/uney-chat-desktop`). JSON-RPC 2.0 over Unix
-│   │                              socket / named pipe — never the internet. Behind the
-│   │                              `kchat-desktop` feature flag on kcreate_bridge.
+│   ├── kcreate_kchat_client/     Phase 7 KChat backend REST client. HTTPS-only
+│   │                              (`reqwest` + `rustls`) against the shared KChat /
+│   │                              Mattermost backend that `uneycom/uney-chat-desktop`
+│   │                              also signs in to. Behind the `kchat-backend`
+│   │                              feature flag on kcreate_bridge; kept OUT of the
+│   │                              editing-path dep tree so the local-first
+│   │                              sentinel stays green.
 │   ├── kcreate_audit/            Append-only audit trail for operations + AI actions +
 │   │                              collab lifecycle events. Separate SQLite DB so audit
 │   │                              history survives project close/delete.
@@ -222,17 +226,21 @@ KCreate/
 └── .github/workflows/ci.yml      CI (Linux + macOS + Windows)
 ```
 
-## Collaboration & KChat Desktop integration
+## Collaboration & KChat backend integration
 
-Phase 7 connects KCreate's LAN collaboration stack to the real
-KChat Desktop client (`uneycom/uney-chat-desktop`) running on
-the same machine. The integration is opt-in through the
-`kchat-desktop` feature flag on `kcreate_bridge` and stays
-local-first end-to-end — the editing-path closure walked by
-`crates/kcreate_tests/tests/local_first.rs` is still
-network-free; the IPC client links `tokio::net::UnixStream`
-(Unix) / `tokio::net::windows::named_pipe` (Windows) and never
-the internet.
+Phase 7 connects KCreate's LAN collaboration stack to the
+shared KChat / Mattermost backend that `uneycom/uney-chat-desktop`
+also signs in to (the **Option C** integration shape). The
+integration is opt-in through the `kchat-backend` feature flag
+on `kcreate_bridge` and stays local-first for the editing path:
+the closure walked by
+`crates/kcreate_tests/tests/local_first.rs` excludes
+`kcreate_kchat_client` even though it links `reqwest` and
+`rustls`. The two desktop apps never speak a peer-to-peer
+Electron IPC — each one independently authenticates with the
+shared backend over HTTPS REST, and a thin `.kcz` companion
+extension (`apps/kchat-extension/`) renders a sidebar inside
+KChat Desktop that bridges deeplinks back to KCreate.
 
 ### What it adds
 
@@ -266,22 +274,21 @@ the internet.
 ### Quick start
 
 Start two KCreate instances on the same LAN with the
-`kchat-desktop` feature enabled and a running
-uney-chat-desktop on each machine. The bridge auto-detects
-the local socket at `~/.kchat/kcreate.sock` (Unix) /
-`\\.\pipe\kchat-kcreate` (Windows) and asks the user to pick
-one of their communities; selecting a community installs the
-KChat-signed attestation in the collab gate and unlocks every
-multiplayer entry point.
+`kchat-backend` feature enabled. Each instance signs in to the
+shared KChat / Mattermost backend through the
+`KChatSignInPanel` (server URL + credentials), picks one of
+their communities, and the bridge fetches a signed membership
+attestation from the backend and installs it in the collab
+gate. Multiplayer entry points unlock once the attestation is
+live. Drop the dev-only `kchat-dev-issuer` flag in for
+integration tests — it mints deterministic attestations
+without requiring a running backend.
 
-The IPC protocol that KCreate speaks to uney-chat-desktop is
-documented end-to-end in
-[`crates/kcreate_kchat_client/src/protocol_spec.md`](./crates/kcreate_kchat_client/src/protocol_spec.md);
-this is the contract the uney-chat-desktop team implements on
-the server side.
-
-See [`ARCHITECTURE.md` § KChat Desktop Integration](./ARCHITECTURE.md)
-for the design.
+The REST surface KCreate talks to is documented in
+[`ARCHITECTURE.md` § KChat backend integration](./ARCHITECTURE.md);
+the matching `.kcz` companion extension that ships inside
+KChat Desktop lives in
+[`apps/kchat-extension/`](./apps/kchat-extension/).
 
 ## License
 

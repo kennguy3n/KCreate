@@ -3991,6 +3991,26 @@ export interface ImageGenBridge {
  * `version: 1` and rejects future versions explicitly so a future
  * schema bump can't silently drop data.
  */
+/**
+ * Phase 7 (Block E) — `kcreate://` deeplink listener exposed by the
+ * preload bridge. The main process registers the protocol via
+ * `app.setAsDefaultProtocolClient("kcreate")` and forwards every
+ * accepted URL to the renderer through the
+ * `kcreate/deeplink/received` IPC channel; `InvitePanel.tsx`
+ * subscribes here so a share-card click in KChat Desktop auto-fills
+ * + accepts the invite when KCreate is already running.
+ */
+export interface DeeplinkBridge {
+  /**
+   * Register a callback that fires whenever a `kcreate://...` URL is
+   * dispatched by the OS shell. Returns an `unsubscribe` function;
+   * call it in a `useEffect` cleanup to detach the listener when
+   * the panel unmounts. Idempotent on the host side — repeated
+   * subscriptions each get their own slot on the IPC channel.
+   */
+  onUrl(callback: (url: string) => void): () => void;
+}
+
 export interface ClipboardBridge {
   /**
    * Serialise `nodeIds` (each with their descendants) into a portable
@@ -4059,6 +4079,7 @@ declare global {
       session: SessionBridge;
       kchat: KChatBridge;
       kchatBackend: KChatBackendBridge;
+      deeplink: DeeplinkBridge;
       clipboard: ClipboardBridge;
     };
   }

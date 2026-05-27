@@ -515,56 +515,66 @@ foundations.
 - [x] `crates/kcreate_tests/tests/text_flow.rs`
 - [x] `crates/kcreate_tests/tests/print_workflow.rs`
 
-## Phase 7 — KChat Desktop Integration | Complete | 100%
+## Phase 7 — KChat backend Integration | Complete | 100%
 
 PR #17 lands Phase 7 — KCreate's first-party integration with
-the real KChat Desktop (`uneycom/uney-chat-desktop`). A new
-local IPC client (`kcreate_kchat_client`) speaks a JSON-RPC 2.0
-protocol over a Unix domain socket / named pipe and bridges
-KChat communities / conversations / community-member rosters
-into the existing collab gate. All 30 tasks ship behind feature
-flags (`kchat-desktop` enables the production client;
-`kchat-dev-issuer` stays for local testing). The local-first
-sentinel still passes — the new crate stays out of the editing
-path closure.
+the shared KChat / Mattermost backend that
+`uneycom/uney-chat-desktop` also signs in to (the **Option C**
+shape). A new HTTPS REST client (`kcreate_kchat_client`) speaks
+`reqwest` + `rustls` to that backend and bridges KChat
+communities / conversations / community-member rosters into
+the existing collab gate. A thin `.kcz` companion extension
+(`apps/kchat-extension/`) renders a sidebar inside KChat
+Desktop and bridges deeplinks back to KCreate. All 30 tasks
+ship behind feature flags (`kchat-backend` enables the
+production client; `kchat-dev-issuer` stays for local
+testing). The local-first sentinel still passes — the new
+crate stays out of the editing-path closure even though it
+links `reqwest`.
 
-### Block A — Local IPC Client (Tasks 1–6)
-- [x] **Task 1: `kcreate_kchat_client` crate.** New crate behind
-      the `kchat-desktop` feature flag. Lifecycle (`connect`,
-      `disconnect`, `is_connected`, `ping`) over
-      `tokio::net::UnixStream` (Unix) / named-pipe equivalent
-      (Windows). Excluded from the editing-path dep closure.
-- [x] **Task 2: JSON-RPC 2.0 protocol.** Request/response types
-      for `kchat.identity.get`, `kchat.communities.list /
-      getMembers / getMembership`, `kchat.conversations.list /
-      postMessage`, `kchat.events.subscribe`. Documented
-      end-to-end in
-      `crates/kcreate_kchat_client/src/protocol_spec.md` so
-      the uney-chat-desktop team can implement the server side.
-- [x] **Task 3: Transport layer.** Newline-delimited JSON
-      framing, id-based request multiplexing, server-initiated
-      notification streams, 5 s connect / 10 s per-request
-      timeouts, exponential reconnect (1 → 2 → 4 → … → 30 s),
+### Block A — KChat backend REST client (Tasks 1–6)
+- [x] **Task 1: `kcreate_kchat_client` crate.** New crate
+      behind the `kchat-backend` feature flag. HTTPS-only
+      `reqwest` + `rustls` lifecycle (`connect` = sign in +
+      hydrate token store; `disconnect` = drop tokens +
+      attestation). Excluded from the editing-path dep closure
+      via the `local_first.rs` deny-list.
+- [x] **Task 2: REST surface + DTOs.** Typed request /
+      response structs for `/api/v1/auth/{login,refresh}`,
+      `/api/v1/me`, `/api/v1/communities`,
+      `/api/v1/communities/{id}/members`,
+      `/api/v1/communities/{id}/attestation`,
+      `/api/v1/communities/{id}/conversations`,
+      `/api/v1/conversations/{id}/messages`. Strict TLS;
+      `http://` URLs refused outside the in-process `axum`
+      fixture used by `kcreate_tests`.
+- [x] **Task 3: Transport layer.** 10 s per-request timeout,
+      transparent token refresh on 401 (with pre-emptive
+      refresh window), capped exponential retry on 429,
       graceful shutdown.
-- [x] **Task 4: Attestation bridging.** Maps the JSON-RPC
-      `getMembership` response into the existing
-      `KChatMembership` / `KChatGroupId` types.
-      `KChatDesktopAuthority` implements `KChatGroupAuthority`
+- [x] **Task 4: Attestation bridging.** Maps the backend's
+      `/communities/{id}/attestation` response into the
+      existing `KChatMembership` / `KChatGroupId` types.
+      `KChatBackendAuthority` implements `KChatGroupAuthority`
       and sources its membership live; auto-refresh kicks in
       when the attestation is within 5 minutes of expiry.
+      Until the backend ships the attestation endpoint, the
+      `kchat-dev-issuer` flag covers the same wire shape.
 - [x] **Task 5: Bridge surface.**
-      `crates/kcreate_bridge/src/kchat_desktop.rs` exposes
+      `crates/kcreate_bridge/src/kchat_backend.rs` exposes
       9 N-API entry points (`connect`, `disconnect`, `status`,
       `list_communities`, `select_community`,
       `get_community_members`, `list_conversations`,
       `share_to_conversation`, `accept_invite`). Wire-format
       lockstep through `bridge.ts`, `main.ts`, `preload.ts`,
-      `scene.ts` with `KChatDesktopStatus`, `KChatCommunity`,
+      `scene.ts` with `KChatBackendStatus`, `KChatCommunity`,
       `KChatCommunityMember`, `KChatConversation` types.
-- [x] **Task 6: Client tests.** Mock IPC server fixtures
-      (canned JSON-RPC responses, malformed frames, reconnect
-      scenarios, auto-refresh exercise), bridge integration in
-      `crates/kcreate_tests/tests/kchat_desktop_client.rs`,
+- [x] **Task 6: Client tests.** In-process `axum` REST
+      fixture (canned JSON, 401 → refresh → replay, 429
+      retry, signature-mismatch / clock-skew / expired
+      attestation, endpoint-not-implemented graceful path),
+      bridge integration in
+      `crates/kcreate_tests/tests/kchat_backend_client.rs`,
       local-first sentinel verified.
 
 ### Block B — Channel/Group-Gated Collaboration (Tasks 7–12)
@@ -701,29 +711,36 @@ path closure.
 - [x] **Task 30: Docs sync.** `README.md` gains a
       "Collaboration & KChat Desktop Integration" section.
       `ARCHITECTURE.md` gains a "§ KChat Desktop Integration"
-      section (local IPC protocol, community → collab gate
-      mapping, security model, feature flag table).
+      section (REST client over `reqwest` + `rustls`, the
+      `.kcz` companion extension surface, community → collab
+      gate mapping, security model, feature flag table).
       `AGENTS.md` indexes the new files
       (`kcreate_kchat_client`, `CursorOverlay.tsx`,
       `SelectionOverlay.tsx`, `InvitePanel.tsx`,
       `AccessControlPanel.tsx`, `ConflictToast.tsx`,
-      `AuditPanel.tsx`, `kchat_desktop.rs`,
-      `benches/collab_perf.rs`).
-      `crates/kcreate_kchat_client/src/protocol_spec.md`
-      finalised with method signatures, example payloads,
-      socket-path conventions per platform, authentication
-      flow, event streaming format, error codes, versioning
-      strategy.
+      `AuditPanel.tsx`, `kchat_backend.rs`,
+      `apps/kchat-extension/`, `benches/collab_perf.rs`).
+      `crates/kcreate_kchat_client/src/protocol.rs` documents
+      the REST DTOs, endpoint paths, HTTPS-only invariant,
+      authentication flow (login → access/refresh tokens with
+      pre-emptive refresh), retry policy (429 with capped
+      exponential backoff), error mapping, and the
+      `kcreate.invite.v1` content-type schema consumed by the
+      companion extension.
 
 ## Changelog
 
 - **2026-05-27 (PR #17)** — Phase 7: KChat Desktop
   (`uneycom/uney-chat-desktop`) integration, community-gated
   collaboration, real-time UX, security hardening, performance
-  optimisation. New `kcreate_kchat_client` crate ships a
-  JSON-RPC 2.0 local IPC client behind the `kchat-desktop`
-  feature flag; the bridge installs membership attestations
-  directly from a running uney-chat-desktop instance.
+  optimisation. New `kcreate_kchat_client` crate ships an
+  HTTPS REST client behind the `kchat-backend` feature flag
+  (Option C); the bridge installs membership attestations
+  from the shared KChat / Mattermost backend that
+  `uneycom/uney-chat-desktop` also signs in to. A thin `.kcz`
+  companion extension (`apps/kchat-extension/`) renders a
+  sidebar inside KChat Desktop and bridges deeplinks back to
+  KCreate.
   Community-aware mDNS, community-member roster sync + kick,
   conversation document-sharing invites, ACL persistence
   (`<project_dir>/acl.json`), per-peer rate limiting,

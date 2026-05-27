@@ -150,16 +150,21 @@ fn derive_shared_aead_key(
 /// Extract the clamped 32-byte X25519 scalar that an Ed25519
 /// signing key implies. This is the standard derivation: SHA-512
 /// the seed, take the first 32 bytes, and apply the X25519
-/// clamping rules. We use ed25519-dalek's `to_scalar_bytes` (the
-/// `hazmat` feature in 2.x exposes the clamped scalar directly,
-/// matching the reference SUPERCOP implementation) so we do not
-/// reimplement the SHA-512 step here.
+/// clamping rules.
+///
+/// `SigningKey::to_scalar_bytes` in ed25519-dalek 2.x returns the
+/// **unreduced, unclamped** first 32 bytes of `SHA-512(seed)`
+/// — specifically intended as the corresponding
+/// `x25519_dalek::StaticSecret` material, which itself applies
+/// clamping on construction. We mirror that by piping the bytes
+/// through `curve25519_dalek::scalar::clamp_integer` before
+/// reducing into a `Scalar`, so the X25519 scalar multiplication
+/// in [`derive_x25519_shared_key`] is symmetric across both ends
+/// of the exchange. Dropping the explicit clamp produces a
+/// different scalar and breaks the round-trip (see the
+/// `shared_key_is_symmetric` / `round_trip_decrypts_to_original_plaintext`
+/// tests below).
 fn ed25519_scalar_for_x25519(signing: &SigningKey) -> Scalar {
-    // Match ed25519-dalek 2.x: `signing.to_scalar()` returns the
-    // clamped scalar suitable for X25519 ECDH. We rebuild it from
-    // bytes through the public `clamp_integer` helper so the
-    // dependency surface stays on stable APIs even if a future
-    // dalek release renames the inherent method.
     let clamped = clamp_integer(signing.to_scalar_bytes());
     Scalar::from_bytes_mod_order(clamped)
 }

@@ -1,0 +1,62 @@
+{
+  "manifestVersion": 1,
+  "identity": {
+    "id": "kcreate.companion",
+    "version": "0.0.1",
+    "displayName": "KCreate",
+    "publisher": "KCreate",
+    "publisherPublicKey": "AOV_isB65_93qrIZ6zwdnqjb7zWLrp1w8nyoSqRB-Ok"
+  },
+  "procedures": [
+    {
+      "id": "kchat.query_my_communities",
+      "category": "read",
+      "description": "List the communities the local user belongs to so KCreate can highlight projects shared in those communities."
+    },
+    {
+      "id": "kchat.query_community_members",
+      "category": "read",
+      "description": "Resolve member display names + roles for the active community when rendering share-invite cards."
+    },
+    {
+      "id": "kchat.query_messages",
+      "category": "read",
+      "description": "Read recent messages in the active conversation to find KCreate share-invite cards."
+    },
+    {
+      "id": "kchat.post_message",
+      "category": "write",
+      "description": "Post a KCreate share-invite card to the active conversation when the user clicks 'Share to channel'."
+    },
+    {
+      "id": "deeplink.open_external",
+      "category": "context",
+      "description": "Open kcreate:// deeplinks (join/edit) in the standalone KCreate desktop app."
+    }
+  ],
+  "contributes": {
+    "views": [
+      {
+        "slot": "outer-rightbar.community-context",
+        "id": "kcreate-community-panel",
+        "title": "KCreate",
+        "entry": "panel.js",
+        "surfaceTargets": ["outer-rightbar", "overlay-root"]
+      }
+    ],
+    "deeplinks": [
+      {
+        "scheme": "kcreate",
+        "hostPrefix": "kcreate://join"
+      },
+      {
+        "scheme": "kcreate",
+        "hostPrefix": "kcreate://edit"
+      }
+    ]
+  },
+  "rateLimits": {
+    "kchat.query_messages": 60,
+    "kchat.post_message": 12
+  }
+}

@@ -138,11 +138,16 @@ pub enum CollabAction {
     /// CRDT resolved a concurrent edit. `node_id` identifies the
     /// document node whose state survived.
     ConflictResolved { node_id: String },
-    /// IPC bridge to uney-chat-desktop transitioned. The string is
-    /// a stable status code (`"connected"`, `"disconnected"`,
-    /// `"reconnect_failed"`) the renderer can map to a localized
-    /// label.
-    KchatDesktopStatus { status: String },
+    /// HTTPS REST link to the shared KChat / Mattermost backend
+    /// transitioned. The string is a stable status code
+    /// (`"connected"`, `"disconnected"`, `"reconnect_failed"`,
+    /// `"reauth_required"`) the renderer can map to a localized
+    /// label. Serialised on the wire as `kchat_backend_status`
+    /// to stay in lockstep with `apps/desktop/shared/scene.ts`
+    /// (`AuditCollabAction`) — the audit row is emitted by the
+    /// REST-based `kcreate_kchat_client` (Option C), not by the
+    /// abandoned local-IPC client design.
+    KchatBackendStatus { status: String },
 }
 
 /// Filter passed to [`crate::AuditStore::query`].
@@ -237,7 +242,7 @@ impl AuditEvent {
     ///
     /// `actor` is the local user's display name for events the
     /// local user initiates (`SessionStarted` / `SessionLeft` /
-    /// `KchatDesktopStatus`), and the remote peer's id for events
+    /// `KchatBackendStatus`), and the remote peer's id for events
     /// the local node observes from a peer (`PeerJoined`,
     /// `PeerKicked`, `OperationReceived`, …). The renderer's
     /// `AuditPanel` displays it without further interpretation.

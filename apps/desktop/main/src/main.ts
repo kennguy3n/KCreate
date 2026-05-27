@@ -2619,11 +2619,8 @@ function registerIpcHandlers(): void {
   // match the rest of the `kcreate/session/*` IPC surface
   // (`request-resume`, `cert-fingerprint`, `pending-clipboard-offers`,
   // etc.).
-  ipcMain.handle(
-    "kcreate/session/queue-operation",
-    (_e, opJson: string) => {
-      requireBridge().sessionQueueOperation(opJson);
-    },
+  ipcMain.handle("kcreate/session/queue-operation", (_e, opJson: string) =>
+    requireBridge().sessionQueueOperation(opJson),
   );
   ipcMain.handle("kcreate/session/flush-pending-operations", () =>
     requireBridge().sessionFlushPendingOperations(),
@@ -2635,12 +2632,118 @@ function registerIpcHandlers(): void {
   // pages the local peer is currently viewing. Presence updates
   // and conflict toasts for off-screen pages are suppressed from
   // the renderer event stream; operations are still journaled.
-  ipcMain.handle(
-    "kcreate/session/set-active-pages",
-    (_e, pageIdsJson: string) => {
-      requireBridge().sessionSetActivePages(pageIdsJson);
-    },
+  ipcMain.handle("kcreate/session/set-active-pages", (_e, pageIdsJson: string) =>
+    requireBridge().sessionSetActivePages(pageIdsJson),
   );
+}
+
+// ---------------------------------------------------------------------------
+// Phase 7 — `kcreate://` deeplink scheme.
+//
+// The companion `.kcz` extension in `apps/kchat-extension/` builds
+// `kcreate://join?payload=<base64url(invite_json)>` URLs that KChat
+// Desktop fires through the OS shell. We:
+//
+//   1. Register `kcreate` as a custom protocol so the OS routes it
+//      to KCreate even when KCreate is closed.
+//   2. Hold a single-instance lock so a second OS-spawned KCreate
+//      process forwards the deeplink to the running instance via
+//      the `second-instance` event (Windows + Linux). macOS hands
+//      the URL through the dedicated `open-url` event instead.
+//   3. Scan `process.argv` on first launch (Windows + Linux only —
+//      on macOS the argv path is empty for deeplinks).
+//   4. Buffer URLs that arrive before the renderer is ready and
+//      flush them once `did-finish-load` fires, so a cold-start
+//      deeplink isn't lost between the OS hand-off and the React
+//      tree mounting.
+//   5. Forward every accepted URL to the renderer through the
+//      `kcreate/deeplink/received` IPC channel; the renderer side
+//      lives in `InvitePanel.tsx` (Phase 7 Task 10).
+//
+// Only `kcreate://` URLs are accepted. Any other scheme that lands
+// here is dropped to keep the deeplink surface tight.
+// ---------------------------------------------------------------------------
+
+const DEEPLINK_SCHEME = "kcreate";
+const DEEPLINK_CHANNEL = "kcreate/deeplink/received";
+
+const pendingDeeplinks: string[] = [];
+
+function isKcreateUrl(value: string): boolean {
+  // We accept both `kcreate://...` and (rarely-seen on Windows
+  // shells) `kcreate:...` so the renderer doesn't have to guess.
+  return value.startsWith(`${DEEPLINK_SCHEME}://`) || value.startsWith(`${DEEPLINK_SCHEME}:`);
+}
+
+function extractDeeplinksFromArgv(argv: readonly string[]): string[] {
+  return argv.filter(isKcreateUrl);
+}
+
+function dispatchDeeplink(url: string): void {
+  if (!isKcreateUrl(url)) {
+    return;
+  }
+  const win = mainWindow;
+  if (!win || win.webContents.isLoading() || win.webContents.isDestroyed()) {
+    // Buffer until the renderer is ready. A cold-start deeplink
+    // path lands here when the OS launches us straight from the
+    // protocol hand-off.
+    pendingDeeplinks.push(url);
+    return;
+  }
+  try {
+    win.webContents.send(DEEPLINK_CHANNEL, url);
+    // Bring the window forward so a one-click deeplink lands the
+    // user on the join UI without an extra Alt-Tab.
+    if (win.isMinimized()) {
+      win.restore();
+    }
+    win.focus();
+  } catch (err) {
+    console.error("kcreate: failed to dispatch deeplink", url, err);
+  }
+}
+
+function flushPendingDeeplinks(): void {
+  const win = mainWindow;
+  if (!win || win.webContents.isDestroyed()) {
+    return;
+  }
+  while (pendingDeeplinks.length > 0) {
+    const url = pendingDeeplinks.shift()!;
+    try {
+      win.webContents.send(DEEPLINK_CHANNEL, url);
+    } catch (err) {
+      console.error("kcreate: failed to flush deeplink", url, err);
+    }
+  }
+}
+
+function registerProtocolHandler(): void {
+  // `setAsDefaultProtocolClient` returns false if the OS refuses
+  // (e.g. another app is registered and the user hasn't approved
+  // the switch). That's not fatal — KCreate still works without
+  // the deeplink path — so we just log and move on.
+  let ok: boolean;
+  if (process.platform === "win32" && process.defaultApp) {
+    // During `electron .` dev runs the entry-point script is
+    // argv[1]; pass it through so the spawned secondary instance
+    // can find our app code.
+    const script = process.argv[1];
+    ok =
+      typeof script === "string"
+        ? app.setAsDefaultProtocolClient(DEEPLINK_SCHEME, process.execPath, [
+            path.resolve(script),
+          ])
+        : app.setAsDefaultProtocolClient(DEEPLINK_SCHEME);
+  } else {
+    ok = app.setAsDefaultProtocolClient(DEEPLINK_SCHEME);
+  }
+  if (!ok) {
+    console.warn(
+      `kcreate: failed to register ${DEEPLINK_SCHEME}:// protocol (already registered by another app?)`,
+    );
+  }
 }
 
 /// Point the KChat trust-store at the per-user JSON file under
@@ -2679,24 +2782,79 @@ function initializeKChatTrustStore(): void {
   }
 }
 
-void app.whenReady().then(() => {
-  // Load the native bridge synchronously, before any window/IPC traffic
-  // can hit `requireBridge()`. See the comment above `let bridge`.
-  bridge = loadBridge();
-  registerIpcHandlers();
-  // Wire the KChat trust-store at `<userData>/kchat_trust.json`.
-  // Must run AFTER the bridge is loaded (it dispatches an N-API
-  // call) but BEFORE any renderer window opens (so the first
-  // `kchat.status()` poll already sees the loaded allowlist).
-  initializeKChatTrustStore();
-  createWindow();
-
-  app.on("activate", () => {
-    if (BrowserWindow.getAllWindows().length === 0) {
-      createWindow();
+// Acquire the single-instance lock BEFORE `app.whenReady`. When a
+// user clicks a `kcreate://` deeplink while KCreate is already
+// running the OS spawns a fresh KCreate process; that second
+// process bails out here and the running primary instance picks
+// up the deeplink via the `second-instance` event below.
+if (!app.requestSingleInstanceLock()) {
+  app.quit();
+} else {
+  app.on("second-instance", (_event, argv) => {
+    // Windows / Linux: the deeplink URL is the last argv entry of
+    // the secondary instance. Forward whatever we find to the
+    // renderer (the helper drops non-`kcreate:` strings).
+    for (const url of extractDeeplinksFromArgv(argv)) {
+      dispatchDeeplink(url);
+    }
+    // Focus + restore even when argv carried no URL, so a second
+    // launch (e.g. user double-clicking the dock icon) still
+    // brings the existing window forward.
+    const win = mainWindow;
+    if (win) {
+      if (win.isMinimized()) win.restore();
+      win.focus();
     }
   });
-});
+
+  // macOS hands deeplinks through the dedicated `open-url` event
+  // rather than argv. The event can fire before `whenReady` — we
+  // still buffer the URL through `dispatchDeeplink` (which routes
+  // to `pendingDeeplinks` when the window doesn't exist yet) so a
+  // cold-start deeplink isn't lost.
+  app.on("open-url", (event, url) => {
+    event.preventDefault();
+    dispatchDeeplink(url);
+  });
+
+  void app.whenReady().then(() => {
+    // Load the native bridge synchronously, before any window/IPC traffic
+    // can hit `requireBridge()`. See the comment above `let bridge`.
+    bridge = loadBridge();
+    registerIpcHandlers();
+    // Wire the KChat trust-store at `<userData>/kchat_trust.json`.
+    // Must run AFTER the bridge is loaded (it dispatches an N-API
+    // call) but BEFORE any renderer window opens (so the first
+    // `kchat.status()` poll already sees the loaded allowlist).
+    initializeKChatTrustStore();
+    // Register the `kcreate://` protocol AFTER the lock is held
+    // and BEFORE the window is created so any URL that happens to
+    // be sitting in argv from a cold-start path is picked up by
+    // the buffer below.
+    registerProtocolHandler();
+    const win = createWindow();
+    // Drain any deeplinks that arrived before the window mounted
+    // (cold-start path: OS spawns us straight from the protocol
+    // hand-off, the URL is in argv, and the renderer needs the
+    // payload as soon as the React tree mounts).
+    win.webContents.once("did-finish-load", () => {
+      flushPendingDeeplinks();
+    });
+    // Cold-start argv scan (Windows / Linux only — macOS routes
+    // through `open-url` and the argv list is empty for deeplink
+    // launches). The first hit goes into `pendingDeeplinks` and is
+    // flushed by the `did-finish-load` hook above.
+    for (const url of extractDeeplinksFromArgv(process.argv)) {
+      dispatchDeeplink(url);
+    }
+
+    app.on("activate", () => {
+      if (BrowserWindow.getAllWindows().length === 0) {
+        createWindow();
+      }
+    });
+  });
+}
 
 app.on("window-all-closed", () => {
   if (process.platform !== "darwin") {

@@ -180,6 +180,7 @@ import type {
   SessionStartReport,
   TrustedIssuer,
   ClipboardBridge,
+  DeeplinkBridge,
 } from "../../shared/scene";
 
 type FrameInfoSnake = {
@@ -2485,6 +2486,26 @@ const kchatBackend: KChatBackendBridge = {
   },
 };
 
+// Phase 7 (Task E): `kcreate://` deeplink listener. The main
+// process forwards every accepted deeplink URL on
+// `kcreate/deeplink/received`; the renderer subscribes through
+// this bridge so `InvitePanel.tsx` can auto-paste an invite
+// payload that arrived through a KChat Desktop share card.
+const deeplink: DeeplinkBridge = {
+  onUrl(callback: (url: string) => void): () => void {
+    const channel = "kcreate/deeplink/received";
+    const listener = (_evt: unknown, url: unknown): void => {
+      if (typeof url === "string") {
+        callback(url);
+      }
+    };
+    ipcRenderer.on(channel, listener);
+    return () => {
+      ipcRenderer.removeListener(channel, listener);
+    };
+  },
+};
+
 const textFrame: TextFrameBridge = {
   async get(nodeId: string): Promise<TextFrameOptions> {
     const raw = (await ipcRenderer.invoke(
@@ -2702,5 +2723,6 @@ contextBridge.exposeInMainWorld("kcreate", {
   session,
   kchat,
   kchatBackend,
+  deeplink,
   clipboard,
 });

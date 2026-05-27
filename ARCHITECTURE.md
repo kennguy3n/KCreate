@@ -738,54 +738,66 @@ seal/open round-trips, tampering detection, version mismatch,
 LWW tiebreaks across disjoint and overlapping affected-node sets,
 replay-window rejection, project-id scoping, peer cap.
 
-## 17c. KChat Desktop integration (Phase 7, ships in PR #17)
+## 17c. KChat backend integration (Phase 7, ships in PR #17)
 
-`kcreate_kchat_client` is the **local-IPC client** that lets KCreate
-source membership attestations from a running KChat Desktop
-(`uneycom/uney-chat-desktop`) instance instead of a dev-mint
-issuer. It speaks a JSON-RPC 2.0 protocol — newline-delimited
-frames over a Unix domain socket (`~/.kchat/kcreate.sock` on
-macOS/Linux) or a Windows named pipe (`\\.\pipe\kchat-kcreate`).
-Like `kcreate_collab_transport`, the crate is kept **out of the
-editing-path dependency tree** so the local-first sentinel
-(`crates/kcreate_tests/tests/local_first.rs`) stays green; the
-only consumer is `kcreate_bridge` under the `kchat-desktop`
-feature flag.
+`kcreate_kchat_client` is the **HTTPS REST client** that lets
+KCreate source membership attestations from the shared KChat /
+Mattermost backend that `uneycom/uney-chat-desktop` also signs
+in to. The integration follows **Option C** of the Phase 7
+pivot: KCreate stays a standalone process and talks to the
+backend directly over HTTPS, while a thin `.kcz` companion
+extension hosted inside KChat Desktop renders sidebar surfaces
+(`apps/kchat-extension/`). There is no local socket / named-pipe
+IPC between the two desktop apps — that approach (originally
+sketched in PR #17 before the pivot) was abandoned because the
+KChat Desktop Extension Platform is a JS-only sandbox that
+consumes host procedures via `defineProcedure()`, not a
+peer-to-peer Electron IPC bridge.
 
-### Local IPC protocol
+The crate is kept **out of the editing-path dependency tree** —
+even though it links `reqwest` / `rustls` — so the local-first
+sentinel (`crates/kcreate_tests/tests/local_first.rs`) stays
+green. The only consumer is `kcreate_bridge` under the
+`kchat-backend` feature flag.
 
-The full method catalogue is documented in
-[`crates/kcreate_kchat_client/src/protocol_spec.md`](./crates/kcreate_kchat_client/src/protocol_spec.md).
+### REST surface
+
+The full route catalogue lives in
+[`crates/kcreate_kchat_client/src/rest.rs`](./crates/kcreate_kchat_client/src/rest.rs)
+and the typed DTOs are in `crates/kcreate_kchat_client/src/dto.rs`.
 At a glance:
 
-| Method                              | Direction | Purpose                                             |
-| ----------------------------------- | --------- | --------------------------------------------------- |
-| `kchat.identity.get`                | request   | Local user JID + Ed25519 public key + display name. |
-| `kchat.communities.list`            | request   | All communities the user belongs to.                |
-| `kchat.communities.getMembers`      | request   | Roster + role for one community.                    |
-| `kchat.communities.getMembership`   | request   | Signed `KChatMembership` attestation.               |
-| `kchat.conversations.list`          | request   | Channels in a community.                            |
-| `kchat.conversations.postMessage`   | request   | Post a rich card (e.g. document-share invite).      |
-| `kchat.events.subscribe`            | request   | Open a server-initiated notification stream.        |
-| `kchat.events.notification`         | notify    | Streamed roster / presence changes (server → KCreate). |
+| Route                                                        | Method | Purpose                                              |
+| ------------------------------------------------------------ | ------ | ---------------------------------------------------- |
+| `/api/v1/auth/login`                                         | POST   | Exchange credentials for access + refresh tokens.    |
+| `/api/v1/auth/refresh`                                       | POST   | Pre-emptive token rotation; also fires on `401`.     |
+| `/api/v1/me`                                                 | GET    | Local user JID + Ed25519 public key + display name.  |
+| `/api/v1/communities`                                        | GET    | All communities the user belongs to.                 |
+| `/api/v1/communities/{id}/members`                           | GET    | Roster + role for one community.                     |
+| `/api/v1/communities/{id}/attestation`                       | POST   | Signed `KChatMembership` (backend signs over a peer pubkey + community id). Endpoint lands in a separate backend PR; until then the `kchat-dev-issuer` flag covers the same shape for tests. |
+| `/api/v1/communities/{id}/conversations`                     | GET    | Channels in a community.                             |
+| `/api/v1/conversations/{id}/messages`                        | POST   | Post a rich card (e.g. document-share invite).       |
 
-Connection lifecycle: 5 s connect timeout, 10 s per-request
-timeout, exponential reconnect (1 → 2 → 4 → … → 30 s),
-graceful shutdown. Frame multiplexing uses JSON-RPC id-based
-correlation.
+TLS is strict (`reqwest` over `rustls`); the client refuses
+`http://` URLs outside the in-process `axum` fixture used by
+`kcreate_tests`. `401` responses transparently refresh the
+access token (and replay the request once); `429` responses
+retry with capped exponential backoff. Per-request timeout
+defaults to 10 s.
 
 ### Community → collaboration gate mapping
 
-`KChatDesktopAuthority` (in
+`KChatBackendAuthority` (in
 `crates/kcreate_kchat_client/src/attestation.rs`) implements the
 existing `KChatGroupAuthority` trait but sources its membership
-live: when the bridge calls `kchat_desktop_select_community`, the
-client requests `kchat.communities.getMembership`, validates the
-returned signature against the issuer's published key, and
-installs the attestation in the collab gate. Auto-refresh kicks
-in when the attestation is within 5 minutes of expiry so a
-long-running session never has to interrupt the user with a
-re-auth prompt.
+live: when the bridge calls `kchat_backend_select_community`,
+the client `POST`s
+`/api/v1/communities/{id}/attestation` with the local peer
+pubkey, validates the returned signature against the backend's
+published issuer key, and installs the attestation in the
+collab gate. Auto-refresh kicks in when the attestation is
+within 5 minutes of expiry so a long-running session never has
+to interrupt the user with a re-auth prompt.
 
 The community id flows downstream:
 
@@ -806,20 +818,28 @@ The community id flows downstream:
 
 ### Bridge surface
 
-`crates/kcreate_bridge/src/kchat_desktop.rs` exposes the
-following N-API entry points, all wired through `bridge.ts`,
-`main.ts`, `preload.ts`, `scene.ts` (wire-format lockstep):
+`crates/kcreate_bridge/src/kchat_backend.rs` exposes the
+following N-API entry points (Option C: REST over HTTPS to the
+shared KChat / Mattermost backend), all wired through
+`bridge.ts`, `main.ts`, `preload.ts`, `scene.ts` (wire-format
+lockstep):
 
 ```
-kchat_desktop_connect()            -> attempt local socket connect
-kchat_desktop_disconnect()         -> tear down + clear attestation
-kchat_desktop_status()             -> connection state + identity
-kchat_desktop_list_communities()
-kchat_desktop_select_community(id) -> install signed attestation
-kchat_desktop_get_community_members(id)
-kchat_desktop_list_conversations(community_id)
-kchat_desktop_share_to_conversation(conversation_id, invite_json)
-kchat_desktop_accept_invite(invite_json) -> dial owner peer
+kchat_backend_connect(request_json)    -> sign in (server URL + creds)
+                                          and persist token store
+kchat_backend_disconnect()             -> clear tokens + attestation
+kchat_backend_status()                 -> connection state + identity
+                                          (server URL, jid, peer id)
+kchat_backend_list_communities()
+kchat_backend_select_community(id)     -> fetch + install signed
+                                          membership attestation
+kchat_backend_get_community_members(id)
+kchat_backend_list_conversations(community_id)
+kchat_backend_share_to_conversation(conversation_id, invite_json)
+kchat_backend_accept_invite(invite_json) -> dial owner peer
+kchat_backend_sync_community_roster(id)  -> Task 8 tick:
+                                            evict peers whose
+                                            membership was revoked
 ```
 
 ### Security model
@@ -892,11 +912,14 @@ The Phase 7 bridge tightens the wire under load:
 | ------------------- | ------------------------------------- | ------- | ------------------------------------------------- |
 | `collab`            | `kcreate_collab` + `kcreate_collab_transport` + `quinn` + `rustls` + `mdns-sd` + `tokio` | off | LAN QUIC + mDNS transport for multi-peer editing.       |
 | `kchat-dev-issuer`  | `kcreate_kchat` (implies `collab`)    | off     | Local dev / integration tests: mint a test KChat attestation against a deterministic key. |
-| `kchat-desktop`     | `kcreate_kchat_client` (implies `collab`) | off | Production: source attestation from a running KChat Desktop over local IPC. |
+| `kchat-backend`     | `kcreate_kchat_client` (implies `collab`) | off | Production: source attestation from the shared KChat / Mattermost backend over HTTPS REST (Option C). |
 
 Both `kchat-*` flags are mutually compatible — a Phase 7 build
-typically enables `kchat-desktop` (production attestation) and
-keeps `kchat-dev-issuer` for the integration test crate.
+typically enables `kchat-backend` (production attestation over
+HTTPS REST against the shared KChat / Mattermost backend) and
+keeps `kchat-dev-issuer` for the integration-test crate so the
+test suite can mint deterministic attestations without standing
+up a real backend.
 
 ## 18. Resource optimization
 
@@ -1057,12 +1080,12 @@ crates/
 │                        # Mints test attestations against deterministic
 │                        # Ed25519 keys. Behind the `kchat-dev-issuer`
 │                        # bridge feature flag.                                              [EXISTS]
-├── kcreate_kchat_client/ # Phase 7 production KChat Desktop local-IPC
-│                        # client. JSON-RPC 2.0 over Unix domain socket
-│                        # (~/.kchat/kcreate.sock) or Windows named
-│                        # pipe (\\.\pipe\kchat-kcreate). Pulled in by
-│                        # `kcreate_bridge` only when the
-│                        # `kchat-desktop` feature is enabled; kept out
+├── kcreate_kchat_client/ # Phase 7 production KChat backend REST client.
+│                        # HTTPS-only (`reqwest` + `rustls`) against the
+│                        # shared KChat / Mattermost backend that
+│                        # `uneycom/uney-chat-desktop` also signs in to.
+│                        # Pulled in by `kcreate_bridge` only when the
+│                        # `kchat-backend` feature is enabled; kept out
 │                        # of the editing-path dep tree (local-first
 │                        # sentinel still green).                                            [EXISTS]
 └── kcreate_audit/       # Phase 6 audit trail: append-only operation +

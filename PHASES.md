@@ -66,18 +66,22 @@ search + colour tagging, E2E user-journey tests, acceptance-
 criteria benchmark suite (`cold_start`, `raster_open_64mp`,
 `viewport_pan`, `batch_50_assets`).
 
-## Phase 7 — KChat Desktop Integration | Complete | 100%
+## Phase 7 — KChat backend Integration | Complete | 100%
 
-First-party integration with the real KChat Desktop
-(`uneycom/uney-chat-desktop`). New `kcreate_kchat_client` crate
-speaks a JSON-RPC 2.0 protocol over a Unix-domain-socket /
-named-pipe to the running uney-chat-desktop process, bridges
-KChat communities / conversations / community-member rosters
-into the existing collab gate. 30 tasks across 6 blocks:
+First-party integration with the shared KChat / Mattermost
+backend that `uneycom/uney-chat-desktop` also signs in to
+(the **Option C** shape). New `kcreate_kchat_client` crate
+speaks HTTPS REST (`reqwest` + `rustls`) to that backend and
+bridges KChat communities / conversations / community-member
+rosters into the existing collab gate. A thin `.kcz` companion
+extension (`apps/kchat-extension/`) renders a sidebar inside
+KChat Desktop and bridges deeplinks back to KCreate. 30 tasks
+across 6 blocks:
 
-- **Block A (Tasks 1–6):** local IPC client crate + JSON-RPC
-  protocol + spec + transport + attestation bridging + bridge
-  surface + mock-server tests.
+- **Block A (Tasks 1–6):** REST client crate (`reqwest` +
+  `rustls`) + DTOs + auth (token store + 401 refresh +
+  429 retry) + attestation bridging + bridge surface +
+  in-process `axum` fixture tests.
 - **Block B (Tasks 7–12):** community-scoped session start +
   member roster sync + conversation document sharing + invite
   acceptance + role-based permissions
@@ -96,12 +100,13 @@ into the existing collab gate. 30 tasks across 6 blocks:
   criterion performance benchmarks
   (`crates/kcreate_bridge/benches/collab_perf.rs`).
 - **Block F (Tasks 29–30):** PROGRESS.md / README.md /
-  ARCHITECTURE.md / AGENTS.md / `protocol_spec.md` updates.
+  ARCHITECTURE.md / AGENTS.md updates covering the Option C
+  REST surface and the `.kcz` companion extension.
 
 Local-first invariant preserved (`kcreate_kchat_client` and the
 existing `kcreate_collab_transport` both stay out of the
 editing-path closure walked by `crates/kcreate_tests/tests/local_first.rs`).
-Feature flags: `kchat-desktop` (production client),
+Feature flags: `kchat-backend` (production REST client),
 `kchat-dev-issuer` (local-mint for tests), `collab` (LAN
 transport). All three off by default; the Electron host opts
 in when packaging release binaries.

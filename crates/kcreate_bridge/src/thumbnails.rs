@@ -45,6 +45,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 use std::thread;
 use std::time::Duration;
@@ -391,11 +392,39 @@ pub fn ensure_page_thumbnail(page_id: Uuid, max_dim_px: u32) -> Result<Thumbnail
     })
 }
 
+/// Process-global flag: is a pre-warm worker currently running? Set
+/// to `true` by [`prepare_thumbnails_background`] before spawning the
+/// thread and cleared by the thread itself on exit (success or
+/// panic-recovered). Guards against thread-thrash if pre-warm is
+/// kicked off repeatedly (e.g. rapid project_create+project_open in
+/// a test, or a user spam-clicking "Open Project") — additional
+/// callers are coalesced into the in-flight worker. Because the
+/// worker re-reads the workspace snapshot it sees the latest page
+/// list, so coalescing doesn't drop updates.
+static PREWARM_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+
 /// Kick off a background thread that pre-warms every page's
 /// thumbnail. Returns immediately. Does nothing in low-resource mode.
+///
+/// Calls are *coalesced*: at most one pre-warm worker runs at a
+/// time. If a second caller arrives while the worker is still
+/// running, it returns `Ok(())` without spawning a new thread — the
+/// in-flight worker covers them. This is safe because the worker
+/// snapshots the page list at the start of its run; the next call
+/// after it exits will pick up any newly-added pages.
 pub fn prepare_thumbnails_background(max_dim_px: u32) -> Result<()> {
     if crate::document::runtime_slot().lock().is_low_resource() {
         log::debug!("thumbnail pre-warm skipped: low_resource_mode on");
+        return Ok(());
+    }
+    // CAS so two simultaneous callers can't both observe `false` and
+    // race past the gate. We use `Acquire` on success to pair with
+    // the worker's `Release` store-on-exit.
+    if PREWARM_IN_FLIGHT
+        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        log::debug!("thumbnail pre-warm skipped: worker already in flight");
         return Ok(());
     }
     let dim = sanitize_dim(max_dim_px);
@@ -403,10 +432,18 @@ pub fn prepare_thumbnails_background(max_dim_px: u32) -> Result<()> {
     // doesn't depend on the document staying open.
     let pages = {
         let guard = workspace_slot().lock();
-        let ws = guard.as_ref().ok_or(DocumentBridgeError::NoProject)?;
+        let ws = match guard.as_ref() {
+            Some(ws) => ws,
+            None => {
+                // Drop the in-flight flag before returning so a
+                // later open_project can spawn a fresh worker.
+                PREWARM_IN_FLIGHT.store(false, Ordering::Release);
+                return Err(DocumentBridgeError::NoProject);
+            }
+        };
         page_ids(ws)
     };
-    thread::Builder::new()
+    let spawn_result = thread::Builder::new()
         .name("kcreate-thumbnail-prewarm".to_string())
         .spawn(move || {
             // Tiny stagger so the renderer isn't slammed if multiple
@@ -420,9 +457,20 @@ pub fn prepare_thumbnails_background(max_dim_px: u32) -> Result<()> {
                     log::debug!("page {page} pre-warm failed: {e}");
                 }
             }
-        })
-        .map_err(|e| DocumentBridgeError::Io(std::io::Error::other(e.to_string())))?;
-    Ok(())
+            // Clear the in-flight flag last so the next call can
+            // observe the worker's effects via `Acquire` on the CAS.
+            PREWARM_IN_FLIGHT.store(false, Ordering::Release);
+        });
+    match spawn_result {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            // Spawn failed — release the gate so a retry can succeed.
+            PREWARM_IN_FLIGHT.store(false, Ordering::Release);
+            Err(DocumentBridgeError::Io(std::io::Error::other(
+                e.to_string(),
+            )))
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

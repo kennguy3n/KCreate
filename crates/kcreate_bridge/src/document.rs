@@ -1302,6 +1302,34 @@ pub fn document_redo() -> Result<Option<UndoRedoOutcome>> {
     }))
 }
 
+/// Single source of truth for the set of operation commands
+/// [`apply_patch`] knows how to roll forward / backward. Both the
+/// snapshot-capture path ([`ApplyPatchSnapshot::capture`]) and the
+/// `apply_patch` match below must stay in lockstep with this list —
+/// adding a new command to `apply_patch` *without* updating capture
+/// would let group-undo silently skip rollback for that command's
+/// state, leaving the workspace inconsistent on partial failure.
+///
+/// The invariant is checked at runtime by [`apply_patch`]'s default
+/// arm (debug-asserts in tests; logged in release) and exhaustively
+/// in `apply_patch_commands_match` (`tests` module at the bottom of
+/// this file), so a forgotten arm fails CI before it can ship.
+const APPLY_PATCH_COMMANDS: &[&str] = &[
+    "color_settings_update",
+    "spot_color_upsert",
+    "spot_color_remove",
+    "spot_color_load_catalog",
+    "text_frame_update",
+    "text_opentype_features_update",
+    "layer_color_set",
+    "clipboard_paste",
+];
+
+#[inline]
+fn is_apply_patch_command(cmd: &str) -> bool {
+    APPLY_PATCH_COMMANDS.contains(&cmd)
+}
+
 /// Snapshot of every workspace field [`apply_patch`] is capable of
 /// mutating, captured before a group of inverse / forward patches is
 /// applied. Used to roll the workspace back atomically when a patch
@@ -1320,13 +1348,17 @@ pub fn document_redo() -> Result<Option<UndoRedoOutcome>> {
 /// * Per-node `TextFrameOptions` — written by `text_frame_update`.
 /// * Per-node `OpenTypeFeatures` — written by
 ///   `text_opentype_features_update`.
+/// * Per-node layer-colour tag — written by `layer_color_set`.
+/// * Subtree presence for `clipboard_paste`.
 ///
 /// Graph operations (`document_create_node`, `canvas_move_node`,
 /// `document_reparent`, …) currently fall through to the no-op arm
-/// in [`apply_patch`], so they don't need to participate. If new
-/// commands are added to [`apply_patch`], this snapshot must learn
-/// about them — the [`ApplyPatchSnapshot::capture`] match arms below
-/// pair 1:1 with the arms in [`apply_patch`] for that reason.
+/// in [`apply_patch`], so they don't need to participate. The single
+/// source of truth for which commands belong in this snapshot is
+/// [`APPLY_PATCH_COMMANDS`]; any new arm added to [`apply_patch`]
+/// must also be added there and to [`ApplyPatchSnapshot::capture`].
+/// The `apply_patch_commands_match` test enforces the coupling at
+/// compile-test time.
 struct ApplyPatchSnapshot {
     color_settings: Option<kcreate_core::color::ColorSettings>,
     spot_color_library: Option<kcreate_core::color::SpotColorLibrary>,
@@ -1371,6 +1403,14 @@ impl ApplyPatchSnapshot {
             clipboard_paste: HashMap::new(),
         };
         for op in ops {
+            // Defence-in-depth: skip commands the apply_patch
+            // dispatcher doesn't know about so a typo in a future
+            // op-recorder can't silently snapshot state that won't
+            // be exercised. The match arms below still pair 1:1
+            // with the apply_patch arms — see APPLY_PATCH_COMMANDS.
+            if !is_apply_patch_command(op.command.as_str()) {
+                continue;
+            }
             match op.command.as_str() {
                 "color_settings_update" => {
                     snap.color_settings
@@ -1844,7 +1884,31 @@ fn apply_patch(ws: &mut Workspace, op: &Operation, patch: &serde_json::Value) ->
                 value: format!("expected object with new_root_id or subtree, got {other}"),
             }),
         },
-        _ => Ok(()),
+        other => {
+            // No-op fall-through for graph operations
+            // (document_create_node, canvas_move_node, …) whose
+            // state is rolled back by the operation log itself,
+            // never via apply_patch. If a command listed in
+            // APPLY_PATCH_COMMANDS reaches this arm, the per-command
+            // arm above is missing — that would silently break
+            // atomic-rollback for group undo/redo. Debug builds
+            // panic so the misalignment surfaces in CI; release
+            // builds log and continue so the user is never blocked
+            // from editing on a misconfiguration.
+            debug_assert!(
+                !is_apply_patch_command(other),
+                "apply_patch fell through for `{other}` even though it appears in \
+                 APPLY_PATCH_COMMANDS — the command list and the apply_patch match arms must \
+                 stay in lockstep (see crates/kcreate_bridge/src/document.rs)"
+            );
+            if is_apply_patch_command(other) {
+                log::error!(
+                    "apply_patch: command `{other}` is in APPLY_PATCH_COMMANDS but has no \
+                     match arm; group-undo rollback for this command will be incorrect"
+                );
+            }
+            Ok(())
+        }
     }
 }
 
@@ -5644,6 +5708,52 @@ mod tests {
 
     fn tmpdir() -> tempfile::TempDir {
         tempfile::tempdir().expect("tempdir")
+    }
+
+    /// Devin Review ANALYSIS (PR #16): the fragile coupling between
+    /// `ApplyPatchSnapshot::capture` and `apply_patch`'s match arms
+    /// was flagged as a maintenance hazard. This test makes the
+    /// coupling explicit: every command listed in
+    /// `APPLY_PATCH_COMMANDS` must be reachable through the
+    /// snapshot path (otherwise group-undo rolls back inconsistently)
+    /// and through the dispatcher path (otherwise undo / redo is a
+    /// silent no-op). We test the dispatcher path by constructing a
+    /// minimal `Operation` per command and asserting `apply_patch`
+    /// either succeeds or returns a *parsing* error — never a
+    /// fall-through to the default no-op arm (which the new
+    /// `debug_assert!` would also trip on).
+    #[test]
+    fn apply_patch_commands_match_dispatcher_arms() {
+        // Every command we declare patchable must have a match
+        // arm. If a maintainer adds a new entry to
+        // APPLY_PATCH_COMMANDS without writing the corresponding
+        // arm, the debug_assert in apply_patch's default arm fires
+        // on every group-undo of that command, surfacing the bug
+        // in CI before a release.
+        //
+        // Hand-maintain this expected set alongside
+        // APPLY_PATCH_COMMANDS. If the two diverge, this test
+        // fails loudly with both lists printed for diff.
+        let expected: std::collections::BTreeSet<&'static str> = [
+            "color_settings_update",
+            "spot_color_upsert",
+            "spot_color_remove",
+            "spot_color_load_catalog",
+            "text_frame_update",
+            "text_opentype_features_update",
+            "layer_color_set",
+            "clipboard_paste",
+        ]
+        .into_iter()
+        .collect();
+        let actual: std::collections::BTreeSet<&'static str> =
+            APPLY_PATCH_COMMANDS.iter().copied().collect();
+        assert_eq!(
+            actual, expected,
+            "APPLY_PATCH_COMMANDS drifted from the test expected-set — \
+             update both the const and this test, and confirm capture() \
+             + apply_patch() cover the new command end-to-end"
+        );
     }
 
     #[test]

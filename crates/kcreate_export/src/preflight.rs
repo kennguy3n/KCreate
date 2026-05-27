@@ -1449,9 +1449,45 @@ fn node_ink_signature(node: &Node, spots: &SpotColorLibrary) -> InkSignature {
                     sig.cmyk.3 += k;
                 }
                 FillStyle::Gradient(_) => {
-                    // Gradients participate in the trapping check via
-                    // their mid-tone average. The shading check
-                    // already validates them more strictly.
+                    // Gradients participate in the trapping check
+                    // through a deliberate simplification: we credit a
+                    // flat ~20% K (a "neutral mid-grey approximation")
+                    // rather than walking every gradient stop on every
+                    // pairwise comparison. The cost reason matters —
+                    // the trapping check is already O(n²) over a
+                    // page's content nodes (see check_trapping) and
+                    // walking stops here would multiply the per-pair
+                    // cost by the stop count. The trade-off:
+                    //
+                    // * Worst case: a pure C→M (or C→Y, M→Y) gradient
+                    //   abutting a similar non-K fill — both sides
+                    //   register the same 20% K plate, share that
+                    //   single plate in the trapping comparison, and
+                    //   the check is suppressed even though on press
+                    //   the two would mis-register. This is a false
+                    //   *negative*: the user misses a warning they
+                    //   could have acted on.
+                    // * Best case: a K-heavy gradient (any darkening
+                    //   ramp through black) registers correctly.
+                    //
+                    // We prefer false negatives over false positives
+                    // here — preflight panels lose user trust quickly
+                    // if they cry wolf, and the printer's own preflight
+                    // catches anything that slips through. The Phase 6
+                    // benchmark suite (Tasks 29–30) is the trigger for
+                    // revisiting this: if pairwise comparison cost
+                    // dominates a real workload, the right fix is to
+                    // precompute a `GradientInkSummary { dominant,
+                    // plates_present, mean_density }` once when the
+                    // gradient is set and stash it on the node, so the
+                    // trapping check stays O(n) per pair (bitmask
+                    // intersection) regardless of stop count.
+                    //
+                    // The shading check (check_node_shading) already
+                    // validates gradient banding more strictly, so the
+                    // user still gets per-gradient feedback there —
+                    // this approximation only weakens the *trapping*
+                    // signal, not the gradient-quality one.
                     had_any_fill = true;
                     sig.cmyk.3 += 0.20;
                 }

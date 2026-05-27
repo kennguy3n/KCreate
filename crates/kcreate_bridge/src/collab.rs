@@ -4170,7 +4170,7 @@ mod tests {
             .mint_install_request_for_peer(
                 "lockstep.group",
                 &peer_pk_b64,
-                std::time::Duration::from_secs(60 * 60),
+                std::time::Duration::from_hours(1),
             )
             .expect("mint should succeed for valid inputs");
 

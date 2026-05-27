@@ -107,11 +107,7 @@ impl Default for SessionConfig {
         Self {
             replay_window: 32_000,
             max_peers: 256,
-            // 1-hour rotation cadence. clippy's
-            // `duration_suboptimal_units` lint requires we name the
-            // unit explicitly rather than `from_secs(3_600)`.
-            #[allow(clippy::duration_suboptimal_units)]
-            key_rotation_interval: Some(std::time::Duration::from_secs(60 * 60)),
+            key_rotation_interval: Some(std::time::Duration::from_hours(1)),
             key_rotation_grace: std::time::Duration::from_secs(30),
             max_ops_per_second: 100,
             max_presence_per_second: 20,

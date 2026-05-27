@@ -181,6 +181,16 @@ impl OperationLog {
         // is O(1). Each dropped op invalidates any branches whose
         // anchor lives below the new front, so we re-base anchors
         // (shift down by one) and drop those that fall to <= 0.
+        //
+        // The same trim-and-rebase pattern runs in
+        // [`Self::restore_branch`]; the two sites MUST stay in
+        // lockstep. Three indices move together when we drop the
+        // front: `history.len()` (down by 1), surviving
+        // `branches[i].anchor_position` (each down by 1, with
+        // anchors at 0 dropped), and — in `restore_branch` only —
+        // `self.position` (saturating_sub(1)). Here in `push`,
+        // `self.position` is set to `history.len()` after the loop,
+        // which absorbs the trim implicitly.
         while self.history.len() > self.max_depth {
             self.history.pop_front();
             self.branches.retain(|b| b.anchor_position > 0);
@@ -456,6 +466,15 @@ impl OperationLog {
             self.history.push_back(op);
         }
         // Bound the buffer; re-base any remaining branches.
+        //
+        // Mirror of the trim loop in [`Self::push`] — see that
+        // site's doc comment for the invariant. The extra wrinkle
+        // here is that `self.position` is NOT reset to
+        // `history.len()` after the loop (we want the cursor to
+        // stay where the user was before restore, not jump to the
+        // end), so we decrement it inline. `saturating_sub`
+        // protects against the edge case where position == 0
+        // before the trim — the cursor cannot go negative.
         while self.history.len() > self.max_depth {
             self.history.pop_front();
             self.branches.retain(|b| b.anchor_position > 0);

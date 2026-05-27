@@ -140,6 +140,38 @@ export function EditorPage({
   useEffect(() => {
     panActiveRef.current = panActive;
   }, [panActive]);
+
+  // Defense-in-depth disarm: the hold-to-pan gesture is normally
+  // cleared by the bound keyup, but a user can lose Space-as-keyup
+  // entirely if focus leaves the document mid-hold — alt-tab to
+  // another app, click into a system dialog, drag a file from
+  // outside the window, etc. The keyup never reaches us in those
+  // cases, so we listen for window `blur` and the document's
+  // `visibilitychange` (fires on tab-switch and OS lock-screen) and
+  // clear the gesture proactively. Gated on `panActiveRef.current`
+  // so we don't fire a no-op state update on every focus change.
+  useEffect(() => {
+    const clearPan = (): void => {
+      if (panActiveRef.current) {
+        setPanActive(false);
+      }
+    };
+    const onVisibilityChange = (): void => {
+      if (typeof document !== "undefined" && document.hidden) {
+        clearPan();
+      }
+    };
+    window.addEventListener("blur", clearPan);
+    if (typeof document !== "undefined") {
+      document.addEventListener("visibilitychange", onVisibilityChange);
+    }
+    return () => {
+      window.removeEventListener("blur", clearPan);
+      if (typeof document !== "undefined") {
+        document.removeEventListener("visibilitychange", onVisibilityChange);
+      }
+    };
+  }, []);
   const [layoutPickerShownFor, setLayoutPickerShownFor] = useState<string | null>(
     null,
   );
@@ -177,16 +209,36 @@ export function EditorPage({
   // canvas still drives a sensible paste origin.
   const lastCursorWorldRef = useRef<{ x: number; y: number } | null>(null);
 
-  /// `nodes` mirror used inside the canvas pointer handler. The
-  /// handler is wrapped in `useCallback` and we deliberately do NOT
-  /// add `nodes` to its deps array (re-creating the callback on every
-  /// node mutation would cancel any in-flight drag). The ref is the
-  /// idiomatic React workaround for "read latest value inside a
-  /// stable callback".
+  /// `nodes`, `selectedIds`, and `artboards` mirrors used inside
+  /// callbacks that must stay reference-stable. We deliberately do
+  /// NOT add the corresponding state to those callbacks' deps —
+  /// re-creating the callback on every node / selection / artboard
+  /// mutation either cancels an in-flight drag (pointer handler) or
+  /// causes the `useShortcuts` window-listener pair to detach and
+  /// re-attach on every keystroke-relevant state change (clipboard
+  /// handlers). The refs are the idiomatic React workaround for
+  /// "read latest value inside a stable callback".
+  ///
+  /// The listener-churn case is the hot one: without these refs,
+  /// `handleCopy` and `handlePaste` would depend on `nodes` (and
+  /// `selectedIds`, `artboards`), so `shortcutHandlers` would rebuild
+  /// on every node mutation, which in turn drives `useShortcuts`'s
+  /// `useEffect` to detach+attach `keydown` and `keyup` on `window`.
+  /// During a 60fps drag-to-move this fires ~60 times per second
+  /// for no functional reason — every dispatch reads the current
+  /// state via the refs anyway.
   const nodesRef = useRef<NodeInfo[]>(nodes);
   useEffect(() => {
     nodesRef.current = nodes;
   }, [nodes]);
+  const selectedIdsRef = useRef<string[]>(selectedIds);
+  useEffect(() => {
+    selectedIdsRef.current = selectedIds;
+  }, [selectedIds]);
+  const artboardsRef = useRef<ArtboardInfo[]>(artboards);
+  useEffect(() => {
+    artboardsRef.current = artboards;
+  }, [artboards]);
 
   const selectedId: string | null =
     selectedIds.length === 1 ? (selectedIds[0] ?? null) : null;
@@ -679,15 +731,22 @@ export function EditorPage({
   //         the pasted nodes.
   // ------------------------------------------------------------------
 
+  // `handleCopy` reads `selectedIds` and `nodes` via refs so its
+  // identity stays stable across node / selection mutations. This
+  // keeps the `shortcutHandlers` memo (and therefore the
+  // `useShortcuts` window listeners) from churning on every drag
+  // frame — see the `nodesRef` doc comment above.
   const handleCopy = useCallback(async () => {
-    if (selectedIds.length === 0) return;
+    const selectionSnapshot = selectedIdsRef.current;
+    const nodesSnapshot = nodesRef.current;
+    if (selectionSnapshot.length === 0) return;
     try {
       // Filter selected ids that are themselves Pages / Artboards.
       // The bridge filters defensively too, but doing it here avoids a
       // surprising "you copied something but the clipboard is empty"
       // when the user has only top-level container ids selected.
-      const eligible = selectedIds.filter((id) => {
-        const n = nodes.find((node) => node.id === id);
+      const eligible = selectionSnapshot.filter((id) => {
+        const n = nodesSnapshot.find((node) => node.id === id);
         if (!n) return false;
         return n.nodeType !== "Page" && n.nodeType !== "Artboard";
       });
@@ -712,10 +771,18 @@ export function EditorPage({
     } catch (e) {
       setStatusMessage(`copy failed: ${errorMessage(e)}`);
     }
-  }, [selectedIds, nodes]);
+  }, []);
 
+  // `handlePaste` reads `selectedIds`, `nodes`, and `artboards`
+  // via refs for the same listener-churn reason as `handleCopy`.
+  // `refreshTree` is itself reference-stable (its deps closure over
+  // only `setNodes`-class setters which React guarantees stable),
+  // so it can stay in the deps array.
   const handlePaste = useCallback(async () => {
     try {
+      const selectionSnapshot = selectedIdsRef.current;
+      const nodesSnapshot = nodesRef.current;
+      const artboardsSnapshot = artboardsRef.current;
       let enveloped: string | undefined;
       if (typeof navigator !== "undefined" && navigator.clipboard?.readText) {
         try {
@@ -738,13 +805,13 @@ export function EditorPage({
       // Resolve target artboard: the artboard owning the first
       // selection if any, otherwise the first artboard on the page.
       let targetArtboard: string | null = null;
-      if (selectedIds.length > 0) {
-        const first = nodes.find((n) => n.id === selectedIds[0]);
+      if (selectionSnapshot.length > 0) {
+        const first = nodesSnapshot.find((n) => n.id === selectionSnapshot[0]);
         // Walk up to find an Artboard ancestor.
         let cursor: NodeInfo | undefined = first;
         while (cursor && cursor.nodeType !== "Artboard") {
           cursor = cursor.parentId
-            ? nodes.find((n) => n.id === cursor!.parentId)
+            ? nodesSnapshot.find((n) => n.id === cursor!.parentId)
             : undefined;
         }
         if (cursor && cursor.nodeType === "Artboard") {
@@ -752,7 +819,7 @@ export function EditorPage({
         }
       }
       if (!targetArtboard) {
-        targetArtboard = artboards[0]?.id ?? null;
+        targetArtboard = artboardsSnapshot[0]?.id ?? null;
       }
       if (!targetArtboard) {
         setStatusMessage("no artboard to paste into");
@@ -799,7 +866,7 @@ export function EditorPage({
     } catch (e) {
       setStatusMessage(`paste failed: ${errorMessage(e)}`);
     }
-  }, [selectedIds, nodes, artboards, refreshTree]);
+  }, [refreshTree]);
 
   // ------------------------------------------------------------------
   // Phase 6 Task 25 — drag-and-drop from the OS file manager.

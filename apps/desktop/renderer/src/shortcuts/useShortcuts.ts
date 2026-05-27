@@ -98,12 +98,27 @@ export function useShortcuts(
       // tools. We deliberately keep this check inside the
       // listener so a freshly-focused input is honoured immediately.
       //
-      // The form-field gate must apply to both phases — if it
-      // didn't, releasing Space inside a text input would still
-      // fire `togglePan.onKeyUp` and disarm the gesture even though
-      // the matching keydown was skipped. Keeping it symmetric
-      // preserves the "shortcuts never interfere with typing"
-      // contract on both sides of the gesture.
+      // The form-field gate is ASYMMETRIC by design:
+      //   * keydown:  always gated — keydown is where new actions
+      //               arm, and arming a shortcut while the user is
+      //               typing would interfere with typing.
+      //   * keyup:    gated ONLY for one-shot (bare-function)
+      //               handlers, which by convention only fire on
+      //               keydown and would never produce a real
+      //               dispatch on keyup anyway. Hold-style handlers
+      //               (`{ onKeyDown, onKeyUp }`) MUST observe keyup
+      //               even when focus has moved to an editable
+      //               element — their `onKeyUp` is the *disarm*
+      //               leg of a gesture (e.g. release-Space ends the
+      //               hold-to-pan). If we gated keyup symmetrically,
+      //               a user who armed pan on the canvas and then
+      //               clicked into a text input before releasing
+      //               Space would be stranded with the gesture
+      //               armed indefinitely, with no keystroke able to
+      //               clear it (every subsequent keydown is gated
+      //               too). Releasing Space-as-keyup does not
+      //               insert text or otherwise affect typing, so
+      //               letting the disarm through is safe.
       const target = event.target as HTMLElement | null;
       const tag = target?.tagName?.toLowerCase();
       const isEditable =
@@ -111,7 +126,7 @@ export function useShortcuts(
         tag === "textarea" ||
         tag === "select" ||
         (target?.isContentEditable ?? false);
-      if (isEditable) return;
+      if (isEditable && phase === "down") return;
 
       // Walk the action list once. The set is small (~15 entries)
       // so a linear scan is fine; we don't index by keystroke

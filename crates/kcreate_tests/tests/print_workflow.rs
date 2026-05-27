@@ -1,8 +1,8 @@
 //! Phase 5 spot-color + overprint coverage.
 
 use kcreate_core::color::{
-    cmyk_to_srgb, total_ink_coverage_with_spots, Color, SpotCatalogError, SpotColorDef,
-    SpotColorLibrary,
+    cmyk_to_srgb, total_ink_coverage_with_spots, CatalogParseStats, Color, SpotCatalogError,
+    SpotColorDef, SpotColorLibrary,
 };
 use kcreate_core::document::DocumentGraph;
 use kcreate_core::node::{
@@ -304,6 +304,84 @@ fn pantone_catalog_rejects_non_object_root() {
     let err =
         SpotColorLibrary::from_json_catalog("not-json").expect_err("malformed JSON fails parse");
     assert!(matches!(err, SpotCatalogError::Parse(_)));
+}
+
+/// Devin Review ANALYSIS_0005 regression guard: `from_json_catalog`
+/// previously silently dropped malformed entries AND silently
+/// dedup'd entries that collided on `id`, reporting only the
+/// surviving `len()`. `from_json_catalog_with_report` must now
+/// surface every reason a catalogue lost rows so the renderer can
+/// show users exactly what happened. The invariant
+/// `raw_entries == parsed + duplicates_in_catalog + malformed`
+/// must hold by construction.
+#[test]
+fn pantone_catalog_with_report_separates_malformed_and_duplicates() {
+    let raw = r#"{
+        "entries": [
+            { "id": "GOOD",       "cmyk": [0.0, 0.5, 0.5, 0.0] },
+            { "id": "GOOD",       "cmyk": [0.1, 0.6, 0.6, 0.1] },
+            { "id": "WRONG_LEN",  "cmyk": [0.0, 0.5, 0.5]      },
+            { "id": "NON_FINITE", "cmyk": [0.0, 0.5, 0.5, null] },
+            { "id": "NO_CMYK",    "display_name": "missing"     },
+            { "id": "ANOTHER",    "cmyk": [0.2, 0.2, 0.2, 0.2] }
+        ]
+    }"#;
+    let (lib, stats) = SpotColorLibrary::from_json_catalog_with_report(raw)
+        .expect("top-level parses even with bad rows");
+    assert_eq!(lib.len(), 2, "GOOD (last wins) + ANOTHER survive");
+    assert_eq!(
+        stats.raw_entries, 6,
+        "all six rows are visible to the parser"
+    );
+    assert_eq!(stats.parsed, 2, "post-dedup, post-validation");
+    assert_eq!(
+        stats.duplicates_in_catalog, 1,
+        "the second GOOD overwrites the first"
+    );
+    assert_eq!(
+        stats.malformed, 3,
+        "WRONG_LEN, NON_FINITE, NO_CMYK all dropped"
+    );
+    assert_eq!(
+        stats.raw_entries,
+        stats.parsed + stats.duplicates_in_catalog + stats.malformed,
+        "the documented invariant holds"
+    );
+    // The dedup picks the *last* well-formed entry, matching
+    // the SpotColorLibrary::merge() last-write-wins policy.
+    let good = lib.get("GOOD").expect("GOOD survives");
+    let (c, m, y, k) = good.fallback_cmyk;
+    assert!((c - 0.1).abs() < 1e-6);
+    assert!((m - 0.6).abs() < 1e-6);
+    assert!((y - 0.6).abs() < 1e-6);
+    assert!((k - 0.1).abs() < 1e-6);
+}
+
+#[test]
+fn pantone_catalog_bare_map_report_never_counts_duplicates() {
+    // JSON object keys are unique at the parser level (serde_json
+    // keeps only the last value for repeated keys), so the bare-map
+    // shape can never report `duplicates_in_catalog > 0`. Only
+    // structural malformation can drop entries.
+    let raw = r#"{
+        "ok-1": { "cmyk": [0.1, 0.2, 0.3, 0.4] },
+        "ok-2": [0.5, 0.5, 0.5, 0.5],
+        "bad":  { "cmyk": [0.1, 0.2, 0.3] }
+    }"#;
+    let (lib, stats) = SpotColorLibrary::from_json_catalog_with_report(raw).unwrap();
+    assert_eq!(lib.len(), 2);
+    assert_eq!(stats.raw_entries, 3);
+    assert_eq!(stats.parsed, 2);
+    assert_eq!(stats.duplicates_in_catalog, 0);
+    assert_eq!(stats.malformed, 1);
+}
+
+#[test]
+fn pantone_catalog_with_report_default_for_empty_catalogue() {
+    let (lib, stats) =
+        SpotColorLibrary::from_json_catalog_with_report(r#"{ "entries": [] }"#).unwrap();
+    assert!(lib.is_empty());
+    assert_eq!(stats, CatalogParseStats::default());
 }
 
 #[test]

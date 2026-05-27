@@ -2245,19 +2245,41 @@ pub fn color_spot_remove(name: &str) -> Result<bool> {
 /// Report of a `color_spot_load_catalog` call.
 ///
 /// Mirrors `SpotCatalogLoadReportWire` in `apps/desktop/shared/scene.ts`.
+///
+/// The four numeric counters satisfy
+/// `raw_entries == parsed + duplicates_in_catalog + malformed`, so the
+/// renderer can present a faithful breakdown of why a load dropped
+/// entries (malformed CMYK arrays, same-id collisions within the
+/// catalogue, etc.) instead of silently showing only the dedup'd
+/// `parsed` count. `added` and `overwritten` are *project-level*
+/// counts on top of that: they describe how the parsed library merged
+/// into the existing `SpotColorLibrary`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SpotCatalogLoadReport {
+    /// Total entries in the catalogue file before any
+    /// validation/dedup, mirroring
+    /// `kcreate_core::color::CatalogParseStats::raw_entries`.
+    /// `parsed + duplicates_in_catalog + malformed` always equals
+    /// this value (Devin Review ANALYSIS_0005 on PR #16).
+    pub raw_entries: usize,
+    /// Number of entries that survived parsing and dedup and were
+    /// merged into the project library.
+    pub parsed: usize,
+    /// Number of entries dropped because they collided with another
+    /// entry of the same `name`/`id` *within the same catalogue*
+    /// (last-write-wins). Always `0` for the bare-map shape because
+    /// JSON object keys are unique at the parser level.
+    pub duplicates_in_catalog: usize,
+    /// Number of entries dropped as malformed (wrong-length CMYK,
+    /// non-finite values, missing `id` in the wrapped form, etc.).
+    pub malformed: usize,
     /// Number of swatches in the parsed catalogue that were not
     /// previously in the project library (newly inserted).
     pub added: usize,
     /// Number of swatches that overwrote an existing entry with the
     /// same `name` (the merge policy is "last-loaded wins").
     pub overwritten: usize,
-    /// Total entries the catalogue contained after parsing. Will be
-    /// less than the raw entry count when malformed entries were
-    /// dropped (e.g. wrong-length CMYK arrays).
-    pub parsed: usize,
 }
 
 /// Load a Pantone-style JSON catalogue and merge its entries into
@@ -2274,17 +2296,21 @@ pub struct SpotCatalogLoadReport {
 /// doesn't have native-file-dialog access on its own.
 pub fn color_spot_load_catalog(raw_json: &str) -> Result<SpotCatalogLoadReport> {
     use kcreate_core::color::SpotColorLibrary;
-    let parsed = SpotColorLibrary::from_json_catalog(raw_json).map_err(|e| {
-        DocumentBridgeError::InvalidArgument {
-            argument: "spot_catalog".into(),
-            value: e.to_string(),
-        }
-    })?;
-    let parsed_count = parsed.len();
+    let (parsed, stats) =
+        SpotColorLibrary::from_json_catalog_with_report(raw_json).map_err(|e| {
+            DocumentBridgeError::InvalidArgument {
+                argument: "spot_catalog".into(),
+                value: e.to_string(),
+            }
+        })?;
+    let parsed_count = stats.parsed;
     let mut report = SpotCatalogLoadReport {
+        raw_entries: stats.raw_entries,
+        parsed: parsed_count,
+        duplicates_in_catalog: stats.duplicates_in_catalog,
+        malformed: stats.malformed,
         added: 0,
         overwritten: 0,
-        parsed: parsed_count,
     };
     if parsed_count == 0 {
         return Ok(report);

@@ -373,6 +373,9 @@ export interface Bridge {
   masterPageDetach(contentPageId: string): void;
   layoutTemplateList(): string;
   layoutTemplateApply(templateId: string): string;
+  templateList(category: string | undefined, query: string | undefined): string;
+  templateInstallLocal(sourcePath: string): string;
+  templateRemove(templateId: string): void;
   pageAdd(
     name: string,
     size?: string,

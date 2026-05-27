@@ -1357,6 +1357,81 @@ export interface LayoutStudioBridge {
 }
 
 // ---------------------------------------------------------------------------
+// Phase 3 — Local template marketplace (Tasks 11-12).
+//
+// Mirrors `kcreate_core::marketplace::{TemplateSource, TemplateManifest,
+// MarketplaceError}`. The renderer's TemplateMarketplace panel calls
+// `window.kcreate.templateMarketplace.{list,installLocal,remove}` to
+// surface the contents of `~/.kcreate/templates/` (or whichever
+// directory is pointed to by the `KCREATE_TEMPLATE_DIR` env var the
+// bridge respects).
+// ---------------------------------------------------------------------------
+
+/**
+ * Mirror of `kcreate_core::marketplace::TemplateSource` —
+ * tagged-union with a single Phase 3 variant for local-on-disk
+ * templates. A future remote-marketplace variant would live here
+ * alongside `Local`.
+ */
+export type TemplateSource = {
+  type: "local";
+  /** Absolute path of the `.ktemplate/` folder on the user's disk. */
+  path: string;
+};
+
+/**
+ * Manifest of an installed template, mirrors
+ * `kcreate_core::marketplace::TemplateManifest`. Wire-format lockstep
+ * (AGENTS.md rule 4).
+ */
+export interface TemplateManifest {
+  id: string;
+  name: string;
+  description: string;
+  category: TemplateCategory;
+  tags: string[];
+  /** Relative path to a thumbnail image inside the template folder. */
+  thumbnail: string | null;
+  page_count: number;
+  author: string | null;
+  version: string;
+  source: TemplateSource | null;
+}
+
+/** Mirror of `kcreate_bridge::phase2::TemplateListReport`. */
+export interface TemplateListReport {
+  templates: TemplateManifest[];
+}
+
+export interface TemplateMarketplaceBridge {
+  /**
+   * List installed templates from the marketplace directory.
+   * `category` filters by `TemplateCategory` discriminant;
+   * `query` filters by case-insensitive substring against name,
+   * tag, or description. When both are supplied, the renderer's
+   * convention is that a non-empty query overrides the category
+   * (search bar dominates).
+   */
+  list(
+    category?: TemplateCategory,
+    query?: string,
+  ): Promise<TemplateListReport>;
+  /**
+   * Install a `.ktemplate/` folder from `sourcePath` into the
+   * marketplace root (copies the directory). Returns the installed
+   * manifest. Rejects with `Status::InvalidArg` if the source has no
+   * valid manifest or the same id is already installed.
+   */
+  installLocal(sourcePath: string): Promise<TemplateManifest>;
+  /**
+   * Remove an installed template by id — deletes the `.ktemplate/`
+   * folder on disk. Rejects with `Status::InvalidArg` for an
+   * unknown id.
+   */
+  remove(templateId: string): Promise<void>;
+}
+
+// ---------------------------------------------------------------------------
 // Phase 2 — Preflight, Icon Pack, Batch Async, AI extras, Plugin sandbox,
 // MCP permission persistence, Screenshot-to-Layout.
 // ---------------------------------------------------------------------------
@@ -2251,14 +2326,31 @@ export interface SpotColorWire {
 
 /// Result of [`ColorBridge.loadCatalog`]. Mirrors
 /// `kcreate_bridge::phase2::SpotCatalogLoadReport` 1:1.
+///
+/// The four catalogue-level counters satisfy
+/// `rawEntries == parsed + duplicatesInCatalog + malformed`, so the
+/// renderer can show users exactly why a load dropped or dedup'd
+/// entries instead of presenting only the surviving `parsed` count
+/// (Devin Review ANALYSIS_0005 on PR #16).
 export interface SpotCatalogLoadReportWire {
+  /// Total entries in the catalogue file before any validation /
+  /// dedup. Mirrors `CatalogParseStats::raw_entries`.
+  rawEntries: number;
+  /// Entries that survived parsing and were merged into the project
+  /// library.
+  parsed: number;
+  /// Entries dropped because they collided on `name`/`id` with an
+  /// earlier well-formed entry in the same catalogue (last-write-
+  /// wins). Always `0` for the bare-map shape (JSON object keys are
+  /// unique at the parser level).
+  duplicatesInCatalog: number;
+  /// Entries dropped as malformed (wrong-length CMYK, non-finite
+  /// values, missing `id` in the wrapped form, etc.).
+  malformed: number;
   /// Swatches newly inserted into the project library.
   added: number;
   /// Swatches that overwrote an existing entry of the same `name`.
   overwritten: number;
-  /// Total entries the catalogue contained after parsing. Less than
-  /// the raw entry count when malformed entries were dropped.
-  parsed: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -3128,6 +3220,7 @@ declare global {
       interaction: InteractionBridge;
       masterPage: MasterPageBridge;
       layoutStudio: LayoutStudioBridge;
+      templateMarketplace: TemplateMarketplaceBridge;
       preflight: PreflightBridge;
       iconPack: IconPackBridge;
       batch: BatchBridge;

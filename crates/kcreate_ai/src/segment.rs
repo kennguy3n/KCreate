@@ -487,18 +487,35 @@ fn run_onnx_sam(
         })?;
 
     // Point prompt in resized image space.
+    //
+    // The fused MobileSAM / EdgeSAM single-file ONNX exports we
+    // target (samexporter `--mobilesam` and the consolidated
+    // ViT-B builds) expose the prompt inputs as:
+    //
+    //   point_coords : f32 [1, N, 2]
+    //   point_labels : f32 [1, N]
+    //
+    // i.e. batch axis + N points + (x, y). Earlier revisions of
+    // this code shipped a 4D `[1, 1, 1, 2]` / 3D `[1, 1, 1]` shape
+    // by analogy with the non-fused two-session exports, which is
+    // not what the fused exports accept and would produce a clear
+    // `ort run` shape-mismatch error on every call (Devin Review
+    // ANALYSIS_0002 on PR #16). We now use the documented 3D / 2D
+    // shapes the fused exports actually require — see the
+    // `ChaoningZhang/MobileSAM` upstream and the `samexporter`
+    // README for the contract.
     let prompt_x = (options.point_x as f32) * scale;
     let prompt_y = (options.point_y as f32) * scale;
     let points: Vec<f32> = vec![prompt_x, prompt_y];
-    let points_shape = [1_i64, 1, 1, 2];
+    let points_shape = [1_i64, 1, 2];
     let points_tensor = TensorRef::from_array_view((points_shape.as_slice(), points.as_slice()))
         .map_err(|e| SegmentError::BackendRuntime {
             backend: SegmentBackend::Sam,
             message: format!("ort points tensor: {e}"),
         })?;
-    // Label `1` = foreground point.
+    // Label `1` = foreground point. Shape `[1, N]` (batch × points).
     let labels: Vec<f32> = vec![1.0];
-    let labels_shape = [1_i64, 1, 1];
+    let labels_shape = [1_i64, 1];
     let labels_tensor = TensorRef::from_array_view((labels_shape.as_slice(), labels.as_slice()))
         .map_err(|e| SegmentError::BackendRuntime {
             backend: SegmentBackend::Sam,

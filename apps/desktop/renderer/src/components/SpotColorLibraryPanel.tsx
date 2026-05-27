@@ -177,8 +177,21 @@ export function SpotColorLibraryPanel({
         const raw = await file.text();
         const report = await window.kcreate.color.loadCatalog(raw);
         setLastReport(report);
+        // Build a status summary that distinguishes catalogue-level
+        // counts (raw/parsed/dropped) from project-level counts
+        // (added/overwritten). Mention drops/dedups only when they
+        // happened, so the common case stays terse.
+        const dropParts: string[] = [];
+        if (report.malformed > 0) {
+          dropParts.push(`${report.malformed} malformed`);
+        }
+        if (report.duplicatesInCatalog > 0) {
+          dropParts.push(`${report.duplicatesInCatalog} duplicate`);
+        }
+        const dropSuffix =
+          dropParts.length > 0 ? ` (dropped ${dropParts.join(" + ")})` : "";
         onStatus?.(
-          `Loaded catalogue: ${report.added} added, ${report.overwritten} replaced, ${report.parsed} parsed.`,
+          `Loaded catalogue: ${report.parsed} of ${report.rawEntries} entries → ${report.added} added, ${report.overwritten} replaced${dropSuffix}.`,
         );
         await refresh();
       } catch (e) {
@@ -289,8 +302,15 @@ export function SpotColorLibraryPanel({
           }}
           data-testid="catalog-report"
         >
-          Catalogue: parsed {lastReport.parsed}, added {lastReport.added},
-          overwrote {lastReport.overwritten}.
+          Catalogue: {lastReport.parsed} of {lastReport.rawEntries}{" "}
+          entries kept{lastReport.duplicatesInCatalog > 0
+            ? `, ${lastReport.duplicatesInCatalog} dedup'd`
+            : ""}
+          {lastReport.malformed > 0
+            ? `, ${lastReport.malformed} malformed dropped`
+            : ""}
+          . Merged: {lastReport.added} added, {lastReport.overwritten}{" "}
+          overwrote.
         </p>
       ) : null}
 

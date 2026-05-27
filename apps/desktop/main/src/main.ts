@@ -1450,6 +1450,33 @@ function registerIpcHandlers(): void {
     (_e, templateId: string): string =>
       requireBridge().layoutTemplateApply(templateId),
   );
+
+  // Local template marketplace (Phase 3 — Tasks 11-12). The
+  // renderer's TemplateMarketplace panel calls list/install/remove
+  // here; the bridge persists installs by copying the .ktemplate
+  // folder into ~/.kcreate/templates/ (configurable via the
+  // KCREATE_TEMPLATE_DIR env var the bridge reads). `category` and
+  // `query` are nullable on the IPC side so the renderer can omit
+  // them; we normalise null → undefined for the napi signature.
+  ipcMain.handle(
+    "kcreate/template/list",
+    (_e, category: string | null, query: string | null): string =>
+      requireBridge().templateList(
+        category ?? undefined,
+        query ?? undefined,
+      ),
+  );
+  ipcMain.handle(
+    "kcreate/template/installLocal",
+    (_e, sourcePath: string): string =>
+      requireBridge().templateInstallLocal(sourcePath),
+  );
+  ipcMain.handle(
+    "kcreate/template/remove",
+    (_e, templateId: string): void => {
+      requireBridge().templateRemove(templateId);
+    },
+  );
   ipcMain.handle(
     "kcreate/page/add",
     (

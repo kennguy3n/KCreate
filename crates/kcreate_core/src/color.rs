@@ -281,23 +281,68 @@ impl SpotColorLibrary {
     /// skipped rather than failing the whole catalogue — a single
     /// corrupted swatch should not lock the user out of all the
     /// others.
+    ///
+    /// This convenience returns just the parsed library; callers that
+    /// need to surface diagnostics (how many raw entries, how many
+    /// were dropped as malformed, how many collided by id) should use
+    /// [`Self::from_json_catalog_with_report`] instead. The bridge's
+    /// `color_spot_load_catalog` uses the reporting variant so the UI
+    /// can show users exactly what happened when a load drops or
+    /// dedups entries (Devin Review ANALYSIS_0005 on PR #16).
     pub fn from_json_catalog(raw: &str) -> Result<Self, SpotCatalogError> {
+        Self::from_json_catalog_with_report(raw).map(|(lib, _)| lib)
+    }
+
+    /// Parse a Pantone-style JSON catalogue and report parse-time
+    /// counts alongside the resulting library.
+    ///
+    /// See [`Self::from_json_catalog`] for the supported input shapes
+    /// and validation rules. The returned [`CatalogParseStats`]
+    /// distinguishes three reasons the library may carry fewer
+    /// entries than the raw JSON contained:
+    ///
+    /// * `malformed` — the entry failed structural validation
+    ///   (missing `id`, wrong-length / non-finite CMYK, not an object
+    ///   in the bare-map form, etc.).
+    /// * `duplicates_in_catalog` — two or more entries shared the
+    ///   same `name`/`id` and only the last one survives (the merge
+    ///   policy is last-write-wins, consistent with `merge()`).
+    /// * `parsed` — the final dedup'd, well-formed count actually
+    ///   loaded into the library.
+    ///
+    /// `raw_entries = parsed + duplicates_in_catalog + malformed`
+    /// holds by construction, so the caller can recover the original
+    /// catalogue size without parsing again.
+    pub fn from_json_catalog_with_report(
+        raw: &str,
+    ) -> Result<(Self, CatalogParseStats), SpotCatalogError> {
         let value: serde_json::Value =
             serde_json::from_str(raw).map_err(|e| SpotCatalogError::Parse(e.to_string()))?;
         let mut out = Self::default();
+        let mut stats = CatalogParseStats::default();
         match value {
             serde_json::Value::Object(map) => {
                 if let Some(entries) = map.get("entries").and_then(|v| v.as_array()) {
                     for entry in entries {
+                        stats.raw_entries += 1;
                         if let Some((name, def)) = parse_catalog_entry_object(entry) {
-                            out.entries.insert(name, def);
+                            if out.entries.insert(name, def).is_some() {
+                                stats.duplicates_in_catalog += 1;
+                            }
+                        } else {
+                            stats.malformed += 1;
                         }
                     }
                 } else {
                     // Bare map form. The map key IS the swatch id —
                     // entries may omit `id` entirely and only carry
                     // `display_name` + `cmyk`, or even just a bare
-                    // 4-element CMYK array.
+                    // 4-element CMYK array. JSON object keys are
+                    // already unique at the parser level (serde_json
+                    // keeps only the last value for repeated keys),
+                    // so `duplicates_in_catalog` is structurally zero
+                    // for this shape — the only way to lose entries
+                    // is structural malformation.
                     for (name, entry) in map {
                         // Skip top-level metadata fields a catalogue
                         // may carry alongside swatches (e.g. "name",
@@ -306,16 +351,42 @@ impl SpotColorLibrary {
                         if entry.is_string() || entry.is_null() {
                             continue;
                         }
+                        stats.raw_entries += 1;
                         if let Some(def) = parse_bare_entry(&name, &entry) {
-                            out.entries.insert(name, def);
+                            if out.entries.insert(name, def).is_some() {
+                                stats.duplicates_in_catalog += 1;
+                            }
+                        } else {
+                            stats.malformed += 1;
                         }
                     }
                 }
             }
             _ => return Err(SpotCatalogError::Shape),
         }
-        Ok(out)
+        stats.parsed = out.entries.len();
+        Ok((out, stats))
     }
+}
+
+/// Diagnostic counts produced by
+/// [`SpotColorLibrary::from_json_catalog_with_report`]. Field
+/// semantics are documented on that method; the invariant
+/// `raw_entries == parsed + duplicates_in_catalog + malformed`
+/// always holds.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CatalogParseStats {
+    /// Total entries encountered in the catalogue before filtering.
+    pub raw_entries: usize,
+    /// Well-formed entries that survived into the library.
+    pub parsed: usize,
+    /// Well-formed entries that collided on `name` with an earlier
+    /// well-formed entry from the same catalogue; the later entry
+    /// overwrote the earlier one (last-write-wins).
+    pub duplicates_in_catalog: usize,
+    /// Entries dropped as malformed (wrong-length CMYK, non-finite
+    /// values, missing `id` in the wrapped form, etc.).
+    pub malformed: usize,
 }
 
 /// Failure modes for [`SpotColorLibrary::from_json_catalog`].

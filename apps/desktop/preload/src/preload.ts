@@ -25,6 +25,10 @@ import type {
   LayoutBridge,
   LayoutStudioBridge,
   LayoutTemplate,
+  TemplateCategory,
+  TemplateListReport,
+  TemplateManifest,
+  TemplateMarketplaceBridge,
   MasterPageBridge,
   MasterPageInfo,
   PageLayout,
@@ -1339,6 +1343,34 @@ const layoutStudio: LayoutStudioBridge = {
 };
 
 // ---------------------------------------------------------------------------
+// Phase 3 — local template marketplace (Tasks 11-12).
+// ---------------------------------------------------------------------------
+
+const templateMarketplace: TemplateMarketplaceBridge = {
+  async list(
+    category?: TemplateCategory,
+    query?: string,
+  ): Promise<TemplateListReport> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/template/list",
+      category ?? null,
+      query ?? null,
+    )) as string;
+    return JSON.parse(raw) as TemplateListReport;
+  },
+  async installLocal(sourcePath: string): Promise<TemplateManifest> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/template/installLocal",
+      sourcePath,
+    )) as string;
+    return JSON.parse(raw) as TemplateManifest;
+  },
+  async remove(templateId: string): Promise<void> {
+    await ipcRenderer.invoke("kcreate/template/remove", templateId);
+  },
+};
+
+// ---------------------------------------------------------------------------
 // Phase 2 — preflight, icon pack, batch async, AI extras, plugins, MCP perms.
 // ---------------------------------------------------------------------------
 
@@ -2257,6 +2289,7 @@ contextBridge.exposeInMainWorld("kcreate", {
   interaction,
   masterPage,
   layoutStudio,
+  templateMarketplace,
   preflight,
   iconPack,
   batch,

@@ -63,13 +63,25 @@ fn map_err(e: BridgeError) -> NapiError {
 
 #[allow(clippy::needless_pass_by_value)]
 fn map_doc_err(e: DocumentBridgeError) -> NapiError {
-    let status = match e {
+    let status = match &e {
         DocumentBridgeError::NoProject
         | DocumentBridgeError::InvalidNodeType(_)
         | DocumentBridgeError::InvalidArgument { .. }
         | DocumentBridgeError::NodeNotFound(_)
         | DocumentBridgeError::ProjectDirExists(_)
         | DocumentBridgeError::InvalidUuid(_, _) => Status::InvalidArg,
+        // Marketplace errors that come from a user-supplied template
+        // path / id are user-correctable (bad path, wrong id, duplicate
+        // install) — surface as InvalidArg so the renderer can show
+        // them inline next to the offending control. Underlying IO
+        // failures (disk full, permission denied) stay GenericFailure.
+        DocumentBridgeError::Marketplace(me) => match me {
+            kcreate_core::MarketplaceError::DirectoryNotFound(_)
+            | kcreate_core::MarketplaceError::ManifestParse { .. }
+            | kcreate_core::MarketplaceError::TemplateNotFound(_)
+            | kcreate_core::MarketplaceError::AlreadyInstalled(_) => Status::InvalidArg,
+            kcreate_core::MarketplaceError::Io(_) => Status::GenericFailure,
+        },
         _ => Status::GenericFailure,
     };
     NapiError::new(status, format!("kcreate_bridge: {e}"))
@@ -1965,6 +1977,50 @@ pub fn layout_template_apply(template_id: String) -> NapiResult<String> {
     let ids = document::layout_template_apply(tid).map_err(map_doc_err)?;
     let strs: Vec<String> = ids.into_iter().map(|i| i.to_string()).collect();
     serde_json::to_string(&strs).map_err(|e| NapiError::from_reason(e.to_string()))
+}
+
+/// List installed local templates. Returns a JSON array of
+/// `TemplateManifest` entries, sorted by name. Optional `category`
+/// (snake_case `TemplateCategory` discriminant such as `"pitch_deck"`)
+/// or `query` (case-insensitive substring matched against name, tag,
+/// or description) narrow the results — providing both with the
+/// query non-empty applies the query and ignores the category, which
+/// matches the renderer's "search box overrides category filter" UX.
+#[napi]
+pub fn template_list(category: Option<String>, query: Option<String>) -> NapiResult<String> {
+    let cat = match category.as_deref().filter(|s| !s.is_empty()) {
+        Some(s) => Some(
+            serde_json::from_str::<kcreate_core::TemplateCategory>(&format!("\"{s}\"")).map_err(
+                |e| {
+                    NapiError::new(
+                        Status::InvalidArg,
+                        format!("template_list: invalid category {s:?}: {e}"),
+                    )
+                },
+            )?,
+        ),
+        None => None,
+    };
+    let q = query.as_deref().filter(|s| !s.is_empty());
+    let report = phase2::template_list(cat, q).map_err(map_doc_err)?;
+    serde_json::to_string(&report).map_err(|e| NapiError::from_reason(e.to_string()))
+}
+
+/// Install a local template from a `.ktemplate/` source folder.
+/// Copies the directory into the marketplace root and returns the
+/// installed `TemplateManifest` as JSON.
+#[napi]
+pub fn template_install_local(source_path: String) -> NapiResult<String> {
+    let manifest = phase2::template_install_local(&source_path).map_err(map_doc_err)?;
+    serde_json::to_string(&manifest).map_err(|e| NapiError::from_reason(e.to_string()))
+}
+
+/// Remove an installed local template by id. Deletes the
+/// `.ktemplate/` folder on disk.
+#[napi]
+pub fn template_remove(template_id: String) -> NapiResult<()> {
+    let id = parse_uuid(&template_id)?;
+    phase2::template_remove(id).map_err(map_doc_err)
 }
 
 /// Add a new content page to the open project. `size` and

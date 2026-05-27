@@ -11,7 +11,11 @@
 import { useEffect, useSyncExternalStore } from "react";
 
 import type { ActionId, ShortcutBinding } from "./registry";
-import { matchesBinding, shortcutStore } from "./registry";
+import {
+  matchesBinding,
+  shortcutGetSnapshot,
+  shortcutSubscribe,
+} from "./registry";
 
 export type ShortcutHandlers = Partial<
   Record<ActionId, (event: KeyboardEvent) => void>
@@ -29,11 +33,17 @@ export type ShortcutHandlers = Partial<
 export function useShortcutBindings(): Readonly<
   Record<ActionId, ShortcutBinding>
 > {
-  const store = shortcutStore();
+  // Subscribe + snapshot are module-level stable bindings into the
+  // singleton store (see `shortcutSubscribe` / `shortcutGetSnapshot`
+  // in registry.ts). Passing them by reference — instead of inline
+  // arrow wrappers — keeps `useSyncExternalStore` from detaching
+  // and re-attaching the listener on every render. The third
+  // argument (server snapshot) is the same getter because the
+  // renderer is always client-side.
   return useSyncExternalStore(
-    (listener) => store.subscribe(listener),
-    () => store.snapshot(),
-    () => store.snapshot(),
+    shortcutSubscribe,
+    shortcutGetSnapshot,
+    shortcutGetSnapshot,
   );
 }
 

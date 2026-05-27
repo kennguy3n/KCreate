@@ -402,7 +402,7 @@ export function TemplateMarketplace({
             padding: spacing.sm,
             border: `1px solid ${colors.danger}`,
             borderRadius: radius.sm,
-            background: "#FEE2E2",
+            background: colors.dangerBg,
             color: colors.danger,
             fontSize: 12,
           }}

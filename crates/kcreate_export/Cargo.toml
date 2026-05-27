@@ -39,3 +39,7 @@ flate2 = "1"
 [[bench]]
 name = "preflight"
 harness = false
+
+[[bench]]
+name = "batch_50_assets"
+harness = false

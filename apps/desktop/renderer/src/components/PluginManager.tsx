@@ -391,8 +391,8 @@ function signaturePresentation(signature: PluginSignatureStatus): {
     case "invalid":
       return {
         label: "Bad sig",
-        bg: "#DC262622",
-        fg: "#DC2626",
+        bg: colors.dangerBg,
+        fg: colors.danger,
         title: `Signature failed verification (key "${signature.key_id}"): ${signature.reason}`,
       };
     case "unsigned":
@@ -417,8 +417,8 @@ function PermissionPill({
     <span
       style={{
         padding: "1px 6px",
-        background: isDangerous ? "#DC262622" : colors.bgSoft,
-        color: isDangerous ? "#DC2626" : colors.textMuted,
+        background: isDangerous ? colors.dangerBg : colors.bgSoft,
+        color: isDangerous ? colors.danger : colors.textMuted,
         borderRadius: radius.pill,
         fontSize: 10,
         fontWeight: 600,

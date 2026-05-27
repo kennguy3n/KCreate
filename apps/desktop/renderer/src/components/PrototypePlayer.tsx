@@ -439,7 +439,7 @@ const errorPillStyle: React.CSSProperties = {
   position: "absolute",
   bottom: 8,
   right: 8,
-  background: "rgba(220,38,38,0.85)",
+  background: colors.danger,
   color: colors.textInverse,
   padding: "4px 10px",
   borderRadius: radius.pill,

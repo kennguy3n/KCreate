@@ -53,3 +53,7 @@ harness = false
 [[bench]]
 name = "viewport_pan"
 harness = false
+
+[[bench]]
+name = "cold_start"
+harness = false

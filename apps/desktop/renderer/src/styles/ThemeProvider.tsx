@@ -1,7 +1,16 @@
 // Phase 6 Tasks 23-24: React context provider that exposes the
-// active theme palette and a toggle function. The chosen theme is
+// active theme id and a toggle function. The chosen theme is
 // persisted to `localStorage` under `kcreate.theme` so it survives
 // reloads.
+//
+// The renderer's theming model is CSS-variable driven (see
+// `./themes.ts` for the rationale): components style themselves via
+// `var(--kc-*)` references from `./tokens.ts`, and switching themes
+// is just a matter of writing `data-theme="dark"` onto the document
+// element. We therefore expose only `themeId`, `setTheme`, and
+// `toggle` from the context — there is no `palette` object because
+// duplicating the palette in JS would create a second source of
+// truth that could drift from `index.html`.
 //
 // Usage:
 //
@@ -11,8 +20,8 @@
 //
 // In any descendant:
 //
-//   const { palette, themeId, setTheme } = useTheme();
-//   <div style={{ background: palette.bg }}>…</div>
+//   const { themeId, toggle } = useTheme();
+//   <button onClick={toggle}>{themeId === "dark" ? "☀" : "☾"}</button>
 
 import {
   createContext,
@@ -23,14 +32,12 @@ import {
   useState,
 } from "react";
 
-import type { ThemeId, ThemePalette } from "./themes";
-import { paletteFor } from "./themes";
+import type { ThemeId } from "./themes";
 
 const STORAGE_KEY = "kcreate.theme";
 
 interface ThemeContextValue {
   themeId: ThemeId;
-  palette: ThemePalette;
   setTheme: (id: ThemeId) => void;
   toggle: () => void;
 }
@@ -77,8 +84,9 @@ export function ThemeProvider({
     });
   }, []);
 
-  // Push the theme id onto the root element so global CSS selectors
-  // (e.g. `[data-theme="dark"] *`) can react.
+  // Push the theme id onto the root element so the CSS variable
+  // overrides in `index.html` (`:root[data-theme="dark"]`) take
+  // effect and every `var(--kc-*)` reference flips synchronously.
   useEffect(() => {
     document.documentElement.setAttribute("data-theme", themeId);
     return () => {
@@ -89,7 +97,6 @@ export function ThemeProvider({
   const value = useMemo<ThemeContextValue>(
     () => ({
       themeId,
-      palette: paletteFor(themeId),
       setTheme,
       toggle,
     }),

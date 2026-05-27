@@ -268,7 +268,7 @@ const styles: Record<string, React.CSSProperties> = {
   },
   error: {
     padding: spacing.sm,
-    background: "#FEE2E2",
+    background: colors.dangerBg,
     color: colors.danger,
     borderRadius: radius.sm,
     fontSize: 12,

@@ -596,9 +596,9 @@ const headerStyle: React.CSSProperties = {
 
 function badgeStyle(state: string): React.CSSProperties {
   const tones: Record<string, string> = {
-    ready: "#0F766E",
+    ready: colors.success,
     starting: colors.accent,
-    error: "#DC2626",
+    error: colors.danger,
     stopped: colors.textMuted,
   };
   return {
@@ -683,9 +683,9 @@ const errorStyle: React.CSSProperties = {
   margin: 0,
   padding: `${spacing.xs}px ${spacing.sm}px`,
   fontSize: 11,
-  color: "#DC2626",
-  background: "rgba(220,38,38,0.08)",
-  border: "1px solid #DC2626",
+  color: colors.danger,
+  background: colors.dangerBgSoft,
+  border: `1px solid ${colors.danger}`,
   borderRadius: radius.card / 2,
 };
 

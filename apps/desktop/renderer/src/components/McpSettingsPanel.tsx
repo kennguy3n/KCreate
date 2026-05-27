@@ -287,8 +287,8 @@ function ClientBlock({
                   style={{
                     padding: "2px 6px",
                     background: "transparent",
-                    color: "#DC2626",
-                    border: `1px solid #DC262644`,
+                    color: colors.danger,
+                    border: `1px solid ${colors.danger}44`,
                     borderRadius: radius.pill,
                     cursor: "pointer",
                     fontSize: 10,

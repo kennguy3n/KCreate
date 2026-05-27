@@ -314,6 +314,24 @@ export function shortcutStore(): ShortcutStore {
   return storeSingleton;
 }
 
+/// Stable bound references to the singleton's subscribe + snapshot.
+/// `useSyncExternalStore` requires its `subscribe` callback to be
+/// reference-stable across renders — otherwise React will detach +
+/// re-attach the listener on every render of the calling component,
+/// which is wasted work and races with concurrent rebinds in the
+/// shortcut panel. We bind once at module load and reuse forever;
+/// `resetShortcutStoreForTests()` rebinds because the singleton
+/// itself is swapped out.
+export function shortcutSubscribe(listener: Listener): () => void {
+  return shortcutStore().subscribe(listener);
+}
+
+export function shortcutGetSnapshot(): Readonly<
+  Record<ActionId, ShortcutBinding>
+> {
+  return shortcutStore().snapshot();
+}
+
 /// Test-only reset hook. Drops the singleton so a unit test can
 /// observe `localStorage` fresh.
 export function resetShortcutStoreForTests(): void {

@@ -32,7 +32,10 @@ pub mod slice;
 pub mod svg;
 pub mod webp;
 
-pub use batch::{run_batch, BatchExportError, BatchExportJob, BatchStatus, ExportItem};
+pub use batch::{
+    run_batch, run_batch_parallel, BatchCancel, BatchExportError, BatchExportJob, BatchProgress,
+    BatchResult, BatchStatus, ExportItem,
+};
 pub use cmyk_dither::{quantize_cmyk_image, CmykDither, CmykPixel};
 pub use code_gen::{inspect_node, node_to_css, node_to_react_style, node_to_tailwind, InspectCode};
 pub use figma_import::{

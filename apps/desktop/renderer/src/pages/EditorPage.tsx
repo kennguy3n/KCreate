@@ -856,7 +856,8 @@ export function EditorPage({
               lower.endsWith(".png") ||
               lower.endsWith(".jpg") ||
               lower.endsWith(".jpeg") ||
-              lower.endsWith(".webp")
+              lower.endsWith(".webp") ||
+              lower.endsWith(".gif")
             ) {
               const buf = await f.arrayBuffer();
               await window.kcreate.canvas.importImageBytes(
@@ -864,6 +865,17 @@ export function EditorPage({
                 new Uint8Array(buf),
               );
               imported += 1;
+              continue;
+            }
+            // SVG cannot go through importImageBytes because the
+            // vector importer (usvg in kcreate_vector) requires a
+            // filesystem path for relative-href resolution. Drop a
+            // helpful message so the user knows to save and reopen
+            // (or run in Electron) instead of silently failing.
+            if (lower.endsWith(".svg")) {
+              errors.push(
+                `${f.name}: SVG drag-drop requires a file path (save the file and use File \u2192 Import, or use the Electron build)`,
+              );
               continue;
             }
             errors.push(`${f.name}: unsupported file type`);

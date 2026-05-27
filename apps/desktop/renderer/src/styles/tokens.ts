@@ -26,6 +26,21 @@ export const colors = {
   /// Used by error banners and the "leave session" destructive
   /// CTA in the PresencePanel.
   danger: "var(--kc-danger)",
+  /// Solid background tint for destructive states (e.g. failed-load
+  /// banners in AuditPanel / TemplateMarketplace). Auto-flips for
+  /// dark mode via the override in index.html.
+  dangerBg: "var(--kc-danger-bg)",
+  /// Lower-alpha background tint for destructive accents inside
+  /// dense panels (chip/badge backgrounds in PluginManager,
+  /// ModelManager, AIAssistPanel).
+  dangerBgSoft: "var(--kc-danger-bg-soft)",
+  /// Warning accent (preflight warnings, plugin permission badges).
+  warn: "var(--kc-warn)",
+  warnBg: "var(--kc-warn-bg)",
+  warnBgSoft: "var(--kc-warn-bg-soft)",
+  /// Info accent (preflight info findings).
+  info: "var(--kc-info)",
+  infoBg: "var(--kc-info-bg)",
 } as const;
 
 export const radius = {
@@ -38,9 +53,13 @@ export const radius = {
   md: 6,
 } as const;
 
+// Shadow tokens are CSS variable references so they automatically pick
+// up the dark-mode override defined in index.html (`--kc-shadow` and
+// `--kc-shadow-hover` are redefined under `:root[data-theme="dark"]`
+// with stronger alphas to match the darker substrate).
 export const shadow = {
-  card: "0 1px 3px rgba(0, 0, 0, 0.08)",
-  cardHover: "0 4px 12px rgba(124, 58, 237, 0.18)",
+  card: "var(--kc-shadow)",
+  cardHover: "var(--kc-shadow-hover)",
 } as const;
 
 export const spacing = {

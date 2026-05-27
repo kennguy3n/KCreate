@@ -724,9 +724,9 @@ const modelBadge: React.CSSProperties = {
 
 function severityBadge(severity: AccessibilitySeverity): React.CSSProperties {
   const palette = {
-    error: { bg: "rgba(220,38,38,0.12)", fg: "#dc2626", border: "#dc2626" },
-    warn: { bg: "rgba(217,119,6,0.12)", fg: "#d97706", border: "#d97706" },
-    info: { bg: "rgba(37,99,235,0.12)", fg: "#2563eb", border: "#2563eb" },
+    error: { bg: colors.dangerBg, fg: colors.danger, border: colors.danger },
+    warn: { bg: colors.warnBgSoft, fg: colors.warn, border: colors.warn },
+    info: { bg: colors.infoBg, fg: colors.info, border: colors.info },
   } as const;
   const p = palette[severity];
   return {
@@ -748,9 +748,9 @@ function statusStripStyle(kind: "ok" | "err"): React.CSSProperties {
     fontSize: 11,
     borderRadius: radius.card / 2,
     background:
-      kind === "ok" ? "rgba(124,58,237,0.08)" : "rgba(220,38,38,0.08)",
-    color: kind === "ok" ? colors.accent : "#dc2626",
-    border: `1px solid ${kind === "ok" ? colors.accent : "#dc2626"}`,
+      kind === "ok" ? "rgba(124,58,237,0.08)" : colors.dangerBgSoft,
+    color: kind === "ok" ? colors.accent : colors.danger,
+    border: `1px solid ${kind === "ok" ? colors.accent : colors.danger}`,
   };
 }
 

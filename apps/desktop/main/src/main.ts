@@ -2542,6 +2542,13 @@ function registerIpcHandlers(): void {
       requireBridge().sessionKickPeer(peerId, reason),
   );
 
+  // Phase 7 (Task 15): ask a connected host to backfill journal
+  // entries we are missing relative to our local ResumeVector.
+  ipcMain.handle(
+    "kcreate/session/request-resume",
+    (_e, peerId: string) => requireBridge().sessionRequestResume(peerId),
+  );
+
   // Phase 7 (Task 11): set peer permission.
   ipcMain.handle(
     "kcreate/session/set-peer-permission",

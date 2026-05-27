@@ -3473,6 +3473,20 @@ pub fn session_kick_peer(peer_id: String, reason: String) -> NapiResult<()> {
     crate::collab::session_kick_peer(&peer_id, &reason).map_err(map_session_err)
 }
 
+/// Phase 7 (Task 15): ask a connected host to backfill any journal
+/// entries we're missing. The reply arrives asynchronously via the
+/// `kcreate/session/event` channel as a `SessionEvent::ResumeApplied`
+/// once the host's `ResumeBundle` has been replayed locally.
+///
+/// Renderers call this right after `session_join` finishes so a
+/// late joiner gets the running document history without forcing
+/// the host to restart their session.
+#[cfg(feature = "collab")]
+#[napi]
+pub fn session_request_resume(peer_id: String) -> NapiResult<()> {
+    crate::collab::session_request_resume(&peer_id).map_err(map_session_err)
+}
+
 /// Capability probe — `true` when the bridge was compiled with the
 /// `kchat-desktop` feature flag. Mirrors `kchat_dev_issuer_available`
 /// for symmetry.

@@ -3073,6 +3073,52 @@ export type SessionEvent =
       kind: "permissionChanged";
       peerId: string;
       permission: CollabPermission;
+    }
+  | {
+      /// Phase 7 (Task 15): the local late-join replay finished —
+      /// a remote host sent us a `ResumeBundle` and the journal
+      /// has been brought up to date. Consumers (EditorPage,
+      /// PresencePanel) use this to dismiss the "syncing…"
+      /// indicator and surface the post-resume document state.
+      kind: "resumeApplied";
+      /// Peer id of the host that supplied the bundle.
+      fromPeerId: string;
+      /// Number of operations from the bundle that were appended
+      /// to the local journal. May be smaller than the bundle's
+      /// operation count because the journal silently dedupes
+      /// entries we have already seen.
+      appliedCount: number;
+    }
+  | {
+      /// Phase 7 (Task 16): the CRDT conflict resolver tiebroke a
+      /// concurrent edit. Renderer surfaces this as a brief
+      /// `ConflictToast` when `loserPeerId` matches the local
+      /// session peer id — "Your edit to X was overridden by Y".
+      kind: "conflictResolved";
+      /// Node whose value the resolver had to tiebreak (UUID).
+      nodeId: string;
+      /// Peer whose write the resolver kept.
+      winnerPeerId: string;
+      /// Peer whose write the resolver discarded. The renderer
+      /// only toasts when this equals the local peer id.
+      loserPeerId: string;
+      /// Free-form field path of the resolved value (e.g.
+      /// `"transform.x"`, `"fill.color"`).
+      field: string;
+    }
+  | {
+      /// Phase 7 (Task 17): a remote peer broadcast an undo (or
+      /// redo) inverse-operation batch. The operations were
+      /// already journaled via `operationsJournaled`; this event
+      /// only carries the "show 'Ken undid …' in the activity
+      /// feed" intent so the renderer can distinguish a fresh
+      /// edit from an undo.
+      kind: "undoBroadcast";
+      /// Peer id that produced the undo.
+      peerId: string;
+      /// Number of inverse operations in the batch (>= 1). Used
+      /// by the activity feed so the toast pluralizes correctly.
+      opCount: number;
     };
 
 /// Block 7: per-peer Lamport high-water marks for the journal
@@ -3191,6 +3237,13 @@ export interface SessionBridge {
   ): Promise<void>;
   /// Phase 7 (Task 11): snapshot of the local peer's permission.
   localPermission(): Promise<CollabPermission>;
+  /// Phase 7 (Task 15): ask the supplied peer for a `ResumeBundle`
+  /// covering everything we're missing relative to our local
+  /// resume vector. Used by late joiners to backfill journal
+  /// history that predates their `join()`. The result arrives
+  /// asynchronously as a `ResumeApplied` session event; this call
+  /// only fires the request. KChat-gated.
+  requestResume(peerId: string): Promise<void>;
 }
 
 // ---------------------------------------------------------------------------

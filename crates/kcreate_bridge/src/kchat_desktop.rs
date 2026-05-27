@@ -59,7 +59,12 @@ pub enum KChatDesktopBridgeError {
     Client(#[from] kcreate_kchat_client::ClientError),
     /// `select_community` failed to convert the wire attestation to
     /// a verified `KChatMembership` (e.g. signature mismatch, peer
-    /// binding mismatch, expired window).
+    /// binding mismatch, expired window). Reserved for failures
+    /// inside the attestation pipeline itself — *not* for collab
+    /// session lifecycle failures, which surface as [`Self::Session`]
+    /// so the renderer can distinguish "your KChat token is stale"
+    /// from "you tried to accept an invite without a running
+    /// session".
     #[error("kchat desktop attestation invalid: {0}")]
     Attestation(String),
     /// The user has not connected to KChat Desktop yet; the renderer
@@ -71,6 +76,17 @@ pub enum KChatDesktopBridgeError {
     /// the local peer can't satisfy.
     #[error("local identity has no member entry in community {community_id}")]
     LocalMemberMissing { community_id: String },
+    /// A downstream call into the collab session bridge failed
+    /// (`session_join`, `session_apply_community_roster`, etc.).
+    /// Wraps the typed [`crate::collab::SessionBridgeError`] so the
+    /// renderer can tell apart "no collab session is running" from
+    /// "your attestation is stale" — these used to all surface as
+    /// [`Self::Attestation`], which was misleading on every
+    /// non-attestation branch (NotRunning, NotInKChatGroup,
+    /// transport errors, etc.). The `#[from]` impl lets the
+    /// bridge methods use `?` directly on session calls.
+    #[error("kchat desktop collab session error: {0}")]
+    Session(#[from] crate::collab::SessionBridgeError),
 }
 
 /// Wire-format result of `kchat_desktop_status`. Mirrored in
@@ -380,8 +396,14 @@ pub fn kchat_desktop_sync_community_roster(
         .iter()
         .map(|m| (m.peer_id.clone(), m.role.as_str().to_string()))
         .collect();
-    let kicked = crate::collab::session_apply_community_roster(&pairs)
-        .map_err(|e| KChatDesktopBridgeError::Attestation(e.to_string()))?;
+    // Bug 0002 fix: surface session-lifecycle errors (NotRunning,
+    // NotInKChatGroup, transport failures) as the typed
+    // `KChatDesktopBridgeError::Session` variant rather than
+    // collapsing them to `Attestation`. The roster-sync tick runs
+    // periodically in the background and can outlive the session,
+    // so misclassifying "session is not running" as an attestation
+    // failure was actively misleading the renderer.
+    let kicked = crate::collab::session_apply_community_roster(&pairs)?;
     Ok(KChatRosterSyncResult {
         polled_members: members.len(),
         kicked,
@@ -444,17 +466,26 @@ pub fn kchat_desktop_accept_invite(
         )));
     }
 
-    // Dial through the regular session_join path. We don't pass an
-    // explicit cert fingerprint -- the bridge expects it as a
-    // separate argument to enforce binding at the QUIC handshake.
+    // Dial through the regular session_join path. The cert
+    // fingerprint from the invite is passed through as the fifth
+    // argument so the QUIC handshake can verify the owner's leaf
+    // cert matches what was advertised in the conversation card.
+    //
+    // Bug 0001 fix: surface session-lifecycle errors (NotRunning,
+    // NotInKChatGroup, transport failures) as the typed
+    // `KChatDesktopBridgeError::Session` variant rather than
+    // collapsing them to `Attestation`. The previous
+    // `.map_err(... Attestation ...)` produced misleading
+    // diagnostics like "attestation invalid: session is not
+    // running" when the real problem was that the user hadn't
+    // started a session yet.
     crate::collab::session_join(
         &card.owner_peer_id,
         &card.owner_public_key,
         &card.owner_display_name,
         &card.owner_socket_addr,
         &card.cert_fingerprint,
-    )
-    .map_err(|e| KChatDesktopBridgeError::Attestation(e.to_string()))?;
+    )?;
 
     Ok(KChatAcceptedInvite {
         project_id: card.project_id,

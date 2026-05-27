@@ -1262,6 +1262,11 @@ pub fn document_undo() -> Result<Option<UndoRedoOutcome>> {
         .undo()
         .expect("pending_undo returned Some, so undo cannot return None on the same lock");
     drop(guard);
+    // Phase 7 (Task 17): broadcast the inverse to remote peers,
+    // tagged `is_undo: true`, so their renderers can apply the
+    // revert AND surface a "<peer> undid their last edit" toast.
+    // No-op when no collab session is active.
+    broadcast_undo_inverse(&op, BroadcastUndoKind::Undo);
     Ok(Some(UndoRedoOutcome {
         command: committed.command,
         affected_nodes: committed.affected_nodes,
@@ -1296,6 +1301,12 @@ pub fn document_redo() -> Result<Option<UndoRedoOutcome>> {
         .redo()
         .expect("pending_redo returned Some, so redo cannot return None on the same lock");
     drop(guard);
+    // Phase 7 (Task 17): broadcast the forward replay to remote
+    // peers, tagged `is_undo: true`. From the remote perspective a
+    // redo is structurally identical to a fresh edit (same forward
+    // patch) but the activity-feed marker keeps "Ken redid …"
+    // separate from "Ken edited …".
+    broadcast_undo_inverse(&op, BroadcastUndoKind::Redo);
     Ok(Some(UndoRedoOutcome {
         command: committed.command,
         affected_nodes: committed.affected_nodes,
@@ -1624,6 +1635,10 @@ pub fn document_undo_group() -> Result<Option<UndoRedoOutcome>> {
             }
         }
     }
+    // Phase 7 (Task 17): broadcast the whole group as a single
+    // `is_undo: true` batch so remote peers see "Ken undid 3 edits"
+    // (one toast) instead of three separate ones.
+    broadcast_undo_inverse_batch(&pending, BroadcastUndoKind::Undo);
     Ok(Some(UndoRedoOutcome {
         command: head.command.clone(),
         affected_nodes: affected,
@@ -1663,6 +1678,9 @@ pub fn document_redo_group() -> Result<Option<UndoRedoOutcome>> {
             }
         }
     }
+    // Phase 7 (Task 17): broadcast the whole redo group as a single
+    // is_undo batch. See `document_undo_group`.
+    broadcast_undo_inverse_batch(&pending, BroadcastUndoKind::Redo);
     Ok(Some(UndoRedoOutcome {
         command: head.command.clone(),
         affected_nodes: affected,
@@ -1733,6 +1751,83 @@ pub fn document_restore_discarded_branch(index_from_back: usize) -> Result<bool>
 /// the workspace relies on continue to function.
 fn apply_inverse_patch(ws: &mut Workspace, op: &Operation) -> Result<()> {
     apply_patch(ws, op, &op.before_patch)
+}
+
+/// Phase 7 (Task 17): kind of broadcast emitted by
+/// [`broadcast_undo_inverse`] / [`broadcast_undo_inverse_batch`].
+/// Selects which patch direction is forwarded to remote peers — an
+/// `Undo` ships the inverse (before_patch) so peers can revert to
+/// the prior state; a `Redo` ships the forward (after_patch) so
+/// peers can re-apply the operation that was previously undone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BroadcastUndoKind {
+    Undo,
+    Redo,
+}
+
+/// Phase 7 (Task 17): broadcast a single undo / redo step to the
+/// active collab session, tagged with the `is_undo: true` marker so
+/// remote peers can render an activity-feed entry ("Ken undid …")
+/// rather than treating the op as a fresh edit. A no-op when no
+/// session is running, so undo / redo still works correctly in solo
+/// mode. Errors from the collab layer (no session, viewer
+/// permission, transport timeout, etc.) are intentionally swallowed
+/// — undo's user-visible local effect is already applied; the
+/// broadcast is best-effort.
+fn broadcast_undo_inverse(orig: &Operation, kind: BroadcastUndoKind) {
+    broadcast_undo_inverse_batch(std::slice::from_ref(orig), kind);
+}
+
+/// Phase 7 (Task 17): batch variant of [`broadcast_undo_inverse`]
+/// used by group-aware undo / redo. Sends all of `orig` as a single
+/// `OperationBroadcast`, so remote peers see "Ken undid 3 edits"
+/// (one toast) rather than three separate ones.
+///
+/// Each broadcast op carries:
+///   * a fresh `id` (so the remote journal doesn't dedupe against
+///     the original we authored earlier),
+///   * a fresh `timestamp` (chronological order on the wire is
+///     anchored to when we *broadcast* the revert, not when we
+///     originally made the edit),
+///   * `before_patch` / `after_patch` swapped for `Undo` so the
+///     remote applies the revert; for `Redo` they're forwarded as-is,
+///   * the original `command`, `affected_nodes`, and `group_id`
+///     (so remote undo-grouping continues to work), and
+///   * `is_undo: true` so [`crate::collab::SessionEvent::UndoBroadcast`]
+///     fires on the remote side when every op in the batch is
+///     marked.
+fn broadcast_undo_inverse_batch(orig: &[Operation], kind: BroadcastUndoKind) {
+    if orig.is_empty() {
+        return;
+    }
+    let now = Utc::now();
+    let inverses: Vec<Operation> = orig
+        .iter()
+        .map(|op| {
+            let (before, after) = match kind {
+                // Undo: swap so the remote applies the inverse.
+                BroadcastUndoKind::Undo => (op.after_patch.clone(), op.before_patch.clone()),
+                // Redo: forward direction so the remote re-applies.
+                BroadcastUndoKind::Redo => (op.before_patch.clone(), op.after_patch.clone()),
+            };
+            Operation {
+                id: Uuid::new_v4(),
+                timestamp: now,
+                actor: op.actor.clone(),
+                command: op.command.clone(),
+                before_patch: before,
+                after_patch: after,
+                affected_nodes: op.affected_nodes.clone(),
+                ai_generated: op.ai_generated,
+                group_id: op.group_id,
+                is_undo: true,
+            }
+        })
+        .collect();
+    // The bridge's collab layer is the single place that knows whether
+    // a session is active. Swallow every error so solo-mode undo
+    // keeps working when no collab gate has been installed.
+    let _ = crate::collab::session_broadcast_operations(inverses);
 }
 
 /// Walk `op.after_patch` into workspace state for the non-graph

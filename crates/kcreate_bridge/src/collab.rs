@@ -35,11 +35,15 @@ use base64::engine::general_purpose::{STANDARD_NO_PAD, URL_SAFE_NO_PAD};
 use base64::Engine;
 use chrono::{DateTime, Utc};
 use ed25519_dalek::VerifyingKey;
+use kcreate_collab::conflict::{
+    ConflictDecision, ConflictResolver, LastWriterWinsResolver, OperationContext,
+};
 use kcreate_collab::message::Cursor;
 use kcreate_collab::{
     no_kchat_authority, BoundKChatGroupAuthority, KChatAuthError, KChatGroupId, KChatMembership,
-    LockClaimPayload, LockReleasePayload, MemoryJournalStore, Message, OperationJournal, PeerId,
-    PeerIdentity, PeerKey, PresencePayload, SessionConfig, SharedKChatAuthority,
+    LamportClock, LockClaimPayload, LockReleasePayload, MemoryJournalStore, Message,
+    OperationJournal, PeerId, PeerIdentity, PeerKey, PresencePayload, SessionConfig,
+    SharedKChatAuthority,
 };
 #[cfg(test)]
 use kcreate_collab::{JournalEntry, ResumeVector};
@@ -223,6 +227,52 @@ pub enum SessionEvent {
         peer_id: String,
         permission: CollabPermission,
     },
+    /// Phase 7 (Task 15): a remote peer applied a `ResumeBundle`
+    /// reply to us — the late-join replay has finished and the
+    /// local journal is now up to date with the host's history.
+    /// The renderer uses this to dismiss the "syncing\u2026"
+    /// indicator and surface the post-resume document.
+    ResumeApplied {
+        /// Peer id of the host that supplied the bundle.
+        from_peer_id: String,
+        /// Number of operations from the bundle that were appended
+        /// to the local journal (may be smaller than the bundle's
+        /// `operations.len()` because the journal silently
+        /// dedupes already-seen entries).
+        applied_count: u32,
+    },
+    /// Phase 7 (Task 16): the CRDT conflict resolver picked a
+    /// winner for a concurrent edit. The renderer uses this to
+    /// surface a "Your edit was overridden by Ken" toast. The
+    /// loser is always the local peer when `loser_peer_id` matches
+    /// the session's `local_peer_id`; the renderer filters its
+    /// toast accordingly.
+    ConflictResolved {
+        /// Node id whose value the resolver had to tiebreak.
+        node_id: Uuid,
+        /// Peer whose write the resolver kept.
+        winner_peer_id: String,
+        /// Peer whose write the resolver discarded.
+        loser_peer_id: String,
+        /// JSON pointer (or dotted path) of the field whose value
+        /// was resolved. Free-form string so the conflict source
+        /// (LWW field, set member, list slot) can be reported
+        /// without baking the CRDT shape into this enum.
+        field: String,
+    },
+    /// Phase 7 (Task 17): a remote peer broadcast an undo (or redo)
+    /// operation. The renderer's activity feed surfaces
+    /// "Ken undid their last edit"; the operation itself was
+    /// already journaled via
+    /// [`SessionEvent::OperationsJournaled`].
+    UndoBroadcast {
+        /// Peer id that produced the undo.
+        peer_id: String,
+        /// Number of inverse operations in the batch (a grouped
+        /// undo spans many primitive ops, so the toast text can
+        /// pluralize correctly).
+        op_count: u32,
+    },
 }
 
 impl From<&PresencePayload> for SessionPresence {
@@ -381,7 +431,31 @@ struct SessionState {
     /// [`CollabPermission::Editor`] when the session is not
     /// community-gated.
     local_permission: CollabPermission,
+    /// Phase 7 (Task 16): bounded ring buffer of recently-broadcast
+    /// local operations, kept so the inbound-event pump can run
+    /// [`LastWriterWinsResolver`] against a remote op whose
+    /// `affected_nodes` overlap a local op we just sent. When the
+    /// resolver decides the local op was the loser, the bridge
+    /// emits a [`SessionEvent::ConflictResolved`] so the renderer's
+    /// `ConflictToast` can surface "Your edit was overridden by …".
+    ///
+    /// Capacity is bounded ([`RECENT_LOCAL_OPS_CAP`]) so a long
+    /// drag-edit burst can't unbound this buffer; older entries
+    /// are evicted FIFO once the cap is hit. Each entry stores the
+    /// op + the Lamport clock value it was broadcast under
+    /// (derived from the journal's local high-water mark) so the
+    /// resolver's tiebreak rules apply unchanged.
+    recent_local_ops:
+        std::collections::VecDeque<(kcreate_collab::LamportClock, kcreate_core::Operation)>,
 }
+
+/// Phase 7 (Task 16): how many of the most-recent local
+/// broadcasts to keep available for conflict detection. Sized to
+/// cover ~3 s of a sustained drag-edit burst at the renderer's
+/// peak input rate of ~30 ops/s, with headroom. A circular buffer
+/// rather than a time-windowed eviction so the upper bound is
+/// strict regardless of clock jitter on the inbound pump.
+const RECENT_LOCAL_OPS_CAP: usize = 128;
 
 /// Phase 7 (Task 11): collaboration permission for a peer. Derived
 /// from the peer's KChat community role: `owner` / `admin` =>
@@ -665,8 +739,31 @@ fn apply_event(ev: InboundEvent) {
                 // request. Replay the entries through the
                 // journal so future sessions see the same
                 // history. Project-id mismatch is dropped.
+                // Phase 7 (Task 15): emit a `ResumeApplied`
+                // event after the replay so the renderer can
+                // dismiss the "syncing…" indicator and
+                // surface the post-resume document state.
                 if p.project_id == state.journal.project_id() {
-                    journal_inbound_resume_bundle(state, p);
+                    let applied = journal_inbound_resume_bundle(state, p);
+                    push_event(
+                        state,
+                        SessionEvent::ResumeApplied {
+                            from_peer_id: from.as_str().to_string(),
+                            applied_count: applied,
+                        },
+                    );
+                }
+            }
+            Message::ResumeRequest(p) => {
+                // Phase 7 (Task 15): a freshly-joined peer is
+                // asking us for the history since their resume
+                // vector. Compute the delta from the journal,
+                // package it as a `ResumeBundle`, and send it
+                // directly back to the requester. Project-id
+                // mismatch is dropped (same rationale as the
+                // other handlers).
+                if p.project_id == state.journal.project_id() {
+                    handle_resume_request(state, &from, p);
                 }
             }
             Message::LockClaim(p) => {
@@ -683,14 +780,13 @@ fn apply_event(ev: InboundEvent) {
                     apply_lock_release(state, &from, p);
                 }
             }
-            // Hello / Welcome / Heartbeat / Goodbye / ResumeRequest
-            // are handled by the transport layer itself, not
-            // surfaced as bridge-level events.
+            // Hello / Welcome / Heartbeat / Goodbye are handled
+            // by the transport layer itself, not surfaced as
+            // bridge-level events.
             Message::Hello(_)
             | Message::Welcome(_)
             | Message::Heartbeat
-            | Message::Goodbye(_)
-            | Message::ResumeRequest(_) => {}
+            | Message::Goodbye(_) => {}
         },
     }
 }
@@ -708,6 +804,11 @@ fn journal_inbound_broadcast(
 ) {
     let mut highest = 0u64;
     let mut recorded: u32 = 0;
+    // Phase 7 (Task 16): collected on the side so we can emit
+    // `ConflictResolved` events *after* the borrow on
+    // `state.recent_local_ops` ends — pushing during the resolve
+    // loop would alias-borrow `state` for the duration.
+    let mut conflict_events: Vec<SessionEvent> = Vec::new();
     for op in &payload.operations {
         // The protocol doesn't put a Lamport clock *on the
         // operation itself* — it lives on the envelope. We
@@ -723,13 +824,28 @@ fn journal_inbound_broadcast(
             .highest_for(from)
             .as_u64()
             .saturating_add(1);
-        let clock = kcreate_collab::LamportClock::from_raw(next_clock);
+        let clock = LamportClock::from_raw(next_clock);
         match state.journal.append(from.clone(), clock, op.clone()) {
             Ok(()) => {
                 recorded += 1;
                 if next_clock > highest {
                     highest = next_clock;
                 }
+                // Phase 7 (Task 16): run the CRDT resolver against
+                // every recent local op whose `affected_nodes`
+                // overlap the incoming remote op. The resolver is
+                // the same `LastWriterWinsResolver` that the wire
+                // protocol picks for tiebreaks, so the renderer's
+                // local document state stays in sync with what
+                // the resolver decided — we just need to *surface*
+                // the loser to the user.
+                collect_conflicts(
+                    state,
+                    from,
+                    op,
+                    clock,
+                    &mut conflict_events,
+                );
             }
             Err(
                 kcreate_collab::JournalError::Duplicate { .. }
@@ -743,6 +859,14 @@ fn journal_inbound_broadcast(
             }
         }
     }
+    // Drain the side-collected conflict events now that the
+    // resolver borrow has dropped. Pushed before
+    // `OperationsJournaled` would also be fine, but the renderer
+    // typically reads events in arrival order, so surfacing the
+    // "what got journaled" baseline first matches the mental model.
+    for ev in conflict_events {
+        push_event(state, ev);
+    }
     if recorded > 0 {
         push_event(
             state,
@@ -752,7 +876,143 @@ fn journal_inbound_broadcast(
                 highest_clock: highest,
             },
         );
+        // Phase 7 (Task 17): if every recorded op in the batch is
+        // an undo / redo inverse, surface a dedicated event so
+        // the renderer's activity feed can show "Ken undid their
+        // last edit" instead of "Ken edited 3 nodes". A mixed
+        // batch is *not* surfaced as `UndoBroadcast` because the
+        // semantics would be ambiguous — callers are expected
+        // to group their broadcasts cleanly (the bridge’s undo
+        // path always sends inverse-only batches).
+        let undo_count: u32 = payload
+            .operations
+            .iter()
+            .filter(|o| o.is_undo)
+            .count()
+            .try_into()
+            .unwrap_or(u32::MAX);
+        if undo_count > 0 && undo_count == recorded {
+            push_event(
+                state,
+                SessionEvent::UndoBroadcast {
+                    peer_id: from.as_str().to_string(),
+                    op_count: undo_count,
+                },
+            );
+        }
     }
+}
+
+/// Phase 7 (Task 16): scan the recent-local-ops ring for any entry
+/// whose `affected_nodes` overlap the incoming remote op, run
+/// [`LastWriterWinsResolver::resolve`] on every match, and push a
+/// [`SessionEvent::ConflictResolved`] into `out` for every case the
+/// resolver picked the remote (i.e. the local peer lost the
+/// tiebreak). When the resolver picks the local op we deliberately
+/// do *not* fire an event — the local document state already wins,
+/// and the renderer doesn't need a toast for "your edit was kept".
+///
+/// `field` is reported as the comma-joined affected-node list. The
+/// CRDT layer doesn't carry per-field provenance today (Phase 3
+/// design left that to a future protocol revision), so reporting the
+/// affected nodes keeps the toast accurate without inventing a
+/// fictional field path — the `ConflictToast` renderer falls back
+/// to the node name when the field string is opaque.
+fn collect_conflicts(
+    state: &SessionState,
+    remote_peer: &PeerId,
+    remote_op: &kcreate_core::Operation,
+    remote_clock: LamportClock,
+    out: &mut Vec<SessionEvent>,
+) {
+    if remote_op.affected_nodes.is_empty() || state.recent_local_ops.is_empty() {
+        return;
+    }
+    let resolver = LastWriterWinsResolver;
+    let local_peer = &state.local_peer_id;
+    for (local_clock, local_op) in &state.recent_local_ops {
+        // Skip operations that share no affected nodes — the
+        // resolver short-circuits these to `KeepBoth` anyway, but
+        // doing the check up front avoids the allocation for
+        // `OperationContext` on the common no-overlap case.
+        if local_op.affected_nodes.is_empty()
+            || !local_op
+                .affected_nodes
+                .iter()
+                .any(|n| remote_op.affected_nodes.contains(n))
+        {
+            continue;
+        }
+        let decision = resolver.resolve(
+            OperationContext {
+                op: local_op,
+                clock: *local_clock,
+                author: local_peer,
+            },
+            OperationContext {
+                op: remote_op,
+                clock: remote_clock,
+                author: remote_peer,
+            },
+        );
+        if decision == ConflictDecision::KeepRemote {
+            // Emit one event per affected node the local op
+            // touched (so the renderer can target the specific
+            // ConflictToast at the right node card). The field
+            // string surfaces the operation command name so the
+            // toast can say "fill.color was overridden by Ken"
+            // rather than the opaque op id.
+            for node_id in &local_op.affected_nodes {
+                out.push(SessionEvent::ConflictResolved {
+                    node_id: *node_id,
+                    winner_peer_id: remote_peer.as_str().to_string(),
+                    loser_peer_id: local_peer.as_str().to_string(),
+                    field: local_op.command.clone(),
+                });
+            }
+        }
+    }
+}
+
+/// Phase 7 (Task 15): handle an inbound [`Message::ResumeRequest`]
+/// from a freshly-joined peer. Computes the delta between the
+/// journal’s current state and the supplied resume vector and
+/// fires the resulting [`Message::ResumeBundle`] directly back at
+/// the requester via [`LanCollabHost::send_to`]. Failures are
+/// logged and dropped — a missing bundle just means the late
+/// joiner stays unsynced until they retry, never panics the host.
+fn handle_resume_request(
+    state: &SessionState,
+    from: &PeerId,
+    payload: &kcreate_collab::ResumeRequestPayload,
+) {
+    let entries = match state.journal.operations_since(&payload.since) {
+        Ok(e) => e,
+        Err(e) => {
+            log::warn!(
+                "resume_request from {}: journal.operations_since failed: {e}",
+                from.as_str()
+            );
+            return;
+        }
+    };
+    let bundle = kcreate_collab::ResumeBundlePayload {
+        project_id: state.journal.project_id(),
+        operations: entries,
+    };
+    let host = state.host.clone();
+    let runtime_handle = state.runtime.handle().clone();
+    let target = from.clone();
+    // Detach: a slow link to one late-joiner must not block the
+    // session pump. Errors are logged on the spawned task.
+    runtime_handle.spawn(async move {
+        if let Err(e) = host.send_to(&target, Message::ResumeBundle(bundle)).await {
+            log::warn!(
+                "resume_request reply to {}: send_to failed: {e}",
+                target.as_str()
+            );
+        }
+    });
 }
 
 /// Replay a [`Message::ResumeBundle`] into the local journal. The
@@ -760,10 +1020,14 @@ fn journal_inbound_broadcast(
 /// feed them in directly; the journal's monotonicity gate will
 /// reject anything that overlaps history we already have, which
 /// is exactly the duplicate-replay semantics we want.
+///
+/// Returns the number of entries that were actually appended
+/// (i.e. were not silent duplicates) so the caller can emit a
+/// matching [`SessionEvent::ResumeApplied`].
 fn journal_inbound_resume_bundle(
     state: &mut SessionState,
     payload: &kcreate_collab::ResumeBundlePayload,
-) {
+) -> u32 {
     let mut per_peer: HashMap<PeerId, (u32, u64)> = HashMap::new();
     for entry in &payload.operations {
         match state
@@ -784,7 +1048,9 @@ fn journal_inbound_resume_bundle(
             }
         }
     }
+    let mut applied_total: u32 = 0;
     for (peer, (count, highest)) in per_peer {
+        applied_total = applied_total.saturating_add(count);
         push_event(
             state,
             SessionEvent::OperationsJournaled {
@@ -794,6 +1060,7 @@ fn journal_inbound_resume_bundle(
             },
         );
     }
+    applied_total
 }
 
 /// Block 8: pure roster mutation for a lock claim. Returns the
@@ -1038,6 +1305,7 @@ pub fn session_start(
         community_id,
         permissions: HashMap::new(),
         local_permission: CollabPermission::Editor,
+        recent_local_ops: std::collections::VecDeque::with_capacity(RECENT_LOCAL_OPS_CAP),
     };
     // Surface the local-lifecycle transition on the same event
     // channel every other session signal flows through, so renderer
@@ -1134,15 +1402,70 @@ pub fn session_join(
     drop(guard);
 
     let result = runtime_handle.block_on(async {
-        tokio::time::timeout(OP_TIMEOUT, host.dial_known_peer(identity, socket, fp)).await
+        tokio::time::timeout(OP_TIMEOUT, host.dial_known_peer(identity.clone(), socket, fp)).await
     });
     match result {
-        Ok(Ok(_)) => Ok(()),
+        Ok(Ok(_)) => {
+            // Phase 7 (Task 15): late-join replay. Right after the
+            // dial succeeds, ask the host we just connected to for
+            // every journal entry we don't already have. The
+            // request fires on a detached tokio task because (a) the
+            // bridge entry point shouldn't block on a transport
+            // hop the host might not answer immediately, and (b)
+            // the resume bundle arrives asynchronously through the
+            // pump loop and surfaces as a `ResumeApplied` event.
+            //
+            // We swallow the result entirely — if the resume fails,
+            // the joiner is still connected and live edits will
+            // backfill the document; the resume is purely an
+            // optimisation for picking up history that predates
+            // the join. A failure mode here would surface as the
+            // user seeing "syncing…" forever, so we ALSO log a
+            // warning so the bug is debuggable from the logs.
+            request_resume_from(&identity.peer_id);
+            Ok(())
+        }
         Ok(Err(e)) => Err(SessionBridgeError::Transport(e)),
         Err(_) => Err(SessionBridgeError::Transport(
             kcreate_collab_transport::TransportError::Quic("dial timed out".into()),
         )),
     }
+}
+
+/// Phase 7 (Task 15): fire-and-forget helper that asks `peer` for a
+/// `ResumeBundle` covering everything we're missing relative to our
+/// local journal's resume vector. Used by `session_join` to
+/// auto-trigger late-join replay without forcing every caller of
+/// `session_join` to know about resume semantics. Failures are
+/// logged and dropped — the live broadcast stream will still keep
+/// the local journal current; the only consequence is the joiner
+/// won't see history that predates their join.
+fn request_resume_from(peer: &PeerId) {
+    let guard = slot().lock();
+    let Some(state) = guard.as_ref() else {
+        // Session ended between the dial and this helper running.
+        return;
+    };
+    let host = state.host.clone();
+    let runtime_handle = state.runtime.handle().clone();
+    let project_id = state.journal.project_id();
+    let since = state.journal.resume_vector();
+    let target = peer.clone();
+    drop(guard);
+    let payload = kcreate_collab::ResumeRequestPayload { project_id, since };
+    runtime_handle.spawn(async move {
+        if let Err(e) = tokio::time::timeout(
+            OP_TIMEOUT,
+            host.send_to(&target, Message::ResumeRequest(payload)),
+        )
+        .await
+        {
+            log::warn!(
+                "auto-resume to {} timed out: {e}",
+                target.as_str(),
+            );
+        }
+    });
 }
 
 /// Return the current peer roster. Includes both connected peers
@@ -1412,10 +1735,33 @@ pub fn session_broadcast_operations(
     if operations.is_empty() {
         return Ok(());
     }
-    let guard = slot().lock();
-    let state = guard.as_ref().ok_or(SessionBridgeError::NotRunning)?;
+    let mut guard = slot().lock();
+    let state = guard.as_mut().ok_or(SessionBridgeError::NotRunning)?;
     if state.local_permission == CollabPermission::Viewer {
         return Err(SessionBridgeError::PermissionDenied);
+    }
+    // Phase 7 (Task 16): record each op into the local ring buffer
+    // BEFORE we ship it on the wire, so the CRDT resolver in
+    // `journal_inbound_broadcast` can detect "remote op landed on a
+    // node I just edited" the moment a colliding remote op arrives.
+    // The clock value is the journal's per-local high-water mark + 1,
+    // matching the same approximation the inbound pump uses for
+    // remote ops (the protocol carries the clock on the envelope,
+    // not on the op, so the bridge derives both sides the same way).
+    let local_peer = state.local_peer_id.clone();
+    let mut local_clock_seq = state
+        .journal
+        .resume_vector()
+        .highest_for(&local_peer)
+        .as_u64();
+    for op in &operations {
+        local_clock_seq = local_clock_seq.saturating_add(1);
+        if state.recent_local_ops.len() == RECENT_LOCAL_OPS_CAP {
+            state.recent_local_ops.pop_front();
+        }
+        state
+            .recent_local_ops
+            .push_back((LamportClock::from_raw(local_clock_seq), op.clone()));
     }
     let host = state.host.clone();
     let runtime_handle = state.runtime.handle().clone();
@@ -1434,6 +1780,54 @@ pub fn session_broadcast_operations(
         Ok(Err(e)) => Err(SessionBridgeError::Transport(e)),
         Err(_) => Err(SessionBridgeError::Transport(
             kcreate_collab_transport::TransportError::Quic("broadcast_operations timed out".into()),
+        )),
+    }
+}
+
+/// Phase 7 (Task 15): send a `ResumeRequest` to a connected peer
+/// asking them to backfill any journal entries we are missing
+/// relative to our local [`ResumeVector`]. Called by the renderer
+/// right after a successful [`session_join`] so a late joiner can
+/// pull the running document history without restarting the
+/// host's session.
+///
+/// The resume bundle reply arrives asynchronously via the pump
+/// loop as a [`SessionEvent::ResumeApplied`] event; this function
+/// only fires the request — callers must consume the event stream
+/// to know when the replay is complete.
+///
+/// Returns [`SessionBridgeError::NotRunning`] if no session is
+/// active, or [`SessionBridgeError::InvalidArgument`] if the
+/// supplied `peer_id_b64` is unparseable. Network errors are
+/// surfaced through [`SessionBridgeError::Transport`].
+pub fn session_request_resume(peer_id_b64: &str) -> Result<()> {
+    require_active_kchat_membership()?;
+    let target: PeerId =
+        peer_id_b64
+            .parse()
+            .map_err(
+                |e: kcreate_collab::CollabError| SessionBridgeError::InvalidArgument {
+                    field: "peerId",
+                    message: e.to_string(),
+                },
+            )?;
+    let guard = slot().lock();
+    let state = guard.as_ref().ok_or(SessionBridgeError::NotRunning)?;
+    let host = state.host.clone();
+    let runtime_handle = state.runtime.handle().clone();
+    let project_id = state.journal.project_id();
+    let since = state.journal.resume_vector();
+    drop(guard);
+
+    let payload = kcreate_collab::ResumeRequestPayload { project_id, since };
+    let message = Message::ResumeRequest(payload);
+    let result = runtime_handle
+        .block_on(async { tokio::time::timeout(OP_TIMEOUT, host.send_to(&target, message)).await });
+    match result {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(SessionBridgeError::Transport(e)),
+        Err(_) => Err(SessionBridgeError::Transport(
+            kcreate_collab_transport::TransportError::Quic("resume_request timed out".into()),
         )),
     }
 }

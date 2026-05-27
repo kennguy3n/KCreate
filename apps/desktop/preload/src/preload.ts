@@ -2207,6 +2207,9 @@ const session: SessionBridge = {
       reason,
     );
   },
+  async requestResume(peerId: string): Promise<void> {
+    await ipcRenderer.invoke("kcreate/session/request-resume", peerId);
+  },
   async setPeerPermission(
     peerId: string,
     permission: CollabPermission,

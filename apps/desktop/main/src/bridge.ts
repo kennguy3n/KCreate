@@ -844,6 +844,9 @@ export interface Bridge {
   kchatDesktopSyncCommunityRoster?(communityId: string): string;
   // Phase 7 (Task 8): kick a connected peer.
   sessionKickPeer(peerId: string, reason: string): void;
+  // Phase 7 (Task 15): ask a connected host to backfill journal
+  // entries we are missing relative to our local ResumeVector.
+  sessionRequestResume(peerId: string): void;
   // Phase 7 (Task 11): set a peer's permission.
   sessionSetPeerPermission(peerId: string, permission: string): void;
   // Phase 7 (Task 11): local permission snapshot.

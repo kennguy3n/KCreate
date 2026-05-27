@@ -180,6 +180,17 @@ export function PresencePanel({
         displayName.trim() || "Anonymous",
         project.id,
         advertiseMdns,
+        // Phase 7 (Task 7) — no community scoping at the
+        // panel-driven start path yet; KChatSignInPanel binds the
+        // membership separately. Pass `null` so the bridge keeps
+        // its pre-Phase-7 LAN-wide discovery semantics.
+        null,
+        // Phase 7 (Task 21) — pass the `.kstudio/` directory so
+        // the bridge loads `<dir>/acl.json` at session start and
+        // persists peer-allowlist edits back to that file. Without
+        // this, ACL changes made through `AccessControlPanel`
+        // would be lost on session end / process restart.
+        project.path,
       );
       setReport(next);
       setPeers([]);

@@ -2113,6 +2113,10 @@ const session: SessionBridge = {
     // Phase 7 (Task 7): optional community gate. `null` (or omitted)
     // = no community scoping; matches pre-Phase-7 behaviour.
     communityId: string | null = null,
+    // Phase 7 (Task 21): optional `.kstudio/` directory path so the
+    // bridge persists ACL mutations to `<dir>/acl.json`. `null` (or
+    // omitted) keeps the ACL in memory only.
+    projectDir: string | null = null,
   ): Promise<SessionStartReport> {
     const raw = (await ipcRenderer.invoke(
       "kcreate/session/start",
@@ -2121,6 +2125,7 @@ const session: SessionBridge = {
       projectId,
       advertiseMdns,
       communityId,
+      projectDir,
     )) as string;
     return JSON.parse(raw) as SessionStartReport;
   },

@@ -36,6 +36,6 @@ pub mod event;
 pub mod store;
 
 pub use event::{
-    AuditEvent, AuditEventKind, AuditQuery, OperationRecord, ProjectAction, Timestamp,
+    AuditEvent, AuditEventKind, AuditQuery, CollabAction, OperationRecord, ProjectAction, Timestamp,
 };
 pub use store::{AuditStore, AuditStoreError};

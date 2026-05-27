@@ -1503,6 +1503,7 @@ export type AuditEventKindTag =
   | "operation"
   | "ai_action"
   | "project"
+  | "collab"
   | "other";
 
 /** Condensed operation record inside an audit event. */
@@ -1519,6 +1520,26 @@ export type AuditProjectAction =
   | { action: "save" }
   | { action: "export"; format: string; destination: string };
 
+/**
+ * Phase 7 (Task 20): collaboration session action payload mirroring
+ * `kcreate_audit::event::CollabAction`. Each variant maps to a
+ * single bridge-level transition (session start, peer kick, …) so
+ * the renderer can render specific human-readable strings.
+ *
+ * Field names are snake_case to match the Rust struct's serde
+ * output (the enum carries `#[serde(rename_all = "snake_case")]`
+ * which renames both variant names and field names).
+ */
+export type AuditCollabAction =
+  | { action: "session_started"; community_id: string | null }
+  | { action: "session_left" }
+  | { action: "peer_joined"; peer_id: string; display_name: string }
+  | { action: "peer_left"; peer_id: string }
+  | { action: "peer_kicked"; peer_id: string; reason: string }
+  | { action: "operation_received"; peer_id: string; op_count: number }
+  | { action: "conflict_resolved"; node_id: string }
+  | { action: "kchat_desktop_status"; status: string };
+
 /** Discriminated union matching `kcreate_audit::AuditEventKind`. */
 export type AuditEventKind =
   | { type: "operation" } & AuditOperationRecord
@@ -1530,6 +1551,7 @@ export type AuditEventKind =
       prompt: string | null;
     }
   | { type: "project" } & AuditProjectAction
+  | { type: "collab" } & AuditCollabAction
   | { type: "other"; label: string; payload: unknown };
 
 /** One row from the audit log. */
@@ -3275,6 +3297,15 @@ export interface SessionBridge {
     /// `invalid argument "communityId"` error from the bridge.
     /// `null` (or omitted) preserves pre-Phase-7 behaviour.
     communityId?: string | null,
+    /// Phase 7 (Task 21): absolute path to the open project's
+    /// `.kstudio/` directory. When supplied the bridge loads
+    /// `<dir>/acl.json` at session start and persists ACL changes
+    /// back to that file via `session.acl.set` so peer-allowlist
+    /// edits survive process restart. Pass `ProjectInfo.path`.
+    /// `null` (or omitted) keeps the ACL in-memory only — useful
+    /// for ad-hoc sessions or test harnesses that don't have a
+    /// project on disk.
+    projectDir?: string | null,
   ): Promise<SessionStartReport>;
   /// Stop the running session. Idempotent.
   leave(): Promise<void>;

@@ -363,8 +363,9 @@ pub struct KeyRotationAckPayload {
 /// `ciphertext` was produced by the sender with X25519 key
 /// agreement against the recipient's static identity (Ed25519 →
 /// X25519 via the curve25519-dalek conversion), then encrypted
-/// with `XChaCha20-Poly1305`. Anyone other than the recipient
-/// sees only opaque bytes — the relay (host) cannot read clipboard
+/// with `ChaCha20-Poly1305` (IETF variant, 12-byte nonce — see
+/// `nonce` field below). Anyone other than the recipient sees
+/// only opaque bytes — the relay (host) cannot read clipboard
 /// content even when it forwards the message.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

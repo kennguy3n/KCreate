@@ -2254,6 +2254,14 @@ function registerIpcHandlers(): void {
       // `null` so legacy renderer callers that don't pass the
       // argument still work unchanged.
       communityId: string | null = null,
+      // Phase 7 (Task 21): absolute path to the open project's
+      // `.kstudio/` directory. When supplied the bridge loads
+      // `<dir>/acl.json` at session start and persists every ACL
+      // mutation back to that file so peer-allowlist edits
+      // survive process restart. Defaults to `null` so legacy
+      // renderer callers that don't pass the argument still work
+      // unchanged (ACL stays in-memory only).
+      projectDir: string | null = null,
     ) => {
       const report = requireBridge().sessionStart(
         seedB64,
@@ -2261,6 +2269,7 @@ function registerIpcHandlers(): void {
         projectId,
         advertiseMdns,
         communityId,
+        projectDir,
       );
       startSessionEventTick();
       return report;

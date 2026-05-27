@@ -1025,4 +1025,204 @@ mod tests {
         let err = b.ingest_envelope_json(&env).unwrap_err();
         assert!(matches!(err, SessionError::UntrustedPeer(_)), "got {err:?}");
     }
+
+    // Phase 7 (Task 22) — rate-limit enforcement.
+
+    #[test]
+    fn rate_limit_under_budget_returns_ok() {
+        let (mut a, _b, _project) = pair();
+        let peer_id = a
+            .peer_identities()
+            .next()
+            .expect("trusted peer exists")
+            .peer_id
+            .clone();
+        let now = std::time::Instant::now();
+        // Default cap is 100 ops/s — five events should fit
+        // comfortably and never produce an overflow.
+        for i in 0..5 {
+            let dec = a.record_rate_event(
+                &peer_id,
+                RateLimitKind::Operation,
+                now + std::time::Duration::from_millis(i * 10),
+            );
+            assert_eq!(dec, RateBudgetDecision::Ok, "event {i} unexpectedly over budget");
+        }
+    }
+
+    #[test]
+    fn rate_limit_overflow_escalates_consecutive_seconds() {
+        let config = SessionConfig {
+            max_ops_per_second: 2,
+            ..SessionConfig::default()
+        };
+        let project = Uuid::new_v4();
+        let mut a = ProjectSession::new_with_authority(
+            PeerKey::from_seed([31; 32]),
+            "alice",
+            project,
+            config,
+            [31; 8],
+            make_authority(31, test_group()),
+        );
+        let b_ident = PeerKey::from_seed([32; 32]).identity("bob");
+        let peer_id = b_ident.peer_id.clone();
+        a.trust_peer(b_ident).unwrap();
+
+        // Second 0: budget is 2 — first three events should produce
+        // OK, OK, OverBudget(1).
+        let t0 = std::time::Instant::now();
+        assert_eq!(
+            a.record_rate_event(&peer_id, RateLimitKind::Operation, t0),
+            RateBudgetDecision::Ok
+        );
+        assert_eq!(
+            a.record_rate_event(&peer_id, RateLimitKind::Operation, t0),
+            RateBudgetDecision::Ok
+        );
+        assert_eq!(
+            a.record_rate_event(&peer_id, RateLimitKind::Operation, t0),
+            RateBudgetDecision::OverBudget {
+                consecutive_overflow_seconds: 1
+            }
+        );
+
+        // Second 1: rolling window resets, two events fit, third
+        // overflows — streak should be 2 now.
+        let t1 = t0 + std::time::Duration::from_secs(1);
+        for _ in 0..2 {
+            assert_eq!(
+                a.record_rate_event(&peer_id, RateLimitKind::Operation, t1),
+                RateBudgetDecision::Ok
+            );
+        }
+        assert_eq!(
+            a.record_rate_event(&peer_id, RateLimitKind::Operation, t1),
+            RateBudgetDecision::OverBudget {
+                consecutive_overflow_seconds: 2
+            }
+        );
+
+        // Second 2: peer behaves — only one event in the whole
+        // window, which is under the cap. When second 3 opens with
+        // a fresh event the just-closed window-2 had count=1 (under
+        // limit) so the streak resets to 0.
+        let t2 = t0 + std::time::Duration::from_secs(2);
+        assert_eq!(
+            a.record_rate_event(&peer_id, RateLimitKind::Operation, t2),
+            RateBudgetDecision::Ok
+        );
+        let t3 = t0 + std::time::Duration::from_secs(3);
+        // First event of second 3 closes second 2 (count=1 ≤ 2)
+        // and resets the streak to 0 — so a fresh overflow now
+        // reports consecutive_overflow_seconds == 1.
+        for _ in 0..2 {
+            assert_eq!(
+                a.record_rate_event(&peer_id, RateLimitKind::Operation, t3),
+                RateBudgetDecision::Ok
+            );
+        }
+        assert_eq!(
+            a.record_rate_event(&peer_id, RateLimitKind::Operation, t3),
+            RateBudgetDecision::OverBudget {
+                consecutive_overflow_seconds: 1
+            }
+        );
+    }
+
+    #[test]
+    fn rate_limit_presence_and_ops_use_independent_budgets() {
+        let config = SessionConfig {
+            max_ops_per_second: 1,
+            max_presence_per_second: 1,
+            ..SessionConfig::default()
+        };
+        let project = Uuid::new_v4();
+        let mut a = ProjectSession::new_with_authority(
+            PeerKey::from_seed([41; 32]),
+            "alice",
+            project,
+            config,
+            [41; 8],
+            make_authority(41, test_group()),
+        );
+        let b_ident = PeerKey::from_seed([42; 32]).identity("bob");
+        let peer_id = b_ident.peer_id.clone();
+        a.trust_peer(b_ident).unwrap();
+
+        let t = std::time::Instant::now();
+        // Burn the ops budget first.
+        assert_eq!(
+            a.record_rate_event(&peer_id, RateLimitKind::Operation, t),
+            RateBudgetDecision::Ok
+        );
+        assert_eq!(
+            a.record_rate_event(&peer_id, RateLimitKind::Operation, t),
+            RateBudgetDecision::OverBudget {
+                consecutive_overflow_seconds: 1
+            }
+        );
+        // Presence budget should still be fresh — independent of
+        // operations.
+        assert_eq!(
+            a.record_rate_event(&peer_id, RateLimitKind::Presence, t),
+            RateBudgetDecision::Ok
+        );
+    }
+
+    #[test]
+    fn rate_limit_unknown_peer_is_a_noop() {
+        let (mut a, _b, _project) = pair();
+        let bogus = PeerKey::from_seed([99; 32]).identity("ghost").peer_id;
+        // The peer was never trusted; record_rate_event should not
+        // create a side-effect entry, and the decision should be
+        // OK so the caller's upstream rejection drives the response.
+        assert_eq!(
+            a.record_rate_event(&bogus, RateLimitKind::Operation, std::time::Instant::now()),
+            RateBudgetDecision::Ok
+        );
+    }
+
+    // Phase 7 (Task 19) — key-rotation ack tracking.
+
+    #[test]
+    fn key_rotation_ack_marks_peer_acknowledged() {
+        let (mut a, _b, _project) = pair();
+        let peer_id = a
+            .peer_identities()
+            .next()
+            .expect("trusted peer exists")
+            .peer_id
+            .clone();
+        // Before any ack the peer is on epoch 0 and missing every
+        // future epoch.
+        assert_eq!(a.peers_missing_key_rotation(1), vec![peer_id.clone()]);
+        assert!(a.record_key_rotation_ack(&peer_id, 1));
+        assert!(a.peers_missing_key_rotation(1).is_empty());
+    }
+
+    #[test]
+    fn key_rotation_ack_is_monotonic() {
+        let (mut a, _b, _project) = pair();
+        let peer_id = a
+            .peer_identities()
+            .next()
+            .expect("trusted peer exists")
+            .peer_id
+            .clone();
+        assert!(a.record_key_rotation_ack(&peer_id, 5));
+        // Trying to "ack" an older epoch is ignored — the peer is
+        // still considered up to epoch 5.
+        assert!(a.record_key_rotation_ack(&peer_id, 3));
+        assert!(a.peers_missing_key_rotation(5).is_empty());
+        // But epoch 6 is still outstanding.
+        assert_eq!(a.peers_missing_key_rotation(6), vec![peer_id]);
+    }
+
+    #[test]
+    fn key_rotation_ack_for_unknown_peer_returns_false() {
+        let (mut a, _b, _project) = pair();
+        let bogus = PeerKey::from_seed([77; 32]).identity("ghost").peer_id;
+        assert!(!a.record_key_rotation_ack(&bogus, 1));
+    }
 }

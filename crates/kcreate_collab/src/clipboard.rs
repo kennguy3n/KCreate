@@ -77,8 +77,11 @@ pub fn derive_x25519_from_ed25519_public(vk: &VerifyingKey) -> [u8; 32] {
 }
 
 /// Encrypt `plaintext` so only the holder of the matching
-/// `recipient_public` Ed25519 key can decrypt. Returns the 12-byte
-/// nonce + ciphertext.
+/// `recipient_public` Ed25519 key can decrypt. The 12-byte AEAD
+/// `nonce` is an **input** the caller must generate fresh (e.g.
+/// via `getrandom`) and transmit separately alongside the
+/// returned ciphertext — this function only returns the
+/// ChaCha20-Poly1305 ciphertext + tag, not the nonce.
 pub fn encrypt_clipboard_payload(
     sender_signing: &SigningKey,
     recipient_public: &VerifyingKey,

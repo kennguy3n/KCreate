@@ -67,6 +67,11 @@ pub enum AuditEventKind {
     /// share the same payload shape and the renderer typically
     /// filters them as a single bucket ("project lifecycle").
     Project(ProjectAction),
+    /// Phase 7 (Task 20): collaboration event. The inner
+    /// discriminator (`CollabAction`) carries the specific session
+    /// transition so the renderer can filter the timeline by
+    /// "all collab activity" without joining every variant.
+    Collab(CollabAction),
     /// Anything else. Forward compatibility hook — a future event
     /// kind landing on an old SQLite file deserializes as `Other`
     /// rather than failing.
@@ -100,6 +105,44 @@ pub enum ProjectAction {
     Close,
     Save,
     Export { format: String, destination: String },
+}
+
+/// Phase 7 (Task 20): variants for [`AuditEventKind::Collab`].
+///
+/// Every transition the bridge wants on the audit timeline has its
+/// own variant — the payload shape varies enough (peer id,
+/// community id, op count, …) that a single shared struct would
+/// either need a lot of `Option<…>` fields or a payload bag.
+/// Tagged enum keeps the on-disk row schema strict.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "action")]
+pub enum CollabAction {
+    /// Local user started or rejoined a session bound to a community.
+    SessionStarted { community_id: Option<String> },
+    /// Local user closed the session.
+    SessionLeft,
+    /// A remote peer completed the Hello/Welcome handshake.
+    PeerJoined {
+        peer_id: String,
+        display_name: String,
+    },
+    /// A remote peer disconnected gracefully.
+    PeerLeft { peer_id: String },
+    /// A remote peer was kicked (community-membership lost,
+    /// rate-limit, ACL deny, key-rotation timeout, …).
+    PeerKicked { peer_id: String, reason: String },
+    /// One inbound batch of operations was applied to the local
+    /// document. `op_count` lets the audit timeline summarise
+    /// "Bob sent 47 operations" without one row per op.
+    OperationReceived { peer_id: String, op_count: u32 },
+    /// CRDT resolved a concurrent edit. `node_id` identifies the
+    /// document node whose state survived.
+    ConflictResolved { node_id: String },
+    /// IPC bridge to uney-chat-desktop transitioned. The string is
+    /// a stable status code (`"connected"`, `"disconnected"`,
+    /// `"reconnect_failed"`) the renderer can map to a localized
+    /// label.
+    KchatDesktopStatus { status: String },
 }
 
 /// Filter passed to [`crate::AuditStore::query`].
@@ -190,6 +233,31 @@ impl AuditEvent {
         }
     }
 
+    /// Phase 7 (Task 20): build a collaboration audit row.
+    ///
+    /// `actor` is the local user's display name for events the
+    /// local user initiates (`SessionStarted` / `SessionLeft` /
+    /// `KchatDesktopStatus`), and the remote peer's id for events
+    /// the local node observes from a peer (`PeerJoined`,
+    /// `PeerKicked`, `OperationReceived`, …). The renderer's
+    /// `AuditPanel` displays it without further interpretation.
+    #[must_use]
+    pub fn collab_action(
+        project_id: Option<Uuid>,
+        actor: impl Into<String>,
+        affected_nodes: Vec<Uuid>,
+        action: CollabAction,
+    ) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            timestamp: Utc::now(),
+            actor: actor.into(),
+            project_id,
+            affected_nodes,
+            kind: AuditEventKind::Collab(action),
+        }
+    }
+
     /// The serde tag string for this event's kind. Useful as the
     /// indexable `kind` column on the database row.
     #[must_use]
@@ -198,6 +266,7 @@ impl AuditEvent {
             AuditEventKind::Operation(_) => "operation",
             AuditEventKind::AiAction { .. } => "ai_action",
             AuditEventKind::Project(_) => "project",
+            AuditEventKind::Collab(_) => "collab",
             AuditEventKind::Other { .. } => "other",
         }
     }
@@ -260,8 +329,55 @@ mod tests {
         );
         let project_event = AuditEvent::project_action(None, "user", ProjectAction::Save);
         let ai_event = AuditEvent::ai_action(None, "a", "m", "cpu", None, vec![]);
+        let collab_event = AuditEvent::collab_action(
+            None,
+            "alice",
+            vec![],
+            CollabAction::SessionStarted {
+                community_id: Some("design-team".into()),
+            },
+        );
         assert_eq!(op_event.kind_tag(), "operation");
         assert_eq!(project_event.kind_tag(), "project");
         assert_eq!(ai_event.kind_tag(), "ai_action");
+        assert_eq!(collab_event.kind_tag(), "collab");
+    }
+
+    #[test]
+    fn collab_action_serde_round_trip_tags_action_field() {
+        let event = AuditEvent::collab_action(
+            None,
+            "alice",
+            vec![],
+            CollabAction::PeerKicked {
+                peer_id: "bob".into(),
+                reason: "rate-limit-exceeded".into(),
+            },
+        );
+        let json = serde_json::to_string(&event).unwrap();
+        // The inner enum is `#[serde(tag = "action")]` so the
+        // discriminator key must be `action`, not `type`.
+        assert!(json.contains("\"action\":\"peer_kicked\""), "json was {json}");
+        let back: AuditEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, event);
+    }
+
+    #[test]
+    fn collab_action_actor_threads_through_constructor() {
+        // The bridge sets the actor explicitly because Collab events
+        // are emitted for both the local user (session_started) and
+        // for remote peers (peer_joined); the constructor must not
+        // overwrite it.
+        let event = AuditEvent::collab_action(
+            Some(Uuid::nil()),
+            "remote-peer-123",
+            vec![],
+            CollabAction::PeerJoined {
+                peer_id: "remote-peer-123".into(),
+                display_name: "Bob".into(),
+            },
+        );
+        assert_eq!(event.actor, "remote-peer-123");
+        assert_eq!(event.project_id, Some(Uuid::nil()));
     }
 }

@@ -749,6 +749,15 @@ export interface Bridge {
      * "communityId"` error from the Rust side.
      */
     communityId: string | null,
+    /**
+     * Phase 7 (Task 21): absolute path to the open project's
+     * `.kstudio/` directory. When supplied the bridge loads
+     * `<dir>/acl.json` at session start and persists every ACL
+     * mutation back to that file so peer-allowlist edits survive
+     * process restart. `null` keeps the ACL purely in-memory —
+     * appropriate for ad-hoc sessions without a project on disk.
+     */
+    projectDir: string | null,
   ): string;
   /**
    * Returns the leaving peer's base64url-encoded id when a session was

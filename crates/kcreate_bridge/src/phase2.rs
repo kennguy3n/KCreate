@@ -548,6 +548,274 @@ pub fn ai_smart_select(node_id: Uuid, x: u32, y: u32, tolerance: f64) -> Result<
     Ok(B64.encode(&mask))
 }
 
+// -----------------------------------------------------------------------------
+// Phase 3 Tasks 9-10 — backend-selectable upscale + point-prompt
+// segmentation. Both bridge entries accept the backend as a string
+// ("lanczos3" / "esrgan" / "edge_aware" / "sam") so the renderer can
+// flip backends without a wire-format change. The ONNX backends are
+// gated behind Cargo features on `kcreate_ai`; when those features
+// are off the underlying enum returns `BackendUnavailable` and the
+// renderer can fall back to the built-in path.
+// -----------------------------------------------------------------------------
+
+/// Result wire shape for `ai_upscale_with_backend`. Mirrors the
+/// existing single-node-return contract for `ai_upscale`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpscaleWithBackendReport {
+    pub new_node_id: Uuid,
+    pub backend: String,
+    pub output_width: u32,
+    pub output_height: u32,
+}
+
+/// Upscale a raster layer with the caller-selected backend.
+/// `backend` accepts the serde representation of
+/// [`kcreate_ai::UpscaleBackend`] (`"lanczos3"` / `"esrgan"`).
+pub fn ai_upscale_with_backend(
+    node_id: Uuid,
+    scale: f64,
+    backend: &str,
+    model_path: Option<&str>,
+) -> Result<String> {
+    let parsed_backend: kcreate_ai::UpscaleBackend =
+        serde_json::from_value(serde_json::Value::String(backend.into())).map_err(|_| {
+            DocumentBridgeError::InvalidArgument {
+                argument: "backend".into(),
+                value: backend.into(),
+            }
+        })?;
+
+    let (encoded, parent) = with_workspace(|ws| {
+        let node = ws
+            .project
+            .document
+            .get_node(node_id)
+            .ok_or(DocumentBridgeError::NodeNotFound(node_id))?;
+        if !matches!(node.node_type, NodeType::RasterLayer) {
+            return Err(DocumentBridgeError::InvalidNodeType(format!(
+                "{:?}",
+                node.node_type
+            )));
+        }
+        let meta_value = node
+            .metadata
+            .get(crate::scene_sync::RASTER_IMAGE_METADATA_KEY)
+            .ok_or_else(|| {
+                DocumentBridgeError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "raster layer missing image metadata",
+                ))
+            })?;
+        let meta: crate::scene_sync::RasterImageMeta = serde_json::from_value(meta_value.clone())?;
+        let bytes = blob_load(ws, &meta.blob_hash)?;
+        Ok((bytes, node.parent_id))
+    })?;
+
+    let img = image::load_from_memory(&encoded).map_err(|e| {
+        DocumentBridgeError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+    })?;
+    let rgba = img.to_rgba8();
+    let (width, height) = rgba.dimensions();
+    let model_path_buf = model_path.map(std::path::PathBuf::from);
+    let (out_pixels, ow, oh) = kcreate_ai::upscale_with_backend(
+        rgba.as_raw(),
+        width,
+        height,
+        scale,
+        parsed_backend,
+        model_path_buf.as_deref(),
+    )
+    .map_err(|e| DocumentBridgeError::Io(std::io::Error::other(e.to_string())))?;
+
+    let mut png: Vec<u8> = Vec::new();
+    {
+        let mut cursor = std::io::Cursor::new(&mut png);
+        image::write_buffer_with_format(
+            &mut cursor,
+            &out_pixels,
+            ow,
+            oh,
+            image::ColorType::Rgba8,
+            image::ImageFormat::Png,
+        )
+        .map_err(|e| DocumentBridgeError::Io(std::io::Error::other(e.to_string())))?;
+    }
+
+    let model_name = match parsed_backend {
+        kcreate_ai::UpscaleBackend::Lanczos3 => "lanczos3",
+        kcreate_ai::UpscaleBackend::Esrgan => "esrgan",
+    };
+
+    let new_id = with_workspace_mut(|ws| {
+        let blob = ws
+            .store
+            .blobs()
+            .store(&png, "image/png")
+            .map_err(|e| DocumentBridgeError::Io(std::io::Error::other(e.to_string())))?;
+        let new_meta = crate::scene_sync::RasterImageMeta {
+            blob_hash: blob.hash,
+            width: ow,
+            height: oh,
+        };
+        let mut new_node = Node::new(NodeType::RasterLayer, "Upscaled");
+        new_node.parent_id = parent;
+        new_node.bounds = Bounds {
+            x: 0.0,
+            y: 0.0,
+            width: f64::from(ow),
+            height: f64::from(oh),
+        };
+        new_node.metadata.insert(
+            crate::scene_sync::RASTER_IMAGE_METADATA_KEY.to_string(),
+            serde_json::to_value(&new_meta)?,
+        );
+        let new_id = ws.project.document.insert_node(new_node)?;
+        let snapshot = ws
+            .project
+            .document
+            .get_node(new_id)
+            .map_or(serde_json::Value::Null, |n| {
+                serde_json::to_value(n).unwrap_or(serde_json::Value::Null)
+            });
+        let op = Operation::new(
+            "ai",
+            "ai_upscale",
+            serde_json::json!({ "scale": scale, "backend": model_name }),
+            snapshot,
+            vec![new_id, node_id],
+        )
+        .as_ai_generated();
+        ws.project.execute_operation(op);
+        kcreate_ai::ActionLog::global()
+            .lock()
+            .append(kcreate_ai::AiAction {
+                id: Uuid::new_v4(),
+                timestamp: Utc::now(),
+                task_type: "upscale".into(),
+                model: model_name.into(),
+                compute_device: "cpu".into(),
+                affected_nodes: vec![new_id, node_id],
+                confidence: None,
+            });
+        ws.project.modified_at = Utc::now();
+        Ok(new_id)
+    })?;
+    sync_scene_after_change();
+    let report = UpscaleWithBackendReport {
+        new_node_id: new_id,
+        backend: model_name.into(),
+        output_width: ow,
+        output_height: oh,
+    };
+    Ok(serde_json::to_string(&report)?)
+}
+
+/// Result wire shape for `ai_segment`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SegmentReport {
+    pub backend: String,
+    pub width: u32,
+    pub height: u32,
+    pub mask_base64: String,
+    pub area: u64,
+    pub confidence: f32,
+}
+
+/// Point-prompt segmentation. Returns a single-channel mask
+/// (`width * height` bytes, `0` = background, `255` = foreground)
+/// base64-encoded so it crosses the N-API boundary as a string.
+pub fn ai_segment(
+    node_id: Uuid,
+    point_x: u32,
+    point_y: u32,
+    tolerance: f64,
+    edge_threshold: f64,
+    backend: &str,
+    model_path: Option<&str>,
+) -> Result<String> {
+    let parsed: kcreate_ai::SegmentBackend =
+        serde_json::from_value(serde_json::Value::String(backend.into())).map_err(|_| {
+            DocumentBridgeError::InvalidArgument {
+                argument: "backend".into(),
+                value: backend.into(),
+            }
+        })?;
+    let encoded = with_workspace(|ws| {
+        let node = ws
+            .project
+            .document
+            .get_node(node_id)
+            .ok_or(DocumentBridgeError::NodeNotFound(node_id))?;
+        if !matches!(node.node_type, NodeType::RasterLayer) {
+            return Err(DocumentBridgeError::InvalidNodeType(format!(
+                "{:?}",
+                node.node_type
+            )));
+        }
+        let meta_value = node
+            .metadata
+            .get(crate::scene_sync::RASTER_IMAGE_METADATA_KEY)
+            .ok_or_else(|| {
+                DocumentBridgeError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "raster layer missing image metadata",
+                ))
+            })?;
+        let meta: crate::scene_sync::RasterImageMeta = serde_json::from_value(meta_value.clone())?;
+        blob_load(ws, &meta.blob_hash)
+    })?;
+    let img = image::load_from_memory(&encoded).map_err(|e| {
+        DocumentBridgeError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+    })?;
+    let rgba = img.to_rgba8();
+    let (w, h) = rgba.dimensions();
+    let opts = kcreate_ai::SegmentOptions {
+        point_x,
+        point_y,
+        tolerance,
+        edge_threshold,
+    };
+    let model_path_buf = model_path.map(std::path::PathBuf::from);
+    let result = kcreate_ai::segment_with_backend(
+        rgba.as_raw(),
+        w,
+        h,
+        &opts,
+        parsed,
+        model_path_buf.as_deref(),
+    )
+    .map_err(|e| DocumentBridgeError::Io(std::io::Error::other(e.to_string())))?;
+    let mask = result.masks.into_iter().next().ok_or_else(|| {
+        DocumentBridgeError::Io(std::io::Error::other("segmentation produced no masks"))
+    })?;
+    let backend_name = match parsed {
+        kcreate_ai::SegmentBackend::EdgeAware => "edge_aware",
+        kcreate_ai::SegmentBackend::Sam => "sam",
+    };
+    kcreate_ai::ActionLog::global()
+        .lock()
+        .append(kcreate_ai::AiAction {
+            id: Uuid::new_v4(),
+            timestamp: Utc::now(),
+            task_type: "segment".into(),
+            model: backend_name.into(),
+            compute_device: "cpu".into(),
+            affected_nodes: vec![node_id],
+            confidence: Some(mask.confidence),
+        });
+    let report = SegmentReport {
+        backend: backend_name.into(),
+        width: mask.width,
+        height: mask.height,
+        mask_base64: B64.encode(&mask.mask),
+        area: mask.area,
+        confidence: mask.confidence,
+    };
+    Ok(serde_json::to_string(&report)?)
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct ScreenshotRequest {

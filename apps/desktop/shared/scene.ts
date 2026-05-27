@@ -1672,6 +1672,36 @@ export interface LayoutSuggestion {
   alignment: LayoutAlignment | null;
 }
 
+/// Serde-rendered name for `kcreate_ai::UpscaleBackend`. The string
+/// is passed through to the bridge verbatim and parsed there; keep
+/// in sync with the Rust enum if a new variant is added.
+export type UpscaleBackendWire = "lanczos3" | "esrgan";
+
+/// Serde-rendered name for `kcreate_ai::SegmentBackend`.
+export type SegmentBackendWire = "edge_aware" | "sam";
+
+/// Wire mirror of `kcreate_bridge::phase2::UpscaleWithBackendReport`.
+export interface UpscaleWithBackendReportWire {
+  /// The id of the newly inserted RasterLayer node.
+  newNodeId: string;
+  /// The backend that produced the result. Matches the request.
+  backend: UpscaleBackendWire;
+  outputWidth: number;
+  outputHeight: number;
+}
+
+/// Wire mirror of `kcreate_bridge::phase2::SegmentReport`. The mask
+/// is base64-encoded so the IPC channel stays a string-only wire.
+export interface SegmentReportWire {
+  backend: SegmentBackendWire;
+  width: number;
+  height: number;
+  /// `width * height` bytes, `255` = foreground, `0` = background.
+  maskBase64: string;
+  area: number;
+  confidence: number;
+}
+
 export interface AiModelBridge {
   upscale(nodeId: string, scale: number): Promise<string>;
   extractPalette(nodeId: string, maxColors: number): Promise<ExtractedColor[]>;
@@ -1681,6 +1711,30 @@ export interface AiModelBridge {
     y: number,
     tolerance: number,
   ): Promise<string>;
+  /// Backend-selectable upscale. `backend = "lanczos3"` is built-in
+  /// and always available; `backend = "esrgan"` requires the
+  /// `onnx_upscale` Cargo feature on the kcreate_ai build and a
+  /// valid model file path (typically resolved via
+  /// `listModelPacks()` then the installed pack's `file_path`).
+  upscaleWithBackend(
+    nodeId: string,
+    scale: number,
+    backend: UpscaleBackendWire,
+    modelPath: string,
+  ): Promise<UpscaleWithBackendReportWire>;
+  /// Point-prompt segmentation. The built-in `edge_aware` backend
+  /// runs a real CIE-Lab + Sobel-edge-aware flood fill — no model
+  /// required. `backend = "sam"` selects the SAM ONNX path, which
+  /// requires the `onnx_segment` feature and a model file.
+  segment(
+    nodeId: string,
+    pointX: number,
+    pointY: number,
+    tolerance: number,
+    edgeThreshold: number,
+    backend: SegmentBackendWire,
+    modelPath: string,
+  ): Promise<SegmentReportWire>;
   listModelPacks(): Promise<ModelPack[]>;
   /// Open the native file picker scoped to weights files and return
   /// the chosen absolute path (or `null` if the user cancelled).

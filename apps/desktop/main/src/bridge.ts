@@ -402,6 +402,25 @@ export interface Bridge {
     y: number,
     tolerance: number,
   ): string;
+  // Phase 3 Tasks 9-10 — backend-selectable upscale + point-prompt
+  // segmentation. Both backends accept the serde representation of
+  // `kcreate_ai::{UpscaleBackend, SegmentBackend}` as a plain string.
+  // `modelPath` may be `""` to omit; ONNX backends require a path.
+  aiUpscaleWithBackend(
+    nodeId: string,
+    scale: number,
+    backend: string,
+    modelPath: string,
+  ): string;
+  aiSegment(
+    nodeId: string,
+    pointX: number,
+    pointY: number,
+    tolerance: number,
+    edgeThreshold: number,
+    backend: string,
+    modelPath: string,
+  ): string;
   aiDetectTextRegions(nodeId: string, optionsJson: string): string;
   aiInsertTextLayerForRegion(requestJson: string): string;
   aiListModelPacks(): string;

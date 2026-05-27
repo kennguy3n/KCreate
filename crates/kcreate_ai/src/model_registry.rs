@@ -285,6 +285,28 @@ fn static_packs() -> Vec<ModelPack> {
             sha256: String::new(),
         },
         ModelPack {
+            // Phase 3 Tasks 9-10 — SAM (Segment Anything) point-prompt
+            // segmentation backend. The bridge consumes this pack
+            // via [`segment::SegmentBackend::Sam`] when the
+            // `onnx_segment` feature is enabled. Sized for the fused
+            // MobileSAM single-file ONNX export (~40 MB) — the full
+            // ViT-B variant would be a separate pack with the same
+            // `segment` capability.
+            id: "segment_sam".into(),
+            name: "Segment Anything — MobileSAM".into(),
+            category: ModelPackCategory::ImagePro,
+            kind: ModelKind::Onnx,
+            capabilities: vec!["segment".into()],
+            size_bytes: 40_000_000,
+            file_path: "sam.onnx".into(),
+            installed: false,
+            // MobileSAM fused-decoder ONNX export. See
+            // `bg_remove_u2net` above for the empty-`sha256` policy.
+            download_url:
+                "https://huggingface.co/ChaoningZhang/MobileSAM/resolve/main/mobile_sam.onnx".into(),
+            sha256: String::new(),
+        },
+        ModelPack {
             id: "screenshot_to_layout".into(),
             name: "Screenshot to Layout (edge+CCA)".into(),
             category: ModelPackCategory::DesignPro,
@@ -850,6 +872,7 @@ mod tests {
             "ocr_heuristic",
             "palette_kmeans",
             "screenshot_to_layout",
+            "segment_sam",
             "smart_select_flood",
             "upscale_esrgan",
             "upscale_lanczos",

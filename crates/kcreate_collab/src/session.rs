@@ -402,11 +402,17 @@ impl ProjectSession {
     /// Resolve a concurrent local-vs-remote pair using the operational
     /// CRDT layer ([`CrdtResolver`]).
     ///
-    /// The remote peer must already be in the roster (i.e. trusted via
-    /// [`Self::trust_peer`]); the local peer is implicit from the
-    /// session. `remote_clock` is the Lamport clock the remote
-    /// operation was sent at — typically the clock the transport
-    /// pulled off `env.clock` for the broadcasting envelope.
+    /// `local_clock` is the Lamport clock at which the local operation
+    /// was *originally created* — the caller must capture this
+    /// **before** `ingest_envelope` advances the session clock past
+    /// the remote clock. Passing the post-ingestion session clock
+    /// would inflate `local_clock` above `remote_clock` on every
+    /// call, making LWW systematically favor `KeepLocal` and causing
+    /// state divergence across peers.
+    ///
+    /// `remote_clock` is the Lamport clock the remote operation was
+    /// sent at — typically the clock the transport pulled off
+    /// `env.clock` for the broadcasting envelope.
     ///
     /// Returns a [`CrdtDecision`] the bridge can apply atomically.
     /// For the `Merge` variant the bridge replaces both ops with the
@@ -416,16 +422,10 @@ impl ProjectSession {
         &self,
         local_op: &Operation,
         remote_op: &Operation,
+        local_clock: LamportClock,
         remote_peer: &PeerId,
         remote_clock: LamportClock,
     ) -> CrdtDecision {
-        let local_clock = self
-            .peers
-            .values()
-            .map(|state| state.last_clock)
-            .max()
-            .unwrap_or_else(|| self.clock())
-            .max(self.clock());
         let local = OperationContext {
             op: local_op,
             clock: local_clock,

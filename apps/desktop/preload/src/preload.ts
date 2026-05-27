@@ -76,6 +76,10 @@ import type {
   WebpExportOptions,
   AiModelBridge,
   AltTextReport,
+  UpscaleBackendWire,
+  UpscaleWithBackendReportWire,
+  SegmentBackendWire,
+  SegmentReportWire,
   BatchBridge,
   BatchExportJob,
   BatchStatus,
@@ -1421,6 +1425,42 @@ const aiModel: AiModelBridge = {
       y,
       tolerance,
     )) as string;
+  },
+  async upscaleWithBackend(
+    nodeId: string,
+    scale: number,
+    backend: UpscaleBackendWire,
+    modelPath: string,
+  ): Promise<UpscaleWithBackendReportWire> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/ai/upscaleWithBackend",
+      nodeId,
+      scale,
+      backend,
+      modelPath,
+    )) as string;
+    return JSON.parse(raw) as UpscaleWithBackendReportWire;
+  },
+  async segment(
+    nodeId: string,
+    pointX: number,
+    pointY: number,
+    tolerance: number,
+    edgeThreshold: number,
+    backend: SegmentBackendWire,
+    modelPath: string,
+  ): Promise<SegmentReportWire> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/ai/segment",
+      nodeId,
+      pointX,
+      pointY,
+      tolerance,
+      edgeThreshold,
+      backend,
+      modelPath,
+    )) as string;
+    return JSON.parse(raw) as SegmentReportWire;
   },
   async detectTextRegions(
     nodeId: string,

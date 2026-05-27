@@ -140,6 +140,8 @@ fn is_document_setting_command(cmd: &str) -> bool {
             | "brand_kit_update"
             | "design_tokens_update"
             | "spot_color_library_update"
+            | "spot_color_upsert"
+            | "spot_color_load_catalog"
     )
 }
 

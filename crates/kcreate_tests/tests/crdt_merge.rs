@@ -326,6 +326,7 @@ fn project_session_resolve_crdt_uses_resolver() {
     let decision = session.resolve_crdt(
         &local_op,
         &remote_op,
+        LamportClock::from_raw(3),
         &remote_peer,
         LamportClock::from_raw(5),
     );

@@ -1430,8 +1430,9 @@ fn node_ink_signature(node: &Node, spots: &SpotColorLibrary) -> InkSignature {
     let mut had_any_fill = false;
 
     if let Some(over) = &node.style.color_override {
-        had_any_fill = true;
-        accumulate_color_signature(over, spots, &mut sig);
+        if accumulate_color_signature(over, spots, &mut sig) {
+            had_any_fill = true;
+        }
     } else {
         for fill in node.style.iter_fills() {
             match fill {
@@ -1471,20 +1472,23 @@ fn node_ink_signature(node: &Node, spots: &SpotColorLibrary) -> InkSignature {
     sig
 }
 
+/// Accumulate ink from `color` into `sig`. Returns `true` when the
+/// colour carried a non-trivial alpha and actually contributed ink.
 fn accumulate_color_signature(
     color: &kcreate_core::color::Color,
     spots: &SpotColorLibrary,
     sig: &mut InkSignature,
-) {
+) -> bool {
     match color {
         kcreate_core::color::Color::Cmyk { c, m, y, k, a } => {
             if *a < 0.001 {
-                return;
+                return false;
             }
             sig.cmyk.0 += c;
             sig.cmyk.1 += m;
             sig.cmyk.2 += y;
             sig.cmyk.3 += k;
+            true
         }
         kcreate_core::color::Color::Spot {
             name,
@@ -1493,7 +1497,7 @@ fn accumulate_color_signature(
             alpha,
         } => {
             if *alpha < 0.001 {
-                return;
+                return false;
             }
             sig.spots.push(name.clone());
             let (c, m, y, k) = spots
@@ -1503,14 +1507,19 @@ fn accumulate_color_signature(
             sig.cmyk.1 += m * tint;
             sig.cmyk.2 += y * tint;
             sig.cmyk.3 += k * tint;
+            true
         }
         _ => {
-            let (r, g, b, _a) = color.to_srgb();
+            let (r, g, b, a) = color.to_srgb();
+            if a < 0.001 {
+                return false;
+            }
             let (c, m, y, k) = kcreate_core::color::srgb_to_cmyk(r, g, b);
             sig.cmyk.0 += c;
             sig.cmyk.1 += m;
             sig.cmyk.2 += y;
             sig.cmyk.3 += k;
+            true
         }
     }
 }

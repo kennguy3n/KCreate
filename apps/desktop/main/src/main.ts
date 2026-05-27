@@ -1519,6 +1519,39 @@ function registerIpcHandlers(): void {
       requireBridge().aiSmartSelect(nodeId, x, y, tolerance),
   );
   ipcMain.handle(
+    "kcreate/ai/upscaleWithBackend",
+    (
+      _e,
+      nodeId: string,
+      scale: number,
+      backend: string,
+      modelPath: string,
+    ) =>
+      requireBridge().aiUpscaleWithBackend(nodeId, scale, backend, modelPath),
+  );
+  ipcMain.handle(
+    "kcreate/ai/segment",
+    (
+      _e,
+      nodeId: string,
+      pointX: number,
+      pointY: number,
+      tolerance: number,
+      edgeThreshold: number,
+      backend: string,
+      modelPath: string,
+    ) =>
+      requireBridge().aiSegment(
+        nodeId,
+        pointX,
+        pointY,
+        tolerance,
+        edgeThreshold,
+        backend,
+        modelPath,
+      ),
+  );
+  ipcMain.handle(
     "kcreate/ai/detectTextRegions",
     (_e, nodeId: string, optionsJson: string) =>
       requireBridge().aiDetectTextRegions(nodeId, optionsJson),

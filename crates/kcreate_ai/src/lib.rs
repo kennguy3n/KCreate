@@ -23,6 +23,7 @@ pub mod model_registry;
 pub mod ocr;
 pub mod palette;
 pub mod screenshot_to_layout;
+pub mod segment;
 pub mod sidecar_dispatcher;
 pub mod smart_crop;
 pub mod smart_select;
@@ -59,6 +60,10 @@ pub use palette::{extract_palette, ExtractedColor};
 pub use screenshot_to_layout::{
     analyze_screenshot_for_layout, Bounds as ScreenshotBounds, DetectedElement, ElementType,
 };
+pub use segment::{
+    segment_image, segment_with_backend, SegmentBackend, SegmentError, SegmentMask, SegmentOptions,
+    SegmentResult,
+};
 pub use smart_select::smart_select;
 pub use task_router::{
     build_accessibility_prompt, build_design_token_prompt, build_layer_naming_prompt, execute_task,
@@ -69,4 +74,4 @@ pub use tool_call::{
     ToolCallParseError, ToolCallRegistry, ToolDescriptor, ToolParamType, ToolParameter,
     ToolRegistryError,
 };
-pub use upscale::{upscale_lanczos, UpscaleError};
+pub use upscale::{upscale_lanczos, upscale_with_backend, UpscaleBackend, UpscaleError};

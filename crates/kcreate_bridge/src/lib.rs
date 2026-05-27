@@ -2119,6 +2119,60 @@ pub fn ai_smart_select(node_id: String, x: u32, y: u32, tolerance: f64) -> NapiR
     phase2::ai_smart_select(id, x, y, tolerance).map_err(map_doc_err)
 }
 
+/// Backend-selectable upscale. `backend` is the serde representation
+/// of [`kcreate_ai::UpscaleBackend`] (`"lanczos3"` / `"esrgan"`).
+/// `model_path` is required for ONNX backends; pass an empty string
+/// to omit. Returns a JSON [`phase2::UpscaleWithBackendReport`].
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn ai_upscale_with_backend(
+    node_id: String,
+    scale: f64,
+    backend: String,
+    model_path: String,
+) -> NapiResult<String> {
+    let id = parse_uuid(&node_id)?;
+    let path = if model_path.is_empty() {
+        None
+    } else {
+        Some(model_path.as_str())
+    };
+    phase2::ai_upscale_with_backend(id, scale, &backend, path).map_err(map_doc_err)
+}
+
+/// Point-prompt segmentation. `backend` is the serde representation
+/// of [`kcreate_ai::SegmentBackend`] (`"edge_aware"` / `"sam"`).
+/// `model_path` is required for ONNX backends; pass an empty string
+/// to omit. Returns a JSON [`phase2::SegmentReport`].
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn ai_segment(
+    node_id: String,
+    point_x: u32,
+    point_y: u32,
+    tolerance: f64,
+    edge_threshold: f64,
+    backend: String,
+    model_path: String,
+) -> NapiResult<String> {
+    let id = parse_uuid(&node_id)?;
+    let path = if model_path.is_empty() {
+        None
+    } else {
+        Some(model_path.as_str())
+    };
+    phase2::ai_segment(
+        id,
+        point_x,
+        point_y,
+        tolerance,
+        edge_threshold,
+        &backend,
+        path,
+    )
+    .map_err(map_doc_err)
+}
+
 /// Detect text-like regions in the raster layer identified by
 /// `node_id`. Returns the JSON-serialised `Vec<TextRegion>` from
 /// `kcreate_ai::ocr::detect_text_regions`. `options_json` accepts

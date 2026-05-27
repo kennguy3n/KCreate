@@ -1455,7 +1455,7 @@ fn request_resume_from(peer: &PeerId) {
         )
         .await
         {
-            log::warn!("auto-resume to {} timed out: {e}", target.as_str(),);
+            log::warn!("auto-resume to {} timed out: {e}", target.as_str());
         }
     });
 }

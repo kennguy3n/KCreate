@@ -1774,6 +1774,16 @@ pub(crate) enum BroadcastUndoKind {
 /// permission, transport timeout, etc.) are intentionally swallowed
 /// — undo's user-visible local effect is already applied; the
 /// broadcast is best-effort.
+///
+/// Under the default (non-`collab`) feature configuration this
+/// resolves to a no-op stub so the four core undo / redo entry points
+/// (`document_undo`, `document_redo`, `document_undo_group`,
+/// `document_redo_group`) compile and behave identically to the
+/// pre-Phase-7 behaviour. The `collab` module only exists with the
+/// feature enabled (see `lib.rs`), so we MUST NOT reference it from
+/// the default build closure — otherwise the editing-path crates
+/// pull in `crate::collab::*` and fail to resolve. This is the
+/// `AGENTS.md` "Collab feature isolation" rule.
 fn broadcast_undo_inverse(orig: &Operation, kind: BroadcastUndoKind) {
     broadcast_undo_inverse_batch(std::slice::from_ref(orig), kind);
 }
@@ -1796,6 +1806,14 @@ fn broadcast_undo_inverse(orig: &Operation, kind: BroadcastUndoKind) {
 ///   * `is_undo: true` so [`crate::collab::SessionEvent::UndoBroadcast`]
 ///     fires on the remote side when every op in the batch is
 ///     marked.
+///
+/// Feature-gated body — see [`broadcast_undo_inverse`] for the
+/// rationale. The non-`collab` build is a strict no-op (we don't
+/// even allocate the inverse vec) because the only place that
+/// `inverses` is consumed is the collab broadcast call, and
+/// allocating just to throw it away would be wasteful on the
+/// default solo-mode build that the vast majority of users run.
+#[cfg(feature = "collab")]
 fn broadcast_undo_inverse_batch(orig: &[Operation], kind: BroadcastUndoKind) {
     if orig.is_empty() {
         return;
@@ -1829,6 +1847,13 @@ fn broadcast_undo_inverse_batch(orig: &[Operation], kind: BroadcastUndoKind) {
     // keeps working when no collab gate has been installed.
     let _ = crate::collab::session_broadcast_operations(inverses);
 }
+
+/// No-op stub for the default (non-`collab`) build. Solo-mode undo /
+/// redo has nothing to broadcast, so this body is intentionally
+/// empty — keeping the same signature means the four core undo /
+/// redo entry points stay free of `#[cfg]` blocks.
+#[cfg(not(feature = "collab"))]
+fn broadcast_undo_inverse_batch(_orig: &[Operation], _kind: BroadcastUndoKind) {}
 
 /// Walk `op.after_patch` into workspace state for the non-graph
 /// operations recorded by Phase 2 panels. See [`apply_inverse_patch`]

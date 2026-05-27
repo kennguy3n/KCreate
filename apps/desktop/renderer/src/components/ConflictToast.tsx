@@ -84,6 +84,12 @@ export function ConflictToast({
   localPeerIdRef.current = localPeerId;
 
   const toastIdSeq = useRef<number>(0);
+  // Track in-flight auto-dismiss timers so unmount can cancel them.
+  // Otherwise each pending timer retains the `setToasts` closure
+  // (worst case `MAX_VISIBLE_TOASTS` dangling 5 s timers on unmount,
+  // which fires a no-op `setToasts` after the component is gone — a
+  // very small leak in React 18+ but still worth eliminating).
+  const dismissTimersRef = useRef<Set<number>>(new Set());
 
   // Pull peers + local id on mount, and refresh on session lifecycle
   // events. We use the latest values in the event handler via refs so
@@ -91,6 +97,11 @@ export function ConflictToast({
   // the same tick as a peer roster update.
   useEffect(() => {
     let cancelled = false;
+    // Capture the timers `Set` reference once so the cleanup
+    // closure refers to the same container the effect populates,
+    // satisfying `react-hooks/exhaustive-deps` and dodging the
+    // theoretical case where `.current` is reassigned mid-life.
+    const dismissTimers = dismissTimersRef.current;
     const refreshPeers = async (): Promise<void> => {
       try {
         const list = await window.kcreate.session.peers();
@@ -152,11 +163,15 @@ export function ConflictToast({
             // Cap the visible stack.
             return next.slice(-MAX_VISIBLE_TOASTS);
           });
-          // Schedule auto-dismiss. setTimeout is fine here — at most
-          // MAX_VISIBLE_TOASTS in-flight timers.
-          window.setTimeout(() => {
+          // Schedule auto-dismiss. Track the timer id so unmount
+          // can cancel it; without that the closure retains
+          // `setToasts` until the timer fires (silent no-op in
+          // React 18+, but still a leak we'd rather avoid).
+          const timerId = window.setTimeout(() => {
+            dismissTimers.delete(timerId);
             setToasts((prev) => prev.filter((t) => t.id !== id));
           }, TOAST_DURATION_MS);
+          dismissTimers.add(timerId);
           return;
         }
         default:
@@ -168,6 +183,12 @@ export function ConflictToast({
     return () => {
       cancelled = true;
       unsubscribe();
+      // Cancel every in-flight auto-dismiss timer so post-unmount
+      // ticks don't run `setToasts` on a dead component.
+      for (const timerId of dismissTimers) {
+        window.clearTimeout(timerId);
+      }
+      dismissTimers.clear();
     };
   }, []);
 

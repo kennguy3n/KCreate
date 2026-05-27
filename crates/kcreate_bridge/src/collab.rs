@@ -783,10 +783,7 @@ fn apply_event(ev: InboundEvent) {
             // Hello / Welcome / Heartbeat / Goodbye are handled
             // by the transport layer itself, not surfaced as
             // bridge-level events.
-            Message::Hello(_)
-            | Message::Welcome(_)
-            | Message::Heartbeat
-            | Message::Goodbye(_) => {}
+            Message::Hello(_) | Message::Welcome(_) | Message::Heartbeat | Message::Goodbye(_) => {}
         },
     }
 }
@@ -839,13 +836,7 @@ fn journal_inbound_broadcast(
                 // local document state stays in sync with what
                 // the resolver decided — we just need to *surface*
                 // the loser to the user.
-                collect_conflicts(
-                    state,
-                    from,
-                    op,
-                    clock,
-                    &mut conflict_events,
-                );
+                collect_conflicts(state, from, op, clock, &mut conflict_events);
             }
             Err(
                 kcreate_collab::JournalError::Duplicate { .. }
@@ -1402,7 +1393,11 @@ pub fn session_join(
     drop(guard);
 
     let result = runtime_handle.block_on(async {
-        tokio::time::timeout(OP_TIMEOUT, host.dial_known_peer(identity.clone(), socket, fp)).await
+        tokio::time::timeout(
+            OP_TIMEOUT,
+            host.dial_known_peer(identity.clone(), socket, fp),
+        )
+        .await
     });
     match result {
         Ok(Ok(_)) => {
@@ -1460,10 +1455,7 @@ fn request_resume_from(peer: &PeerId) {
         )
         .await
         {
-            log::warn!(
-                "auto-resume to {} timed out: {e}",
-                target.as_str(),
-            );
+            log::warn!("auto-resume to {} timed out: {e}", target.as_str(),);
         }
     });
 }
@@ -1802,15 +1794,14 @@ pub fn session_broadcast_operations(
 /// surfaced through [`SessionBridgeError::Transport`].
 pub fn session_request_resume(peer_id_b64: &str) -> Result<()> {
     require_active_kchat_membership()?;
-    let target: PeerId =
-        peer_id_b64
-            .parse()
-            .map_err(
-                |e: kcreate_collab::CollabError| SessionBridgeError::InvalidArgument {
-                    field: "peerId",
-                    message: e.to_string(),
-                },
-            )?;
+    let target: PeerId = peer_id_b64
+        .parse()
+        .map_err(
+            |e: kcreate_collab::CollabError| SessionBridgeError::InvalidArgument {
+                field: "peerId",
+                message: e.to_string(),
+            },
+        )?;
     let guard = slot().lock();
     let state = guard.as_ref().ok_or(SessionBridgeError::NotRunning)?;
     let host = state.host.clone();
@@ -3655,11 +3646,7 @@ mod tests {
             )
             .unwrap();
         let dup_err = journal
-            .append(
-                remote,
-                kcreate_collab::LamportClock::from_raw(1),
-                op,
-            )
+            .append(remote, kcreate_collab::LamportClock::from_raw(1), op)
             .unwrap_err();
         assert!(matches!(
             dup_err,

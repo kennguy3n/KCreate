@@ -29,6 +29,7 @@ pub mod phase4;
 pub mod raster_ops;
 pub mod scene_sync;
 pub mod state;
+pub mod thumbnails;
 pub mod vector_ops;
 pub mod wire;
 
@@ -732,6 +733,149 @@ pub fn document_list_discarded_branches() -> NapiResult<Vec<DiscardedBranchSumma
 #[napi]
 pub fn document_restore_discarded_branch(index_from_back: u32) -> NapiResult<bool> {
     document::document_restore_discarded_branch(index_from_back as usize).map_err(map_doc_err)
+}
+
+// =============================================================================
+// Thumbnail cache + recent-projects bridge
+// =============================================================================
+
+/// Wire-format mirror of [`thumbnails::ThumbnailBytes`].
+///
+/// `bytesBase64` is sent as a `String` rather than a `Buffer` so the
+/// HomePage can assemble a `data:` URL on the JS side without
+/// re-allocating. The encoding is always standard base64 (no URL-safe
+/// alphabet); decoders that need raw bytes can call `atob` once.
+#[napi(object)]
+#[derive(Debug, Clone)]
+pub struct ThumbnailBytes {
+    pub width: u32,
+    pub height: u32,
+    pub mime: String,
+    pub byte_size: f64,
+    pub bytes_base64: String,
+    pub content_hash: String,
+}
+
+impl From<thumbnails::ThumbnailBytes> for ThumbnailBytes {
+    fn from(t: thumbnails::ThumbnailBytes) -> Self {
+        Self {
+            width: t.width,
+            height: t.height,
+            mime: t.mime,
+            byte_size: t.byte_size as f64,
+            bytes_base64: t.bytes_base64,
+            content_hash: t.content_hash,
+        }
+    }
+}
+
+/// Wire-format mirror of [`thumbnails::RecentProjectCoverInfo`].
+#[napi(object)]
+#[derive(Debug, Clone)]
+pub struct RecentProjectCoverInfo {
+    pub width: u32,
+    pub height: u32,
+    pub mime: String,
+    pub byte_size: f64,
+    pub content_hash: String,
+}
+
+impl From<thumbnails::RecentProjectCoverInfo> for RecentProjectCoverInfo {
+    fn from(c: thumbnails::RecentProjectCoverInfo) -> Self {
+        Self {
+            width: c.width,
+            height: c.height,
+            mime: c.mime,
+            byte_size: c.byte_size as f64,
+            content_hash: c.content_hash,
+        }
+    }
+}
+
+/// Wire-format mirror of [`thumbnails::RecentProjectInfo`].
+///
+/// The `path` is emitted as a platform-native string (Linux/macOS:
+/// UTF-8; Windows: lossy-UTF-8 of the wide path). `projectId` carries
+/// the manifest UUID as a hex string so JS can do string-equality
+/// matches against `ProjectInfo.id`.
+#[napi(object)]
+#[derive(Debug, Clone)]
+pub struct RecentProjectInfo {
+    pub path: String,
+    pub name: String,
+    pub project_id: String,
+    pub modified_at: String,
+    pub last_opened_at: String,
+    pub cover: Option<RecentProjectCoverInfo>,
+}
+
+impl From<thumbnails::RecentProjectInfo> for RecentProjectInfo {
+    fn from(r: thumbnails::RecentProjectInfo) -> Self {
+        Self {
+            path: r.path.display().to_string(),
+            name: r.name,
+            project_id: r.project_id.to_string(),
+            modified_at: r.modified_at,
+            last_opened_at: r.last_opened_at,
+            cover: r.cover.map(Into::into),
+        }
+    }
+}
+
+/// Ensure the currently open project has a cover thumbnail on disk
+/// and return it. On a cache hit no rendering is performed. `maxDimPx`
+/// is the long-edge target in pixels; `0` means "use the default
+/// (`thumbnails::DEFAULT_THUMBNAIL_MAX_DIM_PX`)".
+#[napi]
+pub fn thumbnail_for_cover(max_dim_px: u32) -> NapiResult<ThumbnailBytes> {
+    thumbnails::ensure_cover_thumbnail(max_dim_px)
+        .map(Into::into)
+        .map_err(map_doc_err)
+}
+
+/// Ensure the given page's thumbnail is cached and return it. Errors
+/// with `NoProject` when no project is open, `NodeNotFound` when the
+/// page id is unknown, or `InvalidArgument` when the id refers to a
+/// non-Page node.
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn thumbnail_for_page(page_id: String, max_dim_px: u32) -> NapiResult<ThumbnailBytes> {
+    let id = parse_uuid(&page_id)?;
+    thumbnails::ensure_page_thumbnail(id, max_dim_px)
+        .map(Into::into)
+        .map_err(map_doc_err)
+}
+
+/// Spawn a background worker to pre-warm every page's thumbnail for
+/// the currently open project. Returns immediately. Becomes a no-op
+/// when low-resource mode is active.
+#[napi]
+pub fn thumbnail_prepare_background(max_dim_px: u32) -> NapiResult<()> {
+    thumbnails::prepare_thumbnails_background(max_dim_px).map_err(map_doc_err)
+}
+
+/// Snapshot the persistent recent-projects list (most-recent-first).
+/// Entries whose `.kstudio` directory has since been removed are
+/// pruned lazily. Each entry carries best-effort cover-thumbnail
+/// metadata so the HomePage can size `<img>` tags before fetching
+/// bytes.
+#[napi]
+pub fn recent_projects_list() -> Vec<RecentProjectInfo> {
+    thumbnails::recent_projects_list()
+        .into_iter()
+        .map(Into::into)
+        .collect()
+}
+
+/// Read the cached cover-thumbnail bytes for a project on the
+/// recent-projects list *without* opening the project. Returns `null`
+/// when no cover is cached for that path.
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn recent_project_cover_bytes(project_dir: String) -> NapiResult<Option<ThumbnailBytes>> {
+    thumbnails::recent_project_cover_bytes(&PathBuf::from(project_dir))
+        .map(|o| o.map(Into::into))
+        .map_err(map_doc_err)
 }
 
 /// Static runtime / device snapshot.

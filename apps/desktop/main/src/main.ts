@@ -1520,6 +1520,35 @@ function registerIpcHandlers(): void {
     (): string => requireBridge().auditPath(),
   );
 
+  // Phase 6 — Tasks 17-18: lazy thumbnail cache + recent-projects.
+  // All five handlers go through `requireBridge()` (which throws on
+  // the no-bridge path) so the renderer always sees a meaningful
+  // error rather than a `TypeError: undefined.thumbnailForCover`.
+  ipcMain.handle(
+    "kcreate/thumbnail/forCover",
+    (_e, maxDimPx: number) => requireBridge().thumbnailForCover(maxDimPx),
+  );
+  ipcMain.handle(
+    "kcreate/thumbnail/forPage",
+    (_e, pageId: string, maxDimPx: number) =>
+      requireBridge().thumbnailForPage(pageId, maxDimPx),
+  );
+  ipcMain.handle(
+    "kcreate/thumbnail/prepareBackground",
+    (_e, maxDimPx: number): void => {
+      requireBridge().thumbnailPrepareBackground(maxDimPx);
+    },
+  );
+  ipcMain.handle(
+    "kcreate/recent/list",
+    () => requireBridge().recentProjectsList(),
+  );
+  ipcMain.handle(
+    "kcreate/recent/coverBytes",
+    (_e, projectDir: string) =>
+      requireBridge().recentProjectCoverBytes(projectDir),
+  );
+
   ipcMain.handle(
     "kcreate/page/add",
     (

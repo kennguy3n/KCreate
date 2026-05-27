@@ -1,6 +1,10 @@
 import { useEffect, useState } from "react";
 
-import type { RuntimeStatus } from "../../../shared/scene";
+import type {
+  RecentProjectInfo,
+  RuntimeStatus,
+  ThumbnailBytes,
+} from "../../../shared/scene";
 import { colors, font, radius, shadow, spacing } from "../styles/tokens";
 
 /**
@@ -87,11 +91,53 @@ export const CREATE_OPTIONS: ReadonlyArray<CreateOption> = [
 
 export interface HomePageProps {
   onOpenEditor: (kind: string) => void;
+  /**
+   * Fired when the user clicks a card on the "Recent projects" grid.
+   * The shell wires this to `window.kcreate.document.projectOpen(path)`
+   * followed by an editor route push. Receives the absolute
+   * `.kstudio` directory path.
+   */
+  onOpenProject?: (projectDir: string) => void;
 }
 
-export function HomePage({ onOpenEditor }: HomePageProps): JSX.Element {
+/**
+ * `Idle` — the renderer hasn't been asked yet (initial mount).
+ * `Loading` — first request is in flight; show a subtle placeholder.
+ * `Ready` — the renderer has the list; render the grid (or empty state).
+ * `Error` — the bridge call threw; surface the message inline so the
+ * user can report it but don't block the rest of the HomePage.
+ */
+type RecentsLoadState =
+  | { kind: "idle" }
+  | { kind: "loading" }
+  | { kind: "ready"; items: RecentProjectInfo[] }
+  | { kind: "error"; message: string };
+
+/**
+ * `data:image/png;base64,…` is the cheapest way to ship cached PNG
+ * bytes from the bridge into a React `<img>` without taking a trip
+ * through `URL.createObjectURL` (which leaks across HMR reloads and
+ * needs an explicit `revokeObjectURL`). The bridge always emits
+ * standard base64 (not URL-safe), so we can splice straight into the
+ * `data:` URL.
+ */
+function dataUrlFor(bytes: ThumbnailBytes): string {
+  return `data:${bytes.mime};base64,${bytes.bytesBase64}`;
+}
+
+export function HomePage({
+  onOpenEditor,
+  onOpenProject,
+}: HomePageProps): JSX.Element {
   const [status, setStatus] = useState<RuntimeStatus | null>(null);
   const [statusError, setStatusError] = useState<string | null>(null);
+  const [recents, setRecents] = useState<RecentsLoadState>({ kind: "idle" });
+  // Cover-bytes cache keyed by `.kstudio` path. Held outside `recents`
+  // so refreshing the roster (e.g. after creating a new project) does
+  // not force every `<img>` to re-decode its base64.
+  const [covers, setCovers] = useState<
+    Record<string, ThumbnailBytes | null>
+  >({});
 
   useEffect(() => {
     let cancelled = false;
@@ -105,6 +151,42 @@ export function HomePage({ onOpenEditor }: HomePageProps): JSX.Element {
           const msg = e instanceof Error ? e.message : String(e);
           setStatusError(msg);
         }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    setRecents({ kind: "loading" });
+    void window.kcreate.recentProjects
+      .list()
+      .then((items) => {
+        if (cancelled) return;
+        setRecents({ kind: "ready", items });
+        // Fan out one cover-bytes lookup per project. Each call hits
+        // the on-disk cache, so we don't worry about concurrent
+        // renderer work — failures are silent and degrade to "no
+        // cover" so a single bad project never breaks the whole grid.
+        for (const item of items) {
+          if (item.cover === null) continue;
+          void window.kcreate.recentProjects
+            .coverBytes(item.path)
+            .then((bytes) => {
+              if (cancelled) return;
+              setCovers((prev) => ({ ...prev, [item.path]: bytes }));
+            })
+            .catch(() => {
+              if (cancelled) return;
+              setCovers((prev) => ({ ...prev, [item.path]: null }));
+            });
+        }
+      })
+      .catch((e: unknown) => {
+        if (cancelled) return;
+        const msg = e instanceof Error ? e.message : String(e);
+        setRecents({ kind: "error", message: msg });
       });
     return () => {
       cancelled = true;
@@ -168,10 +250,11 @@ export function HomePage({ onOpenEditor }: HomePageProps): JSX.Element {
         </Section>
 
         <Section title="Recent projects">
-          <EmptyState>
-            No recent projects yet. Create one above — your work is saved
-            locally inside <code>.kstudio</code> folders.
-          </EmptyState>
+          <RecentProjectsGrid
+            state={recents}
+            covers={covers}
+            onOpenProject={onOpenProject ?? null}
+          />
         </Section>
       </main>
     </div>
@@ -312,4 +395,194 @@ function EmptyState({
       {children}
     </div>
   );
+}
+
+/**
+ * Recent-projects grid. Renders one card per `.kstudio` directory on
+ * the persistent roster, displaying the cached cover thumbnail when
+ * one is available. Falls back to a tinted placeholder when the
+ * project hasn't been opened since the cache was introduced.
+ *
+ * Cards are buttons (not anchors) because the shell controls
+ * navigation — `onOpenProject` is fired with the absolute
+ * `.kstudio` path so the parent can route through the bridge.
+ */
+function RecentProjectsGrid({
+  state,
+  covers,
+  onOpenProject,
+}: {
+  state: RecentsLoadState;
+  covers: Record<string, ThumbnailBytes | null>;
+  onOpenProject: ((projectDir: string) => void) | null;
+}): JSX.Element {
+  if (state.kind === "idle" || state.kind === "loading") {
+    return (
+      <EmptyState>
+        Loading recent projects&hellip;
+      </EmptyState>
+    );
+  }
+  if (state.kind === "error") {
+    return (
+      <EmptyState>
+        Could not read the recent-projects list:{" "}
+        <code>{state.message}</code>
+      </EmptyState>
+    );
+  }
+  if (state.items.length === 0) {
+    return (
+      <EmptyState>
+        No recent projects yet. Create one above — your work is saved
+        locally inside <code>.kstudio</code> folders.
+      </EmptyState>
+    );
+  }
+  return (
+    <div
+      style={{
+        display: "grid",
+        gridTemplateColumns: "repeat(auto-fill, minmax(220px, 1fr))",
+        gap: spacing.md,
+      }}
+    >
+      {state.items.map((item) => (
+        <RecentProjectCard
+          key={item.path}
+          info={item}
+          cover={covers[item.path] ?? null}
+          onClick={
+            onOpenProject ? () => onOpenProject(item.path) : undefined
+          }
+        />
+      ))}
+    </div>
+  );
+}
+
+function RecentProjectCard({
+  info,
+  cover,
+  onClick,
+}: {
+  info: RecentProjectInfo;
+  cover: ThumbnailBytes | null;
+  onClick: (() => void) | undefined;
+}): JSX.Element {
+  const subtitle = formatRelativeIso(info.lastOpenedAt);
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      disabled={!onClick}
+      title={info.path}
+      style={{
+        textAlign: "left",
+        background: colors.bg,
+        border: `1px solid ${colors.border}`,
+        borderRadius: radius.card,
+        padding: 0,
+        boxShadow: shadow.card,
+        display: "flex",
+        flexDirection: "column",
+        overflow: "hidden",
+        cursor: onClick ? "pointer" : "default",
+        transition: "box-shadow 120ms ease, transform 120ms ease",
+      }}
+      onMouseEnter={(e) => {
+        if (!onClick) return;
+        e.currentTarget.style.boxShadow = shadow.cardHover;
+        e.currentTarget.style.transform = "translateY(-1px)";
+      }}
+      onMouseLeave={(e) => {
+        e.currentTarget.style.boxShadow = shadow.card;
+        e.currentTarget.style.transform = "translateY(0)";
+      }}
+    >
+      <div
+        style={{
+          aspectRatio: "16 / 10",
+          background: cover ? colors.bgSoft : colors.border,
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          overflow: "hidden",
+        }}
+      >
+        {cover ? (
+          <img
+            src={dataUrlFor(cover)}
+            alt={`${info.name} cover thumbnail`}
+            width={cover.width}
+            height={cover.height}
+            loading="lazy"
+            decoding="async"
+            style={{
+              width: "100%",
+              height: "100%",
+              objectFit: "contain",
+              display: "block",
+            }}
+          />
+        ) : (
+          <span style={{ color: colors.textMuted, fontSize: 12 }}>
+            no preview
+          </span>
+        )}
+      </div>
+      <div
+        style={{
+          padding: spacing.sm,
+          display: "flex",
+          flexDirection: "column",
+          gap: 2,
+        }}
+      >
+        <span
+          style={{
+            fontSize: 14,
+            fontWeight: 600,
+            color: colors.text,
+            overflow: "hidden",
+            textOverflow: "ellipsis",
+            whiteSpace: "nowrap",
+          }}
+        >
+          {info.name}
+        </span>
+        <span style={{ fontSize: 12, color: colors.textMuted }}>
+          {subtitle}
+        </span>
+      </div>
+    </button>
+  );
+}
+
+/**
+ * Human-friendly "2h ago" / "yesterday" / "Mar 14" rendering. Falls
+ * back to the raw ISO string when parsing fails — the bridge already
+ * guarantees RFC 3339 UTC, but defending against drift is cheap.
+ */
+function formatRelativeIso(iso: string): string {
+  const ts = Date.parse(iso);
+  if (Number.isNaN(ts)) return iso;
+  const deltaMs = Date.now() - ts;
+  const minute = 60_000;
+  const hour = 60 * minute;
+  const day = 24 * hour;
+  if (deltaMs < minute) return "just now";
+  if (deltaMs < hour) {
+    const m = Math.round(deltaMs / minute);
+    return `${m}m ago`;
+  }
+  if (deltaMs < day) {
+    const h = Math.round(deltaMs / hour);
+    return `${h}h ago`;
+  }
+  if (deltaMs < 7 * day) {
+    const d = Math.round(deltaMs / day);
+    return d === 1 ? "yesterday" : `${d}d ago`;
+  }
+  return new Date(ts).toLocaleDateString();
 }

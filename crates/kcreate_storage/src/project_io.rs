@@ -179,6 +179,22 @@ impl ProjectStore {
         &self.blobs
     }
 
+    /// Path to the project's thumbnails directory
+    /// (`<project>/.kstudio/thumbnails/`). Created by [`Self::create`]
+    /// and re-checked by [`Self::open`]; the directory is guaranteed
+    /// to exist for the lifetime of the store.
+    #[must_use]
+    pub fn thumbnails_dir(&self) -> PathBuf {
+        self.project_dir.join("thumbnails")
+    }
+
+    /// Path to the project's general-purpose cache directory
+    /// (`<project>/.kstudio/cache/`). Safe to delete at any time.
+    #[must_use]
+    pub fn cache_dir(&self) -> PathBuf {
+        self.project_dir.join("cache")
+    }
+
     /// Persist the full document graph. Replaces all existing nodes.
     /// For incremental saves use [`Self::save_node`] /
     /// [`Self::delete_node`].

@@ -1498,6 +1498,7 @@ name = "kcreate_bridge"
 version = "0.0.1"
 dependencies = [
  "base64",
+ "blake3",
  "chrono",
  "criterion",
  "ed25519-dalek",

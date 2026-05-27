@@ -12,6 +12,10 @@ import type {
   AuditEvent,
   AuditQuery,
   AuditQueryReport,
+  ThumbnailBridge,
+  ThumbnailBytes,
+  RecentProjectsBridge,
+  RecentProjectInfo,
   ArtboardInfo,
   ArtboardPreset,
   BrandKit,
@@ -1429,6 +1433,43 @@ const audit: AuditBridge = {
 };
 
 // ---------------------------------------------------------------------------
+// Phase 6 — Tasks 17-18: lazy thumbnail cache + recent-projects.
+// ---------------------------------------------------------------------------
+
+const thumbnail: ThumbnailBridge = {
+  async forCover(maxDimPx: number): Promise<ThumbnailBytes> {
+    return (await ipcRenderer.invoke(
+      "kcreate/thumbnail/forCover",
+      maxDimPx,
+    )) as ThumbnailBytes;
+  },
+  async forPage(pageId: string, maxDimPx: number): Promise<ThumbnailBytes> {
+    return (await ipcRenderer.invoke(
+      "kcreate/thumbnail/forPage",
+      pageId,
+      maxDimPx,
+    )) as ThumbnailBytes;
+  },
+  async prepareBackground(maxDimPx: number): Promise<void> {
+    await ipcRenderer.invoke("kcreate/thumbnail/prepareBackground", maxDimPx);
+  },
+};
+
+const recentProjects: RecentProjectsBridge = {
+  async list(): Promise<RecentProjectInfo[]> {
+    return (await ipcRenderer.invoke(
+      "kcreate/recent/list",
+    )) as RecentProjectInfo[];
+  },
+  async coverBytes(projectDir: string): Promise<ThumbnailBytes | null> {
+    return (await ipcRenderer.invoke(
+      "kcreate/recent/coverBytes",
+      projectDir,
+    )) as ThumbnailBytes | null;
+  },
+};
+
+// ---------------------------------------------------------------------------
 // Phase 2 — preflight, icon pack, batch async, AI extras, plugins, MCP perms.
 // ---------------------------------------------------------------------------
 
@@ -2349,6 +2390,8 @@ contextBridge.exposeInMainWorld("kcreate", {
   layoutStudio,
   templateMarketplace,
   audit,
+  thumbnail,
+  recentProjects,
   preflight,
   iconPack,
   batch,

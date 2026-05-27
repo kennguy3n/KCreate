@@ -48,6 +48,13 @@ chrono = { workspace = true, features = ["serde"] }
 base64.workspace = true
 image.workspace = true
 rayon.workspace = true
+# Used by `src/thumbnails.rs` to content-address cached thumbnail
+# bytes so re-saving identical content is a no-op and cache lookups
+# can skip the disk write entirely. Already in the workspace graph
+# via `kcreate_storage` and `kcreate_plugin`, so adding it here does
+# not extend the editing-path closure walked by the local-first
+# sentinel.
+blake3 = { workspace = true }
 # Used only behind the `native_canvas` feature to interpret raw
 # window handle bytes (NSView* / HWND / XID / wl_surface*) ferried
 # from the Electron main process. The default build does not link

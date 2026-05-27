@@ -97,6 +97,46 @@ type DiscardedBranchSummarySnake = {
   firstCommand: string;
 };
 
+// Thumbnail cache + recent-projects bridge (PR #16, Tasks 17-18).
+//
+// `ThumbnailBytesSnake` mirrors `kcreate_bridge::lib::ThumbnailBytes`.
+// `byteSize` is exposed as `number` rather than `BigInt` because every
+// byte count we care about (PNG thumbnail at <=2048px on the long
+// edge) fits comfortably in JS's safe integer range, and `BigInt`
+// would force every renderer call site onto `Number(b.byteSize)`
+// conversions for `<img>` sizing math.
+type ThumbnailBytesSnake = {
+  width: number;
+  height: number;
+  mime: string;
+  byteSize: number;
+  bytesBase64: string;
+  contentHash: string;
+};
+
+// `RecentProjectCoverInfoSnake` — cover-thumbnail metadata only.
+// Paired with `thumbnailForCover` / `recentProjectCoverBytes` to
+// fetch the actual pixel bytes.
+type RecentProjectCoverInfoSnake = {
+  width: number;
+  height: number;
+  mime: string;
+  byteSize: number;
+  contentHash: string;
+};
+
+// `RecentProjectInfoSnake` — one entry on the recent-projects list.
+// `path` is the absolute path to the `.kstudio` directory; `projectId`
+// is the manifest UUID as a hex string.
+type RecentProjectInfoSnake = {
+  path: string;
+  name: string;
+  projectId: string;
+  modifiedAt: string;
+  lastOpenedAt: string;
+  cover: RecentProjectCoverInfoSnake | null;
+};
+
 export type {
   ProjectInfoSnake,
   NodeInfoSnake,
@@ -105,6 +145,9 @@ export type {
   DocumentStatusSnake,
   UndoRedoOutcomeSnake,
   DiscardedBranchSummarySnake,
+  ThumbnailBytesSnake,
+  RecentProjectCoverInfoSnake,
+  RecentProjectInfoSnake,
 };
 
 export interface Bridge {
@@ -212,6 +255,28 @@ export interface Bridge {
    * can press Redo / Ctrl+Y to re-apply them in order.
    */
   documentRestoreDiscardedBranch(indexFromBack: number): boolean;
+
+  // Phase 6 — Tasks 17-18: lazy thumbnail cache + recent-projects.
+  //
+  // `thumbnailForCover` / `thumbnailForPage` produce cached PNG bytes
+  // for the currently open project. On a cache hit they return
+  // immediately without invoking the renderer. `maxDimPx === 0` means
+  // "use the default" (320 px on the long edge — see
+  // `kcreate_bridge::thumbnails::DEFAULT_THUMBNAIL_MAX_DIM_PX`).
+  thumbnailForCover(maxDimPx: number): ThumbnailBytesSnake;
+  thumbnailForPage(pageId: string, maxDimPx: number): ThumbnailBytesSnake;
+  // Kick off a background worker that warms every page's thumbnail.
+  // Returns immediately. Becomes a no-op under low-resource mode.
+  thumbnailPrepareBackground(maxDimPx: number): void;
+  // Snapshot the persistent recent-projects list (most-recent-first).
+  // Entries whose `.kstudio` directory no longer exists are pruned
+  // lazily. Each entry carries best-effort cover-thumbnail metadata.
+  recentProjectsList(): RecentProjectInfoSnake[];
+  // Fetch the cached cover bytes for a project on the recent list
+  // *without* opening the project. Returns `null` when no cover is
+  // cached for that path.
+  recentProjectCoverBytes(projectDir: string): ThumbnailBytesSnake | null;
+
   documentStatus(): DocumentStatusSnake | null;
   runtimeStatus(): RuntimeStatusSnake;
   lowResourceModeGet(): boolean;

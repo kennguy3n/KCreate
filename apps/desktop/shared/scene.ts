@@ -1563,6 +1563,92 @@ export interface AuditBridge {
 }
 
 // ---------------------------------------------------------------------------
+// Phase 6 — Tasks 17-18: Lazy thumbnail cache + recent-projects.
+//
+// The N-API surface lives in `kcreate_bridge::lib::{thumbnail_for_cover,
+// thumbnail_for_page, thumbnail_prepare_background, recent_projects_list,
+// recent_project_cover_bytes}`; the wire types below mirror the
+// corresponding `#[napi(object)]` structs (`ThumbnailBytes`,
+// `RecentProjectInfo`, `RecentProjectCoverInfo`).
+//
+// `bytesBase64` is a standard (non-URL-safe) base64-encoded PNG. The
+// HomePage assembles `data:${mime};base64,${bytesBase64}` and pins it
+// as the `src` on an `<img>` so React can rely on browser-native
+// decoding + caching without a `Blob`/`createObjectURL` round-trip
+// (which would leak across HMR reloads).
+// ---------------------------------------------------------------------------
+
+export interface ThumbnailBytes {
+  width: number;
+  height: number;
+  mime: string;
+  byteSize: number;
+  bytesBase64: string;
+  /** BLAKE3 hex content hash of the encoded bytes. */
+  contentHash: string;
+}
+
+/** Cover-thumbnail metadata (no pixel bytes — see `recentProjectCoverBytes`). */
+export interface RecentProjectCoverInfo {
+  width: number;
+  height: number;
+  mime: string;
+  byteSize: number;
+  contentHash: string;
+}
+
+/** One entry on the persistent recent-projects roster. */
+export interface RecentProjectInfo {
+  /** Absolute path to the `.kstudio` directory. */
+  path: string;
+  /** Display name from the project manifest. */
+  name: string;
+  /** Manifest UUID as a hex string. Matches `ProjectInfo.id`. */
+  projectId: string;
+  /** RFC 3339 UTC of the last project mutation. */
+  modifiedAt: string;
+  /** RFC 3339 UTC of the most recent open / create through the bridge. */
+  lastOpenedAt: string;
+  /** Best-effort cover-thumbnail metadata. `null` when none is cached. */
+  cover: RecentProjectCoverInfo | null;
+}
+
+export interface ThumbnailBridge {
+  /**
+   * Ensure the current project has a cover thumbnail on disk and
+   * return its bytes. On a cache hit no rendering is performed.
+   * `maxDimPx === 0` means "use the default" (320 px on the long
+   * edge — see `kcreate_bridge::thumbnails::DEFAULT_THUMBNAIL_MAX_DIM_PX`).
+   * Errors with `NoProject` when no project is open.
+   */
+  forCover(maxDimPx: number): Promise<ThumbnailBytes>;
+  /**
+   * Same shape as `forCover`, but for a specific page node id.
+   * Errors with `NodeNotFound` for unknown ids or `InvalidArgument`
+   * when the id refers to a non-Page node.
+   */
+  forPage(pageId: string, maxDimPx: number): Promise<ThumbnailBytes>;
+  /**
+   * Spawn a background worker that pre-warms every page's thumbnail.
+   * Returns immediately. Becomes a no-op when low-resource mode is
+   * active (per ARCHITECTURE.md §14: "skip speculative thumbnails").
+   */
+  prepareBackground(maxDimPx: number): Promise<void>;
+}
+
+export interface RecentProjectsBridge {
+  /** Snapshot the persistent recent-projects list (most-recent-first). */
+  list(): Promise<RecentProjectInfo[]>;
+  /**
+   * Read the cached cover bytes for a project on the recent list
+   * *without* opening the project. Returns `null` when no cover is
+   * cached for that path (e.g. the user has never opened the project
+   * since the cache was introduced).
+   */
+  coverBytes(projectDir: string): Promise<ThumbnailBytes | null>;
+}
+
+// ---------------------------------------------------------------------------
 // Phase 2 — Preflight, Icon Pack, Batch Async, AI extras, Plugin sandbox,
 // MCP permission persistence, Screenshot-to-Layout.
 // ---------------------------------------------------------------------------
@@ -1574,6 +1660,8 @@ export type PreflightCheckId =
   | "font_embed"
   | "image_resolution"
   | "color_space"
+  | "overprint_table"
+  | "trapping"
   | "transparency"
   | "page_size"
   | "shading"
@@ -3353,6 +3441,8 @@ declare global {
       layoutStudio: LayoutStudioBridge;
       templateMarketplace: TemplateMarketplaceBridge;
       audit: AuditBridge;
+      thumbnail: ThumbnailBridge;
+      recentProjects: RecentProjectsBridge;
       preflight: PreflightBridge;
       iconPack: IconPackBridge;
       batch: BatchBridge;

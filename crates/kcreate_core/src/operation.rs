@@ -390,10 +390,22 @@ impl OperationLog {
             .filter(move |b| b.anchor_position == self.position)
     }
 
-    /// All retained discarded branches across the timeline, newest-
-    /// first. Useful for the history panel's "Branches" tab.
+    /// All retained discarded branches across the timeline, **newest-
+    /// first** (the most recently discarded branch is yielded first).
+    /// Useful for the history panel's "Branches" tab.
+    ///
+    /// Internally the branches are stored in insertion order (oldest
+    /// at the front of the deque, newest at the back); this iterator
+    /// reverses that so the public surface matches the doc and the
+    /// natural UX ordering. Note this is purely an iteration-order
+    /// concern — [`Self::restore_branch`] takes an `index_from_back`
+    /// (0 = newest) that is independent of how `branches()` is
+    /// traversed, so consumers can index by `i` of this iterator and
+    /// pass the same `i` to `restore_branch` without further math.
+    /// Symmetric with [`Self::branches_here`], which is also
+    /// newest-first.
     pub fn branches(&self) -> impl ExactSizeIterator<Item = &DiscardedBranch> {
-        self.branches.iter()
+        self.branches.iter().rev()
     }
 
     #[must_use]

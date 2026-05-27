@@ -133,7 +133,7 @@ pub(crate) struct Workspace {
     /// Bidirectional uuid ⇄ `ObjectId` mapping rebuilt by [`scene_sync`]
     /// on every mutation. Lives in the workspace (not a sibling
     /// singleton) so it can't outlive the project it describes.
-    scene_sync: crate::scene_sync::SceneSync,
+    pub(crate) scene_sync: crate::scene_sync::SceneSync,
     /// Currently selected document nodes. Selection is rendered as
     /// highlight overlays in the next scene sync.
     selection: Vec<Uuid>,
@@ -443,7 +443,20 @@ pub fn project_create(name: &str, dir: &Path) -> Result<ProjectInfo> {
     // project headlessly for tests). The next renderer_init + sync
     // will recover.
     let _ = sync_scene_locked(&mut guard);
+    // Record on the recent-projects list while we still hold the
+    // workspace lock — `record_recent_project` only takes the
+    // recent-list mutex internally, so this nesting can't deadlock.
+    if let Some(ws) = guard.as_ref() {
+        crate::thumbnails::record_recent_project(ws);
+    }
     drop(guard);
+    // Kick off a best-effort thumbnail pre-warm so the HomePage has
+    // something to render before the user opens this project again.
+    // Errors here are non-fatal: the thumbnail pipeline will lazily
+    // generate on first access if pre-warming fails.
+    let _ = crate::thumbnails::prepare_thumbnails_background(
+        crate::thumbnails::DEFAULT_THUMBNAIL_MAX_DIM_PX,
+    );
     Ok(info)
 }
 
@@ -500,7 +513,17 @@ pub fn project_open(dir: &Path) -> Result<ProjectInfo> {
         selection: Vec::new(),
     });
     let _ = sync_scene_locked(&mut guard);
+    // Record on the recent-projects list while we still hold the
+    // workspace lock — same locking discipline as `project_create`.
+    if let Some(ws) = guard.as_ref() {
+        crate::thumbnails::record_recent_project(ws);
+    }
     drop(guard);
+    // Background pre-warm so the next HomePage visit has fresh
+    // thumbnails. Non-fatal on failure.
+    let _ = crate::thumbnails::prepare_thumbnails_background(
+        crate::thumbnails::DEFAULT_THUMBNAIL_MAX_DIM_PX,
+    );
     Ok(info)
 }
 
@@ -1371,13 +1394,20 @@ pub struct DiscardedBranchSummary {
 /// List all discarded redo branches in the current project, newest
 /// first. The renderer's undo/branch panel calls this whenever the
 /// log changes.
+///
+/// `Project::discarded_branches()` (a thin wrapper over
+/// `OperationLog::branches`) already yields newest-first as of the
+/// fix for Devin Review ANALYSIS_0001 on PR #16 — so this function
+/// can pass the list through without additional reversal. The index
+/// of each summary in the returned `Vec` therefore matches the
+/// `index_from_back` argument expected by
+/// [`document_restore_discarded_branch`].
 pub fn document_list_discarded_branches() -> Result<Vec<DiscardedBranchSummary>> {
     let guard = slot().lock();
     let ws = guard.as_ref().ok_or(DocumentBridgeError::NoProject)?;
     let branches = ws.project.discarded_branches();
     Ok(branches
         .into_iter()
-        .rev()
         .map(|b| DiscardedBranchSummary {
             anchor_position: b.anchor_position,
             op_count: b.ops.len(),

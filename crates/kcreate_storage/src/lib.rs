@@ -15,7 +15,12 @@
 pub mod blobs;
 pub mod project_io;
 pub mod schema;
+pub mod thumbnails;
 
 pub use blobs::{BlobError, BlobRef, BlobStore};
 pub use project_io::{ProjectManifest, ProjectStore, ProjectStoreError};
 pub use schema::{Database, DatabaseError, MIGRATIONS};
+pub use thumbnails::{
+    CachedThumbnail, ThumbnailCache, ThumbnailEncoding, ThumbnailEntry, ThumbnailError,
+    ThumbnailIndex, COVER_KEY,
+};

@@ -60,8 +60,8 @@ pub(crate) const ESRGAN_OVERLAP: u32 = 8;
 /// the network's receptive field. At image boundaries there's no
 /// neighbouring tile to fill the cropped region, so the crop on those
 /// sides MUST be zero — otherwise the boundary pixels stay at the
-/// `0.0` initial value of the output buffer and the alpha-correct
-/// un-premultiplication renders them as solid black.
+/// `0.0` initial value of the output buffer, rendering them as
+/// solid black.
 ///
 /// This was previously hard-coded to a fixed crop on all four sides,
 /// producing an 8-source-pixel-wide black border on every output and
@@ -435,18 +435,20 @@ fn run_onnx_esrgan(
 
     let out_w = width.saturating_mul(NET_SCALE);
     let out_h = height.saturating_mul(NET_SCALE);
-    let mut out_premul: Vec<f32> = vec![0.0; (out_w as usize) * (out_h as usize) * 4];
+    let out_pixels = (out_w as usize) * (out_h as usize);
+    let mut out_rgb: Vec<f32> = vec![0.0; out_pixels * 3];
 
-    // Premultiply alpha into f32; the ESRGAN network operates on
-    // RGB so we run inference on the colour channels and resample
-    // alpha separately with Lanczos3 below.
-    let mut src_premul: Vec<f32> = Vec::with_capacity((width as usize) * (height as usize) * 4);
+    // Extract straight (non-premultiplied) RGB in [0,1] for the
+    // ESRGAN network. The network was trained on straight RGB so
+    // feeding premultiplied values would darken semi-transparent
+    // pixels and produce incorrect super-resolution output. Alpha
+    // is upscaled separately via Lanczos3 below.
+    let src_pixels = (width as usize) * (height as usize);
+    let mut src_rgb: Vec<f32> = Vec::with_capacity(src_pixels * 3);
     for chunk in input_rgba.chunks_exact(4) {
-        let a = f32::from(chunk[3]) / 255.0;
-        src_premul.push(f32::from(chunk[0]) / 255.0 * a);
-        src_premul.push(f32::from(chunk[1]) / 255.0 * a);
-        src_premul.push(f32::from(chunk[2]) / 255.0 * a);
-        src_premul.push(a);
+        src_rgb.push(f32::from(chunk[0]) / 255.0);
+        src_rgb.push(f32::from(chunk[1]) / 255.0);
+        src_rgb.push(f32::from(chunk[2]) / 255.0);
     }
 
     // Tile iteration with overlap. We feed `TILE × TILE` patches
@@ -460,16 +462,16 @@ fn run_onnx_esrgan(
             let in_w = (TILE).min(width - in_x);
             let in_h = (TILE).min(height - in_y);
 
-            // Build NCHW input tensor in [0,1] RGB.
+            // Build NCHW input tensor in [0,1] straight RGB.
             let mut tile = vec![0f32; (3 * TILE * TILE) as usize];
             let plane = (TILE * TILE) as usize;
             for y in 0..in_h {
                 for x in 0..in_w {
-                    let src_idx = (((in_y + y) * width + (in_x + x)) * 4) as usize;
+                    let src_idx = (((in_y + y) * width + (in_x + x)) * 3) as usize;
                     let dst = (y * TILE + x) as usize;
-                    tile[dst] = src_premul[src_idx];
-                    tile[plane + dst] = src_premul[src_idx + 1];
-                    tile[2 * plane + dst] = src_premul[src_idx + 2];
+                    tile[dst] = src_rgb[src_idx];
+                    tile[plane + dst] = src_rgb[src_idx + 1];
+                    tile[2 * plane + dst] = src_rgb[src_idx + 2];
                 }
             }
 
@@ -512,10 +514,10 @@ fn run_onnx_esrgan(
                     let gx = (in_x * NET_SCALE + x) as usize;
                     let gy = (in_y * NET_SCALE + y) as usize;
                     if gx < out_w as usize && gy < out_h as usize {
-                        let dst = (gy * out_w as usize + gx) * 4;
-                        out_premul[dst] = raw[src].clamp(0.0, 1.0);
-                        out_premul[dst + 1] = raw[out_plane + src].clamp(0.0, 1.0);
-                        out_premul[dst + 2] = raw[2 * out_plane + src].clamp(0.0, 1.0);
+                        let dst = (gy * out_w as usize + gx) * 3;
+                        out_rgb[dst] = raw[src].clamp(0.0, 1.0);
+                        out_rgb[dst + 1] = raw[out_plane + src].clamp(0.0, 1.0);
+                        out_rgb[dst + 2] = raw[2 * out_plane + src].clamp(0.0, 1.0);
                     }
                 }
             }
@@ -530,24 +532,16 @@ fn run_onnx_esrgan(
     }
     let (alpha_up, _, _) = upscale_lanczos(&alpha_rgba, width, height, f64::from(NET_SCALE))?;
 
-    // Compose RGB (from ESRGAN) + A (from Lanczos) into the output
-    // buffer, un-premultiplying as we go.
-    let mut out = Vec::with_capacity((out_w as usize) * (out_h as usize) * 4);
-    for (i, chunk) in out_premul.chunks_exact(4).enumerate() {
-        let a = f32::from(alpha_up[i * 4]) / 255.0;
-        let (r, g, b) = if a > 0.0 {
-            (
-                (chunk[0] / a).clamp(0.0, 1.0),
-                (chunk[1] / a).clamp(0.0, 1.0),
-                (chunk[2] / a).clamp(0.0, 1.0),
-            )
-        } else {
-            (0.0, 0.0, 0.0)
-        };
-        out.push((r * 255.0).round().clamp(0.0, 255.0) as u8);
-        out.push((g * 255.0).round().clamp(0.0, 255.0) as u8);
-        out.push((b * 255.0).round().clamp(0.0, 255.0) as u8);
-        out.push((a * 255.0).round().clamp(0.0, 255.0) as u8);
+    // Compose straight RGB (from ESRGAN) + A (from Lanczos) into the
+    // final RGBA output buffer. No un-premultiplication needed because
+    // the network operated on straight RGB.
+    let mut out = Vec::with_capacity(out_pixels * 4);
+    for (i, rgb) in out_rgb.chunks_exact(3).enumerate() {
+        let a_byte = alpha_up[i * 4];
+        out.push((rgb[0] * 255.0).round().clamp(0.0, 255.0) as u8);
+        out.push((rgb[1] * 255.0).round().clamp(0.0, 255.0) as u8);
+        out.push((rgb[2] * 255.0).round().clamp(0.0, 255.0) as u8);
+        out.push(a_byte);
     }
 
     // If the caller asked for a non-4× scale, resample post-network.

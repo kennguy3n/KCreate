@@ -346,9 +346,13 @@ impl SpotColorLibrary {
                     for (name, entry) in map {
                         // Skip top-level metadata fields a catalogue
                         // may carry alongside swatches (e.g. "name",
-                        // "description", "library_reference"). These
-                        // are strings, not entry objects.
-                        if entry.is_string() || entry.is_null() {
+                        // "description", "library_reference",
+                        // "version": 2, "options": {...}). Anything
+                        // that doesn't structurally look like a
+                        // swatch entry is metadata, not malformed —
+                        // counting it would inflate raw_entries and
+                        // malformed simultaneously.
+                        if !is_bare_entry_shape(&entry) {
                             continue;
                         }
                         stats.raw_entries += 1;
@@ -414,6 +418,26 @@ pub enum SpotCatalogError {
 ///
 /// Returns `None` for anything else (so the caller can drop the
 /// malformed entry without poisoning the rest of the library).
+/// Returns `true` if `v` looks structurally like a swatch entry in
+/// the bare-map catalog shape — either a 4-element JSON array (a
+/// bare CMYK tuple) or a JSON object that carries a `cmyk` /
+/// `fallback_cmyk` / `fallbackCmyk` key. Anything else (numbers,
+/// booleans, strings, objects without those keys) is treated as
+/// catalog-level metadata and excluded from `raw_entries` /
+/// `malformed` so the diagnostic counts only reflect actual
+/// swatch entries the user submitted for parsing.
+fn is_bare_entry_shape(v: &serde_json::Value) -> bool {
+    match v {
+        serde_json::Value::Array(arr) => arr.len() == 4,
+        serde_json::Value::Object(obj) => {
+            obj.contains_key("cmyk")
+                || obj.contains_key("fallback_cmyk")
+                || obj.contains_key("fallbackCmyk")
+        }
+        _ => false,
+    }
+}
+
 fn parse_bare_entry(name: &str, entry: &serde_json::Value) -> Option<SpotColorDef> {
     if let Some(cmyk) = parse_bare_cmyk_array(entry) {
         return Some(SpotColorDef {
@@ -1350,6 +1374,58 @@ mod tests {
             .unwrap(),
             r#"{"Custom":{"name":"MyPress","blob_hash":"deadbeef","color_space":"Cmyk"}}"#
         );
+    }
+
+    #[test]
+    fn bare_map_skips_non_entry_shapes_from_raw_count() {
+        // Metadata fields (string, number, bool, object without
+        // `cmyk`, arrays of wrong length) must be excluded from
+        // `raw_entries` so the diagnostic counts only reflect
+        // actual swatch entries the user submitted for parsing.
+        let raw = r#"{
+            "name": "Custom Catalogue",
+            "version": 2,
+            "active": true,
+            "options": { "preferLab": true },
+            "tags": ["pantone", "solid"],
+            "PANTONE 185 C": { "cmyk": [0, 1, 0.84, 0] },
+            "PANTONE Black C": [0, 0, 0, 1]
+        }"#;
+        let (lib, stats) = SpotColorLibrary::from_json_catalog_with_report(raw).unwrap();
+        assert_eq!(
+            stats.raw_entries, 2,
+            "only the 2 swatch entries should count"
+        );
+        assert_eq!(stats.parsed, 2);
+        assert_eq!(stats.malformed, 0);
+        assert_eq!(stats.duplicates_in_catalog, 0);
+        assert!(lib.get("PANTONE 185 C").is_some());
+        assert!(lib.get("PANTONE Black C").is_some());
+        assert!(lib.get("name").is_none());
+        assert!(lib.get("version").is_none());
+    }
+
+    #[test]
+    fn bare_map_malformed_entry_still_counted() {
+        // Shape looks like an entry (4-elem array, or object with
+        // `cmyk`) but the values are invalid (NaN, wrong length
+        // inside the cmyk field). These should count as both
+        // `raw_entries` and `malformed`.
+        let raw = r#"{
+            "Bad Array Length": [0, 1, 0.5],
+            "Bad Array Values": [0, 1, "foo", 0],
+            "Bad Object CMYK": { "cmyk": [0, 1, 0.5] },
+            "Good Entry": [0, 0.5, 1, 0]
+        }"#;
+        let (lib, stats) = SpotColorLibrary::from_json_catalog_with_report(raw).unwrap();
+        // "Bad Array Length" has len()==3 → fails is_bare_entry_shape,
+        // counted as metadata (skip). The other two are entry-shaped
+        // but unparseable.
+        assert_eq!(stats.raw_entries, 3);
+        assert_eq!(stats.malformed, 2);
+        assert_eq!(stats.parsed, 1);
+        assert_eq!(stats.duplicates_in_catalog, 0);
+        assert!(lib.get("Good Entry").is_some());
     }
 
     #[test]

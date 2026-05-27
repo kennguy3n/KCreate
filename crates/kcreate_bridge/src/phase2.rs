@@ -2935,12 +2935,15 @@ pub struct TemplateListReport {
 }
 
 /// List all installed local templates. Optionally filter by
-/// category or search query.
+/// category or search query. Re-scans the disk on every call so
+/// templates added/removed outside the app are picked up without
+/// requiring a restart.
 pub fn template_list(
     category: Option<kcreate_core::TemplateCategory>,
     query: Option<&str>,
 ) -> Result<TemplateListReport> {
-    let mp = template_marketplace().lock();
+    let mut mp = template_marketplace().lock();
+    let _ = mp.scan();
     let templates: Vec<kcreate_core::TemplateManifest> = if let Some(q) = query {
         mp.search(q).into_iter().cloned().collect()
     } else if let Some(cat) = category {

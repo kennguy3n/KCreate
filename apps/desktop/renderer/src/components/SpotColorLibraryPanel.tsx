@@ -115,7 +115,7 @@ export function SpotColorLibraryPanel({
     const y = parseCmykChannel(draft.y);
     const k = parseCmykChannel(draft.k);
     if (c === null || m === null || y === null || k === null) {
-      setLoadError("CMYK channels must be numbers in [0, 1] or [0, 100].");
+      setLoadError("CMYK channels must be percentages in 0–100.");
       return;
     }
     const display =
@@ -382,25 +382,25 @@ export function SpotColorLibraryPanel({
         </Row>
         <Row>
           <CmykField
-            label="C"
+            label="C %"
             value={draft.c}
             onChange={(v) => setDraft((d) => ({ ...d, c: v }))}
             disabled={busy}
           />
           <CmykField
-            label="M"
+            label="M %"
             value={draft.m}
             onChange={(v) => setDraft((d) => ({ ...d, m: v }))}
             disabled={busy}
           />
           <CmykField
-            label="Y"
+            label="Y %"
             value={draft.y}
             onChange={(v) => setDraft((d) => ({ ...d, y: v }))}
             disabled={busy}
           />
           <CmykField
-            label="K"
+            label="K %"
             value={draft.k}
             onChange={(v) => setDraft((d) => ({ ...d, k: v }))}
             disabled={busy}
@@ -612,19 +612,17 @@ function CmykField({
   );
 }
 
-/// Accept either a 0..1 fraction (`"0.85"`) or a 0..100 percent
-/// (`"85"`) and normalise to a fraction. Returns `null` for any
-/// unparseable input or NaN; the caller surfaces a validation
-/// message.
+/// Parse a CMYK channel value entered as a percentage (0–100) and
+/// normalise to a 0..1 fraction for the Rust bridge. Empty string
+/// defaults to 0. Returns `null` for unparseable, negative, or
+/// out-of-range input.
 function parseCmykChannel(raw: string): number | null {
   const trimmed = raw.trim();
   if (trimmed === "") return 0;
   const n = Number(trimmed);
   if (!Number.isFinite(n)) return null;
-  if (n < 0) return null;
-  if (n <= 1) return n;
-  if (n <= 100) return n / 100;
-  return null;
+  if (n < 0 || n > 100) return null;
+  return n / 100;
 }
 
 function cmykToCssHex(c: number, m: number, y: number, k: number): string {

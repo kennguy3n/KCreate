@@ -171,6 +171,15 @@ fn is_create_command(cmd: &str) -> bool {
     )
 }
 
+/// Ordering invariant: `classify_command` checks `is_delete_command`,
+/// `is_tree_move_command`, `is_document_setting_command`, and
+/// `is_create_command` BEFORE this function. Commands matching those
+/// categories (e.g. `"color_settings_update"` → DocumentSetting) are
+/// already routed before the broad suffix/prefix patterns below fire.
+///
+/// When adding a new bridge command that matches `_update`, `apply_*`,
+/// or `set_*`, register it in the appropriate specific classifier
+/// first so it doesn't silently fall through to property-merge.
 fn is_property_update_command(cmd: &str) -> bool {
     cmd == "document_update_node"
         || cmd == "text_frame_update"

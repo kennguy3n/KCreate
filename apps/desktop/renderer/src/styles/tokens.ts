@@ -1,24 +1,31 @@
 // KChat design tokens. Mirrored here as TypeScript constants so
 // components can compose inline styles without dragging in a CSS-in-JS
-// library. Keep these in lockstep with the `:root` block in
-// `index.html`.
+// library. The colour values are CSS-variable references; the
+// concrete palette is defined in `index.html`'s `:root` and
+// `:root[data-theme="dark"]` blocks and switched at runtime by
+// `ThemeProvider` setting the `data-theme` attribute.
+//
+// This indirection means *every* `style={{ color: colors.text }}`
+// pattern in the renderer automatically participates in light/dark
+// theming without any per-component refactor — the browser
+// re-evaluates `var(...)` whenever the cascade changes.
 
 export const colors = {
-  accent: "#7C3AED",
-  accentHover: "#6D28D9",
-  bg: "#FFFFFF",
-  bgSoft: "#F5F3FF",
-  bgCanvas: "#1e1e1e",
-  border: "#E5E7EB",
-  text: "#111827",
-  textMuted: "#4B5563",
-  textInverse: "#FFFFFF",
+  accent: "var(--kc-accent)",
+  accentHover: "var(--kc-accent-hover)",
+  bg: "var(--kc-bg)",
+  bgSoft: "var(--kc-bg-soft)",
+  bgCanvas: "var(--kc-bg-canvas)",
+  border: "var(--kc-border)",
+  text: "var(--kc-text)",
+  textMuted: "var(--kc-text-muted)",
+  textInverse: "var(--kc-text-inverse)",
   /// Used by the Phase 3 presence indicator for "peer is online
   /// and has broadcast presence in the past few seconds".
-  success: "#16A34A",
+  success: "var(--kc-success)",
   /// Used by error banners and the "leave session" destructive
   /// CTA in the PresencePanel.
-  danger: "#DC2626",
+  danger: "var(--kc-danger)",
 } as const;
 
 export const radius = {

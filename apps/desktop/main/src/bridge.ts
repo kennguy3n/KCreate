@@ -517,6 +517,15 @@ export interface Bridge {
     index: number,
   ): void;
 
+  // Phase 6 Tasks 25-26 — node clipboard.
+  documentClipboardCopy(nodeIds: string[]): string;
+  documentClipboardPaste(
+    payload: string,
+    targetParentId: string | undefined,
+    offsetX: number,
+    offsetY: number,
+  ): string[];
+
   // Phase 2 — print preflight, icon pack, async batch, AI extras,
   // plugin sandbox, MCP permission persistence.
   preflightRun(requestJson: string): string;

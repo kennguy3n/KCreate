@@ -2319,6 +2319,40 @@ pub fn document_reparent_node(
     document::document_reparent_node(nid, pid, index as usize).map_err(map_doc_err)
 }
 
+/// Phase 6 Task 25-26: serialise the supplied node ids (with their
+/// descendants) into a portable clipboard payload string. The
+/// renderer/main process stores this on the OS clipboard so paste
+/// works across windows.
+#[napi]
+pub fn document_clipboard_copy(node_ids: Vec<String>) -> NapiResult<String> {
+    let mut uuids = Vec::with_capacity(node_ids.len());
+    for s in node_ids {
+        uuids.push(parse_uuid(&s)?);
+    }
+    document::document_clipboard_copy(&uuids).map_err(map_doc_err)
+}
+
+/// Phase 6 Task 25-26: deserialise a clipboard payload and insert
+/// each subtree under `target_parent_id` (or root-level when
+/// omitted). The top-level root of every subtree is offset by
+/// (`offset_x`, `offset_y`) so paste at the cursor doesn't
+/// perfectly overlap the original.
+#[napi]
+pub fn document_clipboard_paste(
+    payload: String,
+    target_parent_id: Option<String>,
+    offset_x: f64,
+    offset_y: f64,
+) -> NapiResult<Vec<String>> {
+    let pid = match target_parent_id {
+        Some(s) if !s.is_empty() => Some(parse_uuid(&s)?),
+        _ => None,
+    };
+    document::document_clipboard_paste(&payload, pid, offset_x, offset_y)
+        .map(|ids| ids.into_iter().map(|i| i.to_string()).collect())
+        .map_err(map_doc_err)
+}
+
 // ---------------------------------------------------------------------------
 // Phase 2 — preflight, icon pack, parallel batch, AI model packs,
 // plugin sandbox, MCP permissions, screenshot-to-layout.

@@ -1576,6 +1576,33 @@ function registerIpcHandlers(): void {
       );
     },
   );
+  // -------------------------------------------------------------------
+  // Phase 6 Tasks 25-26 — node clipboard. Renderer marshals the OS
+  // clipboard text; this IPC just serialises selected node ids into a
+  // portable JSON payload (copy) and instantiates fresh nodes from a
+  // payload (paste).
+  // -------------------------------------------------------------------
+  ipcMain.handle(
+    "kcreate/clipboard/copy",
+    (_e, nodeIds: string[]): string =>
+      requireBridge().documentClipboardCopy(nodeIds),
+  );
+  ipcMain.handle(
+    "kcreate/clipboard/paste",
+    (
+      _e,
+      payload: string,
+      targetParentId: string | null | undefined,
+      offsetX: number,
+      offsetY: number,
+    ): string[] =>
+      requireBridge().documentClipboardPaste(
+        payload,
+        targetParentId ?? undefined,
+        offsetX,
+        offsetY,
+      ),
+  );
 
   // ---------------------------------------------------------------------
   // Phase 2 — preflight, icon pack, batch async, AI extras, plugins, MCP perms.

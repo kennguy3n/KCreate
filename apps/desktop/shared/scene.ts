@@ -3474,6 +3474,45 @@ export interface ImageGenBridge {
   recommendedPack(): Promise<string>;
 }
 
+/**
+ * Phase 6 Tasks 25-26 — node clipboard.
+ *
+ * Mirrors `kcreate_bridge::document::{document_clipboard_copy,
+ * document_clipboard_paste}`. The renderer drives Ctrl+C / Ctrl+V
+ * through this surface: copy returns a self-contained JSON payload
+ * the main process stashes on the OS clipboard, paste accepts that
+ * payload back and instantiates fresh nodes (new ids, optional
+ * cursor-offset, recorded as an undoable `clipboard_paste`
+ * operation).
+ *
+ * The payload format is opaque to the renderer — Rust pins
+ * `version: 1` and rejects future versions explicitly so a future
+ * schema bump can't silently drop data.
+ */
+export interface ClipboardBridge {
+  /**
+   * Serialise `nodeIds` (each with their descendants) into a portable
+   * JSON payload. Page and Artboard ids are filtered out defensively —
+   * those have dedicated `page_duplicate` / `artboard_*` ops and must
+   * not flow through the generic clipboard.
+   */
+  copy(nodeIds: string[]): Promise<string>;
+  /**
+   * Deserialise `payload` and insert each subtree under
+   * `targetParentId` (or document root when `null`). Every id is
+   * regenerated so the paste is independent of the source nodes;
+   * each subtree's top-level root is offset by (`offsetX`, `offsetY`)
+   * so paste-at-cursor doesn't perfectly overlap the original.
+   * Returns the new root ids in source order.
+   */
+  paste(
+    payload: string,
+    targetParentId: string | null,
+    offsetX: number,
+    offsetY: number,
+  ): Promise<string[]>;
+}
+
 declare global {
   interface Window {
     kcreate: {
@@ -3517,6 +3556,7 @@ declare global {
       slice: SliceBridge;
       session: SessionBridge;
       kchat: KChatBridge;
+      clipboard: ClipboardBridge;
     };
   }
 }

@@ -2834,6 +2834,184 @@ pub fn document_reparent_node(node_id: Uuid, new_parent: Option<Uuid>, index: us
 }
 
 // -----------------------------------------------------------------------------
+// Clipboard (Phase 6 Tasks 25-26)
+// -----------------------------------------------------------------------------
+//
+// Copy semantics:
+//   * `document_clipboard_copy(node_ids)` walks each node + its
+//     descendants, serialises the snapshots into a self-contained
+//     JSON payload (`ClipboardPayload`), and returns it as a String.
+//     The renderer/main process stores the payload on the system
+//     clipboard so cross-window paste works.
+//   * Payload includes the original parent ids and the source
+//     bounds so paste can either drop the nodes under a new parent
+//     or keep them root-level relative to the target artboard.
+//
+// Paste semantics:
+//   * `document_clipboard_paste(payload, target_parent_id,
+//     offset_x, offset_y)` deserialises the payload and inserts
+//     the subtree under `target_parent_id` (or root-level if
+//     `None`). All ids are regenerated; the top-level node's
+//     bounds are shifted by the offset so paste-at-cursor / paste-
+//     next-to-original works without overlap.
+//   * Cross-artboard paste falls out naturally because the payload
+//     carries no parent reference: the caller picks the destination.
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClipboardPayload {
+    /// Schema version so a future evolution can stay backward
+    /// compatible.
+    pub version: u32,
+    /// Self-contained subtrees. Each entry is a Vec<Node> in
+    /// pre-order (root first); the root has parent_id = None and
+    /// children that reference the new ids in the same vec.
+    pub subtrees: Vec<ClipboardSubtree>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClipboardSubtree {
+    /// All nodes that make up this subtree, in pre-order.
+    pub nodes: Vec<Node>,
+}
+
+/// Serialise `node_ids` (each with their descendants) into a
+/// portable clipboard payload. Missing ids are skipped silently —
+/// the caller is the renderer reacting to the user's selection,
+/// which can race with delete.
+pub fn document_clipboard_copy(node_ids: &[Uuid]) -> Result<String> {
+    let guard = slot().lock();
+    let ws = guard.as_ref().ok_or(DocumentBridgeError::NoProject)?;
+    let mut subtrees = Vec::with_capacity(node_ids.len());
+    for &root in node_ids {
+        let Some(root_node) = ws.project.document.get_node(root) else {
+            continue;
+        };
+        // Skip Page and Artboard. Pages are a top-level shell
+        // (with their own page-duplicate code path) and Artboards
+        // are managed by `artboard_*` ops; pasting them through
+        // the generic clipboard would clobber the document's
+        // artboard registry. The caller (renderer) gates this
+        // already, but we re-check defensively.
+        if matches!(root_node.node_type, NodeType::Page | NodeType::Artboard) {
+            continue;
+        }
+        let descendant_ids = ws.project.document.descendants_of(root);
+        let mut nodes = Vec::with_capacity(descendant_ids.len() + 1);
+        nodes.push(root_node.clone());
+        for id in &descendant_ids {
+            if let Some(n) = ws.project.document.get_node(*id) {
+                nodes.push(n.clone());
+            }
+        }
+        // Detach the root from its old parent so paste sees a
+        // free-floating subtree. Descendants keep their internal
+        // parent references; paste remaps them.
+        if let Some(root_owned) = nodes.first_mut() {
+            root_owned.parent_id = None;
+        }
+        subtrees.push(ClipboardSubtree { nodes });
+    }
+    let payload = ClipboardPayload {
+        version: 1,
+        subtrees,
+    };
+    Ok(serde_json::to_string(&payload)?)
+}
+
+/// Deserialise `payload` and insert each subtree under
+/// `target_parent_id`. All ids are regenerated; the top-level root
+/// of every subtree is offset by (`offset_x`, `offset_y`) so paste
+/// at the cursor doesn't perfectly overlap the original.
+///
+/// Records a `clipboard_paste` operation per subtree so undo unwinds
+/// the paste in one user-visible step (via the existing group-undo
+/// semantics).
+pub fn document_clipboard_paste(
+    payload: &str,
+    target_parent_id: Option<Uuid>,
+    offset_x: f64,
+    offset_y: f64,
+) -> Result<Vec<Uuid>> {
+    let parsed: ClipboardPayload = serde_json::from_str(payload).map_err(|e| {
+        DocumentBridgeError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+    })?;
+    if parsed.version != 1 {
+        return Err(DocumentBridgeError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("unsupported clipboard payload version: {}", parsed.version),
+        )));
+    }
+    let mut guard = slot().lock();
+    let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
+    if let Some(parent_id) = target_parent_id {
+        if ws.project.document.get_node(parent_id).is_none() {
+            return Err(DocumentBridgeError::NodeNotFound(parent_id));
+        }
+    }
+    let mut new_root_ids = Vec::with_capacity(parsed.subtrees.len());
+    let now = Utc::now();
+    for subtree in parsed.subtrees {
+        let Some(_root) = subtree.nodes.first() else {
+            continue;
+        };
+        // Build an old_id → new_id map for the whole subtree so we
+        // can rewrite parent_id / children references in lockstep.
+        let mut id_map: std::collections::HashMap<Uuid, Uuid> =
+            std::collections::HashMap::with_capacity(subtree.nodes.len());
+        for n in &subtree.nodes {
+            id_map.insert(n.id, Uuid::new_v4());
+        }
+        let old_root_id = subtree.nodes[0].id;
+        let new_root_id = id_map[&old_root_id];
+        for (idx, original) in subtree.nodes.into_iter().enumerate() {
+            let old_id = original.id;
+            let mut copy = original;
+            copy.id = id_map[&old_id];
+            copy.parent_id = if idx == 0 {
+                target_parent_id
+            } else {
+                copy.parent_id.and_then(|pid| id_map.get(&pid).copied())
+            };
+            copy.children = copy
+                .children
+                .iter()
+                .filter_map(|c| id_map.get(c).copied())
+                .collect();
+            copy.version = 0;
+            copy.created_at = now;
+            copy.updated_at = now;
+            if idx == 0 {
+                copy.bounds.x += offset_x;
+                copy.bounds.y += offset_y;
+            }
+            ws.project.document.insert_node(copy)?;
+        }
+        let snapshot = ws
+            .project
+            .document
+            .get_node(new_root_id)
+            .map_or(serde_json::Value::Null, |n| {
+                serde_json::to_value(n).unwrap_or(serde_json::Value::Null)
+            });
+        let op = Operation::new(
+            "user",
+            "clipboard_paste",
+            serde_json::json!({ "target_parent_id": target_parent_id }),
+            snapshot,
+            vec![new_root_id],
+        );
+        ws.project.execute_operation(op);
+        new_root_ids.push(new_root_id);
+    }
+    ws.project.modified_at = now;
+    let _ = sync_scene_locked(&mut guard);
+    drop(guard);
+    Ok(new_root_ids)
+}
+
+// -----------------------------------------------------------------------------
 // Components
 // -----------------------------------------------------------------------------
 
@@ -8460,5 +8638,202 @@ mod tests {
         assert_eq!(s.cap, LineCap::Round);
         assert_eq!(s.join, LineJoin::Bevel);
         assert_eq!(s.dash, vec![4.0, 2.0]);
+    }
+
+    // ---------------------------------------------------------------
+    // Clipboard (Phase 6 Tasks 25-26)
+    // ---------------------------------------------------------------
+
+    #[test]
+    #[serial]
+    fn clipboard_copy_paste_round_trip_under_same_artboard() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("clip", dir.path()).expect("create");
+        let ab = artboard_create(None, "Page".into(), 800.0, 600.0).expect("artboard");
+        let rect = document_create_node(
+            "VectorLayer",
+            Some(ab),
+            &CreateNodeProps {
+                name: Some("Rect".into()),
+                ..Default::default()
+            },
+        )
+        .expect("create");
+
+        // Copy → payload is a self-contained JSON Document.
+        let payload = document_clipboard_copy(&[rect]).expect("copy");
+        let parsed: ClipboardPayload = serde_json::from_str(&payload).expect("parse");
+        assert_eq!(parsed.version, 1, "schema version pinned to 1");
+        assert_eq!(parsed.subtrees.len(), 1);
+        assert_eq!(
+            parsed.subtrees[0].nodes.len(),
+            1,
+            "leaf rect has no descendants"
+        );
+        assert_eq!(
+            parsed.subtrees[0].nodes[0].parent_id, None,
+            "root detached so paste picks the parent"
+        );
+
+        // Paste under the same artboard, offset by (10, 20).
+        let pasted = document_clipboard_paste(&payload, Some(ab), 10.0, 20.0).expect("paste");
+        assert_eq!(pasted.len(), 1);
+        let new_id = pasted[0];
+        assert_ne!(new_id, rect, "paste must regenerate ids");
+
+        // The new node must be a child of the destination artboard and
+        // sit at (10, 20) relative to the original (which was at 0,0).
+        let tree = document_get_tree().expect("tree");
+        let pasted_node = tree.iter().find(|n| n.id == new_id).expect("present");
+        assert_eq!(pasted_node.parent_id, Some(ab));
+        assert_eq!(pasted_node.bounds.x, 10.0);
+        assert_eq!(pasted_node.bounds.y, 20.0);
+        project_close();
+    }
+
+    #[test]
+    #[serial]
+    fn clipboard_paste_remaps_descendant_ids_and_keeps_hierarchy() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("clip-tree", dir.path()).expect("create");
+        let ab = artboard_create(None, "Page".into(), 800.0, 600.0).expect("artboard");
+        let parent = document_create_node(
+            "GroupLayer",
+            Some(ab),
+            &CreateNodeProps {
+                name: Some("Group".into()),
+                ..Default::default()
+            },
+        )
+        .expect("parent");
+        let child_a = document_create_node(
+            "VectorLayer",
+            Some(parent),
+            &CreateNodeProps {
+                name: Some("A".into()),
+                ..Default::default()
+            },
+        )
+        .expect("child a");
+        let child_b = document_create_node(
+            "VectorLayer",
+            Some(parent),
+            &CreateNodeProps {
+                name: Some("B".into()),
+                ..Default::default()
+            },
+        )
+        .expect("child b");
+
+        let payload = document_clipboard_copy(&[parent]).expect("copy");
+        let pasted = document_clipboard_paste(&payload, Some(ab), 5.0, 5.0).expect("paste");
+        assert_eq!(pasted.len(), 1);
+        let new_parent = pasted[0];
+        assert_ne!(new_parent, parent);
+
+        let tree = document_get_tree().expect("tree");
+        let new_parent_node = tree.iter().find(|n| n.id == new_parent).expect("parent");
+        assert_eq!(new_parent_node.parent_id, Some(ab));
+        // Two children must have been recreated under the new parent.
+        let new_children: Vec<_> = tree
+            .iter()
+            .filter(|n| n.parent_id == Some(new_parent))
+            .collect();
+        assert_eq!(new_children.len(), 2, "both children recreated");
+        // None of the new ids may collide with the originals.
+        for child in &new_children {
+            assert_ne!(child.id, child_a);
+            assert_ne!(child.id, child_b);
+        }
+        project_close();
+    }
+
+    #[test]
+    #[serial]
+    fn clipboard_paste_cross_artboard() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("clip-cross", dir.path()).expect("create");
+        let ab1 = artboard_create(None, "Page 1".into(), 800.0, 600.0).expect("ab1");
+        let ab2 = artboard_create(None, "Page 2".into(), 800.0, 600.0).expect("ab2");
+        let rect = document_create_node(
+            "VectorLayer",
+            Some(ab1),
+            &CreateNodeProps {
+                name: Some("Rect".into()),
+                ..Default::default()
+            },
+        )
+        .expect("rect");
+
+        let payload = document_clipboard_copy(&[rect]).expect("copy");
+        let pasted = document_clipboard_paste(&payload, Some(ab2), 0.0, 0.0).expect("paste");
+        assert_eq!(pasted.len(), 1);
+        let new_id = pasted[0];
+        let tree = document_get_tree().expect("tree");
+        let pasted_node = tree.iter().find(|n| n.id == new_id).expect("present");
+        assert_eq!(
+            pasted_node.parent_id,
+            Some(ab2),
+            "cross-artboard paste must reparent to the destination"
+        );
+        // Original under ab1 stays put.
+        let original_node = tree.iter().find(|n| n.id == rect).expect("original");
+        assert_eq!(original_node.parent_id, Some(ab1));
+        project_close();
+    }
+
+    #[test]
+    #[serial]
+    fn clipboard_copy_skips_pages_and_artboards() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("clip-skip", dir.path()).expect("create");
+        let ab = artboard_create(None, "Page".into(), 800.0, 600.0).expect("artboard");
+        let page_id = document_get_tree().expect("tree")[0].id;
+
+        // Copy a mix of a Page id, an Artboard id, and an unknown id.
+        let payload = document_clipboard_copy(&[page_id, ab, Uuid::new_v4()]).expect("copy");
+        let parsed: ClipboardPayload = serde_json::from_str(&payload).expect("parse");
+        assert!(
+            parsed.subtrees.is_empty(),
+            "pages/artboards/unknown ids must be filtered out"
+        );
+        project_close();
+    }
+
+    #[test]
+    #[serial]
+    fn clipboard_paste_rejects_invalid_target_parent() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("clip-bad-parent", dir.path()).expect("create");
+        let ab = artboard_create(None, "Page".into(), 800.0, 600.0).expect("artboard");
+        let rect = document_create_node("VectorLayer", Some(ab), &CreateNodeProps::default())
+            .expect("rect");
+        let payload = document_clipboard_copy(&[rect]).expect("copy");
+        let bogus_parent = Uuid::new_v4();
+        let err = document_clipboard_paste(&payload, Some(bogus_parent), 0.0, 0.0)
+            .expect_err("must reject unknown parent");
+        assert!(matches!(err, DocumentBridgeError::NodeNotFound(id) if id == bogus_parent));
+        project_close();
+    }
+
+    #[test]
+    #[serial]
+    fn clipboard_paste_rejects_future_schema_version() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("clip-schema", dir.path()).expect("create");
+        let _ab = artboard_create(None, "Page".into(), 800.0, 600.0).expect("artboard");
+        // Hand-crafted v9 payload — must be rejected loudly so a
+        // future schema bump doesn't get silently dropped.
+        let v9_payload = r#"{"version":9,"subtrees":[]}"#;
+        let err = document_clipboard_paste(v9_payload, None, 0.0, 0.0)
+            .expect_err("must reject future schema");
+        assert!(matches!(err, DocumentBridgeError::Io(_)));
+        project_close();
     }
 }

@@ -14,9 +14,35 @@
         --kc-border: #E5E7EB;
         --kc-text: #111827;
         --kc-text-muted: #4B5563;
+        --kc-text-inverse: #FFFFFF;
+        --kc-success: #16A34A;
+        --kc-danger: #DC2626;
         --kc-shadow: 0 1px 3px rgba(0, 0, 0, 0.08);
+        --kc-shadow-hover: 0 4px 12px rgba(124, 58, 237, 0.18);
         --kc-radius: 12px;
         --kc-radius-pill: 9999px;
+        color-scheme: light;
+      }
+      /* Phase 6 Tasks 23-24: dark theme override. The
+         `ThemeProvider` writes `data-theme="dark"` to the root
+         element when the user toggles dark mode; every CSS variable
+         the renderer reads from is redefined here so existing
+         `var(--kc-*)` references just work without code changes. */
+      :root[data-theme="dark"] {
+        --kc-accent: #7C3AED;
+        --kc-accent-hover: #6D28D9;
+        --kc-bg: #1F2937;
+        --kc-bg-soft: #374151;
+        --kc-bg-canvas: #111827;
+        --kc-border: #4B5563;
+        --kc-text: #F9FAFB;
+        --kc-text-muted: #9CA3AF;
+        --kc-text-inverse: #111827;
+        --kc-success: #22C55E;
+        --kc-danger: #EF4444;
+        --kc-shadow: 0 1px 3px rgba(0, 0, 0, 0.45);
+        --kc-shadow-hover: 0 4px 12px rgba(124, 58, 237, 0.45);
+        color-scheme: dark;
       }
       html, body {
         margin: 0;

@@ -6,6 +6,7 @@ import { PageNavigator } from "../components/PageNavigator";
 import { RightPanel } from "../components/RightPanel";
 import { SoftProofOverlay } from "../components/SoftProofOverlay";
 import { TemplatePicker } from "../components/TemplatePicker";
+import { KeyboardShortcutsPanel } from "../components/KeyboardShortcutsPanel";
 import {
   TopBar,
   type EditorMode,
@@ -31,6 +32,8 @@ import type {
   SnapGuide,
 } from "../../../shared/scene";
 import { LowResourceBanner } from "../components/LowResourceBanner";
+import { useShortcuts } from "../shortcuts/useShortcuts";
+import type { ShortcutHandlers } from "../shortcuts/useShortcuts";
 import { colors, font, spacing } from "../styles/tokens";
 
 export interface EditorPageProps {
@@ -114,6 +117,7 @@ export function EditorPage({
   // project id so re-opening a project skips the picker, but switching
   // projects within one session re-prompts.
   const [templatePickerOpen, setTemplatePickerOpen] = useState<boolean>(false);
+  const [shortcutsPanelOpen, setShortcutsPanelOpen] = useState<boolean>(false);
   const [layoutPickerShownFor, setLayoutPickerShownFor] = useState<string | null>(
     null,
   );
@@ -136,6 +140,12 @@ export function EditorPage({
     cumulativeDx: number;
     cumulativeDy: number;
   } | null>(null);
+
+  // Phase 6 Tasks 25-26: latest world-space cursor sample. Paste uses
+  // it to position the new subtree near the cursor; we update on every
+  // pointer event (not just down/up) so a stationary cursor over the
+  // canvas still drives a sensible paste origin.
+  const lastCursorWorldRef = useRef<{ x: number; y: number } | null>(null);
 
   /// `nodes` mirror used inside the canvas pointer handler. The
   /// handler is wrapped in `useCallback` and we deliberately do NOT
@@ -619,6 +629,253 @@ export function EditorPage({
     }
   }, []);
 
+  // ------------------------------------------------------------------
+  // Phase 6 Tasks 25-26 — node clipboard.
+  //
+  // Copy:   serialise the current selection through the Rust bridge
+  //         (Page/Artboard ids are filtered out defensively), wrap the
+  //         result in a `kcreate:clipboard/v1\n` envelope so paste can
+  //         distinguish a KCreate payload from arbitrary text the user
+  //         may have on the OS clipboard, then push to
+  //         `navigator.clipboard`.
+  //
+  // Paste:  read the OS clipboard, validate the envelope, infer the
+  //         destination artboard (artboard owning the first selected
+  //         node, falling back to the first artboard on the active
+  //         page), compute an offset so the top-left of the first
+  //         pasted root lands at the cursor (or at +20,+20 when the
+  //         cursor hasn't been over the canvas yet), and refresh the
+  //         tree / selection so the user sees + can immediately drag
+  //         the pasted nodes.
+  // ------------------------------------------------------------------
+  const CLIPBOARD_ENVELOPE_HEADER = "kcreate:clipboard/v1\n";
+
+  const handleCopy = useCallback(async () => {
+    if (selectedIds.length === 0) return;
+    try {
+      // Filter selected ids that are themselves Pages / Artboards.
+      // The bridge filters defensively too, but doing it here avoids a
+      // surprising "you copied something but the clipboard is empty"
+      // when the user has only top-level container ids selected.
+      const eligible = selectedIds.filter((id) => {
+        const n = nodes.find((node) => node.id === id);
+        if (!n) return false;
+        return n.nodeType !== "Page" && n.nodeType !== "Artboard";
+      });
+      if (eligible.length === 0) {
+        setStatusMessage(
+          "nothing copyable in selection (pages and artboards are copied via duplicate)",
+        );
+        return;
+      }
+      const payload = await window.kcreate.clipboard.copy(eligible);
+      const enveloped = CLIPBOARD_ENVELOPE_HEADER + payload;
+      if (typeof navigator !== "undefined" && navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(enveloped);
+      } else {
+        // Headless / pre-Electron-ready boot: stash on window so a
+        // subsequent paste in the same session still works. We never
+        // surface this fallback to the user — it's a defensive belt.
+        (window as unknown as { __kcreateClipboard?: string }).__kcreateClipboard =
+          enveloped;
+      }
+      setStatusMessage(`copied ${eligible.length} node(s)`);
+    } catch (e) {
+      setStatusMessage(`copy failed: ${errorMessage(e)}`);
+    }
+  }, [selectedIds, nodes]);
+
+  const handlePaste = useCallback(async () => {
+    try {
+      let enveloped: string | undefined;
+      if (typeof navigator !== "undefined" && navigator.clipboard?.readText) {
+        try {
+          enveloped = await navigator.clipboard.readText();
+        } catch {
+          // Read can throw if the document isn't focused; fall back to
+          // the in-session stash below.
+        }
+      }
+      if (!enveloped) {
+        enveloped = (window as unknown as { __kcreateClipboard?: string })
+          .__kcreateClipboard;
+      }
+      if (!enveloped || !enveloped.startsWith(CLIPBOARD_ENVELOPE_HEADER)) {
+        setStatusMessage("clipboard is empty or not a KCreate payload");
+        return;
+      }
+      const payload = enveloped.slice(CLIPBOARD_ENVELOPE_HEADER.length);
+
+      // Resolve target artboard: the artboard owning the first
+      // selection if any, otherwise the first artboard on the page.
+      let targetArtboard: string | null = null;
+      if (selectedIds.length > 0) {
+        const first = nodes.find((n) => n.id === selectedIds[0]);
+        // Walk up to find an Artboard ancestor.
+        let cursor: NodeInfo | undefined = first;
+        while (cursor && cursor.nodeType !== "Artboard") {
+          cursor = cursor.parentId
+            ? nodes.find((n) => n.id === cursor!.parentId)
+            : undefined;
+        }
+        if (cursor && cursor.nodeType === "Artboard") {
+          targetArtboard = cursor.id;
+        }
+      }
+      if (!targetArtboard) {
+        targetArtboard = artboards[0]?.id ?? null;
+      }
+      if (!targetArtboard) {
+        setStatusMessage("no artboard to paste into");
+        return;
+      }
+
+      // Compute (offset_x, offset_y) so the first pasted root lands
+      // at the cursor (or at +20,+20 when we have no cursor sample).
+      let offsetX = 20;
+      let offsetY = 20;
+      try {
+        const parsed = JSON.parse(payload) as {
+          subtrees?: { nodes?: { bounds?: { x?: number; y?: number } }[] }[];
+        };
+        const firstRoot = parsed.subtrees?.[0]?.nodes?.[0]?.bounds;
+        const cursorWorld = lastCursorWorldRef.current;
+        if (
+          firstRoot &&
+          typeof firstRoot.x === "number" &&
+          typeof firstRoot.y === "number" &&
+          cursorWorld
+        ) {
+          offsetX = cursorWorld.x - firstRoot.x;
+          offsetY = cursorWorld.y - firstRoot.y;
+        }
+      } catch {
+        // Malformed payload — let the bridge surface the real error
+        // when paste runs. We keep the (+20,+20) fallback so the user
+        // still gets visible feedback if Rust accepts it.
+      }
+
+      const newRoots = await window.kcreate.clipboard.paste(
+        payload,
+        targetArtboard,
+        offsetX,
+        offsetY,
+      );
+      await refreshTree();
+      if (newRoots.length > 0) {
+        await window.kcreate.canvas.setSelection(newRoots);
+        setSelectedIds(newRoots);
+      }
+      setStatusMessage(`pasted ${newRoots.length} node(s)`);
+    } catch (e) {
+      setStatusMessage(`paste failed: ${errorMessage(e)}`);
+    }
+  }, [selectedIds, nodes, artboards, refreshTree]);
+
+  // ------------------------------------------------------------------
+  // Phase 6 Task 25 — drag-and-drop from the OS file manager.
+  //
+  // We accept the three formats that have a clean bridge entry point:
+  //   * raster images (PNG / JPEG / WebP / GIF) → canvas.importImage
+  //     (path) or canvas.importImageBytes (sandboxed File only)
+  //   * SVG                                     → canvas.importImage
+  //     (delegates to the SVG path; the bridge's `document_import_image`
+  //     sniffs the magic and routes to the SVG ingest path)
+  //   * PDF                                     → pdfImport.importPdf
+  // Anything else falls through with a status message rather than a
+  // silent no-op.
+  //
+  // Electron's File objects carry an absolute `path`; the bridge takes
+  // file paths so we route through `importImage` directly when path
+  // is present. As a defensive fallback (e.g., when a non-Electron
+  // dev build is hosting the renderer), we read the bytes and call
+  // `importImageBytes` instead — that one accepts raster only.
+  // ------------------------------------------------------------------
+
+  const handleCanvasDragOver = useCallback(
+    (e: React.DragEvent<HTMLElement>): void => {
+      if (e.dataTransfer.types.includes("Files")) {
+        e.preventDefault();
+        // Set the drop effect so the OS shows the "copy" cursor.
+        e.dataTransfer.dropEffect = "copy";
+      }
+    },
+    [],
+  );
+
+  const handleCanvasDrop = useCallback(
+    (e: React.DragEvent<HTMLElement>): void => {
+      if (!e.dataTransfer.files || e.dataTransfer.files.length === 0) return;
+      e.preventDefault();
+      const target = artboards[0]?.id ?? null;
+      if (!target) {
+        setStatusMessage("no artboard available — drop ignored");
+        return;
+      }
+      const files = Array.from(e.dataTransfer.files);
+      void (async () => {
+        let imported = 0;
+        const errors: string[] = [];
+        for (const f of files) {
+          // Electron's File exposes an absolute path. Bare-browser File
+          // does not — fall back to `arrayBuffer` + importImageBytes.
+          const path = (f as unknown as { path?: string }).path;
+          try {
+            const lower = f.name.toLowerCase();
+            if (lower.endsWith(".pdf")) {
+              if (!path) {
+                errors.push(`${f.name}: PDF import requires a file path`);
+                continue;
+              }
+              await window.kcreate.pdfImport.importPdf(path);
+              imported += 1;
+              continue;
+            }
+            if (
+              path &&
+              (lower.endsWith(".png") ||
+                lower.endsWith(".jpg") ||
+                lower.endsWith(".jpeg") ||
+                lower.endsWith(".webp") ||
+                lower.endsWith(".gif") ||
+                lower.endsWith(".svg"))
+            ) {
+              await window.kcreate.canvas.importImage(target, path);
+              imported += 1;
+              continue;
+            }
+            if (
+              lower.endsWith(".png") ||
+              lower.endsWith(".jpg") ||
+              lower.endsWith(".jpeg") ||
+              lower.endsWith(".webp")
+            ) {
+              const buf = await f.arrayBuffer();
+              await window.kcreate.canvas.importImageBytes(
+                target,
+                new Uint8Array(buf),
+              );
+              imported += 1;
+              continue;
+            }
+            errors.push(`${f.name}: unsupported file type`);
+          } catch (err) {
+            errors.push(`${f.name}: ${errorMessage(err)}`);
+          }
+        }
+        await refreshTree();
+        if (errors.length === 0) {
+          setStatusMessage(`imported ${imported} file(s)`);
+        } else {
+          setStatusMessage(
+            `imported ${imported} file(s); ${errors.length} failed: ${errors.join("; ")}`,
+          );
+        }
+      })();
+    },
+    [artboards, refreshTree],
+  );
+
   const handleSelect = useCallback(
     async (id: string | null) => {
       try {
@@ -822,87 +1079,76 @@ export function EditorPage({
     };
   }, [selectedIds, activeSessionPeerId]);
 
-  // Keyboard shortcuts. Scoped to the editor page; the canvas itself
-  // is non-focusable so window-level listeners are the right place.
-  useEffect(() => {
-    const onKeyDown = (e: KeyboardEvent): void => {
-      // Skip shortcuts when the user is typing in an input/textarea —
-      // otherwise hitting "R" inside a name field would silently switch
-      // tools.
-      const target = e.target as HTMLElement | null;
-      const tag = target?.tagName?.toLowerCase();
-      const isEditable =
-        tag === "input" ||
-        tag === "textarea" ||
-        tag === "select" ||
-        (target?.isContentEditable ?? false);
-      if (isEditable) return;
-
-      const mod = e.ctrlKey || e.metaKey;
-      // Undo / redo
-      if (mod && !e.shiftKey && e.key.toLowerCase() === "z") {
+  // Keyboard shortcuts. Routed through the user-overridable
+  // registry (`src/shortcuts/registry.ts`). Tool-switch actions are
+  // gated by the active mode so e.g. "R" in a mode that doesn't
+  // expose the rectangle tool stays a no-op instead of switching
+  // to a tool that isn't in the palette.
+  const tryTool = useCallback(
+    (next: ToolId, e: KeyboardEvent) => {
+      const tools = toolsForMode(mode);
+      if (!tools.includes(next)) return;
+      e.preventDefault();
+      setTool(next);
+    },
+    [mode],
+  );
+  const shortcutHandlers = useMemo<ShortcutHandlers>(
+    () => ({
+      undo: (e) => {
         e.preventDefault();
         void handleUndo();
-        return;
-      }
-      if (
-        (mod && e.shiftKey && e.key.toLowerCase() === "z") ||
-        (mod && e.key.toLowerCase() === "y")
-      ) {
+      },
+      redo: (e) => {
         e.preventDefault();
         void handleRedo();
-        return;
-      }
-      // Select all
-      if (mod && e.key.toLowerCase() === "a") {
+      },
+      redoAlt: (e) => {
+        e.preventDefault();
+        void handleRedo();
+      },
+      selectAll: (e) => {
         e.preventDefault();
         void handleSelectAll();
-        return;
-      }
-      // Delete selection
-      if ((e.key === "Delete" || e.key === "Backspace") && !mod) {
+      },
+      deleteSelection: (e) => {
         e.preventDefault();
         void handleDeleteSelected();
-        return;
-      }
-      // Escape — drop selection
-      if (e.key === "Escape") {
+      },
+      clearSelection: (e) => {
         e.preventDefault();
         void handleClearSelection();
-        return;
-      }
-      // Tool switches. Only single-key, no modifiers.
-      if (!mod && !e.altKey && !e.shiftKey && e.key.length === 1) {
-        const k = e.key.toLowerCase();
-        const tools = toolsForMode(mode);
-        const next: ToolId | null =
-          k === "v"
-            ? "select"
-            : k === "r"
-              ? "rect"
-              : k === "e"
-                ? "ellipse"
-                : k === "l"
-                  ? "line"
-                  : k === "t"
-                    ? "text"
-                    : null;
-        if (next && tools.includes(next)) {
-          e.preventDefault();
-          setTool(next);
-        }
-      }
-    };
-    window.addEventListener("keydown", onKeyDown);
-    return () => window.removeEventListener("keydown", onKeyDown);
-  }, [
-    handleUndo,
-    handleRedo,
-    handleSelectAll,
-    handleDeleteSelected,
-    handleClearSelection,
-    mode,
-  ]);
+      },
+      toolSelect: (e) => tryTool("select", e),
+      toolRect: (e) => tryTool("rect", e),
+      toolEllipse: (e) => tryTool("ellipse", e),
+      toolLine: (e) => tryTool("line", e),
+      toolText: (e) => tryTool("text", e),
+      openShortcutsPanel: (e) => {
+        e.preventDefault();
+        setShortcutsPanelOpen((open) => !open);
+      },
+      copy: (e) => {
+        e.preventDefault();
+        void handleCopy();
+      },
+      paste: (e) => {
+        e.preventDefault();
+        void handlePaste();
+      },
+    }),
+    [
+      handleUndo,
+      handleRedo,
+      handleSelectAll,
+      handleDeleteSelected,
+      handleClearSelection,
+      handleCopy,
+      handlePaste,
+      tryTool,
+    ],
+  );
+  useShortcuts(shortcutHandlers);
 
   // Map screen→world. The renderer reads pan/zoom directly so the same
   // formula is used both for the wheel-zoom anchor (inside CanvasHost)
@@ -931,6 +1177,9 @@ export function EditorPage({
       const sx = e.clientX - rect.left;
       const sy = e.clientY - rect.top;
       const { x: wx, y: wy } = screenToWorld(sx, sy);
+      // Phase 6 Tasks 25-26: latest world-space cursor sample drives
+      // paste-at-cursor.
+      lastCursorWorldRef.current = { x: wx, y: wy };
       // Capture the viewport snapshot at pointer-down time. The Rust
       // hit-test wants screen coordinates plus the viewport so it can
       // run the screen→world transform once — if we pre-transformed
@@ -1330,6 +1579,8 @@ export function EditorPage({
           onDesignSystemStatus={setStatusMessage}
         />
         <main
+          onDragOver={handleCanvasDragOver}
+          onDrop={handleCanvasDrop}
           style={{
             position: "relative",
             background: colors.bgCanvas,
@@ -1522,6 +1773,40 @@ export function EditorPage({
         }}
         onStatus={setStatusMessage}
       />
+      {shortcutsPanelOpen ? (
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-label="Keyboard shortcuts"
+          onClick={(e) => {
+            if (e.target === e.currentTarget) {
+              setShortcutsPanelOpen(false);
+            }
+          }}
+          style={{
+            position: "fixed",
+            inset: 0,
+            background: "rgba(17, 24, 39, 0.45)",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            zIndex: 50,
+          }}
+        >
+          <div
+            style={{
+              width: "min(720px, 90vw)",
+              maxHeight: "80vh",
+              overflowY: "auto",
+              background: colors.bg,
+              borderRadius: 12,
+              boxShadow: "0 12px 32px rgba(0, 0, 0, 0.24)",
+            }}
+          >
+            <KeyboardShortcutsPanel onStatus={setStatusMessage} />
+          </div>
+        </div>
+      ) : null}
     </div>
   );
 }

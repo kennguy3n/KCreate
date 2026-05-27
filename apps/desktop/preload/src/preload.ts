@@ -166,6 +166,7 @@ import type {
   KChatMembershipStatus,
   SessionStartReport,
   TrustedIssuer,
+  ClipboardBridge,
 } from "../../shared/scene";
 
 type FrameInfoSnake = {
@@ -2402,6 +2403,34 @@ const slice: SliceBridge = {
   },
 };
 
+// ---------------------------------------------------------------------------
+// Phase 6 Tasks 25-26 — node clipboard bridge. See `ClipboardBridge` in
+// shared/scene.ts for the contract.
+// ---------------------------------------------------------------------------
+
+const clipboard: ClipboardBridge = {
+  async copy(nodeIds: string[]): Promise<string> {
+    return (await ipcRenderer.invoke(
+      "kcreate/clipboard/copy",
+      nodeIds,
+    )) as string;
+  },
+  async paste(
+    payload: string,
+    targetParentId: string | null,
+    offsetX: number,
+    offsetY: number,
+  ): Promise<string[]> {
+    return (await ipcRenderer.invoke(
+      "kcreate/clipboard/paste",
+      payload,
+      targetParentId,
+      offsetX,
+      offsetY,
+    )) as string[];
+  },
+};
+
 contextBridge.exposeInMainWorld("kcreate", {
   renderer,
   document,
@@ -2443,4 +2472,5 @@ contextBridge.exposeInMainWorld("kcreate", {
   slice,
   session,
   kchat,
+  clipboard,
 });

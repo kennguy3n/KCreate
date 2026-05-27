@@ -2868,6 +2868,83 @@ fn _force_extracted_image_data_link(d: &ExtractedImageData) -> usize {
 // -----------------------------------------------------------------------------
 // Avoid unused warnings on disabled features
 // -----------------------------------------------------------------------------
+// Template marketplace (Phase 3 — local only)
+// -----------------------------------------------------------------------------
+
+fn template_marketplace() -> &'static Mutex<kcreate_core::LocalMarketplace> {
+    static MP: OnceLock<Mutex<kcreate_core::LocalMarketplace>> = OnceLock::new();
+    MP.get_or_init(|| {
+        let root = template_dir();
+        let mut mp = kcreate_core::LocalMarketplace::new(root);
+        let _ = mp.scan();
+        Mutex::new(mp)
+    })
+}
+
+fn template_dir() -> PathBuf {
+    std::env::var("KCREATE_TEMPLATE_DIR").map_or_else(
+        |_| kcreate_core::LocalMarketplace::default_dir(),
+        PathBuf::from,
+    )
+}
+
+/// Re-seed the template marketplace from the current `template_dir()`
+/// so per-test directories take effect. Tasks 11-12 (the bridge tests
+/// for `template_install_local` / `template_remove`) consume this; it
+/// stays compiled in `cfg(test)` builds so those tests have a clean
+/// per-test marketplace state without needing to mutate the
+/// singleton's internals.
+#[cfg(test)]
+#[allow(dead_code)]
+pub(crate) fn reset_marketplace_for_tests() {
+    let dir = template_dir();
+    let mut mp = template_marketplace().lock();
+    *mp = kcreate_core::LocalMarketplace::new(dir);
+    let _ = mp.scan();
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TemplateListReport {
+    pub templates: Vec<kcreate_core::TemplateManifest>,
+}
+
+/// List all installed local templates. Optionally filter by
+/// category or search query.
+pub fn template_list(
+    category: Option<kcreate_core::TemplateCategory>,
+    query: Option<&str>,
+) -> Result<TemplateListReport> {
+    let mp = template_marketplace().lock();
+    let templates: Vec<kcreate_core::TemplateManifest> = if let Some(q) = query {
+        mp.search(q).into_iter().cloned().collect()
+    } else if let Some(cat) = category {
+        mp.filter_by_category(cat).into_iter().cloned().collect()
+    } else {
+        mp.list().into_iter().cloned().collect()
+    };
+    Ok(TemplateListReport { templates })
+}
+
+/// Install a `.ktemplate/` folder from a local path. Wraps
+/// [`kcreate_core::LocalMarketplace::install_local`] and lets the
+/// underlying [`kcreate_core::MarketplaceError`] propagate through
+/// the `#[from]` conversion on [`crate::document::DocumentBridgeError`]
+/// so the renderer receives a structured error rather than a
+/// stringified one.
+pub fn template_install_local(source_path: &str) -> Result<kcreate_core::TemplateManifest> {
+    let path = PathBuf::from(source_path);
+    let mut mp = template_marketplace().lock();
+    Ok(mp.install_local(&path)?)
+}
+
+/// Remove an installed template by id.
+pub fn template_remove(template_id: uuid::Uuid) -> Result<()> {
+    let mut mp = template_marketplace().lock();
+    mp.remove(template_id)?;
+    Ok(())
+}
+
+// -----------------------------------------------------------------------------
 
 #[allow(dead_code)]
 fn _suppress_unused_atomic() {

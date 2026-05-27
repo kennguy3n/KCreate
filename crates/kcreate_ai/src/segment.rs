@@ -455,8 +455,10 @@ fn run_onnx_sam(
 
     // SAM keeps the aspect ratio by resizing the longer side to 1024
     // and zero-padding the shorter side. We compute the same here.
+    // `NET as f32` is lossless because NET (1024) is far below the
+    // f32 integer-precision limit of 2^24.
     let longer = width.max(height) as f32;
-    let scale = f32::from(NET as u16) / longer;
+    let scale = (NET as f32) / longer;
     let resized_w = ((width as f32) * scale).round() as u32;
     let resized_h = ((height as f32) * scale).round() as u32;
 

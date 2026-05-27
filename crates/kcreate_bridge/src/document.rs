@@ -95,6 +95,13 @@ pub enum DocumentBridgeError {
     Io(#[from] std::io::Error),
     #[error(transparent)]
     Bridge(#[from] crate::state::BridgeError),
+    /// Local-template marketplace failures: corrupt manifest, missing
+    /// .ktemplate folder, attempted install of an already-installed
+    /// template, etc. The marketplace lives in `kcreate_core` and has
+    /// its own structured error type, which we wrap here so the
+    /// renderer's structured error mapping stays uniform.
+    #[error(transparent)]
+    Marketplace(#[from] kcreate_core::MarketplaceError),
 }
 
 pub type Result<T> = std::result::Result<T, DocumentBridgeError>;

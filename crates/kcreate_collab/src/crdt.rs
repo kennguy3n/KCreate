@@ -103,6 +103,15 @@ impl OperationCategory {
 }
 
 fn is_delete_command(cmd: &str) -> bool {
+    // Explicit allow-list: only bridge commands that actually delete a
+    // node from the document tree count as `Delete`. Earlier revisions
+    // used `cmd.ends_with("_delete") || cmd.ends_with("_remove")` as a
+    // catch-all, but that misclassified document-level mutations such
+    // as `spot_color_remove` (which modifies `SpotColorLibrary` with no
+    // affected nodes) as node deletions, causing concurrent edits to
+    // be dropped under the delete-wins rule. Anything new that isn't
+    // in this list falls through to `Other` (LWW) by design — adding a
+    // case here is a deliberate opt-in.
     matches!(
         cmd,
         "document_delete_node"
@@ -114,8 +123,7 @@ fn is_delete_command(cmd: &str) -> bool {
             | "component_delete"
             | "interaction_remove"
             | "slice_delete"
-    ) || cmd.ends_with("_delete")
-        || cmd.ends_with("_remove")
+    )
 }
 
 fn is_tree_move_command(cmd: &str) -> bool {
@@ -141,6 +149,7 @@ fn is_document_setting_command(cmd: &str) -> bool {
             | "design_tokens_update"
             | "spot_color_library_update"
             | "spot_color_upsert"
+            | "spot_color_remove"
             | "spot_color_load_catalog"
     )
 }

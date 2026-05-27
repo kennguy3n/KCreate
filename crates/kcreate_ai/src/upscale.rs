@@ -31,6 +31,59 @@ use thiserror::Error;
 const LANCZOS_RADIUS: f32 = 3.0;
 const KERNEL_SAMPLES_PER_TAP: usize = 6; // 2 * radius for radius == 3
 
+/// Real-ESRGAN ships as a 4× super-resolution network with a 128 px
+/// receptive field; we tile the input with an 8 px overlap on each
+/// side so seams between adjacent tiles blend out. Exposed as module
+/// constants (rather than function-local) so the per-tile crop logic
+/// is unit-testable without needing an ONNX model on disk.
+///
+/// `#[allow(dead_code)]` is applied because the constants are only
+/// referenced from the `onnx_upscale`-gated ESRGAN code path and from
+/// the test module. Default builds (no `onnx_upscale`, no `--tests`)
+/// would otherwise warn — incorrectly, since the constants are part
+/// of the documented module API for the ESRGAN tile geometry.
+#[allow(dead_code)]
+pub(crate) const ESRGAN_NET_SCALE: u32 = 4;
+#[allow(dead_code)]
+pub(crate) const ESRGAN_TILE: u32 = 128;
+#[allow(dead_code)]
+pub(crate) const ESRGAN_OVERLAP: u32 = 8;
+
+/// Per-tile crop in upscaled-output pixels. Returns
+/// `(left, top, right, bottom)` — the number of pixels at the start
+/// and end of each axis that should be discarded before writing the
+/// tile's output into the global buffer.
+///
+/// Adjacent tiles overlap by `OVERLAP * NET_SCALE` upscaled pixels on
+/// the shared side. Cropping that region from both tiles eliminates
+/// the seam that would otherwise be visible from the zero-padding of
+/// the network's receptive field. At image boundaries there's no
+/// neighbouring tile to fill the cropped region, so the crop on those
+/// sides MUST be zero — otherwise the boundary pixels stay at the
+/// `0.0` initial value of the output buffer and the alpha-correct
+/// un-premultiplication renders them as solid black.
+///
+/// This was previously hard-coded to a fixed crop on all four sides,
+/// producing an 8-source-pixel-wide black border on every output and
+/// turning images smaller than 16 px wide into all-black tiles. See
+/// BUG-0001 in the Devin Review history on PR #16.
+#[allow(dead_code)]
+#[must_use]
+pub(crate) fn esrgan_tile_crop(
+    tx: u32,
+    ty: u32,
+    step: u32,
+    width: u32,
+    height: u32,
+) -> (u32, u32, u32, u32) {
+    let crop = ESRGAN_OVERLAP * ESRGAN_NET_SCALE;
+    let crop_left = if tx > 0 { crop } else { 0 };
+    let crop_top = if ty > 0 { crop } else { 0 };
+    let crop_right = if tx + step < width { crop } else { 0 };
+    let crop_bottom = if ty + step < height { crop } else { 0 };
+    (crop_left, crop_top, crop_right, crop_bottom)
+}
+
 /// Errors from [`upscale_lanczos`] / [`upscale_with_backend`].
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum UpscaleError {
@@ -373,10 +426,12 @@ fn run_onnx_esrgan(
             message: format!("ort load: {e}"),
         })?;
 
-    // Real-ESRGAN ships as a 4× super-resolution network.
-    const NET_SCALE: u32 = 4;
-    const TILE: u32 = 128;
-    const OVERLAP: u32 = 8;
+    // Real-ESRGAN ships as a 4× super-resolution network. Constants
+    // live at module scope so the per-tile crop math is unit-testable
+    // (see `esrgan_tile_crop` + the tests below).
+    const NET_SCALE: u32 = ESRGAN_NET_SCALE;
+    const TILE: u32 = ESRGAN_TILE;
+    const OVERLAP: u32 = ESRGAN_OVERLAP;
 
     let out_w = width.saturating_mul(NET_SCALE);
     let out_h = height.saturating_mul(NET_SCALE);
@@ -442,26 +497,26 @@ fn run_onnx_esrgan(
             })?;
 
             // Output is NCHW (1 × 3 × TILE*4 × TILE*4). Crop the
-            // OVERLAP*4-pixel border before writing into the global
-            // output buffer.
+            // overlap border only on sides that have a neighbouring
+            // tile; at image boundaries the network output is the
+            // only source of pixels and must not be discarded.
             let out_tile = TILE * NET_SCALE;
             let out_plane = (out_tile * out_tile) as usize;
-            let crop = OVERLAP * NET_SCALE;
-            for y in 0..(in_h * NET_SCALE) {
-                if y < crop || y >= in_h * NET_SCALE - crop {
-                    continue;
-                }
-                for x in 0..(in_w * NET_SCALE) {
-                    if x < crop || x >= in_w * NET_SCALE - crop {
-                        continue;
-                    }
+            let (crop_left, crop_top, crop_right, crop_bottom) =
+                esrgan_tile_crop(tx, ty, step, width, height);
+            let y_end = (in_h * NET_SCALE).saturating_sub(crop_bottom);
+            let x_end = (in_w * NET_SCALE).saturating_sub(crop_right);
+            for y in crop_top..y_end {
+                for x in crop_left..x_end {
                     let src = (y * out_tile + x) as usize;
                     let gx = (in_x * NET_SCALE + x) as usize;
                     let gy = (in_y * NET_SCALE + y) as usize;
-                    let dst = (gy * out_w as usize + gx) * 4;
-                    out_premul[dst] = raw[src].clamp(0.0, 1.0);
-                    out_premul[dst + 1] = raw[out_plane + src].clamp(0.0, 1.0);
-                    out_premul[dst + 2] = raw[2 * out_plane + src].clamp(0.0, 1.0);
+                    if gx < out_w as usize && gy < out_h as usize {
+                        let dst = (gy * out_w as usize + gx) * 4;
+                        out_premul[dst] = raw[src].clamp(0.0, 1.0);
+                        out_premul[dst + 1] = raw[out_plane + src].clamp(0.0, 1.0);
+                        out_premul[dst + 2] = raw[2 * out_plane + src].clamp(0.0, 1.0);
+                    }
                 }
             }
         }
@@ -712,5 +767,87 @@ mod tests {
         let err =
             upscale_with_backend(&pixels, 4, 4, 4.0, UpscaleBackend::Esrgan, None).unwrap_err();
         assert!(matches!(err, UpscaleError::BackendRuntime { .. }));
+    }
+
+    // BUG-0001 regression guard: the ESRGAN tile crop math used to
+    // unconditionally discard `OVERLAP * NET_SCALE = 32` upscaled
+    // pixels on every side of every tile, including image-boundary
+    // tiles that had no neighbour to fill those pixels. That left a
+    // 32-upscaled-pixel-wide black border on every output and
+    // produced an all-black tile for any image dimension < 16 px.
+    // The fix routes the crop through `esrgan_tile_crop`, which
+    // zeroes the crop on edges that don't have a neighbour.
+    #[test]
+    fn esrgan_tile_crop_first_tile_has_no_left_or_top_crop() {
+        // A 400-wide / 300-tall image has multiple tiles. The first
+        // one (tx=0, ty=0) must not crop on the left or top.
+        let step = ESRGAN_TILE - 2 * ESRGAN_OVERLAP;
+        let (l, t, r, b) = esrgan_tile_crop(0, 0, step, 400, 300);
+        assert_eq!(l, 0, "first tile must not crop on the left");
+        assert_eq!(t, 0, "first tile must not crop on the top");
+        // There IS a tile to the right + bottom, so cropping applies.
+        assert_eq!(r, ESRGAN_OVERLAP * ESRGAN_NET_SCALE);
+        assert_eq!(b, ESRGAN_OVERLAP * ESRGAN_NET_SCALE);
+    }
+
+    #[test]
+    fn esrgan_tile_crop_last_tile_has_no_right_or_bottom_crop() {
+        // 400×300 with step 112 ⇒ tx ∈ {0, 112, 224, 336}. The last
+        // column (336) and last row (224) must not crop on the
+        // outside edge — no neighbour to fill it.
+        let step = ESRGAN_TILE - 2 * ESRGAN_OVERLAP;
+        let (l, t, r, b) = esrgan_tile_crop(336, 224, step, 400, 300);
+        assert_eq!(r, 0, "last tile must not crop on the right");
+        assert_eq!(b, 0, "last tile must not crop on the bottom");
+        // Has tiles to the left and top, so we DO crop those.
+        assert_eq!(l, ESRGAN_OVERLAP * ESRGAN_NET_SCALE);
+        assert_eq!(t, ESRGAN_OVERLAP * ESRGAN_NET_SCALE);
+    }
+
+    #[test]
+    fn esrgan_tile_crop_tiny_image_keeps_every_pixel() {
+        // A 10×10 image fits in one tile (TILE = 128). With the bug,
+        // every side cropped → output entirely black. With the fix,
+        // the only tile is both first AND last on every axis, so
+        // crop is (0, 0, 0, 0) and every output pixel is written.
+        let step = ESRGAN_TILE - 2 * ESRGAN_OVERLAP;
+        let (l, t, r, b) = esrgan_tile_crop(0, 0, step, 10, 10);
+        assert_eq!((l, t, r, b), (0, 0, 0, 0));
+    }
+
+    #[test]
+    fn esrgan_tile_crop_middle_tile_crops_all_sides() {
+        // A middle tile in a 500×500 image has neighbours on every
+        // side and must crop on every side.
+        let step = ESRGAN_TILE - 2 * ESRGAN_OVERLAP;
+        let crop = ESRGAN_OVERLAP * ESRGAN_NET_SCALE;
+        let (l, t, r, b) = esrgan_tile_crop(step, step, step, 500, 500);
+        assert_eq!((l, t, r, b), (crop, crop, crop, crop));
+    }
+
+    #[test]
+    fn esrgan_tile_crop_single_tile_when_image_fits_in_one_step() {
+        // For width == step, the tile iteration `(0..step).step_by(step)`
+        // only yields tx=0 and `tx + step == width`, so there's no
+        // neighbouring tile to the right. The crop on left/right must
+        // be zero. Same reasoning for the vertical axis.
+        let step = ESRGAN_TILE - 2 * ESRGAN_OVERLAP;
+        let (l, t, r, b) = esrgan_tile_crop(0, 0, step, step, step);
+        assert_eq!((l, t, r, b), (0, 0, 0, 0));
+    }
+
+    #[test]
+    fn esrgan_tile_crop_image_slightly_larger_than_step_has_two_tiles() {
+        // For width == step + 1, the iteration yields tx=0 and tx=step.
+        // The first tile must crop on the right (neighbour at step);
+        // the second tile must not crop on the right (no neighbour).
+        let step = ESRGAN_TILE - 2 * ESRGAN_OVERLAP;
+        let crop = ESRGAN_OVERLAP * ESRGAN_NET_SCALE;
+        let width = step + 1;
+        let (_, _, r0, _) = esrgan_tile_crop(0, 0, step, width, 1000);
+        assert_eq!(r0, crop, "left tile must crop into neighbour");
+        let (l1, _, r1, _) = esrgan_tile_crop(step, 0, step, width, 1000);
+        assert_eq!(l1, crop, "right tile must crop into neighbour on left");
+        assert_eq!(r1, 0, "right tile must not crop on the right");
     }
 }

@@ -93,6 +93,30 @@ fn classifier_covers_every_bridge_command() {
             ),
             OperationCategory::DocumentSetting,
         ),
+        // BUG-0002 regression guard: `spot_color_remove` was being
+        // misclassified as a node `Delete` because the previous
+        // `is_delete_command` matched any `_remove` suffix. That made
+        // concurrent spot-color edits silently lose under the
+        // delete-wins rule even though the affected_nodes set is
+        // empty. Lock in the correct DocumentSetting routing.
+        (
+            Operation::new("user", "spot_color_remove", json!({}), json!({}), vec![]),
+            OperationCategory::DocumentSetting,
+        ),
+        (
+            Operation::new("user", "spot_color_upsert", json!({}), json!({}), vec![]),
+            OperationCategory::DocumentSetting,
+        ),
+        (
+            Operation::new(
+                "user",
+                "spot_color_load_catalog",
+                json!({}),
+                json!({}),
+                vec![],
+            ),
+            OperationCategory::DocumentSetting,
+        ),
         (
             Operation::new(
                 "user",

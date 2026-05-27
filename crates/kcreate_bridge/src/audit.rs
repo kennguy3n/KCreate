@@ -236,6 +236,27 @@ mod tests {
         assert!(!p.is_empty());
     }
 
+    /// Regression for Devin Review ANALYSIS_0006: when the on-disk
+    /// open fails and the singleton falls back to in-memory, the
+    /// public `audit_path()` must reflect the *effective* path
+    /// (`":memory:"`), not the intended on-disk one. The store
+    /// itself tracks this correctly in `AuditStore::path`, and the
+    /// bridge reads `store.path()` rather than caching the intended
+    /// path; this test pins both invariants so a future refactor
+    /// can't reintroduce a stale-cache regression that would mask
+    /// the in-memory fallback from debugging output.
+    #[test]
+    #[serial]
+    fn audit_path_reflects_in_memory_fallback() {
+        reset_audit_for_tests();
+        let p = audit_path();
+        assert_eq!(
+            p, ":memory:",
+            "post-reset audit_path() must surface the in-memory \
+             store rather than a stale on-disk path"
+        );
+    }
+
     #[test]
     #[serial]
     fn query_report_serialises_to_json() {

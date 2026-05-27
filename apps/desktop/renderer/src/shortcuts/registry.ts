@@ -306,6 +306,35 @@ class ShortcutStore {
     };
   }
 
+  /// Find every action whose current binding collides with the
+  /// supplied keystroke. Returns the list **excluding** `exceptId`
+  /// (so a row can ask "who else has my binding?" without listing
+  /// itself). Used by the KeyboardShortcutsPanel to surface a
+  /// collision warning inline.
+  ///
+  /// Why this exists: `useShortcuts` walks the handler map and
+  /// fires the first action whose binding matches. If two actions
+  /// share a binding, the second is unreachable. We deliberately
+  /// don't *reject* the rebind in `set()` — the user may want to
+  /// swap two actions through a transient collision, or rebind the
+  /// loser later. The collision is therefore informational, not
+  /// blocking; the panel renders a warning and lists the
+  /// conflicting actions so the user can fix it on their own
+  /// schedule.
+  findConflicts(
+    binding: ShortcutBinding,
+    exceptId?: ActionId,
+  ): ActionId[] {
+    const out: ActionId[] = [];
+    for (const id of Object.keys(this.bindings) as ActionId[]) {
+      if (id === exceptId) continue;
+      if (bindingsEqual(this.bindings[id], binding)) {
+        out.push(id);
+      }
+    }
+    return out;
+  }
+
   private persist(): void {
     if (typeof window === "undefined" || !window.localStorage) return;
     try {
@@ -357,6 +386,31 @@ export function resetShortcutStoreForTests(): void {
   storeSingleton = null;
 }
 
+/// Normalise a binding key for equality comparison. Single-character
+/// keys are folded to lower-case (so "A" === "a"), multi-character
+/// named keys ("Escape", "ArrowLeft") are case-sensitive because the
+/// DOM spec itself is. Keep this aligned with the equivalent fold in
+/// `matchesBinding` — they must agree, otherwise the panel could
+/// claim "no conflict" for a binding the dispatcher *does* match.
+function normaliseBindingKey(key: string): string {
+  return key.length === 1 ? key.toLowerCase() : key;
+}
+
+/// Two bindings are equal iff a single `KeyboardEvent` would match
+/// both. This is the contract `findConflicts` uses to surface
+/// collisions in the panel; it must agree with `matchesBinding`.
+export function bindingsEqual(
+  a: ShortcutBinding,
+  b: ShortcutBinding,
+): boolean {
+  return (
+    a.mod === b.mod &&
+    a.shift === b.shift &&
+    a.alt === b.alt &&
+    normaliseBindingKey(a.key) === normaliseBindingKey(b.key)
+  );
+}
+
 /// Match a `KeyboardEvent` against a binding. Letter keys match
 /// case-insensitively; named keys ("Escape", "Delete", "ArrowLeft",
 /// …) are case-sensitive per the DOM spec.
@@ -368,10 +422,7 @@ export function matchesBinding(
   if (mod !== binding.mod) return false;
   if (event.shiftKey !== binding.shift) return false;
   if (event.altKey !== binding.alt) return false;
-  const evKey =
-    event.key.length === 1 ? event.key.toLowerCase() : event.key;
-  const bKey = binding.key.length === 1 ? binding.key.toLowerCase() : binding.key;
-  return evKey === bKey;
+  return normaliseBindingKey(event.key) === normaliseBindingKey(binding.key);
 }
 
 /// Render a binding into a human-readable label

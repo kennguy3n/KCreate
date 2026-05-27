@@ -394,14 +394,49 @@ pub fn ensure_page_thumbnail(page_id: Uuid, max_dim_px: u32) -> Result<Thumbnail
 
 /// Process-global flag: is a pre-warm worker currently running? Set
 /// to `true` by [`prepare_thumbnails_background`] before spawning the
-/// thread and cleared by the thread itself on exit (success or
-/// panic-recovered). Guards against thread-thrash if pre-warm is
-/// kicked off repeatedly (e.g. rapid project_create+project_open in
-/// a test, or a user spam-clicking "Open Project") — additional
-/// callers are coalesced into the in-flight worker. Because the
-/// worker re-reads the workspace snapshot it sees the latest page
-/// list, so coalescing doesn't drop updates.
+/// thread and cleared by the [`PrewarmGuard`] on drop (success, error
+/// return, *or* panic unwind through the thread closure). Guards
+/// against thread-thrash if pre-warm is kicked off repeatedly (e.g.
+/// rapid project_create+project_open in a test, or a user spam-
+/// clicking "Open Project") — additional callers are coalesced into
+/// the in-flight worker. Because the worker re-reads the workspace
+/// snapshot it sees the latest page list, so coalescing doesn't drop
+/// updates.
 static PREWARM_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+
+/// RAII guard that clears [`PREWARM_IN_FLIGHT`] on drop.
+///
+/// The flag *must* be cleared even when the worker thread panics; if
+/// it weren't, the gate would stay `true` for the rest of the process
+/// lifetime and silently disable every subsequent pre-warm. A `Drop`
+/// impl is the only path Rust guarantees runs during stack unwinding
+/// — `defer`-style closures or `catch_unwind` + `AssertUnwindSafe`
+/// both have well-known footguns (closure-captured non-UnwindSafe
+/// state, double-drop on re-panic). This guard exits on three paths:
+///
+/// 1. The worker closure returns normally — the guard is dropped in
+///    the closure's tail position and `Release`-stores `false`.
+/// 2. The closure panics — Rust unwinds through the closure, the
+///    guard's `Drop` still runs, and the flag is cleared. The thread
+///    join handle's `is_err()` would report the panic, but we don't
+///    join (we return `Ok(())` immediately from
+///    `prepare_thumbnails_background`), so logging the panic falls
+///    to the spawning thread's panic hook.
+/// 3. The spawning side fails before the worker starts (workspace
+///    closed between the CAS and the snapshot, or `thread::spawn`
+///    returns `Err`) — the spawner constructs the guard and lets it
+///    drop in place, so the flag is released.
+struct PrewarmGuard;
+
+impl Drop for PrewarmGuard {
+    fn drop(&mut self) {
+        // `Release` pairs with the `Acquire` on the CAS in
+        // `prepare_thumbnails_background` so any writes the worker
+        // made (cache files, renderer state) are visible to the next
+        // pre-warm.
+        PREWARM_IN_FLIGHT.store(false, Ordering::Release);
+    }
+}
 
 /// Kick off a background thread that pre-warms every page's
 /// thumbnail. Returns immediately. Does nothing in low-resource mode.
@@ -428,24 +463,33 @@ pub fn prepare_thumbnails_background(max_dim_px: u32) -> Result<()> {
         return Ok(());
     }
     let dim = sanitize_dim(max_dim_px);
+    // From this point on we own the in-flight token. Construct the
+    // guard *before* any fallible step so every early-return path
+    // releases the flag via `Drop`.
+    let guard = PrewarmGuard;
     // Snapshot the page list under the workspace lock so the worker
     // doesn't depend on the document staying open.
     let pages = {
-        let guard = workspace_slot().lock();
-        let ws = match guard.as_ref() {
+        let wsguard = workspace_slot().lock();
+        let ws = match wsguard.as_ref() {
             Some(ws) => ws,
             None => {
-                // Drop the in-flight flag before returning so a
-                // later open_project can spawn a fresh worker.
-                PREWARM_IN_FLIGHT.store(false, Ordering::Release);
+                // `guard` drops here, releasing the in-flight flag
+                // so a later open_project can spawn a fresh worker.
+                drop(guard);
                 return Err(DocumentBridgeError::NoProject);
             }
         };
         page_ids(ws)
     };
+    // Move the guard into the worker closure. If the closure panics
+    // mid-render, Rust unwinds through it and runs `PrewarmGuard::
+    // drop`, releasing the gate. If it returns normally, the guard
+    // drops in the tail position with the same effect.
     let spawn_result = thread::Builder::new()
         .name("kcreate-thumbnail-prewarm".to_string())
         .spawn(move || {
+            let _guard = guard;
             // Tiny stagger so the renderer isn't slammed if multiple
             // pre-warm requests pile up (e.g. user spam-saves).
             thread::sleep(Duration::from_millis(50));
@@ -457,15 +501,18 @@ pub fn prepare_thumbnails_background(max_dim_px: u32) -> Result<()> {
                     log::debug!("page {page} pre-warm failed: {e}");
                 }
             }
-            // Clear the in-flight flag last so the next call can
-            // observe the worker's effects via `Acquire` on the CAS.
-            PREWARM_IN_FLIGHT.store(false, Ordering::Release);
+            // `_guard` drops here, `Release`-storing `false` so the
+            // next pre-warm CAS sees the worker's effects.
         });
     match spawn_result {
         Ok(_) => Ok(()),
         Err(e) => {
-            // Spawn failed — release the gate so a retry can succeed.
-            PREWARM_IN_FLIGHT.store(false, Ordering::Release);
+            // Spawn failed — `std::thread::Builder::spawn` drops the
+            // closure on failure, which drops the moved-in guard,
+            // which `Release`-stores `false` via `PrewarmGuard::drop`.
+            // No manual flag clear needed: the guard is the single
+            // source of truth for the gate. (See PrewarmGuard's doc
+            // comment, exit path 3.)
             Err(DocumentBridgeError::Io(std::io::Error::other(
                 e.to_string(),
             )))
@@ -867,5 +914,63 @@ mod tests {
         let b64 = encode_base64(original);
         let decoded = STANDARD.decode(b64.as_bytes()).unwrap();
         assert_eq!(decoded.as_slice(), original);
+    }
+
+    // ----- PrewarmGuard panic-safety -----------------------------------
+    //
+    // Regression for Devin Review BUG_0002: if the pre-warm worker
+    // panicked, the in-flight flag stayed `true` and silently disabled
+    // every subsequent pre-warm. The fix moves the flag-clear into an
+    // RAII guard whose `Drop` runs on every exit path — normal,
+    // explicit drop, *and* unwind. These tests pin the contract.
+
+    #[test]
+    fn prewarm_guard_clears_flag_on_normal_drop() {
+        PREWARM_IN_FLIGHT.store(true, Ordering::Release);
+        {
+            let _g = PrewarmGuard;
+        }
+        assert!(
+            !PREWARM_IN_FLIGHT.load(Ordering::Acquire),
+            "flag should be cleared after normal drop"
+        );
+    }
+
+    #[test]
+    fn prewarm_guard_clears_flag_on_panic_unwind() {
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+        PREWARM_IN_FLIGHT.store(true, Ordering::Release);
+        let outcome = catch_unwind(AssertUnwindSafe(|| {
+            let _g = PrewarmGuard;
+            panic!("simulated render panic");
+        }));
+        assert!(outcome.is_err(), "test harness should have caught panic");
+        assert!(
+            !PREWARM_IN_FLIGHT.load(Ordering::Acquire),
+            "flag must be cleared even when the guarded scope unwinds"
+        );
+    }
+
+    #[test]
+    fn prewarm_guard_clears_flag_when_thread_closure_panics() {
+        // Verifies the worker-thread path end-to-end: spawning a
+        // thread whose closure captures a PrewarmGuard and panics
+        // mid-run must still release the global gate by the time the
+        // join handle returns. This is the exact failure mode BUG_0002
+        // describes.
+        PREWARM_IN_FLIGHT.store(true, Ordering::Release);
+        let handle = thread::spawn(move || {
+            let _g = PrewarmGuard;
+            panic!("thread-level render panic");
+        });
+        let join = handle.join();
+        assert!(
+            join.is_err(),
+            "thread should have propagated the panic to join()"
+        );
+        assert!(
+            !PREWARM_IN_FLIGHT.load(Ordering::Acquire),
+            "flag must be cleared after the panicking worker unwinds"
+        );
     }
 }

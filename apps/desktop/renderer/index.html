@@ -35,6 +35,13 @@
            callout cards (McpSettingsPanel "MCP off" notice).
            Replaces `${colors.danger}44`. */
         --kc-danger-border: rgba(220, 38, 38, 0.27);
+        /* High-alpha danger pill used as a translucent overlay so
+           the underlying canvas / prototype content bleeds through
+           (PrototypePlayer error toast). Intentionally not the same
+           as `--kc-danger`, which is fully opaque — the overlay
+           contract requires showing what's behind the pill so the
+           user can still read the canvas while the error is up. */
+        --kc-danger-overlay: rgba(220, 38, 38, 0.85);
         --kc-warn: #D97706;
         --kc-warn-bg: #FEF3C7;
         --kc-warn-bg-soft: rgba(217, 119, 6, 0.12);
@@ -73,6 +80,10 @@
         /* Dark-mode danger border uses the dark `--kc-danger` hue
            (#EF4444) at a comparable alpha to the light variant. */
         --kc-danger-border: rgba(239, 68, 68, 0.40);
+        /* Dark-mode error pill overlay: same 0.85 alpha contract as
+           light mode, swapped to the brighter `#EF4444` hue so the
+           pill stays legible against the darker canvas substrate. */
+        --kc-danger-overlay: rgba(239, 68, 68, 0.85);
         --kc-warn: #FBBF24;
         --kc-warn-bg: rgba(251, 191, 36, 0.18);
         --kc-warn-bg-soft: rgba(251, 191, 36, 0.10);

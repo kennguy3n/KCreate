@@ -51,6 +51,15 @@ export const colors = {
   /// (McpSettingsPanel "MCP off" notice). Same indirection
   /// rationale as `accentBgSoft`.
   dangerBorder: "var(--kc-danger-border)",
+  /// High-alpha (0.85) translucent danger overlay for floating
+  /// error toasts where the underlying content must remain
+  /// partly visible — currently the PrototypePlayer error pill.
+  /// **Do not** substitute `colors.danger` here: `danger` is
+  /// fully opaque, which hides the prototype content the user
+  /// is trying to debug. The 0.85 alpha is baked into the CSS
+  /// variable so dark mode adjusts the underlying hue without
+  /// per-component changes.
+  dangerOverlay: "var(--kc-danger-overlay)",
   /// Warning accent (preflight warnings, plugin permission badges).
   warn: "var(--kc-warn)",
   warnBg: "var(--kc-warn-bg)",

@@ -435,11 +435,17 @@ const loadingPillStyle: React.CSSProperties = {
   fontSize: 10,
 };
 
+// The error pill is a *translucent* overlay — the prototype content
+// must remain partly visible behind it so the user can still see
+// what triggered the error. `dangerOverlay` carries the 0.85 alpha
+// in the CSS variable; using `colors.danger` here would render a
+// fully-opaque block and lose the design intent. The token also
+// re-balances for dark mode (brighter danger hue at the same alpha).
 const errorPillStyle: React.CSSProperties = {
   position: "absolute",
   bottom: 8,
   right: 8,
-  background: colors.danger,
+  background: colors.dangerOverlay,
   color: colors.textInverse,
   padding: "4px 10px",
   borderRadius: radius.pill,

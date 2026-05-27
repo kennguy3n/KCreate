@@ -2866,7 +2866,18 @@ if (!app.requestSingleInstanceLock()) {
 
     app.on("activate", () => {
       if (BrowserWindow.getAllWindows().length === 0) {
-        createWindow();
+        // Mirror the cold-start flush wiring above so any deeplinks
+        // that arrived while every window was closed (macOS: user
+        // closed the last window, then clicked a `kcreate://` link
+        // in KChat Desktop; the `open-url` listener buffered the
+        // URL into `pendingDeeplinks`) are drained as soon as the
+        // re-created renderer finishes loading. Without this hook
+        // the buffered URLs sit in memory forever and the share
+        // invite is silently lost.
+        const reopened = createWindow();
+        reopened.webContents.once("did-finish-load", () => {
+          flushPendingDeeplinks();
+        });
       }
     });
   });

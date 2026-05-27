@@ -111,7 +111,6 @@ export async function ed25519Sign(data, secretKeyRaw) {
     "hex",
   );
   const pkcs8 = Buffer.concat([PREFIX, secretKeyRaw]);
-  const { createPrivateKey, sign } = await import("node:crypto");
   const key = createPrivateKey({
     key: pkcs8,
     format: "der",
@@ -131,7 +130,6 @@ export async function ed25519PublicKey(secretKeyRaw) {
     "hex",
   );
   const pkcs8 = Buffer.concat([PREFIX, secretKeyRaw]);
-  const { createPrivateKey, createPublicKey } = await import("node:crypto");
   const priv = createPrivateKey({ key: pkcs8, format: "der", type: "pkcs8" });
   const pub = createPublicKey(priv);
   const der = pub.export({ format: "der", type: "spki" });

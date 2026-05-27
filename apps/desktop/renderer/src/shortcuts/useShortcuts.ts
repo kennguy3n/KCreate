@@ -19,7 +19,16 @@ export type ShortcutHandlers = Partial<
 
 /// Subscribe to the live snapshot of bindings. Use this in the
 /// shortcut panel and anywhere you need to render bindings live.
-export function useShortcutBindings(): Record<ActionId, ShortcutBinding> {
+///
+/// The returned object is the store's frozen snapshot — same
+/// reference across renders unless a real mutation happened. This
+/// is critical for `useSyncExternalStore`'s reference-equality
+/// contract (`Object.is` between renders), and it also lets the
+/// hook be safely passed to memoised children without invalidating
+/// their props on every parent render.
+export function useShortcutBindings(): Readonly<
+  Record<ActionId, ShortcutBinding>
+> {
   const store = shortcutStore();
   return useSyncExternalStore(
     (listener) => store.subscribe(listener),

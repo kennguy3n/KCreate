@@ -48,6 +48,15 @@ export type ToolId = "select" | "rect" | "ellipse" | "line" | "text";
 const CANVAS_WIDTH = 1024;
 const CANVAS_HEIGHT = 640;
 
+// Envelope header prefixed to the OS clipboard payload by `handleCopy`
+// and stripped by `handlePaste`. Lets the paste path distinguish a
+// KCreate node payload from arbitrary text the user might already
+// have on the clipboard (the header is plain ASCII so a stray paste
+// into a plain-text editor still produces a readable JSON document).
+// Kept at module scope so it isn't recreated on every render — the
+// component body only ever reads it.
+const CLIPBOARD_ENVELOPE_HEADER = "kcreate:clipboard/v1\n";
+
 const DEFAULT_VIEWPORT: ViewportState = { panX: 0, panY: 0, zoom: 1 };
 
 /// Snap threshold in world units. 6 px @ zoom=1 keeps snaps tight
@@ -634,9 +643,9 @@ export function EditorPage({
   //
   // Copy:   serialise the current selection through the Rust bridge
   //         (Page/Artboard ids are filtered out defensively), wrap the
-  //         result in a `kcreate:clipboard/v1\n` envelope so paste can
-  //         distinguish a KCreate payload from arbitrary text the user
-  //         may have on the OS clipboard, then push to
+  //         result in the `CLIPBOARD_ENVELOPE_HEADER` envelope so
+  //         paste can distinguish a KCreate payload from arbitrary
+  //         text the user may have on the OS clipboard, then push to
   //         `navigator.clipboard`.
   //
   // Paste:  read the OS clipboard, validate the envelope, infer the
@@ -648,7 +657,6 @@ export function EditorPage({
   //         tree / selection so the user sees + can immediately drag
   //         the pasted nodes.
   // ------------------------------------------------------------------
-  const CLIPBOARD_ENVELOPE_HEADER = "kcreate:clipboard/v1\n";
 
   const handleCopy = useCallback(async () => {
     if (selectedIds.length === 0) return;

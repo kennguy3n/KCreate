@@ -2353,6 +2353,19 @@ pub fn document_clipboard_paste(
         .map_err(map_doc_err)
 }
 
+/// Phase 6 Tasks 27-28: set or clear the layer-colour tag on a node.
+/// `color = None` (or an empty/whitespace string) clears the tag. The
+/// new `version` is returned as `f64` because napi's BigInt path is
+/// noisy on the renderer side and `Node::version` stays well below
+/// 2^53 in practice.
+#[napi]
+pub fn document_set_layer_color(node_id: String, color: Option<String>) -> NapiResult<f64> {
+    let id = parse_uuid(&node_id)?;
+    document::document_set_layer_color(id, color)
+        .map(|v| v as f64)
+        .map_err(map_doc_err)
+}
+
 // ---------------------------------------------------------------------------
 // Phase 2 — preflight, icon pack, parallel batch, AI model packs,
 // plugin sandbox, MCP permissions, screenshot-to-layout.

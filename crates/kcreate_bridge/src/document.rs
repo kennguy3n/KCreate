@@ -1332,6 +1332,28 @@ struct ApplyPatchSnapshot {
     spot_color_library: Option<kcreate_core::color::SpotColorLibrary>,
     text_frame: HashMap<Uuid, kcreate_core::node::TextFrameOptions>,
     opentype: HashMap<Uuid, kcreate_core::node::OpenTypeFeatures>,
+    // Phase 6 Tasks 27-28: per-node prior layer-colour tag (None =
+    // untagged). Captured before any group-level inverse patch runs
+    // so we can roll the tag back if a later patch in the group
+    // fails.
+    layer_color: HashMap<Uuid, Option<String>>,
+    // Phase 6 Tasks 25-26 (Devin Review ANALYSIS_0005 follow-up):
+    // per-clipboard_paste-op snapshot of the subtree's presence in
+    // the graph at capture time. Keyed by `new_root_id`.
+    //   * `was_present = true`  → we're rolling back an UNDO that
+    //     removed the subtree; restore must re-insert from `subtree`.
+    //   * `was_present = false` → we're rolling back a REDO that
+    //     inserted the subtree; restore must remove `new_root_id`
+    //     (and its descendants, via DocumentGraph::remove_node).
+    clipboard_paste: HashMap<Uuid, ClipboardPasteSnapshot>,
+}
+
+/// Pre-loop state of a single `clipboard_paste` op's subtree so the
+/// atomic-rollback path can put the graph back regardless of which
+/// direction the failed patch was running in.
+struct ClipboardPasteSnapshot {
+    was_present: bool,
+    subtree: Vec<kcreate_core::node::Node>,
 }
 
 impl ApplyPatchSnapshot {
@@ -1345,6 +1367,8 @@ impl ApplyPatchSnapshot {
             spot_color_library: None,
             text_frame: HashMap::new(),
             opentype: HashMap::new(),
+            layer_color: HashMap::new(),
+            clipboard_paste: HashMap::new(),
         };
         for op in ops {
             match op.command.as_str() {
@@ -1382,6 +1406,49 @@ impl ApplyPatchSnapshot {
                         }
                     }
                 }
+                "layer_color_set" => {
+                    if let Some(id) = op.affected_nodes.first().copied() {
+                        if let std::collections::hash_map::Entry::Vacant(slot) =
+                            snap.layer_color.entry(id)
+                        {
+                            if let Some(node) = ws.project.document.get_node(id) {
+                                let prior = node
+                                    .metadata
+                                    .get(LAYER_COLOR_METADATA_KEY)
+                                    .and_then(|v| v.as_str())
+                                    .map(str::to_owned);
+                                slot.insert(prior);
+                            }
+                        }
+                    }
+                }
+                "clipboard_paste" => {
+                    // The `new_root_id` lives in affected_nodes[0]
+                    // (set by document_clipboard_paste) and is also
+                    // the key into the rollback map.
+                    let Some(root_id) = op.affected_nodes.first().copied() else {
+                        continue;
+                    };
+                    if let std::collections::hash_map::Entry::Vacant(slot) =
+                        snap.clipboard_paste.entry(root_id)
+                    {
+                        let was_present = ws.project.document.get_node(root_id).is_some();
+                        // If the root is present we're about to run
+                        // an inverse patch (undo); capture the full
+                        // subtree so restore can re-insert in
+                        // parent-first order. If it's absent we're
+                        // about to redo and only need the marker.
+                        let subtree = if was_present {
+                            collect_subtree_parent_first(&ws.project.document, root_id)
+                        } else {
+                            Vec::new()
+                        };
+                        slot.insert(ClipboardPasteSnapshot {
+                            was_present,
+                            subtree,
+                        });
+                    }
+                }
                 _ => {}
             }
         }
@@ -1407,7 +1474,70 @@ impl ApplyPatchSnapshot {
                 node.set_opentype_features(&feats);
             }
         }
+        for (id, prior_color) in self.layer_color {
+            if let Some(node) = ws.project.document.get_node_mut(id) {
+                match prior_color {
+                    Some(s) => {
+                        node.metadata.insert(
+                            LAYER_COLOR_METADATA_KEY.to_string(),
+                            serde_json::Value::String(s),
+                        );
+                    }
+                    None => {
+                        node.metadata.remove(LAYER_COLOR_METADATA_KEY);
+                    }
+                }
+            }
+        }
+        for (root_id, paste_snap) in self.clipboard_paste {
+            let currently_present = ws.project.document.get_node(root_id).is_some();
+            if paste_snap.was_present && !currently_present {
+                // We snapshotted while the subtree was in the graph
+                // and it's gone now → the failed group ran an undo
+                // that removed it. Re-insert in the original
+                // parent-first order so each child finds its parent
+                // already attached.
+                for node in paste_snap.subtree {
+                    // We can only log + drop the error: restore is
+                    // best-effort and the alternative is to leave
+                    // the workspace partially rolled back.
+                    let _ = ws.project.document.insert_node(node);
+                }
+            } else if !paste_snap.was_present && currently_present {
+                // The subtree wasn't in the graph at capture time
+                // and now it is → the failed group ran a redo that
+                // inserted it. Remove root + descendants.
+                ws.project.document.remove_node(root_id);
+            }
+        }
     }
+}
+
+/// Walk the subtree rooted at `root_id` in parent-first order
+/// (i.e. each child appears after its parent in the returned vec).
+/// Used by [`ApplyPatchSnapshot::capture`] so the matching restore
+/// path can re-insert via `DocumentGraph::insert_node` without
+/// hitting a `NodeNotFound` on a child whose parent hasn't been
+/// re-attached yet.
+fn collect_subtree_parent_first(
+    doc: &kcreate_core::document::DocumentGraph,
+    root_id: Uuid,
+) -> Vec<kcreate_core::node::Node> {
+    let mut out: Vec<kcreate_core::node::Node> = Vec::new();
+    let mut stack: Vec<Uuid> = vec![root_id];
+    while let Some(id) = stack.pop() {
+        let Some(node) = doc.get_node(id) else {
+            continue;
+        };
+        // Push children in reverse so the LIFO stack pops them in
+        // their natural left-to-right order — this preserves the
+        // sibling layout as it appeared at capture time.
+        for child in node.children.iter().rev() {
+            stack.push(*child);
+        }
+        out.push(node.clone());
+    }
+    out
 }
 
 /// One step of group-aware undo. Consumes the entire contiguous run
@@ -1633,6 +1763,87 @@ fn apply_patch(ws: &mut Workspace, op: &Operation, patch: &serde_json::Value) ->
             node.set_opentype_features(&features);
             Ok(())
         }
+        // Phase 6 Tasks 27-28: layer-colour tag. `patch` is either a
+        // JSON string (the colour to install) or `null` (clear the
+        // tag). The matching `document_set_layer_color` packs both
+        // before and after patches in this shape, so undo and redo
+        // both go through this arm.
+        "layer_color_set" => {
+            let id = op.affected_nodes.first().copied().ok_or_else(|| {
+                DocumentBridgeError::InvalidArgument {
+                    argument: "affected_nodes".into(),
+                    value: format!("layer_color_set operation {} has no affected node", op.id),
+                }
+            })?;
+            let node = ws
+                .project
+                .document
+                .get_node_mut(id)
+                .ok_or(DocumentBridgeError::NodeNotFound(id))?;
+            match patch {
+                serde_json::Value::Null => {
+                    node.metadata.remove(LAYER_COLOR_METADATA_KEY);
+                }
+                serde_json::Value::String(s) => {
+                    node.metadata.insert(
+                        LAYER_COLOR_METADATA_KEY.to_string(),
+                        serde_json::Value::String(s.clone()),
+                    );
+                }
+                other => {
+                    return Err(DocumentBridgeError::InvalidArgument {
+                        argument: "layer_color patch".into(),
+                        value: format!("expected string or null, got {other}"),
+                    });
+                }
+            }
+            node.version += 1;
+            node.updated_at = Utc::now();
+            Ok(())
+        }
+        // Phase 6 Tasks 25-26 (Devin Review ANALYSIS_0005 follow-up):
+        // graph-mutating undo / redo of clipboard paste. The matching
+        // `document_clipboard_paste` records:
+        //   * before_patch = `{ "new_root_id": <uuid> }`
+        //   * after_patch  = `{ "subtree": [Node, ...] }`
+        // Undo (before_patch) removes the inserted root, which
+        // cascades through descendants via `DocumentGraph::remove_node`.
+        // Redo (after_patch) re-inserts every node in parent-first
+        // order so each insert finds its parent already present.
+        "clipboard_paste" => match patch {
+            // Undo direction.
+            serde_json::Value::Object(map) if map.contains_key("new_root_id") => {
+                let id = map
+                    .get("new_root_id")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| Uuid::parse_str(s).ok())
+                    .ok_or_else(|| DocumentBridgeError::InvalidArgument {
+                        argument: "clipboard_paste before_patch".into(),
+                        value: format!("missing or invalid new_root_id in {patch}"),
+                    })?;
+                // remove_node returning None means the node is
+                // already gone — treat as success so an interrupted
+                // group can still cleanly roll back.
+                ws.project.document.remove_node(id);
+                Ok(())
+            }
+            // Redo direction.
+            serde_json::Value::Object(map) if map.contains_key("subtree") => {
+                let subtree: Vec<kcreate_core::node::Node> = serde_json::from_value(
+                    map.get("subtree")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null),
+                )?;
+                for node in subtree {
+                    ws.project.document.insert_node(node)?;
+                }
+                Ok(())
+            }
+            other => Err(DocumentBridgeError::InvalidArgument {
+                argument: "clipboard_paste patch".into(),
+                value: format!("expected object with new_root_id or subtree, got {other}"),
+            }),
+        },
         _ => Ok(()),
     }
 }
@@ -2925,9 +3136,15 @@ pub fn document_clipboard_copy(node_ids: &[Uuid]) -> Result<String> {
 /// of every subtree is offset by (`offset_x`, `offset_y`) so paste
 /// at the cursor doesn't perfectly overlap the original.
 ///
-/// Records a `clipboard_paste` operation per subtree so undo unwinds
-/// the paste in one user-visible step (via the existing group-undo
-/// semantics).
+/// Records one `clipboard_paste` operation per subtree, but ALL the
+/// operations from a single paste call share the same `group_id`
+/// (`paste_group_id` below). The `OperationLog::undo_group` /
+/// `redo_group` helpers — which back `document_undo_group()` and
+/// `document_redo_group()` on the bridge — walk a contiguous run of
+/// ops that share a group, so the user sees the entire multi-subtree
+/// paste collapse into a single Ctrl+Z, matching the comment's intent.
+/// Single-op `undo()` still works for callers that want fine-grained
+/// stepping (the grouping is opt-in at consume time, not push time).
 pub fn document_clipboard_paste(
     payload: &str,
     target_parent_id: Option<Uuid>,
@@ -2952,6 +3169,10 @@ pub fn document_clipboard_paste(
     }
     let mut new_root_ids = Vec::with_capacity(parsed.subtrees.len());
     let now = Utc::now();
+    // One group per paste call — every subtree's `clipboard_paste`
+    // op is tagged with the same id so undo_group consumes the
+    // whole paste atomically.
+    let paste_group_id = Uuid::new_v4();
     for subtree in parsed.subtrees {
         let Some(_root) = subtree.nodes.first() else {
             continue;
@@ -2965,6 +3186,11 @@ pub fn document_clipboard_paste(
         }
         let old_root_id = subtree.nodes[0].id;
         let new_root_id = id_map[&old_root_id];
+        // Capture the inserted nodes in topological order so the
+        // redo arm can re-insert them parent-first (matches the
+        // shape produced by `document_clipboard_copy`).
+        let mut inserted_subtree: Vec<kcreate_core::node::Node> =
+            Vec::with_capacity(subtree.nodes.len());
         for (idx, original) in subtree.nodes.into_iter().enumerate() {
             let old_id = original.id;
             let mut copy = original;
@@ -2986,22 +3212,28 @@ pub fn document_clipboard_paste(
                 copy.bounds.x += offset_x;
                 copy.bounds.y += offset_y;
             }
-            ws.project.document.insert_node(copy)?;
+            ws.project.document.insert_node(copy.clone())?;
+            inserted_subtree.push(copy);
         }
-        let snapshot = ws
-            .project
-            .document
-            .get_node(new_root_id)
-            .map_or(serde_json::Value::Null, |n| {
-                serde_json::to_value(n).unwrap_or(serde_json::Value::Null)
-            });
+        // `after_patch` carries the full inserted subtree in
+        // parent-first order so the apply_patch redo arm can
+        // re-insert every node in the same order without re-running
+        // copy's id-remapping logic.  `before_patch` is a marker
+        // pointing at the new root id — the undo arm calls
+        // `remove_node(new_root_id)` which cascades through
+        // descendants, so the marker is sufficient.
+        let before_patch = serde_json::json!({ "new_root_id": new_root_id });
+        let after_patch = serde_json::json!({
+            "subtree": inserted_subtree,
+        });
         let op = Operation::new(
             "user",
             "clipboard_paste",
-            serde_json::json!({ "target_parent_id": target_parent_id }),
-            snapshot,
+            before_patch,
+            after_patch,
             vec![new_root_id],
-        );
+        )
+        .with_group(paste_group_id);
         ws.project.execute_operation(op);
         new_root_ids.push(new_root_id);
     }
@@ -3009,6 +3241,99 @@ pub fn document_clipboard_paste(
     let _ = sync_scene_locked(&mut guard);
     drop(guard);
     Ok(new_root_ids)
+}
+
+// -----------------------------------------------------------------------------
+// Phase 6 Tasks 27-28: layer colour tagging.
+//
+// The layer panel exposes a small palette ("red", "orange", "yellow",
+// "green", "blue", "purple", "gray") that the user can attach to a
+// node for visual grouping in the panel. The tag lives in
+// `node.metadata["layerColor"]` so it survives save / reload and
+// participates in the operation log like any other property edit.
+//
+// Setting `colour = None` removes the metadata key (a tagged layer
+// becomes untagged), which keeps the JSON payload lean for the common
+// case of untagged nodes.
+// -----------------------------------------------------------------------------
+
+/// Public metadata key for the renderer-side layer colour tag. Used
+/// by `document_set_layer_color` here and consumed by the LayerPanel
+/// in TypeScript through `NodeInfo.metadata.layerColor`.
+pub const LAYER_COLOR_METADATA_KEY: &str = "layerColor";
+
+/// Set or clear the layer colour tag on `node_id`. Returns the new
+/// `version` so the renderer can key effects on `[id, version]` to
+/// stay in lockstep with collab and undo/redo.
+///
+/// The tag is a free-form lowercase string the renderer interprets;
+/// no validation here on the Rust side beyond rejecting strings that
+/// would be JSON-illegal (empty / whitespace-only). The bridge is the
+/// wrong layer to enforce a closed palette — the LayerPanel owns the
+/// rendering and the migration path if we ever ship more swatches.
+pub fn document_set_layer_color(node_id: Uuid, color: Option<String>) -> Result<u64> {
+    let mut guard = slot().lock();
+    let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
+    let before = ws
+        .project
+        .document
+        .get_node(node_id)
+        .map(|n| n.metadata.get(LAYER_COLOR_METADATA_KEY).cloned())
+        .ok_or(DocumentBridgeError::NodeNotFound(node_id))?;
+    let new_color = match color.as_deref().map(str::trim) {
+        Some("") | None => None,
+        Some(s) => Some(s.to_lowercase()),
+    };
+    let new_version = {
+        let node = ws
+            .project
+            .document
+            .get_node_mut(node_id)
+            .ok_or(DocumentBridgeError::NodeNotFound(node_id))?;
+        match &new_color {
+            Some(s) => {
+                node.metadata.insert(
+                    LAYER_COLOR_METADATA_KEY.to_string(),
+                    serde_json::Value::String(s.clone()),
+                );
+            }
+            None => {
+                node.metadata.remove(LAYER_COLOR_METADATA_KEY);
+            }
+        }
+        node.version += 1;
+        node.updated_at = Utc::now();
+        node.version
+    };
+    let after = ws
+        .project
+        .document
+        .get_node(node_id)
+        .and_then(|n| n.metadata.get(LAYER_COLOR_METADATA_KEY).cloned());
+    // before/after patches are themselves an Option<JSON string> —
+    // `null` for the untagged state, the colour string otherwise. The
+    // matching arm in `apply_patch` rewrites the metadata key based on
+    // that shape, so undo restores the prior tag (or removes it) and
+    // redo re-applies the new tag.
+    let before_patch = match &before {
+        Some(v) => v.clone(),
+        None => serde_json::Value::Null,
+    };
+    let after_patch = match &after {
+        Some(v) => v.clone(),
+        None => serde_json::Value::Null,
+    };
+    let op = Operation::new(
+        "user",
+        "layer_color_set",
+        before_patch,
+        after_patch,
+        vec![node_id],
+    );
+    ws.project.execute_operation(op);
+    ws.project.modified_at = Utc::now();
+    let _ = sync_scene_locked(&mut guard);
+    Ok(new_version)
 }
 
 // -----------------------------------------------------------------------------
@@ -8818,6 +9143,118 @@ mod tests {
         let err = document_clipboard_paste(&payload, Some(bogus_parent), 0.0, 0.0)
             .expect_err("must reject unknown parent");
         assert!(matches!(err, DocumentBridgeError::NodeNotFound(id) if id == bogus_parent));
+        project_close();
+    }
+
+    #[test]
+    #[serial]
+    fn set_layer_color_round_trip_persists_in_metadata_and_undoes() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("color-tag", dir.path()).expect("create");
+        let ab = artboard_create(None, "Page".into(), 800.0, 600.0).expect("artboard");
+        let rect = document_create_node("VectorLayer", Some(ab), &CreateNodeProps::default())
+            .expect("rect");
+
+        // Set → metadata["layerColor"] = "blue", version bumps.
+        let v0 = document_set_layer_color(rect, Some("Blue".into())).expect("set");
+        let tree = document_get_tree().expect("tree");
+        let node = tree.iter().find(|n| n.id == rect).expect("present");
+        let color = node
+            .metadata
+            .get(LAYER_COLOR_METADATA_KEY)
+            .and_then(|v| v.as_str());
+        assert_eq!(color, Some("blue"), "tag is lower-cased");
+        assert!(v0 >= 1, "version bumped on first set");
+
+        // Clear (empty string) → metadata key removed.
+        document_set_layer_color(rect, Some("   ".into())).expect("clear via whitespace");
+        let tree = document_get_tree().expect("tree");
+        let node = tree.iter().find(|n| n.id == rect).expect("present");
+        assert!(
+            !node.metadata.contains_key(LAYER_COLOR_METADATA_KEY),
+            "empty / whitespace string removes the tag",
+        );
+
+        // Undo restores the prior tag.
+        let undone = document_undo().expect("undo").expect("op present");
+        assert_eq!(undone.affected_nodes, vec![rect]);
+        let tree = document_get_tree().expect("tree");
+        let node = tree.iter().find(|n| n.id == rect).expect("present");
+        let color = node
+            .metadata
+            .get(LAYER_COLOR_METADATA_KEY)
+            .and_then(|v| v.as_str());
+        assert_eq!(color, Some("blue"), "undo restored the previous tag");
+
+        project_close();
+    }
+
+    #[test]
+    #[serial]
+    fn set_layer_color_rejects_unknown_node() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("color-tag-bad", dir.path()).expect("create");
+        let _ab = artboard_create(None, "Page".into(), 800.0, 600.0).expect("artboard");
+        let bogus = Uuid::new_v4();
+        let err = document_set_layer_color(bogus, Some("red".into()))
+            .expect_err("must reject unknown node");
+        assert!(matches!(err, DocumentBridgeError::NodeNotFound(id) if id == bogus));
+        project_close();
+    }
+
+    #[test]
+    #[serial]
+    fn clipboard_paste_multi_subtree_undoes_as_single_group() {
+        // Devin Review ANALYSIS_0005 regression guard. A multi-subtree
+        // paste must collapse into a single user-visible undo because
+        // every subtree's clipboard_paste op shares one `group_id`.
+        // `document_undo` (single-op) still steps once per subtree,
+        // so we cover both shapes to nail the contract.
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("clip-grouped-undo", dir.path()).expect("create");
+        let ab = artboard_create(None, "Page".into(), 800.0, 600.0).expect("artboard");
+        // Copy three sibling rectangles in one go so the payload has
+        // three subtrees (the canonical motivation for grouping).
+        let r1 =
+            document_create_node("VectorLayer", Some(ab), &CreateNodeProps::default()).expect("r1");
+        let r2 =
+            document_create_node("VectorLayer", Some(ab), &CreateNodeProps::default()).expect("r2");
+        let r3 =
+            document_create_node("VectorLayer", Some(ab), &CreateNodeProps::default()).expect("r3");
+        let payload = document_clipboard_copy(&[r1, r2, r3]).expect("copy");
+
+        // Paste under the same artboard; expect three new ids.
+        let pasted = document_clipboard_paste(&payload, Some(ab), 5.0, 5.0).expect("paste");
+        assert_eq!(pasted.len(), 3, "three subtrees → three new roots");
+        let tree_after_paste = document_get_tree().expect("tree");
+        // Three originals + three pastes + 1 artboard + 1 root.
+        let pasted_present: usize = pasted
+            .iter()
+            .filter(|id| tree_after_paste.iter().any(|n| n.id == **id))
+            .count();
+        assert_eq!(pasted_present, 3, "all three pastes are in the tree");
+
+        // Single Ctrl+Z via `document_undo_group` removes ALL THREE
+        // paste operations atomically — the group_id collapses them.
+        let outcome = document_undo_group()
+            .expect("undo group")
+            .expect("op present");
+        assert_eq!(
+            outcome.affected_nodes.len(),
+            3,
+            "group undo reports every affected node",
+        );
+        let tree_after_undo = document_get_tree().expect("tree");
+        for id in &pasted {
+            assert!(
+                !tree_after_undo.iter().any(|n| n.id == *id),
+                "paste {id} removed by group undo",
+            );
+        }
+
         project_close();
     }
 

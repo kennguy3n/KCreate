@@ -184,17 +184,34 @@ export const ACTION_META: Record<ActionId, ActionMeta> = {
 
 const STORAGE_KEY = "kcreate.shortcuts.v1";
 
-type Listener = (bindings: Record<ActionId, ShortcutBinding>) => void;
+type Listener = (
+  bindings: Readonly<Record<ActionId, ShortcutBinding>>,
+) => void;
 
 /// Singleton in-process binding store. Loaded from localStorage on
 /// first access; mutations write through synchronously so a reload
 /// preserves the user's bindings.
+///
+/// React-store contract: `snapshot()` is consumed by
+/// `useSyncExternalStore`, which calls it on every render and
+/// compares the returned value against the previous snapshot via
+/// `Object.is`. Any new reference makes React think the store
+/// changed, which schedules another render, which calls
+/// `snapshot()` again, which… loops. The store therefore holds a
+/// single frozen `bindings` object and only swaps the reference
+/// when an actual mutation happens. Read paths return that frozen
+/// reference directly — never a spread copy.
 class ShortcutStore {
-  private bindings: Record<ActionId, ShortcutBinding>;
+  private bindings: Readonly<Record<ActionId, ShortcutBinding>>;
   private readonly listeners = new Set<Listener>();
 
   constructor() {
-    this.bindings = { ...DEFAULT_BINDINGS };
+    // Assemble the merged binding map as a mutable local, then
+    // freeze it once and assign — the field itself is immutable
+    // from this point onwards, which guarantees that any caller
+    // who holds onto a snapshot can't mutate the store from
+    // under us.
+    const merged: Record<ActionId, ShortcutBinding> = { ...DEFAULT_BINDINGS };
     if (typeof window !== "undefined" && window.localStorage) {
       try {
         const raw = window.localStorage.getItem(STORAGE_KEY);
@@ -216,7 +233,7 @@ class ShortcutStore {
               typeof b.alt === "boolean" &&
               id in DEFAULT_BINDINGS
             ) {
-              this.bindings[id] = b;
+              merged[id] = b;
             }
           }
         }
@@ -224,12 +241,17 @@ class ShortcutStore {
         // Ignore: a malformed entry falls back to defaults.
       }
     }
+    this.bindings = Object.freeze(merged);
   }
 
-  /// Get a snapshot of the current bindings. The returned object is
-  /// a copy so callers may mutate it without affecting the store.
-  snapshot(): Record<ActionId, ShortcutBinding> {
-    return { ...this.bindings };
+  /// Stable, frozen snapshot of the current bindings. The reference
+  /// only changes when a mutation (`set` / `resetOne` / `resetAll`)
+  /// actually rewrites the store, so `useSyncExternalStore` can
+  /// compare snapshots with `Object.is` without thrashing. The
+  /// returned object is frozen; callers who want a mutable copy
+  /// must spread on their side.
+  snapshot(): Readonly<Record<ActionId, ShortcutBinding>> {
+    return this.bindings;
   }
 
   /// Look up the binding for an action.
@@ -240,7 +262,7 @@ class ShortcutStore {
   /// Rebind a single action. Writes through to localStorage and
   /// notifies subscribers synchronously.
   set(id: ActionId, binding: ShortcutBinding): void {
-    this.bindings = { ...this.bindings, [id]: binding };
+    this.bindings = Object.freeze({ ...this.bindings, [id]: binding });
     this.persist();
     this.fire();
   }
@@ -252,7 +274,7 @@ class ShortcutStore {
 
   /// Reset every action to its shipped default.
   resetAll(): void {
-    this.bindings = { ...DEFAULT_BINDINGS };
+    this.bindings = Object.freeze({ ...DEFAULT_BINDINGS });
     this.persist();
     this.fire();
   }

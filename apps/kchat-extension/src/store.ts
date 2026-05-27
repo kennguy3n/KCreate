@@ -226,8 +226,17 @@ export async function openInviteInKCreate(invite: ShareInvite): Promise<void> {
  */
 export function buildJoinDeeplink(invite: ShareInvite): string {
   const json = JSON.stringify(invite);
-  const b64 = Buffer.from(json, "utf8")
-    .toString("base64")
+  // Browser-compatible base64url. The extension bundle is built with
+  // `esbuild platform: "browser"` and runs inside the host's
+  // procedure-registry sandbox — `Buffer` is not in scope there. We
+  // build a Latin-1 binary string from the UTF-8 bytes before
+  // calling `btoa` because `btoa` itself rejects code points > 0xFF.
+  const bytes = new TextEncoder().encode(json);
+  let binary = "";
+  for (const b of bytes) {
+    binary += String.fromCharCode(b);
+  }
+  const b64 = btoa(binary)
     .replaceAll("+", "-")
     .replaceAll("/", "_")
     .replace(/=+$/u, "");

@@ -107,7 +107,14 @@ test("renders project name + owner + a kcreate://join deeplink", async () => {
 
   const container = document.getElementById("root");
   const root = ReactDOMClient.createRoot(container);
-  root.render(React.createElement(InviteCard, { invite: INVITE }));
+  // Disable the freshness tick interval so node:test isn't kept
+  // alive by a 1s timer after the assertions run.
+  root.render(
+    React.createElement(InviteCard, {
+      invite: INVITE,
+      freshnessTickIntervalMs: Infinity,
+    }),
+  );
   await flushReact();
 
   const text = container.textContent ?? "";
@@ -116,6 +123,7 @@ test("renders project name + owner + a kcreate://join deeplink", async () => {
   const link = container.querySelector("[data-testid=\"kcreate-invite-link\"]");
   assert.ok(link, "deeplink anchor must be rendered");
   assert.ok(link.getAttribute("href").startsWith("kcreate://join?"));
+  root.unmount();
 });
 
 test("disables the Open button once the invite has fallen outside the freshness window", async () => {
@@ -132,12 +140,14 @@ test("disables the Open button once the invite has fallen outside the freshness 
     React.createElement(InviteCard, {
       invite: INVITE,
       now: () => new Date("2026-05-28T12:00:00Z"),
+      freshnessTickIntervalMs: Infinity,
     }),
   );
   await flushReact();
   const button = container.querySelector("[data-testid=\"kcreate-invite-open\"]");
   assert.ok(button);
   assert.equal(button.disabled, true);
+  root.unmount();
 });
 
 test("calls onOpen with the invite when the user clicks Open", async () => {
@@ -155,6 +165,7 @@ test("calls onOpen with the invite when the user clicks Open", async () => {
       invite: INVITE,
       // Pin clock pre-expiry so the button is enabled.
       now: () => new Date("2026-05-27T12:30:00Z"),
+      freshnessTickIntervalMs: Infinity,
       onOpen: async (invite) => {
         received = invite;
       },
@@ -169,5 +180,51 @@ test("calls onOpen with the invite when the user clicks Open", async () => {
   );
   // Wait for the async onOpen handler to run.
   await flushReact();
-  assert.equal(received?.inviteId, INVITE.inviteId);
+  // The card forwards the *exact* invite object to `onOpen` — we
+  // deep-equal against the fixture so a future contract change that
+  // drops or renames any field (e.g. `projectId`, `ownerSocketAddr`,
+  // `certFingerprint`) fails the test instead of trivially passing
+  // through `undefined === undefined`.
+  assert.ok(received, "onOpen must be called");
+  assert.deepStrictEqual(received, INVITE);
+  root.unmount();
+});
+
+test("re-renders the freshness label on a setInterval tick", async () => {
+  setupDom();
+  const React = await import("react");
+  const ReactDOMClient = await import("react-dom/client");
+  const { InviteCard } = await loadInviteCard();
+
+  const container = document.getElementById("root");
+  const root = ReactDOMClient.createRoot(container);
+
+  // Walk the injected clock past the freshness window between mount
+  // and the next tick. Verifies the card flips from "valid" to
+  // "expired" via the interval — not just at mount time.
+  const times = [
+    new Date("2026-05-27T12:30:00Z"), // 30 min after issuance
+    new Date("2026-05-27T13:30:00Z"), // 90 min after issuance — expired
+  ];
+  let idx = 0;
+  const tickIntervalMs = 5;
+  root.render(
+    React.createElement(InviteCard, {
+      invite: INVITE,
+      now: () => times[Math.min(idx, times.length - 1)],
+      freshnessTickIntervalMs: tickIntervalMs,
+    }),
+  );
+  await flushReact();
+  let button = container.querySelector("[data-testid=\"kcreate-invite-open\"]");
+  assert.equal(button.disabled, false, "must start enabled before tick");
+
+  // Advance the injected clock so the next interval read trips
+  // expiry, then wait for the interval to fire + React to flush.
+  idx = 1;
+  await new Promise((r) => setTimeout(r, tickIntervalMs * 4));
+  await flushReact();
+  button = container.querySelector("[data-testid=\"kcreate-invite-open\"]");
+  assert.equal(button.disabled, true, "must be disabled after tick");
+  root.unmount();
 });

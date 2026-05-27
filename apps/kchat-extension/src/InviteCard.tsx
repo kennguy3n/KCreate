@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   buildJoinDeeplink,
   openInviteInKCreate,
@@ -18,6 +18,13 @@ interface InviteCardProps {
   // `SessionConfig::key_rotation_interval` in `kcreate_collab`).
   // We mirror that as the default freshness window.
   freshnessWindowMinutes?: number;
+  // How often (ms) to re-evaluate the freshness label so a card
+  // that crosses the expiry boundary while the panel is open
+  // flips to "expired" and disables the Join button without
+  // requiring a remount. Defaults to 1000; tests can pin this to
+  // `Infinity` (or any non-finite value) to opt out of ticking
+  // entirely.
+  freshnessTickIntervalMs?: number;
 }
 
 type OpenState =
@@ -56,14 +63,44 @@ export function InviteCard({
   onOpen,
   now,
   freshnessWindowMinutes = 60,
+  freshnessTickIntervalMs = 1000,
 }: InviteCardProps): JSX.Element {
   const [state, setState] = useState<OpenState>({ phase: "idle" });
+  // Capture the clock in state so the `now` prop swap path stays
+  // stable across re-renders. Tests that pin the clock pass a new
+  // closure on every render but conceptually the clock is the same
+  // — we just need a stable read for the interval callback below.
   const clock = now ?? (() => new Date());
-  const freshness = useMemo(
-    () => formatFreshness(clock(), invite.issuedAt, freshnessWindowMinutes),
-    // The `clock` ref is stable per-render and doesn't need to be a dep.
+  // The current observed time. We re-read the injected clock on
+  // every tick so the freshness label tracks the wall clock for
+  // long-lived cards (or the pinned test clock if the test rerenders
+  // with a new `now` closure).
+  const [observedTime, setObservedTime] = useState<Date>(() => clock());
+  useEffect(() => {
+    // Tests opt out by passing a non-finite interval. Production
+    // defaults to 1s ticks which dominates the cost of running a
+    // panel-sized React tree by a comfortable margin.
+    if (
+      !Number.isFinite(freshnessTickIntervalMs) ||
+      freshnessTickIntervalMs <= 0
+    ) {
+      return undefined;
+    }
+    const timer = setInterval(() => {
+      setObservedTime(clock());
+    }, freshnessTickIntervalMs);
+    return () => {
+      clearInterval(timer);
+    };
+    // `clock` is a per-render closure but we deliberately re-bind
+    // the interval only when the tick interval itself changes —
+    // a fresh `now` injection from a test re-render still applies
+    // the next time the interval fires.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [invite.issuedAt, freshnessWindowMinutes],
+  }, [freshnessTickIntervalMs]);
+  const freshness = useMemo(
+    () => formatFreshness(observedTime, invite.issuedAt, freshnessWindowMinutes),
+    [observedTime, invite.issuedAt, freshnessWindowMinutes],
   );
   const expired = freshness.expired;
 

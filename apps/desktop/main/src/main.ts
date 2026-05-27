@@ -2667,7 +2667,22 @@ function registerIpcHandlers(): void {
 const DEEPLINK_SCHEME = "kcreate";
 const DEEPLINK_CHANNEL = "kcreate/deeplink/received";
 
+// Hard cap the cold-start deeplink buffer so a renderer that
+// crashes mid-load (or a `did-finish-load` event that never fires)
+// can't drive unbounded memory growth if the OS keeps handing us
+// new `kcreate://` URLs through the protocol activation path. Once
+// the cap is hit we drop the *oldest* pending URL on each push so
+// the most recent invite wins — a stale invite is less useful than
+// the one the user clicked five seconds ago.
+const MAX_PENDING_DEEPLINKS = 50;
 const pendingDeeplinks: string[] = [];
+
+function pushPendingDeeplink(url: string): void {
+  if (pendingDeeplinks.length >= MAX_PENDING_DEEPLINKS) {
+    pendingDeeplinks.shift();
+  }
+  pendingDeeplinks.push(url);
+}
 
 function isKcreateUrl(value: string): boolean {
   // We accept both `kcreate://...` and (rarely-seen on Windows
@@ -2687,8 +2702,9 @@ function dispatchDeeplink(url: string): void {
   if (!win || win.webContents.isLoading() || win.webContents.isDestroyed()) {
     // Buffer until the renderer is ready. A cold-start deeplink
     // path lands here when the OS launches us straight from the
-    // protocol hand-off.
-    pendingDeeplinks.push(url);
+    // protocol hand-off. The buffer is capped so a stuck renderer
+    // doesn't trigger unbounded memory growth.
+    pushPendingDeeplink(url);
     return;
   }
   try {

@@ -29,6 +29,11 @@
       "description": "Post a KCreate share-invite card to the active conversation when the user clicks 'Share to channel'."
     },
     {
+      "id": "kchat.query_recent_kcreate_projects",
+      "category": "read",
+      "description": "Look up the local user's recently-opened KCreate projects scoped to the active community. The host returns an empty list when no metadata is available."
+    },
+    {
       "id": "deeplink.open_external",
       "category": "context",
       "description": "Open kcreate:// deeplinks (join/edit) in the standalone KCreate desktop app."

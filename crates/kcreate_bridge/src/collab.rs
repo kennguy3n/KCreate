@@ -1951,6 +1951,25 @@ pub fn kchat_install_authority(req: KChatInstallRequest) -> Result<KChatMembersh
     Ok(membership_status_for(&membership))
 }
 
+/// Install a pre-built `SharedKChatAuthority` directly. Used by
+/// the Phase 7 KChat Desktop bridge (`kchat_desktop`) when the
+/// authority is sourced from a live IPC connection rather than a
+/// wire-format `KChatInstallRequest`. The caller is responsible
+/// for verifying the underlying membership against its issuer trust
+/// root (the `KChatDesktopAuthority::install` constructor does so).
+/// The provided `membership` is used to compute the
+/// `KChatMembershipStatus` returned to the renderer (issuer label,
+/// trusted-issuer lookup, validity window) using the same builder
+/// the regular install path uses, so the renderer state stays
+/// consistent across install sources.
+pub fn install_kchat_authority_direct(
+    authority: SharedKChatAuthority,
+    membership: &KChatMembership,
+) -> KChatMembershipStatus {
+    *kchat_slot().lock() = authority;
+    membership_status_for(membership)
+}
+
 /// Clear the installed authority and re-lock multiplayer. Any
 /// running session is left as-is (the QUIC endpoint stays alive
 /// until `session_leave`), but subsequent `session_start`,

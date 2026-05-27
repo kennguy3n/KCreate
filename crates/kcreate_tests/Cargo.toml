@@ -41,6 +41,13 @@ kcreate_renderer = { path = "../kcreate_renderer" }
 kcreate_storage = { path = "../kcreate_storage" }
 kcreate_text = { path = "../kcreate_text" }
 kcreate_vector = { path = "../kcreate_vector" }
+# Phase 7 integration test (kchat_desktop_client.rs). Pulled in as a
+# dev-dep so the runtime binary tree stays unchanged; the
+# editing-path deny-list check (`tests/local_first.rs`) does not
+# walk `kcreate_tests` itself, so this does not weaken the
+# invariant.
+kcreate_kchat_client = { path = "../kcreate_kchat_client" }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "io-util", "net", "fs", "time"] }
 chrono = { workspace = true }
 serde_json = { workspace = true }
 tempfile = { workspace = true }

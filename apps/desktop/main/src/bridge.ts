@@ -809,6 +809,25 @@ export interface Bridge {
   kchatTrustedIssuers(): string;
   kchatAddTrustedIssuer(issuerJson: string): string;
   kchatRemoveTrustedIssuer(issuerPublicKey: string): string;
+  // Phase 7 — KChat Desktop local IPC. All entry points are gated
+  // on the `kchat-desktop` feature flag (which implies `collab`);
+  // `kchatDesktopAvailable` is always present as a capability
+  // probe. `kchatDesktopConnect/Disconnect/Status` return JSON
+  // `KChatDesktopStatus`; `kchatDesktopListCommunities` returns
+  // JSON `KChatCommunity[]`; `kchatDesktopSelectCommunity` returns
+  // a JSON `KChatMembershipStatus` (same shape as
+  // `kchatInstallAuthority` — replaces the dev-mint flow);
+  // `kchatDesktopShareToConversation` returns a JSON
+  // `KChatPostMessageResult`.
+  kchatDesktopAvailable(): boolean;
+  kchatDesktopConnect?(): string;
+  kchatDesktopDisconnect?(): string;
+  kchatDesktopStatus?(): string;
+  kchatDesktopListCommunities?(): string;
+  kchatDesktopSelectCommunity?(communityId: string): string;
+  kchatDesktopGetCommunityMembers?(communityId: string): string;
+  kchatDesktopListConversations?(communityId: string): string;
+  kchatDesktopShareToConversation?(conversationId: string, inviteJson: string): string;
   /// Re-publish the cached scene. Used by the session event tick
   /// to refresh remote-peer cursor overlays.
   documentRequestRender(): void;

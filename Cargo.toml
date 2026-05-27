@@ -28,6 +28,13 @@ members = [
     # is only pulled into the bridge under the off-by-default
     # `kchat-dev-issuer` feature.
     "crates/kcreate_kchat",
+    # Phase 7 KChat Desktop local IPC client. Like
+    # `kcreate_collab_transport` and `kcreate_kchat`, this is OUT of
+    # `kcreate_tests/tests/local_first.rs::editing_path_crates` — it
+    # opens a local Unix socket (or named pipe on Windows) to talk
+    # to uney-chat-desktop and is only pulled into the bridge under
+    # the off-by-default `kchat-desktop` feature flag.
+    "crates/kcreate_kchat_client",
     "crates/kcreate_tests",
 ]
 

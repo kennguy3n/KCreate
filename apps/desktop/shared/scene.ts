@@ -3344,6 +3344,156 @@ export interface KChatBridge {
   removeTrustedIssuer(issuerPublicKey: string): Promise<TrustedIssuer[]>;
 }
 
+// ---------------------------------------------------------------------------
+// Phase 7 — KChat Desktop local IPC (uney-chat-desktop integration).
+//
+// Mirrors `kcreate_kchat_client` wire-format types and the bridge
+// surface in `kcreate_bridge::kchat_desktop`. The IPC client
+// connects to a local Unix domain socket
+// (`$XDG_RUNTIME_DIR/kchat/kcreate.sock` or
+// `$HOME/.kchat/kcreate.sock`) or named pipe
+// (`\\.\pipe\kchat-kcreate`) exposed by `uney-chat-desktop`. The
+// full protocol spec is documented in
+// `crates/kcreate_kchat_client/src/protocol_spec.md` for the
+// `uney-chat-desktop` maintainers to implement the server side.
+// ---------------------------------------------------------------------------
+
+/// Local-user identity reported by `kchat.identity.get`. Mirrors
+/// `kcreate_kchat_client::KChatIdentity`.
+export interface KChatIdentity {
+  /// Human-readable display name.
+  displayName: string;
+  /// XMPP bare JID (e.g. `alice@kchat.com`) used by
+  /// `uney-chat-desktop` as the primary user identifier.
+  jid: string;
+  /// Ed25519 public key, URL-safe base64 (no padding). KCreate
+  /// uses this to bind multiplayer attestations to the local
+  /// peer.
+  publicKey: string;
+  /// BLAKE3 hash of the Ed25519 public key, URL-safe base64
+  /// (no padding) — same `PeerId` shape KCreate uses across the
+  /// collab stack.
+  peerId: string;
+}
+
+/// Status snapshot returned by `KChatDesktopBridge.{connect,
+/// disconnect, status}`. Mirrors
+/// `kcreate_bridge::kchat_desktop::KChatDesktopStatus`.
+export interface KChatDesktopStatus {
+  connected: boolean;
+  /// Resolved filesystem path the client is connected to (Unix
+  /// socket) or pipe name (Windows). `null` when disconnected.
+  socketPath: string | null;
+  /// `null` until the bridge has fetched identity from the
+  /// desktop app for the first time on the current connection.
+  identity: KChatIdentity | null;
+}
+
+/// A community reported by `kchat.communities.list`. Mirrors
+/// `kcreate_kchat_client::KChatCommunity`.
+export interface KChatCommunity {
+  id: string;
+  name: string;
+  description: string | null;
+  memberCount: number;
+  /// Local user's role in the community. Drives the collab
+  /// permission model in Block B (owner/admin → Editor with
+  /// kick rights; member → Editor or Viewer depending on host
+  /// downgrades).
+  role: "owner" | "admin" | "member";
+}
+
+/// A community member reported by `kchat.communities.getMembers`.
+/// Mirrors `kcreate_kchat_client::KChatCommunityMember`.
+export interface KChatCommunityMember {
+  jid: string;
+  displayName: string;
+  publicKey: string;
+  peerId: string;
+  role: "owner" | "admin" | "member";
+}
+
+/// A conversation/channel within a community. Mirrors
+/// `kcreate_kchat_client::KChatConversation`.
+export interface KChatConversation {
+  id: string;
+  name: string;
+  communityId: string;
+  type: "channel" | "direct";
+}
+
+/// Invite-card payload posted to a KChat conversation by
+/// `KChatDesktopBridge.shareToConversation`. Mirrors
+/// `kcreate_bridge::kchat_desktop::KChatShareInvite`.
+export interface KChatShareInvite {
+  /// KCreate project id the invite points to (UUID).
+  projectId: string;
+  /// Human-readable project name.
+  projectName: string;
+  /// Owning peer id (BLAKE3 hash of owner Ed25519 key).
+  ownerPeerId: string;
+  /// Owner Ed25519 public key, URL-safe base64 (no padding).
+  ownerPublicKey: string;
+  /// Owner display name as shown by KCreate.
+  ownerDisplayName: string;
+  /// SHA-256 of the owner QUIC TLS leaf cert, URL-safe base64.
+  certFingerprint: string;
+  /// Owner QUIC socket address (`<ip>:<port>`).
+  ownerSocketAddr: string;
+  /// Community the invite is gated on. Joiner must be a member.
+  communityId: string;
+  /// Conversation the invite is posted to.
+  conversationId: string;
+}
+
+/// Result of `KChatDesktopBridge.shareToConversation`. Mirrors
+/// `kcreate_kchat_client::PostMessageResult`.
+export interface KChatPostMessageResult {
+  messageId: string;
+  /// RFC3339 UTC timestamp the server stamped on the message.
+  postedAt: string;
+}
+
+/// Phase 7 KChat Desktop bridge surface. Every method other than
+/// `available` is optional because non-`kchat-desktop` builds do
+/// not link the underlying N-API exports; the renderer probes via
+/// `available()` and falls back to the paste-attestation flow when
+/// the answer is `false`.
+export interface KChatDesktopBridge {
+  /// Capability probe — `true` when the bridge was compiled with
+  /// the `kchat-desktop` feature flag.
+  available(): Promise<boolean>;
+  /// Try to connect to the local KChat Desktop IPC socket. Tries
+  /// the platform default paths in order; throws a typed error if
+  /// no socket is reachable.
+  connect(): Promise<KChatDesktopStatus>;
+  /// Disconnect (idempotent). Also clears any KChat authority
+  /// installed by `selectCommunity` so a stale membership doesn't
+  /// outlive the connection it was minted from.
+  disconnect(): Promise<KChatDesktopStatus>;
+  /// Snapshot the current connection state + cached identity.
+  status(): Promise<KChatDesktopStatus>;
+  /// List the communities the local user belongs to.
+  listCommunities(): Promise<KChatCommunity[]>;
+  /// Pick a community and install its attestation as the active
+  /// KChat authority. Returns the same `KChatMembershipStatus`
+  /// shape as `KChatBridge.install`.
+  selectCommunity(communityId: string): Promise<KChatMembershipStatus>;
+  /// Return the member roster (with roles) for the given
+  /// community. Used by Block B's roster-sync tick + the
+  /// community-role-based permissions model.
+  getCommunityMembers(communityId: string): Promise<KChatCommunityMember[]>;
+  /// Return the conversations/channels in the given community.
+  listConversations(communityId: string): Promise<KChatConversation[]>;
+  /// Post a document-share invite into a KChat conversation. The
+  /// payload is tagged `kcreate.invite.v1` so KChat Desktop
+  /// renders it as a rich card.
+  shareToConversation(
+    conversationId: string,
+    invite: KChatShareInvite,
+  ): Promise<KChatPostMessageResult>;
+}
+
 // -----------------------------------------------------------------------------
 // Phase 4 — Vision & Image Generation
 // -----------------------------------------------------------------------------
@@ -3565,6 +3715,7 @@ declare global {
       slice: SliceBridge;
       session: SessionBridge;
       kchat: KChatBridge;
+      kchatDesktop: KChatDesktopBridge;
       clipboard: ClipboardBridge;
     };
   }

@@ -1510,6 +1510,7 @@ dependencies = [
  "kcreate_core",
  "kcreate_export",
  "kcreate_kchat",
+ "kcreate_kchat_client",
  "kcreate_layout",
  "kcreate_mcp",
  "kcreate_plugin",
@@ -1631,6 +1632,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "kcreate_kchat_client"
+version = "0.0.1"
+dependencies = [
+ "base64",
+ "chrono",
+ "ed25519-dalek",
+ "kcreate_collab",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "kcreate_layout"
 version = "0.0.1"
 dependencies = [
@@ -1738,6 +1757,7 @@ dependencies = [
  "kcreate_collab",
  "kcreate_core",
  "kcreate_export",
+ "kcreate_kchat_client",
  "kcreate_mcp",
  "kcreate_raster",
  "kcreate_renderer",
@@ -1747,6 +1767,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tiny_http",
+ "tokio",
  "uuid",
 ]
 

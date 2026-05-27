@@ -21,6 +21,8 @@ pub mod audit;
 pub mod collab;
 pub mod document;
 pub mod hit_test;
+#[cfg(feature = "kchat-desktop")]
+pub mod kchat_desktop;
 pub mod llm;
 #[cfg(feature = "native_canvas")]
 pub mod native_canvas;
@@ -3281,6 +3283,131 @@ pub fn kchat_remove_trusted_issuer(issuer_public_key: String) -> NapiResult<Stri
 #[napi]
 pub fn kchat_dev_mint_membership(request_json: String) -> NapiResult<String> {
     crate::collab::kchat_dev_mint_membership_json(&request_json).map_err(map_session_err)
+}
+
+// =============================================================================
+// Phase 7 — KChat Desktop local IPC
+// =============================================================================
+//
+// Thin N-API wrappers around `kchat_desktop.rs`. The logic lives
+// in that module; this layer marshals JSON strings. Every entry
+// point is gated on the `kchat-desktop` feature flag (which
+// implies `collab` — see Cargo.toml) so non-collab builds don't
+// even see the symbols. All wire-format types are mirrored in
+// `apps/desktop/shared/scene.ts`.
+
+#[cfg(feature = "kchat-desktop")]
+#[allow(clippy::needless_pass_by_value)]
+fn map_kchat_desktop_err(e: crate::kchat_desktop::KChatDesktopBridgeError) -> NapiError {
+    let status = match e {
+        crate::kchat_desktop::KChatDesktopBridgeError::NotConnected => Status::InvalidArg,
+        _ => Status::GenericFailure,
+    };
+    NapiError::new(status, e.to_string())
+}
+
+/// Connect to the local KChat Desktop IPC socket. Returns the new
+/// status as JSON [`crate::kchat_desktop::KChatDesktopStatus`].
+#[cfg(feature = "kchat-desktop")]
+#[napi]
+pub fn kchat_desktop_connect() -> NapiResult<String> {
+    let status = crate::kchat_desktop::kchat_desktop_connect().map_err(map_kchat_desktop_err)?;
+    serde_json::to_string(&status)
+        .map_err(|e| NapiError::from_reason(format!("kchat_desktop_connect: {e}")))
+}
+
+/// Disconnect from the local KChat Desktop IPC socket. Idempotent.
+#[cfg(feature = "kchat-desktop")]
+#[napi]
+pub fn kchat_desktop_disconnect() -> NapiResult<String> {
+    let status = crate::kchat_desktop::kchat_desktop_disconnect().map_err(map_kchat_desktop_err)?;
+    serde_json::to_string(&status)
+        .map_err(|e| NapiError::from_reason(format!("kchat_desktop_disconnect: {e}")))
+}
+
+/// Snapshot the current KChat Desktop connection status.
+#[cfg(feature = "kchat-desktop")]
+#[napi]
+pub fn kchat_desktop_status() -> NapiResult<String> {
+    let status = crate::kchat_desktop::kchat_desktop_status().map_err(map_kchat_desktop_err)?;
+    serde_json::to_string(&status)
+        .map_err(|e| NapiError::from_reason(format!("kchat_desktop_status: {e}")))
+}
+
+/// Return the list of communities the local user belongs to as JSON
+/// `KChatCommunity[]`.
+#[cfg(feature = "kchat-desktop")]
+#[napi]
+pub fn kchat_desktop_list_communities() -> NapiResult<String> {
+    let communities =
+        crate::kchat_desktop::kchat_desktop_list_communities().map_err(map_kchat_desktop_err)?;
+    serde_json::to_string(&communities)
+        .map_err(|e| NapiError::from_reason(format!("kchat_desktop_list_communities: {e}")))
+}
+
+/// Select a community: install its attestation as the active KChat
+/// authority and return the resulting [`KChatMembershipStatus`] as
+/// JSON. Replaces the dev-mint flow for production builds.
+#[cfg(feature = "kchat-desktop")]
+#[napi]
+pub fn kchat_desktop_select_community(community_id: String) -> NapiResult<String> {
+    let status = crate::kchat_desktop::kchat_desktop_select_community(&community_id)
+        .map_err(map_kchat_desktop_err)?;
+    serde_json::to_string(&status)
+        .map_err(|e| NapiError::from_reason(format!("kchat_desktop_select_community: {e}")))
+}
+
+/// Return the member list (with roles) for the given community as
+/// JSON `KChatCommunityMember[]`.
+#[cfg(feature = "kchat-desktop")]
+#[napi]
+pub fn kchat_desktop_get_community_members(community_id: String) -> NapiResult<String> {
+    let members = crate::kchat_desktop::kchat_desktop_get_community_members(&community_id)
+        .map_err(map_kchat_desktop_err)?;
+    serde_json::to_string(&members)
+        .map_err(|e| NapiError::from_reason(format!("kchat_desktop_get_community_members: {e}")))
+}
+
+/// Return the list of conversations/channels in the given community
+/// as JSON `KChatConversation[]`.
+#[cfg(feature = "kchat-desktop")]
+#[napi]
+pub fn kchat_desktop_list_conversations(community_id: String) -> NapiResult<String> {
+    let conversations = crate::kchat_desktop::kchat_desktop_list_conversations(&community_id)
+        .map_err(map_kchat_desktop_err)?;
+    serde_json::to_string(&conversations)
+        .map_err(|e| NapiError::from_reason(format!("kchat_desktop_list_conversations: {e}")))
+}
+
+/// Share a document-invite payload to a KChat conversation. The
+/// `invite_json` argument is a JSON-encoded
+/// [`crate::kchat_desktop::KChatShareInvite`]. Returns the
+/// JSON-encoded [`kcreate_kchat_client::PostMessageResult`].
+#[cfg(feature = "kchat-desktop")]
+#[napi]
+pub fn kchat_desktop_share_to_conversation(
+    conversation_id: String,
+    invite_json: String,
+) -> NapiResult<String> {
+    let invite: crate::kchat_desktop::KChatShareInvite = serde_json::from_str(&invite_json)
+        .map_err(|e| {
+            NapiError::from_reason(format!(
+                "kchat_desktop_share_to_conversation: invalid invite: {e}"
+            ))
+        })?;
+    let result =
+        crate::kchat_desktop::kchat_desktop_share_to_conversation(&conversation_id, invite)
+            .map_err(map_kchat_desktop_err)?;
+    serde_json::to_string(&result)
+        .map_err(|e| NapiError::from_reason(format!("kchat_desktop_share_to_conversation: {e}")))
+}
+
+/// Capability probe — `true` when the bridge was compiled with the
+/// `kchat-desktop` feature flag. Mirrors `kchat_dev_issuer_available`
+/// for symmetry.
+#[napi]
+pub fn kchat_desktop_available() -> bool {
+    cfg!(feature = "kchat-desktop")
 }
 
 // =============================================================================

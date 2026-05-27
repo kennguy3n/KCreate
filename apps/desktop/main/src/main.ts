@@ -2428,6 +2428,85 @@ function registerIpcHandlers(): void {
     (_e, issuerPublicKey: string) =>
       requireBridge().kchatRemoveTrustedIssuer(issuerPublicKey),
   );
+
+  // -------------------------------------------------------------------
+  // Phase 7 — KChat Desktop local IPC. All entry points except the
+  // `available` probe are optional on the bridge: a non-collab or
+  // non-`kchat-desktop` build simply doesn't link them, and the
+  // handlers below return a typed error so the renderer can fall
+  // back to the paste-attestation flow. Channels follow the
+  // `kcreate/kchat-desktop/*` namespace per Block A spec.
+  // -------------------------------------------------------------------
+  ipcMain.handle("kcreate/kchat-desktop/available", () => {
+    const fn = requireBridge().kchatDesktopAvailable;
+    if (typeof fn !== "function") return false;
+    try {
+      return fn();
+    } catch {
+      return false;
+    }
+  });
+  // Helper: resolve an optional `kchat-desktop` bridge function or
+  // throw a typed error. Keeps each handler one line below.
+  const requireKChatDesktop = <K extends keyof Bridge>(method: K): Bridge[K] => {
+    const fn = requireBridge()[method];
+    if (typeof fn !== "function") {
+      throw new Error(
+        `kchat-desktop: ${String(method)} not available in this build ` +
+          "(rebuild kcreate_bridge with --features kchat-desktop)",
+      );
+    }
+    return fn;
+  };
+  ipcMain.handle("kcreate/kchat-desktop/connect", () =>
+    (requireKChatDesktop("kchatDesktopConnect") as () => string)(),
+  );
+  ipcMain.handle("kcreate/kchat-desktop/disconnect", () =>
+    (requireKChatDesktop("kchatDesktopDisconnect") as () => string)(),
+  );
+  ipcMain.handle("kcreate/kchat-desktop/status", () =>
+    (requireKChatDesktop("kchatDesktopStatus") as () => string)(),
+  );
+  ipcMain.handle("kcreate/kchat-desktop/list-communities", () =>
+    (requireKChatDesktop("kchatDesktopListCommunities") as () => string)(),
+  );
+  ipcMain.handle(
+    "kcreate/kchat-desktop/select-community",
+    (_e, communityId: string) =>
+      (
+        requireKChatDesktop("kchatDesktopSelectCommunity") as (
+          id: string,
+        ) => string
+      )(communityId),
+  );
+  ipcMain.handle(
+    "kcreate/kchat-desktop/get-community-members",
+    (_e, communityId: string) =>
+      (
+        requireKChatDesktop("kchatDesktopGetCommunityMembers") as (
+          id: string,
+        ) => string
+      )(communityId),
+  );
+  ipcMain.handle(
+    "kcreate/kchat-desktop/list-conversations",
+    (_e, communityId: string) =>
+      (
+        requireKChatDesktop("kchatDesktopListConversations") as (
+          id: string,
+        ) => string
+      )(communityId),
+  );
+  ipcMain.handle(
+    "kcreate/kchat-desktop/share-to-conversation",
+    (_e, conversationId: string, inviteJson: string) =>
+      (
+        requireKChatDesktop("kchatDesktopShareToConversation") as (
+          c: string,
+          i: string,
+        ) => string
+      )(conversationId, inviteJson),
+  );
 }
 
 /// Point the KChat trust-store at the per-user JSON file under

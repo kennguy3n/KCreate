@@ -76,6 +76,14 @@ kcreate_collab_transport = { path = "../kcreate_collab_transport", optional = tr
 # enable in production builds — minting your own attestation
 # subverts the multiplayer trust root.
 kcreate_kchat = { path = "../kcreate_kchat", optional = true }
+# Phase 7 KChat Desktop local IPC client. Pulled in ONLY behind the
+# `kchat-desktop` feature flag (off by default). The client connects
+# to a LOCAL Unix domain socket / named pipe — no internet — and
+# implements the JSON-RPC protocol documented in
+# `crates/kcreate_kchat_client/src/protocol_spec.md`. Because this
+# crate links `tokio::net::UnixStream` it must stay out of the
+# default editing-path closure walked by `local_first.rs`.
+kcreate_kchat_client = { path = "../kcreate_kchat_client", optional = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time"], optional = true }
 # Used only behind the `collab` feature to decode an Ed25519 public
 # key from the wire-form base64url string into a `VerifyingKey` for
@@ -147,3 +155,10 @@ collab = ["dep:kcreate_collab", "dep:kcreate_collab_transport", "dep:tokio", "de
 # membership locally bypasses the trust root the real KChat product
 # pins to its own keypair.
 kchat-dev-issuer = ["collab", "dep:kcreate_kchat"]
+# Phase 7: enable the real KChat Desktop local-IPC client. Implies
+# `collab` (the bridge installs the wire attestation into the collab
+# gate). Off by default; non-collab builds must NOT enable this. The
+# crate it pulls in (`kcreate_kchat_client`) links `tokio::net` to
+# speak a local Unix socket / named pipe — never the internet — and
+# is excluded from the editing-path closure walked by `local_first.rs`.
+kchat-desktop = ["collab", "dep:kcreate_kchat_client"]

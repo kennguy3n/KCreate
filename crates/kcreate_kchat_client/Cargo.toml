@@ -1,0 +1,54 @@
+[package]
+name = "kcreate_kchat_client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Local IPC client for uney-chat-desktop (KChat Desktop) — JSON-RPC 2.0 over Unix domain socket / named pipe"
+publish = false
+
+[lints]
+workspace = true
+
+# Phase 7: KChat Desktop local IPC client.
+#
+# Connects to a LOCAL process only (`~/.kchat/kcreate.sock` on
+# Unix, `\\.\pipe\kchat-kcreate` on Windows). The transport
+# layer carries newline-delimited JSON-RPC 2.0 messages; the
+# protocol module defines the request/response wire types
+# matching the spec in `src/protocol_spec.md`.
+#
+# Like `kcreate_collab_transport` and `kcreate_kchat`, this
+# crate sits OUTSIDE the editing-path closure walked by
+# `crates/kcreate_tests/tests/local_first.rs::editing_path_crates`.
+# The bridge depends on it only behind the `kchat-desktop`
+# feature flag.
+#
+# Hard rule: no internet. Tokio is used for the local socket and
+# for the request-multiplexing pump task; no `hyper` / `reqwest`
+# / `quinn` / `mdns` here. The connection is a single Unix
+# socket (or named pipe) opened against a path on the local
+# filesystem.
+[dependencies]
+kcreate_collab = { path = "../kcreate_collab" }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "sync", "time", "net", "io-util", "fs"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+base64 = { workspace = true }
+chrono = { workspace = true, features = ["serde"] }
+ed25519-dalek = { workspace = true }
+uuid = { workspace = true, features = ["v4", "serde"] }
+parking_lot = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+# Named-pipe transport implementation. Already pulled in
+# transitively via `tokio` on Windows.
+tokio = { workspace = true, features = ["net"] }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util"] }

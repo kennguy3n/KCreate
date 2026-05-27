@@ -238,19 +238,21 @@ pub fn kchat_backend_connect(
         totp: request.totp,
     };
     let identity = rt.block_on(new_client.login(&login))?;
-    // Tear down any prior client + authority before installing the
-    // new one so stale memberships don't outlive the sign-in they
-    // were minted from. `logout` is synchronous (clears in-memory
-    // tokens — no backend round-trip) so the runtime handle is
-    // only retained for the `login` call above.
-    let prev = client_slot().lock().take();
-    if let Some(prev) = prev {
-        prev.logout();
-    }
+    // Atomic install: swap the new client into the slot under a
+    // single lock acquire so any concurrent call (e.g. a future
+    // background roster-sync timer) sees either the old client or
+    // the new one — never a transient `None` that would surface as
+    // `NotConnected`. The old client is logged out *after* the
+    // lock is released because `logout()` is purely in-memory
+    // (clears tokens, no backend round-trip) so we don't need to
+    // hold the slot lock through it.
+    let prev = client_slot().lock().replace(new_client);
     *authority_slot().lock() = None;
     let _ = rt;
     crate::collab::kchat_clear_authority();
-    *client_slot().lock() = Some(new_client);
+    if let Some(prev) = prev {
+        prev.logout();
+    }
     Ok(KChatBackendStatus {
         connected: true,
         base_url: Some(request.base_url),

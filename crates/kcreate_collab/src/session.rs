@@ -149,17 +149,21 @@ struct PeerState {
 /// at `window_start`. When a new event arrives more than 1 second
 /// after `window_start`, the window slides forward (count resets to
 /// 1, `window_start` becomes the event time, and the
-/// `consecutive_overflow_seconds` counter advances or resets based
+/// `consecutive_overflow_windows` counter advances or resets based
 /// on whether the just-closed window exceeded the budget).
 #[derive(Debug, Clone, Copy)]
 struct RateBudget {
     window_start: std::time::Instant,
     count: u32,
-    /// How many consecutive 1-second windows this peer has been
-    /// over the configured budget. Reset to 0 the first time a
-    /// closing window comes in under the cap. The session evicts
-    /// the peer once this hits the configured threshold.
-    consecutive_overflow_seconds: u32,
+    /// How many consecutive rolling windows this peer has been
+    /// over the configured budget. Each window is currently 1
+    /// second wide; the counter measures **windows**, not
+    /// wall-clock seconds, so the field is named accordingly to
+    /// keep the unit honest if we ever tune the window size. Reset
+    /// to 0 the first time a closing window comes in under the
+    /// cap. The session evicts the peer once this hits the
+    /// configured threshold.
+    consecutive_overflow_windows: u32,
 }
 
 impl RateBudget {
@@ -167,7 +171,7 @@ impl RateBudget {
         Self {
             window_start: now,
             count: 0,
-            consecutive_overflow_seconds: 0,
+            consecutive_overflow_windows: 0,
         }
     }
 
@@ -182,10 +186,10 @@ impl RateBudget {
             // or reset the consecutive-overflow streak based on
             // whether the just-closed window exceeded the cap.
             if self.count > limit {
-                self.consecutive_overflow_seconds =
-                    self.consecutive_overflow_seconds.saturating_add(1);
+                self.consecutive_overflow_windows =
+                    self.consecutive_overflow_windows.saturating_add(1);
             } else {
-                self.consecutive_overflow_seconds = 0;
+                self.consecutive_overflow_windows = 0;
             }
             self.window_start = now;
             self.count = 0;
@@ -193,7 +197,11 @@ impl RateBudget {
         self.count = self.count.saturating_add(1);
         if self.count > limit {
             RateBudgetDecision::OverBudget {
-                consecutive_overflow_seconds: self.consecutive_overflow_seconds + 1,
+                // `saturating_add` mirrors the in-place update
+                // above so a long-running peer that pegs the
+                // counter at `u32::MAX` doesn't wrap to 0 and
+                // suddenly look healthy.
+                consecutive_overflow_windows: self.consecutive_overflow_windows.saturating_add(1),
             }
         } else {
             RateBudgetDecision::Ok
@@ -207,10 +215,10 @@ pub enum RateBudgetDecision {
     /// Inside the budget.
     Ok,
     /// Outside the budget. The host should emit a warning event;
-    /// if `consecutive_overflow_seconds >=
+    /// if `consecutive_overflow_windows >=
     /// SessionConfig::rate_limit_disconnect_after`, the host should
     /// forcibly disconnect the peer.
-    OverBudget { consecutive_overflow_seconds: u32 },
+    OverBudget { consecutive_overflow_windows: u32 },
 }
 
 /// Phase 7 (Task 22): kind of message a rate-limit check is being
@@ -1118,7 +1126,7 @@ mod tests {
         assert_eq!(
             a.record_rate_event(&peer_id, RateLimitKind::Operation, t0),
             RateBudgetDecision::OverBudget {
-                consecutive_overflow_seconds: 1
+                consecutive_overflow_windows: 1
             }
         );
 
@@ -1134,7 +1142,7 @@ mod tests {
         assert_eq!(
             a.record_rate_event(&peer_id, RateLimitKind::Operation, t1),
             RateBudgetDecision::OverBudget {
-                consecutive_overflow_seconds: 2
+                consecutive_overflow_windows: 2
             }
         );
 
@@ -1150,7 +1158,7 @@ mod tests {
         let t3 = t0 + std::time::Duration::from_secs(3);
         // First event of second 3 closes second 2 (count=1 ≤ 2)
         // and resets the streak to 0 — so a fresh overflow now
-        // reports consecutive_overflow_seconds == 1.
+        // reports consecutive_overflow_windows == 1.
         for _ in 0..2 {
             assert_eq!(
                 a.record_rate_event(&peer_id, RateLimitKind::Operation, t3),
@@ -1160,7 +1168,7 @@ mod tests {
         assert_eq!(
             a.record_rate_event(&peer_id, RateLimitKind::Operation, t3),
             RateBudgetDecision::OverBudget {
-                consecutive_overflow_seconds: 1
+                consecutive_overflow_windows: 1
             }
         );
     }
@@ -1194,7 +1202,7 @@ mod tests {
         assert_eq!(
             a.record_rate_event(&peer_id, RateLimitKind::Operation, t),
             RateBudgetDecision::OverBudget {
-                consecutive_overflow_seconds: 1
+                consecutive_overflow_windows: 1
             }
         );
         // Presence budget should still be fresh — independent of

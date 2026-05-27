@@ -2605,21 +2605,24 @@ function registerIpcHandlers(): void {
     requireBridge().sessionPendingClipboardOffers(),
   );
   // Phase 7 (Task 25): outbound op throttle wiring. The renderer
-  // calls `queueOperation` on every local mutation, `tickBatch`
-  // on the same cadence as the event drain (so the bridge can
-  // flush when the 50 ms timer expires without renderer
-  // bookkeeping), and `flushPendingOperations` at the end of a
-  // drag interaction.
+  // calls `queue-operation` on every local mutation,
+  // `tick-outbound-batch` on the same cadence as the event drain
+  // (so the bridge can flush when the 50 ms timer expires without
+  // renderer bookkeeping), and `flush-pending-operations` at the
+  // end of a drag interaction. Channel names use kebab-case to
+  // match the rest of the `kcreate/session/*` IPC surface
+  // (`request-resume`, `cert-fingerprint`, `pending-clipboard-offers`,
+  // etc.).
   ipcMain.handle(
-    "kcreate/session/queueOperation",
+    "kcreate/session/queue-operation",
     (_e, opJson: string) => {
       requireBridge().sessionQueueOperation(opJson);
     },
   );
-  ipcMain.handle("kcreate/session/flushPendingOperations", () =>
+  ipcMain.handle("kcreate/session/flush-pending-operations", () =>
     requireBridge().sessionFlushPendingOperations(),
   );
-  ipcMain.handle("kcreate/session/tickOutboundBatch", () =>
+  ipcMain.handle("kcreate/session/tick-outbound-batch", () =>
     requireBridge().sessionTickOutboundBatch(),
   );
   // Phase 7 (Task 27): selective sync — tell the bridge which
@@ -2627,7 +2630,7 @@ function registerIpcHandlers(): void {
   // and conflict toasts for off-screen pages are suppressed from
   // the renderer event stream; operations are still journaled.
   ipcMain.handle(
-    "kcreate/session/setActivePages",
+    "kcreate/session/set-active-pages",
     (_e, pageIdsJson: string) => {
       requireBridge().sessionSetActivePages(pageIdsJson);
     },

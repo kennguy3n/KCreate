@@ -24,7 +24,7 @@
 // keeps the same colour across the whole UI (Cursor, Selection,
 // PresencePanel dot).
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 
 import type { SessionPeer } from "../../../shared/scene";
 
@@ -102,6 +102,98 @@ export function projectWorld(
 /// Looks like the canonical macOS / Windows pointer (16 px tall);
 /// rendered black-outlined so it stays legible on any background.
 const CURSOR_PATH = "M2 2 L2 22 L8 18 L11 24 L14 22 L11 16 L18 16 Z";
+
+/// Horizontal padding (px) on either side of the display-name text
+/// inside the label pill. Tweak together with `PILL_HEIGHT` if the
+/// font size changes.
+const PILL_PADDING_X = 6;
+/// Pill height (px). Sized for the 11 px label font with a 2 px gap
+/// above and below the cap height.
+const PILL_HEIGHT = 16;
+/// Fallback pill width (px) used on the first paint before
+/// `getBBox()` has measured the actual text. Set to the longest
+/// realistic display-name a single label might need so the layout
+/// doesn't jump for normal Latin names — wide-glyph (CJK / emoji)
+/// names will resize on the next frame.
+const PILL_FALLBACK_WIDTH = 80;
+
+/// Per-peer label that measures its own text via `getBBox()` after
+/// the first paint and resizes the pill background to match. This
+/// is the SVG-native equivalent of CSS `width: fit-content` and
+/// correctly handles wide glyphs (CJK, emoji, ligatures) and the
+/// narrow-glyph case (i, l, 1) that a static `n * 7px` heuristic
+/// gets wrong.
+///
+/// We render the text *before* committing the pill width to a real
+/// value (the `<text>` is mounted as soon as React paints, which is
+/// when `useLayoutEffect` runs and `textRef.current.getBBox()`
+/// returns the measured size). On the very first paint the pill is
+/// drawn with `PILL_FALLBACK_WIDTH` so there's no flash of an
+/// empty rectangle — the layout effect then resizes it in the same
+/// commit cycle, before the browser paints, so the user never sees
+/// a visibly-wrong width.
+function PeerLabel({
+  name,
+  color,
+}: {
+  name: string;
+  color: string;
+}): JSX.Element {
+  const textRef = useRef<SVGTextElement>(null);
+  const [textWidth, setTextWidth] = useState<number | null>(null);
+
+  useLayoutEffect(() => {
+    if (textRef.current == null) return;
+    try {
+      const bbox = textRef.current.getBBox();
+      setTextWidth(bbox.width);
+    } catch {
+      // `getBBox()` throws if the element is detached (e.g. the
+      // overlay was unmounted between the effect being queued and
+      // running). Leave the fallback width in place — the next
+      // mount will measure cleanly.
+    }
+  }, [name]);
+
+  const pillWidth =
+    textWidth != null
+      ? Math.ceil(textWidth) + PILL_PADDING_X * 2
+      : PILL_FALLBACK_WIDTH;
+
+  return (
+    <>
+      {/*
+        Display-name pill. Offset right + down so the arrow tip
+        isn't covered by the label. Background uses the peer
+        colour at full saturation; text is white for legibility.
+        Width is measured from the rendered text rather than
+        estimated from the character count — handles CJK / emoji /
+        ligatures correctly.
+      */}
+      <rect
+        x={18}
+        y={18}
+        rx={3}
+        ry={3}
+        height={PILL_HEIGHT}
+        width={pillWidth}
+        fill={color}
+        opacity={0.95}
+      />
+      <text
+        ref={textRef}
+        x={18 + PILL_PADDING_X}
+        y={30}
+        fill="#ffffff"
+        fontSize={11}
+        fontFamily="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif"
+        fontWeight={600}
+      >
+        {name}
+      </text>
+    </>
+  );
+}
 
 export function CursorOverlay({
   width,
@@ -223,31 +315,7 @@ export function CursorOverlay({
               strokeWidth={1}
               strokeLinejoin="miter"
             />
-            {/*
-              Display-name pill. Offset right + down so the arrow tip
-              isn't covered by the label. Background uses the peer
-              colour at full saturation; text is white for legibility.
-            */}
-            <rect
-              x={18}
-              y={18}
-              rx={3}
-              ry={3}
-              height={16}
-              width={Math.max(24, peer.displayName.length * 7 + 8)}
-              fill={color}
-              opacity={0.95}
-            />
-            <text
-              x={22}
-              y={30}
-              fill="#ffffff"
-              fontSize={11}
-              fontFamily="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif"
-              fontWeight={600}
-            >
-              {peer.displayName}
-            </text>
+            <PeerLabel name={peer.displayName} color={color} />
           </g>
         );
       })}

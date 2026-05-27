@@ -34,10 +34,23 @@ use curve25519_dalek::scalar::{clamp_integer, Scalar};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use thiserror::Error;
 
-/// Domain separation tag fed into the BLAKE3 keyed-hash KDF so the
+/// Domain separation context fed into `blake3::derive_key` so the
 /// derived AEAD key never collides with any other secret a future
 /// caller might derive from the same X25519 shared secret.
-const KDF_DOMAIN: &[u8] = b"kcreate-clipboard-share-v1";
+///
+/// We use `blake3::derive_key` rather than `blake3::Hasher::new_keyed`
+/// here because `derive_key` is the BLAKE3-specified KDF construction
+/// (RFC-style HKDF cousin): the context string is hashed into the
+/// key material via the dedicated key-derivation-function mode, which
+/// is the correct primitive when the input is a Diffie–Hellman shared
+/// secret. `new_keyed` is BLAKE3's MAC mode and is only correct when
+/// the caller already has a uniformly random secret key — using it
+/// for KDF the way the previous implementation did (hash the
+/// context, then use the hash as the MAC key, then MAC the shared
+/// secret) is a non-standard construction even though it produces a
+/// pseudorandom 32-byte output. `derive_key` makes the intent
+/// explicit and matches the BLAKE3 spec's recommendation.
+const KDF_CONTEXT: &str = "kcreate-clipboard-share v1 2025-05-27 X25519->ChaCha20-Poly1305 AEAD key";
 
 /// Successfully decrypted clipboard payload — what the renderer
 /// hands to the paste pipeline.
@@ -125,10 +138,13 @@ fn derive_shared_aead_key(
     let scalar = ed25519_scalar_for_x25519(local_signing);
     let remote_point = MontgomeryPoint(derive_x25519_from_ed25519_public(remote_public));
     let shared = (remote_point * scalar).to_bytes();
-    // Domain-separated BLAKE3 keyed hash → 32-byte AEAD key.
-    let mut hasher = blake3::Hasher::new_keyed(blake3::hash(KDF_DOMAIN).as_bytes());
-    hasher.update(&shared);
-    *hasher.finalize().as_bytes()
+    // Domain-separated KDF: `derive_key(context, ikm)` is the
+    // BLAKE3-specified construction for turning a non-uniform
+    // shared secret (here, the X25519 shared point) into a
+    // uniformly random 32-byte key. The context string carries the
+    // protocol + version + algorithm so two unrelated callers can
+    // never derive the same AEAD key from the same shared secret.
+    blake3::derive_key(KDF_CONTEXT, &shared)
 }
 
 /// Extract the clamped 32-byte X25519 scalar that an Ed25519

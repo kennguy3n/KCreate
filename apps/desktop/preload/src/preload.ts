@@ -2291,23 +2291,23 @@ const session: SessionBridge = {
   },
   async queueOperation(operation: unknown): Promise<void> {
     await ipcRenderer.invoke(
-      "kcreate/session/queueOperation",
+      "kcreate/session/queue-operation",
       JSON.stringify(operation),
     );
   },
   async flushPendingOperations(): Promise<number> {
     return (await ipcRenderer.invoke(
-      "kcreate/session/flushPendingOperations",
+      "kcreate/session/flush-pending-operations",
     )) as number;
   },
   async tickOutboundBatch(): Promise<number> {
     return (await ipcRenderer.invoke(
-      "kcreate/session/tickOutboundBatch",
+      "kcreate/session/tick-outbound-batch",
     )) as number;
   },
   async setActivePages(pageIds: string[]): Promise<void> {
     await ipcRenderer.invoke(
-      "kcreate/session/setActivePages",
+      "kcreate/session/set-active-pages",
       JSON.stringify(pageIds),
     );
   },

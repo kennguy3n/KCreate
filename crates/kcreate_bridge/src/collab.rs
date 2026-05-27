@@ -277,8 +277,9 @@ pub enum SessionEvent {
     /// budget for one of the rate-limited message classes. The
     /// renderer surfaces a "<peer> is sending too fast" warning;
     /// if the abuse continues for
-    /// `SessionConfig::rate_limit_disconnect_after` seconds the
-    /// session emits [`SessionEvent::PeerKicked`] with reason
+    /// `SessionConfig::rate_limit_disconnect_after` consecutive
+    /// rolling windows the session emits
+    /// [`SessionEvent::PeerKicked`] with reason
     /// `rate-limit-exceeded` and closes the QUIC connection.
     RateLimitWarning {
         peer_id: String,
@@ -286,10 +287,13 @@ pub enum SessionEvent {
         /// `metric` rather than `kind` because the enum already
         /// uses `kind` as its serde discriminator.)
         metric: String,
-        /// How many consecutive 1-second windows the peer has now
-        /// been over its budget (1 on the first warning, 2 on the
-        /// second, etc.).
-        consecutive_overflow_seconds: u32,
+        /// How many consecutive rolling 1-second windows the peer
+        /// has now been over its budget (1 on the first warning,
+        /// 2 on the second, etc.). Named `_windows` (not
+        /// `_seconds`) because the counter measures **windows**,
+        /// not wall-clock seconds — keeping the unit explicit if
+        /// we ever tune the window width.
+        consecutive_overflow_windows: u32,
     },
     /// Phase 7 (Task 19): the host scheduled a session encryption
     /// key rotation. Carries the new cert fingerprint peers should
@@ -1049,9 +1053,9 @@ fn apply_event(ev: InboundEvent) {
 ///   dropped so a flood still doesn't make it through, but the
 ///   peer's connection stays open so they can correct their
 ///   behaviour).
-/// - Subsequent consecutive overflow seconds: continue to emit
-///   warnings each second.
-/// - When `consecutive_overflow_seconds >= rate_limit_disconnect_after`
+/// - Subsequent consecutive overflow windows: continue to emit
+///   warnings each window.
+/// - When `consecutive_overflow_windows >= rate_limit_disconnect_after`
 ///   (and that threshold is non-zero): emit `PeerKicked` with reason
 ///   `rate-limit-exceeded` and schedule a transport-level
 ///   disconnect.
@@ -1070,17 +1074,17 @@ fn apply_rate_limit_check(
     match decision {
         kcreate_collab::RateBudgetDecision::Ok => true,
         kcreate_collab::RateBudgetDecision::OverBudget {
-            consecutive_overflow_seconds,
+            consecutive_overflow_windows,
         } => {
             let kick_threshold = host.rate_limit_disconnect_after();
             let should_kick =
-                kick_threshold > 0 && consecutive_overflow_seconds >= kick_threshold;
+                kick_threshold > 0 && consecutive_overflow_windows >= kick_threshold;
             push_event(
                 state,
                 SessionEvent::RateLimitWarning {
                     peer_id: from.as_str().to_string(),
                     metric: metric.into(),
-                    consecutive_overflow_seconds,
+                    consecutive_overflow_windows,
                 },
             );
             if should_kick {

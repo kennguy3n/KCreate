@@ -188,7 +188,7 @@ fn rate_limit_warns_then_escalates_to_kick_threshold() {
         assert_eq!(
             dec,
             RateBudgetDecision::OverBudget {
-                consecutive_overflow_seconds: second + 1
+                consecutive_overflow_windows: second + 1
             }
         );
     }

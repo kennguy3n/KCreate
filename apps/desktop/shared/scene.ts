@@ -3175,10 +3175,14 @@ export type SessionEvent =
       peerId: string;
       /// Which counter was breached: `operations` or `presence`.
       metric: string;
-      /// Number of seconds the peer has been continuously over
-      /// budget. Drives the warn → kick escalation threshold
+      /// Number of consecutive rolling 1-second windows the peer
+      /// has been continuously over budget. Named `_windows`
+      /// (not `_seconds`) because the counter measures **windows**,
+      /// not wall-clock seconds — keeps the unit explicit if the
+      /// window width is ever retuned. Drives the warn → kick
+      /// escalation threshold
       /// (`SessionConfig::rate_limit_disconnect_after`).
-      consecutiveOverflowSeconds: number;
+      consecutiveOverflowWindows: number;
     }
   | {
       /// Phase 7 (Task 21): a peer was rejected (or kicked) because

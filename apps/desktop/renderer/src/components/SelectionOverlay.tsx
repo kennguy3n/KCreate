@@ -19,7 +19,7 @@
 //     too) and re-fetching here would duplicate the IPC traffic on
 //     every node mutation.
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 
 import type { NodeInfo, SessionPeer } from "../../../shared/scene";
 
@@ -46,6 +46,84 @@ export interface SelectionOverlayProps {
 /// through the viewport (a 4-px outline at zoom=8 would be 32 px,
 /// which would dominate the canvas).
 const SELECTION_STROKE_PX = 2;
+
+/// Horizontal padding (px) inside the name pill on either side of
+/// the text. Matches `CursorOverlay`'s pill so the two overlays
+/// look like the same visual language.
+const SEL_PILL_PADDING_X = 4;
+/// Minimum pill width (px) so a 1-character display name doesn't
+/// render as a thin sliver before the layout effect runs.
+const SEL_PILL_MIN_WIDTH = 40;
+/// Fallback pill width (px) used on first paint before `getBBox()`
+/// has measured the actual text. Picked to fit a typical
+/// 6-character Latin name; wide-glyph names resize on the next frame.
+const SEL_PILL_FALLBACK_WIDTH = 56;
+
+/// Per-peer label rendered inside the selection outline. Measures
+/// its own text via `getBBox()` (same pattern as `CursorOverlay`'s
+/// `PeerLabel`) so wide glyphs (CJK / emoji / ligatures) and narrow
+/// glyphs (i / l / 1) get the right pill width — a static
+/// `name.length * 7px` heuristic over-sizes Latin names and
+/// under-sizes CJK names.
+function SelectionPeerLabel({
+  name,
+  color,
+  x,
+  y,
+}: {
+  name: string;
+  color: string;
+  x: number;
+  y: number;
+}): JSX.Element {
+  const textRef = useRef<SVGTextElement>(null);
+  const [textWidth, setTextWidth] = useState<number | null>(null);
+
+  useLayoutEffect(() => {
+    if (textRef.current == null) return;
+    try {
+      const bbox = textRef.current.getBBox();
+      setTextWidth(bbox.width);
+    } catch {
+      // Element was detached between schedule and execution of the
+      // effect — leave the fallback width in place; the next mount
+      // will measure cleanly.
+    }
+  }, [name]);
+
+  const pillWidth = Math.max(
+    SEL_PILL_MIN_WIDTH,
+    textWidth != null
+      ? Math.ceil(textWidth) + SEL_PILL_PADDING_X * 2
+      : SEL_PILL_FALLBACK_WIDTH,
+  );
+
+  return (
+    <>
+      <rect
+        x={x}
+        y={y}
+        width={pillWidth}
+        height={14}
+        rx={2}
+        ry={2}
+        fill={color}
+        opacity={0.95}
+      />
+      <text
+        ref={textRef}
+        x={x + SEL_PILL_PADDING_X}
+        y={y + 10}
+        fill="#ffffff"
+        fontSize={10}
+        fontFamily="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif"
+        fontWeight={600}
+      >
+        {name}
+      </text>
+    </>
+  );
+}
 
 export function SelectionOverlay({
   width,
@@ -182,28 +260,12 @@ export function SelectionOverlay({
               get only the dashed rectangle.
             */}
             {w >= 48 && h >= 18 && (
-              <>
-                <rect
-                  x={x}
-                  y={Math.max(y - 16, 0)}
-                  width={Math.max(40, peer.displayName.length * 7 + 8)}
-                  height={14}
-                  rx={2}
-                  ry={2}
-                  fill={color}
-                  opacity={0.95}
-                />
-                <text
-                  x={x + 4}
-                  y={Math.max(y - 16, 0) + 10}
-                  fill="#ffffff"
-                  fontSize={10}
-                  fontFamily="-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif"
-                  fontWeight={600}
-                >
-                  {peer.displayName}
-                </text>
-              </>
+              <SelectionPeerLabel
+                name={peer.displayName}
+                color={color}
+                x={x}
+                y={Math.max(y - 16, 0)}
+              />
             )}
           </g>
         );

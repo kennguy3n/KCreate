@@ -321,9 +321,15 @@ pub struct KeyRotationPayload {
     /// Bootstrap cert is epoch 0; first rotation is epoch 1.
     #[serde(default)]
     pub epoch: u64,
-    /// BLAKE2 / SHA-256 fingerprint of the host's new self-signed
-    /// certificate, lowercase hex (matches the format already used
-    /// by [`crate::peer::PeerIdentity::public_key`] for consistency).
+    /// SHA-256 fingerprint of the host's new self-signed
+    /// certificate, base64url-no-padding-encoded — same wire
+    /// format used by [`crate::peer::PeerIdentity::public_key`]
+    /// (Ed25519 verifying key) and by the mDNS TXT record's `cf`
+    /// key (see `kcreate_collab_transport::discovery`'s
+    /// `cert_fingerprint_b64`). Receivers MUST pin this exact
+    /// fingerprint when they re-dial the host inside the
+    /// transition window so the TLS handshake refuses any
+    /// imposter holding a different cert.
     pub new_cert_fingerprint: String,
     /// Wall-clock instant by which receivers must acknowledge and
     /// re-dial. Peers that don't ack inside the window are

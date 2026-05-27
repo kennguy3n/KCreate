@@ -161,8 +161,10 @@ pub struct AuditQuery {
     /// Exclusive upper bound on `timestamp`.
     pub until: Option<Timestamp>,
     /// Match the event kind by discriminator string. Use
-    /// `"operation"`, `"ai_action"`, `"project"`, `"other"`. Matches
-    /// the `serde` `rename_all = "snake_case"` tag.
+    /// `"operation"`, `"ai_action"`, `"project"`, `"collab"`,
+    /// `"other"`. Matches the `kind` column written by
+    /// [`AuditEvent::kind_tag`] (which mirrors the `serde`
+    /// `rename_all = "snake_case"` tag).
     pub kind: Option<String>,
     /// Restrict to a specific project.
     pub project_id: Option<Uuid>,

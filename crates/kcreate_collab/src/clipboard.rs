@@ -16,16 +16,21 @@
 //!    Montgomery point map (`VerifyingKey::to_montgomery()`).
 //! 2. The sender computes the X25519 shared secret using its own
 //!    secret scalar and the recipient's Montgomery point.
-//! 3. The shared secret is fed through a BLAKE3 keyed hash with
-//!    a fixed-domain label so it cannot collide with any other
-//!    secret derived from the same shared secret. The output is
-//!    a 32-byte ChaCha20Poly1305 key + 12-byte nonce.
+//! 3. The shared secret is fed through `blake3::derive_key` with a
+//!    fixed-domain context string so the derived key cannot collide
+//!    with any other secret a future caller might derive from the
+//!    same X25519 shared secret. The output is a 32-byte
+//!    ChaCha20-Poly1305 key — the 12-byte AEAD nonce is **not**
+//!    derived here; it is an external input the caller MUST
+//!    generate fresh (via `getrandom`) per message and transmit
+//!    alongside the ciphertext.
 //! 4. The plaintext is encrypted with ChaCha20Poly1305 (AEAD) so
 //!    tampering is detected on the receiver side.
 //!
 //! The wire envelope ([`crate::message::ClipboardSharePayload`])
-//! carries the ciphertext + nonce + a short preview label (e.g.
-//! `"3 nodes"`) the recipient renders in the accept/reject prompt.
+//! carries the ciphertext + the externally generated nonce + a
+//! short preview label (e.g. `"3 nodes"`) the recipient renders in
+//! the accept/reject prompt.
 
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Key as ChaChaKey, Nonce as ChaChaNonce};

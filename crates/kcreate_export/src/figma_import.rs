@@ -591,7 +591,14 @@ fn extract_rgba(
         .and_then(serde_json::Value::as_f64)
         .unwrap_or(1.0);
     let a = (a_inner * a_outer).clamp(0.0, 1.0);
-    Some([clamp_u8(r), clamp_u8(g), clamp_u8(b), (a * 255.0) as u8])
+    // All four channels go through `clamp_u8` (which rounds) so that the
+    // same source color produces the same byte tuple regardless of which
+    // import path is taken — see `sketch_import::parse_sketch_color`,
+    // which is the reference implementation. Truncating the alpha (`as
+    // u8`) would silently subtract 1 from semi-transparent layers, e.g.
+    // a Figma color with `a = 0.999` would yield alpha = 254 instead of
+    // 255, accumulating visible drift across stacked transparent fills.
+    Some([clamp_u8(r), clamp_u8(g), clamp_u8(b), clamp_u8(a)])
 }
 
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -955,5 +962,42 @@ mod tests {
         std::fs::write(&path, "{not valid json").unwrap();
         let err = import_figma(&path).unwrap_err();
         assert!(matches!(err, FigmaImportError::Parse { .. }));
+    }
+
+    #[test]
+    fn extract_rgba_rounds_alpha_consistently_with_rgb() {
+        // The visible bug: `a = 0.999` truncated as u8 yields 254, but
+        // rounded yields 255. The same source color imported through
+        // Sketch's `parse_sketch_color` (which uses `clamp_u8`) yields
+        // 255, so both paths must now agree.
+        let color = serde_json::json!({"r": 0.5, "g": 0.5, "b": 0.5, "a": 0.999});
+        let rgba = super::extract_rgba(&color, None).expect("solid color");
+        assert_eq!(rgba[3], 255, "alpha must round, not truncate");
+        // R/G/B round too: 0.5 * 255 = 127.5 → 128.
+        assert_eq!(&rgba[..3], &[128_u8, 128, 128]);
+    }
+
+    #[test]
+    fn extract_rgba_outer_opacity_rounds_alpha() {
+        // Outer opacity multiplies on top of the inner alpha. The
+        // product is still rounded to the nearest u8.
+        let color = serde_json::json!({"r": 1.0, "g": 1.0, "b": 1.0, "a": 1.0});
+        // 0.5 * 255 = 127.5, which rounds up to 128.
+        let opacity = serde_json::json!(0.5);
+        let rgba = super::extract_rgba(&color, Some(&opacity)).expect("solid color");
+        assert_eq!(rgba[3], 128);
+    }
+
+    #[test]
+    fn extract_rgba_clamps_out_of_range_alpha() {
+        // Even though Figma promises 0..=1, a malformed export may
+        // emit values outside that range. The clamp keeps the cast
+        // sound and prevents UB.
+        let color = serde_json::json!({"r": 1.0, "g": 1.0, "b": 1.0, "a": 2.0});
+        let rgba = super::extract_rgba(&color, None).expect("solid color");
+        assert_eq!(rgba[3], 255);
+        let color = serde_json::json!({"r": 1.0, "g": 1.0, "b": 1.0, "a": -1.0});
+        let rgba = super::extract_rgba(&color, None).expect("solid color");
+        assert_eq!(rgba[3], 0);
     }
 }

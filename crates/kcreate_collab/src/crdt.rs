@@ -155,6 +155,28 @@ fn is_document_setting_command(cmd: &str) -> bool {
 }
 
 fn is_create_command(cmd: &str) -> bool {
+    // Creation commands mint new node ids; concurrent ones are almost
+    // always disjoint, and where they're not (e.g. same id minted on two
+    // peers, only possible with hostile clients) we'd rather keep both
+    // than drop one.
+    //
+    // The clipboard / import populate commands are listed here even
+    // though they're typically single-peer or single-session operations:
+    // (a) `clipboard_paste` mints fresh UUIDs for every pasted root, so
+    //     a remote peer pasting at the same time as us will mint a
+    //     disjoint id set — `KeepBoth` is the right outcome.
+    // (b) `figma_import_populate_page` / `sketch_import_populate_page`
+    //     also append freshly-minted ids to an existing page; if two
+    //     peers were to run an import simultaneously we want both
+    //     trees to land (deduping is the user's problem, not ours).
+    //
+    // Registering them explicitly here (rather than letting them fall
+    // through to `Other` and rely on the empty-affected_nodes
+    // shortcut) makes the intent legible and guards against a future
+    // maintainer adding a clipboard-like op that *reuses* source UUIDs
+    // — that would silently hit the LWW fallback and drop one peer's
+    // work without this explicit registration making the contract
+    // visible at the classifier.
     matches!(
         cmd,
         "document_create_node"
@@ -168,6 +190,9 @@ fn is_create_command(cmd: &str) -> bool {
             | "component_add_variant"
             | "interaction_add"
             | "slice_create"
+            | "clipboard_paste"
+            | "figma_import_populate_page"
+            | "sketch_import_populate_page"
     )
 }
 
@@ -181,6 +206,12 @@ fn is_create_command(cmd: &str) -> bool {
 /// or `set_*`, register it in the appropriate specific classifier
 /// first so it doesn't silently fall through to property-merge.
 fn is_property_update_command(cmd: &str) -> bool {
+    // The exact-match arms come first so a future renamer doesn't
+    // accidentally lose the explicit registration when changing the
+    // suffix/prefix matchers below. `layer_color_set` is listed
+    // explicitly because the `set_*` matcher only fires for commands
+    // that *start with* `set_`; a command ending with `_set` (like
+    // `layer_color_set`) would otherwise fall through to `Other`.
     cmd == "document_update_node"
         || cmd == "text_frame_update"
         || cmd == "text_opentype_features_update"
@@ -188,6 +219,7 @@ fn is_property_update_command(cmd: &str) -> bool {
         || cmd == "artboard_resize"
         || cmd == "component_switch_variant"
         || cmd == "component_detach"
+        || cmd == "layer_color_set"
         || cmd.ends_with("_update")
         || cmd.starts_with("apply_")
         || cmd.starts_with("set_")
@@ -743,5 +775,85 @@ mod tests {
             CrdtDecision::KeepLocal.into_conflict_decision(),
             ConflictDecision::KeepLocal
         );
+    }
+
+    #[test]
+    fn classifier_recognises_clipboard_and_import_populate_as_create() {
+        // The clipboard paste and import populate commands all mint
+        // fresh UUIDs and append to an existing tree. Classifying them
+        // as `Create` guards future renames / additions from silently
+        // dropping a peer's work — see the doc comment on
+        // `is_create_command`.
+        for cmd in [
+            "clipboard_paste",
+            "figma_import_populate_page",
+            "sketch_import_populate_page",
+        ] {
+            let op = Operation::new("user", cmd, json!({}), json!({}), vec![Uuid::new_v4()]);
+            assert_eq!(
+                OperationCategory::classify(&op),
+                OperationCategory::Create,
+                "{cmd} must classify as Create",
+            );
+        }
+    }
+
+    #[test]
+    fn classifier_recognises_layer_color_set_as_property_update() {
+        // `layer_color_set` ends with `_set`; the `set_*` prefix
+        // matcher only fires on commands that *start* with `set_`, so
+        // without the explicit exact-match arm this op would fall
+        // through to `Other` and skip the per-key merge path.
+        let op = Operation::new(
+            "user",
+            "layer_color_set",
+            json!({"color": "red"}),
+            json!({"color": "blue"}),
+            vec![Uuid::new_v4()],
+        );
+        assert_eq!(
+            OperationCategory::classify(&op),
+            OperationCategory::PropertyUpdate,
+        );
+    }
+
+    #[test]
+    fn concurrent_clipboard_paste_keeps_both_sides() {
+        // Two peers paste at the same instant — the freshly-minted
+        // UUIDs on each side are disjoint, so both pastes must land.
+        // The disjoint-affected-nodes shortcut handles this even
+        // without the explicit `Create` classification, but registering
+        // the command as Create means the *second* layer of defence
+        // (the `Create + Create -> KeepBoth` rule at lines ~352-356)
+        // also fires; either path produces `KeepBoth`.
+        let local = Operation::new(
+            "user",
+            "clipboard_paste",
+            json!({}),
+            json!({}),
+            vec![Uuid::new_v4()],
+        );
+        let remote = Operation::new(
+            "user",
+            "clipboard_paste",
+            json!({}),
+            json!({}),
+            vec![Uuid::new_v4()],
+        );
+        let a = peer("alpha");
+        let b = peer("bravo");
+        let decision = CrdtResolver.resolve_crdt(
+            OperationContext {
+                op: &local,
+                clock: LamportClock::from_raw(1),
+                author: &a,
+            },
+            OperationContext {
+                op: &remote,
+                clock: LamportClock::from_raw(2),
+                author: &b,
+            },
+        );
+        assert_eq!(decision, CrdtDecision::KeepBoth);
     }
 }

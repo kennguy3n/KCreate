@@ -196,6 +196,11 @@ struct HostInner {
     /// Application version string echoed in `Hello` for forensic
     /// display.
     app_version: String,
+    /// Phase 7 (Task 22): copy of the [`SessionConfig`] used to
+    /// seed `ProjectSession`. The bridge needs to read knobs like
+    /// `rate_limit_disconnect_after` outside the session lock to
+    /// decide whether a rate-limit overflow warrants a kick.
+    session_config: SessionConfig,
 }
 
 /// State per connected peer.
@@ -253,6 +258,7 @@ impl LanCollabHost {
                 "multiplayer is locked: not signed into a KChat group".into(),
             ));
         }
+        let session_config = opts.session_config.clone();
         let session = ProjectSession::new_with_authority(
             opts.local_key,
             local_identity.display_name.clone(),
@@ -278,6 +284,7 @@ impl LanCollabHost {
             inbound_tx,
             shutdown_tx,
             app_version: env!("CARGO_PKG_VERSION").to_string(),
+            session_config,
         });
 
         let host = Self { inner };
@@ -579,6 +586,68 @@ impl LanCollabHost {
         payload: kcreate_collab::LockReleasePayload,
     ) -> Result<(), TransportError> {
         self.broadcast(Message::LockRelease(payload)).await
+    }
+
+    /// Phase 7 (Task 22): record one inbound metered event from a
+    /// peer and return the budget decision. Callers (the bridge's
+    /// inbound pump) feed this on every `OperationBroadcast` /
+    /// `Presence` ingest; the returned decision drives the
+    /// `RateLimitWarning` event and (after sustained abuse) a
+    /// forced `disconnect_peer` call.
+    pub async fn record_rate_event(
+        &self,
+        peer_id: &PeerId,
+        kind: kcreate_collab::RateLimitKind,
+        now: std::time::Instant,
+    ) -> kcreate_collab::RateBudgetDecision {
+        let mut session = self.inner.session.lock().await;
+        session.record_rate_event(peer_id, kind, now)
+    }
+
+    /// Phase 7 (Task 22): the host-side
+    /// [`SessionConfig::rate_limit_disconnect_after`] knob, exposed
+    /// for the bridge so the inbound pump can decide whether a
+    /// peer over budget should be kicked or only warned.
+    pub fn rate_limit_disconnect_after(&self) -> u32 {
+        self.inner.session_config.rate_limit_disconnect_after
+    }
+
+    /// Phase 7 (Task 19): record a peer's [`Message::KeyRotationAck`].
+    /// Returns `true` if the peer was in the trust roster.
+    pub async fn record_key_rotation_ack(&self, peer_id: &PeerId, epoch: u64) -> bool {
+        let mut session = self.inner.session.lock().await;
+        session.record_key_rotation_ack(peer_id, epoch)
+    }
+
+    /// Phase 7 (Task 19): return all peers that haven't acked
+    /// `current_epoch`. The bridge uses this after the rotation
+    /// grace window has elapsed to disconnect non-compliant peers.
+    pub async fn peers_missing_key_rotation(&self, current_epoch: u64) -> Vec<PeerId> {
+        let session = self.inner.session.lock().await;
+        session.peers_missing_key_rotation(current_epoch)
+    }
+
+    /// Phase 7 (Task 19): fan a [`Message::KeyRotation`] out to
+    /// every connected peer. Receivers reply with
+    /// [`Message::KeyRotationAck`]; the bridge's inbound pump
+    /// pipes those into [`Self::record_key_rotation_ack`].
+    pub async fn broadcast_key_rotation(
+        &self,
+        payload: kcreate_collab::KeyRotationPayload,
+    ) -> Result<(), TransportError> {
+        self.broadcast(Message::KeyRotation(payload)).await
+    }
+
+    /// Phase 7 (Task 23): send an encrypted clipboard payload to
+    /// the named peer. Errors mirror `send_to` — the recipient is
+    /// looked up by peer id.
+    pub async fn send_clipboard_share(
+        &self,
+        peer_id: &PeerId,
+        payload: kcreate_collab::ClipboardSharePayload,
+    ) -> Result<(), TransportError> {
+        self.send_to(peer_id, Message::ClipboardShare(payload))
+            .await
     }
 
     /// Send a graceful `Goodbye` to every peer and close the QUIC
@@ -940,5 +1009,8 @@ fn message_kind(message: &Message) -> &'static str {
         Message::ResumeBundle(_) => "ResumeBundle",
         Message::LockClaim(_) => "LockClaim",
         Message::LockRelease(_) => "LockRelease",
+        Message::KeyRotation(_) => "KeyRotation",
+        Message::KeyRotationAck(_) => "KeyRotationAck",
+        Message::ClipboardShare(_) => "ClipboardShare",
     }
 }

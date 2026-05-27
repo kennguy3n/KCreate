@@ -33,7 +33,7 @@ use crate::peer::{PeerId, PeerKeyError};
 /// Current on-the-wire protocol version. Bump this whenever the
 /// envelope shape, payload variants, or signing canonicalisation
 /// changes.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// 16 bytes of replay-protection nonce. The session layer remembers
 /// a sliding window of recently-seen nonces per peer.

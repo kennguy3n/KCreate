@@ -2560,6 +2560,41 @@ function registerIpcHandlers(): void {
   ipcMain.handle("kcreate/session/local-permission", () =>
     requireBridge().sessionLocalPermission(),
   );
+
+  // Phase 7 (Task 21): ACL snapshot / replace.
+  ipcMain.handle("kcreate/session/acl-get", () =>
+    requireBridge().sessionAclGet(),
+  );
+  ipcMain.handle("kcreate/session/acl-set", (_e, aclJson: string) =>
+    requireBridge().sessionAclSet(aclJson),
+  );
+
+  // Phase 7 (Task 19): force a key rotation / read the current epoch.
+  ipcMain.handle("kcreate/session/rotate-keys", (_e, graceMs: number) =>
+    requireBridge().sessionRotateKeys(graceMs),
+  );
+  ipcMain.handle("kcreate/session/key-epoch", () =>
+    requireBridge().sessionKeyEpoch(),
+  );
+
+  // Phase 7 (Task 23): encrypted clipboard sharing. The bridge
+  // holds the local signing key from session_start — no seed
+  // travels back through IPC.
+  ipcMain.handle(
+    "kcreate/session/clipboard-share",
+    (_e, peerId: string, plaintext: Buffer, previewLabel: string) =>
+      requireBridge().sessionClipboardShare(peerId, plaintext, previewLabel),
+  );
+  ipcMain.handle(
+    "kcreate/session/clipboard-accept",
+    (_e, offerId: string) => requireBridge().sessionClipboardAccept(offerId),
+  );
+  ipcMain.handle("kcreate/session/clipboard-reject", (_e, offerId: string) =>
+    requireBridge().sessionClipboardReject(offerId),
+  );
+  ipcMain.handle("kcreate/session/pending-clipboard-offers", () =>
+    requireBridge().sessionPendingClipboardOffers(),
+  );
 }
 
 /// Point the KChat trust-store at the per-user JSON file under

@@ -2910,10 +2910,17 @@ pub fn session_start(
     // Must match the currently-installed KChat membership's
     // group id; mismatches return `SessionBridgeError::InvalidArgument`.
     community_id: Option<String>,
+    // Phase 7 (Task 21): optional path to the project's `.kstudio/`
+    // directory. When present the bridge loads `<dir>/acl.json` at
+    // session start and persists ACL changes back to that file.
+    // Omitted for ad-hoc sessions (no project on disk) — the ACL
+    // is still tracked in memory but changes are not persisted.
+    project_dir: Option<String>,
 ) -> NapiResult<String> {
     let pid = parse_uuid(&project_id)?;
+    let dir = project_dir.map(std::path::PathBuf::from);
     let report =
-        crate::collab::session_start(&seed_b64, &display_name, pid, advertise_mdns, community_id)
+        crate::collab::session_start(&seed_b64, &display_name, pid, advertise_mdns, community_id, dir)
             .map_err(map_session_err)?;
     serde_json::to_string(&report).map_err(|e| {
         NapiError::new(
@@ -3485,6 +3492,140 @@ pub fn session_kick_peer(peer_id: String, reason: String) -> NapiResult<()> {
 #[napi]
 pub fn session_request_resume(peer_id: String) -> NapiResult<()> {
     crate::collab::session_request_resume(&peer_id).map_err(map_session_err)
+}
+
+// ---------- Phase 7 (Tasks 19/21/23) collab security entry points ----------
+
+/// Phase 7 (Task 21): return the active session's ACL as a JSON
+/// string. `null` is returned when no session is running. The
+/// renderer's `AccessControlPanel.tsx` deserialises this into the
+/// matching `ProjectAcl` TypeScript type.
+#[cfg(feature = "collab")]
+#[napi]
+pub fn session_acl_get() -> NapiResult<Option<String>> {
+    match crate::collab::session_acl_get() {
+        None => Ok(None),
+        Some(acl) => serde_json::to_string(&acl).map(Some).map_err(|e| {
+            NapiError::new(
+                Status::GenericFailure,
+                format!("kcreate_bridge: session_acl_get serialize: {e}"),
+            )
+        }),
+    }
+}
+
+/// Phase 7 (Task 21): replace the active session's ACL with the
+/// JSON-serialised `ProjectAcl` payload. The change is persisted
+/// to `<project_dir>/acl.json` (when the session was started with a
+/// project_dir) and applied immediately — already-connected peers
+/// that no longer meet the new policy are kicked with reason
+/// `acl-rejected` and a matching `SessionEvent::AclRejected` is
+/// emitted.
+#[cfg(feature = "collab")]
+#[napi]
+pub fn session_acl_set(acl_json: String) -> NapiResult<()> {
+    let acl: kcreate_collab::ProjectAcl = serde_json::from_str(&acl_json).map_err(|e| {
+        NapiError::new(
+            Status::InvalidArg,
+            format!("kcreate_bridge: session_acl_set deserialize: {e}"),
+        )
+    })?;
+    crate::collab::session_acl_set(acl).map_err(map_session_err)
+}
+
+/// Phase 7 (Task 19): force an immediate session-key rotation.
+/// Returns the new epoch number. `grace_ms` is the wall-clock
+/// window peers have to ack the rotation; non-acking peers are
+/// disconnected with `key-rotation-timeout`.
+#[cfg(feature = "collab")]
+#[napi]
+pub fn session_rotate_keys(grace_ms: u32) -> NapiResult<u32> {
+    let grace = std::time::Duration::from_millis(u64::from(grace_ms));
+    let epoch = crate::collab::session_rotate_keys(grace).map_err(map_session_err)?;
+    Ok(u32::try_from(epoch).unwrap_or(u32::MAX))
+}
+
+/// Phase 7 (Task 19): current key-rotation epoch (0 at session
+/// start; bumped by every `session_rotate_keys` call). `null` when
+/// no session is running.
+#[cfg(feature = "collab")]
+#[napi]
+pub fn session_key_epoch() -> Option<u32> {
+    crate::collab::session_key_epoch().map(|e| u32::try_from(e).unwrap_or(u32::MAX))
+}
+
+/// Phase 7 (Task 23): encrypt the supplied plaintext for
+/// `peer_id` and send it as a `ClipboardShare` message. Returns
+/// the generated offer id so the renderer can correlate accept /
+/// reject decisions back to the original UI affordance. The local
+/// signing key is held by the bridge — there's no need (and no
+/// safe way) to pass the seed in from the renderer.
+#[cfg(feature = "collab")]
+#[napi]
+pub fn session_clipboard_share(
+    peer_id: String,
+    plaintext: napi::bindgen_prelude::Buffer,
+    preview_label: String,
+) -> NapiResult<String> {
+    crate::collab::session_clipboard_share(&peer_id, &plaintext, &preview_label)
+        .map_err(map_session_err)
+}
+
+/// Phase 7 (Task 23): decrypt a queued inbound clipboard offer and
+/// return the plaintext bytes. The offer is removed from the
+/// pending queue regardless of decryption outcome.
+#[cfg(feature = "collab")]
+#[napi]
+pub fn session_clipboard_accept(
+    offer_id: String,
+) -> NapiResult<napi::bindgen_prelude::Buffer> {
+    let bytes = crate::collab::session_clipboard_accept(&offer_id)
+        .map_err(map_session_err)?;
+    Ok(bytes.into())
+}
+
+/// Phase 7 (Task 23): discard a queued inbound clipboard offer
+/// without decrypting. Idempotent — unknown ids are a no-op.
+#[cfg(feature = "collab")]
+#[napi]
+pub fn session_clipboard_reject(offer_id: String) -> NapiResult<()> {
+    crate::collab::session_clipboard_reject(&offer_id).map_err(map_session_err)
+}
+
+/// Wire-format snapshot of a single pending clipboard offer. Used
+/// only by [`session_pending_clipboard_offers`] below — held at
+/// module scope (rather than nested in the function) so clippy's
+/// `items_after_statements` lint stays happy.
+#[cfg(feature = "collab")]
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WireClipboardOffer {
+    offer_id: String,
+    from_peer_id: String,
+    preview_label: String,
+}
+
+/// Phase 7 (Task 23): JSON-encoded snapshot of pending clipboard
+/// offers. Schema: `Array<{ offerId, fromPeerId, previewLabel }>`.
+/// The renderer renders an accept/reject prompt for each entry.
+#[cfg(feature = "collab")]
+#[napi]
+pub fn session_pending_clipboard_offers() -> NapiResult<String> {
+    let entries = crate::collab::session_pending_clipboard_offers();
+    let wire: Vec<WireClipboardOffer> = entries
+        .into_iter()
+        .map(|(offer_id, from_peer_id, preview_label)| WireClipboardOffer {
+            offer_id,
+            from_peer_id,
+            preview_label,
+        })
+        .collect();
+    serde_json::to_string(&wire).map_err(|e| {
+        NapiError::new(
+            Status::GenericFailure,
+            format!("kcreate_bridge: session_pending_clipboard_offers serialize: {e}"),
+        )
+    })
 }
 
 /// Capability probe — `true` when the bridge was compiled with the

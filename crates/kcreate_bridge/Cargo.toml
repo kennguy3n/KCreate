@@ -92,6 +92,10 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "ti
 # the dependency here under a feature flag doesn't change the
 # default-feature graph the local-first sentinel walks.
 ed25519-dalek = { workspace = true, optional = true }
+# Phase 7 (Task 23): OS RNG for fresh ChaCha20-Poly1305 nonces on
+# the clipboard-share send path. Only used under the `collab`
+# feature.
+getrandom = { workspace = true, optional = true }
 # tracing is pulled in by quinn / rustls under the `collab` feature;
 # we use it directly for `tracing::warn!` in the pump task.
 tracing = { workspace = true, optional = true }
@@ -148,7 +152,7 @@ native_canvas = ["dep:raw-window-handle"]
 # by default so the local-first sentinel keeps quinn / rustls /
 # mdns-sd out of the editing-path dependency tree; the Electron
 # host enables this when packaging a release that ships collab.
-collab = ["dep:kcreate_collab", "dep:kcreate_collab_transport", "dep:tokio", "dep:ed25519-dalek", "dep:tracing"]
+collab = ["dep:kcreate_collab", "dep:kcreate_collab_transport", "dep:tokio", "dep:ed25519-dalek", "dep:getrandom", "dep:tracing"]
 # Enable the dev-only KChat membership issuer N-API surface. Implies
 # `collab` (since the install path runs through the collab gate).
 # Off by default; non-dev builds must NOT enable this — minting a

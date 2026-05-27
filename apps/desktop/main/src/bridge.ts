@@ -851,6 +851,27 @@ export interface Bridge {
   sessionSetPeerPermission(peerId: string, permission: string): void;
   // Phase 7 (Task 11): local permission snapshot.
   sessionLocalPermission(): string;
+  // Phase 7 (Task 21): ACL snapshot / replace. `sessionAclGet`
+  // returns the JSON-serialised `ProjectAcl` or `null` when no
+  // session is running; `sessionAclSet` takes the same shape.
+  sessionAclGet(): string | null;
+  sessionAclSet(aclJson: string): void;
+  // Phase 7 (Task 19): force a session-key rotation; returns the
+  // new epoch. `sessionKeyEpoch` reports the current epoch (or
+  // `null` when idle).
+  sessionRotateKeys(graceMs: number): number;
+  sessionKeyEpoch(): number | null;
+  // Phase 7 (Task 23): encrypted clipboard sharing primitives.
+  // The local signing key lives on the bridge — there's no seed
+  // round-trip in either direction.
+  sessionClipboardShare(
+    peerId: string,
+    plaintext: Buffer,
+    previewLabel: string,
+  ): string;
+  sessionClipboardAccept(offerId: string): Buffer;
+  sessionClipboardReject(offerId: string): void;
+  sessionPendingClipboardOffers(): string;
   /// Re-publish the cached scene. Used by the session event tick
   /// to refresh remote-peer cursor overlays.
   documentRequestRender(): void;

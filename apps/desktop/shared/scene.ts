@@ -3119,7 +3119,111 @@ export type SessionEvent =
       /// Number of inverse operations in the batch (>= 1). Used
       /// by the activity feed so the toast pluralizes correctly.
       opCount: number;
+    }
+  | {
+      /// Phase 7 (Task 19): a fresh session key has been scheduled.
+      /// The renderer can surface a "rotating session keys…" toast
+      /// while peers acknowledge.
+      kind: "keyRotationScheduled";
+      /// Incrementing epoch number; matches the value passed into
+      /// later `keyRotationCompleted` events so the renderer can
+      /// correlate the two.
+      epoch: number;
+      /// New cert fingerprint (base64url, BLAKE3 of the SPKI bytes).
+      newCertFingerprint: string;
+      /// Wall-clock millisecond timestamp by which peers must ack
+      /// the rotation or be disconnected.
+      deadlineUnixMs: number;
+    }
+  | {
+      /// Phase 7 (Task 19): the grace window for a key rotation
+      /// elapsed. Acknowledged peers stay connected; missing peers
+      /// have already been kicked with reason `key-rotation-timeout`.
+      kind: "keyRotationCompleted";
+      epoch: number;
+      ackedPeerIds: string[];
+      droppedPeerIds: string[];
+    }
+  | {
+      /// Phase 7 (Task 22): a peer exceeded its per-second
+      /// operations/presence budget. The renderer surfaces this
+      /// as a non-blocking toast — repeated overflows escalate
+      /// to a `peerKicked` event with reason `rate-limit-exceeded`.
+      kind: "rateLimitWarning";
+      peerId: string;
+      /// Which counter was breached: `operations` or `presence`.
+      metric: string;
+      /// Number of seconds the peer has been continuously over
+      /// budget. Drives the warn → kick escalation threshold
+      /// (`SessionConfig::rate_limit_disconnect_after`).
+      consecutiveOverflowSeconds: number;
+    }
+  | {
+      /// Phase 7 (Task 21): a peer was rejected (or kicked) because
+      /// the project ACL doesn't authorise them and the active
+      /// session isn't relying on community gating to admit them.
+      /// The renderer uses this to log the denial in the audit feed
+      /// and to refresh the connected-peers list.
+      kind: "aclRejected";
+      peerId: string;
+      reason: string;
+    }
+  | {
+      /// Phase 7 (Task 23): a remote peer offered to share an
+      /// encrypted clipboard payload with us. The renderer shows
+      /// an accept/reject prompt; choosing accept resolves to the
+      /// plaintext via `session.acceptClipboardOffer(offerId)`,
+      /// reject simply discards the offer via
+      /// `session.rejectClipboardOffer(offerId)`.
+      kind: "clipboardShareOffered";
+      fromPeerId: string;
+      /// Short, human-readable preview the sender attached. Never
+      /// rendered as HTML — display it as plain text.
+      previewLabel: string;
+      /// Opaque identifier used by `acceptClipboardOffer` /
+      /// `rejectClipboardOffer`.
+      offerId: string;
     };
+
+/// Phase 7 (Task 21): permission level for a single entry in the
+/// project ACL. Mirrors `kcreate_collab::AclPermission`.
+export type AclPermission = "editor" | "viewer";
+
+/// Phase 7 (Task 21): ACL enforcement mode. Mirrors
+/// `kcreate_collab::AclMode`.
+///
+/// - `open`: ACL is advisory; peers not listed are still admitted
+///   (used when community gating is the primary authorisation).
+/// - `enforce`: ACL is the gate; peers must be either in the ACL
+///   or in the active community (when community gating is on).
+export type AclMode = "open" | "enforce";
+
+/// Phase 7 (Task 21): one row in the project ACL. Mirrors
+/// `kcreate_collab::AclEntry`.
+export interface AclEntry {
+  /// Base64url Ed25519 public key.
+  publicKey: string;
+  /// Free-form name shown in the ACL panel.
+  displayName: string;
+  permission: AclPermission;
+}
+
+/// Phase 7 (Task 21): persisted project ACL. Stored as
+/// `<project_dir>/acl.json`. Mirrors `kcreate_collab::ProjectAcl`.
+export interface ProjectAcl {
+  mode: AclMode;
+  entries: AclEntry[];
+}
+
+/// Phase 7 (Task 23): inbound pending clipboard offer surfaced by
+/// `session.pendingClipboardOffers()`. The renderer renders one row
+/// per entry and calls `acceptClipboardOffer` / `rejectClipboardOffer`
+/// when the user picks an action.
+export interface PendingClipboardOffer {
+  offerId: string;
+  fromPeerId: string;
+  previewLabel: string;
+}
 
 /// Block 7: per-peer Lamport high-water marks for the journal
 /// scoped to the running session's project. Mirrors
@@ -3244,6 +3348,42 @@ export interface SessionBridge {
   /// asynchronously as a `ResumeApplied` session event; this call
   /// only fires the request. KChat-gated.
   requestResume(peerId: string): Promise<void>;
+  /// Phase 7 (Task 21): snapshot of the active session's ACL. `null`
+  /// when no session is running.
+  acl(): Promise<ProjectAcl | null>;
+  /// Phase 7 (Task 21): replace the active session's ACL. The new
+  /// policy is persisted to `<project_dir>/acl.json` and applied
+  /// immediately — connected peers that no longer meet the policy
+  /// are kicked with reason `acl-rejected`.
+  setAcl(acl: ProjectAcl): Promise<void>;
+  /// Phase 7 (Task 19): force an immediate session-key rotation.
+  /// Returns the new epoch number. `graceMs` is the wall-clock
+  /// window peers have to ack the rotation; non-acking peers are
+  /// disconnected with `key-rotation-timeout`. The rotation result
+  /// arrives asynchronously as a `keyRotationCompleted` event.
+  rotateKeys(graceMs: number): Promise<number>;
+  /// Phase 7 (Task 19): current rotation epoch (0 at session start;
+  /// bumped on every successful rotation). `null` when no session
+  /// is running.
+  keyEpoch(): Promise<number | null>;
+  /// Phase 7 (Task 23): encrypt `plaintext` for `peerId` and send
+  /// it as an inbound `ClipboardShare` offer. Returns the generated
+  /// offer id; the recipient eventually responds by accepting or
+  /// rejecting through their own bridge.
+  shareClipboard(
+    peerId: string,
+    plaintext: Uint8Array,
+    previewLabel: string,
+  ): Promise<string>;
+  /// Phase 7 (Task 23): decrypt and dequeue an inbound clipboard
+  /// offer matching `offerId`. Returns the plaintext bytes.
+  acceptClipboardOffer(offerId: string): Promise<Uint8Array>;
+  /// Phase 7 (Task 23): discard an inbound clipboard offer without
+  /// decrypting it. Idempotent — unknown ids are a no-op.
+  rejectClipboardOffer(offerId: string): Promise<void>;
+  /// Phase 7 (Task 23): snapshot of inbound clipboard offers that
+  /// haven't yet been accepted or rejected.
+  pendingClipboardOffers(): Promise<PendingClipboardOffer[]>;
 }
 
 // ---------------------------------------------------------------------------

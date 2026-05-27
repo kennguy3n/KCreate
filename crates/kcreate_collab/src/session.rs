@@ -44,6 +44,28 @@ pub struct SessionConfig {
     /// memory bounded against a hostile peer announcing thousands of
     /// fake identities.
     pub max_peers: usize,
+    /// Phase 7 (Task 19): how often the host rotates the QUIC
+    /// session encryption certificate (forward secrecy). Set to
+    /// `None` to disable rotation. Default 60 minutes.
+    pub key_rotation_interval: Option<std::time::Duration>,
+    /// Phase 7 (Task 19): how long peers have to acknowledge a
+    /// [`crate::message::Message::KeyRotation`] before the host
+    /// disconnects them. Default 30 seconds.
+    pub key_rotation_grace: std::time::Duration,
+    /// Phase 7 (Task 22): maximum number of
+    /// [`crate::message::Message::OperationBroadcast`] envelopes a
+    /// single peer may send per rolling 1-second window. Default 100.
+    pub max_ops_per_second: u32,
+    /// Phase 7 (Task 22): maximum number of
+    /// [`crate::message::Message::Presence`] envelopes a single peer
+    /// may send per rolling 1-second window. Default 20.
+    pub max_presence_per_second: u32,
+    /// Phase 7 (Task 22): how many consecutive 1-second windows a
+    /// peer must remain over its budget before the host forcibly
+    /// disconnects them. Default 3 (i.e. ~3 seconds sustained
+    /// abuse). Set to `0` to disable the disconnect path and only
+    /// emit warnings.
+    pub rate_limit_disconnect_after: u32,
 }
 
 impl Default for SessionConfig {
@@ -51,6 +73,15 @@ impl Default for SessionConfig {
         Self {
             replay_window: 32_000,
             max_peers: 256,
+            // 1-hour rotation cadence. clippy's
+            // `duration_suboptimal_units` lint requires we name the
+            // unit explicitly rather than `from_secs(3_600)`.
+            #[allow(clippy::duration_suboptimal_units)]
+            key_rotation_interval: Some(std::time::Duration::from_secs(60 * 60)),
+            key_rotation_grace: std::time::Duration::from_secs(30),
+            max_ops_per_second: 100,
+            max_presence_per_second: 20,
+            rate_limit_disconnect_after: 3,
         }
     }
 }
@@ -61,6 +92,99 @@ struct PeerState {
     identity: PeerIdentity,
     last_clock: LamportClock,
     recent_nonces: VecDeque<[u8; NONCE_BYTES]>,
+    /// Phase 7 (Task 22): per-peer rate-limit counters. One bucket
+    /// per metered message class (operations, presence). The
+    /// buckets are checked + advanced on every inbound envelope of
+    /// the matching class.
+    ops_budget: RateBudget,
+    presence_budget: RateBudget,
+    /// Phase 7 (Task 19): which key rotation epoch the peer has
+    /// acknowledged. `0` means the peer hasn't acked any rotation
+    /// yet (i.e. they're still on the bootstrap cert). The host
+    /// compares this against [`ProjectSession::current_key_epoch`]
+    /// to decide whether the peer has missed the current rotation
+    /// deadline.
+    acked_key_epoch: u64,
+}
+
+/// Phase 7 (Task 22): rolling 1-second rate budget for a single
+/// metered message class.
+///
+/// `count` is the number of events observed in the window starting
+/// at `window_start`. When a new event arrives more than 1 second
+/// after `window_start`, the window slides forward (count resets to
+/// 1, `window_start` becomes the event time, and the
+/// `consecutive_overflow_seconds` counter advances or resets based
+/// on whether the just-closed window exceeded the budget).
+#[derive(Debug, Clone, Copy)]
+struct RateBudget {
+    window_start: std::time::Instant,
+    count: u32,
+    /// How many consecutive 1-second windows this peer has been
+    /// over the configured budget. Reset to 0 the first time a
+    /// closing window comes in under the cap. The session evicts
+    /// the peer once this hits the configured threshold.
+    consecutive_overflow_seconds: u32,
+}
+
+impl RateBudget {
+    fn new(now: std::time::Instant) -> Self {
+        Self {
+            window_start: now,
+            count: 0,
+            consecutive_overflow_seconds: 0,
+        }
+    }
+
+    /// Record one event at `now`. Returns
+    /// [`RateBudgetDecision::Ok`] if the peer is inside its budget,
+    /// [`RateBudgetDecision::OverBudget`] (with the consecutive
+    /// overflow streak) if the peer is over.
+    fn record(&mut self, now: std::time::Instant, limit: u32) -> RateBudgetDecision {
+        let window = std::time::Duration::from_secs(1);
+        if now.saturating_duration_since(self.window_start) >= window {
+            // The previous window closed. Decide whether to grow
+            // or reset the consecutive-overflow streak based on
+            // whether the just-closed window exceeded the cap.
+            if self.count > limit {
+                self.consecutive_overflow_seconds =
+                    self.consecutive_overflow_seconds.saturating_add(1);
+            } else {
+                self.consecutive_overflow_seconds = 0;
+            }
+            self.window_start = now;
+            self.count = 0;
+        }
+        self.count = self.count.saturating_add(1);
+        if self.count > limit {
+            RateBudgetDecision::OverBudget {
+                consecutive_overflow_seconds: self.consecutive_overflow_seconds + 1,
+            }
+        } else {
+            RateBudgetDecision::Ok
+        }
+    }
+}
+
+/// Result of recording one event against a [`RateBudget`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RateBudgetDecision {
+    /// Inside the budget.
+    Ok,
+    /// Outside the budget. The host should emit a warning event;
+    /// if `consecutive_overflow_seconds >=
+    /// SessionConfig::rate_limit_disconnect_after`, the host should
+    /// forcibly disconnect the peer.
+    OverBudget { consecutive_overflow_seconds: u32 },
+}
+
+/// Phase 7 (Task 22): kind of message a rate-limit check is being
+/// performed for. Returned alongside the budget decision so the
+/// bridge can route warnings into the right SessionEvent variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RateLimitKind {
+    Operation,
+    Presence,
 }
 
 /// A collaboration session for one project. Holds the local key,
@@ -218,14 +342,73 @@ impl ProjectSession {
         if derived != identity.peer_id {
             return Err(SessionError::PeerIdMismatch);
         }
+        let now = std::time::Instant::now();
         self.peers
             .entry(identity.peer_id.clone())
             .or_insert_with(|| PeerState {
                 identity,
                 last_clock: LamportClock::default(),
                 recent_nonces: VecDeque::with_capacity(self.config.replay_window.min(64)),
+                ops_budget: RateBudget::new(now),
+                presence_budget: RateBudget::new(now),
+                acked_key_epoch: 0,
             });
         Ok(())
+    }
+
+    /// Phase 7 (Task 22): record one inbound metered event from a
+    /// peer and return the budget decision so the caller can decide
+    /// whether to emit a warning or disconnect. The caller passes
+    /// the metric class so the right per-peer counter is touched.
+    ///
+    /// Returns [`RateBudgetDecision::Ok`] if the peer isn't in the
+    /// trust roster (the caller will already have rejected the
+    /// envelope upstream — we don't want to introduce a side-effect
+    /// that creates a peer entry from a rate-check).
+    pub fn record_rate_event(
+        &mut self,
+        peer_id: &PeerId,
+        kind: RateLimitKind,
+        now: std::time::Instant,
+    ) -> RateBudgetDecision {
+        let Some(state) = self.peers.get_mut(peer_id) else {
+            return RateBudgetDecision::Ok;
+        };
+        let (limit, budget) = match kind {
+            RateLimitKind::Operation => (self.config.max_ops_per_second, &mut state.ops_budget),
+            RateLimitKind::Presence => {
+                (self.config.max_presence_per_second, &mut state.presence_budget)
+            }
+        };
+        budget.record(now, limit)
+    }
+
+    /// Phase 7 (Task 19): record that a peer acknowledged the given
+    /// key rotation epoch. Returns `true` if the peer was known
+    /// (the ack was recorded), `false` if not.
+    pub fn record_key_rotation_ack(&mut self, peer_id: &PeerId, epoch: u64) -> bool {
+        if let Some(state) = self.peers.get_mut(peer_id) {
+            // Acks are monotonic — peers may not roll back to an
+            // older epoch.
+            if epoch > state.acked_key_epoch {
+                state.acked_key_epoch = epoch;
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Phase 7 (Task 19): return all peers whose `acked_key_epoch`
+    /// is behind `current_epoch`. The host calls this once the
+    /// key-rotation grace window has elapsed; every peer in the
+    /// returned set is disconnected for failing the rotation.
+    pub fn peers_missing_key_rotation(&self, current_epoch: u64) -> Vec<PeerId> {
+        self.peers
+            .iter()
+            .filter(|(_, state)| state.acked_key_epoch < current_epoch)
+            .map(|(id, _)| id.clone())
+            .collect()
     }
 
     /// Drop a peer from the roster (e.g. on Goodbye).
@@ -452,6 +635,9 @@ const fn message_project_id(msg: &Message) -> Option<Uuid> {
         Message::ResumeBundle(p) => Some(p.project_id),
         Message::LockClaim(p) => Some(p.project_id),
         Message::LockRelease(p) => Some(p.project_id),
+        Message::KeyRotation(p) => Some(p.project_id),
+        Message::KeyRotationAck(p) => Some(p.project_id),
+        Message::ClipboardShare(p) => Some(p.project_id),
         Message::Welcome(_) | Message::Presence(_) | Message::Heartbeat | Message::Goodbye(_) => {
             None
         }

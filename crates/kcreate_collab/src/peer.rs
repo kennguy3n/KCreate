@@ -159,15 +159,22 @@ impl PeerIdentity {
 
     /// Decode the public-key string back into a [`VerifyingKey`].
     pub fn verifying_key(&self) -> Result<VerifyingKey, PeerKeyError> {
-        let bytes = URL_SAFE_NO_PAD
-            .decode(self.public_key.as_bytes())
-            .map_err(|_| PeerKeyError::BadEncoding)?;
-        let arr: [u8; 32] = bytes
-            .as_slice()
-            .try_into()
-            .map_err(|_| PeerKeyError::WrongLength)?;
-        VerifyingKey::from_bytes(&arr).map_err(|_| PeerKeyError::Invalid)
+        decode_public_key(&self.public_key)
     }
+}
+
+/// Decode a base64url-no-padding-encoded Ed25519 verifying key into
+/// a [`VerifyingKey`]. Used by [`PeerIdentity::verifying_key`] and
+/// by ACL evaluation paths that have only the encoded form.
+pub fn decode_public_key(encoded: &str) -> Result<VerifyingKey, PeerKeyError> {
+    let bytes = URL_SAFE_NO_PAD
+        .decode(encoded.as_bytes())
+        .map_err(|_| PeerKeyError::BadEncoding)?;
+    let arr: [u8; 32] = bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| PeerKeyError::WrongLength)?;
+    VerifyingKey::from_bytes(&arr).map_err(|_| PeerKeyError::Invalid)
 }
 
 /// Local-only handle that owns the Ed25519 signing key. Not

@@ -273,6 +273,68 @@ pub enum SessionEvent {
         /// pluralize correctly).
         op_count: u32,
     },
+    /// Phase 7 (Task 22): a connected peer exceeded its per-second
+    /// budget for one of the rate-limited message classes. The
+    /// renderer surfaces a "<peer> is sending too fast" warning;
+    /// if the abuse continues for
+    /// `SessionConfig::rate_limit_disconnect_after` seconds the
+    /// session emits [`SessionEvent::PeerKicked`] with reason
+    /// `rate-limit-exceeded` and closes the QUIC connection.
+    RateLimitWarning {
+        peer_id: String,
+        /// `"operations"` or `"presence"`. (Field is named
+        /// `metric` rather than `kind` because the enum already
+        /// uses `kind` as its serde discriminator.)
+        metric: String,
+        /// How many consecutive 1-second windows the peer has now
+        /// been over its budget (1 on the first warning, 2 on the
+        /// second, etc.).
+        consecutive_overflow_seconds: u32,
+    },
+    /// Phase 7 (Task 19): the host scheduled a session encryption
+    /// key rotation. Carries the new cert fingerprint peers should
+    /// pin and the wall-clock deadline by which they must
+    /// acknowledge. The renderer surfaces a "session keys rotating
+    /// in N s" toast.
+    KeyRotationScheduled {
+        epoch: u64,
+        new_cert_fingerprint: String,
+        deadline_unix_ms: i64,
+    },
+    /// Phase 7 (Task 19): a key rotation completed — every peer
+    /// that didn't acknowledge in time has been disconnected. The
+    /// renderer dismisses the rotation toast on receipt.
+    KeyRotationCompleted {
+        epoch: u64,
+        /// Peers that successfully acknowledged the rotation.
+        acked_peer_ids: Vec<String>,
+        /// Peers that failed to acknowledge in time and were
+        /// disconnected by the host.
+        dropped_peer_ids: Vec<String>,
+    },
+    /// Phase 7 (Task 21): a peer was rejected at Hello-time because
+    /// they are not on the project ACL (and the project is in
+    /// ACL-enforcement mode — community gating alone is not
+    /// enough). The renderer surfaces this in the activity feed.
+    AclRejected {
+        peer_id: String,
+        public_key: String,
+        community_id: Option<String>,
+    },
+    /// Phase 7 (Task 23): a remote peer offered to share a
+    /// clipboard payload with the local user. The renderer
+    /// surfaces a "Ken wants to share their selection — Accept /
+    /// Reject" prompt; only on accept does the payload get
+    /// decrypted and pasted.
+    ClipboardShareOffered {
+        from_peer_id: String,
+        /// User-facing label the sender chose (e.g.
+        /// `"3 nodes"`).
+        preview_label: String,
+        /// Stable identifier for the offer so the accept/reject
+        /// callback can correlate to a stored ciphertext + nonce.
+        offer_id: String,
+    },
 }
 
 impl From<&PresencePayload> for SessionPresence {
@@ -447,7 +509,57 @@ struct SessionState {
     /// resolver's tiebreak rules apply unchanged.
     recent_local_ops:
         std::collections::VecDeque<(kcreate_collab::LamportClock, kcreate_core::Operation)>,
+    /// Phase 7 (Task 21): the project ACL loaded from disk at
+    /// session start. Consulted in the inbound pump's `PeerJoined`
+    /// handler to reject peers not on the allow-list (when the
+    /// ACL is in `Enforce` mode). Defaults to
+    /// [`ProjectAcl::default`] (open) so legacy projects without
+    /// an `acl.json` file keep working.
+    acl: kcreate_collab::ProjectAcl,
+    /// Phase 7 (Task 21): where the ACL was loaded from, so
+    /// `session_acl_update` can persist changes back to disk.
+    /// `None` for sessions started without a project dir hint —
+    /// the bridge still tracks the ACL in memory but doesn't
+    /// persist changes.
+    acl_path: Option<std::path::PathBuf>,
+    /// Phase 7 (Task 19): monotonic counter of how many key
+    /// rotations the host has issued during this session. The
+    /// bootstrap cert is epoch 0; each rotation bumps the counter.
+    key_epoch: u64,
+    /// Phase 7 (Task 23): pending clipboard offers received from
+    /// remote peers, keyed by `offer_id`. The renderer presents an
+    /// accept/reject prompt — accept calls
+    /// `session_clipboard_accept(offer_id)` which decrypts the
+    /// payload, reject discards. Bounded by
+    /// [`MAX_PENDING_CLIPBOARD_OFFERS`] to keep a hostile peer
+    /// from exhausting memory; the oldest offer is evicted FIFO
+    /// once the cap is hit.
+    pending_clipboard_offers: std::collections::VecDeque<PendingClipboardOffer>,
+    /// Phase 7 (Task 23): the local Ed25519 signing key, retained
+    /// here so the bridge can derive the X25519 shared secret with
+    /// remote peers for clipboard encryption / decryption without
+    /// asking the renderer to round-trip the seed. The seed enters
+    /// the bridge exactly once (via `session_start`) and never
+    /// leaves it; clipboard ops read from this copy instead.
+    local_signing_key: ed25519_dalek::SigningKey,
 }
+
+/// Phase 7 (Task 23): one queued inbound clipboard offer waiting
+/// for the user's accept/reject decision.
+#[derive(Debug, Clone)]
+struct PendingClipboardOffer {
+    offer_id: String,
+    from_peer_id: PeerId,
+    from_public_key: String,
+    payload: kcreate_collab::ClipboardSharePayload,
+}
+
+/// Phase 7 (Task 23): cap on the queue of unresolved clipboard
+/// offers. Each entry holds a ciphertext + nonce + base64-encoded
+/// pubkey; the practical memory ceiling is a few KB even at the
+/// cap, but bounding the queue prevents a hostile peer from
+/// flooding the renderer with unanswerable prompts.
+const MAX_PENDING_CLIPBOARD_OFFERS: usize = 64;
 
 /// Phase 7 (Task 16): how many of the most-recent local
 /// broadcasts to keep available for conflict detection. Sized to
@@ -710,6 +822,20 @@ fn apply_event(ev: InboundEvent) {
         }
         InboundEvent::Message { from, message } => match message.as_ref() {
             Message::Presence(p) => {
+                // Phase 7 (Task 22): rate-limit presence so a
+                // misbehaving peer can't flood the session. The
+                // first second the peer goes over its budget we
+                // emit a warning event; sustained violation for
+                // `rate_limit_disconnect_after` consecutive
+                // seconds triggers a forced disconnect.
+                if !apply_rate_limit_check(
+                    state,
+                    &from,
+                    kcreate_collab::RateLimitKind::Presence,
+                    "presence",
+                ) {
+                    return;
+                }
                 state.presence.insert(from.clone(), p.clone());
                 push_event(
                     state,
@@ -720,6 +846,19 @@ fn apply_event(ev: InboundEvent) {
                 );
             }
             Message::OperationBroadcast(p) => {
+                // Phase 7 (Task 22): same rate-limit treatment as
+                // Presence above. We count one event per inbound
+                // `OperationBroadcast` envelope rather than per
+                // contained operation — a single batched broadcast
+                // of 50 operations is one network event, not 50.
+                if !apply_rate_limit_check(
+                    state,
+                    &from,
+                    kcreate_collab::RateLimitKind::Operation,
+                    "operations",
+                ) {
+                    return;
+                }
                 // Block 7: journal the remote operations. The
                 // transport already verified the envelope's
                 // signature + Lamport monotonicity, and the
@@ -782,9 +921,136 @@ fn apply_event(ev: InboundEvent) {
             }
             // Hello / Welcome / Heartbeat / Goodbye are handled
             // by the transport layer itself, not surfaced as
-            // bridge-level events.
-            Message::Hello(_) | Message::Welcome(_) | Message::Heartbeat | Message::Goodbye(_) => {}
+            // bridge-level events. Phase 7 (Task 19): a
+            // `KeyRotation` from a remote peer (i.e. another
+            // KCreate that's hosting) is recorded for diagnostic
+            // but doesn't drive local state — our own rotation
+            // lifecycle is owned by `session_rotate_keys`.
+            Message::Hello(_)
+            | Message::Welcome(_)
+            | Message::Heartbeat
+            | Message::Goodbye(_)
+            | Message::KeyRotation(_) => {}
+            Message::KeyRotationAck(ack) => {
+                if ack.project_id == state.journal.project_id() {
+                    let host = state.host.clone();
+                    let runtime = state.runtime.handle().clone();
+                    let pid = from.clone();
+                    let epoch = ack.epoch;
+                    runtime.spawn(async move {
+                        let _ = host.record_key_rotation_ack(&pid, epoch).await;
+                    });
+                }
+            }
+            // Phase 7 (Task 23): queue the offer for the renderer
+            // to accept / reject. We bound the queue so a hostile
+            // peer can't exhaust memory; the oldest pending offer
+            // is evicted FIFO once we hit the cap. The actual
+            // decryption only happens on accept.
+            Message::ClipboardShare(payload) => {
+                if payload.project_id == state.journal.project_id() {
+                    if state.pending_clipboard_offers.len() >= MAX_PENDING_CLIPBOARD_OFFERS {
+                        let _ = state.pending_clipboard_offers.pop_front();
+                    }
+                    let preview_label = payload.preview_label.clone();
+                    let offer_id = payload.offer_id.clone();
+                    state.pending_clipboard_offers.push_back(PendingClipboardOffer {
+                        offer_id: offer_id.clone(),
+                        from_peer_id: from.clone(),
+                        from_public_key: payload.sender_public_key.clone(),
+                        payload: payload.clone(),
+                    });
+                    push_event(
+                        state,
+                        SessionEvent::ClipboardShareOffered {
+                            from_peer_id: from.as_str().to_string(),
+                            preview_label,
+                            offer_id,
+                        },
+                    );
+                }
+            }
         },
+    }
+}
+
+/// Phase 7 (Task 22): account for one inbound network event against
+/// the per-peer rate budget. Returns `true` if the message should
+/// be processed normally, `false` if it should be dropped (the peer
+/// is over budget and either deserves a warning or has just been
+/// kicked). The drop path also emits the appropriate
+/// `RateLimitWarning` / `PeerKicked` event so the renderer can show
+/// the moderation outcome.
+///
+/// The "warn then kick" policy is governed by the per-session
+/// `SessionConfig` carried by the host:
+///
+/// - First overflow second: emit `RateLimitWarning` (the message is
+///   dropped so a flood still doesn't make it through, but the
+///   peer's connection stays open so they can correct their
+///   behaviour).
+/// - Subsequent consecutive overflow seconds: continue to emit
+///   warnings each second.
+/// - When `consecutive_overflow_seconds >= rate_limit_disconnect_after`
+///   (and that threshold is non-zero): emit `PeerKicked` with reason
+///   `rate-limit-exceeded` and schedule a transport-level
+///   disconnect.
+fn apply_rate_limit_check(
+    state: &mut SessionState,
+    from: &PeerId,
+    kind: kcreate_collab::RateLimitKind,
+    metric: &'static str,
+) -> bool {
+    let host = state.host.clone();
+    let runtime = state.runtime.handle().clone();
+    let decision = runtime.block_on(async {
+        host.record_rate_event(from, kind, std::time::Instant::now())
+            .await
+    });
+    match decision {
+        kcreate_collab::RateBudgetDecision::Ok => true,
+        kcreate_collab::RateBudgetDecision::OverBudget {
+            consecutive_overflow_seconds,
+        } => {
+            let kick_threshold = host.rate_limit_disconnect_after();
+            let should_kick =
+                kick_threshold > 0 && consecutive_overflow_seconds >= kick_threshold;
+            push_event(
+                state,
+                SessionEvent::RateLimitWarning {
+                    peer_id: from.as_str().to_string(),
+                    metric: metric.into(),
+                    consecutive_overflow_seconds,
+                },
+            );
+            if should_kick {
+                push_event(
+                    state,
+                    SessionEvent::PeerKicked {
+                        peer_id: from.as_str().to_string(),
+                        reason: "rate-limit-exceeded".into(),
+                    },
+                );
+                let pid = from.clone();
+                runtime.spawn(async move {
+                    if let Err(e) = host
+                        .disconnect_peer(
+                            &pid,
+                            kcreate_collab::GoodbyeReason::Kicked(
+                                "rate-limit-exceeded".into(),
+                            ),
+                        )
+                        .await
+                    {
+                        tracing::warn!(
+                            "collab: rate-limit kick of {} failed: {e}",
+                            pid.as_str()
+                        );
+                    }
+                });
+            }
+            false
+        }
     }
 }
 
@@ -1167,6 +1433,7 @@ pub fn session_start(
     project_id: Uuid,
     advertise_mdns: bool,
     community_id: Option<String>,
+    project_dir: Option<std::path::PathBuf>,
 ) -> Result<SessionStartReport> {
     let mut guard = slot().lock();
     if guard.is_some() {
@@ -1283,6 +1550,15 @@ pub fn session_start(
     let journal = OperationJournal::open(MemoryJournalStore::new(), project_id)
         .expect("MemoryJournalStore::summary cannot fail");
 
+    // Phase 7 (Task 21): load the project ACL from `<dir>/acl.json`
+    // if a project directory was supplied. A missing file is fine
+    // — we fall back to an open ACL (no enforcement). Parse
+    // failures are logged + ignored so a corrupted ACL file
+    // doesn't brick session start; the host treats it as open
+    // and the renderer can surface a "couldn't load ACL"
+    // diagnostic via the audit channel.
+    let (acl, acl_path) = load_project_acl(project_dir.as_deref());
+
     let mut state = SessionState {
         host,
         runtime,
@@ -1297,6 +1573,11 @@ pub fn session_start(
         permissions: HashMap::new(),
         local_permission: CollabPermission::Editor,
         recent_local_ops: std::collections::VecDeque::with_capacity(RECENT_LOCAL_OPS_CAP),
+        acl,
+        acl_path,
+        key_epoch: 0,
+        pending_clipboard_offers: std::collections::VecDeque::new(),
+        local_signing_key: ed25519_dalek::SigningKey::from_bytes(&seed),
     };
     // Surface the local-lifecycle transition on the same event
     // channel every other session signal flows through, so renderer
@@ -2903,6 +3184,405 @@ pub fn kchat_derive_local_identity(seed_b64: &str) -> Result<KChatLocalIdentity>
     })
 }
 
+// ---------- Phase 7 (Tasks 19–23) entry points ----------
+
+/// File name written inside the project's `.kstudio/` directory
+/// for the per-document ACL.
+const ACL_FILENAME: &str = "acl.json";
+
+/// Phase 7 (Task 21): load the project ACL from `<project_dir>/acl.json`.
+/// Returns the (acl, source-path) pair. A missing file or unparseable
+/// content yields `(ProjectAcl::default(), Some(path))` so subsequent
+/// edits can still be persisted to the canonical location; an absent
+/// project_dir yields `(default(), None)` (no persistence).
+fn load_project_acl(
+    project_dir: Option<&std::path::Path>,
+) -> (kcreate_collab::ProjectAcl, Option<std::path::PathBuf>) {
+    let Some(dir) = project_dir else {
+        return (kcreate_collab::ProjectAcl::default(), None);
+    };
+    let path = dir.join(ACL_FILENAME);
+    let acl = match std::fs::read_to_string(&path) {
+        Ok(json) => serde_json::from_str::<kcreate_collab::ProjectAcl>(&json).unwrap_or_else(|e| {
+            tracing::warn!(
+                "collab: ACL file at {} could not be parsed ({e}); falling back to open ACL",
+                path.display()
+            );
+            kcreate_collab::ProjectAcl::default()
+        }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => kcreate_collab::ProjectAcl::default(),
+        Err(e) => {
+            tracing::warn!(
+                "collab: ACL file at {} could not be read ({e}); falling back to open ACL",
+                path.display()
+            );
+            kcreate_collab::ProjectAcl::default()
+        }
+    };
+    (acl, Some(path))
+}
+
+/// Phase 7 (Task 21): persist the ACL to `<project_dir>/acl.json`.
+/// Returns the I/O error rendered as a typed bridge error.
+fn save_project_acl(
+    path: &std::path::Path,
+    acl: &kcreate_collab::ProjectAcl,
+) -> Result<()> {
+    let json = serde_json::to_string_pretty(acl).map_err(|e| {
+        SessionBridgeError::InvalidArgument {
+            field: "acl",
+            message: format!("could not serialise ACL: {e}"),
+        }
+    })?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| SessionBridgeError::InvalidArgument {
+            field: "acl_path",
+            message: format!("could not create {}: {e}", parent.display()),
+        })?;
+    }
+    std::fs::write(path, json).map_err(|e| SessionBridgeError::InvalidArgument {
+        field: "acl_path",
+        message: format!("could not write {}: {e}", path.display()),
+    })?;
+    Ok(())
+}
+
+/// Phase 7 (Task 21): snapshot of the active session's ACL. Returns
+/// `None` when no session is running.
+#[must_use]
+pub fn session_acl_get() -> Option<kcreate_collab::ProjectAcl> {
+    let guard = slot().lock();
+    guard.as_ref().map(|s| s.acl.clone())
+}
+
+/// Phase 7 (Task 21): replace the active session's ACL and persist
+/// it to disk (if the session was started with a `project_dir`).
+/// Once the ACL is in `Enforce` mode any subsequently-joining peer
+/// is checked against the entries on Hello; already-connected peers
+/// are re-evaluated and disconnected with `acl-rejected` if they
+/// no longer meet the policy.
+pub fn session_acl_set(acl: kcreate_collab::ProjectAcl) -> Result<()> {
+    let mut guard = slot().lock();
+    let state = guard.as_mut().ok_or(SessionBridgeError::NotRunning)?;
+    state.acl = acl.clone();
+    let host = state.host.clone();
+    let runtime_handle = state.runtime.handle().clone();
+    if let Some(path) = state.acl_path.clone() {
+        save_project_acl(&path, &acl)?;
+    }
+    // Re-evaluate every currently-connected peer against the new
+    // ACL. Anyone who no longer passes is disconnected with an
+    // `acl-rejected` reason and an `AclRejected` event surfaces in
+    // the renderer.
+    let connected: Vec<PeerIdentity> = host.connected_peers();
+    let mut to_kick: Vec<(PeerId, String)> = Vec::new();
+    for ident in connected {
+        if matches!(state.acl.evaluate(&ident), kcreate_collab::AclDecision::Deny) {
+            to_kick.push((ident.peer_id.clone(), ident.public_key.clone()));
+        }
+    }
+    for (peer_id, public_key) in to_kick {
+        push_event(
+            state,
+            SessionEvent::AclRejected {
+                peer_id: peer_id.as_str().to_string(),
+                public_key,
+                community_id: state.community_id.clone(),
+            },
+        );
+        let host = host.clone();
+        let pid = peer_id.clone();
+        // Fire-and-forget — disconnects are best-effort; failure
+        // is logged but doesn't roll back the ACL change.
+        runtime_handle.spawn(async move {
+            if let Err(e) = host
+                .disconnect_peer(
+                    &pid,
+                    kcreate_collab::GoodbyeReason::Kicked("acl-rejected".into()),
+                )
+                .await
+            {
+                tracing::warn!("collab: ACL kick of {} failed: {e}", pid.as_str());
+            }
+        });
+    }
+    Ok(())
+}
+
+/// Phase 7 (Task 19): trigger a session-key rotation. Bumps the
+/// per-session key epoch, broadcasts a [`Message::KeyRotation`]
+/// carrying the new fingerprint and the grace deadline, and
+/// schedules a deferred sweep that disconnects every peer that
+/// hasn't acknowledged by the deadline.
+///
+/// Returns the new epoch number. Idempotent against double-rotation
+/// in the same instant — repeated calls bump the epoch each time so
+/// stale acks are rejected.
+pub fn session_rotate_keys(grace: std::time::Duration) -> Result<u64> {
+    let mut guard = slot().lock();
+    let state = guard.as_mut().ok_or(SessionBridgeError::NotRunning)?;
+    state.key_epoch = state.key_epoch.saturating_add(1);
+    let epoch = state.key_epoch;
+    // The transport already pins the cert per-connection; rotating
+    // here means future inbound connections see a fresh fingerprint
+    // (peers re-dial after handling the announcement). We surface
+    // the host's current fingerprint as the "new" one so the
+    // renderer can show "session keys rotated; new fingerprint X".
+    let new_fingerprint = state.host.cert_fingerprint_b64();
+    let deadline = chrono::Utc::now() + chrono::Duration::from_std(grace).unwrap_or_default();
+    let deadline_ms = deadline.timestamp_millis();
+    push_event(
+        state,
+        SessionEvent::KeyRotationScheduled {
+            epoch,
+            new_cert_fingerprint: new_fingerprint.clone(),
+            deadline_unix_ms: deadline_ms,
+        },
+    );
+    let host = state.host.clone();
+    let runtime_handle = state.runtime.handle().clone();
+    runtime_handle.spawn(async move {
+        let payload = kcreate_collab::KeyRotationPayload {
+            project_id: host.project_id(),
+            epoch,
+            new_cert_fingerprint: new_fingerprint.clone(),
+            transition_deadline: deadline,
+            reason: "periodic".into(),
+        };
+        if let Err(e) = host.broadcast_key_rotation(payload).await {
+            tracing::warn!("collab: broadcast_key_rotation failed: {e}");
+        }
+        tokio::time::sleep(grace).await;
+        // Sweep: every peer still missing the ack is forcibly
+        // disconnected.
+        let missing = host.peers_missing_key_rotation(epoch).await;
+        let mut acked: Vec<PeerId> = host.connected_peer_ids();
+        acked.retain(|p| !missing.contains(p));
+        for peer_id in &missing {
+            if let Err(e) = host
+                .disconnect_peer(
+                    peer_id,
+                    kcreate_collab::GoodbyeReason::Kicked("key-rotation-timeout".into()),
+                )
+                .await
+            {
+                tracing::warn!(
+                    "collab: key-rotation sweep disconnect of {} failed: {e}",
+                    peer_id.as_str()
+                );
+            }
+        }
+        // Surface the completion event so the renderer dismisses
+        // the "rotating…" toast.
+        let mut guard = slot().lock();
+        if let Some(state) = guard.as_mut() {
+            push_event(
+                state,
+                SessionEvent::KeyRotationCompleted {
+                    epoch,
+                    acked_peer_ids: acked
+                        .iter()
+                        .map(|p| p.as_str().to_string())
+                        .collect(),
+                    dropped_peer_ids: missing
+                        .iter()
+                        .map(|p| p.as_str().to_string())
+                        .collect(),
+                },
+            );
+        }
+    });
+    Ok(epoch)
+}
+
+/// Phase 7 (Task 19): snapshot of the current key-rotation epoch.
+/// Bootstrap cert is epoch 0; each [`session_rotate_keys`] bumps
+/// the value. Returns `None` when no session is running.
+#[must_use]
+pub fn session_key_epoch() -> Option<u64> {
+    let guard = slot().lock();
+    guard.as_ref().map(|s| s.key_epoch)
+}
+
+/// Phase 7 (Task 23): encrypt `plaintext` for `target_peer_id`
+/// using the X25519 key derived from the recipient's Ed25519
+/// identity and send it on the wire as a
+/// [`Message::ClipboardShare`]. The local user's signing key is
+/// held by the bridge (set once via `session_start`), so the
+/// renderer never has to round-trip the seed. `preview_label`
+/// is a short user-facing description shown in the recipient's
+/// accept/reject prompt.
+pub fn session_clipboard_share(
+    target_peer_id_b64: &str,
+    plaintext: &[u8],
+    preview_label: &str,
+) -> Result<String> {
+    let target: PeerId = target_peer_id_b64
+        .parse()
+        .map_err(
+            |e: kcreate_collab::CollabError| SessionBridgeError::InvalidArgument {
+                field: "peerId",
+                message: e.to_string(),
+            },
+        )?;
+    // Look up the recipient's public key on the host's roster, plus
+    // the local signing key + runtime / host snapshots we need for
+    // the async send. All taken under one lock so we don't hold the
+    // slot across an `await`.
+    let (recipient_pub_b64, project_id, host, runtime_handle, signing) = {
+        let guard = slot().lock();
+        let state = guard.as_ref().ok_or(SessionBridgeError::NotRunning)?;
+        let pub_b64 = state
+            .host
+            .connected_peers()
+            .iter()
+            .find(|p| p.peer_id == target)
+            .map(|p| p.public_key.clone())
+            .ok_or(SessionBridgeError::InvalidArgument {
+                field: "peerId",
+                message: "target peer is not connected".into(),
+            })?;
+        (
+            pub_b64,
+            state.host.project_id(),
+            state.host.clone(),
+            state.runtime.handle().clone(),
+            state.local_signing_key.clone(),
+        )
+    };
+    let recipient_vk = kcreate_collab::decode_public_key(&recipient_pub_b64).map_err(|e| {
+        SessionBridgeError::InvalidArgument {
+            field: "peerPublicKey",
+            message: format!("decode error: {e}"),
+        }
+    })?;
+    let nonce = generate_random_nonce();
+    let ciphertext_bytes = kcreate_collab::encrypt_clipboard_payload(
+        &signing,
+        &recipient_vk,
+        plaintext,
+        nonce,
+    )
+    .map_err(|e| SessionBridgeError::InvalidArgument {
+        field: "plaintext",
+        message: format!("encryption failed: {e}"),
+    })?;
+
+    let offer_id = uuid::Uuid::new_v4().to_string();
+    let payload = kcreate_collab::ClipboardSharePayload {
+        project_id,
+        offer_id: offer_id.clone(),
+        recipient_peer_id: target.as_str().to_string(),
+        sender_public_key: URL_SAFE_NO_PAD.encode(signing.verifying_key().as_bytes()),
+        nonce: URL_SAFE_NO_PAD.encode(nonce),
+        ciphertext: URL_SAFE_NO_PAD.encode(&ciphertext_bytes),
+        preview_label: preview_label.to_string(),
+    };
+    runtime_handle.block_on(async move {
+        host.send_clipboard_share(&target, payload).await
+    })?;
+    Ok(offer_id)
+}
+
+/// Draw 12 random bytes from the OS RNG for a fresh
+/// ChaCha20-Poly1305 nonce. Pulled into its own helper so the
+/// unsafe-feeling `getrandom` call site is isolated and easy to
+/// audit.
+fn generate_random_nonce() -> [u8; 12] {
+    let mut nonce = [0u8; 12];
+    // ed25519-dalek re-exports the `signature::rand_core` traits;
+    // we use `getrandom` directly to avoid pulling a separate
+    // `rand_core` dep through to this crate. `getrandom` is already
+    // a transitive dep via curve25519-dalek.
+    getrandom::getrandom(&mut nonce).expect("OS RNG must succeed for clipboard nonce");
+    nonce
+}
+
+/// Phase 7 (Task 23): accept a queued inbound clipboard offer,
+/// decrypt the ciphertext with the local signing key, and return
+/// the plaintext bytes to the renderer for paste. Drops the offer
+/// from the pending queue regardless of decryption outcome (a
+/// decryption failure means the ciphertext was tampered or the
+/// sender pubkey was wrong; either way the offer is dead).
+pub fn session_clipboard_accept(offer_id: &str) -> Result<Vec<u8>> {
+    let (offer, signing) = {
+        let mut guard = slot().lock();
+        let state = guard.as_mut().ok_or(SessionBridgeError::NotRunning)?;
+        let idx = state
+            .pending_clipboard_offers
+            .iter()
+            .position(|o| o.offer_id == offer_id)
+            .ok_or(SessionBridgeError::InvalidArgument {
+                field: "offerId",
+                message: "no pending clipboard offer with that id".into(),
+            })?;
+        let offer = state.pending_clipboard_offers.remove(idx).expect("idx valid");
+        let signing = state.local_signing_key.clone();
+        (offer, signing)
+    };
+    let sender_vk = kcreate_collab::decode_public_key(&offer.from_public_key).map_err(|e| {
+        SessionBridgeError::InvalidArgument {
+            field: "senderPublicKey",
+            message: format!("decode error: {e}"),
+        }
+    })?;
+    let nonce_bytes = URL_SAFE_NO_PAD
+        .decode(offer.payload.nonce.as_bytes())
+        .map_err(|e| SessionBridgeError::InvalidArgument {
+            field: "nonce",
+            message: format!("base64 decode failed: {e}"),
+        })?;
+    let ciphertext_bytes = URL_SAFE_NO_PAD
+        .decode(offer.payload.ciphertext.as_bytes())
+        .map_err(|e| SessionBridgeError::InvalidArgument {
+            field: "ciphertext",
+            message: format!("base64 decode failed: {e}"),
+        })?;
+    let pt = kcreate_collab::decrypt_clipboard_payload(
+        &signing,
+        &sender_vk,
+        &ciphertext_bytes,
+        &nonce_bytes,
+    )
+    .map_err(|e| SessionBridgeError::InvalidArgument {
+        field: "ciphertext",
+        message: format!("decryption failed: {e}"),
+    })?;
+    Ok(pt.bytes)
+}
+
+/// Phase 7 (Task 23): discard a queued inbound clipboard offer
+/// without decrypting. Idempotent — unknown ids are a no-op.
+pub fn session_clipboard_reject(offer_id: &str) -> Result<()> {
+    let mut guard = slot().lock();
+    let state = guard.as_mut().ok_or(SessionBridgeError::NotRunning)?;
+    state
+        .pending_clipboard_offers
+        .retain(|o| o.offer_id != offer_id);
+    Ok(())
+}
+
+/// Phase 7 (Task 23): snapshot of pending clipboard offers. The
+/// renderer's ClipboardOfferPrompt reads this to render the
+/// accept/reject UI.
+pub fn session_pending_clipboard_offers() -> Vec<(String, String, String)> {
+    let guard = slot().lock();
+    let Some(state) = guard.as_ref() else {
+        return Vec::new();
+    };
+    state
+        .pending_clipboard_offers
+        .iter()
+        .map(|o| {
+            (
+                o.offer_id.clone(),
+                o.from_peer_id.as_str().to_string(),
+                o.payload.preview_label.clone(),
+            )
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3059,7 +3739,7 @@ mod tests {
         reset_kchat_slot();
         let _ = session_leave();
         let seed_b64 = URL_SAFE_NO_PAD.encode([7u8; 32]);
-        let err = session_start(&seed_b64, "ken", Uuid::new_v4(), false, None).unwrap_err();
+        let err = session_start(&seed_b64, "ken", Uuid::new_v4(), false, None, None).unwrap_err();
         assert!(
             matches!(err, SessionBridgeError::NotInKChatGroup),
             "expected NotInKChatGroup, got {err:?}"
@@ -3174,7 +3854,8 @@ mod tests {
         // was minted for. Even though the slot is "unlocked" by the
         // status reporter, session_start re-verifies and bounces.
         let other_seed_b64 = URL_SAFE_NO_PAD.encode([13u8; 32]);
-        let err = session_start(&other_seed_b64, "ken", Uuid::new_v4(), false, None).unwrap_err();
+        let err =
+            session_start(&other_seed_b64, "ken", Uuid::new_v4(), false, None, None).unwrap_err();
         assert!(
             matches!(err, SessionBridgeError::NotInKChatGroup),
             "expected NotInKChatGroup, got {err:?}"

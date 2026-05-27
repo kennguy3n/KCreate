@@ -83,6 +83,30 @@ pub enum Message {
     /// disconnects (`PeerLeft`); this variant is the explicit
     /// "I'm done editing" signal.
     LockRelease(LockReleasePayload),
+    /// Phase 7 (Task 19): host announces an upcoming session
+    /// encryption key rotation. Carries the *new* certificate
+    /// fingerprint peers should pin once the rotation deadline
+    /// passes and a transition deadline (the renderer surfaces
+    /// "session keys rotating in N s — your connection will
+    /// briefly reconnect"). Receivers reply with
+    /// [`Message::KeyRotationAck`] before the deadline; peers
+    /// that don't acknowledge inside the window are disconnected
+    /// by the host (forward secrecy).
+    KeyRotation(KeyRotationPayload),
+    /// Phase 7 (Task 19): peer acknowledges receipt of a
+    /// [`Message::KeyRotation`]. The host uses this to detect
+    /// which peers stayed online through the rotation; missing
+    /// acks past the transition deadline trigger an automatic
+    /// disconnect.
+    KeyRotationAck(KeyRotationAckPayload),
+    /// Phase 7 (Task 23): one peer sends encrypted clipboard
+    /// content to another. The payload is encrypted client-side
+    /// using X25519 key agreement derived from the sender's and
+    /// recipient's long-lived Ed25519 identity keys; relays
+    /// (host or hub) never see plaintext. The receiver decrypts,
+    /// shows a "Ken wants to share clipboard with you — Accept /
+    /// Reject" prompt, and only paste materializes on accept.
+    ClipboardShare(ClipboardSharePayload),
 }
 
 /// Initial handshake payload sent by the joining peer.
@@ -275,6 +299,109 @@ pub struct LockReleasePayload {
     /// "release everything I hold" — receivers walk their
     /// roster and drop every entry owned by the sender.
     pub node_ids: Vec<Uuid>,
+}
+
+/// Phase 7 (Task 19): payload of [`Message::KeyRotation`]. Sent by
+/// the host to all connected peers when a periodic key rotation
+/// fires. Receivers pin the supplied `new_cert_fingerprint`, reply
+/// with [`Message::KeyRotationAck`], and re-dial the host inside
+/// the transition window using the new fingerprint.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KeyRotationPayload {
+    /// Project the rotation applies to. Receivers MUST drop the
+    /// message if it doesn't match their open project — a
+    /// misrouted rotation cannot disrupt an unrelated session.
+    pub project_id: Uuid,
+    /// Monotonically increasing rotation counter. The host bumps
+    /// this on every [`crate::session::ProjectSession`] key roll;
+    /// peers echo it back in [`KeyRotationAckPayload::epoch`] so
+    /// the host can match an ack to the announcement that fired
+    /// it (multiple rotations may be in flight on a slow network).
+    /// Bootstrap cert is epoch 0; first rotation is epoch 1.
+    #[serde(default)]
+    pub epoch: u64,
+    /// BLAKE2 / SHA-256 fingerprint of the host's new self-signed
+    /// certificate, lowercase hex (matches the format already used
+    /// by [`crate::peer::PeerIdentity::public_key`] for consistency).
+    pub new_cert_fingerprint: String,
+    /// Wall-clock instant by which receivers must acknowledge and
+    /// re-dial. Peers that don't ack inside the window are
+    /// disconnected — forward-secrecy is enforced strictly so a
+    /// silent failure can't keep a peer on the previous key.
+    pub transition_deadline: DateTime<Utc>,
+    /// Reason for the rotation, surfaced as a renderer toast.
+    /// Defaults to `"periodic"`; the protocol leaves the string
+    /// free-form so an out-of-band trigger (manual rotation,
+    /// suspected compromise) can label itself differently without
+    /// requiring a wire-format change.
+    #[serde(default)]
+    pub reason: String,
+}
+
+/// Phase 7 (Task 19): payload of [`Message::KeyRotationAck`]. Sent
+/// by a peer that received and recognised a [`Message::KeyRotation`].
+/// The host records the ack against the announcement's deadline.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KeyRotationAckPayload {
+    /// Project the rotation applied to. Receivers (the host) drop
+    /// acks that don't match an outstanding announcement.
+    pub project_id: Uuid,
+    /// Echoes [`KeyRotationPayload::epoch`] so the host can match
+    /// the ack to the announcement that fired it (multiple
+    /// rotations could be in flight on a slow network).
+    #[serde(default)]
+    pub epoch: u64,
+    /// Echoes [`KeyRotationPayload::new_cert_fingerprint`] so the
+    /// host can detect a peer that's acking a fingerprint they're
+    /// not actually pinned to (e.g. they replayed an old ack).
+    pub new_cert_fingerprint: String,
+}
+
+/// Phase 7 (Task 23): payload of [`Message::ClipboardShare`]. The
+/// `ciphertext` was produced by the sender with X25519 key
+/// agreement against the recipient's static identity (Ed25519 →
+/// X25519 via the curve25519-dalek conversion), then encrypted
+/// with `XChaCha20-Poly1305`. Anyone other than the recipient
+/// sees only opaque bytes — the relay (host) cannot read clipboard
+/// content even when it forwards the message.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClipboardSharePayload {
+    /// Project the share is scoped to. Receivers MUST drop the
+    /// message if it doesn't match their open project.
+    pub project_id: Uuid,
+    /// Unique id for this offer. The recipient uses it to
+    /// correlate accept / reject decisions back to the queued
+    /// ciphertext. UUIDv4 in canonical hyphenated form.
+    pub offer_id: String,
+    /// Intended recipient (BLAKE3-of-pubkey peer id as base64url).
+    /// The transport may broadcast to all peers; only the
+    /// recipient successfully decrypts.
+    pub recipient_peer_id: String,
+    /// Sender's Ed25519 verifying key, base64url-no-padding-encoded.
+    /// The recipient feeds this into the X25519 key derivation so
+    /// they can recompute the shared AEAD key without having to
+    /// look up the sender on the connected-peers roster (the
+    /// sender may have disconnected between sending and the
+    /// user accepting the offer).
+    pub sender_public_key: String,
+    /// 12-byte ChaCha20-Poly1305 nonce, base64url-encoded. Caller
+    /// MUST generate freshly random per message — re-using a nonce
+    /// with the same key catastrophically breaks the construction.
+    pub nonce: String,
+    /// Encrypted payload, base64url-encoded. Plaintext is a
+    /// renderer-defined JSON blob describing the clipboard content
+    /// (node ids, raster bytes, text). The collab protocol stays
+    /// content-agnostic; only the renderer interprets the bytes
+    /// after decryption.
+    pub ciphertext: String,
+    /// Brief sender-supplied label ("3 nodes", "raster 512×512",
+    /// "12 lines of text") surfaced in the recipient's accept
+    /// prompt so the user can decide whether to paste without
+    /// having to commit to the decrypt round-trip first.
+    pub preview_label: String,
 }
 
 /// Why the sender is leaving.

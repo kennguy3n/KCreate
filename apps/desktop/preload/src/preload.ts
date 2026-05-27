@@ -159,6 +159,8 @@ import type {
   SessionJournalSummary,
   SessionLockEntry,
   SessionPeer,
+  ProjectAcl,
+  PendingClipboardOffer,
   KChatBridge,
   KChatCommunity,
   KChatCommunityMember,
@@ -2224,6 +2226,63 @@ const session: SessionBridge = {
     return (await ipcRenderer.invoke(
       "kcreate/session/local-permission",
     )) as CollabPermission;
+  },
+  async acl(): Promise<ProjectAcl | null> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/session/acl-get",
+    )) as string | null;
+    return raw === null ? null : (JSON.parse(raw) as ProjectAcl);
+  },
+  async setAcl(acl: ProjectAcl): Promise<void> {
+    await ipcRenderer.invoke(
+      "kcreate/session/acl-set",
+      JSON.stringify(acl),
+    );
+  },
+  async rotateKeys(graceMs: number): Promise<number> {
+    return (await ipcRenderer.invoke(
+      "kcreate/session/rotate-keys",
+      graceMs,
+    )) as number;
+  },
+  async keyEpoch(): Promise<number | null> {
+    return (await ipcRenderer.invoke(
+      "kcreate/session/key-epoch",
+    )) as number | null;
+  },
+  async shareClipboard(
+    peerId: string,
+    plaintext: Uint8Array,
+    previewLabel: string,
+  ): Promise<string> {
+    // The bridge keeps the local signing key on its side after
+    // `session_start`, so the renderer never has to handle the
+    // seed for clipboard sharing.
+    return (await ipcRenderer.invoke(
+      "kcreate/session/clipboard-share",
+      peerId,
+      Buffer.from(plaintext),
+      previewLabel,
+    )) as string;
+  },
+  async acceptClipboardOffer(offerId: string): Promise<Uint8Array> {
+    const buf = (await ipcRenderer.invoke(
+      "kcreate/session/clipboard-accept",
+      offerId,
+    )) as Buffer;
+    return new Uint8Array(buf);
+  },
+  async rejectClipboardOffer(offerId: string): Promise<void> {
+    await ipcRenderer.invoke(
+      "kcreate/session/clipboard-reject",
+      offerId,
+    );
+  },
+  async pendingClipboardOffers(): Promise<PendingClipboardOffer[]> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/session/pending-clipboard-offers",
+    )) as string;
+    return JSON.parse(raw) as PendingClipboardOffer[];
   },
 };
 

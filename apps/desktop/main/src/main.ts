@@ -1477,6 +1477,31 @@ function registerIpcHandlers(): void {
       requireBridge().templateRemove(templateId);
     },
   );
+  // Phase 6 — Audit log (Tasks 13–14)
+  ipcMain.handle(
+    "kcreate/audit/record",
+    (_e, eventJson: string): string =>
+      requireBridge().auditRecord(eventJson),
+  );
+  ipcMain.handle(
+    "kcreate/audit/query",
+    (_e, queryJson: string): string =>
+      requireBridge().auditQuery(queryJson),
+  );
+  ipcMain.handle(
+    "kcreate/audit/count",
+    (): number => requireBridge().auditCount(),
+  );
+  ipcMain.handle(
+    "kcreate/audit/purge",
+    (_e, cutoffIso: string): number =>
+      requireBridge().auditPurge(cutoffIso),
+  );
+  ipcMain.handle(
+    "kcreate/audit/path",
+    (): string => requireBridge().auditPath(),
+  );
+
   ipcMain.handle(
     "kcreate/page/add",
     (

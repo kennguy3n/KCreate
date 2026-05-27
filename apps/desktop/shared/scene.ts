@@ -1432,6 +1432,83 @@ export interface TemplateMarketplaceBridge {
 }
 
 // ---------------------------------------------------------------------------
+// Phase 6 — Audit log (Tasks 13–14)
+// ---------------------------------------------------------------------------
+
+/** Discriminator for `AuditEventKind`. */
+export type AuditEventKindTag =
+  | "operation"
+  | "ai_action"
+  | "project"
+  | "other";
+
+/** Condensed operation record inside an audit event. */
+export interface AuditOperationRecord {
+  op_id: string;
+  command: string;
+  ai_generated: boolean;
+}
+
+/** Project lifecycle action payload. */
+export type AuditProjectAction =
+  | { action: "open"; path: string }
+  | { action: "close" }
+  | { action: "save" }
+  | { action: "export"; format: string; destination: string };
+
+/** Discriminated union matching `kcreate_audit::AuditEventKind`. */
+export type AuditEventKind =
+  | { type: "operation" } & AuditOperationRecord
+  | {
+      type: "ai_action";
+      action_type: string;
+      model: string;
+      compute_device: string;
+      prompt: string | null;
+    }
+  | { type: "project" } & AuditProjectAction
+  | { type: "other"; label: string; payload: unknown };
+
+/** One row from the audit log. */
+export interface AuditEvent {
+  id: string;
+  timestamp: string;
+  actor: string;
+  project_id: string | null;
+  affected_nodes: string[];
+  kind: AuditEventKind;
+}
+
+/** Filter for `audit.query()`. All fields optional — empty = match all. */
+export interface AuditQuery {
+  since?: string;
+  until?: string;
+  kind?: AuditEventKindTag;
+  project_id?: string;
+  affected_node?: string;
+  limit?: number;
+}
+
+/** Result of `audit.query()`. */
+export interface AuditQueryReport {
+  events: AuditEvent[];
+  total: number;
+}
+
+export interface AuditBridge {
+  /** Record an audit event. Returns the event's UUID. */
+  record(event: AuditEvent): Promise<string>;
+  /** Query the audit log. */
+  query(filter: AuditQuery): Promise<AuditQueryReport>;
+  /** Total row count in the audit log. */
+  count(): Promise<number>;
+  /** Delete rows older than `cutoffIso` (RFC 3339). Returns rows removed. */
+  purge(cutoffIso: string): Promise<number>;
+  /** Filesystem path of the current audit database. */
+  path(): Promise<string>;
+}
+
+// ---------------------------------------------------------------------------
 // Phase 2 — Preflight, Icon Pack, Batch Async, AI extras, Plugin sandbox,
 // MCP permission persistence, Screenshot-to-Layout.
 // ---------------------------------------------------------------------------
@@ -3221,6 +3298,7 @@ declare global {
       masterPage: MasterPageBridge;
       layoutStudio: LayoutStudioBridge;
       templateMarketplace: TemplateMarketplaceBridge;
+      audit: AuditBridge;
       preflight: PreflightBridge;
       iconPack: IconPackBridge;
       batch: BatchBridge;

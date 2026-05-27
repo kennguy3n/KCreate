@@ -102,6 +102,11 @@ pub enum DocumentBridgeError {
     /// renderer's structured error mapping stays uniform.
     #[error(transparent)]
     Marketplace(#[from] kcreate_core::MarketplaceError),
+    /// Catch-all for subsystem errors (audit, thumbnail, etc.) that
+    /// don't warrant their own variant. The string carries the
+    /// underlying error's `Display` output.
+    #[error("{0}")]
+    Internal(String),
 }
 
 pub type Result<T> = std::result::Result<T, DocumentBridgeError>;

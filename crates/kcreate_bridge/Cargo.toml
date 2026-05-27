@@ -24,6 +24,7 @@ kcreate_export = { path = "../kcreate_export" }
 kcreate_raster = { path = "../kcreate_raster" }
 kcreate_vector = { path = "../kcreate_vector" }
 kcreate_ai = { path = "../kcreate_ai" }
+kcreate_audit = { path = "../kcreate_audit" }
 # The MCP server is the *only* component of the editing-side runtime
 # that links a networking library (`tiny_http`). Per AGENTS.md the
 # editing path must stay network-free, so this is optional and gated

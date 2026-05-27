@@ -31,6 +31,7 @@ onnx_segment = ["kcreate_ai/onnx_segment"]
 # default features only, so enabling it for the integration tests
 # does not weaken the invariant.
 kcreate_ai = { path = "../kcreate_ai", features = ["llm_sidecar"] }
+kcreate_audit = { path = "../kcreate_audit" }
 kcreate_collab = { path = "../kcreate_collab" }
 kcreate_core = { path = "../kcreate_core" }
 kcreate_export = { path = "../kcreate_export" }
@@ -40,6 +41,7 @@ kcreate_renderer = { path = "../kcreate_renderer" }
 kcreate_storage = { path = "../kcreate_storage" }
 kcreate_text = { path = "../kcreate_text" }
 kcreate_vector = { path = "../kcreate_vector" }
+chrono = { workspace = true }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
 tiny_http = "0.12"

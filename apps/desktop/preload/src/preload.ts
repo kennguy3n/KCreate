@@ -8,6 +8,10 @@ import type {
   AcquiredFrame,
   AiBridge,
   ArtboardBridge,
+  AuditBridge,
+  AuditEvent,
+  AuditQuery,
+  AuditQueryReport,
   ArtboardInfo,
   ArtboardPreset,
   BrandKit,
@@ -1371,6 +1375,38 @@ const templateMarketplace: TemplateMarketplaceBridge = {
 };
 
 // ---------------------------------------------------------------------------
+// Phase 6 — Audit log (Tasks 13–14)
+// ---------------------------------------------------------------------------
+
+const audit: AuditBridge = {
+  async record(event: AuditEvent): Promise<string> {
+    return (await ipcRenderer.invoke(
+      "kcreate/audit/record",
+      JSON.stringify(event),
+    )) as string;
+  },
+  async query(filter: AuditQuery): Promise<AuditQueryReport> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/audit/query",
+      JSON.stringify(filter),
+    )) as string;
+    return JSON.parse(raw) as AuditQueryReport;
+  },
+  async count(): Promise<number> {
+    return (await ipcRenderer.invoke("kcreate/audit/count")) as number;
+  },
+  async purge(cutoffIso: string): Promise<number> {
+    return (await ipcRenderer.invoke(
+      "kcreate/audit/purge",
+      cutoffIso,
+    )) as number;
+  },
+  async path(): Promise<string> {
+    return (await ipcRenderer.invoke("kcreate/audit/path")) as string;
+  },
+};
+
+// ---------------------------------------------------------------------------
 // Phase 2 — preflight, icon pack, batch async, AI extras, plugins, MCP perms.
 // ---------------------------------------------------------------------------
 
@@ -2290,6 +2326,7 @@ contextBridge.exposeInMainWorld("kcreate", {
   masterPage,
   layoutStudio,
   templateMarketplace,
+  audit,
   preflight,
   iconPack,
   batch,

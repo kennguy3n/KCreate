@@ -16,6 +16,7 @@
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 
+pub mod audit;
 #[cfg(feature = "collab")]
 pub mod collab;
 pub mod document;
@@ -2022,6 +2023,58 @@ pub fn template_remove(template_id: String) -> NapiResult<()> {
     let id = parse_uuid(&template_id)?;
     phase2::template_remove(id).map_err(map_doc_err)
 }
+
+// ---------------------------------------------------------------------------
+// Phase 6 — Audit log (Tasks 13–14)
+// ---------------------------------------------------------------------------
+
+/// Record an audit event. `event_json` is a JSON-serialised
+/// `AuditEvent` from the renderer (or from the bridge itself for
+/// side-effect recording). Returns the event's UUID as a string.
+#[napi]
+pub fn audit_record(event_json: String) -> NapiResult<String> {
+    let event: kcreate_audit::AuditEvent = serde_json::from_str(&event_json)
+        .map_err(|e| NapiError::from_reason(format!("audit_record: {e}")))?;
+    let id = audit::audit_record(&event).map_err(map_doc_err)?;
+    Ok(id.to_string())
+}
+
+/// Query the audit log. `query_json` is a JSON-serialised
+/// `AuditQuery`. Returns a JSON string containing
+/// `{ events: AuditEvent[], total: number }`.
+#[napi]
+pub fn audit_query(query_json: String) -> NapiResult<String> {
+    let filter: kcreate_audit::AuditQuery = serde_json::from_str(&query_json)
+        .map_err(|e| NapiError::from_reason(format!("audit_query: {e}")))?;
+    let report = audit::audit_query(&filter).map_err(map_doc_err)?;
+    serde_json::to_string(&report).map_err(|e| NapiError::from_reason(e.to_string()))
+}
+
+/// Return the total number of audit rows.
+#[napi]
+pub fn audit_count() -> NapiResult<f64> {
+    let count = audit::audit_count().map_err(map_doc_err)?;
+    Ok(count as f64)
+}
+
+/// Delete audit rows strictly older than `cutoff_iso` (RFC 3339).
+/// Returns the number of rows removed.
+#[napi]
+pub fn audit_purge(cutoff_iso: String) -> NapiResult<f64> {
+    let cutoff = chrono::DateTime::parse_from_rfc3339(&cutoff_iso)
+        .map_err(|e| NapiError::from_reason(format!("audit_purge: invalid timestamp: {e}")))?
+        .with_timezone(&chrono::Utc);
+    let removed = audit::audit_purge_before(cutoff).map_err(map_doc_err)?;
+    Ok(removed as f64)
+}
+
+/// Return the filesystem path of the current audit database.
+#[napi]
+pub fn audit_path() -> NapiResult<String> {
+    Ok(audit::audit_path())
+}
+
+// ---------------------------------------------------------------------------
 
 /// Add a new content page to the open project. `size` and
 /// `orientation` are optional; omit both to use the workspace default.

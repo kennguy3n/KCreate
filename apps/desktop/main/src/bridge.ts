@@ -376,6 +376,14 @@ export interface Bridge {
   templateList(category: string | undefined, query: string | undefined): string;
   templateInstallLocal(sourcePath: string): string;
   templateRemove(templateId: string): void;
+
+  // Phase 6 — audit log
+  auditRecord(eventJson: string): string;
+  auditQuery(queryJson: string): string;
+  auditCount(): number;
+  auditPurge(cutoffIso: string): number;
+  auditPath(): string;
+
   pageAdd(
     name: string,
     size?: string,

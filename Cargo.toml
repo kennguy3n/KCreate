@@ -13,6 +13,7 @@ members = [
     "crates/kcreate_ai",
     "crates/kcreate_mcp",
     "crates/kcreate_plugin",
+    "crates/kcreate_audit",
     "crates/kcreate_collab",
     # NOTE: kcreate_collab_transport is intentionally OUT of
     # `kcreate_tests/tests/local_first.rs::editing_path_crates()` so it

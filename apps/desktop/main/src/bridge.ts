@@ -214,6 +214,16 @@ export interface Bridge {
   documentNodeExtraFills(nodeId: string): string | null;
   documentNodeExtraStrokes(nodeId: string): string | null;
   documentDeleteNode(nodeId: string): void;
+  /**
+   * Phase 6 Tasks 27-28 — layer colour tags. `color` is either a
+   * non-empty colour key (canonical lowercase, e.g. `"red"`,
+   * `"blue"`, `"yellow"`) to install, or `null` / `undefined` to
+   * clear the tag. The bridge canonicalises whitespace + case and
+   * records an undoable `layer_color_set` op; returns the node's
+   * post-mutation `version` so renderer reads can be invalidated
+   * without a full `getTree`. Errors on unknown nodes.
+   */
+  documentSetLayerColor(nodeId: string, color?: string | null): number;
   documentUndo(): UndoRedoOutcomeSnake | null;
   documentRedo(): UndoRedoOutcomeSnake | null;
   /**

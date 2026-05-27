@@ -862,6 +862,15 @@ function registerIpcHandlers(): void {
       requireBridge().documentDeleteNode(nodeId);
     },
   );
+  // Phase 6 Tasks 27-28 — layer-colour tag. `color` is either a
+  // colour key string (canonicalised by the Rust side) or `null` to
+  // clear. Returns the node's post-mutation `version` so renderer
+  // listeners can re-key effects without a full tree refresh.
+  ipcMain.handle(
+    "kcreate/document/setLayerColor",
+    (_e, nodeId: string, color: string | null) =>
+      requireBridge().documentSetLayerColor(nodeId, color),
+  );
   // `kcreate/document/undo` and `.../redo` may roll back / replay a
   // `color_settings_update` operation as of Phase 2 (the bridge owns
   // the dispatch — see `crates/kcreate_bridge/src/document.rs`'s

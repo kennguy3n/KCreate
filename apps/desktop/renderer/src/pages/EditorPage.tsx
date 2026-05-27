@@ -1552,6 +1552,30 @@ export function EditorPage({
               }
             })();
           }}
+          onSelectMany={(ids) => {
+            void (async () => {
+              try {
+                await window.kcreate.canvas.setSelection(ids);
+                await refreshSelection();
+              } catch (err) {
+                setStatusMessage(
+                  `select group failed: ${errorMessage(err)}`,
+                );
+              }
+            })();
+          }}
+          onSetLayerColor={(id, color) => {
+            void (async () => {
+              try {
+                await window.kcreate.document.setLayerColor(id, color);
+                await refreshTree();
+              } catch (err) {
+                setStatusMessage(
+                  `set layer colour failed: ${errorMessage(err)}`,
+                );
+              }
+            })();
+          }}
           artboards={artboards}
           onRequestCreateArtboard={() => setArtboardDialogOpen(true)}
           onFocusArtboard={focusArtboard}

@@ -573,6 +573,15 @@ export interface DocumentBridge {
   /// stack.
   nodeExtraStrokes(nodeId: string): Promise<StrokeStyleWire[] | null>;
   deleteNode(nodeId: string): Promise<void>;
+  /**
+   * Phase 6 Tasks 27-28 — install or clear a layer-colour tag on
+   * `nodeId`. Pass a non-empty string to install (the bridge
+   * canonicalises whitespace + case before storing under
+   * `Node::metadata["layerColor"]`); pass `null` to clear. Returns
+   * the node's new `version` so renderer-side effects keyed on
+   * `[id, version]` re-fire without a full `getTree()` round-trip.
+   */
+  setLayerColor(nodeId: string, color: string | null): Promise<number>;
   undo(): Promise<UndoRedoOutcome | null>;
   redo(): Promise<UndoRedoOutcome | null>;
   /**

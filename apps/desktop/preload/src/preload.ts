@@ -529,6 +529,16 @@ const document: DocumentBridge = {
   async deleteNode(nodeId: string): Promise<void> {
     await ipcRenderer.invoke("kcreate/document/deleteNode", nodeId);
   },
+  async setLayerColor(
+    nodeId: string,
+    color: string | null,
+  ): Promise<number> {
+    return (await ipcRenderer.invoke(
+      "kcreate/document/setLayerColor",
+      nodeId,
+      color,
+    )) as number;
+  },
   async undo(): Promise<UndoRedoOutcome | null> {
     return (await ipcRenderer.invoke(
       "kcreate/document/undo",

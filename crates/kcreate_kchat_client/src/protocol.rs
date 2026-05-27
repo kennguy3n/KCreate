@@ -1,144 +1,125 @@
-//! KChat Desktop Local IPC Protocol — JSON-RPC 2.0 wire types.
+//! KChat backend REST API — wire-format types.
 //!
-//! This module defines the request and response types KCreate sends
-//! to and receives from `uney-chat-desktop` over a local Unix domain
-//! socket (`~/.kchat/kcreate.sock`) or Windows named pipe
-//! (`\\.\pipe\kchat-kcreate`).
+//! KCreate talks to the shared KChat / Mattermost backend over
+//! HTTPS. This module defines the JSON shapes of every request +
+//! response body exchanged with that backend, plus the
+//! domain types (identity, community, conversation, attestation,
+//! invite card) that the bridge re-exports to the renderer through
+//! `apps/desktop/shared/scene.ts`.
 //!
-//! See `protocol_spec.md` (same directory) for the comprehensive
-//! protocol contract documented for the uney-chat-desktop team.
+//! ## REST contract (summary)
 //!
-//! ## Lockstep with `apps/desktop/shared/scene.ts`
+//! All endpoints are versioned under `/api/v1/`. The
+//! `Authorization: Bearer <token>` header carries the access token
+//! returned by `POST /api/v1/auth/login`. The client transparently
+//! refreshes the access token on `401` using the cached refresh
+//! token (see `auth.rs`).
 //!
-//! Every type defined here that crosses the bridge to the renderer
-//! has a matching TypeScript declaration in
-//! `apps/desktop/shared/scene.ts`. Adding a field to one requires
-//! adding it to the other.
+//! | Method  | Path                                                    | Purpose                                          |
+//! | ------- | ------------------------------------------------------- | ------------------------------------------------ |
+//! | POST    | `/api/v1/auth/login`                                    | Exchange credentials for access + refresh tokens |
+//! | POST    | `/api/v1/auth/refresh`                                  | Exchange refresh token for a new access token    |
+//! | GET     | `/api/v1/identity`                                      | Local user's identity (JID + display + pubkey)   |
+//! | GET     | `/api/v1/communities`                                   | Communities the local user belongs to            |
+//! | GET     | `/api/v1/communities/{id}/members`                      | Member list with roles                           |
+//! | POST    | `/api/v1/communities/{id}/attestation`                  | Request a signed membership attestation          |
+//! | GET     | `/api/v1/communities/{id}/conversations`                | Channels / DMs in the community                  |
+//! | POST    | `/api/v1/conversations/{id}/messages`                   | Post a rich-card invite to a conversation        |
+//! | GET     | `/api/v1/communities/{id}/events?since={cursor}`        | Roster-change polling endpoint                   |
 //!
-//! ## Mapping to uney-chat-desktop's domain
+//! ### Out of repo scope (follows in a separate PR)
 //!
-//! | KChat Desktop concept             | KCreate type                     |
-//! | --------------------------------- | -------------------------------- |
-//! | XMPP bare JID                     | `KChatIdentity::jid`             |
-//! | MLS identity key (Ed25519 pubkey) | `KChatIdentity::public_key`      |
-//! | Community                         | `KChatCommunity`                 |
-//! | Community member + role           | `KChatCommunityMember`           |
-//! | Conversation / channel            | `KChatConversation`              |
-//! | Signed membership attestation     | `MembershipAttestation`          |
+//! The backend currently exposes communities, members,
+//! conversations, and messages. It does **not** yet sign
+//! `POST /api/v1/communities/{id}/attestation`. KCreate's client
+//! reports a typed
+//! [`ClientError::AttestationEndpointNotProvisioned`](crate::error::ClientError::AttestationEndpointNotProvisioned)
+//! when the backend returns `404` or `501` for this route so the
+//! renderer can surface a clear "backend has not shipped the
+//! attestation endpoint yet — falling back to dev-mint if
+//! `kchat-dev-issuer` is enabled" message.
+//!
+//! The axum fixture server in `fixture.rs` implements every route
+//! above (including signing attestations with a freshly-generated
+//! Ed25519 keypair) so the test suite exercises the full
+//! production code path end-to-end.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-/// JSON-RPC 2.0 version literal.
-pub const JSONRPC_VERSION: &str = "2.0";
-
-/// Protocol version advertised in the handshake. Independent of the
-/// KCreate workspace version so KCreate and uney-chat-desktop can
-/// rev independently.
+/// Wire-format version stamped into request headers so the backend
+/// can refuse traffic from an incompatibly-newer KCreate build.
+/// Independent of the workspace version so KCreate and the
+/// backend can rev independently.
 pub const PROTOCOL_VERSION: u32 = 1;
 
-// ----------------- JSON-RPC 2.0 envelope ------------------------
+/// HTTP header carrying [`PROTOCOL_VERSION`] on every request.
+pub const PROTOCOL_VERSION_HEADER: &str = "X-KCreate-Protocol-Version";
 
-/// JSON-RPC 2.0 request envelope. Carries `method` + `params`.
+/// HTTP header used on every request to identify the calling
+/// product. Lets the backend log + filter KCreate traffic
+/// independently from Desktop/Mobile/Web clients.
+pub const USER_AGENT_HEADER_VALUE: &str = concat!("KCreate/", env!("CARGO_PKG_VERSION"));
+
+// ----------------- Auth ----------------------------------------
+
+/// Body of `POST /api/v1/auth/login`. Sent over HTTPS only; the
+/// REST client refuses to send credentials over `http://` outside
+/// the test fixture.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RpcRequest {
-    pub jsonrpc: String,
-    /// Method id (e.g. `"kchat.identity.get"`).
-    pub method: String,
-    /// Optional structured params. Defaults to a JSON `null` when
-    /// the method takes no parameters.
+#[serde(rename_all = "camelCase")]
+pub struct LoginRequest {
+    /// Login id (XMPP bare JID for KChat). Mattermost installations
+    /// accept either the username or the email — the backend
+    /// disambiguates server-side.
+    pub login_id: String,
+    /// User password.
+    pub password: String,
+    /// Optional TOTP code when the account has 2FA enabled.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub params: Option<serde_json::Value>,
-    /// Caller-supplied id used for response correlation. Always a
-    /// string in KCreate's wire format (uuid-shaped) so JS clients
-    /// don't need to coerce numbers.
-    pub id: String,
+    pub totp: Option<String>,
 }
 
-/// JSON-RPC 2.0 success / error response envelope.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RpcResponse {
-    pub jsonrpc: String,
-    /// Echo of `RpcRequest::id`.
-    pub id: String,
-    /// Success payload (mutually exclusive with `error`).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub result: Option<serde_json::Value>,
-    /// Failure payload (mutually exclusive with `result`).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<RpcError>,
-}
-
-/// JSON-RPC 2.0 error object.
+/// Body of `POST /api/v1/auth/login` response on success.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct RpcError {
-    /// Numeric error code (see [`ErrorCode`]).
-    pub code: i32,
-    /// Human-readable message.
-    pub message: String,
-    /// Optional structured data.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub data: Option<serde_json::Value>,
+#[serde(rename_all = "camelCase")]
+pub struct LoginResponse {
+    /// Short-lived bearer token. Used on every subsequent
+    /// authenticated request.
+    pub access_token: String,
+    /// Long-lived refresh token. Stored in memory only — never
+    /// persisted to disk by KCreate.
+    pub refresh_token: String,
+    /// Lifetime of the access token in seconds. The client uses
+    /// this to schedule pre-emptive refresh.
+    pub expires_in_seconds: u64,
+    /// Identity of the now-authenticated user.
+    pub identity: KChatIdentity,
 }
 
-/// Server-initiated notification — sent without a request, never
-/// expects a response. Used for the `kchat.events.subscribe` stream.
+/// Body of `POST /api/v1/auth/refresh`. The client sends this
+/// transparently on 401 with the cached refresh token.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RpcNotification {
-    pub jsonrpc: String,
-    /// Notification method id (e.g. `"kchat.events.notify"`).
-    pub method: String,
-    /// Structured payload.
-    pub params: serde_json::Value,
+#[serde(rename_all = "camelCase")]
+pub struct RefreshRequest {
+    pub refresh_token: String,
 }
 
-/// Error codes returned by the KChat Desktop server.
-///
-/// Standard JSON-RPC reserves -32700 .. -32000. KChat-specific
-/// errors live in the -32099 .. -32000 implementation-defined
-/// range as required by the spec. Codes < -32000 are reserved
-/// and never returned by this server.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(i32)]
-pub enum ErrorCode {
-    /// JSON parsing failed (`-32700`).
-    ParseError = -32700,
-    /// Request not a valid JSON-RPC 2.0 request (`-32600`).
-    InvalidRequest = -32600,
-    /// Method not found (`-32601`).
-    MethodNotFound = -32601,
-    /// Invalid params (`-32602`).
-    InvalidParams = -32602,
-    /// Internal server error (`-32603`).
-    InternalError = -32603,
-    /// Caller is not authenticated (no active KChat user session).
-    NotAuthenticated = -32001,
-    /// Caller does not have permission for this resource.
-    PermissionDenied = -32002,
-    /// Referenced resource (community, conversation, member) not
-    /// found.
-    NotFound = -32003,
-    /// Subscription already active for this community.
-    AlreadySubscribed = -32004,
-    /// Server is shutting down.
-    Shutdown = -32005,
+/// Body of `POST /api/v1/auth/refresh` response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RefreshResponse {
+    pub access_token: String,
+    /// The backend MAY rotate the refresh token on refresh — when
+    /// it does, the client stores the new value.
+    pub refresh_token: String,
+    pub expires_in_seconds: u64,
 }
 
-impl ErrorCode {
-    /// Numeric value for serialization.
-    #[must_use]
-    pub fn as_i32(self) -> i32 {
-        self as i32
-    }
-}
+// ----------------- Domain DTOs ---------------------------------
 
-// ----------------- Method param + result types ------------------
-
-/// `kchat.identity.get` — empty params.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct IdentityGetParams {}
-
-/// `kchat.identity.get` result — local user identity.
+/// Local user identity returned by `GET /api/v1/identity` and as
+/// part of [`LoginResponse`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct KChatIdentity {
@@ -154,11 +135,13 @@ pub struct KChatIdentity {
     pub peer_id: String,
 }
 
-/// `kchat.communities.list` — empty params.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct CommunitiesListParams {}
+/// Response body for `GET /api/v1/communities`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommunitiesListResponse {
+    pub communities: Vec<KChatCommunity>,
+}
 
-/// One community returned by `kchat.communities.list`.
+/// One community returned by `GET /api/v1/communities`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct KChatCommunity {
@@ -176,14 +159,8 @@ pub struct KChatCommunity {
     pub role: KChatRole,
 }
 
-/// `kchat.communities.list` result.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CommunitiesListResult {
-    pub communities: Vec<KChatCommunity>,
-}
-
-/// Role of a community member. Maps 1:1 to uney-chat-desktop's
-/// community role enum.
+/// Role of a community member. Maps 1:1 to KChat's community role
+/// enum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum KChatRole {
@@ -197,9 +174,8 @@ pub enum KChatRole {
 
 impl KChatRole {
     /// Lowercase string form matching the serde serialization. Used
-    /// by the bridge to map roles through
-    /// [`CollabPermission::from_role`](crate::CollabPermission) on
-    /// the `collab` side.
+    /// by the bridge to map roles through `CollabPermission` on the
+    /// `collab` side.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -210,14 +186,13 @@ impl KChatRole {
     }
 }
 
-/// `kchat.communities.getMembers` params.
+/// Response body for `GET /api/v1/communities/{id}/members`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct GetMembersParams {
-    pub community_id: String,
+pub struct MembersListResponse {
+    pub members: Vec<KChatCommunityMember>,
 }
 
-/// One member returned by `kchat.communities.getMembers`.
+/// One member returned by `GET /api/v1/communities/{id}/members`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct KChatCommunityMember {
@@ -231,22 +206,23 @@ pub struct KChatCommunityMember {
     pub role: KChatRole,
 }
 
-/// `kchat.communities.getMembers` result.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct GetMembersResult {
-    pub members: Vec<KChatCommunityMember>,
-}
-
-/// `kchat.communities.getMembership` params.
+/// Body of `POST /api/v1/communities/{id}/attestation`. The peer
+/// public key is supplied by the calling client so the backend can
+/// bind the attestation to the exact local identity that will be
+/// used for collab.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct GetMembershipParams {
-    pub community_id: String,
+pub struct AttestationRequest {
+    /// Ed25519 verifying key of the local peer, base64url no
+    /// padding. The backend signs an attestation that binds this
+    /// key to the community id, so a stolen attestation can't be
+    /// replayed against a different KCreate install.
+    pub peer_public_key: String,
 }
 
 /// Signed membership attestation returned by
-/// `kchat.communities.getMembership`. Drop-in compatible with
-/// `kcreate_collab::kchat::KChatMembership` after rebuild via
+/// `POST /api/v1/communities/{id}/attestation`. Drop-in compatible
+/// with `kcreate_collab::kchat::KChatMembership` after rebuild via
 /// [`crate::attestation::membership_from_attestation`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -269,14 +245,14 @@ pub struct MembershipAttestation {
     pub signature: String,
 }
 
-/// `kchat.conversations.list` params.
+/// Response body for `GET /api/v1/communities/{id}/conversations`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ConversationsListParams {
-    pub community_id: String,
+pub struct ConversationsListResponse {
+    pub conversations: Vec<KChatConversation>,
 }
 
-/// One conversation returned by `kchat.conversations.list`.
+/// One conversation returned by
+/// `GET /api/v1/communities/{id}/conversations`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct KChatConversation {
@@ -300,54 +276,60 @@ pub enum KChatConversationType {
     Direct,
 }
 
-/// `kchat.conversations.list` result.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ConversationsListResult {
-    pub conversations: Vec<KChatConversation>,
-}
-
-/// `kchat.conversations.postMessage` params.
+/// Body of `POST /api/v1/conversations/{id}/messages`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct PostMessageParams {
-    /// Target conversation.
-    pub conversation_id: String,
+pub struct PostMessageRequest {
     /// Application-defined payload object. For KCreate document
     /// share invites, this carries the [`InviteCardPayload`].
     pub payload: serde_json::Value,
     /// Optional payload kind discriminator (e.g.
-    /// `"kcreate.invite.v1"`). When set, uney-chat-desktop renders
-    /// the message as a rich card using its custom-content registry.
+    /// `"kcreate.invite.v1"`). When set, KChat Desktop's `.kcz`
+    /// extension renders the message as a rich card using its
+    /// custom-content registry.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content_type: Option<String>,
 }
 
-/// `kchat.conversations.postMessage` result.
+/// Backwards-compatible alias for the previous Phase 7
+/// `PostMessageParams` JSON-RPC shape. The bridge constructs an
+/// `PostMessageRequest` from a `conversation_id` + `payload` +
+/// `content_type` triple — we keep the legacy alias so existing
+/// renderer wiring continues to compile after the REST pivot
+/// without touching every call site.
+pub type PostMessageParams = PostMessageRequest;
+
+/// Response body for `POST /api/v1/conversations/{id}/messages`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct PostMessageResult {
+pub struct PostMessageResponse {
     /// Server-assigned message id.
     pub message_id: String,
     /// Server timestamp.
     pub posted_at: DateTime<Utc>,
 }
 
-/// Custom content-type identifier for KCreate document share invites.
-/// uney-chat-desktop renders these as rich cards via the extension
-/// platform's content-renderer registry.
+/// Backwards-compatible alias for the previous `PostMessageResult`
+/// JSON-RPC response shape. See [`PostMessageParams`].
+pub type PostMessageResult = PostMessageResponse;
+
+/// Custom content-type identifier for KCreate document share
+/// invites. The `.kcz` companion extension in
+/// `apps/kchat-extension/` renders these as rich cards via the
+/// host's content-renderer registry.
 pub const INVITE_CONTENT_TYPE: &str = "kcreate.invite.v1";
 
 /// Schema version stamped into [`InviteCardPayload::schema_version`]
 /// when minting a fresh invite. The bridge rejects accept-invite
 /// calls whose payload declares a different version so a future
-/// schema bump (e.g. adding `mls_group_epoch` or `expires_at`)
-/// can't be silently consumed by an older binary that would skip
-/// the new fields.
+/// schema bump can't be silently consumed by an older binary that
+/// would skip the new fields.
 pub const INVITE_SCHEMA_VERSION: u32 = 1;
 
 /// Schema for the KCreate document-share invite payload. The same
 /// JSON shape is consumed by the renderer's `InvitePanel.tsx`
-/// component when a user opens a shared invite.
+/// component when a user opens a shared invite — and by the
+/// `.kcz` companion extension's `InviteCard.tsx` renderer.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct InviteCardPayload {
@@ -380,38 +362,29 @@ pub struct InviteCardPayload {
     pub issued_at: DateTime<Utc>,
 }
 
-/// `kchat.events.subscribe` params.
+// ----------------- Roster polling ------------------------------
+
+/// Response body for
+/// `GET /api/v1/communities/{id}/events?since={cursor}`. KCreate
+/// polls this every 30s during an active collab session to detect
+/// member-joined / member-left / role-changed events without
+/// needing a long-lived streaming connection.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct EventsSubscribeParams {
-    pub community_id: String,
+pub struct CommunityEventsResponse {
+    /// Events that occurred after `since`. Always returned in
+    /// `at` ascending order; an empty list means no changes.
+    pub events: Vec<CommunityEvent>,
+    /// Opaque cursor to pass as `since` on the next poll.
+    pub next_cursor: String,
 }
 
-/// `kchat.events.subscribe` synchronous result. Notifications are
-/// pushed asynchronously via [`RpcNotification`] with the
-/// `kchat.events.notify` method.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct EventsSubscribeResult {
-    /// Server-assigned subscription id. The renderer references
-    /// this in `kchat.events.unsubscribe` to tear down the stream.
-    pub subscription_id: String,
-}
-
-/// `kchat.events.unsubscribe` params.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct EventsUnsubscribeParams {
-    pub subscription_id: String,
-}
-
-/// `kchat.events.notify` payload — a single streaming event from a
-/// subscribed community.
+/// One community event. The same `CommunityEventKind` discriminator
+/// the previous JSON-RPC notification carried — REST polling is
+/// just a different delivery channel.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CommunityEvent {
-    /// Subscription this event belongs to.
-    pub subscription_id: String,
     /// Community the event happened in.
     pub community_id: String,
     /// Event payload.
@@ -447,45 +420,85 @@ pub enum CommunityEventKind {
     },
 }
 
+// ----------------- Backend error envelope -----------------------
+
+/// JSON envelope the backend returns on 4xx/5xx responses. KCreate
+/// surfaces both fields verbatim through
+/// [`ClientError::Backend`](crate::error::ClientError::Backend) so
+/// the renderer can display the backend's error message directly.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct BackendErrorBody {
+    /// Stable error code (e.g. `"AUTH_INVALID"`, `"NOT_FOUND"`,
+    /// `"COMMUNITY_NOT_FOUND"`, `"ATTESTATION_NOT_PROVISIONED"`).
+    pub code: String,
+    /// Human-readable error message.
+    pub message: String,
+    /// Optional structured payload.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<serde_json::Value>,
+}
+
+/// Well-known backend error codes the client maps to typed error
+/// variants. Anything not listed here surfaces as
+/// [`ClientError::Backend`](crate::error::ClientError::Backend)
+/// with the raw `code` + `message`.
+pub mod error_code {
+    /// `POST /api/v1/auth/login` rejected the credentials.
+    pub const AUTH_INVALID: &str = "AUTH_INVALID";
+    /// Caller does not have permission for this resource (e.g.
+    /// not a member of the requested community).
+    pub const PERMISSION_DENIED: &str = "PERMISSION_DENIED";
+    /// Backend hasn't shipped the `/attestation` endpoint yet.
+    pub const ATTESTATION_NOT_PROVISIONED: &str = "ATTESTATION_NOT_PROVISIONED";
+    /// Community id does not exist or is no longer visible.
+    pub const COMMUNITY_NOT_FOUND: &str = "COMMUNITY_NOT_FOUND";
+    /// Conversation id does not exist or is no longer visible.
+    pub const CONVERSATION_NOT_FOUND: &str = "CONVERSATION_NOT_FOUND";
+    /// Caller sent a malformed body.
+    pub const INVALID_REQUEST: &str = "INVALID_REQUEST";
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn jsonrpc_envelope_round_trips() {
-        let req = RpcRequest {
-            jsonrpc: JSONRPC_VERSION.to_string(),
-            method: "kchat.identity.get".into(),
-            params: None,
-            id: "1".into(),
+    fn login_request_round_trips_camel_case() {
+        let req = LoginRequest {
+            login_id: "alice@kchat.com".into(),
+            password: "hunter2".into(),
+            totp: Some("123456".into()),
         };
-        let json = serde_json::to_string(&req).unwrap();
-        let back: RpcRequest = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.method, "kchat.identity.get");
-        assert_eq!(back.id, "1");
+        let json = serde_json::to_value(&req).unwrap();
+        assert_eq!(json["loginId"], "alice@kchat.com");
+        assert_eq!(json["totp"], "123456");
+        let back: LoginRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(back.login_id, "alice@kchat.com");
     }
 
     #[test]
-    fn rpc_error_round_trips() {
-        let resp = RpcResponse {
-            jsonrpc: JSONRPC_VERSION.to_string(),
-            id: "x".into(),
-            result: None,
-            error: Some(RpcError {
-                code: ErrorCode::NotFound.as_i32(),
-                message: "community not found".into(),
-                data: None,
-            }),
+    fn login_response_round_trips() {
+        let resp = LoginResponse {
+            access_token: "a.b.c".into(),
+            refresh_token: "r.t.k".into(),
+            expires_in_seconds: 3600,
+            identity: KChatIdentity {
+                jid: "alice@kchat.com".into(),
+                display_name: "Alice".into(),
+                public_key: "AAA".into(),
+                peer_id: "peer-alice".into(),
+            },
         };
         let json = serde_json::to_string(&resp).unwrap();
-        let back: RpcResponse = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.error.unwrap().code, -32003);
+        let back: LoginResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.access_token, "a.b.c");
+        assert_eq!(back.identity.display_name, "Alice");
     }
 
     #[test]
     fn community_event_serializes_with_camel_case() {
         let event = CommunityEvent {
-            subscription_id: "sub-1".into(),
             community_id: "comm-1".into(),
             event: CommunityEventKind::MemberLeft {
                 peer_id: "peer-x".into(),
@@ -494,7 +507,6 @@ mod tests {
             at: Utc::now(),
         };
         let json = serde_json::to_value(&event).unwrap();
-        assert_eq!(json["subscriptionId"], "sub-1");
         assert_eq!(json["communityId"], "comm-1");
         assert_eq!(json["event"]["kind"], "memberLeft");
         assert_eq!(json["event"]["peerId"], "peer-x");
@@ -504,5 +516,31 @@ mod tests {
     fn role_serializes_lowercase() {
         let v = serde_json::to_value(KChatRole::Admin).unwrap();
         assert_eq!(v, serde_json::Value::String("admin".into()));
+    }
+
+    #[test]
+    fn backend_error_body_round_trips() {
+        let err = BackendErrorBody {
+            code: error_code::AUTH_INVALID.into(),
+            message: "bad credentials".into(),
+            data: Some(serde_json::json!({"attempt": 3})),
+        };
+        let json = serde_json::to_value(&err).unwrap();
+        assert_eq!(json["code"], "AUTH_INVALID");
+        let back: BackendErrorBody = serde_json::from_value(json).unwrap();
+        assert_eq!(back.code, "AUTH_INVALID");
+        assert_eq!(back.data.unwrap()["attempt"], 3);
+    }
+
+    #[test]
+    fn conversation_type_camel_case_field_and_lowercase_value() {
+        let conv = KChatConversation {
+            id: "c1".into(),
+            name: "general".into(),
+            community_id: "comm".into(),
+            conversation_type: KChatConversationType::Channel,
+        };
+        let json = serde_json::to_value(&conv).unwrap();
+        assert_eq!(json["conversationType"], "channel");
     }
 }

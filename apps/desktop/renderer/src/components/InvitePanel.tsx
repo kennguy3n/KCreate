@@ -15,7 +15,7 @@
 //  └──────────────────────────────────┘
 //
 // The panel is rendered inside `EditorPage` alongside the existing
-// `PresencePanel` when `window.kcreate.kchatDesktop.available()` is
+// `PresencePanel` when `window.kcreate.kchatBackend.available()` is
 // true and the user has an active community selected.
 
 import { useCallback, useEffect, useState } from "react";
@@ -119,7 +119,7 @@ export function InvitePanel({ membership, onJoined }: InvitePanelProps) {
     setJoining(true);
     setError(null);
     try {
-      const result = await window.kcreate.kchatDesktop.acceptInvite(raw);
+      const result = await window.kcreate.kchatBackend.acceptInvite(raw);
       setSuccess(result);
       setPending(null);
       setRaw("");

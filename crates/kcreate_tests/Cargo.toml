@@ -41,12 +41,12 @@ kcreate_renderer = { path = "../kcreate_renderer" }
 kcreate_storage = { path = "../kcreate_storage" }
 kcreate_text = { path = "../kcreate_text" }
 kcreate_vector = { path = "../kcreate_vector" }
-# Phase 7 integration test (kchat_desktop_client.rs). Pulled in as a
-# dev-dep so the runtime binary tree stays unchanged; the
-# editing-path deny-list check (`tests/local_first.rs`) does not
-# walk `kcreate_tests` itself, so this does not weaken the
-# invariant.
-kcreate_kchat_client = { path = "../kcreate_kchat_client" }
+# Phase 7 integration tests (kchat_backend_client.rs). Enables the
+# `test-fixture` feature so the in-process axum REST fixture is
+# accessible; the editing-path deny-list check
+# (`tests/local_first.rs`) does not walk `kcreate_tests` itself, so
+# this does not weaken the local-first invariant.
+kcreate_kchat_client = { path = "../kcreate_kchat_client", features = ["test-fixture"] }
 # Phase 7 Block B: community-gated collab tests (collab_communities.rs).
 kcreate_collab_transport = { path = "../kcreate_collab_transport" }
 ed25519-dalek = { workspace = true }

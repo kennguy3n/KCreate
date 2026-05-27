@@ -70,8 +70,8 @@ function collabActionLabel(kind: Extract<AuditEventKind, { type: "collab" }>): s
       return `Collab: ${kind.peer_id.slice(0, 8)}… sent ${kind.op_count} ops`;
     case "conflict_resolved":
       return `Collab: conflict on ${kind.node_id.slice(0, 8)}…`;
-    case "kchat_desktop_status":
-      return `KChat Desktop: ${kind.status}`;
+    case "kchat_backend_status":
+      return `KChat backend: ${kind.status}`;
   }
 }
 

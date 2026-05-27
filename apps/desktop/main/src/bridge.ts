@@ -828,29 +828,32 @@ export interface Bridge {
   kchatTrustedIssuers(): string;
   kchatAddTrustedIssuer(issuerJson: string): string;
   kchatRemoveTrustedIssuer(issuerPublicKey: string): string;
-  // Phase 7 — KChat Desktop local IPC. All entry points are gated
-  // on the `kchat-desktop` feature flag (which implies `collab`);
-  // `kchatDesktopAvailable` is always present as a capability
-  // probe. `kchatDesktopConnect/Disconnect/Status` return JSON
-  // `KChatDesktopStatus`; `kchatDesktopListCommunities` returns
-  // JSON `KChatCommunity[]`; `kchatDesktopSelectCommunity` returns
-  // a JSON `KChatMembershipStatus` (same shape as
-  // `kchatInstallAuthority` — replaces the dev-mint flow);
-  // `kchatDesktopShareToConversation` returns a JSON
+  // Phase 7 — KChat backend (HTTPS REST). All entry points are
+  // gated on the `kchat-backend` feature flag (which implies
+  // `collab`); `kchatBackendAvailable` is always present as a
+  // capability probe. `kchatBackendConnect/Disconnect/Status`
+  // return JSON `KChatBackendStatus`; `kchatBackendListCommunities`
+  // returns JSON `KChatCommunity[]`;
+  // `kchatBackendSelectCommunity` returns a JSON
+  // `KChatMembershipStatus` (same shape as `kchatInstallAuthority`
+  // — replaces the dev-mint flow);
+  // `kchatBackendShareToConversation` returns a JSON
   // `KChatPostMessageResult`.
-  kchatDesktopAvailable(): boolean;
-  kchatDesktopConnect?(): string;
-  kchatDesktopDisconnect?(): string;
-  kchatDesktopStatus?(): string;
-  kchatDesktopListCommunities?(): string;
-  kchatDesktopSelectCommunity?(communityId: string): string;
-  kchatDesktopGetCommunityMembers?(communityId: string): string;
-  kchatDesktopListConversations?(communityId: string): string;
-  kchatDesktopShareToConversation?(conversationId: string, inviteJson: string): string;
+  kchatBackendAvailable(): boolean;
+  // `kchatBackendConnect` accepts a JSON-encoded
+  // `KChatBackendSignInRequest` (`{ baseUrl, loginId, password, totp? }`).
+  kchatBackendConnect?(requestJson: string): string;
+  kchatBackendDisconnect?(): string;
+  kchatBackendStatus?(): string;
+  kchatBackendListCommunities?(): string;
+  kchatBackendSelectCommunity?(communityId: string): string;
+  kchatBackendGetCommunityMembers?(communityId: string): string;
+  kchatBackendListConversations?(communityId: string): string;
+  kchatBackendShareToConversation?(conversationId: string, inviteJson: string): string;
   // Phase 7 (Task 10): accept a document-share invite.
-  kchatDesktopAcceptInvite?(inviteJson: string): string;
+  kchatBackendAcceptInvite?(inviteJson: string): string;
   // Phase 7 (Task 8): roster-sync tick.
-  kchatDesktopSyncCommunityRoster?(communityId: string): string;
+  kchatBackendSyncCommunityRoster?(communityId: string): string;
   // Phase 7 (Task 8): kick a connected peer.
   sessionKickPeer(peerId: string, reason: string): void;
   // Phase 7 (Task 15): ask a connected host to backfill journal

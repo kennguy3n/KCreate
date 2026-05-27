@@ -3274,11 +3274,11 @@ pub fn kchat_install_authority(req: KChatInstallRequest) -> Result<KChatMembersh
 }
 
 /// Install a pre-built `SharedKChatAuthority` directly. Used by
-/// the Phase 7 KChat Desktop bridge (`kchat_desktop`) when the
-/// authority is sourced from a live IPC connection rather than a
+/// the Phase 7 KChat backend bridge (`kchat_backend`) when the
+/// authority is sourced from a live REST sign-in rather than a
 /// wire-format `KChatInstallRequest`. The caller is responsible
 /// for verifying the underlying membership against its issuer trust
-/// root (the `KChatDesktopAuthority::install` constructor does so).
+/// root (the `KChatBackendAuthority::install` constructor does so).
 /// The provided `membership` is used to compute the
 /// `KChatMembershipStatus` returned to the renderer (issuer label,
 /// trusted-issuer lookup, validity window) using the same builder

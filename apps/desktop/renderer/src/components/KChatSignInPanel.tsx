@@ -24,6 +24,9 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 
 import type {
+  KChatBackendSignInRequest,
+  KChatBackendStatus,
+  KChatCommunity,
   KChatDevMintRequest,
   KChatInstallRequest,
   KChatLocalIdentity,
@@ -49,6 +52,14 @@ const LAST_GROUP_ID_STORAGE_KEY = "kcreate.kchat.lastGroupId";
 /// trusted it. Stored as base64url, 32 bytes (Ed25519 seed).
 const DEV_ISSUER_SEED_STORAGE_KEY = "kcreate.kchat.devIssuerSeed";
 
+/// Persistent KChat backend sign-in URL + login id. We never
+/// persist passwords or TOTP codes — the user re-enters them on
+/// each sign-in. The URL + login id round-trip is purely for
+/// convenience so the form re-opens with the same backend on
+/// next launch.
+const BACKEND_BASE_URL_STORAGE_KEY = "kcreate.kchat.backendBaseUrl";
+const BACKEND_LOGIN_ID_STORAGE_KEY = "kcreate.kchat.backendLoginId";
+
 export interface KChatSignInPanelProps {
   /// Current gate state. `null` means we haven't loaded it yet
   /// (treat as locked, conservative default).
@@ -69,6 +80,7 @@ export function KChatSignInPanel({
 }: KChatSignInPanelProps): JSX.Element {
   const locked = status === null || status.locked;
   const [devIssuerAvailable, setDevIssuerAvailable] = useState<boolean>(false);
+  const [backendAvailable, setBackendAvailable] = useState<boolean>(false);
   const [localIdentity, setLocalIdentity] = useState<KChatLocalIdentity | null>(
     null,
   );
@@ -95,6 +107,25 @@ export function KChatSignInPanel({
         if (!cancelled) setDevIssuerAvailable(avail);
       } catch {
         if (!cancelled) setDevIssuerAvailable(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // Probe the kchat-backend feature flag on mount so we can show
+  // the REST sign-in section when the bridge supports it. Cheap
+  // capability probe; the bridge returns `false` in builds that
+  // don't link the REST client.
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const avail = await window.kcreate.kchatBackend.available();
+        if (!cancelled) setBackendAvailable(avail);
+      } catch {
+        if (!cancelled) setBackendAvailable(false);
       }
     })();
     return () => {
@@ -347,8 +378,10 @@ export function KChatSignInPanel({
       <h3 style={sectionTitleStyle}>Sign into a KChat group</h3>
       <p style={hintStyle}>
         Multiplayer is locked at the protocol layer until a verified
-        KChat group membership is installed. The KChat client mints
-        an attestation when you join a group; paste it here.
+        KChat group membership is installed. KCreate signs you into
+        the shared KChat backend over HTTPS and asks it to mint a
+        community-scoped attestation; a paste-attestation fallback
+        and a dev-only mint flow stay available below.
       </p>
 
       {localIdentity !== null ? (
@@ -360,37 +393,50 @@ export function KChatSignInPanel({
           </strong>
           <code style={codeStyle}>{localIdentity.peerPublicKey}</code>
           <span style={hintStyle}>
-            The KChat client will need these when minting a membership.
+            KChat binds the minted membership to this peer key.
           </span>
         </div>
       ) : null}
 
-      <label style={labelStyle}>
-        <span style={labelTextStyle}>Membership attestation (JSON)</span>
-        <textarea
-          value={pasteJson}
-          onChange={(e) => setPasteJson(e.target.value)}
-          placeholder='{"issuerPublicKey": "...", "groupId": "...", ...}'
-          rows={6}
-          spellCheck={false}
-          style={textareaStyle}
-          disabled={busy}
+      {backendAvailable ? (
+        <BackendSignInSection
+          onStatusChange={onStatusChange}
+          onStatus={onStatus}
+          onError={setError}
         />
-      </label>
-      <div style={buttonRowStyle}>
-        <button
-          type="button"
-          onClick={() => {
-            void handleInstall();
-          }}
-          disabled={busy || pasteJson.trim().length === 0}
-          style={primaryButtonStyle(
-            busy || pasteJson.trim().length === 0,
-          )}
-        >
-          {busy ? "Installing…" : "Sign in"}
-        </button>
-      </div>
+      ) : null}
+
+      <details style={fallbackDetailsStyle}>
+        <summary style={fallbackSummaryStyle}>
+          Paste membership attestation (fallback)
+        </summary>
+        <label style={labelStyle}>
+          <span style={labelTextStyle}>Membership attestation (JSON)</span>
+          <textarea
+            value={pasteJson}
+            onChange={(e) => setPasteJson(e.target.value)}
+            placeholder='{"issuerPublicKey": "...", "groupId": "...", ...}'
+            rows={6}
+            spellCheck={false}
+            style={textareaStyle}
+            disabled={busy}
+          />
+        </label>
+        <div style={buttonRowStyle}>
+          <button
+            type="button"
+            onClick={() => {
+              void handleInstall();
+            }}
+            disabled={busy || pasteJson.trim().length === 0}
+            style={primaryButtonStyle(
+              busy || pasteJson.trim().length === 0,
+            )}
+          >
+            {busy ? "Installing…" : "Install attestation"}
+          </button>
+        </div>
+      </details>
 
       {devIssuerAvailable ? (
         <DevMintSection
@@ -778,6 +824,352 @@ function DevMintSection({
 }
 
 // ---------------------------------------------------------------------------
+// Backend (HTTPS REST) sign-in section.
+//
+// Two-step affordance:
+//
+//   1. Collect baseUrl + loginId + password (+ optional TOTP),
+//      `kchatBackend.connect()` → installs the REST client in the
+//      bridge. Renders an identity card + a community picker.
+//
+//   2. Click a community → `kchatBackend.selectCommunity(id)` →
+//      installs the minted attestation as the active KChat
+//      authority (the bridge calls `kchat.install` internally),
+//      bubbles the new `KChatMembershipStatus` up to the parent.
+//
+// We persist `baseUrl` + `loginId` in localStorage so the form
+// re-opens with the same backend. Passwords + TOTP codes are
+// never persisted.
+// ---------------------------------------------------------------------------
+
+function BackendSignInSection({
+  onStatusChange,
+  onStatus,
+  onError,
+}: {
+  onStatusChange: (next: KChatMembershipStatus) => void;
+  onStatus?: (msg: string | null) => void;
+  onError: (msg: string | null) => void;
+}): JSX.Element {
+  const [baseUrl, setBaseUrl] = useState<string>(
+    () => loadBackendString(BACKEND_BASE_URL_STORAGE_KEY) ?? "",
+  );
+  const [loginId, setLoginId] = useState<string>(
+    () => loadBackendString(BACKEND_LOGIN_ID_STORAGE_KEY) ?? "",
+  );
+  const [password, setPassword] = useState<string>("");
+  const [totp, setTotp] = useState<string>("");
+  const [busy, setBusy] = useState(false);
+  const [backendStatus, setBackendStatus] = useState<KChatBackendStatus | null>(
+    null,
+  );
+  const [communities, setCommunities] = useState<KChatCommunity[] | null>(null);
+  const [localError, setLocalError] = useState<string | null>(null);
+
+  // Probe status on mount so a refresh-after-sign-in restores the
+  // identity card + community list without forcing the user to
+  // re-enter their password.
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const s = await window.kcreate.kchatBackend.status();
+        if (cancelled) return;
+        setBackendStatus(s);
+        if (s.connected) {
+          try {
+            const list = await window.kcreate.kchatBackend.listCommunities();
+            if (!cancelled) setCommunities(list);
+          } catch {
+            // Status said connected but the list call failed —
+            // surface as a sign-out prompt rather than silently
+            // hiding the identity card.
+            if (!cancelled) {
+              setCommunities([]);
+            }
+          }
+        }
+      } catch {
+        if (!cancelled) setBackendStatus(null);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const persistFormFields = useCallback((url: string, login: string) => {
+    try {
+      window.localStorage.setItem(BACKEND_BASE_URL_STORAGE_KEY, url);
+      window.localStorage.setItem(BACKEND_LOGIN_ID_STORAGE_KEY, login);
+    } catch {
+      // Persistence is a nice-to-have — quota errors are fine.
+    }
+  }, []);
+
+  const handleConnect = useCallback(async () => {
+    setLocalError(null);
+    onError(null);
+    setBusy(true);
+    try {
+      const url = baseUrl.trim();
+      const lid = loginId.trim();
+      if (url.length === 0) {
+        setLocalError("Enter the KChat backend base URL (https://…).");
+        return;
+      }
+      if (lid.length === 0) {
+        setLocalError("Enter your KChat login id (email or username).");
+        return;
+      }
+      if (password.length === 0) {
+        setLocalError("Enter your KChat password.");
+        return;
+      }
+      const req: KChatBackendSignInRequest = {
+        baseUrl: url,
+        loginId: lid,
+        password,
+      };
+      const trimmedTotp = totp.trim();
+      if (trimmedTotp.length > 0) req.totp = trimmedTotp;
+      const next = await window.kcreate.kchatBackend.connect(req);
+      setBackendStatus(next);
+      persistFormFields(url, lid);
+      // Eagerly clear the password so it doesn't linger in the
+      // DOM after a successful sign-in. The user can still see
+      // their identity card.
+      setPassword("");
+      setTotp("");
+      const list = await window.kcreate.kchatBackend.listCommunities();
+      setCommunities(list);
+      onStatus?.(`Signed into KChat backend ${url}.`);
+    } catch (e) {
+      setLocalError(errMsg(e));
+    } finally {
+      setBusy(false);
+    }
+  }, [baseUrl, loginId, onError, onStatus, password, persistFormFields, totp]);
+
+  const handleSelectCommunity = useCallback(
+    async (community: KChatCommunity) => {
+      setLocalError(null);
+      onError(null);
+      setBusy(true);
+      try {
+        const next = await window.kcreate.kchatBackend.selectCommunity(
+          community.id,
+        );
+        onStatusChange(next);
+        if (next.locked) {
+          setLocalError(
+            "Backend minted an attestation but the gate didn't open. " +
+              "The issuer's signing key may not match a trusted issuer " +
+              "in the local allowlist below.",
+          );
+        } else {
+          onStatus?.(
+            `Joined KChat community "${community.name}" as ${community.role}.`,
+          );
+        }
+      } catch (e) {
+        setLocalError(errMsg(e));
+      } finally {
+        setBusy(false);
+      }
+    },
+    [onError, onStatus, onStatusChange],
+  );
+
+  const handleDisconnect = useCallback(async () => {
+    setLocalError(null);
+    onError(null);
+    setBusy(true);
+    try {
+      const next = await window.kcreate.kchatBackend.disconnect();
+      setBackendStatus(next);
+      setCommunities(null);
+      onStatus?.("Signed out of KChat backend.");
+    } catch (e) {
+      setLocalError(errMsg(e));
+    } finally {
+      setBusy(false);
+    }
+  }, [onError, onStatus]);
+
+  const connected = backendStatus?.connected === true;
+
+  return (
+    <div style={backendSectionStyle}>
+      <div style={backendHeaderStyle}>
+        <strong>Sign in to KChat backend</strong>
+        <span style={infoBadgeStyle}>HTTPS REST</span>
+      </div>
+      <p style={hintStyle}>
+        Signs in to the shared KChat / Mattermost backend. KCreate
+        asks it to mint a per-community attestation bound to this
+        peer key. The companion <code>.kcz</code> extension in KChat
+        Desktop reads the same identity independently.
+      </p>
+
+      {!connected ? (
+        <>
+          <label style={labelStyle}>
+            <span style={labelTextStyle}>Base URL</span>
+            <input
+              type="url"
+              value={baseUrl}
+              onChange={(e) => setBaseUrl(e.target.value)}
+              placeholder="https://kchat.example.com"
+              spellCheck={false}
+              style={inputStyle}
+              disabled={busy}
+              autoComplete="off"
+            />
+          </label>
+          <label style={labelStyle}>
+            <span style={labelTextStyle}>Login id</span>
+            <input
+              type="text"
+              value={loginId}
+              onChange={(e) => setLoginId(e.target.value)}
+              placeholder="alice@kchat.example.com"
+              spellCheck={false}
+              style={inputStyle}
+              disabled={busy}
+              autoComplete="username"
+            />
+          </label>
+          <label style={labelStyle}>
+            <span style={labelTextStyle}>Password</span>
+            <input
+              type="password"
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              style={inputStyle}
+              disabled={busy}
+              autoComplete="current-password"
+            />
+          </label>
+          <label style={labelStyle}>
+            <span style={labelTextStyle}>TOTP (optional)</span>
+            <input
+              type="text"
+              value={totp}
+              onChange={(e) => setTotp(e.target.value)}
+              placeholder="6-digit code"
+              inputMode="numeric"
+              pattern="[0-9]*"
+              maxLength={8}
+              spellCheck={false}
+              style={inputStyle}
+              disabled={busy}
+              autoComplete="one-time-code"
+            />
+          </label>
+          <div style={buttonRowStyle}>
+            <button
+              type="button"
+              onClick={() => {
+                void handleConnect();
+              }}
+              disabled={
+                busy ||
+                baseUrl.trim().length === 0 ||
+                loginId.trim().length === 0 ||
+                password.length === 0
+              }
+              style={primaryButtonStyle(
+                busy ||
+                  baseUrl.trim().length === 0 ||
+                  loginId.trim().length === 0 ||
+                  password.length === 0,
+              )}
+            >
+              {busy ? "Signing in…" : "Sign in"}
+            </button>
+          </div>
+        </>
+      ) : (
+        <>
+          <div style={inlineHintStyle}>
+            <strong>Signed in as:</strong>
+            <code style={codeStyle}>
+              {backendStatus?.identity?.displayName ??
+                backendStatus?.identity?.jid ??
+                "(unknown)"}
+            </code>
+            <strong style={{ marginTop: spacing.xs }}>Backend:</strong>
+            <code style={codeStyle}>
+              {backendStatus?.baseUrl ?? "(unknown)"}
+            </code>
+          </div>
+          {communities === null ? (
+            <p style={hintStyle}>Loading communities…</p>
+          ) : communities.length === 0 ? (
+            <p style={hintStyle}>
+              The backend reported no communities for this account.
+              Create or join one in KChat Desktop, then come back.
+            </p>
+          ) : (
+            <ul style={communityListStyle}>
+              {communities.map((c) => (
+                <li key={c.id} style={communityListItemStyle}>
+                  <div style={communityHeaderStyle}>
+                    <strong>{c.name}</strong>
+                    <span style={badgeStyle}>{c.role}</span>
+                  </div>
+                  {c.description ? (
+                    <span style={hintStyle}>{c.description}</span>
+                  ) : null}
+                  <span style={hintStyle}>
+                    {c.memberCount} members • id <code>{c.id}</code>
+                  </span>
+                  <div style={buttonRowStyle}>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        void handleSelectCommunity(c);
+                      }}
+                      disabled={busy}
+                      style={primaryButtonStyle(busy)}
+                    >
+                      {busy ? "Joining…" : "Join community"}
+                    </button>
+                  </div>
+                </li>
+              ))}
+            </ul>
+          )}
+          <div style={buttonRowStyle}>
+            <button
+              type="button"
+              onClick={() => {
+                void handleDisconnect();
+              }}
+              disabled={busy}
+              style={secondaryButtonStyle(busy)}
+            >
+              {busy ? "Signing out…" : "Sign out of backend"}
+            </button>
+          </div>
+        </>
+      )}
+      {localError !== null ? <div style={errorStyle}>{localError}</div> : null}
+    </div>
+  );
+}
+
+function loadBackendString(key: string): string | null {
+  try {
+    const raw = window.localStorage.getItem(key);
+    return raw === null || raw.length === 0 ? null : raw;
+  } catch {
+    return null;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Hooks + helpers
 // ---------------------------------------------------------------------------
 
@@ -1007,6 +1399,65 @@ const devSectionStyle: React.CSSProperties = {
   border: `1px dashed ${colors.border}`,
   borderRadius: radius.sm,
   background: colors.bg,
+};
+
+const backendSectionStyle: React.CSSProperties = {
+  display: "flex",
+  flexDirection: "column",
+  gap: spacing.sm,
+  padding: spacing.sm,
+  border: `1px solid ${colors.border}`,
+  borderRadius: radius.sm,
+  background: colors.bg,
+};
+
+const backendHeaderStyle: React.CSSProperties = {
+  display: "flex",
+  alignItems: "center",
+  gap: spacing.sm,
+  fontSize: 12,
+  color: colors.text,
+};
+
+const communityListStyle: React.CSSProperties = {
+  display: "flex",
+  flexDirection: "column",
+  gap: spacing.sm,
+  listStyle: "none",
+  margin: 0,
+  padding: 0,
+};
+
+const communityListItemStyle: React.CSSProperties = {
+  display: "flex",
+  flexDirection: "column",
+  gap: spacing.xs,
+  padding: spacing.sm,
+  border: `1px solid ${colors.border}`,
+  borderRadius: radius.sm,
+};
+
+const communityHeaderStyle: React.CSSProperties = {
+  display: "flex",
+  alignItems: "center",
+  gap: spacing.sm,
+};
+
+const fallbackDetailsStyle: React.CSSProperties = {
+  display: "flex",
+  flexDirection: "column",
+  gap: spacing.sm,
+  padding: spacing.sm,
+  border: `1px solid ${colors.border}`,
+  borderRadius: radius.sm,
+  background: colors.bg,
+};
+
+const fallbackSummaryStyle: React.CSSProperties = {
+  fontSize: 12,
+  fontWeight: 500,
+  cursor: "pointer",
+  color: colors.text,
 };
 
 const devHeaderStyle: React.CSSProperties = {

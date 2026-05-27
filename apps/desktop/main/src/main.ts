@@ -2444,15 +2444,15 @@ function registerIpcHandlers(): void {
   );
 
   // -------------------------------------------------------------------
-  // Phase 7 — KChat Desktop local IPC. All entry points except the
-  // `available` probe are optional on the bridge: a non-collab or
-  // non-`kchat-desktop` build simply doesn't link them, and the
+  // Phase 7 — KChat backend (HTTPS REST). All entry points except
+  // the `available` probe are optional on the bridge: a non-collab
+  // or non-`kchat-backend` build simply doesn't link them, and the
   // handlers below return a typed error so the renderer can fall
   // back to the paste-attestation flow. Channels follow the
-  // `kcreate/kchat-desktop/*` namespace per Block A spec.
+  // `kcreate/kchat-backend/*` namespace per Option C spec.
   // -------------------------------------------------------------------
-  ipcMain.handle("kcreate/kchat-desktop/available", () => {
-    const fn = requireBridge().kchatDesktopAvailable;
+  ipcMain.handle("kcreate/kchat-backend/available", () => {
+    const fn = requireBridge().kchatBackendAvailable;
     if (typeof fn !== "function") return false;
     try {
       return fn();
@@ -2460,62 +2460,68 @@ function registerIpcHandlers(): void {
       return false;
     }
   });
-  // Helper: resolve an optional `kchat-desktop` bridge function or
+  // Helper: resolve an optional `kchat-backend` bridge function or
   // throw a typed error. Keeps each handler one line below.
-  const requireKChatDesktop = <K extends keyof Bridge>(method: K): Bridge[K] => {
+  const requireKChatBackend = <K extends keyof Bridge>(method: K): Bridge[K] => {
     const fn = requireBridge()[method];
     if (typeof fn !== "function") {
       throw new Error(
-        `kchat-desktop: ${String(method)} not available in this build ` +
-          "(rebuild kcreate_bridge with --features kchat-desktop)",
+        `kchat-backend: ${String(method)} not available in this build ` +
+          "(rebuild kcreate_bridge with --features kchat-backend)",
       );
     }
     return fn;
   };
-  ipcMain.handle("kcreate/kchat-desktop/connect", () =>
-    (requireKChatDesktop("kchatDesktopConnect") as () => string)(),
+  ipcMain.handle(
+    "kcreate/kchat-backend/connect",
+    (_e, requestJson: string) =>
+      (
+        requireKChatBackend("kchatBackendConnect") as (
+          requestJson: string,
+        ) => string
+      )(requestJson),
   );
-  ipcMain.handle("kcreate/kchat-desktop/disconnect", () =>
-    (requireKChatDesktop("kchatDesktopDisconnect") as () => string)(),
+  ipcMain.handle("kcreate/kchat-backend/disconnect", () =>
+    (requireKChatBackend("kchatBackendDisconnect") as () => string)(),
   );
-  ipcMain.handle("kcreate/kchat-desktop/status", () =>
-    (requireKChatDesktop("kchatDesktopStatus") as () => string)(),
+  ipcMain.handle("kcreate/kchat-backend/status", () =>
+    (requireKChatBackend("kchatBackendStatus") as () => string)(),
   );
-  ipcMain.handle("kcreate/kchat-desktop/list-communities", () =>
-    (requireKChatDesktop("kchatDesktopListCommunities") as () => string)(),
+  ipcMain.handle("kcreate/kchat-backend/list-communities", () =>
+    (requireKChatBackend("kchatBackendListCommunities") as () => string)(),
   );
   ipcMain.handle(
-    "kcreate/kchat-desktop/select-community",
+    "kcreate/kchat-backend/select-community",
     (_e, communityId: string) =>
       (
-        requireKChatDesktop("kchatDesktopSelectCommunity") as (
+        requireKChatBackend("kchatBackendSelectCommunity") as (
           id: string,
         ) => string
       )(communityId),
   );
   ipcMain.handle(
-    "kcreate/kchat-desktop/get-community-members",
+    "kcreate/kchat-backend/get-community-members",
     (_e, communityId: string) =>
       (
-        requireKChatDesktop("kchatDesktopGetCommunityMembers") as (
+        requireKChatBackend("kchatBackendGetCommunityMembers") as (
           id: string,
         ) => string
       )(communityId),
   );
   ipcMain.handle(
-    "kcreate/kchat-desktop/list-conversations",
+    "kcreate/kchat-backend/list-conversations",
     (_e, communityId: string) =>
       (
-        requireKChatDesktop("kchatDesktopListConversations") as (
+        requireKChatBackend("kchatBackendListConversations") as (
           id: string,
         ) => string
       )(communityId),
   );
   ipcMain.handle(
-    "kcreate/kchat-desktop/share-to-conversation",
+    "kcreate/kchat-backend/share-to-conversation",
     (_e, conversationId: string, inviteJson: string) =>
       (
-        requireKChatDesktop("kchatDesktopShareToConversation") as (
+        requireKChatBackend("kchatBackendShareToConversation") as (
           c: string,
           i: string,
         ) => string
@@ -2524,10 +2530,10 @@ function registerIpcHandlers(): void {
 
   // Phase 7 (Task 10): accept invite.
   ipcMain.handle(
-    "kcreate/kchat-desktop/accept-invite",
+    "kcreate/kchat-backend/accept-invite",
     (_e, inviteJson: string) =>
       (
-        requireKChatDesktop("kchatDesktopAcceptInvite") as (
+        requireKChatBackend("kchatBackendAcceptInvite") as (
           j: string,
         ) => string
       )(inviteJson),
@@ -2535,10 +2541,10 @@ function registerIpcHandlers(): void {
 
   // Phase 7 (Task 8): roster-sync tick.
   ipcMain.handle(
-    "kcreate/kchat-desktop/sync-community-roster",
+    "kcreate/kchat-backend/sync-community-roster",
     (_e, communityId: string) =>
       (
-        requireKChatDesktop("kchatDesktopSyncCommunityRoster") as (
+        requireKChatBackend("kchatBackendSyncCommunityRoster") as (
           c: string,
         ) => string
       )(communityId),

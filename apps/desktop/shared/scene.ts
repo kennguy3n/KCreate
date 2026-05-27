@@ -1538,7 +1538,7 @@ export type AuditCollabAction =
   | { action: "peer_kicked"; peer_id: string; reason: string }
   | { action: "operation_received"; peer_id: string; op_count: number }
   | { action: "conflict_resolved"; node_id: string }
-  | { action: "kchat_desktop_status"; status: string };
+  | { action: "kchat_backend_status"; status: string };
 
 /** Discriminated union matching `kcreate_audit::AuditEventKind`. */
 export type AuditEventKind =
@@ -3636,17 +3636,16 @@ export interface KChatBridge {
 }
 
 // ---------------------------------------------------------------------------
-// Phase 7 — KChat Desktop local IPC (uney-chat-desktop integration).
+// Phase 7 — KChat backend (HTTPS REST).
 //
 // Mirrors `kcreate_kchat_client` wire-format types and the bridge
-// surface in `kcreate_bridge::kchat_desktop`. The IPC client
-// connects to a local Unix domain socket
-// (`$XDG_RUNTIME_DIR/kchat/kcreate.sock` or
-// `$HOME/.kchat/kcreate.sock`) or named pipe
-// (`\\.\pipe\kchat-kcreate`) exposed by `uney-chat-desktop`. The
-// full protocol spec is documented in
-// `crates/kcreate_kchat_client/src/protocol_spec.md` for the
-// `uney-chat-desktop` maintainers to implement the server side.
+// surface in `kcreate_bridge::kchat_backend`. The REST client
+// signs in to the same KChat / Mattermost backend
+// `uney-chat-desktop` uses. A separate `.kcz` companion
+// extension ships inside KChat Desktop (`apps/kchat-extension/`)
+// and surfaces recent KCreate projects + share invites via the
+// host's procedures registry — it does NOT proxy this bridge;
+// both apps independently talk to the same backend.
 // ---------------------------------------------------------------------------
 
 /// Local-user identity reported by `kchat.identity.get`. Mirrors
@@ -3667,17 +3666,33 @@ export interface KChatIdentity {
   peerId: string;
 }
 
-/// Status snapshot returned by `KChatDesktopBridge.{connect,
+/// Status snapshot returned by `KChatBackendBridge.{connect,
 /// disconnect, status}`. Mirrors
-/// `kcreate_bridge::kchat_desktop::KChatDesktopStatus`.
-export interface KChatDesktopStatus {
+/// `kcreate_bridge::kchat_backend::KChatBackendStatus`.
+export interface KChatBackendStatus {
   connected: boolean;
-  /// Resolved filesystem path the client is connected to (Unix
-  /// socket) or pipe name (Windows). `null` when disconnected.
-  socketPath: string | null;
-  /// `null` until the bridge has fetched identity from the
-  /// desktop app for the first time on the current connection.
+  /// HTTPS base URL the client is signed in to. `null` when not
+  /// signed in.
+  baseUrl: string | null;
+  /// Identity returned by the login response. `null` until the
+  /// renderer signs in.
   identity: KChatIdentity | null;
+}
+
+/// Sign-in request body the renderer hands to
+/// `KChatBackendBridge.connect`. Mirrors
+/// `kcreate_bridge::kchat_backend::KChatBackendSignInRequest`.
+export interface KChatBackendSignInRequest {
+  /// HTTPS base URL of the KChat / Mattermost backend. The Rust
+  /// client refuses anything but `https://` in production builds.
+  baseUrl: string;
+  /// Login id (XMPP bare JID for KChat; username or email for
+  /// Mattermost — the backend disambiguates).
+  loginId: string;
+  /// Password / OAuth bearer token (treated opaquely).
+  password: string;
+  /// Optional TOTP code when the user has 2FA enabled.
+  totp?: string;
 }
 
 /// A community reported by `kchat.communities.list`. Mirrors
@@ -3714,8 +3729,8 @@ export interface KChatConversation {
 }
 
 /// Invite-card payload posted to a KChat conversation by
-/// `KChatDesktopBridge.shareToConversation`. Mirrors
-/// `kcreate_bridge::kchat_desktop::KChatShareInvite`.
+/// `KChatBackendBridge.shareToConversation`. Mirrors
+/// `kcreate_bridge::kchat_backend::KChatShareInvite`.
 export interface KChatShareInvite {
   /// KCreate project id the invite points to (UUID).
   projectId: string;
@@ -3737,8 +3752,8 @@ export interface KChatShareInvite {
   conversationId: string;
 }
 
-/// Result of `KChatDesktopBridge.shareToConversation`. Mirrors
-/// `kcreate_kchat_client::PostMessageResult`.
+/// Result of `KChatBackendBridge.shareToConversation`. Mirrors
+/// `kcreate_kchat_client::PostMessageResponse`.
 export interface KChatPostMessageResult {
   messageId: string;
   /// RFC3339 UTC timestamp the server stamped on the message.
@@ -3746,7 +3761,7 @@ export interface KChatPostMessageResult {
 }
 
 /// Phase 7 (Task 10): result of accepting a share-document invite.
-/// Mirrors `kcreate_bridge::kchat_desktop::KChatAcceptedInvite`.
+/// Mirrors `kcreate_bridge::kchat_backend::KChatAcceptedInvite`.
 export interface KChatAcceptedInvite {
   projectId: string;
   projectName: string;
@@ -3757,9 +3772,9 @@ export interface KChatAcceptedInvite {
 }
 
 /// Phase 7 (Task 8): result of a roster-sync tick.
-/// Mirrors `kcreate_bridge::kchat_desktop::KChatRosterSyncResult`.
+/// Mirrors `kcreate_bridge::kchat_backend::KChatRosterSyncResult`.
 export interface KChatRosterSyncResult {
-  /// How many members KChat Desktop reported on this tick.
+  /// How many members the KChat backend reported on this tick.
   polledMembers: number;
   /// Peer ids that were evicted because they were no longer in the
   /// community roster.
@@ -3770,25 +3785,26 @@ export interface KChatRosterSyncResult {
 /// Mirrors `kcreate_bridge::collab::CollabPermission`.
 export type CollabPermission = "editor" | "viewer";
 
-/// Phase 7 KChat Desktop bridge surface. Every method other than
-/// `available` is optional because non-`kchat-desktop` builds do
-/// not link the underlying N-API exports; the renderer probes via
-/// `available()` and falls back to the paste-attestation flow when
-/// the answer is `false`.
-export interface KChatDesktopBridge {
+/// Phase 7 KChat **backend** bridge surface. Every method other
+/// than `available` is optional because non-`kchat-backend` builds
+/// do not link the underlying N-API exports; the renderer probes
+/// via `available()` and falls back to the paste-attestation flow
+/// when the answer is `false`.
+export interface KChatBackendBridge {
   /// Capability probe — `true` when the bridge was compiled with
-  /// the `kchat-desktop` feature flag.
+  /// the `kchat-backend` feature flag.
   available(): Promise<boolean>;
-  /// Try to connect to the local KChat Desktop IPC socket. Tries
-  /// the platform default paths in order; throws a typed error if
-  /// no socket is reachable.
-  connect(): Promise<KChatDesktopStatus>;
-  /// Disconnect (idempotent). Also clears any KChat authority
+  /// Sign in to a KChat / Mattermost backend. Tears down any prior
+  /// session + installed authority before installing the new
+  /// client so a stale membership doesn't outlive the sign-in it
+  /// was minted from.
+  connect(request: KChatBackendSignInRequest): Promise<KChatBackendStatus>;
+  /// Sign out (idempotent). Also clears any KChat authority
   /// installed by `selectCommunity` so a stale membership doesn't
-  /// outlive the connection it was minted from.
-  disconnect(): Promise<KChatDesktopStatus>;
-  /// Snapshot the current connection state + cached identity.
-  status(): Promise<KChatDesktopStatus>;
+  /// outlive the sign-in it was minted from.
+  disconnect(): Promise<KChatBackendStatus>;
+  /// Snapshot the current sign-in state + cached identity.
+  status(): Promise<KChatBackendStatus>;
   /// List the communities the local user belongs to.
   listCommunities(): Promise<KChatCommunity[]>;
   /// Pick a community and install its attestation as the active
@@ -3812,9 +3828,10 @@ export interface KChatDesktopBridge {
   /// through a KChat conversation. Validates community match +
   /// sender membership and dials the owner via `session.join()`.
   acceptInvite(inviteJson: string): Promise<KChatAcceptedInvite>;
-  /// Phase 7 (Task 8): roster-sync tick — polls KChat Desktop for
-  /// the latest community members, reconciles against the active
-  /// session (kicks revoked peers, refreshes role -> permission).
+  /// Phase 7 (Task 8): roster-sync tick — polls the KChat backend
+  /// for the latest community members, reconciles against the
+  /// active session (kicks revoked peers, refreshes role ->
+  /// permission).
   syncCommunityRoster(
     communityId: string,
   ): Promise<KChatRosterSyncResult>;
@@ -4041,7 +4058,7 @@ declare global {
       slice: SliceBridge;
       session: SessionBridge;
       kchat: KChatBridge;
-      kchatDesktop: KChatDesktopBridge;
+      kchatBackend: KChatBackendBridge;
       clipboard: ClipboardBridge;
     };
   }

@@ -1,15 +1,15 @@
-//! Membership attestation bridging.
+//! Membership attestation bridging — REST-sourced.
 //!
 //! Maps the wire-format [`MembershipAttestation`] returned by
-//! `kchat.communities.getMembership` into the
+//! `POST /api/v1/communities/{id}/attestation` into the
 //! [`kcreate_collab::KChatMembership`] type the collab gate verifies
-//! against, and exposes a [`KChatDesktopAuthority`] implementing
+//! against, and exposes a [`KChatBackendAuthority`] implementing
 //! [`KChatGroupAuthority`] so the bridge can plug it straight into
 //! the collab session.
 //!
 //! Auto-refresh: when an attestation is within
 //! [`REFRESH_BEFORE_EXPIRY`] of expiring, the authority transparently
-//! re-asks uney-chat-desktop for a fresh one. Callers (the collab
+//! re-asks the KChat backend for a fresh one. Callers (the collab
 //! session) never see the old expired membership.
 
 use std::sync::Arc;
@@ -25,15 +25,14 @@ use kcreate_collab::kchat::{
 use kcreate_collab::peer::PeerId;
 use parking_lot::RwLock;
 
-use crate::client::KChatDesktopClient;
+use crate::client::KChatBackendClient;
 use crate::error::ClientError;
 use crate::protocol::MembershipAttestation;
 
 /// Trigger a refresh when the remaining lifetime drops below this
 /// window. Set to 5 minutes per the Phase 7 spec; configurable via
-/// [`KChatDesktopAuthority::with_refresh_window`].
-#[allow(clippy::duration_suboptimal_units)] // `from_mins` requires nightly.
-pub const REFRESH_BEFORE_EXPIRY: Duration = Duration::from_secs(300);
+/// [`KChatBackendAuthority::with_refresh_window`].
+pub const REFRESH_BEFORE_EXPIRY: Duration = Duration::from_mins(5);
 
 /// Map a [`MembershipAttestation`] (wire format) into a
 /// [`KChatMembership`] (collab type). The two structs are
@@ -77,25 +76,25 @@ pub fn decode_verifying_key(b64: &str) -> Result<VerifyingKey, ClientError> {
     })
 }
 
-/// Production-shape KChat authority backed by a live uney-chat-desktop
-/// connection.
+/// Production-shape KChat authority backed by a live REST
+/// connection to the KChat backend.
 ///
 /// Holds a cached [`KChatMembership`] + issuer trust root, plus a
-/// handle to the [`KChatDesktopClient`] so it can refresh on demand.
+/// handle to the [`KChatBackendClient`] so it can refresh on demand.
 /// Refresh is gated by [`Self::refresh_if_needed`] which the bridge
 /// calls on a tick.
-pub struct KChatDesktopAuthority {
+pub struct KChatBackendAuthority {
     inner: Arc<RwLock<AuthorityInner>>,
-    client: Arc<KChatDesktopClient>,
+    client: Arc<KChatBackendClient>,
     community_id: String,
     refresh_window: Duration,
     local_peer_id: PeerId,
     local_public_key: String,
 }
 
-impl std::fmt::Debug for KChatDesktopAuthority {
+impl std::fmt::Debug for KChatBackendAuthority {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("KChatDesktopAuthority")
+        f.debug_struct("KChatBackendAuthority")
             .field("community_id", &self.community_id)
             .field("local_peer_id", &self.local_peer_id.as_str())
             .field("refresh_window_secs", &self.refresh_window.as_secs())
@@ -108,12 +107,12 @@ struct AuthorityInner {
     trust_root: VerifyingKey,
 }
 
-impl KChatDesktopAuthority {
+impl KChatBackendAuthority {
     /// Install a fresh attestation against the supplied client and
     /// build the authority. The attestation is verified locally
     /// (signature + binding + validity window) before installation.
     pub fn install(
-        client: Arc<KChatDesktopClient>,
+        client: Arc<KChatBackendClient>,
         community_id: impl Into<String>,
         attestation: MembershipAttestation,
         local_peer_id: PeerId,
@@ -187,7 +186,10 @@ impl KChatDesktopAuthority {
             return Ok(false);
         }
 
-        let fresh = self.client.get_membership(&self.community_id).await?;
+        let fresh = self
+            .client
+            .get_membership_attestation(&self.community_id, &self.local_public_key)
+            .await?;
         let trust_root = decode_verifying_key(&fresh.issuer_public_key)?;
         let membership = membership_from_attestation(fresh)?;
         let now = Utc::now();
@@ -205,11 +207,14 @@ impl KChatDesktopAuthority {
         Ok(true)
     }
 
-    /// Explicitly install a new attestation (e.g. after a transport
-    /// reconnect). Equivalent to [`Self::refresh_if_needed`] but
-    /// unconditional.
+    /// Explicitly install a new attestation (e.g. after a session
+    /// reconnect or community switch). Equivalent to
+    /// [`Self::refresh_if_needed`] but unconditional.
     pub async fn force_refresh(&self) -> Result<(), ClientError> {
-        let fresh = self.client.get_membership(&self.community_id).await?;
+        let fresh = self
+            .client
+            .get_membership_attestation(&self.community_id, &self.local_public_key)
+            .await?;
         let trust_root = decode_verifying_key(&fresh.issuer_public_key)?;
         let membership = membership_from_attestation(fresh)?;
         let now = Utc::now();
@@ -228,7 +233,7 @@ impl KChatDesktopAuthority {
     }
 }
 
-impl KChatGroupAuthority for KChatDesktopAuthority {
+impl KChatGroupAuthority for KChatBackendAuthority {
     fn local_membership(&self) -> Option<KChatMembership> {
         Some(self.inner.read().membership.clone())
     }
@@ -270,69 +275,97 @@ mod tests {
     use ed25519_dalek::SigningKey;
     use kcreate_collab::peer::PeerKey;
 
-    fn make_attestation(
-        issuer: &SigningKey,
-        group: &str,
-        peer_seed: [u8; 32],
-        issued_at: DateTime<Utc>,
-        expires_at: DateTime<Utc>,
+    fn mint_attestation(
+        signer: &SigningKey,
+        group_id: &str,
+        local: &PeerKey,
+        now: DateTime<Utc>,
+        ttl_secs: i64,
     ) -> MembershipAttestation {
-        let peer_key = PeerKey::from_seed(peer_seed);
-        let identity = peer_key.identity("test");
-        let group_id = KChatGroupId::new(group.to_string()).expect("test group id is valid");
-        let membership = KChatMembership::issue(
-            group_id,
-            identity.peer_id.clone(),
-            identity.public_key,
-            issued_at,
-            expires_at,
-            issuer,
+        let peer_pub = URL_SAFE_NO_PAD.encode(local.verifying_key().to_bytes());
+        let peer_id = local.peer_id();
+        let group = KChatGroupId::new(group_id.to_string()).expect("valid group id");
+        let m = KChatMembership::issue(
+            group,
+            peer_id.clone(),
+            peer_pub,
+            now,
+            now + chrono::Duration::seconds(ttl_secs),
+            signer,
         )
-        .expect("issue must succeed");
+        .expect("issue");
         MembershipAttestation {
-            issuer_public_key: membership.issuer_public_key.clone(),
-            group_id: membership.group_id.as_str().to_string(),
-            peer_id: membership.peer_id.as_str().to_string(),
-            peer_public_key: membership.peer_public_key.clone(),
-            issued_at: membership.issued_at,
-            expires_at: membership.expires_at,
-            signature: membership.signature.clone(),
+            issuer_public_key: m.issuer_public_key,
+            group_id: group_id.to_string(),
+            peer_id: peer_id.as_str().to_string(),
+            peer_public_key: m.peer_public_key,
+            issued_at: m.issued_at,
+            expires_at: m.expires_at,
+            signature: m.signature,
         }
     }
 
     #[test]
-    fn membership_from_attestation_round_trips_through_verify() {
-        let issuer = SigningKey::from_bytes(&[1u8; 32]);
-        let trust_root = issuer.verifying_key();
-        let peer_key = PeerKey::from_seed([2u8; 32]);
-        let identity = peer_key.identity("test");
+    fn install_verifies_against_issuer_pubkey() {
+        let issuer = SigningKey::from_bytes(&[7u8; 32]);
+        let local = PeerKey::from_seed([3u8; 32]);
+        let now = Utc::now();
+        let att = mint_attestation(&issuer, "comm-1", &local, now, 3600);
 
-        let issued_at = Utc::now() - chrono::Duration::seconds(10);
-        let expires_at = issued_at + chrono::Duration::hours(1);
-        let att = make_attestation(&issuer, "group-a", [2u8; 32], issued_at, expires_at);
-
-        let m = membership_from_attestation(att).expect("conversion succeeds");
-        m.verify(
-            &trust_root,
-            &identity.peer_id,
-            &identity.public_key,
-            Utc::now(),
+        // No real client is needed for the install path: we never
+        // call the network in `install`.
+        let dummy = Arc::new(
+            KChatBackendClient::new_for_tests("http://127.0.0.1:1")
+                .expect("test client"),
+        );
+        let local_pub = URL_SAFE_NO_PAD.encode(local.verifying_key().to_bytes());
+        let authority = KChatBackendAuthority::install(
+            dummy,
+            "comm-1",
+            att,
+            local.peer_id(),
+            local_pub.clone(),
+            now,
         )
-        .expect("verification succeeds after conversion");
+        .expect("install");
+        assert_eq!(authority.community_id(), "comm-1");
+        let cached = authority.cached_membership();
+        assert_eq!(cached.peer_public_key, local_pub);
     }
 
     #[test]
-    fn invalid_group_id_is_rejected() {
-        let att = MembershipAttestation {
-            issuer_public_key: "AA".into(),
-            group_id: "spaces are not allowed".into(),
-            peer_id: "x".into(),
-            peer_public_key: "y".into(),
-            issued_at: Utc::now(),
-            expires_at: Utc::now() + chrono::Duration::seconds(60),
-            signature: "z".into(),
-        };
-        let err = membership_from_attestation(att).unwrap_err();
-        assert!(matches!(err, ClientError::AttestationInvalid(_)));
+    fn install_rejects_signature_from_wrong_signer() {
+        let issuer = SigningKey::from_bytes(&[7u8; 32]);
+        let imposter = SigningKey::from_bytes(&[8u8; 32]);
+        let local = PeerKey::from_seed([3u8; 32]);
+        let now = Utc::now();
+        // Sign with the imposter, claim it's from the real issuer.
+        let mut att = mint_attestation(&imposter, "comm-1", &local, now, 3600);
+        att.issuer_public_key =
+            URL_SAFE_NO_PAD.encode(issuer.verifying_key().to_bytes());
+
+        let dummy = Arc::new(
+            KChatBackendClient::new_for_tests("http://127.0.0.1:1")
+                .expect("test client"),
+        );
+        let local_pub = URL_SAFE_NO_PAD.encode(local.verifying_key().to_bytes());
+        let res = KChatBackendAuthority::install(
+            dummy,
+            "comm-1",
+            att,
+            local.peer_id(),
+            local_pub,
+            now,
+        );
+        assert!(matches!(res, Err(ClientError::AttestationInvalid(_))));
+    }
+
+    #[test]
+    fn membership_from_attestation_round_trips_group_id() {
+        let issuer = SigningKey::from_bytes(&[7u8; 32]);
+        let local = PeerKey::from_seed([3u8; 32]);
+        let att = mint_attestation(&issuer, "comm-xyz", &local, Utc::now(), 60);
+        let m = membership_from_attestation(att).expect("convert");
+        assert_eq!(m.group_id.as_str(), "comm-xyz");
     }
 }

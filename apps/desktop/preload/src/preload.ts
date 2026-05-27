@@ -165,8 +165,9 @@ import type {
   KChatCommunity,
   KChatCommunityMember,
   KChatConversation,
-  KChatDesktopBridge,
-  KChatDesktopStatus,
+  KChatBackendBridge,
+  KChatBackendSignInRequest,
+  KChatBackendStatus,
   KChatDevMintRequest,
   KChatInstallRequest,
   KChatLocalIdentity,
@@ -2392,45 +2393,49 @@ const kchat: KChatBridge = {
 };
 
 // ---------------------------------------------------------------------------
-// Phase 7 — KChat Desktop local IPC bridge. Mirrors the Rust surface
-// in `kcreate_bridge::kchat_desktop`. Every wire call is a thin
-// JSON-string passthrough; the IPC handler in `main.ts` returns a
-// typed error if the bridge wasn't built with `kchat-desktop`.
+// Phase 7 — KChat backend (HTTPS REST) bridge. Mirrors the Rust
+// surface in `kcreate_bridge::kchat_backend`. Every wire call is a
+// thin JSON-string passthrough; the IPC handler in `main.ts`
+// returns a typed error if the bridge wasn't built with
+// `kchat-backend`.
 // ---------------------------------------------------------------------------
 
-const kchatDesktop: KChatDesktopBridge = {
+const kchatBackend: KChatBackendBridge = {
   async available(): Promise<boolean> {
     return (await ipcRenderer.invoke(
-      "kcreate/kchat-desktop/available",
+      "kcreate/kchat-backend/available",
     )) as boolean;
   },
-  async connect(): Promise<KChatDesktopStatus> {
+  async connect(
+    request: KChatBackendSignInRequest,
+  ): Promise<KChatBackendStatus> {
     const raw = (await ipcRenderer.invoke(
-      "kcreate/kchat-desktop/connect",
+      "kcreate/kchat-backend/connect",
+      JSON.stringify(request),
     )) as string;
-    return JSON.parse(raw) as KChatDesktopStatus;
+    return JSON.parse(raw) as KChatBackendStatus;
   },
-  async disconnect(): Promise<KChatDesktopStatus> {
+  async disconnect(): Promise<KChatBackendStatus> {
     const raw = (await ipcRenderer.invoke(
-      "kcreate/kchat-desktop/disconnect",
+      "kcreate/kchat-backend/disconnect",
     )) as string;
-    return JSON.parse(raw) as KChatDesktopStatus;
+    return JSON.parse(raw) as KChatBackendStatus;
   },
-  async status(): Promise<KChatDesktopStatus> {
+  async status(): Promise<KChatBackendStatus> {
     const raw = (await ipcRenderer.invoke(
-      "kcreate/kchat-desktop/status",
+      "kcreate/kchat-backend/status",
     )) as string;
-    return JSON.parse(raw) as KChatDesktopStatus;
+    return JSON.parse(raw) as KChatBackendStatus;
   },
   async listCommunities(): Promise<KChatCommunity[]> {
     const raw = (await ipcRenderer.invoke(
-      "kcreate/kchat-desktop/list-communities",
+      "kcreate/kchat-backend/list-communities",
     )) as string;
     return JSON.parse(raw) as KChatCommunity[];
   },
   async selectCommunity(communityId: string): Promise<KChatMembershipStatus> {
     const raw = (await ipcRenderer.invoke(
-      "kcreate/kchat-desktop/select-community",
+      "kcreate/kchat-backend/select-community",
       communityId,
     )) as string;
     return JSON.parse(raw) as KChatMembershipStatus;
@@ -2439,14 +2444,14 @@ const kchatDesktop: KChatDesktopBridge = {
     communityId: string,
   ): Promise<KChatCommunityMember[]> {
     const raw = (await ipcRenderer.invoke(
-      "kcreate/kchat-desktop/get-community-members",
+      "kcreate/kchat-backend/get-community-members",
       communityId,
     )) as string;
     return JSON.parse(raw) as KChatCommunityMember[];
   },
   async listConversations(communityId: string): Promise<KChatConversation[]> {
     const raw = (await ipcRenderer.invoke(
-      "kcreate/kchat-desktop/list-conversations",
+      "kcreate/kchat-backend/list-conversations",
       communityId,
     )) as string;
     return JSON.parse(raw) as KChatConversation[];
@@ -2456,7 +2461,7 @@ const kchatDesktop: KChatDesktopBridge = {
     invite: KChatShareInvite,
   ): Promise<KChatPostMessageResult> {
     const raw = (await ipcRenderer.invoke(
-      "kcreate/kchat-desktop/share-to-conversation",
+      "kcreate/kchat-backend/share-to-conversation",
       conversationId,
       JSON.stringify(invite),
     )) as string;
@@ -2464,7 +2469,7 @@ const kchatDesktop: KChatDesktopBridge = {
   },
   async acceptInvite(inviteJson: string): Promise<KChatAcceptedInvite> {
     const raw = (await ipcRenderer.invoke(
-      "kcreate/kchat-desktop/accept-invite",
+      "kcreate/kchat-backend/accept-invite",
       inviteJson,
     )) as string;
     return JSON.parse(raw) as KChatAcceptedInvite;
@@ -2473,7 +2478,7 @@ const kchatDesktop: KChatDesktopBridge = {
     communityId: string,
   ): Promise<KChatRosterSyncResult> {
     const raw = (await ipcRenderer.invoke(
-      "kcreate/kchat-desktop/sync-community-roster",
+      "kcreate/kchat-backend/sync-community-roster",
       communityId,
     )) as string;
     return JSON.parse(raw) as KChatRosterSyncResult;
@@ -2696,6 +2701,6 @@ contextBridge.exposeInMainWorld("kcreate", {
   slice,
   session,
   kchat,
-  kchatDesktop,
+  kchatBackend,
   clipboard,
 });

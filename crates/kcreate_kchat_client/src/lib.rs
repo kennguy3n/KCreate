@@ -1,51 +1,57 @@
-//! KChat Desktop local IPC client.
+//! KChat backend REST client used by the KCreate bridge to source
+//! community membership attestations, list communities + members,
+//! and post document-share invites.
 //!
-//! Connects to a running `uney-chat-desktop` instance over a Unix
-//! domain socket (`~/.kchat/kcreate.sock`, with `$XDG_RUNTIME_DIR`
-//! fallback) or a Windows named pipe
-//! (`\\.\pipe\kchat-kcreate`) and speaks the JSON-RPC 2.0 protocol
-//! documented in [`protocol_spec.md`](./protocol_spec.md).
+//! See [`protocol`] for the REST contract this client speaks.
 //!
-//! ## Modules
+//! ## Architecture (Option C pivot — May 2026)
 //!
-//! - [`protocol`] — wire-format request/response/notification types.
-//! - [`transport`] — bidirectional newline-delimited JSON pump.
-//! - [`client`] — high-level connection lifecycle + typed methods.
-//! - [`attestation`] — bridge between the wire-format membership
-//!   attestation and the in-tree `kcreate_collab::KChatMembership`.
-//! - [`error`] — typed error surface.
-//! - [`mock_server`] — in-process JSON-RPC server used by the test
-//!   harness (and as the canonical Rust reference implementation for
-//!   the future uney-chat-desktop server side).
+//! Previously this crate spoke a local Unix-socket / named-pipe
+//! JSON-RPC protocol to a hypothetical `uney-chat-desktop` server
+//! that does not exist. After ken's architectural review, the
+//! correct integration model is:
 //!
-//! ## Local-first invariant
+//!   - KCreate runs as a **standalone process**.
+//!   - It talks to the **shared KChat / Mattermost backend** over
+//!     HTTPS REST — the same backend `uney-chat-desktop` also uses.
+//!   - A separate `.kcz` **companion extension** ships inside
+//!     KChat Desktop (see `apps/kchat-extension/`) and contributes
+//!     a sidebar showing recent KCreate projects + share invites.
+//!     That extension uses the host's procedures registry — it
+//!     does **not** proxy this REST client.
 //!
-//! This crate is the only Phase 7 addition that needs `tokio::net`,
-//! and it talks to a LOCAL socket only — no DNS, no HTTP, no QUIC.
-//! It is excluded from `kcreate_tests::tests::local_first.rs`
-//! `editing_path_crates()` for the same reason
-//! `kcreate_collab_transport` is: the bridge only depends on it
-//! behind the off-by-default `kchat-desktop` feature flag.
+//! ## Crate isolation
+//!
+//! This crate links `reqwest` (rustls-tls). The bridge depends on
+//! it only behind the off-by-default `kchat-backend` feature flag,
+//! so the local-first deny-list sentinel in
+//! `crates/kcreate_tests/tests/local_first.rs` keeps the default
+//! build network-free.
 
 pub mod attestation;
+pub mod auth;
 pub mod client;
 pub mod error;
-pub mod mock_server;
 pub mod protocol;
-pub mod transport;
+pub mod rest;
+
+#[cfg(feature = "test-fixture")]
+pub mod fixture;
 
 pub use attestation::{
-    decode_verifying_key, membership_from_attestation, KChatDesktopAuthority, REFRESH_BEFORE_EXPIRY,
+    decode_verifying_key, membership_from_attestation, KChatBackendAuthority,
+    REFRESH_BEFORE_EXPIRY,
 };
-pub use client::{default_socket_paths, KChatDesktopClient, CONNECT_TIMEOUT, RECONNECT_BACKOFF};
+pub use auth::{TokenSet, TokenStore, PREEMPTIVE_REFRESH_WINDOW};
+pub use client::KChatBackendClient;
 pub use error::ClientError;
 pub use protocol::{
-    CommunityEvent, CommunityEventKind, ErrorCode, InviteCardPayload, KChatCommunity,
-    KChatCommunityMember, KChatConversation, KChatConversationType, KChatIdentity, KChatRole,
-    MembershipAttestation, PostMessageParams, PostMessageResult, INVITE_CONTENT_TYPE,
-    INVITE_SCHEMA_VERSION, PROTOCOL_VERSION,
+    error_code, AttestationRequest, BackendErrorBody, CommunitiesListResponse, CommunityEvent,
+    CommunityEventKind, CommunityEventsResponse, ConversationsListResponse, InviteCardPayload,
+    KChatCommunity, KChatCommunityMember, KChatConversation, KChatConversationType, KChatIdentity,
+    KChatRole, LoginRequest, LoginResponse, MembersListResponse, MembershipAttestation,
+    PostMessageParams, PostMessageRequest, PostMessageResponse, PostMessageResult, RefreshRequest,
+    RefreshResponse, INVITE_CONTENT_TYPE, INVITE_SCHEMA_VERSION, PROTOCOL_VERSION,
+    PROTOCOL_VERSION_HEADER, USER_AGENT_HEADER_VALUE,
 };
-pub use transport::Transport;
-
-#[cfg(test)]
-mod tests;
+pub use rest::{RestClient, RestClientConfig, MAX_RATE_LIMIT_BACKOFF, MAX_RATE_LIMIT_RETRIES};

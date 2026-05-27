@@ -6,34 +6,41 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-description = "Local IPC client for uney-chat-desktop (KChat Desktop) — JSON-RPC 2.0 over Unix domain socket / named pipe"
+description = "REST client for the shared KChat / Mattermost backend used by KCreate to source community membership attestations"
 publish = false
 
 [lints]
 workspace = true
 
-# Phase 7: KChat Desktop local IPC client.
+# Phase 7 (Option C pivot): KChat backend REST client.
 #
-# Connects to a LOCAL process only (`~/.kchat/kcreate.sock` on
-# Unix, `\\.\pipe\kchat-kcreate` on Windows). The transport
-# layer carries newline-delimited JSON-RPC 2.0 messages; the
-# protocol module defines the request/response wire types
-# matching the spec in `src/protocol_spec.md`.
+# After ken's architectural correction, the integration model is
+# NOT a local Unix socket / named pipe between KCreate and
+# `uney-chat-desktop`. The correct model is:
 #
-# Like `kcreate_collab_transport` and `kcreate_kchat`, this
-# crate sits OUTSIDE the editing-path closure walked by
-# `crates/kcreate_tests/tests/local_first.rs::editing_path_crates`.
-# The bridge depends on it only behind the `kchat-desktop`
-# feature flag.
+#   - KCreate runs as a standalone process.
+#   - It speaks REST/HTTPS to the SAME backend that KChat Desktop
+#     speaks to (shared identity, communities, attestations).
+#   - A separate thin `.kcz` companion extension (`apps/kchat-extension/`)
+#     contributes a sidebar inside KChat Desktop and consumes host
+#     procedures — but it does NOT proxy the KChat REST API.
 #
-# Hard rule: no internet. Tokio is used for the local socket and
-# for the request-multiplexing pump task; no `hyper` / `reqwest`
-# / `quinn` / `mdns` here. The connection is a single Unix
-# socket (or named pipe) opened against a path on the local
-# filesystem.
+# This crate therefore links `reqwest` (rustls-tls) — a networking
+# library. To preserve the local-first contract:
+#
+#   - The bridge depends on this crate only behind the off-by-default
+#     `kchat-backend` feature flag, just like the previous socket
+#     client. The deny-list test in
+#     `crates/kcreate_tests/tests/local_first.rs` therefore still
+#     passes for the default build.
+#   - The fixture / test path runs against an in-process `axum`
+#     server bound to `127.0.0.1` — never the public internet —
+#     so the test suite stays hermetic.
 [dependencies]
 kcreate_collab = { path = "../kcreate_collab" }
-tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "sync", "time", "net", "io-util", "fs"] }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "sync", "time"] }
+reqwest = { workspace = true }
+url = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -43,12 +50,22 @@ chrono = { workspace = true, features = ["serde"] }
 ed25519-dalek = { workspace = true }
 uuid = { workspace = true, features = ["v4", "serde"] }
 parking_lot = { workspace = true }
+# Behind the `test-fixture` feature: the in-process axum-backed
+# reference server used by tests (both this crate's `tests/*.rs`
+# integration suite and the cross-crate suite in
+# `crates/kcreate_tests`). Never enters a production binary
+# because the bridge depends on this crate without enabling the
+# feature.
+axum = { workspace = true, optional = true }
 
-[target.'cfg(windows)'.dependencies]
-# Named-pipe transport implementation. Already pulled in
-# transitively via `tokio` on Windows.
-tokio = { workspace = true, features = ["net"] }
+[features]
+default = []
+# Enable the in-process REST fixture server. Test-only — pulls in
+# `axum`. Both this crate's own tests and `kcreate_tests` enable
+# this in their dev-dependencies.
+test-fixture = ["dep:axum"]
 
 [dev-dependencies]
+kcreate_kchat_client = { path = ".", features = ["test-fixture"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time", "net"] }
 tempfile = { workspace = true }
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util"] }

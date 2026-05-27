@@ -88,6 +88,13 @@ declare global {
   var __kchatHost: RawHostBridge | undefined;
 }
 
+// Holds the most recently validated bridge reference. We compare
+// by identity so the (cheap) `Zod.parse` shape check only runs
+// when the bridge object itself changes — typically once at host
+// inject time, plus once per test seam swap. Avoids paying the
+// validation cost on every host procedure invocation.
+let validatedBridge: RawHostBridge | undefined;
+
 function host(): RawHostBridge {
   const bridge = globalThis.__kchatHost;
   if (!bridge) {
@@ -97,10 +104,13 @@ function host(): RawHostBridge {
       "host bridge not injected — extension is running outside KChat Desktop",
     );
   }
-  // Run a one-time shape check so a malformed bridge fails fast at
-  // the first call site instead of producing confusing downstream
-  // errors.
-  HostBridgeSchema.parse(bridge);
+  if (bridge !== validatedBridge) {
+    // Run the shape check the first time we see this bridge
+    // reference so a malformed bridge fails fast at the first call
+    // site instead of producing confusing downstream errors.
+    HostBridgeSchema.parse(bridge);
+    validatedBridge = bridge;
+  }
   return bridge;
 }
 
@@ -171,6 +181,11 @@ export function subscribe<T>(
  * code paths.
  */
 export function __setHostBridgeForTests(bridge: RawHostBridge | undefined): void {
+  // Drop the validated-bridge memo so the next `host()` call
+  // re-validates the new fake bridge (or, after clearing, the next
+  // production call re-validates the real bridge once it's
+  // re-injected).
+  validatedBridge = undefined;
   if (bridge === undefined) {
     globalThis.__kchatHost = undefined;
     return;

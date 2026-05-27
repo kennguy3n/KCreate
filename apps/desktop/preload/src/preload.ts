@@ -2491,17 +2491,49 @@ const kchatBackend: KChatBackendBridge = {
 // `kcreate/deeplink/received`; the renderer subscribes through
 // this bridge so `InvitePanel.tsx` can auto-paste an invite
 // payload that arrived through a KChat Desktop share card.
+//
+// Cold-start race: `main.ts` flushes the pending-deeplink queue
+// on `did-finish-load`, but that fires before the React tree has
+// mounted and registered `onUrl`. To make sure a deeplink fired
+// in that millisecond window isn't lost, we register an IPC
+// listener here (at preload load time, before the renderer's JS
+// bundle runs) and buffer URLs until the consumer subscribes. The
+// buffer is capped to mirror the main-side cap so a renderer
+// stuck before mount can't drive unbounded memory growth.
+const DEEPLINK_CHANNEL = "kcreate/deeplink/received";
+const DEEPLINK_BUFFER_CAP = 50;
+const pendingDeeplinks: string[] = [];
+let deeplinkCallback: ((url: string) => void) | null = null;
+
+ipcRenderer.on(DEEPLINK_CHANNEL, (_evt: unknown, url: unknown): void => {
+  if (typeof url !== "string") {
+    return;
+  }
+  if (deeplinkCallback) {
+    deeplinkCallback(url);
+    return;
+  }
+  if (pendingDeeplinks.length >= DEEPLINK_BUFFER_CAP) {
+    pendingDeeplinks.shift();
+  }
+  pendingDeeplinks.push(url);
+});
+
 const deeplink: DeeplinkBridge = {
   onUrl(callback: (url: string) => void): () => void {
-    const channel = "kcreate/deeplink/received";
-    const listener = (_evt: unknown, url: unknown): void => {
-      if (typeof url === "string") {
+    deeplinkCallback = callback;
+    // Drain any URLs that arrived before the renderer was ready
+    // in arrival order so the consumer observes them deterministically.
+    if (pendingDeeplinks.length > 0) {
+      const drained = pendingDeeplinks.splice(0);
+      for (const url of drained) {
         callback(url);
       }
-    };
-    ipcRenderer.on(channel, listener);
+    }
     return () => {
-      ipcRenderer.removeListener(channel, listener);
+      if (deeplinkCallback === callback) {
+        deeplinkCallback = null;
+      }
     };
   },
 };

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   buildJoinDeeplink,
   openInviteInKCreate,
@@ -31,6 +31,12 @@ type OpenState =
   | { phase: "idle" }
   | { phase: "opening" }
   | { phase: "error"; message: string };
+
+// Module-level wall-clock reader. Stable across renders so the
+// `clock` reference doesn't churn on every parent re-render when
+// the caller omits the `now` prop — keeps the `useEffect` that
+// syncs `clockRef` from firing unnecessarily.
+const defaultClock = (): Date => new Date();
 
 function formatFreshness(
   now: Date,
@@ -66,15 +72,20 @@ export function InviteCard({
   freshnessTickIntervalMs = 1000,
 }: InviteCardProps): JSX.Element {
   const [state, setState] = useState<OpenState>({ phase: "idle" });
-  // Capture the clock in state so the `now` prop swap path stays
-  // stable across re-renders. Tests that pin the clock pass a new
-  // closure on every render but conceptually the clock is the same
-  // — we just need a stable read for the interval callback below.
-  const clock = now ?? (() => new Date());
   // The current observed time. We re-read the injected clock on
   // every tick so the freshness label tracks the wall clock for
-  // long-lived cards (or the pinned test clock if the test rerenders
-  // with a new `now` closure).
+  // long-lived cards (or the pinned test clock).
+  const clock = now ?? defaultClock;
+  // Hold the latest clock in a ref so the interval callback always
+  // reads the newest `now` prop without needing to re-bind on every
+  // render. Without the ref, a parent that swaps the `now` closure
+  // (rare in production — defaults to `() => new Date()` — but
+  // explicitly exercised by tests) would keep firing against the
+  // original captured closure.
+  const clockRef = useRef(clock);
+  useEffect(() => {
+    clockRef.current = clock;
+  }, [clock]);
   const [observedTime, setObservedTime] = useState<Date>(() => clock());
   useEffect(() => {
     // Tests opt out by passing a non-finite interval. Production
@@ -87,16 +98,11 @@ export function InviteCard({
       return undefined;
     }
     const timer = setInterval(() => {
-      setObservedTime(clock());
+      setObservedTime(clockRef.current());
     }, freshnessTickIntervalMs);
     return () => {
       clearInterval(timer);
     };
-    // `clock` is a per-render closure but we deliberately re-bind
-    // the interval only when the tick interval itself changes —
-    // a fresh `now` injection from a test re-render still applies
-    // the next time the interval fires.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [freshnessTickIntervalMs]);
   const freshness = useMemo(
     () => formatFreshness(observedTime, invite.issuedAt, freshnessWindowMinutes),

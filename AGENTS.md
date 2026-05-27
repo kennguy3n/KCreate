@@ -301,7 +301,7 @@ pnpm lint
 | E2E workflow tests                       | `crates/kcreate_tests/tests/e2e_workflow.rs` |
 | Acceptance-criteria benches              | `crates/kcreate_export/benches/batch_50_assets.rs`, `crates/kcreate_renderer/benches/{cold_start,viewport_pan,raster_open_64mp}.rs` |
 | KChat backend REST client (HTTPS)        | `crates/kcreate_kchat_client/src/rest.rs` |
-| KChat backend REST DTOs / endpoints      | `crates/kcreate_kchat_client/src/protocol.rs` + `dto.rs` |
+| KChat backend REST DTOs / endpoints      | `crates/kcreate_kchat_client/src/protocol.rs` |
 | KChat backend token store + 401 refresh  | `crates/kcreate_kchat_client/src/auth.rs` |
 | KChat backend attestation bridging       | `crates/kcreate_kchat_client/src/attestation.rs` |
 | KChat backend bridge surface (N-API)     | `crates/kcreate_bridge/src/kchat_backend.rs` |

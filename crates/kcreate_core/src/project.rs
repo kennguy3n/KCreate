@@ -504,6 +504,57 @@ impl Project {
         self.operation_log.peek_redo().cloned()
     }
 
+    /// Peek at the contiguous group of ops that the next group-aware
+    /// undo would consume. See [`OperationLog::peek_undo_group`].
+    #[must_use]
+    pub fn pending_undo_group(&self) -> Vec<Operation> {
+        self.operation_log.peek_undo_group()
+    }
+
+    /// Peek at the contiguous group of ops that the next group-aware
+    /// redo would consume. See [`OperationLog::peek_redo_group`].
+    #[must_use]
+    pub fn pending_redo_group(&self) -> Vec<Operation> {
+        self.operation_log.peek_redo_group()
+    }
+
+    /// Commit the cursor move for a group-aware undo. Returns the
+    /// ops that were consumed (clones).
+    pub fn undo_group(&mut self) -> Vec<Operation> {
+        let ops = self.operation_log.undo_group();
+        if !ops.is_empty() {
+            self.touch_modified();
+        }
+        ops
+    }
+
+    /// Commit the cursor move for a group-aware redo. Returns the
+    /// ops that were consumed (clones).
+    pub fn redo_group(&mut self) -> Vec<Operation> {
+        let ops = self.operation_log.redo_group();
+        if !ops.is_empty() {
+            self.touch_modified();
+        }
+        ops
+    }
+
+    /// Discarded redo branches available across the timeline.
+    /// See [`OperationLog::branches`].
+    pub fn discarded_branches(&self) -> Vec<crate::operation::DiscardedBranch> {
+        self.operation_log.branches().cloned().collect()
+    }
+
+    /// Restore a discarded branch by index (0 = newest). Returns
+    /// `true` on success. The current redo tail (if any) is itself
+    /// captured as a discarded branch so the swap is reversible.
+    pub fn restore_discarded_branch(&mut self, index_from_back: usize) -> bool {
+        let ok = self.operation_log.restore_branch(index_from_back);
+        if ok {
+            self.touch_modified();
+        }
+        ok
+    }
+
     /// Add or replace a brand kit. Replaces by `id`.
     pub fn upsert_brand_kit(&mut self, kit: BrandKit) {
         if let Some(slot) = self.brand_kits.iter_mut().find(|k| k.id == kit.id) {

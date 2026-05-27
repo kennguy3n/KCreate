@@ -898,6 +898,24 @@ function registerIpcHandlers(): void {
     if (result) broadcastForCommand(result.command);
     return result;
   });
+  ipcMain.handle("kcreate/document/undoGroup", () => {
+    const result = requireBridge().documentUndoGroup();
+    if (result) broadcastForCommand(result.command);
+    return result;
+  });
+  ipcMain.handle("kcreate/document/redoGroup", () => {
+    const result = requireBridge().documentRedoGroup();
+    if (result) broadcastForCommand(result.command);
+    return result;
+  });
+  ipcMain.handle("kcreate/document/listDiscardedBranches", () =>
+    requireBridge().documentListDiscardedBranches(),
+  );
+  ipcMain.handle(
+    "kcreate/document/restoreDiscardedBranch",
+    (_e, indexFromBack: number): boolean =>
+      requireBridge().documentRestoreDiscardedBranch(indexFromBack),
+  );
   ipcMain.handle("kcreate/document/status", () =>
     requireBridge().documentStatus(),
   );

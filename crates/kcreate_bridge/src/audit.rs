@@ -10,9 +10,10 @@
 //! `phase2.rs`) that record events as a side-effect of user actions.
 
 use std::path::PathBuf;
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
 
 use kcreate_audit::{AuditEvent, AuditQuery, AuditStore, AuditStoreError};
+use parking_lot::Mutex;
 use serde::Serialize;
 use uuid::Uuid;
 
@@ -47,7 +48,7 @@ fn audit_db_path() -> PathBuf {
 /// store so test isolation is guaranteed.
 #[cfg(test)]
 pub(crate) fn reset_audit_for_tests() {
-    let mut guard = audit_store().lock().expect("audit lock poisoned");
+    let mut guard = audit_store().lock();
     *guard = AuditStore::open_in_memory().expect("in-memory audit store must not fail");
 }
 
@@ -57,14 +58,14 @@ pub(crate) fn reset_audit_for_tests() {
 
 /// Record a single audit event. Returns the event's UUID as a string.
 pub fn audit_record(event: &AuditEvent) -> Result<Uuid> {
-    let mut store = audit_store().lock().expect("audit lock poisoned");
+    let mut store = audit_store().lock();
     store.record(event).map_err(audit_err)
 }
 
 /// Query audit events. Returns the matching rows as a serialised
 /// JSON array for the N-API layer to forward to the renderer.
 pub fn audit_query(filter: &AuditQuery) -> Result<AuditQueryReport> {
-    let store = audit_store().lock().expect("audit lock poisoned");
+    let store = audit_store().lock();
     let events = store.query(filter).map_err(audit_err)?;
     let total = store.count().map_err(audit_err)?;
     Ok(AuditQueryReport { events, total })
@@ -72,20 +73,20 @@ pub fn audit_query(filter: &AuditQuery) -> Result<AuditQueryReport> {
 
 /// Total number of rows in the audit log.
 pub fn audit_count() -> Result<u64> {
-    let store = audit_store().lock().expect("audit lock poisoned");
+    let store = audit_store().lock();
     store.count().map_err(audit_err)
 }
 
 /// Delete rows strictly older than `cutoff`. Returns the number of
 /// rows removed.
 pub fn audit_purge_before(cutoff: kcreate_audit::Timestamp) -> Result<u64> {
-    let mut store = audit_store().lock().expect("audit lock poisoned");
+    let mut store = audit_store().lock();
     store.purge_before(cutoff).map_err(audit_err)
 }
 
 /// Filesystem path of the currently open audit DB.
 pub fn audit_path() -> String {
-    let store = audit_store().lock().expect("audit lock poisoned");
+    let store = audit_store().lock();
     store.path().display().to_string()
 }
 

@@ -424,6 +424,7 @@ mod tests {
             after_patch: serde_json::Value::Null,
             affected_nodes: Vec::new(),
             ai_generated: false,
+            group_id: None,
         }
     }
 

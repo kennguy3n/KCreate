@@ -81,6 +81,22 @@ type UndoRedoOutcomeSnake = {
   affectedNodes: string[];
 };
 
+// Mirror of `crates/kcreate_bridge/src/lib.rs::DiscardedBranchSummary`.
+// `anchor_position` is the timeline index where the branch would
+// re-attach if restored — UI surfaces it so users can identify which
+// undo state a branch was captured from. `op_count` is the size of
+// the discarded redo tail (typically 1–N for a single user action,
+// or a full group for grouped operations). `discarded_at_iso` is
+// RFC 3339 UTC for sort-most-recent-first display. `first_command`
+// is the `Operation::command` of the first op in the branch so the
+// UI can show a one-line preview (e.g. "Recover: artboard_create").
+type DiscardedBranchSummarySnake = {
+  anchorPosition: number;
+  opCount: number;
+  discardedAtIso: string;
+  firstCommand: string;
+};
+
 export type {
   ProjectInfoSnake,
   NodeInfoSnake,
@@ -88,6 +104,7 @@ export type {
   RuntimeStatusSnake,
   DocumentStatusSnake,
   UndoRedoOutcomeSnake,
+  DiscardedBranchSummarySnake,
 };
 
 export interface Bridge {
@@ -156,6 +173,45 @@ export interface Bridge {
   documentDeleteNode(nodeId: string): void;
   documentUndo(): UndoRedoOutcomeSnake | null;
   documentRedo(): UndoRedoOutcomeSnake | null;
+  /**
+   * Group-aware undo. Consumes the entire contiguous run of ops at
+   * the head of the undo stack that share the same `group_id` (a
+   * `drag-move-50-times` sequence undoes as one user action). Falls
+   * back to single-op undo when the head op carries no `group_id`.
+   * The atomicity is enforced inside `kcreate_bridge::document`:
+   * peek-the-pending-group, apply every `before_patch`, only then
+   * commit the cursor move — so a partial failure leaves the stack
+   * untouched and the next call retries the same group. Returns
+   * `null` when no project is loaded or the stack is empty.
+   */
+  documentUndoGroup(): UndoRedoOutcomeSnake | null;
+  /**
+   * Symmetric with [`documentUndoGroup`] — re-applies the entire
+   * contiguous run at the head of the redo stack that share a
+   * `group_id`.
+   */
+  documentRedoGroup(): UndoRedoOutcomeSnake | null;
+  /**
+   * Newest-first list of redo tails that were dropped because the
+   * user pushed a new op after undoing some history. Each entry is a
+   * `DiscardedBranchSummarySnake`; the renderer's branch panel uses
+   * them to offer "recover branch" affordances. Bounded by the
+   * project's `OperationLog::max_branches` (16 by default — see
+   * `crates/kcreate_core/src/operation.rs::default_max_branches`).
+   * Returns `[]` when no project is loaded or no branches exist.
+   */
+  documentListDiscardedBranches(): DiscardedBranchSummarySnake[];
+  /**
+   * Restore the discarded branch at `indexFromBack` (0 = newest, as
+   * listed by [`documentListDiscardedBranches`]). Returns `true` on
+   * success, `false` if the index is out of range OR the branch's
+   * `anchor_position` no longer matches the current undo cursor
+   * (i.e. the user did more work after the branch was captured and
+   * the branch would attach to the wrong place). On success the
+   * restored ops appear at the head of the redo stack and the user
+   * can press Redo / Ctrl+Y to re-apply them in order.
+   */
+  documentRestoreDiscardedBranch(indexFromBack: number): boolean;
   documentStatus(): DocumentStatusSnake | null;
   runtimeStatus(): RuntimeStatusSnake;
   lowResourceModeGet(): boolean;

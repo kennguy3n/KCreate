@@ -183,6 +183,34 @@ impl AuditStore {
 
     /// Query audit events matching `filter`. Results are ordered
     /// newest first by `timestamp`. The default limit is 500 rows.
+    ///
+    /// # `affected_node` filter semantics
+    ///
+    /// `affected_node` lives inside the JSON `affected_nodes` column
+    /// and JSON1 isn't enabled in our bundled rusqlite features, so
+    /// we can't push an exact array-membership check into SQL.
+    /// Instead the implementation narrows in two layers:
+    ///
+    /// 1. **SQL pre-filter** — a `LIKE` clause on the JSON column
+    ///    against the quote-wrapped UUID literal (e.g.
+    ///    `affected_nodes LIKE '%"abc-..."%'`). This is a strict
+    ///    superset of the true match set (UUIDs cannot be
+    ///    substrings of each other once wrapped in JSON string
+    ///    quotes), so it never misses a row but may admit false
+    ///    positives if a serialiser ever stringifies UUIDs without
+    ///    quotes — which `serde_json::to_string(&Vec<Uuid>)` never
+    ///    does, so in practice the pre-filter is exact.
+    /// 2. **Rust post-filter** — defence-in-depth exact membership
+    ///    check on `event.affected_nodes` to reject any false
+    ///    positives the LIKE might admit.
+    ///
+    /// Critically, the user-supplied `limit` is applied to the
+    /// **post-filtered** result, not the raw SQL pass — so a query
+    /// `{ affected_node: X, limit: 10 }` returns up to 10 rows that
+    /// actually contain X, not up to 10 rows scanned by SQL that
+    /// happen to contain X. The SQL `LIMIT` is set to
+    /// [`Self::MAX_QUERY_LIMIT`] as a hard ceiling on the work
+    /// done in a single query.
     pub fn query(&self, filter: &AuditQuery) -> Result<Vec<AuditEvent>, AuditStoreError> {
         if let Some(limit) = filter.limit {
             if limit > Self::MAX_QUERY_LIMIT {
@@ -196,35 +224,43 @@ impl AuditStore {
             "SELECT id, timestamp, actor, project_id, kind, affected_nodes, payload \
              FROM audit_events",
         );
-        let mut clauses: Vec<&'static str> = Vec::new();
+        let mut clauses: Vec<String> = Vec::new();
         let mut params_v: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
         if let Some(since) = filter.since {
-            clauses.push("timestamp >= ?");
+            clauses.push("timestamp >= ?".to_string());
             params_v.push(Box::new(since.to_rfc3339()));
         }
         if let Some(until) = filter.until {
-            clauses.push("timestamp < ?");
+            clauses.push("timestamp < ?".to_string());
             params_v.push(Box::new(until.to_rfc3339()));
         }
         if let Some(kind) = filter.kind.as_ref() {
-            clauses.push("kind = ?");
+            clauses.push("kind = ?".to_string());
             params_v.push(Box::new(kind.clone()));
         }
         if let Some(project_id) = filter.project_id {
-            clauses.push("project_id = ?");
+            clauses.push("project_id = ?".to_string());
             params_v.push(Box::new(project_id.to_string()));
         }
-        // affected_node is filtered AFTER the SQL pass because it
-        // lives inside a JSON column and JSON1 isn't enabled in our
-        // bundled rusqlite features. The SQL pass narrows by every
-        // other axis, then we post-filter in Rust.
+        if let Some(node_id) = filter.affected_node {
+            // JSON array of UUID strings always emits each UUID
+            // wrapped in double quotes, so a LIKE on the quoted form
+            // is a strict superset of the true match set. The Rust
+            // post-filter below rejects any false positives.
+            clauses.push("affected_nodes LIKE ?".to_string());
+            params_v.push(Box::new(format!("%\"{node_id}\"%")));
+        }
         if !clauses.is_empty() {
             sql.push_str(" WHERE ");
             sql.push_str(&clauses.join(" AND "));
         }
         sql.push_str(" ORDER BY timestamp DESC, rowid DESC");
-        let limit = filter.limit.unwrap_or(500).min(Self::MAX_QUERY_LIMIT);
-        write!(sql, " LIMIT {limit}").expect("writing to String never fails");
+        // SQL LIMIT is the hard work ceiling; the user-visible limit
+        // is enforced on the post-filtered result so callers can
+        // trust that `limit: N` returns up to N matching rows.
+        let user_limit = filter.limit.unwrap_or(500).min(Self::MAX_QUERY_LIMIT) as usize;
+        write!(sql, " LIMIT {ceiling}", ceiling = Self::MAX_QUERY_LIMIT)
+            .expect("writing to String never fails");
 
         let mut stmt = self.conn.prepare(&sql)?;
         let param_refs: Vec<&dyn rusqlite::ToSql> = params_v
@@ -232,7 +268,7 @@ impl AuditStore {
             .map(|p| p.as_ref() as &dyn rusqlite::ToSql)
             .collect();
         let rows = stmt.query_map(param_refs.as_slice(), row_to_event)?;
-        let mut out = Vec::new();
+        let mut out: Vec<AuditEvent> = Vec::with_capacity(user_limit.min(64));
         for row in rows {
             let event = row?;
             if let Some(node_id) = filter.affected_node {
@@ -241,6 +277,9 @@ impl AuditStore {
                 }
             }
             out.push(event);
+            if out.len() >= user_limit {
+                break;
+            }
         }
         Ok(out)
     }
@@ -397,6 +436,34 @@ mod tests {
             .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].affected_nodes, vec![n1_id]);
+    }
+
+    /// Regression — `limit` must apply to the **post-filtered**
+    /// result when `affected_node` is set. Prior to the
+    /// `LIMIT post-filter` fix, the SQL pass would consume the LIMIT
+    /// budget on rows that didn't match the node and return fewer
+    /// rows than the caller asked for. Insert 20 events: 10 touch
+    /// the target node, 10 touch unrelated nodes, interleaved.
+    /// Query with `limit: 5` and assert exactly 5 matches come back.
+    #[test]
+    fn query_limit_is_applied_after_affected_node_filter() {
+        let mut store = AuditStore::open_in_memory().unwrap();
+        let target = Uuid::new_v4();
+        let mut batch = Vec::new();
+        for i in 0..20 {
+            let node = if i % 2 == 0 { target } else { Uuid::new_v4() };
+            batch.push(op_event("user", "node_update", Some(node)));
+        }
+        store.record_batch(&batch).unwrap();
+        let rows = store
+            .query(&AuditQuery {
+                affected_node: Some(target),
+                limit: Some(5),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(rows.len(), 5);
+        assert!(rows.iter().all(|e| e.affected_nodes.contains(&target)));
     }
 
     #[test]

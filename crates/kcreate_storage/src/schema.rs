@@ -104,6 +104,14 @@ pub const MIGRATIONS: &[&str] = &[
         data TEXT NOT NULL,
         updated_at TEXT NOT NULL
     );",
+    // 12: undo grouping (Phase 6 Task 15). `group_id` ties together
+    //     ops that should undo as one user-facing action — e.g. a
+    //     drag-to-move sequence is recorded as 50 tiny move ops in
+    //     `operations` but a single click on Undo collapses them.
+    //     Backwards-compatible: existing rows have NULL `group_id`
+    //     (= no grouping) and the column is read into
+    //     `Operation::group_id: Option<Uuid>`.
+    "ALTER TABLE operations ADD COLUMN group_id TEXT;",
 ];
 
 /// Schema-level errors. Wraps `rusqlite::Error` and adds a couple of

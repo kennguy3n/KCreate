@@ -676,6 +676,64 @@ pub fn document_redo() -> NapiResult<Option<UndoRedoOutcome>> {
     Ok(outcome.map(Into::into))
 }
 
+/// Group-aware undo. Consumes the entire contiguous run of ops
+/// that share a `group_id` (or one op if ungrouped). Returns a
+/// summary outcome describing the user-facing operation.
+#[napi]
+pub fn document_undo_group() -> NapiResult<Option<UndoRedoOutcome>> {
+    let outcome = document::document_undo_group().map_err(map_doc_err)?;
+    Ok(outcome.map(Into::into))
+}
+
+/// Group-aware redo. Symmetric with [`document_undo_group`].
+#[napi]
+pub fn document_redo_group() -> NapiResult<Option<UndoRedoOutcome>> {
+    let outcome = document::document_redo_group().map_err(map_doc_err)?;
+    Ok(outcome.map(Into::into))
+}
+
+/// Wire-format mirror of [`document::DiscardedBranchSummary`].
+#[napi(object)]
+#[derive(Debug, Clone)]
+pub struct DiscardedBranchSummary {
+    /// Position in the timeline this branch attaches to.
+    pub anchor_position: u32,
+    /// Number of operations the branch contains.
+    pub op_count: u32,
+    /// ISO-8601 UTC timestamp the branch was discarded at.
+    pub discarded_at_iso: String,
+    /// Stable command string of the first op in the branch.
+    pub first_command: String,
+}
+
+impl From<document::DiscardedBranchSummary> for DiscardedBranchSummary {
+    fn from(c: document::DiscardedBranchSummary) -> Self {
+        Self {
+            anchor_position: u32::try_from(c.anchor_position).unwrap_or(u32::MAX),
+            op_count: u32::try_from(c.op_count).unwrap_or(u32::MAX),
+            discarded_at_iso: c.discarded_at_iso,
+            first_command: c.first_command,
+        }
+    }
+}
+
+/// List all discarded redo branches in the current project,
+/// newest-first. Returns an empty list when no branches are
+/// retained or no project is loaded.
+#[napi]
+pub fn document_list_discarded_branches() -> NapiResult<Vec<DiscardedBranchSummary>> {
+    let bs = document::document_list_discarded_branches().map_err(map_doc_err)?;
+    Ok(bs.into_iter().map(Into::into).collect())
+}
+
+/// Restore the discarded branch at `indexFromBack` (0 = newest).
+/// Returns `true` on success, `false` if the index is out of
+/// range or the branch's anchor is stale.
+#[napi]
+pub fn document_restore_discarded_branch(index_from_back: u32) -> NapiResult<bool> {
+    document::document_restore_discarded_branch(index_from_back as usize).map_err(map_doc_err)
+}
+
 /// Static runtime / device snapshot.
 #[napi]
 pub fn runtime_status() -> RuntimeStatus {

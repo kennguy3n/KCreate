@@ -1279,6 +1279,123 @@ pub fn document_redo() -> Result<Option<UndoRedoOutcome>> {
     }))
 }
 
+/// One step of group-aware undo. Consumes the entire contiguous run
+/// of ops that share the most recent `group_id` (or just one op if
+/// ungrouped). Applies each `before_patch` atomically — if any
+/// patch fails the cursor stays put so the next call retries the
+/// same group.
+///
+/// Returns `Ok(None)` when the undo stack is empty. Otherwise an
+/// outcome describing the *user-facing* operation: the command
+/// string of the head (newest) op and the union of all affected
+/// nodes across the group.
+pub fn document_undo_group() -> Result<Option<UndoRedoOutcome>> {
+    let mut guard = slot().lock();
+    let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
+    let pending = ws.project.pending_undo_group();
+    if pending.is_empty() {
+        return Ok(None);
+    }
+    // Apply each `before_patch` in undo order (newest-first).
+    for op in &pending {
+        apply_inverse_patch(ws, op)?;
+    }
+    let committed = ws.project.undo_group();
+    debug_assert_eq!(committed.len(), pending.len());
+    drop(guard);
+    let head = pending.first().expect("non-empty");
+    let mut affected: Vec<Uuid> = Vec::new();
+    for op in &pending {
+        for node in &op.affected_nodes {
+            if !affected.contains(node) {
+                affected.push(*node);
+            }
+        }
+    }
+    Ok(Some(UndoRedoOutcome {
+        command: head.command.clone(),
+        affected_nodes: affected,
+    }))
+}
+
+/// One step of group-aware redo. Symmetric with
+/// [`document_undo_group`]; consumes the contiguous run starting
+/// at the cursor.
+pub fn document_redo_group() -> Result<Option<UndoRedoOutcome>> {
+    let mut guard = slot().lock();
+    let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
+    let pending = ws.project.pending_redo_group();
+    if pending.is_empty() {
+        return Ok(None);
+    }
+    for op in &pending {
+        apply_forward_patch(ws, op)?;
+    }
+    let committed = ws.project.redo_group();
+    debug_assert_eq!(committed.len(), pending.len());
+    drop(guard);
+    // Head for "command displayed to user" purposes is the *last*
+    // op (the most recent state we end up in).
+    let head = pending.last().expect("non-empty");
+    let mut affected: Vec<Uuid> = Vec::new();
+    for op in &pending {
+        for node in &op.affected_nodes {
+            if !affected.contains(node) {
+                affected.push(*node);
+            }
+        }
+    }
+    Ok(Some(UndoRedoOutcome {
+        command: head.command.clone(),
+        affected_nodes: affected,
+    }))
+}
+
+/// Wire-format summary of one discarded branch the user can recover.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscardedBranchSummary {
+    /// Position in the timeline this branch attaches to. Restorable
+    /// only while `OperationLog::position() == anchor_position`.
+    pub anchor_position: usize,
+    /// Number of operations the branch contains.
+    pub op_count: usize,
+    /// ISO-8601 UTC timestamp the branch was discarded at. Useful
+    /// for the panel's "discarded 3 minutes ago" affordance.
+    pub discarded_at_iso: String,
+    /// Stable wire identifier of the first op in the branch — the
+    /// renderer uses it as a thumbnail / preview hint.
+    pub first_command: String,
+}
+
+/// List all discarded redo branches in the current project, newest
+/// first. The renderer's undo/branch panel calls this whenever the
+/// log changes.
+pub fn document_list_discarded_branches() -> Result<Vec<DiscardedBranchSummary>> {
+    let guard = slot().lock();
+    let ws = guard.as_ref().ok_or(DocumentBridgeError::NoProject)?;
+    let branches = ws.project.discarded_branches();
+    Ok(branches
+        .into_iter()
+        .rev()
+        .map(|b| DiscardedBranchSummary {
+            anchor_position: b.anchor_position,
+            op_count: b.ops.len(),
+            discarded_at_iso: b.discarded_at.to_rfc3339(),
+            first_command: b.ops.first().map(|o| o.command.clone()).unwrap_or_default(),
+        })
+        .collect())
+}
+
+/// Restore the discarded branch at `index_from_back` (0 = newest).
+/// The current redo tail (if any) is captured as a new discarded
+/// branch so the swap is reversible. Returns `true` on success.
+pub fn document_restore_discarded_branch(index_from_back: usize) -> Result<bool> {
+    let mut guard = slot().lock();
+    let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
+    Ok(ws.project.restore_discarded_branch(index_from_back))
+}
+
 /// Walk `op.before_patch` into workspace state for the non-graph
 /// operations recorded by Phase 2 panels.
 ///

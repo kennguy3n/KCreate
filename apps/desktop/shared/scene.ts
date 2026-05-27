@@ -469,6 +469,30 @@ export interface UndoRedoOutcome {
 }
 
 /**
+ * Summary of a discarded redo tail, surfaced to the renderer so the
+ * branch panel can offer "recover branch" affordances. Mirrors
+ * `crates/kcreate_bridge/src/document.rs::DiscardedBranchSummary`.
+ *
+ * - `anchorPosition`: the timeline cursor index this branch would
+ *   re-attach to if restored. Stale anchors (the user did more work
+ *   after the branch was captured) cause
+ *   {@link DocumentBridge.restoreDiscardedBranch} to return `false`.
+ * - `opCount`: number of ops in the discarded tail. For grouped
+ *   compound operations this is the size of the group.
+ * - `discardedAtIso`: RFC 3339 UTC timestamp; the panel sorts
+ *   most-recent-first using this field.
+ * - `firstCommand`: stable `Operation::command` of the first op in
+ *   the discarded tail. Used as a one-line preview ("Recover:
+ *   artboard_create").
+ */
+export interface DiscardedBranchSummary {
+  anchorPosition: number;
+  opCount: number;
+  discardedAtIso: string;
+  firstCommand: string;
+}
+
+/**
  * Mirror of `kcreate_export::code_gen::InspectCode`. Each field is
  * a copy-paste-ready snippet describing one rendering target's
  * style for the selected node.
@@ -551,6 +575,36 @@ export interface DocumentBridge {
   deleteNode(nodeId: string): Promise<void>;
   undo(): Promise<UndoRedoOutcome | null>;
   redo(): Promise<UndoRedoOutcome | null>;
+  /**
+   * Group-aware undo (Phase 6 Task 15). Consumes the entire
+   * contiguous run of ops at the head of the undo stack that share
+   * the same `group_id` — a `drag-to-move` sequence recorded as 50
+   * `canvas_move_node` ops with the same group id undoes as a single
+   * user action. Falls back to single-op undo when the head op
+   * carries no group id. Resolves to `null` when no project is
+   * loaded or the stack is empty. Mirrors `document_undo_group` on
+   * the Rust bridge — see `crates/kcreate_bridge/src/document.rs`.
+   */
+  undoGroup(): Promise<UndoRedoOutcome | null>;
+  /** Symmetric with {@link undoGroup}. */
+  redoGroup(): Promise<UndoRedoOutcome | null>;
+  /**
+   * Newest-first list of redo tails that were dropped because the
+   * user pushed a new op after undoing some history (Phase 6
+   * Task 16). The branch panel uses this list to offer "recover
+   * branch" UX. Bounded by `OperationLog::max_branches` (16 by
+   * default).
+   */
+  listDiscardedBranches(): Promise<DiscardedBranchSummary[]>;
+  /**
+   * Restore the discarded branch at `indexFromBack` (0 = newest, as
+   * listed by {@link listDiscardedBranches}). Returns `true` on
+   * success, `false` if the index is out of range OR the branch's
+   * `anchorPosition` no longer matches the current undo cursor.
+   * Restored ops appear at the head of the redo stack — the user
+   * presses Redo / Ctrl+Y to replay them.
+   */
+  restoreDiscardedBranch(indexFromBack: number): Promise<boolean>;
 
   /**
    * Snapshot of the open document's editing state, or `null` if no

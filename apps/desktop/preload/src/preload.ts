@@ -40,6 +40,7 @@ import type {
   PageSizeId,
   DesignTokens,
   DesignTokensBridge,
+  DiscardedBranchSummary,
   DocumentBridge,
   DocumentStatus,
   UndoRedoOutcome,
@@ -528,6 +529,27 @@ const document: DocumentBridge = {
     return (await ipcRenderer.invoke(
       "kcreate/document/redo",
     )) as UndoRedoOutcome | null;
+  },
+  async undoGroup(): Promise<UndoRedoOutcome | null> {
+    return (await ipcRenderer.invoke(
+      "kcreate/document/undoGroup",
+    )) as UndoRedoOutcome | null;
+  },
+  async redoGroup(): Promise<UndoRedoOutcome | null> {
+    return (await ipcRenderer.invoke(
+      "kcreate/document/redoGroup",
+    )) as UndoRedoOutcome | null;
+  },
+  async listDiscardedBranches(): Promise<DiscardedBranchSummary[]> {
+    return (await ipcRenderer.invoke(
+      "kcreate/document/listDiscardedBranches",
+    )) as DiscardedBranchSummary[];
+  },
+  async restoreDiscardedBranch(indexFromBack: number): Promise<boolean> {
+    return (await ipcRenderer.invoke(
+      "kcreate/document/restoreDiscardedBranch",
+      indexFromBack,
+    )) as boolean;
   },
   async status(): Promise<DocumentStatus | null> {
     const raw = (await ipcRenderer.invoke(

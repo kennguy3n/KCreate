@@ -542,6 +542,48 @@ struct SessionState {
     /// the bridge exactly once (via `session_start`) and never
     /// leaves it; clipboard ops read from this copy instead.
     local_signing_key: ed25519_dalek::SigningKey,
+    /// Phase 7 (Task 25): operations queued by
+    /// [`session_queue_operation`] waiting for the batch flush
+    /// timer to expire (or for [`session_flush_pending_operations`]
+    /// to drain them explicitly). The renderer calls
+    /// `session_tick_outbound_batch` on the same 50–100 ms cadence
+    /// it uses for `session_drain_events`; the tick checks the
+    /// queue against [`SessionConfig::batch_flush_interval_ms`] and
+    /// flushes when the deadline hits.
+    pending_op_batch: Vec<kcreate_core::operation::Operation>,
+    /// Phase 7 (Task 25): wall-clock instant the first op in the
+    /// current pending batch was queued. Driver for the flush
+    /// timer in `session_tick_outbound_batch`. Cleared on every
+    /// flush.
+    batch_first_queued_at: Option<std::time::Instant>,
+    /// Phase 7 (Task 25): cached batch flush interval, copied out
+    /// of the session config so the bridge can read it without
+    /// re-acquiring a kcreate_collab handle. Re-read on every
+    /// `session_start`.
+    batch_flush_interval: std::time::Duration,
+    /// Phase 7 (Task 25): cached max-batch-size cap copied out of
+    /// the session config for the same reason as above.
+    batch_flush_max_ops: usize,
+    /// Phase 7 (Task 26): the last presence payload that we
+    /// actually broadcast, along with the instant we broadcast it.
+    /// `None` until the first send. Drives the throttle / idle
+    /// suppression in [`session_send_presence`].
+    last_broadcast_presence: Option<(std::time::Instant, PresencePayload)>,
+    /// Phase 7 (Task 26): cached throttle thresholds copied out of
+    /// the session config — minimum inter-broadcast interval,
+    /// cursor-move threshold in scene units, and idle suppression
+    /// window. Re-read on every `session_start`.
+    presence_min_interval: std::time::Duration,
+    presence_move_threshold_px: f32,
+    presence_idle_suppression: std::time::Duration,
+    /// Phase 7 (Task 27): pages the local peer is currently viewing.
+    /// Empty (default) means "interested in everything" — the
+    /// pre-Phase-7-Task-27 behaviour. Non-empty restricts which
+    /// remote presence updates and conflict notifications get
+    /// surfaced to the renderer. Operations are still journaled
+    /// regardless so document consistency is preserved across the
+    /// whole project; only the UI-facing event stream is filtered.
+    active_pages: std::collections::HashSet<Uuid>,
 }
 
 /// Phase 7 (Task 23): one queued inbound clipboard offer waiting
@@ -837,13 +879,31 @@ fn apply_event(ev: InboundEvent) {
                     return;
                 }
                 state.presence.insert(from.clone(), p.clone());
-                push_event(
-                    state,
-                    SessionEvent::PresenceUpdated {
-                        peer_id: from.as_str().to_string(),
-                        presence: SessionPresence::from(p),
-                    },
-                );
+                // Phase 7 (Task 27): selective sync — when the local
+                // peer has constrained itself to a subset of pages
+                // via [`session_set_active_pages`], suppress remote
+                // presence events for pages the local peer is not
+                // viewing. The presence map is still updated above
+                // so a later page switch can backfill from
+                // [`session_peers`], but we don't churn the
+                // renderer's overlays for off-screen activity.
+                let suppress = !state.active_pages.is_empty()
+                    && match p.active_page {
+                        Some(remote_page) => !state.active_pages.contains(&remote_page),
+                        // A peer without an active_page is broadcasting
+                        // "no page context" — still surface so the UI
+                        // can render an unanchored cursor.
+                        None => false,
+                    };
+                if !suppress {
+                    push_event(
+                        state,
+                        SessionEvent::PresenceUpdated {
+                            peer_id: from.as_str().to_string(),
+                            presence: SessionPresence::from(p),
+                        },
+                    );
+                }
             }
             Message::OperationBroadcast(p) => {
                 // Phase 7 (Task 22): same rate-limit treatment as
@@ -1501,6 +1561,20 @@ pub fn session_start(
             message: e.to_string(),
         })?;
 
+    let session_config = SessionConfig::default();
+    // Phase 7 (Tasks 25 / 26): cache the throttle / batch thresholds
+    // so the hot-path bridge entry points (`session_send_presence`,
+    // `session_queue_operation`, `session_tick_outbound_batch`) can
+    // read them directly off the bridge state instead of cloning
+    // the full `SessionConfig` on every call.
+    let batch_flush_interval =
+        std::time::Duration::from_millis(u64::from(session_config.batch_flush_interval_ms));
+    let batch_flush_max_ops = session_config.batch_flush_max_ops as usize;
+    let presence_min_interval =
+        std::time::Duration::from_millis(u64::from(session_config.presence_min_interval_ms));
+    let presence_move_threshold_px = session_config.presence_move_threshold_px;
+    let presence_idle_suppression =
+        std::time::Duration::from_millis(u64::from(session_config.presence_idle_suppression_ms));
     let opts = HostOptions {
         local_key,
         display_name: display_name.to_string(),
@@ -1508,7 +1582,7 @@ pub fn session_start(
         bind_addr: SocketAddr::from(([0, 0, 0, 0], 0)),
         advertise_mdns,
         advertise_addrs: None,
-        session_config: SessionConfig::default(),
+        session_config,
         kchat_authority: authority,
         community_id: community_id.clone(),
     };
@@ -1578,6 +1652,15 @@ pub fn session_start(
         key_epoch: 0,
         pending_clipboard_offers: std::collections::VecDeque::new(),
         local_signing_key: ed25519_dalek::SigningKey::from_bytes(&seed),
+        pending_op_batch: Vec::new(),
+        batch_first_queued_at: None,
+        batch_flush_interval,
+        batch_flush_max_ops,
+        last_broadcast_presence: None,
+        presence_min_interval,
+        presence_move_threshold_px,
+        presence_idle_suppression,
+        active_pages: std::collections::HashSet::new(),
     };
     // Surface the local-lifecycle transition on the same event
     // channel every other session signal flows through, so renderer
@@ -1960,6 +2043,28 @@ pub fn session_release_locks(node_ids: Vec<Uuid>) -> Result<()> {
 /// Broadcast the local user's presence (active page, selection,
 /// cursor). Called by the renderer on selection / canvas pointer
 /// events.
+///
+/// Phase 7 (Task 26): the bridge throttles outbound presence to
+/// protect the LAN from a 60 Hz pointer-move firehose:
+///
+/// 1. **Minimum interval gate** —
+///    [`SessionConfig::presence_min_interval_ms`] (50 ms default)
+///    caps the broadcast rate to 20 Hz when only the cursor is
+///    moving. Sub-interval re-sends are coalesced.
+/// 2. **Cursor delta threshold** —
+///    [`SessionConfig::presence_move_threshold_px`] (2 scene units
+///    default) means a stationary cursor with sub-pixel jitter
+///    does not re-broadcast. Selection-set and active-page
+///    changes always re-broadcast regardless of cursor delta.
+/// 3. **Idle suppression** —
+///    [`SessionConfig::presence_idle_suppression_ms`] (2 s default)
+///    means a presence payload identical to the last broadcast
+///    one is dropped after the idle window. The next real change
+///    re-broadcasts immediately.
+///
+/// Returns `Ok(())` on both broadcast and suppression so the
+/// renderer doesn't have to distinguish the two cases for error
+/// handling; presence is best-effort.
 pub fn session_send_presence(
     active_page: Option<Uuid>,
     selection: Vec<Uuid>,
@@ -1970,18 +2075,67 @@ pub fn session_send_presence(
     // still valid right now. Full re-verification (signature +
     // peer binding + time window) matches `session_start`.
     require_active_kchat_membership()?;
-    let guard = slot().lock();
-    let state = guard.as_ref().ok_or(SessionBridgeError::NotRunning)?;
-    let host = state.host.clone();
-    let runtime_handle = state.runtime.handle().clone();
-    drop(guard);
-
-    let payload = PresencePayload {
+    let now = std::time::Instant::now();
+    let candidate = PresencePayload {
         active_page,
         selection,
         cursor: cursor.map(|c| Cursor { x: c.x, y: c.y }),
         sent_at: Utc::now(),
     };
+
+    let (host, runtime_handle, payload) = {
+        let mut guard = slot().lock();
+        let state = guard.as_mut().ok_or(SessionBridgeError::NotRunning)?;
+        let min_interval = state.presence_min_interval;
+        let move_threshold = state.presence_move_threshold_px;
+        let idle_window = state.presence_idle_suppression;
+
+        if let Some((last_at, last_payload)) = state.last_broadcast_presence.as_ref() {
+            let elapsed = now.saturating_duration_since(*last_at);
+            let selection_changed = last_payload.selection != candidate.selection;
+            let page_changed = last_payload.active_page != candidate.active_page;
+            let cursor_moved_enough = match (last_payload.cursor, candidate.cursor) {
+                (Some(a), Some(b)) => {
+                    let dx = b.x - a.x;
+                    let dy = b.y - a.y;
+                    dx.hypot(dy) >= f64::from(move_threshold)
+                }
+                // Cursor became Some / None — always count as a change
+                // because the renderer overlay needs to show / hide.
+                (None, Some(_)) | (Some(_), None) => true,
+                // Neither side had a cursor: only count if other
+                // fields changed (handled below).
+                (None, None) => false,
+            };
+            let any_change = selection_changed || page_changed || cursor_moved_enough;
+
+            // Idle suppression: payload is materially identical to
+            // the last broadcast one AND we've crossed the idle
+            // window. Drop without sending.
+            if !any_change && elapsed >= idle_window {
+                return Ok(());
+            }
+            // Throttle: we're inside the minimum interval. Drop the
+            // sub-interval re-send; the next call (post-interval)
+            // will pick up the latest state. Critical that we do
+            // NOT mutate `last_broadcast_presence` here — the
+            // throttle compares against the LAST ACTUAL broadcast.
+            if elapsed < min_interval {
+                return Ok(());
+            }
+            // Cursor jitter under the move threshold AND no other
+            // changes → also drop. The idle suppression branch
+            // above catches the long-term case; this catches the
+            // short-term "user wiggled the touchpad" case.
+            if !any_change {
+                return Ok(());
+            }
+        }
+
+        state.last_broadcast_presence = Some((now, candidate.clone()));
+        (state.host.clone(), state.runtime.handle().clone(), candidate)
+    };
+
     let result = runtime_handle.block_on(async {
         tokio::time::timeout(OP_TIMEOUT, host.broadcast_presence(payload)).await
     });
@@ -2055,6 +2209,124 @@ pub fn session_broadcast_operations(
             kcreate_collab_transport::TransportError::Quic("broadcast_operations timed out".into()),
         )),
     }
+}
+
+/// Phase 7 (Task 25): queue one operation into the outbound batch
+/// accumulator. The bridge does not send anything on the wire here
+/// — it appends to a per-session pending buffer that
+/// [`session_tick_outbound_batch`] drains when either of the two
+/// flush conditions is met:
+///
+/// 1. The wall-clock elapsed since the first queued op in the
+///    current batch reaches
+///    [`SessionConfig::batch_flush_interval_ms`] (50 ms default).
+/// 2. The batch size reaches [`SessionConfig::batch_flush_max_ops`]
+///    (200 default) — forces an immediate flush so the buffer
+///    never grows unbounded under high-rate input.
+///
+/// The caller (renderer drag pipeline) is expected to call this
+/// for every per-frame operation generated during a sustained
+/// drag, then call [`session_flush_pending_operations`] explicitly
+/// when the drag completes — that ensures the final state lands
+/// on the wire without waiting for the throttle deadline.
+///
+/// Viewer permission still rejects the queue (consistent with
+/// [`session_broadcast_operations`]) — we don't accumulate work
+/// the local peer is not allowed to send.
+pub fn session_queue_operation(operation: kcreate_core::operation::Operation) -> Result<()> {
+    require_active_kchat_membership()?;
+    let mut guard = slot().lock();
+    let state = guard.as_mut().ok_or(SessionBridgeError::NotRunning)?;
+    if state.local_permission == CollabPermission::Viewer {
+        return Err(SessionBridgeError::PermissionDenied);
+    }
+    if state.batch_first_queued_at.is_none() {
+        state.batch_first_queued_at = Some(std::time::Instant::now());
+    }
+    state.pending_op_batch.push(operation);
+    // Hit the size cap → flush immediately so the batch never grows
+    // past the configured ceiling. Pull everything out under the
+    // lock then release before the wire send.
+    let flush_now = state.pending_op_batch.len() >= state.batch_flush_max_ops;
+    if flush_now {
+        let drained = std::mem::take(&mut state.pending_op_batch);
+        state.batch_first_queued_at = None;
+        drop(guard);
+        return session_broadcast_operations(drained);
+    }
+    Ok(())
+}
+
+/// Phase 7 (Task 25): drain the pending op batch and broadcast it
+/// in one [`OperationBroadcastPayload`]. Called explicitly by the
+/// renderer at the end of a drag / interaction (so the final state
+/// is sent immediately), and called periodically by
+/// [`session_tick_outbound_batch`] when the throttle deadline
+/// expires. Returns the number of operations that were flushed (0
+/// if the queue was empty) so the caller can avoid emitting
+/// metrics for empty flushes.
+pub fn session_flush_pending_operations() -> Result<u32> {
+    require_active_kchat_membership()?;
+    let mut guard = slot().lock();
+    let state = guard.as_mut().ok_or(SessionBridgeError::NotRunning)?;
+    let drained = std::mem::take(&mut state.pending_op_batch);
+    state.batch_first_queued_at = None;
+    drop(guard);
+    if drained.is_empty() {
+        return Ok(0);
+    }
+    let count = u32::try_from(drained.len()).unwrap_or(u32::MAX);
+    session_broadcast_operations(drained)?;
+    Ok(count)
+}
+
+/// Phase 7 (Task 25): check the pending op batch against the
+/// configured flush interval and broadcast it if the deadline has
+/// elapsed. Called by the renderer event-tick on the same cadence
+/// it uses for [`session_drain_events`] (~50 ms). Returns the
+/// number of ops flushed; `0` if no flush was due. Cheap when no
+/// ops are queued — single lock acquisition + early return.
+pub fn session_tick_outbound_batch() -> Result<u32> {
+    require_active_kchat_membership()?;
+    let mut guard = slot().lock();
+    let state = guard.as_mut().ok_or(SessionBridgeError::NotRunning)?;
+    let Some(first_queued_at) = state.batch_first_queued_at else {
+        // No pending ops — nothing to do.
+        return Ok(0);
+    };
+    let elapsed = std::time::Instant::now().saturating_duration_since(first_queued_at);
+    if elapsed < state.batch_flush_interval {
+        // Still inside the throttle window; wait.
+        return Ok(0);
+    }
+    let drained = std::mem::take(&mut state.pending_op_batch);
+    state.batch_first_queued_at = None;
+    drop(guard);
+    if drained.is_empty() {
+        return Ok(0);
+    }
+    let count = u32::try_from(drained.len()).unwrap_or(u32::MAX);
+    session_broadcast_operations(drained)?;
+    Ok(count)
+}
+
+/// Phase 7 (Task 27): set the list of pages the local peer is
+/// currently viewing. Operations on other pages are still
+/// journaled (document consistency is preserved across the whole
+/// project) but the bridge suppresses the renderer-facing
+/// [`SessionEvent::PresenceUpdated`] and
+/// [`SessionEvent::ConflictResolved`] events for those pages —
+/// reducing CPU + visual noise in multi-page documents where the
+/// local peer only needs presence overlays for the page in view.
+///
+/// Pass an empty vector to revert to "interested in everything"
+/// (the pre-Phase-7-Task-27 behaviour) — useful for the export
+/// preview pane or presentation mode that needs every event.
+pub fn session_set_active_pages(page_ids: Vec<Uuid>) -> Result<()> {
+    let mut guard = slot().lock();
+    let state = guard.as_mut().ok_or(SessionBridgeError::NotRunning)?;
+    state.active_pages = page_ids.into_iter().collect();
+    Ok(())
 }
 
 /// Phase 7 (Task 15): send a `ResumeRequest` to a connected peer

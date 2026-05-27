@@ -3415,6 +3415,38 @@ export interface SessionBridge {
   /// Phase 7 (Task 23): snapshot of inbound clipboard offers that
   /// haven't yet been accepted or rejected.
   pendingClipboardOffers(): Promise<PendingClipboardOffer[]>;
+  /// Phase 7 (Task 25): queue one local-authored operation into the
+  /// outbound throttle buffer. The bridge accumulates ops until
+  /// the configured flush interval elapses or the max-ops cap is
+  /// hit, then broadcasts the whole batch in a single envelope.
+  /// `operation` is a JSON-serializable `Operation` value — the
+  /// preload stringifies it and the Rust bridge parses it. Typed
+  /// `unknown` rather than the Rust `Operation` shape because the
+  /// renderer does not currently model operations; future work
+  /// will tighten the type once a renderer-side mutation builder
+  /// exists.
+  queueOperation(operation: unknown): Promise<void>;
+  /// Phase 7 (Task 25): drain the pending op batch and broadcast
+  /// it immediately. Returns the number of ops that were flushed
+  /// (0 if the queue was empty). Call this at the end of a drag
+  /// interaction so the final state lands on the wire without
+  /// waiting for the throttle deadline.
+  flushPendingOperations(): Promise<number>;
+  /// Phase 7 (Task 25): check the pending batch against the
+  /// configured flush interval and broadcast it if the deadline
+  /// has expired. Call once per event tick. Returns the number of
+  /// ops flushed on this tick (0 when no flush was due). Cheap
+  /// when the queue is empty.
+  tickOutboundBatch(): Promise<number>;
+  /// Phase 7 (Task 27): set the list of pages the local peer is
+  /// currently viewing. Remote presence updates and conflict
+  /// toasts for pages outside this set are suppressed from the
+  /// renderer event stream to reduce overlay churn in multi-page
+  /// documents. Operations still journal across the whole project
+  /// so document consistency is preserved. Pass `[]` to revert to
+  /// "interested in everything" (useful for the export preview
+  /// pane or a presentation mode that needs every event).
+  setActivePages(pageIds: string[]): Promise<void>;
 }
 
 // ---------------------------------------------------------------------------

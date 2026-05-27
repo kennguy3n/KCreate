@@ -3021,6 +3021,67 @@ pub fn session_send_presence(
     crate::collab::session_send_presence(active, selection, cursor).map_err(map_session_err)
 }
 
+/// Phase 7 (Task 25): queue one operation into the outbound batch
+/// accumulator. The bridge buffers ops and flushes them in a
+/// single `OperationBroadcast` envelope when either the throttle
+/// deadline (`batch_flush_interval_ms`, 50 ms default) elapses or
+/// the buffer hits `batch_flush_max_ops` (200 default). `op_json`
+/// is a JSON-encoded `Operation` (same wire format used by the
+/// document module's local-record path).
+#[cfg(feature = "collab")]
+#[napi]
+pub fn session_queue_operation(op_json: String) -> NapiResult<()> {
+    let op: kcreate_core::operation::Operation = serde_json::from_str(&op_json).map_err(|e| {
+        NapiError::new(
+            Status::InvalidArg,
+            format!("kcreate_bridge: session_queue_operation parse: {e}"),
+        )
+    })?;
+    crate::collab::session_queue_operation(op).map_err(map_session_err)
+}
+
+/// Phase 7 (Task 25): immediately drain the pending op batch and
+/// broadcast it. Called by the renderer at the end of a drag
+/// interaction so the final state lands on the wire without
+/// waiting for the throttle deadline. Returns the number of ops
+/// that were flushed (0 if the queue was empty).
+#[cfg(feature = "collab")]
+#[napi]
+pub fn session_flush_pending_operations() -> NapiResult<u32> {
+    crate::collab::session_flush_pending_operations().map_err(map_session_err)
+}
+
+/// Phase 7 (Task 25): check the pending op batch against the
+/// configured flush interval and broadcast it if the deadline has
+/// elapsed. Called by the renderer event-tick on the same cadence
+/// as `session_drain_events`. Cheap when no ops are queued
+/// (single lock + early return). Returns the number of ops
+/// flushed (0 if no flush was due).
+#[cfg(feature = "collab")]
+#[napi]
+pub fn session_tick_outbound_batch() -> NapiResult<u32> {
+    crate::collab::session_tick_outbound_batch().map_err(map_session_err)
+}
+
+/// Phase 7 (Task 27): set the list of pages the local peer is
+/// currently viewing. Remote presence updates for pages outside
+/// this set are suppressed from the renderer event stream to
+/// reduce overlay churn in multi-page documents. Operations
+/// continue to be journaled across the whole project so document
+/// consistency is preserved. Pass an empty array (`"[]"`) to
+/// revert to "interested in everything".
+#[cfg(feature = "collab")]
+#[napi]
+pub fn session_set_active_pages(page_ids_json: String) -> NapiResult<()> {
+    let page_ids: Vec<Uuid> = serde_json::from_str(&page_ids_json).map_err(|e| {
+        NapiError::new(
+            Status::InvalidArg,
+            format!("kcreate_bridge: session_set_active_pages parse: {e}"),
+        )
+    })?;
+    crate::collab::session_set_active_pages(page_ids).map_err(map_session_err)
+}
+
 /// Block 7: read the running session's operation journal summary
 /// as a JSON `SessionJournalSummary`. KChat-gated; returns an
 /// error envelope if multiplayer is locked or no session is

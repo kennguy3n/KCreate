@@ -66,6 +66,40 @@ pub struct SessionConfig {
     /// abuse). Set to `0` to disable the disconnect path and only
     /// emit warnings.
     pub rate_limit_disconnect_after: u32,
+    /// Phase 7 (Task 25): how long the bridge accumulates outbound
+    /// operations before flushing a single
+    /// [`crate::message::Message::OperationBroadcast`] batch on the
+    /// wire. The accumulator drains immediately when it reaches
+    /// [`SessionConfig::batch_flush_max_ops`] regardless of the
+    /// timer. Set to `0` to disable batching (every queued op
+    /// flushes immediately). Default 50 ms — chosen so a 60 Hz
+    /// drag interaction produces ~3 ops per batch, slashing
+    /// per-packet overhead without adding user-perceivable lag.
+    pub batch_flush_interval_ms: u32,
+    /// Phase 7 (Task 25): hard cap on operations per flushed batch.
+    /// Protects against unbounded queue growth when a script
+    /// generates ops faster than the flush interval can drain.
+    /// Default 200 (i.e. ~4 s of full-speed drag at 60 Hz with
+    /// the default interval). Exceeding the cap forces an
+    /// immediate flush so the batch never grows beyond it.
+    pub batch_flush_max_ops: u32,
+    /// Phase 7 (Task 26): minimum interval between consecutive
+    /// presence broadcasts when the cursor / selection actually
+    /// changed. Below this, repeat broadcasts are suppressed even
+    /// if the cursor moved. Default 50 ms (20 Hz cap).
+    pub presence_min_interval_ms: u32,
+    /// Phase 7 (Task 26): minimum cursor delta (in scene units) that
+    /// counts as a "move" for throttling purposes. Sub-pixel jitter
+    /// from a touchpad doesn't trigger a re-broadcast. Default
+    /// `2.0`. Selection-set or active-page changes always
+    /// re-broadcast regardless of this threshold.
+    pub presence_move_threshold_px: f32,
+    /// Phase 7 (Task 26): after this long without any presence
+    /// change (no cursor move, no selection change, no page
+    /// change), the bridge stops broadcasting presence until the
+    /// next change. Saves bandwidth on idle peers staring at the
+    /// canvas. Default 2 s.
+    pub presence_idle_suppression_ms: u32,
 }
 
 impl Default for SessionConfig {
@@ -82,6 +116,11 @@ impl Default for SessionConfig {
             max_ops_per_second: 100,
             max_presence_per_second: 20,
             rate_limit_disconnect_after: 3,
+            batch_flush_interval_ms: 50,
+            batch_flush_max_ops: 200,
+            presence_min_interval_ms: 50,
+            presence_move_threshold_px: 2.0,
+            presence_idle_suppression_ms: 2_000,
         }
     }
 }

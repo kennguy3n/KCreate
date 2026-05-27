@@ -881,6 +881,27 @@ export interface Bridge {
   sessionClipboardAccept(offerId: string): Buffer;
   sessionClipboardReject(offerId: string): void;
   sessionPendingClipboardOffers(): string;
+  /// Phase 7 (Task 25): queue one local-authored operation into the
+  /// outbound throttle buffer. The bridge flushes the buffer in a
+  /// single broadcast when the configured interval elapses or the
+  /// max-ops cap is hit.
+  sessionQueueOperation(opJson: string): void;
+  /// Phase 7 (Task 25): drain the pending op batch right now,
+  /// returning the number of ops flushed (0 if the queue was
+  /// empty). Used at the end of a drag interaction so the final
+  /// state lands on the wire without waiting for the timer.
+  sessionFlushPendingOperations(): number;
+  /// Phase 7 (Task 25): check whether the pending batch's timer has
+  /// expired and broadcast it if so. Called every event tick.
+  /// Returns the number of ops flushed on this tick (0 when no
+  /// flush was due). Cheap when the queue is empty.
+  sessionTickOutboundBatch(): number;
+  /// Phase 7 (Task 27): set the list of pages the local peer is
+  /// currently viewing. Remote presence updates for other pages
+  /// are suppressed from the renderer event stream to reduce
+  /// overlay churn. Operations still journal across the whole
+  /// document. Pass `"[]"` to revert to "interested in everything".
+  sessionSetActivePages(pageIdsJson: string): void;
   /// Re-publish the cached scene. Used by the session event tick
   /// to refresh remote-peer cursor overlays.
   documentRequestRender(): void;

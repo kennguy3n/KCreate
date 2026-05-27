@@ -2604,6 +2604,34 @@ function registerIpcHandlers(): void {
   ipcMain.handle("kcreate/session/pending-clipboard-offers", () =>
     requireBridge().sessionPendingClipboardOffers(),
   );
+  // Phase 7 (Task 25): outbound op throttle wiring. The renderer
+  // calls `queueOperation` on every local mutation, `tickBatch`
+  // on the same cadence as the event drain (so the bridge can
+  // flush when the 50 ms timer expires without renderer
+  // bookkeeping), and `flushPendingOperations` at the end of a
+  // drag interaction.
+  ipcMain.handle(
+    "kcreate/session/queueOperation",
+    (_e, opJson: string) => {
+      requireBridge().sessionQueueOperation(opJson);
+    },
+  );
+  ipcMain.handle("kcreate/session/flushPendingOperations", () =>
+    requireBridge().sessionFlushPendingOperations(),
+  );
+  ipcMain.handle("kcreate/session/tickOutboundBatch", () =>
+    requireBridge().sessionTickOutboundBatch(),
+  );
+  // Phase 7 (Task 27): selective sync — tell the bridge which
+  // pages the local peer is currently viewing. Presence updates
+  // and conflict toasts for off-screen pages are suppressed from
+  // the renderer event stream; operations are still journaled.
+  ipcMain.handle(
+    "kcreate/session/setActivePages",
+    (_e, pageIdsJson: string) => {
+      requireBridge().sessionSetActivePages(pageIdsJson);
+    },
+  );
 }
 
 /// Point the KChat trust-store at the per-user JSON file under

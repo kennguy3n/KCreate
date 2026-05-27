@@ -2289,6 +2289,28 @@ const session: SessionBridge = {
     )) as string;
     return JSON.parse(raw) as PendingClipboardOffer[];
   },
+  async queueOperation(operation: unknown): Promise<void> {
+    await ipcRenderer.invoke(
+      "kcreate/session/queueOperation",
+      JSON.stringify(operation),
+    );
+  },
+  async flushPendingOperations(): Promise<number> {
+    return (await ipcRenderer.invoke(
+      "kcreate/session/flushPendingOperations",
+    )) as number;
+  },
+  async tickOutboundBatch(): Promise<number> {
+    return (await ipcRenderer.invoke(
+      "kcreate/session/tickOutboundBatch",
+    )) as number;
+  },
+  async setActivePages(pageIds: string[]): Promise<void> {
+    await ipcRenderer.invoke(
+      "kcreate/session/setActivePages",
+      JSON.stringify(pageIds),
+    );
+  },
 };
 
 // ---------------------------------------------------------------------------

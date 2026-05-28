@@ -112,6 +112,48 @@ pub const MIGRATIONS: &[&str] = &[
     //     (= no grouping) and the column is read into
     //     `Operation::group_id: Option<Uuid>`.
     "ALTER TABLE operations ADD COLUMN group_id TEXT;",
+    // 13: design-review annotations (Phase 8 Task 4). One row per
+    //     annotation; replies hang off a thread_id. Position is
+    //     stored as two REAL columns so a future query can find
+    //     "all annotations near (x, y)" with an index without
+    //     decoding JSON.
+    r"CREATE TABLE IF NOT EXISTS annotations (
+        id TEXT PRIMARY KEY,
+        page_id TEXT NOT NULL,
+        author_peer_id TEXT NOT NULL,
+        author_name TEXT NOT NULL,
+        position_x REAL NOT NULL,
+        position_y REAL NOT NULL,
+        text TEXT NOT NULL,
+        timestamp TEXT NOT NULL,
+        resolved INTEGER NOT NULL DEFAULT 0,
+        thread_id TEXT
+    );",
+    "CREATE INDEX IF NOT EXISTS idx_annotations_page ON annotations(page_id);",
+    "CREATE INDEX IF NOT EXISTS idx_annotations_thread ON annotations(thread_id);",
+    // 14: brand-kit versioning (Phase 8 Task 15). Each row is a
+    //     snapshot of a `BrandKit` at a point in time. `snapshot`
+    //     is the full serialized JSON so a restore is a single
+    //     row read.
+    r"CREATE TABLE IF NOT EXISTS brand_kit_versions (
+        version_id TEXT PRIMARY KEY,
+        brand_kit_id TEXT NOT NULL,
+        timestamp TEXT NOT NULL,
+        description TEXT NOT NULL,
+        snapshot TEXT NOT NULL
+    );",
+    "CREATE INDEX IF NOT EXISTS idx_brand_kit_versions_kit ON brand_kit_versions(brand_kit_id, timestamp);",
+    // 15: per-project encryption configuration (Phase 8 Task 25).
+    //     Stores the PBKDF2 salt + iteration count so an existing
+    //     project can be unlocked without bundling the salt in the
+    //     manifest. `encryption_kdf_salt` is 16 raw bytes encoded
+    //     as base64. Plaintext projects do not write into this
+    //     table; presence of any row implies "this project is
+    //     encrypted".
+    r"CREATE TABLE IF NOT EXISTS encryption_meta (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+    );",
 ];
 
 /// Schema-level errors. Wraps `rusqlite::Error` and adds a couple of
@@ -124,6 +166,8 @@ pub enum DatabaseError {
     InvalidPath(PathBuf),
     #[error("encrypted databases are not enabled in this build")]
     EncryptionUnsupported,
+    #[error("supplied passphrase did not match the database key")]
+    EncryptionWrongKey,
 }
 
 /// Owned `SQLite` connection wrapper. `Database` is `Send` but not
@@ -149,14 +193,157 @@ impl Database {
         Ok(db)
     }
 
-    /// Open an encrypted database. Today this is wired through to the
-    /// same `rusqlite` connection but errors out unless we're built
-    /// with `SQLCipher` support; production crypto lands in Phase 1.
-    pub fn open_encrypted(_path: impl AsRef<Path>, _key: &[u8]) -> Result<Self, DatabaseError> {
-        // We deliberately refuse to fall back to plaintext. The Phase 1
-        // build will recompile rusqlite with the sqlcipher feature and
-        // wire `PRAGMA key = ?` here.
-        Err(DatabaseError::EncryptionUnsupported)
+    /// Open (or create) an encrypted database at `path` with the
+    /// supplied raw key.
+    ///
+    /// `key` should be the 32-byte output of a PBKDF2-SHA256
+    /// derivation over the user's passphrase (see
+    /// `kcreate_storage::crypto::derive_key`). Plaintext fallback
+    /// is intentionally disallowed — pass an empty key to get a
+    /// hard failure rather than a silent downgrade.
+    ///
+    /// The connection is configured with `PRAGMA key` first
+    /// (SQLCipher requires the key to be set before any other
+    /// statement on the connection), then a sentinel query is
+    /// executed to validate the key against an existing
+    /// ciphertext. Wrong keys map to
+    /// [`DatabaseError::EncryptionWrongKey`].
+    pub fn open_encrypted(path: impl AsRef<Path>, key: &[u8]) -> Result<Self, DatabaseError> {
+        if key.is_empty() {
+            return Err(DatabaseError::EncryptionUnsupported);
+        }
+        let path = path.as_ref().to_path_buf();
+        let existed_before = path.exists();
+        let conn = Connection::open_with_flags(
+            &path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
+        )?;
+        // Set the key in raw form using the x'...' hex literal so
+        // SQLCipher uses the bytes verbatim instead of running its
+        // own PBKDF2 over a passphrase. The caller has already
+        // derived a 32-byte key from the user's passphrase.
+        let hex_key = hex::encode(key);
+        conn.pragma_update(None, "key", format!("x'{hex_key}'"))?;
+        // Sanity-check the key by reading the schema. On wrong
+        // key, SQLCipher returns SQLITE_NOTADB at either prepare
+        // or query time depending on the SQLCipher build; treat
+        // both as a wrong-key signal.
+        if existed_before {
+            validate_encrypted_open(&conn)?;
+        }
+        let mut db = Self { conn, path };
+        db.pragma_init()?;
+        db.migrate()?;
+        Ok(db)
+    }
+
+    /// Encrypt an existing plaintext database in place.
+    ///
+    /// SQLCipher's `sqlcipher_export` requires creating a side
+    /// database and copying schema + data, then atomically
+    /// replacing the original. Returns the path the encrypted
+    /// database lives at (always equal to the input `path`).
+    ///
+    /// The plaintext `path` must already exist; calling this on a
+    /// missing database is an error.
+    pub fn encrypt_existing(
+        path: impl AsRef<Path>,
+        key: &[u8],
+    ) -> Result<PathBuf, DatabaseError> {
+        if key.is_empty() {
+            return Err(DatabaseError::EncryptionUnsupported);
+        }
+        let path = path.as_ref().to_path_buf();
+        if !path.exists() {
+            return Err(DatabaseError::Sqlite(
+                rusqlite::Error::InvalidPath(path.clone()),
+            ));
+        }
+        let tmp = path.with_extension("encrypted.tmp");
+        if tmp.exists() {
+            std::fs::remove_file(&tmp)
+                .map_err(|e| DatabaseError::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(e))))?;
+        }
+        // Open the source as plaintext and ATTACH the destination
+        // with a fresh key, then sqlcipher_export.
+        let conn = Connection::open(&path)?;
+        let hex_key = hex::encode(key);
+        let tmp_str = tmp
+            .to_str()
+            .ok_or_else(|| DatabaseError::InvalidPath(tmp.clone()))?;
+        // `ATTACH DATABASE … KEY` is the SQLCipher-specific syntax
+        // for opening the side database with an encryption key.
+        conn.execute(
+            &format!("ATTACH DATABASE ?1 AS encrypted KEY \"x'{hex_key}'\""),
+            rusqlite::params![tmp_str],
+        )?;
+        conn.query_row("SELECT sqlcipher_export('encrypted')", [], |_| Ok(()))?;
+        conn.execute("DETACH DATABASE encrypted", [])?;
+        drop(conn);
+        std::fs::rename(&tmp, &path).map_err(|e| {
+            DatabaseError::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(e)))
+        })?;
+        Ok(path)
+    }
+
+    /// Re-key an existing encrypted database without rewriting the
+    /// pages. Uses SQLCipher's `PRAGMA rekey` which re-encrypts
+    /// the database header in place.
+    pub fn change_key(
+        path: impl AsRef<Path>,
+        old_key: &[u8],
+        new_key: &[u8],
+    ) -> Result<(), DatabaseError> {
+        if old_key.is_empty() || new_key.is_empty() {
+            return Err(DatabaseError::EncryptionUnsupported);
+        }
+        let path = path.as_ref().to_path_buf();
+        let conn = Connection::open(&path)?;
+        let hex_old = hex::encode(old_key);
+        conn.pragma_update(None, "key", format!("x'{hex_old}'"))?;
+        // Validate the old key actually opens the database; without
+        // this an attacker-supplied "old_key" silently re-keys to
+        // the new one against a plaintext or wrong-keyed db.
+        validate_encrypted_open(&conn)?;
+        let hex_new = hex::encode(new_key);
+        conn.pragma_update(None, "rekey", format!("x'{hex_new}'"))?;
+        Ok(())
+    }
+
+    /// Decrypt an existing encrypted database into a new plaintext
+    /// path. Returns the plaintext path. Used by the "export
+    /// unencrypted copy" recovery flow.
+    pub fn export_plaintext(
+        path: impl AsRef<Path>,
+        key: &[u8],
+        plaintext_path: impl AsRef<Path>,
+    ) -> Result<PathBuf, DatabaseError> {
+        if key.is_empty() {
+            return Err(DatabaseError::EncryptionUnsupported);
+        }
+        let path = path.as_ref().to_path_buf();
+        let plain = plaintext_path.as_ref().to_path_buf();
+        if plain.exists() {
+            std::fs::remove_file(&plain).map_err(|e| {
+                DatabaseError::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(e)))
+            })?;
+        }
+        let conn = Connection::open(&path)?;
+        let hex_key = hex::encode(key);
+        conn.pragma_update(None, "key", format!("x'{hex_key}'"))?;
+        // Validate the key opened the database successfully.
+        validate_encrypted_open(&conn)?;
+        let plain_str = plain
+            .to_str()
+            .ok_or_else(|| DatabaseError::InvalidPath(plain.clone()))?;
+        // ATTACH with empty key produces a plaintext side database.
+        conn.execute(
+            "ATTACH DATABASE ?1 AS plaintext KEY ''",
+            rusqlite::params![plain_str],
+        )?;
+        conn.query_row("SELECT sqlcipher_export('plaintext')", [], |_| Ok(()))?;
+        conn.execute("DETACH DATABASE plaintext", [])?;
+        Ok(plain)
     }
 
     /// Borrow the connection. Useful for ad-hoc queries from other
@@ -220,6 +407,34 @@ impl Database {
     }
 }
 
+/// Run a sentinel query against an encrypted connection that has
+/// just had `PRAGMA key = …` applied. Returns
+/// [`DatabaseError::EncryptionWrongKey`] on SQLCipher's
+/// `SQLITE_NOTADB` (raised at either prepare or query time
+/// depending on the SQLCipher build), forwards every other SQLite
+/// error verbatim.
+fn validate_encrypted_open(conn: &Connection) -> Result<(), DatabaseError> {
+    let prepared = conn.prepare("SELECT count(*) FROM sqlite_master");
+    let mut stmt = match prepared {
+        Ok(stmt) => stmt,
+        Err(rusqlite::Error::SqliteFailure(e, _))
+            if e.code == rusqlite::ErrorCode::NotADatabase =>
+        {
+            return Err(DatabaseError::EncryptionWrongKey);
+        }
+        Err(e) => return Err(DatabaseError::Sqlite(e)),
+    };
+    match stmt.query_row([], |r| r.get::<_, i64>(0)) {
+        Ok(_) => Ok(()),
+        Err(rusqlite::Error::SqliteFailure(e, _))
+            if e.code == rusqlite::ErrorCode::NotADatabase =>
+        {
+            Err(DatabaseError::EncryptionWrongKey)
+        }
+        Err(e) => Err(DatabaseError::Sqlite(e)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -274,11 +489,119 @@ mod tests {
     }
 
     #[test]
-    fn open_encrypted_returns_unsupported_error() {
+    fn open_encrypted_with_empty_key_rejects() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("p.sqlite");
-        let err = Database::open_encrypted(&path, b"key").expect_err("must fail");
+        let err = Database::open_encrypted(&path, &[]).expect_err("must fail");
         assert!(matches!(err, DatabaseError::EncryptionUnsupported));
+    }
+
+    #[test]
+    fn open_encrypted_round_trip_writes_then_reads() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("enc.sqlite");
+        let key = [0xA5u8; 32];
+        {
+            let db = Database::open_encrypted(&path, &key).expect("open new");
+            db.conn()
+                .execute("CREATE TABLE t (v INTEGER)", [])
+                .expect("create");
+            db.conn()
+                .execute("INSERT INTO t VALUES (42)", [])
+                .expect("insert");
+        }
+        let db = Database::open_encrypted(&path, &key).expect("reopen");
+        let v: i64 = db
+            .conn()
+            .query_row("SELECT v FROM t", [], |r| r.get(0))
+            .expect("select");
+        assert_eq!(v, 42);
+    }
+
+    #[test]
+    fn open_encrypted_with_wrong_key_errors() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("enc.sqlite");
+        let good = [0xA5u8; 32];
+        let bad = [0xB6u8; 32];
+        {
+            let _db = Database::open_encrypted(&path, &good).expect("create");
+        }
+        let err = Database::open_encrypted(&path, &bad).expect_err("wrong key");
+        assert!(matches!(err, DatabaseError::EncryptionWrongKey), "got {err:?}");
+    }
+
+    #[test]
+    fn encrypt_existing_and_reopen() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("plain.sqlite");
+        {
+            let db = Database::open(&path).expect("open plain");
+            db.conn()
+                .execute("CREATE TABLE t (v INTEGER)", [])
+                .expect("create");
+            db.conn()
+                .execute("INSERT INTO t VALUES (7)", [])
+                .expect("insert");
+        }
+        let key = [0xC3u8; 32];
+        Database::encrypt_existing(&path, &key).expect("encrypt");
+        let db = Database::open_encrypted(&path, &key).expect("reopen encrypted");
+        let v: i64 = db
+            .conn()
+            .query_row("SELECT v FROM t", [], |r| r.get(0))
+            .expect("select");
+        assert_eq!(v, 7);
+    }
+
+    #[test]
+    fn change_key_re_keys_database() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("enc.sqlite");
+        let old = [0xD1u8; 32];
+        let new = [0xE2u8; 32];
+        {
+            let db = Database::open_encrypted(&path, &old).expect("create");
+            db.conn()
+                .execute("CREATE TABLE t (v INTEGER)", [])
+                .expect("create");
+            db.conn()
+                .execute("INSERT INTO t VALUES (3)", [])
+                .expect("insert");
+        }
+        Database::change_key(&path, &old, &new).expect("rekey");
+        let err = Database::open_encrypted(&path, &old).expect_err("old must fail");
+        assert!(matches!(err, DatabaseError::EncryptionWrongKey), "got {err:?}");
+        let db = Database::open_encrypted(&path, &new).expect("new key opens");
+        let v: i64 = db
+            .conn()
+            .query_row("SELECT v FROM t", [], |r| r.get(0))
+            .expect("select");
+        assert_eq!(v, 3);
+    }
+
+    #[test]
+    fn export_plaintext_round_trip() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let enc = dir.path().join("enc.sqlite");
+        let plain = dir.path().join("plain.sqlite");
+        let key = [0xFFu8; 32];
+        {
+            let db = Database::open_encrypted(&enc, &key).expect("create");
+            db.conn()
+                .execute("CREATE TABLE t (v INTEGER)", [])
+                .expect("create");
+            db.conn()
+                .execute("INSERT INTO t VALUES (99)", [])
+                .expect("insert");
+        }
+        Database::export_plaintext(&enc, &key, &plain).expect("export");
+        let db = Database::open(&plain).expect("open plain");
+        let v: i64 = db
+            .conn()
+            .query_row("SELECT v FROM t", [], |r| r.get(0))
+            .expect("select");
+        assert_eq!(v, 99);
     }
 
     #[test]

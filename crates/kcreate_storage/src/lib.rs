@@ -12,12 +12,24 @@
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 
+pub mod annotations;
 pub mod blobs;
+pub mod brand_versions;
+pub mod crypto;
 pub mod project_io;
 pub mod schema;
 pub mod thumbnails;
 
+pub use crypto::{
+    derive_key, generate_salt, passphrase_strength, DEFAULT_PBKDF2_ITERATIONS, KEY_LEN, SALT_LEN,
+};
+
+pub use annotations::{delete_annotation, list_all, list_for_page, set_resolved, upsert_annotation};
 pub use blobs::{BlobError, BlobRef, BlobStore};
+pub use brand_versions::{
+    diff_brand_kit_versions, list_brand_kit_versions, load_brand_kit_version,
+    restore_brand_kit_version, save_brand_kit_version, BrandKitDiff, BrandKitVersion,
+};
 pub use project_io::{ProjectManifest, ProjectStore, ProjectStoreError};
 pub use schema::{Database, DatabaseError, MIGRATIONS};
 pub use thumbnails::{

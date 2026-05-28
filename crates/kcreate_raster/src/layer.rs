@@ -80,6 +80,18 @@ pub enum AdjustmentLayer {
     /// a sorted list of `(t, v)` control points. Identity is
     /// `[(0, 0), (1, 1)]`. Applied per-channel to RGB.
     Curves(Vec<CurvePoint>),
+    /// Three-way color balance (lift / gamma / gain) targeting
+    /// shadow / midtone / highlight tonal ranges. Each triple is
+    /// `[r, g, b]` in `[-1.0, 1.0]`, applied additively to the
+    /// pixel's RGB after weighting by the tonal-range membership
+    /// function (Gaussian-like falloff centred on luminance
+    /// 0.15 / 0.5 / 0.85 respectively). Zero in every channel is
+    /// the identity transform.
+    ColorBalance {
+        shadows: [f32; 3],
+        midtones: [f32; 3],
+        highlights: [f32; 3],
+    },
 }
 
 impl AdjustmentLayer {
@@ -147,6 +159,13 @@ impl AdjustmentLayer {
                     *c = (mapped.clamp(0.0, 1.0) * 255.0).round() as u8;
                 }
             }
+            Self::ColorBalance {
+                shadows,
+                midtones,
+                highlights,
+            } => {
+                apply_color_balance(rgba, *shadows, *midtones, *highlights);
+            }
         }
     }
 
@@ -182,6 +201,15 @@ impl AdjustmentLayer {
                     && (points[1].t - 1.0).abs() < f32::EPSILON
                     && (points[1].v - 1.0).abs() < f32::EPSILON
             }
+            Self::ColorBalance {
+                shadows,
+                midtones,
+                highlights,
+            } => shadows
+                .iter()
+                .chain(midtones.iter())
+                .chain(highlights.iter())
+                .all(|v| v.abs() < f32::EPSILON),
         }
     }
 }
@@ -308,6 +336,59 @@ impl RasterLayer {
             px.copy_from_slice(&a);
         });
         out
+    }
+}
+
+/// Apply a three-way color balance (lift / gamma / gain style) by
+/// computing the pixel's luminance and weighting the shadow /
+/// midtone / highlight offsets by the membership function for each
+/// tonal range. Membership uses a centered Gaussian falloff so
+/// adjacent ranges blend smoothly — pushing red into shadows tints
+/// dark pixels red without producing a hard step at mid-grey.
+///
+/// The triples are clamped to `[-1.0, 1.0]` per channel. Total
+/// contribution is the sum of the three weighted triples, capped
+/// at `±1.0` per channel after summation so a heavy-handed user
+/// configuration can't blow channels past the legal range.
+#[allow(clippy::many_single_char_names)]
+fn apply_color_balance(
+    rgba: &mut [u8; 4],
+    shadows: [f32; 3],
+    midtones: [f32; 3],
+    highlights: [f32; 3],
+) {
+    // Luminance in [0,1]; Rec. 709 weights so the tonal-range
+    // pickers match perceptual brightness rather than channel max.
+    let r_lin = f32::from(rgba[0]) / 255.0;
+    let g_lin = f32::from(rgba[1]) / 255.0;
+    let b_lin = f32::from(rgba[2]) / 255.0;
+    let lum = (0.2126_f32).mul_add(r_lin, 0.7152_f32.mul_add(g_lin, 0.0722 * b_lin));
+    // Centred Gaussian-ish weights. Width chosen so each band's
+    // FWHM is ~0.3; this gives a moderate overlap that matches the
+    // perceptual response of Photoshop's color-balance dialog.
+    let w_shadow = (-((lum - 0.15).powi(2)) / 0.04).exp();
+    let w_mid = (-((lum - 0.5).powi(2)) / 0.04).exp();
+    let w_high = (-((lum - 0.85).powi(2)) / 0.04).exp();
+    // Normalise the weights so total weight is 1.0 — without
+    // normalisation, pure mid-grey (where each weight is small)
+    // would dilute the user's adjustment more than highlights or
+    // shadows do.
+    let sum = w_shadow + w_mid + w_high;
+    let (w_shadow, w_mid, w_high) = if sum > f32::EPSILON {
+        (w_shadow / sum, w_mid / sum, w_high / sum)
+    } else {
+        (0.0, 1.0, 0.0)
+    };
+    let mut delta = [0.0f32; 3];
+    for ch in 0..3 {
+        let s = shadows[ch].clamp(-1.0, 1.0);
+        let m = midtones[ch].clamp(-1.0, 1.0);
+        let h = highlights[ch].clamp(-1.0, 1.0);
+        delta[ch] = (s * w_shadow + m * w_mid + h * w_high).clamp(-1.0, 1.0);
+    }
+    for (ch, c) in rgba.iter_mut().take(3).enumerate() {
+        let v = f32::from(*c) / 255.0 + delta[ch];
+        *c = (v.clamp(0.0, 1.0) * 255.0).round() as u8;
     }
 }
 

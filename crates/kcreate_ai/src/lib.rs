@@ -12,6 +12,7 @@ pub mod action_log;
 pub mod alt_text;
 pub mod bg_remove;
 pub mod brand_extract;
+pub mod color_range;
 pub mod design_critique;
 pub mod design_tokens_vlm;
 pub mod image_gen;
@@ -64,6 +65,7 @@ pub use segment::{
     segment_image, segment_with_backend, SegmentBackend, SegmentError, SegmentMask, SegmentOptions,
     SegmentResult,
 };
+pub use color_range::{pack_mask, select_by_color_range};
 pub use smart_select::smart_select;
 pub use task_router::{
     build_accessibility_prompt, build_design_token_prompt, build_layer_naming_prompt, execute_task,

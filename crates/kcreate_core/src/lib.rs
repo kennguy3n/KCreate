@@ -23,6 +23,7 @@
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 
+pub mod annotation;
 pub mod color;
 pub mod component;
 pub mod config;
@@ -33,6 +34,7 @@ pub mod node;
 pub mod operation;
 pub mod project;
 
+pub use annotation::{Annotation, AnnotationFilter, AnnotationPosition};
 pub use color::{
     cmyk_to_srgb, color_distance_cie76, hsl_to_srgb, lab_to_srgb, linear_to_srgb, srgb_to_cmyk,
     srgb_to_hsl, srgb_to_lab, srgb_to_linear, srgb_to_xyz_d65, xyz_d65_to_srgb, CatalogParseStats,

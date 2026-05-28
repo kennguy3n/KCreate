@@ -321,6 +321,9 @@ pnpm lint
 | Collab perf benchmarks                   | `crates/kcreate_bridge/benches/collab_perf.rs` (criterion, `collab` feature) |
 | Design-review annotations (core)         | `crates/kcreate_core/src/annotation.rs` |
 | Design-review annotations (storage)      | `crates/kcreate_storage/src/annotations.rs` |
+| Design-review annotations (bridge CRUD)  | `crates/kcreate_bridge/src/annotation_bridge.rs` |
+| Design-review annotations (collab broadcast) | `crates/kcreate_bridge/src/collab.rs::apply_inbound_annotation_broadcast` + `session_broadcast_annotation` |
+| Design-review annotations (wire format)  | `apps/desktop/shared/scene.ts` (`AnnotationBridge` and friends) |
 | Brand-kit versioning                     | `crates/kcreate_storage/src/brand_versions.rs` |
 | SQLCipher encryption at rest             | `crates/kcreate_storage/src/crypto.rs` + `crates/kcreate_storage/src/schema.rs` |
 | Design-token binding                     | `crates/kcreate_core/src/token_binding.rs` |

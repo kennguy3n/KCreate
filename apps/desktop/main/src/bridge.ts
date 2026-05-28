@@ -958,6 +958,19 @@ export interface Bridge {
   brandKitListVersions(brandKitIdStr: string): string;
   brandKitRestoreVersion(versionIdStr: string): string;
   brandKitDiff(beforeIdStr: string, afterIdStr: string): string;
+
+  // -------------------------------------------------------------------
+  // Phase 8 (Task 4) — design-review annotations bridge. Each verb is
+  // a thin JSON marshal — the actual logic lives in
+  // `crates/kcreate_bridge/src/annotation_bridge.rs`. When a collab
+  // session is active, mutations also broadcast to peers via
+  // `Message::AnnotationBroadcast`.
+  // -------------------------------------------------------------------
+  annotationCreate(requestJson: string): string;
+  annotationReply(requestJson: string): string;
+  annotationList(requestJson: string): string;
+  annotationResolve(requestJson: string): boolean;
+  annotationDelete(idStr: string): boolean;
 }
 
 function bridgeBinaryPath(): string {

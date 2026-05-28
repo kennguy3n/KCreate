@@ -1006,15 +1006,39 @@ pub struct Annotation {
 Storage is handled by a dedicated `annotations` SQLite table in
 the project DB (`kcreate_storage::annotations`):
 `upsert_annotation`, `list_all`, `list_for_page`, `set_resolved`,
-`delete_annotation`. `AnnotationFilter` lets the renderer ask
-for "unresolved only" / "by author" without doing the work in
-JS.
+`delete_annotation`, `load_annotation`. `AnnotationFilter` lets
+the renderer ask for "unresolved only" / "by author" without
+doing the work in JS.
 
-Annotations are designed to broadcast across a collab session
-via a future `Message::AnnotationBroadcast` variant; receivers
-upsert into their local store using the same `upsert_annotation`
-path, so the renderer's `AnnotationOverlay` reads the same
-table regardless of authorship.
+Bridge surface (`kcreate_bridge::annotation_bridge`) exposes five
+verbs over N-API: `annotation_create`, `annotation_reply`,
+`annotation_list`, `annotation_resolve`, `annotation_delete`.
+Each mutation acquires the workspace mutex via the usual
+`with_workspace_mut` helper, writes through the storage helpers
+above, and — when a collab session is active — broadcasts a
+`Message::AnnotationBroadcast { project_id, kind: Upsert |
+Delete, annotations, sent_at }` envelope to peers. The
+broadcast carries the *full* annotation rows (not just ids) so
+deletes don't lose the `page_id` / `thread_id` snapshot peers
+need to invalidate overlays correctly.
+
+Inbound `AnnotationBroadcast` envelopes are handled by
+`kcreate_bridge::collab::apply_inbound_annotation_broadcast`,
+which applies each entry through the same storage helpers the
+local edit path uses and emits a
+`SessionEvent::AnnotationsApplied { peer_id, verb, count,
+page_ids }` event. The renderer subscribes to this event and
+refreshes the `AnnotationOverlay` for the affected pages. The
+verb (`"upsert"` / `"delete"`) is intentionally serialised as a
+string rather than the enum field name `kind` because the
+parent `SessionEvent` is already serde-tagged with `tag =
+"kind"` — naming the field `verb` avoids a serde tag-name
+collision.
+
+Resume bundles still drive convergence: if a peer joins mid-
+broadcast or misses a packet, the next resume bundle from the
+authoritative peer carries the canonical annotation set
+(LWW-merged by timestamp inside the storage layer).
 
 ## 17f. Design-token binding (Phase 8)
 

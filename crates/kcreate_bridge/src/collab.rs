@@ -40,10 +40,10 @@ use kcreate_collab::conflict::{
 };
 use kcreate_collab::message::Cursor;
 use kcreate_collab::{
-    no_kchat_authority, BoundKChatGroupAuthority, KChatAuthError, KChatGroupId, KChatMembership,
-    LamportClock, LockClaimPayload, LockReleasePayload, MemoryJournalStore, Message,
-    OperationJournal, PeerId, PeerIdentity, PeerKey, PresencePayload, SessionConfig,
-    SharedKChatAuthority,
+    no_kchat_authority, AnnotationBroadcastKind, BoundKChatGroupAuthority, KChatAuthError,
+    KChatGroupId, KChatMembership, LamportClock, LockClaimPayload, LockReleasePayload,
+    MemoryJournalStore, Message, OperationJournal, PeerId, PeerIdentity, PeerKey, PresencePayload,
+    SessionConfig, SharedKChatAuthority,
 };
 #[cfg(test)]
 use kcreate_collab::{JournalEntry, ResumeVector};
@@ -338,6 +338,33 @@ pub enum SessionEvent {
         /// Stable identifier for the offer so the accept/reject
         /// callback can correlate to a stored ciphertext + nonce.
         offer_id: String,
+    },
+    /// Phase 8 (Task 4): a remote peer broadcast an annotation
+    /// mutation (create / edit / resolve / delete) and the bridge
+    /// has already applied it to the local project DB via the
+    /// `kcreate_storage::annotations` upsert / delete helpers. The
+    /// renderer's `AnnotationOverlay` listens for this so its
+    /// per-page list re-renders without polling the DB on every
+    /// frame.
+    AnnotationsApplied {
+        /// Peer id that emitted the broadcast.
+        peer_id: String,
+        /// Whether the broadcast carried upserts or deletes.
+        /// Mirrors [`kcreate_collab::AnnotationBroadcastKind`] in
+        /// `snake_case` (the same shape the wire payload uses).
+        /// Named `verb` instead of `kind` because `kind` is the
+        /// serde discriminator tag on the parent `SessionEvent`.
+        verb: String,
+        /// Number of annotations affected — drives toast text
+        /// pluralization ("Ken added 3 annotations" /
+        /// "Ken resolved an annotation").
+        count: u32,
+        /// Page ids touched by the broadcast. The renderer uses
+        /// these to know which `AnnotationOverlay` instances
+        /// need to re-fetch (a single broadcast can span pages
+        /// when the originating peer batch-resolves a thread
+        /// that spans masters / children).
+        page_ids: Vec<Uuid>,
     },
 }
 
@@ -1036,6 +1063,16 @@ fn apply_event(ev: InboundEvent) {
                     );
                 }
             }
+            // Phase 8 (Task 4): a remote peer broadcast annotation
+            // mutations. Apply each entry to the local project DB
+            // through the same storage helpers the local edit path
+            // uses, then emit an AnnotationsApplied event so the
+            // renderer's AnnotationOverlay re-renders.
+            Message::AnnotationBroadcast(payload) => {
+                if payload.project_id == state.journal.project_id() {
+                    apply_inbound_annotation_broadcast(state, &from, payload);
+                }
+            }
         },
     }
 }
@@ -1481,6 +1518,71 @@ fn apply_lock_release(state: &mut SessionState, from: &PeerId, payload: &LockRel
             },
         );
     }
+}
+
+/// Phase 8 (Task 4): apply a remote annotation broadcast to the
+/// local project DB. The workspace mutex (`with_workspace_mut`) is
+/// acquired inside this helper — it is safe because the lock order
+/// is always `session slot → workspace` (the workspace never
+/// acquires the session slot).
+fn apply_inbound_annotation_broadcast(
+    state: &mut SessionState,
+    from: &PeerId,
+    payload: &kcreate_collab::AnnotationBroadcastPayload,
+) {
+    use std::collections::HashSet;
+
+    let kind_str = match payload.kind {
+        AnnotationBroadcastKind::Upsert => "upsert",
+        AnnotationBroadcastKind::Delete => "delete",
+    };
+    let count = payload.annotations.len() as u32;
+    let page_ids: Vec<Uuid> = payload
+        .annotations
+        .iter()
+        .map(|a| a.page_id)
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+
+    let annotations = payload.annotations.clone();
+    let kind = payload.kind;
+
+    // Apply to the project DB. If no project is open the write is
+    // silently skipped — the session is still running but the local
+    // user closed the project (rare, but possible). The workspace
+    // lock is dropped before we push the event to avoid holding two
+    // locks simultaneously.
+    let applied = crate::document::with_workspace_mut(|ws| {
+        let conn = ws.store.connection();
+        match kind {
+            AnnotationBroadcastKind::Upsert => {
+                for ann in &annotations {
+                    let _ = kcreate_storage::annotations::upsert_annotation(conn, ann);
+                }
+            }
+            AnnotationBroadcastKind::Delete => {
+                for ann in &annotations {
+                    let _ = kcreate_storage::annotations::delete_annotation(conn, ann.id);
+                }
+            }
+        }
+        Ok(())
+    });
+
+    if applied.is_err() {
+        return;
+    }
+
+    push_event(
+        state,
+        SessionEvent::AnnotationsApplied {
+            peer_id: from.as_str().to_string(),
+            verb: kind_str.to_string(),
+            count,
+            page_ids,
+        },
+    );
 }
 
 /// Start a collab session. The local identity is derived from the
@@ -2211,6 +2313,49 @@ pub fn session_broadcast_operations(
         Ok(Err(e)) => Err(SessionBridgeError::Transport(e)),
         Err(_) => Err(SessionBridgeError::Transport(
             kcreate_collab_transport::TransportError::Quic("broadcast_operations timed out".into()),
+        )),
+    }
+}
+
+/// Phase 8 (Task 4): broadcast an annotation mutation to every
+/// connected peer. Called by the annotation bridge module after a
+/// local CRUD write succeeds. Best-effort: if no session is active
+/// or the broadcast fails, the local write is already committed
+/// and the function returns `Ok(())` so the caller never has to
+/// roll back the local DB.
+pub fn session_broadcast_annotation(
+    annotations: Vec<kcreate_core::annotation::Annotation>,
+    kind: AnnotationBroadcastKind,
+) -> Result<()> {
+    if annotations.is_empty() {
+        return Ok(());
+    }
+    let guard = slot().lock();
+    let Some(state) = guard.as_ref() else {
+        return Ok(());
+    };
+    if state.local_permission == CollabPermission::Viewer {
+        return Err(SessionBridgeError::PermissionDenied);
+    }
+    let host = state.host.clone();
+    let runtime_handle = state.runtime.handle().clone();
+    let project_id = state.journal.project_id();
+    drop(guard);
+
+    let payload = kcreate_collab::AnnotationBroadcastPayload {
+        project_id,
+        kind,
+        annotations,
+        sent_at: Utc::now(),
+    };
+    let result = runtime_handle.block_on(async {
+        tokio::time::timeout(OP_TIMEOUT, host.broadcast_annotation(payload)).await
+    });
+    match result {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(SessionBridgeError::Transport(e)),
+        Err(_) => Err(SessionBridgeError::Transport(
+            kcreate_collab_transport::TransportError::Quic("broadcast_annotation timed out".into()),
         )),
     }
 }

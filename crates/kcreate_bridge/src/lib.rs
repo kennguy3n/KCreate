@@ -16,6 +16,7 @@
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 
+pub mod annotation_bridge;
 pub mod audit;
 #[cfg(feature = "collab")]
 pub mod collab;
@@ -4491,4 +4492,94 @@ pub fn brand_kit_diff(before_id_str: String, after_id_str: String) -> NapiResult
     let after = parse_uuid(&after_id_str)?;
     let diff = phase8::brand_kit_diff(before, after).map_err(map_doc_err)?;
     serde_json::to_string(&diff).map_err(|e| NapiError::from_reason(format!("brand_kit_diff: {e}")))
+}
+
+// ---------------------------------------------------------------------
+// Phase 8 (Task 4) — annotation CRUD bridge.
+//
+// Each entry point accepts a single JSON-encoded request string,
+// dispatches to the matching `annotation_bridge::*` impl, and
+// returns the response as JSON. The request/response shapes are
+// mirrored on the TypeScript side in `apps/desktop/shared/scene.ts`
+// (see `AnnotationCreateRequest`, `AnnotationListRequest`, etc.).
+//
+// Going through JSON (instead of the natural N-API struct
+// marshalling) matches the existing Phase 8 pattern in
+// `page_resolve_contexts` / `export_job_presets` — it keeps the
+// surface stable when fields are added to the inner types without
+// requiring the renderer to be rebuilt against new N-API codegen.
+// ---------------------------------------------------------------------
+
+/// Create a new top-level annotation. Returns the persisted
+/// [`kcreate_core::annotation::Annotation`] as JSON.
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn annotation_create(request_json: String) -> NapiResult<String> {
+    let request: annotation_bridge::AnnotationCreateRequest = serde_json::from_str(&request_json)
+        .map_err(|e| {
+        NapiError::new(
+            Status::InvalidArg,
+            format!("annotation_create: bad request json: {e}"),
+        )
+    })?;
+    let ann = annotation_bridge::annotation_create(request).map_err(map_doc_err)?;
+    serde_json::to_string(&ann)
+        .map_err(|e| NapiError::from_reason(format!("annotation_create: {e}")))
+}
+
+/// Post a reply onto an existing annotation thread.
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn annotation_reply(request_json: String) -> NapiResult<String> {
+    let request: annotation_bridge::AnnotationReplyRequest = serde_json::from_str(&request_json)
+        .map_err(|e| {
+            NapiError::new(
+                Status::InvalidArg,
+                format!("annotation_reply: bad request json: {e}"),
+            )
+        })?;
+    let ann = annotation_bridge::annotation_reply(request).map_err(map_doc_err)?;
+    serde_json::to_string(&ann)
+        .map_err(|e| NapiError::from_reason(format!("annotation_reply: {e}")))
+}
+
+/// List annotations for a single page. Returns JSON encoded
+/// [`annotation_bridge::AnnotationListResponse`].
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn annotation_list(request_json: String) -> NapiResult<String> {
+    let request: annotation_bridge::AnnotationListRequest = serde_json::from_str(&request_json)
+        .map_err(|e| {
+            NapiError::new(
+                Status::InvalidArg,
+                format!("annotation_list: bad request json: {e}"),
+            )
+        })?;
+    let resp = annotation_bridge::annotation_list(request).map_err(map_doc_err)?;
+    serde_json::to_string(&resp)
+        .map_err(|e| NapiError::from_reason(format!("annotation_list: {e}")))
+}
+
+/// Toggle the resolved flag on an annotation. Returns the new
+/// state (`true` = resolved, `false` = open).
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn annotation_resolve(request_json: String) -> NapiResult<bool> {
+    let request: annotation_bridge::AnnotationResolveRequest = serde_json::from_str(&request_json)
+        .map_err(|e| {
+            NapiError::new(
+                Status::InvalidArg,
+                format!("annotation_resolve: bad request json: {e}"),
+            )
+        })?;
+    annotation_bridge::annotation_resolve(request).map_err(map_doc_err)
+}
+
+/// Delete an annotation by id. Returns `true` if a row was
+/// removed, `false` if the id was unknown.
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn annotation_delete(id_str: String) -> NapiResult<bool> {
+    let id = parse_uuid(&id_str)?;
+    annotation_bridge::annotation_delete(id).map_err(map_doc_err)
 }

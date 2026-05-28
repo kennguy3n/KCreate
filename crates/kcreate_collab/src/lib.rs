@@ -74,9 +74,10 @@ pub use kchat::{
     KChatGroupId, KChatMembership, NoKChatGroupAuthority, SharedKChatAuthority,
 };
 pub use message::{
-    ClipboardSharePayload, GoodbyeReason, HelloPayload, KeyRotationAckPayload, KeyRotationPayload,
-    LockClaimPayload, LockReleasePayload, Message, OperationBroadcastPayload, PresencePayload,
-    ResumeBundlePayload, ResumeRequestPayload, WelcomePayload, WelcomeStatus,
+    AnnotationBroadcastKind, AnnotationBroadcastPayload, ClipboardSharePayload, GoodbyeReason,
+    HelloPayload, KeyRotationAckPayload, KeyRotationPayload, LockClaimPayload, LockReleasePayload,
+    Message, OperationBroadcastPayload, PresencePayload, ResumeBundlePayload, ResumeRequestPayload,
+    WelcomePayload, WelcomeStatus,
 };
 pub use peer::{decode_public_key, PeerFingerprint, PeerId, PeerIdentity, PeerKey};
 pub use session::{ProjectSession, RateBudgetDecision, RateLimitKind, SessionConfig, SessionError};

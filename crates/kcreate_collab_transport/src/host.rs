@@ -588,6 +588,20 @@ impl LanCollabHost {
         self.broadcast(Message::LockRelease(payload)).await
     }
 
+    /// Phase 8 (Task 4): sugar — fan out an `AnnotationBroadcast`
+    /// to every connected peer. Wraps the supplied payload in a
+    /// signed envelope (same path as every other broadcast) and
+    /// returns once each per-peer send completes. Receivers apply
+    /// the carried upsert / delete entries through their local
+    /// `kcreate_storage::annotations` helpers so the project DB
+    /// converges across the session.
+    pub async fn broadcast_annotation(
+        &self,
+        payload: kcreate_collab::AnnotationBroadcastPayload,
+    ) -> Result<(), TransportError> {
+        self.broadcast(Message::AnnotationBroadcast(payload)).await
+    }
+
     /// Phase 7 (Task 22): record one inbound metered event from a
     /// peer and return the budget decision. Callers (the bridge's
     /// inbound pump) feed this on every `OperationBroadcast` /
@@ -1012,5 +1026,6 @@ fn message_kind(message: &Message) -> &'static str {
         Message::KeyRotation(_) => "KeyRotation",
         Message::KeyRotationAck(_) => "KeyRotationAck",
         Message::ClipboardShare(_) => "ClipboardShare",
+        Message::AnnotationBroadcast(_) => "AnnotationBroadcast",
     }
 }

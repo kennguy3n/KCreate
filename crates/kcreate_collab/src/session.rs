@@ -682,6 +682,7 @@ const fn message_project_id(msg: &Message) -> Option<Uuid> {
         Message::KeyRotation(p) => Some(p.project_id),
         Message::KeyRotationAck(p) => Some(p.project_id),
         Message::ClipboardShare(p) => Some(p.project_id),
+        Message::AnnotationBroadcast(p) => Some(p.project_id),
         Message::Welcome(_) | Message::Presence(_) | Message::Heartbeat | Message::Goodbye(_) => {
             None
         }

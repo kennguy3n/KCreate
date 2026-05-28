@@ -785,11 +785,36 @@ artifact-publishing capabilities the proposal calls for.
       `AnnotationFilter`. Storage in
       `crates/kcreate_storage/src/annotations.rs` (new
       `annotations` table; `upsert_annotation`, `list_all`,
-      `list_for_page`, `set_resolved`, `delete_annotation`).
-      Per-page filtering + resolved/unresolved filtering.
-      `crates/kcreate_tests/tests/annotations.rs` exercises CRUD
-      round-trip, resolve/unresolve, per-page isolation, and
-      filter contracts.
+      `list_for_page`, `set_resolved`, `delete_annotation`,
+      `load_annotation`). Per-page filtering +
+      resolved/unresolved filtering.
+- [x] **Task 4 (bridge + collab): Annotation bridge CRUD +
+      broadcast.** `crates/kcreate_bridge/src/annotation_bridge.rs`
+      exposes `annotation_create`, `annotation_reply`,
+      `annotation_list`, `annotation_resolve`, `annotation_delete`
+      through the workspace mutex. Each mutation also broadcasts
+      via `Message::AnnotationBroadcast` (kind = `Upsert` |
+      `Delete`) when a collab session is active — peers apply the
+      payload through the same storage helpers via the inbound
+      handler in `crates/kcreate_bridge/src/collab.rs::apply_event`,
+      and a `SessionEvent::AnnotationsApplied { peer_id, verb,
+      count, page_ids }` is emitted so the renderer can refresh
+      the overlay. Five N-API entry points in
+      `crates/kcreate_bridge/src/lib.rs`; wire-format mirrors
+      (`AnnotationBridge`, `AnnotationCreateRequest`,
+      `AnnotationReplyRequest`, `AnnotationListRequest`,
+      `AnnotationListResponse`, `AnnotationResolveRequest`,
+      `Annotation`, `AnnotationPosition`) in
+      `apps/desktop/shared/scene.ts`; IPC handlers in
+      `apps/desktop/main/src/main.ts`; preload exposure as
+      `window.kcreate.annotation.{create,reply,list,resolve,delete}`.
+      `crates/kcreate_tests/tests/annotations.rs` covers CRUD
+      round-trip, resolve/unresolve, per-page isolation, filter
+      contracts, bridge-level CRUD via `annotation_bridge` (8
+      `#[serial]` tests including reply-to-unknown-parent error,
+      filter modes, double-delete idempotency, threaded
+      replies), and the `AnnotationBroadcast` envelope shape
+      (upsert + delete kinds round-trip through serde).
 
 ### Block B — Missing Image Studio Primitives (Tasks 7–12)
 - [x] **Task 7: Perspective transform.** `perspective_transform`

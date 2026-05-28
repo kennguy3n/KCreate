@@ -4215,6 +4215,7 @@ declare global {
       deeplink: DeeplinkBridge;
       clipboard: ClipboardBridge;
       phase8: Phase8Bridge;
+      annotation: AnnotationBridge;
     };
   }
 }
@@ -4388,4 +4389,114 @@ export interface Phase8Bridge {
   brandKitListVersions(brandKitId: string): Promise<BrandKitVersionInfo[]>;
   brandKitRestoreVersion(versionId: string): Promise<BrandKit>;
   brandKitDiff(beforeId: string, afterId: string): Promise<BrandKitDiff>;
+}
+
+// ---------------------------------------------------------------------
+// Phase 8 (Task 4) — design-review annotations.
+//
+// Wire-format mirrors for the bridge surface in
+// `crates/kcreate_bridge/src/annotation_bridge.rs`. Every shape uses
+// `camelCase` because the Rust structs all carry
+// `#[serde(rename_all = "camelCase")]`. Position is `f64` on the Rust
+// side; JS numbers are IEEE-754 doubles so the precision matches.
+// ---------------------------------------------------------------------
+
+/**
+ * Wire-format mirror of `kcreate_core::annotation::AnnotationPosition`.
+ * World-coordinate location of the annotation pin on the artboard.
+ * Stored as floats (`f64` on the Rust side) so a pin placed on a
+ * large artboard does not lose precision after a round-trip.
+ */
+export interface AnnotationPosition {
+  x: number;
+  y: number;
+}
+
+/**
+ * Wire-format mirror of `kcreate_core::annotation::Annotation`.
+ *
+ * - `timestamp` is an ISO-8601 RFC3339 string (chrono `DateTime<Utc>`).
+ * - `threadId` is `null` for the head of a new thread; non-null for
+ *   replies — it points at the thread's root annotation id so the
+ *   sidebar UI can group every entry under one pin.
+ */
+export interface Annotation {
+  id: string;
+  pageId: string;
+  authorPeerId: string;
+  authorName: string;
+  position: AnnotationPosition;
+  text: string;
+  timestamp: string;
+  resolved: boolean;
+  threadId: string | null;
+}
+
+/**
+ * Request payload for `annotationCreate`. Posted by the
+ * `AnnotationOverlay` when the user places a new pin on the canvas.
+ */
+export interface AnnotationCreateRequest {
+  pageId: string;
+  authorPeerId: string;
+  authorName: string;
+  position: AnnotationPosition;
+  text: string;
+}
+
+/**
+ * Request payload for `annotationReply`. Posts a threaded reply
+ * onto an existing annotation; the bridge walks `parentId` to the
+ * thread root so the reply is attached correctly regardless of
+ * whether the UI passed the head id or a sibling reply's id.
+ */
+export interface AnnotationReplyRequest {
+  parentId: string;
+  authorPeerId: string;
+  authorName: string;
+  text: string;
+}
+
+/**
+ * Request payload for `annotationList`. The two `include*` flags
+ * cover the three useful filter combinations: open-only (default),
+ * resolved-only (archive view), and all (show everything).
+ */
+export interface AnnotationListRequest {
+  pageId: string;
+  includeResolved: boolean;
+  includeUnresolved: boolean;
+}
+
+/**
+ * Response payload for `annotationList`. Wraps the array so the
+ * N-API marshal layer returns a single JSON object instead of a
+ * bare array — matches the rest of the Phase 8 bridge convention.
+ */
+export interface AnnotationListResponse {
+  annotations: Annotation[];
+}
+
+/**
+ * Request payload for `annotationResolve`. Used for both resolve
+ * (`resolved: true`) and unresolve (`resolved: false`).
+ */
+export interface AnnotationResolveRequest {
+  id: string;
+  resolved: boolean;
+}
+
+/**
+ * Annotation bridge — design-review CRUD over the project's local
+ * SQLite store. When a collab session is active each verb also
+ * broadcasts the mutation to connected peers via
+ * `Message::AnnotationBroadcast` so every project DB converges
+ * through the same upsert / delete helpers.
+ */
+export interface AnnotationBridge {
+  create(request: AnnotationCreateRequest): Promise<Annotation>;
+  reply(request: AnnotationReplyRequest): Promise<Annotation>;
+  list(request: AnnotationListRequest): Promise<AnnotationListResponse>;
+  resolve(request: AnnotationResolveRequest): Promise<boolean>;
+  delete(id: string): Promise<boolean>;
 }

@@ -1697,6 +1697,36 @@ function registerIpcHandlers(): void {
   );
 
   // ---------------------------------------------------------------------
+  // Phase 8 (Task 4) — design-review annotation CRUD. Each handler is a
+  // thin pass-through; the actual storage write + collab broadcast is
+  // performed in `crates/kcreate_bridge/src/annotation_bridge.rs`.
+  // ---------------------------------------------------------------------
+  ipcMain.handle(
+    "kcreate/annotation/create",
+    (_e, requestJson: string): string =>
+      requireBridge().annotationCreate(requestJson),
+  );
+  ipcMain.handle(
+    "kcreate/annotation/reply",
+    (_e, requestJson: string): string =>
+      requireBridge().annotationReply(requestJson),
+  );
+  ipcMain.handle(
+    "kcreate/annotation/list",
+    (_e, requestJson: string): string =>
+      requireBridge().annotationList(requestJson),
+  );
+  ipcMain.handle(
+    "kcreate/annotation/resolve",
+    (_e, requestJson: string): boolean =>
+      requireBridge().annotationResolve(requestJson),
+  );
+  ipcMain.handle(
+    "kcreate/annotation/delete",
+    (_e, id: string): boolean => requireBridge().annotationDelete(id),
+  );
+
+  // ---------------------------------------------------------------------
   // Phase 2 — preflight, icon pack, batch async, AI extras, plugins, MCP perms.
   // ---------------------------------------------------------------------
   ipcMain.handle("kcreate/preflight/run", (_e, requestJson: string) =>

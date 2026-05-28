@@ -13,6 +13,7 @@
 //! used by every other wire type in KCreate).
 
 use chrono::{DateTime, Utc};
+use kcreate_core::annotation::Annotation;
 use kcreate_core::operation::Operation;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -107,6 +108,19 @@ pub enum Message {
     /// shows a "Ken wants to share clipboard with you — Accept /
     /// Reject" prompt, and only paste materializes on accept.
     ClipboardShare(ClipboardSharePayload),
+    /// Phase 8 (Task 4): one peer broadcasts a batch of
+    /// design-review annotation mutations to the session. The
+    /// payload carries an explicit [`AnnotationBroadcastKind`] so
+    /// receivers can distinguish upserts (create + edit + resolve
+    /// toggle, all of which serialise the full [`Annotation`])
+    /// from deletes (which carry only the ids). Batching matches
+    /// [`Message::OperationBroadcast`] so a paste-of-many-pins or
+    /// a "resolve thread" action becomes a single envelope on the
+    /// wire. Receivers apply each entry through the local
+    /// `kcreate_storage::annotations` upsert / delete helpers so a
+    /// rejoining peer sees the same state without re-running the
+    /// operation log.
+    AnnotationBroadcast(AnnotationBroadcastPayload),
 }
 
 /// Initial handshake payload sent by the joining peer.
@@ -411,6 +425,62 @@ pub struct ClipboardSharePayload {
     pub preview_label: String,
 }
 
+/// Payload of [`Message::AnnotationBroadcast`].
+///
+/// Not `Eq` because [`Annotation::position`] carries `f64` fields
+/// (matching [`PresencePayload`] / [`Cursor`]).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AnnotationBroadcastPayload {
+    /// Sender's view of the project id. Receivers MUST drop the
+    /// broadcast if it doesn't match their currently-open project.
+    pub project_id: Uuid,
+    /// What the receiver should do with the carried annotations.
+    pub kind: AnnotationBroadcastKind,
+    /// Affected annotations.
+    ///
+    /// For [`AnnotationBroadcastKind::Upsert`] this is the
+    /// authoritative state to write to the local DB — receivers
+    /// call `kcreate_storage::annotations::upsert_annotation` on
+    /// each entry in order, which handles both create and edit
+    /// (the storage layer's `INSERT … ON CONFLICT DO UPDATE`).
+    ///
+    /// For [`AnnotationBroadcastKind::Delete`] only the `id`,
+    /// `page_id`, and `thread_id` of each entry are
+    /// load-bearing; receivers ignore the other fields. The
+    /// reason the full struct travels instead of a `Vec<Uuid>` is
+    /// so the receiver's UI can echo the deleted pin's position
+    /// in the "X removed an annotation" toast without round-
+    /// tripping back to the DB it just deleted from. Producers
+    /// reading from `annotations` table just before deleting
+    /// will already have the full row.
+    pub annotations: Vec<Annotation>,
+    /// Wall-clock timestamp the sender attached when emitting
+    /// the broadcast. Receivers can use this to age-out stale
+    /// broadcasts (e.g. a peer's resume bundle arrives after a
+    /// rejoin replays older annotation upserts).
+    pub sent_at: DateTime<Utc>,
+}
+
+/// What [`Message::AnnotationBroadcast`] receivers should do with
+/// the carried annotations. Mirrors the local bridge CRUD verbs so
+/// a remote peer's mutations land in the local DB through exactly
+/// the same storage helpers (`upsert_annotation`,
+/// `delete_annotation`) the local edit path uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AnnotationBroadcastKind {
+    /// Insert or update each carried annotation. Covers create,
+    /// edit, and resolve toggle — the storage layer's upsert is
+    /// content-addressed by `id` so a single verb suffices.
+    Upsert,
+    /// Delete each carried annotation by id. Replies that
+    /// referenced the deleted annotation as their thread root
+    /// are NOT cascaded by receivers (matches the local-edit
+    /// path's behaviour in `kcreate_storage::annotations`).
+    Delete,
+}
+
 /// Why the sender is leaving.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind", content = "detail")]
@@ -591,6 +661,76 @@ mod tests {
             Message::LockRelease(p) => {
                 assert_eq!(p.project_id, project_id);
                 assert!(p.node_ids.is_empty());
+            }
+            _ => panic!("wrong variant after round-trip"),
+        }
+    }
+
+    #[test]
+    fn annotation_broadcast_upsert_round_trips() {
+        use kcreate_core::annotation::{Annotation, AnnotationPosition};
+        let project_id = Uuid::new_v4();
+        let page = Uuid::new_v4();
+        let ann = Annotation::new(
+            page,
+            "peer-a",
+            "Alice",
+            AnnotationPosition { x: 10.5, y: 20.25 },
+            "Looks good",
+        );
+        let now = Utc::now();
+        let msg = Message::AnnotationBroadcast(AnnotationBroadcastPayload {
+            project_id,
+            kind: AnnotationBroadcastKind::Upsert,
+            annotations: vec![ann.clone()],
+            sent_at: now,
+        });
+        // Verify the on-the-wire JSON shape: tag/data envelope with
+        // a `kind: "upsert"` discriminator and a camelCase
+        // `projectId`. This pins the contract the renderer relies
+        // on for type-narrowed handling of upserts vs deletes.
+        let v: serde_json::Value = serde_json::to_value(&msg).unwrap();
+        assert_eq!(v["kind"], "annotation_broadcast");
+        assert_eq!(v["data"]["kind"], "upsert");
+        assert_eq!(v["data"]["projectId"], project_id.to_string());
+        assert_eq!(v["data"]["annotations"].as_array().unwrap().len(), 1);
+        // Round-trip back to a `Message` and verify equality.
+        let back: Message = serde_json::from_value(v).unwrap();
+        match back {
+            Message::AnnotationBroadcast(p) => {
+                assert_eq!(p.project_id, project_id);
+                assert_eq!(p.kind, AnnotationBroadcastKind::Upsert);
+                assert_eq!(p.annotations, vec![ann]);
+                assert_eq!(p.sent_at, now);
+            }
+            _ => panic!("wrong variant after round-trip"),
+        }
+    }
+
+    #[test]
+    fn annotation_broadcast_delete_round_trips() {
+        use kcreate_core::annotation::{Annotation, AnnotationPosition};
+        let project_id = Uuid::new_v4();
+        let page = Uuid::new_v4();
+        let ann = Annotation::new(
+            page,
+            "peer-a",
+            "Alice",
+            AnnotationPosition { x: 0.0, y: 0.0 },
+            "to be deleted",
+        );
+        let msg = Message::AnnotationBroadcast(AnnotationBroadcastPayload {
+            project_id,
+            kind: AnnotationBroadcastKind::Delete,
+            annotations: vec![ann.clone()],
+            sent_at: Utc::now(),
+        });
+        let s = serde_json::to_string(&msg).unwrap();
+        let back: Message = serde_json::from_str(&s).unwrap();
+        match back {
+            Message::AnnotationBroadcast(p) => {
+                assert_eq!(p.kind, AnnotationBroadcastKind::Delete);
+                assert_eq!(p.annotations[0].id, ann.id);
             }
             _ => panic!("wrong variant after round-trip"),
         }

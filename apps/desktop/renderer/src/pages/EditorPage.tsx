@@ -1,5 +1,10 @@
+import type { MouseEvent as ReactMouseEvent } from "react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
+import {
+  AnnotationOverlay,
+  type AnnotationOverlayHandle,
+} from "../components/AnnotationOverlay";
 import { CanvasHost, type ViewportState } from "../components/CanvasHost";
 import { ConflictToast } from "../components/ConflictToast";
 import { CursorOverlay } from "../components/CursorOverlay";
@@ -660,6 +665,16 @@ export function EditorPage({
     () => nodes.find((n) => n.id === selectedId) ?? null,
     [nodes, selectedId],
   );
+
+  /// Active page id used by the annotation overlay. Derived
+  /// either from the current selection (if it's a Page) or from
+  /// the first Page in the document tree. Returns `null` if the
+  /// project has no pages yet (during boot before refresh).
+  const activePageId = useMemo<string | null>(() => {
+    if (selected && selected.nodeType === "Page") return selected.id;
+    const firstPage = nodes.find((n) => n.nodeType === "Page");
+    return firstPage ? firstPage.id : null;
+  }, [selected, nodes]);
 
   const canUndo = docStatus?.canUndo ?? false;
   const canRedo = docStatus?.canRedo ?? false;
@@ -1597,6 +1612,39 @@ export function EditorPage({
     setViewport(DEFAULT_VIEWPORT);
   }, []);
 
+  // Imperative handle into the AnnotationOverlay. The overlay's root
+  // SVG is permanently `pointer-events: none` (so it never blocks
+  // canvas tools), and the canvas-level double-click gesture is owned
+  // here on `<main>` instead — when it fires we forward the
+  // overlay-local screen coordinates through this ref. See
+  // `AnnotationOverlayHandle` in `components/AnnotationOverlay.tsx`.
+  const annotationOverlayRef = useRef<AnnotationOverlayHandle | null>(null);
+
+  // The annotation overlay only accepts drop-pin gestures while the
+  // editor is in a creation-friendly mode. Pulled out so the
+  // double-click handler, the overlay's `allowCreate` prop, and the
+  // CanvasHost `onZoomToFit` suppression all agree on the same
+  // predicate.
+  const annotationCreateActive = mode === "design" || mode === "layout";
+
+  // Handle the canvas-area double-click. In annotation-creation modes
+  // we route the gesture into the AnnotationOverlay to drop a draft
+  // pin; in every other mode the default zoom-to-fit fires from
+  // CanvasHost (we don't run anything here). We listen on `<main>`
+  // rather than CanvasHost because the canvas surface stop-propagates
+  // some events for native viewport gestures — `<main>` is the
+  // single point that sees every dblclick within the canvas pane.
+  const onMainDoubleClick = useCallback(
+    (e: ReactMouseEvent<HTMLElement>) => {
+      if (!annotationCreateActive) return;
+      const rect = e.currentTarget.getBoundingClientRect();
+      const localX = e.clientX - rect.left;
+      const localY = e.clientY - rect.top;
+      annotationOverlayRef.current?.beginDraftAt(localX, localY);
+    },
+    [annotationCreateActive],
+  );
+
   const handleUpdateNode = useCallback(
     async (
       nodeId: string,
@@ -1808,6 +1856,7 @@ export function EditorPage({
         <main
           onDragOver={handleCanvasDragOver}
           onDrop={handleCanvasDrop}
+          onDoubleClick={onMainDoubleClick}
           style={{
             position: "relative",
             background: colors.bgCanvas,
@@ -1823,7 +1872,13 @@ export function EditorPage({
             onViewportChange={setViewport}
             onFramePresented={onFrame}
             onPointer={onCanvasPointer}
-            onZoomToFit={onZoomToFit}
+            // In annotation-creation modes the double-click gesture
+            // is reserved for dropping a new annotation pin (handled
+            // via `onMainDoubleClick` on the parent `<main>` and
+            // forwarded into `AnnotationOverlay` via the imperative
+            // handle). Suppress the default zoom-to-fit so the two
+            // behaviours don't fire on the same gesture.
+            onZoomToFit={annotationCreateActive ? undefined : onZoomToFit}
             cursor={cursor}
           />
           {/*
@@ -1874,6 +1929,26 @@ export function EditorPage({
             Self-contained — owns its own subscription + roster.
           */}
           <ConflictToast nodes={nodes} />
+          {/*
+            Phase 8 Task 5 — design-review annotation pins. Root SVG
+            is permanently `pointer-events: none` so it never blocks
+            canvas tools; pin children opt back in with
+            `pointer-events: auto` so they remain clickable, and the
+            host owns the double-click drop-pin gesture via the
+            imperative `AnnotationOverlayHandle` ref forwarded
+            through `onMainDoubleClick` on the parent `<main>`. The
+            overlay returns `null` until a page is mounted (the
+            bridge needs a page id to scope annotation reads/writes).
+          */}
+          <AnnotationOverlay
+            ref={annotationOverlayRef}
+            width={CANVAS_WIDTH}
+            height={CANVAS_HEIGHT}
+            viewport={viewport}
+            pageId={activePageId}
+            project={project}
+            allowCreate={annotationCreateActive}
+          />
           {/*
             Phase 2 soft-proof / gamut-warning overlay. Reads the
             project's color settings via `window.kcreate.color` and

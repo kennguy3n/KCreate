@@ -125,6 +125,77 @@ pub fn document_propagate_token(token_name: &str) -> Result<usize> {
     })
 }
 
+/// Read the current token-binding map on `node_id`. Empty map when
+/// no bindings exist. Returns an error only when the node id is
+/// unknown (so the renderer can distinguish "no node" from "no
+/// bindings"). The map keys are the snake_case property names
+/// surfaced by `StyleProperty::as_str` (e.g. `"fill"`,
+/// `"stroke_color"`); the values are the design-token names the
+/// renderer can look up in `window.kcreate.designTokens.get()`.
+pub fn document_node_token_bindings(
+    node_id: Uuid,
+) -> Result<std::collections::BTreeMap<String, String>> {
+    with_workspace(|ws| {
+        let node = ws
+            .project
+            .document
+            .get_node(node_id)
+            .ok_or(DocumentBridgeError::NodeNotFound(node_id))?;
+        Ok(node.style.token_bindings.clone())
+    })
+}
+
+/// Read the current constraints (horizontal + vertical) on
+/// `node_id`. Used by `ConstraintsPanel` to seed its initial state
+/// without forcing the renderer to pre-emptively send every node's
+/// constraints over the wire on every selection change.
+pub fn document_node_constraints(node_id: Uuid) -> Result<Constraints> {
+    with_workspace(|ws| {
+        let node = ws
+            .project
+            .document
+            .get_node(node_id)
+            .ok_or(DocumentBridgeError::NodeNotFound(node_id))?;
+        Ok(node.constraints)
+    })
+}
+
+/// Update the constraints on `node_id`. Bounds are not recomputed
+/// here — constraints affect the *next* parent resize. Records an
+/// undoable [`Operation`] so the change participates in undo/redo.
+pub fn document_set_node_constraints(node_id: Uuid, constraints: Constraints) -> Result<()> {
+    with_workspace_mut(|ws| {
+        let before;
+        {
+            let node = ws
+                .project
+                .document
+                .get_node_mut(node_id)
+                .ok_or(DocumentBridgeError::NodeNotFound(node_id))?;
+            before = serde_json::to_value(node.constraints).unwrap_or(serde_json::Value::Null);
+            if node.constraints == constraints {
+                // No-op write: skip the operation log entry so a
+                // chatty UI (e.g. drag-to-set on a constraint
+                // visualizer) doesn't pollute history with empty
+                // diffs.
+                return Ok(());
+            }
+            node.constraints = constraints;
+        }
+        let after = serde_json::to_value(constraints).unwrap_or(serde_json::Value::Null);
+        ws.project.modified_at = Utc::now();
+        let op = Operation::new(
+            "user",
+            "document_set_node_constraints",
+            before,
+            after,
+            vec![node_id],
+        );
+        ws.project.execute_operation(op);
+        Ok(())
+    })
+}
+
 /// Resize a frame and apply [`Constraints`] to every direct child.
 ///
 /// `new_bounds` is in the document's coordinate space. The frame's

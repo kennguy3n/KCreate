@@ -919,8 +919,8 @@ artifact-publishing capabilities the proposal calls for.
 - [x] **Task 19: Constraint system for responsive frames.**
       `crates/kcreate_core/src/node.rs` defines
       `Constraints { horizontal, vertical }` with the 6
-      axis modes (`Fixed`, `Scale`, `StretchToParent`,
-      `Center`, `LeftAndRight`, `TopAndBottom`).
+      axis modes (`Fixed`, `Min`, `Max`, `Center`, `Scale`,
+      `Stretch`).
       `crates/kcreate_layout/src/constraints.rs` ships
       `apply_constraints(child_bounds, child_constraints,
       parent_old, parent_new) -> Bounds` and the
@@ -966,6 +966,59 @@ artifact-publishing capabilities the proposal calls for.
       projects continue to work; the salt is persisted in
       `manifest.json` so the project can survive a key
       rotation without re-importing assets.
+
+### Block C UI — React panels (slice A)
+- [x] **AnnotationOverlay** (`apps/desktop/renderer/src/components/AnnotationOverlay.tsx`)
+      — design-review pins + threaded replies overlay on
+      `CanvasHost`. World-space projection mirrors
+      `CursorOverlay`. Wired into `EditorPage` above
+      `SelectionOverlay` with `allowCreate` gated on `mode ∈
+      {design, layout}`. Calls `window.kcreate.annotation.*`
+      (Task 5).
+- [x] **ArtifactPublishPanel** (`ArtifactPublishPanel.tsx`)
+      — publish PNG/PDF/WebP/JPEG/SVG/BrandKit artifacts to a
+      KChat community and list recent artifacts. Lives under
+      the new RightPanel "Publish" tab. Wired to
+      `window.kcreate.kchatBackend.*` (Task 3).
+- [x] **BrandVersionPanel** (`BrandVersionPanel.tsx`) — save
+      / list / restore / diff brand-kit versions, with a
+      colour-aware diff view. Lives under the LeftPanel
+      "Brand" tab alongside `BrandKitEditor`. Wired to
+      `window.kcreate.phase8.brandKit*` (Task 16).
+- [x] **ConstraintsPanel** (`ConstraintsPanel.tsx`) — per-
+      node horizontal + vertical constraint editor with a
+      live SVG visualiser of the resize behaviour. Lives
+      under the new RightPanel "Constraints" tab. Wired to
+      `window.kcreate.phase8.{nodeConstraints,
+      setNodeConstraints}` (Task 20). The bridge surface +
+      N-API wrapper + IPC layer are added in lockstep
+      (`document_node_constraints`,
+      `document_set_node_constraints`).
+- [x] **TokenBindingControl** (`TokenBindingControl.tsx`) —
+      bind / unbind / propagate design tokens to a node's
+      properties (fill, stroke, corner radius, padding,
+      gap…). Filters available tokens by property kind so a
+      colour property only sees colour tokens. Lives under
+      the new RightPanel "Tokens" tab. Wired to
+      `window.kcreate.phase8.{bindToken, unbindToken,
+      propagateToken, nodeTokenBindings}` (Task 22). The
+      `nodeTokenBindings` read method is added in this slice
+      alongside the constraint read methods.
+- [x] **EncryptionPanel** (`EncryptionPanel.tsx`) — project
+      encryption status, enable-encryption flow with a
+      passphrase-strength meter, change-passphrase rotation,
+      and plaintext recovery export. Lives under the new
+      RightPanel "Encryption" tab. Wired to a fresh
+      `window.kcreate.projectEncryption.*` bridge backed by
+      `kcreate_bridge::encryption` (which composes
+      `ProjectStore::{enable_encryption, change_passphrase,
+      export_plaintext_recovery, is_encrypted}` — already
+      shipped in Task 25) and surfaces
+      `crypto::passphrase_strength` to the renderer (Task
+      26). End-to-end test
+      `encryption::tests::enable_change_export_round_trip`
+      drives the full enable → status → rotate → export
+      cycle against SQLCipher.
 
 ### Block F — Documentation & Polish (Tasks 29–30)
 - [x] **Task 29: Phase tracking.** This file (`PROGRESS.md`).

@@ -8,6 +8,7 @@ import type {
 import { colors, radius, spacing } from "../styles/tokens";
 import { ArtboardPanel } from "./ArtboardPanel";
 import { BrandKitEditor } from "./BrandKitEditor";
+import { BrandVersionPanel } from "./BrandVersionPanel";
 import { ComponentPanel } from "./ComponentPanel";
 import { DesignTokenEditor } from "./DesignTokenEditor";
 
@@ -215,7 +216,17 @@ export function LeftPanel({
           />
         ) : null}
         {tab === "brand" ? (
-          <BrandKitEditor onStatus={onDesignSystemStatus ?? noopStatus} />
+          <div
+            style={{ display: "flex", flexDirection: "column", gap: spacing.md }}
+          >
+            <BrandKitEditor onStatus={onDesignSystemStatus ?? noopStatus} />
+            {/* Phase 8 Task 16 — brand-kit version history. Lives
+                under the Brand tab so the user can save / restore /
+                diff versions next to the kit being edited. */}
+            <BrandVersionPanel
+              onStatus={onDesignSystemStatus ?? noopStatus}
+            />
+          </div>
         ) : null}
       </div>
     </aside>

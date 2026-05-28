@@ -189,6 +189,9 @@ import type {
   PageNumberFormat,
   JobType,
   ResizeFrameBounds,
+  Constraints,
+  ProjectEncryptionBridge,
+  EncryptionStatus,
   AnnotationBridge,
   Annotation,
   AnnotationListResponse,
@@ -2869,6 +2872,32 @@ const phase8: Phase8Bridge = {
       tokenName,
     )) as number;
   },
+  async nodeTokenBindings(
+    nodeId: string,
+  ): Promise<Record<string, string>> {
+    const json = (await ipcRenderer.invoke(
+      "kcreate/phase8/node-token-bindings",
+      nodeId,
+    )) as string;
+    return JSON.parse(json) as Record<string, string>;
+  },
+  async nodeConstraints(nodeId: string): Promise<Constraints> {
+    const json = (await ipcRenderer.invoke(
+      "kcreate/phase8/node-constraints",
+      nodeId,
+    )) as string;
+    return JSON.parse(json) as Constraints;
+  },
+  async setNodeConstraints(
+    nodeId: string,
+    constraints: Constraints,
+  ): Promise<void> {
+    await ipcRenderer.invoke(
+      "kcreate/phase8/set-node-constraints",
+      nodeId,
+      constraints,
+    );
+  },
   async resizeFrame(frameId: string, bounds: ResizeFrameBounds): Promise<void> {
     await ipcRenderer.invoke("kcreate/phase8/resize-frame", frameId, bounds);
   },
@@ -2939,6 +2968,58 @@ const phase8: Phase8Bridge = {
       afterId,
     )) as string;
     return JSON.parse(raw);
+  },
+};
+
+// ---------------------------------------------------------------------------
+// Phase 8 (Task 26) — project encryption bridge.
+// See `ProjectEncryptionBridge` in shared/scene.ts for the contract.
+// ---------------------------------------------------------------------------
+
+const projectEncryption: ProjectEncryptionBridge = {
+  async status(): Promise<EncryptionStatus> {
+    const json = (await ipcRenderer.invoke(
+      "kcreate/project/encryption/status",
+    )) as string;
+    return JSON.parse(json) as EncryptionStatus;
+  },
+  async passphraseStrength(passphrase: string): Promise<number> {
+    return (await ipcRenderer.invoke(
+      "kcreate/project/encryption/passphrase-strength",
+      passphrase,
+    )) as number;
+  },
+  async enable(passphrase: string): Promise<EncryptionStatus> {
+    const json = (await ipcRenderer.invoke(
+      "kcreate/project/encryption/enable",
+      passphrase,
+    )) as string;
+    return JSON.parse(json) as EncryptionStatus;
+  },
+  async changePassphrase(
+    oldPassphrase: string,
+    newPassphrase: string,
+  ): Promise<void> {
+    await ipcRenderer.invoke(
+      "kcreate/project/encryption/change-passphrase",
+      oldPassphrase,
+      newPassphrase,
+    );
+  },
+  async exportPlaintextRecovery(
+    passphrase: string,
+    outputPath: string,
+  ): Promise<string> {
+    return (await ipcRenderer.invoke(
+      "kcreate/project/encryption/export-plaintext-recovery",
+      passphrase,
+      outputPath,
+    )) as string;
+  },
+  async pickRecoveryPath(): Promise<string | null> {
+    return (await ipcRenderer.invoke(
+      "kcreate/project/encryption/pick-recovery-path",
+    )) as string | null;
   },
 };
 
@@ -3025,5 +3106,6 @@ contextBridge.exposeInMainWorld("kcreate", {
   deeplink,
   clipboard,
   phase8,
+  projectEncryption,
   annotation,
 });

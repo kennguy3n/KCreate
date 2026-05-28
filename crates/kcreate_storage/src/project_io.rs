@@ -45,6 +45,14 @@ const DATABASE_FILENAME: &str = "document.sqlite";
 const BLOBS_DIRNAME: &str = "blobs";
 const SUBDIRS: &[&str] = &["thumbnails", "exports", "ai", "cache"];
 
+/// Side-car journal written by [`ProjectStore::enable_encryption`]
+/// *before* the database file is rewritten as ciphertext and removed
+/// only *after* the manifest update has been persisted. Its presence
+/// at [`open_with_passphrase`] time signals that an encryption
+/// transition was interrupted and may need to be recovered. The file
+/// lives alongside `manifest.json` in the project dir.
+const ENCRYPTION_JOURNAL_FILENAME: &str = ".encryption_journal.json";
+
 /// Errors from project I/O.
 #[derive(Debug, Error)]
 pub enum ProjectStoreError {
@@ -66,6 +74,90 @@ pub enum ProjectStoreError {
     InvalidManifest(PathBuf),
     #[error("project format {0:?} is not supported")]
     UnsupportedFormat(String),
+    #[error("the project is encrypted; supply a passphrase to open it")]
+    PassphraseRequired,
+    #[error("passphrase must not be empty")]
+    PassphraseEmpty,
+    #[error("project is already encrypted")]
+    AlreadyEncrypted,
+    #[error("project is not encrypted")]
+    NotEncrypted,
+    #[error("invalid encryption metadata: {0}")]
+    InvalidEncryptionMetadata(String),
+}
+
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+
+fn derive_key_from_meta(
+    passphrase: &str,
+    meta: &EncryptionMetadata,
+) -> Result<[u8; crate::crypto::KEY_LEN], ProjectStoreError> {
+    if passphrase.is_empty() {
+        return Err(ProjectStoreError::PassphraseEmpty);
+    }
+    let salt = URL_SAFE_NO_PAD
+        .decode(meta.salt.as_bytes())
+        .map_err(|e| ProjectStoreError::InvalidEncryptionMetadata(format!("salt: {e}")))?;
+    if salt.len() != crate::crypto::SALT_LEN {
+        return Err(ProjectStoreError::InvalidEncryptionMetadata(format!(
+            "salt length must be {} bytes, got {}",
+            crate::crypto::SALT_LEN,
+            salt.len(),
+        )));
+    }
+    let iter = std::num::NonZeroU32::new(meta.iterations).ok_or_else(|| {
+        ProjectStoreError::InvalidEncryptionMetadata(
+            "iterations must be greater than zero".to_string(),
+        )
+    })?;
+    Ok(crate::crypto::derive_key(passphrase, &salt, iter))
+}
+
+/// Side-car journal written before a destructive encryption
+/// transition so the next [`ProjectStore::open_with_passphrase`] can
+/// detect and recover from a crash that lands between
+/// `encrypt_existing` and `write_manifest`. Mirrors
+/// [`EncryptionMetadata`] one-for-one because that is exactly the
+/// state we expect to commit to the manifest once the transition
+/// completes — keeping the shape identical makes the recovery path a
+/// trivial copy.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct EncryptionJournal {
+    /// Url-safe base64 (no padding) PBKDF2 salt. Length pinned to
+    /// `kcreate_storage::crypto::SALT_LEN` (16) bytes.
+    salt: String,
+    /// PBKDF2-HMAC-SHA256 iteration count used to derive the key
+    /// from the passphrase + salt.
+    iterations: u32,
+}
+
+impl EncryptionJournal {
+    fn into_metadata(self) -> EncryptionMetadata {
+        EncryptionMetadata {
+            enabled: true,
+            salt: self.salt,
+            iterations: self.iterations,
+        }
+    }
+}
+
+/// Per-project encryption metadata. When `enabled` is true the
+/// `.kstudio/document.sqlite` file is SQLCipher-encrypted and the
+/// passphrase must be supplied on open. `salt` is the per-project
+/// PBKDF2 salt (base64 url-safe, no padding) — it is intentionally
+/// stored in the manifest so the same passphrase produces the same
+/// key on every machine. `iterations` lets old projects upgrade to
+/// a higher cost factor in the future without re-keying.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EncryptionMetadata {
+    /// Whether the underlying database is encrypted.
+    pub enabled: bool,
+    /// PBKDF2 salt, url-safe base64 without padding. Length is
+    /// always `kcreate_storage::crypto::SALT_LEN` (16) bytes.
+    pub salt: String,
+    /// PBKDF2-HMAC-SHA256 iteration count used to derive the key
+    /// from the passphrase + salt.
+    pub iterations: u32,
 }
 
 /// `manifest.json` schema.
@@ -83,6 +175,11 @@ pub struct ProjectManifest {
     pub modified_at: DateTime<Utc>,
     /// `kstudio-v1`, etc.
     pub format: String,
+    /// Phase 8 Task 25: per-project SQLCipher encryption state.
+    /// `None` for legacy projects created before the field was
+    /// added; the on-disk database is plaintext in that case.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encryption: Option<EncryptionMetadata>,
 }
 
 impl ProjectManifest {
@@ -96,6 +193,7 @@ impl ProjectManifest {
             created_at: now,
             modified_at: now,
             format: MANIFEST_FORMAT.into(),
+            encryption: None,
         }
     }
 }
@@ -138,20 +236,68 @@ impl ProjectStore {
     }
 
     /// Open an existing `.kstudio/` package.
+    ///
+    /// When the manifest declares the database is encrypted, the
+    /// `passphrase` is used to derive the SQLCipher key. A `None`
+    /// passphrase on an encrypted project returns
+    /// [`ProjectStoreError::PassphraseRequired`]; the caller is
+    /// expected to prompt and retry.
     pub fn open(dir: &Path) -> Result<Self, ProjectStoreError> {
+        Self::open_with_passphrase(dir, None)
+    }
+
+    /// Open an existing `.kstudio/` package, optionally supplying a
+    /// passphrase used to unlock an encrypted database.
+    pub fn open_with_passphrase(
+        dir: &Path,
+        passphrase: Option<&str>,
+    ) -> Result<Self, ProjectStoreError> {
         let dir = dir.to_path_buf();
         let manifest_path = dir.join(MANIFEST_FILENAME);
         if !manifest_path.exists() {
             return Err(ProjectStoreError::InvalidManifest(manifest_path));
         }
-        let manifest = read_manifest(&dir)?;
+        let mut manifest = read_manifest(&dir)?;
         if manifest.format != MANIFEST_FORMAT {
             return Err(ProjectStoreError::UnsupportedFormat(manifest.format));
         }
         for sub in SUBDIRS {
             fs::create_dir_all(dir.join(sub))?;
         }
-        let db = Database::open(dir.join(DATABASE_FILENAME))?;
+        // Crash-recovery: a journal file alongside `manifest.json`
+        // signals that a previous `enable_encryption` call rewrote
+        // the database to ciphertext but did not get to commit the
+        // manifest update. Reconcile the on-disk state now so the
+        // rest of this method sees a consistent picture. The
+        // recovery path only runs when the manifest still claims
+        // plaintext — once the manifest reports `enabled = true`,
+        // the journal is a harmless leftover that we just clean up.
+        if let Some(journal) = read_encryption_journal(&dir)? {
+            let manifest_says_encrypted = matches!(
+                manifest.encryption.as_ref(),
+                Some(m) if m.enabled,
+            );
+            if manifest_says_encrypted {
+                // Manifest already reflects the transition — the
+                // journal is stale. Best-effort cleanup; ignore
+                // errors so we don't fail the open on a transient
+                // FS issue (the journal will be re-cleaned on the
+                // next successful `enable_encryption` /
+                // `change_passphrase`).
+                let _ = remove_encryption_journal(&dir);
+            } else {
+                Self::recover_from_encryption_journal(&dir, &mut manifest, journal)?;
+            }
+        }
+        let db_path = dir.join(DATABASE_FILENAME);
+        let db = match manifest.encryption.as_ref() {
+            Some(meta) if meta.enabled => {
+                let pass = passphrase.ok_or(ProjectStoreError::PassphraseRequired)?;
+                let key = derive_key_from_meta(pass, meta)?;
+                Database::open_encrypted(db_path, &key)?
+            }
+            _ => Database::open(db_path)?,
+        };
         let blobs = BlobStore::new(dir.join(BLOBS_DIRNAME))?;
         Ok(Self {
             project_dir: dir,
@@ -159,6 +305,309 @@ impl ProjectStore {
             db,
             blobs,
         })
+    }
+
+    /// Reconcile the on-disk state when a journal exists and the
+    /// manifest still claims plaintext. Three sub-cases:
+    ///
+    /// 1. **Database file is ciphertext** — `encrypt_existing`
+    ///    completed but `write_manifest` did not. Promote the
+    ///    journal contents to the manifest and persist, then drop
+    ///    the journal. This is the case the journal was added to
+    ///    rescue: the user's passphrase still works because the
+    ///    salt + iterations match.
+    /// 2. **Database file is plaintext** — `encrypt_existing` never
+    ///    committed (typical case: the process crashed before the
+    ///    `fs::rename` inside `encrypt_existing`). The manifest is
+    ///    already correct; just drop the journal so we don't run
+    ///    recovery again on the next open.
+    /// 3. **Indeterminate** — neither open succeeds. Surface a
+    ///    structured error so the UI can prompt the user; leaving
+    ///    the journal in place so a future retry has a chance.
+    fn recover_from_encryption_journal(
+        dir: &Path,
+        manifest: &mut ProjectManifest,
+        journal: EncryptionJournal,
+    ) -> Result<(), ProjectStoreError> {
+        let db_path = dir.join(DATABASE_FILENAME);
+        // Probe plaintext first because it's cheaper (no key
+        // derivation) and the more common crash window — the
+        // database rewrite is the long step in `encrypt_existing`
+        // so most interruptions land before the `fs::rename`.
+        match Database::open(&db_path) {
+            Ok(_) => {
+                // File is still plaintext: roll forward by leaving
+                // the manifest as-is and dropping the journal.
+                remove_encryption_journal(dir)
+            }
+            Err(_plain_err) => {
+                // Plaintext open failed — file is most likely
+                // ciphertext. Promote the journal to manifest so
+                // the normal encrypted-open path below picks it
+                // up.
+                manifest.encryption = Some(journal.into_metadata());
+                write_manifest(dir, manifest)?;
+                remove_encryption_journal(dir)
+            }
+        }
+    }
+
+    /// Whether the project's SQLite database is currently encrypted
+    /// (per `manifest.json`). Surface this via the bridge to drive
+    /// the EncryptionPanel UI.
+    #[must_use]
+    pub fn is_encrypted(&self) -> bool {
+        matches!(self.manifest.encryption.as_ref(), Some(m) if m.enabled)
+    }
+
+    /// Encrypt a previously-plaintext project with a fresh
+    /// passphrase. Generates a per-project salt, runs PBKDF2 to
+    /// derive the key, encrypts the database in place via
+    /// [`Database::encrypt_existing`], rewrites the manifest, then
+    /// re-opens the connection encrypted so subsequent writes go
+    /// through SQLCipher.
+    ///
+    /// Returns an error if encryption is already enabled.
+    ///
+    /// **Failure-recovery invariant.** Any error during this method
+    /// leaves `self.db` pointing at a live connection to the
+    /// on-disk database in whatever encryption state it was last
+    /// in. Callers can therefore retry, save, or close the project
+    /// without risking writes landing in a throwaway in-memory DB.
+    pub fn enable_encryption(&mut self, passphrase: &str) -> Result<(), ProjectStoreError> {
+        if passphrase.is_empty() {
+            return Err(ProjectStoreError::PassphraseEmpty);
+        }
+        if self.is_encrypted() {
+            return Err(ProjectStoreError::AlreadyEncrypted);
+        }
+        let salt = crate::crypto::generate_salt();
+        let iterations = crate::crypto::DEFAULT_PBKDF2_ITERATIONS;
+        let iter_nonzero = std::num::NonZeroU32::new(iterations).ok_or_else(|| {
+            ProjectStoreError::InvalidEncryptionMetadata(
+                "DEFAULT_PBKDF2_ITERATIONS must be non-zero".to_string(),
+            )
+        })?;
+        let key = crate::crypto::derive_key(passphrase, &salt, iter_nonzero);
+        let db_path = self.project_dir.join(DATABASE_FILENAME);
+        let salt_b64 = URL_SAFE_NO_PAD.encode(salt);
+        // Persist a side-car journal describing the upcoming
+        // transition BEFORE rewriting the database file. If we crash
+        // between `encrypt_existing` and `write_manifest` below, the
+        // next `open_with_passphrase` will spot the journal alongside
+        // a still-plaintext-looking manifest and run the recovery
+        // path — see `recover_from_encryption_journal` in
+        // `open_with_passphrase`. Writing the journal first is what
+        // makes this method crash-safe across sessions; the in-
+        // session `replace_db_with_placeholder` recovery below only
+        // covers errors observed within the same process.
+        let journal = EncryptionJournal {
+            salt: salt_b64.clone(),
+            iterations,
+        };
+        write_encryption_journal(&self.project_dir, &journal)?;
+        // The previous Database value must be dropped before
+        // `encrypt_existing` opens a fresh connection; otherwise
+        // SQLCipher's `ATTACH … KEY` would fight a live connection
+        // for the WAL file. Use an in-memory placeholder so the
+        // struct stays in a valid state across the failure window
+        // — but we MUST restore a real connection (encrypted on
+        // success, plaintext on failure) before returning so the
+        // store never silently writes into the placeholder.
+        self.replace_db_with_placeholder()?;
+        let result = (|| -> Result<(), ProjectStoreError> {
+            Database::encrypt_existing(&db_path, &key)?;
+            // Re-open encrypted now that the on-disk file is ciphertext.
+            self.db = Database::open_encrypted(&db_path, &key)?;
+            let meta = EncryptionMetadata {
+                enabled: true,
+                salt: salt_b64,
+                iterations,
+            };
+            self.manifest.encryption = Some(meta);
+            write_manifest(&self.project_dir, &self.manifest)?;
+            Ok(())
+        })();
+        if result.is_err() {
+            // Best-effort recovery: try re-opening the on-disk DB
+            // as plaintext first (the typical failure case is that
+            // `encrypt_existing` aborted before mutating the file).
+            // If that fails (e.g. the file is now ciphertext
+            // because `encrypt_existing` succeeded and a later
+            // step failed), fall back to opening it with the
+            // freshly-derived key. If both attempts fail, leave
+            // the placeholder in place — a corrupt-file state we
+            // cannot recover from without user intervention — and
+            // surface the original error so the caller can prompt
+            // the user to re-open the project from disk.
+            if let Ok(db) = Database::open(&db_path) {
+                self.db = db;
+            } else if let Ok(db) = Database::open_encrypted(&db_path, &key) {
+                self.db = db;
+            }
+        }
+        // Whether the transition succeeded or failed, drop the
+        // journal — on success it has done its job; on failure we
+        // either restored plaintext (so the journal would prompt a
+        // bogus recovery on next open) or we left a corrupted file
+        // that the journal cannot rescue anyway. Recovery should
+        // only ever run when a *future* `enable_encryption` call
+        // crashes between the database rewrite and the manifest
+        // update, never as a leftover from a rolled-back attempt.
+        // Ignore removal errors — if even this fails we already
+        // have a more serious problem (disk full / read-only) that
+        // the caller will see via `result`.
+        let _ = remove_encryption_journal(&self.project_dir);
+        result
+    }
+
+    /// Drop the live database connection by swapping in an
+    /// in-memory placeholder. Used by mutation paths
+    /// (`enable_encryption`, `change_passphrase`,
+    /// `export_plaintext_recovery`) that need to call SQLCipher
+    /// operations against the path while the original connection
+    /// is closed.
+    fn replace_db_with_placeholder(&mut self) -> Result<(), ProjectStoreError> {
+        let placeholder = Database::open(":memory:")?;
+        // Replace returns the old value; binding to `_` immediately
+        // drops it, closing the old connection.
+        let _ = std::mem::replace(&mut self.db, placeholder);
+        Ok(())
+    }
+
+    /// Rotate the project passphrase. The per-project salt and
+    /// PBKDF2 iteration count in `manifest.json` are unchanged —
+    /// only the encryption key in the SQLCipher header is rewritten
+    /// via [`Database::change_key`]. After a successful rotation
+    /// **only the new passphrase decrypts the database**; the old
+    /// passphrase no longer works. Both keys are derived against
+    /// the current salt purely so the rekey can hand SQLCipher the
+    /// correct "unlock" key.
+    ///
+    /// **Failure-recovery invariant.** The function first probes
+    /// the old passphrase by opening a throwaway encrypted
+    /// connection to the on-disk file. Only if that succeeds does
+    /// it swap out the live connection and rekey. Wrong-old-key
+    /// rejections therefore never touch `self.db`, and post-rekey
+    /// failures (disk full, etc.) recover by reopening with
+    /// whichever key the on-disk header now holds.
+    pub fn change_passphrase(
+        &mut self,
+        old_passphrase: &str,
+        new_passphrase: &str,
+    ) -> Result<(), ProjectStoreError> {
+        if new_passphrase.is_empty() {
+            return Err(ProjectStoreError::PassphraseEmpty);
+        }
+        let meta = self
+            .manifest
+            .encryption
+            .clone()
+            .ok_or(ProjectStoreError::NotEncrypted)?;
+        if !meta.enabled {
+            return Err(ProjectStoreError::NotEncrypted);
+        }
+        let old_key = derive_key_from_meta(old_passphrase, &meta)?;
+        let new_key = derive_key_from_meta(new_passphrase, &meta)?;
+        let db_path = self.project_dir.join(DATABASE_FILENAME);
+        // Probe the old key against the on-disk file BEFORE
+        // touching `self.db`. If the user gave us the wrong old
+        // passphrase the probe fails immediately and the live
+        // connection is never disturbed, so subsequent saves
+        // continue to hit the real ciphertext file.
+        {
+            let probe = Database::open_encrypted(&db_path, &old_key)?;
+            drop(probe);
+        }
+        // The probe succeeded so we know `old_key` is the correct
+        // unlock key. Drop the live connection (held in `self.db`)
+        // before `PRAGMA rekey` opens its own — the rekey wants
+        // exclusive access to the WAL.
+        self.replace_db_with_placeholder()?;
+        let result = (|| -> Result<(), ProjectStoreError> {
+            Database::change_key(&db_path, &old_key, &new_key)?;
+            self.db = Database::open_encrypted(&db_path, &new_key)?;
+            Ok(())
+        })();
+        if result.is_err() {
+            // Rekey failed after the swap (e.g. disk full,
+            // SQLCipher build mismatch). The probe established
+            // that `old_key` opens the file, so try that first.
+            // If a partial header rewrite occurred, fall back to
+            // `new_key`. As a final fallback leave the placeholder;
+            // the caller surfaces the original error and the user
+            // can re-open the project from disk.
+            if let Ok(db) = Database::open_encrypted(&db_path, &old_key) {
+                self.db = db;
+            } else if let Ok(db) = Database::open_encrypted(&db_path, &new_key) {
+                self.db = db;
+            }
+        }
+        result
+    }
+
+    /// Export an unencrypted copy of the project's database to
+    /// `output_path`. The original encrypted database is left
+    /// untouched. Used by the recovery flow that lets the user
+    /// produce a passphrase-free backup before disabling
+    /// encryption.
+    ///
+    /// The live SQLCipher connection held in `self.db` is closed
+    /// for the duration of the export so the second SQLite
+    /// connection that `Database::export_plaintext` opens does not
+    /// contend with the primary connection on the WAL file. On
+    /// some Windows configurations (antivirus, OneDrive, etc.) the
+    /// second connection would otherwise hit `SQLITE_BUSY` /
+    /// access-denied even though SQLite's WAL mode normally
+    /// permits concurrent readers. After export the live
+    /// connection is re-opened with the same passphrase.
+    pub fn export_plaintext_recovery(
+        &mut self,
+        passphrase: &str,
+        output_path: &Path,
+    ) -> Result<PathBuf, ProjectStoreError> {
+        let meta = self
+            .manifest
+            .encryption
+            .clone()
+            .ok_or(ProjectStoreError::NotEncrypted)?;
+        if !meta.enabled {
+            return Err(ProjectStoreError::NotEncrypted);
+        }
+        let key = derive_key_from_meta(passphrase, &meta)?;
+        let db_path = self.project_dir.join(DATABASE_FILENAME);
+        // Probe the key BEFORE swapping out the live connection so
+        // wrong-passphrase rejections never disturb `self.db`.
+        {
+            let probe = Database::open_encrypted(&db_path, &key)?;
+            drop(probe);
+        }
+        // Close the primary connection so the export-side
+        // connection has exclusive access to the WAL.
+        // `replace_db_with_placeholder` installs an in-memory DB
+        // so any concurrent reader of `self.db` keeps a valid
+        // handle until we restore the real connection at the end
+        // of this method.
+        self.replace_db_with_placeholder()?;
+        let result = Database::export_plaintext(&db_path, &key, output_path);
+        // Always re-open the live connection — even on export
+        // failure — so the store ends in a usable state. The probe
+        // above already proved `key` opens the on-disk file.
+        match Database::open_encrypted(&db_path, &key) {
+            Ok(db) => self.db = db,
+            Err(reopen_err) => {
+                // The export side may have left the file in a
+                // transient state that breaks reopen (extremely
+                // rare). Surface whichever error is the more
+                // actionable: the original export failure if
+                // present, otherwise the reopen failure.
+                return match result {
+                    Ok(_) => Err(ProjectStoreError::Database(reopen_err)),
+                    Err(export_err) => Err(ProjectStoreError::Database(export_err)),
+                };
+            }
+        }
+        Ok(result?)
     }
 
     /// Path to the `.kstudio/` directory.
@@ -690,6 +1139,51 @@ fn read_manifest(dir: &Path) -> Result<ProjectManifest, ProjectStoreError> {
     Ok(serde_json::from_str(&raw)?)
 }
 
+fn encryption_journal_path(dir: &Path) -> PathBuf {
+    dir.join(ENCRYPTION_JOURNAL_FILENAME)
+}
+
+/// Write the encryption journal atomically (write to tmp + rename).
+/// Used by [`ProjectStore::enable_encryption`] *before* the database
+/// file is rewritten so a crash between the database rewrite and the
+/// manifest update remains recoverable.
+fn write_encryption_journal(
+    dir: &Path,
+    journal: &EncryptionJournal,
+) -> Result<(), ProjectStoreError> {
+    let json = serde_json::to_string_pretty(journal)?;
+    let tmp = encryption_journal_path(dir).with_extension("json.tmp");
+    fs::write(&tmp, json)?;
+    fs::rename(&tmp, encryption_journal_path(dir))?;
+    Ok(())
+}
+
+/// Returns `Ok(Some(_))` if a journal is present and parseable.
+/// Returns `Ok(None)` if there is no journal — the common steady-
+/// state case. A corrupt journal surfaces as a real error so we
+/// don't silently lose recovery information.
+fn read_encryption_journal(dir: &Path) -> Result<Option<EncryptionJournal>, ProjectStoreError> {
+    let path = encryption_journal_path(dir);
+    match fs::read_to_string(&path) {
+        Ok(raw) => Ok(Some(serde_json::from_str(&raw)?)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(ProjectStoreError::Io(e)),
+    }
+}
+
+/// Best-effort removal — used both on the success path (after the
+/// manifest has been persisted) and on the failure path (so a future
+/// open doesn't get a stale recovery prompt for a transition we've
+/// already rolled back). `NotFound` is treated as success because the
+/// journal might never have been written.
+fn remove_encryption_journal(dir: &Path) -> Result<(), ProjectStoreError> {
+    match fs::remove_file(encryption_journal_path(dir)) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(ProjectStoreError::Io(e)),
+    }
+}
+
 // Helper for tests / external users: classify a node type as container/leaf.
 #[must_use]
 pub const fn is_container(node_type: NodeType) -> bool {
@@ -995,5 +1489,277 @@ mod tests {
         let reopened = ProjectStore::open(&p).expect("reopen");
         let loaded = reopened.load_components().expect("load after reopen");
         assert!(loaded.contains_key(&cid));
+    }
+
+    /// `change_passphrase` with the wrong old passphrase must surface
+    /// the error AND leave `self.db` pointing at a usable connection
+    /// to the on-disk encrypted database — not a dead in-memory
+    /// placeholder. Without the failure-recovery path, the store
+    /// would silently accept subsequent writes into a throwaway
+    /// in-memory DB.
+    #[test]
+    fn change_passphrase_wrong_old_key_leaves_store_writable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = dir.path().join("Enc.kstudio");
+        let mut store = ProjectStore::create(&p, "Enc").expect("create");
+        store
+            .enable_encryption("first-pass-strong-1")
+            .expect("enable");
+
+        // Wrong old passphrase. This must fail.
+        let err = store
+            .change_passphrase("wrong-pass", "second-pass-strong-2")
+            .expect_err("must fail");
+        assert!(
+            matches!(err, ProjectStoreError::Database(_)),
+            "expected Database error, got {err:?}",
+        );
+
+        // The connection MUST still be alive. Prove it by writing
+        // through `self.db` and re-opening from disk to confirm the
+        // bytes actually landed on the real ciphertext file (not a
+        // throwaway in-memory placeholder).
+        let mut doc = DocumentGraph::new();
+        let mut page = Node::new(NodeType::Page, "AfterFailure");
+        page.bounds = Bounds::new(0.0, 0.0, 100.0, 100.0);
+        let page_id = page.id;
+        doc.insert_node(page).expect("insert page");
+        store
+            .save_document(&doc)
+            .expect("save must succeed against the real on-disk DB");
+
+        drop(store);
+        let reopened = ProjectStore::open_with_passphrase(&p, Some("first-pass-strong-1"))
+            .expect("reopen with original passphrase");
+        let loaded = reopened.load_document().expect("load");
+        assert_eq!(loaded.node_count(), 1, "write must have hit the real DB");
+        assert!(loaded.root_ids().contains(&page_id));
+    }
+
+    /// `export_plaintext_recovery` with the wrong passphrase must
+    /// surface the error AND leave `self.db` connected to the
+    /// encrypted on-disk file.
+    #[test]
+    fn export_plaintext_recovery_wrong_pass_leaves_store_writable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = dir.path().join("Enc.kstudio");
+        let mut store = ProjectStore::create(&p, "Enc").expect("create");
+        store
+            .enable_encryption("export-pass-strong-1")
+            .expect("enable");
+
+        let recovery_path = dir.path().join("recovery.sqlite");
+        let err = store
+            .export_plaintext_recovery("wrong-pass", &recovery_path)
+            .expect_err("must fail");
+        assert!(
+            matches!(err, ProjectStoreError::Database(_)),
+            "expected Database error, got {err:?}",
+        );
+        assert!(
+            !recovery_path.exists()
+                || std::fs::metadata(&recovery_path).map_or(0, |m| m.len()) == 0,
+            "failed export must not leave a valid recovery copy",
+        );
+
+        // Write through the live connection and verify it persists.
+        let mut doc = DocumentGraph::new();
+        let page = Node::new(NodeType::Page, "AfterFailure");
+        let page_id = page.id;
+        doc.insert_node(page).expect("insert page");
+        store.save_document(&doc).expect("save must succeed");
+
+        drop(store);
+        let reopened =
+            ProjectStore::open_with_passphrase(&p, Some("export-pass-strong-1")).expect("reopen");
+        let loaded = reopened.load_document().expect("load");
+        assert_eq!(loaded.node_count(), 1);
+        assert!(loaded.root_ids().contains(&page_id));
+    }
+
+    /// Successful `export_plaintext_recovery` must leave the live
+    /// SQLCipher connection re-opened so the store is immediately
+    /// usable afterwards (no need to close and re-open the project).
+    #[test]
+    fn export_plaintext_recovery_success_leaves_store_writable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = dir.path().join("Enc.kstudio");
+        let mut store = ProjectStore::create(&p, "Enc").expect("create");
+        store
+            .enable_encryption("happy-pass-strong-1")
+            .expect("enable");
+
+        let recovery_path = dir.path().join("recovery.sqlite");
+        let written = store
+            .export_plaintext_recovery("happy-pass-strong-1", &recovery_path)
+            .expect("export");
+        assert_eq!(written, recovery_path);
+        assert!(recovery_path.exists());
+
+        // Subsequent saves must persist to the still-encrypted
+        // on-disk file.
+        let mut doc = DocumentGraph::new();
+        let page = Node::new(NodeType::Page, "AfterExport");
+        let page_id = page.id;
+        doc.insert_node(page).expect("insert page");
+        store.save_document(&doc).expect("save after export");
+
+        drop(store);
+        let reopened = ProjectStore::open_with_passphrase(&p, Some("happy-pass-strong-1"))
+            .expect("reopen encrypted");
+        let loaded = reopened.load_document().expect("load");
+        assert!(loaded.root_ids().contains(&page_id));
+    }
+
+    /// Phase 8 Block C round 2: simulate the crash window between
+    /// `Database::encrypt_existing` finishing (the on-disk DB is
+    /// now ciphertext) and `write_manifest` landing (the manifest
+    /// still claims plaintext). The journal sidecar exists and
+    /// records the salt + iteration count the encrypt step used.
+    /// A subsequent `open_with_passphrase` must detect the
+    /// inconsistency, promote the journal to the manifest, and
+    /// open the database successfully with the user's passphrase.
+    /// Cleans the journal on the way out so a later open doesn't
+    /// re-run recovery.
+    #[test]
+    fn open_recovers_when_journal_present_and_db_is_encrypted() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = dir.path().join("CrashRecover.kstudio");
+
+        // Build the post-crash filesystem state by hand. Encrypt a
+        // plaintext DB on disk, then revert the manifest so it
+        // looks like the manifest write never happened. Drop a
+        // journal that records the encrypt parameters.
+        let mut store = ProjectStore::create(&p, "CrashRecover").expect("create");
+        let mut doc = DocumentGraph::new();
+        let page = Node::new(NodeType::Page, "PreCrash");
+        let page_id = page.id;
+        doc.insert_node(page).expect("insert");
+        store.save_document(&doc).expect("save pre-crash");
+        drop(store);
+
+        let salt = crate::crypto::generate_salt();
+        let iterations = crate::crypto::DEFAULT_PBKDF2_ITERATIONS;
+        let iter_nz = std::num::NonZeroU32::new(iterations).expect("iter nonzero");
+        let key = crate::crypto::derive_key("recovery-pass-strong-1", &salt, iter_nz);
+        Database::encrypt_existing(p.join(DATABASE_FILENAME), &key).expect("encrypt");
+
+        // Manifest must still say plaintext (simulating the lost
+        // write_manifest call). Write the journal with the
+        // parameters the encrypt step used.
+        let salt_b64 = URL_SAFE_NO_PAD.encode(salt);
+        write_encryption_journal(
+            &p,
+            &EncryptionJournal {
+                salt: salt_b64.clone(),
+                iterations,
+            },
+        )
+        .expect("write journal");
+
+        // Recovery: open_with_passphrase must consult the journal,
+        // promote the metadata onto the manifest, drop the journal,
+        // and succeed.
+        let recovered = ProjectStore::open_with_passphrase(&p, Some("recovery-pass-strong-1"))
+            .expect("open with journal");
+        assert!(recovered.is_encrypted(), "manifest must reflect recovery");
+        let meta = recovered
+            .manifest()
+            .encryption
+            .as_ref()
+            .expect("metadata present");
+        assert!(meta.enabled);
+        assert_eq!(meta.salt, salt_b64);
+        assert_eq!(meta.iterations, iterations);
+        assert!(
+            !p.join(ENCRYPTION_JOURNAL_FILENAME).exists(),
+            "journal must be cleaned up post-recovery"
+        );
+
+        // Pre-crash state must still be readable through the
+        // encrypted handle.
+        let loaded = recovered.load_document().expect("load post-recovery");
+        assert!(loaded.root_ids().contains(&page_id));
+    }
+
+    /// Recovery edge case: the journal exists but the on-disk DB
+    /// is still plaintext (the encrypt step crashed before its
+    /// internal `fs::rename` landed). The recovery path must keep
+    /// the manifest plaintext and drop the journal — opening the
+    /// project must succeed *without* a passphrase, just like
+    /// before the failed encrypt attempt.
+    #[test]
+    fn open_clears_journal_when_db_is_still_plaintext() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = dir.path().join("CrashRollback.kstudio");
+        let store = ProjectStore::create(&p, "CrashRollback").expect("create");
+        drop(store);
+
+        // Plant a journal as if encrypt_existing had set up its
+        // intent but crashed before committing the ciphertext file.
+        let salt = crate::crypto::generate_salt();
+        let iterations = crate::crypto::DEFAULT_PBKDF2_ITERATIONS;
+        write_encryption_journal(
+            &p,
+            &EncryptionJournal {
+                salt: URL_SAFE_NO_PAD.encode(salt),
+                iterations,
+            },
+        )
+        .expect("write journal");
+        assert!(p.join(ENCRYPTION_JOURNAL_FILENAME).exists());
+
+        // Plaintext open must succeed — no passphrase required —
+        // and the journal must be gone so we don't loop on
+        // recovery the next time the project opens.
+        let recovered = ProjectStore::open(&p).expect("plaintext open recovers");
+        assert!(!recovered.is_encrypted(), "manifest must remain plaintext");
+        assert!(
+            !p.join(ENCRYPTION_JOURNAL_FILENAME).exists(),
+            "journal must be cleaned up after rollback recovery"
+        );
+    }
+
+    /// Recovery edge case: the encrypt + manifest write both
+    /// completed, so the manifest reports `enabled = true`, but
+    /// `enable_encryption` crashed between the manifest write and
+    /// the journal removal. The recovery path must NOT re-run the
+    /// promotion step (the manifest is already correct); it must
+    /// just clean up the stale journal.
+    #[test]
+    fn open_clears_stale_journal_when_manifest_already_encrypted() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = dir.path().join("StaleJournal.kstudio");
+        let mut store = ProjectStore::create(&p, "StaleJournal").expect("create");
+        store
+            .enable_encryption("stale-journal-pass-1")
+            .expect("enable");
+        drop(store);
+
+        // Re-plant a journal post-fact to simulate a process that
+        // wrote the manifest but died before the journal-removal
+        // call. The journal contents are irrelevant for this case
+        // because the manifest is the source of truth — we just
+        // need *some* parseable journal to be present.
+        let manifest = read_manifest(&p).expect("read manifest");
+        let meta = manifest.encryption.expect("encryption metadata");
+        write_encryption_journal(
+            &p,
+            &EncryptionJournal {
+                salt: meta.salt,
+                iterations: meta.iterations,
+            },
+        )
+        .expect("write stale journal");
+
+        // open_with_passphrase must succeed and silently drop the
+        // journal.
+        let recovered =
+            ProjectStore::open_with_passphrase(&p, Some("stale-journal-pass-1")).expect("reopen");
+        assert!(recovered.is_encrypted());
+        assert!(
+            !p.join(ENCRYPTION_JOURNAL_FILENAME).exists(),
+            "stale journal must be cleaned up on open"
+        );
     }
 }

@@ -4292,6 +4292,7 @@ declare global {
       deeplink: DeeplinkBridge;
       clipboard: ClipboardBridge;
       phase8: Phase8Bridge;
+      projectEncryption: ProjectEncryptionBridge;
       annotation: AnnotationBridge;
     };
   }
@@ -4440,6 +4441,31 @@ export interface ResizeFrameBounds {
 }
 
 /**
+ * Wire-format mirror of `kcreate_core::node::Constraint`. Describes
+ * how one axis (horizontal or vertical) of a node responds when its
+ * parent frame is resized. Tags are the Rust `snake_case` rename
+ * (`fixed`, `min`, `max`, `center`, `scale`, `stretch`).
+ */
+export type Constraint =
+  | "fixed"
+  | "min"
+  | "max"
+  | "center"
+  | "scale"
+  | "stretch";
+
+/**
+ * Wire-format mirror of `kcreate_core::node::Constraints`. A
+ * horizontal + vertical [`Constraint`] pair stored on every node;
+ * applied by `Phase8Bridge.resizeFrame` to recompute child bounds
+ * after a parent resize.
+ */
+export interface Constraints {
+  horizontal: Constraint;
+  vertical: Constraint;
+}
+
+/**
  * Phase 8 production-hardening bridge. Wraps the N-API entry points
  * for design-token binding, constraint-aware frame resize, text
  * auto-fit, page-numbering tokens, section numbering, job-first
@@ -4450,6 +4476,18 @@ export interface Phase8Bridge {
   unbindToken(nodeId: string, property: string): Promise<void>;
   propagateToken(tokenName: string): Promise<number>;
   resizeFrame(frameId: string, bounds: ResizeFrameBounds): Promise<void>;
+  /// Snapshot the token bindings on the supplied node (snake_case
+  /// property → token name). Empty map for unbound nodes.
+  nodeTokenBindings(nodeId: string): Promise<Record<string, string>>;
+  /// Snapshot the resize constraints on the supplied node.
+  nodeConstraints(nodeId: string): Promise<Constraints>;
+  /// Update the resize constraints on the supplied node. Records an
+  /// undoable operation; bounds are not recomputed until the next
+  /// parent resize.
+  setNodeConstraints(
+    nodeId: string,
+    constraints: Constraints,
+  ): Promise<void>;
   setAutoFit(nodeId: string, enabled: boolean): Promise<boolean>;
   pageNumberToken(format: PageNumberFormat): Promise<string>;
   setPageSection(
@@ -4466,6 +4504,84 @@ export interface Phase8Bridge {
   brandKitListVersions(brandKitId: string): Promise<BrandKitVersionInfo[]>;
   brandKitRestoreVersion(versionId: string): Promise<BrandKit>;
   brandKitDiff(beforeId: string, afterId: string): Promise<BrandKitDiff>;
+}
+
+// ---------------------------------------------------------------------
+// Phase 8 (Task 26) — project encryption.
+//
+// Wraps the SQLCipher passphrase / re-key / recovery flows. The
+// renderer never sees raw key material — only passphrases cross the
+// IPC boundary; the bridge derives the key on the Rust side using
+// PBKDF2-HMAC-SHA256 against a per-project salt persisted in
+// `manifest.json`.
+// ---------------------------------------------------------------------
+
+/**
+ * Wire-format mirror of `kcreate_bridge::encryption::EncryptionStatus`.
+ * Reported by `ProjectEncryptionBridge.status()`; when `enabled` is
+ * `false`, the rest of the fields carry stub values (empty salt,
+ * default iteration count) and the renderer should hide the
+ * change-passphrase / export-recovery controls.
+ */
+export interface EncryptionStatus {
+  /** Whether the active project's database is SQLCipher-encrypted. */
+  enabled: boolean;
+  /**
+   * PBKDF2 iteration count in use. Reported even when disabled so
+   * the UI can pre-populate cost-factor sliders for the enable
+   * flow.
+   */
+  iterations: number;
+  /**
+   * Base64 url-safe (no padding) per-project salt. Empty when
+   * `enabled` is `false`.
+   */
+  salt: string;
+}
+
+/**
+ * Phase 8 Task 26 — project encryption bridge. All operations are
+ * scoped to the currently-open project; they fail with a
+ * `DocumentBridgeError::ProjectNotOpen` (surfaced as a JS Error) if
+ * no project is open.
+ */
+export interface ProjectEncryptionBridge {
+  /** Snapshot the current encryption state. */
+  status(): Promise<EncryptionStatus>;
+  /**
+   * Pure passphrase-strength score in `[0, 4]` matching the
+   * standard weak/fair/good/strong/very-strong scale. Does not
+   * touch the workspace.
+   */
+  passphraseStrength(passphrase: string): Promise<number>;
+  /**
+   * Encrypt the active project's database with `passphrase`.
+   * Fails if encryption is already enabled.
+   */
+  enable(passphrase: string): Promise<EncryptionStatus>;
+  /** Rotate the project passphrase. */
+  changePassphrase(
+    oldPassphrase: string,
+    newPassphrase: string,
+  ): Promise<void>;
+  /**
+   * Export a plaintext copy of the project's database to
+   * `outputPath`. The encrypted source is left untouched.
+   */
+  exportPlaintextRecovery(
+    passphrase: string,
+    outputPath: string,
+  ): Promise<string>;
+  /**
+   * Open the OS-native save-file dialog scoped to the plaintext
+   * recovery export (filters to `.sqlite` / `.db`,
+   * `showOverwriteConfirmation` enabled). Returns the absolute
+   * chosen path, or `null` if the user cancelled. Implemented in
+   * the main process so the renderer never sees the user's
+   * filesystem (mirrors the existing `kcreate/pdf/pickFile` /
+   * `kcreate/sketch/pickFile` pattern).
+   */
+  pickRecoveryPath(): Promise<string | null>;
 }
 
 // ---------------------------------------------------------------------

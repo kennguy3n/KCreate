@@ -1636,6 +1636,80 @@ function registerIpcHandlers(): void {
       requireBridge().documentPropagateToken(tokenName),
   );
   ipcMain.handle(
+    "kcreate/phase8/node-token-bindings",
+    (_e, nodeId: string): string =>
+      requireBridge().documentNodeTokenBindings(nodeId),
+  );
+  ipcMain.handle(
+    "kcreate/phase8/node-constraints",
+    (_e, nodeId: string): string =>
+      requireBridge().documentNodeConstraints(nodeId),
+  );
+  ipcMain.handle(
+    "kcreate/phase8/set-node-constraints",
+    (
+      _e,
+      nodeId: string,
+      constraints: unknown,
+    ): void =>
+      requireBridge().documentSetNodeConstraints(
+        nodeId,
+        JSON.stringify(constraints),
+      ),
+  );
+  // -------------------------------------------------------------------
+  // Phase 8 Task 26 — project encryption.
+  // -------------------------------------------------------------------
+  ipcMain.handle(
+    "kcreate/project/encryption/status",
+    (): string => requireBridge().projectEncryptionStatus(),
+  );
+  ipcMain.handle(
+    "kcreate/project/encryption/passphrase-strength",
+    (_e, passphrase: string): number =>
+      requireBridge().projectPassphraseStrength(passphrase),
+  );
+  ipcMain.handle(
+    "kcreate/project/encryption/enable",
+    (_e, passphrase: string): string =>
+      requireBridge().projectEnableEncryption(passphrase),
+  );
+  ipcMain.handle(
+    "kcreate/project/encryption/change-passphrase",
+    (_e, oldPassphrase: string, newPassphrase: string): void =>
+      requireBridge().projectChangePassphrase(oldPassphrase, newPassphrase),
+  );
+  ipcMain.handle(
+    "kcreate/project/encryption/export-plaintext-recovery",
+    (_e, passphrase: string, outputPath: string): string =>
+      requireBridge().projectExportPlaintextRecovery(passphrase, outputPath),
+  );
+  // Native save dialog scoped to the plaintext recovery export. We
+  // keep the picker in the main process (instead of an inline
+  // `<input type="text">` in the renderer) so (a) the renderer
+  // never sees the user's filesystem, (b) the OS handles overwrite-
+  // protection / sandbox prompts / iCloud routing, and (c) the
+  // default filename + extension are pinned in a single place
+  // (mirrors the pattern used by `kcreate/pdf/pickFile` /
+  // `kcreate/sketch/pickFile`). Returns the absolute chosen path,
+  // or `null` if the user cancelled — the panel uses `null` to
+  // short-circuit without showing an error.
+  ipcMain.handle("kcreate/project/encryption/pick-recovery-path", async () => {
+    const win = mainWindow;
+    if (!win) return null;
+    const result = await dialog.showSaveDialog(win, {
+      title: "Export plaintext recovery copy",
+      defaultPath: "recovery.sqlite",
+      filters: [
+        { name: "SQLite database", extensions: ["sqlite", "db"] },
+        { name: "All files", extensions: ["*"] },
+      ],
+      properties: ["showOverwriteConfirmation", "createDirectory"],
+    });
+    if (result.canceled || !result.filePath) return null;
+    return result.filePath;
+  });
+  ipcMain.handle(
     "kcreate/phase8/resize-frame",
     (
       _e,

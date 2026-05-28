@@ -744,8 +744,12 @@ artifact-publishing capabilities the proposal calls for.
       `POST /api/v1/conversations/{id}/artifacts`. Typed DTOs
       (`ArtifactKind`, `ArtifactMetadata`, `ArtifactPublishResult`,
       `ArtifactPublishThumbnail`, `PublishedArtifact`) in
-      `protocol.rs`. Client-side 32 MiB cap via
-      `MAX_ARTIFACT_BYTES`. 11 unit tests + 7 integration tests
+      `protocol.rs`. Client-side 50 MiB cap via
+      `MAX_ARTIFACT_BYTES` (fails fast before the bytes
+      traverse the wire). `ArtifactKind` serialises in
+      `camelCase` so the multi-word `BrandKit` variant lands
+      on the wire as `"brandKit"` in lockstep with the
+      TypeScript mirror. 11 unit tests + 7 integration tests
       in `artifact_round_trip.rs` covering happy path, 401
       token-refresh, 415 unsupported-kind, 413 too-large, 429
       retry, no-thumbnail fallback, and client-side cap.

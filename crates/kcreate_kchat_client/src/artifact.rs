@@ -305,10 +305,14 @@ impl KChatBackendClient {
     }
 }
 
-/// Lower-case text form of [`ArtifactKind`], used by the `kind`
+/// `camelCase` text form of [`ArtifactKind`], used by the `kind`
 /// form field. Mirrors the serde representation so backend
 /// implementations can either parse the string or inspect the
-/// Content-Type — the values must agree.
+/// Content-Type — the values must agree. Single-word variants like
+/// `Png` collapse to plain lowercase; the multi-word `BrandKit`
+/// variant emits `"brandKit"` so the TypeScript mirror in
+/// `apps/desktop/shared/scene.ts` (`KChatArtifactKind`) stays in
+/// lockstep without per-variant overrides.
 const fn kind_text(kind: ArtifactKind) -> &'static str {
     match kind {
         ArtifactKind::Png => "png",
@@ -316,7 +320,7 @@ const fn kind_text(kind: ArtifactKind) -> &'static str {
         ArtifactKind::Pdf => "pdf",
         ArtifactKind::Webp => "webp",
         ArtifactKind::Jpeg => "jpeg",
-        ArtifactKind::BrandKit => "brandkit",
+        ArtifactKind::BrandKit => "brandKit",
     }
 }
 
@@ -415,6 +419,35 @@ mod tests {
         ] {
             assert_eq!(kind.mime(), mime, "{kind:?}");
             assert_eq!(kind.extension(), ext, "{kind:?}");
+        }
+    }
+
+    /// Pins the wire-format text emitted by [`ArtifactKind`] — both
+    /// the serde representation that flows through `ArtifactMetadata`
+    /// JSON and the `kind` multipart form field. The TypeScript
+    /// mirror in `apps/desktop/shared/scene.ts` (`KChatArtifactKind`)
+    /// expects exactly these strings, including `"brandKit"`
+    /// (camelCase, not plain lowercase). A regression in either
+    /// direction would silently mis-classify rich-card previews on
+    /// the renderer side. See Devin Review #20 inline finding
+    /// `BUG_pr-review-job-b22c293062c84a15a9a478c933e39e0d_0001`.
+    #[test]
+    fn artifact_kind_wire_strings_are_camel_case() {
+        for (kind, expected) in [
+            (ArtifactKind::Png, "png"),
+            (ArtifactKind::Svg, "svg"),
+            (ArtifactKind::Pdf, "pdf"),
+            (ArtifactKind::Webp, "webp"),
+            (ArtifactKind::Jpeg, "jpeg"),
+            (ArtifactKind::BrandKit, "brandKit"),
+        ] {
+            let json = serde_json::to_value(kind).expect("serialize");
+            assert_eq!(json, serde_json::Value::String(expected.into()));
+            assert_eq!(kind_text(kind), expected, "{kind:?}");
+            // Round-trip via the publicly-visible wire shape — the
+            // backend echoes the kind back on the publish response.
+            let parsed: ArtifactKind = serde_json::from_value(json).expect("deserialize");
+            assert_eq!(parsed, kind);
         }
     }
 }

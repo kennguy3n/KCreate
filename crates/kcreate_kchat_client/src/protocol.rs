@@ -447,10 +447,13 @@ pub struct BackendErrorBody {
 /// echoed back on the `GET /api/v1/conversations/{id}/artifacts`
 /// list response.
 ///
-/// Values are emitted lowercase to match the surrounding REST
-/// contract (every other enum in this module is `lowercase`).
+/// Values are emitted in `camelCase` — single-word variants like
+/// `Png` collapse to plain lowercase (`"png"`), and the multi-word
+/// `BrandKit` variant emits `"brandKit"` so the TypeScript mirror
+/// (`KChatArtifactKind` in `apps/desktop/shared/scene.ts`) stays in
+/// lockstep without per-variant overrides.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "camelCase")]
 pub enum ArtifactKind {
     /// Rasterised canvas export. Bytes are a PNG image.
     Png,

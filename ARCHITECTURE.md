@@ -932,17 +932,21 @@ methods on `KChatBackendClient`:
 - `publish_artifact(ArtifactPublishParams)` — multipart POST
   to `/api/v1/conversations/{id}/artifacts` carrying the
   artifact bytes, an optional PNG thumbnail, and a JSON
-  `ArtifactMetadata` part. Client-side 32 MiB cap
-  (`MAX_ARTIFACT_BYTES`) prevents oversized uploads; the server
-  may also return 413 `ARTIFACT_TOO_LARGE`.
+  `ArtifactMetadata` part. Client-side 50 MiB cap
+  (`MAX_ARTIFACT_BYTES`) fails fast before the bytes traverse the
+  wire; the server may also return 413 `ARTIFACT_TOO_LARGE` if its
+  own limit is tighter.
 - `list_artifacts(conversation_id)` — GET the published
   artifacts for the renderer's "recent artifacts" pane.
 
 Typed DTOs (`ArtifactKind`, `ArtifactMetadata`,
 `ArtifactPublishResult`, `ArtifactPublishThumbnail`,
 `PublishedArtifact`) live in `protocol.rs`. `ArtifactKind`
-is a flat lowercase enum (`png | svg | pdf | webp | jpeg |
-brandKit`) emitted by serde `#[serde(rename_all = "lowercase")]`.
+is a flat enum (`png | svg | pdf | webp | jpeg | brandKit`)
+emitted by serde `#[serde(rename_all = "camelCase")]` so the
+multi-word `BrandKit` variant lands on the wire as `"brandKit"`
+in lockstep with the TypeScript mirror; single-word variants
+collapse to plain lowercase under `camelCase`.
 
 **Bridge layer** (`kcreate_bridge::kchat_artifact`). Three
 public entry points:

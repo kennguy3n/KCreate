@@ -670,6 +670,41 @@ export interface Bridge {
     radius: number,
   ): void;
   rasterPreviewFilter(nodeId: string, filterJson: string): Buffer;
+  // Phase 8 Block B — perspective transform, HSL adjustment, color
+  // balance adjustment, and mask-aware filter application. Each
+  // mutates the RasterLayer node in place and records an undoable
+  // `Operation`. The mask-aware variant accepts a flat row-major
+  // boolean array whose length must equal `width * height` of the
+  // layer; it composes the filter through a 1-pixel feather kernel
+  // at the mask boundary so the seam does not alias.
+  rasterPerspective(nodeId: string, cornersJson: string): void;
+  rasterApplyHsl(
+    nodeId: string,
+    hue: number,
+    saturation: number,
+    lightness: number,
+  ): void;
+  rasterApplyColorBalance(
+    nodeId: string,
+    shadowsJson: string,
+    midtonesJson: string,
+    highlightsJson: string,
+  ): void;
+  // `mask` is a flat row-major `Buffer` of length
+  // `layer_width * layer_height`. Byte `0` means "not selected";
+  // any non-zero byte means "selected". Crossing the IPC boundary
+  // as bytes (rather than `boolean[]`) avoids per-element
+  // structured-clone work on large masks. The Rust N-API decodes
+  // this via `napi_get_buffer_info`, which only accepts Node
+  // `Buffer` — the preload wraps the renderer-facing `Uint8Array`
+  // with `Buffer.from(buffer, byteOffset, byteLength)` (zero-copy
+  // view over the same ArrayBuffer) before invoking the IPC
+  // channel.
+  rasterApplyFilterMasked(
+    nodeId: string,
+    filterJson: string,
+    mask: Buffer,
+  ): void;
   // Phase 5 — vector path operations + non-destructive effects
   // (Block C Tasks 15, 16, 18). All mutate the VectorLayer's
   // stored geometry (simplify / smooth / offset) or its NodeStyle

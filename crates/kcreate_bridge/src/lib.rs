@@ -1604,6 +1604,86 @@ pub fn raster_preview_filter(node_id: String, filter_json: String) -> NapiResult
     Ok(bytes.into())
 }
 
+/// Apply a 4-corner perspective transform to a raster layer.
+/// `corners_json` must decode to `[[f64; 2]; 4]` in **TL, TR, BL, BR**
+/// order in source-pixel space.
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn raster_perspective(node_id: String, corners_json: String) -> NapiResult<()> {
+    let id = parse_uuid(&node_id)?;
+    let corners: [(f64, f64); 4] = serde_json::from_str(&corners_json)
+        .map_err(|e| NapiError::from_reason(format!("invalid corners JSON: {e}")))?;
+    raster_ops::apply_perspective(id, corners).map_err(map_doc_err)
+}
+
+/// Apply a Hue / Saturation / Lightness adjustment to a raster layer.
+/// `hue` is degrees (`-180.0..=180.0`); `saturation` is a multiplier
+/// (`0.0` flattens to grey, `1.0` is identity); `lightness` is an
+/// additive shift in `[-1.0, 1.0]`.
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn raster_apply_hsl(
+    node_id: String,
+    hue: f64,
+    saturation: f64,
+    lightness: f64,
+) -> NapiResult<()> {
+    let id = parse_uuid(&node_id)?;
+    raster_ops::apply_hsl(id, hue as f32, saturation as f32, lightness as f32).map_err(map_doc_err)
+}
+
+/// Apply a three-way Color Balance adjustment (shadows / midtones /
+/// highlights) to a raster layer. Each triple is `[r, g, b]` in
+/// `[-1.0, 1.0]`; all-zero triples are the identity transform.
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn raster_apply_color_balance(
+    node_id: String,
+    shadows_json: String,
+    midtones_json: String,
+    highlights_json: String,
+) -> NapiResult<()> {
+    let id = parse_uuid(&node_id)?;
+    let parse_triple = |label: &str, src: &str| -> NapiResult<[f32; 3]> {
+        let v: [f64; 3] = serde_json::from_str(src)
+            .map_err(|e| NapiError::from_reason(format!("invalid {label} JSON: {e}")))?;
+        Ok([v[0] as f32, v[1] as f32, v[2] as f32])
+    };
+    let shadows = parse_triple("shadows", &shadows_json)?;
+    let midtones = parse_triple("midtones", &midtones_json)?;
+    let highlights = parse_triple("highlights", &highlights_json)?;
+    raster_ops::apply_color_balance(id, shadows, midtones, highlights).map_err(map_doc_err)
+}
+
+/// Apply a filter to a raster layer only where `mask[i] == true`,
+/// with a 1-pixel feather at the mask boundary. The `mask` argument
+/// is a flat row-major byte buffer (`Uint8Array` from JS); its
+/// length must equal `layer_width * layer_height`. Each byte is
+/// interpreted as a boolean selection predicate: `0` means
+/// "not selected", any non-zero value means "selected". Sending the
+/// mask as bytes (rather than a JS `boolean[]`) avoids the per-
+/// element structured-clone cost — an 8.3 MP 4K mask costs
+/// `8.3 MiB` of typed-array memcpy instead of `~50 MiB` of JS
+/// boolean conversion. `filter_json` decodes to the same
+/// [`PreviewFilter`](raster_ops::PreviewFilter) discriminated union
+/// the live-preview surface uses.
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn raster_apply_filter_masked(
+    node_id: String,
+    filter_json: String,
+    mask: Buffer,
+) -> NapiResult<()> {
+    let id = parse_uuid(&node_id)?;
+    let filter: raster_ops::PreviewFilter = serde_json::from_str(&filter_json)
+        .map_err(|e| NapiError::from_reason(format!("invalid filter JSON: {e}")))?;
+    // `Buffer::as_ref()` borrows the JS-allocated bytes; copy them
+    // into an owned `Vec<u8>` so the workspace lock inside
+    // `apply_filter_masked` can outlive the call.
+    let mask_bytes: Vec<u8> = mask.as_ref().to_vec();
+    raster_ops::apply_filter_masked(id, filter, mask_bytes).map_err(map_doc_err)
+}
+
 // -----------------------------------------------------------------------------
 // Phase 5 — vector path operations + non-destructive effects.
 // All logic lives in `vector_ops.rs`; these are thin N-API marshallers.

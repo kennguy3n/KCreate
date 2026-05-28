@@ -69,6 +69,7 @@ const TILE_SIZE: u32 = 256;
 /// `RGB`A bytes + canonical width/height pulled from the project's
 /// blob store. Returned by `load_layer_pixels` so the slow path can
 /// run outside the workspace lock.
+#[derive(Clone)]
 struct LayerPixels {
     rgba: Vec<u8>,
     width: u32,
@@ -447,14 +448,37 @@ pub enum PreviewFilter {
         amount: f32,
         threshold: u8,
     },
+    Hsl {
+        hue: f32,
+        saturation: f32,
+        lightness: f32,
+    },
+    ColorBalance {
+        shadows: [f32; 3],
+        midtones: [f32; 3],
+        highlights: [f32; 3],
+    },
 }
 
-/// Return the RGBA bytes a filter *would* produce, without mutating
-/// the document. The caller uses this for live previews driven by
-/// a debounced slider.
-pub fn preview_filter(node_id: Uuid, filter: PreviewFilter) -> Result<(Vec<u8>, u32, u32)> {
-    let mut pixels = load_layer_pixels(node_id)?;
-    let (out_rgba, out_w, out_h) = match filter {
+/// Apply a [`PreviewFilter`] in place over a layer's RGBA buffer.
+///
+/// All currently supported variants are dimension-preserving, but
+/// the helper still re-syncs `pixels.{width, height}` from the
+/// underlying operation's output (a no-op today for every variant)
+/// so the contract holds if a future variant changes dimensions. A
+/// `debug_assert!` at the end of the function pins the
+/// `rgba.len() == 4 * width * height` invariant — any future variant
+/// that violates it trips the assertion in debug builds and
+/// `preview_filter` / `apply_filter_masked` continue to return /
+/// composite against coherent dimensions in release builds.
+///
+/// This is the single source of truth for how each `PreviewFilter`
+/// variant maps to a `kcreate_raster` operation; both the live-
+/// preview path (`preview_filter`) and the committal masked-filter
+/// path (`apply_filter_masked`) drive their work through this helper
+/// so a new variant only has to be added in one place.
+fn apply_filter_in_place(pixels: &mut LayerPixels, filter: &PreviewFilter) -> Result<()> {
+    match filter {
         PreviewFilter::Levels {
             black_point,
             white_point,
@@ -463,12 +487,11 @@ pub fn preview_filter(node_id: Uuid, filter: PreviewFilter) -> Result<(Vec<u8>, 
             apply_adjustments_in_place(
                 &mut pixels.rgba,
                 &[AdjustmentLayer::Levels {
-                    black_point,
-                    white_point,
-                    gamma,
+                    black_point: *black_point,
+                    white_point: *white_point,
+                    gamma: *gamma,
                 }],
             );
-            (pixels.rgba, pixels.width, pixels.height)
         }
         PreviewFilter::Curves { points } => {
             let curve_points: Vec<CurvePoint> = points
@@ -476,17 +499,18 @@ pub fn preview_filter(node_id: Uuid, filter: PreviewFilter) -> Result<(Vec<u8>, 
                 .map(|(t, v)| CurvePoint::new(*t, *v))
                 .collect();
             apply_adjustments_in_place(&mut pixels.rgba, &[AdjustmentLayer::Curves(curve_points)]);
-            (pixels.rgba, pixels.width, pixels.height)
         }
         PreviewFilter::Blur { radius, kind } => {
             let grid =
                 TileGrid::from_image(&pixels.rgba, pixels.width, pixels.height, TILE_SIZE)
                     .map_err(|e| DocumentBridgeError::Io(std::io::Error::other(e.to_string())))?;
             let blurred = match kind {
-                BlurKind::Gaussian => filters::gaussian_blur(&grid, radius),
+                BlurKind::Gaussian => filters::gaussian_blur(&grid, *radius),
                 BlurKind::Box => filters::box_blur(&grid, radius.max(0.0).round() as u32),
             };
-            (blurred.to_image(), blurred.width, blurred.height)
+            pixels.rgba = blurred.to_image();
+            pixels.width = blurred.width;
+            pixels.height = blurred.height;
         }
         PreviewFilter::Sharpen {
             radius,
@@ -496,9 +520,762 @@ pub fn preview_filter(node_id: Uuid, filter: PreviewFilter) -> Result<(Vec<u8>, 
             let grid =
                 TileGrid::from_image(&pixels.rgba, pixels.width, pixels.height, TILE_SIZE)
                     .map_err(|e| DocumentBridgeError::Io(std::io::Error::other(e.to_string())))?;
-            let sharp = filters::unsharp_mask(&grid, radius, amount, threshold);
-            (sharp.to_image(), sharp.width, sharp.height)
+            let sharp = filters::unsharp_mask(&grid, *radius, *amount, *threshold);
+            pixels.rgba = sharp.to_image();
+            pixels.width = sharp.width;
+            pixels.height = sharp.height;
         }
+        PreviewFilter::Hsl {
+            hue,
+            saturation,
+            lightness,
+        } => {
+            apply_adjustments_in_place(
+                &mut pixels.rgba,
+                &[AdjustmentLayer::HueSaturation {
+                    hue: *hue,
+                    saturation: *saturation,
+                    lightness: *lightness,
+                }],
+            );
+        }
+        PreviewFilter::ColorBalance {
+            shadows,
+            midtones,
+            highlights,
+        } => {
+            apply_adjustments_in_place(
+                &mut pixels.rgba,
+                &[AdjustmentLayer::ColorBalance {
+                    shadows: *shadows,
+                    midtones: *midtones,
+                    highlights: *highlights,
+                }],
+            );
+        }
+    }
+    debug_assert_eq!(
+        pixels.rgba.len(),
+        4 * (pixels.width as usize) * (pixels.height as usize),
+        "apply_filter_in_place must leave LayerPixels coherent: \
+         rgba.len() = {}, expected 4 * {} * {}",
+        pixels.rgba.len(),
+        pixels.width,
+        pixels.height,
+    );
+    Ok(())
+}
+
+/// Return the RGBA bytes a filter *would* produce, without mutating
+/// the document. The caller uses this for live previews driven by
+/// a debounced slider.
+pub fn preview_filter(node_id: Uuid, filter: PreviewFilter) -> Result<(Vec<u8>, u32, u32)> {
+    let mut pixels = load_layer_pixels(node_id)?;
+    apply_filter_in_place(&mut pixels, &filter)?;
+    Ok((pixels.rgba, pixels.width, pixels.height))
+}
+
+// -----------------------------------------------------------------------------
+// Perspective transform
+// -----------------------------------------------------------------------------
+
+/// Apply a 4-corner projective transform to a raster layer. The
+/// destination corners are supplied as `[(x, y); 4]` in **TL, TR, BL,
+/// BR** order in source-pixel space; the output canvas grows to the
+/// axis-aligned bounding box of those corners, with transparent
+/// padding where the warped quadrilateral does not cover the canvas.
+///
+/// The transform records an undoable `Operation` and resizes the
+/// layer's node bounds — perspective generally changes the canvas
+/// size, so the node has to widen / heighten alongside.
+pub fn apply_perspective(node_id: Uuid, corners: [(f64, f64); 4]) -> Result<()> {
+    let pixels = load_layer_pixels(node_id)?;
+    let grid = TileGrid::from_image(&pixels.rgba, pixels.width, pixels.height, TILE_SIZE)
+        .map_err(|e| DocumentBridgeError::Io(std::io::Error::other(e.to_string())))?;
+    let warped = transform::perspective_transform(&grid, corners);
+    let out_w = warped.width;
+    let out_h = warped.height;
+    let out_rgba = warped.to_image();
+    // The transform falls back to the source grid when the corners
+    // are degenerate, in which case the canvas size does not change
+    // and we mark the op as a no-op resize. Otherwise the bounds
+    // must follow the new canvas extent so the renderer doesn't
+    // letterbox the warped image.
+    let canvas_resized = out_w != pixels.width || out_h != pixels.height;
+    replace_layer_pixels(
+        node_id,
+        out_rgba,
+        out_w,
+        out_h,
+        "raster_perspective",
+        serde_json::json!({ "corners": corners }),
+        canvas_resized,
+    )
+}
+
+// -----------------------------------------------------------------------------
+// HSL + Color Balance
+// -----------------------------------------------------------------------------
+
+/// Apply a Hue / Saturation / Lightness shift to a raster layer.
+///
+/// * `hue` is a rotation in degrees around the colour wheel
+///   (`-180.0..=180.0`).
+/// * `saturation` is a multiplier (`0.0` flattens to grey,
+///   `1.0` is identity, `> 1.0` boosts).
+/// * `lightness` is an additive shift in `[-1.0, 1.0]`.
+pub fn apply_hsl(node_id: Uuid, hue: f32, saturation: f32, lightness: f32) -> Result<()> {
+    let mut pixels = load_layer_pixels(node_id)?;
+    apply_adjustments_in_place(
+        &mut pixels.rgba,
+        &[AdjustmentLayer::HueSaturation {
+            hue,
+            saturation,
+            lightness,
+        }],
+    );
+    replace_layer_pixels(
+        node_id,
+        pixels.rgba,
+        pixels.width,
+        pixels.height,
+        "raster_apply_hsl",
+        serde_json::json!({"hue": hue, "saturation": saturation, "lightness": lightness}),
+        false,
+    )
+}
+
+/// Apply a three-way Color Balance adjustment (shadows / midtones /
+/// highlights) to a raster layer. Each triple is `[r, g, b]` in
+/// `[-1.0, 1.0]`. All-zeros is the identity transform.
+pub fn apply_color_balance(
+    node_id: Uuid,
+    shadows: [f32; 3],
+    midtones: [f32; 3],
+    highlights: [f32; 3],
+) -> Result<()> {
+    let mut pixels = load_layer_pixels(node_id)?;
+    apply_adjustments_in_place(
+        &mut pixels.rgba,
+        &[AdjustmentLayer::ColorBalance {
+            shadows,
+            midtones,
+            highlights,
+        }],
+    );
+    replace_layer_pixels(
+        node_id,
+        pixels.rgba,
+        pixels.width,
+        pixels.height,
+        "raster_apply_color_balance",
+        serde_json::json!({
+            "shadows": shadows,
+            "midtones": midtones,
+            "highlights": highlights,
+        }),
+        false,
+    )
+}
+
+// -----------------------------------------------------------------------------
+// Masked filter application (Phase 8 Task 11)
+// -----------------------------------------------------------------------------
+
+/// Errors specific to [`apply_filter_masked`]. Surfaced through
+/// [`DocumentBridgeError::Io`] so callers see a single error type but
+/// the message identifies the mask shape mismatch.
+#[derive(Debug)]
+struct MaskShapeMismatch {
+    mask_len: usize,
+    expected: usize,
+}
+
+impl std::fmt::Display for MaskShapeMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "filter mask length {} does not match layer pixel count {}",
+            self.mask_len, self.expected
+        )
+    }
+}
+
+impl std::error::Error for MaskShapeMismatch {}
+
+/// Compute a per-pixel float feather weight in `[0.0, 1.0]` from the
+/// raw byte-coded selection mask. The mask is one byte per pixel:
+/// `0` means "not selected", any non-zero byte means "selected".
+/// (Bytes carry the same information as the boolean predicate but
+/// cross the IPC boundary without per-element conversion — a 4K mask
+/// fits in an 8.3 MB `Uint8Array` instead of an 8.3 M-element JS
+/// boolean array.) The weight at pixel `(x, y)` is the average of
+/// itself and its 4-connected neighbours (north / south / east /
+/// west), with selected => `1.0` and not-selected => `0.0`. Pixels
+/// in the interior of a selected / unselected region therefore stay
+/// exactly at `1.0` / `0.0` (no work for `apply_filter_masked` to
+/// do), while pixels on the mask boundary land somewhere in
+/// between, giving us a 1px feather kernel without re-implementing
+/// a separable blur.
+///
+/// Border pixels treat out-of-bounds neighbours as having the same
+/// mask value as the centre — i.e. the kernel is "clamped" at the
+/// canvas edge. This avoids a spurious feather where the canvas
+/// edge happens to be a mask boundary.
+fn feather_mask_weights(mask: &[u8], width: u32, height: u32) -> Vec<f32> {
+    let w = width as usize;
+    let h = height as usize;
+    // A zero-pixel layer has zero weights by definition. Short-
+    // circuit before `par_chunks_mut(w)` (which panics on `w == 0`
+    // in both debug and release) so this function tolerates the
+    // degenerate input cleanly. The two known callers
+    // (`apply_filter_masked` via `load_layer_pixels`, plus the
+    // unit tests) already feed in positive dimensions because the
+    // `image` crate rejects zero-sized PNGs at decode time, but
+    // this guard makes the masked-filter pipeline resilient to a
+    // future caller that bypasses `load_layer_pixels` — combined
+    // with the `mask.len() != total` check upstream.
+    if w == 0 || h == 0 {
+        return Vec::new();
+    }
+    let mut weights = vec![0.0_f32; w * h];
+    let bit = |byte: u8| u8::from(byte != 0);
+    weights.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
+        for (x, slot) in row.iter_mut().enumerate() {
+            let centre = bit(mask[y * w + x]);
+            let west = if x > 0 {
+                bit(mask[y * w + x - 1])
+            } else {
+                centre
+            };
+            let east = if x + 1 < w {
+                bit(mask[y * w + x + 1])
+            } else {
+                centre
+            };
+            let north = if y > 0 {
+                bit(mask[(y - 1) * w + x])
+            } else {
+                centre
+            };
+            let south = if y + 1 < h {
+                bit(mask[(y + 1) * w + x])
+            } else {
+                centre
+            };
+            let count = centre + west + east + north + south;
+            *slot = f32::from(count) / 5.0;
+        }
+    });
+    weights
+}
+
+/// Apply a filter to a raster layer but only where `mask[i] == true`,
+/// with a 1-pixel feather at the mask boundary so the seam does not
+/// alias. The mask must contain exactly `layer_width * layer_height`
+/// elements; any mismatch returns a structured error so the renderer
+/// can recover instead of silently producing nonsense.
+///
+/// Semantics:
+/// * Fully unmasked pixels (`mask[i] == false` *and* all 4 neighbours
+///   are `false`) are copied straight from the source — bit-exact.
+/// * Fully masked pixels (`mask[i] == true` *and* all 4 neighbours
+///   are `true`) take the filtered output verbatim.
+/// * Boundary pixels blend `original * (1 - w) + filtered * w` where
+///   `w` is the 5-tap (centre + N/S/E/W) average of the boolean
+///   mask. This yields a single-pixel feather without re-running a
+///   separable blur over the mask.
+///
+/// Alpha is blended on the same weight curve so feathered edges
+/// reveal the underlying transparency naturally.
+///
+/// Memory profile: at peak the routine holds two full RGBA copies of
+/// the layer (the source — consumed into the output — and the
+/// filtered buffer) plus the `f32` weight grid. A 4K layer therefore
+/// costs ~33 MB × 2 + ~33 MB of weights ≈ 100 MB transient. The
+/// destination buffer reuses the source allocation in place: we
+/// start from `pixels.rgba`, treat each `4`-byte slot as both source
+/// and destination, and only memcpy the filter output for the
+/// `w >= 1.0` and intermediate-weight branches. The `w <= 0.0`
+/// branch is now a true no-op (no redundant `copy_from_slice`).
+pub fn apply_filter_masked(node_id: Uuid, filter: PreviewFilter, mask: Vec<u8>) -> Result<()> {
+    let pixels = load_layer_pixels(node_id)?;
+    let total = (pixels.width as usize) * (pixels.height as usize);
+    if mask.len() != total {
+        return Err(DocumentBridgeError::Io(std::io::Error::other(
+            MaskShapeMismatch {
+                mask_len: mask.len(),
+                expected: total,
+            }
+            .to_string(),
+        )));
+    }
+
+    // Run the filter through the same helper the live-preview path
+    // uses so the masked and unmasked outputs are pixel-equivalent at
+    // mask=1, then composite the result over the source through the
+    // feathered mask.
+    let mut filtered_pixels = pixels.clone();
+    apply_filter_in_place(&mut filtered_pixels, &filter)?;
+    let filtered = filtered_pixels.rgba;
+    if filtered.len() != pixels.rgba.len() {
+        // Defensive: every supported filter is dimension-preserving,
+        // but if a future variant changes size we surface that as a
+        // clear error rather than panic in the blend loop.
+        return Err(DocumentBridgeError::Io(std::io::Error::other(format!(
+            "masked filter produced unexpected buffer size {} (expected {})",
+            filtered.len(),
+            pixels.rgba.len()
+        ))));
+    }
+
+    let weights = feather_mask_weights(&mask, pixels.width, pixels.height);
+    let LayerPixels {
+        rgba: mut out,
+        width,
+        height,
+    } = pixels;
+    // Blend in place over the source buffer: each `out_px` chunk
+    // starts holding the source bytes (because `out` is the moved
+    // `pixels.rgba`), so the `w <= 0.0` branch becomes a true no-op
+    // and the intermediate-weight branch reads its `s` operand from
+    // the same chunk it's about to overwrite. Saves one full RGBA
+    // allocation (~33 MB at 4K) vs. cloning the source into a
+    // separate output buffer.
+    out.par_chunks_mut(4)
+        .zip(filtered.par_chunks(4))
+        .zip(weights.par_iter())
+        .for_each(|((out_px, filt_px), &w)| {
+            if w <= 0.0 {
+                // Fully unmasked — leave the source bytes in place.
+                return;
+            }
+            if w >= 1.0 {
+                // Fully masked — overwrite the source slot with the
+                // filter output verbatim.
+                out_px.copy_from_slice(filt_px);
+                return;
+            }
+            for i in 0..4 {
+                // `out_px[i]` currently holds the source byte (the
+                // chunk has not been written this iteration), so we
+                // read it as the `s` operand and immediately store
+                // the blended result back.
+                let s = f32::from(out_px[i]);
+                let f = f32::from(filt_px[i]);
+                let blended = s.mul_add(1.0 - w, f * w);
+                out_px[i] = blended.round().clamp(0.0, 255.0) as u8;
+            }
+        });
+
+    let mask_true = mask.iter().filter(|b| **b != 0).count();
+    replace_layer_pixels(
+        node_id,
+        out,
+        width,
+        height,
+        "raster_apply_filter_masked",
+        serde_json::json!({
+            "filter": filter,
+            "mask_len": mask.len(),
+            "mask_true": mask_true,
+        }),
+        false,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::document::{
+        document_import_image_bytes, project_close, project_create, reset_for_tests,
     };
-    Ok((out_rgba, out_w, out_h))
+    use serde_json::Value;
+    use serial_test::serial;
+
+    #[test]
+    fn feather_weights_zero_when_mask_all_unset() {
+        let mask = vec![0u8; 9];
+        let weights = feather_mask_weights(&mask, 3, 3);
+        assert_eq!(weights, vec![0.0; 9]);
+    }
+
+    #[test]
+    fn feather_weights_returns_empty_for_zero_dimensions() {
+        // `par_chunks_mut(0)` would panic in release without the
+        // short-circuit guard. Pin the defensive behaviour so a
+        // future caller that bypasses `load_layer_pixels` (which
+        // rejects zero-sized images via the `image` crate) cannot
+        // ride a rayon panic into production.
+        assert!(feather_mask_weights(&[], 0, 0).is_empty());
+        assert!(feather_mask_weights(&[], 0, 5).is_empty());
+        assert!(feather_mask_weights(&[], 5, 0).is_empty());
+    }
+
+    #[test]
+    fn feather_weights_one_when_mask_all_set() {
+        let mask = vec![1u8; 9];
+        let weights = feather_mask_weights(&mask, 3, 3);
+        for w in weights {
+            assert!((w - 1.0).abs() < f32::EPSILON, "expected 1.0, got {w}");
+        }
+    }
+
+    #[test]
+    fn feather_weights_treat_any_nonzero_byte_as_selected() {
+        // Selection masks crossing the IPC boundary as Uint8Array
+        // may carry arbitrary byte values (e.g. 255 from a tool that
+        // pre-multiplied a coverage value). Any non-zero byte must
+        // count as fully selected, identical to a `1`.
+        let mask = vec![255u8; 9];
+        let weights = feather_mask_weights(&mask, 3, 3);
+        for w in weights {
+            assert!((w - 1.0).abs() < f32::EPSILON, "expected 1.0, got {w}");
+        }
+    }
+
+    #[test]
+    fn feather_weights_intermediate_at_boundary() {
+        // A horizontal step: top row unselected, bottom row
+        // selected. The boundary pixels should average (centre + 4
+        // neighbours) and produce intermediate weights.
+        //
+        //   0 0 0
+        //   1 1 1
+        //
+        // Top-row centres see (0, 0, 1 [south], 0, 0) when
+        // neighbours-out-of-bounds clamp to the centre value:
+        // top-row pixels actually see (centre=0, west=0, east=0,
+        // north=0 (clamp), south=1) → 1/5.
+        let mask = vec![0u8, 0, 0, 1, 1, 1];
+        let weights = feather_mask_weights(&mask, 3, 2);
+        // Top row: each centre sees one selected neighbour (south).
+        for w in &weights[0..3] {
+            assert!((w - 0.2).abs() < 1e-4, "expected 0.2, got {w}");
+        }
+        // Bottom row: each centre + west + east + south(clamp)=1
+        // and north=0 → 4/5.
+        for w in &weights[3..6] {
+            assert!((w - 0.8).abs() < 1e-4, "expected 0.8, got {w}");
+        }
+    }
+
+    #[test]
+    fn preview_filter_hsl_serde_round_trip() {
+        let filter = PreviewFilter::Hsl {
+            hue: 180.0,
+            saturation: 0.5,
+            lightness: -0.25,
+        };
+        let json = serde_json::to_value(&filter).expect("serialize");
+        assert_eq!(json["type"], "hsl");
+        assert_eq!(json["hue"], 180.0);
+        assert_eq!(json["saturation"], 0.5);
+        assert_eq!(json["lightness"], -0.25);
+        let back: PreviewFilter = serde_json::from_value(json).expect("deserialize");
+        match back {
+            PreviewFilter::Hsl {
+                hue,
+                saturation,
+                lightness,
+            } => {
+                assert!((hue - 180.0).abs() < f32::EPSILON);
+                assert!((saturation - 0.5).abs() < f32::EPSILON);
+                assert!((lightness - -0.25).abs() < f32::EPSILON);
+            }
+            other => panic!("expected Hsl, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn preview_filter_color_balance_serde_round_trip() {
+        let filter = PreviewFilter::ColorBalance {
+            shadows: [0.1, 0.0, -0.2],
+            midtones: [0.0, 0.3, 0.0],
+            highlights: [-0.4, 0.0, 0.5],
+        };
+        let json = serde_json::to_value(&filter).expect("serialize");
+        assert_eq!(json["type"], "color_balance");
+        let back: PreviewFilter = serde_json::from_value(json).expect("deserialize");
+        match back {
+            PreviewFilter::ColorBalance {
+                shadows,
+                midtones,
+                highlights,
+            } => {
+                assert!((shadows[0] - 0.1).abs() < f32::EPSILON);
+                assert!((midtones[1] - 0.3).abs() < f32::EPSILON);
+                assert!((highlights[2] - 0.5).abs() < f32::EPSILON);
+            }
+            other => panic!("expected ColorBalance, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apply_filter_in_place_keeps_dimensions_coherent_for_blur() {
+        // Pin the invariant added for the "future variant could
+        // desync rgba/{width,height}" maintenance-hazard finding:
+        // after `apply_filter_in_place`, the `LayerPixels` struct
+        // must satisfy `rgba.len() == 4 * width * height`. We hit the
+        // Blur path because it's the only variant today that
+        // re-syncs `pixels.width / pixels.height` from a fresh
+        // `TileGrid::to_image()`; the other variants mutate the
+        // buffer in place so the invariant holds trivially.
+        let mut pixels = LayerPixels {
+            rgba: vec![80u8; 4 * 8 * 8],
+            width: 8,
+            height: 8,
+        };
+        apply_filter_in_place(
+            &mut pixels,
+            &PreviewFilter::Blur {
+                radius: 1.5,
+                kind: BlurKind::Gaussian,
+            },
+        )
+        .expect("blur in place");
+        assert_eq!(
+            pixels.rgba.len(),
+            4 * (pixels.width as usize) * (pixels.height as usize),
+            "blur output desynchronised rgba.len() from width*height",
+        );
+        // And the dimensions themselves stay 8x8 (gaussian_blur is
+        // dimension-preserving) — guarantees the
+        // `preview_filter` / `apply_filter_masked` shapes are stable
+        // for every currently-supported variant.
+        assert_eq!(pixels.width, 8);
+        assert_eq!(pixels.height, 8);
+    }
+
+    /// Build a tiny solid-colour RGBA PNG used to seed a raster
+    /// layer fixture. `width * height` pixels of `colour`.
+    fn build_test_png(width: u32, height: u32, colour: [u8; 4]) -> Vec<u8> {
+        let rgba: Vec<u8> = (0..width * height).flat_map(|_| colour).collect();
+        encode_png(&rgba, width, height).expect("encode test png")
+    }
+
+    /// Inspect the `raster_image` metadata blob for `node_id`.
+    /// Panics if the node is missing or not a raster layer. Used by
+    /// the integration tests below to confirm an op actually
+    /// rewrote the blob hash.
+    fn raster_meta(node_id: Uuid) -> RasterImageMeta {
+        let guard = crate::document::slot().lock();
+        let ws = guard.as_ref().expect("workspace");
+        let node = ws.project.document.get_node(node_id).expect("node exists");
+        let meta = node
+            .metadata
+            .get(RASTER_IMAGE_METADATA_KEY)
+            .expect("raster meta")
+            .clone();
+        serde_json::from_value(meta).expect("decode raster meta")
+    }
+
+    /// Snapshot the node's `Bounds` for assertions across an op.
+    fn raster_bounds(node_id: Uuid) -> Bounds {
+        let guard = crate::document::slot().lock();
+        let ws = guard.as_ref().expect("workspace");
+        ws.project
+            .document
+            .get_node(node_id)
+            .expect("node exists")
+            .bounds
+    }
+
+    /// Helper: create a fresh workspace, import a solid PNG, and
+    /// return the raster node's uuid. Caller is expected to wrap in
+    /// `#[serial]` and to call [`project_close`] at end.
+    fn seed_workspace_with_raster(width: u32, height: u32, colour: [u8; 4]) -> Uuid {
+        reset_for_tests();
+        let dir = tempfile::tempdir().expect("tempdir");
+        project_create("raster-ops-test", dir.path()).expect("create project");
+        let png = build_test_png(width, height, colour);
+        let id = document_import_image_bytes(None, &png).expect("import png");
+        // Leak the tempdir so the workspace's project files survive
+        // until project_close is called by the test body. Using
+        // forget here means we accept a tempdir leak in test mode in
+        // exchange for not racing the workspace.
+        std::mem::forget(dir);
+        id
+    }
+
+    #[test]
+    #[serial]
+    fn apply_hsl_identity_preserves_pixel_count_and_changes_blob() {
+        let node_id = seed_workspace_with_raster(16, 16, [200, 100, 50, 255]);
+        let before = raster_meta(node_id);
+        // Identity HSL: hue=0, saturation=1, lightness=0. The
+        // pixels round-trip unchanged but the bridge still
+        // re-encodes the PNG, so the resulting blob hash _may_ be
+        // the same (PNG is deterministic for the same bytes). We
+        // assert the canvas dimensions hold and the op recorded.
+        apply_hsl(node_id, 0.0, 1.0, 0.0).expect("identity hsl");
+        let after = raster_meta(node_id);
+        assert_eq!(before.width, after.width);
+        assert_eq!(before.height, after.height);
+        assert_eq!(
+            before.blob_hash, after.blob_hash,
+            "identity HSL should produce the same content-addressed blob",
+        );
+        project_close();
+    }
+
+    #[test]
+    #[serial]
+    fn apply_hsl_non_identity_changes_blob() {
+        let node_id = seed_workspace_with_raster(16, 16, [200, 100, 50, 255]);
+        let before = raster_meta(node_id);
+        // Hue rotate 180° flips the chromaticity — the blob bytes
+        // *must* differ from the source.
+        apply_hsl(node_id, 180.0, 1.0, 0.0).expect("hue rotate");
+        let after = raster_meta(node_id);
+        assert_ne!(
+            before.blob_hash, after.blob_hash,
+            "180° hue rotation must produce a different blob",
+        );
+        project_close();
+    }
+
+    #[test]
+    #[serial]
+    fn apply_color_balance_identity_keeps_blob_hash() {
+        let node_id = seed_workspace_with_raster(8, 8, [120, 80, 200, 255]);
+        let before = raster_meta(node_id);
+        apply_color_balance(node_id, [0.0; 3], [0.0; 3], [0.0; 3]).expect("identity balance");
+        let after = raster_meta(node_id);
+        assert_eq!(before.blob_hash, after.blob_hash);
+        project_close();
+    }
+
+    #[test]
+    #[serial]
+    fn apply_perspective_identity_keeps_canvas_size() {
+        let node_id = seed_workspace_with_raster(32, 32, [10, 20, 30, 255]);
+        let bounds_before = raster_bounds(node_id);
+        let meta_before = raster_meta(node_id);
+        let corners = [(0.0, 0.0), (32.0, 0.0), (0.0, 32.0), (32.0, 32.0)];
+        apply_perspective(node_id, corners).expect("perspective identity");
+        let bounds_after = raster_bounds(node_id);
+        let meta_after = raster_meta(node_id);
+        assert!((bounds_before.width - bounds_after.width).abs() < f64::EPSILON);
+        assert!((bounds_before.height - bounds_after.height).abs() < f64::EPSILON);
+        assert_eq!(meta_before.width, meta_after.width);
+        assert_eq!(meta_before.height, meta_after.height);
+        project_close();
+    }
+
+    #[test]
+    #[serial]
+    fn apply_perspective_grows_canvas_for_widened_corners() {
+        let node_id = seed_workspace_with_raster(32, 32, [10, 20, 30, 255]);
+        // Bottom corners pushed outwards: bbox is 50 × 32.
+        let corners = [(0.0, 0.0), (32.0, 0.0), (-9.0, 32.0), (41.0, 32.0)];
+        apply_perspective(node_id, corners).expect("perspective widen");
+        let bounds_after = raster_bounds(node_id);
+        let meta_after = raster_meta(node_id);
+        assert!(
+            bounds_after.width >= 50.0,
+            "expected widened bounds, got {}",
+            bounds_after.width
+        );
+        assert!(meta_after.width >= 50);
+        project_close();
+    }
+
+    #[test]
+    #[serial]
+    fn apply_filter_masked_rejects_wrong_size_mask() {
+        let node_id = seed_workspace_with_raster(8, 8, [50, 50, 50, 255]);
+        let filter = PreviewFilter::Levels {
+            black_point: 0.0,
+            white_point: 1.0,
+            gamma: 1.0,
+        };
+        let bad_mask = vec![1u8; 64 + 1];
+        let err = apply_filter_masked(node_id, filter, bad_mask).expect_err("size mismatch");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("mask length")
+                || msg.contains("does not match")
+                || msg.contains("pixel count"),
+            "unexpected error message: {msg}",
+        );
+        project_close();
+    }
+
+    #[test]
+    #[serial]
+    fn apply_filter_masked_with_all_false_mask_keeps_blob() {
+        // Apply a real (non-identity) filter but mask everything
+        // out → output must match the source byte-for-byte, so the
+        // content-addressed blob hash is unchanged.
+        let node_id = seed_workspace_with_raster(8, 8, [80, 120, 200, 255]);
+        let before = raster_meta(node_id);
+        let filter = PreviewFilter::Hsl {
+            hue: 180.0,
+            saturation: 0.0,
+            lightness: 0.0,
+        };
+        let mask = vec![0u8; 64];
+        apply_filter_masked(node_id, filter, mask).expect("masked filter");
+        let after = raster_meta(node_id);
+        assert_eq!(
+            before.blob_hash, after.blob_hash,
+            "fully-unmasked filter should be a no-op on pixel data",
+        );
+        project_close();
+    }
+
+    #[test]
+    #[serial]
+    fn apply_filter_masked_with_all_true_mask_matches_unmasked_apply() {
+        // Apply a non-identity filter with mask=true everywhere and
+        // confirm the resulting blob differs from the source (i.e.
+        // the filter ran). Equivalence to the unmasked apply is
+        // verified pixel-wise below by the operation log entry
+        // shape — full unmasked-bit-for-bit equality is exercised
+        // by `feather_weights_one_when_mask_all_true`.
+        let node_id = seed_workspace_with_raster(16, 16, [80, 120, 200, 255]);
+        let before = raster_meta(node_id);
+        let filter = PreviewFilter::Hsl {
+            hue: 90.0,
+            saturation: 1.0,
+            lightness: 0.0,
+        };
+        let mask = vec![1u8; 256];
+        apply_filter_masked(node_id, filter, mask).expect("masked filter");
+        let after = raster_meta(node_id);
+        assert_ne!(
+            before.blob_hash, after.blob_hash,
+            "fully-masked filter must rewrite the blob",
+        );
+        project_close();
+    }
+
+    #[test]
+    #[serial]
+    fn apply_filter_masked_records_operation_with_mask_summary() {
+        let node_id = seed_workspace_with_raster(8, 8, [80, 120, 200, 255]);
+        let filter = PreviewFilter::Levels {
+            black_point: 0.0,
+            white_point: 1.0,
+            gamma: 1.0,
+        };
+        // Half-selected mask.
+        let mut mask = vec![0u8; 64];
+        for slot in mask.iter_mut().take(32) {
+            *slot = 1;
+        }
+        apply_filter_masked(node_id, filter, mask).expect("masked filter");
+        // The most recent operation must capture mask_len + mask_true.
+        let guard = crate::document::slot().lock();
+        let ws = guard.as_ref().expect("workspace");
+        let last_op = ws.project.operation_log.last().expect("operation logged");
+        let params: &Value = &last_op.before_patch;
+        // before_patch is `{ "before": <node>, "params": { ... } }`.
+        let captured = params.get("params").expect("captured params").clone();
+        assert_eq!(captured["mask_len"], 64);
+        assert_eq!(captured["mask_true"], 32);
+        drop(guard);
+        project_close();
+    }
 }

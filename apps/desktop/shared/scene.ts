@@ -3785,6 +3785,119 @@ export interface KChatRosterSyncResult {
 /// Mirrors `kcreate_bridge::collab::CollabPermission`.
 export type CollabPermission = "editor" | "viewer";
 
+// -----------------------------------------------------------------------------
+// Phase 8 — KChat artifact publishing (Block A, Tasks 1–3)
+// -----------------------------------------------------------------------------
+
+/// Wire format of an artifact published to a KChat conversation.
+/// Mirrors `kcreate_kchat_client::ArtifactKind` — keep the lowercase
+/// strings in lockstep with the Rust `#[serde(rename_all = "lowercase")]`
+/// emission.
+export type KChatArtifactKind =
+  | "png"
+  | "svg"
+  | "pdf"
+  | "webp"
+  | "jpeg"
+  | "brandKit";
+
+/// Structured metadata stamped onto a published artifact. Mirrors
+/// `kcreate_kchat_client::ArtifactMetadata`. The renderer paints
+/// the rich-card preview directly from this without re-fetching
+/// the artifact bytes.
+export interface KChatArtifactMetadata {
+  /// Originating project name (verbatim).
+  projectName: string;
+  /// Originating page / artboard name, or brand-kit name for
+  /// `brandKit` uploads. `undefined` for whole-project uploads.
+  artboardName?: string;
+  /// Free-form preset label echoed onto the rich-card chip
+  /// (e.g. `"PNG @1x"`, `"PDF A4 300dpi"`).
+  exportPreset?: string;
+  /// Rasterised pixel dimensions. `undefined` for vector-only
+  /// formats (SVG, PDF) and `.kbrand`.
+  widthPx?: number;
+  heightPx?: number;
+  /// Source project id (UUID string).
+  projectId: string;
+  /// Wire format of the artifact bytes.
+  kind: KChatArtifactKind;
+}
+
+/// Response from `KChatBackendBridge.publishArtifact` /
+/// `publishBrandKit`. Mirrors
+/// `kcreate_kchat_client::ArtifactPublishResult`.
+export interface KChatArtifactPublishResult {
+  artifactId: string;
+  conversationId: string;
+  /// Backend-issued URL the renderer can hit to preview / download
+  /// the artifact (typically a signed short-lived link).
+  previewUrl: string;
+  /// Backend-issued URL of the rendered thumbnail. May equal
+  /// `previewUrl` when no separate thumbnail was generated.
+  thumbnailUrl: string;
+  kind: KChatArtifactKind;
+  /// RFC3339 UTC timestamp the backend stamped on the artifact.
+  publishedAt: string;
+}
+
+/// One artifact returned by `KChatBackendBridge.listArtifacts`.
+/// Mirrors `kcreate_kchat_client::PublishedArtifact`.
+export interface KChatPublishedArtifact {
+  artifactId: string;
+  conversationId: string;
+  previewUrl: string;
+  thumbnailUrl: string;
+  kind: KChatArtifactKind;
+  metadata: KChatArtifactMetadata;
+  /// Size of the artifact bytes the backend has on file.
+  byteSize: number;
+  /// RFC3339 UTC timestamp the backend stamped on the artifact.
+  publishedAt: string;
+}
+
+/// SVG-specific artifact-publish payload. Mirrors
+/// `kcreate_bridge::kchat_artifact::KChatSvgArtifactRequest`.
+/// `nodeIds` is optional / empty = "the whole document",
+/// matching the bridge's `export.svg` semantics.
+export interface KChatSvgArtifactRequest {
+  options: SvgExportOptions;
+  nodeIds?: string[];
+}
+
+/// Discriminated union over the artifact format the renderer
+/// wants to publish. Mirrors
+/// `kcreate_bridge::kchat_artifact::KChatArtifactRequestKind`
+/// (Rust `#[serde(tag = "format")]`).
+export type KChatArtifactRequestKind =
+  | ({ format: "png" } & PngExportOptions)
+  | { format: "svg"; options: SvgExportOptions; nodeIds?: string[] }
+  | ({ format: "pdf" } & PdfExportOptions)
+  | ({ format: "webp" } & WebpExportOptions)
+  | ({ format: "jpeg" } & JpegExportOptions);
+
+/// Bridge-facing request for
+/// `KChatBackendBridge.publishArtifact`. Mirrors
+/// `kcreate_bridge::kchat_artifact::KChatArtifactRequest`.
+export interface KChatArtifactPublishRequest {
+  /// Wire format of the artifact to produce.
+  kind: KChatArtifactRequestKind;
+  /// Free-form preset label echoed on the rich-card chip.
+  exportPreset?: string;
+  /// Page / artboard name surfaced on the rich-card preview.
+  artboardName?: string;
+}
+
+/// Bridge-facing request for
+/// `KChatBackendBridge.publishBrandKit`. Mirrors
+/// `kcreate_bridge::kchat_artifact::KChatBrandKitArtifactRequest`.
+export interface KChatBrandKitArtifactRequest {
+  /// Brand-kit to serialise. Must exist in the open project.
+  brandKitId: string;
+  /// Free-form preset label (e.g. `"Brand Kit v3"`). Optional.
+  exportPreset?: string;
+}
+
 /// Phase 7 KChat **backend** bridge surface. Every method other
 /// than `available` is optional because non-`kchat-backend` builds
 /// do not link the underlying N-API exports; the renderer probes
@@ -3835,6 +3948,26 @@ export interface KChatBackendBridge {
   syncCommunityRoster(
     communityId: string,
   ): Promise<KChatRosterSyncResult>;
+  /// Phase 8 (Block A, Task 2): render the current scene to the
+  /// requested artifact format **in memory** + generate a
+  /// thumbnail and publish the package to a KChat conversation
+  /// as a rich preview card. No temp file is touched.
+  publishArtifact(
+    conversationId: string,
+    request: KChatArtifactPublishRequest,
+  ): Promise<KChatArtifactPublishResult>;
+  /// Phase 8 (Block A, Task 2): serialise the named brand-kit
+  /// (and its embedded font / logo asset blobs) into an in-memory
+  /// `.kbrand` archive and publish it as a `brandKit` artifact.
+  publishBrandKit(
+    conversationId: string,
+    request: KChatBrandKitArtifactRequest,
+  ): Promise<KChatArtifactPublishResult>;
+  /// Phase 8 (Block A, Task 2): list previously-published
+  /// artifacts for the given conversation.
+  listArtifacts(
+    conversationId: string,
+  ): Promise<KChatPublishedArtifact[]>;
 }
 
 // -----------------------------------------------------------------------------

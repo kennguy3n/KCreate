@@ -136,7 +136,51 @@ pub fn export_brand_kit<S: std::hash::BuildHasher>(
     output: &Path,
 ) -> Result<(), KbrandError> {
     let file = std::fs::File::create(output)?;
-    let mut zip_writer = zip::ZipWriter::new(file);
+    write_brand_kit(kit, font_assets, logo_assets, file)
+}
+
+/// Serialize `kit` and the supplied font / logo asset blobs into a
+/// `.kbrand` archive returned as an in-memory `Vec<u8>`. Used by
+/// the KChat artifact-publishing pipeline which streams the bytes
+/// straight into a multipart upload without touching the filesystem.
+pub fn export_brand_kit_to_bytes<S: std::hash::BuildHasher>(
+    kit: &BrandKit,
+    font_assets: &HashMap<String, Vec<u8>, S>,
+    logo_assets: &HashMap<String, Vec<u8>, S>,
+) -> Result<Vec<u8>, KbrandError> {
+    let cursor = std::io::Cursor::new(Vec::new());
+    let final_cursor = write_brand_kit_inner(kit, font_assets, logo_assets, cursor)?;
+    Ok(final_cursor.into_inner())
+}
+
+/// Generic brand-kit serializer. Accepts any `Write + Seek` sink so
+/// the file-path and in-memory entry points can share one
+/// implementation.
+fn write_brand_kit<S, W>(
+    kit: &BrandKit,
+    font_assets: &HashMap<String, Vec<u8>, S>,
+    logo_assets: &HashMap<String, Vec<u8>, S>,
+    writer: W,
+) -> Result<(), KbrandError>
+where
+    S: std::hash::BuildHasher,
+    W: std::io::Write + std::io::Seek,
+{
+    write_brand_kit_inner(kit, font_assets, logo_assets, writer)?;
+    Ok(())
+}
+
+fn write_brand_kit_inner<S, W>(
+    kit: &BrandKit,
+    font_assets: &HashMap<String, Vec<u8>, S>,
+    logo_assets: &HashMap<String, Vec<u8>, S>,
+    writer: W,
+) -> Result<W, KbrandError>
+where
+    S: std::hash::BuildHasher,
+    W: std::io::Write + std::io::Seek,
+{
+    let mut zip_writer = zip::ZipWriter::new(writer);
     let options: zip::write::SimpleFileOptions = zip::write::SimpleFileOptions::default()
         .compression_method(zip::CompressionMethod::Deflated);
 
@@ -193,8 +237,8 @@ pub fn export_brand_kit<S: std::hash::BuildHasher>(
     zip_writer.start_file(MANIFEST_FILE, options)?;
     zip_writer.write_all(&manifest_bytes)?;
 
-    zip_writer.finish()?;
-    Ok(())
+    let inner = zip_writer.finish()?;
+    Ok(inner)
 }
 
 /// Read a `.kbrand` archive, validate every embedded asset, and

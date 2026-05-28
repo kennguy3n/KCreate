@@ -439,6 +439,166 @@ pub struct BackendErrorBody {
     pub data: Option<serde_json::Value>,
 }
 
+// ----------------- Artifact publishing -------------------------
+
+/// Wire format of an artifact's MIME / file kind. Carried across
+/// the multipart upload as a string field so the backend can pick
+/// the right preview pipeline (raster vs vector vs ZIP), and
+/// echoed back on the `GET /api/v1/conversations/{id}/artifacts`
+/// list response.
+///
+/// Values are emitted lowercase to match the surrounding REST
+/// contract (every other enum in this module is `lowercase`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ArtifactKind {
+    /// Rasterised canvas export. Bytes are a PNG image.
+    Png,
+    /// Vector canvas export. Bytes are a UTF-8 SVG document.
+    Svg,
+    /// Vector + raster export. Bytes are a PDF document.
+    Pdf,
+    /// Compressed rasterised canvas export. Bytes are a WebP image.
+    Webp,
+    /// JPEG fallback (e.g. when the renderer asked for an opaque
+    /// photo-grade compression).
+    Jpeg,
+    /// `.kbrand` ZIP archive (Brand Kit publish).
+    BrandKit,
+}
+
+impl ArtifactKind {
+    /// Conventional MIME type carried in the multipart Content-Type
+    /// header for the primary artifact part. The backend uses this
+    /// to gate preview generation — uploads with an unknown MIME
+    /// surface as `415 Unsupported Media Type`.
+    #[must_use]
+    pub const fn mime(self) -> &'static str {
+        match self {
+            Self::Png => "image/png",
+            Self::Svg => "image/svg+xml",
+            Self::Pdf => "application/pdf",
+            Self::Webp => "image/webp",
+            Self::Jpeg => "image/jpeg",
+            Self::BrandKit => "application/zip",
+        }
+    }
+
+    /// Conventional file-name suffix (no leading dot). Used by the
+    /// fixture + by the bridge when assembling the multipart part
+    /// filename for the artifact bytes.
+    #[must_use]
+    pub const fn extension(self) -> &'static str {
+        match self {
+            Self::Png => "png",
+            Self::Svg => "svg",
+            Self::Pdf => "pdf",
+            Self::Webp => "webp",
+            Self::Jpeg => "jpeg",
+            Self::BrandKit => "kbrand",
+        }
+    }
+}
+
+/// Structured metadata sent alongside the artifact bytes on
+/// `POST /api/v1/conversations/{id}/artifacts`. Serialised as JSON
+/// into a multipart form-data part named `metadata`. Echoed back on
+/// the `GET .../artifacts` list response (so the renderer can paint
+/// the rich-card preview without re-fetching the bytes).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ArtifactMetadata {
+    /// Originating project name. Surfaced verbatim on the rich
+    /// preview card.
+    pub project_name: String,
+    /// Originating artboard / page name (or brand-kit name for
+    /// `BrandKit` uploads). `None` for whole-project uploads.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub artboard_name: Option<String>,
+    /// Free-form export preset identifier (e.g.
+    /// `"PNG @1x"`, `"PDF A4 300dpi"`). Surfaced as a chip on the
+    /// rich preview card so reviewers can tell which preset they
+    /// are looking at without re-downloading.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub export_preset: Option<String>,
+    /// Rasterised pixel dimensions, when applicable. `None` for
+    /// vector-only artifacts (SVG, PDF) and `.kbrand`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub width_px: Option<u32>,
+    /// See [`Self::width_px`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub height_px: Option<u32>,
+    /// Source project id (`Uuid`). Lets the backend dedupe re-uploads
+    /// from the same project + preset, and lets the renderer
+    /// surface "this came from your KCreate project".
+    pub project_id: uuid::Uuid,
+    /// Wire-format kind of the artifact bytes.
+    pub kind: ArtifactKind,
+}
+
+/// Response body for `POST /api/v1/conversations/{id}/artifacts` on
+/// success. Mirrored on the bridge surface as
+/// `KChatArtifactPublishResult` in `apps/desktop/shared/scene.ts`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ArtifactPublishResult {
+    /// Server-assigned artifact id.
+    pub artifact_id: String,
+    /// Conversation the artifact was published into.
+    pub conversation_id: String,
+    /// URL the renderer can hit to preview / download the artifact.
+    /// Backend is responsible for short-circuiting auth on this URL
+    /// (typically a signed short-lived link).
+    pub preview_url: String,
+    /// URL of the rendered thumbnail. May equal `preview_url` when
+    /// the artifact is already small enough that no separate
+    /// thumbnail was needed.
+    pub thumbnail_url: String,
+    /// Wire format / MIME the backend stored the artifact as.
+    pub kind: ArtifactKind,
+    /// Server-assigned timestamp.
+    pub published_at: DateTime<Utc>,
+}
+
+/// Body of `GET /api/v1/conversations/{id}/artifacts`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ArtifactsListResponse {
+    /// Most-recent-first list of artifacts published to the
+    /// conversation.
+    pub artifacts: Vec<PublishedArtifact>,
+}
+
+/// One artifact returned by [`ArtifactsListResponse`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PublishedArtifact {
+    pub artifact_id: String,
+    pub conversation_id: String,
+    pub preview_url: String,
+    pub thumbnail_url: String,
+    pub kind: ArtifactKind,
+    /// Server-side metadata snapshot captured at upload time.
+    pub metadata: ArtifactMetadata,
+    /// Size of the artifact bytes the backend has on file.
+    pub byte_size: u64,
+    pub published_at: DateTime<Utc>,
+}
+
+/// Multipart form-data field names. Pulled into constants so the
+/// client + fixture + bridge all agree on the wire shape — a typo
+/// in one place would otherwise surface as a confusing `400 Bad
+/// Request` only on production traffic.
+pub mod artifact_field {
+    /// Primary artifact bytes (the export). MIME type is set on
+    /// the part via [`super::ArtifactKind::mime`].
+    pub const ARTIFACT: &str = "artifact";
+    /// PNG-encoded thumbnail bytes.
+    pub const THUMBNAIL: &str = "thumbnail";
+    /// JSON-encoded [`super::ArtifactMetadata`].
+    pub const METADATA: &str = "metadata";
+}
+
 /// Well-known backend error codes the client maps to typed error
 /// variants. Anything not listed here surfaces as
 /// [`ClientError::Backend`](crate::error::ClientError::Backend)
@@ -457,6 +617,11 @@ pub mod error_code {
     pub const CONVERSATION_NOT_FOUND: &str = "CONVERSATION_NOT_FOUND";
     /// Caller sent a malformed body.
     pub const INVALID_REQUEST: &str = "INVALID_REQUEST";
+    /// Caller posted an artifact whose declared kind / MIME isn't
+    /// in the backend's supported set.
+    pub const UNSUPPORTED_ARTIFACT_KIND: &str = "UNSUPPORTED_ARTIFACT_KIND";
+    /// Artifact body exceeds the backend's per-upload byte cap.
+    pub const ARTIFACT_TOO_LARGE: &str = "ARTIFACT_TOO_LARGE";
 }
 
 #[cfg(test)]

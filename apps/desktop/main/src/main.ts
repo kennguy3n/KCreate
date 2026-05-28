@@ -2633,6 +2633,46 @@ function registerIpcHandlers(): void {
       )(communityId),
   );
 
+  // Phase 8 (Block A, Task 2): publish an exported artifact to a
+  // KChat conversation. `requestJson` is a JSON-encoded
+  // `KChatArtifactPublishRequest`; returns the JSON-encoded
+  // `KChatArtifactPublishResult`.
+  ipcMain.handle(
+    "kcreate/kchat-backend/publish-artifact",
+    (_e, conversationId: string, requestJson: string) =>
+      (
+        requireKChatBackend("kchatBackendPublishArtifact") as (
+          c: string,
+          r: string,
+        ) => string
+      )(conversationId, requestJson),
+  );
+
+  // Phase 8 (Block A, Task 2): publish a `.kbrand` brand-kit
+  // archive to a KChat conversation.
+  ipcMain.handle(
+    "kcreate/kchat-backend/publish-brand-kit",
+    (_e, conversationId: string, requestJson: string) =>
+      (
+        requireKChatBackend("kchatBackendPublishBrandKit") as (
+          c: string,
+          r: string,
+        ) => string
+      )(conversationId, requestJson),
+  );
+
+  // Phase 8 (Block A, Task 2): list previously-published
+  // artifacts for the given conversation.
+  ipcMain.handle(
+    "kcreate/kchat-backend/list-artifacts",
+    (_e, conversationId: string) =>
+      (
+        requireKChatBackend("kchatBackendListArtifacts") as (
+          c: string,
+        ) => string
+      )(conversationId),
+  );
+
   // Phase 7 (Task 8): kick a connected peer.
   ipcMain.handle(
     "kcreate/session/kick-peer",

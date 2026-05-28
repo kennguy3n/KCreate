@@ -176,6 +176,24 @@ impl RestClient {
         Ok(self.http.request(method, url).headers(headers))
     }
 
+    /// Build a `reqwest::RequestBuilder` for a multipart upload.
+    /// Differs from [`Self::builder`] in that it does **not**
+    /// pre-set `Content-Type: application/json` — `reqwest` will
+    /// stamp the correct `multipart/form-data; boundary=...` value
+    /// when `.multipart(form)` is applied by the caller.
+    fn multipart_builder(
+        &self,
+        method: Method,
+        path: &str,
+    ) -> Result<reqwest::RequestBuilder, ClientError> {
+        let url = self.join(path)?;
+        let proto_version =
+            HeaderValue::from_str(&PROTOCOL_VERSION.to_string()).expect("PROTOCOL_VERSION ASCII");
+        let mut headers = HeaderMap::new();
+        headers.insert(PROTOCOL_VERSION_HEADER, proto_version);
+        Ok(self.http.request(method, url).headers(headers))
+    }
+
     /// Issue an unauthenticated request. Used for `auth/login`
     /// and `auth/refresh`.
     pub async fn request_unauthed<P, R>(
@@ -304,6 +322,90 @@ impl RestClient {
         }
     }
 
+    /// Issue an authenticated multipart upload. Same retry/refresh
+    /// envelope as [`Self::request_authed`], but the body is a
+    /// `reqwest::multipart::Form`. Because `multipart::Form` is
+    /// not `Clone`, the caller supplies a builder closure that
+    /// produces a fresh form on every retry — this matches reqwest's
+    /// own ergonomics for retried multipart uploads and avoids the
+    /// hidden trap of trying to clone a form that has streaming
+    /// parts.
+    ///
+    /// On retry the closure is called again, so callers must ensure
+    /// the form bytes are owned (e.g. `Vec<u8>`) rather than borrowed
+    /// from a buffer that will be moved/dropped on the first attempt.
+    pub async fn request_authed_multipart<R, F>(
+        &self,
+        method: Method,
+        path: &str,
+        mut build_form: F,
+    ) -> Result<R, ClientError>
+    where
+        R: DeserializeOwned + Send,
+        F: FnMut() -> reqwest::multipart::Form + Send,
+    {
+        if let Some(tokens) = self.tokens.snapshot() {
+            if tokens.needs_preemptive_refresh(Utc::now()) {
+                let _ = self.refresh().await;
+            }
+        }
+
+        let first = self
+            .send_authed_multipart(method.clone(), path, &mut build_form)
+            .await;
+        match first {
+            Err(ClientError::NotAuthenticated) => Err(ClientError::NotAuthenticated),
+            Err(e) if is_auth_failure(&e) => {
+                self.refresh().await?;
+                self.send_authed_multipart(method, path, &mut build_form)
+                    .await
+            }
+            other => other,
+        }
+    }
+
+    async fn send_authed_multipart<R, F>(
+        &self,
+        method: Method,
+        path: &str,
+        build_form: &mut F,
+    ) -> Result<R, ClientError>
+    where
+        R: DeserializeOwned + Send,
+        F: FnMut() -> reqwest::multipart::Form + Send,
+    {
+        let tokens = self
+            .tokens
+            .snapshot()
+            .ok_or(ClientError::NotAuthenticated)?;
+        let mut attempts: u32 = 0;
+        loop {
+            let mut builder = self.multipart_builder(method.clone(), path)?;
+            let auth_header = HeaderValue::from_str(&format!("Bearer {}", tokens.access_token))
+                .map_err(|e| ClientError::Transport(format!("auth header: {e}")))?;
+            builder = builder.header(AUTHORIZATION, auth_header);
+            builder = builder.multipart(build_form());
+            let resp = match builder.send().await {
+                Ok(r) => r,
+                Err(e) => return Err(map_transport_error(e, path)),
+            };
+            let status = resp.status();
+            if status == StatusCode::TOO_MANY_REQUESTS && attempts < MAX_RATE_LIMIT_RETRIES {
+                attempts += 1;
+                let wait = parse_retry_after(&resp)
+                    .unwrap_or_else(|| Duration::from_millis(200u64 * 2u64.pow(attempts.min(6))))
+                    .min(MAX_RATE_LIMIT_BACKOFF);
+                tracing::debug!(
+                    target: "kcreate_kchat_client::rest",
+                    "429 on multipart {path}, retrying after {wait:?} (attempt {attempts})",
+                );
+                sleep(wait).await;
+                continue;
+            }
+            return self.decode_response(resp, path, false).await;
+        }
+    }
+
     async fn refresh(&self) -> Result<(), ClientError> {
         let tokens = self
             .tokens
@@ -395,9 +497,33 @@ pub(crate) fn classify_failure(
             .map_or_else(|| String::from("permission denied"), |b| b.message.clone());
         return ClientError::PermissionDenied { message };
     }
+    // Artifact-upload sentinels. The backend signals these with
+    // `415 Unsupported Media Type` / `413 Payload Too Large` *plus*
+    // a typed `code` so the client can still distinguish
+    // "you sent us an SVG and we only take raster" from
+    // "you sent us 200MB and our cap is 50MB". Either signal is
+    // sufficient — the code check is preferred when present, the
+    // status check is the fallback when the backend can't be
+    // bothered to send a body.
+    let code = body.as_ref().map(|b| b.code.as_str());
+    if status == StatusCode::UNSUPPORTED_MEDIA_TYPE
+        || code == Some(error_code::UNSUPPORTED_ARTIFACT_KIND)
+    {
+        let message = body.as_ref().map_or_else(
+            || String::from("backend rejected artifact kind"),
+            |b| b.message.clone(),
+        );
+        return ClientError::ArtifactKindUnsupported { message };
+    }
+    if status == StatusCode::PAYLOAD_TOO_LARGE || code == Some(error_code::ARTIFACT_TOO_LARGE) {
+        let message = body.as_ref().map_or_else(
+            || String::from("backend rejected artifact: payload too large"),
+            |b| b.message.clone(),
+        );
+        return ClientError::ArtifactTooLarge { message };
+    }
     if status == StatusCode::NOT_FOUND || status == StatusCode::NOT_IMPLEMENTED {
         let is_attestation_path = path.ends_with("/attestation");
-        let code = body.as_ref().map(|b| b.code.as_str());
         if is_attestation_path || code == Some(error_code::ATTESTATION_NOT_PROVISIONED) {
             let message = body.as_ref().map_or_else(
                 || String::from("attestation endpoint not yet provisioned by backend"),

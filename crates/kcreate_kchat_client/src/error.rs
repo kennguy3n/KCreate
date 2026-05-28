@@ -103,6 +103,21 @@ pub enum ClientError {
     /// failed, etc.).
     #[error("KChat membership attestation invalid: {0}")]
     AttestationInvalid(String),
+
+    /// Backend refused an artifact upload because its declared
+    /// kind / MIME isn't in the supported set
+    /// (`UNSUPPORTED_ARTIFACT_KIND`). Surfaced separately from
+    /// [`Self::Backend`] so the renderer can show a clear "this
+    /// format isn't accepted by your community" message.
+    #[error("KChat backend refused unsupported artifact kind: {message}")]
+    ArtifactKindUnsupported { message: String },
+
+    /// Backend refused an artifact upload because the bytes exceed
+    /// its per-upload cap (`ARTIFACT_TOO_LARGE`). The renderer
+    /// can use this to suggest a lower-resolution export preset
+    /// instead of failing silently.
+    #[error("KChat backend refused artifact: payload too large ({message})")]
+    ArtifactTooLarge { message: String },
 }
 
 impl ClientError {

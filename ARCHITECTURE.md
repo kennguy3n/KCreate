@@ -921,7 +921,65 @@ keeps `kchat-dev-issuer` for the integration-test crate so the
 test suite can mint deterministic attestations without standing
 up a real backend.
 
-## 17d. Design-review annotations (Phase 8)
+## 17d. KChat artifact publishing pipeline (Phase 8)
+
+Phase 8 Block A Tasks 1–2 add the ability to publish design
+artifacts (exported images, PDFs, brand kits) into KChat
+conversations as rich preview cards.
+
+**Client layer** (`kcreate_kchat_client::artifact`). Two
+methods on `KChatBackendClient`:
+- `publish_artifact(ArtifactPublishParams)` — multipart POST
+  to `/api/v1/conversations/{id}/artifacts` carrying the
+  artifact bytes, an optional PNG thumbnail, and a JSON
+  `ArtifactMetadata` part. Client-side 32 MiB cap
+  (`MAX_ARTIFACT_BYTES`) prevents oversized uploads; the server
+  may also return 413 `ARTIFACT_TOO_LARGE`.
+- `list_artifacts(conversation_id)` — GET the published
+  artifacts for the renderer's "recent artifacts" pane.
+
+Typed DTOs (`ArtifactKind`, `ArtifactMetadata`,
+`ArtifactPublishResult`, `ArtifactPublishThumbnail`,
+`PublishedArtifact`) live in `protocol.rs`. `ArtifactKind`
+is a flat lowercase enum (`png | svg | pdf | webp | jpeg |
+brandKit`) emitted by serde `#[serde(rename_all = "lowercase")]`.
+
+**Bridge layer** (`kcreate_bridge::kchat_artifact`). Three
+public entry points:
+- `kchat_backend_publish_artifact(conversation_id, request)` —
+  validates the conversation id, reads the project identity from
+  the workspace slot (fail-fast `NoOpenProject`), checks the
+  KChat client is installed (`NotConnected`), renders the
+  artifact in memory via the existing export infrastructure
+  (`export_png_bytes`, `export_svg`, `export_pdf_bytes`, etc.),
+  generates a cover thumbnail (512 px max, reusing the
+  `thumbnails` pipeline), and publishes.
+- `kchat_backend_publish_brand_kit(conversation_id, request)` —
+  same pattern but serialises a `.kbrand` archive via
+  `brand_kit_export_to_bytes`.
+- `kchat_backend_list_artifacts(conversation_id)` — thin
+  passthrough to the client.
+
+**Wire-format** — the renderer sends a discriminated union
+`KChatArtifactRequest` whose `kind` field carries a
+`KChatArtifactRequestKind` with serde
+`#[serde(tag = "format")]`. Variants: `Png`, `Svg`, `Pdf`,
+`Webp`, `Jpeg`. Inner options (width/height/scale for raster,
+nodeIds for SVG, colorMode for PDF) are flattened alongside the
+format tag. TypeScript mirrors live in `scene.ts`; IPC channels
+`kcreate/kchat-backend/publish-artifact`,
+`kcreate/kchat-backend/publish-brand-kit`, and
+`kcreate/kchat-backend/list-artifacts` are wired through
+`bridge.ts`, `main.ts`, and `preload.ts`.
+
+**Test fixture** — the axum `FixtureServer` handles the
+artifact endpoints: validates the multipart upload, stores
+artifacts in memory, and echoes them back from the GET path.
+Bridge integration tests in
+`crates/kcreate_tests/tests/kchat_artifact.rs` drive the
+entry points end-to-end against the fixture.
+
+## 17e. Design-review annotations (Phase 8)
 
 Phase 8 introduces a per-page annotation layer for collaborative
 design review. Annotations live in `kcreate_core::annotation` as
@@ -954,7 +1012,7 @@ upsert into their local store using the same `upsert_annotation`
 path, so the renderer's `AnnotationOverlay` reads the same
 table regardless of authorship.
 
-## 17e. Design-token binding (Phase 8)
+## 17f. Design-token binding (Phase 8)
 
 Phase 8 makes design tokens *live* — bound layers update
 within 100 ms of a token change.
@@ -985,7 +1043,7 @@ combines `propagate_single_token` with the workspace's brand
 kit and the operation log so an Undo step rolls back every
 affected node atomically.
 
-## 17f. Constraint system (Phase 8)
+## 17g. Constraint system (Phase 8)
 
 Phase 8 wires the existing `Constraints` type on `Node` into
 the document resize flow. `Constraints` is per-axis and pairs
@@ -1023,7 +1081,7 @@ the resized frame's children and rewrites each child's bounds
 using `apply_constraints`, then records a single `ResizeFrame`
 operation so the change participates in undo / redo.
 
-## 17g. Smart text auto-fit (Phase 8)
+## 17h. Smart text auto-fit (Phase 8)
 
 `kcreate_text::autofit::compute_autofit_size(text, font, min,
 max, frame)` binary-searches for the largest font size that
@@ -1034,7 +1092,7 @@ enabled)` flips a flag on the node; the document resize path
 calls `compute_autofit_size` whenever an auto-fit text node's
 container changes.
 
-## 17h. Page-numbering tokens (Phase 8)
+## 17i. Page-numbering tokens (Phase 8)
 
 Page-numbering tokens are stored as a Unicode Private-Use
 sentinel (U+E100) followed by a format selector char. The
@@ -1048,7 +1106,7 @@ subtractive (`IV`, `IX`, `XL`, …) and alphabetic is base-26
 (A–Z, AA–AZ, BA–BZ, …) — both implemented as real algorithms
 in `kcreate_text::tokens`, not as `format!("{n}")`.
 
-## 17i. SQLCipher encryption at rest (Phase 8)
+## 17j. SQLCipher encryption at rest (Phase 8)
 
 `kcreate_storage::crypto` derives a 256-bit raw key from a
 user-supplied passphrase via PBKDF2-HMAC-SHA256 with a
@@ -1075,7 +1133,7 @@ difference is whether `PRAGMA key` is issued at open time. The
 salt lives in `manifest.json` so the encrypted DB can be
 recovered even after `change_key`.
 
-## 17j. Brand-kit versioning (Phase 8)
+## 17k. Brand-kit versioning (Phase 8)
 
 `kcreate_storage::brand_versions` adds a `brand_kit_versions`
 SQLite table (separate from the live `brand_kits` table) that
@@ -1097,7 +1155,7 @@ bridge surface exposes save / list / restore / diff:
   The renderer renders this as the green/red side-by-side
   diff view PROPOSAL.md §4.6 calls for.
 
-## 17k. Job-first export presets (Phase 8)
+## 17l. Job-first export presets (Phase 8)
 
 `kcreate_export::job_presets` ships a curated preset list per
 Home-screen job tile (`JobType::{AppOrWebsiteUi,

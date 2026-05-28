@@ -402,6 +402,21 @@ pub fn export_pdf_from_document(
     rasters: &RasterPixelCache,
     output_path: &Path,
 ) -> Result<usize, PdfExportError> {
+    let final_bytes = export_pdf_from_document_to_bytes(document, options, rasters)?;
+    let written = final_bytes.len();
+    fs::write(output_path, &final_bytes)?;
+    Ok(written)
+}
+
+/// Same as [`export_pdf_from_document`] but returns the PDF bytes
+/// without writing to disk. Used by the artifact-publishing pipeline
+/// (which streams the bytes directly into a multipart upload) and
+/// any future in-memory PDF consumers.
+pub fn export_pdf_from_document_to_bytes(
+    document: &DocumentGraph,
+    options: &PdfExportOptions,
+    rasters: &RasterPixelCache,
+) -> Result<Vec<u8>, PdfExportError> {
     let width_mm = as_f32(options.width_mm);
     let height_mm = as_f32(options.height_mm);
     let (doc, page1, layer1) =
@@ -431,9 +446,7 @@ pub fn export_pdf_from_document(
     let bytes = doc
         .save_to_bytes()
         .map_err(|e| PdfExportError::PrintPdf(e.to_string()))?;
-    let final_bytes = inject_shadings(bytes, &pending_shadings).map_err(PdfExportError::from)?;
-    fs::write(output_path, &final_bytes)?;
-    Ok(final_bytes.len())
+    inject_shadings(bytes, &pending_shadings).map_err(PdfExportError::from)
 }
 
 const fn as_f32(value: f64) -> f32 {

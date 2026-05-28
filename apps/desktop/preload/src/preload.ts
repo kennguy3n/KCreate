@@ -176,6 +176,10 @@ import type {
   KChatShareInvite,
   KChatAcceptedInvite,
   KChatRosterSyncResult,
+  KChatArtifactPublishRequest,
+  KChatArtifactPublishResult,
+  KChatBrandKitArtifactRequest,
+  KChatPublishedArtifact,
   CollabPermission,
   SessionStartReport,
   TrustedIssuer,
@@ -2487,6 +2491,37 @@ const kchatBackend: KChatBackendBridge = {
       communityId,
     )) as string;
     return JSON.parse(raw) as KChatRosterSyncResult;
+  },
+  async publishArtifact(
+    conversationId: string,
+    request: KChatArtifactPublishRequest,
+  ): Promise<KChatArtifactPublishResult> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/kchat-backend/publish-artifact",
+      conversationId,
+      JSON.stringify(request),
+    )) as string;
+    return JSON.parse(raw) as KChatArtifactPublishResult;
+  },
+  async publishBrandKit(
+    conversationId: string,
+    request: KChatBrandKitArtifactRequest,
+  ): Promise<KChatArtifactPublishResult> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/kchat-backend/publish-brand-kit",
+      conversationId,
+      JSON.stringify(request),
+    )) as string;
+    return JSON.parse(raw) as KChatArtifactPublishResult;
+  },
+  async listArtifacts(
+    conversationId: string,
+  ): Promise<KChatPublishedArtifact[]> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/kchat-backend/list-artifacts",
+      conversationId,
+    )) as string;
+    return JSON.parse(raw) as KChatPublishedArtifact[];
   },
 };
 

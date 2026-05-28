@@ -22,6 +22,8 @@ pub mod collab;
 pub mod document;
 pub mod hit_test;
 #[cfg(feature = "kchat-backend")]
+pub mod kchat_artifact;
+#[cfg(feature = "kchat-backend")]
 pub mod kchat_backend;
 pub mod llm;
 #[cfg(feature = "native_canvas")]
@@ -3383,7 +3385,8 @@ pub fn kchat_dev_mint_membership(request_json: String) -> NapiResult<String> {
 #[allow(clippy::needless_pass_by_value)]
 fn map_kchat_backend_err(e: crate::kchat_backend::KChatBackendBridgeError) -> NapiError {
     let status = match e {
-        crate::kchat_backend::KChatBackendBridgeError::NotConnected => Status::InvalidArg,
+        crate::kchat_backend::KChatBackendBridgeError::NotConnected
+        | crate::kchat_backend::KChatBackendBridgeError::NoOpenProject => Status::InvalidArg,
         _ => Status::GenericFailure,
     };
     NapiError::new(status, e.to_string())
@@ -3519,6 +3522,79 @@ pub fn kchat_backend_sync_community_roster(community_id: String) -> NapiResult<S
         .map_err(map_kchat_backend_err)?;
     serde_json::to_string(&result)
         .map_err(|e| NapiError::from_reason(format!("kchat_backend_sync_community_roster: {e}")))
+}
+
+/// Phase 8 (Block A, Task 2): publish an exported artifact
+/// (PNG / SVG / PDF / WebP / JPEG) to a KChat conversation.
+///
+/// `request_json` is a JSON-encoded
+/// [`crate::kchat_artifact::KChatArtifactRequest`]:
+///
+/// ```jsonc
+/// {
+///   "kind": { "format": "png", "width": 1920, "height": 1080, "scale": 1.0 },
+///   "exportPreset": "PNG @1x",
+///   "artboardName": "Cover"
+/// }
+/// ```
+///
+/// Renders the artifact bytes (in memory) + a thumbnail (reusing
+/// the HomePage cover-thumbnail cache), then POSTs everything as a
+/// multipart upload via [`kcreate_kchat_client`]. Returns the
+/// server-assigned [`kcreate_kchat_client::ArtifactPublishResult`]
+/// as JSON, mirrored on the TS side as
+/// `KChatArtifactPublishResult`.
+#[cfg(feature = "kchat-backend")]
+#[napi]
+pub fn kchat_backend_publish_artifact(
+    conversation_id: String,
+    request_json: String,
+) -> NapiResult<String> {
+    let request: crate::kchat_artifact::KChatArtifactRequest = serde_json::from_str(&request_json)
+        .map_err(|e| {
+            NapiError::from_reason(format!(
+                "kchat_backend_publish_artifact: invalid request: {e}"
+            ))
+        })?;
+    let result = crate::kchat_artifact::kchat_backend_publish_artifact(&conversation_id, request)
+        .map_err(map_kchat_backend_err)?;
+    serde_json::to_string(&result)
+        .map_err(|e| NapiError::from_reason(format!("kchat_backend_publish_artifact: {e}")))
+}
+
+/// Phase 8 (Block A, Task 2): publish a `.kbrand` brand-kit archive
+/// to a KChat conversation. `request_json` is a JSON-encoded
+/// [`crate::kchat_artifact::KChatBrandKitArtifactRequest`] —
+/// `{ "brandKitId": "<uuid>", "exportPreset": "..." }`.
+#[cfg(feature = "kchat-backend")]
+#[napi]
+pub fn kchat_backend_publish_brand_kit(
+    conversation_id: String,
+    request_json: String,
+) -> NapiResult<String> {
+    let request: crate::kchat_artifact::KChatBrandKitArtifactRequest =
+        serde_json::from_str(&request_json).map_err(|e| {
+            NapiError::from_reason(format!(
+                "kchat_backend_publish_brand_kit: invalid request: {e}"
+            ))
+        })?;
+    let result = crate::kchat_artifact::kchat_backend_publish_brand_kit(&conversation_id, request)
+        .map_err(map_kchat_backend_err)?;
+    serde_json::to_string(&result)
+        .map_err(|e| NapiError::from_reason(format!("kchat_backend_publish_brand_kit: {e}")))
+}
+
+/// Phase 8 (Block A, Task 2): list previously-published artifacts
+/// for a KChat conversation. Returns a JSON-encoded
+/// `KChatPublishedArtifact[]` (oldest-first per the backend's
+/// list order).
+#[cfg(feature = "kchat-backend")]
+#[napi]
+pub fn kchat_backend_list_artifacts(conversation_id: String) -> NapiResult<String> {
+    let result = crate::kchat_artifact::kchat_backend_list_artifacts(&conversation_id)
+        .map_err(map_kchat_backend_err)?;
+    serde_json::to_string(&result)
+        .map_err(|e| NapiError::from_reason(format!("kchat_backend_list_artifacts: {e}")))
 }
 
 /// Phase 7 (Task 11): set a connected peer's collaboration

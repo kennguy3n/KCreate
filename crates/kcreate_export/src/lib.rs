@@ -45,7 +45,8 @@ pub use figma_import::{
 };
 pub use jpeg::{export_jpeg, export_jpeg_to_bytes, JpegExportError, JpegExportOptions};
 pub use pdf::{
-    export_pdf_from_document, PdfExportError, PdfExportOptions, RasterPixelCache, RasterPixels,
+    export_pdf_from_document, export_pdf_from_document_to_bytes, PdfExportError, PdfExportOptions,
+    RasterPixelCache, RasterPixels,
 };
 pub use pdf_import::{
     import_pdf, ExtractedImage, ExtractedImageData, ImportedPdf, ImportedPdfPage, PdfImportError,

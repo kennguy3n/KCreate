@@ -36,6 +36,22 @@
 //! mirrors the LRU semantics in `crates/kcreate_storage::blob_store`
 //! and avoids silently dropping content the caller asked us to
 //! cache.
+//!
+//! ## Tick counter overflow
+//!
+//! `next_tick` is a `u64` incremented via `wrapping_add(1)` on every
+//! read and every write. Wrapping requires 2^64 ≈ 1.8 × 10^19
+//! operations; even at one billion cache ops per second that is
+//! ~584 years of continuous activity, well beyond any realistic
+//! desktop session. We deliberately use the wrapping variant rather
+//! than `checked_add` + panic because the latter would couple every
+//! cache op to a branch that can never be taken in practice. The
+//! `BTreeMap<tick, key>` index would mis-order entries past the
+//! wrap point, which could leak entries that are no longer
+//! reachable via [`evict_until_under_budget`] — if this cache is
+//! ever adapted for a long-running server context, this assumption
+//! should be revisited (e.g. by re-numbering ticks down from
+//! `next_tick` after every Nth op).
 
 use std::collections::{BTreeMap, HashMap};
 use std::hash::Hash;

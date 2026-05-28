@@ -400,11 +400,15 @@ pub struct RuntimeStatus {
 /// should call [`project_close`] (or [`project_save`] followed by
 /// `project_close`) before switching projects.
 pub fn project_create(name: &str, dir: &Path) -> Result<ProjectInfo> {
-    // Phase 8 Block E Task 27: cold-path instrumentation. The two
-    // marks together let the renderer compute "real time spent
-    // creating the project" without needing wall-clock math —
-    // monotonic deltas only.
-    crate::perf::mark("project_create.start");
+    // Phase 8 Block E Task 27: cold-path instrumentation. The RAII
+    // `perf::scope` guard guarantees `project_create.end` fires on
+    // every exit path (early `return`, `?` propagation, success)
+    // — paired manual `.start`/`.end` marks would orphan `.start`
+    // on any error path between them. The renderer computes "real
+    // time spent creating the project" by diffing the two marks;
+    // both are monotonic so resume-from-sleep cannot make the
+    // delta go negative.
+    let _perf = crate::perf::scope("project_create");
     // Hold the singleton lock across the entire create operation so
     // "another project is already open" stays a TOCTOU-free check. The
     // bridge calls are synchronous and short; serialising them is the
@@ -470,19 +474,25 @@ pub fn project_create(name: &str, dir: &Path) -> Result<ProjectInfo> {
     // something to render before the user opens this project again.
     // Errors here are non-fatal: the thumbnail pipeline will lazily
     // generate on first access if pre-warming fails.
+    // `prepare_thumbnails_background` spawns a worker thread and
+    // returns immediately, so the `_perf` guard's drop-emitted
+    // `project_create.end` mark below does not include thumbnail
+    // pre-warm CPU time — only the bookend foreground work.
     let _ = crate::thumbnails::prepare_thumbnails_background(
         crate::thumbnails::DEFAULT_THUMBNAIL_MAX_DIM_PX,
     );
-    crate::perf::mark("project_create.end");
     Ok(info)
 }
 
 /// Open an existing `.kstudio` directory. The process must not have
 /// another project open — callers should call [`project_close`] first.
 pub fn project_open(dir: &Path) -> Result<ProjectInfo> {
-    // Phase 8 Block E Task 27: cold-path instrumentation. Matches
-    // the bookend pattern used by `project_create` above.
-    crate::perf::mark("project_open.start");
+    // Phase 8 Block E Task 27: cold-path instrumentation. RAII
+    // guard so every exit path (including the many `?` operators
+    // below that read manifest / document / tokens / brand kits /
+    // presets / components / color settings / op log) still emits
+    // the matching `project_open.end` mark.
+    let _perf = crate::perf::scope("project_open");
     // Same lock discipline as `project_create`: hold across the entire
     // operation, no TOCTOU window between the check and the set.
     let mut guard = slot().lock();
@@ -540,11 +550,12 @@ pub fn project_open(dir: &Path) -> Result<ProjectInfo> {
     }
     drop(guard);
     // Background pre-warm so the next HomePage visit has fresh
-    // thumbnails. Non-fatal on failure.
+    // thumbnails. Non-fatal on failure. The spawned worker runs
+    // off the perf bookend so `project_open.end` (emitted when
+    // `_perf` drops) reflects only foreground latency.
     let _ = crate::thumbnails::prepare_thumbnails_background(
         crate::thumbnails::DEFAULT_THUMBNAIL_MAX_DIM_PX,
     );
-    crate::perf::mark("project_open.end");
     Ok(info)
 }
 

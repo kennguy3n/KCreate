@@ -65,6 +65,22 @@ pub fn mark(label: impl Into<String>) {
     startup::mark(label);
 }
 
+/// Open a RAII scope on the global startup timeline. Emits
+/// `<label>.start` immediately and `<label>.end` when the returned
+/// guard is dropped — including on early `return`, `?`
+/// propagation, and panic unwinding.
+///
+/// Use this instead of paired `perf::mark("foo.start")` /
+/// `perf::mark("foo.end")` calls in any function with more than
+/// one exit path. The bookend-via-explicit-marks pattern is
+/// fragile because every fallible step between the two marks can
+/// orphan the `.start` (see Devin Review BUG_0001 on PR #24).
+#[must_use = "the returned guard must be held in a binding so the .end mark fires when the scope exits"]
+pub fn scope(label: impl Into<String>) -> startup::StartupScope {
+    ensure_startup_initialized();
+    startup::scope(label)
+}
+
 /// JSON snapshot of the startup timeline. Returns the empty JSON
 /// object string `{}` if the timeline has never been initialised
 /// — this keeps the IPC contract total and the renderer doesn't

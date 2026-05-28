@@ -224,6 +224,12 @@ impl Database {
         // derived a 32-byte key from the user's passphrase.
         let hex_key = hex::encode(key);
         conn.pragma_update(None, "key", format!("x'{hex_key}'"))?;
+        // Defence-in-depth: probe `PRAGMA cipher_version` to confirm
+        // we're actually talking to a SQLCipher-capable build. If a
+        // future Cargo.toml refactor drops the sqlcipher feature
+        // this surfaces immediately rather than at a later
+        // `sqlcipher_export` call.
+        assert_sqlcipher_available(&conn)?;
         // Sanity-check the key by reading the schema. On wrong
         // key, SQLCipher returns SQLITE_NOTADB at either prepare
         // or query time depending on the SQLCipher build; treat
@@ -263,6 +269,12 @@ impl Database {
         // Open the source as plaintext and ATTACH the destination
         // with a fresh key, then sqlcipher_export.
         let conn = Connection::open(&path)?;
+        // Probe for SQLCipher support before issuing the
+        // SQLCipher-specific `ATTACH … KEY` / `sqlcipher_export`
+        // statements so the error message is the user-meaningful
+        // "encryption not enabled in this build" rather than
+        // "no such function: sqlcipher_export".
+        assert_sqlcipher_available(&conn)?;
         let hex_key = hex::encode(key);
         let tmp_str = tmp
             .to_str()
@@ -295,6 +307,10 @@ impl Database {
         }
         let path = path.as_ref().to_path_buf();
         let conn = Connection::open(&path)?;
+        // Probe for SQLCipher support before touching `PRAGMA key`
+        // / `PRAGMA rekey` so a build without sqlcipher fails with
+        // the explicit `EncryptionUnsupported` error.
+        assert_sqlcipher_available(&conn)?;
         let hex_old = hex::encode(old_key);
         conn.pragma_update(None, "key", format!("x'{hex_old}'"))?;
         // Validate the old key actually opens the database; without
@@ -325,6 +341,7 @@ impl Database {
             })?;
         }
         let conn = Connection::open(&path)?;
+        assert_sqlcipher_available(&conn)?;
         let hex_key = hex::encode(key);
         conn.pragma_update(None, "key", format!("x'{hex_key}'"))?;
         // Validate the key opened the database successfully.
@@ -428,6 +445,30 @@ fn validate_encrypted_open(conn: &Connection) -> Result<(), DatabaseError> {
             Err(DatabaseError::EncryptionWrongKey)
         }
         Err(e) => Err(DatabaseError::Sqlite(e)),
+    }
+}
+
+/// Verify the underlying `rusqlite` build actually links a
+/// SQLCipher-capable SQLite. `PRAGMA cipher_version` is a
+/// SQLCipher extension; on a plain SQLite build the pragma returns
+/// no row (or an empty string), which we map to
+/// [`DatabaseError::EncryptionUnsupported`] so the caller gets a
+/// hard, explicit failure instead of a silent downgrade to
+/// plaintext or a confusing "no such function: sqlcipher_export"
+/// at a later step.
+///
+/// Defence-in-depth: the workspace `Cargo.toml` requests
+/// `rusqlite/bundled-sqlcipher-vendored-openssl`, but a future
+/// refactor could accidentally drop that feature without anyone
+/// noticing until production. This runtime probe catches that
+/// regression on the very first encrypted-database operation.
+fn assert_sqlcipher_available(conn: &Connection) -> Result<(), DatabaseError> {
+    let version: Option<String> = conn
+        .query_row("PRAGMA cipher_version", [], |r| r.get::<_, String>(0))
+        .ok();
+    match version {
+        Some(v) if !v.trim().is_empty() => Ok(()),
+        _ => Err(DatabaseError::EncryptionUnsupported),
     }
 }
 

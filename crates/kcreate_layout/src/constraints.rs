@@ -73,7 +73,7 @@ fn solve_axis(
     // measured along the same axis. Used by Max / Stretch to
     // preserve the right/bottom inset.
     let trailing_gap = parent_old_extent - (child_origin + child_extent);
-    match constraint {
+    let (origin, extent) = match constraint {
         Constraint::Fixed | Constraint::Min => {
             // Min == "pin to leading edge". Both behave the same in
             // a single resize: the child stays at the same origin
@@ -102,7 +102,7 @@ fn solve_axis(
             // parent's resize ratio. Falls back to "keep" when the
             // parent had zero extent (avoid divide-by-zero).
             if parent_old_extent <= 0.0 {
-                return (child_origin, child_extent);
+                return (child_origin, child_extent.max(0.0));
             }
             let ratio = parent_new_extent / parent_old_extent;
             (child_origin * ratio, child_extent * ratio)
@@ -110,13 +110,27 @@ fn solve_axis(
         Constraint::Stretch => {
             // Pin both leading + trailing edges to the parent. The
             // child's extent stretches to fill the new parent
-            // minus the original insets.
+            // minus the original insets. When the parent shrinks
+            // far enough that `origin + trailing_gap >
+            // parent_new_extent`, the naive arithmetic would produce
+            // a negative extent — see clamp below for why we
+            // collapse to zero instead.
             (
                 child_origin,
                 parent_new_extent - child_origin - trailing_gap,
             )
         }
-    }
+    };
+    // Clamp the extent at the solver boundary so downstream
+    // consumers (renderer, hit-test, export) never see a
+    // `Bounds::width` / `Bounds::height` below zero. A child that
+    // would mathematically collapse past zero (typically a
+    // Stretch child whose parent shrinks below the combined
+    // leading + trailing insets) is reported as exactly zero,
+    // matching Figma's behaviour. We keep the origin unchanged so
+    // restoring the parent to its old extent reconstructs the
+    // child cleanly.
+    (origin, extent.max(0.0))
 }
 
 #[cfg(test)]
@@ -265,6 +279,57 @@ mod tests {
         // No NaN / Inf.
         assert!(out.x.is_finite());
         assert!(out.width.is_finite());
+    }
+
+    #[test]
+    fn stretch_clamps_to_zero_when_parent_shrinks_below_insets() {
+        // Child has 30 leading + 50 trailing inset on a 100-wide parent
+        // (so child width = 20). Shrink the parent to 60 — the combined
+        // insets (80) exceed the new extent, so the child must collapse
+        // to width 0 rather than report a negative width.
+        let parent_old = b(0.0, 0.0, 100.0, 100.0);
+        let parent_new = b(0.0, 0.0, 60.0, 100.0);
+        let child = b(30.0, 0.0, 20.0, 20.0);
+        let out = apply_constraints(
+            child,
+            Constraints {
+                horizontal: Constraint::Stretch,
+                vertical: Constraint::Fixed,
+            },
+            parent_old,
+            parent_new,
+        );
+        // Origin tracks the leading inset; width clamps to zero.
+        assert!((out.x - 30.0).abs() < 1e-9);
+        assert!(
+            out.width >= 0.0,
+            "stretch must never produce negative width (got {})",
+            out.width
+        );
+        assert!((out.width - 0.0).abs() < 1e-9);
+        // Vertical axis untouched.
+        assert!((out.height - 20.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn scale_clamps_to_zero_when_starting_extent_is_negative() {
+        // Defensive: a caller passing in a negative `child_extent`
+        // would historically propagate through the Scale branch's
+        // zero-parent fallback. The clamp ensures the public API
+        // contract holds even on garbage input.
+        let parent_old = b(0.0, 0.0, 0.0, 100.0);
+        let parent_new = b(0.0, 0.0, 50.0, 100.0);
+        let child = b(0.0, 10.0, -5.0, 20.0);
+        let out = apply_constraints(
+            child,
+            Constraints {
+                horizontal: Constraint::Scale,
+                vertical: Constraint::Fixed,
+            },
+            parent_old,
+            parent_new,
+        );
+        assert!(out.width >= 0.0);
     }
 
     #[test]

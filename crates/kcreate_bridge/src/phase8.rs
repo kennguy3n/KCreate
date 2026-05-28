@@ -390,24 +390,147 @@ pub fn brand_kit_diff(before_id: Uuid, after_id: Uuid) -> Result<BrandKitDiff> {
 /// Resolved page contexts for the whole document — page index,
 /// section total, and section prefix. Pure projection over the
 /// current document so the renderer can substitute tokens.
+///
+/// Page order is taken from `DocumentGraph::root_ids`, which is the
+/// canonical authoring order (newly inserted pages append; explicit
+/// reparents update the vector). Iterating the underlying `HashMap`
+/// would produce nondeterministic page numbering — a subtle bug
+/// where the same document renders different numbers on each open.
 #[must_use]
 pub fn page_resolve_contexts() -> Vec<kcreate_text::tokens::PageContext> {
     with_workspace(|ws| {
         let pages: Vec<kcreate_text::tokens::PageDescriptor> = ws
             .project
             .document
+            .root_ids()
             .iter()
-            .filter(|(_, n)| n.node_type == kcreate_core::node::NodeType::Page)
-            .map(|(id, n)| {
-                let layout = n.page_layout().unwrap_or_default();
-                kcreate_text::tokens::PageDescriptor {
+            .filter_map(|id| {
+                let node = ws.project.document.get_node(*id)?;
+                if node.node_type != kcreate_core::node::NodeType::Page {
+                    return None;
+                }
+                let layout = node.page_layout().unwrap_or_default();
+                Some(kcreate_text::tokens::PageDescriptor {
                     id: *id,
                     section_start: layout.section_start,
                     section_prefix: layout.section_prefix,
-                }
+                })
             })
             .collect();
         Ok(kcreate_text::tokens::resolve_page_contexts(&pages))
     })
     .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::document::{
+        document_create_node, project_close, project_create, reset_for_tests, CreateNodeProps,
+    };
+    use serial_test::serial;
+
+    /// Regression test for the bug Devin Review caught on PR #19: an
+    /// earlier draft of `page_resolve_contexts` iterated
+    /// `DocumentGraph::iter()`, which is a `HashMap::iter()` and
+    /// therefore non-deterministic. Adding several pages and
+    /// re-resolving must always yield the same vector — otherwise
+    /// the renderer would show different page numbers on every
+    /// open / reflow.
+    ///
+    /// Determinism is verified two ways:
+    ///   1. A single resolve produces strictly increasing
+    ///      `display_number` (1..=N).
+    ///   2. 32 consecutive resolves all produce the same vector.
+    #[test]
+    #[serial]
+    fn page_resolve_contexts_is_deterministic_across_calls() {
+        reset_for_tests();
+        let dir = tempfile::tempdir().expect("tempdir");
+        project_create("page-determinism", dir.path()).expect("create");
+
+        // `project_create` seeds the document with a single Page + Artboard.
+        // Add four more pages so HashMap iteration order would shuffle
+        // page numbering observably if the bug regressed.
+        for _ in 0..4 {
+            document_create_node("Page", None, &CreateNodeProps::default()).expect("page");
+        }
+
+        // First resolve: confirm we got 5 pages numbered 1..=5 in order.
+        let first = page_resolve_contexts();
+        assert_eq!(first.len(), 5, "expected 5 pages, got {}", first.len());
+        for (i, ctx) in first.iter().enumerate() {
+            assert_eq!(
+                ctx.display_number,
+                (i + 1) as u32,
+                "page {i} has unexpected display_number {}",
+                ctx.display_number,
+            );
+        }
+
+        // Stability: repeat 32 times. Any HashMap-iteration regression
+        // would produce a different ordering on at least one call
+        // within a handful of iterations (rust's HashMap uses a
+        // process-randomised hasher).
+        for attempt in 0..32 {
+            let again = page_resolve_contexts();
+            assert_eq!(
+                again, first,
+                "page_resolve_contexts disagreed with itself on attempt {attempt}",
+            );
+        }
+
+        project_close();
+    }
+
+    /// Section restarts must also resolve deterministically. We
+    /// re-tag two of the pages with `page_set_section` and verify
+    /// the resulting display numbers are stable across calls.
+    #[test]
+    #[serial]
+    fn page_resolve_contexts_respects_section_restarts_deterministically() {
+        reset_for_tests();
+        let dir = tempfile::tempdir().expect("tempdir");
+        project_create("sections", dir.path()).expect("create");
+
+        let mut page_ids: Vec<Uuid> = Vec::new();
+        // First page already exists from project_create; capture its id.
+        with_workspace(|ws| {
+            for id in ws.project.document.root_ids() {
+                if let Some(n) = ws.project.document.get_node(*id) {
+                    if n.node_type == kcreate_core::node::NodeType::Page {
+                        page_ids.push(*id);
+                    }
+                }
+            }
+            Ok(())
+        })
+        .expect("capture page ids");
+        for _ in 0..3 {
+            let id = document_create_node("Page", None, &CreateNodeProps::default())
+                .expect("create page");
+            page_ids.push(id);
+        }
+
+        // Restart section at page index 2 with prefix "B-". Numbering
+        // should then be 1, 2, B-1, B-2.
+        page_set_section(page_ids[2], Some(1), Some("B-".into())).expect("set section");
+
+        let first = page_resolve_contexts();
+        assert_eq!(first.len(), 4);
+        assert_eq!(first[0].display_number, 1);
+        assert_eq!(first[0].section_prefix, None);
+        assert_eq!(first[1].display_number, 2);
+        assert_eq!(first[1].section_prefix, None);
+        assert_eq!(first[2].display_number, 1);
+        assert_eq!(first[2].section_prefix.as_deref(), Some("B-"));
+        assert_eq!(first[3].display_number, 2);
+        assert_eq!(first[3].section_prefix.as_deref(), Some("B-"));
+
+        for _ in 0..32 {
+            assert_eq!(page_resolve_contexts(), first);
+        }
+
+        project_close();
+    }
 }

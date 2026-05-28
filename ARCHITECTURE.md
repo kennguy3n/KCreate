@@ -988,26 +988,39 @@ affected node atomically.
 ## 17f. Constraint system (Phase 8)
 
 Phase 8 wires the existing `Constraints` type on `Node` into
-the document resize flow. `Constraints` is per-axis:
+the document resize flow. `Constraints` is per-axis and pairs
+a horizontal + vertical `Constraint`:
 
 ```rust
-pub enum ConstraintAxis {
-    Fixed,           // hold offset from parent edge
-    Scale,           // proportional resize
-    StretchToParent, // edge follows parent edge
-    Center,          // recenter inside parent
-    LeftAndRight,    // pin both edges (horizontal axis)
-    TopAndBottom,    // pin both edges (vertical axis)
+pub enum Constraint {
+    Fixed,    // pin to leading edge (default)
+    Min,      // pin to leading edge (alias of Fixed today)
+    Max,      // pin to trailing edge (constant right/bottom inset)
+    Center,   // preserve offset from parent's center
+    Scale,    // resize position + extent proportionally
+    Stretch,  // pin both edges; extent grows / shrinks with parent
+}
+
+pub struct Constraints {
+    pub horizontal: Constraint,
+    pub vertical: Constraint,
 }
 ```
 
 `kcreate_layout::constraints::apply_constraints(child_bounds,
 constraints, parent_old, parent_new) -> Bounds` is the pure
 geometry primitive — same input always produces the same
-output, no side effects. The bridge entry point
-`phase8::document_resize_frame` walks the resized frame's
-children and rewrites each child's bounds using
-`apply_constraints`, then records a single `ResizeFrame`
+output, no side effects. Each `Constraint` variant maps to a
+single closed-form expression on the axis (see `solve_axis`
+in `crates/kcreate_layout/src/constraints.rs`). The solver
+clamps the resulting extent to `>= 0` so an aggressive parent
+resize collapses a `Stretch` child to zero width instead of
+producing a negative `Bounds::width` that downstream consumers
+would have to defensively guard.
+
+The bridge entry point `phase8::document_resize_frame` walks
+the resized frame's children and rewrites each child's bounds
+using `apply_constraints`, then records a single `ResizeFrame`
 operation so the change participates in undo / redo.
 
 ## 17g. Smart text auto-fit (Phase 8)

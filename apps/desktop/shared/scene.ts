@@ -4101,11 +4101,15 @@ export type PageNumberFormat =
  * Wire-format mirror of `kcreate_text::tokens::PageContext`. One
  * entry per page in the document, in document order. The shaper
  * uses these to substitute page-number tokens at render time.
+ *
+ * `section_prefix` is `null` when the page (and its enclosing
+ * section) has no prefix configured — mirrors the Rust
+ * `Option<String>` shape exactly.
  */
 export interface PageContext {
   display_number: number;
   section_total: number;
-  section_prefix: string;
+  section_prefix: string | null;
 }
 
 /**
@@ -4161,15 +4165,56 @@ export interface BrandKitVersionInfo {
 }
 
 /**
+ * Wire-format mirror of `kcreate_core::node::RgbaColor`. Channels
+ * are floats in `[0.0, 1.0]`.
+ */
+export interface RgbaColor {
+  r: number;
+  g: number;
+  b: number;
+  a: number;
+}
+
+/**
+ * Wire-format mirror of `kcreate_core::project::NamedColor`. A
+ * brand-kit colour swatch with a user-facing name and the resolved
+ * `RgbaColor`.
+ */
+export interface NamedColor {
+  name: string;
+  color: RgbaColor;
+}
+
+/**
+ * Wire-format mirror of `kcreate_storage::brand_versions::ColorChange`.
+ * Captures a swatch whose colour value changed between two snapshots,
+ * keyed by `name` so the UI can render `before` / `after` swatches
+ * side-by-side.
+ */
+export interface ColorChange {
+  name: string;
+  before: NamedColor;
+  after: NamedColor;
+}
+
+/**
  * Wire-format mirror of `kcreate_storage::brand_versions::BrandKitDiff`.
+ *
+ * All fields are present on every diff — empty arrays / `false` /
+ * `null` are valid "no change" values. `name_changed` is a JSON
+ * tuple `[before, after]` because Rust's `Option<(String, String)>`
+ * serialises that way; the UI should index `[0]` / `[1]` rather
+ * than `.before` / `.after`.
  */
 export interface BrandKitDiff {
-  added_colors: string[];
-  removed_colors: string[];
-  changed_colors: string[];
+  added_colors: NamedColor[];
+  removed_colors: NamedColor[];
+  changed_colors: ColorChange[];
   added_fonts: string[];
   removed_fonts: string[];
-  name_changed: { before: string; after: string } | null;
+  spacing_changed: boolean;
+  export_rules_changed: boolean;
+  name_changed: [string, string] | null;
 }
 
 /**

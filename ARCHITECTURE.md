@@ -921,6 +921,183 @@ keeps `kchat-dev-issuer` for the integration-test crate so the
 test suite can mint deterministic attestations without standing
 up a real backend.
 
+## 17d. Design-review annotations (Phase 8)
+
+Phase 8 introduces a per-page annotation layer for collaborative
+design review. Annotations live in `kcreate_core::annotation` as
+plain serde-compatible `Annotation` structs:
+
+```rust
+pub struct Annotation {
+    pub id: Uuid,
+    pub page_id: Uuid,
+    pub author_peer_id: String,
+    pub author_name: String,
+    pub position: AnnotationPosition,   // world coords on the page
+    pub text: String,
+    pub timestamp: DateTime<Utc>,
+    pub resolved: bool,
+    pub thread_id: Option<Uuid>,        // None = top-level pin
+}
+```
+
+Storage is handled by a dedicated `annotations` SQLite table in
+the project DB (`kcreate_storage::annotations`):
+`upsert_annotation`, `list_all`, `list_for_page`, `set_resolved`,
+`delete_annotation`. `AnnotationFilter` lets the renderer ask
+for "unresolved only" / "by author" without doing the work in
+JS.
+
+Annotations are designed to broadcast across a collab session
+via a future `Message::AnnotationBroadcast` variant; receivers
+upsert into their local store using the same `upsert_annotation`
+path, so the renderer's `AnnotationOverlay` reads the same
+table regardless of authorship.
+
+## 17e. Design-token binding (Phase 8)
+
+Phase 8 makes design tokens *live* — bound layers update
+within 100 ms of a token change.
+
+`NodeStyle` gains a `token_bindings: BTreeMap<String, String>`
+field mapping style property names (`"fill"`, `"font_size"`,
+`"border_radius"`, …) to the token id they're bound to.
+`kcreate_core::token_binding` is the single source of truth for
+the binding rules:
+
+- `bind_token(style, property, token_id, tokens)` validates the
+  binding (property must exist, token must exist, kind must
+  match — e.g. you can't bind `"fill"` to a numeric token) and
+  applies the current token value immediately so the binding
+  is consistent with the current state of the brand kit.
+- `unbind_token` removes a binding without rewriting the value
+  — the layer keeps whatever color/size the token had at the
+  time of detach.
+- `propagate_single_token(doc, token_name, tokens)` walks the
+  whole document and rewrites every node bound to that token.
+  This is the hot path the bridge calls when the user edits a
+  brand-kit token; the 1000-node integration test in
+  `crates/kcreate_tests/tests/token_binding.rs` confirms it
+  stays well under the PROPOSAL.md §4.6 100 ms budget.
+
+The bridge entry point `phase8::document_propagate_token`
+combines `propagate_single_token` with the workspace's brand
+kit and the operation log so an Undo step rolls back every
+affected node atomically.
+
+## 17f. Constraint system (Phase 8)
+
+Phase 8 wires the existing `Constraints` type on `Node` into
+the document resize flow. `Constraints` is per-axis:
+
+```rust
+pub enum ConstraintAxis {
+    Fixed,           // hold offset from parent edge
+    Scale,           // proportional resize
+    StretchToParent, // edge follows parent edge
+    Center,          // recenter inside parent
+    LeftAndRight,    // pin both edges (horizontal axis)
+    TopAndBottom,    // pin both edges (vertical axis)
+}
+```
+
+`kcreate_layout::constraints::apply_constraints(child_bounds,
+constraints, parent_old, parent_new) -> Bounds` is the pure
+geometry primitive — same input always produces the same
+output, no side effects. The bridge entry point
+`phase8::document_resize_frame` walks the resized frame's
+children and rewrites each child's bounds using
+`apply_constraints`, then records a single `ResizeFrame`
+operation so the change participates in undo / redo.
+
+## 17g. Smart text auto-fit (Phase 8)
+
+`kcreate_text::autofit::compute_autofit_size(text, font, min,
+max, frame)` binary-searches for the largest font size that
+fits the supplied text inside the supplied frame bounds without
+overflow, using the existing shaper for measurement. The
+bridge entry point `phase8::text_set_auto_fit(node_id,
+enabled)` flips a flag on the node; the document resize path
+calls `compute_autofit_size` whenever an auto-fit text node's
+container changes.
+
+## 17h. Page-numbering tokens (Phase 8)
+
+Page-numbering tokens are stored as a Unicode Private-Use
+sentinel (U+E100) followed by a format selector char. The
+shaper sees the sentinel + selector pair, resolves it against
+a `PageContext` (produced by walking the page list once and
+applying any section restarts in `PageLayout::section_start /
+section_prefix`), and substitutes the rendered text before
+shaping. Five formats ship: Arabic, lowercase / uppercase
+Roman, lowercase / uppercase alphabetic. Roman is
+subtractive (`IV`, `IX`, `XL`, …) and alphabetic is base-26
+(A–Z, AA–AZ, BA–BZ, …) — both implemented as real algorithms
+in `kcreate_text::tokens`, not as `format!("{n}")`.
+
+## 17i. SQLCipher encryption at rest (Phase 8)
+
+`kcreate_storage::crypto` derives a 256-bit raw key from a
+user-supplied passphrase via PBKDF2-HMAC-SHA256 with a
+per-project salt persisted in `manifest.json`. Iteration count
+is 200 000 (OWASP 2023 recommendation for SHA-256). The
+project store has three lifecycle entry points:
+
+- `ProjectStore::open_encrypted(path, passphrase)` —
+  opens / creates an encrypted DB. Hashes the passphrase with
+  the project's salt, calls `PRAGMA key = "x'...'"`.
+- `ProjectStore::encrypt_existing(path, passphrase)` — opens
+  the unencrypted DB, attaches an encrypted DB, copies every
+  row, replaces the file atomically.
+- `ProjectStore::change_key(old, new)` — re-keys without
+  re-attaching (`PRAGMA rekey = ...`).
+- `ProjectStore::export_unencrypted(path, passphrase, out)` —
+  the recovery escape hatch. Decrypts the project to a
+  plaintext copy at `out`; this is the user-facing answer to
+  the "what if I lose my passphrase" failure mode called out
+  in PROPOSAL.md §21.
+
+Unencrypted projects continue to work; the only behavioural
+difference is whether `PRAGMA key` is issued at open time. The
+salt lives in `manifest.json` so the encrypted DB can be
+recovered even after `change_key`.
+
+## 17j. Brand-kit versioning (Phase 8)
+
+`kcreate_storage::brand_versions` adds a `brand_kit_versions`
+SQLite table (separate from the live `brand_kits` table) that
+stores immutable JSON snapshots of every save. The Phase 8
+bridge surface exposes save / list / restore / diff:
+
+- `save_brand_kit_version(brand_kit_id, description)` — drops
+  a snapshot. `description` is the user's "what changed?"
+  string. The version id is a fresh UUID.
+- `list_brand_kit_versions(brand_kit_id)` — version history
+  in newest-first order.
+- `restore_brand_kit_version(version_id)` — overwrites the
+  live brand kit with the snapshot (the previous live state
+  is *not* auto-snapshotted; the renderer prompts the user
+  to save first).
+- `diff_brand_kit_versions(before, after)` — structured
+  `BrandKitDiff { added_colors, removed_colors,
+  changed_colors, added_fonts, removed_fonts, name_changed }`.
+  The renderer renders this as the green/red side-by-side
+  diff view PROPOSAL.md §4.6 calls for.
+
+## 17k. Job-first export presets (Phase 8)
+
+`kcreate_export::job_presets` ships a curated preset list per
+Home-screen job tile (`JobType::{AppOrWebsiteUi,
+LogoIconOrBrandKit, SocialMediaPost, ProductPhotoCleanup,
+PitchDeckOrProposal, FlyerPosterOrBrochure,
+DeveloperAssetExport}`). The bridge entry point
+`phase8::export_job_presets(job)` returns a
+`JobExportPresets { job_type, presets: Vec<JobExportPreset> }`
+struct the renderer can drop directly into the Export panel.
+Every preset is a real, validatable `ExportPreset` shape
+(format / scale / optional explicit width-height / optional
+bleed / optional background) — never a placeholder.
+
 ## 18. Resource optimization
 
 - **Startup.** Lazy-load model packs; precompile no shaders we won't

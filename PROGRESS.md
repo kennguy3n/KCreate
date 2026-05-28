@@ -728,8 +728,206 @@ links `reqwest`.
       `kcreate.invite.v1` content-type schema consumed by the
       companion extension.
 
+## Phase 8 — Production Hardening | In Progress
+
+Phase 8 is the production-hardening sweep that fills the gaps left
+by Phases 5–7 in the design-token / layout / brand-hub / image-studio
+surfaces and adds the encryption-at-rest, design-review, and
+artifact-publishing capabilities the proposal calls for.
+
+### Block A — KChat Artifact Publishing & Design Review (Tasks 1–6)
+- [x] **Task 4 (Rust core): Design review annotations.**
+      `crates/kcreate_core/src/annotation.rs` introduces
+      `Annotation { id, page_id, author_peer_id, author_name,
+      position, text, timestamp, resolved, thread_id }` plus
+      `AnnotationFilter`. Storage in
+      `crates/kcreate_storage/src/annotations.rs` (new
+      `annotations` table; `upsert_annotation`, `list_all`,
+      `list_for_page`, `set_resolved`, `delete_annotation`).
+      Per-page filtering + resolved/unresolved filtering.
+      `crates/kcreate_tests/tests/annotations.rs` exercises CRUD
+      round-trip, resolve/unresolve, per-page isolation, and
+      filter contracts.
+
+### Block B — Missing Image Studio Primitives (Tasks 7–12)
+- [x] **Task 7: Perspective transform.** `perspective_transform`
+      in `crates/kcreate_raster/src/transform.rs` computes the
+      3×3 projective matrix from the 4 destination corners and
+      applies inverse mapping with bilinear interpolation,
+      row-parallel via rayon. Identity (corners equal to the
+      source rectangle in TL/TR/BL/BR order) preserves pixels;
+      translated-canvas case covered by
+      `image_studio_advanced.rs`.
+- [x] **Task 8: Color range selection.** `select_by_color_range`
+      in `crates/kcreate_ai/src/color_range.rs` produces a
+      boolean mask using CIE76 ΔE in Lab space for perceptual
+      fuzziness. Row-parallel via rayon.
+- [x] **Task 9 (core variant): HSL adjustment layer.**
+      `AdjustmentLayer::HueSaturation { hue, saturation,
+      lightness }` already exists in
+      `crates/kcreate_raster/src/layer.rs` — Phase 5 shipped
+      the variant; Phase 8 adds dedicated regression coverage
+      in `image_studio_advanced.rs`.
+- [x] **Task 10: Color balance adjustment layer.**
+      `AdjustmentLayer::ColorBalance { shadows, midtones,
+      highlights }` in `crates/kcreate_raster/src/layer.rs`
+      applies three-way lift/gamma/gain in shadow / midtone /
+      highlight tonal ranges using a Gaussian-like falloff
+      centred on luminance 0.15 / 0.5 / 0.85. Identity (all
+      zeros) leaves pixels untouched.
+- [x] **Task 12 (partial): Image Studio tests.**
+      `crates/kcreate_tests/tests/image_studio_advanced.rs`
+      covers perspective identity + translation, color range
+      fuzziness boundaries, HSL roundtrip identity, color
+      balance neutrality.
+
+### Block C — Missing Layout Studio & Brand Hub Features (Tasks 13–18)
+- [x] **Task 13: Page-numbering tokens.**
+      `crates/kcreate_text/src/tokens.rs` introduces the
+      Unicode Private-Use sentinel U+E100 + format selector
+      (`PageNumberFormat::{Arabic, RomanLower, RomanUpper,
+      AlphaLower, AlphaUpper}`). The shaper expands tokens
+      against a `PageContext` produced by the resolver.
+      Roman / Alpha conversion is implemented as real
+      algorithms (subtractive Roman, A–Z…AA–AZ alpha).
+- [x] **Task 14: Section-based page numbering.** `PageLayout`
+      carries `section_start: Option<u32>` and
+      `section_prefix: Option<String>`.
+      `resolve_page_contexts` walks pages in order, applies
+      section restarts, and stamps `display_number` on each
+      `PageContext`.
+- [x] **Task 15: Brand kit versioning.**
+      `crates/kcreate_storage/src/brand_versions.rs` adds the
+      `brand_kit_versions` SQLite table and the
+      `save_brand_kit_version`, `list_brand_kit_versions`,
+      `restore_brand_kit_version`, `diff_brand_kit_versions`
+      surface. The diff is a structured
+      `BrandKitDiff { added_colors, removed_colors,
+      changed_colors, added_fonts, removed_fonts,
+      name_changed }`. `crates/kcreate_tests/tests/brand_versioning.rs`
+      exercises save / list / restore / diff round-trips.
+- [x] **Task 17: Job-first export presets.**
+      `crates/kcreate_export/src/job_presets.rs` curates a
+      preset list per Home-screen job tile: AppOrWebsiteUi
+      (PNG @1x/@2x/@3x + SVG sprite + CSS export),
+      LogoIconOrBrandKit (SVG clean + PNG favicon set + iOS
+      PDF + Android XML), SocialMediaPost (1080² + 1080×1920
+      + 1200×630), ProductPhotoCleanup (transparent PNG +
+      white-bg JPEG + WebP), PitchDeckOrProposal (16:9 + A4
+      PDF), FlyerPosterOrBrochure (300 dpi PDF with bleed +
+      web PNG), DeveloperAssetExport (SVG sprite + density
+      buckets + CSS variables).
+      `crates/kcreate_tests/tests/job_presets.rs` asserts
+      every job type returns a non-empty curated set and
+      that every preset's scale is positive.
+
+### Block D — Design Studio Polish & Missing Features (Tasks 19–24)
+- [x] **Task 19: Constraint system for responsive frames.**
+      `crates/kcreate_core/src/node.rs` defines
+      `Constraints { horizontal, vertical }` with the 6
+      axis modes (`Fixed`, `Scale`, `StretchToParent`,
+      `Center`, `LeftAndRight`, `TopAndBottom`).
+      `crates/kcreate_layout/src/constraints.rs` ships
+      `apply_constraints(child_bounds, child_constraints,
+      parent_old, parent_new) -> Bounds` and the
+      `crates/kcreate_bridge/src/phase8.rs::document_resize_frame`
+      walks the resized frame's children and rewrites each
+      child's bounds.
+      `crates/kcreate_tests/tests/constraints.rs` exercises
+      every axis mode, parent-resize propagation, and
+      no-op when the parent is unchanged.
+- [x] **Task 21: Design token propagation.** `NodeStyle`
+      gains `token_bindings: BTreeMap<String, String>` and
+      `crates/kcreate_core/src/token_binding.rs` exposes
+      `bind_token`, `unbind_token`, `refresh_style`,
+      `propagate_token_changes`, and the targeted
+      `propagate_single_token`. The bridge entry point
+      `phase8::document_propagate_token` walks every node
+      bound to the named token and rewrites it; the 1000-node
+      benchmark in
+      `crates/kcreate_tests/tests/token_binding.rs` confirms
+      it stays under the 100 ms PROPOSAL.md §4.6 budget.
+- [x] **Task 23: Smart text auto-fit.**
+      `crates/kcreate_text/src/autofit.rs` exposes
+      `compute_autofit_size(text, font, min, max, frame)`
+      which binary-searches for the largest font size that
+      fits the supplied text inside the frame without
+      overflow, using the existing shaper for measurement.
+      `crates/kcreate_tests/tests/text_autofit.rs` covers
+      binary-search convergence, min/max clamping, and the
+      identity case (text already fits).
+- [x] **Task 24: Design Studio tests.** Covered by the three
+      test modules above.
+
+### Block E — Performance, Security & Production Hardening (Tasks 25–28)
+- [x] **Task 25: SQLCipher encryption at rest.**
+      `crates/kcreate_storage/src/crypto.rs` derives a
+      256-bit key from a user passphrase via PBKDF2-HMAC-SHA256
+      with a per-project salt (200 000 iterations per OWASP
+      2023). `ProjectStore::open_encrypted`,
+      `encrypt_existing`, `change_key`, and the recovery
+      escape hatch `export_unencrypted` round-trip a real
+      `BrandKit` payload in
+      `crates/kcreate_tests/tests/encryption.rs`. Unencrypted
+      projects continue to work; the salt is persisted in
+      `manifest.json` so the project can survive a key
+      rotation without re-importing assets.
+
+### Block F — Documentation & Polish (Tasks 29–30)
+- [x] **Task 29: Phase tracking.** This file (`PROGRESS.md`).
+- [x] **Task 30: Docs sync.** `ARCHITECTURE.md` adds an
+      annotation/token-binding/constraint/SQLCipher section.
+      `AGENTS.md` indexes the new modules
+      (`annotation.rs`, `color_range.rs`, `constraints.rs`,
+      `autofit.rs`, `brand_versions.rs`, `job_presets.rs`,
+      `tokens.rs`, `crypto.rs`, `phase8.rs`).
+
+### Phase 8 — Bridge & wire-format lockstep
+- [x] **`crates/kcreate_bridge/src/phase8.rs`** owns the
+      workspace-level helpers for token binding, constraint
+      resize, autofit, page numbering, section pages, job
+      presets, and brand-kit versioning.
+- [x] **`crates/kcreate_bridge/src/lib.rs`** exposes 13 new
+      N-API entry points (`document_bind_token`,
+      `document_unbind_token`, `document_propagate_token`,
+      `document_resize_frame`, `text_set_auto_fit`,
+      `page_number_token`, `page_set_section`,
+      `page_resolve_contexts`, `export_job_presets`,
+      `brand_kit_save_version`, `brand_kit_list_versions`,
+      `brand_kit_restore_version`, `brand_kit_diff`).
+- [x] **`apps/desktop/shared/scene.ts`** mirrors the new
+      types (`Phase8Bridge`, `PageNumberFormat`, `PageContext`,
+      `JobType`, `JobExportPreset`, `JobExportPresets`,
+      `BrandKitVersionInfo`, `BrandKitDiff`, `ResizeFrameBounds`).
+- [x] **`apps/desktop/preload/src/preload.ts`** and
+      **`apps/desktop/main/src/{bridge,main}.ts`** wire the
+      IPC handlers + Bridge interface.
+
 ## Changelog
 
+- **2026-05-28** — Phase 8 (in progress): production-hardening
+  sweep — design-review annotations
+  (`kcreate_core::annotation`,
+  `kcreate_storage::annotations`), brand-kit versioning
+  (`kcreate_storage::brand_versions`), SQLCipher encryption
+  at rest with PBKDF2-HMAC-SHA256 key derivation
+  (`kcreate_storage::crypto`), perspective transform + color
+  range selection + color balance / HSL adjustment regression
+  coverage (`kcreate_raster`, `kcreate_ai::color_range`),
+  page-numbering tokens with section restart
+  (`kcreate_text::tokens`), constraint system for responsive
+  frames (`kcreate_layout::constraints`), design-token binding
+  with sub-100 ms propagation
+  (`kcreate_core::token_binding`,
+  `kcreate_bridge::phase8::document_propagate_token`),
+  smart text auto-fit (`kcreate_text::autofit`), job-first
+  export presets (`kcreate_export::job_presets`).
+  All Phase 8 features are wired through
+  `crates/kcreate_bridge/src/phase8.rs` + 13 N-API entry
+  points and mirrored in `apps/desktop/shared/scene.ts`
+  (`Phase8Bridge`). 9 new integration test modules in
+  `crates/kcreate_tests/tests/`. `local_first.rs` sentinel
+  stays green.
 - **2026-05-27 (PR #17)** — Phase 7: KChat Desktop
   (`uneycom/uney-chat-desktop`) integration, community-gated
   collaboration, real-time UX, security hardening, performance

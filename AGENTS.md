@@ -316,3 +316,17 @@ pnpm lint
 | ConflictToast UI                         | `apps/desktop/renderer/src/components/ConflictToast.tsx` |
 | Collab audit events                      | `crates/kcreate_audit/src/event.rs` (`AuditEventKind::Collab*`) |
 | Collab perf benchmarks                   | `crates/kcreate_bridge/benches/collab_perf.rs` (criterion, `collab` feature) |
+| Design-review annotations (core)         | `crates/kcreate_core/src/annotation.rs` |
+| Design-review annotations (storage)      | `crates/kcreate_storage/src/annotations.rs` |
+| Brand-kit versioning                     | `crates/kcreate_storage/src/brand_versions.rs` |
+| SQLCipher encryption at rest             | `crates/kcreate_storage/src/crypto.rs` + `crates/kcreate_storage/src/schema.rs` |
+| Design-token binding                     | `crates/kcreate_core/src/token_binding.rs` |
+| Constraint solver                        | `crates/kcreate_layout/src/constraints.rs` |
+| Smart text auto-fit                      | `crates/kcreate_text/src/autofit.rs` |
+| Page-numbering tokens                    | `crates/kcreate_text/src/tokens.rs` |
+| Job-first export presets                 | `crates/kcreate_export/src/job_presets.rs` |
+| Color range selection                    | `crates/kcreate_ai/src/color_range.rs` |
+| Perspective transform                    | `crates/kcreate_raster/src/transform.rs` (`perspective_transform`) |
+| HSL / Color balance adjustment layers    | `crates/kcreate_raster/src/layer.rs` (`AdjustmentLayer::{HueSaturation, ColorBalance}`) |
+| Phase 8 bridge surface                   | `crates/kcreate_bridge/src/phase8.rs` |
+| Phase 8 wire format (TypeScript mirror)  | `apps/desktop/shared/scene.ts` (`Phase8Bridge` + types) |

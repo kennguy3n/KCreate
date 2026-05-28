@@ -1254,9 +1254,22 @@ N-API marshalling in `kcreate_bridge::lib`:
 `raster_apply_color_balance(node_id, shadows_json,
 midtones_json, highlights_json)`,
 `raster_apply_filter_masked(node_id, filter_json, mask: Buffer)`
-(mask is a flat row-major `Uint8Array`: byte `0` means
-unselected, any non-zero byte means selected).
-TypeScript mirrors land in
+(mask is a flat row-major byte buffer: byte `0` means
+unselected, any non-zero byte means selected). The Rust
+N-API parameter is a `napi::bindgen_prelude::Buffer`,
+decoded via `napi_get_buffer_info` — that NAPI primitive
+only accepts Node `Buffer` instances, not plain
+`Uint8Array`. The renderer-facing API in
+`apps/desktop/shared/scene.ts` keeps the developer-friendly
+`Uint8Array` parameter; the preload (`applyFilterMasked` in
+`apps/desktop/preload/src/preload.ts`) bridges the two by
+wrapping with `Buffer.from(mask.buffer, mask.byteOffset,
+mask.byteLength)` — a zero-copy view over the same
+`ArrayBuffer` — before invoking the IPC channel. The
+main-process handler (`apps/desktop/main/src/main.ts`) and
+the `Bridge` interface (`apps/desktop/main/src/bridge.ts`)
+both type the parameter as `Buffer` in lockstep with the
+N-API surface. TypeScript mirrors land in
 `apps/desktop/shared/scene.ts` (`RasterOpsBridge.{perspective,
 applyHsl, applyColorBalance, applyFilterMasked}`) with the
 `RasterPreviewFilter` discriminated union extended in lockstep.

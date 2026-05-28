@@ -2143,11 +2143,22 @@ const rasterOps: RasterOpsBridge = {
     filter: RasterPreviewFilter,
     mask: Uint8Array,
   ): Promise<void> {
+    // The Rust N-API surface (`raster_apply_filter_masked` in
+    // `crates/kcreate_bridge/src/lib.rs`) declares the mask as
+    // `napi::bindgen_prelude::Buffer`, which is decoded via
+    // `napi_get_buffer_info` — that NAPI primitive only accepts
+    // Node.js `Buffer` instances, not plain `Uint8Array`. Wrap with
+    // `Buffer.from(mask.buffer, mask.byteOffset, mask.byteLength)` so
+    // the resulting Buffer shares the existing ArrayBuffer (no copy)
+    // and crosses the IPC boundary as a Buffer the bridge can decode.
+    // This mirrors the convention already used by every other binary
+    // IPC parameter in this file (e.g. `documentImportImageBytes`,
+    // `visionDescribeImage`, `clipboard-share`).
     await ipcRenderer.invoke(
       "kcreate/raster/apply/filter_masked",
       nodeId,
       JSON.stringify(filter),
-      mask,
+      Buffer.from(mask.buffer, mask.byteOffset, mask.byteLength),
     );
   },
 };

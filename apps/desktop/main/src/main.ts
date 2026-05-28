@@ -2234,7 +2234,12 @@ function registerIpcHandlers(): void {
   );
   ipcMain.handle(
     "kcreate/raster/apply/filter_masked",
-    (_e, nodeId: string, filterJson: string, mask: Uint8Array) => {
+    (_e, nodeId: string, filterJson: string, mask: Buffer) => {
+      // `mask` arrives as a Node `Buffer` because the preload wraps
+      // the renderer-supplied `Uint8Array` with
+      // `Buffer.from(buffer, byteOffset, byteLength)` before invoke;
+      // typing it as `Buffer` here keeps the contract obvious and
+      // matches the napi-rs `Buffer` decoder in `raster_apply_filter_masked`.
       requireBridge().rasterApplyFilterMasked(nodeId, filterJson, mask);
     },
   );

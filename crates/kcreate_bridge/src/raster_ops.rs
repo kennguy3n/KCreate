@@ -723,6 +723,18 @@ impl std::error::Error for MaskShapeMismatch {}
 /// canvas edge. This avoids a spurious feather where the canvas
 /// edge happens to be a mask boundary.
 fn feather_mask_weights(mask: &[u8], width: u32, height: u32) -> Vec<f32> {
+    // `par_chunks_mut(w)` requires a non-zero chunk size. The two
+    // upstream call sites (`apply_filter_masked` via
+    // `load_layer_pixels`, plus the unit tests) only feed in
+    // positive dimensions because the `image` crate rejects zero-
+    // sized PNGs before we ever construct `LayerPixels`. Pin the
+    // contract here so a future caller that bypasses
+    // `load_layer_pixels` fails loudly in debug builds rather than
+    // tripping a rayon panic in release.
+    debug_assert!(
+        width > 0 && height > 0,
+        "feather_mask_weights requires positive dimensions (got {width}x{height})",
+    );
     let w = width as usize;
     let h = height as usize;
     let mut weights = vec![0.0_f32; w * h];
@@ -775,6 +787,16 @@ fn feather_mask_weights(mask: &[u8], width: u32, height: u32) -> Vec<f32> {
 ///
 /// Alpha is blended on the same weight curve so feathered edges
 /// reveal the underlying transparency naturally.
+///
+/// Memory profile: at peak the routine holds two full RGBA copies of
+/// the layer (the source — consumed into the output — and the
+/// filtered buffer) plus the `f32` weight grid. A 4K layer therefore
+/// costs ~33 MB × 2 + ~33 MB of weights ≈ 100 MB transient. The
+/// destination buffer reuses the source allocation in place: we
+/// start from `pixels.rgba`, treat each `4`-byte slot as both source
+/// and destination, and only memcpy the filter output for the
+/// `w >= 1.0` and intermediate-weight branches. The `w <= 0.0`
+/// branch is now a true no-op (no redundant `copy_from_slice`).
 pub fn apply_filter_masked(node_id: Uuid, filter: PreviewFilter, mask: Vec<u8>) -> Result<()> {
     let pixels = load_layer_pixels(node_id)?;
     let total = (pixels.width as usize) * (pixels.height as usize);
@@ -807,25 +829,38 @@ pub fn apply_filter_masked(node_id: Uuid, filter: PreviewFilter, mask: Vec<u8>) 
     }
 
     let weights = feather_mask_weights(&mask, pixels.width, pixels.height);
-    let mut out = pixels.rgba.clone();
+    let LayerPixels {
+        rgba: mut out,
+        width,
+        height,
+    } = pixels;
+    // Blend in place over the source buffer: each `out_px` chunk
+    // starts holding the source bytes (because `out` is the moved
+    // `pixels.rgba`), so the `w <= 0.0` branch becomes a true no-op
+    // and the intermediate-weight branch reads its `s` operand from
+    // the same chunk it's about to overwrite. Saves one full RGBA
+    // allocation (~33 MB at 4K) vs. cloning the source into a
+    // separate output buffer.
     out.par_chunks_mut(4)
-        .zip(pixels.rgba.par_chunks(4))
         .zip(filtered.par_chunks(4))
         .zip(weights.par_iter())
-        .for_each(|(((out_px, src_px), filt_px), &w)| {
+        .for_each(|((out_px, filt_px), &w)| {
             if w <= 0.0 {
-                // Fully unmasked — copy source exactly. (Skip the
-                // float blend so the bytes round-trip bit-exact.)
-                out_px.copy_from_slice(src_px);
+                // Fully unmasked — leave the source bytes in place.
                 return;
             }
             if w >= 1.0 {
-                // Fully masked — copy filter verbatim.
+                // Fully masked — overwrite the source slot with the
+                // filter output verbatim.
                 out_px.copy_from_slice(filt_px);
                 return;
             }
             for i in 0..4 {
-                let s = f32::from(src_px[i]);
+                // `out_px[i]` currently holds the source byte (the
+                // chunk has not been written this iteration), so we
+                // read it as the `s` operand and immediately store
+                // the blended result back.
+                let s = f32::from(out_px[i]);
                 let f = f32::from(filt_px[i]);
                 let blended = s.mul_add(1.0 - w, f * w);
                 out_px[i] = blended.round().clamp(0.0, 255.0) as u8;
@@ -836,8 +871,8 @@ pub fn apply_filter_masked(node_id: Uuid, filter: PreviewFilter, mask: Vec<u8>) 
     replace_layer_pixels(
         node_id,
         out,
-        pixels.width,
-        pixels.height,
+        width,
+        height,
         "raster_apply_filter_masked",
         serde_json::json!({
             "filter": filter,

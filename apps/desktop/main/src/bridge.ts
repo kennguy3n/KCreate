@@ -690,15 +690,20 @@ export interface Bridge {
     midtonesJson: string,
     highlightsJson: string,
   ): void;
-  // `mask` is a flat row-major `Uint8Array` of length
+  // `mask` is a flat row-major `Buffer` of length
   // `layer_width * layer_height`. Byte `0` means "not selected";
   // any non-zero byte means "selected". Crossing the IPC boundary
   // as bytes (rather than `boolean[]`) avoids per-element
-  // structured-clone work on large masks.
+  // structured-clone work on large masks. The Rust N-API decodes
+  // this via `napi_get_buffer_info`, which only accepts Node
+  // `Buffer` — the preload wraps the renderer-facing `Uint8Array`
+  // with `Buffer.from(buffer, byteOffset, byteLength)` (zero-copy
+  // view over the same ArrayBuffer) before invoking the IPC
+  // channel.
   rasterApplyFilterMasked(
     nodeId: string,
     filterJson: string,
-    mask: Uint8Array,
+    mask: Buffer,
   ): void;
   // Phase 5 — vector path operations + non-destructive effects
   // (Block C Tasks 15, 16, 18). All mutate the VectorLayer's

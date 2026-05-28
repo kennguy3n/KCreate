@@ -304,11 +304,7 @@ fn basis_to_points(pts: &[(f64, f64); 4]) -> Option<Mat3> {
 /// destination corners (top-left, top-right, bottom-left,
 /// bottom-right). Returns `None` when the destinations are
 /// degenerate.
-fn perspective_matrix(
-    src_w: f64,
-    src_h: f64,
-    dst: &[(f64, f64); 4],
-) -> Option<Mat3> {
+fn perspective_matrix(src_w: f64, src_h: f64, dst: &[(f64, f64); 4]) -> Option<Mat3> {
     let src = [(0.0, 0.0), (src_w, 0.0), (0.0, src_h), (src_w, src_h)];
     let s = basis_to_points(&src)?;
     let d = basis_to_points(dst)?;
@@ -331,8 +327,8 @@ fn perspective_matrix(
 /// no-op for an invertible-transform API.
 #[must_use]
 pub fn perspective_transform(grid: &TileGrid, corners: [(f64, f64); 4]) -> TileGrid {
-    let src_w = grid.width as f64;
-    let src_h = grid.height as f64;
+    let src_w = f64::from(grid.width);
+    let src_h = f64::from(grid.height);
     if src_w == 0.0 || src_h == 0.0 {
         return grid.clone();
     }
@@ -546,10 +542,7 @@ mod tests {
     #[test]
     fn perspective_identity_corners_round_trip() {
         let g = checker(32, 32);
-        let out = perspective_transform(
-            &g,
-            [(0.0, 0.0), (32.0, 0.0), (0.0, 32.0), (32.0, 32.0)],
-        );
+        let out = perspective_transform(&g, [(0.0, 0.0), (32.0, 0.0), (0.0, 32.0), (32.0, 32.0)]);
         assert_eq!(out.width, 32);
         assert_eq!(out.height, 32);
         // Identity mapping reproduces the source bitmap up to
@@ -567,10 +560,7 @@ mod tests {
     #[test]
     fn perspective_degenerate_returns_source() {
         let g = checker(16, 16);
-        let out = perspective_transform(
-            &g,
-            [(0.0, 0.0), (0.0, 0.0), (0.0, 0.0), (0.0, 0.0)],
-        );
+        let out = perspective_transform(&g, [(0.0, 0.0), (0.0, 0.0), (0.0, 0.0), (0.0, 0.0)]);
         // Degenerate (all corners collapsed): we return the input
         // unchanged so the editor never produces a 0×0 grid.
         assert_eq!(out.to_image(), g.to_image());
@@ -589,10 +579,7 @@ mod tests {
         buf[2] = 255;
         let g = TileGrid::from_image(&buf, 32, 32, 16).expect("grid");
         // Trapezoid: top edge shifted inward by 5 px on either side.
-        let out = perspective_transform(
-            &g,
-            [(5.0, 0.0), (27.0, 0.0), (0.0, 32.0), (32.0, 32.0)],
-        );
+        let out = perspective_transform(&g, [(5.0, 0.0), (27.0, 0.0), (0.0, 32.0), (32.0, 32.0)]);
         // The top-left corner of the source maps to (5, 0); check
         // that the alpha at output (5, 0) is bright.
         let stride = (out.width as usize) * 4;

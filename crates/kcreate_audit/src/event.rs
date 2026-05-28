@@ -364,7 +364,10 @@ mod tests {
         let json = serde_json::to_string(&event).unwrap();
         // The inner enum is `#[serde(tag = "action")]` so the
         // discriminator key must be `action`, not `type`.
-        assert!(json.contains("\"action\":\"peer_kicked\""), "json was {json}");
+        assert!(
+            json.contains("\"action\":\"peer_kicked\""),
+            "json was {json}"
+        );
         let back: AuditEvent = serde_json::from_str(&json).unwrap();
         assert_eq!(back, event);
     }

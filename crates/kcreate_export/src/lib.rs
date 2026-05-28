@@ -19,6 +19,7 @@ pub mod cmyk_dither;
 pub mod code_gen;
 pub mod figma_import;
 pub mod icon_pack;
+pub mod job_presets;
 pub mod jpeg;
 pub mod kbrand;
 pub mod pdf;

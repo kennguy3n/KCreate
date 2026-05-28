@@ -436,8 +436,8 @@ pub fn kchat_backend_sync_community_roster(
 pub fn kchat_backend_accept_invite(
     invite_json: &str,
 ) -> Result<KChatAcceptedInvite, KChatBackendBridgeError> {
-    let card: kcreate_kchat_client::InviteCardPayload = serde_json::from_str(invite_json)
-        .map_err(|e| {
+    let card: kcreate_kchat_client::InviteCardPayload =
+        serde_json::from_str(invite_json).map_err(|e| {
             KChatBackendBridgeError::Attestation(format!("invite is not valid JSON: {e}"))
         })?;
 

@@ -2067,6 +2067,7 @@ dependencies = [
  "kcreate_core",
  "kcreate_export",
  "kcreate_kchat_client",
+ "kcreate_layout",
  "kcreate_mcp",
  "kcreate_raster",
  "kcreate_renderer",
@@ -2091,6 +2092,7 @@ dependencies = [
  "rustybuzz",
  "serde",
  "thiserror 1.0.69",
+ "uuid",
 ]
 
 [[package]]

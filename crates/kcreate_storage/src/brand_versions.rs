@@ -58,9 +58,8 @@ pub fn save_brand_kit_version(
         description: description.into(),
         snapshot: brand_kit.clone(),
     };
-    let snapshot_json = serde_json::to_string(&version.snapshot).map_err(|e| {
-        DatabaseError::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(e)))
-    })?;
+    let snapshot_json = serde_json::to_string(&version.snapshot)
+        .map_err(|e| DatabaseError::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(e))))?;
     conn.execute(
         "INSERT INTO brand_kit_versions (version_id, brand_kit_id, timestamp, description, snapshot)
          VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -189,11 +188,7 @@ fn row_to_version(row: &rusqlite::Row<'_>) -> rusqlite::Result<BrandKitVersion> 
     let description: String = row.get(3)?;
     let snapshot_json: String = row.get(4)?;
     let snapshot: BrandKit = serde_json::from_str(&snapshot_json).map_err(|e| {
-        rusqlite::Error::FromSqlConversionFailure(
-            4,
-            rusqlite::types::Type::Text,
-            Box::new(e),
-        )
+        rusqlite::Error::FromSqlConversionFailure(4, rusqlite::types::Type::Text, Box::new(e))
     })?;
     Ok(BrandKitVersion {
         version_id: parse_uuid(&version_id)?,
@@ -214,11 +209,7 @@ fn row_to_version(row: &rusqlite::Row<'_>) -> rusqlite::Result<BrandKitVersion> 
 
 fn parse_uuid(s: &str) -> rusqlite::Result<Uuid> {
     Uuid::parse_str(s).map_err(|e| {
-        rusqlite::Error::FromSqlConversionFailure(
-            0,
-            rusqlite::types::Type::Text,
-            Box::new(e),
-        )
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
     })
 }
 
@@ -284,7 +275,7 @@ mod tests {
         let after = brand_kit_with_colors(
             "Acme",
             &[
-                ("primary", [10, 20, 31, 255]), // changed
+                ("primary", [10, 20, 31, 255]),      // changed
                 ("secondary", [100, 100, 100, 255]), // added
             ],
         );
@@ -306,10 +297,7 @@ mod tests {
         let mut after = after;
         after.id = before.id;
         let diff = diff_brand_kit_versions(&before, &after);
-        assert_eq!(
-            diff.name_changed,
-            Some(("Old".into(), "New".into()))
-        );
+        assert_eq!(diff.name_changed, Some(("Old".into(), "New".into())));
     }
 
     #[test]

@@ -75,7 +75,10 @@ fn acl_enforce_mode_rejects_peer_not_on_allowlist() {
             permission: AclPermission::Editor,
         }],
     };
-    assert_eq!(acl.evaluate(&allowed), AclDecision::Allow(AclPermission::Editor));
+    assert_eq!(
+        acl.evaluate(&allowed),
+        AclDecision::Allow(AclPermission::Editor)
+    );
     assert_eq!(acl.evaluate(&stranger), AclDecision::Deny);
 }
 
@@ -101,8 +104,14 @@ fn acl_enforce_mode_preserves_per_peer_permission() {
             },
         ],
     };
-    assert_eq!(acl.evaluate(&alice), AclDecision::Allow(AclPermission::Editor));
-    assert_eq!(acl.evaluate(&bob), AclDecision::Allow(AclPermission::Viewer));
+    assert_eq!(
+        acl.evaluate(&alice),
+        AclDecision::Allow(AclPermission::Editor)
+    );
+    assert_eq!(
+        acl.evaluate(&bob),
+        AclDecision::Allow(AclPermission::Viewer)
+    );
 }
 
 #[test]
@@ -341,8 +350,8 @@ fn clipboard_bad_nonce_length_rejected() {
         encrypt_clipboard_payload(&alice, &bob.verifying_key(), b"x", [0; 12]).unwrap();
     // Recipient passes the wrong nonce length — the helper must
     // refuse to even feed it to the cipher.
-    let err = decrypt_clipboard_payload(&bob, &alice.verifying_key(), &ciphertext, &[0; 11])
-        .unwrap_err();
+    let err =
+        decrypt_clipboard_payload(&bob, &alice.verifying_key(), &ciphertext, &[0; 11]).unwrap_err();
     assert!(matches!(err, ClipboardCryptoError::BadNonceLength));
 }
 

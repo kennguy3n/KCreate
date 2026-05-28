@@ -646,6 +646,17 @@ pub struct NodeStyle {
     /// documents loading unchanged.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub path_effects: Vec<PathEffect>,
+    /// Phase 8 token bindings: map from style property name
+    /// (`"fill"`, `"corner_radius"`, `"stroke_color"`, etc.) to
+    /// a design-token id from `Project::design_tokens`. When the
+    /// referenced token changes, the bridge layer rewrites the
+    /// corresponding property so the node stays in lockstep with
+    /// the brand kit.
+    ///
+    /// Empty by default. `BTreeMap` (not `HashMap`) so the
+    /// serialised form is deterministic and diff-friendly.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub token_bindings: std::collections::BTreeMap<String, String>,
 }
 
 /// A non-destructive path effect. Stored on
@@ -686,6 +697,7 @@ impl Default for NodeStyle {
             stroke_width_profile: None,
             overprint: false,
             path_effects: Vec::new(),
+            token_bindings: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -1117,6 +1129,16 @@ pub struct PageLayout {
     pub margins: Margins,
     pub master_page_id: Option<Uuid>,
     pub page_number: Option<u32>,
+    /// When `Some`, page numbering restarts here. Subsequent pages
+    /// without their own `section_start` continue the counter from
+    /// this value. Used by the Layout Studio "section break" tool.
+    #[serde(default)]
+    pub section_start: Option<u32>,
+    /// Optional prefix applied to the resolved page number — e.g.
+    /// `"A-"` produces `"A-1"`, `"A-2"`, etc. Inherited by pages
+    /// in the same section.
+    #[serde(default)]
+    pub section_prefix: Option<String>,
 }
 
 impl PageLayout {
@@ -1129,6 +1151,8 @@ impl PageLayout {
             margins: Margins::default(),
             master_page_id: None,
             page_number: None,
+            section_start: None,
+            section_prefix: None,
         }
     }
 
@@ -1758,6 +1782,8 @@ mod tests {
             margins: Margins::uniform(20.0),
             master_page_id: Some(Uuid::new_v4()),
             page_number: Some(3),
+            section_start: Some(1),
+            section_prefix: Some("A-".into()),
         };
         let json = serde_json::to_string(&layout).expect("serialize");
         let back: PageLayout = serde_json::from_str(&json).expect("deserialize");

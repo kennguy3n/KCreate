@@ -18,6 +18,7 @@ serde.workspace = true
 thiserror.workspace = true
 parking_lot.workspace = true
 log.workspace = true
+uuid = { workspace = true, features = ["v4", "serde"] }
 # `kcreate_text` consumes `Bounds`, `TextFrameOptions`, and
 # `OpenTypeFeatures` from `kcreate_core`. The reverse dependency does
 # not exist (`kcreate_core` is the shared types crate and depends on

@@ -67,7 +67,9 @@ pub enum ClientError {
     /// (a) wait for the backend update or (b) fall back to the
     /// dev-mint flow if the build was compiled with
     /// `kchat-dev-issuer`.
-    #[error("KChat backend has not provisioned the membership attestation endpoint yet: {message}")]
+    #[error(
+        "KChat backend has not provisioned the membership attestation endpoint yet: {message}"
+    )]
     AttestationEndpointNotProvisioned { message: String },
 
     /// The backend returned a 429 and the client's bounded retry
@@ -110,9 +112,7 @@ impl ClientError {
     pub const fn requires_reauth(&self) -> bool {
         matches!(
             self,
-            Self::InvalidCredentials { .. }
-                | Self::RefreshExpired { .. }
-                | Self::NotAuthenticated
+            Self::InvalidCredentials { .. } | Self::RefreshExpired { .. } | Self::NotAuthenticated
         )
     }
 

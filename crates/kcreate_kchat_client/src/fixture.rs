@@ -32,7 +32,6 @@
 //! against [`RestClientConfig::production`](crate::rest::RestClientConfig::production)
 //! separately).
 
-
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -48,10 +47,10 @@ use chrono::Utc;
 use ed25519_dalek::SigningKey;
 use kcreate_collab::kchat::{KChatGroupId, KChatMembership};
 use kcreate_collab::peer::{decode_public_key, PeerId};
-#[allow(unused_imports)]
-use std::future::IntoFuture;
 use parking_lot::Mutex;
 use serde::Deserialize;
+#[allow(unused_imports)]
+use std::future::IntoFuture;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
@@ -165,10 +164,8 @@ impl FixtureServer {
         // seed) so tests can compare `peer_id` outputs against
         // known values.
         let local_signing = SigningKey::from_bytes(&[42u8; 32]);
-        let local_pub_b64 =
-            URL_SAFE_NO_PAD.encode(local_signing.verifying_key().to_bytes());
-        let local_peer_id =
-            PeerId::from_verifying_key(&local_signing.verifying_key());
+        let local_pub_b64 = URL_SAFE_NO_PAD.encode(local_signing.verifying_key().to_bytes());
+        let local_peer_id = PeerId::from_verifying_key(&local_signing.verifying_key());
         let identity = KChatIdentity {
             jid: "alice@kchat.example".into(),
             display_name: "Alice".into(),
@@ -216,8 +213,7 @@ impl FixtureServer {
 
         let issuer = SigningKey::from_bytes(&[7u8; 32]);
         let bad_issuer = SigningKey::from_bytes(&[8u8; 32]);
-        let issuer_pub_b64 =
-            URL_SAFE_NO_PAD.encode(issuer.verifying_key().to_bytes());
+        let issuer_pub_b64 = URL_SAFE_NO_PAD.encode(issuer.verifying_key().to_bytes());
 
         let state = Arc::new(FixtureState {
             behavior: Mutex::new(behavior),
@@ -296,10 +292,7 @@ fn build_router(state: Arc<FixtureState>) -> Router {
         .route("/api/v1/auth/refresh", post(handle_refresh))
         .route("/api/v1/identity", get(handle_identity))
         .route("/api/v1/communities", get(handle_list_communities))
-        .route(
-            "/api/v1/communities/:id/members",
-            get(handle_get_members),
-        )
+        .route("/api/v1/communities/:id/members", get(handle_get_members))
         .route(
             "/api/v1/communities/:id/attestation",
             post(handle_attestation),
@@ -312,10 +305,7 @@ fn build_router(state: Arc<FixtureState>) -> Router {
             "/api/v1/conversations/:id/messages",
             post(handle_post_message),
         )
-        .route(
-            "/api/v1/communities/:id/events",
-            get(handle_poll_events),
-        )
+        .route("/api/v1/communities/:id/events", get(handle_poll_events))
         .with_state(state)
 }
 

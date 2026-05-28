@@ -70,7 +70,9 @@ pub fn select_by_color_range(
 /// keep using the `Vec<bool>` form.
 #[must_use]
 pub fn pack_mask(mask: &[bool]) -> Vec<u8> {
-    mask.par_iter().map(|b| if *b { 255u8 } else { 0u8 }).collect()
+    mask.par_iter()
+        .map(|b| if *b { 255u8 } else { 0u8 })
+        .collect()
 }
 
 /// Convert sRGB → Lab via the standard D65 white-point pipeline
@@ -85,15 +87,11 @@ fn rgb_to_lab(r: u8, g: u8, b: u8) -> (f64, f64, f64) {
     let b = srgb_to_linear(f64::from(b) / 255.0);
 
     // sRGB D65 → XYZ (Bradford-adapted) matrix.
-    let x = 0.412_390_799_265_959_3 * r
-        + 0.357_584_339_383_877_9 * g
-        + 0.180_480_788_401_834_2 * b;
-    let y = 0.212_639_005_871_510_4 * r
-        + 0.715_168_678_767_756_2 * g
-        + 0.072_192_315_360_733_43 * b;
-    let z = 0.019_330_818_715_591_85 * r
-        + 0.119_194_779_794_625_99 * g
-        + 0.950_532_152_249_660_7 * b;
+    let x = 0.412_390_799_265_959_3 * r + 0.357_584_339_383_877_9 * g + 0.180_480_788_401_834_2 * b;
+    let y =
+        0.212_639_005_871_510_4 * r + 0.715_168_678_767_756_2 * g + 0.072_192_315_360_733_43 * b;
+    let z =
+        0.019_330_818_715_591_85 * r + 0.119_194_779_794_625_99 * g + 0.950_532_152_249_660_7 * b;
 
     // D65 reference white.
     let xn = 0.950_47;

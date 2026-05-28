@@ -246,23 +246,19 @@ impl Database {
     ///
     /// The plaintext `path` must already exist; calling this on a
     /// missing database is an error.
-    pub fn encrypt_existing(
-        path: impl AsRef<Path>,
-        key: &[u8],
-    ) -> Result<PathBuf, DatabaseError> {
+    pub fn encrypt_existing(path: impl AsRef<Path>, key: &[u8]) -> Result<PathBuf, DatabaseError> {
         if key.is_empty() {
             return Err(DatabaseError::EncryptionUnsupported);
         }
         let path = path.as_ref().to_path_buf();
         if !path.exists() {
-            return Err(DatabaseError::Sqlite(
-                rusqlite::Error::InvalidPath(path.clone()),
-            ));
+            return Err(DatabaseError::Sqlite(rusqlite::Error::InvalidPath(path)));
         }
         let tmp = path.with_extension("encrypted.tmp");
         if tmp.exists() {
-            std::fs::remove_file(&tmp)
-                .map_err(|e| DatabaseError::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(e))))?;
+            std::fs::remove_file(&tmp).map_err(|e| {
+                DatabaseError::Sqlite(rusqlite::Error::ToSqlConversionFailure(Box::new(e)))
+            })?;
         }
         // Open the source as plaintext and ATTACH the destination
         // with a fresh key, then sqlcipher_export.
@@ -528,7 +524,10 @@ mod tests {
             let _db = Database::open_encrypted(&path, &good).expect("create");
         }
         let err = Database::open_encrypted(&path, &bad).expect_err("wrong key");
-        assert!(matches!(err, DatabaseError::EncryptionWrongKey), "got {err:?}");
+        assert!(
+            matches!(err, DatabaseError::EncryptionWrongKey),
+            "got {err:?}"
+        );
     }
 
     #[test]
@@ -571,7 +570,10 @@ mod tests {
         }
         Database::change_key(&path, &old, &new).expect("rekey");
         let err = Database::open_encrypted(&path, &old).expect_err("old must fail");
-        assert!(matches!(err, DatabaseError::EncryptionWrongKey), "got {err:?}");
+        assert!(
+            matches!(err, DatabaseError::EncryptionWrongKey),
+            "got {err:?}"
+        );
         let db = Database::open_encrypted(&path, &new).expect("new key opens");
         let v: i64 = db
             .conn()

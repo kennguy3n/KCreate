@@ -20,10 +20,10 @@ use reqwest::Method;
 use crate::auth::{TokenSet, TokenStore};
 use crate::error::ClientError;
 use crate::protocol::{
-    AttestationRequest, CommunitiesListResponse, CommunityEventsResponse, ConversationsListResponse,
-    KChatCommunity, KChatCommunityMember, KChatConversation, KChatIdentity, LoginRequest,
-    LoginResponse, MembersListResponse, MembershipAttestation, PostMessageRequest,
-    PostMessageResponse,
+    AttestationRequest, CommunitiesListResponse, CommunityEventsResponse,
+    ConversationsListResponse, KChatCommunity, KChatCommunityMember, KChatConversation,
+    KChatIdentity, LoginRequest, LoginResponse, MembersListResponse, MembershipAttestation,
+    PostMessageRequest, PostMessageResponse,
 };
 use crate::rest::{RestClient, RestClientConfig};
 
@@ -108,10 +108,7 @@ impl KChatBackendClient {
         &self,
         community_id: &str,
     ) -> Result<Vec<KChatCommunityMember>, ClientError> {
-        let path = format!(
-            "/api/v1/communities/{}/members",
-            urlencoding(community_id)
-        );
+        let path = format!("/api/v1/communities/{}/members", urlencoding(community_id));
         let resp: MembersListResponse = self
             .rest
             .request_authed::<(), _>(Method::GET, &path, None)

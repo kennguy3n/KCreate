@@ -55,7 +55,8 @@ use thiserror::Error;
 /// secret) is a non-standard construction even though it produces a
 /// pseudorandom 32-byte output. `derive_key` makes the intent
 /// explicit and matches the BLAKE3 spec's recommendation.
-const KDF_CONTEXT: &str = "kcreate-clipboard-share v1 2025-05-27 X25519->ChaCha20-Poly1305 AEAD key";
+const KDF_CONTEXT: &str =
+    "kcreate-clipboard-share v1 2025-05-27 X25519->ChaCha20-Poly1305 AEAD key";
 
 /// Successfully decrypted clipboard payload — what the renderer
 /// hands to the paste pipeline.
@@ -136,10 +137,7 @@ pub fn decrypt_clipboard_payload(
 /// (signing) party and the remote public key. The same value is
 /// produced on both sides of the conversation because X25519 is
 /// commutative.
-fn derive_shared_aead_key(
-    local_signing: &SigningKey,
-    remote_public: &VerifyingKey,
-) -> [u8; 32] {
+fn derive_shared_aead_key(local_signing: &SigningKey, remote_public: &VerifyingKey) -> [u8; 32] {
     let scalar = ed25519_scalar_for_x25519(local_signing);
     let remote_point = MontgomeryPoint(derive_x25519_from_ed25519_public(remote_public));
     let shared = (remote_point * scalar).to_bytes();

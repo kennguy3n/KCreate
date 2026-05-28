@@ -40,6 +40,7 @@ pub use bg_remove::{
     apply_alpha_mask, remove_background, remove_background_with_backend, BgRemovalBackend,
     BgRemoveError, BgRemoveOptions,
 };
+pub use color_range::{pack_mask, select_by_color_range};
 pub use layout_suggest::{
     suggest_layout_grouping, Bounds as LayoutBounds, LayoutAlignment, LayoutNode,
     LayoutOrientation, LayoutSuggestError, LayoutSuggestOptions, LayoutSuggestion,
@@ -65,7 +66,6 @@ pub use segment::{
     segment_image, segment_with_backend, SegmentBackend, SegmentError, SegmentMask, SegmentOptions,
     SegmentResult,
 };
-pub use color_range::{pack_mask, select_by_color_range};
 pub use smart_select::smart_select;
 pub use task_router::{
     build_accessibility_prompt, build_design_token_prompt, build_layer_naming_prompt, execute_task,

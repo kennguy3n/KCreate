@@ -24,7 +24,9 @@ pub use crypto::{
     derive_key, generate_salt, passphrase_strength, DEFAULT_PBKDF2_ITERATIONS, KEY_LEN, SALT_LEN,
 };
 
-pub use annotations::{delete_annotation, list_all, list_for_page, set_resolved, upsert_annotation};
+pub use annotations::{
+    delete_annotation, list_all, list_for_page, set_resolved, upsert_annotation,
+};
 pub use blobs::{BlobError, BlobRef, BlobStore};
 pub use brand_versions::{
     diff_brand_kit_versions, list_brand_kit_versions, load_brand_kit_version,

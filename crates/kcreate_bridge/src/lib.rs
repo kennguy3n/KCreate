@@ -2919,9 +2919,15 @@ pub fn session_start(
 ) -> NapiResult<String> {
     let pid = parse_uuid(&project_id)?;
     let dir = project_dir.map(std::path::PathBuf::from);
-    let report =
-        crate::collab::session_start(&seed_b64, &display_name, pid, advertise_mdns, community_id, dir)
-            .map_err(map_session_err)?;
+    let report = crate::collab::session_start(
+        &seed_b64,
+        &display_name,
+        pid,
+        advertise_mdns,
+        community_id,
+        dir,
+    )
+    .map_err(map_session_err)?;
     serde_json::to_string(&report).map_err(|e| {
         NapiError::new(
             Status::GenericFailure,
@@ -3395,8 +3401,8 @@ pub fn kchat_backend_connect(request_json: String) -> NapiResult<String> {
                 "kchat_backend_connect: invalid sign-in request: {e}"
             ))
         })?;
-    let status = crate::kchat_backend::kchat_backend_connect(request)
-        .map_err(map_kchat_backend_err)?;
+    let status =
+        crate::kchat_backend::kchat_backend_connect(request).map_err(map_kchat_backend_err)?;
     serde_json::to_string(&status)
         .map_err(|e| NapiError::from_reason(format!("kchat_backend_connect: {e}")))
 }
@@ -3406,8 +3412,7 @@ pub fn kchat_backend_connect(request_json: String) -> NapiResult<String> {
 #[cfg(feature = "kchat-backend")]
 #[napi]
 pub fn kchat_backend_disconnect() -> NapiResult<String> {
-    let status =
-        crate::kchat_backend::kchat_backend_disconnect().map_err(map_kchat_backend_err)?;
+    let status = crate::kchat_backend::kchat_backend_disconnect().map_err(map_kchat_backend_err)?;
     serde_json::to_string(&status)
         .map_err(|e| NapiError::from_reason(format!("kchat_backend_disconnect: {e}")))
 }
@@ -3648,11 +3653,8 @@ pub fn session_clipboard_share(
 /// pending queue regardless of decryption outcome.
 #[cfg(feature = "collab")]
 #[napi]
-pub fn session_clipboard_accept(
-    offer_id: String,
-) -> NapiResult<napi::bindgen_prelude::Buffer> {
-    let bytes = crate::collab::session_clipboard_accept(&offer_id)
-        .map_err(map_session_err)?;
+pub fn session_clipboard_accept(offer_id: String) -> NapiResult<napi::bindgen_prelude::Buffer> {
+    let bytes = crate::collab::session_clipboard_accept(&offer_id).map_err(map_session_err)?;
     Ok(bytes.into())
 }
 
@@ -3686,11 +3688,13 @@ pub fn session_pending_clipboard_offers() -> NapiResult<String> {
     let entries = crate::collab::session_pending_clipboard_offers();
     let wire: Vec<WireClipboardOffer> = entries
         .into_iter()
-        .map(|(offer_id, from_peer_id, preview_label)| WireClipboardOffer {
-            offer_id,
-            from_peer_id,
-            preview_label,
-        })
+        .map(
+            |(offer_id, from_peer_id, preview_label)| WireClipboardOffer {
+                offer_id,
+                from_peer_id,
+                preview_label,
+            },
+        )
         .collect();
     serde_json::to_string(&wire).map_err(|e| {
         NapiError::new(

@@ -56,8 +56,8 @@ impl TokenSet {
     /// response.
     #[must_use]
     pub fn from_login(resp: LoginResponse, now: DateTime<Utc>) -> Self {
-        let expires_at = now
-            + chrono::Duration::seconds(resp.expires_in_seconds.min(i64::MAX as u64) as i64);
+        let expires_at =
+            now + chrono::Duration::seconds(resp.expires_in_seconds.min(i64::MAX as u64) as i64);
         Self {
             access_token: resp.access_token,
             refresh_token: resp.refresh_token,
@@ -72,8 +72,8 @@ impl TokenSet {
     pub fn apply_refresh(&mut self, resp: RefreshResponse, now: DateTime<Utc>) {
         self.access_token = resp.access_token;
         self.refresh_token = resp.refresh_token;
-        self.expires_at = now
-            + chrono::Duration::seconds(resp.expires_in_seconds.min(i64::MAX as u64) as i64);
+        self.expires_at =
+            now + chrono::Duration::seconds(resp.expires_in_seconds.min(i64::MAX as u64) as i64);
     }
 
     /// True if the access token is past or near its expiry. The
@@ -130,11 +130,7 @@ impl TokenStore {
     /// Apply a refresh response in place. Returns the updated
     /// snapshot, or `None` if nobody is logged in (the caller
     /// should treat that as "refresh raced a logout").
-    pub fn apply_refresh(
-        &self,
-        resp: RefreshResponse,
-        now: DateTime<Utc>,
-    ) -> Option<TokenSet> {
+    pub fn apply_refresh(&self, resp: RefreshResponse, now: DateTime<Utc>) -> Option<TokenSet> {
         let mut guard = self.inner.write();
         let tokens = guard.as_mut()?;
         tokens.apply_refresh(resp, now);

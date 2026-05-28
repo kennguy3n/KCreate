@@ -258,10 +258,7 @@ async fn poll_events_returns_initial_member_joined() {
     let server = FixtureServer::spawn(FixtureBehavior::happy()).await;
     let client = KChatBackendClient::new_for_tests(&server.base_url).expect("client");
     client.login(&login_body(&server)).await.expect("login");
-    let resp = client
-        .poll_events("comm-design", None)
-        .await
-        .expect("poll");
+    let resp = client.poll_events("comm-design", None).await.expect("poll");
     assert!(!resp.events.is_empty());
     assert_eq!(resp.next_cursor, "cursor-1");
 }

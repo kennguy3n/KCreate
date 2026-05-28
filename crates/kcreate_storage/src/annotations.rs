@@ -39,7 +39,7 @@ pub fn upsert_annotation(conn: &Connection, ann: &Annotation) -> Result<(), Data
             ann.position.y,
             ann.text,
             ann.timestamp.to_rfc3339(),
-            ann.resolved as i64,
+            i64::from(ann.resolved),
             ann.thread_id.map(|id| id.to_string()),
         ],
     )?;
@@ -67,7 +67,7 @@ pub fn set_resolved(
 ) -> Result<Option<bool>, DatabaseError> {
     let n = conn.execute(
         "UPDATE annotations SET resolved = ?1 WHERE id = ?2",
-        params![resolved as i64, id.to_string()],
+        params![i64::from(resolved), id.to_string()],
     )?;
     if n == 0 {
         return Ok(None);
@@ -146,11 +146,13 @@ fn row_to_annotation(row: &rusqlite::Row<'_>) -> rusqlite::Result<Annotation> {
         },
         text,
         timestamp: chrono::DateTime::parse_from_rfc3339(&timestamp)
-            .map_err(|e| rusqlite::Error::FromSqlConversionFailure(
-                7,
-                rusqlite::types::Type::Text,
-                Box::new(e),
-            ))?
+            .map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    7,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
+            })?
             .with_timezone(&chrono::Utc),
         resolved: resolved != 0,
         thread_id: thread_id.as_deref().map(parse_uuid).transpose()?,
@@ -159,11 +161,7 @@ fn row_to_annotation(row: &rusqlite::Row<'_>) -> rusqlite::Result<Annotation> {
 
 fn parse_uuid(s: &str) -> rusqlite::Result<Uuid> {
     Uuid::parse_str(s).map_err(|e| {
-        rusqlite::Error::FromSqlConversionFailure(
-            0,
-            rusqlite::types::Type::Text,
-            Box::new(e),
-        )
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
     })
 }
 
@@ -184,7 +182,13 @@ mod tests {
     fn upsert_and_list_round_trip() {
         let (_tmp, db) = fresh_db();
         let page = Uuid::new_v4();
-        let ann = Annotation::new(page, "peer-1", "Alice", AnnotationPosition { x: 10.0, y: 20.0 }, "Hi");
+        let ann = Annotation::new(
+            page,
+            "peer-1",
+            "Alice",
+            AnnotationPosition { x: 10.0, y: 20.0 },
+            "Hi",
+        );
         upsert_annotation(db.conn(), &ann).expect("upsert");
         let found = list_for_page(db.conn(), page, AnnotationFilter::all()).expect("list");
         assert_eq!(found.len(), 1);
@@ -197,7 +201,13 @@ mod tests {
     fn upsert_overwrites_existing() {
         let (_tmp, db) = fresh_db();
         let page = Uuid::new_v4();
-        let mut ann = Annotation::new(page, "peer-1", "Alice", AnnotationPosition { x: 0.0, y: 0.0 }, "first");
+        let mut ann = Annotation::new(
+            page,
+            "peer-1",
+            "Alice",
+            AnnotationPosition { x: 0.0, y: 0.0 },
+            "first",
+        );
         upsert_annotation(db.conn(), &ann).expect("upsert");
         ann.text = "second".into();
         upsert_annotation(db.conn(), &ann).expect("upsert");
@@ -216,12 +226,19 @@ mod tests {
     fn set_resolved_toggles() {
         let (_tmp, db) = fresh_db();
         let page = Uuid::new_v4();
-        let ann = Annotation::new(page, "peer-1", "Alice", AnnotationPosition { x: 0.0, y: 0.0 }, "x");
+        let ann = Annotation::new(
+            page,
+            "peer-1",
+            "Alice",
+            AnnotationPosition { x: 0.0, y: 0.0 },
+            "x",
+        );
         upsert_annotation(db.conn(), &ann).expect("upsert");
         set_resolved(db.conn(), ann.id, true).expect("resolve");
         let after = list_for_page(db.conn(), page, AnnotationFilter::all()).expect("list");
         assert!(after[0].resolved);
-        let unres = list_for_page(db.conn(), page, AnnotationFilter::unresolved_only()).expect("list");
+        let unres =
+            list_for_page(db.conn(), page, AnnotationFilter::unresolved_only()).expect("list");
         assert!(unres.is_empty(), "resolved annotation should be filtered");
     }
 
@@ -230,8 +247,20 @@ mod tests {
         let (_tmp, db) = fresh_db();
         let page_a = Uuid::new_v4();
         let page_b = Uuid::new_v4();
-        let ann_a = Annotation::new(page_a, "p1", "A", AnnotationPosition { x: 0.0, y: 0.0 }, "a");
-        let ann_b = Annotation::new(page_b, "p1", "A", AnnotationPosition { x: 0.0, y: 0.0 }, "b");
+        let ann_a = Annotation::new(
+            page_a,
+            "p1",
+            "A",
+            AnnotationPosition { x: 0.0, y: 0.0 },
+            "a",
+        );
+        let ann_b = Annotation::new(
+            page_b,
+            "p1",
+            "A",
+            AnnotationPosition { x: 0.0, y: 0.0 },
+            "b",
+        );
         upsert_annotation(db.conn(), &ann_a).expect("upsert a");
         upsert_annotation(db.conn(), &ann_b).expect("upsert b");
         let list_a = list_for_page(db.conn(), page_a, AnnotationFilter::all()).expect("list");

@@ -33,6 +33,7 @@ pub mod marketplace;
 pub mod node;
 pub mod operation;
 pub mod project;
+pub mod token_binding;
 
 pub use annotation::{Annotation, AnnotationFilter, AnnotationPosition};
 pub use color::{
@@ -62,4 +63,8 @@ pub use project::{
     builtin_layout_templates, BrandKit, DesignTokens, ExportFormat, ExportPreset, FontRef,
     LayoutTemplate, NamedColor, Project, ProjectError, SectionKind, ShadowToken, TemplateCategory,
     TemplatePageDef, TemplateSectionDef, TypographyToken,
+};
+pub use token_binding::{
+    bind_token, nodes_bound_to, propagate_single_token, propagate_token_changes, refresh_style,
+    unbind_token, BindError, PropagationReport, StyleProperty, TokenKind,
 };

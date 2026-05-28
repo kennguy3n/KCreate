@@ -891,6 +891,8 @@ impl Project {
                 margins: crate::node::Margins::default(),
                 master_page_id: None,
                 page_number: Some(u32::try_from(idx + 1).unwrap_or(u32::MAX)),
+                section_start: None,
+                section_prefix: None,
             };
             let (w_mm, h_mm) = layout.dimensions_mm();
             let mut page = Node::new(NodeType::Page, def.name.clone());

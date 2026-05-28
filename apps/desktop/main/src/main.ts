@@ -945,6 +945,28 @@ function registerIpcHandlers(): void {
     requireBridge().resourceLimits(),
   );
 
+  // Phase 8 Block E Task 27 — startup-perf profiling. The bridge
+  // hands back a pre-serialised JSON string (snake_case fields,
+  // mirrors `kcreate_perf::Report`). Renderer parses on the
+  // preload boundary so the IPC payload stays a primitive string
+  // — same pattern as `resourceLimits` above.
+  ipcMain.handle("kcreate/runtime/startupTimeline", (): string =>
+    requireBridge().runtimeStartupTimeline(),
+  );
+  ipcMain.handle(
+    "kcreate/runtime/startupMark",
+    (_e, label: string): void => {
+      requireBridge().runtimeStartupMark(label);
+    },
+  );
+  // Phase 8 Block E Task 28 — tile-cache observability.
+  ipcMain.handle("kcreate/runtime/tileCacheStats", (): string =>
+    requireBridge().runtimeTileCacheStats(),
+  );
+  ipcMain.handle("kcreate/runtime/tileCacheClear", (): number =>
+    requireBridge().runtimeTileCacheClear(),
+  );
+
   ipcMain.handle(
     "kcreate/llm/start",
     (_e, modelPath: string): number =>

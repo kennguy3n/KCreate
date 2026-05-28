@@ -84,6 +84,8 @@ import type {
   RuntimeStatus,
   Scene,
   ScratchCleanupResult,
+  StartupTimelineReport,
+  TileCacheStats,
   SvgExportOptions,
   UpdateNodeProps,
   WebpExportOptions,
@@ -640,6 +642,38 @@ const runtime: RuntimeBridge = {
       JSON.parse(raw) as ResourceLimitsSnake,
     );
   },
+  async startupTimeline(): Promise<StartupTimelineReport | null> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/runtime/startupTimeline",
+    )) as string;
+    // The bridge returns the literal `"{}"` when the timeline
+    // has never been initialised. Detect that empty object case
+    // and surface it as `null` so the renderer's diagnostics
+    // overlay can hide its row cleanly.
+    const parsed = JSON.parse(raw) as Partial<StartupTimelineReportSnake>;
+    if (
+      typeof parsed.name !== "string" ||
+      !Array.isArray(parsed.marks) ||
+      !Array.isArray(parsed.phases)
+    ) {
+      return null;
+    }
+    return startupTimelineFromSnake(parsed as StartupTimelineReportSnake);
+  },
+  async startupMark(label: string): Promise<void> {
+    await ipcRenderer.invoke("kcreate/runtime/startupMark", label);
+  },
+  async tileCacheStats(): Promise<TileCacheStats> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/runtime/tileCacheStats",
+    )) as string;
+    return tileCacheStatsFromSnake(JSON.parse(raw) as TileCacheStatsSnake);
+  },
+  async tileCacheClear(): Promise<number> {
+    return (await ipcRenderer.invoke(
+      "kcreate/runtime/tileCacheClear",
+    )) as number;
+  },
   async writeTextFile(target: string, content: string): Promise<number> {
     return (await ipcRenderer.invoke(
       "kcreate/runtime/writeTextFile",
@@ -672,6 +706,62 @@ function resourceLimitsFromSnake(s: ResourceLimitsSnake): ResourceLimits {
     imageGenerationAllowed: s.image_generation_allowed,
     visionModelMaxMb: s.vision_model_max_mb,
     platform: s.platform,
+  };
+}
+
+// Phase 8 Block E Task 27 — wire shape produced by
+// `kcreate_perf::Report` (snake_case via serde).
+type StartupMarkSnake = {
+  label: string;
+  monotonic_ns: number;
+};
+type StartupPhaseSnake = {
+  label: string;
+  from_ns: number;
+  to_ns: number;
+  duration_ns: number;
+};
+type StartupTimelineReportSnake = {
+  name: string;
+  started_at_unix_ms: number;
+  total_ns: number;
+  marks: StartupMarkSnake[];
+  phases: StartupPhaseSnake[];
+};
+
+function startupTimelineFromSnake(
+  s: StartupTimelineReportSnake,
+): StartupTimelineReport {
+  return {
+    name: s.name,
+    startedAtUnixMs: s.started_at_unix_ms,
+    totalNs: s.total_ns,
+    marks: s.marks.map((m) => ({
+      label: m.label,
+      monotonicNs: m.monotonic_ns,
+    })),
+    phases: s.phases.map((p) => ({
+      label: p.label,
+      fromNs: p.from_ns,
+      toNs: p.to_ns,
+      durationNs: p.duration_ns,
+    })),
+  };
+}
+
+// Phase 8 Block E Task 28 — wire shape produced by
+// `kcreate_bridge::perf::TileCacheStats`.
+type TileCacheStatsSnake = {
+  bytes: number;
+  entries: number;
+  budget_bytes: number;
+};
+
+function tileCacheStatsFromSnake(s: TileCacheStatsSnake): TileCacheStats {
+  return {
+    bytes: s.bytes,
+    entries: s.entries,
+    budgetBytes: s.budget_bytes,
   };
 }
 

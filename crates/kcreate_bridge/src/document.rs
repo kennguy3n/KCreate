@@ -400,6 +400,11 @@ pub struct RuntimeStatus {
 /// should call [`project_close`] (or [`project_save`] followed by
 /// `project_close`) before switching projects.
 pub fn project_create(name: &str, dir: &Path) -> Result<ProjectInfo> {
+    // Phase 8 Block E Task 27: cold-path instrumentation. The two
+    // marks together let the renderer compute "real time spent
+    // creating the project" without needing wall-clock math —
+    // monotonic deltas only.
+    crate::perf::mark("project_create.start");
     // Hold the singleton lock across the entire create operation so
     // "another project is already open" stays a TOCTOU-free check. The
     // bridge calls are synchronous and short; serialising them is the
@@ -468,12 +473,16 @@ pub fn project_create(name: &str, dir: &Path) -> Result<ProjectInfo> {
     let _ = crate::thumbnails::prepare_thumbnails_background(
         crate::thumbnails::DEFAULT_THUMBNAIL_MAX_DIM_PX,
     );
+    crate::perf::mark("project_create.end");
     Ok(info)
 }
 
 /// Open an existing `.kstudio` directory. The process must not have
 /// another project open — callers should call [`project_close`] first.
 pub fn project_open(dir: &Path) -> Result<ProjectInfo> {
+    // Phase 8 Block E Task 27: cold-path instrumentation. Matches
+    // the bookend pattern used by `project_create` above.
+    crate::perf::mark("project_open.start");
     // Same lock discipline as `project_create`: hold across the entire
     // operation, no TOCTOU window between the check and the set.
     let mut guard = slot().lock();
@@ -535,6 +544,7 @@ pub fn project_open(dir: &Path) -> Result<ProjectInfo> {
     let _ = crate::thumbnails::prepare_thumbnails_background(
         crate::thumbnails::DEFAULT_THUMBNAIL_MAX_DIM_PX,
     );
+    crate::perf::mark("project_open.end");
     Ok(info)
 }
 
@@ -4552,6 +4562,12 @@ pub fn low_resource_mode_set(enabled: bool) {
         ws.project.operation_log.set_max_depth(new_depth);
     }
     drop(guard);
+    // Phase 8 Block E Task 28: re-sync the tile cache budget so
+    // toggling low-resource mode immediately reclaims (or grants)
+    // raster memory headroom. The runtime-config lock has already
+    // been released above; `resync_tile_cache_budget` takes the
+    // cache lock independently, so this is deadlock-free.
+    let _ = crate::perf::resync_tile_cache_budget();
 }
 
 /// Resolved resource limits the host UI surfaces in Settings.

@@ -29,7 +29,14 @@ KCreate/
 │   │                        driver (parallel + async cancel), PDF
 │   │                        preflight, icon pack generator, inspect-mode
 │   │                        code-gen (CSS / Tailwind / React)
-│   ├── kcreate_raster/      tile engine, masks, adjustment layers (Phase 1)
+│   ├── kcreate_perf/        cold-path startup profiling primitives
+│   │                        (`Timeline`, `Scope`, `Report`, process-wide
+│   │                        `startup` singleton). Phase 8 Block E Task 27.
+│   │                        Zero networking — safe in the editing-path
+│   │                        closure walked by `local_first.rs`.
+│   ├── kcreate_raster/      tile engine, masks, adjustment layers (Phase 1),
+│   │                        bounded `TileCache<K>` LRU
+│   │                        (`tile_cache.rs`, Phase 8 Block E Task 28)
 │   ├── kcreate_text/        font discovery (fontdb), shaping (rustybuzz),
 │   │                        outline walking (ttf-parser) → renderer paths
 │   ├── kcreate_ai/          local AI task router, action log, bg removal
@@ -191,6 +198,9 @@ pnpm lint
 | Add a vector path operation              | `crates/kcreate_vector/`                           |
 | Add a text layer / font feature          | `crates/kcreate_text/`                             |
 | Raster tile / mask / adjustment          | `crates/kcreate_raster/`                           |
+| Raster tile-cache LRU eviction           | `crates/kcreate_raster/src/tile_cache.rs`          |
+| Cold-path startup profiling primitives   | `crates/kcreate_perf/src/{timeline,report,startup}.rs` |
+| Bridge-side perf wiring (startup + tile cache singletons) | `crates/kcreate_bridge/src/perf.rs` |
 | Persistent storage (SQLite/blobs)        | `crates/kcreate_storage/`                          |
 | Export pipeline (PNG/SVG/PDF/WebP/JPEG)  | `crates/kcreate_export/`                           |
 | Document→Scene translation               | `crates/kcreate_bridge/src/scene_sync.rs`          |

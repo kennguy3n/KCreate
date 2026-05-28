@@ -1,0 +1,22 @@
+[package]
+name = "kcreate_perf"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Lightweight startup + cold-path profiling primitives for KCreate (Phase 8 Block E Task 27)"
+
+[features]
+# Exposes `kcreate_perf::startup::reset_for_tests` to dependent
+# crates so the bridge tests can reset the process-wide startup
+# singleton between cases. Production builds never enable this.
+test_support = []
+
+[lints]
+workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true

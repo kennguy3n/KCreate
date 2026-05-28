@@ -295,6 +295,71 @@ Implemented in `kcreate_raster::tile::TileGrid`. Tiles of 256×256
 cached LRU; pan only invalidates uncovered regions. Dirty-tile
 tracking for incremental updates.
 
+The LRU machinery lives in a separate
+`kcreate_raster::tile_cache::TileCache<K>` (Phase 8 Block E Task 28).
+It is generic over an opaque caller-supplied key (the bridge
+instantiates it as `TileCache<(Uuid, u32, u32)>` for
+`(layer_id, col, row)`), tracks raw pixel bytes via
+`tile.pixels.len()`, and evicts in monotonic-tick LRU order until the
+total drops at or below the configured byte budget. Two guarantees
+make it safe to slot in front of `TileGrid` reads:
+
+1. **MRU is never evicted to make room for itself.** If a caller
+   inserts a tile whose byte count exceeds the budget, the cache
+   evicts every *other* entry and stores the oversized tile,
+   briefly going over budget. The next bounded insert reclaims room.
+2. **Replace is byte-stable.** Re-inserting the same key returns the
+   old tile (so callers can persist dirty content before it is
+   dropped) without double-counting bytes.
+
+The bridge owns the process-wide singleton at
+`kcreate_bridge::perf::tile_cache_lock`. Its budget is seeded from
+`RuntimeConfig::effective_raster_cache_mb` on first access and
+re-synced whenever `low_resource_mode_set` flips the device tier
+budget — toggling low-resource mode immediately reclaims (or grants)
+raster headroom. The renderer observes the cache through two N-API
+entry points:
+
+- `runtime_tile_cache_stats()` → `{ bytes, entries, budget_bytes }`
+- `runtime_tile_cache_clear()` → evicted count
+
+`insert` / `get` are deliberately **not** exposed to the renderer;
+those are bridge-internal raster-op concerns.
+
+### Cold-path startup profiling
+
+Phase 8 Block E Task 27 introduces a tiny `kcreate_perf` crate that
+records named time marks on a monotonic clock. The crate has no
+networking, no async, and pulls only `serde` + `serde_json` (both
+already in the workspace), so it is safe to live in the editing-path
+closure walked by `local_first.rs`. It exposes three primitives:
+
+- **`Timeline`** — append-only sequence of named marks, each tagged
+  with a monotonic nanosecond offset from `Instant::now()`. A
+  single `started_at_unix_ms` anchor is captured at construction
+  for log correlation, but all *deltas* are computed from the
+  monotonic clock so resume-from-sleep cannot make a phase
+  duration go negative.
+- **`Scope`** — RAII span that emits `<label>.start` immediately
+  and `<label>.end` on drop. Calling `Scope::end` explicitly is
+  idempotent: the second mark (whether from the explicit call or
+  the `Drop` impl) is suppressed.
+- **`Report`** — serde-ready JSON snapshot with `marks` plus a
+  derived `phases` array (each phase runs from one mark to the
+  next, or to `total_ns` for the final phase).
+
+The `startup` module owns a process-wide
+`OnceLock<Mutex<Option<Timeline>>>`. `kcreate_bridge::perf` wires it
+on first touch (`ensure_startup_initialized`) and drops marks at
+`bridge.dlopen` (cdylib load), `project_create.{start,end}`, and
+`project_open.{start,end}`. The renderer drops its own
+`first_paint` / `first_interactive` marks on the same monotonic
+clock via the `runtime_startup_mark(label)` N-API entry, so a
+single `Report` tells the full cold-start story without juggling
+two clocks. `runtime_startup_timeline()` returns the JSON
+`Report`; the renderer's diagnostics overlay parses it on the
+preload boundary.
+
 ### Vector engine
 
 - **Path representation:** compact `Vec<PathSegment>` arrays in

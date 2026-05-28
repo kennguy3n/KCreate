@@ -1811,6 +1811,7 @@ dependencies = [
  "kcreate_kchat_client",
  "kcreate_layout",
  "kcreate_mcp",
+ "kcreate_perf",
  "kcreate_plugin",
  "kcreate_raster",
  "kcreate_renderer",
@@ -1980,6 +1981,14 @@ dependencies = [
  "thiserror 1.0.69",
  "tiny_http",
  "uuid",
+]
+
+[[package]]
+name = "kcreate_perf"
+version = "0.0.1"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

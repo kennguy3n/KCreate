@@ -25,6 +25,11 @@ kcreate_raster = { path = "../kcreate_raster" }
 kcreate_vector = { path = "../kcreate_vector" }
 kcreate_ai = { path = "../kcreate_ai" }
 kcreate_audit = { path = "../kcreate_audit" }
+# Phase 8 Block E Task 27: lightweight cold-path / startup
+# profiling primitives. The crate has no networking and no async,
+# so it is safe to live in the editing-path closure walked by
+# `local_first.rs`.
+kcreate_perf = { path = "../kcreate_perf" }
 # The MCP server is the *only* component of the editing-side runtime
 # that links a networking library (`tiny_http`). Per AGENTS.md the
 # editing path must stay network-free, so this is optional and gated

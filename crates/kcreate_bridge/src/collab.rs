@@ -466,6 +466,25 @@ const EVENT_QUEUE_CAP: usize = 1024;
 /// the QUIC idle timeout chosen by `kcreate_collab_transport`.
 const OP_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// Maximum age of an inbound `AnnotationBroadcast` (sender `sent_at`
+/// vs. receiver wall clock) we will accept. Broadcasts older than
+/// this are dropped — they represent resume-bundle replays of
+/// obsolete state that the resume-vector machinery will reconcile
+/// more efficiently than replaying every annotation upsert in
+/// order. 30 minutes comfortably covers laptop-lid-closed delays
+/// and short network outages, while keeping the replay surface
+/// from being unbounded.
+const ANNOTATION_BROADCAST_MAX_AGE: chrono::Duration = chrono::Duration::minutes(30);
+
+/// Maximum future skew (receiver wall clock behind sender
+/// `sent_at`) we tolerate before dropping an annotation broadcast.
+/// One minute is generous against NTP drift but rejects obvious
+/// clock-tampering attempts that try to forge "newest" timestamps
+/// to win LWW reconciliation. Symmetric tolerance on both sides
+/// would allow ~30 min of forward-skew abuse, so this one is
+/// deliberately tighter.
+const ANNOTATION_BROADCAST_MAX_FUTURE_SKEW: chrono::Duration = chrono::Duration::minutes(1);
+
 /// Internal state machine. One per process; gated by [`SLOT`].
 struct SessionState {
     host: LanCollabHost,
@@ -1535,6 +1554,48 @@ fn apply_lock_release(state: &mut SessionState, from: &PeerId, payload: &LockRel
     }
 }
 
+/// Reason a `AnnotationBroadcast` envelope was rejected by the
+/// stale-window filter in [`apply_inbound_annotation_broadcast`].
+/// Surfaced as a structured `tracing` field so log scrapers can
+/// distinguish a legitimate-but-late peer from a clock-skewed one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AnnotationBroadcastDropReason {
+    /// `sent_at` is older than [`ANNOTATION_BROADCAST_MAX_AGE`].
+    Stale,
+    /// `sent_at` is more than
+    /// [`ANNOTATION_BROADCAST_MAX_FUTURE_SKEW`] in the future
+    /// relative to the receiver's wall clock.
+    FutureSkew,
+}
+
+impl AnnotationBroadcastDropReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Stale => "stale",
+            Self::FutureSkew => "future_skew",
+        }
+    }
+}
+
+/// Pure helper: decide whether an inbound annotation broadcast
+/// should be dropped given the sender's `sent_at` timestamp and the
+/// receiver's notion of `now`. Returning `None` means "accept and
+/// apply". Extracted so the stale-window policy can be unit-tested
+/// without standing up a transport.
+fn annotation_broadcast_drop_reason(
+    sent_at: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> Option<AnnotationBroadcastDropReason> {
+    let age = now.signed_duration_since(sent_at);
+    if age > ANNOTATION_BROADCAST_MAX_AGE {
+        return Some(AnnotationBroadcastDropReason::Stale);
+    }
+    if age < -ANNOTATION_BROADCAST_MAX_FUTURE_SKEW {
+        return Some(AnnotationBroadcastDropReason::FutureSkew);
+    }
+    None
+}
+
 /// Phase 8 (Task 4): apply a remote annotation broadcast to the
 /// local project DB. The workspace mutex (`with_workspace_mut`) is
 /// acquired inside this helper — it is safe because the lock order
@@ -1547,11 +1608,27 @@ fn apply_inbound_annotation_broadcast(
 ) {
     use std::collections::HashSet;
 
+    // Stale-broadcast filter. `sent_at` is the sender's wall-clock
+    // timestamp at emit time; we drop envelopes outside a generous
+    // sliding window to defang resume-bundle replays of obsolete
+    // upserts and clock-skewed peers. The window is asymmetric
+    // because legitimate skew is bounded (~1 min, NTP) but
+    // legitimate delivery lag is not (peer rejoining after a
+    // 20-minute disconnect replays buffered envelopes).
+    if let Some(drop_reason) = annotation_broadcast_drop_reason(payload.sent_at, Utc::now()) {
+        tracing::warn!(
+            peer_id = %from.as_str(),
+            sent_at = %payload.sent_at,
+            reason = drop_reason.as_str(),
+            "dropping annotation broadcast",
+        );
+        return;
+    }
+
     let kind_str = match payload.kind {
         AnnotationBroadcastKind::Upsert => "upsert",
         AnnotationBroadcastKind::Delete => "delete",
     };
-    let count = payload.annotations.len() as u32;
     let page_ids: Vec<Uuid> = payload
         .annotations
         .iter()
@@ -1568,24 +1645,57 @@ fn apply_inbound_annotation_broadcast(
     // user closed the project (rare, but possible). The workspace
     // lock is dropped before we push the event to avoid holding two
     // locks simultaneously.
-    let applied = crate::document::with_workspace_mut(|ws| {
+    //
+    // Per-annotation failures are individually logged AND counted —
+    // the renderer is told how many actually landed, not how many
+    // were attempted, so the toast text matches the post-condition
+    // of the local DB. Resume bundles converge any rows that
+    // failed to persist on this pass.
+    let mut applied_count: u32 = 0;
+    let workspace_result = crate::document::with_workspace_mut(|ws| {
         let conn = ws.store.connection();
         match kind {
             AnnotationBroadcastKind::Upsert => {
                 for ann in &annotations {
-                    let _ = kcreate_storage::annotations::upsert_annotation(conn, ann);
+                    match kcreate_storage::annotations::upsert_annotation(conn, ann) {
+                        Ok(()) => applied_count += 1,
+                        Err(e) => tracing::warn!(
+                            peer_id = %from.as_str(),
+                            annotation_id = %ann.id,
+                            page_id = %ann.page_id,
+                            error = %e,
+                            "inbound annotation upsert failed",
+                        ),
+                    }
                 }
             }
             AnnotationBroadcastKind::Delete => {
                 for ann in &annotations {
-                    let _ = kcreate_storage::annotations::delete_annotation(conn, ann.id);
+                    match kcreate_storage::annotations::delete_annotation(conn, ann.id) {
+                        Ok(true) => applied_count += 1,
+                        // Already-deleted row is not a failure — the
+                        // operation is idempotent and converging.
+                        Ok(false) => {}
+                        Err(e) => tracing::warn!(
+                            peer_id = %from.as_str(),
+                            annotation_id = %ann.id,
+                            error = %e,
+                            "inbound annotation delete failed",
+                        ),
+                    }
                 }
             }
         }
         Ok(())
     });
 
-    if applied.is_err() {
+    if workspace_result.is_err() {
+        return;
+    }
+
+    // Nothing landed → don't trigger a UI refresh that would find
+    // nothing to render. The error has already been logged above.
+    if applied_count == 0 {
         return;
     }
 
@@ -1594,7 +1704,7 @@ fn apply_inbound_annotation_broadcast(
         SessionEvent::AnnotationsApplied {
             peer_id: from.as_str().to_string(),
             verb: kind_str.to_string(),
-            count,
+            count: applied_count,
             page_ids,
         },
     );
@@ -2342,6 +2452,16 @@ pub fn session_broadcast_annotation(
     annotations: Vec<kcreate_core::annotation::Annotation>,
     kind: AnnotationBroadcastKind,
 ) -> Result<()> {
+    // Phase 7 defense-in-depth: every public broadcast entry point
+    // re-verifies KChat membership before touching the wire. The
+    // QUIC session itself stays open past membership expiry (the
+    // transport doesn't tear down on TTL), so without this gate an
+    // expired-membership peer could keep emitting annotation
+    // broadcasts long after they should have lost write access.
+    // Matches `session_broadcast_operations` / `session_send_presence`
+    // / `session_queue_operation` / `session_claim_locks` /
+    // `session_release_locks`.
+    require_active_kchat_membership()?;
     if annotations.is_empty() {
         return Ok(());
     }
@@ -5106,5 +5226,120 @@ mod tests {
             back,
             SessionEvent::SessionLeft { peer_id } if peer_id == "departing-peer-xyz"
         ));
+    }
+
+    // ====================================================================
+    // Phase 8 annotation broadcast — defense-in-depth gates + stale window.
+    // ====================================================================
+
+    /// `session_broadcast_annotation` must fail closed with
+    /// `NotInKChatGroup` when no KChat membership is installed,
+    /// matching `session_broadcast_operations` /
+    /// `session_send_presence`. Without this gate an expired-
+    /// membership peer could keep emitting annotation broadcasts
+    /// long after their write access should have lapsed, because the
+    /// QUIC session itself doesn't tear down on membership expiry.
+    #[test]
+    #[serial]
+    fn session_broadcast_annotation_fails_when_locked() {
+        reset_kchat_slot();
+        let _ = session_leave();
+        let ann = kcreate_core::annotation::Annotation {
+            id: Uuid::new_v4(),
+            page_id: Uuid::new_v4(),
+            author_peer_id: "p".to_string(),
+            author_name: "a".to_string(),
+            position: kcreate_core::annotation::AnnotationPosition { x: 0.0, y: 0.0 },
+            text: "x".to_string(),
+            timestamp: Utc::now(),
+            resolved: false,
+            thread_id: None,
+        };
+        let err = session_broadcast_annotation(
+            vec![ann],
+            kcreate_collab::AnnotationBroadcastKind::Upsert,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, SessionBridgeError::NotInKChatGroup),
+            "expected NotInKChatGroup, got {err:?}"
+        );
+    }
+
+    /// Empty annotation slices short-circuit to `Ok(())` only AFTER
+    /// the membership gate fires. The gate must run unconditionally
+    /// — otherwise a peer that lost membership could probe the
+    /// session state via no-op broadcasts and infer state without
+    /// triggering the lock.
+    #[test]
+    #[serial]
+    fn session_broadcast_annotation_empty_input_still_gated() {
+        reset_kchat_slot();
+        let _ = session_leave();
+        let err = session_broadcast_annotation(
+            Vec::new(),
+            kcreate_collab::AnnotationBroadcastKind::Upsert,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, SessionBridgeError::NotInKChatGroup),
+            "membership gate must fire before the empty short-circuit; got {err:?}"
+        );
+    }
+
+    /// Fresh `sent_at` inside the acceptance window → accept.
+    #[test]
+    fn annotation_broadcast_filter_accepts_fresh() {
+        let now = Utc::now();
+        assert_eq!(annotation_broadcast_drop_reason(now, now), None);
+        assert_eq!(
+            annotation_broadcast_drop_reason(now - chrono::Duration::seconds(5), now),
+            None,
+        );
+    }
+
+    /// `sent_at` past the max-age window → reject as Stale. This is
+    /// the resume-bundle replay-defense path.
+    #[test]
+    fn annotation_broadcast_filter_rejects_stale() {
+        let now = Utc::now();
+        let stale = now - ANNOTATION_BROADCAST_MAX_AGE - chrono::Duration::seconds(1);
+        assert_eq!(
+            annotation_broadcast_drop_reason(stale, now),
+            Some(AnnotationBroadcastDropReason::Stale),
+        );
+    }
+
+    /// `sent_at` from the boundary itself is accepted (`>` not
+    /// `>=`), so envelopes sitting exactly on the threshold don't
+    /// flap depending on tick alignment.
+    #[test]
+    fn annotation_broadcast_filter_boundary_accepts_max_age_exact() {
+        let now = Utc::now();
+        let boundary = now - ANNOTATION_BROADCAST_MAX_AGE;
+        assert_eq!(annotation_broadcast_drop_reason(boundary, now), None);
+    }
+
+    /// `sent_at` too far in the future (clock-skew abuse to game
+    /// LWW) → reject as FutureSkew. The asymmetric threshold means
+    /// the forward boundary is tighter than the backward one.
+    #[test]
+    fn annotation_broadcast_filter_rejects_future_skew() {
+        let now = Utc::now();
+        let future = now + ANNOTATION_BROADCAST_MAX_FUTURE_SKEW + chrono::Duration::seconds(1);
+        assert_eq!(
+            annotation_broadcast_drop_reason(future, now),
+            Some(AnnotationBroadcastDropReason::FutureSkew),
+        );
+    }
+
+    /// NTP-drift envelope just inside the future-skew tolerance →
+    /// accepted. Real-world clients are not perfectly synchronised
+    /// and we don't want to bounce them.
+    #[test]
+    fn annotation_broadcast_filter_accepts_minor_future_skew() {
+        let now = Utc::now();
+        let near_future = now + chrono::Duration::seconds(30);
+        assert_eq!(annotation_broadcast_drop_reason(near_future, now), None);
     }
 }

@@ -4,21 +4,17 @@
 //!
 //! See [`protocol`] for the REST contract this client speaks.
 //!
-//! ## Architecture (Option C pivot — May 2026)
+//! ## Integration model
 //!
-//! Previously this crate spoke a local Unix-socket / named-pipe
-//! JSON-RPC protocol to a hypothetical `uney-chat-desktop` server
-//! that does not exist. After ken's architectural review, the
-//! correct integration model is:
-//!
-//!   - KCreate runs as a **standalone process**.
-//!   - It talks to the **shared KChat / Mattermost backend** over
-//!     HTTPS REST — the same backend `uney-chat-desktop` also uses.
-//!   - A separate `.kcz` **companion extension** ships inside
-//!     KChat Desktop (see `apps/kchat-extension/`) and contributes
-//!     a sidebar showing recent KCreate projects + share invites.
-//!     That extension uses the host's procedures registry — it
-//!     does **not** proxy this REST client.
+//! KCreate runs as a standalone process. Both KCreate and KChat
+//! Desktop independently authenticate to the same KChat /
+//! Mattermost backend over HTTPS REST — there is no external IPC
+//! socket between the two desktop apps. A separate `.kcz`
+//! companion extension ships inside KChat Desktop (see
+//! `apps/kchat-extension/`) and contributes a sidebar showing
+//! recent KCreate projects + share invites. That extension uses
+//! the host's procedures registry — it does **not** proxy this
+//! REST client.
 //!
 //! ## Crate isolation
 //!

@@ -36,8 +36,9 @@ pub enum ClientError {
     Timeout { path: String },
 
     /// Caller used the client without logging in first. Renderer
-    /// must call `kchat_backend_login` before any other entry
-    /// point.
+    /// must call `kchat_backend_connect` (or, in tests,
+    /// [`KChatBackendClient::login`](crate::client::KChatBackendClient::login))
+    /// before any other entry point.
     #[error("KChat backend client is not authenticated; call login() first")]
     NotAuthenticated,
 

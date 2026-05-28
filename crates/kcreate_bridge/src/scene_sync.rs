@@ -20,10 +20,9 @@
 //!   artboard colour, and a name label drawn above the top edge.
 //!   Descendants whose bounds fall entirely outside the artboard
 //!   clip rect are pruned from the scene (Figma/Penpot-style frame
-//!   clipping). TODO(Block A Task 3 follow-up): emit dashed spacing
-//!   guides between adjacent artboards while one is being
-//!   dragged/resized — requires gesture-state plumbing the bridge
-//!   doesn't yet expose, so it's deferred to a later task.
+//!   clipping). Dashed spacing guides between adjacent artboards
+//!   during drag/resize are not yet emitted — that gesture-state
+//!   plumbing is not exposed by the bridge.
 //! * [`NodeType::VectorLayer`] with a `vector_path` metadata entry →
 //!   an [`ObjectKind::Path`] driven by the layer's [`VectorPath`].
 //! * [`NodeType::RasterLayer`] with a `raster_image` metadata entry →

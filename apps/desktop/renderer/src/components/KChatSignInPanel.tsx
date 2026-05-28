@@ -1,19 +1,29 @@
-// KChatSignInPanel — multiplayer gate UI (Phase 4 follow-up).
+// KChatSignInPanel — KChat group authority + backend sign-in UI.
 //
 // Renders the sign-in / sign-out affordance for the KChat group
-// authority that gates KCreate multiplayer. There are two modes:
+// authority that gates KCreate multiplayer. The panel covers three
+// independent install paths:
 //
-//   1. **Locked** — the user is not signed into a KChat group.
-//      We surface a textarea to paste a JSON `KChatInstallRequest`
-//      minted by the real (out-of-tree) KChat client. Bridges
-//      built with the `kchat-dev-issuer` feature also offer a
-//      "Mint dev membership" affordance backed by the in-process
+//   1. **KChat backend sign-in** (Phase 7). The user enters a
+//      backend URL + login id + password (+ optional TOTP); the
+//      bridge logs in via `kchat_backend_connect`, fetches the
+//      user's communities, and installs the selected community's
+//      signed attestation as the global collab authority.
+//
+//   2. **Paste install request**. A JSON `KChatInstallRequest`
+//      minted by an out-of-tree KChat client can be pasted into a
+//      textarea — useful when the backend sign-in flow is not
+//      available (e.g. self-hosted issuer, no REST endpoint yet).
+//
+//   3. **Dev-mint** (only when the bridge was built with
+//      `kchat-dev-issuer`). Backed by the in-process
 //      `kcreate_kchat::DevIssuer` so engineers can drive the
-//      multiplayer pipeline end-to-end without a live KChat server.
+//      multiplayer pipeline end-to-end without a live KChat
+//      server.
 //
-//   2. **Signed in** — the gate is open. We show the group id,
-//      peer id, and an "Expires in …" countdown, plus a sign-out
-//      button that calls `kchat.clear()` and re-locks the gate.
+// Once any of the three install a membership the panel switches to
+// the signed-in view: group id, peer id, an "Expires in …"
+// countdown, and a sign-out button.
 //
 // The panel deliberately does NOT manage the peer roster, dial
 // flow, or session state — that's `PresencePanel`'s job. We sit

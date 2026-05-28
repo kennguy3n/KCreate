@@ -2,10 +2,10 @@
 //!
 //! Mirrors the future KChat backend REST contract documented in
 //! `protocol.rs`. Used by the test suite (and as the canonical
-//! reference implementation for the backend team) — never enters
-//! a production binary because it lives behind
-//! `#[cfg(any(test, feature = "fixture"))]` is unnecessary: the
-//! module itself is gated by the `axum` dev-dependency.
+//! reference implementation for the backend team). The module is
+//! gated by the `test-fixture` Cargo feature — it pulls in `axum`
+//! and `tokio` (full), neither of which we want in a production
+//! build, so this module never enters a shipped binary.
 //!
 //! ## What it implements
 //!

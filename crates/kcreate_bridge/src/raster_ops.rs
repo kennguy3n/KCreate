@@ -723,20 +723,21 @@ impl std::error::Error for MaskShapeMismatch {}
 /// canvas edge. This avoids a spurious feather where the canvas
 /// edge happens to be a mask boundary.
 fn feather_mask_weights(mask: &[u8], width: u32, height: u32) -> Vec<f32> {
-    // `par_chunks_mut(w)` requires a non-zero chunk size. The two
-    // upstream call sites (`apply_filter_masked` via
-    // `load_layer_pixels`, plus the unit tests) only feed in
-    // positive dimensions because the `image` crate rejects zero-
-    // sized PNGs before we ever construct `LayerPixels`. Pin the
-    // contract here so a future caller that bypasses
-    // `load_layer_pixels` fails loudly in debug builds rather than
-    // tripping a rayon panic in release.
-    debug_assert!(
-        width > 0 && height > 0,
-        "feather_mask_weights requires positive dimensions (got {width}x{height})",
-    );
     let w = width as usize;
     let h = height as usize;
+    // A zero-pixel layer has zero weights by definition. Short-
+    // circuit before `par_chunks_mut(w)` (which panics on `w == 0`
+    // in both debug and release) so this function tolerates the
+    // degenerate input cleanly. The two known callers
+    // (`apply_filter_masked` via `load_layer_pixels`, plus the
+    // unit tests) already feed in positive dimensions because the
+    // `image` crate rejects zero-sized PNGs at decode time, but
+    // this guard makes the masked-filter pipeline resilient to a
+    // future caller that bypasses `load_layer_pixels` — combined
+    // with the `mask.len() != total` check upstream.
+    if w == 0 || h == 0 {
+        return Vec::new();
+    }
     let mut weights = vec![0.0_f32; w * h];
     let bit = |byte: u8| u8::from(byte != 0);
     weights.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
@@ -897,6 +898,18 @@ mod tests {
         let mask = vec![0u8; 9];
         let weights = feather_mask_weights(&mask, 3, 3);
         assert_eq!(weights, vec![0.0; 9]);
+    }
+
+    #[test]
+    fn feather_weights_returns_empty_for_zero_dimensions() {
+        // `par_chunks_mut(0)` would panic in release without the
+        // short-circuit guard. Pin the defensive behaviour so a
+        // future caller that bypasses `load_layer_pixels` (which
+        // rejects zero-sized images via the `image` crate) cannot
+        // ride a rayon panic into production.
+        assert!(feather_mask_weights(&[], 0, 0).is_empty());
+        assert!(feather_mask_weights(&[], 0, 5).is_empty());
+        assert!(feather_mask_weights(&[], 5, 0).is_empty());
     }
 
     #[test]

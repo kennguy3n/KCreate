@@ -8,26 +8,24 @@
 //! feature flag, and every wire-format type is mirrored in
 //! `apps/desktop/shared/scene.ts`.
 //!
-//! ## Architecture (Option C, May 2026)
+//! ## Flow
 //!
-//! Previously this module spoke a Unix-socket / named-pipe
-//! JSON-RPC protocol to a hypothetical local server inside
-//! `uney-chat-desktop`. After ken's architectural review the
-//! correct model is:
+//! - The renderer collects the user's backend URL + credentials in
+//!   `KChatSignInPanel` and calls [`kchat_backend_connect`], which
+//!   logs in and caches the resulting [`KChatBackendClient`] in
+//!   this module's process-global slot.
+//! - [`kchat_backend_list_communities`] / [`kchat_backend_select_community`]
+//!   pull the user's communities and install the active community's
+//!   signed attestation as the global collab authority.
+//! - [`kchat_backend_share_to_conversation`] posts a rich-card
+//!   invite to a KChat conversation; [`kchat_backend_accept_invite`]
+//!   parses such a card on the joiner side and triggers
+//!   `session_join` to dial the host peer.
 //!
-//!   - KCreate runs as a standalone process and signs in to the
-//!     **same KChat / Mattermost backend** uney-chat-desktop uses
-//!     via HTTPS REST.
-//!   - The renderer collects the user's backend URL + credentials
-//!     in [`KChatSignInPanel`](apps/desktop/renderer/src/components/KChatSignInPanel.tsx)
-//!     and calls [`kchat_backend_connect`] which logs in and
-//!     caches the resulting [`KChatBackendClient`] in this
-//!     module's process-global slot.
-//!   - A separate `.kcz` companion extension ships inside KChat
-//!     Desktop (`apps/kchat-extension/`) and surfaces recent
-//!     projects + share invites via the host's procedures
-//!     registry. That extension does NOT proxy this bridge —
-//!     both apps independently talk to the same backend.
+//! A separate `.kcz` companion extension ships inside KChat Desktop
+//! (`apps/kchat-extension/`) and surfaces recent projects + share
+//! invites via the host's procedures registry — it does not proxy
+//! this bridge; both apps independently talk to the same backend.
 //!
 //! ## Mapping to `kcreate_collab`
 //!
@@ -90,14 +88,13 @@ pub enum KChatBackendBridgeError {
     #[error("local identity has no member entry in community {community_id}")]
     LocalMemberMissing { community_id: String },
     /// A downstream call into the collab session bridge failed
-    /// (`session_join`, `session_apply_community_roster`, etc.).
+    /// (e.g. `session_join`, `session_apply_community_roster`).
     /// Wraps the typed [`crate::collab::SessionBridgeError`] so the
-    /// renderer can tell apart "no collab session is running" from
-    /// "your attestation is stale" — these used to all surface as
-    /// [`Self::Attestation`], which was misleading on every
-    /// non-attestation branch (NotRunning, NotInKChatGroup,
-    /// transport errors, etc.). The `#[from]` impl lets the
-    /// bridge methods use `?` directly on session calls.
+    /// renderer can distinguish session-lifecycle failures
+    /// (`NotRunning`, `NotInKChatGroup`, transport errors) from
+    /// attestation failures, which surface as [`Self::Attestation`].
+    /// The `#[from]` impl lets bridge methods use `?` directly on
+    /// session calls.
     #[error("kchat backend collab session error: {0}")]
     Session(#[from] crate::collab::SessionBridgeError),
 }

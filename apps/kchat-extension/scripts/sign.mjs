@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 // Pack + sign the staged bundle into a real `.kcz` archive.
 //
-//   1. Compute BLAKE2b-256 (via Node's `crypto.createHash("sha256")`
-//      where supported; Ed25519 signing is the actual trust root,
-//      so the hash here is only an integrity check the host's
-//      signature verifier double-uses) over the staging contents.
+//   1. Compute a SHA-256 digest of each staged file. Ed25519
+//      signing is the actual trust root; the per-file digest is
+//      what we feed into the signing input so the host can verify
+//      file contents one by one without re-streaming the bundle.
 //   2. Ed25519-sign the staging contents with the publisher key
 //      defined in `KCREATE_KCHAT_EXT_SIGN_KEY` (an ed25519 secret
 //      key in 64-char base64-url-no-pad form). The matching public
@@ -98,7 +98,7 @@ export async function buildSigningInput(stagingDir) {
  * we wrap the raw seed in a PKCS#8 DER envelope manually so the
  * script has no native dependency beyond the bundled `node:crypto`.
  */
-export async function ed25519Sign(data, secretKeyRaw) {
+export function ed25519Sign(data, secretKeyRaw) {
   if (secretKeyRaw.length !== 32) {
     throw new Error(
       `ed25519 secret seed must be 32 bytes, got ${secretKeyRaw.length}`,
@@ -124,7 +124,7 @@ export async function ed25519Sign(data, secretKeyRaw) {
  * Used so the script can refuse to sign with a key that doesn't
  * match the manifest's pinned `publisherPublicKey`.
  */
-export async function ed25519PublicKey(secretKeyRaw) {
+export function ed25519PublicKey(secretKeyRaw) {
   const PREFIX = Buffer.from(
     "302e020100300506032b657004220420",
     "hex",

@@ -199,9 +199,10 @@ export async function postShareInvite(
 }
 
 /**
- * Build the `kcreate://join?invite=<id>` deeplink for a share-invite
- * card and ask the host to dispatch it. The standalone KCreate
- * desktop app handles the URL via its registered protocol handler.
+ * Build the `kcreate://join?payload=<base64url(json)>` deeplink (see
+ * [`buildJoinDeeplink`]) for a share-invite card and ask the host to
+ * dispatch it. The standalone KCreate desktop app handles the URL
+ * via its registered protocol handler.
  */
 export async function openInviteInKCreate(invite: ShareInvite): Promise<void> {
   const url = buildJoinDeeplink(invite);

@@ -73,7 +73,7 @@ pub fn encode_page_number_token(format: PageNumberFormat) -> String {
 /// Context for token expansion. The resolver walks document
 /// pages in order and updates the section state, then passes a
 /// [`PageContext`] per page to the shaper.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PageContext {
     /// The resolved 1-based page number after section restarts
     /// have been applied. `display_number` is what the user

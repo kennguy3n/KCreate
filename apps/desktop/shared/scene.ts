@@ -4081,6 +4081,133 @@ declare global {
       kchatBackend: KChatBackendBridge;
       deeplink: DeeplinkBridge;
       clipboard: ClipboardBridge;
+      phase8: Phase8Bridge;
     };
   }
+}
+
+/**
+ * Wire-format mirror of `kcreate_text::tokens::PageNumberFormat`.
+ * Matches the Rust serde `rename_all = "snake_case"` form.
+ */
+export type PageNumberFormat =
+  | "arabic"
+  | "roman_lower"
+  | "roman_upper"
+  | "alpha_lower"
+  | "alpha_upper";
+
+/**
+ * Wire-format mirror of `kcreate_text::tokens::PageContext`. One
+ * entry per page in the document, in document order. The shaper
+ * uses these to substitute page-number tokens at render time.
+ */
+export interface PageContext {
+  display_number: number;
+  section_total: number;
+  section_prefix: string;
+}
+
+/**
+ * Wire-format mirror of `kcreate_export::job_presets::JobType`. The
+ * `Phase8Bridge.exportJobPresets` API accepts the short snake_case
+ * aliases (`app_ui`, `logo`, etc.) for ergonomics.
+ */
+export type JobType =
+  | "app_or_website_ui"
+  | "app_ui"
+  | "logo_icon_or_brand_kit"
+  | "logo"
+  | "social_media_post"
+  | "social_post"
+  | "product_photo_cleanup"
+  | "product_photo"
+  | "pitch_deck_or_proposal"
+  | "pitch_deck"
+  | "flyer_poster_or_brochure"
+  | "flyer_poster"
+  | "developer_asset_export"
+  | "developer_asset";
+
+/**
+ * Wire-format mirror of `kcreate_export::job_presets::JobExportPreset`.
+ */
+export interface JobExportPreset {
+  name: string;
+  format: string;
+  scale: number;
+  width?: number | null;
+  height?: number | null;
+  bleed_mm?: number | null;
+  background?: string | null;
+}
+
+/**
+ * Wire-format mirror of `kcreate_export::job_presets::JobExportPresets`.
+ */
+export interface JobExportPresets {
+  job_type: string;
+  presets: JobExportPreset[];
+}
+
+/**
+ * Wire-format mirror of `kcreate_bridge::phase8::BrandKitVersionInfo`.
+ */
+export interface BrandKitVersionInfo {
+  versionId: string;
+  brandKitId: string;
+  timestamp: string;
+  description: string;
+}
+
+/**
+ * Wire-format mirror of `kcreate_storage::brand_versions::BrandKitDiff`.
+ */
+export interface BrandKitDiff {
+  added_colors: string[];
+  removed_colors: string[];
+  changed_colors: string[];
+  added_fonts: string[];
+  removed_fonts: string[];
+  name_changed: { before: string; after: string } | null;
+}
+
+/**
+ * Wire-format mirror of `kcreate_core::node::Bounds` used by
+ * `Phase8Bridge.documentResizeFrame`.
+ */
+export interface ResizeFrameBounds {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+/**
+ * Phase 8 production-hardening bridge. Wraps the N-API entry points
+ * for design-token binding, constraint-aware frame resize, text
+ * auto-fit, page-numbering tokens, section numbering, job-first
+ * export presets, and brand-kit versioning.
+ */
+export interface Phase8Bridge {
+  bindToken(nodeId: string, property: string, tokenName: string): Promise<void>;
+  unbindToken(nodeId: string, property: string): Promise<void>;
+  propagateToken(tokenName: string): Promise<number>;
+  resizeFrame(frameId: string, bounds: ResizeFrameBounds): Promise<void>;
+  setAutoFit(nodeId: string, enabled: boolean): Promise<boolean>;
+  pageNumberToken(format: PageNumberFormat): Promise<string>;
+  setPageSection(
+    pageId: string,
+    startNumber: number | null,
+    prefix: string | null,
+  ): Promise<void>;
+  resolvePageContexts(): Promise<PageContext[]>;
+  exportJobPresets(job: JobType): Promise<JobExportPresets>;
+  brandKitSaveVersion(
+    brandKitId: string,
+    description: string,
+  ): Promise<BrandKitVersionInfo>;
+  brandKitListVersions(brandKitId: string): Promise<BrandKitVersionInfo[]>;
+  brandKitRestoreVersion(versionId: string): Promise<BrandKit>;
+  brandKitDiff(beforeId: string, afterId: string): Promise<BrandKitDiff>;
 }

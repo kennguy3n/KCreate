@@ -908,6 +908,36 @@ export interface Bridge {
   /// Re-publish the cached scene. Used by the session event tick
   /// to refresh remote-peer cursor overlays.
   documentRequestRender(): void;
+
+  // -------------------------------------------------------------------
+  // Phase 8 — design-token binding, constraint-aware resize, text
+  // auto-fit, page-numbering tokens, section pages, job presets,
+  // brand-kit versioning. See `crates/kcreate_bridge/src/phase8.rs`.
+  // -------------------------------------------------------------------
+  documentBindToken(
+    nodeIdStr: string,
+    property: string,
+    tokenName: string,
+  ): void;
+  documentUnbindToken(nodeIdStr: string, property: string): void;
+  documentPropagateToken(tokenName: string): number;
+  documentResizeFrame(frameIdStr: string, boundsJson: string): void;
+  textSetAutoFit(nodeIdStr: string, enabled: boolean): boolean;
+  pageNumberToken(format: string): string;
+  pageSetSection(
+    pageIdStr: string,
+    startNumber: number | null | undefined,
+    prefix: string | null | undefined,
+  ): void;
+  pageResolveContexts(): string;
+  exportJobPresets(job: string): string;
+  brandKitSaveVersion(
+    brandKitIdStr: string,
+    description: string,
+  ): string;
+  brandKitListVersions(brandKitIdStr: string): string;
+  brandKitRestoreVersion(versionIdStr: string): string;
+  brandKitDiff(beforeIdStr: string, afterIdStr: string): string;
 }
 
 function bridgeBinaryPath(): string {

@@ -1636,6 +1636,55 @@ function registerIpcHandlers(): void {
       requireBridge().documentPropagateToken(tokenName),
   );
   ipcMain.handle(
+    "kcreate/phase8/node-token-bindings",
+    (_e, nodeId: string): string =>
+      requireBridge().documentNodeTokenBindings(nodeId),
+  );
+  ipcMain.handle(
+    "kcreate/phase8/node-constraints",
+    (_e, nodeId: string): string =>
+      requireBridge().documentNodeConstraints(nodeId),
+  );
+  ipcMain.handle(
+    "kcreate/phase8/set-node-constraints",
+    (
+      _e,
+      nodeId: string,
+      constraints: unknown,
+    ): void =>
+      requireBridge().documentSetNodeConstraints(
+        nodeId,
+        JSON.stringify(constraints),
+      ),
+  );
+  // -------------------------------------------------------------------
+  // Phase 8 Task 26 — project encryption.
+  // -------------------------------------------------------------------
+  ipcMain.handle(
+    "kcreate/project/encryption/status",
+    (): string => requireBridge().projectEncryptionStatus(),
+  );
+  ipcMain.handle(
+    "kcreate/project/encryption/passphrase-strength",
+    (_e, passphrase: string): number =>
+      requireBridge().projectPassphraseStrength(passphrase),
+  );
+  ipcMain.handle(
+    "kcreate/project/encryption/enable",
+    (_e, passphrase: string): string =>
+      requireBridge().projectEnableEncryption(passphrase),
+  );
+  ipcMain.handle(
+    "kcreate/project/encryption/change-passphrase",
+    (_e, oldPassphrase: string, newPassphrase: string): void =>
+      requireBridge().projectChangePassphrase(oldPassphrase, newPassphrase),
+  );
+  ipcMain.handle(
+    "kcreate/project/encryption/export-plaintext-recovery",
+    (_e, passphrase: string, outputPath: string): string =>
+      requireBridge().projectExportPlaintextRecovery(passphrase, outputPath),
+  );
+  ipcMain.handle(
     "kcreate/phase8/resize-frame",
     (
       _e,

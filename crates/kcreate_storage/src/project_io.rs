@@ -66,6 +66,62 @@ pub enum ProjectStoreError {
     InvalidManifest(PathBuf),
     #[error("project format {0:?} is not supported")]
     UnsupportedFormat(String),
+    #[error("the project is encrypted; supply a passphrase to open it")]
+    PassphraseRequired,
+    #[error("passphrase must not be empty")]
+    PassphraseEmpty,
+    #[error("project is already encrypted")]
+    AlreadyEncrypted,
+    #[error("project is not encrypted")]
+    NotEncrypted,
+    #[error("invalid encryption metadata: {0}")]
+    InvalidEncryptionMetadata(String),
+}
+
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+
+fn derive_key_from_meta(
+    passphrase: &str,
+    meta: &EncryptionMetadata,
+) -> Result<[u8; crate::crypto::KEY_LEN], ProjectStoreError> {
+    if passphrase.is_empty() {
+        return Err(ProjectStoreError::PassphraseEmpty);
+    }
+    let salt = URL_SAFE_NO_PAD
+        .decode(meta.salt.as_bytes())
+        .map_err(|e| ProjectStoreError::InvalidEncryptionMetadata(format!("salt: {e}")))?;
+    if salt.len() != crate::crypto::SALT_LEN {
+        return Err(ProjectStoreError::InvalidEncryptionMetadata(format!(
+            "salt length must be {} bytes, got {}",
+            crate::crypto::SALT_LEN,
+            salt.len(),
+        )));
+    }
+    let iter = std::num::NonZeroU32::new(meta.iterations).ok_or_else(|| {
+        ProjectStoreError::InvalidEncryptionMetadata(
+            "iterations must be greater than zero".to_string(),
+        )
+    })?;
+    Ok(crate::crypto::derive_key(passphrase, &salt, iter))
+}
+
+/// Per-project encryption metadata. When `enabled` is true the
+/// `.kstudio/document.sqlite` file is SQLCipher-encrypted and the
+/// passphrase must be supplied on open. `salt` is the per-project
+/// PBKDF2 salt (base64 url-safe, no padding) — it is intentionally
+/// stored in the manifest so the same passphrase produces the same
+/// key on every machine. `iterations` lets old projects upgrade to
+/// a higher cost factor in the future without re-keying.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EncryptionMetadata {
+    /// Whether the underlying database is encrypted.
+    pub enabled: bool,
+    /// PBKDF2 salt, url-safe base64 without padding. Length is
+    /// always `kcreate_storage::crypto::SALT_LEN` (16) bytes.
+    pub salt: String,
+    /// PBKDF2-HMAC-SHA256 iteration count used to derive the key
+    /// from the passphrase + salt.
+    pub iterations: u32,
 }
 
 /// `manifest.json` schema.
@@ -83,6 +139,11 @@ pub struct ProjectManifest {
     pub modified_at: DateTime<Utc>,
     /// `kstudio-v1`, etc.
     pub format: String,
+    /// Phase 8 Task 25: per-project SQLCipher encryption state.
+    /// `None` for legacy projects created before the field was
+    /// added; the on-disk database is plaintext in that case.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encryption: Option<EncryptionMetadata>,
 }
 
 impl ProjectManifest {
@@ -96,6 +157,7 @@ impl ProjectManifest {
             created_at: now,
             modified_at: now,
             format: MANIFEST_FORMAT.into(),
+            encryption: None,
         }
     }
 }
@@ -138,7 +200,22 @@ impl ProjectStore {
     }
 
     /// Open an existing `.kstudio/` package.
+    ///
+    /// When the manifest declares the database is encrypted, the
+    /// `passphrase` is used to derive the SQLCipher key. A `None`
+    /// passphrase on an encrypted project returns
+    /// [`ProjectStoreError::PassphraseRequired`]; the caller is
+    /// expected to prompt and retry.
     pub fn open(dir: &Path) -> Result<Self, ProjectStoreError> {
+        Self::open_with_passphrase(dir, None)
+    }
+
+    /// Open an existing `.kstudio/` package, optionally supplying a
+    /// passphrase used to unlock an encrypted database.
+    pub fn open_with_passphrase(
+        dir: &Path,
+        passphrase: Option<&str>,
+    ) -> Result<Self, ProjectStoreError> {
         let dir = dir.to_path_buf();
         let manifest_path = dir.join(MANIFEST_FILENAME);
         if !manifest_path.exists() {
@@ -151,7 +228,15 @@ impl ProjectStore {
         for sub in SUBDIRS {
             fs::create_dir_all(dir.join(sub))?;
         }
-        let db = Database::open(dir.join(DATABASE_FILENAME))?;
+        let db_path = dir.join(DATABASE_FILENAME);
+        let db = match manifest.encryption.as_ref() {
+            Some(meta) if meta.enabled => {
+                let pass = passphrase.ok_or(ProjectStoreError::PassphraseRequired)?;
+                let key = derive_key_from_meta(pass, meta)?;
+                Database::open_encrypted(db_path, &key)?
+            }
+            _ => Database::open(db_path)?,
+        };
         let blobs = BlobStore::new(dir.join(BLOBS_DIRNAME))?;
         Ok(Self {
             project_dir: dir,
@@ -159,6 +244,124 @@ impl ProjectStore {
             db,
             blobs,
         })
+    }
+
+    /// Whether the project's SQLite database is currently encrypted
+    /// (per `manifest.json`). Surface this via the bridge to drive
+    /// the EncryptionPanel UI.
+    #[must_use]
+    pub fn is_encrypted(&self) -> bool {
+        matches!(self.manifest.encryption.as_ref(), Some(m) if m.enabled)
+    }
+
+    /// Encrypt a previously-plaintext project with a fresh
+    /// passphrase. Generates a per-project salt, runs PBKDF2 to
+    /// derive the key, encrypts the database in place via
+    /// [`Database::encrypt_existing`], rewrites the manifest, then
+    /// re-opens the connection encrypted so subsequent writes go
+    /// through SQLCipher.
+    ///
+    /// Returns an error if encryption is already enabled.
+    pub fn enable_encryption(&mut self, passphrase: &str) -> Result<(), ProjectStoreError> {
+        if passphrase.is_empty() {
+            return Err(ProjectStoreError::PassphraseEmpty);
+        }
+        if self.is_encrypted() {
+            return Err(ProjectStoreError::AlreadyEncrypted);
+        }
+        let salt = crate::crypto::generate_salt();
+        let iterations = crate::crypto::DEFAULT_PBKDF2_ITERATIONS;
+        let iter_nonzero = std::num::NonZeroU32::new(iterations).ok_or_else(|| {
+            ProjectStoreError::InvalidEncryptionMetadata(
+                "DEFAULT_PBKDF2_ITERATIONS must be non-zero".to_string(),
+            )
+        })?;
+        let key = crate::crypto::derive_key(passphrase, &salt, iter_nonzero);
+        let db_path = self.project_dir.join(DATABASE_FILENAME);
+        // The previous Database value must be dropped before
+        // `encrypt_existing` opens a fresh connection; otherwise
+        // SQLCipher's `ATTACH … KEY` would fight a live connection
+        // for the WAL file. Use an in-memory placeholder so the
+        // struct stays in a valid state across the failure window.
+        self.replace_db_with_placeholder()?;
+        Database::encrypt_existing(&db_path, &key)?;
+        // Re-open encrypted now that the on-disk file is ciphertext.
+        self.db = Database::open_encrypted(&db_path, &key)?;
+        let meta = EncryptionMetadata {
+            enabled: true,
+            salt: URL_SAFE_NO_PAD.encode(salt),
+            iterations,
+        };
+        self.manifest.encryption = Some(meta);
+        write_manifest(&self.project_dir, &self.manifest)?;
+        Ok(())
+    }
+
+    /// Drop the live database connection by swapping in an
+    /// in-memory placeholder. Used by mutation paths
+    /// (`enable_encryption`, `change_passphrase`) that need to call
+    /// SQLCipher operations against the path while the original
+    /// connection is closed.
+    fn replace_db_with_placeholder(&mut self) -> Result<(), ProjectStoreError> {
+        let placeholder = Database::open(":memory:")?;
+        // Replace returns the old value; binding to `_` immediately
+        // drops it, closing the old connection.
+        let _ = std::mem::replace(&mut self.db, placeholder);
+        Ok(())
+    }
+
+    /// Rotate the project passphrase. Both passphrases derive keys
+    /// against the *current* salt; the on-disk salt is unchanged so
+    /// future opens of either passphrase work consistently.
+    pub fn change_passphrase(
+        &mut self,
+        old_passphrase: &str,
+        new_passphrase: &str,
+    ) -> Result<(), ProjectStoreError> {
+        if new_passphrase.is_empty() {
+            return Err(ProjectStoreError::PassphraseEmpty);
+        }
+        let meta = self
+            .manifest
+            .encryption
+            .clone()
+            .ok_or(ProjectStoreError::NotEncrypted)?;
+        if !meta.enabled {
+            return Err(ProjectStoreError::NotEncrypted);
+        }
+        let old_key = derive_key_from_meta(old_passphrase, &meta)?;
+        let new_key = derive_key_from_meta(new_passphrase, &meta)?;
+        let db_path = self.project_dir.join(DATABASE_FILENAME);
+        // Drop the live connection (held in `self.db`) before
+        // PRAGMA rekey opens its own.
+        self.replace_db_with_placeholder()?;
+        Database::change_key(&db_path, &old_key, &new_key)?;
+        self.db = Database::open_encrypted(&db_path, &new_key)?;
+        Ok(())
+    }
+
+    /// Export an unencrypted copy of the project's database to
+    /// `output_path`. The original encrypted database is left
+    /// untouched. Used by the recovery flow that lets the user
+    /// produce a passphrase-free backup before disabling
+    /// encryption.
+    pub fn export_plaintext_recovery(
+        &self,
+        passphrase: &str,
+        output_path: &Path,
+    ) -> Result<PathBuf, ProjectStoreError> {
+        let meta = self
+            .manifest
+            .encryption
+            .as_ref()
+            .ok_or(ProjectStoreError::NotEncrypted)?;
+        if !meta.enabled {
+            return Err(ProjectStoreError::NotEncrypted);
+        }
+        let key = derive_key_from_meta(passphrase, meta)?;
+        let db_path = self.project_dir.join(DATABASE_FILENAME);
+        let out = Database::export_plaintext(&db_path, &key, output_path)?;
+        Ok(out)
     }
 
     /// Path to the `.kstudio/` directory.

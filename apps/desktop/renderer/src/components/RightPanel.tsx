@@ -22,7 +22,11 @@ import { OpenTypePanel } from "./OpenTypePanel";
 import { PreflightPanel } from "./PreflightPanel";
 import { PresencePanel } from "./PresencePanel";
 import { FiltersPanel } from "./FiltersPanel";
+import { ArtifactPublishPanel } from "./ArtifactPublishPanel";
+import { ConstraintsPanel } from "./ConstraintsPanel";
+import { EncryptionPanel } from "./EncryptionPanel";
 import { TextFramePanel } from "./TextFramePanel";
+import { TokenBindingControl } from "./TokenBindingControl";
 
 export type RightPanelTab =
   | "properties"
@@ -35,7 +39,11 @@ export type RightPanelTab =
   | "interaction"
   | "preflight"
   | "color"
-  | "presence";
+  | "presence"
+  | "constraints"
+  | "tokens"
+  | "publish"
+  | "encryption";
 
 /// Tabs shown by default. Some tabs (Accessibility, Interaction) only
 /// appear when the active editor mode calls for them — gated below.
@@ -135,6 +143,14 @@ export function RightPanel({
         : []),
       ...(showColor ? [{ id: "color" as const, label: "Color" }] : []),
       { id: "presence" as const, label: "Presence" },
+      // Phase 8 Block C — node-scoped + project-scoped surfaces.
+      // Constraints + Tokens are per-selected-node so they only
+      // make sense when a node is selected; rendered with a hint
+      // otherwise (mirrors how the Properties tab degrades).
+      { id: "constraints" as const, label: "Constraints" },
+      { id: "tokens" as const, label: "Tokens" },
+      { id: "publish" as const, label: "Publish" },
+      { id: "encryption" as const, label: "Encryption" },
     ],
     [showAccessibility, showInteraction, showPreflight, showColor],
   );
@@ -261,6 +277,32 @@ export function RightPanel({
         ) : null}
         {tab === "presence" ? (
           <PresencePanel project={project ?? null} onStatus={onStatus} />
+        ) : null}
+        {tab === "constraints" ? (
+          selected !== null ? (
+            <ConstraintsPanel
+              nodeId={selected.id}
+              onStatus={onStatus}
+            />
+          ) : (
+            <Hint>Select a node to edit its resize constraints.</Hint>
+          )
+        ) : null}
+        {tab === "tokens" ? (
+          selected !== null ? (
+            <TokenBindingControl
+              nodeId={selected.id}
+              onStatus={onStatus}
+            />
+          ) : (
+            <Hint>Select a node to bind design tokens to its properties.</Hint>
+          )
+        ) : null}
+        {tab === "publish" ? (
+          <ArtifactPublishPanel onStatus={onStatus} />
+        ) : null}
+        {tab === "encryption" ? (
+          <EncryptionPanel onStatus={onStatus} />
         ) : null}
       </div>
     </aside>

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
+import { AnnotationOverlay } from "../components/AnnotationOverlay";
 import { CanvasHost, type ViewportState } from "../components/CanvasHost";
 import { ConflictToast } from "../components/ConflictToast";
 import { CursorOverlay } from "../components/CursorOverlay";
@@ -660,6 +661,16 @@ export function EditorPage({
     () => nodes.find((n) => n.id === selectedId) ?? null,
     [nodes, selectedId],
   );
+
+  /// Active page id used by the annotation overlay. Derived
+  /// either from the current selection (if it's a Page) or from
+  /// the first Page in the document tree. Returns `null` if the
+  /// project has no pages yet (during boot before refresh).
+  const activePageId = useMemo<string | null>(() => {
+    if (selected && selected.nodeType === "Page") return selected.id;
+    const firstPage = nodes.find((n) => n.nodeType === "Page");
+    return firstPage ? firstPage.id : null;
+  }, [selected, nodes]);
 
   const canUndo = docStatus?.canUndo ?? false;
   const canRedo = docStatus?.canRedo ?? false;
@@ -1874,6 +1885,23 @@ export function EditorPage({
             Self-contained — owns its own subscription + roster.
           */}
           <ConflictToast nodes={nodes} />
+          {/*
+            Phase 8 Task 5 — design-review annotation pins. Sits
+            above SelectionOverlay so the pin hit-targets are
+            clickable, but uses its own pointer-events policy so
+            it doesn't intercept canvas clicks when no pin is
+            under the cursor. The overlay returns `null` until a
+            page is mounted (the bridge needs a page id to scope
+            annotation reads/writes).
+          */}
+          <AnnotationOverlay
+            width={CANVAS_WIDTH}
+            height={CANVAS_HEIGHT}
+            viewport={viewport}
+            pageId={activePageId}
+            project={project}
+            allowCreate={mode === "design" || mode === "layout"}
+          />
           {/*
             Phase 2 soft-proof / gamut-warning overlay. Reads the
             project's color settings via `window.kcreate.color` and

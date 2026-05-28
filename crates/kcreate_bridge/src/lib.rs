@@ -21,6 +21,7 @@ pub mod audit;
 #[cfg(feature = "collab")]
 pub mod collab;
 pub mod document;
+pub mod encryption;
 pub mod hit_test;
 #[cfg(feature = "kchat-backend")]
 pub mod kchat_artifact;
@@ -506,6 +507,63 @@ pub fn project_open(dir: String) -> NapiResult<ProjectInfo> {
 #[napi]
 pub fn project_save() -> NapiResult<()> {
     document::project_save().map_err(map_doc_err)
+}
+
+/// Snapshot the current project's SQLCipher encryption status.
+/// Returns a JSON-serialised
+/// [`encryption::EncryptionStatus`].
+#[napi]
+pub fn project_encryption_status() -> NapiResult<String> {
+    let status = encryption::encryption_status().map_err(map_doc_err)?;
+    serde_json::to_string(&status).map_err(|e| {
+        NapiError::new(
+            Status::GenericFailure,
+            format!("project_encryption_status: serialize: {e}"),
+        )
+    })
+}
+
+/// Pure passphrase-strength meter — `[0, 4]` mapping to the
+/// standard weak/fair/good/strong/very-strong scale.
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn project_passphrase_strength(passphrase: String) -> u32 {
+    u32::from(encryption::passphrase_strength(&passphrase).score)
+}
+
+/// Encrypt the active project's database with `passphrase`.
+/// Returns the new encryption status JSON on success.
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn project_enable_encryption(passphrase: String) -> NapiResult<String> {
+    let status = encryption::enable_encryption(&passphrase).map_err(map_doc_err)?;
+    serde_json::to_string(&status).map_err(|e| {
+        NapiError::new(
+            Status::GenericFailure,
+            format!("project_enable_encryption: serialize: {e}"),
+        )
+    })
+}
+
+/// Rotate the project passphrase.
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn project_change_passphrase(old_passphrase: String, new_passphrase: String) -> NapiResult<()> {
+    encryption::change_passphrase(&old_passphrase, &new_passphrase).map_err(map_doc_err)
+}
+
+/// Export an unencrypted copy of the project's database to
+/// `output_path`. Returns the resolved path the plaintext copy
+/// was written to (always equal to `output_path`).
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn project_export_plaintext_recovery(
+    passphrase: String,
+    output_path: String,
+) -> NapiResult<String> {
+    let out = encryption::export_plaintext_recovery(&passphrase, PathBuf::from(output_path))
+        .map_err(map_doc_err)?;
+    Ok(out.to_string_lossy().into_owned())
 }
 
 /// Close the current project, discarding unsaved in-memory state.
@@ -4424,6 +4482,55 @@ pub fn document_propagate_token(token_name: String) -> NapiResult<u32> {
     phase8::document_propagate_token(&token_name)
         .map(|n| u32::try_from(n).unwrap_or(u32::MAX))
         .map_err(map_doc_err)
+}
+
+/// Snapshot the token bindings on `node_id_str`. Returns a JSON
+/// object mapping snake_case property names to design-token names.
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn document_node_token_bindings(node_id_str: String) -> NapiResult<String> {
+    let id = parse_uuid(&node_id_str)?;
+    let map = phase8::document_node_token_bindings(id).map_err(map_doc_err)?;
+    serde_json::to_string(&map).map_err(|e| {
+        NapiError::new(
+            Status::GenericFailure,
+            format!("document_node_token_bindings: serialize: {e}"),
+        )
+    })
+}
+
+/// Snapshot the constraints on `node_id_str`. Returned JSON mirrors
+/// `kcreate_core::node::Constraints` (`{ "horizontal": ..., "vertical": ... }`).
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn document_node_constraints(node_id_str: String) -> NapiResult<String> {
+    let id = parse_uuid(&node_id_str)?;
+    let constraints = phase8::document_node_constraints(id).map_err(map_doc_err)?;
+    serde_json::to_string(&constraints).map_err(|e| {
+        NapiError::new(
+            Status::GenericFailure,
+            format!("document_node_constraints: serialize: {e}"),
+        )
+    })
+}
+
+/// Update the constraints on `node_id_str`. `constraints_json`
+/// mirrors `kcreate_core::node::Constraints`.
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn document_set_node_constraints(
+    node_id_str: String,
+    constraints_json: String,
+) -> NapiResult<()> {
+    let id = parse_uuid(&node_id_str)?;
+    let constraints: kcreate_core::node::Constraints = serde_json::from_str(&constraints_json)
+        .map_err(|e| {
+            NapiError::new(
+                Status::InvalidArg,
+                format!("document_set_node_constraints: bad constraints json: {e}"),
+            )
+        })?;
+    phase8::document_set_node_constraints(id, constraints).map_err(map_doc_err)
 }
 
 /// Resize a frame and apply [`Constraints`] to every direct child.

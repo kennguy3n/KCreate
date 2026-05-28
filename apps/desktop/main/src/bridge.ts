@@ -976,7 +976,24 @@ export interface Bridge {
   ): void;
   documentUnbindToken(nodeIdStr: string, property: string): void;
   documentPropagateToken(tokenName: string): number;
+  documentNodeTokenBindings(nodeIdStr: string): string;
+  documentNodeConstraints(nodeIdStr: string): string;
+  documentSetNodeConstraints(nodeIdStr: string, constraintsJson: string): void;
   documentResizeFrame(frameIdStr: string, boundsJson: string): void;
+  // -------------------------------------------------------------------
+  // Phase 8 Task 26 — project encryption surface.
+  // -------------------------------------------------------------------
+  projectEncryptionStatus(): string;
+  projectPassphraseStrength(passphrase: string): number;
+  projectEnableEncryption(passphrase: string): string;
+  projectChangePassphrase(
+    oldPassphrase: string,
+    newPassphrase: string,
+  ): void;
+  projectExportPlaintextRecovery(
+    passphrase: string,
+    outputPath: string,
+  ): string;
   textSetAutoFit(nodeIdStr: string, enabled: boolean): boolean;
   pageNumberToken(format: string): string;
   pageSetSection(

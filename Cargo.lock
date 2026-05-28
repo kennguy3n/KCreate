@@ -2038,6 +2038,7 @@ dependencies = [
 name = "kcreate_storage"
 version = "0.0.1"
 dependencies = [
+ "base64",
  "blake3",
  "chrono",
  "hex",

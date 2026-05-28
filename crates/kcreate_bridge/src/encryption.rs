@@ -96,9 +96,12 @@ pub fn enable_encryption(passphrase: &str) -> Result<EncryptionStatus> {
     })
 }
 
-/// Rotate the project passphrase. Both keys derive against the
-/// existing salt, so future opens with either passphrase produce
-/// consistent keys.
+/// Rotate the project passphrase. The per-project salt and PBKDF2
+/// iteration count are unchanged; only the SQLCipher header key is
+/// rewritten. After a successful rotation **only the new passphrase
+/// decrypts the database** — the old passphrase no longer works.
+/// Both keys are derived against the current salt purely so the
+/// rekey can hand SQLCipher the correct "unlock" key.
 pub fn change_passphrase(old_passphrase: &str, new_passphrase: &str) -> Result<()> {
     with_workspace_mut(|ws| {
         ws.store
@@ -110,8 +113,13 @@ pub fn change_passphrase(old_passphrase: &str, new_passphrase: &str) -> Result<(
 /// Export a plaintext copy of the project's database to
 /// `output_path`. The encrypted source is left untouched; used by
 /// the "create recovery backup" flow.
+///
+/// Requires the mutable workspace helper because the underlying
+/// `ProjectStore::export_plaintext_recovery` now closes and re-opens
+/// the live SQLCipher connection across the export to avoid
+/// Windows-side WAL contention from a second concurrent reader.
 pub fn export_plaintext_recovery(passphrase: &str, output_path: PathBuf) -> Result<PathBuf> {
-    with_workspace(|ws| {
+    with_workspace_mut(|ws| {
         ws.store
             .export_plaintext_recovery(passphrase, &output_path)
             .map_err(map_store_err)

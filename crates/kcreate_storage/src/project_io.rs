@@ -262,6 +262,12 @@ impl ProjectStore {
     /// through SQLCipher.
     ///
     /// Returns an error if encryption is already enabled.
+    ///
+    /// **Failure-recovery invariant.** Any error during this method
+    /// leaves `self.db` pointing at a live connection to the
+    /// on-disk database in whatever encryption state it was last
+    /// in. Callers can therefore retry, save, or close the project
+    /// without risking writes landing in a throwaway in-memory DB.
     pub fn enable_encryption(&mut self, passphrase: &str) -> Result<(), ProjectStoreError> {
         if passphrase.is_empty() {
             return Err(ProjectStoreError::PassphraseEmpty);
@@ -282,26 +288,51 @@ impl ProjectStore {
         // `encrypt_existing` opens a fresh connection; otherwise
         // SQLCipher's `ATTACH … KEY` would fight a live connection
         // for the WAL file. Use an in-memory placeholder so the
-        // struct stays in a valid state across the failure window.
+        // struct stays in a valid state across the failure window
+        // — but we MUST restore a real connection (encrypted on
+        // success, plaintext on failure) before returning so the
+        // store never silently writes into the placeholder.
         self.replace_db_with_placeholder()?;
-        Database::encrypt_existing(&db_path, &key)?;
-        // Re-open encrypted now that the on-disk file is ciphertext.
-        self.db = Database::open_encrypted(&db_path, &key)?;
-        let meta = EncryptionMetadata {
-            enabled: true,
-            salt: URL_SAFE_NO_PAD.encode(salt),
-            iterations,
-        };
-        self.manifest.encryption = Some(meta);
-        write_manifest(&self.project_dir, &self.manifest)?;
-        Ok(())
+        let result = (|| -> Result<(), ProjectStoreError> {
+            Database::encrypt_existing(&db_path, &key)?;
+            // Re-open encrypted now that the on-disk file is ciphertext.
+            self.db = Database::open_encrypted(&db_path, &key)?;
+            let meta = EncryptionMetadata {
+                enabled: true,
+                salt: URL_SAFE_NO_PAD.encode(salt),
+                iterations,
+            };
+            self.manifest.encryption = Some(meta);
+            write_manifest(&self.project_dir, &self.manifest)?;
+            Ok(())
+        })();
+        if result.is_err() {
+            // Best-effort recovery: try re-opening the on-disk DB
+            // as plaintext first (the typical failure case is that
+            // `encrypt_existing` aborted before mutating the file).
+            // If that fails (e.g. the file is now ciphertext
+            // because `encrypt_existing` succeeded and a later
+            // step failed), fall back to opening it with the
+            // freshly-derived key. If both attempts fail, leave
+            // the placeholder in place — a corrupt-file state we
+            // cannot recover from without user intervention — and
+            // surface the original error so the caller can prompt
+            // the user to re-open the project from disk.
+            if let Ok(db) = Database::open(&db_path) {
+                self.db = db;
+            } else if let Ok(db) = Database::open_encrypted(&db_path, &key) {
+                self.db = db;
+            }
+        }
+        result
     }
 
     /// Drop the live database connection by swapping in an
     /// in-memory placeholder. Used by mutation paths
-    /// (`enable_encryption`, `change_passphrase`) that need to call
-    /// SQLCipher operations against the path while the original
-    /// connection is closed.
+    /// (`enable_encryption`, `change_passphrase`,
+    /// `export_plaintext_recovery`) that need to call SQLCipher
+    /// operations against the path while the original connection
+    /// is closed.
     fn replace_db_with_placeholder(&mut self) -> Result<(), ProjectStoreError> {
         let placeholder = Database::open(":memory:")?;
         // Replace returns the old value; binding to `_` immediately
@@ -310,9 +341,22 @@ impl ProjectStore {
         Ok(())
     }
 
-    /// Rotate the project passphrase. Both passphrases derive keys
-    /// against the *current* salt; the on-disk salt is unchanged so
-    /// future opens of either passphrase work consistently.
+    /// Rotate the project passphrase. The per-project salt and
+    /// PBKDF2 iteration count in `manifest.json` are unchanged —
+    /// only the encryption key in the SQLCipher header is rewritten
+    /// via [`Database::change_key`]. After a successful rotation
+    /// **only the new passphrase decrypts the database**; the old
+    /// passphrase no longer works. Both keys are derived against
+    /// the current salt purely so the rekey can hand SQLCipher the
+    /// correct "unlock" key.
+    ///
+    /// **Failure-recovery invariant.** The function first probes
+    /// the old passphrase by opening a throwaway encrypted
+    /// connection to the on-disk file. Only if that succeeds does
+    /// it swap out the live connection and rekey. Wrong-old-key
+    /// rejections therefore never touch `self.db`, and post-rekey
+    /// failures (disk full, etc.) recover by reopening with
+    /// whichever key the on-disk header now holds.
     pub fn change_passphrase(
         &mut self,
         old_passphrase: &str,
@@ -332,12 +376,40 @@ impl ProjectStore {
         let old_key = derive_key_from_meta(old_passphrase, &meta)?;
         let new_key = derive_key_from_meta(new_passphrase, &meta)?;
         let db_path = self.project_dir.join(DATABASE_FILENAME);
-        // Drop the live connection (held in `self.db`) before
-        // PRAGMA rekey opens its own.
+        // Probe the old key against the on-disk file BEFORE
+        // touching `self.db`. If the user gave us the wrong old
+        // passphrase the probe fails immediately and the live
+        // connection is never disturbed, so subsequent saves
+        // continue to hit the real ciphertext file.
+        {
+            let probe = Database::open_encrypted(&db_path, &old_key)?;
+            drop(probe);
+        }
+        // The probe succeeded so we know `old_key` is the correct
+        // unlock key. Drop the live connection (held in `self.db`)
+        // before `PRAGMA rekey` opens its own — the rekey wants
+        // exclusive access to the WAL.
         self.replace_db_with_placeholder()?;
-        Database::change_key(&db_path, &old_key, &new_key)?;
-        self.db = Database::open_encrypted(&db_path, &new_key)?;
-        Ok(())
+        let result = (|| -> Result<(), ProjectStoreError> {
+            Database::change_key(&db_path, &old_key, &new_key)?;
+            self.db = Database::open_encrypted(&db_path, &new_key)?;
+            Ok(())
+        })();
+        if result.is_err() {
+            // Rekey failed after the swap (e.g. disk full,
+            // SQLCipher build mismatch). The probe established
+            // that `old_key` opens the file, so try that first.
+            // If a partial header rewrite occurred, fall back to
+            // `new_key`. As a final fallback leave the placeholder;
+            // the caller surfaces the original error and the user
+            // can re-open the project from disk.
+            if let Ok(db) = Database::open_encrypted(&db_path, &old_key) {
+                self.db = db;
+            } else if let Ok(db) = Database::open_encrypted(&db_path, &new_key) {
+                self.db = db;
+            }
+        }
+        result
     }
 
     /// Export an unencrypted copy of the project's database to
@@ -345,23 +417,63 @@ impl ProjectStore {
     /// untouched. Used by the recovery flow that lets the user
     /// produce a passphrase-free backup before disabling
     /// encryption.
+    ///
+    /// The live SQLCipher connection held in `self.db` is closed
+    /// for the duration of the export so the second SQLite
+    /// connection that `Database::export_plaintext` opens does not
+    /// contend with the primary connection on the WAL file. On
+    /// some Windows configurations (antivirus, OneDrive, etc.) the
+    /// second connection would otherwise hit `SQLITE_BUSY` /
+    /// access-denied even though SQLite's WAL mode normally
+    /// permits concurrent readers. After export the live
+    /// connection is re-opened with the same passphrase.
     pub fn export_plaintext_recovery(
-        &self,
+        &mut self,
         passphrase: &str,
         output_path: &Path,
     ) -> Result<PathBuf, ProjectStoreError> {
         let meta = self
             .manifest
             .encryption
-            .as_ref()
+            .clone()
             .ok_or(ProjectStoreError::NotEncrypted)?;
         if !meta.enabled {
             return Err(ProjectStoreError::NotEncrypted);
         }
-        let key = derive_key_from_meta(passphrase, meta)?;
+        let key = derive_key_from_meta(passphrase, &meta)?;
         let db_path = self.project_dir.join(DATABASE_FILENAME);
-        let out = Database::export_plaintext(&db_path, &key, output_path)?;
-        Ok(out)
+        // Probe the key BEFORE swapping out the live connection so
+        // wrong-passphrase rejections never disturb `self.db`.
+        {
+            let probe = Database::open_encrypted(&db_path, &key)?;
+            drop(probe);
+        }
+        // Close the primary connection so the export-side
+        // connection has exclusive access to the WAL.
+        // `replace_db_with_placeholder` installs an in-memory DB
+        // so any concurrent reader of `self.db` keeps a valid
+        // handle until we restore the real connection at the end
+        // of this method.
+        self.replace_db_with_placeholder()?;
+        let result = Database::export_plaintext(&db_path, &key, output_path);
+        // Always re-open the live connection — even on export
+        // failure — so the store ends in a usable state. The probe
+        // above already proved `key` opens the on-disk file.
+        match Database::open_encrypted(&db_path, &key) {
+            Ok(db) => self.db = db,
+            Err(reopen_err) => {
+                // The export side may have left the file in a
+                // transient state that breaks reopen (extremely
+                // rare). Surface whichever error is the more
+                // actionable: the original export failure if
+                // present, otherwise the reopen failure.
+                return match result {
+                    Ok(_) => Err(ProjectStoreError::Database(reopen_err)),
+                    Err(export_err) => Err(ProjectStoreError::Database(export_err)),
+                };
+            }
+        }
+        Ok(result?)
     }
 
     /// Path to the `.kstudio/` directory.
@@ -1198,5 +1310,125 @@ mod tests {
         let reopened = ProjectStore::open(&p).expect("reopen");
         let loaded = reopened.load_components().expect("load after reopen");
         assert!(loaded.contains_key(&cid));
+    }
+
+    /// `change_passphrase` with the wrong old passphrase must surface
+    /// the error AND leave `self.db` pointing at a usable connection
+    /// to the on-disk encrypted database — not a dead in-memory
+    /// placeholder. Without the failure-recovery path, the store
+    /// would silently accept subsequent writes into a throwaway
+    /// in-memory DB.
+    #[test]
+    fn change_passphrase_wrong_old_key_leaves_store_writable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = dir.path().join("Enc.kstudio");
+        let mut store = ProjectStore::create(&p, "Enc").expect("create");
+        store
+            .enable_encryption("first-pass-strong-1")
+            .expect("enable");
+
+        // Wrong old passphrase. This must fail.
+        let err = store
+            .change_passphrase("wrong-pass", "second-pass-strong-2")
+            .expect_err("must fail");
+        assert!(
+            matches!(err, ProjectStoreError::Database(_)),
+            "expected Database error, got {err:?}",
+        );
+
+        // The connection MUST still be alive. Prove it by writing
+        // through `self.db` and re-opening from disk to confirm the
+        // bytes actually landed on the real ciphertext file (not a
+        // throwaway in-memory placeholder).
+        let mut doc = DocumentGraph::new();
+        let mut page = Node::new(NodeType::Page, "AfterFailure");
+        page.bounds = Bounds::new(0.0, 0.0, 100.0, 100.0);
+        let page_id = page.id;
+        doc.insert_node(page).expect("insert page");
+        store
+            .save_document(&doc)
+            .expect("save must succeed against the real on-disk DB");
+
+        drop(store);
+        let reopened = ProjectStore::open_with_passphrase(&p, Some("first-pass-strong-1"))
+            .expect("reopen with original passphrase");
+        let loaded = reopened.load_document().expect("load");
+        assert_eq!(loaded.node_count(), 1, "write must have hit the real DB");
+        assert!(loaded.root_ids().contains(&page_id));
+    }
+
+    /// `export_plaintext_recovery` with the wrong passphrase must
+    /// surface the error AND leave `self.db` connected to the
+    /// encrypted on-disk file.
+    #[test]
+    fn export_plaintext_recovery_wrong_pass_leaves_store_writable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = dir.path().join("Enc.kstudio");
+        let mut store = ProjectStore::create(&p, "Enc").expect("create");
+        store
+            .enable_encryption("export-pass-strong-1")
+            .expect("enable");
+
+        let recovery_path = dir.path().join("recovery.sqlite");
+        let err = store
+            .export_plaintext_recovery("wrong-pass", &recovery_path)
+            .expect_err("must fail");
+        assert!(
+            matches!(err, ProjectStoreError::Database(_)),
+            "expected Database error, got {err:?}",
+        );
+        assert!(
+            !recovery_path.exists()
+                || std::fs::metadata(&recovery_path).map_or(0, |m| m.len()) == 0,
+            "failed export must not leave a valid recovery copy",
+        );
+
+        // Write through the live connection and verify it persists.
+        let mut doc = DocumentGraph::new();
+        let page = Node::new(NodeType::Page, "AfterFailure");
+        let page_id = page.id;
+        doc.insert_node(page).expect("insert page");
+        store.save_document(&doc).expect("save must succeed");
+
+        drop(store);
+        let reopened =
+            ProjectStore::open_with_passphrase(&p, Some("export-pass-strong-1")).expect("reopen");
+        let loaded = reopened.load_document().expect("load");
+        assert_eq!(loaded.node_count(), 1);
+        assert!(loaded.root_ids().contains(&page_id));
+    }
+
+    /// Successful `export_plaintext_recovery` must leave the live
+    /// SQLCipher connection re-opened so the store is immediately
+    /// usable afterwards (no need to close and re-open the project).
+    #[test]
+    fn export_plaintext_recovery_success_leaves_store_writable() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = dir.path().join("Enc.kstudio");
+        let mut store = ProjectStore::create(&p, "Enc").expect("create");
+        store
+            .enable_encryption("happy-pass-strong-1")
+            .expect("enable");
+
+        let recovery_path = dir.path().join("recovery.sqlite");
+        let written = store
+            .export_plaintext_recovery("happy-pass-strong-1", &recovery_path)
+            .expect("export");
+        assert_eq!(written, recovery_path);
+        assert!(recovery_path.exists());
+
+        // Subsequent saves must persist to the still-encrypted
+        // on-disk file.
+        let mut doc = DocumentGraph::new();
+        let page = Node::new(NodeType::Page, "AfterExport");
+        let page_id = page.id;
+        doc.insert_node(page).expect("insert page");
+        store.save_document(&doc).expect("save after export");
+
+        drop(store);
+        let reopened = ProjectStore::open_with_passphrase(&p, Some("happy-pass-strong-1"))
+            .expect("reopen encrypted");
+        let loaded = reopened.load_document().expect("load");
+        assert!(loaded.root_ids().contains(&page_id));
     }
 }

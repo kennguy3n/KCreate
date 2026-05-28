@@ -919,8 +919,8 @@ artifact-publishing capabilities the proposal calls for.
 - [x] **Task 19: Constraint system for responsive frames.**
       `crates/kcreate_core/src/node.rs` defines
       `Constraints { horizontal, vertical }` with the 6
-      axis modes (`Fixed`, `Scale`, `StretchToParent`,
-      `Center`, `LeftAndRight`, `TopAndBottom`).
+      axis modes (`Fixed`, `Min`, `Max`, `Center`, `Scale`,
+      `Stretch`).
       `crates/kcreate_layout/src/constraints.rs` ships
       `apply_constraints(child_bounds, child_constraints,
       parent_old, parent_new) -> Bounds` and the

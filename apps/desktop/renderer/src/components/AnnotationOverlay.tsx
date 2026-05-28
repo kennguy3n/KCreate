@@ -188,7 +188,9 @@ export function AnnotationOverlay({
   // Pull the current session identity once on mount + on every
   // session lifecycle change. Used as the `authorPeerId` /
   // `authorName` for new annotations so attribution is consistent
-  // with the cursor / selection overlays.
+  // with the cursor / selection overlays. Runs on mount only — the
+  // event handler captures `refresh` by closure so it always reads
+  // the latest identity from the bridge.
   useEffect(() => {
     let cancelled = false;
     const refresh = async (): Promise<void> => {
@@ -206,11 +208,20 @@ export function AnnotationOverlay({
       if (ev.kind === "sessionStarted" || ev.kind === "sessionLeft") {
         void refresh();
       }
-      // Re-pull annotations when a peer broadcasts a mutation that
-      // touched our page. The bridge guarantees `pageIds` is the
-      // exact set of affected page UUIDs — we check membership
-      // rather than blindly reloading on every event so other
-      // pages' churn doesn't trigger work.
+    });
+    return () => {
+      cancelled = true;
+      unsubscribe();
+    };
+  }, []);
+
+  // Re-pull annotations when a peer broadcasts a mutation that
+  // touched our page. Separated from the session-identity effect
+  // above so visibility-filter changes (which update `reload`)
+  // only re-subscribe the annotation listener — not the session
+  // identity subscription.
+  useEffect(() => {
+    const unsubscribe = window.kcreate.session.onEvent((ev) => {
       if (ev.kind === "annotationsApplied") {
         if (pageId != null && ev.pageIds.includes(pageId)) {
           void reload();
@@ -218,7 +229,6 @@ export function AnnotationOverlay({
       }
     });
     return () => {
-      cancelled = true;
       unsubscribe();
     };
   }, [pageId, reload]);

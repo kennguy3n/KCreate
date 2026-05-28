@@ -50,12 +50,12 @@ export function EncryptionPanel({
 
   // Enable-encryption form.
   const [enableForm, setEnableForm] = useState<FormState>(EMPTY_FORM);
-  const [enableStrength, setEnableStrength] = useState<number>(0);
+  const [enableStrength, setEnableStrength] = useState<number | null>(null);
 
   // Change-passphrase form.
   const [oldPassphrase, setOldPassphrase] = useState<string>("");
   const [newForm, setNewForm] = useState<FormState>(EMPTY_FORM);
-  const [newStrength, setNewStrength] = useState<number>(0);
+  const [newStrength, setNewStrength] = useState<number | null>(null);
 
   // Recovery export form.
   const [recoveryPassphrase, setRecoveryPassphrase] = useState<string>("");
@@ -80,7 +80,7 @@ export function EncryptionPanel({
   // is acceptable (sub-millisecond).
   useEffect(() => {
     if (enableForm.passphrase.length === 0) {
-      setEnableStrength(0);
+      setEnableStrength(null);
       return;
     }
     let cancelled = false;
@@ -101,7 +101,7 @@ export function EncryptionPanel({
 
   useEffect(() => {
     if (newForm.passphrase.length === 0) {
-      setNewStrength(0);
+      setNewStrength(null);
       return;
     }
     let cancelled = false;
@@ -453,8 +453,7 @@ function Header(): JSX.Element {
   );
 }
 
-function StrengthMeter({ score }: { score: number }): JSX.Element {
-  const safeScore = Math.max(0, Math.min(4, Math.round(score)));
+function StrengthMeter({ score }: { score: number | null }): JSX.Element {
   const fillColors = [
     colors.danger,
     colors.danger,
@@ -462,6 +461,8 @@ function StrengthMeter({ score }: { score: number }): JSX.Element {
     colors.success,
     colors.success,
   ];
+  const safeScore =
+    score === null ? null : Math.max(0, Math.min(4, Math.round(score)));
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
       <div style={{ display: "flex", gap: 2 }}>
@@ -472,7 +473,10 @@ function StrengthMeter({ score }: { score: number }): JSX.Element {
               flex: 1,
               height: 4,
               borderRadius: radius.pill,
-              background: i <= safeScore ? fillColors[safeScore] : colors.bgSoft,
+              background:
+                safeScore !== null && i <= safeScore
+                  ? fillColors[safeScore]
+                  : colors.bgSoft,
               border: `1px solid ${colors.border}`,
             }}
             aria-hidden
@@ -480,7 +484,7 @@ function StrengthMeter({ score }: { score: number }): JSX.Element {
         ))}
       </div>
       <small style={{ color: colors.textMuted, fontSize: 10 }}>
-        {STRENGTH_LABELS[safeScore]}
+        {safeScore !== null ? STRENGTH_LABELS[safeScore] : "\u00A0"}
       </small>
     </div>
   );

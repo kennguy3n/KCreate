@@ -38,8 +38,10 @@
 //     before they ever start a session.
 
 import {
+  forwardRef,
   useCallback,
   useEffect,
+  useImperativeHandle,
   useLayoutEffect,
   useMemo,
   useRef,
@@ -74,15 +76,30 @@ export interface AnnotationOverlayProps {
    * local-peer-id when no collab session is active so the author
    * attribution is consistent across the lifetime of the project. */
   project: ProjectInfo | null;
-  /** When `false`, the overlay still renders existing pins (read
-   * + thread interactions) but the double-click drop-pin gesture is
-   * disabled. Lets the host gate the writing path behind a mode
-   * toggle (`mode === "design"` etc.) without unmounting the whole
-   * overlay. */
+  /** When `false`, the imperative `beginDraftAt` handle is a no-op
+   * (existing pins still render + thread interactions still work).
+   * Lets the host gate the writing path behind a mode toggle
+   * (`mode === "design"` etc.) without unmounting the whole overlay.
+   * The host owns the double-click gesture and forwards it through
+   * the ref (see `AnnotationOverlayHandle`). */
   allowCreate?: boolean;
   /** Forwarded so the host can hide tool overlays while a thread is
    * open. Optional. */
   onThreadOpenChange?: (open: boolean) => void;
+}
+
+/// Imperative handle the host uses to drop a new pin in response to a
+/// canvas-level gesture (typically a double-click on the canvas
+/// surface). Living on a ref instead of as a prop keeps the overlay's
+/// root SVG `pointer-events: none` so it never intercepts canvas
+/// clicks — the host owns the gesture and the overlay only owns the
+/// draft-editor state once the host invokes the handle.
+export interface AnnotationOverlayHandle {
+  /** Drop a draft pin at the given overlay-local screen-space
+   * coordinates. Coordinates outside the overlay extents, or calls
+   * made while `allowCreate` is `false` or no page is mounted, are
+   * silently ignored so the host can fire-and-forget. */
+  beginDraftAt(screenX: number, screenY: number): void;
 }
 
 /// Pin radius in screen-space pixels. Constant — does NOT scale
@@ -127,15 +144,21 @@ export function localPeerIdForProject(projectId: string): string {
   return `local:${projectId}`;
 }
 
-export function AnnotationOverlay({
-  width,
-  height,
-  viewport,
-  pageId,
-  project,
-  allowCreate = true,
-  onThreadOpenChange,
-}: AnnotationOverlayProps): JSX.Element | null {
+export const AnnotationOverlay = forwardRef<
+  AnnotationOverlayHandle,
+  AnnotationOverlayProps
+>(function AnnotationOverlay(
+  {
+    width,
+    height,
+    viewport,
+    pageId,
+    project,
+    allowCreate = true,
+    onThreadOpenChange,
+  },
+  handleRef,
+): JSX.Element | null {
   const [annotations, setAnnotations] = useState<Annotation[]>([]);
   const [openThreadId, setOpenThreadId] = useState<string | null>(null);
   const [visibility, setVisibility] = useState<AnnotationVisibility>("open");
@@ -262,25 +285,31 @@ export function AnnotationOverlay({
     [viewport.panX, viewport.panY, viewport.zoom],
   );
 
-  const handleSurfaceDoubleClick = useCallback(
-    (event: React.MouseEvent<SVGSVGElement>) => {
+  // Imperative entrypoint the host uses to drop a draft pin in
+  // response to a canvas-level gesture. The host owns the gesture
+  // (it lives on `<main>` so it does NOT intercept canvas clicks via
+  // an absolutely-positioned hit surface) and forwards the local
+  // overlay-space coordinates through this ref.
+  const beginDraftAt = useCallback(
+    (screenX: number, screenY: number): void => {
       if (!allowCreate || pageId == null) return;
-      // Use the SVG element's own bounding rect to translate the
-      // viewport-relative `clientX/Y` into the overlay's local
-      // coordinate system. This handles the case where the overlay
-      // is not glued to the viewport top-left (e.g. wrapped in a
-      // panel with margins).
-      const svg = overlayRef.current;
-      if (svg == null) return;
-      const rect = svg.getBoundingClientRect();
-      const screenX = event.clientX - rect.left;
-      const screenY = event.clientY - rect.top;
+      // Bounds-check so a double-click on the host's surrounding
+      // padding (outside the canvas region) is a no-op instead of a
+      // pin drop at negative or off-canvas world coordinates.
+      if (screenX < 0 || screenY < 0) return;
+      if (screenX > width || screenY > height) return;
       const world = eventToWorld(screenX, screenY);
       setDraftPosition(world);
       // Close any open thread so the draft editor takes focus.
       setOpenThreadId(null);
     },
-    [allowCreate, eventToWorld, pageId],
+    [allowCreate, eventToWorld, height, pageId, width],
+  );
+
+  useImperativeHandle(
+    handleRef,
+    () => ({ beginDraftAt }),
+    [beginDraftAt],
   );
 
   const handleCreate = useCallback(
@@ -375,22 +404,21 @@ export function AnnotationOverlay({
   return (
     <svg
       ref={overlayRef}
-      // The SVG itself captures the double-click that drops a new
-      // pin, but individual pin children opt out of bubbling via
-      // `event.stopPropagation()` in their handlers so clicking an
-      // existing pin opens the thread instead of dropping a new one.
-      onDoubleClick={handleSurfaceDoubleClick}
       style={{
         position: "absolute",
         inset: 0,
         width,
         height,
-        // Pins themselves take pointer events (see per-circle
-        // override below). The surface is `auto` so the
-        // double-click handler fires; if `allowCreate` is false we
-        // turn this off so canvas tools below can receive the
-        // gesture.
-        pointerEvents: allowCreate ? "auto" : "none",
+        // Root SVG is ALWAYS `pointer-events: none` so canvas tools
+        // (pan / draw / select) below this overlay receive every
+        // gesture by default. Individual pin children opt back in
+        // with `pointer-events: auto` (see per-`<g>` override
+        // below) so they remain clickable, and the host owns the
+        // double-click drop-pin gesture via the imperative
+        // `beginDraftAt` handle (see `AnnotationOverlayHandle`).
+        // Mirrors the policy used by `CursorOverlay` /
+        // `SnapGuidesOverlay` / `SelectionOverlay`.
+        pointerEvents: "none",
       }}
       width={width}
       height={height}
@@ -497,7 +525,7 @@ export function AnnotationOverlay({
       />
     </svg>
   );
-}
+});
 
 interface ThreadGroup {
   head: Annotation;

@@ -1684,6 +1684,31 @@ function registerIpcHandlers(): void {
     (_e, passphrase: string, outputPath: string): string =>
       requireBridge().projectExportPlaintextRecovery(passphrase, outputPath),
   );
+  // Native save dialog scoped to the plaintext recovery export. We
+  // keep the picker in the main process (instead of an inline
+  // `<input type="text">` in the renderer) so (a) the renderer
+  // never sees the user's filesystem, (b) the OS handles overwrite-
+  // protection / sandbox prompts / iCloud routing, and (c) the
+  // default filename + extension are pinned in a single place
+  // (mirrors the pattern used by `kcreate/pdf/pickFile` /
+  // `kcreate/sketch/pickFile`). Returns the absolute chosen path,
+  // or `null` if the user cancelled — the panel uses `null` to
+  // short-circuit without showing an error.
+  ipcMain.handle("kcreate/project/encryption/pick-recovery-path", async () => {
+    const win = mainWindow;
+    if (!win) return null;
+    const result = await dialog.showSaveDialog(win, {
+      title: "Export plaintext recovery copy",
+      defaultPath: "recovery.sqlite",
+      filters: [
+        { name: "SQLite database", extensions: ["sqlite", "db"] },
+        { name: "All files", extensions: ["*"] },
+      ],
+      properties: ["showOverwriteConfirmation", "createDirectory"],
+    });
+    if (result.canceled || !result.filePath) return null;
+    return result.filePath;
+  });
   ipcMain.handle(
     "kcreate/phase8/resize-frame",
     (

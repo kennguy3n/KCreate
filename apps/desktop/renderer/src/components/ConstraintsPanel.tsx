@@ -298,12 +298,18 @@ function ConstraintVisualiser({
 
   // Anchor points on the child rectangle that the constraint pulls
   // toward. (Decorative — not a fidelity match for `apply_constraints`.)
+  // `fixed` and `min` both pin the leading edge under
+  // `kcreate_layout::constraints::apply_constraints` (see the
+  // `Constraint::Fixed | Constraint::Min` match arm there), so the
+  // visualiser shows the same leading anchor line for both.
   const child = childRectForConstraints(parent, constraints);
-  const leadH = constraints.horizontal === "min" ||
+  const leadH = constraints.horizontal === "fixed" ||
+    constraints.horizontal === "min" ||
     constraints.horizontal === "stretch";
   const trailH = constraints.horizontal === "max" ||
     constraints.horizontal === "stretch";
-  const leadV = constraints.vertical === "min" ||
+  const leadV = constraints.vertical === "fixed" ||
+    constraints.vertical === "min" ||
     constraints.vertical === "stretch";
   const trailV = constraints.vertical === "max" ||
     constraints.vertical === "stretch";

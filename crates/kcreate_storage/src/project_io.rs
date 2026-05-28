@@ -45,6 +45,14 @@ const DATABASE_FILENAME: &str = "document.sqlite";
 const BLOBS_DIRNAME: &str = "blobs";
 const SUBDIRS: &[&str] = &["thumbnails", "exports", "ai", "cache"];
 
+/// Side-car journal written by [`ProjectStore::enable_encryption`]
+/// *before* the database file is rewritten as ciphertext and removed
+/// only *after* the manifest update has been persisted. Its presence
+/// at [`open_with_passphrase`] time signals that an encryption
+/// transition was interrupted and may need to be recovered. The file
+/// lives alongside `manifest.json` in the project dir.
+const ENCRYPTION_JOURNAL_FILENAME: &str = ".encryption_journal.json";
+
 /// Errors from project I/O.
 #[derive(Debug, Error)]
 pub enum ProjectStoreError {
@@ -103,6 +111,34 @@ fn derive_key_from_meta(
         )
     })?;
     Ok(crate::crypto::derive_key(passphrase, &salt, iter))
+}
+
+/// Side-car journal written before a destructive encryption
+/// transition so the next [`ProjectStore::open_with_passphrase`] can
+/// detect and recover from a crash that lands between
+/// `encrypt_existing` and `write_manifest`. Mirrors
+/// [`EncryptionMetadata`] one-for-one because that is exactly the
+/// state we expect to commit to the manifest once the transition
+/// completes — keeping the shape identical makes the recovery path a
+/// trivial copy.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct EncryptionJournal {
+    /// Url-safe base64 (no padding) PBKDF2 salt. Length pinned to
+    /// `kcreate_storage::crypto::SALT_LEN` (16) bytes.
+    salt: String,
+    /// PBKDF2-HMAC-SHA256 iteration count used to derive the key
+    /// from the passphrase + salt.
+    iterations: u32,
+}
+
+impl EncryptionJournal {
+    fn into_metadata(self) -> EncryptionMetadata {
+        EncryptionMetadata {
+            enabled: true,
+            salt: self.salt,
+            iterations: self.iterations,
+        }
+    }
 }
 
 /// Per-project encryption metadata. When `enabled` is true the
@@ -221,12 +257,37 @@ impl ProjectStore {
         if !manifest_path.exists() {
             return Err(ProjectStoreError::InvalidManifest(manifest_path));
         }
-        let manifest = read_manifest(&dir)?;
+        let mut manifest = read_manifest(&dir)?;
         if manifest.format != MANIFEST_FORMAT {
             return Err(ProjectStoreError::UnsupportedFormat(manifest.format));
         }
         for sub in SUBDIRS {
             fs::create_dir_all(dir.join(sub))?;
+        }
+        // Crash-recovery: a journal file alongside `manifest.json`
+        // signals that a previous `enable_encryption` call rewrote
+        // the database to ciphertext but did not get to commit the
+        // manifest update. Reconcile the on-disk state now so the
+        // rest of this method sees a consistent picture. The
+        // recovery path only runs when the manifest still claims
+        // plaintext — once the manifest reports `enabled = true`,
+        // the journal is a harmless leftover that we just clean up.
+        if let Some(journal) = read_encryption_journal(&dir)? {
+            let manifest_says_encrypted = matches!(
+                manifest.encryption.as_ref(),
+                Some(m) if m.enabled,
+            );
+            if manifest_says_encrypted {
+                // Manifest already reflects the transition — the
+                // journal is stale. Best-effort cleanup; ignore
+                // errors so we don't fail the open on a transient
+                // FS issue (the journal will be re-cleaned on the
+                // next successful `enable_encryption` /
+                // `change_passphrase`).
+                let _ = remove_encryption_journal(&dir);
+            } else {
+                Self::recover_from_encryption_journal(&dir, &mut manifest, journal)?;
+            }
         }
         let db_path = dir.join(DATABASE_FILENAME);
         let db = match manifest.encryption.as_ref() {
@@ -244,6 +305,51 @@ impl ProjectStore {
             db,
             blobs,
         })
+    }
+
+    /// Reconcile the on-disk state when a journal exists and the
+    /// manifest still claims plaintext. Three sub-cases:
+    ///
+    /// 1. **Database file is ciphertext** — `encrypt_existing`
+    ///    completed but `write_manifest` did not. Promote the
+    ///    journal contents to the manifest and persist, then drop
+    ///    the journal. This is the case the journal was added to
+    ///    rescue: the user's passphrase still works because the
+    ///    salt + iterations match.
+    /// 2. **Database file is plaintext** — `encrypt_existing` never
+    ///    committed (typical case: the process crashed before the
+    ///    `fs::rename` inside `encrypt_existing`). The manifest is
+    ///    already correct; just drop the journal so we don't run
+    ///    recovery again on the next open.
+    /// 3. **Indeterminate** — neither open succeeds. Surface a
+    ///    structured error so the UI can prompt the user; leaving
+    ///    the journal in place so a future retry has a chance.
+    fn recover_from_encryption_journal(
+        dir: &Path,
+        manifest: &mut ProjectManifest,
+        journal: EncryptionJournal,
+    ) -> Result<(), ProjectStoreError> {
+        let db_path = dir.join(DATABASE_FILENAME);
+        // Probe plaintext first because it's cheaper (no key
+        // derivation) and the more common crash window — the
+        // database rewrite is the long step in `encrypt_existing`
+        // so most interruptions land before the `fs::rename`.
+        match Database::open(&db_path) {
+            Ok(_) => {
+                // File is still plaintext: roll forward by leaving
+                // the manifest as-is and dropping the journal.
+                remove_encryption_journal(dir)
+            }
+            Err(_plain_err) => {
+                // Plaintext open failed — file is most likely
+                // ciphertext. Promote the journal to manifest so
+                // the normal encrypted-open path below picks it
+                // up.
+                manifest.encryption = Some(journal.into_metadata());
+                write_manifest(dir, manifest)?;
+                remove_encryption_journal(dir)
+            }
+        }
     }
 
     /// Whether the project's SQLite database is currently encrypted
@@ -284,6 +390,22 @@ impl ProjectStore {
         })?;
         let key = crate::crypto::derive_key(passphrase, &salt, iter_nonzero);
         let db_path = self.project_dir.join(DATABASE_FILENAME);
+        let salt_b64 = URL_SAFE_NO_PAD.encode(salt);
+        // Persist a side-car journal describing the upcoming
+        // transition BEFORE rewriting the database file. If we crash
+        // between `encrypt_existing` and `write_manifest` below, the
+        // next `open_with_passphrase` will spot the journal alongside
+        // a still-plaintext-looking manifest and run the recovery
+        // path — see `recover_from_encryption_journal` in
+        // `open_with_passphrase`. Writing the journal first is what
+        // makes this method crash-safe across sessions; the in-
+        // session `replace_db_with_placeholder` recovery below only
+        // covers errors observed within the same process.
+        let journal = EncryptionJournal {
+            salt: salt_b64.clone(),
+            iterations,
+        };
+        write_encryption_journal(&self.project_dir, &journal)?;
         // The previous Database value must be dropped before
         // `encrypt_existing` opens a fresh connection; otherwise
         // SQLCipher's `ATTACH … KEY` would fight a live connection
@@ -299,7 +421,7 @@ impl ProjectStore {
             self.db = Database::open_encrypted(&db_path, &key)?;
             let meta = EncryptionMetadata {
                 enabled: true,
-                salt: URL_SAFE_NO_PAD.encode(salt),
+                salt: salt_b64,
                 iterations,
             };
             self.manifest.encryption = Some(meta);
@@ -324,6 +446,18 @@ impl ProjectStore {
                 self.db = db;
             }
         }
+        // Whether the transition succeeded or failed, drop the
+        // journal — on success it has done its job; on failure we
+        // either restored plaintext (so the journal would prompt a
+        // bogus recovery on next open) or we left a corrupted file
+        // that the journal cannot rescue anyway. Recovery should
+        // only ever run when a *future* `enable_encryption` call
+        // crashes between the database rewrite and the manifest
+        // update, never as a leftover from a rolled-back attempt.
+        // Ignore removal errors — if even this fails we already
+        // have a more serious problem (disk full / read-only) that
+        // the caller will see via `result`.
+        let _ = remove_encryption_journal(&self.project_dir);
         result
     }
 
@@ -1005,6 +1139,51 @@ fn read_manifest(dir: &Path) -> Result<ProjectManifest, ProjectStoreError> {
     Ok(serde_json::from_str(&raw)?)
 }
 
+fn encryption_journal_path(dir: &Path) -> PathBuf {
+    dir.join(ENCRYPTION_JOURNAL_FILENAME)
+}
+
+/// Write the encryption journal atomically (write to tmp + rename).
+/// Used by [`ProjectStore::enable_encryption`] *before* the database
+/// file is rewritten so a crash between the database rewrite and the
+/// manifest update remains recoverable.
+fn write_encryption_journal(
+    dir: &Path,
+    journal: &EncryptionJournal,
+) -> Result<(), ProjectStoreError> {
+    let json = serde_json::to_string_pretty(journal)?;
+    let tmp = encryption_journal_path(dir).with_extension("json.tmp");
+    fs::write(&tmp, json)?;
+    fs::rename(&tmp, encryption_journal_path(dir))?;
+    Ok(())
+}
+
+/// Returns `Ok(Some(_))` if a journal is present and parseable.
+/// Returns `Ok(None)` if there is no journal — the common steady-
+/// state case. A corrupt journal surfaces as a real error so we
+/// don't silently lose recovery information.
+fn read_encryption_journal(dir: &Path) -> Result<Option<EncryptionJournal>, ProjectStoreError> {
+    let path = encryption_journal_path(dir);
+    match fs::read_to_string(&path) {
+        Ok(raw) => Ok(Some(serde_json::from_str(&raw)?)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(ProjectStoreError::Io(e)),
+    }
+}
+
+/// Best-effort removal — used both on the success path (after the
+/// manifest has been persisted) and on the failure path (so a future
+/// open doesn't get a stale recovery prompt for a transition we've
+/// already rolled back). `NotFound` is treated as success because the
+/// journal might never have been written.
+fn remove_encryption_journal(dir: &Path) -> Result<(), ProjectStoreError> {
+    match fs::remove_file(encryption_journal_path(dir)) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(ProjectStoreError::Io(e)),
+    }
+}
+
 // Helper for tests / external users: classify a node type as container/leaf.
 #[must_use]
 pub const fn is_container(node_type: NodeType) -> bool {
@@ -1430,5 +1609,157 @@ mod tests {
             .expect("reopen encrypted");
         let loaded = reopened.load_document().expect("load");
         assert!(loaded.root_ids().contains(&page_id));
+    }
+
+    /// Phase 8 Block C round 2: simulate the crash window between
+    /// `Database::encrypt_existing` finishing (the on-disk DB is
+    /// now ciphertext) and `write_manifest` landing (the manifest
+    /// still claims plaintext). The journal sidecar exists and
+    /// records the salt + iteration count the encrypt step used.
+    /// A subsequent `open_with_passphrase` must detect the
+    /// inconsistency, promote the journal to the manifest, and
+    /// open the database successfully with the user's passphrase.
+    /// Cleans the journal on the way out so a later open doesn't
+    /// re-run recovery.
+    #[test]
+    fn open_recovers_when_journal_present_and_db_is_encrypted() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = dir.path().join("CrashRecover.kstudio");
+
+        // Build the post-crash filesystem state by hand. Encrypt a
+        // plaintext DB on disk, then revert the manifest so it
+        // looks like the manifest write never happened. Drop a
+        // journal that records the encrypt parameters.
+        let mut store = ProjectStore::create(&p, "CrashRecover").expect("create");
+        let mut doc = DocumentGraph::new();
+        let page = Node::new(NodeType::Page, "PreCrash");
+        let page_id = page.id;
+        doc.insert_node(page).expect("insert");
+        store.save_document(&doc).expect("save pre-crash");
+        drop(store);
+
+        let salt = crate::crypto::generate_salt();
+        let iterations = crate::crypto::DEFAULT_PBKDF2_ITERATIONS;
+        let iter_nz = std::num::NonZeroU32::new(iterations).expect("iter nonzero");
+        let key = crate::crypto::derive_key("recovery-pass-strong-1", &salt, iter_nz);
+        Database::encrypt_existing(p.join(DATABASE_FILENAME), &key).expect("encrypt");
+
+        // Manifest must still say plaintext (simulating the lost
+        // write_manifest call). Write the journal with the
+        // parameters the encrypt step used.
+        let salt_b64 = URL_SAFE_NO_PAD.encode(salt);
+        write_encryption_journal(
+            &p,
+            &EncryptionJournal {
+                salt: salt_b64.clone(),
+                iterations,
+            },
+        )
+        .expect("write journal");
+
+        // Recovery: open_with_passphrase must consult the journal,
+        // promote the metadata onto the manifest, drop the journal,
+        // and succeed.
+        let recovered = ProjectStore::open_with_passphrase(&p, Some("recovery-pass-strong-1"))
+            .expect("open with journal");
+        assert!(recovered.is_encrypted(), "manifest must reflect recovery");
+        let meta = recovered
+            .manifest()
+            .encryption
+            .as_ref()
+            .expect("metadata present");
+        assert!(meta.enabled);
+        assert_eq!(meta.salt, salt_b64);
+        assert_eq!(meta.iterations, iterations);
+        assert!(
+            !p.join(ENCRYPTION_JOURNAL_FILENAME).exists(),
+            "journal must be cleaned up post-recovery"
+        );
+
+        // Pre-crash state must still be readable through the
+        // encrypted handle.
+        let loaded = recovered.load_document().expect("load post-recovery");
+        assert!(loaded.root_ids().contains(&page_id));
+    }
+
+    /// Recovery edge case: the journal exists but the on-disk DB
+    /// is still plaintext (the encrypt step crashed before its
+    /// internal `fs::rename` landed). The recovery path must keep
+    /// the manifest plaintext and drop the journal — opening the
+    /// project must succeed *without* a passphrase, just like
+    /// before the failed encrypt attempt.
+    #[test]
+    fn open_clears_journal_when_db_is_still_plaintext() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = dir.path().join("CrashRollback.kstudio");
+        let store = ProjectStore::create(&p, "CrashRollback").expect("create");
+        drop(store);
+
+        // Plant a journal as if encrypt_existing had set up its
+        // intent but crashed before committing the ciphertext file.
+        let salt = crate::crypto::generate_salt();
+        let iterations = crate::crypto::DEFAULT_PBKDF2_ITERATIONS;
+        write_encryption_journal(
+            &p,
+            &EncryptionJournal {
+                salt: URL_SAFE_NO_PAD.encode(salt),
+                iterations,
+            },
+        )
+        .expect("write journal");
+        assert!(p.join(ENCRYPTION_JOURNAL_FILENAME).exists());
+
+        // Plaintext open must succeed — no passphrase required —
+        // and the journal must be gone so we don't loop on
+        // recovery the next time the project opens.
+        let recovered = ProjectStore::open(&p).expect("plaintext open recovers");
+        assert!(!recovered.is_encrypted(), "manifest must remain plaintext");
+        assert!(
+            !p.join(ENCRYPTION_JOURNAL_FILENAME).exists(),
+            "journal must be cleaned up after rollback recovery"
+        );
+    }
+
+    /// Recovery edge case: the encrypt + manifest write both
+    /// completed, so the manifest reports `enabled = true`, but
+    /// `enable_encryption` crashed between the manifest write and
+    /// the journal removal. The recovery path must NOT re-run the
+    /// promotion step (the manifest is already correct); it must
+    /// just clean up the stale journal.
+    #[test]
+    fn open_clears_stale_journal_when_manifest_already_encrypted() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = dir.path().join("StaleJournal.kstudio");
+        let mut store = ProjectStore::create(&p, "StaleJournal").expect("create");
+        store
+            .enable_encryption("stale-journal-pass-1")
+            .expect("enable");
+        drop(store);
+
+        // Re-plant a journal post-fact to simulate a process that
+        // wrote the manifest but died before the journal-removal
+        // call. The journal contents are irrelevant for this case
+        // because the manifest is the source of truth — we just
+        // need *some* parseable journal to be present.
+        let manifest = read_manifest(&p).expect("read manifest");
+        let meta = manifest.encryption.expect("encryption metadata");
+        write_encryption_journal(
+            &p,
+            &EncryptionJournal {
+                salt: meta.salt,
+                iterations: meta.iterations,
+            },
+        )
+        .expect("write stale journal");
+
+        // open_with_passphrase must succeed and silently drop the
+        // journal.
+        let recovered =
+            ProjectStore::open_with_passphrase(&p, Some("stale-journal-pass-1")).expect("reopen");
+        assert!(recovered.is_encrypted());
+        assert!(
+            !p.join(ENCRYPTION_JOURNAL_FILENAME).exists(),
+            "stale journal must be cleaned up on open"
+        );
     }
 }

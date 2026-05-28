@@ -182,6 +182,22 @@ export function EncryptionPanel({
     reload,
   ]);
 
+  // Open the OS-native save dialog (filters scoped to `.sqlite` /
+  // `.db`, overwrite confirmation enabled) and remember the chosen
+  // path. We deliberately do NOT trigger the export here so the
+  // user can review the path + re-enter their passphrase before
+  // committing — matches the two-step flow of the change-passphrase
+  // card above. Cancelling the dialog is a silent no-op.
+  const handleChooseRecoveryPath = useCallback(async () => {
+    setErrorMsg(null);
+    try {
+      const picked = await window.kcreate.projectEncryption.pickRecoveryPath();
+      if (picked != null) setRecoveryPath(picked);
+    } catch (e) {
+      setErrorMsg(`Choosing the output path failed: ${errMsg(e)}`);
+    }
+  }, []);
+
   const handleExportRecovery = useCallback(async () => {
     if (recoveryPassphrase.length === 0) {
       setErrorMsg("Passphrase must not be empty.");
@@ -400,23 +416,41 @@ export function EncryptionPanel({
               />
             </label>
             <label style={fieldLabelStyle}>
-              Output path (absolute)
-              <input
-                type="text"
-                value={recoveryPath}
-                onChange={(e) => setRecoveryPath(e.target.value)}
-                placeholder="/Users/me/Desktop/recovery.sqlite"
-                disabled={busy != null}
-                style={inputStyle}
-              />
+              Output path
+              <div style={{ display: "flex", gap: 6, alignItems: "stretch" }}>
+                <input
+                  type="text"
+                  value={recoveryPath}
+                  readOnly
+                  placeholder="Click “Choose…” to pick a destination"
+                  disabled={busy != null}
+                  aria-label="Recovery export path"
+                  style={{
+                    ...inputStyle,
+                    flex: 1,
+                    background: colors.bgSoft,
+                    cursor: "default",
+                  }}
+                />
+                <button
+                  type="button"
+                  onClick={() => {
+                    void handleChooseRecoveryPath();
+                  }}
+                  disabled={busy != null}
+                  style={secondaryButtonStyle(false)}
+                >
+                  Choose…
+                </button>
+              </div>
             </label>
             <button
               type="button"
               onClick={() => {
                 void handleExportRecovery();
               }}
-              disabled={busy != null}
-              style={secondaryButtonStyle(busy === "recovery")}
+              disabled={busy != null || recoveryPath.trim().length === 0}
+              style={primaryButtonStyle(busy === "recovery")}
             >
               {busy === "recovery" ? "Exporting…" : "Export recovery copy"}
             </button>

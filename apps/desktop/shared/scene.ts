@@ -4572,6 +4572,16 @@ export interface ProjectEncryptionBridge {
     passphrase: string,
     outputPath: string,
   ): Promise<string>;
+  /**
+   * Open the OS-native save-file dialog scoped to the plaintext
+   * recovery export (filters to `.sqlite` / `.db`,
+   * `showOverwriteConfirmation` enabled). Returns the absolute
+   * chosen path, or `null` if the user cancelled. Implemented in
+   * the main process so the renderer never sees the user's
+   * filesystem (mirrors the existing `kcreate/pdf/pickFile` /
+   * `kcreate/sketch/pickFile` pattern).
+   */
+  pickRecoveryPath(): Promise<string | null>;
 }
 
 // ---------------------------------------------------------------------

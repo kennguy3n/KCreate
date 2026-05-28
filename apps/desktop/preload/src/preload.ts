@@ -3016,6 +3016,11 @@ const projectEncryption: ProjectEncryptionBridge = {
       outputPath,
     )) as string;
   },
+  async pickRecoveryPath(): Promise<string | null> {
+    return (await ipcRenderer.invoke(
+      "kcreate/project/encryption/pick-recovery-path",
+    )) as string | null;
+  },
 };
 
 // ---------------------------------------------------------------------------

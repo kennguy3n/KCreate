@@ -174,10 +174,16 @@ mod tests {
         assert!(status.salt.is_empty());
     }
 
+    /// `passphrase_strength` is a pure function — it delegates to
+    /// `kcreate_storage::crypto::passphrase_strength` and never
+    /// touches the bridge workspace. So this test deliberately does
+    /// NOT call `document::reset_for_tests()` (which would suggest a
+    /// workspace dependency that isn't there) and is NOT marked
+    /// `#[serial]` (no shared mutable state). If a future refactor
+    /// makes scoring workspace-dependent, both attributes must come
+    /// back together — they're a matched pair, not optional.
     #[test]
-    #[serial]
     fn strength_meter_returns_score() {
-        document::reset_for_tests();
         let weak = passphrase_strength("abc");
         let strong = passphrase_strength("Abc123!@#defghijkl");
         assert_eq!(weak.score, 0);

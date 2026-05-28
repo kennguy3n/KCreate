@@ -854,6 +854,26 @@ export interface Bridge {
   kchatBackendAcceptInvite?(inviteJson: string): string;
   // Phase 7 (Task 8): roster-sync tick.
   kchatBackendSyncCommunityRoster?(communityId: string): string;
+  // Phase 8 (Block A, Task 2): publish an exported artifact
+  // (PNG / SVG / PDF / WebP / JPEG) to a KChat conversation.
+  // `requestJson` is a JSON-encoded
+  // `KChatArtifactPublishRequest`; the return is JSON-encoded
+  // `KChatArtifactPublishResult`.
+  kchatBackendPublishArtifact?(
+    conversationId: string,
+    requestJson: string,
+  ): string;
+  // Phase 8 (Block A, Task 2): publish a `.kbrand` brand-kit
+  // archive. `requestJson` is a JSON-encoded
+  // `KChatBrandKitArtifactRequest`.
+  kchatBackendPublishBrandKit?(
+    conversationId: string,
+    requestJson: string,
+  ): string;
+  // Phase 8 (Block A, Task 2): list previously-published
+  // artifacts for the given conversation. Returns
+  // JSON-encoded `KChatPublishedArtifact[]`.
+  kchatBackendListArtifacts?(conversationId: string): string;
   // Phase 7 (Task 8): kick a connected peer.
   sessionKickPeer(peerId: string, reason: string): void;
   // Phase 7 (Task 15): ask a connected host to backfill journal

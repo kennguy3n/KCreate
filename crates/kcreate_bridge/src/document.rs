@@ -24,7 +24,7 @@ use kcreate_core::operation::Operation;
 use kcreate_core::project::{
     BrandKit, DesignTokens, ExportFormat, ExportPreset, Project, ProjectError, Slice,
 };
-use kcreate_export::png::{export_png, PngExportError, PngExportOptions};
+use kcreate_export::png::{export_png_to_bytes, PngExportError, PngExportOptions};
 use kcreate_export::svg::{export_svg_from_document, SvgDocumentExportError, SvgExportOptions};
 use kcreate_layout::{layout_flex, layout_grid, FlexLayout, GridLayout};
 use kcreate_storage::project_io::{ProjectStore, ProjectStoreError};
@@ -4672,18 +4672,30 @@ const fn default_scale() -> f32 {
 /// parameter so callers don't get the impression filtering happens
 /// here when it doesn't.
 pub fn export_png_file(output_path: &Path, options: &PngExportRequest) -> Result<u64> {
+    let bytes = export_png_bytes(options)?;
+    let written = bytes.len() as u64;
+    std::fs::write(output_path, bytes)?;
+    Ok(written)
+}
+
+/// In-memory companion to [`export_png_file`]. Renders the current
+/// scene to PNG bytes without touching the filesystem. Used by the
+/// KChat artifact publisher.
+pub fn export_png_bytes(options: &PngExportRequest) -> Result<Vec<u8>> {
     let scene = crate::state::current_scene()?;
-    let opts = PngExportOptions {
+    let opts = png_options_for(options);
+    Ok(export_png_to_bytes(&scene, &opts)?)
+}
+
+fn png_options_for(options: &PngExportRequest) -> PngExportOptions {
+    PngExportOptions {
         width: options.width,
         height: options.height,
         scale: options.scale,
         background: options
             .background
             .map(|[r, g, b, a]| kcreate_renderer::geometry::Color::rgba(r, g, b, a)),
-    };
-    export_png(&scene, &opts, output_path)?;
-    let meta = std::fs::metadata(output_path)?;
-    Ok(meta.len())
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -4717,6 +4729,16 @@ pub struct PdfExportRequest {
 
 /// Render the open document to PDF. Returns the number of bytes written.
 pub fn export_pdf_file(output_path: &Path, options: &PdfExportRequest) -> Result<u64> {
+    let bytes = export_pdf_bytes(options)?;
+    let written = bytes.len() as u64;
+    std::fs::write(output_path, bytes)?;
+    Ok(written)
+}
+
+/// In-memory companion to [`export_pdf_file`]. Renders the open
+/// document to a PDF `Vec<u8>` without touching the filesystem. Used
+/// by the KChat artifact publisher.
+pub fn export_pdf_bytes(options: &PdfExportRequest) -> Result<Vec<u8>> {
     let guard = slot().lock();
     let ws = guard.as_ref().ok_or(DocumentBridgeError::NoProject)?;
     let mut rasters = kcreate_export::pdf::RasterPixelCache::new();
@@ -4795,15 +4817,14 @@ pub fn export_pdf_file(output_path: &Path, options: &PdfExportRequest) -> Result
         color_mode: resolved_color_mode,
         cmyk_dither: resolved_dither,
     };
-    let bytes = kcreate_export::pdf::export_pdf_from_document(
+    let bytes = kcreate_export::pdf::export_pdf_from_document_to_bytes(
         &ws.project.document,
         &opts,
         &rasters,
-        output_path,
     )
     .map_err(|e| DocumentBridgeError::Io(std::io::Error::other(e.to_string())))?;
     drop(guard);
-    Ok(bytes as u64)
+    Ok(bytes)
 }
 
 // -----------------------------------------------------------------------------
@@ -4837,6 +4858,15 @@ const fn default_lossless() -> bool {
 /// Render the current renderer scene to WebP at `output_path`. Returns
 /// the number of bytes written.
 pub fn export_webp_file(output_path: &Path, options: &WebpExportRequest) -> Result<u64> {
+    let bytes = export_webp_bytes(options)?;
+    let written = bytes.len() as u64;
+    std::fs::write(output_path, bytes)?;
+    Ok(written)
+}
+
+/// In-memory companion to [`export_webp_file`]. Used by the KChat
+/// artifact publisher.
+pub fn export_webp_bytes(options: &WebpExportRequest) -> Result<Vec<u8>> {
     let scene = crate::state::current_scene()?;
     let opts = kcreate_export::WebpExportOptions {
         width: options.width,
@@ -4848,10 +4878,8 @@ pub fn export_webp_file(output_path: &Path, options: &WebpExportRequest) -> Resu
             .background
             .map(|[r, g, b, a]| kcreate_renderer::geometry::Color::rgba(r, g, b, a)),
     };
-    kcreate_export::export_webp(&scene, &opts, output_path)
-        .map_err(|e| DocumentBridgeError::Io(std::io::Error::other(e.to_string())))?;
-    let meta = std::fs::metadata(output_path)?;
-    Ok(meta.len())
+    kcreate_export::export_webp_to_bytes(&scene, &opts)
+        .map_err(|e| DocumentBridgeError::Io(std::io::Error::other(e.to_string())))
 }
 
 // -----------------------------------------------------------------------------
@@ -4876,6 +4904,15 @@ pub struct JpegExportRequest {
 /// Render the current renderer scene to JPEG at `output_path`. Returns
 /// the number of bytes written.
 pub fn export_jpeg_file(output_path: &Path, options: &JpegExportRequest) -> Result<u64> {
+    let bytes = export_jpeg_bytes(options)?;
+    let written = bytes.len() as u64;
+    std::fs::write(output_path, bytes)?;
+    Ok(written)
+}
+
+/// In-memory companion to [`export_jpeg_file`]. Used by the KChat
+/// artifact publisher.
+pub fn export_jpeg_bytes(options: &JpegExportRequest) -> Result<Vec<u8>> {
     let scene = crate::state::current_scene()?;
     let opts = kcreate_export::JpegExportOptions {
         width: options.width,
@@ -4886,10 +4923,8 @@ pub fn export_jpeg_file(output_path: &Path, options: &JpegExportRequest) -> Resu
             .background
             .map(|[r, g, b, a]| kcreate_renderer::geometry::Color::rgba(r, g, b, a)),
     };
-    kcreate_export::export_jpeg(&scene, &opts, output_path)
-        .map_err(|e| DocumentBridgeError::Io(std::io::Error::other(e.to_string())))?;
-    let meta = std::fs::metadata(output_path)?;
-    Ok(meta.len())
+    kcreate_export::export_jpeg_to_bytes(&scene, &opts)
+        .map_err(|e| DocumentBridgeError::Io(std::io::Error::other(e.to_string())))
 }
 
 // -----------------------------------------------------------------------------
@@ -5635,50 +5670,79 @@ fn logo_mime_for(path: &str) -> &'static str {
 /// without an `embedded_asset_id` are recorded by family name in
 /// the manifest but contribute no archive entry.
 pub fn brand_kit_export(kit_id: Uuid, output_path: &Path) -> Result<()> {
-    let (kit, font_assets, logo_assets) = {
-        let guard = slot().lock();
-        let ws = guard.as_ref().ok_or(DocumentBridgeError::NoProject)?;
-        let kit = ws
-            .project
-            .brand_kits
-            .iter()
-            .find(|k| k.id == kit_id)
-            .cloned()
-            .ok_or(DocumentBridgeError::NodeNotFound(kit_id))?;
-
-        // Build the font-asset map keyed exactly the way kbrand's
-        // `export_brand_kit` looks them up — i.e. through
-        // `kcreate_export::kbrand::font_archive_basename`. Otherwise
-        // any family containing non-alphanumeric characters
-        // (e.g. "Source-Sans-Pro") would fail the lookup and silently
-        // drop the font bytes from the archive.
-        let mut fonts: std::collections::HashMap<String, Vec<u8>> =
-            std::collections::HashMap::new();
-        for font in &kit.fonts {
-            if let Some(asset_id) = font.embedded_asset_id {
-                if let Some(bytes) = ws.store.load_asset(asset_id)? {
-                    let key = kcreate_export::kbrand::font_archive_basename(
-                        &font.family,
-                        font.weight,
-                        font.italic,
-                    );
-                    fonts.insert(key, bytes);
-                }
-            }
-        }
-        let mut logos: std::collections::HashMap<String, Vec<u8>> =
-            std::collections::HashMap::new();
-        if let Some(logo_id) = kit.logo_asset_id {
-            if let Some(bytes) = ws.store.load_asset(logo_id)? {
-                logos.insert("primary".into(), bytes);
-            }
-        }
-        (kit, fonts, logos)
-    };
-
+    let (kit, font_assets, logo_assets) = collect_brand_kit_assets(kit_id)?;
     kcreate_export::kbrand::export_brand_kit(&kit, &font_assets, &logo_assets, output_path)
         .map_err(|e| DocumentBridgeError::Io(std::io::Error::other(e.to_string())))?;
     Ok(())
+}
+
+/// In-memory companion to [`brand_kit_export`]: serialise the
+/// `.kbrand` archive into a `Vec<u8>` without touching disk. Used
+/// by the KChat artifact-publishing pipeline so the bytes can be
+/// streamed straight into a multipart upload.
+///
+/// Returns the kit name + the encoded archive bytes. The name is
+/// surfaced so the publisher can stamp it into the metadata
+/// (`projectName`) without re-loading the kit.
+pub fn brand_kit_export_to_bytes(kit_id: Uuid) -> Result<(String, Vec<u8>)> {
+    let (kit, font_assets, logo_assets) = collect_brand_kit_assets(kit_id)?;
+    let bytes = kcreate_export::kbrand::export_brand_kit_to_bytes(&kit, &font_assets, &logo_assets)
+        .map_err(|e| DocumentBridgeError::Io(std::io::Error::other(e.to_string())))?;
+    Ok((kit.name, bytes))
+}
+
+/// Shared helper that snapshots a brand kit + every embedded font /
+/// logo asset blob it references. Pulled out so both
+/// [`brand_kit_export`] (file destination) and
+/// [`brand_kit_export_to_bytes`] (in-memory) can drive the same
+/// load logic without diverging on what counts as "embedded".
+/// Bundle of brand-kit + the (basename → raw bytes) maps for its
+/// embedded fonts + logos, returned by [`collect_brand_kit_assets`].
+/// Pulled out as a type alias so `clippy::type_complexity` is happy
+/// and so the file-vs-bytes export functions share one signature.
+type BrandKitAssetBundle = (
+    BrandKit,
+    std::collections::HashMap<String, Vec<u8>>,
+    std::collections::HashMap<String, Vec<u8>>,
+);
+
+fn collect_brand_kit_assets(kit_id: Uuid) -> Result<BrandKitAssetBundle> {
+    let guard = slot().lock();
+    let ws = guard.as_ref().ok_or(DocumentBridgeError::NoProject)?;
+    let kit = ws
+        .project
+        .brand_kits
+        .iter()
+        .find(|k| k.id == kit_id)
+        .cloned()
+        .ok_or(DocumentBridgeError::NodeNotFound(kit_id))?;
+
+    // Build the font-asset map keyed exactly the way kbrand's
+    // `export_brand_kit` looks them up — i.e. through
+    // `kcreate_export::kbrand::font_archive_basename`. Otherwise
+    // any family containing non-alphanumeric characters
+    // (e.g. "Source-Sans-Pro") would fail the lookup and silently
+    // drop the font bytes from the archive.
+    let mut fonts: std::collections::HashMap<String, Vec<u8>> = std::collections::HashMap::new();
+    for font in &kit.fonts {
+        if let Some(asset_id) = font.embedded_asset_id {
+            if let Some(bytes) = ws.store.load_asset(asset_id)? {
+                let key = kcreate_export::kbrand::font_archive_basename(
+                    &font.family,
+                    font.weight,
+                    font.italic,
+                );
+                fonts.insert(key, bytes);
+            }
+        }
+    }
+    let mut logos: std::collections::HashMap<String, Vec<u8>> = std::collections::HashMap::new();
+    if let Some(logo_id) = kit.logo_asset_id {
+        if let Some(bytes) = ws.store.load_asset(logo_id)? {
+            logos.insert("primary".into(), bytes);
+        }
+    }
+    Ok((kit, fonts, logos))
 }
 
 /// Import a `.kbrand` archive: persist every embedded font / logo

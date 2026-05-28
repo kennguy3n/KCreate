@@ -736,6 +736,48 @@ surfaces and adds the encryption-at-rest, design-review, and
 artifact-publishing capabilities the proposal calls for.
 
 ### Block A — KChat Artifact Publishing & Design Review (Tasks 1–6)
+- [x] **Task 1: Artifact publish pipeline (Rust).**
+      `crates/kcreate_kchat_client/src/artifact.rs` implements
+      `publish_artifact(ArtifactPublishParams)` and
+      `list_artifacts(conversation_id)`. Multipart upload
+      (artifact bytes + thumbnail + JSON metadata) to
+      `POST /api/v1/conversations/{id}/artifacts`. Typed DTOs
+      (`ArtifactKind`, `ArtifactMetadata`, `ArtifactPublishResult`,
+      `ArtifactPublishThumbnail`, `PublishedArtifact`) in
+      `protocol.rs`. Client-side 50 MiB cap via
+      `MAX_ARTIFACT_BYTES` (fails fast before the bytes
+      traverse the wire). `ArtifactKind` serialises in
+      `camelCase` so the multi-word `BrandKit` variant lands
+      on the wire as `"brandKit"` in lockstep with the
+      TypeScript mirror. 11 unit tests + 7 integration tests
+      in `artifact_round_trip.rs` covering happy path, 401
+      token-refresh, 415 unsupported-kind, 413 too-large, 429
+      retry, no-thumbnail fallback, and client-side cap.
+- [x] **Task 2: Artifact publish bridge surface.**
+      `crates/kcreate_bridge/src/kchat_artifact.rs` provides
+      `kchat_backend_publish_artifact(conversation_id, request)`,
+      `kchat_backend_publish_brand_kit(conversation_id, request)`,
+      and `kchat_backend_list_artifacts(conversation_id)`.
+      Fail-fast ordering: validate → `project_identity()` →
+      `require_client()` → render → publish. Wire-format
+      `KChatArtifactRequest` uses `#[serde(tag = "format")]`
+      discriminated union (PNG/SVG/PDF/WebP/JPEG/brandKit).
+      In-memory export via `export_png_bytes`, `export_svg`,
+      `export_pdf_bytes`, `export_webp_bytes`, `export_jpeg_bytes`,
+      `brand_kit_export_to_bytes`. Thumbnail reuses
+      `thumbnails::ensure_cover_thumbnail(512)`.
+      N-API entry points in `lib.rs`; IPC handlers in `main.ts`;
+      preload in `preload.ts`; bridge methods in `bridge.ts`;
+      TypeScript mirrors (`KChatArtifactKind`,
+      `KChatArtifactMetadata`, `KChatPublishedArtifact`,
+      `KChatArtifactPublishResult`, `KChatArtifactPublishRequest`,
+      `KChatBrandKitArtifactRequest`, `KChatSvgArtifactRequest`,
+      `KChatArtifactRequestKind`) in `scene.ts`.
+      `kchat_backend_connect_for_tests` helper for integration
+      tests. 4 serde wire-shape unit tests + 4 bridge integration
+      tests in `crates/kcreate_tests/tests/kchat_artifact.rs`
+      (publish round-trip, no-project error, not-connected error,
+      empty-conversation-id rejection).
 - [x] **Task 4 (Rust core): Design review annotations.**
       `crates/kcreate_core/src/annotation.rs` introduces
       `Annotation { id, page_id, author_peer_id, author_name,
@@ -922,12 +964,18 @@ artifact-publishing capabilities the proposal calls for.
   `kcreate_bridge::phase8::document_propagate_token`),
   smart text auto-fit (`kcreate_text::autofit`), job-first
   export presets (`kcreate_export::job_presets`).
+  KChat artifact publishing pipeline
+  (`kcreate_kchat_client::artifact` + `kcreate_bridge::kchat_artifact`):
+  in-memory export → multipart upload → thumbnail → metadata,
+  wired end-to-end through N-API, IPC, and TypeScript mirrors;
+  discriminated union `KChatArtifactRequestKind` with serde
+  `#[serde(tag = "format")]`.
   All Phase 8 features are wired through
-  `crates/kcreate_bridge/src/phase8.rs` + 13 N-API entry
+  `crates/kcreate_bridge/src/phase8.rs` + 16 N-API entry
   points and mirrored in `apps/desktop/shared/scene.ts`
-  (`Phase8Bridge`). 9 new integration test modules in
-  `crates/kcreate_tests/tests/`. `local_first.rs` sentinel
-  stays green.
+  (`Phase8Bridge` + `KChatBackendBridge`). 10 new integration
+  test modules in `crates/kcreate_tests/tests/`.
+  `local_first.rs` sentinel stays green.
 - **2026-05-27 (PR #17)** — Phase 7: KChat Desktop
   (`uneycom/uney-chat-desktop`) integration, community-gated
   collaboration, real-time UX, security hardening, performance

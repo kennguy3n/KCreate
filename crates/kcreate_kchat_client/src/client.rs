@@ -57,6 +57,14 @@ impl KChatBackendClient {
         self.rest.tokens()
     }
 
+    /// Internal accessor used by the `artifact` module to drive a
+    /// multipart upload through the same retry/refresh transport
+    /// as every other call. Kept `pub(crate)` because the bridge
+    /// should not be calling into the REST wrapper directly.
+    pub(crate) fn rest(&self) -> &RestClient {
+        &self.rest
+    }
+
     /// Currently-cached identity, if logged in.
     pub fn cached_identity(&self) -> Option<KChatIdentity> {
         self.tokens().snapshot().map(|t| t.identity)
@@ -205,7 +213,7 @@ impl KChatBackendClient {
 /// inputs here are community / conversation ids which are
 /// constrained server-side to URL-safe ascii, so we only need to
 /// escape the byte set the backend would reject.
-fn urlencoding(s: &str) -> String {
+pub(crate) fn urlencoding(s: &str) -> String {
     const SAFE: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ\
                           abcdefghijklmnopqrstuvwxyz\
                           0123456789-_.~";

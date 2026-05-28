@@ -305,6 +305,9 @@ pnpm lint
 | KChat backend token store + 401 refresh  | `crates/kcreate_kchat_client/src/auth.rs` |
 | KChat backend attestation bridging       | `crates/kcreate_kchat_client/src/attestation.rs` |
 | KChat backend bridge surface (N-API)     | `crates/kcreate_bridge/src/kchat_backend.rs` |
+| KChat artifact publish client            | `crates/kcreate_kchat_client/src/artifact.rs` |
+| KChat artifact publish bridge surface    | `crates/kcreate_bridge/src/kchat_artifact.rs` |
+| KChat artifact integration tests         | `crates/kcreate_tests/tests/kchat_artifact.rs` |
 | KChat companion `.kcz` extension         | `apps/kchat-extension/` |
 | `kcreate://` deeplink registration       | `apps/desktop/main/src/main.ts` (`registerProtocolHandler` + `dispatchDeeplink`) |
 | Document ACL                             | `crates/kcreate_collab/src/acl.rs` |

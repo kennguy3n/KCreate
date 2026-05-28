@@ -56,14 +56,24 @@ use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
 use crate::protocol::{
-    error_code, AttestationRequest, BackendErrorBody, CommunitiesListResponse, CommunityEvent,
+    artifact_field, error_code, ArtifactMetadata, ArtifactPublishResult, ArtifactsListResponse,
+    AttestationRequest, BackendErrorBody, CommunitiesListResponse, CommunityEvent,
     CommunityEventKind, CommunityEventsResponse, ConversationsListResponse, KChatCommunity,
     KChatCommunityMember, KChatConversation, KChatConversationType, KChatIdentity, KChatRole,
     LoginRequest, LoginResponse, MembersListResponse, MembershipAttestation, PostMessageRequest,
-    PostMessageResponse, RefreshRequest, RefreshResponse,
+    PostMessageResponse, PublishedArtifact, RefreshRequest, RefreshResponse,
 };
 
 /// Knobs the fixture honours to simulate failure modes.
+///
+/// Tests sometimes want to combine multiple failure modes
+/// (e.g. 429-rate-limit while also driving 415-unsupported-kind
+/// on the artifact endpoint), so these stay as independent
+/// boolean toggles rather than a state-machine enum. Clippy's
+/// `struct_excessive_bools` lint is the price of that
+/// independence — silenced with an explanation rather than
+/// papered over.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Default)]
 pub struct FixtureBehavior {
     /// When true, `POST .../attestation` returns 501 with the
@@ -88,6 +98,15 @@ pub struct FixtureBehavior {
     /// When true, refresh always returns 401 — used to drive the
     /// `RefreshExpired` path.
     pub refresh_always_fails: bool,
+    /// When true, `POST /api/v1/conversations/{id}/artifacts`
+    /// returns `415 UNSUPPORTED_ARTIFACT_KIND`. Used by tests to
+    /// exercise [`crate::error::ClientError::ArtifactKindUnsupported`].
+    pub artifact_kind_rejected: bool,
+    /// When true, the artifact endpoint returns `413
+    /// ARTIFACT_TOO_LARGE` regardless of payload size. Used by
+    /// tests to drive [`crate::error::ClientError::ArtifactTooLarge`]
+    /// even when the client-side cap would otherwise pass.
+    pub artifact_too_large: bool,
 }
 
 impl FixtureBehavior {
@@ -102,6 +121,8 @@ impl FixtureBehavior {
             rate_limit_initial: None,
             access_token_lifetime_secs: 3600,
             refresh_always_fails: false,
+            artifact_kind_rejected: false,
+            artifact_too_large: false,
         }
     }
 }
@@ -138,6 +159,13 @@ struct FixtureState {
     /// the refresh-then-retry tests can prove the second call
     /// used the new token.
     next_token_seq: Mutex<u64>,
+    /// In-memory artifact store keyed by conversation id. Mirrors
+    /// what the real backend would persist; the fixture echoes
+    /// these back from `GET /api/v1/conversations/{id}/artifacts`.
+    artifacts: Mutex<std::collections::HashMap<String, Vec<PublishedArtifact>>>,
+    /// Monotonic counter for the synthetic `artifact_id` values
+    /// the fixture mints.
+    next_artifact_seq: Mutex<u64>,
 }
 
 /// Running fixture server. Drop the handle to shut it down — the
@@ -230,6 +258,8 @@ impl FixtureServer {
             issued_access_at: Mutex::new(None),
             issued_refresh: Mutex::new(None),
             next_token_seq: Mutex::new(0),
+            artifacts: Mutex::new(std::collections::HashMap::new()),
+            next_artifact_seq: Mutex::new(0),
         });
 
         let router = build_router(state.clone());
@@ -304,6 +334,10 @@ fn build_router(state: Arc<FixtureState>) -> Router {
         .route(
             "/api/v1/conversations/:id/messages",
             post(handle_post_message),
+        )
+        .route(
+            "/api/v1/conversations/:id/artifacts",
+            post(handle_publish_artifact).get(handle_list_artifacts),
         )
         .route("/api/v1/communities/:id/events", get(handle_poll_events))
         .with_state(state)
@@ -625,6 +659,188 @@ async fn handle_post_message(
 struct EventsQuery {
     #[serde(default)]
     since: Option<String>,
+}
+
+async fn handle_publish_artifact(
+    State(state): State<Arc<FixtureState>>,
+    headers: HeaderMap,
+    Path(conversation_id): Path<String>,
+    mut multipart: axum::extract::Multipart,
+) -> axum::response::Response {
+    if let Err(e) = check_auth(&state, &headers) {
+        return *e;
+    }
+    let behavior = state.behavior.lock().clone();
+    if behavior.artifact_kind_rejected {
+        return json_error(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            error_code::UNSUPPORTED_ARTIFACT_KIND,
+            "fixture: kind rejected",
+        );
+    }
+    if behavior.artifact_too_large {
+        return json_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            error_code::ARTIFACT_TOO_LARGE,
+            "fixture: payload too large",
+        );
+    }
+
+    // Walk the multipart form and collect the three named parts.
+    // The fixture is permissive — missing thumbnail is OK, missing
+    // artifact / metadata is a 400.
+    let mut artifact_bytes: Option<Vec<u8>> = None;
+    let mut artifact_mime: Option<String> = None;
+    let mut artifact_filename: Option<String> = None;
+    let mut thumbnail_bytes: Option<Vec<u8>> = None;
+    let mut metadata_bytes: Option<Vec<u8>> = None;
+    let mut declared_kind: Option<String> = None;
+
+    loop {
+        let next = match multipart.next_field().await {
+            Ok(Some(f)) => f,
+            Ok(None) => break,
+            Err(e) => {
+                return json_error(
+                    StatusCode::BAD_REQUEST,
+                    error_code::INVALID_REQUEST,
+                    &format!("multipart parse error: {e}"),
+                );
+            }
+        };
+        let name = next.name().map(str::to_owned);
+        let mime = next.content_type().map(str::to_owned);
+        let filename = next.file_name().map(str::to_owned);
+        let bytes = match next.bytes().await {
+            Ok(b) => b.to_vec(),
+            Err(e) => {
+                return json_error(
+                    StatusCode::BAD_REQUEST,
+                    error_code::INVALID_REQUEST,
+                    &format!("multipart body read error: {e}"),
+                );
+            }
+        };
+        match name.as_deref() {
+            Some(n) if n == artifact_field::ARTIFACT => {
+                artifact_bytes = Some(bytes);
+                artifact_mime = mime;
+                artifact_filename = filename;
+            }
+            Some(n) if n == artifact_field::THUMBNAIL => {
+                thumbnail_bytes = Some(bytes);
+            }
+            Some(n) if n == artifact_field::METADATA => {
+                metadata_bytes = Some(bytes);
+            }
+            Some("kind") => {
+                declared_kind = String::from_utf8(bytes).ok();
+            }
+            _ => {
+                // Unknown parts are ignored — a forward-compatible
+                // contract.
+            }
+        }
+    }
+
+    let Some(artifact_bytes) = artifact_bytes else {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            error_code::INVALID_REQUEST,
+            "missing 'artifact' part",
+        );
+    };
+    let Some(metadata_bytes) = metadata_bytes else {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            error_code::INVALID_REQUEST,
+            "missing 'metadata' part",
+        );
+    };
+    let metadata: ArtifactMetadata = match serde_json::from_slice(&metadata_bytes) {
+        Ok(m) => m,
+        Err(e) => {
+            return json_error(
+                StatusCode::BAD_REQUEST,
+                error_code::INVALID_REQUEST,
+                &format!("metadata is not valid JSON: {e}"),
+            );
+        }
+    };
+
+    // Mint a synthetic artifact id and preview URLs.
+    let mut seq = state.next_artifact_seq.lock();
+    *seq += 1;
+    let artifact_id = format!("art-{}", *seq);
+    drop(seq);
+
+    let preview_url = format!("https://artifacts.kchat.example/{artifact_id}");
+    let thumbnail_url = if thumbnail_bytes.is_some() {
+        format!("https://artifacts.kchat.example/{artifact_id}/thumb.png")
+    } else {
+        preview_url.clone()
+    };
+
+    let kind = metadata.kind;
+    let now = Utc::now();
+    let result = ArtifactPublishResult {
+        artifact_id: artifact_id.clone(),
+        conversation_id: conversation_id.clone(),
+        preview_url: preview_url.clone(),
+        thumbnail_url: thumbnail_url.clone(),
+        kind,
+        published_at: now,
+    };
+
+    // Stash the artifact in the fixture's in-memory log so the
+    // GET path can list it.
+    let entry = PublishedArtifact {
+        artifact_id,
+        conversation_id: conversation_id.clone(),
+        preview_url,
+        thumbnail_url,
+        kind,
+        metadata,
+        byte_size: artifact_bytes.len() as u64,
+        published_at: now,
+    };
+    state
+        .artifacts
+        .lock()
+        .entry(conversation_id.clone())
+        .or_default()
+        .push(entry);
+
+    // Cross-check sanity bits so tests can prove the wire shape
+    // actually matched: the `kind` text field must agree with the
+    // metadata kind, and the MIME on the `artifact` part should
+    // be a sensible match for the declared kind. We *don't* hard-
+    // fail on mismatch — the real backend may be lenient — but
+    // a tracing line gives the test author a breadcrumb.
+    if let (Some(text_kind), Some(mime)) = (declared_kind.as_deref(), artifact_mime.as_deref()) {
+        tracing::debug!(
+            target: "kcreate_kchat_client::fixture",
+            "artifact upload kind={text_kind} mime={mime} filename={:?} bytes={}",
+            artifact_filename,
+            artifact_bytes.len(),
+        );
+    }
+
+    (StatusCode::OK, Json(result)).into_response()
+}
+
+async fn handle_list_artifacts(
+    State(state): State<Arc<FixtureState>>,
+    headers: HeaderMap,
+    Path(conversation_id): Path<String>,
+) -> axum::response::Response {
+    if let Err(e) = check_auth(&state, &headers) {
+        return *e;
+    }
+    let store = state.artifacts.lock();
+    let artifacts = store.get(&conversation_id).cloned().unwrap_or_default();
+    let resp = ArtifactsListResponse { artifacts };
+    (StatusCode::OK, Json(resp)).into_response()
 }
 
 async fn handle_poll_events(

@@ -82,6 +82,12 @@ pub enum KChatBackendBridgeError {
     /// renderer must call [`kchat_backend_connect`] first.
     #[error("not signed in to kchat backend")]
     NotConnected,
+    /// No project is currently open in the bridge. Returned by the
+    /// artifact-publishing entry points which need
+    /// [`crate::document::project_info`] to stamp the source-project
+    /// id / name into the artifact metadata.
+    #[error("no project is open — call project_create or project_open first")]
+    NoOpenProject,
     /// The community returned by the backend has no member entry
     /// for the local identity — refuses to install an attestation
     /// the local peer can't satisfy.
@@ -215,6 +221,25 @@ fn require_client() -> Result<Arc<KChatBackendClient>, KChatBackendBridgeError> 
         .ok_or(KChatBackendBridgeError::NotConnected)
 }
 
+/// `pub(crate)` re-export of [`require_client`] for the sibling
+/// artifact module. Kept as a separate function (not just
+/// `pub(crate)` on the existing one) so production callers inside
+/// this module continue to use the same private helper and a
+/// future refactor of the auth-token cache can change the
+/// internal helper without rippling into `kchat_artifact.rs`.
+pub(crate) fn require_client_for_artifacts(
+) -> Result<Arc<KChatBackendClient>, KChatBackendBridgeError> {
+    require_client()
+}
+
+/// `pub(crate)` accessor for the shared Tokio runtime; used by
+/// the artifact module so the multipart upload runs on the same
+/// pool as the rest of the bridge's REST calls (otherwise two
+/// runtimes would compete for worker threads).
+pub(crate) fn runtime_for_artifacts() -> Result<&'static Runtime, KChatBackendBridgeError> {
+    runtime()
+}
+
 /// Sign in to a KChat backend. Tears down any prior client + the
 /// installed authority before installing the new client so a stale
 /// session doesn't outlive the sign-in it was minted from. Returns
@@ -243,6 +268,46 @@ pub fn kchat_backend_connect(
     // lock is released because `logout()` is purely in-memory
     // (clears tokens, no backend round-trip) so we don't need to
     // hold the slot lock through it.
+    let prev = client_slot().lock().replace(new_client);
+    *authority_slot().lock() = None;
+    let _ = rt;
+    crate::collab::kchat_clear_authority();
+    if let Some(prev) = prev {
+        prev.logout();
+    }
+    Ok(KChatBackendStatus {
+        connected: true,
+        base_url: Some(request.base_url),
+        identity: Some(identity),
+    })
+}
+
+/// Test-only `kchat_backend_connect` that accepts plain-HTTP
+/// `base_url`s pointing at the in-process axum fixture. Builds the
+/// REST client via [`KChatBackendClient::new_for_tests`] (which
+/// skips the production HTTPS check) and installs it in the
+/// process-global client slot exactly the way
+/// [`kchat_backend_connect`] does, so all of the regular
+/// bridge entry points (`kchat_backend_share_to_conversation`,
+/// `kchat_backend_publish_artifact`, etc.) see a real signed-in
+/// session.
+///
+/// The renderer's Developer Mode wires this up so contributors
+/// can point KCreate at a local fixture; integration tests in
+/// `crates/kcreate_tests/` call it directly to drive the
+/// bridge against the same `FixtureServer` the client tests use.
+#[doc(hidden)]
+pub fn kchat_backend_connect_for_tests(
+    request: KChatBackendSignInRequest,
+) -> Result<KChatBackendStatus, KChatBackendBridgeError> {
+    let rt = runtime()?;
+    let new_client = Arc::new(KChatBackendClient::new_for_tests(&request.base_url)?);
+    let login = LoginRequest {
+        login_id: request.login_id,
+        password: request.password,
+        totp: request.totp,
+    };
+    let identity = rt.block_on(new_client.login(&login))?;
     let prev = client_slot().lock().replace(new_client);
     *authority_slot().lock() = None;
     let _ = rt;

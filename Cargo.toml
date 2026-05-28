@@ -239,12 +239,12 @@ sha2 = "0.10"
 # dependency on `kcreate_kchat_client` outside the off-by-default
 # `kchat-backend` feature flag — which the deny-list test would
 # catch immediately.
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream", "gzip", "deflate"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream", "gzip", "deflate", "multipart"] }
 # Test-only in-process HTTP server that mirrors the future KChat
 # backend REST contract. Used as a dev-dependency only — never
 # enters any production binary. See
 # `crates/kcreate_kchat_client/src/fixture.rs`.
-axum = { version = "0.7", default-features = false, features = ["http1", "json", "tokio", "tracing", "query"] }
+axum = { version = "0.7", default-features = false, features = ["http1", "json", "tokio", "tracing", "query", "multipart"] }
 # URL parsing for the REST client (validates scheme + host before
 # every request, refuses `http://` outside the test fixture).
 url = "2"

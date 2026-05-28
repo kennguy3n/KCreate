@@ -24,6 +24,7 @@
 //! `crates/kcreate_tests/tests/local_first.rs` keeps the default
 //! build network-free.
 
+pub mod artifact;
 pub mod attestation;
 pub mod auth;
 pub mod client;
@@ -34,6 +35,7 @@ pub mod rest;
 #[cfg(feature = "test-fixture")]
 pub mod fixture;
 
+pub use artifact::{ArtifactPublishParams, ArtifactPublishThumbnail, MAX_ARTIFACT_BYTES};
 pub use attestation::{
     decode_verifying_key, membership_from_attestation, KChatBackendAuthority, REFRESH_BEFORE_EXPIRY,
 };
@@ -41,12 +43,14 @@ pub use auth::{TokenSet, TokenStore, PREEMPTIVE_REFRESH_WINDOW};
 pub use client::KChatBackendClient;
 pub use error::ClientError;
 pub use protocol::{
-    error_code, AttestationRequest, BackendErrorBody, CommunitiesListResponse, CommunityEvent,
-    CommunityEventKind, CommunityEventsResponse, ConversationsListResponse, InviteCardPayload,
-    KChatCommunity, KChatCommunityMember, KChatConversation, KChatConversationType, KChatIdentity,
-    KChatRole, LoginRequest, LoginResponse, MembersListResponse, MembershipAttestation,
-    PostMessageParams, PostMessageRequest, PostMessageResponse, PostMessageResult, RefreshRequest,
-    RefreshResponse, INVITE_CONTENT_TYPE, INVITE_SCHEMA_VERSION, PROTOCOL_VERSION,
-    PROTOCOL_VERSION_HEADER, USER_AGENT_HEADER_VALUE,
+    artifact_field, error_code, ArtifactKind, ArtifactMetadata, ArtifactPublishResult,
+    ArtifactsListResponse, AttestationRequest, BackendErrorBody, CommunitiesListResponse,
+    CommunityEvent, CommunityEventKind, CommunityEventsResponse, ConversationsListResponse,
+    InviteCardPayload, KChatCommunity, KChatCommunityMember, KChatConversation,
+    KChatConversationType, KChatIdentity, KChatRole, LoginRequest, LoginResponse,
+    MembersListResponse, MembershipAttestation, PostMessageParams, PostMessageRequest,
+    PostMessageResponse, PostMessageResult, PublishedArtifact, RefreshRequest, RefreshResponse,
+    INVITE_CONTENT_TYPE, INVITE_SCHEMA_VERSION, PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER,
+    USER_AGENT_HEADER_VALUE,
 };
 pub use rest::{RestClient, RestClientConfig, MAX_RATE_LIMIT_BACKOFF, MAX_RATE_LIMIT_RETRIES};

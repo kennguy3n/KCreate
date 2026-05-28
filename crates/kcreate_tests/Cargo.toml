@@ -48,6 +48,14 @@ kcreate_vector = { path = "../kcreate_vector" }
 # (`tests/local_first.rs`) does not walk `kcreate_tests` itself, so
 # this does not weaken the local-first invariant.
 kcreate_kchat_client = { path = "../kcreate_kchat_client", features = ["test-fixture"] }
+# Phase 8 Block A integration test (kchat_artifact.rs). Drives the
+# bridge entry points (`kchat_backend_publish_artifact`, etc.)
+# end-to-end against the axum fixture. The `kchat-backend` feature
+# pulls in `kcreate_kchat_client` + tokio inside the bridge; the
+# local-first deny-list test (`local_first.rs`) only walks the
+# editing-path crates under DEFAULT features, so enabling the
+# feature here does not weaken the invariant.
+kcreate_bridge = { path = "../kcreate_bridge", features = ["kchat-backend"] }
 # Phase 7 Block B: community-gated collab tests (collab_communities.rs).
 kcreate_collab_transport = { path = "../kcreate_collab_transport" }
 ed25519-dalek = { workspace = true }
@@ -58,6 +66,10 @@ tempfile = { workspace = true }
 tiny_http = "0.12"
 uuid = { workspace = true }
 base64 = { workspace = true }
+# Phase 8 Block A integration test (kchat_artifact.rs) — same
+# version pin as the bridge's own use to keep the proc-macro
+# crate de-duplicated in the dep graph.
+serial_test = "3"
 
 [lints]
 workspace = true

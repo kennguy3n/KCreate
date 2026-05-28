@@ -136,7 +136,10 @@ impl ProjectAcl {
     /// Remove the entry with the given public key, if any. Returns
     /// the removed permission level.
     pub fn remove(&mut self, public_key: &str) -> Option<AclPermission> {
-        let idx = self.entries.iter().position(|e| e.public_key == public_key)?;
+        let idx = self
+            .entries
+            .iter()
+            .position(|e| e.public_key == public_key)?;
         Some(self.entries.remove(idx).permission)
     }
 
@@ -169,7 +172,10 @@ mod tests {
     fn open_mode_allows_everyone_as_editor() {
         let acl = ProjectAcl::default();
         let ident = identity(1, "alice");
-        assert_eq!(acl.evaluate(&ident), AclDecision::Allow(AclPermission::Editor));
+        assert_eq!(
+            acl.evaluate(&ident),
+            AclDecision::Allow(AclPermission::Editor)
+        );
     }
 
     #[test]
@@ -200,8 +206,14 @@ mod tests {
                 },
             ],
         };
-        assert_eq!(acl.evaluate(&alice), AclDecision::Allow(AclPermission::Editor));
-        assert_eq!(acl.evaluate(&bob), AclDecision::Allow(AclPermission::Viewer));
+        assert_eq!(
+            acl.evaluate(&alice),
+            AclDecision::Allow(AclPermission::Editor)
+        );
+        assert_eq!(
+            acl.evaluate(&bob),
+            AclDecision::Allow(AclPermission::Viewer)
+        );
     }
 
     #[test]

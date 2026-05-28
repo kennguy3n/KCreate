@@ -314,10 +314,8 @@ mod tests {
 
         // No real client is needed for the install path: we never
         // call the network in `install`.
-        let dummy = Arc::new(
-            KChatBackendClient::new_for_tests("http://127.0.0.1:1")
-                .expect("test client"),
-        );
+        let dummy =
+            Arc::new(KChatBackendClient::new_for_tests("http://127.0.0.1:1").expect("test client"));
         let local_pub = URL_SAFE_NO_PAD.encode(local.verifying_key().to_bytes());
         let authority = KChatBackendAuthority::install(
             dummy,
@@ -341,22 +339,13 @@ mod tests {
         let now = Utc::now();
         // Sign with the imposter, claim it's from the real issuer.
         let mut att = mint_attestation(&imposter, "comm-1", &local, now, 3600);
-        att.issuer_public_key =
-            URL_SAFE_NO_PAD.encode(issuer.verifying_key().to_bytes());
+        att.issuer_public_key = URL_SAFE_NO_PAD.encode(issuer.verifying_key().to_bytes());
 
-        let dummy = Arc::new(
-            KChatBackendClient::new_for_tests("http://127.0.0.1:1")
-                .expect("test client"),
-        );
+        let dummy =
+            Arc::new(KChatBackendClient::new_for_tests("http://127.0.0.1:1").expect("test client"));
         let local_pub = URL_SAFE_NO_PAD.encode(local.verifying_key().to_bytes());
-        let res = KChatBackendAuthority::install(
-            dummy,
-            "comm-1",
-            att,
-            local.peer_id(),
-            local_pub,
-            now,
-        );
+        let res =
+            KChatBackendAuthority::install(dummy, "comm-1", att, local.peer_id(), local_pub, now);
         assert!(matches!(res, Err(ClientError::AttestationInvalid(_))));
     }
 

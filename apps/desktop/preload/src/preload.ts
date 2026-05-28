@@ -181,6 +181,10 @@ import type {
   TrustedIssuer,
   ClipboardBridge,
   DeeplinkBridge,
+  Phase8Bridge,
+  PageNumberFormat,
+  JobType,
+  ResizeFrameBounds,
 } from "../../shared/scene";
 
 type FrameInfoSnake = {
@@ -2729,6 +2733,111 @@ const clipboard: ClipboardBridge = {
   },
 };
 
+// ---------------------------------------------------------------------------
+// Phase 8 — design-token binding, constraints, autofit, page numbering,
+// section pages, job presets, brand-kit versioning. See `Phase8Bridge` in
+// shared/scene.ts for the contract.
+// ---------------------------------------------------------------------------
+
+const phase8: Phase8Bridge = {
+  async bindToken(
+    nodeId: string,
+    property: string,
+    tokenName: string,
+  ): Promise<void> {
+    await ipcRenderer.invoke(
+      "kcreate/phase8/bind-token",
+      nodeId,
+      property,
+      tokenName,
+    );
+  },
+  async unbindToken(nodeId: string, property: string): Promise<void> {
+    await ipcRenderer.invoke(
+      "kcreate/phase8/unbind-token",
+      nodeId,
+      property,
+    );
+  },
+  async propagateToken(tokenName: string): Promise<number> {
+    return (await ipcRenderer.invoke(
+      "kcreate/phase8/propagate-token",
+      tokenName,
+    )) as number;
+  },
+  async resizeFrame(frameId: string, bounds: ResizeFrameBounds): Promise<void> {
+    await ipcRenderer.invoke("kcreate/phase8/resize-frame", frameId, bounds);
+  },
+  async setAutoFit(nodeId: string, enabled: boolean): Promise<boolean> {
+    return (await ipcRenderer.invoke(
+      "kcreate/phase8/set-auto-fit",
+      nodeId,
+      enabled,
+    )) as boolean;
+  },
+  async pageNumberToken(format: PageNumberFormat): Promise<string> {
+    return (await ipcRenderer.invoke(
+      "kcreate/phase8/page-number-token",
+      format,
+    )) as string;
+  },
+  async setPageSection(
+    pageId: string,
+    startNumber: number | null,
+    prefix: string | null,
+  ): Promise<void> {
+    await ipcRenderer.invoke(
+      "kcreate/phase8/set-page-section",
+      pageId,
+      startNumber,
+      prefix,
+    );
+  },
+  async resolvePageContexts() {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/phase8/resolve-page-contexts",
+    )) as string;
+    return JSON.parse(raw);
+  },
+  async exportJobPresets(job: JobType) {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/phase8/export-job-presets",
+      job,
+    )) as string;
+    return JSON.parse(raw);
+  },
+  async brandKitSaveVersion(brandKitId: string, description: string) {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/phase8/brand-kit/save-version",
+      brandKitId,
+      description,
+    )) as string;
+    return JSON.parse(raw);
+  },
+  async brandKitListVersions(brandKitId: string) {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/phase8/brand-kit/list-versions",
+      brandKitId,
+    )) as string;
+    return JSON.parse(raw);
+  },
+  async brandKitRestoreVersion(versionId: string) {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/phase8/brand-kit/restore-version",
+      versionId,
+    )) as string;
+    return JSON.parse(raw);
+  },
+  async brandKitDiff(beforeId: string, afterId: string) {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/phase8/brand-kit/diff",
+      beforeId,
+      afterId,
+    )) as string;
+    return JSON.parse(raw);
+  },
+};
+
 contextBridge.exposeInMainWorld("kcreate", {
   renderer,
   document,
@@ -2773,4 +2882,5 @@ contextBridge.exposeInMainWorld("kcreate", {
   kchatBackend,
   deeplink,
   clipboard,
+  phase8,
 });

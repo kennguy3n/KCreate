@@ -35,8 +35,7 @@ pub mod rest;
 pub mod fixture;
 
 pub use attestation::{
-    decode_verifying_key, membership_from_attestation, KChatBackendAuthority,
-    REFRESH_BEFORE_EXPIRY,
+    decode_verifying_key, membership_from_attestation, KChatBackendAuthority, REFRESH_BEFORE_EXPIRY,
 };
 pub use auth::{TokenSet, TokenStore, PREEMPTIVE_REFRESH_WINDOW};
 pub use client::KChatBackendClient;

@@ -154,12 +154,13 @@ impl RestClient {
     /// should be impossible for well-formed callers — every
     /// production path is a string literal).
     fn join(&self, path: &str) -> Result<Url, ClientError> {
-        self.config.base_url.join(path).map_err(|e| {
-            ClientError::InvalidBaseUrl {
+        self.config
+            .base_url
+            .join(path)
+            .map_err(|e| ClientError::InvalidBaseUrl {
                 url: format!("{} + {}", self.config.base_url, path),
                 message: e.to_string(),
-            }
-        })
+            })
     }
 
     /// Build a `reqwest::RequestBuilder` with the protocol-version
@@ -216,9 +217,8 @@ impl RestClient {
             let status = resp.status();
             if status == StatusCode::TOO_MANY_REQUESTS && attempts < MAX_RATE_LIMIT_RETRIES {
                 attempts += 1;
-                let wait = parse_retry_after(&resp).unwrap_or_else(|| {
-                    Duration::from_millis(200u64 * 2u64.pow(attempts.min(6)))
-                });
+                let wait = parse_retry_after(&resp)
+                    .unwrap_or_else(|| Duration::from_millis(200u64 * 2u64.pow(attempts.min(6))));
                 let wait = wait.min(MAX_RATE_LIMIT_BACKOFF);
                 tracing::debug!(
                     target: "kcreate_kchat_client::rest",
@@ -315,11 +315,7 @@ impl RestClient {
         let resp: RefreshResponse = self
             .request_unauthed_typed(Method::POST, "/api/v1/auth/refresh", Some(&req), true)
             .await?;
-        if self
-            .tokens
-            .apply_refresh(resp, Utc::now())
-            .is_none()
-        {
+        if self.tokens.apply_refresh(resp, Utc::now()).is_none() {
             return Err(ClientError::NotAuthenticated);
         }
         Ok(())
@@ -344,11 +340,9 @@ impl RestClient {
                 .bytes()
                 .await
                 .map_err(|e| ClientError::Transport(format!("read body: {e}")))?;
-            return serde_json::from_slice::<R>(&bytes).map_err(|e| {
-                ClientError::Deserialization {
-                    path: path.into(),
-                    message: e.to_string(),
-                }
+            return serde_json::from_slice::<R>(&bytes).map_err(|e| ClientError::Deserialization {
+                path: path.into(),
+                message: e.to_string(),
             });
         }
 
@@ -370,10 +364,7 @@ impl RestClient {
 fn is_auth_failure(err: &ClientError) -> bool {
     matches!(
         err,
-        ClientError::InvalidCredentials { .. }
-            | ClientError::Backend {
-                status: 401, ..
-            }
+        ClientError::InvalidCredentials { .. } | ClientError::Backend { status: 401, .. }
     )
 }
 
@@ -390,28 +381,24 @@ pub(crate) fn classify_failure(
         return ClientError::RateLimited;
     }
     if status == StatusCode::UNAUTHORIZED {
-        let message = body.as_ref().map_or_else(
-            || String::from("unauthorized"),
-            |b| b.message.clone(),
-        );
+        let message = body
+            .as_ref()
+            .map_or_else(|| String::from("unauthorized"), |b| b.message.clone());
         if is_refresh {
             return ClientError::RefreshExpired { message };
         }
         return ClientError::InvalidCredentials { message };
     }
     if status == StatusCode::FORBIDDEN {
-        let message = body.as_ref().map_or_else(
-            || String::from("permission denied"),
-            |b| b.message.clone(),
-        );
+        let message = body
+            .as_ref()
+            .map_or_else(|| String::from("permission denied"), |b| b.message.clone());
         return ClientError::PermissionDenied { message };
     }
     if status == StatusCode::NOT_FOUND || status == StatusCode::NOT_IMPLEMENTED {
         let is_attestation_path = path.ends_with("/attestation");
         let code = body.as_ref().map(|b| b.code.as_str());
-        if is_attestation_path
-            || code == Some(error_code::ATTESTATION_NOT_PROVISIONED)
-        {
+        if is_attestation_path || code == Some(error_code::ATTESTATION_NOT_PROVISIONED) {
             let message = body.as_ref().map_or_else(
                 || String::from("attestation endpoint not yet provisioned by backend"),
                 |b| b.message.clone(),
@@ -510,12 +497,7 @@ mod tests {
 
     #[test]
     fn classify_404_outside_attestation_returns_not_found() {
-        let err = classify_failure(
-            StatusCode::NOT_FOUND,
-            None,
-            "/api/v1/communities/x",
-            false,
-        );
+        let err = classify_failure(StatusCode::NOT_FOUND, None, "/api/v1/communities/x", false);
         assert!(matches!(err, ClientError::NotFound { .. }));
     }
 

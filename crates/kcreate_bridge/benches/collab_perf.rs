@@ -129,11 +129,7 @@ fn bench_journal_append_throughput(c: &mut Criterion) {
             let peer = &peers[idx % peers.len()];
             clock = clock.tick();
             journal
-                .append(
-                    peer.clone(),
-                    clock,
-                    make_op("bench", node_id, idx as i64),
-                )
+                .append(peer.clone(), clock, make_op("bench", node_id, idx as i64))
                 .expect("journal append");
             idx = idx.wrapping_add(1);
         });

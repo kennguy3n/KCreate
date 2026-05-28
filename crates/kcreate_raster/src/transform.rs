@@ -224,6 +224,197 @@ pub fn rotate(grid: &TileGrid, angle_deg: f32) -> TileGrid {
         .expect("from_image with matching dims is infallible")
 }
 
+/// 3×3 projective matrix in row-major order. Used internally by
+/// [`perspective_transform`].
+type Mat3 = [[f64; 3]; 3];
+
+fn mat_mul(a: &Mat3, b: &Mat3) -> Mat3 {
+    let mut out = [[0.0; 3]; 3];
+    for i in 0..3 {
+        for j in 0..3 {
+            let mut s = 0.0;
+            for k in 0..3 {
+                s += a[i][k] * b[k][j];
+            }
+            out[i][j] = s;
+        }
+    }
+    out
+}
+
+fn mat_inverse(m: &Mat3) -> Option<Mat3> {
+    let a = m[0][0];
+    let b = m[0][1];
+    let c = m[0][2];
+    let d = m[1][0];
+    let e = m[1][1];
+    let f = m[1][2];
+    let g = m[2][0];
+    let h = m[2][1];
+    let i = m[2][2];
+    let det = a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g);
+    if det.abs() < 1e-12 {
+        return None;
+    }
+    let inv_det = 1.0 / det;
+    let mut out = [[0.0; 3]; 3];
+    out[0][0] = (e * i - f * h) * inv_det;
+    out[0][1] = (c * h - b * i) * inv_det;
+    out[0][2] = (b * f - c * e) * inv_det;
+    out[1][0] = (f * g - d * i) * inv_det;
+    out[1][1] = (a * i - c * g) * inv_det;
+    out[1][2] = (c * d - a * f) * inv_det;
+    out[2][0] = (d * h - e * g) * inv_det;
+    out[2][1] = (b * g - a * h) * inv_det;
+    out[2][2] = (a * e - b * d) * inv_det;
+    Some(out)
+}
+
+/// Compute the projective basis-mapping `B` such that
+/// `B * (1,0,0) = (x0,y0,1)`, `B * (0,1,0) = (x1,y1,1)`,
+/// `B * (0,0,1) = (x2,y2,1)`, `B * (1,1,1) ∝ (x3,y3,1)`.
+///
+/// Returns `None` when the four points are degenerate (collinear).
+/// Implements the closed-form construction from Heckbert,
+/// "Fundamentals of Texture Mapping and Image Warping" (1989) §2.2.
+fn basis_to_points(pts: &[(f64, f64); 4]) -> Option<Mat3> {
+    let (x0, y0) = pts[0];
+    let (x1, y1) = pts[1];
+    let (x2, y2) = pts[2];
+    let (x3, y3) = pts[3];
+    // Solve for scalars (a, b, c) such that
+    //   a * (x0,y0,1) + b * (x1,y1,1) + c * (x2,y2,1) = (x3,y3,1)
+    let m = [[x0, x1, x2], [y0, y1, y2], [1.0, 1.0, 1.0]];
+    let inv = mat_inverse(&m)?;
+    let a = inv[0][0] * x3 + inv[0][1] * y3 + inv[0][2];
+    let b = inv[1][0] * x3 + inv[1][1] * y3 + inv[1][2];
+    let c = inv[2][0] * x3 + inv[2][1] * y3 + inv[2][2];
+    if a.abs() < 1e-12 || b.abs() < 1e-12 || c.abs() < 1e-12 {
+        return None;
+    }
+    Some([
+        [a * x0, b * x1, c * x2],
+        [a * y0, b * y1, c * y2],
+        [a, b, c],
+    ])
+}
+
+/// Build the 3×3 projective matrix that maps the source rectangle
+/// corners `(0,0)`, `(w,0)`, `(0,h)`, `(w,h)` to the four supplied
+/// destination corners (top-left, top-right, bottom-left,
+/// bottom-right). Returns `None` when the destinations are
+/// degenerate.
+fn perspective_matrix(src_w: f64, src_h: f64, dst: &[(f64, f64); 4]) -> Option<Mat3> {
+    let src = [(0.0, 0.0), (src_w, 0.0), (0.0, src_h), (src_w, src_h)];
+    let s = basis_to_points(&src)?;
+    let d = basis_to_points(dst)?;
+    let s_inv = mat_inverse(&s)?;
+    Some(mat_mul(&d, &s_inv))
+}
+
+/// Apply a perspective (projective) transform to `grid`, mapping the
+/// source rectangle's four corners to the supplied destination
+/// corners (in `(top_left, top_right, bottom_left, bottom_right)`
+/// order, in pixels of the output canvas). Uses inverse mapping with
+/// bilinear interpolation, row-parallel via rayon.
+///
+/// The output canvas size is the axis-aligned bounding box of the
+/// supplied destination corners, clamped to `[1, u32::MAX]`. Pixels
+/// outside the warped quadrilateral are transparent.
+///
+/// Returns the source grid unchanged when the destination corners
+/// are degenerate (collinear / collapsed) — the only sensible
+/// no-op for an invertible-transform API.
+#[must_use]
+pub fn perspective_transform(grid: &TileGrid, corners: [(f64, f64); 4]) -> TileGrid {
+    let src_w = f64::from(grid.width);
+    let src_h = f64::from(grid.height);
+    if src_w == 0.0 || src_h == 0.0 {
+        return grid.clone();
+    }
+    let Some(forward) = perspective_matrix(src_w, src_h, &corners) else {
+        return grid.clone();
+    };
+    let Some(inverse) = mat_inverse(&forward) else {
+        return grid.clone();
+    };
+
+    // Output canvas = axis-aligned bbox of destination corners,
+    // translated so the bbox sits at (0, 0). The caller's `corners`
+    // are in absolute pixels of the output canvas's coordinate
+    // system; we re-anchor at the min so a negative corner doesn't
+    // produce a negative-sized canvas.
+    let mut min_x = f64::INFINITY;
+    let mut max_x = f64::NEG_INFINITY;
+    let mut min_y = f64::INFINITY;
+    let mut max_y = f64::NEG_INFINITY;
+    for (cx, cy) in &corners {
+        if *cx < min_x {
+            min_x = *cx;
+        }
+        if *cx > max_x {
+            max_x = *cx;
+        }
+        if *cy < min_y {
+            min_y = *cy;
+        }
+        if *cy > max_y {
+            max_y = *cy;
+        }
+    }
+    let out_w_f = (max_x - min_x).ceil().max(1.0);
+    let out_h_f = (max_y - min_y).ceil().max(1.0);
+    let out_w = (out_w_f as u32).max(1);
+    let out_h = (out_h_f as u32).max(1);
+
+    let stride_out = (out_w as usize) * 4;
+    let src = grid.to_image();
+    let mut buf = vec![0u8; stride_out * (out_h as usize)];
+    let src_w_usize = grid.width as usize;
+    let src_h_usize = grid.height as usize;
+
+    buf.par_chunks_mut(stride_out)
+        .enumerate()
+        .for_each(|(row, dst)| {
+            // Pixel positions are addressed by their top-left
+            // corner (matching `rotate`); the inverse transform
+            // maps output corner `(dx, dy)` back to a source
+            // sample position, and `bilinear_sample` interpolates
+            // there. Using the corner convention means an identity
+            // perspective is bitwise-stable instead of averaging
+            // four neighbours at every integer position.
+            let dy = row as f64 + min_y;
+            for x in 0..(out_w as usize) {
+                let dx = x as f64 + min_x;
+                // Apply inverse projective transform.
+                let w = inverse[2][0] * dx + inverse[2][1] * dy + inverse[2][2];
+                if w.abs() < 1e-12 {
+                    let off = x * 4;
+                    dst[off..off + 4].copy_from_slice(&[0, 0, 0, 0]);
+                    continue;
+                }
+                let sx = (inverse[0][0] * dx + inverse[0][1] * dy + inverse[0][2]) / w;
+                let sy = (inverse[1][0] * dx + inverse[1][1] * dy + inverse[1][2]) / w;
+                let off = x * 4;
+                if sx < -0.5
+                    || sx >= src_w - 0.5
+                    || sy < -0.5
+                    || sy >= src_h - 0.5
+                    || !sx.is_finite()
+                    || !sy.is_finite()
+                {
+                    dst[off..off + 4].copy_from_slice(&[0, 0, 0, 0]);
+                } else {
+                    let px = bilinear_sample(&src, src_w_usize, src_h_usize, sx as f32, sy as f32);
+                    dst[off..off + 4].copy_from_slice(&px);
+                }
+            }
+        });
+
+    TileGrid::from_image(&buf, out_w, out_h, grid.tile_size)
+        .expect("from_image with matching dims is infallible")
+}
+
 /// In-place horizontal flip.
 pub fn flip_h(grid: &mut TileGrid) {
     let w = grid.width;
@@ -346,5 +537,54 @@ mod tests {
         // a valid bilinear sample of the source centre.
         assert!(out.width >= g.width);
         assert!(out.height >= g.height);
+    }
+
+    #[test]
+    fn perspective_identity_corners_round_trip() {
+        let g = checker(32, 32);
+        let out = perspective_transform(&g, [(0.0, 0.0), (32.0, 0.0), (0.0, 32.0), (32.0, 32.0)]);
+        assert_eq!(out.width, 32);
+        assert_eq!(out.height, 32);
+        // Identity mapping reproduces the source bitmap up to
+        // bilinear-sampling rounding (use a max-abs-diff bound).
+        let src = g.to_image();
+        let dst = out.to_image();
+        assert_eq!(src.len(), dst.len());
+        let mut max_diff = 0i32;
+        for (a, b) in src.iter().zip(dst.iter()) {
+            max_diff = max_diff.max((i32::from(*a) - i32::from(*b)).abs());
+        }
+        assert!(max_diff <= 2, "identity perspective drift {max_diff}");
+    }
+
+    #[test]
+    fn perspective_degenerate_returns_source() {
+        let g = checker(16, 16);
+        let out = perspective_transform(&g, [(0.0, 0.0), (0.0, 0.0), (0.0, 0.0), (0.0, 0.0)]);
+        // Degenerate (all corners collapsed): we return the input
+        // unchanged so the editor never produces a 0×0 grid.
+        assert_eq!(out.to_image(), g.to_image());
+    }
+
+    #[test]
+    fn perspective_top_compressed_keeps_corners_in_place() {
+        // Build a synthetic image with a single white pixel at the
+        // top-left corner and zero elsewhere. After a transform that
+        // maps (0,0) → (10, 5), the resulting canvas should have a
+        // bright pixel near (10, 5) and dark elsewhere.
+        let mut buf = vec![0u8; 32 * 32 * 4];
+        buf[3] = 255; // (0,0) alpha
+        buf[0] = 255;
+        buf[1] = 255;
+        buf[2] = 255;
+        let g = TileGrid::from_image(&buf, 32, 32, 16).expect("grid");
+        // Trapezoid: top edge shifted inward by 5 px on either side.
+        let out = perspective_transform(&g, [(5.0, 0.0), (27.0, 0.0), (0.0, 32.0), (32.0, 32.0)]);
+        // The top-left corner of the source maps to (5, 0); check
+        // that the alpha at output (5, 0) is bright.
+        let stride = (out.width as usize) * 4;
+        let alpha_5_0 = out.to_image()[3 + 5 * 4];
+        let _ = stride;
+        assert!(alpha_5_0 > 128, "warped corner pixel dim ({alpha_5_0})");
     }
 }

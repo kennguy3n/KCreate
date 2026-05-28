@@ -12,6 +12,7 @@ pub mod action_log;
 pub mod alt_text;
 pub mod bg_remove;
 pub mod brand_extract;
+pub mod color_range;
 pub mod design_critique;
 pub mod design_tokens_vlm;
 pub mod image_gen;
@@ -39,6 +40,7 @@ pub use bg_remove::{
     apply_alpha_mask, remove_background, remove_background_with_backend, BgRemovalBackend,
     BgRemoveError, BgRemoveOptions,
 };
+pub use color_range::{pack_mask, select_by_color_range};
 pub use layout_suggest::{
     suggest_layout_grouping, Bounds as LayoutBounds, LayoutAlignment, LayoutNode,
     LayoutOrientation, LayoutSuggestError, LayoutSuggestOptions, LayoutSuggestion,

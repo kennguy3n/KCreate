@@ -35,6 +35,7 @@ kcreate_audit = { path = "../kcreate_audit" }
 kcreate_collab = { path = "../kcreate_collab" }
 kcreate_core = { path = "../kcreate_core" }
 kcreate_export = { path = "../kcreate_export" }
+kcreate_layout = { path = "../kcreate_layout" }
 kcreate_mcp = { path = "../kcreate_mcp" }
 kcreate_raster = { path = "../kcreate_raster" }
 kcreate_renderer = { path = "../kcreate_renderer" }

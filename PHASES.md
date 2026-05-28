@@ -112,3 +112,48 @@ transport). All three off by default; the Electron host opts
 in when packaging release binaries.
 
 See PROGRESS.md §"Phase 7" for the per-task breakdown.
+
+## Phase 8 — Production Hardening | In Progress
+
+Phase 8 is the production-hardening sweep that fills the gaps left
+by Phases 5–7 in the design-token / layout / brand-hub / image-studio
+surfaces and adds the encryption-at-rest, design-review, and
+artifact-publishing capabilities the proposal originally called for.
+30 tasks across 6 blocks:
+
+- **Block A (Tasks 1–6):** KChat artifact publishing pipeline +
+  design-review annotation layer (`kcreate_core::annotation`,
+  `kcreate_storage::annotations`).
+- **Block B (Tasks 7–12):** Image Studio primitives —
+  perspective transform (`kcreate_raster::transform`), color
+  range selection (`kcreate_ai::color_range`), HSL +
+  ColorBalance adjustment layers (`kcreate_raster::layer`),
+  selection-based filter application.
+- **Block C (Tasks 13–18):** page-numbering tokens with
+  section restart (`kcreate_text::tokens`), brand-kit
+  versioning with structured diff
+  (`kcreate_storage::brand_versions`), job-first export
+  presets (`kcreate_export::job_presets`).
+- **Block D (Tasks 19–24):** constraint system for
+  responsive frames (`kcreate_layout::constraints`),
+  design-token binding with sub-100 ms propagation
+  (`kcreate_core::token_binding`), smart text auto-fit
+  (`kcreate_text::autofit`).
+- **Block E (Tasks 25–28):** SQLCipher encryption at rest
+  with PBKDF2-HMAC-SHA256 key derivation
+  (`kcreate_storage::crypto`), startup performance
+  optimisation, memory budget enforcement.
+- **Block F (Tasks 29–30):** PROGRESS.md / PHASES.md /
+  README.md / ARCHITECTURE.md / AGENTS.md updates.
+
+All Phase 8 Rust + bridge work lives in
+`crates/kcreate_bridge/src/phase8.rs` (workspace-level
+helpers) and is exposed through 13 new N-API entry points in
+`crates/kcreate_bridge/src/lib.rs`. The TypeScript wire format
+is mirrored in `apps/desktop/shared/scene.ts` as
+`Phase8Bridge`. The local-first sentinel
+(`crates/kcreate_tests/tests/local_first.rs`) stays green —
+none of the new code introduces a networking dependency to
+the editing-path closure.
+
+See PROGRESS.md §"Phase 8" for the per-task breakdown.

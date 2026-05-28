@@ -125,7 +125,12 @@ serde_json = "1.0"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
 
 # Persistence (statically linked SQLite)
-rusqlite = { version = "0.34", features = ["bundled", "blob", "chrono", "uuid"] }
+# SQLCipher (vendored OpenSSL) so encrypted projects work on every
+# platform without a system OpenSSL dependency. SQLCipher is a
+# superset of SQLite: plaintext databases continue to open and
+# write normally as long as no `PRAGMA key` is set, so this also
+# satisfies the legacy `bundled` use case.
+rusqlite = { version = "0.34", features = ["bundled-sqlcipher-vendored-openssl", "blob", "chrono", "uuid"] }
 
 # Content-addressed hashing
 blake3 = "1.5"

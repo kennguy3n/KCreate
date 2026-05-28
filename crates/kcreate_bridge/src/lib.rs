@@ -28,6 +28,7 @@ pub mod llm;
 pub mod native_canvas;
 pub mod phase2;
 pub mod phase4;
+pub mod phase8;
 pub mod raster_ops;
 pub mod scene_sync;
 pub mod state;
@@ -2919,9 +2920,15 @@ pub fn session_start(
 ) -> NapiResult<String> {
     let pid = parse_uuid(&project_id)?;
     let dir = project_dir.map(std::path::PathBuf::from);
-    let report =
-        crate::collab::session_start(&seed_b64, &display_name, pid, advertise_mdns, community_id, dir)
-            .map_err(map_session_err)?;
+    let report = crate::collab::session_start(
+        &seed_b64,
+        &display_name,
+        pid,
+        advertise_mdns,
+        community_id,
+        dir,
+    )
+    .map_err(map_session_err)?;
     serde_json::to_string(&report).map_err(|e| {
         NapiError::new(
             Status::GenericFailure,
@@ -3395,8 +3402,8 @@ pub fn kchat_backend_connect(request_json: String) -> NapiResult<String> {
                 "kchat_backend_connect: invalid sign-in request: {e}"
             ))
         })?;
-    let status = crate::kchat_backend::kchat_backend_connect(request)
-        .map_err(map_kchat_backend_err)?;
+    let status =
+        crate::kchat_backend::kchat_backend_connect(request).map_err(map_kchat_backend_err)?;
     serde_json::to_string(&status)
         .map_err(|e| NapiError::from_reason(format!("kchat_backend_connect: {e}")))
 }
@@ -3406,8 +3413,7 @@ pub fn kchat_backend_connect(request_json: String) -> NapiResult<String> {
 #[cfg(feature = "kchat-backend")]
 #[napi]
 pub fn kchat_backend_disconnect() -> NapiResult<String> {
-    let status =
-        crate::kchat_backend::kchat_backend_disconnect().map_err(map_kchat_backend_err)?;
+    let status = crate::kchat_backend::kchat_backend_disconnect().map_err(map_kchat_backend_err)?;
     serde_json::to_string(&status)
         .map_err(|e| NapiError::from_reason(format!("kchat_backend_disconnect: {e}")))
 }
@@ -3648,11 +3654,8 @@ pub fn session_clipboard_share(
 /// pending queue regardless of decryption outcome.
 #[cfg(feature = "collab")]
 #[napi]
-pub fn session_clipboard_accept(
-    offer_id: String,
-) -> NapiResult<napi::bindgen_prelude::Buffer> {
-    let bytes = crate::collab::session_clipboard_accept(&offer_id)
-        .map_err(map_session_err)?;
+pub fn session_clipboard_accept(offer_id: String) -> NapiResult<napi::bindgen_prelude::Buffer> {
+    let bytes = crate::collab::session_clipboard_accept(&offer_id).map_err(map_session_err)?;
     Ok(bytes.into())
 }
 
@@ -3686,11 +3689,13 @@ pub fn session_pending_clipboard_offers() -> NapiResult<String> {
     let entries = crate::collab::session_pending_clipboard_offers();
     let wire: Vec<WireClipboardOffer> = entries
         .into_iter()
-        .map(|(offer_id, from_peer_id, preview_label)| WireClipboardOffer {
-            offer_id,
-            from_peer_id,
-            preview_label,
-        })
+        .map(
+            |(offer_id, from_peer_id, preview_label)| WireClipboardOffer {
+                offer_id,
+                from_peer_id,
+                preview_label,
+            },
+        )
         .collect();
     serde_json::to_string(&wire).map_err(|e| {
         NapiError::new(
@@ -4225,4 +4230,189 @@ pub fn image_gen_allowed() -> bool {
 #[napi]
 pub fn image_gen_recommended_pack() -> String {
     phase4::image_gen_recommended_pack().unwrap_or_default()
+}
+
+// ---------------------------------------------------------------------------
+// Phase 8 N-API entry points
+// ---------------------------------------------------------------------------
+
+/// Bind `property` on the node identified by `node_id_str` to the
+/// design-token named `token_name`. See [`phase8::document_bind_token`].
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn document_bind_token(
+    node_id_str: String,
+    property: String,
+    token_name: String,
+) -> NapiResult<()> {
+    let id = parse_uuid(&node_id_str)?;
+    phase8::document_bind_token(id, &property, &token_name).map_err(map_doc_err)
+}
+
+/// Remove the binding for `property` from `node_id_str`. See
+/// [`phase8::document_unbind_token`].
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn document_unbind_token(node_id_str: String, property: String) -> NapiResult<()> {
+    let id = parse_uuid(&node_id_str)?;
+    phase8::document_unbind_token(id, &property).map_err(map_doc_err)
+}
+
+/// Re-evaluate every binding to `token_name` across the open
+/// document. Returns the number of nodes whose properties were
+/// updated. See [`phase8::document_propagate_token`].
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn document_propagate_token(token_name: String) -> NapiResult<u32> {
+    phase8::document_propagate_token(&token_name)
+        .map(|n| u32::try_from(n).unwrap_or(u32::MAX))
+        .map_err(map_doc_err)
+}
+
+/// Resize a frame and apply [`Constraints`] to every direct child.
+/// The bounds JSON is `{ "x": f64, "y": f64, "width": f64, "height": f64 }`.
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn document_resize_frame(frame_id_str: String, bounds_json: String) -> NapiResult<()> {
+    let id = parse_uuid(&frame_id_str)?;
+    let bounds: kcreate_core::node::Bounds = serde_json::from_str(&bounds_json).map_err(|e| {
+        NapiError::new(
+            Status::InvalidArg,
+            format!("document_resize_frame: bad bounds json: {e}"),
+        )
+    })?;
+    phase8::document_resize_frame(id, bounds).map_err(map_doc_err)
+}
+
+/// Toggle text auto-fit on a text node. Returns the previous value.
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn text_set_auto_fit(node_id_str: String, enabled: bool) -> NapiResult<bool> {
+    let id = parse_uuid(&node_id_str)?;
+    phase8::text_set_auto_fit(id, enabled).map_err(map_doc_err)
+}
+
+/// Build a page-number sentinel string for `format` (one of
+/// `"arabic" | "roman_lower" | "roman_upper" | "alpha_lower" | "alpha_upper"`).
+/// The string includes the Unicode private-use sentinel followed by
+/// the format selector — the renderer inserts it directly into the
+/// text content at the caret.
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn page_number_token(format: String) -> NapiResult<String> {
+    let fmt = parse_page_number_format(&format)?;
+    Ok(phase8::page_number_token(fmt))
+}
+
+fn parse_page_number_format(s: &str) -> NapiResult<kcreate_text::tokens::PageNumberFormat> {
+    use kcreate_text::tokens::PageNumberFormat as F;
+    match s {
+        "arabic" => Ok(F::Arabic),
+        "roman_lower" => Ok(F::RomanLower),
+        "roman_upper" => Ok(F::RomanUpper),
+        "alpha_lower" => Ok(F::AlphaLower),
+        "alpha_upper" => Ok(F::AlphaUpper),
+        other => Err(NapiError::new(
+            Status::InvalidArg,
+            format!("unknown page_number_format: {other}"),
+        )),
+    }
+}
+
+/// Set the section-numbering metadata on a page. Pass `null` for
+/// either argument to clear it.
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn page_set_section(
+    page_id_str: String,
+    start_number: Option<u32>,
+    prefix: Option<String>,
+) -> NapiResult<()> {
+    let id = parse_uuid(&page_id_str)?;
+    phase8::page_set_section(id, start_number, prefix).map_err(map_doc_err)
+}
+
+/// JSON-encoded list of resolved page contexts in document order.
+/// Each entry has `{ id, index, display_number, section_total, section_prefix }`.
+#[napi]
+pub fn page_resolve_contexts() -> NapiResult<String> {
+    let contexts = phase8::page_resolve_contexts();
+    serde_json::to_string(&contexts)
+        .map_err(|e| NapiError::from_reason(format!("page_resolve_contexts: {e}")))
+}
+
+/// Curated export presets for the supplied job tile name. The
+/// `job` argument is a snake_case identifier matching one of the
+/// Home-screen job tiles (`"app_ui"`, `"logo"`, `"social_post"`,
+/// `"product_photo"`, `"pitch_deck"`, `"flyer_poster"`,
+/// `"developer_asset"`). Returns JSON-encoded
+/// [`phase8::JobExportPresets`].
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn export_job_presets(job: String) -> NapiResult<String> {
+    let job_type = parse_job_type(&job)?;
+    let presets = phase8::export_job_presets(job_type);
+    serde_json::to_string(&presets)
+        .map_err(|e| NapiError::from_reason(format!("export_job_presets: {e}")))
+}
+
+fn parse_job_type(s: &str) -> NapiResult<kcreate_export::job_presets::JobType> {
+    use kcreate_export::job_presets::JobType as J;
+    match s {
+        "app_or_website_ui" | "app_ui" => Ok(J::AppOrWebsiteUi),
+        "logo_icon_or_brand_kit" | "logo" => Ok(J::LogoIconOrBrandKit),
+        "social_media_post" | "social_post" => Ok(J::SocialMediaPost),
+        "product_photo_cleanup" | "product_photo" => Ok(J::ProductPhotoCleanup),
+        "pitch_deck_or_proposal" | "pitch_deck" => Ok(J::PitchDeckOrProposal),
+        "flyer_poster_or_brochure" | "flyer_poster" => Ok(J::FlyerPosterOrBrochure),
+        "developer_asset_export" | "developer_asset" => Ok(J::DeveloperAssetExport),
+        other => Err(NapiError::new(
+            Status::InvalidArg,
+            format!("unknown job_type: {other}"),
+        )),
+    }
+}
+
+/// Save a brand-kit snapshot. Returns JSON-encoded
+/// [`phase8::BrandKitVersionInfo`].
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn brand_kit_save_version(brand_kit_id_str: String, description: String) -> NapiResult<String> {
+    let id = parse_uuid(&brand_kit_id_str)?;
+    let v = phase8::brand_kit_save_version(id, &description).map_err(map_doc_err)?;
+    serde_json::to_string(&v)
+        .map_err(|e| NapiError::from_reason(format!("brand_kit_save_version: {e}")))
+}
+
+/// List brand-kit snapshots, newest first. Returns JSON-encoded
+/// `Vec<phase8::BrandKitVersionInfo>`.
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn brand_kit_list_versions(brand_kit_id_str: String) -> NapiResult<String> {
+    let id = parse_uuid(&brand_kit_id_str)?;
+    let vs = phase8::brand_kit_list_versions(id).map_err(map_doc_err)?;
+    serde_json::to_string(&vs)
+        .map_err(|e| NapiError::from_reason(format!("brand_kit_list_versions: {e}")))
+}
+
+/// Restore a brand kit to the snapshot identified by `version_id`.
+/// Returns JSON-encoded [`kcreate_core::project::BrandKit`].
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn brand_kit_restore_version(version_id_str: String) -> NapiResult<String> {
+    let id = parse_uuid(&version_id_str)?;
+    let kit = phase8::brand_kit_restore_version(id).map_err(map_doc_err)?;
+    serde_json::to_string(&kit)
+        .map_err(|e| NapiError::from_reason(format!("brand_kit_restore_version: {e}")))
+}
+
+/// Structured diff between two brand-kit snapshots. Returns
+/// JSON-encoded [`kcreate_storage::brand_versions::BrandKitDiff`].
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn brand_kit_diff(before_id_str: String, after_id_str: String) -> NapiResult<String> {
+    let before = parse_uuid(&before_id_str)?;
+    let after = parse_uuid(&after_id_str)?;
+    let diff = phase8::brand_kit_diff(before, after).map_err(map_doc_err)?;
+    serde_json::to_string(&diff).map_err(|e| NapiError::from_reason(format!("brand_kit_diff: {e}")))
 }

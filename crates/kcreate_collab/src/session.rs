@@ -419,9 +419,10 @@ impl ProjectSession {
         };
         let (limit, budget) = match kind {
             RateLimitKind::Operation => (self.config.max_ops_per_second, &mut state.ops_budget),
-            RateLimitKind::Presence => {
-                (self.config.max_presence_per_second, &mut state.presence_budget)
-            }
+            RateLimitKind::Presence => (
+                self.config.max_presence_per_second,
+                &mut state.presence_budget,
+            ),
         };
         budget.record(now, limit)
     }
@@ -1089,7 +1090,11 @@ mod tests {
                 RateLimitKind::Operation,
                 now + std::time::Duration::from_millis(i * 10),
             );
-            assert_eq!(dec, RateBudgetDecision::Ok, "event {i} unexpectedly over budget");
+            assert_eq!(
+                dec,
+                RateBudgetDecision::Ok,
+                "event {i} unexpectedly over budget"
+            );
         }
     }
 

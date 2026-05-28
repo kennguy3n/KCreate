@@ -22,14 +22,17 @@
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 
+pub mod autofit;
 pub mod flow;
 pub mod font_db;
 pub mod hyphenation;
 pub mod outline;
 pub mod paragraph;
 pub mod shaper;
+pub mod tokens;
 pub mod wrap;
 
+pub use autofit::{compute_autofit_size, AutofitError, AutofitOptions};
 pub use font_db::{FontInfo, FontManager, FontManagerError};
 pub use hyphenation::{HyphenationPatterns, EN_US_PATTERNS};
 pub use outline::{outline_glyph, OutlineCommand, OutlineError};
@@ -39,6 +42,10 @@ pub use paragraph::{
 pub use shaper::{
     opentype_features_to_buzz, shape_text, shape_text_with_features, shape_with_face,
     shape_with_face_and_features, ShapedGlyph, ShapedText, ShaperError,
+};
+pub use tokens::{
+    encode_page_number_token, expand_tokens, format_page_number, resolve_page_contexts,
+    PageContext, PageDescriptor, PageNumberFormat, TOKEN_SENTINEL,
 };
 
 /// Combined error surface for the crate (re-exported for crates that

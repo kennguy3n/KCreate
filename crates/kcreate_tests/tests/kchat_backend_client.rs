@@ -26,9 +26,7 @@ use std::time::Duration;
 use chrono::Utc;
 use kcreate_collab::kchat::KChatGroupAuthority;
 use kcreate_kchat_client::fixture::{FixtureBehavior, FixtureServer};
-use kcreate_kchat_client::{
-    KChatBackendAuthority, KChatBackendClient, KChatRole, LoginRequest,
-};
+use kcreate_kchat_client::{KChatBackendAuthority, KChatBackendClient, KChatRole, LoginRequest};
 
 fn login_body(server: &FixtureServer) -> LoginRequest {
     LoginRequest {
@@ -90,9 +88,8 @@ async fn end_to_end_signin_select_install_and_verify() {
         .get_membership_attestation(&community.id, &server.local_public_key_b64)
         .await
         .expect("attestation 2");
-    let remote_membership =
-        kcreate_kchat_client::membership_from_attestation(remote_attestation)
-            .expect("decode membership");
+    let remote_membership = kcreate_kchat_client::membership_from_attestation(remote_attestation)
+        .expect("decode membership");
     authority
         .verify_remote(
             &server.local_peer_id,

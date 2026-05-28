@@ -1613,6 +1613,89 @@ function registerIpcHandlers(): void {
       ),
   );
 
+  // -------------------------------------------------------------------
+  // Phase 8 — design-token binding, constraint-aware frame resize,
+  // text auto-fit, page-numbering tokens, section pages, job presets,
+  // brand-kit versioning. The renderer parses JSON-returning calls
+  // (presets, version info, diffs) itself; the main process just
+  // forwards strings.
+  // -------------------------------------------------------------------
+  ipcMain.handle(
+    "kcreate/phase8/bind-token",
+    (_e, nodeId: string, property: string, tokenName: string): void =>
+      requireBridge().documentBindToken(nodeId, property, tokenName),
+  );
+  ipcMain.handle(
+    "kcreate/phase8/unbind-token",
+    (_e, nodeId: string, property: string): void =>
+      requireBridge().documentUnbindToken(nodeId, property),
+  );
+  ipcMain.handle(
+    "kcreate/phase8/propagate-token",
+    (_e, tokenName: string): number =>
+      requireBridge().documentPropagateToken(tokenName),
+  );
+  ipcMain.handle(
+    "kcreate/phase8/resize-frame",
+    (
+      _e,
+      frameId: string,
+      bounds: { x: number; y: number; width: number; height: number },
+    ): void =>
+      requireBridge().documentResizeFrame(frameId, JSON.stringify(bounds)),
+  );
+  ipcMain.handle(
+    "kcreate/phase8/set-auto-fit",
+    (_e, nodeId: string, enabled: boolean): boolean =>
+      requireBridge().textSetAutoFit(nodeId, enabled),
+  );
+  ipcMain.handle(
+    "kcreate/phase8/page-number-token",
+    (_e, format: string): string => requireBridge().pageNumberToken(format),
+  );
+  ipcMain.handle(
+    "kcreate/phase8/set-page-section",
+    (
+      _e,
+      pageId: string,
+      startNumber: number | null,
+      prefix: string | null,
+    ): void =>
+      requireBridge().pageSetSection(
+        pageId,
+        startNumber ?? null,
+        prefix ?? null,
+      ),
+  );
+  ipcMain.handle(
+    "kcreate/phase8/resolve-page-contexts",
+    (): string => requireBridge().pageResolveContexts(),
+  );
+  ipcMain.handle(
+    "kcreate/phase8/export-job-presets",
+    (_e, job: string): string => requireBridge().exportJobPresets(job),
+  );
+  ipcMain.handle(
+    "kcreate/phase8/brand-kit/save-version",
+    (_e, brandKitId: string, description: string): string =>
+      requireBridge().brandKitSaveVersion(brandKitId, description),
+  );
+  ipcMain.handle(
+    "kcreate/phase8/brand-kit/list-versions",
+    (_e, brandKitId: string): string =>
+      requireBridge().brandKitListVersions(brandKitId),
+  );
+  ipcMain.handle(
+    "kcreate/phase8/brand-kit/restore-version",
+    (_e, versionId: string): string =>
+      requireBridge().brandKitRestoreVersion(versionId),
+  );
+  ipcMain.handle(
+    "kcreate/phase8/brand-kit/diff",
+    (_e, beforeId: string, afterId: string): string =>
+      requireBridge().brandKitDiff(beforeId, afterId),
+  );
+
   // ---------------------------------------------------------------------
   // Phase 2 — preflight, icon pack, batch async, AI extras, plugins, MCP perms.
   // ---------------------------------------------------------------------

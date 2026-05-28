@@ -1018,12 +1018,14 @@ fn apply_event(ev: InboundEvent) {
                     }
                     let preview_label = payload.preview_label.clone();
                     let offer_id = payload.offer_id.clone();
-                    state.pending_clipboard_offers.push_back(PendingClipboardOffer {
-                        offer_id: offer_id.clone(),
-                        from_peer_id: from.clone(),
-                        from_public_key: payload.sender_public_key.clone(),
-                        payload: payload.clone(),
-                    });
+                    state
+                        .pending_clipboard_offers
+                        .push_back(PendingClipboardOffer {
+                            offer_id: offer_id.clone(),
+                            from_peer_id: from.clone(),
+                            from_public_key: payload.sender_public_key.clone(),
+                            payload: payload.clone(),
+                        });
                     push_event(
                         state,
                         SessionEvent::ClipboardShareOffered {
@@ -1077,8 +1079,7 @@ fn apply_rate_limit_check(
             consecutive_overflow_windows,
         } => {
             let kick_threshold = host.rate_limit_disconnect_after();
-            let should_kick =
-                kick_threshold > 0 && consecutive_overflow_windows >= kick_threshold;
+            let should_kick = kick_threshold > 0 && consecutive_overflow_windows >= kick_threshold;
             push_event(
                 state,
                 SessionEvent::RateLimitWarning {
@@ -1100,16 +1101,11 @@ fn apply_rate_limit_check(
                     if let Err(e) = host
                         .disconnect_peer(
                             &pid,
-                            kcreate_collab::GoodbyeReason::Kicked(
-                                "rate-limit-exceeded".into(),
-                            ),
+                            kcreate_collab::GoodbyeReason::Kicked("rate-limit-exceeded".into()),
                         )
                         .await
                     {
-                        tracing::warn!(
-                            "collab: rate-limit kick of {} failed: {e}",
-                            pid.as_str()
-                        );
+                        tracing::warn!("collab: rate-limit kick of {} failed: {e}", pid.as_str());
                     }
                 });
             }
@@ -2137,7 +2133,11 @@ pub fn session_send_presence(
         }
 
         state.last_broadcast_presence = Some((now, candidate.clone()));
-        (state.host.clone(), state.runtime.handle().clone(), candidate)
+        (
+            state.host.clone(),
+            state.runtime.handle().clone(),
+            candidate,
+        )
     };
 
     let result = runtime_handle.block_on(async {
@@ -3500,16 +3500,12 @@ fn load_project_acl(
 
 /// Phase 7 (Task 21): persist the ACL to `<project_dir>/acl.json`.
 /// Returns the I/O error rendered as a typed bridge error.
-fn save_project_acl(
-    path: &std::path::Path,
-    acl: &kcreate_collab::ProjectAcl,
-) -> Result<()> {
-    let json = serde_json::to_string_pretty(acl).map_err(|e| {
-        SessionBridgeError::InvalidArgument {
+fn save_project_acl(path: &std::path::Path, acl: &kcreate_collab::ProjectAcl) -> Result<()> {
+    let json =
+        serde_json::to_string_pretty(acl).map_err(|e| SessionBridgeError::InvalidArgument {
             field: "acl",
             message: format!("could not serialise ACL: {e}"),
-        }
-    })?;
+        })?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| SessionBridgeError::InvalidArgument {
             field: "acl_path",
@@ -3553,7 +3549,10 @@ pub fn session_acl_set(acl: kcreate_collab::ProjectAcl) -> Result<()> {
     let connected: Vec<PeerIdentity> = host.connected_peers();
     let mut to_kick: Vec<(PeerId, String)> = Vec::new();
     for ident in connected {
-        if matches!(state.acl.evaluate(&ident), kcreate_collab::AclDecision::Deny) {
+        if matches!(
+            state.acl.evaluate(&ident),
+            kcreate_collab::AclDecision::Deny
+        ) {
             to_kick.push((ident.peer_id.clone(), ident.public_key.clone()));
         }
     }
@@ -3656,14 +3655,8 @@ pub fn session_rotate_keys(grace: std::time::Duration) -> Result<u64> {
                 state,
                 SessionEvent::KeyRotationCompleted {
                     epoch,
-                    acked_peer_ids: acked
-                        .iter()
-                        .map(|p| p.as_str().to_string())
-                        .collect(),
-                    dropped_peer_ids: missing
-                        .iter()
-                        .map(|p| p.as_str().to_string())
-                        .collect(),
+                    acked_peer_ids: acked.iter().map(|p| p.as_str().to_string()).collect(),
+                    dropped_peer_ids: missing.iter().map(|p| p.as_str().to_string()).collect(),
                 },
             );
         }
@@ -3733,16 +3726,12 @@ pub fn session_clipboard_share(
         }
     })?;
     let nonce = generate_random_nonce();
-    let ciphertext_bytes = kcreate_collab::encrypt_clipboard_payload(
-        &signing,
-        &recipient_vk,
-        plaintext,
-        nonce,
-    )
-    .map_err(|e| SessionBridgeError::InvalidArgument {
-        field: "plaintext",
-        message: format!("encryption failed: {e}"),
-    })?;
+    let ciphertext_bytes =
+        kcreate_collab::encrypt_clipboard_payload(&signing, &recipient_vk, plaintext, nonce)
+            .map_err(|e| SessionBridgeError::InvalidArgument {
+                field: "plaintext",
+                message: format!("encryption failed: {e}"),
+            })?;
 
     let offer_id = uuid::Uuid::new_v4().to_string();
     let payload = kcreate_collab::ClipboardSharePayload {
@@ -3754,9 +3743,7 @@ pub fn session_clipboard_share(
         ciphertext: URL_SAFE_NO_PAD.encode(&ciphertext_bytes),
         preview_label: preview_label.to_string(),
     };
-    runtime_handle.block_on(async move {
-        host.send_clipboard_share(&target, payload).await
-    })?;
+    runtime_handle.block_on(async move { host.send_clipboard_share(&target, payload).await })?;
     Ok(offer_id)
 }
 
@@ -3792,7 +3779,10 @@ pub fn session_clipboard_accept(offer_id: &str) -> Result<Vec<u8>> {
                 field: "offerId",
                 message: "no pending clipboard offer with that id".into(),
             })?;
-        let offer = state.pending_clipboard_offers.remove(idx).expect("idx valid");
+        let offer = state
+            .pending_clipboard_offers
+            .remove(idx)
+            .expect("idx valid");
         let signing = state.local_signing_key.clone();
         (offer, signing)
     };

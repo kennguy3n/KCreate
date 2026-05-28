@@ -57,6 +57,11 @@ pub mod message;
 pub mod peer;
 pub mod session;
 
+pub use acl::{AclDecision, AclEntry, AclMode, AclPermission, ProjectAcl};
+pub use clipboard::{
+    decrypt_clipboard_payload, derive_x25519_from_ed25519_public, encrypt_clipboard_payload,
+    ClipboardCryptoError, ClipboardPlaintext,
+};
 pub use clock::LamportClock;
 pub use conflict::{ConflictDecision, ConflictResolver, LastWriterWinsResolver};
 pub use crdt::{classify as classify_operation, CrdtDecision, CrdtResolver, OperationCategory};
@@ -73,12 +78,5 @@ pub use message::{
     LockClaimPayload, LockReleasePayload, Message, OperationBroadcastPayload, PresencePayload,
     ResumeBundlePayload, ResumeRequestPayload, WelcomePayload, WelcomeStatus,
 };
-pub use acl::{AclDecision, AclEntry, AclMode, AclPermission, ProjectAcl};
-pub use clipboard::{
-    decrypt_clipboard_payload, derive_x25519_from_ed25519_public, encrypt_clipboard_payload,
-    ClipboardCryptoError, ClipboardPlaintext,
-};
 pub use peer::{decode_public_key, PeerFingerprint, PeerId, PeerIdentity, PeerKey};
-pub use session::{
-    ProjectSession, RateBudgetDecision, RateLimitKind, SessionConfig, SessionError,
-};
+pub use session::{ProjectSession, RateBudgetDecision, RateLimitKind, SessionConfig, SessionError};

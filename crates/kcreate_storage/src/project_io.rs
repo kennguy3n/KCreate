@@ -653,6 +653,24 @@ impl ProjectStore {
         write_manifest(&self.project_dir, &self.manifest)?;
         Ok(())
     }
+
+    /// Shared SQLite connection. Used by the Phase 8 bridge for
+    /// auxiliary tables that live outside the core ProjectStore API
+    /// (annotations, brand-kit versions, audit-trail) so each table
+    /// can keep its own dedicated `&Connection`-taking helpers.
+    #[must_use]
+    pub const fn connection(&self) -> &rusqlite::Connection {
+        self.db.conn()
+    }
+
+    /// Mutable counterpart of [`Self::connection`]. The caller is
+    /// responsible for serializing writes — `ProjectStore` itself is
+    /// `!Sync`, but we surface `&mut Connection` here so transactions
+    /// can be used from auxiliary modules without re-entering
+    /// `&mut self` borrows on the store.
+    pub const fn connection_mut(&mut self) -> &mut rusqlite::Connection {
+        self.db.conn_mut()
+    }
 }
 
 fn manifest_path(dir: &Path) -> PathBuf {

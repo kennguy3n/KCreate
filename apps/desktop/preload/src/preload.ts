@@ -189,6 +189,9 @@ import type {
   PageNumberFormat,
   JobType,
   ResizeFrameBounds,
+  AnnotationBridge,
+  Annotation,
+  AnnotationListResponse,
 } from "../../shared/scene";
 
 type FrameInfoSnake = {
@@ -2873,6 +2876,44 @@ const phase8: Phase8Bridge = {
   },
 };
 
+// ---------------------------------------------------------------------------
+// Phase 8 (Task 4) — design-review annotations bridge.
+// See `AnnotationBridge` in shared/scene.ts for the contract.
+// ---------------------------------------------------------------------------
+
+const annotation: AnnotationBridge = {
+  async create(request) {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/annotation/create",
+      JSON.stringify(request),
+    )) as string;
+    return JSON.parse(raw) as Annotation;
+  },
+  async reply(request) {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/annotation/reply",
+      JSON.stringify(request),
+    )) as string;
+    return JSON.parse(raw) as Annotation;
+  },
+  async list(request) {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/annotation/list",
+      JSON.stringify(request),
+    )) as string;
+    return JSON.parse(raw) as AnnotationListResponse;
+  },
+  async resolve(request) {
+    return (await ipcRenderer.invoke(
+      "kcreate/annotation/resolve",
+      JSON.stringify(request),
+    )) as boolean;
+  },
+  async delete(id) {
+    return (await ipcRenderer.invoke("kcreate/annotation/delete", id)) as boolean;
+  },
+};
+
 contextBridge.exposeInMainWorld("kcreate", {
   renderer,
   document,
@@ -2918,4 +2959,5 @@ contextBridge.exposeInMainWorld("kcreate", {
   deeplink,
   clipboard,
   phase8,
+  annotation,
 });

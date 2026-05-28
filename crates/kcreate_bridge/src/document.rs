@@ -102,6 +102,17 @@ pub enum DocumentBridgeError {
     /// renderer's structured error mapping stays uniform.
     #[error(transparent)]
     Marketplace(#[from] kcreate_core::MarketplaceError),
+    /// Phase 8 (Task 4): a bridge call that requires collab Editor
+    /// permission was invoked while the local peer is in
+    /// `CollabPermission::Viewer`. Pre-checked BEFORE any local
+    /// mutation so a Viewer doesn't end up with annotations / edits
+    /// that only exist in their local DB and never reach peers (the
+    /// confusing "I added a comment but no-one else sees it" UX).
+    /// Surfaces the same string as
+    /// [`crate::collab::SessionBridgeError::PermissionDenied`] so
+    /// the renderer's error toast logic stays unified.
+    #[error("local peer is in read-only mode: operation requires Editor permission")]
+    PermissionDenied,
     /// Catch-all for subsystem errors (audit, thumbnail, etc.) that
     /// don't warrant their own variant. The string carries the
     /// underlying error's `Display` output.

@@ -101,6 +101,24 @@ pub fn list_for_page(
     Ok(out)
 }
 
+/// Load a single annotation by id. Returns `None` when the id is
+/// not present in the project DB. Used by the bridge resolve /
+/// delete paths so they can broadcast the full row (carrying
+/// `page_id` and `thread_id`) to peers after mutating it.
+pub fn load_annotation(conn: &Connection, id: Uuid) -> Result<Option<Annotation>, DatabaseError> {
+    let mut stmt = conn.prepare(
+        "SELECT id, page_id, author_peer_id, author_name,
+                position_x, position_y, text, timestamp, resolved, thread_id
+         FROM annotations
+         WHERE id = ?1",
+    )?;
+    let mut rows = stmt.query_map([id.to_string()], row_to_annotation)?;
+    match rows.next() {
+        Some(r) => Ok(Some(r?)),
+        None => Ok(None),
+    }
+}
+
 /// List every annotation across every page. Used by the audit
 /// trail export.
 pub fn list_all(

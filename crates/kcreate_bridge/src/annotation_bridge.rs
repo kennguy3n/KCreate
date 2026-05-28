@@ -18,6 +18,20 @@
 //! local edit is authoritative, and peers will eventually reconcile
 //! through resume bundles when the session reconnects. This
 //! mirrors how `session_broadcast_operations` behaves.
+//!
+//! Permission pre-check. When a collab session is active AND the
+//! local peer is in [`CollabPermission::Viewer`], the four mutating
+//! verbs ([`annotation_create`], [`annotation_reply`],
+//! [`annotation_resolve`], [`annotation_delete`]) return
+//! [`DocumentBridgeError::PermissionDenied`] BEFORE touching the
+//! project DB. Without the pre-check a Viewer's annotation would
+//! land in their local DB, the outbound broadcast would silently
+//! fail at [`crate::collab::session_broadcast_annotation`], and the
+//! renderer would show a pin no other peer can see — the same
+//! "I commented but no-one received it" trap that
+//! [`crate::collab::session_broadcast_operations`] guards against
+//! for operation broadcasts. With no collab session active the
+//! pre-check is a no-op (local-first editing is always allowed).
 
 use kcreate_core::annotation::{Annotation, AnnotationFilter, AnnotationPosition};
 use serde::{Deserialize, Serialize};
@@ -101,6 +115,7 @@ pub struct AnnotationResolveRequest {
 /// Create a new top-level annotation. Persists the row, then (if
 /// a collab session is active) broadcasts an upsert to peers.
 pub fn annotation_create(request: AnnotationCreateRequest) -> Result<Annotation> {
+    require_editor_permission()?;
     let ann = Annotation::new(
         request.page_id,
         request.author_peer_id,
@@ -120,6 +135,7 @@ pub fn annotation_create(request: AnnotationCreateRequest) -> Result<Annotation>
 
 /// Post a reply onto an existing annotation thread.
 pub fn annotation_reply(request: AnnotationReplyRequest) -> Result<Annotation> {
+    require_editor_permission()?;
     let parent = with_workspace(|ws| {
         kcreate_storage::annotations::load_annotation(ws.store.connection(), request.parent_id)
             .map_err(|e| DocumentBridgeError::Internal(format!("load_annotation: {e}")))?
@@ -163,6 +179,7 @@ pub fn annotation_list(request: AnnotationListRequest) -> Result<AnnotationListR
 /// Toggle the resolved flag on an annotation. Returns the new
 /// resolved state. Errors if the id is unknown.
 pub fn annotation_resolve(request: AnnotationResolveRequest) -> Result<bool> {
+    require_editor_permission()?;
     let new_state = with_workspace_mut(|ws| {
         let state = kcreate_storage::annotations::set_resolved(
             ws.store.connection(),
@@ -192,6 +209,7 @@ pub fn annotation_resolve(request: AnnotationResolveRequest) -> Result<bool> {
 /// Delete an annotation. Returns `true` if a row was removed,
 /// `false` if the id was unknown.
 pub fn annotation_delete(id: Uuid) -> Result<bool> {
+    require_editor_permission()?;
     // Snapshot the row BEFORE deleting so the broadcast payload
     // carries the full annotation (page_id, thread_id, position)
     // even though the id is gone from the DB by the time we send.
@@ -241,3 +259,30 @@ fn broadcast_upsert(_annotations: Vec<Annotation>) {}
 
 #[cfg(not(feature = "collab"))]
 fn broadcast_delete(_annotations: Vec<Annotation>) {}
+
+// --- Permission helpers -------------------------------------------------
+//
+// Returns `Ok(())` when the local peer is allowed to mutate
+// annotations — either no collab session is active (local-first
+// editing is always allowed) or the session has assigned this peer
+// `CollabPermission::Editor` / `Owner`. Returns
+// `Err(DocumentBridgeError::PermissionDenied)` when a session is
+// active and the local peer is in `CollabPermission::Viewer`.
+//
+// Mirrors the check `crate::collab::session_broadcast_operations`
+// performs before broadcasting, but raised to the bridge boundary so
+// the local write itself is rejected (instead of succeeding locally
+// and silently failing to propagate).
+
+#[cfg(feature = "collab")]
+fn require_editor_permission() -> Result<()> {
+    if crate::collab::session_local_permission() == crate::collab::CollabPermission::Viewer {
+        return Err(DocumentBridgeError::PermissionDenied);
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "collab"))]
+fn require_editor_permission() -> Result<()> {
+    Ok(())
+}

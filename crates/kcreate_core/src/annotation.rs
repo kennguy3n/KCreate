@@ -16,6 +16,7 @@ use uuid::Uuid;
 /// a collaboration session is active) broadcast to peers via the
 /// `Message::AnnotationBroadcast` envelope.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
 pub struct Annotation {
     pub id: Uuid,
     pub page_id: Uuid,
@@ -37,6 +38,7 @@ pub struct Annotation {
 /// `f64` because annotations may be placed on large artboards
 /// where `f32` precision could quantise the click location.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
 pub struct AnnotationPosition {
     pub x: f64,
     pub y: f64,

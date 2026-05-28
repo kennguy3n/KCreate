@@ -3209,6 +3209,30 @@ export type SessionEvent =
       /// Opaque identifier used by `acceptClipboardOffer` /
       /// `rejectClipboardOffer`.
       offerId: string;
+    }
+  | {
+      /// Phase 8 (Task 4): a remote peer broadcast an annotation
+      /// mutation (create / edit / resolve / delete) and the bridge
+      /// has already applied it to the local project DB. The
+      /// renderer's `AnnotationOverlay` listens for this so its
+      /// per-page list re-renders without polling the DB on every
+      /// frame.
+      ///
+      /// `verb` is named `verb` (not `kind`) because the parent
+      /// `SessionEvent` is serde-tagged with `tag = "kind"`. Mirrors
+      /// `kcreate_bridge::collab::SessionEvent::AnnotationsApplied`.
+      kind: "annotationsApplied";
+      /// Peer id that emitted the broadcast.
+      peerId: string;
+      /// `"upsert"` or `"delete"` — snake_case mirror of
+      /// `kcreate_collab::AnnotationBroadcastKind`.
+      verb: string;
+      /// Number of annotations affected. Drives toast text
+      /// pluralization in the UI.
+      count: number;
+      /// Page ids touched by the broadcast. Used by the renderer to
+      /// know which `AnnotationOverlay` instances need to re-fetch.
+      pageIds: string[];
     };
 
 /// Phase 7 (Task 21): permission level for a single entry in the

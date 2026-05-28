@@ -60,6 +60,16 @@ pub struct SessionConfig {
     /// [`crate::message::Message::Presence`] envelopes a single peer
     /// may send per rolling 1-second window. Default 20.
     pub max_presence_per_second: u32,
+    /// Phase 8 (Task 4): maximum number of
+    /// [`crate::message::Message::AnnotationBroadcast`] envelopes a
+    /// single peer may send per rolling 1-second window. Default
+    /// 30 — annotations are user-driven (typing a comment, clicking
+    /// resolve) so legitimate traffic is sub-1 Hz, but batch-paste
+    /// of pins and resume-bundle replay can briefly spike. The
+    /// budget counts envelopes not annotations, so a single
+    /// envelope carrying 50 pins is one event (same accounting as
+    /// `max_ops_per_second`).
+    pub max_annotations_per_second: u32,
     /// Phase 7 (Task 22): how many consecutive 1-second windows a
     /// peer must remain over its budget before the host forcibly
     /// disconnects them. Default 3 (i.e. ~3 seconds sustained
@@ -111,6 +121,7 @@ impl Default for SessionConfig {
             key_rotation_grace: std::time::Duration::from_secs(30),
             max_ops_per_second: 100,
             max_presence_per_second: 20,
+            max_annotations_per_second: 30,
             rate_limit_disconnect_after: 3,
             batch_flush_interval_ms: 50,
             batch_flush_max_ops: 200,
@@ -133,6 +144,8 @@ struct PeerState {
     /// the matching class.
     ops_budget: RateBudget,
     presence_budget: RateBudget,
+    /// Phase 8 (Task 4): annotation-broadcast rate-limit bucket.
+    annotation_budget: RateBudget,
     /// Phase 7 (Task 19): which key rotation epoch the peer has
     /// acknowledged. `0` means the peer hasn't acked any rotation
     /// yet (i.e. they're still on the bootstrap cert). The host
@@ -228,6 +241,11 @@ pub enum RateBudgetDecision {
 pub enum RateLimitKind {
     Operation,
     Presence,
+    /// Phase 8 (Task 4): inbound `AnnotationBroadcast` envelopes.
+    /// Throttled with the same warn-then-kick policy as
+    /// `Operation` / `Presence` so a malicious peer can't flood the
+    /// session with annotation upserts.
+    Annotation,
 }
 
 /// A collaboration session for one project. Holds the local key,
@@ -394,6 +412,7 @@ impl ProjectSession {
                 recent_nonces: VecDeque::with_capacity(self.config.replay_window.min(64)),
                 ops_budget: RateBudget::new(now),
                 presence_budget: RateBudget::new(now),
+                annotation_budget: RateBudget::new(now),
                 acked_key_epoch: 0,
             });
         Ok(())
@@ -422,6 +441,10 @@ impl ProjectSession {
             RateLimitKind::Presence => (
                 self.config.max_presence_per_second,
                 &mut state.presence_budget,
+            ),
+            RateLimitKind::Annotation => (
+                self.config.max_annotations_per_second,
+                &mut state.annotation_budget,
             ),
         };
         budget.record(now, limit)

@@ -1068,7 +1068,22 @@ fn apply_event(ev: InboundEvent) {
             // through the same storage helpers the local edit path
             // uses, then emit an AnnotationsApplied event so the
             // renderer's AnnotationOverlay re-renders.
+            //
+            // Rate-limited with the same warn-then-kick policy as
+            // `Presence` / `OperationBroadcast`. We count one event
+            // per inbound envelope (not per contained annotation)
+            // so a single batched broadcast carrying 50 pins counts
+            // as one network event — matching how OperationBroadcast
+            // accounts for batch-broadcasts.
             Message::AnnotationBroadcast(payload) => {
+                if !apply_rate_limit_check(
+                    state,
+                    &from,
+                    kcreate_collab::RateLimitKind::Annotation,
+                    "annotations",
+                ) {
+                    return;
+                }
                 if payload.project_id == state.journal.project_id() {
                     apply_inbound_annotation_broadcast(state, &from, payload);
                 }

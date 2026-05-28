@@ -2191,6 +2191,54 @@ function registerIpcHandlers(): void {
       requireBridge().rasterPreviewFilter(nodeId, filterJson),
   );
 
+  // -------------------------------------------------------------------
+  // Phase 8 Block B — perspective transform, HSL, color balance, and
+  // mask-aware filter application. All commit-only (no preview path)
+  // because the live-preview surface for these ops re-uses
+  // `kcreate/raster/preview` with the extended `PreviewFilter` enum.
+  // -------------------------------------------------------------------
+  ipcMain.handle(
+    "kcreate/raster/perspective",
+    (_e, nodeId: string, cornersJson: string) => {
+      requireBridge().rasterPerspective(nodeId, cornersJson);
+    },
+  );
+  ipcMain.handle(
+    "kcreate/raster/apply/hsl",
+    (
+      _e,
+      nodeId: string,
+      hue: number,
+      saturation: number,
+      lightness: number,
+    ) => {
+      requireBridge().rasterApplyHsl(nodeId, hue, saturation, lightness);
+    },
+  );
+  ipcMain.handle(
+    "kcreate/raster/apply/color_balance",
+    (
+      _e,
+      nodeId: string,
+      shadowsJson: string,
+      midtonesJson: string,
+      highlightsJson: string,
+    ) => {
+      requireBridge().rasterApplyColorBalance(
+        nodeId,
+        shadowsJson,
+        midtonesJson,
+        highlightsJson,
+      );
+    },
+  );
+  ipcMain.handle(
+    "kcreate/raster/apply/filter_masked",
+    (_e, nodeId: string, filterJson: string, mask: boolean[]) => {
+      requireBridge().rasterApplyFilterMasked(nodeId, filterJson, mask);
+    },
+  );
+
   // ---------------------------------------------------------------------
   // Phase 5 — vector path operations + non-destructive effects.
   // (Block C Tasks 15, 16, 18.) All mutating; see Rust-side

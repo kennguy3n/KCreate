@@ -2727,6 +2727,22 @@ export type RasterPreviewFilter =
       radius: number;
       amount: number;
       threshold: number;
+    }
+  | {
+      // Phase 8 Block B Task 9 — hue (deg), saturation (multiplier),
+      // lightness (additive shift in `[-1, 1]`).
+      type: "hsl";
+      hue: number;
+      saturation: number;
+      lightness: number;
+    }
+  | {
+      // Phase 8 Block B Task 10 — three-way shadows / midtones /
+      // highlights balance, each `[r, g, b]` in `[-1, 1]`.
+      type: "color_balance";
+      shadows: [number, number, number];
+      midtones: [number, number, number];
+      highlights: [number, number, number];
     };
 
 export interface RasterOpsBridge {
@@ -2771,6 +2787,40 @@ export interface RasterOpsBridge {
     nodeId: string,
     filter: RasterPreviewFilter,
   ): Promise<Uint8Array>;
+  // Phase 8 Block B — perspective transform, HSL adjustment, color
+  // balance, and mask-aware filter application. Each commits an
+  // undoable `Operation`. `perspective` accepts the destination
+  // corners in **TL, TR, BL, BR** order in source-pixel space.
+  // `applyFilterMasked` accepts a flat row-major boolean array
+  // whose length must equal `width * height` of the layer; the
+  // bridge composes the filter through a 1-pixel feather kernel at
+  // the mask boundary so the seam does not alias.
+  perspective(
+    nodeId: string,
+    corners: [
+      [number, number],
+      [number, number],
+      [number, number],
+      [number, number],
+    ],
+  ): Promise<void>;
+  applyHsl(
+    nodeId: string,
+    hue: number,
+    saturation: number,
+    lightness: number,
+  ): Promise<void>;
+  applyColorBalance(
+    nodeId: string,
+    shadows: [number, number, number],
+    midtones: [number, number, number],
+    highlights: [number, number, number],
+  ): Promise<void>;
+  applyFilterMasked(
+    nodeId: string,
+    filter: RasterPreviewFilter,
+    mask: boolean[],
+  ): Promise<void>;
 }
 
 // ---------------------------------------------------------------------------

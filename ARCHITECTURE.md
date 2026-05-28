@@ -1197,6 +1197,68 @@ Every preset is a real, validatable `ExportPreset` shape
 (format / scale / optional explicit width-height / optional
 bleed / optional background) — never a placeholder.
 
+## 17m. Image Studio bridge surfaces — perspective / HSL / color balance / mask-aware filter (Phase 8)
+
+Phase 8 Block B extends `kcreate_bridge::raster_ops` with four
+new committal bridge surfaces. The pattern is identical to the
+Phase 5 raster ops:
+
+1. `load_layer_pixels(node_id)` — decode the PNG blob the
+   `RasterImageMeta` points at into a flat `LayerPixels`
+   (`rgba: Vec<u8>`, `width`, `height`).
+2. Run the operation outside the workspace lock so the
+   filter / warp doesn't block scene sync. All four surfaces
+   are row-parallel via `rayon`.
+3. `replace_layer_pixels(...)` — re-encode PNG, store a new
+   blob, point the node's metadata at the new hash, optionally
+   resize the node `Bounds`, and append an undoable
+   [`Operation`] capturing the before/after snapshot.
+
+The four surfaces:
+
+- **`apply_perspective(node_id, corners: [(f64, f64); 4])`** —
+  delegates to `kcreate_raster::transform::perspective_transform`
+  (inverse-mapped bilinear warp) and resizes the node bounds
+  whenever the warped canvas size changes, so the renderer
+  doesn't letterbox the output.
+- **`apply_hsl(node_id, hue, saturation, lightness)`** —
+  applies `AdjustmentLayer::HueSaturation` in place. Bounds
+  preserved.
+- **`apply_color_balance(node_id, shadows, midtones,
+  highlights)`** — applies `AdjustmentLayer::ColorBalance`
+  in place. Bounds preserved.
+- **`apply_filter_masked(node_id, filter, mask)`** — runs any
+  `PreviewFilter` variant against the layer's pixels and
+  composes the filtered output over the source through a
+  per-pixel float weight derived from the boolean mask. The
+  weight is the 5-tap (centre + N/S/E/W) average of the
+  mask with out-of-bounds neighbours clamped to the centre;
+  this gives a 1-pixel feather at boundaries without
+  re-implementing a separable blur. Fully unmasked pixels are
+  copied bit-exact, fully masked pixels take the filtered
+  output verbatim, boundary pixels blend on the float curve
+  with alpha included so transparency reveals smoothly.
+  Mask length must equal `width * height`; mismatches return
+  a structured error rather than panicking.
+
+The live-preview surface (`PreviewFilter`) gains two new
+variants — `Hsl { hue, saturation, lightness }` and
+`ColorBalance { shadows: [f32; 3], midtones: [f32; 3],
+highlights: [f32; 3] }` — so the renderer can drive HSL and
+color-balance sliders through the existing
+`raster_preview_filter` path without committing.
+
+N-API marshalling in `kcreate_bridge::lib`:
+`raster_perspective(node_id, corners_json)`,
+`raster_apply_hsl(node_id, hue, saturation, lightness)`,
+`raster_apply_color_balance(node_id, shadows_json,
+midtones_json, highlights_json)`,
+`raster_apply_filter_masked(node_id, filter_json, mask: Vec<bool>)`.
+TypeScript mirrors land in
+`apps/desktop/shared/scene.ts` (`RasterOpsBridge.{perspective,
+applyHsl, applyColorBalance, applyFilterMasked}`) with the
+`RasterPreviewFilter` discriminated union extended in lockstep.
+
 ## 18. Resource optimization
 
 - **Startup.** Lazy-load model packs; precompile no shaders we won't

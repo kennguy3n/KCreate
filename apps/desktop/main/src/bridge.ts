@@ -670,6 +670,31 @@ export interface Bridge {
     radius: number,
   ): void;
   rasterPreviewFilter(nodeId: string, filterJson: string): Buffer;
+  // Phase 8 Block B — perspective transform, HSL adjustment, color
+  // balance adjustment, and mask-aware filter application. Each
+  // mutates the RasterLayer node in place and records an undoable
+  // `Operation`. The mask-aware variant accepts a flat row-major
+  // boolean array whose length must equal `width * height` of the
+  // layer; it composes the filter through a 1-pixel feather kernel
+  // at the mask boundary so the seam does not alias.
+  rasterPerspective(nodeId: string, cornersJson: string): void;
+  rasterApplyHsl(
+    nodeId: string,
+    hue: number,
+    saturation: number,
+    lightness: number,
+  ): void;
+  rasterApplyColorBalance(
+    nodeId: string,
+    shadowsJson: string,
+    midtonesJson: string,
+    highlightsJson: string,
+  ): void;
+  rasterApplyFilterMasked(
+    nodeId: string,
+    filterJson: string,
+    mask: boolean[],
+  ): void;
   // Phase 5 — vector path operations + non-destructive effects
   // (Block C Tasks 15, 16, 18). All mutate the VectorLayer's
   // stored geometry (simplify / smooth / offset) or its NodeStyle

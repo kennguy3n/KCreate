@@ -2095,6 +2095,61 @@ const rasterOps: RasterOpsBridge = {
     // wrap it in `ImageData` without a copy.
     return buf instanceof Uint8Array ? buf : new Uint8Array(buf);
   },
+  async perspective(
+    nodeId: string,
+    corners: [
+      [number, number],
+      [number, number],
+      [number, number],
+      [number, number],
+    ],
+  ): Promise<void> {
+    await ipcRenderer.invoke(
+      "kcreate/raster/perspective",
+      nodeId,
+      JSON.stringify(corners),
+    );
+  },
+  async applyHsl(
+    nodeId: string,
+    hue: number,
+    saturation: number,
+    lightness: number,
+  ): Promise<void> {
+    await ipcRenderer.invoke(
+      "kcreate/raster/apply/hsl",
+      nodeId,
+      hue,
+      saturation,
+      lightness,
+    );
+  },
+  async applyColorBalance(
+    nodeId: string,
+    shadows: [number, number, number],
+    midtones: [number, number, number],
+    highlights: [number, number, number],
+  ): Promise<void> {
+    await ipcRenderer.invoke(
+      "kcreate/raster/apply/color_balance",
+      nodeId,
+      JSON.stringify(shadows),
+      JSON.stringify(midtones),
+      JSON.stringify(highlights),
+    );
+  },
+  async applyFilterMasked(
+    nodeId: string,
+    filter: RasterPreviewFilter,
+    mask: boolean[],
+  ): Promise<void> {
+    await ipcRenderer.invoke(
+      "kcreate/raster/apply/filter_masked",
+      nodeId,
+      JSON.stringify(filter),
+      mask,
+    );
+  },
 };
 
 // ---------------------------------------------------------------------------

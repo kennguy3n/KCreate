@@ -821,32 +821,59 @@ artifact-publishing capabilities the proposal calls for.
       in `crates/kcreate_raster/src/transform.rs` computes the
       3×3 projective matrix from the 4 destination corners and
       applies inverse mapping with bilinear interpolation,
-      row-parallel via rayon. Identity (corners equal to the
-      source rectangle in TL/TR/BL/BR order) preserves pixels;
-      translated-canvas case covered by
-      `image_studio_advanced.rs`.
+      row-parallel via rayon. Bridge surface
+      `raster_ops::apply_perspective` decodes the layer's PNG
+      blob, warps it, re-encodes, and resizes the node's
+      `Bounds` to match the new canvas. N-API:
+      `raster_perspective(node_id, corners_json)`.
 - [x] **Task 8: Color range selection.** `select_by_color_range`
       in `crates/kcreate_ai/src/color_range.rs` produces a
       boolean mask using CIE76 ΔE in Lab space for perceptual
       fuzziness. Row-parallel via rayon.
-- [x] **Task 9 (core variant): HSL adjustment layer.**
+- [x] **Task 9: HSL adjustment layer + bridge.**
       `AdjustmentLayer::HueSaturation { hue, saturation,
-      lightness }` already exists in
-      `crates/kcreate_raster/src/layer.rs` — Phase 5 shipped
-      the variant; Phase 8 adds dedicated regression coverage
-      in `image_studio_advanced.rs`.
-- [x] **Task 10: Color balance adjustment layer.**
+      lightness }` in `crates/kcreate_raster/src/layer.rs`,
+      plus the destructive bridge surface
+      `raster_ops::apply_hsl` and the live-preview
+      `PreviewFilter::Hsl` arm. N-API:
+      `raster_apply_hsl(node_id, hue, saturation, lightness)`.
+- [x] **Task 10: Color balance adjustment layer + bridge.**
       `AdjustmentLayer::ColorBalance { shadows, midtones,
-      highlights }` in `crates/kcreate_raster/src/layer.rs`
-      applies three-way lift/gamma/gain in shadow / midtone /
-      highlight tonal ranges using a Gaussian-like falloff
-      centred on luminance 0.15 / 0.5 / 0.85. Identity (all
-      zeros) leaves pixels untouched.
-- [x] **Task 12 (partial): Image Studio tests.**
+      highlights }` applies three-way lift/gamma/gain in
+      shadow / midtone / highlight tonal ranges using a
+      Gaussian-like falloff centred on luminance 0.15 / 0.5 /
+      0.85. Bridge surface `raster_ops::apply_color_balance`
+      plus the live-preview `PreviewFilter::ColorBalance` arm.
+      N-API: `raster_apply_color_balance(node_id, shadows_json,
+      midtones_json, highlights_json)`.
+- [x] **Task 11: Selection-based filter application.**
+      `raster_ops::apply_filter_masked(node_id, filter, mask)`
+      runs any `PreviewFilter` variant against a layer's
+      pixels but only commits the result where `mask[i] ==
+      true`. A 5-tap (centre + N/S/E/W) average produces a
+      1-pixel feather at the mask boundary so the seam does
+      not alias; fully unmasked pixels are copied bit-exact,
+      fully masked pixels take the filtered output verbatim,
+      boundary pixels blend on the float weight curve
+      (alpha included so transparency reveals naturally).
+      Mask shape mismatches surface a structured error
+      instead of panicking. N-API:
+      `raster_apply_filter_masked(node_id, filter_json, mask)`.
+- [x] **Task 12: Image Studio tests.**
       `crates/kcreate_tests/tests/image_studio_advanced.rs`
       covers perspective identity + translation, color range
       fuzziness boundaries, HSL roundtrip identity, color
-      balance neutrality.
+      balance neutrality, and the `PreviewFilter` wire shape
+      (Levels / Curves / Blur / Sharpen / Hsl / ColorBalance
+      tags + snake_case fields locked against `scene.ts`).
+      Bridge integration tests in
+      `crates/kcreate_bridge/src/raster_ops.rs::tests` cover
+      perspective canvas growth, HSL identity vs. hue-rotate,
+      color balance identity, masked-filter edge cases
+      (wrong-size mask error, all-false mask preserves blob,
+      all-true mask rewrites blob, operation log captures
+      `{mask_len, mask_true}`) plus the feather-kernel
+      math (zero / one / boundary 0.2 / 0.8).
 
 ### Block C — Missing Layout Studio & Brand Hub Features (Tasks 13–18)
 - [x] **Task 13: Page-numbering tokens.**

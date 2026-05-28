@@ -1657,8 +1657,14 @@ pub fn raster_apply_color_balance(
 
 /// Apply a filter to a raster layer only where `mask[i] == true`,
 /// with a 1-pixel feather at the mask boundary. The `mask` argument
-/// is a flat row-major boolean array; its length must equal
-/// `layer_width * layer_height`. `filter_json` decodes to the same
+/// is a flat row-major byte buffer (`Uint8Array` from JS); its
+/// length must equal `layer_width * layer_height`. Each byte is
+/// interpreted as a boolean selection predicate: `0` means
+/// "not selected", any non-zero value means "selected". Sending the
+/// mask as bytes (rather than a JS `boolean[]`) avoids the per-
+/// element structured-clone cost — an 8.3 MP 4K mask costs
+/// `8.3 MiB` of typed-array memcpy instead of `~50 MiB` of JS
+/// boolean conversion. `filter_json` decodes to the same
 /// [`PreviewFilter`](raster_ops::PreviewFilter) discriminated union
 /// the live-preview surface uses.
 #[napi]
@@ -1666,12 +1672,16 @@ pub fn raster_apply_color_balance(
 pub fn raster_apply_filter_masked(
     node_id: String,
     filter_json: String,
-    mask: Vec<bool>,
+    mask: Buffer,
 ) -> NapiResult<()> {
     let id = parse_uuid(&node_id)?;
     let filter: raster_ops::PreviewFilter = serde_json::from_str(&filter_json)
         .map_err(|e| NapiError::from_reason(format!("invalid filter JSON: {e}")))?;
-    raster_ops::apply_filter_masked(id, filter, mask).map_err(map_doc_err)
+    // `Buffer::as_ref()` borrows the JS-allocated bytes; copy them
+    // into an owned `Vec<u8>` so the workspace lock inside
+    // `apply_filter_masked` can outlive the call.
+    let mask_bytes: Vec<u8> = mask.as_ref().to_vec();
+    raster_ops::apply_filter_masked(id, filter, mask_bytes).map_err(map_doc_err)
 }
 
 // -----------------------------------------------------------------------------

@@ -69,6 +69,7 @@ const TILE_SIZE: u32 = 256;
 /// `RGB`A bytes + canonical width/height pulled from the project's
 /// blob store. Returned by `load_layer_pixels` so the slow path can
 /// run outside the workspace lock.
+#[derive(Clone)]
 struct LayerPixels {
     rgba: Vec<u8>,
     width: u32,
@@ -459,12 +460,17 @@ pub enum PreviewFilter {
     },
 }
 
-/// Return the RGBA bytes a filter *would* produce, without mutating
-/// the document. The caller uses this for live previews driven by
-/// a debounced slider.
-pub fn preview_filter(node_id: Uuid, filter: PreviewFilter) -> Result<(Vec<u8>, u32, u32)> {
-    let mut pixels = load_layer_pixels(node_id)?;
-    let (out_rgba, out_w, out_h) = match filter {
+/// Apply a [`PreviewFilter`] in place over a layer's RGBA buffer.
+/// All currently supported variants are dimension-preserving, so the
+/// caller's `LayerPixels::{width, height}` remain authoritative.
+///
+/// This is the single source of truth for how each `PreviewFilter`
+/// variant maps to a `kcreate_raster` operation; both the live-
+/// preview path (`preview_filter`) and the committal masked-filter
+/// path (`apply_filter_masked`) drive their work through this helper
+/// so a new variant only has to be added in one place.
+fn apply_filter_in_place(pixels: &mut LayerPixels, filter: &PreviewFilter) -> Result<()> {
+    match filter {
         PreviewFilter::Levels {
             black_point,
             white_point,
@@ -473,12 +479,11 @@ pub fn preview_filter(node_id: Uuid, filter: PreviewFilter) -> Result<(Vec<u8>, 
             apply_adjustments_in_place(
                 &mut pixels.rgba,
                 &[AdjustmentLayer::Levels {
-                    black_point,
-                    white_point,
-                    gamma,
+                    black_point: *black_point,
+                    white_point: *white_point,
+                    gamma: *gamma,
                 }],
             );
-            (pixels.rgba, pixels.width, pixels.height)
         }
         PreviewFilter::Curves { points } => {
             let curve_points: Vec<CurvePoint> = points
@@ -486,17 +491,16 @@ pub fn preview_filter(node_id: Uuid, filter: PreviewFilter) -> Result<(Vec<u8>, 
                 .map(|(t, v)| CurvePoint::new(*t, *v))
                 .collect();
             apply_adjustments_in_place(&mut pixels.rgba, &[AdjustmentLayer::Curves(curve_points)]);
-            (pixels.rgba, pixels.width, pixels.height)
         }
         PreviewFilter::Blur { radius, kind } => {
             let grid =
                 TileGrid::from_image(&pixels.rgba, pixels.width, pixels.height, TILE_SIZE)
                     .map_err(|e| DocumentBridgeError::Io(std::io::Error::other(e.to_string())))?;
             let blurred = match kind {
-                BlurKind::Gaussian => filters::gaussian_blur(&grid, radius),
+                BlurKind::Gaussian => filters::gaussian_blur(&grid, *radius),
                 BlurKind::Box => filters::box_blur(&grid, radius.max(0.0).round() as u32),
             };
-            (blurred.to_image(), blurred.width, blurred.height)
+            pixels.rgba = blurred.to_image();
         }
         PreviewFilter::Sharpen {
             radius,
@@ -506,8 +510,8 @@ pub fn preview_filter(node_id: Uuid, filter: PreviewFilter) -> Result<(Vec<u8>, 
             let grid =
                 TileGrid::from_image(&pixels.rgba, pixels.width, pixels.height, TILE_SIZE)
                     .map_err(|e| DocumentBridgeError::Io(std::io::Error::other(e.to_string())))?;
-            let sharp = filters::unsharp_mask(&grid, radius, amount, threshold);
-            (sharp.to_image(), sharp.width, sharp.height)
+            let sharp = filters::unsharp_mask(&grid, *radius, *amount, *threshold);
+            pixels.rgba = sharp.to_image();
         }
         PreviewFilter::Hsl {
             hue,
@@ -517,12 +521,11 @@ pub fn preview_filter(node_id: Uuid, filter: PreviewFilter) -> Result<(Vec<u8>, 
             apply_adjustments_in_place(
                 &mut pixels.rgba,
                 &[AdjustmentLayer::HueSaturation {
-                    hue,
-                    saturation,
-                    lightness,
+                    hue: *hue,
+                    saturation: *saturation,
+                    lightness: *lightness,
                 }],
             );
-            (pixels.rgba, pixels.width, pixels.height)
         }
         PreviewFilter::ColorBalance {
             shadows,
@@ -532,15 +535,23 @@ pub fn preview_filter(node_id: Uuid, filter: PreviewFilter) -> Result<(Vec<u8>, 
             apply_adjustments_in_place(
                 &mut pixels.rgba,
                 &[AdjustmentLayer::ColorBalance {
-                    shadows,
-                    midtones,
-                    highlights,
+                    shadows: *shadows,
+                    midtones: *midtones,
+                    highlights: *highlights,
                 }],
             );
-            (pixels.rgba, pixels.width, pixels.height)
         }
-    };
-    Ok((out_rgba, out_w, out_h))
+    }
+    Ok(())
+}
+
+/// Return the RGBA bytes a filter *would* produce, without mutating
+/// the document. The caller uses this for live previews driven by
+/// a debounced slider.
+pub fn preview_filter(node_id: Uuid, filter: PreviewFilter) -> Result<(Vec<u8>, u32, u32)> {
+    let mut pixels = load_layer_pixels(node_id)?;
+    apply_filter_in_place(&mut pixels, &filter)?;
+    Ok((pixels.rgba, pixels.width, pixels.height))
 }
 
 // -----------------------------------------------------------------------------
@@ -672,134 +683,57 @@ impl std::fmt::Display for MaskShapeMismatch {
 impl std::error::Error for MaskShapeMismatch {}
 
 /// Compute a per-pixel float feather weight in `[0.0, 1.0]` from the
-/// raw boolean mask. The weight at pixel `(x, y)` is the average of
+/// raw byte-coded selection mask. The mask is one byte per pixel:
+/// `0` means "not selected", any non-zero byte means "selected".
+/// (Bytes carry the same information as the boolean predicate but
+/// cross the IPC boundary without per-element conversion — a 4K mask
+/// fits in an 8.3 MB `Uint8Array` instead of an 8.3 M-element JS
+/// boolean array.) The weight at pixel `(x, y)` is the average of
 /// itself and its 4-connected neighbours (north / south / east /
-/// west), with `true => 1.0` and `false => 0.0`. Pixels in the
-/// interior of a masked / unmasked region therefore stay exactly at
-/// `1.0` / `0.0` (no work for `apply_filter_masked` to do), while
-/// pixels on the mask boundary land somewhere in between, giving us
-/// a 1px feather kernel without re-implementing a separable blur.
+/// west), with selected => `1.0` and not-selected => `0.0`. Pixels
+/// in the interior of a selected / unselected region therefore stay
+/// exactly at `1.0` / `0.0` (no work for `apply_filter_masked` to
+/// do), while pixels on the mask boundary land somewhere in
+/// between, giving us a 1px feather kernel without re-implementing
+/// a separable blur.
 ///
 /// Border pixels treat out-of-bounds neighbours as having the same
 /// mask value as the centre — i.e. the kernel is "clamped" at the
 /// canvas edge. This avoids a spurious feather where the canvas
 /// edge happens to be a mask boundary.
-fn feather_mask_weights(mask: &[bool], width: u32, height: u32) -> Vec<f32> {
+fn feather_mask_weights(mask: &[u8], width: u32, height: u32) -> Vec<f32> {
     let w = width as usize;
     let h = height as usize;
     let mut weights = vec![0.0_f32; w * h];
+    let bit = |byte: u8| u8::from(byte != 0);
     weights.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
         for (x, slot) in row.iter_mut().enumerate() {
-            let centre = mask[y * w + x];
-            let west = if x > 0 { mask[y * w + x - 1] } else { centre };
+            let centre = bit(mask[y * w + x]);
+            let west = if x > 0 {
+                bit(mask[y * w + x - 1])
+            } else {
+                centre
+            };
             let east = if x + 1 < w {
-                mask[y * w + x + 1]
+                bit(mask[y * w + x + 1])
             } else {
                 centre
             };
-            let north = if y > 0 { mask[(y - 1) * w + x] } else { centre };
+            let north = if y > 0 {
+                bit(mask[(y - 1) * w + x])
+            } else {
+                centre
+            };
             let south = if y + 1 < h {
-                mask[(y + 1) * w + x]
+                bit(mask[(y + 1) * w + x])
             } else {
                 centre
             };
-            let count = u8::from(centre)
-                + u8::from(west)
-                + u8::from(east)
-                + u8::from(north)
-                + u8::from(south);
+            let count = centre + west + east + north + south;
             *slot = f32::from(count) / 5.0;
         }
     });
     weights
-}
-
-/// Render the supplied filter against `pixels` (RGBA8, row-major,
-/// canonical dimensions) without touching the workspace. Returns a
-/// new RGBA buffer of the same size — masked-filter application
-/// composes the filtered buffer over the original through the
-/// feather kernel.
-fn render_filter_to_buffer(pixels: &LayerPixels, filter: &PreviewFilter) -> Result<Vec<u8>> {
-    match filter {
-        PreviewFilter::Levels {
-            black_point,
-            white_point,
-            gamma,
-        } => {
-            let mut buf = pixels.rgba.clone();
-            apply_adjustments_in_place(
-                &mut buf,
-                &[AdjustmentLayer::Levels {
-                    black_point: *black_point,
-                    white_point: *white_point,
-                    gamma: *gamma,
-                }],
-            );
-            Ok(buf)
-        }
-        PreviewFilter::Curves { points } => {
-            let mut buf = pixels.rgba.clone();
-            let curve_points: Vec<CurvePoint> = points
-                .iter()
-                .map(|(t, v)| CurvePoint::new(*t, *v))
-                .collect();
-            apply_adjustments_in_place(&mut buf, &[AdjustmentLayer::Curves(curve_points)]);
-            Ok(buf)
-        }
-        PreviewFilter::Blur { radius, kind } => {
-            let grid =
-                TileGrid::from_image(&pixels.rgba, pixels.width, pixels.height, TILE_SIZE)
-                    .map_err(|e| DocumentBridgeError::Io(std::io::Error::other(e.to_string())))?;
-            let blurred = match kind {
-                BlurKind::Gaussian => filters::gaussian_blur(&grid, *radius),
-                BlurKind::Box => filters::box_blur(&grid, radius.max(0.0).round() as u32),
-            };
-            Ok(blurred.to_image())
-        }
-        PreviewFilter::Sharpen {
-            radius,
-            amount,
-            threshold,
-        } => {
-            let grid =
-                TileGrid::from_image(&pixels.rgba, pixels.width, pixels.height, TILE_SIZE)
-                    .map_err(|e| DocumentBridgeError::Io(std::io::Error::other(e.to_string())))?;
-            let sharp = filters::unsharp_mask(&grid, *radius, *amount, *threshold);
-            Ok(sharp.to_image())
-        }
-        PreviewFilter::Hsl {
-            hue,
-            saturation,
-            lightness,
-        } => {
-            let mut buf = pixels.rgba.clone();
-            apply_adjustments_in_place(
-                &mut buf,
-                &[AdjustmentLayer::HueSaturation {
-                    hue: *hue,
-                    saturation: *saturation,
-                    lightness: *lightness,
-                }],
-            );
-            Ok(buf)
-        }
-        PreviewFilter::ColorBalance {
-            shadows,
-            midtones,
-            highlights,
-        } => {
-            let mut buf = pixels.rgba.clone();
-            apply_adjustments_in_place(
-                &mut buf,
-                &[AdjustmentLayer::ColorBalance {
-                    shadows: *shadows,
-                    midtones: *midtones,
-                    highlights: *highlights,
-                }],
-            );
-            Ok(buf)
-        }
-    }
 }
 
 /// Apply a filter to a raster layer but only where `mask[i] == true`,
@@ -820,7 +754,7 @@ fn render_filter_to_buffer(pixels: &LayerPixels, filter: &PreviewFilter) -> Resu
 ///
 /// Alpha is blended on the same weight curve so feathered edges
 /// reveal the underlying transparency naturally.
-pub fn apply_filter_masked(node_id: Uuid, filter: PreviewFilter, mask: Vec<bool>) -> Result<()> {
+pub fn apply_filter_masked(node_id: Uuid, filter: PreviewFilter, mask: Vec<u8>) -> Result<()> {
     let pixels = load_layer_pixels(node_id)?;
     let total = (pixels.width as usize) * (pixels.height as usize);
     if mask.len() != total {
@@ -833,7 +767,13 @@ pub fn apply_filter_masked(node_id: Uuid, filter: PreviewFilter, mask: Vec<bool>
         )));
     }
 
-    let filtered = render_filter_to_buffer(&pixels, &filter)?;
+    // Run the filter through the same helper the live-preview path
+    // uses so the masked and unmasked outputs are pixel-equivalent at
+    // mask=1, then composite the result over the source through the
+    // feathered mask.
+    let mut filtered_pixels = pixels.clone();
+    apply_filter_in_place(&mut filtered_pixels, &filter)?;
+    let filtered = filtered_pixels.rgba;
     if filtered.len() != pixels.rgba.len() {
         // Defensive: every supported filter is dimension-preserving,
         // but if a future variant changes size we surface that as a
@@ -871,6 +811,7 @@ pub fn apply_filter_masked(node_id: Uuid, filter: PreviewFilter, mask: Vec<bool>
             }
         });
 
+    let mask_true = mask.iter().filter(|b| **b != 0).count();
     replace_layer_pixels(
         node_id,
         out,
@@ -880,7 +821,7 @@ pub fn apply_filter_masked(node_id: Uuid, filter: PreviewFilter, mask: Vec<bool>
         serde_json::json!({
             "filter": filter,
             "mask_len": mask.len(),
-            "mask_true": mask.iter().filter(|b| **b).count(),
+            "mask_true": mask_true,
         }),
         false,
     )
@@ -896,15 +837,28 @@ mod tests {
     use serial_test::serial;
 
     #[test]
-    fn feather_weights_zero_when_mask_all_false() {
-        let mask = vec![false; 9];
+    fn feather_weights_zero_when_mask_all_unset() {
+        let mask = vec![0u8; 9];
         let weights = feather_mask_weights(&mask, 3, 3);
         assert_eq!(weights, vec![0.0; 9]);
     }
 
     #[test]
-    fn feather_weights_one_when_mask_all_true() {
-        let mask = vec![true; 9];
+    fn feather_weights_one_when_mask_all_set() {
+        let mask = vec![1u8; 9];
+        let weights = feather_mask_weights(&mask, 3, 3);
+        for w in weights {
+            assert!((w - 1.0).abs() < f32::EPSILON, "expected 1.0, got {w}");
+        }
+    }
+
+    #[test]
+    fn feather_weights_treat_any_nonzero_byte_as_selected() {
+        // Selection masks crossing the IPC boundary as Uint8Array
+        // may carry arbitrary byte values (e.g. 255 from a tool that
+        // pre-multiplied a coverage value). Any non-zero byte must
+        // count as fully selected, identical to a `1`.
+        let mask = vec![255u8; 9];
         let weights = feather_mask_weights(&mask, 3, 3);
         for w in weights {
             assert!((w - 1.0).abs() < f32::EPSILON, "expected 1.0, got {w}");
@@ -913,25 +867,25 @@ mod tests {
 
     #[test]
     fn feather_weights_intermediate_at_boundary() {
-        // A horizontal step: top row unmasked, bottom row masked.
-        // The boundary pixels should average (centre + 4 neighbours)
-        // and produce intermediate weights.
+        // A horizontal step: top row unselected, bottom row
+        // selected. The boundary pixels should average (centre + 4
+        // neighbours) and produce intermediate weights.
         //
-        //   false false false
-        //   true  true  true
+        //   0 0 0
+        //   1 1 1
         //
-        // Top-row centres see (false, false, true [south], false,
-        // false) when neighbours-out-of-bounds clamp to the centre
-        // value: top-row pixels actually see (centre=F, west=F,
-        // east=F, north=F (clamp), south=T) → 1/5.
-        let mask = vec![false, false, false, true, true, true];
+        // Top-row centres see (0, 0, 1 [south], 0, 0) when
+        // neighbours-out-of-bounds clamp to the centre value:
+        // top-row pixels actually see (centre=0, west=0, east=0,
+        // north=0 (clamp), south=1) → 1/5.
+        let mask = vec![0u8, 0, 0, 1, 1, 1];
         let weights = feather_mask_weights(&mask, 3, 2);
-        // Top row: each centre sees one true neighbour (south).
+        // Top row: each centre sees one selected neighbour (south).
         for w in &weights[0..3] {
             assert!((w - 0.2).abs() < 1e-4, "expected 0.2, got {w}");
         }
-        // Bottom row: each centre + west + east + south(clamp)=T and
-        // north=F → 4/5.
+        // Bottom row: each centre + west + east + south(clamp)=1
+        // and north=0 → 4/5.
         for w in &weights[3..6] {
             assert!((w - 0.8).abs() < 1e-4, "expected 0.8, got {w}");
         }
@@ -1131,7 +1085,7 @@ mod tests {
             white_point: 1.0,
             gamma: 1.0,
         };
-        let bad_mask = vec![true; 64 + 1];
+        let bad_mask = vec![1u8; 64 + 1];
         let err = apply_filter_masked(node_id, filter, bad_mask).expect_err("size mismatch");
         let msg = err.to_string();
         assert!(
@@ -1156,7 +1110,7 @@ mod tests {
             saturation: 0.0,
             lightness: 0.0,
         };
-        let mask = vec![false; 64];
+        let mask = vec![0u8; 64];
         apply_filter_masked(node_id, filter, mask).expect("masked filter");
         let after = raster_meta(node_id);
         assert_eq!(
@@ -1182,7 +1136,7 @@ mod tests {
             saturation: 1.0,
             lightness: 0.0,
         };
-        let mask = vec![true; 256];
+        let mask = vec![1u8; 256];
         apply_filter_masked(node_id, filter, mask).expect("masked filter");
         let after = raster_meta(node_id);
         assert_ne!(
@@ -1201,10 +1155,10 @@ mod tests {
             white_point: 1.0,
             gamma: 1.0,
         };
-        // Half-true mask.
-        let mut mask = vec![false; 64];
+        // Half-selected mask.
+        let mut mask = vec![0u8; 64];
         for slot in mask.iter_mut().take(32) {
-            *slot = true;
+            *slot = 1;
         }
         apply_filter_masked(node_id, filter, mask).expect("masked filter");
         // The most recent operation must capture mask_len + mask_true.

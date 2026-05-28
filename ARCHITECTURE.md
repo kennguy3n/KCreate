@@ -1253,7 +1253,9 @@ N-API marshalling in `kcreate_bridge::lib`:
 `raster_apply_hsl(node_id, hue, saturation, lightness)`,
 `raster_apply_color_balance(node_id, shadows_json,
 midtones_json, highlights_json)`,
-`raster_apply_filter_masked(node_id, filter_json, mask: Vec<bool>)`.
+`raster_apply_filter_masked(node_id, filter_json, mask: Buffer)`
+(mask is a flat row-major `Uint8Array`: byte `0` means
+unselected, any non-zero byte means selected).
 TypeScript mirrors land in
 `apps/desktop/shared/scene.ts` (`RasterOpsBridge.{perspective,
 applyHsl, applyColorBalance, applyFilterMasked}`) with the

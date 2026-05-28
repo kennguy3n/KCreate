@@ -2234,7 +2234,7 @@ function registerIpcHandlers(): void {
   );
   ipcMain.handle(
     "kcreate/raster/apply/filter_masked",
-    (_e, nodeId: string, filterJson: string, mask: boolean[]) => {
+    (_e, nodeId: string, filterJson: string, mask: Uint8Array) => {
       requireBridge().rasterApplyFilterMasked(nodeId, filterJson, mask);
     },
   );

@@ -2791,10 +2791,13 @@ export interface RasterOpsBridge {
   // balance, and mask-aware filter application. Each commits an
   // undoable `Operation`. `perspective` accepts the destination
   // corners in **TL, TR, BL, BR** order in source-pixel space.
-  // `applyFilterMasked` accepts a flat row-major boolean array
-  // whose length must equal `width * height` of the layer; the
-  // bridge composes the filter through a 1-pixel feather kernel at
-  // the mask boundary so the seam does not alias.
+  // `applyFilterMasked` accepts a flat row-major `Uint8Array` whose
+  // length must equal `width * height` of the layer; each byte is a
+  // selection predicate (`0` = not selected, any non-zero = selected).
+  // Byte-array transport keeps large masks cheap to send across the
+  // IPC boundary versus a JS `boolean[]`. The bridge composes the
+  // filter through a 1-pixel feather kernel at the mask boundary so
+  // the seam does not alias.
   perspective(
     nodeId: string,
     corners: [
@@ -2819,7 +2822,7 @@ export interface RasterOpsBridge {
   applyFilterMasked(
     nodeId: string,
     filter: RasterPreviewFilter,
-    mask: boolean[],
+    mask: Uint8Array,
   ): Promise<void>;
 }
 

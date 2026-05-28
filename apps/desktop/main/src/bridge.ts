@@ -690,10 +690,15 @@ export interface Bridge {
     midtonesJson: string,
     highlightsJson: string,
   ): void;
+  // `mask` is a flat row-major `Uint8Array` of length
+  // `layer_width * layer_height`. Byte `0` means "not selected";
+  // any non-zero byte means "selected". Crossing the IPC boundary
+  // as bytes (rather than `boolean[]`) avoids per-element
+  // structured-clone work on large masks.
   rasterApplyFilterMasked(
     nodeId: string,
     filterJson: string,
-    mask: boolean[],
+    mask: Uint8Array,
   ): void;
   // Phase 5 — vector path operations + non-destructive effects
   // (Block C Tasks 15, 16, 18). All mutate the VectorLayer's

@@ -2141,7 +2141,7 @@ const rasterOps: RasterOpsBridge = {
   async applyFilterMasked(
     nodeId: string,
     filter: RasterPreviewFilter,
-    mask: boolean[],
+    mask: Uint8Array,
   ): Promise<void> {
     await ipcRenderer.invoke(
       "kcreate/raster/apply/filter_masked",

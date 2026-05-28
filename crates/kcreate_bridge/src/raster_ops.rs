@@ -461,8 +461,16 @@ pub enum PreviewFilter {
 }
 
 /// Apply a [`PreviewFilter`] in place over a layer's RGBA buffer.
-/// All currently supported variants are dimension-preserving, so the
-/// caller's `LayerPixels::{width, height}` remain authoritative.
+///
+/// All currently supported variants are dimension-preserving, but
+/// the helper still re-syncs `pixels.{width, height}` from the
+/// underlying operation's output (a no-op today for every variant)
+/// so the contract holds if a future variant changes dimensions. A
+/// `debug_assert!` at the end of the function pins the
+/// `rgba.len() == 4 * width * height` invariant — any future variant
+/// that violates it trips the assertion in debug builds and
+/// `preview_filter` / `apply_filter_masked` continue to return /
+/// composite against coherent dimensions in release builds.
 ///
 /// This is the single source of truth for how each `PreviewFilter`
 /// variant maps to a `kcreate_raster` operation; both the live-
@@ -501,6 +509,8 @@ fn apply_filter_in_place(pixels: &mut LayerPixels, filter: &PreviewFilter) -> Re
                 BlurKind::Box => filters::box_blur(&grid, radius.max(0.0).round() as u32),
             };
             pixels.rgba = blurred.to_image();
+            pixels.width = blurred.width;
+            pixels.height = blurred.height;
         }
         PreviewFilter::Sharpen {
             radius,
@@ -512,6 +522,8 @@ fn apply_filter_in_place(pixels: &mut LayerPixels, filter: &PreviewFilter) -> Re
                     .map_err(|e| DocumentBridgeError::Io(std::io::Error::other(e.to_string())))?;
             let sharp = filters::unsharp_mask(&grid, *radius, *amount, *threshold);
             pixels.rgba = sharp.to_image();
+            pixels.width = sharp.width;
+            pixels.height = sharp.height;
         }
         PreviewFilter::Hsl {
             hue,
@@ -542,6 +554,15 @@ fn apply_filter_in_place(pixels: &mut LayerPixels, filter: &PreviewFilter) -> Re
             );
         }
     }
+    debug_assert_eq!(
+        pixels.rgba.len(),
+        4 * (pixels.width as usize) * (pixels.height as usize),
+        "apply_filter_in_place must leave LayerPixels coherent: \
+         rgba.len() = {}, expected 4 * {} * {}",
+        pixels.rgba.len(),
+        pixels.width,
+        pixels.height,
+    );
     Ok(())
 }
 
@@ -940,6 +961,42 @@ mod tests {
             }
             other => panic!("expected ColorBalance, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn apply_filter_in_place_keeps_dimensions_coherent_for_blur() {
+        // Pin the invariant added for the "future variant could
+        // desync rgba/{width,height}" maintenance-hazard finding:
+        // after `apply_filter_in_place`, the `LayerPixels` struct
+        // must satisfy `rgba.len() == 4 * width * height`. We hit the
+        // Blur path because it's the only variant today that
+        // re-syncs `pixels.width / pixels.height` from a fresh
+        // `TileGrid::to_image()`; the other variants mutate the
+        // buffer in place so the invariant holds trivially.
+        let mut pixels = LayerPixels {
+            rgba: vec![80u8; 4 * 8 * 8],
+            width: 8,
+            height: 8,
+        };
+        apply_filter_in_place(
+            &mut pixels,
+            &PreviewFilter::Blur {
+                radius: 1.5,
+                kind: BlurKind::Gaussian,
+            },
+        )
+        .expect("blur in place");
+        assert_eq!(
+            pixels.rgba.len(),
+            4 * (pixels.width as usize) * (pixels.height as usize),
+            "blur output desynchronised rgba.len() from width*height",
+        );
+        // And the dimensions themselves stay 8x8 (gaussian_blur is
+        // dimension-preserving) — guarantees the
+        // `preview_filter` / `apply_filter_masked` shapes are stable
+        // for every currently-supported variant.
+        assert_eq!(pixels.width, 8);
+        assert_eq!(pixels.height, 8);
     }
 
     /// Build a tiny solid-colour RGBA PNG used to seed a raster

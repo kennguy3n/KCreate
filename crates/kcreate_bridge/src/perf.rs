@@ -12,8 +12,13 @@
 //! 2. **A tile-cache budget honoured by [`kcreate_raster::TileCache`].**
 //!    [`tile_cache_lock`] returns a handle to a process-wide
 //!    `TileCache` whose byte budget is seeded from
-//!    [`kcreate_core::config::RuntimeConfig::max_raster_cache_mb`]
-//!    and re-synced whenever the runtime config changes.
+//!    [`kcreate_core::config::RuntimeConfig::effective_raster_cache_mb`]
+//!    — i.e. the configured `max_raster_cache_mb` clamped to the
+//!    device tier's default ceiling and halved (floor: 16 MB) when
+//!    low-resource mode is on — and re-synced via
+//!    [`resync_tile_cache_budget`] whenever the runtime config
+//!    changes (see `document::low_resource_mode_set`).
+//!
 //! 3. **N-API-facing JSON snapshots.** The bridge exposes a
 //!    `runtime_startup_timeline` / `runtime_tile_cache_stats`
 //!    surface (defined in `lib.rs`) that calls into this module
@@ -95,7 +100,10 @@ pub fn startup_timeline_json() -> String {
 
 /// Process-wide tile cache. Lazily initialised on first access.
 /// Budget is seeded from the current `RuntimeConfig`'s
-/// `max_raster_cache_mb`, converted to bytes via `* 1024 * 1024`.
+/// `effective_raster_cache_mb()` (i.e. the configured
+/// `max_raster_cache_mb` clamped to the device tier's default and
+/// halved when low-resource mode is on), converted to bytes via
+/// `* 1024 * 1024`.
 /// The static lives behind a `parking_lot::Mutex` (the rest of
 /// the bridge uses parking_lot, so callers can compose locks
 /// without mixing parking_lot + std).

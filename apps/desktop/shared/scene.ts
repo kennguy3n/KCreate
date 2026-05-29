@@ -686,10 +686,15 @@ export interface ResourceLimits {
 
 /**
  * Phase 8 Block E Task 27 — one entry in `StartupTimelineReport.marks`.
- * `monotonicNs` is the nanosecond offset from
- * `StartupTimelineReport.startedAtUnixMs` — durations are computed
- * monotonically (never wall-clock) so resume-from-sleep cannot make
- * them go backwards.
+ * `monotonicNs` is the nanosecond offset from the monotonic clock
+ * anchor captured when the timeline was created (Rust-side
+ * `Instant::now()` at `Timeline::start`), NOT from `startedAtUnixMs`.
+ * The wall-clock `startedAtUnixMs` is only kept for human correlation
+ * with system logs; never mix the two by adding them (the units don't
+ * line up — one is monotonic ns since timeline construction, the other
+ * is wall-clock ms since epoch). All per-mark and per-phase durations
+ * are computed monotonically so resume-from-sleep cannot make them go
+ * backwards.
  */
 export interface StartupMark {
   label: string;

@@ -815,7 +815,7 @@ function TraceRasterSection({
       setPathCount(result.pathCount);
       setPhase("done");
       onStatus(
-        `Trace: ${result.pathCount} paths (${result.closedCount} closed).`,
+        `Trace: ${result.pathCount} paths (${result.closedPathCount} closed).`,
       );
       onApplied();
     } catch (e) {

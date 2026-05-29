@@ -43,7 +43,7 @@ use std::time::Duration;
 use kcreate_perf::startup;
 use kcreate_raster::tile::Tile;
 use kcreate_raster::TileCache;
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -297,6 +297,14 @@ pub enum MemoryPressureEvent {
 struct WatchdogState {
     queue: Mutex<VecDeque<MemoryPressureEvent>>,
     running: AtomicBool,
+    /// Paired with [`WatchdogState::shutdown_lock`]. `memory_watchdog_stop`
+    /// flips `running` and calls `notify_all` so the polling thread
+    /// wakes immediately instead of sleeping out the rest of the
+    /// interval. Mirrors the autosave pattern in `autosave.rs` —
+    /// keeping shutdown latency uniformly ~0ms across the two
+    /// long-running background threads.
+    shutdown_lock: Mutex<()>,
+    shutdown_cv: Condvar,
 }
 
 fn watchdog_state() -> &'static Arc<WatchdogState> {
@@ -305,6 +313,8 @@ fn watchdog_state() -> &'static Arc<WatchdogState> {
         Arc::new(WatchdogState {
             queue: Mutex::new(VecDeque::new()),
             running: AtomicBool::new(false),
+            shutdown_lock: Mutex::new(()),
+            shutdown_cv: Condvar::new(),
         })
     })
 }
@@ -359,7 +369,13 @@ pub fn memory_watchdog_start(poll_interval_ms: u64) -> bool {
                         threshold_mb,
                     });
                 }
-                thread::sleep(interval);
+                // Sleep via a condvar so `memory_watchdog_stop` can
+                // wake us up immediately — the previous
+                // `thread::sleep(interval)` made shutdown latency
+                // equal to a full poll interval. This matches the
+                // autosave pattern (see `autosave.rs`).
+                let mut guard = state.shutdown_lock.lock();
+                let _ = state.shutdown_cv.wait_for(&mut guard, interval);
             }
         })
         .expect("spawn watchdog thread");
@@ -367,9 +383,16 @@ pub fn memory_watchdog_start(poll_interval_ms: u64) -> bool {
 }
 
 /// Stop the background watcher. Returns `true` if it was running.
+/// The polling thread is woken via the shutdown condvar so it
+/// observes the new flag instantly.
 pub fn memory_watchdog_stop() -> bool {
     let state = watchdog_state();
-    state.running.swap(false, Ordering::SeqCst)
+    let was_running = state.running.swap(false, Ordering::SeqCst);
+    if was_running {
+        let _g = state.shutdown_lock.lock();
+        state.shutdown_cv.notify_all();
+    }
+    was_running
 }
 
 /// Pull and clear every queued event. The renderer calls this on a

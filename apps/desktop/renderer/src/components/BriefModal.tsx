@@ -26,6 +26,7 @@ import type {
   BriefPlan,
   LlmMessage,
 } from "../../../shared/scene";
+import { openScratchProject } from "../App";
 import { colors, font, radius, spacing } from "../styles/tokens";
 
 interface BriefModalProps {
@@ -159,9 +160,21 @@ export function BriefModal({
   const applyPlan = useCallback(async (plan: BriefPlan) => {
     setPhase({ kind: "applying" });
     try {
+      // The Rust `brief_to_project` bridge mutates the currently
+      // mounted workspace. When the modal is opened from
+      // `HomePage` no project is yet open, so we materialise a
+      // fresh scratch project before applying the plan — same
+      // scratch convention used by the "Create new" tile in
+      // `App.handleOpenEditor`. When the modal is opened from
+      // inside the editor a workspace is already mounted and we
+      // skip the scratch step so the brief composes onto the
+      // existing project instead of replacing it.
+      const current = await window.kcreate.document.getProjectInfo();
+      if (current === null) {
+        await openScratchProject();
+      }
       const result = await window.kcreate.phase9.briefToProject(plan);
       onApplied(result);
-      // Reset for next open.
       setBrief("");
       setPhase({ kind: "idle" });
     } catch (err) {

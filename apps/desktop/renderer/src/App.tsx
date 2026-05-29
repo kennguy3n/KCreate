@@ -60,24 +60,25 @@ export function App(): JSX.Element {
 
   // Phase 9 Block B Task 7 — Brief-to-project applied. The bridge
   // has already added the artboard, brand kit, and starter layers
-  // to the currently open project. We need to flip the route into
-  // the editor by reading the open project's metadata so EditorPage
-  // can render the new content.
+  // to the currently open project. `BriefModal.applyPlan`
+  // guarantees there is an open project (it materialises a scratch
+  // one when invoked from HomePage), so `getProjectInfo` is
+  // expected to be non-null on this path.
   const handleBriefApplied = useCallback(async (result: BriefApplyResult) => {
     try {
       const project = await window.kcreate.document.getProjectInfo();
       if (!project) {
+        // Defensive: brief_to_project would have failed if no
+        // project was open, so reaching here means the workspace
+        // was closed between the apply call returning and this
+        // callback firing. Surface a clear error.
         setRoute({
           kind: "error",
           message:
-            "Brief applied but no active project is open. Open a project first, then run the brief flow from the editor.",
+            "Brief applied but the project was closed before the editor could open it.",
         });
         return;
       }
-      // Successful application — both layer count and artboard ID are
-      // returned but here we only need to flip the route into the
-      // editor. The editor's selection panel will surface the new
-      // artboard the next time the scene syncs.
       void result;
       setRoute({ kind: "editor", project });
     } catch (e) {
@@ -134,7 +135,7 @@ export function App(): JSX.Element {
   );
 }
 
-async function openScratchProject(): Promise<ProjectInfo> {
+export async function openScratchProject(): Promise<ProjectInfo> {
   // Phase 0 scaffold: drop the scratch project into the OS temp dir
   // resolved by the Electron main process via Node's `os.tmpdir()`. The
   // renderer never hard-codes paths — `/tmp` doesn't exist on Windows,

@@ -4836,15 +4836,17 @@ export interface AutofitRecomputeResult {
 export interface TraceResult {
   groupNodeId: string;
   pathCount: number;
-  closedCount: number;
+  closedPathCount: number;
   pathNodeIds: string[];
 }
 
 /** Mirror of `kcreate_bridge::phase9::IconifyResultInfo`. */
 export interface IconifyResultInfo {
-  iconNodeId: string;
-  gridSize: number;
+  sourceNodeId: string;
+  groupNodeId: string;
   pathCount: number;
+  strokeWidth: number;
+  gridSize: number;
 }
 
 /** Mirror of `kcreate_bridge::phase9::BatchAltTextEntry`. */

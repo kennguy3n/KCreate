@@ -106,7 +106,22 @@ export function GridOverlay({
     );
   }
   if (subPx !== null) {
-    for (let x = startX % subPx; x < width; x += subPx) {
+    // Subdivisions are anchored to the major grid (the first sub
+    // line *is* a major line, so it shares the major colour). We
+    // step the subdivision index from the major origin and skip
+    // every Nth tick where it would coincide with a major line —
+    // otherwise the major lines render twice (major + sub) and
+    // appear noticeably darker than expected.
+    const subPerMajor = settings.subdivisions;
+    // Offset from `startX` to the first sub line at or before
+    // `startX`. Because `startX` already sits on a major (it's
+    // `panX mod majorPx`), the loop simply iterates indices.
+    for (
+      let i = 0, x = startX;
+      x < width;
+      i += 1, x = startX + i * subPx
+    ) {
+      if (i % subPerMajor === 0) continue;
       lines.push(
         <line
           key={`vsub-${x}`}
@@ -119,7 +134,12 @@ export function GridOverlay({
         />,
       );
     }
-    for (let y = startY % subPx; y < height; y += subPx) {
+    for (
+      let i = 0, y = startY;
+      y < height;
+      i += 1, y = startY + i * subPx
+    ) {
+      if (i % subPerMajor === 0) continue;
       lines.push(
         <line
           key={`hsub-${y}`}

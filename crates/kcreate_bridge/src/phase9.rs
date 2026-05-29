@@ -564,6 +564,12 @@ pub struct TraceResult {
     pub group_node_id: String,
     pub path_count: usize,
     pub closed_path_count: usize,
+    /// IDs of the per-path VectorLayer nodes inserted under
+    /// `group_node_id`, in the same order they appear in the
+    /// document. Surfaced so callers (e.g. AIAssistPanel) can offer
+    /// "select traced paths" / "jump to" actions without having to
+    /// re-query the document graph.
+    pub path_node_ids: Vec<String>,
 }
 
 /// Trace the raster attached to `node_id` into vector contours and
@@ -599,7 +605,7 @@ pub fn ai_trace_raster(
     let path_count = paths.len();
     let closed_count = paths.iter().filter(|p| p.closed).count();
 
-    let group_id = with_workspace_mut(|ws| {
+    let (group_id, path_ids) = with_workspace_mut(|ws| {
         let (parent_id, source_bounds) = {
             let n = ws
                 .project
@@ -618,6 +624,7 @@ pub fn ai_trace_raster(
             .insert_node(group)
             .map_err(DocumentBridgeError::Document)?;
 
+        let mut path_ids: Vec<Uuid> = Vec::with_capacity(paths.len());
         for (i, p) in paths.iter().enumerate() {
             let mut node = Node::new(NodeType::VectorLayer, format!("Traced path {}", i + 1));
             node.bounds = source_bounds;
@@ -642,10 +649,12 @@ pub fn ai_trace_raster(
                 "traced_polyline".into(),
                 serde_json::json!({ "points": points, "closed": p.closed }),
             );
-            ws.project
+            let path_id = ws
+                .project
                 .document
                 .insert_node(node)
                 .map_err(DocumentBridgeError::Document)?;
+            path_ids.push(path_id);
         }
         ws.project.modified_at = Utc::now();
         let op = Operation::new(
@@ -657,13 +666,14 @@ pub fn ai_trace_raster(
         )
         .as_ai_generated();
         ws.project.execute_operation(op);
-        Ok::<Uuid, DocumentBridgeError>(group_id)
+        Ok::<(Uuid, Vec<Uuid>), DocumentBridgeError>((group_id, path_ids))
     })?;
 
     Ok(TraceResult {
         group_node_id: group_id.to_string(),
         path_count,
         closed_path_count: closed_count,
+        path_node_ids: path_ids.into_iter().map(|u| u.to_string()).collect(),
     })
 }
 

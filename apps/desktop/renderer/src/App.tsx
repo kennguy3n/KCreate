@@ -2,7 +2,7 @@ import { useCallback, useState } from "react";
 
 import { EditorPage } from "./pages/EditorPage";
 import { CREATE_OPTIONS, HomePage } from "./pages/HomePage";
-import type { ProjectInfo } from "../../shared/scene";
+import type { BriefApplyResult, ProjectInfo } from "../../shared/scene";
 
 type Route =
   | { kind: "home" }
@@ -58,6 +58,36 @@ export function App(): JSX.Element {
     });
   }, []);
 
+  // Phase 9 Block B Task 7 — Brief-to-project applied. The bridge
+  // has already added the artboard, brand kit, and starter layers
+  // to the currently open project. We need to flip the route into
+  // the editor by reading the open project's metadata so EditorPage
+  // can render the new content.
+  const handleBriefApplied = useCallback(async (result: BriefApplyResult) => {
+    try {
+      const project = await window.kcreate.document.getProjectInfo();
+      if (!project) {
+        setRoute({
+          kind: "error",
+          message:
+            "Brief applied but no active project is open. Open a project first, then run the brief flow from the editor.",
+        });
+        return;
+      }
+      // Successful application — both layer count and artboard ID are
+      // returned but here we only need to flip the route into the
+      // editor. The editor's selection panel will surface the new
+      // artboard the next time the scene syncs.
+      void result;
+      setRoute({ kind: "editor", project });
+    } catch (e) {
+      setRoute({
+        kind: "error",
+        message: e instanceof Error ? e.message : String(e),
+      });
+    }
+  }, []);
+
   // Open a project from the HomePage's Recent grid. The bridge's
   // `projectOpen` does the heavy lifting (workspace mount, scene
   // sync, audit + recent-list update). Failures route to the error
@@ -99,6 +129,7 @@ export function App(): JSX.Element {
     <HomePage
       onOpenEditor={handleOpenEditor}
       onOpenProject={(p) => void handleOpenProject(p)}
+      onBriefApplied={(r) => void handleBriefApplied(r)}
     />
   );
 }

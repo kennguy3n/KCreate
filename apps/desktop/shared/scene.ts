@@ -4938,10 +4938,9 @@ export interface BriefPlan {
 
 /** Mirror of `kcreate_bridge::phase9::BriefApplyResult`. */
 export interface BriefApplyResult {
-  projectId: string;
-  artboardNodeId: string;
+  artboardId: string;
   brandKitId: string;
-  layerNodeIds: string[];
+  layerIds: string[];
 }
 
 /** Mirror of `kcreate_bridge::perf::MemoryPressureEvent`. */

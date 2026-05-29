@@ -269,12 +269,17 @@ pub fn artboard_set_grid(
 // ---------------------------------------------------------------------------
 
 fn parse_align(s: &str) -> Result<Align> {
+    // The wire-format mirror in `apps/desktop/shared/scene.ts`
+    // exposes the friendlier `center` / `middle` aliases that
+    // Design Studio buttons use. The underlying `Align` enum
+    // distinguishes the X and Y centres explicitly, so we accept
+    // both naming conventions here.
     match s {
         "left" => Ok(Align::Left),
-        "center_horizontal" | "centerHorizontal" => Ok(Align::CenterHorizontal),
+        "center" | "center_horizontal" | "centerHorizontal" => Ok(Align::CenterHorizontal),
         "right" => Ok(Align::Right),
         "top" => Ok(Align::Top),
-        "center_vertical" | "centerVertical" => Ok(Align::CenterVertical),
+        "middle" | "center_vertical" | "centerVertical" => Ok(Align::CenterVertical),
         "bottom" => Ok(Align::Bottom),
         other => Err(DocumentBridgeError::InvalidArgument {
             argument: "alignment".into(),

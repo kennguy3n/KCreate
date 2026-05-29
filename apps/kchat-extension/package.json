@@ -11,7 +11,7 @@
     "package": "node scripts/build.mjs && node scripts/sign.mjs",
     "typecheck": "tsc --noEmit",
     "lint": "eslint --max-warnings=0 src tests scripts",
-    "test": "node --test tests/manifest.test.mjs tests/invite-card.test.mjs tests/store.test.mjs tests/sign.test.mjs"
+    "test": "node --test tests/manifest.test.mjs tests/invite-card.test.mjs tests/store.test.mjs tests/sign.test.mjs tests/phase9-panels.test.mjs"
   },
   "dependencies": {
     "react": "18.3.1",

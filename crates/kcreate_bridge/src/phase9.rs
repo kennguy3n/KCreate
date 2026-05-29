@@ -1187,13 +1187,29 @@ pub struct BriefApplyResult {
     pub layer_ids: Vec<String>,
 }
 
+/// Collapse a preset name to its loose-match key: lowercase + only
+/// `[a-z0-9]`. Lets `"Instagram Post"`, `"instagram-post"`,
+/// `"instagramPost"`, and `"INSTAGRAM_POST"` all resolve to the
+/// same preset. The frontend prompt enumerates display names from
+/// `artboardPresets()` so the LLM should already see the canonical
+/// form, but tolerating reasonable variants is cheap and prevents
+/// a brittle exact-match against an LLM-generated string from
+/// silently breaking the whole brief flow.
+fn normalize_preset_name(name: &str) -> String {
+    name.chars()
+        .filter(char::is_ascii_alphanumeric)
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
 /// Apply a [`BriefPlan`] to the currently open project: create an
 /// artboard at the requested preset, upsert a "Brief Kit" brand
 /// kit, and add starter layers as children of the artboard.
 pub fn brief_to_project(plan: &BriefPlan) -> Result<BriefApplyResult> {
+    let plan_key = normalize_preset_name(&plan.artboard_preset);
     let preset = standard_presets()
         .into_iter()
-        .find(|p| p.name == plan.artboard_preset)
+        .find(|p| normalize_preset_name(&p.name) == plan_key)
         .ok_or_else(|| DocumentBridgeError::InvalidArgument {
             argument: "artboard_preset".into(),
             value: plan.artboard_preset.clone(),

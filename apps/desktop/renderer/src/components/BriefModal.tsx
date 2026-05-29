@@ -20,14 +20,34 @@
 // The user can always cancel; nothing is persisted until the
 // bridge call completes successfully.
 
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import type {
+  ArtboardPreset,
   BriefApplyResult,
   BriefPlan,
   LlmMessage,
 } from "../../../shared/scene";
 import { openScratchProject } from "../lib/scratchProject";
 import { colors, font, radius, spacing } from "../styles/tokens";
+
+/**
+ * Collapse a preset name to a loose-match key: lowercase ASCII
+ * alphanumerics only. Mirrors `normalize_preset_name` in
+ * `crates/kcreate_bridge/src/phase9.rs` so the renderer's
+ * client-side validator agrees with the bridge’s server-side
+ * matcher on which strings resolve to the same preset.
+ */
+function normalizePresetName(name: string): string {
+  let out = "";
+  for (const ch of name) {
+    if ((ch >= "a" && ch <= "z") || (ch >= "0" && ch <= "9")) {
+      out += ch;
+    } else if (ch >= "A" && ch <= "Z") {
+      out += ch.toLowerCase();
+    }
+  }
+  return out;
+}
 
 interface BriefModalProps {
   open: boolean;
@@ -36,17 +56,29 @@ interface BriefModalProps {
   onApplied: (result: BriefApplyResult) => void;
 }
 
-const SYSTEM_PROMPT = `You are an expert graphic-design planner. The
+/**
+ * Build the LLM system prompt with the LIVE list of artboard
+ * preset display names taken from `window.kcreate.artboard.presets()`.
+ *
+ * Why dynamic: the previous revision hardcoded a synthetic camelCase
+ * list (`"instagramPost"`, `"a4"`, …) that did not match any name
+ * `standard_presets()` actually returns on the Rust side
+ * (`"Instagram Post"`, `"A4"`, …). The exact-match in
+ * `brief_to_project` would have failed for every LLM-produced plan,
+ * silently breaking the entire brief→project flow end-to-end. The
+ * Rust matcher now normalizes both sides as a defense-in-depth
+ * layer, but the prompt is the *primary* source of truth for what
+ * the LLM emits, so it must enumerate the real names instead of an
+ * out-of-band synthetic set.
+ */
+function buildSystemPrompt(presets: readonly ArtboardPreset[]): string {
+  const names = presets.map((p) => `"${p.name}"`).join(", ");
+  return `You are an expert graphic-design planner. The
 user will describe a design they want and you will reply with STRICT
 JSON in this shape — no Markdown, no commentary, no extra fields:
 
 {
-  "artboardPreset": string,      // one of: "instagramPost",
-                                 // "instagramStory", "twitterPost",
-                                 // "facebookPost", "youtubeThumbnail",
-                                 // "a4", "letter", "businessCard",
-                                 // "desktop1440", "mobile375",
-                                 // "logo1024"
+  "artboardPreset": string,      // exactly one of: ${names}
   "palette": string[],           // 3-6 hex colors like "#1F2937"
   "starterLayers": [
     { "name": string, "kind": "text"|"shape"|"image"|"group",
@@ -57,22 +89,12 @@ JSON in this shape — no Markdown, no commentary, no extra fields:
 Pick the artboardPreset that best matches the user's brief. Pick a
 palette that fits the brand mood. Suggest 3-8 starter layers (title,
 subtitle, hero shape, etc.). Reply ONLY with the JSON object.`;
+}
 
-const KNOWN_PRESETS = new Set([
-  "instagramPost",
-  "instagramStory",
-  "twitterPost",
-  "facebookPost",
-  "youtubeThumbnail",
-  "a4",
-  "letter",
-  "businessCard",
-  "desktop1440",
-  "mobile375",
-  "logo1024",
-]);
-
-function parseBriefPlan(raw: string): BriefPlan {
+function parseBriefPlan(
+  raw: string,
+  presetKeys: ReadonlySet<string>,
+): BriefPlan {
   // The LLM occasionally wraps replies in ``` fences even when told
   // not to. Strip them defensively before parsing.
   const trimmed = raw
@@ -86,7 +108,10 @@ function parseBriefPlan(raw: string): BriefPlan {
   }
   const obj = parsed as Record<string, unknown>;
   const artboardPreset = obj["artboardPreset"];
-  if (typeof artboardPreset !== "string" || !KNOWN_PRESETS.has(artboardPreset)) {
+  if (
+    typeof artboardPreset !== "string" ||
+    !presetKeys.has(normalizePresetName(artboardPreset))
+  ) {
     throw new Error(`unknown artboard preset: ${String(artboardPreset)}`);
   }
   const palette = obj["palette"];
@@ -140,22 +165,58 @@ export function BriefModal({
 }: BriefModalProps): JSX.Element | null {
   const [brief, setBrief] = useState("");
   const [phase, setPhase] = useState<Phase>({ kind: "idle" });
+  const [presets, setPresets] = useState<readonly ArtboardPreset[]>([]);
+
+  // Fetch the real preset list whenever the modal is opened so the
+  // SYSTEM_PROMPT enumerates names that the Rust bridge will actually
+  // accept. The previous hardcoded list drifted from
+  // `standard_presets()` and broke the end-to-end flow.
+  useEffect(() => {
+    if (!open) return;
+    let cancelled = false;
+    void window.kcreate.artboard
+      .presets()
+      .then((list) => {
+        if (!cancelled) setPresets(list);
+      })
+      .catch((err: unknown) => {
+        if (!cancelled) {
+          const message = err instanceof Error ? err.message : String(err);
+          setPhase({ kind: "error", message: `preset fetch failed: ${message}` });
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [open]);
+
+  const presetKeys = useMemo(
+    () => new Set(presets.map((p) => normalizePresetName(p.name))),
+    [presets],
+  );
 
   const submitBrief = useCallback(async () => {
+    if (presets.length === 0) {
+      setPhase({
+        kind: "error",
+        message: "artboard presets not loaded yet — try again in a moment",
+      });
+      return;
+    }
     setPhase({ kind: "asking" });
     try {
       const messages: LlmMessage[] = [
-        { role: "system", content: SYSTEM_PROMPT },
+        { role: "system", content: buildSystemPrompt(presets) },
         { role: "user", content: brief },
       ];
       const reply = await window.kcreate.llm.chat(messages, 1024, 0.2);
-      const plan = parseBriefPlan(reply.content);
+      const plan = parseBriefPlan(reply.content, presetKeys);
       setPhase({ kind: "preview", plan });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       setPhase({ kind: "error", message });
     }
-  }, [brief]);
+  }, [brief, presets, presetKeys]);
 
   const applyPlan = useCallback(async (plan: BriefPlan) => {
     setPhase({ kind: "applying" });

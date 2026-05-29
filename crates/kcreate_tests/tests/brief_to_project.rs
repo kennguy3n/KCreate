@@ -74,6 +74,34 @@ fn brief_to_project_creates_artboard_brand_kit_and_layers() {
 
 #[test]
 #[serial]
+fn brief_to_project_accepts_camel_case_preset_name() {
+    // The LLM is prompted with display names like "Instagram Post"
+    // but is not guaranteed to echo them verbatim — older revisions
+    // of `BriefModal` even told it to produce camelCase tokens.
+    // `brief_to_project` must tolerate reasonable variations so a
+    // single drift between the prompt and the Rust matcher doesn't
+    // break the entire brief→project flow end-to-end.
+    let _dir = open_project("brief-camelcase-preset");
+    let mut plan = standard_plan();
+    plan.artboard_preset = "instagramPost".into();
+    let result = brief_to_project(&plan).expect("camelCase preset must resolve");
+    assert!(!result.artboard_id.is_empty());
+    project_close();
+}
+
+#[test]
+#[serial]
+fn brief_to_project_accepts_kebab_case_preset_name() {
+    let _dir = open_project("brief-kebab-preset");
+    let mut plan = standard_plan();
+    plan.artboard_preset = "instagram-post".into();
+    let result = brief_to_project(&plan).expect("kebab preset must resolve");
+    assert!(!result.artboard_id.is_empty());
+    project_close();
+}
+
+#[test]
+#[serial]
 fn brief_to_project_rejects_unknown_preset() {
     let _dir = open_project("brief-bad-preset");
     let mut plan = standard_plan();

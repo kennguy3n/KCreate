@@ -351,7 +351,8 @@ closure walked by `local_first.rs`. It exposes three primitives:
 The `startup` module owns a process-wide
 `OnceLock<Mutex<Option<Timeline>>>`. `kcreate_bridge::perf` wires it
 on first touch (`ensure_startup_initialized`) and drops marks at
-`bridge.dlopen` (cdylib load), `project_create.{start,end}`, and
+`bridge.first_call` (first perf API use after dlopen — true load-time
+would need an `unsafe` ctor), `project_create.{start,end}`, and
 `project_open.{start,end}`. The renderer drops its own
 `first_paint` / `first_interactive` marks on the same monotonic
 clock via the `runtime_startup_mark(label)` N-API entry, so a

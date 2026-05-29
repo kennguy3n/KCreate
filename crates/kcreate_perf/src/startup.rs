@@ -28,8 +28,9 @@ fn cell() -> &'static Mutex<Option<Timeline>> {
 
 /// Initialise the global startup timeline if it has not been
 /// initialised yet. Idempotent — the second + later calls are
-/// silent no-ops. The caller passes the start label (typically
-/// `"bridge.dlopen"`) which is also the timeline name.
+/// silent no-ops. The caller passes the timeline `name` (the
+/// bridge passes `"bridge.startup"`); this is *not* the first
+/// mark label.
 pub fn init(name: impl Into<String>) {
     let mut slot = cell().lock().expect("startup timeline mutex poisoned");
     if slot.is_none() {

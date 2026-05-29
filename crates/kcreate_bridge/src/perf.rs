@@ -8,7 +8,13 @@
 //!    `document::project_create`, or `document::project_open` we
 //!    are inside the bridge cdylib. [`ensure_startup_initialized`]
 //!    is idempotent and safe to call from any hot path, so
-//!    sprinkled marks never depend on order.
+//!    sprinkled marks never depend on order. The single mark this
+//!    routine emits is named **`bridge.first_call`** — deliberately
+//!    *not* `bridge.dlopen`, because the underlying `OnceLock` does
+//!    not fire at actual `dlopen` time but on the first perf API
+//!    call (a true load-time mark would need an `unsafe` ctor,
+//!    which conflicts with the workspace's
+//!    `forbid(unsafe_op_in_unsafe_fn)` lint).
 //! 2. **A tile-cache budget honoured by [`kcreate_raster::TileCache`].**
 //!    [`tile_cache_lock`] returns a handle to a process-wide
 //!    `TileCache` whose byte budget is seeded from
@@ -46,19 +52,41 @@ use crate::document::runtime_slot;
 pub type TileKey = (Uuid, u32, u32);
 
 /// Initialise the global startup timeline once. Subsequent calls
-/// are idempotent no-ops thanks to `OnceLock` + `Mutex<Option<_>>`
-/// inside `kcreate_perf::startup`.
+/// are idempotent no-ops thanks to the `INIT_DONE: Mutex<bool>`
+/// latch below — plus the `Mutex<Option<_>>` inside
+/// `kcreate_perf::startup` which makes the upstream init reentrant
+/// safe as well.
 ///
 /// Call from every cold-path entry point that wants to drop marks
 /// — there is no ordering requirement, and calling from a hot
-/// path is cheap (one mutex acquire to peek the `Option`).
+/// path is cheap (one mutex acquire to read a bool).
 pub fn ensure_startup_initialized() {
-    static INIT: OnceLock<()> = OnceLock::new();
-    INIT.get_or_init(|| {
+    // Use a Mutex<bool> rather than OnceLock<()> so the test-only
+    // `reset_init_for_tests` helper can reset both this flag *and*
+    // the underlying `kcreate_perf` singleton. With a `OnceLock`,
+    // resetting the timeline below would leave the OnceLock
+    // exhausted, so subsequent tests would observe an empty
+    // timeline that nobody could re-init — making tests subtly
+    // order-dependent. (Devin Review ANALYSIS_0003 round 3 on PR
+    // #24.)
+    let mut done = INIT_DONE.lock();
+    if !*done {
         startup::init("bridge.startup");
-        startup::mark("bridge.dlopen");
-    });
+        // NB: deliberately *not* `bridge.dlopen` — see the module
+        // doc. This mark fires on first perf call, which is
+        // "shortly after dlopen" in practice but not at dlopen
+        // itself.
+        startup::mark("bridge.first_call");
+        *done = true;
+    }
 }
+
+// `parking_lot::Mutex::new` is `const` (parking_lot 0.12+), so the
+// static can live without a `OnceLock` wrapper. This is the only
+// place in the bridge that uses parking_lot in a const context;
+// keep it adjacent to `ensure_startup_initialized` so the read
+// path is obvious.
+static INIT_DONE: Mutex<bool> = Mutex::new(false);
 
 /// Drop a mark on the startup timeline. Convenience wrapper so
 /// other bridge modules don't have to depend on `kcreate_perf`
@@ -186,6 +214,16 @@ pub fn tile_cache_get(key: &TileKey) -> Option<Tile> {
 
 #[cfg(test)]
 pub(crate) fn reset_for_tests() {
+    // Reset the bridge's INIT latch and the upstream kcreate_perf
+    // singleton so every test starts from a clean slate. Without
+    // this, the `OnceLock`-shaped predecessor in this module left
+    // tests sharing a process-wide timeline whose contents depended
+    // on test execution order (Devin Review ANALYSIS_0003 round 3
+    // on PR #24). With the `kcreate_perf/test_support` feature
+    // enabled for the bridge's dev-deps (see Cargo.toml), the
+    // upstream reset is in scope.
+    startup::reset_for_tests();
+    *INIT_DONE.lock() = false;
     // Re-seed budget from whatever the test's RuntimeConfig is.
     let budget = current_budget_bytes();
     let mut cache = tile_cache_lock().lock();
@@ -211,30 +249,35 @@ mod tests {
 
     #[test]
     #[serial]
-    fn startup_timeline_initialises_once_and_emits_dlopen_mark() {
+    fn startup_timeline_initialises_once_and_emits_first_call_mark() {
+        // Reset both the timeline AND the bridge's INIT latch so
+        // this test isn't order-dependent on whatever earlier
+        // tests did to the process-wide singleton (regression for
+        // Devin Review ANALYSIS_0003 round 3 on PR #24).
+        reset_for_tests();
         ensure_startup_initialized();
         ensure_startup_initialized();
         ensure_startup_initialized();
         let report: kcreate_perf::Report =
             serde_json::from_str(&startup_timeline_json()).expect("timeline is valid JSON");
-        // The "dlopen" mark is emitted exactly once even though
-        // `ensure_startup_initialized` was called three times in
-        // this test, and possibly other times in earlier tests
-        // sharing the process-wide singleton. Counting raw
-        // substrings would double-count (every mark label also
-        // appears in the derived `phases` array) — parse the JSON
-        // instead and count only the `marks` entries.
-        let dlopen_count = report
+        // The `bridge.first_call` mark is emitted exactly once
+        // even though `ensure_startup_initialized` was called
+        // three times. Counting raw substrings would double-count
+        // (every mark label also appears in the derived `phases`
+        // array) — parse the JSON instead and count only the
+        // `marks` entries.
+        let first_call_count = report
             .marks
             .iter()
-            .filter(|m| m.label == "bridge.dlopen")
+            .filter(|m| m.label == "bridge.first_call")
             .count();
-        assert_eq!(dlopen_count, 1);
+        assert_eq!(first_call_count, 1);
     }
 
     #[test]
     #[serial]
     fn mark_records_into_global_timeline() {
+        reset_for_tests();
         ensure_startup_initialized();
         mark("test.before_cache");
         let json = startup_timeline_json();

@@ -130,19 +130,34 @@ impl<K: Eq + Hash + Clone> TileCache<K> {
         Some(&self.storage.get(key)?.tile)
     }
 
-    /// Mutably borrow a tile by key, bumping it to
-    /// most-recently-used. Returns `None` if the key is not
-    /// cached.
+    /// Mutate a tile in place via a closure, bumping it to
+    /// most-recently-used and re-syncing the cache's byte
+    /// accounting once the closure returns. Returns `Some(R)` if
+    /// the key was present (the closure ran), `None` otherwise.
     ///
-    /// Note: this does **not** re-account for byte-count drift if
-    /// the caller resizes `tile.pixels` through the returned
-    /// reference. If you need to mutate a tile's pixel buffer
-    /// length, [`remove`](Self::remove) it and [`insert`](Self::insert)
-    /// the new version so the cache's `bytes` counter stays
-    /// accurate.
-    pub fn get_mut(&mut self, key: &K) -> Option<&mut Tile> {
+    /// Closure-shaped on purpose: handing out a bare `&mut Tile`
+    /// would let callers `tile.pixels.resize(...)` silently and
+    /// leave `self.bytes` desynced from `sum(pixels.len())`,
+    /// breaking the LRU budget. Here we observe the byte count
+    /// before and after the closure and patch both the per-entry
+    /// and the cache-wide counters in one shot.
+    ///
+    /// If the closure enlarges the tile past the budget, the cache
+    /// can briefly exceed `budget` (same as oversized inserts — see
+    /// the module-level doc). The next [`insert`](Self::insert) or
+    /// [`set_budget`](Self::set_budget) call will rebalance.
+    pub fn mutate<F, R>(&mut self, key: &K, f: F) -> Option<R>
+    where
+        F: FnOnce(&mut Tile) -> R,
+    {
         self.bump(key)?;
-        Some(&mut self.storage.get_mut(key)?.tile)
+        let entry = self.storage.get_mut(key)?;
+        let before = entry.bytes;
+        let out = f(&mut entry.tile);
+        let after = entry.tile.pixels.len() as u64;
+        entry.bytes = after;
+        self.bytes = self.bytes.saturating_sub(before).saturating_add(after);
+        Some(out)
     }
 
     /// Insert `(key, tile)` into the cache, possibly evicting the
@@ -318,13 +333,66 @@ mod tests {
     }
 
     #[test]
-    fn get_mut_also_bumps_to_most_recently_used() {
+    fn mutate_also_bumps_to_most_recently_used() {
         let mut cache: TileCache<u32> = TileCache::with_byte_budget(128);
         cache.insert(1, small_tile(1));
         cache.insert(2, small_tile(2));
-        assert!(cache.get_mut(&1).is_some());
+        let touched = cache.mutate(&1, |tile| tile.pixels[0] = 0xFF);
+        assert!(touched.is_some());
         let ev = cache.insert(3, small_tile(3));
         assert_eq!(ev[0].0, 2);
+    }
+
+    #[test]
+    fn mutate_resyncs_byte_accounting_when_closure_resizes_pixels() {
+        // Regression for Devin Review ANALYSIS_0005 round 3 on PR #24:
+        // returning a bare `&mut Tile` from `get_mut` let callers
+        // resize `tile.pixels` and silently desync `bytes` from
+        // `sum(pixels.len())`. The closure-shaped API re-accounts
+        // bytes after F returns, so even a pathological grow/shrink
+        // keeps the cache's invariants intact.
+        let mut cache: TileCache<u32> = TileCache::with_byte_budget(4096);
+        cache.insert(
+            1,
+            Tile {
+                x: 0,
+                y: 0,
+                pixels: vec![0; 16],
+                dirty: false,
+            },
+        );
+        cache.insert(
+            2,
+            Tile {
+                x: 0,
+                y: 0,
+                pixels: vec![0; 16],
+                dirty: false,
+            },
+        );
+        assert_eq!(cache.bytes(), 32);
+
+        // Grow tile 1 from 16 to 100 bytes.
+        cache.mutate(&1, |tile| tile.pixels.resize(100, 0xAA));
+        assert_eq!(
+            cache.bytes(),
+            116,
+            "bytes counter must include the grown pixel buffer"
+        );
+
+        // Shrink tile 2 from 16 to 4 bytes.
+        cache.mutate(&2, |tile| tile.pixels.truncate(4));
+        assert_eq!(
+            cache.bytes(),
+            104,
+            "bytes counter must shrink with the truncated buffer"
+        );
+
+        // Sanity: the per-pixel sum agrees with `bytes`.
+        let summed: u64 = (1..=2)
+            .map(|k| cache.get(&k).expect("present").pixels.len() as u64)
+            .sum();
+        assert_eq!(summed, cache.bytes());
     }
 
     #[test]

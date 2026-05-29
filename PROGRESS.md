@@ -968,8 +968,9 @@ artifact-publishing capabilities the proposal calls for.
       `OnceLock<Mutex<Option<Timeline>>>` keyed on
       `"startup"`; `ensure_initialized` is idempotent and
       callable from any hot path. The bridge wires it on
-      first touch and drops marks at `bridge.dlopen` (cdylib
-      load), `project_create.{start,end}`, and
+      first touch and drops marks at `bridge.first_call` (first
+      perf API use after `process.dlopen` — a true load-time mark
+      would need an `unsafe` ctor), `project_create.{start,end}`, and
       `project_open.{start,end}`. The renderer drops its own
       `first_paint` / `first_interactive` marks on the same
       monotonic clock via `runtime_startup_mark`. N-API
@@ -978,7 +979,7 @@ artifact-publishing capabilities the proposal calls for.
       monotonic-order, scope idempotency, snapshot
       non-consuming, JSON round-trip, and singleton
       idempotency invariants; 6 bridge-level tests verify
-      that `bridge.dlopen` is emitted exactly once across
+      that `bridge.first_call` is emitted exactly once across
       repeated `ensure_startup_initialized` calls.
 - [x] **Task 28: Tile-cache LRU eviction in
       `kcreate_raster::tile_cache`.** `TileCache<K>` is a

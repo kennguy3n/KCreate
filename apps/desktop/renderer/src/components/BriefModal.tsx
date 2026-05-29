@@ -174,9 +174,16 @@ export function BriefModal({
         await openScratchProject();
       }
       const result = await window.kcreate.phase9.briefToProject(plan);
-      onApplied(result);
+      // Reset local state *before* notifying the parent. The parent
+      // typically navigates to the editor in response to
+      // `onApplied`, which unmounts this modal — calling
+      // `setBrief` / `setPhase` afterwards is a no-op on the
+      // unmounted component (silent in React 18, but pointless).
+      // Resetting first means a subsequent re-mount sees a clean
+      // initial state without depending on React 18 semantics.
       setBrief("");
       setPhase({ kind: "idle" });
+      onApplied(result);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       setPhase({ kind: "error", message });

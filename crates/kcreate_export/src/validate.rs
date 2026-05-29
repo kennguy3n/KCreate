@@ -33,8 +33,6 @@ pub enum ExportValidationError {
     ZeroDimension { axis: &'static str, dim: u32 },
     #[error("jpeg quality {0} is outside the supported range 1..=100")]
     InvalidJpegQuality(u32),
-    #[error("svg + jpeg are incompatible (SVG is vector-only, JPEG is raster-only)")]
-    SvgJpegCombination,
     #[error("transparent backgrounds are not supported by JPEG")]
     JpegTransparency,
 }
@@ -189,13 +187,15 @@ pub fn validate_export_request(req: &ExportValidationRequest) -> ExportValidatio
             "SVG export references text glyphs whose font is not installed; viewers may substitute fallback fonts".into(),
         ));
     }
-    if fmt_norm == "svg" && req.format.eq_ignore_ascii_case("jpeg") {
-        // unreachable in practice but guards against caller bugs.
-        issues.push(error(
-            "SVG_JPEG_MIX",
-            ExportValidationError::SvgJpegCombination.to_string(),
-        ));
-    }
+    // NOTE: an earlier revision carried an `SVG_JPEG_MIX` guard here
+    // (`fmt_norm == "svg" && req.format.eq_ignore_ascii_case("jpeg")`).
+    // `fmt_norm` is derived from `req.format` via `to_ascii_lowercase()`,
+    // so that condition is logically dead: a single `format` field
+    // cannot simultaneously be `svg` and `jpeg`. The check and the
+    // matching `SvgJpegCombination` error variant were removed rather
+    // than retained as defensive vestiges — keeping unreachable
+    // branches around as "belt and braces" makes future
+    // readers waste effort proving why the impossible can't happen.
     let ok = !issues
         .iter()
         .any(|i| matches!(i.severity, ExportSeverity::Error));

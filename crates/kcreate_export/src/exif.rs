@@ -14,7 +14,7 @@
 
 use std::collections::BTreeMap;
 
-use exif::{In, Reader};
+use exif::{Context, In, Reader};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -88,29 +88,29 @@ pub fn read_exif_from_bytes(bytes: &[u8]) -> Result<ExifMetadata, ExifError> {
     let mut primary = BTreeMap::new();
     let mut gps = BTreeMap::new();
     for f in exif.fields() {
+        // `ifd_num` only distinguishes PRIMARY (image #0) from
+        // THUMBNAIL (image #1) — it is NOT a way to route between
+        // the TIFF, Exif, GPS and Interop tag groups (those are
+        // sub-IFDs reached via pointer tags). Skip thumbnail fields
+        // outright (they duplicate the primary image's metadata),
+        // then route the remainder by the tag's own `Context`. The
+        // earlier `f.ifd_num.index() == 1` heuristic was wrong
+        // twice over: GPS fields are emitted under `In::PRIMARY`
+        // by kamadak-exif 0.6, and `In::THUMBNAIL` already *is*
+        // `In(1)` — so the catch-all branch could never route GPS
+        // correctly anyway. See `kamadak-exif-0.6.1/src/tag.rs`
+        // for the `Tag::context()` definition.
+        if f.ifd_num == In::THUMBNAIL {
+            continue;
+        }
         let key = format!("{}", f.tag);
         let value = field_to_value(f);
-        match f.ifd_num {
-            In::PRIMARY => {
-                primary.insert(key, value);
-            }
-            In::THUMBNAIL => {
-                // Thumbnail tags duplicate the primary IFD; we
-                // skip them so the metadata bag is the minimal
-                // useful subset.
+        match f.tag.context() {
+            Context::Gps => {
+                gps.insert(key, value);
             }
             _ => {
-                // Penpot, Lightroom, etc. emit GPS in the GPSInfo
-                // sub-IFD. Match on the tag's IFD number =
-                // `In::PRIMARY + 1` = `In(1)` which is the GPS
-                // sub-IFD per the EXIF spec. The kamadak crate
-                // doesn't have a `GPS` constant so we compare
-                // numerically.
-                if f.ifd_num.index() == 1 {
-                    gps.insert(key, value);
-                } else {
-                    primary.insert(key, value);
-                }
+                primary.insert(key, value);
             }
         }
     }

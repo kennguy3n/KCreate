@@ -11,7 +11,7 @@
 // The overlay is purely visual: snapping is enforced by the Rust
 // snap engine (see `crates/kcreate_vector/src/snap.rs`).
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { GuideInfo } from "../../../shared/scene";
 import { font } from "../styles/tokens";
 
@@ -52,6 +52,19 @@ export function RulerOverlay({
   >(null);
   const [dragPos, setDragPos] = useState<number>(0);
   const [error, setError] = useState<string | undefined>(undefined);
+  /**
+   * Ref to the overlay's outer `<div>` so we can read its
+   * bounding rect on each pointer event and translate viewport-
+   * relative `clientX`/`clientY` into overlay-local coordinates.
+   * Without this, both the drag-line preview (which uses `dragPos`
+   * as `top:` / `left:` inside the overlay) AND the document-space
+   * guide position computed in `handlePointerUp` are wrong
+   * whenever the overlay's top-left does not coincide with the
+   * viewport origin (toolbars above, sidebars left, app chrome,
+   * etc.). The overlay's own bounding rect is the single source
+   * of truth for that offset.
+   */
+  const containerRef = useRef<HTMLDivElement | null>(null);
 
   const refresh = useCallback(async () => {
     if (pageId === null) return;
@@ -82,22 +95,42 @@ export function RulerOverlay({
     return 5 * pow;
   }, [zoom]);
 
+  /**
+   * Translate a viewport-relative pointer event into a position
+   * that is local to the overlay element along the given axis.
+   * Returns `null` if the container ref hasn't been attached yet
+   * (which would only happen during the very first render before
+   * React commits the ref, but is handled defensively).
+   */
+  const localPos = useCallback(
+    (e: React.PointerEvent, axis: "x" | "y"): number | null => {
+      const rect = containerRef.current?.getBoundingClientRect();
+      if (rect === undefined) return null;
+      return axis === "y" ? e.clientY - rect.top : e.clientX - rect.left;
+    },
+    [],
+  );
+
   const handleRulerDown = useCallback(
     (which: "top" | "left", e: React.PointerEvent) => {
       e.preventDefault();
+      const pos = localPos(e, which === "top" ? "y" : "x");
+      if (pos === null) return;
       setDraggingFrom(which);
-      setDragPos(which === "top" ? e.clientY : e.clientX);
+      setDragPos(pos);
       (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
     },
-    [],
+    [localPos],
   );
 
   const handlePointerMove = useCallback(
     (e: React.PointerEvent) => {
       if (draggingFrom === null) return;
-      setDragPos(draggingFrom === "top" ? e.clientY : e.clientX);
+      const pos = localPos(e, draggingFrom === "top" ? "y" : "x");
+      if (pos === null) return;
+      setDragPos(pos);
     },
-    [draggingFrom],
+    [draggingFrom, localPos],
   );
 
   const handlePointerUp = useCallback(
@@ -105,11 +138,20 @@ export function RulerOverlay({
       if (draggingFrom === null || pageId === null) return;
       const from = draggingFrom;
       setDraggingFrom(null);
-      // Convert CSS coordinates → document coordinates, then call
-      // the bridge to materialize the guide.
-      const screenPos = from === "top" ? e.clientY : e.clientX;
+      // Convert overlay-local CSS coordinates → document
+      // coordinates, then call the bridge to materialize the
+      // guide. Using `localPos` here (instead of raw `e.clientY` /
+      // `e.clientX`) is critical: the overlay is mounted inside
+      // the editor's layout grid with toolbars / panels above and
+      // to the left, so the viewport origin and the overlay
+      // origin do not coincide. `panX` / `panY` are defined
+      // relative to the overlay's own coordinate system, so the
+      // doc-space math `(screenPos - pan) / zoom` is only correct
+      // when `screenPos` is also overlay-local.
+      const pos = localPos(e, from === "top" ? "y" : "x");
+      if (pos === null) return;
       const pan = from === "top" ? panY : panX;
-      const docPos = (screenPos - pan) / zoom;
+      const docPos = (pos - pan) / zoom;
       try {
         await window.kcreate.phase9.guideCreate(
           pageId,
@@ -123,7 +165,7 @@ export function RulerOverlay({
         setError(err instanceof Error ? err.message : String(err));
       }
     },
-    [draggingFrom, pageId, panX, panY, zoom, refresh],
+    [draggingFrom, pageId, panX, panY, zoom, refresh, localPos],
   );
 
   if (pageId === null) {
@@ -135,6 +177,7 @@ export function RulerOverlay({
 
   return (
     <div
+      ref={containerRef}
       style={overlayStyle(width, height)}
       onPointerMove={handlePointerMove}
       onPointerUp={(e) => void handlePointerUp(e)}

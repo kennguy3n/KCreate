@@ -22,6 +22,20 @@ interface GridOverlayProps {
   height: number;
   /** Caller-controlled visibility (e.g. bound to Ctrl+'). */
   visible: boolean;
+  /**
+   * Monotonic revision number incremented by the parent whenever the
+   * artboard's grid settings change out-of-band — e.g. after the
+   * settings dialog calls `window.kcreate.phase9.artboardSetGrid`.
+   * The overlay otherwise has no way to know its cached snapshot has
+   * gone stale (the bridge does not currently surface grid-change
+   * events). Defaults to `0`; pass any integer that increments on
+   * every update. Adding `settingsRevision` to the effect's dep
+   * array is the architecturally correct fix here because it keeps
+   * the overlay self-contained — the parent owns *when* a refresh
+   * is needed but the overlay still owns *how* to fetch and
+   * present the data.
+   */
+  settingsRevision?: number;
 }
 
 export function GridOverlay({
@@ -32,6 +46,7 @@ export function GridOverlay({
   width,
   height,
   visible,
+  settingsRevision = 0,
 }: GridOverlayProps): JSX.Element | null {
   const [settings, setSettings] = useState<GridSettingsInfo | null>(null);
 
@@ -55,7 +70,10 @@ export function GridOverlay({
     return () => {
       cancelled = true;
     };
-  }, [artboardId]);
+    // `settingsRevision` re-triggers the fetch after the parent
+    // mutates grid settings via `artboardSetGrid`; without it, the
+    // overlay would only refresh on artboard switch.
+  }, [artboardId, settingsRevision]);
 
   if (!visible || settings === null || !settings.enabled || settings.spacing <= 0) {
     return null;

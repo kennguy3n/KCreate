@@ -228,7 +228,16 @@ pub fn document_resize_frame(frame_id: Uuid, new_bounds: Bounds) -> Result<()> {
                 })
                 .collect();
         }
-        let before = serde_json::json!({
+        // `before_bounds` captures the parent and children's
+        // *pre-resize* bounds so we can reuse the values when
+        // assembling the final `before` payload after autofit
+        // changes are known. Naming this `before` and then
+        // re-binding `before` further down was correct (Rust
+        // shadowing evaluates the RHS against the prior binding
+        // before the new one takes effect) but easy to misread
+        // as self-referential; the explicit name keeps the
+        // dataflow obvious.
+        let before_bounds = serde_json::json!({
             "frame": parent_old,
             "children": child_updates
                 .iter()
@@ -289,8 +298,8 @@ pub fn document_resize_frame(frame_id: Uuid, new_bounds: Bounds) -> Result<()> {
                 .collect::<Vec<_>>(),
         });
         let before = serde_json::json!({
-            "frame": before["frame"].clone(),
-            "children": before["children"].clone(),
+            "frame": before_bounds["frame"].clone(),
+            "children": before_bounds["children"].clone(),
             "autofit": autofit_changes
                 .iter()
                 .map(|c| serde_json::json!({

@@ -728,7 +728,7 @@ links `reqwest`.
       `kcreate.invite.v1` content-type schema consumed by the
       companion extension.
 
-## Phase 8 — Production Hardening | In Progress
+## Phase 8 — Production Hardening | Complete | 100%
 
 Phase 8 is the production-hardening sweep that fills the gaps left
 by Phases 5–7 in the design-token / layout / brand-hub / image-studio

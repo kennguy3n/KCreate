@@ -60,6 +60,10 @@ rayon.workspace = true
 # not extend the editing-path closure walked by the local-first
 # sentinel.
 blake3 = { workspace = true }
+# Phase 9 Task 25: cross-platform memory-pressure probe. Pure Rust,
+# no networking, no async runtime — safe inside the editing-path
+# closure walked by `crates/kcreate_tests/tests/local_first.rs`.
+sysinfo.workspace = true
 # Used only behind the `native_canvas` feature to interpret raw
 # window handle bytes (NSView* / HWND / XID / wl_surface*) ferried
 # from the Electron main process. The default build does not link

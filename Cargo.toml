@@ -253,6 +253,30 @@ url = "2"
 # System info probe for device tiering
 sys-info = "0.9"
 
+# Phase 9: cross-platform system memory probe for the memory-pressure
+# watchdog. Pure Rust, no networking, MIT-licensed. `sys-info` cannot
+# report available memory on every platform consistently — `sysinfo`
+# does and is already in the Cargo registry via several transitive
+# deps in the workspace.
+sysinfo = { version = "0.39", default-features = false, features = ["system"] }
+
+# Phase 9 Block C Task 13: PSD layered raster importer. Pure-Rust,
+# no native deps, MIT-licensed. Parses Adobe Photoshop `.psd` files
+# down to layer pixel data + bounds + blend mode + opacity.
+psd = "0.3"
+
+# Phase 9 Block C Task 14: EXIF metadata extraction for JPEG / TIFF /
+# WebP / HEIC. Pure Rust (kamadak-exif), no native deps, BSD-licensed.
+# Used by `kcreate_export::jpeg` / `webp` import paths to preserve
+# EXIF metadata on round-trip.
+kamadak-exif = "0.6"
+
+# Phase 9 Block C Task 16: SVG-to-raster preview rasteriser. Pure
+# Rust, no native deps (uses `usvg` + `tiny-skia` which are already
+# in the workspace dep graph). Used for thumbnail generation of
+# SVG-only artboards and for the Export panel SVG preview.
+resvg = { version = "0.47", default-features = false, features = ["text"] }
+
 # Benchmarks
 criterion = { version = "0.5", features = ["html_reports"] }
 

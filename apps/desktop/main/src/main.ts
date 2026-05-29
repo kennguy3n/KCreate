@@ -1823,6 +1823,203 @@ function registerIpcHandlers(): void {
   );
 
   // ---------------------------------------------------------------------
+  // Phase 9 — guides, grid, alignment, AI palette/autofit/trace/iconify/
+  // batch-alt-text, PSD/Penpot/EXIF import, SVG preview, history panel,
+  // export validation, brief→project, memory watchdog, autosave.
+  // ---------------------------------------------------------------------
+  ipcMain.handle(
+    "kcreate/phase9/guide/create",
+    (
+      _e,
+      pageId: string,
+      orientation: string,
+      position: number,
+      color: string | null,
+      locked: boolean,
+    ): string =>
+      requireBridge().guideCreate(pageId, orientation, position, color, locked),
+  );
+  ipcMain.handle(
+    "kcreate/phase9/guide/delete",
+    (_e, id: string): boolean => requireBridge().guideDelete(id),
+  );
+  ipcMain.handle(
+    "kcreate/phase9/guide/clear-page",
+    (_e, pageId: string): number => requireBridge().guideClearPage(pageId),
+  );
+  ipcMain.handle(
+    "kcreate/phase9/guide/list",
+    (_e, pageId: string): string => requireBridge().guideList(pageId),
+  );
+  ipcMain.handle(
+    "kcreate/phase9/guide/list-all",
+    (): string => requireBridge().guideListAll(),
+  );
+
+  ipcMain.handle(
+    "kcreate/phase9/grid/get",
+    (_e, artboardId: string): string =>
+      requireBridge().artboardGridSettings(artboardId),
+  );
+  ipcMain.handle(
+    "kcreate/phase9/grid/set",
+    (
+      _e,
+      artboardId: string,
+      enabled: boolean,
+      spacing: number,
+      subdivisions: number,
+      color: string | null,
+    ): string =>
+      requireBridge().artboardSetGrid(
+        artboardId,
+        enabled,
+        spacing,
+        subdivisions,
+        color,
+      ),
+  );
+
+  ipcMain.handle(
+    "kcreate/phase9/document/align",
+    (_e, nodeIds: string[], alignment: string): string =>
+      requireBridge().documentAlign(JSON.stringify(nodeIds), alignment),
+  );
+  ipcMain.handle(
+    "kcreate/phase9/document/distribute",
+    (_e, nodeIds: string[], axis: string): string =>
+      requireBridge().documentDistribute(JSON.stringify(nodeIds), axis),
+  );
+
+  ipcMain.handle(
+    "kcreate/phase9/palette/apply-brand-kit",
+    (_e, nodeId: string, numColors: number, brandKitName: string): string =>
+      requireBridge().paletteExtractAndApplyBrandKit(
+        nodeId,
+        numColors,
+        brandKitName,
+      ),
+  );
+
+  ipcMain.handle(
+    "kcreate/phase9/text/autofit-recompute",
+    (_e, nodeId: string): string =>
+      requireBridge().textAutofitRecompute(nodeId),
+  );
+
+  ipcMain.handle(
+    "kcreate/phase9/ai/trace-raster",
+    (
+      _e,
+      nodeId: string,
+      threshold: number,
+      simplifyTolerance: number,
+    ): string =>
+      requireBridge().aiTraceRaster(nodeId, threshold, simplifyTolerance),
+  );
+  ipcMain.handle(
+    "kcreate/phase9/ai/iconify",
+    (_e, nodeId: string, gridSize: number): string =>
+      requireBridge().aiIconify(nodeId, gridSize),
+  );
+  ipcMain.handle(
+    "kcreate/phase9/ai/batch-alt-text",
+    (_e, pageId: string): string => requireBridge().aiBatchAltText(pageId),
+  );
+
+  ipcMain.handle(
+    "kcreate/phase9/import/psd",
+    (_e, path: string): string => requireBridge().importPsd(path),
+  );
+  ipcMain.handle(
+    "kcreate/phase9/import/penpot",
+    (_e, path: string): string => requireBridge().importPenpot(path),
+  );
+  ipcMain.handle(
+    "kcreate/phase9/image/read-exif",
+    (_e, bytes: Uint8Array): string => requireBridge().imageReadExif(bytes),
+  );
+
+  ipcMain.handle(
+    "kcreate/phase9/export/svg-preview",
+    (
+      _e,
+      svgBytes: Uint8Array,
+      maxWidth: number,
+      maxHeight: number,
+      transparent: boolean,
+    ): string =>
+      requireBridge().exportSvgPreview(
+        svgBytes,
+        maxWidth,
+        maxHeight,
+        transparent,
+      ),
+  );
+
+  ipcMain.handle(
+    "kcreate/phase9/operation-log/filter",
+    (_e, filterJson: string): string =>
+      requireBridge().operationLogFilter(filterJson),
+  );
+  ipcMain.handle(
+    "kcreate/phase9/export/validate",
+    (_e, requestJson: string): string =>
+      requireBridge().exportValidate(requestJson),
+  );
+  ipcMain.handle(
+    "kcreate/phase9/brief/to-project",
+    (_e, planJson: string): string => requireBridge().briefToProject(planJson),
+  );
+
+  ipcMain.handle(
+    "kcreate/phase9/memory/watchdog-start",
+    (_e, pollIntervalMs: number): boolean =>
+      requireBridge().memoryWatchdogStart(pollIntervalMs),
+  );
+  ipcMain.handle(
+    "kcreate/phase9/memory/watchdog-stop",
+    (): boolean => requireBridge().memoryWatchdogStop(),
+  );
+  ipcMain.handle(
+    "kcreate/phase9/memory/drain-events",
+    (): string => requireBridge().drainMemoryEvents(),
+  );
+  ipcMain.handle(
+    "kcreate/phase9/runtime/gpu-backend-name",
+    (): string => requireBridge().runtimeGpuBackendName(),
+  );
+
+  ipcMain.handle(
+    "kcreate/phase9/autosave/start",
+    (): boolean => requireBridge().autosaveStart(),
+  );
+  ipcMain.handle(
+    "kcreate/phase9/autosave/stop",
+    (): boolean => requireBridge().autosaveStop(),
+  );
+  ipcMain.handle(
+    "kcreate/phase9/autosave/force-now",
+    (): boolean => requireBridge().autosaveForceNow(),
+  );
+  ipcMain.handle(
+    "kcreate/phase9/autosave/status",
+    (): string => requireBridge().autosaveStatus(),
+  );
+  ipcMain.handle(
+    "kcreate/phase9/autosave/recovery-available",
+    (): string => requireBridge().autosaveRecoveryAvailable(),
+  );
+  ipcMain.handle(
+    "kcreate/phase9/autosave/recover",
+    (): void => requireBridge().autosaveRecover(),
+  );
+  ipcMain.handle(
+    "kcreate/phase9/autosave/dismiss-recovery",
+    (): void => requireBridge().autosaveDismissRecovery(),
+  );
+
+  // ---------------------------------------------------------------------
   // Phase 2 — preflight, icon pack, batch async, AI extras, plugins, MCP perms.
   // ---------------------------------------------------------------------
   ipcMain.handle("kcreate/preflight/run", (_e, requestJson: string) =>

@@ -17,6 +17,7 @@
 pub mod batch;
 pub mod cmyk_dither;
 pub mod code_gen;
+pub mod exif;
 pub mod figma_import;
 pub mod icon_pack;
 pub mod job_presets;
@@ -25,12 +26,16 @@ pub mod kbrand;
 pub mod pdf;
 pub mod pdf_import;
 pub mod pdf_shading;
+pub mod penpot_import;
 pub mod png;
 pub mod preflight;
+pub mod psd_import;
 pub mod scene_metadata;
 pub mod sketch_import;
 pub mod slice;
 pub mod svg;
+pub mod svg_preview;
+pub mod validate;
 pub mod webp;
 
 pub use batch::{
@@ -70,4 +75,22 @@ pub use preflight::{
 pub use scene_metadata::{
     raster_image_meta, text_layer_meta, RasterImageMeta, TextLayerMeta, RASTER_IMAGE_METADATA_KEY,
     TEXT_LAYER_METADATA_KEY, VECTOR_PATH_METADATA_KEY,
+};
+
+pub use exif::{read_exif_from_bytes, ExifError, ExifMetadata, ExifValue};
+pub use penpot_import::{
+    import_penpot, import_penpot_bytes, ImportedPenpot, ImportedPenpotAsset,
+    ImportedPenpotFrame, ImportedPenpotPage, ImportedPenpotShape, ImportedPenpotShapeKind,
+    PenpotImportError, PenpotImportWarning,
+};
+pub use psd_import::{
+    group_children as psd_group_children, import_psd, import_psd_bytes, ImportedPsd,
+    ImportedPsdGroup, ImportedPsdLayer, PsdImportError,
+};
+pub use svg_preview::{
+    svg_to_raster_preview, SvgPreview, SvgPreviewError, SvgPreviewOptions,
+};
+pub use validate::{
+    validate_export_request, ExportSeverity, ExportValidationError, ExportValidationIssue,
+    ExportValidationReport, ExportValidationRequest, DEFAULT_MAX_DIMENSION,
 };

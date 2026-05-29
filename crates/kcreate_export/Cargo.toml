@@ -27,6 +27,12 @@ log.workspace = true
 rayon.workspace = true
 parking_lot.workspace = true
 zip.workspace = true
+# Phase 9 Block C Task 13 PSD importer. Pure Rust, no native deps.
+psd.workspace = true
+# Phase 9 Block C Task 14 EXIF preservation. Pure Rust.
+kamadak-exif.workspace = true
+# Phase 9 Block C Task 16 SVG-to-raster preview. Pure Rust.
+resvg.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

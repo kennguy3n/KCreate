@@ -16,6 +16,7 @@ pub mod annotations;
 pub mod blobs;
 pub mod brand_versions;
 pub mod crypto;
+pub mod guides;
 pub mod project_io;
 pub mod schema;
 pub mod thumbnails;
@@ -26,6 +27,12 @@ pub use crypto::{
 
 pub use annotations::{
     delete_annotation, list_all, list_for_page, set_resolved, upsert_annotation,
+};
+pub use guides::{
+    delete_all_for_page as delete_all_guides_for_page, delete_guide,
+    list_all as list_all_guides, list_for_page as list_guides_for_page,
+    load_grid_settings, upsert_grid_settings, upsert_guide, Guide, GridSettings,
+    GuideOrientation,
 };
 pub use blobs::{BlobError, BlobRef, BlobStore};
 pub use brand_versions::{

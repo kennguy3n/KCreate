@@ -34,7 +34,11 @@
 //! place and the data crates (`kcreate_perf`, `kcreate_raster`)
 //! stay napi-free.
 
-use std::sync::OnceLock;
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
+use std::thread;
+use std::time::Duration;
 
 use kcreate_perf::startup;
 use kcreate_raster::tile::Tile;
@@ -255,6 +259,152 @@ pub fn tile_cache_insert(key: TileKey, tile: Tile) -> u64 {
 #[must_use]
 pub fn tile_cache_get(key: &TileKey) -> Option<Tile> {
     tile_cache_lock().lock().get(key).cloned()
+}
+
+// ---------------------------------------------------------------------------
+// Memory pressure watchdog (Phase 9 Task 25)
+// ---------------------------------------------------------------------------
+//
+// Background poll thread that watches the host's available RAM and
+// emits `MemoryPressureEvent::Entered` when it drops below the
+// configured threshold, then `Released` once it climbs back above
+// the threshold + a hysteresis margin. The thread is opt-in
+// (started by `memory_watchdog_start`) so unit tests that never
+// touch it don't pay the polling cost.
+//
+// On entering pressure, we proactively clear the tile cache so the
+// renderer's working set falls immediately. The thread does NOT
+// touch the workspace lock — the renderer reads events via
+// `drain_memory_events` and reacts on its own thread, keeping this
+// module deadlock-free w.r.t. the lock-ordering protocol documented
+// above.
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum MemoryPressureEvent {
+    /// Available RAM dropped below the configured threshold.
+    Entered { available_mb: u64, threshold_mb: u64 },
+    /// Available RAM climbed back above (threshold + hysteresis).
+    Released { available_mb: u64, threshold_mb: u64 },
+}
+
+struct WatchdogState {
+    queue: Mutex<VecDeque<MemoryPressureEvent>>,
+    running: AtomicBool,
+}
+
+fn watchdog_state() -> &'static Arc<WatchdogState> {
+    static STATE: OnceLock<Arc<WatchdogState>> = OnceLock::new();
+    STATE.get_or_init(|| {
+        Arc::new(WatchdogState {
+            queue: Mutex::new(VecDeque::new()),
+            running: AtomicBool::new(false),
+        })
+    })
+}
+
+/// Spawn the background memory-pressure watcher. Idempotent — a
+/// second call while the watcher is already running is a no-op and
+/// returns `false`. `poll_interval_ms == 0` is interpreted as the
+/// default 5 s.
+pub fn memory_watchdog_start(poll_interval_ms: u64) -> bool {
+    let interval = if poll_interval_ms == 0 {
+        Duration::from_secs(5)
+    } else {
+        Duration::from_millis(poll_interval_ms.max(100))
+    };
+    let state = watchdog_state().clone();
+    if state
+        .running
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return false;
+    }
+    thread::Builder::new()
+        .name("kcreate-mem-watchdog".to_string())
+        .spawn(move || {
+            let mut sysinfo = sysinfo::System::new();
+            let mut under_pressure = false;
+            while state.running.load(Ordering::SeqCst) {
+                let threshold_mb = {
+                    let guard = runtime_slot().lock();
+                    guard.effective_memory_pressure_threshold_mb()
+                };
+                sysinfo.refresh_memory();
+                // `available_memory()` is in bytes per sysinfo 0.39.
+                let available_mb = sysinfo.available_memory() / 1024 / 1024;
+                if available_mb < threshold_mb && !under_pressure {
+                    under_pressure = true;
+                    // Reactive cleanup — the cache is the largest
+                    // working set we can safely drop without
+                    // touching open project state.
+                    let _ = tile_cache_clear();
+                    push_event(MemoryPressureEvent::Entered {
+                        available_mb,
+                        threshold_mb,
+                    });
+                } else if under_pressure
+                    && available_mb > threshold_mb.saturating_add(threshold_mb / 4)
+                {
+                    under_pressure = false;
+                    push_event(MemoryPressureEvent::Released {
+                        available_mb,
+                        threshold_mb,
+                    });
+                }
+                thread::sleep(interval);
+            }
+        })
+        .expect("spawn watchdog thread");
+    true
+}
+
+/// Stop the background watcher. Returns `true` if it was running.
+pub fn memory_watchdog_stop() -> bool {
+    let state = watchdog_state();
+    state.running.swap(false, Ordering::SeqCst)
+}
+
+/// Pull and clear every queued event. The renderer calls this on a
+/// timer or in response to an IPC tick and updates the
+/// LowResourceBanner accordingly.
+pub fn drain_memory_events() -> Vec<MemoryPressureEvent> {
+    let mut q = watchdog_state().queue.lock();
+    q.drain(..).collect()
+}
+
+fn push_event(event: MemoryPressureEvent) {
+    let mut q = watchdog_state().queue.lock();
+    // Cap queued history at 32 — a runaway scenario would otherwise
+    // grow unbounded.
+    if q.len() >= 32 {
+        q.pop_front();
+    }
+    q.push_back(event);
+}
+
+/// Synthesise a memory-pressure event for tests / IPC fan-out from
+/// other bridge modules that need to nudge the renderer (e.g. the
+/// autosave subsystem detecting low disk space). Real callers
+/// should prefer `memory_watchdog_start` and let the polling
+/// thread do the work.
+pub fn memory_pressure_emit_for_test(event: MemoryPressureEvent) {
+    push_event(event);
+}
+
+/// Return a human-readable name for the active wgpu backend
+/// (Metal / D3D12 / Vulkan / CPU). Pulled from
+/// `RuntimeConfig::gpu_name` populated by `state::ensure_initialized`.
+/// Falls back to `"CPU"` when the renderer is running in the
+/// software backend (no wgpu adapter acquired).
+#[must_use]
+pub fn runtime_gpu_backend_name() -> String {
+    let guard = runtime_slot().lock();
+    guard
+        .gpu_name
+        .clone()
+        .unwrap_or_else(|| "CPU".to_string())
 }
 
 #[cfg(test)]

@@ -14,6 +14,7 @@ pub mod bg_remove;
 pub mod brand_extract;
 pub mod color_range;
 pub mod design_critique;
+pub mod iconify;
 pub mod design_tokens_vlm;
 pub mod image_gen;
 pub mod layout_suggest;
@@ -31,6 +32,7 @@ pub mod smart_select;
 pub mod style_describe;
 pub mod task_router;
 pub mod tool_call;
+pub mod trace;
 pub mod upscale;
 pub mod vision_chat;
 
@@ -41,6 +43,8 @@ pub use bg_remove::{
     BgRemoveError, BgRemoveOptions,
 };
 pub use color_range::{pack_mask, select_by_color_range};
+pub use iconify::{iconify, IconPath, IconPoint, IconifyError, IconifyOptions, IconifyResult};
+pub use trace::{trace_raster, TraceError, TraceOptions, TraceThreshold, TracedPath, TracedPoint};
 pub use layout_suggest::{
     suggest_layout_grouping, Bounds as LayoutBounds, LayoutAlignment, LayoutNode,
     LayoutOrientation, LayoutSuggestError, LayoutSuggestOptions, LayoutSuggestion,

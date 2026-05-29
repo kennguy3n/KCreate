@@ -1,0 +1,214 @@
+// Phase 9 Block D Task 22 — Configurable grid overlay.
+//
+// Reads per-artboard grid settings via
+// `window.kcreate.phase9.artboardGridSettings` and draws an evenly-
+// spaced grid over the canvas in the viewport space. Subdivisions
+// are drawn at half opacity. Toggling visibility is handled by the
+// parent (a keyboard shortcut and a menu item), so this component
+// just renders nothing when the artboard's grid is disabled.
+
+import { useEffect, useState } from "react";
+import type { GridSettingsInfo } from "../../../shared/scene";
+
+interface GridOverlayProps {
+  artboardId: string | null;
+  /** Viewport pan offset (document → screen) in CSS pixels. */
+  panX: number;
+  panY: number;
+  /** Viewport zoom factor (document → screen). */
+  zoom: number;
+  /** Width / height of the viewport's CSS area. */
+  width: number;
+  height: number;
+  /** Caller-controlled visibility (e.g. bound to Ctrl+'). */
+  visible: boolean;
+  /**
+   * Monotonic revision number incremented by the parent whenever the
+   * artboard's grid settings change out-of-band — e.g. after the
+   * settings dialog calls `window.kcreate.phase9.artboardSetGrid`.
+   * The overlay otherwise has no way to know its cached snapshot has
+   * gone stale (the bridge does not currently surface grid-change
+   * events). Defaults to `0`; pass any integer that increments on
+   * every update. Adding `settingsRevision` to the effect's dep
+   * array is the architecturally correct fix here because it keeps
+   * the overlay self-contained — the parent owns *when* a refresh
+   * is needed but the overlay still owns *how* to fetch and
+   * present the data.
+   */
+  settingsRevision?: number;
+}
+
+export function GridOverlay({
+  artboardId,
+  panX,
+  panY,
+  zoom,
+  width,
+  height,
+  visible,
+  settingsRevision = 0,
+}: GridOverlayProps): JSX.Element | null {
+  const [settings, setSettings] = useState<GridSettingsInfo | null>(null);
+
+  useEffect(() => {
+    if (artboardId === null) {
+      setSettings(null);
+      return;
+    }
+    let cancelled = false;
+    void window.kcreate.phase9
+      .artboardGridSettings(artboardId)
+      .then((s) => {
+        if (!cancelled) setSettings(s);
+      })
+      .catch(() => {
+        // Missing grid settings → no overlay. Errors are swallowed
+        // because the grid is a pure visual aid; failing should not
+        // disturb the editor.
+        if (!cancelled) setSettings(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+    // `settingsRevision` re-triggers the fetch after the parent
+    // mutates grid settings via `artboardSetGrid`; without it, the
+    // overlay would only refresh on artboard switch.
+  }, [artboardId, settingsRevision]);
+
+  if (!visible || settings === null || !settings.enabled || settings.spacing <= 0) {
+    return null;
+  }
+
+  const majorPx = settings.spacing * zoom;
+  if (majorPx < 4) {
+    // Spacing collapses to noise at extreme zoom-out. Skip drawing
+    // rather than producing a moiré pattern.
+    return null;
+  }
+  const subPx = settings.subdivisions > 1
+    ? majorPx / settings.subdivisions
+    : null;
+
+  const startX = mod(panX, majorPx);
+  const startY = mod(panY, majorPx);
+  const majorColor = settings.color || "#444a55";
+  const subColor = withAlpha(majorColor, 0.4);
+
+  // We key SVG lines by their integer index (vmaj-0, hmaj-3, ...)
+  // rather than by their floating-point coordinate. Two grid lines
+  // can round to the same float string at certain zoom/pan combos,
+  // which would emit a duplicate-key warning and silently drop one
+  // of the lines. Indexed keys are stable regardless of IEEE 754
+  // representation.
+  const lines: JSX.Element[] = [];
+  let vmajIdx = 0;
+  for (let x = startX; x < width; x += majorPx, vmajIdx += 1) {
+    lines.push(
+      <line
+        key={`vmaj-${vmajIdx}`}
+        x1={x}
+        x2={x}
+        y1={0}
+        y2={height}
+        stroke={majorColor}
+        strokeWidth={1}
+      />,
+    );
+  }
+  let hmajIdx = 0;
+  for (let y = startY; y < height; y += majorPx, hmajIdx += 1) {
+    lines.push(
+      <line
+        key={`hmaj-${hmajIdx}`}
+        x1={0}
+        x2={width}
+        y1={y}
+        y2={y}
+        stroke={majorColor}
+        strokeWidth={1}
+      />,
+    );
+  }
+  if (subPx !== null) {
+    // Subdivisions are anchored to the major grid (the first sub
+    // line *is* a major line, so it shares the major colour). We
+    // step the subdivision index from the major origin and skip
+    // every Nth tick where it would coincide with a major line —
+    // otherwise the major lines render twice (major + sub) and
+    // appear noticeably darker than expected.
+    const subPerMajor = settings.subdivisions;
+    // Offset from `startX` to the first sub line at or before
+    // `startX`. Because `startX` already sits on a major (it's
+    // `panX mod majorPx`), the loop simply iterates indices.
+    for (
+      let i = 0, x = startX;
+      x < width;
+      i += 1, x = startX + i * subPx
+    ) {
+      if (i % subPerMajor === 0) continue;
+      lines.push(
+        <line
+          key={`vsub-${i}`}
+          x1={x}
+          x2={x}
+          y1={0}
+          y2={height}
+          stroke={subColor}
+          strokeWidth={1}
+        />,
+      );
+    }
+    for (
+      let i = 0, y = startY;
+      y < height;
+      i += 1, y = startY + i * subPx
+    ) {
+      if (i % subPerMajor === 0) continue;
+      lines.push(
+        <line
+          key={`hsub-${i}`}
+          x1={0}
+          x2={width}
+          y1={y}
+          y2={y}
+          stroke={subColor}
+          strokeWidth={1}
+        />,
+      );
+    }
+  }
+
+  return (
+    <svg
+      width={width}
+      height={height}
+      style={{
+        position: "absolute",
+        inset: 0,
+        pointerEvents: "none",
+      }}
+      role="img"
+      aria-label="Pixel grid overlay"
+      data-testid="kcreate-grid-overlay"
+    >
+      {lines}
+    </svg>
+  );
+}
+
+function mod(a: number, b: number): number {
+  const r = a % b;
+  return r < 0 ? r + b : r;
+}
+
+function withAlpha(hex: string, alpha: number): string {
+  // Accepts "#RRGGBB" and returns rgba(). Falls back to rgba(0,0,0,a)
+  // when the input is malformed.
+  const m = /^#([0-9a-f]{6})$/iu.exec(hex);
+  if (!m) return `rgba(0,0,0,${alpha})`;
+  const v = m[1] ?? "";
+  const r = parseInt(v.slice(0, 2), 16);
+  const g = parseInt(v.slice(2, 4), 16);
+  const b = parseInt(v.slice(4, 6), 16);
+  return `rgba(${r},${g},${b},${alpha})`;
+}

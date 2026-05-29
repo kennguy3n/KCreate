@@ -1,8 +1,11 @@
 import { useCallback, useState } from "react";
 
+import { openScratchProject } from "./lib/scratchProject";
 import { EditorPage } from "./pages/EditorPage";
 import { CREATE_OPTIONS, HomePage } from "./pages/HomePage";
-import type { ProjectInfo } from "../../shared/scene";
+import type { BriefApplyResult, ProjectInfo } from "../../shared/scene";
+
+export { openScratchProject };
 
 type Route =
   | { kind: "home" }
@@ -58,6 +61,37 @@ export function App(): JSX.Element {
     });
   }, []);
 
+  // Phase 9 Block B Task 7 — Brief-to-project applied. The bridge
+  // has already added the artboard, brand kit, and starter layers
+  // to the currently open project. `BriefModal.applyPlan`
+  // guarantees there is an open project (it materialises a scratch
+  // one when invoked from HomePage), so `getProjectInfo` is
+  // expected to be non-null on this path.
+  const handleBriefApplied = useCallback(async (result: BriefApplyResult) => {
+    try {
+      const project = await window.kcreate.document.getProjectInfo();
+      if (!project) {
+        // Defensive: brief_to_project would have failed if no
+        // project was open, so reaching here means the workspace
+        // was closed between the apply call returning and this
+        // callback firing. Surface a clear error.
+        setRoute({
+          kind: "error",
+          message:
+            "Brief applied but the project was closed before the editor could open it.",
+        });
+        return;
+      }
+      void result;
+      setRoute({ kind: "editor", project });
+    } catch (e) {
+      setRoute({
+        kind: "error",
+        message: e instanceof Error ? e.message : String(e),
+      });
+    }
+  }, []);
+
   // Open a project from the HomePage's Recent grid. The bridge's
   // `projectOpen` does the heavy lifting (workspace mount, scene
   // sync, audit + recent-list update). Failures route to the error
@@ -99,48 +133,8 @@ export function App(): JSX.Element {
     <HomePage
       onOpenEditor={handleOpenEditor}
       onOpenProject={(p) => void handleOpenProject(p)}
+      onBriefApplied={(r) => void handleBriefApplied(r)}
     />
   );
 }
 
-async function openScratchProject(): Promise<ProjectInfo> {
-  // Phase 0 scaffold: drop the scratch project into the OS temp dir
-  // resolved by the Electron main process via Node's `os.tmpdir()`. The
-  // renderer never hard-codes paths — `/tmp` doesn't exist on Windows,
-  // and the previous fallback (`C:\\\\Temp` in a JS source literal) was
-  // double-escaped: the runtime string was `C:\\Temp` (with a literal
-  // backslash before `Temp`) instead of the intended `C:\Temp`, so
-  // project creation failed on Windows. The host's `os.tmpdir()` is
-  // correct on every platform and survives sandboxing.
-  //
-  // Before creating the new scratch project, ask the host to sweep
-  // stale `scratch-*.kstudio` directories from the temp dir. Without
-  // this, every Home→Editor transition leaks one directory — harmless
-  // on macOS/Linux (their temp reapers eventually clean up) but
-  // accumulates indefinitely on Windows.
-  //
-  // The sweep is `await`-ed (NOT fire-and-forget) on purpose. An
-  // earlier version of this code dispatched the cleanup as
-  // `void cleanupScratchProjects()` so we wouldn't block on a locked
-  // file from another running KCreate instance, but Devin Review
-  // (BUG_0001 on PR #2) caught the race: `cleanupScratchProjects`'s
-  // `fs.readdir` runs on the libuv thread pool, so the readdir can
-  // resolve *after* `createProject` has already mkdir'd the new
-  // `scratch-{timestamp}.kstudio` directory. The new directory's name
-  // matches the sweep filter, so the cleanup loop would `fs.rm` it
-  // out from under the live SQLite handle on macOS/Linux (no
-  // mandatory file locking) — corrupting the project on the next
-  // save. Awaiting guarantees the sweep observes a temp dir that
-  // *doesn't* yet contain the new project. The sweep is fast
-  // (single `readdir` + N `rm` calls in parallel internally) and
-  // already swallows per-entry errors, so locked files from other
-  // instances are skipped without blocking the user.
-  await window.kcreate.runtime.cleanupScratchProjects().catch(() => {
-    // Errors are already counted inside the host sweep; the renderer
-    // doesn't surface them — best-effort housekeeping must never
-    // block the user-facing path.
-  });
-  const name = `scratch-${Date.now()}`;
-  const dir = await window.kcreate.runtime.tempDir();
-  return window.kcreate.document.createProject(name, dir);
-}

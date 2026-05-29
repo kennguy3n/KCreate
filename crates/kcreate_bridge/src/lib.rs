@@ -18,6 +18,7 @@
 
 pub mod annotation_bridge;
 pub mod audit;
+pub mod autosave;
 #[cfg(feature = "collab")]
 pub mod collab;
 pub mod document;
@@ -34,6 +35,7 @@ pub mod perf;
 pub mod phase2;
 pub mod phase4;
 pub mod phase8;
+pub mod phase9;
 pub mod raster_ops;
 pub mod scene_sync;
 pub mod state;
@@ -4817,4 +4819,355 @@ pub fn annotation_resolve(request_json: String) -> NapiResult<bool> {
 pub fn annotation_delete(id_str: String) -> NapiResult<bool> {
     let id = parse_uuid(&id_str)?;
     annotation_bridge::annotation_delete(id).map_err(map_doc_err)
+}
+
+// =====================================================================
+// Phase 9 — N-API wrappers. The phase 9 bridge surface is large and
+// the JSON-string return pattern (already used by document_node_fill,
+// audit_list, etc.) keeps lib.rs from sprouting one #[napi(object)]
+// definition per struct on top of the canonical Serialize impl in
+// phase9.rs. The renderer parses these strings with the
+// scene.ts wire-format helpers.
+// =====================================================================
+
+fn json_out<T: serde::Serialize>(label: &'static str, value: &T) -> NapiResult<String> {
+    serde_json::to_string(value).map_err(|e| {
+        NapiError::new(
+            Status::GenericFailure,
+            format!("kcreate_bridge: serialize {label}: {e}"),
+        )
+    })
+}
+
+// ---------- Guides (Block D Task 21) ----------------------------------
+
+/// Create a guide on `page_id`. Returns the serialized [`GuideInfo`].
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn guide_create(
+    page_id_str: String,
+    orientation: String,
+    position: f64,
+    color: Option<String>,
+    locked: bool,
+) -> NapiResult<String> {
+    let page_id = parse_uuid(&page_id_str)?;
+    let info = phase9::guide_create(page_id, &orientation, position, color, locked)
+        .map_err(map_doc_err)?;
+    json_out("guide_create", &info)
+}
+
+/// Delete a guide by id. Returns `true` if a row was removed.
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn guide_delete(id_str: String) -> NapiResult<bool> {
+    let id = parse_uuid(&id_str)?;
+    phase9::guide_delete(id).map_err(map_doc_err)
+}
+
+/// Delete every guide on the page. Returns the count removed.
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn guide_clear_page(page_id_str: String) -> NapiResult<i64> {
+    let page_id = parse_uuid(&page_id_str)?;
+    phase9::guide_clear_page(page_id)
+        .map(|n| n as i64)
+        .map_err(map_doc_err)
+}
+
+/// List guides for a single page as a JSON array.
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn guide_list(page_id_str: String) -> NapiResult<String> {
+    let page_id = parse_uuid(&page_id_str)?;
+    let rows = phase9::guide_list(page_id).map_err(map_doc_err)?;
+    json_out("guide_list", &rows)
+}
+
+/// List guides across all pages as a JSON array.
+#[napi]
+pub fn guide_list_all() -> NapiResult<String> {
+    let rows = phase9::guide_list_all().map_err(map_doc_err)?;
+    json_out("guide_list_all", &rows)
+}
+
+// ---------- Grid settings (Block D Task 22) ---------------------------
+
+/// Load grid settings for an artboard as a JSON [`GridSettingsInfo`].
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn artboard_grid_settings(artboard_id_str: String) -> NapiResult<String> {
+    let id = parse_uuid(&artboard_id_str)?;
+    let info = phase9::artboard_grid_settings(id).map_err(map_doc_err)?;
+    json_out("artboard_grid_settings", &info)
+}
+
+/// Upsert grid settings for an artboard. Returns the stored row
+/// as JSON [`GridSettingsInfo`].
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn artboard_set_grid(
+    artboard_id_str: String,
+    enabled: bool,
+    spacing: f64,
+    subdivisions: u32,
+    color: Option<String>,
+) -> NapiResult<String> {
+    let id = parse_uuid(&artboard_id_str)?;
+    let info = phase9::artboard_set_grid(id, enabled, spacing, subdivisions, color)
+        .map_err(map_doc_err)?;
+    json_out("artboard_set_grid", &info)
+}
+
+// ---------- Alignment + distribution (Block D Task 23) ----------------
+
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn document_align(node_ids_json: String, alignment: String) -> NapiResult<String> {
+    let ids: Vec<String> = serde_json::from_str(&node_ids_json).map_err(|e| {
+        NapiError::new(
+            Status::InvalidArg,
+            format!("document_align: bad node_ids json: {e}"),
+        )
+    })?;
+    let uuids: Vec<Uuid> = ids
+        .iter()
+        .map(|s| parse_uuid(s))
+        .collect::<NapiResult<_>>()?;
+    let result = phase9::document_align(&uuids, &alignment).map_err(map_doc_err)?;
+    json_out("document_align", &result)
+}
+
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn document_distribute(node_ids_json: String, axis: String) -> NapiResult<String> {
+    let ids: Vec<String> = serde_json::from_str(&node_ids_json).map_err(|e| {
+        NapiError::new(
+            Status::InvalidArg,
+            format!("document_distribute: bad node_ids json: {e}"),
+        )
+    })?;
+    let uuids: Vec<Uuid> = ids
+        .iter()
+        .map(|s| parse_uuid(s))
+        .collect::<NapiResult<_>>()?;
+    let result = phase9::document_distribute(&uuids, &axis).map_err(map_doc_err)?;
+    json_out("document_distribute", &result)
+}
+
+// ---------- AI: palette → brand kit (Block B Task 10) -----------------
+
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn palette_extract_and_apply_brand_kit(
+    node_id_str: String,
+    num_colors: u32,
+    brand_kit_name: String,
+) -> NapiResult<String> {
+    let id = parse_uuid(&node_id_str)?;
+    let info = phase9::palette_extract_and_apply_brand_kit(id, num_colors, &brand_kit_name)
+        .map_err(map_doc_err)?;
+    json_out("palette_extract_and_apply_brand_kit", &info)
+}
+
+// ---------- AI: text autofit on resize (Block B Task 11) --------------
+
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn text_autofit_recompute(node_id_str: String) -> NapiResult<String> {
+    let id = parse_uuid(&node_id_str)?;
+    let info = phase9::text_autofit_recompute(id).map_err(map_doc_err)?;
+    json_out("text_autofit_recompute", &info)
+}
+
+// ---------- AI: raster → vector trace (Block B Task 12) ---------------
+
+/// Trace a raster node into vector paths. `threshold == 0` selects
+/// Otsu auto-thresholding. `simplify_tolerance` is RDP epsilon in
+/// pixels (use 1.0 for a reasonable default).
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn ai_trace_raster(
+    node_id_str: String,
+    threshold: u32,
+    simplify_tolerance: f64,
+) -> NapiResult<String> {
+    let id = parse_uuid(&node_id_str)?;
+    let threshold_u8 = u8::try_from(threshold).map_err(|_| {
+        NapiError::new(
+            Status::InvalidArg,
+            format!("ai_trace_raster: threshold {threshold} out of u8 range"),
+        )
+    })?;
+    let tol = simplify_tolerance as f32;
+    let info = phase9::ai_trace_raster(id, threshold_u8, tol).map_err(map_doc_err)?;
+    json_out("ai_trace_raster", &info)
+}
+
+// ---------- AI: icon-ify (Block D Task 19) ----------------------------
+
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn ai_iconify(source_node_id_str: String, grid_size: u32) -> NapiResult<String> {
+    let id = parse_uuid(&source_node_id_str)?;
+    let info = phase9::ai_iconify(id, grid_size).map_err(map_doc_err)?;
+    json_out("ai_iconify", &info)
+}
+
+// ---------- AI: batch alt-text (Block D Task 20) ----------------------
+
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn ai_batch_alt_text(page_id_str: String) -> NapiResult<String> {
+    let id = parse_uuid(&page_id_str)?;
+    let rows = phase9::ai_batch_alt_text(id).map_err(map_doc_err)?;
+    json_out("ai_batch_alt_text", &rows)
+}
+
+// ---------- Import: PSD / Penpot + EXIF (Block C Tasks 13–15) ---------
+
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn import_psd(path: String) -> NapiResult<String> {
+    let info = phase9::import_psd(&path).map_err(map_doc_err)?;
+    json_out("import_psd", &info)
+}
+
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn import_penpot(path: String) -> NapiResult<String> {
+    let info = phase9::import_penpot(&path).map_err(map_doc_err)?;
+    json_out("import_penpot", &info)
+}
+
+#[napi]
+pub fn image_read_exif(bytes: napi::bindgen_prelude::Buffer) -> NapiResult<String> {
+    let info = phase9::image_read_exif(&bytes).map_err(map_doc_err)?;
+    json_out("image_read_exif", &info)
+}
+
+// ---------- Export: SVG raster preview (Block C Task 16) --------------
+
+/// Rasterise `svg_bytes` (the source SVG text) into a PNG sized to
+/// fit `(max_width, max_height)`. `transparent` controls whether
+/// the background is left transparent or composited against white.
+#[napi]
+pub fn export_svg_preview(
+    svg_bytes: napi::bindgen_prelude::Buffer,
+    max_width: u32,
+    max_height: u32,
+    transparent: bool,
+) -> NapiResult<String> {
+    let info = phase9::export_svg_preview(&svg_bytes, max_width, max_height, transparent)
+        .map_err(map_doc_err)?;
+    json_out("export_svg_preview", &info)
+}
+
+// ---------- History panel (Block C Task 17) ---------------------------
+
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn operation_log_filter(filter_json: String) -> NapiResult<String> {
+    let filter: phase9::OperationLogFilter = serde_json::from_str(&filter_json).map_err(|e| {
+        NapiError::new(
+            Status::InvalidArg,
+            format!("operation_log_filter: bad filter json: {e}"),
+        )
+    })?;
+    let rows = phase9::operation_log_filter(&filter).map_err(map_doc_err)?;
+    json_out("operation_log_filter", &rows)
+}
+
+// ---------- Export validation (Block E Task 27) -----------------------
+
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn export_validate(request_json: String) -> NapiResult<String> {
+    let request: kcreate_export::validate::ExportValidationRequest =
+        serde_json::from_str(&request_json).map_err(|e| {
+            NapiError::new(
+                Status::InvalidArg,
+                format!("export_validate: bad request json: {e}"),
+            )
+        })?;
+    let report = phase9::export_validate(request);
+    json_out("export_validate", &report)
+}
+
+// ---------- Brief → project (Block B Task 7) --------------------------
+
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn brief_to_project(plan_json: String) -> NapiResult<String> {
+    let plan: phase9::BriefPlan = serde_json::from_str(&plan_json).map_err(|e| {
+        NapiError::new(
+            Status::InvalidArg,
+            format!("brief_to_project: bad plan json: {e}"),
+        )
+    })?;
+    let info = phase9::brief_to_project(&plan).map_err(map_doc_err)?;
+    json_out("brief_to_project", &info)
+}
+
+// ---------- Memory watchdog (Block E Task 25) -------------------------
+
+#[napi]
+pub fn memory_watchdog_start(poll_interval_ms: u32) -> bool {
+    perf::memory_watchdog_start(u64::from(poll_interval_ms))
+}
+
+#[napi]
+pub fn memory_watchdog_stop() -> bool {
+    perf::memory_watchdog_stop()
+}
+
+#[napi]
+pub fn drain_memory_events() -> NapiResult<String> {
+    let events = perf::drain_memory_events();
+    json_out("drain_memory_events", &events)
+}
+
+/// Wgpu backend name (Metal / D3D12 / Vulkan / CPU). Block B Task 8.
+#[napi]
+pub fn runtime_gpu_backend_name() -> String {
+    perf::runtime_gpu_backend_name()
+}
+
+// ---------- Autosave + crash recovery (Block E Task 26) ---------------
+
+#[napi]
+pub fn autosave_start() -> bool {
+    autosave::autosave_start()
+}
+
+#[napi]
+pub fn autosave_stop() -> bool {
+    autosave::autosave_stop()
+}
+
+#[napi]
+pub fn autosave_force_now() -> NapiResult<bool> {
+    autosave::autosave_force_now().map_err(map_doc_err)
+}
+
+#[napi]
+pub fn autosave_status() -> NapiResult<String> {
+    let status = autosave::autosave_status();
+    json_out("autosave_status", &status)
+}
+
+#[napi]
+pub fn autosave_recovery_available() -> NapiResult<String> {
+    let marker = autosave::autosave_recovery_available().map_err(map_doc_err)?;
+    json_out("autosave_recovery_available", &marker)
+}
+
+#[napi]
+pub fn autosave_recover() -> NapiResult<()> {
+    autosave::autosave_recover().map_err(map_doc_err)
+}
+
+#[napi]
+pub fn autosave_dismiss_recovery() -> NapiResult<()> {
+    autosave::autosave_dismiss_recovery().map_err(map_doc_err)
 }

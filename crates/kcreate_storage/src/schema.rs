@@ -154,6 +154,32 @@ pub const MIGRATIONS: &[&str] = &[
         key TEXT PRIMARY KEY,
         value TEXT NOT NULL
     );",
+    // 16: ruler guides (Phase 9 Task 21). One row per guide. A
+    //     guide is a horizontal or vertical line on a page used
+    //     as a snap target; we persist them per-project so they
+    //     survive close/reopen and undo/redo.
+    r"CREATE TABLE IF NOT EXISTS guides (
+        id TEXT PRIMARY KEY,
+        page_id TEXT NOT NULL,
+        orientation TEXT NOT NULL CHECK (orientation IN ('horizontal', 'vertical')),
+        position REAL NOT NULL,
+        color TEXT NOT NULL DEFAULT '#0099ff',
+        locked INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL
+    );",
+    "CREATE INDEX IF NOT EXISTS idx_guides_page ON guides(page_id);",
+    // 17: grid settings (Phase 9 Task 22). One row per artboard
+    //     storing the per-artboard pixel-grid override. The
+    //     project-level default lives in `project_meta` under
+    //     key `grid_default`.
+    r"CREATE TABLE IF NOT EXISTS grid_settings (
+        artboard_id TEXT PRIMARY KEY,
+        enabled INTEGER NOT NULL DEFAULT 0,
+        spacing REAL NOT NULL DEFAULT 16.0,
+        subdivisions INTEGER NOT NULL DEFAULT 2,
+        color TEXT NOT NULL DEFAULT '#cccccc',
+        updated_at TEXT NOT NULL
+    );",
 ];
 
 /// Schema-level errors. Wraps `rusqlite::Error` and adds a couple of

@@ -202,6 +202,26 @@ pub struct RuntimeConfig {
     pub max_model_mb: u64,
     pub ai_models_dir: PathBuf,
     pub low_resource_mode: bool,
+    /// Phase 9 Task 26: how often the autosave thread snapshots the
+    /// open project. Default 60s; floor 10s, ceiling 600s. `0` is
+    /// treated as "use default".
+    #[serde(default = "default_autosave_interval_secs")]
+    pub autosave_interval_secs: u32,
+    /// Phase 9 Task 25: available-RAM watermark (in MB). When the
+    /// memory-pressure watchdog observes available system memory
+    /// drop below this floor it raises a `MemoryPressure` event so
+    /// the bridge can flush the tile cache and trim the undo log.
+    /// Default 500 MB; floor 128 MB.
+    #[serde(default = "default_memory_pressure_threshold_mb")]
+    pub memory_pressure_threshold_mb: u64,
+}
+
+const fn default_autosave_interval_secs() -> u32 {
+    60
+}
+
+const fn default_memory_pressure_threshold_mb() -> u64 {
+    500
 }
 
 impl RuntimeConfig {
@@ -306,6 +326,30 @@ impl RuntimeConfig {
     pub fn set_low_resource(&mut self, enabled: bool) {
         self.low_resource_mode = enabled || self.device_tier.defaults_to_low_resource();
     }
+
+    /// Clamped autosave interval in seconds. Phase 9 Task 26 — the
+    /// watchdog uses this rather than the raw field so a hand-edited
+    /// config that sets `autosave_interval_secs = 0` (or > 10
+    /// minutes) is still operable.
+    #[must_use]
+    pub fn effective_autosave_interval_secs(&self) -> u32 {
+        let raw = if self.autosave_interval_secs == 0 {
+            default_autosave_interval_secs()
+        } else {
+            self.autosave_interval_secs
+        };
+        raw.clamp(10, 600)
+    }
+
+    /// Clamped memory-pressure threshold in MB. Phase 9 Task 25.
+    #[must_use]
+    pub fn effective_memory_pressure_threshold_mb(&self) -> u64 {
+        if self.memory_pressure_threshold_mb < 128 {
+            128
+        } else {
+            self.memory_pressure_threshold_mb
+        }
+    }
 }
 
 impl RuntimeConfig {
@@ -352,6 +396,8 @@ impl RuntimeConfig {
             max_model_mb,
             ai_models_dir: default_ai_models_dir(),
             low_resource_mode,
+            autosave_interval_secs: default_autosave_interval_secs(),
+            memory_pressure_threshold_mb: default_memory_pressure_threshold_mb(),
         }
     }
 }

@@ -197,6 +197,29 @@ import type {
   AnnotationBridge,
   Annotation,
   AnnotationListResponse,
+  Phase9Bridge,
+  GuideInfo,
+  GridSettingsInfo,
+  AlignmentResult,
+  Alignment,
+  DistributeAxis,
+  PaletteApplyResult,
+  AutofitRecomputeResult,
+  TraceResult,
+  IconifyResultInfo,
+  BatchAltTextEntry,
+  ImportSummary,
+  ExifResult,
+  SvgPreviewInfo,
+  OperationLogFilter,
+  OperationInfo,
+  ExportValidationRequest,
+  ExportValidationReport,
+  BriefPlan,
+  BriefApplyResult,
+  MemoryPressureEvent,
+  AutosaveStatus,
+  AutosaveMarker,
 } from "../../shared/scene";
 
 type FrameInfoSnake = {
@@ -3151,6 +3174,213 @@ const annotation: AnnotationBridge = {
   },
 };
 
+// ---------------------------------------------------------------------------
+// Phase 9 — guides, grid, alignment, AI palette/autofit/trace/iconify/batch-
+// alt-text, PSD/Penpot/EXIF import, SVG preview, history panel, export
+// validation, brief → project, memory watchdog, autosave. See `Phase9Bridge`
+// in shared/scene.ts for the contract.
+// ---------------------------------------------------------------------------
+
+const phase9: Phase9Bridge = {
+  async guideCreate(pageId, orientation, position, color, locked) {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/phase9/guide/create",
+      pageId,
+      orientation,
+      position,
+      color,
+      locked,
+    )) as string;
+    return JSON.parse(raw) as GuideInfo;
+  },
+  async guideDelete(id) {
+    return (await ipcRenderer.invoke("kcreate/phase9/guide/delete", id)) as boolean;
+  },
+  async guideClearPage(pageId) {
+    return (await ipcRenderer.invoke("kcreate/phase9/guide/clear-page", pageId)) as number;
+  },
+  async guideList(pageId) {
+    const raw = (await ipcRenderer.invoke("kcreate/phase9/guide/list", pageId)) as string;
+    return JSON.parse(raw) as GuideInfo[];
+  },
+  async guideListAll() {
+    const raw = (await ipcRenderer.invoke("kcreate/phase9/guide/list-all")) as string;
+    return JSON.parse(raw) as GuideInfo[];
+  },
+
+  async artboardGridSettings(artboardId) {
+    const raw = (await ipcRenderer.invoke("kcreate/phase9/grid/get", artboardId)) as string;
+    return JSON.parse(raw) as GridSettingsInfo;
+  },
+  async artboardSetGrid(artboardId, enabled, spacing, subdivisions, color) {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/phase9/grid/set",
+      artboardId,
+      enabled,
+      spacing,
+      subdivisions,
+      color,
+    )) as string;
+    return JSON.parse(raw) as GridSettingsInfo;
+  },
+
+  async documentAlign(nodeIds, alignment: Alignment) {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/phase9/document/align",
+      nodeIds,
+      alignment,
+    )) as string;
+    return JSON.parse(raw) as AlignmentResult[];
+  },
+  async documentDistribute(nodeIds, axis: DistributeAxis) {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/phase9/document/distribute",
+      nodeIds,
+      axis,
+    )) as string;
+    return JSON.parse(raw) as AlignmentResult[];
+  },
+
+  async paletteExtractAndApplyBrandKit(nodeId, numColors, brandKitName) {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/phase9/palette/apply-brand-kit",
+      nodeId,
+      numColors,
+      brandKitName,
+    )) as string;
+    return JSON.parse(raw) as PaletteApplyResult;
+  },
+
+  async textAutofitRecompute(nodeId) {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/phase9/text/autofit-recompute",
+      nodeId,
+    )) as string;
+    return JSON.parse(raw) as AutofitRecomputeResult;
+  },
+
+  async aiTraceRaster(nodeId, threshold, simplifyTolerance) {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/phase9/ai/trace-raster",
+      nodeId,
+      threshold,
+      simplifyTolerance,
+    )) as string;
+    return JSON.parse(raw) as TraceResult;
+  },
+  async aiIconify(sourceNodeId, gridSize) {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/phase9/ai/iconify",
+      sourceNodeId,
+      gridSize,
+    )) as string;
+    return JSON.parse(raw) as IconifyResultInfo;
+  },
+  async aiBatchAltText(pageId) {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/phase9/ai/batch-alt-text",
+      pageId,
+    )) as string;
+    return JSON.parse(raw) as BatchAltTextEntry[];
+  },
+
+  async importPsd(path) {
+    const raw = (await ipcRenderer.invoke("kcreate/phase9/import/psd", path)) as string;
+    return JSON.parse(raw) as ImportSummary;
+  },
+  async importPenpot(path) {
+    const raw = (await ipcRenderer.invoke("kcreate/phase9/import/penpot", path)) as string;
+    return JSON.parse(raw) as ImportSummary;
+  },
+  async imageReadExif(bytes) {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/phase9/image/read-exif",
+      bytes,
+    )) as string;
+    return JSON.parse(raw) as ExifResult;
+  },
+
+  async exportSvgPreview(svgBytes, maxWidth, maxHeight, transparent) {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/phase9/export/svg-preview",
+      svgBytes,
+      maxWidth,
+      maxHeight,
+      transparent,
+    )) as string;
+    return JSON.parse(raw) as SvgPreviewInfo;
+  },
+
+  async operationLogFilter(filter: OperationLogFilter) {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/phase9/operation-log/filter",
+      JSON.stringify(filter),
+    )) as string;
+    return JSON.parse(raw) as OperationInfo[];
+  },
+  async exportValidate(request: ExportValidationRequest) {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/phase9/export/validate",
+      JSON.stringify(request),
+    )) as string;
+    return JSON.parse(raw) as ExportValidationReport;
+  },
+  async briefToProject(plan: BriefPlan) {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/phase9/brief/to-project",
+      JSON.stringify(plan),
+    )) as string;
+    return JSON.parse(raw) as BriefApplyResult;
+  },
+
+  async memoryWatchdogStart(pollIntervalMs) {
+    return (await ipcRenderer.invoke(
+      "kcreate/phase9/memory/watchdog-start",
+      pollIntervalMs,
+    )) as boolean;
+  },
+  async memoryWatchdogStop() {
+    return (await ipcRenderer.invoke("kcreate/phase9/memory/watchdog-stop")) as boolean;
+  },
+  async drainMemoryEvents() {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/phase9/memory/drain-events",
+    )) as string;
+    return JSON.parse(raw) as MemoryPressureEvent[];
+  },
+  async runtimeGpuBackendName() {
+    return (await ipcRenderer.invoke(
+      "kcreate/phase9/runtime/gpu-backend-name",
+    )) as string;
+  },
+
+  async autosaveStart() {
+    return (await ipcRenderer.invoke("kcreate/phase9/autosave/start")) as boolean;
+  },
+  async autosaveStop() {
+    return (await ipcRenderer.invoke("kcreate/phase9/autosave/stop")) as boolean;
+  },
+  async autosaveForceNow() {
+    return (await ipcRenderer.invoke("kcreate/phase9/autosave/force-now")) as boolean;
+  },
+  async autosaveStatus() {
+    const raw = (await ipcRenderer.invoke("kcreate/phase9/autosave/status")) as string;
+    return JSON.parse(raw) as AutosaveStatus;
+  },
+  async autosaveRecoveryAvailable() {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/phase9/autosave/recovery-available",
+    )) as string;
+    return JSON.parse(raw) as AutosaveMarker | null;
+  },
+  async autosaveRecover() {
+    await ipcRenderer.invoke("kcreate/phase9/autosave/recover");
+  },
+  async autosaveDismissRecovery() {
+    await ipcRenderer.invoke("kcreate/phase9/autosave/dismiss-recovery");
+  },
+};
+
 contextBridge.exposeInMainWorld("kcreate", {
   renderer,
   document,
@@ -3196,6 +3426,7 @@ contextBridge.exposeInMainWorld("kcreate", {
   deeplink,
   clipboard,
   phase8,
+  phase9,
   projectEncryption,
   annotation,
 });

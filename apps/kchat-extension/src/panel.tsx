@@ -1,5 +1,8 @@
 import { useCallback, useEffect, useState } from "react";
+import { ActivityFeed } from "./ActivityFeed";
 import { InviteCard } from "./InviteCard";
+import { ProjectBrowserPanel } from "./ProjectBrowserPanel";
+import { SessionStatusBadge } from "./SessionStatusBadge";
 import {
   listMyCommunities,
   listRecentProjects,
@@ -77,15 +80,18 @@ export function Panel({
     <section data-testid="kcreate-companion-panel" style={panelStyle}>
       <header style={panelHeaderStyle}>
         <h2 style={panelTitleStyle}>KCreate</h2>
-        <button
-          type="button"
-          onClick={() => void refresh()}
-          disabled={state.loadState === "loading"}
-          style={refreshButtonStyle}
-          data-testid="kcreate-refresh"
-        >
-          {state.loadState === "loading" ? "…" : "Refresh"}
-        </button>
+        <div style={headerActionsStyle}>
+          <SessionStatusBadge />
+          <button
+            type="button"
+            onClick={() => void refresh()}
+            disabled={state.loadState === "loading"}
+            style={refreshButtonStyle}
+            data-testid="kcreate-refresh"
+          >
+            {state.loadState === "loading" ? "…" : "Refresh"}
+          </button>
+        </div>
       </header>
 
       {state.error !== undefined && (
@@ -111,6 +117,14 @@ export function Panel({
             </li>
           ))}
         </ul>
+      )}
+
+      <ProjectBrowserPanel
+        {...(activeCommunityId !== undefined ? { activeCommunityId } : {})}
+      />
+
+      {activeConversationId !== undefined && (
+        <ActivityFeed conversationId={activeConversationId} />
       )}
 
       <h3 style={sectionTitleStyle}>Share invites</h3>
@@ -164,6 +178,12 @@ const panelHeaderStyle = {
   alignItems: "center",
   justifyContent: "space-between",
   marginBottom: 10,
+};
+
+const headerActionsStyle = {
+  display: "flex",
+  alignItems: "center",
+  gap: 8,
 };
 
 const panelTitleStyle = {

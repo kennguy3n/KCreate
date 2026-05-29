@@ -17,15 +17,18 @@
 //! `lib.rs`.
 
 use chrono::Utc;
-use kcreate_core::node::{Bounds, Constraints};
+use kcreate_core::node::{Bounds, Constraints, NodeType};
 use kcreate_core::operation::Operation;
 use kcreate_core::token_binding;
 use kcreate_export::job_presets::{presets_for_job, JobExportPresets, JobType};
+use kcreate_export::scene_metadata::{text_layer_meta, TextLayerMeta, TEXT_LAYER_METADATA_KEY};
 use kcreate_layout::constraints::apply_constraints;
 use kcreate_storage::brand_versions::{
     diff_brand_kit_versions, list_brand_kit_versions, restore_brand_kit_version,
     save_brand_kit_version, BrandKitDiff, BrandKitVersion,
 };
+use kcreate_text::autofit::{compute_autofit_size, AutofitOptions};
+use kcreate_text::paragraph::TextStyle;
 use kcreate_text::tokens::{encode_page_number_token, PageNumberFormat};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -225,7 +228,16 @@ pub fn document_resize_frame(frame_id: Uuid, new_bounds: Bounds) -> Result<()> {
                 })
                 .collect();
         }
-        let before = serde_json::json!({
+        // `before_bounds` captures the parent and children's
+        // *pre-resize* bounds so we can reuse the values when
+        // assembling the final `before` payload after autofit
+        // changes are known. Naming this `before` and then
+        // re-binding `before` further down was correct (Rust
+        // shadowing evaluates the RHS against the prior binding
+        // before the new one takes effect) but easy to misread
+        // as self-referential; the explicit name keeps the
+        // dataflow obvious.
+        let before_bounds = serde_json::json!({
             "frame": parent_old,
             "children": child_updates
                 .iter()
@@ -247,17 +259,136 @@ pub fn document_resize_frame(frame_id: Uuid, new_bounds: Bounds) -> Result<()> {
                 affected.push(*child_id);
             }
         }
+        // Phase 9 Task 11 — copy-fit text on resize. Any TextLayer
+        // child whose bounds we just changed and which has the
+        // `text_autofit` opt-in metadata gets its font size
+        // bisected so the existing text fits the new frame. The
+        // recomputation is captured in the same `before`/`after`
+        // payload so undo restores both the bounds *and* the font
+        // size atomically (you can't undo a resize and leave a
+        // stale autofitted size behind).
+        let mut autofit_changes: Vec<AutofitChange> = Vec::new();
+        for (child_id, _, _, _) in &child_updates {
+            if let Some(change) = recompute_autofit_in_place(ws, *child_id) {
+                autofit_changes.push(change);
+            }
+        }
+        // The autofit slice of the audit payload must encode the
+        // state the slot *holds*, not the diff. `before.autofit[i]`
+        // captures the pre-resize font size (the value to restore on
+        // undo), and `after.autofit[i]` captures the post-resize
+        // size. An earlier revision emitted `{previous_size,
+        // new_size}` in both halves, which made the two snapshots
+        // identical — undoing the resize would have left autofitted
+        // text at its post-resize size. Encoding each half as the
+        // single `font_size` it represents keeps the audit payload
+        // suitable for a future symmetric apply_patch arm.
         let after = serde_json::json!({
             "frame": new_bounds,
             "children": child_updates
                 .iter()
                 .map(|(id, _, new_b, _)| serde_json::json!({ "id": id.to_string(), "bounds": new_b }))
                 .collect::<Vec<_>>(),
+            "autofit": autofit_changes
+                .iter()
+                .map(|c| serde_json::json!({
+                    "id": c.node_id.to_string(),
+                    "font_size": c.new_size,
+                }))
+                .collect::<Vec<_>>(),
+        });
+        let before = serde_json::json!({
+            "frame": before_bounds["frame"].clone(),
+            "children": before_bounds["children"].clone(),
+            "autofit": autofit_changes
+                .iter()
+                .map(|c| serde_json::json!({
+                    "id": c.node_id.to_string(),
+                    "font_size": c.previous_size,
+                }))
+                .collect::<Vec<_>>(),
         });
         ws.project.modified_at = Utc::now();
         let op = Operation::new("user", "document_resize_frame", before, after, affected);
         ws.project.execute_operation(op);
         Ok(())
+    })
+}
+
+/// Bookkeeping for `recompute_autofit_in_place`. Captured per
+/// text node whose font size actually changed so the
+/// `document_resize_frame` undo payload includes both halves
+/// of the recomputation.
+struct AutofitChange {
+    node_id: Uuid,
+    previous_size: f32,
+    new_size: f32,
+}
+
+/// If `node_id` is a text layer with `text_autofit = true` in
+/// its metadata, bisect a new font size for its current bounds
+/// and write it back to `TextLayerMeta`. Returns `Some(change)`
+/// when the size actually moved, `None` when there was no change
+/// (font fits unchanged, autofit disabled, wrong node type, or
+/// the recomputation failed — failures are logged via tracing
+/// so they don't silently swallow the resize).
+fn recompute_autofit_in_place(
+    ws: &mut crate::document::Workspace,
+    node_id: Uuid,
+) -> Option<AutofitChange> {
+    let node = ws.project.document.get_node_mut(node_id)?;
+    if node.node_type != NodeType::TextLayer {
+        return None;
+    }
+    let autofit_enabled = node
+        .metadata
+        .get(TEXT_AUTOFIT_METADATA_KEY)
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    if !autofit_enabled {
+        return None;
+    }
+    let meta = text_layer_meta(node)?;
+    let frame = node.text_frame_options();
+    let bounds = node.bounds;
+    let previous_size = meta.font_size;
+    let style = TextStyle {
+        font_family: meta.font_family.clone(),
+        font_size: meta.font_size,
+        line_height: 1.25,
+    };
+    let opts = AutofitOptions {
+        min_size: 6.0,
+        max_size: 240.0,
+        tolerance: 0.25,
+        max_iterations: 12,
+    };
+    let new_size = match compute_autofit_size(&meta.text, &style, &frame, bounds, &opts) {
+        Ok(s) => s,
+        Err(_) => {
+            // Layout failure (e.g. zero-size font cache miss) —
+            // leave the meta alone and bail. The renderer will
+            // fall back to the existing font size.
+            return None;
+        }
+    };
+    if (new_size - previous_size).abs() < f32::EPSILON {
+        return None;
+    }
+    let new_meta = TextLayerMeta {
+        text: meta.text,
+        font_family: meta.font_family,
+        font_size: new_size,
+    };
+    node.metadata.insert(
+        TEXT_LAYER_METADATA_KEY.to_string(),
+        serde_json::to_value(&new_meta).unwrap_or(serde_json::Value::Null),
+    );
+    node.touch();
+    Some(AutofitChange {
+        node_id,
+        previous_size,
+        new_size,
     })
 }
 

@@ -1038,6 +1038,80 @@ export interface Bridge {
   annotationList(requestJson: string): string;
   annotationResolve(requestJson: string): boolean;
   annotationDelete(idStr: string): boolean;
+
+  // -------------------------------------------------------------------
+  // Phase 9 — guides, grid, alignment, AI palette/autofit/trace/iconify/
+  // batch-alt-text, PSD/Penpot/EXIF import, SVG preview, history panel,
+  // export validation, brief→project, memory watchdog, autosave. See
+  // `crates/kcreate_bridge/src/{phase9,perf,autosave}.rs`.
+  // -------------------------------------------------------------------
+  guideCreate(
+    pageIdStr: string,
+    orientation: string,
+    position: number,
+    color: string | null | undefined,
+    locked: boolean,
+  ): string;
+  guideDelete(idStr: string): boolean;
+  guideClearPage(pageIdStr: string): number;
+  guideList(pageIdStr: string): string;
+  guideListAll(): string;
+
+  artboardGridSettings(artboardIdStr: string): string;
+  artboardSetGrid(
+    artboardIdStr: string,
+    enabled: boolean,
+    spacing: number,
+    subdivisions: number,
+    color: string | null | undefined,
+  ): string;
+
+  documentAlign(nodeIdsJson: string, alignment: string): string;
+  documentDistribute(nodeIdsJson: string, axis: string): string;
+
+  paletteExtractAndApplyBrandKit(
+    nodeIdStr: string,
+    numColors: number,
+    brandKitName: string,
+  ): string;
+
+  textAutofitRecompute(nodeIdStr: string): string;
+
+  aiTraceRaster(
+    nodeIdStr: string,
+    threshold: number,
+    simplifyTolerance: number,
+  ): string;
+  aiIconify(sourceNodeIdStr: string, gridSize: number): string;
+  aiBatchAltText(pageIdStr: string): string;
+
+  importPsd(path: string): string;
+  importPenpot(path: string): string;
+  imageReadExif(bytes: Uint8Array): string;
+
+  exportSvgPreview(
+    svgBytes: Uint8Array,
+    maxWidth: number,
+    maxHeight: number,
+    transparent: boolean,
+  ): string;
+
+  operationLogFilter(filterJson: string): string;
+  exportValidate(requestJson: string): string;
+  briefToProject(planJson: string): string;
+
+  memoryWatchdogStart(pollIntervalMs: number): boolean;
+  memoryWatchdogStop(): boolean;
+  drainMemoryEvents(): string;
+  runtimeGpuBackendName(): string;
+
+  autosaveStart(): boolean;
+  autosaveStop(): boolean;
+  autosaveForceNow(): boolean;
+  autosaveStatus(): string;
+  autosaveRecoveryAvailable(): string;
+  autosaveRecover(): void;
+  autosaveDismissRecovery(): void;
 }
 
 function bridgeBinaryPath(): string {

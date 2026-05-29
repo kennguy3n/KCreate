@@ -1,11 +1,14 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 
 import type {
+  BriefApplyResult,
+  LlmStatus,
   RecentProjectInfo,
   RuntimeStatus,
   ThumbnailBytes,
 } from "../../../shared/scene";
 import { colors, font, radius, shadow, spacing } from "../styles/tokens";
+import { BriefModal } from "../components/BriefModal";
 
 /**
  * Job-first create options. The order mirrors PROPOSAL.md §4.1: we
@@ -98,6 +101,11 @@ export interface HomePageProps {
    * `.kstudio` directory path.
    */
   onOpenProject?: (projectDir: string) => void;
+  /**
+   * Fired when the "Start from a brief" modal successfully creates
+   * a project. The shell routes the user into the editor.
+   */
+  onBriefApplied?: (result: BriefApplyResult) => void;
 }
 
 /**
@@ -128,9 +136,12 @@ function dataUrlFor(bytes: ThumbnailBytes): string {
 export function HomePage({
   onOpenEditor,
   onOpenProject,
+  onBriefApplied,
 }: HomePageProps): JSX.Element {
   const [status, setStatus] = useState<RuntimeStatus | null>(null);
   const [statusError, setStatusError] = useState<string | null>(null);
+  const [llmStatus, setLlmStatus] = useState<LlmStatus | null>(null);
+  const [briefOpen, setBriefOpen] = useState(false);
   const [recents, setRecents] = useState<RecentsLoadState>({ kind: "idle" });
   // Cover-bytes cache keyed by `.kstudio` path. Held outside `recents`
   // so refreshing the roster (e.g. after creating a new project) does
@@ -156,6 +167,29 @@ export function HomePage({
       cancelled = true;
     };
   }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    void window.kcreate.llm
+      .status()
+      .then((s) => {
+        if (!cancelled) setLlmStatus(s);
+      })
+      .catch(() => {
+        // LLM sidecar is opt-in; absence is normal so we swallow.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const handleBriefApplied = useCallback(
+    (result: BriefApplyResult) => {
+      setBriefOpen(false);
+      onBriefApplied?.(result);
+    },
+    [onBriefApplied],
+  );
 
   useEffect(() => {
     let cancelled = false;
@@ -230,6 +264,13 @@ export function HomePage({
           gap: spacing.xl,
         }}
       >
+        <Section title="Start from a brief">
+          <BriefTile
+            llmStatus={llmStatus}
+            onOpen={() => setBriefOpen(true)}
+          />
+        </Section>
+
         <Section title="Create new">
           <div
             style={{
@@ -256,7 +297,221 @@ export function HomePage({
             onOpenProject={onOpenProject ?? null}
           />
         </Section>
+
+        <Section title="Model status">
+          <ModelStatusGrid status={status} llmStatus={llmStatus} />
+        </Section>
+
+        <Section title="Help & learn">
+          <HelpAndLearnGrid />
+        </Section>
       </main>
+      <BriefModal
+        open={briefOpen}
+        onClose={() => setBriefOpen(false)}
+        onApplied={handleBriefApplied}
+      />
+    </div>
+  );
+}
+
+function BriefTile({
+  llmStatus,
+  onOpen,
+}: {
+  llmStatus: LlmStatus | null;
+  onOpen: () => void;
+}): JSX.Element {
+  const ready = llmStatus?.state === "ready";
+  return (
+    <button
+      type="button"
+      onClick={onOpen}
+      data-testid="kcreate-brief-tile"
+      style={{
+        textAlign: "left",
+        background: colors.bg,
+        border: `1px solid ${colors.border}`,
+        borderRadius: radius.card,
+        padding: spacing.lg,
+        boxShadow: shadow.card,
+        display: "flex",
+        alignItems: "center",
+        gap: spacing.md,
+        cursor: "pointer",
+      }}
+    >
+      <div
+        aria-hidden="true"
+        style={{
+          width: 44,
+          height: 44,
+          borderRadius: 12,
+          background: colors.accent,
+          color: "white",
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          fontWeight: 700,
+        }}
+      >
+        AI
+      </div>
+      <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+        <span style={{ fontSize: 15, fontWeight: 600, color: colors.text }}>
+          Start from a brief
+        </span>
+        <span style={{ fontSize: 13, color: colors.textMuted }}>
+          {ready
+            ? "Describe what you want; the local model fills in the canvas, palette, and starter layers."
+            : "Start the local LLM in Model Manager to enable brief-driven setup."}
+        </span>
+      </div>
+    </button>
+  );
+}
+
+function ModelStatusGrid({
+  status,
+  llmStatus,
+}: {
+  status: RuntimeStatus | null;
+  llmStatus: LlmStatus | null;
+}): JSX.Element {
+  const gpuLabel = status?.gpuAvailable
+    ? (status.gpuName ?? "GPU")
+    : status
+      ? "CPU only"
+      : "…";
+  const llmLabel =
+    llmStatus === null
+      ? "unknown"
+      : llmStatus.state === "ready"
+        ? `ready (${llmStatus.model_name ?? "model"})`
+        : llmStatus.state;
+  return (
+    <div
+      style={{
+        display: "grid",
+        gridTemplateColumns: "repeat(auto-fill, minmax(200px, 1fr))",
+        gap: spacing.md,
+      }}
+      data-testid="kcreate-model-status"
+    >
+      <StatusCard
+        label="Device tier"
+        value={status?.deviceTier ?? "…"}
+      />
+      <StatusCard label="GPU backend" value={gpuLabel} />
+      <StatusCard
+        label="System RAM"
+        value={status ? `${status.totalRamMb} MB` : "…"}
+      />
+      <StatusCard label="LLM sidecar" value={llmLabel} />
+    </div>
+  );
+}
+
+function StatusCard({
+  label,
+  value,
+}: {
+  label: string;
+  value: string;
+}): JSX.Element {
+  return (
+    <div
+      style={{
+        padding: spacing.md,
+        background: colors.bg,
+        border: `1px solid ${colors.border}`,
+        borderRadius: radius.card,
+        display: "flex",
+        flexDirection: "column",
+        gap: 4,
+      }}
+    >
+      <span
+        style={{
+          fontSize: 11,
+          textTransform: "uppercase",
+          letterSpacing: 0.5,
+          color: colors.textMuted,
+        }}
+      >
+        {label}
+      </span>
+      <span style={{ fontSize: 14, fontWeight: 600, color: colors.text }}>
+        {value}
+      </span>
+    </div>
+  );
+}
+
+interface HelpLink {
+  label: string;
+  blurb: string;
+  href: string;
+}
+
+const HELP_LINKS: ReadonlyArray<HelpLink> = [
+  {
+    label: "Getting started",
+    blurb: "First-run walkthrough: artboards, layers, exporting.",
+    href: "https://kcreate.app/learn/getting-started",
+  },
+  {
+    label: "Keyboard shortcuts",
+    blurb: "Every shortcut in one place — printable cheat sheet.",
+    href: "https://kcreate.app/learn/shortcuts",
+  },
+  {
+    label: "What's new",
+    blurb: "Changelog and feature highlights.",
+    href: "https://kcreate.app/learn/changelog",
+  },
+  {
+    label: "Architecture",
+    blurb: "Local-first, Rust + Electron, deep technical docs.",
+    href: "https://kcreate.app/learn/architecture",
+  },
+];
+
+function HelpAndLearnGrid(): JSX.Element {
+  return (
+    <div
+      style={{
+        display: "grid",
+        gridTemplateColumns: "repeat(auto-fill, minmax(240px, 1fr))",
+        gap: spacing.md,
+      }}
+      data-testid="kcreate-help-and-learn"
+    >
+      {HELP_LINKS.map((link) => (
+        <a
+          key={link.href}
+          href={link.href}
+          target="_blank"
+          rel="noreferrer"
+          style={{
+            textDecoration: "none",
+            background: colors.bg,
+            border: `1px solid ${colors.border}`,
+            borderRadius: radius.card,
+            padding: spacing.md,
+            display: "flex",
+            flexDirection: "column",
+            gap: spacing.xs,
+            color: colors.text,
+            boxShadow: shadow.card,
+          }}
+        >
+          <span style={{ fontSize: 15, fontWeight: 600 }}>{link.label}</span>
+          <span style={{ fontSize: 13, color: colors.textMuted }}>
+            {link.blurb}
+          </span>
+        </a>
+      ))}
     </div>
   );
 }

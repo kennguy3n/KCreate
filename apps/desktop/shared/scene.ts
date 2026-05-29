@@ -4367,6 +4367,7 @@ declare global {
       deeplink: DeeplinkBridge;
       clipboard: ClipboardBridge;
       phase8: Phase8Bridge;
+      phase9: Phase9Bridge;
       projectEncryption: ProjectEncryptionBridge;
       annotation: AnnotationBridge;
     };
@@ -4767,4 +4768,325 @@ export interface AnnotationBridge {
   list(request: AnnotationListRequest): Promise<AnnotationListResponse>;
   resolve(request: AnnotationResolveRequest): Promise<boolean>;
   delete(id: string): Promise<boolean>;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 9 — wire-format types for the new bridge surface.
+//
+// Mirrors `crates/kcreate_bridge/src/phase9.rs`, `perf.rs`, and
+// `autosave.rs`. All JSON-string boundaries are decoded in the
+// preload layer (`window.kcreate.phase9.*`) so the renderer only
+// sees typed objects.
+// ---------------------------------------------------------------------------
+
+/** Mirror of `kcreate_bridge::phase9::GuideInfo`. */
+export interface GuideInfo {
+  id: string;
+  pageId: string;
+  orientation: "horizontal" | "vertical";
+  position: number;
+  color: string;
+  locked: boolean;
+  createdAt: string;
+}
+
+/** Mirror of `kcreate_bridge::phase9::GridSettingsInfo`. */
+export interface GridSettingsInfo {
+  artboardId: string;
+  enabled: boolean;
+  spacing: number;
+  subdivisions: number;
+  color: string;
+}
+
+/** Mirror of `kcreate_bridge::phase9::AlignmentResult`. One per node
+ * the align/distribute pass actually moved. */
+export interface AlignmentResult {
+  nodeId: string;
+  oldBounds: ResizeFrameBounds;
+  newBounds: ResizeFrameBounds;
+}
+
+/** Alignment keyword accepted by `documentAlign`. */
+export type Alignment =
+  | "left"
+  | "center"
+  | "right"
+  | "top"
+  | "middle"
+  | "bottom";
+
+/** Distribution axis accepted by `documentDistribute`. */
+export type DistributeAxis = "horizontal" | "vertical";
+
+/** Mirror of `kcreate_bridge::phase9::PaletteApplyResult`. */
+export interface PaletteApplyResult {
+  brandKitId: string;
+  colors: NamedColor[];
+}
+
+/** Mirror of `kcreate_bridge::phase9::AutofitRecomputeResult`. */
+export interface AutofitRecomputeResult {
+  nodeId: string;
+  previousSize: number;
+  newSize: number;
+}
+
+/** Mirror of `kcreate_bridge::phase9::TraceResult`. */
+export interface TraceResult {
+  groupNodeId: string;
+  pathCount: number;
+  closedPathCount: number;
+  pathNodeIds: string[];
+}
+
+/** Mirror of `kcreate_bridge::phase9::IconifyResultInfo`. */
+export interface IconifyResultInfo {
+  sourceNodeId: string;
+  groupNodeId: string;
+  pathCount: number;
+  strokeWidth: number;
+  gridSize: number;
+}
+
+/** Mirror of `kcreate_bridge::phase9::BatchAltTextEntry`. */
+export interface BatchAltTextEntry {
+  nodeId: string;
+  altText: string;
+  fallback: boolean;
+}
+
+/** Mirror of `kcreate_bridge::phase9::ImportSummary`. */
+export interface ImportSummary {
+  rootNodeId: string;
+  pageNodeId: string | null;
+  layerCount: number;
+  warnings: string[];
+}
+
+/** Mirror of `kcreate_bridge::phase9::ExifResult`. */
+export interface ExifResult {
+  width: number | null;
+  height: number | null;
+  makeModel: string | null;
+  dateTime: string | null;
+  orientation: number | null;
+  gps: [number, number] | null;
+  raw: Record<string, string>;
+}
+
+/** Mirror of `kcreate_bridge::phase9::SvgPreviewInfo`. */
+export interface SvgPreviewInfo {
+  pngBytes: number[];
+  width: number;
+  height: number;
+}
+
+/** Mirror of `kcreate_bridge::phase9::OperationLogFilter`. */
+export interface OperationLogFilter {
+  aiOnly: boolean;
+  manualOnly: boolean;
+  since: string | null;
+  until: string | null;
+  limit: number;
+}
+
+/** Mirror of `kcreate_bridge::phase9::OperationInfo`. */
+export interface OperationInfo {
+  id: string;
+  timestamp: string;
+  actor: string;
+  command: string;
+  affectedNodes: string[];
+  aiGenerated: boolean;
+  groupId: string | null;
+  isUndo: boolean;
+}
+
+/** Mirror of `kcreate_export::validate::ExportSeverity`. */
+export type ExportSeverity = "error" | "warning";
+
+/** Mirror of `kcreate_export::validate::ExportValidationIssue`. */
+export interface ExportValidationIssue {
+  severity: ExportSeverity;
+  code: string;
+  message: string;
+}
+
+/** Mirror of `kcreate_export::validate::ExportValidationRequest`.
+ *
+ * Field names and optionality mirror the Rust struct exactly so that
+ * `JSON.stringify` of this object deserialises cleanly into the Rust
+ * value via `serde(rename_all = "camelCase")`. Keep the four boolean
+ * attributes flat — see the Rust doc comment for the rationale. */
+export interface ExportValidationRequest {
+  /** One or more node IDs to export. Empty is invalid. */
+  nodeIds: string[];
+  /** Target format. Currently one of `png`, `jpeg`, `webp`, `svg`, `pdf`. */
+  format: string;
+  /** Optional explicit output width in pixels. `0` is rejected. */
+  width: number | null;
+  /** Optional explicit output height in pixels. */
+  height: number | null;
+  /** JPEG quality slider in `[1, 100]`, if format = `jpeg`. */
+  jpegQuality: number | null;
+  /** Whether the request wants a transparent background. */
+  transparent: boolean;
+  /** If true, suppress non-fatal warnings about oversized dimensions. */
+  forceOversized: boolean;
+  /** True if any of the selected nodes has text content. */
+  hasText: boolean;
+  /** True if the bridge could not find a system font that covers every
+   * glyph in the selection. */
+  missingFonts: boolean;
+}
+
+/** Mirror of `kcreate_export::validate::ExportValidationReport`. */
+export interface ExportValidationReport {
+  ok: boolean;
+  issues: ExportValidationIssue[];
+}
+
+/** Mirror of `kcreate_bridge::phase9::BriefStarterLayer`. */
+export interface BriefStarterLayer {
+  name: string;
+  kind: "text" | "shape" | "image" | "group";
+  suggestedContent: string | null;
+}
+
+/** Mirror of `kcreate_bridge::phase9::BriefPlan`. */
+export interface BriefPlan {
+  artboardPreset: string;
+  palette: string[];
+  starterLayers: BriefStarterLayer[];
+}
+
+/** Mirror of `kcreate_bridge::phase9::BriefApplyResult`. */
+export interface BriefApplyResult {
+  artboardId: string;
+  brandKitId: string;
+  layerIds: string[];
+}
+
+/** Mirror of `kcreate_bridge::perf::MemoryPressureEvent`. */
+export type MemoryPressureEvent =
+  | { kind: "entered"; available_mb: number; threshold_mb: number }
+  | { kind: "released"; available_mb: number; threshold_mb: number };
+
+/** Mirror of `kcreate_bridge::autosave::AutosaveStatus`. */
+export interface AutosaveStatus {
+  running: boolean;
+  intervalSecs: number;
+  lastSavedAt: string | null;
+  pendingChanges: boolean;
+}
+
+/** Mirror of `kcreate_bridge::autosave::AutosaveMarker`. */
+export interface AutosaveMarker {
+  projectPath: string;
+  autosavePath: string;
+  capturedAt: string;
+  cleanRevision: number;
+}
+
+/**
+ * Phase 9 bridge surface. Each method round-trips through the
+ * `kcreate/phase9/*` IPC channels; preload decodes the JSON strings
+ * returned by the napi entry points so callers see typed objects.
+ */
+export interface Phase9Bridge {
+  // -------- Block D Task 21 — Guides ----------------------------------
+  guideCreate(
+    pageId: string,
+    orientation: "horizontal" | "vertical",
+    position: number,
+    color: string | null,
+    locked: boolean,
+  ): Promise<GuideInfo>;
+  guideDelete(id: string): Promise<boolean>;
+  guideClearPage(pageId: string): Promise<number>;
+  guideList(pageId: string): Promise<GuideInfo[]>;
+  guideListAll(): Promise<GuideInfo[]>;
+
+  // -------- Block D Task 22 — Grid settings ---------------------------
+  artboardGridSettings(artboardId: string): Promise<GridSettingsInfo>;
+  artboardSetGrid(
+    artboardId: string,
+    enabled: boolean,
+    spacing: number,
+    subdivisions: number,
+    color: string | null,
+  ): Promise<GridSettingsInfo>;
+
+  // -------- Block D Task 23 — Alignment / distribution ----------------
+  documentAlign(
+    nodeIds: string[],
+    alignment: Alignment,
+  ): Promise<AlignmentResult[]>;
+  documentDistribute(
+    nodeIds: string[],
+    axis: DistributeAxis,
+  ): Promise<AlignmentResult[]>;
+
+  // -------- Block B Task 10 — Palette → brand kit ---------------------
+  paletteExtractAndApplyBrandKit(
+    nodeId: string,
+    numColors: number,
+    brandKitName: string,
+  ): Promise<PaletteApplyResult>;
+
+  // -------- Block B Task 11 — Text autofit ----------------------------
+  textAutofitRecompute(nodeId: string): Promise<AutofitRecomputeResult>;
+
+  // -------- Block B Task 12 — Raster → vector trace -------------------
+  aiTraceRaster(
+    nodeId: string,
+    threshold: number,
+    simplifyTolerance: number,
+  ): Promise<TraceResult>;
+
+  // -------- Block D Task 19 — Icon-ify --------------------------------
+  aiIconify(sourceNodeId: string, gridSize: number): Promise<IconifyResultInfo>;
+
+  // -------- Block D Task 20 — Batch alt-text --------------------------
+  aiBatchAltText(pageId: string): Promise<BatchAltTextEntry[]>;
+
+  // -------- Block C Tasks 13–15 — PSD / Penpot / EXIF -----------------
+  importPsd(path: string): Promise<ImportSummary>;
+  importPenpot(path: string): Promise<ImportSummary>;
+  imageReadExif(bytes: Uint8Array): Promise<ExifResult>;
+
+  // -------- Block C Task 16 — SVG preview -----------------------------
+  exportSvgPreview(
+    svgBytes: Uint8Array,
+    maxWidth: number,
+    maxHeight: number,
+    transparent: boolean,
+  ): Promise<SvgPreviewInfo>;
+
+  // -------- Block C Task 17 — History panel ---------------------------
+  operationLogFilter(filter: OperationLogFilter): Promise<OperationInfo[]>;
+
+  // -------- Block E Task 27 — Export validation -----------------------
+  exportValidate(
+    request: ExportValidationRequest,
+  ): Promise<ExportValidationReport>;
+
+  // -------- Block B Task 7 — Brief → project --------------------------
+  briefToProject(plan: BriefPlan): Promise<BriefApplyResult>;
+
+  // -------- Block E Task 25 — Memory watchdog -------------------------
+  memoryWatchdogStart(pollIntervalMs: number): Promise<boolean>;
+  memoryWatchdogStop(): Promise<boolean>;
+  drainMemoryEvents(): Promise<MemoryPressureEvent[]>;
+  runtimeGpuBackendName(): Promise<string>;
+
+  // -------- Block E Task 26 — Autosave --------------------------------
+  autosaveStart(): Promise<boolean>;
+  autosaveStop(): Promise<boolean>;
+  autosaveForceNow(): Promise<boolean>;
+  autosaveStatus(): Promise<AutosaveStatus>;
+  autosaveRecoveryAvailable(): Promise<AutosaveMarker | null>;
+  autosaveRecover(): Promise<void>;
+  autosaveDismissRecovery(): Promise<void>;
 }

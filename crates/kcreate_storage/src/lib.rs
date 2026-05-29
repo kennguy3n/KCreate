@@ -16,6 +16,7 @@ pub mod annotations;
 pub mod blobs;
 pub mod brand_versions;
 pub mod crypto;
+pub mod guides;
 pub mod project_io;
 pub mod schema;
 pub mod thumbnails;
@@ -31,6 +32,11 @@ pub use blobs::{BlobError, BlobRef, BlobStore};
 pub use brand_versions::{
     diff_brand_kit_versions, list_brand_kit_versions, load_brand_kit_version,
     restore_brand_kit_version, save_brand_kit_version, BrandKitDiff, BrandKitVersion,
+};
+pub use guides::{
+    delete_all_for_page as delete_all_guides_for_page, delete_guide, list_all as list_all_guides,
+    list_for_page as list_guides_for_page, load_grid_settings, upsert_grid_settings, upsert_guide,
+    GridSettings, Guide, GuideOrientation,
 };
 pub use project_io::{ProjectManifest, ProjectStore, ProjectStoreError};
 pub use schema::{Database, DatabaseError, MIGRATIONS};

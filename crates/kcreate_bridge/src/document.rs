@@ -659,7 +659,14 @@ pub fn project_save() -> Result<()> {
 }
 
 /// Close the current project, discarding unsaved in-memory changes.
+///
+/// In addition to dropping the workspace slot, this resets the
+/// autosave subsystem so per-project bookkeeping
+/// (`last_saved_modified_at`, `counter`, `last_error`) doesn't
+/// leak into the next `project_open` / `project_create`. See
+/// [`crate::autosave::autosave_reset`] for the full rationale.
 pub fn project_close() {
+    crate::autosave::autosave_reset();
     *slot().lock() = None;
 }
 

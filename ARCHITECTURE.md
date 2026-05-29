@@ -1340,6 +1340,105 @@ N-API surface. TypeScript mirrors land in
 applyHsl, applyColorBalance, applyFilterMasked}`) with the
 `RasterPreviewFilter` discriminated union extended in lockstep.
 
+## 17n. Phase 9 — KChat extension depth, brief→project, design-studio polish, robustness
+
+Phase 9 finishes the proposal-level workflows that Phases 5–8
+deferred. The work falls into four architectural buckets:
+
+**KChat companion extension depth.**
+`apps/kchat-extension/src/` now ships four React panels —
+`ProjectBrowserPanel.tsx`, `ArtifactCard.tsx`,
+`SessionStatusBadge.tsx`, `ActivityFeed.tsx` — all of which
+talk to the host through `globalThis.__kchatHost.invokeProcedure`
+and round-trip back into KCreate via `openDeeplink('kcreate://…')`.
+The KCreate `main.ts` deeplink dispatcher now recognises a new
+`kcreate://artifact?id=…` form that navigates to the
+artifact in the export panel; the existing
+`kcreate://open?project_id=…` is reused by the project
+browser. The extension is intentionally probe-only — it never
+queries KCreate's process state directly, since the two
+desktop apps are separate Electron processes with no shared
+IPC bus.
+
+**Home screen: brief → project.**
+`kcreate_bridge::phase9::brief_to_project` is the new entry
+point for the proposal's "Start from a brief" flow. The
+renderer collects the user's brief in `BriefModal.tsx`,
+ships it to the local LLM sidecar with a GBNF grammar that
+constrains the JSON output to `{ artboard_preset, palette,
+starter_layers }`, then calls `brief_to_project` which
+atomically (a) creates the artboard with the requested
+preset, (b) upserts a brand kit carrying the palette, and
+(c) inserts starter layers — all against the *currently
+open* project (no implicit new-project path). The whole
+thing lands as a single AI-tagged operation on the audit
+log, so the user can undo the entire brief application in
+one step.
+
+**AI palette / trace / iconify / alt-text.**
+`kcreate_ai::trace` (Otsu / fixed threshold → Moore-neighbour
+contour trace → RDP simplify) and `kcreate_ai::iconify`
+(rescale + half-pixel snap + RDP simplify + recommended
+stroke width) ship the algorithms; the bridge wires them
+through `ai_trace_raster`, `ai_iconify`,
+`palette_extract_and_apply_brand_kit`, and
+`ai_batch_alt_text`. Trace appends a sibling group whose
+children carry the traced polyline as
+`metadata["traced_polyline"]`; iconify produces a
+re-normalised path set ready to drop into a brand-kit icon
+slot.
+
+**Import edges: PSD / Penpot / EXIF / SVG preview.**
+`kcreate_export::psd_import` parses Adobe PSD files with the
+`psd` crate, materialises layer pixels into the BLAKE3 blob
+store as PNGs, and maps PSD blend modes to
+`kcreate_core::BlendMode`. `kcreate_export::penpot_import`
+parses Penpot `.penpot` zip bundles, treating frames as
+KCreate artboards and shapes (rect / circle / path / text /
+image) as the corresponding `NodeType` variants. EXIF
+metadata is extracted with `kamadak-exif` on import
+(`kcreate_export::exif`) and re-embedded on JPEG / WebP
+export. `kcreate_export::svg_preview` rasterises arbitrary
+SVG payloads with `resvg` for the export panel preview and
+the thumbnail pipeline.
+
+**Design Studio polish.**
+`kcreate_core::align` implements the alignment + horizontal
+/ vertical distribution math (returns per-node `dx/dy`
+deltas, so undo / redo can replay them through the operation
+log). `kcreate_storage::guides` stores per-page measurement
+guides in a new `guides` SQLite table; the snap engine
+treats guide lines as snap targets identical to artboard
+edges. Grid settings are stored on the artboard node
+metadata. The renderer surfaces all three via
+`AlignmentToolbar.tsx`, `RulerOverlay.tsx`, and
+`GridOverlay.tsx`.
+
+**Robustness: memory pressure + autosave + export
+validation.** `kcreate_bridge::perf::memory_watchdog_start`
+spawns a `sysinfo`-backed poll thread that watches available
+RAM and emits `MemoryPressureEvent::{Entered, Released}` on
+a bounded 32-entry queue (the renderer drains it via
+`drain_memory_events`). On pressure, the watchdog clears
+the tile cache. `kcreate_bridge::autosave` adds an opt-in
+background thread that calls `project_save` whenever
+`modified_at` advances and writes an autosave marker per
+tick; the renderer surfaces "recover unsaved work" prompts
+via `autosave_recovery_available` / `autosave_recover` /
+`autosave_dismiss_recovery`. `kcreate_export::validate`
+returns an `ExportValidationReport` carrying every issue
+(zero dimensions, unknown format, oversized without
+override, JPEG quality out of range, missing fonts) with
+`ExportSeverity::{Error, Warning}` so the renderer can
+either block or just banner the user before the export
+starts.
+
+**Local-first invariant.** `psd`, `kamadak-exif`, and
+`resvg` are all pure-Rust crates with no networking — none
+of them lands in the editing-path closure walked by
+`crates/kcreate_tests/tests/local_first.rs`. The sentinel
+stays green.
+
 ## 18. Resource optimization
 
 - **Startup.** Lazy-load model packs; precompile no shaders we won't

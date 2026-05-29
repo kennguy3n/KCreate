@@ -167,6 +167,12 @@ export function AIAssistPanel({
       <hr style={separatorStyle} />
       <PaletteSection selected={selectedNode} onStatus={onStatus} />
       <hr style={separatorStyle} />
+      <TraceRasterSection
+        selected={selectedNode}
+        onApplied={onApplied}
+        onStatus={onStatus}
+      />
+      <hr style={separatorStyle} />
       <SmartSelectSection selected={selectedNode} onStatus={onStatus} />
       <hr style={separatorStyle} />
       <OcrSection
@@ -459,6 +465,13 @@ function PaletteSection({
   const [maxColors, setMaxColors] = useState(6);
   const [palette, setPalette] = useState<ExtractedColor[]>([]);
   const [error, setError] = useState<string | null>(null);
+  // Phase 9 Block B Task 10 — track the in-flight brand-kit apply
+  // separately so a transient apply failure doesn't blow away the
+  // palette we already showed.
+  const [applying, setApplying] = useState(false);
+  const [appliedKitId, setAppliedKitId] = useState<string | null>(null);
+  const [applyError, setApplyError] = useState<string | null>(null);
+  const [brandKitName, setBrandKitName] = useState("Extracted Palette");
   // Per-section request token — same rationale as LayoutAssistSection
   // above (re-running while a previous call is in flight must drop
   // the stale result rather than overwrite the fresh one).
@@ -663,6 +676,241 @@ function PaletteSection({
           ))}
         </ul>
       ) : null}
+      {palette.length > 0 ? (
+        <div
+          style={{
+            display: "flex",
+            flexDirection: "column",
+            gap: spacing.xs,
+            borderTop: `1px dashed ${colors.border}`,
+            paddingTop: spacing.sm,
+          }}
+        >
+          <label
+            htmlFor="palette-brand-kit-name"
+            style={{ fontSize: 11, color: colors.textMuted }}
+          >
+            Apply as brand kit
+          </label>
+          <input
+            id="palette-brand-kit-name"
+            type="text"
+            value={brandKitName}
+            onChange={(e) => setBrandKitName(e.target.value)}
+            disabled={applying}
+            placeholder="Brand kit name"
+            style={{
+              padding: "4px 8px",
+              border: `1px solid ${colors.border}`,
+              borderRadius: radius.card / 2,
+              fontSize: 11,
+              background: colors.bg,
+              color: colors.text,
+            }}
+          />
+          <button
+            type="button"
+            onClick={() => {
+              if (nodeId === null) return;
+              setApplying(true);
+              setApplyError(null);
+              setAppliedKitId(null);
+              onStatus(`Creating brand kit "${brandKitName}" from palette…`);
+              window.kcreate.phase9
+                .paletteExtractAndApplyBrandKit(
+                  nodeId,
+                  palette.length,
+                  brandKitName.trim().length === 0
+                    ? "Extracted Palette"
+                    : brandKitName,
+                )
+                .then((result) => {
+                  setAppliedKitId(result.brandKitId);
+                  onStatus(
+                    `Brand kit created: ${result.brandKitId} (${result.colors.length} colors).`,
+                  );
+                })
+                .catch((e: unknown) => {
+                  const msg = e instanceof Error ? e.message : String(e);
+                  setApplyError(msg);
+                  onStatus(`Brand kit apply failed: ${msg}`);
+                })
+                .finally(() => setApplying(false));
+            }}
+            disabled={applying || nodeId === null}
+            style={primaryBtn(applying)}
+            data-testid="kcreate-palette-apply-brand-kit"
+          >
+            {applying ? "Applying…" : "Apply as Brand Kit"}
+          </button>
+          {applyError !== null && (
+            <div style={statusStripStyle("err")}>{applyError}</div>
+          )}
+          {appliedKitId !== null && (
+            <div style={statusStripStyle("ok")}>
+              Brand kit created (id: {appliedKitId.slice(0, 8)}…)
+            </div>
+          )}
+        </div>
+      ) : null}
+    </section>
+  );
+}
+
+/**
+ * Phase 9 Block B Task 12 — Raster → vector tracer.
+ *
+ * Calls `kcreate_ai::trace::trace_raster_node` via
+ * `window.kcreate.phase9.aiTraceRaster`. The result is a new
+ * VectorLayer with the traced paths; the user can fine-tune the
+ * threshold (0 = Otsu auto-threshold) and the RDP simplify
+ * tolerance before re-running.
+ */
+function TraceRasterSection({
+  selected,
+  onApplied,
+  onStatus,
+}: {
+  selected: NodeInfo | null;
+  onApplied: () => void;
+  onStatus: (msg: string | null) => void;
+}): JSX.Element {
+  const isRaster = selected !== null && selected.nodeType === "RasterLayer";
+  const nodeId = isRaster ? selected.id : null;
+
+  type TracePhase = "idle" | "running" | "done" | "error";
+  const [phase, setPhase] = useState<TracePhase>("idle");
+  const [threshold, setThreshold] = useState(0); // 0 → Otsu
+  const [tolerance, setTolerance] = useState(1.0);
+  const [pathCount, setPathCount] = useState<number | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  if (!isRaster || nodeId === null) {
+    return (
+      <section style={cardStyle}>
+        <div style={cardHeaderStyle}>
+          <strong>Trace to vector</strong>
+          <span style={badgeStyle("ok")}>Local CPU</span>
+        </div>
+        <p style={paragraphStyle}>
+          Select a <b>RasterLayer</b> to trace it into vector paths.
+        </p>
+      </section>
+    );
+  }
+
+  const run = async (): Promise<void> => {
+    setPhase("running");
+    setError(null);
+    setPathCount(null);
+    onStatus(
+      `Tracing raster (threshold=${threshold === 0 ? "auto" : threshold}, ε=${tolerance})…`,
+    );
+    try {
+      const result = await window.kcreate.phase9.aiTraceRaster(
+        nodeId,
+        threshold,
+        tolerance,
+      );
+      setPathCount(result.pathCount);
+      setPhase("done");
+      onStatus(
+        `Trace: ${result.pathCount} paths (${result.closedPathCount} closed).`,
+      );
+      onApplied();
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      setError(msg);
+      setPhase("error");
+      onStatus(`Trace failed: ${msg}`);
+    }
+  };
+
+  return (
+    <section style={cardStyle} data-testid="kcreate-trace-section">
+      <div style={cardHeaderStyle}>
+        <strong>Trace to vector</strong>
+        <span style={badgeStyle("ok")}>Local CPU</span>
+      </div>
+      <p style={paragraphStyle}>
+        Marching-squares + Suzuki-Abe contour extraction + RDP
+        simplification. Threshold of 0 selects Otsu auto-threshold.
+      </p>
+      <div
+        style={{
+          display: "flex",
+          gap: spacing.xs,
+          alignItems: "center",
+          fontSize: 11,
+          color: colors.textMuted,
+        }}
+      >
+        <label htmlFor="trace-threshold">Threshold</label>
+        <input
+          id="trace-threshold"
+          type="number"
+          min={0}
+          max={255}
+          value={threshold}
+          onChange={(e) => {
+            const next = Number.parseInt(e.target.value, 10);
+            if (Number.isFinite(next)) {
+              setThreshold(Math.min(255, Math.max(0, next)));
+            }
+          }}
+          disabled={phase === "running"}
+          style={{
+            width: 48,
+            padding: "2px 6px",
+            border: `1px solid ${colors.border}`,
+            borderRadius: radius.card / 2,
+            fontSize: 11,
+            background: colors.bg,
+            color: colors.text,
+          }}
+        />
+        <label htmlFor="trace-tolerance">ε</label>
+        <input
+          id="trace-tolerance"
+          type="number"
+          min={0}
+          step={0.1}
+          value={tolerance}
+          onChange={(e) => {
+            const next = Number.parseFloat(e.target.value);
+            if (Number.isFinite(next) && next >= 0) {
+              setTolerance(next);
+            }
+          }}
+          disabled={phase === "running"}
+          style={{
+            width: 56,
+            padding: "2px 6px",
+            border: `1px solid ${colors.border}`,
+            borderRadius: radius.card / 2,
+            fontSize: 11,
+            background: colors.bg,
+            color: colors.text,
+          }}
+        />
+        <button
+          type="button"
+          onClick={() => void run()}
+          disabled={phase === "running"}
+          style={primaryBtn(phase === "running")}
+          data-testid="kcreate-trace-run"
+        >
+          {phase === "running" ? "Tracing…" : "Trace"}
+        </button>
+      </div>
+      {phase === "error" && error !== null && (
+        <div style={statusStripStyle("err")}>{error}</div>
+      )}
+      {phase === "done" && pathCount !== null && (
+        <div style={statusStripStyle("ok")}>
+          Traced {pathCount} path{pathCount === 1 ? "" : "s"}.
+        </div>
+      )}
     </section>
   );
 }

@@ -346,3 +346,25 @@ pnpm lint
 | HSL / Color balance adjustment layers    | `crates/kcreate_raster/src/layer.rs` (`AdjustmentLayer::{HueSaturation, ColorBalance}`) |
 | Phase 8 bridge surface                   | `crates/kcreate_bridge/src/phase8.rs` |
 | Phase 8 wire format (TypeScript mirror)  | `apps/desktop/shared/scene.ts` (`Phase8Bridge` + types) |
+| Phase 9 bridge surface                   | `crates/kcreate_bridge/src/phase9.rs` (brief→project, AI trace / iconify / palette / alt-text, PSD / Penpot import, SVG preview, history filter, align/distribute, guides, grid settings, export validation) |
+| Memory pressure watchdog                 | `crates/kcreate_bridge/src/perf.rs` (`memory_watchdog_start`, `drain_memory_events`, `MemoryPressureEvent`) |
+| Project autosave + crash recovery        | `crates/kcreate_bridge/src/autosave.rs` (`autosave_start`, `autosave_force_now`, `autosave_recovery_available`, `autosave_recover`, `autosave_dismiss_recovery`) |
+| Raster-to-vector trace (Otsu + Moore)    | `crates/kcreate_ai/src/trace.rs` |
+| AI icon-ify (grid normalise + RDP)       | `crates/kcreate_ai/src/iconify.rs` |
+| PSD layered raster import                | `crates/kcreate_export/src/psd_import.rs` |
+| Penpot best-effort import                | `crates/kcreate_export/src/penpot_import.rs` |
+| `resvg` SVG-to-raster preview            | `crates/kcreate_export/src/svg_preview.rs` |
+| EXIF preservation (kamadak-exif)         | `crates/kcreate_export/src/exif.rs` |
+| Export validation (pre-flight)           | `crates/kcreate_export/src/validate.rs` |
+| Alignment + distribution math            | `crates/kcreate_core/src/align.rs` |
+| Ruler / measurement guide storage        | `crates/kcreate_storage/src/guides.rs` + `kcreate_storage::schema::CREATE_GUIDES_SQL` |
+| HistoryPanel (operation log filter)      | `apps/desktop/renderer/src/components/HistoryPanel.tsx` |
+| RulerOverlay (ruler + guide drag)        | `apps/desktop/renderer/src/components/RulerOverlay.tsx` |
+| GridOverlay (per-artboard grid)          | `apps/desktop/renderer/src/components/GridOverlay.tsx` |
+| AlignmentToolbar UI                      | `apps/desktop/renderer/src/components/AlignmentToolbar.tsx` |
+| BriefModal (Start-from-a-brief)          | `apps/desktop/renderer/src/components/BriefModal.tsx` |
+| Phase 9 wire format (TypeScript mirror)  | `apps/desktop/shared/scene.ts` (`BriefApplyResult`, `TraceResult`, `IconifyResultInfo`, `GuideInfo`, `GridSettings`, `MemoryPressureEvent`, `AutosaveStatusInfo`, `ExportValidationReport`, `OperationLogEntry`, …) |
+| KChat extension — project browser        | `apps/kchat-extension/src/ProjectBrowserPanel.tsx` |
+| KChat extension — artifact preview cards | `apps/kchat-extension/src/ArtifactCard.tsx` |
+| KChat extension — session status badge   | `apps/kchat-extension/src/SessionStatusBadge.tsx` |
+| KChat extension — activity feed          | `apps/kchat-extension/src/ActivityFeed.tsx` |

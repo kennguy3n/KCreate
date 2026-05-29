@@ -64,9 +64,9 @@ use kcreate_export::validate::{
 use kcreate_storage::guides::{
     delete_all_for_page as storage_delete_all_guides_for_page,
     delete_guide as storage_delete_guide, list_all as storage_list_all_guides,
-    list_for_page as storage_list_guides_for_page, load_grid_settings as storage_load_grid_settings,
-    upsert_grid_settings as storage_upsert_grid, upsert_guide as storage_upsert_guide, GridSettings,
-    Guide, GuideOrientation,
+    list_for_page as storage_list_guides_for_page,
+    load_grid_settings as storage_load_grid_settings, upsert_grid_settings as storage_upsert_grid,
+    upsert_guide as storage_upsert_guide, GridSettings, Guide, GuideOrientation,
 };
 use kcreate_text::autofit::{compute_autofit_size, AutofitOptions};
 use kcreate_text::paragraph::TextStyle;
@@ -506,9 +506,11 @@ pub fn text_autofit_recompute(node_id: Uuid) -> Result<AutofitRecomputeResult> {
                 value: format!("node {node_id} does not have text_autofit enabled"),
             });
         }
-        let meta = text_layer_meta(node).ok_or_else(|| DocumentBridgeError::Internal(
-            format!("text layer {node_id} is missing a TextLayerMeta payload"),
-        ))?;
+        let meta = text_layer_meta(node).ok_or_else(|| {
+            DocumentBridgeError::Internal(format!(
+                "text layer {node_id} is missing a TextLayerMeta payload"
+            ))
+        })?;
         let frame = node.text_frame_options();
         let bounds = node.bounds;
         let previous_size = meta.font_size;
@@ -768,7 +770,10 @@ fn collect_icon_paths(source_node_id: Uuid) -> Result<Vec<IconPath>> {
         let push_node = |node: &Node, out: &mut Vec<IconPath>| {
             if let Some(meta) = node.metadata.get("traced_polyline") {
                 if let Some(pts) = meta.get("points").and_then(|v| v.as_array()) {
-                    let closed = meta.get("closed").and_then(serde_json::Value::as_bool).unwrap_or(false);
+                    let closed = meta
+                        .get("closed")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false);
                     let pts: Vec<IconPoint> = pts
                         .iter()
                         .filter_map(|p| {
@@ -900,9 +905,8 @@ pub struct ImportSummary {
 }
 
 pub fn import_psd(path: &str) -> Result<ImportSummary> {
-    let bytes = fs::read(path).map_err(|e| {
-        DocumentBridgeError::Internal(format!("read psd `{path}`: {e}"))
-    })?;
+    let bytes = fs::read(path)
+        .map_err(|e| DocumentBridgeError::Internal(format!("read psd `{path}`: {e}")))?;
     let imported = import_psd_bytes(&bytes)
         .map_err(|e| DocumentBridgeError::Internal(format!("import_psd: {e}")))?;
     Ok(ImportSummary {
@@ -956,9 +960,8 @@ pub fn image_read_exif(bytes: &[u8]) -> Result<ExifResult> {
 // ---------------------------------------------------------------------------
 
 pub fn import_penpot(path: &str) -> Result<ImportSummary> {
-    let bytes = fs::read(path).map_err(|e| {
-        DocumentBridgeError::Internal(format!("read penpot `{path}`: {e}"))
-    })?;
+    let bytes = fs::read(path)
+        .map_err(|e| DocumentBridgeError::Internal(format!("read penpot `{path}`: {e}")))?;
     let imported = import_penpot_bytes(&bytes)
         .map_err(|e| DocumentBridgeError::Internal(format!("import_penpot: {e}")))?;
     // Derive a width/height from the first page's first frame if
@@ -967,16 +970,13 @@ pub fn import_penpot(path: &str) -> Result<ImportSummary> {
         .pages
         .first()
         .and_then(|p| p.frames.first())
-        .map_or((0, 0), |f| (f.width.round() as u32, f.height.round() as u32));
+        .map_or((0, 0), |f| {
+            (f.width.round() as u32, f.height.round() as u32)
+        });
     let node_count: usize = imported
         .pages
         .iter()
-        .map(|p| {
-            p.frames
-                .iter()
-                .map(|f| 1 + f.shapes.len())
-                .sum::<usize>()
-        })
+        .map(|p| p.frames.iter().map(|f| 1 + f.shapes.len()).sum::<usize>())
         .sum();
     Ok(ImportSummary {
         source_path: path.to_string(),
@@ -1026,10 +1026,9 @@ pub fn export_svg_preview(
         max_height,
         transparent,
     };
-    let preview =
-        svg_to_raster_preview(svg_bytes, &opts).map_err(|e: SvgPreviewError| {
-            DocumentBridgeError::Internal(format!("svg_to_raster_preview: {e}"))
-        })?;
+    let preview = svg_to_raster_preview(svg_bytes, &opts).map_err(|e: SvgPreviewError| {
+        DocumentBridgeError::Internal(format!("svg_to_raster_preview: {e}"))
+    })?;
     Ok(preview.into())
 }
 
@@ -1413,7 +1412,10 @@ mod tests {
 
     #[test]
     fn parse_starter_layer_kind_accepts_canonical_names() {
-        assert_eq!(parse_starter_layer_kind("text").unwrap(), NodeType::TextLayer);
+        assert_eq!(
+            parse_starter_layer_kind("text").unwrap(),
+            NodeType::TextLayer
+        );
         assert_eq!(
             parse_starter_layer_kind("shape").unwrap(),
             NodeType::VectorLayer
@@ -1422,7 +1424,10 @@ mod tests {
             parse_starter_layer_kind("image").unwrap(),
             NodeType::RasterLayer
         );
-        assert_eq!(parse_starter_layer_kind("group").unwrap(), NodeType::GroupLayer);
+        assert_eq!(
+            parse_starter_layer_kind("group").unwrap(),
+            NodeType::GroupLayer
+        );
         assert!(parse_starter_layer_kind("widget").is_err());
     }
 

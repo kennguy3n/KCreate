@@ -232,7 +232,7 @@ mod tests {
         app1.extend_from_slice(b"II"); // little-endian
         app1.extend_from_slice(&42u16.to_le_bytes()); // magic
         app1.extend_from_slice(&8u32.to_le_bytes()); // IFD0 offset
-        // IFD0: 2 entries
+                                                     // IFD0: 2 entries
         app1.extend_from_slice(&2u16.to_le_bytes());
         // Tag 0x0112 = Orientation, type 3 (SHORT), count 1, value 1
         app1.extend_from_slice(&0x0112u16.to_le_bytes());

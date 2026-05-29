@@ -272,9 +272,12 @@ function BriefPreview({ plan }: { plan: BriefPlan }): JSX.Element {
       <div style={previewRowStyle}>
         <span style={previewLabelStyle}>Palette</span>
         <div style={swatchRowStyle}>
-          {plan.palette.map((c) => (
+          {plan.palette.map((c, i) => (
+            // Key includes the index so duplicate colors in an LLM-
+            // generated palette (e.g. two `#1F2937`s) don't collide and
+            // trigger React's "duplicate key" warning + render skips.
             <span
-              key={c}
+              key={`${i}-${c}`}
               title={c}
               style={{ ...swatchStyle, background: c }}
             />

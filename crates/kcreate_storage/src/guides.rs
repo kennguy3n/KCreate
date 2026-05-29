@@ -127,10 +127,12 @@ fn row_to_guide(row: &rusqlite::Row<'_>) -> rusqlite::Result<Guide> {
     let color: String = row.get(4)?;
     let locked_i: i64 = row.get(5)?;
     let created_s: String = row.get(6)?;
-    let id = Uuid::parse_str(&id_s)
-        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e)))?;
-    let page_id = Uuid::parse_str(&page_s)
-        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(1, rusqlite::types::Type::Text, Box::new(e)))?;
+    let id = Uuid::parse_str(&id_s).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+    })?;
+    let page_id = Uuid::parse_str(&page_s).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(1, rusqlite::types::Type::Text, Box::new(e))
+    })?;
     let orientation = GuideOrientation::parse(&orient_s).ok_or_else(|| {
         rusqlite::Error::FromSqlConversionFailure(
             2,
@@ -142,7 +144,9 @@ fn row_to_guide(row: &rusqlite::Row<'_>) -> rusqlite::Result<Guide> {
         )
     })?;
     let created_at = DateTime::parse_from_rfc3339(&created_s)
-        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(6, rusqlite::types::Type::Text, Box::new(e)))?
+        .map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(6, rusqlite::types::Type::Text, Box::new(e))
+        })?
         .with_timezone(&Utc);
     Ok(Guide {
         id,

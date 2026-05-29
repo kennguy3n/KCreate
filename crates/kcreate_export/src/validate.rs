@@ -112,7 +112,10 @@ pub struct ExportValidationReport {
 pub fn validate_export_request(req: &ExportValidationRequest) -> ExportValidationReport {
     let mut issues: Vec<ExportValidationIssue> = Vec::new();
     if req.node_ids.is_empty() {
-        issues.push(error("NO_NODES", ExportValidationError::NoNodes.to_string()));
+        issues.push(error(
+            "NO_NODES",
+            ExportValidationError::NoNodes.to_string(),
+        ));
     }
     let fmt_norm = req.format.to_ascii_lowercase();
     if !FORMATS.iter().any(|f| f.eq_ignore_ascii_case(&fmt_norm)) {
@@ -125,7 +128,11 @@ pub fn validate_export_request(req: &ExportValidationRequest) -> ExportValidatio
         if w == 0 {
             issues.push(error(
                 "ZERO_WIDTH",
-                ExportValidationError::ZeroDimension { axis: "width", dim: 0 }.to_string(),
+                ExportValidationError::ZeroDimension {
+                    axis: "width",
+                    dim: 0,
+                }
+                .to_string(),
             ));
         } else if w > DEFAULT_MAX_DIMENSION && !req.force_oversized {
             issues.push(warning(
@@ -140,7 +147,11 @@ pub fn validate_export_request(req: &ExportValidationRequest) -> ExportValidatio
         if h == 0 {
             issues.push(error(
                 "ZERO_HEIGHT",
-                ExportValidationError::ZeroDimension { axis: "height", dim: 0 }.to_string(),
+                ExportValidationError::ZeroDimension {
+                    axis: "height",
+                    dim: 0,
+                }
+                .to_string(),
             ));
         } else if h > DEFAULT_MAX_DIMENSION && !req.force_oversized {
             issues.push(warning(

@@ -14,8 +14,8 @@ pub mod bg_remove;
 pub mod brand_extract;
 pub mod color_range;
 pub mod design_critique;
-pub mod iconify;
 pub mod design_tokens_vlm;
+pub mod iconify;
 pub mod image_gen;
 pub mod layout_suggest;
 pub mod llm_chat;
@@ -44,7 +44,6 @@ pub use bg_remove::{
 };
 pub use color_range::{pack_mask, select_by_color_range};
 pub use iconify::{iconify, IconPath, IconPoint, IconifyError, IconifyOptions, IconifyResult};
-pub use trace::{trace_raster, TraceError, TraceOptions, TraceThreshold, TracedPath, TracedPoint};
 pub use layout_suggest::{
     suggest_layout_grouping, Bounds as LayoutBounds, LayoutAlignment, LayoutNode,
     LayoutOrientation, LayoutSuggestError, LayoutSuggestOptions, LayoutSuggestion,
@@ -80,4 +79,5 @@ pub use tool_call::{
     ToolCallParseError, ToolCallRegistry, ToolDescriptor, ToolParamType, ToolParameter,
     ToolRegistryError,
 };
+pub use trace::{trace_raster, TraceError, TraceOptions, TraceThreshold, TracedPath, TracedPoint};
 pub use upscale::{upscale_lanczos, upscale_with_backend, UpscaleBackend, UpscaleError};

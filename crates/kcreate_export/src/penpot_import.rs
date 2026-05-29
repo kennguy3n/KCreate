@@ -256,10 +256,7 @@ fn parse_page(
         let mut shapes_by_parent: HashMap<String, Vec<ImportedPenpotShape>> = HashMap::new();
         let mut frame_records: Vec<(String, &serde_json::Value)> = Vec::new();
         for (sid, sv) in obj {
-            let kind = sv
-                .get("type")
-                .and_then(|t| t.as_str())
-                .unwrap_or("other");
+            let kind = sv.get("type").and_then(|t| t.as_str()).unwrap_or("other");
             if kind == "frame" {
                 frame_records.push((sid.clone(), sv));
                 continue;
@@ -408,10 +405,22 @@ fn parse_shape(id: &str, sv: &serde_json::Value) -> Option<ImportedPenpotShape> 
 }
 
 fn bbox(sv: &serde_json::Value) -> (f32, f32, f32, f32) {
-    let x = sv.get("x").and_then(serde_json::Value::as_f64).unwrap_or(0.0) as f32;
-    let y = sv.get("y").and_then(serde_json::Value::as_f64).unwrap_or(0.0) as f32;
-    let w = sv.get("width").and_then(serde_json::Value::as_f64).unwrap_or(0.0) as f32;
-    let h = sv.get("height").and_then(serde_json::Value::as_f64).unwrap_or(0.0) as f32;
+    let x = sv
+        .get("x")
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or(0.0) as f32;
+    let y = sv
+        .get("y")
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or(0.0) as f32;
+    let w = sv
+        .get("width")
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or(0.0) as f32;
+    let h = sv
+        .get("height")
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or(0.0) as f32;
     (x, y, w, h)
 }
 
@@ -426,8 +435,8 @@ mod tests {
         let mut out = Vec::new();
         {
             let mut z = zip::ZipWriter::new(std::io::Cursor::new(&mut out));
-            let opts = SimpleFileOptions::default()
-                .compression_method(zip::CompressionMethod::Deflated);
+            let opts =
+                SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
             for (name, bytes) in entries {
                 z.start_file(*name, opts).unwrap();
                 z.write_all(bytes).unwrap();

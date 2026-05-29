@@ -233,12 +233,7 @@ fn rdp_recurse(points: &[IconPoint], lo: usize, hi: usize, epsilon: f32, keep: &
     let b = points[hi];
     let mut max_dist = 0.0_f32;
     let mut max_idx = lo;
-    for (i, p) in points
-        .iter()
-        .enumerate()
-        .take(hi)
-        .skip(lo + 1)
-    {
+    for (i, p) in points.iter().enumerate().take(hi).skip(lo + 1) {
         let d = perpendicular_distance(*p, a, b);
         if d > max_dist {
             max_dist = d;
@@ -349,7 +344,10 @@ mod tests {
             points: vec![
                 IconPoint { x: 0.0, y: 0.0 },
                 IconPoint { x: 1000.0, y: 0.0 },
-                IconPoint { x: 1000.0, y: 1000.0 },
+                IconPoint {
+                    x: 1000.0,
+                    y: 1000.0,
+                },
                 IconPoint { x: 0.0, y: 1000.0 },
                 IconPoint { x: 0.0, y: 0.0 },
             ],
@@ -358,7 +356,10 @@ mod tests {
         let tiny = IconPath {
             points: vec![
                 IconPoint { x: 500.0, y: 500.0 },
-                IconPoint { x: 500.01, y: 500.0 },
+                IconPoint {
+                    x: 500.01,
+                    y: 500.0,
+                },
             ],
             closed: false,
         };

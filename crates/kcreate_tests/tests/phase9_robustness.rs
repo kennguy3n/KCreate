@@ -12,9 +12,7 @@ use kcreate_bridge::autosave::{
     autosave_dismiss_recovery, autosave_force_now, autosave_recover, autosave_recovery_available,
     autosave_start, autosave_status, autosave_stop,
 };
-use kcreate_bridge::document::{
-    artboard_create, project_close, project_create, project_save,
-};
+use kcreate_bridge::document::{artboard_create, project_close, project_create, project_save};
 use kcreate_bridge::perf::{
     drain_memory_events, memory_pressure_emit_for_test, MemoryPressureEvent,
 };
@@ -96,7 +94,8 @@ fn memory_event_queue_caps_at_32_entries() {
         matches!(
             e,
             MemoryPressureEvent::Entered {
-                available_mb: 49, ..
+                available_mb: 49,
+                ..
             }
         )
     });
@@ -117,10 +116,7 @@ fn autosave_start_is_idempotent() {
         first || second,
         "first autosave_start should report true, got {first} / {second}",
     );
-    assert!(
-        !(first && second),
-        "second autosave_start must be a no-op",
-    );
+    assert!(!(first && second), "second autosave_start must be a no-op");
     autosave_stop();
     project_close();
 }
@@ -131,8 +127,7 @@ fn autosave_force_now_persists_when_modified() {
     let _dir = open_project("autosave-tick");
     // Trigger a document mutation so `modified_at` advances and the
     // tick has something to save.
-    let _ab = artboard_create(None, "Hero".to_string(), 1080.0, 1080.0)
-        .expect("artboard");
+    let _ab = artboard_create(None, "Hero".to_string(), 1080.0, 1080.0).expect("artboard");
     let saved = autosave_force_now().expect("autosave_force_now");
     assert!(saved, "tick must report a successful save");
 
@@ -207,9 +202,10 @@ fn export_validate_rejects_zero_dimensions() {
     req.width = Some(0);
     let report = export_validate(req);
     assert!(!report.ok, "zero width must fail validation");
-    assert!(report.issues.iter().any(|i| {
-        i.severity == ExportSeverity::Error && i.code == "ZERO_WIDTH"
-    }));
+    assert!(report
+        .issues
+        .iter()
+        .any(|i| { i.severity == ExportSeverity::Error && i.code == "ZERO_WIDTH" }));
 }
 
 #[test]
@@ -246,10 +242,7 @@ fn export_validate_suppresses_oversized_when_forced() {
     req.force_oversized = true;
     let report = export_validate(req);
     assert!(
-        !report
-            .issues
-            .iter()
-            .any(|i| i.code == "OVERSIZED_WIDTH"),
+        !report.issues.iter().any(|i| i.code == "OVERSIZED_WIDTH"),
         "force_oversized must suppress the warning"
     );
 }

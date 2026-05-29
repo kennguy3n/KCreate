@@ -112,7 +112,8 @@ pub fn svg_to_raster_preview(
 mod tests {
     use super::*;
 
-    const RED_SQUARE_SVG: &[u8] = br##"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="50" viewBox="0 0 100 50">
+    const RED_SQUARE_SVG: &[u8] =
+        br##"<svg xmlns="http://www.w3.org/2000/svg" width="100" height="50" viewBox="0 0 100 50">
         <rect x="0" y="0" width="100" height="50" fill="#ff0000"/>
     </svg>"##;
 
@@ -124,7 +125,10 @@ mod tests {
         assert!(preview.height > 0);
         assert!(preview.width >= preview.height * 2 - 2);
         // Real PNG signature.
-        assert_eq!(&preview.png_bytes[..8], &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]);
+        assert_eq!(
+            &preview.png_bytes[..8],
+            &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]
+        );
     }
 
     #[test]

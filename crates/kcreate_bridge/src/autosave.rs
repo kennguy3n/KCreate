@@ -26,7 +26,7 @@ use std::thread;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 use serde::{Deserialize, Serialize};
 
 use crate::document::{
@@ -74,6 +74,13 @@ struct AutosaveSharedState {
 struct AutosaveState {
     running: AtomicBool,
     shared: Mutex<AutosaveSharedState>,
+    /// Paired with [`AutosaveState::shutdown_lock`]. `autosave_stop`
+    /// flips `running` and calls `notify_all` so the background
+    /// thread wakes immediately instead of sleeping out the rest of
+    /// the interval. The thread waits on this condvar with a
+    /// timeout equal to the configured interval.
+    shutdown_lock: Mutex<()>,
+    shutdown_cv: Condvar,
 }
 
 fn state() -> &'static Arc<AutosaveState> {
@@ -82,6 +89,8 @@ fn state() -> &'static Arc<AutosaveState> {
         Arc::new(AutosaveState {
             running: AtomicBool::new(false),
             shared: Mutex::new(AutosaveSharedState::default()),
+            shutdown_lock: Mutex::new(()),
+            shutdown_cv: Condvar::new(),
         })
     })
 }
@@ -108,7 +117,15 @@ pub fn autosave_start() -> bool {
                     let g = runtime_slot().lock();
                     g.effective_autosave_interval_secs()
                 };
-                thread::sleep(Duration::from_secs(u64::from(interval_secs)));
+                // Sleep via a condvar so `autosave_stop` can wake
+                // us up immediately — the previous unconditional
+                // `thread::sleep` made shutdown latency equal to a
+                // full interval (up to 10 min on hand-tuned configs).
+                let mut guard = state.shutdown_lock.lock();
+                let _ = state
+                    .shutdown_cv
+                    .wait_for(&mut guard, Duration::from_secs(u64::from(interval_secs)));
+                drop(guard);
                 if !state.running.load(Ordering::SeqCst) {
                     break;
                 }
@@ -120,9 +137,16 @@ pub fn autosave_start() -> bool {
 }
 
 /// Stop the autosave background thread. Returns `true` if it was
-/// running.
+/// running. The waiting thread is woken via the shutdown condvar
+/// so it observes the new flag instantly.
 pub fn autosave_stop() -> bool {
-    state().running.swap(false, Ordering::SeqCst)
+    let st = state();
+    let was_running = st.running.swap(false, Ordering::SeqCst);
+    if was_running {
+        let _g = st.shutdown_lock.lock();
+        st.shutdown_cv.notify_all();
+    }
+    was_running
 }
 
 /// Run a single autosave cycle synchronously. Useful for unit
@@ -282,10 +306,7 @@ fn write_marker_for_current_project() -> Result<()> {
 fn write_marker(marker: &AutosaveMarker, marker_path: &Path) -> Result<()> {
     if let Some(parent) = marker_path.parent() {
         fs::create_dir_all(parent).map_err(|e| {
-            DocumentBridgeError::Internal(format!(
-                "create autosave dir {}: {e}",
-                parent.display()
-            ))
+            DocumentBridgeError::Internal(format!("create autosave dir {}: {e}", parent.display()))
         })?;
     }
     let bytes = serde_json::to_vec_pretty(marker)
@@ -295,10 +316,7 @@ fn write_marker(marker: &AutosaveMarker, marker_path: &Path) -> Result<()> {
     let mut tmp_path = marker_path.to_path_buf();
     tmp_path.set_extension("json.tmp");
     fs::write(&tmp_path, &bytes).map_err(|e| {
-        DocumentBridgeError::Internal(format!(
-            "write autosave tmp {}: {e}",
-            tmp_path.display()
-        ))
+        DocumentBridgeError::Internal(format!("write autosave tmp {}: {e}", tmp_path.display()))
     })?;
     fs::rename(&tmp_path, marker_path).map_err(|e| {
         DocumentBridgeError::Internal(format!(

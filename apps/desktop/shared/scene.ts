@@ -4895,31 +4895,54 @@ export interface OperationInfo {
   timestamp: string;
   actor: string;
   command: string;
-  affected: string[];
+  affectedNodes: string[];
   aiGenerated: boolean;
+  groupId: string | null;
+  isUndo: boolean;
 }
 
-/** Mirror of `kcreate_export::validate::ExportWarning`. */
-export interface ExportWarning {
+/** Mirror of `kcreate_export::validate::ExportSeverity`. */
+export type ExportSeverity = "error" | "warning";
+
+/** Mirror of `kcreate_export::validate::ExportValidationIssue`. */
+export interface ExportValidationIssue {
+  severity: ExportSeverity;
   code: string;
   message: string;
 }
 
-/** Mirror of `kcreate_export::validate::ExportValidationRequest`. */
+/** Mirror of `kcreate_export::validate::ExportValidationRequest`.
+ *
+ * Field names and optionality mirror the Rust struct exactly so that
+ * `JSON.stringify` of this object deserialises cleanly into the Rust
+ * value via `serde(rename_all = "camelCase")`. Keep the four boolean
+ * attributes flat — see the Rust doc comment for the rationale. */
 export interface ExportValidationRequest {
-  width: number;
-  height: number;
+  /** One or more node IDs to export. Empty is invalid. */
+  nodeIds: string[];
+  /** Target format. Currently one of `png`, `jpeg`, `webp`, `svg`, `pdf`. */
   format: string;
+  /** Optional explicit output width in pixels. `0` is rejected. */
+  width: number | null;
+  /** Optional explicit output height in pixels. */
+  height: number | null;
+  /** JPEG quality slider in `[1, 100]`, if format = `jpeg`. */
+  jpegQuality: number | null;
+  /** Whether the request wants a transparent background. */
+  transparent: boolean;
+  /** If true, suppress non-fatal warnings about oversized dimensions. */
+  forceOversized: boolean;
+  /** True if any of the selected nodes has text content. */
   hasText: boolean;
-  hasTransparency: boolean;
-  allowOversize: boolean;
-  missingFonts: string[];
+  /** True if the bridge could not find a system font that covers every
+   * glyph in the selection. */
+  missingFonts: boolean;
 }
 
 /** Mirror of `kcreate_export::validate::ExportValidationReport`. */
 export interface ExportValidationReport {
   ok: boolean;
-  warnings: ExportWarning[];
+  issues: ExportValidationIssue[];
 }
 
 /** Mirror of `kcreate_bridge::phase9::BriefStarterLayer`. */

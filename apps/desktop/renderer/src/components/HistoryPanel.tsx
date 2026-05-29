@@ -137,14 +137,14 @@ export function HistoryPanel({ onJumpTo }: HistoryPanelProps): JSX.Element {
               </div>
               <div style={metaStyle}>
                 <span style={actorStyle}>{op.actor || "anonymous"}</span>
-                {op.affected.length > 0 && (
+                {op.affectedNodes.length > 0 && (
                   <button
                     type="button"
-                    onClick={() => onJumpTo?.(op.affected)}
+                    onClick={() => onJumpTo?.(op.affectedNodes)}
                     style={jumpButtonStyle}
                     data-testid="kcreate-history-jump"
                   >
-                    Jump to ({op.affected.length})
+                    Jump to ({op.affectedNodes.length})
                   </button>
                 )}
               </div>

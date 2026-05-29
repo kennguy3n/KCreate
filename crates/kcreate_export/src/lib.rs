@@ -79,17 +79,15 @@ pub use scene_metadata::{
 
 pub use exif::{read_exif_from_bytes, ExifError, ExifMetadata, ExifValue};
 pub use penpot_import::{
-    import_penpot, import_penpot_bytes, ImportedPenpot, ImportedPenpotAsset,
-    ImportedPenpotFrame, ImportedPenpotPage, ImportedPenpotShape, ImportedPenpotShapeKind,
-    PenpotImportError, PenpotImportWarning,
+    import_penpot, import_penpot_bytes, ImportedPenpot, ImportedPenpotAsset, ImportedPenpotFrame,
+    ImportedPenpotPage, ImportedPenpotShape, ImportedPenpotShapeKind, PenpotImportError,
+    PenpotImportWarning,
 };
 pub use psd_import::{
     group_children as psd_group_children, import_psd, import_psd_bytes, ImportedPsd,
     ImportedPsdGroup, ImportedPsdLayer, PsdImportError,
 };
-pub use svg_preview::{
-    svg_to_raster_preview, SvgPreview, SvgPreviewError, SvgPreviewOptions,
-};
+pub use svg_preview::{svg_to_raster_preview, SvgPreview, SvgPreviewError, SvgPreviewOptions};
 pub use validate::{
     validate_export_request, ExportSeverity, ExportValidationError, ExportValidationIssue,
     ExportValidationReport, ExportValidationRequest, DEFAULT_MAX_DIMENSION,

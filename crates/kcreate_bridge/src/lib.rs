@@ -5068,13 +5068,12 @@ pub fn export_svg_preview(
 #[napi]
 #[allow(clippy::needless_pass_by_value)]
 pub fn operation_log_filter(filter_json: String) -> NapiResult<String> {
-    let filter: phase9::OperationLogFilter =
-        serde_json::from_str(&filter_json).map_err(|e| {
-            NapiError::new(
-                Status::InvalidArg,
-                format!("operation_log_filter: bad filter json: {e}"),
-            )
-        })?;
+    let filter: phase9::OperationLogFilter = serde_json::from_str(&filter_json).map_err(|e| {
+        NapiError::new(
+            Status::InvalidArg,
+            format!("operation_log_filter: bad filter json: {e}"),
+        )
+    })?;
     let rows = phase9::operation_log_filter(&filter).map_err(map_doc_err)?;
     json_out("operation_log_filter", &rows)
 }

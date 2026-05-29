@@ -58,7 +58,10 @@ fn trace_rejects_too_small_image() {
     let img = vec![0u8; 4];
     let opts = TraceOptions::default();
     let err = trace_raster(&img, 1, 1, &opts).expect_err("too small must error");
-    assert!(format!("{err}").to_ascii_lowercase().contains("small") || format!("{err:?}").contains("TooSmall"));
+    assert!(
+        format!("{err}").to_ascii_lowercase().contains("small")
+            || format!("{err:?}").contains("TooSmall")
+    );
 }
 
 #[test]

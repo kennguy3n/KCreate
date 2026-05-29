@@ -283,9 +283,15 @@ pub fn tile_cache_get(key: &TileKey) -> Option<Tile> {
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum MemoryPressureEvent {
     /// Available RAM dropped below the configured threshold.
-    Entered { available_mb: u64, threshold_mb: u64 },
+    Entered {
+        available_mb: u64,
+        threshold_mb: u64,
+    },
     /// Available RAM climbed back above (threshold + hysteresis).
-    Released { available_mb: u64, threshold_mb: u64 },
+    Released {
+        available_mb: u64,
+        threshold_mb: u64,
+    },
 }
 
 struct WatchdogState {
@@ -401,10 +407,7 @@ pub fn memory_pressure_emit_for_test(event: MemoryPressureEvent) {
 #[must_use]
 pub fn runtime_gpu_backend_name() -> String {
     let guard = runtime_slot().lock();
-    guard
-        .gpu_name
-        .clone()
-        .unwrap_or_else(|| "CPU".to_string())
+    guard.gpu_name.clone().unwrap_or_else(|| "CPU".to_string())
 }
 
 #[cfg(test)]

@@ -36,7 +36,10 @@ pub mod operation;
 pub mod project;
 pub mod token_binding;
 
-pub use align::{align_bounds, distribute_bounds, distribute_gap, union_bounds, Align, AlignDelta, DistributeAxis};
+pub use align::{
+    align_bounds, distribute_bounds, distribute_gap, union_bounds, Align, AlignDelta,
+    DistributeAxis,
+};
 pub use annotation::{Annotation, AnnotationFilter, AnnotationPosition};
 pub use color::{
     cmyk_to_srgb, color_distance_cie76, hsl_to_srgb, lab_to_srgb, linear_to_srgb, srgb_to_cmyk,

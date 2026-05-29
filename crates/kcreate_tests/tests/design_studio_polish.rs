@@ -62,8 +62,7 @@ fn seed_three_rects() -> (Uuid, Uuid, [Uuid; 3]) {
 fn align_left_collapses_x_to_min() {
     let _dir = open_project("align-left");
     let (_, _, ids) = seed_three_rects();
-    let results =
-        document_align(&ids, "left").expect("align left should succeed");
+    let results = document_align(&ids, "left").expect("align left should succeed");
     assert_eq!(results.len(), 3);
     // Smallest x in the seed is 10.0 — the leftmost node shouldn't move.
     let r0 = &results[0];
@@ -74,9 +73,17 @@ fn align_left_collapses_x_to_min() {
     );
     // The remaining nodes should have shifted by (10 - their x).
     let r1 = &results[1];
-    assert!((r1.dx - (10.0 - 200.0)).abs() < 1e-9, "r1 dx wrong: {}", r1.dx);
+    assert!(
+        (r1.dx - (10.0 - 200.0)).abs() < 1e-9,
+        "r1 dx wrong: {}",
+        r1.dx
+    );
     let r2 = &results[2];
-    assert!((r2.dx - (10.0 - 400.0)).abs() < 1e-9, "r2 dx wrong: {}", r2.dx);
+    assert!(
+        (r2.dx - (10.0 - 400.0)).abs() < 1e-9,
+        "r2 dx wrong: {}",
+        r2.dx
+    );
     project_close();
 }
 
@@ -140,8 +147,7 @@ fn distribute_axis_must_be_horizontal_or_vertical() {
 fn guide_create_persists_and_lists_back() {
     let _dir = open_project("guide-roundtrip");
     let (page_id, _, _) = seed_three_rects();
-    let guide = guide_create(page_id, "horizontal", 100.0, None, false)
-        .expect("guide_create");
+    let guide = guide_create(page_id, "horizontal", 100.0, None, false).expect("guide_create");
     assert_eq!(guide.page_id, page_id.to_string());
     assert_eq!(guide.orientation, "horizontal");
     assert!((guide.position - 100.0).abs() < 1e-9);
@@ -192,14 +198,8 @@ fn grid_settings_default_then_upsert() {
     assert!(defaults.spacing > 0.0);
 
     // Upsert custom settings.
-    let saved = artboard_set_grid(
-        ab_id,
-        true,
-        32.0,
-        4,
-        Some("#aabbcc".to_string()),
-    )
-    .expect("upsert");
+    let saved =
+        artboard_set_grid(ab_id, true, 32.0, 4, Some("#aabbcc".to_string())).expect("upsert");
     assert!(saved.enabled);
     assert!((saved.spacing - 32.0).abs() < 1e-9);
     assert_eq!(saved.subdivisions, 4);
@@ -220,13 +220,13 @@ fn grid_settings_rejects_invalid_spacing() {
     let (_, ab_id, _) = seed_three_rects();
 
     // Negative spacing must be rejected.
-    let err = artboard_set_grid(ab_id, true, -1.0, 1, None)
-        .expect_err("negative spacing must error");
+    let err =
+        artboard_set_grid(ab_id, true, -1.0, 1, None).expect_err("negative spacing must error");
     assert!(format!("{err:?}").contains("spacing"));
 
     // NaN must also be rejected.
-    let err = artboard_set_grid(ab_id, true, f64::NAN, 1, None)
-        .expect_err("NaN spacing must error");
+    let err =
+        artboard_set_grid(ab_id, true, f64::NAN, 1, None).expect_err("NaN spacing must error");
     assert!(format!("{err:?}").contains("spacing"));
     project_close();
 }

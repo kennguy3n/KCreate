@@ -30,13 +30,9 @@ pub enum PsdImportError {
     Io(#[from] std::io::Error),
     #[error("PSD parse failed: {0}")]
     Parse(String),
-    #[error(
-        "unsupported PSD bit depth (only 8-bit supported; got {0:?})"
-    )]
+    #[error("unsupported PSD bit depth (only 8-bit supported; got {0:?})")]
     UnsupportedDepth(PsdDepth),
-    #[error(
-        "unsupported PSD color mode (only RGB/Grayscale supported; got {0:?})"
-    )]
+    #[error("unsupported PSD color mode (only RGB/Grayscale supported; got {0:?})")]
     UnsupportedColorMode(ColorMode),
     #[error("PSD has zero dimensions ({width}x{height})")]
     EmptyDocument { width: u32, height: u32 },
@@ -289,7 +285,7 @@ mod tests {
         v.extend_from_slice(&[0, 0, 0, 1]); // width = 1
         v.extend_from_slice(&[0, 8]); // depth = 8
         v.extend_from_slice(&[0, 3]); // color mode = RGB
-        // Color mode data length = 0
+                                      // Color mode data length = 0
         v.extend_from_slice(&[0, 0, 0, 0]);
         // Image resources length = 0
         v.extend_from_slice(&[0, 0, 0, 0]);

@@ -410,12 +410,7 @@ fn rdp_recurse(points: &[TracedPoint], lo: usize, hi: usize, epsilon: f32, keep:
     let (a, b) = (points[lo], points[hi]);
     let mut max_dist = 0.0_f32;
     let mut max_idx = lo;
-    for (i, p) in points
-        .iter()
-        .enumerate()
-        .take(hi)
-        .skip(lo + 1)
-    {
+    for (i, p) in points.iter().enumerate().take(hi).skip(lo + 1) {
         let d = perpendicular_distance(*p, a, b);
         if d > max_dist {
             max_dist = d;

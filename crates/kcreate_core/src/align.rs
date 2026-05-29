@@ -61,10 +61,7 @@ impl AlignDelta {
 /// the slice is empty.
 #[must_use]
 pub fn union_bounds(inputs: &[Bounds]) -> Option<Bounds> {
-    inputs
-        .iter()
-        .copied()
-        .reduce(|acc, b| acc.union(&b))
+    inputs.iter().copied().reduce(|acc, b| acc.union(&b))
 }
 
 /// Compute the per-node delta needed to align every bounding box
@@ -243,7 +240,11 @@ mod tests {
 
     #[test]
     fn align_left_pins_to_min_x() {
-        let inputs = [b(10.0, 0.0, 5.0, 5.0), b(50.0, 0.0, 5.0, 5.0), b(100.0, 0.0, 5.0, 5.0)];
+        let inputs = [
+            b(10.0, 0.0, 5.0, 5.0),
+            b(50.0, 0.0, 5.0, 5.0),
+            b(100.0, 0.0, 5.0, 5.0),
+        ];
         let d = align_bounds(&inputs, Align::Left);
         assert_eq!(d[0].dx, 0.0);
         assert_eq!(d[1].dx, -40.0);
@@ -255,7 +256,11 @@ mod tests {
 
     #[test]
     fn align_right_pins_to_max_right() {
-        let inputs = [b(10.0, 0.0, 5.0, 5.0), b(50.0, 0.0, 5.0, 5.0), b(100.0, 0.0, 5.0, 5.0)];
+        let inputs = [
+            b(10.0, 0.0, 5.0, 5.0),
+            b(50.0, 0.0, 5.0, 5.0),
+            b(100.0, 0.0, 5.0, 5.0),
+        ];
         let d = align_bounds(&inputs, Align::Right);
         // anchor.right = 105
         assert_eq!(d[0].dx, 90.0);
@@ -286,7 +291,11 @@ mod tests {
     fn distribute_horizontal_three_items_equal_gap() {
         // Three 10x10 boxes at x=0, 50, 100. Total extent = 110.
         // Total size = 30. Gap = (110 - 30) / 2 = 40.
-        let inputs = [b(0.0, 0.0, 10.0, 10.0), b(50.0, 0.0, 10.0, 10.0), b(100.0, 0.0, 10.0, 10.0)];
+        let inputs = [
+            b(0.0, 0.0, 10.0, 10.0),
+            b(50.0, 0.0, 10.0, 10.0),
+            b(100.0, 0.0, 10.0, 10.0),
+        ];
         let d = distribute_bounds(&inputs, DistributeAxis::Horizontal);
         // First and last stay put.
         assert_eq!(d[0].dx, 0.0);
@@ -302,7 +311,11 @@ mod tests {
         // Extent = 110, total_size = 40. Gap = 70 / 2 = 35.
         // Cursor: 0 (place box 0 at 0) -> 10 + 35 = 45 (place box 1)
         // -> 45 + 20 + 35 = 100 (place box 2). Box 1 moves from 30 to 45 (dx = 15).
-        let inputs = [b(0.0, 0.0, 10.0, 10.0), b(30.0, 0.0, 20.0, 10.0), b(100.0, 0.0, 10.0, 10.0)];
+        let inputs = [
+            b(0.0, 0.0, 10.0, 10.0),
+            b(30.0, 0.0, 20.0, 10.0),
+            b(100.0, 0.0, 10.0, 10.0),
+        ];
         let d = distribute_bounds(&inputs, DistributeAxis::Horizontal);
         assert_eq!(d[0].dx, 0.0);
         assert!((d[1].dx - 15.0).abs() < 1e-9);
@@ -327,7 +340,11 @@ mod tests {
 
     #[test]
     fn distribute_gap_value() {
-        let inputs = [b(0.0, 0.0, 10.0, 10.0), b(50.0, 0.0, 10.0, 10.0), b(100.0, 0.0, 10.0, 10.0)];
+        let inputs = [
+            b(0.0, 0.0, 10.0, 10.0),
+            b(50.0, 0.0, 10.0, 10.0),
+            b(100.0, 0.0, 10.0, 10.0),
+        ];
         let gap = distribute_gap(&inputs, DistributeAxis::Horizontal).unwrap();
         assert!((gap - 40.0).abs() < 1e-9);
     }

@@ -45,6 +45,51 @@ use uuid::Uuid;
 
 use crate::document::runtime_slot;
 
+// ---------------------------------------------------------------------------
+// Lock ordering invariant
+// ---------------------------------------------------------------------------
+//
+// This module participates in a small lock-ordering protocol shared with
+// `crate::document`. There are four process-wide locks that can be touched
+// from a single call chain (e.g. `document::low_resource_mode_set`):
+//
+//   1. `crate::document::runtime_slot()`     — parking_lot Mutex<RuntimeConfig>
+//   2. `crate::document::slot()` (workspace) — parking_lot Mutex<Workspace>
+//   3. `tile_cache_lock()`                   — parking_lot Mutex<TileCache>
+//   4. `INIT_DONE`                           — parking_lot Mutex<bool>
+//
+// Plus one upstream lock owned by `kcreate_perf::startup`:
+//
+//   5. `kcreate_perf::startup::cell()`       — std::sync::Mutex<Option<Timeline>>
+//
+// **Invariant:** locks must be acquired in the order listed above, with
+// the strict additional rule that **no two of (1)–(3) may be held at the
+// same time**. Concretely:
+//
+//   * `runtime_slot` and the workspace `slot` are released before
+//     `tile_cache_lock` is taken (see `current_budget_bytes` /
+//     `resync_tile_cache_budget` below — both drop the runtime guard
+//     before locking the cache).
+//   * `INIT_DONE` (4) is independent: it is only held inside
+//     `ensure_startup_initialized`, briefly, and never composed with
+//     (1)–(3).
+//   * The kcreate_perf `cell` lock (5) is acquired by `startup::*`
+//     functions for the duration of a single push/snapshot and never
+//     held across a call back into this module.
+//
+// **Why this matters:** holding `tile_cache_lock` while calling into
+// `runtime_slot` (or vice-versa) would let a second thread that took
+// them in the documented order block on the first, while the first
+// blocks on the second — a textbook deadlock. The current call graph
+// is deadlock-free precisely because every site releases (1)/(2)
+// before acquiring (3). Future contributors adding a new path that
+// reaches into both must release the upstream guard first, exactly
+// as `resync_tile_cache_budget` does.
+//
+// Bot raised this on Devin Review round 4 PR #24
+// (ANALYSIS_pr-review-job-8e3bcb8412d549429473b2f73cd5811b_0002).
+// ---------------------------------------------------------------------------
+
 /// Key shape for the process-wide tile cache: `(layer_id, col, row)`.
 /// The layer id is the same `Uuid` that `RasterLayer` instances
 /// carry, so callers can compose a key without inventing a

@@ -1250,16 +1250,25 @@ pub fn brief_to_project(plan: &BriefPlan) -> Result<BriefApplyResult> {
             id
         };
 
-        // Starter layers.
+        // Starter layers. Each layer is a 10%-tall band, 80% as wide
+        // as the artboard, vertically stacked with a small gap so the
+        // user opens the project to a readable column instead of a
+        // pile of identically-positioned overlapping rectangles. The
+        // bridge isn't responsible for final layout — the user is
+        // expected to drag things around — but stacking by index
+        // gives a much better first-paint than placing everything at
+        // the same coordinates.
+        let row_height = preset.height * 0.1;
+        let row_gap = preset.height * 0.02;
         let mut layer_ids = Vec::with_capacity(plan.starter_layers.len());
-        for layer in &plan.starter_layers {
+        for (idx, layer) in plan.starter_layers.iter().enumerate() {
             let kind = parse_starter_layer_kind(&layer.kind)?;
             let mut node = Node::new(kind, &layer.name);
             node.bounds = Bounds::new(
                 preset.width * 0.1,
-                preset.height * 0.1,
+                preset.height * 0.1 + (idx as f64) * (row_height + row_gap),
                 preset.width * 0.8,
-                preset.height * 0.1,
+                row_height,
             );
             node.parent_id = Some(artboard_id);
             if kind == NodeType::TextLayer {

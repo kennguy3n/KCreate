@@ -26,7 +26,7 @@ import type {
   BriefPlan,
   LlmMessage,
 } from "../../../shared/scene";
-import { openScratchProject } from "../App";
+import { openScratchProject } from "../lib/scratchProject";
 import { colors, font, radius, spacing } from "../styles/tokens";
 
 interface BriefModalProps {

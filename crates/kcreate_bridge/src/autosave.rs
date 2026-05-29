@@ -22,7 +22,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::thread;
+use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -81,8 +81,31 @@ struct AutosaveState {
     /// timeout equal to the configured interval.
     shutdown_lock: Mutex<()>,
     shutdown_cv: Condvar,
+    /// JoinHandle of the running worker, taken by `autosave_stop`
+    /// so the shutdown is deterministic. Holding the handle in the
+    /// state (rather than letting it drop in `autosave_start`)
+    /// means a rapid start/stop cycle in tests or UI toggles
+    /// observes the previous worker fully exited before the next
+    /// `compare_exchange(false, true, ...)` succeeds.
+    handle: Mutex<Option<JoinHandle<()>>>,
 }
 
+/// The autosave subsystem holds a single process-wide
+/// `OnceLock<AutosaveState>` for its bookkeeping. The lock itself
+/// is permanent — `Mutex<JoinHandle>` and the condvar can't be
+/// reset and there's no benefit to re-allocating them per project
+/// — but the *bookkeeping fields inside* (the
+/// `AutosaveSharedState`) belong to the open project. Without an
+/// explicit reset, opening project B in the same process would
+/// see project A's `last_saved_modified_at`, and a coincident
+/// match of `modified_at` would skip the first autosave tick of
+/// the new project. The skip is self-healing (the next mutation
+/// bumps `modified_at`), but on a crash before that next mutation
+/// the user loses the recovery marker for project B's initial
+/// state. `autosave_reset` is invoked from
+/// [`crate::document::project_close`] to clear those
+/// workspace-tied fields back to defaults, restoring the
+/// invariant that autosave bookkeeping is per-project.
 fn state() -> &'static Arc<AutosaveState> {
     static STATE: OnceLock<Arc<AutosaveState>> = OnceLock::new();
     STATE.get_or_init(|| {
@@ -91,6 +114,7 @@ fn state() -> &'static Arc<AutosaveState> {
             shared: Mutex::new(AutosaveSharedState::default()),
             shutdown_lock: Mutex::new(()),
             shutdown_cv: Condvar::new(),
+            handle: Mutex::new(None),
         })
     })
 }
@@ -109,9 +133,11 @@ pub fn autosave_start() -> bool {
     {
         return false;
     }
-    thread::Builder::new()
+    let worker_state = state.clone();
+    let handle = thread::Builder::new()
         .name("kcreate-autosave".to_string())
         .spawn(move || {
+            let state = worker_state;
             while state.running.load(Ordering::SeqCst) {
                 let interval_secs = {
                     let g = runtime_slot().lock();
@@ -133,20 +159,62 @@ pub fn autosave_start() -> bool {
             }
         })
         .expect("spawn autosave thread");
+    // Park the handle in the state so `autosave_stop` can join
+    // deterministically. Holding the lock for the duration of the
+    // `.replace` is fine — start and stop are user-visible
+    // transitions, not hot-path operations.
+    *state.handle.lock() = Some(handle);
     true
 }
 
 /// Stop the autosave background thread. Returns `true` if it was
 /// running. The waiting thread is woken via the shutdown condvar
-/// so it observes the new flag instantly.
+/// so it observes the new flag instantly, then the caller waits
+/// for the worker to actually exit before returning — this makes
+/// repeated start/stop cycles (test teardown, UI toggles) free of
+/// transient "two workers briefly coexist" windows. The
+/// `compare_exchange` in `autosave_start` already guards against
+/// two *running* workers, but joining here means the next start
+/// observes the previous worker fully reaped.
 pub fn autosave_stop() -> bool {
     let st = state();
     let was_running = st.running.swap(false, Ordering::SeqCst);
     if was_running {
-        let _g = st.shutdown_lock.lock();
-        st.shutdown_cv.notify_all();
+        {
+            let _g = st.shutdown_lock.lock();
+            st.shutdown_cv.notify_all();
+        }
+        // Take the handle into a local so the inner `MutexGuard`
+        // drops *before* we `join()`; without this, clippy's
+        // `significant_drop_in_scrutinee` (rightly) flags that the
+        // guard would live across the join and risk a deadlock if
+        // the thread tried to grab `handle.lock()` itself.
+        let pending = st.handle.lock().take();
+        if let Some(handle) = pending {
+            // A panicked worker would leave the join result `Err`;
+            // we deliberately swallow it because the public
+            // contract of `autosave_stop` is "the worker is no
+            // longer running" and the thread *is* no longer
+            // running in either branch.
+            let _ = handle.join();
+        }
     }
     was_running
+}
+
+/// Reset the per-project autosave bookkeeping. Invoked by
+/// [`crate::document::project_close`] so a subsequent
+/// `project_open` starts with a fresh `last_saved_modified_at` /
+/// `counter` / error fields — see the comment on [`state`] for
+/// the full rationale.
+///
+/// Also stops the background worker if one is running. Restarting
+/// is the responsibility of the next `project_open` path (which
+/// already calls `autosave_start`), keeping the lifecycle
+/// symmetric: open -> start, close -> stop+reset.
+pub fn autosave_reset() {
+    autosave_stop();
+    *state().shared.lock() = AutosaveSharedState::default();
 }
 
 /// Run a single autosave cycle synchronously. Useful for unit

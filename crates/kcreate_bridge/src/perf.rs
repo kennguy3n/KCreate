@@ -37,7 +37,7 @@
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::thread;
+use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use kcreate_perf::startup;
@@ -305,6 +305,14 @@ struct WatchdogState {
     /// long-running background threads.
     shutdown_lock: Mutex<()>,
     shutdown_cv: Condvar,
+    /// JoinHandle of the running worker, taken by
+    /// `memory_watchdog_stop` so shutdown is deterministic. Without
+    /// this, repeated start/stop cycles could briefly let two
+    /// workers coexist (the new one passing the `compare_exchange`
+    /// before the old one has actually exited its loop). Holding
+    /// the handle in the state and joining on stop closes that
+    /// window. Mirrors the same field on `AutosaveState`.
+    handle: Mutex<Option<JoinHandle<()>>>,
 }
 
 fn watchdog_state() -> &'static Arc<WatchdogState> {
@@ -315,6 +323,7 @@ fn watchdog_state() -> &'static Arc<WatchdogState> {
             running: AtomicBool::new(false),
             shutdown_lock: Mutex::new(()),
             shutdown_cv: Condvar::new(),
+            handle: Mutex::new(None),
         })
     })
 }
@@ -337,9 +346,11 @@ pub fn memory_watchdog_start(poll_interval_ms: u64) -> bool {
     {
         return false;
     }
-    thread::Builder::new()
+    let worker_state = state.clone();
+    let handle = thread::Builder::new()
         .name("kcreate-mem-watchdog".to_string())
         .spawn(move || {
+            let state = worker_state;
             let mut sysinfo = sysinfo::System::new();
             let mut under_pressure = false;
             while state.running.load(Ordering::SeqCst) {
@@ -379,18 +390,41 @@ pub fn memory_watchdog_start(poll_interval_ms: u64) -> bool {
             }
         })
         .expect("spawn watchdog thread");
+    // Park the handle in the state so `memory_watchdog_stop` can
+    // join deterministically. See `AutosaveState::handle` for the
+    // rationale on why we don't let the JoinHandle drop on the
+    // spawning thread.
+    *state.handle.lock() = Some(handle);
     true
 }
 
 /// Stop the background watcher. Returns `true` if it was running.
 /// The polling thread is woken via the shutdown condvar so it
-/// observes the new flag instantly.
+/// observes the new flag instantly, then the caller waits for the
+/// worker to actually exit before returning. This makes rapid
+/// start/stop cycles (test teardown, UI toggles) free of the
+/// "two workers briefly coexist" window that a detached spawn
+/// would leave open.
 pub fn memory_watchdog_stop() -> bool {
     let state = watchdog_state();
     let was_running = state.running.swap(false, Ordering::SeqCst);
     if was_running {
-        let _g = state.shutdown_lock.lock();
-        state.shutdown_cv.notify_all();
+        {
+            let _g = state.shutdown_lock.lock();
+            state.shutdown_cv.notify_all();
+        }
+        // Take the handle into a local so the inner `MutexGuard`
+        // drops *before* we `join()`; clippy's
+        // `significant_drop_in_scrutinee` flags the alternative as
+        // a deadlock risk. See the matching block in
+        // `autosave::autosave_stop` for the same pattern.
+        let pending = state.handle.lock().take();
+        if let Some(handle) = pending {
+            // Swallow join errors — a panicked worker still
+            // counts as "no longer running", which is the
+            // contract we publish to callers.
+            let _ = handle.join();
+        }
     }
     was_running
 }

@@ -264,6 +264,16 @@ pub fn document_resize_frame(frame_id: Uuid, new_bounds: Bounds) -> Result<()> {
                 autofit_changes.push(change);
             }
         }
+        // The autofit slice of the audit payload must encode the
+        // state the slot *holds*, not the diff. `before.autofit[i]`
+        // captures the pre-resize font size (the value to restore on
+        // undo), and `after.autofit[i]` captures the post-resize
+        // size. An earlier revision emitted `{previous_size,
+        // new_size}` in both halves, which made the two snapshots
+        // identical — undoing the resize would have left autofitted
+        // text at its post-resize size. Encoding each half as the
+        // single `font_size` it represents keeps the audit payload
+        // suitable for a future symmetric apply_patch arm.
         let after = serde_json::json!({
             "frame": new_bounds,
             "children": child_updates
@@ -274,8 +284,7 @@ pub fn document_resize_frame(frame_id: Uuid, new_bounds: Bounds) -> Result<()> {
                 .iter()
                 .map(|c| serde_json::json!({
                     "id": c.node_id.to_string(),
-                    "previous_size": c.previous_size,
-                    "new_size": c.new_size,
+                    "font_size": c.new_size,
                 }))
                 .collect::<Vec<_>>(),
         });
@@ -286,8 +295,7 @@ pub fn document_resize_frame(frame_id: Uuid, new_bounds: Bounds) -> Result<()> {
                 .iter()
                 .map(|c| serde_json::json!({
                     "id": c.node_id.to_string(),
-                    "previous_size": c.previous_size,
-                    "new_size": c.new_size,
+                    "font_size": c.previous_size,
                 }))
                 .collect::<Vec<_>>(),
         });

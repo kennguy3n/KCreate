@@ -76,12 +76,18 @@ export function GridOverlay({
   const majorColor = settings.color || "#444a55";
   const subColor = withAlpha(majorColor, 0.4);
 
+  // We key SVG lines by their integer index (vmaj-0, hmaj-3, ...)
+  // rather than by their floating-point coordinate. Two grid lines
+  // can round to the same float string at certain zoom/pan combos,
+  // which would emit a duplicate-key warning and silently drop one
+  // of the lines. Indexed keys are stable regardless of IEEE 754
+  // representation.
   const lines: JSX.Element[] = [];
-  // Vertical major lines.
-  for (let x = startX; x < width; x += majorPx) {
+  let vmajIdx = 0;
+  for (let x = startX; x < width; x += majorPx, vmajIdx += 1) {
     lines.push(
       <line
-        key={`vmaj-${x}`}
+        key={`vmaj-${vmajIdx}`}
         x1={x}
         x2={x}
         y1={0}
@@ -91,11 +97,11 @@ export function GridOverlay({
       />,
     );
   }
-  // Horizontal major lines.
-  for (let y = startY; y < height; y += majorPx) {
+  let hmajIdx = 0;
+  for (let y = startY; y < height; y += majorPx, hmajIdx += 1) {
     lines.push(
       <line
-        key={`hmaj-${y}`}
+        key={`hmaj-${hmajIdx}`}
         x1={0}
         x2={width}
         y1={y}
@@ -124,7 +130,7 @@ export function GridOverlay({
       if (i % subPerMajor === 0) continue;
       lines.push(
         <line
-          key={`vsub-${x}`}
+          key={`vsub-${i}`}
           x1={x}
           x2={x}
           y1={0}
@@ -142,7 +148,7 @@ export function GridOverlay({
       if (i % subPerMajor === 0) continue;
       lines.push(
         <line
-          key={`hsub-${y}`}
+          key={`hsub-${i}`}
           x1={0}
           x2={width}
           y1={y}

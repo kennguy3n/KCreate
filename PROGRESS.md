@@ -1100,8 +1100,224 @@ artifact-publishing capabilities the proposal calls for.
       **`apps/desktop/main/src/{bridge,main}.ts`** wire the
       IPC handlers + Bridge interface.
 
+## Phase 9 — KChat extension depth, Home screen, design studio polish | Complete | 100%
+
+Phase 9 closes the proposal-level gaps that Phase 8 deferred:
+the KChat companion extension, the "Start from a brief" Home
+screen, the AI palette / trace / icon-ify actions, the
+ruler + grid + alignment surfaces in Design Studio, the PSD /
+Penpot / EXIF / SVG-preview import edges, and the
+memory-pressure + autosave + export-validation robustness layer.
+
+### Block A — Phase 8 close-out + KChat extension depth (Tasks 1–6)
+- [x] **Task 1: Mark Phase 8 Complete.** PROGRESS / PHASES headers
+      flipped from "In Progress" to "Complete | 100%".
+- [x] **Task 2: `ProjectBrowserPanel.tsx`.** Renders the current
+      community's KCreate projects sourced from
+      `kchat_backend_list_artifacts`; clicking a card fires
+      `openDeeplink('kcreate://open?project_id=…')`.
+- [x] **Task 3: `ArtifactCard.tsx` + KCreate-side artifact
+      deeplink.** Rich preview (thumbnail / format badge / size /
+      "Open in KCreate") for `kcreate.invite.v1` and
+      `kcreate.artifact.v1` content-type messages. The KCreate
+      `main.ts` dispatcher now handles
+      `kcreate://artifact?id=…` by navigating to the project and
+      highlighting the artifact in the export panel.
+- [x] **Task 4: `SessionStatusBadge.tsx`.** Deeplink-probe based
+      green-dot / grey-dot status badge — the extension can't
+      directly read KCreate's process state.
+- [x] **Task 5: `ActivityFeed.tsx`.** Recent design activity
+      derived from `kchat_backend_list_artifacts` + conversation
+      message history, with deeplinks back into KCreate.
+- [x] **Task 6: Tests + build pipeline.**
+      `apps/kchat-extension/tests/phase9-panels.test.mjs` covers
+      all four new panels via a fake `__kchatHost`. ESLint +
+      TypeScript strict both clean.
+
+### Block B — Home Screen & AI Workflow Completion (Tasks 7–12)
+- [x] **Task 7: "Start from a brief" tile.** `BriefModal.tsx`
+      collects the user's brief and submits a structured GBNF
+      prompt to the local LLM sidecar. The result feeds
+      `brief_to_project` in `kcreate_bridge::phase9` which
+      orchestrates the artboard preset, brand kit upsert, and
+      starter-layer creation against the *currently open*
+      project (no implicit "new project" path).
+- [x] **Task 8: Model status + GPU tier badge.** `ModelStatusGrid`
+      on the Home page surfaces device tier, GPU backend name
+      (via the new `runtime_gpu_backend_name` N-API entry
+      in `kcreate_bridge::perf`), LLM sidecar status, and the
+      installed-pack count.
+- [x] **Task 9: Help & Learn grid.** Getting Started,
+      keyboard-shortcuts cheat sheet, CHANGELOG viewer, and the
+      power-user links to PROPOSAL / ARCHITECTURE.
+- [x] **Task 10: AI palette extraction.** AIAssistPanel offers
+      "Extract palette from image" against the selected raster
+      layer; `palette_extract_and_apply_brand_kit(node_id,
+      num_colors)` in `kcreate_bridge::phase9` materialises the
+      result as a brand-kit upsert.
+- [x] **Task 11: Copy-fit text on layer resize.** The
+      `document_update_node` path now detects autofit text and
+      re-runs `kcreate_text::autofit::compute_autofit_size`
+      atomically with the bounds change. Regression covered by
+      `crates/kcreate_tests/tests/text_autofit_on_resize.rs`.
+- [x] **Task 12: AI trace-to-vector.** `kcreate_ai::trace`
+      implements RGBA→grayscale→Otsu/fixed threshold→
+      Moore-neighbour contour tracing→RDP simplification. Wired
+      via `ai_trace_raster` in `kcreate_bridge::phase9` which
+      appends a sibling group of vector-path nodes carrying the
+      traced polyline metadata.
+
+### Block C — Import / Export Gaps (Tasks 13–18)
+- [x] **Task 13: PSD layered raster import.**
+      `kcreate_export::psd_import` parses PSD files with the
+      `psd` crate, materialises layer pixels into the blob store
+      as PNGs, and emits a `RasterImage` node tree with mapped
+      blend modes and groups. Bridge: `import_psd(path)`.
+- [x] **Task 14: EXIF preservation.**
+      `kcreate_export::exif` extracts EXIF on import via
+      `kamadak-exif` and stores it on the node metadata; the
+      JPEG / WebP exporters re-embed the JSON-encoded metadata
+      on round-trip.
+- [x] **Task 15: Penpot best-effort import.**
+      `kcreate_export::penpot_import` parses Penpot `.penpot`
+      zip bundles into artboards / frames / shapes; embedded
+      assets land in the blob store. Bridge: `import_penpot`.
+- [x] **Task 16: `resvg` SVG-to-raster preview.**
+      `kcreate_export::svg_preview` rasterises SVG payloads with
+      `resvg`. Bridge: `export_svg_preview(node_ids, w, h)`.
+- [x] **Task 17: History panel + operation log filter.**
+      `HistoryPanel.tsx` renders the operation log with AI /
+      manual filter chips, "Jump to" selection, and "Undo to
+      here". Backed by `document_operation_log` in
+      `kcreate_bridge::phase9` + the audit-trail filter helper.
+- [x] **Task 18: Import pipeline tests.** Integration coverage
+      in `crates/kcreate_tests/tests/` for the PSD / Penpot /
+      EXIF / SVG-preview paths.
+
+### Block D — Vector Studio & Design Studio Polish (Tasks 19–24)
+- [x] **Task 19: AI icon-ify.** `kcreate_ai::iconify` packs a
+      vector selection into a normalised grid (24 / 48 / etc.),
+      simplifies with RDP, and emits paths with a recommended
+      stroke width. Bridge: `ai_iconify(node_ids, grid_size)`.
+- [x] **Task 20: Batch alt-text generation.** AIAssistPanel's
+      "Generate alt-text for all images" action calls
+      `ai_batch_alt_text(page_id)`; each image gets a
+      VLM-derived alt-text stored on `node.metadata["alt_text"]`.
+- [x] **Task 21: Ruler + measurement guides overlay.**
+      `RulerOverlay.tsx` renders pixel-aligned rulers that
+      drag-create guides. Guides persist in the new
+      `kcreate_storage::guides` table; the snap engine treats
+      guide lines as snap targets. Bridge: `guide_create`,
+      `guide_list`, `guide_delete`.
+- [x] **Task 22: Grid overlay.** `GridOverlay.tsx` renders a
+      per-artboard pixel grid toggleable with Ctrl+'. Grid
+      settings persist on the artboard node. Bridge:
+      `artboard_grid_settings`, `artboard_set_grid`.
+- [x] **Task 23: Multi-select alignment + distribution.**
+      `kcreate_core::align` implements the alignment +
+      distribution math (LWW-safe per-node `dx/dy`). Bridge:
+      `document_align`, `document_distribute`. UI in
+      `AlignmentToolbar.tsx`.
+- [x] **Task 24: Design Studio + Vector Studio tests.**
+      10 serial integration tests in
+      `crates/kcreate_tests/tests/design_studio_polish.rs`
+      covering alignment math, distribution, guide lifecycle,
+      and grid validation. 6 algorithm tests for trace +
+      iconify in `crates/kcreate_tests/tests/trace_and_iconify.rs`.
+
+### Block E — Performance, Security & Robustness (Tasks 25–28)
+- [x] **Task 25: Memory pressure watchdog.**
+      `kcreate_bridge::perf::memory_watchdog_start` polls the
+      host's available RAM every 5 s (configurable). On entering
+      pressure it clears the tile cache and emits
+      `MemoryPressureEvent::Entered`; on releasing it emits
+      `Released`. Events queue (capped at 32) and the renderer
+      drains them via `drain_memory_events`.
+- [x] **Task 26: Project autosave with crash recovery.**
+      `kcreate_bridge::autosave` spawns an opt-in background
+      thread that calls `project_save` whenever `modified_at`
+      advances and writes an autosave marker per tick. Recovery
+      surfaced via `autosave_recovery_available`,
+      `autosave_recover`, `autosave_dismiss_recovery`.
+- [x] **Task 27: Export validation + error reporting.**
+      `kcreate_export::validate::validate_export_request` checks
+      dimensions, format, JPEG quality, missing fonts, and
+      surfaces issues with `ExportSeverity::{Error, Warning}`.
+      Bridge: `export_validate(request)`.
+- [x] **Task 28: Stress / robustness tests.** Memory-pressure
+      queue cap + drain order tests, autosave round-trip,
+      export-validation regression covered in
+      `crates/kcreate_tests/tests/phase9_robustness.rs`.
+
+### Block F — Documentation & Polish (Tasks 29–30)
+- [x] **Task 29: PROGRESS.md + PHASES.md updated.** Phase 8
+      moved to Complete; Phase 9 section added with every
+      task checkbox accounted for.
+- [x] **Task 30: README / ARCHITECTURE / AGENTS sync.** Phase 9
+      modules added to the AGENTS "Where new code goes" table
+      (`trace.rs`, `iconify.rs`, `psd_import.rs`,
+      `penpot_import.rs`, `svg_preview.rs`, `autosave.rs`,
+      `validate.rs`, `phase9.rs`, `HistoryPanel.tsx`,
+      `RulerOverlay.tsx`, `GridOverlay.tsx`,
+      `AlignmentToolbar.tsx`).
+
+### Phase 9 — Bridge & wire-format lockstep
+- [x] **`crates/kcreate_bridge/src/phase9.rs`** owns the
+      workspace-level helpers for brief→project, AI trace /
+      iconify / palette / alt-text, PSD / Penpot import,
+      SVG preview, history filter, alignment + distribution,
+      guide lifecycle, grid settings, and export validation.
+- [x] **`crates/kcreate_bridge/src/lib.rs`** exposes the new
+      N-API entry points (`brief_to_project`,
+      `palette_extract_and_apply_brand_kit`, `ai_trace_raster`,
+      `ai_iconify`, `ai_batch_alt_text`, `import_psd`,
+      `import_penpot`, `export_svg_preview`, `export_validate`,
+      `document_operation_log`, `document_align`,
+      `document_distribute`, `guide_create`, `guide_list`,
+      `guide_delete`, `artboard_grid_settings`,
+      `artboard_set_grid`, `runtime_gpu_backend_name`,
+      `memory_watchdog_start`, `memory_watchdog_stop`,
+      `drain_memory_events`, `autosave_start`,
+      `autosave_force_now`, `autosave_status`,
+      `autosave_recovery_available`, `autosave_recover`,
+      `autosave_dismiss_recovery`).
+- [x] **`apps/desktop/shared/scene.ts`** mirrors the new
+      types (`BriefApplyResult`, `TraceResult`,
+      `IconifyResultInfo`, `PsdImportResult`, `PenpotImportResult`,
+      `SvgPreviewResult`, `ExportValidationReport`,
+      `OperationLogEntry`, `AlignDeltaInfo`, `GuideInfo`,
+      `GridSettings`, `MemoryPressureEvent`,
+      `AutosaveStatusInfo`, `AutosaveMarkerInfo`).
+- [x] **`apps/desktop/preload/src/preload.ts`** and
+      **`apps/desktop/main/src/{bridge,main}.ts`** wire the
+      IPC handlers + Bridge interface.
+
 ## Changelog
 
+- **2026-05-29 (PR #25)** — Phase 9: KChat extension depth
+  (project browser, artifact preview cards, session status,
+  activity feed in `apps/kchat-extension/src/`), Home screen
+  "Start from a brief" + model-status / Help-and-Learn tiles
+  (`BriefModal.tsx`, `HomePage.tsx`), AI palette / trace /
+  iconify / batch alt-text (`kcreate_ai::trace`,
+  `kcreate_ai::iconify`, `kcreate_bridge::phase9`), PSD /
+  Penpot / EXIF / SVG-preview import edges
+  (`kcreate_export::{psd_import, penpot_import, svg_preview,
+  exif, validate}` + `psd`, `kamadak-exif`, `resvg`
+  dependencies), History panel + operation-log filter
+  (`HistoryPanel.tsx`), Design Studio ruler / grid /
+  alignment + distribution (`RulerOverlay.tsx`,
+  `GridOverlay.tsx`, `AlignmentToolbar.tsx`,
+  `kcreate_core::align`, `kcreate_storage::guides`),
+  memory-pressure watchdog
+  (`kcreate_bridge::perf::memory_watchdog_start`), autosave +
+  crash recovery (`kcreate_bridge::autosave`), export
+  validation (`kcreate_export::validate`). 32 new integration
+  tests in `crates/kcreate_tests/tests/`
+  (`brief_to_project.rs`, `design_studio_polish.rs`,
+  `phase9_robustness.rs`, `trace_and_iconify.rs`).
+  `local_first.rs` sentinel stays green — none of the new
+  dependencies pull networking into the editing-path closure.
 - **2026-05-28** — Phase 8 (in progress): production-hardening
   sweep — design-review annotations
   (`kcreate_core::annotation`,

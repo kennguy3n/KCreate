@@ -157,3 +157,55 @@ none of the new code introduces a networking dependency to
 the editing-path closure.
 
 See PROGRESS.md §"Phase 8" for the per-task breakdown.
+
+## Phase 9 — KChat extension depth, Home screen, design studio polish | Complete | 100%
+
+Phase 9 closes the proposal-level gaps that Phase 8 deferred:
+the KChat companion extension panels, the "Start from a
+brief" Home screen flow, the AI palette / trace / icon-ify
+actions, the ruler + grid + alignment surfaces in Design
+Studio, the PSD / Penpot / EXIF / SVG-preview import edges,
+and the memory-pressure + autosave + export-validation
+robustness layer. 30 tasks across 6 blocks:
+
+- **Block A (Tasks 1–6):** Phase 8 close-out + KChat
+  extension depth — `ProjectBrowserPanel.tsx`,
+  `ArtifactCard.tsx`, `SessionStatusBadge.tsx`,
+  `ActivityFeed.tsx` in `apps/kchat-extension/src/`, plus
+  the KCreate-side `kcreate://artifact?id=` deeplink.
+- **Block B (Tasks 7–12):** Home screen — "Start from a
+  brief" tile (`BriefModal.tsx`), Model status + GPU tier
+  badge, Help & Learn grid, AI palette extraction, copy-fit
+  text on layer resize, AI raster-to-vector trace.
+- **Block C (Tasks 13–18):** PSD layered raster import
+  (`kcreate_export::psd_import`), EXIF preservation
+  (`kcreate_export::exif`), Penpot best-effort import
+  (`kcreate_export::penpot_import`), `resvg`-backed SVG
+  preview (`kcreate_export::svg_preview`), History panel +
+  operation-log filter (`HistoryPanel.tsx`).
+- **Block D (Tasks 19–24):** AI icon-ify
+  (`kcreate_ai::iconify`), batch alt-text, ruler +
+  measurement guides (`RulerOverlay.tsx`,
+  `kcreate_storage::guides`), grid overlay
+  (`GridOverlay.tsx`), multi-select alignment + distribution
+  (`kcreate_core::align`, `AlignmentToolbar.tsx`).
+- **Block E (Tasks 25–28):** memory pressure watchdog
+  (`kcreate_bridge::perf::memory_watchdog_start`), project
+  autosave with crash recovery (`kcreate_bridge::autosave`),
+  export validation (`kcreate_export::validate`), stress /
+  robustness regression coverage.
+- **Block F (Tasks 29–30):** PROGRESS.md / PHASES.md /
+  README.md / ARCHITECTURE.md / AGENTS.md updates.
+
+All Phase 9 Rust + bridge work lives in
+`crates/kcreate_bridge/src/phase9.rs` (workspace-level
+helpers) plus `kcreate_bridge::perf` and
+`kcreate_bridge::autosave`, exposed through ~30 new N-API
+entry points in `crates/kcreate_bridge/src/lib.rs`. The
+TypeScript wire format is mirrored in
+`apps/desktop/shared/scene.ts`. The local-first sentinel
+(`crates/kcreate_tests/tests/local_first.rs`) stays green —
+the new `psd`, `kamadak-exif`, and `resvg` dependencies are
+either pure-Rust or already in the editing path.
+
+See PROGRESS.md §"Phase 9" for the per-task breakdown.

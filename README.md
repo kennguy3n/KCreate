@@ -63,6 +63,8 @@ See [`PROPOSAL.md`](./PROPOSAL.md) for the full product spec.
 | Collaboration protocol | Ed25519-signed envelopes, Lamport clocks, LWW + operational CRDT conflict resolution, append-only operation journal, 60-min QUIC cert rotation, per-peer rate limits, ChaCha20-Poly1305 encrypted clipboard share over BLAKE3-derived X25519 session keys |
 | KChat backend integration | `kcreate_kchat_client`: HTTPS REST (`reqwest` + `rustls`) to the shared KChat / Mattermost backend that `uneycom/uney-chat-desktop` also signs in to; community-gated sessions + member roster sync + conversation-based document sharing (opt-in via `kchat-backend` feature on `kcreate_bridge`). A thin `.kcz` companion extension (`apps/kchat-extension/`) renders a sidebar inside KChat Desktop and bridges deeplinks back to KCreate. |
 | Brand kit format     | `.kbrand` ZIP archive: `manifest.json` + `fonts/` (TTF/OTF) + `logos/` (PNG/SVG/JPEG) |
+| Import edges (Phase 9) | `psd` (Adobe PSD layered import), `kamadak-exif` (JPEG / WebP EXIF round-trip), `resvg` (SVG-to-raster preview + thumbnail rasterisation) |
+| Robustness (Phase 9) | Memory-pressure watchdog (`kcreate_bridge::perf::memory_watchdog_start`, `sysinfo`-backed), opt-in autosave + crash recovery (`kcreate_bridge::autosave`), export pre-flight validation (`kcreate_export::validate`) |
 
 See [`ARCHITECTURE.md`](./ARCHITECTURE.md) for the technical design.
 

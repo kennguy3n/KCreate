@@ -25,6 +25,11 @@ kcreate_raster = { path = "../kcreate_raster" }
 kcreate_vector = { path = "../kcreate_vector" }
 kcreate_ai = { path = "../kcreate_ai" }
 kcreate_audit = { path = "../kcreate_audit" }
+# Phase 8 Block E Task 27: lightweight cold-path / startup
+# profiling primitives. The crate has no networking and no async,
+# so it is safe to live in the editing-path closure walked by
+# `local_first.rs`.
+kcreate_perf = { path = "../kcreate_perf" }
 # The MCP server is the *only* component of the editing-side runtime
 # that links a networking library (`tiny_http`). Per AGENTS.md the
 # editing path must stay network-free, so this is optional and gated
@@ -106,6 +111,14 @@ napi-build.workspace = true
 # The bridge state machine is a process-global singleton, so tests that
 # mutate it must run serialized.
 serial_test = "3"
+# Re-import `kcreate_perf` under its `test_support` feature so the bridge's
+# test path can call `kcreate_perf::startup::reset_for_tests()` to clear
+# the process-wide startup timeline between cases. Without this, bridge
+# tests sharing the singleton became subtly order-dependent (Devin Review
+# ANALYSIS_0003 round 3 on PR #24). The feature is dev-only and not enabled
+# in the production dep above, so the local-first sentinel + release builds
+# are unaffected.
+kcreate_perf = { path = "../kcreate_perf", features = ["test_support"] }
 tempfile.workspace = true
 # WAT plugin fixtures for the Phase 2 Block C plugin-context tests
 # (see `document.rs::tests::plugin_execute_with_context_*`). Pinned

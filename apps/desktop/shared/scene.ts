@@ -684,6 +684,47 @@ export interface ResourceLimits {
   platform: string;
 }
 
+/**
+ * Phase 8 Block E Task 27 — one entry in `StartupTimelineReport.marks`.
+ * `monotonicNs` is the nanosecond offset from the monotonic clock
+ * anchor captured when the timeline was created (Rust-side
+ * `Instant::now()` at `Timeline::start`), NOT from `startedAtUnixMs`.
+ * The wall-clock `startedAtUnixMs` is only kept for human correlation
+ * with system logs; never mix the two by adding them (the units don't
+ * line up — one is monotonic ns since timeline construction, the other
+ * is wall-clock ms since epoch). All per-mark and per-phase durations
+ * are computed monotonically so resume-from-sleep cannot make them go
+ * backwards.
+ */
+export interface StartupMark {
+  label: string;
+  monotonicNs: number;
+}
+
+/** Phase 8 Block E Task 27 — one derived `phase` interval. */
+export interface StartupPhase {
+  label: string;
+  fromNs: number;
+  toNs: number;
+  durationNs: number;
+}
+
+/** Phase 8 Block E Task 27 — full startup-timeline snapshot. */
+export interface StartupTimelineReport {
+  name: string;
+  startedAtUnixMs: number;
+  totalNs: number;
+  marks: StartupMark[];
+  phases: StartupPhase[];
+}
+
+/** Phase 8 Block E Task 28 — tile-cache snapshot. */
+export interface TileCacheStats {
+  bytes: number;
+  entries: number;
+  budgetBytes: number;
+}
+
 /** Runtime / device probe. */
 export interface RuntimeBridge {
   status(): Promise<RuntimeStatus>;
@@ -712,6 +753,40 @@ export interface RuntimeBridge {
   lowResourceModeSet(enabled: boolean): Promise<void>;
   /** Snapshot the resolved effective limits. */
   resourceLimits(): Promise<ResourceLimits>;
+  /**
+   * Phase 8 Block E Task 27 — startup-perf profiling.
+   *
+   * Snapshot of the process-wide startup timeline owned by the
+   * bridge (`kcreate_perf::startup`). Returns `null` when the
+   * timeline has never been initialised — the renderer can then
+   * skip showing the diagnostics overlay. Each entry in
+   * `marks` is `{ label, monotonicNs }`; each entry in `phases`
+   * is `{ label, fromNs, toNs, durationNs }`. All durations
+   * are monotonic — never wall-clock — so resume from sleep
+   * cannot make them go backwards.
+   */
+  startupTimeline(): Promise<StartupTimelineReport | null>;
+  /**
+   * Drop a named mark on the global startup timeline from the
+   * renderer (e.g. `first_paint`, `first_interactive`). The
+   * mark joins the same monotonic timeline as the bridge's own
+   * cold-path marks so a single report tells the full story.
+   */
+  startupMark(label: string): Promise<void>;
+  /**
+   * Phase 8 Block E Task 28 — tile-cache observability.
+   *
+   * Snapshot of the bridge-owned LRU tile cache. `bytes` and
+   * `budgetBytes` are byte counts (not MB); `entries` is the
+   * number of cached tile slots.
+   */
+  tileCacheStats(): Promise<TileCacheStats>;
+  /**
+   * Drop every entry from the process-wide tile cache. Returns
+   * the count of entries that were evicted so the UI can show
+   * `Freed N tiles`.
+   */
+  tileCacheClear(): Promise<number>;
   /**
    * Write a UTF-8 text file at `path`. The host requires the path to
    * be inside the OS temp directory returned by `tempDir()` — any

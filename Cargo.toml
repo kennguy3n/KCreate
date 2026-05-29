@@ -7,6 +7,7 @@ members = [
     "crates/kcreate_storage",
     "crates/kcreate_vector",
     "crates/kcreate_export",
+    "crates/kcreate_perf",
     "crates/kcreate_raster",
     "crates/kcreate_text",
     "crates/kcreate_layout",

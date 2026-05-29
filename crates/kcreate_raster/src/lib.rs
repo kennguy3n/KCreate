@@ -21,10 +21,12 @@ pub mod filters;
 pub mod heal;
 pub mod layer;
 pub mod tile;
+pub mod tile_cache;
 pub mod transform;
 
 pub use filters::{box_blur, gaussian_blur, unsharp_mask};
 pub use heal::heal;
 pub use layer::{AdjustmentLayer, BlendMode, CurvePoint, Mask, RasterLayer, RasterLayerError};
 pub use tile::{Tile, TileGrid, TileGridError, DEFAULT_TILE_SIZE};
+pub use tile_cache::TileCache;
 pub use transform::{crop, flip_h, flip_v, perspective_transform, rotate};

@@ -292,6 +292,21 @@ export interface Bridge {
   lowResourceModeGet(): boolean;
   lowResourceModeSet(enabled: boolean): void;
   resourceLimits(): string;
+  // Phase 8 Block E Task 27 — startup-perf profiling.
+  // `runtimeStartupTimeline` returns the JSON-serialised
+  // `kcreate_perf::Report` shape (snake_case fields). Returns the
+  // literal `"{}"` if the timeline has never been initialised, so
+  // the renderer doesn't have to special-case "no timeline yet".
+  runtimeStartupTimeline(): string;
+  // Drop a renderer-side phase mark onto the same global timeline
+  // (e.g. `"first_paint"`, `"first_interactive"`) so a single
+  // report tells the full startup story.
+  runtimeStartupMark(label: string): void;
+  // Phase 8 Block E Task 28 — tile-cache stats + clear. The
+  // bridge deliberately does NOT expose insert / get to the
+  // renderer; those are raster-op internals.
+  runtimeTileCacheStats(): string;
+  runtimeTileCacheClear(): number;
   llmStart(modelPath: string): number;
   llmStop(): void;
   llmStatus(): string;

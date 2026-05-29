@@ -30,6 +30,7 @@ pub mod kchat_backend;
 pub mod llm;
 #[cfg(feature = "native_canvas")]
 pub mod native_canvas;
+pub mod perf;
 pub mod phase2;
 pub mod phase4;
 pub mod phase8;
@@ -969,6 +970,53 @@ pub fn resource_limits() -> NapiResult<String> {
     let limits = document::resource_limits();
     serde_json::to_string(&limits)
         .map_err(|e| NapiError::from_reason(format!("resource_limits: {e}")))
+}
+
+// =============================================================================
+// Startup / runtime profiling (Phase 8 Block E Task 27)
+// =============================================================================
+
+/// JSON snapshot of the process-wide startup timeline. The shape
+/// mirrors [`kcreate_perf::Report`] (snake_case fields, monotonic
+/// nanosecond durations, derived `phases` array). Returns the
+/// literal string `"{}"` if the timeline has never been
+/// initialised — keeps the IPC contract total so the renderer
+/// doesn't have to special-case "no timeline yet".
+#[napi]
+pub fn runtime_startup_timeline() -> String {
+    perf::startup_timeline_json()
+}
+
+/// Drop a named mark on the process-wide startup timeline.
+/// Convenience for renderer-side phases (first paint, first
+/// interactive). The bridge owns the cold-path marks; this lets
+/// the renderer correlate its own phase boundaries on the same
+/// monotonic clock so a single JSON report tells the full story.
+#[napi]
+pub fn runtime_startup_mark(label: String) {
+    perf::mark(label);
+}
+
+/// JSON snapshot of the process-wide tile-cache stats. Fields
+/// are `bytes`, `entries`, `budget_bytes` (snake_case to match
+/// [`perf::TileCacheStats`]). Used by the diagnostics overlay
+/// and the storage-impact card in `EncryptionPanel`.
+#[napi]
+pub fn runtime_tile_cache_stats() -> NapiResult<String> {
+    let stats = perf::tile_cache_stats();
+    serde_json::to_string(&stats)
+        .map_err(|e| NapiError::from_reason(format!("runtime_tile_cache_stats: {e}")))
+}
+
+/// Drop every entry from the process-wide tile cache. Returns
+/// the count of entries that were evicted. Used by the
+/// diagnostics overlay's "Reclaim memory" action — the bridge
+/// chooses not to expose `insert` / `get` to the renderer (those
+/// are bridge-internal raster-op concerns).
+#[napi]
+pub fn runtime_tile_cache_clear() -> u32 {
+    let dropped = perf::tile_cache_clear();
+    u32::try_from(dropped).unwrap_or(u32::MAX)
 }
 
 // =============================================================================

@@ -954,6 +954,56 @@ artifact-publishing capabilities the proposal calls for.
       test modules above.
 
 ### Block E — Performance, Security & Production Hardening (Tasks 25–28)
+- [x] **Task 27: Cold-path startup profiling crate
+      `kcreate_perf`.** New workspace member (no networking,
+      no async, only `serde` + `serde_json` deps; safe to live
+      in the editing-path closure walked by `local_first.rs`).
+      Three primitives: `Timeline` (append-only sequence of
+      named time marks, each tagged with a monotonic
+      nanosecond offset from `Instant::now()`), `Scope` (RAII
+      span that auto-marks `<label>.end` on drop and is
+      idempotent under explicit `Scope::end`), and `Report`
+      (serde-ready JSON snapshot with derived `phases`). The
+      `startup` module owns a process-wide
+      `OnceLock<Mutex<Option<Timeline>>>` keyed on
+      `"startup"`; `ensure_initialized` is idempotent and
+      callable from any hot path. The bridge wires it on
+      first touch and drops marks at `bridge.first_call` (first
+      perf API use after `process.dlopen` — a true load-time mark
+      would need an `unsafe` ctor), `project_create.{start,end}`, and
+      `project_open.{start,end}`. The renderer drops its own
+      `first_paint` / `first_interactive` marks on the same
+      monotonic clock via `runtime_startup_mark`. N-API
+      surface: `runtime_startup_timeline` (JSON Report) and
+      `runtime_startup_mark(label)`. 11 unit tests pin the
+      monotonic-order, scope idempotency, snapshot
+      non-consuming, JSON round-trip, and singleton
+      idempotency invariants; 6 bridge-level tests verify
+      that `bridge.first_call` is emitted exactly once across
+      repeated `ensure_startup_initialized` calls.
+- [x] **Task 28: Tile-cache LRU eviction in
+      `kcreate_raster::tile_cache`.** `TileCache<K>` is a
+      bounded LRU store of decoded `Tile`s keyed on an
+      opaque caller-supplied key (the bridge instantiates
+      `TileCache<(Uuid, u32, u32)>` for `(layer_id, col,
+      row)`). Memory accounting tracks raw pixel bytes
+      (`tile.pixels.len()`); eviction policy is
+      least-recently-used by a monotonic tick counter bumped
+      on every read and write. Oversized inserts (a single
+      tile larger than the budget) never evict the
+      most-recently-used entry — the cache briefly goes over
+      budget and the next insert reclaims room. Wire-up: the
+      bridge owns a process-wide singleton at
+      `kcreate_bridge::perf::tile_cache_lock`, seeded from
+      `RuntimeConfig::effective_raster_cache_mb` and
+      re-synced whenever `low_resource_mode_set` flips. N-API
+      surface: `runtime_tile_cache_stats` (`{bytes,
+      entries, budget_bytes}`) and `runtime_tile_cache_clear`
+      (returns evicted count). 12 unit tests in the data
+      crate pin hit/miss/replace/clear/budget-shrink/oversized-
+      insert behaviour; 4 bridge tests verify that the budget
+      tracks `RuntimeConfig`, that `clear` drains in LRU
+      order, and that the snake_case JSON round-trips.
 - [x] **Task 25: SQLCipher encryption at rest.**
       `crates/kcreate_storage/src/crypto.rs` derives a
       256-bit key from a user passphrase via PBKDF2-HMAC-SHA256

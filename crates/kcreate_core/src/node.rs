@@ -966,34 +966,326 @@ impl Default for OpenTypeFeatures {
 }
 
 /// What triggers an [`Interaction`] in prototype playback.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+///
+/// Phase 11 extends the original `Click` / `Hover` / `Press` set
+/// with `MouseEnter` / `MouseLeave` / `AfterDelay { ms }`.
+/// `AfterDelay` fires automatically `ms` milliseconds after the
+/// player navigates to the artboard the trigger lives on — this
+/// powers splash-screen → home-screen autoplay and timed
+/// onboarding flows.
+///
+/// Wire format: the simple, unit-style variants serialise as bare
+/// strings (`"click"`, `"hover"`, `"press"`, `"mouse_enter"`,
+/// `"mouse_leave"`) so legacy projects authored before Phase 11
+/// continue to load unchanged. `AfterDelay` serialises as
+/// `{"kind":"after_delay","ms":1500}` because it carries data; the
+/// hand-rolled (de)serialiser below accepts either form.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum InteractionTrigger {
     /// Mouse / touch click.
     Click,
-    /// Pointer hover (no click).
+    /// Pointer hover (no click). Legacy alias for the more
+    /// specific `MouseEnter` trigger; kept for backwards
+    /// compatibility with projects authored before Phase 11.
     Hover,
     /// Mouse button held down (or long-press on touch).
     Press,
+    /// Pointer entered the node's hotspot.
+    MouseEnter,
+    /// Pointer left the node's hotspot.
+    MouseLeave,
+    /// Auto-fires `ms` milliseconds after the artboard becomes the
+    /// player's current screen.
+    AfterDelay { ms: u32 },
+}
+
+impl InteractionTrigger {
+    /// Snake-case discriminator used by the JSON wire format. The
+    /// renderer's TypeScript types (`InteractionTrigger` in
+    /// `apps/desktop/shared/scene.ts`) match these strings exactly.
+    #[must_use]
+    pub const fn discriminator(&self) -> &'static str {
+        match self {
+            Self::Click => "click",
+            Self::Hover => "hover",
+            Self::Press => "press",
+            Self::MouseEnter => "mouse_enter",
+            Self::MouseLeave => "mouse_leave",
+            Self::AfterDelay { .. } => "after_delay",
+        }
+    }
+}
+
+impl Serialize for InteractionTrigger {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeMap;
+        match *self {
+            Self::AfterDelay { ms } => {
+                let mut map = serializer.serialize_map(Some(2))?;
+                map.serialize_entry("kind", "after_delay")?;
+                map.serialize_entry("ms", &ms)?;
+                map.end()
+            }
+            other => serializer.serialize_str(other.discriminator()),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for InteractionTrigger {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct TriggerVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for TriggerVisitor {
+            type Value = InteractionTrigger;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(
+                    "an InteractionTrigger string (\"click\" / \"hover\" / \"press\" / \
+                     \"mouse_enter\" / \"mouse_leave\") or an after-delay object \
+                     ({\"kind\":\"after_delay\",\"ms\":1500})",
+                )
+            }
+
+            fn visit_str<E>(self, v: &str) -> std::result::Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                match v {
+                    "click" => Ok(InteractionTrigger::Click),
+                    "hover" => Ok(InteractionTrigger::Hover),
+                    "press" => Ok(InteractionTrigger::Press),
+                    "mouse_enter" => Ok(InteractionTrigger::MouseEnter),
+                    "mouse_leave" => Ok(InteractionTrigger::MouseLeave),
+                    "after_delay" => Err(E::custom(
+                        "after_delay trigger requires an `ms` field; pass an object",
+                    )),
+                    other => Err(E::unknown_variant(
+                        other,
+                        &[
+                            "click",
+                            "hover",
+                            "press",
+                            "mouse_enter",
+                            "mouse_leave",
+                            "after_delay",
+                        ],
+                    )),
+                }
+            }
+
+            fn visit_map<A>(self, mut map: A) -> std::result::Result<Self::Value, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                let mut kind: Option<String> = None;
+                let mut ms: Option<u32> = None;
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "kind" => {
+                            if kind.is_some() {
+                                return Err(serde::de::Error::duplicate_field("kind"));
+                            }
+                            kind = Some(map.next_value()?);
+                        }
+                        "ms" => {
+                            if ms.is_some() {
+                                return Err(serde::de::Error::duplicate_field("ms"));
+                            }
+                            ms = Some(map.next_value()?);
+                        }
+                        other => {
+                            return Err(serde::de::Error::unknown_field(other, &["kind", "ms"]));
+                        }
+                    }
+                }
+                let kind = kind.ok_or_else(|| serde::de::Error::missing_field("kind"))?;
+                match kind.as_str() {
+                    "click" => Ok(InteractionTrigger::Click),
+                    "hover" => Ok(InteractionTrigger::Hover),
+                    "press" => Ok(InteractionTrigger::Press),
+                    "mouse_enter" => Ok(InteractionTrigger::MouseEnter),
+                    "mouse_leave" => Ok(InteractionTrigger::MouseLeave),
+                    "after_delay" => {
+                        let ms =
+                            ms.ok_or_else(|| serde::de::Error::missing_field("ms"))?;
+                        Ok(InteractionTrigger::AfterDelay { ms })
+                    }
+                    other => Err(serde::de::Error::unknown_variant(
+                        other,
+                        &[
+                            "click",
+                            "hover",
+                            "press",
+                            "mouse_enter",
+                            "mouse_leave",
+                            "after_delay",
+                        ],
+                    )),
+                }
+            }
+        }
+
+        deserializer.deserialize_any(TriggerVisitor)
+    }
+}
+
+/// Animation curve applied while a [`Transition`] is in flight.
+///
+/// The standard four presets cover ~95% of design-tool prototypes.
+/// `Spring` uses a damped harmonic oscillator (see
+/// `apps/desktop/renderer/src/utils/EasingEngine.ts`) and
+/// `CubicBezier` matches the CSS `cubic-bezier()` form so authors
+/// can paste curves straight from Figma / Sketch.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum EasingCurve {
+    Linear,
+    EaseIn,
+    EaseOut,
+    #[default]
+    EaseInOut,
+    Spring { stiffness: f32, damping: f32 },
+    CubicBezier { x1: f32, y1: f32, x2: f32, y2: f32 },
+}
+
+/// `Transition::animation` variants.
+///
+/// `Instant` keeps the pre-Phase-11 behaviour (no animation, screen
+/// swap takes one frame). All other variants are driven by the
+/// renderer-side animation engine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AnimationType {
+    /// No animation; the new screen replaces the old in one frame.
+    #[default]
+    Instant,
+    /// Cross-fade old → new.
+    Dissolve,
+    /// The new screen slides in over the old.
+    SlideIn,
+    /// The old screen slides out, revealing the new.
+    SlideOut,
+    /// Old pushes out, new pushes in (carousel).
+    Push,
+    /// The new screen translates in over the old, which holds still.
+    MoveIn,
+}
+
+/// Direction parameter for slide / push / move-in animations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SlideDirection {
+    #[default]
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
+/// Transition configuration attached to an [`InteractionAction`].
+///
+/// Default is `{ animation: Instant, duration_ms: 300, easing:
+/// EaseInOut, direction: None }`, which means projects authored
+/// before Phase 11 (whose actions had no transition field at all)
+/// deserialize unchanged — the `#[serde(default)]` on every
+/// `transition` field gives us the legacy `Instant` behaviour.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct Transition {
+    #[serde(default)]
+    pub animation: AnimationType,
+    #[serde(default = "Transition::default_duration_ms")]
+    pub duration_ms: u32,
+    #[serde(default)]
+    pub easing: EasingCurve,
+    /// Required for `SlideIn` / `SlideOut` / `Push` / `MoveIn`.
+    /// Ignored by `Instant` / `Dissolve`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direction: Option<SlideDirection>,
+}
+
+impl Transition {
+    /// Default duration_ms for a newly-authored transition. Matches
+    /// the Figma / Material-Motion 300 ms standard.
+    const fn default_duration_ms() -> u32 {
+        300
+    }
+
+    /// Convenience constructor for the legacy "no animation, swap
+    /// instantly" behaviour — handy for tests and call sites that
+    /// want to opt out without spelling out every field.
+    #[must_use]
+    pub const fn instant() -> Self {
+        Self {
+            animation: AnimationType::Instant,
+            duration_ms: 0,
+            easing: EasingCurve::Linear,
+            direction: None,
+        }
+    }
+}
+
+impl Default for Transition {
+    fn default() -> Self {
+        Self {
+            animation: AnimationType::Instant,
+            duration_ms: Self::default_duration_ms(),
+            easing: EasingCurve::EaseInOut,
+            direction: None,
+        }
+    }
+}
+
+/// Serde helper: synthesises a default [`Transition`] for legacy
+/// JSON that omits the `transition` field entirely.
+fn default_transition() -> Transition {
+    Transition::default()
 }
 
 /// What an [`Interaction`] does when its trigger fires.
 ///
 /// All fields use `Uuid` so the action can be serialised intact even
 /// when the target node has not yet been resolved by the player.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `transition` is optional in the JSON wire format — projects from
+/// before Phase 11 deserialise with `Transition::default()` (i.e.
+/// the legacy `Instant` behaviour).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum InteractionAction {
     /// Navigate the prototype player to a specific artboard.
-    NavigateTo { target_artboard_id: Uuid },
+    NavigateTo {
+        target_artboard_id: Uuid,
+        #[serde(default = "default_transition")]
+        transition: Transition,
+    },
     /// Scroll the canvas so `target_node_id` is in view.
     ScrollTo { target_node_id: Uuid },
     /// Open an artboard as an overlay above the current artboard.
-    OpenOverlay { overlay_artboard_id: Uuid },
+    OpenOverlay {
+        overlay_artboard_id: Uuid,
+        #[serde(default = "default_transition")]
+        transition: Transition,
+    },
     /// Close the topmost overlay (no target).
     CloseOverlay,
     /// Step one navigation entry back in the player's history.
     Back,
+    /// Switch the source component instance to one of its variants
+    /// (Figma "Smart Animate" equivalent). The player matches
+    /// layers between the two variants by name and interpolates
+    /// bounds / opacity / fill / corner radius across
+    /// `transition.duration_ms`.
+    SwitchVariant {
+        variant_id: Uuid,
+        #[serde(default = "default_transition")]
+        transition: Transition,
+    },
 }
 
 /// A prototype interaction bound to a [`Node`].
@@ -1001,7 +1293,7 @@ pub enum InteractionAction {
 /// Persisted as a JSON array under
 /// [`INTERACTIONS_METADATA_KEY`] in `Node::metadata`. The renderer
 /// ignores interactions; only the prototype player reads them.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Interaction {
     pub id: Uuid,
     pub trigger: InteractionTrigger,
@@ -1819,6 +2111,7 @@ mod tests {
             InteractionTrigger::Click,
             InteractionAction::NavigateTo {
                 target_artboard_id: Uuid::new_v4(),
+                transition: Transition::default(),
             },
         );
         let json = serde_json::to_string(&interaction).expect("serialize");
@@ -1835,12 +2128,75 @@ mod tests {
                 InteractionTrigger::Click,
                 InteractionAction::NavigateTo {
                     target_artboard_id: Uuid::new_v4(),
+                    transition: Transition::default(),
                 },
             ),
             Interaction::new(InteractionTrigger::Hover, InteractionAction::Back),
         ];
         node.set_interactions(&interactions);
         assert_eq!(node.interactions(), interactions);
+    }
+
+    #[test]
+    fn legacy_navigate_to_without_transition_deserialises_as_instant() {
+        // Projects authored before Phase 11 stored NavigateTo without a
+        // `transition` field. `#[serde(default = "default_transition")]`
+        // must round-trip those into the legacy Instant default.
+        let target = Uuid::new_v4();
+        let legacy = format!(
+            r#"{{"kind":"navigate_to","target_artboard_id":"{target}"}}"#
+        );
+        let parsed: InteractionAction = serde_json::from_str(&legacy).expect("parse");
+        match parsed {
+            InteractionAction::NavigateTo { transition, target_artboard_id } => {
+                assert_eq!(target_artboard_id, target);
+                assert_eq!(transition.animation, AnimationType::Instant);
+                assert_eq!(transition.duration_ms, Transition::default_duration_ms());
+                assert_eq!(transition.easing, EasingCurve::EaseInOut);
+                assert!(transition.direction.is_none());
+            }
+            other => panic!("unexpected parsed action: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn after_delay_trigger_serialises_as_object_with_ms() {
+        let trigger = InteractionTrigger::AfterDelay { ms: 1500 };
+        let json = serde_json::to_string(&trigger).expect("serialize");
+        assert_eq!(json, r#"{"kind":"after_delay","ms":1500}"#);
+        let back: InteractionTrigger = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, trigger);
+    }
+
+    #[test]
+    fn legacy_click_trigger_deserialises_from_bare_string() {
+        let parsed: InteractionTrigger =
+            serde_json::from_str(r#""click""#).expect("parse legacy click");
+        assert_eq!(parsed, InteractionTrigger::Click);
+        let parsed: InteractionTrigger =
+            serde_json::from_str(r#""mouse_enter""#).expect("parse mouse_enter");
+        assert_eq!(parsed, InteractionTrigger::MouseEnter);
+    }
+
+    #[test]
+    fn switch_variant_action_round_trips() {
+        let variant_id = Uuid::new_v4();
+        let action = InteractionAction::SwitchVariant {
+            variant_id,
+            transition: Transition {
+                animation: AnimationType::Dissolve,
+                duration_ms: 450,
+                easing: EasingCurve::Spring {
+                    stiffness: 180.0,
+                    damping: 22.0,
+                },
+                direction: None,
+            },
+        };
+        let json = serde_json::to_string(&action).expect("serialize");
+        let back: InteractionAction =
+            serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, action);
     }
 
     #[test]

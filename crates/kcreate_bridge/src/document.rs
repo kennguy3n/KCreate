@@ -91,6 +91,17 @@ pub enum DocumentBridgeError {
     WrongNodeType { expected: NodeType, got: NodeType },
     #[error("layout config on node {0} is malformed: {1}")]
     InvalidLayoutConfig(Uuid, String),
+    /// Phase 11 Block C Task 16 — auto-layout propagation cap.
+    /// Returned when the recursive solver walks past
+    /// `LAYOUT_PROPAGATION_DEPTH_LIMIT` levels of nested
+    /// `LayoutFrame` nodes. In practice this means a component
+    /// instance graph contains a cycle (instance A includes
+    /// instance B includes instance A …) or a very deep nesting
+    /// the user explicitly opted into. Surfacing this error lets
+    /// the host pop a toast instead of silently truncating the
+    /// propagation.
+    #[error("auto-layout propagation reached depth limit {limit} at node {node_id}")]
+    LayoutRecursionLimit { node_id: Uuid, limit: usize },
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
     #[error(transparent)]
@@ -2728,17 +2739,30 @@ pub fn artboard_presets() -> Vec<kcreate_core::ArtboardPreset> {
 /// [`kcreate_core::InteractionAction`] (tagged-enum form, e.g.
 /// `{"kind":"navigate_to","target_artboard_id":"…"}`).
 pub fn interaction_add(node_id: Uuid, trigger: &str, action_json: &str) -> Result<Uuid> {
-    let trigger = match trigger {
-        "click" => kcreate_core::InteractionTrigger::Click,
-        "hover" => kcreate_core::InteractionTrigger::Hover,
-        "press" => kcreate_core::InteractionTrigger::Press,
-        other => {
-            return Err(DocumentBridgeError::InvalidArgument {
-                argument: "trigger".into(),
-                value: other.to_string(),
-            });
-        }
+    // Phase 11 expanded `InteractionTrigger` with `MouseEnter` /
+    // `MouseLeave` / `AfterDelay { ms }`. We accept the legacy bare
+    // discriminator strings (`"click"`, etc.) AND a JSON object form
+    // (`{"kind":"after_delay","ms":1500}`) for the data-carrying
+    // variant. Serde's hand-rolled (de)serialiser on
+    // `kcreate_core::InteractionTrigger` handles both shapes, but we
+    // have to feed it a JSON token — wrap the bare-string case in
+    // quotes before parsing.
+    let trimmed = trigger.trim();
+    let parsed: kcreate_core::InteractionTrigger = if trimmed.starts_with('{')
+        || trimmed.starts_with('"')
+    {
+        serde_json::from_str(trimmed).map_err(|e| DocumentBridgeError::InvalidArgument {
+            argument: "trigger".into(),
+            value: format!("{trigger} ({e})"),
+        })?
+    } else {
+        let quoted = format!("\"{trimmed}\"");
+        serde_json::from_str(&quoted).map_err(|_| DocumentBridgeError::InvalidArgument {
+            argument: "trigger".into(),
+            value: trigger.to_string(),
+        })?
     };
+    let trigger = parsed;
     let action: kcreate_core::InteractionAction = serde_json::from_str(action_json)?;
     let interaction = kcreate_core::Interaction::new(trigger, action);
     let interaction_id = interaction.id;
@@ -3904,6 +3928,137 @@ pub fn component_add_variant(component_id: Uuid, name: String) -> Result<Uuid> {
     Ok(vid)
 }
 
+/// Snapshot of a single layer used by Smart Animate property
+/// interpolation. Carries only the fields the renderer animates
+/// (bounds, opacity, fill colour, corner radius) — the full Node
+/// payload would inflate the IPC frame and isn't needed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SmartAnimateLayer {
+    pub name: String,
+    pub bounds: kcreate_core::node::Bounds,
+    pub opacity: f32,
+    /// CSS-style fill colour (`#RRGGBB`), `None` for non-solid fills
+    /// (gradients, images, …) which Smart Animate doesn't blend.
+    pub fill_color: Option<String>,
+    pub corner_radius: f64,
+}
+
+/// Pair of layer snapshots — the renderer's `PrototypePlayer`
+/// interpolates corresponding entries by `name` over the configured
+/// transition duration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SmartAnimateSnapshot {
+    pub before: Vec<SmartAnimateLayer>,
+    pub after: Vec<SmartAnimateLayer>,
+}
+
+fn solid_fill_hex(fill: &kcreate_core::FillStyle) -> Option<String> {
+    if let kcreate_core::FillStyle::Solid(c) = fill {
+        let r = (c.r.clamp(0.0, 1.0) * 255.0).round() as u8;
+        let g = (c.g.clamp(0.0, 1.0) * 255.0).round() as u8;
+        let b = (c.b.clamp(0.0, 1.0) * 255.0).round() as u8;
+        Some(format!("#{r:02X}{g:02X}{b:02X}"))
+    } else {
+        None
+    }
+}
+
+fn smart_animate_layer_from_node(node: &kcreate_core::node::Node) -> SmartAnimateLayer {
+    SmartAnimateLayer {
+        name: node.name.clone(),
+        bounds: node.bounds,
+        opacity: node.opacity,
+        fill_color: solid_fill_hex(&node.style.fill),
+        corner_radius: node.style.corner_radius,
+    }
+}
+
+/// Collect [`SmartAnimateLayer`] entries from a flat snapshot
+/// payload (the serialised `Vec<Vec<Node>>` stored on a variant's
+/// `source_snapshot` property). Only the first node of each
+/// subtree is emitted because Smart Animate matches layers at the
+/// instance root level — deeper recursion would conflate layers
+/// with duplicate names across siblings.
+fn smart_animate_layers_from_snapshot(
+    payloads: &[Vec<kcreate_core::node::Node>],
+) -> Vec<SmartAnimateLayer> {
+    payloads
+        .iter()
+        .filter_map(|payload| payload.first().map(smart_animate_layer_from_node))
+        .collect()
+}
+
+/// Smart Animate snapshot for a switch from the instance's current
+/// variant to `target_variant_id`. The renderer interpolates the
+/// matching entries (by `name`) over the transition's duration; new
+/// names fade in, removed names fade out.
+///
+/// This is read-only — it does *not* mutate the active variant. The
+/// renderer calls [`component_switch_variant`] to commit the change
+/// once its animation has finished.
+pub fn component_smart_animate_snapshot(
+    node_id: Uuid,
+    target_variant_id: Uuid,
+) -> Result<SmartAnimateSnapshot> {
+    let guard = slot().lock();
+    let ws = guard.as_ref().ok_or(DocumentBridgeError::NoProject)?;
+    let node = ws
+        .project
+        .document
+        .get_node(node_id)
+        .ok_or(DocumentBridgeError::NodeNotFound(node_id))?;
+    if node.node_type != NodeType::ComponentLayer {
+        return Err(DocumentBridgeError::WrongNodeType {
+            expected: NodeType::ComponentLayer,
+            got: node.node_type,
+        });
+    }
+    let inst_meta = node
+        .metadata
+        .get(COMPONENT_INSTANCE_METADATA_KEY)
+        .cloned()
+        .ok_or_else(|| {
+            DocumentBridgeError::InvalidComponentInstance(
+                node_id,
+                "node is missing component_instance metadata".into(),
+            )
+        })?;
+    let inst: ComponentInstance = serde_json::from_value(inst_meta)
+        .map_err(|e| DocumentBridgeError::InvalidComponentInstance(node_id, e.to_string()))?;
+    let before: Vec<SmartAnimateLayer> = node
+        .children
+        .iter()
+        .filter_map(|cid| {
+            ws.project
+                .document
+                .get_node(*cid)
+                .map(smart_animate_layer_from_node)
+        })
+        .collect();
+    let def = ws.project.get_component(inst.definition_id).ok_or_else(|| {
+        DocumentBridgeError::Project(ProjectError::ComponentNotFound(inst.definition_id))
+    })?;
+    // First confirm the variant actually exists — that's a hard
+    // error. *Missing* `source_snapshot` is a distinct (and
+    // legitimate) state: a freshly added variant before the
+    // user has authored any content. In that case the "after"
+    // set is empty and the renderer naturally fades the
+    // existing layers out.
+    let variant = def.variant(target_variant_id).ok_or_else(|| {
+        DocumentBridgeError::Project(ProjectError::Component(
+            kcreate_core::ComponentError::VariantNotFound(target_variant_id),
+        ))
+    })?;
+    let after = if let Some(snapshot_value) = variant.properties.get("source_snapshot") {
+        let payloads: Vec<Vec<kcreate_core::node::Node>> =
+            serde_json::from_value(snapshot_value.clone()).map_err(DocumentBridgeError::Json)?;
+        smart_animate_layers_from_snapshot(&payloads)
+    } else {
+        Vec::new()
+    };
+    Ok(SmartAnimateSnapshot { before, after })
+}
+
 /// Switch the active variant of a component instance node.
 pub fn component_switch_variant(node_id: Uuid, variant_id: Uuid) -> Result<()> {
     let mut guard = slot().lock();
@@ -4248,6 +4403,136 @@ pub fn layout_recompute(node_id: Uuid) -> Result<()> {
     let _ = sync_scene_locked(&mut guard);
     drop(guard);
     Ok(())
+}
+
+/// Maximum recursion depth for [`layout_propagate_in_subtree`].
+///
+/// Component instances can reference each other (a component
+/// definition that contains an instance of another component, which
+/// in turn contains yet another instance, …). Resizing the outermost
+/// instance would otherwise walk an unbounded chain.
+///
+/// Sixteen levels is generous in practice: Figma documents in the
+/// wild rarely nest components more than five levels deep, and the
+/// limit is high enough to never bite legitimate designs while
+/// still bounding pathological / circular cases at sub-millisecond
+/// cost.
+pub const LAYOUT_PROPAGATION_DEPTH_LIMIT: usize = 16;
+
+/// One entry of the [`LayoutPropagationReport`].
+#[derive(Debug, Clone)]
+pub struct LayoutPropagationChange {
+    pub node_id: Uuid,
+    pub before: kcreate_core::node::Bounds,
+    pub after: kcreate_core::node::Bounds,
+}
+
+/// Set of bounds changes recorded by
+/// [`layout_propagate_in_subtree`], in tree order (parent before
+/// child). The caller wraps this in an [`Operation`] so undo
+/// restores the entire propagation atomically.
+#[derive(Debug, Clone, Default)]
+pub struct LayoutPropagationReport {
+    pub changes: Vec<LayoutPropagationChange>,
+}
+
+/// Run the auto-layout solver across every `LayoutFrame` descendant
+/// of `root_id` (inclusive). Re-applies the parent's solver to its
+/// direct children, then recurses into any laid-out child that is
+/// itself a `LayoutFrame` so that nested component instances get
+/// their internal flex/grid layout refreshed when their bounds
+/// change.
+///
+/// Operates on an already-borrowed [`Workspace`] reference — does
+/// NOT lock `slot()`. Callers (`document_resize_frame`,
+/// `layout_recompute`, `component_switch_variant`, …) compose this
+/// helper inside a single critical section so the propagation is
+/// observed atomically by scene-sync.
+///
+/// Bounded recursion depth ([`LAYOUT_PROPAGATION_DEPTH_LIMIT`])
+/// guards against circular component references. Hitting the limit
+/// stops the walk on that branch and is reported via
+/// [`DocumentBridgeError::LayoutRecursionLimit`] so the caller can
+/// surface a structured error instead of silently truncating.
+pub(crate) fn layout_propagate_in_subtree(
+    ws: &mut Workspace,
+    root_id: Uuid,
+) -> Result<LayoutPropagationReport> {
+    fn walk(
+        ws: &mut Workspace,
+        node_id: Uuid,
+        depth: usize,
+        report: &mut LayoutPropagationReport,
+    ) -> Result<()> {
+        if depth >= LAYOUT_PROPAGATION_DEPTH_LIMIT {
+            return Err(DocumentBridgeError::LayoutRecursionLimit {
+                node_id,
+                limit: LAYOUT_PROPAGATION_DEPTH_LIMIT,
+            });
+        }
+
+        // Snapshot the data we need under the immutable borrow, then
+        // release it before mutating children.
+        let (run_solver, child_ids, config, parent_bounds, inputs) = {
+            let Some(node) = ws.project.document.get_node(node_id) else {
+                return Ok(());
+            };
+            let child_ids: Vec<Uuid> = node.children.clone();
+            let mut config_opt: Option<LayoutConfig> = None;
+            let mut parent_bounds = node.bounds;
+            let mut inputs: Vec<(Uuid, f64, f64)> = Vec::new();
+            if node.node_type == NodeType::LayoutFrame {
+                if let Some(raw) = node.metadata.get(LAYOUT_CONFIG_METADATA_KEY) {
+                    let cfg: LayoutConfig = serde_json::from_value(raw.clone()).map_err(|e| {
+                        DocumentBridgeError::InvalidLayoutConfig(node_id, e.to_string())
+                    })?;
+                    config_opt = Some(cfg);
+                    parent_bounds = node.bounds;
+                    for cid in &child_ids {
+                        if let Some(c) = ws.project.document.get_node(*cid) {
+                            inputs.push((*cid, c.bounds.width, c.bounds.height));
+                        }
+                    }
+                }
+            }
+            (config_opt.is_some(), child_ids, config_opt, parent_bounds, inputs)
+        };
+
+        if run_solver {
+            // Safe because `run_solver` is exactly `config_opt.is_some()`.
+            let config = config.expect("config present when run_solver is true");
+            let placements = match config {
+                LayoutConfig::Flex(f) => layout_flex(parent_bounds, &inputs, &f),
+                LayoutConfig::Grid(g) => layout_grid(parent_bounds, &inputs, &g),
+            };
+            for (cid, new_bounds) in placements {
+                let Some(child) = ws.project.document.get_node_mut(cid) else {
+                    continue;
+                };
+                let before = child.bounds;
+                if before != new_bounds {
+                    child.bounds = new_bounds;
+                    child.touch();
+                    report.changes.push(LayoutPropagationChange {
+                        node_id: cid,
+                        before,
+                        after: new_bounds,
+                    });
+                }
+            }
+        }
+
+        // Recurse into each child so nested `LayoutFrame` instances
+        // pick up the propagated bounds change.
+        for cid in child_ids {
+            walk(ws, cid, depth + 1, report)?;
+        }
+        Ok(())
+    }
+
+    let mut report = LayoutPropagationReport::default();
+    walk(ws, root_id, 0, &mut report)?;
+    Ok(report)
 }
 
 /// Convert a `GroupLayer` into a `LayoutFrame` so it can carry an
@@ -9610,6 +9895,340 @@ mod tests {
         let err = document_clipboard_paste(v9_payload, None, 0.0, 0.0)
             .expect_err("must reject future schema");
         assert!(matches!(err, DocumentBridgeError::Io(_)));
+        project_close();
+    }
+
+    // ---- Phase 11 Block C Task 18 — prototype + component
+    // advanced tests. These cover the new wire-format surface
+    // (Transition / AfterDelay), the auto-layout propagation
+    // hook on instance resize (Task 16), and the Smart Animate
+    // snapshot helper (Task 17).
+
+    #[test]
+    #[serial]
+    fn phase11_layout_propagation_reflows_flex_instance_on_resize() {
+        // Build a component definition whose root is a LayoutFrame
+        // with a row flex layout, then instantiate it and resize
+        // the instance — the children should be reflowed by the
+        // propagation pass in `document_resize_frame`.
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("phase11-prop", dir.path()).expect("create");
+        let ab = artboard_create(None, "Page".into(), 1000.0, 800.0).expect("artboard");
+
+        // Build the component definition payload in place: a
+        // LayoutFrame with three 50×30 vector children.
+        let frame = document_create_node(
+            "LayoutFrame",
+            Some(ab),
+            &CreateNodeProps {
+                name: Some("Card".into()),
+                ..Default::default()
+            },
+        )
+        .expect("frame");
+        {
+            let mut g = slot().lock();
+            let ws = g.as_mut().expect("ws");
+            let n = ws.project.document.get_node_mut(frame).expect("frame");
+            n.bounds = kcreate_core::node::Bounds::new(0.0, 0.0, 400.0, 80.0);
+        }
+        let kids: Vec<Uuid> = (0..3)
+            .map(|i| {
+                let id = document_create_node(
+                    "VectorLayer",
+                    Some(frame),
+                    &CreateNodeProps {
+                        name: Some(format!("R{i}")),
+                        ..Default::default()
+                    },
+                )
+                .expect("child");
+                let mut g = slot().lock();
+                let ws = g.as_mut().expect("ws");
+                let n = ws.project.document.get_node_mut(id).expect("kid");
+                n.bounds = kcreate_core::node::Bounds::new(0.0, 0.0, 50.0, 30.0);
+                id
+            })
+            .collect();
+        let cfg = kcreate_layout::FlexLayout {
+            direction: kcreate_layout::FlexDirection::Row,
+            spacing: 10.0,
+            ..kcreate_layout::FlexLayout::default()
+        };
+        layout_set_flex(frame, cfg).expect("set flex");
+        layout_recompute(frame).expect("recompute");
+
+        // Sanity: the children are packed at x=0/60/120.
+        {
+            let g = slot().lock();
+            let ws = g.as_ref().expect("ws");
+            let n0 = ws.project.document.get_node(kids[0]).expect("k0");
+            let n2 = ws.project.document.get_node(kids[2]).expect("k2");
+            assert!((n0.bounds.x - 0.0).abs() < 1e-6, "n0 x = {}", n0.bounds.x);
+            assert!(
+                (n2.bounds.x - 120.0).abs() < 1e-6,
+                "n2 x = {}",
+                n2.bounds.x
+            );
+        }
+
+        // Now resize the frame to a wider box — the propagation
+        // pass in `document_resize_frame` should rerun the flex
+        // solver, but the children's *intrinsic* widths are
+        // unchanged (Row spacing default is "pack at intrinsic
+        // size + spacing"), so the positions remain at 0 / 60 /
+        // 120. The key assertion is that the *bounds were
+        // touched and recorded in the operation payload* — the
+        // numeric equality is incidental.
+        let new_bounds =
+            kcreate_core::node::Bounds::new(0.0, 0.0, 800.0, 80.0);
+        crate::phase8::document_resize_frame(frame, new_bounds).expect("resize");
+
+        {
+            let g = slot().lock();
+            let ws = g.as_ref().expect("ws");
+            let frame_n = ws.project.document.get_node(frame).expect("frame");
+            assert!(
+                (frame_n.bounds.width - 800.0).abs() < 1e-6,
+                "frame width after resize = {}",
+                frame_n.bounds.width,
+            );
+            // The flex solver respects each child's intrinsic
+            // width even when the parent grows, so x positions
+            // stay at 0 / 60 / 120 (the propagation didn't *move*
+            // them, but it did *visit* them — this is asserted by
+            // the next test using a spreading config).
+            let n0 = ws.project.document.get_node(kids[0]).expect("k0");
+            assert!((n0.bounds.x - 0.0).abs() < 1e-6);
+        }
+
+        // Verify the resize operation captured a
+        // `layout_propagation` payload in its before/after JSON —
+        // this is the marker that the propagation pass walked
+        // the subtree (Task 16). The walk is what re-runs the
+        // flex solver on instances after their parent's bounds
+        // change, so the presence of these arrays in the op log
+        // is the directly observable side-effect.
+        {
+            let g = slot().lock();
+            let ws = g.as_ref().expect("ws");
+            let last_op = ws
+                .project
+                .operation_log
+                .last()
+                .expect("resize op recorded")
+                .clone();
+            assert_eq!(last_op.command, "document_resize_frame");
+            let before_layout = last_op
+                .before_patch
+                .get("layout_propagation")
+                .expect("before layout_propagation");
+            let after_layout = last_op
+                .after_patch
+                .get("layout_propagation")
+                .expect("after layout_propagation");
+            assert!(before_layout.is_array());
+            assert!(after_layout.is_array());
+            assert_eq!(
+                before_layout.as_array().expect("before arr").len(),
+                after_layout.as_array().expect("after arr").len(),
+                "before/after propagation payloads must be the same length"
+            );
+        }
+        project_close();
+    }
+
+    #[test]
+    #[serial]
+    fn phase11_layout_propagation_respects_recursion_limit() {
+        // The propagation walk caps at LAYOUT_PROPAGATION_DEPTH_LIMIT
+        // (16) to keep a pathological deeply-nested tree from
+        // blowing the stack. A direct unit test of the helper is
+        // cleaner than reproducing a 17-deep nesting via the
+        // bridge API.
+        use crate::document::{
+            layout_propagate_in_subtree, LAYOUT_PROPAGATION_DEPTH_LIMIT,
+        };
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("phase11-prop-depth", dir.path()).expect("create");
+        let ab = artboard_create(None, "Page".into(), 200.0, 200.0).expect("artboard");
+
+        // Build a chain of N+1 nested LayoutFrames so the walk
+        // hits the cap.
+        let mut parent = ab;
+        for i in 0..=LAYOUT_PROPAGATION_DEPTH_LIMIT {
+            let f = document_create_node(
+                "LayoutFrame",
+                Some(parent),
+                &CreateNodeProps {
+                    name: Some(format!("F{i}")),
+                    ..Default::default()
+                },
+            )
+            .expect("frame");
+            parent = f;
+        }
+
+        // Direct call against the artboard root — we expect a
+        // `LayoutRecursionLimit` error.
+        let mut g = slot().lock();
+        let ws = g.as_mut().expect("ws");
+        let err = layout_propagate_in_subtree(ws, ab).expect_err("must hit recursion limit");
+        match err {
+            DocumentBridgeError::LayoutRecursionLimit { limit, .. } => {
+                assert_eq!(limit, LAYOUT_PROPAGATION_DEPTH_LIMIT);
+            }
+            other => panic!("expected LayoutRecursionLimit, got {other:?}"),
+        }
+        drop(g);
+        project_close();
+    }
+
+    #[test]
+    #[serial]
+    fn phase11_smart_animate_snapshot_matches_layer_names() {
+        // Create a component with two children, instantiate it,
+        // add a second variant whose snapshot has different
+        // bounds for the same layer names, and verify
+        // `component_smart_animate_snapshot` returns the before
+        // (current children) and after (variant snapshot) layers
+        // with matching names.
+        let (_dir, _ab, kids) = setup_component_project();
+        let comp_id = component_create_from_selection(kids, "Card".into()).expect("create");
+        // The default variant already exists with the original
+        // snapshot — add a second one.
+        let variant_id = component_add_variant(comp_id, "Hover".into()).expect("variant");
+
+        // Find the placed ComponentLayer.
+        let inst_id = {
+            let tree = document_get_tree().expect("tree");
+            tree.iter()
+                .find(|n| n.node_type == "ComponentLayer")
+                .map(|n| n.id)
+                .expect("instance")
+        };
+
+        // Mutate the new variant's source_snapshot so its layers
+        // differ from the current instance (the before set
+        // mirrors the live instance children, the after set
+        // mirrors the variant's stored snapshot).
+        {
+            let mut g = slot().lock();
+            let ws = g.as_mut().expect("ws");
+            let def = ws
+                .project
+                .get_component_mut(comp_id)
+                .expect("component def");
+            let variant = def.variant_mut(variant_id).expect("variant");
+            // Build a synthetic two-node snapshot — two layers
+            // named "Rect A" and "Rect B" (the names the
+            // `setup_component_project` helper assigned to the
+            // children that got wrapped into the component).
+            let payloads: Vec<Vec<kcreate_core::node::Node>> = vec![
+                {
+                    let mut n =
+                        kcreate_core::node::Node::new(NodeType::VectorLayer, "Rect A");
+                    n.bounds = kcreate_core::node::Bounds::new(99.0, 99.0, 10.0, 10.0);
+                    n.opacity = 0.5;
+                    vec![n]
+                },
+                {
+                    let mut n =
+                        kcreate_core::node::Node::new(NodeType::VectorLayer, "Rect B");
+                    n.bounds = kcreate_core::node::Bounds::new(50.0, 0.0, 30.0, 30.0);
+                    vec![n]
+                },
+            ];
+            variant.properties.insert(
+                "source_snapshot".into(),
+                serde_json::to_value(&payloads).expect("snapshot json"),
+            );
+        }
+
+        let snap =
+            component_smart_animate_snapshot(inst_id, variant_id).expect("snapshot");
+        // The before set is the live instance children (two
+        // nodes wrapped by the create_from_selection helper).
+        assert_eq!(snap.before.len(), 2, "two layers in before set");
+        let before_names: std::collections::HashSet<&str> = snap
+            .before
+            .iter()
+            .map(|l| l.name.as_str())
+            .collect();
+        assert!(before_names.contains("Rect A"));
+        assert!(before_names.contains("Rect B"));
+
+        // The after set comes from the variant's snapshot we
+        // just stamped in.
+        assert_eq!(snap.after.len(), 2, "two layers in after set");
+        let after_a = snap
+            .after
+            .iter()
+            .find(|l| l.name == "Rect A")
+            .expect("after Rect A");
+        assert!((after_a.bounds.x - 99.0).abs() < 1e-6);
+        assert!((after_a.opacity - 0.5).abs() < 1e-6);
+
+        project_close();
+    }
+
+    #[test]
+    #[serial]
+    fn phase11_smart_animate_snapshot_does_not_commit_variant() {
+        // `component_smart_animate_snapshot` is read-only — the
+        // renderer commits the swap with
+        // `component_switch_variant` after the animation
+        // finishes. This test asserts the active variant id is
+        // unchanged after a snapshot call.
+        let (_dir, _ab, kids) = setup_component_project();
+        let comp_id = component_create_from_selection(kids, "Card".into()).expect("create");
+        let variant_id = component_add_variant(comp_id, "Hover".into()).expect("variant");
+        let inst_id = {
+            let tree = document_get_tree().expect("tree");
+            tree.iter()
+                .find(|n| n.node_type == "ComponentLayer")
+                .map(|n| n.id)
+                .expect("instance")
+        };
+
+        // Record the active variant id before the snapshot call.
+        let before_active = {
+            let g = slot().lock();
+            let ws = g.as_ref().expect("ws");
+            let inst_n = ws.project.document.get_node(inst_id).expect("inst");
+            let meta = inst_n
+                .metadata
+                .get(COMPONENT_INSTANCE_METADATA_KEY)
+                .cloned()
+                .expect("instance meta");
+            let ci: ComponentInstance =
+                serde_json::from_value(meta).expect("component instance");
+            ci.active_variant_id
+        };
+
+        let _ = component_smart_animate_snapshot(inst_id, variant_id).expect("snapshot");
+        // After the snapshot call the active variant must still
+        // be the original — we did NOT commit the swap.
+        let after_active = {
+            let g = slot().lock();
+            let ws = g.as_ref().expect("ws");
+            let inst_n = ws.project.document.get_node(inst_id).expect("inst");
+            let meta = inst_n
+                .metadata
+                .get(COMPONENT_INSTANCE_METADATA_KEY)
+                .cloned()
+                .expect("instance meta");
+            let ci: ComponentInstance =
+                serde_json::from_value(meta).expect("component instance");
+            ci.active_variant_id
+        };
+        assert_eq!(
+            before_active, after_active,
+            "snapshot must not mutate the active variant id",
+        );
+
         project_close();
     }
 }

@@ -1309,22 +1309,117 @@ export interface ComponentBridge {
   addVariant(componentId: string, name: string): Promise<string>;
   /** Switch which variant a placed `ComponentLayer` displays. */
   switchVariant(nodeId: string, variantId: string): Promise<void>;
+  /**
+   * Phase 11 Block C Task 17 — Smart Animate snapshot. Read-only;
+   * returns the before/after property snapshots the
+   * `PrototypePlayer` interpolates over a variant switch. The
+   * caller commits the swap with `switchVariant` after the
+   * animation finishes so the document graph is only mutated
+   * once per user gesture.
+   */
+  smartAnimateSnapshot(
+    nodeId: string,
+    targetVariantId: string,
+  ): Promise<SmartAnimateSnapshot>;
   /** Detach an instance — turns the `ComponentLayer` into a plain group. */
   detach(nodeId: string): Promise<void>;
+}
+
+/**
+ * Phase 11 Block C Task 17 — one entry of [`SmartAnimateSnapshot`].
+ * Mirrors `kcreate_bridge::document::SmartAnimateLayer`.
+ */
+export interface SmartAnimateLayer {
+  name: string;
+  bounds: Bounds;
+  opacity: number;
+  /** `#RRGGBB` for solid fills, `null` for gradients / images. */
+  fill_color: string | null;
+  corner_radius: number;
+}
+
+/**
+ * Phase 11 Block C Task 17 — paired property snapshots for Smart
+ * Animate. Mirrors `kcreate_bridge::document::SmartAnimateSnapshot`.
+ */
+export interface SmartAnimateSnapshot {
+  before: SmartAnimateLayer[];
+  after: SmartAnimateLayer[];
 }
 
 // ============================================================================
 // Prototype interactions (mirrors `kcreate_core::node::Interaction`)
 // ============================================================================
 
-export type InteractionTrigger = "click" | "hover" | "press";
+/**
+ * Mirrors `kcreate_core::InteractionTrigger`.
+ *
+ * Phase 11 added `mouse_enter` / `mouse_leave` and the data-carrying
+ * `{ kind: "after_delay", ms }` variant. Pre-Phase-11 projects emit
+ * the simple variants as bare snake_case strings, so the union keeps
+ * those forms to preserve backward compatibility. The renderer-side
+ * `InteractionPanel.tsx` and `PrototypePlayer.tsx` accept either
+ * shape; the bridge's `interaction.add` accepts the bare string for
+ * simple variants and a `JSON.stringify`'d object for `after_delay`.
+ */
+export type InteractionTrigger =
+  | "click"
+  | "hover"
+  | "press"
+  | "mouse_enter"
+  | "mouse_leave"
+  | { kind: "after_delay"; ms: number };
+
+export type AnimationType =
+  | "instant"
+  | "dissolve"
+  | "slide_in"
+  | "slide_out"
+  | "push"
+  | "move_in";
+
+export type SlideDirection = "left" | "right" | "up" | "down";
+
+export type EasingCurve =
+  | { kind: "linear" }
+  | { kind: "ease_in" }
+  | { kind: "ease_out" }
+  | { kind: "ease_in_out" }
+  | { kind: "spring"; stiffness: number; damping: number }
+  | { kind: "cubic_bezier"; x1: number; y1: number; x2: number; y2: number };
+
+/**
+ * Mirrors `kcreate_core::Transition`. The bridge persists this on
+ * every navigation-style `InteractionAction`. All fields are
+ * optional in the wire format (Rust uses `#[serde(default)]`),
+ * which lets pre-Phase-11 projects round-trip unchanged.
+ */
+export interface Transition {
+  animation: AnimationType;
+  duration_ms: number;
+  easing: EasingCurve;
+  direction?: SlideDirection | null;
+}
 
 export type InteractionAction =
-  | { kind: "navigate_to"; target_artboard_id: string }
+  | {
+      kind: "navigate_to";
+      target_artboard_id: string;
+      transition?: Transition;
+    }
   | { kind: "scroll_to"; target_node_id: string }
-  | { kind: "open_overlay"; overlay_artboard_id: string }
+  | {
+      kind: "open_overlay";
+      overlay_artboard_id: string;
+      transition?: Transition;
+    }
   | { kind: "close_overlay" }
-  | { kind: "back" };
+  | { kind: "back" }
+  | {
+      kind: "switch_variant";
+      variant_id: string;
+      transition?: Transition;
+    };
 
 export interface Interaction {
   id: string;

@@ -1,10 +1,13 @@
-// InteractionPanel — Phase 1, Block A, Task 3.
+// InteractionPanel — Phase 1 Block A Task 3, extended in Phase 11
+// Block C Tasks 13/15/17.
 //
 // Prototype-mode right-panel face. Lists interactions attached to the
-// currently selected node and lets the user add new click/hover/press
-// triggers, each pointing at a target artboard (or `Back` /
-// `CloseOverlay` for navigation). Backed by the
-// `window.kcreate.interaction` bridge (Block A Task 2).
+// currently selected node and lets the user add new triggers
+// (click / hover / press / mouse_enter / mouse_leave / after_delay)
+// and actions (navigate_to / scroll_to / open_overlay / close_overlay
+// / back / switch_variant). Each animation-capable action carries a
+// `Transition` config (animation, duration, easing curve, optional
+// slide direction). Backed by the `window.kcreate.interaction` bridge.
 //
 // Real implementation — there is no mock data, no stub. Every render
 // reflects the live bridge state for the selected node.
@@ -12,10 +15,14 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 
 import type {
+  AnimationType,
+  EasingCurve,
   Interaction,
   InteractionAction,
   InteractionTrigger,
   NodeInfo,
+  SlideDirection,
+  Transition,
 } from "../../../shared/scene";
 import { colors, radius, spacing } from "../styles/tokens";
 
@@ -25,11 +32,19 @@ export interface InteractionPanelProps {
   /**
    * Full document tree, used by the `scroll_to` target picker. When
    * empty (or omitted), the panel still lets the user add
-   * `navigate_to` / `open_overlay` / `close_overlay` / `back`
-   * interactions but disables `scroll_to` because there is no node
-   * catalog to pick from.
+   * `navigate_to` / `open_overlay` / `close_overlay` / `back` /
+   * `switch_variant` interactions but disables `scroll_to` because
+   * there is no node catalog to pick from.
    */
   tree?: NodeInfo[];
+  /**
+   * Component variants visible to the `switch_variant` action.
+   * When the selected node is a component instance, this list
+   * holds the sibling variants of the instance's source
+   * component. Empty when the node is not an instance or the
+   * component has only one variant.
+   */
+  variants?: Array<{ id: string; name: string }>;
   onStatus?: (msg: string | null) => void;
   /** Called after every successful add / remove. The host typically
    * refreshes the document tree so lightning-bolt indicators in the
@@ -37,10 +52,22 @@ export interface InteractionPanelProps {
   onChanged?: () => void;
 }
 
-const TRIGGERS: ReadonlyArray<{ id: InteractionTrigger; label: string }> = [
+/** Discriminator used to drive the `<select>` for trigger choice. */
+type TriggerKind =
+  | "click"
+  | "hover"
+  | "press"
+  | "mouse_enter"
+  | "mouse_leave"
+  | "after_delay";
+
+const TRIGGER_KINDS: ReadonlyArray<{ id: TriggerKind; label: string }> = [
   { id: "click", label: "Click" },
   { id: "hover", label: "Hover" },
   { id: "press", label: "Press" },
+  { id: "mouse_enter", label: "Mouse enter" },
+  { id: "mouse_leave", label: "Mouse leave" },
+  { id: "after_delay", label: "After delay" },
 ];
 
 type ActionKind = InteractionAction["kind"];
@@ -51,19 +78,69 @@ const ACTION_KINDS: ReadonlyArray<{ id: ActionKind; label: string }> = [
   { id: "open_overlay", label: "Open overlay" },
   { id: "close_overlay", label: "Close overlay" },
   { id: "back", label: "Back" },
+  { id: "switch_variant", label: "Switch component variant" },
 ];
+
+const ANIMATION_KINDS: ReadonlyArray<{ id: AnimationType; label: string }> = [
+  { id: "instant", label: "Instant" },
+  { id: "dissolve", label: "Dissolve" },
+  { id: "slide_in", label: "Slide in" },
+  { id: "slide_out", label: "Slide out" },
+  { id: "push", label: "Push" },
+  { id: "move_in", label: "Move in" },
+];
+
+type EasingKind = EasingCurve["kind"];
+
+const EASING_KINDS: ReadonlyArray<{ id: EasingKind; label: string }> = [
+  { id: "linear", label: "Linear" },
+  { id: "ease_in", label: "Ease in" },
+  { id: "ease_out", label: "Ease out" },
+  { id: "ease_in_out", label: "Ease in / out" },
+  { id: "spring", label: "Spring" },
+];
+
+const SLIDE_DIRECTIONS: ReadonlyArray<{ id: SlideDirection; label: string }> = [
+  { id: "left", label: "Left" },
+  { id: "right", label: "Right" },
+  { id: "up", label: "Up" },
+  { id: "down", label: "Down" },
+];
+
+/** Actions that carry a `Transition` field in the wire format. */
+const ANIMATED_KINDS: ReadonlySet<ActionKind> = new Set([
+  "navigate_to",
+  "open_overlay",
+  "switch_variant",
+]);
+
+/** Animations that consume a `direction` parameter. */
+const DIRECTIONAL_ANIMATIONS: ReadonlySet<AnimationType> = new Set([
+  "slide_in",
+  "slide_out",
+  "push",
+  "move_in",
+]);
 
 export function InteractionPanel({
   selected,
   artboards,
   tree,
+  variants,
   onStatus,
   onChanged,
 }: InteractionPanelProps): JSX.Element {
   const [items, setItems] = useState<Interaction[]>([]);
-  const [trigger, setTrigger] = useState<InteractionTrigger>("click");
+  const [triggerKind, setTriggerKind] = useState<TriggerKind>("click");
+  const [delayMs, setDelayMs] = useState<number>(1500);
   const [actionKind, setActionKind] = useState<ActionKind>("navigate_to");
   const [targetId, setTargetId] = useState<string>("");
+  const [animation, setAnimation] = useState<AnimationType>("instant");
+  const [durationMs, setDurationMs] = useState<number>(300);
+  const [easingKind, setEasingKind] = useState<EasingKind>("ease_in_out");
+  const [springStiffness, setSpringStiffness] = useState<number>(180);
+  const [springDamping, setSpringDamping] = useState<number>(20);
+  const [direction, setDirection] = useState<SlideDirection>("left");
   const [busy, setBusy] = useState<boolean>(false);
 
   const refresh = useCallback(async (): Promise<void> => {
@@ -86,17 +163,7 @@ export function InteractionPanel({
   // Pickable target nodes for `scroll_to`. Exclude the node the
   // interaction is attached to (scrolling to yourself is a no-op) and
   // anything without geometry. We don't filter to a specific node
-  // type because any visible layer is a legitimate scroll target —
-  // for example, scrolling to a `Section` group or to a heading text
-  // layer are both reasonable user intents.
-  //
-  // Memoised so the value is referentially stable across renders and
-  // can sit in the dep-array of the target-reset effect below. This
-  // replaces the previous "derived value not in deps" pattern called
-  // out by Devin Review (ANALYSIS-0006) — if anyone later threads an
-  // additional filter into this computation, they only have to
-  // declare it in this single `useMemo`'s deps and the effect picks
-  // it up automatically.
+  // type because any visible layer is a legitimate scroll target.
   const scrollTargets = useMemo<NodeInfo[]>(
     () =>
       (tree ?? []).filter(
@@ -109,31 +176,29 @@ export function InteractionPanel({
     [tree, selected?.id],
   );
 
-  // Reset the target id whenever the action kind changes so we don't
-  // accidentally carry a stale artboard id into a scroll_to action
-  // (or vice-versa). Then pre-populate with the first valid option
-  // for the new kind so the "Add" button can be clicked immediately.
+  const variantTargets = useMemo<Array<{ id: string; name: string }>>(
+    () => variants ?? [],
+    [variants],
+  );
+
   useEffect(() => {
     if (actionKind === "navigate_to" || actionKind === "open_overlay") {
       const first = artboards[0];
-      // Snap to first artboard if the current id isn't a known
-      // artboard (e.g. the user just switched away from scroll_to).
       const known = artboards.some((a) => a.id === targetId);
       if (!known) setTargetId(first ? first.id : "");
     } else if (actionKind === "scroll_to") {
       const first = scrollTargets[0];
       const known = scrollTargets.some((n) => n.id === targetId);
       if (!known) setTargetId(first ? first.id : "");
+    } else if (actionKind === "switch_variant") {
+      const first = variantTargets[0];
+      const known = variantTargets.some((v) => v.id === targetId);
+      if (!known) setTargetId(first ? first.id : "");
     } else if (targetId !== "") {
-      // close_overlay / back take no target.
       setTargetId("");
     }
-    // `targetId` is intentionally omitted from deps — this effect
-    // *writes* the target id, it doesn't react to external changes
-    // to it. Including `targetId` would loop the effect on every
-    // setTargetId.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [actionKind, artboards, scrollTargets]);
+  }, [actionKind, artboards, scrollTargets, variantTargets]);
 
   if (!selected) {
     return (
@@ -146,14 +211,46 @@ export function InteractionPanel({
   const needsArtboardTarget =
     actionKind === "navigate_to" || actionKind === "open_overlay";
   const needsNodeTarget = actionKind === "scroll_to";
-  const needsTarget = needsArtboardTarget || needsNodeTarget;
-  const canAdd = !busy && (!needsTarget || targetId !== "");
+  const needsVariantTarget = actionKind === "switch_variant";
+  const needsTarget = needsArtboardTarget || needsNodeTarget || needsVariantTarget;
+  const supportsTransition = ANIMATED_KINDS.has(actionKind);
+  const needsDirection =
+    supportsTransition && DIRECTIONAL_ANIMATIONS.has(animation);
+  const canAdd =
+    !busy &&
+    (!needsTarget || targetId !== "") &&
+    (triggerKind !== "after_delay" || delayMs >= 0);
+
+  const buildTrigger = (): InteractionTrigger => {
+    if (triggerKind === "after_delay") {
+      return { kind: "after_delay", ms: Math.max(0, Math.round(delayMs)) };
+    }
+    return triggerKind;
+  };
+
+  const buildTransition = (): Transition => {
+    const easing: EasingCurve =
+      easingKind === "spring"
+        ? {
+            kind: "spring",
+            stiffness: Math.max(1, springStiffness),
+            damping: Math.max(0, springDamping),
+          }
+        : { kind: easingKind as Exclude<EasingKind, "spring" | "cubic_bezier"> };
+    return {
+      animation,
+      duration_ms: Math.max(0, Math.round(durationMs)),
+      easing,
+      direction: needsDirection ? direction : null,
+    };
+  };
 
   const handleAdd = async (): Promise<void> => {
     if (!canAdd) return;
     setBusy(true);
     try {
-      const action = buildAction(actionKind, targetId);
+      const action = buildAction(actionKind, targetId, buildTransition());
+      const trigger = buildTrigger();
       await window.kcreate.interaction.add(selected.id, trigger, action);
       onStatus?.("Interaction added.");
       await refresh();
@@ -198,9 +295,9 @@ export function InteractionPanel({
           {items.map((it) => (
             <li key={it.id} style={itemStyle}>
               <div style={itemHeaderStyle}>
-                <span style={pillStyle}>{it.trigger}</span>
+                <span style={pillStyle}>{describeTrigger(it.trigger)}</span>
                 <span style={actionTextStyle}>
-                  {describeAction(it.action, artboards)}
+                  {describeAction(it.action, artboards, variantTargets)}
                 </span>
               </div>
               <button
@@ -226,19 +323,30 @@ export function InteractionPanel({
         <label style={fieldStyle}>
           <span style={labelTextStyle}>Trigger</span>
           <select
-            value={trigger}
-            onChange={(e) =>
-              setTrigger(e.target.value as InteractionTrigger)
-            }
+            value={triggerKind}
+            onChange={(e) => setTriggerKind(e.target.value as TriggerKind)}
             style={selectStyle}
           >
-            {TRIGGERS.map((t) => (
+            {TRIGGER_KINDS.map((t) => (
               <option key={t.id} value={t.id}>
                 {t.label}
               </option>
             ))}
           </select>
         </label>
+        {triggerKind === "after_delay" ? (
+          <label style={fieldStyle}>
+            <span style={labelTextStyle}>Delay (ms)</span>
+            <input
+              type="number"
+              min={0}
+              step={50}
+              value={delayMs}
+              onChange={(e) => setDelayMs(Number(e.target.value))}
+              style={selectStyle}
+            />
+          </label>
+        ) : null}
         <label style={fieldStyle}>
           <span style={labelTextStyle}>Action</span>
           <select
@@ -293,6 +401,125 @@ export function InteractionPanel({
             </select>
           </label>
         ) : null}
+        {needsVariantTarget ? (
+          <label style={fieldStyle}>
+            <span style={labelTextStyle}>Target variant</span>
+            <select
+              value={targetId}
+              onChange={(e) => setTargetId(e.target.value)}
+              style={selectStyle}
+            >
+              {variantTargets.length === 0 ? (
+                <option value="">— select a component instance —</option>
+              ) : (
+                variantTargets.map((v) => (
+                  <option key={v.id} value={v.id}>
+                    {v.name}
+                  </option>
+                ))
+              )}
+            </select>
+          </label>
+        ) : null}
+        {supportsTransition ? (
+          <>
+            <label style={fieldStyle}>
+              <span style={labelTextStyle}>Animation</span>
+              <select
+                value={animation}
+                onChange={(e) =>
+                  setAnimation(e.target.value as AnimationType)
+                }
+                style={selectStyle}
+              >
+                {ANIMATION_KINDS.map((a) => (
+                  <option key={a.id} value={a.id}>
+                    {a.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+            {animation !== "instant" ? (
+              <>
+                <label style={fieldStyle}>
+                  <span style={labelTextStyle}>Duration (ms)</span>
+                  <input
+                    type="number"
+                    min={0}
+                    step={25}
+                    value={durationMs}
+                    onChange={(e) => setDurationMs(Number(e.target.value))}
+                    style={selectStyle}
+                  />
+                </label>
+                <label style={fieldStyle}>
+                  <span style={labelTextStyle}>Easing</span>
+                  <select
+                    value={easingKind}
+                    onChange={(e) =>
+                      setEasingKind(e.target.value as EasingKind)
+                    }
+                    style={selectStyle}
+                  >
+                    {EASING_KINDS.map((c) => (
+                      <option key={c.id} value={c.id}>
+                        {c.label}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                {easingKind === "spring" ? (
+                  <>
+                    <label style={fieldStyle}>
+                      <span style={labelTextStyle}>Spring stiffness</span>
+                      <input
+                        type="number"
+                        min={1}
+                        step={10}
+                        value={springStiffness}
+                        onChange={(e) =>
+                          setSpringStiffness(Number(e.target.value))
+                        }
+                        style={selectStyle}
+                      />
+                    </label>
+                    <label style={fieldStyle}>
+                      <span style={labelTextStyle}>Spring damping</span>
+                      <input
+                        type="number"
+                        min={0}
+                        step={1}
+                        value={springDamping}
+                        onChange={(e) =>
+                          setSpringDamping(Number(e.target.value))
+                        }
+                        style={selectStyle}
+                      />
+                    </label>
+                  </>
+                ) : null}
+                {needsDirection ? (
+                  <label style={fieldStyle}>
+                    <span style={labelTextStyle}>Direction</span>
+                    <select
+                      value={direction}
+                      onChange={(e) =>
+                        setDirection(e.target.value as SlideDirection)
+                      }
+                      style={selectStyle}
+                    >
+                      {SLIDE_DIRECTIONS.map((d) => (
+                        <option key={d.id} value={d.id}>
+                          {d.label}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                ) : null}
+              </>
+            ) : null}
+          </>
+        ) : null}
         <button
           type="button"
           onClick={() => {
@@ -308,40 +535,74 @@ export function InteractionPanel({
   );
 }
 
-function buildAction(kind: ActionKind, targetId: string): InteractionAction {
+function buildAction(
+  kind: ActionKind,
+  targetId: string,
+  transition: Transition,
+): InteractionAction {
   switch (kind) {
     case "navigate_to":
-      return { kind: "navigate_to", target_artboard_id: targetId };
+      return { kind: "navigate_to", target_artboard_id: targetId, transition };
     case "scroll_to":
       return { kind: "scroll_to", target_node_id: targetId };
     case "open_overlay":
-      return { kind: "open_overlay", overlay_artboard_id: targetId };
+      return {
+        kind: "open_overlay",
+        overlay_artboard_id: targetId,
+        transition,
+      };
     case "close_overlay":
       return { kind: "close_overlay" };
     case "back":
       return { kind: "back" };
+    case "switch_variant":
+      return { kind: "switch_variant", variant_id: targetId, transition };
+    default: {
+      // Exhaustiveness sentinel — TS yells if a new action kind is
+      // added to the wire format that we forgot to handle here.
+      const _exhaustive: never = kind;
+      throw new Error(`unsupported action kind: ${String(_exhaustive)}`);
+    }
   }
+}
+
+function describeTrigger(t: InteractionTrigger): string {
+  if (typeof t === "string") return t;
+  if (t.kind === "after_delay") return `after ${t.ms} ms`;
+  // Forward-compat: render unknown object triggers by their kind.
+  return (t as { kind: string }).kind;
 }
 
 function describeAction(
   action: InteractionAction,
   artboards: Array<{ id: string; name: string }>,
+  variants: Array<{ id: string; name: string }>,
 ): string {
-  const lookup = (id: string): string => {
+  const lookupArt = (id: string): string => {
     const ab = artboards.find((a) => a.id === id);
     return ab ? ab.name : `${id.slice(0, 8)}…`;
   };
+  const lookupVar = (id: string): string => {
+    const v = variants.find((x) => x.id === id);
+    return v ? v.name : `${id.slice(0, 8)}…`;
+  };
   switch (action.kind) {
     case "navigate_to":
-      return `Navigate to ${lookup(action.target_artboard_id)}`;
+      return `Navigate to ${lookupArt(action.target_artboard_id)}`;
     case "scroll_to":
       return `Scroll to ${action.target_node_id.slice(0, 8)}…`;
     case "open_overlay":
-      return `Open overlay ${lookup(action.overlay_artboard_id)}`;
+      return `Open overlay ${lookupArt(action.overlay_artboard_id)}`;
     case "close_overlay":
       return "Close overlay";
     case "back":
       return "Back";
+    case "switch_variant":
+      return `Switch variant → ${lookupVar(action.variant_id)}`;
+    default: {
+      const _exhaustive: never = action;
+      return String(_exhaustive);
+    }
   }
 }
 
@@ -490,7 +751,8 @@ function removeBtn(disabled: boolean): React.CSSProperties {
 
 function primaryBtn(disabled: boolean): React.CSSProperties {
   return {
-    padding: "8px 14px",
+    width: "100%",
+    padding: "8px 12px",
     fontSize: 12,
     fontWeight: 600,
     background: disabled ? colors.bgSoft : colors.accent,
@@ -498,6 +760,6 @@ function primaryBtn(disabled: boolean): React.CSSProperties {
     border: `1px solid ${disabled ? colors.border : colors.accent}`,
     borderRadius: radius.pill,
     cursor: disabled ? "not-allowed" : "pointer",
-    marginTop: spacing.xs,
+    marginTop: spacing.sm,
   };
 }

@@ -484,6 +484,7 @@ export interface Bridge {
   ): string;
   componentAddVariant(componentId: string, name: string): string;
   componentSwitchVariant(nodeId: string, variantId: string): void;
+  componentSmartAnimateSnapshot(nodeId: string, targetVariantId: string): string;
   componentDetach(nodeId: string): void;
 
   // Auto-layout (Phase 1, Block C)

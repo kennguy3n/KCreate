@@ -2285,6 +2285,29 @@ pub fn component_switch_variant(node_id: String, variant_id: String) -> NapiResu
     document::component_switch_variant(nid, vid).map_err(map_doc_err)
 }
 
+/// Phase 11 Block C Task 17 — Smart Animate snapshot. Returns a
+/// JSON string `{"before":[{name,bounds,opacity,fill_color,
+/// corner_radius}, …], "after":[…]}` for the renderer's
+/// `PrototypePlayer` to drive property interpolation across a
+/// variant switch. The bridge intentionally does NOT mutate the
+/// active variant here — the renderer commits the swap with
+/// `component_switch_variant` after its animation completes so the
+/// document graph is only touched once per gesture.
+#[napi]
+pub fn component_smart_animate_snapshot(
+    node_id: String,
+    target_variant_id: String,
+) -> NapiResult<String> {
+    let nid = parse_uuid(&node_id)?;
+    let vid = parse_uuid(&target_variant_id)?;
+    let snap = document::component_smart_animate_snapshot(nid, vid).map_err(map_doc_err)?;
+    serde_json::to_string(&snap).map_err(|e| {
+        napi::Error::from_reason(format!(
+            "component_smart_animate_snapshot: serialize: {e}"
+        ))
+    })
+}
+
 /// Detach a component instance — converts the ComponentLayer into a
 /// regular GroupLayer.
 #[napi]

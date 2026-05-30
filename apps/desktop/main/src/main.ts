@@ -1426,6 +1426,11 @@ function registerIpcHandlers(): void {
     },
   );
   ipcMain.handle(
+    "kcreate/component/smartAnimateSnapshot",
+    (_e, nodeId: string, targetVariantId: string): string =>
+      requireBridge().componentSmartAnimateSnapshot(nodeId, targetVariantId),
+  );
+  ipcMain.handle(
     "kcreate/component/detach",
     (_e, nodeId: string): void => {
       requireBridge().componentDetach(nodeId);

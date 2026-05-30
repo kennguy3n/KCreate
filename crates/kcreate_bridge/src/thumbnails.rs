@@ -565,7 +565,16 @@ struct ThumbnailTarget {
 ///    thumbnail request will see the new hash → miss → re-render.
 fn ensure_thumbnail_for<F>(key: Uuid, max_dim_px: u32, prepare: F) -> Result<ThumbnailBytes>
 where
-    F: FnOnce(&mut Workspace) -> Result<(String, ThumbnailTarget, Scene)>,
+    // Phase 11 Block A follow-up round 5 — Devin Review
+    // ANALYSIS-0002 (r5). `prepare` derives the content hash,
+    // target bounds, and scene from a read-only view of the
+    // workspace; signature is `FnOnce(&Workspace)` (not `&mut`)
+    // so we can hold the workspace `RwLock` in `read()` mode
+    // during step 1. Concurrent readers (tree view, status bar,
+    // selection inspector, renderer version polling) stay
+    // parallel while thumbnails are computed, preserving the
+    // Phase 11 Block D RwLock benefit on the thumbnail path.
+    F: FnOnce(&Workspace) -> Result<(String, ThumbnailTarget, Scene)>,
 {
     // Step 1 — single lock window: derive hash + target + scene, and
     // short-circuit on a cache hit. Note the cache is on disk under
@@ -573,8 +582,8 @@ where
     // enough to safely open it; the open is cheap (sled-style hash
     // map) so this doesn't materially block the UI thread.
     let (content_hash, target, scene) = {
-        let mut guard = workspace_slot().write();
-        let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
+        let guard = workspace_slot().read();
+        let ws = guard.as_ref().ok_or(DocumentBridgeError::NoProject)?;
         let cache = ThumbnailCache::open(ws.store.lock().thumbnails_dir()).map_err(thumb_err)?;
         let (hash, target, scene) = prepare(ws)?;
         if let Some(cached) = cache.lookup(key, &hash).map_err(thumb_err)? {

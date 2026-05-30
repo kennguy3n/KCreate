@@ -361,6 +361,27 @@ export function PrototypePlayer({
           easing: { kind: "ease_in_out" },
           direction: null,
         };
+        // Phase 11 Block C follow-up round 5 — Devin Review
+        // BUG-0001 (r5). Mirror the instant-transition guard used
+        // by navigate_to / open_overlay (above): when the
+        // transition is Instant or its duration is non-positive,
+        // commit the variant swap directly via `switchVariant`
+        // instead of running the Smart Animate overlay. The
+        // InteractionPanel hides duration controls for "instant",
+        // so its `durationMs` state may still hold a stale 300ms
+        // value — running the overlay would visually animate for
+        // 300ms even though the user explicitly chose Instant.
+        if (
+          transition.animation === "instant" ||
+          transition.duration_ms <= 0
+        ) {
+          void window.kcreate.component
+            .switchVariant(instanceId, variantId)
+            .catch((e: unknown) => {
+              setErrorMsg(errorMessage(e));
+            });
+          break;
+        }
         void window.kcreate.component
           .smartAnimateSnapshot(instanceId, variantId)
           .then((snapshot) => {

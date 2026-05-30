@@ -724,37 +724,76 @@ fn probe_health(port: u16) -> bool {
     .is_ok()
 }
 
-/// Phase 11 Block E Task 26 — verify the listener on the sidecar's
-/// loopback port is actually the llama-server we spawned by talking
-/// to it with our bearer token. The contract:
+/// Phase 11 Block E Task 26 + round 5 — verify the listener on the
+/// sidecar's loopback port is actually the llama-server we spawned by
+/// proving it differentiates between our bearer token and an
+/// obviously-wrong token. The round-1 implementation accepted any
+/// listener that returned `200 OK` or `404 Not Found` with our token,
+/// which Devin Review ANALYSIS-0006 (r5) correctly identified as
+/// fragile: a foreign web server that returned `404` for unknown
+/// routes regardless of `Authorization` would have passed the check
+/// (re-opening the TOCTOU window the verifier exists to close).
 ///
-/// * `200 OK` on `GET /v1/models` with `Authorization: Bearer …` =
-///   the listener accepted our token = it really is our sidecar.
-/// * `404 Not Found` is permitted because some llama.cpp builds
-///   accept `--api-key` (their server returns 401 for the wrong
-///   token on protected routes) but do not expose `/v1/models`;
-///   reaching `404` proves the listener honoured the route logic
-///   AND the token, otherwise we'd have got `401`.
-/// * `401 / 403` or no response = the listener is NOT our process
-///   (TOCTOU race or a stale llama-server from a previous run).
+/// Round 5 contract: send *two* probes against `GET /v1/models`,
+/// one with the real bearer and one with a deliberately-wrong bearer
+/// the verifier owns, and require the listener to **distinguish**
+/// them:
 ///
-/// All other transport errors are treated as "not us" to be safe.
+/// 1. Right-token probe — must NOT come back as `401`/`403`. Any
+///    other status (typically `200`, or `404` on older llama.cpp
+///    builds that take `--api-key` but don't expose `/v1/models`)
+///    counts as "accepted our token".
+/// 2. Wrong-token probe — MUST come back as `401`/`403`. Anything
+///    else (including the same `200`/`404` returned for the right
+///    token) means the listener is ignoring `Authorization` and is
+///    therefore not the `--api-key`-honouring llama-server we
+///    spawned.
+///
+/// Both probes must succeed; if either's transport fails we treat
+/// it as "not us" to fail closed. This pins down the TOCTOU window
+/// to a hypothetical foreign server that not only happens to be
+/// listening on the freshly-allocated port between
+/// [`pick_loopback_port`] and the llama-server bind, but also
+/// implements a complete `--api-key`-aware response policy by
+/// coincidence — vanishingly unlikely on loopback.
 #[cfg(feature = "llm_sidecar")]
 fn verify_bearer_token(port: u16, token: &str) -> bool {
+    /// A deliberately-bogus bearer the verifier owns. Reused across
+    /// all wrong-token probes so a debug log of `Authorization`
+    /// values from the listener is greppable for this fixed string.
+    const WRONG_TOKEN: &str = "kcreate-toctou-probe-deliberately-wrong";
+
     let url = format!("http://127.0.0.1:{port}/v1/models");
-    let bearer = format!("Bearer {token}");
-    let resp = ureq::get(&url)
-        .timeout(Duration::from_secs(2))
-        .set("authorization", &bearer)
-        .call();
-    match resp {
-        Ok(r) => {
-            let code = r.status();
-            code == 200 || code == 404
+    let probe = |bearer: String| -> Option<u16> {
+        let resp = ureq::get(&url)
+            .timeout(Duration::from_secs(2))
+            .set("authorization", &bearer)
+            .call();
+        match resp {
+            Ok(r) => Some(r.status()),
+            Err(ureq::Error::Status(code, _)) => Some(code),
+            Err(_) => None,
         }
-        Err(ureq::Error::Status(code, _)) => code == 200 || code == 404,
-        Err(_) => false,
-    }
+    };
+
+    let Some(right) = probe(format!("Bearer {token}")) else {
+        return false;
+    };
+    let Some(wrong) = probe(format!("Bearer {WRONG_TOKEN}")) else {
+        return false;
+    };
+
+    // Right token: must NOT be auth-rejected. Anything other than
+    // 401/403 (200, 404, or even a 500 from a real server hitting
+    // an unrelated bug) at least demonstrates the listener didn't
+    // reject *our* token.
+    let right_accepted = !matches!(right, 401 | 403);
+    // Wrong token: MUST be auth-rejected. A foreign server that
+    // ignores `Authorization` will return the same code for both
+    // probes, so this is the load-bearing assertion.
+    let wrong_rejected = matches!(wrong, 401 | 403);
+
+    right_accepted && wrong_rejected
 }
 
 /// When the `llm_sidecar` Cargo feature is off the HTTP client is
@@ -1103,6 +1142,47 @@ mod tests {
         assert!(
             seen.iter().any(|h| h == "Bearer the-correct-token"),
             "verify_bearer_token must send `Authorization: Bearer <token>`; saw {seen:?}",
+        );
+        stop.store(true, std::sync::atomic::Ordering::Release);
+        let _ = handle;
+    }
+
+    /// Phase 11 Block E follow-up round 5 — Devin Review ANALYSIS-0006
+    /// (r5). A foreign HTTP server that returns `404 Not Found` for
+    /// every request regardless of `Authorization` MUST be rejected
+    /// by the verifier. The round-1 implementation accepted 404 as
+    /// "older llama.cpp without `/v1/models`" without proving the
+    /// listener honoured the `--api-key` flag, leaving a TOCTOU
+    /// window open. The round-5 differential-probe contract closes
+    /// it: the wrong-token probe must come back as `401`/`403`, and
+    /// a foreign server returning `404` for both probes therefore
+    /// fails. This test pins that behaviour so a future refactor
+    /// can't quietly re-loosen the verifier.
+    #[cfg(feature = "llm_sidecar")]
+    #[test]
+    fn verify_rejects_foreign_listener_returning_404_for_any_token() {
+        let port = pick_loopback_port().expect("port");
+        let server = tiny_http::Server::http(format!("127.0.0.1:{port}")).expect("server");
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_for_thread = std::sync::Arc::clone(&stop);
+        let handle = std::thread::spawn(move || {
+            for req in server.incoming_requests() {
+                if stop_for_thread.load(std::sync::atomic::Ordering::Acquire) {
+                    break;
+                }
+                // Mimic a foreign web server that doesn't care about
+                // `Authorization`: 404 on every route, every header.
+                let resp = tiny_http::Response::from_string("not found")
+                    .with_status_code(tiny_http::StatusCode(404));
+                let _ = req.respond(resp);
+            }
+        });
+
+        let ok = verify_bearer_token(port, "the-correct-token");
+        assert!(
+            !ok,
+            "verifier must reject a listener that returns 404 for both right and wrong tokens — \
+             that's the TOCTOU foreign-server signature the round-5 differential probe defends against",
         );
         stop.store(true, std::sync::atomic::Ordering::Release);
         let _ = handle;

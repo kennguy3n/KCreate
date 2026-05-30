@@ -28,6 +28,10 @@
 //! `llm_sidecar` just like the chat client. The editing-path
 //! `local_first.rs` deny-list test stays green.
 
+// Only the `llm_sidecar`-feature build (which pulls in `ureq`)
+// actually uses `Duration` here for the HTTP-client read timeout —
+// without the feature flag the import is unused and cargo warns.
+#[cfg(feature = "llm_sidecar")]
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};

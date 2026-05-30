@@ -178,8 +178,43 @@ impl DiffusionSidecar {
         // binary isn't found. That keeps `binary: PathBuf::from("sd-server")`
         // (PATH-resolved) working without forcing callers to compute
         // the absolute path. Mirrors `llm_sidecar.rs`.
-        let port = pick_loopback_port()?;
-        let child = spawn_child(&self.config, port)?;
+        //
+        // Devin Review (post-Phase-12 round) flagged the original
+        // `let port = pick_loopback_port()?` / `let child = spawn_child(...)?`
+        // pair for using bare `?`, which propagates the error but
+        // leaves `self.status` in `Stopped` instead of transitioning
+        // to `Error`. That diverged from `LlmSidecar::start`
+        // (`crates/kcreate_ai/src/llm_sidecar.rs:322-330` and
+        // `:365-372`) and from the old `ImageGenSidecar` this
+        // sidecar replaces — and any direct caller of
+        // `DiffusionSidecar::status()` after a failed `start()`
+        // would see `Stopped` and lose the failure detail. The
+        // bridge currently discards the sidecar on failure so the
+        // visible UX did not regress, but the lifecycle contract
+        // documented at the top of this file says
+        // `Stopped → Starting → Ready | Error`, and "Stopped" is
+        // not a valid terminal state for a `start()` that returned
+        // `Err`. Use the same explicit `match` shape `LlmSidecar`
+        // uses so the parity is grep-able the next time someone
+        // refactors either driver.
+        let port = match pick_loopback_port() {
+            Ok(p) => p,
+            Err(e) => {
+                *self.status.lock() = SidecarStatus::Error {
+                    message: e.to_string(),
+                };
+                return Err(e);
+            }
+        };
+        let child = match spawn_child(&self.config, port) {
+            Ok(c) => c,
+            Err(e) => {
+                *self.status.lock() = SidecarStatus::Error {
+                    message: e.to_string(),
+                };
+                return Err(e);
+            }
+        };
         *self.status.lock() = SidecarStatus::Starting;
         let stop_signal = Arc::new(AtomicBool::new(false));
         self.stop_signal = Some(stop_signal.clone());
@@ -453,6 +488,58 @@ mod tests {
             matches!(err, SidecarError::ModelMissing(_)),
             "expected ModelMissing error, got {err:?}",
         );
+    }
+
+    /// A failed `start()` must leave the sidecar in `Error { .. }`,
+    /// not `Stopped`. The lifecycle contract documented at the top
+    /// of the module is `Stopped → Starting → Ready | Error`, and
+    /// any caller polling `status()` after `Err(...)` returns must
+    /// see the failure detail.
+    ///
+    /// Devin Review (post-Phase-12) flagged this for the
+    /// `pick_loopback_port` and `spawn_child` paths, but the
+    /// `validate_model` path already had the right behavior — we
+    /// assert all three paths here so a future refactor of any
+    /// single arm can't silently regress the others.
+    #[test]
+    fn failed_start_transitions_to_error_state() {
+        // validate_model path: the model file does not exist.
+        let mut sidecar = DiffusionSidecar::new(DiffusionSidecarConfig::new(
+            PathBuf::from("/usr/local/bin/sd-server"),
+            PathBuf::from("/no/such/model.gguf"),
+        ));
+        let _ = sidecar.start().unwrap_err();
+        match sidecar.status() {
+            SidecarStatus::Error { message } => {
+                assert!(
+                    message.contains("model") || message.to_lowercase().contains("missing"),
+                    "validate_model error message must describe the missing model, got: {message}",
+                );
+            }
+            other => panic!("expected Error status after validate_model failure, got {other:?}"),
+        }
+
+        // spawn_child path: model exists, but the binary doesn't.
+        // We create a temp file so `validate_model` passes, then
+        // hand `start()` a nonsense binary path so `Command::spawn`
+        // errors at fork-exec time. The new match-on-spawn-err arm
+        // must transition the status to `Error`, NOT leave it in
+        // `Stopped`.
+        let dir = tempfile::tempdir().unwrap();
+        let model_path = dir.path().join("flux.gguf");
+        std::fs::write(&model_path, b"not a real gguf").unwrap();
+        let mut sidecar = DiffusionSidecar::new(DiffusionSidecarConfig::new(
+            // Absolute path that demonstrably does not exist on any
+            // CI runner — bypasses PATH resolution so the spawn
+            // failure is deterministic.
+            PathBuf::from("/no/such/dir/sd-server-binary-that-does-not-exist"),
+            model_path,
+        ));
+        let _ = sidecar.start().unwrap_err();
+        match sidecar.status() {
+            SidecarStatus::Error { .. } => {}
+            other => panic!("expected Error status after spawn_child failure, got {other:?}"),
+        }
     }
 
     /// `DiffusionSidecarConfig::new` defaults must be sensible —

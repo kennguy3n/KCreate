@@ -1125,35 +1125,28 @@ fn collect_page_svgs() -> Result<Vec<kcreate_export::pdf_multi::PdfPageInput>> {
         let mut pages = Vec::new();
         for (id, n) in ws.project.document.iter() {
             if n.node_type == NodeType::Page || n.node_type == NodeType::Artboard {
-                // Render the page subtree to SVG via the existing
-                // SVG exporter. We pass `false` for `include_hidden`
-                // so invisible layers are skipped, matching the
-                // single-page export pipeline.
-                let opts = kcreate_export::svg::SvgExportOptions {
-                    width: n.bounds.width,
-                    height: n.bounds.height,
-                    ..Default::default()
-                };
-                // Collect all descendant vector ids so the per-page
-                // SVG carries the page's full content. Non-vector
-                // descendants are tolerated by the empty-list path
-                // (vector-only filtering happens inside).
-                let descendants = ws.project.document.descendants_of(*id);
-                let vector_ids: Vec<Uuid> = descendants
-                    .into_iter()
-                    .filter(|d| {
-                        ws.project
-                            .document
-                            .get_node(*d)
-                            .is_some_and(|nn| nn.node_type == NodeType::VectorLayer)
-                    })
-                    .collect();
-                let svg = kcreate_export::svg::export_svg_from_document(
+                // Round-11 fix: walk the full page subtree including
+                // `RasterLayer` and `TextLayer` descendants — the
+                // prior vector-only filter silently produced blank
+                // PDF pages for any document that wasn't purely
+                // vector. `compose_page_svg` emits `<image>` /
+                // `<text>` alongside `<path>`, resolving raster
+                // blobs through the bridge's `BlobStore` (kept out
+                // of `kcreate_export`'s dep graph via a callback).
+                //
+                // `ws.store.blobs()` returns the active `BlobStore`
+                // for the open project; `load(hash)` returns the
+                // blob bytes in whatever encoding they were stored
+                // (PNG/JPEG/WebP for imports, raw RGBA for tile
+                // renders). `compose_page_svg` auto-detects.
+                let store = ws.store.blobs();
+                let svg = kcreate_export::compose_page_svg(
                     &ws.project.document,
-                    &vector_ids,
-                    &opts,
-                )
-                .unwrap_or_else(|_| String::new());
+                    *id,
+                    n.bounds.width,
+                    n.bounds.height,
+                    |hash| store.load(hash).ok(),
+                );
                 pages.push(kcreate_export::pdf_multi::PdfPageInput {
                     title: n.name.clone(),
                     svg,

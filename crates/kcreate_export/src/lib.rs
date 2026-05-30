@@ -24,6 +24,7 @@ pub mod icon_pack;
 pub mod job_presets;
 pub mod jpeg;
 pub mod kbrand;
+pub mod page_svg;
 pub mod pdf;
 pub mod pdf_import;
 pub mod pdf_multi;
@@ -53,6 +54,7 @@ pub use figma_import::{
     ImportedFigma, ImportedFigmaArtboard, ImportedFigmaNode, ImportedFigmaPage,
 };
 pub use jpeg::{export_jpeg, export_jpeg_to_bytes, JpegExportError, JpegExportOptions};
+pub use page_svg::compose_page_svg;
 pub use pdf::{
     export_pdf_from_document, export_pdf_from_document_to_bytes, PdfExportError, PdfExportOptions,
     RasterPixelCache, RasterPixels,

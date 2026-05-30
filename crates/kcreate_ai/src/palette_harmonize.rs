@@ -217,6 +217,15 @@ impl Hsl {
 
 fn parse_hex(s: &str) -> Option<Hsl> {
     let s = s.trim().trim_start_matches('#');
+    // Index-by-byte slicing below would panic on a non-ASCII string
+    // whose UTF-8 byte length happens to be 6 or 8 (e.g. two
+    // 3-byte CJK codepoints). `is_ascii()` is O(n) but `n <= 8`
+    // in the only branches we reach, so the check is free in
+    // practice and turns a panic into the documented `BadHex`
+    // error in the public `harmonize_palette` API.
+    if !s.is_ascii() {
+        return None;
+    }
     let (r, g, b, a) = match s.len() {
         6 => {
             let r = u8::from_str_radix(&s[0..2], 16).ok()?;
@@ -316,6 +325,25 @@ mod tests {
     fn bad_hex_errors() {
         let err = harmonize_palette(&["not_a_hex".into()], HarmonyRule::Triadic).unwrap_err();
         assert!(matches!(err, HarmonyError::BadHex(_)));
+    }
+
+    #[test]
+    fn non_ascii_hex_does_not_panic() {
+        // Two CJK codepoints encode to 6 UTF-8 bytes, which would
+        // hit `parse_hex`'s `len() == 6` arm and panic on the first
+        // `&s[0..2]` slice (byte index 2 falls inside a 3-byte
+        // codepoint). The contract is `HarmonyError::BadHex`, not
+        // a panic — `parse_hex` now early-returns on non-ASCII.
+        let palette: Vec<String> = vec!["中文".into()];
+        let err = harmonize_palette(&palette, HarmonyRule::Triadic).unwrap_err();
+        assert!(matches!(err, HarmonyError::BadHex(_)));
+
+        // Same shape for the alpha-suffixed path (8 bytes via
+        // "中文中" — three 3-byte codepoints is 9 bytes, so use a
+        // 2-byte + 3-byte + 3-byte mix that lands on 8 bytes).
+        let palette2: Vec<String> = vec!["é中文".into()]; // 2 + 3 + 3 = 8 bytes
+        let err2 = harmonize_palette(&palette2, HarmonyRule::Triadic).unwrap_err();
+        assert!(matches!(err2, HarmonyError::BadHex(_)));
     }
 
     #[test]

@@ -5339,10 +5339,16 @@ export interface Preferences {
     theme: "dark" | "light" | "system";
     language: string;
     autosaveIntervalSec: number;
+    /**
+     * Days of `.kstudio` scratch-project retention before the
+     * autosaver garbage-collects them. `0` disables the sweep.
+     * Mirrors `GeneralPrefs::scratch_project_cleanup_days` (u32).
+     */
     scratchProjectCleanupDays: number;
   };
   canvas: {
     defaultGridSpacing: number;
+    defaultGridSubdivisions: number;
     snapThresholdPx: number;
     rulerUnits: "px" | "mm" | "in" | "pt";
   };

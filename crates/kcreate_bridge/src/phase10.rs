@@ -1283,7 +1283,12 @@ pub struct GeneralPrefs {
     pub theme: String,
     pub language: String,
     pub autosave_interval_sec: u32,
-    pub scratch_project_cleanup: bool,
+    /// How long (in days) to retain `.kstudio` scratch projects
+    /// before the autosaver garbage-collects them. `0` disables
+    /// the sweep entirely. Stored as a count rather than a bool so
+    /// the UI can expose a meaningful slider without burning a
+    /// second preference field. Wire field is `scratchProjectCleanupDays`.
+    pub scratch_project_cleanup_days: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1325,7 +1330,7 @@ impl Default for Preferences {
                 theme: "system".into(),
                 language: "en-US".into(),
                 autosave_interval_sec: 60,
-                scratch_project_cleanup: true,
+                scratch_project_cleanup_days: 30,
             },
             canvas: CanvasPrefs {
                 default_grid_spacing: 16.0,
@@ -1375,6 +1380,13 @@ pub(crate) fn user_home_dir() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+/// Load `~/.kcreate/preferences.json`.
+///
+/// Returns [`Preferences::default()`] only when the file does NOT
+/// exist (a first-run scenario). When the file exists but cannot
+/// be parsed the error is surfaced to the caller so the renderer
+/// can prompt the user — silently overwriting bad preferences with
+/// defaults would discard the user's settings on the next save.
 pub fn preferences_load() -> Result<Preferences> {
     let path = preferences_path()?;
     if !path.exists() {
@@ -1384,7 +1396,6 @@ pub fn preferences_load() -> Result<Preferences> {
         .map_err(|e| DocumentBridgeError::Internal(format!("preferences read: {e}")))?;
     serde_json::from_slice::<Preferences>(&bytes)
         .map_err(|e| DocumentBridgeError::Internal(format!("preferences parse: {e}")))
-        .or_else(|_| Ok(Preferences::default()))
 }
 
 pub fn preferences_save(prefs_json: &str) -> Result<()> {

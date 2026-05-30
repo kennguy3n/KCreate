@@ -1037,6 +1037,9 @@ mod tests {
     /// cascade of unrelated failures.
     ///
     /// The test does the following dance:
+    ///   0. Snapshot whatever value the test process had set
+    ///      before this test ran so Step 4 can put it back
+    ///      exactly the way we found it.
     ///   1. Briefly take the serializing mutex, install a SENTINEL
     ///      value as the "prior" state, drop the mutex. This is the
     ///      only place a value escapes the guard mechanism, and
@@ -1052,7 +1055,8 @@ mod tests {
     ///   3. The catch_unwind unwinds across the guard's drop, which
     ///      must restore SENTINEL and release the mutex.
     ///   4. Re-acquire the mutex, observe the env var is SENTINEL,
-    ///      then unset it on the way out.
+    ///      and restore the Step-0 snapshot so the test process
+    ///      ends exactly where it started.
     ///
     /// `AssertUnwindSafe` is sound: every value touched inside the
     /// closure is either a Drop-cleaned RAII guard
@@ -1063,6 +1067,17 @@ mod tests {
         // Sentinel that no other parser test sets, so a successful
         // restore is unambiguous.
         const SENTINEL: &str = "--restore-panic-test /tmp/sentinel";
+
+        // Step 0: snapshot whatever value the test process had
+        // before we touched anything, so Step 4 can put the world
+        // back exactly the way we found it (instead of
+        // unconditionally unsetting and clobbering a pre-existing
+        // caller-set value — e.g. a developer running this test
+        // with `KCREATE_SD_SERVER_EXTRA_ARGS=foo cargo test`).
+        let process_prior = {
+            let _capture = sd_args_test_lock().lock();
+            std::env::var_os("KCREATE_SD_SERVER_EXTRA_ARGS")
+        };
 
         // Step 1: install SENTINEL as the "prior" state. Hold the
         // mutex only for the write itself so the catch_unwind body
@@ -1111,13 +1126,17 @@ mod tests {
         // result.)
 
         // Step 4: re-acquire mutex, observe env reverted to
-        // SENTINEL, and clean up so the sentinel doesn't bleed into
-        // other tests.
+        // SENTINEL, and restore the truly-prior process value
+        // captured at Step 0 so this test leaves the env exactly
+        // the way it found it.
         let _teardown = sd_args_test_lock().lock();
         let restored = std::env::var_os("KCREATE_SD_SERVER_EXTRA_ARGS");
         // SAFETY: mutex held.
         unsafe {
-            std::env::remove_var("KCREATE_SD_SERVER_EXTRA_ARGS");
+            match process_prior {
+                Some(v) => std::env::set_var("KCREATE_SD_SERVER_EXTRA_ARGS", v),
+                None => std::env::remove_var("KCREATE_SD_SERVER_EXTRA_ARGS"),
+            }
         }
         assert_eq!(
             restored.as_deref(),

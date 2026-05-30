@@ -1439,6 +1439,181 @@ of them lands in the editing-path closure walked by
 `crates/kcreate_tests/tests/local_first.rs`. The sentinel
 stays green.
 
+## 17o. Phase 10 — Image Studio AI, Vector / Layout AI, Export AI, plugin marketplace, perf & startup hardening
+
+Phase 10 closes out the AI-assisted authoring story across
+every studio surface, finishes the Export Center with live
+previews + intelligent compression, lands the local plugin
+marketplace, and tightens the performance envelope. The
+work falls into six architectural buckets:
+
+**Image Studio AI pipeline.** `kcreate_ai::denoise`
+implements non-local-means denoising — for each pixel a
+local search window is walked, patches are compared via
+SSD-weighted Gaussian similarity, and the surviving
+patches are averaged into the output. Search radius, patch
+radius, and strength (h in the NLM literature) are all
+parameterised; rows are computed in parallel via rayon.
+`kcreate_ai::inpaint` runs a PatchMatch-style multi-scale
+exemplar synthesis: for every masked pixel the algorithm
+randomly seeds a source patch from the unmasked region,
+then iteratively propagates / random-searches better
+matches until a quota of iterations is exhausted. Coarse
+levels in the pyramid carry structural coherence; the
+finest level fills the actual mask. `kcreate_ai::auto_color`
+runs histogram equalisation (`AutoLevels`), gray-world
+white balance (`WhiteBalance`), per-channel 0.5 %-clip
+auto-levels (`HistogramEqualization`), or the
+`Combined` cascade. The SAM segmentation tool reuses the
+existing `kcreate_ai::segment` ONNX path with a BFS
+smart-select fallback when the model pack isn't
+installed; the magic wand tool reuses `kcreate_ai::smart_select`
+with `Replace | Add | Subtract` cumulative mask semantics.
+All five tools are wired through
+`crates/kcreate_bridge/src/phase10.rs` as undoable
+operations (so the Ask → Preview → Apply → Undo loop holds).
+
+**Vector / Layout / Brand-Hub AI.**
+`kcreate_ai::stroke_match` copies the source vector node's
+stroke geometry (width, dash pattern, cap, join, profile,
+fill colour) onto every target node and returns the
+per-property delta so the caller can render a confirmation
+diff. `kcreate_ai::glyph_extract` pipes a cropped raster
+region through the Phase 9 trace pipeline with
+letterform-tuned threshold defaults, simplifies the
+resulting polylines aggressively, and normalises the path
+set to a 1000-unit em-square (the same unit a font tool
+ships glyphs in). `kcreate_ai::reformat` drives the local
+LLM sidecar with a GBNF grammar that constrains the output
+to `{ pages: [{ title, nodes: [{ source_node_id,
+new_bounds, scale }] }] }` and then materialises those
+pages with the standard 16:9 artboard preset; `one_pager`
+follows the same shape but emits header / body /
+image-placeholder / callout sections for a single-page
+brief. `palette_harmonize` converts every brand-kit colour
+to HSL, picks the closest harmony rule
+(`Complementary | Triadic | Analogous | SplitComplementary |
+Tetradic`, or `Auto` which scores all five and picks the
+best fit), and nudges hues / saturations to land exactly on
+that rule's intervals — the LLM is *not* in the loop here
+because the math is deterministic. `type_pairing`, by
+contrast, is LLM-driven: heading-font classification +
+weight range get fed to the sidecar; suggested body fonts
+are filtered against the installed `fontdb` snapshot.
+`brand_template` generates a multi-page brochure (cover /
+content / back) with brand-kit tokens applied to every
+section.
+
+**Export AI + live preview.**
+`kcreate_export::svg_optimize` is *element-aware*: before
+running any of the optimiser passes (empty-group removal,
+redundant-transform collapse, path-data decimal-shortening,
+default-attribute drop, single-use `<defs>` inlining) it
+walks the SVG to compute `protected_regions` —
+`<text>`, `<style>`, `<script>`, and CDATA bodies whose
+content must not be mangled — and uses a `with_unprotected`
+helper to ensure every byte mutation lands strictly outside
+those regions. `kcreate_export::smart_compress` binary-
+searches the JPEG / WebP quality knob against an SSIM
+target (default 0.98); SSIM is computed as the product of
+the luminance / contrast / structure terms over 8 × 8
+blocks, row-parallel via rayon. The live preview path
+(`export_preview` → `ExportPreviewPanel.tsx`) caps render
+resolution at 1024 px on the longest side and debounces at
+300 ms so rapid slider drags don't flood the bridge.
+`kcreate_export::ai_import` parses `.ai` (PDF-wrapped)
+files: it walks the PDF object stream for the
+`%%AI_IllustratorSVG` payload marker; if found, the
+embedded SVG is piped through the standard
+`usvg` → `VectorPath` importer with awareness of AI-
+specific extensions (clipping masks, symbol definitions,
+named layers). When no SVG payload is present, the
+importer falls back to `pdf_import` so the file is at
+least usable as raster pages.
+
+**Plugin marketplace.**
+`kcreate_plugin::marketplace` mirrors the existing template
+marketplace: a `PluginMarketplace` scans
+`~/.kcreate/plugins/` for `.wasm` + `.kcplugin` bundles,
+surfaces `PluginListing { id, name, version, author,
+description, permissions, trust_status, installed }`, and
+exposes `list`, `install_local(path)`, `remove(id)`.
+Installation runs the Ed25519 signature verification path
+that already gates the WASM sandbox; un-signed bundles can
+still be installed but land with `TrustStatus::Unverified`
+so the UI can warn before enabling them.
+
+**Incremental scene sync.**
+`crates/kcreate_bridge/src/scene_sync.rs` now tracks a
+`scene_version: u64` counter on every node and a
+`DirtySet<Uuid>` keyed by `document_update_node` /
+`document_create_node` / `document_delete_node`. On every
+`scene_sync` tick the bridge rebuilds display-list entries
+only for nodes whose version has advanced since the last
+sync; entries for unchanged nodes are reused verbatim.
+The cache + version invariants are exercised by
+`crates/kcreate_tests/tests/incremental_sync.rs`, which
+asserts that partial updates yield byte-identical display
+lists to a from-scratch rebuild.
+
+**Undo memory optimisation.**
+`crates/kcreate_core/src/operation_compress.rs` implements
+deterministic JSON delta compression: `compute_diff` walks
+the two JSON trees in lockstep and emits a sequence of
+`DiffOp::{Set, Remove}` over keyed `PathSegment` paths
+(`Key | Index`). `apply_diff` replays the ops onto a
+mutable target. `compress_operation` wraps an `Operation`
+into a `CompressedOperation` carrying the full
+`before_patch` and the `forward_diff`; `expand_operation`
+reconstructs the original. Large inline base64 raster
+blobs are handled separately: `replace_blobs_with_refs`
+walks the patch JSON, extracts any string whose decoded
+size exceeds `undo_blob_threshold_bytes`, BLAKE3-hashes
+the bytes, and replaces the inline payload with a marker
+of shape `{ "__blobRef": "<hex hash>" }`; the original
+bytes are returned to the caller for persistence in the
+content-addressed blob store. `materialize_blob_refs`
+inverts the swap on load. Storage integration in
+`crates/kcreate_storage/src/project_io.rs` writes the
+encoded form when `compress_undo_log` is enabled (default)
+with a `__kcreateCompressedOpV1` sentinel; on load the
+sentinel is auto-detected so legacy rows continue to work
+without migration. Both flags live on
+`RuntimeConfig::{compress_undo_log,
+undo_blob_threshold_bytes}` (default 8192 bytes for the
+threshold).
+
+**Startup time optimisation.**
+`crates/kcreate_bridge/src/perf.rs` lazy-allocates the
+process-wide tile cache: `tile_cache_lock()` only fires
+the `bridge.tile_cache.subsystem_ready` startup-timeline
+mark on first touch (latched by `TILE_CACHE_READY_MARKED`
+so repeated calls are no-ops). The memory watchdog is
+opt-in: `memory_watchdog_start` emits
+`bridge.memory_watchdog.subsystem_ready` only when the
+host actually arms it. The LLM sidecar is also opt-in:
+`crate::llm::llm_start` calls `mark_llm_sidecar_ready` on
+first successful spawn so the sidecar discovery / probe /
+spawn path stays off the critical startup path. A cold
+startup now contains zero `bridge.*.subsystem_ready` marks
+until something actually touches each subsystem; the
+report surfaced via `startup_timeline_json` shows the gap
+between `bridge.first_call` and `project_create.start`
+shrinking accordingly. Four perf-module tests
+(`cold_startup_emits_no_subsystem_ready_marks`,
+`first_tile_cache_touch_fires_subsystem_ready_mark`,
+`tile_cache_subsystem_ready_mark_is_idempotent`,
+`llm_sidecar_subsystem_ready_mark_fires_once`) lock in
+the lazy contract.
+
+**Local-first invariant.** None of the Phase 10 work pulls
+networking into the editing-path closure walked by
+`crates/kcreate_tests/tests/local_first.rs`. The plugin
+marketplace operates entirely off the local filesystem;
+the LLM sidecar is unchanged from earlier phases (loopback
+only); export AI, preview, and import all run in-process.
+The sentinel stays green.
+
 ## 18. Resource optimization
 
 - **Startup.** Lazy-load model packs; precompile no shaders we won't

@@ -214,6 +214,21 @@ pub struct RuntimeConfig {
     /// Default 500 MB; floor 128 MB.
     #[serde(default = "default_memory_pressure_threshold_mb")]
     pub memory_pressure_threshold_mb: u64,
+    /// Phase 10 Block E Task 27: when true, the persisted operation
+    /// log is encoded as
+    /// [`crate::operation_compress::CompressedOperation`] entries —
+    /// each entry keeps `before_patch` in full but replaces
+    /// `after_patch` with a structural diff. Round-trips losslessly.
+    /// Default `true`.
+    #[serde(default = "default_compress_undo_log")]
+    pub compress_undo_log: bool,
+    /// Phase 10 Block E Task 27: minimum decoded blob size (bytes)
+    /// at which an inline base64 raster payload inside an
+    /// `Operation::*_patch` is eligible for content-addressed blob-ref
+    /// substitution before persisting. Default `8192` (8 KiB). Set to
+    /// `0` to disable the substitution path entirely.
+    #[serde(default = "default_undo_blob_threshold_bytes")]
+    pub undo_blob_threshold_bytes: usize,
 }
 
 const fn default_autosave_interval_secs() -> u32 {
@@ -222,6 +237,14 @@ const fn default_autosave_interval_secs() -> u32 {
 
 const fn default_memory_pressure_threshold_mb() -> u64 {
     500
+}
+
+const fn default_compress_undo_log() -> bool {
+    true
+}
+
+const fn default_undo_blob_threshold_bytes() -> usize {
+    8192
 }
 
 impl RuntimeConfig {
@@ -398,6 +421,8 @@ impl RuntimeConfig {
             low_resource_mode,
             autosave_interval_secs: default_autosave_interval_secs(),
             memory_pressure_threshold_mb: default_memory_pressure_threshold_mb(),
+            compress_undo_log: default_compress_undo_log(),
+            undo_blob_threshold_bytes: default_undo_blob_threshold_bytes(),
         }
     }
 }

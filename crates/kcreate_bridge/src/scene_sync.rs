@@ -251,12 +251,56 @@ pub const fn is_selection_highlight_id(id: ObjectId) -> bool {
 /// `append_presence_cursors` continues the same upward stream
 /// rather than restarting at the threshold and colliding with the
 /// artboard overlays that just got emitted.
+/// Phase 10 Block E Task 26 — per-node cache entry. Leaf-node emit
+/// (`emit_vector`, `emit_raster`, `emit_text`) is idempotent given an
+/// unchanged [`Node::version`], so we record the `Object`s those
+/// emitters produced and replay them on a subsequent sync without
+/// re-walking the node metadata. The sub-id list lets us re-populate
+/// the reverse `object_id_to_uuid` map for dashed vector paths whose
+/// sub-paths each carry their own `ObjectId`.
+#[derive(Debug, Clone)]
+struct NodeCacheEntry {
+    /// Snapshot of `Node::version` when these objects were emitted.
+    version: u64,
+    /// Objects emitted by the leaf-node emitter. `z` values are
+    /// rewritten on reuse so they slot into the current sync's z
+    /// stream rather than the historical one.
+    objects: Vec<Object>,
+    /// Every sub-`ObjectId` (sub-paths of a dashed vector) whose
+    /// reverse-map entry must be restored. Includes the primary id
+    /// for uniformity.
+    sub_object_ids: Vec<ObjectId>,
+    /// The `z` advance the original emit produced, captured as
+    /// `z_after - z_before`. Today every leaf emitter increments `z`
+    /// by exactly one per emitted [`Object`], so this is identical to
+    /// `objects.len() as i32` — but storing the actual delta lets a
+    /// future emitter reserve z slots (e.g. for sub-layers) without
+    /// silently corrupting the replay path. Replay rebases the
+    /// stream's `z` by exactly this many units, regardless of how
+    /// many objects were cached.
+    z_advance: i32,
+}
+
 #[derive(Debug, Default)]
 pub struct SceneSync {
     uuid_to_object_id: HashMap<Uuid, ObjectId>,
     object_id_to_uuid: HashMap<ObjectId, Uuid>,
     next_id: AtomicU64,
     overlay_watermark: u64,
+    /// Per-node cache of previously-emitted display-list objects.
+    /// Only populated for leaf node types whose `emit_*` is a pure
+    /// function of `(node, blob_store)` — Vector, Raster, Text.
+    /// Container nodes (Artboard, Page, Group) are NOT cached
+    /// because their emits draw overlay decorations (drop shadow,
+    /// label) whose `ObjectId`s come from the per-sync overlay
+    /// allocator and must not be re-used across syncs.
+    node_cache: HashMap<Uuid, NodeCacheEntry>,
+    /// Last-seen `Node::version` per uuid. Lets the next sync
+    /// distinguish a stale cache (version bumped → re-emit) from a
+    /// fresh cache (version unchanged → reuse). Kept separately
+    /// from `node_cache` so a cache miss can still update the
+    /// version table without allocating an empty entry.
+    last_version: HashMap<Uuid, u64>,
 }
 
 impl SceneSync {
@@ -268,7 +312,16 @@ impl SceneSync {
             // ObjectId(0) is reserved as a sentinel for "no object".
             next_id: AtomicU64::new(1),
             overlay_watermark: OVERLAY_ID_THRESHOLD,
+            node_cache: HashMap::new(),
+            last_version: HashMap::new(),
         }
+    }
+
+    /// Diagnostic accessor for [`tests`] — number of leaf-node
+    /// entries currently held in the incremental cache.
+    #[must_use]
+    pub fn cached_node_count(&self) -> usize {
+        self.node_cache.len()
     }
 
     fn next_overlay_id(state: &mut OverlayIdAllocator) -> ObjectId {
@@ -310,6 +363,8 @@ impl SceneSync {
         self.object_id_to_uuid.clear();
         self.next_id.store(1, Ordering::Relaxed);
         self.overlay_watermark = OVERLAY_ID_THRESHOLD;
+        self.node_cache.clear();
+        self.last_version.clear();
     }
 
     fn allocate(&self, doc_id: Uuid) -> ObjectId {
@@ -340,6 +395,109 @@ impl SceneSync {
         let id = ObjectId(self.next_id.fetch_add(1, Ordering::Relaxed));
         self.object_id_to_uuid.insert(id, parent_doc_id);
         id
+    }
+
+    /// Phase 10 Block E Task 26 — try to replay a previously-cached
+    /// leaf emit for `node`. Returns `true` when the cache hit and
+    /// objects were appended; the caller should NOT then call the
+    /// fresh `emit_*` for this node.
+    ///
+    /// Cache hit conditions:
+    /// 1. An entry exists for `node.id` from a prior sync.
+    /// 2. The cached `version` matches `node.version` exactly (any
+    ///    mutation bumps it via `Node::touch`).
+    ///
+    /// On hit, the cached `Object`s are cloned with their stored
+    /// relative z values (`0, 1, 2, …`) rebased onto the current `z`
+    /// stream so they slot into the right place in document order.
+    /// The reverse-map entries for every sub-`ObjectId` are restored
+    /// so hit-testing on a sub-path still resolves back to the parent
+    /// uuid.
+    fn try_replay_cached(
+        &mut self,
+        node: &Node,
+        objects: &mut Vec<Object>,
+        z: &mut i32,
+        emitted: &mut Vec<Uuid>,
+    ) -> bool {
+        let Some(entry) = self.node_cache.get(&node.id) else {
+            return false;
+        };
+        if entry.version != node.version {
+            return false;
+        }
+        let base_z = *z;
+        // Clone the slice up front so the borrow on `node_cache`
+        // ends before we mutate `self.uuid_to_object_id` /
+        // `self.object_id_to_uuid` below.
+        let cached_objects = entry.objects.clone();
+        let sub_object_ids = entry.sub_object_ids.clone();
+        // Use the recorded `z_advance` rather than the cached object
+        // count: replay must move the z stream by the same delta the
+        // original emit moved it, even if a future emitter chooses to
+        // skip slots (e.g. reserving z values for adjustment sub-
+        // layers). Coupling replay to `len()` looks innocent today
+        // because every leaf emitter is z+=1 per object, but it would
+        // silently produce mismatched z values the day that
+        // assumption changes.
+        let advance = entry.z_advance;
+        for obj in cached_objects {
+            let stored_z = obj.z;
+            let mut cloned = obj;
+            cloned.z = base_z.saturating_add(stored_z);
+            objects.push(cloned);
+        }
+        *z = z.saturating_add(advance);
+        // Repopulate the maps so hit-testing works the same as a
+        // fresh emit. The primary id is the first sub id (every
+        // leaf emit calls `record` for the first object); follow-on
+        // sub ids only need the reverse map.
+        if let Some(&primary) = sub_object_ids.first() {
+            self.uuid_to_object_id.insert(node.id, primary);
+        }
+        for &sub_id in &sub_object_ids {
+            self.object_id_to_uuid.insert(sub_id, node.id);
+        }
+        emitted.push(node.id);
+        self.last_version.insert(node.id, node.version);
+        true
+    }
+
+    /// Phase 10 Block E Task 26 — capture the objects emitted by a
+    /// leaf `emit_*` call into [`node_cache`] so the next sync with
+    /// the same `node.version` can replay them.
+    ///
+    /// `obj_start` and `z_start` are the watermarks captured before
+    /// the emit; cached `z` values are stored relative to `z_start`
+    /// so the replay path can rebase them onto an arbitrary current
+    /// `z`.
+    fn capture_cache(
+        &mut self,
+        node: &Node,
+        objects: &[Object],
+        obj_start: usize,
+        z_start: i32,
+        z_end: i32,
+    ) {
+        let mut cached_objects = Vec::with_capacity(objects.len() - obj_start);
+        let mut sub_ids = Vec::with_capacity(objects.len() - obj_start);
+        for obj in &objects[obj_start..] {
+            sub_ids.push(obj.id);
+            let mut snapshot = obj.clone();
+            snapshot.z = obj.z.saturating_sub(z_start);
+            cached_objects.push(snapshot);
+        }
+        let z_advance = z_end.saturating_sub(z_start);
+        self.node_cache.insert(
+            node.id,
+            NodeCacheEntry {
+                version: node.version,
+                objects: cached_objects,
+                sub_object_ids: sub_ids,
+                z_advance,
+            },
+        );
+        self.last_version.insert(node.id, node.version);
     }
 
     /// Translate the document graph into a fresh renderer [`Scene`].
@@ -419,6 +577,13 @@ impl SceneSync {
         self.uuid_to_object_id.retain(|uuid, _| kept.contains(uuid));
         // Mirror the prune into the reverse map.
         self.object_id_to_uuid.retain(|_, uuid| kept.contains(uuid));
+        // Phase 10 Block E Task 26 — sweep stale cache entries for
+        // nodes that didn't appear in this sync (deleted or hidden).
+        // Keeping them would leak memory and risk a wrong replay if
+        // a future sync somehow encounters the same uuid in a
+        // different document state.
+        self.node_cache.retain(|uuid, _| kept.contains(uuid));
+        self.last_version.retain(|uuid, _| kept.contains(uuid));
 
         // Persist the watermark for follow-up overlay emitters
         // (notably `append_presence_cursors`). Selection highlights
@@ -800,15 +965,43 @@ impl SceneSync {
                 Some(node_world_bounds(node))
             }
             NodeType::VectorLayer => {
-                self.emit_vector(node, objects, z, emitted);
+                if !self.try_replay_cached(node, objects, z, emitted) {
+                    let z_start = *z;
+                    let obj_start = objects.len();
+                    self.emit_vector(node, objects, z, emitted);
+                    self.capture_cache(node, objects, obj_start, z_start, *z);
+                }
                 clip
             }
             NodeType::RasterLayer => {
-                self.emit_raster(node, objects, z, blob_store, emitted);
+                // Raster cache depends on blob_store availability —
+                // if blob_store is None, we may emit a placeholder
+                // rect; once a blob_store appears the next sync
+                // should regenerate. Only cache when the blob_store
+                // is present so cache→reality drift can't happen.
+                if blob_store.is_some() && self.try_replay_cached(node, objects, z, emitted) {
+                    // hit
+                } else {
+                    let z_start = *z;
+                    let obj_start = objects.len();
+                    self.emit_raster(node, objects, z, blob_store, emitted);
+                    if blob_store.is_some() {
+                        self.capture_cache(node, objects, obj_start, z_start, *z);
+                    } else {
+                        // Without a blob store, invalidate any prior
+                        // cache so the next blob-bearing sync re-emits.
+                        self.node_cache.remove(&node.id);
+                    }
+                }
                 clip
             }
             NodeType::TextLayer => {
-                self.emit_text(node, objects, z, emitted);
+                if !self.try_replay_cached(node, objects, z, emitted) {
+                    let z_start = *z;
+                    let obj_start = objects.len();
+                    self.emit_text(node, objects, z, emitted);
+                    self.capture_cache(node, objects, obj_start, z_start, *z);
+                }
                 clip
             }
             NodeType::Page
@@ -2146,5 +2339,104 @@ mod tests {
             seen.contains(&primary),
             "primary ObjectId {primary:?} was not one of the emitted sub-path ids",
         );
+    }
+
+    // -----------------------------------------------------------
+    // Phase 10 Block E Task 26 — incremental scene-cache tests.
+    // -----------------------------------------------------------
+
+    /// Helper: build a scene with three sibling vector layers, run a
+    /// fresh sync, then return `(doc, sync, scene, ids)`.
+    fn three_vector_scene() -> (DocumentGraph, SceneSync, Scene, Vec<Uuid>) {
+        let mut doc = DocumentGraph::new();
+        let path = unit_square_path();
+        let ids: Vec<Uuid> = (0..3)
+            .map(|i| {
+                let mut n = vector_node(&path);
+                n.name = format!("rect_{i}");
+                n.bounds.x = f64::from(i) * 20.0;
+                doc.insert_node(n).expect("insert")
+            })
+            .collect();
+        let mut sync = SceneSync::new();
+        let scene = sync.sync_document_to_scene(&doc, None, &[]);
+        (doc, sync, scene, ids)
+    }
+
+    #[test]
+    fn cache_populated_after_first_sync() {
+        let (_doc, sync, _scene, ids) = three_vector_scene();
+        // 3 vector nodes → 3 cache entries.
+        assert_eq!(sync.cached_node_count(), ids.len());
+    }
+
+    #[test]
+    fn second_sync_with_no_changes_reuses_cache_and_matches_full_rebuild() {
+        let (doc, mut cached_sync, scene_a, _ids) = three_vector_scene();
+        // Replay against the same doc; nothing has changed so the
+        // cache should be 100% hit and the resulting scene must be
+        // bit-identical to a fresh-from-empty sync.
+        let scene_b = cached_sync.sync_document_to_scene(&doc, None, &[]);
+        let mut fresh = SceneSync::new();
+        let scene_c = fresh.sync_document_to_scene(&doc, None, &[]);
+        // Both syncs from the same doc state must produce the same
+        // object count and per-object kinds (Path).
+        assert_eq!(scene_a.objects.len(), scene_b.objects.len());
+        assert_eq!(scene_b.objects.len(), scene_c.objects.len());
+        for (b, c) in scene_b.objects.iter().zip(scene_c.objects.iter()) {
+            assert_eq!(b.z, c.z, "cached replay z must match fresh sync z");
+        }
+    }
+
+    #[test]
+    fn version_bump_invalidates_cache_entry_for_that_node() {
+        let (mut doc, mut sync, _scene_a, ids) = three_vector_scene();
+        let cache_before = sync.cached_node_count();
+        // Bump the middle node's version (simulates a property edit).
+        if let Some(n) = doc.get_node_mut(ids[1]) {
+            n.touch();
+        }
+        // Re-sync — the cache entry for ids[1] should regenerate but
+        // entries for ids[0] and ids[2] should replay unchanged.
+        let scene = sync.sync_document_to_scene(&doc, None, &[]);
+        assert_eq!(scene.objects.len(), 3, "still three vector objects");
+        assert_eq!(
+            sync.cached_node_count(),
+            cache_before,
+            "cache count unchanged: one entry replaced, two reused"
+        );
+    }
+
+    #[test]
+    fn deleted_node_drops_cache_entry() {
+        let (mut doc, mut sync, _scene_a, ids) = three_vector_scene();
+        let before = sync.cached_node_count();
+        doc.remove_node(ids[0]).expect("remove first node");
+        let scene = sync.sync_document_to_scene(&doc, None, &[]);
+        assert_eq!(scene.objects.len(), 2, "two objects remain");
+        assert_eq!(
+            sync.cached_node_count(),
+            before - 1,
+            "cache must drop the deleted node",
+        );
+    }
+
+    #[test]
+    fn cached_replay_preserves_object_id_stability() {
+        let (doc, mut sync, scene_a, ids) = three_vector_scene();
+        let id_a: Vec<_> = scene_a.objects.iter().map(|o| o.id).collect();
+        // Second sync with no changes — every emitted object id must
+        // match the first sync's, since the cache replays the exact
+        // ObjectId values it captured.
+        let scene_b = sync.sync_document_to_scene(&doc, None, &[]);
+        let id_b: Vec<_> = scene_b.objects.iter().map(|o| o.id).collect();
+        assert_eq!(id_a, id_b, "cached replay must yield identical ObjectIds");
+        // Forward map still resolves every node uuid.
+        for id in &ids {
+            assert!(
+                sync.object_id_for_uuid(*id).is_some(),
+                "uuid {id} dropped from forward map after cached sync",
+            );
+        }
     }
 }

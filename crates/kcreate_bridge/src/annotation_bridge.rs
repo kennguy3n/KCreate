@@ -283,6 +283,7 @@ fn require_editor_permission() -> Result<()> {
 }
 
 #[cfg(not(feature = "collab"))]
+#[allow(clippy::unnecessary_wraps)] // signature mirrors the collab variant which CAN fail
 fn require_editor_permission() -> Result<()> {
     Ok(())
 }

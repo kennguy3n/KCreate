@@ -205,7 +205,18 @@ pub struct ProjectStore {
     manifest: ProjectManifest,
     db: Database,
     blobs: BlobStore,
+    /// Phase 10 Block E Task 27 — when true, [`Self::save_operation`]
+    /// stores each undo-log entry in compressed form
+    /// (full `before_patch` + structural diff in lieu of `after_patch`).
+    /// [`Self::load_operations`] auto-detects and expands the marker
+    /// transparently so the in-memory [`Operation`] surface is unchanged.
+    /// Default `true`; mirror [`kcreate_core::RuntimeConfig::compress_undo_log`].
+    compress_undo_log: bool,
 }
+
+/// Sentinel marker stored under the `after_patch` JSON column when an
+/// operation has been written in compressed form. Detected on load.
+const COMPRESSED_OP_MARKER: &str = "__kcreateCompressedOpV1";
 
 impl ProjectStore {
     /// Create a new `.kstudio/` package at `dir` (which is the
@@ -232,6 +243,7 @@ impl ProjectStore {
             manifest,
             db,
             blobs,
+            compress_undo_log: true,
         })
     }
 
@@ -304,6 +316,7 @@ impl ProjectStore {
             manifest,
             db,
             blobs,
+            compress_undo_log: true,
         })
     }
 
@@ -701,6 +714,22 @@ impl ProjectStore {
 
     /// Append an operation to the operation log table.
     pub fn save_operation(&mut self, op: &Operation) -> Result<(), ProjectStoreError> {
+        // Phase 10 Block E Task 27 — when the compress-undo-log toggle
+        // is on, we encode the entry as
+        // `{ "__kcreateCompressedOpV1": true, "forward_diff": [...] }`
+        // stored in the `after_patch` column. `before_patch` stays
+        // verbatim so a partially-decoded row still surfaces the prior
+        // state. `load_operations` auto-detects the marker and rebuilds
+        // the original `after_patch` by applying the diff.
+        let after_payload = if self.compress_undo_log {
+            let diff = kcreate_core::compute_diff(&op.before_patch, &op.after_patch);
+            serde_json::to_string(&serde_json::json!({
+                COMPRESSED_OP_MARKER: true,
+                "forward_diff": diff,
+            }))?
+        } else {
+            serde_json::to_string(&op.after_patch)?
+        };
         self.db.conn().execute(
             "INSERT OR REPLACE INTO operations
              (id, timestamp, actor, command, before_patch, after_patch, affected_nodes, ai_generated, group_id)
@@ -711,13 +740,28 @@ impl ProjectStore {
                 op.actor,
                 op.command,
                 serde_json::to_string(&op.before_patch)?,
-                serde_json::to_string(&op.after_patch)?,
+                after_payload,
                 serde_json::to_string(&op.affected_nodes)?,
                 i64::from(op.ai_generated),
                 op.group_id.as_ref().map(uuid::Uuid::to_string),
             ],
         )?;
         Ok(())
+    }
+
+    /// Toggle the Phase 10 compress-undo-log path. Subsequent
+    /// [`Self::save_operation`] calls honour the new setting; rows
+    /// already on disk are not rewritten (the load path handles both
+    /// encodings transparently).
+    pub fn set_compress_undo_log(&mut self, on: bool) {
+        self.compress_undo_log = on;
+    }
+
+    /// Whether [`Self::save_operation`] is currently writing compressed
+    /// entries. Mirrors `RuntimeConfig::compress_undo_log`.
+    #[must_use]
+    pub const fn compress_undo_log(&self) -> bool {
+        self.compress_undo_log
     }
 
     /// Load the most recent `limit` operations, oldest first.
@@ -761,6 +805,31 @@ impl ProjectStore {
                     Some(s) => Some(Uuid::parse_str(&s)?),
                     None => None,
                 };
+                let before_patch: serde_json::Value = serde_json::from_str(&before)?;
+                // Phase 10 Block E Task 27 — detect the compressed
+                // wire marker in the `after_patch` column and rebuild
+                // the original `after_patch` by applying the stored
+                // diff to `before_patch`. Legacy rows (no marker) read
+                // through verbatim.
+                let raw_after: serde_json::Value = serde_json::from_str(&after)?;
+                let after_patch = if raw_after
+                    .as_object()
+                    .and_then(|m| m.get(COMPRESSED_OP_MARKER))
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false)
+                {
+                    let diff_value = raw_after
+                        .as_object()
+                        .and_then(|m| m.get("forward_diff"))
+                        .cloned()
+                        .unwrap_or_else(|| serde_json::Value::Array(Vec::new()));
+                    let ops: Vec<kcreate_core::DiffOp> = serde_json::from_value(diff_value)?;
+                    let mut after = before_patch.clone();
+                    kcreate_core::apply_diff(&mut after, &ops);
+                    after
+                } else {
+                    raw_after
+                };
                 Ok(Operation {
                     id: Uuid::parse_str(&id)?,
                     timestamp: chrono::DateTime::parse_from_rfc3339(&ts)
@@ -768,8 +837,8 @@ impl ProjectStore {
                         .with_timezone(&chrono::Utc),
                     actor,
                     command,
-                    before_patch: serde_json::from_str(&before)?,
-                    after_patch: serde_json::from_str(&after)?,
+                    before_patch,
+                    after_patch,
                     affected_nodes: serde_json::from_str(&affected)?,
                     ai_generated: ai != 0,
                     group_id,
@@ -1276,6 +1345,75 @@ mod tests {
         assert_eq!(ops.len(), 1);
         assert_eq!(ops[0].id, op.id);
         assert_eq!(ops[0].actor, "user");
+    }
+
+    /// Phase 10 Block E Task 27 — when the compress-undo-log toggle is
+    /// on (the default), an op is serialised as a structural diff but
+    /// `load_operations` rebuilds the original `before_patch` /
+    /// `after_patch` pair byte-for-byte.
+    #[test]
+    fn save_operation_compressed_round_trip_reconstructs_after_patch() {
+        let (_dir, mut store) = new_project();
+        assert!(
+            store.compress_undo_log(),
+            "compress_undo_log must default to true"
+        );
+        let before = serde_json::json!({
+            "node": "abc",
+            "version": 1,
+            "metadata": {"k": "old", "shared": "blob"},
+            "list": [1, 2, 3],
+        });
+        let after = serde_json::json!({
+            "node": "abc",
+            "version": 2,
+            "metadata": {"k": "new", "shared": "blob"},
+            "list": [1, 9, 3],
+        });
+        let op = Operation::new("user", "edit", before.clone(), after.clone(), Vec::new());
+        store.save_operation(&op).expect("save");
+        let ops = store.load_operations(10).expect("load");
+        assert_eq!(ops.len(), 1, "exactly one row");
+        assert_eq!(ops[0].before_patch, before, "before_patch must round-trip");
+        assert_eq!(ops[0].after_patch, after, "after_patch must round-trip");
+    }
+
+    /// Phase 10 Block E Task 27 — switching the compress toggle off
+    /// produces legacy uncompressed rows; switching it back on must not
+    /// break the load path for rows already written without the marker.
+    #[test]
+    fn load_operations_handles_mixed_compressed_and_legacy_rows() {
+        let (_dir, mut store) = new_project();
+        // Write a legacy (uncompressed) op first.
+        store.set_compress_undo_log(false);
+        let legacy_before = serde_json::json!({"v": 1});
+        let legacy_after = serde_json::json!({"v": 2});
+        let legacy = Operation::new(
+            "user",
+            "legacy",
+            legacy_before,
+            legacy_after.clone(),
+            Vec::new(),
+        );
+        store.save_operation(&legacy).expect("save legacy");
+        // Flip the toggle and write a compressed op.
+        store.set_compress_undo_log(true);
+        let new_before = serde_json::json!({"v": 10});
+        let new_after = serde_json::json!({"v": 11});
+        let new_op = Operation::new(
+            "user",
+            "compressed",
+            new_before,
+            new_after.clone(),
+            Vec::new(),
+        );
+        store.save_operation(&new_op).expect("save compressed");
+        let ops = store.load_operations(10).expect("load");
+        assert_eq!(ops.len(), 2, "both rows loaded");
+        let by_cmd: std::collections::HashMap<_, _> =
+            ops.iter().map(|o| (o.command.clone(), o.clone())).collect();
+        assert_eq!(by_cmd["legacy"].after_patch, legacy_after);
+        assert_eq!(by_cmd["compressed"].after_patch, new_after);
     }
 
     /// Regression: `load_operations(limit)` must return the *newest*

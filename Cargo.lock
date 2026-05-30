@@ -1913,6 +1913,8 @@ dependencies = [
 name = "kcreate_core"
 version = "0.0.1"
 dependencies = [
+ "base64",
+ "blake3",
  "chrono",
  "log",
  "serde",
@@ -1927,6 +1929,7 @@ dependencies = [
 name = "kcreate_export"
 version = "0.0.1"
 dependencies = [
+ "base64",
  "criterion",
  "flate2",
  "image 0.25.10",
@@ -2039,6 +2042,7 @@ dependencies = [
  "uuid",
  "wasmi",
  "wat",
+ "zip",
 ]
 
 [[package]]
@@ -2112,11 +2116,13 @@ dependencies = [
  "kcreate_kchat_client",
  "kcreate_layout",
  "kcreate_mcp",
+ "kcreate_plugin",
  "kcreate_raster",
  "kcreate_renderer",
  "kcreate_storage",
  "kcreate_text",
  "kcreate_vector",
+ "lopdf",
  "serde_json",
  "serial_test",
  "tempfile",

@@ -4368,6 +4368,7 @@ declare global {
       clipboard: ClipboardBridge;
       phase8: Phase8Bridge;
       phase9: Phase9Bridge;
+      phase10: Phase10Bridge;
       projectEncryption: ProjectEncryptionBridge;
       annotation: AnnotationBridge;
     };
@@ -5089,4 +5090,435 @@ export interface Phase9Bridge {
   autosaveRecoveryAvailable(): Promise<AutosaveMarker | null>;
   autosaveRecover(): Promise<void>;
   autosaveDismissRecovery(): Promise<void>;
+}
+
+// =============================================================
+// Phase 10 — Image Studio AI, Vector/Layout AI, Export AI +
+// Live Preview, Brand Hub + Plugin Marketplace, Preferences.
+// Wire-format mirrors of `crates/kcreate_bridge/src/phase10.rs`.
+// =============================================================
+
+/** Result of `aiDenoise`. New raster node id + dimensions. */
+export interface DenoiseResult {
+  newNodeId: string;
+  width: number;
+  height: number;
+}
+
+/** Result of `aiInpaint`. */
+export interface InpaintResult {
+  newNodeId: string;
+  width: number;
+  height: number;
+}
+
+/** Auto-color mode (matches Rust `AutoColorMode` serde). */
+export type AutoColorMode =
+  | "auto_levels"
+  | "white_balance"
+  | "histogram_equalization"
+  | "combined";
+
+/** Result of `aiAutoColor`. */
+export interface AutoColorResult {
+  newNodeId: string;
+  mode: string;
+  width: number;
+  height: number;
+}
+
+/** Result of `aiSegmentAtPoint`. */
+export interface SegmentAtPointResult {
+  /** Base64-encoded `width*height` byte mask (255 fg, 0 bg). */
+  maskBase64: string;
+  width: number;
+  height: number;
+  /** Backend that produced the mask (`edge_aware` | `sam`). */
+  backend: string;
+}
+
+/** Set-op mode for `aiSmartSelectAtPoint`. */
+export type SmartSelectMode = "replace" | "add" | "subtract";
+
+/** Result of `aiSmartSelectAtPoint`. */
+export interface SmartSelectAtPointResult {
+  maskBase64: string;
+  width: number;
+  height: number;
+  mode: string;
+  selectedPixelCount: number;
+}
+
+/** Rectangle for inpainting mask input. */
+export interface InpaintMaskRect {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
+
+/**
+ * Flattened stroke properties — wire-format mirror of
+ * `kcreate_ai::stroke_match::StrokeProperties` (`#[serde(rename_all = "camelCase")]`).
+ */
+export interface StrokeProperties {
+  /** `#RRGGBBAA` lowercase hex, matching the renderer convention. */
+  colorHex: string;
+  width: number;
+  /** Dash array; empty when the stroke is solid. */
+  dash: number[];
+  cap: string;
+  join: string;
+  /** `(t, width)` pairs describing a variable-width profile, or `null` for uniform. */
+  widthProfile: Array<[number, number]> | null;
+}
+
+/** Per-target record returned for each node that received the source's stroke. */
+export interface StrokeDeltaApplied {
+  targetNodeId: string;
+  /** `true` when the target had a previous stroke that got overwritten. */
+  hadPreviousStroke: boolean;
+}
+
+/** Result of `aiMatchStroke`. Mirror of Rust `StrokeMatchSummary`. */
+export interface StrokeMatchSummary {
+  sourceNodeId: string;
+  applied: StrokeDeltaApplied[];
+  sourceProperties: StrokeProperties;
+}
+
+/** Result of `aiExtractGlyph`. */
+export interface ExtractedGlyphResult {
+  /** Serialized vector paths as JSON. */
+  pathsJson: string;
+  emSize: number;
+  /** `(minX, minY, maxX, maxY)`. */
+  boundingBox: [number, number, number, number];
+}
+
+/**
+ * One placement on a reformatted deck page. Mirror of Rust
+ * `kcreate_ai::reformat::ReformatPagePlacement`
+ * (`#[serde(rename_all = "camelCase")]`). Coordinates are flat
+ * (`newX`/`newY`/`newWidth`/`newHeight`) — there is no nested
+ * `bounds` object.
+ */
+export interface ReformatPagePlacement {
+  sourceNodeId: string;
+  newX: number;
+  newY: number;
+  newWidth: number;
+  newHeight: number;
+  scale: number;
+}
+
+/**
+ * One page in a reformatted deck. Mirror of Rust
+ * `kcreate_ai::reformat::ReformatPage`. The Rust field is
+ * `placements`, not `nodes`, and the index is exposed at the page
+ * level.
+ */
+export interface ReformatPage {
+  index: number;
+  title: string;
+  placements: ReformatPagePlacement[];
+}
+
+/** Result of `aiReformatToDeck`. Mirror of Rust `ReformatDeckResult`. */
+export interface ReformatDeckResult {
+  pages: ReformatPage[];
+  pageWidth: number;
+  pageHeight: number;
+}
+
+/** Section type returned by `aiBriefToOnePager`. */
+export type OnePagerSectionType =
+  | "header"
+  | "body"
+  | "image_placeholder"
+  | "callout";
+
+/**
+ * Mirror of Rust `kcreate_ai::one_pager::OnePagerSection`
+ * (`#[serde(rename_all = "camelCase")]`). Coordinates are flat —
+ * the Rust struct has `x`, `y`, `width`, `height` at the top level
+ * rather than nested under `bounds`.
+ */
+export interface OnePagerSection {
+  sectionType: OnePagerSectionType;
+  text: string;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+/** Result of `aiBriefToOnePager`. Mirror of Rust `BriefToOnePagerResult`. */
+export interface BriefToOnePagerResult {
+  sections: OnePagerSection[];
+  pageWidth: number;
+  pageHeight: number;
+}
+
+/** Harmony type for `aiHarmonizePalette`. */
+export type HarmonyType =
+  | "auto"
+  | "complementary"
+  | "triadic"
+  | "analogous"
+  | "split_complementary"
+  | "tetradic";
+
+/**
+ * Mirror of Rust `kcreate_ai::palette_harmonize::HarmonySuggestion`
+ * (`#[serde(rename_all = "camelCase")]`).
+ */
+export interface HarmonySuggestion {
+  inputHex: string;
+  suggestedHex: string;
+  hueShiftDegrees: number;
+}
+
+/** Mirror of Rust `HarmonyResult`. */
+export interface HarmonyResult {
+  /** Serialized as snake_case (`HarmonyRule` uses `rename_all = "snake_case"`). */
+  rule: HarmonyType;
+  suggestions: HarmonySuggestion[];
+}
+
+/** Result of `aiSuggestTypePairing`. */
+export interface TypePairingSuggestion {
+  fontName: string;
+  reason: string;
+  confidence: number;
+}
+
+/** Mirror of Rust `TypePairingResult` (`#[serde(rename_all = "camelCase")]`). */
+export interface TypePairingResult {
+  headingFont: string;
+  /** Heading-font classification — `serif` | `sans` | `mono` | `display` | `script`. */
+  headingCategory: string;
+  suggestions: TypePairingSuggestion[];
+}
+
+/** Result of `exportOptimizeSvg`. */
+export interface SvgOptimizeReport {
+  originalBytes: number;
+  optimisedBytes: number;
+  bytesSaved: number;
+  ratio: number;
+  outputSvg: string;
+}
+
+/** Result of `exportSmartCompress`. */
+export interface SmartCompressReport {
+  quality: number;
+  format: "jpeg" | "webp";
+  originalBytes: number;
+  compressedBytes: number;
+  ratio: number;
+  ssim: number;
+  iterations: number;
+  /** Base64-encoded compressed bytes. */
+  bytes: string;
+}
+
+/** Request for `exportPreview`. */
+export interface ExportPreviewRequest {
+  nodeId: string;
+  /** `png` | `jpeg` | `jpg` | `webp`. */
+  format: string;
+  maxDimensionPx?: number | null;
+}
+
+/** Result of `exportPreview`. */
+export interface ExportPreviewResponse {
+  bytesBase64: string;
+  mimeType: string;
+  width: number;
+  height: number;
+  byteSize: number;
+}
+
+/** Result of `importAi`. */
+export interface AiImportSummary {
+  path: "svg" | "pdf";
+  widthPt: number | null;
+  heightPt: number | null;
+  objectCount: number;
+  message: string | null;
+  svgPayloadBase64: string;
+}
+
+/**
+ * Mirror of Rust `BrochureSection` in
+ * `kcreate_bridge::phase10` (`#[serde(rename_all = "camelCase")]`).
+ * Coordinates are flat (no nested `bounds`).
+ */
+export interface BrochureSection {
+  sectionKind: string;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  /** Hex string `#RRGGBB` of the brand-token applied to this section. */
+  styleColorHex: string | null;
+}
+
+/** Mirror of Rust `BrochurePage`. */
+export interface BrochurePage {
+  index: number;
+  /** `cover` | `content` | `back`. */
+  pageType: string;
+  sections: BrochureSection[];
+}
+
+/** Result of `aiBrandToBrochure`. Mirror of Rust `BrochurePlanResult`. */
+export interface BrochurePlanResult {
+  pages: BrochurePage[];
+  brandKitId: string;
+}
+
+/** Listing returned by `pluginMarketplaceList`. */
+export interface PluginListing {
+  id: string;
+  name: string;
+  version: string;
+  author: string;
+  description: string;
+  permissions: string[];
+  trustStatus: string;
+  installed: boolean;
+}
+
+/** Result of `exportPdfMulti`. Mirror of Rust `PdfMultiReport`. */
+export interface PdfMultiReport {
+  pageCount: number;
+  bytesWritten: number;
+  tocEmitted: boolean;
+  /** `true` when the bookmarks/outline tree was emitted. */
+  bookmarksEmitted: boolean;
+}
+
+/** Mirror of `kcreate_bridge::phase10::Preferences`. */
+export interface Preferences {
+  general: {
+    theme: "dark" | "light" | "system";
+    language: string;
+    autosaveIntervalSec: number;
+    /**
+     * Days of `.kstudio` scratch-project retention before the
+     * autosaver garbage-collects them. `0` disables the sweep.
+     * Mirrors `GeneralPrefs::scratch_project_cleanup_days` (u32).
+     */
+    scratchProjectCleanupDays: number;
+  };
+  canvas: {
+    defaultGridSpacing: number;
+    defaultGridSubdivisions: number;
+    snapThresholdPx: number;
+    rulerUnits: "px" | "mm" | "in" | "pt";
+  };
+  ai: {
+    defaultLlmModel: string;
+    autoStartSidecar: boolean;
+    gbnfGrammarDebugging: boolean;
+  };
+  performance: {
+    rasterCacheBudgetMb: number;
+    undoDepthOverride: number | null;
+    lowResourceMode: boolean;
+  };
+  privacy: {
+    telemetryOptIn: boolean;
+    auditLogRetentionDays: number;
+  };
+}
+
+/**
+ * Phase 10 bridge surface. Each method round-trips through the
+ * `kcreate/phase10/*` IPC channels; preload decodes JSON strings
+ * returned by the napi entry points so callers see typed objects.
+ */
+export interface Phase10Bridge {
+  // -------- Block A — Image Studio AI -----------------------
+  aiDenoise(
+    nodeId: string,
+    strength: number,
+    searchRadius: number,
+    patchRadius: number,
+  ): Promise<DenoiseResult>;
+  aiInpaint(
+    nodeId: string,
+    maskRects: InpaintMaskRect[],
+    patchRadius: number | null,
+    numIterations: number | null,
+    pyramidLevels: number | null,
+  ): Promise<InpaintResult>;
+  aiAutoColor(nodeId: string, mode: AutoColorMode): Promise<AutoColorResult>;
+  aiSegmentAtPoint(
+    nodeId: string,
+    pointX: number,
+    pointY: number,
+    isPositive: boolean,
+  ): Promise<SegmentAtPointResult>;
+  aiSmartSelectAtPoint(
+    nodeId: string,
+    x: number,
+    y: number,
+    tolerance: number,
+    mode: SmartSelectMode,
+    previousMaskBase64: string | null,
+  ): Promise<SmartSelectAtPointResult>;
+
+  // -------- Block B — Vector/Layout AI ----------------------
+  aiMatchStroke(
+    sourceNodeId: string,
+    targetNodeIds: string[],
+  ): Promise<StrokeMatchSummary>;
+  aiExtractGlyph(
+    nodeId: string,
+    cropX: number,
+    cropY: number,
+    cropWidth: number,
+    cropHeight: number,
+    emSize: number,
+  ): Promise<ExtractedGlyphResult>;
+  aiReformatToDeck(pageId: string): Promise<ReformatDeckResult>;
+  aiBriefToOnePager(
+    brief: string,
+    pageSize: "letter" | "a4" | "square" | null,
+  ): Promise<BriefToOnePagerResult>;
+  aiHarmonizePalette(
+    brandKitId: string,
+    harmonyType: HarmonyType,
+  ): Promise<HarmonyResult>;
+  aiSuggestTypePairing(headingFontName: string): Promise<TypePairingResult>;
+
+  // -------- Block C — Export AI + Live Preview --------------
+  exportOptimizeSvg(svg: string): Promise<SvgOptimizeReport>;
+  exportSmartCompress(
+    nodeId: string,
+    format: "jpeg" | "webp",
+    targetSsim: number | null,
+  ): Promise<SmartCompressReport>;
+  exportPreview(request: ExportPreviewRequest): Promise<ExportPreviewResponse>;
+  importAi(path: string): Promise<AiImportSummary>;
+
+  // -------- Block D — Brand Hub + Plugin Marketplace --------
+  aiBrandToBrochure(
+    brandKitId: string,
+    numPages: number,
+  ): Promise<BrochurePlanResult>;
+  pluginMarketplaceList(): Promise<PluginListing[]>;
+  pluginMarketplaceInstallLocal(path: string): Promise<PluginListing>;
+  pluginMarketplaceRemove(id: string): Promise<boolean>;
+  exportPdfMulti(
+    options: Record<string, unknown>,
+    outputPath: string,
+  ): Promise<PdfMultiReport>;
+
+  // -------- Block D Task 23 — Preferences -------------------
+  preferencesLoad(): Promise<Preferences>;
+  preferencesSave(prefs: Preferences): Promise<void>;
 }

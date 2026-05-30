@@ -166,6 +166,14 @@ pub fn llm_start(model_path: PathBuf) -> LlmBridgeResult<u16> {
     let mut sidecar = LlmSidecar::new(cfg);
     let port = sidecar.start()?;
     *guard = Some(sidecar);
+    // Phase 10 Block E Task 28 — emit the startup-timeline marker
+    // exactly once per process (well, once per `reset_for_tests`
+    // cycle) so the cold-start report can show when the LLM
+    // sidecar transitioned from "lazy" to "ready". The whole
+    // sidecar discovery / spawn path is opt-in — nothing in the
+    // bridge touches it until `llm_start` is invoked — so this is
+    // the canonical lazy-init boundary.
+    crate::perf::mark_llm_sidecar_ready();
     Ok(port)
 }
 

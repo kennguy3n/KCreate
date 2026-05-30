@@ -33,6 +33,7 @@ pub mod icc;
 pub mod marketplace;
 pub mod node;
 pub mod operation;
+pub mod operation_compress;
 pub mod project;
 pub mod token_binding;
 
@@ -64,6 +65,11 @@ pub use node::{
     PAGE_LAYOUT_METADATA_KEY, TEXT_FRAME_METADATA_KEY,
 };
 pub use operation::{Operation, OperationLog};
+pub use operation_compress::{
+    apply_diff, compress_operation, compute_diff, expand_operation, materialize_blob_refs,
+    replace_blobs_with_refs, CompressedOperation, DiffOp, PathSegment, BLOB_REF_MARKER,
+    INLINE_BLOB_MARKER,
+};
 pub use project::{
     builtin_layout_templates, BrandKit, DesignTokens, ExportFormat, ExportPreset, FontRef,
     LayoutTemplate, NamedColor, Project, ProjectError, SectionKind, ShadowToken, TemplateCategory,

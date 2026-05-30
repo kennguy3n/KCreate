@@ -37,6 +37,7 @@ kcreate_core = { path = "../kcreate_core" }
 kcreate_export = { path = "../kcreate_export" }
 kcreate_layout = { path = "../kcreate_layout" }
 kcreate_mcp = { path = "../kcreate_mcp" }
+kcreate_plugin = { path = "../kcreate_plugin" }
 kcreate_raster = { path = "../kcreate_raster" }
 kcreate_renderer = { path = "../kcreate_renderer" }
 kcreate_storage = { path = "../kcreate_storage" }
@@ -70,6 +71,11 @@ base64 = { workspace = true }
 # version pin as the bridge's own use to keep the proc-macro
 # crate de-duplicated in the dep graph.
 serial_test = "3"
+# Used by Phase 10 Block C integration test (export_ai.rs) to verify
+# that multi-page PDF assembly produces structurally-valid PDFs
+# (page count, /Outlines catalog entry). Not pulled into editing-path
+# crates — only into the integration-test crate.
+lopdf = { workspace = true }
 
 [lints]
 workspace = true

@@ -1292,7 +1292,274 @@ memory-pressure + autosave + export-validation robustness layer.
       **`apps/desktop/main/src/{bridge,main}.ts`** wire the
       IPC handlers + Bridge interface.
 
+## Phase 10 — Image Studio AI, Vector/Layout AI, Export AI, Brand Hub & Plugin Marketplace, Performance Hardening | Complete | 100%
+
+### Block A — Image Studio AI Actions (Tasks 1–6)
+- [x] **Task 1: AI denoise.** Non-local-means denoiser in
+      `crates/kcreate_ai/src/denoise.rs` (search-window patch
+      weighting, row-parallel via rayon). Bridge:
+      `ai_denoise(node_id, strength, search_radius, patch_radius)`
+      in `crates/kcreate_bridge/src/phase10.rs`. Records an
+      undoable operation. UI surface in `AIAssistPanel.tsx`
+      under "AI Filters". Tests in
+      `crates/kcreate_tests/tests/image_studio_ai.rs`.
+- [x] **Task 2: AI object removal / inpainting.** Exemplar-based
+      PatchMatch in `crates/kcreate_ai/src/inpaint.rs`
+      (multi-scale pyramid, parameterised patch size +
+      iterations). Bridge: `ai_inpaint(node_id, mask_json)`.
+      UI: "Remove Object" with rectangular/lasso mask input.
+- [x] **Task 3: AI auto color correction.** Histogram
+      equalisation + gray-world white balance + auto levels in
+      `crates/kcreate_ai/src/auto_color.rs`. Modes:
+      `AutoLevels | WhiteBalance | HistogramEqualization |
+      Combined`. Bridge: `ai_auto_color(node_id, mode)`.
+- [x] **Task 4: AI segmentation-based selection tool.** SAM
+      bridge with BFS smart-select fallback in
+      `crates/kcreate_bridge/src/phase10.rs::ai_segment_at_point`.
+      Positive + negative prompts surfaced via
+      `AIAssistPanel.tsx` "Smart Segment" action.
+- [x] **Task 5: Magic wand tool.** Dedicated tool mounted via
+      `apps/desktop/renderer/src/components/MagicWandTool.tsx`,
+      bridge `ai_smart_select_at_point(node_id, x, y,
+      tolerance, mode)` with `Replace | Add | Subtract`
+      cumulative mask semantics.
+- [x] **Task 6: Image Studio AI tests.** Coverage in
+      `crates/kcreate_tests/tests/image_studio_ai.rs` (12
+      tests: SNR improvement on synthetic noise, rectangular
+      mask inpaint, histogram bounds, segment fallback,
+      tolerance boundary, add/subtract modes).
+
+### Block B — Vector Studio & Layout Studio AI Features (Tasks 7–12)
+- [x] **Task 7: AI "match this stroke style".**
+      `crates/kcreate_ai/src/stroke_match.rs` extracts stroke
+      properties (width, dash, cap, join, profile, colour)
+      from a source vector node and applies them to targets.
+      Bridge: `ai_match_stroke(source_node_id,
+      target_node_ids_json)`.
+- [x] **Task 8: AI "extract glyph from photo".**
+      `crates/kcreate_ai/src/glyph_extract.rs` runs the trace
+      pipeline on a cropped raster region, simplifies +
+      normalises to a 1000-unit em-square. Bridge:
+      `ai_extract_glyph(node_id, region_json, em_size)`.
+- [x] **Task 9: AI "Reformat content into a 16:9 deck".**
+      `crates/kcreate_ai/src/reformat.rs` drives the LLM
+      sidecar with a GBNF grammar to propose per-page node
+      placements. Bridge: `ai_reformat_to_deck(page_id)`.
+- [x] **Task 10: AI "fit brief into a one-pager".**
+      `crates/kcreate_ai/src/one_pager.rs` materialises a
+      brief into a single-page layout with header/body/
+      callout/image-placeholder sections. Bridge:
+      `ai_brief_to_one_pager(brief_text, page_size)`.
+- [x] **Task 11: AI "harmonize this palette".**
+      `crates/kcreate_ai/src/palette_harmonize.rs`
+      (complementary / triadic / analogous / split-comp /
+      tetradic harmony rules in HSL). Bridge:
+      `ai_harmonize_palette(brand_kit_id, harmony_type)`.
+- [x] **Task 12: AI "suggest complementary type pairing".**
+      `crates/kcreate_ai/src/type_pairing.rs` LLM-suggests
+      body fonts filtered against `fontdb`. Bridge:
+      `ai_suggest_type_pairing(heading_font_name)`.
+
+### Block C — Export Center AI Features & Live Preview (Tasks 13–18)
+- [x] **Task 13: AI "Optimize this SVG".**
+      `crates/kcreate_export/src/svg_optimize.rs`: element-aware
+      optimiser (empty-group removal, redundant-transform
+      collapse, path-data shortening, default-attribute drop,
+      `<defs>` inlining) with `protected_regions` /
+      `with_unprotected` so it cannot mangle `<text>`,
+      `<style>`, or CDATA bodies. Bridge:
+      `export_optimize_svg(svg_string)` returns optimised
+      bytes + reduction stats.
+- [x] **Task 14: AI "compress raster without visible loss".**
+      `crates/kcreate_export/src/smart_compress.rs` binary-
+      searches JPEG/WebP quality against an SSIM target
+      (default 0.98) computed on 8×8 blocks, row-parallel via
+      rayon. Bridge: `export_smart_compress(node_id, format,
+      target_ssim)`.
+- [x] **Task 15: Live export preview.**
+      `apps/desktop/renderer/src/components/ExportPreviewPanel.tsx`
+      renders raster / SVG / PDF previews via
+      `export_preview(request_json)` (capped at 1024 px
+      longest side, 300 ms debounce).
+- [x] **Task 16: Floating contextual toolbar.**
+      `apps/desktop/renderer/src/components/FloatingToolbar.tsx`
+      follows the active selection, shows context-appropriate
+      actions for vector / text / raster / group nodes,
+      respects the user-preference toggle.
+- [x] **Task 17: AI/Illustrator SVG subset import.**
+      `crates/kcreate_export/src/ai_import.rs` parses `.ai`
+      (PDF-wrapped) files, extracts embedded SVG payloads
+      when present, falls back to `pdf_import` otherwise.
+      Bridge: `import_ai(path)`.
+- [x] **Task 18: Export & import tests.** Coverage in
+      `crates/kcreate_tests/tests/export_ai.rs` (24 tests:
+      SVG redundant-group removal, transform collapse, size
+      reduction, SSIM correctness, smart-compress
+      convergence, preview byte validity, PDF-with-SVG
+      extraction, fallback to PDF import).
+
+### Block D — Brand Hub AI + Plugin Marketplace (Tasks 19–24)
+- [x] **Task 19: AI "extend brand to brochure template".**
+      `crates/kcreate_ai/src/brand_template.rs` generates a
+      multi-page brochure with cover / content / back page
+      structures driven by brand-kit tokens. Bridge:
+      `ai_brand_to_brochure(brand_kit_id, num_pages)`.
+- [x] **Task 20: Plugin marketplace foundation.**
+      `crates/kcreate_plugin/src/marketplace.rs` mirrors
+      `TemplateMarketplace`: scans `~/.kcreate/plugins/`,
+      surfaces `PluginListing`, install-from-local + remove
+      flows with Ed25519 signature verification. Bridge:
+      `plugin_marketplace_list`,
+      `plugin_marketplace_install_local(path)`,
+      `plugin_marketplace_remove(id)`. UI: "Marketplace" tab
+      in `PluginManager.tsx`.
+- [x] **Task 21: Multi-page PDF export improvements.**
+      `crates/kcreate_export/src/pdf_multi.rs` adds TOC
+      generation from heading text nodes, PDF outline
+      bookmarks, page-numbering tokens per page, hyperlink
+      annotations from `Navigate` interactions, per-page
+      glyph-subset embedded fonts. Bridge:
+      `export_pdf_multi(options_json)`.
+- [x] **Task 22: Batch export progress UI.**
+      `apps/desktop/renderer/src/components/BatchExportProgress.tsx`
+      provides real-time per-asset progress, ETA, cancel,
+      retry-individual-asset, and summary panel on
+      completion (uses existing `export_batch_start /
+      _status / _cancel` bridge endpoints).
+- [x] **Task 23: Workspace preferences panel.**
+      `apps/desktop/renderer/src/components/PreferencesPanel.tsx`
+      surfaces General / Canvas / AI / Performance /
+      Shortcuts / Privacy sections, persisted via
+      `preferences_load()` and `preferences_save(json)` to
+      `~/.kcreate/preferences.json`.
+- [x] **Task 24: Block D tests.** Coverage in
+      `crates/kcreate_tests/tests/brand_plugin_ai.rs` (10
+      tests: brochure page count + token application,
+      marketplace scan + install + remove, PDF outline tree
+      + TOC, preferences round-trip).
+
+### Block E — Performance Validation & Hardening (Tasks 25–28)
+- [x] **Task 25: Acceptance-criteria perf benchmark suite.**
+      `crates/kcreate_tests/tests/acceptance_criteria.rs`
+      measures cold-start, 50 MB project open, 1000-node
+      pan/zoom frame time, 64 MP raster open, 50-asset
+      batch export. Regression tests with 2× target
+      margins. Bridge: `runtime_benchmark_cold_start_ms()`.
+- [x] **Task 26: Render pipeline optimisation — incremental
+      scene diff.** `crates/kcreate_bridge/src/scene_sync.rs`
+      tracks per-node `scene_version` + `DirtySet<Uuid>`,
+      reuses cached display-list entries for unchanged
+      nodes. Tests in
+      `crates/kcreate_tests/tests/incremental_sync.rs`
+      verify partial updates produce identical output to
+      full rebuilds.
+- [x] **Task 27: Undo/redo memory optimisation.**
+      `crates/kcreate_core/src/operation_compress.rs`
+      implements deterministic JSON delta compression
+      (`compute_diff`, `apply_diff`, `compress_operation`,
+      `expand_operation`) plus BLAKE3-addressed blob
+      reference swapping (`replace_blobs_with_refs`,
+      `materialize_blob_refs`) for large inline base64
+      payloads. Configurable via
+      `RuntimeConfig::{compress_undo_log,
+      undo_blob_threshold_bytes}`. Storage integration in
+      `crates/kcreate_storage/src/project_io.rs` encodes the
+      `__kcreateCompressedOpV1` sentinel on save and
+      auto-detects on load (legacy rows pass through
+      verbatim). 14 unit tests + 2 storage round-trip tests.
+- [x] **Task 28: Startup time optimisation.**
+      `tile_cache_lock()` is lazy-allocated and emits
+      `bridge.tile_cache.subsystem_ready` on first touch
+      (`TILE_CACHE_READY_MARKED` latch keeps it
+      idempotent). `memory_watchdog_start` emits
+      `bridge.memory_watchdog.subsystem_ready` only when
+      explicitly armed. `llm_start` calls
+      `mark_llm_sidecar_ready` on first successful sidecar
+      spawn. Cold startup now contains zero
+      `bridge.*.subsystem_ready` marks until something
+      actually touches each subsystem. 4 perf-module tests
+      assert the lazy contract.
+
+### Block F — Documentation & Polish (Tasks 29–30)
+- [x] **Task 29: PROGRESS.md + PHASES.md updated.** Phase 10
+      section added with every task checkbox accounted for;
+      Phase 8 / 9 headers reconfirmed at "Complete | 100%";
+      changelog entry below.
+- [x] **Task 30: README / ARCHITECTURE / AGENTS sync.**
+      README Stack table + modules section updated with
+      Phase 10 entries (NLM denoise, PatchMatch inpaint,
+      SSIM smart compress, SVG optimiser, plugin
+      marketplace, undo compression, lazy startup).
+      ARCHITECTURE §17o (Phase 10) documents the Image
+      Studio AI pipeline, Vector / Layout AI actions,
+      Export AI (SVG optimise / smart compress / live
+      preview), plugin marketplace, incremental scene sync,
+      undo compression, and startup lazy-init. AGENTS
+      "Where new code goes" table covers `denoise.rs`,
+      `inpaint.rs`, `auto_color.rs`, `stroke_match.rs`,
+      `glyph_extract.rs`, `reformat.rs`, `one_pager.rs`,
+      `palette_harmonize.rs`, `type_pairing.rs`,
+      `brand_template.rs`, `svg_optimize.rs`,
+      `smart_compress.rs`, `ai_import.rs`, `pdf_multi.rs`,
+      `phase10.rs`, `operation_compress.rs`,
+      `FloatingToolbar.tsx`, `ExportPreviewPanel.tsx`,
+      `BatchExportProgress.tsx`, `PreferencesPanel.tsx`,
+      `MagicWandTool.tsx`.
+
+### Phase 10 — Bridge & wire-format lockstep
+- [x] **`crates/kcreate_bridge/src/phase10.rs`** owns every
+      Phase 10 bridge entry point (`ai_denoise`,
+      `ai_inpaint`, `ai_auto_color`, `ai_segment_at_point`,
+      `ai_smart_select_at_point`, `ai_match_stroke`,
+      `ai_extract_glyph`, `ai_reformat_to_deck`,
+      `ai_brief_to_one_pager`, `ai_harmonize_palette`,
+      `ai_suggest_type_pairing`, `ai_brand_to_brochure`,
+      `export_optimize_svg`, `export_smart_compress`,
+      `export_preview`, `export_pdf_multi`, `import_ai`,
+      `plugin_marketplace_list`,
+      `plugin_marketplace_install_local`,
+      `plugin_marketplace_remove`, `preferences_load`,
+      `preferences_save`,
+      `runtime_benchmark_cold_start_ms`).
+- [x] **`crates/kcreate_bridge/src/lib.rs`** exposes the new
+      N-API entry points; `apps/desktop/shared/scene.ts`
+      mirrors every new type and request/response shape;
+      `apps/desktop/preload/src/preload.ts` and
+      `apps/desktop/main/src/{bridge,main}.ts` wire the IPC
+      handlers + Bridge interface in lockstep with the
+      Rust surface.
+
 ## Changelog
+
+- **2026-05-29 (PR #26)** — Phase 10: Image Studio AI
+  pipeline (NLM denoise, PatchMatch inpaint, auto-colour,
+  SAM segmentation tool, magic wand), Vector / Layout AI
+  (stroke match, glyph extract, deck reformat, one-pager,
+  brand-to-brochure), palette harmonisation + type pairing,
+  Export AI (element-aware SVG optimiser, SSIM smart
+  compress, live export preview, multi-page PDF with
+  outline/TOC/hyperlinks, AI/Illustrator import), plugin
+  marketplace foundation (scan / install-from-local /
+  remove with Ed25519 signature verification), preferences
+  panel persisted to `~/.kcreate/preferences.json`,
+  incremental scene sync via per-node version + dirty set,
+  undo-log delta compression + BLAKE3 blob reference
+  swapping, startup lazy-init for tile cache / LLM
+  sidecar / memory watchdog with cold-start timeline
+  marks. Every feature is wired through
+  `crates/kcreate_bridge/src/phase10.rs` + mirrored in
+  `apps/desktop/shared/scene.ts` and the preload / main
+  IPC layer. 66 new integration tests in
+  `crates/kcreate_tests/tests/`
+  (`image_studio_ai.rs`, `vector_layout_ai.rs`,
+  `export_ai.rs`, `brand_plugin_ai.rs`,
+  `acceptance_criteria.rs`, `incremental_sync.rs`),
+  plus 14 unit tests in `operation_compress.rs` and 2
+  storage round-trip tests in `project_io.rs`, plus 4
+  perf-module tests for the lazy subsystem-ready marks.
+  `local_first.rs` sentinel stays green — none of the new
+  dependencies pull networking into the editing-path
+  closure.
 
 - **2026-05-29 (PR #25)** — Phase 9: KChat extension depth
   (project browser, artifact preview cards, session status,

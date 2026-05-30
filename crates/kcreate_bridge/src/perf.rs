@@ -186,11 +186,27 @@ pub fn startup_timeline_json() -> String {
 /// without mixing parking_lot + std).
 pub fn tile_cache_lock() -> &'static Mutex<TileCache<TileKey>> {
     static CACHE: OnceLock<Mutex<TileCache<TileKey>>> = OnceLock::new();
-    CACHE.get_or_init(|| {
+    let m = CACHE.get_or_init(|| {
         let budget_bytes = current_budget_bytes();
         Mutex::new(TileCache::with_byte_budget(budget_bytes))
-    })
+    });
+    // Phase 10 Block E Task 28 — fire the lazy-init "ready" mark on
+    // first observation. The bool latch lives *outside* the
+    // OnceLock so `reset_for_tests` can re-arm it without having to
+    // drop the cache itself (OnceLock has no reset API). Cache
+    // construction happens at most once per process; the mark fires
+    // at most once per `reset_for_tests` cycle.
+    if !TILE_CACHE_READY_MARKED.swap(true, Ordering::SeqCst) {
+        mark("bridge.tile_cache.subsystem_ready");
+    }
+    m
 }
+
+/// Set when [`tile_cache_lock`] has emitted the `subsystem_ready`
+/// startup-timeline mark for this process. Cleared by
+/// [`reset_for_tests`] so test runs that exercise the cold-start path
+/// can re-observe the mark.
+static TILE_CACHE_READY_MARKED: AtomicBool = AtomicBool::new(false);
 
 /// Resync the global tile cache's budget from the current
 /// `RuntimeConfig`. Returns the count of evicted entries so the
@@ -395,8 +411,35 @@ pub fn memory_watchdog_start(poll_interval_ms: u64) -> bool {
     // rationale on why we don't let the JoinHandle drop on the
     // spawning thread.
     *state.handle.lock() = Some(handle);
+    // Phase 10 Block E Task 28 — startup-timeline marker for the
+    // explicit "watchdog is now armed" transition. Distinct from
+    // the tile-cache and llm marks because this one is *opt-in*:
+    // it only fires when the host invokes `memory_watchdog_start`,
+    // and we want a stable cold→ready signal that survives
+    // start/stop/start cycles within a single process. The latch
+    // is cleared in `reset_for_tests` so tests can re-observe it.
+    if !MEMORY_WATCHDOG_READY_MARKED.swap(true, Ordering::SeqCst) {
+        mark("bridge.memory_watchdog.subsystem_ready");
+    }
     true
 }
+
+/// See [`TILE_CACHE_READY_MARKED`].
+static MEMORY_WATCHDOG_READY_MARKED: AtomicBool = AtomicBool::new(false);
+
+/// Emit the LLM-sidecar lazy-init marker on the startup timeline
+/// (Phase 10 Block E Task 28). Idempotent across a process: only
+/// the first call after a `reset_for_tests` actually marks. Public
+/// so `crate::llm::llm_start` can fire it without poking the latch
+/// directly.
+pub fn mark_llm_sidecar_ready() {
+    if !LLM_SIDECAR_READY_MARKED.swap(true, Ordering::SeqCst) {
+        mark("bridge.llm_sidecar.subsystem_ready");
+    }
+}
+
+/// See [`TILE_CACHE_READY_MARKED`].
+static LLM_SIDECAR_READY_MARKED: AtomicBool = AtomicBool::new(false);
 
 /// Stop the background watcher. Returns `true` if it was running.
 /// The polling thread is woken via the shutdown condvar so it
@@ -479,12 +522,30 @@ pub(crate) fn reset_for_tests() {
     // upstream reset is in scope.
     startup::reset_for_tests();
     *INIT_DONE.lock() = false;
+    // Phase 10 Block E Task 28 — clear the subsystem-ready latches
+    // so the next test that exercises a lazy subsystem can
+    // re-observe its `.subsystem_ready` mark on the freshly reset
+    // timeline. Without this, the second test would silently miss
+    // the mark and produce a passing-but-meaningless assertion.
+    TILE_CACHE_READY_MARKED.store(false, Ordering::SeqCst);
+    MEMORY_WATCHDOG_READY_MARKED.store(false, Ordering::SeqCst);
+    LLM_SIDECAR_READY_MARKED.store(false, Ordering::SeqCst);
     // Re-seed budget from whatever the test's RuntimeConfig is.
     let budget = current_budget_bytes();
     let mut cache = tile_cache_lock().lock();
     cache.clear();
     let evicted = cache.set_budget(budget);
     drop(evicted);
+    // The above tile_cache_lock() touch re-fires the
+    // `tile_cache.subsystem_ready` mark (and re-arms
+    // `ensure_startup_initialized` via the inner `mark()` call),
+    // polluting any test that wants to assert the *cold* (untouched)
+    // state. Drop the timeline a second time and re-clear both
+    // latches so callers see exactly the same view they would on a
+    // freshly-loaded process.
+    startup::reset_for_tests();
+    *INIT_DONE.lock() = false;
+    TILE_CACHE_READY_MARKED.store(false, Ordering::SeqCst);
 }
 
 #[cfg(test)]
@@ -583,5 +644,89 @@ mod tests {
         assert_eq!(stats, back);
         assert_eq!(stats.entries, 1);
         assert_eq!(stats.bytes, 64);
+    }
+
+    /// Phase 10 Block E Task 28 — cold startup, before any subsystem
+    /// is touched, must NOT contain any `bridge.*.subsystem_ready`
+    /// marks. Confirms the lazy-init contract: nothing fires before
+    /// it is needed.
+    #[test]
+    #[serial]
+    fn cold_startup_emits_no_subsystem_ready_marks() {
+        reset_for_tests();
+        ensure_startup_initialized();
+        let report: kcreate_perf::Report =
+            serde_json::from_str(&startup_timeline_json()).expect("timeline is valid JSON");
+        let cold_marks: Vec<&str> = report
+            .marks
+            .iter()
+            .filter(|m| m.label.contains("subsystem_ready"))
+            .map(|m| m.label.as_str())
+            .collect();
+        assert!(
+            cold_marks.is_empty(),
+            "cold startup must not emit any subsystem_ready marks, got: {cold_marks:?}",
+        );
+    }
+
+    /// Phase 10 Block E Task 28 — first touch of the tile cache
+    /// fires `bridge.tile_cache.subsystem_ready`. Confirms the lazy
+    /// boundary lands in the timeline so the cold-start diagnostics
+    /// overlay can show "tile cache armed at T+Nms".
+    #[test]
+    #[serial]
+    fn first_tile_cache_touch_fires_subsystem_ready_mark() {
+        reset_for_tests();
+        let _ = tile_cache_lock();
+        let report: kcreate_perf::Report =
+            serde_json::from_str(&startup_timeline_json()).expect("timeline is valid JSON");
+        let count = report
+            .marks
+            .iter()
+            .filter(|m| m.label == "bridge.tile_cache.subsystem_ready")
+            .count();
+        assert_eq!(count, 1, "exactly one tile_cache subsystem_ready mark");
+    }
+
+    /// Phase 10 Block E Task 28 — repeated touches do NOT re-emit
+    /// the lazy-init mark. Idempotency comes from
+    /// `TILE_CACHE_READY_MARKED`.
+    #[test]
+    #[serial]
+    fn tile_cache_subsystem_ready_mark_is_idempotent() {
+        reset_for_tests();
+        for _ in 0..5 {
+            let _ = tile_cache_lock();
+        }
+        let report: kcreate_perf::Report =
+            serde_json::from_str(&startup_timeline_json()).expect("timeline is valid JSON");
+        let count = report
+            .marks
+            .iter()
+            .filter(|m| m.label == "bridge.tile_cache.subsystem_ready")
+            .count();
+        assert_eq!(count, 1, "mark must fire at most once per process");
+    }
+
+    /// Phase 10 Block E Task 28 — `mark_llm_sidecar_ready` is the
+    /// public entry point that `crate::llm::llm_start` calls. Hit
+    /// it directly so the test stays free of any external process
+    /// dependency (LlmSidecar::start would actually try to spawn a
+    /// llama-server binary).
+    #[test]
+    #[serial]
+    fn llm_sidecar_subsystem_ready_mark_fires_once() {
+        reset_for_tests();
+        mark_llm_sidecar_ready();
+        mark_llm_sidecar_ready();
+        mark_llm_sidecar_ready();
+        let report: kcreate_perf::Report =
+            serde_json::from_str(&startup_timeline_json()).expect("timeline is valid JSON");
+        let count = report
+            .marks
+            .iter()
+            .filter(|m| m.label == "bridge.llm_sidecar.subsystem_ready")
+            .count();
+        assert_eq!(count, 1);
     }
 }

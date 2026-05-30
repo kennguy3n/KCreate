@@ -32,6 +32,7 @@ pub mod llm;
 #[cfg(feature = "native_canvas")]
 pub mod native_canvas;
 pub mod perf;
+pub mod phase10;
 pub mod phase2;
 pub mod phase4;
 pub mod phase8;
@@ -5170,4 +5171,244 @@ pub fn autosave_recover() -> NapiResult<()> {
 #[napi]
 pub fn autosave_dismiss_recovery() -> NapiResult<()> {
     autosave::autosave_dismiss_recovery().map_err(map_doc_err)
+}
+
+// =====================================================================
+// Phase 10 — N-API wrappers (Image Studio AI, Vector/Layout AI,
+// Export AI + Live Preview, Brand Hub + Plugin Marketplace,
+// Preferences). Each entry point is a thin marshalling shim that
+// parses string-typed arguments coming over the napi boundary and
+// returns a JSON-serialised payload. The implementations all live in
+// `phase10.rs`; this layer only wires types.
+// =====================================================================
+
+// ---------- Block A: Image Studio AI ---------------------------------
+
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn ai_denoise(
+    node_id_str: String,
+    strength: f64,
+    search_radius: u32,
+    patch_radius: u32,
+) -> NapiResult<String> {
+    let node_id = parse_uuid(&node_id_str)?;
+    let res = phase10::ai_denoise(node_id, strength as f32, search_radius, patch_radius)
+        .map_err(map_doc_err)?;
+    json_out("ai_denoise", &res)
+}
+
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn ai_inpaint(
+    node_id_str: String,
+    mask_json: String,
+    patch_radius: Option<u32>,
+    num_iterations: Option<u32>,
+    pyramid_levels: Option<u32>,
+) -> NapiResult<String> {
+    let node_id = parse_uuid(&node_id_str)?;
+    let res = phase10::ai_inpaint(
+        node_id,
+        &mask_json,
+        patch_radius,
+        num_iterations,
+        pyramid_levels,
+    )
+    .map_err(map_doc_err)?;
+    json_out("ai_inpaint", &res)
+}
+
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn ai_auto_color(node_id_str: String, mode: String) -> NapiResult<String> {
+    let node_id = parse_uuid(&node_id_str)?;
+    let res = phase10::ai_auto_color(node_id, &mode).map_err(map_doc_err)?;
+    json_out("ai_auto_color", &res)
+}
+
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn ai_segment_at_point(
+    node_id_str: String,
+    point_x: u32,
+    point_y: u32,
+    is_positive: bool,
+) -> NapiResult<String> {
+    let node_id = parse_uuid(&node_id_str)?;
+    let res = phase10::ai_segment_at_point(node_id, point_x, point_y, is_positive)
+        .map_err(map_doc_err)?;
+    json_out("ai_segment_at_point", &res)
+}
+
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn ai_smart_select_at_point(
+    node_id_str: String,
+    x: u32,
+    y: u32,
+    tolerance: f64,
+    mode: String,
+    previous_mask_base64: Option<String>,
+) -> NapiResult<String> {
+    let node_id = parse_uuid(&node_id_str)?;
+    let prev = previous_mask_base64.as_deref();
+    let res = phase10::ai_smart_select_at_point(node_id, x, y, tolerance, &mode, prev)
+        .map_err(map_doc_err)?;
+    json_out("ai_smart_select_at_point", &res)
+}
+
+// ---------- Block B: Vector/Layout AI --------------------------------
+
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn ai_match_stroke(source_id_str: String, target_ids_json: String) -> NapiResult<String> {
+    let source_id = parse_uuid(&source_id_str)?;
+    let target_ids: Vec<String> = serde_json::from_str(&target_ids_json).map_err(|e| {
+        NapiError::new(
+            Status::InvalidArg,
+            format!("ai_match_stroke: bad target_ids json: {e}"),
+        )
+    })?;
+    let parsed: NapiResult<Vec<uuid::Uuid>> = target_ids.iter().map(|s| parse_uuid(s)).collect();
+    let parsed = parsed?;
+    let res = phase10::ai_match_stroke(source_id, &parsed).map_err(map_doc_err)?;
+    json_out("ai_match_stroke", &res)
+}
+
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn ai_extract_glyph(
+    node_id_str: String,
+    crop_x: u32,
+    crop_y: u32,
+    crop_width: u32,
+    crop_height: u32,
+    em_size: f64,
+) -> NapiResult<String> {
+    let node_id = parse_uuid(&node_id_str)?;
+    let res = phase10::ai_extract_glyph(node_id, crop_x, crop_y, crop_width, crop_height, em_size)
+        .map_err(map_doc_err)?;
+    json_out("ai_extract_glyph", &res)
+}
+
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn ai_reformat_to_deck(page_id_str: String) -> NapiResult<String> {
+    let page_id = parse_uuid(&page_id_str)?;
+    let res = phase10::ai_reformat_to_deck(page_id).map_err(map_doc_err)?;
+    json_out("ai_reformat_to_deck", &res)
+}
+
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn ai_brief_to_one_pager(brief: String, page_size: Option<String>) -> NapiResult<String> {
+    let res = phase10::ai_brief_to_one_pager(&brief, page_size.as_deref()).map_err(map_doc_err)?;
+    json_out("ai_brief_to_one_pager", &res)
+}
+
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn ai_harmonize_palette(brand_kit_id_str: String, harmony_type: String) -> NapiResult<String> {
+    let brand_kit_id = parse_uuid(&brand_kit_id_str)?;
+    let res = phase10::ai_harmonize_palette(brand_kit_id, &harmony_type).map_err(map_doc_err)?;
+    json_out("ai_harmonize_palette", &res)
+}
+
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn ai_suggest_type_pairing(heading_font_name: String) -> NapiResult<String> {
+    let res = phase10::ai_suggest_type_pairing(&heading_font_name).map_err(map_doc_err)?;
+    json_out("ai_suggest_type_pairing", &res)
+}
+
+// ---------- Block C: Export AI + Live Preview ------------------------
+
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn export_optimize_svg(svg: String) -> NapiResult<String> {
+    let res = phase10::export_optimize_svg(&svg).map_err(map_doc_err)?;
+    json_out("export_optimize_svg", &res)
+}
+
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn export_smart_compress(
+    node_id_str: String,
+    format: String,
+    target_ssim: Option<f64>,
+) -> NapiResult<String> {
+    let node_id = parse_uuid(&node_id_str)?;
+    let res = phase10::export_smart_compress(node_id, &format, target_ssim).map_err(map_doc_err)?;
+    json_out("export_smart_compress", &res)
+}
+
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn export_preview(request_json: String) -> NapiResult<String> {
+    let req: phase10::ExportPreviewRequest = serde_json::from_str(&request_json).map_err(|e| {
+        NapiError::new(
+            Status::InvalidArg,
+            format!("export_preview: bad request json: {e}"),
+        )
+    })?;
+    let res = phase10::export_preview(req).map_err(map_doc_err)?;
+    json_out("export_preview", &res)
+}
+
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn import_ai(path: String) -> NapiResult<String> {
+    let res = phase10::import_ai(&path).map_err(map_doc_err)?;
+    json_out("import_ai", &res)
+}
+
+// ---------- Block D: Brand Hub + Plugin Marketplace ------------------
+
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn ai_brand_to_brochure(brand_kit_id_str: String, num_pages: u32) -> NapiResult<String> {
+    let brand_kit_id = parse_uuid(&brand_kit_id_str)?;
+    let res = phase10::ai_brand_to_brochure(brand_kit_id, num_pages).map_err(map_doc_err)?;
+    json_out("ai_brand_to_brochure", &res)
+}
+
+#[napi]
+pub fn plugin_marketplace_list() -> NapiResult<String> {
+    let res = phase10::plugin_marketplace_list().map_err(map_doc_err)?;
+    json_out("plugin_marketplace_list", &res)
+}
+
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn plugin_marketplace_install_local(path: String) -> NapiResult<String> {
+    let res = phase10::plugin_marketplace_install_local(&path).map_err(map_doc_err)?;
+    json_out("plugin_marketplace_install_local", &res)
+}
+
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn plugin_marketplace_remove(id: String) -> NapiResult<bool> {
+    phase10::plugin_marketplace_remove(&id).map_err(map_doc_err)
+}
+
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn export_pdf_multi(options_json: String, output_path: String) -> NapiResult<String> {
+    let res = phase10::export_pdf_multi(&options_json, &output_path).map_err(map_doc_err)?;
+    json_out("export_pdf_multi", &res)
+}
+
+// ---------- Block D Task 23: Preferences -----------------------------
+
+#[napi]
+pub fn preferences_load() -> NapiResult<String> {
+    let res = phase10::preferences_load().map_err(map_doc_err)?;
+    json_out("preferences_load", &res)
+}
+
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn preferences_save(prefs_json: String) -> NapiResult<()> {
+    phase10::preferences_save(&prefs_json).map_err(map_doc_err)
 }

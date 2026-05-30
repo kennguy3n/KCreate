@@ -220,6 +220,26 @@ import type {
   MemoryPressureEvent,
   AutosaveStatus,
   AutosaveMarker,
+  Phase10Bridge,
+  DenoiseResult,
+  InpaintResult,
+  AutoColorResult,
+  SegmentAtPointResult,
+  SmartSelectAtPointResult,
+  StrokeMatchSummary,
+  ExtractedGlyphResult,
+  ReformatDeckResult,
+  BriefToOnePagerResult,
+  HarmonyResult,
+  TypePairingResult,
+  SvgOptimizeReport,
+  SmartCompressReport,
+  ExportPreviewResponse,
+  AiImportSummary,
+  BrochurePlanResult,
+  PluginListing,
+  PdfMultiReport,
+  Preferences,
 } from "../../shared/scene";
 
 type FrameInfoSnake = {
@@ -3381,6 +3401,217 @@ const phase9: Phase9Bridge = {
   },
 };
 
+// ---------------------------------------------------------------------------
+// Phase 10 — Image Studio AI, Vector/Layout AI, Export AI + Live Preview,
+// Brand Hub + Plugin Marketplace, Preferences. See `Phase10Bridge`
+// in shared/scene.ts for the contract and `crates/kcreate_bridge/src/
+// phase10.rs` for the Rust side.
+// ---------------------------------------------------------------------------
+
+const phase10: Phase10Bridge = {
+  // ---- Block A — Image Studio AI ------------------------------------------
+  async aiDenoise(nodeId, strength, searchRadius, patchRadius) {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/phase10/ai/denoise",
+      nodeId,
+      strength,
+      searchRadius,
+      patchRadius,
+    )) as string;
+    return JSON.parse(raw) as DenoiseResult;
+  },
+  async aiInpaint(nodeId, maskRects, patchRadius, numIterations, pyramidLevels) {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/phase10/ai/inpaint",
+      nodeId,
+      JSON.stringify(maskRects),
+      patchRadius,
+      numIterations,
+      pyramidLevels,
+    )) as string;
+    return JSON.parse(raw) as InpaintResult;
+  },
+  async aiAutoColor(nodeId, mode) {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/phase10/ai/auto-color",
+      nodeId,
+      mode,
+    )) as string;
+    return JSON.parse(raw) as AutoColorResult;
+  },
+  async aiSegmentAtPoint(nodeId, pointX, pointY, isPositive) {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/phase10/ai/segment-at-point",
+      nodeId,
+      pointX,
+      pointY,
+      isPositive,
+    )) as string;
+    return JSON.parse(raw) as SegmentAtPointResult;
+  },
+  async aiSmartSelectAtPoint(
+    nodeId,
+    x,
+    y,
+    tolerance,
+    mode,
+    previousMaskBase64,
+  ) {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/phase10/ai/smart-select-at-point",
+      nodeId,
+      x,
+      y,
+      tolerance,
+      mode,
+      previousMaskBase64,
+    )) as string;
+    return JSON.parse(raw) as SmartSelectAtPointResult;
+  },
+
+  // ---- Block B — Vector/Layout AI -----------------------------------------
+  async aiMatchStroke(sourceId, targetIds) {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/phase10/ai/match-stroke",
+      sourceId,
+      targetIds,
+    )) as string;
+    return JSON.parse(raw) as StrokeMatchSummary;
+  },
+  async aiExtractGlyph(
+    nodeId,
+    cropX,
+    cropY,
+    cropWidth,
+    cropHeight,
+    emSize,
+  ) {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/phase10/ai/extract-glyph",
+      nodeId,
+      cropX,
+      cropY,
+      cropWidth,
+      cropHeight,
+      emSize,
+    )) as string;
+    return JSON.parse(raw) as ExtractedGlyphResult;
+  },
+  async aiReformatToDeck(pageId) {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/phase10/ai/reformat-to-deck",
+      pageId,
+    )) as string;
+    return JSON.parse(raw) as ReformatDeckResult;
+  },
+  async aiBriefToOnePager(brief, pageSize) {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/phase10/ai/brief-to-one-pager",
+      brief,
+      pageSize,
+    )) as string;
+    return JSON.parse(raw) as BriefToOnePagerResult;
+  },
+  async aiHarmonizePalette(brandKitId, harmonyType) {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/phase10/ai/harmonize-palette",
+      brandKitId,
+      harmonyType,
+    )) as string;
+    return JSON.parse(raw) as HarmonyResult;
+  },
+  async aiSuggestTypePairing(headingFontName) {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/phase10/ai/suggest-type-pairing",
+      headingFontName,
+    )) as string;
+    return JSON.parse(raw) as TypePairingResult;
+  },
+
+  // ---- Block C — Export AI + Live Preview ---------------------------------
+  async exportOptimizeSvg(svg) {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/phase10/export/optimize-svg",
+      svg,
+    )) as string;
+    return JSON.parse(raw) as SvgOptimizeReport;
+  },
+  async exportSmartCompress(nodeId, format, targetSsim) {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/phase10/export/smart-compress",
+      nodeId,
+      format,
+      targetSsim,
+    )) as string;
+    return JSON.parse(raw) as SmartCompressReport;
+  },
+  async exportPreview(request) {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/phase10/export/preview",
+      JSON.stringify(request),
+    )) as string;
+    return JSON.parse(raw) as ExportPreviewResponse;
+  },
+  async importAi(path) {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/phase10/import/ai",
+      path,
+    )) as string;
+    return JSON.parse(raw) as AiImportSummary;
+  },
+
+  // ---- Block D — Brand Hub + Plugin Marketplace ---------------------------
+  async aiBrandToBrochure(brandKitId, numPages) {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/phase10/ai/brand-to-brochure",
+      brandKitId,
+      numPages,
+    )) as string;
+    return JSON.parse(raw) as BrochurePlanResult;
+  },
+  async pluginMarketplaceList() {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/phase10/plugin-marketplace/list",
+    )) as string;
+    return JSON.parse(raw) as PluginListing[];
+  },
+  async pluginMarketplaceInstallLocal(path) {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/phase10/plugin-marketplace/install-local",
+      path,
+    )) as string;
+    return JSON.parse(raw) as PluginListing;
+  },
+  async pluginMarketplaceRemove(id) {
+    return (await ipcRenderer.invoke(
+      "kcreate/phase10/plugin-marketplace/remove",
+      id,
+    )) as boolean;
+  },
+  async exportPdfMulti(options, outputPath) {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/phase10/export/pdf-multi",
+      JSON.stringify(options),
+      outputPath,
+    )) as string;
+    return JSON.parse(raw) as PdfMultiReport;
+  },
+
+  // ---- Block D Task 23 — Preferences --------------------------------------
+  async preferencesLoad() {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/phase10/preferences/load",
+    )) as string;
+    return JSON.parse(raw) as Preferences;
+  },
+  async preferencesSave(prefs) {
+    await ipcRenderer.invoke(
+      "kcreate/phase10/preferences/save",
+      JSON.stringify(prefs),
+    );
+  },
+};
+
 contextBridge.exposeInMainWorld("kcreate", {
   renderer,
   document,
@@ -3427,6 +3658,7 @@ contextBridge.exposeInMainWorld("kcreate", {
   clipboard,
   phase8,
   phase9,
+  phase10,
   projectEncryption,
   annotation,
 });

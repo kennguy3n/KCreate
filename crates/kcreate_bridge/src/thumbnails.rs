@@ -620,7 +620,7 @@ fn build_scene_for_target(ws: &mut Workspace, target: ThumbnailTarget) -> Scene 
     // selection so highlight overlays aren't baked into thumbnails.
     let mut scene =
         ws.scene_sync
-            .sync_document_to_scene(&ws.project.document, Some(ws.store.blobs()), &[]);
+            .sync_document_to_scene(&mut ws.project.document, Some(ws.store.blobs()), &[]);
     // Translate so the target bounds land at the renderer origin —
     // mirroring `kcreate_export::slice::translate_scene`.
     let dx = -target.bounds.x as f32;

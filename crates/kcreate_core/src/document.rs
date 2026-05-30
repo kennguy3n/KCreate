@@ -4,14 +4,73 @@
 //! Cycle detection: every `reparent_node` walks the prospective parent
 //! chain to ensure the operation does not introduce a cycle. Empty
 //! children vectors are skipped, so the walk is O(depth).
+//!
+//! ## Phase 11 Block A — incremental sync support
+//!
+//! [`DocumentGraph`] tracks an explicit per-sync dirty set so the
+//! scene-sync layer can skip nodes that did not change since the
+//! previous walk. Every mutation method below marks the affected
+//! node(s) via [`DocumentGraph::mark_dirty`] and flips
+//! [`DocumentGraph::structure_dirty`] when the tree shape (insertions,
+//! removals, reparents, reorders) changes. The scene-sync code calls
+//! [`DocumentGraph::drain_dirty`] at the start of each sync to take
+//! ownership of the set and reset it.
+//!
+//! A lazily-built R-tree spatial index (rstar) backs
+//! [`DocumentGraph::query_point`] for O(log N) hit testing on large
+//! documents. The index is rebuilt opportunistically on the first
+//! query after a structural change or a node-bounds change; reads
+//! that do not mutate the graph reuse the cached tree across syncs.
+//! Held as `Option<RTree<...>>` so the zero-cost path stays free when
+//! the document never gets queried spatially (CI, headless export).
+//!
+//! Finally, a process-wide [`DocumentGraph::document_version`] counter
+//! bumps on every mutation so external observers (renderer, IPC
+//! pollers) can short-circuit "has anything changed?" checks without
+//! re-walking the tree.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 
+use rstar::{Envelope, PointDistance, RTree, RTreeObject, AABB};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
 use crate::node::{Bounds, Node, NodeType};
+
+/// One R-tree entry: a node id with its current world-space
+/// rectangle. Wrapping the raw bounds keeps the rstar dependency
+/// internal to this module.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct SpatialEntry {
+    id: Uuid,
+    /// `[xmin, ymin]` / `[xmax, ymax]`; same convention as
+    /// `kcreate_vector::spatial_index`.
+    aabb: AABB<[f64; 2]>,
+}
+
+impl RTreeObject for SpatialEntry {
+    type Envelope = AABB<[f64; 2]>;
+
+    fn envelope(&self) -> Self::Envelope {
+        self.aabb
+    }
+}
+
+impl PointDistance for SpatialEntry {
+    fn distance_2(&self, point: &[f64; 2]) -> f64 {
+        self.aabb.distance_2(point)
+    }
+
+    fn contains_point(&self, point: &[f64; 2]) -> bool {
+        self.aabb.contains_point(point)
+    }
+}
+
+fn bounds_to_aabb(b: Bounds) -> AABB<[f64; 2]> {
+    AABB::from_corners([b.x, b.y], [b.x + b.width, b.y + b.height])
+}
 
 /// Errors returned by [`DocumentGraph`].
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -42,16 +101,223 @@ pub type Result<T> = std::result::Result<T, DocumentError>;
 /// Roots are typically the [`crate::node::NodeType::Page`] nodes of the
 /// document. The root-id list lets us iterate top-level pages without
 /// scanning every node.
+///
+/// **Phase 11 Block A.** Three new transient fields back the
+/// incremental sync / hit-test path:
+///
+/// * `dirty` — set of node ids touched since the last
+///   [`drain_dirty`](Self::drain_dirty). Skipped during
+///   serialisation so on-disk projects stay byte-identical.
+/// * `structure_dirty` — `true` after inserts / removes / reparents /
+///   reorders. Forces a full sync re-walk because container z-order
+///   shifted.
+/// * `spatial_index` — lazily rebuilt R-tree used by
+///   [`query_point`](Self::query_point).
+/// * `version` — monotonically increasing counter for MVCC-style
+///   change detection.
+///
+/// `#[serde(skip)]` on each so [`DocumentGraph::from_parts`] paths
+/// (project load) get the defaults via `Default` and don't need to
+/// serialise any of this.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DocumentGraph {
     nodes: HashMap<Uuid, Node>,
     root_ids: Vec<Uuid>,
+    /// Per-sync dirty set. Populated by every mutation method below;
+    /// drained by [`drain_dirty`].
+    #[serde(skip)]
+    dirty: HashSet<Uuid>,
+    /// `true` when the tree shape (children list, root list, parent
+    /// pointers) changed since the last [`drain_dirty`]. Forces a
+    /// full scene-sync rebuild.
+    #[serde(skip)]
+    structure_dirty: bool,
+    /// Lazily-built spatial index. `None` until the first
+    /// [`query_point`] / [`rebuild_spatial_index`] call, then
+    /// invalidated whenever `structure_dirty` flips or a bounds
+    /// change lands in `dirty`.
+    #[serde(skip)]
+    spatial_index: Option<RTree<SpatialEntry>>,
+    /// Monotonic version counter. Bumped on every mutation by
+    /// [`bump_version`]; readable lock-free via
+    /// [`document_version`]. Stored on a regular field (not the
+    /// process-wide atomic in [`DOCUMENT_VERSION_GLOBAL`]) so
+    /// snapshot-style undo/redo replaying historical projects
+    /// doesn't bleed counters across documents.
+    #[serde(skip)]
+    version: u64,
+}
+
+/// Process-wide monotonic counter mirroring the active workspace's
+/// document_version. The bridge updates this from
+/// [`bump_version`] so renderer-side pollers can do a single
+/// `AtomicU64::load` without re-acquiring the workspace lock — the
+/// hot-path "has the document changed?" test used by the React
+/// renderer's `requestAnimationFrame` loop.
+///
+/// **Important**: this is process-global so the bridge layer is
+/// responsible for resetting it when the active workspace closes /
+/// reopens. Tests can read it directly via [`document_version_global`].
+static DOCUMENT_VERSION_GLOBAL: AtomicU64 = AtomicU64::new(0);
+
+/// Read the process-wide document version counter without taking any
+/// lock. Bumped by every [`bump_version`] call across every active
+/// document. The bridge plumbs this through the N-API
+/// `document_version()` export (Phase 11 Block D Task 21).
+#[must_use]
+pub fn document_version_global() -> u64 {
+    DOCUMENT_VERSION_GLOBAL.load(Ordering::Acquire)
+}
+
+/// Reset the process-wide counter to zero. Only used by tests and by
+/// the bridge on `reset_for_tests`.
+pub fn reset_document_version_global() {
+    DOCUMENT_VERSION_GLOBAL.store(0, Ordering::Release);
 }
 
 impl DocumentGraph {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    // ------------------------------------------------------------------
+    // Phase 11 Block A — dirty tracking + version + spatial index
+    // ------------------------------------------------------------------
+
+    /// Mark `id` as dirty so the next [`drain_dirty`] yields it. Safe
+    /// to call even when `id` is not present (the scene-sync layer
+    /// will skip missing ids on replay). Bumps the process-wide
+    /// version counter so renderer pollers detect a change.
+    pub fn mark_dirty(&mut self, id: Uuid) {
+        self.dirty.insert(id);
+        self.bump_version();
+        // A pure-property change does NOT invalidate the spatial
+        // index unless `bounds` actually moved — callers that
+        // re-position a node go through `mark_bounds_changed`.
+    }
+
+    /// Explicitly mark `id`'s bounds as having changed. Bumps the
+    /// dirty set, invalidates the spatial index, and bumps the
+    /// version counter. Use this from any path that mutates a node's
+    /// `bounds` (auto-layout, drag handles, the bridge's
+    /// `document_update_node`).
+    pub fn mark_bounds_changed(&mut self, id: Uuid) {
+        self.dirty.insert(id);
+        self.spatial_index = None;
+        self.bump_version();
+    }
+
+    /// Mark the tree shape as dirty (insertions / removals /
+    /// reparents / reorders). Forces a full scene-sync rebuild on
+    /// the next drain. Also invalidates the spatial index since
+    /// node identity (and therefore z-order) shifted.
+    pub fn mark_structure_dirty(&mut self) {
+        self.structure_dirty = true;
+        self.spatial_index = None;
+        self.bump_version();
+    }
+
+    /// Take ownership of the per-sync dirty set + structure flag and
+    /// reset both. Callers (notably
+    /// `kcreate_bridge::scene_sync::sync_document_to_scene`) use the
+    /// result to short-circuit unchanged nodes between syncs.
+    pub fn drain_dirty(&mut self) -> (HashSet<Uuid>, bool) {
+        let set = std::mem::take(&mut self.dirty);
+        let structure = std::mem::replace(&mut self.structure_dirty, false);
+        (set, structure)
+    }
+
+    /// Peek the current dirty set without resetting it. Used by
+    /// diagnostics and unit tests.
+    #[must_use]
+    pub fn dirty(&self) -> &HashSet<Uuid> {
+        &self.dirty
+    }
+
+    /// `true` if the tree shape has changed since the last
+    /// [`drain_dirty`].
+    #[must_use]
+    pub const fn structure_dirty(&self) -> bool {
+        self.structure_dirty
+    }
+
+    /// Current document version counter. Bumped on every mutation.
+    /// Renderer-side change detection compares this against the
+    /// previously-observed value to skip redundant
+    /// `document.getTree()` IPC round-trips.
+    #[must_use]
+    pub const fn document_version(&self) -> u64 {
+        self.version
+    }
+
+    /// Bump the per-document version + the process-wide global. The
+    /// global lets the bridge expose a lock-free reader to the
+    /// renderer (Phase 11 Block D Task 21).
+    fn bump_version(&mut self) {
+        self.version = self.version.wrapping_add(1);
+        DOCUMENT_VERSION_GLOBAL.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Rebuild the spatial index from scratch using rstar's
+    /// O(n log n) bulk loader. Called lazily by [`query_point`] when
+    /// the cached index is absent. Exposed so callers (e.g. perf
+    /// tests) can force a rebuild without going through a query.
+    pub fn rebuild_spatial_index(&mut self) {
+        let entries: Vec<SpatialEntry> = self
+            .nodes
+            .values()
+            .filter(|n| n.visible && n.bounds.width > 0.0 && n.bounds.height > 0.0)
+            .map(|n| SpatialEntry {
+                id: n.id,
+                aabb: bounds_to_aabb(n.bounds),
+            })
+            .collect();
+        self.spatial_index = Some(RTree::bulk_load(entries));
+    }
+
+    /// All visible node ids whose `bounds` contain `(x, y)`. Returns
+    /// topmost-first, with the topmost defined as: greatest depth in
+    /// the tree (descendants render on top of ancestors), breaking
+    /// ties by stable iteration order. The container ancestors of
+    /// each hit are returned **above** the hit so prototype hotspot
+    /// resolution can walk parent → child if no leaf claims the
+    /// click.
+    ///
+    /// Triggers a lazy rebuild of the spatial index if it's been
+    /// invalidated since the last query. Subsequent queries against
+    /// an unchanged document are O(log N + k) where k is the
+    /// candidate count.
+    pub fn query_point(&mut self, x: f64, y: f64) -> Vec<Uuid> {
+        if self.spatial_index.is_none() {
+            self.rebuild_spatial_index();
+        }
+        let tree = self.spatial_index.as_ref().expect("just built");
+        let mut hits: Vec<(Uuid, usize)> = tree
+            .locate_all_at_point(&[x, y])
+            .filter_map(|entry| {
+                self.nodes.get(&entry.id).filter(|n| n.visible).map(|_| {
+                    let depth = self.depth_of(entry.id);
+                    (entry.id, depth)
+                })
+            })
+            .collect();
+        // Sort by descending depth so leaves come first.
+        hits.sort_by_key(|hit| std::cmp::Reverse(hit.1));
+        hits.into_iter().map(|(id, _)| id).collect()
+    }
+
+    /// Depth of `id` in the document tree (roots are depth 0).
+    /// Implementation detail used by [`query_point`] for z-order
+    /// resolution.
+    fn depth_of(&self, id: Uuid) -> usize {
+        let mut depth = 0usize;
+        let mut cursor = self.nodes.get(&id).and_then(|n| n.parent_id);
+        while let Some(p) = cursor {
+            depth += 1;
+            cursor = self.nodes.get(&p).and_then(|n| n.parent_id);
+        }
+        depth
     }
 
     /// Build a graph from a pre-existing collection of nodes plus an
@@ -81,6 +347,7 @@ impl DocumentGraph {
         Ok(Self {
             nodes: map,
             root_ids,
+            ..Self::default()
         })
     }
 
@@ -104,10 +371,13 @@ impl DocumentGraph {
                     parent.children.push(id);
                     parent.touch();
                 }
+                self.dirty.insert(pid);
             }
         } else if !self.root_ids.contains(&id) {
             self.root_ids.push(id);
         }
+        self.dirty.insert(id);
+        self.mark_structure_dirty();
         Ok(id)
     }
 
@@ -119,7 +389,22 @@ impl DocumentGraph {
 
     /// Mutably borrow a node by id. The caller is responsible for
     /// calling [`Node::touch`] when mutating.
+    ///
+    /// **Phase 11 Block A.** This intentionally marks the node dirty
+    /// even though the caller may not actually mutate — every
+    /// `get_node_mut` site in the bridge layer mutates, and the
+    /// extra dirty entry costs one `HashSet::insert`. Callers that
+    /// truly need a read should use [`get_node`].
     pub fn get_node_mut(&mut self, id: Uuid) -> Option<&mut Node> {
+        if self.nodes.contains_key(&id) {
+            self.dirty.insert(id);
+            // Bounds-change-by-default conservatism: assume callers
+            // may move the node. The cheap pessimistic invalidation
+            // is preferable to silently serving stale spatial-index
+            // hits.
+            self.spatial_index = None;
+            self.bump_version();
+        }
         self.nodes.get_mut(&id)
     }
 
@@ -133,6 +418,7 @@ impl DocumentGraph {
                 parent.children.retain(|c| *c != id);
                 parent.touch();
             }
+            self.dirty.insert(pid);
         } else {
             self.root_ids.retain(|c| *c != id);
         }
@@ -146,6 +432,8 @@ impl DocumentGraph {
             }
             self.remove_node(kid);
         }
+        self.dirty.insert(id);
+        self.mark_structure_dirty();
         Some(node)
     }
 
@@ -202,6 +490,14 @@ impl DocumentGraph {
             n.parent_id = new_parent;
             n.touch();
         }
+        self.dirty.insert(id);
+        if let Some(pid) = new_parent {
+            self.dirty.insert(pid);
+        }
+        if let Some(pid) = old_parent {
+            self.dirty.insert(pid);
+        }
+        self.mark_structure_dirty();
         Ok(())
     }
 
@@ -228,6 +524,11 @@ impl DocumentGraph {
         }
         parent.children = new_order.to_vec();
         parent.touch();
+        self.dirty.insert(parent_id);
+        // Reorders don't change membership but do change z-order, so
+        // we flag structure_dirty: scene-sync iterates children in
+        // list-order and emits them in z-stream order.
+        self.mark_structure_dirty();
         Ok(())
     }
 
@@ -492,6 +793,7 @@ impl DocumentGraph {
         }
         node.bounds = new_bounds;
         node.touch();
+        self.mark_bounds_changed(artboard_id);
         Ok(())
     }
 }

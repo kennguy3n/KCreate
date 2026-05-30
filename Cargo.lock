@@ -1917,6 +1917,7 @@ dependencies = [
  "blake3",
  "chrono",
  "log",
+ "rstar",
  "serde",
  "serde_json",
  "sys-info",

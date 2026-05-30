@@ -81,6 +81,17 @@ impl CpuBackend {
                         self.draw_path(&pb, *style, transform);
                     }
                 }
+                DisplayCommand::BatchedRects { rects, style } => {
+                    // Phase 11 Block A Task 5 — pixel-equivalent to
+                    // a sequence of FillRect commands; the GPU
+                    // backend will swap this for an instanced draw
+                    // in a future phase.
+                    for rect in rects {
+                        if let Some(pb) = path_for_rect(*rect) {
+                            self.draw_path(&pb, *style, transform);
+                        }
+                    }
+                }
                 DisplayCommand::FillCircle {
                     center,
                     radius,

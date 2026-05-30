@@ -21,7 +21,7 @@
 use std::hash::{Hash, Hasher};
 
 use crate::display_list::{DisplayCommand, DisplayList};
-use crate::geometry::{Color, PathCommand, Stroke, Style};
+use crate::geometry::{Color, PathCommand, Rect, Stroke, Style};
 use crate::scene::{Object, ObjectKind, Scene};
 use crate::viewport::Viewport;
 
@@ -149,6 +149,7 @@ fn hash_object(o: &Object, h: &mut impl Hasher) {
             pixels_width,
             pixels_height,
             pixels,
+            content_hash,
         } => {
             4u8.hash(h);
             rect.x.to_bits().hash(h);
@@ -157,14 +158,24 @@ fn hash_object(o: &Object, h: &mut impl Hasher) {
             rect.height.to_bits().hash(h);
             pixels_width.hash(h);
             pixels_height.hash(h);
-            // Hash the byte-length plus a content fingerprint so two
-            // images with the same dimensions but different pixels
-            // produce distinct fingerprints. We blake-hash the buffer
-            // once via the std SipHash that the rest of this file
-            // uses (Hasher::write).
-            pixels.len().hash(h);
-            for chunk in pixels.chunks(4096) {
-                chunk.hash(h);
+            // **Phase 11 Block A Task 3 — content-addressed fingerprint.**
+            //
+            // When the scene-sync layer attached a token derived from
+            // the blob store's BLAKE3 hash, hash 8 bytes instead of
+            // the (potentially 100MB) pixel buffer. For a 4000×3000
+            // RGBA image this collapses ~48MB of byte-wise SipHash
+            // into 8 bytes — the entire reason this field exists.
+            //
+            // Synthetic / in-memory rasters (no blob, no token) fall
+            // back to chunked pixel hashing so the fingerprint is
+            // still pixel-accurate.
+            if let Some(token) = content_hash {
+                token.hash(h);
+            } else {
+                pixels.len().hash(h);
+                for chunk in pixels.chunks(4096) {
+                    chunk.hash(h);
+                }
             }
         }
         ObjectKind::Text {
@@ -231,8 +242,102 @@ impl Pipeline {
             let cmd = DisplayList::command_from_object(obj);
             list.push_from_object(cmd, obj);
         }
+        // Phase 11 Block A Task 5 — coalesce runs of same-style
+        // FillRects into BatchedRects to cut draw-call count on
+        // artboard-heavy scenes. Pixel output is identical because
+        // the rasterizer iterates the rect list with the same style.
+        let list = batch_consecutive_rects(list);
         self.cache = Some((fp, list.clone()));
         list
+    }
+}
+
+/// **Phase 11 Block A Task 5 — display-list rect batching.**
+///
+/// Walks `list` in order and folds maximal runs of
+/// [`DisplayCommand::FillRect`] entries with the same [`Style`] into a
+/// single [`DisplayCommand::BatchedRects`]. The world-bounds /
+/// origins / `cmd_bounds` parallel arrays are kept in lockstep: the
+/// batch's bounds is the union of the constituents' bounds, and the
+/// batch inherits `origins[i] = None` so per-object lookup callers
+/// (display-list cache invalidation, hit-testing) treat it as
+/// derived.
+///
+/// Runs of length 1 stay as a plain [`DisplayCommand::FillRect`] so
+/// the common single-rect case pays no overhead. Heterogeneous-style
+/// neighbours pass through unchanged.
+fn batch_consecutive_rects(list: DisplayList) -> DisplayList {
+    let DisplayList {
+        commands,
+        world_bounds,
+        origins,
+        cmd_bounds,
+    } = list;
+    let mut out_commands: Vec<DisplayCommand> = Vec::with_capacity(commands.len());
+    let mut out_origins: Vec<Option<crate::scene::ObjectId>> = Vec::with_capacity(origins.len());
+    let mut out_bounds: Vec<Option<Rect>> = Vec::with_capacity(cmd_bounds.len());
+
+    let mut i = 0;
+    while i < commands.len() {
+        match &commands[i] {
+            DisplayCommand::FillRect { rect, style } => {
+                let run_style = *style;
+                let mut run_rects: Vec<Rect> = vec![*rect];
+                let mut run_bounds = cmd_bounds[i];
+                let mut j = i + 1;
+                while j < commands.len() {
+                    if let DisplayCommand::FillRect {
+                        rect: r2,
+                        style: s2,
+                    } = &commands[j]
+                    {
+                        if *s2 == run_style {
+                            run_rects.push(*r2);
+                            run_bounds = match (run_bounds, cmd_bounds[j]) {
+                                (Some(a), Some(b)) => Some(a.union(&b)),
+                                (Some(a), None) => Some(a),
+                                (None, Some(b)) => Some(b),
+                                (None, None) => None,
+                            };
+                            j += 1;
+                            continue;
+                        }
+                    }
+                    break;
+                }
+                if run_rects.len() == 1 {
+                    out_commands.push(commands[i].clone());
+                    out_origins.push(origins[i]);
+                    out_bounds.push(cmd_bounds[i]);
+                    i += 1;
+                } else {
+                    out_commands.push(DisplayCommand::BatchedRects {
+                        rects: run_rects,
+                        style: run_style,
+                    });
+                    // Batched command isn't attributable to a single
+                    // scene object — cache-invalidation already keys
+                    // on the full SceneFingerprint, so a None origin
+                    // is safe.
+                    out_origins.push(None);
+                    out_bounds.push(run_bounds);
+                    i = j;
+                }
+            }
+            _ => {
+                out_commands.push(commands[i].clone());
+                out_origins.push(origins[i]);
+                out_bounds.push(cmd_bounds[i]);
+                i += 1;
+            }
+        }
+    }
+
+    DisplayList {
+        commands: out_commands,
+        world_bounds,
+        origins: out_origins,
+        cmd_bounds: out_bounds,
     }
 }
 

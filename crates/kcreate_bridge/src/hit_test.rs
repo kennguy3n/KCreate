@@ -14,6 +14,7 @@
 //! hit-testing — clicking on a selection outline should not "hit" the
 //! outline itself; we want the underlying node.
 
+use kcreate_core::document::DocumentGraph;
 use kcreate_renderer::{Scene, Vec2};
 use uuid::Uuid;
 
@@ -95,6 +96,35 @@ fn point_in_rect(rect: kcreate_renderer::Rect, x: f32, y: f32) -> bool {
     x >= rect.x && x <= rect.x + rect.width && y >= rect.y && y <= rect.y + rect.height
 }
 
+/// **Phase 11 Block A Task 4 — spatial-index document hit test.**
+///
+/// Walk the [`DocumentGraph`]'s R-tree to find every node whose
+/// bounds contain `(screen_x, screen_y)` after `viewport` is
+/// inverted, then return the *topmost* — defined as the deepest node
+/// in the tree (descendants render on top of ancestors). Falls back
+/// to `None` when no node contains the point.
+///
+/// This is the O(log N + k) replacement for the linear scan in
+/// [`hit_test`] for callers that don't need scene-level overlay
+/// awareness (selection highlights, presence cursors). Use [`hit_test`]
+/// when the click might land on a selection outline that should be
+/// transparent to picking.
+///
+/// Mutable borrow is required because the index is lazily rebuilt on
+/// the first call after a structural change.
+#[must_use]
+pub fn document_query_point(
+    doc: &mut DocumentGraph,
+    screen_x: f32,
+    screen_y: f32,
+    viewport: Viewport,
+) -> Option<Uuid> {
+    let (wx, wy) = viewport.screen_to_world(screen_x, screen_y);
+    let hits = doc.query_point(f64::from(wx), f64::from(wy));
+    // `query_point` already sorts deepest-first.
+    hits.into_iter().next()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -134,9 +164,9 @@ mod tests {
 
     #[test]
     fn click_inside_object_returns_uuid() {
-        let (doc, id) = make_doc_with_rect_at(10.0, 10.0, 20.0, 20.0);
+        let (mut doc, id) = make_doc_with_rect_at(10.0, 10.0, 20.0, 20.0);
         let mut sync = SceneSync::new();
-        let scene = sync.sync_document_to_scene(&doc, None, &[]);
+        let scene = sync.sync_document_to_scene(&mut doc, None, &[]);
         let vp = Viewport::new(Vec2::new(0.0, 0.0), 1.0);
         let hit = hit_test(&sync, &scene, 15.0, 15.0, vp);
         assert_eq!(hit, Some(id));
@@ -144,9 +174,9 @@ mod tests {
 
     #[test]
     fn click_outside_returns_none() {
-        let (doc, _id) = make_doc_with_rect_at(10.0, 10.0, 20.0, 20.0);
+        let (mut doc, _id) = make_doc_with_rect_at(10.0, 10.0, 20.0, 20.0);
         let mut sync = SceneSync::new();
-        let scene = sync.sync_document_to_scene(&doc, None, &[]);
+        let scene = sync.sync_document_to_scene(&mut doc, None, &[]);
         let vp = Viewport::new(Vec2::new(0.0, 0.0), 1.0);
         let hit = hit_test(&sync, &scene, 1.0, 1.0, vp);
         assert!(hit.is_none());
@@ -196,7 +226,7 @@ mod tests {
         );
         let id_b = doc.insert_node(b).unwrap();
 
-        let scene = sync.sync_document_to_scene(&doc, None, &[]);
+        let scene = sync.sync_document_to_scene(&mut doc, None, &[]);
         let vp = Viewport::new(Vec2::new(0.0, 0.0), 1.0);
         // Click inside both: must hit B (drawn last → highest z).
         let hit = hit_test(&sync, &scene, 20.0, 20.0, vp);
@@ -208,9 +238,9 @@ mod tests {
 
     #[test]
     fn viewport_pan_and_zoom_are_inverted() {
-        let (doc, id) = make_doc_with_rect_at(100.0, 100.0, 10.0, 10.0);
+        let (mut doc, id) = make_doc_with_rect_at(100.0, 100.0, 10.0, 10.0);
         let mut sync = SceneSync::new();
-        let scene = sync.sync_document_to_scene(&doc, None, &[]);
+        let scene = sync.sync_document_to_scene(&mut doc, None, &[]);
         // Pan world (100,100) onto screen (50,50) at 0.5x zoom:
         // screen = world * 0.5 + pan ⇒ 50 = 100 * 0.5 + 0 ⇒ pan = 0
         let vp = Viewport::new(Vec2::new(0.0, 0.0), 0.5);
@@ -224,9 +254,9 @@ mod tests {
 
     #[test]
     fn empty_scene_returns_none() {
-        let doc = DocumentGraph::new();
+        let mut doc = DocumentGraph::new();
         let mut sync = SceneSync::new();
-        let scene = sync.sync_document_to_scene(&doc, None, &[]);
+        let scene = sync.sync_document_to_scene(&mut doc, None, &[]);
         let vp = Viewport::new(Vec2::new(0.0, 0.0), 1.0);
         assert!(hit_test(&sync, &scene, 0.0, 0.0, vp).is_none());
     }
@@ -277,7 +307,7 @@ mod tests {
         let id = doc.insert_node(node).unwrap();
 
         let mut sync = SceneSync::new();
-        let scene = sync.sync_document_to_scene(&doc, None, &[]);
+        let scene = sync.sync_document_to_scene(&mut doc, None, &[]);
         let vp = Viewport::new(Vec2::new(0.0, 0.0), 1.0);
         let hit = hit_test(&sync, &scene, 5.0, 5.0, vp);
         assert_eq!(
@@ -295,10 +325,10 @@ mod tests {
     /// `ObjectId` ↔ `Uuid` map at all).
     #[test]
     fn click_on_selected_node_returns_node_not_highlight() {
-        let (doc, id) = make_doc_with_rect_at(10.0, 10.0, 20.0, 20.0);
+        let (mut doc, id) = make_doc_with_rect_at(10.0, 10.0, 20.0, 20.0);
         let mut sync = SceneSync::new();
         // Mark the node as selected so a highlight is appended.
-        let scene = sync.sync_document_to_scene(&doc, None, &[id]);
+        let scene = sync.sync_document_to_scene(&mut doc, None, &[id]);
         let vp = Viewport::new(Vec2::new(0.0, 0.0), 1.0);
         let hit = hit_test(&sync, &scene, 15.0, 15.0, vp);
         assert_eq!(

@@ -41,6 +41,19 @@ pub enum ObjectKind {
         /// RGBA8 pixel data. Length must equal
         /// `pixels_width * pixels_height * 4`.
         pixels: Vec<u8>,
+        /// **Phase 11 Block A Task 3 — content-addressed fingerprint.**
+        ///
+        /// The first 8 bytes of the source blob's BLAKE3 hash
+        /// (`RasterImageMeta.hash`). When present, the scene
+        /// fingerprint hashes this 8-byte token instead of walking
+        /// the (potentially 100MB) pixel buffer. Identical content
+        /// always produces the same token, so caches can short-circuit
+        /// without re-checksumming. `None` for synthetic raster
+        /// layers built outside the blob store (tests, placeholders);
+        /// the renderer falls back to chunked pixel hashing in that
+        /// case.
+        #[serde(default)]
+        content_hash: Option<u64>,
     },
     /// A short string painted at `origin`. The renderer uses
     /// [`kcreate_text::shape_text`] to convert this into glyph paths

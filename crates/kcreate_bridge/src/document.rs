@@ -2123,7 +2123,7 @@ pub(crate) fn sync_scene_locked(
     };
     #[allow(unused_mut)]
     let mut scene = ws.scene_sync.sync_document_to_scene(
-        &ws.project.document,
+        &mut ws.project.document,
         Some(ws.store.blobs()),
         &ws.selection,
     );
@@ -2323,7 +2323,7 @@ pub fn canvas_hit_test(
     // question entirely: a hit-test is cheap (a few hundred reverse-z
     // AABB checks) compared to its UX cost when wrong.
     let scene = ws.scene_sync.sync_document_to_scene(
-        &ws.project.document,
+        &mut ws.project.document,
         Some(ws.store.blobs()),
         &ws.selection,
     );

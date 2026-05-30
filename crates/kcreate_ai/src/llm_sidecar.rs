@@ -1323,12 +1323,20 @@ mod tests {
         // The supervisor loop's `check_child_for_early_exit` runs
         // before every probe; on the very first iteration the child
         // may not yet have been reaped by the kernel, so this call
-        // is allowed to return `None`. We then wait for the exit
-        // and re-check.
-        let _ = check_child_for_early_exit(&mut child);
-        let _ = child.wait();
-
+        // is allowed to return `None`. If the child HAS already
+        // been reaped by then (CI runners are fast enough that
+        // `/bin/sh -c '...; exit 7'` frequently exits in under a
+        // millisecond), the first call returns `Some(err)` AND
+        // drains stderr via `child.stderr.take()` — so we must
+        // capture *that* err, because a follow-up call after
+        // `child.wait()` would find `stderr_tail` empty and the
+        // assertion below would fail spuriously. Either call may
+        // surface the real error; we accept whichever fires first.
         let err = check_child_for_early_exit(&mut child)
+            .or_else(|| {
+                let _ = child.wait();
+                check_child_for_early_exit(&mut child)
+            })
             .expect("check_child_for_early_exit must report the exited child");
         match err {
             SidecarError::ChildExited { code, stderr_tail } => {

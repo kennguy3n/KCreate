@@ -137,14 +137,22 @@ pub type Result<T> = std::result::Result<T, DocumentBridgeError>;
 /// bookkeeping needed for incremental persistence.
 pub(crate) struct Workspace {
     pub(crate) project: Project,
-    /// On-disk store wrapped in a [`parking_lot::Mutex`] so the
-    /// `Workspace` itself can be `Sync` (rusqlite's `Connection`
-    /// contains `RefCell`s and is `Send + !Sync`). Phase 11 Block D
-    /// Task 19 then puts the whole workspace inside an `RwLock` so
+    /// On-disk store wrapped in an `Arc<parking_lot::Mutex<…>>` so
+    /// (a) the `Workspace` itself can be `Sync` (rusqlite's
+    /// `Connection` contains `RefCell`s and is `Send + !Sync`),
+    /// (b) the whole workspace can live inside an `RwLock` so
     /// in-memory reads of `project` / `selection` / `scene_sync` can
     /// proceed concurrently while only the on-disk path serialises
-    /// through this inner mutex.
-    pub(crate) store: parking_lot::Mutex<ProjectStore>,
+    /// through this inner mutex (Phase 11 Block D Task 19), and (c)
+    /// long-running disk operations can `Arc::clone` the handle,
+    /// drop the workspace lock, and then run their SQL writes
+    /// without holding the workspace lock at all (Phase 11 Block B
+    /// follow-up round 7 — Devin Review BUG-0001 r7). [`project_save`]
+    /// is the canonical consumer of (c): it snapshots the document /
+    /// metadata under a brief read lock, drops it, and streams to
+    /// SQLite against the cloned `Arc` so concurrent renderer reads
+    /// and writes never wait on the save.
+    pub(crate) store: std::sync::Arc<parking_lot::Mutex<ProjectStore>>,
     /// Set of operation ids already written to the on-disk store.
     ///
     /// Tracking by id (not by index) is the only correct option once
@@ -487,7 +495,7 @@ pub fn project_create(name: &str, dir: &Path) -> Result<ProjectInfo> {
     let info = build_info(&project, store.project_dir());
     *guard = Some(Workspace {
         project,
-        store: parking_lot::Mutex::new(store),
+        store: std::sync::Arc::new(parking_lot::Mutex::new(store)),
         persisted_op_ids: HashSet::new(),
         scene_sync: crate::scene_sync::SceneSync::new(),
         selection: Vec::new(),
@@ -572,7 +580,7 @@ pub fn project_open(dir: &Path) -> Result<ProjectInfo> {
     let info = build_info(&project, store.project_dir());
     *guard = Some(Workspace {
         project,
-        store: parking_lot::Mutex::new(store),
+        store: std::sync::Arc::new(parking_lot::Mutex::new(store)),
         persisted_op_ids,
         scene_sync: crate::scene_sync::SceneSync::new(),
         selection: Vec::new(),
@@ -621,74 +629,157 @@ pub fn project_open(dir: &Path) -> Result<ProjectInfo> {
 /// range-delete using a timestamp index). At `max_depth` = 256 the
 /// full save path stays in the microseconds.
 pub fn project_save() -> Result<()> {
+    // Phase 11 Block B follow-up round 7 — Devin Review BUG-0001 (r7).
+    //
+    // The pre-round-7 implementation held `slot().write()` (exclusive
+    // workspace lock) for the entire SQLite write sequence below,
+    // which on multi-MB projects could pin every other workspace-
+    // touching IPC call (tree view queries, selection inspector,
+    // renderer ticks) for hundreds of ms. The async wrapper in
+    // `phase11::ProjectSaveTask` moved the call off the libuv main
+    // thread, but the workspace lock was still held on the worker —
+    // so any concurrent `with_workspace(...)` request on a different
+    // thread would queue up behind it. The N-API doc-comment claimed
+    // "snapshots under the lock then releases" but the code never
+    // released until the SQLite stream was done.
+    //
+    // Round-7 fix (option (a) from the Devin Review prompt):
+    //
+    //   1. Snapshot the document + metadata under a **read** lock.
+    //      Everything written is a `Clone` (Project derives Clone),
+    //      so the snapshot is a deep copy free of any workspace
+    //      borrow. `Arc::clone(&ws.store)` is also taken so the
+    //      SQLite handle outlives the read guard.
+    //   2. Drop the read guard. **No workspace lock is held during
+    //      the SQLite write sequence** — readers and writers run
+    //      concurrently against the in-memory project state.
+    //   3. Stream the snapshot to SQLite using the cloned
+    //      `Arc<Mutex<ProjectStore>>`. The inner `Mutex` still
+    //      serialises writes against the SQLite connection itself,
+    //      which is required because rusqlite's `Connection` is
+    //      `Send + !Sync`.
+    //   4. Take a brief `write()` lock at the end to merge the
+    //      newly-persisted op ids into `persisted_op_ids`. Critical
+    //      subtlety: between snapshot and merge, the in-memory log
+    //      may have grown (user kept editing). The merge uses set
+    //      union with the *post-merge* `operation_log` ids as the
+    //      retention mask, so:
+    //        - new ops added since snapshot stay unpersisted
+    //          (next save picks them up — correct);
+    //        - ops trimmed from the front of the log since snapshot
+    //          drop out of `persisted_op_ids` (matches the O(max_depth)
+    //          invariant — correct).
+    //
+    // `prune_operations` runs in step 3 against the snapshot's
+    // `max_depth`; if the user changed `max_depth` between snapshot
+    // and merge, the next save will reconcile to the new bound. This
+    // is a non-event because `max_depth` is rarely mutated at
+    // runtime (it's a device-tier config setting set at startup).
+
+    // -- Step 1: snapshot under a brief read lock. -----------------
+    struct SaveSnapshot {
+        document: kcreate_core::DocumentGraph,
+        design_tokens: kcreate_core::DesignTokens,
+        color_settings: kcreate_core::ColorSettings,
+        brand_kits: Vec<kcreate_core::BrandKit>,
+        export_presets: Vec<kcreate_core::ExportPreset>,
+        components: HashMap<Uuid, kcreate_core::ComponentDefinition>,
+        /// Ops in the log that are *not yet* in `persisted_op_ids` at
+        /// snapshot time. We clone the operations themselves because
+        /// step 3 (SQLite stream) runs without the workspace lock.
+        unseen_ops: Vec<Operation>,
+        max_depth: usize,
+    }
+
+    let (snapshot, store) = {
+        let guard = slot().read();
+        let ws = guard.as_ref().ok_or(DocumentBridgeError::NoProject)?;
+        let unseen_ops: Vec<Operation> = ws
+            .project
+            .operation_log
+            .iter()
+            .filter(|op| !ws.persisted_op_ids.contains(&op.id))
+            .cloned()
+            .collect();
+        let snapshot = SaveSnapshot {
+            document: ws.project.document.clone(),
+            design_tokens: ws.project.design_tokens.clone(),
+            color_settings: ws.project.color_settings.clone(),
+            brand_kits: ws.project.brand_kits.clone(),
+            export_presets: ws.project.export_presets.clone(),
+            components: ws.project.components.clone(),
+            unseen_ops,
+            max_depth: ws.project.operation_log.max_depth(),
+        };
+        let store = std::sync::Arc::clone(&ws.store);
+        (snapshot, store)
+        // `guard` (and therefore the workspace read lock) drops here.
+    };
+
+    // -- Step 2: stream the snapshot to SQLite without holding any
+    //    workspace lock. The inner store `Mutex` is the only thing
+    //    serialising disk writes from here on.
+    let unseen_ids: Vec<Uuid> = snapshot.unseen_ops.iter().map(|op| op.id).collect();
+    {
+        let mut store_guard = store.lock();
+        store_guard.save_document(&snapshot.document)?;
+        store_guard.save_design_tokens(&snapshot.design_tokens)?;
+        store_guard.save_color_settings(&snapshot.color_settings)?;
+        for kit in &snapshot.brand_kits {
+            store_guard.save_brand_kit(kit)?;
+        }
+        // Reconcile deleted brand kits: any rows on disk whose id is no
+        // longer in the snapshot must be removed so deletes survive
+        // the next reopen.
+        let kit_ids: HashSet<Uuid> = snapshot.brand_kits.iter().map(|k| k.id).collect();
+        let on_disk_kits = store_guard.load_brand_kits()?;
+        for kit in &on_disk_kits {
+            if !kit_ids.contains(&kit.id) {
+                store_guard.delete_brand_kit(kit.id)?;
+            }
+        }
+        for preset in &snapshot.export_presets {
+            store_guard.save_export_preset(preset)?;
+        }
+        let preset_ids: HashSet<Uuid> =
+            snapshot.export_presets.iter().map(|p| p.id).collect();
+        let on_disk_presets = store_guard.load_export_presets()?;
+        for preset in &on_disk_presets {
+            if !preset_ids.contains(&preset.id) {
+                store_guard.delete_export_preset(preset.id)?;
+            }
+        }
+        // Components: the in-memory map is the source of truth, so we
+        // bulk-replace on disk. This handles both upsert and delete in
+        // one round-trip; matches how `replace_components` is documented.
+        store_guard.replace_components(&snapshot.components)?;
+        for op in &snapshot.unseen_ops {
+            store_guard.save_operation(op)?;
+        }
+        // Mirror the in-memory `max_depth` bound onto the on-disk
+        // table. Without this, the operations table grows for the
+        // project's lifetime; combined with the (historic) load_operations
+        // bug, it would silently lose recent history once the row count
+        // exceeded `max_depth`. The on-disk bound is the same as the
+        // in-memory bound by design — the in-memory log is the canonical
+        // undo surface and the disk just snapshots it.
+        store_guard.prune_operations(snapshot.max_depth)?;
+    }
+
+    // -- Step 3: brief write lock to merge persisted ids. ----------
+    // We only update bookkeeping (`persisted_op_ids`); no rendering or
+    // disk side effects fire here, so the critical section is O(log).
     let mut guard = slot().write();
     let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
-    ws.store.lock().save_document(&ws.project.document)?;
-    // Persist project-level metadata (design tokens, brand kits,
-    // export presets). These mirror the in-memory `Project` fields
-    // and must round-trip across close/reopen so identifiers stay
-    // stable. Brand kits / presets are upserted by id; the design
-    // tokens table holds a single row keyed on `'current'`.
-    ws.store.lock().save_design_tokens(&ws.project.design_tokens)?;
-    ws.store.lock().save_color_settings(&ws.project.color_settings)?;
-    for kit in &ws.project.brand_kits {
-        ws.store.lock().save_brand_kit(kit)?;
+    for id in &unseen_ids {
+        ws.persisted_op_ids.insert(*id);
     }
-    // Reconcile deleted brand kits: any rows on disk whose id is no
-    // longer in memory must be removed so deletes survive the next
-    // reopen.
-    let kit_ids: HashSet<Uuid> = ws.project.brand_kits.iter().map(|k| k.id).collect();
-    let on_disk_kits = ws.store.lock().load_brand_kits()?;
-    for kit in &on_disk_kits {
-        if !kit_ids.contains(&kit.id) {
-            ws.store.lock().delete_brand_kit(kit.id)?;
-        }
-    }
-    for preset in &ws.project.export_presets {
-        ws.store.lock().save_export_preset(preset)?;
-    }
-    let preset_ids: HashSet<Uuid> = ws.project.export_presets.iter().map(|p| p.id).collect();
-    let on_disk_presets = ws.store.lock().load_export_presets()?;
-    for preset in &on_disk_presets {
-        if !preset_ids.contains(&preset.id) {
-            ws.store.lock().delete_export_preset(preset.id)?;
-        }
-    }
-    // Components: the in-memory map is the source of truth, so we
-    // bulk-replace on disk. This handles both upsert and delete in
-    // one round-trip; matches how `replace_components` is documented.
-    ws.store.lock().replace_components(&ws.project.components)?;
-
+    // Retain only ids that are still in the post-save in-memory log
+    // (some may have aged out via bounded-depth front-trim while we
+    // were streaming to SQLite). This preserves the O(max_depth)
+    // size invariant on `persisted_op_ids`.
     let current_ids: HashSet<Uuid> = ws.project.operation_log.iter().map(|op| op.id).collect();
-    // Collect new ops first so we can satisfy the borrow checker (the
-    // save loop borrows `ws.store` mutably while reading from
-    // `ws.project.operation_log` immutably) and so we can use
-    // `HashSet::insert`'s return value to avoid the
-    // contains-then-insert race that `clippy::set_contains_or_insert`
-    // flags.
-    let unseen: Vec<Operation> = ws
-        .project
-        .operation_log
-        .iter()
-        .filter(|op| !ws.persisted_op_ids.contains(&op.id))
-        .cloned()
-        .collect();
-    for op in &unseen {
-        ws.store.lock().save_operation(op)?;
-        ws.persisted_op_ids.insert(op.id);
-    }
-    // Forget ids that have aged out of the bounded in-memory log so
-    // `persisted_op_ids` stays O(max_depth).
     ws.persisted_op_ids.retain(|id| current_ids.contains(id));
-    // Mirror the in-memory `max_depth` bound onto the on-disk table.
-    // Without this, the operations table grows for the project's
-    // lifetime; combined with the (now-fixed) load_operations bug, it
-    // would silently lose recent history once the row count exceeded
-    // `max_depth`. The on-disk bound is the same as the in-memory bound
-    // by design — the in-memory log is the canonical undo surface and
-    // the disk just snapshots it.
-    let max_depth = ws.project.operation_log.max_depth();
-    ws.store.lock().prune_operations(max_depth)?;
     drop(guard);
     Ok(())
 }

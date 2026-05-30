@@ -1691,10 +1691,23 @@ operations (`export_png`, `export_pdf`,
 Phase 4 `VisionDescribeImageTask` pattern. The filter
 runs on libuv's threadpool with the workspace lock
 released; resolve is on the main thread. `project_save`
-snapshots the document inside the write guard before
-releasing the lock so a long save can't be raced by
-edits. `apps/desktop/shared/scene.ts` mirrors the
-`Promise<void>` signatures.
+(Phase 11 follow-up round 7 — Devin Review BUG-0001 r7)
+follows a five-step workspace-lock-free SQLite pattern:
+(1) snapshot `Project` fields under a brief read lock,
+(2) `Arc::clone` the `ProjectStore` handle (the store
+is wrapped in `Arc<parking_lot::Mutex<…>>` precisely so
+the SQLite connection can outlive the workspace
+guard), (3) drop the read lock, (4) stream the snapshot
+to SQLite holding *only* the inner store `Mutex` —
+**no workspace lock is held during this step**, so
+concurrent renderer reads and writes never wait on the
+save, and (5) take a brief workspace write lock to
+merge newly-persisted op ids into `persisted_op_ids`
+(set union with the post-merge `operation_log` ids as
+the retention mask, so new edits land in the next save
+and front-trimmed ops drop out — preserving the
+`O(max_depth)` invariant). `apps/desktop/shared/scene.ts`
+mirrors the `Promise<void>` signatures.
 
 ### GPU compute filters
 

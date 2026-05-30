@@ -424,12 +424,23 @@ impl Task for ProjectSaveTask {
     type JsValue = ();
 
     fn compute(&mut self) -> NapiResult<Self::Output> {
-        // `document::project_save` already snapshots the document
-        // graph under the workspace lock, drops the lock, then
-        // streams the snapshot to SQLite. Dispatching the whole
-        // call to the worker pool means even the snapshot step
-        // (which traverses the node tree) doesn't pin the main
-        // thread on multi-thousand-node projects.
+        // Phase 11 Block B follow-up round 7 — Devin Review BUG-0001
+        // (r7). The pre-r7 version of this comment claimed
+        // `document::project_save` "snapshots under the workspace
+        // lock, then drops the lock, then streams to SQLite", but
+        // the implementation actually held `slot().write()` for the
+        // entire SQLite stream. Round 7 fixed `project_save` to
+        // match the contract: it now (1) snapshots Project fields
+        // under a brief read lock, (2) clones the `Arc` to the
+        // SQLite store, (3) drops the workspace lock, (4) streams
+        // the snapshot to SQLite holding *only* the inner store
+        // `Mutex`, and (5) takes a brief workspace write lock to
+        // merge the newly-persisted op ids back into
+        // `persisted_op_ids`. Dispatching this task to the napi
+        // worker pool keeps the long step (4) off the libuv main
+        // thread, and the workspace-lock-free design of step (4)
+        // also means concurrent renderer reads / writes don't
+        // block waiting on the save.
         document::project_save().map_err(map_doc_err)
     }
 

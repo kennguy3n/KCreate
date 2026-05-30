@@ -200,7 +200,7 @@ export function PreferencesPanel({
 
   return (
     <PanelShell onClose={requestClose} title="Preferences">
-      <div style={{ display: "flex", height: "100%" }}>
+      <div style={{ display: "flex", flex: 1, minHeight: 0 }}>
         <nav
           style={{
             width: 140,
@@ -742,7 +742,17 @@ function PanelShell({
             ×
           </button>
         </header>
-        <div style={{ flex: 1, overflow: "hidden" }}>{children}</div>
+        <div
+          style={{
+            flex: 1,
+            minHeight: 0,
+            display: "flex",
+            flexDirection: "column",
+            overflow: "hidden",
+          }}
+        >
+          {children}
+        </div>
       </div>
     </div>
   );

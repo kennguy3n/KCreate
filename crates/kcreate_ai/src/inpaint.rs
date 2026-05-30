@@ -25,6 +25,8 @@
 //! itself is inherently sequential within a single sweep but we run
 //! the random-search step in parallel across mask pixels.
 
+use std::collections::HashMap;
+
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -375,6 +377,17 @@ fn run_patchmatch_level(
         return;
     }
 
+    // Build a coordinate -> index lookup so the propagation step can
+    // find the target index for an arbitrary `(x, y)` in O(1).
+    // Without this, propagating from the top neighbour would need a
+    // linear scan over `targets` for every masked pixel; the map
+    // turns that into a constant-time hash hit and keeps the per-
+    // sweep cost linear in the mask size.
+    let mut index_by_coord: HashMap<(i32, i32), usize> = HashMap::with_capacity(targets.len());
+    for (i, &(tx, ty)) in targets.iter().enumerate() {
+        index_by_coord.insert((tx, ty), i);
+    }
+
     // NNF: for each target, the (sx, sy) source patch centre that
     // currently matches it best. Initialise with a deterministic
     // pseudo-random pick per target so reruns are reproducible.
@@ -420,28 +433,45 @@ fn run_patchmatch_level(
         nnf = scored;
 
         // 2) Propagation: for each target, check whether the
-        //    upstream/leftward neighbours' source patches would be
-        //    a better fit when applied here. Sequential because the
-        //    neighbour writes happen in scan order.
+        //    leftward / upward neighbours' source patches would be
+        //    a better fit when shifted into this target. Both
+        //    neighbours are tried — standard PatchMatch propagates
+        //    along the scan-order axes (left + top), which lets a
+        //    good match travel both horizontally and vertically
+        //    through the mask in a single sweep. Sequential
+        //    because the neighbour writes happen in scan order.
         for (i, &(tx, ty)) in targets.iter().enumerate() {
             let mut best = nnf[i];
             let mut best_cost = patch_ssd(pixels, original, width, tx, ty, best.0, best.1, pr);
-            // Left neighbour
-            if i > 0 {
-                let (lx, ly) = targets[i - 1];
-                if lx + 1 == tx && ly == ty {
-                    let (sx, sy) = nnf[i - 1];
-                    let cand_x = sx + 1;
-                    let cand_y = sy;
-                    if cand_x >= pr && cand_x < w - pr && cand_y >= pr && cand_y < h - pr {
-                        let cost = patch_ssd(pixels, original, width, tx, ty, cand_x, cand_y, pr);
-                        if cost < best_cost {
-                            best = (cand_x, cand_y);
-                            best_cost = cost;
-                        }
+
+            // Left neighbour: (tx - 1, ty) -> shift its source by +1 in x.
+            if let Some(&li) = index_by_coord.get(&(tx - 1, ty)) {
+                let (sx, sy) = nnf[li];
+                let cand_x = sx + 1;
+                let cand_y = sy;
+                if cand_x >= pr && cand_x < w - pr && cand_y >= pr && cand_y < h - pr {
+                    let cost = patch_ssd(pixels, original, width, tx, ty, cand_x, cand_y, pr);
+                    if cost < best_cost {
+                        best = (cand_x, cand_y);
+                        best_cost = cost;
                     }
                 }
             }
+
+            // Top neighbour: (tx, ty - 1) -> shift its source by +1 in y.
+            if let Some(&ti) = index_by_coord.get(&(tx, ty - 1)) {
+                let (sx, sy) = nnf[ti];
+                let cand_x = sx;
+                let cand_y = sy + 1;
+                if cand_x >= pr && cand_x < w - pr && cand_y >= pr && cand_y < h - pr {
+                    let cost = patch_ssd(pixels, original, width, tx, ty, cand_x, cand_y, pr);
+                    if cost < best_cost {
+                        best = (cand_x, cand_y);
+                        best_cost = cost;
+                    }
+                }
+            }
+
             nnf[i] = best;
         }
 

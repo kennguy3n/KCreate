@@ -266,23 +266,59 @@ pub fn histogram_equalization(pixels: &[u8], width: u32, height: u32) -> Vec<u8>
     out
 }
 
+/// BT.601 forward RGB -> YCbCr transform: returns floating-point
+/// Y/Cb/Cr in 0..255 (Cb/Cr offset by +128). Keeping chroma in
+/// floats and only quantising Y avoids rounding-error accumulation
+/// when we round-trip through the equalisation LUT.
+#[inline]
+fn rgb_to_ycbcr_601(r: u8, g: u8, b: u8) -> (f32, f32, f32) {
+    let rf = f32::from(r);
+    let gf = f32::from(g);
+    let bf = f32::from(b);
+    let y = 0.299 * rf + 0.587 * gf + 0.114 * bf;
+    let cb = -0.168_736 * rf - 0.331_264 * gf + 0.5 * bf + 128.0;
+    let cr = 0.5 * rf - 0.418_688 * gf - 0.081_312 * bf + 128.0;
+    (y, cb, cr)
+}
+
+/// BT.601 inverse YCbCr -> RGB transform: takes Y/Cb/Cr in 0..255
+/// (Cb/Cr offset by +128) and returns clamped 8-bit RGB.
+#[inline]
+fn ycbcr_to_rgb_601(y: f32, cb: f32, cr: f32) -> (u8, u8, u8) {
+    let cb_off = cb - 128.0;
+    let cr_off = cr - 128.0;
+    let r = y + 1.402 * cr_off;
+    let g = y - 0.344_136 * cb_off - 0.714_136 * cr_off;
+    let b = y + 1.772 * cb_off;
+    (
+        r.clamp(0.0, 255.0).round() as u8,
+        g.clamp(0.0, 255.0).round() as u8,
+        b.clamp(0.0, 255.0).round() as u8,
+    )
+}
+
 /// Luminance-only histogram equalisation in YCbCr space. Avoids the
-/// hue shifts of per-channel RGB equalisation by only modifying the
-/// Y (luma) channel.
+/// hue shifts of per-channel RGB equalisation by doing a full
+/// `RGB -> YCbCr -> equalise Y -> YCbCr -> RGB` round-trip: the
+/// chroma channels (`Cb`, `Cr`) are preserved exactly, so a tinted
+/// near-black pixel (e.g. `RGB(0, 0, 1)`) cannot get its colour
+/// blown up by a large `new_y / y` scale factor — the chroma stays
+/// pinned and only the brightness moves.
 fn luminance_equalization(pixels: &[u8], width: u32, height: u32) -> Vec<u8> {
     let total = (width as usize) * (height as usize);
     if total == 0 {
         return Vec::new();
     }
+
+    // Build the Y-channel histogram in scan order.
     let mut hist = [0u32; 256];
-    // BT.601 luma weights.
-    let lum = |r: u8, g: u8, b: u8| -> u8 {
-        let y = 0.299 * f32::from(r) + 0.587 * f32::from(g) + 0.114 * f32::from(b);
-        y.clamp(0.0, 255.0).round() as u8
-    };
     for chunk in pixels.chunks_exact(4) {
-        hist[lum(chunk[0], chunk[1], chunk[2]) as usize] += 1;
+        let (y, _cb, _cr) = rgb_to_ycbcr_601(chunk[0], chunk[1], chunk[2]);
+        let yi = y.clamp(0.0, 255.0).round() as usize;
+        hist[yi] += 1;
     }
+
+    // Build the equalisation LUT for the Y channel.
     let mut cdf = 0u32;
     let mut cdf_min = 0u32;
     for &h in &hist {
@@ -299,23 +335,22 @@ fn luminance_equalization(pixels: &[u8], width: u32, height: u32) -> Vec<u8> {
             .clamp(0.0, 255.0)
             .round() as u8;
     }
+
+    // Apply the LUT to Y only; chroma is preserved exactly. Because
+    // the new Y is added to the chroma channels (rather than
+    // multiplied with them), a near-black tinted pixel can no longer
+    // be blown up by a huge `new_y / y` ratio.
     let mut out = vec![0u8; pixels.len()];
     out.par_chunks_mut(4)
         .zip(pixels.par_chunks(4))
         .for_each(|(dst, src)| {
-            let y = lum(src[0], src[1], src[2]);
-            let new_y = lut[y as usize];
-            if y == 0 {
-                // Avoid division by zero — black pixel stays black.
-                dst[0] = 0;
-                dst[1] = 0;
-                dst[2] = 0;
-            } else {
-                let scale = f32::from(new_y) / f32::from(y);
-                dst[0] = (f32::from(src[0]) * scale).clamp(0.0, 255.0).round() as u8;
-                dst[1] = (f32::from(src[1]) * scale).clamp(0.0, 255.0).round() as u8;
-                dst[2] = (f32::from(src[2]) * scale).clamp(0.0, 255.0).round() as u8;
-            }
+            let (y, cb, cr) = rgb_to_ycbcr_601(src[0], src[1], src[2]);
+            let yi = y.clamp(0.0, 255.0).round() as usize;
+            let new_y = f32::from(lut[yi]);
+            let (r, g, b) = ycbcr_to_rgb_601(new_y, cb, cr);
+            dst[0] = r;
+            dst[1] = g;
+            dst[2] = b;
             dst[3] = src[3];
         });
     out

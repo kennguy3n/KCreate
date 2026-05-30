@@ -99,6 +99,31 @@ pub enum SidecarError {
     /// AI feature outright.
     #[error("failed to sample bearer token from OS CSPRNG: {0}")]
     TokenEntropyFailed(String),
+    /// Phase 12 round 3 — Devin Review flagged that the health-probe
+    /// loop only watched the readiness endpoint, so a child that
+    /// crashed during init (invalid model, missing shared library,
+    /// GPU init failure) would sit until the full health timeout
+    /// elapsed (~90 s) before surfacing as a generic
+    /// `HealthTimeout`. We now `try_wait` the child between probes
+    /// and surface this typed error with the captured exit code plus
+    /// the tail of stderr so the renderer can show a meaningful
+    /// toast in ~500 ms instead.
+    #[error("sidecar child exited during startup (exit_status={code:?}): {stderr_tail}")]
+    ChildExited {
+        /// `child.wait()` exit code, when available. Signal kills on
+        /// Unix surface as `None` (the platform reports the signal,
+        /// not a code). The `Display` formatting uses `{code:?}` so
+        /// `Some(2)` renders as `Some(2)` and signal kills render as
+        /// `None`, which is unambiguous in the renderer toast and
+        /// keeps the error formatting compatible with thiserror's
+        /// no-runtime-conditionals constraint.
+        code: Option<i32>,
+        /// Last ~2 KB of the child's stderr stream. sd-server /
+        /// llama-server both print their fatal-init error on the
+        /// final line before exiting, so even this small tail is
+        /// usually enough to diagnose the failure.
+        stderr_tail: String,
+    },
 }
 
 /// Coarse status the host UI displays in the Model Manager panel.
@@ -502,6 +527,17 @@ fn health_worker(
             *status.lock() = SidecarStatus::Stopped;
             return;
         }
+        // Phase 12 round 3 — detect crashes during init in ~500 ms
+        // instead of waiting the full `health_timeout` (~90 s). If
+        // the child has already exited, surface a typed error with
+        // the exit code plus the tail of its stderr stream so the
+        // renderer can render a meaningful toast.
+        if let Some(err) = check_child_for_early_exit(&mut child) {
+            *status.lock() = SidecarStatus::Error {
+                message: err.to_string(),
+            };
+            return;
+        }
         if probe_health(port) {
             ready = true;
             break;
@@ -566,6 +602,58 @@ fn kill_child(child: &mut Child) {
     // Best-effort: the process may already have exited.
     let _ = child.kill();
     let _ = child.wait();
+}
+
+/// Maximum stderr tail we capture when the child exits early. Both
+/// sd-server and llama-server print their fatal-init message on the
+/// last line before exiting, so this is plenty.
+const CHILD_STDERR_TAIL_BYTES: usize = 2048;
+
+/// Non-blocking check for an early child exit. Returns `Some(err)` if
+/// the child has already exited (typed [`SidecarError::ChildExited`]
+/// carrying the exit code plus the tail of stderr); `None` if the
+/// child is still alive (the supervisor should keep probing
+/// readiness).
+///
+/// Public-in-crate so the diffusion sidecar (`diffusion_sidecar.rs`)
+/// shares the same early-exit detection path — keeping the two
+/// drivers symmetric was the whole point of Devin Review round 3's
+/// `try_wait` finding.
+pub(crate) fn check_child_for_early_exit(child: &mut Child) -> Option<SidecarError> {
+    match child.try_wait() {
+        Ok(Some(status)) => {
+            let code = status.code();
+            let stderr_tail = drain_child_stderr_tail(child);
+            Some(SidecarError::ChildExited { code, stderr_tail })
+        }
+        // Ok(None) — child still running. Err(...) — we couldn't
+        // even ask; treat as "keep going" so a transient
+        // /proc/self/wait4 hiccup doesn't tear down a healthy
+        // sidecar prematurely. The full health timeout still
+        // guards against a truly stuck child.
+        _ => None,
+    }
+}
+
+/// Drain up to [`CHILD_STDERR_TAIL_BYTES`] of stderr from a
+/// just-exited child. Best-effort: returns an empty string when the
+/// child wasn't spawned with `Stdio::piped()` for stderr, or when
+/// the read itself errors.
+fn drain_child_stderr_tail(child: &mut Child) -> String {
+    use std::io::Read;
+    let Some(mut stderr) = child.stderr.take() else {
+        return String::new();
+    };
+    let mut buf = Vec::with_capacity(CHILD_STDERR_TAIL_BYTES);
+    // Read everything available; sd-server/llama-server emit a few
+    // KB at most before exiting on a fatal config error, so we
+    // don't need a streaming reader here.
+    let _ = stderr.read_to_end(&mut buf);
+    if buf.len() > CHILD_STDERR_TAIL_BYTES {
+        let start = buf.len() - CHILD_STDERR_TAIL_BYTES;
+        buf.drain(..start);
+    }
+    String::from_utf8_lossy(&buf).into_owned()
 }
 
 /// Allocate a loopback port the OS confirms is free. We bind then
@@ -1186,5 +1274,57 @@ mod tests {
         );
         stop.store(true, std::sync::atomic::Ordering::Release);
         let _ = handle;
+    }
+
+    /// Phase 12 round 3 — Devin Review flagged that the health-probe
+    /// loop only watched the readiness endpoint, so a child that
+    /// crashed during init would sit until the full
+    /// `health_timeout` elapsed. `check_child_for_early_exit` is the
+    /// shared seam that fixes that: between probes, the health
+    /// worker asks the child whether it has exited, and surfaces a
+    /// typed [`SidecarError::ChildExited`] in ~500 ms instead of
+    /// waiting 90 s for a generic [`SidecarError::HealthTimeout`].
+    ///
+    /// This test exercises the helper end-to-end against a real
+    /// child that exits immediately (`/bin/sh -c 'echo boom 1>&2;
+    /// exit 7'`). We assert:
+    ///   * `Ok(None)` is observed before the child is reaped (the
+    ///     loop's "keep probing" branch),
+    ///   * after the child exits, `check_child_for_early_exit`
+    ///     returns `Some(ChildExited { code: Some(7), stderr_tail })`
+    ///     and the stderr tail contains the `boom` we wrote, so the
+    ///     renderer toast carries real diagnostic content rather
+    ///     than the previous opaque "health timeout".
+    #[cfg(unix)]
+    #[test]
+    fn check_child_for_early_exit_surfaces_exit_code_and_stderr_tail() {
+        let mut child = Command::new("/bin/sh")
+            .arg("-c")
+            .arg("echo boom 1>&2; exit 7")
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn /bin/sh");
+
+        // The supervisor loop's `check_child_for_early_exit` runs
+        // before every probe; on the very first iteration the child
+        // may not yet have been reaped by the kernel, so this call
+        // is allowed to return `None`. We then wait for the exit
+        // and re-check.
+        let _ = check_child_for_early_exit(&mut child);
+        let _ = child.wait();
+
+        let err = check_child_for_early_exit(&mut child)
+            .expect("check_child_for_early_exit must report the exited child");
+        match err {
+            SidecarError::ChildExited { code, stderr_tail } => {
+                assert_eq!(code, Some(7), "captured exit code");
+                assert!(
+                    stderr_tail.contains("boom"),
+                    "stderr tail must carry diagnostic text the renderer can show, got: {stderr_tail:?}"
+                );
+            }
+            other => panic!("expected ChildExited, got {other:?}"),
+        }
     }
 }

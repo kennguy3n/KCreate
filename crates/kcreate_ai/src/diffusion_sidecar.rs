@@ -283,6 +283,17 @@ fn health_worker(
             *status.lock() = SidecarStatus::Stopped;
             return;
         }
+        // Phase 12 round 3 — detect crashes during init in ~500 ms
+        // instead of waiting the full `health_timeout` (~90 s).
+        // Shares the same `check_child_for_early_exit` helper as
+        // `llm_sidecar::health_worker` so the two drivers expose
+        // identical lifecycle semantics to the bridge.
+        if let Some(err) = crate::llm_sidecar::check_child_for_early_exit(&mut child) {
+            *status.lock() = SidecarStatus::Error {
+                message: err.to_string(),
+            };
+            return;
+        }
         if probe_ready(port) {
             ready = true;
             break;

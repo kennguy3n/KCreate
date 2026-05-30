@@ -413,20 +413,63 @@ pub fn vision_mmproj_for(pack_id: String) -> Option<String> {
 /// Apply the legacy → current pack-id migration table from
 /// `kcreate_ai::model_registry::migrate_legacy_pack_id`. Returns the
 /// rewritten id (or `pack_id` unchanged when no migration applies)
-/// and emits a one-time `log::warn!` so the renderer can surface a
-/// "your saved model preference was renamed" prompt in the model
-/// manager. We use `log::warn!` (not `error!`) because the rewrite
-/// is benign — the user lost no functionality, the new id points at
-/// the same architecture under the GGUF-llama-server pipeline.
+/// and emits a one-time `log::warn!` per (legacy-id, process-lifetime)
+/// pair so the renderer can surface a "your saved model preference
+/// was renamed" prompt in the model manager. We use `log::warn!` (not
+/// `error!`) because the rewrite is benign — the user lost no
+/// functionality, the new id points at the same architecture under
+/// the GGUF-llama-server pipeline.
+///
+/// Devin Review (post-Phase-12 round) noted the original implementation
+/// emitted the warning on every call rather than once-per-legacy-id
+/// as the doc comment claimed. A renderer that keeps re-invoking
+/// `vision_start` / `image_gen_start` with the same stale saved-
+/// preferences entry would have flooded the log. The dedup state is a
+/// `OnceLock<Mutex<HashSet<String>>>` keyed on the *input* legacy id
+/// so multiple legacy ids each get exactly one warning, and the same
+/// id passed through twice gets only the first warning.
 fn resolve_pack_id(pack_id: &str) -> String {
     if let Some(new_id) = kcreate_ai::model_registry::migrate_legacy_pack_id(pack_id) {
-        log::warn!(
-            "kcreate_bridge: legacy MLX pack id `{pack_id}` migrated to `{new_id}` \
-             (Phase 12 removed the MLX runtime; update saved preferences to silence this)",
-        );
+        log_legacy_pack_migration_once(pack_id, new_id);
         return new_id.to_string();
     }
     pack_id.to_string()
+}
+
+/// Process-lifetime dedup set for the legacy-pack migration warning.
+/// Module-level so the test-only reset helper below can reach the
+/// same backing store as `log_legacy_pack_migration_once`.
+static LEGACY_PACK_WARN_SEEN: std::sync::OnceLock<parking_lot::Mutex<std::collections::HashSet<String>>> =
+    std::sync::OnceLock::new();
+
+fn legacy_pack_warn_seen() -> &'static parking_lot::Mutex<std::collections::HashSet<String>> {
+    LEGACY_PACK_WARN_SEEN.get_or_init(|| parking_lot::Mutex::new(std::collections::HashSet::new()))
+}
+
+/// Emit the legacy-pack migration warning at most once per
+/// (legacy-id, process-lifetime) pair. Returns `true` iff the warning
+/// fired (i.e. this was the first sighting of `legacy`); the bool is
+/// crate-private and exists purely so the unit test below can pin the
+/// dedup behavior without poking at the `log` facade.
+fn log_legacy_pack_migration_once(legacy: &str, current: &str) -> bool {
+    let newly_seen = legacy_pack_warn_seen().lock().insert(legacy.to_string());
+    if newly_seen {
+        log::warn!(
+            "kcreate_bridge: legacy MLX pack id `{legacy}` migrated to `{current}` \
+             (Phase 12 removed the MLX runtime; update saved preferences to silence this)",
+        );
+    }
+    newly_seen
+}
+
+/// Test-only reset for the dedup set so we can exercise the
+/// one-emission-per-id contract without leaking state across tests.
+/// Crate-private; the production code path never resets the set —
+/// the user-visible "one warning per id per process" semantics rely
+/// on the set surviving for the lifetime of the bridge.
+#[cfg(test)]
+fn reset_legacy_pack_migration_dedup_for_tests() {
+    legacy_pack_warn_seen().lock().clear();
 }
 
 /// List the packs the renderer is allowed to show in the vision
@@ -1072,5 +1115,54 @@ mod tests {
             vision_mmproj_for("vision_smolvlm_256m_mlx".into()),
             Some("vision_smolvlm2_256m_mmproj".to_string()),
         );
+    }
+
+    /// `log_legacy_pack_migration_once` must fire exactly once per
+    /// legacy id per process lifetime. Devin Review (post-Phase-12)
+    /// flagged that the original implementation logged on every call
+    /// even though the doc comment said "one-time", which would have
+    /// flooded the log if a renderer kept invoking
+    /// `vision_start` / `image_gen_start` with the same stale saved
+    /// preferences entry. The dedup state is module-level
+    /// (`LEGACY_PACK_WARN_SEEN`) so multiple sibling tests within the
+    /// same `cargo test` binary share it — we explicitly reset it at
+    /// the top of the test so the assertion is deterministic
+    /// regardless of test ordering.
+    ///
+    /// We intentionally don't assert on the `log` facade output (no
+    /// in-process subscriber) because the contract under test is
+    /// "the dedup set absorbs repeats", not the log layer's behavior.
+    /// The boolean returned by `log_legacy_pack_migration_once` is
+    /// exposed for exactly this reason.
+    #[test]
+    fn log_legacy_pack_migration_dedups_on_repeat_calls() {
+        reset_legacy_pack_migration_dedup_for_tests();
+        // First sighting of each legacy id => warning fires.
+        assert!(log_legacy_pack_migration_once(
+            "vision_smolvlm_256m_mlx",
+            "vision_smolvlm2_256m"
+        ));
+        assert!(log_legacy_pack_migration_once(
+            "image_gen_flux_klein_mlx",
+            "image_gen_flux_klein_4b"
+        ));
+        // Same legacy id again => suppressed.
+        assert!(!log_legacy_pack_migration_once(
+            "vision_smolvlm_256m_mlx",
+            "vision_smolvlm2_256m"
+        ));
+        assert!(!log_legacy_pack_migration_once(
+            "image_gen_flux_klein_mlx",
+            "image_gen_flux_klein_4b"
+        ));
+        // A different legacy id still fires the first time.
+        assert!(log_legacy_pack_migration_once(
+            "vision_qwen25vl_7b_mlx",
+            "vision_qwen25vl_7b"
+        ));
+        // Reset the dedup state so sibling tests that also exercise
+        // `resolve_pack_id` aren't observed via shared module-level
+        // state.
+        reset_legacy_pack_migration_dedup_for_tests();
     }
 }

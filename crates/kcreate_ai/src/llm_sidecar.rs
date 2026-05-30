@@ -88,6 +88,17 @@ pub enum SidecarError {
     /// a sidecar that is not in the expected state.
     #[error("sidecar is not in the expected state: {0}")]
     WrongState(String),
+    /// Phase 11 Block E Task 25 follow-up round 3 — Devin Review
+    /// ANALYSIS-0006 (r3). The OS CSPRNG (`getrandom`) refused to
+    /// produce a bearer token when `require_api_key` was set. Rather
+    /// than silently downgrading the sidecar to unauthenticated
+    /// loopback — which is the exact attack surface Block E was
+    /// designed to close — we now fail-closed and surface the
+    /// underlying error so the host UI can decide whether to retry,
+    /// fall back to the no-auth profile *explicitly*, or block the
+    /// AI feature outright.
+    #[error("failed to sample bearer token from OS CSPRNG: {0}")]
+    TokenEntropyFailed(String),
 }
 
 /// Coarse status the host UI displays in the Model Manager panel.
@@ -322,17 +333,30 @@ impl LlmSidecar {
         // `--api-key`. We use `getrandom` (already in the workspace
         // for the collab nonces) so the token is sampled from the
         // OS CSPRNG, not a pseudo-random Lamport-style counter.
+        //
+        // Phase 11 Block E Task 25 follow-up round 3 — Devin Review
+        // ANALYSIS-0006 (r3). When the caller has set
+        // `require_api_key`, a CSPRNG failure used to log a warning
+        // and silently start the sidecar **without** a bearer
+        // token — i.e. the unauthenticated loopback path that Block
+        // E exists to eliminate. The renderer never saw the
+        // downgrade, so a defence-in-depth control could vanish
+        // without an observable signal. Fail-closed instead: record
+        // a typed `Error` status so the UI surfaces the failure,
+        // and return `SidecarError::TokenEntropyFailed` so callers
+        // can decide whether to retry, prompt the user, or fall
+        // back **explicitly** to the no-auth profile by flipping
+        // `require_api_key = false` on the config.
         let bearer_token: Option<String> = if self.config.require_api_key {
             let mut buf = [0u8; 32];
             match getrandom::fill(&mut buf) {
                 Ok(()) => Some(hex_encode(&buf)),
                 Err(e) => {
-                    log::warn!(
-                        "llm_sidecar: failed to sample bearer token from OS CSPRNG ({e}); \
-                         starting sidecar without auth\
-                        ",
-                    );
-                    None
+                    let err = SidecarError::TokenEntropyFailed(e.to_string());
+                    *self.status.lock() = SidecarStatus::Error {
+                        message: err.to_string(),
+                    };
+                    return Err(err);
                 }
             }
         } else {

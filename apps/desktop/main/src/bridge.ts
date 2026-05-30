@@ -735,11 +735,21 @@ export interface Bridge {
   // with `Buffer.from(buffer, byteOffset, byteLength)` (zero-copy
   // view over the same ArrayBuffer) before invoking the IPC
   // channel.
+  // Phase 11 Block B follow-up round 3 — Devin Review BUG-0001 (r3).
+  // `raster_apply_filter_masked` on the Rust side now returns
+  // `AsyncTask<phase11::RasterFilterMaskedTask>` so the masked filter
+  // pipeline runs on the libuv worker pool instead of the main
+  // thread. The N-API export carries
+  // `#[napi(ts_return_type = "Promise<void>")]`, the generated
+  // `.d.ts` and `main.ts` IPC handler already `await` the call,
+  // and `shared/scene.ts` declares `Promise<void>` — so this
+  // hand-written `NativeBridge` declaration must match
+  // `Promise<void>` too. AGENTS.md Rule 4 (wire-format lockstep).
   rasterApplyFilterMasked(
     nodeId: string,
     filterJson: string,
     mask: Buffer,
-  ): void;
+  ): Promise<void>;
   // Phase 5 — vector path operations + non-destructive effects
   // (Block C Tasks 15, 16, 18). All mutate the VectorLayer's
   // stored geometry (simplify / smooth / offset) or its NodeStyle

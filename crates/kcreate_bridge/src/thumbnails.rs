@@ -64,6 +64,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::document::{slot as workspace_slot, DocumentBridgeError, Workspace};
+use crate::scene_sync::SceneSync;
 
 type Result<T> = std::result::Result<T, DocumentBridgeError>;
 
@@ -621,14 +622,36 @@ fn cache_store(key: Uuid, content_hash: &str, bytes: &[u8], width: u32, height: 
         .map_err(thumb_err)
 }
 
-fn build_scene_for_target(ws: &mut Workspace, target: ThumbnailTarget) -> Scene {
-    // Hidden ws field access matches what `sync_scene_locked` does. We
-    // use the workspace's scene_sync since it already understands the
-    // document's blobs / selection layering — but pass `&[]` for
-    // selection so highlight overlays aren't baked into thumbnails.
-    let mut scene =
-        ws.scene_sync
-            .sync_document_to_scene(&mut ws.project.document, Some(ws.store.lock().blobs()), &[]);
+fn build_scene_for_target(ws: &Workspace, target: ThumbnailTarget) -> Scene {
+    // Phase 11 Block A follow-up round 3 — Devin Review ANALYSIS-0004
+    // (r3). Previously this called
+    // `ws.scene_sync.sync_document_to_scene(&mut ws.project.document, …)`
+    // which has two side effects we do NOT want here:
+    //   (1) `drain_dirty()` empties the document's pending mutation
+    //       set, so any edits since the last main-thread sync would
+    //       be consumed by the thumbnail path and silently skipped
+    //       by the next `documentGetTree`/scene-sync round-trip,
+    //       producing a stale main canvas;
+    //   (2) the workspace's incremental `node_cache` would be
+    //       partially repopulated against the *thumbnail's* viewport
+    //       coordinates (after `translate` below), poisoning the
+    //       cache for the next main render.
+    //
+    // The architecturally correct fix is for thumbnails to keep their
+    // own ephemeral `SceneSync` instance: `SceneSync::default()` is
+    // essentially free (empty hashmaps), takes `&DocumentGraph` via
+    // `sync_document_to_scene_borrowed`, and is dropped at the end
+    // of this function. The main `ws.scene_sync` and the document's
+    // dirty set are untouched. Selection is empty so highlight
+    // overlays aren't baked into the thumbnail. Workspace is taken
+    // as `&Workspace` (no `&mut`) to make the read-only contract
+    // explicit at the type level.
+    let mut thumbnail_sync = SceneSync::default();
+    let mut scene = thumbnail_sync.sync_document_to_scene_borrowed(
+        &ws.project.document,
+        Some(ws.store.lock().blobs()),
+        &[],
+    );
     // Translate so the target bounds land at the renderer origin —
     // mirroring `kcreate_export::slice::translate_scene`.
     let dx = -target.bounds.x as f32;

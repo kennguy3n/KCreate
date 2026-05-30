@@ -277,4 +277,81 @@ sentinel (`crates/kcreate_tests/tests/local_first.rs`) stays
 green — none of the new dependencies pull networking into
 the editing-path closure.
 
+## Phase 11 — Render Performance, Async Bridge, Prototype
+Animation, Concurrency & Security Hardening (Complete)
+
+Phase 11 closes the gap between KCreate and the
+professional-tier reference designers (Figma, Affinity,
+Photoshop) by attacking the four categories the audit
+flagged as the biggest deltas: render-pipeline throughput,
+bridge responsiveness, prototype expressiveness, and
+defence-in-depth. 30 tasks across six blocks.
+
+- **Block A (Tasks 1–6):** Render pipeline incrementalisation
+  — `DocumentGraph` dirty-set + `structure_dirty` flag, cached
+  per-node `Vec<Object>` lists in `SceneSync`, BLAKE3
+  content-addressed image fingerprints (`ObjectKind::Image`
+  carries an 8-byte digest instead of forcing a 48 MB pixel
+  walk), R-tree spatial index for hit testing
+  (`SpatialEntry` over `rstar::RTreeObject`), batched
+  `FillRect` / `StrokeRect` display-list commands. The hot
+  edit path is now O(dirty) rather than O(nodes).
+- **Block B (Tasks 7–12):** Async N-API for raster filters,
+  exports, and `project_save` (libuv-threadpool AsyncTasks
+  with a write-locked snapshot so a long save can't be
+  raced by edits) + GPU compute filters
+  (`crates/kcreate_renderer/src/compute/*.wgsl`): two-pass
+  separable Gaussian blur, levels/curves via 256-entry
+  storage-buffer LUT, unsharp mask reusing the blur output.
+  GPU paths fall back to CPU when no adapter is available.
+- **Block C (Tasks 13–18):** Prototype expressiveness —
+  `Transition { AnimationType, duration_ms, EasingCurve,
+  SlideDirection }`, `EasingEngine.ts` with cubic-bezier and
+  damped-spring solvers, hover / press / mouse-enter /
+  mouse-leave / `AfterDelay` triggers, `SwitchVariant`
+  Smart-Animate (layers matched by name, bounds / opacity /
+  HSL fill / corner-radius interpolated), and auto-layout
+  propagation through component instances with
+  override-aware solvers (`layout_flex_with_overrides`,
+  `layout_grid_with_overrides`).
+- **Block D (Tasks 19–24):** Workspace concurrency + undo
+  optimisation — `RwLock<Option<Workspace>>` with audited
+  read/write call sites, delta-compressed operations,
+  per-node `version` plus a `document_version: AtomicU64`
+  the renderer polls lock-free, lazy subsystem-init audit
+  (tile cache / LLM sidecar / memory watchdog / audit DB /
+  collab transport / `fontdb`), 10 000-node scale
+  validation in
+  `crates/kcreate_tests/tests/scale_validation.rs`.
+- **Block E (Tasks 25–28):** Security hardening — per-session
+  bearer-token-authenticated LLM sidecar
+  (`Authorization: Bearer <32 bytes from getrandom>`),
+  TOCTOU port allocation fix via a post-spawn verification
+  handshake, ChaCha20-Poly1305 encryption of `acl.json` with
+  the same SQLCipher-derived key (auto-migration of
+  plaintext on encrypted projects, `acl.json.enc` magic +
+  nonce + ciphertext wire format), KChat REST certificate
+  pinning via a custom `rustls::ServerCertVerifier` that
+  chains the Mozilla WebPKI root store with a constant-time
+  leaf-cert SHA-256 fingerprint check
+  (`crates/kcreate_kchat_client/src/pinning.rs`).
+- **Block F (Tasks 29–30):** PROGRESS.md / PHASES.md /
+  PROPOSAL.md acceptance-criteria bumps + README.md /
+  ARCHITECTURE.md / AGENTS.md sync. Performance targets
+  upgraded: 5000-node Tier 1, 10 000-node Tier 2+,
+  64 MP Gaussian blur < 500 ms on Tier 2+, prototype
+  transition at 60 fps on Tier 1+.
+
+All Phase 11 Rust + bridge work routes through
+`crates/kcreate_bridge/src/phase11.rs`, with N-API entries
+in `crates/kcreate_bridge/src/lib.rs` mirrored verbatim in
+`apps/desktop/shared/scene.ts`,
+`apps/desktop/preload/src/preload.ts`, and
+`apps/desktop/main/src/{bridge,main}.ts`. The local-first
+sentinel (`crates/kcreate_tests/tests/local_first.rs`)
+stays green: the only new networking-adjacent dep
+(`webpki-roots`) is consumed exclusively by
+`kcreate_kchat_client`, which is excluded from the
+editing-path closure.
+
 See PROGRESS.md §"Phase 10" for the per-task breakdown.

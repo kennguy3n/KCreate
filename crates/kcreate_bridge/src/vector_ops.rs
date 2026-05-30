@@ -27,7 +27,14 @@ use kcreate_vector::{offset as offset_path, simplify as simplify_path, smooth as
 use crate::document::{slot, sync_scene_locked, DocumentBridgeError, Result};
 
 fn load_vector_path(node_id: Uuid) -> Result<VectorPath> {
-    let guard = slot().lock();
+    // Phase 11 Block D follow-up round 2 — Devin Review BUG-0004.
+    // Pure-read path (no mutation): use `slot().read()` so concurrent
+    // vector simplify/smooth/offset ops on different nodes (and any
+    // unrelated read traffic — tree view, status bar, selection
+    // inspector) can run in parallel. Same rationale as
+    // `load_layer_pixels` in `raster_ops.rs` (Devin Review BUG-0001 +
+    // ANALYSIS-0001 round 1).
+    let guard = slot().read();
     let ws = guard.as_ref().ok_or(DocumentBridgeError::NoProject)?;
     let node = ws
         .project
@@ -58,7 +65,7 @@ fn replace_vector_geometry(
     op_kind: &'static str,
     op_payload: serde_json::Value,
 ) -> Result<()> {
-    let mut guard = slot().lock();
+    let mut guard = slot().write();
     let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
 
     let before_snapshot = ws
@@ -169,7 +176,7 @@ fn mutate_style(
     op_payload: serde_json::Value,
     mutator: impl FnOnce(&mut kcreate_core::node::NodeStyle),
 ) -> Result<()> {
-    let mut guard = slot().lock();
+    let mut guard = slot().write();
     let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
 
     let before_snapshot = ws

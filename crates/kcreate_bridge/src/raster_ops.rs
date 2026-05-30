@@ -23,7 +23,10 @@
 //! re-acquired only for the final node + blob mutation.
 
 use chrono::Utc;
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::sync::{Arc, OnceLock};
 use uuid::Uuid;
 
 use kcreate_core::node::{Bounds, NodeType};
@@ -35,6 +38,75 @@ use kcreate_raster::layer::{AdjustmentLayer, CurvePoint};
 use kcreate_raster::tile::TileGrid;
 use kcreate_raster::transform;
 use rayon::prelude::*;
+
+// -----------------------------------------------------------------------------
+// Per-node async serialisation
+// -----------------------------------------------------------------------------
+//
+// Phase 11 Block B follow-up — Devin Review ANALYSIS-0005.
+//
+// Every raster op runs the slow path (decode → filter → encode)
+// *outside* the workspace lock so the renderer stays responsive
+// during long blurs / large rotations. The flip side is that two
+// concurrent async ops on the **same** node can race:
+//
+//   T0 ─ apply_blur(N): load blob A, release ws lock
+//   T1 ─ apply_sharpen(N): load blob A (same snapshot!), release ws lock
+//   T2 ─ apply_blur(N): write blob B = blur(A)
+//   T3 ─ apply_sharpen(N): write blob C = sharpen(A) ← clobbers B
+//
+// The Phase 11 task list pushed nine ops onto the libuv worker pool
+// (blur / sharpen / levels / curves / hsl / colour_balance /
+// perspective / masked_filter / crop) plus rotate / flip / heal
+// once ANALYSIS-0003 was wired up, so the race surface area is
+// large.
+//
+// Fix: give every raster op a **per-node** serial guard. Two ops
+// targeting the same node serialise; ops targeting different nodes
+// continue to run in parallel on the worker pool. The map of
+// `Uuid -> Arc<Mutex<()>>` lives in `OnceLock` so it has zero
+// per-call allocation amortised, and entries are kept for the life
+// of the process (each entry is ~80 bytes — bounded by the number
+// of raster layers ever touched in a session, which is small).
+//
+// Using `parking_lot::Mutex` keeps the guard `Send` and lets us
+// hold it across `load_layer_pixels` (read), the slow filter, and
+// `replace_layer_pixels` (write) without needing tokio. The actual
+// workspace locks (read/write) acquired *inside* the per-node guard
+// are still short-lived; the per-node guard is what serialises the
+// load-snapshot / write-back pair.
+fn raster_node_serial_lock(node_id: Uuid) -> Arc<Mutex<()>> {
+    static MAP: OnceLock<Mutex<HashMap<Uuid, Arc<Mutex<()>>>>> = OnceLock::new();
+    let map = MAP.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = map.lock();
+    guard
+        .entry(node_id)
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone()
+}
+
+/// RAII guard returned by [`raster_node_serial`]. Holding it
+/// guarantees that no other raster op is mutating `node_id` until
+/// the guard is dropped. `ArcMutexGuard` owns its `Arc<Mutex<()>>`
+/// internally, so the underlying mutex stays alive for the lifetime
+/// of the guard even if the global map is concurrently mutated by
+/// another op for a *different* node id. Requires the
+/// `arc_lock` feature on `parking_lot`.
+struct RasterNodeSerial {
+    _guard: parking_lot::ArcMutexGuard<parking_lot::RawMutex, ()>,
+}
+
+/// Acquire the per-node serial lock for `node_id`. Concurrent
+/// calls for the **same** node serialise; calls for different
+/// nodes proceed in parallel. Must be held across the entire
+/// `load_layer_pixels → filter → replace_layer_pixels` sequence to
+/// prevent the lost-update race.
+fn raster_node_serial(node_id: Uuid) -> RasterNodeSerial {
+    let lock = raster_node_serial_lock(node_id);
+    RasterNodeSerial {
+        _guard: parking_lot::Mutex::lock_arc(&lock),
+    }
+}
 
 /// Apply a sequence of `AdjustmentLayer` ops to a flat RGBA8 buffer
 /// in place, row-parallel via rayon. Mirrors the per-tile loop on
@@ -77,7 +149,19 @@ struct LayerPixels {
 }
 
 fn load_layer_pixels(node_id: Uuid) -> Result<LayerPixels> {
-    let guard = slot().lock();
+    // Phase 11 Block A follow-up — Devin Review BUG-0001.
+    //
+    // `load_layer_pixels` is read-only against the workspace (it
+    // borrows the node + asks the blob store for bytes), so it must
+    // take a *shared* `read()` guard. Using `write()` here would
+    // serialise every async raster task (blur / sharpen / levels /
+    // curves / HSL / colour balance / perspective / crop / masked
+    // filter) on the workspace lock during the multi-millisecond
+    // image-decode step, which directly undermines the Phase 11
+    // Mutex → RwLock migration. The blob store is locked separately
+    // (`ws.store.lock()`), so concurrent loaders that hit *different*
+    // blob hashes do not contend on the store mutex either.
+    let guard = slot().read();
     let ws = guard.as_ref().ok_or(DocumentBridgeError::NoProject)?;
     let node = ws
         .project
@@ -101,7 +185,7 @@ fn load_layer_pixels(node_id: Uuid) -> Result<LayerPixels> {
         })?;
     let meta: RasterImageMeta = serde_json::from_value(meta_value.clone())?;
     let bytes = ws
-        .store
+        .store.lock()
         .blobs()
         .load(&meta.blob_hash)
         .map_err(|e| DocumentBridgeError::Io(std::io::Error::other(e.to_string())))?;
@@ -148,7 +232,7 @@ fn replace_layer_pixels(
     resize_bounds: bool,
 ) -> Result<()> {
     let png = encode_png(&new_rgba, out_w, out_h)?;
-    let mut guard = slot().lock();
+    let mut guard = slot().write();
     let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
 
     let before_snapshot = ws
@@ -160,7 +244,7 @@ fn replace_layer_pixels(
         });
 
     let blob = ws
-        .store
+        .store.lock()
         .blobs()
         .store(&png, "image/png")
         .map_err(|e| DocumentBridgeError::Io(std::io::Error::other(e.to_string())))?;
@@ -220,16 +304,38 @@ fn replace_layer_pixels(
 // -----------------------------------------------------------------------------
 
 /// Apply a Levels adjustment to a raster layer.
+///
+/// Phase 11 Block B Task 10 routes the per-pixel work through the
+/// GPU compute LUT shader when a compute context is available. The
+/// CPU fallback runs the same operation via
+/// `apply_adjustments_in_place` (rayon over RGBA chunks).
 pub fn apply_levels(node_id: Uuid, black_point: f32, white_point: f32, gamma: f32) -> Result<()> {
+    // Phase 11 Block B follow-up — Devin Review ANALYSIS-0005.
+    let _serial = raster_node_serial(node_id);
     let mut pixels = load_layer_pixels(node_id)?;
-    apply_adjustments_in_place(
-        &mut pixels.rgba,
-        &[AdjustmentLayer::Levels {
-            black_point,
-            white_point,
-            gamma,
-        }],
-    );
+    let mut applied_on_gpu = false;
+    if let Some(ctx) = crate::gpu_compute::try_context() {
+        let lut = kcreate_renderer::compute::build_levels_lut(black_point, white_point, gamma);
+        match ctx.levels_curves(&pixels.rgba, pixels.width, pixels.height, &lut, false) {
+            Ok(out) => {
+                pixels.rgba = out;
+                applied_on_gpu = true;
+            }
+            Err(err) => eprintln!(
+                "kcreate_bridge::raster_ops: GPU levels failed ({err}); falling back to CPU"
+            ),
+        }
+    }
+    if !applied_on_gpu {
+        apply_adjustments_in_place(
+            &mut pixels.rgba,
+            &[AdjustmentLayer::Levels {
+                black_point,
+                white_point,
+                gamma,
+            }],
+        );
+    }
     replace_layer_pixels(
         node_id,
         pixels.rgba,
@@ -242,13 +348,35 @@ pub fn apply_levels(node_id: Uuid, black_point: f32, white_point: f32, gamma: f3
 }
 
 /// Apply a Curves adjustment defined by `(input, output)` control points.
+///
+/// Phase 11 Block B Task 10 — same GPU LUT path as
+/// [`apply_levels`]; the host compiles the curve to a 256-entry
+/// LUT and dispatches the per-pixel shader. CPU fallback uses the
+/// existing `AdjustmentLayer::Curves` solver.
 pub fn apply_curves(node_id: Uuid, points: Vec<(f32, f32)>) -> Result<()> {
+    // Phase 11 Block B follow-up — Devin Review ANALYSIS-0005.
+    let _serial = raster_node_serial(node_id);
     let mut pixels = load_layer_pixels(node_id)?;
-    let curve_points: Vec<CurvePoint> = points
-        .iter()
-        .map(|(t, v)| CurvePoint::new(*t, *v))
-        .collect();
-    apply_adjustments_in_place(&mut pixels.rgba, &[AdjustmentLayer::Curves(curve_points)]);
+    let mut applied_on_gpu = false;
+    if let Some(ctx) = crate::gpu_compute::try_context() {
+        let lut = kcreate_renderer::compute::build_curves_lut(&points);
+        match ctx.levels_curves(&pixels.rgba, pixels.width, pixels.height, &lut, false) {
+            Ok(out) => {
+                pixels.rgba = out;
+                applied_on_gpu = true;
+            }
+            Err(err) => eprintln!(
+                "kcreate_bridge::raster_ops: GPU curves failed ({err}); falling back to CPU"
+            ),
+        }
+    }
+    if !applied_on_gpu {
+        let curve_points: Vec<CurvePoint> = points
+            .iter()
+            .map(|(t, v)| CurvePoint::new(*t, *v))
+            .collect();
+        apply_adjustments_in_place(&mut pixels.rgba, &[AdjustmentLayer::Curves(curve_points)]);
+    }
     replace_layer_pixels(
         node_id,
         pixels.rgba,
@@ -273,16 +401,25 @@ pub enum BlurKind {
 }
 
 /// Apply Gaussian or Box blur with the given radius (in pixels).
+///
+/// Gaussian blur takes the GPU compute path when
+/// [`crate::gpu_compute::try_context`] returns a context (Phase 11
+/// Block B Task 9); box blur and the GPU-unavailable fallback keep
+/// the rayon CPU implementation in `kcreate_raster::filters`.
 pub fn apply_blur(node_id: Uuid, radius: f32, kind: BlurKind) -> Result<()> {
+    // Phase 11 Block B follow-up — Devin Review ANALYSIS-0005.
+    let _serial = raster_node_serial(node_id);
     let pixels = load_layer_pixels(node_id)?;
-    let grid = TileGrid::from_image(&pixels.rgba, pixels.width, pixels.height, TILE_SIZE)
-        .map_err(|e| DocumentBridgeError::Io(std::io::Error::other(e.to_string())))?;
-    let blurred = match kind {
-        BlurKind::Gaussian => filters::gaussian_blur(&grid, radius),
-        // Box blur takes an integer radius; clamp negative / NaN to 0.
-        BlurKind::Box => filters::box_blur(&grid, radius.max(0.0).round() as u32),
+    let out_rgba = match kind {
+        BlurKind::Gaussian => gaussian_blur_gpu_or_cpu(&pixels, radius)?,
+        BlurKind::Box => {
+            let grid =
+                TileGrid::from_image(&pixels.rgba, pixels.width, pixels.height, TILE_SIZE)
+                    .map_err(|e| DocumentBridgeError::Io(std::io::Error::other(e.to_string())))?;
+            // Box blur takes an integer radius; clamp negative / NaN to 0.
+            filters::box_blur(&grid, radius.max(0.0).round() as u32).to_image()
+        }
     };
-    let out_rgba = blurred.to_image();
     replace_layer_pixels(
         node_id,
         out_rgba,
@@ -294,13 +431,72 @@ pub fn apply_blur(node_id: Uuid, radius: f32, kind: BlurKind) -> Result<()> {
     )
 }
 
-/// Apply an unsharp-mask sharpen (`radius` + `amount` + `threshold`).
-pub fn apply_sharpen(node_id: Uuid, radius: f32, amount: f32, threshold: u8) -> Result<()> {
-    let pixels = load_layer_pixels(node_id)?;
+fn gaussian_blur_gpu_or_cpu(pixels: &LayerPixels, radius: f32) -> Result<Vec<u8>> {
+    if !radius.is_finite() || radius <= 0.0 {
+        return Ok(pixels.rgba.clone());
+    }
+    if let Some(ctx) = crate::gpu_compute::try_context() {
+        let bounded = radius.min(kcreate_renderer::compute::MAX_BLUR_SIGMA);
+        match ctx.gaussian_blur(&pixels.rgba, pixels.width, pixels.height, bounded) {
+            Ok(out) => return Ok(out),
+            Err(err) => {
+                // GPU surfaced an error — fall back to CPU so the
+                // user's edit still applies. Log so we notice
+                // recurring GPU breakage in the audit channel.
+                eprintln!(
+                    "kcreate_bridge::raster_ops: GPU blur failed ({err}); falling back to CPU"
+                );
+            }
+        }
+    }
     let grid = TileGrid::from_image(&pixels.rgba, pixels.width, pixels.height, TILE_SIZE)
         .map_err(|e| DocumentBridgeError::Io(std::io::Error::other(e.to_string())))?;
-    let sharp = filters::unsharp_mask(&grid, radius, amount, threshold);
-    let out_rgba = sharp.to_image();
+    Ok(filters::gaussian_blur(&grid, radius).to_image())
+}
+
+/// Apply an unsharp-mask sharpen (`radius` + `amount` + `threshold`).
+///
+/// Routes through the GPU compute path when available (Phase 11
+/// Block B Task 11). The blurred input texture is computed by the
+/// same separable Gaussian blur pipeline used by [`apply_blur`];
+/// the second dispatch composes `original + amount * (original -
+/// blurred)` with the threshold gate.
+pub fn apply_sharpen(node_id: Uuid, radius: f32, amount: f32, threshold: u8) -> Result<()> {
+    // Phase 11 Block B follow-up — Devin Review ANALYSIS-0005.
+    let _serial = raster_node_serial(node_id);
+    let pixels = load_layer_pixels(node_id)?;
+    let mut out_rgba: Option<Vec<u8>> = None;
+    if radius.is_finite() && radius > 0.0 {
+        if let Some(ctx) = crate::gpu_compute::try_context() {
+            let bounded = radius.min(kcreate_renderer::compute::MAX_BLUR_SIGMA);
+            match ctx.unsharp_mask(
+                &pixels.rgba,
+                pixels.width,
+                pixels.height,
+                bounded,
+                amount,
+                threshold,
+            ) {
+                Ok(out) => out_rgba = Some(out),
+                Err(err) => eprintln!(
+                    "kcreate_bridge::raster_ops: GPU unsharp failed ({err}); falling back to CPU"
+                ),
+            }
+        }
+    }
+    let out_rgba = match out_rgba {
+        Some(v) => v,
+        None => {
+            let grid = TileGrid::from_image(
+                &pixels.rgba,
+                pixels.width,
+                pixels.height,
+                TILE_SIZE,
+            )
+            .map_err(|e| DocumentBridgeError::Io(std::io::Error::other(e.to_string())))?;
+            filters::unsharp_mask(&grid, radius, amount, threshold).to_image()
+        }
+    };
     replace_layer_pixels(
         node_id,
         out_rgba,
@@ -318,6 +514,8 @@ pub fn apply_sharpen(node_id: Uuid, radius: f32, amount: f32, threshold: u8) -> 
 
 /// Crop a raster layer to `(x, y, w, h)` in source-pixel coordinates.
 pub fn crop(node_id: Uuid, x: u32, y: u32, w: u32, h: u32) -> Result<()> {
+    // Phase 11 Block B follow-up — Devin Review ANALYSIS-0005.
+    let _serial = raster_node_serial(node_id);
     let pixels = load_layer_pixels(node_id)?;
     let grid = TileGrid::from_image(&pixels.rgba, pixels.width, pixels.height, TILE_SIZE)
         .map_err(|e| DocumentBridgeError::Io(std::io::Error::other(e.to_string())))?;
@@ -338,6 +536,8 @@ pub fn crop(node_id: Uuid, x: u32, y: u32, w: u32, h: u32) -> Result<()> {
 
 /// Rotate a raster layer by `angle_deg` degrees (positive = clockwise).
 pub fn rotate(node_id: Uuid, angle_deg: f32) -> Result<()> {
+    // Phase 11 Block B follow-up — Devin Review ANALYSIS-0005.
+    let _serial = raster_node_serial(node_id);
     let pixels = load_layer_pixels(node_id)?;
     let grid = TileGrid::from_image(&pixels.rgba, pixels.width, pixels.height, TILE_SIZE)
         .map_err(|e| DocumentBridgeError::Io(std::io::Error::other(e.to_string())))?;
@@ -366,6 +566,8 @@ pub enum FlipDirection {
 
 /// Flip a raster layer about its centre.
 pub fn flip(node_id: Uuid, direction: FlipDirection) -> Result<()> {
+    // Phase 11 Block B follow-up — Devin Review ANALYSIS-0005.
+    let _serial = raster_node_serial(node_id);
     let pixels = load_layer_pixels(node_id)?;
     let mut grid = TileGrid::from_image(&pixels.rgba, pixels.width, pixels.height, TILE_SIZE)
         .map_err(|e| DocumentBridgeError::Io(std::io::Error::other(e.to_string())))?;
@@ -399,6 +601,8 @@ pub fn heal(
     dst_y: u32,
     radius: u32,
 ) -> Result<()> {
+    // Phase 11 Block B follow-up — Devin Review ANALYSIS-0005.
+    let _serial = raster_node_serial(node_id);
     let pixels = load_layer_pixels(node_id)?;
     let mut grid = TileGrid::from_image(&pixels.rgba, pixels.width, pixels.height, TILE_SIZE)
         .map_err(|e| DocumentBridgeError::Io(std::io::Error::other(e.to_string())))?;
@@ -589,6 +793,8 @@ pub fn preview_filter(node_id: Uuid, filter: PreviewFilter) -> Result<(Vec<u8>, 
 /// layer's node bounds — perspective generally changes the canvas
 /// size, so the node has to widen / heighten alongside.
 pub fn apply_perspective(node_id: Uuid, corners: [(f64, f64); 4]) -> Result<()> {
+    // Phase 11 Block B follow-up — Devin Review ANALYSIS-0005.
+    let _serial = raster_node_serial(node_id);
     let pixels = load_layer_pixels(node_id)?;
     let grid = TileGrid::from_image(&pixels.rgba, pixels.width, pixels.height, TILE_SIZE)
         .map_err(|e| DocumentBridgeError::Io(std::io::Error::other(e.to_string())))?;
@@ -625,6 +831,8 @@ pub fn apply_perspective(node_id: Uuid, corners: [(f64, f64); 4]) -> Result<()> 
 ///   `1.0` is identity, `> 1.0` boosts).
 /// * `lightness` is an additive shift in `[-1.0, 1.0]`.
 pub fn apply_hsl(node_id: Uuid, hue: f32, saturation: f32, lightness: f32) -> Result<()> {
+    // Phase 11 Block B follow-up — Devin Review ANALYSIS-0005.
+    let _serial = raster_node_serial(node_id);
     let mut pixels = load_layer_pixels(node_id)?;
     apply_adjustments_in_place(
         &mut pixels.rgba,
@@ -654,6 +862,8 @@ pub fn apply_color_balance(
     midtones: [f32; 3],
     highlights: [f32; 3],
 ) -> Result<()> {
+    // Phase 11 Block B follow-up — Devin Review ANALYSIS-0005.
+    let _serial = raster_node_serial(node_id);
     let mut pixels = load_layer_pixels(node_id)?;
     apply_adjustments_in_place(
         &mut pixels.rgba,
@@ -799,6 +1009,8 @@ fn feather_mask_weights(mask: &[u8], width: u32, height: u32) -> Vec<f32> {
 /// `w >= 1.0` and intermediate-weight branches. The `w <= 0.0`
 /// branch is now a true no-op (no redundant `copy_from_slice`).
 pub fn apply_filter_masked(node_id: Uuid, filter: PreviewFilter, mask: Vec<u8>) -> Result<()> {
+    // Phase 11 Block B follow-up — Devin Review ANALYSIS-0005.
+    let _serial = raster_node_serial(node_id);
     let pixels = load_layer_pixels(node_id)?;
     let total = (pixels.width as usize) * (pixels.height as usize);
     if mask.len() != total {
@@ -1059,7 +1271,10 @@ mod tests {
     /// the integration tests below to confirm an op actually
     /// rewrote the blob hash.
     fn raster_meta(node_id: Uuid) -> RasterImageMeta {
-        let guard = crate::document::slot().lock();
+        // Phase 11 Block A follow-up — Devin Review ANALYSIS-0001.
+        // Read-only inspection; share the workspace lock so
+        // concurrent-read tests are not artificially serialised.
+        let guard = crate::document::slot().read();
         let ws = guard.as_ref().expect("workspace");
         let node = ws.project.document.get_node(node_id).expect("node exists");
         let meta = node
@@ -1072,7 +1287,9 @@ mod tests {
 
     /// Snapshot the node's `Bounds` for assertions across an op.
     fn raster_bounds(node_id: Uuid) -> Bounds {
-        let guard = crate::document::slot().lock();
+        // Phase 11 Block A follow-up — Devin Review ANALYSIS-0001.
+        // Read-only snapshot of node bounds for assertions.
+        let guard = crate::document::slot().read();
         let ws = guard.as_ref().expect("workspace");
         ws.project
             .document
@@ -1267,7 +1484,9 @@ mod tests {
         }
         apply_filter_masked(node_id, filter, mask).expect("masked filter");
         // The most recent operation must capture mask_len + mask_true.
-        let guard = crate::document::slot().lock();
+        // Phase 11 Block A follow-up — Devin Review ANALYSIS-0001.
+        // Read-only inspection of the operation log.
+        let guard = crate::document::slot().read();
         let ws = guard.as_ref().expect("workspace");
         let last_op = ws.project.operation_log.last().expect("operation logged");
         let params: &Value = &last_op.before_patch;

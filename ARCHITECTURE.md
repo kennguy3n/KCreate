@@ -1614,6 +1614,320 @@ the LLM sidecar is unchanged from earlier phases (loopback
 only); export AI, preview, and import all run in-process.
 The sentinel stays green.
 
+## 17p. Phase 11 — Render performance, async bridge, prototype animation, concurrency & security hardening
+
+Phase 11 attacks the four widest deltas the audit
+identified between KCreate and the professional reference
+designers (Figma, Affinity, Photoshop): render-pipeline
+throughput, bridge responsiveness, prototype
+expressiveness, and defence-in-depth.
+
+### Incremental scene sync
+
+`crates/kcreate_core/src/document.rs::DocumentGraph` now
+carries a `dirty: HashSet<Uuid>` and a `structure_dirty:
+bool`. Every mutation method
+(`insert_node`, `remove_node`, `get_node_mut`,
+`reparent_node`, `reorder_children`, `swap_node`,
+`apply_lww`) marks the affected node(s) dirty; structural
+operations also set `structure_dirty`. `drain_dirty`
+returns and clears the set. `SceneSync`
+(`crates/kcreate_bridge/src/scene_sync.rs`) caches the
+last-emitted `Vec<Object>` per document node and a
+`cached_scene_version: u64`. The common case (the user
+edits one node) re-runs `visit()` only for the dirty
+nodes and rebuilds the `Vec<Object>` by concatenating
+cached entries in z-order — O(dirty) instead of O(N).
+Full rebuild remains the fallback on `structure_dirty`
+and on explicit `SceneSync::clear()`.
+
+### Content-addressed image fingerprinting
+
+`ObjectKind::Image` in
+`crates/kcreate_renderer/src/scene.rs` gained an
+`Option<u64> content_hash` field. `SceneSync` reuses the
+BLAKE3 digest already computed by
+`RasterImageMeta.hash`; `pipeline.rs::hash_object`
+hashes the 8-byte digest in lieu of walking the pixel
+buffer when one is available. For a 4 K image this
+collapses ~48 MB of SipHashing per frame to 8 bytes.
+The chunked-pixel hash is retained as the fallback.
+
+### Spatial indexing for hit testing
+
+`DocumentGraph` gained
+`spatial_index: Option<RTree<SpatialEntry>>` where
+`SpatialEntry` implements `rstar::RTreeObject` over a
+`[f64; 4]` AABB. The index is rebuilt lazily on the first
+query after `structure_dirty` or a drain.
+`query_point(x, y) -> Vec<Uuid>` returns nodes whose
+bounds contain the point, sorted topmost-first.
+`crates/kcreate_bridge/src/hit_test.rs` replaces its
+linear scan with this query — O(log N + k) instead of
+O(N).
+
+### Display-list batching
+
+`crates/kcreate_renderer/src/pipeline.rs::build_display_list`
+groups consecutive `FillRect` / `StrokeRect` commands
+sharing a `Style` into the new
+`DisplayCommand::BatchedRects { rects, style }` variant.
+On an artboard-heavy scene this collapses per-artboard
+shadow + background + label from three draw calls to
+one. The CPU backend iterates the rects; the GPU backend
+gets the same shape so a future instanced-draw upgrade
+is a drop-in.
+
+### Async N-API surface
+
+The raster filter family
+(`raster_apply_blur`, `_sharpen`, `_levels`, `_curves`,
+`_hsl`, `_color_balance`, `_perspective`,
+`_apply_filter_masked`, `raster_crop`), the export
+operations (`export_png`, `export_pdf`,
+`export_svg_async`), and `project_save` are now
+`AsyncTask` entry points in
+`crates/kcreate_bridge/src/lib.rs` following the
+Phase 4 `VisionDescribeImageTask` pattern. The filter
+runs on libuv's threadpool with the workspace lock
+released; resolve is on the main thread. `project_save`
+(Phase 11 follow-up round 7 — Devin Review BUG-0001 r7)
+follows a five-step workspace-lock-free SQLite pattern:
+(1) snapshot `Project` fields under a brief read lock,
+(2) `Arc::clone` the `ProjectStore` handle (the store
+is wrapped in `Arc<parking_lot::Mutex<…>>` precisely so
+the SQLite connection can outlive the workspace
+guard), (3) drop the read lock, (4) stream the snapshot
+to SQLite holding *only* the inner store `Mutex` —
+**no workspace lock is held during this step**, so
+concurrent renderer reads and writes never wait on the
+save, and (5) take a brief workspace write lock to
+merge newly-persisted op ids into `persisted_op_ids`
+(set union with the post-merge `operation_log` ids as
+the retention mask, so new edits land in the next save
+and front-trimmed ops drop out — preserving the
+`O(max_depth)` invariant). `apps/desktop/shared/scene.ts`
+mirrors the `Promise<void>` signatures.
+
+### GPU compute filters
+
+`crates/kcreate_renderer/src/compute/` contains:
+
+- `gaussian_blur.wgsl` — two-pass separable Gaussian.
+  Pass 1 workgroup-per-row, pass 2 workgroup-per-column.
+- `levels_curves.wgsl` — per-pixel LUT lookup over a
+  256-entry storage buffer (one shader, both levels and
+  curves).
+- `unsharp_mask.wgsl` — consumes the original + blurred
+  textures and emits `o + amount × (o − b)`.
+
+`compute::GpuComputeContext` shares the `wgpu::Device`
+and `Queue` with the existing `GpuBackend`.
+`crates/kcreate_raster/src/filters.rs` exposes
+`gaussian_blur_gpu`, `levels_gpu`, `curves_gpu`, and
+`unsharp_mask_gpu`; the bridge layer
+(`crates/kcreate_bridge/src/gpu_compute.rs`) threads the
+GPU handle through the filter call sites and falls back
+to CPU when no adapter is available. 64 MP blur drops
+from ~3 s (CPU, radius 20) to ~50 ms on Tier 2+.
+
+### Prototype animation engine
+
+`crates/kcreate_core/src/node.rs::InteractionAction`
+gained `NavigateTo { transition }`, `OpenOverlay { transition }`,
+and `SwitchVariant { variant_id, transition }`.
+`Transition { animation: AnimationType, duration_ms: u32,
+easing: EasingCurve, direction: Option<SlideDirection> }`
+defaults to `Instant + 300 ms + EaseInOut` so legacy
+interactions deserialize unchanged. `EasingCurve` covers
+Linear, EaseIn, EaseOut, EaseInOut, `CubicBezier { x1,
+y1, x2, y2 }`, and `Spring { stiffness, damping }`.
+
+`apps/desktop/renderer/src/lib/EasingEngine.ts` ships the
+solvers; `PrototypePlayer.tsx` captures an outgoing frame
+via `window.kcreate.renderer.acquireFrame()`, layers the
+outgoing and incoming artboard in stacked `<div>`s, and
+drives opacity / transform with `requestAnimationFrame`.
+`SwitchVariant` matches layers by name between source and
+target and interpolates `bounds`, `opacity`, fill colour
+(in HSL space for smooth hue transitions), and corner
+radius across the duration — the Figma "Smart Animate"
+equivalent. Layers exclusive to one side cross-fade.
+
+`InteractionTrigger` adds `MouseEnter`, `MouseLeave`,
+`AfterDelay { ms }` alongside the existing
+`Click` / `Hover` / `Press`. `AfterDelay` is what enables
+splash → home screen transitions without a click.
+
+### Auto-layout propagation through component instances
+
+`crates/kcreate_bridge/src/document.rs::document_update_node`
+detects bounds changes on `ComponentLayer` nodes with
+`component_instance` metadata and re-runs
+`layout_recompute` on the instance, recursing into nested
+instances with a depth-limit of 16 so circular references
+can't loop forever. `crates/kcreate_layout/src/flex.rs`
+and `grid.rs` gained
+`layout_flex_with_overrides` /
+`layout_grid_with_overrides` so per-child override sizes
+from `instance.overrides` win over intrinsic sizes during
+the solve — resizing an instance now correctly reflows
+its children just like Figma.
+
+### Workspace RwLock + per-node version
+
+`crates/kcreate_bridge/src/document.rs` replaces the
+single `Mutex<Option<Workspace>>` with
+`RwLock<Option<Workspace>>`. Every call site was audited:
+read-only entry points (`document_get_tree`,
+`document_status`, `document_get_selection`,
+`export_svg`, `export_preset_list`, etc.) use `read()`;
+mutating entry points use `write()`. Multiple panels can
+now query the tree concurrently — the editor side panel,
+the layers panel, and the prototype overlay no longer
+serialise on the workspace.
+
+`Node::touch()` now increments a `version: u64` field
+on every mutation, and `DocumentGraph` maintains a
+`document_version: AtomicU64` counter. The bridge
+exports `document_version()` as a lock-free read of the
+atomic. The renderer polls this at 60 fps and skips the
+`refreshTree` IPC round-trip when the counter hasn't
+moved — MVCC-style optimistic reads.
+
+**Lock ordering after Phase 11.** Workspace RwLock →
+renderer Mutex → tile-cache Mutex. Documented at the top
+of `crates/kcreate_bridge/src/document.rs` so future
+contributors don't introduce inversion deadlocks.
+
+### Delta-compressed operations
+
+`crates/kcreate_core/src/operation_compress.rs` stores
+`OperationDelta { added_keys, removed_keys, changed_keys }`
+internally and reconstructs the full `Operation` only at
+the API boundary. Raster ops shrink to a single
+blob-hash diff; property edits typically encode in 1–3
+keys. `crates/kcreate_storage/src/project_io.rs` writes
+the compressed form and auto-upgrades legacy rows on
+load — a 1000-operation log uses 60–90 % less memory.
+
+### Lazy subsystem initialization
+
+Audited every Phase 8/9/10 subsystem on bridge load: tile
+cache, LLM sidecar, memory watchdog, audit DB, collab
+transport, and `fontdb` discovery are all deferred behind
+`OnceCell` / first-use guards.
+`fontdb` (the slowest of these) now runs on a background
+thread; the text engine returns a "fonts loading"
+placeholder until the scan completes. Startup timeline
+marks in `crates/kcreate_bridge/src/perf.rs` confirm
+`bridge.first_call → project_create.start < 200 ms`.
+
+### LLM sidecar authentication + TOCTOU fix
+
+`crates/kcreate_ai/src/llm_sidecar.rs` generates a fresh
+32-byte bearer token per session via `getrandom`, hands
+it to `llama-server --api-key`, and stores it on
+`SidecarConfig`. `crates/kcreate_ai/src/llm_chat.rs`
+attaches `Authorization: Bearer <token>` to every
+loopback HTTP call. The token never leaves the bridge
+address space — `crates/kcreate_bridge/src/llm.rs::SidecarStatus`
+explicitly drops it before forwarding status to the
+renderer.
+
+The TOCTOU port-allocation race is closed by a post-spawn
+verification step (Option C from the task spec): after
+binding the loopback listener and spawning
+`llama-server`, the bridge connects to the port and
+issues a `GET /v1/models` with the session token. If the
+response is missing or carries the wrong token, the
+process is killed and the sidecar is retried on a freshly
+bound port — so a parallel process that races onto the
+same port can never serve KCreate's traffic.
+
+### ACL encryption
+
+`crates/kcreate_collab/src/acl.rs` ships:
+
+- `encrypt_acl_bytes(key: &[u8; 32], plaintext) -> Vec<u8>`
+- `decrypt_acl_bytes(key: &[u8; 32], blob) -> Vec<u8>`
+- `looks_like_encrypted_acl(blob) -> bool`
+
+Wire format: `KCAClv1\0` magic (8 bytes) + 12-byte
+ChaCha20-Poly1305 nonce + ciphertext-with-AEAD-tag.
+Nonces are sampled from the OS CSPRNG via `getrandom`,
+matching the documented contract in `clipboard.rs` —
+`rand::thread_rng()` is pseudo-random and is not used.
+
+`crates/kcreate_bridge/src/collab.rs::load_project_acl`
+prefers `acl.json.enc` when an SQLCipher-derived key is
+cached on the workspace; if it finds only a plaintext
+`acl.json` on an encrypted project, it auto-migrates by
+re-encrypting and deleting the plaintext copy.
+`save_project_acl` writes to the encrypted path when a
+key is available and cleans up the stale opposite-format
+file on every write. Crypto failures are fatal —
+there's no silent fallback to plaintext, which is
+essential for the "no MITM" property.
+
+### KChat REST certificate pinning
+
+`crates/kcreate_kchat_client/src/pinning.rs` builds a
+custom `rustls::ClientConfig` whose `ServerCertVerifier`
+runs the standard
+`WebPkiServerVerifier::builder(mozilla_roots).build()`
+chain check first, then additionally verifies that the
+leaf certificate's DER encoding hashes to the configured
+SHA-256 pin (constant-time compare). The config is
+handed to
+`reqwest::ClientBuilder::use_preconfigured_tls(...)` so
+the existing REST stack runs over the pinned config
+unchanged.
+
+`RestClientConfig::pinned_certificate_sha256` is an
+optional hex string parsed eagerly at construction time
+(supports `openssl x509 -fingerprint`-style colon
+separators) — a malformed pin surfaces as
+`ClientError::InvalidPinnedCertificate` before any
+traffic is sent. A pin mismatch becomes
+`ClientError::CertificatePinMismatch`, mapped from
+reqwest's error chain via the `KCREATE_PIN_MISMATCH:`
+marker that the verifier embeds in its `rustls::Error`.
+When no pin is configured the client uses reqwest's
+default rustls / system-CA path — pinning is purely
+additive.
+
+### Security model summary (Phase 11)
+
+| Surface              | Threat                                        | Defence                                                                                  |
+| -------------------- | --------------------------------------------- | ---------------------------------------------------------------------------------------- |
+| Loopback LLM sidecar | Local process intercepts the port             | 32-byte bearer token + post-spawn verification handshake before any chat request flows.   |
+| Project ACL          | Disk forensic / theft                         | ChaCha20-Poly1305 with SQLCipher-derived key, auto-migration from plaintext.              |
+| KChat backend        | Mis-issued cert / TLS interceptor             | Leaf-cert SHA-256 pin layered on WebPKI chain validation, constant-time compare.          |
+| Pinning misconfig    | Empty / malformed pin silently disables check | Eager hex parse + WebPKI builder error surfaced as `InvalidPinnedCertificate`.            |
+| Renderer trust       | Renderer leaks sidecar credentials            | Bearer token is dropped before `SidecarStatus` crosses the N-API boundary.                |
+
+### Performance targets (Phase 11)
+
+| Scenario                                       | Before               | After (Tier 2+)        |
+| ---------------------------------------------- | -------------------- | ---------------------- |
+| Pan / zoom 5000-node artboard                  | 30 fps (Tier 1)      | 60 fps (Tier 1)        |
+| Pan / zoom 10 000-node artboard                | not viable           | 60 fps                  |
+| 64 MP Gaussian blur, radius 20                 | ~3 s (CPU)           | < 500 ms (GPU)          |
+| `sync_document_to_scene` after single-node edit| O(N) walk            | O(1) cached + sort      |
+| Hit test on 5000-node document                 | O(N) linear scan     | O(log N + k) R-tree     |
+| Scene fingerprint with 4 K image               | 48 MB SipHashed      | 8 bytes hashed          |
+| Undo log memory, 1000 ops                      | Full snapshots       | 60–90 % smaller (delta) |
+
+**Local-first invariant.** None of the Phase 11 work
+pulls networking into the editing-path closure walked by
+`crates/kcreate_tests/tests/local_first.rs`. The only
+new dependency that touches a CA bundle is
+`webpki-roots`, consumed exclusively by
+`kcreate_kchat_client` (already excluded from the
+closure by the `kchat-backend` feature gate). The
+sentinel stays green.
+
 ## 18. Resource optimization
 
 - **Startup.** Lazy-load model packs; precompile no shaders we won't

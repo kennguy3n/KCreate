@@ -227,7 +227,7 @@ fn bench_sync_document_dense(c: &mut Criterion) {
         group.bench_with_input(BenchmarkId::from_parameter(count), &doc, |b, doc| {
             b.iter(|| {
                 let mut sync = SceneSync::new();
-                let scene = sync.sync_document_to_scene(doc, None, &[]);
+                let scene = sync.sync_document_to_scene_borrowed(doc, None, &[]);
                 criterion::black_box(scene.objects.len());
             });
         });

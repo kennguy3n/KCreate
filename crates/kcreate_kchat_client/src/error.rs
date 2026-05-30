@@ -118,6 +118,22 @@ pub enum ClientError {
     /// instead of failing silently.
     #[error("KChat backend refused artifact: payload too large ({message})")]
     ArtifactTooLarge { message: String },
+
+    /// Phase 11 Block E Task 28 — the configured pinned-certificate
+    /// SHA-256 is malformed (not 64 hex digits, contains non-hex
+    /// characters, etc.). Surfaced at client-construction time
+    /// rather than on first request so misconfiguration is caught
+    /// before any traffic is sent.
+    #[error("KChat backend pinned-certificate config invalid: {message}")]
+    InvalidPinnedCertificate { message: String },
+
+    /// Phase 11 Block E Task 28 — TLS handshake completed standard
+    /// WebPKI chain validation but the leaf certificate's SHA-256
+    /// fingerprint did not match the configured pin. This is the
+    /// canonical "possible MITM" signal: a valid CA chain is no
+    /// longer sufficient when pinning is in effect.
+    #[error("KChat backend certificate pin mismatch — possible MITM. Contact your KChat administrator. ({message})")]
+    CertificatePinMismatch { message: String },
 }
 
 impl ClientError {

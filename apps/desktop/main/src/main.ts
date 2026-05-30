@@ -789,8 +789,11 @@ function registerIpcHandlers(): void {
     }
     return info;
   });
-  ipcMain.handle("kcreate/project/save", () => {
-    requireBridge().projectSave();
+  ipcMain.handle("kcreate/project/save", async () => {
+    // Phase 11 Block B: projectSave is now async; the worker pool
+    // serialises the project off the main thread. ipcMain.handle
+    // forwards the Promise to the renderer transparently.
+    await requireBridge().projectSave();
   });
   ipcMain.handle("kcreate/project/close", async () => {
     // Release the lockfile *before* the bridge call so a concurrent
@@ -815,6 +818,12 @@ function registerIpcHandlers(): void {
 
   ipcMain.handle("kcreate/document/getTree", () =>
     requireBridge().documentGetTree(),
+  );
+  // Phase 11 Block D Task 21 — lock-free document-version snapshot
+  // used by renderer pollers to skip `getTree` round-trips when the
+  // workspace hasn't changed.
+  ipcMain.handle("kcreate/document/version", () =>
+    requireBridge().documentVersion(),
   );
   ipcMain.handle(
     "kcreate/document/inspectNode",
@@ -1162,17 +1171,37 @@ function registerIpcHandlers(): void {
 
   ipcMain.handle(
     "kcreate/export/svg",
-    (_e, nodeIds: string[], optionsJson: string) =>
-      requireBridge().exportSvg(nodeIds, optionsJson),
+    (_e, nodeIds: string[], optionsJson: string) => {
+      // Pick async vs sync based on the **export selection** size,
+      // not the total document size. Worker dispatch is ~200 µs;
+      // serialising the SVG for a 5-node selection is faster than
+      // that, so the sync path stays for small selections and we
+      // switch to the async worker past 100 selected nodes (where
+      // the round-trip pays for itself many times over). This is a
+      // heuristic, not a guarantee — a single-artboard export from
+      // a huge document still hits the sync path because the
+      // subtree we're serialising is bounded by `nodeIds`, not the
+      // whole document. The bridge SVG serialiser walks only the
+      // requested nodes' subtrees, so the heuristic tracks the
+      // actual cost.
+      //
+      // Phase 11 Block B follow-up — Devin Review ANALYSIS-0006.
+      if (nodeIds.length > 100) {
+        return requireBridge().exportSvgAsync(nodeIds, optionsJson);
+      }
+      return requireBridge().exportSvg(nodeIds, optionsJson);
+    },
   );
   ipcMain.handle(
     "kcreate/export/png",
     (_e, outputPath: string, optionsJson: string) =>
+      // Phase 11 Block B: async; returns Promise<number>.
       requireBridge().exportPng(outputPath, optionsJson),
   );
   ipcMain.handle(
     "kcreate/export/pdf",
     (_e, outputPath: string, optionsJson: string) =>
+      // Phase 11 Block B: async; returns Promise<number>.
       requireBridge().exportPdf(outputPath, optionsJson),
   );
   ipcMain.handle(
@@ -1410,6 +1439,11 @@ function registerIpcHandlers(): void {
     (_e, nodeId: string, variantId: string): void => {
       requireBridge().componentSwitchVariant(nodeId, variantId);
     },
+  );
+  ipcMain.handle(
+    "kcreate/component/smartAnimateSnapshot",
+    (_e, nodeId: string, targetVariantId: string): string =>
+      requireBridge().componentSmartAnimateSnapshot(nodeId, targetVariantId),
   );
   ipcMain.handle(
     "kcreate/component/detach",
@@ -2594,57 +2628,65 @@ function registerIpcHandlers(): void {
   // through `kcreate/raster/preview` (non-destructive); the rest are
   // undoable commits.
   // ---------------------------------------------------------------------
+  // Phase 11 Block B: raster filters became Promise-returning. The
+  // handlers must `await` so ipcMain.handle forwards rejection back
+  // to the renderer's `invoke`.
   ipcMain.handle(
     "kcreate/raster/apply/levels",
-    (_e, nodeId: string, black: number, white: number, gamma: number) => {
-      requireBridge().rasterApplyLevels(nodeId, black, white, gamma);
+    async (_e, nodeId: string, black: number, white: number, gamma: number) => {
+      await requireBridge().rasterApplyLevels(nodeId, black, white, gamma);
     },
   );
   ipcMain.handle(
     "kcreate/raster/apply/curves",
-    (_e, nodeId: string, pointsJson: string) => {
-      requireBridge().rasterApplyCurves(nodeId, pointsJson);
+    async (_e, nodeId: string, pointsJson: string) => {
+      await requireBridge().rasterApplyCurves(nodeId, pointsJson);
     },
   );
   ipcMain.handle(
     "kcreate/raster/apply/blur",
-    (_e, nodeId: string, radius: number, kind: string) => {
-      requireBridge().rasterApplyBlur(nodeId, radius, kind);
+    async (_e, nodeId: string, radius: number, kind: string) => {
+      await requireBridge().rasterApplyBlur(nodeId, radius, kind);
     },
   );
   ipcMain.handle(
     "kcreate/raster/apply/sharpen",
-    (
+    async (
       _e,
       nodeId: string,
       radius: number,
       amount: number,
       threshold: number,
     ) => {
-      requireBridge().rasterApplySharpen(nodeId, radius, amount, threshold);
+      await requireBridge().rasterApplySharpen(nodeId, radius, amount, threshold);
     },
   );
   ipcMain.handle(
     "kcreate/raster/crop",
-    (_e, nodeId: string, x: number, y: number, w: number, h: number) => {
-      requireBridge().rasterCrop(nodeId, x, y, w, h);
+    async (_e, nodeId: string, x: number, y: number, w: number, h: number) => {
+      await requireBridge().rasterCrop(nodeId, x, y, w, h);
     },
   );
+  // Phase 11 Block B follow-up — Devin Review ANALYSIS-0003.
+  // Rotate / flip / heal are now async (AsyncTask) on the Rust
+  // side; `await` so the IPC reply is sent only after the worker
+  // finishes mutating the layer (renderer relies on the resolved
+  // promise to invalidate caches and refresh the tree).
   ipcMain.handle(
     "kcreate/raster/rotate",
-    (_e, nodeId: string, angleDeg: number) => {
-      requireBridge().rasterRotate(nodeId, angleDeg);
+    async (_e, nodeId: string, angleDeg: number) => {
+      await requireBridge().rasterRotate(nodeId, angleDeg);
     },
   );
   ipcMain.handle(
     "kcreate/raster/flip",
-    (_e, nodeId: string, direction: string) => {
-      requireBridge().rasterFlip(nodeId, direction);
+    async (_e, nodeId: string, direction: string) => {
+      await requireBridge().rasterFlip(nodeId, direction);
     },
   );
   ipcMain.handle(
     "kcreate/raster/heal",
-    (
+    async (
       _e,
       nodeId: string,
       srcX: number,
@@ -2653,7 +2695,7 @@ function registerIpcHandlers(): void {
       dstY: number,
       radius: number,
     ) => {
-      requireBridge().rasterHeal(nodeId, srcX, srcY, dstX, dstY, radius);
+      await requireBridge().rasterHeal(nodeId, srcX, srcY, dstX, dstY, radius);
     },
   );
   ipcMain.handle(
@@ -2670,32 +2712,32 @@ function registerIpcHandlers(): void {
   // -------------------------------------------------------------------
   ipcMain.handle(
     "kcreate/raster/perspective",
-    (_e, nodeId: string, cornersJson: string) => {
-      requireBridge().rasterPerspective(nodeId, cornersJson);
+    async (_e, nodeId: string, cornersJson: string) => {
+      await requireBridge().rasterPerspective(nodeId, cornersJson);
     },
   );
   ipcMain.handle(
     "kcreate/raster/apply/hsl",
-    (
+    async (
       _e,
       nodeId: string,
       hue: number,
       saturation: number,
       lightness: number,
     ) => {
-      requireBridge().rasterApplyHsl(nodeId, hue, saturation, lightness);
+      await requireBridge().rasterApplyHsl(nodeId, hue, saturation, lightness);
     },
   );
   ipcMain.handle(
     "kcreate/raster/apply/color_balance",
-    (
+    async (
       _e,
       nodeId: string,
       shadowsJson: string,
       midtonesJson: string,
       highlightsJson: string,
     ) => {
-      requireBridge().rasterApplyColorBalance(
+      await requireBridge().rasterApplyColorBalance(
         nodeId,
         shadowsJson,
         midtonesJson,
@@ -2705,13 +2747,13 @@ function registerIpcHandlers(): void {
   );
   ipcMain.handle(
     "kcreate/raster/apply/filter_masked",
-    (_e, nodeId: string, filterJson: string, mask: Buffer) => {
+    async (_e, nodeId: string, filterJson: string, mask: Buffer) => {
       // `mask` arrives as a Node `Buffer` because the preload wraps
       // the renderer-supplied `Uint8Array` with
       // `Buffer.from(buffer, byteOffset, byteLength)` before invoke;
       // typing it as `Buffer` here keeps the contract obvious and
       // matches the napi-rs `Buffer` decoder in `raster_apply_filter_masked`.
-      requireBridge().rasterApplyFilterMasked(nodeId, filterJson, mask);
+      await requireBridge().rasterApplyFilterMasked(nodeId, filterJson, mask);
     },
   );
 

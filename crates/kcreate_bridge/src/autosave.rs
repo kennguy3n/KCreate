@@ -247,7 +247,7 @@ pub fn autosave_status() -> AutosaveStatus {
 /// when the project was last cleanly closed. The renderer surfaces
 /// the result as the "Recover unsaved work?" dialog.
 pub fn autosave_recovery_available() -> Result<Option<AutosaveMarker>> {
-    let marker_path = with_workspace(|ws| Ok(marker_path_for(ws.store.project_dir())))?;
+    let marker_path = with_workspace(|ws| Ok(marker_path_for(ws.store.lock().project_dir())))?;
     if !marker_path.exists() {
         return Ok(None);
     }
@@ -291,7 +291,7 @@ pub fn autosave_recover() -> Result<()> {
 /// last clean save) to roll the document back to the user's last
 /// confirmed state.
 pub fn autosave_dismiss_recovery() -> Result<()> {
-    let marker_path = with_workspace(|ws| Ok(marker_path_for(ws.store.project_dir())))?;
+    let marker_path = with_workspace(|ws| Ok(marker_path_for(ws.store.lock().project_dir())))?;
     if marker_path.exists() {
         fs::remove_file(&marker_path).map_err(|e| {
             DocumentBridgeError::Internal(format!(
@@ -354,7 +354,7 @@ fn marker_path_for(project_dir: &Path) -> PathBuf {
 
 fn write_marker_with_counter(counter: u64) -> Result<()> {
     let (marker, marker_path) = with_workspace_mut(|ws| {
-        let dir = ws.store.project_dir().to_path_buf();
+        let dir = ws.store.lock().project_dir().to_path_buf();
         let marker = AutosaveMarker {
             project_path: dir.clone(),
             modified_at: ws.project.modified_at,

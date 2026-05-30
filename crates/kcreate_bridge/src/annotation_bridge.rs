@@ -125,7 +125,7 @@ pub fn annotation_create(request: AnnotationCreateRequest) -> Result<Annotation>
     );
     let stored = ann.clone();
     with_workspace_mut(|ws| {
-        kcreate_storage::annotations::upsert_annotation(ws.store.connection(), &stored)
+        kcreate_storage::annotations::upsert_annotation(ws.store.lock().connection(), &stored)
             .map_err(|e| DocumentBridgeError::Internal(format!("upsert_annotation: {e}")))?;
         Ok(())
     })?;
@@ -137,7 +137,7 @@ pub fn annotation_create(request: AnnotationCreateRequest) -> Result<Annotation>
 pub fn annotation_reply(request: AnnotationReplyRequest) -> Result<Annotation> {
     require_editor_permission()?;
     let parent = with_workspace(|ws| {
-        kcreate_storage::annotations::load_annotation(ws.store.connection(), request.parent_id)
+        kcreate_storage::annotations::load_annotation(ws.store.lock().connection(), request.parent_id)
             .map_err(|e| DocumentBridgeError::Internal(format!("load_annotation: {e}")))?
             .ok_or_else(|| {
                 DocumentBridgeError::Internal(format!(
@@ -154,7 +154,7 @@ pub fn annotation_reply(request: AnnotationReplyRequest) -> Result<Annotation> {
     );
     let stored = reply.clone();
     with_workspace_mut(|ws| {
-        kcreate_storage::annotations::upsert_annotation(ws.store.connection(), &stored)
+        kcreate_storage::annotations::upsert_annotation(ws.store.lock().connection(), &stored)
             .map_err(|e| DocumentBridgeError::Internal(format!("upsert_annotation: {e}")))?;
         Ok(())
     })?;
@@ -167,7 +167,7 @@ pub fn annotation_list(request: AnnotationListRequest) -> Result<AnnotationListR
     let filter = request.into_filter();
     with_workspace(|ws| {
         let annotations = kcreate_storage::annotations::list_for_page(
-            ws.store.connection(),
+            ws.store.lock().connection(),
             request.page_id,
             filter,
         )
@@ -182,7 +182,7 @@ pub fn annotation_resolve(request: AnnotationResolveRequest) -> Result<bool> {
     require_editor_permission()?;
     let new_state = with_workspace_mut(|ws| {
         let state = kcreate_storage::annotations::set_resolved(
-            ws.store.connection(),
+            ws.store.lock().connection(),
             request.id,
             request.resolved,
         )
@@ -197,7 +197,7 @@ pub fn annotation_resolve(request: AnnotationResolveRequest) -> Result<bool> {
     // Re-read the full row so the broadcast carries the
     // authoritative timestamp + resolved flag.
     let post = with_workspace(|ws| {
-        kcreate_storage::annotations::load_annotation(ws.store.connection(), request.id)
+        kcreate_storage::annotations::load_annotation(ws.store.lock().connection(), request.id)
             .map_err(|e| DocumentBridgeError::Internal(format!("load_annotation: {e}")))
     })?;
     if let Some(ann) = post {
@@ -214,11 +214,11 @@ pub fn annotation_delete(id: Uuid) -> Result<bool> {
     // carries the full annotation (page_id, thread_id, position)
     // even though the id is gone from the DB by the time we send.
     let snapshot = with_workspace(|ws| {
-        kcreate_storage::annotations::load_annotation(ws.store.connection(), id)
+        kcreate_storage::annotations::load_annotation(ws.store.lock().connection(), id)
             .map_err(|e| DocumentBridgeError::Internal(format!("load_annotation: {e}")))
     })?;
     let removed = with_workspace_mut(|ws| {
-        kcreate_storage::annotations::delete_annotation(ws.store.connection(), id)
+        kcreate_storage::annotations::delete_annotation(ws.store.lock().connection(), id)
             .map_err(|e| DocumentBridgeError::Internal(format!("delete_annotation: {e}")))
     })?;
     if removed {

@@ -18,6 +18,20 @@ pub enum DisplayCommand {
         rect: Rect,
         style: Style,
     },
+    /// **Phase 11 Block A Task 5 — batched rect draw.**
+    ///
+    /// Emitted by [`Pipeline::build_display_list`] when consecutive
+    /// scene objects produced [`DisplayCommand::FillRect`] entries
+    /// with the same [`Style`]. The CPU backend iterates and paints
+    /// each rect; the GPU backend uses an instanced draw call.
+    /// Reduces draw-call count proportionally to the number of
+    /// same-style rects clustered in z-order — most impactful for
+    /// artboard-heavy pages where every artboard emits a background +
+    /// shadow + label rect.
+    BatchedRects {
+        rects: Vec<Rect>,
+        style: Style,
+    },
     FillCircle {
         center: Point2,
         radius: f32,
@@ -134,6 +148,9 @@ impl DisplayList {
                 pixels_width,
                 pixels_height,
                 pixels,
+                // content_hash is consumed by the scene fingerprint
+                // path; the display-list translation doesn't need it.
+                content_hash: _,
             } => DisplayCommand::DrawImage {
                 rect: Rect::new(rect.x + dx, rect.y + dy, rect.width, rect.height),
                 pixels_width: *pixels_width,

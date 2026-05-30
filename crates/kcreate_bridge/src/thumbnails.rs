@@ -64,6 +64,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::document::{slot as workspace_slot, DocumentBridgeError, Workspace};
+use crate::scene_sync::SceneSync;
 
 type Result<T> = std::result::Result<T, DocumentBridgeError>;
 
@@ -267,10 +268,11 @@ impl RecentProjectsStore {
 /// caller's already-held workspace lock; the recent-projects mutex is
 /// briefly contended and never held across renderer work.
 pub(crate) fn record_recent_project(ws: &Workspace) {
-    let manifest = ws.store.manifest();
+    let store = ws.store.lock();
+    let manifest = store.manifest();
     let mut slot = recent_slot().lock();
     slot.record(
-        ws.store.project_dir(),
+        store.project_dir(),
         &manifest.name,
         manifest.id,
         manifest.modified_at,
@@ -469,8 +471,15 @@ pub fn prepare_thumbnails_background(max_dim_px: u32) -> Result<()> {
     let guard = PrewarmGuard;
     // Snapshot the page list under the workspace lock so the worker
     // doesn't depend on the document staying open.
+    //
+    // Phase 11 Block D follow-up round 2 — Devin Review ANALYSIS-0001
+    // (round 2). `page_ids(ws)` is a pure read over `ws.project.doc`;
+    // upgrading to `write()` was a mechanical Mutex → RwLock leftover.
+    // Use `read()` so the thumbnail prewarm doesn't block concurrent
+    // document reads during page enumeration. Matches the discipline
+    // documented in ARCHITECTURE.md §17p (RwLock audit intent).
     let pages = {
-        let wsguard = workspace_slot().lock();
+        let wsguard = workspace_slot().read();
         let ws = match wsguard.as_ref() {
             Some(ws) => ws,
             None => {
@@ -556,17 +565,26 @@ struct ThumbnailTarget {
 ///    thumbnail request will see the new hash → miss → re-render.
 fn ensure_thumbnail_for<F>(key: Uuid, max_dim_px: u32, prepare: F) -> Result<ThumbnailBytes>
 where
-    F: FnOnce(&mut Workspace) -> Result<(String, ThumbnailTarget, Scene)>,
+    // Phase 11 Block A follow-up round 5 — Devin Review
+    // ANALYSIS-0002 (r5). `prepare` derives the content hash,
+    // target bounds, and scene from a read-only view of the
+    // workspace; signature is `FnOnce(&Workspace)` (not `&mut`)
+    // so we can hold the workspace `RwLock` in `read()` mode
+    // during step 1. Concurrent readers (tree view, status bar,
+    // selection inspector, renderer version polling) stay
+    // parallel while thumbnails are computed, preserving the
+    // Phase 11 Block D RwLock benefit on the thumbnail path.
+    F: FnOnce(&Workspace) -> Result<(String, ThumbnailTarget, Scene)>,
 {
     // Step 1 — single lock window: derive hash + target + scene, and
     // short-circuit on a cache hit. Note the cache is on disk under
-    // `ws.store.thumbnails_dir()`, so we must hold the lock long
+    // `ws.store.lock().thumbnails_dir()`, so we must hold the lock long
     // enough to safely open it; the open is cheap (sled-style hash
     // map) so this doesn't materially block the UI thread.
     let (content_hash, target, scene) = {
-        let mut guard = workspace_slot().lock();
-        let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
-        let cache = ThumbnailCache::open(ws.store.thumbnails_dir()).map_err(thumb_err)?;
+        let guard = workspace_slot().read();
+        let ws = guard.as_ref().ok_or(DocumentBridgeError::NoProject)?;
+        let cache = ThumbnailCache::open(ws.store.lock().thumbnails_dir()).map_err(thumb_err)?;
         let (hash, target, scene) = prepare(ws)?;
         if let Some(cached) = cache.lookup(key, &hash).map_err(thumb_err)? {
             return Ok(ThumbnailBytes::from_cached(cached));
@@ -598,9 +616,9 @@ where
 }
 
 fn cache_store(key: Uuid, content_hash: &str, bytes: &[u8], width: u32, height: u32) -> Result<()> {
-    let mut guard = workspace_slot().lock();
+    let mut guard = workspace_slot().write();
     let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
-    let mut cache = ThumbnailCache::open(ws.store.thumbnails_dir()).map_err(thumb_err)?;
+    let mut cache = ThumbnailCache::open(ws.store.lock().thumbnails_dir()).map_err(thumb_err)?;
     cache
         .store(
             key,
@@ -613,14 +631,36 @@ fn cache_store(key: Uuid, content_hash: &str, bytes: &[u8], width: u32, height: 
         .map_err(thumb_err)
 }
 
-fn build_scene_for_target(ws: &mut Workspace, target: ThumbnailTarget) -> Scene {
-    // Hidden ws field access matches what `sync_scene_locked` does. We
-    // use the workspace's scene_sync since it already understands the
-    // document's blobs / selection layering — but pass `&[]` for
-    // selection so highlight overlays aren't baked into thumbnails.
-    let mut scene =
-        ws.scene_sync
-            .sync_document_to_scene(&ws.project.document, Some(ws.store.blobs()), &[]);
+fn build_scene_for_target(ws: &Workspace, target: ThumbnailTarget) -> Scene {
+    // Phase 11 Block A follow-up round 3 — Devin Review ANALYSIS-0004
+    // (r3). Previously this called
+    // `ws.scene_sync.sync_document_to_scene(&mut ws.project.document, …)`
+    // which has two side effects we do NOT want here:
+    //   (1) `drain_dirty()` empties the document's pending mutation
+    //       set, so any edits since the last main-thread sync would
+    //       be consumed by the thumbnail path and silently skipped
+    //       by the next `documentGetTree`/scene-sync round-trip,
+    //       producing a stale main canvas;
+    //   (2) the workspace's incremental `node_cache` would be
+    //       partially repopulated against the *thumbnail's* viewport
+    //       coordinates (after `translate` below), poisoning the
+    //       cache for the next main render.
+    //
+    // The architecturally correct fix is for thumbnails to keep their
+    // own ephemeral `SceneSync` instance: `SceneSync::default()` is
+    // essentially free (empty hashmaps), takes `&DocumentGraph` via
+    // `sync_document_to_scene_borrowed`, and is dropped at the end
+    // of this function. The main `ws.scene_sync` and the document's
+    // dirty set are untouched. Selection is empty so highlight
+    // overlays aren't baked into the thumbnail. Workspace is taken
+    // as `&Workspace` (no `&mut`) to make the read-only contract
+    // explicit at the type level.
+    let mut thumbnail_sync = SceneSync::default();
+    let mut scene = thumbnail_sync.sync_document_to_scene_borrowed(
+        &ws.project.document,
+        Some(ws.store.lock().blobs()),
+        &[],
+    );
     // Translate so the target bounds land at the renderer origin —
     // mirroring `kcreate_export::slice::translate_scene`.
     let dx = -target.bounds.x as f32;

@@ -23,6 +23,7 @@ import type {
   CanvasBridge,
   ComponentBridge,
   ComponentInfo,
+  SmartAnimateSnapshot,
   CreateNodeProps,
   FlexLayout,
   GridLayout,
@@ -533,6 +534,16 @@ const document: DocumentBridge = {
       "kcreate/document/getTree",
     )) as NodeInfoSnake[];
     return raw.map(nodeFromSnake);
+  },
+  /**
+   * Phase 11 Block D Task 21 — read the workspace version counter
+   * without acquiring the workspace lock. Pollers use this to skip
+   * `getDocumentTree` IPC when nothing has changed.
+   */
+  async getDocumentVersion(): Promise<number> {
+    return (await ipcRenderer.invoke(
+      "kcreate/document/version",
+    )) as number;
   },
   async inspectNode(nodeId: string): Promise<InspectCode> {
     const raw = (await ipcRenderer.invoke(
@@ -1388,6 +1399,17 @@ const component: ComponentBridge = {
       variantId,
     );
   },
+  async smartAnimateSnapshot(
+    nodeId: string,
+    targetVariantId: string,
+  ): Promise<SmartAnimateSnapshot> {
+    const json = (await ipcRenderer.invoke(
+      "kcreate/component/smartAnimateSnapshot",
+      nodeId,
+      targetVariantId,
+    )) as string;
+    return JSON.parse(json) as SmartAnimateSnapshot;
+  },
   async detach(nodeId: string): Promise<void> {
     await ipcRenderer.invoke("kcreate/component/detach", nodeId);
   },
@@ -1422,10 +1444,17 @@ const interaction: InteractionBridge = {
     trigger: InteractionTrigger,
     action: InteractionAction,
   ): Promise<string> {
+    // Phase 11: `InteractionTrigger` is now a union of simple
+    // discriminator strings (`"click"`, …) AND a data-carrying
+    // `{ kind: "after_delay", ms }` object. The bridge accepts both
+    // forms, but the IPC channel passes a string — JSON-encode the
+    // object form before crossing the boundary.
+    const triggerWire =
+      typeof trigger === "string" ? trigger : JSON.stringify(trigger);
     return (await ipcRenderer.invoke(
       "kcreate/interaction/add",
       nodeId,
-      trigger,
+      triggerWire,
       JSON.stringify(action),
     )) as string;
   },

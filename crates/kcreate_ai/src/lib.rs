@@ -69,9 +69,9 @@ pub use layout_suggest::{
     LayoutOrientation, LayoutSuggestError, LayoutSuggestOptions, LayoutSuggestion,
 };
 pub use llm_chat::{
-    build_system_prompt, build_tool_call_system_prompt, chat_completion, parse_completion,
-    request_tool_call, ChatContent, ChatError, ChatMessage, ChatRequest, ChatResponse, ChatResult,
-    ChatRole, ContentPart,
+    build_system_prompt, build_tool_call_system_prompt, chat_completion,
+    chat_completion_with_token, parse_completion, request_tool_call, ChatContent, ChatError,
+    ChatMessage, ChatRequest, ChatResponse, ChatResult, ChatRole, ContentPart,
 };
 pub use llm_sidecar::{LlmSidecar, SidecarConfig, SidecarError, SidecarResult, SidecarStatus};
 pub use mlx_sidecar::{probe_mlx_available, MlxSidecar, MlxSidecarConfig};

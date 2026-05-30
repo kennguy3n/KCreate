@@ -23,6 +23,7 @@ pub mod autosave;
 pub mod collab;
 pub mod document;
 pub mod encryption;
+pub mod gpu_compute;
 pub mod hit_test;
 #[cfg(feature = "kchat-backend")]
 pub mod kchat_artifact;
@@ -33,6 +34,7 @@ pub mod llm;
 pub mod native_canvas;
 pub mod perf;
 pub mod phase10;
+pub mod phase11;
 pub mod phase2;
 pub mod phase4;
 pub mod phase8;
@@ -56,8 +58,8 @@ use uuid::Uuid;
 
 use crate::document::{
     BoundsInfo as CoreBoundsInfo, CreateNodeProps, DocumentBridgeError, NodeInfo as CoreNodeInfo,
-    PngExportRequest as CorePngRequest, ProjectInfo as CoreProjectInfo,
-    RuntimeStatus as CoreRuntimeStatus, UndoRedoOutcome as CoreUndoRedoOutcome, UpdateNodeProps,
+    ProjectInfo as CoreProjectInfo, RuntimeStatus as CoreRuntimeStatus,
+    UndoRedoOutcome as CoreUndoRedoOutcome, UpdateNodeProps,
 };
 use crate::state::{
     AcquiredFrame as CoreAcquiredFrame, BridgeError, RendererFrameInfo as CoreFrameInfo,
@@ -507,10 +509,50 @@ pub fn project_open(dir: String) -> NapiResult<ProjectInfo> {
         .map_err(map_doc_err)
 }
 
-/// Persist the current project to disk.
+/// Persist the current project to disk. Runs on the napi worker
+/// pool so a multi-megabyte save doesn't freeze the renderer.
+#[napi(ts_return_type = "Promise<void>")]
+pub fn project_save() -> AsyncTask<phase11::ProjectSaveTask> {
+    AsyncTask::new(phase11::ProjectSaveTask)
+}
+
+/// Phase 11 Block D Task 21 — monotonic document version. Bumps on
+/// every mutation (create / update / delete / undo / redo / paste /
+/// reparent etc.). Renderer-side pollers compare two snapshots of
+/// this counter to short-circuit `documentGetTree` IPC round trips
+/// when nothing has changed.
+///
+/// Returns `0` when no project is open AND no mutations have been
+/// applied this process lifetime. The counter is process-global —
+/// every active document advances the same atomic — so the renderer
+/// only has to call this once per frame to know if anything in the
+/// graph changed since the last paint.
+///
+/// Returned as `f64` because TypeScript `number` is IEEE-754
+/// double-precision and represents every integer in `[0, 2^53]`
+/// exactly. The counter would have to advance `2^53 ≈ 9.0 × 10^15`
+/// times before two distinct internal versions could collide at
+/// the JS boundary; at 60 mutations / second that's ~4.7 million
+/// years, which is effectively never.
+///
+/// Phase 11 Block D Task 21 follow-up round 2 — Devin Review
+/// ANALYSIS-0006. The previous `u32` return type wrapped at
+/// `u32::MAX` (~4 billion mutations, ~2 years of nonstop editing
+/// at 60 mut/s). On wrap, the renderer poller would see a value
+/// it had seen before and skip a `documentGetTree` refresh,
+/// surfacing as a stale-tree bug. Using `f64` keeps a single
+/// number-typed handshake with JS (`!==` comparison still works,
+/// no BigInt churn) while pushing the collision horizon out of
+/// the realistic operating envelope.
 #[napi]
-pub fn project_save() -> NapiResult<()> {
-    document::project_save().map_err(map_doc_err)
+#[must_use]
+pub fn document_version() -> f64 {
+    // `as f64` from `u64` is lossless for inputs ≤ 2^53; for
+    // larger inputs it rounds to the nearest f64, which is fine
+    // because we only need *change detection*, not exact magnitude.
+    // The next mutation past the rounding boundary still produces a
+    // different f64, so the poller still wakes up on the next bump.
+    kcreate_core::document::document_version_global() as f64
 }
 
 /// Snapshot the current project's SQLCipher encryption status.
@@ -1265,6 +1307,27 @@ pub fn export_svg(node_ids: Vec<String>, options_json: String) -> NapiResult<Str
     document::export_svg(&ids, &opts).map_err(map_doc_err)
 }
 
+/// Async SVG export for large documents. Small-doc callers should
+/// continue to use [`export_svg`] (microseconds; worker dispatch
+/// would dominate). The renderer chooses between the two based on
+/// node count: > 100 nodes goes async to avoid stalling the main
+/// thread on a multi-thousand-node SVG serialisation.
+#[napi(ts_return_type = "Promise<string>")]
+#[allow(clippy::needless_pass_by_value)]
+pub fn export_svg_async(
+    node_ids: Vec<String>,
+    options_json: String,
+) -> NapiResult<AsyncTask<phase11::ExportSvgAsyncTask>> {
+    let ids: Vec<Uuid> = node_ids
+        .iter()
+        .map(|s| parse_uuid(s))
+        .collect::<NapiResult<_>>()?;
+    Ok(AsyncTask::new(phase11::ExportSvgAsyncTask {
+        node_ids: ids,
+        options_json,
+    }))
+}
+
 /// Export the current renderer scene to PNG at `output_path`. Returns
 /// the file size in bytes.
 ///
@@ -1274,34 +1337,29 @@ pub fn export_svg(node_ids: Vec<String>, options_json: String) -> NapiResult<Str
 /// `Uuid`s. Per-node PNG export will land in Phase 1 alongside the
 /// document→scene translator. SVG export, which walks the document
 /// graph directly, *does* accept node ids today.
-#[napi]
+#[napi(ts_return_type = "Promise<number>")]
 #[allow(clippy::needless_pass_by_value)]
-pub fn export_png(output_path: String, options_json: String) -> NapiResult<u32> {
-    let opts: CorePngRequest = serde_json::from_str(&options_json).map_err(|e| {
-        NapiError::new(
-            Status::InvalidArg,
-            format!("kcreate_bridge: bad png options json: {e}"),
-        )
-    })?;
-    let bytes =
-        document::export_png_file(&PathBuf::from(output_path), &opts).map_err(map_doc_err)?;
-    Ok(u32::try_from(bytes).unwrap_or(u32::MAX))
+pub fn export_png(output_path: String, options_json: String) -> AsyncTask<phase11::ExportPngTask> {
+    // Heavy: walks the doc graph, rasterises, encodes PNG.
+    // Dispatched to the napi worker pool so a 30 MP export
+    // doesn't freeze the renderer.
+    AsyncTask::new(phase11::ExportPngTask {
+        output_path: PathBuf::from(output_path),
+        options_json,
+    })
 }
 
 /// Export the open document to PDF at `output_path`. Returns the file
 /// size in bytes. `options_json` accepts `{ width_mm, height_mm, title? }`.
-#[napi]
+#[napi(ts_return_type = "Promise<number>")]
 #[allow(clippy::needless_pass_by_value)]
-pub fn export_pdf(output_path: String, options_json: String) -> NapiResult<u32> {
-    let opts: document::PdfExportRequest = serde_json::from_str(&options_json).map_err(|e| {
-        NapiError::new(
-            Status::InvalidArg,
-            format!("kcreate_bridge: bad pdf options json: {e}"),
-        )
-    })?;
-    let bytes =
-        document::export_pdf_file(&PathBuf::from(output_path), &opts).map_err(map_doc_err)?;
-    Ok(u32::try_from(bytes).unwrap_or(u32::MAX))
+pub fn export_pdf(output_path: String, options_json: String) -> AsyncTask<phase11::ExportPdfTask> {
+    // Heavy: PDF writer streams every node + embeds raster
+    // payloads. Dispatched to the worker pool.
+    AsyncTask::new(phase11::ExportPdfTask {
+        output_path: PathBuf::from(output_path),
+        options_json,
+    })
 }
 
 /// Render the current renderer scene to WebP at `output_path`. Returns
@@ -1590,36 +1648,54 @@ pub fn ai_get_action_log() -> NapiResult<String> {
 // `ai_generated: false` (these are user edits, not AI suggestions).
 // -----------------------------------------------------------------------------
 
-/// Apply a Levels adjustment to a raster layer (in place).
-#[napi]
+/// Apply a Levels adjustment to a raster layer (in place). Runs on
+/// the napi worker pool: a 64 MP layer takes ~50 ms of CPU work that
+/// previously froze the main thread.
+#[napi(ts_return_type = "Promise<void>")]
 #[allow(clippy::needless_pass_by_value)]
 pub fn raster_apply_levels(
     node_id: String,
     black_point: f64,
     white_point: f64,
     gamma: f64,
-) -> NapiResult<()> {
+) -> NapiResult<AsyncTask<phase11::RasterLevelsTask>> {
     let id = parse_uuid(&node_id)?;
-    raster_ops::apply_levels(id, black_point as f32, white_point as f32, gamma as f32)
-        .map_err(map_doc_err)
+    Ok(AsyncTask::new(phase11::RasterLevelsTask {
+        node_id: id,
+        black_point: black_point as f32,
+        white_point: white_point as f32,
+        gamma: gamma as f32,
+    }))
 }
 
 /// Apply a Curves adjustment defined by `(input, output)` control
 /// points. `points_json` is a JSON array of `[[x, y], ...]` floats in
-/// `[0.0, 1.0]`.
-#[napi]
+/// `[0.0, 1.0]`. Runs on the napi worker pool.
+#[napi(ts_return_type = "Promise<void>")]
 #[allow(clippy::needless_pass_by_value)]
-pub fn raster_apply_curves(node_id: String, points_json: String) -> NapiResult<()> {
+pub fn raster_apply_curves(
+    node_id: String,
+    points_json: String,
+) -> NapiResult<AsyncTask<phase11::RasterCurvesTask>> {
     let id = parse_uuid(&node_id)?;
     let parsed: Vec<(f32, f32)> = serde_json::from_str(&points_json)
         .map_err(|e| NapiError::from_reason(format!("invalid curves points JSON: {e}")))?;
-    raster_ops::apply_curves(id, parsed).map_err(map_doc_err)
+    Ok(AsyncTask::new(phase11::RasterCurvesTask {
+        node_id: id,
+        points: parsed,
+    }))
 }
 
-/// Apply a blur filter. `kind` is `"gaussian"` or `"box"`.
-#[napi]
+/// Apply a blur filter. `kind` is `"gaussian"` or `"box"`. Runs on
+/// the napi worker pool — the blur pass is the heaviest pixel op in
+/// the editor (multi-second on radius ≥ 16 large layers).
+#[napi(ts_return_type = "Promise<void>")]
 #[allow(clippy::needless_pass_by_value)]
-pub fn raster_apply_blur(node_id: String, radius: f64, kind: String) -> NapiResult<()> {
+pub fn raster_apply_blur(
+    node_id: String,
+    radius: f64,
+    kind: String,
+) -> NapiResult<AsyncTask<phase11::RasterBlurTask>> {
     let id = parse_uuid(&node_id)?;
     let kind = match kind.as_str() {
         "gaussian" => raster_ops::BlurKind::Gaussian,
@@ -1630,43 +1706,100 @@ pub fn raster_apply_blur(node_id: String, radius: f64, kind: String) -> NapiResu
             )));
         }
     };
-    raster_ops::apply_blur(id, radius as f32, kind).map_err(map_doc_err)
+    Ok(AsyncTask::new(phase11::RasterBlurTask {
+        node_id: id,
+        radius: radius as f32,
+        kind,
+    }))
 }
 
-/// Apply an unsharp-mask sharpen.
-#[napi]
+/// Apply an unsharp-mask sharpen. Runs on the napi worker pool
+/// (composes a blur + subtraction over the full pixel grid).
+#[napi(ts_return_type = "Promise<void>")]
 #[allow(clippy::needless_pass_by_value)]
 pub fn raster_apply_sharpen(
     node_id: String,
     radius: f64,
     amount: f64,
     threshold: u32,
-) -> NapiResult<()> {
+) -> NapiResult<AsyncTask<phase11::RasterSharpenTask>> {
     let id = parse_uuid(&node_id)?;
     let threshold_byte = u8::try_from(threshold.min(u32::from(u8::MAX))).unwrap_or(u8::MAX);
-    raster_ops::apply_sharpen(id, radius as f32, amount as f32, threshold_byte).map_err(map_doc_err)
+    Ok(AsyncTask::new(phase11::RasterSharpenTask {
+        node_id: id,
+        radius: radius as f32,
+        amount: amount as f32,
+        threshold: threshold_byte,
+    }))
 }
 
-/// Crop a raster layer in source-pixel coordinates.
-#[napi]
+/// Crop a raster layer in source-pixel coordinates. Runs on the
+/// napi worker pool — the crop allocates a fresh pixel buffer and
+/// recomputes the layer bounds.
+#[napi(ts_return_type = "Promise<void>")]
 #[allow(clippy::needless_pass_by_value)]
-pub fn raster_crop(node_id: String, x: u32, y: u32, w: u32, h: u32) -> NapiResult<()> {
+pub fn raster_crop(
+    node_id: String,
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+) -> NapiResult<AsyncTask<phase11::RasterCropTask>> {
     let id = parse_uuid(&node_id)?;
-    raster_ops::crop(id, x, y, w, h).map_err(map_doc_err)
+    Ok(AsyncTask::new(phase11::RasterCropTask {
+        node_id: id,
+        x,
+        y,
+        w,
+        h,
+    }))
 }
 
 /// Rotate a raster layer by `angle_deg` degrees (positive = clockwise).
-#[napi]
+///
+/// Phase 11 Block B follow-up — Devin Review ANALYSIS-0003.
+/// Now routed through `phase11::RasterRotateTask` so the rotation
+/// runs on the libuv worker pool instead of the main thread.
+/// Rotating a 64 MP layer ran the renderer thread for ~700 ms on
+/// CPU and ~250 ms on GPU; the AsyncTask was already implemented
+/// in `phase11.rs` but the N-API export here was still synchronous,
+/// negating the off-thread design.
+///
+/// Phase 11 Block B follow-up round 2 — Devin Review BUG-0001.
+/// `#[napi(ts_return_type = "Promise<void>")]` so napi-rs's generated
+/// `.d.ts` matches the hand-written `bridge.ts` (which declares
+/// `Promise<void>`) and the `await` site in `main.ts`. AGENTS.md
+/// Rule 4 (wire-format lockstep).
+#[napi(ts_return_type = "Promise<void>")]
 #[allow(clippy::needless_pass_by_value)]
-pub fn raster_rotate(node_id: String, angle_deg: f64) -> NapiResult<()> {
+pub fn raster_rotate(
+    node_id: String,
+    angle_deg: f64,
+) -> NapiResult<AsyncTask<phase11::RasterRotateTask>> {
     let id = parse_uuid(&node_id)?;
-    raster_ops::rotate(id, angle_deg as f32).map_err(map_doc_err)
+    Ok(AsyncTask::new(phase11::RasterRotateTask {
+        node_id: id,
+        angle_deg: angle_deg as f32,
+    }))
 }
 
 /// Flip a raster layer. `direction` is `"horizontal"` or `"vertical"`.
-#[napi]
+///
+/// Phase 11 Block B follow-up — Devin Review ANALYSIS-0003.
+/// Same async migration as `raster_rotate` above. Flipping a large
+/// layer still costs an in-place pixel walk on the worker pool;
+/// dispatch through `RasterFlipTask` so the main thread stays
+/// responsive.
+///
+/// Phase 11 Block B follow-up round 2 — Devin Review BUG-0002. See
+/// the `raster_rotate` doc-comment above for the wire-format-lockstep
+/// rationale on `ts_return_type`.
+#[napi(ts_return_type = "Promise<void>")]
 #[allow(clippy::needless_pass_by_value)]
-pub fn raster_flip(node_id: String, direction: String) -> NapiResult<()> {
+pub fn raster_flip(
+    node_id: String,
+    direction: String,
+) -> NapiResult<AsyncTask<phase11::RasterFlipTask>> {
     let id = parse_uuid(&node_id)?;
     let dir = match direction.as_str() {
         "horizontal" => raster_ops::FlipDirection::Horizontal,
@@ -1677,12 +1810,23 @@ pub fn raster_flip(node_id: String, direction: String) -> NapiResult<()> {
             )));
         }
     };
-    raster_ops::flip(id, dir).map_err(map_doc_err)
+    Ok(AsyncTask::new(phase11::RasterFlipTask {
+        node_id: id,
+        direction: dir,
+    }))
 }
 
 /// Heal a disc from `(src_x, src_y)` over `(dst_x, dst_y)` with the
 /// given radius. All coordinates are source-pixel.
-#[napi]
+///
+/// Phase 11 Block B follow-up — Devin Review ANALYSIS-0003.
+/// Routed through `phase11::RasterHealTask` so multiple heal
+/// strokes don't queue on the main thread.
+///
+/// Phase 11 Block B follow-up round 2 — Devin Review BUG-0003. See
+/// the `raster_rotate` doc-comment above for the wire-format-lockstep
+/// rationale on `ts_return_type`.
+#[napi(ts_return_type = "Promise<void>")]
 #[allow(clippy::needless_pass_by_value)]
 pub fn raster_heal(
     node_id: String,
@@ -1691,9 +1835,16 @@ pub fn raster_heal(
     dst_x: u32,
     dst_y: u32,
     radius: u32,
-) -> NapiResult<()> {
+) -> NapiResult<AsyncTask<phase11::RasterHealTask>> {
     let id = parse_uuid(&node_id)?;
-    raster_ops::heal(id, src_x, src_y, dst_x, dst_y, radius).map_err(map_doc_err)
+    Ok(AsyncTask::new(phase11::RasterHealTask {
+        node_id: id,
+        src_x,
+        src_y,
+        dst_x,
+        dst_y,
+        radius,
+    }))
 }
 
 /// Non-destructive filter preview. `filter_json` is a JSON object
@@ -1715,43 +1866,55 @@ pub fn raster_preview_filter(node_id: String, filter_json: String) -> NapiResult
 
 /// Apply a 4-corner perspective transform to a raster layer.
 /// `corners_json` must decode to `[[f64; 2]; 4]` in **TL, TR, BL, BR**
-/// order in source-pixel space.
-#[napi]
+/// order in source-pixel space. Runs on the napi worker pool.
+#[napi(ts_return_type = "Promise<void>")]
 #[allow(clippy::needless_pass_by_value)]
-pub fn raster_perspective(node_id: String, corners_json: String) -> NapiResult<()> {
+pub fn raster_perspective(
+    node_id: String,
+    corners_json: String,
+) -> NapiResult<AsyncTask<phase11::RasterPerspectiveTask>> {
     let id = parse_uuid(&node_id)?;
     let corners: [(f64, f64); 4] = serde_json::from_str(&corners_json)
         .map_err(|e| NapiError::from_reason(format!("invalid corners JSON: {e}")))?;
-    raster_ops::apply_perspective(id, corners).map_err(map_doc_err)
+    Ok(AsyncTask::new(phase11::RasterPerspectiveTask {
+        node_id: id,
+        corners,
+    }))
 }
 
 /// Apply a Hue / Saturation / Lightness adjustment to a raster layer.
 /// `hue` is degrees (`-180.0..=180.0`); `saturation` is a multiplier
 /// (`0.0` flattens to grey, `1.0` is identity); `lightness` is an
-/// additive shift in `[-1.0, 1.0]`.
-#[napi]
+/// additive shift in `[-1.0, 1.0]`. Runs on the napi worker pool.
+#[napi(ts_return_type = "Promise<void>")]
 #[allow(clippy::needless_pass_by_value)]
 pub fn raster_apply_hsl(
     node_id: String,
     hue: f64,
     saturation: f64,
     lightness: f64,
-) -> NapiResult<()> {
+) -> NapiResult<AsyncTask<phase11::RasterHslTask>> {
     let id = parse_uuid(&node_id)?;
-    raster_ops::apply_hsl(id, hue as f32, saturation as f32, lightness as f32).map_err(map_doc_err)
+    Ok(AsyncTask::new(phase11::RasterHslTask {
+        node_id: id,
+        hue: hue as f32,
+        saturation: saturation as f32,
+        lightness: lightness as f32,
+    }))
 }
 
 /// Apply a three-way Color Balance adjustment (shadows / midtones /
 /// highlights) to a raster layer. Each triple is `[r, g, b]` in
-/// `[-1.0, 1.0]`; all-zero triples are the identity transform.
-#[napi]
+/// `[-1.0, 1.0]`; all-zero triples are the identity transform. Runs
+/// on the napi worker pool.
+#[napi(ts_return_type = "Promise<void>")]
 #[allow(clippy::needless_pass_by_value)]
 pub fn raster_apply_color_balance(
     node_id: String,
     shadows_json: String,
     midtones_json: String,
     highlights_json: String,
-) -> NapiResult<()> {
+) -> NapiResult<AsyncTask<phase11::RasterColorBalanceTask>> {
     let id = parse_uuid(&node_id)?;
     let parse_triple = |label: &str, src: &str| -> NapiResult<[f32; 3]> {
         let v: [f64; 3] = serde_json::from_str(src)
@@ -1761,7 +1924,12 @@ pub fn raster_apply_color_balance(
     let shadows = parse_triple("shadows", &shadows_json)?;
     let midtones = parse_triple("midtones", &midtones_json)?;
     let highlights = parse_triple("highlights", &highlights_json)?;
-    raster_ops::apply_color_balance(id, shadows, midtones, highlights).map_err(map_doc_err)
+    Ok(AsyncTask::new(phase11::RasterColorBalanceTask {
+        node_id: id,
+        shadows,
+        midtones,
+        highlights,
+    }))
 }
 
 /// Apply a filter to a raster layer only where `mask[i] == true`,
@@ -1775,22 +1943,26 @@ pub fn raster_apply_color_balance(
 /// `8.3 MiB` of typed-array memcpy instead of `~50 MiB` of JS
 /// boolean conversion. `filter_json` decodes to the same
 /// [`PreviewFilter`](raster_ops::PreviewFilter) discriminated union
-/// the live-preview surface uses.
-#[napi]
+/// the live-preview surface uses. Runs on the napi worker pool.
+#[napi(ts_return_type = "Promise<void>")]
 #[allow(clippy::needless_pass_by_value)]
 pub fn raster_apply_filter_masked(
     node_id: String,
     filter_json: String,
     mask: Buffer,
-) -> NapiResult<()> {
+) -> NapiResult<AsyncTask<phase11::RasterFilterMaskedTask>> {
     let id = parse_uuid(&node_id)?;
     let filter: raster_ops::PreviewFilter = serde_json::from_str(&filter_json)
         .map_err(|e| NapiError::from_reason(format!("invalid filter JSON: {e}")))?;
     // `Buffer::as_ref()` borrows the JS-allocated bytes; copy them
-    // into an owned `Vec<u8>` so the workspace lock inside
-    // `apply_filter_masked` can outlive the call.
+    // into an owned `Vec<u8>` so the worker thread owns its mask
+    // copy past the AsyncTask boundary.
     let mask_bytes: Vec<u8> = mask.as_ref().to_vec();
-    raster_ops::apply_filter_masked(id, filter, mask_bytes).map_err(map_doc_err)
+    Ok(AsyncTask::new(phase11::RasterFilterMaskedTask {
+        node_id: id,
+        filter,
+        mask: mask_bytes,
+    }))
 }
 
 // -----------------------------------------------------------------------------
@@ -2201,6 +2373,29 @@ pub fn component_switch_variant(node_id: String, variant_id: String) -> NapiResu
     let nid = parse_uuid(&node_id)?;
     let vid = parse_uuid(&variant_id)?;
     document::component_switch_variant(nid, vid).map_err(map_doc_err)
+}
+
+/// Phase 11 Block C Task 17 — Smart Animate snapshot. Returns a
+/// JSON string `{"before":[{name,bounds,opacity,fill_color,
+/// corner_radius}, …], "after":[…]}` for the renderer's
+/// `PrototypePlayer` to drive property interpolation across a
+/// variant switch. The bridge intentionally does NOT mutate the
+/// active variant here — the renderer commits the swap with
+/// `component_switch_variant` after its animation completes so the
+/// document graph is only touched once per gesture.
+#[napi]
+pub fn component_smart_animate_snapshot(
+    node_id: String,
+    target_variant_id: String,
+) -> NapiResult<String> {
+    let nid = parse_uuid(&node_id)?;
+    let vid = parse_uuid(&target_variant_id)?;
+    let snap = document::component_smart_animate_snapshot(nid, vid).map_err(map_doc_err)?;
+    serde_json::to_string(&snap).map_err(|e| {
+        napi::Error::from_reason(format!(
+            "component_smart_animate_snapshot: serialize: {e}"
+        ))
+    })
 }
 
 /// Detach a component instance — converts the ComponentLayer into a

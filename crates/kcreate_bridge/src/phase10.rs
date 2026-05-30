@@ -131,7 +131,7 @@ fn install_processed_raster(
     }
     with_workspace_mut(|ws| {
         let blob = ws
-            .store
+            .store.lock()
             .blobs()
             .store(&png_bytes, "image/png")
             .map_err(|e| DocumentBridgeError::Internal(format!("blob store: {e}")))?;
@@ -1134,12 +1134,13 @@ fn collect_page_svgs() -> Result<Vec<kcreate_export::pdf_multi::PdfPageInput>> {
                 // blobs through the bridge's `BlobStore` (kept out
                 // of `kcreate_export`'s dep graph via a callback).
                 //
-                // `ws.store.blobs()` returns the active `BlobStore`
+                // `ws.store.lock().blobs()` returns the active `BlobStore`
                 // for the open project; `load(hash)` returns the
                 // blob bytes in whatever encoding they were stored
                 // (PNG/JPEG/WebP for imports, raw RGBA for tile
                 // renders). `compose_page_svg` auto-detects.
-                let store = ws.store.blobs();
+                let store_guard = ws.store.lock();
+                let store = store_guard.blobs();
                 let svg = kcreate_export::compose_page_svg(
                     &ws.project.document,
                     *id,

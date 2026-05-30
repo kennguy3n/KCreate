@@ -88,6 +88,17 @@ pub enum SidecarError {
     /// a sidecar that is not in the expected state.
     #[error("sidecar is not in the expected state: {0}")]
     WrongState(String),
+    /// Phase 11 Block E Task 25 follow-up round 3 — Devin Review
+    /// ANALYSIS-0006 (r3). The OS CSPRNG (`getrandom`) refused to
+    /// produce a bearer token when `require_api_key` was set. Rather
+    /// than silently downgrading the sidecar to unauthenticated
+    /// loopback — which is the exact attack surface Block E was
+    /// designed to close — we now fail-closed and surface the
+    /// underlying error so the host UI can decide whether to retry,
+    /// fall back to the no-auth profile *explicitly*, or block the
+    /// AI feature outright.
+    #[error("failed to sample bearer token from OS CSPRNG: {0}")]
+    TokenEntropyFailed(String),
 }
 
 /// Coarse status the host UI displays in the Model Manager panel.
@@ -103,6 +114,14 @@ pub enum SidecarStatus {
         model_name: String,
         context_size: usize,
         port: u16,
+        /// Phase 11 Block E Task 25 — per-session bearer token the
+        /// HTTP client must echo as `Authorization: Bearer <token>`
+        /// on every request. `None` for legacy builds of
+        /// llama-server that don't accept `--api-key`; clients
+        /// then talk to the sidecar without auth (logged with a
+        /// warning at start time).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        bearer_token: Option<String>,
     },
     /// Last attempt failed. The error message is preserved verbatim
     /// for the user-facing toast.
@@ -121,6 +140,18 @@ impl SidecarStatus {
     pub const fn port(&self) -> Option<u16> {
         match self {
             Self::Ready { port, .. } => Some(*port),
+            _ => None,
+        }
+    }
+
+    /// Bearer token clients must send to authenticate against the
+    /// sidecar, if one was minted at `start()`. `None` when the
+    /// sidecar was started without auth (typically a llama-server
+    /// build that doesn't accept `--api-key`).
+    #[must_use]
+    pub fn bearer_token(&self) -> Option<&str> {
+        match self {
+            Self::Ready { bearer_token, .. } => bearer_token.as_deref(),
             _ => None,
         }
     }
@@ -146,6 +177,14 @@ pub struct SidecarConfig {
     /// Extra args appended to the llama-server invocation. Useful for
     /// `--n-gpu-layers`, `--threads`, etc.
     pub extra_args: Vec<String>,
+    /// Phase 11 Block E Task 25 — whether `start()` should mint a
+    /// random per-session bearer token and pass it to llama-server
+    /// via `--api-key`. Defaults to `true` so all callers are
+    /// authenticated by default. Tests that point `binary` at a
+    /// mock HTTP server can flip this off if the mock doesn't
+    /// honour the `--api-key` flag.
+    pub require_api_key: bool,
+
     /// Optional path to the multimodal projector (mmproj) file that
     /// pairs with a vision-language GGUF. llama.cpp's `llama-server`
     /// accepts `--mmproj <path>` to load the projector weights that
@@ -172,6 +211,7 @@ impl SidecarConfig {
             context_size: 4096,
             health_timeout: DEFAULT_HEALTH_TIMEOUT,
             extra_args: Vec::new(),
+            require_api_key: true,
             mmproj_path: None,
         }
     }
@@ -288,7 +328,41 @@ impl LlmSidecar {
                 return Err(e);
             }
         };
-        let child = match spawn_child(&self.config, port) {
+        // Phase 11 Block E Task 25: mint a 32-byte hex bearer
+        // token before spawn so we can pass it to llama-server via
+        // `--api-key`. We use `getrandom` (already in the workspace
+        // for the collab nonces) so the token is sampled from the
+        // OS CSPRNG, not a pseudo-random Lamport-style counter.
+        //
+        // Phase 11 Block E Task 25 follow-up round 3 — Devin Review
+        // ANALYSIS-0006 (r3). When the caller has set
+        // `require_api_key`, a CSPRNG failure used to log a warning
+        // and silently start the sidecar **without** a bearer
+        // token — i.e. the unauthenticated loopback path that Block
+        // E exists to eliminate. The renderer never saw the
+        // downgrade, so a defence-in-depth control could vanish
+        // without an observable signal. Fail-closed instead: record
+        // a typed `Error` status so the UI surfaces the failure,
+        // and return `SidecarError::TokenEntropyFailed` so callers
+        // can decide whether to retry, prompt the user, or fall
+        // back **explicitly** to the no-auth profile by flipping
+        // `require_api_key = false` on the config.
+        let bearer_token: Option<String> = if self.config.require_api_key {
+            let mut buf = [0u8; 32];
+            match getrandom::fill(&mut buf) {
+                Ok(()) => Some(hex_encode(&buf)),
+                Err(e) => {
+                    let err = SidecarError::TokenEntropyFailed(e.to_string());
+                    *self.status.lock() = SidecarStatus::Error {
+                        message: err.to_string(),
+                    };
+                    return Err(err);
+                }
+            }
+        } else {
+            None
+        };
+        let child = match spawn_child(&self.config, port, bearer_token.as_deref()) {
             Ok(c) => c,
             Err(e) => {
                 *self.status.lock() = SidecarStatus::Error {
@@ -322,6 +396,7 @@ impl LlmSidecar {
                 health_timeout,
                 stop_for_worker,
                 status_for_worker,
+                bearer_token,
             );
         });
 
@@ -355,7 +430,11 @@ impl Drop for LlmSidecar {
 /// Spawn the llama-server child process. Pure helper — does not
 /// touch any sidecar state, so `start()` can call it before deciding
 /// whether the spawn succeeded.
-fn spawn_child(config: &SidecarConfig, port: u16) -> SidecarResult<Child> {
+fn spawn_child(
+    config: &SidecarConfig,
+    port: u16,
+    bearer_token: Option<&str>,
+) -> SidecarResult<Child> {
     let mut cmd = Command::new(&config.binary);
     cmd.args([
         "--model",
@@ -367,6 +446,14 @@ fn spawn_child(config: &SidecarConfig, port: u16) -> SidecarResult<Child> {
         "-c",
         &config.context_size.to_string(),
     ]);
+    // Phase 11 Block E Task 25 — authenticate the sidecar with a
+    // per-session bearer token. llama.cpp's `--api-key` flag
+    // configures the server to reject requests whose
+    // `Authorization: Bearer ...` header doesn't match. Older
+    // builds ignore unknown flags so this is forward-compatible.
+    if let Some(token) = bearer_token {
+        cmd.arg("--api-key").arg(token);
+    }
     if let Some(mmproj) = config.mmproj_path.as_deref() {
         // `--mmproj <path>` is the llama.cpp flag for the multimodal
         // projector (CLIP/SmolVLM/etc.). Passing it switches the
@@ -398,8 +485,14 @@ fn health_worker(
     model_name: String,
     context_size: usize,
     health_timeout: Duration,
+    // remaining args declared below — split here to keep the
+    // function visually under 80 chars per arg line.
+    // Phase 11 Block E Task 25 — bearer token to embed into the
+    // resulting `SidecarStatus::Ready` payload so callers can
+    // attach it to outbound chat HTTP requests.
     stop_signal: Arc<AtomicBool>,
     status: Arc<Mutex<SidecarStatus>>,
+    bearer_token: Option<String>,
 ) {
     let deadline = Instant::now() + health_timeout;
     let mut ready = false;
@@ -425,10 +518,39 @@ fn health_worker(
         };
         return;
     }
+    // Phase 11 Block E Task 26 — post-spawn TOCTOU verification.
+    // Between `pick_loopback_port` dropping the listener and
+    // `llama-server` binding the same port, another process on the
+    // host could grab the port and answer `/health` with `ok`.
+    // Defence-in-depth: probe `/v1/models` with our bearer token.
+    // Two outcomes are accepted:
+    //   * `200 OK`  — the real sidecar accepted our token.
+    //   * `404`     — older builds that don't expose `/v1/models`
+    //                 but DID accept `--api-key` (otherwise it would
+    //                 have failed earlier with an unknown-flag exit).
+    // Any other response, in particular `401 Unauthorized`, means
+    // the listener on that port is NOT our llama-server: kill the
+    // (now-orphaned) child and surface a typed error.
+    if let Some(token) = bearer_token.as_deref() {
+        if !verify_bearer_token(port, token) {
+            kill_child(&mut child);
+            *status.lock() = SidecarStatus::Error {
+                message: SidecarError::WrongState(
+                    "post-spawn token verification failed: an unknown process \
+                     answered on the sidecar's loopback port. Refusing to mark \
+                     the sidecar Ready (possible TOCTOU race or stale child)."
+                        .to_string(),
+                )
+                .to_string(),
+            };
+            return;
+        }
+    }
     *status.lock() = SidecarStatus::Ready {
         model_name,
         context_size,
         port,
+        bearer_token,
     };
     // Watch the stop signal until shutdown. The poll interval here
     // is purely how long `stop()` may wait for the worker to notice;
@@ -462,6 +584,19 @@ fn pick_loopback_port() -> SidecarResult<u16> {
     Ok(port)
 }
 
+/// Hex-encode raw bytes for the bearer token. Lowercase nibbles,
+/// fixed length = `2 * bytes.len()`. Inlined here to avoid pulling
+/// the entire `hex` crate just for one 32-byte buffer.
+fn hex_encode(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push(ALPHABET[(b >> 4) as usize] as char);
+        out.push(ALPHABET[(b & 0x0f) as usize] as char);
+    }
+    out
+}
+
 fn validate_model(model: &Path, max_mb: u64) -> SidecarResult<()> {
     let meta =
         std::fs::metadata(model).map_err(|_| SidecarError::ModelMissing(model.to_path_buf()))?;
@@ -493,8 +628,24 @@ fn validate_mmproj(mmproj: &Path) -> SidecarResult<()> {
 /// `Vec<OsString>` to keep the assertion shape ergonomic; non-UTF-8
 /// paths are rendered with `to_string_lossy` so the function never
 /// panics.
+///
+/// Phase 11 Block E Task 25 / 26 — when `bearer_token` is `Some`, the
+/// argv includes `--api-key <token>` immediately after `--port`.
+/// Tests assert on that ordering so a future refactor can't silently
+/// drop the auth flag and re-introduce the unauthenticated sidecar.
 #[must_use]
 pub fn build_argv(config: &SidecarConfig, port: u16) -> Vec<String> {
+    build_argv_with_token(config, port, None)
+}
+
+/// Same as [`build_argv`] but with an explicit bearer token. Split
+/// out for tests that need to assert the `--api-key` flag wiring.
+#[must_use]
+pub fn build_argv_with_token(
+    config: &SidecarConfig,
+    port: u16,
+    bearer_token: Option<&str>,
+) -> Vec<String> {
     let mut argv = vec![
         "--model".to_string(),
         config.model_path.to_string_lossy().into_owned(),
@@ -505,6 +656,10 @@ pub fn build_argv(config: &SidecarConfig, port: u16) -> Vec<String> {
         "-c".to_string(),
         config.context_size.to_string(),
     ];
+    if let Some(token) = bearer_token {
+        argv.push("--api-key".to_string());
+        argv.push(token.to_string());
+    }
     if let Some(mmproj) = config.mmproj_path.as_deref() {
         argv.push("--mmproj".to_string());
         argv.push(mmproj.to_string_lossy().into_owned());
@@ -569,6 +724,87 @@ fn probe_health(port: u16) -> bool {
     .is_ok()
 }
 
+/// Phase 11 Block E Task 26 + round 5 — verify the listener on the
+/// sidecar's loopback port is actually the llama-server we spawned by
+/// proving it differentiates between our bearer token and an
+/// obviously-wrong token. The round-1 implementation accepted any
+/// listener that returned `200 OK` or `404 Not Found` with our token,
+/// which Devin Review ANALYSIS-0006 (r5) correctly identified as
+/// fragile: a foreign web server that returned `404` for unknown
+/// routes regardless of `Authorization` would have passed the check
+/// (re-opening the TOCTOU window the verifier exists to close).
+///
+/// Round 5 contract: send *two* probes against `GET /v1/models`,
+/// one with the real bearer and one with a deliberately-wrong bearer
+/// the verifier owns, and require the listener to **distinguish**
+/// them:
+///
+/// 1. Right-token probe — must NOT come back as `401`/`403`. Any
+///    other status (typically `200`, or `404` on older llama.cpp
+///    builds that take `--api-key` but don't expose `/v1/models`)
+///    counts as "accepted our token".
+/// 2. Wrong-token probe — MUST come back as `401`/`403`. Anything
+///    else (including the same `200`/`404` returned for the right
+///    token) means the listener is ignoring `Authorization` and is
+///    therefore not the `--api-key`-honouring llama-server we
+///    spawned.
+///
+/// Both probes must succeed; if either's transport fails we treat
+/// it as "not us" to fail closed. This pins down the TOCTOU window
+/// to a hypothetical foreign server that not only happens to be
+/// listening on the freshly-allocated port between
+/// [`pick_loopback_port`] and the llama-server bind, but also
+/// implements a complete `--api-key`-aware response policy by
+/// coincidence — vanishingly unlikely on loopback.
+#[cfg(feature = "llm_sidecar")]
+fn verify_bearer_token(port: u16, token: &str) -> bool {
+    /// A deliberately-bogus bearer the verifier owns. Reused across
+    /// all wrong-token probes so a debug log of `Authorization`
+    /// values from the listener is greppable for this fixed string.
+    const WRONG_TOKEN: &str = "kcreate-toctou-probe-deliberately-wrong";
+
+    let url = format!("http://127.0.0.1:{port}/v1/models");
+    let probe = |bearer: String| -> Option<u16> {
+        let resp = ureq::get(&url)
+            .timeout(Duration::from_secs(2))
+            .set("authorization", &bearer)
+            .call();
+        match resp {
+            Ok(r) => Some(r.status()),
+            Err(ureq::Error::Status(code, _)) => Some(code),
+            Err(_) => None,
+        }
+    };
+
+    let Some(right) = probe(format!("Bearer {token}")) else {
+        return false;
+    };
+    let Some(wrong) = probe(format!("Bearer {WRONG_TOKEN}")) else {
+        return false;
+    };
+
+    // Right token: must NOT be auth-rejected. Anything other than
+    // 401/403 (200, 404, or even a 500 from a real server hitting
+    // an unrelated bug) at least demonstrates the listener didn't
+    // reject *our* token.
+    let right_accepted = !matches!(right, 401 | 403);
+    // Wrong token: MUST be auth-rejected. A foreign server that
+    // ignores `Authorization` will return the same code for both
+    // probes, so this is the load-bearing assertion.
+    let wrong_rejected = matches!(wrong, 401 | 403);
+
+    right_accepted && wrong_rejected
+}
+
+/// When the `llm_sidecar` Cargo feature is off the HTTP client is
+/// not linked and there is no way to talk to the child anyway —
+/// tests in this configuration use mocked transports — so the
+/// verifier is a no-op (always trusts the spawn).
+#[cfg(not(feature = "llm_sidecar"))]
+fn verify_bearer_token(_port: u16, _token: &str) -> bool {
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -604,9 +840,11 @@ mod tests {
             model_name: "m".into(),
             context_size: 2048,
             port: 9999,
+            bearer_token: Some("abc".to_string()),
         };
         assert!(r.is_ready());
         assert_eq!(r.port(), Some(9999));
+        assert_eq!(r.bearer_token(), Some("abc"));
     }
 
     #[test]
@@ -618,6 +856,7 @@ mod tests {
             context_size: 2048,
             health_timeout: Duration::from_millis(50),
             extra_args: vec![],
+            require_api_key: false,
             mmproj_path: None,
         };
         let mut s = LlmSidecar::new(cfg);
@@ -638,6 +877,7 @@ mod tests {
             context_size: 2048,
             health_timeout: Duration::from_millis(50),
             extra_args: vec![],
+            require_api_key: false,
             mmproj_path: None,
         };
         let mut s = LlmSidecar::new(cfg);
@@ -746,6 +986,7 @@ mod tests {
             context_size: 2048,
             health_timeout: Duration::from_millis(50),
             extra_args: vec![],
+            require_api_key: false,
             mmproj_path: Some(mmproj),
         };
         let mut s = LlmSidecar::new(cfg);
@@ -754,5 +995,196 @@ mod tests {
             matches!(err, SidecarError::Spawn(_)),
             "expected Spawn (mmproj must have validated), got {err:?}",
         );
+    }
+
+    /// Phase 11 Block E Task 25 — `build_argv_with_token` must emit
+    /// the `--api-key <token>` pair so llama-server starts with the
+    /// per-session bearer enforced. Two consecutive argv entries,
+    /// `--api-key` followed immediately by the token verbatim.
+    #[test]
+    fn build_argv_with_token_emits_api_key() {
+        let cfg = SidecarConfig::new(PathBuf::from("/tmp/m.gguf"));
+        let argv = build_argv_with_token(&cfg, 12345, Some("deadbeef"));
+        let pos = argv
+            .iter()
+            .position(|a| a == "--api-key")
+            .expect("argv must contain --api-key");
+        assert_eq!(
+            argv.get(pos + 1).map(String::as_str),
+            Some("deadbeef"),
+            "argv must have the token immediately after --api-key: {argv:?}",
+        );
+    }
+
+    /// And the legacy `build_argv` (None bearer) must NOT emit
+    /// `--api-key`, so callers that explicitly disable auth (e.g.
+    /// tests that point at a mock server which doesn't honour the
+    /// flag) don't get a spurious flag baked in.
+    #[test]
+    fn build_argv_without_token_omits_api_key() {
+        let cfg = SidecarConfig::new(PathBuf::from("/tmp/m.gguf"));
+        let argv = build_argv(&cfg, 12345);
+        assert!(
+            !argv.iter().any(|a| a == "--api-key"),
+            "argv must not contain --api-key when bearer_token is None: {argv:?}",
+        );
+    }
+
+    /// Phase 11 Block E Task 26 — a foreign listener (one that does
+    /// NOT honour our bearer) MUST cause `verify_bearer_token` to
+    /// return false. We simulate this with a tiny_http server that
+    /// returns 401 on every request: the verifier sees the status
+    /// and rejects.
+    ///
+    /// Round 2 — Devin Review ANALYSIS-0005: this test ALSO captures
+    /// the inbound `Authorization` header on the mock server and
+    /// asserts it carries the bearer token the verifier was asked
+    /// to prove. This closes the coverage gap where a regression
+    /// that *forgot* to send the header (or sent a wrong literal)
+    /// could still pass the prior status-only assertion.
+    #[cfg(feature = "llm_sidecar")]
+    #[test]
+    fn verify_rejects_foreign_listener_returning_401() {
+        let port = pick_loopback_port().expect("port");
+        let server = tiny_http::Server::http(format!("127.0.0.1:{port}")).expect("server");
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_for_thread = std::sync::Arc::clone(&stop);
+        let captured_auth =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let captured_for_thread = std::sync::Arc::clone(&captured_auth);
+        let handle = std::thread::spawn(move || {
+            for req in server.incoming_requests() {
+                if stop_for_thread.load(std::sync::atomic::Ordering::Acquire) {
+                    break;
+                }
+                // Record the Authorization header (or empty string
+                // if missing) so the test can assert that the
+                // verifier actually sent the bearer token rather
+                // than relying solely on the response status.
+                let auth = req
+                    .headers()
+                    .iter()
+                    .find(|h| h.field.as_str().as_str().eq_ignore_ascii_case("authorization"))
+                    .map(|h| h.value.as_str().to_string())
+                    .unwrap_or_default();
+                captured_for_thread.lock().expect("captured-auth lock").push(auth);
+                let resp = tiny_http::Response::from_string("unauthorized")
+                    .with_status_code(tiny_http::StatusCode(401));
+                let _ = req.respond(resp);
+            }
+        });
+
+        let ok = verify_bearer_token(port, "the-correct-token");
+        assert!(
+            !ok,
+            "verifier must reject a listener that returns 401 — that's the TOCTOU signature",
+        );
+        let seen = captured_auth.lock().expect("captured-auth lock").clone();
+        assert!(
+            seen.iter().any(|h| h == "Bearer the-correct-token"),
+            "verify_bearer_token must send `Authorization: Bearer <token>`; saw {seen:?}",
+        );
+        stop.store(true, std::sync::atomic::Ordering::Release);
+        let _ = handle;
+    }
+
+    /// Phase 11 Block E Task 26 — a real llama-server-style listener
+    /// (200 OK on /v1/models with the correct bearer) MUST be
+    /// accepted. tiny_http returns 200 by default.
+    ///
+    /// Round 2 — Devin Review ANALYSIS-0005: same header-capture
+    /// hardening as the 401 test above. We additionally only
+    /// return `200 OK` if the bearer matches, and `401` otherwise,
+    /// so a future regression that misformats the header would
+    /// flip this assertion from `accept` to `reject`.
+    #[cfg(feature = "llm_sidecar")]
+    #[test]
+    fn verify_accepts_real_listener_returning_200() {
+        let port = pick_loopback_port().expect("port");
+        let server = tiny_http::Server::http(format!("127.0.0.1:{port}")).expect("server");
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_for_thread = std::sync::Arc::clone(&stop);
+        let captured_auth =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let captured_for_thread = std::sync::Arc::clone(&captured_auth);
+        let handle = std::thread::spawn(move || {
+            for req in server.incoming_requests() {
+                if stop_for_thread.load(std::sync::atomic::Ordering::Acquire) {
+                    break;
+                }
+                let auth = req
+                    .headers()
+                    .iter()
+                    .find(|h| h.field.as_str().as_str().eq_ignore_ascii_case("authorization"))
+                    .map(|h| h.value.as_str().to_string())
+                    .unwrap_or_default();
+                captured_for_thread.lock().expect("captured-auth lock").push(auth.clone());
+                // Mimic a real llama-server that enforces --api-key:
+                // 200 only when the bearer header matches what we
+                // were told to expect. Verifier's positive case must
+                // therefore actually be carrying the header.
+                let resp = if auth == "Bearer the-correct-token" {
+                    tiny_http::Response::from_string("{\"data\":[]}")
+                } else {
+                    tiny_http::Response::from_string("unauthorized")
+                        .with_status_code(tiny_http::StatusCode(401))
+                };
+                let _ = req.respond(resp);
+            }
+        });
+
+        let ok = verify_bearer_token(port, "the-correct-token");
+        assert!(
+            ok,
+            "verifier must accept a listener that returns 200 on /v1/models",
+        );
+        let seen = captured_auth.lock().expect("captured-auth lock").clone();
+        assert!(
+            seen.iter().any(|h| h == "Bearer the-correct-token"),
+            "verify_bearer_token must send `Authorization: Bearer <token>`; saw {seen:?}",
+        );
+        stop.store(true, std::sync::atomic::Ordering::Release);
+        let _ = handle;
+    }
+
+    /// Phase 11 Block E follow-up round 5 — Devin Review ANALYSIS-0006
+    /// (r5). A foreign HTTP server that returns `404 Not Found` for
+    /// every request regardless of `Authorization` MUST be rejected
+    /// by the verifier. The round-1 implementation accepted 404 as
+    /// "older llama.cpp without `/v1/models`" without proving the
+    /// listener honoured the `--api-key` flag, leaving a TOCTOU
+    /// window open. The round-5 differential-probe contract closes
+    /// it: the wrong-token probe must come back as `401`/`403`, and
+    /// a foreign server returning `404` for both probes therefore
+    /// fails. This test pins that behaviour so a future refactor
+    /// can't quietly re-loosen the verifier.
+    #[cfg(feature = "llm_sidecar")]
+    #[test]
+    fn verify_rejects_foreign_listener_returning_404_for_any_token() {
+        let port = pick_loopback_port().expect("port");
+        let server = tiny_http::Server::http(format!("127.0.0.1:{port}")).expect("server");
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_for_thread = std::sync::Arc::clone(&stop);
+        let handle = std::thread::spawn(move || {
+            for req in server.incoming_requests() {
+                if stop_for_thread.load(std::sync::atomic::Ordering::Acquire) {
+                    break;
+                }
+                // Mimic a foreign web server that doesn't care about
+                // `Authorization`: 404 on every route, every header.
+                let resp = tiny_http::Response::from_string("not found")
+                    .with_status_code(tiny_http::StatusCode(404));
+                let _ = req.respond(resp);
+            }
+        });
+
+        let ok = verify_bearer_token(port, "the-correct-token");
+        assert!(
+            !ok,
+            "verifier must reject a listener that returns 404 for both right and wrong tokens — \
+             that's the TOCTOU foreign-server signature the round-5 differential probe defends against",
+        );
+        stop.store(true, std::sync::atomic::Ordering::Release);
+        let _ = handle;
     }
 }

@@ -186,10 +186,18 @@ export interface Bridge {
   // Document / project lifecycle
   projectCreate(name: string, dir: string): ProjectInfoSnake;
   projectOpen(dir: string): ProjectInfoSnake;
-  projectSave(): void;
+  projectSave(): Promise<void>;
   projectClose(): void;
   projectGetInfo(): ProjectInfoSnake | null;
   projectIsUntouched(): boolean;
+  /**
+   * Phase 11 Block D Task 21 — monotonic version counter that
+   * advances on every workspace mutation. Renderer pollers compare
+   * two snapshots to skip `documentGetTree` IPC when the document
+   * hasn't changed. The reader is a single `AtomicU64` load on the
+   * Rust side, so it's safe to call at 60Hz.
+   */
+  documentVersion(): number;
   documentGetTree(): NodeInfoSnake[];
   documentInspectNode(nodeId: string): string;
   documentCreateNode(
@@ -387,8 +395,12 @@ export interface Bridge {
   imageGenAllowed(): boolean;
   imageGenRecommendedPack(): string;
   exportSvg(nodeIds: string[], optionsJson: string): string;
-  exportPng(outputPath: string, optionsJson: string): number;
-  exportPdf(outputPath: string, optionsJson: string): number;
+  // Async SVG variant the renderer uses when the document has > 100
+  // nodes; the sync variant stays for small docs where worker
+  // dispatch overhead would dominate.
+  exportSvgAsync(nodeIds: string[], optionsJson: string): Promise<string>;
+  exportPng(outputPath: string, optionsJson: string): Promise<number>;
+  exportPdf(outputPath: string, optionsJson: string): Promise<number>;
   exportWebp(outputPath: string, optionsJson: string): number;
   exportJpeg(outputPath: string, optionsJson: string): number;
 
@@ -480,6 +492,7 @@ export interface Bridge {
   ): string;
   componentAddVariant(componentId: string, name: string): string;
   componentSwitchVariant(nodeId: string, variantId: string): void;
+  componentSmartAnimateSnapshot(nodeId: string, targetVariantId: string): string;
   componentDetach(nodeId: string): void;
 
   // Auto-layout (Phase 1, Block C)
@@ -653,29 +666,36 @@ export interface Bridge {
   // RasterLayer node's tile grid in place and record an undoable
   // `Operation` with `ai_generated: false`. `rasterPreviewFilter`
   // returns the post-filter RGBA buffer without committing.
+  // Phase 11 Block B: these were sync prior to Phase 11. Each now
+  // returns a Promise that resolves once the worker-pool task
+  // finishes; the renderer already `await`s the calls.
   rasterApplyLevels(
     nodeId: string,
     black: number,
     white: number,
     gamma: number,
-  ): void;
-  rasterApplyCurves(nodeId: string, pointsJson: string): void;
-  rasterApplyBlur(nodeId: string, radius: number, kind: string): void;
+  ): Promise<void>;
+  rasterApplyCurves(nodeId: string, pointsJson: string): Promise<void>;
+  rasterApplyBlur(nodeId: string, radius: number, kind: string): Promise<void>;
   rasterApplySharpen(
     nodeId: string,
     radius: number,
     amount: number,
     threshold: number,
-  ): void;
+  ): Promise<void>;
   rasterCrop(
     nodeId: string,
     x: number,
     y: number,
     w: number,
     h: number,
-  ): void;
-  rasterRotate(nodeId: string, angleDeg: number): void;
-  rasterFlip(nodeId: string, direction: string): void;
+  ): Promise<void>;
+  // Phase 11 Block B follow-up — Devin Review ANALYSIS-0003.
+  // Rotate / flip / heal now dispatch through `AsyncTask` on the
+  // Rust side, so the N-API surface returns `Promise<void>` instead
+  // of executing on the main thread.
+  rasterRotate(nodeId: string, angleDeg: number): Promise<void>;
+  rasterFlip(nodeId: string, direction: string): Promise<void>;
   rasterHeal(
     nodeId: string,
     srcX: number,
@@ -683,7 +703,7 @@ export interface Bridge {
     dstX: number,
     dstY: number,
     radius: number,
-  ): void;
+  ): Promise<void>;
   rasterPreviewFilter(nodeId: string, filterJson: string): Buffer;
   // Phase 8 Block B — perspective transform, HSL adjustment, color
   // balance adjustment, and mask-aware filter application. Each
@@ -692,19 +712,19 @@ export interface Bridge {
   // boolean array whose length must equal `width * height` of the
   // layer; it composes the filter through a 1-pixel feather kernel
   // at the mask boundary so the seam does not alias.
-  rasterPerspective(nodeId: string, cornersJson: string): void;
+  rasterPerspective(nodeId: string, cornersJson: string): Promise<void>;
   rasterApplyHsl(
     nodeId: string,
     hue: number,
     saturation: number,
     lightness: number,
-  ): void;
+  ): Promise<void>;
   rasterApplyColorBalance(
     nodeId: string,
     shadowsJson: string,
     midtonesJson: string,
     highlightsJson: string,
-  ): void;
+  ): Promise<void>;
   // `mask` is a flat row-major `Buffer` of length
   // `layer_width * layer_height`. Byte `0` means "not selected";
   // any non-zero byte means "selected". Crossing the IPC boundary
@@ -715,11 +735,21 @@ export interface Bridge {
   // with `Buffer.from(buffer, byteOffset, byteLength)` (zero-copy
   // view over the same ArrayBuffer) before invoking the IPC
   // channel.
+  // Phase 11 Block B follow-up round 3 — Devin Review BUG-0001 (r3).
+  // `raster_apply_filter_masked` on the Rust side now returns
+  // `AsyncTask<phase11::RasterFilterMaskedTask>` so the masked filter
+  // pipeline runs on the libuv worker pool instead of the main
+  // thread. The N-API export carries
+  // `#[napi(ts_return_type = "Promise<void>")]`, the generated
+  // `.d.ts` and `main.ts` IPC handler already `await` the call,
+  // and `shared/scene.ts` declares `Promise<void>` — so this
+  // hand-written `NativeBridge` declaration must match
+  // `Promise<void>` too. AGENTS.md Rule 4 (wire-format lockstep).
   rasterApplyFilterMasked(
     nodeId: string,
     filterJson: string,
     mask: Buffer,
-  ): void;
+  ): Promise<void>;
   // Phase 5 — vector path operations + non-destructive effects
   // (Block C Tasks 15, 16, 18). All mutate the VectorLayer's
   // stored geometry (simplify / smooth / offset) or its NodeStyle

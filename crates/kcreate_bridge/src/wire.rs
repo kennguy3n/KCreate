@@ -194,6 +194,14 @@ pub fn parse_scene(json: &str) -> Result<Scene, WireError> {
                     pixels_width,
                     pixels_height,
                     pixels,
+                    // Phase 11 Block A Task 3 — wire-format raster
+                    // payloads come from external callers (export
+                    // tests, scene-roundtrip fixtures) that don't
+                    // route through the blob store, so we don't have
+                    // a content-addressed hash to attach. The
+                    // fingerprint hot path will fall back to chunked
+                    // pixel hashing for these.
+                    content_hash: None,
                 }
             }
             WireKind::Text {

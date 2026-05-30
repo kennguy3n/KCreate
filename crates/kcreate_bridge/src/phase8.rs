@@ -33,7 +33,9 @@ use kcreate_text::tokens::{encode_page_number_token, PageNumberFormat};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::document::{with_workspace, with_workspace_mut, DocumentBridgeError, Result};
+use crate::document::{
+    layout_propagate_in_subtree, with_workspace, with_workspace_mut, DocumentBridgeError, Result,
+};
 
 /// Metadata key on a [`kcreate_core::node::Node`] storing the
 /// boolean autofit-enabled flag for text layers. Lives in the
@@ -273,6 +275,31 @@ pub fn document_resize_frame(frame_id: Uuid, new_bounds: Bounds) -> Result<()> {
                 autofit_changes.push(change);
             }
         }
+        // Phase 11 Block C Task 16 — propagate auto-layout
+        // through the resized frame's descendants. If any of the
+        // resized children are themselves `LayoutFrame` nodes
+        // (e.g. component instances whose root is a flex
+        // container), this re-runs their solver so their own
+        // children get repositioned for the new bounds. We
+        // capture both halves of the layout propagation in the
+        // operation payload so undo restores the entire chain
+        // atomically.
+        let layout_report = layout_propagate_in_subtree(ws, frame_id)?;
+        let mut layout_before: Vec<serde_json::Value> =
+            Vec::with_capacity(layout_report.changes.len());
+        let mut layout_after: Vec<serde_json::Value> =
+            Vec::with_capacity(layout_report.changes.len());
+        for change in &layout_report.changes {
+            layout_before.push(
+                serde_json::json!({ "id": change.node_id.to_string(), "bounds": change.before }),
+            );
+            layout_after.push(
+                serde_json::json!({ "id": change.node_id.to_string(), "bounds": change.after }),
+            );
+            if !affected.contains(&change.node_id) {
+                affected.push(change.node_id);
+            }
+        }
         // The autofit slice of the audit payload must encode the
         // state the slot *holds*, not the diff. `before.autofit[i]`
         // captures the pre-resize font size (the value to restore on
@@ -296,6 +323,7 @@ pub fn document_resize_frame(frame_id: Uuid, new_bounds: Bounds) -> Result<()> {
                     "font_size": c.new_size,
                 }))
                 .collect::<Vec<_>>(),
+            "layout_propagation": layout_after,
         });
         let before = serde_json::json!({
             "frame": before_bounds["frame"].clone(),
@@ -307,6 +335,7 @@ pub fn document_resize_frame(frame_id: Uuid, new_bounds: Bounds) -> Result<()> {
                     "font_size": c.previous_size,
                 }))
                 .collect::<Vec<_>>(),
+            "layout_propagation": layout_before,
         });
         ws.project.modified_at = Utc::now();
         let op = Operation::new("user", "document_resize_frame", before, after, affected);
@@ -522,7 +551,8 @@ pub fn brand_kit_save_version(
             .ok_or_else(|| {
                 DocumentBridgeError::Internal(format!("brand kit {brand_kit_id} not found"))
             })?;
-        let conn = ws.store.connection();
+        let store = ws.store.lock();
+        let conn = store.connection();
         let version = save_brand_kit_version(conn, brand_kit, description.to_string())
             .map_err(|e| DocumentBridgeError::Internal(format!("save_brand_kit_version: {e}")))?;
         Ok(BrandKitVersionInfo::from(version))
@@ -532,7 +562,8 @@ pub fn brand_kit_save_version(
 /// List versions for a brand kit, newest first.
 pub fn brand_kit_list_versions(brand_kit_id: Uuid) -> Result<Vec<BrandKitVersionInfo>> {
     with_workspace(|ws| {
-        let conn = ws.store.connection();
+        let store = ws.store.lock();
+        let conn = store.connection();
         let versions = list_brand_kit_versions(conn, brand_kit_id)
             .map_err(|e| DocumentBridgeError::Internal(format!("list_brand_kit_versions: {e}")))?;
         Ok(versions
@@ -547,7 +578,8 @@ pub fn brand_kit_list_versions(brand_kit_id: Uuid) -> Result<Vec<BrandKitVersion
 /// project so subsequent reads see the restored values immediately.
 pub fn brand_kit_restore_version(version_id: Uuid) -> Result<kcreate_core::project::BrandKit> {
     with_workspace_mut(|ws| {
-        let conn = ws.store.connection();
+        let store = ws.store.lock();
+        let conn = store.connection();
         let snapshot = restore_brand_kit_version(conn, version_id).map_err(|e| {
             DocumentBridgeError::Internal(format!("restore_brand_kit_version: {e}"))
         })?;
@@ -578,7 +610,8 @@ pub fn brand_kit_restore_version(version_id: Uuid) -> Result<kcreate_core::proje
 /// identified by their version ids.
 pub fn brand_kit_diff(before_id: Uuid, after_id: Uuid) -> Result<BrandKitDiff> {
     with_workspace(|ws| {
-        let conn = ws.store.connection();
+        let store = ws.store.lock();
+        let conn = store.connection();
         let before = kcreate_storage::brand_versions::load_brand_kit_version(conn, before_id)
             .map_err(|e| DocumentBridgeError::Internal(format!("load before: {e}")))?
             .ok_or_else(|| DocumentBridgeError::Internal(format!("before {before_id} missing")))?;

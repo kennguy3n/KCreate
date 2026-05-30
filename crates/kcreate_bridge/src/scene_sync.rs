@@ -500,12 +500,41 @@ impl SceneSync {
         self.last_version.insert(node.id, node.version);
     }
 
-    /// Translate the document graph into a fresh renderer [`Scene`].
+    /// Phase 11 Block A Task 2 — read-only sync entry point used by
+    /// test fixtures that hand in a `&DocumentGraph`. Always does a
+    /// full rebuild (no dirty-set drain, no incremental cache
+    /// pruning). Production code MUST use
+    /// [`Self::sync_document_to_scene`] so dirty tracking stays in
+    /// lockstep with the document.
+    pub fn sync_document_to_scene_borrowed(
+        &mut self,
+        doc: &DocumentGraph,
+        blob_store: Option<&BlobStore>,
+        selection: &[Uuid],
+    ) -> Scene {
+        // Conservative: invalidate the entire incremental cache so a
+        // borrowed-form caller cannot accidentally serve stale
+        // entries from a previous mutable sync.
+        self.node_cache.clear();
+        self.last_version.clear();
+        self.sync_document_to_scene_inner(doc, blob_store, selection)
+    }
+
+    /// Translate the document graph into a renderer [`Scene`].
     ///
-    /// This rebuilds the scene from scratch every call. That is
-    /// deliberate: Phase 0 doesn't need incremental scene patching, and
-    /// a full rebuild keeps the mapping in lockstep with the document
-    /// (no risk of stale `ObjectId`s outliving deleted nodes).
+    /// **Phase 11 Block A Task 2 — incremental sync.**
+    ///
+    /// Takes [`&mut DocumentGraph`] so the sync can drain the
+    /// document's dirty set in one atomic step. When
+    /// `structure_dirty` is set, the per-node version cache is
+    /// flushed (forcing every leaf-node emit_* to re-walk metadata).
+    /// When only a subset of node ids is dirty, only those entries
+    /// are evicted from the cache; the version-comparison path in
+    /// [`Self::try_replay_cached`] then naturally reuses every other
+    /// node's previous emit. A document with no edits since the
+    /// previous sync (empty dirty set, `structure_dirty == false`)
+    /// replays the entire scene from cache without re-walking any
+    /// leaf metadata.
     ///
     /// `blob_store` is consulted for raster image pixel data. When
     /// `None` (or when a particular blob can't be loaded), raster
@@ -518,6 +547,37 @@ impl SceneSync {
     /// map (they have ids in a private high range so hit-testing
     /// against them never collides with a real node).
     pub fn sync_document_to_scene(
+        &mut self,
+        doc: &mut DocumentGraph,
+        blob_store: Option<&BlobStore>,
+        selection: &[Uuid],
+    ) -> Scene {
+        let (dirty_ids, structure_dirty) = doc.drain_dirty();
+        if structure_dirty {
+            // Tree shape changed (insert/remove/reparent/reorder).
+            // Evict the entire incremental cache because the
+            // z-order / container chrome must be re-emitted from
+            // scratch — z values are positional and would slot in
+            // wrong if we replayed.
+            self.node_cache.clear();
+            self.last_version.clear();
+        } else {
+            // Only specific node properties changed. Evict just
+            // those entries; everything else replays.
+            for id in &dirty_ids {
+                self.node_cache.remove(id);
+                self.last_version.remove(id);
+            }
+        }
+        self.sync_document_to_scene_inner(doc, blob_store, selection)
+    }
+
+    /// Internal scene walk shared by [`Self::sync_document_to_scene`]
+    /// and the legacy immutable test entry point
+    /// [`Self::sync_document_to_scene_borrowed`]. The dirty-set
+    /// handling lives in the public mutable form so the internal
+    /// walk only depends on read access to the graph.
+    fn sync_document_to_scene_inner(
         &mut self,
         doc: &DocumentGraph,
         blob_store: Option<&BlobStore>,
@@ -1173,16 +1233,25 @@ impl SceneSync {
             world.width as f32,
             world.height as f32,
         );
-        let meta = node.metadata.get(RASTER_IMAGE_METADATA_KEY);
+        let meta = node
+            .metadata
+            .get(RASTER_IMAGE_METADATA_KEY)
+            .and_then(|v| serde_json::from_value::<RasterImageMeta>(v.clone()).ok());
+        // Phase 11 Block A Task 3 — compute the content-addressed
+        // fingerprint up-front from the blob hash before we resolve
+        // pixels. Surviving the resolve step means the renderer can
+        // skip chunk-hashing the pixel buffer on every fingerprint.
+        let content_hash = meta.as_ref().map(|m| blob_hash_to_token(&m.blob_hash));
         let resolved = meta
-            .and_then(|v| serde_json::from_value::<RasterImageMeta>(v.clone()).ok())
-            .and_then(|m| resolve_raster_image(&m, blob_store));
+            .as_ref()
+            .and_then(|m| resolve_raster_image(m, blob_store));
         let kind = if let Some((pw, ph, pixels)) = resolved {
             ObjectKind::Image {
                 rect,
                 pixels_width: pw,
                 pixels_height: ph,
                 pixels,
+                content_hash,
             }
         } else {
             ObjectKind::Rect(rect)
@@ -1235,6 +1304,69 @@ impl SceneSync {
         .with_z(*z);
         objects.push(obj);
         *z += 1;
+    }
+}
+
+/// **Phase 11 Block A Task 3 — content-addressed fingerprint token.**
+///
+/// Compresses a BLAKE3 blob hash (hex string, 64 chars / 32 bytes)
+/// down to a 64-bit token by XOR-folding eight 8-byte stripes. The
+/// scene fingerprint hashes the resulting `u64` instead of walking
+/// the raster pixel buffer — collisions inside a single document are
+/// negligible (a 4×10⁻¹⁸ birthday probability across 10 000 distinct
+/// images) and indistinguishable from cache-noise even if they did
+/// occur, because the renderer would just re-hash the unchanged
+/// pixels and produce the same display-list cache key.
+///
+/// Inputs that aren't valid hex (corrupt project, in-memory only
+/// rasters) fall back to FxHash of the raw bytes so we still produce
+/// a stable token rather than silently emitting `0` for every layer.
+#[must_use]
+fn blob_hash_to_token(blob_hash: &str) -> u64 {
+    // BLAKE3 produces 32 bytes / 64 hex chars. Decode strictly and
+    // XOR-fold; non-hex inputs fall through to byte-FxHash.
+    let decoded: Option<[u8; 32]> = {
+        let bytes = blob_hash.as_bytes();
+        if bytes.len() == 64 && bytes.iter().all(u8::is_ascii_hexdigit) {
+            let mut out = [0u8; 32];
+            for (i, chunk) in bytes.chunks_exact(2).enumerate() {
+                let hi = (chunk[0] as char).to_digit(16).unwrap_or(0) as u8;
+                let lo = (chunk[1] as char).to_digit(16).unwrap_or(0) as u8;
+                out[i] = (hi << 4) | lo;
+            }
+            Some(out)
+        } else {
+            None
+        }
+    };
+    if let Some(bytes) = decoded {
+        let mut folded = [0u8; 8];
+        for stripe_idx in 0..4 {
+            let start = stripe_idx * 8;
+            for i in 0..8 {
+                folded[i] ^= bytes[start + i];
+            }
+        }
+        u64::from_le_bytes(folded)
+    } else {
+        // Fallback: hash the raw string with a *fixed-seed* hasher.
+        //
+        // Phase 11 Block A follow-up — Devin Review BUG-0003.
+        //
+        // Earlier revisions used `RandomState::new()`, whose seed is
+        // randomised per call — so the same blob string produced a
+        // different token on each invocation, breaking the
+        // pipeline's display-list cache for non-hex blob hashes
+        // (tests, in-memory fixtures, corrupt project data).
+        // `BuildHasherDefault::<DefaultHasher>` always constructs a
+        // `DefaultHasher` with the standard zero-seeded SipHash
+        // state, which is deterministic for the lifetime of the
+        // process AND across processes on the same rustc build.
+        use std::hash::{BuildHasher, BuildHasherDefault, Hasher};
+        let builder = BuildHasherDefault::<std::collections::hash_map::DefaultHasher>::default();
+        let mut hasher = builder.build_hasher();
+        hasher.write(blob_hash.as_bytes());
+        hasher.finish()
     }
 }
 
@@ -1507,7 +1639,7 @@ mod tests {
         let node = vector_node(&path);
         let id = doc.insert_node(node).expect("insert");
         let mut sync = SceneSync::new();
-        let scene = sync.sync_document_to_scene(&doc, None, &[]);
+        let scene = sync.sync_document_to_scene(&mut doc, None, &[]);
         assert_eq!(scene.objects.len(), 1);
         assert!(matches!(scene.objects[0].kind, ObjectKind::Path(_)));
         let obj_id = sync.object_id_for_uuid(id).expect("forward lookup");
@@ -1526,7 +1658,7 @@ mod tests {
         child.parent_id = Some(group_id);
         doc.insert_node(child).expect("child");
         let mut sync = SceneSync::new();
-        let scene = sync.sync_document_to_scene(&doc, None, &[]);
+        let scene = sync.sync_document_to_scene(&mut doc, None, &[]);
         assert!(
             scene.objects.is_empty(),
             "hiding the group must hide everything beneath it"
@@ -1541,7 +1673,7 @@ mod tests {
         let node = vector_node(&path);
         let id = doc.insert_node(node).expect("insert");
         let mut sync = SceneSync::new();
-        let scene = sync.sync_document_to_scene(&doc, None, &[id]);
+        let scene = sync.sync_document_to_scene(&mut doc, None, &[id]);
         assert_eq!(
             scene.objects.len(),
             2,
@@ -1565,9 +1697,9 @@ mod tests {
         let node = vector_node(&path);
         let id = doc.insert_node(node).expect("insert");
         let mut sync = SceneSync::new();
-        let _ = sync.sync_document_to_scene(&doc, None, &[]);
+        let _ = sync.sync_document_to_scene(&mut doc, None, &[]);
         let first = sync.object_id_for_uuid(id).expect("first");
-        let _ = sync.sync_document_to_scene(&doc, None, &[]);
+        let _ = sync.sync_document_to_scene(&mut doc, None, &[]);
         let second = sync.object_id_for_uuid(id).expect("second");
         assert_eq!(
             first, second,
@@ -1593,7 +1725,7 @@ mod tests {
         });
         let id = doc.insert_node(art).expect("art");
         let mut sync = SceneSync::new();
-        let scene = sync.sync_document_to_scene(&doc, None, &[]);
+        let scene = sync.sync_document_to_scene(&mut doc, None, &[]);
         // Shadow + background + label = 3 scene objects.
         assert_eq!(scene.objects.len(), 3, "shadow + bg + label");
 
@@ -1638,7 +1770,7 @@ mod tests {
         };
         doc.insert_node(art).expect("art");
         let mut sync = SceneSync::new();
-        let scene = sync.sync_document_to_scene(&doc, None, &[]);
+        let scene = sync.sync_document_to_scene(&mut doc, None, &[]);
         // Shadow + background only, no label.
         assert_eq!(scene.objects.len(), 2);
     }
@@ -1681,7 +1813,7 @@ mod tests {
             .expect("attach outside");
 
         let mut sync = SceneSync::new();
-        let scene = sync.sync_document_to_scene(&doc, None, &[]);
+        let scene = sync.sync_document_to_scene(&mut doc, None, &[]);
         // Shadow + bg + label + inside child = 4 (outside pruned).
         assert_eq!(scene.objects.len(), 4);
         // The pruned child must not have a mapping.
@@ -1736,7 +1868,7 @@ mod tests {
         };
         doc.insert_node(node).expect("insert");
         let mut sync = SceneSync::new();
-        let scene = sync.sync_document_to_scene(&doc, None, &[]);
+        let scene = sync.sync_document_to_scene(&mut doc, None, &[]);
         let obj = &scene.objects[0];
         assert_eq!(obj.translation, (50.0, 75.0));
     }
@@ -1764,7 +1896,7 @@ mod tests {
         }
 
         let mut sync = SceneSync::new();
-        let mut scene = sync.sync_document_to_scene(&doc, None, &[]);
+        let mut scene = sync.sync_document_to_scene(&mut doc, None, &[]);
 
         // Snapshot the overlay-id set emitted by the document walk.
         let pre_cursor_overlay_ids: std::collections::HashSet<ObjectId> = scene
@@ -1909,7 +2041,7 @@ mod tests {
         doc.insert_node(hidden).expect("hidden");
 
         let mut sync = SceneSync::new();
-        let mut scene = sync.sync_document_to_scene(&doc, None, &[]);
+        let mut scene = sync.sync_document_to_scene(&mut doc, None, &[]);
         let pre_overlay_ids: std::collections::HashSet<ObjectId> = scene
             .objects
             .iter()
@@ -1986,7 +2118,7 @@ mod tests {
         doc.insert_node(visible).expect("visible");
 
         let mut sync = SceneSync::new();
-        let mut scene = sync.sync_document_to_scene(&doc, None, &[]);
+        let mut scene = sync.sync_document_to_scene(&mut doc, None, &[]);
         let pre_overlay_ids: std::collections::HashSet<ObjectId> = scene
             .objects
             .iter()
@@ -2066,7 +2198,7 @@ mod tests {
         doc.insert_node(visible_b).expect("b");
 
         let mut sync = SceneSync::new();
-        let mut scene = sync.sync_document_to_scene(&doc, None, &[]);
+        let mut scene = sync.sync_document_to_scene(&mut doc, None, &[]);
         let pre_overlay_ids: std::collections::HashSet<ObjectId> = scene
             .objects
             .iter()
@@ -2154,7 +2286,7 @@ mod tests {
         doc.insert_node(child).expect("child");
 
         let mut sync = SceneSync::new();
-        let mut scene = sync.sync_document_to_scene(&doc, None, &[]);
+        let mut scene = sync.sync_document_to_scene(&mut doc, None, &[]);
         let cursors = vec![PresenceCursor {
             peer_id: "peer-1".into(),
             display_name: "Alice".into(),
@@ -2202,9 +2334,9 @@ mod tests {
         doc.insert_node(node).expect("node");
 
         let mut sync_1x = SceneSync::new();
-        let mut scene_1x = sync_1x.sync_document_to_scene(&doc, None, &[]);
+        let mut scene_1x = sync_1x.sync_document_to_scene(&mut doc, None, &[]);
         let mut sync_2x = SceneSync::new();
-        let mut scene_2x = sync_2x.sync_document_to_scene(&doc, None, &[]);
+        let mut scene_2x = sync_2x.sync_document_to_scene(&mut doc, None, &[]);
 
         let selections = vec![PresenceSelection {
             peer_id: "peer-1".into(),
@@ -2233,7 +2365,7 @@ mod tests {
 
         // Pathological zoom: just confirm finite, bounded output.
         let mut sync_bad = SceneSync::new();
-        let mut scene_bad = sync_bad.sync_document_to_scene(&doc, None, &[]);
+        let mut scene_bad = sync_bad.sync_document_to_scene(&mut doc, None, &[]);
         sync_bad.append_presence_selection_halos(&mut scene_bad, &doc, &selections, 0, -1.0);
         let wb = stroke_width(&scene_bad);
         assert!(
@@ -2309,7 +2441,7 @@ mod tests {
         let id = doc.insert_node(node).expect("insert");
 
         let mut sync = SceneSync::new();
-        let scene = sync.sync_document_to_scene(&doc, None, &[]);
+        let scene = sync.sync_document_to_scene(&mut doc, None, &[]);
 
         assert!(
             scene.objects.len() >= 2,
@@ -2359,7 +2491,7 @@ mod tests {
             })
             .collect();
         let mut sync = SceneSync::new();
-        let scene = sync.sync_document_to_scene(&doc, None, &[]);
+        let scene = sync.sync_document_to_scene(&mut doc, None, &[]);
         (doc, sync, scene, ids)
     }
 
@@ -2372,13 +2504,13 @@ mod tests {
 
     #[test]
     fn second_sync_with_no_changes_reuses_cache_and_matches_full_rebuild() {
-        let (doc, mut cached_sync, scene_a, _ids) = three_vector_scene();
+        let (mut doc, mut cached_sync, scene_a, _ids) = three_vector_scene();
         // Replay against the same doc; nothing has changed so the
         // cache should be 100% hit and the resulting scene must be
         // bit-identical to a fresh-from-empty sync.
-        let scene_b = cached_sync.sync_document_to_scene(&doc, None, &[]);
+        let scene_b = cached_sync.sync_document_to_scene(&mut doc, None, &[]);
         let mut fresh = SceneSync::new();
-        let scene_c = fresh.sync_document_to_scene(&doc, None, &[]);
+        let scene_c = fresh.sync_document_to_scene(&mut doc, None, &[]);
         // Both syncs from the same doc state must produce the same
         // object count and per-object kinds (Path).
         assert_eq!(scene_a.objects.len(), scene_b.objects.len());
@@ -2398,7 +2530,7 @@ mod tests {
         }
         // Re-sync — the cache entry for ids[1] should regenerate but
         // entries for ids[0] and ids[2] should replay unchanged.
-        let scene = sync.sync_document_to_scene(&doc, None, &[]);
+        let scene = sync.sync_document_to_scene(&mut doc, None, &[]);
         assert_eq!(scene.objects.len(), 3, "still three vector objects");
         assert_eq!(
             sync.cached_node_count(),
@@ -2412,7 +2544,7 @@ mod tests {
         let (mut doc, mut sync, _scene_a, ids) = three_vector_scene();
         let before = sync.cached_node_count();
         doc.remove_node(ids[0]).expect("remove first node");
-        let scene = sync.sync_document_to_scene(&doc, None, &[]);
+        let scene = sync.sync_document_to_scene(&mut doc, None, &[]);
         assert_eq!(scene.objects.len(), 2, "two objects remain");
         assert_eq!(
             sync.cached_node_count(),
@@ -2423,12 +2555,12 @@ mod tests {
 
     #[test]
     fn cached_replay_preserves_object_id_stability() {
-        let (doc, mut sync, scene_a, ids) = three_vector_scene();
+        let (mut doc, mut sync, scene_a, ids) = three_vector_scene();
         let id_a: Vec<_> = scene_a.objects.iter().map(|o| o.id).collect();
         // Second sync with no changes — every emitted object id must
         // match the first sync's, since the cache replays the exact
         // ObjectId values it captured.
-        let scene_b = sync.sync_document_to_scene(&doc, None, &[]);
+        let scene_b = sync.sync_document_to_scene(&mut doc, None, &[]);
         let id_b: Vec<_> = scene_b.objects.iter().map(|o| o.id).collect();
         assert_eq!(id_a, id_b, "cached replay must yield identical ObjectIds");
         // Forward map still resolves every node uuid.

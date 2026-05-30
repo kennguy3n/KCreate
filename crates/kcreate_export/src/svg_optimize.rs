@@ -13,10 +13,17 @@
 //! - shorten path data coordinates to a configurable precision.
 //!
 //! The minifier is deliberately string-only — bringing in a full
-//! SVG/XML AST would mean another large dependency. The patterns
-//! here are anchored at tag boundaries so they don't accidentally
-//! mutate text inside `<text>` / `<title>` / `<desc>` nodes (we
-//! only touch attribute values and whitespace).
+//! SVG/XML AST would mean another large dependency. To avoid
+//! corrupting authored content the rewrites that run on the markup
+//! (default-attribute stripping, whitespace collapse) are run only on
+//! the regions that lie *outside* preserved blocks. A block is
+//! preserved if it is either an XML CDATA section
+//! (`<![CDATA[ ... ]]>`) or the body of a content-bearing element
+//! whose text matters byte-for-byte (`<text>`, `<title>`, `<desc>`,
+//! `<style>`, `<script>`). See [`protected_regions`] /
+//! [`with_unprotected`]. Path-coordinate shortening only touches the
+//! payload of `d="..."` attributes, which can never appear inside
+//! those preserved bodies, so it is safe to run on the full string.
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -88,7 +95,7 @@ pub fn optimize_svg_with(
     }
     s = strip_doctype_and_xml(&s);
     if opts.strip_default_attrs {
-        s = strip_default_attrs(&s);
+        s = with_unprotected(&s, strip_default_attrs);
     }
     if opts.strip_empty_groups {
         // Re-run until fixed point — removing a group can leave its
@@ -102,7 +109,7 @@ pub fn optimize_svg_with(
     if opts.coord_precision < 10 {
         s = shorten_path_coords(&s, opts.coord_precision);
     }
-    s = collapse_whitespace(&s);
+    s = with_unprotected(&s, collapse_whitespace);
     let optimised_bytes = s.len() as u64;
     let bytes_saved = original_bytes.saturating_sub(optimised_bytes);
     let ratio = if original_bytes == 0 {
@@ -171,20 +178,129 @@ fn strip_doctype_and_xml(s: &str) -> String {
 
 fn strip_default_attrs(s: &str) -> String {
     let defaults = [
-        (" fill=\"black\"", ""),
-        (" fill=\"#000\"", ""),
-        (" fill=\"#000000\"", ""),
-        (" stroke=\"none\"", ""),
-        (" opacity=\"1\"", ""),
-        (" fill-opacity=\"1\"", ""),
-        (" stroke-opacity=\"1\"", ""),
-        (" stroke-width=\"1\"", ""),
+        " fill=\"black\"",
+        " fill=\"#000\"",
+        " fill=\"#000000\"",
+        " stroke=\"none\"",
+        " opacity=\"1\"",
+        " fill-opacity=\"1\"",
+        " stroke-opacity=\"1\"",
+        " stroke-width=\"1\"",
     ];
     let mut s = s.to_string();
-    for (needle, repl) in defaults {
-        s = s.replace(needle, repl);
+    for needle in defaults {
+        s = s.replace(needle, "");
     }
     s
+}
+
+/// Run `f` only on the slices of `s` that are not inside a preserved
+/// region (CDATA sections + `<text>`/`<title>`/`<desc>`/`<style>`/
+/// `<script>` element bodies). Preserved slices are concatenated
+/// back unchanged. This is how we avoid corrupting authored content
+/// while still rewriting the markup around it.
+fn with_unprotected(s: &str, f: fn(&str) -> String) -> String {
+    let regions = protected_regions(s);
+    if regions.is_empty() {
+        return f(s);
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut cursor = 0;
+    for (start, end) in regions {
+        if cursor < start {
+            out.push_str(&f(&s[cursor..start]));
+        }
+        out.push_str(&s[start..end]);
+        cursor = end;
+    }
+    if cursor < s.len() {
+        out.push_str(&f(&s[cursor..]));
+    }
+    out
+}
+
+/// Return a sorted, non-overlapping list of `[start, end)` byte ranges
+/// inside `s` that must not be touched by the markup-level
+/// transformations (default-attribute stripping, whitespace collapse).
+/// Each region covers the *inside* of a preserved span — opening and
+/// closing markers are intentionally left out so the markup rewrites
+/// can still clean up the tags themselves.
+fn protected_regions(s: &str) -> Vec<(usize, usize)> {
+    const ELEMENTS: &[&str] = &["text", "title", "desc", "style", "script"];
+    let bytes = s.as_bytes();
+    let mut out: Vec<(usize, usize)> = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        // CDATA: `<![CDATA[ ... ]]>` — protect the inner payload.
+        if bytes[i..].starts_with(b"<![CDATA[") {
+            let start = i + b"<![CDATA[".len();
+            if let Some(rel) = find_subslice(&bytes[start..], b"]]>") {
+                let end = start + rel;
+                out.push((start, end));
+                i = end + b"]]>".len();
+                continue;
+            }
+            // Unterminated CDATA: preserve the rest verbatim.
+            out.push((start, bytes.len()));
+            break;
+        }
+        // Opening tag for one of the preserved elements.
+        if bytes[i] == b'<' {
+            if let Some((tag, after_open)) = matched_open_tag(s, i, ELEMENTS) {
+                // `after_open` is the byte index immediately after the
+                // closing `>` of the opening tag. Self-closing tags
+                // (e.g. `<title/>`) have no inner content.
+                if !s[..after_open].trim_end_matches('>').ends_with('/') {
+                    let close_needle = format!("</{tag}");
+                    if let Some(rel) = find_subslice(&bytes[after_open..], close_needle.as_bytes()) {
+                        let end = after_open + rel;
+                        out.push((after_open, end));
+                        i = end;
+                        continue;
+                    }
+                    // Unterminated: preserve to EOF.
+                    out.push((after_open, bytes.len()));
+                    break;
+                }
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+fn find_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || needle.len() > hay.len() {
+        return None;
+    }
+    (0..=hay.len() - needle.len()).find(|&w| hay[w..w + needle.len()] == *needle)
+}
+
+/// If position `pos` is the start of an opening tag whose name is
+/// one of `names`, return `(matched_name, position_after_closing_>)`.
+fn matched_open_tag<'a>(s: &str, pos: usize, names: &'a [&'a str]) -> Option<(&'a str, usize)> {
+    let bytes = s.as_bytes();
+    if bytes.get(pos) != Some(&b'<') {
+        return None;
+    }
+    for &name in names {
+        let head = format!("<{name}");
+        if !s[pos..].starts_with(&head) {
+            continue;
+        }
+        // The next byte after the name must be whitespace, `/`, or `>`
+        // — otherwise we matched a prefix (e.g. `<textPath` shouldn't
+        // match `text`).
+        let next = bytes.get(pos + head.len()).copied();
+        let is_boundary = matches!(next, Some(b) if b.is_ascii_whitespace() || b == b'/' || b == b'>');
+        if !is_boundary {
+            continue;
+        }
+        let after = &s[pos + head.len()..];
+        let rel = after.find('>')?;
+        return Some((name, pos + head.len() + rel + 1));
+    }
+    None
 }
 
 fn strip_empty_groups_once(s: &str) -> String {
@@ -410,5 +526,74 @@ mod tests {
         let svg = r#"<svg><text font-family="Helvetica Neue">Hello</text></svg>"#;
         let r = optimize_svg(svg).unwrap();
         assert!(r.output_svg.contains("Helvetica Neue"));
+    }
+
+    #[test]
+    fn text_element_body_is_not_collapsed() {
+        // Multi-space body text must survive collapse_whitespace.
+        let svg = "<svg><text>hello    world</text></svg>";
+        let r = optimize_svg(svg).unwrap();
+        assert!(
+            r.output_svg.contains("hello    world"),
+            "text body collapsed: {}",
+            r.output_svg
+        );
+    }
+
+    #[test]
+    fn style_block_payload_is_preserved_byte_for_byte() {
+        // CSS inside a <style> block uses whitespace + `:` `;` syntax
+        // that must not be mangled by the markup-level rewrites.
+        let css = ".foo { fill: black;\n  stroke: red; }";
+        let svg = format!("<svg><style>{css}</style><rect/></svg>");
+        let r = optimize_svg(&svg).unwrap();
+        assert!(
+            r.output_svg.contains(css),
+            "style payload mutated: {}",
+            r.output_svg
+        );
+    }
+
+    #[test]
+    fn strip_default_attrs_does_not_touch_text_bodies() {
+        // The literal ` fill="black"` inside a <text> body must not
+        // be deleted by strip_default_attrs.
+        let svg = r#"<svg><text>example fill="black" inline</text><rect fill="black"/></svg>"#;
+        let r = optimize_svg(svg).unwrap();
+        assert!(
+            r.output_svg.contains(r#"example fill="black" inline"#),
+            "text body lost literal: {}",
+            r.output_svg
+        );
+        // The actual rect attribute is still stripped.
+        assert!(!r.output_svg.contains(r#"<rect fill="black""#));
+    }
+
+    #[test]
+    fn cdata_payload_is_preserved() {
+        // CDATA sections must round-trip unchanged.
+        let svg =
+            "<svg><script><![CDATA[ a < b && c > d  // multi space ]]></script><rect/></svg>";
+        let r = optimize_svg(svg).unwrap();
+        assert!(
+            r.output_svg.contains("a < b && c > d  // multi space"),
+            "CDATA mangled: {}",
+            r.output_svg
+        );
+    }
+
+    #[test]
+    fn textpath_prefix_match_is_rejected() {
+        // `<textPath>` shares the `<text` prefix; the boundary
+        // check must keep us from treating its body as preserved.
+        let svg = "<svg><textPath href=\"#p\"   data-x=\"y\" >x  y</textPath></svg>";
+        let r = optimize_svg(svg).unwrap();
+        // Inside the <textPath> body, multi-space sequences in the
+        // attribute list of the opening tag SHOULD have collapsed.
+        assert!(
+            !r.output_svg.contains("#p\"   data-x"),
+            "textPath attrs not collapsed: {}",
+            r.output_svg
+        );
     }
 }

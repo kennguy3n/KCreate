@@ -410,8 +410,8 @@ mod tests {
         // high-frequency noise that disrupts the structure term of
         // SSIM the way real compression artefacts do.
         for (i, chunk) in noisy.chunks_exact_mut(4).enumerate() {
-            let sign = if i.is_multiple_of(2) { 1i16 } else { -1 };
-            let delta = (60 * sign) as i16;
+            let sign: i16 = if i.is_multiple_of(2) { 1 } else { -1 };
+            let delta = 60 * sign;
             for slot in chunk.iter_mut().take(3) {
                 *slot = (i16::from(*slot) + delta).clamp(0, 255) as u8;
             }

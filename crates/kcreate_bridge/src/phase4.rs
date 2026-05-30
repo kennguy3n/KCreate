@@ -1098,6 +1098,13 @@ mod tests {
             "panic should propagate out of catch_unwind"
         );
 
+        // (Step 3 happens implicitly: between catch_unwind returning
+        // and the next line, the panic propagates through
+        // `SdExtraArgsGuard::drop`, which restores SENTINEL and
+        // releases the mutex. There's no code here because it's the
+        // runtime behavior we're testing — the assertions at Step 4
+        // are what observe the result.)
+
         // Step 4: re-acquire mutex, observe env reverted to
         // SENTINEL, and clean up so the sentinel doesn't bleed into
         // other tests.

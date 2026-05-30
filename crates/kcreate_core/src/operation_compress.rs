@@ -284,10 +284,23 @@ pub const INLINE_BLOB_MARKER: &str = "__inlineBlob";
 ///
 /// Smaller inline blobs (below `threshold_bytes`) are kept inline so
 /// the round-trip remains exact without a blob-store dependency.
+///
+/// **`threshold_bytes == 0` disables the substitution path entirely**
+/// — `value` is left untouched and an empty side table is returned.
+/// This matches the documented contract on
+/// [`crate::RuntimeConfig::undo_blob_threshold_bytes`]: *"Set to `0`
+/// to disable the substitution path entirely."* Without this guard
+/// the comparison `bytes.len() >= 0` would always succeed and the
+/// `disable` semantics would silently flip to *"extract every blob
+/// regardless of size"* — the exact opposite of what the docs
+/// promise.
 pub fn replace_blobs_with_refs(
     value: &mut Value,
     threshold_bytes: usize,
 ) -> Vec<(String, Vec<u8>)> {
+    if threshold_bytes == 0 {
+        return Vec::new();
+    }
     let mut out = Vec::new();
     extract_blobs(value, threshold_bytes, &mut out);
     out
@@ -597,6 +610,49 @@ mod tests {
         materialize_blob_refs(&mut value, |_| None);
         let raster = value.get("raster").and_then(Value::as_object).expect("obj");
         assert!(raster.contains_key(BLOB_REF_MARKER));
+    }
+
+    #[test]
+    fn threshold_zero_disables_substitution_entirely() {
+        // Per the public RuntimeConfig::undo_blob_threshold_bytes
+        // contract ("Set to 0 to disable the substitution path
+        // entirely"), a threshold of 0 must NOT extract any blob —
+        // including tiny ones that would trivially satisfy a
+        // `bytes.len() >= 0` comparison. Round-11 finding: without
+        // the explicit guard the `>=` check would be vacuously true
+        // for every blob, which silently flips the "disable"
+        // semantics into "extract everything". Lock that contract
+        // with a representative mix of large + small inline blobs.
+        let big = vec![0xABu8; 1024];
+        let mut value = json!({
+            "raster_large": { INLINE_BLOB_MARKER: encode_base64(&big) },
+            "raster_small": { INLINE_BLOB_MARKER: encode_base64(&[1u8, 2, 3]) },
+            "raster_empty": { INLINE_BLOB_MARKER: encode_base64(&[]) },
+        });
+        let snapshot_before = value.clone();
+        let table = replace_blobs_with_refs(&mut value, 0);
+        assert!(
+            table.is_empty(),
+            "threshold=0 must extract zero blobs, got {}",
+            table.len()
+        );
+        assert_eq!(
+            value, snapshot_before,
+            "threshold=0 must leave the value tree byte-for-byte unchanged"
+        );
+        // All three inline markers must survive — none rewritten to
+        // blob refs.
+        for key in ["raster_large", "raster_small", "raster_empty"] {
+            let obj = value.get(key).and_then(Value::as_object).expect(key);
+            assert!(
+                obj.contains_key(INLINE_BLOB_MARKER),
+                "{key} should keep its inline marker when threshold=0"
+            );
+            assert!(
+                !obj.contains_key(BLOB_REF_MARKER),
+                "{key} must not be rewritten to a blob ref when threshold=0"
+            );
+        }
     }
 
     #[test]

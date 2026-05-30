@@ -368,3 +368,29 @@ pnpm lint
 | KChat extension — artifact preview cards | `apps/kchat-extension/src/ArtifactCard.tsx` |
 | KChat extension — session status badge   | `apps/kchat-extension/src/SessionStatusBadge.tsx` |
 | KChat extension — activity feed          | `apps/kchat-extension/src/ActivityFeed.tsx` |
+| AI non-local-means denoise               | `crates/kcreate_ai/src/denoise.rs` |
+| AI PatchMatch exemplar inpaint           | `crates/kcreate_ai/src/inpaint.rs` |
+| AI auto colour correction                | `crates/kcreate_ai/src/auto_color.rs` |
+| AI stroke-style match                    | `crates/kcreate_ai/src/stroke_match.rs` |
+| AI glyph extraction from photo           | `crates/kcreate_ai/src/glyph_extract.rs` |
+| AI reformat-to-deck (LLM + GBNF)         | `crates/kcreate_ai/src/reformat.rs` |
+| AI brief-to-one-pager (LLM + GBNF)       | `crates/kcreate_ai/src/one_pager.rs` |
+| AI palette harmonisation (HSL rules)     | `crates/kcreate_ai/src/palette_harmonize.rs` |
+| AI type pairing (LLM + fontdb filter)    | `crates/kcreate_ai/src/type_pairing.rs` |
+| AI brand-to-brochure template            | `crates/kcreate_ai/src/brand_template.rs` |
+| Export SVG optimiser (element-aware)     | `crates/kcreate_export/src/svg_optimize.rs` |
+| Export smart-compress (SSIM-targeted)    | `crates/kcreate_export/src/smart_compress.rs` |
+| AI / Illustrator subset import           | `crates/kcreate_export/src/ai_import.rs` |
+| Multi-page PDF (TOC / outline / links)   | `crates/kcreate_export/src/pdf_multi.rs` |
+| Plugin marketplace (scan + install)      | `crates/kcreate_plugin/src/marketplace.rs` |
+| Undo-log delta compression + blob refs   | `crates/kcreate_core/src/operation_compress.rs` |
+| Workspace preferences persistence        | `crates/kcreate_bridge/src/phase10.rs` (`preferences_load`, `preferences_save`) |
+| Incremental scene diff                   | `crates/kcreate_bridge/src/scene_sync.rs` (`scene_version`, `DirtySet<Uuid>`) |
+| Startup lazy-init marks                  | `crates/kcreate_bridge/src/perf.rs` (`tile_cache_lock`, `mark_llm_sidecar_ready`, `memory_watchdog_start`, `TILE_CACHE_READY_MARKED`, `LLM_SIDECAR_READY_MARKED`, `MEMORY_WATCHDOG_READY_MARKED`) |
+| Phase 10 bridge surface                  | `crates/kcreate_bridge/src/phase10.rs` |
+| Phase 10 wire format (TypeScript mirror) | `apps/desktop/shared/scene.ts` (`Phase10Bridge` + types) |
+| MagicWandTool UI                         | `apps/desktop/renderer/src/components/MagicWandTool.tsx` |
+| FloatingToolbar UI                       | `apps/desktop/renderer/src/components/FloatingToolbar.tsx` |
+| ExportPreviewPanel UI                    | `apps/desktop/renderer/src/components/ExportPreviewPanel.tsx` |
+| BatchExportProgress UI                   | `apps/desktop/renderer/src/components/BatchExportProgress.tsx` |
+| PreferencesPanel UI                      | `apps/desktop/renderer/src/components/PreferencesPanel.tsx` |

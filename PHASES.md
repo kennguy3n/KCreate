@@ -209,3 +209,72 @@ the new `psd`, `kamadak-exif`, and `resvg` dependencies are
 either pure-Rust or already in the editing path.
 
 See PROGRESS.md §"Phase 9" for the per-task breakdown.
+
+## Phase 10 — Image Studio AI, Vector/Layout AI, Export AI, Brand Hub & Plugin Marketplace, Performance Hardening | Complete | 100%
+
+Phase 10 closes out the AI-assisted authoring story across
+every studio surface, finishes the Export Center with live
+previews + intelligent compression, lands the local plugin
+marketplace, and tightens the performance envelope
+(incremental scene diff, delta-compressed undo log, lazy
+subsystem init). 30 tasks across 6 blocks:
+
+- **Block A (Tasks 1–6):** Image Studio AI actions — NLM
+  denoise (`crates/kcreate_ai/src/denoise.rs`),
+  PatchMatch inpainting (`inpaint.rs`), auto colour
+  (`auto_color.rs`), SAM segmentation tool with smart-select
+  fallback (`AIAssistPanel.tsx` "Smart Segment"), magic-wand
+  tool (`MagicWandTool.tsx`).
+- **Block B (Tasks 7–12):** Vector / Layout / Brand Hub AI —
+  stroke-style match (`stroke_match.rs`), glyph-from-photo
+  extraction (`glyph_extract.rs`), reformat-to-deck
+  (`reformat.rs`), brief-to-one-pager (`one_pager.rs`),
+  palette harmonisation (`palette_harmonize.rs`), type
+  pairing (`type_pairing.rs`).
+- **Block C (Tasks 13–18):** Export Center polish —
+  element-aware SVG optimiser
+  (`crates/kcreate_export/src/svg_optimize.rs` with
+  `protected_regions` / `with_unprotected` so it cannot
+  mangle `<text>` / `<style>` / CDATA), SSIM-targeted
+  smart compress (`smart_compress.rs`), live export preview
+  (`ExportPreviewPanel.tsx`), floating contextual toolbar
+  (`FloatingToolbar.tsx`), AI/Illustrator subset import
+  (`ai_import.rs`).
+- **Block D (Tasks 19–24):** Brand Hub + plugin
+  marketplace — brand-to-brochure generator
+  (`brand_template.rs`), local plugin marketplace
+  (`crates/kcreate_plugin/src/marketplace.rs`,
+  `PluginManager.tsx` "Marketplace" tab), multi-page PDF
+  with TOC / outline / hyperlinks / per-page subset fonts
+  (`pdf_multi.rs`), batch export progress UI
+  (`BatchExportProgress.tsx`), workspace preferences
+  panel (`PreferencesPanel.tsx`,
+  `~/.kcreate/preferences.json`).
+- **Block E (Tasks 25–28):** Performance hardening —
+  acceptance-criteria perf bench suite
+  (`crates/kcreate_tests/tests/acceptance_criteria.rs`),
+  incremental scene diff with per-node `scene_version` +
+  `DirtySet<Uuid>` (`crates/kcreate_bridge/src/scene_sync.rs`),
+  undo-log delta compression + BLAKE3 blob-ref swapping
+  (`crates/kcreate_core/src/operation_compress.rs` +
+  `RuntimeConfig::{compress_undo_log,
+  undo_blob_threshold_bytes}` + auto-detect on load in
+  `crates/kcreate_storage/src/project_io.rs`), startup
+  lazy-init for tile cache / LLM sidecar / memory watchdog
+  with `bridge.<subsystem>.subsystem_ready` startup-timeline
+  marks (`crates/kcreate_bridge/src/perf.rs`).
+- **Block F (Tasks 29–30):** PROGRESS.md / PHASES.md /
+  README.md / ARCHITECTURE.md / AGENTS.md updates.
+
+All Phase 10 Rust + bridge work lives in
+`crates/kcreate_bridge/src/phase10.rs`, exposed through new
+N-API entry points in `crates/kcreate_bridge/src/lib.rs`.
+The TypeScript wire format is mirrored in
+`apps/desktop/shared/scene.ts`,
+`apps/desktop/preload/src/preload.ts`, and
+`apps/desktop/main/src/{bridge,main}.ts`. The local-first
+sentinel (`crates/kcreate_tests/tests/local_first.rs`) stays
+green — none of the new dependencies pull networking into
+the editing-path closure.
+
+See PROGRESS.md §"Phase 10" for the per-task breakdown.

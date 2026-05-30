@@ -259,6 +259,19 @@ impl DocumentGraph {
         DOCUMENT_VERSION_GLOBAL.fetch_add(1, Ordering::AcqRel);
     }
 
+    /// Public re-entry for callers that perform a logical mutation
+    /// without going through a `&mut self` graph method — e.g. the
+    /// bridge's `document_undo` / `document_redo` move the operation
+    /// cursor and apply patches via helper modules, and need to
+    /// announce the resulting state change to renderer pollers.
+    ///
+    /// Symmetric with [`Self::bump_version`] (private) but reachable
+    /// from outside the crate so the bridge doesn't need to mutate a
+    /// dummy node just to advance the counter.
+    pub fn touch_version(&mut self) {
+        self.bump_version();
+    }
+
     /// Rebuild the spatial index from scratch using rstar's
     /// O(n log n) bulk loader. Called lazily by [`query_point`] when
     /// the cached index is absent. Exposed so callers (e.g. perf

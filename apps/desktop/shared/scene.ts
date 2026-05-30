@@ -540,6 +540,16 @@ export interface DocumentBridge {
 
   getDocumentTree(): Promise<NodeInfo[]>;
   /**
+   * Phase 11 Block D Task 21 — monotonic workspace version counter.
+   * Bumps on every mutation (create / update / delete / undo / redo /
+   * reparent / paste). Renderer pollers compare two snapshots of
+   * this value to skip the full `getDocumentTree` IPC round-trip
+   * when the document hasn't changed since the last paint. The Rust
+   * implementation is a single `AtomicU64::load`, so calling this
+   * at 60Hz is free.
+   */
+  getDocumentVersion(): Promise<number>;
+  /**
    * Inspect-mode code generation for a single node. Returns three
    * handoff snippets (raw CSS rule body, Tailwind utility classes,
    * React inline-style object literal) computed by

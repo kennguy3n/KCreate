@@ -28,6 +28,12 @@ base64.workspace = true
 # Rust, no networking, no dynamic linking — safe to depend on from
 # the editing path.
 sha2 = "0.10"
+# Phase 11 Block E Task 25 — `getrandom` sources bytes from the OS
+# CSPRNG to mint the per-session bearer token the LLM sidecar
+# uses to authenticate clients. Pure-Rust, no networking; safe in
+# the editing path even when `llm_sidecar` is off (it just isn't
+# called).
+getrandom = "0.3"
 # `ureq` is the blocking HTTP client used by the LLM sidecar (Tasks
 # 16–18) to talk to `llama-server` over loopback (127.0.0.1). It is
 # gated behind the `llm_sidecar` feature so default builds — and the

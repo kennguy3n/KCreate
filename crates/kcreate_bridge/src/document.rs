@@ -28,7 +28,7 @@ use kcreate_export::png::{export_png_to_bytes, PngExportError, PngExportOptions}
 use kcreate_export::svg::{export_svg_from_document, SvgDocumentExportError, SvgExportOptions};
 use kcreate_layout::{layout_flex, layout_grid, FlexLayout, GridLayout};
 use kcreate_storage::project_io::{ProjectStore, ProjectStoreError};
-use parking_lot::Mutex;
+use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
@@ -137,7 +137,14 @@ pub type Result<T> = std::result::Result<T, DocumentBridgeError>;
 /// bookkeeping needed for incremental persistence.
 pub(crate) struct Workspace {
     pub(crate) project: Project,
-    pub(crate) store: ProjectStore,
+    /// On-disk store wrapped in a [`parking_lot::Mutex`] so the
+    /// `Workspace` itself can be `Sync` (rusqlite's `Connection`
+    /// contains `RefCell`s and is `Send + !Sync`). Phase 11 Block D
+    /// Task 19 then puts the whole workspace inside an `RwLock` so
+    /// in-memory reads of `project` / `selection` / `scene_sync` can
+    /// proceed concurrently while only the on-disk path serialises
+    /// through this inner mutex.
+    pub(crate) store: parking_lot::Mutex<ProjectStore>,
     /// Set of operation ids already written to the on-disk store.
     ///
     /// Tracking by id (not by index) is the only correct option once
@@ -161,9 +168,26 @@ pub(crate) struct Workspace {
     selection: Vec<Uuid>,
 }
 
-pub(crate) fn slot() -> &'static Mutex<Option<Workspace>> {
-    static WS: OnceLock<Mutex<Option<Workspace>>> = OnceLock::new();
-    WS.get_or_init(|| Mutex::new(None))
+/// Workspace singleton.
+///
+/// Phase 11 Block D Task 19: changed from `parking_lot::Mutex` to
+/// `parking_lot::RwLock` so multiple read-only panels (tree view,
+/// status bar, selection inspector, export pickers) can query the
+/// workspace concurrently. Mutations still take the exclusive
+/// `write()` guard so the operation log and scene-sync invariants
+/// remain intact.
+///
+/// # Lock-ordering invariant (Phase 11)
+///
+/// `workspace RwLock` → `renderer Mutex` → `tile cache Mutex`.
+///
+/// Every site that touches more than one of these must observe this
+/// order. The only path that enters the renderer lock while holding
+/// the workspace lock is [`sync_scene_locked`]; the renderer never
+/// re-enters the workspace.
+pub(crate) fn slot() -> &'static RwLock<Option<Workspace>> {
+    static WS: OnceLock<RwLock<Option<Workspace>>> = OnceLock::new();
+    WS.get_or_init(|| RwLock::new(None))
 }
 
 /// Run `f` against the open workspace under a read-style lock. The
@@ -172,7 +196,7 @@ pub(crate) fn slot() -> &'static Mutex<Option<Workspace>> {
 /// of bridge entry points doesn't need to know about [`Workspace`]'s
 /// private field layout.
 pub(crate) fn with_workspace<R>(f: impl FnOnce(&Workspace) -> Result<R>) -> Result<R> {
-    let guard = slot().lock();
+    let guard = slot().read();
     let ws = guard.as_ref().ok_or(DocumentBridgeError::NoProject)?;
     f(ws)
 }
@@ -180,7 +204,7 @@ pub(crate) fn with_workspace<R>(f: impl FnOnce(&Workspace) -> Result<R>) -> Resu
 /// Mutable counterpart of [`with_workspace`]. The caller closure must
 /// not re-lock the workspace.
 pub(crate) fn with_workspace_mut<R>(f: impl FnOnce(&mut Workspace) -> Result<R>) -> Result<R> {
-    let mut guard = slot().lock();
+    let mut guard = slot().write();
     let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
     f(ws)
 }
@@ -189,7 +213,7 @@ pub(crate) fn with_workspace_mut<R>(f: impl FnOnce(&mut Workspace) -> Result<R>)
 /// store. Pulled out so `phase2.rs` does not need to know about the
 /// `ProjectStore` API surface.
 pub(crate) fn blob_load(ws: &Workspace, hash: &str) -> Result<Vec<u8>> {
-    ws.store
+    ws.store.lock()
         .blobs()
         .load(hash)
         .map_err(|e| DocumentBridgeError::Io(std::io::Error::other(e.to_string())))
@@ -201,7 +225,7 @@ pub(crate) fn blob_load(ws: &Workspace, hash: &str) -> Result<Vec<u8>> {
 /// sync recovers the state, matching the pattern used elsewhere in
 /// this module.
 pub(crate) fn sync_scene_after_change() {
-    let mut guard = slot().lock();
+    let mut guard = slot().write();
     let _ = sync_scene_locked(&mut guard);
 }
 
@@ -251,7 +275,7 @@ pub const fn mcp_state() -> (bool, Option<u32>) {
 /// Test-only helper to reset the singleton between serial tests.
 #[cfg(test)]
 pub(crate) fn reset_for_tests() {
-    *slot().lock() = None;
+    *slot().write() = None;
 }
 
 /// Snapshot of project identity returned to the host.
@@ -425,10 +449,10 @@ pub fn project_create(name: &str, dir: &Path) -> Result<ProjectInfo> {
     // bridge calls are synchronous and short; serialising them is the
     // correct semantics even when N-API begins driving requests from a
     // worker thread.
-    let mut guard = slot().lock();
+    let mut guard = slot().write();
     if let Some(ws) = guard.as_ref() {
         return Err(DocumentBridgeError::ProjectAlreadyOpen(
-            ws.store.project_dir().to_path_buf(),
+            ws.store.lock().project_dir().to_path_buf(),
         ));
     }
     let project_dir = dir.join(format!("{name}.kstudio"));
@@ -463,7 +487,7 @@ pub fn project_create(name: &str, dir: &Path) -> Result<ProjectInfo> {
     let info = build_info(&project, store.project_dir());
     *guard = Some(Workspace {
         project,
-        store,
+        store: parking_lot::Mutex::new(store),
         persisted_op_ids: HashSet::new(),
         scene_sync: crate::scene_sync::SceneSync::new(),
         selection: Vec::new(),
@@ -506,10 +530,10 @@ pub fn project_open(dir: &Path) -> Result<ProjectInfo> {
     let _perf = crate::perf::scope("project_open");
     // Same lock discipline as `project_create`: hold across the entire
     // operation, no TOCTOU window between the check and the set.
-    let mut guard = slot().lock();
+    let mut guard = slot().write();
     if let Some(ws) = guard.as_ref() {
         return Err(DocumentBridgeError::ProjectAlreadyOpen(
-            ws.store.project_dir().to_path_buf(),
+            ws.store.lock().project_dir().to_path_buf(),
         ));
     }
     let store = ProjectStore::open(dir)?;
@@ -548,7 +572,7 @@ pub fn project_open(dir: &Path) -> Result<ProjectInfo> {
     let info = build_info(&project, store.project_dir());
     *guard = Some(Workspace {
         project,
-        store,
+        store: parking_lot::Mutex::new(store),
         persisted_op_ids,
         scene_sync: crate::scene_sync::SceneSync::new(),
         selection: Vec::new(),
@@ -597,43 +621,43 @@ pub fn project_open(dir: &Path) -> Result<ProjectInfo> {
 /// range-delete using a timestamp index). At `max_depth` = 256 the
 /// full save path stays in the microseconds.
 pub fn project_save() -> Result<()> {
-    let mut guard = slot().lock();
+    let mut guard = slot().write();
     let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
-    ws.store.save_document(&ws.project.document)?;
+    ws.store.lock().save_document(&ws.project.document)?;
     // Persist project-level metadata (design tokens, brand kits,
     // export presets). These mirror the in-memory `Project` fields
     // and must round-trip across close/reopen so identifiers stay
     // stable. Brand kits / presets are upserted by id; the design
     // tokens table holds a single row keyed on `'current'`.
-    ws.store.save_design_tokens(&ws.project.design_tokens)?;
-    ws.store.save_color_settings(&ws.project.color_settings)?;
+    ws.store.lock().save_design_tokens(&ws.project.design_tokens)?;
+    ws.store.lock().save_color_settings(&ws.project.color_settings)?;
     for kit in &ws.project.brand_kits {
-        ws.store.save_brand_kit(kit)?;
+        ws.store.lock().save_brand_kit(kit)?;
     }
     // Reconcile deleted brand kits: any rows on disk whose id is no
     // longer in memory must be removed so deletes survive the next
     // reopen.
     let kit_ids: HashSet<Uuid> = ws.project.brand_kits.iter().map(|k| k.id).collect();
-    let on_disk_kits = ws.store.load_brand_kits()?;
+    let on_disk_kits = ws.store.lock().load_brand_kits()?;
     for kit in &on_disk_kits {
         if !kit_ids.contains(&kit.id) {
-            ws.store.delete_brand_kit(kit.id)?;
+            ws.store.lock().delete_brand_kit(kit.id)?;
         }
     }
     for preset in &ws.project.export_presets {
-        ws.store.save_export_preset(preset)?;
+        ws.store.lock().save_export_preset(preset)?;
     }
     let preset_ids: HashSet<Uuid> = ws.project.export_presets.iter().map(|p| p.id).collect();
-    let on_disk_presets = ws.store.load_export_presets()?;
+    let on_disk_presets = ws.store.lock().load_export_presets()?;
     for preset in &on_disk_presets {
         if !preset_ids.contains(&preset.id) {
-            ws.store.delete_export_preset(preset.id)?;
+            ws.store.lock().delete_export_preset(preset.id)?;
         }
     }
     // Components: the in-memory map is the source of truth, so we
     // bulk-replace on disk. This handles both upsert and delete in
     // one round-trip; matches how `replace_components` is documented.
-    ws.store.replace_components(&ws.project.components)?;
+    ws.store.lock().replace_components(&ws.project.components)?;
 
     let current_ids: HashSet<Uuid> = ws.project.operation_log.iter().map(|op| op.id).collect();
     // Collect new ops first so we can satisfy the borrow checker (the
@@ -650,7 +674,7 @@ pub fn project_save() -> Result<()> {
         .cloned()
         .collect();
     for op in &unseen {
-        ws.store.save_operation(op)?;
+        ws.store.lock().save_operation(op)?;
         ws.persisted_op_ids.insert(op.id);
     }
     // Forget ids that have aged out of the bounded in-memory log so
@@ -664,7 +688,7 @@ pub fn project_save() -> Result<()> {
     // by design — the in-memory log is the canonical undo surface and
     // the disk just snapshots it.
     let max_depth = ws.project.operation_log.max_depth();
-    ws.store.prune_operations(max_depth)?;
+    ws.store.lock().prune_operations(max_depth)?;
     drop(guard);
     Ok(())
 }
@@ -678,15 +702,15 @@ pub fn project_save() -> Result<()> {
 /// [`crate::autosave::autosave_reset`] for the full rationale.
 pub fn project_close() {
     crate::autosave::autosave_reset();
-    *slot().lock() = None;
+    *slot().write() = None;
 }
 
 /// Snapshot of the open project (or `None` if nothing is open).
 pub fn project_info() -> Option<ProjectInfo> {
-    let guard = slot().lock();
+    let guard = slot().write();
     let info = guard
         .as_ref()
-        .map(|ws| build_info(&ws.project, ws.store.project_dir()));
+        .map(|ws| build_info(&ws.project, ws.store.lock().project_dir()));
     drop(guard);
     info
 }
@@ -725,7 +749,7 @@ pub fn project_info() -> Option<ProjectInfo> {
 /// open so the host can distinguish "no project" from "untouched
 /// project" without inspecting `project_info()` first.
 pub fn project_is_untouched() -> Result<bool> {
-    let guard = slot().lock();
+    let guard = slot().write();
     let ws = guard.as_ref().ok_or(DocumentBridgeError::NoProject)?;
     Ok(ws.project.operation_log.is_empty())
 }
@@ -739,7 +763,7 @@ pub fn project_is_untouched() -> Result<bool> {
 /// a stable React state shape without special-casing the no-project
 /// path.
 pub fn design_tokens_get() -> Result<DesignTokens> {
-    let guard = slot().lock();
+    let guard = slot().write();
     let ws = guard.as_ref().ok_or(DocumentBridgeError::NoProject)?;
     Ok(ws.project.design_tokens.clone())
 }
@@ -748,7 +772,7 @@ pub fn design_tokens_get() -> Result<DesignTokens> {
 /// for calling [`project_save`] afterwards; this only mutates the
 /// in-memory project.
 pub fn design_tokens_set(tokens: DesignTokens) -> Result<()> {
-    let mut guard = slot().lock();
+    let mut guard = slot().write();
     let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
     ws.project.design_tokens = tokens;
     drop(guard);
@@ -758,7 +782,7 @@ pub fn design_tokens_set(tokens: DesignTokens) -> Result<()> {
 /// Create a new (empty) brand kit and append it to the project.
 /// Returns the new kit's id.
 pub fn brand_kit_create(name: String) -> Result<Uuid> {
-    let mut guard = slot().lock();
+    let mut guard = slot().write();
     let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
     let kit = BrandKit::new(name);
     let id = kit.id;
@@ -774,7 +798,7 @@ pub fn brand_kit_create(name: String) -> Result<Uuid> {
 /// reuse the existing error variant rather than introducing a
 /// second "not found" type that callers would have to disambiguate.
 pub fn brand_kit_update(kit: BrandKit) -> Result<()> {
-    let mut guard = slot().lock();
+    let mut guard = slot().write();
     let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
     let slot_idx = ws
         .project
@@ -789,14 +813,14 @@ pub fn brand_kit_update(kit: BrandKit) -> Result<()> {
 
 /// List every brand kit in the project, in insertion order.
 pub fn brand_kit_list() -> Result<Vec<BrandKit>> {
-    let guard = slot().lock();
+    let guard = slot().write();
     let ws = guard.as_ref().ok_or(DocumentBridgeError::NoProject)?;
     Ok(ws.project.brand_kits.clone())
 }
 
 /// Remove a brand kit by id. Returns true when something was removed.
 pub fn brand_kit_delete(id: Uuid) -> Result<bool> {
-    let mut guard = slot().lock();
+    let mut guard = slot().write();
     let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
     let before = ws.project.brand_kits.len();
     ws.project.brand_kits.retain(|k| k.id != id);
@@ -806,7 +830,7 @@ pub fn brand_kit_delete(id: Uuid) -> Result<bool> {
 /// Create a new export preset and append it to the project. Returns the new id.
 pub fn export_preset_create(name: String, format: &str, scale: f32) -> Result<Uuid> {
     let format = parse_export_format(format)?;
-    let mut guard = slot().lock();
+    let mut guard = slot().write();
     let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
     let preset = ExportPreset::new(name, format, scale);
     let id = preset.id;
@@ -817,14 +841,15 @@ pub fn export_preset_create(name: String, format: &str, scale: f32) -> Result<Uu
 
 /// List every export preset, in insertion order.
 pub fn export_preset_list() -> Result<Vec<ExportPreset>> {
-    let guard = slot().lock();
+    // Phase 11 Task 19: read-only — share the lock with other readers.
+    let guard = slot().read();
     let ws = guard.as_ref().ok_or(DocumentBridgeError::NoProject)?;
     Ok(ws.project.export_presets.clone())
 }
 
 /// Delete an export preset by id. Returns true when something was removed.
 pub fn export_preset_delete(id: Uuid) -> Result<bool> {
-    let mut guard = slot().lock();
+    let mut guard = slot().write();
     let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
     let before = ws.project.export_presets.len();
     ws.project.export_presets.retain(|p| p.id != id);
@@ -852,7 +877,10 @@ fn parse_export_format(format: &str) -> Result<kcreate_core::project::ExportForm
 
 /// Returns a flat list of every node in document order.
 pub fn document_get_tree() -> Result<Vec<NodeInfo>> {
-    let guard = slot().lock();
+    // Phase 11 Task 19: read-only path — use a shared read guard
+    // so the tree panel, status bar, and selection inspector can
+    // poll the workspace concurrently with each other.
+    let guard = slot().read();
     let ws = guard.as_ref().ok_or(DocumentBridgeError::NoProject)?;
     let mut out = Vec::with_capacity(ws.project.document.node_count());
     for root in ws.project.document.root_ids() {
@@ -881,7 +909,7 @@ pub fn document_get_tree() -> Result<Vec<NodeInfo>> {
 /// the full visual record to produce useful output, so we walk the
 /// live `DocumentGraph` directly and serialise every visible property.
 pub fn document_serialise_for_ai() -> Result<String> {
-    let guard = slot().lock();
+    let guard = slot().write();
     let ws = guard.as_ref().ok_or(DocumentBridgeError::NoProject)?;
     let mut nodes = Vec::with_capacity(ws.project.document.node_count());
     for root in ws.project.document.root_ids() {
@@ -927,7 +955,7 @@ fn push_subtree_full(doc: &DocumentGraph, id: Uuid, out: &mut Vec<serde_json::Va
 /// same `InspectCode` struct emitted by `kcreate_export::code_gen`
 /// — we just serialize it to JSON at the N-API boundary.
 pub fn document_inspect_node(id: Uuid) -> Result<kcreate_export::InspectCode> {
-    let guard = slot().lock();
+    let guard = slot().write();
     let ws = guard.as_ref().ok_or(DocumentBridgeError::NoProject)?;
     let node = ws
         .project
@@ -989,7 +1017,7 @@ pub fn document_create_node(
     if let Some(meta) = &props.metadata {
         node.metadata.clone_from(meta);
     }
-    let mut guard = slot().lock();
+    let mut guard = slot().write();
     let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
     let id = ws.project.document.insert_node(node)?;
     ws.project.modified_at = Utc::now();
@@ -1109,7 +1137,7 @@ where
 /// [`kcreate_core::project::Project::undo`] for the host-driven
 /// patch-application contract.
 pub fn document_update_node(id: Uuid, changes: &UpdateNodeProps) -> Result<()> {
-    let mut guard = slot().lock();
+    let mut guard = slot().write();
     let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
     let node = ws
         .project
@@ -1163,7 +1191,7 @@ pub fn document_update_node(id: Uuid, changes: &UpdateNodeProps) -> Result<()> {
 /// need fill data for every node and pre-serialising the enum would
 /// inflate every tree payload.
 pub fn document_node_fill(id: Uuid) -> Result<Option<String>> {
-    let guard = slot().lock();
+    let guard = slot().write();
     let ws = guard.as_ref().ok_or(DocumentBridgeError::NoProject)?;
     let Some(node) = ws.project.document.get_node(id) else {
         return Ok(None);
@@ -1182,7 +1210,7 @@ pub fn document_node_fill(id: Uuid) -> Result<Option<String>> {
 /// distinguish "no extras yet" (empty array) from "node not
 /// found" (null). Phase 5 Block C Task 17.
 pub fn document_node_extra_fills(id: Uuid) -> Result<Option<String>> {
-    let guard = slot().lock();
+    let guard = slot().write();
     let ws = guard.as_ref().ok_or(DocumentBridgeError::NoProject)?;
     let Some(node) = ws.project.document.get_node(id) else {
         return Ok(None);
@@ -1194,7 +1222,7 @@ pub fn document_node_extra_fills(id: Uuid) -> Result<Option<String>> {
 /// Read the node's `extra_strokes` stack as a JSON array. Returns
 /// `None` when the node id is unknown. Phase 5 Block C Task 17.
 pub fn document_node_extra_strokes(id: Uuid) -> Result<Option<String>> {
-    let guard = slot().lock();
+    let guard = slot().write();
     let ws = guard.as_ref().ok_or(DocumentBridgeError::NoProject)?;
     let Some(node) = ws.project.document.get_node(id) else {
         return Ok(None);
@@ -1209,7 +1237,7 @@ pub fn document_node_extra_strokes(id: Uuid) -> Result<Option<String>> {
 /// [`kcreate_core::project::Project::undo`] for the host-driven
 /// patch-application contract.
 pub fn document_delete_node(id: Uuid) -> Result<()> {
-    let mut guard = slot().lock();
+    let mut guard = slot().write();
     let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
     if ws.project.document.remove_node(id).is_none() {
         return Err(DocumentBridgeError::NodeNotFound(id));
@@ -1233,7 +1261,7 @@ pub fn document_delete_node(id: Uuid) -> Result<()> {
 /// pointer sample). See [`kcreate_core::project::Project::undo`] for
 /// the architectural rationale.
 pub fn document_record_operation(operation: Operation) -> Result<()> {
-    let mut guard = slot().lock();
+    let mut guard = slot().write();
     let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
     ws.project.execute_operation(operation);
     drop(guard);
@@ -1299,7 +1327,7 @@ pub struct UndoRedoOutcome {
 /// [`text_frame_update`]: crate::phase2::text_frame_update
 /// [`text_opentype_features_update`]: crate::phase2::text_opentype_features_update
 pub fn document_undo() -> Result<Option<UndoRedoOutcome>> {
-    let mut guard = slot().lock();
+    let mut guard = slot().write();
     let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
     let Some(op) = ws.project.pending_undo() else {
         return Ok(None);
@@ -1311,6 +1339,14 @@ pub fn document_undo() -> Result<Option<UndoRedoOutcome>> {
         .project
         .undo()
         .expect("pending_undo returned Some, so undo cannot return None on the same lock");
+    // Phase 11 Block D Task 21: announce the state change to
+    // renderer pollers. Graph-mutating operations rely on the host
+    // to fold `before_patch` back into the in-memory tree, so
+    // `apply_inverse_patch` does NOT touch the graph and therefore
+    // does not bump `document_version` itself. The undo is still a
+    // user-visible state transition that observers need to see, so
+    // we advance the counter here, before dropping the guard.
+    ws.project.document.touch_version();
     drop(guard);
     // Phase 7 (Task 17): broadcast the inverse to remote peers,
     // tagged `is_undo: true`, so their renderers can apply the
@@ -1340,7 +1376,7 @@ pub fn document_undo() -> Result<Option<UndoRedoOutcome>> {
 /// `after_patch` to the workspace itself; for graph-mutating
 /// operations the host-driven contract still applies.
 pub fn document_redo() -> Result<Option<UndoRedoOutcome>> {
-    let mut guard = slot().lock();
+    let mut guard = slot().write();
     let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
     let Some(op) = ws.project.pending_redo() else {
         return Ok(None);
@@ -1350,6 +1386,9 @@ pub fn document_redo() -> Result<Option<UndoRedoOutcome>> {
         .project
         .redo()
         .expect("pending_redo returned Some, so redo cannot return None on the same lock");
+    // Phase 11 Block D Task 21: see `document_undo` — same
+    // rationale, redo is a state transition pollers need to see.
+    ws.project.document.touch_version();
     drop(guard);
     // Phase 7 (Task 17): broadcast the forward replay to remote
     // peers, tagged `is_undo: true`. From the remote perspective a
@@ -1653,7 +1692,7 @@ fn collect_subtree_parent_first(
 /// string of the head (newest) op and the union of all affected
 /// nodes across the group.
 pub fn document_undo_group() -> Result<Option<UndoRedoOutcome>> {
-    let mut guard = slot().lock();
+    let mut guard = slot().write();
     let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
     let pending = ws.project.pending_undo_group();
     if pending.is_empty() {
@@ -1701,7 +1740,7 @@ pub fn document_undo_group() -> Result<Option<UndoRedoOutcome>> {
 /// a patch failure mid-group cannot leave the workspace partially
 /// re-applied.
 pub fn document_redo_group() -> Result<Option<UndoRedoOutcome>> {
-    let mut guard = slot().lock();
+    let mut guard = slot().write();
     let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
     let pending = ws.project.pending_redo_group();
     if pending.is_empty() {
@@ -1766,7 +1805,7 @@ pub struct DiscardedBranchSummary {
 /// `index_from_back` argument expected by
 /// [`document_restore_discarded_branch`].
 pub fn document_list_discarded_branches() -> Result<Vec<DiscardedBranchSummary>> {
-    let guard = slot().lock();
+    let guard = slot().write();
     let ws = guard.as_ref().ok_or(DocumentBridgeError::NoProject)?;
     let branches = ws.project.discarded_branches();
     Ok(branches
@@ -1784,7 +1823,7 @@ pub fn document_list_discarded_branches() -> Result<Vec<DiscardedBranchSummary>>
 /// The current redo tail (if any) is captured as a new discarded
 /// branch so the swap is reversible. Returns `true` on success.
 pub fn document_restore_discarded_branch(index_from_back: usize) -> Result<bool> {
-    let mut guard = slot().lock();
+    let mut guard = slot().write();
     let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
     Ok(ws.project.restore_discarded_branch(index_from_back))
 }
@@ -2098,7 +2137,7 @@ fn apply_patch(ws: &mut Workspace, op: &Operation, patch: &serde_json::Value) ->
 /// constructing a canvas. All other renderer errors are returned so
 /// the host can surface them.
 pub fn document_sync_scene() -> Result<()> {
-    let mut guard = slot().lock();
+    let mut guard = slot().write();
     let _ = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
     sync_scene_locked(&mut guard)?;
     drop(guard);
@@ -2127,7 +2166,7 @@ pub fn document_sync_scene() -> Result<()> {
 /// there is no path that can deadlock by acquiring them in opposite
 /// orders.
 pub(crate) fn sync_scene_locked(
-    guard: &mut parking_lot::MutexGuard<'_, Option<Workspace>>,
+    guard: &mut parking_lot::RwLockWriteGuard<'_, Option<Workspace>>,
 ) -> Result<()> {
     let Some(ws) = guard.as_mut() else {
         return Ok(());
@@ -2135,7 +2174,7 @@ pub(crate) fn sync_scene_locked(
     #[allow(unused_mut)]
     let mut scene = ws.scene_sync.sync_document_to_scene(
         &mut ws.project.document,
-        Some(ws.store.blobs()),
+        Some(ws.store.lock().blobs()),
         &ws.selection,
     );
     // Layer remote-peer cursors on top of the document.
@@ -2261,7 +2300,7 @@ pub(crate) fn sync_scene_locked(
 /// `Ok(())` when no project is loaded, mirroring the rest of the
 /// "no-op when headless" surface of `sync_scene_locked`.
 pub fn document_request_render() -> Result<()> {
-    let mut guard = slot().lock();
+    let mut guard = slot().write();
     sync_scene_locked(&mut guard)
 }
 
@@ -2275,7 +2314,7 @@ pub fn document_request_render() -> Result<()> {
 /// with the document — selecting a node and then deleting it must not
 /// produce a stale selection entry.
 pub fn document_set_selection(ids: Vec<Uuid>) -> Result<()> {
-    let mut guard = slot().lock();
+    let mut guard = slot().write();
     let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
     let valid: Vec<Uuid> = ids
         .into_iter()
@@ -2289,7 +2328,8 @@ pub fn document_set_selection(ids: Vec<Uuid>) -> Result<()> {
 
 /// Snapshot of the current selection.
 pub fn document_get_selection() -> Result<Vec<Uuid>> {
-    let guard = slot().lock();
+    // Phase 11 Task 19: read-only — selection is a `Vec<Uuid>` copy.
+    let guard = slot().read();
     let ws = guard.as_ref().ok_or(DocumentBridgeError::NoProject)?;
     let sel = ws.selection.clone();
     drop(guard);
@@ -2298,7 +2338,7 @@ pub fn document_get_selection() -> Result<Vec<Uuid>> {
 
 /// Clear the selection. No-op when nothing is selected.
 pub fn document_clear_selection() -> Result<()> {
-    let mut guard = slot().lock();
+    let mut guard = slot().write();
     let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
     if ws.selection.is_empty() {
         return Ok(());
@@ -2327,7 +2367,7 @@ pub fn canvas_hit_test(
     pan_y: f32,
     zoom: f32,
 ) -> Result<Option<Uuid>> {
-    let mut guard = slot().lock();
+    let mut guard = slot().write();
     let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
     // Rebuild the scene from the document on every hit-test. This
     // sidesteps the "is the renderer's cached scene up to date?"
@@ -2335,7 +2375,7 @@ pub fn canvas_hit_test(
     // AABB checks) compared to its UX cost when wrong.
     let scene = ws.scene_sync.sync_document_to_scene(
         &mut ws.project.document,
-        Some(ws.store.blobs()),
+        Some(ws.store.lock().blobs()),
         &ws.selection,
     );
     let vp = crate::hit_test::Viewport::new(kcreate_renderer::Vec2::new(pan_x, pan_y), zoom);
@@ -2365,7 +2405,7 @@ pub fn canvas_snap(
     candidate_h: f64,
     threshold: f64,
 ) -> Result<Option<kcreate_vector::snap::SnapResult>> {
-    let guard = slot().lock();
+    let guard = slot().write();
     let Some(ws) = guard.as_ref() else {
         return Ok(None);
     };
@@ -2536,7 +2576,7 @@ fn create_vector_layer(
         crate::scene_sync::VECTOR_PATH_METADATA_KEY.to_string(),
         serde_json::to_value(&path)?,
     );
-    let mut guard = slot().lock();
+    let mut guard = slot().write();
     let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
     let id = ws.project.document.insert_node(node)?;
     ws.project.modified_at = Utc::now();
@@ -2589,7 +2629,7 @@ pub fn artboard_create(
     if !(width.is_finite() && width > 0.0 && height.is_finite() && height > 0.0) {
         return Err(DocumentBridgeError::InvalidBounds { width, height });
     }
-    let mut guard = slot().lock();
+    let mut guard = slot().write();
     let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
 
     // Resolve target page.
@@ -2635,7 +2675,7 @@ pub fn artboard_create(
 /// then `bounds.x` (the per-page left-to-right order chosen by
 /// [`DocumentGraph::list_artboards`]).
 pub fn artboard_list() -> Result<Vec<ArtboardInfo>> {
-    let guard = slot().lock();
+    let guard = slot().write();
     let ws = guard.as_ref().ok_or(DocumentBridgeError::NoProject)?;
     let mut pages: Vec<&Node> = ws
         .project
@@ -2666,7 +2706,7 @@ pub fn artboard_list() -> Result<Vec<ArtboardInfo>> {
 /// (the snapshot is the new root node only — undo deletes the clone
 /// subtree wholesale by removing the new root).
 pub fn artboard_duplicate(artboard_id: Uuid) -> Result<Uuid> {
-    let mut guard = slot().lock();
+    let mut guard = slot().write();
     let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
     let new_id = ws.project.document.duplicate_artboard(artboard_id)?;
     ws.project.modified_at = Utc::now();
@@ -2696,7 +2736,7 @@ pub fn artboard_resize(artboard_id: Uuid, width: f64, height: f64) -> Result<()>
     if !(width.is_finite() && width > 0.0 && height.is_finite() && height > 0.0) {
         return Err(DocumentBridgeError::InvalidBounds { width, height });
     }
-    let mut guard = slot().lock();
+    let mut guard = slot().write();
     let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
     let before = ws
         .project
@@ -2766,7 +2806,7 @@ pub fn interaction_add(node_id: Uuid, trigger: &str, action_json: &str) -> Resul
     let action: kcreate_core::InteractionAction = serde_json::from_str(action_json)?;
     let interaction = kcreate_core::Interaction::new(trigger, action);
     let interaction_id = interaction.id;
-    let mut guard = slot().lock();
+    let mut guard = slot().write();
     let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
     let before;
     let after;
@@ -2793,7 +2833,7 @@ pub fn interaction_add(node_id: Uuid, trigger: &str, action_json: &str) -> Resul
 /// an undoable op when an interaction is actually removed; returns
 /// `Ok(false)` if no interaction with that id exists.
 pub fn interaction_remove(node_id: Uuid, interaction_id: Uuid) -> Result<bool> {
-    let mut guard = slot().lock();
+    let mut guard = slot().write();
     let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
     let removed;
     let before;
@@ -2825,7 +2865,7 @@ pub fn interaction_remove(node_id: Uuid, interaction_id: Uuid) -> Result<bool> {
 
 /// List all interactions stored on `node_id`.
 pub fn interaction_list(node_id: Uuid) -> Result<Vec<kcreate_core::Interaction>> {
-    let guard = slot().lock();
+    let guard = slot().write();
     let ws = guard.as_ref().ok_or(DocumentBridgeError::NoProject)?;
     let node = ws
         .project
@@ -2845,7 +2885,7 @@ pub fn interaction_list(node_id: Uuid) -> Result<Vec<kcreate_core::Interaction>>
 pub fn interaction_list_batch(
     node_ids: &[Uuid],
 ) -> Result<std::collections::HashMap<Uuid, Vec<kcreate_core::Interaction>>> {
-    let guard = slot().lock();
+    let guard = slot().write();
     let ws = guard.as_ref().ok_or(DocumentBridgeError::NoProject)?;
     let mut out = std::collections::HashMap::with_capacity(node_ids.len());
     for id in node_ids {
@@ -2869,7 +2909,7 @@ pub fn interaction_list_batch(
 /// if the node is not a `Page`.
 pub fn page_set_layout(page_id: Uuid, layout_json: &str) -> Result<()> {
     let layout: kcreate_core::PageLayout = serde_json::from_str(layout_json)?;
-    let mut guard = slot().lock();
+    let mut guard = slot().write();
     let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
     let before;
     let after;
@@ -2900,7 +2940,7 @@ pub fn page_set_layout(page_id: Uuid, layout_json: &str) -> Result<()> {
 
 /// Read the [`kcreate_core::PageLayout`] stored on `page_id`, if any.
 pub fn page_get_layout(page_id: Uuid) -> Result<Option<kcreate_core::PageLayout>> {
-    let guard = slot().lock();
+    let guard = slot().write();
     let ws = guard.as_ref().ok_or(DocumentBridgeError::NoProject)?;
     let node = ws
         .project
@@ -2935,7 +2975,7 @@ pub fn master_page_create(name: String, size: &str, orientation: &str) -> Result
         }
     };
     let layout = kcreate_core::PageLayout::new(page_size, orientation);
-    let mut guard = slot().lock();
+    let mut guard = slot().write();
     let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
     let id = ws.project.create_master_page(name, layout)?;
     let snapshot = ws
@@ -2993,7 +3033,7 @@ fn parse_page_size(s: &str) -> Result<kcreate_core::PageSize> {
 
 /// List all master pages in the open project, sorted by name.
 pub fn master_page_list() -> Result<Vec<MasterPageInfo>> {
-    let guard = slot().lock();
+    let guard = slot().write();
     let ws = guard.as_ref().ok_or(DocumentBridgeError::NoProject)?;
     let masters = ws.project.list_master_pages();
     Ok(masters
@@ -3013,7 +3053,7 @@ pub fn master_page_list() -> Result<Vec<MasterPageInfo>> {
 /// (the master id alone is not sufficient — the page may not have had a
 /// layout at all before the call, and undo must restore that).
 pub fn master_page_apply(content_page_id: Uuid, master_page_id: Uuid) -> Result<()> {
-    let mut guard = slot().lock();
+    let mut guard = slot().write();
     let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
     let before = ws
         .project
@@ -3052,7 +3092,7 @@ pub fn master_page_apply(content_page_id: Uuid, master_page_id: Uuid) -> Result<
 /// would otherwise be lost — the bridge does not keep a separate copy of
 /// page layouts).
 pub fn master_page_detach(content_page_id: Uuid) -> Result<()> {
-    let mut guard = slot().lock();
+    let mut guard = slot().write();
     let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
     let before = ws
         .project
@@ -3097,7 +3137,7 @@ pub fn layout_template_apply(template_id: Uuid) -> Result<Vec<Uuid>> {
         .into_iter()
         .find(|t| t.id == template_id)
         .ok_or_else(|| DocumentBridgeError::InvalidNodeType(template_id.to_string()))?;
-    let mut guard = slot().lock();
+    let mut guard = slot().write();
     let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
     let created = ws.project.apply_layout_template(&template)?;
     let op = Operation::new(
@@ -3145,7 +3185,7 @@ pub fn page_add(name: String, size: Option<&str>, orientation: Option<&str>) -> 
             });
         }
     };
-    let mut guard = slot().lock();
+    let mut guard = slot().write();
     let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
     let page_id = ws.project.add_page(name)?;
     // Apply page layout if the caller supplied one. This must happen
@@ -3201,7 +3241,7 @@ pub fn page_add(name: String, size: Option<&str>, orientation: Option<&str>) -> 
 /// document root. Returns the new page id. Records an undoable
 /// `page_duplicate` op.
 pub fn page_duplicate(page_id: Uuid) -> Result<Uuid> {
-    let mut guard = slot().lock();
+    let mut guard = slot().write();
     let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
     // Validate the source is a Page before we clone.
     let source = ws
@@ -3247,7 +3287,7 @@ pub fn page_duplicate(page_id: Uuid) -> Result<Uuid> {
 /// Records an undoable `document_reparent` op carrying the prior
 /// parent + index so the patch can be reversed.
 pub fn document_reparent_node(node_id: Uuid, new_parent: Option<Uuid>, index: usize) -> Result<()> {
-    let mut guard = slot().lock();
+    let mut guard = slot().write();
     let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
     let (prior_parent, prior_index) = {
         let node = ws
@@ -3339,7 +3379,7 @@ pub struct ClipboardSubtree {
 /// the caller is the renderer reacting to the user's selection,
 /// which can race with delete.
 pub fn document_clipboard_copy(node_ids: &[Uuid]) -> Result<String> {
-    let guard = slot().lock();
+    let guard = slot().write();
     let ws = guard.as_ref().ok_or(DocumentBridgeError::NoProject)?;
     let mut subtrees = Vec::with_capacity(node_ids.len());
     for &root in node_ids {
@@ -3407,7 +3447,7 @@ pub fn document_clipboard_paste(
             format!("unsupported clipboard payload version: {}", parsed.version),
         )));
     }
-    let mut guard = slot().lock();
+    let mut guard = slot().write();
     let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
     if let Some(parent_id) = target_parent_id {
         if ws.project.document.get_node(parent_id).is_none() {
@@ -3519,7 +3559,7 @@ pub const LAYER_COLOR_METADATA_KEY: &str = "layerColor";
 /// wrong layer to enforce a closed palette — the LayerPanel owns the
 /// rendering and the migration path if we ever ship more swatches.
 pub fn document_set_layer_color(node_id: Uuid, color: Option<String>) -> Result<u64> {
-    let mut guard = slot().lock();
+    let mut guard = slot().write();
     let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
     let before = ws
         .project
@@ -3657,7 +3697,7 @@ pub fn component_create_from_selection(node_ids: Vec<Uuid>, name: String) -> Res
             "selection is empty".into(),
         ));
     }
-    let mut guard = slot().lock();
+    let mut guard = slot().write();
     let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
 
     // Validate every selected node exists and share a common parent
@@ -3789,7 +3829,7 @@ pub fn component_create_from_selection(node_ids: Vec<Uuid>, name: String) -> Res
 
 /// List all registered components (sorted by name).
 pub fn component_list() -> Result<Vec<ComponentInfo>> {
-    let guard = slot().lock();
+    let guard = slot().write();
     let ws = guard.as_ref().ok_or(DocumentBridgeError::NoProject)?;
     Ok(ws
         .project
@@ -3813,7 +3853,7 @@ pub fn component_instantiate(
             height: y,
         });
     }
-    let mut guard = slot().lock();
+    let mut guard = slot().write();
     let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
 
     // Snapshot the definition so we can release the borrow before
@@ -3911,7 +3951,7 @@ pub fn component_instantiate(
 
 /// Append a fresh variant to a component. Returns the new variant id.
 pub fn component_add_variant(component_id: Uuid, name: String) -> Result<Uuid> {
-    let mut guard = slot().lock();
+    let mut guard = slot().write();
     let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
     let vid = ws
         .project
@@ -4000,7 +4040,7 @@ pub fn component_smart_animate_snapshot(
     node_id: Uuid,
     target_variant_id: Uuid,
 ) -> Result<SmartAnimateSnapshot> {
-    let guard = slot().lock();
+    let guard = slot().write();
     let ws = guard.as_ref().ok_or(DocumentBridgeError::NoProject)?;
     let node = ws
         .project
@@ -4061,7 +4101,7 @@ pub fn component_smart_animate_snapshot(
 
 /// Switch the active variant of a component instance node.
 pub fn component_switch_variant(node_id: Uuid, variant_id: Uuid) -> Result<()> {
-    let mut guard = slot().lock();
+    let mut guard = slot().write();
     let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
     // Validate the node is a ComponentLayer with valid instance
     // metadata, and the variant belongs to its definition.
@@ -4144,7 +4184,7 @@ pub fn component_switch_variant(node_id: Uuid, variant_id: Uuid) -> Result<()> {
 /// `NodeType::GroupLayer` so its children remain editable as plain
 /// nodes.
 pub fn component_detach(node_id: Uuid) -> Result<()> {
-    let mut guard = slot().lock();
+    let mut guard = slot().write();
     let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
     let before = ws
         .project
@@ -4289,7 +4329,7 @@ pub fn layout_set_grid(node_id: Uuid, layout: GridLayout) -> Result<()> {
 }
 
 fn write_layout_metadata(node_id: Uuid, config: LayoutConfig, op_kind: &str) -> Result<()> {
-    let mut guard = slot().lock();
+    let mut guard = slot().write();
     let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
     let before;
     let after;
@@ -4330,7 +4370,7 @@ fn write_layout_metadata(node_id: Uuid, config: LayoutConfig, op_kind: &str) -> 
 /// [`DocumentBridgeError::InvalidLayoutConfig`] so the caller can
 /// recover (e.g. by re-running `layout_set_flex`).
 pub fn layout_recompute(node_id: Uuid) -> Result<()> {
-    let mut guard = slot().lock();
+    let mut guard = slot().write();
     let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
 
     // Stage 1: read everything we need under the lock — config,
@@ -4539,7 +4579,7 @@ pub(crate) fn layout_propagate_in_subtree(
 /// auto-layout config. No-op if the node is already a `LayoutFrame`;
 /// returns an error for any other node type.
 pub fn layout_convert_to_frame(node_id: Uuid) -> Result<()> {
-    let mut guard = slot().lock();
+    let mut guard = slot().write();
     let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
     let before;
     let after;
@@ -4586,7 +4626,7 @@ pub fn layout_convert_to_frame(node_id: Uuid) -> Result<()> {
 /// (i.e. on mouseup with the accumulated delta), not once per
 /// pointer-move event, so the operation log doesn't get spammed.
 pub fn canvas_move_node(node_id: Uuid, dx: f64, dy: f64) -> Result<()> {
-    let mut guard = slot().lock();
+    let mut guard = slot().write();
     let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
     let before;
     let after;
@@ -4654,10 +4694,10 @@ fn document_import_image_bytes_inner(
     })?;
     let rgba = img.to_rgba8();
     let (width, height) = rgba.dimensions();
-    let mut guard = slot().lock();
+    let mut guard = slot().write();
     let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
     let blob = ws
-        .store
+        .store.lock()
         .blobs()
         .store(bytes, mime_type)
         .map_err(|e| DocumentBridgeError::Io(std::io::Error::other(e.to_string())))?;
@@ -4771,7 +4811,7 @@ pub fn canvas_create_text(
         crate::scene_sync::TEXT_LAYER_METADATA_KEY.to_string(),
         serde_json::to_value(&meta)?,
     );
-    let mut guard = slot().lock();
+    let mut guard = slot().write();
     let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
     let id = ws.project.document.insert_node(node)?;
     ws.project.modified_at = Utc::now();
@@ -4860,7 +4900,7 @@ pub fn low_resource_mode_set(enabled: bool) {
         cfg.set_low_resource(enabled);
         cfg.effective_undo_depth()
     };
-    let mut guard = slot().lock();
+    let mut guard = slot().write();
     if let Some(ws) = guard.as_mut() {
         ws.project.operation_log.set_max_depth(new_depth);
     }
@@ -4946,7 +4986,8 @@ pub struct DocumentStatus {
 /// `None` if no project is open — the host can treat that as "all
 /// editing actions disabled".
 pub fn document_status() -> Option<DocumentStatus> {
-    let guard = slot().lock();
+    // Phase 11 Task 19: read-only — derives counters from the log.
+    let guard = slot().read();
     let status = guard.as_ref().map(|ws| {
         let log = &ws.project.operation_log;
         DocumentStatus {
@@ -4967,7 +5008,7 @@ pub fn document_status() -> Option<DocumentStatus> {
 
 /// Render `node_ids` (or the entire document if empty) to SVG.
 pub fn export_svg(node_ids: &[Uuid], options: &SvgExportOptions) -> Result<String> {
-    let guard = slot().lock();
+    let guard = slot().write();
     let ws = guard.as_ref().ok_or(DocumentBridgeError::NoProject)?;
     let svg = export_svg_from_document(&ws.project.document, node_ids, options)?;
     drop(guard);
@@ -5069,7 +5110,7 @@ pub fn export_pdf_file(output_path: &Path, options: &PdfExportRequest) -> Result
 /// document to a PDF `Vec<u8>` without touching the filesystem. Used
 /// by the KChat artifact publisher.
 pub fn export_pdf_bytes(options: &PdfExportRequest) -> Result<Vec<u8>> {
-    let guard = slot().lock();
+    let guard = slot().write();
     let ws = guard.as_ref().ok_or(DocumentBridgeError::NoProject)?;
     let mut rasters = kcreate_export::pdf::RasterPixelCache::new();
     // Preload every raster layer's pixels so the export crate doesn't
@@ -5093,9 +5134,12 @@ pub fn export_pdf_bytes(options: &PdfExportRequest) -> Result<Vec<u8>> {
         if rasters.contains_key(&meta.blob_hash) {
             continue;
         }
-        let bytes = match ws.store.blobs().load(&meta.blob_hash) {
-            Ok(b) => b,
-            Err(_) => continue,
+        let bytes = {
+            let store = ws.store.lock();
+            match store.blobs().load(&meta.blob_hash) {
+                Ok(b) => b,
+                Err(_) => continue,
+            }
         };
         if let Ok(pixels) = kcreate_export::pdf::RasterPixels::decode(&bytes) {
             rasters.insert(meta.blob_hash, pixels);
@@ -5273,7 +5317,7 @@ pub fn export_jpeg_bytes(options: &JpegExportRequest) -> Result<Vec<u8>> {
 /// operation deletes the new node (its `before_patch` is `null`).
 pub fn ai_remove_background(node_id: Uuid) -> Result<Uuid> {
     let (encoded_bytes, parent) = {
-        let guard = slot().lock();
+        let guard = slot().write();
         let ws = guard.as_ref().ok_or(DocumentBridgeError::NoProject)?;
         let node = ws
             .project
@@ -5297,7 +5341,7 @@ pub fn ai_remove_background(node_id: Uuid) -> Result<Uuid> {
             })?;
         let meta: crate::scene_sync::RasterImageMeta = serde_json::from_value(meta_value.clone())?;
         let bytes = ws
-            .store
+            .store.lock()
             .blobs()
             .load(&meta.blob_hash)
             .map_err(|e| DocumentBridgeError::Io(std::io::Error::other(e.to_string())))?;
@@ -5332,10 +5376,10 @@ pub fn ai_remove_background(node_id: Uuid) -> Result<Uuid> {
     }
 
     // Store the new blob, insert a sibling node, append an op + AI action.
-    let mut guard = slot().lock();
+    let mut guard = slot().write();
     let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
     let blob = ws
-        .store
+        .store.lock()
         .blobs()
         .store(&png, "image/png")
         .map_err(|e| DocumentBridgeError::Io(std::io::Error::other(e.to_string())))?;
@@ -5417,7 +5461,7 @@ struct WorkspaceAccess;
 #[cfg(feature = "mcp")]
 impl kcreate_mcp::tools::DocumentAccess for WorkspaceAccess {
     fn list_artboards(&self) -> Vec<kcreate_mcp::tools::ArtboardInfo> {
-        let guard = slot().lock();
+        let guard = slot().write();
         let Some(ws) = guard.as_ref() else {
             return Vec::new();
         };
@@ -5439,7 +5483,7 @@ impl kcreate_mcp::tools::DocumentAccess for WorkspaceAccess {
         name: String,
         parent_id: Option<Uuid>,
     ) -> std::result::Result<Uuid, String> {
-        let mut guard = slot().lock();
+        let mut guard = slot().write();
         let ws = guard
             .as_mut()
             .ok_or_else(|| "no project open".to_string())?;
@@ -5459,7 +5503,7 @@ impl kcreate_mcp::tools::DocumentAccess for WorkspaceAccess {
     }
 
     fn export_svg(&self, node_ids: &[Uuid]) -> std::result::Result<String, String> {
-        let guard = slot().lock();
+        let guard = slot().write();
         let ws = guard
             .as_ref()
             .ok_or_else(|| "no project open".to_string())?;
@@ -5585,7 +5629,7 @@ pub fn text_frame_link(a_id: Uuid, b_id: Uuid) -> Result<()> {
             value: format!("cannot link {a_id} to itself"),
         });
     }
-    let mut guard = slot().lock();
+    let mut guard = slot().write();
     let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
 
     // Validate target exists and is a text layer.
@@ -5681,7 +5725,7 @@ pub fn text_frame_link(a_id: Uuid, b_id: Uuid) -> Result<()> {
 /// Break the link out of `id` (sets `next_frame_id` to `None`).
 /// No-op on frames that aren't currently linked.
 pub fn text_frame_unlink(id: Uuid) -> Result<()> {
-    let mut guard = slot().lock();
+    let mut guard = slot().write();
     let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
     let node = ws
         .project
@@ -5738,7 +5782,7 @@ pub fn text_frame_unlink(id: Uuid) -> Result<()> {
 pub fn text_frame_set_wrap(id: Uuid, mode_json: &str) -> Result<()> {
     let mode: kcreate_core::node::TextWrapMode =
         serde_json::from_str(mode_json).map_err(DocumentBridgeError::Json)?;
-    let mut guard = slot().lock();
+    let mut guard = slot().write();
     let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
 
     let node = ws
@@ -5820,7 +5864,7 @@ pub fn slice_create(
     let slice = Slice::new(name, bounds, fmt, scale);
     let id = slice.id;
 
-    let mut guard = slot().lock();
+    let mut guard = slot().write();
     let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
     let before = serde_json::to_value(&ws.project.slices).unwrap_or(serde_json::Value::Null);
     ws.project.slices.push(slice);
@@ -5880,7 +5924,7 @@ pub fn slice_update(id: Uuid, changes: SliceUpdateProps) -> Result<()> {
         }
     }
 
-    let mut guard = slot().lock();
+    let mut guard = slot().write();
     let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
     let idx = ws
         .project
@@ -5920,7 +5964,7 @@ pub fn slice_update(id: Uuid, changes: SliceUpdateProps) -> Result<()> {
 
 /// Remove a slice by id. Returns true when something was removed.
 pub fn slice_delete(id: Uuid) -> Result<bool> {
-    let mut guard = slot().lock();
+    let mut guard = slot().write();
     let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
     let before = serde_json::to_value(&ws.project.slices).unwrap_or(serde_json::Value::Null);
     let before_len = ws.project.slices.len();
@@ -5937,7 +5981,7 @@ pub fn slice_delete(id: Uuid) -> Result<bool> {
 
 /// List every slice in the project, in insertion order.
 pub fn slice_list() -> Result<Vec<Slice>> {
-    let guard = slot().lock();
+    let guard = slot().write();
     let ws = guard.as_ref().ok_or(DocumentBridgeError::NoProject)?;
     Ok(ws.project.slices.clone())
 }
@@ -5950,7 +5994,7 @@ pub fn slice_export_all(output_dir: &Path) -> Result<Vec<kcreate_export::slice::
     let scene = crate::state::current_scene()
         .map_err(|e| DocumentBridgeError::Io(std::io::Error::other(e.to_string())))?;
     let slices = {
-        let guard = slot().lock();
+        let guard = slot().write();
         let ws = guard.as_ref().ok_or(DocumentBridgeError::NoProject)?;
         ws.project.slices.clone()
     };
@@ -6037,7 +6081,7 @@ type BrandKitAssetBundle = (
 );
 
 fn collect_brand_kit_assets(kit_id: Uuid) -> Result<BrandKitAssetBundle> {
-    let guard = slot().lock();
+    let guard = slot().write();
     let ws = guard.as_ref().ok_or(DocumentBridgeError::NoProject)?;
     let kit = ws
         .project
@@ -6056,7 +6100,11 @@ fn collect_brand_kit_assets(kit_id: Uuid) -> Result<BrandKitAssetBundle> {
     let mut fonts: std::collections::HashMap<String, Vec<u8>> = std::collections::HashMap::new();
     for font in &kit.fonts {
         if let Some(asset_id) = font.embedded_asset_id {
-            if let Some(bytes) = ws.store.load_asset(asset_id)? {
+            let loaded = {
+                let store = ws.store.lock();
+                store.load_asset(asset_id)?
+            };
+            if let Some(bytes) = loaded {
                 let key = kcreate_export::kbrand::font_archive_basename(
                     &font.family,
                     font.weight,
@@ -6068,7 +6116,11 @@ fn collect_brand_kit_assets(kit_id: Uuid) -> Result<BrandKitAssetBundle> {
     }
     let mut logos: std::collections::HashMap<String, Vec<u8>> = std::collections::HashMap::new();
     if let Some(logo_id) = kit.logo_asset_id {
-        if let Some(bytes) = ws.store.load_asset(logo_id)? {
+        let loaded = {
+            let store = ws.store.lock();
+            store.load_asset(logo_id)?
+        };
+        if let Some(bytes) = loaded {
             logos.insert("primary".into(), bytes);
         }
     }
@@ -6083,7 +6135,7 @@ pub fn brand_kit_import(file_path: &Path) -> Result<Uuid> {
     let bundle = kcreate_export::kbrand::import_brand_kit(file_path)
         .map_err(|e| DocumentBridgeError::Io(std::io::Error::other(e.to_string())))?;
 
-    let mut guard = slot().lock();
+    let mut guard = slot().write();
     let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
 
     // Stage 1: walk the manifest and turn each archive-relative
@@ -6106,7 +6158,7 @@ pub fn brand_kit_import(file_path: &Path) -> Result<Uuid> {
         };
         let mime = font_mime_for(archive_path);
         let id = Uuid::new_v4();
-        ws.store.store_asset_with_id(id, bytes, mime)?;
+        ws.store.lock().store_asset_with_id(id, bytes, mime)?;
         font_asset_ids.insert(archive_path.clone(), id);
         font_archive_paths.push(Some(archive_path.clone()));
     }
@@ -6114,7 +6166,7 @@ pub fn brand_kit_import(file_path: &Path) -> Result<Uuid> {
         let bytes = bundle.assets.get(&logo.archive_path)?;
         let mime = logo_mime_for(&logo.archive_path);
         let id = Uuid::new_v4();
-        ws.store.store_asset_with_id(id, bytes, mime).ok()?;
+        ws.store.lock().store_asset_with_id(id, bytes, mime).ok()?;
         Some(id)
     });
 
@@ -6149,7 +6201,7 @@ pub fn brand_kit_import(file_path: &Path) -> Result<Uuid> {
 /// name should keep using `color_spot_upsert` directly).
 pub fn color_add_spot(name: String, c: f32, m: f32, y: f32, k: f32) -> Result<()> {
     use kcreate_core::color::SpotColorDef;
-    let mut guard = slot().lock();
+    let mut guard = slot().write();
     let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
     let before = serde_json::to_value(&ws.project.spot_color_library)?;
     let def = SpotColorDef {
@@ -6176,7 +6228,7 @@ pub fn color_add_spot(name: String, c: f32, m: f32, y: f32, k: f32) -> Result<()
 /// `node_set_overprint` operation. `node_id` must reference any
 /// node (overprint is a style flag, not node-type-specific).
 pub fn node_set_overprint(id: Uuid, enabled: bool) -> Result<()> {
-    let mut guard = slot().lock();
+    let mut guard = slot().write();
     let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
     let before_snapshot = ws
         .project
@@ -6899,7 +6951,7 @@ mod tests {
         // Reach into the workspace to confirm op_b's id is present in
         // the restored log. Release the guard before further asserts.
         let found_b = {
-            let guard = slot().lock();
+            let guard = slot().write();
             let ws = guard.as_ref().expect("workspace");
             let present = ws.project.operation_log.iter().any(|op| op.id == op_b_id);
             drop(guard);
@@ -7392,7 +7444,7 @@ mod tests {
                 )
                 .expect("child");
                 {
-                    let mut g = slot().lock();
+                    let mut g = slot().write();
                     let ws = g.as_mut().expect("ws");
                     let n = ws.project.document.get_node_mut(id).expect("node");
                     n.bounds = kcreate_core::node::Bounds::new(0.0, 0.0, 50.0, 30.0);
@@ -7402,7 +7454,7 @@ mod tests {
             .collect();
         // Give the frame an explicit size.
         {
-            let mut g = slot().lock();
+            let mut g = slot().write();
             let ws = g.as_mut().expect("ws");
             let n = ws.project.document.get_node_mut(frame).expect("frame node");
             n.bounds = kcreate_core::node::Bounds::new(0.0, 0.0, 400.0, 200.0);
@@ -7450,7 +7502,7 @@ mod tests {
         layout_recompute(frame).expect("recompute");
 
         // Each child is 50px wide with 10px spacing → 0, 60, 120.
-        let g = slot().lock();
+        let g = slot().write();
         let ws = g.as_ref().expect("ws");
         let expected = [0.0, 60.0, 120.0];
         for (i, kid) in kids.iter().enumerate() {
@@ -7483,7 +7535,7 @@ mod tests {
         layout_set_grid(frame, cfg).expect("set grid");
         layout_recompute(frame).expect("recompute");
 
-        let g = slot().lock();
+        let g = slot().write();
         let ws = g.as_ref().expect("ws");
         let n0 = ws.project.document.get_node(kids[0]).expect("n0");
         let n1 = ws.project.document.get_node(kids[1]).expect("n1");
@@ -7504,7 +7556,7 @@ mod tests {
         layout_convert_to_frame(frame).expect("convert");
         layout_recompute(frame).expect("noop");
         // Children's bounds unchanged.
-        let g = slot().lock();
+        let g = slot().write();
         let ws = g.as_ref().expect("ws");
         for kid in &kids {
             let n = ws.project.document.get_node(*kid).expect("kid");
@@ -7547,7 +7599,7 @@ mod tests {
         project_close();
         project_open(&project_path).expect("reopen");
         // The layout metadata should still be on the frame.
-        let g = slot().lock();
+        let g = slot().write();
         let ws = g.as_ref().expect("ws");
         let node = ws.project.document.get_node(frame).expect("frame");
         let stored = node
@@ -7628,12 +7680,12 @@ mod tests {
         project_create("lrm", dir.path()).expect("create");
         let before = low_resource_mode_get();
         let before_depth = {
-            let g = slot().lock();
+            let g = slot().write();
             g.as_ref().unwrap().project.operation_log.max_depth()
         };
         low_resource_mode_set(true);
         let lr_depth = {
-            let g = slot().lock();
+            let g = slot().write();
             g.as_ref().unwrap().project.operation_log.max_depth()
         };
         assert!(lr_depth <= before_depth, "{lr_depth} <= {before_depth}");
@@ -7933,7 +7985,7 @@ mod tests {
         // `PageLayout` with the master attached.
         master_page_apply(content_page, master).expect("apply");
         {
-            let guard = slot().lock();
+            let guard = slot().write();
             let ws = guard.as_ref().expect("ws");
             let op = ws.project.operation_log.last().expect("apply op");
             assert_eq!(op.command, "master_page_apply");
@@ -7952,7 +8004,7 @@ mod tests {
         // master set in `before` and cleared in `after`.
         master_page_detach(content_page).expect("detach");
         {
-            let guard = slot().lock();
+            let guard = slot().write();
             let ws = guard.as_ref().expect("ws");
             let op = ws.project.operation_log.last().expect("detach op");
             assert_eq!(op.command, "master_page_detach");
@@ -9928,7 +9980,7 @@ mod tests {
         )
         .expect("frame");
         {
-            let mut g = slot().lock();
+            let mut g = slot().write();
             let ws = g.as_mut().expect("ws");
             let n = ws.project.document.get_node_mut(frame).expect("frame");
             n.bounds = kcreate_core::node::Bounds::new(0.0, 0.0, 400.0, 80.0);
@@ -9944,7 +9996,7 @@ mod tests {
                     },
                 )
                 .expect("child");
-                let mut g = slot().lock();
+                let mut g = slot().write();
                 let ws = g.as_mut().expect("ws");
                 let n = ws.project.document.get_node_mut(id).expect("kid");
                 n.bounds = kcreate_core::node::Bounds::new(0.0, 0.0, 50.0, 30.0);
@@ -9961,7 +10013,7 @@ mod tests {
 
         // Sanity: the children are packed at x=0/60/120.
         {
-            let g = slot().lock();
+            let g = slot().write();
             let ws = g.as_ref().expect("ws");
             let n0 = ws.project.document.get_node(kids[0]).expect("k0");
             let n2 = ws.project.document.get_node(kids[2]).expect("k2");
@@ -9986,7 +10038,7 @@ mod tests {
         crate::phase8::document_resize_frame(frame, new_bounds).expect("resize");
 
         {
-            let g = slot().lock();
+            let g = slot().write();
             let ws = g.as_ref().expect("ws");
             let frame_n = ws.project.document.get_node(frame).expect("frame");
             assert!(
@@ -10011,7 +10063,7 @@ mod tests {
         // change, so the presence of these arrays in the op log
         // is the directly observable side-effect.
         {
-            let g = slot().lock();
+            let g = slot().write();
             let ws = g.as_ref().expect("ws");
             let last_op = ws
                 .project
@@ -10073,7 +10125,7 @@ mod tests {
 
         // Direct call against the artboard root — we expect a
         // `LayoutRecursionLimit` error.
-        let mut g = slot().lock();
+        let mut g = slot().write();
         let ws = g.as_mut().expect("ws");
         let err = layout_propagate_in_subtree(ws, ab).expect_err("must hit recursion limit");
         match err {
@@ -10115,7 +10167,7 @@ mod tests {
         // mirrors the live instance children, the after set
         // mirrors the variant's stored snapshot).
         {
-            let mut g = slot().lock();
+            let mut g = slot().write();
             let ws = g.as_mut().expect("ws");
             let def = ws
                 .project
@@ -10195,7 +10247,7 @@ mod tests {
 
         // Record the active variant id before the snapshot call.
         let before_active = {
-            let g = slot().lock();
+            let g = slot().write();
             let ws = g.as_ref().expect("ws");
             let inst_n = ws.project.document.get_node(inst_id).expect("inst");
             let meta = inst_n
@@ -10212,7 +10264,7 @@ mod tests {
         // After the snapshot call the active variant must still
         // be the original — we did NOT commit the swap.
         let after_active = {
-            let g = slot().lock();
+            let g = slot().write();
             let ws = g.as_ref().expect("ws");
             let inst_n = ws.project.document.get_node(inst_id).expect("inst");
             let meta = inst_n
@@ -10228,6 +10280,183 @@ mod tests {
             before_active, after_active,
             "snapshot must not mutate the active variant id",
         );
+
+        project_close();
+    }
+
+    // ---- Phase 11 Block D Tasks 19/21/24 — concurrency stress +
+    // document-version bump invariants.
+
+    /// Task 19 + 24 — concurrent readers do not deadlock or
+    /// observe torn data while a single writer mutates the
+    /// workspace. We spawn `READERS` reader threads that hammer
+    /// `document_get_tree` / `document_status` (both now use
+    /// `slot().read()`) and one writer that creates, updates, then
+    /// deletes a sequence of vector layers. The assertions are:
+    ///
+    ///   * Every reader returns at least the expected baseline
+    ///     count (the writer never deletes the artboard).
+    ///   * The writer completes all `WRITES` iterations.
+    ///   * No reader observes a `NoProject` mid-run (the writer
+    ///     never closes the project).
+    ///
+    /// Iteration counts are intentionally modest (200 writes,
+    /// 8 readers, 200 iterations each) so the test stays CI-fast
+    /// (< 1s) while still exercising real parallelism on the
+    /// `RwLock` — the previous `Mutex` would serialise every read,
+    /// so a regression to `Mutex` would still pass but the
+    /// `RUNS / second` ratio would drop. We assert the qualitative
+    /// invariant (no deadlock, no corruption) which is what users
+    /// actually care about; a microbenchmark lives in
+    /// `crates/kcreate_tests/tests/render_pipeline_perf.rs`.
+    #[test]
+    #[serial]
+    fn phase11_rwlock_workspace_concurrent_readers_no_deadlock() {
+        const READERS: usize = 8;
+        const READS_PER_READER: usize = 200;
+        const WRITES: usize = 200;
+
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("phase11-rwlock", dir.path()).expect("create");
+        let ab = artboard_create(None, "Page".into(), 1000.0, 800.0).expect("artboard");
+
+        // Pre-create one stable child so readers always observe
+        // at least one VectorLayer beyond the artboard root.
+        let stable = document_create_node(
+            "VectorLayer",
+            Some(ab),
+            &CreateNodeProps {
+                name: Some("Stable".into()),
+                ..Default::default()
+            },
+        )
+        .expect("stable");
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(READERS + 1));
+        let mut readers = Vec::with_capacity(READERS);
+        for _ in 0..READERS {
+            let b = std::sync::Arc::clone(&barrier);
+            readers.push(std::thread::spawn(move || {
+                b.wait();
+                let mut last_count = 0usize;
+                for _ in 0..READS_PER_READER {
+                    let tree = document_get_tree().expect("tree");
+                    // The artboard + the stable layer are always
+                    // present; writer-created transient layers
+                    // may or may not be in this snapshot.
+                    assert!(
+                        tree.len() >= 2,
+                        "reader observed truncated tree: len={}",
+                        tree.len()
+                    );
+                    let status = document_status().expect("status");
+                    assert!(
+                        status.node_count >= 2,
+                        "reader observed truncated node_count: {}",
+                        status.node_count
+                    );
+                    last_count = tree.len();
+                }
+                last_count
+            }));
+        }
+
+        // Writer thread: drives mutations through the bridge.
+        let writer = {
+            let b = std::sync::Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                b.wait();
+                let mut transient_ids = Vec::with_capacity(WRITES);
+                for i in 0..WRITES {
+                    let id = document_create_node(
+                        "VectorLayer",
+                        Some(ab),
+                        &CreateNodeProps {
+                            name: Some(format!("T{i}")),
+                            ..Default::default()
+                        },
+                    )
+                    .expect("transient");
+                    transient_ids.push(id);
+                }
+                for id in &transient_ids {
+                    document_delete_node(*id).expect("delete");
+                }
+                transient_ids.len()
+            })
+        };
+
+        let writes = writer.join().expect("writer joined");
+        assert_eq!(writes, WRITES);
+        for r in readers {
+            let n = r.join().expect("reader joined");
+            assert!(n >= 2, "final read snapshot too small: {n}");
+        }
+
+        // The stable layer must survive the storm.
+        let final_tree = document_get_tree().expect("tree");
+        assert!(
+            final_tree.iter().any(|n| n.id == stable),
+            "stable layer must be present after concurrent storm",
+        );
+
+        project_close();
+    }
+
+    /// Task 21 — every mutation bumps the process-global
+    /// `document_version` counter; read-only entry points must
+    /// NOT bump it. The counter is plumbed through the bridge as
+    /// `lib::document_version()`; we read it via the core helper
+    /// (the bridge wrapper just truncates to `u32`).
+    #[test]
+    #[serial]
+    fn phase11_document_version_advances_on_mutation_only() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("phase11-ver", dir.path()).expect("create");
+        let ab = artboard_create(None, "Page".into(), 200.0, 200.0).expect("artboard");
+
+        let v0 = kcreate_core::document::document_version_global();
+
+        // Read-only calls must not advance the counter.
+        let _ = document_get_tree().expect("tree");
+        let _ = document_status().expect("status");
+        let _ = document_get_selection().expect("selection");
+        let v_read = kcreate_core::document::document_version_global();
+        assert_eq!(v_read, v0, "read-only calls bumped document_version");
+
+        // Single mutation: create + update.
+        let id = document_create_node(
+            "VectorLayer",
+            Some(ab),
+            &CreateNodeProps {
+                name: Some("v".into()),
+                ..Default::default()
+            },
+        )
+        .expect("create");
+        let v1 = kcreate_core::document::document_version_global();
+        assert!(v1 > v0, "create did not bump document_version: {v0} -> {v1}");
+
+        document_update_node(
+            id,
+            &UpdateNodeProps {
+                name: Some("renamed".into()),
+                ..Default::default()
+            },
+        )
+        .expect("update");
+        let v2 = kcreate_core::document::document_version_global();
+        assert!(v2 > v1, "update did not bump document_version: {v1} -> {v2}");
+
+        // Undo + redo must each bump.
+        let _ = document_undo().expect("undo");
+        let v3 = kcreate_core::document::document_version_global();
+        assert!(v3 > v2, "undo did not bump document_version: {v2} -> {v3}");
+        let _ = document_redo().expect("redo");
+        let v4 = kcreate_core::document::document_version_global();
+        assert!(v4 > v3, "redo did not bump document_version: {v3} -> {v4}");
 
         project_close();
     }

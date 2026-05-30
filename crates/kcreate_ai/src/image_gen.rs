@@ -276,6 +276,12 @@ fn health_worker(
         // the wire shape uniform with the chat sidecar.
         context_size: 0,
         port,
+        // The FLUX diffusion sidecar speaks our own loopback
+        // protocol — it doesn't expose llama.cpp's `/v1/*` routes
+        // and doesn't accept `--api-key`. Phase 11 Block E Task 25
+        // only authenticates the chat sidecar; the diffusion
+        // sidecar stays loopback-only without a per-session token.
+        bearer_token: None,
     };
     while !stop_signal.load(Ordering::Acquire) {
         thread::sleep(Duration::from_millis(200));

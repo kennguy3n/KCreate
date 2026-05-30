@@ -77,7 +77,7 @@ struct LayerPixels {
 }
 
 fn load_layer_pixels(node_id: Uuid) -> Result<LayerPixels> {
-    let guard = slot().lock();
+    let guard = slot().write();
     let ws = guard.as_ref().ok_or(DocumentBridgeError::NoProject)?;
     let node = ws
         .project
@@ -101,7 +101,7 @@ fn load_layer_pixels(node_id: Uuid) -> Result<LayerPixels> {
         })?;
     let meta: RasterImageMeta = serde_json::from_value(meta_value.clone())?;
     let bytes = ws
-        .store
+        .store.lock()
         .blobs()
         .load(&meta.blob_hash)
         .map_err(|e| DocumentBridgeError::Io(std::io::Error::other(e.to_string())))?;
@@ -148,7 +148,7 @@ fn replace_layer_pixels(
     resize_bounds: bool,
 ) -> Result<()> {
     let png = encode_png(&new_rgba, out_w, out_h)?;
-    let mut guard = slot().lock();
+    let mut guard = slot().write();
     let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
 
     let before_snapshot = ws
@@ -160,7 +160,7 @@ fn replace_layer_pixels(
         });
 
     let blob = ws
-        .store
+        .store.lock()
         .blobs()
         .store(&png, "image/png")
         .map_err(|e| DocumentBridgeError::Io(std::io::Error::other(e.to_string())))?;
@@ -1163,7 +1163,7 @@ mod tests {
     /// the integration tests below to confirm an op actually
     /// rewrote the blob hash.
     fn raster_meta(node_id: Uuid) -> RasterImageMeta {
-        let guard = crate::document::slot().lock();
+        let guard = crate::document::slot().write();
         let ws = guard.as_ref().expect("workspace");
         let node = ws.project.document.get_node(node_id).expect("node exists");
         let meta = node
@@ -1176,7 +1176,7 @@ mod tests {
 
     /// Snapshot the node's `Bounds` for assertions across an op.
     fn raster_bounds(node_id: Uuid) -> Bounds {
-        let guard = crate::document::slot().lock();
+        let guard = crate::document::slot().write();
         let ws = guard.as_ref().expect("workspace");
         ws.project
             .document
@@ -1371,7 +1371,7 @@ mod tests {
         }
         apply_filter_masked(node_id, filter, mask).expect("masked filter");
         // The most recent operation must capture mask_len + mask_true.
-        let guard = crate::document::slot().lock();
+        let guard = crate::document::slot().write();
         let ws = guard.as_ref().expect("workspace");
         let last_op = ws.project.operation_log.last().expect("operation logged");
         let params: &Value = &last_op.before_patch;

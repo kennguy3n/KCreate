@@ -40,6 +40,14 @@ workspace = true
 kcreate_collab = { path = "../kcreate_collab" }
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "sync", "time"] }
 reqwest = { workspace = true }
+# Phase 11 Block E Task 28: certificate pinning. Builds a custom
+# rustls `ClientConfig` that chains standard WebPKI validation with
+# a leaf-cert SHA-256 fingerprint check; the config is then handed to
+# `reqwest::Client::builder().use_preconfigured_tls(...)`.
+rustls = { workspace = true }
+rustls-pki-types = { workspace = true }
+sha2 = { workspace = true }
+webpki-roots = { workspace = true }
 url = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }

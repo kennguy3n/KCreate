@@ -551,7 +551,8 @@ pub fn brand_kit_save_version(
             .ok_or_else(|| {
                 DocumentBridgeError::Internal(format!("brand kit {brand_kit_id} not found"))
             })?;
-        let conn = ws.store.connection();
+        let store = ws.store.lock();
+        let conn = store.connection();
         let version = save_brand_kit_version(conn, brand_kit, description.to_string())
             .map_err(|e| DocumentBridgeError::Internal(format!("save_brand_kit_version: {e}")))?;
         Ok(BrandKitVersionInfo::from(version))
@@ -561,7 +562,8 @@ pub fn brand_kit_save_version(
 /// List versions for a brand kit, newest first.
 pub fn brand_kit_list_versions(brand_kit_id: Uuid) -> Result<Vec<BrandKitVersionInfo>> {
     with_workspace(|ws| {
-        let conn = ws.store.connection();
+        let store = ws.store.lock();
+        let conn = store.connection();
         let versions = list_brand_kit_versions(conn, brand_kit_id)
             .map_err(|e| DocumentBridgeError::Internal(format!("list_brand_kit_versions: {e}")))?;
         Ok(versions
@@ -576,7 +578,8 @@ pub fn brand_kit_list_versions(brand_kit_id: Uuid) -> Result<Vec<BrandKitVersion
 /// project so subsequent reads see the restored values immediately.
 pub fn brand_kit_restore_version(version_id: Uuid) -> Result<kcreate_core::project::BrandKit> {
     with_workspace_mut(|ws| {
-        let conn = ws.store.connection();
+        let store = ws.store.lock();
+        let conn = store.connection();
         let snapshot = restore_brand_kit_version(conn, version_id).map_err(|e| {
             DocumentBridgeError::Internal(format!("restore_brand_kit_version: {e}"))
         })?;
@@ -607,7 +610,8 @@ pub fn brand_kit_restore_version(version_id: Uuid) -> Result<kcreate_core::proje
 /// identified by their version ids.
 pub fn brand_kit_diff(before_id: Uuid, after_id: Uuid) -> Result<BrandKitDiff> {
     with_workspace(|ws| {
-        let conn = ws.store.connection();
+        let store = ws.store.lock();
+        let conn = store.connection();
         let before = kcreate_storage::brand_versions::load_brand_kit_version(conn, before_id)
             .map_err(|e| DocumentBridgeError::Internal(format!("load before: {e}")))?
             .ok_or_else(|| DocumentBridgeError::Internal(format!("before {before_id} missing")))?;

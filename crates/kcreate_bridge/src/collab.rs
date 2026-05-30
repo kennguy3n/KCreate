@@ -1653,7 +1653,8 @@ fn apply_inbound_annotation_broadcast(
     // failed to persist on this pass.
     let mut applied_count: u32 = 0;
     let workspace_result = crate::document::with_workspace_mut(|ws| {
-        let conn = ws.store.connection();
+        let store = ws.store.lock();
+        let conn = store.connection();
         match kind {
             AnnotationBroadcastKind::Upsert => {
                 for ann in &annotations {
@@ -3743,26 +3744,115 @@ pub fn kchat_derive_local_identity(seed_b64: &str) -> Result<KChatLocalIdentity>
 // ---------- Phase 7 (Tasks 19–23) entry points ----------
 
 /// File name written inside the project's `.kstudio/` directory
-/// for the per-document ACL.
+/// for the per-document ACL when the project is unencrypted.
 const ACL_FILENAME: &str = "acl.json";
 
-/// Phase 7 (Task 21): load the project ACL from `<project_dir>/acl.json`.
-/// Returns the (acl, source-path) pair. A missing file or unparseable
-/// content yields `(ProjectAcl::default(), Some(path))` so subsequent
-/// edits can still be persisted to the canonical location; an absent
-/// project_dir yields `(default(), None)` (no persistence).
+/// Phase 11 Block E Task 27 — companion file name used when the
+/// project is encrypted. Contents are a `KCAClv1\0`-prefixed
+/// ChaCha20-Poly1305 blob produced by
+/// [`kcreate_collab::encrypt_acl_bytes`]. The two filenames are
+/// deliberately kept separate so an attacker who swaps one for the
+/// other gets caught by the magic-header check.
+const ACL_FILENAME_ENC: &str = "acl.json.enc";
+
+/// Phase 11 Block E Task 27 — read the active project's PBKDF2-
+/// derived SQLCipher key, if the project is open and encrypted.
+/// Returns `None` for plaintext projects, for sessions started
+/// without a workspace (rare in production, common in tests), and
+/// for the brief window during `project_open_encrypted` before the
+/// key is cached. The returned 32 bytes are a copy of the cached
+/// key — callers must drop the binding promptly and never persist
+/// it. Reads are non-blocking (workspace `RwLock` upgrade-friendly).
+fn current_project_encryption_key() -> Option<[u8; 32]> {
+    crate::document::with_workspace(|ws| Ok(ws.store.lock().derived_key().copied()))
+        .ok()
+        .flatten()
+}
+
+/// Phase 7 (Task 21) + Phase 11 Block E Task 27 — load the project
+/// ACL from disk. Looks for `acl.json.enc` first (encrypted
+/// projects); falls back to plaintext `acl.json` otherwise. On a
+/// successful plaintext load against an encrypted project, the ACL
+/// is auto-migrated by writing the encrypted form and deleting the
+/// plaintext copy so subsequent saves don't keep both around.
+///
+/// A missing file, unreadable file, unparseable content, or
+/// AEAD-authentication failure all degrade gracefully to
+/// `ProjectAcl::default()` (open ACL, no enforcement) so a
+/// corrupted ACL file doesn't brick session start; the renderer
+/// surfaces a diagnostic via the audit channel. The returned path
+/// is always the *plaintext* file name so `save_project_acl` has a
+/// stable canonical anchor — the actual on-disk filename it writes
+/// to (encrypted or not) is rederived from the current key.
 fn load_project_acl(
     project_dir: Option<&std::path::Path>,
 ) -> (kcreate_collab::ProjectAcl, Option<std::path::PathBuf>) {
     let Some(dir) = project_dir else {
         return (kcreate_collab::ProjectAcl::default(), None);
     };
-    let path = dir.join(ACL_FILENAME);
-    let acl = match std::fs::read_to_string(&path) {
+    let plaintext_path = dir.join(ACL_FILENAME);
+    let encrypted_path = dir.join(ACL_FILENAME_ENC);
+    let encryption_key = current_project_encryption_key();
+
+    // Phase 11 Block E Task 27 — encrypted projects keep the ACL at
+    // `acl.json.enc`. Read it first when present; the decrypt step
+    // double-checks the magic header and AEAD tag so a wrong-key
+    // or tampered file cannot silently fall through to a default.
+    if encrypted_path.exists() {
+        match std::fs::read(&encrypted_path) {
+            Ok(blob) => {
+                if let Some(key) = encryption_key.as_ref() {
+                    match kcreate_collab::decrypt_acl_bytes(key, &blob) {
+                        Ok(plaintext) => match serde_json::from_slice::<
+                            kcreate_collab::ProjectAcl,
+                        >(&plaintext)
+                        {
+                            Ok(acl) => return (acl, Some(plaintext_path)),
+                            Err(e) => {
+                                tracing::warn!(
+                                    "collab: encrypted ACL at {} decrypted but JSON malformed ({e}); falling back to open ACL",
+                                    encrypted_path.display()
+                                );
+                                return (
+                                    kcreate_collab::ProjectAcl::default(),
+                                    Some(plaintext_path),
+                                );
+                            }
+                        },
+                        Err(e) => {
+                            tracing::warn!(
+                                "collab: encrypted ACL at {} could not be decrypted ({e}); falling back to open ACL",
+                                encrypted_path.display()
+                            );
+                            return (
+                                kcreate_collab::ProjectAcl::default(),
+                                Some(plaintext_path),
+                            );
+                        }
+                    }
+                }
+                tracing::warn!(
+                    "collab: encrypted ACL at {} found but no derived key in workspace; falling back to open ACL",
+                    encrypted_path.display()
+                );
+                return (kcreate_collab::ProjectAcl::default(), Some(plaintext_path));
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "collab: encrypted ACL at {} could not be read ({e}); falling back to plaintext path",
+                    encrypted_path.display()
+                );
+            }
+        }
+    }
+
+    // No usable encrypted blob — fall through to the legacy
+    // plaintext path so existing projects keep working.
+    let acl = match std::fs::read_to_string(&plaintext_path) {
         Ok(json) => serde_json::from_str::<kcreate_collab::ProjectAcl>(&json).unwrap_or_else(|e| {
             tracing::warn!(
                 "collab: ACL file at {} could not be parsed ({e}); falling back to open ACL",
-                path.display()
+                plaintext_path.display()
             );
             kcreate_collab::ProjectAcl::default()
         }),
@@ -3770,32 +3860,114 @@ fn load_project_acl(
         Err(e) => {
             tracing::warn!(
                 "collab: ACL file at {} could not be read ({e}); falling back to open ACL",
-                path.display()
+                plaintext_path.display()
             );
             kcreate_collab::ProjectAcl::default()
         }
     };
-    (acl, Some(path))
+
+    // Phase 11 Block E Task 27 — auto-migration. If the project is
+    // encrypted but only a plaintext ACL exists on disk, re-encrypt
+    // and remove the plaintext file so the SQLCipher protection
+    // extends to ACL metadata going forward. Failures are logged
+    // and tolerated — the in-memory ACL is correct either way.
+    if let Some(key) = encryption_key.as_ref() {
+        if plaintext_path.exists() {
+            match serde_json::to_vec_pretty(&acl) {
+                Ok(json_bytes) => match kcreate_collab::encrypt_acl_bytes(key, &json_bytes) {
+                    Ok(blob) => match std::fs::write(&encrypted_path, &blob) {
+                        Ok(()) => {
+                            if let Err(e) = std::fs::remove_file(&plaintext_path) {
+                                tracing::warn!(
+                                    "collab: ACL auto-migration: could not delete plaintext {} ({e})",
+                                    plaintext_path.display()
+                                );
+                            }
+                        }
+                        Err(e) => tracing::warn!(
+                            "collab: ACL auto-migration: write {} failed ({e})",
+                            encrypted_path.display()
+                        ),
+                    },
+                    Err(e) => {
+                        tracing::warn!("collab: ACL auto-migration: encrypt failed ({e})");
+                    }
+                },
+                Err(e) => tracing::warn!("collab: ACL auto-migration: serialize failed ({e})"),
+            }
+        }
+    }
+
+    (acl, Some(plaintext_path))
 }
 
-/// Phase 7 (Task 21): persist the ACL to `<project_dir>/acl.json`.
-/// Returns the I/O error rendered as a typed bridge error.
+/// Phase 7 (Task 21) + Phase 11 Block E Task 27 — persist the ACL
+/// next to the project's database. When the project is encrypted
+/// the bytes are written to `acl.json.enc` under the SQLCipher
+/// derived key; otherwise plaintext `acl.json` is written. The
+/// opposite-state file is removed if present so we never leave a
+/// stale plaintext copy around after enabling encryption or vice
+/// versa.
+///
+/// `path` is the canonical plaintext path returned by
+/// [`load_project_acl`]; this function derives the encrypted
+/// sibling path from the same parent directory.
 fn save_project_acl(path: &std::path::Path, acl: &kcreate_collab::ProjectAcl) -> Result<()> {
-    let json =
-        serde_json::to_string_pretty(acl).map_err(|e| SessionBridgeError::InvalidArgument {
-            field: "acl",
-            message: format!("could not serialise ACL: {e}"),
-        })?;
+    let json = serde_json::to_vec_pretty(acl).map_err(|e| SessionBridgeError::InvalidArgument {
+        field: "acl",
+        message: format!("could not serialise ACL: {e}"),
+    })?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| SessionBridgeError::InvalidArgument {
             field: "acl_path",
             message: format!("could not create {}: {e}", parent.display()),
         })?;
     }
-    std::fs::write(path, json).map_err(|e| SessionBridgeError::InvalidArgument {
-        field: "acl_path",
-        message: format!("could not write {}: {e}", path.display()),
-    })?;
+    let encrypted_path = path.parent().map_or_else(
+        || std::path::PathBuf::from(ACL_FILENAME_ENC),
+        |p| p.join(ACL_FILENAME_ENC),
+    );
+    let encryption_key = current_project_encryption_key();
+    if let Some(key) = encryption_key.as_ref() {
+        let blob = kcreate_collab::encrypt_acl_bytes(key, &json).map_err(|e| {
+            SessionBridgeError::InvalidArgument {
+                field: "acl",
+                message: format!("could not encrypt ACL: {e}"),
+            }
+        })?;
+        std::fs::write(&encrypted_path, blob).map_err(|e| {
+            SessionBridgeError::InvalidArgument {
+                field: "acl_path",
+                message: format!("could not write {}: {e}", encrypted_path.display()),
+            }
+        })?;
+        // Best-effort cleanup of any stale plaintext file. We
+        // don't fail the save if the cleanup itself fails — the
+        // encrypted copy is already the source of truth.
+        if path.exists() {
+            if let Err(e) = std::fs::remove_file(path) {
+                tracing::warn!(
+                    "collab: stale plaintext ACL at {} could not be removed ({e})",
+                    path.display()
+                );
+            }
+        }
+    } else {
+        std::fs::write(path, json).map_err(|e| SessionBridgeError::InvalidArgument {
+            field: "acl_path",
+            message: format!("could not write {}: {e}", path.display()),
+        })?;
+        // If encryption was just disabled (or never enabled),
+        // make sure no stale encrypted blob lingers.
+        if encrypted_path.exists() {
+            if let Err(e) = std::fs::remove_file(&encrypted_path) {
+                tracing::warn!(
+                    "collab: stale encrypted ACL at {} could not be removed ({e})",
+                    encrypted_path.display()
+                );
+            }
+        }
+    }
     Ok(())
 }
 

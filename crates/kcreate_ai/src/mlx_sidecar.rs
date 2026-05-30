@@ -304,6 +304,12 @@ fn health_worker(
         model_name,
         context_size,
         port,
+        // Phase 11 Block E Task 25 — the MLX sidecar is the macOS
+        // Metal alternative spawn path; the auth flag wiring there
+        // tracks llama-server, but the MLX server doesn't ship an
+        // `--api-key` equivalent yet, so the bearer is reported as
+        // `None` and clients fall back to unauthenticated loopback.
+        bearer_token: None,
     };
     while !stop_signal.load(Ordering::Acquire) {
         thread::sleep(Duration::from_millis(200));

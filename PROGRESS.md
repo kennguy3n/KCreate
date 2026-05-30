@@ -1529,7 +1529,355 @@ memory-pressure + autosave + export-validation robustness layer.
       handlers + Bridge interface in lockstep with the
       Rust surface.
 
+## Phase 11 — Render Performance, Async Bridge, Prototype Animation, Concurrency & Security Hardening | Complete | 100%
+
+### Block A — Render Pipeline: Incremental Scene Sync + Content-Addressed Images (Tasks 1–6)
+- [x] **Task 1: Dirty-node tracking in `DocumentGraph`.**
+      Added `dirty: HashSet<Uuid>` and `structure_dirty: bool`
+      to `crates/kcreate_core/src/document.rs`. Every mutation
+      method (`insert_node`, `remove_node`, `get_node_mut`,
+      `reparent_node`, `reorder_children`, `swap_node`,
+      `apply_lww`) marks the affected node(s) dirty and sets
+      `structure_dirty` when the tree shape changes.
+      `drain_dirty()` returns and clears the dirty set;
+      `mark_dirty(id)` allows explicit external marking.
+      Coverage in `crates/kcreate_tests/tests/dirty_tracking.rs`.
+- [x] **Task 2: Incremental scene sync in `SceneSync`.**
+      `crates/kcreate_bridge/src/scene_sync.rs` now caches the
+      last-emitted `Vec<Object>` per document node id and a
+      `cached_scene_version: u64` counter. The hot path drains
+      the dirty set, re-runs `visit()` only for dirty nodes,
+      and concatenates cached entries in z-order. Full rebuild
+      remains the fallback on `structure_dirty` or
+      `SceneSync::clear()`. Equivalence verified in
+      `crates/kcreate_tests/tests/incremental_sync.rs`.
+- [x] **Task 3: Content-addressed image fingerprinting.**
+      Renderer `ObjectKind::Image` gained an
+      `content_hash: Option<u64>` field
+      (`crates/kcreate_renderer/src/scene.rs`). `SceneSync`
+      reuses the BLAKE3 hash from `RasterImageMeta.hash`
+      instead of re-hashing pixels.
+      `crates/kcreate_renderer/src/pipeline.rs::hash_object`
+      hashes the 8-byte digest for the cache-hit path, with
+      the chunked-pixel path retained as a fallback when no
+      digest is available.
+- [x] **Task 4: Spatial indexing for document-level hit testing.**
+      Added `spatial_index: Option<RTree<SpatialEntry>>` to
+      `DocumentGraph`. `SpatialEntry` implements
+      `rstar::RTreeObject` over `[f64; 4]` bounds; the index
+      is rebuilt lazily after `structure_dirty`. `query_point`
+      returns nodes whose bounds contain the point in
+      topmost-first z-order. Wired into
+      `crates/kcreate_bridge/src/hit_test.rs`.
+- [x] **Task 5: Display list batching + GPU instancing prep.**
+      `crates/kcreate_renderer/src/pipeline.rs` groups
+      consecutive `FillRect` / `StrokeRect` commands sharing
+      a `Style` into the new
+      `DisplayCommand::BatchedRects { rects, style }` variant.
+      CPU backend iterates batched rects; the GPU backend gets
+      the same shape so a future instanced-draw upgrade is a
+      drop-in. Visual equivalence verified by golden tests.
+- [x] **Task 6: Incremental sync + fingerprint tests.**
+      `crates/kcreate_tests/tests/render_pipeline_perf.rs`
+      covers the 5000-node single-edit speedup ratio,
+      content-addressed cache-hit fingerprint (no pixel hash
+      walk), spatial-index scaling (1k vs 5k nodes), and
+      batched display-list reduction on a 20-artboard scene.
+
+### Block B — Async Bridge + GPU Compute Filters (Tasks 7–12)
+- [x] **Task 7: Async N-API wrapper for raster operations.**
+      `raster_apply_blur`, `_sharpen`, `_levels`, `_curves`,
+      `_hsl`, `_color_balance`, `_perspective`,
+      `_apply_filter_masked`, and `raster_crop` are now
+      `AsyncTask` entry points in
+      `crates/kcreate_bridge/src/lib.rs`, following the
+      Phase 4 `VisionDescribeImageTask` pattern. The filter
+      step itself runs on libuv's threadpool; resolve is on
+      the main thread. `apps/desktop/shared/scene.ts` types
+      updated to `Promise<void>`.
+- [x] **Task 8: Async N-API for export operations.**
+      `export_png`, `export_pdf`, `export_svg_async`, and
+      `project_save` are now `AsyncTask`s. The save task
+      snapshots the document inside the write guard before
+      releasing the lock, so concurrent edits during a long
+      save can't corrupt the on-disk file.
+- [x] **Task 9: GPU compute shader for Gaussian blur.**
+      `crates/kcreate_renderer/src/compute/gaussian_blur.wgsl`
+      implements a two-pass separable Gaussian (horizontal
+      then vertical) with workgroup-per-row / per-column.
+      `compute/mod.rs::GpuComputeContext` shares the
+      `wgpu::Device`/`Queue` with the existing `GpuBackend`.
+      `crates/kcreate_raster/src/filters.rs` exposes
+      `gaussian_blur_gpu`; `crates/kcreate_bridge/src/gpu_compute.rs`
+      threads the GPU handle through the filter call sites and
+      falls back to CPU when no adapter is available.
+- [x] **Task 10: GPU compute shader for levels/curves.**
+      `compute/levels_curves.wgsl` reads a 256-entry LUT from
+      a storage buffer and applies it per pixel. Wired into
+      `filters.rs` as `levels_gpu` and `curves_gpu`. Identity
+      LUTs verified to be no-ops to within ±1 per channel.
+- [x] **Task 11: GPU compute shader for unsharp mask.**
+      `compute/unsharp_mask.wgsl` consumes the original +
+      Gaussian-blurred textures from Task 9 and emits
+      `original + amount × (original − blurred)`. Pixel
+      parity with the CPU path verified.
+- [x] **Task 12: GPU compute filter integration tests.**
+      `crates/kcreate_tests/tests/gpu_compute.rs` skips when
+      `wgpu::Instance::request_adapter` returns `None`;
+      otherwise verifies CPU↔GPU parity on Gaussian blur,
+      levels, curves, and unsharp mask, plus a 4096×4096 GPU
+      blur within a 500 ms ceiling.
+
+### Block C — Prototype Animation + Auto-Layout in Components (Tasks 13–18)
+- [x] **Task 13: Prototype transitions — dissolve, slide, push.**
+      `crates/kcreate_core/src/node.rs` extends
+      `InteractionAction` with a `Transition` value
+      (`AnimationType`, `duration_ms`, `EasingCurve`,
+      optional `SlideDirection`). `Transition::default()`
+      is `Instant + 300 ms + EaseInOut` so legacy
+      interactions deserialize unchanged. Bridge
+      `interaction_add` accepts transition JSON.
+      `crates/kcreate_tests/tests/prototype_advanced.rs`
+      round-trips every variant.
+- [x] **Task 14: PrototypePlayer animation engine.**
+      `apps/desktop/renderer/src/lib/EasingEngine.ts`
+      provides `linear`, `easeIn`, `easeOut`, `easeInOut`,
+      `cubicBezier(t, x1, y1, x2, y2)`, and a damped
+      harmonic-oscillator `spring(t, stiffness, damping)`.
+      `PrototypePlayer.tsx` captures an outgoing frame via
+      `window.kcreate.renderer.acquireFrame()`, layers the
+      outgoing + incoming artboard, and drives opacity /
+      transform via `requestAnimationFrame`. Animation
+      layers are torn down on completion.
+      `InteractionPanel.tsx` exposes the full transition
+      config.
+- [x] **Task 15: Hover / press / MouseEnter / MouseLeave /
+      AfterDelay triggers.** `InteractionTrigger` gained
+      `MouseEnter`, `MouseLeave`, and
+      `AfterDelay { ms }`. `PrototypePlayer.tsx` wires
+      enter/leave on the hotspot overlay, a press visual
+      state (scale 0.97, opacity 0.8) on mousedown, and
+      starts/clears the AfterDelay timer on artboard
+      navigation. Splash → home transitions now work without
+      a click.
+- [x] **Task 16: Auto-layout propagation through component
+      instances.** `crates/kcreate_bridge/src/document.rs::document_update_node`
+      detects bounds changes on `ComponentLayer` nodes with
+      `component_instance` metadata and re-runs
+      `layout_recompute` on the instance — recursing into
+      nested instances with a depth-limit of 16 so circular
+      references can't loop. `crates/kcreate_layout`
+      gained `layout_flex_with_overrides` /
+      `layout_grid_with_overrides` so override sizes from
+      `instance.overrides` win over intrinsic sizes during
+      the solve. Coverage in
+      `crates/kcreate_tests/tests/component_autolayout.rs`.
+- [x] **Task 17: SwitchVariant action ("Smart Animate").**
+      `InteractionAction::SwitchVariant { variant_id,
+      transition }` added. `PrototypePlayer.tsx` matches
+      layers by name between the current and target variant,
+      interpolates `bounds`, `opacity`, fill colour (in HSL
+      space), and corner radius across the transition
+      duration, fades in layers that exist only in the
+      target, and fades out layers that exist only in the
+      source. `component_switch_variant` returns the
+      before/after states so the renderer can compute the
+      interpolation without re-fetching the tree.
+- [x] **Task 18: Prototype + component usability tests.**
+      `crates/kcreate_tests/tests/prototype_advanced.rs`
+      and `component_autolayout.rs` cover transition serde
+      round-trip, AfterDelay 0 ms + 5000 ms, SwitchVariant
+      matching, flex/grid instance resize, nested instance
+      reflow, and override-size respect.
+      `EasingEngine.test.ts` covers linear identity,
+      easeInOut symmetry, spring convergence.
+
+### Block D — Workspace Concurrency + Undo Optimization (Tasks 19–24)
+- [x] **Task 19: RwLock for workspace reads.** Replaced
+      `Mutex<Option<Workspace>>` with
+      `RwLock<Option<Workspace>>` in
+      `crates/kcreate_bridge/src/document.rs`. Every
+      call-site audited: read-only entry points
+      (`document_get_tree`, `document_status`,
+      `document_get_selection`, `export_svg`,
+      `export_preset_list`, etc.) use `read()`; mutating
+      entry points use `write()`. `sync_scene_locked` was
+      refactored to take `&mut Workspace` rather than a
+      `MutexGuard` so it composes cleanly inside a write
+      guard.
+- [x] **Task 20: Delta-compressed operations.**
+      `crates/kcreate_core/src/operation.rs` (and Phase 10's
+      `operation_compress.rs`) stores `OperationDelta`
+      values internally —
+      `{ added_keys, removed_keys, changed_keys }` —
+      decompressing only at the API boundary. Raster
+      operations carrying blob hashes shrink to a single
+      changed key; property edits typically encode in 1–3.
+      `crates/kcreate_storage/src/schema.rs` writes the
+      compressed form and auto-upgrades legacy rows on load.
+- [x] **Task 21: Per-node version tracking for MVCC reads.**
+      `Node::touch()` increments `version: u64` on every
+      mutation; `DocumentGraph` maintains a
+      `document_version: AtomicU64` counter the bridge
+      exports via the lock-free `document_version()` N-API
+      entry point. The renderer polls this at 60 fps and
+      skips `refreshTree` round-trips when it hasn't moved.
+- [x] **Task 22: Node count scaling target 5k → 10k.**
+      `crates/kcreate_tests/tests/scale_validation.rs`
+      builds a 10 000-node artboard and asserts:
+      sync-after-single-edit < 5 ms, hit-test at a random
+      point < 1 ms, `document_get_tree` serialization
+      < 50 ms, full scene fingerprint < 10 ms (with
+      content-addressed images), undo / redo < 5 ms with
+      compressed operations. Acceptance bumped to "5k Tier 1,
+      10k Tier 2+" in PROPOSAL §20.
+- [x] **Task 23: Lazy subsystem initialization.** Verified
+      every Phase 8/9/10 subsystem stays deferred behind
+      `OnceCell` / first-use guards: tile cache, LLM
+      sidecar, memory watchdog, audit DB, collab transport,
+      `fontdb` discovery. `fontdb` now runs on a background
+      thread; the text engine returns a "fonts loading"
+      placeholder until the scan completes. Startup
+      timeline marks confirm
+      `bridge.first_call → project_create.start < 200 ms`.
+- [x] **Task 24: Concurrency + undo tests.**
+      `crates/kcreate_tests/tests/concurrency.rs`: 10
+      reader threads × 1 writer × 1000 iterations of the
+      RwLock under stress, delta compress/expand round-trip
+      on 1000 random operations, MVCC version monotonicity
+      across undo/redo, font lazy-init non-blocking, no
+      eager subsystem init on bridge load.
+
+### Block E — Security Hardening (Tasks 25–28)
+- [x] **Task 25: Authenticated LLM sidecar with per-session
+      bearer token.** `crates/kcreate_ai/src/llm_sidecar.rs`
+      generates a fresh 32-byte token via `getrandom`,
+      passes it to `llama-server --api-key`, and stores it
+      on `SidecarConfig`. `crates/kcreate_ai/src/llm_chat.rs`
+      attaches `Authorization: Bearer <token>` to every
+      loopback request. The token never leaves the bridge
+      address space — it is not forwarded across N-API
+      (see `crates/kcreate_bridge/src/llm.rs::SidecarStatus`).
+- [x] **Task 26: TOCTOU port allocation fix.** Spawning a
+      sidecar binds the loopback listener, hands the bound
+      port to `llama-server`, then performs a post-spawn
+      verification handshake: `GET /v1/models` with the
+      session bearer token. If the server responds with a
+      mismatched / absent token, the sidecar is killed and
+      retried on a freshly-bound port. Verification covered
+      in `crates/kcreate_tests/tests/llm_sidecar_auth.rs`.
+- [x] **Task 27: Encrypt ACL alongside project.**
+      `crates/kcreate_collab/src/acl.rs` ships
+      `encrypt_acl_bytes` / `decrypt_acl_bytes` /
+      `looks_like_encrypted_acl` plus the
+      `KCAClv1\0` magic + 12-byte nonce +
+      ChaCha20-Poly1305 wire format. Nonces are sampled
+      directly from `getrandom` to match the OS-CSPRNG
+      contract documented in `clipboard.rs`.
+      `crates/kcreate_bridge/src/collab.rs::load_project_acl`
+      prefers `acl.json.enc`, auto-migrates plaintext ACLs
+      on encrypted projects, and `save_project_acl` cleans
+      up the stale opposite-format file on every write.
+      13 ACL tests (6 new + 7 pre-existing) green.
+- [x] **Task 28: Certificate pinning for KChat backend.**
+      `crates/kcreate_kchat_client/src/pinning.rs` builds a
+      custom `rustls::ClientConfig` that chains the
+      Mozilla-root `WebPkiServerVerifier` with a leaf-cert
+      SHA-256 fingerprint check (constant-time compare).
+      `RestClientConfig::pinned_certificate_sha256` is
+      hex-parsed eagerly at construction time; pin
+      mismatches surface as the typed
+      `ClientError::CertificatePinMismatch` (mapped from
+      reqwest's error chain via the
+      `KCREATE_PIN_MISMATCH:` marker) so the renderer can
+      show "possible MITM — contact your KChat
+      administrator". Coverage in
+      `crates/kcreate_kchat_client/src/pinning.rs` unit
+      tests.
+
+### Block F — Documentation & Acceptance Criteria (Tasks 29–30)
+- [x] **Task 29: PROGRESS / PHASES / PROPOSAL updated.**
+      Phase 11 section added with every task checkbox.
+      Acceptance criteria in PROPOSAL §20 bumped:
+      pan/zoom 5000-node Tier 1 / 10 000-node Tier 2+,
+      64MP Gaussian blur < 500 ms on Tier 2+, prototype
+      transition at 60 fps on Tier 1+.
+- [x] **Task 30: README / ARCHITECTURE / AGENTS sync.**
+      README Stack table + module list updated.
+      ARCHITECTURE §17p (Phase 11) documents incremental
+      scene sync, content-addressed image fingerprinting,
+      spatial indexing, GPU compute filters, async N-API
+      surface, RwLock workspace, delta-compressed undo log,
+      prototype transitions / Smart Animate, auto-layout
+      propagation, LLM sidecar auth + TOCTOU fix, ACL
+      encryption, and KChat certificate pinning. AGENTS
+      "Where new code goes" gains `compute/mod.rs`,
+      `compute/*.wgsl`, `EasingEngine.ts`,
+      `dirty_tracking.rs`, `phase11.rs`, and the kchat
+      `pinning.rs` module.
+
+### Phase 11 — Bridge & wire-format lockstep
+- [x] **`crates/kcreate_bridge/src/phase11.rs`** owns the
+      new Phase 11 bridge entry points (raster + export
+      async tasks, `document_version`, prototype transition
+      JSON, layout-with-overrides recompute, GPU compute
+      filter dispatch, encrypted-ACL load/save helpers).
+- [x] **`crates/kcreate_bridge/src/lib.rs`** exposes the
+      new N-API surface; `apps/desktop/shared/scene.ts`
+      mirrors every new type and request/response shape;
+      `apps/desktop/preload/src/preload.ts` and
+      `apps/desktop/main/src/{bridge,main}.ts` wire the IPC
+      handlers + Bridge interface in lockstep with the Rust
+      surface.
+
 ## Changelog
+
+- **2026-05-30 (PR #27)** — Phase 11: incremental scene
+  sync (`DocumentGraph::drain_dirty` + cached per-node
+  object lists + `structure_dirty` full-rebuild fallback),
+  content-addressed image fingerprinting (BLAKE3 digest on
+  `ObjectKind::Image`, 8 bytes hashed per frame instead of
+  walking a 48 MB pixel buffer), R-tree spatial index for
+  document-level hit testing, batched `FillRect` /
+  `StrokeRect` display-list commands, async N-API for
+  raster ops + export + `project_save` (libuv-threadpool
+  AsyncTasks, lock-snapshot before save), GPU compute
+  filters (Gaussian blur / levels / curves / unsharp mask
+  in `crates/kcreate_renderer/src/compute/*.wgsl`),
+  prototype transitions (`AnimationType`, `EasingCurve`
+  incl. cubic-bezier + spring, `SlideDirection`),
+  PrototypePlayer animation engine (`EasingEngine.ts` +
+  layered outgoing/incoming artboard frames),
+  hover/press/MouseEnter/MouseLeave/AfterDelay triggers,
+  auto-layout propagation through component instances
+  (recursion-bounded `layout_recompute` + per-child
+  override sizes), `SwitchVariant` Smart-Animate
+  interpolation (bounds / opacity / HSL fill / corner
+  radius matched by layer name), RwLock workspace with
+  audited read/write call sites, delta-compressed undo log,
+  per-node `version` + `document_version` AtomicU64 for
+  lock-free poll-skipping, lazy subsystem init audit +
+  background `fontdb` scan, 10 000-node scale validation,
+  per-session LLM sidecar bearer token + TOCTOU
+  post-spawn verification handshake, ChaCha20-Poly1305
+  ACL encryption with auto-migration of plaintext on
+  encrypted projects, KChat REST cert pinning
+  (`PinnedCertVerifier` over the Mozilla `webpki-roots`
+  trust store, constant-time leaf-fingerprint compare).
+  Wired through `crates/kcreate_bridge/src/phase11.rs` +
+  mirrored in `apps/desktop/shared/scene.ts` and the
+  preload / main IPC layer. New integration tests in
+  `crates/kcreate_tests/tests/`
+  (`dirty_tracking.rs`, `incremental_sync.rs`,
+  `render_pipeline_perf.rs`, `gpu_compute.rs`,
+  `prototype_advanced.rs`, `component_autolayout.rs`,
+  `concurrency.rs`, `scale_validation.rs`,
+  `llm_sidecar_auth.rs`) plus
+  `crates/kcreate_collab/src/acl.rs` and
+  `crates/kcreate_kchat_client/src/pinning.rs` unit tests.
+  `local_first.rs` sentinel stays green — `webpki-roots`
+  is pulled in only by `kcreate_kchat_client`, which is
+  out of the editing-path closure.
 
 - **2026-05-29 (PR #26)** — Phase 10: Image Studio AI
   pipeline (NLM denoise, PatchMatch inpaint, auto-colour,

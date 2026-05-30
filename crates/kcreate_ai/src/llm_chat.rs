@@ -387,17 +387,42 @@ pub enum ChatError {
 ///
 /// `port` is taken from `LlmSidecar::status().port()`. Times out
 /// after 60 s; the renderer should disable the input while in flight.
+///
+/// Phase 11 Block E Task 25 — callers that started the sidecar with
+/// `require_api_key = true` (the default) must forward the bearer
+/// token returned by `LlmSidecar::status().bearer_token()` here so
+/// llama-server doesn't reject the request with `401`.
 pub fn chat_completion(port: u16, request: &ChatRequest) -> ChatResult<ChatResponse> {
-    chat_completion_impl(port, request)
+    chat_completion_impl(port, request, None)
+}
+
+/// Same as [`chat_completion`] but attaches `Authorization: Bearer
+/// <token>` to the outbound request. Use this whenever a bearer
+/// token is available; the unauthenticated variant remains for
+/// older llama-server builds that don't accept `--api-key`.
+pub fn chat_completion_with_token(
+    port: u16,
+    request: &ChatRequest,
+    bearer_token: &str,
+) -> ChatResult<ChatResponse> {
+    chat_completion_impl(port, request, Some(bearer_token))
 }
 
 #[cfg(feature = "llm_sidecar")]
-fn chat_completion_impl(port: u16, request: &ChatRequest) -> ChatResult<ChatResponse> {
+fn chat_completion_impl(
+    port: u16,
+    request: &ChatRequest,
+    bearer_token: Option<&str>,
+) -> ChatResult<ChatResponse> {
     let url = format!("http://127.0.0.1:{port}/v1/chat/completions");
     let body = serde_json::to_value(request).map_err(|e| ChatError::Decode(e.to_string()))?;
-    let resp = ureq::post(&url)
+    let mut req = ureq::post(&url)
         .timeout(Duration::from_mins(1))
-        .set("content-type", "application/json")
+        .set("content-type", "application/json");
+    if let Some(token) = bearer_token {
+        req = req.set("authorization", &format!("Bearer {token}"));
+    }
+    let resp = req
         .send_json(body)
         .map_err(|e| ChatError::Http(e.to_string()))?;
     let raw: serde_json::Value = resp
@@ -407,7 +432,11 @@ fn chat_completion_impl(port: u16, request: &ChatRequest) -> ChatResult<ChatResp
 }
 
 #[cfg(not(feature = "llm_sidecar"))]
-fn chat_completion_impl(_port: u16, _request: &ChatRequest) -> ChatResult<ChatResponse> {
+fn chat_completion_impl(
+    _port: u16,
+    _request: &ChatRequest,
+    _bearer_token: Option<&str>,
+) -> ChatResult<ChatResponse> {
     Err(ChatError::FeatureDisabled)
 }
 

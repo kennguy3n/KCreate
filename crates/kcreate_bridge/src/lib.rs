@@ -516,6 +516,32 @@ pub fn project_save() -> AsyncTask<phase11::ProjectSaveTask> {
     AsyncTask::new(phase11::ProjectSaveTask)
 }
 
+/// Phase 11 Block D Task 21 — monotonic document version. Bumps on
+/// every mutation (create / update / delete / undo / redo / paste /
+/// reparent etc.). Renderer-side pollers compare two snapshots of
+/// this counter to short-circuit `documentGetTree` IPC round trips
+/// when nothing has changed.
+///
+/// Returns `0` when no project is open AND no mutations have been
+/// applied this process lifetime. The counter is process-global —
+/// every active document advances the same atomic — so the renderer
+/// only has to call this once per frame to know if anything in the
+/// graph changed since the last paint.
+///
+/// Implemented as a `u32` because TypeScript `number` covers `u32`
+/// exactly. The counter would have to wrap at `u32::MAX` (≈ 4
+/// billion mutations) before the renderer would see a duplicate
+/// value; at 60 mutations / second that's ~ 2 years of nonstop
+/// editing.
+#[napi]
+#[must_use]
+pub fn document_version() -> u32 {
+    let raw = kcreate_core::document::document_version_global();
+    // Wrap into u32 keeping the low bits — the renderer only cares
+    // about inequality, not magnitude. Wrap is well-defined.
+    (raw & u64::from(u32::MAX)) as u32
+}
+
 /// Snapshot the current project's SQLCipher encryption status.
 /// Returns a JSON-serialised
 /// [`encryption::EncryptionStatus`].

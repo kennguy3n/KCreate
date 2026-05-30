@@ -29,6 +29,11 @@ pub mod attestation;
 pub mod auth;
 pub mod client;
 pub mod error;
+/// Phase 11 Block E Task 28 — certificate pinning support for the
+/// KChat REST client. Builds a custom `rustls::ClientConfig` that
+/// runs WebPKI chain validation and then checks the leaf cert's
+/// SHA-256 fingerprint against a configured pin.
+pub mod pinning;
 pub mod protocol;
 pub mod rest;
 

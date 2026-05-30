@@ -47,7 +47,7 @@ pub struct PassphraseStrength {
 /// Snapshot the current project's encryption status.
 pub fn encryption_status() -> Result<EncryptionStatus> {
     with_workspace(|ws| {
-        let store = &ws.store;
+        let store = ws.store.lock();
         if let Some(meta) = store.manifest().encryption.as_ref() {
             Ok(EncryptionStatus {
                 enabled: meta.enabled,
@@ -80,10 +80,11 @@ pub fn passphrase_strength(passphrase: &str) -> PassphraseStrength {
 /// and the manifest carries the encryption metadata.
 pub fn enable_encryption(passphrase: &str) -> Result<EncryptionStatus> {
     with_workspace_mut(|ws| {
-        ws.store
+        ws.store.lock()
             .enable_encryption(passphrase)
             .map_err(map_store_err)?;
-        let meta = ws.store.manifest().encryption.as_ref().ok_or_else(|| {
+        let store = ws.store.lock();
+        let meta = store.manifest().encryption.as_ref().ok_or_else(|| {
             DocumentBridgeError::Internal(
                 "enable_encryption succeeded but manifest is missing metadata".to_string(),
             )
@@ -104,7 +105,7 @@ pub fn enable_encryption(passphrase: &str) -> Result<EncryptionStatus> {
 /// rekey can hand SQLCipher the correct "unlock" key.
 pub fn change_passphrase(old_passphrase: &str, new_passphrase: &str) -> Result<()> {
     with_workspace_mut(|ws| {
-        ws.store
+        ws.store.lock()
             .change_passphrase(old_passphrase, new_passphrase)
             .map_err(map_store_err)
     })
@@ -120,7 +121,7 @@ pub fn change_passphrase(old_passphrase: &str, new_passphrase: &str) -> Result<(
 /// Windows-side WAL contention from a second concurrent reader.
 pub fn export_plaintext_recovery(passphrase: &str, output_path: PathBuf) -> Result<PathBuf> {
     with_workspace_mut(|ws| {
-        ws.store
+        ws.store.lock()
             .export_plaintext_recovery(passphrase, &output_path)
             .map_err(map_store_err)
     })

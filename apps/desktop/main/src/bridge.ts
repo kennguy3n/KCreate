@@ -190,6 +190,14 @@ export interface Bridge {
   projectClose(): void;
   projectGetInfo(): ProjectInfoSnake | null;
   projectIsUntouched(): boolean;
+  /**
+   * Phase 11 Block D Task 21 — monotonic version counter that
+   * advances on every workspace mutation. Renderer pollers compare
+   * two snapshots to skip `documentGetTree` IPC when the document
+   * hasn't changed. The reader is a single `AtomicU64` load on the
+   * Rust side, so it's safe to call at 60Hz.
+   */
+  documentVersion(): number;
   documentGetTree(): NodeInfoSnake[];
   documentInspectNode(nodeId: string): string;
   documentCreateNode(

@@ -18,9 +18,26 @@ use std::sync::OnceLock;
 
 use kcreate_ai::{
     build_accessibility_prompt, build_design_token_prompt, build_layer_naming_prompt,
-    build_system_prompt, chat_completion, parse_layer_naming_reply, ChatError, ChatMessage,
-    ChatRequest, ChatResponse, ChatRole, LlmSidecar, SidecarConfig, SidecarError, SidecarStatus,
+    build_system_prompt, chat_completion, chat_completion_with_token, parse_layer_naming_reply,
+    ChatError, ChatMessage, ChatRequest, ChatResponse, ChatRole, LlmSidecar, SidecarConfig,
+    SidecarError, SidecarStatus,
 };
+
+/// Phase 11 Block E Task 25 — dispatch a chat completion using
+/// whichever client-auth path is configured for the running
+/// sidecar. Falls back to the unauthenticated client only when the
+/// sidecar reported no bearer token (older llama-server builds).
+fn chat_dispatch(
+    port: u16,
+    bearer_token: Option<&str>,
+    req: &ChatRequest,
+) -> Result<ChatResponse, ChatError> {
+    if let Some(token) = bearer_token {
+        chat_completion_with_token(port, req, token)
+    } else {
+        chat_completion(port, req)
+    }
+}
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
@@ -78,6 +95,12 @@ impl From<&SidecarStatus> for LlmStatusInfo {
                 model_name,
                 context_size,
                 port,
+                // Phase 11 Block E Task 25 — the bearer token stays
+                // inside the bridge process and is consumed directly
+                // by `llm_chat` (which lives in the same address
+                // space). We never forward it across N-API to the
+                // renderer.
+                bearer_token: _,
             } => Self {
                 state: "ready",
                 model_name: Some(model_name.clone()),
@@ -209,7 +232,7 @@ pub fn llm_chat(
     max_tokens: usize,
     temperature: f32,
 ) -> LlmBridgeResult<LlmReply> {
-    let port = ready_port()?;
+    let (port, token) = ready_port_and_token()?;
     let converted = messages
         .into_iter()
         .map(LlmMessage::into_core)
@@ -220,7 +243,7 @@ pub fn llm_chat(
         temperature,
         grammar: None,
     };
-    let resp = chat_completion(port, &req)?;
+    let resp = chat_dispatch(port, token.as_deref(), &req)?;
     Ok(resp.into())
 }
 
@@ -288,8 +311,8 @@ pub fn ai_suggest_layer_names() -> LlmBridgeResult<LayerNamingResult> {
     }
     let names: Vec<_> = tree.iter().map(|n| (n.id, n.name.clone())).collect();
     let req = build_layer_naming_prompt(&names);
-    let port = ready_port()?;
-    let resp = chat_completion(port, &req)?;
+    let (port, token) = ready_port_and_token()?;
+    let resp = chat_dispatch(port, token.as_deref(), &req)?;
     let suggestions = parse_layer_naming_reply(&resp.content);
     Ok(LayerNamingResult {
         suggestions,
@@ -313,8 +336,8 @@ pub fn ai_extract_design_tokens() -> LlmBridgeResult<LlmJsonResult> {
     let document_json =
         document_serialise_for_ai().map_err(|e| LlmBridgeError::Invalid(e.to_string()))?;
     let req = build_design_token_prompt(&document_json);
-    let port = ready_port()?;
-    let resp = chat_completion(port, &req)?;
+    let (port, token) = ready_port_and_token()?;
+    let resp = chat_dispatch(port, token.as_deref(), &req)?;
     Ok(LlmJsonResult {
         json: resp.content,
         tokens_used: resp.tokens_used,
@@ -335,8 +358,8 @@ pub fn ai_check_accessibility() -> LlmBridgeResult<LlmJsonResult> {
     let document_json =
         document_serialise_for_ai().map_err(|e| LlmBridgeError::Invalid(e.to_string()))?;
     let req = build_accessibility_prompt(&document_json);
-    let port = ready_port()?;
-    let resp = chat_completion(port, &req)?;
+    let (port, token) = ready_port_and_token()?;
+    let resp = chat_dispatch(port, token.as_deref(), &req)?;
     Ok(LlmJsonResult {
         json: resp.content,
         tokens_used: resp.tokens_used,
@@ -344,14 +367,24 @@ pub fn ai_check_accessibility() -> LlmBridgeResult<LlmJsonResult> {
     })
 }
 
-/// Look up the sidecar's listening port, failing fast with `NotReady`
-/// if the sidecar isn't `Ready`.
-pub(crate) fn ready_port() -> LlmBridgeResult<u16> {
+/// Phase 11 Block E Task 25 — look up the sidecar's listening port
+/// plus the per-session bearer token. Returns `(port, None)` for
+/// older llama-server builds that don't accept `--api-key` (so the
+/// host gets a token-less Ready) — the chat client then talks to
+/// the sidecar without auth and logs a warning. Returns
+/// `NotReady` when the sidecar isn't `Ready` yet.
+///
+/// Replaces the earlier port-only `ready_port` helper; every chat
+/// entry-point now resolves the bearer token in the same call so a
+/// `Ready` sidecar can never be reached over loopback without it
+/// (when the server accepted `--api-key`).
+pub(crate) fn ready_port_and_token() -> LlmBridgeResult<(u16, Option<String>)> {
     let guard = slot().lock();
-    guard
-        .as_ref()
-        .and_then(|s| s.status().port())
-        .ok_or(LlmBridgeError::NotReady)
+    let sidecar = guard.as_ref().ok_or(LlmBridgeError::NotReady)?;
+    let status = sidecar.status();
+    let port = status.port().ok_or(LlmBridgeError::NotReady)?;
+    let token = status.bearer_token().map(std::string::ToString::to_string);
+    Ok((port, token))
 }
 
 /// Compact, human-readable summary of the open document. Kept here

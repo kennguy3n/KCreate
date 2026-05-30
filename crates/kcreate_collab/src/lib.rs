@@ -57,7 +57,10 @@ pub mod message;
 pub mod peer;
 pub mod session;
 
-pub use acl::{AclDecision, AclEntry, AclMode, AclPermission, ProjectAcl};
+pub use acl::{
+    decrypt_acl_bytes, encrypt_acl_bytes, looks_like_encrypted_acl, AclCryptoError, AclDecision,
+    AclEntry, AclMode, AclPermission, ProjectAcl, ACL_ENC_MAGIC, ACL_NONCE_LEN,
+};
 pub use clipboard::{
     decrypt_clipboard_payload, derive_x25519_from_ed25519_public, encrypt_clipboard_payload,
     ClipboardCryptoError, ClipboardPlaintext,

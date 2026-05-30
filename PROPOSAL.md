@@ -438,9 +438,12 @@ vetted local templates. KChat artifact publishing.
 | ---------------------------------------------- | ------------- | ------------- | -------------- | --------------- |
 | Cold start                                     | < 3 s         | < 2 s         | < 1.5 s        | < 1 s           |
 | Open a 50 MB project                           | < 5 s         | < 3 s         | < 2 s          | < 1 s           |
-| Pan / zoom 1000-node artboard                  | 30 fps        | 60 fps        | 60 fps         | 120 fps         |
+| Pan / zoom 5 000-node artboard                 | 30 fps        | 60 fps        | 60 fps         | 120 fps         |
+| Pan / zoom 10 000-node artboard (Phase 11)     | —             | 30 fps        | 60 fps         | 60 fps          |
 | Background removal (4 MP)                      | 15 s          | 8 s           | 4 s            | < 2 s           |
 | Open a 64 MP raster                            | 4 s           | 2 s           | < 1 s          | < 1 s           |
+| Gaussian blur, 64 MP, radius 20 (Phase 11 GPU) | —             | —             | < 500 ms       | < 250 ms        |
+| Prototype transition (dissolve / slide / push) | 30 fps        | 60 fps        | 60 fps         | 120 fps         |
 
 ### UX
 

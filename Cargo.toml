@@ -233,6 +233,16 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"
 tracing = "0.1"
 # Custom server-cert verifier needs a small SHA-256 helper.
 sha2 = "0.10"
+# Phase 11 Block E Task 28: Mozilla root CA bundle used by the KChat
+# REST client when certificate pinning is enabled. With a pin, we
+# still want full chain validation against well-known roots before
+# the leaf-fingerprint check — defeating one shouldn't be cheaper
+# than defeating the other. `webpki-roots` is already pulled in as a
+# transitive of `reqwest` (via `hyper-rustls`), so this just promotes
+# it to a first-class dep so the rustls `ClientConfig` we build can
+# load `TLS_SERVER_ROOTS` directly without going through reqwest's
+# internal path.
+webpki-roots = "1.0"
 
 # Phase 7 (Option C pivot): REST client for the shared KChat /
 # Mattermost backend. Only enters the editing-path closure walked by

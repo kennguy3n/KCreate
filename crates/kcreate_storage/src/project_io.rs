@@ -212,6 +212,26 @@ pub struct ProjectStore {
     /// transparently so the in-memory [`Operation`] surface is unchanged.
     /// Default `true`; mirror [`kcreate_core::RuntimeConfig::compress_undo_log`].
     compress_undo_log: bool,
+    /// Phase 11 Block E Task 27 — cached PBKDF2-derived key for the
+    /// SQLCipher database, kept in-memory for the duration of the
+    /// open session so adjacent metadata files (currently `acl.json`)
+    /// can be encrypted under the same key without re-prompting the
+    /// user. `None` for plaintext projects. The buffer is owned by
+    /// `Box<[u8; KEY_LEN]>` (heap, no allocator-cache reuse) and is
+    /// explicitly zeroed on `Drop`/replacement via
+    /// [`Self::clear_cached_key`]; it lives only as long as the
+    /// process holds an open connection to the encrypted DB.
+    cached_key: Option<Box<[u8; crate::crypto::KEY_LEN]>>,
+}
+
+impl Drop for ProjectStore {
+    fn drop(&mut self) {
+        // Wipe the cached SQLCipher key on close so a heap-residue
+        // dump can't recover it. The SQLCipher connection holds its
+        // own copy in C heap (we can't reach that), but the bridge-
+        // side cache is ours to control.
+        self.clear_cached_key();
+    }
 }
 
 /// Sentinel marker stored under the `after_patch` JSON column when an
@@ -244,6 +264,7 @@ impl ProjectStore {
             db,
             blobs,
             compress_undo_log: true,
+            cached_key: None,
         })
     }
 
@@ -302,13 +323,17 @@ impl ProjectStore {
             }
         }
         let db_path = dir.join(DATABASE_FILENAME);
-        let db = match manifest.encryption.as_ref() {
+        let (db, cached_key) = match manifest.encryption.as_ref() {
             Some(meta) if meta.enabled => {
                 let pass = passphrase.ok_or(ProjectStoreError::PassphraseRequired)?;
                 let key = derive_key_from_meta(pass, meta)?;
-                Database::open_encrypted(db_path, &key)?
+                let db = Database::open_encrypted(&db_path, &key)?;
+                // Phase 11 Block E Task 27 — cache the derived key so
+                // sibling metadata (acl.json.enc) can be decrypted /
+                // re-encrypted across the session without re-prompting.
+                (db, Some(Box::new(key)))
             }
-            _ => Database::open(db_path)?,
+            _ => (Database::open(db_path)?, None),
         };
         let blobs = BlobStore::new(dir.join(BLOBS_DIRNAME))?;
         Ok(Self {
@@ -317,6 +342,7 @@ impl ProjectStore {
             db,
             blobs,
             compress_undo_log: true,
+            cached_key,
         })
     }
 
@@ -371,6 +397,37 @@ impl ProjectStore {
     #[must_use]
     pub fn is_encrypted(&self) -> bool {
         matches!(self.manifest.encryption.as_ref(), Some(m) if m.enabled)
+    }
+
+    /// Phase 11 Block E Task 27 — borrow the cached PBKDF2-derived
+    /// SQLCipher key, if one is in memory.
+    ///
+    /// Returns `Some(&[u8; KEY_LEN])` only when the project is
+    /// encrypted **and** was opened / encrypted within this process
+    /// (so the key was derived live, not read from a side store).
+    /// `None` for plaintext projects, and `None` for encrypted
+    /// projects whose key was forgotten via [`Self::clear_cached_key`].
+    ///
+    /// The caller MUST treat the returned slice as session-scoped key
+    /// material: never log it, never persist it to disk, never send
+    /// it across IPC. The only intended consumer is the bridge-side
+    /// ACL encryption path, which keeps the bytes in the same address
+    /// space.
+    #[must_use]
+    pub fn derived_key(&self) -> Option<&[u8; crate::crypto::KEY_LEN]> {
+        self.cached_key.as_deref()
+    }
+
+    /// Phase 11 Block E Task 27 — zero out and drop the cached
+    /// SQLCipher key. Idempotent. Used by `Drop` to wipe key bytes
+    /// when the project closes, and by tests that need to assert the
+    /// key is no longer in memory.
+    pub fn clear_cached_key(&mut self) {
+        if let Some(mut key) = self.cached_key.take() {
+            for byte in key.iter_mut() {
+                *byte = 0;
+            }
+        }
     }
 
     /// Encrypt a previously-plaintext project with a fresh
@@ -441,6 +498,16 @@ impl ProjectStore {
             write_manifest(&self.project_dir, &self.manifest)?;
             Ok(())
         })();
+        // Phase 11 Block E Task 27 — cache (or wipe) the derived key
+        // only AFTER the recovery branch below has settled. If
+        // encryption succeeded we keep the bytes so the ACL writer
+        // can re-encrypt under the same key without re-prompting;
+        // if anything failed we ensure no stale key lingers.
+        if result.is_ok() {
+            self.cached_key = Some(Box::new(key));
+        } else {
+            self.clear_cached_key();
+        }
         if result.is_err() {
             // Best-effort recovery: try re-opening the on-disk DB
             // as plaintext first (the typical failure case is that
@@ -542,6 +609,19 @@ impl ProjectStore {
             self.db = Database::open_encrypted(&db_path, &new_key)?;
             Ok(())
         })();
+        // Phase 11 Block E Task 27 — keep the cached key aligned
+        // with whichever passphrase the on-disk file is now
+        // encrypted with. On success that's `new_key`; on failure
+        // the recovery branch below may settle on `old_key` (if
+        // rekey aborted before mutating the header) or `new_key`
+        // (if it crashed after). Wipe the cache here and let the
+        // recovery branch set the correct one — clients are
+        // expected to reopen the project on failure, but the
+        // in-process surface stays consistent.
+        self.clear_cached_key();
+        if result.is_ok() {
+            self.cached_key = Some(Box::new(new_key));
+        }
         if result.is_err() {
             // Rekey failed after the swap (e.g. disk full,
             // SQLCipher build mismatch). The probe established
@@ -552,8 +632,10 @@ impl ProjectStore {
             // can re-open the project from disk.
             if let Ok(db) = Database::open_encrypted(&db_path, &old_key) {
                 self.db = db;
+                self.cached_key = Some(Box::new(old_key));
             } else if let Ok(db) = Database::open_encrypted(&db_path, &new_key) {
                 self.db = db;
+                self.cached_key = Some(Box::new(new_key));
             }
         }
         result

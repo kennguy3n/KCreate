@@ -59,6 +59,15 @@ pub struct RestClientConfig {
     /// `true` so it can bind to `127.0.0.1` without provisioning
     /// a TLS cert.
     pub allow_http_for_tests: bool,
+    /// Phase 11 Block E Task 28 — SHA-256 fingerprint of the
+    /// backend's leaf certificate, hex-encoded (64 chars, with or
+    /// without colon separators). When `Some`, the rustls config
+    /// rejects any chain whose leaf does not hash to this value
+    /// even if the chain otherwise validates against a public CA
+    /// — defence-in-depth against mis-issuance / MITM. When
+    /// `None` (the default for backwards-compatibility) reqwest's
+    /// default system-CA chain validation applies.
+    pub pinned_certificate_sha256: Option<String>,
 }
 
 impl RestClientConfig {
@@ -78,7 +87,20 @@ impl RestClientConfig {
             base_url: url,
             request_timeout: REQUEST_TIMEOUT,
             allow_http_for_tests: false,
+            pinned_certificate_sha256: None,
         })
+    }
+
+    /// Phase 11 Block E Task 28 — production config with leaf-cert
+    /// pinning enabled. The supplied hex string is parsed eagerly,
+    /// so a malformed pin surfaces as `InvalidPinnedCertificate`
+    /// at config-construction time rather than at first request.
+    pub fn production_pinned(base_url: &str, pin_sha256_hex: &str) -> Result<Self, ClientError> {
+        // Parse-validate the pin up front so a typo is caught now.
+        let _ = crate::pinning::parse_pin_hex(pin_sha256_hex)?;
+        let mut cfg = Self::production(base_url)?;
+        cfg.pinned_certificate_sha256 = Some(pin_sha256_hex.to_string());
+        Ok(cfg)
     }
 
     /// Test-fixture config. Only used by the axum-backed test
@@ -99,6 +121,7 @@ impl RestClientConfig {
             base_url: url,
             request_timeout: Duration::from_secs(5),
             allow_http_for_tests: true,
+            pinned_certificate_sha256: None,
         })
     }
 }
@@ -124,12 +147,21 @@ impl RestClient {
                 url: config.base_url.to_string(),
             });
         }
-        let http = reqwest::Client::builder()
+        let mut builder = reqwest::Client::builder()
             .timeout(config.request_timeout)
-            .user_agent(USER_AGENT_HEADER_VALUE)
-            // The collab transport already pins rustls; the REST
-            // client uses rustls too so the workspace ships with
-            // exactly one TLS backend.
+            .user_agent(USER_AGENT_HEADER_VALUE);
+        // Phase 11 Block E Task 28 — when a pinned-certificate
+        // fingerprint is configured, swap reqwest's default rustls
+        // ClientConfig for one that runs WebPKI chain validation
+        // and then additionally enforces a leaf-cert SHA-256 pin.
+        // The collab transport already uses rustls for QUIC, so the
+        // workspace ships exactly one TLS backend regardless.
+        if let Some(pin_hex) = config.pinned_certificate_sha256.as_deref() {
+            let pin_bytes = crate::pinning::parse_pin_hex(pin_hex)?;
+            let tls_config = crate::pinning::build_pinned_tls_config(pin_bytes)?;
+            builder = builder.use_preconfigured_tls(tls_config);
+        }
+        let http = builder
             .build()
             .map_err(|e| ClientError::Transport(format!("build reqwest client: {e}")))?;
         Ok(Self {
@@ -572,7 +604,39 @@ fn map_transport_error(err: reqwest::Error, path: &str) -> ClientError {
             message: err.to_string(),
         };
     }
-    ClientError::Transport(err.to_string())
+    // Phase 11 Block E Task 28 — surface a pin-mismatch as a
+    // distinct typed error so the renderer can render the "possible
+    // MITM" prompt. Our custom `PinnedCertVerifier` tags its error
+    // message with the `KCREATE_PIN_MISMATCH:` prefix; reqwest
+    // forwards the full TLS error chain through `Display`, which
+    // may include that prefix verbatim, so we walk both the
+    // top-level message and every wrapped source.
+    let display = err.to_string();
+    if is_pin_mismatch_chain(&err, &display) {
+        return ClientError::CertificatePinMismatch { message: display };
+    }
+    ClientError::Transport(display)
+}
+
+/// Walk a `reqwest::Error`'s full `source()` chain looking for the
+/// `KCREATE_PIN_MISMATCH:` marker our pinned verifier emits.
+/// Implemented as a free function (rather than inlined into
+/// `map_transport_error`) so the `use std::error::Error` import lives
+/// at function scope and doesn't trip the `items_after_statements`
+/// clippy lint.
+fn is_pin_mismatch_chain(err: &reqwest::Error, display: &str) -> bool {
+    use std::error::Error as _;
+    if display.contains("KCREATE_PIN_MISMATCH:") {
+        return true;
+    }
+    let mut source: Option<&dyn std::error::Error> = err.source();
+    while let Some(s) = source {
+        if s.to_string().contains("KCREATE_PIN_MISMATCH:") {
+            return true;
+        }
+        source = s.source();
+    }
+    false
 }
 
 /// Parse a `Retry-After` header value into a `Duration`. Supports

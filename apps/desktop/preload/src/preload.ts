@@ -535,6 +535,16 @@ const document: DocumentBridge = {
     )) as NodeInfoSnake[];
     return raw.map(nodeFromSnake);
   },
+  /**
+   * Phase 11 Block D Task 21 — read the workspace version counter
+   * without acquiring the workspace lock. Pollers use this to skip
+   * `getDocumentTree` IPC when nothing has changed.
+   */
+  async getDocumentVersion(): Promise<number> {
+    return (await ipcRenderer.invoke(
+      "kcreate/document/version",
+    )) as number;
+  },
   async inspectNode(nodeId: string): Promise<InspectCode> {
     const raw = (await ipcRenderer.invoke(
       "kcreate/document/inspectNode",

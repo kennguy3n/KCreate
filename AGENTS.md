@@ -394,3 +394,22 @@ pnpm lint
 | ExportPreviewPanel UI                    | `apps/desktop/renderer/src/components/ExportPreviewPanel.tsx` |
 | BatchExportProgress UI                   | `apps/desktop/renderer/src/components/BatchExportProgress.tsx` |
 | PreferencesPanel UI                      | `apps/desktop/renderer/src/components/PreferencesPanel.tsx` |
+| Phase 11 bridge surface                  | `crates/kcreate_bridge/src/phase11.rs` |
+| Dirty-set + structure-dirty tracking     | `crates/kcreate_core/src/document.rs` (`drain_dirty`, `mark_dirty`, `structure_dirty`) |
+| R-tree spatial index                     | `crates/kcreate_core/src/document.rs` (`SpatialEntry`, `spatial_index`, `query_point`) |
+| GPU compute Gaussian blur shader         | `crates/kcreate_renderer/src/compute/gaussian_blur.wgsl` |
+| GPU compute levels / curves shader       | `crates/kcreate_renderer/src/compute/levels_curves.wgsl` |
+| GPU compute unsharp mask shader          | `crates/kcreate_renderer/src/compute/unsharp_mask.wgsl` |
+| GPU compute context (wgpu plumbing)      | `crates/kcreate_renderer/src/compute/mod.rs` (`GpuComputeContext`) |
+| Bridge-side GPU compute dispatch         | `crates/kcreate_bridge/src/gpu_compute.rs` |
+| Async N-API for raster / export / save   | `crates/kcreate_bridge/src/lib.rs` (`AsyncTask` wrappers; see Phase 11 block) |
+| Prototype transition + easing types      | `crates/kcreate_core/src/node.rs` (`Transition`, `AnimationType`, `EasingCurve`, `SlideDirection`) |
+| EasingEngine (cubic-bezier + spring)     | `apps/desktop/renderer/src/lib/EasingEngine.ts` |
+| Auto-layout overrides                    | `crates/kcreate_layout/src/{flex,grid}.rs` (`layout_*_with_overrides`) |
+| LLM sidecar bearer-token auth + TOCTOU   | `crates/kcreate_ai/src/llm_sidecar.rs` (`--api-key`, post-spawn verification) |
+| LLM chat Authorization header            | `crates/kcreate_ai/src/llm_chat.rs` |
+| ACL encryption (ChaCha20-Poly1305)       | `crates/kcreate_collab/src/acl.rs` (`encrypt_acl_bytes`, `decrypt_acl_bytes`, `looks_like_encrypted_acl`) |
+| ACL load / save / migration              | `crates/kcreate_bridge/src/collab.rs` (`load_project_acl`, `save_project_acl`) |
+| KChat REST cert pinning                  | `crates/kcreate_kchat_client/src/pinning.rs` (`PinnedCertVerifier`, `build_pinned_tls_config`) |
+| Phase 11 wire format (TypeScript mirror) | `apps/desktop/shared/scene.ts` (Phase 11 async signatures + transition types) |
+| Phase 11 cross-crate tests               | `crates/kcreate_tests/tests/{dirty_tracking,incremental_sync,render_pipeline_perf,gpu_compute,prototype_advanced,component_autolayout,concurrency,scale_validation,llm_sidecar_auth}.rs` |

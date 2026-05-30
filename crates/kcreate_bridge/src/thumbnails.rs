@@ -267,10 +267,11 @@ impl RecentProjectsStore {
 /// caller's already-held workspace lock; the recent-projects mutex is
 /// briefly contended and never held across renderer work.
 pub(crate) fn record_recent_project(ws: &Workspace) {
-    let manifest = ws.store.manifest();
+    let store = ws.store.lock();
+    let manifest = store.manifest();
     let mut slot = recent_slot().lock();
     slot.record(
-        ws.store.project_dir(),
+        store.project_dir(),
         &manifest.name,
         manifest.id,
         manifest.modified_at,
@@ -470,7 +471,7 @@ pub fn prepare_thumbnails_background(max_dim_px: u32) -> Result<()> {
     // Snapshot the page list under the workspace lock so the worker
     // doesn't depend on the document staying open.
     let pages = {
-        let wsguard = workspace_slot().lock();
+        let wsguard = workspace_slot().write();
         let ws = match wsguard.as_ref() {
             Some(ws) => ws,
             None => {
@@ -560,13 +561,13 @@ where
 {
     // Step 1 — single lock window: derive hash + target + scene, and
     // short-circuit on a cache hit. Note the cache is on disk under
-    // `ws.store.thumbnails_dir()`, so we must hold the lock long
+    // `ws.store.lock().thumbnails_dir()`, so we must hold the lock long
     // enough to safely open it; the open is cheap (sled-style hash
     // map) so this doesn't materially block the UI thread.
     let (content_hash, target, scene) = {
-        let mut guard = workspace_slot().lock();
+        let mut guard = workspace_slot().write();
         let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
-        let cache = ThumbnailCache::open(ws.store.thumbnails_dir()).map_err(thumb_err)?;
+        let cache = ThumbnailCache::open(ws.store.lock().thumbnails_dir()).map_err(thumb_err)?;
         let (hash, target, scene) = prepare(ws)?;
         if let Some(cached) = cache.lookup(key, &hash).map_err(thumb_err)? {
             return Ok(ThumbnailBytes::from_cached(cached));
@@ -598,9 +599,9 @@ where
 }
 
 fn cache_store(key: Uuid, content_hash: &str, bytes: &[u8], width: u32, height: u32) -> Result<()> {
-    let mut guard = workspace_slot().lock();
+    let mut guard = workspace_slot().write();
     let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
-    let mut cache = ThumbnailCache::open(ws.store.thumbnails_dir()).map_err(thumb_err)?;
+    let mut cache = ThumbnailCache::open(ws.store.lock().thumbnails_dir()).map_err(thumb_err)?;
     cache
         .store(
             key,
@@ -620,7 +621,7 @@ fn build_scene_for_target(ws: &mut Workspace, target: ThumbnailTarget) -> Scene 
     // selection so highlight overlays aren't baked into thumbnails.
     let mut scene =
         ws.scene_sync
-            .sync_document_to_scene(&mut ws.project.document, Some(ws.store.blobs()), &[]);
+            .sync_document_to_scene(&mut ws.project.document, Some(ws.store.lock().blobs()), &[]);
     // Translate so the target bounds land at the renderer origin —
     // mirroring `kcreate_export::slice::translate_scene`.
     let dx = -target.bounds.x as f32;

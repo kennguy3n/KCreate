@@ -141,7 +141,7 @@ pub fn guide_create(
     };
     let stored = guide.clone();
     with_workspace_mut(|ws| {
-        storage_upsert_guide(ws.store.connection(), &stored)
+        storage_upsert_guide(ws.store.lock().connection(), &stored)
             .map_err(|e| DocumentBridgeError::Internal(format!("upsert_guide: {e}")))?;
         ws.project.modified_at = Utc::now();
         Ok(())
@@ -152,7 +152,7 @@ pub fn guide_create(
 /// Delete a guide by id. Returns `true` if a row was removed.
 pub fn guide_delete(id: Uuid) -> Result<bool> {
     with_workspace_mut(|ws| {
-        let removed = storage_delete_guide(ws.store.connection(), id)
+        let removed = storage_delete_guide(ws.store.lock().connection(), id)
             .map_err(|e| DocumentBridgeError::Internal(format!("delete_guide: {e}")))?;
         if removed {
             ws.project.modified_at = Utc::now();
@@ -164,7 +164,7 @@ pub fn guide_delete(id: Uuid) -> Result<bool> {
 /// Delete every guide on a page. Returns the count removed.
 pub fn guide_clear_page(page_id: Uuid) -> Result<u64> {
     with_workspace_mut(|ws| {
-        let n = storage_delete_all_guides_for_page(ws.store.connection(), page_id)
+        let n = storage_delete_all_guides_for_page(ws.store.lock().connection(), page_id)
             .map_err(|e| DocumentBridgeError::Internal(format!("delete_all_for_page: {e}")))?;
         if n > 0 {
             ws.project.modified_at = Utc::now();
@@ -176,7 +176,7 @@ pub fn guide_clear_page(page_id: Uuid) -> Result<u64> {
 /// All guides for the given page, sorted by orientation then position.
 pub fn guide_list(page_id: Uuid) -> Result<Vec<GuideInfo>> {
     with_workspace(|ws| {
-        let rows = storage_list_guides_for_page(ws.store.connection(), page_id)
+        let rows = storage_list_guides_for_page(ws.store.lock().connection(), page_id)
             .map_err(|e| DocumentBridgeError::Internal(format!("list_for_page: {e}")))?;
         Ok(rows.into_iter().map(GuideInfo::from).collect())
     })
@@ -185,7 +185,7 @@ pub fn guide_list(page_id: Uuid) -> Result<Vec<GuideInfo>> {
 /// All guides across all pages of the open project.
 pub fn guide_list_all() -> Result<Vec<GuideInfo>> {
     with_workspace(|ws| {
-        let rows = storage_list_all_guides(ws.store.connection())
+        let rows = storage_list_all_guides(ws.store.lock().connection())
             .map_err(|e| DocumentBridgeError::Internal(format!("list_all_guides: {e}")))?;
         Ok(rows.into_iter().map(GuideInfo::from).collect())
     })
@@ -222,7 +222,7 @@ impl From<GridSettings> for GridSettingsInfo {
 /// a usable struct.
 pub fn artboard_grid_settings(artboard_id: Uuid) -> Result<GridSettingsInfo> {
     with_workspace(|ws| {
-        let cfg = storage_load_grid_settings(ws.store.connection(), artboard_id)
+        let cfg = storage_load_grid_settings(ws.store.lock().connection(), artboard_id)
             .map_err(|e| DocumentBridgeError::Internal(format!("load_grid_settings: {e}")))?;
         Ok(cfg
             .unwrap_or_else(|| GridSettings::default_for(artboard_id))
@@ -256,7 +256,7 @@ pub fn artboard_set_grid(
     };
     let stored = cfg.clone();
     with_workspace_mut(|ws| {
-        storage_upsert_grid(ws.store.connection(), &stored)
+        storage_upsert_grid(ws.store.lock().connection(), &stored)
             .map_err(|e| DocumentBridgeError::Internal(format!("upsert_grid_settings: {e}")))?;
         ws.project.modified_at = Utc::now();
         Ok(())

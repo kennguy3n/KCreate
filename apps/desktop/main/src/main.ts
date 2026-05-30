@@ -819,6 +819,12 @@ function registerIpcHandlers(): void {
   ipcMain.handle("kcreate/document/getTree", () =>
     requireBridge().documentGetTree(),
   );
+  // Phase 11 Block D Task 21 — lock-free document-version snapshot
+  // used by renderer pollers to skip `getTree` round-trips when the
+  // workspace hasn't changed.
+  ipcMain.handle("kcreate/document/version", () =>
+    requireBridge().documentVersion(),
+  );
   ipcMain.handle(
     "kcreate/document/inspectNode",
     (_e, nodeId: string): string =>

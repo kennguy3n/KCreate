@@ -688,9 +688,12 @@ export interface ResourceLimits {
   /// low-resource halving on top — that would double-discount.
   visionModelMaxMb: number;
   /// `Debug` form of the host `Platform` enum
-  /// (`"MacOsAppleSilicon"`, `"Linux"`, `"Windows"`, …). The
-  /// ModelManager uses this — NOT `deviceTier` — to gate MLX-only
-  /// packs onto Apple Silicon.
+  /// (`"MacOsAppleSilicon"`, `"Linux"`, `"Windows"`, …). Phase 12
+  /// removed the MLX sidecar so this is no longer used to gate
+  /// `_mlx`-suffixed packs (the registry no longer ships any),
+  /// but the field stays in the wire shape because a future
+  /// platform-aware optimisation (e.g. a Vulkan-only image gen
+  /// pack) will need it again.
   platform: string;
 }
 
@@ -4234,7 +4237,12 @@ export interface KChatBackendBridge {
 /** Mirror of `kcreate_bridge::phase4::VisionStatusInfo`. */
 export interface VisionStatus {
   state: "stopped" | "starting" | "ready" | "error";
-  runtime: "llama_server" | "mlx_lm" | null;
+  // Phase 12 collapsed the vision dispatcher down to a single
+  // runtime (`llama_server`). The field is retained — typed as a
+  // string union to preserve forward-compat — so a future
+  // Rust-native runtime can extend the variant set without
+  // requiring every renderer caller to be re-typed.
+  runtime: "llama_server" | null;
   port: number | null;
   modelName: string | null;
   error: string | null;
@@ -4288,11 +4296,10 @@ export interface GeneratedImage {
 }
 
 /**
- * Vision (VLM) bridge. Runs a multimodal sidecar (llama-server with
- * an mmproj projector, or `python3 -m mlx_lm.server` on Apple
- * Silicon) on loopback and exposes describe / alt-text / critique
- * operations. Soft-gated: available on every tier, but the
- * dispatcher picks model size by `RuntimeConfig`.
+ * Vision (VLM) bridge. Runs a multimodal sidecar (llama-server
+ * with an mmproj projector) on loopback and exposes describe /
+ * alt-text / critique operations. Soft-gated: available on every
+ * tier, but the dispatcher picks model size by `RuntimeConfig`.
  */
 export interface VisionBridge {
   start(packId: string): Promise<number>;

@@ -18,6 +18,7 @@ pub mod color_range;
 pub mod denoise;
 pub mod design_critique;
 pub mod design_tokens_vlm;
+pub mod diffusion_sidecar;
 pub mod glyph_extract;
 pub mod iconify;
 pub mod image_gen;
@@ -25,7 +26,6 @@ pub mod inpaint;
 pub mod layout_suggest;
 pub mod llm_chat;
 pub mod llm_sidecar;
-pub mod mlx_sidecar;
 pub mod model_registry;
 pub mod ocr;
 pub mod one_pager;
@@ -68,13 +68,13 @@ pub use layout_suggest::{
     suggest_layout_grouping, Bounds as LayoutBounds, LayoutAlignment, LayoutNode,
     LayoutOrientation, LayoutSuggestError, LayoutSuggestOptions, LayoutSuggestion,
 };
+pub use diffusion_sidecar::{DiffusionSidecar, DiffusionSidecarConfig};
 pub use llm_chat::{
     build_system_prompt, build_tool_call_system_prompt, chat_completion,
     chat_completion_with_token, parse_completion, request_tool_call, ChatContent, ChatError,
     ChatMessage, ChatRequest, ChatResponse, ChatResult, ChatRole, ContentPart,
 };
 pub use llm_sidecar::{LlmSidecar, SidecarConfig, SidecarError, SidecarResult, SidecarStatus};
-pub use mlx_sidecar::{probe_mlx_available, MlxSidecar, MlxSidecarConfig};
 pub use model_registry::{
     install_model_pack, is_installed, list_model_packs, mmproj_for, pack_path,
     recommended_generation_pack, recommended_llm_pack, recommended_vision_pack,

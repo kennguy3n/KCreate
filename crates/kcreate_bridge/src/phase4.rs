@@ -28,10 +28,10 @@ use kcreate_ai::{
     brand_extract::{extract_brand_from_image, BrandExtraction},
     design_critique::critique_design,
     design_tokens_vlm::{suggest_design_tokens, DesignTokenSuggestion},
-    image_gen::{generate_image, ImageGenConfig, ImageGenError, ImageGenRequest, ImageGenSidecar},
+    diffusion_sidecar::{DiffusionSidecar, DiffusionSidecarConfig},
+    image_gen::{generate_image, ImageGenError, ImageGenRequest},
     llm_sidecar::{LlmSidecar, SidecarConfig, SidecarError, SidecarStatus},
-    mlx_sidecar::{probe_mlx_available, MlxSidecar, MlxSidecarConfig},
-    model_registry::{list_model_packs, mmproj_for, recommended_vision_pack},
+    model_registry::{list_model_packs, recommended_vision_pack},
     sidecar_dispatcher::{plan_dispatch, DispatchPlan, SidecarRuntime},
     smart_crop::{suggest_crop, CropSuggestion},
     style_describe::{describe_style, StyleDescription},
@@ -79,19 +79,21 @@ pub type Phase4Result<T> = std::result::Result<T, Phase4BridgeError>;
 // without paying 5 GB of RAM each time they describe an image.
 // -----------------------------------------------------------------------------
 
-/// Variant of the live vision sidecar, mirroring
-/// `kcreate_ai::sidecar_dispatcher::SidecarHandle` but kept inside
-/// the bridge so we can hand out non-`'static` borrows safely.
+/// Variant of the live vision sidecar. Phase 12 collapsed this down
+/// to a single backend (llama-server) when the MLX path was
+/// removed, but we keep the wrapper enum so a future Rust-native
+/// inference engine can slot in without rewriting the bridge's
+/// vision lifecycle code. The serializer therefore still reports a
+/// `runtime` string (`"llama_server"`) so the renderer's existing
+/// `VisionStatus.runtime` field doesn't break.
 enum VisionHandle {
     Llama(LlmSidecar),
-    Mlx(MlxSidecar),
 }
 
 impl VisionHandle {
     fn status(&self) -> SidecarStatus {
         match self {
             Self::Llama(s) => s.status(),
-            Self::Mlx(s) => s.status(),
         }
     }
 
@@ -105,14 +107,12 @@ impl VisionHandle {
     fn stop(&mut self) {
         match self {
             Self::Llama(s) => s.stop(),
-            Self::Mlx(s) => s.stop(),
         }
     }
 
     fn runtime(&self) -> SidecarRuntime {
         match self {
             Self::Llama(_) => SidecarRuntime::LlamaServer,
-            Self::Mlx(_) => SidecarRuntime::MlxLm,
         }
     }
 }
@@ -140,11 +140,11 @@ pub struct VisionStatusInfo {
     pub error: Option<String>,
 }
 
-/// Start a vision sidecar for `pack_id`. Looks up the model + (for
-/// llama-server vision) its mmproj companion in the registry,
-/// resolves them under the user's models directory, and spawns the
-/// appropriate runtime — MLX when the pack id ends in `_mlx` AND the
-/// host can run it, llama-server otherwise.
+/// Start a vision sidecar for `pack_id`. Looks up the model and its
+/// mmproj companion in the registry, resolves them under the user's
+/// models directory, and spawns llama-server with `--mmproj` so
+/// vision-language models accept `image_url` content parts on the
+/// OpenAI-compatible chat API.
 ///
 /// Returns the listening port **immediately**, before the health
 /// check completes — the underlying sidecar runs its probe loop on
@@ -157,8 +157,7 @@ pub struct VisionStatusInfo {
 pub fn vision_start(pack_id: String) -> Phase4Result<u16> {
     let models_dir = models_root();
     let platform = runtime_slot().lock().platform;
-    let plan = plan_dispatch(&pack_id, &models_dir, platform, probe_mlx_available())
-        .map_err(Phase4BridgeError::Sidecar)?;
+    let plan = plan_dispatch(&pack_id, &models_dir, platform).map_err(Phase4BridgeError::Sidecar)?;
     let mut guard = vision_slot().lock();
     // Stop the previous sidecar first — never run two side-by-side,
     // they'd both hold mmproj + model weights and OOM a tight box.
@@ -194,7 +193,6 @@ pub fn vision_status() -> VisionStatusInfo {
         Some(h) => {
             let runtime = match h.runtime() {
                 SidecarRuntime::LlamaServer => "llama_server",
-                SidecarRuntime::MlxLm => "mlx_lm",
             };
             match h.status() {
                 SidecarStatus::Stopped => VisionStatusInfo {
@@ -233,9 +231,9 @@ pub fn vision_status() -> VisionStatusInfo {
 }
 
 /// Spawn the underlying sidecar. Returns the handle paired with the
-/// listening port. `start()` on both runtimes is non-blocking — it
-/// reserves the port, forks the child, and hands off health probing
-/// to a background thread. Callers observe readiness via
+/// listening port. `start()` is non-blocking — it reserves the port,
+/// forks the llama-server child, and hands off health probing to a
+/// background thread. Callers observe readiness via
 /// [`vision_status`].
 fn spawn_vision(plan: &DispatchPlan) -> Phase4Result<(VisionHandle, u16)> {
     match plan.runtime {
@@ -248,18 +246,6 @@ fn spawn_vision(plan: &DispatchPlan) -> Phase4Result<(VisionHandle, u16)> {
             let mut s = LlmSidecar::new(cfg);
             let port = s.start().map_err(Phase4BridgeError::Sidecar)?;
             Ok((VisionHandle::Llama(s), port))
-        }
-        SidecarRuntime::MlxLm => {
-            let cfg = MlxSidecarConfig {
-                python: PathBuf::from("python3"),
-                model_path: plan.model_path.clone(),
-                context_size: 4096,
-                health_timeout: std::time::Duration::from_secs(90),
-                extra_args: vec![],
-            };
-            let mut s = MlxSidecar::new(cfg);
-            let port = s.start().map_err(Phase4BridgeError::Sidecar)?;
-            Ok((VisionHandle::Mlx(s), port))
         }
     }
 }
@@ -408,20 +394,21 @@ pub fn vision_recommended_pack() -> Option<String> {
 }
 
 /// Inverse lookup convenience for the renderer: given a vision pack
-/// id, return the mmproj companion's id (or `None` for MLX packs).
+/// id, return the mmproj companion's id (or `None` if the pack has
+/// no companion projector — e.g. a text-only LLM pack).
 pub fn vision_mmproj_for(pack_id: String) -> Option<String> {
-    mmproj_for(&pack_id).map(str::to_string)
+    kcreate_ai::model_registry::mmproj_for(&pack_id).map(str::to_string)
 }
 
 /// List the packs the renderer is allowed to show in the vision
-/// section of the Model Manager. Filters MLX packs off non-Apple
-/// hosts, and clips by [`crate::runtime_slot`]'s vision ceiling.
+/// section of the Model Manager. Clips by
+/// [`crate::runtime_slot`]'s vision ceiling. Phase 12 removed the
+/// `is_apple_silicon` MLX-filter branch — every vision pack now
+/// runs on llama-server, so the renderer shows the same set on
+/// every host.
 pub fn vision_listable_packs() -> Vec<String> {
     let dir = models_root();
-    let cfg = runtime_slot().lock();
-    let cap_mb = cfg.effective_vision_model_mb();
-    let platform = cfg.platform;
-    drop(cfg);
+    let cap_mb = runtime_slot().lock().effective_vision_model_mb();
     list_model_packs(&dir)
         .into_iter()
         .filter(|p| {
@@ -438,14 +425,6 @@ pub fn vision_listable_packs() -> Vec<String> {
             p.capabilities.iter().any(|c| c == "vision")
                 && !p.capabilities.iter().any(|c| c == "mmproj")
         })
-        .filter(|p| {
-            // MLX packs only on Apple Silicon.
-            if p.id.ends_with("_mlx") {
-                matches!(platform, kcreate_core::config::Platform::MacOsAppleSilicon)
-            } else {
-                true
-            }
-        })
         .filter(|p| (p.size_bytes / (1024 * 1024)) <= cap_mb)
         .map(|p| p.id)
         .collect()
@@ -455,9 +434,21 @@ pub fn vision_listable_packs() -> Vec<String> {
 // Image generation sidecar
 // -----------------------------------------------------------------------------
 
-fn image_gen_slot() -> &'static Mutex<Option<ImageGenSidecar>> {
-    static SLOT: OnceLock<Mutex<Option<ImageGenSidecar>>> = OnceLock::new();
+fn image_gen_slot() -> &'static Mutex<Option<DiffusionSidecar>> {
+    static SLOT: OnceLock<Mutex<Option<DiffusionSidecar>>> = OnceLock::new();
     SLOT.get_or_init(|| Mutex::new(None))
+}
+
+/// Resolve the sd-server binary path. Phase 12 ships a single env
+/// var, `KCREATE_SD_SERVER_BINARY`, that points at an absolute path
+/// to the stable-diffusion.cpp `sd-server` executable. When unset,
+/// we fall back to the bare name `"sd-server"` and rely on the OS
+/// PATH — the same fallback `llm_sidecar` uses for `llama-server`.
+/// Mirrors the existing `KCREATE_MODELS_DIR` / `KCREATE_PLUGIN_DIR`
+/// env-var override pattern in `phase2.rs`.
+fn sd_server_binary() -> PathBuf {
+    std::env::var_os("KCREATE_SD_SERVER_BINARY")
+        .map_or_else(|| PathBuf::from("sd-server"), PathBuf::from)
 }
 
 /// Wire shape for the image-generation sidecar status. Mirrors
@@ -497,7 +488,7 @@ pub fn image_gen_start(pack_id: String) -> Phase4Result<u16> {
     }
     let model_path = dir.join(&pack.file_path);
     // Take the slot lock and stop any existing sidecar *before*
-    // spawning the new Python child. Diffusion weights are large
+    // spawning the new sd-server child. Diffusion weights are large
     // enough (FLUX.2-Klein-4B is ~2.5 GB on a GPU) that we never
     // want two copies resident, even briefly, on a Tier-2 box.
     let mut guard = image_gen_slot().lock();
@@ -505,16 +496,42 @@ pub fn image_gen_start(pack_id: String) -> Phase4Result<u16> {
         prev.stop();
     }
     *guard = None;
-    let mut sidecar = ImageGenSidecar::new(ImageGenConfig {
-        python: PathBuf::from("python3"),
-        host_python_module: "kcreate_diffusion.server".into(),
+    let cfg = DiffusionSidecarConfig {
+        binary: sd_server_binary(),
         model_path,
         health_timeout: std::time::Duration::from_mins(2),
-        extra_args: vec![],
-    });
+        // FLUX builds need supplementary text-encoder / VAE paths.
+        // Phase 12 leaves the registry shipping the single fused
+        // pack `image_gen_flux_klein_4b`; users who load a
+        // standalone FLUX checkpoint pass component paths through
+        // `KCREATE_SD_SERVER_EXTRA_ARGS` (space-separated, parsed
+        // shell-style — see `parse_sd_server_extra_args`).
+        extra_args: parse_sd_server_extra_args(),
+    };
+    let mut sidecar = DiffusionSidecar::new(cfg);
     let port = sidecar.start().map_err(Phase4BridgeError::Sidecar)?;
     *guard = Some(sidecar);
     Ok(port)
+}
+
+/// Parse the `KCREATE_SD_SERVER_EXTRA_ARGS` env var into an argv
+/// slice that gets forwarded to sd-server. The env var is a
+/// space-separated list of tokens; quoting and escapes are NOT
+/// supported because every flag sd-server accepts is either a
+/// hyphenated long-flag or a path that callers can avoid spaces in.
+/// Empty / unset => no extra args.
+///
+/// Example:
+///   KCREATE_SD_SERVER_EXTRA_ARGS="--clip_l /m/clip.sft --t5xxl /m/t5.sft --vae /m/ae.sft"
+fn parse_sd_server_extra_args() -> Vec<String> {
+    std::env::var("KCREATE_SD_SERVER_EXTRA_ARGS")
+        .ok()
+        .map(|s| {
+            s.split_whitespace()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
 }
 
 /// Stop the image-generation sidecar. Idempotent.
@@ -743,16 +760,25 @@ mod tests {
         let _ = listed;
     }
 
-    /// Dispatch reasons round-trip through the bridge — used by the
-    /// renderer's "Why is MLX unavailable?" affordance.
+    /// Dispatch reasons round-trip through the bridge. Phase 12
+    /// collapsed the MLX-fallback variants and left a single
+    /// `LlamaServer` reason, but we still exercise it here so a
+    /// future addition of a Rust-native runtime is caught in this
+    /// test rather than at the UI surface.
     #[test]
     fn dispatch_reason_variants_are_exhaustive() {
         use kcreate_ai::sidecar_dispatcher::DispatchReason;
-        for r in [
-            DispatchReason::LlamaServer,
-            DispatchReason::MlxNative,
-            DispatchReason::MlxUnavailableFallback,
-        ] {
+        // Phase 12 collapsed every MLX dispatch branch into the
+        // single `LlamaServer` reason; the loop shape here is
+        // intentional so a future Rust-native runtime variant
+        // (or any other variant added to `DispatchReason`) shows
+        // up as a missing match arm in this test rather than at
+        // the UI surface. `clippy::single_element_loop` would
+        // rather we expanded to a single binding, but that
+        // would silently accept future additions — keep the
+        // loop and allow the lint at the call site.
+        #[allow(clippy::single_element_loop)]
+        for r in [DispatchReason::LlamaServer] {
             let _ = format!("{r:?}");
         }
     }

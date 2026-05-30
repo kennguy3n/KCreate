@@ -50,7 +50,7 @@ See [`PROPOSAL.md`](./PROPOSAL.md) for the full product spec.
 | GPU rendering        | wgpu (Metal / D3D12 / Vulkan / OpenGL)                       |
 | CPU rendering        | `tiny-skia` (real software rasterizer, not a placeholder)    |
 | Persistence          | SQLite + content-addressed blob store (BLAKE3)               |
-| Local AI             | `llama.cpp` (LLM + Vision-LLM + FLUX image-gen) / MLX (Apple Silicon) / ONNX Runtime (loopback sidecars; never network) |
+| Local AI             | `llama.cpp` (LLM + Vision-LLM) + `stable-diffusion.cpp` (FLUX image-gen) + ONNX Runtime (loopback sidecars; never network; zero Python) |
 | In-process AI        | Lanczos3 upscale, k-means palette, BFS smart-select, Sobel + CCA screenshot-to-layout, alt-text statistics |
 | Vision actions       | design critique, alt-text, brand / palette / spacing extraction, content-aware crop, design-token + style description, smart layer naming (all GBNF-constrained) |
 | Vector math          | `kurbo`, `i_overlay`, `rstar`                                |
@@ -83,7 +83,7 @@ See [`ARCHITECTURE.md`](./ARCHITECTURE.md) for the technical design.
 
 | Platform | Architectures | Notes |
 | --- | --- | --- |
-| macOS  | Intel + Apple Silicon | Metal backend on wgpu; MLX vision/image-gen sidecars available on Apple Silicon. |
+| macOS  | Intel + Apple Silicon | Metal backend on wgpu; llama.cpp + sd.cpp ship with native Metal acceleration on Apple Silicon (no MLX or Python required — see Phase 12). |
 | Windows | x64 | D3D12 backend on wgpu. |
 | Linux  | x64 + arm64 | Vulkan backend on wgpu (mesa ≥ 22 or proprietary drivers). `fontconfig` is required at runtime for system-font discovery; the build script vendors `fontconfig-sys`. **Wayland support: graceful fallback** — if the compositor refuses a window surface (no XDG/X11 bridge), the renderer transparently switches to its offscreen path so the canvas still renders. X11 (`xcb`) is the recommended display server for end users. |
 
@@ -198,8 +198,8 @@ KCreate/
 │   ├── kcreate_ai/               Local AI: bg-removal (threshold + ONNX u2net), LLM sidecar,
 │   │                              Lanczos upscale, k-means palette, BFS smart-select, model
 │   │                              pack registry, screenshot-to-layout, multimodal chat,
-│   │                              vision sidecar + MLX sidecar dispatcher, FLUX image-gen
-│   │                              sidecar, design critique / brand / crop / token / style
+│   │                              vision sidecar dispatcher (llama-server), sd.cpp image-gen
+│   │                              sidecar (`diffusion_sidecar.rs`), design critique / brand / crop / token / style
 │   ├── kcreate_mcp/              Loopback-only MCP server (3 tools) + permission store
 │   │                              (Once / Always / Denied)
 │   ├── kcreate_plugin/           WASM plugin sandbox (wasmi 0.42, deny-by-default host ABI;
@@ -225,9 +225,6 @@ KCreate/
 │   │                              collab lifecycle events. Separate SQLite DB so audit
 │   │                              history survives project close/delete.
 │   └── kcreate_tests/            Cross-crate integration tests
-├── tools/
-│   └── kcreate_diffusion/        Loopback Python diffusion sidecar (FLUX.2-Klein-4B,
-│                                  diffusers; spawned by `image_gen.rs`, never networked)
 ├── PROPOSAL.md                   Product specification
 ├── ARCHITECTURE.md               Technical architecture
 ├── PROGRESS.md                   Phase tracking

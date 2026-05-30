@@ -100,9 +100,6 @@ KCreate/
 │   │                        `kcreate_bridge::audit` + `AuditPanel.tsx`.
 │   └── kcreate_tests/       cross-crate integration tests (no library
 │                            surface — see tests/ subdir)
-├── tools/
-│   └── kcreate_diffusion/   loopback Python FLUX sidecar spawned by
-│                            kcreate_ai::image_gen — never networked.
 ├── apps/
 │   └── desktop/             Electron shell (main + preload + React renderer)
 │       ├── main/            main process (loads bridge.node via process.dlopen)
@@ -253,8 +250,9 @@ pnpm lint
 | PluginManager                            | `apps/desktop/renderer/src/components/PluginManager.tsx` |
 | McpSettingsPanel                         | `apps/desktop/renderer/src/components/McpSettingsPanel.tsx` |
 | ScreenshotToLayout                       | `apps/desktop/renderer/src/components/ScreenshotToLayout.tsx` |
-| Vision sidecar (VLM)                     | `crates/kcreate_ai/src/{vision_chat,mlx_sidecar,sidecar_dispatcher}.rs` |
-| Image generation sidecar                 | `crates/kcreate_ai/src/image_gen.rs` |
+| Vision sidecar (VLM)                     | `crates/kcreate_ai/src/{vision_chat,sidecar_dispatcher}.rs` |
+| Image generation HTTP client             | `crates/kcreate_ai/src/image_gen.rs` |
+| Diffusion (sd.cpp) sidecar lifecycle     | `crates/kcreate_ai/src/diffusion_sidecar.rs` |
 | Brand / crop / tokens / style / critique | `crates/kcreate_ai/src/{brand_extract,smart_crop,design_tokens_vlm,style_describe,design_critique}.rs` |
 | OCR text-region detection                | `crates/kcreate_ai/src/ocr.rs` |
 | VisionAssistSection                      | `apps/desktop/renderer/src/components/VisionAssistSection.tsx` |
@@ -266,7 +264,6 @@ pnpm lint
 | Transport wire codec                     | `crates/kcreate_collab_transport/src/wire.rs` |
 | Transport TLS cert bundle                | `crates/kcreate_collab_transport/src/cert.rs` |
 | Session bridge                           | `crates/kcreate_bridge/src/collab.rs` |
-| Diffusion sidecar                        | `tools/kcreate_diffusion/server.py` |
 | Phase 4 bridge surface                   | `crates/kcreate_bridge/src/phase4.rs` |
 | LLM bridge (lifecycle + chat)            | `crates/kcreate_bridge/src/llm.rs` |
 | Operation journal                        | `crates/kcreate_collab/src/journal.rs` |

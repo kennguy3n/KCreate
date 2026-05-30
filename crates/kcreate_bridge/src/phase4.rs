@@ -941,83 +941,135 @@ mod tests {
     // executors can't race the `set_var` / `remove_var` pair.
     // -------------------------------------------------------------
 
-    fn sd_args_test_lock() -> &'static parking_lot::Mutex<()> {
-        static LOCK: std::sync::OnceLock<parking_lot::Mutex<()>> = std::sync::OnceLock::new();
-        LOCK.get_or_init(|| parking_lot::Mutex::new(()))
-    }
+    /// Test-internal serialization of `KCREATE_SD_SERVER_EXTRA_ARGS`.
+    ///
+    /// Encapsulating the lock + guard in a private sub-module makes
+    /// the serialization invariant type-enforced rather than
+    /// convention-enforced: the only way to mutate the env var from
+    /// test code is through one of the two APIs this module exports
+    /// (`SdExtraArgsGuard::new` for the production path,
+    /// `with_locked_raw_env` for the panic test that exercises the
+    /// guard itself). External test code cannot reach the underlying
+    /// `parking_lot::Mutex` and therefore cannot accidentally bypass
+    /// the lock and torn-read the env var.
+    ///
+    /// If a future parser test needs raw env access for a reason
+    /// not covered by `SdExtraArgsGuard`, it must go through
+    /// `with_locked_raw_env` — there is no other way to construct
+    /// a locked critical section.
+    mod sd_extra_args_env {
+        /// Process-global env var manipulated by these tests. Kept
+        /// `pub(super)` so the tests can pass the same name into the
+        /// production parser without having to repeat the literal.
+        pub(super) const KEY: &str = "KCREATE_SD_SERVER_EXTRA_ARGS";
 
-    /// RAII guard for the `KCREATE_SD_SERVER_EXTRA_ARGS` test slot.
-    /// One construction acquires the global serializing mutex,
-    /// captures the prior env value, and installs the requested
-    /// scratch value. One drop restores the prior env value and then
-    /// releases the mutex.
-    ///
-    /// The whole point of bundling both responsibilities into a
-    /// single type is that the ordering invariant — *restore env
-    /// before releasing the mutex, so the next waiter sees a clean
-    /// starting state* — is enforced by the type's `Drop` impl, not
-    /// by a `let` declaration-order convention that a future
-    /// refactor could silently violate. Rust drops struct fields
-    /// *after* the user-supplied `Drop::drop` body runs, so the env
-    /// restore in `drop` always happens while `_lock` is still
-    /// alive, regardless of field declaration order.
-    ///
-    /// Used by [`with_sd_extra_args`] for the normal case and
-    /// directly by the panic-path test below. Both paths share the
-    /// same single ordering guarantee so the panic test is a
-    /// faithful proxy for the normal-return path.
-    ///
-    /// We rely on `parking_lot::Mutex` (workspace-wide already, see
-    /// `crates/kcreate_bridge/Cargo.toml`) specifically because it
-    /// does *not* poison on panic — if the body inside the guard
-    /// panics, the mutex remains usable for every subsequent test.
-    /// Swapping to `std::sync::Mutex` would silently make every
-    /// later parser test fail with a `PoisonError` after a single
-    /// failing test, which would mask the original failure.
-    struct SdExtraArgsGuard {
-        _lock: parking_lot::MutexGuard<'static, ()>,
-        prior: Option<std::ffi::OsString>,
-    }
+        /// Private serializing mutex. There is no accessor — every
+        /// path that acquires it must go through one of the
+        /// `pub(super)` APIs in this module, so the lock cannot
+        /// leak out to ad-hoc test code.
+        fn lock() -> &'static parking_lot::Mutex<()> {
+            static LOCK: std::sync::OnceLock<parking_lot::Mutex<()>> = std::sync::OnceLock::new();
+            LOCK.get_or_init(|| parking_lot::Mutex::new(()))
+        }
 
-    impl SdExtraArgsGuard {
-        /// Acquire the serializing mutex, snapshot the current
-        /// `KCREATE_SD_SERVER_EXTRA_ARGS`, and install `value` (or
-        /// unset the var when `value` is `None`).
-        fn new(value: Option<&str>) -> Self {
-            let lock = sd_args_test_lock().lock();
-            let prior = std::env::var_os("KCREATE_SD_SERVER_EXTRA_ARGS");
-            // SAFETY: cargo runs unit tests across multiple threads
-            // by default; `lock` makes this critical section
-            // single-writer, and every parser test that touches
-            // `KCREATE_SD_SERVER_EXTRA_ARGS` goes through this guard,
-            // so no other thread can observe a torn read or race
-            // against this write.
-            unsafe {
-                match value {
-                    Some(v) => std::env::set_var("KCREATE_SD_SERVER_EXTRA_ARGS", v),
-                    None => std::env::remove_var("KCREATE_SD_SERVER_EXTRA_ARGS"),
+        /// RAII guard for the `KCREATE_SD_SERVER_EXTRA_ARGS` test slot.
+        /// One construction acquires the global serializing mutex,
+        /// captures the prior env value, and installs the requested
+        /// scratch value. One drop restores the prior env value and
+        /// then releases the mutex.
+        ///
+        /// The whole point of bundling both responsibilities into a
+        /// single type is that the ordering invariant — *restore env
+        /// before releasing the mutex, so the next waiter sees a clean
+        /// starting state* — is enforced by the type's `Drop` impl, not
+        /// by a `let` declaration-order convention that a future
+        /// refactor could silently violate. Rust drops struct fields
+        /// *after* the user-supplied `Drop::drop` body runs, so the env
+        /// restore in `drop` always happens while `_lock` is still
+        /// alive, regardless of field declaration order.
+        ///
+        /// Used by `with_sd_extra_args` for the normal case and by
+        /// the panic-path test below (via [`with_locked_raw_env`] for
+        /// its setup/teardown plumbing). Both paths share the same
+        /// single ordering guarantee so the panic test is a faithful
+        /// proxy for the normal-return path.
+        ///
+        /// We rely on `parking_lot::Mutex` (workspace-wide already,
+        /// see `crates/kcreate_bridge/Cargo.toml`) specifically
+        /// because it does *not* poison on panic — if the body inside
+        /// the guard panics, the mutex remains usable for every
+        /// subsequent test. Swapping to `std::sync::Mutex` would
+        /// silently make every later parser test fail with a
+        /// `PoisonError` after a single failing test, which would
+        /// mask the original failure.
+        pub(super) struct SdExtraArgsGuard {
+            _lock: parking_lot::MutexGuard<'static, ()>,
+            prior: Option<std::ffi::OsString>,
+        }
+
+        impl SdExtraArgsGuard {
+            /// Acquire the serializing mutex, snapshot the current
+            /// `KCREATE_SD_SERVER_EXTRA_ARGS`, and install `value`
+            /// (or unset the var when `value` is `None`).
+            pub(super) fn new(value: Option<&str>) -> Self {
+                let lock = lock().lock();
+                let prior = std::env::var_os(KEY);
+                // SAFETY: cargo runs unit tests across multiple
+                // threads by default; `lock` makes this critical
+                // section single-writer, and every parser test that
+                // touches `KCREATE_SD_SERVER_EXTRA_ARGS` goes through
+                // this guard (or `with_locked_raw_env`), so no other
+                // thread can observe a torn read or race against
+                // this write.
+                unsafe {
+                    match value {
+                        Some(v) => std::env::set_var(KEY, v),
+                        None => std::env::remove_var(KEY),
+                    }
+                }
+                Self { _lock: lock, prior }
+            }
+        }
+
+        impl Drop for SdExtraArgsGuard {
+            fn drop(&mut self) {
+                // SAFETY: `self._lock` is still alive at this point —
+                // Rust drops the struct's fields *after* the
+                // user-supplied `Drop::drop` body returns, so we
+                // still hold the serializing mutex while restoring
+                // the env var. The mutex then drops as a field on
+                // the way out, releasing the lock only *after* the
+                // restore is observable.
+                unsafe {
+                    match self.prior.take() {
+                        Some(v) => std::env::set_var(KEY, v),
+                        None => std::env::remove_var(KEY),
+                    }
                 }
             }
-            Self { _lock: lock, prior }
+        }
+
+        /// Escape hatch for the panic-unwind test that exercises
+        /// `SdExtraArgsGuard::drop` itself. Holds the serializing
+        /// mutex for the duration of `f` and releases it on the way
+        /// out (including on panic — `parking_lot` mutexes do not
+        /// poison, by design). The caller is responsible for any
+        /// `unsafe` env mutation inside `f`; this function only
+        /// provides the lock, not the env access.
+        ///
+        /// Do not use this in normal parser tests — use
+        /// `SdExtraArgsGuard::new` (via `with_sd_extra_args`)
+        /// instead. The only legitimate caller is the panic test
+        /// itself, which cannot use `SdExtraArgsGuard` recursively
+        /// because that would conflate "the thing under test" with
+        /// "the test harness".
+        pub(super) fn with_locked_raw_env<R>(f: impl FnOnce() -> R) -> R {
+            let _lock = lock().lock();
+            f()
         }
     }
 
-    impl Drop for SdExtraArgsGuard {
-        fn drop(&mut self) {
-            // SAFETY: `self._lock` is still alive at this point — Rust
-            // drops the struct's fields *after* the user-supplied
-            // `Drop::drop` body returns, so we still hold the
-            // serializing mutex while restoring the env var. The
-            // mutex then drops as a field on the way out, releasing
-            // the lock only *after* the restore is observable.
-            unsafe {
-                match self.prior.take() {
-                    Some(v) => std::env::set_var("KCREATE_SD_SERVER_EXTRA_ARGS", v),
-                    None => std::env::remove_var("KCREATE_SD_SERVER_EXTRA_ARGS"),
-                }
-            }
-        }
-    }
+    use sd_extra_args_env::{with_locked_raw_env, SdExtraArgsGuard};
 
     /// Helper: run `body` with `KCREATE_SD_SERVER_EXTRA_ARGS` forced
     /// to `value` (or unset when `None`), then restore whatever the
@@ -1074,25 +1126,22 @@ mod tests {
         // unconditionally unsetting and clobbering a pre-existing
         // caller-set value — e.g. a developer running this test
         // with `KCREATE_SD_SERVER_EXTRA_ARGS=foo cargo test`).
-        let process_prior = {
-            let _capture = sd_args_test_lock().lock();
-            std::env::var_os("KCREATE_SD_SERVER_EXTRA_ARGS")
-        };
+        let process_prior = with_locked_raw_env(|| std::env::var_os(sd_extra_args_env::KEY));
 
         // Step 1: install SENTINEL as the "prior" state. Hold the
         // mutex only for the write itself so the catch_unwind body
         // below can re-acquire it without deadlocking (parking_lot
         // mutexes are non-reentrant).
-        {
-            let _setup = sd_args_test_lock().lock();
-            // SAFETY: mutex held; only this test mutates the env var
-            // inside this critical section, and any concurrent
-            // parser test goes through `SdExtraArgsGuard` which
+        with_locked_raw_env(|| {
+            // SAFETY: mutex held via `with_locked_raw_env`; only
+            // this test mutates the env var inside this critical
+            // section, and any concurrent parser test goes through
+            // `SdExtraArgsGuard` (or `with_locked_raw_env`) which
             // would block on the same mutex.
             unsafe {
-                std::env::set_var("KCREATE_SD_SERVER_EXTRA_ARGS", SENTINEL);
+                std::env::set_var(sd_extra_args_env::KEY, SENTINEL);
             }
-        }
+        });
 
         // Step 2: panic inside an `SdExtraArgsGuard`.
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -1102,7 +1151,7 @@ mod tests {
             // because the prior value was never overridden in the
             // first place.
             assert_eq!(
-                std::env::var("KCREATE_SD_SERVER_EXTRA_ARGS").as_deref(),
+                std::env::var(sd_extra_args_env::KEY).as_deref(),
                 Ok("--inner /tmp/should-be-restored"),
                 "guard must install the scratch value before body runs",
             );
@@ -1129,20 +1178,23 @@ mod tests {
         // SENTINEL, and restore the truly-prior process value
         // captured at Step 0 so this test leaves the env exactly
         // the way it found it.
-        let _teardown = sd_args_test_lock().lock();
-        let restored = std::env::var_os("KCREATE_SD_SERVER_EXTRA_ARGS");
-        // SAFETY: mutex held.
-        unsafe {
-            match process_prior {
-                Some(v) => std::env::set_var("KCREATE_SD_SERVER_EXTRA_ARGS", v),
-                None => std::env::remove_var("KCREATE_SD_SERVER_EXTRA_ARGS"),
+        with_locked_raw_env(|| {
+            let restored = std::env::var_os(sd_extra_args_env::KEY);
+            // SAFETY: mutex held via `with_locked_raw_env`.
+            unsafe {
+                match process_prior {
+                    Some(ref v) => {
+                        std::env::set_var(sd_extra_args_env::KEY, v);
+                    }
+                    None => std::env::remove_var(sd_extra_args_env::KEY),
+                }
             }
-        }
-        assert_eq!(
-            restored.as_deref(),
-            Some(std::ffi::OsStr::new(SENTINEL)),
-            "SdExtraArgsGuard::drop must restore prior env value on panic unwind",
-        );
+            assert_eq!(
+                restored.as_deref(),
+                Some(std::ffi::OsStr::new(SENTINEL)),
+                "SdExtraArgsGuard::drop must restore prior env value on panic unwind",
+            );
+        });
     }
 
     /// Unset env var => empty argv.

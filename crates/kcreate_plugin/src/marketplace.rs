@@ -266,10 +266,38 @@ fn stage_from_dir(source: &Path, plugin_root: &Path) -> Result<PathBuf, Marketpl
     Ok(dest)
 }
 
+/// Remove orphaned `.staging-*` directories under `plugin_root`.
+/// A previous install that crashed between extract and rename can
+/// leave behind a `.staging-{pid}` dir from a now-dead process.
+/// Called at the top of every install so disk usage stays bounded
+/// even across repeated crashes — leftovers from the *current*
+/// process are also cleared, which keeps the per-pid staging path
+/// safe to recreate immediately after.
+fn sweep_stale_staging(plugin_root: &Path) {
+    let Ok(entries) = fs::read_dir(plugin_root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.starts_with(".staging-") {
+            continue;
+        }
+        let path = entry.path();
+        if path.is_dir() {
+            let _ = fs::remove_dir_all(&path);
+        } else {
+            let _ = fs::remove_file(&path);
+        }
+    }
+}
+
 fn stage_from_zip(source: &Path, plugin_root: &Path) -> Result<PathBuf, MarketplaceError> {
     let file = fs::File::open(source)?;
     let mut archive = ZipArchive::new(file)?;
-    // First pass: find manifest.json and read its id.
+    // Sweep orphan staging dirs from prior crashed installs before
+    // claiming the per-pid staging path for this run.
+    sweep_stale_staging(plugin_root);
     let staging = plugin_root.join(format!(".staging-{}", std::process::id()));
     if staging.exists() {
         let _ = fs::remove_dir_all(&staging);
@@ -466,5 +494,52 @@ mod tests {
         mp.install_local(&src).unwrap();
         assert!(mp.remove("test.rm").unwrap());
         assert!(mp.list().unwrap().is_empty());
+    }
+
+    #[test]
+    fn sweep_stale_staging_removes_orphan_dirs() {
+        // Simulate a crashed install: a `.staging-<pid>` dir from
+        // a now-dead process is left behind in the plugin root.
+        // The sweep must reclaim it (and leave the real plugin
+        // directories untouched).
+        let plugins = TempDir::new().unwrap();
+        let root = plugins.path();
+        fs::create_dir_all(root).unwrap();
+        // Two orphan staging dirs (different pids) + one orphan
+        // staging file + one legitimate plugin dir.
+        let orphan_a = root.join(".staging-99991");
+        let orphan_b = root.join(".staging-99992");
+        let orphan_file = root.join(".staging-stray");
+        let real_plugin = root.join("real.plugin");
+        fs::create_dir_all(&orphan_a).unwrap();
+        fs::write(orphan_a.join("junk"), b"x").unwrap();
+        fs::create_dir_all(&orphan_b).unwrap();
+        fs::write(&orphan_file, b"y").unwrap();
+        fs::create_dir_all(&real_plugin).unwrap();
+        write_min_manifest(&real_plugin, "real.plugin").unwrap();
+
+        sweep_stale_staging(root);
+
+        assert!(!orphan_a.exists(), ".staging-99991 should be swept");
+        assert!(!orphan_b.exists(), ".staging-99992 should be swept");
+        assert!(!orphan_file.exists(), ".staging-stray should be swept");
+        assert!(
+            real_plugin.exists(),
+            "real plugin dir must not be touched by the sweep"
+        );
+    }
+
+    #[test]
+    fn sweep_stale_staging_is_idempotent_and_safe_on_missing_root() {
+        // Sweeping a directory that doesn't exist (e.g. before the
+        // first ever install) must not panic or error.
+        let plugins = TempDir::new().unwrap();
+        let missing = plugins.path().join("does-not-exist");
+        sweep_stale_staging(&missing); // no panic
+                                       // And sweeping an empty root is a no-op.
+        let empty = plugins.path().join("empty");
+        fs::create_dir_all(&empty).unwrap();
+        sweep_stale_staging(&empty);
+        assert!(empty.exists());
     }
 }

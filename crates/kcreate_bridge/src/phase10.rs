@@ -1292,6 +1292,14 @@ pub fn preferences_load() -> Result<Preferences> {
         .map_err(|e| DocumentBridgeError::Internal(format!("preferences parse: {e}")))
 }
 
+/// Persist `prefs_json` to the preferences file via an
+/// atomic write-temp-then-rename. The temp file lives in the
+/// same directory as the final preferences file so the rename
+/// is always within the same filesystem and is therefore atomic
+/// on POSIX (`rename(2)`) and near-atomic on Windows NTFS. A
+/// crash or power-loss mid-write leaves either the previous
+/// file intact or the new file fully written — never a partial
+/// file that `preferences_load` would have to recover from.
 pub fn preferences_save(prefs_json: &str) -> Result<()> {
     let parsed: Preferences =
         serde_json::from_str(prefs_json).map_err(|e| DocumentBridgeError::InvalidArgument {
@@ -1301,9 +1309,35 @@ pub fn preferences_save(prefs_json: &str) -> Result<()> {
     let path = preferences_path()?;
     let pretty = serde_json::to_string_pretty(&parsed)
         .map_err(|e| DocumentBridgeError::Internal(format!("preferences serialize: {e}")))?;
-    std::fs::write(&path, pretty)
-        .map_err(|e| DocumentBridgeError::Internal(format!("preferences write: {e}")))?;
+    let tmp = preferences_tmp_path(&path);
+    std::fs::write(&tmp, &pretty)
+        .map_err(|e| DocumentBridgeError::Internal(format!("preferences write (tmp): {e}")))?;
+    if let Err(e) = std::fs::rename(&tmp, &path) {
+        // Try to clean up the orphan tmp so the next save isn't
+        // misled by a stale file. Best-effort: rename failure is
+        // already the error we're returning to the caller.
+        let _ = std::fs::remove_file(&tmp);
+        return Err(DocumentBridgeError::Internal(format!(
+            "preferences rename: {e}"
+        )));
+    }
     Ok(())
+}
+
+/// Build the temp-file path used by `preferences_save`. Keeping
+/// the temp in the same directory as the destination is what
+/// makes the subsequent `rename` atomic — moving across
+/// filesystems would fall back to copy+delete and lose the
+/// atomicity guarantee.
+fn preferences_tmp_path(final_path: &std::path::Path) -> std::path::PathBuf {
+    let mut name = final_path.file_name().map_or_else(
+        || std::ffi::OsString::from("preferences.json"),
+        std::ffi::OsStr::to_os_string,
+    );
+    name.push(format!(".tmp-{}", std::process::id()));
+    final_path
+        .parent()
+        .map_or_else(|| std::path::PathBuf::from(&name), |p| p.join(&name))
 }
 
 // ---------------------------------------------------------------------------
@@ -1344,5 +1378,23 @@ mod tests {
     fn scale_to_fit_caps_longest_side() {
         assert_eq!(scale_to_fit(2000, 1000, 1024), (1024, 512));
         assert_eq!(scale_to_fit(500, 500, 1024), (500, 500));
+    }
+
+    #[test]
+    fn preferences_tmp_path_is_sibling_of_final_path() {
+        // The temp path MUST live next to the final path so the
+        // subsequent `rename` is on the same filesystem and is
+        // therefore atomic on POSIX. A temp on a different
+        // filesystem would fall back to copy+delete and lose
+        // atomicity.
+        let final_path = std::path::PathBuf::from("/home/user/.kcreate/preferences.json");
+        let tmp = preferences_tmp_path(&final_path);
+        assert_eq!(tmp.parent(), final_path.parent());
+        let tmp_name = tmp.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(tmp_name.starts_with("preferences.json.tmp-"));
+        // pid suffix uniquifies the temp so two concurrent processes
+        // don't clobber each other mid-write.
+        let pid = std::process::id().to_string();
+        assert!(tmp_name.ends_with(&pid));
     }
 }

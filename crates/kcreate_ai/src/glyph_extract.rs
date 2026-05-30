@@ -164,9 +164,8 @@ pub fn extract_glyph(
     let mut sum_y = 0u64;
     let total_px = (cw as usize) * (ch as usize);
     for chunk in cropped.chunks(4) {
-        let y = 0.299 * f32::from(chunk[0])
-            + 0.587 * f32::from(chunk[1])
-            + 0.114 * f32::from(chunk[2]);
+        let y =
+            0.299 * f32::from(chunk[0]) + 0.587 * f32::from(chunk[1]) + 0.114 * f32::from(chunk[2]);
         sum_y += y as u64;
     }
     let mean_y = sum_y as f32 / total_px as f32;
@@ -225,12 +224,7 @@ pub fn extract_glyph(
             closed: p.closed,
         })
         .collect();
-    let bbox = (
-        0.0,
-        0.0,
-        span_x * scale,
-        span_y * scale,
-    );
+    let bbox = (0.0, 0.0, span_x * scale, span_y * scale);
     let metrics = GlyphMetrics::standard(opts.em_size);
     Ok(ExtractedGlyph {
         paths: normalized,

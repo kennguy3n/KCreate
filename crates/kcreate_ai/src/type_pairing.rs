@@ -162,28 +162,76 @@ fn contains_any(s: &str, needles: &[&str]) -> bool {
 fn candidates_for(cat: FontCategory) -> Vec<TypePairingSuggestion> {
     match cat {
         FontCategory::Serif => vec![
-            sug("Inter", "Modern sans pairs cleanly with a classic serif heading", 0.9),
-            sug("Helvetica Neue", "Neutral, ubiquitous body font for serif headings", 0.85),
-            sug("Source Sans 3", "Open-source sans with excellent legibility under serifs", 0.8),
+            sug(
+                "Inter",
+                "Modern sans pairs cleanly with a classic serif heading",
+                0.9,
+            ),
+            sug(
+                "Helvetica Neue",
+                "Neutral, ubiquitous body font for serif headings",
+                0.85,
+            ),
+            sug(
+                "Source Sans 3",
+                "Open-source sans with excellent legibility under serifs",
+                0.8,
+            ),
         ],
         FontCategory::SansSerif => vec![
-            sug("Source Serif 4", "Adobe's open-source companion serif for sans headings", 0.9),
-            sug("Lora", "Friendly humanist serif body, pairs with geometric sans", 0.85),
-            sug("Georgia", "Web-standard serif, high readability at small sizes", 0.8),
+            sug(
+                "Source Serif 4",
+                "Adobe's open-source companion serif for sans headings",
+                0.9,
+            ),
+            sug(
+                "Lora",
+                "Friendly humanist serif body, pairs with geometric sans",
+                0.85,
+            ),
+            sug(
+                "Georgia",
+                "Web-standard serif, high readability at small sizes",
+                0.8,
+            ),
         ],
         FontCategory::Monospace => vec![
-            sug("Inter", "Geometric sans contrasts with monospace headings", 0.9),
-            sug("Roboto", "Clean, neutral body for code-style headings", 0.85),
+            sug(
+                "Inter",
+                "Geometric sans contrasts with monospace headings",
+                0.9,
+            ),
+            sug(
+                "Roboto",
+                "Clean, neutral body for code-style headings",
+                0.85,
+            ),
             sug("IBM Plex Sans", "Same superfamily as IBM Plex Mono", 0.8),
         ],
         FontCategory::Display => vec![
-            sug("Inter", "Neutral sans lets the display heading dominate", 0.9),
-            sug("Source Sans 3", "Open-source workhorse that won't compete with display type", 0.85),
-            sug("Noto Sans", "Wide language coverage for display-heavy designs", 0.8),
+            sug(
+                "Inter",
+                "Neutral sans lets the display heading dominate",
+                0.9,
+            ),
+            sug(
+                "Source Sans 3",
+                "Open-source workhorse that won't compete with display type",
+                0.85,
+            ),
+            sug(
+                "Noto Sans",
+                "Wide language coverage for display-heavy designs",
+                0.8,
+            ),
         ],
         FontCategory::Script => vec![
             sug("Lora", "Friendly serif balances script headings", 0.9),
-            sug("Source Serif 4", "Refined serif that complements handwritten type", 0.85),
+            sug(
+                "Source Serif 4",
+                "Refined serif that complements handwritten type",
+                0.85,
+            ),
             sug("Georgia", "Approachable serif anchor for script", 0.8),
         ],
     }
@@ -220,9 +268,11 @@ mod tests {
         let r = suggest_type_pairing("Inter").unwrap();
         assert_eq!(r.heading_category, "sans_serif");
         // Sans heading → serif body candidate first.
-        assert!(r.suggestions[0].font_name.contains("Serif")
-            || r.suggestions[0].font_name == "Lora"
-            || r.suggestions[0].font_name == "Georgia");
+        assert!(
+            r.suggestions[0].font_name.contains("Serif")
+                || r.suggestions[0].font_name == "Lora"
+                || r.suggestions[0].font_name == "Georgia"
+        );
     }
 
     #[test]

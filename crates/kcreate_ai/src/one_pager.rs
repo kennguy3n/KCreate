@@ -20,9 +20,11 @@ pub enum OnePagerPageSize {
     #[default]
     A4,
     Square,
-    Custom { width: u32, height: u32 },
+    Custom {
+        width: u32,
+        height: u32,
+    },
 }
-
 
 impl OnePagerPageSize {
     /// Return the page's dimensions in pixels (assuming 96 DPI).
@@ -269,11 +271,8 @@ mod tests {
 
     #[test]
     fn markdown_heading_marks_stripped() {
-        let r = brief_to_one_pager(
-            "## Hello world\nbody",
-            BriefToOnePagerOptions::default(),
-        )
-        .unwrap();
+        let r =
+            brief_to_one_pager("## Hello world\nbody", BriefToOnePagerOptions::default()).unwrap();
         assert_eq!(r.sections[0].text, "Hello world");
     }
 

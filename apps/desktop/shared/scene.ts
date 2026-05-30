@@ -5157,21 +5157,34 @@ export interface InpaintMaskRect {
   h: number;
 }
 
-/** Result of `aiMatchStroke`. */
-export interface StrokeMatchSummary {
-  source: StrokeProperties;
-  applied: Array<{
-    nodeId: string;
-    deltas: Record<string, unknown>;
-  }>;
-}
-
+/**
+ * Flattened stroke properties — wire-format mirror of
+ * `kcreate_ai::stroke_match::StrokeProperties` (`#[serde(rename_all = "camelCase")]`).
+ */
 export interface StrokeProperties {
-  widthPx: number;
-  dash: number[] | null;
+  /** `#RRGGBBAA` lowercase hex, matching the renderer convention. */
+  colorHex: string;
+  width: number;
+  /** Dash array; empty when the stroke is solid. */
+  dash: number[];
   cap: string;
   join: string;
-  color: [number, number, number, number];
+  /** `(t, width)` pairs describing a variable-width profile, or `null` for uniform. */
+  widthProfile: Array<[number, number]> | null;
+}
+
+/** Per-target record returned for each node that received the source's stroke. */
+export interface StrokeDeltaApplied {
+  targetNodeId: string;
+  /** `true` when the target had a previous stroke that got overwritten. */
+  hadPreviousStroke: boolean;
+}
+
+/** Result of `aiMatchStroke`. Mirror of Rust `StrokeMatchSummary`. */
+export interface StrokeMatchSummary {
+  sourceNodeId: string;
+  applied: StrokeDeltaApplied[];
+  sourceProperties: StrokeProperties;
 }
 
 /** Result of `aiExtractGlyph`. */
@@ -5205,17 +5218,26 @@ export type OnePagerSectionType =
   | "image_placeholder"
   | "callout";
 
+/**
+ * Mirror of Rust `kcreate_ai::one_pager::OnePagerSection`
+ * (`#[serde(rename_all = "camelCase")]`). Coordinates are flat —
+ * the Rust struct has `x`, `y`, `width`, `height` at the top level
+ * rather than nested under `bounds`.
+ */
 export interface OnePagerSection {
-  type: OnePagerSectionType;
+  sectionType: OnePagerSectionType;
   text: string;
-  bounds: { x: number; y: number; width: number; height: number };
+  x: number;
+  y: number;
+  width: number;
+  height: number;
 }
 
-/** Result of `aiBriefToOnePager`. */
+/** Result of `aiBriefToOnePager`. Mirror of Rust `BriefToOnePagerResult`. */
 export interface BriefToOnePagerResult {
-  pageSize: string;
   sections: OnePagerSection[];
-  brandKitSuggestion: string | null;
+  pageWidth: number;
+  pageHeight: number;
 }
 
 /** Harmony type for `aiHarmonizePalette`. */
@@ -5227,16 +5249,21 @@ export type HarmonyType =
   | "split_complementary"
   | "tetradic";
 
-export interface HarmonyDelta {
-  index: number;
-  fromHex: string;
-  toHex: string;
+/**
+ * Mirror of Rust `kcreate_ai::palette_harmonize::HarmonySuggestion`
+ * (`#[serde(rename_all = "camelCase")]`).
+ */
+export interface HarmonySuggestion {
+  inputHex: string;
+  suggestedHex: string;
+  hueShiftDegrees: number;
 }
 
+/** Mirror of Rust `HarmonyResult`. */
 export interface HarmonyResult {
-  rule: string;
-  deltas: HarmonyDelta[];
-  appliedToBrandKitId: string | null;
+  /** Serialized as snake_case (`HarmonyRule` uses `rename_all = "snake_case"`). */
+  rule: HarmonyType;
+  suggestions: HarmonySuggestion[];
 }
 
 /** Result of `aiSuggestTypePairing`. */
@@ -5246,9 +5273,11 @@ export interface TypePairingSuggestion {
   confidence: number;
 }
 
+/** Mirror of Rust `TypePairingResult` (`#[serde(rename_all = "camelCase")]`). */
 export interface TypePairingResult {
-  heading: string;
-  classification: string;
+  headingFont: string;
+  /** Heading-font classification — `serif` | `sans` | `mono` | `display` | `script`. */
+  headingCategory: string;
   suggestions: TypePairingSuggestion[];
 }
 
@@ -5301,16 +5330,33 @@ export interface AiImportSummary {
   svgPayloadBase64: string;
 }
 
-/** Result of `aiBrandToBrochure`. */
+/**
+ * Mirror of Rust `BrochureSection` in
+ * `kcreate_bridge::phase10` (`#[serde(rename_all = "camelCase")]`).
+ * Coordinates are flat (no nested `bounds`).
+ */
+export interface BrochureSection {
+  sectionKind: string;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  /** Hex string `#RRGGBB` of the brand-token applied to this section. */
+  styleColorHex: string | null;
+}
+
+/** Mirror of Rust `BrochurePage`. */
+export interface BrochurePage {
+  index: number;
+  /** `cover` | `content` | `back`. */
+  pageType: string;
+  sections: BrochureSection[];
+}
+
+/** Result of `aiBrandToBrochure`. Mirror of Rust `BrochurePlanResult`. */
 export interface BrochurePlanResult {
-  pages: Array<{
-    pageType: "cover" | "content" | "back";
-    sections: Array<{
-      type: string;
-      bounds: { x: number; y: number; width: number; height: number };
-      styleTokens: Record<string, string>;
-    }>;
-  }>;
+  pages: BrochurePage[];
+  brandKitId: string;
 }
 
 /** Listing returned by `pluginMarketplaceList`. */
@@ -5325,12 +5371,13 @@ export interface PluginListing {
   installed: boolean;
 }
 
-/** Result of `exportPdfMulti`. */
+/** Result of `exportPdfMulti`. Mirror of Rust `PdfMultiReport`. */
 export interface PdfMultiReport {
   pageCount: number;
   bytesWritten: number;
   tocEmitted: boolean;
-  bookmarksEmitted: number;
+  /** `true` when the bookmarks/outline tree was emitted. */
+  bookmarksEmitted: boolean;
 }
 
 /** Mirror of `kcreate_bridge::phase10::Preferences`. */

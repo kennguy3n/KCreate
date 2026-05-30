@@ -37,7 +37,6 @@ pub enum AutoColorMode {
     Combined,
 }
 
-
 impl AutoColorMode {
     /// Parse a wire-format name into a mode. Accepts both the
     /// snake_case serde rendering and a couple of friendlier aliases
@@ -406,16 +405,8 @@ mod tests {
             AutoColorMode::HistogramEqualization,
             AutoColorMode::Combined,
         ] {
-            let out = auto_color_correct(
-                &img,
-                8,
-                8,
-                AutoColorOptions {
-                    mode,
-                    clip: 0.005,
-                },
-            )
-            .unwrap();
+            let out =
+                auto_color_correct(&img, 8, 8, AutoColorOptions { mode, clip: 0.005 }).unwrap();
             assert_eq!(out[5 * 4 + 3], 0, "alpha lost in mode {mode:?}");
         }
     }

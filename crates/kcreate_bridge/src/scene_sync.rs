@@ -454,13 +454,7 @@ impl SceneSync {
     /// the emit; cached `z` values are stored relative to `z_start`
     /// so the replay path can rebase them onto an arbitrary current
     /// `z`.
-    fn capture_cache(
-        &mut self,
-        node: &Node,
-        objects: &[Object],
-        obj_start: usize,
-        z_start: i32,
-    ) {
+    fn capture_cache(&mut self, node: &Node, objects: &[Object], obj_start: usize, z_start: i32) {
         let mut cached_objects = Vec::with_capacity(objects.len() - obj_start);
         let mut sub_ids = Vec::with_capacity(objects.len() - obj_start);
         for obj in &objects[obj_start..] {
@@ -959,9 +953,7 @@ impl SceneSync {
                 // rect; once a blob_store appears the next sync
                 // should regenerate. Only cache when the blob_store
                 // is present so cache→reality drift can't happen.
-                if blob_store.is_some()
-                    && self.try_replay_cached(node, objects, z, emitted)
-                {
+                if blob_store.is_some() && self.try_replay_cached(node, objects, z, emitted) {
                     // hit
                 } else {
                     let z_start = *z;

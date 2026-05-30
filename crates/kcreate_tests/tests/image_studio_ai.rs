@@ -5,9 +5,7 @@
 //! workspace; here we drive each algorithm directly on synthetic
 //! data so the math itself is locked in.
 
-use kcreate_ai::auto_color::{
-    auto_color_correct, AutoColorMode, AutoColorOptions,
-};
+use kcreate_ai::auto_color::{auto_color_correct, AutoColorMode, AutoColorOptions};
 use kcreate_ai::denoise::{denoise, DenoiseOptions};
 use kcreate_ai::inpaint::{inpaint, InpaintOptions};
 use kcreate_ai::smart_select::smart_select;
@@ -22,12 +20,7 @@ fn flat(width: u32, height: u32, rgba: [u8; 4]) -> Vec<u8> {
 }
 
 /// Replace a rectangular region of `buf` with `rgba`.
-fn paint_rect(
-    buf: &mut [u8],
-    width: u32,
-    rect: (u32, u32, u32, u32),
-    rgba: [u8; 4],
-) {
+fn paint_rect(buf: &mut [u8], width: u32, rect: (u32, u32, u32, u32), rgba: [u8; 4]) {
     let (x0, y0, w, h) = rect;
     for y in y0..y0 + h {
         for x in x0..x0 + w {
@@ -46,8 +39,7 @@ fn add_noise(buf: &mut [u8], width: u32, height: u32, amplitude: u8) {
         for x in 0..width {
             let idx = ((y * width + x) * 4) as usize;
             for c in 0..3 {
-                let seed = x
-                    .wrapping_mul(73_856_093)
+                let seed = x.wrapping_mul(73_856_093)
                     ^ y.wrapping_mul(19_349_663)
                     ^ (c as u32).wrapping_mul(83_492_791);
                 // xorshift32-style scramble for a pseudo-random byte.
@@ -163,7 +155,10 @@ fn denoise_rejects_bad_buffer_size() {
     let bad = vec![0u8; 10]; // not 8*8*4
     let err = denoise(&bad, 8, 8, DenoiseOptions::default()).unwrap_err();
     let msg = format!("{err}");
-    assert!(msg.contains("buffer"), "expected buffer-size error, got {msg}");
+    assert!(
+        msg.contains("buffer"),
+        "expected buffer-size error, got {msg}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -320,7 +315,10 @@ fn auto_color_white_balance_normalises_per_channel_means() {
     let means = [sums[0] / count, sums[1] / count, sums[2] / count];
     // After gray-world WB the per-channel means converge.
     let spread = means.iter().max().unwrap() - means.iter().min().unwrap();
-    assert!(spread <= 8, "white-balanced means too spread out: {means:?}");
+    assert!(
+        spread <= 8,
+        "white-balanced means too spread out: {means:?}"
+    );
 }
 
 #[test]

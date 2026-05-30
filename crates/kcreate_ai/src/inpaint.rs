@@ -155,7 +155,8 @@ pub fn inpaint(
     }
 
     // Build pyramid from coarse → fine.
-    let mut levels: Vec<(Vec<u8>, Vec<u8>, u32, u32)> = Vec::with_capacity(opts.pyramid_levels as usize);
+    let mut levels: Vec<(Vec<u8>, Vec<u8>, u32, u32)> =
+        Vec::with_capacity(opts.pyramid_levels as usize);
     levels.push((pixels.to_vec(), mask.to_vec(), width, height));
     let mut cw = width;
     let mut ch = height;
@@ -303,18 +304,15 @@ fn seed_with_mean(pixels: &[u8], mask: &[u8], _width: u32, _height: u32) -> Vec<
             count += 1;
         }
     }
-    let mean = std::num::NonZeroU64::new(count).map_or(
-        [128u8, 128, 128, 255],
-        |c| {
-            let c = c.get();
-            [
-                (sum[0] / c) as u8,
-                (sum[1] / c) as u8,
-                (sum[2] / c) as u8,
-                255,
-            ]
-        },
-    );
+    let mean = std::num::NonZeroU64::new(count).map_or([128u8, 128, 128, 255], |c| {
+        let c = c.get();
+        [
+            (sum[0] / c) as u8,
+            (sum[1] / c) as u8,
+            (sum[2] / c) as u8,
+            255,
+        ]
+    });
     let mut out = pixels.to_vec();
     for (i, &m) in mask.iter().enumerate() {
         if m != 0 {
@@ -449,9 +447,7 @@ fn run_patchmatch_level(
 
         // 3) Splat the matched source patches back into the masked
         //    region with overlap-averaging.
-        splat_into_masked(
-            pixels, original, mask, width, height, &targets, &nnf, pr,
-        );
+        splat_into_masked(pixels, original, mask, width, height, &targets, &nnf, pr);
     }
 
     debug_assert_eq!(pixels.len(), total * 4);
@@ -578,7 +574,11 @@ struct XorShiftRng {
 impl XorShiftRng {
     fn seed(seed: u64) -> Self {
         Self {
-            state: if seed == 0 { 0xCAFE_BABE_DEAD_BEEF } else { seed },
+            state: if seed == 0 {
+                0xCAFE_BABE_DEAD_BEEF
+            } else {
+                seed
+            },
         }
     }
     fn next_u32(&mut self) -> u32 {
@@ -647,9 +647,21 @@ mod tests {
                 // Allow ±25 per channel — exemplar inpaint converges
                 // close to red but the boundary blending can drift
                 // before convergence.
-                assert!((i32::from(out[i]) - i32::from(red[0])).abs() <= 25, "R drift at ({x},{y}): {}", out[i]);
-                assert!((i32::from(out[i + 1]) - i32::from(red[1])).abs() <= 25, "G drift at ({x},{y}): {}", out[i+1]);
-                assert!((i32::from(out[i + 2]) - i32::from(red[2])).abs() <= 25, "B drift at ({x},{y}): {}", out[i+2]);
+                assert!(
+                    (i32::from(out[i]) - i32::from(red[0])).abs() <= 25,
+                    "R drift at ({x},{y}): {}",
+                    out[i]
+                );
+                assert!(
+                    (i32::from(out[i + 1]) - i32::from(red[1])).abs() <= 25,
+                    "G drift at ({x},{y}): {}",
+                    out[i + 1]
+                );
+                assert!(
+                    (i32::from(out[i + 2]) - i32::from(red[2])).abs() <= 25,
+                    "B drift at ({x},{y}): {}",
+                    out[i + 2]
+                );
             }
         }
     }

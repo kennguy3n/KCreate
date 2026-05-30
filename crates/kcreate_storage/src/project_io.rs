@@ -823,8 +823,7 @@ impl ProjectStore {
                         .and_then(|m| m.get("forward_diff"))
                         .cloned()
                         .unwrap_or_else(|| serde_json::Value::Array(Vec::new()));
-                    let ops: Vec<kcreate_core::DiffOp> =
-                        serde_json::from_value(diff_value)?;
+                    let ops: Vec<kcreate_core::DiffOp> = serde_json::from_value(diff_value)?;
                     let mut after = before_patch.clone();
                     kcreate_core::apply_diff(&mut after, &ops);
                     after

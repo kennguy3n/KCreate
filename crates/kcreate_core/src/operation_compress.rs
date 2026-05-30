@@ -107,12 +107,7 @@ pub fn compute_diff(from: &Value, to: &Value) -> Vec<DiffOp> {
     ops
 }
 
-fn diff_into(
-    from: &Value,
-    to: &Value,
-    path: &mut Vec<PathSegment>,
-    out: &mut Vec<DiffOp>,
-) {
+fn diff_into(from: &Value, to: &Value, path: &mut Vec<PathSegment>, out: &mut Vec<DiffOp>) {
     if from == to {
         return;
     }

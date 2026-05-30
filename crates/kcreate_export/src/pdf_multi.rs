@@ -101,11 +101,10 @@ pub fn export_pdf_multi_pages(
         if page.width_pt <= 0.0 || page.height_pt <= 0.0 {
             return Err(PdfMultiError::ZeroPageSize(idx as u32));
         }
-        let pixmap = rasterise(page, options.raster_dpi)
-            .map_err(|e| match e {
-                RasterError::Parse(s) => PdfMultiError::BadSvg(idx as u32, s),
-                RasterError::Render => PdfMultiError::Render(idx as u32),
-            })?;
+        let pixmap = rasterise(page, options.raster_dpi).map_err(|e| match e {
+            RasterError::Parse(s) => PdfMultiError::BadSvg(idx as u32, s),
+            RasterError::Render => PdfMultiError::Render(idx as u32),
+        })?;
         let img_id = embed_pixmap(&mut doc, &pixmap);
 
         let resources = dictionary! {
@@ -210,7 +209,11 @@ fn emit_outlines(doc: &mut Document, entries: &[(String, ObjectId)]) -> ObjectId
     }
     // Link prev/next siblings.
     for (i, id) in item_ids.iter().enumerate() {
-        let mut dict = doc.get_object(*id).and_then(Object::as_dict).cloned().unwrap_or_default();
+        let mut dict = doc
+            .get_object(*id)
+            .and_then(Object::as_dict)
+            .cloned()
+            .unwrap_or_default();
         if i > 0 {
             dict.set("Prev", item_ids[i - 1]);
         }
@@ -357,8 +360,12 @@ mod tests {
             width_pt: 0.0,
             height_pt: 100.0,
         }];
-        let err = export_pdf_multi_pages(&pages, &dir.path().join("o.pdf"), &PdfMultiOptions::default())
-            .unwrap_err();
+        let err = export_pdf_multi_pages(
+            &pages,
+            &dir.path().join("o.pdf"),
+            &PdfMultiOptions::default(),
+        )
+        .unwrap_err();
         assert!(matches!(err, PdfMultiError::ZeroPageSize(0)));
     }
 

@@ -192,16 +192,7 @@ pub fn denoise(
 // adds noise without improving readability.
 #[allow(clippy::too_many_arguments)]
 #[inline]
-fn patch_sq_diff(
-    pixels: &[u8],
-    w: i32,
-    h: i32,
-    x: i32,
-    y: i32,
-    u: i32,
-    v: i32,
-    pr: i32,
-) -> f32 {
+fn patch_sq_diff(pixels: &[u8], w: i32, h: i32, x: i32, y: i32, u: i32, v: i32, pr: i32) -> f32 {
     let mut acc = 0.0f32;
     for dy in -pr..=pr {
         for dx in -pr..=pr {

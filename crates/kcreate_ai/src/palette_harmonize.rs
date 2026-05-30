@@ -131,7 +131,7 @@ pub fn harmonize_palette(
 /// best. We pick the rule with the smallest total "distance from
 /// nearest target" sum.
 fn choose_rule_auto(hsl: &[Hsl]) -> HarmonyRule {
-    use HarmonyRule::{Complementary, Triadic, Analogous, SplitComplementary, Tetradic};
+    use HarmonyRule::{Analogous, Complementary, SplitComplementary, Tetradic, Triadic};
     let base = hsl[0].h;
     let candidates = [
         Complementary,
@@ -166,11 +166,7 @@ fn rule_targets(rule: HarmonyRule, base: f32) -> Vec<f32> {
         HarmonyRule::Complementary => vec![wrap(base), wrap(base + 180.0)],
         HarmonyRule::Triadic => vec![wrap(base), wrap(base + 120.0), wrap(base + 240.0)],
         HarmonyRule::Analogous => vec![wrap(base - 30.0), wrap(base), wrap(base + 30.0)],
-        HarmonyRule::SplitComplementary => vec![
-            wrap(base),
-            wrap(base + 150.0),
-            wrap(base + 210.0),
-        ],
+        HarmonyRule::SplitComplementary => vec![wrap(base), wrap(base + 150.0), wrap(base + 210.0)],
         HarmonyRule::Tetradic => vec![
             wrap(base),
             wrap(base + 60.0),
@@ -278,7 +274,11 @@ fn hsl_to_rgb(h: f32, s: f32, l: f32) -> [u8; 3] {
         return [v, v, v];
     }
     let h = ((h % 360.0) + 360.0) % 360.0 / 360.0;
-    let q = if l < 0.5 { l * (1.0 + s) } else { l + s - l * s };
+    let q = if l < 0.5 {
+        l * (1.0 + s)
+    } else {
+        l + s - l * s
+    };
     let p = 2.0 * l - q;
     let to_v = |t: f32| {
         let mut t = t;
@@ -314,8 +314,7 @@ mod tests {
 
     #[test]
     fn bad_hex_errors() {
-        let err =
-            harmonize_palette(&["not_a_hex".into()], HarmonyRule::Triadic).unwrap_err();
+        let err = harmonize_palette(&["not_a_hex".into()], HarmonyRule::Triadic).unwrap_err();
         assert!(matches!(err, HarmonyError::BadHex(_)));
     }
 

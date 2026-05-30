@@ -32,11 +32,11 @@ pub mod llm;
 #[cfg(feature = "native_canvas")]
 pub mod native_canvas;
 pub mod perf;
+pub mod phase10;
 pub mod phase2;
 pub mod phase4;
 pub mod phase8;
 pub mod phase9;
-pub mod phase10;
 pub mod raster_ops;
 pub mod scene_sync;
 pub mod state;
@@ -5208,8 +5208,14 @@ pub fn ai_inpaint(
     pyramid_levels: Option<u32>,
 ) -> NapiResult<String> {
     let node_id = parse_uuid(&node_id_str)?;
-    let res = phase10::ai_inpaint(node_id, &mask_json, patch_radius, num_iterations, pyramid_levels)
-        .map_err(map_doc_err)?;
+    let res = phase10::ai_inpaint(
+        node_id,
+        &mask_json,
+        patch_radius,
+        num_iterations,
+        pyramid_levels,
+    )
+    .map_err(map_doc_err)?;
     json_out("ai_inpaint", &res)
 }
 
@@ -5230,8 +5236,8 @@ pub fn ai_segment_at_point(
     is_positive: bool,
 ) -> NapiResult<String> {
     let node_id = parse_uuid(&node_id_str)?;
-    let res =
-        phase10::ai_segment_at_point(node_id, point_x, point_y, is_positive).map_err(map_doc_err)?;
+    let res = phase10::ai_segment_at_point(node_id, point_x, point_y, is_positive)
+        .map_err(map_doc_err)?;
     json_out("ai_segment_at_point", &res)
 }
 
@@ -5256,10 +5262,7 @@ pub fn ai_smart_select_at_point(
 
 #[napi]
 #[allow(clippy::needless_pass_by_value)]
-pub fn ai_match_stroke(
-    source_id_str: String,
-    target_ids_json: String,
-) -> NapiResult<String> {
+pub fn ai_match_stroke(source_id_str: String, target_ids_json: String) -> NapiResult<String> {
     let source_id = parse_uuid(&source_id_str)?;
     let target_ids: Vec<String> = serde_json::from_str(&target_ids_json).map_err(|e| {
         NapiError::new(
@@ -5267,8 +5270,7 @@ pub fn ai_match_stroke(
             format!("ai_match_stroke: bad target_ids json: {e}"),
         )
     })?;
-    let parsed: NapiResult<Vec<uuid::Uuid>> =
-        target_ids.iter().map(|s| parse_uuid(s)).collect();
+    let parsed: NapiResult<Vec<uuid::Uuid>> = target_ids.iter().map(|s| parse_uuid(s)).collect();
     let parsed = parsed?;
     let res = phase10::ai_match_stroke(source_id, &parsed).map_err(map_doc_err)?;
     json_out("ai_match_stroke", &res)
@@ -5285,10 +5287,8 @@ pub fn ai_extract_glyph(
     em_size: f64,
 ) -> NapiResult<String> {
     let node_id = parse_uuid(&node_id_str)?;
-    let res = phase10::ai_extract_glyph(
-        node_id, crop_x, crop_y, crop_width, crop_height, em_size,
-    )
-    .map_err(map_doc_err)?;
+    let res = phase10::ai_extract_glyph(node_id, crop_x, crop_y, crop_width, crop_height, em_size)
+        .map_err(map_doc_err)?;
     json_out("ai_extract_glyph", &res)
 }
 
@@ -5302,20 +5302,14 @@ pub fn ai_reformat_to_deck(page_id_str: String) -> NapiResult<String> {
 
 #[napi]
 #[allow(clippy::needless_pass_by_value)]
-pub fn ai_brief_to_one_pager(
-    brief: String,
-    page_size: Option<String>,
-) -> NapiResult<String> {
+pub fn ai_brief_to_one_pager(brief: String, page_size: Option<String>) -> NapiResult<String> {
     let res = phase10::ai_brief_to_one_pager(&brief, page_size.as_deref()).map_err(map_doc_err)?;
     json_out("ai_brief_to_one_pager", &res)
 }
 
 #[napi]
 #[allow(clippy::needless_pass_by_value)]
-pub fn ai_harmonize_palette(
-    brand_kit_id_str: String,
-    harmony_type: String,
-) -> NapiResult<String> {
+pub fn ai_harmonize_palette(brand_kit_id_str: String, harmony_type: String) -> NapiResult<String> {
     let brand_kit_id = parse_uuid(&brand_kit_id_str)?;
     let res = phase10::ai_harmonize_palette(brand_kit_id, &harmony_type).map_err(map_doc_err)?;
     json_out("ai_harmonize_palette", &res)

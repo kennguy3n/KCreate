@@ -114,16 +114,8 @@ fn glyph_extract_normalises_paths_to_em_square() {
     // tolerance for rounding.
     for path in &g.paths {
         for p in &path.points {
-            assert!(
-                (-2.0..=1002.0).contains(&p.x),
-                "x outside em: {}",
-                p.x
-            );
-            assert!(
-                (-2.0..=1002.0).contains(&p.y),
-                "y outside em: {}",
-                p.y
-            );
+            assert!((-2.0..=1002.0).contains(&p.x), "x outside em: {}", p.x);
+            assert!((-2.0..=1002.0).contains(&p.y), "y outside em: {}", p.y);
         }
     }
 }
@@ -243,10 +235,7 @@ fn one_pager_promotes_first_line_to_header() {
                  Our mission\n\
                  Build delightful tools for creative professionals.\n";
     let result = brief_to_one_pager(brief, BriefToOnePagerOptions::default()).expect("plan");
-    assert!(
-        !result.sections.is_empty(),
-        "expected at least one section"
-    );
+    assert!(!result.sections.is_empty(), "expected at least one section");
     let header = result
         .sections
         .iter()
@@ -354,7 +343,10 @@ fn harmonize_invalid_hex_errors() {
 #[test]
 fn type_pairing_returns_at_least_one_suggestion() {
     let r = suggest_type_pairing("Inter").expect("pairing");
-    assert!(!r.suggestions.is_empty(), "expected at least one suggestion");
+    assert!(
+        !r.suggestions.is_empty(),
+        "expected at least one suggestion"
+    );
     for s in &r.suggestions {
         assert!(!s.font_name.is_empty());
         assert!(!s.reason.is_empty());

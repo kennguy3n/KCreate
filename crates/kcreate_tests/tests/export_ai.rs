@@ -15,9 +15,7 @@
 //!   container with embedded SVG payload, legacy AI8 rejection,
 //!   PDF fallback for containers with no SVG.
 
-use kcreate_export::ai_import::{
-    import_illustrator_bytes, AiImportError, AiImportPath,
-};
+use kcreate_export::ai_import::{import_illustrator_bytes, AiImportError, AiImportPath};
 use kcreate_export::pdf_multi::{
     export_pdf_multi_pages, PdfMultiError, PdfMultiOptions, PdfPageInput,
 };
@@ -34,8 +32,14 @@ use kcreate_export::svg_optimize::{optimize_svg, optimize_svg_with, SvgOptimizeO
 fn svg_optimize_strips_xml_decl_and_comments_outside_protected_regions() {
     let input = "<?xml version=\"1.0\"?>\n<!-- hand-edited -->\n<svg xmlns=\"http://www.w3.org/2000/svg\"><rect/></svg>";
     let report = optimize_svg(input).expect("optimize");
-    assert!(report.bytes_saved > 0, "should reclaim XML-decl + comment bytes");
-    assert!(!report.output_svg.contains("<?xml"), "XML decl should be dropped");
+    assert!(
+        report.bytes_saved > 0,
+        "should reclaim XML-decl + comment bytes"
+    );
+    assert!(
+        !report.output_svg.contains("<?xml"),
+        "XML decl should be dropped"
+    );
     assert!(
         !report.output_svg.contains("<!-- hand-edited -->"),
         "comments should be dropped"
@@ -163,7 +167,11 @@ fn gradient_rgba(width: u32, height: u32) -> Vec<u8> {
             let r = ((x * 255) / width.max(1)) as u8;
             let g = ((y * 255) / height.max(1)) as u8;
             // A vertical band in the middle for edge content.
-            let b = if x > width / 3 && x < width * 2 / 3 { 240 } else { 32 };
+            let b = if x > width / 3 && x < width * 2 / 3 {
+                240
+            } else {
+                32
+            };
             buf.extend_from_slice(&[r, g, b, 255]);
         }
     }
@@ -183,12 +191,24 @@ fn smart_compress_jpeg_returns_payload_within_quality_range() {
     };
     let report = smart_compress(&pixels, w, h, opts).expect("compress");
     assert_eq!(report.format, SmartCompressFormat::Jpeg);
-    assert!((20..=95).contains(&report.quality), "quality {} out of band", report.quality);
+    assert!(
+        (20..=95).contains(&report.quality),
+        "quality {} out of band",
+        report.quality
+    );
     assert!(!report.bytes.is_empty(), "must return non-empty payload");
-    assert!(report.iterations > 0, "binary search should record at least one step");
-    assert!(report.compressed_bytes <= report.original_bytes,
-        "JPEG should at least not exceed raw RGBA byte count for a 64×48 image");
-    assert!(report.ssim >= 0.0 && report.ssim <= 1.0, "SSIM out of unit interval");
+    assert!(
+        report.iterations > 0,
+        "binary search should record at least one step"
+    );
+    assert!(
+        report.compressed_bytes <= report.original_bytes,
+        "JPEG should at least not exceed raw RGBA byte count for a 64×48 image"
+    );
+    assert!(
+        report.ssim >= 0.0 && report.ssim <= 1.0,
+        "SSIM out of unit interval"
+    );
 }
 
 #[test]
@@ -299,7 +319,10 @@ fn ai_import_extracts_embedded_svg_payload_from_pdf_container() {
     assert_eq!(summary.path, AiImportPath::Svg);
     assert_eq!(summary.width_pt, Some(120.0));
     assert_eq!(summary.height_pt, Some(80.0));
-    assert!(summary.object_count >= 1, "at least one node should be reported");
+    assert!(
+        summary.object_count >= 1,
+        "at least one node should be reported"
+    );
     assert!(!summary.svg_payload_base64.is_empty());
     assert!(summary.message.is_some());
 }
@@ -382,14 +405,20 @@ fn pdf_multi_emits_bookmarks_when_requested() {
     };
     let report = export_pdf_multi_pages(&pages, &tmp, &opts).expect("pdf");
     assert_eq!(report.page_count, 2);
-    assert!(report.bookmarks_emitted, "bookmarks toggle should be honoured");
+    assert!(
+        report.bookmarks_emitted,
+        "bookmarks toggle should be honoured"
+    );
     let doc = lopdf::Document::load(&tmp).expect("load PDF");
     let catalog = doc
         .get_object(doc.trailer.get(b"Root").unwrap().as_reference().unwrap())
         .unwrap()
         .as_dict()
         .unwrap();
-    assert!(catalog.has(b"Outlines"), "catalog should expose /Outlines when bookmarks are on");
+    assert!(
+        catalog.has(b"Outlines"),
+        "catalog should expose /Outlines when bookmarks are on"
+    );
     std::fs::remove_file(&tmp).ok();
 }
 

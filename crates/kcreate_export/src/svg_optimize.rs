@@ -252,7 +252,8 @@ fn protected_regions(s: &str) -> Vec<(usize, usize)> {
                 // (e.g. `<title/>`) have no inner content.
                 if !s[..after_open].trim_end_matches('>').ends_with('/') {
                     let close_needle = format!("</{tag}");
-                    if let Some(rel) = find_subslice(&bytes[after_open..], close_needle.as_bytes()) {
+                    if let Some(rel) = find_subslice(&bytes[after_open..], close_needle.as_bytes())
+                    {
                         let end = after_open + rel;
                         out.push((after_open, end));
                         i = end;
@@ -292,7 +293,8 @@ fn matched_open_tag<'a>(s: &str, pos: usize, names: &'a [&'a str]) -> Option<(&'
         // — otherwise we matched a prefix (e.g. `<textPath` shouldn't
         // match `text`).
         let next = bytes.get(pos + head.len()).copied();
-        let is_boundary = matches!(next, Some(b) if b.is_ascii_whitespace() || b == b'/' || b == b'>');
+        let is_boundary =
+            matches!(next, Some(b) if b.is_ascii_whitespace() || b == b'/' || b == b'>');
         if !is_boundary {
             continue;
         }
@@ -373,17 +375,14 @@ fn shorten_numbers(s: &str, precision: u8) -> String {
             if b == b'-' || b == b'+' {
                 cursor += 1;
             }
-            while cursor < bytes.len()
-                && (bytes[cursor].is_ascii_digit() || bytes[cursor] == b'.')
+            while cursor < bytes.len() && (bytes[cursor].is_ascii_digit() || bytes[cursor] == b'.')
             {
                 cursor += 1;
             }
             // Optional exponent
             if cursor < bytes.len() && (bytes[cursor] == b'e' || bytes[cursor] == b'E') {
                 cursor += 1;
-                if cursor < bytes.len()
-                    && (bytes[cursor] == b'-' || bytes[cursor] == b'+')
-                {
+                if cursor < bytes.len() && (bytes[cursor] == b'-' || bytes[cursor] == b'+') {
                     cursor += 1;
                 }
                 while cursor < bytes.len() && bytes[cursor].is_ascii_digit() {
@@ -572,8 +571,7 @@ mod tests {
     #[test]
     fn cdata_payload_is_preserved() {
         // CDATA sections must round-trip unchanged.
-        let svg =
-            "<svg><script><![CDATA[ a < b && c > d  // multi space ]]></script><rect/></svg>";
+        let svg = "<svg><script><![CDATA[ a < b && c > d  // multi space ]]></script><rect/></svg>";
         let r = optimize_svg(svg).unwrap();
         assert!(
             r.output_svg.contains("a < b && c > d  // multi space"),

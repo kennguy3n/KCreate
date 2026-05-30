@@ -48,12 +48,12 @@ use kcreate_ai::segment::{segment_image, SegmentBackend, SegmentOptions};
 use kcreate_ai::smart_select::smart_select;
 use kcreate_ai::stroke_match::{match_stroke_style, StrokeMatchSummary, StrokeProperties};
 use kcreate_ai::type_pairing::{suggest_type_pairing, TypePairingResult};
-use kcreate_core::node::{
-    Bounds, LineCap, LineJoin, Node, NodeType, RgbaColor, StrokeStyle,
-};
+use kcreate_core::node::{Bounds, LineCap, LineJoin, Node, NodeType, RgbaColor, StrokeStyle};
 use kcreate_core::operation::Operation;
 use kcreate_export::ai_import::{import_illustrator_bytes, AiImportError, AiImportSummary};
-use kcreate_export::pdf_multi::{export_pdf_multi_pages, PdfMultiError, PdfMultiOptions, PdfMultiReport};
+use kcreate_export::pdf_multi::{
+    export_pdf_multi_pages, PdfMultiError, PdfMultiOptions, PdfMultiReport,
+};
 use kcreate_export::smart_compress::{
     smart_compress, SmartCompressFormat, SmartCompressOptions, SmartCompressReport,
 };
@@ -61,9 +61,7 @@ use kcreate_export::svg_optimize::{optimize_svg, SvgOptimizeReport};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::document::{
-    blob_load, with_workspace, with_workspace_mut, DocumentBridgeError, Result,
-};
+use crate::document::{blob_load, with_workspace, with_workspace_mut, DocumentBridgeError, Result};
 use crate::scene_sync::{RasterImageMeta, RASTER_IMAGE_METADATA_KEY};
 
 // ---------------------------------------------------------------------------
@@ -218,9 +216,8 @@ pub fn ai_denoise(
         patch_radius,
     }
     .clamped();
-    let out = denoise(&rgba, w, h, effective_opts).map_err(|e| {
-        DocumentBridgeError::Internal(format!("ai_denoise: {e}"))
-    })?;
+    let out = denoise(&rgba, w, h, effective_opts)
+        .map_err(|e| DocumentBridgeError::Internal(format!("ai_denoise: {e}")))?;
     let new_id = install_processed_raster(
         node_id,
         &out,
@@ -262,12 +259,11 @@ pub fn ai_inpaint(
     num_iterations: Option<u32>,
     pyramid_levels: Option<u32>,
 ) -> Result<InpaintResult> {
-    let rects: Vec<MaskRect> = serde_json::from_str(mask_json).map_err(|e| {
-        DocumentBridgeError::InvalidArgument {
+    let rects: Vec<MaskRect> =
+        serde_json::from_str(mask_json).map_err(|e| DocumentBridgeError::InvalidArgument {
             argument: "mask_json".into(),
             value: format!("{e}"),
-        }
-    })?;
+        })?;
     let (rgba, w, h) = load_raster_rgba(node_id)?;
     let mask = mask_from_rects(&rects, w, h);
     // Defense-in-depth: clamp at the bridge boundary even though
@@ -280,9 +276,8 @@ pub fn ai_inpaint(
         pyramid_levels: pyramid_levels.unwrap_or(3),
     }
     .clamped();
-    let out = inpaint(&rgba, &mask, w, h, effective_opts).map_err(|e| {
-        DocumentBridgeError::Internal(format!("ai_inpaint: {e}"))
-    })?;
+    let out = inpaint(&rgba, &mask, w, h, effective_opts)
+        .map_err(|e| DocumentBridgeError::Internal(format!("ai_inpaint: {e}")))?;
     let new_id = install_processed_raster(
         node_id,
         &out,
@@ -319,12 +314,11 @@ pub struct AutoColorResult {
 
 /// Apply automatic colour correction to `node_id`.
 pub fn ai_auto_color(node_id: Uuid, mode: &str) -> Result<AutoColorResult> {
-    let parsed_mode = AutoColorMode::from_wire(mode).ok_or_else(|| {
-        DocumentBridgeError::InvalidArgument {
+    let parsed_mode =
+        AutoColorMode::from_wire(mode).ok_or_else(|| DocumentBridgeError::InvalidArgument {
             argument: "mode".into(),
             value: mode.into(),
-        }
-    })?;
+        })?;
     let (rgba, w, h) = load_raster_rgba(node_id)?;
     let out = auto_color_correct(
         &rgba,
@@ -401,7 +395,8 @@ pub fn ai_segment_at_point(
             let first = result
                 .masks
                 .into_iter()
-                .next().map_or_else(|| vec![0u8; (w * h) as usize], |m| m.mask);
+                .next()
+                .map_or_else(|| vec![0u8; (w * h) as usize], |m| m.mask);
             (first, result.backend)
         }
         Err(_) => {
@@ -462,12 +457,11 @@ pub fn ai_smart_select_at_point(
     mode: &str,
     previous_mask_base64: Option<&str>,
 ) -> Result<SmartSelectAtPointResult> {
-    let parsed_mode = SmartSelectMode::from_wire(mode).ok_or_else(|| {
-        DocumentBridgeError::InvalidArgument {
+    let parsed_mode =
+        SmartSelectMode::from_wire(mode).ok_or_else(|| DocumentBridgeError::InvalidArgument {
             argument: "mode".into(),
             value: mode.into(),
-        }
-    })?;
+        })?;
     let (rgba, w, h) = load_raster_rgba(node_id)?;
     let new_mask = smart_select(&rgba, w, h, x, y, tolerance);
     let merged: Vec<u8> = match parsed_mode {
@@ -538,13 +532,18 @@ pub fn ai_match_stroke(source_id: Uuid, target_ids: &[Uuid]) -> Result<StrokeMat
             .document
             .get_node(source_id)
             .ok_or(DocumentBridgeError::NodeNotFound(source_id))?;
-        let stroke = node.style.stroke.clone().ok_or_else(|| {
-            DocumentBridgeError::InvalidArgument {
-                argument: "source_node_id".into(),
-                value: "no stroke on source".into(),
-            }
-        })?;
-        Ok(stroke_to_props(&stroke, node.style.stroke_width_profile.clone()))
+        let stroke =
+            node.style
+                .stroke
+                .clone()
+                .ok_or_else(|| DocumentBridgeError::InvalidArgument {
+                    argument: "source_node_id".into(),
+                    value: "no stroke on source".into(),
+                })?;
+        Ok(stroke_to_props(
+            &stroke,
+            node.style.stroke_width_profile.clone(),
+        ))
     })?;
     let target_pairs: Vec<(String, bool)> = with_workspace(|ws| {
         let mut out = Vec::with_capacity(target_ids.len());
@@ -558,12 +557,8 @@ pub fn ai_match_stroke(source_id: Uuid, target_ids: &[Uuid]) -> Result<StrokeMat
         }
         Ok(out)
     })?;
-    let summary = match_stroke_style(
-        &source_id.to_string(),
-        Some(&source_props),
-        &target_pairs,
-    )
-    .map_err(|e| DocumentBridgeError::Internal(format!("match_stroke_style: {e}")))?;
+    let summary = match_stroke_style(&source_id.to_string(), Some(&source_props), &target_pairs)
+        .map_err(|e| DocumentBridgeError::Internal(format!("match_stroke_style: {e}")))?;
 
     let new_stroke = props_to_stroke(&source_props);
     let width_profile = source_props.width_profile;
@@ -602,10 +597,7 @@ pub fn ai_match_stroke(source_id: Uuid, target_ids: &[Uuid]) -> Result<StrokeMat
     Ok(summary)
 }
 
-fn stroke_to_props(
-    s: &StrokeStyle,
-    width_profile: Option<Vec<(f64, f64)>>,
-) -> StrokeProperties {
+fn stroke_to_props(s: &StrokeStyle, width_profile: Option<Vec<(f64, f64)>>) -> StrokeProperties {
     StrokeProperties {
         color_hex: s.color.to_hex(),
         width: s.width,
@@ -690,9 +682,8 @@ pub fn ai_extract_glyph(
         em_size,
         simplify_tolerance: 4.0,
     };
-    let result = extract_glyph(&rgba, w, h, crop, opts).map_err(|e| {
-        DocumentBridgeError::Internal(format!("ai_extract_glyph: {e}"))
-    })?;
+    let result = extract_glyph(&rgba, w, h, crop, opts)
+        .map_err(|e| DocumentBridgeError::Internal(format!("ai_extract_glyph: {e}")))?;
     let paths_json = serde_json::to_string(&result.paths)
         .map_err(|e| DocumentBridgeError::Internal(format!("serialize glyph paths: {e}")))?;
     Ok(ExtractedGlyphResult {
@@ -885,13 +876,13 @@ pub struct ExportPreviewResponse {
 /// the longest side at `max_dimension_px` (default 1024) so the IPC
 /// surface stays small even at high zoom levels.
 pub fn export_preview(req: ExportPreviewRequest) -> Result<ExportPreviewResponse> {
-    let node_id = req
-        .node_id
-        .parse::<Uuid>()
-        .map_err(|e| DocumentBridgeError::InvalidArgument {
-            argument: "node_id".into(),
-            value: format!("{e}"),
-        })?;
+    let node_id =
+        req.node_id
+            .parse::<Uuid>()
+            .map_err(|e| DocumentBridgeError::InvalidArgument {
+                argument: "node_id".into(),
+                value: format!("{e}"),
+            })?;
     let max_dim = req.max_dimension_px.unwrap_or(1024).clamp(64, 4096);
     let format = req.format.to_ascii_lowercase();
     let (rgba, w, h) = load_raster_rgba(node_id)?;
@@ -1202,22 +1193,19 @@ impl From<kcreate_plugin::marketplace::PluginListing> for PluginListing {
 /// bookmarks, and hyperlinks. The actual SVG-to-PDF rendering is
 /// delegated to `kcreate_export::pdf_multi`.
 pub fn export_pdf_multi(options_json: &str, output_path: &str) -> Result<PdfMultiReport> {
-    let opts: PdfMultiOptions = serde_json::from_str(options_json).map_err(|e| {
-        DocumentBridgeError::InvalidArgument {
+    let opts: PdfMultiOptions =
+        serde_json::from_str(options_json).map_err(|e| DocumentBridgeError::InvalidArgument {
             argument: "options_json".into(),
             value: format!("{e}"),
-        }
-    })?;
+        })?;
     // Just verify a project is open before we render pages.
     with_workspace(|_ws| Ok(()))?;
     let pages = collect_page_svgs()?;
-    export_pdf_multi_pages(&pages, std::path::Path::new(output_path), &opts).map_err(
-        |e: PdfMultiError| DocumentBridgeError::Internal(format!("export_pdf_multi: {e}")),
-    )
+    export_pdf_multi_pages(&pages, std::path::Path::new(output_path), &opts)
+        .map_err(|e: PdfMultiError| DocumentBridgeError::Internal(format!("export_pdf_multi: {e}")))
 }
 
-fn collect_page_svgs(
-) -> Result<Vec<kcreate_export::pdf_multi::PdfPageInput>> {
+fn collect_page_svgs() -> Result<Vec<kcreate_export::pdf_multi::PdfPageInput>> {
     with_workspace(|ws| {
         let mut pages = Vec::new();
         for (id, n) in ws.project.document.iter() {
@@ -1399,16 +1387,14 @@ pub fn preferences_load() -> Result<Preferences> {
 }
 
 pub fn preferences_save(prefs_json: &str) -> Result<()> {
-    let parsed: Preferences = serde_json::from_str(prefs_json).map_err(|e| {
-        DocumentBridgeError::InvalidArgument {
+    let parsed: Preferences =
+        serde_json::from_str(prefs_json).map_err(|e| DocumentBridgeError::InvalidArgument {
             argument: "preferences_json".into(),
             value: format!("{e}"),
-        }
-    })?;
+        })?;
     let path = preferences_path()?;
-    let pretty = serde_json::to_string_pretty(&parsed).map_err(|e| {
-        DocumentBridgeError::Internal(format!("preferences serialize: {e}"))
-    })?;
+    let pretty = serde_json::to_string_pretty(&parsed)
+        .map_err(|e| DocumentBridgeError::Internal(format!("preferences serialize: {e}")))?;
     std::fs::write(&path, pretty)
         .map_err(|e| DocumentBridgeError::Internal(format!("preferences write: {e}")))?;
     Ok(())
@@ -1428,7 +1414,10 @@ mod tests {
             SmartSelectMode::from_wire("replace"),
             Some(SmartSelectMode::Replace)
         );
-        assert_eq!(SmartSelectMode::from_wire("add"), Some(SmartSelectMode::Add));
+        assert_eq!(
+            SmartSelectMode::from_wire("add"),
+            Some(SmartSelectMode::Add)
+        );
         assert_eq!(
             SmartSelectMode::from_wire("subtract"),
             Some(SmartSelectMode::Subtract)

@@ -19,9 +19,7 @@ use std::path::PathBuf;
 
 use kcreate_export::pdf_multi::default_titles_for;
 use kcreate_plugin::manifest::{PluginManifest, PluginType};
-use kcreate_plugin::marketplace::{
-    MarketplaceError, PluginMarketplace,
-};
+use kcreate_plugin::marketplace::{MarketplaceError, PluginMarketplace};
 
 // ---------------------------------------------------------------------------
 // Task 20 — Plugin marketplace
@@ -186,8 +184,7 @@ fn preferences_round_trips_through_json_with_zero_scratch_cleanup() {
     prefs.general.scratch_project_cleanup_days = 0;
     prefs.canvas.default_grid_subdivisions = 8;
     let s = serde_json::to_string(&prefs).expect("ser");
-    let back: kcreate_bridge::phase10::Preferences =
-        serde_json::from_str(&s).expect("de");
+    let back: kcreate_bridge::phase10::Preferences = serde_json::from_str(&s).expect("de");
     assert_eq!(back.general.scratch_project_cleanup_days, 0);
     assert_eq!(back.canvas.default_grid_subdivisions, 8);
 }

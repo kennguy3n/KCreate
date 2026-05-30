@@ -79,8 +79,8 @@ pub struct PluginMarketplace {
 
 impl Default for PluginMarketplace {
     fn default() -> Self {
-        let dir = default_plugin_dir()
-            .unwrap_or_else(|| std::env::temp_dir().join("kcreate-plugins"));
+        let dir =
+            default_plugin_dir().unwrap_or_else(|| std::env::temp_dir().join("kcreate-plugins"));
         Self { plugin_dir: dir }
     }
 }
@@ -126,7 +126,9 @@ impl PluginMarketplace {
         // state stays consistent even on the error path.
         let mut reg = PluginRegistry::new(self.plugin_dir.clone());
         reg.scan()?;
-        let already = reg.list().iter().any(|m| m.id == manifest.id && Path::new(&staged_dir) != reg_dir_for(&self.plugin_dir, m));
+        let already = reg.list().iter().any(|m| {
+            m.id == manifest.id && Path::new(&staged_dir) != reg_dir_for(&self.plugin_dir, m)
+        });
         if already {
             let _ = fs::remove_dir_all(&staged_dir);
             return Err(MarketplaceError::AlreadyInstalled(manifest.id));
@@ -217,10 +219,7 @@ fn stage_from_zip(source: &Path, plugin_root: &Path) -> Result<PathBuf, Marketpl
     let file = fs::File::open(source)?;
     let mut archive = ZipArchive::new(file)?;
     // First pass: find manifest.json and read its id.
-    let staging = plugin_root.join(format!(
-        ".staging-{}",
-        std::process::id()
-    ));
+    let staging = plugin_root.join(format!(".staging-{}", std::process::id()));
     if staging.exists() {
         let _ = fs::remove_dir_all(&staging);
     }

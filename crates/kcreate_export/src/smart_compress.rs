@@ -68,7 +68,9 @@ pub struct SmartCompressReport {
 
 #[derive(Debug, Error)]
 pub enum SmartCompressError {
-    #[error("smart_compress: input pixel buffer is the wrong length: expected {expected}, got {got}")]
+    #[error(
+        "smart_compress: input pixel buffer is the wrong length: expected {expected}, got {got}"
+    )]
     BadBuffer { expected: usize, got: usize },
     #[error("smart_compress: dimensions zero (width={0}, height={1})")]
     ZeroDim(u32, u32),
@@ -197,23 +199,19 @@ fn encode_at_quality(
             let small = if (dw, dh) == (width, height) {
                 img
             } else {
-                let s = image::imageops::resize(
-                    &img,
-                    dw,
-                    dh,
-                    image::imageops::FilterType::Triangle,
-                );
-                image::imageops::resize(
-                    &s,
-                    width,
-                    height,
-                    image::imageops::FilterType::Triangle,
-                )
+                let s =
+                    image::imageops::resize(&img, dw, dh, image::imageops::FilterType::Triangle);
+                image::imageops::resize(&s, width, height, image::imageops::FilterType::Triangle)
             };
             let mut cursor = std::io::Cursor::new(&mut out);
             let enc = image::codecs::webp::WebPEncoder::new_lossless(&mut cursor);
-            enc.write_image(small.as_raw(), width, height, image::ExtendedColorType::Rgba8)
-                .map_err(|e| SmartCompressError::Encode(format!("WebP: {e}")))?;
+            enc.write_image(
+                small.as_raw(),
+                width,
+                height,
+                image::ExtendedColorType::Rgba8,
+            )
+            .map_err(|e| SmartCompressError::Encode(format!("WebP: {e}")))?;
         }
     }
     Ok(out)
@@ -232,12 +230,8 @@ fn decode_to_rgba(
         // For lossy formats the decoder should still produce
         // identical dims; if it doesn't (e.g. WebP rescaled) resize
         // back so SSIM compares apples-to-apples.
-        let resized = image::imageops::resize(
-            &img,
-            width,
-            height,
-            image::imageops::FilterType::Triangle,
-        );
+        let resized =
+            image::imageops::resize(&img, width, height, image::imageops::FilterType::Triangle);
         Ok(resized.into_raw())
     } else {
         let _ = format; // currently unused beyond decode dispatch
@@ -297,16 +291,7 @@ pub fn ssim_rgba(a: &[u8], b: &[u8], width: u32, height: u32) -> f64 {
 // constants) matches the SSIM paper's notation 1:1 so we keep it
 // flat rather than bundling into a struct.
 #[allow(clippy::too_many_arguments)]
-fn ssim_block(
-    a: &[u8],
-    b: &[u8],
-    w: usize,
-    _h: usize,
-    bx: u32,
-    by: u32,
-    c1: f64,
-    c2: f64,
-) -> f64 {
+fn ssim_block(a: &[u8], b: &[u8], w: usize, _h: usize, bx: u32, by: u32, c1: f64, c2: f64) -> f64 {
     let x0 = (bx * BLOCK) as usize;
     let y0 = (by * BLOCK) as usize;
     let n = f64::from(BLOCK * BLOCK);
@@ -351,7 +336,9 @@ fn luminance(rgba: &[u8]) -> Vec<u8> {
             let r = f64::from(c[0]);
             let g = f64::from(c[1]);
             let b = f64::from(c[2]);
-            (0.2126 * r + 0.7152 * g + 0.0722 * b).clamp(0.0, 255.0).round() as u8
+            (0.2126 * r + 0.7152 * g + 0.0722 * b)
+                .clamp(0.0, 255.0)
+                .round() as u8
         })
         .collect()
 }

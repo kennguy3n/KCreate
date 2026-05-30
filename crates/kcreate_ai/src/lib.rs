@@ -19,29 +19,29 @@ pub mod design_critique;
 pub mod design_tokens_vlm;
 pub mod glyph_extract;
 pub mod iconify;
-pub mod inpaint;
-pub mod one_pager;
-pub mod palette_harmonize;
-pub mod reformat;
-pub mod stroke_match;
-pub mod type_pairing;
 pub mod image_gen;
+pub mod inpaint;
 pub mod layout_suggest;
 pub mod llm_chat;
 pub mod llm_sidecar;
 pub mod mlx_sidecar;
 pub mod model_registry;
 pub mod ocr;
+pub mod one_pager;
 pub mod palette;
+pub mod palette_harmonize;
+pub mod reformat;
 pub mod screenshot_to_layout;
 pub mod segment;
 pub mod sidecar_dispatcher;
 pub mod smart_crop;
 pub mod smart_select;
+pub mod stroke_match;
 pub mod style_describe;
 pub mod task_router;
 pub mod tool_call;
 pub mod trace;
+pub mod type_pairing;
 pub mod upscale;
 pub mod vision_chat;
 
@@ -55,29 +55,10 @@ pub use bg_remove::{
 pub use color_range::{pack_mask, select_by_color_range};
 pub use denoise::{denoise, DenoiseError, DenoiseOptions};
 pub use glyph_extract::{
-    extract_glyph, ExtractedGlyph, GlyphCrop, GlyphExtractError, GlyphExtractOptions,
-    GlyphMetrics,
-};
-pub use inpaint::{inpaint, mask_from_rects, InpaintError, InpaintOptions, MaskRect};
-pub use one_pager::{
-    brief_to_one_pager, BriefToOnePagerError, BriefToOnePagerOptions, BriefToOnePagerResult,
-    OnePagerPageSize, OnePagerSection, OnePagerSectionType,
-};
-pub use palette_harmonize::{
-    harmonize_palette, HarmonyError, HarmonyResult, HarmonyRule, HarmonySuggestion,
-};
-pub use reformat::{
-    reformat_to_deck, ReformatDeckError, ReformatDeckOptions, ReformatDeckResult, ReformatPage,
-    ReformatPagePlacement,
-};
-pub use stroke_match::{
-    match_stroke_style, StrokeDeltaApplied, StrokeMatchError, StrokeMatchSummary,
-    StrokeProperties,
-};
-pub use type_pairing::{
-    suggest_type_pairing, TypePairingError, TypePairingResult, TypePairingSuggestion,
+    extract_glyph, ExtractedGlyph, GlyphCrop, GlyphExtractError, GlyphExtractOptions, GlyphMetrics,
 };
 pub use iconify::{iconify, IconPath, IconPoint, IconifyError, IconifyOptions, IconifyResult};
+pub use inpaint::{inpaint, mask_from_rects, InpaintError, InpaintOptions, MaskRect};
 pub use layout_suggest::{
     suggest_layout_grouping, Bounds as LayoutBounds, LayoutAlignment, LayoutNode,
     LayoutOrientation, LayoutSuggestError, LayoutSuggestOptions, LayoutSuggestion,
@@ -95,7 +76,18 @@ pub use model_registry::{
     uninstall_model_pack, InstallError, InstallReport, ModelKind, ModelPack, ModelPackCategory,
 };
 pub use ocr::{detect_text_regions, DetectTextRegionsOptions, OcrError, TextRegion};
+pub use one_pager::{
+    brief_to_one_pager, BriefToOnePagerError, BriefToOnePagerOptions, BriefToOnePagerResult,
+    OnePagerPageSize, OnePagerSection, OnePagerSectionType,
+};
 pub use palette::{extract_palette, ExtractedColor};
+pub use palette_harmonize::{
+    harmonize_palette, HarmonyError, HarmonyResult, HarmonyRule, HarmonySuggestion,
+};
+pub use reformat::{
+    reformat_to_deck, ReformatDeckError, ReformatDeckOptions, ReformatDeckResult, ReformatPage,
+    ReformatPagePlacement,
+};
 pub use screenshot_to_layout::{
     analyze_screenshot_for_layout, Bounds as ScreenshotBounds, DetectedElement, ElementType,
 };
@@ -104,6 +96,9 @@ pub use segment::{
     SegmentResult,
 };
 pub use smart_select::smart_select;
+pub use stroke_match::{
+    match_stroke_style, StrokeDeltaApplied, StrokeMatchError, StrokeMatchSummary, StrokeProperties,
+};
 pub use task_router::{
     build_accessibility_prompt, build_design_token_prompt, build_layer_naming_prompt, execute_task,
     parse_layer_naming_reply, AiError, AiResult, AiTask,
@@ -114,4 +109,7 @@ pub use tool_call::{
     ToolRegistryError,
 };
 pub use trace::{trace_raster, TraceError, TraceOptions, TraceThreshold, TracedPath, TracedPoint};
+pub use type_pairing::{
+    suggest_type_pairing, TypePairingError, TypePairingResult, TypePairingSuggestion,
+};
 pub use upscale::{upscale_lanczos, upscale_with_backend, UpscaleBackend, UpscaleError};

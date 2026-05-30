@@ -528,18 +528,31 @@ pub fn project_save() -> AsyncTask<phase11::ProjectSaveTask> {
 /// only has to call this once per frame to know if anything in the
 /// graph changed since the last paint.
 ///
-/// Implemented as a `u32` because TypeScript `number` covers `u32`
-/// exactly. The counter would have to wrap at `u32::MAX` (≈ 4
-/// billion mutations) before the renderer would see a duplicate
-/// value; at 60 mutations / second that's ~ 2 years of nonstop
-/// editing.
+/// Returned as `f64` because TypeScript `number` is IEEE-754
+/// double-precision and represents every integer in `[0, 2^53]`
+/// exactly. The counter would have to advance `2^53 ≈ 9.0 × 10^15`
+/// times before two distinct internal versions could collide at
+/// the JS boundary; at 60 mutations / second that's ~4.7 million
+/// years, which is effectively never.
+///
+/// Phase 11 Block D Task 21 follow-up round 2 — Devin Review
+/// ANALYSIS-0006. The previous `u32` return type wrapped at
+/// `u32::MAX` (~4 billion mutations, ~2 years of nonstop editing
+/// at 60 mut/s). On wrap, the renderer poller would see a value
+/// it had seen before and skip a `documentGetTree` refresh,
+/// surfacing as a stale-tree bug. Using `f64` keeps a single
+/// number-typed handshake with JS (`!==` comparison still works,
+/// no BigInt churn) while pushing the collision horizon out of
+/// the realistic operating envelope.
 #[napi]
 #[must_use]
-pub fn document_version() -> u32 {
-    let raw = kcreate_core::document::document_version_global();
-    // Wrap into u32 keeping the low bits — the renderer only cares
-    // about inequality, not magnitude. Wrap is well-defined.
-    (raw & u64::from(u32::MAX)) as u32
+pub fn document_version() -> f64 {
+    // `as f64` from `u64` is lossless for inputs ≤ 2^53; for
+    // larger inputs it rounds to the nearest f64, which is fine
+    // because we only need *change detection*, not exact magnitude.
+    // The next mutation past the rounding boundary still produces a
+    // different f64, so the poller still wakes up on the next bump.
+    kcreate_core::document::document_version_global() as f64
 }
 
 /// Snapshot the current project's SQLCipher encryption status.
@@ -1751,7 +1764,13 @@ pub fn raster_crop(
 /// CPU and ~250 ms on GPU; the AsyncTask was already implemented
 /// in `phase11.rs` but the N-API export here was still synchronous,
 /// negating the off-thread design.
-#[napi]
+///
+/// Phase 11 Block B follow-up round 2 — Devin Review BUG-0001.
+/// `#[napi(ts_return_type = "Promise<void>")]` so napi-rs's generated
+/// `.d.ts` matches the hand-written `bridge.ts` (which declares
+/// `Promise<void>`) and the `await` site in `main.ts`. AGENTS.md
+/// Rule 4 (wire-format lockstep).
+#[napi(ts_return_type = "Promise<void>")]
 #[allow(clippy::needless_pass_by_value)]
 pub fn raster_rotate(
     node_id: String,
@@ -1771,7 +1790,11 @@ pub fn raster_rotate(
 /// layer still costs an in-place pixel walk on the worker pool;
 /// dispatch through `RasterFlipTask` so the main thread stays
 /// responsive.
-#[napi]
+///
+/// Phase 11 Block B follow-up round 2 — Devin Review BUG-0002. See
+/// the `raster_rotate` doc-comment above for the wire-format-lockstep
+/// rationale on `ts_return_type`.
+#[napi(ts_return_type = "Promise<void>")]
 #[allow(clippy::needless_pass_by_value)]
 pub fn raster_flip(
     node_id: String,
@@ -1799,7 +1822,11 @@ pub fn raster_flip(
 /// Phase 11 Block B follow-up — Devin Review ANALYSIS-0003.
 /// Routed through `phase11::RasterHealTask` so multiple heal
 /// strokes don't queue on the main thread.
-#[napi]
+///
+/// Phase 11 Block B follow-up round 2 — Devin Review BUG-0003. See
+/// the `raster_rotate` doc-comment above for the wire-format-lockstep
+/// rationale on `ts_return_type`.
+#[napi(ts_return_type = "Promise<void>")]
 #[allow(clippy::needless_pass_by_value)]
 pub fn raster_heal(
     node_id: String,

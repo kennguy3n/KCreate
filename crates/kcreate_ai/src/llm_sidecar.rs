@@ -972,6 +972,13 @@ mod tests {
     /// return false. We simulate this with a tiny_http server that
     /// returns 401 on every request: the verifier sees the status
     /// and rejects.
+    ///
+    /// Round 2 — Devin Review ANALYSIS-0005: this test ALSO captures
+    /// the inbound `Authorization` header on the mock server and
+    /// asserts it carries the bearer token the verifier was asked
+    /// to prove. This closes the coverage gap where a regression
+    /// that *forgot* to send the header (or sent a wrong literal)
+    /// could still pass the prior status-only assertion.
     #[cfg(feature = "llm_sidecar")]
     #[test]
     fn verify_rejects_foreign_listener_returning_401() {
@@ -979,11 +986,25 @@ mod tests {
         let server = tiny_http::Server::http(format!("127.0.0.1:{port}")).expect("server");
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let stop_for_thread = std::sync::Arc::clone(&stop);
+        let captured_auth =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let captured_for_thread = std::sync::Arc::clone(&captured_auth);
         let handle = std::thread::spawn(move || {
             for req in server.incoming_requests() {
                 if stop_for_thread.load(std::sync::atomic::Ordering::Acquire) {
                     break;
                 }
+                // Record the Authorization header (or empty string
+                // if missing) so the test can assert that the
+                // verifier actually sent the bearer token rather
+                // than relying solely on the response status.
+                let auth = req
+                    .headers()
+                    .iter()
+                    .find(|h| h.field.as_str().as_str().eq_ignore_ascii_case("authorization"))
+                    .map(|h| h.value.as_str().to_string())
+                    .unwrap_or_default();
+                captured_for_thread.lock().expect("captured-auth lock").push(auth);
                 let resp = tiny_http::Response::from_string("unauthorized")
                     .with_status_code(tiny_http::StatusCode(401));
                 let _ = req.respond(resp);
@@ -995,6 +1016,11 @@ mod tests {
             !ok,
             "verifier must reject a listener that returns 401 — that's the TOCTOU signature",
         );
+        let seen = captured_auth.lock().expect("captured-auth lock").clone();
+        assert!(
+            seen.iter().any(|h| h == "Bearer the-correct-token"),
+            "verify_bearer_token must send `Authorization: Bearer <token>`; saw {seen:?}",
+        );
         stop.store(true, std::sync::atomic::Ordering::Release);
         let _ = handle;
     }
@@ -1002,6 +1028,12 @@ mod tests {
     /// Phase 11 Block E Task 26 — a real llama-server-style listener
     /// (200 OK on /v1/models with the correct bearer) MUST be
     /// accepted. tiny_http returns 200 by default.
+    ///
+    /// Round 2 — Devin Review ANALYSIS-0005: same header-capture
+    /// hardening as the 401 test above. We additionally only
+    /// return `200 OK` if the bearer matches, and `401` otherwise,
+    /// so a future regression that misformats the header would
+    /// flip this assertion from `accept` to `reject`.
     #[cfg(feature = "llm_sidecar")]
     #[test]
     fn verify_accepts_real_listener_returning_200() {
@@ -1009,12 +1041,31 @@ mod tests {
         let server = tiny_http::Server::http(format!("127.0.0.1:{port}")).expect("server");
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let stop_for_thread = std::sync::Arc::clone(&stop);
+        let captured_auth =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let captured_for_thread = std::sync::Arc::clone(&captured_auth);
         let handle = std::thread::spawn(move || {
             for req in server.incoming_requests() {
                 if stop_for_thread.load(std::sync::atomic::Ordering::Acquire) {
                     break;
                 }
-                let resp = tiny_http::Response::from_string("{\"data\":[]}");
+                let auth = req
+                    .headers()
+                    .iter()
+                    .find(|h| h.field.as_str().as_str().eq_ignore_ascii_case("authorization"))
+                    .map(|h| h.value.as_str().to_string())
+                    .unwrap_or_default();
+                captured_for_thread.lock().expect("captured-auth lock").push(auth.clone());
+                // Mimic a real llama-server that enforces --api-key:
+                // 200 only when the bearer header matches what we
+                // were told to expect. Verifier's positive case must
+                // therefore actually be carrying the header.
+                let resp = if auth == "Bearer the-correct-token" {
+                    tiny_http::Response::from_string("{\"data\":[]}")
+                } else {
+                    tiny_http::Response::from_string("unauthorized")
+                        .with_status_code(tiny_http::StatusCode(401))
+                };
                 let _ = req.respond(resp);
             }
         });
@@ -1023,6 +1074,11 @@ mod tests {
         assert!(
             ok,
             "verifier must accept a listener that returns 200 on /v1/models",
+        );
+        let seen = captured_auth.lock().expect("captured-auth lock").clone();
+        assert!(
+            seen.iter().any(|h| h == "Bearer the-correct-token"),
+            "verify_bearer_token must send `Authorization: Bearer <token>`; saw {seen:?}",
         );
         stop.store(true, std::sync::atomic::Ordering::Release);
         let _ = handle;

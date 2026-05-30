@@ -470,8 +470,15 @@ pub fn prepare_thumbnails_background(max_dim_px: u32) -> Result<()> {
     let guard = PrewarmGuard;
     // Snapshot the page list under the workspace lock so the worker
     // doesn't depend on the document staying open.
+    //
+    // Phase 11 Block D follow-up round 2 — Devin Review ANALYSIS-0001
+    // (round 2). `page_ids(ws)` is a pure read over `ws.project.doc`;
+    // upgrading to `write()` was a mechanical Mutex → RwLock leftover.
+    // Use `read()` so the thumbnail prewarm doesn't block concurrent
+    // document reads during page enumeration. Matches the discipline
+    // documented in ARCHITECTURE.md §17p (RwLock audit intent).
     let pages = {
-        let wsguard = workspace_slot().write();
+        let wsguard = workspace_slot().read();
         let ws = match wsguard.as_ref() {
             Some(ws) => ws,
             None => {

@@ -690,8 +690,12 @@ export interface Bridge {
     w: number,
     h: number,
   ): Promise<void>;
-  rasterRotate(nodeId: string, angleDeg: number): void;
-  rasterFlip(nodeId: string, direction: string): void;
+  // Phase 11 Block B follow-up — Devin Review ANALYSIS-0003.
+  // Rotate / flip / heal now dispatch through `AsyncTask` on the
+  // Rust side, so the N-API surface returns `Promise<void>` instead
+  // of executing on the main thread.
+  rasterRotate(nodeId: string, angleDeg: number): Promise<void>;
+  rasterFlip(nodeId: string, direction: string): Promise<void>;
   rasterHeal(
     nodeId: string,
     srcX: number,
@@ -699,7 +703,7 @@ export interface Bridge {
     dstX: number,
     dstY: number,
     radius: number,
-  ): void;
+  ): Promise<void>;
   rasterPreviewFilter(nodeId: string, filterJson: string): Buffer;
   // Phase 8 Block B — perspective transform, HSL adjustment, color
   // balance adjustment, and mask-aware filter application. Each

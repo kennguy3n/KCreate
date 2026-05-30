@@ -26,6 +26,15 @@ base64.workspace = true
 pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
 sha2 = "0.10"
 rand = { version = "0.8", default-features = false, features = ["std", "std_rng"] }
+# Phase 11 Block E follow-up — Devin Review ANALYSIS-0008.
+# Key wiping for the cached SQLCipher key on Drop / explicit
+# `clear_cached_key`. Plain `for byte in iter { *byte = 0 }` is
+# permitted to be dead-code-eliminated by LLVM because the buffer
+# is never read after the loop. `zeroize` uses inline-asm /
+# volatile primitives to defeat that optimisation. Already
+# resident transitively via `chacha20poly1305` + `curve25519-dalek`,
+# so adding the direct dep is free.
+zeroize = { version = "1", default-features = false, features = ["alloc"] }
 
 [dev-dependencies]
 tempfile = "3.10"

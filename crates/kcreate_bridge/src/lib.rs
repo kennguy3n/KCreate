@@ -1743,17 +1743,40 @@ pub fn raster_crop(
 }
 
 /// Rotate a raster layer by `angle_deg` degrees (positive = clockwise).
+///
+/// Phase 11 Block B follow-up — Devin Review ANALYSIS-0003.
+/// Now routed through `phase11::RasterRotateTask` so the rotation
+/// runs on the libuv worker pool instead of the main thread.
+/// Rotating a 64 MP layer ran the renderer thread for ~700 ms on
+/// CPU and ~250 ms on GPU; the AsyncTask was already implemented
+/// in `phase11.rs` but the N-API export here was still synchronous,
+/// negating the off-thread design.
 #[napi]
 #[allow(clippy::needless_pass_by_value)]
-pub fn raster_rotate(node_id: String, angle_deg: f64) -> NapiResult<()> {
+pub fn raster_rotate(
+    node_id: String,
+    angle_deg: f64,
+) -> NapiResult<AsyncTask<phase11::RasterRotateTask>> {
     let id = parse_uuid(&node_id)?;
-    raster_ops::rotate(id, angle_deg as f32).map_err(map_doc_err)
+    Ok(AsyncTask::new(phase11::RasterRotateTask {
+        node_id: id,
+        angle_deg: angle_deg as f32,
+    }))
 }
 
 /// Flip a raster layer. `direction` is `"horizontal"` or `"vertical"`.
+///
+/// Phase 11 Block B follow-up — Devin Review ANALYSIS-0003.
+/// Same async migration as `raster_rotate` above. Flipping a large
+/// layer still costs an in-place pixel walk on the worker pool;
+/// dispatch through `RasterFlipTask` so the main thread stays
+/// responsive.
 #[napi]
 #[allow(clippy::needless_pass_by_value)]
-pub fn raster_flip(node_id: String, direction: String) -> NapiResult<()> {
+pub fn raster_flip(
+    node_id: String,
+    direction: String,
+) -> NapiResult<AsyncTask<phase11::RasterFlipTask>> {
     let id = parse_uuid(&node_id)?;
     let dir = match direction.as_str() {
         "horizontal" => raster_ops::FlipDirection::Horizontal,
@@ -1764,11 +1787,18 @@ pub fn raster_flip(node_id: String, direction: String) -> NapiResult<()> {
             )));
         }
     };
-    raster_ops::flip(id, dir).map_err(map_doc_err)
+    Ok(AsyncTask::new(phase11::RasterFlipTask {
+        node_id: id,
+        direction: dir,
+    }))
 }
 
 /// Heal a disc from `(src_x, src_y)` over `(dst_x, dst_y)` with the
 /// given radius. All coordinates are source-pixel.
+///
+/// Phase 11 Block B follow-up — Devin Review ANALYSIS-0003.
+/// Routed through `phase11::RasterHealTask` so multiple heal
+/// strokes don't queue on the main thread.
 #[napi]
 #[allow(clippy::needless_pass_by_value)]
 pub fn raster_heal(
@@ -1778,9 +1808,16 @@ pub fn raster_heal(
     dst_x: u32,
     dst_y: u32,
     radius: u32,
-) -> NapiResult<()> {
+) -> NapiResult<AsyncTask<phase11::RasterHealTask>> {
     let id = parse_uuid(&node_id)?;
-    raster_ops::heal(id, src_x, src_y, dst_x, dst_y, radius).map_err(map_doc_err)
+    Ok(AsyncTask::new(phase11::RasterHealTask {
+        node_id: id,
+        src_x,
+        src_y,
+        dst_x,
+        dst_y,
+        radius,
+    }))
 }
 
 /// Non-destructive filter preview. `filter_json` is a JSON object

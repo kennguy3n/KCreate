@@ -191,6 +191,16 @@ pub enum AclCryptoError {
     NonceSamplingFailed(String),
     #[error("ACL blob AEAD authentication failed (wrong key, corrupt ciphertext, or tampered)")]
     DecryptFailed,
+    /// Phase 11 Block E Task 27 follow-up — Devin Review BUG-0002.
+    ///
+    /// Surface AEAD encrypt failures with their own variant.
+    /// ChaCha20-Poly1305 encryption is practically infallible (no
+    /// realistic trigger in current `chacha20poly1305`), but future
+    /// crate versions or pluggable AEAD backends could add bounds
+    /// checks. Keeping a dedicated variant means decrypt-side error
+    /// messages stay accurate to what actually happened.
+    #[error("ACL blob AEAD encryption failed")]
+    EncryptFailed,
 }
 
 /// Encrypt the JSON-serialised ACL `plaintext` under the same
@@ -218,16 +228,20 @@ pub fn encrypt_acl_bytes(key: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>, Ac
     let cipher = ChaCha20Poly1305::new(Key::from_slice(key));
     let mut nonce_bytes = [0u8; ACL_NONCE_LEN];
     // Sample directly from the OS CSPRNG — same source `clipboard.rs`
-    // documents callers should use for AEAD nonces. `getrandom` is
-    // fallible on every supported platform (kernel CSPRNG unavailable,
-    // sandboxed env without `/dev/urandom`, etc.) so the failure mode
-    // is surfaced rather than panicked.
-    getrandom::getrandom(&mut nonce_bytes)
+    // documents callers should use for AEAD nonces. `getrandom::fill`
+    // is fallible on every supported platform (kernel CSPRNG
+    // unavailable, sandboxed env without `/dev/urandom`, etc.) so the
+    // failure mode is surfaced rather than panicked.
+    //
+    // Phase 11 Block E follow-up — Devin Review ANALYSIS-0002.
+    // Uses the 0.3 `fill()` API now that the workspace dep has been
+    // unified at 0.3.
+    getrandom::fill(&mut nonce_bytes)
         .map_err(|e| AclCryptoError::NonceSamplingFailed(e.to_string()))?;
     let nonce = Nonce::from_slice(&nonce_bytes);
     let ciphertext = cipher
         .encrypt(nonce, plaintext)
-        .map_err(|_| AclCryptoError::DecryptFailed)?;
+        .map_err(|_| AclCryptoError::EncryptFailed)?;
     let mut out = Vec::with_capacity(ACL_ENC_MAGIC.len() + ACL_NONCE_LEN + ciphertext.len());
     out.extend_from_slice(ACL_ENC_MAGIC);
     out.extend_from_slice(&nonce_bytes);

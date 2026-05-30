@@ -1349,11 +1349,21 @@ fn blob_hash_to_token(blob_hash: &str) -> u64 {
         }
         u64::from_le_bytes(folded)
     } else {
-        // Fallback: hash the raw string. Stable across runs because
-        // SipHasher with the default seed is deterministic per
-        // process; this branch only fires for tests / corrupt data.
-        use std::hash::{BuildHasher, Hasher};
-        let builder = std::collections::hash_map::RandomState::new();
+        // Fallback: hash the raw string with a *fixed-seed* hasher.
+        //
+        // Phase 11 Block A follow-up — Devin Review BUG-0003.
+        //
+        // Earlier revisions used `RandomState::new()`, whose seed is
+        // randomised per call — so the same blob string produced a
+        // different token on each invocation, breaking the
+        // pipeline's display-list cache for non-hex blob hashes
+        // (tests, in-memory fixtures, corrupt project data).
+        // `BuildHasherDefault::<DefaultHasher>` always constructs a
+        // `DefaultHasher` with the standard zero-seeded SipHash
+        // state, which is deterministic for the lifetime of the
+        // process AND across processes on the same rustc build.
+        use std::hash::{BuildHasher, BuildHasherDefault, Hasher};
+        let builder = BuildHasherDefault::<std::collections::hash_map::DefaultHasher>::default();
         let mut hasher = builder.build_hasher();
         hasher.write(blob_hash.as_bytes());
         hasher.finish()

@@ -105,7 +105,7 @@ tiny-skia = "0.11"
 glam = { version = "0.29", features = ["bytemuck"] }
 
 # Async / sync
-parking_lot = "0.12"
+parking_lot = { version = "0.12", features = ["arc_lock"] }
 crossbeam-channel = "0.5"
 
 # Logging / errors
@@ -205,7 +205,16 @@ chacha20poly1305 = { version = "0.10", default-features = false, features = ["al
 # the clipboard-share send path. Already in the dep tree
 # transitively via curve25519-dalek; pulling it in directly keeps
 # the call site auditable.
-getrandom = "0.2"
+#
+# Phase 11 Block E follow-up — Devin Review ANALYSIS-0002.
+# Pinned at 0.3 so every caller in the workspace (kcreate_collab,
+# kcreate_bridge, kcreate_ai LLM sidecar) goes through the same
+# `getrandom::fill(&mut buf)` API. Earlier this lived at 0.2 with
+# `kcreate_ai` overriding to 0.3 directly, which left two copies of
+# the crate in the dep tree and split the call style. The 0.3
+# release is API-renamed (getrandom → fill) but is otherwise the
+# same OS-CSPRNG wrapper, so the security posture is unchanged.
+getrandom = "0.3"
 
 # Phase 3 LAN transport — these are intentionally pulled in only by
 # `kcreate_collab_transport` (and transitively, the bridge under the

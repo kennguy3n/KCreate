@@ -1172,11 +1172,20 @@ function registerIpcHandlers(): void {
   ipcMain.handle(
     "kcreate/export/svg",
     (_e, nodeIds: string[], optionsJson: string) => {
-      // Pick async vs sync based on doc size. Worker dispatch is
-      // ~200 µs; SVG serialisation of a 5-node doc is faster than
-      // that, so we keep the sync path for small docs and switch
-      // to the async path past 100 nodes (where the worker round-
-      // trip pays for itself many times over).
+      // Pick async vs sync based on the **export selection** size,
+      // not the total document size. Worker dispatch is ~200 µs;
+      // serialising the SVG for a 5-node selection is faster than
+      // that, so the sync path stays for small selections and we
+      // switch to the async worker past 100 selected nodes (where
+      // the round-trip pays for itself many times over). This is a
+      // heuristic, not a guarantee — a single-artboard export from
+      // a huge document still hits the sync path because the
+      // subtree we're serialising is bounded by `nodeIds`, not the
+      // whole document. The bridge SVG serialiser walks only the
+      // requested nodes' subtrees, so the heuristic tracks the
+      // actual cost.
+      //
+      // Phase 11 Block B follow-up — Devin Review ANALYSIS-0006.
       if (nodeIds.length > 100) {
         return requireBridge().exportSvgAsync(nodeIds, optionsJson);
       }
@@ -2658,21 +2667,26 @@ function registerIpcHandlers(): void {
       await requireBridge().rasterCrop(nodeId, x, y, w, h);
     },
   );
+  // Phase 11 Block B follow-up — Devin Review ANALYSIS-0003.
+  // Rotate / flip / heal are now async (AsyncTask) on the Rust
+  // side; `await` so the IPC reply is sent only after the worker
+  // finishes mutating the layer (renderer relies on the resolved
+  // promise to invalidate caches and refresh the tree).
   ipcMain.handle(
     "kcreate/raster/rotate",
-    (_e, nodeId: string, angleDeg: number) => {
-      requireBridge().rasterRotate(nodeId, angleDeg);
+    async (_e, nodeId: string, angleDeg: number) => {
+      await requireBridge().rasterRotate(nodeId, angleDeg);
     },
   );
   ipcMain.handle(
     "kcreate/raster/flip",
-    (_e, nodeId: string, direction: string) => {
-      requireBridge().rasterFlip(nodeId, direction);
+    async (_e, nodeId: string, direction: string) => {
+      await requireBridge().rasterFlip(nodeId, direction);
     },
   );
   ipcMain.handle(
     "kcreate/raster/heal",
-    (
+    async (
       _e,
       nodeId: string,
       srcX: number,
@@ -2681,7 +2695,7 @@ function registerIpcHandlers(): void {
       dstY: number,
       radius: number,
     ) => {
-      requireBridge().rasterHeal(nodeId, srcX, srcY, dstX, dstY, radius);
+      await requireBridge().rasterHeal(nodeId, srcX, srcY, dstX, dstY, radius);
     },
   );
   ipcMain.handle(

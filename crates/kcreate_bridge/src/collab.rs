@@ -4203,13 +4203,19 @@ pub fn session_clipboard_share(
 /// ChaCha20-Poly1305 nonce. Pulled into its own helper so the
 /// unsafe-feeling `getrandom` call site is isolated and easy to
 /// audit.
+///
+/// Phase 11 Block E follow-up — Devin Review ANALYSIS-0002.
+/// Uses the 0.3 `fill()` API now that the workspace dep has been
+/// unified at 0.3 (previously this crate pinned 0.2 directly while
+/// `kcreate_ai` already pinned 0.3, so two copies of the crate
+/// were resident).
 fn generate_random_nonce() -> [u8; 12] {
     let mut nonce = [0u8; 12];
     // ed25519-dalek re-exports the `signature::rand_core` traits;
     // we use `getrandom` directly to avoid pulling a separate
     // `rand_core` dep through to this crate. `getrandom` is already
     // a transitive dep via curve25519-dalek.
-    getrandom::getrandom(&mut nonce).expect("OS RNG must succeed for clipboard nonce");
+    getrandom::fill(&mut nonce).expect("OS RNG must succeed for clipboard nonce");
     nonce
 }
 

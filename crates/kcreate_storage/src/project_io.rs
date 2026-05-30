@@ -422,11 +422,20 @@ impl ProjectStore {
     /// SQLCipher key. Idempotent. Used by `Drop` to wipe key bytes
     /// when the project closes, and by tests that need to assert the
     /// key is no longer in memory.
+    ///
+    /// Phase 11 Block E follow-up — Devin Review ANALYSIS-0008.
+    /// Uses `zeroize::Zeroize` rather than a plain
+    /// `for byte in key.iter_mut() { *byte = 0 }` loop. The hand-
+    /// written loop is permitted to be dead-code-eliminated by LLVM
+    /// at higher opt levels because the buffer is never read after
+    /// the writes; `zeroize` uses inline-asm / volatile primitives
+    /// that the optimiser cannot elide, which is what's needed for
+    /// the security invariant ("key material is wiped from memory
+    /// before the boxed buffer is freed").
     pub fn clear_cached_key(&mut self) {
+        use zeroize::Zeroize;
         if let Some(mut key) = self.cached_key.take() {
-            for byte in key.iter_mut() {
-                *byte = 0;
-            }
+            key.zeroize();
         }
     }
 

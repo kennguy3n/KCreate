@@ -425,6 +425,16 @@ fn format_finite(v: f64, precision: u8) -> String {
 fn collapse_whitespace(s: &str) -> String {
     // Collapse runs of whitespace BUT only outside of attribute
     // values. We do this with a small state machine.
+    //
+    // We must NOT touch the contents of attribute values, including
+    // values that happen to contain the literal sequences `> <`,
+    // ` >`, or `< ` (e.g. `title="a > b"`). Earlier versions of this
+    // function ran post-hoc `.replace("> <", "><")` / `.replace(" >",
+    // ">")` / `.replace("< ", "<")` passes over the already-processed
+    // string, which would corrupt such attribute values. Instead we
+    // do those normalisations inline using a small lookback: when we
+    // are about to emit a space-then-`<` or space-then-`>` pair while
+    // outside of an attribute, we drop the space.
     let mut out = String::with_capacity(s.len());
     let mut last_was_space = false;
     let mut in_attr = false;
@@ -438,6 +448,9 @@ fn collapse_whitespace(s: &str) -> String {
             continue;
         }
         if ch == '"' || ch == '\'' {
+            // Edge case: drop a pending unattached space directly
+            // adjacent to the start of an attribute value's quote.
+            // Browsers tolerate it but it adds bytes for no win.
             quote_char = ch;
             in_attr = true;
             out.push(ch);
@@ -450,14 +463,26 @@ fn collapse_whitespace(s: &str) -> String {
                 last_was_space = true;
             }
         } else {
+            // Normalise " <" → "<" and " >" → ">" inline so we never
+            // need to post-process the string. Because `in_attr` is
+            // false here, we know the trailing space in `out` is real
+            // markup whitespace, not part of an authored attribute
+            // value, so it is safe to drop.
+            if last_was_space && (ch == '<' || ch == '>') && out.ends_with(' ') {
+                out.pop();
+            }
+            // And normalise "> <" → "><" by dropping a leading space
+            // immediately after a closing `>` once we see the next
+            // `<`. Same reasoning — outside of `in_attr`, that space
+            // is markup whitespace.
+            if ch == '<' && out.ends_with("> ") {
+                out.pop();
+            }
             out.push(ch);
             last_was_space = false;
         }
     }
-    // Trim "> <" → "><" and " <" / "> " patterns introduced above.
-    out.replace("> <", "><")
-        .replace(" >", ">")
-        .replace("< ", "<")
+    out
 }
 
 #[cfg(test)]
@@ -549,6 +574,32 @@ mod tests {
         assert!(
             r.output_svg.contains(css),
             "style payload mutated: {}",
+            r.output_svg
+        );
+    }
+
+    #[test]
+    fn attribute_value_containing_markup_chars_is_not_mangled() {
+        // Regression for: collapse_whitespace used to do a post-hoc
+        // `.replace("> <", "><")` / `.replace(" >", ">")` /
+        // `.replace("< ", "<")` pass that would silently corrupt
+        // attribute values containing those literal sequences.
+        // Phase 10 — Devin Review finding ANALYSIS_…_0007.
+        let svg = r#"<svg><g title="a > b"><rect aria-label="x < y"/><circle data-cmp="p > q < r"/></g></svg>"#;
+        let r = optimize_svg(svg).unwrap();
+        assert!(
+            r.output_svg.contains(r#"title="a > b""#),
+            "title attribute mangled: {}",
+            r.output_svg
+        );
+        assert!(
+            r.output_svg.contains(r#"aria-label="x < y""#),
+            "aria-label attribute mangled: {}",
+            r.output_svg
+        );
+        assert!(
+            r.output_svg.contains(r#"data-cmp="p > q < r""#),
+            "data-cmp attribute mangled: {}",
             r.output_svg
         );
     }

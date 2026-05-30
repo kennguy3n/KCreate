@@ -157,7 +157,13 @@ pub struct VisionStatusInfo {
 pub fn vision_start(pack_id: String) -> Phase4Result<u16> {
     let models_dir = models_root();
     let platform = runtime_slot().lock().platform;
-    let plan = plan_dispatch(&pack_id, &models_dir, platform).map_err(Phase4BridgeError::Sidecar)?;
+    // Phase 12 Block A removed MLX pack ids from the registry; a
+    // stale project file or saved settings entry can still surface
+    // them here. Rewrite to the current id transparently so the user
+    // doesn't see an opaque `ModelMissing` after upgrade.
+    let resolved_pack_id = resolve_pack_id(&pack_id);
+    let plan = plan_dispatch(&resolved_pack_id, &models_dir, platform)
+        .map_err(Phase4BridgeError::Sidecar)?;
     let mut guard = vision_slot().lock();
     // Stop the previous sidecar first — never run two side-by-side,
     // they'd both hold mmproj + model weights and OOM a tight box.
@@ -397,7 +403,30 @@ pub fn vision_recommended_pack() -> Option<String> {
 /// id, return the mmproj companion's id (or `None` if the pack has
 /// no companion projector — e.g. a text-only LLM pack).
 pub fn vision_mmproj_for(pack_id: String) -> Option<String> {
-    kcreate_ai::model_registry::mmproj_for(&pack_id).map(str::to_string)
+    // Apply the Phase 12 legacy-id migration first so a stale
+    // saved-preferences entry pointing at `vision_qwen25vl_7b_mlx`
+    // still resolves the matching mmproj companion.
+    let resolved = resolve_pack_id(&pack_id);
+    kcreate_ai::model_registry::mmproj_for(&resolved).map(str::to_string)
+}
+
+/// Apply the legacy → current pack-id migration table from
+/// `kcreate_ai::model_registry::migrate_legacy_pack_id`. Returns the
+/// rewritten id (or `pack_id` unchanged when no migration applies)
+/// and emits a one-time `log::warn!` so the renderer can surface a
+/// "your saved model preference was renamed" prompt in the model
+/// manager. We use `log::warn!` (not `error!`) because the rewrite
+/// is benign — the user lost no functionality, the new id points at
+/// the same architecture under the GGUF-llama-server pipeline.
+fn resolve_pack_id(pack_id: &str) -> String {
+    if let Some(new_id) = kcreate_ai::model_registry::migrate_legacy_pack_id(pack_id) {
+        log::warn!(
+            "kcreate_bridge: legacy MLX pack id `{pack_id}` migrated to `{new_id}` \
+             (Phase 12 removed the MLX runtime; update saved preferences to silence this)",
+        );
+        return new_id.to_string();
+    }
+    pack_id.to_string()
 }
 
 /// List the packs the renderer is allowed to show in the vision
@@ -477,13 +506,19 @@ pub fn image_gen_start(pack_id: String) -> Phase4Result<u16> {
     }
     drop(cfg);
     let dir = models_root();
+    // Phase 12 Block A removed `image_gen_flux_klein_mlx` from the
+    // registry; old project files / settings can still reference it.
+    // Rewrite transparently to the current FLUX Klein 4B GGUF pack.
+    let resolved_pack_id = resolve_pack_id(&pack_id);
     let pack = list_model_packs(&dir)
         .into_iter()
-        .find(|p| p.id == pack_id)
-        .ok_or_else(|| Phase4BridgeError::Invalid(format!("unknown image-gen pack: {pack_id}")))?;
+        .find(|p| p.id == resolved_pack_id)
+        .ok_or_else(|| {
+            Phase4BridgeError::Invalid(format!("unknown image-gen pack: {resolved_pack_id}"))
+        })?;
     if pack.category != kcreate_ai::ModelPackCategory::Generation {
         return Err(Phase4BridgeError::Invalid(format!(
-            "pack {pack_id} is not an image-generation pack"
+            "pack {resolved_pack_id} is not an image-generation pack"
         )));
     }
     let model_path = dir.join(&pack.file_path);
@@ -504,9 +539,9 @@ pub fn image_gen_start(pack_id: String) -> Phase4Result<u16> {
         // Phase 12 leaves the registry shipping the single fused
         // pack `image_gen_flux_klein_4b`; users who load a
         // standalone FLUX checkpoint pass component paths through
-        // `KCREATE_SD_SERVER_EXTRA_ARGS` (space-separated, parsed
-        // shell-style — see `parse_sd_server_extra_args`).
-        extra_args: parse_sd_server_extra_args(),
+        // `KCREATE_SD_SERVER_EXTRA_ARGS` (POSIX shell-word parsed —
+        // see `parse_sd_server_extra_args`).
+        extra_args: parse_sd_server_extra_args()?,
     };
     let mut sidecar = DiffusionSidecar::new(cfg);
     let port = sidecar.start().map_err(Phase4BridgeError::Sidecar)?;
@@ -515,23 +550,46 @@ pub fn image_gen_start(pack_id: String) -> Phase4Result<u16> {
 }
 
 /// Parse the `KCREATE_SD_SERVER_EXTRA_ARGS` env var into an argv
-/// slice that gets forwarded to sd-server. The env var is a
-/// space-separated list of tokens; quoting and escapes are NOT
-/// supported because every flag sd-server accepts is either a
-/// hyphenated long-flag or a path that callers can avoid spaces in.
-/// Empty / unset => no extra args.
+/// slice that gets forwarded to sd-server. The env var is parsed
+/// with POSIX shell-word rules (`shell-words` crate): single and
+/// double quotes group spaces into a single token, and backslash
+/// escapes inside double quotes survive. Empty / unset => no extra
+/// args.
 ///
-/// Example:
-///   KCREATE_SD_SERVER_EXTRA_ARGS="--clip_l /m/clip.sft --t5xxl /m/t5.sft --vae /m/ae.sft"
-fn parse_sd_server_extra_args() -> Vec<String> {
-    std::env::var("KCREATE_SD_SERVER_EXTRA_ARGS")
-        .ok()
-        .map(|s| {
-            s.split_whitespace()
-                .map(str::to_string)
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default()
+/// We use shell-word splitting (vs. naive `split_whitespace`)
+/// specifically so Windows paths with spaces work. On a typical
+/// Windows install the FLUX text encoder lives somewhere like
+/// `C:\Program Files\sd-models\flux\t5xxl_fp16.safetensors`; with
+/// the old whitespace-split parser the operator had to either
+/// reinstall to a no-space path or hard-link an alias, and even
+/// then they got an opaque `failed to open file` from sd-server on
+/// the malformed argv. Quoting now works as expected, e.g.:
+///
+/// ```text
+/// KCREATE_SD_SERVER_EXTRA_ARGS=
+///   --clip_l "C:\Program Files\sd-models\clip_l.safetensors"
+///   --t5xxl  "C:\Program Files\sd-models\t5xxl.safetensors"
+///   --vae    "C:\Program Files\sd-models\ae.safetensors"
+/// ```
+///
+/// Returns `Phase4BridgeError::Invalid` if the env var is set but
+/// the value has mismatched quotes — surfacing the parse failure to
+/// the renderer is much friendlier than silently truncating the
+/// argv and letting sd-server fail with a cryptic missing-file
+/// error.
+fn parse_sd_server_extra_args() -> Phase4Result<Vec<String>> {
+    let Some(raw) = std::env::var_os("KCREATE_SD_SERVER_EXTRA_ARGS") else {
+        return Ok(Vec::new());
+    };
+    let raw_str = raw.to_string_lossy();
+    if raw_str.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    shell_words::split(&raw_str).map_err(|e| {
+        Phase4BridgeError::Invalid(format!(
+            "KCREATE_SD_SERVER_EXTRA_ARGS could not be parsed as a shell-quoted argv: {e}",
+        ))
+    })
 }
 
 /// Stop the image-generation sidecar. Idempotent.
@@ -828,5 +886,191 @@ mod tests {
         assert_eq!(back.width, 512);
         assert_eq!(back.height, 512);
         assert_eq!(back.png_b64, "iVBORw0KGgo=");
+    }
+
+    // -------------------------------------------------------------
+    // KCREATE_SD_SERVER_EXTRA_ARGS parsing — POSIX shell-word rules.
+    //
+    // These tests run serially (the env var is process-global) but
+    // each restores the prior value before returning so test order
+    // doesn't leak. They are guarded by a single mutex so concurrent
+    // executors can't race the `set_var` / `remove_var` pair.
+    // -------------------------------------------------------------
+
+    fn sd_args_test_lock() -> &'static parking_lot::Mutex<()> {
+        static LOCK: std::sync::OnceLock<parking_lot::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| parking_lot::Mutex::new(()))
+    }
+
+    /// Helper: run `body` with `KCREATE_SD_SERVER_EXTRA_ARGS` forced
+    /// to `value` (or unset when `None`), then restore whatever the
+    /// caller had set on the way in.
+    fn with_sd_extra_args<R>(value: Option<&str>, body: impl FnOnce() -> R) -> R {
+        let _guard = sd_args_test_lock().lock();
+        let prior = std::env::var_os("KCREATE_SD_SERVER_EXTRA_ARGS");
+        // SAFETY: env mutation is gated by `sd_args_test_lock`, and
+        // every test that touches this env var goes through this
+        // helper. Cargo runs unit tests across multiple threads by
+        // default; the lock plus the restore-on-exit semantics is
+        // what keeps the parser tests reproducible.
+        unsafe {
+            match value {
+                Some(v) => std::env::set_var("KCREATE_SD_SERVER_EXTRA_ARGS", v),
+                None => std::env::remove_var("KCREATE_SD_SERVER_EXTRA_ARGS"),
+            }
+        }
+        let out = body();
+        unsafe {
+            match prior {
+                Some(v) => std::env::set_var("KCREATE_SD_SERVER_EXTRA_ARGS", v),
+                None => std::env::remove_var("KCREATE_SD_SERVER_EXTRA_ARGS"),
+            }
+        }
+        out
+    }
+
+    /// Unset env var => empty argv.
+    #[test]
+    fn parse_sd_extra_args_unset_returns_empty() {
+        let out = with_sd_extra_args(None, parse_sd_server_extra_args).unwrap();
+        assert!(out.is_empty());
+    }
+
+    /// Empty / whitespace-only value => empty argv (no spurious
+    /// tokens that would confuse sd-server's flag parser).
+    #[test]
+    fn parse_sd_extra_args_whitespace_only_returns_empty() {
+        let out = with_sd_extra_args(Some("   \t\n  "), parse_sd_server_extra_args).unwrap();
+        assert!(out.is_empty(), "got {out:?}");
+    }
+
+    /// Plain unquoted argv splits on whitespace, matching prior
+    /// behavior so existing Linux/macOS configs don't regress.
+    #[test]
+    fn parse_sd_extra_args_unquoted_splits_on_whitespace() {
+        let out = with_sd_extra_args(
+            Some("--clip_l /m/clip.sft --t5xxl /m/t5.sft --vae /m/ae.sft"),
+            parse_sd_server_extra_args,
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            vec![
+                "--clip_l".to_string(),
+                "/m/clip.sft".to_string(),
+                "--t5xxl".to_string(),
+                "/m/t5.sft".to_string(),
+                "--vae".to_string(),
+                "/m/ae.sft".to_string(),
+            ]
+        );
+    }
+
+    /// Double-quoted Windows path stays one token, including the
+    /// embedded space — this is the regression the bug report flagged.
+    #[test]
+    fn parse_sd_extra_args_double_quoted_path_with_spaces() {
+        let out = with_sd_extra_args(
+            Some(r#"--clip_l "C:\Program Files\sd-models\clip_l.safetensors" --t5xxl "C:\Program Files\sd-models\t5xxl.safetensors""#),
+            parse_sd_server_extra_args,
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            vec![
+                "--clip_l".to_string(),
+                r"C:\Program Files\sd-models\clip_l.safetensors".to_string(),
+                "--t5xxl".to_string(),
+                r"C:\Program Files\sd-models\t5xxl.safetensors".to_string(),
+            ]
+        );
+    }
+
+    /// Single quotes work the same way as double quotes for POSIX
+    /// shell tokenization — confirm both surfaces.
+    #[test]
+    fn parse_sd_extra_args_single_quoted_path_with_spaces() {
+        let out = with_sd_extra_args(
+            Some("--vae '/Users/me/My Models/ae.safetensors'"),
+            parse_sd_server_extra_args,
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            vec![
+                "--vae".to_string(),
+                "/Users/me/My Models/ae.safetensors".to_string(),
+            ]
+        );
+    }
+
+    /// Mismatched quotes surface as a typed parse error rather than
+    /// a silently-truncated argv — so the renderer can show a
+    /// helpful error toast instead of letting sd-server fail with
+    /// an opaque missing-file message.
+    #[test]
+    fn parse_sd_extra_args_mismatched_quotes_errors() {
+        let r = with_sd_extra_args(Some(r#"--clip_l "unterminated"#), parse_sd_server_extra_args);
+        match r {
+            Err(Phase4BridgeError::Invalid(msg)) => {
+                assert!(
+                    msg.contains("KCREATE_SD_SERVER_EXTRA_ARGS"),
+                    "error message must name the env var, got: {msg}"
+                );
+            }
+            other => panic!("expected Invalid error, got {other:?}"),
+        }
+    }
+
+    /// Phase 12 legacy MLX pack-id migration round-trips through
+    /// the bridge `resolve_pack_id` helper. The helper is the
+    /// single migration seam — every entry point (`vision_start`,
+    /// `image_gen_start`, `vision_mmproj_for`) goes through it, so
+    /// asserting on it here covers all three call sites.
+    #[test]
+    fn resolve_pack_id_migrates_legacy_mlx_ids() {
+        assert_eq!(
+            resolve_pack_id("vision_smolvlm_256m_mlx"),
+            "vision_smolvlm2_256m",
+        );
+        assert_eq!(
+            resolve_pack_id("vision_qwen25vl_7b_mlx"),
+            "vision_qwen25vl_7b",
+        );
+        assert_eq!(
+            resolve_pack_id("image_gen_flux_klein_mlx"),
+            "image_gen_flux_klein_4b",
+        );
+    }
+
+    /// `resolve_pack_id` is a no-op for current ids — current
+    /// callers must not see allocations or spurious log warnings
+    /// for the common path.
+    #[test]
+    fn resolve_pack_id_passes_through_current_ids() {
+        for id in [
+            "llm_bonsai_1_7b",
+            "vision_smolvlm2_256m",
+            "image_gen_flux_klein_4b",
+            "totally_unknown_pack_id",
+        ] {
+            assert_eq!(resolve_pack_id(id), id);
+        }
+    }
+
+    /// `vision_mmproj_for` migrates legacy MLX ids before looking
+    /// up the projector companion — a stale settings entry that
+    /// still names the MLX variant must resolve to the current
+    /// mmproj pack, not surface as `None`.
+    #[test]
+    fn vision_mmproj_for_migrates_legacy_mlx_ids() {
+        assert_eq!(
+            vision_mmproj_for("vision_qwen25vl_7b_mlx".into()),
+            Some("vision_qwen25vl_7b_mmproj".to_string()),
+        );
+        assert_eq!(
+            vision_mmproj_for("vision_smolvlm_256m_mlx".into()),
+            Some("vision_smolvlm2_256m_mmproj".to_string()),
+        );
     }
 }

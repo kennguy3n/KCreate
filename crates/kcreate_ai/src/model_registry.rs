@@ -547,6 +547,40 @@ pub fn mmproj_for(pack_id: &str) -> Option<&'static str> {
     }
 }
 
+/// Migrate a legacy pack id from a saved project preference (or a
+/// stale settings JSON) to the current registry equivalent. Returns
+/// `None` when `pack_id` is already current — callers treat that as
+/// "no rewrite needed" rather than a missing pack.
+///
+/// Phase 12 Block A dropped the MLX runtime, which removed three
+/// pack ids that previously shipped:
+///
+/// * `vision_smolvlm_256m_mlx`   → `vision_smolvlm2_256m`
+/// * `vision_qwen25vl_7b_mlx`    → `vision_qwen25vl_7b`
+/// * `image_gen_flux_klein_mlx`  → `image_gen_flux_klein_4b`
+///
+/// Phase 4–11 installations wrote those ids into project files and
+/// the per-user settings store; without this table they would
+/// surface as `SidecarError::ModelMissing` errors on first launch
+/// after the upgrade. The bridge entry points
+/// (`vision_start`, `image_gen_start`, `vision_mmproj_for`) call
+/// this helper before any lookup so the migration is transparent
+/// to the renderer — they also log a one-time deprecation notice
+/// so the model-manager UI can prompt the user to re-pick.
+///
+/// New pack additions in future phases that supersede an existing
+/// id should extend this table rather than introducing a parallel
+/// migration mechanism.
+#[must_use]
+pub fn migrate_legacy_pack_id(pack_id: &str) -> Option<&'static str> {
+    match pack_id {
+        "vision_smolvlm_256m_mlx" => Some("vision_smolvlm2_256m"),
+        "vision_qwen25vl_7b_mlx" => Some("vision_qwen25vl_7b"),
+        "image_gen_flux_klein_mlx" => Some("image_gen_flux_klein_4b"),
+        _ => None,
+    }
+}
+
 /// Recommend a vision pack for the given (tier, platform). Returns
 /// the canonical pack id the model-manager UI should highlight as
 /// "best for this machine".
@@ -1505,5 +1539,83 @@ mod tests {
             serde_json::to_string(&ModelPackCategory::DesignPro).unwrap(),
             "\"design_pro\""
         );
+    }
+
+    /// Phase 12 migration table: legacy MLX pack ids saved in
+    /// Phase 4–11 project files must rewrite to their current GGUF
+    /// equivalents. Without this, a user upgrading from a Phase 11
+    /// install would see an opaque `ModelMissing` error on the
+    /// first launch.
+    #[test]
+    fn migrate_legacy_pack_id_rewrites_known_mlx_ids() {
+        assert_eq!(
+            migrate_legacy_pack_id("vision_smolvlm_256m_mlx"),
+            Some("vision_smolvlm2_256m"),
+        );
+        assert_eq!(
+            migrate_legacy_pack_id("vision_qwen25vl_7b_mlx"),
+            Some("vision_qwen25vl_7b"),
+        );
+        assert_eq!(
+            migrate_legacy_pack_id("image_gen_flux_klein_mlx"),
+            Some("image_gen_flux_klein_4b"),
+        );
+    }
+
+    /// Migration is a no-op for already-current ids — callers
+    /// distinguish "no rewrite needed" from "unknown pack" by the
+    /// `None` return.
+    #[test]
+    fn migrate_legacy_pack_id_passes_through_current_ids() {
+        for id in [
+            "llm_bonsai_1_7b",
+            "llm_bonsai_4b",
+            "llm_bonsai_8b",
+            "llm_sidecar_3b",
+            "vision_smolvlm2_256m",
+            "vision_qwen25vl_7b",
+            "image_gen_flux_klein_4b",
+            "bg_remove_u2net",
+        ] {
+            assert_eq!(
+                migrate_legacy_pack_id(id),
+                None,
+                "current id `{id}` must NOT be rewritten",
+            );
+        }
+    }
+
+    /// Unknown ids surface as `None` too — the migration helper is
+    /// scoped to legacy MLX ids only; surfacing a typo or stray
+    /// string as `ModelMissing` later is the desired behavior.
+    #[test]
+    fn migrate_legacy_pack_id_passes_through_unknown_ids() {
+        assert_eq!(migrate_legacy_pack_id(""), None);
+        assert_eq!(migrate_legacy_pack_id("totally_not_a_pack"), None);
+        assert_eq!(migrate_legacy_pack_id("vision_qwen25vl_7b_mlx_typo"), None);
+    }
+
+    /// Every migration target must be a real pack id in the
+    /// current registry. Catches the regression where someone
+    /// renames a pack but forgets to update the migration table.
+    #[test]
+    fn migrate_legacy_pack_id_targets_exist_in_registry() {
+        let dir = tempfile::tempdir().unwrap();
+        let current_ids: Vec<String> = list_model_packs(dir.path())
+            .into_iter()
+            .map(|p| p.id)
+            .collect();
+        for legacy in [
+            "vision_smolvlm_256m_mlx",
+            "vision_qwen25vl_7b_mlx",
+            "image_gen_flux_klein_mlx",
+        ] {
+            let target = migrate_legacy_pack_id(legacy)
+                .unwrap_or_else(|| panic!("legacy id `{legacy}` must migrate"));
+            assert!(
+                current_ids.iter().any(|id| id == target),
+                "migration target `{target}` for legacy id `{legacy}` is not a registry pack",
+            );
+        }
     }
 }

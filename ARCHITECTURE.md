@@ -2032,6 +2032,34 @@ removed. The new shape is:
   unchanged — the `kcreate.imageGen.*` IPC surface kept
   the same shape, only the implementing sidecar swapped
   underneath.
+- **Legacy pack-id migration.**
+  `kcreate_ai::model_registry::migrate_legacy_pack_id`
+  rewrites the three obsolete MLX ids
+  (`vision_smolvlm_256m_mlx`,
+  `vision_qwen25vl_7b_mlx`,
+  `image_gen_flux_klein_mlx`) to their current GGUF
+  equivalents. The bridge entry points (`vision_start`,
+  `image_gen_start`, `vision_mmproj_for`) funnel through
+  a single `resolve_pack_id` helper that consults the
+  migration table before any dispatcher lookup, so a
+  user upgrading from a Phase 4–11 install whose project
+  file or settings JSON still names an `_mlx` pack sees
+  a transparent rewrite (with a `log::warn!` deprecation
+  notice) rather than an opaque `ModelMissing` error.
+  The dispatcher itself is unchanged — it sees a current
+  id or surfaces missing; the migration table is a
+  user-facing UX layer, not part of the dispatch contract.
+- **Operator override quoting.** Phase 12 originally
+  parsed `KCREATE_SD_SERVER_EXTRA_ARGS` with naive
+  whitespace splitting, which dropped the second half
+  of any Windows path containing spaces. The follow-up
+  Devin-Review pass replaced the parser with
+  `shell-words` (POSIX shell-word rules: double / single
+  quoting plus backslash escapes), so operators can pass
+  `--clip_l "C:\Program Files\sd-models\clip_l.sft"`
+  literally. Mismatched quotes surface as
+  `Phase4BridgeError::Invalid` instead of a silently
+  truncated argv.
 - **Local-first invariant.** Zero new network crates.
   Both sidecars are subprocesses; the HTTP clients
   (`ureq`) live behind the `llm_sidecar` Cargo feature

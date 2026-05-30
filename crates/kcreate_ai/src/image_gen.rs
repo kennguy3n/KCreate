@@ -143,7 +143,14 @@ pub fn generate_image(port: u16, req: &ImageGenRequest) -> ImageGenResult<Genera
         .into_iter()
         .next()
         .ok_or_else(|| ImageGenError::Decode("sd-server returned empty `images` array".into()))?;
-    decode_png_payload(&first, req.width, req.height)
+    // The HTTP path uses the lenient variant so a future model pack
+    // whose architecture rounds dimensions (e.g. SDXL's multiple-of-8
+    // requirement) doesn't get rejected at the decode boundary —
+    // sd-server is authoritative on the actual output resolution and
+    // the renderer is happy to display whatever pixels came back.
+    // The strict variant remains for tests + callers that want a
+    // hard equality check against a known-honored resolution.
+    decode_png_payload_lenient(&first)
 }
 
 #[cfg(not(feature = "llm_sidecar"))]
@@ -162,19 +169,46 @@ fn map_ureq_error(e: ureq::Error) -> ImageGenError {
     }
 }
 
-/// Decode a base64-encoded PNG into RGBA8 pixels. Used after the
-/// server response is parsed; broken out so tests can exercise the
-/// decode independently of the HTTP round-trip.
+/// Decode a base64-encoded PNG into RGBA8 pixels and require the
+/// result to match `expected_width` / `expected_height` exactly.
+///
+/// Use this when the caller knows the model's architecture honors
+/// the requested resolution byte-for-byte (FLUX does; SDXL
+/// internally rounds to multiples of 8). The HTTP path in
+/// [`generate_image`] uses [`decode_png_payload_lenient`] instead
+/// so future non-FLUX packs don't get rejected at the decode
+/// boundary for what is actually correct server behavior.
 ///
 /// sd-server occasionally prefixes its base64 payloads with a
 /// `data:image/png;base64,` data URI header in some build configs;
-/// we strip the prefix transparently so the bridge doesn't have to
-/// branch on which build it's talking to.
+/// the prefix is stripped transparently so the bridge doesn't have
+/// to branch on which build it's talking to.
 pub fn decode_png_payload(
     base64_png: &str,
     expected_width: u32,
     expected_height: u32,
 ) -> ImageGenResult<GeneratedImage> {
+    let img = decode_png_payload_lenient(base64_png)?;
+    if img.width != expected_width || img.height != expected_height {
+        return Err(ImageGenError::Decode(format!(
+            "server returned {}x{}, expected {expected_width}x{expected_height}",
+            img.width, img.height,
+        )));
+    }
+    Ok(img)
+}
+
+/// Decode a base64-encoded PNG into RGBA8 pixels and report the
+/// dimensions the server actually produced. No equality check
+/// against any client-side expectation — the caller decides what
+/// (if anything) to do with the dimensions.
+///
+/// This is the HTTP-path decoder. It exists so [`generate_image`]
+/// remains valid when a future model pack (e.g. SDXL) legitimately
+/// rounds the output resolution to satisfy an architectural
+/// constraint. The strict variant ([`decode_png_payload`]) is kept
+/// for tests + callers that want to assert server fidelity.
+pub fn decode_png_payload_lenient(base64_png: &str) -> ImageGenResult<GeneratedImage> {
     use base64::Engine as _;
     let trimmed = base64_png
         .strip_prefix("data:image/png;base64,")
@@ -186,11 +220,6 @@ pub fn decode_png_payload(
     let img = image::load_from_memory(&bytes).map_err(|e| ImageGenError::Png(e.to_string()))?;
     let rgba = img.to_rgba8();
     let (w, h) = (rgba.width(), rgba.height());
-    if w != expected_width || h != expected_height {
-        return Err(ImageGenError::Decode(format!(
-            "server returned {w}x{h}, expected {expected_width}x{expected_height}",
-        )));
-    }
     Ok(GeneratedImage {
         rgba: rgba.into_raw(),
         width: w,
@@ -279,6 +308,63 @@ mod tests {
     fn decode_png_payload_rejects_empty_string() {
         let err = decode_png_payload("", 1, 1).expect_err("empty");
         assert!(matches!(err, ImageGenError::Png(_)));
+    }
+
+    /// The lenient decoder reports whatever dimensions the server
+    /// actually produced — no expected-size argument, no rejection.
+    /// This is the variant the HTTP path uses so future packs whose
+    /// architecture rounds dimensions (e.g. SDXL's multiple-of-8
+    /// rule) don't trip a false-positive decode error.
+    #[test]
+    fn decode_png_payload_lenient_returns_actual_dimensions() {
+        use base64::Engine as _;
+        // Server "returned" a 16x16 image when the request asked
+        // for 17x17 (simulating SDXL's rounding behavior). The
+        // strict variant would reject this; the lenient one must
+        // accept it and report 16x16.
+        let pixels: Vec<u8> = vec![42u8; 16 * 16 * 4];
+        let img: image::RgbaImage = image::ImageBuffer::from_raw(16, 16, pixels).unwrap();
+        let mut png_bytes: Vec<u8> = Vec::new();
+        image::DynamicImage::ImageRgba8(img)
+            .write_to(
+                &mut std::io::Cursor::new(&mut png_bytes),
+                image::ImageFormat::Png,
+            )
+            .unwrap();
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&png_bytes);
+        let lenient = decode_png_payload_lenient(&b64).expect("lenient must accept actual dims");
+        assert_eq!(lenient.width, 16);
+        assert_eq!(lenient.height, 16);
+        assert_eq!(lenient.rgba.len(), 16 * 16 * 4);
+        // Same payload through the strict variant must fail when
+        // the expectation doesn't match — this is the contract
+        // difference the split exists for.
+        let err =
+            decode_png_payload(&b64, 17, 17).expect_err("strict must reject mismatched dims");
+        assert!(matches!(err, ImageGenError::Decode(_)));
+    }
+
+    /// The lenient decoder also strips the `data:image/png;base64,`
+    /// data-URI prefix so the HTTP path doesn't have to peek at
+    /// which sd-server build it's talking to.
+    #[test]
+    fn decode_png_payload_lenient_strips_data_uri_prefix() {
+        use base64::Engine as _;
+        let pixels: Vec<u8> = vec![1, 2, 3, 255];
+        let img: image::RgbaImage = image::ImageBuffer::from_raw(1, 1, pixels.clone()).unwrap();
+        let mut png_bytes: Vec<u8> = Vec::new();
+        image::DynamicImage::ImageRgba8(img)
+            .write_to(
+                &mut std::io::Cursor::new(&mut png_bytes),
+                image::ImageFormat::Png,
+            )
+            .unwrap();
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&png_bytes);
+        let with_prefix = format!("data:image/png;base64,{b64}");
+        let lenient = decode_png_payload_lenient(&with_prefix).unwrap();
+        assert_eq!(lenient.width, 1);
+        assert_eq!(lenient.height, 1);
+        assert_eq!(lenient.rgba, pixels);
     }
 
     /// Mock sd-server with `tiny_http` and round-trip a real

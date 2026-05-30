@@ -257,7 +257,16 @@ mod tests {
         // Legacy MLX pack ids — they used to fall back via
         // `gguf_fallback_for_mlx_pack`, but Phase 12 dropped that
         // table along with the MLX runtime, so the dispatcher now
-        // reports them as missing instead of silently rerouting.
+        // reports them as missing instead of silently rerouting at
+        // the dispatch layer. Migration of stale ids is handled at
+        // the bridge entry point (`kcreate_bridge::phase4::
+        // resolve_pack_id`) via the
+        // `kcreate_ai::model_registry::migrate_legacy_pack_id`
+        // table — so the user-facing UX path stays smooth, but the
+        // dispatcher's contract is unchanged: it sees a current id
+        // or surfaces `ModelMissing`. Keep this assertion in place
+        // so a future refactor that conflates the two layers shows
+        // up as a test failure.
         for legacy_mlx in [
             "vision_smolvlm_256m_mlx",
             "vision_qwen25vl_7b_mlx",
@@ -268,6 +277,14 @@ mod tests {
             assert!(
                 matches!(err, SidecarError::ModelMissing(_)),
                 "expected legacy MLX pack {legacy_mlx} to surface as missing, got {err:?}",
+            );
+            // The migration helper must still rewrite them — this
+            // is the post-condition the bridge relies on. If a
+            // future change ever drops the migration table, this
+            // assertion catches it without needing a separate test.
+            assert!(
+                crate::model_registry::migrate_legacy_pack_id(legacy_mlx).is_some(),
+                "Phase 12 migration table must still rewrite legacy id {legacy_mlx}",
             );
         }
     }

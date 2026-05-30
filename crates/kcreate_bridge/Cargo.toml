@@ -107,6 +107,13 @@ getrandom = { workspace = true, optional = true }
 # tracing is pulled in by quinn / rustls under the `collab` feature;
 # we use it directly for `tracing::warn!` in the pump task.
 tracing = { workspace = true, optional = true }
+# Phase 12 (Devin Review): proper POSIX shell-word splitting for
+# the `KCREATE_SD_SERVER_EXTRA_ARGS` env var passthrough used by
+# `image_gen_start`. The previous naive `split_whitespace` parser
+# silently dropped the second half of any path containing spaces,
+# which made Windows installs (e.g. `C:\Program Files\sd-models\…`)
+# unable to load FLUX component weights.
+shell-words = { workspace = true }
 
 [build-dependencies]
 napi-build.workspace = true

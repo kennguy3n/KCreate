@@ -220,16 +220,36 @@ fn replace_layer_pixels(
 // -----------------------------------------------------------------------------
 
 /// Apply a Levels adjustment to a raster layer.
+///
+/// Phase 11 Block B Task 10 routes the per-pixel work through the
+/// GPU compute LUT shader when a compute context is available. The
+/// CPU fallback runs the same operation via
+/// `apply_adjustments_in_place` (rayon over RGBA chunks).
 pub fn apply_levels(node_id: Uuid, black_point: f32, white_point: f32, gamma: f32) -> Result<()> {
     let mut pixels = load_layer_pixels(node_id)?;
-    apply_adjustments_in_place(
-        &mut pixels.rgba,
-        &[AdjustmentLayer::Levels {
-            black_point,
-            white_point,
-            gamma,
-        }],
-    );
+    let mut applied_on_gpu = false;
+    if let Some(ctx) = crate::gpu_compute::try_context() {
+        let lut = kcreate_renderer::compute::build_levels_lut(black_point, white_point, gamma);
+        match ctx.levels_curves(&pixels.rgba, pixels.width, pixels.height, &lut, false) {
+            Ok(out) => {
+                pixels.rgba = out;
+                applied_on_gpu = true;
+            }
+            Err(err) => eprintln!(
+                "kcreate_bridge::raster_ops: GPU levels failed ({err}); falling back to CPU"
+            ),
+        }
+    }
+    if !applied_on_gpu {
+        apply_adjustments_in_place(
+            &mut pixels.rgba,
+            &[AdjustmentLayer::Levels {
+                black_point,
+                white_point,
+                gamma,
+            }],
+        );
+    }
     replace_layer_pixels(
         node_id,
         pixels.rgba,
@@ -242,13 +262,33 @@ pub fn apply_levels(node_id: Uuid, black_point: f32, white_point: f32, gamma: f3
 }
 
 /// Apply a Curves adjustment defined by `(input, output)` control points.
+///
+/// Phase 11 Block B Task 10 — same GPU LUT path as
+/// [`apply_levels`]; the host compiles the curve to a 256-entry
+/// LUT and dispatches the per-pixel shader. CPU fallback uses the
+/// existing `AdjustmentLayer::Curves` solver.
 pub fn apply_curves(node_id: Uuid, points: Vec<(f32, f32)>) -> Result<()> {
     let mut pixels = load_layer_pixels(node_id)?;
-    let curve_points: Vec<CurvePoint> = points
-        .iter()
-        .map(|(t, v)| CurvePoint::new(*t, *v))
-        .collect();
-    apply_adjustments_in_place(&mut pixels.rgba, &[AdjustmentLayer::Curves(curve_points)]);
+    let mut applied_on_gpu = false;
+    if let Some(ctx) = crate::gpu_compute::try_context() {
+        let lut = kcreate_renderer::compute::build_curves_lut(&points);
+        match ctx.levels_curves(&pixels.rgba, pixels.width, pixels.height, &lut, false) {
+            Ok(out) => {
+                pixels.rgba = out;
+                applied_on_gpu = true;
+            }
+            Err(err) => eprintln!(
+                "kcreate_bridge::raster_ops: GPU curves failed ({err}); falling back to CPU"
+            ),
+        }
+    }
+    if !applied_on_gpu {
+        let curve_points: Vec<CurvePoint> = points
+            .iter()
+            .map(|(t, v)| CurvePoint::new(*t, *v))
+            .collect();
+        apply_adjustments_in_place(&mut pixels.rgba, &[AdjustmentLayer::Curves(curve_points)]);
+    }
     replace_layer_pixels(
         node_id,
         pixels.rgba,
@@ -273,16 +313,23 @@ pub enum BlurKind {
 }
 
 /// Apply Gaussian or Box blur with the given radius (in pixels).
+///
+/// Gaussian blur takes the GPU compute path when
+/// [`crate::gpu_compute::try_context`] returns a context (Phase 11
+/// Block B Task 9); box blur and the GPU-unavailable fallback keep
+/// the rayon CPU implementation in `kcreate_raster::filters`.
 pub fn apply_blur(node_id: Uuid, radius: f32, kind: BlurKind) -> Result<()> {
     let pixels = load_layer_pixels(node_id)?;
-    let grid = TileGrid::from_image(&pixels.rgba, pixels.width, pixels.height, TILE_SIZE)
-        .map_err(|e| DocumentBridgeError::Io(std::io::Error::other(e.to_string())))?;
-    let blurred = match kind {
-        BlurKind::Gaussian => filters::gaussian_blur(&grid, radius),
-        // Box blur takes an integer radius; clamp negative / NaN to 0.
-        BlurKind::Box => filters::box_blur(&grid, radius.max(0.0).round() as u32),
+    let out_rgba = match kind {
+        BlurKind::Gaussian => gaussian_blur_gpu_or_cpu(&pixels, radius)?,
+        BlurKind::Box => {
+            let grid =
+                TileGrid::from_image(&pixels.rgba, pixels.width, pixels.height, TILE_SIZE)
+                    .map_err(|e| DocumentBridgeError::Io(std::io::Error::other(e.to_string())))?;
+            // Box blur takes an integer radius; clamp negative / NaN to 0.
+            filters::box_blur(&grid, radius.max(0.0).round() as u32).to_image()
+        }
     };
-    let out_rgba = blurred.to_image();
     replace_layer_pixels(
         node_id,
         out_rgba,
@@ -294,13 +341,70 @@ pub fn apply_blur(node_id: Uuid, radius: f32, kind: BlurKind) -> Result<()> {
     )
 }
 
-/// Apply an unsharp-mask sharpen (`radius` + `amount` + `threshold`).
-pub fn apply_sharpen(node_id: Uuid, radius: f32, amount: f32, threshold: u8) -> Result<()> {
-    let pixels = load_layer_pixels(node_id)?;
+fn gaussian_blur_gpu_or_cpu(pixels: &LayerPixels, radius: f32) -> Result<Vec<u8>> {
+    if !radius.is_finite() || radius <= 0.0 {
+        return Ok(pixels.rgba.clone());
+    }
+    if let Some(ctx) = crate::gpu_compute::try_context() {
+        let bounded = radius.min(kcreate_renderer::compute::MAX_BLUR_SIGMA);
+        match ctx.gaussian_blur(&pixels.rgba, pixels.width, pixels.height, bounded) {
+            Ok(out) => return Ok(out),
+            Err(err) => {
+                // GPU surfaced an error — fall back to CPU so the
+                // user's edit still applies. Log so we notice
+                // recurring GPU breakage in the audit channel.
+                eprintln!(
+                    "kcreate_bridge::raster_ops: GPU blur failed ({err}); falling back to CPU"
+                );
+            }
+        }
+    }
     let grid = TileGrid::from_image(&pixels.rgba, pixels.width, pixels.height, TILE_SIZE)
         .map_err(|e| DocumentBridgeError::Io(std::io::Error::other(e.to_string())))?;
-    let sharp = filters::unsharp_mask(&grid, radius, amount, threshold);
-    let out_rgba = sharp.to_image();
+    Ok(filters::gaussian_blur(&grid, radius).to_image())
+}
+
+/// Apply an unsharp-mask sharpen (`radius` + `amount` + `threshold`).
+///
+/// Routes through the GPU compute path when available (Phase 11
+/// Block B Task 11). The blurred input texture is computed by the
+/// same separable Gaussian blur pipeline used by [`apply_blur`];
+/// the second dispatch composes `original + amount * (original -
+/// blurred)` with the threshold gate.
+pub fn apply_sharpen(node_id: Uuid, radius: f32, amount: f32, threshold: u8) -> Result<()> {
+    let pixels = load_layer_pixels(node_id)?;
+    let mut out_rgba: Option<Vec<u8>> = None;
+    if radius.is_finite() && radius > 0.0 {
+        if let Some(ctx) = crate::gpu_compute::try_context() {
+            let bounded = radius.min(kcreate_renderer::compute::MAX_BLUR_SIGMA);
+            match ctx.unsharp_mask(
+                &pixels.rgba,
+                pixels.width,
+                pixels.height,
+                bounded,
+                amount,
+                threshold,
+            ) {
+                Ok(out) => out_rgba = Some(out),
+                Err(err) => eprintln!(
+                    "kcreate_bridge::raster_ops: GPU unsharp failed ({err}); falling back to CPU"
+                ),
+            }
+        }
+    }
+    let out_rgba = match out_rgba {
+        Some(v) => v,
+        None => {
+            let grid = TileGrid::from_image(
+                &pixels.rgba,
+                pixels.width,
+                pixels.height,
+                TILE_SIZE,
+            )
+            .map_err(|e| DocumentBridgeError::Io(std::io::Error::other(e.to_string())))?;
+            filters::unsharp_mask(&grid, radius, amount, threshold).to_image()
+        }
+    };
     replace_layer_pixels(
         node_id,
         out_rgba,

@@ -13,6 +13,7 @@
 //! carries forward unchanged.
 #![forbid(unsafe_op_in_unsafe_fn)]
 
+pub mod compute;
 pub mod cpu_backend;
 pub mod display_list;
 pub mod geometry;

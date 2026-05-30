@@ -14,6 +14,7 @@
 pub mod context;
 pub mod js_panel;
 pub mod manifest;
+pub mod marketplace;
 pub mod registry;
 pub mod trust;
 pub mod wasm_runtime;

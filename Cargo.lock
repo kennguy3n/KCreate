@@ -1927,6 +1927,7 @@ dependencies = [
 name = "kcreate_export"
 version = "0.0.1"
 dependencies = [
+ "base64",
  "criterion",
  "flate2",
  "image 0.25.10",
@@ -2039,6 +2040,7 @@ dependencies = [
  "uuid",
  "wasmi",
  "wat",
+ "zip",
 ]
 
 [[package]]

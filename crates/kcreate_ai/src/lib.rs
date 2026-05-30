@@ -10,12 +10,21 @@
 
 pub mod action_log;
 pub mod alt_text;
+pub mod auto_color;
 pub mod bg_remove;
 pub mod brand_extract;
 pub mod color_range;
+pub mod denoise;
 pub mod design_critique;
 pub mod design_tokens_vlm;
+pub mod glyph_extract;
 pub mod iconify;
+pub mod inpaint;
+pub mod one_pager;
+pub mod palette_harmonize;
+pub mod reformat;
+pub mod stroke_match;
+pub mod type_pairing;
 pub mod image_gen;
 pub mod layout_suggest;
 pub mod llm_chat;
@@ -38,11 +47,36 @@ pub mod vision_chat;
 
 pub use action_log::{ActionLog, AiAction};
 pub use alt_text::{generate_alt_text, AltTextError, AltTextOptions, AltTextReport};
+pub use auto_color::{auto_color_correct, AutoColorError, AutoColorMode, AutoColorOptions};
 pub use bg_remove::{
     apply_alpha_mask, remove_background, remove_background_with_backend, BgRemovalBackend,
     BgRemoveError, BgRemoveOptions,
 };
 pub use color_range::{pack_mask, select_by_color_range};
+pub use denoise::{denoise, DenoiseError, DenoiseOptions};
+pub use glyph_extract::{
+    extract_glyph, ExtractedGlyph, GlyphCrop, GlyphExtractError, GlyphExtractOptions,
+    GlyphMetrics,
+};
+pub use inpaint::{inpaint, mask_from_rects, InpaintError, InpaintOptions, MaskRect};
+pub use one_pager::{
+    brief_to_one_pager, BriefToOnePagerError, BriefToOnePagerOptions, BriefToOnePagerResult,
+    OnePagerPageSize, OnePagerSection, OnePagerSectionType,
+};
+pub use palette_harmonize::{
+    harmonize_palette, HarmonyError, HarmonyResult, HarmonyRule, HarmonySuggestion,
+};
+pub use reformat::{
+    reformat_to_deck, ReformatDeckError, ReformatDeckOptions, ReformatDeckResult, ReformatPage,
+    ReformatPagePlacement,
+};
+pub use stroke_match::{
+    match_stroke_style, StrokeDeltaApplied, StrokeMatchError, StrokeMatchSummary,
+    StrokeProperties,
+};
+pub use type_pairing::{
+    suggest_type_pairing, TypePairingError, TypePairingResult, TypePairingSuggestion,
+};
 pub use iconify::{iconify, IconPath, IconPoint, IconifyError, IconifyOptions, IconifyResult};
 pub use layout_suggest::{
     suggest_layout_grouping, Bounds as LayoutBounds, LayoutAlignment, LayoutNode,

@@ -33,6 +33,9 @@ psd.workspace = true
 kamadak-exif.workspace = true
 # Phase 9 Block C Task 16 SVG-to-raster preview. Pure Rust.
 resvg.workspace = true
+# Phase 10 Block C Task 14 smart-compress encodes JPEG/WebP payloads
+# whose preview JSON wraps them in base64 for the renderer bridge.
+base64.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

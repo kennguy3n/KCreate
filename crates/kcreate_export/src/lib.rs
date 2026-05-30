@@ -14,6 +14,7 @@
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 
+pub mod ai_import;
 pub mod batch;
 pub mod cmyk_dither;
 pub mod code_gen;
@@ -25,6 +26,7 @@ pub mod jpeg;
 pub mod kbrand;
 pub mod pdf;
 pub mod pdf_import;
+pub mod pdf_multi;
 pub mod pdf_shading;
 pub mod penpot_import;
 pub mod png;
@@ -33,7 +35,9 @@ pub mod psd_import;
 pub mod scene_metadata;
 pub mod sketch_import;
 pub mod slice;
+pub mod smart_compress;
 pub mod svg;
+pub mod svg_optimize;
 pub mod svg_preview;
 pub mod validate;
 pub mod webp;

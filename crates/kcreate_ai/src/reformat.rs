@@ -252,7 +252,7 @@ mod tests {
                 &format!("n{i}"),
                 &format!("Node {i}"),
                 0.0,
-                (i as f64) * 100.0,
+                f64::from(i) * 100.0,
                 200.0,
                 80.0,
                 "text",

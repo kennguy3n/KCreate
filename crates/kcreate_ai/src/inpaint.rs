@@ -258,11 +258,12 @@ fn downsample(
                 }
             }
             let di = ((y * dst_w + x) * 4) as usize;
-            if count > 0 {
-                dst_p[di] = (sum[0] / count) as u8;
-                dst_p[di + 1] = (sum[1] / count) as u8;
-                dst_p[di + 2] = (sum[2] / count) as u8;
-                dst_p[di + 3] = (sum[3] / count) as u8;
+            if let Some(c) = std::num::NonZeroU32::new(count) {
+                let c = c.get();
+                dst_p[di] = (sum[0] / c) as u8;
+                dst_p[di + 1] = (sum[1] / c) as u8;
+                dst_p[di + 2] = (sum[2] / c) as u8;
+                dst_p[di + 3] = (sum[3] / c) as u8;
             }
             dst_m[(y * dst_w + x) as usize] = if masked { 255 } else { 0 };
         }
@@ -276,9 +277,9 @@ fn downsample(
 fn upsample(pixels: &[u8], src_w: u32, src_h: u32, dst_w: u32, dst_h: u32) -> Vec<u8> {
     let mut dst = vec![0u8; (dst_w as usize) * (dst_h as usize) * 4];
     for y in 0..dst_h {
-        let sy = ((y as u64 * src_h as u64) / dst_h as u64) as u32;
+        let sy = ((u64::from(y) * u64::from(src_h)) / u64::from(dst_h)) as u32;
         for x in 0..dst_w {
-            let sx = ((x as u64 * src_w as u64) / dst_w as u64) as u32;
+            let sx = ((u64::from(x) * u64::from(src_w)) / u64::from(dst_w)) as u32;
             let si = ((sy * src_w + sx) * 4) as usize;
             let di = ((y * dst_w + x) * 4) as usize;
             dst[di..di + 4].copy_from_slice(&pixels[si..si + 4]);
@@ -302,16 +303,18 @@ fn seed_with_mean(pixels: &[u8], mask: &[u8], _width: u32, _height: u32) -> Vec<
             count += 1;
         }
     }
-    let mean = if count > 0 {
-        [
-            (sum[0] / count) as u8,
-            (sum[1] / count) as u8,
-            (sum[2] / count) as u8,
-            255,
-        ]
-    } else {
-        [128, 128, 128, 255]
-    };
+    let mean = std::num::NonZeroU64::new(count).map_or(
+        [128u8, 128, 128, 255],
+        |c| {
+            let c = c.get();
+            [
+                (sum[0] / c) as u8,
+                (sum[1] / c) as u8,
+                (sum[2] / c) as u8,
+                255,
+            ]
+        },
+    );
     let mut out = pixels.to_vec();
     for (i, &m) in mask.iter().enumerate() {
         if m != 0 {
@@ -377,7 +380,7 @@ fn run_patchmatch_level(
     // NNF: for each target, the (sx, sy) source patch centre that
     // currently matches it best. Initialise with a deterministic
     // pseudo-random pick per target so reruns are reproducible.
-    let mut rng = XorShiftRng::seed(0xA1B2_C3D4 ^ (width as u64) ^ ((height as u64) << 16));
+    let mut rng = XorShiftRng::seed(0xA1B2_C3D4 ^ u64::from(width) ^ (u64::from(height) << 16));
     let mut nnf: Vec<(i32, i32)> = targets
         .iter()
         .map(|_| {
@@ -467,6 +470,10 @@ fn patch_is_pure_source(mask: &[u8], width: u32, cx: i32, cy: i32, pr: i32) -> b
     true
 }
 
+// Eight scalar args is the natural shape for a per-patch SSD
+// helper (two image buffers + width + two coords + patch radius).
+// Bundling them into a struct just to dodge clippy adds noise.
+#[allow(clippy::too_many_arguments)]
 #[inline]
 fn patch_ssd(
     target_buf: &[u8],
@@ -493,6 +500,11 @@ fn patch_ssd(
     acc
 }
 
+// Eight-arg helper that takes the working buffer, the original
+// pixels, the mask, image dimensions, the precomputed target
+// locations, the source map, and the patch radius. A struct would
+// just be a one-shot named tuple.
+#[allow(clippy::too_many_arguments)]
 fn splat_into_masked(
     pixels: &mut [u8],
     original: &[u8],
@@ -635,9 +647,9 @@ mod tests {
                 // Allow ±25 per channel — exemplar inpaint converges
                 // close to red but the boundary blending can drift
                 // before convergence.
-                assert!((out[i] as i32 - red[0] as i32).abs() <= 25, "R drift at ({x},{y}): {}", out[i]);
-                assert!((out[i + 1] as i32 - red[1] as i32).abs() <= 25, "G drift at ({x},{y}): {}", out[i+1]);
-                assert!((out[i + 2] as i32 - red[2] as i32).abs() <= 25, "B drift at ({x},{y}): {}", out[i+2]);
+                assert!((i32::from(out[i]) - i32::from(red[0])).abs() <= 25, "R drift at ({x},{y}): {}", out[i]);
+                assert!((i32::from(out[i + 1]) - i32::from(red[1])).abs() <= 25, "G drift at ({x},{y}): {}", out[i+1]);
+                assert!((i32::from(out[i + 2]) - i32::from(red[2])).abs() <= 25, "B drift at ({x},{y}): {}", out[i+2]);
             }
         }
     }
@@ -692,6 +704,11 @@ mod tests {
         assert_eq!(mask[6 * 8 + 6], 255);
         assert_eq!(mask[7 * 8 + 7], 255);
         assert_eq!(mask.len(), 64);
-        assert_eq!(mask.iter().filter(|&&b| b == 255).count(), 4);
+        // `naive_bytecount` would suggest the bytecount crate; we
+        // deliberately keep this dependency-free since the test
+        // mask is tiny (64 bytes).
+        #[allow(clippy::naive_bytecount)]
+        let masked = mask.iter().filter(|&&b| b == 255).count();
+        assert_eq!(masked, 4);
     }
 }

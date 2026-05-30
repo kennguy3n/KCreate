@@ -215,7 +215,7 @@ fn strip_empty_groups_once(s: &str) -> String {
             }
         }
         // Not an empty group — emit verbatim.
-        out.push_str(&rest[idx..idx + 2 + open_close + 1]);
+        out.push_str(&rest[idx..=(idx + 2 + open_close)]);
         rest = after_tag;
     }
     out.push_str(rest);

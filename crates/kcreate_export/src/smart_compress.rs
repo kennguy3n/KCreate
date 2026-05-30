@@ -191,7 +191,7 @@ fn encode_at_quality(
             // — lower quality means more aggressive downsample.
             let img = RgbaImage::from_raw(width, height, pixels.to_vec())
                 .ok_or_else(|| SmartCompressError::Encode("WebP wrap".into()))?;
-            let scale = (q as f32 / 100.0).clamp(0.30, 1.0);
+            let scale = (f32::from(q) / 100.0).clamp(0.30, 1.0);
             let dw = ((width as f32 * scale).round() as u32).max(1);
             let dh = ((height as f32 * scale).round() as u32).max(1);
             let small = if (dw, dh) == (width, height) {
@@ -248,10 +248,10 @@ fn decode_to_rgba(
 fn rgba_to_rgb_over_white(rgba: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(rgba.len() / 4 * 3);
     for chunk in rgba.chunks_exact(4) {
-        let r = chunk[0] as u16;
-        let g = chunk[1] as u16;
-        let b = chunk[2] as u16;
-        let a = chunk[3] as u16;
+        let r = u16::from(chunk[0]);
+        let g = u16::from(chunk[1]);
+        let b = u16::from(chunk[2]);
+        let a = u16::from(chunk[3]);
         let composite = |c: u16| ((c * a + 255 * (255 - a) + 127) / 255).min(255) as u8;
         out.push(composite(r));
         out.push(composite(g));
@@ -292,6 +292,11 @@ pub fn ssim_rgba(a: &[u8], b: &[u8], width: u32, height: u32) -> f64 {
     total / rows.len() as f64
 }
 
+// Per-block SSIM helper — its arg shape (two luma buffers, image
+// dimensions, block coordinates, and the two SSIM stabilisation
+// constants) matches the SSIM paper's notation 1:1 so we keep it
+// flat rather than bundling into a struct.
+#[allow(clippy::too_many_arguments)]
 fn ssim_block(
     a: &[u8],
     b: &[u8],
@@ -304,7 +309,7 @@ fn ssim_block(
 ) -> f64 {
     let x0 = (bx * BLOCK) as usize;
     let y0 = (by * BLOCK) as usize;
-    let n = (BLOCK * BLOCK) as f64;
+    let n = f64::from(BLOCK * BLOCK);
     let mut sum_a = 0.0;
     let mut sum_b = 0.0;
     for dy in 0..BLOCK as usize {
@@ -398,9 +403,18 @@ mod tests {
     fn ssim_falls_with_noise() {
         let buf = checker(32, 32);
         let mut noisy = buf.clone();
-        for chunk in noisy.chunks_exact_mut(4) {
-            chunk[0] = chunk[0].saturating_add(40);
-            chunk[1] = chunk[1].saturating_sub(40);
+        // SSIM is computed on luminance, so a uniform RGB bias would
+        // largely cancel out (e.g. +40 R and -40 G produces a small
+        // luminance shift). To actually move the luminance variance
+        // we alternate the bias sign every pixel — this introduces
+        // high-frequency noise that disrupts the structure term of
+        // SSIM the way real compression artefacts do.
+        for (i, chunk) in noisy.chunks_exact_mut(4).enumerate() {
+            let sign = if i.is_multiple_of(2) { 1i16 } else { -1 };
+            let delta = (60 * sign) as i16;
+            for slot in chunk.iter_mut().take(3) {
+                *slot = (i16::from(*slot) + delta).clamp(0, 255) as u8;
+            }
         }
         let s = ssim_rgba(&buf, &noisy, 32, 32);
         assert!(s < 0.98, "expected <0.98, got {s}");

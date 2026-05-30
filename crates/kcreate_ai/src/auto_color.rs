@@ -28,18 +28,15 @@ use thiserror::Error;
 /// Which correction algorithm(s) to run.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum AutoColorMode {
     AutoLevels,
     WhiteBalance,
     HistogramEqualization,
+    #[default]
     Combined,
 }
 
-impl Default for AutoColorMode {
-    fn default() -> Self {
-        Self::Combined
-    }
-}
 
 impl AutoColorMode {
     /// Parse a wire-format name into a mode. Accepts both the
@@ -175,9 +172,9 @@ pub fn auto_levels(pixels: &[u8], width: u32, height: u32, clip: f32) -> Vec<u8>
         let lo_f = f32::from(lo[c]);
         let hi_f = f32::from(hi[c]);
         let span = (hi_f - lo_f).max(1.0);
-        for v in 0..256usize {
+        for (v, slot) in lut[c].iter_mut().enumerate() {
             let scaled = ((v as f32 - lo_f) * 255.0 / span).clamp(0.0, 255.0);
-            lut[c][v] = scaled.round() as u8;
+            *slot = scaled.round() as u8;
         }
     }
     let mut out = vec![0u8; pixels.len()];
@@ -243,15 +240,15 @@ pub fn histogram_equalization(pixels: &[u8], width: u32, height: u32) -> Vec<u8>
         let mut cdf = 0u32;
         let mut cdf_min = 0u32;
         // First non-zero CDF anchor.
-        for v in 0..256usize {
-            if hist[c][v] > 0 {
-                cdf_min = hist[c][v];
+        for &h in &hist[c] {
+            if h > 0 {
+                cdf_min = h;
                 break;
             }
         }
         let denom = (total as u32).saturating_sub(cdf_min).max(1) as f32;
-        for v in 0..256usize {
-            cdf += hist[c][v];
+        for (v, &h) in hist[c].iter().enumerate() {
+            cdf += h;
             let value = ((cdf.saturating_sub(cdf_min) as f32) * 255.0 / denom)
                 .clamp(0.0, 255.0)
                 .round();
@@ -289,16 +286,16 @@ fn luminance_equalization(pixels: &[u8], width: u32, height: u32) -> Vec<u8> {
     }
     let mut cdf = 0u32;
     let mut cdf_min = 0u32;
-    for v in 0..256usize {
-        if hist[v] > 0 {
-            cdf_min = hist[v];
+    for &h in &hist {
+        if h > 0 {
+            cdf_min = h;
             break;
         }
     }
     let denom = (total as u32).saturating_sub(cdf_min).max(1) as f32;
     let mut lut = [0u8; 256];
-    for v in 0..256usize {
-        cdf += hist[v];
+    for (v, &h) in hist.iter().enumerate() {
+        cdf += h;
         lut[v] = ((cdf.saturating_sub(cdf_min) as f32) * 255.0 / denom)
             .clamp(0.0, 255.0)
             .round() as u8;
@@ -331,7 +328,7 @@ mod tests {
 
     fn ramp(w: u32, h: u32) -> Vec<u8> {
         let mut v = Vec::with_capacity((w as usize) * (h as usize) * 4);
-        for y in 0..h {
+        for _y in 0..h {
             for x in 0..w {
                 let g = ((x as f32 / (w - 1) as f32) * 255.0) as u8;
                 v.extend_from_slice(&[g, g, g, 255]);

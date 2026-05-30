@@ -2020,6 +2020,184 @@ function registerIpcHandlers(): void {
   );
 
   // ---------------------------------------------------------------------
+  // Phase 10 — Image Studio AI, Vector/Layout AI, Export AI + Live
+  // Preview, Brand Hub + Plugin Marketplace, Preferences. See
+  // `crates/kcreate_bridge/src/phase10.rs` and `apps/desktop/preload`.
+  // ---------------------------------------------------------------------
+  // Block A — Image Studio AI
+  ipcMain.handle(
+    "kcreate/phase10/ai/denoise",
+    (
+      _e,
+      nodeId: string,
+      strength: number,
+      searchRadius: number,
+      patchRadius: number,
+    ): string =>
+      requireBridge().aiDenoise(nodeId, strength, searchRadius, patchRadius),
+  );
+  ipcMain.handle(
+    "kcreate/phase10/ai/inpaint",
+    (
+      _e,
+      nodeId: string,
+      maskJson: string,
+      patchRadius: number | null,
+      numIterations: number | null,
+      pyramidLevels: number | null,
+    ): string =>
+      requireBridge().aiInpaint(
+        nodeId,
+        maskJson,
+        patchRadius,
+        numIterations,
+        pyramidLevels,
+      ),
+  );
+  ipcMain.handle(
+    "kcreate/phase10/ai/auto-color",
+    (_e, nodeId: string, mode: string): string =>
+      requireBridge().aiAutoColor(nodeId, mode),
+  );
+  ipcMain.handle(
+    "kcreate/phase10/ai/segment-at-point",
+    (
+      _e,
+      nodeId: string,
+      pointX: number,
+      pointY: number,
+      isPositive: boolean,
+    ): string =>
+      requireBridge().aiSegmentAtPoint(nodeId, pointX, pointY, isPositive),
+  );
+  ipcMain.handle(
+    "kcreate/phase10/ai/smart-select-at-point",
+    (
+      _e,
+      nodeId: string,
+      x: number,
+      y: number,
+      tolerance: number,
+      mode: string,
+      previousMaskBase64: string | null,
+    ): string =>
+      requireBridge().aiSmartSelectAtPoint(
+        nodeId,
+        x,
+        y,
+        tolerance,
+        mode,
+        previousMaskBase64,
+      ),
+  );
+
+  // Block B — Vector/Layout AI
+  ipcMain.handle(
+    "kcreate/phase10/ai/match-stroke",
+    (_e, sourceId: string, targetIds: string[]): string =>
+      requireBridge().aiMatchStroke(sourceId, JSON.stringify(targetIds)),
+  );
+  ipcMain.handle(
+    "kcreate/phase10/ai/extract-glyph",
+    (
+      _e,
+      nodeId: string,
+      cropX: number,
+      cropY: number,
+      cropWidth: number,
+      cropHeight: number,
+      emSize: number,
+    ): string =>
+      requireBridge().aiExtractGlyph(
+        nodeId,
+        cropX,
+        cropY,
+        cropWidth,
+        cropHeight,
+        emSize,
+      ),
+  );
+  ipcMain.handle(
+    "kcreate/phase10/ai/reformat-to-deck",
+    (_e, pageId: string): string => requireBridge().aiReformatToDeck(pageId),
+  );
+  ipcMain.handle(
+    "kcreate/phase10/ai/brief-to-one-pager",
+    (_e, brief: string, pageSize: string | null): string =>
+      requireBridge().aiBriefToOnePager(brief, pageSize),
+  );
+  ipcMain.handle(
+    "kcreate/phase10/ai/harmonize-palette",
+    (_e, brandKitId: string, harmonyType: string): string =>
+      requireBridge().aiHarmonizePalette(brandKitId, harmonyType),
+  );
+  ipcMain.handle(
+    "kcreate/phase10/ai/suggest-type-pairing",
+    (_e, headingFontName: string): string =>
+      requireBridge().aiSuggestTypePairing(headingFontName),
+  );
+
+  // Block C — Export AI + Live Preview
+  ipcMain.handle(
+    "kcreate/phase10/export/optimize-svg",
+    (_e, svg: string): string => requireBridge().exportOptimizeSvg(svg),
+  );
+  ipcMain.handle(
+    "kcreate/phase10/export/smart-compress",
+    (
+      _e,
+      nodeId: string,
+      format: string,
+      targetSsim: number | null,
+    ): string =>
+      requireBridge().exportSmartCompress(nodeId, format, targetSsim),
+  );
+  ipcMain.handle(
+    "kcreate/phase10/export/preview",
+    (_e, requestJson: string): string =>
+      requireBridge().exportPreview(requestJson),
+  );
+  ipcMain.handle(
+    "kcreate/phase10/import/ai",
+    (_e, path: string): string => requireBridge().importAi(path),
+  );
+
+  // Block D — Brand Hub + Plugin Marketplace
+  ipcMain.handle(
+    "kcreate/phase10/ai/brand-to-brochure",
+    (_e, brandKitId: string, numPages: number): string =>
+      requireBridge().aiBrandToBrochure(brandKitId, numPages),
+  );
+  ipcMain.handle(
+    "kcreate/phase10/plugin-marketplace/list",
+    (): string => requireBridge().pluginMarketplaceList(),
+  );
+  ipcMain.handle(
+    "kcreate/phase10/plugin-marketplace/install-local",
+    (_e, path: string): string =>
+      requireBridge().pluginMarketplaceInstallLocal(path),
+  );
+  ipcMain.handle(
+    "kcreate/phase10/plugin-marketplace/remove",
+    (_e, id: string): boolean => requireBridge().pluginMarketplaceRemove(id),
+  );
+  ipcMain.handle(
+    "kcreate/phase10/export/pdf-multi",
+    (_e, optionsJson: string, outputPath: string): string =>
+      requireBridge().exportPdfMulti(optionsJson, outputPath),
+  );
+
+  // Block D Task 23 — Preferences
+  ipcMain.handle(
+    "kcreate/phase10/preferences/load",
+    (): string => requireBridge().preferencesLoad(),
+  );
+  ipcMain.handle(
+    "kcreate/phase10/preferences/save",
+    (_e, prefsJson: string): void => requireBridge().preferencesSave(prefsJson),
+  );
+
+  // ---------------------------------------------------------------------
   // Phase 2 — preflight, icon pack, batch async, AI extras, plugins, MCP perms.
   // ---------------------------------------------------------------------
   ipcMain.handle("kcreate/preflight/run", (_e, requestJson: string) =>

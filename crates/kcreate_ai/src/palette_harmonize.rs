@@ -131,7 +131,7 @@ pub fn harmonize_palette(
 /// best. We pick the rule with the smallest total "distance from
 /// nearest target" sum.
 fn choose_rule_auto(hsl: &[Hsl]) -> HarmonyRule {
-    use HarmonyRule::*;
+    use HarmonyRule::{Complementary, Triadic, Analogous, SplitComplementary, Tetradic};
     let base = hsl[0].h;
     let candidates = [
         Complementary,
@@ -144,10 +144,12 @@ fn choose_rule_auto(hsl: &[Hsl]) -> HarmonyRule {
     let mut best_cost = f32::INFINITY;
     for rule in candidates {
         let targets = rule_targets(rule, base);
+        // Use `wrap_degrees` so circular distances are measured
+        // correctly (e.g. hue 350° → target 10° is 20°, not 340°).
         let cost: f32 = hsl
             .iter()
             .skip(1)
-            .map(|c| (c.h - nearest_target(c.h, &targets)).abs())
+            .map(|c| wrap_degrees(c.h - nearest_target(c.h, &targets)).abs())
             .sum();
         if cost < best_cost {
             best_cost = cost;
@@ -213,7 +215,7 @@ impl Hsl {
     fn to_hex(self) -> String {
         let [r, g, b] = hsl_to_rgb(self.h, self.s, self.l);
         let a = (self.a.clamp(0.0, 1.0) * 255.0).round() as u8;
-        format!("#{:02x}{:02x}{:02x}{:02x}", r, g, b, a)
+        format!("#{r:02x}{g:02x}{b:02x}{a:02x}")
     }
 }
 
@@ -250,7 +252,7 @@ fn rgb_to_hsl(r: u8, g: u8, b: u8) -> (f32, f32, f32) {
     let b = f32::from(b) / 255.0;
     let max = r.max(g).max(b);
     let min = r.min(g).min(b);
-    let l = (max + min) / 2.0;
+    let l = f32::midpoint(max, min);
     if (max - min).abs() < f32::EPSILON {
         return (0.0, 0.0, l);
     }
@@ -387,7 +389,7 @@ mod tests {
             // Allow ±1 quantisation drift.
             for i in 0..3 {
                 assert!(
-                    (back[i] as i32 - c[i] as i32).abs() <= 1,
+                    (i32::from(back[i]) - i32::from(c[i])).abs() <= 1,
                     "rgb→hsl→rgb drift at channel {i}"
                 );
             }

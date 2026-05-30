@@ -14,18 +14,15 @@ use thiserror::Error;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum OnePagerPageSize {
     Letter,
+    #[default]
     A4,
     Square,
     Custom { width: u32, height: u32 },
 }
 
-impl Default for OnePagerPageSize {
-    fn default() -> Self {
-        Self::A4
-    }
-}
 
 impl OnePagerPageSize {
     /// Return the page's dimensions in pixels (assuming 96 DPI).

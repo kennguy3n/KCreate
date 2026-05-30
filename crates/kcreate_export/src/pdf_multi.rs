@@ -166,19 +166,20 @@ pub fn export_pdf_multi_pages(
         "Pages" => pages_id,
     };
 
-    let mut bookmarks_emitted = false;
-    if options.include_bookmarks {
+    let bookmarks_emitted = if options.include_bookmarks {
         let outlines_id = emit_outlines(&mut doc, &toc_entries);
         catalog.set("Outlines", outlines_id);
         catalog.set("PageMode", Object::Name(b"UseOutlines".to_vec()));
-        bookmarks_emitted = true;
-    }
+        true
+    } else {
+        false
+    };
 
     let catalog_id = doc.add_object(catalog);
     doc.trailer.set("Root", catalog_id);
 
     doc.save(output_path)?;
-    let bytes_written = std::fs::metadata(output_path).map(|m| m.len()).unwrap_or(0);
+    let bytes_written = std::fs::metadata(output_path).map_or(0, |m| m.len());
 
     Ok(PdfMultiReport {
         page_count: pages.len() as u32,
@@ -238,11 +239,30 @@ fn embed_pixmap(doc: &mut Document, pixmap: &Pixmap) -> ObjectId {
     let h = pixmap.height();
     // Convert RGBA → RGB and harvest the alpha channel separately;
     // PDF doesn't accept RGBA inline streams without a soft mask.
+    //
+    // CRUCIAL: `tiny_skia::Pixmap::data()` returns *premultiplied*
+    // RGBA. PDF (per ISO 32000-1 §11.6.4) applies the SMask alpha
+    // straight to the colour samples, so if we leave the RGB
+    // channels premultiplied the alpha is applied twice and any
+    // semi-transparent region renders ~A/255 too dark. Un-premultiply
+    // the RGB channels here using the standard
+    // `out = (in * 255 + a/2) / a` rounding formula.
     let raw = pixmap.data();
     let mut rgb = Vec::with_capacity((w * h * 3) as usize);
     let mut alpha = Vec::with_capacity((w * h) as usize);
     for chunk in raw.chunks_exact(4) {
-        rgb.extend_from_slice(&chunk[..3]);
+        let a = u16::from(chunk[3]);
+        if a == 0 {
+            rgb.extend_from_slice(&[0, 0, 0]);
+        } else if a == 255 {
+            rgb.extend_from_slice(&chunk[..3]);
+        } else {
+            // Round-to-nearest divide by `a`.
+            let r = ((u16::from(chunk[0]) * 255 + a / 2) / a).min(255) as u8;
+            let g = ((u16::from(chunk[1]) * 255 + a / 2) / a).min(255) as u8;
+            let b = ((u16::from(chunk[2]) * 255 + a / 2) / a).min(255) as u8;
+            rgb.extend_from_slice(&[r, g, b]);
+        }
         alpha.push(chunk[3]);
     }
 

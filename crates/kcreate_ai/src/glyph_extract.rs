@@ -187,8 +187,16 @@ pub fn extract_glyph(
         &TraceOptions {
             threshold: TraceThreshold::Auto,
             simplify_tolerance: opts.simplify_tolerance.max(1.0) as f32,
-            min_path_points: 4,
-            smooth: true,
+            // Letterforms can be as small as a 4-pixel-wide stem on
+            // a tight crop. Asking for >= 4 points loses those
+            // outlines after RDP simplification reduces them to a
+            // bounding triangle.
+            min_path_points: 3,
+            // Letterforms have intentionally crisp edges; pre-blur
+            // smears narrow horizontal/vertical stems into the
+            // background, which then trips Otsu thresholding on
+            // small crops. Trust the source contrast.
+            smooth: false,
         },
     )?;
 
@@ -207,11 +215,11 @@ pub fn extract_glyph(
                 .points
                 .into_iter()
                 .map(|pt| crate::trace::TracedPoint {
-                    x: ((pt.x as f64 - min_x) * scale) as f32,
+                    x: ((f64::from(pt.x) - min_x) * scale) as f32,
                     // Flip Y axis: in image coords Y grows down; in
                     // font coords Y grows up. We translate so the
                     // glyph's bottom sits at baseline = 0.
-                    y: ((max_y - pt.y as f64) * scale) as f32,
+                    y: ((max_y - f64::from(pt.y)) * scale) as f32,
                 })
                 .collect(),
             closed: p.closed,
@@ -238,8 +246,8 @@ fn bounding_box(paths: &[TracedPath]) -> (f64, f64, f64, f64) {
     let mut max_y = f64::NEG_INFINITY;
     for p in paths {
         for pt in &p.points {
-            let x = pt.x as f64;
-            let y = pt.y as f64;
+            let x = f64::from(pt.x);
+            let y = f64::from(pt.y);
             if x < min_x {
                 min_x = x;
             }

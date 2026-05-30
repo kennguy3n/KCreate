@@ -17,6 +17,7 @@
 //!    contiguous SVG document and import it through `usvg`.
 //! 3. If no SVG marker is found, delegate to [`crate::pdf_import`].
 
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -73,9 +74,11 @@ pub fn import_illustrator_bytes(bytes: &[u8]) -> Result<AiImportSummary, AiImpor
     if bytes.is_empty() {
         return Err(AiImportError::Empty);
     }
-    let head_len = bytes.len().min(2048);
-    let head = std::str::from_utf8(&bytes[..head_len]).unwrap_or("");
-    if !head.starts_with("%PDF-") {
+    // Sniff the PDF magic at the byte level — real PDF headers are
+    // followed by a comment line containing high-bit bytes
+    // (e.g. `%\xe2\xe3\xcf\xd3`) that aren't valid UTF-8, so any
+    // string-based decode of the head would fail to recognise them.
+    if !bytes.starts_with(b"%PDF-") {
         // Legacy AI8 files are PostScript without a PDF wrapper.
         return Err(AiImportError::LegacyPostScript);
     }
@@ -88,7 +91,6 @@ pub fn import_illustrator_bytes(bytes: &[u8]) -> Result<AiImportSummary, AiImpor
             .map_err(|e| AiImportError::BadSvg(format!("{e}")))?;
         let size = tree.size();
         let count = count_group(tree.root());
-        use base64::Engine as _;
         let payload_b64 = base64::engine::general_purpose::STANDARD.encode(&svg_payload);
         return Ok(AiImportSummary {
             path: AiImportPath::Svg,
@@ -149,15 +151,25 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 }
 
 fn sniff_pdf_page_count(bytes: &[u8]) -> Option<u32> {
-    // Count `/Type /Page` occurrences. Not robust but good enough
-    // to surface a reasonable page count in the summary; the actual
-    // import goes through the rich `pdf_import` path.
+    // Count `/Type /Page` occurrences, taking care to EXCLUDE the
+    // `/Type /Pages` parent dictionary entry which would otherwise
+    // inflate the page count by one. We require the following byte
+    // after `/Type /Page` to be a non-name-continuation character
+    // (anything other than an ASCII alphanumeric / `_` / `.` / `-`)
+    // so `/Type /Pages` is rejected.
     let needle = b"/Type /Page";
     let mut count = 0u32;
     let mut cursor = 0;
     while cursor + needle.len() <= bytes.len() {
         if &bytes[cursor..cursor + needle.len()] == needle {
-            count += 1;
+            let next = bytes.get(cursor + needle.len()).copied();
+            let is_page_dict = match next {
+                None => true,
+                Some(c) => !is_pdf_name_continuation(c),
+            };
+            if is_page_dict {
+                count += 1;
+            }
             cursor += needle.len();
         } else {
             cursor += 1;
@@ -168,6 +180,15 @@ fn sniff_pdf_page_count(bytes: &[u8]) -> Option<u32> {
     } else {
         Some(count)
     }
+}
+
+/// Returns `true` if `c` could continue a PDF name token after
+/// `/Type /Page`. PDF names accept any character except the
+/// delimiters/whitespace listed in PDF 1.7 §7.2.2 — for our prefix
+/// disambiguation we only need to reject characters that would
+/// extend `Page` into something else like `Pages` or `PageMode`.
+fn is_pdf_name_continuation(c: u8) -> bool {
+    c.is_ascii_alphanumeric() || c == b'_' || c == b'.' || c == b'-'
 }
 
 fn count_group(group: &resvg::usvg::Group) -> u32 {
@@ -229,11 +250,41 @@ mod tests {
     }
 
     #[test]
-    fn malformed_svg_payload_errors() {
+    fn pdf_page_count_excludes_pages_parent_dictionary() {
+        // A real-world 2-page PDF contains one `/Type /Pages` parent
+        // dictionary plus two `/Type /Page` leaf dictionaries; the
+        // sniff must report 2, not 3.
         let mut buf = b"%PDF-1.4\n".to_vec();
-        // unclosed tag
-        buf.extend_from_slice(b"<svg width=\"oops\">unterminated</svg>");
+        buf.extend_from_slice(b"/Type /Pages\n/Type /Page\n/Type /Page\n");
+        buf.extend_from_slice(b"%%EOF\n");
+        let s = import_illustrator_bytes(&buf).unwrap();
+        assert_eq!(s.path, AiImportPath::Pdf);
+        assert_eq!(s.object_count, 2);
+    }
+
+    #[test]
+    fn pdf_page_count_excludes_pagemode_name() {
+        // `/PageMode` shares the `/Page` prefix but is a Catalog
+        // entry, not a page dictionary.
+        let mut buf = b"%PDF-1.4\n".to_vec();
+        buf.extend_from_slice(b"/Type /PageMode\n/Type /Page\n");
+        buf.extend_from_slice(b"%%EOF\n");
+        let s = import_illustrator_bytes(&buf).unwrap();
+        assert_eq!(s.path, AiImportPath::Pdf);
+        assert_eq!(s.object_count, 1);
+    }
+
+    #[test]
+    fn malformed_svg_payload_errors() {
+        // Genuinely malformed XML: unbalanced angle brackets after
+        // the `<svg` open tag. `usvg` rejects this with a parse
+        // error, surfaced as `AiImportError::BadSvg`.
+        let mut buf = b"%PDF-1.4\n".to_vec();
+        buf.extend_from_slice(b"<svg xmlns=\"http://www.w3.org/2000/svg\"<<broken</svg>");
         let err = import_illustrator_bytes(&buf).unwrap_err();
-        assert!(matches!(err, AiImportError::BadSvg(_)));
+        assert!(
+            matches!(err, AiImportError::BadSvg(_)),
+            "expected BadSvg, got {err:?}"
+        );
     }
 }

@@ -33,6 +33,7 @@
 
 use std::path::PathBuf;
 
+use base64::Engine as _;
 use chrono::Utc;
 use kcreate_ai::auto_color::{auto_color_correct, AutoColorMode, AutoColorOptions};
 use kcreate_ai::denoise::{denoise, DenoiseOptions};
@@ -207,12 +208,17 @@ pub fn ai_denoise(
     patch_radius: u32,
 ) -> Result<DenoiseResult> {
     let (rgba, w, h) = load_raster_rgba(node_id)?;
-    let opts = DenoiseOptions {
+    // Defense-in-depth: clamp at the bridge boundary even though
+    // `denoise()` clamps internally. Keeps the operation-log JSON,
+    // the algorithm call, and the wire reply in lockstep with one
+    // canonical `effective_opts` value.
+    let effective_opts = DenoiseOptions {
         strength,
         search_radius,
         patch_radius,
-    };
-    let out = denoise(&rgba, w, h, opts).map_err(|e| {
+    }
+    .clamped();
+    let out = denoise(&rgba, w, h, effective_opts).map_err(|e| {
         DocumentBridgeError::Internal(format!("ai_denoise: {e}"))
     })?;
     let new_id = install_processed_raster(
@@ -222,9 +228,9 @@ pub fn ai_denoise(
         h,
         "ai_denoise",
         serde_json::json!({
-            "strength": opts.clamped().strength,
-            "search_radius": opts.clamped().search_radius,
-            "patch_radius": opts.clamped().patch_radius,
+            "strength": effective_opts.strength,
+            "search_radius": effective_opts.search_radius,
+            "patch_radius": effective_opts.patch_radius,
         }),
         "Denoised",
     )?;
@@ -264,12 +270,17 @@ pub fn ai_inpaint(
     })?;
     let (rgba, w, h) = load_raster_rgba(node_id)?;
     let mask = mask_from_rects(&rects, w, h);
-    let opts = InpaintOptions {
+    // Defense-in-depth: clamp at the bridge boundary even though
+    // `inpaint()` clamps internally; ensures the algorithm call, the
+    // operation-log JSON, and the wire reply all reference one
+    // canonical `effective_opts`.
+    let effective_opts = InpaintOptions {
         patch_radius: patch_radius.unwrap_or(3),
         num_iterations: num_iterations.unwrap_or(5),
         pyramid_levels: pyramid_levels.unwrap_or(3),
-    };
-    let out = inpaint(&rgba, &mask, w, h, opts).map_err(|e| {
+    }
+    .clamped();
+    let out = inpaint(&rgba, &mask, w, h, effective_opts).map_err(|e| {
         DocumentBridgeError::Internal(format!("ai_inpaint: {e}"))
     })?;
     let new_id = install_processed_raster(
@@ -280,9 +291,9 @@ pub fn ai_inpaint(
         "ai_inpaint",
         serde_json::json!({
             "rects": rects,
-            "patch_radius": opts.clamped().patch_radius,
-            "num_iterations": opts.clamped().num_iterations,
-            "pyramid_levels": opts.clamped().pyramid_levels,
+            "patch_radius": effective_opts.patch_radius,
+            "num_iterations": effective_opts.num_iterations,
+            "pyramid_levels": effective_opts.pyramid_levels,
         }),
         "Inpainted",
     )?;
@@ -390,9 +401,7 @@ pub fn ai_segment_at_point(
             let first = result
                 .masks
                 .into_iter()
-                .next()
-                .map(|m| m.mask)
-                .unwrap_or_else(|| vec![0u8; (w * h) as usize]);
+                .next().map_or_else(|| vec![0u8; (w * h) as usize], |m| m.mask);
             (first, result.backend)
         }
         Err(_) => {
@@ -401,7 +410,6 @@ pub fn ai_segment_at_point(
             (m, SegmentBackend::EdgeAware)
         }
     };
-    use base64::Engine as _;
     let mask_b64 = base64::engine::general_purpose::STANDARD.encode(&mask);
     Ok(SegmentAtPointResult {
         mask_base64: mask_b64,
@@ -462,7 +470,6 @@ pub fn ai_smart_select_at_point(
     })?;
     let (rgba, w, h) = load_raster_rgba(node_id)?;
     let new_mask = smart_select(&rgba, w, h, x, y, tolerance);
-    use base64::Engine as _;
     let merged: Vec<u8> = match parsed_mode {
         SmartSelectMode::Replace => new_mask,
         SmartSelectMode::Add => {
@@ -493,7 +500,6 @@ pub fn ai_smart_select_at_point(
 }
 
 fn decode_mask_base64(b64: Option<&str>, w: u32, h: u32) -> Result<Vec<u8>> {
-    use base64::Engine as _;
     let expected = (w as usize) * (h as usize);
     let Some(s) = b64 else {
         return Ok(vec![0u8; expected]);
@@ -560,7 +566,7 @@ pub fn ai_match_stroke(source_id: Uuid, target_ids: &[Uuid]) -> Result<StrokeMat
     .map_err(|e| DocumentBridgeError::Internal(format!("match_stroke_style: {e}")))?;
 
     let new_stroke = props_to_stroke(&source_props);
-    let width_profile = source_props.width_profile.clone();
+    let width_profile = source_props.width_profile;
     let group_id = Uuid::new_v4();
     let target_ids_owned: Vec<Uuid> = target_ids.to_vec();
     with_workspace_mut(|ws| {
@@ -574,7 +580,7 @@ pub fn ai_match_stroke(source_id: Uuid, target_ids: &[Uuid]) -> Result<StrokeMat
                 .ok_or(DocumentBridgeError::NodeNotFound(*tid))?;
             before.push(serde_json::to_value(&node.style).unwrap_or(serde_json::Value::Null));
             node.style.stroke = Some(new_stroke.clone());
-            node.style.stroke_width_profile = width_profile.clone();
+            node.style.stroke_width_profile.clone_from(&width_profile);
             node.touch();
             after.push(serde_json::to_value(&node.style).unwrap_or(serde_json::Value::Null));
         }
@@ -891,7 +897,7 @@ pub fn export_preview(req: ExportPreviewRequest) -> Result<ExportPreviewResponse
     let (rgba, w, h) = load_raster_rgba(node_id)?;
     // Resize so longest side <= max_dim while preserving aspect.
     let (pw, ph) = scale_to_fit(w, h, max_dim);
-    let img = image::RgbaImage::from_raw(w, h, rgba.clone()).ok_or_else(|| {
+    let img = image::RgbaImage::from_raw(w, h, rgba).ok_or_else(|| {
         DocumentBridgeError::Internal("export_preview: failed to wrap RGBA".into())
     })?;
     let resized = if (pw, ph) == (w, h) {
@@ -947,7 +953,6 @@ pub fn export_preview(req: ExportPreviewRequest) -> Result<ExportPreviewResponse
             });
         }
     };
-    use base64::Engine as _;
     let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
     Ok(ExportPreviewResponse {
         bytes_base64: b64,
@@ -1111,7 +1116,7 @@ pub fn ai_brand_to_brochure(brand_kit_id: Uuid, num_pages: u32) -> Result<Brochu
                 y: margin,
                 width: page_w - 2.0 * margin,
                 height: 200.0,
-                style_color_hex: primary.clone(),
+                style_color_hex: primary,
             },
             BrochureSection {
                 section_kind: "color_swatches".into(),
@@ -1347,17 +1352,27 @@ impl Default for Preferences {
 }
 
 fn preferences_path() -> Result<PathBuf> {
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .ok_or_else(|| {
-            DocumentBridgeError::Internal(
-                "preferences: $HOME is not set; cannot resolve preferences path".into(),
-            )
-        })?;
+    let home = user_home_dir().ok_or_else(|| {
+        DocumentBridgeError::Internal(
+            "preferences: neither $HOME nor %USERPROFILE% is set; cannot resolve preferences path"
+                .into(),
+        )
+    })?;
     let dir = home.join(".kcreate");
     std::fs::create_dir_all(&dir)
         .map_err(|e| DocumentBridgeError::Internal(format!("preferences: mkdir: {e}")))?;
     Ok(dir.join("preferences.json"))
+}
+
+/// Cross-platform home-directory resolver. Mirrors the
+/// `HOME` → `USERPROFILE` fallback chain used by
+/// `crates/kcreate_bridge/src/phase2.rs`, `kcreate_core::marketplace`
+/// and `kcreate_audit::store`, so that `~/.kcreate/...` lookups work
+/// uniformly on Linux/macOS (`HOME`) and Windows (`USERPROFILE`).
+pub(crate) fn user_home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
 }
 
 pub fn preferences_load() -> Result<Preferences> {

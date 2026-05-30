@@ -1112,6 +1112,78 @@ export interface Bridge {
   autosaveRecoveryAvailable(): string;
   autosaveRecover(): void;
   autosaveDismissRecovery(): void;
+
+  // -------------------------------------------------------------------
+  // Phase 10 — Image Studio AI, Vector/Layout AI, Export AI + Live
+  // Preview, Brand Hub + Plugin Marketplace, Preferences. See
+  // `crates/kcreate_bridge/src/phase10.rs`.
+  // -------------------------------------------------------------------
+
+  // Image Studio AI (Block A)
+  aiDenoise(
+    nodeIdStr: string,
+    strength: number,
+    searchRadius: number,
+    patchRadius: number,
+  ): string;
+  aiInpaint(
+    nodeIdStr: string,
+    maskJson: string,
+    patchRadius: number | null | undefined,
+    numIterations: number | null | undefined,
+    pyramidLevels: number | null | undefined,
+  ): string;
+  aiAutoColor(nodeIdStr: string, mode: string): string;
+  aiSegmentAtPoint(
+    nodeIdStr: string,
+    pointX: number,
+    pointY: number,
+    isPositive: boolean,
+  ): string;
+  aiSmartSelectAtPoint(
+    nodeIdStr: string,
+    x: number,
+    y: number,
+    tolerance: number,
+    mode: string,
+    previousMaskBase64: string | null | undefined,
+  ): string;
+
+  // Vector/Layout AI (Block B)
+  aiMatchStroke(sourceIdStr: string, targetIdsJson: string): string;
+  aiExtractGlyph(
+    nodeIdStr: string,
+    cropX: number,
+    cropY: number,
+    cropWidth: number,
+    cropHeight: number,
+    emSize: number,
+  ): string;
+  aiReformatToDeck(pageIdStr: string): string;
+  aiBriefToOnePager(brief: string, pageSize: string | null | undefined): string;
+  aiHarmonizePalette(brandKitIdStr: string, harmonyType: string): string;
+  aiSuggestTypePairing(headingFontName: string): string;
+
+  // Export AI + Live Preview (Block C)
+  exportOptimizeSvg(svg: string): string;
+  exportSmartCompress(
+    nodeIdStr: string,
+    format: string,
+    targetSsim: number | null | undefined,
+  ): string;
+  exportPreview(requestJson: string): string;
+  importAi(path: string): string;
+
+  // Brand Hub + Plugin Marketplace (Block D)
+  aiBrandToBrochure(brandKitIdStr: string, numPages: number): string;
+  pluginMarketplaceList(): string;
+  pluginMarketplaceInstallLocal(path: string): string;
+  pluginMarketplaceRemove(id: string): boolean;
+  exportPdfMulti(optionsJson: string, outputPath: string): string;
+
+  // Preferences (Block D Task 23)
+  preferencesLoad(): string;
+  preferencesSave(prefsJson: string): void;
 }
 
 function bridgeBinaryPath(): string {

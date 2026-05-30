@@ -4368,6 +4368,7 @@ declare global {
       clipboard: ClipboardBridge;
       phase8: Phase8Bridge;
       phase9: Phase9Bridge;
+      phase10: Phase10Bridge;
       projectEncryption: ProjectEncryptionBridge;
       annotation: AnnotationBridge;
     };
@@ -5089,4 +5090,362 @@ export interface Phase9Bridge {
   autosaveRecoveryAvailable(): Promise<AutosaveMarker | null>;
   autosaveRecover(): Promise<void>;
   autosaveDismissRecovery(): Promise<void>;
+}
+
+// =============================================================
+// Phase 10 — Image Studio AI, Vector/Layout AI, Export AI +
+// Live Preview, Brand Hub + Plugin Marketplace, Preferences.
+// Wire-format mirrors of `crates/kcreate_bridge/src/phase10.rs`.
+// =============================================================
+
+/** Result of `aiDenoise`. New raster node id + dimensions. */
+export interface DenoiseResult {
+  newNodeId: string;
+  width: number;
+  height: number;
+}
+
+/** Result of `aiInpaint`. */
+export interface InpaintResult {
+  newNodeId: string;
+  width: number;
+  height: number;
+}
+
+/** Auto-color mode (matches Rust `AutoColorMode` serde). */
+export type AutoColorMode =
+  | "auto_levels"
+  | "white_balance"
+  | "histogram_equalization"
+  | "combined";
+
+/** Result of `aiAutoColor`. */
+export interface AutoColorResult {
+  newNodeId: string;
+  mode: string;
+  width: number;
+  height: number;
+}
+
+/** Result of `aiSegmentAtPoint`. */
+export interface SegmentAtPointResult {
+  /** Base64-encoded `width*height` byte mask (255 fg, 0 bg). */
+  maskBase64: string;
+  width: number;
+  height: number;
+  /** Backend that produced the mask (`edge_aware` | `sam`). */
+  backend: string;
+}
+
+/** Set-op mode for `aiSmartSelectAtPoint`. */
+export type SmartSelectMode = "replace" | "add" | "subtract";
+
+/** Result of `aiSmartSelectAtPoint`. */
+export interface SmartSelectAtPointResult {
+  maskBase64: string;
+  width: number;
+  height: number;
+  mode: string;
+  selectedPixelCount: number;
+}
+
+/** Rectangle for inpainting mask input. */
+export interface InpaintMaskRect {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
+
+/** Result of `aiMatchStroke`. */
+export interface StrokeMatchSummary {
+  source: StrokeProperties;
+  applied: Array<{
+    nodeId: string;
+    deltas: Record<string, unknown>;
+  }>;
+}
+
+export interface StrokeProperties {
+  widthPx: number;
+  dash: number[] | null;
+  cap: string;
+  join: string;
+  color: [number, number, number, number];
+}
+
+/** Result of `aiExtractGlyph`. */
+export interface ExtractedGlyphResult {
+  /** Serialized vector paths as JSON. */
+  pathsJson: string;
+  emSize: number;
+  /** `(minX, minY, maxX, maxY)`. */
+  boundingBox: [number, number, number, number];
+}
+
+export interface DeckSlide {
+  title: string;
+  bounds: { x: number; y: number; width: number; height: number };
+  nodes: Array<{
+    sourceNodeId: string;
+    newBounds: { x: number; y: number; width: number; height: number };
+    scale: number;
+  }>;
+}
+
+/** Result of `aiReformatToDeck`. */
+export interface ReformatDeckResult {
+  pages: DeckSlide[];
+}
+
+/** Section type returned by `aiBriefToOnePager`. */
+export type OnePagerSectionType =
+  | "header"
+  | "body"
+  | "image_placeholder"
+  | "callout";
+
+export interface OnePagerSection {
+  type: OnePagerSectionType;
+  text: string;
+  bounds: { x: number; y: number; width: number; height: number };
+}
+
+/** Result of `aiBriefToOnePager`. */
+export interface BriefToOnePagerResult {
+  pageSize: string;
+  sections: OnePagerSection[];
+  brandKitSuggestion: string | null;
+}
+
+/** Harmony type for `aiHarmonizePalette`. */
+export type HarmonyType =
+  | "auto"
+  | "complementary"
+  | "triadic"
+  | "analogous"
+  | "split_complementary"
+  | "tetradic";
+
+export interface HarmonyDelta {
+  index: number;
+  fromHex: string;
+  toHex: string;
+}
+
+export interface HarmonyResult {
+  rule: string;
+  deltas: HarmonyDelta[];
+  appliedToBrandKitId: string | null;
+}
+
+/** Result of `aiSuggestTypePairing`. */
+export interface TypePairingSuggestion {
+  fontName: string;
+  reason: string;
+  confidence: number;
+}
+
+export interface TypePairingResult {
+  heading: string;
+  classification: string;
+  suggestions: TypePairingSuggestion[];
+}
+
+/** Result of `exportOptimizeSvg`. */
+export interface SvgOptimizeReport {
+  originalBytes: number;
+  optimisedBytes: number;
+  bytesSaved: number;
+  ratio: number;
+  outputSvg: string;
+}
+
+/** Result of `exportSmartCompress`. */
+export interface SmartCompressReport {
+  quality: number;
+  format: "jpeg" | "webp";
+  originalBytes: number;
+  compressedBytes: number;
+  ratio: number;
+  ssim: number;
+  iterations: number;
+  /** Base64-encoded compressed bytes. */
+  bytes: string;
+}
+
+/** Request for `exportPreview`. */
+export interface ExportPreviewRequest {
+  nodeId: string;
+  /** `png` | `jpeg` | `jpg` | `webp`. */
+  format: string;
+  maxDimensionPx?: number | null;
+}
+
+/** Result of `exportPreview`. */
+export interface ExportPreviewResponse {
+  bytesBase64: string;
+  mimeType: string;
+  width: number;
+  height: number;
+  byteSize: number;
+}
+
+/** Result of `importAi`. */
+export interface AiImportSummary {
+  path: "svg" | "pdf";
+  widthPt: number | null;
+  heightPt: number | null;
+  objectCount: number;
+  message: string | null;
+  svgPayloadBase64: string;
+}
+
+/** Result of `aiBrandToBrochure`. */
+export interface BrochurePlanResult {
+  pages: Array<{
+    pageType: "cover" | "content" | "back";
+    sections: Array<{
+      type: string;
+      bounds: { x: number; y: number; width: number; height: number };
+      styleTokens: Record<string, string>;
+    }>;
+  }>;
+}
+
+/** Listing returned by `pluginMarketplaceList`. */
+export interface PluginListing {
+  id: string;
+  name: string;
+  version: string;
+  author: string;
+  description: string;
+  permissions: string[];
+  trustStatus: string;
+  installed: boolean;
+}
+
+/** Result of `exportPdfMulti`. */
+export interface PdfMultiReport {
+  pageCount: number;
+  bytesWritten: number;
+  tocEmitted: boolean;
+  bookmarksEmitted: number;
+}
+
+/** Mirror of `kcreate_bridge::phase10::Preferences`. */
+export interface Preferences {
+  general: {
+    theme: "dark" | "light" | "system";
+    language: string;
+    autosaveIntervalSec: number;
+    scratchProjectCleanupDays: number;
+  };
+  canvas: {
+    defaultGridSpacing: number;
+    snapThresholdPx: number;
+    rulerUnits: "px" | "mm" | "in" | "pt";
+  };
+  ai: {
+    defaultLlmModel: string;
+    autoStartSidecar: boolean;
+    gbnfGrammarDebugging: boolean;
+  };
+  performance: {
+    rasterCacheBudgetMb: number;
+    undoDepthOverride: number | null;
+    lowResourceMode: boolean;
+  };
+  privacy: {
+    telemetryOptIn: boolean;
+    auditLogRetentionDays: number;
+  };
+}
+
+/**
+ * Phase 10 bridge surface. Each method round-trips through the
+ * `kcreate/phase10/*` IPC channels; preload decodes JSON strings
+ * returned by the napi entry points so callers see typed objects.
+ */
+export interface Phase10Bridge {
+  // -------- Block A — Image Studio AI -----------------------
+  aiDenoise(
+    nodeId: string,
+    strength: number,
+    searchRadius: number,
+    patchRadius: number,
+  ): Promise<DenoiseResult>;
+  aiInpaint(
+    nodeId: string,
+    maskRects: InpaintMaskRect[],
+    patchRadius: number | null,
+    numIterations: number | null,
+    pyramidLevels: number | null,
+  ): Promise<InpaintResult>;
+  aiAutoColor(nodeId: string, mode: AutoColorMode): Promise<AutoColorResult>;
+  aiSegmentAtPoint(
+    nodeId: string,
+    pointX: number,
+    pointY: number,
+    isPositive: boolean,
+  ): Promise<SegmentAtPointResult>;
+  aiSmartSelectAtPoint(
+    nodeId: string,
+    x: number,
+    y: number,
+    tolerance: number,
+    mode: SmartSelectMode,
+    previousMaskBase64: string | null,
+  ): Promise<SmartSelectAtPointResult>;
+
+  // -------- Block B — Vector/Layout AI ----------------------
+  aiMatchStroke(
+    sourceNodeId: string,
+    targetNodeIds: string[],
+  ): Promise<StrokeMatchSummary>;
+  aiExtractGlyph(
+    nodeId: string,
+    cropX: number,
+    cropY: number,
+    cropWidth: number,
+    cropHeight: number,
+    emSize: number,
+  ): Promise<ExtractedGlyphResult>;
+  aiReformatToDeck(pageId: string): Promise<ReformatDeckResult>;
+  aiBriefToOnePager(
+    brief: string,
+    pageSize: "letter" | "a4" | "square" | null,
+  ): Promise<BriefToOnePagerResult>;
+  aiHarmonizePalette(
+    brandKitId: string,
+    harmonyType: HarmonyType,
+  ): Promise<HarmonyResult>;
+  aiSuggestTypePairing(headingFontName: string): Promise<TypePairingResult>;
+
+  // -------- Block C — Export AI + Live Preview --------------
+  exportOptimizeSvg(svg: string): Promise<SvgOptimizeReport>;
+  exportSmartCompress(
+    nodeId: string,
+    format: "jpeg" | "webp",
+    targetSsim: number | null,
+  ): Promise<SmartCompressReport>;
+  exportPreview(request: ExportPreviewRequest): Promise<ExportPreviewResponse>;
+  importAi(path: string): Promise<AiImportSummary>;
+
+  // -------- Block D — Brand Hub + Plugin Marketplace --------
+  aiBrandToBrochure(
+    brandKitId: string,
+    numPages: number,
+  ): Promise<BrochurePlanResult>;
+  pluginMarketplaceList(): Promise<PluginListing[]>;
+  pluginMarketplaceInstallLocal(path: string): Promise<PluginListing>;
+  pluginMarketplaceRemove(id: string): Promise<boolean>;
+  exportPdfMulti(
+    options: Record<string, unknown>,
+    outputPath: string,
+  ): Promise<PdfMultiReport>;
+
+  // -------- Block D Task 23 — Preferences -------------------
+  preferencesLoad(): Promise<Preferences>;
+  preferencesSave(prefs: Preferences): Promise<void>;
 }

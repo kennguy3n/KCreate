@@ -59,9 +59,17 @@ pub enum MarketplaceError {
 }
 
 /// Default location for installed plugins — `~/.kcreate/plugins/`.
+///
+/// Resolves the user's home directory in a cross-platform way:
+/// `HOME` (Linux / macOS) → `USERPROFILE` (Windows). Mirrors the
+/// fallback chain already used by `kcreate_core::marketplace` and
+/// `kcreate_bridge::phase2`, so plugin discovery works on the
+/// `windows-2022` CI matrix where `HOME` is not exported.
 #[must_use]
 pub fn default_plugin_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".kcreate").join("plugins"))
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(|h| PathBuf::from(h).join(".kcreate").join("plugins"))
 }
 
 #[derive(Debug, Clone)]
@@ -109,7 +117,7 @@ impl PluginMarketplace {
             stage_from_dir(source, &self.plugin_dir)?
         } else {
             match source.extension().and_then(|e| e.to_str()) {
-                Some("zip") | Some("kcplugin") => stage_from_zip(source, &self.plugin_dir)?,
+                Some("zip" | "kcplugin") => stage_from_zip(source, &self.plugin_dir)?,
                 _ => return Err(MarketplaceError::UnsupportedSource(source.into())),
             }
         };
@@ -121,7 +129,7 @@ impl PluginMarketplace {
         let already = reg.list().iter().any(|m| m.id == manifest.id && Path::new(&staged_dir) != reg_dir_for(&self.plugin_dir, m));
         if already {
             let _ = fs::remove_dir_all(&staged_dir);
-            return Err(MarketplaceError::AlreadyInstalled(manifest.id.clone()));
+            return Err(MarketplaceError::AlreadyInstalled(manifest.id));
         }
         // Re-scan to pick up the new plugin and surface signature
         // status.
@@ -138,7 +146,7 @@ impl PluginMarketplace {
         self.ensure_dir()?;
         let mut reg = PluginRegistry::new(self.plugin_dir.clone());
         reg.scan()?;
-        let manifest = match reg.list().iter().find(|m| m.id == id).cloned() {
+        let manifest = match reg.list().iter().find(|m| m.id == id).copied() {
             Some(m) => m.clone(),
             None => return Ok(false),
         };
@@ -169,6 +177,7 @@ fn make_listing(
         permissions: manifest
             .permissions
             .iter()
+            .copied()
             .map(permission_str)
             .collect(),
         trust_status: trust_status_str(sig),
@@ -176,7 +185,7 @@ fn make_listing(
     }
 }
 
-fn permission_str(p: &PluginPermission) -> String {
+fn permission_str(p: PluginPermission) -> String {
     format!("{p:?}")
 }
 
@@ -198,7 +207,7 @@ fn stage_from_dir(source: &Path, plugin_root: &Path) -> Result<PathBuf, Marketpl
     let (manifest, _raw) = PluginManifest::load_with_raw(source)?;
     let dest = plugin_root.join(&manifest.id);
     if dest.exists() {
-        return Err(MarketplaceError::AlreadyInstalled(manifest.id.clone()));
+        return Err(MarketplaceError::AlreadyInstalled(manifest.id));
     }
     copy_dir_recursive(source, &dest)?;
     Ok(dest)
@@ -236,7 +245,7 @@ fn stage_from_zip(source: &Path, plugin_root: &Path) -> Result<PathBuf, Marketpl
     let dest = plugin_root.join(&manifest.id);
     if dest.exists() {
         let _ = fs::remove_dir_all(&staging);
-        return Err(MarketplaceError::AlreadyInstalled(manifest.id.clone()));
+        return Err(MarketplaceError::AlreadyInstalled(manifest.id));
     }
     fs::rename(&staging, &dest).or_else(|_| {
         // rename failed (different filesystem) — fall back to copy.

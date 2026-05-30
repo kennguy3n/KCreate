@@ -307,9 +307,32 @@ fn matched_open_tag<'a>(s: &str, pos: usize, names: &'a [&'a str]) -> Option<(&'
 
 fn strip_empty_groups_once(s: &str) -> String {
     // Remove `<g[..]></g>` whose attributes are all whitespace.
+    //
+    // We must only match the actual `<g>` element, never any other
+    // SVG element whose tag name starts with the letter `g`
+    // (`<glyph>`, `<glyphRef>`, `<gradient>`, `<g…>` etc.). A bare
+    // `rest.find("<g")` would treat `<glyphRef …/>` as a self-closing
+    // `<g>` and silently delete the entire element. To prevent that,
+    // we require the character immediately after the `<g` prefix to
+    // be a valid tag-name terminator: ASCII whitespace, `/`, or `>`.
+    // Same boundary rule used by `matched_open_tag` above.
     let mut out = String::with_capacity(s.len());
     let mut rest = s;
     while let Some(idx) = rest.find("<g") {
+        // Boundary check — reject `<gradient`, `<glyph`, `<glyphRef`,
+        // etc. by inspecting the byte right after `<g`.
+        let next_byte = rest.as_bytes().get(idx + 2).copied();
+        let is_g_element = matches!(
+            next_byte,
+            Some(b) if b.is_ascii_whitespace() || b == b'/' || b == b'>'
+        );
+        if !is_g_element {
+            // Emit `<g` verbatim and advance past it — this is some
+            // other element whose name happens to start with `g`.
+            out.push_str(&rest[..=idx + 1]);
+            rest = &rest[idx + 2..];
+            continue;
+        }
         out.push_str(&rest[..idx]);
         let after = &rest[idx + 2..];
         // Find the close of the opening tag.
@@ -574,6 +597,39 @@ mod tests {
         assert!(
             r.output_svg.contains(css),
             "style payload mutated: {}",
+            r.output_svg
+        );
+    }
+
+    #[test]
+    fn non_g_elements_starting_with_g_are_preserved() {
+        // Regression for: strip_empty_groups_once used to do a bare
+        // rest.find("<g") which also matched `<glyph>`, `<glyphRef>`,
+        // `<gradient>`, etc. Self-closing instances of those elements
+        // would then be incorrectly deleted because the function's
+        // "ends with /" check would treat them as empty <g/> groups.
+        // Phase 10 — Devin Review finding BUG_…_0001.
+        let svg = r##"<svg><glyphRef xlink:href="#a"/><glyph unicode="A"/><gradient id="g1"><stop/></gradient><g></g></svg>"##;
+        let r = optimize_svg(svg).unwrap();
+        assert!(
+            r.output_svg.contains("<glyphRef"),
+            "glyphRef was deleted: {}",
+            r.output_svg
+        );
+        assert!(
+            r.output_svg.contains("<glyph "),
+            "glyph was deleted: {}",
+            r.output_svg
+        );
+        assert!(
+            r.output_svg.contains("<gradient"),
+            "gradient was deleted: {}",
+            r.output_svg
+        );
+        // The actual empty <g></g> at the end is still stripped.
+        assert!(
+            !r.output_svg.contains("<g></g>"),
+            "empty <g> was not stripped: {}",
             r.output_svg
         );
     }

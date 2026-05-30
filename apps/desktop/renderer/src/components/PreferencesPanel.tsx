@@ -7,7 +7,7 @@
 // mirror in `apps/desktop/shared/scene.ts` — adding a field here
 // without updating both sides will fail typecheck.
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import type { Preferences } from "../../../shared/scene";
 import { colors, radius, spacing } from "../styles/tokens";
@@ -32,6 +32,29 @@ export function PreferencesPanel({
   const [section, setSection] = useState<Section>("general");
   const [dirty, setDirty] = useState(false);
   const [busy, setBusy] = useState(false);
+
+  // Stable ref so requestClose always sees the latest `dirty` value
+  // without re-creating the callback (PanelShell memoizes on it).
+  const dirtyRef = useRef(dirty);
+  useEffect(() => {
+    dirtyRef.current = dirty;
+  }, [dirty]);
+
+  // Guard close paths: if there are unsaved edits, ask the user
+  // before discarding. Wired into the footer Close button, the
+  // PanelShell header × button, and the overlay click. UX finding
+  // from Devin Review (ANALYSIS_…_0007).
+  const requestClose = useCallback(() => {
+    if (
+      dirtyRef.current &&
+      !window.confirm(
+        "You have unsaved preference changes. Discard them and close?",
+      )
+    ) {
+      return;
+    }
+    onClose();
+  }, [onClose]);
 
   const load = useCallback(async () => {
     try {
@@ -116,7 +139,7 @@ export function PreferencesPanel({
 
   if (loadError) {
     return (
-      <PanelShell onClose={onClose} title="Preferences">
+      <PanelShell onClose={requestClose} title="Preferences">
         <div
           style={{
             padding: spacing.lg,
@@ -167,7 +190,7 @@ export function PreferencesPanel({
 
   if (!prefs) {
     return (
-      <PanelShell onClose={onClose} title="Preferences">
+      <PanelShell onClose={requestClose} title="Preferences">
         <div style={{ padding: spacing.lg, color: colors.textMuted }}>
           Loading…
         </div>
@@ -176,7 +199,7 @@ export function PreferencesPanel({
   }
 
   return (
-    <PanelShell onClose={onClose} title="Preferences">
+    <PanelShell onClose={requestClose} title="Preferences">
       <div style={{ display: "flex", height: "100%" }}>
         <nav
           style={{
@@ -239,7 +262,7 @@ export function PreferencesPanel({
       >
         <button
           type="button"
-          onClick={onClose}
+          onClick={requestClose}
           style={{
             padding: `${spacing.sm}px ${spacing.md}px`,
             background: "transparent",

@@ -5196,19 +5196,39 @@ export interface ExtractedGlyphResult {
   boundingBox: [number, number, number, number];
 }
 
-export interface DeckSlide {
-  title: string;
-  bounds: { x: number; y: number; width: number; height: number };
-  nodes: Array<{
-    sourceNodeId: string;
-    newBounds: { x: number; y: number; width: number; height: number };
-    scale: number;
-  }>;
+/**
+ * One placement on a reformatted deck page. Mirror of Rust
+ * `kcreate_ai::reformat::ReformatPagePlacement`
+ * (`#[serde(rename_all = "camelCase")]`). Coordinates are flat
+ * (`newX`/`newY`/`newWidth`/`newHeight`) — there is no nested
+ * `bounds` object.
+ */
+export interface ReformatPagePlacement {
+  sourceNodeId: string;
+  newX: number;
+  newY: number;
+  newWidth: number;
+  newHeight: number;
+  scale: number;
 }
 
-/** Result of `aiReformatToDeck`. */
+/**
+ * One page in a reformatted deck. Mirror of Rust
+ * `kcreate_ai::reformat::ReformatPage`. The Rust field is
+ * `placements`, not `nodes`, and the index is exposed at the page
+ * level.
+ */
+export interface ReformatPage {
+  index: number;
+  title: string;
+  placements: ReformatPagePlacement[];
+}
+
+/** Result of `aiReformatToDeck`. Mirror of Rust `ReformatDeckResult`. */
 export interface ReformatDeckResult {
-  pages: DeckSlide[];
+  pages: ReformatPage[];
+  pageWidth: number;
+  pageHeight: number;
 }
 
 /** Section type returned by `aiBriefToOnePager`. */

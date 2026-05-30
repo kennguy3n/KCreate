@@ -3952,7 +3952,27 @@ fn migrate_legacy_plaintext_acl_if_needed(
 /// `path` is the canonical plaintext path returned by
 /// [`load_project_acl`]; this function derives the encrypted
 /// sibling path from the same parent directory.
-fn save_project_acl(path: &std::path::Path, acl: &kcreate_collab::ProjectAcl) -> Result<()> {
+///
+/// `encryption_key` MUST be supplied by the caller — pass `None`
+/// for plaintext projects, `Some(key)` for SQLCipher-backed ones.
+/// The key is intentionally a parameter rather than being looked
+/// up inside this function because the canonical lock order in
+/// the bridge is **workspace → collab** (see
+/// [`document::sync_scene_locked`] for the documented invariant
+/// and [`session_acl_set`] for the load-bearing call site). The
+/// previous revision called [`current_project_encryption_key`]
+/// internally, which acquired `workspace_slot().read()` while the
+/// caller (`session_acl_set`) already held the collab session
+/// mutex — opposite of the canonical order and a textbook ABBA
+/// deadlock against any concurrent `sync_scene_locked` (Devin
+/// Review BUG-0001 round 6). Threading the key through as a
+/// parameter forces every caller to acquire it **before** the
+/// collab lock, restoring the invariant.
+fn save_project_acl(
+    path: &std::path::Path,
+    acl: &kcreate_collab::ProjectAcl,
+    encryption_key: Option<&[u8; 32]>,
+) -> Result<()> {
     let json = serde_json::to_vec_pretty(acl).map_err(|e| SessionBridgeError::InvalidArgument {
         field: "acl",
         message: format!("could not serialise ACL: {e}"),
@@ -3967,8 +3987,7 @@ fn save_project_acl(path: &std::path::Path, acl: &kcreate_collab::ProjectAcl) ->
         || std::path::PathBuf::from(ACL_FILENAME_ENC),
         |p| p.join(ACL_FILENAME_ENC),
     );
-    let encryption_key = current_project_encryption_key();
-    if let Some(key) = encryption_key.as_ref() {
+    if let Some(key) = encryption_key {
         let blob = kcreate_collab::encrypt_acl_bytes(key, &json).map_err(|e| {
             SessionBridgeError::InvalidArgument {
                 field: "acl",
@@ -4026,13 +4045,26 @@ pub fn session_acl_get() -> Option<kcreate_collab::ProjectAcl> {
 /// are re-evaluated and disconnected with `acl-rejected` if they
 /// no longer meet the policy.
 pub fn session_acl_set(acl: kcreate_collab::ProjectAcl) -> Result<()> {
+    // Phase 11 Block E follow-up round 6 — Devin Review BUG-0001
+    // (r6). The canonical bridge lock order is **workspace →
+    // collab** (see `document::sync_scene_locked`'s invariant
+    // doc-comment). Acquiring the workspace `RwLock` *inside*
+    // `save_project_acl` while we already hold the collab session
+    // `Mutex` would invert that order and deadlock with
+    // `sync_scene_locked`, which holds the workspace write lock
+    // and reaches into the collab mutex via `presence_snapshot()`.
+    // Snapshot the encryption key here, BEFORE `slot().lock()`,
+    // and thread it through to `save_project_acl` so the entire
+    // collab-locked region is workspace-lock-free.
+    let encryption_key = current_project_encryption_key();
+
     let mut guard = slot().lock();
     let state = guard.as_mut().ok_or(SessionBridgeError::NotRunning)?;
     state.acl = acl.clone();
     let host = state.host.clone();
     let runtime_handle = state.runtime.handle().clone();
     if let Some(path) = state.acl_path.clone() {
-        save_project_acl(&path, &acl)?;
+        save_project_acl(&path, &acl, encryption_key.as_ref())?;
     }
     // Re-evaluate every currently-connected peer against the new
     // ACL. Anyone who no longer passes is disconnected with an

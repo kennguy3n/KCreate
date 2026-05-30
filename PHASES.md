@@ -354,4 +354,73 @@ stays green: the only new networking-adjacent dep
 `kcreate_kchat_client`, which is excluded from the
 editing-path closure.
 
+## Phase 12 — Python Elimination, Native AI Stack
+
+**Goal.** Strip every Python dependency from KCreate's AI stack.
+After Phase 12, the runtime is `llama.cpp` (text + vision) and
+`stable-diffusion.cpp` (image gen) talking loopback HTTP. No
+PyTorch, no diffusers, no `mlx_lm`, no `pip` — just two native
+binaries plus optional ONNX Runtime for the existing
+background-removal / segmentation / upscale features.
+
+- **Block A — MLX out, Ternary-Bonsai in.** Remove
+  `crates/kcreate_ai/src/mlx_sidecar.rs`,
+  `SidecarRuntime::MlxLm`, `DispatchReason::MlxNative` /
+  `MlxUnavailableFallback`, `gguf_fallback_for_mlx_pack`, and every
+  `_mlx` pack from the registry. Add three tier-aware
+  Ternary-Bonsai GGUF packs (1.7B / 4B / 8B from
+  `huggingface.co/prism-ml/Ternary-Bonsai-{size}-gguf`) and rewrite
+  `recommended_llm_pack` so Tier 0 boxes get the 1.7B, Tier 1 the
+  4B, Tier 2+ the 8B. The legacy `llm_sidecar_3b` (Llama 3.2 3B)
+  stays in the registry as an alternative, just not the default.
+- **Block B — sd.cpp replaces the Python diffusion sidecar.**
+  Delete `tools/kcreate_diffusion/` (the FastAPI + diffusers
+  server). Add `crates/kcreate_ai/src/diffusion_sidecar.rs` that
+  spawns `sd-server` from stable-diffusion.cpp with
+  `--listen-ip 127.0.0.1 --listen-port <port>
+  --diffusion-model <path>`, polls `/sdcpp/v1/capabilities` for
+  readiness, and exposes the same `Stopped → Starting → Ready →
+  Stopped` lifecycle as `LlmSidecar`. Rewrite
+  `crates/kcreate_ai/src/image_gen.rs` into a thin HTTP client
+  that POSTs to `/sdapi/v1/txt2img` (A1111-compatible) and
+  decodes the `images[0]` base64 PNG into RGBA8. FLUX Klein 4B
+  stays the sole image-gen pack — Bonsai Image Ternary variants
+  are confirmed NOT sd.cpp-compatible (gemlite / MLX-specific
+  2-bit quantisation; sd.cpp expects GGUF or safetensors with the
+  FLUX architecture header).
+- **Block C — Bridge + UI cleanup.** Drop `VisionHandle::Mlx`,
+  `MlxSidecarConfig`, and every `_mlx`-specific filter from
+  `crates/kcreate_bridge/src/phase4.rs`. Wire
+  `image_gen_start` to construct `DiffusionSidecarConfig`. In
+  `apps/desktop/shared/scene.ts`, collapse the
+  `VisionStatus.runtime` union from
+  `"llama_server" | "mlx_lm" | null` down to
+  `"llama_server" | null` and document the forward-compat
+  reason. Renderer-side, remove the MLX filter branch from
+  `ModelManager.tsx`'s `filterPacksForTier`.
+- **Block D + E (carried over).** Already shipped in Phase 11
+  (PR #27): content-addressed image fingerprinting, R-tree
+  spatial index, async N-API for raster + export ops, RwLock for
+  workspace reads, LLM sidecar bearer-token auth with TOCTOU
+  verification (Block D); transition data model + prototype
+  player animations + component auto-layout propagation through
+  instances with override preservation (Block E). Phase 12
+  verifies the work survived the Python-elimination diff and
+  fills any gaps inline (no new gaps were found).
+- **Block F — Documentation.** Update PROGRESS.md, PHASES.md,
+  ARCHITECTURE.md §17q, README.md, CONTRIBUTING.md, AGENTS.md to
+  reflect zero-Python stack. Add the `KCREATE_SD_SERVER_BINARY`
+  and `KCREATE_SD_SERVER_EXTRA_ARGS` env vars to the contributor
+  docs.
+
+All Phase 12 Rust + bridge work routes through
+`crates/kcreate_ai/src/{diffusion_sidecar,image_gen,
+model_registry,sidecar_dispatcher}.rs` and
+`crates/kcreate_bridge/src/phase4.rs`. The local-first sentinel
+(`crates/kcreate_tests/tests/local_first.rs`) stays green: no new
+network crates were added (sd-server is a subprocess just like
+llama-server). The `ureq` dependency that the chat / image-gen
+HTTP clients use is feature-gated behind `llm_sidecar`, so the
+editing-path closure walked by the sentinel still excludes it.
+
 See PROGRESS.md §"Phase 10" for the per-task breakdown.

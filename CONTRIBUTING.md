@@ -110,15 +110,27 @@ Bridge tests share a process-global renderer singleton; they use the
 `serial_test` crate to run serialized.
 
 The Phase 4 vision sidecar (`kcreate_ai::vision_chat`) and the FLUX
-image-generation sidecar (`kcreate_ai::image_gen` + `tools/kcreate_diffusion`)
-optionally spawn Python subprocesses (`mlx_lm.server` on Apple
-Silicon, `python -m kcreate_diffusion.server` everywhere else). These
-are not required for building or testing — they enhance the runtime
-AI experience. Without them the bridge still loads and the relevant
-tier of model packs is reported as unavailable rather than failing.
+image-generation sidecar (`kcreate_ai::diffusion_sidecar` +
+`kcreate_ai::image_gen`) optionally spawn native C++ subprocesses
+(`llama-server` for chat / vision, `sd-server` from
+[stable-diffusion.cpp][sd-cpp] for diffusion). They are NOT required
+for building or testing — without them the bridge still loads and
+the relevant tier of model packs is reported as unavailable rather
+than failing. Phase 12 (PROGRESS.md §"Phase 12") removed all Python
+subprocess dependencies; KCreate ships zero Python, pip, or PyTorch
+at runtime.
+
+The bridge resolves both binaries by PATH lookup at sidecar-start
+time. Set `KCREATE_SD_SERVER_BINARY` to point at a non-PATH
+`sd-server` build, and `KCREATE_SD_SERVER_EXTRA_ARGS` to pass
+through flags like FLUX text-encoder / VAE component paths
+(space-separated).
+
 LAN collaboration is opt-in via `--features kcreate_bridge/collab`
 and `kcreate_bridge/kchat-dev-issuer`; both pull `quinn`, `rustls`,
 `mdns-sd`, and `tokio` from the workspace deps.
+
+[sd-cpp]: https://github.com/leejet/stable-diffusion.cpp
 
 ## Code style
 

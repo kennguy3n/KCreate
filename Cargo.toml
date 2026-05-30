@@ -216,6 +216,18 @@ chacha20poly1305 = { version = "0.10", default-features = false, features = ["al
 # same OS-CSPRNG wrapper, so the security posture is unchanged.
 getrandom = "0.3"
 
+# Shell-style tokenizer for environment-variable arg overrides
+# (KCREATE_SD_SERVER_EXTRA_ARGS, KCREATE_LLAMA_SERVER_EXTRA_ARGS, …).
+# `shell-words` is a thin, dep-free implementation of POSIX shell
+# word splitting — it understands single/double quotes and `\`
+# escapes, which the previous naive `split_whitespace` did not.
+# Without proper quoting, Windows paths like
+# `C:\Program Files\sd-models\flux\ae.sft` silently broke into two
+# argv tokens, dropping the second half of the path; the operator
+# would then see an opaque `failed to open file` error from
+# sd-server. shell-words fixes that.
+shell-words = "1.1"
+
 # Phase 3 LAN transport — these are intentionally pulled in only by
 # `kcreate_collab_transport` (and transitively, the bridge under the
 # `collab` feature). The editing-path crates never reach them, which is

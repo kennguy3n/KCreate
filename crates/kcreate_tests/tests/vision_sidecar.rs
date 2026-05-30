@@ -1,8 +1,7 @@
 //! Vision (VLM) sidecar integration tests.
 //!
 //! These run against a `tiny_http`-backed mock server bound to a
-//! loopback port — the same shape `llama-server` (or
-//! `python3 -m mlx_lm.server` on Apple Silicon) speaks. The intent is
+//! loopback port — the same shape `llama-server` speaks. The intent is
 //! NOT to verify the model's output (which is unknowable) but to
 //! check the wire shape both ways:
 //!
@@ -18,9 +17,6 @@
 //!      i.e. `SidecarConfig` validates the path at construction
 //!      time so a typo crashes the host UI rather than a half-running
 //!      sidecar.
-//!   5. MLX sidecar gracefully reports unavailability on non-Apple
-//!      platforms (we don't try to spawn `python3 -m mlx_lm.server`
-//!      on Linux CI).
 
 use kcreate_ai::llm_chat::{ChatContent, ChatMessage, ChatRequest, ChatRole, ContentPart};
 use kcreate_ai::vision_chat::{describe_image, describe_image_with_grammar};
@@ -247,19 +243,9 @@ fn chat_request_with_no_messages_is_an_invalid_input() {
     let _ = err;
 }
 
-/// MLX sidecar must be gracefully unavailable on non-Apple-Silicon
-/// platforms — we should not be spawning `python3 -m mlx_lm.server`
-/// on Linux CI. `probe_mlx_available` calls `python3 -c
-/// "import mlx_lm"`, which on a Linux box without the `mlx_lm`
-/// wheel returns `false`. We don't assert on Apple Silicon because
-/// the developer's box may or may not have MLX installed; the test
-/// only verifies the contract that the probe is honest.
-#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-#[test]
-fn mlx_probe_returns_false_off_apple_silicon() {
-    assert!(
-        !kcreate_ai::mlx_sidecar::probe_mlx_available(),
-        "MLX should not be available off Apple Silicon — \
-         `python3 -m mlx_lm` is macOS-arm64-only",
-    );
-}
+// Phase 12 removed the MLX sidecar entirely. The
+// `mlx_probe_returns_false_off_apple_silicon` test that lived here
+// previously was deleted along with `crates/kcreate_ai/src/mlx_sidecar.rs`
+// — there is no longer a Python-based VLM fallback path to probe.
+// All vision models now run on llama-server with `--mmproj` and a
+// GGUF projector companion (see `model_registry::mmproj_for`).

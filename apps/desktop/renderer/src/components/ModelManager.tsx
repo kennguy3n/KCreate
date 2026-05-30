@@ -284,28 +284,21 @@ export function ModelManager({ onStatus }: ModelManagerProps): JSX.Element {
 ///   (`crates/kcreate_bridge/src/phase4.rs::vision_listable_packs`)
 ///   — using decimal MB here would diverge by ~2.4% and could
 ///   produce edge-case disagreements at tier boundaries.
-/// - MLX-suffixed packs are filtered out on non-Apple-Silicon
-///   platforms by inspecting `limits.platform` (the `Debug` form of
-///   the host `Platform` enum). Earlier code looked at
-///   `limits.deviceTier`, but that string only encodes the
-///   performance class (`Tier0`/`Tier1`/…) and never contains
-///   platform info — so every MLX pack was incorrectly hidden on
-///   Apple Silicon too.
+/// - Phase 12 removed every `_mlx`-suffixed pack from the registry
+///   (the MLX sidecar is gone), so the historical
+///   "hide MLX packs on non-Apple-Silicon" branch is no longer
+///   needed. Every pack the bridge surfaces here is GGUF and runs
+///   on the same llama-server / sd-server stack regardless of
+///   host platform.
 const BINARY_MB = 1024 * 1024;
 function filterPacksForTier(
   packs: ModelPack[],
   limits: ResourceLimits | null,
 ): { visible: ModelPack[]; disabledIds: Set<string> } {
   if (!limits) return { visible: packs, disabledIds: new Set() };
-  const isAppleSilicon = limits.platform
-    .toLowerCase()
-    .includes("applesilicon");
   const disabled = new Set<string>();
   const visible = packs.filter((p) => {
     if (p.category === "generation" && !limits.imageGenerationAllowed) {
-      return false;
-    }
-    if (p.id.endsWith("_mlx") && !isAppleSilicon) {
       return false;
     }
     if (p.category === "vision") {

@@ -3818,31 +3818,27 @@ fn load_project_acl(
             Ok(blob) => {
                 if let Some(key) = encryption_key.as_ref() {
                     match kcreate_collab::decrypt_acl_bytes(key, &blob) {
-                        Ok(plaintext) => match serde_json::from_slice::<
-                            kcreate_collab::ProjectAcl,
-                        >(&plaintext)
-                        {
-                            Ok(acl) => return (acl, Some(plaintext_path)),
-                            Err(e) => {
-                                tracing::warn!(
+                        Ok(plaintext) => {
+                            match serde_json::from_slice::<kcreate_collab::ProjectAcl>(&plaintext) {
+                                Ok(acl) => return (acl, Some(plaintext_path)),
+                                Err(e) => {
+                                    tracing::warn!(
                                     "collab: encrypted ACL at {} decrypted but JSON malformed ({e}); falling back to open ACL",
                                     encrypted_path.display()
                                 );
-                                return (
-                                    kcreate_collab::ProjectAcl::default(),
-                                    Some(plaintext_path),
-                                );
+                                    return (
+                                        kcreate_collab::ProjectAcl::default(),
+                                        Some(plaintext_path),
+                                    );
+                                }
                             }
-                        },
+                        }
                         Err(e) => {
                             tracing::warn!(
                                 "collab: encrypted ACL at {} could not be decrypted ({e}); falling back to open ACL",
                                 encrypted_path.display()
                             );
-                            return (
-                                kcreate_collab::ProjectAcl::default(),
-                                Some(plaintext_path),
-                            );
+                            return (kcreate_collab::ProjectAcl::default(), Some(plaintext_path));
                         }
                     }
                 }
@@ -3906,7 +3902,9 @@ fn migrate_legacy_plaintext_acl_if_needed(
     acl: &kcreate_collab::ProjectAcl,
 ) {
     let Some(dir) = project_dir else { return };
-    let Some(key) = current_project_encryption_key() else { return };
+    let Some(key) = current_project_encryption_key() else {
+        return;
+    };
     let plaintext_path = dir.join(ACL_FILENAME);
     let encrypted_path = dir.join(ACL_FILENAME_ENC);
     if !plaintext_path.exists() {
@@ -3994,11 +3992,9 @@ fn save_project_acl(
                 message: format!("could not encrypt ACL: {e}"),
             }
         })?;
-        std::fs::write(&encrypted_path, blob).map_err(|e| {
-            SessionBridgeError::InvalidArgument {
-                field: "acl_path",
-                message: format!("could not write {}: {e}", encrypted_path.display()),
-            }
+        std::fs::write(&encrypted_path, blob).map_err(|e| SessionBridgeError::InvalidArgument {
+            field: "acl_path",
+            message: format!("could not write {}: {e}", encrypted_path.display()),
         })?;
         // Best-effort cleanup of any stale plaintext file. We
         // don't fail the save if the cleanup itself fails — the

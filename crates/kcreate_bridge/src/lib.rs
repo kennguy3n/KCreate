@@ -2392,9 +2392,7 @@ pub fn component_smart_animate_snapshot(
     let vid = parse_uuid(&target_variant_id)?;
     let snap = document::component_smart_animate_snapshot(nid, vid).map_err(map_doc_err)?;
     serde_json::to_string(&snap).map_err(|e| {
-        napi::Error::from_reason(format!(
-            "component_smart_animate_snapshot: serialize: {e}"
-        ))
+        napi::Error::from_reason(format!("component_smart_animate_snapshot: serialize: {e}"))
     })
 }
 

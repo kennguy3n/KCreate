@@ -438,7 +438,8 @@ pub fn ai_upscale(node_id: Uuid, scale: f64) -> Result<Uuid> {
     // Insert resulting node + op + ai action.
     let new_id = with_workspace_mut(|ws| {
         let blob = ws
-            .store.lock()
+            .store
+            .lock()
             .blobs()
             .store(&png, "image/png")
             .map_err(|e| DocumentBridgeError::Io(std::io::Error::other(e.to_string())))?;
@@ -663,7 +664,8 @@ pub fn ai_upscale_with_backend(
 
     let new_id = with_workspace_mut(|ws| {
         let blob = ws
-            .store.lock()
+            .store
+            .lock()
             .blobs()
             .store(&png, "image/png")
             .map_err(|e| DocumentBridgeError::Io(std::io::Error::other(e.to_string())))?;
@@ -2775,7 +2777,8 @@ fn ingest_imported_pdf(imported: ImportedPdf) -> Result<PdfImportReport> {
             let mut created_node_ids = Vec::<Uuid>::new();
             for img in &imported_page.images {
                 let blob = ws
-                    .store.lock()
+                    .store
+                    .lock()
                     .blobs()
                     .store(img.data.bytes(), img.data.mime_type())
                     .map_err(|e| DocumentBridgeError::Io(std::io::Error::other(e.to_string())))?;
@@ -3452,7 +3455,8 @@ fn insert_raster_child(
     };
     let mime = sniff_image_mime(image_bytes);
     let blob = ws
-        .store.lock()
+        .store
+        .lock()
         .blobs()
         .store(image_bytes, mime)
         .map_err(|e| DocumentBridgeError::Io(std::io::Error::other(e.to_string())))?;
@@ -3734,7 +3738,8 @@ mod ai_inference_tests {
     fn insert_test_raster(png: &[u8], width: u32, height: u32, parent: Option<Uuid>) -> Uuid {
         with_workspace_mut(|ws| {
             let blob = ws
-                .store.lock()
+                .store
+                .lock()
                 .blobs()
                 .store(png, "image/png")
                 .map_err(|e| DocumentBridgeError::Io(std::io::Error::other(e.to_string())))?;
@@ -4223,7 +4228,8 @@ mod ai_inference_tests {
         // mapping isn't accidentally an identity transform.
         let raster_id = with_workspace_mut(|ws| {
             let blob = ws
-                .store.lock()
+                .store
+                .lock()
                 .blobs()
                 .store(&png, "image/png")
                 .map_err(|e| DocumentBridgeError::Io(std::io::Error::other(e.to_string())))?;
@@ -4722,7 +4728,12 @@ mod import_tests {
             // renderer's later texture-upload pass will look them up
             // by hash, so a broken store would silently render a
             // missing-image placeholder.
-            let raw_blob = ws.store.lock().blobs().load(&meta.blob_hash).expect("blob load");
+            let raw_blob = ws
+                .store
+                .lock()
+                .blobs()
+                .load(&meta.blob_hash)
+                .expect("blob load");
             assert!(
                 raw_blob.starts_with(&[0x89, 0x50, 0x4E, 0x47]),
                 "blob is a real PNG header",

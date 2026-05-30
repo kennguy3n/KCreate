@@ -356,6 +356,63 @@ fn static_packs() -> Vec<ModelPack> {
                 "https://huggingface.co/bartowski/Llama-3.2-3B-Instruct-GGUF/resolve/main/Llama-3.2-3B-Instruct-Q4_K_M.gguf".into(),
             sha256: String::new(),
         },
+        // ---- Phase 12 Block A: Ternary-Bonsai text packs ----
+        //
+        // Tier-aware default LLMs that replace `llm_sidecar_3b` as
+        // the recommended text model (see `recommended_llm_pack`).
+        // All three are standard GGUF (Q2_0 ternary quantisation,
+        // ~1.58 bits/weight) and load directly in llama-server with
+        // Metal / CUDA / Vulkan acceleration on every supported
+        // platform — no Python, no MLX. Sizes are verified directly
+        // from the upstream Hugging Face repos.
+        ModelPack {
+            id: "llm_bonsai_1_7b".into(),
+            name: "Design LLM — Ternary-Bonsai 1.7B (GGUF Q2_0)".into(),
+            category: ModelPackCategory::DesignPro,
+            kind: ModelKind::Sidecar,
+            capabilities: vec!["design_suggestions".into(), "layer_naming".into()],
+            // 463 MB on disk per `huggingface-cli ls` against
+            // `prism-ml/Ternary-Bonsai-1.7B-gguf` (Q2_0 file). Fits
+            // comfortably in Tier 0 (4 GB) RAM budgets.
+            size_bytes: 463_000_000,
+            file_path: "Ternary-Bonsai-1.7B-Q2_0.gguf".into(),
+            installed: false,
+            download_url:
+                "https://huggingface.co/prism-ml/Ternary-Bonsai-1.7B-gguf/resolve/main/Ternary-Bonsai-1.7B-Q2_0.gguf".into(),
+            sha256: String::new(),
+        },
+        ModelPack {
+            id: "llm_bonsai_4b".into(),
+            name: "Design LLM — Ternary-Bonsai 4B (GGUF Q2_0)".into(),
+            category: ModelPackCategory::DesignPro,
+            kind: ModelKind::Sidecar,
+            capabilities: vec!["design_suggestions".into(), "layer_naming".into()],
+            // 1.07 GB on disk per `huggingface-cli ls` against
+            // `prism-ml/Ternary-Bonsai-4B-gguf` (Q2_0 file). Tier 1
+            // (8 GB) sweet spot.
+            size_bytes: 1_070_000_000,
+            file_path: "Ternary-Bonsai-4B-Q2_0.gguf".into(),
+            installed: false,
+            download_url:
+                "https://huggingface.co/prism-ml/Ternary-Bonsai-4B-gguf/resolve/main/Ternary-Bonsai-4B-Q2_0.gguf".into(),
+            sha256: String::new(),
+        },
+        ModelPack {
+            id: "llm_bonsai_8b".into(),
+            name: "Design LLM — Ternary-Bonsai 8B (GGUF Q2_0)".into(),
+            category: ModelPackCategory::DesignPro,
+            kind: ModelKind::Sidecar,
+            capabilities: vec!["design_suggestions".into(), "layer_naming".into()],
+            // 2.18 GB on disk per `huggingface-cli ls` against
+            // `prism-ml/Ternary-Bonsai-8B-gguf` (Q2_0 file). Tier 2
+            // (16+ GB) target.
+            size_bytes: 2_180_000_000,
+            file_path: "Ternary-Bonsai-8B-Q2_0.gguf".into(),
+            installed: false,
+            download_url:
+                "https://huggingface.co/prism-ml/Ternary-Bonsai-8B-gguf/resolve/main/Ternary-Bonsai-8B-Q2_0.gguf".into(),
+            sha256: String::new(),
+        },
         // ---- Phase 4 vision packs (GGUF + mmproj) ----
         //
         // Each vision pack consists of TWO file entries — the model
@@ -434,57 +491,23 @@ fn static_packs() -> Vec<ModelPack> {
                 "https://huggingface.co/ggml-org/Qwen2.5-VL-7B-Instruct-GGUF/resolve/main/mmproj-Qwen2.5-VL-7B-Instruct-F16.gguf".into(),
             sha256: String::new(),
         },
-        // ---- MLX (Apple Silicon) vision packs ----
-        //
-        // These are model *directories*, not single GGUF files; the
-        // MLX sidecar resolves the path as either a local folder or
-        // a Hugging Face `mlx-community/...` slug at runtime (see
-        // `mlx_sidecar::validate_model_dir`). `file_path` is the
-        // canonical local directory name we expect under
-        // `models_dir/`, so the installer can resolve a folder once
-        // the user has fetched it (e.g. via `huggingface-cli
-        // download`).
-        ModelPack {
-            id: "vision_smolvlm_256m_mlx".into(),
-            name: "Vision (Apple Silicon) — SmolVLM-256M MLX 4bit".into(),
-            category: ModelPackCategory::Vision,
-            kind: ModelKind::Sidecar,
-            capabilities: vec!["vision".into(), "alt_text".into(), "mlx".into()],
-            size_bytes: 200_000_000,
-            file_path: "mlx-community__SmolVLM-256M-Instruct-4bit".into(),
-            installed: false,
-            download_url:
-                "https://huggingface.co/mlx-community/SmolVLM-256M-Instruct-4bit".into(),
-            sha256: String::new(),
-        },
-        ModelPack {
-            id: "vision_qwen25vl_7b_mlx".into(),
-            name: "Vision (Apple Silicon) — Qwen2.5-VL 7B Instruct MLX 4bit".into(),
-            category: ModelPackCategory::Vision,
-            kind: ModelKind::Sidecar,
-            capabilities: vec![
-                "vision".into(),
-                "design_critique".into(),
-                "alt_text".into(),
-                "brand_extract".into(),
-                "smart_crop".into(),
-                "style_describe".into(),
-                "mlx".into(),
-            ],
-            size_bytes: 4_300_000_000,
-            file_path: "mlx-community__Qwen2.5-VL-7B-Instruct-4bit".into(),
-            installed: false,
-            download_url:
-                "https://huggingface.co/mlx-community/Qwen2.5-VL-7B-Instruct-4bit".into(),
-            sha256: String::new(),
-        },
+        // Phase 12 Block A removed the MLX vision packs
+        // (`vision_smolvlm_256m_mlx`, `vision_qwen25vl_7b_mlx`) when
+        // we consolidated text + vision on llama-server. The GGUF
+        // entries above run with Metal acceleration on Apple
+        // Silicon and the registry no longer surfaces MLX-only
+        // alternatives.
+
         // ---- Phase 4 image generation packs (FLUX) ----
         //
         // Generation models are loaded by an entirely separate
-        // sidecar (`crate::image_gen::ImageGenSidecar`) running a
-        // small Python diffusers server — *not* llama-server. They
-        // are gated to Tier 2+ with GPU; the UI hides them on lower
-        // tiers (see `DeviceTier::image_generation_allowed`).
+        // sidecar (`crate::image_gen::ImageGenSidecar`) running
+        // `sd-server` from stable-diffusion.cpp — *not* llama-server.
+        // They are gated to Tier 2+ with GPU; the UI hides them on
+        // lower tiers (see `DeviceTier::image_generation_allowed`).
+        // Phase 12 Block B replaced the original Python diffusers
+        // server with `sd-server` so there is no Python in the image
+        // generation path either.
         ModelPack {
             id: "image_gen_flux_klein_4b".into(),
             name: "Image Generation — FLUX Klein 4B (GGUF)".into(),
@@ -498,19 +521,16 @@ fn static_packs() -> Vec<ModelPack> {
                 "https://huggingface.co/themindstudio/FLUX-Klein-4B-GGUF/resolve/main/flux-klein-4b-Q4_0.gguf".into(),
             sha256: String::new(),
         },
-        ModelPack {
-            id: "image_gen_flux_klein_mlx".into(),
-            name: "Image Generation (Apple Silicon) — FLUX Klein 4B MLX 4bit".into(),
-            category: ModelPackCategory::Generation,
-            kind: ModelKind::Sidecar,
-            capabilities: vec!["image_generation".into(), "mlx".into()],
-            size_bytes: 2_700_000_000,
-            file_path: "mlx-community__flux2-klein-4b-mlx-4bit".into(),
-            installed: false,
-            download_url:
-                "https://huggingface.co/themindstudio/flux2-klein-4b-mlx-4bit".into(),
-            sha256: String::new(),
-        },
+        // Phase 12 Block A also removed `image_gen_flux_klein_mlx`.
+        // sd-server handles FLUX.2 Klein natively with Metal
+        // acceleration on Apple Silicon, so the MLX-specific bundle
+        // is no longer needed. Bonsai Image Ternary 4B was
+        // investigated but is NOT compatible with stable-diffusion.cpp
+        // — its gemlite-2bit and MLX 2bit variants ship with their
+        // own runtimes (HQQ / gemlite kernels / DrawThings) that
+        // sd-server does not support. The full-precision unpacked
+        // safetensors are >7 GB and would defeat the size argument.
+        // We keep FLUX Klein 4B as the sole image-gen recommendation.
     ]
 }
 
@@ -527,19 +547,32 @@ pub fn mmproj_for(pack_id: &str) -> Option<&'static str> {
     }
 }
 
-/// Return the canonical GGUF/llama-server pack id to fall back to
-/// when an MLX pack is requested but MLX is unavailable (e.g. the
-/// host is not Apple Silicon, or `python3 -m mlx_lm` is not
-/// installed). Returns `None` if `pack_id` is not an MLX pack or
-/// has no GGUF equivalent.
+/// Migrate a legacy pack id from a saved project preference (or a
+/// stale settings JSON) to the current registry equivalent. Returns
+/// `None` when `pack_id` is already current — callers treat that as
+/// "no rewrite needed" rather than a missing pack.
 ///
-/// We use an explicit map rather than `trim_end_matches("_mlx")`
-/// because the GGUF and MLX builds are sometimes named slightly
-/// differently in their upstream repos. SmolVLM2-256M (GGUF) and
-/// SmolVLM-256M-Instruct (MLX), for example, differ by more than
-/// the `_mlx` suffix.
+/// Phase 12 Block A dropped the MLX runtime, which removed three
+/// pack ids that previously shipped:
+///
+/// * `vision_smolvlm_256m_mlx`   → `vision_smolvlm2_256m`
+/// * `vision_qwen25vl_7b_mlx`    → `vision_qwen25vl_7b`
+/// * `image_gen_flux_klein_mlx`  → `image_gen_flux_klein_4b`
+///
+/// Phase 4–11 installations wrote those ids into project files and
+/// the per-user settings store; without this table they would
+/// surface as `SidecarError::ModelMissing` errors on first launch
+/// after the upgrade. The bridge entry points
+/// (`vision_start`, `image_gen_start`, `vision_mmproj_for`) call
+/// this helper before any lookup so the migration is transparent
+/// to the renderer — they also log a one-time deprecation notice
+/// so the model-manager UI can prompt the user to re-pick.
+///
+/// New pack additions in future phases that supersede an existing
+/// id should extend this table rather than introducing a parallel
+/// migration mechanism.
 #[must_use]
-pub fn gguf_fallback_for_mlx_pack(pack_id: &str) -> Option<&'static str> {
+pub fn migrate_legacy_pack_id(pack_id: &str) -> Option<&'static str> {
     match pack_id {
         "vision_smolvlm_256m_mlx" => Some("vision_smolvlm2_256m"),
         "vision_qwen25vl_7b_mlx" => Some("vision_qwen25vl_7b"),
@@ -550,12 +583,16 @@ pub fn gguf_fallback_for_mlx_pack(pack_id: &str) -> Option<&'static str> {
 
 /// Recommend a vision pack for the given (tier, platform). Returns
 /// the canonical pack id the model-manager UI should highlight as
-/// "best for this machine". The policy:
+/// "best for this machine".
 ///
-/// - On Apple Silicon, prefer MLX-format vision packs (MLX is
-///   meaningfully faster than llama.cpp Metal for VLMs at the time
-///   of writing).
-/// - Tier 0 / 1: SmolVLM-256M — runs comfortably on CPU.
+/// Phase 12 Block A removed the platform branch: every tier uses
+/// the GGUF vision packs through llama-server, which has full Metal
+/// acceleration on Apple Silicon. The `_platform` argument stays in
+/// the signature for forward compatibility (a future Rust-native
+/// runtime may want to pick differently per OS) but is currently
+/// unused.
+///
+/// - Tier 0 / 1: SmolVLM2-256M — runs comfortably on CPU.
 /// - Tier 2 / 3: Qwen2.5-VL — the larger model is worth the cost.
 ///
 /// Returns `None` only when the tier does not allow vision at all,
@@ -563,31 +600,45 @@ pub fn gguf_fallback_for_mlx_pack(pack_id: &str) -> Option<&'static str> {
 #[must_use]
 pub fn recommended_vision_pack(
     tier: kcreate_core::config::DeviceTier,
-    platform: kcreate_core::config::Platform,
+    _platform: kcreate_core::config::Platform,
 ) -> Option<&'static str> {
     use kcreate_core::config::DeviceTier::{Tier0, Tier1, Tier2, Tier3};
     if !tier.vision_model_allowed() {
         return None;
     }
-    let is_apple_silicon = matches!(platform, kcreate_core::config::Platform::MacOsAppleSilicon);
-    Some(match (tier, is_apple_silicon) {
-        (Tier0 | Tier1, true) => "vision_smolvlm_256m_mlx",
-        (Tier0 | Tier1, false) => "vision_smolvlm2_256m",
-        (Tier2 | Tier3, true) => "vision_qwen25vl_7b_mlx",
-        (Tier2 | Tier3, false) => "vision_qwen25vl_7b",
+    Some(match tier {
+        Tier0 | Tier1 => "vision_smolvlm2_256m",
+        Tier2 | Tier3 => "vision_qwen25vl_7b",
     })
 }
 
-/// Recommend a text LLM pack. The current 3B Llama 3.2 ships across
-/// every supported tier (Tier 0 runs it slowly but functionally);
-/// future tier-specific variants land here. Returns `None` only if
-/// the tier opts out entirely.
+/// Recommend a text LLM pack.
+///
+/// Phase 12 Block A made this tier-aware against the Ternary-Bonsai
+/// GGUF family (Q2_0 / 1.58-bit ternary quantisation). Each tier
+/// gets the largest Bonsai model that fits its RAM envelope:
+///
+/// - Tier 0 → 1.7B (~460 MB on disk, runs on 4 GB RAM)
+/// - Tier 1 → 4B   (~1.1 GB on disk, runs on 8 GB RAM)
+/// - Tier 2 / 3 → 8B (~2.2 GB on disk, runs on 16+ GB RAM)
+///
+/// `llm_sidecar_3b` (Llama 3.2 3B Q4_K_M) stays in the registry as
+/// an alternative for users who already have the GGUF cached or who
+/// prefer a more conventional architecture. The `_platform` argument
+/// is retained for API compatibility — every recommendation is the
+/// same GGUF across Linux / Windows / macOS once the MLX-only
+/// alternatives were removed.
 #[must_use]
 pub fn recommended_llm_pack(
-    _tier: kcreate_core::config::DeviceTier,
+    tier: kcreate_core::config::DeviceTier,
     _platform: kcreate_core::config::Platform,
 ) -> Option<&'static str> {
-    Some("llm_sidecar_3b")
+    use kcreate_core::config::DeviceTier::{Tier0, Tier1, Tier2, Tier3};
+    Some(match tier {
+        Tier0 => "llm_bonsai_1_7b",
+        Tier1 => "llm_bonsai_4b",
+        Tier2 | Tier3 => "llm_bonsai_8b",
+    })
 }
 
 /// Recommend an image-generation pack, or `None` when the device
@@ -595,19 +646,20 @@ pub fn recommended_llm_pack(
 /// AFTER checking [`kcreate_core::config::RuntimeConfig::image_generation_allowed`];
 /// the function also returns `None` for sub-Tier-2 devices as a
 /// belt-and-braces check.
+///
+/// Phase 12 Block A removed the Apple-Silicon-only MLX branch.
+/// `sd-server` (stable-diffusion.cpp) loads the FLUX.2 Klein GGUF
+/// with Metal acceleration on Apple Silicon and CUDA / Vulkan
+/// elsewhere, so a single recommendation works everywhere.
 #[must_use]
 pub fn recommended_generation_pack(
     tier: kcreate_core::config::DeviceTier,
-    platform: kcreate_core::config::Platform,
+    _platform: kcreate_core::config::Platform,
 ) -> Option<&'static str> {
     if !tier.image_generation_allowed() {
         return None;
     }
-    if matches!(platform, kcreate_core::config::Platform::MacOsAppleSilicon) {
-        Some("image_gen_flux_klein_mlx")
-    } else {
-        Some("image_gen_flux_klein_4b")
-    }
+    Some("image_gen_flux_klein_4b")
 }
 
 /// Errors from [`install_model_pack`] / [`uninstall_model_pack`].
@@ -863,11 +915,16 @@ mod tests {
         // the sorted id vector instead. Per Devin Review 3289537741.
         let mut got: Vec<String> = packs.into_iter().map(|p| p.id).collect();
         got.sort();
+        // Phase 12 Block A: removed `image_gen_flux_klein_mlx`,
+        // `vision_qwen25vl_7b_mlx`, `vision_smolvlm_256m_mlx`; added
+        // `llm_bonsai_1_7b`, `llm_bonsai_4b`, `llm_bonsai_8b`.
         let expected: Vec<&str> = vec![
             "bg_remove_threshold",
             "bg_remove_u2net",
             "image_gen_flux_klein_4b",
-            "image_gen_flux_klein_mlx",
+            "llm_bonsai_1_7b",
+            "llm_bonsai_4b",
+            "llm_bonsai_8b",
             "llm_sidecar_3b",
             "ocr_heuristic",
             "palette_kmeans",
@@ -877,11 +934,9 @@ mod tests {
             "upscale_esrgan",
             "upscale_lanczos",
             "vision_qwen25vl_7b",
-            "vision_qwen25vl_7b_mlx",
             "vision_qwen25vl_7b_mmproj",
             "vision_smolvlm2_256m",
             "vision_smolvlm2_256m_mmproj",
-            "vision_smolvlm_256m_mlx",
         ];
         assert_eq!(got, expected, "pack id set drifted from canonical list");
     }
@@ -1383,12 +1438,13 @@ mod tests {
         assert!(recommended_generation_pack(DeviceTier::Tier3, Platform::LinuxX64).is_some());
     }
 
-    /// MLX recommendations must only fire on Apple Silicon — the
-    /// MLX runtime is x86-incompatible and the dispatcher would
-    /// reject it. Any drift here would produce a "nothing happens"
-    /// UX when a Linux user clicks "install recommended."
+    /// Phase 12 Block A invariant: no recommendation \u2014 vision,
+    /// generation, or LLM \u2014 may return an MLX pack on any platform,
+    /// because the registry no longer contains MLX packs. Any future
+    /// `_mlx` pack id that slips into the recommended set would be a
+    /// silent regression of the Python-elimination work.
     #[test]
-    fn mlx_recommendations_only_on_apple_silicon() {
+    fn no_recommendation_is_mlx_after_phase12() {
         use kcreate_core::config::{DeviceTier, Platform};
         for tier in [
             DeviceTier::Tier0,
@@ -1396,15 +1452,64 @@ mod tests {
             DeviceTier::Tier2,
             DeviceTier::Tier3,
         ] {
-            let linux = recommended_vision_pack(tier, Platform::LinuxX64).unwrap();
-            assert!(
-                !linux.ends_with("_mlx"),
-                "Linux must not recommend an MLX pack: tier={tier:?} got {linux}",
+            for platform in [
+                Platform::LinuxX64,
+                Platform::WindowsX64,
+                Platform::MacOsIntel,
+                Platform::MacOsAppleSilicon,
+            ] {
+                if let Some(v) = recommended_vision_pack(tier, platform) {
+                    assert!(
+                        !v.ends_with("_mlx"),
+                        "vision recommendation must not be MLX after Phase 12: tier={tier:?} platform={platform:?} got {v}",
+                    );
+                }
+                if let Some(g) = recommended_generation_pack(tier, platform) {
+                    assert!(
+                        !g.ends_with("_mlx"),
+                        "generation recommendation must not be MLX after Phase 12: tier={tier:?} platform={platform:?} got {g}",
+                    );
+                }
+                if let Some(l) = recommended_llm_pack(tier, platform) {
+                    assert!(
+                        !l.ends_with("_mlx"),
+                        "LLM recommendation must not be MLX after Phase 12: tier={tier:?} platform={platform:?} got {l}",
+                    );
+                }
+            }
+        }
+    }
+
+    /// Phase 12 Block A: the LLM recommendation must map each tier
+    /// to its tier-aware Ternary-Bonsai GGUF pack.
+    #[test]
+    fn recommended_llm_pack_is_bonsai_per_tier() {
+        use kcreate_core::config::{DeviceTier, Platform};
+        for platform in [
+            Platform::LinuxX64,
+            Platform::WindowsX64,
+            Platform::MacOsIntel,
+            Platform::MacOsAppleSilicon,
+        ] {
+            assert_eq!(
+                recommended_llm_pack(DeviceTier::Tier0, platform),
+                Some("llm_bonsai_1_7b"),
+                "Tier 0 should recommend Ternary-Bonsai 1.7B on {platform:?}",
             );
-            let mac = recommended_vision_pack(tier, Platform::MacOsAppleSilicon).unwrap();
-            assert!(
-                mac.ends_with("_mlx"),
-                "Apple Silicon must recommend an MLX pack: tier={tier:?} got {mac}",
+            assert_eq!(
+                recommended_llm_pack(DeviceTier::Tier1, platform),
+                Some("llm_bonsai_4b"),
+                "Tier 1 should recommend Ternary-Bonsai 4B on {platform:?}",
+            );
+            assert_eq!(
+                recommended_llm_pack(DeviceTier::Tier2, platform),
+                Some("llm_bonsai_8b"),
+                "Tier 2 should recommend Ternary-Bonsai 8B on {platform:?}",
+            );
+            assert_eq!(
+                recommended_llm_pack(DeviceTier::Tier3, platform),
+                Some("llm_bonsai_8b"),
+                "Tier 3 should recommend Ternary-Bonsai 8B on {platform:?}",
             );
         }
     }
@@ -1434,5 +1539,83 @@ mod tests {
             serde_json::to_string(&ModelPackCategory::DesignPro).unwrap(),
             "\"design_pro\""
         );
+    }
+
+    /// Phase 12 migration table: legacy MLX pack ids saved in
+    /// Phase 4–11 project files must rewrite to their current GGUF
+    /// equivalents. Without this, a user upgrading from a Phase 11
+    /// install would see an opaque `ModelMissing` error on the
+    /// first launch.
+    #[test]
+    fn migrate_legacy_pack_id_rewrites_known_mlx_ids() {
+        assert_eq!(
+            migrate_legacy_pack_id("vision_smolvlm_256m_mlx"),
+            Some("vision_smolvlm2_256m"),
+        );
+        assert_eq!(
+            migrate_legacy_pack_id("vision_qwen25vl_7b_mlx"),
+            Some("vision_qwen25vl_7b"),
+        );
+        assert_eq!(
+            migrate_legacy_pack_id("image_gen_flux_klein_mlx"),
+            Some("image_gen_flux_klein_4b"),
+        );
+    }
+
+    /// Migration is a no-op for already-current ids — callers
+    /// distinguish "no rewrite needed" from "unknown pack" by the
+    /// `None` return.
+    #[test]
+    fn migrate_legacy_pack_id_passes_through_current_ids() {
+        for id in [
+            "llm_bonsai_1_7b",
+            "llm_bonsai_4b",
+            "llm_bonsai_8b",
+            "llm_sidecar_3b",
+            "vision_smolvlm2_256m",
+            "vision_qwen25vl_7b",
+            "image_gen_flux_klein_4b",
+            "bg_remove_u2net",
+        ] {
+            assert_eq!(
+                migrate_legacy_pack_id(id),
+                None,
+                "current id `{id}` must NOT be rewritten",
+            );
+        }
+    }
+
+    /// Unknown ids surface as `None` too — the migration helper is
+    /// scoped to legacy MLX ids only; surfacing a typo or stray
+    /// string as `ModelMissing` later is the desired behavior.
+    #[test]
+    fn migrate_legacy_pack_id_passes_through_unknown_ids() {
+        assert_eq!(migrate_legacy_pack_id(""), None);
+        assert_eq!(migrate_legacy_pack_id("totally_not_a_pack"), None);
+        assert_eq!(migrate_legacy_pack_id("vision_qwen25vl_7b_mlx_typo"), None);
+    }
+
+    /// Every migration target must be a real pack id in the
+    /// current registry. Catches the regression where someone
+    /// renames a pack but forgets to update the migration table.
+    #[test]
+    fn migrate_legacy_pack_id_targets_exist_in_registry() {
+        let dir = tempfile::tempdir().unwrap();
+        let current_ids: Vec<String> = list_model_packs(dir.path())
+            .into_iter()
+            .map(|p| p.id)
+            .collect();
+        for legacy in [
+            "vision_smolvlm_256m_mlx",
+            "vision_qwen25vl_7b_mlx",
+            "image_gen_flux_klein_mlx",
+        ] {
+            let target = migrate_legacy_pack_id(legacy)
+                .unwrap_or_else(|| panic!("legacy id `{legacy}` must migrate"));
+            assert!(
+                current_ids.iter().any(|id| id == target),
+                "migration target `{target}` for legacy id `{legacy}` is not a registry pack",
+            );
+        }
     }
 }

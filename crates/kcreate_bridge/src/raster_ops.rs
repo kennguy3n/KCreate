@@ -185,7 +185,8 @@ fn load_layer_pixels(node_id: Uuid) -> Result<LayerPixels> {
         })?;
     let meta: RasterImageMeta = serde_json::from_value(meta_value.clone())?;
     let bytes = ws
-        .store.lock()
+        .store
+        .lock()
         .blobs()
         .load(&meta.blob_hash)
         .map_err(|e| DocumentBridgeError::Io(std::io::Error::other(e.to_string())))?;
@@ -244,7 +245,8 @@ fn replace_layer_pixels(
         });
 
     let blob = ws
-        .store.lock()
+        .store
+        .lock()
         .blobs()
         .store(&png, "image/png")
         .map_err(|e| DocumentBridgeError::Io(std::io::Error::other(e.to_string())))?;
@@ -487,13 +489,9 @@ pub fn apply_sharpen(node_id: Uuid, radius: f32, amount: f32, threshold: u8) -> 
     let out_rgba = match out_rgba {
         Some(v) => v,
         None => {
-            let grid = TileGrid::from_image(
-                &pixels.rgba,
-                pixels.width,
-                pixels.height,
-                TILE_SIZE,
-            )
-            .map_err(|e| DocumentBridgeError::Io(std::io::Error::other(e.to_string())))?;
+            let grid =
+                TileGrid::from_image(&pixels.rgba, pixels.width, pixels.height, TILE_SIZE)
+                    .map_err(|e| DocumentBridgeError::Io(std::io::Error::other(e.to_string())))?;
             filters::unsharp_mask(&grid, radius, amount, threshold).to_image()
         }
     };

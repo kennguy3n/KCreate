@@ -28,10 +28,10 @@ use kcreate_ai::{
     brand_extract::{extract_brand_from_image, BrandExtraction},
     design_critique::critique_design,
     design_tokens_vlm::{suggest_design_tokens, DesignTokenSuggestion},
-    image_gen::{generate_image, ImageGenConfig, ImageGenError, ImageGenRequest, ImageGenSidecar},
+    diffusion_sidecar::{DiffusionSidecar, DiffusionSidecarConfig},
+    image_gen::{generate_image, ImageGenError, ImageGenRequest},
     llm_sidecar::{LlmSidecar, SidecarConfig, SidecarError, SidecarStatus},
-    mlx_sidecar::{probe_mlx_available, MlxSidecar, MlxSidecarConfig},
-    model_registry::{list_model_packs, mmproj_for, recommended_vision_pack},
+    model_registry::{list_model_packs, recommended_vision_pack},
     sidecar_dispatcher::{plan_dispatch, DispatchPlan, SidecarRuntime},
     smart_crop::{suggest_crop, CropSuggestion},
     style_describe::{describe_style, StyleDescription},
@@ -79,19 +79,21 @@ pub type Phase4Result<T> = std::result::Result<T, Phase4BridgeError>;
 // without paying 5 GB of RAM each time they describe an image.
 // -----------------------------------------------------------------------------
 
-/// Variant of the live vision sidecar, mirroring
-/// `kcreate_ai::sidecar_dispatcher::SidecarHandle` but kept inside
-/// the bridge so we can hand out non-`'static` borrows safely.
+/// Variant of the live vision sidecar. Phase 12 collapsed this down
+/// to a single backend (llama-server) when the MLX path was
+/// removed, but we keep the wrapper enum so a future Rust-native
+/// inference engine can slot in without rewriting the bridge's
+/// vision lifecycle code. The serializer therefore still reports a
+/// `runtime` string (`"llama_server"`) so the renderer's existing
+/// `VisionStatus.runtime` field doesn't break.
 enum VisionHandle {
     Llama(LlmSidecar),
-    Mlx(MlxSidecar),
 }
 
 impl VisionHandle {
     fn status(&self) -> SidecarStatus {
         match self {
             Self::Llama(s) => s.status(),
-            Self::Mlx(s) => s.status(),
         }
     }
 
@@ -105,14 +107,12 @@ impl VisionHandle {
     fn stop(&mut self) {
         match self {
             Self::Llama(s) => s.stop(),
-            Self::Mlx(s) => s.stop(),
         }
     }
 
     fn runtime(&self) -> SidecarRuntime {
         match self {
             Self::Llama(_) => SidecarRuntime::LlamaServer,
-            Self::Mlx(_) => SidecarRuntime::MlxLm,
         }
     }
 }
@@ -140,11 +140,11 @@ pub struct VisionStatusInfo {
     pub error: Option<String>,
 }
 
-/// Start a vision sidecar for `pack_id`. Looks up the model + (for
-/// llama-server vision) its mmproj companion in the registry,
-/// resolves them under the user's models directory, and spawns the
-/// appropriate runtime — MLX when the pack id ends in `_mlx` AND the
-/// host can run it, llama-server otherwise.
+/// Start a vision sidecar for `pack_id`. Looks up the model and its
+/// mmproj companion in the registry, resolves them under the user's
+/// models directory, and spawns llama-server with `--mmproj` so
+/// vision-language models accept `image_url` content parts on the
+/// OpenAI-compatible chat API.
 ///
 /// Returns the listening port **immediately**, before the health
 /// check completes — the underlying sidecar runs its probe loop on
@@ -157,7 +157,12 @@ pub struct VisionStatusInfo {
 pub fn vision_start(pack_id: String) -> Phase4Result<u16> {
     let models_dir = models_root();
     let platform = runtime_slot().lock().platform;
-    let plan = plan_dispatch(&pack_id, &models_dir, platform, probe_mlx_available())
+    // Phase 12 Block A removed MLX pack ids from the registry; a
+    // stale project file or saved settings entry can still surface
+    // them here. Rewrite to the current id transparently so the user
+    // doesn't see an opaque `ModelMissing` after upgrade.
+    let resolved_pack_id = resolve_pack_id(&pack_id);
+    let plan = plan_dispatch(&resolved_pack_id, &models_dir, platform)
         .map_err(Phase4BridgeError::Sidecar)?;
     let mut guard = vision_slot().lock();
     // Stop the previous sidecar first — never run two side-by-side,
@@ -194,7 +199,6 @@ pub fn vision_status() -> VisionStatusInfo {
         Some(h) => {
             let runtime = match h.runtime() {
                 SidecarRuntime::LlamaServer => "llama_server",
-                SidecarRuntime::MlxLm => "mlx_lm",
             };
             match h.status() {
                 SidecarStatus::Stopped => VisionStatusInfo {
@@ -233,9 +237,9 @@ pub fn vision_status() -> VisionStatusInfo {
 }
 
 /// Spawn the underlying sidecar. Returns the handle paired with the
-/// listening port. `start()` on both runtimes is non-blocking — it
-/// reserves the port, forks the child, and hands off health probing
-/// to a background thread. Callers observe readiness via
+/// listening port. `start()` is non-blocking — it reserves the port,
+/// forks the llama-server child, and hands off health probing to a
+/// background thread. Callers observe readiness via
 /// [`vision_status`].
 fn spawn_vision(plan: &DispatchPlan) -> Phase4Result<(VisionHandle, u16)> {
     match plan.runtime {
@@ -248,18 +252,6 @@ fn spawn_vision(plan: &DispatchPlan) -> Phase4Result<(VisionHandle, u16)> {
             let mut s = LlmSidecar::new(cfg);
             let port = s.start().map_err(Phase4BridgeError::Sidecar)?;
             Ok((VisionHandle::Llama(s), port))
-        }
-        SidecarRuntime::MlxLm => {
-            let cfg = MlxSidecarConfig {
-                python: PathBuf::from("python3"),
-                model_path: plan.model_path.clone(),
-                context_size: 4096,
-                health_timeout: std::time::Duration::from_secs(90),
-                extra_args: vec![],
-            };
-            let mut s = MlxSidecar::new(cfg);
-            let port = s.start().map_err(Phase4BridgeError::Sidecar)?;
-            Ok((VisionHandle::Mlx(s), port))
         }
     }
 }
@@ -408,20 +400,88 @@ pub fn vision_recommended_pack() -> Option<String> {
 }
 
 /// Inverse lookup convenience for the renderer: given a vision pack
-/// id, return the mmproj companion's id (or `None` for MLX packs).
+/// id, return the mmproj companion's id (or `None` if the pack has
+/// no companion projector — e.g. a text-only LLM pack).
 pub fn vision_mmproj_for(pack_id: String) -> Option<String> {
-    mmproj_for(&pack_id).map(str::to_string)
+    // Apply the Phase 12 legacy-id migration first so a stale
+    // saved-preferences entry pointing at `vision_qwen25vl_7b_mlx`
+    // still resolves the matching mmproj companion.
+    let resolved = resolve_pack_id(&pack_id);
+    kcreate_ai::model_registry::mmproj_for(&resolved).map(str::to_string)
+}
+
+/// Apply the legacy → current pack-id migration table from
+/// `kcreate_ai::model_registry::migrate_legacy_pack_id`. Returns the
+/// rewritten id (or `pack_id` unchanged when no migration applies)
+/// and emits a one-time `log::warn!` per (legacy-id, process-lifetime)
+/// pair so the renderer can surface a "your saved model preference
+/// was renamed" prompt in the model manager. We use `log::warn!` (not
+/// `error!`) because the rewrite is benign — the user lost no
+/// functionality, the new id points at the same architecture under
+/// the GGUF-llama-server pipeline.
+///
+/// Devin Review (post-Phase-12 round) noted the original implementation
+/// emitted the warning on every call rather than once-per-legacy-id
+/// as the doc comment claimed. A renderer that keeps re-invoking
+/// `vision_start` / `image_gen_start` with the same stale saved-
+/// preferences entry would have flooded the log. The dedup state is a
+/// `OnceLock<Mutex<HashSet<String>>>` keyed on the *input* legacy id
+/// so multiple legacy ids each get exactly one warning, and the same
+/// id passed through twice gets only the first warning.
+fn resolve_pack_id(pack_id: &str) -> String {
+    if let Some(new_id) = kcreate_ai::model_registry::migrate_legacy_pack_id(pack_id) {
+        log_legacy_pack_migration_once(pack_id, new_id);
+        return new_id.to_string();
+    }
+    pack_id.to_string()
+}
+
+/// Process-lifetime dedup set for the legacy-pack migration warning.
+/// Module-level so the test-only reset helper below can reach the
+/// same backing store as `log_legacy_pack_migration_once`.
+static LEGACY_PACK_WARN_SEEN: std::sync::OnceLock<
+    parking_lot::Mutex<std::collections::HashSet<String>>,
+> = std::sync::OnceLock::new();
+
+fn legacy_pack_warn_seen() -> &'static parking_lot::Mutex<std::collections::HashSet<String>> {
+    LEGACY_PACK_WARN_SEEN.get_or_init(|| parking_lot::Mutex::new(std::collections::HashSet::new()))
+}
+
+/// Emit the legacy-pack migration warning at most once per
+/// (legacy-id, process-lifetime) pair. Returns `true` iff the warning
+/// fired (i.e. this was the first sighting of `legacy`); the bool is
+/// crate-private and exists purely so the unit test below can pin the
+/// dedup behavior without poking at the `log` facade.
+fn log_legacy_pack_migration_once(legacy: &str, current: &str) -> bool {
+    let newly_seen = legacy_pack_warn_seen().lock().insert(legacy.to_string());
+    if newly_seen {
+        log::warn!(
+            "kcreate_bridge: legacy MLX pack id `{legacy}` migrated to `{current}` \
+             (Phase 12 removed the MLX runtime; update saved preferences to silence this)",
+        );
+    }
+    newly_seen
+}
+
+/// Test-only reset for the dedup set so we can exercise the
+/// one-emission-per-id contract without leaking state across tests.
+/// Crate-private; the production code path never resets the set —
+/// the user-visible "one warning per id per process" semantics rely
+/// on the set surviving for the lifetime of the bridge.
+#[cfg(test)]
+fn reset_legacy_pack_migration_dedup_for_tests() {
+    legacy_pack_warn_seen().lock().clear();
 }
 
 /// List the packs the renderer is allowed to show in the vision
-/// section of the Model Manager. Filters MLX packs off non-Apple
-/// hosts, and clips by [`crate::runtime_slot`]'s vision ceiling.
+/// section of the Model Manager. Clips by
+/// [`crate::runtime_slot`]'s vision ceiling. Phase 12 removed the
+/// `is_apple_silicon` MLX-filter branch — every vision pack now
+/// runs on llama-server, so the renderer shows the same set on
+/// every host.
 pub fn vision_listable_packs() -> Vec<String> {
     let dir = models_root();
-    let cfg = runtime_slot().lock();
-    let cap_mb = cfg.effective_vision_model_mb();
-    let platform = cfg.platform;
-    drop(cfg);
+    let cap_mb = runtime_slot().lock().effective_vision_model_mb();
     list_model_packs(&dir)
         .into_iter()
         .filter(|p| {
@@ -438,14 +498,6 @@ pub fn vision_listable_packs() -> Vec<String> {
             p.capabilities.iter().any(|c| c == "vision")
                 && !p.capabilities.iter().any(|c| c == "mmproj")
         })
-        .filter(|p| {
-            // MLX packs only on Apple Silicon.
-            if p.id.ends_with("_mlx") {
-                matches!(platform, kcreate_core::config::Platform::MacOsAppleSilicon)
-            } else {
-                true
-            }
-        })
         .filter(|p| (p.size_bytes / (1024 * 1024)) <= cap_mb)
         .map(|p| p.id)
         .collect()
@@ -455,9 +507,21 @@ pub fn vision_listable_packs() -> Vec<String> {
 // Image generation sidecar
 // -----------------------------------------------------------------------------
 
-fn image_gen_slot() -> &'static Mutex<Option<ImageGenSidecar>> {
-    static SLOT: OnceLock<Mutex<Option<ImageGenSidecar>>> = OnceLock::new();
+fn image_gen_slot() -> &'static Mutex<Option<DiffusionSidecar>> {
+    static SLOT: OnceLock<Mutex<Option<DiffusionSidecar>>> = OnceLock::new();
     SLOT.get_or_init(|| Mutex::new(None))
+}
+
+/// Resolve the sd-server binary path. Phase 12 ships a single env
+/// var, `KCREATE_SD_SERVER_BINARY`, that points at an absolute path
+/// to the stable-diffusion.cpp `sd-server` executable. When unset,
+/// we fall back to the bare name `"sd-server"` and rely on the OS
+/// PATH — the same fallback `llm_sidecar` uses for `llama-server`.
+/// Mirrors the existing `KCREATE_MODELS_DIR` / `KCREATE_PLUGIN_DIR`
+/// env-var override pattern in `phase2.rs`.
+fn sd_server_binary() -> PathBuf {
+    std::env::var_os("KCREATE_SD_SERVER_BINARY")
+        .map_or_else(|| PathBuf::from("sd-server"), PathBuf::from)
 }
 
 /// Wire shape for the image-generation sidecar status. Mirrors
@@ -486,18 +550,24 @@ pub fn image_gen_start(pack_id: String) -> Phase4Result<u16> {
     }
     drop(cfg);
     let dir = models_root();
+    // Phase 12 Block A removed `image_gen_flux_klein_mlx` from the
+    // registry; old project files / settings can still reference it.
+    // Rewrite transparently to the current FLUX Klein 4B GGUF pack.
+    let resolved_pack_id = resolve_pack_id(&pack_id);
     let pack = list_model_packs(&dir)
         .into_iter()
-        .find(|p| p.id == pack_id)
-        .ok_or_else(|| Phase4BridgeError::Invalid(format!("unknown image-gen pack: {pack_id}")))?;
+        .find(|p| p.id == resolved_pack_id)
+        .ok_or_else(|| {
+            Phase4BridgeError::Invalid(format!("unknown image-gen pack: {resolved_pack_id}"))
+        })?;
     if pack.category != kcreate_ai::ModelPackCategory::Generation {
         return Err(Phase4BridgeError::Invalid(format!(
-            "pack {pack_id} is not an image-generation pack"
+            "pack {resolved_pack_id} is not an image-generation pack"
         )));
     }
     let model_path = dir.join(&pack.file_path);
     // Take the slot lock and stop any existing sidecar *before*
-    // spawning the new Python child. Diffusion weights are large
+    // spawning the new sd-server child. Diffusion weights are large
     // enough (FLUX.2-Klein-4B is ~2.5 GB on a GPU) that we never
     // want two copies resident, even briefly, on a Tier-2 box.
     let mut guard = image_gen_slot().lock();
@@ -505,16 +575,65 @@ pub fn image_gen_start(pack_id: String) -> Phase4Result<u16> {
         prev.stop();
     }
     *guard = None;
-    let mut sidecar = ImageGenSidecar::new(ImageGenConfig {
-        python: PathBuf::from("python3"),
-        host_python_module: "kcreate_diffusion.server".into(),
+    let cfg = DiffusionSidecarConfig {
+        binary: sd_server_binary(),
         model_path,
         health_timeout: std::time::Duration::from_mins(2),
-        extra_args: vec![],
-    });
+        // FLUX builds need supplementary text-encoder / VAE paths.
+        // Phase 12 leaves the registry shipping the single fused
+        // pack `image_gen_flux_klein_4b`; users who load a
+        // standalone FLUX checkpoint pass component paths through
+        // `KCREATE_SD_SERVER_EXTRA_ARGS` (POSIX shell-word parsed —
+        // see `parse_sd_server_extra_args`).
+        extra_args: parse_sd_server_extra_args()?,
+    };
+    let mut sidecar = DiffusionSidecar::new(cfg);
     let port = sidecar.start().map_err(Phase4BridgeError::Sidecar)?;
     *guard = Some(sidecar);
     Ok(port)
+}
+
+/// Parse the `KCREATE_SD_SERVER_EXTRA_ARGS` env var into an argv
+/// slice that gets forwarded to sd-server. The env var is parsed
+/// with POSIX shell-word rules (`shell-words` crate): single and
+/// double quotes group spaces into a single token, and backslash
+/// escapes inside double quotes survive. Empty / unset => no extra
+/// args.
+///
+/// We use shell-word splitting (vs. naive `split_whitespace`)
+/// specifically so Windows paths with spaces work. On a typical
+/// Windows install the FLUX text encoder lives somewhere like
+/// `C:\Program Files\sd-models\flux\t5xxl_fp16.safetensors`; with
+/// the old whitespace-split parser the operator had to either
+/// reinstall to a no-space path or hard-link an alias, and even
+/// then they got an opaque `failed to open file` from sd-server on
+/// the malformed argv. Quoting now works as expected, e.g.:
+///
+/// ```text
+/// KCREATE_SD_SERVER_EXTRA_ARGS=
+///   --clip_l "C:\Program Files\sd-models\clip_l.safetensors"
+///   --t5xxl  "C:\Program Files\sd-models\t5xxl.safetensors"
+///   --vae    "C:\Program Files\sd-models\ae.safetensors"
+/// ```
+///
+/// Returns `Phase4BridgeError::Invalid` if the env var is set but
+/// the value has mismatched quotes — surfacing the parse failure to
+/// the renderer is much friendlier than silently truncating the
+/// argv and letting sd-server fail with a cryptic missing-file
+/// error.
+fn parse_sd_server_extra_args() -> Phase4Result<Vec<String>> {
+    let Some(raw) = std::env::var_os("KCREATE_SD_SERVER_EXTRA_ARGS") else {
+        return Ok(Vec::new());
+    };
+    let raw_str = raw.to_string_lossy();
+    if raw_str.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    shell_words::split(&raw_str).map_err(|e| {
+        Phase4BridgeError::Invalid(format!(
+            "KCREATE_SD_SERVER_EXTRA_ARGS could not be parsed as a shell-quoted argv: {e}",
+        ))
+    })
 }
 
 /// Stop the image-generation sidecar. Idempotent.
@@ -743,16 +862,25 @@ mod tests {
         let _ = listed;
     }
 
-    /// Dispatch reasons round-trip through the bridge — used by the
-    /// renderer's "Why is MLX unavailable?" affordance.
+    /// Dispatch reasons round-trip through the bridge. Phase 12
+    /// collapsed the MLX-fallback variants and left a single
+    /// `LlamaServer` reason, but we still exercise it here so a
+    /// future addition of a Rust-native runtime is caught in this
+    /// test rather than at the UI surface.
     #[test]
     fn dispatch_reason_variants_are_exhaustive() {
         use kcreate_ai::sidecar_dispatcher::DispatchReason;
-        for r in [
-            DispatchReason::LlamaServer,
-            DispatchReason::MlxNative,
-            DispatchReason::MlxUnavailableFallback,
-        ] {
+        // Phase 12 collapsed every MLX dispatch branch into the
+        // single `LlamaServer` reason; the loop shape here is
+        // intentional so a future Rust-native runtime variant
+        // (or any other variant added to `DispatchReason`) shows
+        // up as a missing match arm in this test rather than at
+        // the UI surface. `clippy::single_element_loop` would
+        // rather we expanded to a single binding, but that
+        // would silently accept future additions — keep the
+        // loop and allow the lint at the call site.
+        #[allow(clippy::single_element_loop)]
+        for r in [DispatchReason::LlamaServer] {
             let _ = format!("{r:?}");
         }
     }
@@ -802,5 +930,243 @@ mod tests {
         assert_eq!(back.width, 512);
         assert_eq!(back.height, 512);
         assert_eq!(back.png_b64, "iVBORw0KGgo=");
+    }
+
+    // -------------------------------------------------------------
+    // KCREATE_SD_SERVER_EXTRA_ARGS parsing — POSIX shell-word rules.
+    //
+    // These tests run serially (the env var is process-global) but
+    // each restores the prior value before returning so test order
+    // doesn't leak. They are guarded by a single mutex so concurrent
+    // executors can't race the `set_var` / `remove_var` pair.
+    // -------------------------------------------------------------
+
+    fn sd_args_test_lock() -> &'static parking_lot::Mutex<()> {
+        static LOCK: std::sync::OnceLock<parking_lot::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| parking_lot::Mutex::new(()))
+    }
+
+    /// Helper: run `body` with `KCREATE_SD_SERVER_EXTRA_ARGS` forced
+    /// to `value` (or unset when `None`), then restore whatever the
+    /// caller had set on the way in.
+    fn with_sd_extra_args<R>(value: Option<&str>, body: impl FnOnce() -> R) -> R {
+        let _guard = sd_args_test_lock().lock();
+        let prior = std::env::var_os("KCREATE_SD_SERVER_EXTRA_ARGS");
+        // SAFETY: env mutation is gated by `sd_args_test_lock`, and
+        // every test that touches this env var goes through this
+        // helper. Cargo runs unit tests across multiple threads by
+        // default; the lock plus the restore-on-exit semantics is
+        // what keeps the parser tests reproducible.
+        unsafe {
+            match value {
+                Some(v) => std::env::set_var("KCREATE_SD_SERVER_EXTRA_ARGS", v),
+                None => std::env::remove_var("KCREATE_SD_SERVER_EXTRA_ARGS"),
+            }
+        }
+        let out = body();
+        unsafe {
+            match prior {
+                Some(v) => std::env::set_var("KCREATE_SD_SERVER_EXTRA_ARGS", v),
+                None => std::env::remove_var("KCREATE_SD_SERVER_EXTRA_ARGS"),
+            }
+        }
+        out
+    }
+
+    /// Unset env var => empty argv.
+    #[test]
+    fn parse_sd_extra_args_unset_returns_empty() {
+        let out = with_sd_extra_args(None, parse_sd_server_extra_args).unwrap();
+        assert!(out.is_empty());
+    }
+
+    /// Empty / whitespace-only value => empty argv (no spurious
+    /// tokens that would confuse sd-server's flag parser).
+    #[test]
+    fn parse_sd_extra_args_whitespace_only_returns_empty() {
+        let out = with_sd_extra_args(Some("   \t\n  "), parse_sd_server_extra_args).unwrap();
+        assert!(out.is_empty(), "got {out:?}");
+    }
+
+    /// Plain unquoted argv splits on whitespace, matching prior
+    /// behavior so existing Linux/macOS configs don't regress.
+    #[test]
+    fn parse_sd_extra_args_unquoted_splits_on_whitespace() {
+        let out = with_sd_extra_args(
+            Some("--clip_l /m/clip.sft --t5xxl /m/t5.sft --vae /m/ae.sft"),
+            parse_sd_server_extra_args,
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            vec![
+                "--clip_l".to_string(),
+                "/m/clip.sft".to_string(),
+                "--t5xxl".to_string(),
+                "/m/t5.sft".to_string(),
+                "--vae".to_string(),
+                "/m/ae.sft".to_string(),
+            ]
+        );
+    }
+
+    /// Double-quoted Windows path stays one token, including the
+    /// embedded space — this is the regression the bug report flagged.
+    #[test]
+    fn parse_sd_extra_args_double_quoted_path_with_spaces() {
+        let out = with_sd_extra_args(
+            Some(r#"--clip_l "C:\Program Files\sd-models\clip_l.safetensors" --t5xxl "C:\Program Files\sd-models\t5xxl.safetensors""#),
+            parse_sd_server_extra_args,
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            vec![
+                "--clip_l".to_string(),
+                r"C:\Program Files\sd-models\clip_l.safetensors".to_string(),
+                "--t5xxl".to_string(),
+                r"C:\Program Files\sd-models\t5xxl.safetensors".to_string(),
+            ]
+        );
+    }
+
+    /// Single quotes work the same way as double quotes for POSIX
+    /// shell tokenization — confirm both surfaces.
+    #[test]
+    fn parse_sd_extra_args_single_quoted_path_with_spaces() {
+        let out = with_sd_extra_args(
+            Some("--vae '/Users/me/My Models/ae.safetensors'"),
+            parse_sd_server_extra_args,
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            vec![
+                "--vae".to_string(),
+                "/Users/me/My Models/ae.safetensors".to_string(),
+            ]
+        );
+    }
+
+    /// Mismatched quotes surface as a typed parse error rather than
+    /// a silently-truncated argv — so the renderer can show a
+    /// helpful error toast instead of letting sd-server fail with
+    /// an opaque missing-file message.
+    #[test]
+    fn parse_sd_extra_args_mismatched_quotes_errors() {
+        let r = with_sd_extra_args(
+            Some(r#"--clip_l "unterminated"#),
+            parse_sd_server_extra_args,
+        );
+        match r {
+            Err(Phase4BridgeError::Invalid(msg)) => {
+                assert!(
+                    msg.contains("KCREATE_SD_SERVER_EXTRA_ARGS"),
+                    "error message must name the env var, got: {msg}"
+                );
+            }
+            other => panic!("expected Invalid error, got {other:?}"),
+        }
+    }
+
+    /// Phase 12 legacy MLX pack-id migration round-trips through
+    /// the bridge `resolve_pack_id` helper. The helper is the
+    /// single migration seam — every entry point (`vision_start`,
+    /// `image_gen_start`, `vision_mmproj_for`) goes through it, so
+    /// asserting on it here covers all three call sites.
+    #[test]
+    fn resolve_pack_id_migrates_legacy_mlx_ids() {
+        assert_eq!(
+            resolve_pack_id("vision_smolvlm_256m_mlx"),
+            "vision_smolvlm2_256m",
+        );
+        assert_eq!(
+            resolve_pack_id("vision_qwen25vl_7b_mlx"),
+            "vision_qwen25vl_7b",
+        );
+        assert_eq!(
+            resolve_pack_id("image_gen_flux_klein_mlx"),
+            "image_gen_flux_klein_4b",
+        );
+    }
+
+    /// `resolve_pack_id` is a no-op for current ids — current
+    /// callers must not see allocations or spurious log warnings
+    /// for the common path.
+    #[test]
+    fn resolve_pack_id_passes_through_current_ids() {
+        for id in [
+            "llm_bonsai_1_7b",
+            "vision_smolvlm2_256m",
+            "image_gen_flux_klein_4b",
+            "totally_unknown_pack_id",
+        ] {
+            assert_eq!(resolve_pack_id(id), id);
+        }
+    }
+
+    /// `vision_mmproj_for` migrates legacy MLX ids before looking
+    /// up the projector companion — a stale settings entry that
+    /// still names the MLX variant must resolve to the current
+    /// mmproj pack, not surface as `None`.
+    #[test]
+    fn vision_mmproj_for_migrates_legacy_mlx_ids() {
+        assert_eq!(
+            vision_mmproj_for("vision_qwen25vl_7b_mlx".into()),
+            Some("vision_qwen25vl_7b_mmproj".to_string()),
+        );
+        assert_eq!(
+            vision_mmproj_for("vision_smolvlm_256m_mlx".into()),
+            Some("vision_smolvlm2_256m_mmproj".to_string()),
+        );
+    }
+
+    /// `log_legacy_pack_migration_once` must fire exactly once per
+    /// legacy id per process lifetime. Devin Review (post-Phase-12)
+    /// flagged that the original implementation logged on every call
+    /// even though the doc comment said "one-time", which would have
+    /// flooded the log if a renderer kept invoking
+    /// `vision_start` / `image_gen_start` with the same stale saved
+    /// preferences entry. The dedup state is module-level
+    /// (`LEGACY_PACK_WARN_SEEN`) so multiple sibling tests within the
+    /// same `cargo test` binary share it — we explicitly reset it at
+    /// the top of the test so the assertion is deterministic
+    /// regardless of test ordering.
+    ///
+    /// We intentionally don't assert on the `log` facade output (no
+    /// in-process subscriber) because the contract under test is
+    /// "the dedup set absorbs repeats", not the log layer's behavior.
+    /// The boolean returned by `log_legacy_pack_migration_once` is
+    /// exposed for exactly this reason.
+    #[test]
+    fn log_legacy_pack_migration_dedups_on_repeat_calls() {
+        reset_legacy_pack_migration_dedup_for_tests();
+        // First sighting of each legacy id => warning fires.
+        assert!(log_legacy_pack_migration_once(
+            "vision_smolvlm_256m_mlx",
+            "vision_smolvlm2_256m"
+        ));
+        assert!(log_legacy_pack_migration_once(
+            "image_gen_flux_klein_mlx",
+            "image_gen_flux_klein_4b"
+        ));
+        // Same legacy id again => suppressed.
+        assert!(!log_legacy_pack_migration_once(
+            "vision_smolvlm_256m_mlx",
+            "vision_smolvlm2_256m"
+        ));
+        assert!(!log_legacy_pack_migration_once(
+            "image_gen_flux_klein_mlx",
+            "image_gen_flux_klein_4b"
+        ));
+        // A different legacy id still fires the first time.
+        assert!(log_legacy_pack_migration_once(
+            "vision_qwen25vl_7b_mlx",
+            "vision_qwen25vl_7b"
+        ));
+        // Reset the dedup state so sibling tests that also exercise
+        // `resolve_pack_id` aren't observed via shared module-level
+        // state.
+        reset_legacy_pack_migration_dedup_for_tests();
     }
 }

@@ -137,14 +137,17 @@ pub fn annotation_create(request: AnnotationCreateRequest) -> Result<Annotation>
 pub fn annotation_reply(request: AnnotationReplyRequest) -> Result<Annotation> {
     require_editor_permission()?;
     let parent = with_workspace(|ws| {
-        kcreate_storage::annotations::load_annotation(ws.store.lock().connection(), request.parent_id)
-            .map_err(|e| DocumentBridgeError::Internal(format!("load_annotation: {e}")))?
-            .ok_or_else(|| {
-                DocumentBridgeError::Internal(format!(
-                    "annotation_reply: parent {} not found",
-                    request.parent_id
-                ))
-            })
+        kcreate_storage::annotations::load_annotation(
+            ws.store.lock().connection(),
+            request.parent_id,
+        )
+        .map_err(|e| DocumentBridgeError::Internal(format!("load_annotation: {e}")))?
+        .ok_or_else(|| {
+            DocumentBridgeError::Internal(format!(
+                "annotation_reply: parent {} not found",
+                request.parent_id
+            ))
+        })
     })?;
     let reply = Annotation::reply(
         &parent,

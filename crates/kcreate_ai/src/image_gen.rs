@@ -1,353 +1,43 @@
-//! Image-generation sidecar (FLUX diffusion).
+//! Image-generation HTTP client.
 //!
-//! This module spawns and supervises a Python subprocess that runs
-//! a minimal diffusers-based HTTP server (see
-//! `tools/kcreate_diffusion/server.py`). The server binds loopback
-//! only, exposes a `/health` liveness probe, a `/ready` readiness
-//! probe (200 once the diffusion pipeline finishes loading; 503
-//! while still loading; 500 on load failure), and a
-//! `POST /v1/images/generations` endpoint that accepts
+//! Phase 12 Block B replaced the Python diffusion sidecar with
+//! `sd-server` (stable-diffusion.cpp). The process lifecycle now
+//! lives in [`crate::diffusion_sidecar`]; this module is the
+//! thin HTTP client the bridge uses to drive that sidecar.
 //!
-//! ```json
-//! { "prompt": "...", "width": 1024, "height": 1024, "steps": 20 }
-//! ```
+//! sd-server exposes three API surfaces on its loopback listener:
 //!
-//! and returns
+//! * `POST /sdapi/v1/txt2img`     — Automatic1111-compatible
+//!   text-to-image endpoint. Request body:
+//!   ```json
+//!   { "prompt": "...", "width": 1024, "height": 1024,
+//!     "steps": 20, "seed": 42 }
+//!   ```
+//!   Response body:
+//!   ```json
+//!   { "images": ["<base64 PNG>"], ... }
+//!   ```
+//! * `POST /v1/images/generations` — OpenAI Images-compatible
+//!   endpoint. We don't use it here; the A1111 shape matches our
+//!   internal request shape one-for-one.
+//! * `GET  /sdcpp/v1/capabilities` — readiness probe used by the
+//!   supervisor (not invoked from this module).
 //!
-//! ```json
-//! { "image": "<base64 PNG>", "width": 1024, "height": 1024 }
-//! ```
-//!
-//! The HOST keeps everything else identical to `llm_sidecar.rs`:
-//! status enum, lifecycle, kill-on-drop, port allocation, no
-//! external network. Image generation is gated to Tier 2+ with
-//! GPU; the UI hides the panel below that gate (the gate is
-//! enforced by [`kcreate_core::config::RuntimeConfig::image_generation_allowed`]).
-//!
-//! Local-first invariant: this module is in `kcreate_ai` (not the
+//! Local-first invariant: this module sits in `kcreate_ai` (not the
 //! editing path), and its `ureq` dependency is feature-gated behind
 //! `llm_sidecar` just like the chat client. The editing-path
 //! `local_first.rs` deny-list test stays green.
 
-use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::thread;
-use std::time::{Duration, Instant};
+// Only the `llm_sidecar`-feature build (which pulls in `ureq`)
+// actually uses `Duration` here for the HTTP-client read timeout —
+// without the feature flag the import is unused and cargo warns.
+#[cfg(feature = "llm_sidecar")]
+use std::time::Duration;
 
-use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::llm_sidecar::{SidecarError, SidecarResult, SidecarStatus};
-
-/// Default health-check ceiling. FLUX cold loads can take a while
-/// on the first request (the diffusers warm-up step compiles the
-/// CUDA kernels), so we allow a generous 90 s window. Subsequent
-/// generations are bounded by the per-request timeout.
-const DEFAULT_HEALTH_TIMEOUT: Duration = Duration::from_secs(90);
-const HEALTH_POLL_INTERVAL: Duration = Duration::from_millis(500);
-
-/// Tunables for the image-generation sidecar. Mirrors
-/// [`crate::llm_sidecar::SidecarConfig`] field-for-field where it
-/// makes sense, and adds `host_python_module` so callers can swap
-/// the server entry point (useful for tests that stand up a
-/// `tools.fake_diffusion.server` instead of the real one).
-#[derive(Debug, Clone)]
-pub struct ImageGenConfig {
-    /// Python interpreter to invoke.
-    pub python: PathBuf,
-    /// Python module to run with `-m`. Defaults to
-    /// `kcreate_diffusion.server`.
-    pub host_python_module: String,
-    /// Path or HF slug for the diffusion weights.
-    pub model_path: PathBuf,
-    /// Sidecar must transition to Ready within this duration.
-    pub health_timeout: Duration,
-    /// Extra args forwarded to the Python entry point.
-    pub extra_args: Vec<String>,
-}
-
-impl ImageGenConfig {
-    /// Construct a config from a model path with default knobs.
-    #[must_use]
-    pub fn new(model_path: PathBuf) -> Self {
-        Self {
-            python: PathBuf::from("python3"),
-            host_python_module: "kcreate_diffusion.server".to_string(),
-            model_path,
-            health_timeout: DEFAULT_HEALTH_TIMEOUT,
-            extra_args: Vec::new(),
-        }
-    }
-}
-
-/// Image-generation sidecar driver. Same shape as
-/// [`crate::llm_sidecar::LlmSidecar`].
-#[derive(Debug)]
-pub struct ImageGenSidecar {
-    config: ImageGenConfig,
-    status: Arc<Mutex<SidecarStatus>>,
-    stop_signal: Option<Arc<AtomicBool>>,
-    worker: Option<thread::JoinHandle<()>>,
-}
-
-impl ImageGenSidecar {
-    /// Construct a stopped sidecar with the given config.
-    #[must_use]
-    pub fn new(config: ImageGenConfig) -> Self {
-        Self {
-            config,
-            status: Arc::new(Mutex::new(SidecarStatus::Stopped)),
-            stop_signal: None,
-            worker: None,
-        }
-    }
-
-    /// Current status snapshot.
-    #[must_use]
-    pub fn status(&self) -> SidecarStatus {
-        self.status.lock().clone()
-    }
-
-    /// True iff Ready.
-    #[must_use]
-    pub fn is_ready(&self) -> bool {
-        self.status.lock().is_ready()
-    }
-
-    /// Spawn the Python child process and start probing `/ready`.
-    /// Returns the listening port immediately; the caller observes
-    /// `Ready`/`Error` by polling [`Self::status`]. We poll
-    /// `/ready` (not `/health`) so the sidecar only transitions to
-    /// `Ready` once the diffusion pipeline has finished loading —
-    /// otherwise the first generate call would block 30-60 s on a
-    /// silent torch import while the UI showed a green "ready"
-    /// dot.
-    pub fn start(&mut self) -> SidecarResult<u16> {
-        {
-            let s = self.status.lock();
-            if s.is_ready() || matches!(*s, SidecarStatus::Starting) {
-                return Err(SidecarError::WrongState("already running".to_string()));
-            }
-        }
-        if let Err(e) = validate_model(&self.config.model_path) {
-            *self.status.lock() = SidecarStatus::Error {
-                message: e.to_string(),
-            };
-            return Err(e);
-        }
-        let port = match pick_loopback_port() {
-            Ok(p) => p,
-            Err(e) => {
-                *self.status.lock() = SidecarStatus::Error {
-                    message: e.to_string(),
-                };
-                return Err(e);
-            }
-        };
-        let child = match spawn_child(&self.config, port) {
-            Ok(c) => c,
-            Err(e) => {
-                *self.status.lock() = SidecarStatus::Error {
-                    message: e.to_string(),
-                };
-                return Err(e);
-            }
-        };
-
-        *self.status.lock() = SidecarStatus::Starting;
-        let stop = Arc::new(AtomicBool::new(false));
-        let status_for_worker = Arc::clone(&self.status);
-        let stop_for_worker = Arc::clone(&stop);
-        let model_name = self
-            .config
-            .model_path
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("image-gen")
-            .to_string();
-        let health_timeout = self.config.health_timeout;
-
-        let handle = thread::spawn(move || {
-            health_worker(
-                child,
-                port,
-                model_name,
-                health_timeout,
-                stop_for_worker,
-                status_for_worker,
-            );
-        });
-        self.stop_signal = Some(stop);
-        self.worker = Some(handle);
-        Ok(port)
-    }
-
-    /// Stop the sidecar. Idempotent.
-    pub fn stop(&mut self) {
-        if let Some(sig) = self.stop_signal.take() {
-            sig.store(true, Ordering::Release);
-        }
-        if let Some(h) = self.worker.take() {
-            let _ = h.join();
-        }
-        *self.status.lock() = SidecarStatus::Stopped;
-    }
-}
-
-impl Drop for ImageGenSidecar {
-    fn drop(&mut self) {
-        self.stop();
-    }
-}
-
-/// Build the argv that the Python entry point receives. Public for
-/// tests + debug logging.
-#[must_use]
-pub fn build_argv(config: &ImageGenConfig, port: u16) -> Vec<String> {
-    let mut argv = vec![
-        "-m".to_string(),
-        config.host_python_module.clone(),
-        "--model".to_string(),
-        config.model_path.to_string_lossy().into_owned(),
-        "--host".to_string(),
-        "127.0.0.1".to_string(),
-        "--port".to_string(),
-        port.to_string(),
-    ];
-    for arg in &config.extra_args {
-        argv.push(arg.clone());
-    }
-    argv
-}
-
-fn spawn_child(config: &ImageGenConfig, port: u16) -> SidecarResult<Child> {
-    let mut cmd = Command::new(&config.python);
-    for arg in build_argv(config, port) {
-        cmd.arg(arg);
-    }
-    cmd.stdout(Stdio::null()).stderr(Stdio::piped());
-    log::debug!(
-        "spawning image-gen sidecar: {} -m {} --port {}",
-        config.python.display(),
-        config.host_python_module,
-        port,
-    );
-    cmd.spawn().map_err(SidecarError::Spawn)
-}
-
-fn health_worker(
-    mut child: Child,
-    port: u16,
-    model_name: String,
-    health_timeout: Duration,
-    stop_signal: Arc<AtomicBool>,
-    status: Arc<Mutex<SidecarStatus>>,
-) {
-    let deadline = Instant::now() + health_timeout;
-    let mut ready = false;
-    while Instant::now() < deadline {
-        if stop_signal.load(Ordering::Acquire) {
-            kill_child(&mut child);
-            *status.lock() = SidecarStatus::Stopped;
-            return;
-        }
-        if probe_ready(port) {
-            ready = true;
-            break;
-        }
-        thread::sleep(HEALTH_POLL_INTERVAL);
-    }
-    if !ready {
-        kill_child(&mut child);
-        *status.lock() = SidecarStatus::Error {
-            message: SidecarError::HealthTimeout {
-                timeout: health_timeout,
-            }
-            .to_string(),
-        };
-        return;
-    }
-    *status.lock() = SidecarStatus::Ready {
-        model_name,
-        // FLUX context isn't a token budget; we report 0 to keep
-        // the wire shape uniform with the chat sidecar.
-        context_size: 0,
-        port,
-        // The FLUX diffusion sidecar speaks our own loopback
-        // protocol — it doesn't expose llama.cpp's `/v1/*` routes
-        // and doesn't accept `--api-key`. Phase 11 Block E Task 25
-        // only authenticates the chat sidecar; the diffusion
-        // sidecar stays loopback-only without a per-session token.
-        bearer_token: None,
-    };
-    while !stop_signal.load(Ordering::Acquire) {
-        thread::sleep(Duration::from_millis(200));
-    }
-    kill_child(&mut child);
-    *status.lock() = SidecarStatus::Stopped;
-}
-
-fn kill_child(child: &mut Child) {
-    let _ = child.kill();
-    let _ = child.wait();
-}
-
-fn pick_loopback_port() -> SidecarResult<u16> {
-    use std::net::{SocketAddr, TcpListener};
-    let addr: SocketAddr = "127.0.0.1:0".parse().expect("static addr");
-    let listener = TcpListener::bind(addr).map_err(SidecarError::PortAllocation)?;
-    let port = listener
-        .local_addr()
-        .map_err(SidecarError::PortAllocation)?
-        .port();
-    drop(listener);
-    Ok(port)
-}
-
-/// Diffusion model files are typically directories (HF format) or
-/// single GGUF/safetensors files. We accept either, and let
-/// non-existent paths fall through assuming they're HF slugs (same
-/// contract as [`crate::mlx_sidecar`]).
-fn validate_model(model: &Path) -> SidecarResult<()> {
-    if model.as_os_str().is_empty() {
-        return Err(SidecarError::ModelMissing(model.to_path_buf()));
-    }
-    Ok(())
-}
-
-/// Probe the diffusion server's `/ready` endpoint. Returns `true`
-/// only when the pipeline has finished loading (200). `503` (still
-/// loading) and `500` (load error) both return `false` so the
-/// health worker keeps polling until the deadline or success.
-///
-/// When `llm_sidecar` isn't compiled in we can't actually parse
-/// HTTP responses, so we fall back to a TCP-connect probe — that's
-/// only used by unit tests that mock out the supervisor anyway.
-#[cfg(feature = "llm_sidecar")]
-fn probe_ready(port: u16) -> bool {
-    let url = format!("http://127.0.0.1:{port}/ready");
-    match ureq::get(&url).timeout(Duration::from_secs(2)).call() {
-        Ok(resp) => resp.status() == 200,
-        // ureq surfaces 4xx/5xx as `Err(Status)`; only 200 counts
-        // as "pipeline loaded".
-        Err(_) => false,
-    }
-}
-
-#[cfg(not(feature = "llm_sidecar"))]
-fn probe_ready(port: u16) -> bool {
-    use std::net::{SocketAddr, TcpStream};
-    TcpStream::connect_timeout(
-        &SocketAddr::from(([127, 0, 0, 1], port)),
-        Duration::from_millis(500),
-    )
-    .is_ok()
-}
-
-// ---- Generation client (Task 9) ----
+// ---- Generation client ----
 
 /// Errors returned by [`generate_image`].
 #[derive(Debug, Error)]
@@ -380,8 +70,14 @@ pub enum ImageGenError {
 /// Result alias for image-gen operations.
 pub type ImageGenResult<T> = Result<T, ImageGenError>;
 
-/// Request payload that mirrors what the Python server expects.
-/// Public so tests / IPC layer can construct it directly.
+/// Request payload for `POST /sdapi/v1/txt2img`. The field set is a
+/// subset of A1111's full request schema — sd-server happily
+/// ignores unknown fields and supplies defaults for absent ones, so
+/// the bridge only needs to surface the knobs the UI exposes.
+///
+/// `serde` defaults keep the wire shape backwards-compatible with
+/// the historical Python sidecar request — `seed: None` is omitted
+/// from the JSON entirely, letting sd-server pick a random one.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImageGenRequest {
     pub prompt: String,
@@ -406,23 +102,22 @@ pub struct GeneratedImage {
     pub height: u32,
 }
 
-/// Wire shape of the server response — separate from
-/// [`GeneratedImage`] so we can parse the JSON without committing
-/// to the RGBA expansion until after base64+PNG decode.
+/// Wire shape of the A1111-compatible response from
+/// `POST /sdapi/v1/txt2img`. We pull only the `images` array — the
+/// rest of the response (`parameters`, `info`) is metadata we don't
+/// surface to the renderer.
 #[cfg(feature = "llm_sidecar")]
 #[derive(Debug, Clone, Deserialize)]
-struct ImageGenResponseWire {
-    image: String,
-    width: u32,
-    height: u32,
+struct A1111Response {
+    images: Vec<String>,
 }
 
-/// POST a generation request to the local diffusion server and
-/// return decoded RGBA pixels. Network access is loopback-only
-/// (the URL is hard-coded to `127.0.0.1:<port>`).
+/// POST a generation request to the local sd-server and return
+/// decoded RGBA pixels. Network access is loopback-only (the URL is
+/// hard-coded to `127.0.0.1:<port>`).
 #[cfg(feature = "llm_sidecar")]
 pub fn generate_image(port: u16, req: &ImageGenRequest) -> ImageGenResult<GeneratedImage> {
-    let url = format!("http://127.0.0.1:{port}/v1/images/generations");
+    let url = format!("http://127.0.0.1:{port}/sdapi/v1/txt2img");
     let body = serde_json::to_string(req).map_err(|e| ImageGenError::Decode(e.to_string()))?;
     let resp = ureq::post(&url)
         // Generations can take 10–60 s on a warm pipeline; bump
@@ -432,22 +127,33 @@ pub fn generate_image(port: u16, req: &ImageGenRequest) -> ImageGenResult<Genera
         .send_string(&body)
         .map_err(map_ureq_error)?;
     // ureq 2.x surfaces 4xx/5xx as `Err(ureq::Error::Status)` so
-    // reaching `Ok(resp)` already guarantees a 2xx — but the
-    // diffusion server could in principle return `201 Created` or
-    // a `204 No Content` on a future endpoint shape, and a strict
-    // `== 200` check would then swallow the response body as an
-    // empty JSON parse error. Accept any 2xx instead; treat the
-    // (presently unreachable) non-2xx success codes as protocol
-    // errors with the status preserved.
+    // reaching `Ok(resp)` already guarantees a 2xx — but sd-server
+    // could in principle return `201 Created` or a `204 No Content`
+    // on a future endpoint shape, and a strict `== 200` check would
+    // then swallow the response body as an empty JSON parse error.
+    // Accept any 2xx instead; treat the (presently unreachable)
+    // non-2xx success codes as protocol errors with the status
+    // preserved.
     let status = resp.status();
     if !(200..300).contains(&status) {
         let body = resp.into_string().unwrap_or_default();
         return Err(ImageGenError::Status { status, body });
     }
-    let parsed: ImageGenResponseWire = resp
+    let parsed: A1111Response = resp
         .into_json()
         .map_err(|e| ImageGenError::Decode(e.to_string()))?;
-    decode_png_payload(&parsed.image, parsed.width, parsed.height)
+    let first =
+        parsed.images.into_iter().next().ok_or_else(|| {
+            ImageGenError::Decode("sd-server returned empty `images` array".into())
+        })?;
+    // The HTTP path uses the lenient variant so a future model pack
+    // whose architecture rounds dimensions (e.g. SDXL's multiple-of-8
+    // requirement) doesn't get rejected at the decode boundary —
+    // sd-server is authoritative on the actual output resolution and
+    // the renderer is happy to display whatever pixels came back.
+    // The strict variant remains for tests + callers that want a
+    // hard equality check against a known-honored resolution.
+    decode_png_payload_lenient(&first)
 }
 
 #[cfg(not(feature = "llm_sidecar"))]
@@ -466,26 +172,57 @@ fn map_ureq_error(e: ureq::Error) -> ImageGenError {
     }
 }
 
-/// Decode a base64-encoded PNG into RGBA8 pixels. Used after the
-/// server response is parsed; broken out so tests can exercise the
-/// decode independently of the HTTP round-trip.
+/// Decode a base64-encoded PNG into RGBA8 pixels and require the
+/// result to match `expected_width` / `expected_height` exactly.
+///
+/// Use this when the caller knows the model's architecture honors
+/// the requested resolution byte-for-byte (FLUX does; SDXL
+/// internally rounds to multiples of 8). The HTTP path in
+/// [`generate_image`] uses [`decode_png_payload_lenient`] instead
+/// so future non-FLUX packs don't get rejected at the decode
+/// boundary for what is actually correct server behavior.
+///
+/// sd-server occasionally prefixes its base64 payloads with a
+/// `data:image/png;base64,` data URI header in some build configs;
+/// the prefix is stripped transparently so the bridge doesn't have
+/// to branch on which build it's talking to.
 pub fn decode_png_payload(
     base64_png: &str,
     expected_width: u32,
     expected_height: u32,
 ) -> ImageGenResult<GeneratedImage> {
+    let img = decode_png_payload_lenient(base64_png)?;
+    if img.width != expected_width || img.height != expected_height {
+        return Err(ImageGenError::Decode(format!(
+            "server returned {}x{}, expected {expected_width}x{expected_height}",
+            img.width, img.height,
+        )));
+    }
+    Ok(img)
+}
+
+/// Decode a base64-encoded PNG into RGBA8 pixels and report the
+/// dimensions the server actually produced. No equality check
+/// against any client-side expectation — the caller decides what
+/// (if anything) to do with the dimensions.
+///
+/// This is the HTTP-path decoder. It exists so [`generate_image`]
+/// remains valid when a future model pack (e.g. SDXL) legitimately
+/// rounds the output resolution to satisfy an architectural
+/// constraint. The strict variant ([`decode_png_payload`]) is kept
+/// for tests + callers that want to assert server fidelity.
+pub fn decode_png_payload_lenient(base64_png: &str) -> ImageGenResult<GeneratedImage> {
     use base64::Engine as _;
+    let trimmed = base64_png
+        .strip_prefix("data:image/png;base64,")
+        .unwrap_or(base64_png)
+        .trim();
     let bytes = base64::engine::general_purpose::STANDARD
-        .decode(base64_png.as_bytes())
+        .decode(trimmed.as_bytes())
         .map_err(|e| ImageGenError::Base64(e.to_string()))?;
     let img = image::load_from_memory(&bytes).map_err(|e| ImageGenError::Png(e.to_string()))?;
     let rgba = img.to_rgba8();
     let (w, h) = (rgba.width(), rgba.height());
-    if w != expected_width || h != expected_height {
-        return Err(ImageGenError::Decode(format!(
-            "server returned {w}x{h}, expected {expected_width}x{expected_height}",
-        )));
-    }
     Ok(GeneratedImage {
         rgba: rgba.into_raw(),
         width: w,
@@ -496,45 +233,6 @@ pub fn decode_png_payload(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn argv_invokes_python_module() {
-        let cfg = ImageGenConfig::new(PathBuf::from("/tmp/flux.gguf"));
-        let argv = build_argv(&cfg, 12345);
-        assert_eq!(argv.first().map(String::as_str), Some("-m"));
-        assert_eq!(
-            argv.get(1).map(String::as_str),
-            Some("kcreate_diffusion.server"),
-        );
-        let host_pos = argv.iter().position(|a| a == "--host").unwrap();
-        assert_eq!(
-            argv.get(host_pos + 1).map(String::as_str),
-            Some("127.0.0.1")
-        );
-        let port_pos = argv.iter().position(|a| a == "--port").unwrap();
-        assert_eq!(argv.get(port_pos + 1).map(String::as_str), Some("12345"));
-    }
-
-    #[test]
-    fn validate_rejects_empty_path() {
-        let err = validate_model(Path::new("")).expect_err("empty path");
-        assert!(matches!(err, SidecarError::ModelMissing(_)));
-    }
-
-    #[test]
-    fn start_with_bad_python_transitions_to_error() {
-        let cfg = ImageGenConfig {
-            python: PathBuf::from("/this/python/does/not/exist"),
-            host_python_module: "kcreate_diffusion.server".into(),
-            model_path: PathBuf::from("/tmp/flux"),
-            health_timeout: Duration::from_millis(50),
-            extra_args: vec![],
-        };
-        let mut s = ImageGenSidecar::new(cfg);
-        let err = s.start().expect_err("bad python");
-        assert!(matches!(err, SidecarError::Spawn(_)));
-        assert!(matches!(s.status(), SidecarStatus::Error { .. }));
-    }
 
     /// Round-trip a known 2x2 RGBA PNG through base64 + PNG decode.
     /// Exercises [`decode_png_payload`] without needing an HTTP
@@ -564,6 +262,29 @@ mod tests {
         assert_eq!(decoded.rgba, pixels);
     }
 
+    /// Some sd-server builds prefix the payload with a data-URI
+    /// header. The decoder must strip it transparently so the
+    /// bridge isn't sensitive to which build is loaded.
+    #[test]
+    fn decode_png_payload_strips_data_uri_prefix() {
+        use base64::Engine as _;
+        let pixels: Vec<u8> = vec![
+            0, 0, 0, 255, 255, 255, 255, 255, 128, 0, 128, 255, 0, 128, 0, 255,
+        ];
+        let img: image::RgbaImage = image::ImageBuffer::from_raw(2, 2, pixels.clone()).unwrap();
+        let mut png_bytes: Vec<u8> = Vec::new();
+        image::DynamicImage::ImageRgba8(img)
+            .write_to(
+                &mut std::io::Cursor::new(&mut png_bytes),
+                image::ImageFormat::Png,
+            )
+            .unwrap();
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&png_bytes);
+        let with_prefix = format!("data:image/png;base64,{b64}");
+        let decoded = decode_png_payload(&with_prefix, 2, 2).unwrap();
+        assert_eq!(decoded.rgba, pixels);
+    }
+
     /// Mismatched dimensions surface as a `Decode` error, not a
     /// silent reshape. Catches a server that hands back the wrong
     /// resolution.
@@ -584,19 +305,86 @@ mod tests {
         assert!(matches!(err, ImageGenError::Decode(_)));
     }
 
-    /// Mock the diffusion server with `tiny_http` and round-trip a
-    /// real generate request. Confirms the wire format the Python
-    /// server must implement.
+    /// Empty input surfaces as a `Base64` error (an empty string is
+    /// valid base64 but decodes to zero bytes, which the image
+    /// decoder then rejects with an `Unsupported` error — keep the
+    /// surface message tight so the UI can show a clean toast).
+    #[test]
+    fn decode_png_payload_rejects_empty_string() {
+        let err = decode_png_payload("", 1, 1).expect_err("empty");
+        assert!(matches!(err, ImageGenError::Png(_)));
+    }
+
+    /// The lenient decoder reports whatever dimensions the server
+    /// actually produced — no expected-size argument, no rejection.
+    /// This is the variant the HTTP path uses so future packs whose
+    /// architecture rounds dimensions (e.g. SDXL's multiple-of-8
+    /// rule) don't trip a false-positive decode error.
+    #[test]
+    fn decode_png_payload_lenient_returns_actual_dimensions() {
+        use base64::Engine as _;
+        // Server "returned" a 16x16 image when the request asked
+        // for 17x17 (simulating SDXL's rounding behavior). The
+        // strict variant would reject this; the lenient one must
+        // accept it and report 16x16.
+        let pixels: Vec<u8> = vec![42u8; 16 * 16 * 4];
+        let img: image::RgbaImage = image::ImageBuffer::from_raw(16, 16, pixels).unwrap();
+        let mut png_bytes: Vec<u8> = Vec::new();
+        image::DynamicImage::ImageRgba8(img)
+            .write_to(
+                &mut std::io::Cursor::new(&mut png_bytes),
+                image::ImageFormat::Png,
+            )
+            .unwrap();
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&png_bytes);
+        let lenient = decode_png_payload_lenient(&b64).expect("lenient must accept actual dims");
+        assert_eq!(lenient.width, 16);
+        assert_eq!(lenient.height, 16);
+        assert_eq!(lenient.rgba.len(), 16 * 16 * 4);
+        // Same payload through the strict variant must fail when
+        // the expectation doesn't match — this is the contract
+        // difference the split exists for.
+        let err = decode_png_payload(&b64, 17, 17).expect_err("strict must reject mismatched dims");
+        assert!(matches!(err, ImageGenError::Decode(_)));
+    }
+
+    /// The lenient decoder also strips the `data:image/png;base64,`
+    /// data-URI prefix so the HTTP path doesn't have to peek at
+    /// which sd-server build it's talking to.
+    #[test]
+    fn decode_png_payload_lenient_strips_data_uri_prefix() {
+        use base64::Engine as _;
+        let pixels: Vec<u8> = vec![1, 2, 3, 255];
+        let img: image::RgbaImage = image::ImageBuffer::from_raw(1, 1, pixels.clone()).unwrap();
+        let mut png_bytes: Vec<u8> = Vec::new();
+        image::DynamicImage::ImageRgba8(img)
+            .write_to(
+                &mut std::io::Cursor::new(&mut png_bytes),
+                image::ImageFormat::Png,
+            )
+            .unwrap();
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&png_bytes);
+        let with_prefix = format!("data:image/png;base64,{b64}");
+        let lenient = decode_png_payload_lenient(&with_prefix).unwrap();
+        assert_eq!(lenient.width, 1);
+        assert_eq!(lenient.height, 1);
+        assert_eq!(lenient.rgba, pixels);
+    }
+
+    /// Mock sd-server with `tiny_http` and round-trip a real
+    /// generate request. Confirms the A1111 `/sdapi/v1/txt2img`
+    /// wire format the bridge expects.
     #[cfg(feature = "llm_sidecar")]
     #[test]
-    fn generate_image_round_trip_against_mock() {
+    fn generate_image_round_trip_against_sd_server_mock() {
         use base64::Engine as _;
         let server = tiny_http::Server::http("127.0.0.1:0").expect("mock server");
         let port = server.server_addr().to_ip().expect("ip addr").port();
-        // Background thread that responds to the /v1/images/generations
-        // endpoint with a base64 PNG.
+        // Background thread that responds to /sdapi/v1/txt2img with
+        // a base64 PNG inside an `images: [...]` array.
         let handle = std::thread::spawn(move || {
             for req in server.incoming_requests().take(1) {
+                assert_eq!(req.url(), "/sdapi/v1/txt2img");
                 let pixels: Vec<u8> = vec![
                     10, 20, 30, 255, 40, 50, 60, 255, 70, 80, 90, 255, 100, 110, 120, 255,
                 ];
@@ -609,7 +397,7 @@ mod tests {
                     )
                     .unwrap();
                 let b64 = base64::engine::general_purpose::STANDARD.encode(&png_bytes);
-                let body = format!(r#"{{"image":"{b64}","width":2,"height":2}}"#);
+                let body = format!(r#"{{"images":["{b64}"]}}"#);
                 let resp = tiny_http::Response::from_string(body).with_header(
                     "Content-Type: application/json"
                         .parse::<tiny_http::Header>()
@@ -629,6 +417,39 @@ mod tests {
         assert_eq!(img.width, 2);
         assert_eq!(img.height, 2);
         assert_eq!(img.rgba.len(), 16);
+        let _ = handle.join();
+    }
+
+    /// An empty `images` array must surface as `Decode`, not a
+    /// silent zero-pixel image. Guards against an sd-server
+    /// configuration that returns a response shell without the
+    /// payload (e.g., a model-load failure that returns 200 + an
+    /// empty array).
+    #[cfg(feature = "llm_sidecar")]
+    #[test]
+    fn generate_image_rejects_empty_images_array() {
+        let server = tiny_http::Server::http("127.0.0.1:0").expect("mock server");
+        let port = server.server_addr().to_ip().expect("ip addr").port();
+        let handle = std::thread::spawn(move || {
+            for req in server.incoming_requests().take(1) {
+                let body = r#"{"images":[]}"#;
+                let resp = tiny_http::Response::from_string(body).with_header(
+                    "Content-Type: application/json"
+                        .parse::<tiny_http::Header>()
+                        .unwrap(),
+                );
+                let _ = req.respond(resp);
+            }
+        });
+        let req = ImageGenRequest {
+            prompt: "anything".into(),
+            width: 64,
+            height: 64,
+            steps: 4,
+            seed: None,
+        };
+        let err = generate_image(port, &req).expect_err("empty images");
+        assert!(matches!(err, ImageGenError::Decode(_)));
         let _ = handle.join();
     }
 }

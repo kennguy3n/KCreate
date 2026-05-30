@@ -221,7 +221,8 @@ pub(crate) fn with_workspace_mut<R>(f: impl FnOnce(&mut Workspace) -> Result<R>)
 /// store. Pulled out so `phase2.rs` does not need to know about the
 /// `ProjectStore` API surface.
 pub(crate) fn blob_load(ws: &Workspace, hash: &str) -> Result<Vec<u8>> {
-    ws.store.lock()
+    ws.store
+        .lock()
         .blobs()
         .load(hash)
         .map_err(|e| DocumentBridgeError::Io(std::io::Error::other(e.to_string())))
@@ -741,8 +742,7 @@ pub fn project_save() -> Result<()> {
         for preset in &snapshot.export_presets {
             store_guard.save_export_preset(preset)?;
         }
-        let preset_ids: HashSet<Uuid> =
-            snapshot.export_presets.iter().map(|p| p.id).collect();
+        let preset_ids: HashSet<Uuid> = snapshot.export_presets.iter().map(|p| p.id).collect();
         let on_disk_presets = store_guard.load_export_presets()?;
         for preset in &on_disk_presets {
             if !preset_ids.contains(&preset.id) {
@@ -2879,20 +2879,19 @@ pub fn interaction_add(node_id: Uuid, trigger: &str, action_json: &str) -> Resul
     // have to feed it a JSON token — wrap the bare-string case in
     // quotes before parsing.
     let trimmed = trigger.trim();
-    let parsed: kcreate_core::InteractionTrigger = if trimmed.starts_with('{')
-        || trimmed.starts_with('"')
-    {
-        serde_json::from_str(trimmed).map_err(|e| DocumentBridgeError::InvalidArgument {
-            argument: "trigger".into(),
-            value: format!("{trigger} ({e})"),
-        })?
-    } else {
-        let quoted = format!("\"{trimmed}\"");
-        serde_json::from_str(&quoted).map_err(|_| DocumentBridgeError::InvalidArgument {
-            argument: "trigger".into(),
-            value: trigger.to_string(),
-        })?
-    };
+    let parsed: kcreate_core::InteractionTrigger =
+        if trimmed.starts_with('{') || trimmed.starts_with('"') {
+            serde_json::from_str(trimmed).map_err(|e| DocumentBridgeError::InvalidArgument {
+                argument: "trigger".into(),
+                value: format!("{trigger} ({e})"),
+            })?
+        } else {
+            let quoted = format!("\"{trimmed}\"");
+            serde_json::from_str(&quoted).map_err(|_| DocumentBridgeError::InvalidArgument {
+                argument: "trigger".into(),
+                value: trigger.to_string(),
+            })?
+        };
     let trigger = parsed;
     let action: kcreate_core::InteractionAction = serde_json::from_str(action_json)?;
     let interaction = kcreate_core::Interaction::new(trigger, action);
@@ -4176,9 +4175,12 @@ pub fn component_smart_animate_snapshot(
                 .map(smart_animate_layer_from_node)
         })
         .collect();
-    let def = ws.project.get_component(inst.definition_id).ok_or_else(|| {
-        DocumentBridgeError::Project(ProjectError::ComponentNotFound(inst.definition_id))
-    })?;
+    let def = ws
+        .project
+        .get_component(inst.definition_id)
+        .ok_or_else(|| {
+            DocumentBridgeError::Project(ProjectError::ComponentNotFound(inst.definition_id))
+        })?;
     // First confirm the variant actually exists — that's a hard
     // error. *Missing* `source_snapshot` is a distinct (and
     // legitimate) state: a freshly added variant before the
@@ -4636,7 +4638,13 @@ pub(crate) fn layout_propagate_in_subtree(
                     }
                 }
             }
-            (config_opt.is_some(), child_ids, config_opt, parent_bounds, inputs)
+            (
+                config_opt.is_some(),
+                child_ids,
+                config_opt,
+                parent_bounds,
+                inputs,
+            )
         };
 
         if run_solver {
@@ -4798,7 +4806,8 @@ fn document_import_image_bytes_inner(
     let mut guard = slot().write();
     let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
     let blob = ws
-        .store.lock()
+        .store
+        .lock()
         .blobs()
         .store(bytes, mime_type)
         .map_err(|e| DocumentBridgeError::Io(std::io::Error::other(e.to_string())))?;
@@ -5442,7 +5451,8 @@ pub fn ai_remove_background(node_id: Uuid) -> Result<Uuid> {
             })?;
         let meta: crate::scene_sync::RasterImageMeta = serde_json::from_value(meta_value.clone())?;
         let bytes = ws
-            .store.lock()
+            .store
+            .lock()
             .blobs()
             .load(&meta.blob_hash)
             .map_err(|e| DocumentBridgeError::Io(std::io::Error::other(e.to_string())))?;
@@ -5480,7 +5490,8 @@ pub fn ai_remove_background(node_id: Uuid) -> Result<Uuid> {
     let mut guard = slot().write();
     let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
     let blob = ws
-        .store.lock()
+        .store
+        .lock()
         .blobs()
         .store(&png, "image/png")
         .map_err(|e| DocumentBridgeError::Io(std::io::Error::other(e.to_string())))?;
@@ -10119,11 +10130,7 @@ mod tests {
             let n0 = ws.project.document.get_node(kids[0]).expect("k0");
             let n2 = ws.project.document.get_node(kids[2]).expect("k2");
             assert!((n0.bounds.x - 0.0).abs() < 1e-6, "n0 x = {}", n0.bounds.x);
-            assert!(
-                (n2.bounds.x - 120.0).abs() < 1e-6,
-                "n2 x = {}",
-                n2.bounds.x
-            );
+            assert!((n2.bounds.x - 120.0).abs() < 1e-6, "n2 x = {}", n2.bounds.x);
         }
 
         // Now resize the frame to a wider box — the propagation
@@ -10134,8 +10141,7 @@ mod tests {
         // 120. The key assertion is that the *bounds were
         // touched and recorded in the operation payload* — the
         // numeric equality is incidental.
-        let new_bounds =
-            kcreate_core::node::Bounds::new(0.0, 0.0, 800.0, 80.0);
+        let new_bounds = kcreate_core::node::Bounds::new(0.0, 0.0, 800.0, 80.0);
         crate::phase8::document_resize_frame(frame, new_bounds).expect("resize");
 
         {
@@ -10200,9 +10206,7 @@ mod tests {
         // blowing the stack. A direct unit test of the helper is
         // cleaner than reproducing a 17-deep nesting via the
         // bridge API.
-        use crate::document::{
-            layout_propagate_in_subtree, LAYOUT_PROPAGATION_DEPTH_LIMIT,
-        };
+        use crate::document::{layout_propagate_in_subtree, LAYOUT_PROPAGATION_DEPTH_LIMIT};
         reset_for_tests();
         let dir = tmpdir();
         project_create("phase11-prop-depth", dir.path()).expect("create");
@@ -10281,15 +10285,13 @@ mod tests {
             // children that got wrapped into the component).
             let payloads: Vec<Vec<kcreate_core::node::Node>> = vec![
                 {
-                    let mut n =
-                        kcreate_core::node::Node::new(NodeType::VectorLayer, "Rect A");
+                    let mut n = kcreate_core::node::Node::new(NodeType::VectorLayer, "Rect A");
                     n.bounds = kcreate_core::node::Bounds::new(99.0, 99.0, 10.0, 10.0);
                     n.opacity = 0.5;
                     vec![n]
                 },
                 {
-                    let mut n =
-                        kcreate_core::node::Node::new(NodeType::VectorLayer, "Rect B");
+                    let mut n = kcreate_core::node::Node::new(NodeType::VectorLayer, "Rect B");
                     n.bounds = kcreate_core::node::Bounds::new(50.0, 0.0, 30.0, 30.0);
                     vec![n]
                 },
@@ -10300,16 +10302,12 @@ mod tests {
             );
         }
 
-        let snap =
-            component_smart_animate_snapshot(inst_id, variant_id).expect("snapshot");
+        let snap = component_smart_animate_snapshot(inst_id, variant_id).expect("snapshot");
         // The before set is the live instance children (two
         // nodes wrapped by the create_from_selection helper).
         assert_eq!(snap.before.len(), 2, "two layers in before set");
-        let before_names: std::collections::HashSet<&str> = snap
-            .before
-            .iter()
-            .map(|l| l.name.as_str())
-            .collect();
+        let before_names: std::collections::HashSet<&str> =
+            snap.before.iter().map(|l| l.name.as_str()).collect();
         assert!(before_names.contains("Rect A"));
         assert!(before_names.contains("Rect B"));
 
@@ -10356,8 +10354,7 @@ mod tests {
                 .get(COMPONENT_INSTANCE_METADATA_KEY)
                 .cloned()
                 .expect("instance meta");
-            let ci: ComponentInstance =
-                serde_json::from_value(meta).expect("component instance");
+            let ci: ComponentInstance = serde_json::from_value(meta).expect("component instance");
             ci.active_variant_id
         };
 
@@ -10373,8 +10370,7 @@ mod tests {
                 .get(COMPONENT_INSTANCE_METADATA_KEY)
                 .cloned()
                 .expect("instance meta");
-            let ci: ComponentInstance =
-                serde_json::from_value(meta).expect("component instance");
+            let ci: ComponentInstance = serde_json::from_value(meta).expect("component instance");
             ci.active_variant_id
         };
         assert_eq!(
@@ -10538,7 +10534,10 @@ mod tests {
         )
         .expect("create");
         let v1 = kcreate_core::document::document_version_global();
-        assert!(v1 > v0, "create did not bump document_version: {v0} -> {v1}");
+        assert!(
+            v1 > v0,
+            "create did not bump document_version: {v0} -> {v1}"
+        );
 
         document_update_node(
             id,
@@ -10549,7 +10548,10 @@ mod tests {
         )
         .expect("update");
         let v2 = kcreate_core::document::document_version_global();
-        assert!(v2 > v1, "update did not bump document_version: {v1} -> {v2}");
+        assert!(
+            v2 > v1,
+            "update did not bump document_version: {v1} -> {v2}"
+        );
 
         // Undo + redo must each bump.
         let _ = document_undo().expect("undo");

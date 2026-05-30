@@ -39,9 +39,9 @@ flowchart TB
     end
 
     subgraph ai[AI sidecar]
-        llama[llama.cpp / MLX]
+        llama[llama.cpp]
         onnx[ONNX Runtime]
-        diffusion[kcreate_diffusion<br/>FLUX Python sidecar]
+        diffusion[sd.cpp<br/>C++ diffusion sidecar]
     end
 
     renderer <--> preload
@@ -80,11 +80,17 @@ KCreate runs in up to five distinct processes:
    exclusively through the preload-exposed `window.kcreate.*` API.
 3. **Electron preload** — runs in a privileged Node context, uses
    `contextBridge.exposeInMainWorld` to expose a small typed surface.
-4. **AI sidecar** — long-lived `llama.cpp` / MLX / ONNX process spawned
-   on demand. Communicates over loopback HTTP (`127.0.0.1:<port>`,
-   OpenAI-compatible `/v1/chat/completions` against `llama-server`).
-   Lifecycle managed by `kcreate_ai::llm_sidecar::LlmSidecar`. Runs at
-   a lower priority and is killable independently of the editor.
+4. **AI sidecar** — long-lived `llama.cpp` / `stable-diffusion.cpp`
+   / ONNX process spawned on demand. Communicates over loopback
+   HTTP (`127.0.0.1:<port>`, OpenAI-compatible
+   `/v1/chat/completions` against `llama-server`,
+   A1111-compatible `/sdapi/v1/txt2img` against `sd-server`).
+   Lifecycle managed by
+   `kcreate_ai::llm_sidecar::LlmSidecar` and
+   `kcreate_ai::diffusion_sidecar::DiffusionSidecar`. Phase 12
+   eliminated every Python subprocess — the AI tier is now
+   100% native C++ + ONNX. Runs at a lower priority and is
+   killable independently of the editor.
 5. **MCP server** — local-loopback server (built, `kcreate_mcp`).
    Exposes `list_artboards`, `create_node`, `export_artboard` via
    JSON-RPC on `127.0.0.1:<port>`. Gated by an `McpPermissionStore`
@@ -100,8 +106,10 @@ KCreate runs in up to five distinct processes:
    Communication with the editing path uses broadcast / mpsc
    channels owned by `SessionState`; the editing path never sees a
    socket directly. The diffusion sidecar process listed under (4)
-   is `tools/kcreate_diffusion/server.py` — a loopback FLUX
-   inference daemon spawned by `kcreate_ai::image_gen`.
+   is `sd-server` from
+   [stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp)
+   — a loopback FLUX inference daemon spawned by
+   `kcreate_ai::diffusion_sidecar` (no Python; see Phase 12).
 
 The renderer process never imports native code. The bridge cdylib lives
 in the Electron main process only.
@@ -397,7 +405,7 @@ so a single token change repaints only the affected layers.
 | Platform        | wgpu  | tiny-skia | ONNX  | llama.cpp |
 | --------------- | :---: | :-------: | :---: | :-------: |
 | macOS Intel     |   ✅  |    ✅     |   ✅  |    ✅     |
-| macOS Apple Si  |   ✅  |    ✅     |   ✅  |    ✅ (MLX)|
+| macOS Apple Si  |   ✅  |    ✅     |   ✅  |    ✅ (Metal) |
 | Windows x64     |   ✅  |    ✅     |   ✅  |    ✅     |
 | Linux x64       |   ✅  |    ✅     |   ✅  |    ✅     |
 | Linux arm64     |   ✅  |    ✅     |   ✅  |    ✅     |
@@ -675,53 +683,83 @@ size at `DeviceTier::vision_model_max_mb` (Tier 0: 500 MB; Tier
 1: 2 GB; Tier 2: 5 GB; Tier 3: 8 GB). Tier 0 + 1 default to
 SmolVLM2-256M; Tier 2 + 3 default to Qwen2.5-VL-4B.
 
-## 16j. Image generation pipeline (Phase 4)
+## 16j. Image generation pipeline (Phase 4, Phase 12)
 
 Image generation is a *hard-gated* feature: when
 `RuntimeConfig::image_generation_allowed()` is false (Tier < 2,
 or no GPU detected), the UI removes the panel entirely and the
 bridge refuses to spawn the sidecar. The pipeline itself:
 
-1. `ImageGenSidecar` (`crates/kcreate_ai/src/image_gen.rs`) spawns
-   `python3 -m kcreate_diffusion.server --model <path>
-   --port <port>` on a loopback port. The companion package lives
-   in `tools/kcreate_diffusion/` and wraps `diffusers` so the bulk
-   of the inference code is upstream.
-2. `image_gen_generate(prompt, width, height, steps, seed)` posts
-   to `/v1/images/generations`; the response is a base64-encoded
-   PNG which the bridge decodes and forwards to the renderer.
-3. The renderer applies the Ask → Preview → Apply loop: the
-   preview is a floating overlay, and Apply imports the bytes
-   via `document_import_image_bytes` (MIME-sniffed, blob-stored
-   under the same content-addressed BLAKE3 path used by
-   imported assets). No temp files are written.
+1. `DiffusionSidecar`
+   (`crates/kcreate_ai/src/diffusion_sidecar.rs`) spawns
+   `sd-server --listen-ip 127.0.0.1 --listen-port <port>
+   --diffusion-model <path>` on a loopback port — the
+   `sd-server` binary ships with
+   [stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp).
+   Phase 12 replaced the original Python sidecar
+   (`tools/kcreate_diffusion/server.py`, FastAPI + diffusers,
+   ~5 GB of pip deps) with this single C++ binary; KCreate
+   ships zero Python at runtime.
+2. Readiness is observed by polling
+   `/sdcpp/v1/capabilities` (HTTP 200 JSON) through a
+   background `health_worker` thread that mirrors
+   `LlmSidecar`'s lifecycle
+   (`Stopped → Starting → Ready → Stopped`).
+3. `image_gen_generate(prompt, width, height, steps, seed)`
+   POSTs to `/sdapi/v1/txt2img` (Automatic1111-compatible
+   shape); the response is `{images: ["<base64 PNG>"]}` from
+   which `image_gen.rs` strips an optional
+   `data:image/png;base64,` URI prefix before handing the
+   bytes to `decode_png_payload`.
+4. The renderer applies the Ask → Preview → Apply loop: the
+   preview is a floating overlay, and Apply imports the
+   bytes via `document_import_image_bytes` (MIME-sniffed,
+   blob-stored under the same content-addressed BLAKE3 path
+   used by imported assets). No temp files are written.
 
-Two registry entries ship in this phase:
-`image_gen_flux_klein_4b` (GGUF, llama.cpp via the diffusion
-sidecar) and `image_gen_flux_klein_mlx` (Apple Silicon).
+Operator overrides:
 
-## 16k. MLX sidecar (Apple Silicon)
+- `KCREATE_SD_SERVER_BINARY` — absolute path to a custom
+  `sd-server` build (default: PATH lookup of `sd-server`).
+- `KCREATE_SD_SERVER_EXTRA_ARGS` — space-separated additional
+  CLI flags forwarded to `sd-server`. The Phase 12
+  recommended setup passes the FLUX text encoder + VAE
+  component flags here
+  (`--clip_l <path> --t5xxl <path> --vae <path>`).
 
-`crates/kcreate_ai/src/mlx_sidecar.rs` is a structural mirror of
-`LlmSidecar` that spawns `python3 -m mlx_lm.server` instead of
-`llama-server`. It is only used on Apple Silicon, and only when
-`probe_mlx_available()` (which caches a `python3 -c "import
-mlx_lm"` probe) returns `true`. On every other platform — and on
-Apple Silicon when MLX is not installed — `SidecarDispatcher`
-transparently falls back to the GGUF/llama-server pack returned
-by `model_registry::gguf_fallback_for_mlx_pack` so the user never
-sees an MLX-only failure.
+One registry entry ships in this phase:
+`image_gen_flux_klein_4b` (FLUX.2-Klein-4B GGUF). The
+Bonsai Image Ternary variants from prism-ml are *not*
+sd.cpp-compatible (gemlite / MLX 2-bit; sd.cpp's FLUX loader
+rejects the tensor layout) and so are not surfaced in the
+registry.
+
+## 16k. MLX sidecar (removed in Phase 12)
+
+The original `crates/kcreate_ai/src/mlx_sidecar.rs` wrapped
+`python3 -m mlx_lm.server` on Apple Silicon and used
+`probe_mlx_available()` (a cached
+`python3 -c "import mlx_lm"` probe) to gate spawn-time
+dispatch. Phase 12 deleted the module and the entire MLX
+dispatch arm: `llama.cpp` already has full Metal acceleration
+on Apple Silicon via the `--n-gpu-layers` flag, and the
+new Ternary-Bonsai GGUF packs (1.7B / 4B / 8B) run
+natively under `llama-server` on every supported platform.
+There is no longer a structural mirror sidecar, no
+`SidecarRuntime::MlxLm`, no
+`DispatchReason::Mlx*`, no `gguf_fallback_for_mlx_pack`,
+and no `_mlx`-suffixed model pack IDs.
 
 ### CPU / GPU support by platform
 
-| Platform           | Renderer (Phase 1)   | LLM (Phase 3)    | Vision (Phase 4)              | Image Gen (Phase 4)         |
-| ------------------ | -------------------- | ---------------- | ----------------------------- | --------------------------- |
-| macOS (Apple Si)   | wgpu / Metal         | llama-server     | llama-server **or** MLX `mlx_lm` | FLUX.2-Klein-4B GGUF or MLX |
-| macOS (Intel)      | wgpu / Metal         | llama-server     | llama-server                  | Disabled (no GPU tier)      |
-| Windows            | wgpu / DX12          | llama-server     | llama-server                  | FLUX.2-Klein-4B GGUF (Tier 2+) |
-| Linux (NVIDIA)     | wgpu / Vulkan        | llama-server     | llama-server                  | FLUX.2-Klein-4B GGUF (Tier 2+) |
+| Platform           | Renderer (Phase 1)   | LLM (Phase 3)    | Vision (Phase 4)              | Image Gen (Phase 4 / 12)         |
+| ------------------ | -------------------- | ---------------- | ----------------------------- | -------------------------------- |
+| macOS (Apple Si)   | wgpu / Metal         | llama-server (Metal) | llama-server (Metal)        | sd-server (Metal, FLUX.2-Klein-4B GGUF) |
+| macOS (Intel)      | wgpu / Metal         | llama-server     | llama-server                  | Disabled (no GPU tier)           |
+| Windows            | wgpu / DX12          | llama-server     | llama-server                  | sd-server (FLUX.2-Klein-4B GGUF, Tier 2+) |
+| Linux (NVIDIA)     | wgpu / Vulkan        | llama-server     | llama-server                  | sd-server (CUDA / Vulkan, FLUX.2-Klein-4B GGUF, Tier 2+) |
 | Linux (other GPU)  | wgpu / Vulkan        | llama-server     | llama-server                  | Disabled (CPU diffusion ≠ usable) |
-| CPU fallback       | tiny-skia            | llama-server CPU | SmolVLM2-256M (CPU)           | Disabled                    |
+| CPU fallback       | tiny-skia            | llama-server CPU | SmolVLM2-256M (CPU)           | Disabled                          |
 
 ## 17. Plugin types and runtime (Phase 2+)
 
@@ -1928,6 +1966,127 @@ new dependency that touches a CA bundle is
 closure by the `kchat-backend` feature gate). The
 sentinel stays green.
 
+## 17q. Phase 12 — Python elimination, native AI stack
+
+Phase 12 strips every Python runtime dependency from the AI
+stack. The high-level architecture diagram (§ "Overview")
+swapped the `kcreate_diffusion Python sidecar` node for
+`sd.cpp (C++)`; the `ai_rs -. spawn .-> diffusion` edge now
+points at a native binary. §16k (MLX sidecar) is marked
+removed. The new shape is:
+
+- **Text + Vision** — `llama-server` (llama.cpp). Metal /
+  CUDA / Vulkan / D3D12 acceleration depending on host
+  platform. Authentication is per-session bearer token via
+  `--api-key` (carried over from Phase 11 Block D).
+  `mmproj_for` retains the GGUF projector paths for
+  multimodal Qwen2.5-VL and SmolVLM2 packs.
+- **Image generation** — `sd-server` (stable-diffusion.cpp,
+  [leejet/stable-diffusion.cpp][sd-cpp]). HTTP API:
+  `/sdapi/v1/txt2img` (Automatic1111-compatible request /
+  response shape) plus `/sdcpp/v1/capabilities` for
+  readiness probing. Loopback-only (`--listen-ip
+  127.0.0.1`) — sd-server's `--api-key` flag exists but the
+  loopback-bind + ephemeral-port allocation gives the same
+  no-network-egress guarantee that the Python sidecar had,
+  so auth is intentionally not enabled (no public-LAN
+  threat model). Operator overrides:
+  `KCREATE_SD_SERVER_BINARY` (absolute path),
+  `KCREATE_SD_SERVER_EXTRA_ARGS` (space-separated extra
+  CLI flags — typically `--clip_l … --t5xxl … --vae …` for
+  FLUX component models).
+- **Lifecycle parity.** `DiffusionSidecar` exposes the same
+  `Stopped → Starting → Ready → Stopped` state machine as
+  `LlmSidecar`, with a background `health_worker` thread
+  polling `/sdcpp/v1/capabilities` (HTTP 200 JSON) when
+  the `llm_sidecar` feature is enabled, and a raw TCP
+  connect fallback otherwise. Both sidecars allocate
+  loopback ports the same way (bind `127.0.0.1:0`, read
+  the kernel-assigned port back out, hand to the child).
+- **Model packs.** Three Ternary-Bonsai GGUF entries
+  (`llm_bonsai_1_7b`, `llm_bonsai_4b`, `llm_bonsai_8b`)
+  added to `static_packs()`. `recommended_llm_pack` is
+  tier-aware: Tier 0 → 1.7B, Tier 1 → 4B, Tier 2/3 → 8B.
+  Image gen still ships only FLUX.2-Klein-4B GGUF;
+  Bonsai-Image Ternary variants are gemlite / MLX 2-bit
+  and not loadable by sd.cpp's FLUX backend.
+- **Dispatcher.** `SidecarDispatcher` collapsed to a single
+  runtime arm (`SidecarRuntime::LlamaServer`).
+  `SidecarHandle` retains the enum shape (one variant for
+  now) so a future Rust-native inference engine can be
+  added without re-typing every consumer.
+  `DispatchPlan` no longer carries an `mlx_available`
+  parameter. `gguf_fallback_for_mlx_pack` is gone.
+- **Bridge.** `crates/kcreate_bridge/src/phase4.rs`
+  collapsed `VisionHandle` to `Llama` only; `vision_status`
+  reports `runtime: "llama_server"` exclusively;
+  `image_gen_start` constructs `DiffusionSidecarConfig`
+  via two new helpers (`sd_server_binary`,
+  `parse_sd_server_extra_args`).
+  `apps/desktop/shared/scene.ts` mirrors the change:
+  `VisionStatus.runtime` is now
+  `"llama_server" | null` (forward-compat for a future
+  Rust-native runtime variant).
+- **UI.** `ModelManager.tsx::filterPacksForTier` dropped
+  the `_mlx`-suffix branch. `ImageGenPanel.tsx` is
+  unchanged — the `kcreate.imageGen.*` IPC surface kept
+  the same shape, only the implementing sidecar swapped
+  underneath.
+- **Legacy pack-id migration.**
+  `kcreate_ai::model_registry::migrate_legacy_pack_id`
+  rewrites the three obsolete MLX ids
+  (`vision_smolvlm_256m_mlx`,
+  `vision_qwen25vl_7b_mlx`,
+  `image_gen_flux_klein_mlx`) to their current GGUF
+  equivalents. The bridge entry points (`vision_start`,
+  `image_gen_start`, `vision_mmproj_for`) funnel through
+  a single `resolve_pack_id` helper that consults the
+  migration table before any dispatcher lookup, so a
+  user upgrading from a Phase 4–11 install whose project
+  file or settings JSON still names an `_mlx` pack sees
+  a transparent rewrite (with a `log::warn!` deprecation
+  notice) rather than an opaque `ModelMissing` error.
+  The dispatcher itself is unchanged — it sees a current
+  id or surfaces missing; the migration table is a
+  user-facing UX layer, not part of the dispatch contract.
+- **Operator override quoting.** Phase 12 originally
+  parsed `KCREATE_SD_SERVER_EXTRA_ARGS` with naive
+  whitespace splitting, which dropped the second half
+  of any Windows path containing spaces. The follow-up
+  Devin-Review pass replaced the parser with
+  `shell-words` (POSIX shell-word rules: double / single
+  quoting plus backslash escapes), so operators can pass
+  `--clip_l "C:\Program Files\sd-models\clip_l.sft"`
+  literally. Mismatched quotes surface as
+  `Phase4BridgeError::Invalid` instead of a silently
+  truncated argv.
+- **Local-first invariant.** Zero new network crates.
+  Both sidecars are subprocesses; the HTTP clients
+  (`ureq`) live behind the `llm_sidecar` Cargo feature
+  and stay outside the editing-path closure walked by
+  `crates/kcreate_tests/tests/local_first.rs`.
+- **Deletions.** `crates/kcreate_ai/src/mlx_sidecar.rs`,
+  `tools/kcreate_diffusion/` (FastAPI + diffusers Python
+  daemon), every `_mlx`-suffixed pack ID,
+  `SidecarRuntime::MlxLm`,
+  `DispatchReason::MlxNative` / `MlxUnavailableFallback`,
+  `VisionHandle::Mlx`, `gguf_fallback_for_mlx_pack`,
+  `probe_mlx_available`. KCreate ships zero Python, zero
+  pip, zero PyTorch at runtime.
+
+Phase 12 carries forward (and re-verifies in HEAD) the
+Block D + E hardening originally specced in the audit but
+shipped in PR #27 (Phase 11): content-addressed image
+fingerprinting, R-tree spatial indexing, async N-API for
+raster + export ops, RwLock for workspace reads, LLM
+sidecar bearer-token auth with post-spawn TOCTOU
+verification, prototype transitions + animation engine,
+and component auto-layout propagation through instances
+with override preservation. No gaps were found; no extra
+work was needed in Phase 12 for those items.
+
+[sd-cpp]: https://github.com/leejet/stable-diffusion.cpp
+
 ## 18. Resource optimization
 
 - **Startup.** Lazy-load model packs; precompile no shaders we won't
@@ -2106,14 +2265,12 @@ crates/
                          # disconnect) to the same store.                                    [EXISTS]
 ```
 
-Also shipped under `tools/`:
-
-```
-tools/
-└── kcreate_diffusion/   # Loopback Python diffusion sidecar (FLUX.2-Klein-4B,
-                         # via huggingface diffusers; spawned by
-                         # `kcreate_ai::image_gen`, never networked).                       [EXISTS]
-```
+Phase 12 removed `tools/kcreate_diffusion/` (the Python FLUX
+sidecar); the entire `tools/` directory is gone. The diffusion
+sidecar is now `sd-server` from
+[stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp),
+resolved via `KCREATE_SD_SERVER_BINARY` or PATH lookup. See
+`crates/kcreate_ai/src/diffusion_sidecar.rs`.
 
 `kcreate_audit` shipped as part of Phase 6 (PR #16) and is wired into
 the rest of the workspace via `kcreate_bridge::audit`. It writes to a
@@ -2175,11 +2332,11 @@ structured queries by date / action / node.
 | KChat dev issuer             | Built    | `crates/kcreate_kchat/src/lib.rs`                    |
 | Fill editor (solid + gradient) | Built  | `apps/desktop/renderer/src/components/RightPanel.tsx` (FillSection) |
 | OCR text-region detection    | Built    | `crates/kcreate_ai/src/ocr.rs`                       |
-| Vision sidecar (VLM)         | Built    | `crates/kcreate_ai/src/{vision_chat,mlx_sidecar,sidecar_dispatcher}.rs` |
-| Image generation sidecar     | Built    | `crates/kcreate_ai/src/image_gen.rs`                 |
+| Vision sidecar (VLM)         | Built    | `crates/kcreate_ai/src/{vision_chat,sidecar_dispatcher}.rs` |
+| Image generation HTTP client | Built    | `crates/kcreate_ai/src/image_gen.rs`                 |
+| sd.cpp diffusion sidecar     | Built (Phase 12) | `crates/kcreate_ai/src/diffusion_sidecar.rs` |
 | Design critique / brand / crop / tokens / style | Built | `crates/kcreate_ai/src/{design_critique,brand_extract,smart_crop,design_tokens_vlm,style_describe}.rs` |
 | Operation journal            | Built    | `crates/kcreate_collab/src/journal.rs`               |
-| Diffusion Python sidecar     | Built    | `tools/kcreate_diffusion/server.py`                  |
 | Raster filter pipeline (Levels / Curves / blur / sharpen / crop / rotate / flip / heal) | Built (Phase 5) | `crates/kcreate_raster/src/{layer,filters,transform,heal}.rs` |
 | Raster ops bridge            | Built (Phase 5) | `crates/kcreate_bridge/src/raster_ops.rs`     |
 | Filters UI panel             | Built (Phase 5) | `apps/desktop/renderer/src/components/FiltersPanel.tsx` |

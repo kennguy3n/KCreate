@@ -22,7 +22,8 @@
 //! Bridge-side callers should always go through this module rather
 //! than building multimodal messages by hand — keeping the encoding
 //! contract in one place is what lets us swap the underlying
-//! sidecar (llama-server / mlx_lm.server) transparently.
+//! sidecar (currently llama-server, future Rust-native engines)
+//! transparently.
 
 use std::io::Cursor;
 

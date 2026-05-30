@@ -36,9 +36,8 @@ pub fn try_context() -> Option<&'static GpuComputeContext> {
         .get_or_init(|| {
             // The first call into wgpu can panic on broken systems.
             // `catch_unwind` keeps the bridge usable.
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
-                GpuComputeContext::try_new,
-            ));
+            let result =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(GpuComputeContext::try_new));
             match result {
                 Ok(Ok(ctx)) => ctx,
                 Ok(Err(err)) => {

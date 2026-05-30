@@ -1860,6 +1860,14 @@ pub fn session_start(
     // and the renderer can surface a "couldn't load ACL"
     // diagnostic via the audit channel.
     let (acl, acl_path) = load_project_acl(project_dir.as_deref());
+    // Phase 11 Block E follow-up round 4 — Devin Review ANALYSIS-0008
+    // (r4). `load_project_acl` is now a pure read; trigger the
+    // one-time plaintext→encrypted migration here from
+    // session_start, which is the canonical write-context entry
+    // point for opening a project. No-op for plaintext projects,
+    // for projects already migrated, or for sessions started
+    // without a project directory.
+    migrate_legacy_plaintext_acl_if_needed(project_dir.as_deref(), &acl);
 
     let mut state = SessionState {
         host,
@@ -3771,10 +3779,7 @@ fn current_project_encryption_key() -> Option<[u8; 32]> {
 
 /// Phase 7 (Task 21) + Phase 11 Block E Task 27 — load the project
 /// ACL from disk. Looks for `acl.json.enc` first (encrypted
-/// projects); falls back to plaintext `acl.json` otherwise. On a
-/// successful plaintext load against an encrypted project, the ACL
-/// is auto-migrated by writing the encrypted form and deleting the
-/// plaintext copy so subsequent saves don't keep both around.
+/// projects); falls back to plaintext `acl.json` otherwise.
 ///
 /// A missing file, unreadable file, unparseable content, or
 /// AEAD-authentication failure all degrade gracefully to
@@ -3784,6 +3789,16 @@ fn current_project_encryption_key() -> Option<[u8; 32]> {
 /// is always the *plaintext* file name so `save_project_acl` has a
 /// stable canonical anchor — the actual on-disk filename it writes
 /// to (encrypted or not) is rederived from the current key.
+///
+/// Phase 11 Block E follow-up round 4 — Devin Review ANALYSIS-0008
+/// (r4). This function is a **pure read** as of the round-4
+/// refactor. The plaintext→encrypted auto-migration that used to
+/// live here as a side effect now lives in the explicit
+/// [`migrate_legacy_plaintext_acl_if_needed`] helper, which is
+/// called once from [`session_start`] after the workspace key is
+/// available. That keeps `load_project_acl` safe to call from any
+/// read context (including `with_workspace`-held read locks)
+/// without surprise filesystem writes.
 fn load_project_acl(
     project_dir: Option<&std::path::Path>,
 ) -> (kcreate_collab::ProjectAcl, Option<std::path::PathBuf>) {
@@ -3866,39 +3881,64 @@ fn load_project_acl(
         }
     };
 
-    // Phase 11 Block E Task 27 — auto-migration. If the project is
-    // encrypted but only a plaintext ACL exists on disk, re-encrypt
-    // and remove the plaintext file so the SQLCipher protection
-    // extends to ACL metadata going forward. Failures are logged
-    // and tolerated — the in-memory ACL is correct either way.
-    if let Some(key) = encryption_key.as_ref() {
-        if plaintext_path.exists() {
-            match serde_json::to_vec_pretty(&acl) {
-                Ok(json_bytes) => match kcreate_collab::encrypt_acl_bytes(key, &json_bytes) {
-                    Ok(blob) => match std::fs::write(&encrypted_path, &blob) {
-                        Ok(()) => {
-                            if let Err(e) = std::fs::remove_file(&plaintext_path) {
-                                tracing::warn!(
-                                    "collab: ACL auto-migration: could not delete plaintext {} ({e})",
-                                    plaintext_path.display()
-                                );
-                            }
-                        }
-                        Err(e) => tracing::warn!(
-                            "collab: ACL auto-migration: write {} failed ({e})",
-                            encrypted_path.display()
-                        ),
-                    },
-                    Err(e) => {
-                        tracing::warn!("collab: ACL auto-migration: encrypt failed ({e})");
-                    }
-                },
-                Err(e) => tracing::warn!("collab: ACL auto-migration: serialize failed ({e})"),
-            }
-        }
-    }
-
     (acl, Some(plaintext_path))
+}
+
+/// Phase 11 Block E Task 27 + round 4 — explicit plaintext→encrypted
+/// ACL migration. Extracted out of [`load_project_acl`] (which is now
+/// a pure read) so the migration only fires from contexts that
+/// expect filesystem mutations. [`session_start`] calls this once
+/// after loading the ACL, while holding the workspace write
+/// guard, so the encrypted blob lands atomically with the rest of
+/// the session-start side effects.
+///
+/// Behaviour: if `project_dir` is set, the workspace has a derived
+/// key, and a legacy plaintext `acl.json` is sitting next to the
+/// encrypted database, this re-serialises the in-memory ACL under
+/// the SQLCipher derived key, writes it to `acl.json.enc`, and
+/// deletes the plaintext copy. Failures are logged + tolerated —
+/// the in-memory ACL is correct either way, and the next
+/// `save_project_acl` round will retry the encryption naturally.
+/// No-op on plaintext projects, when the file is already absent,
+/// or when no key is available.
+fn migrate_legacy_plaintext_acl_if_needed(
+    project_dir: Option<&std::path::Path>,
+    acl: &kcreate_collab::ProjectAcl,
+) {
+    let Some(dir) = project_dir else { return };
+    let Some(key) = current_project_encryption_key() else { return };
+    let plaintext_path = dir.join(ACL_FILENAME);
+    let encrypted_path = dir.join(ACL_FILENAME_ENC);
+    if !plaintext_path.exists() {
+        return;
+    }
+    let json_bytes = match serde_json::to_vec_pretty(acl) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!("collab: ACL auto-migration: serialize failed ({e})");
+            return;
+        }
+    };
+    let blob = match kcreate_collab::encrypt_acl_bytes(&key, &json_bytes) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!("collab: ACL auto-migration: encrypt failed ({e})");
+            return;
+        }
+    };
+    if let Err(e) = std::fs::write(&encrypted_path, &blob) {
+        tracing::warn!(
+            "collab: ACL auto-migration: write {} failed ({e})",
+            encrypted_path.display()
+        );
+        return;
+    }
+    if let Err(e) = std::fs::remove_file(&plaintext_path) {
+        tracing::warn!(
+            "collab: ACL auto-migration: could not delete plaintext {} ({e})",
+            plaintext_path.display()
+        );
+    }
 }
 
 /// Phase 7 (Task 21) + Phase 11 Block E Task 27 — persist the ACL

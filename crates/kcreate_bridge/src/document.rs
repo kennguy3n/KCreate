@@ -4036,11 +4036,21 @@ fn smart_animate_layers_from_snapshot(
 /// This is read-only — it does *not* mutate the active variant. The
 /// renderer calls [`component_switch_variant`] to commit the change
 /// once its animation has finished.
+///
+/// Phase 11 Block D follow-up round 4 — Devin Review BUG-0001 (r4).
+/// This entry point is documented read-only in `scene.ts` and
+/// `lib.rs` and only ever calls `guard.as_ref()`. Holding the
+/// workspace `RwLock` in `write()` mode for a pure read serialises
+/// concurrent readers (tree view, selection inspector, renderer
+/// version polling) for the duration of the snapshot — directly
+/// undoing the Phase 11 Block D RwLock work documented in
+/// ARCHITECTURE.md §17p. Acquire `read()` instead so concurrent
+/// readers stay parallel.
 pub fn component_smart_animate_snapshot(
     node_id: Uuid,
     target_variant_id: Uuid,
 ) -> Result<SmartAnimateSnapshot> {
-    let guard = slot().write();
+    let guard = slot().read();
     let ws = guard.as_ref().ok_or(DocumentBridgeError::NoProject)?;
     let node = ws
         .project

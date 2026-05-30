@@ -333,15 +333,29 @@ pub struct ExportPngTask {
 }
 
 impl Task for ExportPngTask {
-    type Output = u32;
-    type JsValue = u32;
+    // Phase 11 Block B follow-up round 4 — Devin Review ANALYSIS-0005
+    // (r4). The pre-Phase-11 sync `export_png` returned
+    // `u32::try_from(bytes).unwrap_or(u32::MAX)` — i.e. **silently**
+    // capped the byte count for files >4 GB, so a caller asking
+    // "how big is my export?" got a wrong-but-finite number. The
+    // first Phase 11 port replaced the silent cap with a hard
+    // `Promise` rejection, which is more correct but also a
+    // user-facing behaviour change for the same overflow regime.
+    // The right architectural fix is to remove the overflow regime
+    // altogether: return the byte count as `f64` (which is what JS
+    // `number` already is on the wire), giving us a precise integer
+    // up to 2^53 bytes (≈9 PB) before any rounding. The N-API
+    // export already advertises `Promise<number>` to TypeScript,
+    // so this changes nothing for callers — it just preserves the
+    // upper bits and eliminates the regression vs the sync API.
+    type Output = f64;
+    type JsValue = f64;
 
     fn compute(&mut self) -> NapiResult<Self::Output> {
         let opts = serde_json::from_str(&self.options_json)
             .map_err(|e| NapiError::from_reason(format!("invalid export_png options JSON: {e}")))?;
         let bytes = document::export_png_file(&self.output_path, &opts).map_err(map_doc_err)?;
-        u32::try_from(bytes)
-            .map_err(|_| NapiError::from_reason("export_png byte count overflows u32"))
+        Ok(bytes as f64)
     }
 
     fn resolve(&mut self, _env: Env, output: Self::Output) -> NapiResult<Self::JsValue> {
@@ -356,15 +370,19 @@ pub struct ExportPdfTask {
 }
 
 impl Task for ExportPdfTask {
-    type Output = u32;
-    type JsValue = u32;
+    // Phase 11 Block B follow-up round 4 — Devin Review ANALYSIS-0005
+    // (r4). Same rationale as `ExportPngTask` above: return the byte
+    // count as `f64` so the precision matches the wire-level
+    // `Promise<number>` contract and we don't silently cap or hard
+    // error on >4 GB exports.
+    type Output = f64;
+    type JsValue = f64;
 
     fn compute(&mut self) -> NapiResult<Self::Output> {
         let opts = serde_json::from_str(&self.options_json)
             .map_err(|e| NapiError::from_reason(format!("invalid export_pdf options JSON: {e}")))?;
         let bytes = document::export_pdf_file(&self.output_path, &opts).map_err(map_doc_err)?;
-        u32::try_from(bytes)
-            .map_err(|_| NapiError::from_reason("export_pdf byte count overflows u32"))
+        Ok(bytes as f64)
     }
 
     fn resolve(&mut self, _env: Env, output: Self::Output) -> NapiResult<Self::JsValue> {

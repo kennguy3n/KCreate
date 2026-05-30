@@ -872,21 +872,38 @@ export function animationLayers(
         },
       };
     case "slide_out":
+      // Phase 11 Block C follow-up round 4 — Devin Review
+      // ANALYSIS-0003 (r4). Figma's "Slide out → <direction>"
+      // means the outgoing content exits in that direction. The
+      // previous code passed `-clampedP`, which sent the outgoing
+      // layer the OPPOSITE way (slide_out + left moved the layer
+      // to the right). Flipped the sign so direction describes
+      // the visible motion of the outgoing layer, matching Figma
+      // semantics that designers using KCreate already expect.
       return {
         outgoing: {
-          transform: slideTransform(direction, -clampedP),
+          transform: slideTransform(direction, clampedP),
           opacity: 1,
         },
         incoming: { opacity: 1 },
       };
     case "push":
+      // Phase 11 Block C follow-up round 4 — Devin Review
+      // ANALYSIS-0003 (r4). Figma's "Push → <direction>" slides
+      // both layers in <direction>: the outgoing layer exits in
+      // <direction>, and the incoming layer enters from the
+      // OPPOSITE side (so it appears to push the outgoing one
+      // off). Previous code had the outgoing exiting the wrong
+      // way AND the incoming entering from the wrong side. Now:
+      // outgoing translates 0 → +direction (Figma exit); incoming
+      // translates −direction → 0 (Figma entry from opposite).
       return {
         outgoing: {
-          transform: slideTransform(direction, -clampedP),
+          transform: slideTransform(direction, clampedP),
           opacity: 1,
         },
         incoming: {
-          transform: slideTransform(direction, 1 - clampedP),
+          transform: slideTransform(direction, clampedP - 1),
           opacity: 1,
         },
       };

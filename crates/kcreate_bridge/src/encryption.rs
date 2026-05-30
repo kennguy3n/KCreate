@@ -80,10 +80,19 @@ pub fn passphrase_strength(passphrase: &str) -> PassphraseStrength {
 /// and the manifest carries the encryption metadata.
 pub fn enable_encryption(passphrase: &str) -> Result<EncryptionStatus> {
     with_workspace_mut(|ws| {
-        ws.store.lock()
-            .enable_encryption(passphrase)
-            .map_err(map_store_err)?;
-        let store = ws.store.lock();
+        // Phase 11 Block E follow-up round 4 — Devin Review
+        // ANALYSIS-0006 (r4). Hold one `MutexGuard` for the
+        // duration of the encrypt-then-read-manifest sequence
+        // instead of dropping and re-acquiring across the
+        // semicolon. The workspace `RwLock` write guard already
+        // serialises external readers, so the brief unlock/relock
+        // window cannot be raced — but consolidating to a single
+        // guard avoids the round-trip through the `parking_lot`
+        // mutex queue and makes the "manifest is observed
+        // immediately after the write" invariant explicit at the
+        // type level.
+        let mut store = ws.store.lock();
+        store.enable_encryption(passphrase).map_err(map_store_err)?;
         let meta = store.manifest().encryption.as_ref().ok_or_else(|| {
             DocumentBridgeError::Internal(
                 "enable_encryption succeeded but manifest is missing metadata".to_string(),

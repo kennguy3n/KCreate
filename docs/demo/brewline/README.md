@@ -4,7 +4,7 @@
 
 **Test environment:** Headless Linux VM, x86_64, CPU-only (no GPU adapter). KCreate built from `main` @ commit `7416758` (Phase 11 merged). Electron + native Rust bridge (`libkcreate_bridge.so`, 437 MB debug build) loaded via `process.dlopen()`. No internet egress during the demo — confirmed by `/etc/network/no-internet` sentinel and by the AI panels' "Network: None" markers.
 
-**Recording:** see `kcreate-brewline-demo-edited.mp4` (attached). 24 structured annotations covering 11 named `it(...)` style tests.
+**Recording:** [`./recording.mp4`](./recording.mp4) (2.7 MB) — 24 structured annotations covering 11 named `it(...)` style tests. The annotation timeline ships alongside as [`./recording-annotations.json`](./recording-annotations.json) (the JSON's `recording_id` field is `kcreate-brewline-demo`, the stable internal identifier from the recorder; the filename is `recording.mp4` for repo-relative simplicity).
 
 ---
 

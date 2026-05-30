@@ -59,6 +59,7 @@ pub use brand_template::{
 };
 pub use color_range::{pack_mask, select_by_color_range};
 pub use denoise::{denoise, DenoiseError, DenoiseOptions};
+pub use diffusion_sidecar::{DiffusionSidecar, DiffusionSidecarConfig};
 pub use glyph_extract::{
     extract_glyph, ExtractedGlyph, GlyphCrop, GlyphExtractError, GlyphExtractOptions, GlyphMetrics,
 };
@@ -68,7 +69,6 @@ pub use layout_suggest::{
     suggest_layout_grouping, Bounds as LayoutBounds, LayoutAlignment, LayoutNode,
     LayoutOrientation, LayoutSuggestError, LayoutSuggestOptions, LayoutSuggestion,
 };
-pub use diffusion_sidecar::{DiffusionSidecar, DiffusionSidecarConfig};
 pub use llm_chat::{
     build_system_prompt, build_tool_call_system_prompt, chat_completion,
     chat_completion_with_token, parse_completion, request_tool_call, ChatContent, ChatError,

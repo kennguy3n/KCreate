@@ -142,11 +142,10 @@ pub fn generate_image(port: u16, req: &ImageGenRequest) -> ImageGenResult<Genera
     let parsed: A1111Response = resp
         .into_json()
         .map_err(|e| ImageGenError::Decode(e.to_string()))?;
-    let first = parsed
-        .images
-        .into_iter()
-        .next()
-        .ok_or_else(|| ImageGenError::Decode("sd-server returned empty `images` array".into()))?;
+    let first =
+        parsed.images.into_iter().next().ok_or_else(|| {
+            ImageGenError::Decode("sd-server returned empty `images` array".into())
+        })?;
     // The HTTP path uses the lenient variant so a future model pack
     // whose architecture rounds dimensions (e.g. SDXL's multiple-of-8
     // requirement) doesn't get rejected at the decode boundary —
@@ -269,7 +268,9 @@ mod tests {
     #[test]
     fn decode_png_payload_strips_data_uri_prefix() {
         use base64::Engine as _;
-        let pixels: Vec<u8> = vec![0, 0, 0, 255, 255, 255, 255, 255, 128, 0, 128, 255, 0, 128, 0, 255];
+        let pixels: Vec<u8> = vec![
+            0, 0, 0, 255, 255, 255, 255, 255, 128, 0, 128, 255, 0, 128, 0, 255,
+        ];
         let img: image::RgbaImage = image::ImageBuffer::from_raw(2, 2, pixels.clone()).unwrap();
         let mut png_bytes: Vec<u8> = Vec::new();
         image::DynamicImage::ImageRgba8(img)
@@ -343,8 +344,7 @@ mod tests {
         // Same payload through the strict variant must fail when
         // the expectation doesn't match — this is the contract
         // difference the split exists for.
-        let err =
-            decode_png_payload(&b64, 17, 17).expect_err("strict must reject mismatched dims");
+        let err = decode_png_payload(&b64, 17, 17).expect_err("strict must reject mismatched dims");
         assert!(matches!(err, ImageGenError::Decode(_)));
     }
 
@@ -388,8 +388,7 @@ mod tests {
                 let pixels: Vec<u8> = vec![
                     10, 20, 30, 255, 40, 50, 60, 255, 70, 80, 90, 255, 100, 110, 120, 255,
                 ];
-                let img: image::RgbaImage =
-                    image::ImageBuffer::from_raw(2, 2, pixels).unwrap();
+                let img: image::RgbaImage = image::ImageBuffer::from_raw(2, 2, pixels).unwrap();
                 let mut png_bytes: Vec<u8> = Vec::new();
                 image::DynamicImage::ImageRgba8(img)
                     .write_to(

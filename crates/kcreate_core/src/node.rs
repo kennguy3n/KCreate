@@ -1112,8 +1112,7 @@ impl<'de> Deserialize<'de> for InteractionTrigger {
                     "mouse_enter" => Ok(InteractionTrigger::MouseEnter),
                     "mouse_leave" => Ok(InteractionTrigger::MouseLeave),
                     "after_delay" => {
-                        let ms =
-                            ms.ok_or_else(|| serde::de::Error::missing_field("ms"))?;
+                        let ms = ms.ok_or_else(|| serde::de::Error::missing_field("ms"))?;
                         Ok(InteractionTrigger::AfterDelay { ms })
                     }
                     other => Err(serde::de::Error::unknown_variant(
@@ -1150,8 +1149,16 @@ pub enum EasingCurve {
     EaseOut,
     #[default]
     EaseInOut,
-    Spring { stiffness: f32, damping: f32 },
-    CubicBezier { x1: f32, y1: f32, x2: f32, y2: f32 },
+    Spring {
+        stiffness: f32,
+        damping: f32,
+    },
+    CubicBezier {
+        x1: f32,
+        y1: f32,
+        x2: f32,
+        y2: f32,
+    },
 }
 
 /// `Transition::animation` variants.
@@ -2143,12 +2150,13 @@ mod tests {
         // `transition` field. `#[serde(default = "default_transition")]`
         // must round-trip those into the legacy Instant default.
         let target = Uuid::new_v4();
-        let legacy = format!(
-            r#"{{"kind":"navigate_to","target_artboard_id":"{target}"}}"#
-        );
+        let legacy = format!(r#"{{"kind":"navigate_to","target_artboard_id":"{target}"}}"#);
         let parsed: InteractionAction = serde_json::from_str(&legacy).expect("parse");
         match parsed {
-            InteractionAction::NavigateTo { transition, target_artboard_id } => {
+            InteractionAction::NavigateTo {
+                transition,
+                target_artboard_id,
+            } => {
                 assert_eq!(target_artboard_id, target);
                 assert_eq!(transition.animation, AnimationType::Instant);
                 assert_eq!(transition.duration_ms, Transition::default_duration_ms());
@@ -2194,8 +2202,7 @@ mod tests {
             },
         };
         let json = serde_json::to_string(&action).expect("serialize");
-        let back: InteractionAction =
-            serde_json::from_str(&json).expect("deserialize");
+        let back: InteractionAction = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back, action);
     }
 

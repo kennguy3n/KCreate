@@ -558,10 +558,8 @@ mod tests {
     /// load.
     #[test]
     fn config_defaults_have_cold_load_budget() {
-        let cfg = DiffusionSidecarConfig::new(
-            PathBuf::from("sd-server"),
-            PathBuf::from("flux.gguf"),
-        );
+        let cfg =
+            DiffusionSidecarConfig::new(PathBuf::from("sd-server"), PathBuf::from("flux.gguf"));
         assert!(cfg.health_timeout >= Duration::from_secs(30));
         assert!(cfg.extra_args.is_empty());
     }
@@ -571,10 +569,8 @@ mod tests {
     /// `image_gen_status` before any `start` call.
     #[test]
     fn new_sidecar_is_stopped() {
-        let cfg = DiffusionSidecarConfig::new(
-            PathBuf::from("sd-server"),
-            PathBuf::from("flux.gguf"),
-        );
+        let cfg =
+            DiffusionSidecarConfig::new(PathBuf::from("sd-server"), PathBuf::from("flux.gguf"));
         let sidecar = DiffusionSidecar::new(cfg);
         assert!(matches!(sidecar.status(), SidecarStatus::Stopped));
         assert!(!sidecar.is_ready());

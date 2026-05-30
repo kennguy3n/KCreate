@@ -131,7 +131,8 @@ fn install_processed_raster(
     }
     with_workspace_mut(|ws| {
         let blob = ws
-            .store.lock()
+            .store
+            .lock()
             .blobs()
             .store(&png_bytes, "image/png")
             .map_err(|e| DocumentBridgeError::Internal(format!("blob store: {e}")))?;

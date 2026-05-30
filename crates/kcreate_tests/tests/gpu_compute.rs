@@ -140,10 +140,8 @@ fn levels_brighten_increases_average_luma() {
         .levels_curves(&rgba, width, height, &lut, false)
         .expect("levels brighten dispatch");
     let pixel_count = f64::from(width) * f64::from(height);
-    let avg_in: f64 =
-        rgba.iter().step_by(4).map(|v| f64::from(*v)).sum::<f64>() / pixel_count;
-    let avg_out: f64 =
-        out.iter().step_by(4).map(|v| f64::from(*v)).sum::<f64>() / pixel_count;
+    let avg_in: f64 = rgba.iter().step_by(4).map(|v| f64::from(*v)).sum::<f64>() / pixel_count;
+    let avg_out: f64 = out.iter().step_by(4).map(|v| f64::from(*v)).sum::<f64>() / pixel_count;
     assert!(
         avg_out > avg_in,
         "levels brighten lowered luma: in={avg_in}, out={avg_out}"

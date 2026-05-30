@@ -160,11 +160,11 @@ impl PinnedCertVerifier {
         expected_fingerprint: [u8; PIN_SHA256_LEN],
         root_store: Arc<RootCertStore>,
     ) -> Result<Arc<Self>, ClientError> {
-        let inner = WebPkiServerVerifier::builder(root_store).build().map_err(|e| {
-            ClientError::InvalidPinnedCertificate {
+        let inner = WebPkiServerVerifier::builder(root_store)
+            .build()
+            .map_err(|e| ClientError::InvalidPinnedCertificate {
                 message: format!("failed to build WebPKI verifier: {e}"),
-            }
-        })?;
+            })?;
         Ok(Arc::new(Self {
             expected_fingerprint,
             inner,
@@ -185,8 +185,13 @@ impl ServerCertVerifier for PinnedCertVerifier {
         //    period validation. If this fails, the error is the
         //    normal "untrusted/expired/wrong-name" surface — we
         //    don't reveal the pin even existed yet.
-        self.inner
-            .verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now)?;
+        self.inner.verify_server_cert(
+            end_entity,
+            intermediates,
+            server_name,
+            ocsp_response,
+            now,
+        )?;
 
         // 2. Additionally, the leaf must hash to the pinned
         //    fingerprint. Constant-time comparison so an attacker

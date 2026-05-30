@@ -1137,8 +1137,7 @@ mod tests {
         let server = tiny_http::Server::http(format!("127.0.0.1:{port}")).expect("server");
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let stop_for_thread = std::sync::Arc::clone(&stop);
-        let captured_auth =
-            std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let captured_auth = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let captured_for_thread = std::sync::Arc::clone(&captured_auth);
         let handle = std::thread::spawn(move || {
             for req in server.incoming_requests() {
@@ -1152,10 +1151,18 @@ mod tests {
                 let auth = req
                     .headers()
                     .iter()
-                    .find(|h| h.field.as_str().as_str().eq_ignore_ascii_case("authorization"))
+                    .find(|h| {
+                        h.field
+                            .as_str()
+                            .as_str()
+                            .eq_ignore_ascii_case("authorization")
+                    })
                     .map(|h| h.value.as_str().to_string())
                     .unwrap_or_default();
-                captured_for_thread.lock().expect("captured-auth lock").push(auth);
+                captured_for_thread
+                    .lock()
+                    .expect("captured-auth lock")
+                    .push(auth);
                 let resp = tiny_http::Response::from_string("unauthorized")
                     .with_status_code(tiny_http::StatusCode(401));
                 let _ = req.respond(resp);
@@ -1192,8 +1199,7 @@ mod tests {
         let server = tiny_http::Server::http(format!("127.0.0.1:{port}")).expect("server");
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let stop_for_thread = std::sync::Arc::clone(&stop);
-        let captured_auth =
-            std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let captured_auth = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let captured_for_thread = std::sync::Arc::clone(&captured_auth);
         let handle = std::thread::spawn(move || {
             for req in server.incoming_requests() {
@@ -1203,10 +1209,18 @@ mod tests {
                 let auth = req
                     .headers()
                     .iter()
-                    .find(|h| h.field.as_str().as_str().eq_ignore_ascii_case("authorization"))
+                    .find(|h| {
+                        h.field
+                            .as_str()
+                            .as_str()
+                            .eq_ignore_ascii_case("authorization")
+                    })
                     .map(|h| h.value.as_str().to_string())
                     .unwrap_or_default();
-                captured_for_thread.lock().expect("captured-auth lock").push(auth.clone());
+                captured_for_thread
+                    .lock()
+                    .expect("captured-auth lock")
+                    .push(auth.clone());
                 // Mimic a real llama-server that enforces --api-key:
                 // 200 only when the bearer header matches what we
                 // were told to expect. Verifier's positive case must

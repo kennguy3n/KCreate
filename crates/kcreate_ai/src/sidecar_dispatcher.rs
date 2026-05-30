@@ -293,8 +293,7 @@ mod tests {
     #[test]
     fn vision_pack_on_llama_server_resolves_mmproj() {
         let dir = tempfile::tempdir().unwrap();
-        let plan =
-            plan_dispatch("vision_smolvlm2_256m", dir.path(), Platform::LinuxX64).unwrap();
+        let plan = plan_dispatch("vision_smolvlm2_256m", dir.path(), Platform::LinuxX64).unwrap();
         assert_eq!(plan.runtime, SidecarRuntime::LlamaServer);
         assert!(plan.mmproj_path.is_some());
         assert!(plan
@@ -310,10 +309,13 @@ mod tests {
     #[test]
     fn vision_pack_dispatch_is_platform_agnostic() {
         let dir = tempfile::tempdir().unwrap();
-        let linux =
-            plan_dispatch("vision_qwen25vl_7b", dir.path(), Platform::LinuxX64).unwrap();
-        let mac =
-            plan_dispatch("vision_qwen25vl_7b", dir.path(), Platform::MacOsAppleSilicon).unwrap();
+        let linux = plan_dispatch("vision_qwen25vl_7b", dir.path(), Platform::LinuxX64).unwrap();
+        let mac = plan_dispatch(
+            "vision_qwen25vl_7b",
+            dir.path(),
+            Platform::MacOsAppleSilicon,
+        )
+        .unwrap();
         assert_eq!(linux, mac);
         assert_eq!(linux.runtime, SidecarRuntime::LlamaServer);
         assert!(linux

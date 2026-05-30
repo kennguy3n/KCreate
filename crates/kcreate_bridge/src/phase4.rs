@@ -439,8 +439,9 @@ fn resolve_pack_id(pack_id: &str) -> String {
 /// Process-lifetime dedup set for the legacy-pack migration warning.
 /// Module-level so the test-only reset helper below can reach the
 /// same backing store as `log_legacy_pack_migration_once`.
-static LEGACY_PACK_WARN_SEEN: std::sync::OnceLock<parking_lot::Mutex<std::collections::HashSet<String>>> =
-    std::sync::OnceLock::new();
+static LEGACY_PACK_WARN_SEEN: std::sync::OnceLock<
+    parking_lot::Mutex<std::collections::HashSet<String>>,
+> = std::sync::OnceLock::new();
 
 fn legacy_pack_warn_seen() -> &'static parking_lot::Mutex<std::collections::HashSet<String>> {
     LEGACY_PACK_WARN_SEEN.get_or_init(|| parking_lot::Mutex::new(std::collections::HashSet::new()))
@@ -1053,7 +1054,10 @@ mod tests {
     /// an opaque missing-file message.
     #[test]
     fn parse_sd_extra_args_mismatched_quotes_errors() {
-        let r = with_sd_extra_args(Some(r#"--clip_l "unterminated"#), parse_sd_server_extra_args);
+        let r = with_sd_extra_args(
+            Some(r#"--clip_l "unterminated"#),
+            parse_sd_server_extra_args,
+        );
         match r {
             Err(Phase4BridgeError::Invalid(msg)) => {
                 assert!(

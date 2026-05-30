@@ -200,8 +200,12 @@ impl GpuComputeContext {
     ) -> Self {
         let (blur_pipeline, blur_bind_layout) =
             build_pipeline(&device, "blur", GAUSSIAN_WGSL, BindKind::FourBuffer);
-        let (lut_pipeline, lut_bind_layout) =
-            build_pipeline(&device, "levels-curves", LEVELS_CURVES_WGSL, BindKind::FourBuffer);
+        let (lut_pipeline, lut_bind_layout) = build_pipeline(
+            &device,
+            "levels-curves",
+            LEVELS_CURVES_WGSL,
+            BindKind::FourBuffer,
+        );
         let (unsharp_pipeline, unsharp_bind_layout) = build_pipeline(
             &device,
             "unsharp-mask",
@@ -260,11 +264,13 @@ impl GpuComputeContext {
         let weights = build_gaussian_kernel(sigma);
         let weights_bytes = bytemuck_f32_slice(&weights);
 
-        let input_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("compute-blur-input"),
-            contents: bytemuck_u32_slice(&input_packed),
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-        });
+        let input_buf = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("compute-blur-input"),
+                contents: bytemuck_u32_slice(&input_packed),
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            });
         let intermediate_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("compute-blur-intermediate"),
             size: buf_size,
@@ -277,11 +283,13 @@ impl GpuComputeContext {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
-        let weights_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("compute-blur-weights"),
-            contents: weights_bytes,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-        });
+        let weights_buf = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("compute-blur-weights"),
+                contents: weights_bytes,
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            });
 
         // Pass 1: horizontal blur, input -> intermediate.
         self.encode_blur_pass(
@@ -325,11 +333,13 @@ impl GpuComputeContext {
             width,
             height,
         };
-        let params_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("compute-blur-params"),
-            contents: bytemuck_one(&params),
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        });
+        let params_buf = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("compute-blur-params"),
+                contents: bytemuck_one(&params),
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            });
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("compute-blur-bind"),
             layout: &self.blur_bind_layout,
@@ -392,16 +402,20 @@ impl GpuComputeContext {
         let buf_size = (pixel_count * std::mem::size_of::<u32>()) as u64;
         let input_packed = pack_rgba_to_u32(rgba);
 
-        let input_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("compute-lut-input"),
-            contents: bytemuck_u32_slice(&input_packed),
-            usage: wgpu::BufferUsages::STORAGE,
-        });
-        let lut_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("compute-lut-table"),
-            contents: bytemuck_f32_slice(lut),
-            usage: wgpu::BufferUsages::STORAGE,
-        });
+        let input_buf = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("compute-lut-input"),
+                contents: bytemuck_u32_slice(&input_packed),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
+        let lut_buf = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("compute-lut-table"),
+                contents: bytemuck_f32_slice(lut),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
         let output_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("compute-lut-output"),
             size: buf_size,
@@ -414,11 +428,13 @@ impl GpuComputeContext {
             apply_alpha: u32::from(apply_alpha),
             _pad: 0,
         };
-        let params_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("compute-lut-params"),
-            contents: bytemuck_one(&params),
-            usage: wgpu::BufferUsages::UNIFORM,
-        });
+        let params_buf = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("compute-lut-params"),
+                contents: bytemuck_one(&params),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
 
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("compute-lut-bind"),
@@ -454,7 +470,11 @@ impl GpuComputeContext {
             });
             pass.set_pipeline(&self.lut_pipeline);
             pass.set_bind_group(0, &bind_group, &[]);
-            pass.dispatch_workgroups(width.div_ceil(WORKGROUP_DIM), height.div_ceil(WORKGROUP_DIM), 1);
+            pass.dispatch_workgroups(
+                width.div_ceil(WORKGROUP_DIM),
+                height.div_ceil(WORKGROUP_DIM),
+                1,
+            );
         }
         self.queue.submit(Some(encoder.finish()));
 
@@ -483,16 +503,20 @@ impl GpuComputeContext {
         let original_packed = pack_rgba_to_u32(rgba);
         let blurred_packed = pack_rgba_to_u32(&blurred);
 
-        let original_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("compute-unsharp-original"),
-            contents: bytemuck_u32_slice(&original_packed),
-            usage: wgpu::BufferUsages::STORAGE,
-        });
-        let blurred_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("compute-unsharp-blurred"),
-            contents: bytemuck_u32_slice(&blurred_packed),
-            usage: wgpu::BufferUsages::STORAGE,
-        });
+        let original_buf = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("compute-unsharp-original"),
+                contents: bytemuck_u32_slice(&original_packed),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
+        let blurred_buf = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("compute-unsharp-blurred"),
+                contents: bytemuck_u32_slice(&blurred_packed),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
         let output_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("compute-unsharp-output"),
             size: buf_size,
@@ -505,11 +529,13 @@ impl GpuComputeContext {
             amount,
             threshold: f32::from(threshold) / 255.0,
         };
-        let params_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("compute-unsharp-params"),
-            contents: bytemuck_one(&params),
-            usage: wgpu::BufferUsages::UNIFORM,
-        });
+        let params_buf = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("compute-unsharp-params"),
+                contents: bytemuck_one(&params),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
 
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("compute-unsharp-bind"),
@@ -545,7 +571,11 @@ impl GpuComputeContext {
             });
             pass.set_pipeline(&self.unsharp_pipeline);
             pass.set_bind_group(0, &bind_group, &[]);
-            pass.dispatch_workgroups(width.div_ceil(WORKGROUP_DIM), height.div_ceil(WORKGROUP_DIM), 1);
+            pass.dispatch_workgroups(
+                width.div_ceil(WORKGROUP_DIM),
+                height.div_ceil(WORKGROUP_DIM),
+                1,
+            );
         }
         self.queue.submit(Some(encoder.finish()));
 
@@ -751,9 +781,9 @@ pub fn build_curves_lut(points: &[(f32, f32)]) -> Vec<f32> {
         .map(|i| {
             let t = i as f32 / 255.0;
             // Binary search the segment containing `t`.
-            let (left, right) = match anchors.binary_search_by(|p| {
-                p.0.partial_cmp(&t).unwrap_or(std::cmp::Ordering::Equal)
-            }) {
+            let (left, right) = match anchors
+                .binary_search_by(|p| p.0.partial_cmp(&t).unwrap_or(std::cmp::Ordering::Equal))
+            {
                 Ok(idx) => return anchors[idx].1.clamp(0.0, 1.0),
                 Err(idx) => {
                     let l = idx.saturating_sub(1).min(anchors.len() - 1);
@@ -839,7 +869,10 @@ fn bytemuck_one<T: Copy>(value: &T) -> &[u8] {
     // the `T` and has the same lifetime, so no aliasing or
     // lifetime-extension is possible.
     unsafe {
-        std::slice::from_raw_parts(std::ptr::from_ref(value).cast::<u8>(), std::mem::size_of::<T>())
+        std::slice::from_raw_parts(
+            std::ptr::from_ref(value).cast::<u8>(),
+            std::mem::size_of::<T>(),
+        )
     }
 }
 

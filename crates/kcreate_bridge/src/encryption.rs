@@ -114,7 +114,8 @@ pub fn enable_encryption(passphrase: &str) -> Result<EncryptionStatus> {
 /// rekey can hand SQLCipher the correct "unlock" key.
 pub fn change_passphrase(old_passphrase: &str, new_passphrase: &str) -> Result<()> {
     with_workspace_mut(|ws| {
-        ws.store.lock()
+        ws.store
+            .lock()
             .change_passphrase(old_passphrase, new_passphrase)
             .map_err(map_store_err)
     })
@@ -130,7 +131,8 @@ pub fn change_passphrase(old_passphrase: &str, new_passphrase: &str) -> Result<(
 /// Windows-side WAL contention from a second concurrent reader.
 pub fn export_plaintext_recovery(passphrase: &str, output_path: PathBuf) -> Result<PathBuf> {
     with_workspace_mut(|ws| {
-        ws.store.lock()
+        ws.store
+            .lock()
             .export_plaintext_recovery(passphrase, &output_path)
             .map_err(map_store_err)
     })

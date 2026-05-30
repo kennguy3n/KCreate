@@ -247,11 +247,21 @@ fn emit_outlines(doc: &mut Document, entries: &[(String, ObjectId)]) -> ObjectId
 }
 
 /// Embed a pixmap as an `/XObject /Image` and return its id.
+///
+/// When every pixel is fully opaque (alpha == 255), we skip the
+/// separate `DeviceGray` SMask XObject entirely — that mask is purely
+/// overhead for opaque content, and document pages produced by the
+/// kcreate SVG pipeline are opaque the overwhelming majority of the
+/// time. Without this gate, a typical multi-page document carries
+/// `width * height` bytes of all-`0xFF` mask per page that PDF viewers
+/// must decompress and composite for no visual difference. The
+/// fully-opaque detection is folded into the single un-premultiply
+/// pass below so we don't pay an extra `O(n)` scan for the
+/// optimisation.
 fn embed_pixmap(doc: &mut Document, pixmap: &Pixmap) -> ObjectId {
     let w = pixmap.width();
     let h = pixmap.height();
-    // Convert RGBA → RGB and harvest the alpha channel separately;
-    // PDF doesn't accept RGBA inline streams without a soft mask.
+    // Convert RGBA → RGB and (optionally) harvest the alpha channel.
     //
     // CRUCIAL: `tiny_skia::Pixmap::data()` returns *premultiplied*
     // RGBA. PDF (per ISO 32000-1 §11.6.4) applies the SMask alpha
@@ -263,10 +273,12 @@ fn embed_pixmap(doc: &mut Document, pixmap: &Pixmap) -> ObjectId {
     let raw = pixmap.data();
     let mut rgb = Vec::with_capacity((w * h * 3) as usize);
     let mut alpha = Vec::with_capacity((w * h) as usize);
+    let mut fully_opaque = true;
     for chunk in raw.chunks_exact(4) {
         let a = u16::from(chunk[3]);
         if a == 0 {
             rgb.extend_from_slice(&[0, 0, 0]);
+            fully_opaque = false;
         } else if a == 255 {
             rgb.extend_from_slice(&chunk[..3]);
         } else {
@@ -275,35 +287,34 @@ fn embed_pixmap(doc: &mut Document, pixmap: &Pixmap) -> ObjectId {
             let g = ((u16::from(chunk[1]) * 255 + a / 2) / a).min(255) as u8;
             let b = ((u16::from(chunk[2]) * 255 + a / 2) / a).min(255) as u8;
             rgb.extend_from_slice(&[r, g, b]);
+            fully_opaque = false;
         }
         alpha.push(chunk[3]);
     }
 
-    let alpha_id = doc.add_object(Stream::new(
-        dictionary! {
-            "Type" => "XObject",
-            "Subtype" => "Image",
-            "Width" => Object::Integer(i64::from(w)),
-            "Height" => Object::Integer(i64::from(h)),
-            "ColorSpace" => "DeviceGray",
-            "BitsPerComponent" => Object::Integer(8),
-        },
-        alpha,
-    ));
-
-    let img = Stream::new(
-        dictionary! {
-            "Type" => "XObject",
-            "Subtype" => "Image",
-            "Width" => Object::Integer(i64::from(w)),
-            "Height" => Object::Integer(i64::from(h)),
-            "ColorSpace" => "DeviceRGB",
-            "BitsPerComponent" => Object::Integer(8),
-            "SMask" => alpha_id,
-        },
-        rgb,
-    );
-    doc.add_object(img)
+    let mut img_dict = dictionary! {
+        "Type" => "XObject",
+        "Subtype" => "Image",
+        "Width" => Object::Integer(i64::from(w)),
+        "Height" => Object::Integer(i64::from(h)),
+        "ColorSpace" => "DeviceRGB",
+        "BitsPerComponent" => Object::Integer(8),
+    };
+    if !fully_opaque {
+        let alpha_id = doc.add_object(Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Image",
+                "Width" => Object::Integer(i64::from(w)),
+                "Height" => Object::Integer(i64::from(h)),
+                "ColorSpace" => "DeviceGray",
+                "BitsPerComponent" => Object::Integer(8),
+            },
+            alpha,
+        ));
+        img_dict.set("SMask", alpha_id);
+    }
+    doc.add_object(Stream::new(img_dict, rgb))
 }
 
 enum RasterError {
@@ -377,6 +388,95 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, PdfMultiError::ZeroPageSize(0)));
+    }
+
+    fn collect_image_xobject_dicts(doc: &Document) -> Vec<lopdf::Dictionary> {
+        let mut out = Vec::new();
+        for obj in doc.objects.values() {
+            if let Object::Stream(stream) = obj {
+                if stream
+                    .dict
+                    .get(b"Subtype")
+                    .and_then(Object::as_name_str)
+                    .ok()
+                    == Some("Image")
+                {
+                    out.push(stream.dict.clone());
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn fully_opaque_pixmap_does_not_emit_smask() {
+        // Regression for the SMask-overhead-on-opaque-pages bug:
+        // when every pixel has alpha=255 there is no visual reason
+        // to carry a separate DeviceGray soft-mask object. The
+        // optimisation must:
+        //   1. drop the `SMask` key from the colour image dict, and
+        //   2. *not* add a second Image XObject (the alpha mask).
+        let mut doc = Document::with_version("1.7");
+        let mut pixmap = Pixmap::new(8, 8).unwrap();
+        // Fill every pixel solid red, alpha=255.
+        for px in pixmap.pixels_mut() {
+            *px = resvg::tiny_skia::PremultipliedColorU8::from_rgba(255, 0, 0, 255).unwrap();
+        }
+        embed_pixmap(&mut doc, &pixmap);
+        let images = collect_image_xobject_dicts(&doc);
+        assert_eq!(
+            images.len(),
+            1,
+            "opaque page must emit exactly one image XObject; got {}",
+            images.len()
+        );
+        let dict = &images[0];
+        assert!(
+            dict.get(b"SMask").is_err(),
+            "opaque page must not carry an SMask reference"
+        );
+    }
+
+    #[test]
+    fn translucent_pixmap_still_emits_smask() {
+        // The opacity fast-path must NOT regress alpha handling — a
+        // single semi-transparent pixel still needs the SMask object
+        // or PDF viewers will composite the page against black and
+        // darken transparent regions (the round-9 JPEG bug all over
+        // again, but in PDF form).
+        let mut doc = Document::with_version("1.7");
+        let mut pixmap = Pixmap::new(8, 8).unwrap();
+        for px in pixmap.pixels_mut() {
+            *px = resvg::tiny_skia::PremultipliedColorU8::from_rgba(255, 0, 0, 255).unwrap();
+        }
+        // Make exactly one pixel partially transparent. We have to
+        // store premultiplied bytes because that's what `Pixmap` keeps
+        // internally; a=128 over red→(128, 0, 0, 128).
+        *pixmap.pixels_mut().get_mut(0).unwrap() =
+            resvg::tiny_skia::PremultipliedColorU8::from_rgba(128, 0, 0, 128).unwrap();
+        embed_pixmap(&mut doc, &pixmap);
+        let images = collect_image_xobject_dicts(&doc);
+        assert_eq!(
+            images.len(),
+            2,
+            "translucent page must emit both colour + mask Image XObjects"
+        );
+        let with_smask = images.iter().filter(|d| d.get(b"SMask").is_ok()).count();
+        assert_eq!(with_smask, 1, "exactly one image must carry the SMask key");
+    }
+
+    #[test]
+    fn fully_transparent_pixmap_emits_smask() {
+        // A pixmap that is entirely transparent (alpha=0 everywhere)
+        // is the other end of the spectrum — it MUST still emit the
+        // SMask, otherwise viewers would render the zeroed RGB
+        // channels as solid black instead of "see-through" content.
+        let mut doc = Document::with_version("1.7");
+        let pixmap = Pixmap::new(4, 4).unwrap();
+        embed_pixmap(&mut doc, &pixmap);
+        let images = collect_image_xobject_dicts(&doc);
+        assert_eq!(images.len(), 2);
+        assert!(images.iter().any(|d| d.get(b"SMask").is_ok()));
     }
 
     #[test]

@@ -25,6 +25,12 @@ import { ImageGenPanel } from "./ImageGenPanel";
 import { LlmChatPanel } from "./LlmChatPanel";
 import { McpSettingsPanel } from "./McpSettingsPanel";
 import { ModelManager } from "./ModelManager";
+import {
+  AutoColorSection,
+  BriefToOnePagerSection,
+  DenoiseSection,
+  ReformatDeckSection,
+} from "./Phase10Sections";
 import { PluginManager } from "./PluginManager";
 import { VisionAssistSection } from "./VisionAssistSection";
 
@@ -177,6 +183,29 @@ export function AIAssistPanel({
       <hr style={separatorStyle} />
       <OcrSection
         selected={selectedNode}
+        onStatus={onStatus}
+        onApplied={onApplied}
+      />
+      <hr style={separatorStyle} />
+      <DenoiseSection
+        selected={selectedNode}
+        onStatus={onStatus}
+        onApplied={onApplied}
+      />
+      <hr style={separatorStyle} />
+      <AutoColorSection
+        selected={selectedNode}
+        onStatus={onStatus}
+        onApplied={onApplied}
+      />
+      <hr style={separatorStyle} />
+      <ReformatDeckSection
+        selected={selectedNode}
+        onStatus={onStatus}
+        onApplied={onApplied}
+      />
+      <hr style={separatorStyle} />
+      <BriefToOnePagerSection
         onStatus={onStatus}
         onApplied={onApplied}
       />

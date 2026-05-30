@@ -55,7 +55,8 @@ use kcreate_export::pdf_multi::{
     export_pdf_multi_pages, PdfMultiError, PdfMultiOptions, PdfMultiReport,
 };
 use kcreate_export::smart_compress::{
-    smart_compress, SmartCompressFormat, SmartCompressOptions, SmartCompressReport,
+    rgba_to_rgb_over_white, smart_compress, SmartCompressFormat, SmartCompressOptions,
+    SmartCompressReport,
 };
 use kcreate_export::svg_optimize::{optimize_svg, SvgOptimizeReport};
 use serde::{Deserialize, Serialize};
@@ -912,13 +913,21 @@ pub fn export_preview(req: ExportPreviewRequest) -> Result<ExportPreviewResponse
             "image/png"
         }
         "jpeg" | "jpg" => {
+            // JPEG is opaque — passing RGBA8 straight to the encoder
+            // either errors at runtime or silently drops alpha, which
+            // composites semi-transparent pixels against black and
+            // produces dark halos. Composite over white first (same
+            // behaviour as `smart_compress`'s JPEG branch so the
+            // preview and the final compressed export agree
+            // byte-for-byte on transparency handling).
+            let rgb = rgba_to_rgb_over_white(resized.as_raw());
             let mut cursor = std::io::Cursor::new(&mut bytes);
             image::write_buffer_with_format(
                 &mut cursor,
-                resized.as_raw(),
+                &rgb,
                 pw,
                 ph,
-                image::ColorType::Rgba8,
+                image::ColorType::Rgb8,
                 image::ImageFormat::Jpeg,
             )
             .map_err(|e| DocumentBridgeError::Internal(format!("preview encode JPEG: {e}")))?;

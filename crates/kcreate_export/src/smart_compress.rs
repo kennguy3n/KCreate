@@ -239,7 +239,16 @@ fn decode_to_rgba(
     }
 }
 
-fn rgba_to_rgb_over_white(rgba: &[u8]) -> Vec<u8> {
+/// Composite an RGBA buffer onto an opaque white background and
+/// return the resulting `Rgb8` byte stream. JPEG (and any other
+/// alpha-less encoder) needs this — passing RGBA pixels straight to
+/// a JPEG encoder either errors at runtime or silently drops the
+/// alpha channel, which composites semi-transparent pixels against
+/// black and produces dark halos. Reused by `kcreate_bridge`'s
+/// export-preview path so JPEG previews match smart-compress output
+/// byte-for-byte in their transparency handling.
+#[must_use]
+pub fn rgba_to_rgb_over_white(rgba: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(rgba.len() / 4 * 3);
     for chunk in rgba.chunks_exact(4) {
         let r = u16::from(chunk[0]);
@@ -446,5 +455,44 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, SmartCompressError::BadTarget(_)));
+    }
+
+    #[test]
+    fn rgba_to_rgb_over_white_composites_against_white_not_black() {
+        // Regression for the JPEG-with-alpha bug: a 50%-alpha mid-grey
+        // pixel must composite to a *lighter* colour over white, not a
+        // darker one (which is what a naive "drop alpha" would produce
+        // because most encoders default to a black backdrop).
+        // 128 * 0.5 + 255 * 0.5 = 191.5 → rounds to 191.
+        let rgba = [128, 128, 128, 128];
+        let rgb = rgba_to_rgb_over_white(&rgba);
+        assert_eq!(rgb.len(), 3);
+        assert!(
+            rgb[0] >= 190 && rgb[0] <= 192,
+            "expected composite ~191, got {}",
+            rgb[0]
+        );
+        assert!(rgb[1] >= 190 && rgb[1] <= 192);
+        assert!(rgb[2] >= 190 && rgb[2] <= 192);
+    }
+
+    #[test]
+    fn rgba_to_rgb_over_white_opaque_pixels_pass_through() {
+        // Alpha 255 must drop straight through unchanged — composite
+        // formula reduces to `c` so any drift here would indicate a
+        // rounding bug.
+        let rgba = [10, 20, 30, 255];
+        let rgb = rgba_to_rgb_over_white(&rgba);
+        assert_eq!(rgb, vec![10, 20, 30]);
+    }
+
+    #[test]
+    fn rgba_to_rgb_over_white_transparent_pixels_become_white() {
+        // Alpha 0 means the source contributes nothing — the result
+        // must be opaque white, not the source RGB (which would be a
+        // common bug where the encoder ignores alpha entirely).
+        let rgba = [10, 20, 30, 0];
+        let rgb = rgba_to_rgb_over_white(&rgba);
+        assert_eq!(rgb, vec![255, 255, 255]);
     }
 }

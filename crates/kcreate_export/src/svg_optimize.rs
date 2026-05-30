@@ -8,8 +8,9 @@
 //! - collapse runs of whitespace to single spaces,
 //! - remove whitespace surrounding tag boundaries,
 //! - drop empty `<g>` groups (recursively),
-//! - drop default attribute values (`fill="black"`, `stroke="none"`,
-//!   `opacity="1"`, `fill-opacity="1"`),
+//! - drop default values for the **non-inherited** `opacity` attribute
+//!   only (see [`strip_default_attrs`] for why inherited properties
+//!   are intentionally left untouched),
 //! - shorten path data coordinates to a configurable precision.
 //!
 //! The minifier is deliberately string-only — bringing in a full
@@ -177,21 +178,25 @@ fn strip_doctype_and_xml(s: &str) -> String {
 }
 
 fn strip_default_attrs(s: &str) -> String {
-    // Default attribute values that are safe to drop because the SVG
-    // initial-value table already implies them. Each pattern starts
-    // with a leading space so we only match them when they appear as
-    // a discrete attribute (not as a suffix of a longer attribute name
-    // like `data-fill="black"`).
-    const DEFAULTS: &[&[u8]] = &[
-        b" fill=\"black\"",
-        b" fill=\"#000\"",
-        b" fill=\"#000000\"",
-        b" stroke=\"none\"",
-        b" opacity=\"1\"",
-        b" fill-opacity=\"1\"",
-        b" stroke-opacity=\"1\"",
-        b" stroke-width=\"1\"",
-    ];
+    // Only attributes whose SVG property is **not inherited** can be
+    // safely stripped by a string-level optimiser. For an inherited
+    // property such as `fill`, `stroke`, `fill-opacity`,
+    // `stroke-opacity` or `stroke-width`, an explicit value on a
+    // child element might be deliberately overriding a non-default
+    // value cascading down from an ancestor — e.g.
+    // `<g fill="red"><text fill="black">x</text></g>`. Stripping
+    // the child's `fill="black"` would silently flip the text to
+    // red. A full AST-based optimiser (SVGO's
+    // `removeUselessStrokeAndFill`) handles this by walking the
+    // ancestor cascade; this string-only optimiser deliberately
+    // refuses to strip those attributes. `opacity` is the one
+    // historically-listed default that is genuinely safe because
+    // SVG declares it non-inherited (initial value `1`).
+    //
+    // Each pattern starts with a leading space so we only match
+    // them when they appear as a discrete attribute (not as a
+    // suffix of a longer attribute name like `data-opacity="1"`).
+    const DEFAULTS: &[&[u8]] = &[b" opacity=\"1\""];
     // State machine identical in shape to `collapse_whitespace` below:
     // we track `in_attr` so a default-looking substring that happens
     // to live inside an attribute value (e.g. `data-info='set
@@ -587,13 +592,58 @@ mod tests {
     }
 
     #[test]
-    fn default_attrs_are_stripped() {
+    fn default_opacity_is_stripped() {
+        // `opacity` is the one historically-listed default that the
+        // SVG spec marks as non-inherited (initial value `1`), so it
+        // is the only attribute we can strip without walking the
+        // ancestor cascade.
         let svg =
             r#"<svg><rect width="10" height="10" fill="black" stroke="none" opacity="1"/></svg>"#;
         let r = optimize_svg(svg).unwrap();
-        assert!(!r.output_svg.contains("fill=\"black\""));
-        assert!(!r.output_svg.contains("stroke=\"none\""));
         assert!(!r.output_svg.contains("opacity=\"1\""));
+    }
+
+    #[test]
+    fn inherited_default_attrs_are_preserved() {
+        // Inherited properties (`fill`, `stroke`, `fill-opacity`,
+        // `stroke-opacity`, `stroke-width`) might be deliberately
+        // overriding a non-default value cascading down from an
+        // ancestor (e.g. `<g fill="red"><text fill="black">` —
+        // stripping `fill="black"` would flip the text to red).
+        // The string-only optimiser cannot reason about ancestors,
+        // so it deliberately leaves those attributes in place.
+        let svg = concat!(
+            r#"<svg><g fill="red" stroke="blue">"#,
+            r#"<text fill="black" stroke="none" fill-opacity="1" "#,
+            r#"stroke-opacity="1" stroke-width="1">hi</text>"#,
+            "</g></svg>",
+        );
+        let r = optimize_svg(svg).unwrap();
+        assert!(
+            r.output_svg.contains(r#"fill="black""#),
+            "inherited fill=black must NOT be stripped: {}",
+            r.output_svg
+        );
+        assert!(
+            r.output_svg.contains(r#"stroke="none""#),
+            "inherited stroke=none must NOT be stripped: {}",
+            r.output_svg
+        );
+        assert!(
+            r.output_svg.contains(r#"fill-opacity="1""#),
+            "inherited fill-opacity=1 must NOT be stripped: {}",
+            r.output_svg
+        );
+        assert!(
+            r.output_svg.contains(r#"stroke-opacity="1""#),
+            "inherited stroke-opacity=1 must NOT be stripped: {}",
+            r.output_svg
+        );
+        assert!(
+            r.output_svg.contains(r#"stroke-width="1""#),
+            "inherited stroke-width=1 must NOT be stripped: {}",
+            r.output_svg
+        );
     }
 
     #[test]
@@ -603,11 +653,11 @@ mod tests {
         // any attribute value that happened to contain a literal
         // attribute-assignment substring (e.g. a `data-info` blob).
         // The state-machine version must leave the body of
-        // `data-info='set fill="black" as default'` intact while
+        // `data-info='set opacity="1" as default'` intact while
         // still stripping the genuine default attribute that follows.
         let svg = concat!(
             "<svg>",
-            r#"<rect data-info='set fill="black" as default' fill="black"/>"#,
+            r#"<rect data-info='set opacity="1" as default' opacity="1"/>"#,
             "</svg>",
         );
         let r = optimize_svg(svg).unwrap();
@@ -615,12 +665,12 @@ mod tests {
         // preserved verbatim.
         assert!(
             r.output_svg
-                .contains(r#"data-info='set fill="black" as default'"#),
+                .contains(r#"data-info='set opacity="1" as default'"#),
             "attribute value corrupted: {}",
             r.output_svg
         );
         // The genuine default has been stripped — only ONE literal
-        // ` fill="black"` remained after the strip, and it lived
+        // ` opacity="1"` remained after the strip, and it lived
         // inside the protected data-info value (preserved above).
         // We assert there's no occurrence of the default outside that
         // protected span by checking that the rect tag closes
@@ -758,17 +808,18 @@ mod tests {
 
     #[test]
     fn strip_default_attrs_does_not_touch_text_bodies() {
-        // The literal ` fill="black"` inside a <text> body must not
-        // be deleted by strip_default_attrs.
-        let svg = r#"<svg><text>example fill="black" inline</text><rect fill="black"/></svg>"#;
+        // The literal ` opacity="1"` inside a <text> body must not
+        // be deleted by strip_default_attrs (which acts only on
+        // unprotected regions).
+        let svg = r#"<svg><text>example opacity="1" inline</text><rect opacity="1"/></svg>"#;
         let r = optimize_svg(svg).unwrap();
         assert!(
-            r.output_svg.contains(r#"example fill="black" inline"#),
+            r.output_svg.contains(r#"example opacity="1" inline"#),
             "text body lost literal: {}",
             r.output_svg
         );
         // The actual rect attribute is still stripped.
-        assert!(!r.output_svg.contains(r#"<rect fill="black""#));
+        assert!(!r.output_svg.contains(r#"<rect opacity="1""#));
     }
 
     #[test]

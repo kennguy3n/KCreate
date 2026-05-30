@@ -101,20 +101,38 @@ fn svg_optimize_strips_empty_groups() {
 }
 
 #[test]
-fn svg_optimize_strips_default_attribute_values() {
+fn svg_optimize_strips_default_opacity_but_preserves_inherited_properties() {
+    // `opacity` is non-inherited per the SVG spec (initial value 1),
+    // so it is safe to drop without ancestor-cascade analysis. The
+    // string-only optimiser deliberately keeps inherited properties
+    // (`fill`, `stroke`, `fill-opacity`, `stroke-opacity`,
+    // `stroke-width`) in place because a child's explicit
+    // `fill="black"` might be overriding a non-default value
+    // cascading from an ancestor (e.g. `<g fill="red">`).
     let input = "<svg xmlns=\"http://www.w3.org/2000/svg\"><rect fill=\"black\" stroke=\"none\" opacity=\"1\" fill-opacity=\"1\"/></svg>";
     let report = optimize_svg(input).expect("optimize");
+    // Check for the discrete attribute with a leading space so we
+    // don't accidentally match the `opacity="1"` suffix inside the
+    // preserved inherited `fill-opacity="1"` attribute.
     assert!(
-        !report.output_svg.contains("fill=\"black\""),
-        "default fill should be dropped"
+        !report.output_svg.contains(" opacity=\"1\""),
+        "non-inherited default opacity should be dropped: {}",
+        report.output_svg
     );
     assert!(
-        !report.output_svg.contains("stroke=\"none\""),
-        "default stroke should be dropped"
+        report.output_svg.contains("fill=\"black\""),
+        "inherited fill=black must NOT be dropped without ancestor analysis: {}",
+        report.output_svg
     );
     assert!(
-        !report.output_svg.contains("opacity=\"1\""),
-        "default opacity should be dropped"
+        report.output_svg.contains("stroke=\"none\""),
+        "inherited stroke=none must NOT be dropped without ancestor analysis: {}",
+        report.output_svg
+    );
+    assert!(
+        report.output_svg.contains("fill-opacity=\"1\""),
+        "inherited fill-opacity=1 must NOT be dropped without ancestor analysis: {}",
+        report.output_svg
     );
 }
 

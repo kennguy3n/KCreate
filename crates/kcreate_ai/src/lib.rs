@@ -13,6 +13,7 @@ pub mod alt_text;
 pub mod auto_color;
 pub mod bg_remove;
 pub mod brand_extract;
+pub mod brand_template;
 pub mod color_range;
 pub mod denoise;
 pub mod design_critique;
@@ -51,6 +52,10 @@ pub use auto_color::{auto_color_correct, AutoColorError, AutoColorMode, AutoColo
 pub use bg_remove::{
     apply_alpha_mask, remove_background, remove_background_with_backend, BgRemovalBackend,
     BgRemoveError, BgRemoveOptions,
+};
+pub use brand_template::{
+    plan_brochure, BrandTemplateError, BrochurePage, BrochurePlan, BrochureSection, PageGeometry,
+    DEFAULT_PAGE_HEIGHT, DEFAULT_PAGE_MARGIN, DEFAULT_PAGE_WIDTH, MAX_PAGES, MIN_PAGES,
 };
 pub use color_range::{pack_mask, select_by_color_range};
 pub use denoise::{denoise, DenoiseError, DenoiseOptions};

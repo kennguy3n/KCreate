@@ -15,7 +15,7 @@
 // to the host (`onMaskChanged`) so other Image Studio actions
 // (filter, crop, mask creation) can consume it.
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import type {
   SmartSelectAtPointResult,
@@ -60,17 +60,35 @@ export function MagicWandTool({
   const [tolerance, setTolerance] = useState<number>(TOLERANCE_DEFAULT);
   const [last, setLast] = useState<SmartSelectAtPointResult | null>(null);
   const [busy, setBusy] = useState(false);
+  // Two refs make the click handler concurrency-safe:
+  //
+  //  - `lastRef` mirrors the latest selection synchronously so the
+  //    NEXT `add`/`subtract` click sees the correct base mask even
+  //    if React hasn't flushed `setLast` yet (e.g. clicks fired
+  //    inside the same task as the awaited bridge call).
+  //  - `busyRef` lets the synchronous DOM click handler reject any
+  //    click that arrives while a previous bridge call is still in
+  //    flight. Without it, a rapid double-click would dispatch two
+  //    concurrent `aiSmartSelectAtPoint` calls; both would read the
+  //    same base mask, and whichever resolved second would overwrite
+  //    the first — silently dropping the intermediate add/subtract.
+  const lastRef = useRef<SmartSelectAtPointResult | null>(null);
+  const busyRef = useRef(false);
 
   const runSelect = useCallback(
     async (x: number, y: number, mode: SmartSelectMode) => {
       if (!nodeId) return;
+      busyRef.current = true;
       setBusy(true);
       try {
         // For Add / Subtract, hand the bridge the previous mask so
         // it can run the set-op server-side without round-tripping
-        // mask state through the renderer. `replace` ignores it.
+        // mask state through the renderer. `replace` ignores it. We
+        // read from `lastRef` instead of the `last` state value so a
+        // chain of add/subtract clicks composes correctly even when
+        // React batches the intermediate state updates.
         const previousMask =
-          mode === "replace" ? null : last?.maskBase64 ?? null;
+          mode === "replace" ? null : lastRef.current?.maskBase64 ?? null;
         const result = await window.kcreate.phase10.aiSmartSelectAtPoint(
           nodeId,
           Math.round(x),
@@ -79,6 +97,7 @@ export function MagicWandTool({
           mode,
           previousMask,
         );
+        lastRef.current = result;
         setLast(result);
         onMaskChanged(result);
         onStatus?.(
@@ -87,15 +106,21 @@ export function MagicWandTool({
       } catch (e) {
         onStatus?.(`magic-wand failed: ${errMsg(e)}`);
       } finally {
+        busyRef.current = false;
         setBusy(false);
       }
     },
-    [nodeId, tolerance, last, onMaskChanged, onStatus],
+    [nodeId, tolerance, onMaskChanged, onStatus],
   );
 
   useEffect(() => {
     if (!canvasEl || !nodeId) return;
     const onClick = (ev: MouseEvent) => {
+      // Drop clicks while a previous bridge call is still in flight.
+      // The wand state machine is intentionally non-queued: rapid
+      // double-clicks would otherwise race on `lastRef` and produce
+      // a non-deterministic mask.
+      if (busyRef.current) return;
       const canvasPt = viewportToCanvas(ev.clientX, ev.clientY);
       if (!canvasPt) return;
       const mode: SmartSelectMode = ev.shiftKey
@@ -110,6 +135,7 @@ export function MagicWandTool({
   }, [canvasEl, nodeId, viewportToCanvas, runSelect]);
 
   const clear = useCallback(() => {
+    lastRef.current = null;
     setLast(null);
     onMaskChanged(null);
   }, [onMaskChanged]);

@@ -180,11 +180,21 @@ pub fn export_pdf_multi_pages(
     doc.save(output_path)?;
     let bytes_written = std::fs::metadata(output_path).map_or(0, |m| m.len());
 
+    // `toc_emitted` reflects ACTUAL emission, not just the request
+    // flag. We represent the TOC through the PDF outline tree
+    // (bookmarks), so the TOC is materialised iff the user asked for
+    // it, AND we had pages to enumerate, AND the bookmarks side was
+    // actually written. If the caller asks for `include_toc=true` but
+    // disables bookmarks, there is no TOC in the output and we report
+    // that honestly. Without this, the field was a useless echo of
+    // the request and a consumer that branched on it would get the
+    // wrong answer.
+    let toc_emitted = options.include_toc && bookmarks_emitted && !toc_entries.is_empty();
+
     Ok(PdfMultiReport {
         page_count: pages.len() as u32,
         bytes_written,
-        toc_emitted: options.include_toc, // TOC is informational; we
-        // emit the page-mode hint via bookmarks above.
+        toc_emitted,
         bookmarks_emitted,
     })
 }

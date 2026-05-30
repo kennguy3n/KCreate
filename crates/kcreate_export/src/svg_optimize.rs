@@ -177,21 +177,81 @@ fn strip_doctype_and_xml(s: &str) -> String {
 }
 
 fn strip_default_attrs(s: &str) -> String {
-    let defaults = [
-        " fill=\"black\"",
-        " fill=\"#000\"",
-        " fill=\"#000000\"",
-        " stroke=\"none\"",
-        " opacity=\"1\"",
-        " fill-opacity=\"1\"",
-        " stroke-opacity=\"1\"",
-        " stroke-width=\"1\"",
+    // Default attribute values that are safe to drop because the SVG
+    // initial-value table already implies them. Each pattern starts
+    // with a leading space so we only match them when they appear as
+    // a discrete attribute (not as a suffix of a longer attribute name
+    // like `data-fill="black"`).
+    const DEFAULTS: &[&[u8]] = &[
+        b" fill=\"black\"",
+        b" fill=\"#000\"",
+        b" fill=\"#000000\"",
+        b" stroke=\"none\"",
+        b" opacity=\"1\"",
+        b" fill-opacity=\"1\"",
+        b" stroke-opacity=\"1\"",
+        b" stroke-width=\"1\"",
     ];
-    let mut s = s.to_string();
-    for needle in defaults {
-        s = s.replace(needle, "");
+    // State machine identical in shape to `collapse_whitespace` below:
+    // we track `in_attr` so a default-looking substring that happens
+    // to live inside an attribute value (e.g. `data-info='set
+    // fill=\"black\" as default'`) is never stripped. Without this
+    // guard a single-quoted value containing literal attribute-
+    // assignment syntax would be silently corrupted — unlikely in
+    // practice but documented as an inconsistency between the two
+    // rewrite functions' safety guarantees, so we close the gap.
+    let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    let mut in_attr = false;
+    let mut quote: u8 = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if in_attr {
+            out.push(c);
+            if c == quote {
+                in_attr = false;
+                quote = 0;
+            }
+            i += 1;
+            continue;
+        }
+        if c == b'"' || c == b'\'' {
+            out.push(c);
+            in_attr = true;
+            quote = c;
+            i += 1;
+            continue;
+        }
+        // Outside any attribute value: a leading space might begin
+        // one of the strippable default patterns. We also require
+        // the byte immediately after the pattern to be an attribute
+        // terminator (whitespace, `/`, or `>`) so we don't eat half
+        // of a longer attribute that happens to share a prefix.
+        let mut matched = false;
+        if c == b' ' {
+            for d in DEFAULTS {
+                if bytes[i..].starts_with(d) {
+                    let after = bytes.get(i + d.len()).copied();
+                    if matches!(
+                        after,
+                        Some(b) if b.is_ascii_whitespace() || b == b'/' || b == b'>'
+                    ) {
+                        i += d.len();
+                        matched = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if !matched {
+            out.push(c);
+            i += 1;
+        }
     }
-    s
+    // SAFETY: every byte we wrote is either copied unchanged from `s`
+    // or skipped. Copying bytes never breaks UTF-8 validity.
+    String::from_utf8(out).expect("strip_default_attrs preserves UTF-8")
 }
 
 /// Run `f` only on the slices of `s` that are not inside a preserved
@@ -534,6 +594,42 @@ mod tests {
         assert!(!r.output_svg.contains("fill=\"black\""));
         assert!(!r.output_svg.contains("stroke=\"none\""));
         assert!(!r.output_svg.contains("opacity=\"1\""));
+    }
+
+    #[test]
+    fn default_attr_substrings_inside_attribute_values_are_preserved() {
+        // Regression: strip_default_attrs used to walk a raw
+        // .replace() over the unprotected slice, which would corrupt
+        // any attribute value that happened to contain a literal
+        // attribute-assignment substring (e.g. a `data-info` blob).
+        // The state-machine version must leave the body of
+        // `data-info='set fill="black" as default'` intact while
+        // still stripping the genuine default attribute that follows.
+        let svg = concat!(
+            "<svg>",
+            r#"<rect data-info='set fill="black" as default' fill="black"/>"#,
+            "</svg>",
+        );
+        let r = optimize_svg(svg).unwrap();
+        // The attribute value containing the literal substring is
+        // preserved verbatim.
+        assert!(
+            r.output_svg
+                .contains(r#"data-info='set fill="black" as default'"#),
+            "attribute value corrupted: {}",
+            r.output_svg
+        );
+        // The genuine default has been stripped — only ONE literal
+        // ` fill="black"` remained after the strip, and it lived
+        // inside the protected data-info value (preserved above).
+        // We assert there's no occurrence of the default outside that
+        // protected span by checking that the rect tag closes
+        // immediately after data-info's closing quote.
+        assert!(
+            r.output_svg.contains(r"as default'/>"),
+            "expected stripped rect to close immediately after data-info; got: {}",
+            r.output_svg
+        );
     }
 
     #[test]

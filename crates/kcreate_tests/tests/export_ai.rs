@@ -423,8 +423,13 @@ fn pdf_multi_emits_bookmarks_when_requested() {
 }
 
 #[test]
-fn pdf_multi_emits_toc_first_page_when_requested() {
-    let tmp = tempfile_path("kcreate-pdf-multi-toc.pdf");
+fn pdf_multi_toc_alone_does_not_get_emitted() {
+    // The implementation materialises the TOC through the PDF
+    // outline (bookmark) tree. Asking for `include_toc=true` while
+    // turning off bookmarks therefore produces no TOC in the output,
+    // and `toc_emitted` must reflect that honestly — it must NOT
+    // echo the request flag.
+    let tmp = tempfile_path("kcreate-pdf-multi-toc-only.pdf");
     let pages: Vec<PdfPageInput> = (0..2).map(synth_page).collect();
     let opts = PdfMultiOptions {
         include_toc: true,
@@ -433,11 +438,42 @@ fn pdf_multi_emits_toc_first_page_when_requested() {
         raster_dpi: 72.0,
     };
     let report = export_pdf_multi_pages(&pages, &tmp, &opts).expect("pdf");
+    assert!(
+        !report.toc_emitted,
+        "toc cannot be emitted without the outline tree it lives in"
+    );
+    assert!(!report.bookmarks_emitted);
+    assert_eq!(report.page_count, pages.len() as u32);
+    std::fs::remove_file(&tmp).ok();
+}
+
+#[test]
+fn pdf_multi_emits_toc_via_outlines_when_both_requested() {
+    // When the caller asks for BOTH a TOC and bookmarks, the outline
+    // tree IS the TOC, so `toc_emitted` must be true.
+    let tmp = tempfile_path("kcreate-pdf-multi-toc.pdf");
+    let pages: Vec<PdfPageInput> = (0..2).map(synth_page).collect();
+    let opts = PdfMultiOptions {
+        include_toc: true,
+        include_bookmarks: true,
+        include_hyperlinks: false,
+        raster_dpi: 72.0,
+    };
+    let report = export_pdf_multi_pages(&pages, &tmp, &opts).expect("pdf");
     assert!(report.toc_emitted, "toc toggle should be honoured");
-    // TOC counts as an extra page prepended at the start.
-    assert!(report.page_count >= pages.len() as u32);
+    assert!(report.bookmarks_emitted);
+    assert_eq!(report.page_count, pages.len() as u32);
     let doc = lopdf::Document::load(&tmp).expect("load PDF");
     assert!(doc.get_pages().len() >= 2);
+    let catalog = doc
+        .get_object(doc.trailer.get(b"Root").unwrap().as_reference().unwrap())
+        .unwrap()
+        .as_dict()
+        .unwrap();
+    assert!(
+        catalog.has(b"Outlines"),
+        "outline tree must be present when toc + bookmarks are emitted"
+    );
     std::fs::remove_file(&tmp).ok();
 }
 

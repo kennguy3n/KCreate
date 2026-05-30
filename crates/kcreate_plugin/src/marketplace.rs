@@ -56,6 +56,44 @@ pub enum MarketplaceError {
     AlreadyInstalled(String),
     #[error("plugin_marketplace: plugin {0} is not installed")]
     NotInstalled(String),
+    #[error("plugin_marketplace: manifest.id {0:?} is not a safe path component")]
+    InvalidPluginId(String),
+}
+
+/// Validate that `id` is safe to use as a single path component
+/// under the plugin root. Rejects empty strings, anything containing
+/// path separators (`/` or `\`), parent-directory references
+/// (`..`), NUL bytes, or names that don't round-trip through
+/// `Path::file_name()`. This is the security gate for plugin
+/// install / remove because `manifest.id` comes from an untrusted
+/// bundle and is joined onto `plugin_root` to form a destination
+/// path. Without this check a hostile bundle could write to (or
+/// delete) arbitrary directories outside `~/.kcreate/plugins/`.
+fn validate_plugin_id(id: &str) -> Result<(), MarketplaceError> {
+    if id.is_empty() {
+        return Err(MarketplaceError::InvalidPluginId(id.into()));
+    }
+    if id.contains('/')
+        || id.contains('\\')
+        || id.contains('\0')
+        || id == "."
+        || id == ".."
+        || id.split(['/', '\\']).any(|seg| seg == "..")
+    {
+        return Err(MarketplaceError::InvalidPluginId(id.into()));
+    }
+    // Final sanity check: the id must round-trip through Path's
+    // own component extractor and equal itself. This catches
+    // OS-specific oddities (drive letters, UNC prefixes, etc.) that
+    // the explicit byte checks above might miss.
+    let p = Path::new(id);
+    if p.file_name().and_then(|s| s.to_str()) != Some(id) {
+        return Err(MarketplaceError::InvalidPluginId(id.into()));
+    }
+    if p.components().count() != 1 {
+        return Err(MarketplaceError::InvalidPluginId(id.into()));
+    }
+    Ok(())
 }
 
 /// Default location for installed plugins — `~/.kcreate/plugins/`.
@@ -93,13 +131,19 @@ impl PluginMarketplace {
         Self { plugin_dir }
     }
 
-    /// Enumerate installed plugins.
+    /// Enumerate installed plugins. Defensively skips any on-disk
+    /// manifest whose `id` would not pass [`validate_plugin_id`] — a
+    /// hostile id that somehow predates the install-time check
+    /// would otherwise be reachable via [`Self::remove`].
     pub fn list(&self) -> Result<Vec<PluginListing>, MarketplaceError> {
         self.ensure_dir()?;
         let mut reg = PluginRegistry::new(self.plugin_dir.clone());
         reg.scan()?;
         let mut out = Vec::new();
         for manifest in reg.list() {
+            if validate_plugin_id(&manifest.id).is_err() {
+                continue;
+            }
             let sig = reg.signature_status_for(&manifest.id).cloned();
             out.push(make_listing(manifest, sig.as_ref(), true));
         }
@@ -127,7 +171,8 @@ impl PluginMarketplace {
         let mut reg = PluginRegistry::new(self.plugin_dir.clone());
         reg.scan()?;
         let already = reg.list().iter().any(|m| {
-            m.id == manifest.id && Path::new(&staged_dir) != reg_dir_for(&self.plugin_dir, m)
+            m.id == manifest.id
+                && reg_dir_for(&self.plugin_dir, m).is_ok_and(|d| Path::new(&staged_dir) != d)
         });
         if already {
             let _ = fs::remove_dir_all(&staged_dir);
@@ -143,8 +188,12 @@ impl PluginMarketplace {
 
     /// Remove an installed plugin by id. Returns `true` if a plugin
     /// was actually removed; `false` if no plugin with that id was
-    /// installed.
+    /// installed. Rejects ids that aren't safe single path
+    /// components — even if a malicious manifest somehow got onto
+    /// disk, an attacker cannot turn `remove("../../evil")` into an
+    /// arbitrary directory deletion.
     pub fn remove(&self, id: &str) -> Result<bool, MarketplaceError> {
+        validate_plugin_id(id)?;
         self.ensure_dir()?;
         let mut reg = PluginRegistry::new(self.plugin_dir.clone());
         reg.scan()?;
@@ -152,7 +201,7 @@ impl PluginMarketplace {
             Some(m) => m.clone(),
             None => return Ok(false),
         };
-        let dir = reg_dir_for(&self.plugin_dir, &manifest);
+        let dir = reg_dir_for(&self.plugin_dir, &manifest)?;
         if dir.exists() {
             fs::remove_dir_all(&dir)?;
         }
@@ -201,12 +250,14 @@ fn trust_status_str(sig: Option<&SignatureStatus>) -> String {
     }
 }
 
-fn reg_dir_for(root: &Path, manifest: &PluginManifest) -> PathBuf {
-    root.join(&manifest.id)
+fn reg_dir_for(root: &Path, manifest: &PluginManifest) -> Result<PathBuf, MarketplaceError> {
+    validate_plugin_id(&manifest.id)?;
+    Ok(root.join(&manifest.id))
 }
 
 fn stage_from_dir(source: &Path, plugin_root: &Path) -> Result<PathBuf, MarketplaceError> {
     let (manifest, _raw) = PluginManifest::load_with_raw(source)?;
+    validate_plugin_id(&manifest.id)?;
     let dest = plugin_root.join(&manifest.id);
     if dest.exists() {
         return Err(MarketplaceError::AlreadyInstalled(manifest.id));
@@ -241,6 +292,10 @@ fn stage_from_zip(source: &Path, plugin_root: &Path) -> Result<PathBuf, Marketpl
         }
     }
     let (manifest, _raw) = PluginManifest::load_with_raw(&staging)?;
+    if let Err(e) = validate_plugin_id(&manifest.id) {
+        let _ = fs::remove_dir_all(&staging);
+        return Err(e);
+    }
     let dest = plugin_root.join(&manifest.id);
     if dest.exists() {
         let _ = fs::remove_dir_all(&staging);
@@ -290,6 +345,71 @@ mod tests {
         fs::write(dir.join("manifest.json"), manifest)?;
         fs::write(dir.join("plugin.wasm"), b"\0asm\x01\0\0\0")?;
         Ok(())
+    }
+
+    #[test]
+    fn validate_plugin_id_rejects_path_traversal() {
+        // Every shape an attacker might try to break out of the
+        // plugin root with must be rejected.
+        let bad = [
+            "",
+            ".",
+            "..",
+            "../evil",
+            "..\\evil",
+            "../../etc/passwd",
+            "a/b",
+            "a\\b",
+            "/abs",
+            "\\abs",
+            "foo\0bar",
+            "foo/../bar",
+        ];
+        for id in bad {
+            assert!(
+                validate_plugin_id(id).is_err(),
+                "expected {id:?} to be rejected"
+            );
+        }
+        // The legitimate id shapes used by real plugins must still
+        // pass.
+        for id in ["a", "plugin", "com.example.plugin", "my-plugin_v2"] {
+            assert!(validate_plugin_id(id).is_ok(), "expected {id:?} to pass");
+        }
+    }
+
+    #[test]
+    fn install_rejects_traversal_id_in_manifest() {
+        // A malicious plugin bundle with `id: "../../evil"` MUST be
+        // rejected before any directory is created outside the plugin
+        // root. We assert both that the install fails with
+        // `InvalidPluginId` AND that no escape directory was created.
+        let staging = TempDir::new().unwrap();
+        let plugins = TempDir::new().unwrap();
+        let src = staging.path().join("hostile");
+        fs::create_dir_all(&src).unwrap();
+        write_min_manifest(&src, "../../escape").unwrap();
+        let mp = PluginMarketplace::new(plugins.path().join("plugins"));
+        let err = mp.install_local(&src).unwrap_err();
+        assert!(
+            matches!(err, MarketplaceError::InvalidPluginId(_)),
+            "expected InvalidPluginId, got {err:?}"
+        );
+        // The plugin root itself was created by ensure_dir(); but no
+        // sibling "escape" directory should exist anywhere near it.
+        assert!(!plugins.path().join("escape").exists());
+        assert!(!plugins.path().parent().unwrap().join("escape").exists());
+    }
+
+    #[test]
+    fn remove_rejects_traversal_id() {
+        // Even if a hostile id somehow ends up in a `remove()` call,
+        // we must refuse it rather than turning it into
+        // `fs::remove_dir_all("../../something")`.
+        let plugins = TempDir::new().unwrap();
+        let mp = PluginMarketplace::new(plugins.path().to_path_buf());
+        let err = mp.remove("../../etc").unwrap_err();
+        assert!(matches!(err, MarketplaceError::InvalidPluginId(_)));
     }
 
     #[test]

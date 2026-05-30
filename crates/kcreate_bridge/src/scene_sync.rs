@@ -270,6 +270,15 @@ struct NodeCacheEntry {
     /// reverse-map entry must be restored. Includes the primary id
     /// for uniformity.
     sub_object_ids: Vec<ObjectId>,
+    /// The `z` advance the original emit produced, captured as
+    /// `z_after - z_before`. Today every leaf emitter increments `z`
+    /// by exactly one per emitted [`Object`], so this is identical to
+    /// `objects.len() as i32` — but storing the actual delta lets a
+    /// future emitter reserve z slots (e.g. for sub-layers) without
+    /// silently corrupting the replay path. Replay rebases the
+    /// stream's `z` by exactly this many units, regardless of how
+    /// many objects were cached.
+    z_advance: i32,
 }
 
 #[derive(Debug, Default)]
@@ -423,7 +432,15 @@ impl SceneSync {
         // `self.object_id_to_uuid` below.
         let cached_objects = entry.objects.clone();
         let sub_object_ids = entry.sub_object_ids.clone();
-        let advance = i32::try_from(cached_objects.len()).unwrap_or(i32::MAX);
+        // Use the recorded `z_advance` rather than the cached object
+        // count: replay must move the z stream by the same delta the
+        // original emit moved it, even if a future emitter chooses to
+        // skip slots (e.g. reserving z values for adjustment sub-
+        // layers). Coupling replay to `len()` looks innocent today
+        // because every leaf emitter is z+=1 per object, but it would
+        // silently produce mismatched z values the day that
+        // assumption changes.
+        let advance = entry.z_advance;
         for obj in cached_objects {
             let stored_z = obj.z;
             let mut cloned = obj;
@@ -454,7 +471,14 @@ impl SceneSync {
     /// the emit; cached `z` values are stored relative to `z_start`
     /// so the replay path can rebase them onto an arbitrary current
     /// `z`.
-    fn capture_cache(&mut self, node: &Node, objects: &[Object], obj_start: usize, z_start: i32) {
+    fn capture_cache(
+        &mut self,
+        node: &Node,
+        objects: &[Object],
+        obj_start: usize,
+        z_start: i32,
+        z_end: i32,
+    ) {
         let mut cached_objects = Vec::with_capacity(objects.len() - obj_start);
         let mut sub_ids = Vec::with_capacity(objects.len() - obj_start);
         for obj in &objects[obj_start..] {
@@ -463,12 +487,14 @@ impl SceneSync {
             snapshot.z = obj.z.saturating_sub(z_start);
             cached_objects.push(snapshot);
         }
+        let z_advance = z_end.saturating_sub(z_start);
         self.node_cache.insert(
             node.id,
             NodeCacheEntry {
                 version: node.version,
                 objects: cached_objects,
                 sub_object_ids: sub_ids,
+                z_advance,
             },
         );
         self.last_version.insert(node.id, node.version);
@@ -943,7 +969,7 @@ impl SceneSync {
                     let z_start = *z;
                     let obj_start = objects.len();
                     self.emit_vector(node, objects, z, emitted);
-                    self.capture_cache(node, objects, obj_start, z_start);
+                    self.capture_cache(node, objects, obj_start, z_start, *z);
                 }
                 clip
             }
@@ -960,7 +986,7 @@ impl SceneSync {
                     let obj_start = objects.len();
                     self.emit_raster(node, objects, z, blob_store, emitted);
                     if blob_store.is_some() {
-                        self.capture_cache(node, objects, obj_start, z_start);
+                        self.capture_cache(node, objects, obj_start, z_start, *z);
                     } else {
                         // Without a blob store, invalidate any prior
                         // cache so the next blob-bearing sync re-emits.
@@ -974,7 +1000,7 @@ impl SceneSync {
                     let z_start = *z;
                     let obj_start = objects.len();
                     self.emit_text(node, objects, z, emitted);
-                    self.capture_cache(node, objects, obj_start, z_start);
+                    self.capture_cache(node, objects, obj_start, z_start, *z);
                 }
                 clip
             }

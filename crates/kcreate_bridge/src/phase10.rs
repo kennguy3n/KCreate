@@ -981,41 +981,32 @@ pub fn import_ai(path: &str) -> std::result::Result<AiImportSummary, DocumentBri
 
 // ---------------------------------------------------------------------------
 // Block D Task 19 — Brand → brochure template
+//
+// The pure layout algorithm lives in
+// `kcreate_ai::brand_template::plan_brochure`. This module is the
+// workspace-aware adapter: it loads the brand kit from the active
+// project, hands the hex colour list off to the AI plan function,
+// and returns the resulting plan over N-API. Wire-format types are
+// re-exported as aliases so the renderer / scene.ts continue to
+// see the same `BrochurePlanResult`, `BrochurePage`, and
+// `BrochureSection` names.
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct BrochurePlanResult {
-    pub pages: Vec<BrochurePage>,
-    pub brand_kit_id: String,
-}
+pub use kcreate_ai::brand_template::{BrochurePage, BrochureSection};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct BrochurePage {
-    pub index: u32,
-    pub page_type: String,
-    pub sections: Vec<BrochureSection>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct BrochureSection {
-    pub section_kind: String,
-    pub x: f64,
-    pub y: f64,
-    pub width: f64,
-    pub height: f64,
-    pub style_color_hex: Option<String>,
-}
+/// Result envelope returned to the renderer. Re-exports
+/// [`kcreate_ai::brand_template::BrochurePlan`] under the bridge's
+/// historical name so existing wire-format consumers stay stable.
+pub type BrochurePlanResult = kcreate_ai::brand_template::BrochurePlan;
 
 /// Build a multi-page brochure layout plan for a brand kit.
 ///
+/// Looks up the brand kit on the active workspace, then delegates to
+/// [`kcreate_ai::brand_template::plan_brochure`] (the pure planner).
 /// Deterministic structural template: cover page (logo + headline +
 /// sub-headline), then alternating content pages (heading + body +
 /// image placeholder), then a back page (contact + brand colours).
 pub fn ai_brand_to_brochure(brand_kit_id: Uuid, num_pages: u32) -> Result<BrochurePlanResult> {
-    let n = num_pages.clamp(2, 32);
     let kit_colors = with_workspace(|ws| {
         let kit = ws
             .project
@@ -1025,104 +1016,19 @@ pub fn ai_brand_to_brochure(brand_kit_id: Uuid, num_pages: u32) -> Result<Brochu
             .ok_or_else(|| {
                 DocumentBridgeError::Internal(format!("brand kit {brand_kit_id} not found"))
             })?;
-        Ok(kit.colors.clone())
+        Ok(kit
+            .colors
+            .iter()
+            .map(|c| c.color.to_hex())
+            .collect::<Vec<_>>())
     })?;
-    let primary = kit_colors.first().map(|c| c.color.to_hex());
-    let secondary = kit_colors.get(1).map(|c| c.color.to_hex());
-
-    let page_w = 794.0; // A4 portrait at 96dpi
-    let page_h = 1123.0;
-    let margin = 64.0;
-
-    let mut pages: Vec<BrochurePage> = Vec::new();
-    pages.push(BrochurePage {
-        index: 0,
-        page_type: "cover".into(),
-        sections: vec![
-            BrochureSection {
-                section_kind: "logo".into(),
-                x: margin,
-                y: margin,
-                width: 240.0,
-                height: 80.0,
-                style_color_hex: primary.clone(),
-            },
-            BrochureSection {
-                section_kind: "headline".into(),
-                x: margin,
-                y: page_h * 0.45,
-                width: page_w - 2.0 * margin,
-                height: 96.0,
-                style_color_hex: primary.clone(),
-            },
-            BrochureSection {
-                section_kind: "subheadline".into(),
-                x: margin,
-                y: page_h * 0.55,
-                width: page_w - 2.0 * margin,
-                height: 48.0,
-                style_color_hex: secondary.clone(),
-            },
-        ],
-    });
-    for i in 1..(n - 1) {
-        pages.push(BrochurePage {
-            index: i,
-            page_type: "content".into(),
-            sections: vec![
-                BrochureSection {
-                    section_kind: "heading".into(),
-                    x: margin,
-                    y: margin,
-                    width: page_w - 2.0 * margin,
-                    height: 72.0,
-                    style_color_hex: primary.clone(),
-                },
-                BrochureSection {
-                    section_kind: "body".into(),
-                    x: margin,
-                    y: margin + 96.0,
-                    width: (page_w - 2.0 * margin) / 2.0 - 16.0,
-                    height: page_h - 2.0 * margin - 96.0,
-                    style_color_hex: None,
-                },
-                BrochureSection {
-                    section_kind: "image_placeholder".into(),
-                    x: margin + (page_w - 2.0 * margin) / 2.0 + 16.0,
-                    y: margin + 96.0,
-                    width: (page_w - 2.0 * margin) / 2.0 - 16.0,
-                    height: page_h - 2.0 * margin - 96.0,
-                    style_color_hex: secondary.clone(),
-                },
-            ],
-        });
-    }
-    pages.push(BrochurePage {
-        index: n - 1,
-        page_type: "back".into(),
-        sections: vec![
-            BrochureSection {
-                section_kind: "contact".into(),
-                x: margin,
-                y: margin,
-                width: page_w - 2.0 * margin,
-                height: 200.0,
-                style_color_hex: primary,
-            },
-            BrochureSection {
-                section_kind: "color_swatches".into(),
-                x: margin,
-                y: page_h - margin - 96.0,
-                width: page_w - 2.0 * margin,
-                height: 96.0,
-                style_color_hex: secondary,
-            },
-        ],
-    });
-    Ok(BrochurePlanResult {
-        pages,
-        brand_kit_id: brand_kit_id.to_string(),
-    })
+    kcreate_ai::brand_template::plan_brochure(
+        &brand_kit_id.to_string(),
+        &kit_colors,
+        num_pages,
+        kcreate_ai::brand_template::PageGeometry::default(),
+    )
+    .map_err(|e| DocumentBridgeError::Internal(format!("ai_brand_to_brochure: {e}")))
 }
 
 // ---------------------------------------------------------------------------

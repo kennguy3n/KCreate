@@ -1913,6 +1913,8 @@ dependencies = [
 name = "kcreate_core"
 version = "0.0.1"
 dependencies = [
+ "base64",
+ "blake3",
  "chrono",
  "log",
  "serde",

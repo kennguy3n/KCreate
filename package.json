@@ -17,6 +17,7 @@
     "build": "pnpm -r build",
     "typecheck": "pnpm -r typecheck",
     "lint": "pnpm -r lint",
+    "test": "pnpm -r test",
     "cargo:check": "cargo check --workspace --all-targets",
     "cargo:test": "cargo test --workspace",
     "cargo:fmt": "cargo fmt --all",

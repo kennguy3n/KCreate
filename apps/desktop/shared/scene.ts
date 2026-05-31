@@ -802,12 +802,47 @@ export interface RuntimeBridge {
   tileCacheClear(): Promise<number>;
   /**
    * Write a UTF-8 text file at `path`. The host requires the path to
-   * be inside the OS temp directory returned by `tempDir()` — any
-   * other location is rejected — so the renderer can only land
-   * sidecar files (e.g. design-token JSON for a dev handoff) next to
-   * its other exports. Returns the number of bytes written.
+   * be inside either the OS temp directory returned by `tempDir()`
+   * OR a directory the user has explicitly approved this session via
+   * `chooseExportTarget` / `chooseExportDirectory` — any other
+   * location is rejected. This lets the renderer land sidecar files
+   * (e.g. design-token JSON for a dev handoff) next to a user-
+   * picked primary export without granting it write access to
+   * arbitrary paths. Returns the number of bytes written.
    */
   writeTextFile(path: string, content: string): Promise<number>;
+  /**
+   * Phase A2 — native save-as dialog. Wraps Electron's
+   * `dialog.showSaveDialog` with per-format extension filters and
+   * an optional initial directory.
+   *
+   * - `format` is the wire-format export-format name (`"png"`,
+   *   `"svg"`, `"pdf"`, `"webp"`, `"jpeg"`); the filter list and
+   *   the dialog title are derived from it.
+   * - `defaultName` is the basename (with extension) the dialog
+   *   pre-populates — e.g. `kcreate-export-1735574000.png`.
+   * - `defaultDir` (optional) is the directory the dialog opens in.
+   *   The renderer typically passes
+   *   `Preferences.export.lastDirByFormat[format]` so the user
+   *   doesn't have to re-navigate each time.
+   *
+   * Returns the absolute chosen path, or `null` if the user
+   * cancelled (the renderer must short-circuit the export in
+   * that case — no temp-dir fallback).
+   */
+  chooseExportTarget(
+    format: string,
+    defaultName: string,
+    defaultDir: string | null,
+  ): Promise<string | null>;
+  /**
+   * Sibling to `chooseExportTarget` for batch presets that emit
+   * multiple files into a shared directory. Wraps
+   * `dialog.showOpenDialog` with `properties: ['openDirectory',
+   * 'createDirectory']`. Returns the absolute chosen directory,
+   * or `null` if the user cancelled.
+   */
+  chooseExportDirectory(defaultDir: string | null): Promise<string | null>;
 }
 
 /** PDF export options. `width_mm`/`height_mm` are the page size in mm. */
@@ -3157,6 +3192,59 @@ export interface TextLayoutWire {
   usedHeight: number;
 }
 
+/// Wire-format mirror of `kcreate_bridge::phase2::TextStyleWire`,
+/// which itself mirrors `kcreate_text::paragraph::TextStyle`. Phase
+/// A1 wire surface — used by `window.kcreate.text.{getStyle,setStyle}`.
+///
+/// `lineHeight` is the multiplier the shaper applies to `fontSize`
+/// when laying out lines; `1.25` is the Rust-side default.
+///
+/// Adding a field here requires the matching change in
+/// `crates/kcreate_bridge/src/phase2.rs::TextStyleWire` and
+/// `crates/kcreate_text/src/paragraph.rs::TextStyle` (rule 4 of
+/// `AGENTS.md`).
+export interface TextStyleWire {
+  fontFamily: string;
+  fontSize: number;
+  lineHeight: number;
+}
+
+/// Phase A1 — inline text editor + font controls. Mutators record
+/// an undoable operation in the project's log; reads are pure.
+///
+/// `replaceRange` indices are **UTF-16 code-unit offsets** (matching
+/// JavaScript's `String.length` / `Selection.anchorOffset`) — the
+/// bridge converts to/from UTF-8 internally and rejects ranges that
+/// would split a surrogate pair.
+export interface TextBridge {
+  /// Replace the text content of a `TextLayer` node. Preserves the
+  /// current style; use `setStyle` to mutate font family / size /
+  /// line height.
+  setContent(nodeId: string, content: string): Promise<void>;
+  /// Replace the text style for a `TextLayer` node.
+  setStyle(nodeId: string, style: TextStyleWire): Promise<void>;
+  /// Splice the UTF-16 range `[start..end]` of the node's text with
+  /// `replacement`. Used by the inline canvas editor's blur
+  /// commit path: `replaceRange(0, content.length, newContent)`.
+  replaceRange(
+    nodeId: string,
+    start: number,
+    end: number,
+    replacement: string,
+  ): Promise<void>;
+  /// Read the current text content for a `TextLayer` node. Used to
+  /// hydrate the `TextStylePanel` content textarea + the inline
+  /// canvas editor's initial buffer.
+  getContent(nodeId: string): Promise<string>;
+  /// Read the current text style for a `TextLayer` node. Used to
+  /// hydrate the `TextStylePanel` controls on selection change.
+  getStyle(nodeId: string): Promise<TextStyleWire>;
+  /// Sorted, deduplicated list of font family names known to the
+  /// process-wide font database. First call lazily loads system
+  /// fonts; subsequent calls are cached.
+  listFonts(): Promise<string[]>;
+}
+
 export interface TextFrameBridge {
   /// Read the text-frame options for a `TextLayer` node.
   get(nodeId: string): Promise<TextFrameOptions>;
@@ -4543,6 +4631,7 @@ declare global {
       canvasSnap: CanvasSnapBridge;
       rasterOps: RasterOpsBridge;
       textFrame: TextFrameBridge;
+      text: TextBridge;
       vectorOps: VectorOpsBridge;
       slice: SliceBridge;
       session: SessionBridge;
@@ -5616,6 +5705,22 @@ export interface Preferences {
   privacy: {
     telemetryOptIn: boolean;
     auditLogRetentionDays: number;
+  };
+  /**
+   * Phase A2 — sticky directory state for the native save-as
+   * dialog. `lastDirByFormat` keys are the wire-format export
+   * names (`"png"`, `"svg"`, `"pdf"`, `"webp"`, `"jpeg"`); values
+   * are absolute directory paths the user last picked. The
+   * renderer passes the entry as `defaultDir` to
+   * `chooseExportTarget` so consecutive exports for the same
+   * format open in the same place.
+   *
+   * `lastBatchDir` is the absolute directory last picked via
+   * `chooseExportDirectory`; `null` until the first batch run.
+   */
+  export: {
+    lastDirByFormat: Record<string, string>;
+    lastBatchDir: string | null;
   };
 }
 

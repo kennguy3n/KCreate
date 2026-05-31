@@ -1514,6 +1514,16 @@ const APPLY_PATCH_COMMANDS: &[&str] = &[
     "text_opentype_features_update",
     "layer_color_set",
     "clipboard_paste",
+    // Phase A1 — inline text editor + font controls. `text_set_*`
+    // and `text_replace_range` all write the canonical
+    // `TextLayerMeta` payload at `metadata[TEXT_LAYER_METADATA_KEY]`;
+    // `text_set_style` additionally writes the camelCase wire
+    // payload at `metadata["text_style"]`. Group-undo reverse
+    // capture needs to know about these slots — see
+    // `ApplyPatchSnapshot::capture`.
+    "text_set_content",
+    "text_replace_range",
+    "text_set_style",
 ];
 
 #[inline]
@@ -1569,6 +1579,26 @@ struct ApplyPatchSnapshot {
     //     inserted the subtree; restore must remove `new_root_id`
     //     (and its descendants, via DocumentGraph::remove_node).
     clipboard_paste: HashMap<Uuid, ClipboardPasteSnapshot>,
+    // Phase A1 — per-node text-layer metadata captured before any
+    // `text_set_content` / `text_replace_range` / `text_set_style`
+    // patch in the group runs. Each entry stores the raw JSON for
+    // both metadata slots (`TEXT_LAYER_METADATA_KEY` and
+    // `text_style`); restore writes them back atomically so a
+    // failed group leaves the node where it started, without
+    // requiring the rollback code to know the typed shape of
+    // either payload (the shape is already verified by the
+    // recorder + `apply_patch`).
+    text_layer: HashMap<Uuid, TextLayerSnapshot>,
+}
+
+/// Pre-loop snapshot of the metadata slots Phase A1 commands write.
+/// Both fields are `Option<Value>` because a freshly-created text
+/// layer may not yet carry the camelCase `text_style` slot — the
+/// inspector populates it the first time the user touches the
+/// style panel. `None` means "remove the key entirely on restore".
+struct TextLayerSnapshot {
+    meta: Option<serde_json::Value>,
+    style: Option<serde_json::Value>,
 }
 
 /// Pre-loop state of a single `clipboard_paste` op's subtree so the
@@ -1592,6 +1622,7 @@ impl ApplyPatchSnapshot {
             opentype: HashMap::new(),
             layer_color: HashMap::new(),
             clipboard_paste: HashMap::new(),
+            text_layer: HashMap::new(),
         };
         for op in ops {
             // Defence-in-depth: skip commands the apply_patch
@@ -1649,6 +1680,23 @@ impl ApplyPatchSnapshot {
                                     .and_then(|v| v.as_str())
                                     .map(str::to_owned);
                                 slot.insert(prior);
+                            }
+                        }
+                    }
+                }
+                "text_set_content" | "text_replace_range" | "text_set_style" => {
+                    if let Some(id) = op.affected_nodes.first().copied() {
+                        if let std::collections::hash_map::Entry::Vacant(slot) =
+                            snap.text_layer.entry(id)
+                        {
+                            if let Some(node) = ws.project.document.get_node(id) {
+                                slot.insert(TextLayerSnapshot {
+                                    meta: node
+                                        .metadata
+                                        .get(crate::scene_sync::TEXT_LAYER_METADATA_KEY)
+                                        .cloned(),
+                                    style: node.metadata.get("text_style").cloned(),
+                                });
                             }
                         }
                     }
@@ -1716,6 +1764,28 @@ impl ApplyPatchSnapshot {
                     }
                     None => {
                         node.metadata.remove(LAYER_COLOR_METADATA_KEY);
+                    }
+                }
+            }
+        }
+        for (id, snap) in self.text_layer {
+            if let Some(node) = ws.project.document.get_node_mut(id) {
+                match snap.meta {
+                    Some(v) => {
+                        node.metadata
+                            .insert(crate::scene_sync::TEXT_LAYER_METADATA_KEY.to_string(), v);
+                    }
+                    None => {
+                        node.metadata
+                            .remove(crate::scene_sync::TEXT_LAYER_METADATA_KEY);
+                    }
+                }
+                match snap.style {
+                    Some(v) => {
+                        node.metadata.insert("text_style".to_string(), v);
+                    }
+                    None => {
+                        node.metadata.remove("text_style");
                     }
                 }
             }
@@ -2101,6 +2171,90 @@ fn apply_patch(ws: &mut Workspace, op: &Operation, patch: &serde_json::Value) ->
                 .get_node_mut(id)
                 .ok_or(DocumentBridgeError::NodeNotFound(id))?;
             node.set_opentype_features(&features);
+            Ok(())
+        }
+        // Phase A1 — inline text editor + font controls.
+        //
+        // `text_set_content` and `text_replace_range` both record a
+        // canonical `TextLayerMeta` JSON in `before_patch` /
+        // `after_patch`. Roll forward / backward is a single
+        // metadata insert against `TEXT_LAYER_METADATA_KEY`; the
+        // shaper / scene_sync will pick up the new payload on the
+        // next sync. We intentionally do NOT touch the renderer
+        // here — `document_undo` / `document_redo` re-run scene
+        // sync after the apply_patch loop via `touch_version` plus
+        // the caller's existing republish path.
+        "text_set_content" | "text_replace_range" => {
+            let id = op.affected_nodes.first().copied().ok_or_else(|| {
+                DocumentBridgeError::InvalidArgument {
+                    argument: "affected_nodes".into(),
+                    value: format!("{} operation {} has no affected node", op.command, op.id),
+                }
+            })?;
+            // Validate the payload shape up-front so a malformed
+            // patch fails before we mutate node metadata. The
+            // recorders write `TextLayerMeta` directly.
+            let _: kcreate_export::TextLayerMeta = serde_json::from_value(patch.clone())?;
+            let node = ws
+                .project
+                .document
+                .get_node_mut(id)
+                .ok_or(DocumentBridgeError::NodeNotFound(id))?;
+            node.metadata.insert(
+                crate::scene_sync::TEXT_LAYER_METADATA_KEY.to_string(),
+                patch.clone(),
+            );
+            node.touch();
+            Ok(())
+        }
+        // `text_set_style` packs `{ meta: TextLayerMeta, style:
+        // TextStyleWire }` because it writes BOTH metadata slots
+        // (the canonical layer meta the shaper consumes AND the
+        // camelCase wire-format `text_style` slot the inspector
+        // panel reads). Roll forward / backward replays both
+        // inserts in one match arm.
+        "text_set_style" => {
+            let id = op.affected_nodes.first().copied().ok_or_else(|| {
+                DocumentBridgeError::InvalidArgument {
+                    argument: "affected_nodes".into(),
+                    value: format!("text_set_style operation {} has no affected node", op.id),
+                }
+            })?;
+            let obj = patch
+                .as_object()
+                .ok_or_else(|| DocumentBridgeError::InvalidArgument {
+                    argument: "text_set_style patch".into(),
+                    value: format!("expected {{meta, style}} object, got {patch}"),
+                })?;
+            let meta_val = obj
+                .get("meta")
+                .ok_or_else(|| DocumentBridgeError::InvalidArgument {
+                    argument: "text_set_style patch".into(),
+                    value: format!("missing `meta` field in {patch}"),
+                })?;
+            let style_val =
+                obj.get("style")
+                    .ok_or_else(|| DocumentBridgeError::InvalidArgument {
+                        argument: "text_set_style patch".into(),
+                        value: format!("missing `style` field in {patch}"),
+                    })?;
+            // Validate both payload shapes before mutating so a
+            // malformed patch cannot leave the node half-written
+            // (style up to date, meta stale or vice versa).
+            let _: kcreate_export::TextLayerMeta = serde_json::from_value(meta_val.clone())?;
+            let _: crate::phase2::TextStyleWire = serde_json::from_value(style_val.clone())?;
+            let node = ws
+                .project
+                .document
+                .get_node_mut(id)
+                .ok_or(DocumentBridgeError::NodeNotFound(id))?;
+            node.metadata.insert(
+                crate::scene_sync::TEXT_LAYER_METADATA_KEY.to_string(),
+                meta_val.clone(),
+            );
+            node.metadata
+                .insert("text_style".to_string(), style_val.clone());
+            node.touch();
             Ok(())
         }
         // Phase 6 Tasks 27-28: layer-colour tag. `patch` is either a
@@ -5032,9 +5186,7 @@ pub enum CanvasBatchItem {
 /// this out of [`canvas_create_nodes`] keeps the per-item match arm
 /// small and lets the batch loop stay focused on lock ordering +
 /// op-log accounting.
-fn build_canvas_batch_node(
-    item: CanvasBatchItem,
-) -> Result<(Node, &'static str)> {
+fn build_canvas_batch_node(item: CanvasBatchItem) -> Result<(Node, &'static str)> {
     use kcreate_core::node::Bounds;
     match item {
         CanvasBatchItem::Rect {
@@ -5049,10 +5201,7 @@ fn build_canvas_batch_node(
             let path = kcreate_vector::VectorPath::new(vec![
                 kcreate_vector::PathSegment::MoveTo(kcreate_vector::PathPoint::new(x, y)),
                 kcreate_vector::PathSegment::LineTo(kcreate_vector::PathPoint::new(x + w, y)),
-                kcreate_vector::PathSegment::LineTo(kcreate_vector::PathPoint::new(
-                    x + w,
-                    y + h,
-                )),
+                kcreate_vector::PathSegment::LineTo(kcreate_vector::PathPoint::new(x + w, y + h)),
                 kcreate_vector::PathSegment::LineTo(kcreate_vector::PathPoint::new(x, y + h)),
                 kcreate_vector::PathSegment::Close,
             ]);
@@ -5087,10 +5236,7 @@ fn build_canvas_batch_node(
             let ox = rx * KAPPA;
             let oy = ry * KAPPA;
             let path = kcreate_vector::VectorPath::new(vec![
-                kcreate_vector::PathSegment::MoveTo(kcreate_vector::PathPoint::new(
-                    cx - rx,
-                    cy,
-                )),
+                kcreate_vector::PathSegment::MoveTo(kcreate_vector::PathPoint::new(cx - rx, cy)),
                 kcreate_vector::PathSegment::CubicTo {
                     ctrl1: kcreate_vector::PathPoint::new(cx - rx, cy - oy),
                     ctrl2: kcreate_vector::PathPoint::new(cx - ox, cy - ry),
@@ -5264,13 +5410,7 @@ pub fn canvas_create_nodes(items: Vec<CanvasBatchItem>) -> Result<Vec<Uuid>> {
                 .map_or(serde_json::Value::Null, |n| {
                     serde_json::to_value(n).unwrap_or(serde_json::Value::Null)
                 });
-            let op = Operation::new(
-                "user",
-                op_kind,
-                serde_json::Value::Null,
-                snapshot,
-                vec![id],
-            );
+            let op = Operation::new("user", op_kind, serde_json::Value::Null, snapshot, vec![id]);
             ws.project.execute_operation(op);
             Ok::<Uuid, DocumentBridgeError>(id)
         });
@@ -6771,6 +6911,10 @@ mod tests {
             "text_opentype_features_update",
             "layer_color_set",
             "clipboard_paste",
+            // Phase A1 — inline text editor + font controls.
+            "text_set_content",
+            "text_replace_range",
+            "text_set_style",
         ]
         .into_iter()
         .collect();

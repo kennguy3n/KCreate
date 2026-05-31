@@ -814,6 +814,21 @@ export interface Bridge {
   textLayoutCompute(nodeId: string): string;
   textOpentypeFeaturesGet(nodeId: string): string;
   textOpentypeFeaturesUpdate(nodeId: string, featuresJson: string): void;
+  // Phase A1 — inline text editor + font controls. The wrappers
+  // mirror the matching `kcreate_bridge::text_*` entry points.
+  // `textListFonts` returns a JSON array of strings; the others
+  // mutate the document and record an undoable operation.
+  textSetContent(nodeId: string, content: string): void;
+  textSetStyle(nodeId: string, styleJson: string): void;
+  textReplaceRange(
+    nodeId: string,
+    start: number,
+    end: number,
+    replacement: string,
+  ): void;
+  textContentGet(nodeId: string): string;
+  textStyleGet(nodeId: string): string;
+  textListFonts(): string;
   // Phase 3 — LAN collaboration session. All entry points are
   // gated by the bridge crate's `collab` feature flag at compile
   // time; when the bridge is built without the flag, calls into

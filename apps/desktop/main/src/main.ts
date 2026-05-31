@@ -276,6 +276,91 @@ function requireBridge(): Bridge {
 // native handle it would hand out.
 let mainWindow: BrowserWindow | null = null;
 
+// Phase A2 — set of directories the user has explicitly approved
+// for sidecar writes (`writeTextFile`) by going through one of the
+// native pickers (`chooseExportTarget` / `chooseExportDirectory`).
+// Process-scoped so it survives across panel re-mounts but resets
+// on app restart; entries are absolute paths after `path.resolve`.
+//
+// The renderer never writes into this set — it only grows when the
+// main process gets back a non-null result from an Electron
+// `dialog.show*Dialog` call, which means the user clicked through
+// a native picker for that exact path.
+const approvedExportDirectories: Set<string> = new Set();
+
+/// Register `absoluteDir` as a session-approved sidecar-write root.
+/// Idempotent; safe to call from both the save-file picker (which
+/// passes the *parent* dir of the chosen file) and the open-folder
+/// picker (which passes the folder itself).
+function approveExportDirectory(absoluteDir: string): void {
+  approvedExportDirectories.add(path.resolve(absoluteDir));
+}
+
+/// Return `true` when `target` (an already-resolved absolute path)
+/// is inside either (a) the OS temp directory or (b) any directory
+/// the user approved this session. Mirrors the historical
+/// `writeTextFile` sandbox semantics — `..` escapes and `/etc/...`-
+/// style absolute paths both come back false.
+function isWriteableExportPath(target: string): boolean {
+  const tmp = path.resolve(os.tmpdir());
+  if (isInside(target, tmp)) return true;
+  for (const approved of approvedExportDirectories) {
+    if (isInside(target, approved)) return true;
+  }
+  return false;
+}
+
+/// Pure helper: `true` iff `target` lives under `root` (or is the
+/// root itself), based on `path.relative`. A relative path that
+/// starts with `..` or is itself absolute means `target` escaped
+/// `root`, so we refuse it.
+function isInside(target: string, root: string): boolean {
+  const rel = path.relative(root, target);
+  return !rel.startsWith("..") && !path.isAbsolute(rel);
+}
+
+/// Electron `dialog.showSaveDialog` filter set keyed by the wire-
+/// format export-format names (`"png"`, `"svg"`, `"pdf"`, `"webp"`,
+/// `"jpeg"`). Matches the `formatExt` table in `ExportPanel.tsx`
+/// and the bridge's `kcreate/export/{format}` IPC channels — the
+/// filter `extensions` array drives the OS-native picker's file-
+/// type dropdown so the user always sees a sensible default.
+function exportSaveDialogFilters(
+  format: string,
+): Array<{ name: string; extensions: string[] }> {
+  switch (format) {
+    case "png":
+      return [
+        { name: "PNG image", extensions: ["png"] },
+        { name: "All files", extensions: ["*"] },
+      ];
+    case "svg":
+      return [
+        { name: "SVG vector", extensions: ["svg"] },
+        { name: "All files", extensions: ["*"] },
+      ];
+    case "pdf":
+      return [
+        { name: "PDF document", extensions: ["pdf"] },
+        { name: "All files", extensions: ["*"] },
+      ];
+    case "webp":
+      return [
+        { name: "WebP image", extensions: ["webp"] },
+        { name: "All files", extensions: ["*"] },
+      ];
+    case "jpeg":
+      return [
+        { name: "JPEG image", extensions: ["jpg", "jpeg"] },
+        { name: "All files", extensions: ["*"] },
+      ];
+    default:
+      // Unknown formats still get a non-empty filter list so the
+      // dialog opens; the user can pick "All files" to override.
+      return [{ name: "All files", extensions: ["*"] }];
+  }
+}
+
 function createWindow(): BrowserWindow {
   const win = new BrowserWindow({
     width: 1280,
@@ -1146,26 +1231,92 @@ function registerIpcHandlers(): void {
     cleanupScratchProjects(),
   );
   // Sandboxed text-file sink used by the dev-handoff export preset
-  // and other renderer-side sidecars. The path is canonicalised
-  // against `os.tmpdir()` so the renderer can only write inside the
-  // OS temp directory (the same root `tempDir()` hands out). Any
-  // attempt to escape that root via `..` or an absolute prefix is
-  // rejected.
+  // and other renderer-side sidecars. The path must land inside
+  // either (a) the OS temp directory (`os.tmpdir()`) — the
+  // historical sandbox root — or (b) a directory the user has
+  // explicitly approved this session via `chooseExportTarget` /
+  // `chooseExportDirectory`. Anything else (a stray absolute path
+  // or a `..` escape) is rejected. The session allowlist starts
+  // empty and only grows when a user OS dialog returns a directory,
+  // so the renderer can never grant itself write access — every
+  // approved path is one the user typed into a native picker.
   ipcMain.handle(
     "kcreate/runtime/writeTextFile",
     async (_e, target: string, content: string): Promise<number> => {
-      const tmp = path.resolve(os.tmpdir());
       const resolved = path.resolve(target);
-      const rel = path.relative(tmp, resolved);
-      if (rel.startsWith("..") || path.isAbsolute(rel)) {
+      if (!isWriteableExportPath(resolved)) {
         throw new Error(
-          `writeTextFile rejected: ${target} is outside ${tmp}`,
+          `writeTextFile rejected: ${target} is outside ${os.tmpdir()} and any user-approved export directory`,
         );
       }
       await fs.mkdir(path.dirname(resolved), { recursive: true });
       const bytes = Buffer.byteLength(content, "utf8");
       await fs.writeFile(resolved, content, "utf8");
       return bytes;
+    },
+  );
+
+  // Phase A2 — native save-as dialog.
+  //
+  // `chooseExportTarget` wraps `dialog.showSaveDialog` with
+  // per-format extension filters so the renderer can land exports
+  // at a user-chosen absolute path instead of the OS temp dir.
+  // Returns the absolute chosen path on success, `null` on cancel.
+  // The dialog opens in `defaultDir` (when provided) so consecutive
+  // exports for the same format stay rooted at the user's last
+  // location — the renderer persists that hint in
+  // `Preferences.export.lastDirByFormat`.
+  ipcMain.handle(
+    "kcreate/runtime/chooseExportTarget",
+    async (
+      _e,
+      format: string,
+      defaultName: string,
+      defaultDir: string | null,
+    ): Promise<string | null> => {
+      const win = mainWindow;
+      if (!win) return null;
+      const filters = exportSaveDialogFilters(format);
+      const initial = defaultDir
+        ? path.join(defaultDir, defaultName)
+        : defaultName;
+      const result = await dialog.showSaveDialog(win, {
+        title: `Export ${format.toUpperCase()}`,
+        defaultPath: initial,
+        filters,
+        properties: ["showOverwriteConfirmation", "createDirectory"],
+      });
+      if (result.canceled || !result.filePath) return null;
+      const chosen = path.resolve(result.filePath);
+      // Approve the parent directory so later sidecar writes
+      // (e.g. dev-handoff `tokens.json`) can land next to the
+      // primary export through `writeTextFile`.
+      approveExportDirectory(path.dirname(chosen));
+      return chosen;
+    },
+  );
+
+  // Sibling to `chooseExportTarget` for batch presets that emit
+  // multiple files into a shared directory. Wraps `showOpenDialog`
+  // with `openDirectory` + `createDirectory` so the user can drop
+  // the run into a new folder. Returns the absolute chosen
+  // directory or `null` on cancel.
+  ipcMain.handle(
+    "kcreate/runtime/chooseExportDirectory",
+    async (_e, defaultDir: string | null): Promise<string | null> => {
+      const win = mainWindow;
+      if (!win) return null;
+      const result = await dialog.showOpenDialog(win, {
+        title: "Choose export directory",
+        defaultPath: defaultDir ?? undefined,
+        properties: ["openDirectory", "createDirectory"],
+      });
+      if (result.canceled || result.filePaths.length === 0) return null;
+      const first = result.filePaths[0];
+      if (!first) return null;
+      const chosen = path.resolve(first);
+      approveExportDirectory(chosen);
+      return chosen;
     },
   );
 
@@ -2908,6 +3059,49 @@ function registerIpcHandlers(): void {
     (_e, nodeId: string, featuresJson: string) => {
       requireBridge().textOpentypeFeaturesUpdate(nodeId, featuresJson);
     },
+  );
+
+  // ---------------------------------------------------------------------
+  // Phase A1 — inline text editor + font controls.
+  //
+  // The five mutators record undoable operations in the project's
+  // log (the bridge handles operation construction + scene-sync
+  // republish); `listFonts` is a pure read of the process-wide
+  // FontManager. All channels live under `kcreate/text/*` next to
+  // the existing text-frame + OpenType handlers.
+  // ---------------------------------------------------------------------
+  ipcMain.handle(
+    "kcreate/text/content/set",
+    (_e, nodeId: string, content: string) => {
+      requireBridge().textSetContent(nodeId, content);
+    },
+  );
+  ipcMain.handle(
+    "kcreate/text/style/set",
+    (_e, nodeId: string, styleJson: string) => {
+      requireBridge().textSetStyle(nodeId, styleJson);
+    },
+  );
+  ipcMain.handle(
+    "kcreate/text/range/replace",
+    (
+      _e,
+      nodeId: string,
+      start: number,
+      end: number,
+      replacement: string,
+    ) => {
+      requireBridge().textReplaceRange(nodeId, start, end, replacement);
+    },
+  );
+  ipcMain.handle("kcreate/text/content/get", (_e, nodeId: string) =>
+    requireBridge().textContentGet(nodeId),
+  );
+  ipcMain.handle("kcreate/text/style/get", (_e, nodeId: string) =>
+    requireBridge().textStyleGet(nodeId),
+  );
+  ipcMain.handle("kcreate/text/fonts/list", () =>
+    requireBridge().textListFonts(),
   );
 
   // ---------------------------------------------------------------------

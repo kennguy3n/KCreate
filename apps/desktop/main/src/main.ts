@@ -1454,6 +1454,27 @@ function registerIpcHandlers(): void {
     (_e, op: string, sourceIds: string[]) =>
       requireBridge().canvasPathBoolean(op, sourceIds),
   );
+  // Phase B3 — Node editor read/write surface. `pathGetSegments`
+  // returns a JSON-encoded `PathSnapshot` (see
+  // `apps/desktop/shared/scene.ts::PathSnapshot`); preload
+  // re-parses it before handing to the renderer so the channel
+  // payload stays a single string and matches the
+  // `createPath` / `pathBoolean` discipline of passing path
+  // geometry across the boundary as JSON.
+  ipcMain.handle(
+    "kcreate/canvas/pathGetSegments",
+    (_e, nodeId: string) => requireBridge().canvasPathGetSegments(nodeId),
+  );
+  ipcMain.handle(
+    "kcreate/canvas/pathSetSegments",
+    (
+      _e,
+      nodeId: string,
+      segmentsJson: string,
+      closed: boolean,
+    ) =>
+      requireBridge().canvasPathSetSegments(nodeId, segmentsJson, closed),
+  );
   ipcMain.handle(
     "kcreate/canvas/createText",
     (

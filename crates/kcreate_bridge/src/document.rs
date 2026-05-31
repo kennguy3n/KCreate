@@ -144,6 +144,15 @@ pub enum DocumentBridgeError {
     /// toast / telemetry tag in `PathfinderPanel.tsx`.
     #[error(transparent)]
     PathBoolean(#[from] PathBooleanError),
+    /// Phase B3 (Node editor): `canvas_path_get_segments` /
+    /// `canvas_path_set_segments` rejected the caller's request.
+    /// See [`PathSegmentsError`] for the discriminator. Routed
+    /// through its own variant for the same reason as `CreatePath`
+    /// and `PathBoolean` — the node editor surfaces each subkind
+    /// with a different toast in `useToolStateMachine.ts` node-edit
+    /// branch.
+    #[error(transparent)]
+    PathSegments(#[from] PathSegmentsError),
 }
 
 pub type Result<T> = std::result::Result<T, DocumentBridgeError>;
@@ -3352,6 +3361,264 @@ fn merge_paths(paths: &[kcreate_vector::VectorPath]) -> kcreate_vector::VectorPa
     out.closed = first.closed;
     out.fill_rule = first.fill_rule;
     out
+}
+
+// -----------------------------------------------------------------------------
+// Phase B3 — Node editor read/write surface
+// -----------------------------------------------------------------------------
+
+/// Errors specific to the [`canvas_path_get_segments`] and
+/// [`canvas_path_set_segments`] entry points.
+///
+/// The node editor reads a path's geometry on entry (to populate
+/// the anchor / handle overlay) and writes it back on every drag
+/// commit (one drag = one undo step). Each direction has its own
+/// failure modes — read-side errors are *"this isn't a path"*-class
+/// (`NodeNotFound`, `NotVectorLayer`, `MissingPathMetadata`) and
+/// write-side errors add wire-validation kinds that mirror
+/// [`CreatePathError`] (`InvalidJson`, `Empty`, `MissingMoveTo`).
+/// We share the type because every reader-side variant is also a
+/// possible writer-side failure (the writer re-resolves the node).
+#[derive(Debug, Error)]
+pub enum PathSegmentsError {
+    /// The node id doesn't exist in the document graph. Caller is
+    /// expected to re-fetch the document tree before retrying —
+    /// the node may have been deleted by another gesture (undo,
+    /// remote-peer op).
+    #[error("node {0} not found")]
+    NodeNotFound(Uuid),
+    /// The node exists but isn't a `VectorLayer`. The node editor
+    /// is vector-only; rasters / text / groups / frames don't
+    /// have an anchor model.
+    #[error("node {id} is a {got:?}, expected a VectorLayer")]
+    NotVectorLayer { id: Uuid, got: NodeType },
+    /// The `VectorLayer` is missing its `VECTOR_PATH_METADATA_KEY`
+    /// slot, or the slot deserialized as `null`. Indicates a
+    /// corrupt document — every shape-creator in this file writes
+    /// the metadata on insert, so the slot is always present in
+    /// well-formed projects.
+    #[error("vector layer {0} is missing path metadata")]
+    MissingPathMetadata(Uuid),
+    /// `set_segments` only: the wire payload couldn't be parsed
+    /// as `Vec<PathSegment>`. Mirrors [`CreatePathError::InvalidJson`]
+    /// — the error message includes the underlying serde
+    /// diagnostic for caller-side debugging.
+    #[error("invalid path JSON: {0}")]
+    InvalidJson(String),
+    /// `set_segments` only: zero segments. Mirrors
+    /// [`CreatePathError::Empty`] — an empty path would deserialize
+    /// to an invisible 0×0 bounding box, which almost always means
+    /// a logic bug in the renderer's serializer. The node editor
+    /// in particular should never reach this state because the
+    /// gesture began with a non-empty path.
+    #[error("path has no segments")]
+    Empty,
+    /// `set_segments` only: the path does not start with a
+    /// `MoveTo`. Same rationale as [`CreatePathError::MissingMoveTo`]
+    /// — `VectorPath` doesn't enforce the invariant structurally,
+    /// but the renderer-side translator and Kurbo's bounds
+    /// computation both rely on it.
+    #[error("path must start with move_to")]
+    MissingMoveTo,
+}
+
+/// Wire shape returned by [`canvas_path_get_segments`]. Mirrors
+/// `PathSnapshot` in `apps/desktop/shared/scene.ts`.
+///
+/// `segments` is the path-local sequence of `PathSegment`s, same
+/// shape `canvas_create_path` accepts. `closed` and `fill_rule`
+/// mirror `VectorPath::closed` / `VectorPath::fill_rule`. The two
+/// `translation_*` fields carry the node's current
+/// `transform.tx` / `transform.ty` so the renderer can project
+/// path-local anchors into world space without a second bridge
+/// round-trip.
+///
+/// World position = path-local + translation. The node editor
+/// preserves this contract by NOT folding the translation into
+/// the path coordinates on edit — anchor drags only mutate the
+/// path-local segments. `canvas_move_node` keeps owning the
+/// translation, so undo of a node move stays a clean transform
+/// patch instead of a path-replace patch.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PathSnapshot {
+    pub segments: Vec<kcreate_vector::PathSegment>,
+    pub closed: bool,
+    pub fill_rule: kcreate_vector::FillRule,
+    /// `node.transform.tx`. World-X of any path-local point P is
+    /// `P.x + translation_x`.
+    pub translation_x: f64,
+    /// `node.transform.ty`. World-Y of any path-local point P is
+    /// `P.y + translation_y`.
+    pub translation_y: f64,
+}
+
+/// Read the geometry of a `VectorLayer` node for the node editor.
+///
+/// Returns a [`PathSnapshot`] carrying the path's intrinsic
+/// segments, its `closed` / `fill_rule` flags, and the node's
+/// current transform translation so the renderer can project
+/// path-local coords into world space without a second IPC.
+///
+/// Does NOT take any locks longer than the read needed to clone
+/// the metadata payload — the node editor calls this on every
+/// entry to the tool plus after every external mutation (undo,
+/// remote-peer op) without coalescing, so the locking overhead
+/// has to stay cheap.
+pub fn canvas_path_get_segments(node_id: Uuid) -> Result<PathSnapshot> {
+    let guard = slot().read();
+    let ws = guard.as_ref().ok_or(DocumentBridgeError::NoProject)?;
+    let node = ws
+        .project
+        .document
+        .get_node(node_id)
+        .ok_or(DocumentBridgeError::PathSegments(
+            PathSegmentsError::NodeNotFound(node_id),
+        ))?;
+    if node.node_type != NodeType::VectorLayer {
+        return Err(DocumentBridgeError::PathSegments(
+            PathSegmentsError::NotVectorLayer {
+                id: node_id,
+                got: node.node_type,
+            },
+        ));
+    }
+    let path: kcreate_vector::VectorPath = node
+        .metadata
+        .get(crate::scene_sync::VECTOR_PATH_METADATA_KEY)
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .ok_or(DocumentBridgeError::PathSegments(
+            PathSegmentsError::MissingPathMetadata(node_id),
+        ))?;
+    Ok(PathSnapshot {
+        segments: path.commands,
+        closed: path.closed,
+        fill_rule: path.fill_rule,
+        translation_x: node.transform.tx,
+        translation_y: node.transform.ty,
+    })
+}
+
+/// Write a new geometry for a `VectorLayer` node from the node
+/// editor.
+///
+/// `segments_json` is the JSON serialization of
+/// `Vec<kcreate_vector::PathSegment>` — same wire shape as
+/// `canvas_create_path` (the renderer keeps a single
+/// `PathSegmentWire` mirror across both APIs). `closed` becomes
+/// `VectorPath.closed`.
+///
+/// Recomputes the node's `bounds` via `VectorPath::bounds()` (tight
+/// curve bounds, matching `canvas_create_path`'s seed behaviour),
+/// so a node-editor drag that grows the path also grows the
+/// selection rect / layers-panel size readout. `transform.tx/ty`
+/// are left untouched — the node editor only touches geometry,
+/// not position. This keeps the undo replay of a node-move op
+/// independent from any subsequent path edit.
+///
+/// Records ONE undoable operation per call (op_kind:
+/// `canvas_path_set_segments`). Callers should coalesce
+/// pointermove-rate updates into a single end-of-gesture call so
+/// the operation log doesn't get spammed — matches the
+/// `canvas_move_node` discipline.
+pub fn canvas_path_set_segments(node_id: Uuid, segments_json: &str, closed: bool) -> Result<()> {
+    let segments: Vec<kcreate_vector::PathSegment> =
+        serde_json::from_str(segments_json).map_err(|e| {
+            DocumentBridgeError::PathSegments(PathSegmentsError::InvalidJson(e.to_string()))
+        })?;
+    if segments.is_empty() {
+        return Err(DocumentBridgeError::PathSegments(PathSegmentsError::Empty));
+    }
+    if !matches!(segments[0], kcreate_vector::PathSegment::MoveTo(_)) {
+        return Err(DocumentBridgeError::PathSegments(
+            PathSegmentsError::MissingMoveTo,
+        ));
+    }
+    let mut new_path = kcreate_vector::VectorPath::new(segments);
+    new_path.closed = closed;
+
+    let mut guard = slot().write();
+    let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
+
+    // Validate the target before snapshotting anything: same
+    // ordering as `canvas_path_get_segments` so callers see a
+    // consistent error variant regardless of whether they are
+    // reading or writing.
+    let before;
+    let after;
+    {
+        let node =
+            ws.project
+                .document
+                .get_node(node_id)
+                .ok_or(DocumentBridgeError::PathSegments(
+                    PathSegmentsError::NodeNotFound(node_id),
+                ))?;
+        if node.node_type != NodeType::VectorLayer {
+            return Err(DocumentBridgeError::PathSegments(
+                PathSegmentsError::NotVectorLayer {
+                    id: node_id,
+                    got: node.node_type,
+                },
+            ));
+        }
+        // Inherit the existing path's `fill_rule` so a node-editor
+        // commit doesn't silently revert a user-chosen fill rule
+        // back to the `VectorPath::new` default (`NonZero`).
+        let existing: Option<kcreate_vector::VectorPath> = node
+            .metadata
+            .get(crate::scene_sync::VECTOR_PATH_METADATA_KEY)
+            .and_then(|v| serde_json::from_value(v.clone()).ok());
+        if let Some(prev) = existing {
+            new_path.fill_rule = prev.fill_rule;
+        }
+        // `before` snapshots the FULL node so undo restores the
+        // exact pre-edit geometry + bounds + metadata in one
+        // operation log entry. Matches the patch shape
+        // `create_vector_layer` records on insert (full
+        // before/after) so the host-driven undo path in
+        // `EditorPage` doesn't need a special arm for set-segments.
+        before = serde_json::to_value(node)?;
+    }
+
+    // Re-borrow mutably to apply the geometry edit. Splitting the
+    // borrow scope is the cleanest way to keep the validation read
+    // and the mutation write in the same write-locked workspace
+    // call without holding two mutable references simultaneously.
+    {
+        let node = ws.project.document.get_node_mut(node_id).ok_or(
+            // Defensive: the node was present 3 lines ago under
+            // the same write lock, so this branch is unreachable
+            // in practice. Surfacing the typed error instead of
+            // panicking keeps the bridge resilient if a future
+            // refactor relaxes the locking discipline.
+            DocumentBridgeError::PathSegments(PathSegmentsError::NodeNotFound(node_id)),
+        )?;
+        let bounds = new_path.bounds();
+        node.bounds = kcreate_core::node::Bounds {
+            x: bounds.min_x,
+            y: bounds.min_y,
+            width: bounds.width(),
+            height: bounds.height(),
+        };
+        node.metadata.insert(
+            crate::scene_sync::VECTOR_PATH_METADATA_KEY.to_string(),
+            serde_json::to_value(&new_path)?,
+        );
+        node.touch();
+        after = serde_json::to_value(&*node)?;
+    }
+    ws.project.modified_at = Utc::now();
+    let op = Operation::new(
+        "user",
+        "canvas_path_set_segments",
+        before,
+        after,
+        vec![node_id],
+    );
+    ws.project.execute_operation(op);
+    let _ = sync_scene_locked(&mut guard);
+    drop(guard);
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -12460,5 +12727,275 @@ mod tests {
             "concatenates segment lists"
         );
         assert!(merged.closed, "merged inherits first input's closed flag");
+    }
+
+    // -------------------------------------------------------------
+    // Phase B3 — canvas_path_get_segments / canvas_path_set_segments
+    // coverage
+    // -------------------------------------------------------------
+    //
+    // These two entry points are the bridge surface for the node
+    // editor. The invariants verified here are exactly the
+    // contract the renderer-side `useToolStateMachine` /
+    // `NodeEditOverlay` rely on:
+    //
+    //   * `get_segments` returns the path-local geometry +
+    //     translation, so the renderer can project anchors into
+    //     world space without a second IPC.
+    //   * the wire round-trip is lossless (get → edit → set →
+    //     get yields the edited path bit-for-bit).
+    //   * `set_segments` recomputes bounds via Kurbo (tight
+    //     curve bounds), so a node-editor drag that grows the
+    //     path also grows the selection rect.
+    //   * `set_segments` records exactly one undoable
+    //     `canvas_path_set_segments` op per call — undo
+    //     restores the pre-edit geometry.
+    //   * every `PathSegmentsError` variant fires on the right
+    //     input.
+
+    #[test]
+    #[serial]
+    fn canvas_path_get_segments_returns_translation_and_path_local_geometry() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("path_get", dir.path()).expect("create");
+        let id = insert_square(0.0, 0.0, 10.0);
+        // Move the node by (50, 70). The path-local geometry
+        // should be unaffected (we re-emit the same square in
+        // path-local coords) but the snapshot's translation
+        // fields should carry the move.
+        canvas_move_node(id, 50.0, 70.0).expect("move");
+        let snap = canvas_path_get_segments(id).expect("get_segments");
+        assert!(snap.closed, "square was inserted with closed=true");
+        assert_eq!(snap.translation_x, 50.0);
+        assert_eq!(snap.translation_y, 70.0);
+        // The square inserted by `insert_square(0,0,10)` is a
+        // move + 3 line + close, so the snapshot's segments
+        // should be the same count.
+        assert_eq!(snap.segments.len(), 5);
+        // First segment should be MoveTo (0, 0) in path-local.
+        match &snap.segments[0] {
+            kcreate_vector::PathSegment::MoveTo(p) => {
+                assert_eq!(p.x, 0.0);
+                assert_eq!(p.y, 0.0);
+            }
+            other => panic!("expected MoveTo as first segment, got {other:?}"),
+        }
+        project_close();
+    }
+
+    #[test]
+    #[serial]
+    fn canvas_path_get_segments_rejects_non_vector_layer() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("path_get_nonvec", dir.path()).expect("create");
+        // Create a TextLayer (not a VectorLayer) and try to get
+        // its segments — should fail with NotVectorLayer.
+        // `canvas_create_rect` would create a VectorLayer (rects
+        // are stored as 5-segment paths), so it would not
+        // exercise this guard.
+        let id = canvas_create_text(None, 0.0, 0.0, "hi".to_string(), "Inter".to_string(), 12.0)
+            .expect("create text");
+        let err = canvas_path_get_segments(id).expect_err("expected error");
+        match err {
+            DocumentBridgeError::PathSegments(PathSegmentsError::NotVectorLayer {
+                id: got_id,
+                ..
+            }) => {
+                assert_eq!(got_id, id);
+            }
+            other => panic!("expected NotVectorLayer, got {other:?}"),
+        }
+        project_close();
+    }
+
+    #[test]
+    #[serial]
+    fn canvas_path_get_segments_rejects_missing_node() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("path_get_missing", dir.path()).expect("create");
+        let phantom = Uuid::new_v4();
+        let err = canvas_path_get_segments(phantom).expect_err("expected error");
+        match err {
+            DocumentBridgeError::PathSegments(PathSegmentsError::NodeNotFound(got_id)) => {
+                assert_eq!(got_id, phantom);
+            }
+            other => panic!("expected NodeNotFound, got {other:?}"),
+        }
+        project_close();
+    }
+
+    #[test]
+    #[serial]
+    fn canvas_path_set_segments_round_trips_through_get_segments() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("path_round_trip", dir.path()).expect("create");
+        let id = insert_square(0.0, 0.0, 10.0);
+        // Replace the square with a diagonal line.
+        let new_segments = line_segments_json(2.0, 3.0, 100.0, 200.0);
+        canvas_path_set_segments(id, &new_segments, false).expect("set_segments");
+        // Read it back.
+        let snap = canvas_path_get_segments(id).expect("get_segments");
+        assert!(!snap.closed, "explicit closed=false should round-trip");
+        assert_eq!(snap.segments.len(), 2);
+        match &snap.segments[0] {
+            kcreate_vector::PathSegment::MoveTo(p) => {
+                assert_eq!(p.x, 2.0);
+                assert_eq!(p.y, 3.0);
+            }
+            other => panic!("expected MoveTo, got {other:?}"),
+        }
+        match &snap.segments[1] {
+            kcreate_vector::PathSegment::LineTo(p) => {
+                assert_eq!(p.x, 100.0);
+                assert_eq!(p.y, 200.0);
+            }
+            other => panic!("expected LineTo, got {other:?}"),
+        }
+        project_close();
+    }
+
+    #[test]
+    #[serial]
+    fn canvas_path_set_segments_recomputes_bounds_via_kurbo() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("path_bounds", dir.path()).expect("create");
+        let id = insert_square(0.0, 0.0, 10.0);
+        // Replace with a much-larger diagonal line. The node's
+        // bounds should grow to match the new geometry — this is
+        // the contract the layers panel + selection rect depend
+        // on.
+        let new_segments = line_segments_json(5.0, 7.0, 105.0, 207.0);
+        canvas_path_set_segments(id, &new_segments, false).expect("set_segments");
+        let tree = document_get_tree().expect("tree");
+        let node = tree.iter().find(|n| n.id == id).expect("node still exists");
+        // Line from (5,7) to (105,207) → bounds (5,7) - (105,207),
+        // width 100, height 200.
+        assert!(
+            (node.bounds.x - 5.0).abs() < 1e-6,
+            "x got {:?}",
+            node.bounds
+        );
+        assert!(
+            (node.bounds.y - 7.0).abs() < 1e-6,
+            "y got {:?}",
+            node.bounds
+        );
+        assert!(
+            (node.bounds.width - 100.0).abs() < 1e-6,
+            "width got {:?}",
+            node.bounds
+        );
+        assert!(
+            (node.bounds.height - 200.0).abs() < 1e-6,
+            "height got {:?}",
+            node.bounds
+        );
+        project_close();
+    }
+
+    #[test]
+    #[serial]
+    fn canvas_path_set_segments_records_undoable_op() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("path_undo", dir.path()).expect("create");
+        let id = insert_square(0.0, 0.0, 10.0);
+        // Replace with a diagonal line.
+        let new_segments = line_segments_json(2.0, 3.0, 100.0, 200.0);
+        canvas_path_set_segments(id, &new_segments, false).expect("set_segments");
+        // Per `apply_inverse_patch` doc comment, `canvas_path_set_segments`
+        // is a host-driven rollback command (NOT in
+        // APPLY_PATCH_COMMANDS) — the renderer is expected to re-
+        // fetch via `canvas.pathGetSegments` after the undo cursor
+        // moves. What we can verify at the bridge layer is that an
+        // op was recorded under the `canvas_path_set_segments`
+        // op_kind and is visible to `document_undo` / `document_redo`,
+        // exactly the same contract `canvas_create_path` uses
+        // (see `canvas_create_path_records_undoable_op` above).
+        let undo_outcome = document_undo()
+            .expect("undo")
+            .expect("canvas_path_set_segments was recorded");
+        assert_eq!(undo_outcome.command, "canvas_path_set_segments");
+        assert_eq!(undo_outcome.affected_nodes, vec![id]);
+        let redo_outcome = document_redo()
+            .expect("redo")
+            .expect("canvas_path_set_segments is on the redo stack");
+        assert_eq!(redo_outcome.command, "canvas_path_set_segments");
+        assert_eq!(redo_outcome.affected_nodes, vec![id]);
+        project_close();
+    }
+
+    #[test]
+    #[serial]
+    fn canvas_path_set_segments_rejects_empty_segments() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("path_set_empty", dir.path()).expect("create");
+        let id = insert_square(0.0, 0.0, 10.0);
+        let err = canvas_path_set_segments(id, "[]", false).expect_err("err");
+        match err {
+            DocumentBridgeError::PathSegments(PathSegmentsError::Empty) => {}
+            other => panic!("expected Empty, got {other:?}"),
+        }
+        project_close();
+    }
+
+    #[test]
+    #[serial]
+    fn canvas_path_set_segments_rejects_missing_move_to() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("path_set_no_move", dir.path()).expect("create");
+        let id = insert_square(0.0, 0.0, 10.0);
+        // A single line_to with no preceding move_to.
+        let bad = r#"[{"op":"line_to","x":10,"y":20}]"#;
+        let err = canvas_path_set_segments(id, bad, false).expect_err("err");
+        match err {
+            DocumentBridgeError::PathSegments(PathSegmentsError::MissingMoveTo) => {}
+            other => panic!("expected MissingMoveTo, got {other:?}"),
+        }
+        project_close();
+    }
+
+    #[test]
+    #[serial]
+    fn canvas_path_set_segments_rejects_invalid_json() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("path_set_bad_json", dir.path()).expect("create");
+        let id = insert_square(0.0, 0.0, 10.0);
+        let err = canvas_path_set_segments(id, "{not json", false).expect_err("err");
+        match err {
+            DocumentBridgeError::PathSegments(PathSegmentsError::InvalidJson(_)) => {}
+            other => panic!("expected InvalidJson, got {other:?}"),
+        }
+        project_close();
+    }
+
+    #[test]
+    #[serial]
+    fn canvas_path_set_segments_rejects_non_vector_layer() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("path_set_nonvec", dir.path()).expect("create");
+        let id = canvas_create_text(None, 0.0, 0.0, "hi".to_string(), "Inter".to_string(), 12.0)
+            .expect("create text");
+        let segs = line_segments_json(0.0, 0.0, 5.0, 5.0);
+        let err = canvas_path_set_segments(id, &segs, false).expect_err("err");
+        match err {
+            DocumentBridgeError::PathSegments(PathSegmentsError::NotVectorLayer {
+                id: got_id,
+                ..
+            }) => {
+                assert_eq!(got_id, id);
+            }
+            other => panic!("expected NotVectorLayer, got {other:?}"),
+        }
+        project_close();
     }
 }

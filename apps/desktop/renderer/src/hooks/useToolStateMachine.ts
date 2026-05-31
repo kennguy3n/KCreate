@@ -100,6 +100,33 @@ export const PEN_DRAG_THRESHOLD_SCREEN = 4;
 export const PEN_CLOSE_HIT_RADIUS_SCREEN = 8;
 
 /**
+ * Node-editor (Phase B3): screen-space radius around an anchor
+ * point that counts as a "hit" for select / drag. Same threshold
+ * Illustrator / Affinity Designer use for the Direct Select tool
+ * (8 px). Matched against `PEN_CLOSE_HIT_RADIUS_SCREEN` so the
+ * Pen tool's close-path and the Node tool's anchor-select feel
+ * consistent.
+ *
+ * Compared against screen pixels — converted into world units at
+ * comparison time via `viewport.zoom`.
+ */
+export const NODE_ANCHOR_HIT_RADIUS_SCREEN = 8;
+
+/**
+ * Node-editor (Phase B3): screen-space radius around a control
+ * handle that counts as a "hit" for select / drag. Slightly
+ * smaller than the anchor radius because (a) handles are visually
+ * smaller (3 px dot vs. 6 px anchor square), so the bigger
+ * radius would invite mis-grabs onto the wrong handle, and (b)
+ * handle priority is HIGHER than anchor priority — when an
+ * anchor's handle is rendered on top of its own anchor at high
+ * zoom-out, the user almost always wants the handle.
+ *
+ * Compared against screen pixels.
+ */
+export const NODE_HANDLE_HIT_RADIUS_SCREEN = 6;
+
+/**
  * One anchor in a pen-tool gesture. Stored in world space (matches
  * `kcreate_vector::PathSegment` coordinates) so the overlay can
  * paint directly without re-applying transforms and the commit
@@ -228,6 +255,60 @@ export type ToolMachineState =
       /// anchor to the cursor in `PenOverlay`. `null` until the
       /// first cursor sample after the gesture starts.
       cursor: { x: number; y: number } | null;
+    }
+  | {
+      kind: "nodeEdit";
+      /// Tool captured at entry — kept for parity with `pen.tool`,
+      /// `create.tool`, etc.
+      tool: ToolId;
+      /// The VectorLayer node id whose anchors / handles this
+      /// gesture is editing. Captured on entry; a tool switch
+      /// mid-gesture doesn't change which node receives the
+      /// edits (matches `move.tool` capture-at-entry rationale).
+      nodeId: string;
+      /// Anchors in WORLD space (already projected through
+      /// `translationX` / `translationY` from the bridge's
+      /// `PathSnapshot`). The overlay renders directly from this
+      /// array; the commit path re-projects back to path-local
+      /// before handing to `canvas.pathSetSegments`.
+      anchors: PenAnchor[];
+      /// Mirrors `VectorPath.closed`. Preserved across the
+      /// gesture so commits round-trip the open/closed flag.
+      closed: boolean;
+      /// Translation captured on entry. We do NOT re-read this
+      /// per pointermove: any concurrent `canvas.moveNode` would
+      /// shift the on-screen anchors out from under the user
+      /// mid-drag, which is worse than the rare stale-translation
+      /// risk (the node editor takes the selection's lock per
+      /// pre-existing editor convention — see EditorPage.handlePointerDown).
+      translationX: number;
+      translationY: number;
+      /// Set of indices into `anchors` that are currently
+      /// selected. Single-anchor click clears+adds; shift-click
+      /// toggles. Mirrors `EditorContext.selectedIds`'s set
+      /// semantics. Empty when no anchor is selected (e.g. just
+      /// after entering the tool).
+      selectedAnchorIndices: ReadonlySet<number>;
+      /// Live cursor world position. Used by the overlay's hover
+      /// indicator and by `pointerdown` to test which anchor /
+      /// handle (if any) is being grabbed. `null` until the
+      /// pointer has moved over the canvas since entry.
+      cursor: { x: number; y: number } | null;
+      /// What the user has grabbed and is dragging right now,
+      /// or `null` between drags. Hoisted into the variant
+      /// (rather than a sibling state variant) so the overlay
+      /// keeps its anchor list available while a drag is in
+      /// flight — the user has to see the anchors they're
+      /// pulling on.
+      drag: NodeEditDrag | null;
+      /// True when the cumulative drag delta has exceeded the
+      /// minimum threshold to be considered a "real" drag (vs.
+      /// a click+release with sub-pixel pointer jitter).
+      /// Anchors / handles only commit their post-drag position
+      /// to the bridge when this flag is set on `pointerup`;
+      /// otherwise the gesture is treated as a select-only
+      /// click. Resets to `false` on every new `pointerdown`.
+      dragMoved: boolean;
     };
 
 /**
@@ -282,6 +363,182 @@ function buildBetween(prev: PenAnchor, curr: PenAnchor): PathSegmentWire {
     end: { x: curr.x, y: curr.y },
   };
 }
+
+/**
+ * Phase B3 — convert the bridge wire-format `PathSegmentWire[]`
+ * stream back into the anchor representation the node editor
+ * works with. Round-trips with `anchorsToSegments` for any
+ * sequence the pen tool emits:
+ *
+ *   - `move_to` at index 0 seeds the first anchor.
+ *   - `line_to` appends a corner anchor; the inbound/outbound
+ *     handles for the segment-between are both null.
+ *   - `cubic_to` appends an anchor at `end`; `ctrl1` becomes the
+ *     PREVIOUS anchor's `outHandle` (if it differs from the
+ *     anchor coords — equal means "no handle"); `ctrl2` becomes
+ *     the NEW anchor's `inHandle` under the same rule.
+ *   - `quad_to` is elevated to a cubic-equivalent via the
+ *     standard 2/3rds Bezier conversion (Q[p0, c, p1] → C[p0,
+ *     p0+2/3*(c-p0), p1+2/3*(c-p1), p1]). The node editor's
+ *     internal model is always cubic — pen / SVG import paths
+ *     may produce quad segments but the user-facing handle UI
+ *     doesn't need to distinguish.
+ *   - `close` flips `closed: true`. If present after a
+ *     `line_to`/`cubic_to` that lands on the start anchor, the
+ *     redundant duplicate-of-first anchor is collapsed (we keep
+ *     the closing-segment's handles on the first anchor's inbound
+ *     side, which is exactly how `anchorsToSegments` would emit
+ *     them on the next round trip).
+ *
+ * Returns `{ anchors, closed }`. Empty input returns `{ anchors:
+ * [], closed: false }`. A degenerate path missing `move_to` at
+ * index 0 returns `{ anchors: [], closed: false }` (matches the
+ * bridge's `MissingMoveTo` rejection — defense in depth so the
+ * overlay doesn't render garbage if the contract slips).
+ */
+export function segmentsToAnchors(
+  segments: ReadonlyArray<PathSegmentWire>,
+): { anchors: PenAnchor[]; closed: boolean } {
+  if (segments.length === 0 || segments[0]?.op !== "move_to") {
+    return { anchors: [], closed: false };
+  }
+  const anchors: PenAnchor[] = [];
+  const first = segments[0]!;
+  anchors.push({
+    x: first.x,
+    y: first.y,
+    inHandle: null,
+    outHandle: null,
+  });
+  let closed = false;
+  for (let i = 1; i < segments.length; i++) {
+    const seg = segments[i]!;
+    if (seg.op === "move_to") {
+      // Multi-subpath imports — current node editor handles only
+      // a single subpath, so trailing `move_to`s are dropped
+      // rather than silently merged with the preceding anchor.
+      // Matches the bridge's single-VectorPath model. Future
+      // multi-subpath support extends `nodeEdit` with a subpath
+      // index; this branch becomes the seam.
+      break;
+    }
+    if (seg.op === "close") {
+      closed = true;
+      continue;
+    }
+    if (seg.op === "line_to") {
+      anchors.push({
+        x: seg.x,
+        y: seg.y,
+        inHandle: null,
+        outHandle: null,
+      });
+      continue;
+    }
+    // Promote both cubic and quad to anchor + handle pair. The
+    // previous anchor receives `outHandle = ctrl1` (or
+    // 2/3-derived for quads); the new anchor receives `inHandle
+    // = ctrl2`. Coincident-with-anchor handles collapse to
+    // `null` so the next `anchorsToSegments` emits `line_to`
+    // (preserves round-trip fidelity for already-corner anchors
+    // that happened to be encoded as zero-bend cubics).
+    let ctrl1: { x: number; y: number };
+    let ctrl2: { x: number; y: number };
+    let end: { x: number; y: number };
+    if (seg.op === "cubic_to") {
+      ctrl1 = seg.ctrl1;
+      ctrl2 = seg.ctrl2;
+      end = seg.end;
+    } else {
+      // quad_to — 2/3 Bezier elevation.
+      const prev = anchors[anchors.length - 1]!;
+      ctrl1 = {
+        x: prev.x + (2 / 3) * (seg.ctrl.x - prev.x),
+        y: prev.y + (2 / 3) * (seg.ctrl.y - prev.y),
+      };
+      ctrl2 = {
+        x: seg.end.x + (2 / 3) * (seg.ctrl.x - seg.end.x),
+        y: seg.end.y + (2 / 3) * (seg.ctrl.y - seg.end.y),
+      };
+      end = seg.end;
+    }
+    const prev = anchors[anchors.length - 1]!;
+    const prevHandle =
+      ctrl1.x === prev.x && ctrl1.y === prev.y ? null : ctrl1;
+    if (prevHandle !== null) {
+      prev.outHandle = prevHandle;
+    }
+    const inHandle =
+      ctrl2.x === end.x && ctrl2.y === end.y ? null : ctrl2;
+    anchors.push({
+      x: end.x,
+      y: end.y,
+      inHandle,
+      outHandle: null,
+    });
+  }
+  // If the last appended anchor coincides with the first (the
+  // standard close-with-explicit-segment-back-to-start pattern
+  // emitted by `anchorsToSegments`), fold its `inHandle` onto
+  // the first anchor's inbound slot and drop it. Without this
+  // collapse, round-tripping a closed path would gain a phantom
+  // duplicate anchor every cycle.
+  if (closed && anchors.length >= 2) {
+    const last = anchors[anchors.length - 1]!;
+    const head = anchors[0]!;
+    if (last.x === head.x && last.y === head.y) {
+      if (last.inHandle !== null) {
+        head.inHandle = last.inHandle;
+      }
+      anchors.pop();
+    }
+  }
+  return { anchors, closed };
+}
+
+/**
+ * Phase B3 — discriminated union of "what's being grabbed" inside
+ * an active node-edit drag. Anchors and handles are addressed by
+ * their index in the parent path's anchor array; handles also
+ * carry which side (`in` or `out`) is being dragged.
+ *
+ * Drag state is kept FLAT inside the `nodeEdit` variant rather
+ * than nested under `drag: NodeEditDrag | null` so the
+ * discriminated union narrows cleanly: `state.kind ===
+ * "nodeEdit"` only tells you the user is in the node-edit tool,
+ * `state.drag?.kind === "anchor"` then tells you what's in
+ * flight. Mirrors `pen.pending` shape.
+ */
+export type NodeEditDrag =
+  | {
+      kind: "anchor";
+      pointerId: number;
+      anchorIndex: number;
+      /// Cumulative world-space delta since drag start; applied
+      /// to anchor coords (and to the anchor's own handles, so
+      /// in/out handles travel with the anchor). Folded into the
+      /// committed anchor set on `pointerup`.
+      cumulativeDx: number;
+      cumulativeDy: number;
+      /// Last world-space cursor sample; per-frame delta is
+      /// `(world - last)`. Re-sampled on every pointermove.
+      lastWorldX: number;
+      lastWorldY: number;
+    }
+  | {
+      kind: "handle";
+      pointerId: number;
+      anchorIndex: number;
+      side: "in" | "out";
+      /// World-space coords the handle should be moved to on the
+      /// next frame. Unlike anchor drags we replace the handle
+      /// position outright instead of accumulating a delta — a
+      /// dragged handle "follows the cursor" rather than "tracks
+      /// its grab offset". Matches Illustrator / Figma behaviour
+      /// and avoids handle drift on pointer-rate noise.
+      cursorWorldX: number;
+      cursorWorldY: number;
+    };
 
 /**
  * Dependency injection surface. Everything the hook needs to do its
@@ -375,6 +632,23 @@ export interface ToolStateMachineDeps {
  *   without re-rendering React, so without an explicit subscribe
  *   surface the overlay would be invisible. Returns an unsubscribe
  *   function.
+ * - `enterNodeEdit`: Phase B3 — fetch the given VectorLayer's
+ *   geometry via `canvas.pathGetSegments`, project anchors into
+ *   world space, and transition into the `nodeEdit` variant. If
+ *   another tool's gesture is in flight (`pen`, `move`, etc.)
+ *   the call is rejected with a status toast — same defensive
+ *   posture as `commitPen`'s `state.kind === "pen"` guard.
+ *   Resolves with `true` on success, `false` if the bridge call
+ *   failed or the state machine wasn't idle.
+ * - `commitNodeEdit`: Phase B3 — push the current `nodeEdit`
+ *   variant's anchors back through `canvas.pathSetSegments`,
+ *   then return to `idle`. No-op (returns `false`) when not in
+ *   `nodeEdit`. Resolves AFTER `onAfterCommit` so the caller can
+ *   chain a refresh.
+ * - `cancelNodeEdit`: Phase B3 — drop the in-flight `nodeEdit`
+ *   variant without committing, returning to `idle`. Used by
+ *   the Escape shortcut. Returns `true` if a gesture was
+ *   actually cancelled.
  */
 export interface ToolStateMachine {
   onCanvasPointer: (e: React.PointerEvent<HTMLCanvasElement>) => void;
@@ -382,6 +656,9 @@ export interface ToolStateMachine {
   getLastCursorWorld: () => { x: number; y: number } | null;
   commitPen: () => Promise<string | null>;
   cancelPen: () => boolean;
+  enterNodeEdit: (nodeId: string) => Promise<boolean>;
+  commitNodeEdit: () => Promise<boolean>;
+  cancelNodeEdit: () => boolean;
   subscribe: (listener: () => void) => () => void;
 }
 
@@ -577,6 +854,169 @@ export function useToolStateMachine(
     return true;
   }, [notify]);
 
+  /**
+   * Phase B3 — enter `nodeEdit` for the given VectorLayer node.
+   * Round-trips through `canvas.pathGetSegments`, converts
+   * `PathSnapshot.segments` (path-local) into the anchor
+   * representation, projects every anchor + handle into world
+   * space using the snapshot's `translationX` / `translationY`,
+   * and atomically transitions into the `nodeEdit` variant.
+   *
+   * Refuses (returns `false`) if the state machine is not in
+   * `idle` — same posture as `commitPen`'s `state.kind === "pen"`
+   * guard. The caller is expected to commit / cancel any active
+   * gesture first.
+   *
+   * On bridge failure the error is surfaced via `onError` and the
+   * state machine stays in `idle`. Callers should not assume a
+   * transition happened on `true`-vs-`false` alone; reading
+   * `getState()` after `await` is the source of truth.
+   */
+  const enterNodeEdit = useCallback(
+    async (nodeId: string): Promise<boolean> => {
+      const state = stateRef.current;
+      if (state.kind !== "idle") {
+        onErrorRef.current(
+          "node edit refused: another gesture is in flight",
+        );
+        return false;
+      }
+      try {
+        const snap = await window.kcreate.canvas.pathGetSegments(nodeId);
+        const { anchors: pathLocal, closed } = segmentsToAnchors(
+          snap.segments,
+        );
+        // Project path-local → world by adding the node's
+        // translation. The node editor renders directly off
+        // these world-space anchors; the commit path
+        // re-projects back to path-local using the same
+        // translation captured here.
+        const anchors: PenAnchor[] = pathLocal.map((a) => ({
+          x: a.x + snap.translationX,
+          y: a.y + snap.translationY,
+          inHandle:
+            a.inHandle === null
+              ? null
+              : {
+                  x: a.inHandle.x + snap.translationX,
+                  y: a.inHandle.y + snap.translationY,
+                },
+          outHandle:
+            a.outHandle === null
+              ? null
+              : {
+                  x: a.outHandle.x + snap.translationX,
+                  y: a.outHandle.y + snap.translationY,
+                },
+        }));
+        stateRef.current = {
+          kind: "nodeEdit",
+          tool: toolRef.current,
+          nodeId,
+          anchors,
+          closed,
+          translationX: snap.translationX,
+          translationY: snap.translationY,
+          selectedAnchorIndices: new Set<number>(),
+          cursor: null,
+          drag: null,
+          dragMoved: false,
+        };
+        notify();
+        return true;
+      } catch (err) {
+        onErrorRef.current(
+          `node edit enter failed: ${errorMessage(err)}`,
+        );
+        return false;
+      }
+    },
+    [notify],
+  );
+
+  /**
+   * Phase B3 — commit the current `nodeEdit` gesture's anchors
+   * back through `canvas.pathSetSegments`. Projects world-space
+   * anchors back to path-local using the `translationX` /
+   * `translationY` captured at entry (NOT a fresh read — see
+   * the doc on `nodeEdit.translationX`). Records ONE undoable
+   * operation per call.
+   *
+   * No-op (returns `false`) when not in `nodeEdit`. Resolves
+   * AFTER `onAfterCommit` so the caller can chain a refresh.
+   */
+  const commitNodeEdit = useCallback(async (): Promise<boolean> => {
+    const state = stateRef.current;
+    if (state.kind !== "nodeEdit") return false;
+    // Need at least a single anchor for a path that the bridge
+    // will accept (`canvas.pathSetSegments` rejects empty input
+    // and missing-`MoveTo` paths). An anchor list with one entry
+    // serializes to a single `move_to` plus the optional `close`,
+    // both of which the bridge accepts.
+    if (state.anchors.length === 0) {
+      onErrorRef.current(
+        "node edit commit refused: path has no anchors",
+      );
+      return false;
+    }
+    // Re-project world → path-local using the translation
+    // captured on entry. If `translationX/Y` is `(0, 0)` this is
+    // an identity transform and `anchors` round-trip unchanged.
+    const local: PenAnchor[] = state.anchors.map((a) => ({
+      x: a.x - state.translationX,
+      y: a.y - state.translationY,
+      inHandle:
+        a.inHandle === null
+          ? null
+          : {
+              x: a.inHandle.x - state.translationX,
+              y: a.inHandle.y - state.translationY,
+            },
+      outHandle:
+        a.outHandle === null
+          ? null
+          : {
+              x: a.outHandle.x - state.translationX,
+              y: a.outHandle.y - state.translationY,
+            },
+    }));
+    const segments = anchorsToSegments(local, state.closed);
+    const { nodeId, closed } = state;
+    // Reset to idle BEFORE the async bridge call so subsequent
+    // events (tool switch, Escape) cannot mutate the in-flight
+    // gesture. Same discipline as `commitPenGesture`.
+    stateRef.current = IDLE;
+    notify();
+    try {
+      await window.kcreate.canvas.pathSetSegments(
+        nodeId,
+        segments,
+        closed,
+      );
+      await onAfterCommitRef.current();
+      return true;
+    } catch (err) {
+      onErrorRef.current(
+        `node edit commit failed: ${errorMessage(err)}`,
+      );
+      return false;
+    }
+  }, [notify]);
+
+  /**
+   * Phase B3 — discard the in-flight `nodeEdit` gesture without
+   * committing. Sync (no bridge call) — the document is
+   * unchanged. Returns `true` if the cancellation actually
+   * consumed a `nodeEdit` gesture.
+   */
+  const cancelNodeEdit = useCallback((): boolean => {
+    const state = stateRef.current;
+    if (state.kind !== "nodeEdit") return false;
+    stateRef.current = IDLE;
+    notify();
+    return true;
+  }, [notify]);
+
   const onCanvasPointer = useCallback(
     (e: React.PointerEvent<HTMLCanvasElement>): void => {
       // `pointerdown` is the only event we filter by mouse button —
@@ -646,6 +1086,126 @@ export function useToolStateMachine(
         }
 
         const activeTool = toolRef.current;
+
+        // Phase B3 — Node editor pointerdown. Only intercepts
+        // when we're already in the `nodeEdit` variant (the
+        // editor enters it via `enterNodeEdit` from a
+        // double-click on a VectorLayer, not from a tool
+        // selection). When in `nodeEdit`, EVERY click in the
+        // canvas routes through this branch regardless of
+        // `activeTool`, because the user is conceptually inside
+        // a modal sub-editor of the path. Tool-bar tool changes
+        // STILL work — they just don't take effect until the
+        // user commits/cancels and the state returns to `idle`.
+        {
+          const existing = stateRef.current;
+          if (existing.kind === "nodeEdit") {
+            const hitRadiusWorld =
+              NODE_ANCHOR_HIT_RADIUS_SCREEN / vp.zoom;
+            const handleRadiusWorld =
+              NODE_HANDLE_HIT_RADIUS_SCREEN / vp.zoom;
+            // Handles are tested BEFORE anchors so when a handle
+            // sits on top of its own anchor (a zero-bend cubic
+            // viewed at high zoom-out) the user still grabs the
+            // handle. Matches Illustrator's Direct Select
+            // priority.
+            let handleHit: {
+              anchorIndex: number;
+              side: "in" | "out";
+            } | null = null;
+            for (let i = 0; i < existing.anchors.length; i++) {
+              const a = existing.anchors[i]!;
+              if (a.inHandle !== null) {
+                const dx = wx - a.inHandle.x;
+                const dy = wy - a.inHandle.y;
+                if (Math.hypot(dx, dy) <= handleRadiusWorld) {
+                  handleHit = { anchorIndex: i, side: "in" };
+                  break;
+                }
+              }
+              if (a.outHandle !== null) {
+                const dx = wx - a.outHandle.x;
+                const dy = wy - a.outHandle.y;
+                if (Math.hypot(dx, dy) <= handleRadiusWorld) {
+                  handleHit = { anchorIndex: i, side: "out" };
+                  break;
+                }
+              }
+            }
+            if (handleHit !== null) {
+              canvasEl.setPointerCapture(pointerId);
+              stateRef.current = {
+                ...existing,
+                cursor: { x: wx, y: wy },
+                drag: {
+                  kind: "handle",
+                  pointerId,
+                  anchorIndex: handleHit.anchorIndex,
+                  side: handleHit.side,
+                  cursorWorldX: wx,
+                  cursorWorldY: wy,
+                },
+                dragMoved: false,
+              };
+              notify();
+              return;
+            }
+            let anchorHit = -1;
+            for (let i = 0; i < existing.anchors.length; i++) {
+              const a = existing.anchors[i]!;
+              const dx = wx - a.x;
+              const dy = wy - a.y;
+              if (Math.hypot(dx, dy) <= hitRadiusWorld) {
+                anchorHit = i;
+                break;
+              }
+            }
+            if (anchorHit >= 0) {
+              canvasEl.setPointerCapture(pointerId);
+              // Shift-click toggles set membership; plain click
+              // replaces. Mirrors `EditorContext`'s top-level
+              // node selection semantics so the muscle memory
+              // transfers.
+              const nextSelection = new Set<number>(
+                e.shiftKey ? existing.selectedAnchorIndices : [],
+              );
+              if (e.shiftKey && nextSelection.has(anchorHit)) {
+                nextSelection.delete(anchorHit);
+              } else {
+                nextSelection.add(anchorHit);
+              }
+              stateRef.current = {
+                ...existing,
+                cursor: { x: wx, y: wy },
+                selectedAnchorIndices: nextSelection,
+                drag: {
+                  kind: "anchor",
+                  pointerId,
+                  anchorIndex: anchorHit,
+                  cumulativeDx: 0,
+                  cumulativeDy: 0,
+                  lastWorldX: wx,
+                  lastWorldY: wy,
+                },
+                dragMoved: false,
+              };
+              notify();
+              return;
+            }
+            // Click in empty space inside `nodeEdit` clears
+            // the anchor selection — same affordance as the
+            // top-level select tool's empty-canvas click.
+            stateRef.current = {
+              ...existing,
+              cursor: { x: wx, y: wy },
+              selectedAnchorIndices: new Set<number>(),
+              drag: null,
+              dragMoved: false,
+            };
+            notify();
+            return;
+          }
+        }
 
         if (activeTool === "select") {
           // Click-to-select: hit-test, then either start a move drag
@@ -811,6 +1371,111 @@ export function useToolStateMachine(
           return;
         }
 
+        if (drag.kind === "nodeEdit") {
+          // Phase B3 — node editor pointermove. Like `pen`, the
+          // `nodeEdit` variant has no top-level `pointerId`
+          // because the gesture spans many pointer presses (each
+          // anchor / handle drag is its own captured-pointer
+          // session). We always update `cursor` for the hover
+          // indicator; we update the active drag only when the
+          // event's `pointerId` matches the captured drag.
+          //
+          // Same useSyncExternalStore caveat as `pen`: new
+          // object identity required so subscribers re-paint.
+          if (drag.drag !== null && drag.drag.pointerId === pointerId) {
+            if (drag.drag.kind === "anchor") {
+              const dx = wx - drag.drag.lastWorldX;
+              const dy = wy - drag.drag.lastWorldY;
+              const cumulativeDx = drag.drag.cumulativeDx + dx;
+              const cumulativeDy = drag.drag.cumulativeDy + dy;
+              // Apply the delta to ALL selected anchors so a
+              // multi-select drags as a group. Singleton drags
+              // also fall through this path — `selectedAnchorIndices`
+              // is guaranteed to include `anchorIndex` because
+              // the pointerdown branch always added it.
+              const nextAnchors = drag.anchors.map((a, i) => {
+                if (!drag.selectedAnchorIndices.has(i)) return a;
+                return {
+                  x: a.x + dx,
+                  y: a.y + dy,
+                  inHandle:
+                    a.inHandle === null
+                      ? null
+                      : {
+                          x: a.inHandle.x + dx,
+                          y: a.inHandle.y + dy,
+                        },
+                  outHandle:
+                    a.outHandle === null
+                      ? null
+                      : {
+                          x: a.outHandle.x + dx,
+                          y: a.outHandle.y + dy,
+                        },
+                };
+              });
+              stateRef.current = {
+                ...drag,
+                anchors: nextAnchors,
+                cursor: { x: wx, y: wy },
+                drag: {
+                  kind: "anchor",
+                  pointerId: drag.drag.pointerId,
+                  anchorIndex: drag.drag.anchorIndex,
+                  cumulativeDx,
+                  cumulativeDy,
+                  lastWorldX: wx,
+                  lastWorldY: wy,
+                },
+                dragMoved:
+                  drag.dragMoved ||
+                  Math.hypot(cumulativeDx, cumulativeDy) > 0,
+              };
+              notify();
+              return;
+            }
+            // handle drag — set the handle's coords to the cursor
+            // directly (no cumulative delta — handle follows
+            // cursor 1:1).
+            const idx = drag.drag.anchorIndex;
+            const side = drag.drag.side;
+            const nextAnchors = drag.anchors.map((a, i) => {
+              if (i !== idx) return a;
+              return {
+                ...a,
+                inHandle:
+                  side === "in" ? { x: wx, y: wy } : a.inHandle,
+                outHandle:
+                  side === "out" ? { x: wx, y: wy } : a.outHandle,
+              };
+            });
+            stateRef.current = {
+              ...drag,
+              anchors: nextAnchors,
+              cursor: { x: wx, y: wy },
+              drag: {
+                kind: "handle",
+                pointerId: drag.drag.pointerId,
+                anchorIndex: idx,
+                side,
+                cursorWorldX: wx,
+                cursorWorldY: wy,
+              },
+              dragMoved: true,
+            };
+            notify();
+            return;
+          }
+          // Pointer moved with no active drag — just update
+          // cursor for the hover indicator.
+          stateRef.current = {
+            ...drag,
+            cursor: { x: wx, y: wy },
+          };
+          notify();
+          return;
+        }
+
         if (drag.pointerId !== pointerId) return;
 
         if (drag.kind === "pan") {
@@ -952,6 +1617,35 @@ export function useToolStateMachine(
             ...drag,
             anchors: [...drag.anchors, newAnchor],
             pending: null,
+            cursor: { x: wx, y: wy },
+          };
+          notify();
+          return;
+        }
+
+        if (drag.kind === "nodeEdit") {
+          // Phase B3 — node editor pointerup. Like `pen`, the
+          // gesture spans pointer-press cycles so we don't
+          // collapse to `idle`. We just clear the active drag.
+          // The mutation to the anchor positions has already
+          // landed via pointermove; the actual bridge commit is
+          // deferred until the user presses Enter or switches
+          // tools (see `commitNodeEdit`). This matches Figma /
+          // Illustrator: every anchor/handle drag updates the
+          // overlay live but the document only takes a single
+          // operation at end-of-edit-session.
+          if (drag.drag === null || drag.drag.pointerId !== pointerId) {
+            return;
+          }
+          try {
+            canvasEl.releasePointerCapture(pointerId);
+          } catch {
+            // capture might already be released — same as
+            // the non-nodeEdit path below.
+          }
+          stateRef.current = {
+            ...drag,
+            drag: null,
             cursor: { x: wx, y: wy },
           };
           notify();
@@ -1134,6 +1828,9 @@ export function useToolStateMachine(
     getLastCursorWorld,
     commitPen,
     cancelPen,
+    enterNodeEdit,
+    commitNodeEdit,
+    cancelNodeEdit,
     subscribe,
   };
 }

@@ -103,6 +103,42 @@ export type PathSegmentWire =
   | { op: "close" };
 
 /**
+ * SVG-style fill rule, mirrors `kcreate_vector::FillRule` with the
+ * `snake_case` serde rename.
+ */
+export type FillRuleWire = "non_zero" | "even_odd";
+
+/**
+ * Phase B3 — snapshot returned by `CanvasBridge.pathGetSegments` for
+ * the node editor's anchor/handle overlay. Mirrors
+ * `crates/kcreate_bridge/src/document.rs::PathSnapshot`.
+ *
+ * `segments` carry the path's intrinsic (path-local) geometry —
+ * the same wire shape `createPath` accepts. `closed` /
+ * `fillRule` mirror `VectorPath.closed` / `VectorPath.fill_rule`.
+ *
+ * `translationX` / `translationY` carry the node's current
+ * `transform.tx` / `transform.ty` so the renderer can project
+ * path-local anchors into world space without a second IPC round
+ * trip. **World position = path-local + translation.** The node
+ * editor preserves this contract by NOT folding the translation
+ * into the path coordinates on edit; `canvas.moveNode` keeps
+ * owning the translation so undo of a node move stays a clean
+ * transform patch instead of a path-replace patch.
+ *
+ * Field names use camelCase here (TS convention) but the Rust
+ * struct serializes them as `translation_x` / `translation_y`;
+ * the bridge re-shapes between the two when crossing N-API.
+ */
+export interface PathSnapshot {
+  segments: PathSegmentWire[];
+  closed: boolean;
+  fillRule: FillRuleWire;
+  translationX: number;
+  translationY: number;
+}
+
+/**
  * Phase B2 — Pathfinder boolean op wire token.
  *
  * Mirrors `kcreate_vector::BooleanOp`'s `serde(rename_all =
@@ -1079,6 +1115,47 @@ export interface CanvasBridge {
    *   `intersect` on non-overlapping inputs).
    */
   pathBoolean(op: PathBooleanOp, sourceIds: string[]): Promise<string[]>;
+  /**
+   * Phase B3 — read a `VectorLayer`'s geometry into a
+   * {@link PathSnapshot} for the node editor's anchor/handle
+   * overlay. The returned `segments` are path-local; the
+   * `translationX` / `translationY` carry the node's
+   * `transform.tx` / `transform.ty` so the renderer can project
+   * each anchor into world space without a second IPC.
+   *
+   * Read-only — records NO operation in the undo log. Caller is
+   * the node-edit state machine's tool-entry handler.
+   *
+   * Rejects with `Status::InvalidArg` for every
+   * `PathSegmentsError` variant (`NodeNotFound`, `NotVectorLayer`,
+   * `MissingPathMetadata`) so the renderer's typed-toast path can
+   * tell the user "the layer disappeared, please re-select" vs.
+   * the generic "internal error" toast.
+   */
+  pathGetSegments(nodeId: string): Promise<PathSnapshot>;
+  /**
+   * Phase B3 — write new geometry to a `VectorLayer` from the
+   * node editor. `segments` are path-local (intrinsic to the
+   * path, NOT world-space); the bridge recomputes `node.bounds`
+   * from them but leaves `transform.tx` / `transform.ty`
+   * untouched so `canvas.moveNode` keeps owning node position.
+   *
+   * Records ONE undoable `canvas_path_set_segments` operation
+   * per call. Callers MUST coalesce pointermove-rate updates
+   * into a single end-of-gesture call so the operation log stays
+   * coarse-grained (one drag = one undo step) — matches the
+   * `canvas.moveNode` discipline.
+   *
+   * Rejects with `Status::InvalidArg` for `PathSegmentsError`
+   * variants `NodeNotFound`, `NotVectorLayer`, `InvalidJson`,
+   * `Empty`, and `MissingMoveTo` — same routing as `createPath`
+   * and `pathBoolean`.
+   */
+  pathSetSegments(
+    nodeId: string,
+    segments: PathSegmentWire[],
+    closed: boolean,
+  ): Promise<void>;
   createText(
     parentId: string | null,
     x: number,

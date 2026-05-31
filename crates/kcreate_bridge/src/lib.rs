@@ -105,7 +105,18 @@ fn map_doc_err(e: DocumentBridgeError) -> NapiError {
         // doc-comment in `document.rs:140-146` that explicitly
         // mirrors the `CreatePath` routing rationale. Devin Review
         // BUG_0001 (round 4) on PR #38.
-        | DocumentBridgeError::PathBoolean(_) => Status::InvalidArg,
+        | DocumentBridgeError::PathBoolean(_)
+        // Phase B3 Node editor: every `PathSegmentsError` variant
+        // (`NodeNotFound`, `NotVectorLayer`, `MissingPathMetadata`,
+        // `InvalidJson`, `Empty`, `MissingMoveTo`) is caller-side —
+        // either a stale node id (the node was deleted between
+        // tool-enter and the next read/write) or a wire validation
+        // miss (renderer regression in the segment serializer).
+        // Same category as `CreatePath` / `PathBoolean`; we surface
+        // as `InvalidArg` so the renderer's typed-toast path can
+        // tell the user "the layer disappeared, please re-select"
+        // vs. "internal serialization bug — please report".
+        | DocumentBridgeError::PathSegments(_) => Status::InvalidArg,
         // Marketplace errors that come from a user-supplied template
         // path / id are user-correctable (bad path, wrong id, duplicate
         // install) — surface as InvalidArg so the renderer can show
@@ -1627,6 +1638,56 @@ pub fn canvas_path_boolean(op: String, source_ids: Vec<String>) -> NapiResult<Ve
     document::canvas_path_boolean(&op, ids)
         .map(|out| out.into_iter().map(|u| u.to_string()).collect())
         .map_err(map_doc_err)
+}
+
+/// Phase B3 (Node editor): read a `VectorLayer` node's geometry
+/// for the anchor/handle overlay. Returns a JSON-encoded
+/// `PathSnapshot` (segments + closed + fill_rule + translation_x/y)
+/// — see `apps/desktop/shared/scene.ts::PathSnapshot` for the TS
+/// wire mirror. JSON instead of a structured N-API value mirrors
+/// `canvas_create_path` / `canvas_path_boolean`: keeps adding a
+/// new `PathSegment` variant in `kcreate_vector` a pure
+/// kcreate_vector change.
+///
+/// Records NO operation — read-only.
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn canvas_path_get_segments(node_id: String) -> NapiResult<String> {
+    let id = parse_uuid(&node_id)?;
+    let snap = document::canvas_path_get_segments(id).map_err(map_doc_err)?;
+    serde_json::to_string(&snap).map_err(|e| {
+        // Snapshot serialisation can only fail on a malformed
+        // `PathSnapshot` (impossible — we just built it from a
+        // serde-deserialized `VectorPath`) but we surface it via
+        // the standard error route so a future schema change
+        // surfaces a typed `GenericFailure` instead of a panic.
+        NapiError::new(
+            Status::GenericFailure,
+            format!("kcreate_bridge: snapshot serialise: {e}"),
+        )
+    })
+}
+
+/// Phase B3 (Node editor): write new geometry to a `VectorLayer`
+/// node from the node editor. `segments_json` is the JSON
+/// serialization of `Vec<kcreate_vector::PathSegment>` — same
+/// wire shape as `canvas_create_path`. `closed` becomes
+/// `VectorPath.closed`.
+///
+/// Records ONE undoable `canvas_path_set_segments` operation per
+/// call; the renderer is expected to coalesce per-frame
+/// pointermove updates into a single end-of-gesture call so the
+/// operation log stays coarse-grained (one drag = one undo step),
+/// matching the `canvas_move_node` discipline.
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn canvas_path_set_segments(
+    node_id: String,
+    segments_json: String,
+    closed: bool,
+) -> NapiResult<()> {
+    let id = parse_uuid(&node_id)?;
+    document::canvas_path_set_segments(id, &segments_json, closed).map_err(map_doc_err)
 }
 
 /// Translate a node by `(dx, dy)` in world coordinates. Records an
@@ -5864,5 +5925,51 @@ mod tests {
             crate::document::CreatePathError::Empty,
         ));
         assert_eq!(err.status, Status::InvalidArg);
+    }
+
+    /// Phase B3 (Node editor): every `PathSegmentsError` sub-variant
+    /// must route to `Status::InvalidArg` so the renderer's typed-toast
+    /// path fires (e.g. "the layer disappeared, please re-select")
+    /// instead of the generic "internal error" fallback. Mirrors the
+    /// `PathBoolean` exhaustiveness test above — if a new variant
+    /// lands without being listed here, the compile-time `match`
+    /// exhaustiveness fails and forces a re-audit of `map_doc_err`.
+    #[test]
+    fn map_doc_err_routes_every_path_segments_variant_to_invalid_arg() {
+        use crate::document::PathSegmentsError;
+        let sample = Uuid::nil();
+        let variants: Vec<PathSegmentsError> = vec![
+            PathSegmentsError::NodeNotFound(sample),
+            PathSegmentsError::NotVectorLayer {
+                id: sample,
+                got: NodeType::TextLayer,
+            },
+            PathSegmentsError::MissingPathMetadata(sample),
+            PathSegmentsError::InvalidJson("expected value at line 1 col 1".into()),
+            PathSegmentsError::Empty,
+            PathSegmentsError::MissingMoveTo,
+        ];
+
+        let exhaustiveness_audit = |v: &PathSegmentsError| match v {
+            PathSegmentsError::NodeNotFound(_)
+            | PathSegmentsError::NotVectorLayer { .. }
+            | PathSegmentsError::MissingPathMetadata(_)
+            | PathSegmentsError::InvalidJson(_)
+            | PathSegmentsError::Empty
+            | PathSegmentsError::MissingMoveTo => (),
+        };
+        for v in &variants {
+            exhaustiveness_audit(v);
+        }
+
+        for variant in variants {
+            let label = format!("{variant:?}");
+            let err = map_doc_err(DocumentBridgeError::PathSegments(variant));
+            assert_eq!(
+                err.status,
+                Status::InvalidArg,
+                "{label} must map to InvalidArg so the renderer's typed-toast path fires",
+            );
+        }
     }
 }

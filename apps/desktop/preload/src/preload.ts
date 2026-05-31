@@ -22,6 +22,8 @@ import type {
   BrandKitBridge,
   CanvasBatchItem,
   CanvasBridge,
+  PathSegmentWire,
+  FillRuleWire,
   ComponentBridge,
   ComponentInfo,
   SmartAnimateSnapshot,
@@ -988,6 +990,54 @@ const canvas: CanvasBridge = {
       op,
       sourceIds,
     )) as string[];
+  },
+  // Phase B3 — Node editor read entry. The bridge returns a
+  // JSON-encoded `PathSnapshot` (Rust serde uses snake_case keys
+  // `translation_x` / `translation_y` / `fill_rule`); we re-shape
+  // to the camelCase TS wire (`translationX` / `translationY` /
+  // `fillRule`) here so renderer consumers only deal with the
+  // shape declared in `apps/desktop/shared/scene.ts`. Doing the
+  // re-shape in preload (rather than in every renderer caller)
+  // keeps the wire boundary single-sourced.
+  async pathGetSegments(nodeId: string) {
+    const json = (await ipcRenderer.invoke(
+      "kcreate/canvas/pathGetSegments",
+      nodeId,
+    )) as string;
+    const raw = JSON.parse(json) as {
+      segments: PathSegmentWire[];
+      closed: boolean;
+      fill_rule: FillRuleWire;
+      translation_x: number;
+      translation_y: number;
+    };
+    return {
+      segments: raw.segments,
+      closed: raw.closed,
+      fillRule: raw.fill_rule,
+      translationX: raw.translation_x,
+      translationY: raw.translation_y,
+    };
+  },
+  // Phase B3 — Node editor write entry. Segments are
+  // path-local (the bridge keeps the node's transform
+  // translation independent of geometry — see the doc-comment
+  // on `PathSnapshot`). We serialize on the renderer side for
+  // the same reason `createPath` does: keep the wire payload's
+  // JSON shape (the serde-tagged `PathSegment` representation)
+  // as the single source of truth.
+  async pathSetSegments(
+    nodeId: string,
+    segments: PathSegmentWire[],
+    closed: boolean,
+  ): Promise<void> {
+    const segmentsJson = JSON.stringify(segments);
+    await ipcRenderer.invoke(
+      "kcreate/canvas/pathSetSegments",
+      nodeId,
+      segmentsJson,
+      closed,
+    );
   },
   async createText(
     parentId,

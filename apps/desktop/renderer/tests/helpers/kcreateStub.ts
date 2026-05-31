@@ -124,6 +124,21 @@ const defaultsByMethod: Record<string, () => unknown> = {
   "document.projectOpen": () => null,
   "document.status": () => null,
   "document.getDocumentTree": () => [],
+  // `canvasSnap.query` returns `null` by default — no snap. Tests
+  // that exercise the snap path override this. The bridge contract
+  // is `(nodeId, x, y, w, h, threshold) => SnapResult | null`, where
+  // `SnapResult = { dx, dy, guides }`.
+  "canvasSnap.query": () => null,
+  // `canvas.hitTest` returns null by default (miss). The state
+  // machine's select-tool branch routes through here.
+  "canvas.hitTest": () => null,
+  "canvas.setSelection": () => undefined,
+  "canvas.clearSelection": () => undefined,
+  "canvas.moveNode": () => undefined,
+  "canvas.createRect": () => "default-rect-id",
+  "canvas.createEllipse": () => "default-ellipse-id",
+  "canvas.createLine": () => "default-line-id",
+  "canvas.createText": () => "default-text-id",
   setLayerColor: () => undefined,
 };
 
@@ -164,6 +179,7 @@ export function installKcreateStub(): KcreateStubHandle {
     artboard: namespace("artboard"),
     document: namespace("document"),
     canvas: namespace("canvas"),
+    canvasSnap: namespace("canvasSnap"),
     text: namespace("text"),
     project: namespace("project"),
     audit: namespace("audit"),

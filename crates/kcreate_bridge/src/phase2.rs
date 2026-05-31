@@ -2594,12 +2594,23 @@ pub fn text_layout_compute(node_id: Uuid) -> Result<String> {
 /// here because the bridge crate is the wire-format boundary
 /// (rule 4 of AGENTS.md). Adding a field on either side requires
 /// adding it here too plus a test in `document.rs`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct TextStyleWire {
-    font_family: String,
-    font_size: f32,
-    line_height: f64,
+pub struct TextStyleWire {
+    pub font_family: String,
+    pub font_size: f32,
+    pub line_height: f64,
+}
+
+impl Default for TextStyleWire {
+    fn default() -> Self {
+        let inner = kcreate_text::TextStyle::default();
+        Self {
+            font_family: inner.font_family,
+            font_size: inner.font_size,
+            line_height: inner.line_height,
+        }
+    }
 }
 
 impl From<TextStyleWire> for kcreate_text::TextStyle {
@@ -2610,6 +2621,390 @@ impl From<TextStyleWire> for kcreate_text::TextStyle {
             line_height: w.line_height,
         }
     }
+}
+
+impl From<&kcreate_text::TextStyle> for TextStyleWire {
+    fn from(s: &kcreate_text::TextStyle) -> Self {
+        Self {
+            font_family: s.font_family.clone(),
+            font_size: s.font_size,
+            line_height: s.line_height,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Phase A1 — inline text editor + font controls.
+//
+// `text_set_content`, `text_set_style`, `text_replace_range`, and
+// `text_list_fonts` form the wire surface the renderer's
+// `TextStylePanel` + canvas inline editor consume. The first three
+// mutate the canonical `TextLayerMeta` payload at
+// `metadata[TEXT_LAYER_METADATA_KEY]` (so `scene_sync` sees the
+// updated text the next frame) and record an undoable operation;
+// the fourth is a pure read of the process-wide `FontManager`.
+//
+// Index convention for `text_replace_range`: `start` / `end` are
+// **UTF-16 code-unit offsets**, matching JavaScript's `String.length`
+// / `Selection.anchorOffset`. The bridge converts to / from UTF-8
+// internally; surrogate-splitting requests are rejected.
+// ---------------------------------------------------------------------------
+
+/// Splice `[start..end]` (UTF-16 code-unit indices) of `text` with
+/// `replacement`. Returns the new UTF-8 string. Surrogate-pair
+/// splitting requests (`start` / `end` landing on a low surrogate)
+/// are rejected because they would produce invalid UTF-16.
+fn splice_utf16(text: &str, start: u32, end: u32, replacement: &str) -> Result<String> {
+    if start > end {
+        return Err(DocumentBridgeError::InvalidArgument {
+            argument: "range".into(),
+            value: format!("start {start} is greater than end {end}"),
+        });
+    }
+    let utf16: Vec<u16> = text.encode_utf16().collect();
+    let start_us = start as usize;
+    let end_us = end as usize;
+    if end_us > utf16.len() {
+        return Err(DocumentBridgeError::InvalidArgument {
+            argument: "range".into(),
+            value: format!(
+                "end {end} is past the end of the text ({} UTF-16 code units)",
+                utf16.len()
+            ),
+        });
+    }
+    // Reject splits in the middle of a surrogate pair. A high
+    // surrogate is in `0xD800..=0xDBFF`; if it sits at `index - 1`
+    // then `index` would split the pair and `String::from_utf16`
+    // would error anyway, so we surface a structured error here
+    // instead of letting the implicit failure propagate as an
+    // opaque `Internal` later.
+    let on_surrogate_boundary = |idx: usize| -> bool {
+        if idx == 0 || idx > utf16.len() {
+            return false;
+        }
+        let prev = utf16[idx - 1];
+        (0xD800..=0xDBFF).contains(&prev)
+    };
+    if on_surrogate_boundary(start_us) || on_surrogate_boundary(end_us) {
+        return Err(DocumentBridgeError::InvalidArgument {
+            argument: "range".into(),
+            value: format!("range {start}..{end} would split a UTF-16 surrogate pair"),
+        });
+    }
+    let mut next: Vec<u16> =
+        Vec::with_capacity(utf16.len() - (end_us - start_us) + replacement.encode_utf16().count());
+    next.extend_from_slice(&utf16[..start_us]);
+    next.extend(replacement.encode_utf16());
+    next.extend_from_slice(&utf16[end_us..]);
+    String::from_utf16(&next).map_err(|e| DocumentBridgeError::InvalidArgument {
+        argument: "replacement".into(),
+        value: format!("produced invalid UTF-16: {e}"),
+    })
+}
+
+/// Read the current `TextLayerMeta` for a node, falling back to a
+/// reasonable default when the slot is absent (e.g. a TextLayer
+/// inserted by a legacy code path that never wrote the metadata
+/// key). Used by the inline-editor + style setters so they can
+/// `before := load; after := mutate(before)` even for nodes that
+/// don't yet carry a payload.
+fn load_text_meta_or_default(node: &Node) -> TextLayerMeta {
+    if let Some(meta) = kcreate_export::text_layer_meta(node) {
+        return meta;
+    }
+    // Fallback: try the legacy "bare string at metadata[text]"
+    // convention some bridge tests still use, otherwise default.
+    let text = node
+        .metadata
+        .get(TEXT_LAYER_METADATA_KEY)
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .unwrap_or_default();
+    let style = kcreate_text::TextStyle::default();
+    TextLayerMeta {
+        text,
+        font_family: style.font_family,
+        font_size: style.font_size,
+    }
+}
+
+fn ensure_text_layer(node: &Node, node_id: Uuid) -> Result<()> {
+    if node.node_type != NodeType::TextLayer {
+        return Err(DocumentBridgeError::WrongNodeType {
+            expected: NodeType::TextLayer,
+            got: node.node_type,
+        });
+    }
+    // `node_id` is here only so the error message identifies the
+    // offending node — borrow it explicitly so clippy doesn't flag
+    // it as unused on the happy path.
+    let _ = node_id;
+    Ok(())
+}
+
+/// Replace the text content of a `TextLayer` node and record an
+/// undoable `text_set_content` operation. The font family / size on
+/// the node's `TextLayerMeta` are preserved — use
+/// [`text_set_style`] to mutate those. The bridge re-runs scene
+/// sync after the operation so the renderer picks up the new
+/// content next frame.
+pub fn text_set_content(node_id: Uuid, content: &str) -> Result<()> {
+    with_workspace_mut(|ws| {
+        let node = ws
+            .project
+            .document
+            .get_node(node_id)
+            .ok_or(DocumentBridgeError::NodeNotFound(node_id))?;
+        ensure_text_layer(node, node_id)?;
+        let before = load_text_meta_or_default(node);
+        let after = TextLayerMeta {
+            text: content.to_string(),
+            font_family: before.font_family.clone(),
+            font_size: before.font_size,
+        };
+        let before_json = serde_json::to_value(&before)?;
+        let after_json = serde_json::to_value(&after)?;
+        let node_mut = ws
+            .project
+            .document
+            .get_node_mut(node_id)
+            .ok_or(DocumentBridgeError::NodeNotFound(node_id))?;
+        node_mut.metadata.insert(
+            TEXT_LAYER_METADATA_KEY.to_string(),
+            serde_json::to_value(&after)?,
+        );
+        node_mut.touch();
+        ws.project.modified_at = Utc::now();
+        let op = Operation::new(
+            "user",
+            "text_set_content",
+            before_json,
+            after_json,
+            vec![node_id],
+        );
+        ws.project.execute_operation(op);
+        Ok(())
+    })?;
+    sync_scene_after_change();
+    Ok(())
+}
+
+/// Splice the UTF-16 range `[start..end]` of a `TextLayer` node's
+/// text with `replacement` and record an undoable
+/// `text_replace_range` operation. The wire surface mirrors
+/// `String.prototype.replace` semantics so the renderer's inline
+/// contenteditable editor can call
+/// `replaceRange(0, content.length, newContent)` on blur.
+///
+/// `start` and `end` are UTF-16 code-unit offsets (matching JS
+/// `String.length`); the bridge rejects ranges that land in the
+/// middle of a surrogate pair or that extend past the existing
+/// content.
+pub fn text_replace_range(node_id: Uuid, start: u32, end: u32, replacement: &str) -> Result<()> {
+    with_workspace_mut(|ws| {
+        let node = ws
+            .project
+            .document
+            .get_node(node_id)
+            .ok_or(DocumentBridgeError::NodeNotFound(node_id))?;
+        ensure_text_layer(node, node_id)?;
+        let before = load_text_meta_or_default(node);
+        let new_text = splice_utf16(&before.text, start, end, replacement)?;
+        let after = TextLayerMeta {
+            text: new_text,
+            font_family: before.font_family.clone(),
+            font_size: before.font_size,
+        };
+        let before_json = serde_json::to_value(&before)?;
+        let after_json = serde_json::to_value(&after)?;
+        let node_mut = ws
+            .project
+            .document
+            .get_node_mut(node_id)
+            .ok_or(DocumentBridgeError::NodeNotFound(node_id))?;
+        node_mut.metadata.insert(
+            TEXT_LAYER_METADATA_KEY.to_string(),
+            serde_json::to_value(&after)?,
+        );
+        node_mut.touch();
+        ws.project.modified_at = Utc::now();
+        let op = Operation::new(
+            "user",
+            "text_replace_range",
+            before_json,
+            after_json,
+            vec![node_id],
+        );
+        ws.project.execute_operation(op);
+        Ok(())
+    })?;
+    sync_scene_after_change();
+    Ok(())
+}
+
+/// Replace the text style (`font_family`, `font_size`, `line_height`)
+/// for a `TextLayer` node and record an undoable
+/// `text_set_style` operation.
+///
+/// The wire format is [`TextStyleWire`] (camelCase JSON). The bridge
+/// keeps the canonical `TextLayerMeta` payload in sync — `family` /
+/// `size` are written both to `metadata[TEXT_LAYER_METADATA_KEY]`
+/// (which `scene_sync` reads to drive the renderer) and to
+/// `metadata["text_style"]` (which `text_layout_compute` reads for
+/// the inspector's paragraph layout). Keeping them in lockstep is
+/// the same contract `text_autofit_recompute` already maintains.
+pub fn text_set_style(node_id: Uuid, style_json: &str) -> Result<()> {
+    let new_style: TextStyleWire =
+        serde_json::from_str(style_json).map_err(|e| DocumentBridgeError::InvalidArgument {
+            argument: "style_json".into(),
+            value: format!("{e}"),
+        })?;
+    if !new_style.font_size.is_finite() || new_style.font_size <= 0.0 {
+        return Err(DocumentBridgeError::InvalidArgument {
+            argument: "fontSize".into(),
+            value: format!(
+                "font_size must be finite and positive, got {}",
+                new_style.font_size
+            ),
+        });
+    }
+    if !new_style.line_height.is_finite() || new_style.line_height <= 0.0 {
+        return Err(DocumentBridgeError::InvalidArgument {
+            argument: "lineHeight".into(),
+            value: format!(
+                "line_height must be finite and positive, got {}",
+                new_style.line_height
+            ),
+        });
+    }
+    if new_style.font_family.trim().is_empty() {
+        return Err(DocumentBridgeError::InvalidArgument {
+            argument: "fontFamily".into(),
+            value: "fontFamily must be a non-empty string".into(),
+        });
+    }
+    with_workspace_mut(|ws| {
+        let node = ws
+            .project
+            .document
+            .get_node(node_id)
+            .ok_or(DocumentBridgeError::NodeNotFound(node_id))?;
+        ensure_text_layer(node, node_id)?;
+        let before_meta = load_text_meta_or_default(node);
+        let before_style: TextStyleWire = node
+            .metadata
+            .get("text_style")
+            .and_then(|v| serde_json::from_value::<TextStyleWire>(v.clone()).ok())
+            .unwrap_or_else(|| TextStyleWire {
+                font_family: before_meta.font_family.clone(),
+                font_size: before_meta.font_size,
+                line_height: TextStyleWire::default().line_height,
+            });
+        let after_meta = TextLayerMeta {
+            text: before_meta.text.clone(),
+            font_family: new_style.font_family.clone(),
+            font_size: new_style.font_size,
+        };
+        let before_json = serde_json::json!({
+            "meta": serde_json::to_value(&before_meta)?,
+            "style": serde_json::to_value(&before_style)?,
+        });
+        let after_json = serde_json::json!({
+            "meta": serde_json::to_value(&after_meta)?,
+            "style": serde_json::to_value(&new_style)?,
+        });
+        let node_mut = ws
+            .project
+            .document
+            .get_node_mut(node_id)
+            .ok_or(DocumentBridgeError::NodeNotFound(node_id))?;
+        node_mut.metadata.insert(
+            TEXT_LAYER_METADATA_KEY.to_string(),
+            serde_json::to_value(&after_meta)?,
+        );
+        node_mut
+            .metadata
+            .insert("text_style".to_string(), serde_json::to_value(&new_style)?);
+        node_mut.touch();
+        ws.project.modified_at = Utc::now();
+        let op = Operation::new(
+            "user",
+            "text_set_style",
+            before_json,
+            after_json,
+            vec![node_id],
+        );
+        ws.project.execute_operation(op);
+        Ok(())
+    })?;
+    sync_scene_after_change();
+    Ok(())
+}
+
+/// Return the sorted, deduplicated list of font family names known
+/// to the process-wide [`kcreate_text::FontManager`]. The renderer's
+/// font-family combobox populates from this list.
+///
+/// First call lazily loads system fonts (fontdb walks the OS font
+/// directories); subsequent calls reuse the cached database. The
+/// result excludes empty family names (some bitmap-only faces
+/// surface without a usable `family` entry).
+pub fn text_list_fonts() -> Result<Vec<String>> {
+    use std::collections::BTreeSet;
+    let manager = kcreate_text::FontManager::new();
+    let mut families: BTreeSet<String> = BTreeSet::new();
+    for face in manager.all_faces() {
+        let name = face.family.trim();
+        if !name.is_empty() {
+            families.insert(name.to_string());
+        }
+    }
+    Ok(families.into_iter().collect())
+}
+
+/// Read the current text-style wire payload for a `TextLayer` node
+/// (the `metadata["text_style"]` slot, falling back to the
+/// `TextLayerMeta` family / size + the default line height when
+/// the override slot is missing). Used by the renderer's
+/// `TextStylePanel` to hydrate its controls on selection change.
+pub fn text_style_get(node_id: Uuid) -> Result<String> {
+    let style = with_workspace(|ws| {
+        let node = ws
+            .project
+            .document
+            .get_node(node_id)
+            .ok_or(DocumentBridgeError::NodeNotFound(node_id))?;
+        ensure_text_layer(node, node_id)?;
+        let meta = load_text_meta_or_default(node);
+        let style: TextStyleWire = node
+            .metadata
+            .get("text_style")
+            .and_then(|v| serde_json::from_value::<TextStyleWire>(v.clone()).ok())
+            .unwrap_or_else(|| TextStyleWire {
+                font_family: meta.font_family.clone(),
+                font_size: meta.font_size,
+                line_height: TextStyleWire::default().line_height,
+            });
+        Ok(style)
+    })?;
+    Ok(serde_json::to_string(&style)?)
+}
+
+/// Read the current text content for a `TextLayer` node. Used by
+/// the renderer's `TextStylePanel` content textarea + the inline
+/// canvas editor to hydrate the contenteditable surface.
+pub fn text_content_get(node_id: Uuid) -> Result<String> {
+    let text = with_workspace(|ws| {
+        let node = ws
+            .project
+            .document
+            .get_node(node_id)
+            .ok_or(DocumentBridgeError::NodeNotFound(node_id))?;
+        ensure_text_layer(node, node_id)?;
+        Ok(load_text_meta_or_default(node).text)
+    })?;
+    Ok(text)
 }
 
 /// Read the `OpenTypeFeatures` metadata for a `TextLayer` node and

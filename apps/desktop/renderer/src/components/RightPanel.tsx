@@ -27,6 +27,7 @@ import { ArtifactPublishPanel } from "./ArtifactPublishPanel";
 import { ConstraintsPanel } from "./ConstraintsPanel";
 import { EncryptionPanel } from "./EncryptionPanel";
 import { TextFramePanel } from "./TextFramePanel";
+import { TextStylePanel } from "./TextStylePanel";
 import { TokenBindingControl } from "./TokenBindingControl";
 import { Icon, type IconName } from "./Icon";
 
@@ -611,6 +612,8 @@ function PropertiesPanel({
       ) : null}
       {node.nodeType === "TextLayer" ? (
         <>
+          <hr style={hrStyle} />
+          <TextStylePanel node={node} onStatus={onStatus} />
           <hr style={hrStyle} />
           <TextFramePanel node={node} onStatus={onStatus} />
           <hr style={hrStyle} />

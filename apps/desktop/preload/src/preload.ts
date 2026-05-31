@@ -150,6 +150,8 @@ import type {
   TextWrapMode,
   OpenTypeFeatures,
   TextLayoutWire,
+  TextBridge,
+  TextStyleWire,
   VectorOpsBridge,
   StrokeWidthProfile,
   PathEffectWire,
@@ -735,6 +737,26 @@ const runtime: RuntimeBridge = {
       target,
       content,
     )) as number;
+  },
+  async chooseExportTarget(
+    format: string,
+    defaultName: string,
+    defaultDir: string | null,
+  ): Promise<string | null> {
+    return (await ipcRenderer.invoke(
+      "kcreate/runtime/chooseExportTarget",
+      format,
+      defaultName,
+      defaultDir,
+    )) as string | null;
+  },
+  async chooseExportDirectory(
+    defaultDir: string | null,
+  ): Promise<string | null> {
+    return (await ipcRenderer.invoke(
+      "kcreate/runtime/chooseExportDirectory",
+      defaultDir,
+    )) as string | null;
   },
 };
 
@@ -2899,6 +2921,64 @@ const textFrame: TextFrameBridge = {
 };
 
 // ---------------------------------------------------------------------------
+// Phase A1 — inline text editor + font controls.
+//
+// Mirrors the `kcreate_bridge::text_*` entry points; each mutator
+// records an undoable operation on the Rust side. The wire format
+// for `setStyle` is `TextStyleWire` (camelCase JSON, fields
+// `fontFamily`, `fontSize`, `lineHeight`).
+// ---------------------------------------------------------------------------
+const text: TextBridge = {
+  async setContent(nodeId: string, content: string): Promise<void> {
+    await ipcRenderer.invoke(
+      "kcreate/text/content/set",
+      nodeId,
+      content,
+    );
+  },
+  async setStyle(nodeId: string, style: TextStyleWire): Promise<void> {
+    await ipcRenderer.invoke(
+      "kcreate/text/style/set",
+      nodeId,
+      JSON.stringify(style),
+    );
+  },
+  async replaceRange(
+    nodeId: string,
+    start: number,
+    end: number,
+    replacement: string,
+  ): Promise<void> {
+    await ipcRenderer.invoke(
+      "kcreate/text/range/replace",
+      nodeId,
+      start,
+      end,
+      replacement,
+    );
+  },
+  async getContent(nodeId: string): Promise<string> {
+    return (await ipcRenderer.invoke(
+      "kcreate/text/content/get",
+      nodeId,
+    )) as string;
+  },
+  async getStyle(nodeId: string): Promise<TextStyleWire> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/text/style/get",
+      nodeId,
+    )) as string;
+    return JSON.parse(raw) as TextStyleWire;
+  },
+  async listFonts(): Promise<string[]> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/text/fonts/list",
+    )) as string;
+    return JSON.parse(raw) as string[];
+  },
+};
+
+// ---------------------------------------------------------------------------
 // Phase 5 — vector path operations (Block C Tasks 15, 16, 18).
 // ---------------------------------------------------------------------------
 
@@ -3692,6 +3772,7 @@ contextBridge.exposeInMainWorld("kcreate", {
   canvasSnap,
   rasterOps,
   textFrame,
+  text,
   vectorOps,
   slice,
   session,

@@ -124,6 +124,13 @@ export function PreferencesPanel({
           telemetryOptIn: false,
           auditLogRetentionDays: 90,
         },
+        // Phase A2 — sticky export-dialog state starts empty on
+        // reset. The save-as flow re-populates it the first time
+        // the user picks a destination after the reset.
+        export: {
+          lastDirByFormat: {},
+          lastBatchDir: null,
+        },
       };
       await window.kcreate.phase10.preferencesSave(defaultPrefs);
       setPrefs(defaultPrefs);

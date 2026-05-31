@@ -106,11 +106,14 @@ fn batch_round_trips_all_four_primitives() {
         );
     }
 
-    let nodes: Vec<_> = ids.iter().map(|id| {
-        tree.iter().find(|n| n.id == *id).unwrap_or_else(|| {
-            panic!("batch id {id} should appear in document tree");
+    let nodes: Vec<_> = ids
+        .iter()
+        .map(|id| {
+            tree.iter().find(|n| n.id == *id).unwrap_or_else(|| {
+                panic!("batch id {id} should appear in document tree");
+            })
         })
-    }).collect();
+        .collect();
 
     // Rect → VectorLayer, default name "Rectangle"
     assert_eq!(nodes[0].node_type, "VectorLayer");

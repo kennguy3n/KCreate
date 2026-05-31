@@ -7,6 +7,7 @@ import {
 } from "../components/AnnotationOverlay";
 import { CanvasHost, type ViewportState } from "../components/CanvasHost";
 import { ConflictToast } from "../components/ConflictToast";
+import { InlineTextEditor } from "../components/InlineTextEditor";
 import { CursorOverlay } from "../components/CursorOverlay";
 import { LeftPanel } from "../components/LeftPanel";
 import { PageNavigator } from "../components/PageNavigator";
@@ -38,6 +39,7 @@ import type {
   ResourceLimits,
   Scene,
   SnapGuide,
+  TextStyleWire,
 } from "../../../shared/scene";
 import { LowResourceBanner } from "../components/LowResourceBanner";
 import { useShortcuts } from "../shortcuts/useShortcuts";
@@ -86,6 +88,17 @@ const TOOL_CURSORS: Record<ToolId, string> = {
   text: "text",
 };
 
+// Captured at double-click time so the editor lines up with the
+// canvas glyphs underneath even if pan/zoom change while the user
+// is typing. Also used as the identity for race-safe commit
+// dismissal (see `inlineTextEditRef`).
+type InlineTextEditState = {
+  nodeId: string;
+  rect: { x: number; y: number; width: number; height: number };
+  style: TextStyleWire;
+  initialContent: string;
+};
+
 export function EditorPage({
   project,
   onBackHome,
@@ -101,6 +114,29 @@ export function EditorPage({
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
   const [fps, setFps] = useState<number>(0);
   const [viewport, setViewport] = useState<ViewportState>(DEFAULT_VIEWPORT);
+  // Phase A1 — inline canvas text editor. Mounted as an absolutely
+  // positioned `<contenteditable>` over a hit-tested `TextLayer`
+  // when the user double-clicks. Stays null while the editor is
+  // dismissed; the bounds are captured in *screen space* at
+  // double-click time so the editor lines up with the canvas
+  // glyphs underneath even if pan/zoom change while the user is
+  // typing.
+  const [inlineTextEdit, setInlineTextEdit] = useState<InlineTextEditState | null>(
+    null,
+  );
+  // Identity ref for the currently-open inline text editor draft.
+  // The renderer can mount a new editor (different node, different
+  // initial content) BEFORE a prior `commitInlineTextEdit` finishes
+  // its bridge round-trip; without an identity check the late
+  // `setInlineTextEdit(null)` in the prior commit's `finally` would
+  // unmount the new editor and flash it closed. We compare the
+  // captured draft against this ref before nulling so only the
+  // commit that owns the current draft can dismiss it. Kept in
+  // lockstep with the state via the effect below.
+  const inlineTextEditRef = useRef<InlineTextEditState | null>(null);
+  useEffect(() => {
+    inlineTextEditRef.current = inlineTextEdit;
+  }, [inlineTextEdit]);
   // The document graph lives in Rust; we only keep a sampled `Scene`
   // snapshot here for the renderer. Phase 1 will swap this for a
   // push-based subscription rather than periodic resync. We don't
@@ -1636,14 +1672,113 @@ export function EditorPage({
   // single point that sees every dblclick within the canvas pane.
   const onMainDoubleClick = useCallback(
     (e: ReactMouseEvent<HTMLElement>) => {
-      if (!annotationCreateActive) return;
       const rect = e.currentTarget.getBoundingClientRect();
       const localX = e.clientX - rect.left;
       const localY = e.clientY - rect.top;
-      annotationOverlayRef.current?.beginDraftAt(localX, localY);
+      if (annotationCreateActive) {
+        annotationOverlayRef.current?.beginDraftAt(localX, localY);
+        return;
+      }
+      // Phase A1 — when the user double-clicks a `TextLayer`, mount
+      // the inline canvas editor over its bounding box. Hit-test
+      // through the bridge (same coordinate convention as the
+      // pointer-down handler above) so we agree with what the
+      // renderer is drawing. World-space bounds come from the
+      // existing `nodes` mirror; we project through the live
+      // viewport to position the editor.
+      void (async () => {
+        try {
+          const hit = await window.kcreate.canvas.hitTest(
+            localX,
+            localY,
+            viewport.panX,
+            viewport.panY,
+            viewport.zoom,
+          );
+          if (!hit) return;
+          const node = nodes.find((n) => n.id === hit);
+          if (!node || node.nodeType !== "TextLayer") return;
+          const [style, content] = await Promise.all([
+            window.kcreate.text.getStyle(hit),
+            window.kcreate.text.getContent(hit),
+          ]);
+          const screenX = node.bounds.x * viewport.zoom + viewport.panX;
+          const screenY = node.bounds.y * viewport.zoom + viewport.panY;
+          const screenW = node.bounds.width * viewport.zoom;
+          const screenH = node.bounds.height * viewport.zoom;
+          const nextDraft: InlineTextEditState = {
+            nodeId: hit,
+            rect: {
+              x: screenX,
+              y: screenY,
+              width: Math.max(screenW, 32),
+              height: Math.max(screenH, style.fontSize * style.lineHeight),
+            },
+            style,
+            initialContent: content,
+          };
+          // Update the ref BEFORE scheduling the state update so any
+          // commit captured between this tick and the next React
+          // render flush sees the new draft identity — without this,
+          // a commit that resolves in the gap between `setState` and
+          // the lockstep effect could still null the new editor.
+          inlineTextEditRef.current = nextDraft;
+          setInlineTextEdit(nextDraft);
+        } catch (err) {
+          setStatusMessage(
+            `Inline text edit failed: ${errorMessage(err)}`,
+          );
+        }
+      })();
     },
-    [annotationCreateActive],
+    [annotationCreateActive, nodes, viewport],
   );
+
+  // Commit / cancel handlers for the inline text editor. Commit
+  // uses `replaceRange(0, length, next)` so the operation log
+  // records a single splice (matches what the bridge would do for
+  // a future remote-peer text-edit; the operation kind is the same
+  // as for partial edits, which keeps the undo replay tidy).
+  // Indices are UTF-16 code units — same as JavaScript string
+  // length — so we can pass `initialContent.length` directly.
+  //
+  // The captured `draft` is the editor instance this commit owns;
+  // `inlineTextEditRef.current` is the editor currently mounted on
+  // screen. They diverge when the user double-clicks a different
+  // TextLayer while the prior commit's `replaceRange` round-trip is
+  // still in flight — in that case the new editor has already
+  // taken over the draft slot and the prior commit must NOT null
+  // it, or the new editor flashes closed. The identity check in
+  // `finally` enforces this.
+  const commitInlineTextEdit = useCallback(
+    async (next: string) => {
+      const draft = inlineTextEditRef.current;
+      if (!draft) return;
+      try {
+        await window.kcreate.text.replaceRange(
+          draft.nodeId,
+          0,
+          draft.initialContent.length,
+          next,
+        );
+        setStatusMessage("Text updated.");
+      } catch (err) {
+        setStatusMessage(`Text update failed: ${errorMessage(err)}`);
+      } finally {
+        if (inlineTextEditRef.current === draft) {
+          setInlineTextEdit(null);
+        }
+      }
+    },
+    [],
+  );
+
+  // Cancel always nulls — the user explicitly dismissed the
+  // editor (Escape key, blur, etc.), so the latest draft is the
+  // one being cancelled regardless of any in-flight commit.
+  const cancelInlineTextEdit = useCallback(() => {
+    setInlineTextEdit(null);
+  }, []);
 
   const handleUpdateNode = useCallback(
     async (
@@ -1957,6 +2092,18 @@ export function EditorPage({
             wgpu path remains the source of truth for exports.
           */}
           <SoftProofOverlay />
+          {inlineTextEdit ? (
+            <InlineTextEditor
+              nodeId={inlineTextEdit.nodeId}
+              rect={inlineTextEdit.rect}
+              style={inlineTextEdit.style}
+              initialContent={inlineTextEdit.initialContent}
+              onCommit={(next) => {
+                void commitInlineTextEdit(next);
+              }}
+              onCancel={cancelInlineTextEdit}
+            />
+          ) : null}
           <div
             style={{
               position: "absolute",

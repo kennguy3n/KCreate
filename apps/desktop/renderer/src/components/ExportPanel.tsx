@@ -5,12 +5,13 @@
 // .export.*` IPC bridge. The bridge does the file I/O — the renderer
 // never touches disk directly.
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 
 import type {
   JpegExportOptions,
   PdfExportOptions,
   PngExportOptions,
+  Preferences,
   SvgExportOptions,
   WebpExportOptions,
 } from "../../../shared/scene";
@@ -147,32 +148,77 @@ export function ExportPanel({
   const [transparent, setTransparent] = useState(true);
   const [quality, setQuality] = useState(90);
   const [lossless, setLossless] = useState(true);
-  const [tempDir, setTempDir] = useState<string>("");
   const [running, setRunning] = useState(false);
   const [iconPackOpen, setIconPackOpen] = useState(false);
+  // Phase A2 — sticky directory state, loaded from preferences on
+  // mount and persisted after every successful export. `null`
+  // entries mean "no last-used dir for this format yet" and the
+  // native dialog opens at the OS default.
+  const [lastDirByFormat, setLastDirByFormat] = useState<
+    Record<string, string>
+  >({});
+  const [lastBatchDir, setLastBatchDir] = useState<string | null>(null);
 
-  // Resolve a writable directory for export targets. The renderer
-  // doesn't have filesystem access — the main process exposes a
-  // platform-appropriate temp dir via `runtime.tempDir()`.
   useEffect(() => {
     let cancelled = false;
-    void window.kcreate.runtime.tempDir().then((d) => {
-      if (!cancelled) setTempDir(d);
+    void window.kcreate.phase10.preferencesLoad().then((prefs) => {
+      if (cancelled) return;
+      setLastDirByFormat({ ...prefs.export.lastDirByFormat });
+      setLastBatchDir(prefs.export.lastBatchDir);
     });
     return () => {
       cancelled = true;
     };
   }, []);
 
+  // Round-trip the sticky directory back into preferences. Reads
+  // the current file, splices the updated `export` section, and
+  // saves — preserving any other section the user may have changed
+  // elsewhere in the app. Wrapped in `useCallback` so the closure
+  // identity is stable across re-renders (consistent with the
+  // `commit*` helpers in `TextStylePanel`), keeping `useEffect`
+  // dependency arrays in callers clean if this is ever passed down.
+  const persistStickyDirs = useCallback(
+    async (
+      nextDirByFormat: Record<string, string>,
+      nextBatchDir: string | null,
+    ): Promise<void> => {
+      try {
+        const prefs: Preferences =
+          await window.kcreate.phase10.preferencesLoad();
+        const updated: Preferences = {
+          ...prefs,
+          export: {
+            lastDirByFormat: nextDirByFormat,
+            lastBatchDir: nextBatchDir,
+          },
+        };
+        await window.kcreate.phase10.preferencesSave(updated);
+      } catch (e) {
+        // A persist failure must not break the export the user
+        // already saw succeed — surface as a non-fatal warning so
+        // the next session may open the dialog at the OS default.
+        onStatus(`Note: failed to remember export dir: ${errorMessage(e)}`);
+      }
+    },
+    [onStatus],
+  );
+
   const handleExport = async (): Promise<void> => {
-    if (!tempDir) {
-      onStatus("Export: temp dir not resolved yet.");
+    const ts = Date.now();
+    const defaultName = `kcreate-export-${ts}.${formatExt(format)}`;
+    const defaultDir = lastDirByFormat[format] ?? null;
+    const target = await window.kcreate.runtime.chooseExportTarget(
+      format,
+      defaultName,
+      defaultDir,
+    );
+    if (!target) {
+      onStatus(`Export ${format.toUpperCase()}: cancelled.`);
       return;
     }
     setRunning(true);
     onStatus(`Export: ${format.toUpperCase()} →`);
-    const ts = Date.now();
-    const out = `${tempDir}/kcreate-export-${ts}.${formatExt(format)}`;
     try {
       const bg = transparent ? null : whiteColor();
       if (format === "png") {
@@ -182,8 +228,8 @@ export function ExportPanel({
           scale,
           background: bg,
         };
-        const bytes = await window.kcreate.export.png(out, opts);
-        onStatus(`PNG · ${bytes} bytes → ${out}`);
+        const bytes = await window.kcreate.export.png(target, opts);
+        onStatus(`PNG · ${bytes} bytes → ${target}`);
       } else if (format === "svg") {
         const opts: SvgExportOptions = {
           width,
@@ -192,15 +238,20 @@ export function ExportPanel({
           optimize: true,
         };
         const svg = await window.kcreate.export.svg([], opts);
-        onStatus(`SVG · ${svg.length} bytes (inline)`);
+        // SVG export returns the inline string — land it via
+        // `writeTextFile`, which the main process now accepts at
+        // any user-approved export directory (the parent of
+        // `target`).
+        const bytes = await window.kcreate.runtime.writeTextFile(target, svg);
+        onStatus(`SVG · ${bytes} bytes → ${target}`);
       } else if (format === "pdf") {
         const opts: PdfExportOptions = {
           widthMm: 210,
           heightMm: 297,
           title: "KCreate document",
         };
-        const bytes = await window.kcreate.export.pdf(out, opts);
-        onStatus(`PDF · ${bytes} bytes → ${out}`);
+        const bytes = await window.kcreate.export.pdf(target, opts);
+        onStatus(`PDF · ${bytes} bytes → ${target}`);
       } else if (format === "webp") {
         const opts: WebpExportOptions = {
           width,
@@ -210,8 +261,8 @@ export function ExportPanel({
           lossless,
           background: bg,
         };
-        const bytes = await window.kcreate.export.webp(out, opts);
-        onStatus(`WebP · ${bytes} bytes → ${out}`);
+        const bytes = await window.kcreate.export.webp(target, opts);
+        onStatus(`WebP · ${bytes} bytes → ${target}`);
       } else if (format === "jpeg") {
         // JPEG has no alpha — force a non-null background.
         const opts: JpegExportOptions = {
@@ -221,9 +272,13 @@ export function ExportPanel({
           quality,
           background: bg ?? whiteColor(),
         };
-        const bytes = await window.kcreate.export.jpeg(out, opts);
-        onStatus(`JPEG · ${bytes} bytes → ${out}`);
+        const bytes = await window.kcreate.export.jpeg(target, opts);
+        onStatus(`JPEG · ${bytes} bytes → ${target}`);
       }
+      const targetDir = dirnameOf(target);
+      const nextDirByFormat = { ...lastDirByFormat, [format]: targetDir };
+      setLastDirByFormat(nextDirByFormat);
+      await persistStickyDirs(nextDirByFormat, lastBatchDir);
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       onStatus(`Export failed: ${msg}`);
@@ -233,7 +288,13 @@ export function ExportPanel({
   };
 
   const runPreset = async (preset: ExportPreset): Promise<void> => {
-    if (!tempDir) return;
+    const targetDir = await window.kcreate.runtime.chooseExportDirectory(
+      lastBatchDir,
+    );
+    if (!targetDir) {
+      onStatus(`Preset "${preset.label}": cancelled.`);
+      return;
+    }
     setRunning(true);
     onStatus(`Preset "${preset.label}" → 0/${preset.jobs.length}`);
     const ts = Date.now();
@@ -248,7 +309,7 @@ export function ExportPanel({
       try {
         const bytes = await runOnePresetJob(
           job,
-          tempDir,
+          targetDir,
           baseName,
           width,
           height,
@@ -267,7 +328,7 @@ export function ExportPanel({
         const tokens = await window.kcreate.designTokens.get();
         const json = JSON.stringify(tokens, null, 2);
         const blobBytes = new TextEncoder().encode(json).byteLength;
-        const handoffPath = `${tempDir}/${baseName}-tokens.json`;
+        const handoffPath = `${targetDir}/${baseName}-tokens.json`;
         await window.kcreate.runtime.writeTextFile(handoffPath, json);
         totalBytes += blobBytes;
         succeeded += 1;
@@ -278,13 +339,15 @@ export function ExportPanel({
     setRunning(false);
     if (failures.length === 0) {
       onStatus(
-        `Preset "${preset.label}" · ${succeeded} files · ${totalBytes} bytes → ${tempDir}`,
+        `Preset "${preset.label}" · ${succeeded} files · ${totalBytes} bytes → ${targetDir}`,
       );
     } else {
       onStatus(
         `Preset "${preset.label}" finished with ${failures.length} failures: ${failures.join("; ")}`,
       );
     }
+    setLastBatchDir(targetDir);
+    await persistStickyDirs(lastDirByFormat, targetDir);
   };
 
   const supportsQuality = format === "webp" || format === "jpeg";
@@ -388,8 +451,8 @@ export function ExportPanel({
           onClick={() => {
             void handleExport();
           }}
-          disabled={running || !tempDir}
-          style={primaryBtn(running || !tempDir)}
+          disabled={running}
+          style={primaryBtn(running)}
         >
           {running ? "Exporting…" : "Export"}
         </button>
@@ -404,9 +467,9 @@ export function ExportPanel({
       />
       <h3 style={presetHeaderStyle}>Batch presets</h3>
       <p style={hintStyle}>
-        Each preset runs as a chain of single-format exports under the
-        OS temp directory. Failures inside a chain do not abort the
-        rest of the chain.
+        Each preset prompts for a target directory, then runs as a
+        chain of single-format exports inside it. Failures inside a
+        chain do not abort the rest of the chain.
       </p>
       <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
         {BUILTIN_PRESETS.map((p) => (
@@ -416,8 +479,8 @@ export function ExportPanel({
             onClick={() => {
               void runPreset(p);
             }}
-            disabled={running || !tempDir}
-            style={presetBtn(running || !tempDir)}
+            disabled={running}
+            style={presetBtn(running)}
           >
             <span
               style={{
@@ -436,11 +499,6 @@ export function ExportPanel({
           </button>
         ))}
       </div>
-
-      <p style={hintStyle}>
-        Files write to <code style={monoStyle}>{tempDir || "…"}</code>.
-        Phase 1 will add a native save-as dialog.
-      </p>
 
       <hr
         style={{
@@ -489,13 +547,13 @@ function errorMessage(e: unknown): string {
 // for parity with the rasters.
 async function runOnePresetJob(
   job: PresetJob,
-  tempDir: string,
+  targetDir: string,
   baseName: string,
   width: number,
   height: number,
 ): Promise<number> {
   const ext = formatExt(job.format);
-  const out = `${tempDir}/${baseName}${job.suffix}.${ext}`;
+  const out = `${targetDir}/${baseName}${job.suffix}.${ext}`;
   switch (job.format) {
     case "png": {
       const opts: PngExportOptions = {
@@ -557,6 +615,33 @@ async function runOnePresetJob(
 
 function whiteColor(): [number, number, number, number] {
   return [1.0, 1.0, 1.0, 1.0];
+}
+
+/// Pure-JS dirname for the absolute path the OS picker returned.
+/// Handles both POSIX (`/`) and Windows (`\\`) separators so the
+/// `lastDirByFormat` map persists usable paths regardless of host
+/// OS.
+///
+/// Edge cases:
+/// * No separator at all (bare filename — shouldn't happen via the
+///   OS dialog but is safe to handle): return empty string.
+/// * Root-level POSIX path like `/foo.png`: the last `/` is at
+///   index 0; we must return `"/"` itself (not `""`) so the sticky
+///   `lastDirByFormat` entry round-trips as a usable absolute path
+///   the next time `chooseExportTarget` opens the dialog. Returning
+///   `""` would silently fall back to the OS default on the next
+///   export.
+function dirnameOf(absolutePath: string): string {
+  const lastFwd = absolutePath.lastIndexOf("/");
+  const lastBack = absolutePath.lastIndexOf("\\");
+  const cut = Math.max(lastFwd, lastBack);
+  if (cut < 0) return "";
+  // Preserve the separator at the root so `/foo.png` → `/` and
+  // (on Windows) `\\server\share\foo.png` style roots keep their
+  // leading separator. `absolutePath[0]` is always defined here
+  // because `cut >= 0` implies the string has at least one char.
+  if (cut === 0) return absolutePath[0] ?? "";
+  return absolutePath.slice(0, cut);
 }
 
 function Field({
@@ -691,8 +776,4 @@ const hintStyle: React.CSSProperties = {
   lineHeight: 1.5,
 };
 
-const monoStyle: React.CSSProperties = {
-  fontFamily:
-    'ui-monospace, SFMono-Regular, Menlo, "Roboto Mono", monospace',
-  fontSize: 11,
-};
+

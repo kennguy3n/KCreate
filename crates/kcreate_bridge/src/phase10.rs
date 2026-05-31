@@ -1173,6 +1173,14 @@ pub struct Preferences {
     pub ai: AiPrefs,
     pub performance: PerformancePrefs,
     pub privacy: PrivacyPrefs,
+    /// Phase A2 — native save-as dialog. Sticky directory state
+    /// for the renderer's `chooseExportTarget` /
+    /// `chooseExportDirectory` flow. Wire field is `export`.
+    /// `#[serde(default)]` so preferences files written before
+    /// Phase A2 load cleanly (the new section materialises as an
+    /// empty map + `None`).
+    #[serde(default)]
+    pub export: ExportPrefs,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1221,6 +1229,28 @@ pub struct PrivacyPrefs {
     pub audit_log_retention_days: u32,
 }
 
+/// Phase A2 — sticky directory state for the native save-as dialog.
+///
+/// `last_dir_by_format` keys are the wire-format lower-case format
+/// names already used by the export bridge (`"png"`, `"svg"`,
+/// `"pdf"`, `"webp"`, `"jpeg"`). Values are absolute directory
+/// paths the user last picked via `chooseExportTarget`. The
+/// renderer reads the entry on panel mount and passes it as the
+/// `defaultDir` hint so the OS dialog opens in the user's most
+/// recent location for that format.
+///
+/// `last_batch_dir` is the absolute directory the user last picked
+/// via `chooseExportDirectory` for batch presets. `None` until the
+/// first successful batch run.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportPrefs {
+    #[serde(default)]
+    pub last_dir_by_format: std::collections::HashMap<String, String>,
+    #[serde(default)]
+    pub last_batch_dir: Option<String>,
+}
+
 impl Default for Preferences {
     fn default() -> Self {
         Self {
@@ -1250,6 +1280,7 @@ impl Default for Preferences {
                 telemetry_opt_in: false,
                 audit_log_retention_days: 90,
             },
+            export: ExportPrefs::default(),
         }
     }
 }
@@ -1376,6 +1407,79 @@ mod tests {
         let back: Preferences = serde_json::from_str(&s).unwrap();
         assert_eq!(back.general.theme, "system");
         assert!(!back.privacy.telemetry_opt_in);
+        // Phase A2 — the new `export` section round-trips empty.
+        assert!(back.export.last_dir_by_format.is_empty());
+        assert!(back.export.last_batch_dir.is_none());
+    }
+
+    #[test]
+    fn preferences_export_section_round_trips_sticky_dirs() {
+        // Pre-populate per-format sticky directories and a batch
+        // dir; the round-trip must preserve every entry verbatim.
+        let mut prefs = Preferences::default();
+        prefs
+            .export
+            .last_dir_by_format
+            .insert("png".into(), "/home/u/exports/png".into());
+        prefs
+            .export
+            .last_dir_by_format
+            .insert("svg".into(), "/home/u/exports/svg".into());
+        prefs.export.last_batch_dir = Some("/home/u/exports/batch".into());
+        let s = serde_json::to_string(&prefs).expect("serialize");
+        let back: Preferences = serde_json::from_str(&s).expect("deserialize");
+        assert_eq!(
+            back.export.last_dir_by_format.get("png"),
+            Some(&"/home/u/exports/png".to_string())
+        );
+        assert_eq!(
+            back.export.last_dir_by_format.get("svg"),
+            Some(&"/home/u/exports/svg".to_string())
+        );
+        assert_eq!(
+            back.export.last_batch_dir,
+            Some("/home/u/exports/batch".into())
+        );
+    }
+
+    #[test]
+    fn preferences_legacy_file_without_export_section_deserialises() {
+        // A preferences.json written before Phase A2 has no `export`
+        // section — the renderer must still be able to load such a
+        // file (the new field defaults to an empty `ExportPrefs`).
+        let legacy = serde_json::json!({
+            "general": {
+                "theme": "dark",
+                "language": "en-US",
+                "autosaveIntervalSec": 60,
+                "scratchProjectCleanupDays": 30,
+            },
+            "canvas": {
+                "defaultGridSpacing": 16.0,
+                "defaultGridSubdivisions": 4,
+                "snapThresholdPx": 6.0,
+                "rulerUnits": "px",
+            },
+            "ai": {
+                "defaultLlmModel": "",
+                "autoStartSidecar": false,
+                "gbnfGrammarDebugging": false,
+            },
+            "performance": {
+                "rasterCacheBudgetMb": 512,
+                "undoDepthOverride": null,
+                "lowResourceMode": false,
+            },
+            "privacy": {
+                "telemetryOptIn": false,
+                "auditLogRetentionDays": 90,
+            },
+            // No `export` field — must default cleanly.
+        });
+        let prefs: Preferences = serde_json::from_value(legacy).expect("legacy preferences load");
+        assert_eq!(prefs.general.theme, "dark");
+        assert!(prefs.export.last_dir_by_format.is_empty());
+        assert!(prefs.export.last_batch_dir.is_none());
     }
 
     #[test]

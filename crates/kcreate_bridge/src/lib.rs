@@ -3285,6 +3285,73 @@ pub fn text_opentype_features_update(node_id: String, features_json: String) -> 
 }
 
 // ---------------------------------------------------------------------------
+// Phase A1 — inline text editor + font controls
+// ---------------------------------------------------------------------------
+
+/// Replace the text content of a `TextLayer` node and record an
+/// undoable `text_set_content` operation. The font family / size on
+/// the node's `TextLayerMeta` are preserved — use
+/// [`text_set_style`] to mutate those.
+#[napi]
+pub fn text_set_content(node_id: String, content: String) -> NapiResult<()> {
+    let id = parse_uuid(&node_id)?;
+    phase2::text_set_content(id, &content).map_err(map_doc_err)
+}
+
+/// Replace the text style (`fontFamily`, `fontSize`, `lineHeight`)
+/// for a `TextLayer` node and record an undoable `text_set_style`
+/// operation. `style_json` is a [`TextStyleWire`] (camelCase JSON).
+#[napi]
+pub fn text_set_style(node_id: String, style_json: String) -> NapiResult<()> {
+    let id = parse_uuid(&node_id)?;
+    phase2::text_set_style(id, &style_json).map_err(map_doc_err)
+}
+
+/// Splice the UTF-16 range `[start..end]` of a `TextLayer` node's
+/// text with `replacement` and record an undoable
+/// `text_replace_range` operation. `start` / `end` are UTF-16
+/// code-unit offsets (matching JavaScript's `String.length`).
+#[napi]
+pub fn text_replace_range(
+    node_id: String,
+    start: u32,
+    end: u32,
+    replacement: String,
+) -> NapiResult<()> {
+    let id = parse_uuid(&node_id)?;
+    phase2::text_replace_range(id, start, end, &replacement).map_err(map_doc_err)
+}
+
+/// Read the current text content for a `TextLayer` node. Used by
+/// the renderer's `TextStylePanel` content textarea + the inline
+/// canvas editor to hydrate the contenteditable surface.
+#[napi]
+pub fn text_content_get(node_id: String) -> NapiResult<String> {
+    let id = parse_uuid(&node_id)?;
+    phase2::text_content_get(id).map_err(map_doc_err)
+}
+
+/// Read the current text style for a `TextLayer` node as JSON
+/// ([`TextStyleWire`]). Used by the renderer's `TextStylePanel` to
+/// hydrate its controls on selection change.
+#[napi]
+pub fn text_style_get(node_id: String) -> NapiResult<String> {
+    let id = parse_uuid(&node_id)?;
+    phase2::text_style_get(id).map_err(map_doc_err)
+}
+
+/// Return the sorted, deduplicated list of font family names known
+/// to the process-wide [`kcreate_text::FontManager`], encoded as a
+/// JSON array string (`["Arial", "Helvetica", ...]`). First call
+/// lazily loads system fonts; subsequent calls reuse the cached
+/// database.
+#[napi]
+pub fn text_list_fonts() -> NapiResult<String> {
+    let families = phase2::text_list_fonts().map_err(map_doc_err)?;
+    serde_json::to_string(&families).map_err(|e| napi::Error::from_reason(e.to_string()))
+}
+
+// ---------------------------------------------------------------------------
 // Phase 3 — LAN collaboration session
 //
 // Gated by the `collab` feature so default builds keep the

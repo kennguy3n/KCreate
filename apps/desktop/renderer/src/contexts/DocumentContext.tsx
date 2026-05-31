@@ -47,14 +47,26 @@ import type {
 /**
  * Empty scene used while we haven't yet pulled one from the
  * bridge. Module-scoped so the reference is stable across re-renders.
- * Matches EditorPage's prior local constant — we don't freeze it
- * because the Scene wire-format declares mutable arrays, and the
- * shape is treated as a frozen sentinel by convention only.
+ *
+ * Deep-frozen at runtime so accidental mutation by a future consumer
+ * (e.g. Phase 1's push-subscription path doing `scene.objects.push(...)`
+ * on the sentinel before swapping in a real Scene) becomes a strict-mode
+ * `TypeError` instead of silently corrupting every other provider
+ * instance that shares this module-scoped reference. The `Scene` wire
+ * type still declares mutable arrays — the freeze is defense-in-depth
+ * at the sentinel only; real bridge-pulled scenes remain mutable as
+ * before.
  */
-const EMPTY_SCENE: Scene = {
-  clear_color: [0.12, 0.12, 0.14, 1.0],
-  objects: [],
-};
+const EMPTY_SCENE: Scene = (() => {
+  const sentinel: Scene = {
+    clear_color: [0.12, 0.12, 0.14, 1.0],
+    objects: [],
+  };
+  Object.freeze(sentinel.clear_color);
+  Object.freeze(sentinel.objects);
+  Object.freeze(sentinel);
+  return sentinel;
+})();
 
 /** Re-export so EditorPage can keep using the same identity. */
 export { EMPTY_SCENE };
@@ -314,6 +326,16 @@ function requireDocumentContext<T>(
  * Components that only need a subset MUST use `useDocumentState` /
  * `useDocumentActions` / `useDocumentRefs` to opt out of unrelated
  * re-renders.
+ *
+ * The returned bundle is memoised against `[state, actions, refs]` so
+ * its object identity only changes when one of the three underlying
+ * context values changes. Without the memo, every call would build a
+ * fresh `{ state, actions, refs }` object — safe for the current
+ * destructuring callsites in `EditorPageInner`, but a foot-gun for any
+ * future consumer that passes the bundle into a `useEffect` /
+ * `useMemo` dep array or down to a child as a prop (it would re-fire /
+ * re-render on every parent render). Memoising at the hook boundary
+ * makes the bundle behave like the underlying contexts themselves.
  */
 export function useDocument(): DocumentContextValue {
   const state = requireDocumentContext(
@@ -328,7 +350,10 @@ export function useDocument(): DocumentContextValue {
     useContext(DocumentRefsContext),
     "useDocument",
   );
-  return { state, actions, refs };
+  return useMemo<DocumentContextValue>(
+    () => ({ state, actions, refs }),
+    [state, actions, refs],
+  );
 }
 
 /** State only — re-renders on any state change. */

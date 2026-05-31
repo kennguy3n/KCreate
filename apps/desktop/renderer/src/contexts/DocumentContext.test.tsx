@@ -20,7 +20,7 @@
 //     optimistic local updates).
 
 import { act, render } from "@testing-library/react";
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type {
@@ -340,5 +340,80 @@ describe("DocumentContext", () => {
     expect(stateRenderCount).toBeGreaterThan(1);
     expect(actionsRenderCount).toBe(1);
     expect(refsRenderCount).toBe(1);
+  });
+
+  it("EMPTY_SCENE sentinel is deep-frozen", async () => {
+    // Architectural invariant from PR #35 / Devin Review #0005:
+    // the module-scoped `EMPTY_SCENE` is shared across ALL
+    // DocumentProvider instances, so accidental mutation would
+    // silently corrupt every consumer. The freeze converts the
+    // latent foot-gun into a strict-mode `TypeError` at the
+    // offending call site.
+    const { EMPTY_SCENE } = await import("./DocumentContext");
+    expect(Object.isFrozen(EMPTY_SCENE)).toBe(true);
+    expect(Object.isFrozen(EMPTY_SCENE.clear_color)).toBe(true);
+    expect(Object.isFrozen(EMPTY_SCENE.objects)).toBe(true);
+
+    // Mutation attempts throw in strict mode (which vitest +
+    // ES-modules run under). Use `as any` casts to bypass the
+    // TypeScript surface, since the wire type still declares
+    // mutable arrays — the freeze is runtime defense-in-depth at
+    // the sentinel only.
+    expect(() => {
+      (EMPTY_SCENE.objects as unknown as unknown[]).push({});
+    }).toThrow();
+    expect(() => {
+      (EMPTY_SCENE.clear_color as unknown as number[])[0] = 999;
+    }).toThrow();
+    expect(() => {
+      (EMPTY_SCENE as { clear_color: unknown }).clear_color = [1, 1, 1, 1];
+    }).toThrow();
+  });
+
+  it("useDocument() returns a memoised bundle (stable across pure re-renders)", () => {
+    // Architectural invariant from PR #35 / Devin Review #0004:
+    // the full-bundle hook must memoise against
+    // `[state, actions, refs]` so its identity is preserved when
+    // none of the underlying context values change. Without the
+    // memo, any future consumer passing the bundle into a
+    // `useEffect` dep array would re-fire on every parent render.
+    let bumpParent: (() => void) | null = null;
+    const seenBundles: Array<ReturnType<typeof useDocument>> = [];
+
+    function Inner(): JSX.Element {
+      const bundle = useDocument();
+      seenBundles.push(bundle);
+      return <div />;
+    }
+
+    function Parent(): JSX.Element {
+      // Parent-local state — changes here force a re-render of
+      // Parent (and therefore Inner) WITHOUT touching the provider's
+      // context values. The bundle identity must survive this.
+      const [, setTick] = useState(0);
+      bumpParent = () => setTick((n) => n + 1);
+      return <Inner />;
+    }
+
+    render(
+      <DocumentProvider>
+        <Parent />
+      </DocumentProvider>,
+    );
+
+    expect(seenBundles.length).toBeGreaterThan(0);
+    const first = seenBundles[seenBundles.length - 1];
+
+    // Drive a parent-only re-render. The provider's context
+    // values are untouched.
+    act(() => {
+      bumpParent!();
+    });
+
+    const second = seenBundles[seenBundles.length - 1];
+
+    // Bundle identity is preserved because state / actions /
+    // refs identities are all preserved by the provider.
+    expect(second).toBe(first);
   });
 });

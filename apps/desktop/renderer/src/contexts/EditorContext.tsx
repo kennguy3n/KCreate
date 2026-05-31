@@ -351,6 +351,16 @@ function requireEditorContext<T>(
  * `useEditorActions` / `useEditorRefs` to opt out of unrelated
  * re-renders. The `EditorDocumentBridge` host wrapper is the
  * canonical example.
+ *
+ * The returned bundle is memoised against `[state, actions, refs]` so
+ * its object identity only changes when one of the three underlying
+ * context values changes. Without the memo, every call would build a
+ * fresh `{ state, actions, refs }` object — safe for the current
+ * destructuring callsites in `EditorPageInner`, but a foot-gun for any
+ * future consumer that passes the bundle into a `useEffect` /
+ * `useMemo` dep array or down to a child as a prop (it would re-fire /
+ * re-render on every parent render). Memoising at the hook boundary
+ * makes the bundle behave like the underlying contexts themselves.
  */
 export function useEditor(): EditorContextValue {
   const state = requireEditorContext(
@@ -365,7 +375,10 @@ export function useEditor(): EditorContextValue {
     useContext(EditorRefsContext),
     "useEditor",
   );
-  return { state, actions, refs };
+  return useMemo<EditorContextValue>(
+    () => ({ state, actions, refs }),
+    [state, actions, refs],
+  );
 }
 
 /** State only — re-renders on any state change. */

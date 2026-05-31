@@ -24,7 +24,7 @@
 // here).
 
 import { act, render, screen } from "@testing-library/react";
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import { afterEach, describe, expect, it } from "vitest";
 
 import {
@@ -322,5 +322,50 @@ describe("EditorContext", () => {
     );
     expect(captured.bundle!.state.mode).toBe("layout");
     expect(captured.bundle!.state.tool).toBe("rect");
+  });
+
+  it("useEditor() returns a memoised bundle (stable across pure re-renders)", () => {
+    // Architectural invariant from PR #35 / Devin Review #0004:
+    // the full-bundle hook must memoise against
+    // `[state, actions, refs]` so its identity is preserved when
+    // none of the underlying context values change. Without the
+    // memo, any future consumer passing the bundle into a
+    // `useEffect` dep array would re-fire on every parent render.
+    let bumpParent: (() => void) | null = null;
+    const seenBundles: Array<ReturnType<typeof useEditor>> = [];
+
+    function Inner(): JSX.Element {
+      const bundle = useEditor();
+      seenBundles.push(bundle);
+      return <div />;
+    }
+
+    function Parent(): JSX.Element {
+      // Parent-local state — changes here force a re-render of
+      // Parent (and therefore Inner) WITHOUT touching the provider's
+      // context values. The bundle identity must survive this.
+      const [, setTick] = useState(0);
+      bumpParent = () => setTick((n) => n + 1);
+      return <Inner />;
+    }
+
+    render(
+      <EditorProvider>
+        <Parent />
+      </EditorProvider>,
+    );
+
+    expect(seenBundles.length).toBeGreaterThan(0);
+    const first = seenBundles[seenBundles.length - 1];
+
+    act(() => {
+      bumpParent!();
+    });
+
+    const second = seenBundles[seenBundles.length - 1];
+
+    // Bundle identity is preserved because state / actions /
+    // refs identities are all preserved by the provider.
+    expect(second).toBe(first);
   });
 });

@@ -775,6 +775,26 @@ pub fn image_gen_recommended_pack() -> Option<String> {
         .map(str::to_string)
 }
 
+/// Phase C — recommend the best LLM (sidecar) pack for the
+/// current device tier + platform. Mirrors
+/// [`vision_recommended_pack`] / [`image_gen_recommended_pack`]
+/// so the welcome modal can drive a one-click "install
+/// recommended pack" flow without the renderer having to mirror
+/// the tier → pack mapping.
+///
+/// The pack id returned here is the *intended* recommendation;
+/// the welcome modal still cross-references it against
+/// [`kcreate_ai::list_model_packs`] to surface display name,
+/// size, and download URL. Returns `None` only if the registry
+/// has no recommendation for the current device, which is
+/// expected to be never — [`kcreate_ai::recommended_llm_pack`]
+/// covers every supported tier.
+pub fn llm_recommended_pack() -> Option<String> {
+    let cfg = runtime_slot().lock();
+    kcreate_ai::model_registry::recommended_llm_pack(cfg.device_tier, cfg.platform)
+        .map(str::to_string)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1392,5 +1412,24 @@ mod tests {
         // `resolve_pack_id` aren't observed via shared module-level
         // state.
         reset_legacy_pack_migration_dedup_for_tests();
+    }
+
+    /// Phase C — the LLM recommendation must always resolve to one
+    /// of the three Bonsai pack ids so the welcome modal can look
+    /// up display name + URL via `list_model_packs`. Returning
+    /// `None` would force the renderer down a "no recommendation"
+    /// degraded path that we never want on a supported device, so
+    /// we pin both that the call succeeds and that the id is one
+    /// of the registry's canonical sidecar pack ids.
+    #[test]
+    fn llm_recommended_pack_resolves_to_a_known_bonsai_pack() {
+        let id = llm_recommended_pack().expect("LLM recommendation present for every device tier");
+        assert!(
+            matches!(
+                id.as_str(),
+                "llm_bonsai_1_7b" | "llm_bonsai_4b" | "llm_bonsai_8b"
+            ),
+            "unexpected LLM recommendation id: {id}"
+        );
     }
 }

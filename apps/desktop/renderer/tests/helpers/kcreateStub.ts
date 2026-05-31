@@ -93,6 +93,16 @@ const defaultPrefs: Preferences = {
     lastDirByFormat: {},
     lastBatchDir: null,
   },
+  // Phase C — default to `completed=true` in test land so any
+  // component that mounts the renderer under the stub does not
+  // accidentally render the welcome modal and steal focus from
+  // the assertion target. Tests that exercise the welcome modal
+  // override this explicitly via the per-method `phase10.preferencesLoad`
+  // override map below.
+  onboarding: {
+    completed: true,
+    lastSeenPackId: null,
+  },
 };
 
 const defaultsByMethod: Record<string, () => unknown> = {
@@ -176,8 +186,96 @@ const defaultsByMethod: Record<string, () => unknown> = {
   // with a throwing function.
   "canvas.pathSetSegments": () => undefined,
   "canvas.createText": () => "default-text-id",
+  // Phase C — runtime tier surface for the welcome modal. Returns
+  // a neutral mid-tier so existing tests that previously didn't
+  // touch this method keep working; welcome-modal tests override
+  // this explicitly per case.
+  "runtime.resourceLimits": () => ({
+    deviceTier: "1",
+    lowResourceMode: false,
+    effectiveUndoDepth: 50,
+    effectiveRasterCacheMb: 256,
+    effectiveMaxModelMb: 4096,
+    gpuRenderingAllowed: true,
+    imageGenerationAllowed: false,
+    effectiveMaxVisionModelMb: 256,
+  }),
+  // Phase C — recommended LLM pack id surfaced via the bridge.
+  // Defaults to the 1.7B Bonsai pack (matches the tier-1 default
+  // above). Welcome-modal tests override to drive each branch.
+  "llm.recommendedPack": () => "llm_bonsai_1_7b",
+  // Phase C — full model pack catalog used by the welcome modal
+  // to look up display name + size for the recommended pack id.
+  "aiModel.listModelPacks": () => [
+    {
+      id: "llm_bonsai_1_7b",
+      name: "Ternary-Bonsai 1.7B (Q2_0 GGUF)",
+      kind: "sidecar",
+      category: "core",
+      capabilities: ["chat"],
+      sizeBytes: 750_000_000,
+      sha256: "",
+      filePath: "",
+      installed: false,
+      downloadUrl: "https://huggingface.co/example/llm_bonsai_1_7b.gguf",
+    },
+  ],
+  // Phase C — manual-install fallback. Returns null by default so
+  // a welcome-modal test that exercises "I have the file" without
+  // overriding gets the same cancel-path semantics as
+  // ModelManager. Tests that drive the success branch override.
+  "aiModel.pickModelFile": () => null,
+  // Phase C — manual installer used by both ModelManager and the
+  // "I have the file" fallback in the welcome modal. Default
+  // mirrors the verified-install happy path with a small payload.
+  "aiModel.installModelPack": () => ({
+    packId: "llm_bonsai_1_7b",
+    verified: true,
+    actualSha256: "0".repeat(64),
+    sizeBytes: 750_000_000,
+  }),
+  // Phase C — one-click install. Default mirrors a verified
+  // download + install happy path. Tests that drive the error
+  // branch override with a throwing resolver.
+  "onboarding.installRecommendedPack": () => ({
+    pack_id: "llm_bonsai_1_7b",
+    verified: true,
+    actual_sha256: "0".repeat(64),
+    size_bytes: 750_000_000,
+  }),
+  // Phase C — idempotent cancel. Welcome modal calls this on
+  // unmount even when no install is in flight, so the default
+  // must be a no-op.
+  "onboarding.cancelInstall": () => undefined,
+  // Phase C — progress subscription. The default returns a
+  // no-op unsubscribe so tests that don't drive progress events
+  // still mount cleanly. Tests that drive progress override with
+  // a resolver that captures the listener and returns a real
+  // unsubscribe function.
+  "onboarding.onInstallProgress": () => (): void => undefined,
+  // Phase C — narrow system surface used by the welcome modal's
+  // "Open download page" fallback. Main-process validation against
+  // the host allow-list is the real defence; the stub just records.
+  "system.openExternal": () => undefined,
   setLayerColor: () => undefined,
 };
+
+/**
+ * Methods that the production preload exposes as **synchronous**
+ * (return the value directly, NOT a Promise). The stub must
+ * preserve this so callers can use the returned value (e.g. an
+ * unsubscribe function) without unwrapping a Promise. Add new
+ * entries here when wiring a new sync bridge method that the
+ * tests need to observe.
+ */
+const SYNC_METHODS = new Set<string>([
+  // Phase C — `onboarding.onInstallProgress(fn) => unsubscribe`.
+  // The unsubscribe handle MUST be a callable, not a Promise, so
+  // React's useEffect cleanup can invoke it on unmount. Wrapping
+  // in Promise.resolve makes the cleanup call a Promise and
+  // throws `destroy is not a function`.
+  "onboarding.onInstallProgress",
+]);
 
 export function installKcreateStub(): KcreateStubHandle {
   const calls: KcreateStubCall[] = [];
@@ -186,11 +284,16 @@ export function installKcreateStub(): KcreateStubHandle {
   const recordCall = (method: string, args: unknown[]): unknown => {
     calls.push({ method, args });
     const override = overrides.get(method);
-    if (override !== undefined) {
-      return Promise.resolve(override(...args));
+    const value =
+      override !== undefined
+        ? override(...args)
+        : (() => {
+            const def = defaultsByMethod[method];
+            return def === undefined ? undefined : def();
+          })();
+    if (SYNC_METHODS.has(method)) {
+      return value;
     }
-    const defaultResolver = defaultsByMethod[method];
-    const value = defaultResolver === undefined ? undefined : defaultResolver();
     return Promise.resolve(value);
   };
 
@@ -221,6 +324,10 @@ export function installKcreateStub(): KcreateStubHandle {
     project: namespace("project"),
     audit: namespace("audit"),
     component: namespace("component"),
+    // Phase C — model manager + welcome modal surfaces.
+    aiModel: namespace("aiModel"),
+    onboarding: namespace("onboarding"),
+    system: namespace("system"),
     setLayerColor: (...args: unknown[]): unknown =>
       recordCall("setLayerColor", args),
   };

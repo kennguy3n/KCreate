@@ -318,6 +318,10 @@ export interface Bridge {
   llmStart(modelPath: string): number;
   llmStop(): void;
   llmStatus(): string;
+  /// Phase C — recommended LLM pack id for the current device.
+  /// Empty string when the registry has no recommendation
+  /// (expected to be never for any supported device tier).
+  llmRecommendedPack(): string;
   // LLM completion calls return Promises because the underlying
   // `AsyncTask` runs the blocking HTTP round-trip on N-API's libuv
   // thread pool instead of the Electron main loop. See the

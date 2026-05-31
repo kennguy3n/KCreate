@@ -3,6 +3,7 @@ import { useCallback, useEffect, useState } from "react";
 import type {
   BriefApplyResult,
   LlmStatus,
+  Preferences,
   RecentProjectInfo,
   RuntimeStatus,
   ThumbnailBytes,
@@ -10,6 +11,10 @@ import type {
 import { colors, font, radius, shadow, spacing } from "../styles/tokens";
 import { BriefModal } from "../components/BriefModal";
 import { Icon, type IconName } from "../components/Icon";
+import {
+  WelcomeModal,
+  shouldShowWelcomeModal,
+} from "../components/WelcomeModal";
 
 /**
  * Job-first create options. The order mirrors PROPOSAL.md §4.1: we
@@ -170,6 +175,20 @@ export function HomePage({
   const [llmStatus, setLlmStatus] = useState<LlmStatus | null>(null);
   const [briefOpen, setBriefOpen] = useState(false);
   const [recents, setRecents] = useState<RecentsLoadState>({ kind: "idle" });
+  // Phase C — welcome-modal state. `null` means "preferences not
+  // loaded yet" (modal stays closed during the initial fetch so we
+  // don't flash it on top of HomePage when the user is a returning
+  // user). After the load, `welcomeOpen` is `true` iff
+  // `prefs.onboarding.completed === false`. Any close path flips
+  // it to `false` AND persists the new preferences atomically.
+  const [welcomeOpen, setWelcomeOpen] = useState(false);
+  // We hold the loaded preferences only to thread the unchanged
+  // sections through to the dismiss-time save so we don't clobber
+  // anything the user may have edited via `PreferencesPanel` in
+  // a separate tab. The setter is the only read site; the value
+  // is read inside `setPrefs((prev) => …)` so React can rebase
+  // against the latest snapshot.
+  const [, setPrefs] = useState<Preferences | null>(null);
   // Cover-bytes cache keyed by `.kstudio` path. Held outside `recents`
   // so refreshing the roster (e.g. after creating a new project) does
   // not force every `<img>` to re-decode its base64.
@@ -209,6 +228,68 @@ export function HomePage({
       cancelled = true;
     };
   }, []);
+
+  // Phase C — preferences load. On a fresh install the file
+  // doesn't exist yet; `phase10.preferencesLoad` synthesises a
+  // defaults payload with `onboarding.completed = false`, which
+  // is the correct first-run trigger. A read error (e.g.
+  // corrupted JSON) is silently treated as "do not show the
+  // modal" so the user can still get to PreferencesPanel's
+  // "reset to defaults" button without the welcome overlay
+  // hijacking their first interaction.
+  useEffect(() => {
+    let cancelled = false;
+    void window.kcreate.phase10
+      .preferencesLoad()
+      .then((loaded) => {
+        if (cancelled) return;
+        setPrefs(loaded);
+        if (shouldShowWelcomeModal(loaded)) {
+          setWelcomeOpen(true);
+        }
+      })
+      .catch(() => {
+        // Preferences load failed — leave the modal closed so the
+        // user isn't blocked from accessing the editor.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // Phase C — welcome-modal dismiss callback. Atomically:
+  //   1. Flip in-memory preferences so `shouldShowWelcomeModal`
+  //      returns false on any subsequent render.
+  //   2. Persist via `preferencesSave` so the next launch picks
+  //      up the closed state.
+  //   3. Close the modal.
+  // The persist call is intentionally awaited only inside the
+  // promise chain — UI state flips immediately so the user
+  // doesn't see a stutter when they hit "Skip". A persist
+  // failure is swallowed; the worst case is the modal shows
+  // again on next launch, which is preferable to bubbling an
+  // error toast on top of the welcome experience.
+  const handleWelcomeDismiss = useCallback(
+    (installedPackId: string | null) => {
+      setWelcomeOpen(false);
+      setPrefs((prev) => {
+        if (!prev) return prev;
+        const next: Preferences = {
+          ...prev,
+          onboarding: {
+            completed: true,
+            lastSeenPackId:
+              installedPackId ?? prev.onboarding.lastSeenPackId,
+          },
+        };
+        void window.kcreate.phase10.preferencesSave(next).catch(() => {
+          // See callback docstring.
+        });
+        return next;
+      });
+    },
+    [],
+  );
 
   const handleBriefApplied = useCallback(
     (result: BriefApplyResult) => {
@@ -364,6 +445,10 @@ export function HomePage({
         open={briefOpen}
         onClose={() => setBriefOpen(false)}
         onApplied={handleBriefApplied}
+      />
+      <WelcomeModal
+        open={welcomeOpen}
+        onDismiss={handleWelcomeDismiss}
       />
     </div>
   );

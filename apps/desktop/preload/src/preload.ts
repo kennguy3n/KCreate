@@ -203,6 +203,10 @@ import type {
   AnnotationBridge,
   Annotation,
   AnnotationListResponse,
+  SystemBridge,
+  OnboardingBridge,
+  OnboardingInstallReport,
+  OnboardingProgress,
   Phase9Bridge,
   GuideInfo,
   GridSettingsInfo,
@@ -1317,6 +1321,11 @@ const llm: LlmBridge = {
   async suggestForSelection(): Promise<LlmReply> {
     const raw = (await ipcRenderer.invoke("kcreate/llm/suggest")) as string;
     return JSON.parse(raw) as LlmReply;
+  },
+  async recommendedPack(): Promise<string> {
+    return (await ipcRenderer.invoke(
+      "kcreate/llm/recommendedPack",
+    )) as string;
   },
 };
 
@@ -3813,6 +3822,49 @@ const phase10: Phase10Bridge = {
   },
 };
 
+// Phase C — system surface for the welcome modal's "Open download
+// page" fallback. The main process validates the URL against the
+// `onboardingDownloader.ALLOWED_HOSTS` allow-list before passing
+// it to `shell.openExternal`, so a compromised renderer cannot
+// coax the main process into opening arbitrary URLs.
+const system: SystemBridge = {
+  async openExternal(url: string): Promise<void> {
+    await ipcRenderer.invoke("kcreate/system/openExternal", url);
+  },
+};
+
+// Phase C — one-click recommended-pack download surface. The
+// renderer triggers the download via `installRecommendedPack()`,
+// subscribes to progress via `onInstallProgress(fn)` (returns an
+// unsubscribe handle), and aborts via `cancelInstall()`. See
+// `main/src/onboardingDownloader.ts` for the wire-shape of
+// `OnboardingProgress` / `OnboardingInstallReport`.
+const onboarding: OnboardingBridge = {
+  async installRecommendedPack(): Promise<OnboardingInstallReport> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/onboarding/installRecommendedPack",
+    )) as string;
+    return JSON.parse(raw) as OnboardingInstallReport;
+  },
+  async cancelInstall(): Promise<void> {
+    await ipcRenderer.invoke("kcreate/onboarding/cancelInstall");
+  },
+  onInstallProgress(
+    fn: (progress: OnboardingProgress) => void,
+  ): () => void {
+    const handler = (_e: unknown, progress: OnboardingProgress): void => {
+      fn(progress);
+    };
+    ipcRenderer.on("kcreate/onboarding/installProgress", handler);
+    return (): void => {
+      ipcRenderer.removeListener(
+        "kcreate/onboarding/installProgress",
+        handler,
+      );
+    };
+  },
+};
+
 contextBridge.exposeInMainWorld("kcreate", {
   renderer,
   document,
@@ -3863,4 +3915,6 @@ contextBridge.exposeInMainWorld("kcreate", {
   phase10,
   projectEncryption,
   annotation,
+  system,
+  onboarding,
 });

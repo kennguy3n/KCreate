@@ -99,8 +99,24 @@ function EditorDocumentBridge({
   children: ReactNode;
 }): JSX.Element {
   const { setStatusMessage } = useEditorActions();
+  // Wrap `setStatusMessage` in a plain `(msg: string) => void` closure
+  // instead of passing the `Dispatch<SetStateAction<string | null>>`
+  // setter directly. Without the wrapper, if `onStatusError` were ever
+  // invoked with a function-shaped argument (e.g. a future refactor in
+  // `DocumentContext.reportError`), the setter would silently interpret
+  // it as a functional updater. The closure narrows the signature to
+  // exactly `(msg: string) => void`, making any such drift a compile
+  // error at the call site instead of a runtime surprise. Memoised so
+  // the prop identity is stable across editor state changes (matters
+  // for `onStatusErrorRef` lockstep inside `DocumentProvider`).
+  const onStatusError = useCallback(
+    (msg: string): void => {
+      setStatusMessage(msg);
+    },
+    [setStatusMessage],
+  );
   return (
-    <DocumentProvider onStatusError={setStatusMessage}>
+    <DocumentProvider onStatusError={onStatusError}>
       {children}
     </DocumentProvider>
   );

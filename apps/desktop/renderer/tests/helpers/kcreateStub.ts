@@ -118,7 +118,12 @@ const defaultsByMethod: Record<string, () => unknown> = {
   "export.webp": () => 0,
   "export.jpeg": () => 0,
   "artboard.create": () => "00000000-0000-0000-0000-000000000000",
+  "artboard.list": () => [],
+  "artboard.presets": () => [],
+  "component.list": () => [],
   "document.projectOpen": () => null,
+  "document.status": () => null,
+  "document.getDocumentTree": () => [],
   setLayerColor: () => undefined,
 };
 
@@ -162,6 +167,7 @@ export function installKcreateStub(): KcreateStubHandle {
     text: namespace("text"),
     project: namespace("project"),
     audit: namespace("audit"),
+    component: namespace("component"),
     setLayerColor: (...args: unknown[]): unknown =>
       recordCall("setLayerColor", args),
   };

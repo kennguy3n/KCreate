@@ -1,0 +1,306 @@
+/**
+ * Document / project mirror state context.
+ *
+ * Phase A3a — extracts the server-mirror state that EditorPage used
+ * to own as `useState` hooks tied to bridge probes. These are read
+ * by many panels (LeftPanel for the layer tree, RightPanel for the
+ * selected node, the artboard tab, the component asset list, the
+ * low-resource banner). Lifting them into a context lets future
+ * components consume them without prop drilling.
+ *
+ * This context owns the **DATA**; refresh callbacks are exposed
+ * via `actions` so a consumer (or EditorPage) can re-pull from the
+ * bridge. Error reporting flows out through an `onStatusError`
+ * prop on the provider so the refresh helpers can surface failures
+ * without depending on `EditorContext` directly (avoids a circular
+ * import — `EditorContext.setStatusMessage` is reached via the
+ * provider callback instead).
+ *
+ * `scene` lives here because conceptually it's a server-derived
+ * sample of the document graph. Today it's the empty sentinel; in
+ * Phase 1 we'll swap it for a push-based subscription. Having it
+ * already routed through the context means that swap doesn't
+ * require touching every consumer.
+ */
+
+import {
+  createContext,
+  useCallback,
+  useContext,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+import type { Dispatch, MutableRefObject, ReactNode, SetStateAction } from "react";
+
+import type {
+  ArtboardInfo,
+  ArtboardPreset,
+  ComponentInfo,
+  DocumentStatus,
+  NodeInfo,
+  ResourceLimits,
+  Scene,
+} from "../../../shared/scene";
+
+/**
+ * Empty scene used while we haven't yet pulled one from the
+ * bridge. Module-scoped so the reference is stable across re-renders.
+ * Matches EditorPage's prior local constant — we don't freeze it
+ * because the Scene wire-format declares mutable arrays, and the
+ * shape is treated as a frozen sentinel by convention only.
+ */
+const EMPTY_SCENE: Scene = {
+  clear_color: [0.12, 0.12, 0.14, 1.0],
+  objects: [],
+};
+
+/** Re-export so EditorPage can keep using the same identity. */
+export { EMPTY_SCENE };
+
+/** Local helper — mirrors the duplicated `errorMessage` used by
+ * EditorPage and other renderer modules. Inlined here to avoid an
+ * unrelated cross-file extraction inside the A3a refactor; a
+ * dedicated cleanup is a sensible follow-up. */
+function errorMessage(e: unknown): string {
+  return e instanceof Error ? e.message : String(e);
+}
+
+/**
+ * Public state surface. Field semantics match the `useState` hooks
+ * they replace in EditorPage.
+ */
+export interface DocumentState {
+  nodes: NodeInfo[];
+  artboards: ArtboardInfo[];
+  artboardPresets: ArtboardPreset[];
+  components: ComponentInfo[];
+  docStatus: DocumentStatus | null;
+  resourceLimits: ResourceLimits | null;
+  scene: Scene;
+}
+
+/**
+ * Public action surface. Setters keep the `Dispatch<SetStateAction<T>>`
+ * shape so existing functional-update patterns work unchanged.
+ * Refresh callbacks have stable identity (memoised with empty
+ * deps) so they can be safely listed in consumer `useEffect` /
+ * `useCallback` deps without forcing re-runs.
+ */
+export interface DocumentActions {
+  setNodes: Dispatch<SetStateAction<NodeInfo[]>>;
+  setArtboards: Dispatch<SetStateAction<ArtboardInfo[]>>;
+  setArtboardPresets: Dispatch<SetStateAction<ArtboardPreset[]>>;
+  setComponents: Dispatch<SetStateAction<ComponentInfo[]>>;
+  setDocStatus: Dispatch<SetStateAction<DocumentStatus | null>>;
+  setResourceLimits: Dispatch<SetStateAction<ResourceLimits | null>>;
+
+  refreshStatus: () => Promise<void>;
+  refreshArtboards: () => Promise<void>;
+  refreshComponents: () => Promise<void>;
+  /**
+   * Re-pulls the document tree and then refreshes status,
+   * artboards, and components. Does NOT refresh selection — that
+   * lives in `EditorContext`. EditorPage composes the two when a
+   * full resync is needed.
+   */
+  refreshTree: () => Promise<void>;
+}
+
+/**
+ * Read-latest refs for callbacks that must stay reference-stable.
+ * Matches EditorPage's prior `nodesRef` / `artboardsRef` pattern —
+ * see `EditorContext.EditorRefs` for the broader rationale.
+ */
+export interface DocumentRefs {
+  nodesRef: MutableRefObject<NodeInfo[]>;
+  artboardsRef: MutableRefObject<ArtboardInfo[]>;
+}
+
+interface DocumentContextValue {
+  state: DocumentState;
+  actions: DocumentActions;
+  refs: DocumentRefs;
+}
+
+const DocumentContext = createContext<DocumentContextValue | null>(null);
+
+export interface DocumentProviderProps {
+  /**
+   * Initial artboard presets. EditorPage prior pre-seeded these
+   * synchronously from a hard-coded list while the bridge probe
+   * resolved; we accept it as a prop so the provider stays test-
+   * friendly.
+   */
+  initialArtboardPresets?: ArtboardPreset[];
+  /**
+   * Error sink for refresh failures. EditorPage wires this to
+   * `EditorContext.setStatusMessage`. The provider invokes it with
+   * a human-readable string like `"status probe failed: ..."`.
+   * Optional; when omitted, refresh errors are swallowed.
+   */
+  onStatusError?: (msg: string) => void;
+  children: ReactNode;
+}
+
+/**
+ * Provider that owns the document mirror state. Mount inside the
+ * editor surface (today: `EditorPage`).
+ */
+export function DocumentProvider({
+  initialArtboardPresets = [],
+  onStatusError,
+  children,
+}: DocumentProviderProps): JSX.Element {
+  const [nodes, setNodes] = useState<NodeInfo[]>([]);
+  const [artboards, setArtboards] = useState<ArtboardInfo[]>([]);
+  const [artboardPresets, setArtboardPresets] =
+    useState<ArtboardPreset[]>(initialArtboardPresets);
+  const [components, setComponents] = useState<ComponentInfo[]>([]);
+  const [docStatus, setDocStatus] = useState<DocumentStatus | null>(null);
+  const [resourceLimits, setResourceLimits] = useState<ResourceLimits | null>(
+    null,
+  );
+
+  // Read-latest refs. Match EditorPage's prior pattern.
+  const nodesRef = useRef<NodeInfo[]>(nodes);
+  useEffect(() => {
+    nodesRef.current = nodes;
+  }, [nodes]);
+  const artboardsRef = useRef<ArtboardInfo[]>(artboards);
+  useEffect(() => {
+    artboardsRef.current = artboards;
+  }, [artboards]);
+
+  // Keep the error sink in a ref so we can call it inside refresh
+  // callbacks without re-creating those callbacks every render —
+  // EditorPage's prior versions had the same property.
+  const onStatusErrorRef = useRef(onStatusError);
+  useEffect(() => {
+    onStatusErrorRef.current = onStatusError;
+  }, [onStatusError]);
+
+  const reportError = useCallback((msg: string): void => {
+    onStatusErrorRef.current?.(msg);
+  }, []);
+
+  const refreshStatus = useCallback(async (): Promise<void> => {
+    try {
+      const s = await window.kcreate.document.status();
+      setDocStatus(s);
+    } catch (e) {
+      reportError(`status probe failed: ${errorMessage(e)}`);
+    }
+  }, [reportError]);
+
+  const refreshArtboards = useCallback(async (): Promise<void> => {
+    try {
+      const list = await window.kcreate.artboard.list();
+      setArtboards(list);
+    } catch (e) {
+      reportError(`artboard list failed: ${errorMessage(e)}`);
+    }
+  }, [reportError]);
+
+  const refreshComponents = useCallback(async (): Promise<void> => {
+    try {
+      const list = await window.kcreate.component.list();
+      setComponents(list);
+    } catch (e) {
+      reportError(`component list failed: ${errorMessage(e)}`);
+    }
+  }, [reportError]);
+
+  const refreshTree = useCallback(async (): Promise<void> => {
+    try {
+      const tree = await window.kcreate.document.getDocumentTree();
+      setNodes(tree);
+    } catch (e) {
+      reportError(`tree load failed: ${errorMessage(e)}`);
+    }
+    await refreshStatus();
+    await refreshArtboards();
+    await refreshComponents();
+  }, [reportError, refreshStatus, refreshArtboards, refreshComponents]);
+
+  const actions = useMemo<DocumentActions>(
+    () => ({
+      setNodes,
+      setArtboards,
+      setArtboardPresets,
+      setComponents,
+      setDocStatus,
+      setResourceLimits,
+      refreshStatus,
+      refreshArtboards,
+      refreshComponents,
+      refreshTree,
+    }),
+    [refreshStatus, refreshArtboards, refreshComponents, refreshTree],
+  );
+
+  const refs = useMemo<DocumentRefs>(
+    () => ({
+      nodesRef,
+      artboardsRef,
+    }),
+    [],
+  );
+
+  const state = useMemo<DocumentState>(
+    () => ({
+      nodes,
+      artboards,
+      artboardPresets,
+      components,
+      docStatus,
+      resourceLimits,
+      scene: EMPTY_SCENE,
+    }),
+    [nodes, artboards, artboardPresets, components, docStatus, resourceLimits],
+  );
+
+  const value = useMemo<DocumentContextValue>(
+    () => ({ state, actions, refs }),
+    [state, actions, refs],
+  );
+
+  return (
+    <DocumentContext.Provider value={value}>
+      {children}
+    </DocumentContext.Provider>
+  );
+}
+
+function useDocumentContextOrThrow(): DocumentContextValue {
+  const ctx = useContext(DocumentContext);
+  if (ctx === null) {
+    throw new Error(
+      "DocumentContext consumer used outside <DocumentProvider>. Wrap the " +
+        "editor surface in <DocumentProvider> before rendering components " +
+        "that call useDocument / useDocumentState / useDocumentActions / useDocumentRefs.",
+    );
+  }
+  return ctx;
+}
+
+/** Full bundle — state + actions + refs. Convenient for EditorPage. */
+export function useDocument(): DocumentContextValue {
+  return useDocumentContextOrThrow();
+}
+
+/** State only — re-renders on any state change. */
+export function useDocumentState(): DocumentState {
+  return useDocumentContextOrThrow().state;
+}
+
+/** Actions only — stable identity. */
+export function useDocumentActions(): DocumentActions {
+  return useDocumentContextOrThrow().actions;
+}
+
+/** Refs only — stable identity. */
+export function useDocumentRefs(): DocumentRefs {
+  return useDocumentContextOrThrow().refs;
+}

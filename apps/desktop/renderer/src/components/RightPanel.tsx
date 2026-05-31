@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 
+import { clampTabToAvailable } from "../lib/rightPanelTabs";
 import type {
   FillStyle,
   FlexLayout,
@@ -203,6 +204,27 @@ export function RightPanel({
     [showAccessibility, showInteraction, showPreflight, showColor],
   );
   const [tab, setTab] = useState<RightPanelTab>("properties");
+  // Clamp the active tab back into the visible strip whenever the
+  // editor `mode` transition removes the entry we were on. Without
+  // this, switching from `design` (Accessibility visible) to
+  // `vector` (Accessibility gone) leaves `tab === "accessibility"`
+  // but no matching pill in the strip and no matching `tab === …`
+  // branch in the render block — the right panel goes blank until
+  // the user clicks any other pill. Devin Review surfaced this on
+  // PR #31 round 3 (`RightPanel.tsx:205`); the round-3 reply
+  // declined as "pre-existing UX quirk" and noted the proper fix
+  // is a clamping pass. This is that fix.
+  //
+  // The effect only writes when the clamp actually changes value —
+  // `clampTabToAvailable` returns `tab` itself when it's still in
+  // the strip, so the common case is a single equality check and
+  // no state write. Depending on `TABS` (which is itself memoized
+  // on the mode-derived booleans) means the effect runs at most
+  // once per mode transition, not on every render.
+  useEffect(() => {
+    const next = clampTabToAvailable(tab, TABS);
+    if (next !== tab) setTab(next);
+  }, [TABS, tab]);
   // Subscribe to the advisory edit-lock roster so panels can grey
   // out controls (and the right-panel header can render a "Locked
   // by …" pill) when the current selection is held by a remote

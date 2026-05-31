@@ -18,6 +18,8 @@
 // The stub is reinstalled in `beforeEach` so call logs and overrides
 // don't bleed across tests.
 
+import type { Preferences } from "../../../shared/scene";
+
 export interface KcreateStubCall {
   /// Dot-path of the method, e.g. "runtime.status", "export.png".
   method: string;
@@ -48,22 +50,45 @@ export function kcreateStub(): KcreateStubHandle {
   return handle;
 }
 
-const defaultPrefs = {
-  autosaveSeconds: 60,
-  confirmDelete: true,
-  snapEnabled: true,
-  smartGuidesEnabled: true,
-  canvasBackground: "checker",
-  keyboardLayout: "qwerty",
-  accent: "#3B82F6",
-  theme: "light",
-  locale: "en-US",
-  units: "px",
-  showRulers: true,
-  showGrid: false,
-  gridSize: 8,
-  nudgeSmall: 1,
-  nudgeLarge: 10,
+// Mirror of `Preferences` from `apps/desktop/shared/scene.ts`
+// (which in turn mirrors `kcreate_bridge::phase10::Preferences`).
+// Tests reach into nested keys (e.g. `prefs.export.lastDirByFormat`)
+// and the production `PreferencesPanel` reads `general.theme`,
+// `canvas.snapThresholdPx`, etc. — so the stub default MUST have
+// the same shape as production or the first render under the test
+// harness throws on `undefined.<nestedKey>`. Drift here has bitten
+// us before; keep this in lockstep with the `Preferences` interface
+// in `apps/desktop/shared/scene.ts:5677`.
+//
+// Typed via the imported interface so a future field addition is a
+// compile error here, not a silent runtime gap in test land.
+const defaultPrefs: Preferences = {
+  general: {
+    theme: "system",
+    language: "en-US",
+    autosaveIntervalSec: 60,
+    scratchProjectCleanupDays: 7,
+  },
+  canvas: {
+    defaultGridSpacing: 8,
+    defaultGridSubdivisions: 4,
+    snapThresholdPx: 6,
+    rulerUnits: "px",
+  },
+  ai: {
+    defaultLlmModel: "",
+    autoStartSidecar: false,
+    gbnfGrammarDebugging: false,
+  },
+  performance: {
+    rasterCacheBudgetMb: 256,
+    undoDepthOverride: null,
+    lowResourceMode: false,
+  },
+  privacy: {
+    telemetryOptIn: false,
+    auditLogRetentionDays: 30,
+  },
   export: {
     lastDirByFormat: {},
     lastBatchDir: null,

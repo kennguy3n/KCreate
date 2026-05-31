@@ -88,6 +88,17 @@ const TOOL_CURSORS: Record<ToolId, string> = {
   text: "text",
 };
 
+// Captured at double-click time so the editor lines up with the
+// canvas glyphs underneath even if pan/zoom change while the user
+// is typing. Also used as the identity for race-safe commit
+// dismissal (see `inlineTextEditRef`).
+type InlineTextEditState = {
+  nodeId: string;
+  rect: { x: number; y: number; width: number; height: number };
+  style: TextStyleWire;
+  initialContent: string;
+};
+
 export function EditorPage({
   project,
   onBackHome,
@@ -110,12 +121,22 @@ export function EditorPage({
   // double-click time so the editor lines up with the canvas
   // glyphs underneath even if pan/zoom change while the user is
   // typing.
-  const [inlineTextEdit, setInlineTextEdit] = useState<{
-    nodeId: string;
-    rect: { x: number; y: number; width: number; height: number };
-    style: TextStyleWire;
-    initialContent: string;
-  } | null>(null);
+  const [inlineTextEdit, setInlineTextEdit] = useState<InlineTextEditState | null>(
+    null,
+  );
+  // Identity ref for the currently-open inline text editor draft.
+  // The renderer can mount a new editor (different node, different
+  // initial content) BEFORE a prior `commitInlineTextEdit` finishes
+  // its bridge round-trip; without an identity check the late
+  // `setInlineTextEdit(null)` in the prior commit's `finally` would
+  // unmount the new editor and flash it closed. We compare the
+  // captured draft against this ref before nulling so only the
+  // commit that owns the current draft can dismiss it. Kept in
+  // lockstep with the state via the effect below.
+  const inlineTextEditRef = useRef<InlineTextEditState | null>(null);
+  useEffect(() => {
+    inlineTextEditRef.current = inlineTextEdit;
+  }, [inlineTextEdit]);
   // The document graph lives in Rust; we only keep a sampled `Scene`
   // snapshot here for the renderer. Phase 1 will swap this for a
   // push-based subscription rather than periodic resync. We don't
@@ -1685,7 +1706,7 @@ export function EditorPage({
           const screenY = node.bounds.y * viewport.zoom + viewport.panY;
           const screenW = node.bounds.width * viewport.zoom;
           const screenH = node.bounds.height * viewport.zoom;
-          setInlineTextEdit({
+          const nextDraft: InlineTextEditState = {
             nodeId: hit,
             rect: {
               x: screenX,
@@ -1695,7 +1716,14 @@ export function EditorPage({
             },
             style,
             initialContent: content,
-          });
+          };
+          // Update the ref BEFORE scheduling the state update so any
+          // commit captured between this tick and the next React
+          // render flush sees the new draft identity — without this,
+          // a commit that resolves in the gap between `setState` and
+          // the lockstep effect could still null the new editor.
+          inlineTextEditRef.current = nextDraft;
+          setInlineTextEdit(nextDraft);
         } catch (err) {
           setStatusMessage(
             `Inline text edit failed: ${errorMessage(err)}`,
@@ -1713,9 +1741,18 @@ export function EditorPage({
   // as for partial edits, which keeps the undo replay tidy).
   // Indices are UTF-16 code units — same as JavaScript string
   // length — so we can pass `initialContent.length` directly.
+  //
+  // The captured `draft` is the editor instance this commit owns;
+  // `inlineTextEditRef.current` is the editor currently mounted on
+  // screen. They diverge when the user double-clicks a different
+  // TextLayer while the prior commit's `replaceRange` round-trip is
+  // still in flight — in that case the new editor has already
+  // taken over the draft slot and the prior commit must NOT null
+  // it, or the new editor flashes closed. The identity check in
+  // `finally` enforces this.
   const commitInlineTextEdit = useCallback(
     async (next: string) => {
-      const draft = inlineTextEdit;
+      const draft = inlineTextEditRef.current;
       if (!draft) return;
       try {
         await window.kcreate.text.replaceRange(
@@ -1728,12 +1765,17 @@ export function EditorPage({
       } catch (err) {
         setStatusMessage(`Text update failed: ${errorMessage(err)}`);
       } finally {
-        setInlineTextEdit(null);
+        if (inlineTextEditRef.current === draft) {
+          setInlineTextEdit(null);
+        }
       }
     },
-    [inlineTextEdit],
+    [],
   );
 
+  // Cancel always nulls — the user explicitly dismissed the
+  // editor (Escape key, blur, etc.), so the latest draft is the
+  // one being cancelled regardless of any in-flight commit.
   const cancelInlineTextEdit = useCallback(() => {
     setInlineTextEdit(null);
   }, []);

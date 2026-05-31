@@ -5,7 +5,7 @@
 // .export.*` IPC bridge. The bridge does the file I/O — the renderer
 // never touches disk directly.
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 
 import type {
   JpegExportOptions,
@@ -174,29 +174,35 @@ export function ExportPanel({
   // Round-trip the sticky directory back into preferences. Reads
   // the current file, splices the updated `export` section, and
   // saves — preserving any other section the user may have changed
-  // elsewhere in the app.
-  const persistStickyDirs = async (
-    nextDirByFormat: Record<string, string>,
-    nextBatchDir: string | null,
-  ): Promise<void> => {
-    try {
-      const prefs: Preferences =
-        await window.kcreate.phase10.preferencesLoad();
-      const updated: Preferences = {
-        ...prefs,
-        export: {
-          lastDirByFormat: nextDirByFormat,
-          lastBatchDir: nextBatchDir,
-        },
-      };
-      await window.kcreate.phase10.preferencesSave(updated);
-    } catch (e) {
-      // A persist failure must not break the export the user
-      // already saw succeed — surface as a non-fatal warning so the
-      // next session may open the dialog at the OS default.
-      onStatus(`Note: failed to remember export dir: ${errorMessage(e)}`);
-    }
-  };
+  // elsewhere in the app. Wrapped in `useCallback` so the closure
+  // identity is stable across re-renders (consistent with the
+  // `commit*` helpers in `TextStylePanel`), keeping `useEffect`
+  // dependency arrays in callers clean if this is ever passed down.
+  const persistStickyDirs = useCallback(
+    async (
+      nextDirByFormat: Record<string, string>,
+      nextBatchDir: string | null,
+    ): Promise<void> => {
+      try {
+        const prefs: Preferences =
+          await window.kcreate.phase10.preferencesLoad();
+        const updated: Preferences = {
+          ...prefs,
+          export: {
+            lastDirByFormat: nextDirByFormat,
+            lastBatchDir: nextBatchDir,
+          },
+        };
+        await window.kcreate.phase10.preferencesSave(updated);
+      } catch (e) {
+        // A persist failure must not break the export the user
+        // already saw succeed — surface as a non-fatal warning so
+        // the next session may open the dialog at the OS default.
+        onStatus(`Note: failed to remember export dir: ${errorMessage(e)}`);
+      }
+    },
+    [onStatus],
+  );
 
   const handleExport = async (): Promise<void> => {
     const ts = Date.now();
@@ -614,14 +620,28 @@ function whiteColor(): [number, number, number, number] {
 /// Pure-JS dirname for the absolute path the OS picker returned.
 /// Handles both POSIX (`/`) and Windows (`\\`) separators so the
 /// `lastDirByFormat` map persists usable paths regardless of host
-/// OS. Empty string when the input has no separator (the user
-/// somehow picked a bare filename — shouldn't happen via the OS
-/// dialog but is safe to handle).
+/// OS.
+///
+/// Edge cases:
+/// * No separator at all (bare filename — shouldn't happen via the
+///   OS dialog but is safe to handle): return empty string.
+/// * Root-level POSIX path like `/foo.png`: the last `/` is at
+///   index 0; we must return `"/"` itself (not `""`) so the sticky
+///   `lastDirByFormat` entry round-trips as a usable absolute path
+///   the next time `chooseExportTarget` opens the dialog. Returning
+///   `""` would silently fall back to the OS default on the next
+///   export.
 function dirnameOf(absolutePath: string): string {
   const lastFwd = absolutePath.lastIndexOf("/");
   const lastBack = absolutePath.lastIndexOf("\\");
   const cut = Math.max(lastFwd, lastBack);
-  return cut <= 0 ? "" : absolutePath.slice(0, cut);
+  if (cut < 0) return "";
+  // Preserve the separator at the root so `/foo.png` → `/` and
+  // (on Windows) `\\server\share\foo.png` style roots keep their
+  // leading separator. `absolutePath[0]` is always defined here
+  // because `cut >= 0` implies the string has at least one char.
+  if (cut === 0) return absolutePath[0] ?? "";
+  return absolutePath.slice(0, cut);
 }
 
 function Field({

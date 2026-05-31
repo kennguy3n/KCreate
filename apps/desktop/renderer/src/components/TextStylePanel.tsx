@@ -44,6 +44,15 @@ export function TextStylePanel({
   // remount-on-every-keystroke flicker we'd get if `value` were
   // bound to local state.
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+  // Last font-family value the bridge accepted via `text_set_style`.
+  // The font-family `<input>` is controlled (`value={style.fontFamily}`)
+  // so `onChange` updates `style.fontFamily` before `onBlur` fires —
+  // comparing the blur value against the live state is therefore a
+  // dead check and would silently drop the user's edit. We compare
+  // against this ref instead, which is only updated from inside
+  // `commitStyle`'s success path (and `load`'s hydration), so it
+  // always reflects the bridge's view of the world.
+  const lastCommittedFamilyRef = useRef<string | null>(null);
 
   const load = useCallback(async (id: string) => {
     setError(null);
@@ -54,6 +63,7 @@ export function TextStylePanel({
       ]);
       setStyle(nextStyle);
       setContent(nextContent);
+      lastCommittedFamilyRef.current = nextStyle.fontFamily;
       if (textareaRef.current && textareaRef.current.value !== nextContent) {
         textareaRef.current.value = nextContent;
       }
@@ -99,6 +109,7 @@ export function TextStylePanel({
       try {
         await window.kcreate.text.setStyle(node.id, next);
         setStyle(next);
+        lastCommittedFamilyRef.current = next.fontFamily;
         setError(null);
         onStatus?.("Text style: updated.");
       } catch (e) {
@@ -205,7 +216,12 @@ export function TextStylePanel({
           }
           onBlur={(e) => {
             const next = e.target.value;
-            if (next && next !== style.fontFamily) {
+            // Compare against the last value the bridge accepted —
+            // `style.fontFamily` was already updated by `onChange`
+            // before this blur handler fired, so comparing against
+            // it would always be false. See `lastCommittedFamilyRef`
+            // declaration for the longer rationale.
+            if (next && next !== lastCommittedFamilyRef.current) {
               void commitStyle({ ...style, fontFamily: next });
             }
           }}

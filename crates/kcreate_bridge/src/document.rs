@@ -129,6 +129,14 @@ pub enum DocumentBridgeError {
     /// underlying error's `Display` output.
     #[error("{0}")]
     Internal(String),
+    /// Phase B1 (Pen tool): `canvas_create_path` rejected a
+    /// caller-supplied path geometry. See [`CreatePathError`] for
+    /// the discriminator. Routed through its own variant (rather
+    /// than collapsing into `InvalidArgument`) because the renderer
+    /// surfaces each subkind with a different toast and a different
+    /// telemetry tag — see `useToolStateMachine.ts` pen branch.
+    #[error(transparent)]
+    CreatePath(#[from] CreatePathError),
 }
 
 pub type Result<T> = std::result::Result<T, DocumentBridgeError>;
@@ -2795,6 +2803,99 @@ pub fn canvas_create_line(
         bh,
         path,
         "canvas_create_line",
+    )
+}
+
+/// Errors specific to the [`canvas_create_path`] entry point.
+///
+/// `canvas_create_path` is the only bridge entry that accepts a
+/// caller-provided path geometry rather than synthesizing one from
+/// shape parameters (`x, y, w, h` for rects, `cx, cy, rx, ry` for
+/// ellipses, …). That means it needs richer error reporting so the
+/// Pen tool can surface "you sent us junk" without dropping the
+/// gesture silently.
+#[derive(Debug, Error)]
+pub enum CreatePathError {
+    /// The wire payload couldn't be parsed as `Vec<PathSegment>`.
+    /// The error message includes the underlying serde diagnostic
+    /// (line, column, kind) so renderer-side regressions can be
+    /// caught without re-deserializing client-side.
+    #[error("invalid path JSON: {0}")]
+    InvalidJson(String),
+    /// The caller sent zero segments. We reject this rather than
+    /// silently inserting an invisible 0×0 node, because every Pen
+    /// gesture is required to produce at least one `MoveTo` and one
+    /// committed segment (line or cubic). A 0-segment payload almost
+    /// always means a logic bug in the renderer.
+    #[error("path has no segments")]
+    Empty,
+    /// The path does not start with a `MoveTo`. `VectorPath` doesn't
+    /// enforce this structurally (it's just a `Vec<PathSegment>`),
+    /// but Kurbo's `BezPath`-derived bounds and the renderer-side
+    /// translator both assume `commands[0]` is `MoveTo`. We catch
+    /// this here so renderer regressions surface as a typed error
+    /// instead of silent geometry corruption downstream.
+    #[error("path must start with move_to")]
+    MissingMoveTo,
+}
+
+/// Create a freehand vector path from a caller-provided sequence of
+/// path segments. Used by the Pen tool to commit a finished gesture
+/// to the document.
+///
+/// `segments_json` is the JSON serialization of
+/// `Vec<kcreate_vector::PathSegment>` — the same shape `PathSegment`
+/// already serializes to via serde's internal tagging (`{"op": ...}`).
+/// This piggybacks on the existing serde wire instead of inventing
+/// a parallel TS-friendly shape, so adding a new `PathSegment`
+/// variant in `kcreate_vector` automatically widens the Pen wire
+/// without bridge-side changes.
+///
+/// `closed` matches `VectorPath::closed` (whether the renderer
+/// should join the last point back to the first for fill / hit-test
+/// purposes — independent of whether the caller appended an
+/// explicit `Close` segment).
+///
+/// `name` is the layer name to show in the layers panel. `None`
+/// defaults to `"Path"`, matching the convention used by the other
+/// shape creators (`"Rectangle"`, `"Ellipse"`, `"Line"`).
+///
+/// Returns the new node's uuid. Records an undoable operation under
+/// the `canvas_create_path` op_kind. Bounds are computed by Kurbo's
+/// `BezPath::bounding_box()` (tight curve bounds, not control-point
+/// bounds) so the layers panel and selection rect match what the
+/// user actually drew.
+pub fn canvas_create_path(
+    parent_id: Option<Uuid>,
+    segments_json: &str,
+    closed: bool,
+    name: Option<String>,
+) -> Result<Uuid> {
+    let segments: Vec<kcreate_vector::PathSegment> =
+        serde_json::from_str(segments_json).map_err(|e| {
+            DocumentBridgeError::CreatePath(CreatePathError::InvalidJson(e.to_string()))
+        })?;
+    if segments.is_empty() {
+        return Err(DocumentBridgeError::CreatePath(CreatePathError::Empty));
+    }
+    if !matches!(segments[0], kcreate_vector::PathSegment::MoveTo(_)) {
+        return Err(DocumentBridgeError::CreatePath(
+            CreatePathError::MissingMoveTo,
+        ));
+    }
+    let mut path = kcreate_vector::VectorPath::new(segments);
+    path.closed = closed;
+    let bounds = path.bounds();
+    let layer_name = name.unwrap_or_else(|| "Path".to_string());
+    create_vector_layer(
+        parent_id,
+        layer_name.as_str(),
+        bounds.min_x,
+        bounds.min_y,
+        bounds.width(),
+        bounds.height(),
+        path,
+        "canvas_create_path",
     )
 }
 
@@ -11056,5 +11157,230 @@ mod tests {
         assert!(v4 > v3, "redo did not bump document_version: {v3} -> {v4}");
 
         project_close();
+    }
+
+    // -------------------------------------------------------------
+    // Phase B1 — canvas_create_path coverage
+    // -------------------------------------------------------------
+    //
+    // canvas_create_path is the only shape-creator that takes a
+    // caller-provided segment list (rest synthesize one from
+    // {x,y,w,h} / {cx,cy,rx,ry} / endpoints). These tests pin:
+    //   * the wire shape (JSON `{"op":"move_to",...}`) round-trips
+    //     into a real `VectorPath` end-to-end,
+    //   * bounds come from Kurbo's `BezPath::bounding_box()` (tight
+    //     curve bounds, not control-point bounds),
+    //   * undo deletes the node and redo recreates it (i.e. the
+    //     "create" op_kind is properly recorded), and
+    //   * every `CreatePathError` variant fires on the right input.
+
+    fn line_segments_json(x1: f64, y1: f64, x2: f64, y2: f64) -> String {
+        format!(r#"[{{"op":"move_to","x":{x1},"y":{y1}}},{{"op":"line_to","x":{x2},"y":{y2}}}]"#)
+    }
+
+    #[test]
+    #[serial]
+    fn canvas_create_path_inserts_node_with_kurbo_bounds() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("path1", dir.path()).expect("create");
+        // Diagonal line from (5,7) to (20,30). Bounds should be the
+        // tight box (5,7)-(20,30) = width 15, height 23.
+        let id = canvas_create_path(None, &line_segments_json(5.0, 7.0, 20.0, 30.0), false, None)
+            .expect("create_path");
+        let tree = document_get_tree().expect("tree");
+        let node = tree.iter().find(|n| n.id == id).expect("inserted");
+        assert_eq!(node.node_type, "VectorLayer");
+        assert_eq!(node.name, "Path");
+        assert!(
+            (node.bounds.x - 5.0).abs() < 1e-6
+                && (node.bounds.y - 7.0).abs() < 1e-6
+                && (node.bounds.width - 15.0).abs() < 1e-6
+                && (node.bounds.height - 23.0).abs() < 1e-6,
+            "got bounds {:?}",
+            node.bounds
+        );
+        project_close();
+    }
+
+    #[test]
+    #[serial]
+    fn canvas_create_path_uses_tight_curve_bounds_not_control_point_bounds() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("path_curve", dir.path()).expect("create");
+        // A cubic curve from (0,0) to (10,0) with both control
+        // points yanked up to y=100. The CURVE itself never goes
+        // above y=75 (cubic peaks at 3/4 of the control height for
+        // symmetric handles), but the control-point bounding box
+        // includes the full (0,0)-(10,100) extent. We pin that the
+        // bridge uses Kurbo's tight bounds.
+        let segs = r#"[
+            {"op":"move_to","x":0.0,"y":0.0},
+            {"op":"cubic_to","ctrl1":{"x":0.0,"y":100.0},"ctrl2":{"x":10.0,"y":100.0},"end":{"x":10.0,"y":0.0}}
+        ]"#;
+        let id = canvas_create_path(None, segs, false, Some("Curve".into())).expect("path");
+        let tree = document_get_tree().expect("tree");
+        let node = tree.iter().find(|n| n.id == id).expect("inserted");
+        assert_eq!(node.name, "Curve");
+        // Tight cubic peak: y_max = 75 exactly for the chosen
+        // symmetric handles. Allow 1e-3 for Kurbo's flattening.
+        assert!(
+            node.bounds.height < 80.0 && node.bounds.height > 70.0,
+            "expected tight cubic bounds ~75, got {:?}",
+            node.bounds
+        );
+        project_close();
+    }
+
+    #[test]
+    #[serial]
+    fn canvas_create_path_stores_vector_path_metadata() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("path_meta", dir.path()).expect("create");
+        let id = canvas_create_path(None, &line_segments_json(0.0, 0.0, 10.0, 0.0), true, None)
+            .expect("path");
+        // Read back the raw metadata blob and verify it deserializes
+        // to a VectorPath whose `closed` flag matches the caller.
+        let guard = slot().read();
+        let ws = guard.as_ref().expect("ws");
+        let node = ws.project.document.get_node(id).expect("node");
+        let blob = node
+            .metadata
+            .get(crate::scene_sync::VECTOR_PATH_METADATA_KEY)
+            .expect("vector_path metadata");
+        let path: kcreate_vector::VectorPath =
+            serde_json::from_value(blob.clone()).expect("vector_path deserializes");
+        assert!(path.closed);
+        assert_eq!(path.commands.len(), 2);
+    }
+
+    #[test]
+    #[serial]
+    fn canvas_create_path_records_undoable_operation() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("path_undo", dir.path()).expect("create");
+        let id = canvas_create_path(None, &line_segments_json(0.0, 0.0, 5.0, 5.0), false, None)
+            .expect("path");
+        let after_create = document_get_tree().expect("tree");
+        assert!(after_create.iter().any(|n| n.id == id));
+
+        // For graph-mutating ops the bridge does NOT fold the
+        // inverse patch back into the in-memory tree itself — the
+        // host owns that step (see `document_undo` doc comment).
+        // What we *can* verify at the bridge layer is that an op
+        // was recorded under the `canvas_create_path` op_kind and
+        // is visible to `document_undo` / `document_redo`.
+        let undo_outcome = document_undo()
+            .expect("undo")
+            .expect("canvas_create_path was recorded");
+        assert_eq!(undo_outcome.command, "canvas_create_path");
+        assert_eq!(undo_outcome.affected_nodes, vec![id]);
+
+        let redo_outcome = document_redo()
+            .expect("redo")
+            .expect("canvas_create_path is on the redo stack");
+        assert_eq!(redo_outcome.command, "canvas_create_path");
+        assert_eq!(redo_outcome.affected_nodes, vec![id]);
+        project_close();
+    }
+
+    #[test]
+    #[serial]
+    fn canvas_create_path_rejects_empty_payload() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("path_empty", dir.path()).expect("create");
+        let err = canvas_create_path(None, "[]", false, None).expect_err("empty rejected");
+        assert!(matches!(
+            err,
+            DocumentBridgeError::CreatePath(CreatePathError::Empty)
+        ));
+        project_close();
+    }
+
+    #[test]
+    #[serial]
+    fn canvas_create_path_rejects_missing_move_to() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("path_no_move", dir.path()).expect("create");
+        // A path that starts with `line_to` is structurally invalid:
+        // `LineTo` needs an implicit current-point that doesn't
+        // exist without a leading `MoveTo`.
+        let segs = r#"[{"op":"line_to","x":1.0,"y":1.0}]"#;
+        let err = canvas_create_path(None, segs, false, None).expect_err("missing move_to");
+        assert!(matches!(
+            err,
+            DocumentBridgeError::CreatePath(CreatePathError::MissingMoveTo)
+        ));
+        project_close();
+    }
+
+    #[test]
+    #[serial]
+    fn canvas_create_path_rejects_invalid_json() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("path_bad_json", dir.path()).expect("create");
+        let err =
+            canvas_create_path(None, "not-json", false, None).expect_err("invalid json rejected");
+        assert!(matches!(
+            err,
+            DocumentBridgeError::CreatePath(CreatePathError::InvalidJson(_))
+        ));
+        project_close();
+    }
+
+    #[test]
+    #[serial]
+    fn canvas_create_path_supports_all_segment_kinds() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("path_all_kinds", dir.path()).expect("create");
+        // Exercises every PathSegment variant in one path, including
+        // QuadTo + CubicTo + Close. Locks in that the wire format
+        // covers the full kcreate_vector::PathSegment surface.
+        let segs = r#"[
+            {"op":"move_to","x":0.0,"y":0.0},
+            {"op":"line_to","x":10.0,"y":0.0},
+            {"op":"quad_to","ctrl":{"x":15.0,"y":5.0},"end":{"x":10.0,"y":10.0}},
+            {"op":"cubic_to","ctrl1":{"x":5.0,"y":15.0},"ctrl2":{"x":0.0,"y":15.0},"end":{"x":0.0,"y":10.0}},
+            {"op":"close"}
+        ]"#;
+        let id = canvas_create_path(None, segs, true, None).expect("create");
+        let guard = slot().read();
+        let ws = guard.as_ref().expect("ws");
+        let node = ws.project.document.get_node(id).expect("node");
+        let blob = node
+            .metadata
+            .get(crate::scene_sync::VECTOR_PATH_METADATA_KEY)
+            .expect("vector_path metadata");
+        let path: kcreate_vector::VectorPath =
+            serde_json::from_value(blob.clone()).expect("path deserializes");
+        assert_eq!(path.commands.len(), 5);
+        assert!(matches!(
+            path.commands[0],
+            kcreate_vector::PathSegment::MoveTo(_)
+        ));
+        assert!(matches!(
+            path.commands[1],
+            kcreate_vector::PathSegment::LineTo(_)
+        ));
+        assert!(matches!(
+            path.commands[2],
+            kcreate_vector::PathSegment::QuadTo { .. }
+        ));
+        assert!(matches!(
+            path.commands[3],
+            kcreate_vector::PathSegment::CubicTo { .. }
+        ));
+        assert!(matches!(
+            path.commands[4],
+            kcreate_vector::PathSegment::Close
+        ));
+        assert!(path.closed);
     }
 }

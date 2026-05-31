@@ -84,7 +84,14 @@ fn map_doc_err(e: DocumentBridgeError) -> NapiError {
         | DocumentBridgeError::InvalidArgument { .. }
         | DocumentBridgeError::NodeNotFound(_)
         | DocumentBridgeError::ProjectDirExists(_)
-        | DocumentBridgeError::InvalidUuid(_, _) => Status::InvalidArg,
+        | DocumentBridgeError::InvalidUuid(_, _)
+        // Phase B1 Pen tool: every `CreatePathError` variant is a
+        // caller-side wire / structure mistake, not a runtime
+        // bridge failure. Surface as `InvalidArg` so the renderer's
+        // error handler can attach the offending payload to a
+        // useful toast rather than the generic "internal error"
+        // path that GenericFailure would route through.
+        | DocumentBridgeError::CreatePath(_) => Status::InvalidArg,
         // Marketplace errors that come from a user-supplied template
         // path / id are user-correctable (bad path, wrong id, duplicate
         // install) — surface as InvalidArg so the renderer can show
@@ -1550,6 +1557,36 @@ pub fn canvas_create_line(
         None => None,
     };
     document::canvas_create_line(parent, x1, y1, x2, y2)
+        .map(|u| u.to_string())
+        .map_err(map_doc_err)
+}
+
+/// Create a freehand vector path from a caller-provided segment
+/// list. The Pen tool calls this to commit a finished gesture.
+///
+/// `segments_json` is the JSON serialization of
+/// `Vec<kcreate_vector::PathSegment>`. The TS wire mirror lives in
+/// `apps/desktop/shared/scene.ts::PathSegmentWire`. We pass JSON
+/// rather than a structured N-API value to (a) avoid maintaining a
+/// parallel marshalling table for every `PathSegment` variant and
+/// (b) keep adding new variants (e.g. ArcTo) a pure
+/// `kcreate_vector` change.
+///
+/// `closed` becomes `VectorPath.closed`. `name` is the layer name
+/// (default `"Path"`).
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn canvas_create_path(
+    parent_id: Option<String>,
+    segments_json: String,
+    closed: bool,
+    name: Option<String>,
+) -> NapiResult<String> {
+    let parent = match parent_id.as_deref() {
+        Some(s) => Some(parse_uuid(s)?),
+        None => None,
+    };
+    document::canvas_create_path(parent, &segments_json, closed, name)
         .map(|u| u.to_string())
         .map_err(map_doc_err)
 }

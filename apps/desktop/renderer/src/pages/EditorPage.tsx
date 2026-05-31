@@ -23,6 +23,7 @@ import { InlineTextEditor } from "../components/InlineTextEditor";
 import { CursorOverlay } from "../components/CursorOverlay";
 import { LeftPanel } from "../components/LeftPanel";
 import { PageNavigator } from "../components/PageNavigator";
+import { PenOverlay } from "../components/PenOverlay";
 import { RightPanel } from "../components/RightPanel";
 import { SelectionOverlay } from "../components/SelectionOverlay";
 import { SoftProofOverlay } from "../components/SoftProofOverlay";
@@ -80,6 +81,11 @@ const TOOL_CURSORS: Record<ToolId, string> = {
   rect: "crosshair",
   ellipse: "crosshair",
   line: "crosshair",
+  // Pen uses the same crosshair as the other geometry tools rather
+  // than a custom "pen tip" cursor; the in-canvas anchor/handle
+  // overlay (see PenOverlay) gives the user the precision feedback
+  // a bespoke cursor would otherwise add.
+  pen: "crosshair",
   text: "text",
 };
 
@@ -1245,6 +1251,59 @@ function EditorPageInner({
     },
     [mode, setTool],
   );
+
+  // Wrap `setStatusMessage` in a plain `(msg: string) => void` closure
+  // before handing it to the state machine. `setStatusMessage` is
+  // `Dispatch<SetStateAction<string | null>>`, which accepts both a
+  // plain string AND a functional updater (`prev => string | null`).
+  // The hook only ever calls `onError(string)`, so the assignment is
+  // currently type-safe via function parameter contravariance — but
+  // any future drift inside the hook (e.g. accidentally passing an
+  // `Error` object whose value happens to be callable, or a closure
+  // captured for some other purpose) would be silently interpreted
+  // as a functional updater by React rather than a string. Narrowing
+  // the prop boundary to `(msg: string) => void` here makes that
+  // drift a compile error instead of a runtime surprise. Mirrors the
+  // same defensive wrapper used by `EditorDocumentBridge` above.
+  const onToolStateMachineError = useCallback(
+    (msg: string): void => {
+      setStatusMessage(msg);
+    },
+    [setStatusMessage],
+  );
+  // Pointer-event state machine. Owns the
+  // (Idle | Pan | Move | Create | Pen) discriminated-union state,
+  // the canvas pointer handler, and the bridge side effects
+  // (hit-test, snap query, moveNode, createRect/Ellipse/Line/
+  // Text/Path). See `hooks/useToolStateMachine.ts` for the
+  // architectural rationale. The hook's `onAfterCommit` hooks into
+  // `refreshTree` so committed drags trigger a full document re-
+  // pull, exactly as the pre-refactor handler did.
+  // `lastCursorWorldRef` is declared higher up (right after the
+  // context destructures) so the paste closure created earlier in
+  // this component captures a defined binding.
+  //
+  // Declared BEFORE `shortcutHandlers` so the Escape (cancel pen) /
+  // Enter (commit pen) routes can call `toolStateMachine.cancelPen()`
+  // / `commitPen()` directly. Moving it later was the pre-Phase-B1
+  // layout — fine when the state machine only exposed
+  // `onCanvasPointer`, since `CanvasHost` is rendered way below
+  // `shortcutHandlers`, but it broke the moment Pen shortcuts
+  // needed to call back into the machine.
+  const toolStateMachine = useToolStateMachine({
+    tool,
+    viewport,
+    panActiveRef,
+    nodesRef,
+    lastCursorWorldRef,
+    setSelectedIds,
+    setViewport,
+    setSnapGuides,
+    onError: onToolStateMachineError,
+    onAfterCommit: refreshTree,
+  });
+  const onCanvasPointer = toolStateMachine.onCanvasPointer;
+
   const shortcutHandlers = useMemo<ShortcutHandlers>(
     () => ({
       undo: (e) => {
@@ -1277,12 +1336,29 @@ function EditorPageInner({
       },
       clearSelection: (e) => {
         e.preventDefault();
+        // Escape semantics, in priority order:
+        //   1. If a pen gesture is in flight, cancel it. The user
+        //      pressed Escape to abandon the path; it would be
+        //      surprising if Escape also deselected an unrelated
+        //      shape under that gesture.
+        //   2. Otherwise clear the current selection (the
+        //      pre-pen-tool behaviour).
+        if (toolStateMachine.cancelPen()) return;
         void handleClearSelection();
+      },
+      // Phase B1 — Enter commits the in-flight pen gesture as an
+      // OPEN path. No-op when the state machine isn't in the pen
+      // variant (handled inside `commitPen`), so this binding
+      // can't interfere with other modes.
+      commitPath: (e) => {
+        e.preventDefault();
+        void toolStateMachine.commitPen();
       },
       toolSelect: (e) => tryTool("select", e),
       toolRect: (e) => tryTool("rect", e),
       toolEllipse: (e) => tryTool("ellipse", e),
       toolLine: (e) => tryTool("line", e),
+      toolPen: (e) => tryTool("pen", e),
       toolText: (e) => tryTool("text", e),
       // Hold-to-pan: object-form handler so `useShortcuts`
       // dispatches both phases. `event.repeat` guards against OS
@@ -1324,52 +1400,9 @@ function EditorPageInner({
         void handlePaste();
       },
     }),
-    [handleUndo, handleRedo, handleSelectAll, handleDeleteSelected, handleClearSelection, handleCopy, handlePaste, tryTool, setMode, setPanActive],
+    [handleUndo, handleRedo, handleSelectAll, handleDeleteSelected, handleClearSelection, handleCopy, handlePaste, tryTool, setMode, setPanActive, toolStateMachine],
   );
   useShortcuts(shortcutHandlers);
-
-  // Wrap `setStatusMessage` in a plain `(msg: string) => void` closure
-  // before handing it to the state machine. `setStatusMessage` is
-  // `Dispatch<SetStateAction<string | null>>`, which accepts both a
-  // plain string AND a functional updater (`prev => string | null`).
-  // The hook only ever calls `onError(string)`, so the assignment is
-  // currently type-safe via function parameter contravariance — but
-  // any future drift inside the hook (e.g. accidentally passing an
-  // `Error` object whose value happens to be callable, or a closure
-  // captured for some other purpose) would be silently interpreted
-  // as a functional updater by React rather than a string. Narrowing
-  // the prop boundary to `(msg: string) => void` here makes that
-  // drift a compile error instead of a runtime surprise. Mirrors the
-  // same defensive wrapper used by `EditorDocumentBridge` above.
-  const onToolStateMachineError = useCallback(
-    (msg: string): void => {
-      setStatusMessage(msg);
-    },
-    [setStatusMessage],
-  );
-  // Pointer-event state machine. Owns the (Idle | Pan | Move | Create)
-  // discriminated-union state, the canvas pointer handler, and the
-  // bridge side effects (hit-test, snap query, moveNode,
-  // createRect/Ellipse/Line/Text). See `hooks/useToolStateMachine.ts`
-  // for the architectural rationale. The hook's `onAfterCommit`
-  // hooks into `refreshTree` so committed drags trigger a full
-  // document re-pull, exactly as the pre-refactor handler did.
-  // `lastCursorWorldRef` is declared higher up (right after the
-  // context destructures) so the paste closure created earlier in
-  // this component captures a defined binding.
-  const toolStateMachine = useToolStateMachine({
-    tool,
-    viewport,
-    panActiveRef,
-    nodesRef,
-    lastCursorWorldRef,
-    setSelectedIds,
-    setViewport,
-    setSnapGuides,
-    onError: onToolStateMachineError,
-    onAfterCommit: refreshTree,
-  });
-  const onCanvasPointer = toolStateMachine.onCanvasPointer;
 
   const onZoomToFit = useCallback(() => {
     // No documentBounds API yet; reset to identity. Phase 1 will compute
@@ -1755,6 +1788,22 @@ function EditorPageInner({
           */}
           <SnapGuidesOverlay
             guides={snapGuides}
+            viewport={viewport}
+            width={CANVAS_WIDTH}
+            height={CANVAS_HEIGHT}
+          />
+          {/*
+            Phase B1 — pen tool overlay. Renders in-flight anchors,
+            handles, and the rubber-band preview from the last
+            committed anchor to the cursor while the user is laying
+            down a path. Returns `null` (and renders nothing) when
+            the state machine is not in the `"pen"` variant, so this
+            adds zero DOM weight when the pen tool isn't active.
+            Pointer-events: none — the pen tool's pointer handler
+            is wired directly on `CanvasHost` via `onCanvasPointer`.
+          */}
+          <PenOverlay
+            machine={toolStateMachine}
             viewport={viewport}
             width={CANVAS_WIDTH}
             height={CANVAS_HEIGHT}

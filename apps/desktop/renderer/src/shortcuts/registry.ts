@@ -38,7 +38,9 @@ export type ActionId =
   | "toolRect"
   | "toolEllipse"
   | "toolLine"
+  | "toolPen"
   | "toolText"
+  | "commitPath"
   | "togglePan"
   | "openExport"
   | "openShortcutsPanel"
@@ -99,7 +101,14 @@ export const DEFAULT_BINDINGS: Record<ActionId, ShortcutBinding> = {
   toolRect: { key: "r", mod: false, shift: false, alt: false },
   toolEllipse: { key: "e", mod: false, shift: false, alt: false },
   toolLine: { key: "l", mod: false, shift: false, alt: false },
+  toolPen: { key: "p", mod: false, shift: false, alt: false },
   toolText: { key: "t", mod: false, shift: false, alt: false },
+  // Phase B1 — Pen tool gesture commit. Bound to Enter so a path-in-
+  // flight (>= 2 anchors) can be promoted to a real `VectorLayer`
+  // without forcing the user to switch tools or click into empty
+  // space. The handler is a no-op when the pen state machine is
+  // idle, so this binding cannot interfere with non-pen workflows.
+  commitPath: { key: "Enter", mod: false, shift: false, alt: false },
   // Space-bar pan: held to temporarily switch to pan mode (a
   // gesture, not a one-shot action). The handler in `useShortcuts`
   // dispatches both keydown and keyup for this action.
@@ -167,6 +176,12 @@ export const ACTION_META: Record<ActionId, ActionMeta> = {
     category: "tools",
     description: "Switch to the line tool.",
   },
+  toolPen: {
+    label: "Tool: Pen",
+    category: "tools",
+    description:
+      "Switch to the pen tool (multi-click to add anchors; click+drag for smooth curves; Enter to commit; Esc to cancel).",
+  },
   toolText: {
     label: "Tool: Text",
     category: "tools",
@@ -198,6 +213,12 @@ export const ACTION_META: Record<ActionId, ActionMeta> = {
     category: "editing",
     description:
       "Insert the clipboard payload under the active artboard, offset to avoid overlap.",
+  },
+  commitPath: {
+    label: "Commit path",
+    category: "editing",
+    description:
+      "Commit the in-flight pen path as a `VectorLayer`. No-op when the pen tool has no anchors recorded.",
   },
 };
 

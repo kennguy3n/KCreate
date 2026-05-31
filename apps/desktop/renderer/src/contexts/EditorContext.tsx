@@ -36,7 +36,7 @@ import type { SnapGuide, TextStyleWire } from "../../../shared/scene";
  * inline definition. The selected tool drives the canvas cursor and
  * the pointer-handler dispatch.
  */
-export type ToolId = "select" | "rect" | "ellipse" | "line" | "text";
+export type ToolId = "select" | "rect" | "ellipse" | "line" | "text" | "pen";
 
 /**
  * State for the in-canvas text editor that mounts as an absolutely

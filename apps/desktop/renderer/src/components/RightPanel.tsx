@@ -243,12 +243,44 @@ export function RightPanel({
         flexDirection: "column",
       }}
     >
+      {/*
+        Tab strip layout — Devin Review PR #31 round 5 surfaced the
+        problem (RightPanel.tsx:233): 14 icon+label pills inside a
+        300px-wide aside wrapped to 3–4 vertical rows, eating screen
+        real estate the panels below should own. Round-5 reply
+        sketched three mitigations (scrollable strip, overflow menu,
+        icon-only mode); this commit lands the scrollable strip,
+        which is the lowest-disruption option:
+
+          - Every pill stays full icon+label, so discoverability for
+            the always-on Phase 8 surfaces (Constraints, Tokens,
+            Publish, Encryption) survives — those names don't have
+            obvious icon glyphs and an icon-only mode would force
+            users to hover-and-wait for the tooltip on every glance.
+          - One row + horizontal scroll matches the pattern VSCode,
+            Figma, and Chrome devtools use for crowded panel tabs,
+            so the affordance is already learned by the target user.
+          - `flexShrink: 0` on each pill prevents the "all pills
+            squished to illegibility" failure mode that a naive
+            `whiteSpace: nowrap` parent would otherwise allow when
+            the browser tries to compress before scrolling.
+          - `scrollbarWidth: "thin"` keeps the native scrollbar
+            informative but ~6px tall instead of the default ~12px,
+            so it doesn't dominate vertically. WebKit's overlay
+            scrollbar already auto-hides; Firefox honours `thin`.
+
+        The lock pill (LockBanner) and content panels below are
+        unchanged — only the strip's wrap-vs-scroll behaviour was
+        crowding.
+      */}
       <div
         style={{
           display: "flex",
-          flexWrap: "wrap",
           gap: 2,
           padding: `${spacing.sm}px ${spacing.sm}px 0`,
+          overflowX: "auto",
+          overflowY: "hidden",
+          scrollbarWidth: "thin",
         }}
         role="tablist"
       >
@@ -272,6 +304,15 @@ export function RightPanel({
               display: "inline-flex",
               alignItems: "center",
               gap: 4,
+              // Keep each pill at its natural width — without
+              // `flexShrink: 0` the flex container would try to
+              // compress pills before scrolling, producing a row of
+              // illegible truncated labels. Forcing pills to their
+              // intrinsic size means overflow always becomes a
+              // horizontal scroll (the intended affordance) rather
+              // than a degraded layout.
+              flexShrink: 0,
+              whiteSpace: "nowrap",
             }}
           >
             <Icon name={t.icon} size={12} />

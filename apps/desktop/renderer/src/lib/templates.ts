@@ -171,9 +171,21 @@ const BRAND_RESOLVER: TemplateResolver = {
     // even-width swatches with a small horizontal gap; total row
     // width = artboard - 2*margin. Each swatch is square-ish
     // (height = swatch width).
+    //
+    // `Math.floor` (not `Math.round`) so the four-swatch budget is
+    // never over-allocated: `4 * swatchWidth + 3 * swatchGap <=
+    // swatchRowWidth`. With `Math.round` an odd numerator could round
+    // the quotient up by 0.5 on each of the four swatches, costing up
+    // to ~2px on the row's right edge. Today the shipped 1024×1024
+    // brand preset has slack — `4*214 + 3*15 = 901 <= 902` even with
+    // rounding — so this is defensive, not load-bearing. But the
+    // floor invariant `4*swatchWidth + 3*swatchGap <= swatchRowWidth`
+    // then holds for any artboard size a future surface might apply
+    // this resolver to, mirroring the pattern already in use on
+    // `APP_UI_RESOLVER` (line 389) and `DECK_RESOLVER` (line 519).
     const swatchGap = Math.round(aw * 0.015);
     const swatchRowWidth = aw - margin * 2;
-    const swatchWidth = Math.round(
+    const swatchWidth = Math.floor(
       (swatchRowWidth - swatchGap * 3) / 4,
     );
     const swatchHeight = swatchWidth;
@@ -387,7 +399,13 @@ const APP_UI_RESOLVER: TemplateResolver = {
     const tileTop = ay + headerH + tileMargin;
     const tileBottom = ay + ah - tileMargin;
     const tileWidth = Math.floor((aw - rail - tileMargin * 4) / 3);
-    const tileHeight = tileBottom - tileTop;
+    // `Math.max(0, ...)` so a future surface applying this resolver
+    // to a very short artboard (`ah < headerH + 2*tileMargin`) doesn't
+    // pass a negative height into `createRect`. Mirrors the documented
+    // clamp on `DECK_RESOLVER`'s `colHeight` (see line 508). Today the
+    // shipped 1440×900 app-ui preset always yields a positive value
+    // (~764px), so this is defensive, not load-bearing.
+    const tileHeight = Math.max(0, tileBottom - tileTop);
     for (let i = 0; i < 3; i += 1) {
       const tx = ax + rail + tileMargin + i * (tileWidth + tileMargin);
       await rect(

@@ -351,6 +351,64 @@ test("BRAND resolver lays out cleanly on the actual 1024\u00d71024 brand preset"
     lastRight <= ctx.width,
     `last swatch right edge ${lastRight} > artboard width ${ctx.width}`,
   );
+  // Floor invariant on the four-swatch budget. The resolver computes
+  // `swatchWidth = Math.floor((swatchRowWidth - swatchGap * 3) / 4)`
+  // so `4*swatchWidth + 3*swatchGap <= swatchRowWidth` (with at most
+  // 3px of unused slack — one per dropped fractional part). With
+  // `Math.round` the sum could exceed the row width by ~2px on an
+  // unfavorable numerator. This is exercised here against the actual
+  // 1024\u00d71024 shipped preset so a future regression to `Math.round`
+  // (or any other rounding mode that can round up) would be caught
+  // by the inequality regardless of whether the production geometry
+  // happens to have slack. Mirrors the DECK_RESOLVER floor invariant.
+  const espresso = named.get("Palette / Espresso");
+  const sage = named.get("Palette / Sage");
+  assert.ok(espresso, "missing 'Palette / Espresso' rect for floor check");
+  assert.ok(sage, "missing 'Palette / Sage' rect for floor check");
+  const swatchWidth = espresso.create.w;
+  // Adjacent swatches are spaced by `swatchWidth + swatchGap` so we
+  // can recover `swatchGap` from any two consecutive swatches.
+  const cream = named.get("Palette / Cream");
+  assert.ok(cream, "missing 'Palette / Cream' rect for gap check");
+  const swatchGap = cream.create.x - (espresso.create.x + swatchWidth);
+  const margin = espresso.create.x;
+  const swatchRowWidth = ctx.width - margin * 2;
+  assert.ok(
+    4 * swatchWidth + 3 * swatchGap <= swatchRowWidth,
+    `floor invariant violated: 4*${swatchWidth} + 3*${swatchGap} = ` +
+      `${4 * swatchWidth + 3 * swatchGap} > swatchRowWidth ${swatchRowWidth}`,
+  );
+});
+
+// APP_UI_RESOLVER computes `tileHeight = Math.max(0, tileBottom -
+// tileTop)` so a future surface applying it to an extremely short
+// artboard doesn't pass a negative height into `createRect`. The
+// shipped 1440\u00d7900 preset has plenty of slack, so this test exercises
+// a degenerate \u201cnegative budget\u201d artboard size and asserts the clamp
+// kicks in: tile rects must still have `h >= 0`. Mirrors the
+// documented clamp on `DECK_RESOLVER`'s `colHeight` (line 508).
+test("APP_UI resolver clamps tileHeight to >= 0 on a degenerate short artboard", async (t) => {
+  const { templateResolverFor } = await loadResolvers();
+  const calls = installRecorder(t);
+  // `headerH = round(50 * 0.08) = 4`, `tileMargin = 32`, so
+  // `tileTop = 0 + 4 + 32 = 36`, `tileBottom = 0 + 50 - 32 = 18`,
+  // and the un-clamped value would be `18 - 36 = -18`.
+  const ctx = { x: 0, y: 0, width: 1440, height: 50 };
+  await templateResolverFor("app-ui").apply(ctx);
+  const nodes = nodesFromCalls(calls);
+  const named = new Map(
+    [...nodes.values()]
+      .map((n) => [nameOf(n), n])
+      .filter(([n]) => n !== null),
+  );
+  for (const i of [1, 2, 3]) {
+    const tile = named.get(`Content tile ${i}`);
+    assert.ok(tile, `missing 'Content tile ${i}'`);
+    assert.ok(
+      tile.create.h >= 0,
+      `tile ${i} height ${tile.create.h} must be >= 0 after clamp`,
+    );
+  }
 });
 
 test("SOCIAL resolver seeds a cream background, burnt-orange headline band, headline + body copy, and sage accent", async (t) => {

@@ -15,6 +15,7 @@ import type {
   WebpExportOptions,
 } from "../../../shared/scene";
 import { colors, radius, spacing } from "../styles/tokens";
+import { Icon, type IconName } from "./Icon";
 import { IconPackDialog } from "./IconPackDialog";
 
 // One leaf job inside a preset. Each leaf is a single `export.*` call.
@@ -34,6 +35,12 @@ interface ExportPreset {
   label: string;
   description: string;
   jobs: PresetJob[];
+  /// Lucide icon name displayed inside the preset button. Keyed to
+  /// the same registry as the rest of the UI (`components/Icon.tsx`).
+  /// Picked to summarise the workflow ("web-assets" → `globe`,
+  /// "icon-pack" → `grid-2x2`, …) so the buttons are recognisable at
+  /// a glance.
+  icon: IconName;
 }
 
 const WHITE: [number, number, number, number] = [1, 1, 1, 1];
@@ -46,6 +53,7 @@ const BUILTIN_PRESETS: ReadonlyArray<ExportPreset> = [
     id: "web-assets",
     label: "Web Assets",
     description: "PNG @1x, @2x, @3x.",
+    icon: "globe",
     jobs: [
       { format: "png", scale: 1, suffix: "-1x" },
       { format: "png", scale: 2, suffix: "-2x" },
@@ -56,6 +64,7 @@ const BUILTIN_PRESETS: ReadonlyArray<ExportPreset> = [
     id: "social-pack",
     label: "Social Pack",
     description: "Instagram 1080², Twitter 1200×675, FB 1200×630.",
+    icon: "share",
     jobs: [
       { format: "png", scale: 1, suffix: "-instagram", background: WHITE },
       { format: "png", scale: 1, suffix: "-twitter", background: WHITE },
@@ -66,6 +75,7 @@ const BUILTIN_PRESETS: ReadonlyArray<ExportPreset> = [
     id: "icon-pack",
     label: "Icon Pack",
     description: "PNG @16/24/32/48/512 + SVG.",
+    icon: "grid-2x2",
     jobs: [
       { format: "png", scale: 1, suffix: "-16" },
       { format: "png", scale: 1, suffix: "-24" },
@@ -79,6 +89,7 @@ const BUILTIN_PRESETS: ReadonlyArray<ExportPreset> = [
     id: "print-ready",
     label: "Print Ready",
     description: "PDF at A4 300dpi.",
+    icon: "printer",
     jobs: [
       {
         format: "pdf",
@@ -92,6 +103,7 @@ const BUILTIN_PRESETS: ReadonlyArray<ExportPreset> = [
     id: "dev-handoff",
     label: "Developer Handoff",
     description: "SVG + CSS tokens JSON.",
+    icon: "code",
     jobs: [{ format: "svg", suffix: "" }],
   },
 ];
@@ -407,7 +419,17 @@ export function ExportPanel({
             disabled={running || !tempDir}
             style={presetBtn(running || !tempDir)}
           >
-            <span style={{ fontWeight: 600 }}>{p.label}</span>
+            <span
+              style={{
+                display: "inline-flex",
+                alignItems: "center",
+                gap: 6,
+                fontWeight: 600,
+              }}
+            >
+              <Icon name={p.icon} size={14} />
+              {p.label}
+            </span>
             <span style={{ fontSize: 10, color: colors.textMuted }}>
               {p.description}
             </span>

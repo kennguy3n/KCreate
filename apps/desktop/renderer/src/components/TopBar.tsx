@@ -1,6 +1,7 @@
 import { useTheme } from "../styles/ThemeProvider";
 import { colors, font, radius, spacing } from "../styles/tokens";
 import type { ToolId } from "../pages/EditorPage";
+import { Icon, type IconName } from "./Icon";
 
 export type EditorMode =
   | "design"
@@ -60,12 +61,15 @@ export function defaultPanelForMode(mode: EditorMode): RightPanelFocus {
   return PANEL_FOR_MODE[mode];
 }
 
-const TOOL_LABELS: Record<ToolId, { label: string; key: string }> = {
-  select: { label: "Select", key: "V" },
-  rect: { label: "Rect", key: "R" },
-  ellipse: { label: "Ellipse", key: "E" },
-  line: { label: "Line", key: "L" },
-  text: { label: "Text", key: "T" },
+const TOOL_LABELS: Record<
+  ToolId,
+  { label: string; key: string; icon: IconName }
+> = {
+  select: { label: "Select", key: "V", icon: "mouse-pointer" },
+  rect: { label: "Rect", key: "R", icon: "square" },
+  ellipse: { label: "Ellipse", key: "E", icon: "circle" },
+  line: { label: "Line", key: "L", icon: "minus" },
+  text: { label: "Text", key: "T", icon: "type" },
 };
 
 export interface TopBarProps {
@@ -118,7 +122,10 @@ export function TopBar(props: TopBarProps): JSX.Element {
         style={pillButton(false)}
         aria-label="Back to home"
       >
-        ← Home
+        <span style={iconRow()}>
+          <Icon name="arrow-left" size={14} />
+          Home
+        </span>
       </button>
       <span style={{ fontWeight: 600 }}>{projectName}</span>
       <nav
@@ -159,10 +166,11 @@ export function TopBar(props: TopBarProps): JSX.Element {
             type="button"
             onClick={() => onToolChange(t)}
             aria-pressed={t === tool}
+            aria-label={TOOL_LABELS[t].label}
             title={`${TOOL_LABELS[t].label} (${TOOL_LABELS[t].key})`}
             style={toolButton(t === tool)}
           >
-            {TOOL_LABELS[t].label}
+            <Icon name={TOOL_LABELS[t].icon} size={16} />
           </button>
         ))}
       </div>
@@ -171,17 +179,21 @@ export function TopBar(props: TopBarProps): JSX.Element {
         type="button"
         onClick={onUndo}
         disabled={!canUndo}
+        aria-label="Undo"
+        title="Undo"
         style={pillButton(false, !canUndo)}
       >
-        Undo
+        <Icon name="undo" size={14} />
       </button>
       <button
         type="button"
         onClick={onRedo}
         disabled={!canRedo}
+        aria-label="Redo"
+        title="Redo"
         style={pillButton(false, !canRedo)}
       >
-        Redo
+        <Icon name="redo" size={14} />
       </button>
       <button
         type="button"
@@ -194,10 +206,13 @@ export function TopBar(props: TopBarProps): JSX.Element {
         }
         title={`Theme: ${themeId === "dark" ? "Dark" : "Light"}`}
       >
-        {themeId === "dark" ? "\u263C" : "\u263D"}
+        <Icon name={themeId === "dark" ? "sun" : "moon"} size={14} />
       </button>
       <button type="button" onClick={onExport} style={pillButton(true)}>
-        Export
+        <span style={iconRow()}>
+          <Icon name="download" size={14} />
+          Export
+        </span>
       </button>
     </header>
   );
@@ -237,9 +252,24 @@ function toolButton(active: boolean): React.CSSProperties {
     background: active ? colors.bg : "transparent",
     color: active ? colors.accent : colors.textMuted,
     borderRadius: radius.pill,
-    padding: "4px 10px",
+    padding: "4px 8px",
     fontSize: 11,
     fontWeight: active ? 600 : 500,
     cursor: "pointer",
+    display: "inline-flex",
+    alignItems: "center",
+    justifyContent: "center",
+  };
+}
+
+/// Inline-flex row used by the Home / Export / undo / redo pills to
+/// align the icon to the label without leaving an awkward baseline
+/// gap. Centralised here so every icon+label pill in the TopBar uses
+/// the same vertical-centering rule.
+function iconRow(): React.CSSProperties {
+  return {
+    display: "inline-flex",
+    alignItems: "center",
+    gap: 6,
   };
 }

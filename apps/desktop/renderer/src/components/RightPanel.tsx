@@ -27,6 +27,7 @@ import { ConstraintsPanel } from "./ConstraintsPanel";
 import { EncryptionPanel } from "./EncryptionPanel";
 import { TextFramePanel } from "./TextFramePanel";
 import { TokenBindingControl } from "./TokenBindingControl";
+import { Icon, type IconName } from "./Icon";
 
 export type RightPanelTab =
   | "properties"
@@ -47,13 +48,17 @@ export type RightPanelTab =
 
 /// Tabs shown by default. Some tabs (Accessibility, Interaction) only
 /// appear when the active editor mode calls for them — gated below.
-const BASE_TABS: ReadonlyArray<{ id: RightPanelTab; label: string }> = [
-  { id: "properties", label: "Properties" },
-  { id: "effects", label: "Effects" },
-  { id: "ai", label: "AI Assist" },
-  { id: "export", label: "Export" },
-  { id: "inspect", label: "Inspect" },
-  { id: "history", label: "History" },
+const BASE_TABS: ReadonlyArray<{
+  id: RightPanelTab;
+  label: string;
+  icon: IconName;
+}> = [
+  { id: "properties", label: "Properties", icon: "sliders-horizontal" },
+  { id: "effects", label: "Effects", icon: "sparkles" },
+  { id: "ai", label: "AI Assist", icon: "bot" },
+  { id: "export", label: "Export", icon: "download" },
+  { id: "inspect", label: "Inspect", icon: "code" },
+  { id: "history", label: "History", icon: "clock" },
 ];
 
 export interface LayoutHandlers {
@@ -128,29 +133,75 @@ export function RightPanel({
   // a fresh array (and new option object literals) on every render,
   // breaking referential equality for any downstream memo.
   const TABS = useMemo<
-    ReadonlyArray<{ id: RightPanelTab; label: string }>
+    ReadonlyArray<{ id: RightPanelTab; label: string; icon: IconName }>
   >(
     () => [
       ...BASE_TABS,
       ...(showAccessibility
-        ? [{ id: "accessibility" as const, label: "Accessibility" }]
+        ? [
+            {
+              id: "accessibility" as const,
+              label: "Accessibility",
+              icon: "eye" as IconName,
+            },
+          ]
         : []),
       ...(showInteraction
-        ? [{ id: "interaction" as const, label: "Interaction" }]
+        ? [
+            {
+              id: "interaction" as const,
+              label: "Interaction",
+              icon: "wand" as IconName,
+            },
+          ]
         : []),
       ...(showPreflight
-        ? [{ id: "preflight" as const, label: "Preflight" }]
+        ? [
+            {
+              id: "preflight" as const,
+              label: "Preflight",
+              icon: "file-text" as IconName,
+            },
+          ]
         : []),
-      ...(showColor ? [{ id: "color" as const, label: "Color" }] : []),
-      { id: "presence" as const, label: "Presence" },
+      ...(showColor
+        ? [
+            {
+              id: "color" as const,
+              label: "Color",
+              icon: "palette" as IconName,
+            },
+          ]
+        : []),
+      {
+        id: "presence" as const,
+        label: "Presence",
+        icon: "users" as IconName,
+      },
       // Phase 8 Block C — node-scoped + project-scoped surfaces.
       // Constraints + Tokens are per-selected-node so they only
       // make sense when a node is selected; rendered with a hint
       // otherwise (mirrors how the Properties tab degrades).
-      { id: "constraints" as const, label: "Constraints" },
-      { id: "tokens" as const, label: "Tokens" },
-      { id: "publish" as const, label: "Publish" },
-      { id: "encryption" as const, label: "Encryption" },
+      {
+        id: "constraints" as const,
+        label: "Constraints",
+        icon: "move" as IconName,
+      },
+      {
+        id: "tokens" as const,
+        label: "Tokens",
+        icon: "variable" as IconName,
+      },
+      {
+        id: "publish" as const,
+        label: "Publish",
+        icon: "globe" as IconName,
+      },
+      {
+        id: "encryption" as const,
+        label: "Encryption",
+        icon: "lock" as IconName,
+      },
     ],
     [showAccessibility, showInteraction, showPreflight, showColor],
   );
@@ -188,6 +239,7 @@ export function RightPanel({
             type="button"
             role="tab"
             aria-selected={tab === t.id}
+            title={t.label}
             onClick={() => setTab(t.id)}
             style={{
               padding: "4px 10px",
@@ -198,8 +250,12 @@ export function RightPanel({
               border: "none",
               borderRadius: radius.pill,
               cursor: "pointer",
+              display: "inline-flex",
+              alignItems: "center",
+              gap: 4,
             }}
           >
+            <Icon name={t.icon} size={12} />
             {t.label}
           </button>
         ))}

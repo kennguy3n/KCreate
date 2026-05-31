@@ -237,3 +237,210 @@ describe("PathfinderPanel — bridge interaction", () => {
     expect(applied).not.toHaveBeenCalled();
   });
 });
+
+describe("PathfinderPanel — pending-state gating", () => {
+  // Devin Review #0002 (round 3) on PR #38: without an in-flight
+  // gate, a user can double-click a boolean-op button during the
+  // async `pathBoolean` IPC. The first call deletes the source
+  // nodes and inserts the results; the second call sees the
+  // now-deleted source ids and surfaces a confusing
+  // `SourceNotFound` toast for a gesture that visually succeeded.
+  //
+  // These tests pin the gate at the panel level so the issue is
+  // caught at the same boundary that introduced it (the panel),
+  // independent of any host-side debouncing.
+
+  it("disables all four buttons while pathBoolean is in flight", async () => {
+    const stub = kcreateStub();
+    // Park the IPC indefinitely so the panel stays in its pending
+    // state and we can observe the disabled markup before
+    // resolution. `Promise.resolve(override(...))` unwraps thenables
+    // so returning a Promise from the override forwards it intact
+    // to the awaiter inside `apply`. We use a holder object instead
+    // of a `let` binding so TS doesn't narrow the closure-assigned
+    // value to `never` at the call site below.
+    const bridge: { release: ((ids: string[]) => void) | null } = {
+      release: null,
+    };
+    stub.override(
+      "canvas.pathBoolean",
+      () =>
+        new Promise<string[]>((resolve) => {
+          bridge.release = resolve;
+        }),
+    );
+    const nodes = [mkNode("v1", "VectorLayer"), mkNode("v2", "VectorLayer")];
+    mount({ selectedIds: ["v1", "v2"], nodes });
+
+    // Pre-condition: every button is enabled before the click.
+    for (const op of [
+      "union",
+      "subtract",
+      "intersect",
+      "exclude",
+    ] as const) {
+      expect(
+        (screen.getByTestId(`pathfinder-${op}`) as HTMLButtonElement).disabled,
+        `${op} should be enabled before any click`,
+      ).toBe(false);
+    }
+
+    fireEvent.click(screen.getByTestId("pathfinder-union"));
+    // Give React a microtask to flush the `setIsPending(true)`
+    // state update — without this the click handler hasn't
+    // committed and the disabled flag hasn't propagated yet.
+    await flushAsync();
+
+    // While the bridge call is parked, every button (including
+    // the other three ops the user didn't click) must be
+    // disabled. Disabling the whole row, not just the clicked
+    // button, prevents a "click Union, immediately click
+    // Intersect" double-fire that would race two boolean ops on
+    // the same source set.
+    for (const op of [
+      "union",
+      "subtract",
+      "intersect",
+      "exclude",
+    ] as const) {
+      expect(
+        (screen.getByTestId(`pathfinder-${op}`) as HTMLButtonElement).disabled,
+        `${op} should be disabled while pathBoolean is in flight`,
+      ).toBe(true);
+    }
+
+    // Release the IPC so the test doesn't leak a pending
+    // promise; assert re-enable in the next test.
+    bridge.release?.(["r1"]);
+    await flushAsync();
+  });
+
+  it("re-enables all buttons after the bridge resolves", async () => {
+    const stub = kcreateStub();
+    const bridge: { release: ((ids: string[]) => void) | null } = {
+      release: null,
+    };
+    stub.override(
+      "canvas.pathBoolean",
+      () =>
+        new Promise<string[]>((resolve) => {
+          bridge.release = resolve;
+        }),
+    );
+    const nodes = [mkNode("v1", "VectorLayer"), mkNode("v2", "VectorLayer")];
+    const { applied } = mount({ selectedIds: ["v1", "v2"], nodes });
+
+    fireEvent.click(screen.getByTestId("pathfinder-subtract"));
+    await flushAsync();
+    expect(
+      (screen.getByTestId("pathfinder-subtract") as HTMLButtonElement).disabled,
+    ).toBe(true);
+
+    // Release the bridge; the `finally` block must clear the
+    // pending state regardless of whether the promise resolved or
+    // rejected.
+    await act(async () => {
+      bridge.release?.(["r1", "r2"]);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(applied).toHaveBeenCalledWith(["r1", "r2"]);
+    for (const op of [
+      "union",
+      "subtract",
+      "intersect",
+      "exclude",
+    ] as const) {
+      expect(
+        (screen.getByTestId(`pathfinder-${op}`) as HTMLButtonElement).disabled,
+        `${op} should be re-enabled after the bridge resolves`,
+      ).toBe(false);
+    }
+  });
+
+  it("re-enables all buttons after the bridge rejects", async () => {
+    const stub = kcreateStub();
+    const bridge: { reject: ((err: Error) => void) | null } = {
+      reject: null,
+    };
+    stub.override(
+      "canvas.pathBoolean",
+      () =>
+        new Promise<string[]>((_, reject) => {
+          bridge.reject = reject;
+        }),
+    );
+    const nodes = [mkNode("v1", "VectorLayer"), mkNode("v2", "VectorLayer")];
+    const { captured } = mount({ selectedIds: ["v1", "v2"], nodes });
+
+    fireEvent.click(screen.getByTestId("pathfinder-exclude"));
+    await flushAsync();
+    expect(
+      (screen.getByTestId("pathfinder-exclude") as HTMLButtonElement).disabled,
+    ).toBe(true);
+
+    await act(async () => {
+      bridge.reject?.(new Error("boolean op produced no output"));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    await waitFor(() => {
+      expect(captured.lastStatus).toMatch(/^exclude failed:/);
+    });
+    for (const op of [
+      "union",
+      "subtract",
+      "intersect",
+      "exclude",
+    ] as const) {
+      expect(
+        (screen.getByTestId(`pathfinder-${op}`) as HTMLButtonElement).disabled,
+        `${op} should be re-enabled after the bridge rejects`,
+      ).toBe(false);
+    }
+  });
+
+  it("only invokes pathBoolean once when a button is double-clicked rapidly", async () => {
+    // The canonical race the gate protects against: rapid
+    // double-click on Union while the first IPC is still in
+    // flight. The second click must be a no-op (button disabled,
+    // and `apply`'s own `if (isPending) return` belt-and-braces).
+    const stub = kcreateStub();
+    const bridge: { release: ((ids: string[]) => void) | null } = {
+      release: null,
+    };
+    stub.override(
+      "canvas.pathBoolean",
+      () =>
+        new Promise<string[]>((resolve) => {
+          bridge.release = resolve;
+        }),
+    );
+    const nodes = [mkNode("v1", "VectorLayer"), mkNode("v2", "VectorLayer")];
+    mount({ selectedIds: ["v1", "v2"], nodes });
+
+    const btn = screen.getByTestId("pathfinder-union");
+    fireEvent.click(btn);
+    await flushAsync();
+    // Second click while disabled — should be ignored by the
+    // browser (disabled buttons don't fire click handlers) AND
+    // by the in-handler guard if a synthetic test bypass slipped
+    // through.
+    fireEvent.click(btn);
+    await flushAsync();
+
+    const calls = stub.calls.filter((c) => c.method === "canvas.pathBoolean");
+    expect(
+      calls,
+      "double-click while pending must fire pathBoolean exactly once",
+    ).toHaveLength(1);
+
+    await act(async () => {
+      bridge.release?.(["r1"]);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+  });
+});

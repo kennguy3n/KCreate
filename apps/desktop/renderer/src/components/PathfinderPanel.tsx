@@ -29,7 +29,7 @@
  * text is more self-documenting at this size anyway.
  */
 
-import { useCallback, useMemo, type JSX } from "react";
+import { useCallback, useMemo, useState, type JSX } from "react";
 import type { NodeInfo, PathBooleanOp } from "../../../shared/scene";
 import { errorMessage } from "../lib/errorMessage";
 import { colors, radius, spacing } from "../styles/tokens";
@@ -102,6 +102,17 @@ export function PathfinderPanel({
     return selectedIds.filter((id) => byId.get(id) === "VectorLayer");
   }, [selectedIds, nodes]);
 
+  // Tracks whether a boolean is currently in flight, so the
+  // buttons can disable themselves until the IPC round-trip
+  // resolves. Without this gate a double-click on (say) Union
+  // fires the gesture twice: the first delete-and-replace succeeds,
+  // and the second sends the now-deleted source ids back to the
+  // bridge which returns `PathBooleanError::SourceNotFound`. The
+  // error toasts cleanly so it's not data-corrupting, but the user
+  // still sees a confusing red message for a gesture that visually
+  // succeeded. Devin Review #0002 (round 3) on PR #38.
+  const [isPending, setIsPending] = useState(false);
+
   // Bridge call. Bound separately so the disabled-state and the
   // four button click handlers all close over the same identity —
   // makes the click handler trivially stable for tests + memoised
@@ -109,6 +120,12 @@ export function PathfinderPanel({
   // closure can't fire against an outdated selection.
   const apply = useCallback(
     async (op: PathBooleanOp) => {
+      // Belt-and-braces: the buttons are also `disabled` when
+      // `isPending` is true, but a synthetic click via
+      // `button.click()` from devtools / a test would bypass that.
+      // Re-checking here keeps the bridge call truly serialised.
+      if (isPending) return;
+      setIsPending(true);
       try {
         const result = await window.kcreate.canvas.pathBoolean(
           op,
@@ -122,9 +139,14 @@ export function PathfinderPanel({
         // user-readable ("source node {id} is a TextLayer, expected
         // a VectorLayer", "boolean op produced no output ...").
         onStatus(`${op} failed: ${errorMessage(e)}`);
+      } finally {
+        // Always re-enable on completion — the panel will
+        // re-render against the new (or unchanged) selection on
+        // the next refresh and the user can fire the next gesture.
+        setIsPending(false);
       }
     },
-    [vectorSelection, onStatus, onApplied],
+    [vectorSelection, onStatus, onApplied, isPending],
   );
 
   // Hide the panel entirely when there's nothing to do. This is
@@ -167,6 +189,7 @@ export function PathfinderPanel({
           title={hint}
           aria-label={hint}
           data-testid={`pathfinder-${op}`}
+          disabled={isPending}
           onClick={() => {
             void apply(op);
           }}
@@ -177,7 +200,13 @@ export function PathfinderPanel({
             border: `1px solid ${colors.border}`,
             borderRadius: radius.sm,
             fontSize: 12,
-            cursor: "pointer",
+            // Pending buttons get the standard not-allowed cursor;
+            // the visual greying comes from `disabled` itself via
+            // the browser default. We don't theme it heavier than
+            // that because the panel only flickers through the
+            // pending state for ~10-100ms in practice.
+            cursor: isPending ? "not-allowed" : "pointer",
+            opacity: isPending ? 0.6 : 1,
           }}
         >
           {label}

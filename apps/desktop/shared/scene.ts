@@ -67,6 +67,41 @@ export type PathCommand =
     }
   | { type: "close" };
 
+/**
+ * Phase B1 — Pen tool wire mirror of `kcreate_vector::PathSegment`.
+ *
+ * This is the document-side path command shape used by
+ * {@link CanvasBridge.createPath} and (eventually) the Phase B3
+ * node-editor read/write APIs. It is NOT the same as
+ * {@link PathCommand} above — `PathCommand` is the renderer-side
+ * scene wire (consumed by `parse_scene` to feed the GPU pipeline)
+ * and uses a `type` discriminator with `cx`/`cy`/`c1x`/`c1y` flat
+ * shorthand. `PathSegmentWire` is the document-side metadata wire
+ * (round-tripped through serde on `Vec<PathSegment>`), uses an
+ * `op` discriminator with nested `{x, y}` points, and stays in
+ * lockstep with the Rust enum so adding a new variant in
+ * `kcreate_vector::PathSegment` is a single point of change.
+ *
+ * The JSON shape is verified against serde by a Rust unit test in
+ * `kcreate_bridge::document::tests::canvas_create_path_*`.
+ */
+export interface PathPointWire {
+  x: number;
+  y: number;
+}
+
+export type PathSegmentWire =
+  | { op: "move_to"; x: number; y: number }
+  | { op: "line_to"; x: number; y: number }
+  | { op: "quad_to"; ctrl: PathPointWire; end: PathPointWire }
+  | {
+      op: "cubic_to";
+      ctrl1: PathPointWire;
+      ctrl2: PathPointWire;
+      end: PathPointWire;
+    }
+  | { op: "close" };
+
 export interface SceneObject {
   id: number;
   z: number;
@@ -965,6 +1000,39 @@ export interface CanvasBridge {
     y1: number,
     x2: number,
     y2: number,
+  ): Promise<string>;
+  /**
+   * Phase B1 — Pen tool commit path.
+   *
+   * Insert a freehand vector path from a caller-built segment
+   * list. Mirrors `kcreate_bridge::document::canvas_create_path`.
+   *
+   * `segments` is serialized to JSON and passed across the IPC
+   * boundary unchanged — the bridge re-deserializes via serde so
+   * the TS wire shape MUST match
+   * `kcreate_vector::PathSegment`'s serde-internally-tagged
+   * representation. See {@link PathSegmentWire} for the
+   * authoritative type.
+   *
+   * `closed` becomes `VectorPath.closed` (whether the renderer
+   * joins the last point back to the first for fill / hit-test
+   * purposes — independent of whether the caller appended an
+   * explicit `{op:"close"}` segment).
+   *
+   * `name` is the layer name shown in the layers panel; default
+   * `"Path"`.
+   *
+   * Throws:
+   * - `InvalidArg` when `segments` parses but is empty.
+   * - `InvalidArg` when the first segment is not `move_to`.
+   * - `InvalidArg` when `segments` is not valid JSON for
+   *   `Vec<PathSegment>`.
+   */
+  createPath(
+    parentId: string | null,
+    segments: PathSegmentWire[],
+    closed: boolean,
+    name?: string | null,
   ): Promise<string>;
   createText(
     parentId: string | null,

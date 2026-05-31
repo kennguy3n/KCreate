@@ -961,6 +961,21 @@ const canvas: CanvasBridge = {
       y2,
     )) as string;
   },
+  async createPath(parentId, segments, closed, name): Promise<string> {
+    // Serialize on the renderer side: keeps the wire payload's
+    // JSON shape (the serde-tagged `PathSegment` representation)
+    // as the single source of truth — both the IPC channel and
+    // the Rust bridge agree it's a `string`, and never have to
+    // negotiate the discriminator layout.
+    const segmentsJson = JSON.stringify(segments);
+    return (await ipcRenderer.invoke(
+      "kcreate/canvas/createPath",
+      parentId,
+      segmentsJson,
+      closed,
+      name ?? null,
+    )) as string;
+  },
   async createText(
     parentId,
     x,

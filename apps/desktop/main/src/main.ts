@@ -1439,6 +1439,17 @@ function registerIpcHandlers(): void {
     ) => requireBridge().canvasCreateLine(parentId, x1, y1, x2, y2),
   );
   ipcMain.handle(
+    "kcreate/canvas/createPath",
+    (
+      _e,
+      parentId: string | null,
+      segmentsJson: string,
+      closed: boolean,
+      name: string | null,
+    ) =>
+      requireBridge().canvasCreatePath(parentId, segmentsJson, closed, name),
+  );
+  ipcMain.handle(
     "kcreate/canvas/createText",
     (
       _e,

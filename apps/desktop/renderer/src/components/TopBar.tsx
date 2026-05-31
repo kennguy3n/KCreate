@@ -29,8 +29,8 @@ export const EDITOR_MODES: ReadonlyArray<{
 /// to decide which tool to default to when the user switches modes,
 /// and the TopBar uses it to enable/disable tool buttons.
 const TOOLS_BY_MODE: Record<EditorMode, ReadonlyArray<ToolId>> = {
-  design: ["select", "rect", "ellipse", "line", "text"],
-  vector: ["select", "rect", "ellipse", "line"],
+  design: ["select", "rect", "ellipse", "line", "pen", "text"],
+  vector: ["select", "rect", "ellipse", "line", "pen"],
   image: ["select"],
   layout: ["select", "rect", "text"],
   prototype: ["select"],
@@ -69,6 +69,7 @@ const TOOL_LABELS: Record<
   rect: { label: "Rect", key: "R", icon: "square" },
   ellipse: { label: "Ellipse", key: "E", icon: "circle" },
   line: { label: "Line", key: "L", icon: "minus" },
+  pen: { label: "Pen", key: "P", icon: "pen-tool" },
   text: { label: "Text", key: "T", icon: "type" },
 };
 

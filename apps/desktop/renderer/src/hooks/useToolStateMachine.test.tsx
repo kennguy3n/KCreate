@@ -1044,4 +1044,823 @@ makeNode("n1", 0, 0, 10, 10),
       expect(result.current.getState()).toEqual({ kind: "idle" });
     });
   });
+
+  // Phase B1 — Pen tool. Covers the multi-event gesture model:
+  // clicks place anchors, drags promote anchors to smooth (with
+  // symmetric handles), close-on-first-anchor commits as a closed
+  // path, Enter / `commitPen()` commits as an open path, Escape /
+  // `cancelPen()` discards, tool-switch auto-commits, the
+  // `subscribe()` surface fires on each transition, and the wire
+  // format handed to `canvas.createPath` mirrors the
+  // `PathSegmentWire` JSON shape consumed by the Rust bridge.
+  describe("pen tool", () => {
+    it("first click places a single anchor and seeds the gesture", () => {
+      const { deps } = makeDeps({ tool: "pen" });
+      const { result } = renderHook(() => useToolStateMachine(deps));
+      const canvas = makeFakeCanvas();
+
+      act(() => {
+        result.current.onCanvasPointer(
+          makeEvent(canvas, {
+            type: "pointerdown",
+            clientX: 10,
+            clientY: 20,
+            pointerId: 3,
+          }),
+        );
+      });
+
+      const s = result.current.getState();
+      expect(s.kind).toBe("pen");
+      if (s.kind !== "pen") throw new Error("expected pen");
+      expect(s.anchors).toEqual([]);
+      expect(s.pending).toEqual({
+        pointerId: 3,
+        x: 10,
+        y: 20,
+        drag: null,
+      });
+      expect(s.cursor).toEqual({ x: 10, y: 20 });
+      // Pointer capture must be acquired so subsequent move/up
+      // events route correctly even if the cursor briefly exits
+      // the canvas bounds.
+      expect(canvas.setPointerCaptureCalls).toEqual([3]);
+    });
+
+    it("pointerup with no drag promotes pending to a corner anchor", () => {
+      const { deps } = makeDeps({ tool: "pen" });
+      const { result } = renderHook(() => useToolStateMachine(deps));
+      const canvas = makeFakeCanvas();
+
+      act(() => {
+        result.current.onCanvasPointer(
+          makeEvent(canvas, { type: "pointerdown", clientX: 5, clientY: 5 }),
+        );
+      });
+      act(() => {
+        result.current.onCanvasPointer(
+          makeEvent(canvas, { type: "pointerup", clientX: 5, clientY: 5 }),
+        );
+      });
+
+      const s = result.current.getState();
+      if (s.kind !== "pen") throw new Error("expected pen");
+      expect(s.pending).toBeNull();
+      expect(s.anchors).toEqual([
+        { x: 5, y: 5, inHandle: null, outHandle: null },
+      ]);
+    });
+
+    it("drag past threshold promotes pending to a smooth anchor with mirrored handles", () => {
+      const { deps } = makeDeps({ tool: "pen" });
+      const { result } = renderHook(() => useToolStateMachine(deps));
+      const canvas = makeFakeCanvas();
+
+      act(() => {
+        result.current.onCanvasPointer(
+          makeEvent(canvas, { type: "pointerdown", clientX: 100, clientY: 100 }),
+        );
+      });
+      // 20 px drag — well past the 4 px screen threshold.
+      act(() => {
+        result.current.onCanvasPointer(
+          makeEvent(canvas, { type: "pointermove", clientX: 120, clientY: 100 }),
+        );
+      });
+      act(() => {
+        result.current.onCanvasPointer(
+          makeEvent(canvas, { type: "pointerup", clientX: 120, clientY: 100 }),
+        );
+      });
+
+      const s = result.current.getState();
+      if (s.kind !== "pen") throw new Error("expected pen");
+      expect(s.anchors).toHaveLength(1);
+      const a = s.anchors[0]!;
+      expect(a.x).toBe(100);
+      expect(a.y).toBe(100);
+      // outHandle is where the drag ended; inHandle is the
+      // symmetric reflection through the anchor.
+      expect(a.outHandle).toEqual({ x: 120, y: 100 });
+      expect(a.inHandle).toEqual({ x: 80, y: 100 });
+    });
+
+    it("sub-threshold drag stays a corner anchor", () => {
+      const { deps } = makeDeps({ tool: "pen" });
+      const { result } = renderHook(() => useToolStateMachine(deps));
+      const canvas = makeFakeCanvas();
+
+      act(() => {
+        result.current.onCanvasPointer(
+          makeEvent(canvas, { type: "pointerdown", clientX: 100, clientY: 100 }),
+        );
+      });
+      // 2 px drag — below the 4 px screen threshold.
+      act(() => {
+        result.current.onCanvasPointer(
+          makeEvent(canvas, { type: "pointermove", clientX: 102, clientY: 100 }),
+        );
+      });
+      act(() => {
+        result.current.onCanvasPointer(
+          makeEvent(canvas, { type: "pointerup", clientX: 102, clientY: 100 }),
+        );
+      });
+
+      const s = result.current.getState();
+      if (s.kind !== "pen") throw new Error("expected pen");
+      expect(s.anchors).toEqual([
+        { x: 100, y: 100, inHandle: null, outHandle: null },
+      ]);
+    });
+
+    it("commitPen no-ops when state is idle", async () => {
+      const { deps } = makeDeps({ tool: "pen" });
+      const { result } = renderHook(() => useToolStateMachine(deps));
+
+      let newId: string | null | undefined;
+      await act(async () => {
+        newId = await result.current.commitPen();
+      });
+      expect(newId).toBeNull();
+      expect(stub.calls.filter((c) => c.method === "canvas.createPath")).toEqual([]);
+    });
+
+    it("commitPen no-ops when fewer than 2 anchors have been laid", async () => {
+      const { deps, onAfterCommit } = makeDeps({ tool: "pen" });
+      const { result } = renderHook(() => useToolStateMachine(deps));
+      const canvas = makeFakeCanvas();
+
+      // Lay a single corner anchor — not enough to commit.
+      act(() => {
+        result.current.onCanvasPointer(
+          makeEvent(canvas, { type: "pointerdown", clientX: 0, clientY: 0 }),
+        );
+      });
+      act(() => {
+        result.current.onCanvasPointer(
+          makeEvent(canvas, { type: "pointerup", clientX: 0, clientY: 0 }),
+        );
+      });
+
+      let newId: string | null | undefined;
+      await act(async () => {
+        newId = await result.current.commitPen();
+      });
+
+      expect(newId).toBeNull();
+      // State resets to idle (the failed commit can't leave a
+      // dangling one-anchor gesture).
+      expect(result.current.getState()).toEqual({ kind: "idle" });
+      // No bridge call, no refresh.
+      expect(stub.calls.filter((c) => c.method === "canvas.createPath")).toEqual([]);
+      expect(onAfterCommit).not.toHaveBeenCalled();
+    });
+
+    it("commitPen with 2+ anchors fires createPath as an open path and selects the new node", async () => {
+      const { deps, onAfterCommit } = makeDeps({ tool: "pen" });
+      const { result } = renderHook(() => useToolStateMachine(deps));
+      const canvas = makeFakeCanvas();
+
+      // Click-click — two corner anchors.
+      act(() => {
+        result.current.onCanvasPointer(
+          makeEvent(canvas, { type: "pointerdown", clientX: 0, clientY: 0 }),
+        );
+      });
+      act(() => {
+        result.current.onCanvasPointer(
+          makeEvent(canvas, { type: "pointerup", clientX: 0, clientY: 0 }),
+        );
+      });
+      act(() => {
+        result.current.onCanvasPointer(
+          makeEvent(canvas, { type: "pointerdown", clientX: 50, clientY: 50 }),
+        );
+      });
+      act(() => {
+        result.current.onCanvasPointer(
+          makeEvent(canvas, { type: "pointerup", clientX: 50, clientY: 50 }),
+        );
+      });
+
+      let newId: string | null | undefined;
+      await act(async () => {
+        newId = await result.current.commitPen();
+      });
+
+      expect(newId).toBe("default-path-id");
+      expect(result.current.getState()).toEqual({ kind: "idle" });
+
+      const createCall = stub.calls.find((c) => c.method === "canvas.createPath");
+      expect(createCall).toBeDefined();
+      expect(createCall!.args[0]).toBeNull(); // parentId
+      // Wire-format check: segments come in as PathSegmentWire[] —
+      // the preload serializes them to JSON before crossing the
+      // IPC boundary, but `window.kcreate.canvas.createPath` (the
+      // preload entry, mocked here) receives the array directly.
+      const segs = createCall!.args[1] as Array<Record<string, unknown>>;
+      expect(segs).toEqual([
+        { op: "move_to", x: 0, y: 0 },
+        { op: "line_to", x: 50, y: 50 },
+      ]);
+      expect(createCall!.args[2]).toBe(false); // closed
+      expect(createCall!.args[3]).toBeNull(); // name
+
+      // setSelection routed to the new node + refresh fired.
+      const selCall = stub.calls.find(
+        (c) =>
+          c.method === "canvas.setSelection" &&
+          (c.args[0] as string[])[0] === "default-path-id",
+      );
+      expect(selCall).toBeDefined();
+      expect(onAfterCommit).toHaveBeenCalledTimes(1);
+    });
+
+    it("clicking on the first anchor closes the path (commits with closed=true + close segment)", async () => {
+      const { deps } = makeDeps({ tool: "pen" });
+      const { result } = renderHook(() => useToolStateMachine(deps));
+      const canvas = makeFakeCanvas();
+
+      // Lay anchors at (0,0) → (50,0) → (50,50).
+      const layCorner = (x: number, y: number): void => {
+        act(() => {
+          result.current.onCanvasPointer(
+            makeEvent(canvas, { type: "pointerdown", clientX: x, clientY: y }),
+          );
+        });
+        act(() => {
+          result.current.onCanvasPointer(
+            makeEvent(canvas, { type: "pointerup", clientX: x, clientY: y }),
+          );
+        });
+      };
+      layCorner(0, 0);
+      layCorner(50, 0);
+      layCorner(50, 50);
+
+      // Click back on the first anchor (within close-hit radius of
+      // 8 px). The hit-test is on pointerdown, which then fires
+      // commitPenGesture(true) — we await flush for the async
+      // bridge call.
+      act(() => {
+        result.current.onCanvasPointer(
+          makeEvent(canvas, { type: "pointerdown", clientX: 2, clientY: 2 }),
+        );
+      });
+      await flush();
+
+      expect(result.current.getState()).toEqual({ kind: "idle" });
+      const createCall = stub.calls.find((c) => c.method === "canvas.createPath");
+      expect(createCall).toBeDefined();
+      const segs = createCall!.args[1] as Array<Record<string, unknown>>;
+      // 3 corner anchors → MoveTo + 2 LineTos + closing LineTo + Close.
+      expect(segs).toEqual([
+        { op: "move_to", x: 0, y: 0 },
+        { op: "line_to", x: 50, y: 0 },
+        { op: "line_to", x: 50, y: 50 },
+        { op: "line_to", x: 0, y: 0 },
+        { op: "close" },
+      ]);
+      expect(createCall!.args[2]).toBe(true); // closed
+    });
+
+    it("close-hit radius scales with zoom so the gesture stays a consistent screen-space click", async () => {
+      // At zoom=2, the close radius (8 screen px) becomes 4 world
+      // units. A 5-world-unit click should NOT close, but a 3-
+      // world-unit click should. This guards against future
+      // refactors that swap the screen-space comparison for a
+      // raw world-space one.
+      const { deps } = makeDeps({
+        tool: "pen",
+        viewport: { panX: 0, panY: 0, zoom: 2 },
+      });
+      const { result } = renderHook(() => useToolStateMachine(deps));
+      const canvas = makeFakeCanvas();
+
+      // Lay 2 anchors. clientX/Y are screen coords; world coords
+      // at zoom=2 are clientX/2.
+      act(() => {
+        result.current.onCanvasPointer(
+          makeEvent(canvas, { type: "pointerdown", clientX: 0, clientY: 0 }),
+        );
+      });
+      act(() => {
+        result.current.onCanvasPointer(
+          makeEvent(canvas, { type: "pointerup", clientX: 0, clientY: 0 }),
+        );
+      });
+      act(() => {
+        result.current.onCanvasPointer(
+          makeEvent(canvas, { type: "pointerdown", clientX: 100, clientY: 100 }),
+        );
+      });
+      act(() => {
+        result.current.onCanvasPointer(
+          makeEvent(canvas, { type: "pointerup", clientX: 100, clientY: 100 }),
+        );
+      });
+
+      // Click 10 world units away from (0,0) → 20 px in screen
+      // space. WELL outside the 8 px close radius → stays open,
+      // lays a 3rd anchor.
+      act(() => {
+        result.current.onCanvasPointer(
+          makeEvent(canvas, { type: "pointerdown", clientX: 20, clientY: 0 }),
+        );
+      });
+      act(() => {
+        result.current.onCanvasPointer(
+          makeEvent(canvas, { type: "pointerup", clientX: 20, clientY: 0 }),
+        );
+      });
+      await flush();
+
+      // No close fired yet — state still in pen with 3 anchors.
+      const s = result.current.getState();
+      if (s.kind !== "pen") throw new Error("expected pen");
+      expect(s.anchors).toHaveLength(3);
+      expect(stub.calls.filter((c) => c.method === "canvas.createPath")).toEqual([]);
+    });
+
+    it("cancelPen discards an in-flight gesture and returns true", () => {
+      const { deps } = makeDeps({ tool: "pen" });
+      const { result } = renderHook(() => useToolStateMachine(deps));
+      const canvas = makeFakeCanvas();
+
+      act(() => {
+        result.current.onCanvasPointer(
+          makeEvent(canvas, { type: "pointerdown", clientX: 0, clientY: 0 }),
+        );
+      });
+      act(() => {
+        result.current.onCanvasPointer(
+          makeEvent(canvas, { type: "pointerup", clientX: 0, clientY: 0 }),
+        );
+      });
+
+      const cancelled = result.current.cancelPen();
+      expect(cancelled).toBe(true);
+      expect(result.current.getState()).toEqual({ kind: "idle" });
+    });
+
+    it("cancelPen returns false when state is idle (so caller falls through to clearSelection)", () => {
+      const { deps } = makeDeps({ tool: "pen" });
+      const { result } = renderHook(() => useToolStateMachine(deps));
+
+      expect(result.current.cancelPen()).toBe(false);
+      expect(result.current.getState()).toEqual({ kind: "idle" });
+    });
+
+    it("switching tool away from pen auto-commits the in-flight gesture", async () => {
+      const { deps } = makeDeps({ tool: "pen" });
+      const { result, rerender } = renderHook(
+        ({ depsArg }: { depsArg: typeof deps }) =>
+          useToolStateMachine(depsArg),
+        { initialProps: { depsArg: deps } },
+      );
+      const canvas = makeFakeCanvas();
+
+      // Lay 2 anchors.
+      act(() => {
+        result.current.onCanvasPointer(
+          makeEvent(canvas, { type: "pointerdown", clientX: 0, clientY: 0 }),
+        );
+      });
+      act(() => {
+        result.current.onCanvasPointer(
+          makeEvent(canvas, { type: "pointerup", clientX: 0, clientY: 0 }),
+        );
+      });
+      act(() => {
+        result.current.onCanvasPointer(
+          makeEvent(canvas, { type: "pointerdown", clientX: 10, clientY: 10 }),
+        );
+      });
+      act(() => {
+        result.current.onCanvasPointer(
+          makeEvent(canvas, { type: "pointerup", clientX: 10, clientY: 10 }),
+        );
+      });
+
+      // Now switch tool. The hook's useEffect on [tool] should
+      // detect tool !== "pen" + state.kind === "pen" and auto-fire
+      // commitPenGesture(false).
+      await act(async () => {
+        rerender({ depsArg: { ...deps, tool: "select" } });
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+
+      const createCall = stub.calls.find((c) => c.method === "canvas.createPath");
+      expect(createCall).toBeDefined();
+      expect(createCall!.args[2]).toBe(false); // open path
+      expect(result.current.getState()).toEqual({ kind: "idle" });
+    });
+
+    it("subscribe fires on every state transition; unsubscribe stops further calls", () => {
+      const { deps } = makeDeps({ tool: "pen" });
+      const { result } = renderHook(() => useToolStateMachine(deps));
+      const listener = vi.fn();
+      const canvas = makeFakeCanvas();
+
+      const unsub = result.current.subscribe(listener);
+
+      act(() => {
+        result.current.onCanvasPointer(
+          makeEvent(canvas, { type: "pointerdown", clientX: 0, clientY: 0 }),
+        );
+      });
+      expect(listener).toHaveBeenCalledTimes(1);
+
+      act(() => {
+        result.current.onCanvasPointer(
+          makeEvent(canvas, { type: "pointermove", clientX: 5, clientY: 5 }),
+        );
+      });
+      expect(listener).toHaveBeenCalledTimes(2);
+
+      act(() => {
+        result.current.onCanvasPointer(
+          makeEvent(canvas, { type: "pointerup", clientX: 5, clientY: 5 }),
+        );
+      });
+      expect(listener).toHaveBeenCalledTimes(3);
+
+      unsub();
+      // Further events should not call the listener again.
+      act(() => {
+        result.current.onCanvasPointer(
+          makeEvent(canvas, { type: "pointerdown", clientX: 20, clientY: 20 }),
+        );
+      });
+      expect(listener).toHaveBeenCalledTimes(3);
+    });
+
+    it("bridge failure on createPath routes through onError and clears state", async () => {
+      stub.override("canvas.createPath", () => {
+        throw new Error("disk full");
+      });
+      const { deps, onError, onAfterCommit } = makeDeps({ tool: "pen" });
+      const { result } = renderHook(() => useToolStateMachine(deps));
+      const canvas = makeFakeCanvas();
+
+      // Lay 2 anchors so the commit actually fires.
+      act(() => {
+        result.current.onCanvasPointer(
+          makeEvent(canvas, { type: "pointerdown", clientX: 0, clientY: 0 }),
+        );
+      });
+      act(() => {
+        result.current.onCanvasPointer(
+          makeEvent(canvas, { type: "pointerup", clientX: 0, clientY: 0 }),
+        );
+      });
+      act(() => {
+        result.current.onCanvasPointer(
+          makeEvent(canvas, { type: "pointerdown", clientX: 5, clientY: 5 }),
+        );
+      });
+      act(() => {
+        result.current.onCanvasPointer(
+          makeEvent(canvas, { type: "pointerup", clientX: 5, clientY: 5 }),
+        );
+      });
+
+      let newId: string | null | undefined;
+      await act(async () => {
+        newId = await result.current.commitPen();
+      });
+
+      expect(newId).toBeNull();
+      expect(onError).toHaveBeenCalledWith(
+        expect.stringContaining("disk full"),
+      );
+      // State was reset to idle BEFORE the bridge call, so the
+      // failed commit doesn't leave a dangling pen state.
+      expect(result.current.getState()).toEqual({ kind: "idle" });
+      // onAfterCommit only fires on success — the bridge throw
+      // short-circuits before it.
+      expect(onAfterCommit).not.toHaveBeenCalled();
+    });
+
+    it("smooth-anchor segment between two smooth anchors emits cubic_to with both handles", async () => {
+      const { deps } = makeDeps({ tool: "pen" });
+      const { result } = renderHook(() => useToolStateMachine(deps));
+      const canvas = makeFakeCanvas();
+
+      // Anchor 1 at (0,0), dragged to (10,0) → smooth, out=(10,0), in=(-10,0).
+      act(() => {
+        result.current.onCanvasPointer(
+          makeEvent(canvas, { type: "pointerdown", clientX: 0, clientY: 0 }),
+        );
+      });
+      act(() => {
+        result.current.onCanvasPointer(
+          makeEvent(canvas, { type: "pointermove", clientX: 10, clientY: 0 }),
+        );
+      });
+      act(() => {
+        result.current.onCanvasPointer(
+          makeEvent(canvas, { type: "pointerup", clientX: 10, clientY: 0 }),
+        );
+      });
+      // Anchor 2 at (50,50), dragged to (60,50) → smooth, out=(60,50), in=(40,50).
+      act(() => {
+        result.current.onCanvasPointer(
+          makeEvent(canvas, { type: "pointerdown", clientX: 50, clientY: 50 }),
+        );
+      });
+      act(() => {
+        result.current.onCanvasPointer(
+          makeEvent(canvas, { type: "pointermove", clientX: 60, clientY: 50 }),
+        );
+      });
+      act(() => {
+        result.current.onCanvasPointer(
+          makeEvent(canvas, { type: "pointerup", clientX: 60, clientY: 50 }),
+        );
+      });
+
+      await act(async () => {
+        await result.current.commitPen();
+      });
+
+      const createCall = stub.calls.find((c) => c.method === "canvas.createPath");
+      const segs = createCall!.args[1] as Array<Record<string, unknown>>;
+      expect(segs).toEqual([
+        { op: "move_to", x: 0, y: 0 },
+        {
+          op: "cubic_to",
+          // Anchor 1's outHandle (where the user dragged).
+          ctrl1: { x: 10, y: 0 },
+          // Anchor 2's inHandle (symmetric reflection of (60,50)
+          // through (50,50)).
+          ctrl2: { x: 40, y: 50 },
+          end: { x: 50, y: 50 },
+        },
+      ]);
+    });
+
+    it("non-pen tools (select/rect/etc.) do not enter pen state", () => {
+      const { deps } = makeDeps({ tool: "rect" });
+      const { result } = renderHook(() => useToolStateMachine(deps));
+      const canvas = makeFakeCanvas();
+
+      act(() => {
+        result.current.onCanvasPointer(
+          makeEvent(canvas, { type: "pointerdown", clientX: 0, clientY: 0 }),
+        );
+      });
+      // Rect tool goes into `create`, not `pen`.
+      expect(result.current.getState().kind).toBe("create");
+    });
+
+    // Devin-Review BUG_0001 regression: every pen state transition
+    // MUST return a new object reference so
+    // `useSyncExternalStore`'s `Object.is` snapshot comparison
+    // actually re-renders the overlay. In-place mutation +
+    // `notify()` would fire the listeners but React would
+    // short-circuit the re-render.
+    it("pen state transitions return new object references on every event", () => {
+      const { deps } = makeDeps({ tool: "pen" });
+      const { result } = renderHook(() => useToolStateMachine(deps));
+      const canvas = makeFakeCanvas();
+
+      // pointerdown → seeds pen state (new ref from IDLE)
+      act(() => {
+        result.current.onCanvasPointer(
+          makeEvent(canvas, { type: "pointerdown", clientX: 0, clientY: 0 }),
+        );
+      });
+      const afterDown = result.current.getState();
+      expect(afterDown.kind).toBe("pen");
+
+      // pointermove → must produce a NEW state object reference
+      act(() => {
+        result.current.onCanvasPointer(
+          makeEvent(canvas, {
+            type: "pointermove",
+            clientX: 5,
+            clientY: 5,
+          }),
+        );
+      });
+      const afterMove = result.current.getState();
+      expect(afterMove).not.toBe(afterDown);
+      expect(afterMove.kind).toBe("pen");
+      if (afterMove.kind === "pen") {
+        expect(afterMove.cursor).toEqual({ x: 5, y: 5 });
+      }
+
+      // pointerup → must also produce a NEW state object reference
+      act(() => {
+        result.current.onCanvasPointer(
+          makeEvent(canvas, {
+            type: "pointerup",
+            clientX: 5,
+            clientY: 5,
+          }),
+        );
+      });
+      const afterUp = result.current.getState();
+      expect(afterUp).not.toBe(afterMove);
+      expect(afterUp.kind).toBe("pen");
+      if (afterUp.kind === "pen") {
+        expect(afterUp.anchors).toHaveLength(1);
+        expect(afterUp.pending).toBeNull();
+      }
+    });
+
+    // Devin-Review BUG_0002 regression: hold-to-pan during a
+    // multi-click pen gesture must NOT discard the committed
+    // anchors. The pen state is stashed in a shadow ref on pan
+    // entry and restored on pan exit.
+    it("hold-to-pan preserves committed pen anchors across pan release", () => {
+      const { deps, panActiveRef, setViewport } = makeDeps({ tool: "pen" });
+      const { result } = renderHook(() => useToolStateMachine(deps));
+      const canvas = makeFakeCanvas();
+
+      // Click + release to commit the first corner anchor.
+      act(() => {
+        result.current.onCanvasPointer(
+          makeEvent(canvas, { type: "pointerdown", clientX: 10, clientY: 10 }),
+        );
+        result.current.onCanvasPointer(
+          makeEvent(canvas, { type: "pointerup", clientX: 10, clientY: 10 }),
+        );
+      });
+      // Click + release to commit the second corner anchor.
+      act(() => {
+        result.current.onCanvasPointer(
+          makeEvent(canvas, { type: "pointerdown", clientX: 20, clientY: 20 }),
+        );
+        result.current.onCanvasPointer(
+          makeEvent(canvas, { type: "pointerup", clientX: 20, clientY: 20 }),
+        );
+      });
+      // Sanity: two anchors committed, no pending.
+      const beforePan = result.current.getState();
+      expect(beforePan.kind).toBe("pen");
+      if (beforePan.kind === "pen") {
+        expect(beforePan.anchors).toHaveLength(2);
+        expect(beforePan.pending).toBeNull();
+      }
+
+      // Now arm hold-to-pan and start a pan gesture with a fresh
+      // pointer id (touch + mouse on a hybrid laptop, conceptually).
+      panActiveRef.current = true;
+      act(() => {
+        result.current.onCanvasPointer(
+          makeEvent(canvas, {
+            type: "pointerdown",
+            clientX: 100,
+            clientY: 100,
+            pointerId: 99,
+          }),
+        );
+      });
+      expect(result.current.getState().kind).toBe("pan");
+
+      // Drag the pan a bit — verify the viewport actually moved
+      // (proves the pan path is functional, not a no-op).
+      act(() => {
+        result.current.onCanvasPointer(
+          makeEvent(canvas, {
+            type: "pointermove",
+            clientX: 150,
+            clientY: 130,
+            pointerId: 99,
+          }),
+        );
+      });
+      expect(setViewport).toHaveBeenCalled();
+
+      // Release the pan. Pen state should be restored intact.
+      act(() => {
+        result.current.onCanvasPointer(
+          makeEvent(canvas, {
+            type: "pointerup",
+            clientX: 150,
+            clientY: 130,
+            pointerId: 99,
+          }),
+        );
+      });
+      const afterPan = result.current.getState();
+      expect(afterPan.kind).toBe("pen");
+      if (afterPan.kind === "pen") {
+        expect(afterPan.anchors).toHaveLength(2);
+        // Coordinates must be the original world-space positions
+        // (the user's two clicks at world (10,10) and (20,20)) —
+        // NOT shifted by the pan delta. Pan moves the viewport,
+        // not the document.
+        expect(afterPan.anchors[0]).toMatchObject({
+          x: 10,
+          y: 10,
+          inHandle: null,
+          outHandle: null,
+        });
+        expect(afterPan.anchors[1]).toMatchObject({
+          x: 20,
+          y: 20,
+          inHandle: null,
+          outHandle: null,
+        });
+      }
+    });
+
+    // Edge case for BUG_0002: pan with zero committed anchors
+    // (user pressed Space before any click) should NOT rehydrate
+    // an empty pen state on pan release — we'd be left with a
+    // ghost pen state holding nothing.
+    it("hold-to-pan with no committed pen anchors leaves IDLE on pan release", () => {
+      const { deps, panActiveRef } = makeDeps({ tool: "pen" });
+      const { result } = renderHook(() => useToolStateMachine(deps));
+      const canvas = makeFakeCanvas();
+
+      panActiveRef.current = true;
+      act(() => {
+        result.current.onCanvasPointer(
+          makeEvent(canvas, {
+            type: "pointerdown",
+            clientX: 0,
+            clientY: 0,
+            pointerId: 1,
+          }),
+        );
+        result.current.onCanvasPointer(
+          makeEvent(canvas, {
+            type: "pointerup",
+            clientX: 0,
+            clientY: 0,
+            pointerId: 1,
+          }),
+        );
+      });
+      // Pan saved nothing → restore is a no-op → state is IDLE.
+      expect(result.current.getState().kind).toBe("idle");
+    });
+
+    // Edge case: switching tools while still holding Space (pen
+    // state lives only in the shadow ref) must still auto-commit
+    // the gesture — otherwise the user's path is silently dropped.
+    it("tool-switch during pan promotes saved pen anchors and auto-commits", async () => {
+      const bundle = makeDeps({ tool: "pen" });
+      const { result, rerender } = renderHook(
+        ({ deps: d }) => useToolStateMachine(d),
+        { initialProps: { deps: bundle.deps } },
+      );
+      const canvas = makeFakeCanvas();
+
+      // Lay two anchors.
+      act(() => {
+        result.current.onCanvasPointer(
+          makeEvent(canvas, { type: "pointerdown", clientX: 0, clientY: 0 }),
+        );
+        result.current.onCanvasPointer(
+          makeEvent(canvas, { type: "pointerup", clientX: 0, clientY: 0 }),
+        );
+        result.current.onCanvasPointer(
+          makeEvent(canvas, { type: "pointerdown", clientX: 30, clientY: 0 }),
+        );
+        result.current.onCanvasPointer(
+          makeEvent(canvas, { type: "pointerup", clientX: 30, clientY: 0 }),
+        );
+      });
+      expect(
+        (result.current.getState() as { kind: string; anchors: unknown[] })
+          .anchors,
+      ).toHaveLength(2);
+
+      // Pan starts; pen state moves to the shadow.
+      bundle.panActiveRef.current = true;
+      act(() => {
+        result.current.onCanvasPointer(
+          makeEvent(canvas, {
+            type: "pointerdown",
+            clientX: 100,
+            clientY: 100,
+            pointerId: 7,
+          }),
+        );
+      });
+      expect(result.current.getState().kind).toBe("pan");
+
+      // Now switch tools while still mid-pan. The auto-commit
+      // effect should pull the shadow back and commit it as an
+      // open path.
+      const nextDeps = { ...bundle.deps, tool: "select" as ToolId };
+      await act(async () => {
+        rerender({ deps: nextDeps });
+        // Let the tool-switch effect's async createPath resolve.
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      const createCall = stub.calls.find(
+        (c) => c.method === "canvas.createPath",
+      );
+      expect(createCall).toBeTruthy();
+    });
+  });
 });

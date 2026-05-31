@@ -439,6 +439,21 @@ export interface Bridge {
     x2: number,
     y2: number,
   ): string;
+  /**
+   * Phase B1 — Pen tool. Mirrors
+   * `kcreate_bridge::canvas_create_path`. `segmentsJson` is the
+   * JSON serialization of `Vec<kcreate_vector::PathSegment>`
+   * (see `PathSegmentWire` in `apps/desktop/shared/scene.ts`).
+   * The bridge re-deserializes server-side, so the only contract
+   * the main process needs to honour is "valid JSON in, uuid out
+   * or throw on error".
+   */
+  canvasCreatePath(
+    parentId: string | null,
+    segmentsJson: string,
+    closed: boolean,
+    name: string | null,
+  ): string;
   canvasCreateText(
     parentId: string | null,
     x: number,

@@ -48,11 +48,15 @@
 
 import type { Dispatch, MutableRefObject, SetStateAction } from "react";
 import type React from "react";
-import { useCallback, useRef } from "react";
+import { useCallback, useEffect, useRef } from "react";
 
 import type { ViewportState } from "../components/CanvasHost";
 import type { ToolId } from "../contexts/EditorContext";
-import type { NodeInfo, SnapGuide } from "../../../shared/scene";
+import type {
+  NodeInfo,
+  PathSegmentWire,
+  SnapGuide,
+} from "../../../shared/scene";
 import { errorMessage } from "../lib/errorMessage";
 
 /**
@@ -63,6 +67,79 @@ import { errorMessage } from "../lib/errorMessage";
  * duplicate constant.
  */
 export const SNAP_THRESHOLD_WORLD = 6;
+
+/**
+ * Pen-tool: minimum screen-space distance the cursor must travel
+ * from the anchor point before we promote a `pointerdown` into a
+ * smooth-anchor drag (vs. treating it as a corner-anchor click).
+ *
+ * 4 px is the same threshold most vector editors use (Illustrator,
+ * Figma, Affinity Designer) and matches typical OS-level "drag
+ * intent" thresholds (Windows SM_CXDRAG defaults to 4, GNOME's
+ * `gtk-dnd-drag-threshold` defaults to 8 but most apps override to
+ * 4). Below this, hand jitter on a click would silently insert
+ * tiny tangent handles next to every "corner" anchor.
+ *
+ * Compared against screen pixels — converted into world units at
+ * comparison time via `viewport.zoom`.
+ */
+export const PEN_DRAG_THRESHOLD_SCREEN = 4;
+
+/**
+ * Pen-tool: screen-space radius around the first anchor that
+ * counts as a "close path" click. Same threshold the Figma /
+ * Illustrator pen tools use (8 px). Bigger than
+ * `PEN_DRAG_THRESHOLD_SCREEN` because closing is a high-precision
+ * action — the user is deliberately aiming at a visible 6 px
+ * anchor dot — but we still need a few pixels of slack so a click
+ * 2 px away from the centre still closes.
+ *
+ * Compared against screen pixels — converted into world units at
+ * comparison time via `viewport.zoom`.
+ */
+export const PEN_CLOSE_HIT_RADIUS_SCREEN = 8;
+
+/**
+ * One anchor in a pen-tool gesture. Stored in world space (matches
+ * `kcreate_vector::PathSegment` coordinates) so the overlay can
+ * paint directly without re-applying transforms and the commit
+ * path can hand the geometry to the bridge unchanged.
+ *
+ * - `x`, `y`: the anchor point itself.
+ * - `inHandle`: where the curve enters this anchor (the second
+ *   control point of the *incoming* cubic). `null` ⇒ corner anchor
+ *   (no smoothing on the way in).
+ * - `outHandle`: where the curve leaves this anchor (the first
+ *   control point of the *outgoing* cubic). `null` ⇒ corner anchor
+ *   (no smoothing on the way out).
+ *
+ * Both handles are stored in absolute world coordinates (NOT
+ * relative offsets from the anchor) so the overlay can render
+ * them in-place without re-deriving the offset every paint.
+ */
+export interface PenAnchor {
+  x: number;
+  y: number;
+  inHandle: { x: number; y: number } | null;
+  outHandle: { x: number; y: number } | null;
+}
+
+/**
+ * The in-flight anchor while the pointer is down during a pen
+ * gesture. Promoted to a committed `PenAnchor` on `pointerup` —
+ * the type of anchor (corner vs. smooth) is determined by whether
+ * `drag` is non-null at release.
+ */
+export interface PenPendingAnchor {
+  pointerId: number;
+  /// Anchor world coords captured at `pointerdown`.
+  x: number;
+  y: number;
+  /// Live cursor world coords if the cursor has moved past
+  /// `PEN_DRAG_THRESHOLD_SCREEN` since `pointerdown`. `null`
+  /// until the threshold is exceeded.
+  drag: { x: number; y: number } | null;
+}
 
 /**
  * Explicit pointer-drag state.
@@ -125,7 +202,86 @@ export type ToolMachineState =
       tool: ToolId;
       startWorldX: number;
       startWorldY: number;
+    }
+  | {
+      kind: "pen";
+      /// Tool captured at gesture entry. Always `"pen"` today; kept
+      /// for parity with `create.tool` / `move.tool` so a future
+      /// tool that delegates into pen mode (e.g. a "pencil" tool
+      /// that builds a path via the same machinery but commits as
+      /// a different node type) has a stable place to record
+      /// itself.
+      tool: ToolId;
+      /// Committed anchors, in draw order. Cleared on commit /
+      /// cancel. Persists across `pointerup` because a pen gesture
+      /// spans many click cycles — unlike `create`/`move`/`pan`
+      /// which begin on `pointerdown` and end on `pointerup`.
+      anchors: PenAnchor[];
+      /// In-flight anchor while the pointer is down inside the
+      /// gesture. `null` between clicks. Promoted to a committed
+      /// anchor (corner if `drag` is null, smooth if `drag` is set)
+      /// on `pointerup`.
+      pending: PenPendingAnchor | null;
+      /// Last cursor world position sampled while the pen state is
+      /// active, regardless of whether the pointer is down. Drives
+      /// the rubber-band preview line from the last committed
+      /// anchor to the cursor in `PenOverlay`. `null` until the
+      /// first cursor sample after the gesture starts.
+      cursor: { x: number; y: number } | null;
     };
+
+/**
+ * Convert a sequence of pen anchors into the wire-format segment
+ * list consumed by `canvas.createPath`. Adjacent corner anchors
+ * connect via `line_to`; anchors with at least one non-null handle
+ * connect via `cubic_to` (missing handles fall back to the anchor
+ * coords, matching the convention `kcreate_vector::VectorPath` uses
+ * for "no smoothing on this side"). When `closed` is true and the
+ * gesture has ≥ 2 anchors, a closing segment (line or cubic) is
+ * appended along with an explicit `close` so `VectorPath::bounds`
+ * and the renderer-side fill both treat the path as closed.
+ *
+ * Exposed for the test suite — the rest of the module accesses it
+ * through `commitPen` directly.
+ */
+export function anchorsToSegments(
+  anchors: ReadonlyArray<PenAnchor>,
+  closed: boolean,
+): PathSegmentWire[] {
+  if (anchors.length === 0) return [];
+  const segs: PathSegmentWire[] = [];
+  const first = anchors[0]!;
+  segs.push({ op: "move_to", x: first.x, y: first.y });
+  for (let i = 1; i < anchors.length; i++) {
+    const prev = anchors[i - 1]!;
+    const curr = anchors[i]!;
+    segs.push(buildBetween(prev, curr));
+  }
+  if (closed && anchors.length >= 2) {
+    const prev = anchors[anchors.length - 1]!;
+    const curr = anchors[0]!;
+    segs.push(buildBetween(prev, curr));
+    segs.push({ op: "close" });
+  }
+  return segs;
+}
+
+/// Internal helper: pick `line_to` vs. `cubic_to` for the segment
+/// from `prev` to `curr`. A pair of pure-corner anchors becomes a
+/// straight line; any handle on either side promotes the segment
+/// to a cubic with the missing-handle slots collapsed onto the
+/// anchor coords (matching `VectorPath` convention).
+function buildBetween(prev: PenAnchor, curr: PenAnchor): PathSegmentWire {
+  if (prev.outHandle === null && curr.inHandle === null) {
+    return { op: "line_to", x: curr.x, y: curr.y };
+  }
+  return {
+    op: "cubic_to",
+    ctrl1: prev.outHandle ?? { x: prev.x, y: prev.y },
+    ctrl2: curr.inHandle ?? { x: curr.x, y: curr.y },
+    end: { x: curr.x, y: curr.y },
+  };
+}
 
 /**
  * Dependency injection surface. Everything the hook needs to do its
@@ -201,11 +357,32 @@ export interface ToolStateMachineDeps {
  *   Returns `null` until the user has moved the pointer over the
  *   canvas at least once. `EditorPage`'s `handlePaste` reads this
  *   to position the new subtree near the cursor.
+ * - `commitPen`: promote the in-flight pen gesture to a real
+ *   `VectorLayer` via `canvas.createPath`. No-op when the state
+ *   machine is not in the `"pen"` variant or has fewer than 2
+ *   committed anchors. Returns the new node id on success, or
+ *   `null` if there was nothing to commit. Resolves AFTER
+ *   `onAfterCommit` has run so callers can chain a refresh.
+ * - `cancelPen`: discard the in-flight pen gesture without
+ *   committing. No-op when the state machine is not in the
+ *   `"pen"` variant. Returns `true` if a gesture was actually
+ *   cancelled (so `EditorPage`'s Escape handler can decide whether
+ *   to fall through to "clear selection").
+ * - `subscribe`: register a listener that fires on every state
+ *   transition. Used by the `PenOverlay` component (and future
+ *   tool overlays) to re-paint when the in-flight gesture
+ *   advances. Pointer events otherwise mutate the state machine
+ *   without re-rendering React, so without an explicit subscribe
+ *   surface the overlay would be invisible. Returns an unsubscribe
+ *   function.
  */
 export interface ToolStateMachine {
   onCanvasPointer: (e: React.PointerEvent<HTMLCanvasElement>) => void;
   getState: () => ToolMachineState;
   getLastCursorWorld: () => { x: number; y: number } | null;
+  commitPen: () => Promise<string | null>;
+  cancelPen: () => boolean;
+  subscribe: (listener: () => void) => () => void;
 }
 
 const IDLE: ToolMachineState = { kind: "idle" };
@@ -234,6 +411,46 @@ export function useToolStateMachine(
   // setter) or churn renders (one per pointermove). Same tradeoff
   // the pre-refactor code made.
   const stateRef = useRef<ToolMachineState>(IDLE);
+
+  // Subscriber registry for the `subscribe`/`notify` surface. Used
+  // by `PenOverlay` (and future tool overlays) to re-paint when an
+  // in-flight pen gesture advances — without this, the overlay
+  // would render once with stale state because pointer events
+  // mutate the ref without triggering React. A plain `Set` is used
+  // because (a) the number of listeners is tiny (1, in practice)
+  // and (b) the contract is "fire-and-forget" — no listener should
+  // throw, and any that does won't corrupt the registry because
+  // the call is wrapped in a try/catch.
+  const listenersRef = useRef<Set<() => void>>(new Set());
+  // Saved pen state across hold-to-pan interruptions. Pen is the
+  // first multi-cycle tool gesture in the codebase (every click
+  // commits an anchor that survives across pointerdown/up cycles),
+  // so the naive "pan replaces state" pattern that worked for the
+  // single-cycle `create` / `move` / `select` tools silently loses
+  // every laid-down anchor the moment the user holds Space. We
+  // stash the pen state here on pan entry and restore it on pan
+  // exit, mirroring Figma / Illustrator behaviour. `null` when no
+  // gesture is in flight.
+  const savedPenStateRef = useRef<ToolMachineState | null>(null);
+  const notify = useCallback((): void => {
+    for (const listener of listenersRef.current) {
+      try {
+        listener();
+      } catch {
+        // Listeners are expected to be react-state setters; the
+        // only way they throw is if the consumer unmounted between
+        // the pointer event firing and the listener executing.
+        // Swallow so the state machine survives a buggy subscriber.
+      }
+    }
+  }, []);
+  const subscribe = useCallback((listener: () => void): (() => void) => {
+    const set = listenersRef.current;
+    set.add(listener);
+    return () => {
+      set.delete(listener);
+    };
+  }, []);
 
   // Keep the callback deps stable across renders. `onError` and
   // `onAfterCommit` come in as fresh closures on every parent
@@ -265,6 +482,100 @@ export function useToolStateMachine(
     }),
     [viewport],
   );
+
+  /**
+   * Commit the in-flight pen gesture as a `VectorLayer` via
+   * `canvas.createPath`. Resolves with the new node id on success
+   * or `null` if there was nothing to commit (idle / fewer than 2
+   * anchors). State is reset to `idle` BEFORE the bridge call so
+   * a tool-switch or Escape mid-commit cannot trample on the
+   * gesture being committed.
+   *
+   * `closed` is forwarded as both (a) the `VectorPath.closed` flag
+   * (controls fill / hit-test) and (b) the trigger for appending a
+   * closing segment + explicit `close` op to the segment list.
+   *
+   * Shared between three call sites:
+   *   1. `pointerdown` when the click lands inside the first
+   *      anchor's hit radius (closes the path with `closed=true`).
+   *   2. `commitPen` public method (Enter shortcut / tool-switch
+   *      effect; commits open with `closed=false`).
+   *   3. The tool-switch `useEffect` below (commits open).
+   */
+  const commitPenGesture = useCallback(
+    async (closed: boolean): Promise<string | null> => {
+      const state = stateRef.current;
+      if (state.kind !== "pen") return null;
+      // Need at least 2 anchors for a meaningful path — a single
+      // anchor would deserialize to one `MoveTo` and reject in
+      // `canvas_create_path` (`CreatePathError::Empty`-adjacent —
+      // it'd be `MissingMoveTo`-passing but zero-length geometry).
+      // We catch it here so the bridge call is never even fired
+      // for trivially invalid gestures.
+      if (state.anchors.length < 2) {
+        // Reset state so the next pen click starts fresh, even
+        // though we didn't commit. Otherwise a 1-anchor gesture
+        // would silently persist across the user's "give up and
+        // switch tools" action. Also clear any saved-across-pan
+        // shadow so it can't rehydrate the abandoned gesture.
+        stateRef.current = IDLE;
+        savedPenStateRef.current = null;
+        notify();
+        return null;
+      }
+      const segments = anchorsToSegments(state.anchors, closed);
+      // Reset to idle BEFORE the async bridge call so subsequent
+      // events (tool switch, Escape) cannot mutate the in-flight
+      // gesture. The bridge call is fire-and-forget from the
+      // state machine's perspective.
+      stateRef.current = IDLE;
+      savedPenStateRef.current = null;
+      notify();
+      try {
+        const newId = await window.kcreate.canvas.createPath(
+          null,
+          segments,
+          closed,
+          null,
+        );
+        await window.kcreate.canvas.setSelection([newId]);
+        await onAfterCommitRef.current();
+        return newId;
+      } catch (err) {
+        onErrorRef.current(`pen commit failed: ${errorMessage(err)}`);
+        return null;
+      }
+    },
+    [notify],
+  );
+
+  /**
+   * Discard the in-flight pen gesture without committing.
+   * Returns `true` if the cancellation actually consumed a pen
+   * gesture (so `EditorPage`'s Escape handler can decide whether
+   * to fall through to "clear selection").
+   *
+   * Shared between two call sites:
+   *   1. `cancelPen` public method (Escape shortcut).
+   *   2. The tool-switch `useEffect` for safety when a future
+   *      caller wants to abandon rather than auto-commit.
+   *
+   * Sync (no bridge call) because cancellation has no
+   * persistent-state side effect — the document is unchanged.
+   */
+  const cancelPenGesture = useCallback((): boolean => {
+    const state = stateRef.current;
+    // Also treat "pan with a saved pen shadow" as a cancellable
+    // gesture so the user can Escape out of a pen path even
+    // while still holding Space — otherwise the shadow rehydrates
+    // an abandoned path on pan release.
+    const hasShadow = savedPenStateRef.current !== null;
+    if (state.kind !== "pen" && !hasShadow) return false;
+    stateRef.current = IDLE;
+    savedPenStateRef.current = null;
+    notify();
+    return true;
+  }, [notify]);
 
   const onCanvasPointer = useCallback(
     (e: React.PointerEvent<HTMLCanvasElement>): void => {
@@ -302,12 +613,35 @@ export function useToolStateMachine(
         // don't worry about coarsening like we do for node moves.
         if (panActiveRef.current) {
           canvasEl.setPointerCapture(pointerId);
+          // Stash an in-flight pen gesture so the user doesn't
+          // lose every committed anchor when they hold Space to
+          // pan mid-path. We only save when the user has actually
+          // committed at least one anchor — a "fresh pen + Space"
+          // shouldn't strand an empty pen state in the ref.
+          // Discarding any `pending` anchor is correct: if the
+          // user's currently mid-click, the pan steals the gesture
+          // and the half-pressed click never reaches pointerup —
+          // restoring `pending` would leave a permanent
+          // pending-anchor ghost in the overlay.
+          const existing = stateRef.current;
+          if (
+            existing.kind === "pen" &&
+            existing.anchors.length > 0
+          ) {
+            savedPenStateRef.current = {
+              ...existing,
+              pending: null,
+            };
+          } else {
+            savedPenStateRef.current = null;
+          }
           stateRef.current = {
             kind: "pan",
             pointerId,
             lastScreenX: sx,
             lastScreenY: sy,
           };
+          notify();
           return;
         }
 
@@ -353,6 +687,65 @@ export function useToolStateMachine(
           return;
         }
 
+        if (activeTool === "pen") {
+          // Pen tool is the only multi-event gesture: each
+          // `pointerdown` either (a) closes the path if the click
+          // lands inside `PEN_CLOSE_HIT_RADIUS_SCREEN` of the
+          // first anchor (with ≥ 2 anchors already laid down), or
+          // (b) starts a new in-flight anchor. Pointer capture
+          // makes sure `pointermove` / `pointerup` reach us even
+          // if the cursor briefly leaves the canvas bounds (e.g.
+          // tracking a fast drag along the edge).
+          canvasEl.setPointerCapture(pointerId);
+          const existing = stateRef.current;
+          // Convert close-hit radius to world units at the active
+          // zoom so the threshold stays a constant ~8 screen-px
+          // regardless of zoom level. At zoom < 1 (zoomed out) the
+          // world-space radius grows; at zoom > 1 (zoomed in) it
+          // shrinks — same gesture, same precision.
+          const closeRadiusWorld = PEN_CLOSE_HIT_RADIUS_SCREEN / vp.zoom;
+          if (existing.kind === "pen" && existing.anchors.length >= 2) {
+            const first = existing.anchors[0]!;
+            const dx = wx - first.x;
+            const dy = wy - first.y;
+            if (Math.hypot(dx, dy) <= closeRadiusWorld) {
+              // Click-on-first-anchor: commit as a closed path.
+              // `commitPenGesture(true)` clears the state and
+              // releases pointer capture as part of its cleanup,
+              // so we can return immediately afterward.
+              try {
+                canvasEl.releasePointerCapture(pointerId);
+              } catch {
+                // capture may have been released already; the
+                // commit below doesn't depend on it.
+              }
+              void commitPenGesture(true);
+              return;
+            }
+          }
+          // Start (or continue) a pen gesture by laying a new
+          // pending anchor. If state was idle (gesture just
+          // started), bootstrap a fresh `pen` state with no
+          // committed anchors yet. If state is already `pen`
+          // (additional click), keep the existing anchor list.
+          const baseAnchors =
+            existing.kind === "pen" ? existing.anchors : [];
+          stateRef.current = {
+            kind: "pen",
+            tool: activeTool,
+            anchors: baseAnchors,
+            pending: {
+              pointerId,
+              x: wx,
+              y: wy,
+              drag: null,
+            },
+            cursor: { x: wx, y: wy },
+          };
+          notify();
+          return;
+        }
+
         // Drawing tools — record drag start in world coords; commit
         // on pointerup.
         canvasEl.setPointerCapture(pointerId);
@@ -368,7 +761,57 @@ export function useToolStateMachine(
 
       if (e.type === "pointermove") {
         const drag = stateRef.current;
-        if (drag.kind === "idle" || drag.pointerId !== pointerId) return;
+        if (drag.kind === "idle") return;
+
+        if (drag.kind === "pen") {
+          // Pen state has no top-level `pointerId` because the
+          // gesture spans many pointers (each click can in
+          // principle be from a different pointer device — e.g.
+          // touch + mouse on a hybrid laptop). We always update
+          // `cursor` for the rubber-band preview; we update
+          // `pending.drag` only when the in-flight anchor is
+          // owned by THIS pointer.
+          //
+          // CRITICAL: assign a NEW state object rather than
+          // mutating `stateRef.current` in place. The pen tool's
+          // overlay is wired through `useSyncExternalStore`, which
+          // compares snapshots with `Object.is`. A same-reference
+          // return short-circuits the subscriber re-render even
+          // though `notify()` fires the listeners, so in-place
+          // mutation here would make the cursor preview / drag
+          // handles / rubber-band invisible until the next
+          // `pointerdown`. `pan` and `move` states get away with
+          // in-place mutation because they don't expose their
+          // intermediate state through `useSyncExternalStore` —
+          // they drive React state directly via `setViewport` /
+          // bridge calls. This same lesson is documented at
+          // `apps/desktop/renderer/src/shortcuts/registry.ts:236`
+          // for `ShortcutStore.snapshot()`.
+          let nextPending: PenPendingAnchor | null = drag.pending;
+          if (drag.pending && drag.pending.pointerId === pointerId) {
+            const pdx = sx - (drag.pending.x * vp.zoom + vp.panX);
+            const pdy = sy - (drag.pending.y * vp.zoom + vp.panY);
+            // Promote to a "drag in progress" only after the
+            // cursor moves past the screen-space threshold —
+            // below it the user is just clicking with mild hand
+            // jitter and shouldn't get spurious smooth handles.
+            if (
+              drag.pending.drag !== null ||
+              Math.hypot(pdx, pdy) >= PEN_DRAG_THRESHOLD_SCREEN
+            ) {
+              nextPending = { ...drag.pending, drag: { x: wx, y: wy } };
+            }
+          }
+          stateRef.current = {
+            ...drag,
+            cursor: { x: wx, y: wy },
+            pending: nextPending,
+          };
+          notify();
+          return;
+        }
+
+        if (drag.pointerId !== pointerId) return;
 
         if (drag.kind === "pan") {
           // Translate the viewport by the screen-space delta since
@@ -453,7 +896,69 @@ export function useToolStateMachine(
 
       if (e.type === "pointerup") {
         const drag = stateRef.current;
-        if (drag.kind === "idle" || drag.pointerId !== pointerId) return;
+        if (drag.kind === "idle") return;
+
+        if (drag.kind === "pen") {
+          // Pen state spans gestures, so we don't reset to idle on
+          // pointerup. We only promote the in-flight pending
+          // anchor (if any) into the committed `anchors` list.
+          // Releasing pointer capture matches the symmetry with
+          // `pointerdown`; without it, a subsequent pointermove
+          // outside the canvas wouldn't fire and the cursor
+          // preview would freeze.
+          try {
+            canvasEl.releasePointerCapture(pointerId);
+          } catch {
+            // capture might already be released by the OS — same
+            // as the non-pen path below.
+          }
+          if (!drag.pending || drag.pending.pointerId !== pointerId) {
+            // Stale pointerup (different pointer, or pending was
+            // already promoted). Nothing to do.
+            return;
+          }
+          const pending = drag.pending;
+          let newAnchor: PenAnchor;
+          if (pending.drag) {
+            // Smooth anchor: outHandle is where the user dragged,
+            // inHandle is the symmetric reflection through the
+            // anchor (so the curve passes through the anchor with
+            // continuous first derivative — the same convention
+            // Illustrator / Figma use for "smooth" pen anchors).
+            const out = pending.drag;
+            newAnchor = {
+              x: pending.x,
+              y: pending.y,
+              inHandle: {
+                x: 2 * pending.x - out.x,
+                y: 2 * pending.y - out.y,
+              },
+              outHandle: { x: out.x, y: out.y },
+            };
+          } else {
+            // Corner anchor: no smoothing on either side.
+            newAnchor = {
+              x: pending.x,
+              y: pending.y,
+              inHandle: null,
+              outHandle: null,
+            };
+          }
+          // Same `useSyncExternalStore` immutability contract as
+          // the pointermove branch above — must assign a NEW state
+          // object so `Object.is` sees a different snapshot and
+          // re-paints the overlay with the newly committed anchor.
+          stateRef.current = {
+            ...drag,
+            anchors: [...drag.anchors, newAnchor],
+            pending: null,
+            cursor: { x: wx, y: wy },
+          };
+          notify();
+          return;
+        }
+
+        if (drag.pointerId !== pointerId) return;
         try {
           canvasEl.releasePointerCapture(pointerId);
         } catch {
@@ -464,7 +969,28 @@ export function useToolStateMachine(
         setSnapGuides([]);
         // Reset state BEFORE firing the bridge commit so the in-flight
         // snap-query guard above sees the transition immediately.
-        stateRef.current = IDLE;
+        // For pan release, prefer restoring a saved pen gesture (set
+        // on pan-enter when a pen gesture was in-flight) over the IDLE
+        // default — see the `savedPenStateRef` comment above. The ref
+        // is cleared after restoration so a subsequent unrelated pan
+        // can't accidentally rehydrate stale state.
+        if (drag.kind === "pan" && savedPenStateRef.current) {
+          stateRef.current = savedPenStateRef.current;
+          savedPenStateRef.current = null;
+          notify();
+        } else {
+          stateRef.current = IDLE;
+          // Notify only on pan exit so a pen-overlay subscriber
+          // observing pen-vs-pan transitions sees the gesture
+          // ended. `move`/`create` already drive their own React
+          // state via setSelectedIds/onAfterCommit downstream, so
+          // an extra notify would just trigger a redundant
+          // subscriber callback. The "pen" branch was eliminated
+          // by the pen-specific early-return block above.
+          if (drag.kind === "pan") {
+            notify();
+          }
+        }
 
         if (drag.kind === "pan") {
           // Pan drags don't write to the op log or touch the
@@ -562,14 +1088,52 @@ export function useToolStateMachine(
       setSelectedIds,
       setViewport,
       setSnapGuides,
+      notify,
+      commitPenGesture,
     ],
   );
+
+  // Tool-switch effect: if the user switches AWAY from the pen
+  // tool while a pen gesture is in flight (≥ 1 anchor laid down),
+  // auto-commit the gesture instead of silently dropping the
+  // anchors. Matches Illustrator / Figma semantics: "I'm done
+  // drawing this path; pick a different tool". A < 2 anchor
+  // gesture is dropped (no path to commit) — `commitPenGesture`
+  // handles the "nothing to commit" case as a clean reset.
+  useEffect(() => {
+    if (tool === "pen") return;
+    const state = stateRef.current;
+    // If we're currently mid-pan with a saved pen shadow, promote
+    // the shadow back to the active state first so
+    // `commitPenGesture` (which only inspects `stateRef.current`)
+    // sees the anchors and commits them. Without this, switching
+    // tools while still holding Space would silently drop the
+    // entire path.
+    if (state.kind !== "pen" && savedPenStateRef.current) {
+      stateRef.current = savedPenStateRef.current;
+      savedPenStateRef.current = null;
+    }
+    if (stateRef.current.kind !== "pen") return;
+    void commitPenGesture(false);
+  }, [tool, commitPenGesture]);
 
   const getState = useCallback((): ToolMachineState => stateRef.current, []);
   const getLastCursorWorld = useCallback(
     () => lastCursorWorldRef.current,
     [lastCursorWorldRef],
   );
+  const commitPen = useCallback(
+    () => commitPenGesture(false),
+    [commitPenGesture],
+  );
+  const cancelPen = useCallback(() => cancelPenGesture(), [cancelPenGesture]);
 
-  return { onCanvasPointer, getState, getLastCursorWorld };
+  return {
+    onCanvasPointer,
+    getState,
+    getLastCursorWorld,
+    commitPen,
+    cancelPen,
+    subscribe,
+  };
 }

@@ -138,6 +138,12 @@ const defaultsByMethod: Record<string, () => unknown> = {
   "canvas.createRect": () => "default-rect-id",
   "canvas.createEllipse": () => "default-ellipse-id",
   "canvas.createLine": () => "default-line-id",
+  // Phase B1 — pen tool. `createPath(parentId, segmentsJson, closed,
+  // name) => string` matches the preload entry shape; stub returns
+  // a stable default id so tests exercising the pen state machine
+  // can assert on the bridge call's call list + `setSelection`
+  // follow-up without wiring a custom override every time.
+  "canvas.createPath": () => "default-path-id",
   "canvas.createText": () => "default-text-id",
   setLayerColor: () => undefined,
 };

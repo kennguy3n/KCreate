@@ -39,15 +39,23 @@ export function App(): JSX.Element {
         // floating at the world origin. Both stages are non-fatal —
         // a failure leaves the user on a recoverable editor surface
         // (blank artboard / "+ New artboard" affordance still works).
-        let artboardOk = false;
+        //
+        // `artboard.create()` returns the created artboard's id
+        // directly from the bridge; we capture it so the template
+        // resolver can look up the world rect by id (unambiguous)
+        // rather than by name (which would race a hypothetical
+        // pre-existing artboard with the same name — Devin Review
+        // surfaced this on PR #31 as a latent footgun if
+        // `handleOpenEditor` were ever extended to apply to a
+        // non-fresh project).
+        let createdArtboardId: string | null = null;
         try {
-          await window.kcreate.artboard.create(
+          createdArtboardId = await window.kcreate.artboard.create(
             null,
             preset.name,
             preset.width,
             preset.height,
           );
-          artboardOk = true;
         } catch {
           // Non-fatal: the editor's artboard panel can still create
           // one manually. The error is swallowed here because surface
@@ -56,7 +64,7 @@ export function App(): JSX.Element {
           // editor and can recover by clicking "+ New artboard".
         }
 
-        if (artboardOk) {
+        if (createdArtboardId !== null) {
           // Track 2 — seed the artboard with starter content via the
           // template resolver registered for this card. The resolver
           // reads the artboard's world rect off `artboard.list()` so
@@ -68,18 +76,20 @@ export function App(): JSX.Element {
             const resolver = templateResolverFor(jobKind);
             if (resolver) {
               const artboards = await window.kcreate.artboard.list();
-              // The artboard we just created is the most recent one
-              // for the active project. Falling back to the preset
-              // dimensions (origin 0,0) keeps the resolver running
-              // even if listing returns an empty array. (If listing
-              // *throws*, the outer try/catch below skips the
-              // resolver entirely — a thrown `list()` likely means
-              // the bridge state is too inconsistent to seed safely,
-              // so landing on a blank artboard is the right
-              // recovery surface.)
-              const target =
-                artboards.find((a) => a.name === preset.name) ??
-                artboards[artboards.length - 1];
+              // Look up the artboard by the id we just received from
+              // the bridge — exact match, no name collisions. The
+              // empty-list / id-not-found fallback uses the preset's
+              // nominal dimensions at the origin; the resolver still
+              // runs and lands nodes at world (0,0), which is at
+              // worst visually misaligned (the user can fix it from
+              // the editor). If `list()` itself *throws*, the outer
+              // try/catch below skips the resolver entirely — a
+              // thrown `list()` likely means the bridge state is too
+              // inconsistent to seed safely, so landing on a blank
+              // artboard is the right recovery surface.
+              const target = artboards.find(
+                (a) => a.id === createdArtboardId,
+              );
               const ctx = target
                 ? {
                     x: target.x,

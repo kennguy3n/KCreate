@@ -218,9 +218,20 @@ export function RightPanel({
   // The effect only writes when the clamp actually changes value —
   // `clampTabToAvailable` returns `tab` itself when it's still in
   // the strip, so the common case is a single equality check and
-  // no state write. Depending on `TABS` (which is itself memoized
-  // on the mode-derived booleans) means the effect runs at most
-  // once per mode transition, not on every render.
+  // no state write. Trigger surface is the dep array `[TABS, tab]`:
+  //
+  //   - `TABS` identity changes once per mode transition (the
+  //     `useMemo` above is keyed on the mode-derived booleans), so
+  //     mode flips fire the effect exactly once.
+  //   - `tab` changes on every user pill click. In that case the
+  //     clicked tab is always already in `TABS`, so the clamp is a
+  //     no-op single-pass `for` loop with an early `return current`
+  //     and no `setTab` call — fast path, no re-render.
+  //
+  // `tab` must stay in the deps for the React exhaustive-deps rule
+  // and to avoid a stale-closure read of the previous tab during
+  // back-to-back mode transitions. The no-op guard keeps the
+  // tab-click path cheap.
   useEffect(() => {
     const next = clampTabToAvailable(tab, TABS);
     if (next !== tab) setTab(next);

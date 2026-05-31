@@ -448,6 +448,13 @@ export interface Bridge {
     fontSize: number,
   ): string;
   canvasMoveNode(nodeId: string, dx: number, dy: number): void;
+  /**
+   * Atomic batch canvas creation. Takes a JSON-encoded array of
+   * `CanvasBatchItem` and returns a JSON-encoded array of the
+   * new node ids in the same order. Mirrors
+   * `kcreate_bridge::canvas_create_nodes`.
+   */
+  canvasCreateNodes(itemsJson: string): string;
 
   // AI Assist
   aiRemoveBackground(nodeId: string): string;

@@ -91,6 +91,13 @@ async function loadResolvers() {
 function installRecorder(t) {
   const calls = [];
   let nextId = 0;
+  // Track every `createNodes` invocation separately so a test can
+  // assert "the resolver actually used the batch surface" without
+  // having to inspect the per-item synthesized calls below. Each
+  // entry has `items` (the raw batch) and `ids` (the assigned ids
+  // in submission order) so tests can verify both the wire shape
+  // and the id mapping the resolver received.
+  const batchCalls = [];
   const recorder = {
     canvas: {
       async createRect(_parentId, x, y, w, h) {
@@ -102,6 +109,72 @@ function installRecorder(t) {
         const id = `n-${nextId++}`;
         calls.push({ kind: "createText", id, x, y, body, family, size });
         return id;
+      },
+      async createNodes(items) {
+        // Synthesize the same per-item `createRect`/`createText` +
+        // `updateNode` calls the old non-batch path would have
+        // produced. This preserves the existing `nodesFromCalls`
+        // aggregator + every per-node assertion verbatim, while
+        // also exposing the batch shape via `batchCalls` for tests
+        // that need to assert "the batch surface is what was used".
+        const ids = [];
+        for (const item of items) {
+          const id = `n-${nextId++}`;
+          ids.push(id);
+          switch (item.kind) {
+            case "rect":
+              calls.push({
+                kind: "createRect",
+                id,
+                x: item.x,
+                y: item.y,
+                w: item.w,
+                h: item.h,
+              });
+              break;
+            case "text":
+              calls.push({
+                kind: "createText",
+                id,
+                x: item.x,
+                y: item.y,
+                body: item.body,
+                family: item.family,
+                size: item.size,
+              });
+              break;
+            case "ellipse":
+              calls.push({
+                kind: "createEllipse",
+                id,
+                cx: item.cx,
+                cy: item.cy,
+                rx: item.rx,
+                ry: item.ry,
+              });
+              break;
+            case "line":
+              calls.push({
+                kind: "createLine",
+                id,
+                x1: item.x1,
+                y1: item.y1,
+                x2: item.x2,
+                y2: item.y2,
+              });
+              break;
+            default:
+              throw new Error(`unknown batch item kind: ${item.kind}`);
+          }
+          if (item.fill !== undefined || item.name !== undefined) {
+            const props = {};
+            if (item.fill !== undefined) props.fill = item.fill;
+            if (item.name !== undefined) props.name = item.name;
+            calls.push({ kind: "updateNode", id, props });
+          }
+        }
+        batchCalls.push({ items, ids });
+        return ids;
       },
     },
     document: {
@@ -128,6 +201,14 @@ function installRecorder(t) {
       }
     });
   }
+  // Attach the per-batch view as a property on the returned array
+  // so existing callers (`const calls = installRecorder(t)`) keep
+  // working unchanged, and the few callers that want to assert on
+  // batching can reach for `calls.batchCalls` without a recorder
+  // API change. Arrays in JS allow arbitrary properties, and the
+  // standard array methods (`for-of`, `.filter`, `.map`, …) don't
+  // care.
+  calls.batchCalls = batchCalls;
   return calls;
 }
 
@@ -756,4 +837,137 @@ test("Resolvers honour a non-zero artboard Y offset (second + later artboards)",
       `node ${c.id} at y=${c.y} below artboard top ${ctx.y}`,
     );
   }
+});
+
+// Item 2 of the PR #31 follow-up work: every resolver must use the
+// `canvas.createNodes` batch surface — not the per-item
+// `createRect`/`createText` helpers. Asserting this directly
+// guarantees that the IPC-traffic improvement (12+ round-trips → 1)
+// can't silently regress in a future refactor that accidentally
+// re-introduces sequential awaits.
+test("every resolver issues exactly one canvas.createNodes batch (no per-item createRect/createText calls)", async (t) => {
+  const { templateResolverFor } = await loadResolvers();
+  // Use a context per resolver so each test exercises its actual
+  // shipped artboard preset (matches the size the bridge hands to
+  // the resolver from `HomePage.tsx` after the user clicks a card).
+  const cases = [
+    { id: "brand", ctx: { x: 0, y: 0, width: 1024, height: 1024 } },
+    { id: "social", ctx: { x: 0, y: 0, width: 1080, height: 1080 } },
+    { id: "print", ctx: { x: 0, y: 0, width: 2480, height: 3508 } },
+    { id: "app-ui", ctx: { x: 0, y: 0, width: 1440, height: 900 } },
+    { id: "photo", ctx: { x: 0, y: 0, width: 2048, height: 2048 } },
+    { id: "deck", ctx: { x: 0, y: 0, width: 1920, height: 1080 } },
+    { id: "dev-export", ctx: { x: 0, y: 0, width: 512, height: 512 } },
+  ];
+  for (const { id, ctx } of cases) {
+    const calls = installRecorder(t);
+    await templateResolverFor(id).apply(ctx);
+    // The batch fixture exposes `batchCalls` for this assertion;
+    // every resolver must call `canvas.createNodes` exactly once and
+    // never reach for the per-item `createRect`/`createText` helpers
+    // (those still exist as a backward-compat surface on the
+    // bridge, but the resolvers themselves only go through the
+    // batch).
+    assert.equal(
+      calls.batchCalls.length,
+      1,
+      `${id} resolver should issue exactly one batch (got ${calls.batchCalls.length})`,
+    );
+    assert.ok(
+      calls.batchCalls[0].items.length > 0,
+      `${id} resolver batch must contain at least one item`,
+    );
+    // No top-level updateNode calls (fills + names go onto the
+    // batch items directly, not through a follow-up updateNode).
+    // The batch fixture re-emits an updateNode entry per item with
+    // fill/name set, so we have to scope the count to entries the
+    // batch did NOT synthesize. Easiest: count direct
+    // updateNode calls before the batch ran by inspecting recorder
+    // sequence — every updateNode in this fixture comes from the
+    // batch synth path (the resolvers never invoke
+    // document.updateNode directly anymore), so the count of
+    // updateNode entries must equal the count of batch items that
+    // carried fill or name. Verify that here.
+    const updateCount = calls.filter((c) => c.kind === "updateNode").length;
+    const batchItems = calls.batchCalls[0].items;
+    const expectedUpdateCount = batchItems.filter(
+      (it) => it.fill !== undefined || it.name !== undefined,
+    ).length;
+    assert.equal(
+      updateCount,
+      expectedUpdateCount,
+      `${id}: expected ${expectedUpdateCount} synthesized updateNode entries (one per batch item carrying fill/name), got ${updateCount}`,
+    );
+  }
+});
+
+
+// Regression for Devin Review PR #32 INFO_0001 — BatchBuilder.flush()
+// must clear its internal items buffer so a reused builder cannot
+// re-submit previously-flushed items. The shipped resolvers each
+// instantiate their own `b = makeBatch()` and call `flush()` once,
+// so the production code path doesn't exercise this — but a future
+// contributor doing multi-phase seeding (e.g.
+// `b.rect(...); await b.flush(); b.text(...); await b.flush();`)
+// would silently double-submit phase 1 without this guarantee.
+test("BatchBuilder.flush() clears the queue so a reused builder cannot double-submit", async (t) => {
+  const recorder = installRecorder(t);
+  const { makeBatch } = await loadResolvers();
+  const b = makeBatch();
+  b.rect({ x: 0, y: 0, w: 10, h: 10, name: "phase-1" });
+  await b.flush();
+  // If `flush()` didn't clear the buffer, the second flush would
+  // re-submit phase-1 alongside phase-2.
+  b.rect({ x: 20, y: 0, w: 10, h: 10, name: "phase-2" });
+  await b.flush();
+  assert.equal(
+    recorder.batchCalls.length,
+    2,
+    "two flushes should issue two distinct batch calls",
+  );
+  assert.equal(
+    recorder.batchCalls[0].items.length,
+    1,
+    "first batch must contain only phase-1",
+  );
+  assert.equal(
+    recorder.batchCalls[0].items[0].name,
+    "phase-1",
+    "first batch's only item must be phase-1",
+  );
+  assert.equal(
+    recorder.batchCalls[1].items.length,
+    1,
+    "second batch must contain only phase-2 — would be 2 (phase-1 + phase-2) if buffer not cleared",
+  );
+  assert.equal(
+    recorder.batchCalls[1].items[0].name,
+    "phase-2",
+    "second batch's only item must be phase-2",
+  );
+});
+
+// Same property exercised at the integration level: running the same
+// resolver back-to-back must not leak any state across invocations.
+// This is the property a contributor would actually care about if
+// they were debugging a "why does the second template have double
+// nodes?" report.
+test("re-running a resolver back-to-back produces independent single-batch invocations", async (t) => {
+  const { templateResolverFor } = await loadResolvers();
+  const ctx = { x: 0, y: 0, width: 1024, height: 1024 };
+
+  const calls1 = installRecorder(t);
+  await templateResolverFor("brand").apply(ctx);
+  const firstItemCount = calls1.batchCalls[0]?.items.length ?? 0;
+  assert.equal(calls1.batchCalls.length, 1, "first apply() emits one batch");
+
+  const calls2 = installRecorder(t);
+  await templateResolverFor("brand").apply(ctx);
+  const secondItemCount = calls2.batchCalls[0]?.items.length ?? 0;
+  assert.equal(calls2.batchCalls.length, 1, "second apply() emits one batch");
+  assert.equal(
+    firstItemCount,
+    secondItemCount,
+    "second apply() must emit the same item count — drift here would indicate cross-invocation state leak",
+  );
 });

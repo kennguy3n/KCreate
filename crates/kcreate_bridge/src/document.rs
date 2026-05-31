@@ -5002,7 +5002,16 @@ pub enum CanvasBatchItem {
         y: f64,
         body: String,
         family: String,
-        size: f32,
+        // f64 in the wire shape, narrowed to f32 at the use site to
+        // mirror the single-item `canvas_create_text` N-API helper
+        // (`crates/kcreate_bridge/src/lib.rs:1575` takes `font_size:
+        // f64` from JS and does `font_size as f32` before calling
+        // into the document layer). JSON numbers are
+        // double-precision, so this keeps the JSON → Rust narrowing
+        // boundary identical between the batch and per-item paths
+        // (AGENTS.md rule 4 — wire-format lockstep with TS
+        // `CanvasBatchItem.size: number` in `shared/scene.ts`).
+        size: f64,
         #[serde(default)]
         fill: Option<kcreate_core::node::FillStyle>,
         #[serde(default)]
@@ -5159,10 +5168,16 @@ fn build_canvas_batch_node(
             fill,
             name,
         } => {
+            // Narrow size to f32 once at the use site so the rest of
+            // the function matches the single-item path. The f64
+            // bounds maths uses the pre-narrow value (matches the
+            // wire-format intent: caller-supplied precision until the
+            // last possible moment).
+            let size_f32 = size as f32;
             let meta = crate::scene_sync::TextLayerMeta {
                 text: body.clone(),
                 font_family: family,
-                font_size: size,
+                font_size: size_f32,
             };
             let default_name = name.as_deref().unwrap_or("Text");
             let mut node = Node::new(NodeType::TextLayer, default_name);
@@ -5173,8 +5188,8 @@ fn build_canvas_batch_node(
                 // Same heuristic as single-item canvas_create_text:
                 // bounds width = size × char-count × 0.6, refined by
                 // the layer panel once shaping has run.
-                width: f64::from(size) * (body.len().max(1) as f64) * 0.6,
-                height: f64::from(size),
+                width: size * (body.len().max(1) as f64) * 0.6,
+                height: size,
             };
             node.metadata.insert(
                 crate::scene_sync::TEXT_LAYER_METADATA_KEY.to_string(),

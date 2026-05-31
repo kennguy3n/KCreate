@@ -3199,6 +3199,18 @@ pub fn canvas_path_boolean(op_wire: &str, source_ids: Vec<Uuid>) -> Result<Vec<U
 /// path produces line-only shapes, so curve attributes don't need
 /// to be reconciled across inputs.
 fn merge_paths(paths: &[kcreate_vector::VectorPath]) -> kcreate_vector::VectorPath {
+    // Caller contract: `paths` is always non-empty. The chain of
+    // invariants that keeps it true is documented at the top of
+    // `canvas_path_boolean` — `acc` is seeded with one element and
+    // the fold short-circuits on `pair.is_empty()` before
+    // reassigning. The `debug_assert!` makes the contract explicit
+    // at the callee so any future caller that violates it surfaces
+    // immediately under `cargo test` instead of panicking on the
+    // subsequent `paths[0]` index.
+    debug_assert!(
+        !paths.is_empty(),
+        "merge_paths requires at least one input path",
+    );
     if paths.len() == 1 {
         return paths[0].clone();
     }

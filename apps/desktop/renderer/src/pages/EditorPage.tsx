@@ -516,6 +516,23 @@ function EditorPageInner({
     [refreshTree, focusArtboard, setStatusMessage],
   );
 
+  /**
+   * Phase B2 — re-select the new boolean result(s) and refresh
+   * the document tree after a successful Pathfinder gesture.
+   * Memoised so `PathfinderPanel`'s internal `useCallback` for the
+   * click dispatcher has a stable identity across `EditorPage`
+   * re-renders — matches the stability discipline `onStatus`
+   * already has via the `setStatusMessage` setter (Devin Review
+   * #0003 on PR #38).
+   */
+  const handlePathfinderApplied = useCallback(
+    (resultIds: string[]) => {
+      setSelectedIds(resultIds);
+      void refreshTree();
+    },
+    [setSelectedIds, refreshTree],
+  );
+
   const handleDuplicateArtboard = useCallback(
     async (id: string) => {
       try {
@@ -1859,10 +1876,7 @@ function EditorPageInner({
             selectedIds={selectedIds}
             nodes={nodes}
             onStatus={setStatusMessage}
-            onApplied={(resultIds) => {
-              setSelectedIds(resultIds);
-              void refreshTree();
-            }}
+            onApplied={handlePathfinderApplied}
           />
           {/*
             Phase 7 Task 14 — remote-peer selection outlines. Coloured

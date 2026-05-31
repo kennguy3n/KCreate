@@ -212,6 +212,74 @@ describe("DocumentContext", () => {
     expect(captured.bundle!.state.components).toEqual([SAMPLE_COMPONENT]);
   });
 
+  it("refresh actions RETURN the fetched data (no double-fetch foot-gun)", async () => {
+    // Architectural invariant from PR #35 / Devin Review #0003:
+    // refresh methods sit at the boundary between "fire-and-forget
+    // side-effect" and "fetch-and-use" callers. Returning the data
+    // they pulled lets callers like `handleCreateArtboard` use the
+    // value directly instead of racing React's commit (state /
+    // refs are only updated when the next render flushes, not when
+    // the awaited promise resolves) or paying for a redundant
+    // second IPC round-trip.
+    kcreateStub().override("document.status", () => SAMPLE_STATUS);
+    kcreateStub().override("artboard.list", () => [SAMPLE_ARTBOARD]);
+    kcreateStub().override("component.list", () => [SAMPLE_COMPONENT]);
+    kcreateStub().override("document.getDocumentTree", () => [SAMPLE_NODE]);
+
+    const captured = renderDocument();
+
+    let statusReturn: DocumentStatus | null = null;
+    let artboardsReturn: ArtboardInfo[] = [];
+    let componentsReturn: ComponentInfo[] = [];
+    let treeReturn: NodeInfo[] = [];
+    await act(async () => {
+      statusReturn = await captured.bundle!.actions.refreshStatus();
+      artboardsReturn = await captured.bundle!.actions.refreshArtboards();
+      componentsReturn = await captured.bundle!.actions.refreshComponents();
+      treeReturn = await captured.bundle!.actions.refreshTree();
+    });
+
+    expect(statusReturn).toEqual(SAMPLE_STATUS);
+    expect(artboardsReturn).toEqual([SAMPLE_ARTBOARD]);
+    expect(componentsReturn).toEqual([SAMPLE_COMPONENT]);
+    expect(treeReturn).toEqual([SAMPLE_NODE]);
+  });
+
+  it("refresh actions return safe defaults on bridge failure", async () => {
+    // The error path returns null / [] so callers can pattern-match
+    // on the return value without an extra try/catch.
+    kcreateStub().override("document.status", () => {
+      throw new Error("status boom");
+    });
+    kcreateStub().override("artboard.list", () => {
+      throw new Error("artboard boom");
+    });
+    kcreateStub().override("component.list", () => {
+      throw new Error("component boom");
+    });
+    kcreateStub().override("document.getDocumentTree", () => {
+      throw new Error("tree boom");
+    });
+
+    const captured = renderDocument({ onStatusError: () => undefined });
+
+    let statusReturn: DocumentStatus | null = SAMPLE_STATUS;
+    let artboardsReturn: ArtboardInfo[] = [SAMPLE_ARTBOARD];
+    let componentsReturn: ComponentInfo[] = [SAMPLE_COMPONENT];
+    let treeReturn: NodeInfo[] = [SAMPLE_NODE];
+    await act(async () => {
+      statusReturn = await captured.bundle!.actions.refreshStatus();
+      artboardsReturn = await captured.bundle!.actions.refreshArtboards();
+      componentsReturn = await captured.bundle!.actions.refreshComponents();
+      treeReturn = await captured.bundle!.actions.refreshTree();
+    });
+
+    expect(statusReturn).toBeNull();
+    expect(artboardsReturn).toEqual([]);
+    expect(componentsReturn).toEqual([]);
+    expect(treeReturn).toEqual([]);
+  });
+
   it("refreshTree pulls ONLY the document tree (no cascade)", async () => {
     kcreateStub().override("document.getDocumentTree", () => [SAMPLE_NODE]);
     kcreateStub().override("document.status", () => SAMPLE_STATUS);

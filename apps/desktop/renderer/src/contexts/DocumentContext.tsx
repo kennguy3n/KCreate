@@ -108,9 +108,35 @@ export interface DocumentActions {
   setDocStatus: Dispatch<SetStateAction<DocumentStatus | null>>;
   setResourceLimits: Dispatch<SetStateAction<ResourceLimits | null>>;
 
-  refreshStatus: () => Promise<void>;
-  refreshArtboards: () => Promise<void>;
-  refreshComponents: () => Promise<void>;
+  /**
+   * Pulls the document status from the bridge, sets it on state, and
+   * returns it. Returns `null` if the bridge call failed (the error
+   * is also routed through `onStatusError`). Callers that just want
+   * the side-effect (state update) can ignore the return value;
+   * callers that need to use the freshly-fetched value (e.g. for a
+   * follow-up action that references the latest value before the
+   * next render commits) read the returned value directly instead
+   * of awaiting React's commit and reading from state / a ref.
+   */
+  refreshStatus: () => Promise<DocumentStatus | null>;
+  /**
+   * Pulls the artboard list from the bridge, sets it on state, and
+   * returns it. Returns `[]` if the bridge call failed. See
+   * `refreshStatus` for the rationale on returning the value.
+   *
+   * `EditorPage.handleCreateArtboard` is the canonical caller that
+   * needs the freshly-fetched value: it has to locate the newly-
+   * created artboard by id to focus it, and reading from
+   * `artboards` state or `artboardsRef.current` immediately after
+   * `await refreshArtboards()` is unreliable because React's commit
+   * runs after the awaited promise resolves.
+   */
+  refreshArtboards: () => Promise<ArtboardInfo[]>;
+  /**
+   * Pulls the component list from the bridge, sets it on state, and
+   * returns it. Returns `[]` if the bridge call failed.
+   */
+  refreshComponents: () => Promise<ComponentInfo[]>;
   /**
    * Re-pulls the document tree ONLY. Single-purpose by design —
    * status / artboards / components / selection refreshes live on
@@ -118,9 +144,11 @@ export interface DocumentActions {
    * order their feature requires. EditorPage's composed full-resync
    * wraps this together with `refreshStatus` / `refreshSelection` /
    * `refreshArtboards` / `refreshComponents` to preserve the
-   * pre-refactor sequencing exactly.
+   * pre-refactor sequencing exactly. Returns the fetched tree
+   * (`[]` on failure) so callers that compose this with other
+   * refreshes can chain the returned data.
    */
-  refreshTree: () => Promise<void>;
+  refreshTree: () => Promise<NodeInfo[]>;
 }
 
 /**
@@ -220,39 +248,47 @@ export function DocumentProvider({
     onStatusErrorRef.current?.(msg);
   }, []);
 
-  const refreshStatus = useCallback(async (): Promise<void> => {
+  const refreshStatus = useCallback(async (): Promise<DocumentStatus | null> => {
     try {
       const s = await window.kcreate.document.status();
       setDocStatus(s);
+      return s;
     } catch (e) {
       reportError(`status probe failed: ${errorMessage(e)}`);
+      return null;
     }
   }, [reportError]);
 
-  const refreshArtboards = useCallback(async (): Promise<void> => {
+  const refreshArtboards = useCallback(async (): Promise<ArtboardInfo[]> => {
     try {
       const list = await window.kcreate.artboard.list();
       setArtboards(list);
+      return list;
     } catch (e) {
       reportError(`artboard list failed: ${errorMessage(e)}`);
+      return [];
     }
   }, [reportError]);
 
-  const refreshComponents = useCallback(async (): Promise<void> => {
+  const refreshComponents = useCallback(async (): Promise<ComponentInfo[]> => {
     try {
       const list = await window.kcreate.component.list();
       setComponents(list);
+      return list;
     } catch (e) {
       reportError(`component list failed: ${errorMessage(e)}`);
+      return [];
     }
   }, [reportError]);
 
-  const refreshTree = useCallback(async (): Promise<void> => {
+  const refreshTree = useCallback(async (): Promise<NodeInfo[]> => {
     try {
       const tree = await window.kcreate.document.getDocumentTree();
       setNodes(tree);
+      return tree;
     } catch (e) {
       reportError(`tree load failed: ${errorMessage(e)}`);
+      return [];
     }
   }, [reportError]);
 

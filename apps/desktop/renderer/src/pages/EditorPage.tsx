@@ -183,7 +183,6 @@ function EditorPageInner({
     scene,
   } = documentCtx.state;
   const {
-    setArtboards,
     setArtboardPresets,
     setResourceLimits,
     refreshStatus,
@@ -283,12 +282,34 @@ function EditorPageInner({
     }
   }, [setSelectedIds, setStatusMessage]);
 
+  /**
+   * Composed full-resync. Pulls the document tree, status, selection,
+   * artboards, and components in the exact sequence the pre-refactor
+   * `EditorPage` used. Returns the fetched artboards / components /
+   * tree so callers that need a freshly-fetched value for a follow-up
+   * action (e.g. `handleCreateArtboard` locating the newly-created
+   * artboard by id) can read it directly instead of double-fetching
+   * via a second IPC round-trip or racing against React's commit.
+   *
+   * Devin Review #0003 on PR #35: the prior `handleCreateArtboard`
+   * called `refreshTree()` and then `await window.kcreate.artboard.list()`
+   * a second time because the composed refresher swallowed the data
+   * `refreshArtboards()` had already pulled. Threading the data
+   * through the return value eliminates the double-fetch while
+   * preserving the side-effect semantics for callers that ignore it.
+   */
   const refreshTree = useCallback(async () => {
-    await refreshDocumentTree();
-    await refreshStatus();
+    const tree = await refreshDocumentTree();
+    const status = await refreshStatus();
     await refreshSelection();
-    await refreshArtboards();
-    await refreshComponents();
+    const artboardsList = await refreshArtboards();
+    const componentsList = await refreshComponents();
+    return {
+      tree,
+      status,
+      artboards: artboardsList,
+      components: componentsList,
+    };
   }, [
     refreshDocumentTree,
     refreshStatus,
@@ -466,9 +487,16 @@ function EditorPageInner({
           args.width,
           args.height,
         );
-        await refreshTree();
-        const list = await window.kcreate.artboard.list();
-        setArtboards(list);
+        // Use the artboards list `refreshTree` already pulled (via
+        // `refreshArtboards` inside its cascade). Reading from the
+        // returned value instead of state / `artboardsRef.current`
+        // avoids two pitfalls: (a) a redundant second
+        // `window.kcreate.artboard.list()` IPC round-trip, and (b)
+        // a race against React's commit since the ref / state are
+        // only updated when the next render flushes — not when the
+        // `await refreshTree()` promise resolves.
+        // Devin Review #0003 on PR #35.
+        const { artboards: list } = await refreshTree();
         const created = list.find((a) => a.id === id);
         if (created) focusArtboard(created);
       } catch (e) {
@@ -477,7 +505,7 @@ function EditorPageInner({
         setArtboardDialogOpen(false);
       }
     },
-    [refreshTree, focusArtboard, setArtboards, setStatusMessage],
+    [refreshTree, focusArtboard, setStatusMessage],
   );
 
   const handleDuplicateArtboard = useCallback(

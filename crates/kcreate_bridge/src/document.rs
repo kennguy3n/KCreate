@@ -3002,17 +3002,34 @@ pub enum PathBooleanError {
 ///   IS the bottom object because the renderer passes the
 ///   selection in iteration order over `nodes`, which is
 ///   z-bottom-first.)
-/// * **Hierarchical sources are safe.** If source `B` is a descendant
-///   of source `A`, [`DocumentGraph::remove_node`] recursively
-///   removes `B` along with `A` (see
-///   `crates/kcreate_core/src/document.rs:438-447`); the subsequent
-///   `remove_node(B)` returns `None` and is intentionally ignored.
-///   `selection.retain` likewise no-ops on an already-absent id. No
-///   panic, no double-free. Validation (step 1) still reads `B`'s
-///   path BEFORE any mutation, so the boolean fold uses the
-///   pre-removal geometry — the descendant relationship doesn't
-///   change the math, only the cleanup. Devin Review ANALYSIS_0004
-///   (round 6) on PR #38.
+/// * **Hierarchical sources are safe.** The function is designed to
+///   tolerate any `Vec<Uuid>` from a caller (UI selection, MCP tool
+///   surface, plugin via extended ABI, future scripting API),
+///   including cases where one source is a descendant of another.
+///   Three independent mechanisms keep the gesture sound:
+///
+///   1. **Validation reads pre-removal geometry.** Step 1 walks
+///      every source id and snapshots its `VectorPath` from the
+///      `VECTOR_PATH_METADATA_KEY` BEFORE any graph mutation, so the
+///      boolean fold operates on the user-visible shapes regardless
+///      of any parent/child relationship between sources.
+///
+///   2. **Result parent resolved to first non-source ancestor.**
+///      Step 3 takes `first_parent = source_ids[0].parent_id` and
+///      walks up the parent chain skipping any ancestor that itself
+///      appears in `source_ids`, so result nodes are always parented
+///      to a node that survives step 4. Without this resolution
+///      step, the case `parent(source_ids[0]) == source_ids[1]`
+///      would silently cascade-delete every result node in step 4
+///      because [`DocumentGraph::remove_node`] recursively removes
+///      children (`crates/kcreate_core/src/document.rs:438-447`).
+///      Devin Review BUG_0001 (round 7) on PR #38.
+///
+///   3. **Cleanup is idempotent.** When step 4 calls `remove_node`
+///      on a node already swept by an ancestor's recursive deletion,
+///      the call returns `None` and is intentionally ignored;
+///      `selection.retain` likewise no-ops on absent ids. No panic,
+///      no double-free.
 ///
 /// # Undo / redo
 ///
@@ -3137,6 +3154,15 @@ pub fn canvas_path_boolean(op_wire: &str, source_ids: Vec<Uuid>) -> Result<Vec<U
     //    fold step by concatenating their segment lists. This
     //    matches Inkscape's behaviour: the intermediate stays a
     //    single composite path until the final emit.
+    //
+    //    `acc` is seeded with `paths[0].clone()` and only ever
+    //    reassigned from a `pair` that the in-loop guard above has
+    //    already proven non-empty, so `acc.is_empty()` is impossible
+    //    after the loop and we don't repeat the check. The fold
+    //    contract is: the loop body either returns `EmptyResult` or
+    //    overwrites `acc` with a non-empty `Vec`. Devin Review
+    //    ANALYSIS_0003 (round 7) on PR #38 — the previous defensive
+    //    post-loop check was unreachable dead code.
     let mut acc: Vec<kcreate_vector::VectorPath> = vec![paths[0].clone()];
     for next in paths.iter().skip(1) {
         let combined = merge_paths(&acc);
@@ -3150,18 +3176,43 @@ pub fn canvas_path_boolean(op_wire: &str, source_ids: Vec<Uuid>) -> Result<Vec<U
         acc = pair;
     }
 
-    if acc.is_empty() {
-        return Err(DocumentBridgeError::PathBoolean(
-            PathBooleanError::EmptyResult,
-        ));
-    }
-
     // 3. Insert one result node per shape. Use the first source's
-    //    style + parent so the gesture stays inside the user's
-    //    working scope. Bounds are recomputed per-shape so each
-    //    result has tight kurbo bounds.
+    //    style so fill/stroke/corner-radius carry over predictably.
+    //    For the parent, walk up the chain from `first_parent`
+    //    skipping any ancestor that itself appears in `source_ids`
+    //    — those will be deleted in step 4 along with all their
+    //    descendants, so parenting results to them would silently
+    //    cascade-delete the results too. The walk is bounded by
+    //    `nodes.len()` as a belt-and-braces guard against any
+    //    pathologically corrupt graph with a parent cycle (the core
+    //    `reparent_node` rejects cycles, but a defensive ceiling
+    //    here costs O(N) at worst and rules out an infinite loop in
+    //    the bridge regardless of how the graph got into that
+    //    state). Devin Review BUG_0001 (round 7) on PR #38.
+    //
+    //    Bounds are recomputed per-shape so each result has tight
+    //    kurbo bounds.
     let style = first_style.expect("set on first source loop iteration");
-    let parent = first_parent;
+    let source_set: HashSet<Uuid> = source_ids.iter().copied().collect();
+    let mut parent = first_parent;
+    let max_depth = ws.project.document.node_count();
+    let mut walked = 0usize;
+    while let Some(pid) = parent {
+        if !source_set.contains(&pid) {
+            break;
+        }
+        if walked >= max_depth {
+            // Defense in depth: a corrupt graph with a parent cycle
+            // would loop forever. Fall back to the root list — every
+            // node in `source_set` will be removed in step 4 anyway,
+            // so the worst-case outcome is a result parented to
+            // root rather than the (now-deleted) descendant scope.
+            parent = None;
+            break;
+        }
+        walked += 1;
+        parent = ws.project.document.get_node(pid).and_then(|n| n.parent_id);
+    }
     let mut result_ids: Vec<Uuid> = Vec::with_capacity(acc.len());
     let mut result_snapshots: Vec<serde_json::Value> = Vec::with_capacity(acc.len());
     for (idx, path) in acc.into_iter().enumerate() {
@@ -12274,6 +12325,96 @@ mod tests {
             ws.project.document.get_node(a).is_some(),
             "source untouched after early-rejected dedup gesture"
         );
+        drop(guard);
+        project_close();
+    }
+
+    /// Regression test for Devin Review BUG_0001 (round 7) on PR #38:
+    /// when `source_ids[0]` is a child (or deeper descendant) of
+    /// another source node, the result nodes must NOT be silently
+    /// cascade-deleted by step 4's recursive `remove_node`.
+    ///
+    /// Pre-fix behaviour (the bug): `first_parent = source_ids[0]
+    /// .parent_id` was used verbatim. If that parent_id belonged to
+    /// `source_ids[1]`, the result nodes were inserted as children
+    /// of `source_ids[1]`; then `remove_node(source_ids[1])`
+    /// recursively deleted ALL its children — including the
+    /// just-inserted results. The function returned ids that no
+    /// longer existed in the graph; the JS side selected phantom
+    /// nodes and the operation log referenced deleted nodes.
+    ///
+    /// Post-fix behaviour: step 3 walks up the parent chain from
+    /// `first_parent` skipping any ancestor that itself appears in
+    /// `source_ids`. With `parent(a) == b` and `source_ids = [a, b]`,
+    /// the walk advances past `b` to `b.parent_id` (root in this
+    /// test setup), so the results are parented to root and survive
+    /// step 4's cleanup of `a` + `b`.
+    ///
+    /// The test pins three invariants together: (1) the call
+    /// succeeds and returns non-empty `result_ids`; (2) every
+    /// returned id resolves to a live node in the graph; (3) both
+    /// sources (parent + descendant) are gone; (4) the selection
+    /// matches the result ids — the JS side will paint exactly the
+    /// new shapes, no phantoms.
+    #[test]
+    #[serial]
+    fn canvas_path_boolean_hierarchical_sources_do_not_cascade_delete_results() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("bool_hier", dir.path()).expect("create");
+        // Two overlapping squares so the union has a connected
+        // shape (matches `_union_merges_overlapping_squares`).
+        let parent_sq = insert_square(0.0, 0.0, 10.0);
+        let child_sq = insert_square(5.0, 5.0, 10.0);
+        // Reparent the child square under the parent square so the
+        // hierarchy is `root -> parent_sq -> child_sq`. The bridge
+        // accepts this via `document_reparent_node`; the core
+        // `reparent_node` permits any non-cycling reparent
+        // regardless of node-type (VectorLayer accepting a
+        // VectorLayer child is unusual in normal UI flow but
+        // structurally valid).
+        document_reparent_node(child_sq, Some(parent_sq), 0).expect("reparent");
+
+        // Pass the child FIRST so `first_parent == parent_sq` —
+        // this is the exact configuration that triggered the
+        // cascade-delete bug pre-fix.
+        let result_ids = canvas_path_boolean("union", vec![child_sq, parent_sq]).expect("union ok");
+        assert!(!result_ids.is_empty(), "union produced at least one result");
+
+        let guard = slot().read();
+        let ws = guard.as_ref().expect("ws");
+        // The load-bearing invariant: every returned id must
+        // resolve to a live node. Pre-fix this assertion FAILS
+        // because step 4's recursive remove_node deleted the
+        // results along with `parent_sq`.
+        for rid in &result_ids {
+            assert!(
+                ws.project.document.get_node(*rid).is_some(),
+                "result {rid} survived step 4 cleanup (not cascade-deleted)"
+            );
+            // And it must be parented at root (the first non-source
+            // ancestor of `parent_sq` is `None`), not inside the
+            // descendant scope that got swept.
+            let n = ws.project.document.get_node(*rid).expect("live");
+            assert_eq!(
+                n.parent_id, None,
+                "result {rid} parented to first non-source ancestor (root)"
+            );
+        }
+        // Both sources are gone — parent_sq directly via
+        // `remove_node`, child_sq via the recursive cascade from
+        // its parent.
+        assert!(
+            ws.project.document.get_node(parent_sq).is_none(),
+            "parent_sq removed"
+        );
+        assert!(
+            ws.project.document.get_node(child_sq).is_none(),
+            "child_sq swept by parent's recursive remove (or by its own remove_node call — both paths are idempotent)"
+        );
+        // Selection adopts the result ids only — no phantoms, no
+        // remnants.
+        assert_eq!(ws.selection, result_ids, "selection == result_ids");
         drop(guard);
         project_close();
     }

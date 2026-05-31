@@ -1450,6 +1450,11 @@ function registerIpcHandlers(): void {
       requireBridge().canvasCreatePath(parentId, segmentsJson, closed, name),
   );
   ipcMain.handle(
+    "kcreate/canvas/pathBoolean",
+    (_e, op: string, sourceIds: string[]) =>
+      requireBridge().canvasPathBoolean(op, sourceIds),
+  );
+  ipcMain.handle(
     "kcreate/canvas/createText",
     (
       _e,

@@ -1591,6 +1591,30 @@ pub fn canvas_create_path(
         .map_err(map_doc_err)
 }
 
+/// Apply a polygon boolean (`union` / `subtract` / `intersect` /
+/// `exclude`) across `source_ids`, replacing the source vector
+/// layers with the resulting shapes. Pathfinder panel entry point.
+///
+/// `op` is the lowercase wire token; `source_ids` is a string list
+/// of source node UUIDs (2+ required). Returns the freshly
+/// inserted result node ids in iteration order so the renderer can
+/// re-select them all and preserve the boolean's shape ordering.
+///
+/// Wire shape mirrors `apps/desktop/shared/scene.ts::PathBooleanOp`.
+/// Records ONE undoable `canvas_path_boolean` operation; see
+/// [`document::canvas_path_boolean`] for the undo/redo contract.
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn canvas_path_boolean(op: String, source_ids: Vec<String>) -> NapiResult<Vec<String>> {
+    let ids: Vec<uuid::Uuid> = source_ids
+        .iter()
+        .map(|s| parse_uuid(s))
+        .collect::<NapiResult<_>>()?;
+    document::canvas_path_boolean(&op, ids)
+        .map(|out| out.into_iter().map(|u| u.to_string()).collect())
+        .map_err(map_doc_err)
+}
+
 /// Translate a node by `(dx, dy)` in world coordinates. Records an
 /// undoable operation.
 #[napi]

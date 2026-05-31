@@ -204,21 +204,34 @@ function AnchorMarker({
   project: (wx: number, wy: number) => { x: number; y: number };
 }): JSX.Element {
   const a = project(anchor.x, anchor.y);
+  // Project each handle exactly once. `project()` is cheap (two
+  // multiplies + two adds) but calling it four times per handle
+  // for the line endpoints AND the circle centres is noisy and
+  // makes it look like the four calls are meant to be different —
+  // they aren't. This matches the `const d = project(...)` pattern
+  // already used in `PendingAnchorMarker` below so the two
+  // siblings read consistently.
+  const inHandle = anchor.inHandle
+    ? project(anchor.inHandle.x, anchor.inHandle.y)
+    : null;
+  const outHandle = anchor.outHandle
+    ? project(anchor.outHandle.x, anchor.outHandle.y)
+    : null;
   return (
     <g>
-      {anchor.inHandle ? (
+      {inHandle ? (
         <>
           <line
             x1={a.x}
             y1={a.y}
-            x2={project(anchor.inHandle.x, anchor.inHandle.y).x}
-            y2={project(anchor.inHandle.x, anchor.inHandle.y).y}
+            x2={inHandle.x}
+            y2={inHandle.y}
             stroke={PEN_STROKE}
             strokeWidth={1}
           />
           <circle
-            cx={project(anchor.inHandle.x, anchor.inHandle.y).x}
-            cy={project(anchor.inHandle.x, anchor.inHandle.y).y}
+            cx={inHandle.x}
+            cy={inHandle.y}
             r={HANDLE_RADIUS_PX}
             fill="#ffffff"
             stroke={PEN_STROKE}
@@ -226,19 +239,19 @@ function AnchorMarker({
           />
         </>
       ) : null}
-      {anchor.outHandle ? (
+      {outHandle ? (
         <>
           <line
             x1={a.x}
             y1={a.y}
-            x2={project(anchor.outHandle.x, anchor.outHandle.y).x}
-            y2={project(anchor.outHandle.x, anchor.outHandle.y).y}
+            x2={outHandle.x}
+            y2={outHandle.y}
             stroke={PEN_STROKE}
             strokeWidth={1}
           />
           <circle
-            cx={project(anchor.outHandle.x, anchor.outHandle.y).x}
-            cy={project(anchor.outHandle.x, anchor.outHandle.y).y}
+            cx={outHandle.x}
+            cy={outHandle.y}
             r={HANDLE_RADIUS_PX}
             fill="#ffffff"
             stroke={PEN_STROKE}

@@ -422,6 +422,16 @@ export function useToolStateMachine(
   // throw, and any that does won't corrupt the registry because
   // the call is wrapped in a try/catch.
   const listenersRef = useRef<Set<() => void>>(new Set());
+  // Saved pen state across hold-to-pan interruptions. Pen is the
+  // first multi-cycle tool gesture in the codebase (every click
+  // commits an anchor that survives across pointerdown/up cycles),
+  // so the naive "pan replaces state" pattern that worked for the
+  // single-cycle `create` / `move` / `select` tools silently loses
+  // every laid-down anchor the moment the user holds Space. We
+  // stash the pen state here on pan entry and restore it on pan
+  // exit, mirroring Figma / Illustrator behaviour. `null` when no
+  // gesture is in flight.
+  const savedPenStateRef = useRef<ToolMachineState | null>(null);
   const notify = useCallback((): void => {
     for (const listener of listenersRef.current) {
       try {
@@ -506,8 +516,10 @@ export function useToolStateMachine(
         // Reset state so the next pen click starts fresh, even
         // though we didn't commit. Otherwise a 1-anchor gesture
         // would silently persist across the user's "give up and
-        // switch tools" action.
+        // switch tools" action. Also clear any saved-across-pan
+        // shadow so it can't rehydrate the abandoned gesture.
         stateRef.current = IDLE;
+        savedPenStateRef.current = null;
         notify();
         return null;
       }
@@ -517,6 +529,7 @@ export function useToolStateMachine(
       // gesture. The bridge call is fire-and-forget from the
       // state machine's perspective.
       stateRef.current = IDLE;
+      savedPenStateRef.current = null;
       notify();
       try {
         const newId = await window.kcreate.canvas.createPath(
@@ -552,8 +565,14 @@ export function useToolStateMachine(
    */
   const cancelPenGesture = useCallback((): boolean => {
     const state = stateRef.current;
-    if (state.kind !== "pen") return false;
+    // Also treat "pan with a saved pen shadow" as a cancellable
+    // gesture so the user can Escape out of a pen path even
+    // while still holding Space — otherwise the shadow rehydrates
+    // an abandoned path on pan release.
+    const hasShadow = savedPenStateRef.current !== null;
+    if (state.kind !== "pen" && !hasShadow) return false;
     stateRef.current = IDLE;
+    savedPenStateRef.current = null;
     notify();
     return true;
   }, [notify]);
@@ -594,12 +613,35 @@ export function useToolStateMachine(
         // don't worry about coarsening like we do for node moves.
         if (panActiveRef.current) {
           canvasEl.setPointerCapture(pointerId);
+          // Stash an in-flight pen gesture so the user doesn't
+          // lose every committed anchor when they hold Space to
+          // pan mid-path. We only save when the user has actually
+          // committed at least one anchor — a "fresh pen + Space"
+          // shouldn't strand an empty pen state in the ref.
+          // Discarding any `pending` anchor is correct: if the
+          // user's currently mid-click, the pan steals the gesture
+          // and the half-pressed click never reaches pointerup —
+          // restoring `pending` would leave a permanent
+          // pending-anchor ghost in the overlay.
+          const existing = stateRef.current;
+          if (
+            existing.kind === "pen" &&
+            existing.anchors.length > 0
+          ) {
+            savedPenStateRef.current = {
+              ...existing,
+              pending: null,
+            };
+          } else {
+            savedPenStateRef.current = null;
+          }
           stateRef.current = {
             kind: "pan",
             pointerId,
             lastScreenX: sx,
             lastScreenY: sy,
           };
+          notify();
           return;
         }
 
@@ -729,7 +771,23 @@ export function useToolStateMachine(
           // `cursor` for the rubber-band preview; we update
           // `pending.drag` only when the in-flight anchor is
           // owned by THIS pointer.
-          drag.cursor = { x: wx, y: wy };
+          //
+          // CRITICAL: assign a NEW state object rather than
+          // mutating `stateRef.current` in place. The pen tool's
+          // overlay is wired through `useSyncExternalStore`, which
+          // compares snapshots with `Object.is`. A same-reference
+          // return short-circuits the subscriber re-render even
+          // though `notify()` fires the listeners, so in-place
+          // mutation here would make the cursor preview / drag
+          // handles / rubber-band invisible until the next
+          // `pointerdown`. `pan` and `move` states get away with
+          // in-place mutation because they don't expose their
+          // intermediate state through `useSyncExternalStore` —
+          // they drive React state directly via `setViewport` /
+          // bridge calls. This same lesson is documented at
+          // `apps/desktop/renderer/src/shortcuts/registry.ts:236`
+          // for `ShortcutStore.snapshot()`.
+          let nextPending: PenPendingAnchor | null = drag.pending;
           if (drag.pending && drag.pending.pointerId === pointerId) {
             const pdx = sx - (drag.pending.x * vp.zoom + vp.panX);
             const pdy = sy - (drag.pending.y * vp.zoom + vp.panY);
@@ -741,9 +799,14 @@ export function useToolStateMachine(
               drag.pending.drag !== null ||
               Math.hypot(pdx, pdy) >= PEN_DRAG_THRESHOLD_SCREEN
             ) {
-              drag.pending.drag = { x: wx, y: wy };
+              nextPending = { ...drag.pending, drag: { x: wx, y: wy } };
             }
           }
+          stateRef.current = {
+            ...drag,
+            cursor: { x: wx, y: wy },
+            pending: nextPending,
+          };
           notify();
           return;
         }
@@ -881,9 +944,16 @@ export function useToolStateMachine(
               outHandle: null,
             };
           }
-          drag.anchors = [...drag.anchors, newAnchor];
-          drag.pending = null;
-          drag.cursor = { x: wx, y: wy };
+          // Same `useSyncExternalStore` immutability contract as
+          // the pointermove branch above — must assign a NEW state
+          // object so `Object.is` sees a different snapshot and
+          // re-paints the overlay with the newly committed anchor.
+          stateRef.current = {
+            ...drag,
+            anchors: [...drag.anchors, newAnchor],
+            pending: null,
+            cursor: { x: wx, y: wy },
+          };
           notify();
           return;
         }
@@ -899,7 +969,28 @@ export function useToolStateMachine(
         setSnapGuides([]);
         // Reset state BEFORE firing the bridge commit so the in-flight
         // snap-query guard above sees the transition immediately.
-        stateRef.current = IDLE;
+        // For pan release, prefer restoring a saved pen gesture (set
+        // on pan-enter when a pen gesture was in-flight) over the IDLE
+        // default — see the `savedPenStateRef` comment above. The ref
+        // is cleared after restoration so a subsequent unrelated pan
+        // can't accidentally rehydrate stale state.
+        if (drag.kind === "pan" && savedPenStateRef.current) {
+          stateRef.current = savedPenStateRef.current;
+          savedPenStateRef.current = null;
+          notify();
+        } else {
+          stateRef.current = IDLE;
+          // Notify only on pan exit so a pen-overlay subscriber
+          // observing pen-vs-pan transitions sees the gesture
+          // ended. `move`/`create` already drive their own React
+          // state via setSelectedIds/onAfterCommit downstream, so
+          // an extra notify would just trigger a redundant
+          // subscriber callback. The "pen" branch was eliminated
+          // by the pen-specific early-return block above.
+          if (drag.kind === "pan") {
+            notify();
+          }
+        }
 
         if (drag.kind === "pan") {
           // Pan drags don't write to the op log or touch the
@@ -1012,7 +1103,17 @@ export function useToolStateMachine(
   useEffect(() => {
     if (tool === "pen") return;
     const state = stateRef.current;
-    if (state.kind !== "pen") return;
+    // If we're currently mid-pan with a saved pen shadow, promote
+    // the shadow back to the active state first so
+    // `commitPenGesture` (which only inspects `stateRef.current`)
+    // sees the anchors and commits them. Without this, switching
+    // tools while still holding Space would silently drop the
+    // entire path.
+    if (state.kind !== "pen" && savedPenStateRef.current) {
+      stateRef.current = savedPenStateRef.current;
+      savedPenStateRef.current = null;
+    }
+    if (stateRef.current.kind !== "pen") return;
     void commitPenGesture(false);
   }, [tool, commitPenGesture]);
 

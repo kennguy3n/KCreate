@@ -1303,6 +1303,16 @@ function EditorPageInner({
     onAfterCommit: refreshTree,
   });
   const onCanvasPointer = toolStateMachine.onCanvasPointer;
+  // Pull the stable-identity pen callbacks out into locals so the
+  // `shortcutHandlers` useMemo can list THEM in its dep array
+  // instead of the whole `toolStateMachine` bundle. The bundle is
+  // a fresh object every render (see hook return), so depending
+  // on it would re-create `shortcutHandlers` every render and
+  // make `useShortcuts` reattach its window listeners on every
+  // render. Each individual callback IS `useCallback`-wrapped
+  // inside the hook so their identity is stable.
+  const cancelPen = toolStateMachine.cancelPen;
+  const commitPen = toolStateMachine.commitPen;
 
   const shortcutHandlers = useMemo<ShortcutHandlers>(
     () => ({
@@ -1343,7 +1353,7 @@ function EditorPageInner({
         //      shape under that gesture.
         //   2. Otherwise clear the current selection (the
         //      pre-pen-tool behaviour).
-        if (toolStateMachine.cancelPen()) return;
+        if (cancelPen()) return;
         void handleClearSelection();
       },
       // Phase B1 — Enter commits the in-flight pen gesture as an
@@ -1352,7 +1362,7 @@ function EditorPageInner({
       // can't interfere with other modes.
       commitPath: (e) => {
         e.preventDefault();
-        void toolStateMachine.commitPen();
+        void commitPen();
       },
       toolSelect: (e) => tryTool("select", e),
       toolRect: (e) => tryTool("rect", e),
@@ -1400,7 +1410,30 @@ function EditorPageInner({
         void handlePaste();
       },
     }),
-    [handleUndo, handleRedo, handleSelectAll, handleDeleteSelected, handleClearSelection, handleCopy, handlePaste, tryTool, setMode, setPanActive, toolStateMachine],
+    // Depend on `toolStateMachine.cancelPen` / `commitPen`
+    // individually rather than the whole `toolStateMachine` object.
+    // The hook intentionally returns a fresh object on every render
+    // (it's a bundle of stable `useCallback` refs, not a
+    // `useMemo`-wrapped struct), so depending on `toolStateMachine`
+    // would recreate `shortcutHandlers` every render and cause
+    // `useShortcuts` to detach + reattach its window keydown / keyup
+    // listeners on every render. The individual callbacks ARE stable
+    // (each is `useCallback`-wrapped inside the hook), so depending
+    // on them gives `shortcutHandlers` proper identity.
+    [
+      handleUndo,
+      handleRedo,
+      handleSelectAll,
+      handleDeleteSelected,
+      handleClearSelection,
+      handleCopy,
+      handlePaste,
+      tryTool,
+      setMode,
+      setPanActive,
+      cancelPen,
+      commitPen,
+    ],
   );
   useShortcuts(shortcutHandlers);
 

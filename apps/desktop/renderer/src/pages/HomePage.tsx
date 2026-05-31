@@ -9,6 +9,7 @@ import type {
 } from "../../../shared/scene";
 import { colors, font, radius, shadow, spacing } from "../styles/tokens";
 import { BriefModal } from "../components/BriefModal";
+import { Icon, type IconName } from "../components/Icon";
 
 /**
  * Job-first create options. The order mirrors PROPOSAL.md §4.1: we
@@ -29,6 +30,16 @@ export interface CreateOption {
   /// `null` means the user picks dimensions later (e.g. the Import
   /// flow doesn't create a fresh artboard).
   defaultArtboard: { name: string; width: number; height: number } | null;
+  /// Lucide icon name for the card's coloured badge. See
+  /// `iconRegistry.ts`. Picked to summarise the workflow the card
+  /// triggers ("social" → `share`, "print" → `printer`, …) so the
+  /// home page reads as a job-board rather than a wall of text.
+  icon: IconName;
+  /// Tailwind-ish accent colour rendered behind the badge icon.
+  /// Centralised here (rather than per-card in the JSX) so the
+  /// palette stays visually balanced and a future Track-2 template
+  /// resolver can reuse the same hue when seeding swatches.
+  accent: string;
 }
 
 export const CREATE_OPTIONS: ReadonlyArray<CreateOption> = [
@@ -38,6 +49,8 @@ export const CREATE_OPTIONS: ReadonlyArray<CreateOption> = [
     blurb: "Frames, components, design tokens",
     nodeType: "Page",
     defaultArtboard: { name: "Desktop", width: 1440, height: 900 },
+    icon: "monitor",
+    accent: "#3B82F6",
   },
   {
     id: "brand",
@@ -45,6 +58,8 @@ export const CREATE_OPTIONS: ReadonlyArray<CreateOption> = [
     blurb: "Vector marks, palettes, type",
     nodeType: "Artboard",
     defaultArtboard: { name: "Logo", width: 1024, height: 1024 },
+    icon: "palette",
+    accent: "#E65100",
   },
   {
     id: "social",
@@ -52,6 +67,8 @@ export const CREATE_OPTIONS: ReadonlyArray<CreateOption> = [
     blurb: "Common sizes for every channel",
     nodeType: "Artboard",
     defaultArtboard: { name: "Instagram Post", width: 1080, height: 1080 },
+    icon: "share",
+    accent: "#7C3AED",
   },
   {
     id: "photo",
@@ -59,6 +76,8 @@ export const CREATE_OPTIONS: ReadonlyArray<CreateOption> = [
     blurb: "Background removal, retouching",
     nodeType: "RasterLayer",
     defaultArtboard: { name: "Photo", width: 2048, height: 2048 },
+    icon: "camera",
+    accent: "#0EA5E9",
   },
   {
     id: "deck",
@@ -66,6 +85,8 @@ export const CREATE_OPTIONS: ReadonlyArray<CreateOption> = [
     blurb: "Multi-page layouts, master pages",
     nodeType: "LayoutFrame",
     defaultArtboard: { name: "Slide", width: 1920, height: 1080 },
+    icon: "presentation",
+    accent: "#10B981",
   },
   {
     id: "print",
@@ -75,6 +96,8 @@ export const CREATE_OPTIONS: ReadonlyArray<CreateOption> = [
     // A4 @ 300dpi: 2480 × 3508. Same default as the standard A4 preset
     // in `kcreate_core::node::standard_presets()`.
     defaultArtboard: { name: "A4", width: 2480, height: 3508 },
+    icon: "printer",
+    accent: "#DC2626",
   },
   {
     id: "dev-export",
@@ -82,6 +105,8 @@ export const CREATE_OPTIONS: ReadonlyArray<CreateOption> = [
     blurb: "Icons, SVG, PNG, code snippets",
     nodeType: "VectorLayer",
     defaultArtboard: { name: "Icon", width: 512, height: 512 },
+    icon: "code",
+    accent: "#475569",
   },
   {
     id: "import",
@@ -89,6 +114,8 @@ export const CREATE_OPTIONS: ReadonlyArray<CreateOption> = [
     blurb: "SVG, PNG, JPEG, PDF",
     nodeType: "VectorLayer",
     defaultArtboard: null,
+    icon: "upload",
+    accent: "#F59E0B",
   },
 ];
 
@@ -249,7 +276,32 @@ export function HomePage({
           borderBottom: `1px solid ${colors.border}`,
         }}
       >
-        <div style={{ fontSize: 20, fontWeight: 600 }}>KCreate</div>
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: spacing.sm,
+            fontSize: 20,
+            fontWeight: 600,
+          }}
+        >
+          <span
+            aria-hidden="true"
+            style={{
+              width: 28,
+              height: 28,
+              borderRadius: 8,
+              background: colors.accent,
+              color: "white",
+              display: "inline-flex",
+              alignItems: "center",
+              justifyContent: "center",
+            }}
+          >
+            <Icon name="pen-tool" size={16} />
+          </span>
+          <span>KCreate</span>
+        </div>
         <RuntimeBadge status={status} error={statusError} />
       </header>
 
@@ -284,6 +336,8 @@ export function HomePage({
                 key={opt.id}
                 title={opt.title}
                 blurb={opt.blurb}
+                icon={opt.icon}
+                accent={opt.accent}
                 onClick={() => onOpenEditor(opt.id)}
               />
             ))}
@@ -544,10 +598,14 @@ function Section({
 function CreateCard({
   title,
   blurb,
+  icon,
+  accent,
   onClick,
 }: {
   title: string;
   blurb: string;
+  icon: IconName;
+  accent: string;
   onClick: () => void;
 }): JSX.Element {
   return (
@@ -575,6 +633,22 @@ function CreateCard({
         e.currentTarget.style.transform = "translateY(0)";
       }}
     >
+      <span
+        aria-hidden="true"
+        style={{
+          width: 40,
+          height: 40,
+          borderRadius: 10,
+          background: accent,
+          color: "white",
+          display: "inline-flex",
+          alignItems: "center",
+          justifyContent: "center",
+          marginBottom: spacing.xs,
+        }}
+      >
+        <Icon name={icon} size={20} />
+      </span>
       <span style={{ fontSize: 15, fontWeight: 600, color: colors.text }}>
         {title}
       </span>

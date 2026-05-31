@@ -11,6 +11,7 @@ import { BrandKitEditor } from "./BrandKitEditor";
 import { BrandVersionPanel } from "./BrandVersionPanel";
 import { ComponentPanel } from "./ComponentPanel";
 import { DesignTokenEditor } from "./DesignTokenEditor";
+import { Icon, type IconName } from "./Icon";
 
 export type LeftPanelTab =
   | "pages"
@@ -127,12 +128,19 @@ export function LeftPanel({
     >
       <PanelTabs
         tabs={[
-          { id: "pages", label: "Pages" },
-          { id: "artboards", label: "Artboards" },
-          { id: "layers", label: "Layers" },
-          { id: "assets", label: "Assets" },
-          { id: "tokens", label: "Tokens" },
-          { id: "brand", label: "Brand" },
+          // Icons paired with each tab mirror the RightPanel pattern
+          // (see `mkTab` + `BASE_TABS` in `RightPanel.tsx`) so the two
+          // side panels read as the same control surface. Picked by
+          // semantic match: layers ↔ stacked rectangles, artboards ↔
+          // boxed frame, brand ↔ palette, etc. The leading icon is
+          // 14px (inline) so the strip stays narrow enough for a 260px
+          // panel without wrapping the labels.
+          { id: "pages", label: "Pages", icon: "file-text" },
+          { id: "artboards", label: "Artboards", icon: "frame" },
+          { id: "layers", label: "Layers", icon: "layers" },
+          { id: "assets", label: "Assets", icon: "package" },
+          { id: "tokens", label: "Tokens", icon: "variable" },
+          { id: "brand", label: "Brand", icon: "palette" },
         ]}
         active={tab}
         onChange={setTab}
@@ -333,7 +341,7 @@ function LayerTabContent({
             onClick={() => onQueryChange("")}
             style={iconButton(true)}
           >
-            ×
+            <Icon name="x" size={12} />
           </button>
         ) : null}
       </div>
@@ -401,7 +409,11 @@ function PanelTabs<T extends string>({
   active,
   onChange,
 }: {
-  tabs: ReadonlyArray<{ id: T; label: string }>;
+  /// Each tab carries an optional Lucide `icon` rendered before the
+  /// label. Optional (not required) so existing callers — and any
+  /// future ones that need a label-only tab strip — keep compiling
+  /// without a sentinel value.
+  tabs: ReadonlyArray<{ id: T; label: string; icon?: IconName }>;
   active: T;
   onChange: (id: T) => void;
 }): JSX.Element {
@@ -422,7 +434,14 @@ function PanelTabs<T extends string>({
           aria-selected={active === t.id}
           onClick={() => onChange(t.id)}
           style={{
+            // `flex: 1` distributes the strip width evenly; the
+            // inline-flex inner row aligns icon + label without
+            // disturbing that outer distribution.
             flex: 1,
+            display: "inline-flex",
+            alignItems: "center",
+            justifyContent: "center",
+            gap: 4,
             padding: "6px 8px",
             fontSize: 12,
             fontWeight: 500,
@@ -435,6 +454,7 @@ function PanelTabs<T extends string>({
             cursor: "pointer",
           }}
         >
+          {t.icon ? <Icon name={t.icon} size={14} /> : null}
           {t.label}
         </button>
       ))}
@@ -541,7 +561,10 @@ function NodeList({
                 }}
                 style={iconButton(n.visible)}
               >
-                {n.visible ? "●" : "○"}
+                <Icon
+                  name={n.visible ? "eye" : "eye-off"}
+                  size={14}
+                />
               </button>
               <button
                 type="button"
@@ -553,19 +576,23 @@ function NodeList({
                 }}
                 style={iconButton(n.locked)}
               >
-                {n.locked ? "⌧" : "⌬"}
+                <Icon
+                  name={n.locked ? "lock" : "unlock"}
+                  size={14}
+                />
               </button>
               <span
+                aria-label={`${n.nodeType} layer`}
+                title={n.nodeType}
                 style={{
-                  fontSize: 10,
                   color: colors.textMuted,
-                  textTransform: "uppercase",
-                  letterSpacing: 0.4,
                   width: 14,
-                  textAlign: "center",
+                  display: "inline-flex",
+                  alignItems: "center",
+                  justifyContent: "center",
                 }}
               >
-                {nodeTypeAbbrev(n.nodeType)}
+                <Icon name={nodeTypeIcon(n.nodeType)} size={12} />
               </span>
               {isRenaming ? (
                 <input
@@ -629,7 +656,7 @@ function NodeList({
                   }}
                   style={iconButton(false)}
                 >
-                  ×
+                  <Icon name="trash-2" size={14} />
                 </button>
               ) : null}
             </div>
@@ -755,26 +782,32 @@ function iconButton(active: boolean): React.CSSProperties {
   };
 }
 
-function nodeTypeAbbrev(t: string): string {
+/// Pick a lucide icon that visually summarises a node type for the
+/// layer-tree leaf rows. Previously each row showed a single ASCII
+/// letter (`P`, `A`, `G`, …), which both collided with the actual
+/// layer name and required users to memorise the legend. Icons fit
+/// the same 14 px fixed-width column while making the type readable
+/// at a glance.
+function nodeTypeIcon(t: string): IconName {
   switch (t) {
     case "Page":
-      return "P";
+      return "file-text";
     case "Artboard":
-      return "A";
+      return "square";
     case "GroupLayer":
-      return "G";
+      return "layers";
     case "VectorLayer":
-      return "V";
+      return "pen-tool";
     case "RasterLayer":
-      return "R";
+      return "image";
     case "TextLayer":
-      return "T";
+      return "type";
     case "ComponentLayer":
-      return "C";
+      return "package";
     case "LayoutFrame":
-      return "L";
+      return "layout";
     default:
-      return "?";
+      return "file-text";
   }
 }
 

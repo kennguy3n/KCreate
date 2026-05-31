@@ -27,6 +27,7 @@ import { ConstraintsPanel } from "./ConstraintsPanel";
 import { EncryptionPanel } from "./EncryptionPanel";
 import { TextFramePanel } from "./TextFramePanel";
 import { TokenBindingControl } from "./TokenBindingControl";
+import { Icon, type IconName } from "./Icon";
 
 export type RightPanelTab =
   | "properties"
@@ -45,15 +46,47 @@ export type RightPanelTab =
   | "publish"
   | "encryption";
 
+/// One entry in the RightPanel tab strip. `id` is generic so each
+/// call site keeps its narrowed `RightPanelTab` discriminant after
+/// going through `mkTab` below.
+type Tab = { id: RightPanelTab; label: string; icon: IconName };
+
+/// Typed-identity helper used by the `TABS` `useMemo` factory to
+/// build conditional tab entries. The parameter type validates the
+/// `icon` string against the `IconName` union at compile time. Bare
+/// object literals would widen `icon` to `string` (TypeScript only
+/// narrows literal-typed properties when the contextual type is
+/// propagated, which doesn't happen through a fresh array literal
+/// spread), defeating the whole point of `IconName`. The helper
+/// restores type-checking without forcing every caller to write
+/// `as IconName` casts that silently accept typos.
+///
+/// Hoisted to module scope (instead of `const mkTab = ...` inside
+/// `RightPanel`) for two reasons:
+///   1. It's a pure `t => t` identity — it never captures component
+///      state, props, or closure refs. Keeping it stable across
+///      renders makes the intent obvious.
+///   2. The `useMemo` factory references it; defining it inside the
+///      component body would create a new function identity each
+///      render, and `react-hooks/exhaustive-deps` would (correctly)
+///      flag it as a missing dependency. The factory's stable
+///      `[showAccessibility, showInteraction, showPreflight, showColor]`
+///      dep list is the right set; hoisting keeps that list honest.
+function mkTab<Id extends RightPanelTab>(
+  t: { id: Id; label: string; icon: IconName },
+): { id: Id; label: string; icon: IconName } {
+  return t;
+}
+
 /// Tabs shown by default. Some tabs (Accessibility, Interaction) only
 /// appear when the active editor mode calls for them — gated below.
-const BASE_TABS: ReadonlyArray<{ id: RightPanelTab; label: string }> = [
-  { id: "properties", label: "Properties" },
-  { id: "effects", label: "Effects" },
-  { id: "ai", label: "AI Assist" },
-  { id: "export", label: "Export" },
-  { id: "inspect", label: "Inspect" },
-  { id: "history", label: "History" },
+const BASE_TABS: ReadonlyArray<Tab> = [
+  { id: "properties", label: "Properties", icon: "sliders-horizontal" },
+  { id: "effects", label: "Effects", icon: "sparkles" },
+  { id: "ai", label: "AI Assist", icon: "bot" },
+  { id: "export", label: "Export", icon: "download" },
+  { id: "inspect", label: "Inspect", icon: "code" },
+  { id: "history", label: "History", icon: "clock" },
 ];
 
 export interface LayoutHandlers {
@@ -127,30 +160,45 @@ export function RightPanel({
   // mode-derived booleans don't change. Otherwise the spread allocates
   // a fresh array (and new option object literals) on every render,
   // breaking referential equality for any downstream memo.
-  const TABS = useMemo<
-    ReadonlyArray<{ id: RightPanelTab; label: string }>
-  >(
+  //
+  // Each conditional entry goes through the module-scope `mkTab`
+  // helper (defined above the component) — a typed-identity function
+  // whose parameter type validates the `icon` string against the
+  // `IconName` union at compile time. Bare object literals would
+  // widen `icon` to `string` (TypeScript only narrows literal-typed
+  // properties when the contextual type is propagated, which doesn't
+  // happen through a fresh array literal spread), defeating the
+  // whole point of `IconName`. The helper restores type-checking
+  // without forcing every caller to write `as IconName` casts that
+  // silently accept typos. `id` is generic so each tab keeps its
+  // narrowed `RightPanelTab` discriminant. Hoisting it out of the
+  // component body keeps it out of `useMemo`'s captured-deps closure
+  // (it's a pure `t => t` identity, identical every render), which
+  // silences `react-hooks/exhaustive-deps` without false negatives.
+  const TABS = useMemo<ReadonlyArray<Tab>>(
     () => [
       ...BASE_TABS,
       ...(showAccessibility
-        ? [{ id: "accessibility" as const, label: "Accessibility" }]
+        ? [mkTab({ id: "accessibility", label: "Accessibility", icon: "eye" })]
         : []),
       ...(showInteraction
-        ? [{ id: "interaction" as const, label: "Interaction" }]
+        ? [mkTab({ id: "interaction", label: "Interaction", icon: "wand" })]
         : []),
       ...(showPreflight
-        ? [{ id: "preflight" as const, label: "Preflight" }]
+        ? [mkTab({ id: "preflight", label: "Preflight", icon: "file-text" })]
         : []),
-      ...(showColor ? [{ id: "color" as const, label: "Color" }] : []),
-      { id: "presence" as const, label: "Presence" },
+      ...(showColor
+        ? [mkTab({ id: "color", label: "Color", icon: "palette" })]
+        : []),
+      mkTab({ id: "presence", label: "Presence", icon: "users" }),
       // Phase 8 Block C — node-scoped + project-scoped surfaces.
       // Constraints + Tokens are per-selected-node so they only
       // make sense when a node is selected; rendered with a hint
       // otherwise (mirrors how the Properties tab degrades).
-      { id: "constraints" as const, label: "Constraints" },
-      { id: "tokens" as const, label: "Tokens" },
-      { id: "publish" as const, label: "Publish" },
-      { id: "encryption" as const, label: "Encryption" },
+      mkTab({ id: "constraints", label: "Constraints", icon: "move" }),
+      mkTab({ id: "tokens", label: "Tokens", icon: "variable" }),
+      mkTab({ id: "publish", label: "Publish", icon: "globe" }),
+      mkTab({ id: "encryption", label: "Encryption", icon: "lock" }),
     ],
     [showAccessibility, showInteraction, showPreflight, showColor],
   );
@@ -188,6 +236,7 @@ export function RightPanel({
             type="button"
             role="tab"
             aria-selected={tab === t.id}
+            title={t.label}
             onClick={() => setTab(t.id)}
             style={{
               padding: "4px 10px",
@@ -198,8 +247,12 @@ export function RightPanel({
               border: "none",
               borderRadius: radius.pill,
               cursor: "pointer",
+              display: "inline-flex",
+              alignItems: "center",
+              gap: 4,
             }}
           >
+            <Icon name={t.icon} size={12} />
             {t.label}
           </button>
         ))}

@@ -52,9 +52,10 @@ export interface TemplateResolver {
 
 /// Convert a 0xRRGGBB hex literal to an `RgbaColor` (channels in
 /// `[0.0, 1.0]`). Mirrors the conversion the FillEditor does for
-/// solid swatches.
-function hex(hex: string, alpha = 1.0): RgbaColor {
-  const raw = hex.startsWith("#") ? hex.slice(1) : hex;
+/// solid swatches. The parameter is named `value` rather than `hex`
+/// so it doesn't shadow the function name (`no-shadow`).
+function hex(value: string, alpha = 1.0): RgbaColor {
+  const raw = value.startsWith("#") ? value.slice(1) : value;
   const r = parseInt(raw.slice(0, 2), 16) / 255;
   const g = parseInt(raw.slice(2, 4), 16) / 255;
   const b = parseInt(raw.slice(4, 6), 16) / 255;
@@ -444,8 +445,17 @@ const DECK_RESOLVER: TemplateResolver = {
     // first) yields a negative height. Mirrors the shape used by
     // `APP_UI_RESOLVER` (`tileBottom = ay + ah - tileMargin`,
     // `tileHeight = tileBottom - tileTop`).
-    const colTop = ay + margin + 220;
-    const colHeight = ay + ah - colTop - margin;
+    //
+    // The 220px title-block reserve fits a 1920×1080 slide (the
+    // shipped deck preset, ~20% of `ah`). Clamping it to at most
+    // 30% of `ah` keeps the columns visible if this resolver is
+    // ever applied to a smaller custom artboard surface — without
+    // that bound a 300px-tall artboard would have a negative
+    // `colHeight` and the two background rects would silently
+    // collapse to zero-size nodes.
+    const titleReserve = Math.min(220, Math.round(ah * 0.3));
+    const colTop = ay + margin + titleReserve;
+    const colHeight = Math.max(0, ay + ah - colTop - margin);
     const colWidth = Math.round((aw - margin * 3) / 2);
     await rect(
       ax + margin,

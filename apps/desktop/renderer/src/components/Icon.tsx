@@ -61,6 +61,15 @@ function toReactAttrs(a: Readonly<Record<string, string>>): Record<string, strin
   return out;
 }
 
+/// Exhaustiveness helper. Adding a new tag to `IconNodeTag` without
+/// extending the `renderNode` switch causes `_exhaustive` to be
+/// `never` at compile time and the `default` branch to throw at
+/// runtime — belt-and-braces guard against the registry growing a
+/// tag the renderer can't draw.
+function assertNever(_exhaustive: never, tag: string): never {
+  throw new Error(`Icon registry has unsupported tag: ${tag}`);
+}
+
 function renderNode(node: IconNode, key: number): JSX.Element {
   const props = toReactAttrs(node.a);
   switch (node.t) {
@@ -76,6 +85,8 @@ function renderNode(node: IconNode, key: number): JSX.Element {
       return <polyline key={key} {...props} />;
     case "polygon":
       return <polygon key={key} {...props} />;
+    default:
+      return assertNever(node.t, (node as { t: string }).t);
   }
 }
 

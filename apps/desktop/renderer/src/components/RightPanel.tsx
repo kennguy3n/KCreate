@@ -132,76 +132,47 @@ export function RightPanel({
   // mode-derived booleans don't change. Otherwise the spread allocates
   // a fresh array (and new option object literals) on every render,
   // breaking referential equality for any downstream memo.
-  const TABS = useMemo<
-    ReadonlyArray<{ id: RightPanelTab; label: string; icon: IconName }>
-  >(
+  //
+  // Each conditional entry goes through `tab(...)`, a typed-identity
+  // helper whose parameter type validates the `icon` string against
+  // the `IconName` union at compile time. Bare object literals would
+  // widen `icon` to `string` (TypeScript only narrows literal-typed
+  // properties when the contextual type is propagated, which doesn't
+  // happen through a fresh array literal spread), defeating the
+  // whole point of `IconName`. The helper restores type-checking
+  // without forcing every caller to write `as IconName` casts that
+  // silently accept typos. `id` is generic so each tab keeps its
+  // narrowed `RightPanelTab` discriminant.
+  type Tab = { id: RightPanelTab; label: string; icon: IconName };
+  // Renamed `mkTab` (not `tab`) to avoid shadowing the active-tab
+  // `tab` / `setTab` `useState` pair declared below.
+  const mkTab = <Id extends RightPanelTab>(
+    t: { id: Id; label: string; icon: IconName },
+  ): { id: Id; label: string; icon: IconName } => t;
+  const TABS = useMemo<ReadonlyArray<Tab>>(
     () => [
       ...BASE_TABS,
       ...(showAccessibility
-        ? [
-            {
-              id: "accessibility" as const,
-              label: "Accessibility",
-              icon: "eye" as IconName,
-            },
-          ]
+        ? [mkTab({ id: "accessibility", label: "Accessibility", icon: "eye" })]
         : []),
       ...(showInteraction
-        ? [
-            {
-              id: "interaction" as const,
-              label: "Interaction",
-              icon: "wand" as IconName,
-            },
-          ]
+        ? [mkTab({ id: "interaction", label: "Interaction", icon: "wand" })]
         : []),
       ...(showPreflight
-        ? [
-            {
-              id: "preflight" as const,
-              label: "Preflight",
-              icon: "file-text" as IconName,
-            },
-          ]
+        ? [mkTab({ id: "preflight", label: "Preflight", icon: "file-text" })]
         : []),
       ...(showColor
-        ? [
-            {
-              id: "color" as const,
-              label: "Color",
-              icon: "palette" as IconName,
-            },
-          ]
+        ? [mkTab({ id: "color", label: "Color", icon: "palette" })]
         : []),
-      {
-        id: "presence" as const,
-        label: "Presence",
-        icon: "users" as IconName,
-      },
+      mkTab({ id: "presence", label: "Presence", icon: "users" }),
       // Phase 8 Block C — node-scoped + project-scoped surfaces.
       // Constraints + Tokens are per-selected-node so they only
       // make sense when a node is selected; rendered with a hint
       // otherwise (mirrors how the Properties tab degrades).
-      {
-        id: "constraints" as const,
-        label: "Constraints",
-        icon: "move" as IconName,
-      },
-      {
-        id: "tokens" as const,
-        label: "Tokens",
-        icon: "variable" as IconName,
-      },
-      {
-        id: "publish" as const,
-        label: "Publish",
-        icon: "globe" as IconName,
-      },
-      {
-        id: "encryption" as const,
-        label: "Encryption",
-        icon: "lock" as IconName,
-      },
+      mkTab({ id: "constraints", label: "Constraints", icon: "move" }),
+      mkTab({ id: "tokens", label: "Tokens", icon: "variable" }),
+      mkTab({ id: "publish", label: "Publish", icon: "globe" }),
+      mkTab({ id: "encryption", label: "Encryption", icon: "lock" }),
     ],
     [showAccessibility, showInteraction, showPreflight, showColor],
   );

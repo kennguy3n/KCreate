@@ -71,7 +71,12 @@ export function App(): JSX.Element {
               // The artboard we just created is the most recent one
               // for the active project. Falling back to the preset
               // dimensions (origin 0,0) keeps the resolver running
-              // even if listing fails or returns an empty array.
+              // even if listing returns an empty array. (If listing
+              // *throws*, the outer try/catch below skips the
+              // resolver entirely — a thrown `list()` likely means
+              // the bridge state is too inconsistent to seed safely,
+              // so landing on a blank artboard is the right
+              // recovery surface.)
               const target =
                 artboards.find((a) => a.name === preset.name) ??
                 artboards[artboards.length - 1];

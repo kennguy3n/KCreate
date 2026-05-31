@@ -29,7 +29,7 @@
  * text is more self-documenting at this size anyway.
  */
 
-import { useCallback, useMemo, useState, type JSX } from "react";
+import { useCallback, useMemo, useRef, useState, type JSX } from "react";
 import type { NodeInfo, PathBooleanOp } from "../../../shared/scene";
 import { errorMessage } from "../lib/errorMessage";
 import { colors, radius, spacing } from "../styles/tokens";
@@ -102,15 +102,44 @@ export function PathfinderPanel({
     return selectedIds.filter((id) => byId.get(id) === "VectorLayer");
   }, [selectedIds, nodes]);
 
-  // Tracks whether a boolean is currently in flight, so the
-  // buttons can disable themselves until the IPC round-trip
-  // resolves. Without this gate a double-click on (say) Union
-  // fires the gesture twice: the first delete-and-replace succeeds,
-  // and the second sends the now-deleted source ids back to the
-  // bridge which returns `PathBooleanError::SourceNotFound`. The
-  // error toasts cleanly so it's not data-corrupting, but the user
-  // still sees a confusing red message for a gesture that visually
-  // succeeded. Devin Review #0002 (round 3) on PR #38.
+  // Tracks whether a boolean is currently in flight. Split into
+  // a ref + a state because the two roles want different update
+  // semantics:
+  //
+  //   * `pendingRef` — the **serialization guard**. Mutated
+  //     synchronously inside the click handler before any
+  //     `await`, so a second click fired during the
+  //     sub-microtask window between `setPending(true)` and the
+  //     React re-render commit still sees `pendingRef.current ===
+  //     true` and is rejected. A `useState` value here would
+  //     close over the *render-time* snapshot inside `apply`'s
+  //     closure and could let the racing click slip through
+  //     before React schedules the next render. Refs are the
+  //     correct primitive for "this changed *now*, not after the
+  //     next commit" — same pattern we use for the pen tool's
+  //     `dragStateRef` and the editor's `inlineTextEditRef`.
+  //
+  //   * `isPending` (state) — the **visual disabled flag**. Must
+  //     be React state so the four `<button disabled={…}>` props
+  //     re-render and the browser's built-in click suppression
+  //     kicks in. This is the *primary* defense (browsers drop
+  //     `pointerdown` on `disabled` buttons natively); the ref
+  //     guard is a belt-and-braces secondary line that also
+  //     covers synthetic `button.click()` calls from devtools /
+  //     tests / MCP scripting where the disabled attribute is
+  //     ignored.
+  //
+  // Without this gate a double-click on (say) Union fires the
+  // gesture twice: the first delete-and-replace succeeds, and the
+  // second sends the now-deleted source ids back to the bridge
+  // which returns `PathBooleanError::SourceNotFound`. The error
+  // toasts cleanly so it's not data-corrupting, but the user
+  // still sees a confusing red message for a gesture that
+  // visually succeeded. Devin Review #0002 (round 3) on PR #38;
+  // upgraded from a pure `useState` guard to the ref + state
+  // split in response to ANALYSIS_0001 (round 4) which correctly
+  // pointed out the sub-microtask window.
+  const pendingRef = useRef(false);
   const [isPending, setIsPending] = useState(false);
 
   // Bridge call. Bound separately so the disabled-state and the
@@ -118,13 +147,27 @@ export function PathfinderPanel({
   // makes the click handler trivially stable for tests + memoised
   // children. Captures `vectorSelection` by reference so a stale
   // closure can't fire against an outdated selection.
+  //
+  // NOTE: `pendingRef` is intentionally NOT in the deps array.
+  // Refs are stable across renders (the `useRef` return identity
+  // never changes) and reading `.current` inside the callback
+  // always sees the latest write — that's the whole point of
+  // using a ref here. Listing it as a dep would do nothing
+  // useful and would mislead future readers into thinking the
+  // callback identity tracks the guard value.
   const apply = useCallback(
     async (op: PathBooleanOp) => {
-      // Belt-and-braces: the buttons are also `disabled` when
-      // `isPending` is true, but a synthetic click via
-      // `button.click()` from devtools / a test would bypass that.
-      // Re-checking here keeps the bridge call truly serialised.
-      if (isPending) return;
+      // Synchronous guard. Reads the ref (always current) and
+      // *atomically* claims the in-flight slot before any
+      // `await`. A second `apply()` invocation that happens in
+      // the same task or the next microtask (e.g. a synthetic
+      // double-click via `button.click(); button.click();` in
+      // devtools) will short-circuit here.
+      if (pendingRef.current) return;
+      pendingRef.current = true;
+      // Schedule the re-render that flips `disabled` on the four
+      // buttons. This is the user-visible primary defense — the
+      // ref guard above is the belt-and-braces secondary one.
       setIsPending(true);
       try {
         const result = await window.kcreate.canvas.pathBoolean(
@@ -140,13 +183,17 @@ export function PathfinderPanel({
         // a VectorLayer", "boolean op produced no output ...").
         onStatus(`${op} failed: ${errorMessage(e)}`);
       } finally {
-        // Always re-enable on completion — the panel will
+        // Always release on completion — the panel will
         // re-render against the new (or unchanged) selection on
-        // the next refresh and the user can fire the next gesture.
+        // the next refresh and the user can fire the next
+        // gesture. Ref release MUST come first so a click landing
+        // between `setIsPending(false)` and React's commit can
+        // proceed without being blocked by a stale-true ref.
+        pendingRef.current = false;
         setIsPending(false);
       }
     },
-    [vectorSelection, onStatus, onApplied, isPending],
+    [vectorSelection, onStatus, onApplied],
   );
 
   // Hide the panel entirely when there's nothing to do. This is

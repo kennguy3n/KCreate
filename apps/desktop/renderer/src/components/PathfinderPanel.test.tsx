@@ -406,7 +406,8 @@ describe("PathfinderPanel — pending-state gating", () => {
     // The canonical race the gate protects against: rapid
     // double-click on Union while the first IPC is still in
     // flight. The second click must be a no-op (button disabled,
-    // and `apply`'s own `if (isPending) return` belt-and-braces).
+    // and `apply`'s own `if (pendingRef.current) return`
+    // belt-and-braces).
     const stub = kcreateStub();
     const bridge: { release: ((ids: string[]) => void) | null } = {
       release: null,
@@ -442,5 +443,104 @@ describe("PathfinderPanel — pending-state gating", () => {
       await Promise.resolve();
       await Promise.resolve();
     });
+  });
+
+  it("ref-based guard serialises synchronous back-to-back clicks in the same task", async () => {
+    // Devin Review ANALYSIS_0001 (round 4) on PR #38: the prior
+    // implementation tracked `isPending` as React state, so the
+    // `if (isPending) return` guard inside `apply` only saw the
+    // updated value AFTER React committed the
+    // `setIsPending(true)` re-render. A synthetic test or
+    // devtools script that fired two clicks back-to-back within
+    // the same task (no microtask boundary between them) could
+    // squeeze the second click in before the disabled attribute
+    // propagated AND before the guard's closure captured the new
+    // value, double-firing the bridge call.
+    //
+    // The fix moves the guard to a `useRef<boolean>` that's
+    // mutated synchronously inside `apply` before the first
+    // `await`, so subsequent invocations in the same / next
+    // microtask see the updated `pendingRef.current === true`
+    // and short-circuit. This test pins that behaviour: even
+    // with NO `await flushAsync()` between the two clicks (so
+    // React hasn't had a chance to re-render), the bridge must
+    // be called exactly once.
+    const stub = kcreateStub();
+    const bridge: { release: ((ids: string[]) => void) | null } = {
+      release: null,
+    };
+    stub.override(
+      "canvas.pathBoolean",
+      () =>
+        new Promise<string[]>((resolve) => {
+          bridge.release = resolve;
+        }),
+    );
+    const nodes = [mkNode("v1", "VectorLayer"), mkNode("v2", "VectorLayer")];
+    mount({ selectedIds: ["v1", "v2"], nodes });
+
+    const btn = screen.getByTestId("pathfinder-union");
+    // Synchronous back-to-back. No `await` between them — this
+    // is the case the old `useState` guard could not protect
+    // against because React had not yet committed the disabled
+    // re-render and the closure inside `apply` still had
+    // `isPending === false`. The ref-based guard does close
+    // this window: `pendingRef.current = true` runs in the
+    // first click handler before any `await`, and the second
+    // click's `if (pendingRef.current) return` reads the
+    // already-mutated value.
+    fireEvent.click(btn);
+    fireEvent.click(btn);
+    await flushAsync();
+
+    const calls = stub.calls.filter((c) => c.method === "canvas.pathBoolean");
+    expect(
+      calls,
+      "synchronous back-to-back clicks must serialise to exactly one IPC",
+    ).toHaveLength(1);
+
+    await act(async () => {
+      bridge.release?.(["r1"]);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+  });
+
+  it("ref guard releases before the visual flag so a click landing in the post-finally microtask window proceeds", async () => {
+    // The release order inside `finally` matters: the ref MUST
+    // be cleared first, then state. If the order were swapped,
+    // a click that landed in the sub-microtask window between
+    // `setIsPending(false)` and React's re-render commit would
+    // see `disabled` still true (browser drops it) but if a
+    // synthetic call slipped past, the ref would still be true
+    // and the second gesture would be incorrectly rejected even
+    // though the first has fully completed.
+    //
+    // Concretely: fire the first click, resolve the bridge,
+    // then immediately fire a second synthetic click on the
+    // (now-still-disabled-for-one-frame) button. The second
+    // call must succeed because the ref was released first.
+    const stub = kcreateStub();
+    let callCount = 0;
+    stub.override("canvas.pathBoolean", () => {
+      callCount += 1;
+      return [`r${callCount}`];
+    });
+    const nodes = [mkNode("v1", "VectorLayer"), mkNode("v2", "VectorLayer")];
+    mount({ selectedIds: ["v1", "v2"], nodes });
+
+    const btn = screen.getByTestId("pathfinder-union");
+    fireEvent.click(btn);
+    await flushAsync();
+    // After the first click fully resolves, the next click must
+    // be accepted by the panel — both the ref (now false) and
+    // the disabled state (now false after commit) agree.
+    fireEvent.click(btn);
+    await flushAsync();
+
+    expect(
+      callCount,
+      "after release, subsequent clicks must be honoured",
+    ).toBe(2);
   });
 });

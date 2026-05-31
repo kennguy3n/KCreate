@@ -51,6 +51,7 @@ import { useShortcuts } from "../shortcuts/useShortcuts";
 import type { ShortcutHandlers } from "../shortcuts/useShortcuts";
 import { colors, font, spacing } from "../styles/tokens";
 import { errorMessage } from "../lib/errorMessage";
+import { useToolStateMachine } from "../hooks/useToolStateMachine";
 
 export interface EditorPageProps {
   project: ProjectInfo;
@@ -73,11 +74,6 @@ const CANVAS_HEIGHT = 640;
 // Kept at module scope so it isn't recreated on every render — the
 // component body only ever reads it.
 const CLIPBOARD_ENVELOPE_HEADER = "kcreate:clipboard/v1\n";
-
-/// Snap threshold in world units. 6 px @ zoom=1 keeps snaps tight
-/// enough to feel deliberate but forgiving on a 4K display where the
-/// cursor is travelling at high pixel velocity.
-const SNAP_THRESHOLD_WORLD = 6;
 
 const TOOL_CURSORS: Record<ToolId, string> = {
   select: "default",
@@ -193,6 +189,16 @@ function EditorPageInner({
   } = documentCtx.actions;
   const { nodesRef, artboardsRef } = documentCtx.refs;
 
+  // Phase 6 Tasks 25-26: latest world-space cursor sample. Paste reads
+  // it (`handlePaste` below) to position the new subtree near the
+  // cursor. The state machine in `useToolStateMachine` (mounted later
+  // in this component) updates it on every pointer event (down / move
+  // / up) so a stationary cursor still drives a sensible paste origin.
+  // Declared up here, BEFORE `handlePaste`, so the closure capture is
+  // safe — moving it next to the state machine call site would put it
+  // in the Temporal Dead Zone for the paste closure created earlier.
+  const lastCursorWorldRef = useRef<{ x: number; y: number } | null>(null);
+
   // Host-specific UI / modal state. These don't need to be shared
   // with future tools so they stay as plain `useState` in the
   // EditorPage body.
@@ -225,34 +231,16 @@ function EditorPageInner({
     null,
   );
   const lastTickAtRef = useRef<number>(performance.now());
-  // Drag-to-create / drag-to-move / hold-to-pan state. Storing in a
-  // ref keeps the pointer handler stable while still tracking the
-  // current drag. The `"pan"` kind reuses the same record because
-  // the pointer state-machine (pointerdown / pointermove / pointerup
-  // routing) is identical — only the per-move side effect differs
-  // (translate viewport vs. translate selected node vs. accumulate
-  // creation rect). `lastWorldX`/`lastWorldY` carry *screen* pixels
-  // for pan drags (not world coords) so we can compute panX/panY
-  // deltas without round-tripping through the inverse viewport
-  // transform on every frame.
-  const dragStateRef = useRef<{
-    kind: "create" | "move" | "pan";
-    tool: ToolId;
-    pointerId: number;
-    startWorldX: number;
-    startWorldY: number;
-    lastWorldX: number;
-    lastWorldY: number;
-    movingNodeId: string | null;
-    cumulativeDx: number;
-    cumulativeDy: number;
-  } | null>(null);
-
-  // Phase 6 Tasks 25-26: latest world-space cursor sample. Paste uses
-  // it to position the new subtree near the cursor; we update on every
-  // pointer event (not just down/up) so a stationary cursor over the
-  // canvas still drives a sensible paste origin.
-  const lastCursorWorldRef = useRef<{ x: number; y: number } | null>(null);
+  // Drag state lives in `useToolStateMachine` (`apps/desktop/renderer/
+  // src/hooks/useToolStateMachine.ts`). The hook owns the
+  // discriminated-union state (Idle | Pan | Move | Create), the
+  // pointer event router, and the bridge side effects (hit-test,
+  // snap query, moveNode, createRect/Ellipse/Line/Text). The hook
+  // also owns the last-world-cursor sample (used by paste-at-cursor)
+  // because it's the only place with the live screen→world
+  // transform handy. See the `dragKind` reader below for how the
+  // cursor logic peeks at the state machine, and `lastCursorWorld`
+  // for the paste reader.
 
   // `nodes`, `selectedIds`, and `artboards` read-latest refs live in
   // their respective contexts (`DocumentContext` / `EditorContext`).
@@ -1340,300 +1328,48 @@ function EditorPageInner({
   );
   useShortcuts(shortcutHandlers);
 
-  // Map screen→world. The renderer reads pan/zoom directly so the same
-  // formula is used both for the wheel-zoom anchor (inside CanvasHost)
-  // and for click-to-hit-test below.
-  const screenToWorld = useCallback(
-    (sx: number, sy: number): { x: number; y: number } => {
-      return {
-        x: (sx - viewport.panX) / viewport.zoom,
-        y: (sy - viewport.panY) / viewport.zoom,
-      };
+  // Wrap `setStatusMessage` in a plain `(msg: string) => void` closure
+  // before handing it to the state machine. `setStatusMessage` is
+  // `Dispatch<SetStateAction<string | null>>`, which accepts both a
+  // plain string AND a functional updater (`prev => string | null`).
+  // The hook only ever calls `onError(string)`, so the assignment is
+  // currently type-safe via function parameter contravariance — but
+  // any future drift inside the hook (e.g. accidentally passing an
+  // `Error` object whose value happens to be callable, or a closure
+  // captured for some other purpose) would be silently interpreted
+  // as a functional updater by React rather than a string. Narrowing
+  // the prop boundary to `(msg: string) => void` here makes that
+  // drift a compile error instead of a runtime surprise. Mirrors the
+  // same defensive wrapper used by `EditorDocumentBridge` above.
+  const onToolStateMachineError = useCallback(
+    (msg: string): void => {
+      setStatusMessage(msg);
     },
-    [viewport],
+    [setStatusMessage],
   );
-
-  const onCanvasPointer = useCallback(
-    (e: React.PointerEvent<HTMLCanvasElement>) => {
-      if (e.button !== 0 && e.type === "pointerdown") return;
-      // React nullifies `SyntheticEvent.currentTarget` once the
-      // synchronous handler returns, so the async IIFE below cannot
-      // read it after an `await`. Capture the canvas element + pointer
-      // id synchronously so `setPointerCapture` /
-      // `releasePointerCapture` keep working across awaits.
-      const canvasEl = e.currentTarget;
-      const pointerId = e.pointerId;
-      const rect = canvasEl.getBoundingClientRect();
-      const sx = e.clientX - rect.left;
-      const sy = e.clientY - rect.top;
-      const { x: wx, y: wy } = screenToWorld(sx, sy);
-      // Phase 6 Tasks 25-26: latest world-space cursor sample drives
-      // paste-at-cursor.
-      lastCursorWorldRef.current = { x: wx, y: wy };
-      // Capture the viewport snapshot at pointer-down time. The Rust
-      // hit-test wants screen coordinates plus the viewport so it can
-      // run the screen→world transform once — if we pre-transformed
-      // here too, the renderer would double-apply pan + zoom and miss
-      // every click.
-      const vp = viewport;
-
-      if (e.type === "pointerdown") {
-        // Hold-to-pan beats every tool — if the user is holding the
-        // pan key, treat the drag as a viewport translation instead
-        // of hit-testing or creating geometry. We commit the
-        // viewport delta on every pointermove (no batching) because
-        // pan is a transient visual effect; there's no op-log
-        // entry, so we don't worry about coarsening like we do for
-        // node moves.
-        if (panActiveRef.current) {
-          canvasEl.setPointerCapture(pointerId);
-          dragStateRef.current = {
-            kind: "pan",
-            tool,
-            pointerId,
-            startWorldX: sx,
-            startWorldY: sy,
-            lastWorldX: sx,
-            lastWorldY: sy,
-            movingNodeId: null,
-            cumulativeDx: 0,
-            cumulativeDy: 0,
-          };
-          return;
-        }
-        if (tool === "select") {
-          // Click-to-select: hit-test, then either start a move drag or
-          // clear selection. The bridge does the screen→world transform
-          // internally; we send raw screen coordinates plus the current
-          // viewport (single source of truth, no double-transform).
-          void (async () => {
-            try {
-              const hit = await window.kcreate.canvas.hitTest(
-                sx,
-                sy,
-                vp.panX,
-                vp.panY,
-                vp.zoom,
-              );
-              if (hit) {
-                await window.kcreate.canvas.setSelection([hit]);
-                setSelectedIds([hit]);
-                canvasEl.setPointerCapture(pointerId);
-                dragStateRef.current = {
-                  kind: "move",
-                  tool,
-                  pointerId,
-                  startWorldX: wx,
-                  startWorldY: wy,
-                  lastWorldX: wx,
-                  lastWorldY: wy,
-                  movingNodeId: hit,
-                  cumulativeDx: 0,
-                  cumulativeDy: 0,
-                };
-              } else {
-                await window.kcreate.canvas.clearSelection();
-                setSelectedIds([]);
-              }
-            } catch (err) {
-              setStatusMessage(`hit-test failed: ${errorMessage(err)}`);
-            }
-          })();
-          return;
-        }
-        // Drawing tools — record drag start in world coords; commit on
-        // pointerup.
-        canvasEl.setPointerCapture(pointerId);
-        dragStateRef.current = {
-          kind: "create",
-          tool,
-          pointerId,
-          startWorldX: wx,
-          startWorldY: wy,
-          lastWorldX: wx,
-          lastWorldY: wy,
-          movingNodeId: null,
-          cumulativeDx: 0,
-          cumulativeDy: 0,
-        };
-        return;
-      }
-
-      if (e.type === "pointermove") {
-        const drag = dragStateRef.current;
-        if (!drag || drag.pointerId !== e.pointerId) return;
-        if (drag.kind === "pan") {
-          // Translate the viewport by the screen-space delta since
-          // the last sample. We work in screen pixels (not world
-          // units) on purpose: panning *is* the screen→world
-          // translation we'd otherwise compute, so re-deriving it
-          // would just be `delta_screen / zoom * zoom = delta_screen`.
-          const dx = sx - drag.lastWorldX;
-          const dy = sy - drag.lastWorldY;
-          drag.lastWorldX = sx;
-          drag.lastWorldY = sy;
-          setViewport((v) => ({
-            ...v,
-            panX: v.panX + dx,
-            panY: v.panY + dy,
-          }));
-          return;
-        }
-        if (drag.kind === "move" && drag.movingNodeId) {
-          const dx = wx - drag.lastWorldX;
-          const dy = wy - drag.lastWorldY;
-          drag.lastWorldX = wx;
-          drag.lastWorldY = wy;
-          drag.cumulativeDx += dx;
-          drag.cumulativeDy += dy;
-          // Smart-guides: query the snap engine for the candidate
-          // world-space bounds and apply the returned delta to the
-          // *cumulative* offset (so the next pointermove keeps
-          // working off the snapped position). The bridge call is
-          // cheap (O(log n) per axis after the sorted-edge build);
-          // we still fire it on every move because the engine is
-          // built from-scratch each time — the dragged node's bounds
-          // are dirty otherwise.
-          const movingNode = nodesRef.current.find(
-            (n) => n.id === drag.movingNodeId,
-          );
-          if (movingNode) {
-            const candX =
-              movingNode.bounds.x + drag.cumulativeDx;
-            const candY =
-              movingNode.bounds.y + drag.cumulativeDy;
-            void (async () => {
-              try {
-                const snap = await window.kcreate.canvasSnap.query(
-                  movingNode.id,
-                  candX,
-                  candY,
-                  movingNode.bounds.width,
-                  movingNode.bounds.height,
-                  SNAP_THRESHOLD_WORLD,
-                );
-                if (!snap) return;
-                if (snap.dx !== 0 || snap.dy !== 0) {
-                  drag.cumulativeDx += snap.dx;
-                  drag.cumulativeDy += snap.dy;
-                }
-                setSnapGuides(snap.guides);
-              } catch {
-                // Snap is purely advisory — failures shouldn't
-                // abort the drag. Silently swallow.
-              }
-            })();
-          }
-          // Don't fire a bridge call for every micro-pixel of cursor
-          // motion — only push the accumulated delta on pointerup. This
-          // keeps undo entries coarse (one drag = one op) and avoids
-          // op-log spam.
-          return;
-        }
-        // Drawing — no commit until pointerup; the canvas does not yet
-        // show an in-flight ghost. Phase 1 will add a transient overlay
-        // by passing the in-progress rect/ellipse to the renderer
-        // alongside the persisted scene.
-        return;
-      }
-
-      if (e.type === "pointerup") {
-        const drag = dragStateRef.current;
-        if (!drag || drag.pointerId !== pointerId) return;
-        try {
-          canvasEl.releasePointerCapture(pointerId);
-        } catch {
-          // capture might already be released
-        }
-        dragStateRef.current = null;
-        // Clear smart-guides — the drag is done, so any displayed
-        // guide lines belong to a stale candidate position.
-        setSnapGuides([]);
-        if (drag.kind === "pan") {
-          // Pan drags don't write to the op log or touch the
-          // document — there's nothing to commit on release. The
-          // viewport has already been mutated incrementally on each
-          // pointermove sample.
-          return;
-        }
-        if (drag.kind === "move" && drag.movingNodeId) {
-          if (drag.cumulativeDx !== 0 || drag.cumulativeDy !== 0) {
-            void (async () => {
-              try {
-                await window.kcreate.canvas.moveNode(
-                  drag.movingNodeId!,
-                  drag.cumulativeDx,
-                  drag.cumulativeDy,
-                );
-                await refreshTree();
-              } catch (err) {
-                setStatusMessage(`move failed: ${errorMessage(err)}`);
-              }
-            })();
-          }
-          return;
-        }
-        // Creation: convert the drag to the actual shape parameters.
-        const x0 = drag.startWorldX;
-        const y0 = drag.startWorldY;
-        const x1 = wx;
-        const y1 = wy;
-        const minX = Math.min(x0, x1);
-        const minY = Math.min(y0, y1);
-        const w = Math.abs(x1 - x0);
-        const h = Math.abs(y1 - y0);
-        // Reject zero-area drags — that's a stray click, not a drawing.
-        if (w < 1 && h < 1 && drag.tool !== "text") return;
-
-        void (async () => {
-          try {
-            let newId: string | null = null;
-            if (drag.tool === "rect") {
-              newId = await window.kcreate.canvas.createRect(
-                null,
-                minX,
-                minY,
-                w,
-                h,
-              );
-            } else if (drag.tool === "ellipse") {
-              newId = await window.kcreate.canvas.createEllipse(
-                null,
-                minX + w / 2,
-                minY + h / 2,
-                w / 2,
-                h / 2,
-              );
-            } else if (drag.tool === "line") {
-              newId = await window.kcreate.canvas.createLine(
-                null,
-                x0,
-                y0,
-                x1,
-                y1,
-              );
-            } else if (drag.tool === "text") {
-              newId = await window.kcreate.canvas.createText(
-                null,
-                x0,
-                y0,
-                "Text",
-                "sans-serif",
-                24,
-              );
-            }
-            if (newId) {
-              await window.kcreate.canvas.setSelection([newId]);
-            }
-            await refreshTree();
-          } catch (err) {
-            setStatusMessage(`create failed: ${errorMessage(err)}`);
-          }
-        })();
-      }
-    },
-    [tool, viewport, screenToWorld, refreshTree, nodesRef, panActiveRef, setSelectedIds, setSnapGuides, setStatusMessage, setViewport],
-  );
+  // Pointer-event state machine. Owns the (Idle | Pan | Move | Create)
+  // discriminated-union state, the canvas pointer handler, and the
+  // bridge side effects (hit-test, snap query, moveNode,
+  // createRect/Ellipse/Line/Text). See `hooks/useToolStateMachine.ts`
+  // for the architectural rationale. The hook's `onAfterCommit`
+  // hooks into `refreshTree` so committed drags trigger a full
+  // document re-pull, exactly as the pre-refactor handler did.
+  // `lastCursorWorldRef` is declared higher up (right after the
+  // context destructures) so the paste closure created earlier in
+  // this component captures a defined binding.
+  const toolStateMachine = useToolStateMachine({
+    tool,
+    viewport,
+    panActiveRef,
+    nodesRef,
+    lastCursorWorldRef,
+    setSelectedIds,
+    setViewport,
+    setSnapGuides,
+    onError: onToolStateMachineError,
+    onAfterCommit: refreshTree,
+  });
+  const onCanvasPointer = toolStateMachine.onCanvasPointer;
 
   const onZoomToFit = useCallback(() => {
     // No documentBounds API yet; reset to identity. Phase 1 will compute
@@ -1801,7 +1537,7 @@ function EditorPageInner({
   // immediately. Falls back to the per-tool cursor when the gesture
   // isn't armed.
   const cursor = panActive
-    ? dragStateRef.current?.kind === "pan"
+    ? toolStateMachine.getState().kind === "pan"
       ? "grabbing"
       : "grab"
     : TOOL_CURSORS[tool];

@@ -6,9 +6,12 @@
 //
 //   * setters MUST have stable identity across re-renders
 //     (memoised `actions` bundle);
-//   * `refreshTree` pulls `getDocumentTree` then sequences the
-//     three sub-refreshers; setters surface the bridge return
-//     values into state;
+//   * `refreshTree` pulls ONLY the document tree (single-purpose by
+//     design — status / artboards / components / selection refresh
+//     live on their own actions so EditorPage can compose them in
+//     the original pre-refactor sequencing);
+//   * `refreshStatus` / `refreshArtboards` / `refreshComponents`
+//     each pull their slice from the bridge in isolation;
 //   * `nodesRef` / `artboardsRef` mirror their state in lockstep;
 //   * a refresh failure routes through `onStatusError` (the
 //     provider's error sink wired by EditorPage to
@@ -25,10 +28,16 @@ import type {
   ComponentInfo,
   DocumentStatus,
   NodeInfo,
-} from "../../../../shared/scene";
+} from "../../../shared/scene";
 import { installKcreateStub, kcreateStub } from "../../tests/helpers/kcreateStub";
 
-import { DocumentProvider, useDocument } from "./DocumentContext";
+import {
+  DocumentProvider,
+  useDocument,
+  useDocumentActions,
+  useDocumentRefs,
+  useDocumentState,
+} from "./DocumentContext";
 
 interface Captured {
   bundle: ReturnType<typeof useDocument> | null;
@@ -64,6 +73,8 @@ const SAMPLE_NODE: NodeInfo = {
   visible: true,
   locked: false,
   children: [],
+  bounds: { x: 0, y: 0, width: 0, height: 0 },
+  version: 1,
 };
 
 const SAMPLE_ARTBOARD: ArtboardInfo = {
@@ -73,19 +84,26 @@ const SAMPLE_ARTBOARD: ArtboardInfo = {
   y: 0,
   width: 100,
   height: 100,
+  pageId: "page-1",
 };
 
 const SAMPLE_COMPONENT: ComponentInfo = {
   id: "c1",
   name: "Comp",
-  thumbnailPath: null,
-  artboardId: "ab1",
+  description: "",
+  defaultVariantId: "v1",
+  variants: [
+    { id: "v1", name: "Default", properties: {} },
+  ],
+  createdAt: "2025-01-01T00:00:00Z",
+  modifiedAt: "2025-01-01T00:00:00Z",
 };
 
 const SAMPLE_STATUS: DocumentStatus = {
-  projectId: "p1",
-  unsaved: false,
-  undoDepth: 0,
+  nodeCount: 4,
+  canUndo: true,
+  canRedo: false,
+  undoDepth: 2,
   redoDepth: 0,
 };
 
@@ -194,7 +212,7 @@ describe("DocumentContext", () => {
     expect(captured.bundle!.state.components).toEqual([SAMPLE_COMPONENT]);
   });
 
-  it("refreshTree sequences tree + status + artboards + components", async () => {
+  it("refreshTree pulls ONLY the document tree (no cascade)", async () => {
     kcreateStub().override("document.getDocumentTree", () => [SAMPLE_NODE]);
     kcreateStub().override("document.status", () => SAMPLE_STATUS);
     kcreateStub().override("artboard.list", () => [SAMPLE_ARTBOARD]);
@@ -205,17 +223,20 @@ describe("DocumentContext", () => {
       await captured.bundle!.actions.refreshTree();
     });
 
+    // Only the tree slice should be touched — status / artboards /
+    // components remain at their defaults. Composing those into a
+    // full resync is the caller's job (see EditorPage.refreshTree).
     expect(captured.bundle!.state.nodes).toEqual([SAMPLE_NODE]);
-    expect(captured.bundle!.state.docStatus).toEqual(SAMPLE_STATUS);
-    expect(captured.bundle!.state.artboards).toEqual([SAMPLE_ARTBOARD]);
-    expect(captured.bundle!.state.components).toEqual([SAMPLE_COMPONENT]);
+    expect(captured.bundle!.state.docStatus).toBeNull();
+    expect(captured.bundle!.state.artboards).toEqual([]);
+    expect(captured.bundle!.state.components).toEqual([]);
 
-    // Confirm the right methods were invoked.
+    // Confirm only the tree method was invoked.
     const calls = kcreateStub().calls.map((c) => c.method);
     expect(calls).toContain("document.getDocumentTree");
-    expect(calls).toContain("document.status");
-    expect(calls).toContain("artboard.list");
-    expect(calls).toContain("component.list");
+    expect(calls).not.toContain("document.status");
+    expect(calls).not.toContain("artboard.list");
+    expect(calls).not.toContain("component.list");
   });
 
   it("routes refresh failures through onStatusError", async () => {
@@ -230,7 +251,8 @@ describe("DocumentContext", () => {
     });
 
     expect(onStatusError).toHaveBeenCalledTimes(1);
-    expect(onStatusError.mock.calls[0][0]).toMatch(/status probe failed: boom/);
+    const firstCallArg = onStatusError.mock.calls[0]?.[0];
+    expect(firstCallArg).toMatch(/status probe failed: boom/);
     expect(captured.bundle!.state.docStatus).toBeNull();
   });
 
@@ -256,5 +278,67 @@ describe("DocumentContext", () => {
     } finally {
       console.error = origError;
     }
+  });
+
+  it("actions-only consumers do NOT re-render on state changes", () => {
+    // Architectural invariant from the context split (PR #35 / Devin
+    // Review #0003 + #0004): a consumer that subscribes only to the
+    // actions context stays inert through state churn — the actions
+    // value has stable identity for the provider's lifetime, so
+    // React skips the consumer entirely.
+    //
+    // Same proof point as the parallel test in EditorContext, but
+    // for DocumentContext (the contexts are independent but share
+    // the split-by-shape pattern).
+    let actionsRenderCount = 0;
+    let refsRenderCount = 0;
+    let stateRenderCount = 0;
+    let capturedActions: ReturnType<typeof useDocumentActions> | null = null;
+
+    function ActionsConsumer(): JSX.Element {
+      actionsRenderCount += 1;
+      const a = useDocumentActions();
+      capturedActions = a;
+      return <div data-testid="doc-actions-only" />;
+    }
+    function RefsConsumer(): JSX.Element {
+      refsRenderCount += 1;
+      useDocumentRefs();
+      return <div data-testid="doc-refs-only" />;
+    }
+    function StateConsumer(): JSX.Element {
+      stateRenderCount += 1;
+      useDocumentState();
+      return <div data-testid="doc-state-only" />;
+    }
+
+    render(
+      <DocumentProvider>
+        <ActionsConsumer />
+        <RefsConsumer />
+        <StateConsumer />
+      </DocumentProvider>,
+    );
+
+    expect(actionsRenderCount).toBe(1);
+    expect(refsRenderCount).toBe(1);
+    expect(stateRenderCount).toBe(1);
+
+    act(() => {
+      capturedActions!.setNodes([SAMPLE_NODE]);
+    });
+    act(() => {
+      capturedActions!.setArtboards([SAMPLE_ARTBOARD]);
+    });
+    act(() => {
+      capturedActions!.setComponents([SAMPLE_COMPONENT]);
+    });
+    act(() => {
+      capturedActions!.setDocStatus(SAMPLE_STATUS);
+    });
+
+    expect(stateRenderCount).toBeGreaterThan(1);
+    expect(actionsRenderCount).toBe(1);
+    expect(refsRenderCount).toBe(1);
   });
 });

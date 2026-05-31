@@ -170,6 +170,8 @@ function EditorPageInner({
     setArtboards,
     setArtboardPresets,
     setResourceLimits,
+    refreshStatus,
+    refreshArtboards,
     refreshComponents,
     refreshTree: refreshDocumentTree,
   } = documentCtx.actions;
@@ -246,12 +248,15 @@ function EditorPageInner({
   const selectedId: string | null =
     selectedIds.length === 1 ? (selectedIds[0] ?? null) : null;
 
-  // `refreshStatus`, `refreshArtboards`, `refreshComponents` come
-  // from `DocumentContext.actions`; `refreshDocumentTree` is its
-  // tree+document refresher (renamed in the destructure above).
-  // `refreshSelection` stays local because it owns `selectedIds`
-  // (which lives in `EditorContext`); the composed `refreshTree`
-  // below wraps both so existing call sites keep their semantics.
+  // `refreshStatus`, `refreshArtboards`, `refreshComponents`, and
+  // `refreshDocumentTree` come from `DocumentContext.actions` and
+  // each pulls exactly one slice from the bridge. `refreshSelection`
+  // lives here because selection state belongs to `EditorContext`
+  // (cross-context orchestration), not `DocumentContext`. The
+  // composed `refreshTree` below preserves the pre-refactor
+  // sequencing (tree → status → selection → artboards → components)
+  // verbatim so undo/redo / artboard-creation / component-instance
+  // flows that depend on visibility ordering keep their semantics.
 
   const refreshSelection = useCallback(async () => {
     try {
@@ -264,8 +269,17 @@ function EditorPageInner({
 
   const refreshTree = useCallback(async () => {
     await refreshDocumentTree();
+    await refreshStatus();
     await refreshSelection();
-  }, [refreshDocumentTree, refreshSelection]);
+    await refreshArtboards();
+    await refreshComponents();
+  }, [
+    refreshDocumentTree,
+    refreshStatus,
+    refreshSelection,
+    refreshArtboards,
+    refreshComponents,
+  ]);
 
   // Initial load + on-mode-change resync.
   useEffect(() => {
@@ -348,7 +362,7 @@ function EditorPageInner({
     }
     setTemplatePickerOpen(true);
     setLayoutPickerShownFor(project.id);
-  }, [mode, project.id, untouchedProbe, layoutPickerShownFor, setStatusMessage]);
+  }, [mode, project.id, untouchedProbe, layoutPickerShownFor]);
 
   // Layout mode page selection helper — selects the page node so the
   // canvas pans/zooms to its bounds and the right panel shows its
@@ -388,7 +402,7 @@ function EditorPageInner({
 
   useEffect(() => {
     void refreshResourceLimits();
-  }, [refreshResourceLimits, setStatusMessage]);
+  }, [refreshResourceLimits]);
 
   // Load preset catalogue once. It's deterministic and the bridge
   // recomputes it on each call so caching once on mount is fine.
@@ -626,7 +640,7 @@ function EditorPageInner({
     if (!tools.includes(tool)) {
       setTool(tools[0] ?? "select");
     }
-  }, [mode, tool, setStatusMessage, setTool]);
+  }, [mode, tool, setTool]);
 
   const selected = useMemo(
     () => nodes.find((n) => n.id === selectedId) ?? null,

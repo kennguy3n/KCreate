@@ -100,10 +100,13 @@ export interface DocumentActions {
   refreshArtboards: () => Promise<void>;
   refreshComponents: () => Promise<void>;
   /**
-   * Re-pulls the document tree and then refreshes status,
-   * artboards, and components. Does NOT refresh selection — that
-   * lives in `EditorContext`. EditorPage composes the two when a
-   * full resync is needed.
+   * Re-pulls the document tree ONLY. Single-purpose by design —
+   * status / artboards / components / selection refreshes live on
+   * their own actions so callers can compose them in whatever
+   * order their feature requires. EditorPage's composed full-resync
+   * wraps this together with `refreshStatus` / `refreshSelection` /
+   * `refreshArtboards` / `refreshComponents` to preserve the
+   * pre-refactor sequencing exactly.
    */
   refreshTree: () => Promise<void>;
 }
@@ -124,7 +127,27 @@ interface DocumentContextValue {
   refs: DocumentRefs;
 }
 
-const DocumentContext = createContext<DocumentContextValue | null>(null);
+/**
+ * Why three distinct contexts instead of a single bundle?
+ *
+ * React's context API only supports whole-value subscription:
+ * `useContext(ctx)` re-renders the consumer whenever the provider's
+ * `value` prop changes identity. A `{ state, actions, refs }` bundle
+ * forces every consumer to re-render on every state change — even
+ * components that only read `actions`, whose identity is stable for
+ * the provider's whole lifetime.
+ *
+ * Splitting into `DocumentStateContext` / `DocumentActionsContext` /
+ * `DocumentRefsContext` lets each consumer subscribe only to what
+ * it actually reads. `EditorPage` keeps its existing destructure via
+ * `useDocument()` (which subscribes to all three — same behaviour as
+ * before), but components that only need refreshers or refs can
+ * call the targeted hooks and stay inert through state churn. See
+ * the parallel rationale block in `EditorContext.tsx`.
+ */
+const DocumentStateContext = createContext<DocumentState | null>(null);
+const DocumentActionsContext = createContext<DocumentActions | null>(null);
+const DocumentRefsContext = createContext<DocumentRefs | null>(null);
 
 export interface DocumentProviderProps {
   /**
@@ -219,10 +242,7 @@ export function DocumentProvider({
     } catch (e) {
       reportError(`tree load failed: ${errorMessage(e)}`);
     }
-    await refreshStatus();
-    await refreshArtboards();
-    await refreshComponents();
-  }, [reportError, refreshStatus, refreshArtboards, refreshComponents]);
+  }, [reportError]);
 
   const actions = useMemo<DocumentActions>(
     () => ({
@@ -261,46 +281,82 @@ export function DocumentProvider({
     [nodes, artboards, artboardPresets, components, docStatus, resourceLimits],
   );
 
-  const value = useMemo<DocumentContextValue>(
-    () => ({ state, actions, refs }),
-    [state, actions, refs],
-  );
-
   return (
-    <DocumentContext.Provider value={value}>
-      {children}
-    </DocumentContext.Provider>
+    <DocumentStateContext.Provider value={state}>
+      <DocumentActionsContext.Provider value={actions}>
+        <DocumentRefsContext.Provider value={refs}>
+          {children}
+        </DocumentRefsContext.Provider>
+      </DocumentActionsContext.Provider>
+    </DocumentStateContext.Provider>
   );
 }
 
-function useDocumentContextOrThrow(): DocumentContextValue {
-  const ctx = useContext(DocumentContext);
-  if (ctx === null) {
+function requireDocumentContext<T>(
+  ctxValue: T | null,
+  consumerName: string,
+): T {
+  if (ctxValue === null) {
     throw new Error(
-      "DocumentContext consumer used outside <DocumentProvider>. Wrap the " +
-        "editor surface in <DocumentProvider> before rendering components " +
-        "that call useDocument / useDocumentState / useDocumentActions / useDocumentRefs.",
+      `DocumentContext consumer used outside <DocumentProvider>. Wrap the ` +
+        `editor surface in <DocumentProvider> before rendering components ` +
+        `that call ${consumerName}.`,
     );
   }
-  return ctx;
+  return ctxValue;
 }
 
-/** Full bundle — state + actions + refs. Convenient for EditorPage. */
+/**
+ * Full bundle — state + actions + refs. Convenient for EditorPage
+ * (which needs everything).
+ *
+ * NOTE: subscribers to this hook re-render on every state change.
+ * Components that only need a subset MUST use `useDocumentState` /
+ * `useDocumentActions` / `useDocumentRefs` to opt out of unrelated
+ * re-renders.
+ */
 export function useDocument(): DocumentContextValue {
-  return useDocumentContextOrThrow();
+  const state = requireDocumentContext(
+    useContext(DocumentStateContext),
+    "useDocument",
+  );
+  const actions = requireDocumentContext(
+    useContext(DocumentActionsContext),
+    "useDocument",
+  );
+  const refs = requireDocumentContext(
+    useContext(DocumentRefsContext),
+    "useDocument",
+  );
+  return { state, actions, refs };
 }
 
 /** State only — re-renders on any state change. */
 export function useDocumentState(): DocumentState {
-  return useDocumentContextOrThrow().state;
+  return requireDocumentContext(
+    useContext(DocumentStateContext),
+    "useDocumentState",
+  );
 }
 
-/** Actions only — stable identity. */
+/**
+ * Actions only — stable identity for the provider's lifetime, so
+ * consumers of this hook never re-render from state changes here.
+ */
 export function useDocumentActions(): DocumentActions {
-  return useDocumentContextOrThrow().actions;
+  return requireDocumentContext(
+    useContext(DocumentActionsContext),
+    "useDocumentActions",
+  );
 }
 
-/** Refs only — stable identity. */
+/**
+ * Refs only — stable identity for the provider's lifetime, so
+ * consumers of this hook never re-render from state changes here.
+ */
 export function useDocumentRefs(): DocumentRefs {
-  return useDocumentContextOrThrow().refs;
+  return requireDocumentContext(
+    useContext(DocumentRefsContext),
+    "useDocumentRefs",
+  );
 }

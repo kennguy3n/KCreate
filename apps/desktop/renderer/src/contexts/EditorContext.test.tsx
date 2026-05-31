@@ -31,6 +31,9 @@ import {
   DEFAULT_VIEWPORT,
   EditorProvider,
   useEditor,
+  useEditorActions,
+  useEditorRefs,
+  useEditorState,
 } from "./EditorContext";
 
 interface Captured {
@@ -210,12 +213,9 @@ describe("EditorContext", () => {
       nodeId: "n1",
       rect: { x: 0, y: 0, width: 10, height: 10 },
       style: {
-        family: "Arial",
-        size: 16,
-        weight: 400,
-        italic: false,
-        align: "left" as const,
-        fill: [0, 0, 0, 1] as [number, number, number, number],
+        fontFamily: "Arial",
+        fontSize: 16,
+        lineHeight: 1.25,
       },
       initialContent: "hi",
     };
@@ -241,6 +241,71 @@ describe("EditorContext", () => {
     } finally {
       console.error = origError;
     }
+  });
+
+  it("actions-only consumers do NOT re-render on state changes", () => {
+    // Architectural invariant from the context split (PR #35 / Devin
+    // Review #0003 + #0004): a consumer that subscribes only to the
+    // actions context must stay inert through state churn — the
+    // actions value has stable identity for the provider's lifetime,
+    // so React skips the consumer entirely.
+    //
+    // This is what unblocks `EditorDocumentBridge` from re-rendering
+    // (and re-mounting `DocumentProvider`) every time selection /
+    // status / viewport / FPS change.
+    let actionsRenderCount = 0;
+    let refsRenderCount = 0;
+    let stateRenderCount = 0;
+    let capturedActions: ReturnType<typeof useEditorActions> | null = null;
+
+    function ActionsConsumer(): JSX.Element {
+      actionsRenderCount += 1;
+      const a = useEditorActions();
+      capturedActions = a;
+      return <div data-testid="actions-only" />;
+    }
+    function RefsConsumer(): JSX.Element {
+      refsRenderCount += 1;
+      useEditorRefs();
+      return <div data-testid="refs-only" />;
+    }
+    function StateConsumer(): JSX.Element {
+      stateRenderCount += 1;
+      useEditorState();
+      return <div data-testid="state-only" />;
+    }
+
+    render(
+      <EditorProvider>
+        <ActionsConsumer />
+        <RefsConsumer />
+        <StateConsumer />
+      </EditorProvider>,
+    );
+
+    expect(actionsRenderCount).toBe(1);
+    expect(refsRenderCount).toBe(1);
+    expect(stateRenderCount).toBe(1);
+
+    // Drive a sequence of unrelated state changes. The state
+    // consumer should re-render for each; the actions/refs
+    // consumers must stay at exactly one render.
+    act(() => {
+      capturedActions!.setStatusMessage("first");
+    });
+    act(() => {
+      capturedActions!.setViewport({ panX: 10, panY: 20, zoom: 1.5 });
+    });
+    act(() => {
+      capturedActions!.setSelectedIds(["a"]);
+    });
+    act(() => {
+      capturedActions!.setFps(60);
+    });
+
+    expect(stateRenderCount).toBeGreaterThan(1);
+    expect(actionsRenderCount).toBe(1);
+    expect(refsRenderCount).toBe(1);
   });
 
   it("honours initialMode / initialTool provider props", () => {

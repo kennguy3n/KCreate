@@ -131,7 +131,34 @@ interface EditorContextValue {
   refs: EditorRefs;
 }
 
-const EditorContext = createContext<EditorContextValue | null>(null);
+/**
+ * Why three distinct contexts instead of one bundle?
+ *
+ * React's context API only supports whole-value subscription:
+ * `useContext(ctx)` re-renders the consumer whenever the provider's
+ * `value` prop is referentially different. A naive `{ state, actions,
+ * refs }` bundle means EVERY consumer re-renders on EVERY state
+ * change — even consumers that only read `actions` (which are
+ * intentionally stable for the provider's whole lifetime).
+ *
+ * `EditorDocumentBridge` is the canonical victim: it only needs
+ * `setStatusMessage` (an action) but would re-render on every
+ * status / viewport / FPS / selection change otherwise. The bridge
+ * sits between `EditorProvider` and `DocumentProvider`, so each
+ * spurious re-render also re-mounts `DocumentProvider`'s subtree.
+ *
+ * Splitting into `EditorStateContext` / `EditorActionsContext` /
+ * `EditorRefsContext` lets each consumer subscribe only to what it
+ * actually reads. The Provider builds all three values once;
+ * `actions` and `refs` get stable identity (empty-deps `useMemo`),
+ * so consumers of those contexts NEVER re-render from this
+ * provider. Consumers that mix concerns can still call
+ * `useEditor()` to get the merged bundle — that hook subscribes to
+ * all three, which is the original behaviour.
+ */
+const EditorStateContext = createContext<EditorState | null>(null);
+const EditorActionsContext = createContext<EditorActions | null>(null);
+const EditorRefsContext = createContext<EditorRefs | null>(null);
 
 export interface EditorProviderProps {
   /**
@@ -279,50 +306,94 @@ export function EditorProvider({
     ],
   );
 
-  const value = useMemo<EditorContextValue>(
-    () => ({ state, actions, refs }),
-    [state, actions, refs],
-  );
-
+  // Provider nests are equivalent semantically to a single
+  // multi-value `<Context.Provider>` chain; React's reconciler
+  // optimises away no-op subtrees for stable values, so the actions
+  // and refs providers never invalidate their consumers.
   return (
-    <EditorContext.Provider value={value}>{children}</EditorContext.Provider>
+    <EditorStateContext.Provider value={state}>
+      <EditorActionsContext.Provider value={actions}>
+        <EditorRefsContext.Provider value={refs}>
+          {children}
+        </EditorRefsContext.Provider>
+      </EditorActionsContext.Provider>
+    </EditorStateContext.Provider>
   );
 }
 
 /**
- * Internal helper — throws if called outside an `<EditorProvider>`.
- * All public hooks below use this so missing-provider errors fail
- * loudly at the call site instead of silently returning `null` and
+ * Internal helper — throws if the requested context is missing.
+ * Used by every public hook so missing-provider errors fail loudly
+ * at the call site instead of silently returning `null` and
  * crashing later when a property is destructured.
  */
-function useEditorContextOrThrow(): EditorContextValue {
-  const ctx = useContext(EditorContext);
-  if (ctx === null) {
+function requireEditorContext<T>(
+  ctxValue: T | null,
+  consumerName: string,
+): T {
+  if (ctxValue === null) {
     throw new Error(
-      "EditorContext consumer used outside <EditorProvider>. Wrap the " +
-        "editor surface in <EditorProvider> before rendering components " +
-        "that call useEditor / useEditorState / useEditorActions / useEditorRefs.",
+      `EditorContext consumer used outside <EditorProvider>. Wrap the ` +
+        `editor surface in <EditorProvider> before rendering components ` +
+        `that call ${consumerName}.`,
     );
   }
-  return ctx;
+  return ctxValue;
 }
 
-/** Full bundle — state + actions + refs. Convenient for EditorPage. */
+/**
+ * Full bundle — state + actions + refs. Convenient for EditorPage
+ * (which needs everything) and tests that want to assert on the
+ * whole value at once.
+ *
+ * NOTE: subscribers to this hook re-render on every state change.
+ * Components that only need a subset MUST use `useEditorState` /
+ * `useEditorActions` / `useEditorRefs` to opt out of unrelated
+ * re-renders. The `EditorDocumentBridge` host wrapper is the
+ * canonical example.
+ */
 export function useEditor(): EditorContextValue {
-  return useEditorContextOrThrow();
+  const state = requireEditorContext(
+    useContext(EditorStateContext),
+    "useEditor",
+  );
+  const actions = requireEditorContext(
+    useContext(EditorActionsContext),
+    "useEditor",
+  );
+  const refs = requireEditorContext(
+    useContext(EditorRefsContext),
+    "useEditor",
+  );
+  return { state, actions, refs };
 }
 
 /** State only — re-renders on any state change. */
 export function useEditorState(): EditorState {
-  return useEditorContextOrThrow().state;
+  return requireEditorContext(
+    useContext(EditorStateContext),
+    "useEditorState",
+  );
 }
 
-/** Actions only — stable identity, never causes re-renders by itself. */
+/**
+ * Actions only — stable identity for the provider's lifetime, so
+ * consumers of this hook never re-render from state changes here.
+ */
 export function useEditorActions(): EditorActions {
-  return useEditorContextOrThrow().actions;
+  return requireEditorContext(
+    useContext(EditorActionsContext),
+    "useEditorActions",
+  );
 }
 
-/** Refs only — stable identity, never causes re-renders by itself. */
+/**
+ * Refs only — stable identity for the provider's lifetime, so
+ * consumers of this hook never re-render from state changes here.
+ */
 export function useEditorRefs(): EditorRefs {
-  return useEditorContextOrThrow().refs;
+  return requireEditorContext(
+    useContext(EditorRefsContext),
+    "useEditorRefs",
+  );
 }

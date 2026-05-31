@@ -3161,6 +3161,38 @@ pub fn canvas_path_boolean(op_wire: &str, source_ids: Vec<Uuid>) -> Result<Vec<U
         ws.selection.retain(|sel| sel != id);
     }
 
+    // 4b. Adopt the result ids into the selection. The boolean is a
+    //     destructive replace: the result nodes ARE the new
+    //     selection semantically, and the host's `refreshTree()`
+    //     pulls selection back from the bridge via
+    //     `canvas.getSelection()` (see `refreshSelection` in
+    //     `apps/desktop/renderer/src/pages/EditorPage.tsx`). If the
+    //     bridge omitted this step, the JS-side `setSelectedIds`
+    //     would get clobbered to `[]` on the next refresh because
+    //     step 4 above already removed the source ids and nothing
+    //     would have re-populated the slot.
+    //
+    //     We do this on the bridge side (rather than asking the host
+    //     to call `setSelection(resultIds)` after the IPC returns)
+    //     for two reasons:
+    //
+    //     * Atomicity. Graph mutation and selection mutation happen
+    //       under the same write lock, so an interleaved
+    //       `getSelection()` from another caller never observes the
+    //       "sources removed, results not yet selected" intermediate
+    //       state.
+    //     * Caller-path robustness. A future caller of
+    //       `canvas_path_boolean` (the MCP tool surface, a plugin
+    //       via the extended ABI, or a future scripting API) gets a
+    //       correct selection state without having to know the
+    //       JS-side "create-then-select" convention used by
+    //       `canvas_create_rect` / `canvas_create_path`. Those
+    //       creators deliberately leave selection to the host
+    //       because rapid-fire creation (e.g. a paste flurry) often
+    //       wants to keep the existing selection; pathfinder's
+    //       destructive-replace semantic has no such ambiguity.
+    ws.selection.extend(result_ids.iter().copied());
+
     // 5. Record one undoable operation. `before_patch` carries the
     //    full source node snapshots (renderer re-inserts them on
     //    undo); `after_patch` carries the result snapshots (renderer
@@ -3199,28 +3231,31 @@ pub fn canvas_path_boolean(op_wire: &str, source_ids: Vec<Uuid>) -> Result<Vec<U
 /// path produces line-only shapes, so curve attributes don't need
 /// to be reconciled across inputs.
 fn merge_paths(paths: &[kcreate_vector::VectorPath]) -> kcreate_vector::VectorPath {
-    // Caller contract: `paths` is always non-empty. The chain of
-    // invariants that keeps it true is documented at the top of
-    // `canvas_path_boolean` — `acc` is seeded with one element and
-    // the fold short-circuits on `pair.is_empty()` before
-    // reassigning. The `debug_assert!` makes the contract explicit
-    // at the callee so any future caller that violates it surfaces
-    // immediately under `cargo test` instead of panicking on the
-    // subsequent `paths[0]` index.
-    debug_assert!(
-        !paths.is_empty(),
-        "merge_paths requires at least one input path",
-    );
+    // Total function: defined for every `&[VectorPath]` including
+    // the empty slice. Returns an empty `VectorPath` on empty input
+    // rather than panicking, so a release-mode caller that violates
+    // the documented "non-empty" expectation degrades to a
+    // well-defined no-op instead of an out-of-bounds index panic.
+    //
+    // The downstream call site (`canvas_path_boolean`) seeds `acc`
+    // with one element and only reassigns from a non-empty `pair`,
+    // so this branch is unreachable in practice — but anchoring the
+    // safe path at the type system makes the contract robust to
+    // future refactors that might add a new call site without
+    // re-deriving the invariant.
+    let Some(first) = paths.first() else {
+        return kcreate_vector::VectorPath::new(Vec::new());
+    };
     if paths.len() == 1 {
-        return paths[0].clone();
+        return first.clone();
     }
     let mut segments: Vec<kcreate_vector::PathSegment> = Vec::new();
     for p in paths {
         segments.extend(p.commands.iter().copied());
     }
     let mut out = kcreate_vector::VectorPath::new(segments);
-    out.closed = paths[0].closed;
-    out.fill_rule = paths[0].fill_rule;
+    out.closed = first.closed;
+    out.fill_rule = first.fill_rule;
     out
 }
 
@@ -12073,5 +12108,82 @@ mod tests {
             "got {err:?}"
         );
         project_close();
+    }
+
+    /// Regression test for Devin Review #0001 (round 2) on PR #38.
+    ///
+    /// After a successful boolean, `ws.selection` must contain
+    /// exactly the new result ids — not the (now-deleted) source
+    /// ids, and not the empty slot left by step 4 of
+    /// `canvas_path_boolean`. The host's `refreshTree()` pulls
+    /// selection back via `document_get_selection()`, so if the
+    /// bridge state were stale here the JS-side `setSelectedIds`
+    /// would be clobbered to `[]` on the next refresh and the user
+    /// would lose their selection right after the gesture.
+    #[test]
+    #[serial]
+    fn canvas_path_boolean_sets_selection_to_result_ids() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("bool_sel", dir.path()).expect("create");
+        let a = insert_square(0.0, 0.0, 10.0);
+        let b = insert_square(5.0, 5.0, 10.0);
+        // Seed the selection with the source ids — this mirrors the
+        // real host gesture (user selects A + B, then clicks Union).
+        document_set_selection(vec![a, b]).expect("seed selection");
+        let result_ids = canvas_path_boolean("union", vec![a, b]).expect("union");
+        assert!(!result_ids.is_empty(), "union produced ≥1 result shape");
+        let after = document_get_selection().expect("get selection");
+        // The new selection IS the result ids, in iteration order,
+        // and contains neither of the (now-deleted) source ids.
+        assert_eq!(after, result_ids, "selection adopts result ids");
+        assert!(
+            !after.contains(&a) && !after.contains(&b),
+            "deleted source ids are gone from selection: {after:?}"
+        );
+        project_close();
+    }
+
+    /// Regression test for Devin Review #0004 (round 1, edited) on
+    /// PR #38: `merge_paths` is now a total function — defined for
+    /// the empty slice — so a future caller that violates the
+    /// "non-empty" expectation degrades to a well-defined empty
+    /// path instead of a release-mode out-of-bounds panic.
+    ///
+    /// This pin guards the type-system fix against future
+    /// refactors that might re-introduce a `paths[0]` index without
+    /// first proving the slice is non-empty.
+    #[test]
+    fn merge_paths_handles_empty_slice_without_panic() {
+        // The function is private; the test lives in the same
+        // module so we can call it directly. Empty input yields an
+        // empty path with the default fill rule, not a panic.
+        let out = super::merge_paths(&[]);
+        assert!(out.commands.is_empty(), "empty input → empty segments");
+        assert!(
+            !out.closed,
+            "empty path is not closed (no contour to close)"
+        );
+
+        // Single-element input is short-circuited to a clone.
+        let p = kcreate_vector::VectorPath::new(square_path_segments(0.0, 0.0, 10.0));
+        let cloned = super::merge_paths(std::slice::from_ref(&p));
+        assert_eq!(cloned.commands, p.commands, "len=1 → clone");
+
+        // Multi-element input concatenates segments and inherits
+        // the first input's `closed` + `fill_rule`.
+        let a = {
+            let mut v = kcreate_vector::VectorPath::new(square_path_segments(0.0, 0.0, 10.0));
+            v.closed = true;
+            v
+        };
+        let b = kcreate_vector::VectorPath::new(square_path_segments(20.0, 0.0, 10.0));
+        let merged = super::merge_paths(&[a.clone(), b.clone()]);
+        assert_eq!(
+            merged.commands.len(),
+            a.commands.len() + b.commands.len(),
+            "concatenates segment lists"
+        );
+        assert!(merged.closed, "merged inherits first input's closed flag");
     }
 }

@@ -144,6 +144,12 @@ const defaultsByMethod: Record<string, () => unknown> = {
   // can assert on the bridge call's call list + `setSelection`
   // follow-up without wiring a custom override every time.
   "canvas.createPath": () => "default-path-id",
+  // Phase B2 — Pathfinder boolean. `pathBoolean(op, sourceIds) =>
+  // string[]` mirrors the preload entry shape; stub returns a
+  // single deterministic result id so tests for `PathfinderPanel`
+  // can pin both the call list (op + sourceIds passed verbatim)
+  // and the re-selection follow-up without per-test wiring.
+  "canvas.pathBoolean": () => ["default-bool-result-id"],
   "canvas.createText": () => "default-text-id",
   setLayerColor: () => undefined,
 };

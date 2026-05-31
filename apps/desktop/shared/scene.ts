@@ -102,6 +102,19 @@ export type PathSegmentWire =
     }
   | { op: "close" };
 
+/**
+ * Phase B2 — Pathfinder boolean op wire token.
+ *
+ * Mirrors `kcreate_vector::BooleanOp`'s `serde(rename_all =
+ * "snake_case")` discriminator. The bridge parses these as plain
+ * strings (`canvas_path_boolean(op: &str, ...)`) — adding a new
+ * variant means updating this union AND the bridge's match arm
+ * AND `kcreate_vector::BooleanOp`, kept in lockstep by
+ * `apply_patch_commands_match_dispatcher_arms` and the bridge's
+ * own `PathBooleanError::InvalidOp` test.
+ */
+export type PathBooleanOp = "union" | "subtract" | "intersect" | "exclude";
+
 export interface SceneObject {
   id: number;
   z: number;
@@ -1034,6 +1047,38 @@ export interface CanvasBridge {
     closed: boolean,
     name?: string | null,
   ): Promise<string>;
+  /**
+   * Phase B2 — Pathfinder gesture.
+   *
+   * Apply a polygon boolean (`union` / `subtract` / `intersect` /
+   * `exclude`) across the given source vector layers, replacing
+   * them with the resulting shape(s). Destructive: the source
+   * nodes are removed and replaced by one or more new
+   * `VectorLayer` nodes that inherit the *first* source's style.
+   *
+   * `sourceIds` must contain at least two ids, each pointing at a
+   * `VectorLayer` with a vector path payload. The bridge folds
+   * left-to-right via `kcreate_vector::boolean_operation` (matches
+   * Inkscape's `Path > Union` semantics — see
+   * `canvas_path_boolean` for the full contract).
+   *
+   * Returns the freshly-inserted result node ids in iteration
+   * order so the renderer can re-select them all and preserve the
+   * boolean's shape ordering.
+   *
+   * Throws (each maps to a distinct `PathfinderPanel` toast):
+   * - `PathBoolean::InvalidOp` — `op` is not one of the four
+   *   wire tokens.
+   * - `PathBoolean::TooFewSources` — fewer than 2 ids.
+   * - `PathBoolean::SourceNotFound` — id does not match any node.
+   * - `PathBoolean::SourceNotVector` — source is not a VectorLayer.
+   * - `PathBoolean::SourceMissingPath` — source has no path metadata.
+   * - `PathBoolean::Vector` — `boolean_operation` rejected the
+   *   inputs (e.g. polyline flattening produced no contour).
+   * - `PathBoolean::EmptyResult` — op produced zero shapes (e.g.
+   *   `intersect` on non-overlapping inputs).
+   */
+  pathBoolean(op: PathBooleanOp, sourceIds: string[]): Promise<string[]>;
   createText(
     parentId: string | null,
     x: number,

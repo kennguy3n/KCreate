@@ -91,7 +91,21 @@ fn map_doc_err(e: DocumentBridgeError) -> NapiError {
         // error handler can attach the offending payload to a
         // useful toast rather than the generic "internal error"
         // path that GenericFailure would route through.
-        | DocumentBridgeError::CreatePath(_) => Status::InvalidArg,
+        | DocumentBridgeError::CreatePath(_)
+        // Phase B2 Pathfinder: every `PathBooleanError` sub-variant
+        // (`InvalidOp`, `TooFewSources`, `SourceNotFound`,
+        // `SourceNotVector`, `SourceMissingPath`, `Vector`,
+        // `EmptyResult`) is a caller-side validation failure or a
+        // structurally-invalid input the renderer can recover from
+        // — same category as `CreatePath`. Surface as `InvalidArg`
+        // so the renderer's typed-toast path fires instead of the
+        // generic "internal error" route. Without this arm the
+        // variant fell through to the `_ => GenericFailure`
+        // catch-all below, which contradicted the `PathBoolean`
+        // doc-comment in `document.rs:140-146` that explicitly
+        // mirrors the `CreatePath` routing rationale. Devin Review
+        // BUG_0001 (round 4) on PR #38.
+        | DocumentBridgeError::PathBoolean(_) => Status::InvalidArg,
         // Marketplace errors that come from a user-supplied template
         // path / id are user-correctable (bad path, wrong id, duplicate
         // install) — surface as InvalidArg so the renderer can show
@@ -1588,6 +1602,30 @@ pub fn canvas_create_path(
     };
     document::canvas_create_path(parent, &segments_json, closed, name)
         .map(|u| u.to_string())
+        .map_err(map_doc_err)
+}
+
+/// Apply a polygon boolean (`union` / `subtract` / `intersect` /
+/// `exclude`) across `source_ids`, replacing the source vector
+/// layers with the resulting shapes. Pathfinder panel entry point.
+///
+/// `op` is the lowercase wire token; `source_ids` is a string list
+/// of source node UUIDs (2+ required). Returns the freshly
+/// inserted result node ids in iteration order so the renderer can
+/// re-select them all and preserve the boolean's shape ordering.
+///
+/// Wire shape mirrors `apps/desktop/shared/scene.ts::PathBooleanOp`.
+/// Records ONE undoable `canvas_path_boolean` operation; see
+/// [`document::canvas_path_boolean`] for the undo/redo contract.
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn canvas_path_boolean(op: String, source_ids: Vec<String>) -> NapiResult<Vec<String>> {
+    let ids: Vec<uuid::Uuid> = source_ids
+        .iter()
+        .map(|s| parse_uuid(s))
+        .collect::<NapiResult<_>>()?;
+    document::canvas_path_boolean(&op, ids)
+        .map(|out| out.into_iter().map(|u| u.to_string()).collect())
         .map_err(map_doc_err)
 }
 
@@ -5738,4 +5776,93 @@ pub fn preferences_load() -> NapiResult<String> {
 #[allow(clippy::needless_pass_by_value)]
 pub fn preferences_save(prefs_json: String) -> NapiResult<()> {
     phase10::preferences_save(&prefs_json).map_err(map_doc_err)
+}
+
+#[cfg(test)]
+mod tests {
+    //! Unit coverage for the thin N-API marshalling layer.
+    //!
+    //! Anything that requires the renderer / project workspace
+    //! singletons lives in `state.rs` / `document.rs` / cross-crate
+    //! `kcreate_tests` and uses `serial_test`. The cases here are
+    //! pure-data: they exercise the error-mapping discipline
+    //! (`map_doc_err`) without touching global state, so they can
+    //! run in parallel with the rest of the workspace tests.
+    use super::*;
+    use crate::document::{DocumentBridgeError, PathBooleanError};
+    use kcreate_core::node::NodeType;
+    use uuid::Uuid;
+
+    /// Every `PathBooleanError` sub-variant must surface as
+    /// `Status::InvalidArg`, not `Status::GenericFailure`.
+    ///
+    /// The renderer's typed-toast dispatch in `PathfinderPanel.tsx`
+    /// keys on the N-API status — `InvalidArg` routes to the per-cause
+    /// path ("select at least two vector layers", "boolean op produced
+    /// no output ...") and `GenericFailure` routes to the catch-all
+    /// "internal error" toast. Falling through the `_` arm would
+    /// silently regress the user-facing error UX even though the
+    /// Rust-side error type and message are unchanged.
+    ///
+    /// Pins the fix for Devin Review BUG_0001 (round 4) on PR #38 and
+    /// guards against a future variant being added to `PathBooleanError`
+    /// without an accompanying update to `map_doc_err` — if any new
+    /// sub-variant ever lands without coverage here, the compile-time
+    /// `match` exhaustiveness below will fail to typecheck.
+    #[test]
+    fn map_doc_err_routes_every_path_boolean_variant_to_invalid_arg() {
+        let sample = Uuid::nil();
+        let variants: Vec<PathBooleanError> = vec![
+            PathBooleanError::InvalidOp("xor".into()),
+            PathBooleanError::TooFewSources(1),
+            PathBooleanError::SourceNotFound(sample),
+            PathBooleanError::SourceNotVector {
+                id: sample,
+                got: NodeType::TextLayer,
+            },
+            PathBooleanError::SourceMissingPath(sample),
+            PathBooleanError::Vector(kcreate_vector::VectorBooleanError::EmptyPath),
+            PathBooleanError::EmptyResult,
+        ];
+
+        // Compile-time exhaustiveness: forces this test to be updated
+        // (and `map_doc_err` re-audited) any time a new variant is
+        // added to `PathBooleanError`. The closure walks every
+        // variant via a non-wildcard `match`; if a new variant is
+        // added without being listed here the file fails to compile.
+        let exhaustiveness_audit = |v: &PathBooleanError| match v {
+            PathBooleanError::InvalidOp(_)
+            | PathBooleanError::TooFewSources(_)
+            | PathBooleanError::SourceNotFound(_)
+            | PathBooleanError::SourceNotVector { .. }
+            | PathBooleanError::SourceMissingPath(_)
+            | PathBooleanError::Vector(_)
+            | PathBooleanError::EmptyResult => (),
+        };
+        for v in &variants {
+            exhaustiveness_audit(v);
+        }
+
+        for variant in variants {
+            let label = format!("{variant:?}");
+            let err = map_doc_err(DocumentBridgeError::PathBoolean(variant));
+            assert_eq!(
+                err.status,
+                Status::InvalidArg,
+                "{label} must map to InvalidArg so the renderer's typed-toast path fires",
+            );
+        }
+    }
+
+    /// `CreatePath` already mapped correctly — keep the test alongside
+    /// the `PathBoolean` one so the pair stays paired in the test
+    /// surface, matching how the two arms sit adjacent in
+    /// `map_doc_err`.
+    #[test]
+    fn map_doc_err_routes_create_path_to_invalid_arg() {
+        let err = map_doc_err(DocumentBridgeError::CreatePath(
+            crate::document::CreatePathError::Empty,
+        ));
+        assert_eq!(err.status, Status::InvalidArg);
+    }
 }

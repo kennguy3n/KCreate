@@ -23,6 +23,7 @@ import { InlineTextEditor } from "../components/InlineTextEditor";
 import { CursorOverlay } from "../components/CursorOverlay";
 import { LeftPanel } from "../components/LeftPanel";
 import { PageNavigator } from "../components/PageNavigator";
+import { PathfinderPanel } from "../components/PathfinderPanel";
 import { PenOverlay } from "../components/PenOverlay";
 import { RightPanel } from "../components/RightPanel";
 import { SelectionOverlay } from "../components/SelectionOverlay";
@@ -513,6 +514,23 @@ function EditorPageInner({
       }
     },
     [refreshTree, focusArtboard, setStatusMessage],
+  );
+
+  /**
+   * Phase B2 — re-select the new boolean result(s) and refresh
+   * the document tree after a successful Pathfinder gesture.
+   * Memoised so `PathfinderPanel`'s internal `useCallback` for the
+   * click dispatcher has a stable identity across `EditorPage`
+   * re-renders — matches the stability discipline `onStatus`
+   * already has via the `setStatusMessage` setter (Devin Review
+   * #0003 on PR #38).
+   */
+  const handlePathfinderApplied = useCallback(
+    (resultIds: string[]) => {
+      setSelectedIds(resultIds);
+      void refreshTree();
+    },
+    [setSelectedIds, refreshTree],
   );
 
   const handleDuplicateArtboard = useCallback(
@@ -1840,6 +1858,25 @@ function EditorPageInner({
             viewport={viewport}
             width={CANVAS_WIDTH}
             height={CANVAS_HEIGHT}
+          />
+          {/*
+            Phase B2 — Pathfinder boolean-op panel. Floating
+            pill at the bottom-centre of the canvas with the
+            four boolean ops (Union / Subtract / Intersect /
+            Exclude). The panel renders `null` when fewer than
+            two `VectorLayer` nodes are selected, so it costs
+            zero DOM weight in the (common) inactive case.
+            On success it pushes the new result ids back into
+            the selection and refreshes the tree, matching the
+            "destructive replace" semantics the bridge
+            implements (sources are removed, results take
+            their place).
+          */}
+          <PathfinderPanel
+            selectedIds={selectedIds}
+            nodes={nodes}
+            onStatus={setStatusMessage}
+            onApplied={handlePathfinderApplied}
           />
           {/*
             Phase 7 Task 14 — remote-peer selection outlines. Coloured

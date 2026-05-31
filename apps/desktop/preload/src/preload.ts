@@ -976,6 +976,19 @@ const canvas: CanvasBridge = {
       name ?? null,
     )) as string;
   },
+  async pathBoolean(op, sourceIds): Promise<string[]> {
+    // Pathfinder gesture: the renderer hands us the lowercase op
+    // token + the source-id selection in iteration order
+    // (z-bottom-first). Bridge re-validates length (>=2) and
+    // node-type (VectorLayer) so a future caller bypassing the UI
+    // gate still fails cleanly. Returns the new result node ids
+    // in shape-emission order so the panel can re-select them.
+    return (await ipcRenderer.invoke(
+      "kcreate/canvas/pathBoolean",
+      op,
+      sourceIds,
+    )) as string[];
+  },
   async createText(
     parentId,
     x,

@@ -454,6 +454,18 @@ export interface Bridge {
     closed: boolean,
     name: string | null,
   ): string;
+  /**
+   * Phase B2 (Pathfinder): apply a polygon boolean across the
+   * given source vector layers, replacing them with the result(s).
+   *
+   * `op` is the lowercase wire token (`"union"` / `"subtract"` /
+   * `"intersect"` / `"exclude"`); `sourceIds` is a 2+ length list
+   * of source node UUIDs. Returns the freshly-inserted result
+   * node ids in iteration order.
+   *
+   * Wire mirror: `apps/desktop/shared/scene.ts::PathBooleanOp`.
+   */
+  canvasPathBoolean(op: string, sourceIds: string[]): string[];
   canvasCreateText(
     parentId: string | null,
     x: number,

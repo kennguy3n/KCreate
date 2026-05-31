@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 import { clampTabToAvailable } from "../lib/rightPanelTabs";
 import type {
@@ -236,6 +236,33 @@ export function RightPanel({
     const next = clampTabToAvailable(tab, TABS);
     if (next !== tab) setTab(next);
   }, [TABS, tab]);
+  // Keep the active pill scrolled into view in the single-row strip.
+  //
+  // Devin Review on `3007b71` (PR #33) pointed out that with the
+  // strip now scrollable, a clamp triggered by a mode transition
+  // could leave the newly-active pill off-screen if the user had
+  // previously scrolled. Same hazard applies to programmatic
+  // `setTab` callers (header pills, future deep-link handlers) and
+  // to the case where a user clicks a partially-visible pill near
+  // the strip edge — the pill is now highlighted but only half
+  // its body is in the viewport.
+  //
+  // The ref attaches *only* to the pill whose id matches the
+  // active `tab` (see the `<button ref={...}>` callback below).
+  // That means we never hold references to inactive DOM nodes,
+  // and React handles ref re-targeting on each render. `block`
+  // and `inline: "nearest"` keep the call cheap when the pill is
+  // already fully visible — the browser short-circuits with no
+  // scroll. Instant (`behavior: "auto"`) avoids any animation
+  // overlap with the mode-transition repaint.
+  const activePillRef = useRef<HTMLButtonElement | null>(null);
+  useEffect(() => {
+    activePillRef.current?.scrollIntoView({
+      behavior: "auto",
+      block: "nearest",
+      inline: "nearest",
+    });
+  }, [tab]);
   // Subscribe to the advisory edit-lock roster so panels can grey
   // out controls (and the right-panel header can render a "Locked
   // by …" pill) when the current selection is held by a remote
@@ -303,6 +330,14 @@ export function RightPanel({
             aria-selected={tab === t.id}
             title={t.label}
             onClick={() => setTab(t.id)}
+            // Only the active pill carries the ref — React assigns
+            // refs during commit, so on tab change the previous
+            // pill's `ref={null}` clears `activePillRef.current`
+            // before the new pill's `ref={el => ...}` writes the
+            // new node. The `useEffect` on `[tab]` then reads the
+            // up-to-date ref and scrolls. No ref Map, no per-pill
+            // ref objects.
+            ref={t.id === tab ? activePillRef : null}
             style={{
               padding: "4px 10px",
               fontSize: 11,

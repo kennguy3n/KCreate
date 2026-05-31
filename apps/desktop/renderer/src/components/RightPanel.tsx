@@ -1,5 +1,6 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
+import { clampTabToAvailable } from "../lib/rightPanelTabs";
 import type {
   FillStyle,
   FlexLayout,
@@ -203,6 +204,65 @@ export function RightPanel({
     [showAccessibility, showInteraction, showPreflight, showColor],
   );
   const [tab, setTab] = useState<RightPanelTab>("properties");
+  // Clamp the active tab back into the visible strip whenever the
+  // editor `mode` transition removes the entry we were on. Without
+  // this, switching from `design` (Accessibility visible) to
+  // `vector` (Accessibility gone) leaves `tab === "accessibility"`
+  // but no matching pill in the strip and no matching `tab === …`
+  // branch in the render block — the right panel goes blank until
+  // the user clicks any other pill. Devin Review surfaced this on
+  // PR #31 round 3 (`RightPanel.tsx:205`); the round-3 reply
+  // declined as "pre-existing UX quirk" and noted the proper fix
+  // is a clamping pass. This is that fix.
+  //
+  // The effect only writes when the clamp actually changes value —
+  // `clampTabToAvailable` returns `tab` itself when it's still in
+  // the strip, so the common case is a single equality check and
+  // no state write. Trigger surface is the dep array `[TABS, tab]`:
+  //
+  //   - `TABS` identity changes once per mode transition (the
+  //     `useMemo` above is keyed on the mode-derived booleans), so
+  //     mode flips fire the effect exactly once.
+  //   - `tab` changes on every user pill click. In that case the
+  //     clicked tab is always already in `TABS`, so the clamp is a
+  //     no-op single-pass `for` loop with an early `return current`
+  //     and no `setTab` call — fast path, no re-render.
+  //
+  // `tab` must stay in the deps for the React exhaustive-deps rule
+  // and to avoid a stale-closure read of the previous tab during
+  // back-to-back mode transitions. The no-op guard keeps the
+  // tab-click path cheap.
+  useEffect(() => {
+    const next = clampTabToAvailable(tab, TABS);
+    if (next !== tab) setTab(next);
+  }, [TABS, tab]);
+  // Keep the active pill scrolled into view in the single-row strip.
+  //
+  // Devin Review on `3007b71` (PR #33) pointed out that with the
+  // strip now scrollable, a clamp triggered by a mode transition
+  // could leave the newly-active pill off-screen if the user had
+  // previously scrolled. Same hazard applies to programmatic
+  // `setTab` callers (header pills, future deep-link handlers) and
+  // to the case where a user clicks a partially-visible pill near
+  // the strip edge — the pill is now highlighted but only half
+  // its body is in the viewport.
+  //
+  // The ref attaches *only* to the pill whose id matches the
+  // active `tab` (see the `<button ref={...}>` callback below).
+  // That means we never hold references to inactive DOM nodes,
+  // and React handles ref re-targeting on each render. `block`
+  // and `inline: "nearest"` keep the call cheap when the pill is
+  // already fully visible — the browser short-circuits with no
+  // scroll. Instant (`behavior: "auto"`) avoids any animation
+  // overlap with the mode-transition repaint.
+  const activePillRef = useRef<HTMLButtonElement | null>(null);
+  useEffect(() => {
+    activePillRef.current?.scrollIntoView({
+      behavior: "auto",
+      block: "nearest",
+      inline: "nearest",
+    });
+  }, [tab]);
   // Subscribe to the advisory edit-lock roster so panels can grey
   // out controls (and the right-panel header can render a "Locked
   // by …" pill) when the current selection is held by a remote
@@ -221,12 +281,44 @@ export function RightPanel({
         flexDirection: "column",
       }}
     >
+      {/*
+        Tab strip layout — Devin Review PR #31 round 5 surfaced the
+        problem (RightPanel.tsx:233): 14 icon+label pills inside a
+        300px-wide aside wrapped to 3–4 vertical rows, eating screen
+        real estate the panels below should own. Round-5 reply
+        sketched three mitigations (scrollable strip, overflow menu,
+        icon-only mode); this commit lands the scrollable strip,
+        which is the lowest-disruption option:
+
+          - Every pill stays full icon+label, so discoverability for
+            the always-on Phase 8 surfaces (Constraints, Tokens,
+            Publish, Encryption) survives — those names don't have
+            obvious icon glyphs and an icon-only mode would force
+            users to hover-and-wait for the tooltip on every glance.
+          - One row + horizontal scroll matches the pattern VSCode,
+            Figma, and Chrome devtools use for crowded panel tabs,
+            so the affordance is already learned by the target user.
+          - `flexShrink: 0` on each pill prevents the "all pills
+            squished to illegibility" failure mode that a naive
+            `whiteSpace: nowrap` parent would otherwise allow when
+            the browser tries to compress before scrolling.
+          - `scrollbarWidth: "thin"` keeps the native scrollbar
+            informative but ~6px tall instead of the default ~12px,
+            so it doesn't dominate vertically. WebKit's overlay
+            scrollbar already auto-hides; Firefox honours `thin`.
+
+        The lock pill (LockBanner) and content panels below are
+        unchanged — only the strip's wrap-vs-scroll behaviour was
+        crowding.
+      */}
       <div
         style={{
           display: "flex",
-          flexWrap: "wrap",
           gap: 2,
           padding: `${spacing.sm}px ${spacing.sm}px 0`,
+          overflowX: "auto",
+          overflowY: "hidden",
+          scrollbarWidth: "thin",
         }}
         role="tablist"
       >
@@ -238,6 +330,14 @@ export function RightPanel({
             aria-selected={tab === t.id}
             title={t.label}
             onClick={() => setTab(t.id)}
+            // Only the active pill carries the ref — React assigns
+            // refs during commit, so on tab change the previous
+            // pill's `ref={null}` clears `activePillRef.current`
+            // before the new pill's `ref={el => ...}` writes the
+            // new node. The `useEffect` on `[tab]` then reads the
+            // up-to-date ref and scrolls. No ref Map, no per-pill
+            // ref objects.
+            ref={t.id === tab ? activePillRef : null}
             style={{
               padding: "4px 10px",
               fontSize: 11,
@@ -250,6 +350,15 @@ export function RightPanel({
               display: "inline-flex",
               alignItems: "center",
               gap: 4,
+              // Keep each pill at its natural width — without
+              // `flexShrink: 0` the flex container would try to
+              // compress pills before scrolling, producing a row of
+              // illegible truncated labels. Forcing pills to their
+              // intrinsic size means overflow always becomes a
+              // horizontal scroll (the intended affordance) rather
+              // than a degraded layout.
+              flexShrink: 0,
+              whiteSpace: "nowrap",
             }}
           >
             <Icon name={t.icon} size={12} />

@@ -60,7 +60,7 @@ The HomePage renders with eight tinted-square Lucide icon badges
 
 ### 2. Click `Logo / Icon / Brand Kit`
 
-The editor opens on the 1024×1024 `Logo` artboard with **14 named seed
+The editor opens on the 1024×1024 `Logo` artboard with **12 named seed
 nodes** already laid down by `BRAND_RESOLVER.apply()`:
 
 - `Brand title` (64pt, espresso)
@@ -231,7 +231,7 @@ budget invariant.
 | RightPanel tab strip       | Text-only labels                           | Icon + label on every tab (Preflight, Color, Constraints, …) |
 | Export batch presets       | Unlabelled rows                            | `globe` / `share` / `grid-2x2` / `printer` / `code` icons    |
 | Editor first-paint         | Blank artboard                             | Resolver-seeded canvas (named nodes + Brewline palette)      |
-| Brand template content     | None                                       | 14-node brand kit (title, tagline, 4 swatches, logo)          |
+| Brand template content     | None                                       | 12-node brand kit (title, tagline, 4 swatches + 4 labels, logo + caption) |
 | Social template content    | None                                       | 5-node Instagram layout (background, band, headline, body, accent) |
 | Print template content     | None                                       | 6-node A4 layout (header bar, title, body block, two paragraphs, footer) |
 | App-UI template content    | None                                       | 11-node app-shell (background, rail, header + title, 3 tiles + headings) |

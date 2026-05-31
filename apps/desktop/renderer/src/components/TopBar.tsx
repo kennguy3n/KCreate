@@ -122,7 +122,7 @@ export function TopBar(props: TopBarProps): JSX.Element {
         style={pillButton(false)}
         aria-label="Back to home"
       >
-        <span style={iconRow()}>
+        <span style={ICON_ROW_STYLE}>
           <Icon name="arrow-left" size={14} />
           Home
         </span>
@@ -209,7 +209,7 @@ export function TopBar(props: TopBarProps): JSX.Element {
         <Icon name={themeId === "dark" ? "sun" : "moon"} size={14} />
       </button>
       <button type="button" onClick={onExport} style={pillButton(true)}>
-        <span style={iconRow()}>
+        <span style={ICON_ROW_STYLE}>
           <Icon name="download" size={14} />
           Export
         </span>
@@ -266,10 +266,19 @@ function toolButton(active: boolean): React.CSSProperties {
 /// align the icon to the label without leaving an awkward baseline
 /// gap. Centralised here so every icon+label pill in the TopBar uses
 /// the same vertical-centering rule.
-function iconRow(): React.CSSProperties {
-  return {
-    display: "inline-flex",
-    alignItems: "center",
-    gap: 6,
-  };
-}
+///
+/// Hoisted to a module-level constant (rather than the
+/// `pillButton`/`modeTab`/`toolButton` factory-function pattern used
+/// elsewhere in this file) because it takes zero arguments and the
+/// returned object is identical for every call site. Allocating a
+/// fresh style object on every render would defeat React's reference
+/// equality on the `style` prop and force the underlying DOM node to
+/// rewrite inline styles on every parent re-render even when nothing
+/// changed. The factory functions above genuinely need to remain
+/// functions because their output varies by argument (`primary`,
+/// `active`, `disabled`).
+const ICON_ROW_STYLE: React.CSSProperties = {
+  display: "inline-flex",
+  alignItems: "center",
+  gap: 6,
+};

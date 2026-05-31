@@ -67,8 +67,9 @@ coloured, deterministically-positioned starter nodes.
 
 ### Resolvers shipped
 
-- `BRAND_RESOLVER` — brand kit (14 nodes: title, tagline, four
-  palette swatches with labels, logo placeholder + caption).
+- `BRAND_RESOLVER` — brand kit (12 nodes: title, tagline, four
+  palette swatches with four matching labels, logo placeholder +
+  caption).
 - `SOCIAL_RESOLVER` — Instagram post (5 nodes: cream background,
   burnt-orange headline band, headline, body copy, sage accent).
 - `PRINT_RESOLVER` — A4 print layout (6 nodes: espresso header bar,

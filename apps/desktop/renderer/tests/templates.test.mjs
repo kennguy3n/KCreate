@@ -380,6 +380,56 @@ test("BRAND resolver lays out cleanly on the actual 1024\u00d71024 brand preset"
   );
 });
 
+// BRAND_RESOLVER originally set `swatchHeight = swatchWidth` (square
+// tile), which fits cleanly on the shipped 1024\u00d71024 brand preset
+// but overlaps the logo placeholder on wide artboards. On 1920\u00d71080:
+// swatchWidth = 400, swatchY = 486, label baseline \u2248 922, logo top =
+// 658 \u2192 264px of label/logo overlap. Devin Review surfaced this on
+// commit 55afb7b. The fix clamps `swatchHeight` to the available
+// vertical budget between `swatchY` and the logo top (minus a label
+// + safety reserve). This test exercises the 1920\u00d71080 stress case
+// and asserts the swatch row + its labels never collide with the
+// logo placeholder, regardless of artboard aspect ratio.
+test("BRAND resolver clamps swatchHeight so labels never overlap the logo on a wide artboard", async (t) => {
+  const { templateResolverFor } = await loadResolvers();
+  const calls = installRecorder(t);
+  const ctx = { x: 0, y: 0, width: 1920, height: 1080 };
+  await templateResolverFor("brand").apply(ctx);
+  const nodes = nodesFromCalls(calls);
+  const named = new Map(
+    [...nodes.values()]
+      .map((n) => [nameOf(n), n])
+      .filter(([n]) => n !== null),
+  );
+  const swatch = named.get("Palette / Espresso");
+  const swatchLabel = named.get("Swatch label / Espresso");
+  const logo = named.get("Logo placeholder");
+  assert.ok(swatch, "missing 'Palette / Espresso' rect for overlap check");
+  assert.ok(swatchLabel, "missing 'Swatch label / Espresso' text for overlap check");
+  assert.ok(logo, "missing 'Logo placeholder' rect for overlap check");
+  // Swatch row bottom must clear the logo top.
+  const swatchBottom = swatch.create.y + swatch.create.h;
+  const logoTop = logo.create.y;
+  assert.ok(
+    swatchBottom <= logoTop,
+    `swatch row bottom ${swatchBottom} > logo top ${logoTop} (overlap)`,
+  );
+  // Label baseline (text y is its top; reserve 20px for the glyph
+  // height to match the resolver's `labelHeight` budget) must also
+  // clear the logo top.
+  const labelBottom = swatchLabel.create.y + 20;
+  assert.ok(
+    labelBottom <= logoTop,
+    `label bottom ${labelBottom} > logo top ${logoTop} (overlap)`,
+  );
+  // And the swatch must still have positive height (the clamp does
+  // not collapse the row to zero on this stress case).
+  assert.ok(
+    swatch.create.h > 0,
+    `swatch height ${swatch.create.h} must be > 0 on 1920\u00d71080`,
+  );
+});
+
 // APP_UI_RESOLVER computes `tileHeight = Math.max(0, tileBottom -
 // tileTop)` so a future surface applying it to an extremely short
 // artboard doesn't pass a negative height into `createRect`. The

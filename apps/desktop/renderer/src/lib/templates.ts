@@ -188,8 +188,39 @@ const BRAND_RESOLVER: TemplateResolver = {
     const swatchWidth = Math.floor(
       (swatchRowWidth - swatchGap * 3) / 4,
     );
-    const swatchHeight = swatchWidth;
     const swatchY = ay + Math.round(ah * 0.45);
+
+    // `swatchHeight` is the *vertical* budget for one swatch tile. The
+    // resolver was originally designed for the shipped 1024×1024 brand
+    // preset where `ah ≈ aw` and a square tile (`swatchHeight =
+    // swatchWidth`) fits between `swatchY` and the logo placeholder
+    // anchored at `ay + ah - margin - logoSize`. On a wider artboard
+    // (e.g. 1920×1080 with `swatchWidth = 400`, `swatchY = 486`,
+    // `logoY = 658`) the square would extend down to y=886 and collide
+    // with the logo block at y=658..965 — a real visual regression
+    // surfaced by Devin Review on commit 55afb7b.
+    //
+    // Clamp to the available vertical budget so the swatch row + its
+    // labels never collide with the logo placeholder, regardless of
+    // artboard aspect ratio. The reserved space below the swatch row
+    // accounts for the 16px gap before the label (`swatchY +
+    // swatchHeight + 16`), the label's ~20px text height, and an 8px
+    // safety margin between the label baseline and the logo top.
+    // `Math.max(0, …)` mirrors the `APP_UI_RESOLVER` tileHeight clamp
+    // (line 396) so a degenerate short artboard never passes a
+    // negative height into `createRect`.
+    const logoSize = Math.round(aw * 0.16);
+    const logoTopRelative = ah - margin - logoSize;
+    const swatchTopRelative = Math.round(ah * 0.45);
+    const labelGap = 16;
+    const labelHeight = 20;
+    const labelToLogoSafety = 8;
+    const availableSwatchHeight =
+      logoTopRelative - swatchTopRelative - labelGap - labelHeight - labelToLogoSafety;
+    const swatchHeight = Math.max(
+      0,
+      Math.min(swatchWidth, availableSwatchHeight),
+    );
     const swatches: ReadonlyArray<{ label: string; hex: string }> = [
       { label: "Espresso", hex: BRAND_PALETTE.espresso },
       { label: "Cream", hex: BRAND_PALETTE.cream },
@@ -225,10 +256,12 @@ const BRAND_RESOLVER: TemplateResolver = {
 
     // Logo placeholder mark anchored to the bottom-left. Rendered
     // as a filled circle (espresso) with a light ring so it reads
-    // as a logomark target rather than a content rectangle.
-    const logoSize = Math.round(aw * 0.16);
+    // as a logomark target rather than a content rectangle. `logoSize`
+    // was hoisted above the swatch row to participate in the
+    // `availableSwatchHeight` clamp; reuse it here so the geometry
+    // stays in lockstep.
     const logoX = ax + margin;
-    const logoY = ay + ah - margin - logoSize;
+    const logoY = ay + logoTopRelative;
     await rect(
       logoX,
       logoY,

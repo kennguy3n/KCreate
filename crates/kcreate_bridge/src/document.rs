@@ -3033,6 +3033,39 @@ pub fn canvas_path_boolean(op_wire: &str, source_ids: Vec<Uuid>) -> Result<Vec<U
             ));
         }
     };
+    // Deduplicate source ids while preserving the caller's iteration
+    // order (first occurrence wins). Boolean ops over the same shape
+    // are mathematical no-ops — `A ∪ A == A`, `A \ A == ∅`,
+    // `A ∩ A == A`, `A ⊕ A == ∅` — so doing the fold on duplicate
+    // inputs would either waste work (union/intersect) or produce a
+    // confusing empty-result error (subtract/exclude) for a gesture
+    // the caller obviously didn't intend that way.
+    //
+    // The renderer's selection model is a Set, so the normal UI flow
+    // can't produce duplicates — this guard exists for the same
+    // reason the explicit `TooFewSources` / `SourceNotVector` checks
+    // do: future callers (MCP tool surface, plugin via extended ABI,
+    // future scripting API) can hand us any `Vec<Uuid>` and we must
+    // behave sensibly without crashing or wasting work. Without
+    // dedup, `[a, a]` resolved the same node twice in the validation
+    // loop, folded `union(A, A) = A`, then called `remove_node(a)`
+    // twice — the second call returned `None` and was silently
+    // ignored. Functionally correct but wasteful and easy to misread
+    // when debugging via the operation log.
+    //
+    // We dedup BEFORE the `< 2` check so `[a, a, a]` is rejected as
+    // `TooFewSources(1)` rather than incorrectly proceeding as if
+    // three distinct sources were passed. The renderer's `onStatus`
+    // toast becomes "boolean op requires at least 2 source layers,
+    // got 1" — accurate after dedup. Devin Review ANALYSIS_0003
+    // (round 5) on PR #38.
+    let source_ids: Vec<Uuid> = {
+        let mut seen: HashSet<Uuid> = HashSet::with_capacity(source_ids.len());
+        source_ids
+            .into_iter()
+            .filter(|id| seen.insert(*id))
+            .collect()
+    };
     if source_ids.len() < 2 {
         return Err(DocumentBridgeError::PathBoolean(
             PathBooleanError::TooFewSources(source_ids.len()),
@@ -12141,6 +12174,96 @@ mod tests {
             !after.contains(&a) && !after.contains(&b),
             "deleted source ids are gone from selection: {after:?}"
         );
+        project_close();
+    }
+
+    /// Regression test for Devin Review ANALYSIS_0003 (round 5) on
+    /// PR #38: duplicate source ids in `canvas_path_boolean` must
+    /// be deduplicated (first occurrence wins) before the
+    /// `TooFewSources` count check, so a future caller (MCP /
+    /// plugin / scripting API) that passes `[a, a, b]` gets a
+    /// correct two-distinct-shapes fold instead of wasting work
+    /// resolving `a` twice and silently double-removing it from
+    /// the graph, AND a caller that passes `[a, a]` (all dupes)
+    /// gets a clean `TooFewSources(1)` error with the accurate
+    /// post-dedup count instead of being allowed to proceed as if
+    /// two distinct sources were passed.
+    #[test]
+    #[serial]
+    fn canvas_path_boolean_dedupes_duplicate_source_ids() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("bool_dup", dir.path()).expect("create");
+        let a = insert_square(0.0, 0.0, 10.0);
+        let b = insert_square(5.0, 5.0, 10.0);
+        // Pass `a` three times interleaved with `b`. After dedup
+        // this reduces to `[a, b]` — the exact same input the
+        // `_union_merges_overlapping_squares` test uses — so the
+        // result must match: a single connected union shape.
+        let result_ids =
+            canvas_path_boolean("union", vec![a, a, b, a]).expect("dedup-then-union ok");
+        assert!(
+            !result_ids.is_empty(),
+            "union produced at least one result shape"
+        );
+
+        // After the gesture, the source nodes are gone (each
+        // removed exactly once — without dedup, `remove_node(a)`
+        // would have been called three times, with the second and
+        // third calls silently returning `None`). The bridge
+        // selection now contains exactly the result ids.
+        let guard = slot().read();
+        let ws = guard.as_ref().expect("ws");
+        assert!(
+            ws.project.document.get_node(a).is_none(),
+            "source a removed once, cleanly"
+        );
+        assert!(
+            ws.project.document.get_node(b).is_none(),
+            "source b removed once, cleanly"
+        );
+        assert_eq!(
+            ws.selection, result_ids,
+            "selection adopts result ids (no source remnants)"
+        );
+    }
+
+    /// Regression test for Devin Review ANALYSIS_0003 (round 5)
+    /// on PR #38, edge case: a `Vec<Uuid>` consisting entirely of
+    /// duplicates of the same id must be rejected as
+    /// `TooFewSources` with the **deduplicated** count (1), not
+    /// the raw input length. This is the load-bearing reason we
+    /// dedup BEFORE the `< 2` check rather than after — `[a, a]`
+    /// passing the count check then folding `union(A, A) = A`
+    /// would be a silently-degenerate gesture.
+    #[test]
+    #[serial]
+    fn canvas_path_boolean_all_duplicates_rejected_as_too_few_sources() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("bool_all_dup", dir.path()).expect("create");
+        let a = insert_square(0.0, 0.0, 10.0);
+        for raw_len in [2usize, 3, 5] {
+            let ids: Vec<Uuid> = std::iter::repeat_n(a, raw_len).collect();
+            let err = canvas_path_boolean("union", ids).expect_err("all-dupes rejected");
+            assert!(
+                matches!(
+                    err,
+                    DocumentBridgeError::PathBoolean(PathBooleanError::TooFewSources(1))
+                ),
+                "raw_len={raw_len} must dedup to 1 and report TooFewSources(1), got {err:?}"
+            );
+        }
+        // The shape itself must still be intact — the early
+        // rejection happens BEFORE the write-guard is taken, so
+        // nothing in the graph should have changed.
+        let guard = slot().read();
+        let ws = guard.as_ref().expect("ws");
+        assert!(
+            ws.project.document.get_node(a).is_some(),
+            "source untouched after early-rejected dedup gesture"
+        );
+        drop(guard);
         project_close();
     }
 

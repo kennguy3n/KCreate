@@ -1328,6 +1328,25 @@ function EditorPageInner({
   );
   useShortcuts(shortcutHandlers);
 
+  // Wrap `setStatusMessage` in a plain `(msg: string) => void` closure
+  // before handing it to the state machine. `setStatusMessage` is
+  // `Dispatch<SetStateAction<string | null>>`, which accepts both a
+  // plain string AND a functional updater (`prev => string | null`).
+  // The hook only ever calls `onError(string)`, so the assignment is
+  // currently type-safe via function parameter contravariance — but
+  // any future drift inside the hook (e.g. accidentally passing an
+  // `Error` object whose value happens to be callable, or a closure
+  // captured for some other purpose) would be silently interpreted
+  // as a functional updater by React rather than a string. Narrowing
+  // the prop boundary to `(msg: string) => void` here makes that
+  // drift a compile error instead of a runtime surprise. Mirrors the
+  // same defensive wrapper used by `EditorDocumentBridge` above.
+  const onToolStateMachineError = useCallback(
+    (msg: string): void => {
+      setStatusMessage(msg);
+    },
+    [setStatusMessage],
+  );
   // Pointer-event state machine. Owns the (Idle | Pan | Move | Create)
   // discriminated-union state, the canvas pointer handler, and the
   // bridge side effects (hit-test, snap query, moveNode,
@@ -1347,7 +1366,7 @@ function EditorPageInner({
     setSelectedIds,
     setViewport,
     setSnapGuides,
-    onError: setStatusMessage,
+    onError: onToolStateMachineError,
     onAfterCommit: refreshTree,
   });
   const onCanvasPointer = toolStateMachine.onCanvasPointer;

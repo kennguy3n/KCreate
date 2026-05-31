@@ -40,6 +40,7 @@ import type {
 } from "../../../shared/scene";
 import { sample as sampleEasing } from "../lib/EasingEngine";
 import { colors, radius, spacing } from "../styles/tokens";
+import { errorMessage } from "../lib/errorMessage";
 
 export interface PrototypePlayerProps {
   open: boolean;
@@ -977,9 +978,7 @@ function negate(percent: string): string {
   return `-${percent}`;
 }
 
-function errorMessage(e: unknown): string {
-  return e instanceof Error ? e.message : String(e);
-}
+
 
 const overlayStyle: React.CSSProperties = {
   position: "fixed",

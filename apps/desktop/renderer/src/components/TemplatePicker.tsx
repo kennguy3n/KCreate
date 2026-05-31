@@ -19,6 +19,7 @@ import type {
   TemplateCategory,
 } from "../../../shared/scene";
 import { colors, font, radius, spacing } from "../styles/tokens";
+import { errorMessage } from "../lib/errorMessage";
 
 export interface TemplatePickerProps {
   /** Controls visibility. Parent owns the open/closed state. */
@@ -479,10 +480,7 @@ function sectionTint(kind: string): string {
   }
 }
 
-function errorMessage(e: unknown): string {
-  if (e instanceof Error) return e.message;
-  return String(e);
-}
+
 
 // ---------------------------------------------------------------------
 // Styles

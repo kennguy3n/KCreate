@@ -25,6 +25,7 @@ import type {
   Transition,
 } from "../../../shared/scene";
 import { colors, radius, spacing } from "../styles/tokens";
+import { errorMessage } from "../lib/errorMessage";
 
 export interface InteractionPanelProps {
   selected: NodeInfo | null;
@@ -606,9 +607,7 @@ function describeAction(
   }
 }
 
-function errorMessage(e: unknown): string {
-  return e instanceof Error ? e.message : String(e);
-}
+
 
 const containerStyle: React.CSSProperties = {
   display: "flex",

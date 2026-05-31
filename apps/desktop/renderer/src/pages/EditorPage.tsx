@@ -1,4 +1,4 @@
-import type { MouseEvent as ReactMouseEvent } from "react";
+import type { MouseEvent as ReactMouseEvent, ReactNode } from "react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import {
@@ -6,6 +6,18 @@ import {
   type AnnotationOverlayHandle,
 } from "../components/AnnotationOverlay";
 import { CanvasHost, type ViewportState } from "../components/CanvasHost";
+import {
+  DEFAULT_VIEWPORT,
+  EditorProvider,
+  useEditor,
+  useEditorActions,
+  type InlineTextEditState,
+  type ToolId,
+} from "../contexts/EditorContext";
+import {
+  DocumentProvider,
+  useDocument,
+} from "../contexts/DocumentContext";
 import { ConflictToast } from "../components/ConflictToast";
 import { InlineTextEditor } from "../components/InlineTextEditor";
 import { CursorOverlay } from "../components/CursorOverlay";
@@ -18,7 +30,6 @@ import { TemplatePicker } from "../components/TemplatePicker";
 import { KeyboardShortcutsPanel } from "../components/KeyboardShortcutsPanel";
 import {
   TopBar,
-  type EditorMode,
   toolsForMode,
   defaultPanelForMode,
 } from "../components/TopBar";
@@ -29,31 +40,27 @@ import { ResponsivePreview } from "../components/ResponsivePreview";
 import { PrototypePlayer } from "../components/PrototypePlayer";
 import type {
   ArtboardInfo,
-  ArtboardPreset,
-  ComponentInfo,
-  DocumentStatus,
   FlexLayout,
   GridLayout,
   NodeInfo,
   ProjectInfo,
-  ResourceLimits,
-  Scene,
   SnapGuide,
-  TextStyleWire,
 } from "../../../shared/scene";
 import { LowResourceBanner } from "../components/LowResourceBanner";
 import { useShortcuts } from "../shortcuts/useShortcuts";
 import type { ShortcutHandlers } from "../shortcuts/useShortcuts";
 import { colors, font, spacing } from "../styles/tokens";
+import { errorMessage } from "../lib/errorMessage";
 
 export interface EditorPageProps {
   project: ProjectInfo;
   onBackHome: () => void;
 }
 
-/// Active drawing/selection tool. The selected tool drives both the
-/// canvas cursor and the click→action wiring.
-export type ToolId = "select" | "rect" | "ellipse" | "line" | "text";
+/// Active drawing/selection tool. Re-exported from EditorContext for
+/// callers that imported `ToolId` from EditorPage in the past — the
+/// canonical definition now lives in `../contexts/EditorContext`.
+export type { ToolId } from "../contexts/EditorContext";
 
 const CANVAS_WIDTH = 1024;
 const CANVAS_HEIGHT = 640;
@@ -67,18 +74,10 @@ const CANVAS_HEIGHT = 640;
 // component body only ever reads it.
 const CLIPBOARD_ENVELOPE_HEADER = "kcreate:clipboard/v1\n";
 
-const DEFAULT_VIEWPORT: ViewportState = { panX: 0, panY: 0, zoom: 1 };
-
 /// Snap threshold in world units. 6 px @ zoom=1 keeps snaps tight
 /// enough to feel deliberate but forgiving on a 4K display where the
 /// cursor is travelling at high pixel velocity.
 const SNAP_THRESHOLD_WORLD = 6;
-
-/// Empty scene used while we haven't yet pulled one from the bridge.
-const EMPTY_SCENE: Scene = {
-  clear_color: [0.12, 0.12, 0.14, 1.0],
-  objects: [],
-};
 
 const TOOL_CURSORS: Record<ToolId, string> = {
   select: "default",
@@ -88,64 +87,115 @@ const TOOL_CURSORS: Record<ToolId, string> = {
   text: "text",
 };
 
-// Captured at double-click time so the editor lines up with the
-// canvas glyphs underneath even if pan/zoom change while the user
-// is typing. Also used as the identity for race-safe commit
-// dismissal (see `inlineTextEditRef`).
-type InlineTextEditState = {
-  nodeId: string;
-  rect: { x: number; y: number; width: number; height: number };
-  style: TextStyleWire;
-  initialContent: string;
-};
+/**
+ * Bridge component that wires `DocumentProvider.onStatusError` to
+ * `EditorContext.setStatusMessage`. Lives between the two providers
+ * because `DocumentProvider` needs to call the editor's status
+ * setter, but `setStatusMessage` is only available inside
+ * `EditorProvider`. Mounted by the outer `EditorPage` shell below.
+ */
+function EditorDocumentBridge({
+  children,
+}: {
+  children: ReactNode;
+}): JSX.Element {
+  const { setStatusMessage } = useEditorActions();
+  // Wrap `setStatusMessage` in a plain `(msg: string) => void` closure
+  // instead of passing the `Dispatch<SetStateAction<string | null>>`
+  // setter directly. Without the wrapper, if `onStatusError` were ever
+  // invoked with a function-shaped argument (e.g. a future refactor in
+  // `DocumentContext.reportError`), the setter would silently interpret
+  // it as a functional updater. The closure narrows the signature to
+  // exactly `(msg: string) => void`, making any such drift a compile
+  // error at the call site instead of a runtime surprise. Memoised so
+  // the prop identity is stable across editor state changes (matters
+  // for `onStatusErrorRef` lockstep inside `DocumentProvider`).
+  const onStatusError = useCallback(
+    (msg: string): void => {
+      setStatusMessage(msg);
+    },
+    [setStatusMessage],
+  );
+  return (
+    <DocumentProvider onStatusError={onStatusError}>
+      {children}
+    </DocumentProvider>
+  );
+}
 
-export function EditorPage({
+/**
+ * Outer shell. Mounts the two providers, then delegates to
+ * `EditorPageInner` which reads the contexts and renders the
+ * editor surface. Splitting the shell from the body lets the body
+ * use `useEditor()` / `useDocument()` (which require being under
+ * the respective providers).
+ */
+export function EditorPage(props: EditorPageProps): JSX.Element {
+  return (
+    <EditorProvider>
+      <EditorDocumentBridge>
+        <EditorPageInner {...props} />
+      </EditorDocumentBridge>
+    </EditorProvider>
+  );
+}
+
+function EditorPageInner({
   project,
   onBackHome,
 }: EditorPageProps): JSX.Element {
-  const [mode, setMode] = useState<EditorMode>("design");
-  const [tool, setTool] = useState<ToolId>("select");
-  const [nodes, setNodes] = useState<NodeInfo[]>([]);
-  const [selectedIds, setSelectedIds] = useState<string[]>([]);
-  // Active smart-guides for the in-flight drag, in world space.
-  // Cleared on pointerup. Rendered as an SVG overlay positioned
-  // above the canvas (see the `<svg>` in the canvas pane below).
-  const [snapGuides, setSnapGuides] = useState<SnapGuide[]>([]);
-  const [statusMessage, setStatusMessage] = useState<string | null>(null);
-  const [fps, setFps] = useState<number>(0);
-  const [viewport, setViewport] = useState<ViewportState>(DEFAULT_VIEWPORT);
-  // Phase A1 — inline canvas text editor. Mounted as an absolutely
-  // positioned `<contenteditable>` over a hit-tested `TextLayer`
-  // when the user double-clicks. Stays null while the editor is
-  // dismissed; the bounds are captured in *screen space* at
-  // double-click time so the editor lines up with the canvas
-  // glyphs underneath even if pan/zoom change while the user is
-  // typing.
-  const [inlineTextEdit, setInlineTextEdit] = useState<InlineTextEditState | null>(
-    null,
-  );
-  // Identity ref for the currently-open inline text editor draft.
-  // The renderer can mount a new editor (different node, different
-  // initial content) BEFORE a prior `commitInlineTextEdit` finishes
-  // its bridge round-trip; without an identity check the late
-  // `setInlineTextEdit(null)` in the prior commit's `finally` would
-  // unmount the new editor and flash it closed. We compare the
-  // captured draft against this ref before nulling so only the
-  // commit that owns the current draft can dismiss it. Kept in
-  // lockstep with the state via the effect below.
-  const inlineTextEditRef = useRef<InlineTextEditState | null>(null);
-  useEffect(() => {
-    inlineTextEditRef.current = inlineTextEdit;
-  }, [inlineTextEdit]);
-  // The document graph lives in Rust; we only keep a sampled `Scene`
-  // snapshot here for the renderer. Phase 1 will swap this for a
-  // push-based subscription rather than periodic resync. We don't
-  // currently rebuild the scene client-side (the Rust scene_sync
-  // pushes into the renderer directly), so this is a stable empty
-  // sentinel today.
-  const [scene] = useState<Scene>(EMPTY_SCENE);
-  const [docStatus, setDocStatus] = useState<DocumentStatus | null>(null);
-  const [artboards, setArtboards] = useState<ArtboardInfo[]>([]);
+  // Editor UI / tool state lives in `EditorContext`. We destructure
+  // here so the existing local variable names in the function body
+  // continue to compile unchanged.
+  const editor = useEditor();
+  const {
+    mode,
+    tool,
+    selectedIds,
+    statusMessage,
+    viewport,
+    fps,
+    panActive,
+    snapGuides,
+    inlineTextEdit,
+  } = editor.state;
+  const {
+    setMode,
+    setTool,
+    setSelectedIds,
+    setStatusMessage,
+    setViewport,
+    setFps,
+    setPanActive,
+    setSnapGuides,
+    setInlineTextEdit,
+  } = editor.actions;
+  const { selectedIdsRef, panActiveRef, inlineTextEditRef } = editor.refs;
+
+  // Document / project mirror state lives in `DocumentContext`.
+  const documentCtx = useDocument();
+  const {
+    nodes,
+    artboards,
+    artboardPresets,
+    components,
+    docStatus,
+    resourceLimits,
+    scene,
+  } = documentCtx.state;
+  const {
+    setArtboardPresets,
+    setResourceLimits,
+    refreshStatus,
+    refreshArtboards,
+    refreshComponents,
+    refreshTree: refreshDocumentTree,
+  } = documentCtx.actions;
+  const { nodesRef, artboardsRef } = documentCtx.refs;
+
+  // Host-specific UI / modal state. These don't need to be shared
+  // with future tools so they stay as plain `useState` in the
+  // EditorPage body.
   const [prototypePlaying, setPrototypePlaying] = useState<boolean>(false);
   // Stable identity for `PrototypePlayer`'s `onClose` prop. Devin
   // Review PR #5 ANALYSIS-0004 (commit 4ee9970): the player's
@@ -161,9 +211,9 @@ export function EditorPage({
   const handlePrototypeClose = useCallback((): void => {
     setPrototypePlaying(false);
   }, []);
-  const [artboardPresets, setArtboardPresets] = useState<ArtboardPreset[]>(
-    [],
-  );
+  // `panActive` lifecycle (state + ref mirror + defense-in-depth
+  // disarm on window blur / visibilitychange) is owned by
+  // `EditorContext.EditorProvider`. The host only reads + dispatches.
   const [artboardDialogOpen, setArtboardDialogOpen] = useState(false);
   // TemplatePicker is shown automatically the first time the user
   // enters Layout mode for a given project. The sentinel below is per
@@ -171,56 +221,7 @@ export function EditorPage({
   // projects within one session re-prompts.
   const [templatePickerOpen, setTemplatePickerOpen] = useState<boolean>(false);
   const [shortcutsPanelOpen, setShortcutsPanelOpen] = useState<boolean>(false);
-  // Phase 6 Task 21-22: hold-to-pan state. `panActive` is true while
-  // the user is holding the bound Space key. We use a state (not just
-  // a ref) so the canvas cursor flips to `grab`/`grabbing` while the
-  // gesture is armed, and we mirror it into `panActiveRef` so the
-  // pointer handler (whose closure is stable across re-renders) can
-  // observe the latest value without depending on it. The keydown
-  // dispatch is gated on `event.repeat` so OS auto-repeat doesn't
-  // re-arm the gesture every frame.
-  const [panActive, setPanActive] = useState<boolean>(false);
-  const panActiveRef = useRef<boolean>(false);
-  useEffect(() => {
-    panActiveRef.current = panActive;
-  }, [panActive]);
-
-  // Defense-in-depth disarm: the hold-to-pan gesture is normally
-  // cleared by the bound keyup, but a user can lose Space-as-keyup
-  // entirely if focus leaves the document mid-hold — alt-tab to
-  // another app, click into a system dialog, drag a file from
-  // outside the window, etc. The keyup never reaches us in those
-  // cases, so we listen for window `blur` and the document's
-  // `visibilitychange` (fires on tab-switch and OS lock-screen) and
-  // clear the gesture proactively. Gated on `panActiveRef.current`
-  // so we don't fire a no-op state update on every focus change.
-  useEffect(() => {
-    const clearPan = (): void => {
-      if (panActiveRef.current) {
-        setPanActive(false);
-      }
-    };
-    const onVisibilityChange = (): void => {
-      if (typeof document !== "undefined" && document.hidden) {
-        clearPan();
-      }
-    };
-    window.addEventListener("blur", clearPan);
-    if (typeof document !== "undefined") {
-      document.addEventListener("visibilitychange", onVisibilityChange);
-    }
-    return () => {
-      window.removeEventListener("blur", clearPan);
-      if (typeof document !== "undefined") {
-        document.removeEventListener("visibilitychange", onVisibilityChange);
-      }
-    };
-  }, []);
   const [layoutPickerShownFor, setLayoutPickerShownFor] = useState<string | null>(
-    null,
-  );
-  const [components, setComponents] = useState<ComponentInfo[]>([]);
-  const [resourceLimits, setResourceLimits] = useState<ResourceLimits | null>(
     null,
   );
   const lastTickAtRef = useRef<number>(performance.now());
@@ -253,48 +254,25 @@ export function EditorPage({
   // canvas still drives a sensible paste origin.
   const lastCursorWorldRef = useRef<{ x: number; y: number } | null>(null);
 
-  /// `nodes`, `selectedIds`, and `artboards` mirrors used inside
-  /// callbacks that must stay reference-stable. We deliberately do
-  /// NOT add the corresponding state to those callbacks' deps —
-  /// re-creating the callback on every node / selection / artboard
-  /// mutation either cancels an in-flight drag (pointer handler) or
-  /// causes the `useShortcuts` window-listener pair to detach and
-  /// re-attach on every keystroke-relevant state change (clipboard
-  /// handlers). The refs are the idiomatic React workaround for
-  /// "read latest value inside a stable callback".
-  ///
-  /// The listener-churn case is the hot one: without these refs,
-  /// `handleCopy` and `handlePaste` would depend on `nodes` (and
-  /// `selectedIds`, `artboards`), so `shortcutHandlers` would rebuild
-  /// on every node mutation, which in turn drives `useShortcuts`'s
-  /// `useEffect` to detach+attach `keydown` and `keyup` on `window`.
-  /// During a 60fps drag-to-move this fires ~60 times per second
-  /// for no functional reason — every dispatch reads the current
-  /// state via the refs anyway.
-  const nodesRef = useRef<NodeInfo[]>(nodes);
-  useEffect(() => {
-    nodesRef.current = nodes;
-  }, [nodes]);
-  const selectedIdsRef = useRef<string[]>(selectedIds);
-  useEffect(() => {
-    selectedIdsRef.current = selectedIds;
-  }, [selectedIds]);
-  const artboardsRef = useRef<ArtboardInfo[]>(artboards);
-  useEffect(() => {
-    artboardsRef.current = artboards;
-  }, [artboards]);
+  // `nodes`, `selectedIds`, and `artboards` read-latest refs live in
+  // their respective contexts (`DocumentContext` / `EditorContext`).
+  // Consumers in this function body read them via the destructured
+  // names above (`nodesRef`, `selectedIdsRef`, `artboardsRef`) so
+  // the call sites are unchanged. The rationale for refs-instead-of-
+  // deps is documented on `EditorRefs` and `DocumentRefs`.
 
   const selectedId: string | null =
     selectedIds.length === 1 ? (selectedIds[0] ?? null) : null;
 
-  const refreshStatus = useCallback(async () => {
-    try {
-      const s = await window.kcreate.document.status();
-      setDocStatus(s);
-    } catch (e) {
-      setStatusMessage(`status probe failed: ${errorMessage(e)}`);
-    }
-  }, []);
+  // `refreshStatus`, `refreshArtboards`, `refreshComponents`, and
+  // `refreshDocumentTree` come from `DocumentContext.actions` and
+  // each pulls exactly one slice from the bridge. `refreshSelection`
+  // lives here because selection state belongs to `EditorContext`
+  // (cross-context orchestration), not `DocumentContext`. The
+  // composed `refreshTree` below preserves the pre-refactor
+  // sequencing (tree → status → selection → artboards → components)
+  // verbatim so undo/redo / artboard-creation / component-instance
+  // flows that depend on visibility ordering keep their semantics.
 
   const refreshSelection = useCallback(async () => {
     try {
@@ -303,40 +281,57 @@ export function EditorPage({
     } catch (e) {
       setStatusMessage(`selection probe failed: ${errorMessage(e)}`);
     }
-  }, []);
+  }, [setSelectedIds, setStatusMessage]);
 
-  const refreshArtboards = useCallback(async () => {
-    try {
-      const list = await window.kcreate.artboard.list();
-      setArtboards(list);
-    } catch (e) {
-      setStatusMessage(`artboard list failed: ${errorMessage(e)}`);
-    }
-  }, []);
-
-  const refreshComponents = useCallback(async () => {
-    try {
-      const list = await window.kcreate.component.list();
-      setComponents(list);
-    } catch (e) {
-      setStatusMessage(`component list failed: ${errorMessage(e)}`);
-    }
-  }, []);
-
+  /**
+   * Composed full-resync. Pulls the document tree, status, selection,
+   * artboards, and components in the exact sequence the pre-refactor
+   * `EditorPage` used. Returns the fetched artboards / components /
+   * tree so callers that need a freshly-fetched value for a follow-up
+   * action (e.g. `handleCreateArtboard` locating the newly-created
+   * artboard by id) can read it directly instead of double-fetching
+   * via a second IPC round-trip or racing against React's commit.
+   *
+   * Devin Review #0003 on PR #35: the prior `handleCreateArtboard`
+   * called `refreshTree()` and then `await window.kcreate.artboard.list()`
+   * a second time because the composed refresher swallowed the data
+   * `refreshArtboards()` had already pulled. Threading the data
+   * through the return value eliminates the double-fetch while
+   * preserving the side-effect semantics for callers that ignore it.
+   */
   const refreshTree = useCallback(async () => {
-    try {
-      const tree = await window.kcreate.document.getDocumentTree();
-      setNodes(tree);
-    } catch (e) {
-      setStatusMessage(`tree load failed: ${errorMessage(e)}`);
-    }
-    await refreshStatus();
+    const tree = await refreshDocumentTree();
+    const status = await refreshStatus();
     await refreshSelection();
-    await refreshArtboards();
-    await refreshComponents();
-  }, [refreshStatus, refreshSelection, refreshArtboards, refreshComponents]);
+    const artboardsList = await refreshArtboards();
+    const componentsList = await refreshComponents();
+    return {
+      tree,
+      status,
+      artboards: artboardsList,
+      components: componentsList,
+    };
+  }, [
+    refreshDocumentTree,
+    refreshStatus,
+    refreshSelection,
+    refreshArtboards,
+    refreshComponents,
+  ]);
 
-  // Initial load + on-mode-change resync.
+  // Initial-load resync. Fires once on mount because `refreshTree`'s
+  // identity is stable for the provider's lifetime (all of its
+  // transitive deps — `refreshDocumentTree`, `refreshStatus`,
+  // `refreshSelection`, `refreshArtboards`, `refreshComponents` —
+  // come from DocumentContext / EditorContext actions, both of which
+  // are memoised with empty deps so their callable identities never
+  // change).
+  //
+  // Pre-refactor this comment said "Initial load + on-mode-change
+  // resync", which was stale — mode-change reset for the active
+  // tool is handled by a separate `useEffect` further down (the one
+  // keyed on `[mode, tool, setTool]`). Devin Review #0004 on
+  // commit `5b09939` flagged the drift.
   useEffect(() => {
     void refreshTree();
   }, [refreshTree]);
@@ -401,7 +396,7 @@ export function EditorPage({
     return () => {
       cancelled = true;
     };
-  }, [project.id]);
+  }, [project.id, setStatusMessage]);
 
   useEffect(() => {
     if (mode !== "layout") return;
@@ -431,7 +426,7 @@ export function EditorPage({
         setStatusMessage(`select page failed: ${errorMessage(e)}`);
       }
     },
-    [],
+    [setSelectedIds, setStatusMessage],
   );
 
   const refreshResourceLimits = useCallback(async () => {
@@ -441,7 +436,7 @@ export function EditorPage({
     } catch (e) {
       setStatusMessage(`resource limits failed: ${errorMessage(e)}`);
     }
-  }, []);
+  }, [setStatusMessage, setResourceLimits]);
 
   const handleToggleLowResource = useCallback(
     async (enabled: boolean) => {
@@ -452,7 +447,7 @@ export function EditorPage({
         setStatusMessage(`toggle low-resource failed: ${errorMessage(e)}`);
       }
     },
-    [refreshResourceLimits],
+    [refreshResourceLimits, setStatusMessage],
   );
 
   useEffect(() => {
@@ -476,7 +471,7 @@ export function EditorPage({
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [setArtboardPresets, setStatusMessage]);
 
   // Focus the canvas viewport on an artboard with ~10% margin.
   // World→screen transform is `screen = world * zoom + pan`, so to
@@ -494,7 +489,7 @@ export function EditorPage({
     const panY = CANVAS_HEIGHT / 2 - centerWorldY * zoom;
     setViewport({ panX, panY, zoom });
     void window.kcreate.canvas.setSelection([a.id]).then(refreshSelection);
-  }, [refreshSelection]);
+  }, [refreshSelection, setViewport]);
 
   const handleCreateArtboard = useCallback(
     async (args: { name: string; width: number; height: number }) => {
@@ -505,9 +500,16 @@ export function EditorPage({
           args.width,
           args.height,
         );
-        await refreshTree();
-        const list = await window.kcreate.artboard.list();
-        setArtboards(list);
+        // Use the artboards list `refreshTree` already pulled (via
+        // `refreshArtboards` inside its cascade). Reading from the
+        // returned value instead of state / `artboardsRef.current`
+        // avoids two pitfalls: (a) a redundant second
+        // `window.kcreate.artboard.list()` IPC round-trip, and (b)
+        // a race against React's commit since the ref / state are
+        // only updated when the next render flushes — not when the
+        // `await refreshTree()` promise resolves.
+        // Devin Review #0003 on PR #35.
+        const { artboards: list } = await refreshTree();
         const created = list.find((a) => a.id === id);
         if (created) focusArtboard(created);
       } catch (e) {
@@ -516,7 +518,7 @@ export function EditorPage({
         setArtboardDialogOpen(false);
       }
     },
-    [refreshTree, focusArtboard],
+    [refreshTree, focusArtboard, setStatusMessage],
   );
 
   const handleDuplicateArtboard = useCallback(
@@ -528,7 +530,7 @@ export function EditorPage({
         setStatusMessage(`duplicate artboard failed: ${errorMessage(e)}`);
       }
     },
-    [refreshTree],
+    [refreshTree, setStatusMessage],
   );
 
   const handleResizeArtboard = useCallback(
@@ -540,7 +542,7 @@ export function EditorPage({
         setStatusMessage(`resize artboard failed: ${errorMessage(e)}`);
       }
     },
-    [refreshTree],
+    [refreshTree, setStatusMessage],
   );
 
   const handleDeleteArtboard = useCallback(
@@ -552,7 +554,7 @@ export function EditorPage({
         setStatusMessage(`delete artboard failed: ${errorMessage(e)}`);
       }
     },
-    [refreshTree],
+    [refreshTree, setStatusMessage],
   );
 
   const handleRenameArtboard = useCallback(
@@ -564,7 +566,7 @@ export function EditorPage({
         setStatusMessage(`rename artboard failed: ${errorMessage(e)}`);
       }
     },
-    [refreshTree],
+    [refreshTree, setStatusMessage],
   );
 
   // Component lifecycle handlers. Each one mirrors a single bridge
@@ -583,7 +585,7 @@ export function EditorPage({
         setStatusMessage(`create component failed: ${errorMessage(e)}`);
       }
     },
-    [selectedIds, refreshTree],
+    [selectedIds, refreshTree, setStatusMessage],
   );
 
   const handleComponentInstantiate = useCallback(
@@ -604,7 +606,7 @@ export function EditorPage({
         setStatusMessage(`instantiate component failed: ${errorMessage(e)}`);
       }
     },
-    [artboards, refreshTree],
+    [artboards, refreshTree, setStatusMessage],
   );
 
   const handleComponentAddVariant = useCallback(
@@ -616,7 +618,7 @@ export function EditorPage({
         setStatusMessage(`add variant failed: ${errorMessage(e)}`);
       }
     },
-    [refreshComponents],
+    [refreshComponents, setStatusMessage],
   );
 
   const handleComponentSwitchVariant = useCallback(
@@ -628,7 +630,7 @@ export function EditorPage({
         setStatusMessage(`switch variant failed: ${errorMessage(e)}`);
       }
     },
-    [refreshTree],
+    [refreshTree, setStatusMessage],
   );
 
   const handleComponentDetach = useCallback(
@@ -640,7 +642,7 @@ export function EditorPage({
         setStatusMessage(`detach component failed: ${errorMessage(e)}`);
       }
     },
-    [refreshTree],
+    [refreshTree, setStatusMessage],
   );
 
   const layoutHandlers = useMemo(
@@ -685,7 +687,7 @@ export function EditorPage({
         }
       },
     }),
-    [refreshTree],
+    [refreshTree, setStatusMessage],
   );
 
   // When the mode changes, snap to its default tool so the canvas
@@ -695,7 +697,7 @@ export function EditorPage({
     if (!tools.includes(tool)) {
       setTool(tools[0] ?? "select");
     }
-  }, [mode, tool]);
+  }, [mode, tool, setTool]);
 
   const selected = useMemo(
     () => nodes.find((n) => n.id === selectedId) ?? null,
@@ -722,7 +724,7 @@ export function EditorPage({
     } catch (e) {
       setStatusMessage(`undo failed: ${errorMessage(e)}`);
     }
-  }, [refreshTree]);
+  }, [refreshTree, setStatusMessage]);
 
   const handleRedo = useCallback(async () => {
     try {
@@ -731,7 +733,7 @@ export function EditorPage({
     } catch (e) {
       setStatusMessage(`redo failed: ${errorMessage(e)}`);
     }
-  }, [refreshTree]);
+  }, [refreshTree, setStatusMessage]);
 
   const handleDeleteSelected = useCallback(async () => {
     if (selectedIds.length === 0) return;
@@ -744,7 +746,7 @@ export function EditorPage({
     } catch (e) {
       setStatusMessage(`delete failed: ${errorMessage(e)}`);
     }
-  }, [selectedIds, refreshTree]);
+  }, [selectedIds, refreshTree, setStatusMessage]);
 
   const handleSelectAll = useCallback(async () => {
     try {
@@ -754,7 +756,7 @@ export function EditorPage({
     } catch (e) {
       setStatusMessage(`select all failed: ${errorMessage(e)}`);
     }
-  }, [nodes, refreshSelection]);
+  }, [nodes, refreshSelection, setStatusMessage]);
 
   const handleClearSelection = useCallback(async () => {
     try {
@@ -763,7 +765,7 @@ export function EditorPage({
     } catch (e) {
       setStatusMessage(`clear selection failed: ${errorMessage(e)}`);
     }
-  }, []);
+  }, [setSelectedIds, setStatusMessage]);
 
   // ------------------------------------------------------------------
   // Phase 6 Tasks 25-26 — node clipboard.
@@ -825,7 +827,7 @@ export function EditorPage({
     } catch (e) {
       setStatusMessage(`copy failed: ${errorMessage(e)}`);
     }
-  }, []);
+  }, [nodesRef, selectedIdsRef, setStatusMessage]);
 
   // `handlePaste` reads `selectedIds`, `nodes`, and `artboards`
   // via refs for the same listener-churn reason as `handleCopy`.
@@ -920,7 +922,7 @@ export function EditorPage({
     } catch (e) {
       setStatusMessage(`paste failed: ${errorMessage(e)}`);
     }
-  }, [refreshTree]);
+  }, [refreshTree, artboardsRef, nodesRef, selectedIdsRef, setSelectedIds, setStatusMessage]);
 
   // ------------------------------------------------------------------
   // Phase 6 Task 25 — drag-and-drop from the OS file manager.
@@ -1035,7 +1037,7 @@ export function EditorPage({
         }
       })();
     },
-    [artboards, refreshTree],
+    [artboards, refreshTree, setStatusMessage],
   );
 
   const handleSelect = useCallback(
@@ -1052,7 +1054,7 @@ export function EditorPage({
         setStatusMessage(`select failed: ${errorMessage(e)}`);
       }
     },
-    [],
+    [setStatusMessage, setSelectedIds],
   );
 
   const handleExport = useCallback(async () => {
@@ -1067,14 +1069,14 @@ export function EditorPage({
     } catch (e) {
       setStatusMessage(`export failed: ${errorMessage(e)}`);
     }
-  }, []);
+  }, [setStatusMessage]);
 
   const onFrame = useCallback(() => {
     const now = performance.now();
     const elapsed = now - lastTickAtRef.current;
     lastTickAtRef.current = now;
     if (elapsed > 0) setFps(Math.round(1000 / elapsed));
-  }, []);
+  }, [setFps]);
 
   // Periodically resync the rendered scene from the bridge so document
   // mutations (creates, moves, deletes, undo/redo) show up on the
@@ -1253,7 +1255,7 @@ export function EditorPage({
       e.preventDefault();
       setTool(next);
     },
-    [mode],
+    [mode, setTool],
   );
   const shortcutHandlers = useMemo<ShortcutHandlers>(
     () => ({
@@ -1334,16 +1336,7 @@ export function EditorPage({
         void handlePaste();
       },
     }),
-    [
-      handleUndo,
-      handleRedo,
-      handleSelectAll,
-      handleDeleteSelected,
-      handleClearSelection,
-      handleCopy,
-      handlePaste,
-      tryTool,
-    ],
+    [handleUndo, handleRedo, handleSelectAll, handleDeleteSelected, handleClearSelection, handleCopy, handlePaste, tryTool, setMode, setPanActive],
   );
   useShortcuts(shortcutHandlers);
 
@@ -1639,14 +1632,14 @@ export function EditorPage({
         })();
       }
     },
-    [tool, viewport, screenToWorld, refreshTree],
+    [tool, viewport, screenToWorld, refreshTree, nodesRef, panActiveRef, setSelectedIds, setSnapGuides, setStatusMessage, setViewport],
   );
 
   const onZoomToFit = useCallback(() => {
     // No documentBounds API yet; reset to identity. Phase 1 will compute
     // a bounding box across visible nodes.
     setViewport(DEFAULT_VIEWPORT);
-  }, []);
+  }, [setViewport]);
 
   // Imperative handle into the AnnotationOverlay. The overlay's root
   // SVG is permanently `pointer-events: none` (so it never blocks
@@ -1731,7 +1724,7 @@ export function EditorPage({
         }
       })();
     },
-    [annotationCreateActive, nodes, viewport],
+    [annotationCreateActive, nodes, viewport, inlineTextEditRef, setInlineTextEdit, setStatusMessage],
   );
 
   // Commit / cancel handlers for the inline text editor. Commit
@@ -1770,7 +1763,7 @@ export function EditorPage({
         }
       }
     },
-    [],
+    [inlineTextEditRef, setInlineTextEdit, setStatusMessage],
   );
 
   // Cancel always nulls — the user explicitly dismissed the
@@ -1778,7 +1771,7 @@ export function EditorPage({
   // one being cancelled regardless of any in-flight commit.
   const cancelInlineTextEdit = useCallback(() => {
     setInlineTextEdit(null);
-  }, []);
+  }, [setInlineTextEdit]);
 
   const handleUpdateNode = useCallback(
     async (
@@ -1794,7 +1787,7 @@ export function EditorPage({
         setStatusMessage(`update failed: ${errorMessage(err)}`);
       }
     },
-    [refreshTree],
+    [refreshTree, setStatusMessage],
   );
 
   // Right-panel content depends on the active mode (see PROPOSAL § 6).
@@ -2294,9 +2287,7 @@ export function EditorPage({
   );
 }
 
-function errorMessage(e: unknown): string {
-  return e instanceof Error ? e.message : String(e);
-}
+
 
 interface SnapGuidesOverlayProps {
   guides: SnapGuide[];

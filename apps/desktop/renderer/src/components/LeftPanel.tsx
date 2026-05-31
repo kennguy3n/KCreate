@@ -558,9 +558,9 @@ function NodeList({
                 style={iconButton(n.locked)}
               >
                 <Icon
-                name={n.locked ? "lock" : "unlock"}
-                size={14}
-              />
+                  name={n.locked ? "lock" : "unlock"}
+                  size={14}
+                />
               </button>
               <span
                 aria-label={`${n.nodeType} layer`}

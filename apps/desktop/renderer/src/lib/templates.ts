@@ -437,9 +437,15 @@ const DECK_RESOLVER: TemplateResolver = {
       "sans-serif",
       "Subtitle",
     );
-    // Two-column body for talking points.
+    // Two-column body for talking points. `colTop` already includes
+    // the artboard Y-offset (`ay`), so the closing edge of the
+    // column also has to include `ay` — otherwise a non-zero
+    // artboard origin (the bridge offsets every artboard after the
+    // first) yields a negative height. Mirrors the shape used by
+    // `APP_UI_RESOLVER` (`tileBottom = ay + ah - tileMargin`,
+    // `tileHeight = tileBottom - tileTop`).
     const colTop = ay + margin + 220;
-    const colHeight = ah - colTop - margin;
+    const colHeight = ay + ah - colTop - margin;
     const colWidth = Math.round((aw - margin * 3) / 2);
     await rect(
       ax + margin,

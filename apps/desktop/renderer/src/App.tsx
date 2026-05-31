@@ -32,6 +32,14 @@ export function App(): JSX.Element {
       const option = CREATE_OPTIONS.find((o) => o.id === jobKind);
       const preset = option?.defaultArtboard ?? null;
       if (preset) {
+        // Two stages: (1) create the artboard, (2) if that succeeded
+        // run the Track-2 template resolver to seed starter content
+        // inside it. Step (2) is gated on step (1) so a failed
+        // artboard.create can never produce orphan rect/text nodes
+        // floating at the world origin. Both stages are non-fatal —
+        // a failure leaves the user on a recoverable editor surface
+        // (blank artboard / "+ New artboard" affordance still works).
+        let artboardOk = false;
         try {
           await window.kcreate.artboard.create(
             null,
@@ -39,6 +47,7 @@ export function App(): JSX.Element {
             preset.width,
             preset.height,
           );
+          artboardOk = true;
         } catch {
           // Non-fatal: the editor's artboard panel can still create
           // one manually. The error is swallowed here because surface
@@ -47,42 +56,44 @@ export function App(): JSX.Element {
           // editor and can recover by clicking "+ New artboard".
         }
 
-        // Track 2 — seed the artboard with starter content via the
-        // template resolver registered for this card. The resolver
-        // reads the artboard's world rect off `artboard.list()` so
-        // we don't have to assume `(0, 0)` (the bridge offsets
-        // subsequent artboards). Wrapped in try/catch — a resolver
-        // failure should not block the editor from opening; the
-        // user lands on a blank artboard they can still edit.
-        try {
-          const resolver = templateResolverFor(jobKind);
-          if (resolver) {
-            const artboards = await window.kcreate.artboard.list();
-            // The artboard we just created is the most recent one
-            // for the active project. Falling back to the preset
-            // dimensions (origin 0,0) keeps the resolver running
-            // even if listing fails or returns an empty array.
-            const target =
-              artboards.find((a) => a.name === preset.name) ??
-              artboards[artboards.length - 1];
-            const ctx = target
-              ? {
-                  x: target.x,
-                  y: target.y,
-                  width: target.width,
-                  height: target.height,
-                }
-              : { x: 0, y: 0, width: preset.width, height: preset.height };
-            await resolver.apply(ctx);
-            // Push the new nodes into the renderer's scene so the
-            // editor opens on a populated canvas instead of waiting
-            // for the next event-driven sync.
-            await window.kcreate.canvas.syncScene();
+        if (artboardOk) {
+          // Track 2 — seed the artboard with starter content via the
+          // template resolver registered for this card. The resolver
+          // reads the artboard's world rect off `artboard.list()` so
+          // we don't have to assume `(0, 0)` (the bridge offsets
+          // subsequent artboards). Wrapped in try/catch — a resolver
+          // failure should not block the editor from opening; the
+          // user lands on a blank artboard they can still edit.
+          try {
+            const resolver = templateResolverFor(jobKind);
+            if (resolver) {
+              const artboards = await window.kcreate.artboard.list();
+              // The artboard we just created is the most recent one
+              // for the active project. Falling back to the preset
+              // dimensions (origin 0,0) keeps the resolver running
+              // even if listing fails or returns an empty array.
+              const target =
+                artboards.find((a) => a.name === preset.name) ??
+                artboards[artboards.length - 1];
+              const ctx = target
+                ? {
+                    x: target.x,
+                    y: target.y,
+                    width: target.width,
+                    height: target.height,
+                  }
+                : { x: 0, y: 0, width: preset.width, height: preset.height };
+              await resolver.apply(ctx);
+              // Push the new nodes into the renderer's scene so the
+              // editor opens on a populated canvas instead of waiting
+              // for the next event-driven sync.
+              await window.kcreate.canvas.syncScene();
+            }
+          } catch {
+            // Non-fatal: same rationale as the artboard.create catch
+            // above. A failed template seed should never block the
+            // editor from opening.
           }
-        } catch {
-          // Non-fatal: same rationale as the artboard.create catch
-          // above. A failed template seed should never block the
-          // editor from opening.
         }
       }
       setRoute({ kind: "editor", project });

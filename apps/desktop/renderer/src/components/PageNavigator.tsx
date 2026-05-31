@@ -28,6 +28,7 @@ import type {
   PageSizeId,
 } from "../../../shared/scene";
 import { colors, radius, spacing } from "../styles/tokens";
+import { errorMessage } from "../lib/errorMessage";
 
 export interface PageNavigatorProps {
   /** Full document tree — we filter to `nodeType === "Page"` ourselves. */
@@ -933,10 +934,7 @@ function aspectFromLayout(layout: PageLayout | null): number {
   return layout.orientation === "portrait" ? a : 1 / a;
 }
 
-function errorMessage(e: unknown): string {
-  if (e instanceof Error) return e.message;
-  return String(e);
-}
+
 
 // -----------------------------------------------------------------------------
 // Styles

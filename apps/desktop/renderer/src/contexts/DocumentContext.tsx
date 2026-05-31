@@ -43,6 +43,7 @@ import type {
   ResourceLimits,
   Scene,
 } from "../../../shared/scene";
+import { errorMessage } from "../lib/errorMessage";
 
 /**
  * Empty scene used while we haven't yet pulled one from the
@@ -70,14 +71,6 @@ const EMPTY_SCENE: Scene = (() => {
 
 /** Re-export so EditorPage can keep using the same identity. */
 export { EMPTY_SCENE };
-
-/** Local helper — mirrors the duplicated `errorMessage` used by
- * EditorPage and other renderer modules. Inlined here to avoid an
- * unrelated cross-file extraction inside the A3a refactor; a
- * dedicated cleanup is a sensible follow-up. */
-function errorMessage(e: unknown): string {
-  return e instanceof Error ? e.message : String(e);
-}
 
 /**
  * Public state surface. Field semantics match the `useState` hooks

@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 
 import type { SessionEvent, SessionLockEntry } from "../../../shared/scene";
+import { errorMessage } from "../lib/errorMessage";
 
 /**
  * Reactive view of the advisory edit-lock roster maintained by the
@@ -266,12 +267,4 @@ function acquiredAtIsNewer(candidate: string, existing: string): boolean {
   return c > e;
 }
 
-function errorMessage(e: unknown): string {
-  if (e instanceof Error) return e.message;
-  if (typeof e === "string") return e;
-  try {
-    return JSON.stringify(e);
-  } catch {
-    return String(e);
-  }
-}
+

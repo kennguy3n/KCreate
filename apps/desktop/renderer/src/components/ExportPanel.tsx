@@ -16,6 +16,7 @@ import type {
   WebpExportOptions,
 } from "../../../shared/scene";
 import { colors, radius, spacing } from "../styles/tokens";
+import { errorMessage } from "../lib/errorMessage";
 import { Icon, type IconName } from "./Icon";
 import { IconPackDialog } from "./IconPackDialog";
 
@@ -538,9 +539,7 @@ function formatExt(f: ExportFormat): string {
   return FORMATS.find((x) => x.id === f)?.ext ?? f;
 }
 
-function errorMessage(e: unknown): string {
-  return e instanceof Error ? e.message : String(e);
-}
+
 
 // Execute a single leaf inside a preset chain. Returns bytes written
 // so the caller can aggregate. SVG returns the inline string length

@@ -50,6 +50,7 @@ import { LowResourceBanner } from "../components/LowResourceBanner";
 import { useShortcuts } from "../shortcuts/useShortcuts";
 import type { ShortcutHandlers } from "../shortcuts/useShortcuts";
 import { colors, font, spacing } from "../styles/tokens";
+import { errorMessage } from "../lib/errorMessage";
 
 export interface EditorPageProps {
   project: ProjectInfo;
@@ -2286,9 +2287,7 @@ function EditorPageInner({
   );
 }
 
-function errorMessage(e: unknown): string {
-  return e instanceof Error ? e.message : String(e);
-}
+
 
 interface SnapGuidesOverlayProps {
   guides: SnapGuide[];

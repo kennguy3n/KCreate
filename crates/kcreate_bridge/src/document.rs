@@ -3002,6 +3002,17 @@ pub enum PathBooleanError {
 ///   IS the bottom object because the renderer passes the
 ///   selection in iteration order over `nodes`, which is
 ///   z-bottom-first.)
+/// * **Hierarchical sources are safe.** If source `B` is a descendant
+///   of source `A`, [`DocumentGraph::remove_node`] recursively
+///   removes `B` along with `A` (see
+///   `crates/kcreate_core/src/document.rs:438-447`); the subsequent
+///   `remove_node(B)` returns `None` and is intentionally ignored.
+///   `selection.retain` likewise no-ops on an already-absent id. No
+///   panic, no double-free. Validation (step 1) still reads `B`'s
+///   path BEFORE any mutation, so the boolean fold uses the
+///   pre-removal geometry — the descendant relationship doesn't
+///   change the math, only the cleanup. Devin Review ANALYSIS_0004
+///   (round 6) on PR #38.
 ///
 /// # Undo / redo
 ///

@@ -4900,12 +4900,19 @@ pub fn canvas_create_text(
     y: f64,
     text: String,
     font_family: String,
-    font_size: f32,
+    // f64 in, narrowed to f32 once at the TextLayerMeta use site.
+    // Mirrors the batch path (`CanvasBatchItem::Text.size: f64`) so
+    // both routes preserve caller-supplied JSON precision through the
+    // bounds maths and only narrow at the moment of writing into the
+    // (still f32) font metadata blob. AGENTS.md rule 4 — wire-format
+    // lockstep parity with the batch helper.
+    font_size: f64,
 ) -> Result<Uuid> {
+    let font_size_f32 = font_size as f32;
     let meta = crate::scene_sync::TextLayerMeta {
         text: text.clone(),
         font_family,
-        font_size,
+        font_size: font_size_f32,
     };
     let mut node = Node::new(NodeType::TextLayer, "Text");
     node.parent_id = parent_id;
@@ -4913,9 +4920,10 @@ pub fn canvas_create_text(
         x,
         y,
         // Bounds height defaults to font size; the layer panel can
-        // refine it once shaping has run.
-        width: f64::from(font_size) * (text.len().max(1) as f64) * 0.6,
-        height: f64::from(font_size),
+        // refine it once shaping has run. Use the pre-narrow f64 so
+        // exotic caller-supplied sizes survive the bounds round-trip.
+        width: font_size * (text.len().max(1) as f64) * 0.6,
+        height: font_size,
     };
     node.metadata.insert(
         crate::scene_sync::TEXT_LAYER_METADATA_KEY.to_string(),

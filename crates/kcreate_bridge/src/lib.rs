@@ -1578,7 +1578,7 @@ pub fn canvas_create_text(
         Some(s) => Some(parse_uuid(s)?),
         None => None,
     };
-    document::canvas_create_text(parent, x, y, text, font_family, font_size as f32)
+    document::canvas_create_text(parent, x, y, text, font_family, font_size)
         .map(|u| u.to_string())
         .map_err(map_doc_err)
 }

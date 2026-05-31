@@ -42,7 +42,12 @@ import {
   installKcreateStub,
   type KcreateStubHandle,
 } from "../../tests/helpers/kcreateStub";
-import { useToolStateMachine } from "./useToolStateMachine";
+import {
+  anchorsToSegments,
+  segmentsToAnchors,
+  useToolStateMachine,
+  type PenAnchor,
+} from "./useToolStateMachine";
 
 // Build a minimum-viable `NodeInfo` for snap-engine tests. The hook
 // only reads `id` and `bounds`; the other fields are required by the
@@ -1862,5 +1867,568 @@ makeNode("n1", 0, 0, 10, 10),
       );
       expect(createCall).toBeTruthy();
     });
+  });
+});
+
+describe("segmentsToAnchors", () => {
+  // The converter is the bridge from the wire-format
+  // `PathSegmentWire[]` (what the bridge returns / accepts) to
+  // the `PenAnchor[]` representation the node editor (and pen
+  // tool) work with. It's the inverse of `anchorsToSegments`,
+  // and the round-trip must be lossless for every shape the pen
+  // tool can produce so commit-after-edit doesn't corrupt the
+  // path.
+
+  it("returns empty result on empty input", () => {
+    const out = segmentsToAnchors([]);
+    expect(out.anchors).toHaveLength(0);
+    expect(out.closed).toBe(false);
+  });
+
+  it("returns empty result when first segment is not move_to", () => {
+    // Defense-in-depth: bridge rejects `MissingMoveTo`, but if
+    // a future code path slips a malformed list through, the
+    // overlay shouldn't render garbage.
+    const out = segmentsToAnchors([{ op: "line_to", x: 10, y: 10 }]);
+    expect(out.anchors).toHaveLength(0);
+    expect(out.closed).toBe(false);
+  });
+
+  it("round-trips an open line path through anchorsToSegments", () => {
+    const original: PenAnchor[] = [
+      { x: 0, y: 0, inHandle: null, outHandle: null },
+      { x: 100, y: 0, inHandle: null, outHandle: null },
+      { x: 100, y: 100, inHandle: null, outHandle: null },
+    ];
+    const segs = anchorsToSegments(original, false);
+    const { anchors, closed } = segmentsToAnchors(segs);
+    expect(closed).toBe(false);
+    expect(anchors).toEqual(original);
+  });
+
+  it("round-trips a closed corner path (square) and collapses the duplicate close anchor", () => {
+    const original: PenAnchor[] = [
+      { x: 0, y: 0, inHandle: null, outHandle: null },
+      { x: 100, y: 0, inHandle: null, outHandle: null },
+      { x: 100, y: 100, inHandle: null, outHandle: null },
+      { x: 0, y: 100, inHandle: null, outHandle: null },
+    ];
+    const segs = anchorsToSegments(original, true);
+    const { anchors, closed } = segmentsToAnchors(segs);
+    expect(closed).toBe(true);
+    // The closing line_to back to (0, 0) plus the explicit close
+    // would normally produce a phantom duplicate of the first
+    // anchor; the collapse path should drop it.
+    expect(anchors).toEqual(original);
+  });
+
+  it("round-trips a smooth cubic anchor and preserves handles", () => {
+    const original: PenAnchor[] = [
+      {
+        x: 0,
+        y: 0,
+        inHandle: null,
+        outHandle: { x: 10, y: -20 },
+      },
+      {
+        x: 100,
+        y: 0,
+        inHandle: { x: 80, y: -20 },
+        outHandle: { x: 120, y: 20 },
+      },
+      {
+        x: 200,
+        y: 0,
+        inHandle: { x: 180, y: 20 },
+        outHandle: null,
+      },
+    ];
+    const segs = anchorsToSegments(original, false);
+    const { anchors, closed } = segmentsToAnchors(segs);
+    expect(closed).toBe(false);
+    expect(anchors).toEqual(original);
+  });
+
+  it("treats a cubic with coincident handles as a corner anchor", () => {
+    // The bridge can return a cubic_to where ctrl1 == prev.end
+    // and ctrl2 == curr.end (a zero-bend cubic). The converter
+    // should collapse these to null so the next anchorsToSegments
+    // emits a line_to, preserving the user's intent ("this was a
+    // straight line").
+    const out = segmentsToAnchors([
+      { op: "move_to", x: 0, y: 0 },
+      {
+        op: "cubic_to",
+        ctrl1: { x: 0, y: 0 },
+        ctrl2: { x: 100, y: 0 },
+        end: { x: 100, y: 0 },
+      },
+    ]);
+    expect(out.anchors).toEqual([
+      { x: 0, y: 0, inHandle: null, outHandle: null },
+      { x: 100, y: 0, inHandle: null, outHandle: null },
+    ]);
+  });
+
+  it("elevates a quad_to into a cubic anchor pair using the 2/3 conversion", () => {
+    // Q[p0, c, p1] should become C[p0, p0+2/3*(c-p0),
+    // p1+2/3*(c-p1), p1]. The converter applies the same
+    // arithmetic so the resulting in/out handles read as a
+    // smooth bezier.
+    const out = segmentsToAnchors([
+      { op: "move_to", x: 0, y: 0 },
+      { op: "quad_to", ctrl: { x: 30, y: 30 }, end: { x: 60, y: 0 } },
+    ]);
+    expect(out.anchors).toHaveLength(2);
+    // First anchor's outHandle = (0,0) + 2/3 * ((30,30) - (0,0))
+    //                         = (20, 20)
+    expect(out.anchors[0]!.outHandle).toEqual({ x: 20, y: 20 });
+    // Second anchor's inHandle = (60,0) + 2/3 * ((30,30) - (60,0))
+    //                         = (40, 20)
+    expect(out.anchors[1]!.inHandle).toEqual({ x: 40, y: 20 });
+    expect(out.anchors[1]!.x).toBe(60);
+    expect(out.anchors[1]!.y).toBe(0);
+  });
+
+  it("stops at a trailing move_to (single-subpath model)", () => {
+    // Multi-subpath imports may emit a second move_to after the
+    // first subpath. The node editor handles only one subpath
+    // today, so the converter drops trailing subpaths rather
+    // than splicing them into the first.
+    const out = segmentsToAnchors([
+      { op: "move_to", x: 0, y: 0 },
+      { op: "line_to", x: 10, y: 0 },
+      { op: "move_to", x: 100, y: 100 },
+      { op: "line_to", x: 110, y: 100 },
+    ]);
+    expect(out.anchors).toEqual([
+      { x: 0, y: 0, inHandle: null, outHandle: null },
+      { x: 10, y: 0, inHandle: null, outHandle: null },
+    ]);
+  });
+});
+
+describe("node-edit state machine", () => {
+  let stub: KcreateStubHandle;
+  beforeEach(() => {
+    stub = installKcreateStub();
+  });
+
+  it("enterNodeEdit refuses when state is not idle", async () => {
+    const bundle = makeDeps({ tool: "pen" });
+    const { result } = renderHook(() =>
+      useToolStateMachine(bundle.deps),
+    );
+    const canvas = makeFakeCanvas();
+    // Drop a pen anchor so state is non-idle.
+    act(() => {
+      result.current.onCanvasPointer(
+        makeEvent(canvas, {
+          type: "pointerdown",
+          clientX: 10,
+          clientY: 10,
+        }),
+      );
+      result.current.onCanvasPointer(
+        makeEvent(canvas, {
+          type: "pointerup",
+          clientX: 10,
+          clientY: 10,
+        }),
+      );
+    });
+    expect(result.current.getState().kind).toBe("pen");
+    let ok: boolean | undefined;
+    await act(async () => {
+      ok = await result.current.enterNodeEdit("node-foo");
+    });
+    expect(ok).toBe(false);
+    expect(bundle.onError).toHaveBeenCalledWith(
+      expect.stringContaining("another gesture is in flight"),
+    );
+    expect(result.current.getState().kind).toBe("pen");
+  });
+
+  it("enterNodeEdit transitions to nodeEdit with anchors projected into world", async () => {
+    const bundle = makeDeps();
+    stub.override("canvas.pathGetSegments", () => ({
+      segments: [
+        { op: "move_to", x: 0, y: 0 },
+        { op: "line_to", x: 50, y: 0 },
+        { op: "line_to", x: 50, y: 50 },
+        { op: "close" },
+      ],
+      closed: true,
+      fillRule: "non_zero" as const,
+      translationX: 100,
+      translationY: 200,
+    }));
+    const { result } = renderHook(() =>
+      useToolStateMachine(bundle.deps),
+    );
+    let ok: boolean | undefined;
+    await act(async () => {
+      ok = await result.current.enterNodeEdit("node-square");
+    });
+    expect(ok).toBe(true);
+    const state = result.current.getState();
+    expect(state.kind).toBe("nodeEdit");
+    if (state.kind !== "nodeEdit") return;
+    expect(state.nodeId).toBe("node-square");
+    expect(state.translationX).toBe(100);
+    expect(state.translationY).toBe(200);
+    // Anchors should be projected (path-local + translation):
+    // (0,0)+(100,200)=(100,200); (50,0)+(100,200)=(150,200);
+    // (50,50)+(100,200)=(150,250). Close + duplicate-of-first
+    // collapse leaves exactly these 3 anchors.
+    expect(state.anchors).toEqual([
+      { x: 100, y: 200, inHandle: null, outHandle: null },
+      { x: 150, y: 200, inHandle: null, outHandle: null },
+      { x: 150, y: 250, inHandle: null, outHandle: null },
+    ]);
+    expect(state.closed).toBe(true);
+    expect(state.selectedAnchorIndices.size).toBe(0);
+    expect(state.drag).toBe(null);
+  });
+
+  it("enterNodeEdit surfaces bridge failure via onError and stays idle", async () => {
+    const bundle = makeDeps();
+    stub.override("canvas.pathGetSegments", () => {
+      throw new Error("node disappeared");
+    });
+    const { result } = renderHook(() =>
+      useToolStateMachine(bundle.deps),
+    );
+    let ok: boolean | undefined;
+    await act(async () => {
+      ok = await result.current.enterNodeEdit("node-missing");
+    });
+    expect(ok).toBe(false);
+    expect(bundle.onError).toHaveBeenCalledWith(
+      expect.stringContaining("node disappeared"),
+    );
+    expect(result.current.getState().kind).toBe("idle");
+  });
+
+  it("pointerdown on an anchor selects it and starts an anchor drag", async () => {
+    const bundle = makeDeps();
+    stub.override("canvas.pathGetSegments", () => ({
+      segments: [
+        { op: "move_to", x: 0, y: 0 },
+        { op: "line_to", x: 100, y: 0 },
+        { op: "line_to", x: 100, y: 100 },
+      ],
+      closed: false,
+      fillRule: "non_zero" as const,
+      translationX: 0,
+      translationY: 0,
+    }));
+    const { result } = renderHook(() =>
+      useToolStateMachine(bundle.deps),
+    );
+    await act(async () => {
+      await result.current.enterNodeEdit("n");
+    });
+    const canvas = makeFakeCanvas();
+    // Click exactly on the second anchor at world (100, 0).
+    act(() => {
+      result.current.onCanvasPointer(
+        makeEvent(canvas, {
+          type: "pointerdown",
+          clientX: 100,
+          clientY: 0,
+        }),
+      );
+    });
+    const state = result.current.getState();
+    expect(state.kind).toBe("nodeEdit");
+    if (state.kind !== "nodeEdit") return;
+    expect(Array.from(state.selectedAnchorIndices)).toEqual([1]);
+    expect(state.drag?.kind).toBe("anchor");
+    if (state.drag?.kind !== "anchor") return;
+    expect(state.drag.anchorIndex).toBe(1);
+    expect(canvas.setPointerCaptureCalls).toHaveLength(1);
+  });
+
+  it("pointermove on a selected anchor drags it to the new position", async () => {
+    const bundle = makeDeps();
+    stub.override("canvas.pathGetSegments", () => ({
+      segments: [
+        { op: "move_to", x: 0, y: 0 },
+        { op: "line_to", x: 100, y: 0 },
+      ],
+      closed: false,
+      fillRule: "non_zero" as const,
+      translationX: 0,
+      translationY: 0,
+    }));
+    const { result } = renderHook(() =>
+      useToolStateMachine(bundle.deps),
+    );
+    await act(async () => {
+      await result.current.enterNodeEdit("n");
+    });
+    const canvas = makeFakeCanvas();
+    act(() => {
+      result.current.onCanvasPointer(
+        makeEvent(canvas, {
+          type: "pointerdown",
+          clientX: 100,
+          clientY: 0,
+        }),
+      );
+      result.current.onCanvasPointer(
+        makeEvent(canvas, {
+          type: "pointermove",
+          clientX: 130,
+          clientY: 40,
+        }),
+      );
+    });
+    const state = result.current.getState();
+    if (state.kind !== "nodeEdit") {
+      throw new Error("expected nodeEdit");
+    }
+    // Anchor 1 should now be at (130, 40). Anchor 0 should be
+    // unmoved.
+    expect(state.anchors[0]).toEqual({
+      x: 0,
+      y: 0,
+      inHandle: null,
+      outHandle: null,
+    });
+    expect(state.anchors[1]).toEqual({
+      x: 130,
+      y: 40,
+      inHandle: null,
+      outHandle: null,
+    });
+    expect(state.dragMoved).toBe(true);
+  });
+
+  it("commitNodeEdit pushes anchors back through pathSetSegments and returns to idle", async () => {
+    const bundle = makeDeps();
+    stub.override("canvas.pathGetSegments", () => ({
+      segments: [
+        { op: "move_to", x: 0, y: 0 },
+        { op: "line_to", x: 100, y: 0 },
+      ],
+      closed: false,
+      fillRule: "non_zero" as const,
+      translationX: 10,
+      translationY: 20,
+    }));
+    const setCalls: Array<unknown[]> = [];
+    stub.override("canvas.pathSetSegments", (...args) => {
+      setCalls.push(args);
+      return undefined;
+    });
+    const { result } = renderHook(() =>
+      useToolStateMachine(bundle.deps),
+    );
+    await act(async () => {
+      await result.current.enterNodeEdit("n");
+    });
+    // World anchors should be (10,20) and (110,20).
+    const canvas = makeFakeCanvas();
+    act(() => {
+      result.current.onCanvasPointer(
+        makeEvent(canvas, {
+          type: "pointerdown",
+          clientX: 10,
+          clientY: 20,
+        }),
+      );
+      result.current.onCanvasPointer(
+        makeEvent(canvas, {
+          type: "pointermove",
+          clientX: 50,
+          clientY: 60,
+        }),
+      );
+      result.current.onCanvasPointer(
+        makeEvent(canvas, {
+          type: "pointerup",
+          clientX: 50,
+          clientY: 60,
+        }),
+      );
+    });
+    let ok: boolean | undefined;
+    await act(async () => {
+      ok = await result.current.commitNodeEdit();
+    });
+    expect(ok).toBe(true);
+    expect(result.current.getState().kind).toBe("idle");
+    expect(setCalls).toHaveLength(1);
+    const [nodeId, segments, closed] = setCalls[0]!;
+    expect(nodeId).toBe("n");
+    expect(closed).toBe(false);
+    // Path-local re-projection: anchor 0 moved from world
+    // (10,20) → (50,60) (dx=40, dy=40); subtracting the
+    // translation (10,20) puts it at path-local (40, 40).
+    // Anchor 1 stays at world (110,20) → path-local (100, 0).
+    expect(segments).toEqual([
+      { op: "move_to", x: 40, y: 40 },
+      { op: "line_to", x: 100, y: 0 },
+    ]);
+    expect(bundle.onAfterCommit).toHaveBeenCalledTimes(1);
+  });
+
+  it("cancelNodeEdit drops the gesture without calling pathSetSegments", async () => {
+    const bundle = makeDeps();
+    const setCalls: Array<unknown[]> = [];
+    stub.override("canvas.pathSetSegments", (...args) => {
+      setCalls.push(args);
+      return undefined;
+    });
+    const { result } = renderHook(() =>
+      useToolStateMachine(bundle.deps),
+    );
+    await act(async () => {
+      await result.current.enterNodeEdit("n");
+    });
+    expect(result.current.getState().kind).toBe("nodeEdit");
+    let cancelled: boolean | undefined;
+    act(() => {
+      cancelled = result.current.cancelNodeEdit();
+    });
+    expect(cancelled).toBe(true);
+    expect(result.current.getState().kind).toBe("idle");
+    expect(setCalls).toHaveLength(0);
+  });
+
+  it("shift-click toggles set membership in selectedAnchorIndices", async () => {
+    const bundle = makeDeps();
+    stub.override("canvas.pathGetSegments", () => ({
+      segments: [
+        { op: "move_to", x: 0, y: 0 },
+        { op: "line_to", x: 100, y: 0 },
+        { op: "line_to", x: 100, y: 100 },
+      ],
+      closed: false,
+      fillRule: "non_zero" as const,
+      translationX: 0,
+      translationY: 0,
+    }));
+    const { result } = renderHook(() =>
+      useToolStateMachine(bundle.deps),
+    );
+    await act(async () => {
+      await result.current.enterNodeEdit("n");
+    });
+    const canvas = makeFakeCanvas();
+    // Plain click on anchor 0.
+    act(() => {
+      result.current.onCanvasPointer(
+        makeEvent(canvas, {
+          type: "pointerdown",
+          clientX: 0,
+          clientY: 0,
+        }),
+      );
+      result.current.onCanvasPointer(
+        makeEvent(canvas, {
+          type: "pointerup",
+          clientX: 0,
+          clientY: 0,
+        }),
+      );
+    });
+    let state = result.current.getState();
+    if (state.kind !== "nodeEdit") throw new Error("expected nodeEdit");
+    expect(Array.from(state.selectedAnchorIndices).sort()).toEqual([0]);
+
+    // Shift-click on anchor 1: should be ADDED to selection.
+    act(() => {
+      const ev = makeEvent(canvas, {
+        type: "pointerdown",
+        clientX: 100,
+        clientY: 0,
+      });
+      // Patch shiftKey onto the synthetic event.
+      (ev as unknown as { shiftKey: boolean }).shiftKey = true;
+      result.current.onCanvasPointer(ev);
+      const upEv = makeEvent(canvas, {
+        type: "pointerup",
+        clientX: 100,
+        clientY: 0,
+      });
+      (upEv as unknown as { shiftKey: boolean }).shiftKey = true;
+      result.current.onCanvasPointer(upEv);
+    });
+    state = result.current.getState();
+    if (state.kind !== "nodeEdit") throw new Error("expected nodeEdit");
+    expect(Array.from(state.selectedAnchorIndices).sort()).toEqual([
+      0, 1,
+    ]);
+
+    // Shift-click on anchor 1 again: should be REMOVED from selection.
+    act(() => {
+      const ev = makeEvent(canvas, {
+        type: "pointerdown",
+        clientX: 100,
+        clientY: 0,
+      });
+      (ev as unknown as { shiftKey: boolean }).shiftKey = true;
+      result.current.onCanvasPointer(ev);
+    });
+    state = result.current.getState();
+    if (state.kind !== "nodeEdit") throw new Error("expected nodeEdit");
+    expect(Array.from(state.selectedAnchorIndices).sort()).toEqual([0]);
+  });
+
+  it("click in empty space clears anchor selection", async () => {
+    const bundle = makeDeps();
+    stub.override("canvas.pathGetSegments", () => ({
+      segments: [
+        { op: "move_to", x: 0, y: 0 },
+        { op: "line_to", x: 100, y: 0 },
+      ],
+      closed: false,
+      fillRule: "non_zero" as const,
+      translationX: 0,
+      translationY: 0,
+    }));
+    const { result } = renderHook(() =>
+      useToolStateMachine(bundle.deps),
+    );
+    await act(async () => {
+      await result.current.enterNodeEdit("n");
+    });
+    const canvas = makeFakeCanvas();
+    // Select anchor 0 first.
+    act(() => {
+      result.current.onCanvasPointer(
+        makeEvent(canvas, {
+          type: "pointerdown",
+          clientX: 0,
+          clientY: 0,
+        }),
+      );
+    });
+    let state = result.current.getState();
+    if (state.kind !== "nodeEdit") throw new Error("expected nodeEdit");
+    expect(state.selectedAnchorIndices.size).toBe(1);
+    // Click far from any anchor.
+    act(() => {
+      result.current.onCanvasPointer(
+        makeEvent(canvas, {
+          type: "pointerup",
+          clientX: 0,
+          clientY: 0,
+        }),
+      );
+      result.current.onCanvasPointer(
+        makeEvent(canvas, {
+          type: "pointerdown",
+          clientX: 500,
+          clientY: 500,
+        }),
+      );
+    });
+    state = result.current.getState();
+    if (state.kind !== "nodeEdit") throw new Error("expected nodeEdit");
+    expect(state.selectedAnchorIndices.size).toBe(0);
   });
 });

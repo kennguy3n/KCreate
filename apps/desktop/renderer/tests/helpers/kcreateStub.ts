@@ -150,6 +150,31 @@ const defaultsByMethod: Record<string, () => unknown> = {
   // can pin both the call list (op + sourceIds passed verbatim)
   // and the re-selection follow-up without per-test wiring.
   "canvas.pathBoolean": () => ["default-bool-result-id"],
+  // Phase B3 — Node editor read/write surface.
+  // `pathGetSegments(nodeId) => PathSnapshot` returns a tiny
+  // valid square path so tests can exercise the node-edit entry
+  // path (anchor population, overlay render, hit-test) without
+  // wiring a custom override every time. Per-test overrides
+  // still apply for the edge cases (missing node, non-vector,
+  // etc.). Coordinates and `closed: true` match a 100x100 square
+  // at the origin; `fillRule: "non_zero"` is the default.
+  "canvas.pathGetSegments": () => ({
+    segments: [
+      { op: "move_to", x: 0, y: 0 },
+      { op: "line_to", x: 100, y: 0 },
+      { op: "line_to", x: 100, y: 100 },
+      { op: "line_to", x: 0, y: 100 },
+      { op: "close" },
+    ],
+    closed: true,
+    fillRule: "non_zero",
+    translationX: 0,
+    translationY: 0,
+  }),
+  // `pathSetSegments(nodeId, segments, closed) => void` returns
+  // undefined on success; tests asserting failure modes override
+  // with a throwing function.
+  "canvas.pathSetSegments": () => undefined,
   "canvas.createText": () => "default-text-id",
   setLayerColor: () => undefined,
 };

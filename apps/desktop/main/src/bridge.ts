@@ -466,6 +466,36 @@ export interface Bridge {
    * Wire mirror: `apps/desktop/shared/scene.ts::PathBooleanOp`.
    */
   canvasPathBoolean(op: string, sourceIds: string[]): string[];
+  /**
+   * Phase B3 (Node editor): read a `VectorLayer` node's geometry
+   * into a JSON-encoded `PathSnapshot` (see
+   * `apps/desktop/shared/scene.ts::PathSnapshot`). The bridge
+   * round-trips through JSON for the same reason `createPath` does
+   * — keeps adding a new `PathSegment` variant in
+   * `kcreate_vector` a pure kcreate_vector change instead of
+   * cascading into bridge schema updates.
+   *
+   * Read-only — records NO operation. Throws on missing node /
+   * wrong node type / missing path metadata.
+   */
+  canvasPathGetSegments(nodeId: string): string;
+  /**
+   * Phase B3 (Node editor): write new geometry to a `VectorLayer`
+   * node. `segmentsJson` is the JSON serialization of
+   * `Vec<kcreate_vector::PathSegment>` — same wire shape as
+   * `canvasCreatePath`. `closed` becomes `VectorPath.closed`.
+   *
+   * Records ONE undoable `canvas_path_set_segments` operation per
+   * call; the renderer is expected to coalesce per-frame
+   * pointermove updates into a single end-of-gesture call so the
+   * operation log stays coarse-grained — matches the
+   * `canvasMoveNode` discipline.
+   */
+  canvasPathSetSegments(
+    nodeId: string,
+    segmentsJson: string,
+    closed: boolean,
+  ): void;
   canvasCreateText(
     parentId: string | null,
     x: number,

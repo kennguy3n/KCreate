@@ -25,6 +25,7 @@ import { LeftPanel } from "../components/LeftPanel";
 import { PageNavigator } from "../components/PageNavigator";
 import { PathfinderPanel } from "../components/PathfinderPanel";
 import { PenOverlay } from "../components/PenOverlay";
+import { NodeEditOverlay } from "../components/NodeEditOverlay";
 import { RightPanel } from "../components/RightPanel";
 import { SelectionOverlay } from "../components/SelectionOverlay";
 import { SoftProofOverlay } from "../components/SoftProofOverlay";
@@ -1331,6 +1332,13 @@ function EditorPageInner({
   // inside the hook so their identity is stable.
   const cancelPen = toolStateMachine.cancelPen;
   const commitPen = toolStateMachine.commitPen;
+  // Phase B3 — same stable-callback-destructuring discipline as
+  // `cancelPen` / `commitPen`. The destructure exists so
+  // `shortcutHandlers`'s dep array can list these directly
+  // instead of the volatile-identity `toolStateMachine` bundle.
+  const enterNodeEdit = toolStateMachine.enterNodeEdit;
+  const cancelNodeEdit = toolStateMachine.cancelNodeEdit;
+  const commitNodeEdit = toolStateMachine.commitNodeEdit;
 
   const shortcutHandlers = useMemo<ShortcutHandlers>(
     () => ({
@@ -1365,12 +1373,17 @@ function EditorPageInner({
       clearSelection: (e) => {
         e.preventDefault();
         // Escape semantics, in priority order:
-        //   1. If a pen gesture is in flight, cancel it. The user
-        //      pressed Escape to abandon the path; it would be
-        //      surprising if Escape also deselected an unrelated
-        //      shape under that gesture.
-        //   2. Otherwise clear the current selection (the
+        //   1. If a node-edit gesture is in flight, cancel it.
+        //      Highest priority because nodeEdit is a modal
+        //      sub-editor — the user expects Escape to exit
+        //      that mode before doing anything else.
+        //   2. If a pen gesture is in flight, cancel it. The
+        //      user pressed Escape to abandon the path; it would
+        //      be surprising if Escape also deselected an
+        //      unrelated shape under that gesture.
+        //   3. Otherwise clear the current selection (the
         //      pre-pen-tool behaviour).
+        if (cancelNodeEdit()) return;
         if (cancelPen()) return;
         void handleClearSelection();
       },
@@ -1378,9 +1391,18 @@ function EditorPageInner({
       // OPEN path. No-op when the state machine isn't in the pen
       // variant (handled inside `commitPen`), so this binding
       // can't interfere with other modes.
+      // Phase B3 — Enter ALSO commits an in-flight node-edit
+      // gesture (preferred ordering: node-edit first because
+      // it's modal; pen second because the user has to be
+      // actively in the pen tool to have a pen state). Both
+      // commit functions are no-ops when their respective
+      // variant is not active, so the fall-through is safe.
       commitPath: (e) => {
         e.preventDefault();
-        void commitPen();
+        void (async () => {
+          if (await commitNodeEdit()) return;
+          await commitPen();
+        })();
       },
       toolSelect: (e) => tryTool("select", e),
       toolRect: (e) => tryTool("rect", e),
@@ -1451,6 +1473,8 @@ function EditorPageInner({
       setPanActive,
       cancelPen,
       commitPen,
+      cancelNodeEdit,
+      commitNodeEdit,
     ],
   );
   useShortcuts(shortcutHandlers);
@@ -1499,6 +1523,14 @@ function EditorPageInner({
       // renderer is drawing. World-space bounds come from the
       // existing `nodes` mirror; we project through the live
       // viewport to position the editor.
+      // Phase B3 — when the user double-clicks a `VectorLayer`,
+      // enter the node editor for that node instead (mounting an
+      // overlay full of anchor/handle widgets via the state
+      // machine's `nodeEdit` variant). The two are
+      // mutually-exclusive (a node is either TextLayer OR
+      // VectorLayer) so the branch order doesn't matter for
+      // correctness; we test `TextLayer` first to preserve the
+      // pre-Phase-B3 hit ordering for that path.
       void (async () => {
         try {
           const hit = await window.kcreate.canvas.hitTest(
@@ -1510,7 +1542,12 @@ function EditorPageInner({
           );
           if (!hit) return;
           const node = nodes.find((n) => n.id === hit);
-          if (!node || node.nodeType !== "TextLayer") return;
+          if (!node) return;
+          if (node.nodeType === "VectorLayer") {
+            await enterNodeEdit(hit);
+            return;
+          }
+          if (node.nodeType !== "TextLayer") return;
           const [style, content] = await Promise.all([
             window.kcreate.text.getStyle(hit),
             window.kcreate.text.getContent(hit),
@@ -1544,7 +1581,7 @@ function EditorPageInner({
         }
       })();
     },
-    [annotationCreateActive, nodes, viewport, inlineTextEditRef, setInlineTextEdit, setStatusMessage],
+    [annotationCreateActive, nodes, viewport, inlineTextEditRef, setInlineTextEdit, setStatusMessage, enterNodeEdit],
   );
 
   // Commit / cancel handlers for the inline text editor. Commit
@@ -1854,6 +1891,21 @@ function EditorPageInner({
             is wired directly on `CanvasHost` via `onCanvasPointer`.
           */}
           <PenOverlay
+            machine={toolStateMachine}
+            viewport={viewport}
+            width={CANVAS_WIDTH}
+            height={CANVAS_HEIGHT}
+          />
+          {/*
+            Phase B3 — Node-editor overlay. Renders the in-flight
+            node-edit gesture (path outline + anchor squares +
+            handle dots + tangent lines) when the state machine is
+            in the `"nodeEdit"` variant; returns `null` otherwise.
+            Pointer-events: none — pointer handling for anchor /
+            handle drag is wired directly on `CanvasHost` via
+            `onCanvasPointer`, same as `PenOverlay`.
+          */}
+          <NodeEditOverlay
             machine={toolStateMachine}
             viewport={viewport}
             width={CANVAS_WIDTH}

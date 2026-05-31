@@ -270,11 +270,46 @@ const BRAND_RESOLVER: TemplateResolver = {
       solidFill(BRAND_PALETTE.espresso),
       "Logo placeholder",
     );
+
+    // Caption placement: by default the caption sits to the *right* of
+    // the logomark, vertically centred — the visual the shipped
+    // 1024×1024 brand preset was designed around. On a narrow brand
+    // artboard the right-of-logo placement would push the caption past
+    // the right edge of the canvas (Devin Review surfaced this on
+    // commit cb2c097: at 300×300 the caption starts at x=90 and the
+    // estimated 247px-wide text ends at x=337 — 55px past the
+    // artboard's 282px right margin). Detect that case and fall back
+    // to placing the caption *above* the logomark, left-aligned with
+    // it, which preserves the caption's role as a labelling tag
+    // without overflowing either axis (the logo is anchored to the
+    // bottom-left margin, so there's always vertical room above it).
+    //
+    // Width estimate (`charCount × fontSize × 0.55`) is a conservative
+    // approximation for proportional sans-serif text — exact glyph
+    // widths aren't available at this layer (the renderer's shaped
+    // text metrics live behind the bridge in `kcreate_text`). The
+    // estimate intentionally rounds up: a slight over-estimate flips
+    // borderline cases to the safer above-logo placement.
+    const captionFontSize = 24;
+    const captionText = "Drop your mark here";
+    const captionEstimatedWidth = Math.ceil(
+      captionText.length * captionFontSize * 0.55,
+    );
+    const captionRightOfLogoX = logoX + logoSize + 24;
+    const artboardRightEdge = ax + aw - margin;
+    const captionFitsRightOfLogo =
+      captionRightOfLogoX + captionEstimatedWidth <= artboardRightEdge;
+    const captionX = captionFitsRightOfLogo
+      ? captionRightOfLogoX
+      : logoX;
+    const captionY = captionFitsRightOfLogo
+      ? logoY + Math.round(logoSize / 2) - 14
+      : logoY - captionFontSize - 8;
     await text(
-      logoX + logoSize + 24,
-      logoY + Math.round(logoSize / 2) - 14,
-      "Drop your mark here",
-      24,
+      captionX,
+      captionY,
+      captionText,
+      captionFontSize,
       solidFill(BRAND_PALETTE.espresso),
       "sans-serif",
       "Logo caption",
@@ -621,7 +656,7 @@ const DEV_EXPORT_RESOLVER: TemplateResolver = {
     await text(
       ax + 16,
       ay + 16,
-      `${aw}\u00d7${ah}\u00a0\u00b7\u00a0${iconGridSizeHint}px grid`,
+      `${aw}×${ah}\u00a0\u00b7\u00a0${iconGridSizeHint}px grid`,
       18,
       solidFill(BRAND_PALETTE.espresso),
       "sans-serif",

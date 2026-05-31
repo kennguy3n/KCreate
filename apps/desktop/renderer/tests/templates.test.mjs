@@ -430,6 +430,93 @@ test("BRAND resolver clamps swatchHeight so labels never overlap the logo on a w
   );
 });
 
+// BRAND_RESOLVER originally placed the logo caption at
+// `logoX + logoSize + 24` (right-of-logo), which fits cleanly on the
+// shipped 1024\u00d71024 brand preset but overflows the right edge on a
+// narrow artboard (Devin Review surfaced on commit cb2c097: at
+// 300\u00d7300 the caption estimated at 247px wide starts at x=90 and
+// ends at x=337, 55px past the 282px right margin). The fix detects
+// the overflow case and flips the caption to *above* the logomark,
+// left-aligned with it. This test exercises the 300\u00d7300 narrow
+// case and asserts the caption origin stays within the artboard
+// horizontally and the caption sits above (not on/below) the logo.
+test("BRAND resolver flips logo caption above the logomark when right-of-logo would overflow on a narrow artboard", async (t) => {
+  const { templateResolverFor } = await loadResolvers();
+  const calls = installRecorder(t);
+  const ctx = { x: 0, y: 0, width: 300, height: 300 };
+  await templateResolverFor("brand").apply(ctx);
+  const nodes = nodesFromCalls(calls);
+  const named = new Map(
+    [...nodes.values()]
+      .map((n) => [nameOf(n), n])
+      .filter(([n]) => n !== null),
+  );
+  const logo = named.get("Logo placeholder");
+  const caption = named.get("Logo caption");
+  assert.ok(logo, "missing 'Logo placeholder' rect for caption-flip check");
+  assert.ok(caption, "missing 'Logo caption' text for caption-flip check");
+  // Caption origin must be \u2264 logo top (caption is above, not beside).
+  assert.ok(
+    caption.create.y <= logo.create.y,
+    `caption y ${caption.create.y} should be <= logo y ${logo.create.y} (above-logo flip)`,
+  );
+  // Caption origin must be at logo's left edge (left-aligned with logo).
+  assert.equal(
+    caption.create.x,
+    logo.create.x,
+    `caption x ${caption.create.x} should match logo x ${logo.create.x} when flipped above`,
+  );
+  // Caption origin must be inside the artboard horizontally.
+  assert.ok(
+    caption.create.x >= 0,
+    `caption x ${caption.create.x} should be >= 0`,
+  );
+  assert.ok(
+    caption.create.x < ctx.width,
+    `caption x ${caption.create.x} should be < artboard width ${ctx.width}`,
+  );
+  // Caption origin must be inside the artboard vertically (positive y).
+  assert.ok(
+    caption.create.y >= 0,
+    `caption y ${caption.create.y} should be >= 0 (above-logo flip must fit)`,
+  );
+});
+
+// Sanity: the shipped 1024\u00d71024 brand preset must keep the original
+// right-of-logo caption placement (no behavioural regression from the
+// narrow-artboard defensive flip above).
+test("BRAND resolver keeps logo caption to the right of the logomark on the shipped 1024\u00d71024 preset", async (t) => {
+  const { templateResolverFor } = await loadResolvers();
+  const calls = installRecorder(t);
+  const ctx = { x: 0, y: 0, width: 1024, height: 1024 };
+  await templateResolverFor("brand").apply(ctx);
+  const nodes = nodesFromCalls(calls);
+  const named = new Map(
+    [...nodes.values()]
+      .map((n) => [nameOf(n), n])
+      .filter(([n]) => n !== null),
+  );
+  const logo = named.get("Logo placeholder");
+  const caption = named.get("Logo caption");
+  assert.ok(logo, "missing 'Logo placeholder' rect for caption-position check");
+  assert.ok(caption, "missing 'Logo caption' text for caption-position check");
+  // Caption must be to the right of the logo (not flipped above).
+  assert.ok(
+    caption.create.x > logo.create.x + logo.create.w,
+    `caption x ${caption.create.x} should be right of logo right edge ${logo.create.x + logo.create.w} on shipped preset`,
+  );
+  // Caption must overlap the logo vertically (it is centred against
+  // the logomark, not above/below it).
+  assert.ok(
+    caption.create.y >= logo.create.y,
+    `caption y ${caption.create.y} should be >= logo top ${logo.create.y} on shipped preset`,
+  );
+  assert.ok(
+    caption.create.y < logo.create.y + logo.create.h,
+    `caption y ${caption.create.y} should be < logo bottom ${logo.create.y + logo.create.h} on shipped preset`,
+  );
+});
+
 // APP_UI_RESOLVER computes `tileHeight = Math.max(0, tileBottom -
 // tileTop)` so a future surface applying it to an extremely short
 // artboard doesn't pass a negative height into `createRect`. The

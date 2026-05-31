@@ -90,6 +90,20 @@ function renderNode(node: IconNode, key: number): JSX.Element {
   }
 }
 
+/// Default inline style applied to every rendered `<Icon>`. Hoisted to
+/// module scope so the common case (no caller-supplied `style`) shares
+/// a single object reference across every render of every icon in the
+/// app. The previous per-render `{ display: 'inline-block', ... }`
+/// literal allocated a fresh object on every render even when the
+/// callsite never passed a `style` prop, which defeated React's
+/// reference equality and forced the DOM to rewrite inline styles
+/// each tick.
+const DEFAULT_ICON_STYLE: CSSProperties = {
+  display: "inline-block",
+  flexShrink: 0,
+  verticalAlign: "middle",
+};
+
 export function Icon({
   name,
   size = 16,
@@ -103,12 +117,18 @@ export function Icon({
   // collapsing inside a flex row when the surrounding label is
   // wider than the available space. `verticalAlign: middle` lines
   // it up with adjacent text glyphs in inline contexts.
-  const mergedStyle: CSSProperties = {
-    display: "inline-block",
-    flexShrink: 0,
-    verticalAlign: "middle",
-    ...style,
-  };
+  //
+  // When no caller-supplied `style` is passed (the majority of icon
+  // usages across the app), reuse the shared `DEFAULT_ICON_STYLE`
+  // module constant so React sees a stable `style` reference across
+  // renders and skips the DOM inline-style rewrite. Only allocate a
+  // fresh merged object when the caller is actually layering style
+  // on top of the defaults. This mirrors the `ICON_ROW_STYLE`
+  // hoist in `TopBar.tsx`.
+  const mergedStyle: CSSProperties =
+    style === undefined
+      ? DEFAULT_ICON_STYLE
+      : { ...DEFAULT_ICON_STYLE, ...style };
   return (
     <svg
       xmlns="http://www.w3.org/2000/svg"

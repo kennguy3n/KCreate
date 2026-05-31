@@ -162,7 +162,7 @@ export function RightPanel({
   // breaking referential equality for any downstream memo.
   //
   // Each conditional entry goes through the module-scope `mkTab`
-  // helper (defined below the component) — a typed-identity function
+  // helper (defined above the component) — a typed-identity function
   // whose parameter type validates the `icon` string against the
   // `IconName` union at compile time. Bare object literals would
   // widen `icon` to `string` (TypeScript only narrows literal-typed

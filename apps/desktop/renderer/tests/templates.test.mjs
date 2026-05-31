@@ -391,8 +391,15 @@ test("SOCIAL resolver seeds a cream background, burnt-orange headline band, head
 test("PRINT resolver seeds an espresso header bar, cream body block, two body paragraphs, and a burnt-orange footer accent on A4", async (t) => {
   const { BRAND_PALETTE, templateResolverFor } = await loadResolvers();
   const calls = installRecorder(t);
-  // A4 @ 150dpi-ish — the shipped print preset.
-  const ctx = { x: 0, y: 0, width: 1240, height: 1754 };
+  // A4 @ 300dpi — matches the shipped print preset on
+  // `HomePage.tsx::CREATE_OPTIONS` (`{ name: "A4", width: 2480, height:
+  // 3508 }`). Mirrors `kcreate_core::node::standard_presets()`.
+  // Running on the real shipped dimensions ensures the resolver's
+  // proportional math (margin = aw * 0.06, headerHeight = ah * 0.16,
+  // body block = ah * 0.5, footer = ah * 0.04) covers the production
+  // geometry — not a half-resolution stand-in — so any rounding /
+  // overflow regression at the actual size is caught here.
+  const ctx = { x: 0, y: 0, width: 2480, height: 3508 };
   await templateResolverFor("print").apply(ctx);
   assertInsideArtboard(calls, ctx);
   const nodes = nodesFromCalls(calls);

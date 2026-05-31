@@ -78,15 +78,22 @@ function solidFill(rgb: string, alpha = 1.0): FillStyle {
 /// Returns immediately (no IPC) when neither field is supplied; the
 /// caller may have legitimate reasons to seed an anonymous, unfilled
 /// node (e.g. a temporary measurement guide).
+///
+/// The presence checks use explicit `=== null` / `=== undefined`
+/// instead of truthiness so an empty-string `name` (a legitimate way
+/// to clear an existing name) still issues the IPC. Truthy checks
+/// would silently drop `name: ""` and `name: undefined` alike, which
+/// is fine for every current call site but a footgun for any future
+/// resolver that genuinely wants to blank out a node's name.
 async function paint(
   nodeId: string,
   fill: FillStyle | null,
   name: string | undefined,
 ): Promise<void> {
-  if (!fill && !name) return;
+  if (fill === null && name === undefined) return;
   const props: { fill?: FillStyle; name?: string } = {};
-  if (fill) props.fill = fill;
-  if (name) props.name = name;
+  if (fill !== null) props.fill = fill;
+  if (name !== undefined) props.name = name;
   await window.kcreate.document.updateNode(nodeId, props);
 }
 
@@ -366,11 +373,20 @@ const APP_UI_RESOLVER: TemplateResolver = {
       "sans-serif",
       "Header title",
     );
-    // Three content tiles in the body area.
+    // Three content tiles in the body area. `Math.floor` (not
+    // `Math.round`) so the three-tile budget is never over-allocated,
+    // mirroring the documented rationale on `DECK_RESOLVER`'s
+    // `colWidth` (see `templates.ts:493-503`). Today the APP_UI
+    // formula has slack — `rail + 4*tileMargin + 3*tileWidth ≤ aw`
+    // leaves ~`tileMargin` of right padding even with `Math.round`'s
+    // worst-case +1 — so this is defensive, not load-bearing. But the
+    // floor invariant `rail + 4*tileMargin + 3*tileWidth ≤ aw` then
+    // holds for any artboard size a future surface might apply this
+    // resolver to, without re-deriving the rounding behaviour.
     const tileMargin = 32;
     const tileTop = ay + headerH + tileMargin;
     const tileBottom = ay + ah - tileMargin;
-    const tileWidth = Math.round((aw - rail - tileMargin * 4) / 3);
+    const tileWidth = Math.floor((aw - rail - tileMargin * 4) / 3);
     const tileHeight = tileBottom - tileTop;
     for (let i = 0; i < 3; i += 1) {
       const tx = ax + rail + tileMargin + i * (tileWidth + tileMargin);

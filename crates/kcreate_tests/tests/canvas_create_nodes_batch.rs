@@ -154,7 +154,7 @@ fn batch_stamps_fill_and_name_before_insert() {
             body: "Headline".to_string(),
             family: "Inter".to_string(),
             size: 48.0,
-            fill: Some(red.clone()),
+            fill: Some(red),
             name: Some("HeroHeadline".to_string()),
         },
     ];
@@ -212,8 +212,7 @@ fn batch_preserves_submission_z_order() {
         .map(|id| {
             tree.iter()
                 .find(|n| n.id == *id)
-                .map(|n| n.name.as_str())
-                .unwrap_or("<missing>")
+                .map_or("<missing>", |n| n.name.as_str())
         })
         .collect();
     assert_eq!(batch_names, vec!["R0", "R1", "R2", "R3", "R4"]);
@@ -282,9 +281,106 @@ fn batch_omitting_name_uses_default_per_primitive() {
         .map(|id| {
             tree.iter()
                 .find(|n| n.id == *id)
-                .map(|n| n.name.as_str())
-                .unwrap_or("<missing>")
+                .map_or("<missing>", |n| n.name.as_str())
         })
         .collect();
     assert_eq!(names, vec!["Rectangle", "Ellipse", "Line", "Text"]);
+}
+
+/// Regression for Devin Review PR #32 BUG_0001 — partial batch
+/// failure. If `insert_node` rejects an item in the middle of the
+/// loop (here: bogus parent UUID), the function must:
+///
+/// 1. Return `Err` to the caller.
+/// 2. Leave the items that *did* succeed in the document graph
+///    (the single-item helpers had this property too — partial
+///    progress on a multi-call seed is preserved across the failure
+///    boundary).
+/// 3. Have already-finalized `modified_at` + run `sync_scene_locked`,
+///    so the surviving nodes don't become "ghost nodes" — present
+///    in the document but invisible until the next user-triggered
+///    sync.
+///
+/// We can directly assert (1) and (2) here. (3) is structurally
+/// guaranteed by the `if !created_ids.is_empty() { … }` block in
+/// `canvas_create_nodes`: it always runs `sync_scene_locked` on
+/// the error path when any item succeeded.
+#[test]
+#[serial]
+fn batch_partial_failure_preserves_inserted_nodes_and_returns_err() {
+    let _dir = open_project("partial_fail");
+    let ab = seed_artboard();
+    let bogus_parent = Uuid::new_v4();
+    let items = vec![
+        CanvasBatchItem::Rect {
+            parent: Some(ab),
+            x: 0.0,
+            y: 0.0,
+            w: 10.0,
+            h: 10.0,
+            fill: None,
+            name: Some("Survivor 1".to_string()),
+        },
+        CanvasBatchItem::Rect {
+            parent: Some(ab),
+            x: 20.0,
+            y: 0.0,
+            w: 10.0,
+            h: 10.0,
+            fill: None,
+            name: Some("Survivor 2".to_string()),
+        },
+        // This one is rejected by `insert_node` because its parent
+        // UUID isn't in the document — the batch loop must short-
+        // circuit here.
+        CanvasBatchItem::Rect {
+            parent: Some(bogus_parent),
+            x: 40.0,
+            y: 0.0,
+            w: 10.0,
+            h: 10.0,
+            fill: None,
+            name: Some("Casualty".to_string()),
+        },
+        // This trailing item must NOT be inserted — failure must
+        // halt the loop, not "continue past the bad item".
+        CanvasBatchItem::Rect {
+            parent: Some(ab),
+            x: 60.0,
+            y: 0.0,
+            w: 10.0,
+            h: 10.0,
+            fill: None,
+            name: Some("Should not appear".to_string()),
+        },
+    ];
+    let err = canvas_create_nodes(items).expect_err("partial batch must fail");
+    // `InvalidReparent` is what the document raises for a missing
+    // parent uuid — surface the exact discriminant so a future
+    // refactor of `insert_node`'s failure modes doesn't silently
+    // convert this into a different code path.
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("InvalidReparent") || msg.contains("invalid"),
+        "expected reparent error, got: {msg}"
+    );
+    // Survivors are still in the document graph.
+    let tree = document_get_tree().expect("tree");
+    let names: Vec<&str> = tree.iter().map(|n| n.name.as_str()).collect();
+    assert!(
+        names.contains(&"Survivor 1"),
+        "first item must survive partial failure; got names: {names:?}"
+    );
+    assert!(
+        names.contains(&"Survivor 2"),
+        "second item must survive partial failure; got names: {names:?}"
+    );
+    assert!(
+        !names.contains(&"Casualty"),
+        "rejected item must NOT be in the document; got names: {names:?}"
+    );
+    assert!(
+        !names.contains(&"Should not appear"),
+        "items after the failure must NOT be inserted; got names: {names:?}"
+    );
 }

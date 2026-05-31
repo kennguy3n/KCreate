@@ -115,7 +115,7 @@ export interface RectSeed {
 /// Helpers are synchronous (no IPC during build) so the resolver
 /// body reads as a flat list of geometry decisions. Only `flush()`
 /// touches the bridge.
-interface BatchBuilder {
+export interface BatchBuilder {
   rect(seed: RectSeed): void;
   text(seed: TextSeed): void;
   flush(): Promise<string[]>;
@@ -124,7 +124,11 @@ interface BatchBuilder {
 /// Construct a fresh [`BatchBuilder`]. Each resolver builds its own
 /// — they don't share state so the order of `apply()` calls is
 /// deterministic from the caller's perspective.
-function makeBatch(): BatchBuilder {
+///
+/// Exported so the templates test can pin the reuse-safety contract
+/// (post-flush, the internal queue is empty so a second `flush()` is
+/// a no-op rather than a re-submission).
+export function makeBatch(): BatchBuilder {
   const items: CanvasBatchItem[] = [];
   return {
     rect({ x, y, w, h, fill, name }) {
@@ -156,7 +160,16 @@ function makeBatch(): BatchBuilder {
     },
     async flush() {
       if (items.length === 0) return [];
-      return await window.kcreate.canvas.createNodes(items);
+      // Snapshot the queued items and clear the buffer *before* we
+      // hit the bridge. This makes the builder safely reusable: a
+      // future caller that does multi-phase seeding
+      // (`b.rect(...); await b.flush(); b.text(...); await b.flush()`)
+      // cannot accidentally double-submit the first phase. We snapshot
+      // because we must not feed the bridge an array we're about to
+      // mutate. Devin Review PR #32 INFO_0001.
+      const batch = items.slice();
+      items.length = 0;
+      return await window.kcreate.canvas.createNodes(batch);
     },
   };
 }

@@ -900,3 +900,74 @@ test("every resolver issues exactly one canvas.createNodes batch (no per-item cr
     );
   }
 });
+
+
+// Regression for Devin Review PR #32 INFO_0001 — BatchBuilder.flush()
+// must clear its internal items buffer so a reused builder cannot
+// re-submit previously-flushed items. The shipped resolvers each
+// instantiate their own `b = makeBatch()` and call `flush()` once,
+// so the production code path doesn't exercise this — but a future
+// contributor doing multi-phase seeding (e.g.
+// `b.rect(...); await b.flush(); b.text(...); await b.flush();`)
+// would silently double-submit phase 1 without this guarantee.
+test("BatchBuilder.flush() clears the queue so a reused builder cannot double-submit", async (t) => {
+  const recorder = installRecorder(t);
+  const { makeBatch } = await loadResolvers();
+  const b = makeBatch();
+  b.rect({ x: 0, y: 0, w: 10, h: 10, name: "phase-1" });
+  await b.flush();
+  // If `flush()` didn't clear the buffer, the second flush would
+  // re-submit phase-1 alongside phase-2.
+  b.rect({ x: 20, y: 0, w: 10, h: 10, name: "phase-2" });
+  await b.flush();
+  assert.equal(
+    recorder.batchCalls.length,
+    2,
+    "two flushes should issue two distinct batch calls",
+  );
+  assert.equal(
+    recorder.batchCalls[0].items.length,
+    1,
+    "first batch must contain only phase-1",
+  );
+  assert.equal(
+    recorder.batchCalls[0].items[0].name,
+    "phase-1",
+    "first batch's only item must be phase-1",
+  );
+  assert.equal(
+    recorder.batchCalls[1].items.length,
+    1,
+    "second batch must contain only phase-2 — would be 2 (phase-1 + phase-2) if buffer not cleared",
+  );
+  assert.equal(
+    recorder.batchCalls[1].items[0].name,
+    "phase-2",
+    "second batch's only item must be phase-2",
+  );
+});
+
+// Same property exercised at the integration level: running the same
+// resolver back-to-back must not leak any state across invocations.
+// This is the property a contributor would actually care about if
+// they were debugging a "why does the second template have double
+// nodes?" report.
+test("re-running a resolver back-to-back produces independent single-batch invocations", async (t) => {
+  const { templateResolverFor } = await loadResolvers();
+  const ctx = { x: 0, y: 0, width: 1024, height: 1024 };
+
+  const calls1 = installRecorder(t);
+  await templateResolverFor("brand").apply(ctx);
+  const firstItemCount = calls1.batchCalls[0]?.items.length ?? 0;
+  assert.equal(calls1.batchCalls.length, 1, "first apply() emits one batch");
+
+  const calls2 = installRecorder(t);
+  await templateResolverFor("brand").apply(ctx);
+  const secondItemCount = calls2.batchCalls[0]?.items.length ?? 0;
+  assert.equal(calls2.batchCalls.length, 1, "second apply() emits one batch");
+  assert.equal(
+    firstItemCount,
+    secondItemCount,
+    "second apply() must emit the same item count — drift here would indicate cross-invocation state leak",
+  );
+});

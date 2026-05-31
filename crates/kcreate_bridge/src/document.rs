@@ -5223,30 +5223,53 @@ pub fn canvas_create_nodes(items: Vec<CanvasBatchItem>) -> Result<Vec<Uuid>> {
     let mut guard = slot().write();
     let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
     let mut created_ids = Vec::with_capacity(items.len());
+    // Track the first error from the loop so we can finalize the
+    // document state (modified_at + scene sync) for any nodes that *did*
+    // make it in, before propagating the error to the caller. Without
+    // this, a mid-batch failure would leave already-inserted nodes
+    // present in the document graph (and undoable!) but invisible
+    // until the next user-triggered scene sync — Devin Review PR #32
+    // BUG_0001 ("ghost nodes" on partial batch failure).
+    let mut loop_err: Option<DocumentBridgeError> = None;
     for item in items {
-        let (node, op_kind) = build_canvas_batch_node(item)?;
-        let id = ws.project.document.insert_node(node)?;
-        let snapshot = ws
-            .project
-            .document
-            .get_node(id)
-            .map_or(serde_json::Value::Null, |n| {
-                serde_json::to_value(n).unwrap_or(serde_json::Value::Null)
-            });
-        let op = Operation::new(
-            "user",
-            op_kind,
-            serde_json::Value::Null,
-            snapshot,
-            vec![id],
-        );
-        ws.project.execute_operation(op);
-        created_ids.push(id);
+        let step = build_canvas_batch_node(item).and_then(|(node, op_kind)| {
+            let id = ws.project.document.insert_node(node)?;
+            let snapshot = ws
+                .project
+                .document
+                .get_node(id)
+                .map_or(serde_json::Value::Null, |n| {
+                    serde_json::to_value(n).unwrap_or(serde_json::Value::Null)
+                });
+            let op = Operation::new(
+                "user",
+                op_kind,
+                serde_json::Value::Null,
+                snapshot,
+                vec![id],
+            );
+            ws.project.execute_operation(op);
+            Ok::<Uuid, DocumentBridgeError>(id)
+        });
+        match step {
+            Ok(id) => created_ids.push(id),
+            Err(e) => {
+                loop_err = Some(e);
+                break;
+            }
+        }
     }
-    ws.project.modified_at = Utc::now();
-    let _ = sync_scene_locked(&mut guard);
+    // Always finalize when at least one node was inserted, even on
+    // the error path. The fully-successful path is a strict subset.
+    if !created_ids.is_empty() {
+        ws.project.modified_at = Utc::now();
+        let _ = sync_scene_locked(&mut guard);
+    }
     drop(guard);
-    Ok(created_ids)
+    match loop_err {
+        Some(e) => Err(e),
+        None => Ok(created_ids),
+    }
 }
 
 // -----------------------------------------------------------------------------

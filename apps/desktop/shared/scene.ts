@@ -939,8 +939,80 @@ export interface CanvasBridge {
     fontFamily: string,
     fontSize: number,
   ): Promise<string>;
+  /**
+   * Atomic batch creation of canvas primitives. The bridge takes
+   * the workspace write lock once, inserts every item in
+   * submission order, records one operation per item against the
+   * single-item `op_kind` (so undo/redo granularity matches the
+   * non-batch path), and runs a single `sync_scene` before
+   * releasing the lock.
+   *
+   * Each item may carry optional `fill` and `name` fields which
+   * are stamped onto the node *before* it is inserted into the
+   * graph — so the batch never has to round-trip through
+   * `document.updateNode` to colour or label a node. Returns the
+   * new node ids in the same order as `items`. Empty input is a
+   * no-op that returns `[]` without taking the lock.
+   *
+   * Mirrors `canvas_create_nodes` /
+   * `kcreate_bridge::document::CanvasBatchItem`.
+   */
+  createNodes(items: CanvasBatchItem[]): Promise<string[]>;
   moveNode(nodeId: string, dx: number, dy: number): Promise<void>;
 }
+
+/**
+ * One item in a {@link CanvasBridge.createNodes} batch. Internally
+ * tagged on `kind` (matching the {@link FillStyle} wire shape) so a
+ * single tagged-union array can hold heterogeneous primitives. All
+ * variants accept optional `fill` and `name`; the bridge stamps
+ * both onto the node before insert so no follow-up `updateNode`
+ * round-trip is required to colour or label a freshly-created node.
+ *
+ * Mirrors `kcreate_bridge::document::CanvasBatchItem`.
+ */
+export type CanvasBatchItem =
+  | {
+      kind: "rect";
+      parent: string | null;
+      x: number;
+      y: number;
+      w: number;
+      h: number;
+      fill?: FillStyle;
+      name?: string;
+    }
+  | {
+      kind: "ellipse";
+      parent: string | null;
+      cx: number;
+      cy: number;
+      rx: number;
+      ry: number;
+      fill?: FillStyle;
+      name?: string;
+    }
+  | {
+      kind: "line";
+      parent: string | null;
+      x1: number;
+      y1: number;
+      x2: number;
+      y2: number;
+      fill?: FillStyle;
+      name?: string;
+    }
+  | {
+      kind: "text";
+      parent: string | null;
+      x: number;
+      y: number;
+      body: string;
+      family: string;
+      size: number;
+      fill?: FillStyle;
+      name?: string;
+    };
 
 /**
  * AI Assist bridge. Phase 0 ships the threshold-based background

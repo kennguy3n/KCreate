@@ -1313,6 +1313,11 @@ function registerIpcHandlers(): void {
       requireBridge().canvasMoveNode(nodeId, dx, dy);
     },
   );
+  ipcMain.handle(
+    "kcreate/canvas/createNodes",
+    (_e, itemsJson: string): string =>
+      requireBridge().canvasCreateNodes(itemsJson),
+  );
 
   // AI Assist
   ipcMain.handle(

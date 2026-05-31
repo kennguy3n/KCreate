@@ -1583,6 +1583,36 @@ pub fn canvas_create_text(
         .map_err(map_doc_err)
 }
 
+/// Batch creation surface for the four canvas primitives (rect /
+/// ellipse / line / text). Accepts a JSON-encoded array of
+/// [`document::CanvasBatchItem`] (internally tagged on `kind`) and
+/// returns a JSON-encoded array of the new node ids in the same
+/// order as the input. Empty array → empty result; no lock taken.
+///
+/// Motivation: each per-item helper acquires the workspace write lock
+/// once and runs a full `sync_scene_locked` at the end. Seeding a
+/// 12-node template costs 12 lock acquisitions + 12 scene rebuilds
+/// + (up to) 12 follow-up `document_update_node` round-trips for
+/// fill/name. This batch surface collapses all of that into one
+/// lock, one scene rebuild, and zero `document_update_node` calls
+/// (fill / name are stamped onto each node before insert).
+///
+/// JSON is the wire format here (rather than per-shape napi structs)
+/// so the host can produce a uniform tagged-union shape that mirrors
+/// `apps/desktop/shared/scene.ts:CanvasBatchItem` — and so we don't
+/// have to expose four separate napi structs whose Option<FillStyle>
+/// payloads would each duplicate the FillStyle wire shape.
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn canvas_create_nodes(items_json: String) -> NapiResult<String> {
+    let items: Vec<document::CanvasBatchItem> = serde_json::from_str(&items_json)
+        .map_err(|e| napi::Error::new(napi::Status::InvalidArg, e.to_string()))?;
+    let ids = document::canvas_create_nodes(items).map_err(map_doc_err)?;
+    let id_strings: Vec<String> = ids.into_iter().map(|u| u.to_string()).collect();
+    serde_json::to_string(&id_strings)
+        .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))
+}
+
 /// Import a raster image from disk into the project. The image bytes
 /// are stored as a content-addressed blob and a `RasterLayer` node is
 /// inserted referencing it. Returns the new node's uuid.

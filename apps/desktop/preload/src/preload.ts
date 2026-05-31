@@ -20,6 +20,7 @@ import type {
   ArtboardPreset,
   BrandKit,
   BrandKitBridge,
+  CanvasBatchItem,
   CanvasBridge,
   ComponentBridge,
   ComponentInfo,
@@ -958,6 +959,19 @@ const canvas: CanvasBridge = {
   },
   async moveNode(nodeId: string, dx: number, dy: number): Promise<void> {
     await ipcRenderer.invoke("kcreate/canvas/moveNode", nodeId, dx, dy);
+  },
+  async createNodes(items: CanvasBatchItem[]): Promise<string[]> {
+    // Wire format: JSON-encoded array of CanvasBatchItem in,
+    // JSON-encoded array of ids out. The bridge owns the locking +
+    // op-log + scene-sync; the preload layer is the marshal step.
+    // Empty input is short-circuited renderer-side so we don't pay
+    // the IPC round-trip for a no-op.
+    if (items.length === 0) return [];
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/canvas/createNodes",
+      JSON.stringify(items),
+    )) as string;
+    return JSON.parse(raw) as string[];
   },
 };
 

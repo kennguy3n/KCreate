@@ -4946,6 +4946,310 @@ pub fn canvas_create_text(
 }
 
 // -----------------------------------------------------------------------------
+// Canvas batch creation
+// -----------------------------------------------------------------------------
+
+/// One node-creation step inside a [`canvas_create_nodes`] batch.
+/// Internally tagged on `kind` to match the [`FillStyle`] wire shape
+/// (`{ "kind": "solid", "r": …, … }`), so the host can produce a
+/// uniform JSON value without learning a second discriminant
+/// convention. All four variants accept optional `fill` and `name`
+/// — when supplied, they are stamped onto the node *before* it is
+/// inserted into the graph, which eliminates the second round-trip
+/// through `document_update_node` that the single-item helpers
+/// require to colour and label a node.
+///
+/// Mirrors `CanvasBatchItem` in `apps/desktop/shared/scene.ts`.
+#[derive(Debug, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CanvasBatchItem {
+    Rect {
+        parent: Option<Uuid>,
+        x: f64,
+        y: f64,
+        w: f64,
+        h: f64,
+        #[serde(default)]
+        fill: Option<kcreate_core::node::FillStyle>,
+        #[serde(default)]
+        name: Option<String>,
+    },
+    Ellipse {
+        parent: Option<Uuid>,
+        cx: f64,
+        cy: f64,
+        rx: f64,
+        ry: f64,
+        #[serde(default)]
+        fill: Option<kcreate_core::node::FillStyle>,
+        #[serde(default)]
+        name: Option<String>,
+    },
+    Line {
+        parent: Option<Uuid>,
+        x1: f64,
+        y1: f64,
+        x2: f64,
+        y2: f64,
+        #[serde(default)]
+        fill: Option<kcreate_core::node::FillStyle>,
+        #[serde(default)]
+        name: Option<String>,
+    },
+    Text {
+        parent: Option<Uuid>,
+        x: f64,
+        y: f64,
+        body: String,
+        family: String,
+        size: f32,
+        #[serde(default)]
+        fill: Option<kcreate_core::node::FillStyle>,
+        #[serde(default)]
+        name: Option<String>,
+    },
+}
+
+/// Build the in-memory [`Node`] for one batch item and report which
+/// `op_kind` should be recorded against it for undo/redo. Splitting
+/// this out of [`canvas_create_nodes`] keeps the per-item match arm
+/// small and lets the batch loop stay focused on lock ordering +
+/// op-log accounting.
+fn build_canvas_batch_node(
+    item: CanvasBatchItem,
+) -> Result<(Node, &'static str)> {
+    use kcreate_core::node::Bounds;
+    match item {
+        CanvasBatchItem::Rect {
+            parent,
+            x,
+            y,
+            w,
+            h,
+            fill,
+            name,
+        } => {
+            let path = kcreate_vector::VectorPath::new(vec![
+                kcreate_vector::PathSegment::MoveTo(kcreate_vector::PathPoint::new(x, y)),
+                kcreate_vector::PathSegment::LineTo(kcreate_vector::PathPoint::new(x + w, y)),
+                kcreate_vector::PathSegment::LineTo(kcreate_vector::PathPoint::new(
+                    x + w,
+                    y + h,
+                )),
+                kcreate_vector::PathSegment::LineTo(kcreate_vector::PathPoint::new(x, y + h)),
+                kcreate_vector::PathSegment::Close,
+            ]);
+            let default_name = name.as_deref().unwrap_or("Rectangle");
+            let mut node = Node::new(NodeType::VectorLayer, default_name);
+            node.parent_id = parent;
+            node.bounds = Bounds {
+                x,
+                y,
+                width: w,
+                height: h,
+            };
+            node.metadata.insert(
+                crate::scene_sync::VECTOR_PATH_METADATA_KEY.to_string(),
+                serde_json::to_value(&path)?,
+            );
+            if let Some(f) = fill {
+                node.style.fill = f;
+            }
+            Ok((node, "canvas_create_rect"))
+        }
+        CanvasBatchItem::Ellipse {
+            parent,
+            cx,
+            cy,
+            rx,
+            ry,
+            fill,
+            name,
+        } => {
+            const KAPPA: f64 = 0.552_284_749_830_793_4;
+            let ox = rx * KAPPA;
+            let oy = ry * KAPPA;
+            let path = kcreate_vector::VectorPath::new(vec![
+                kcreate_vector::PathSegment::MoveTo(kcreate_vector::PathPoint::new(
+                    cx - rx,
+                    cy,
+                )),
+                kcreate_vector::PathSegment::CubicTo {
+                    ctrl1: kcreate_vector::PathPoint::new(cx - rx, cy - oy),
+                    ctrl2: kcreate_vector::PathPoint::new(cx - ox, cy - ry),
+                    end: kcreate_vector::PathPoint::new(cx, cy - ry),
+                },
+                kcreate_vector::PathSegment::CubicTo {
+                    ctrl1: kcreate_vector::PathPoint::new(cx + ox, cy - ry),
+                    ctrl2: kcreate_vector::PathPoint::new(cx + rx, cy - oy),
+                    end: kcreate_vector::PathPoint::new(cx + rx, cy),
+                },
+                kcreate_vector::PathSegment::CubicTo {
+                    ctrl1: kcreate_vector::PathPoint::new(cx + rx, cy + oy),
+                    ctrl2: kcreate_vector::PathPoint::new(cx + ox, cy + ry),
+                    end: kcreate_vector::PathPoint::new(cx, cy + ry),
+                },
+                kcreate_vector::PathSegment::CubicTo {
+                    ctrl1: kcreate_vector::PathPoint::new(cx - ox, cy + ry),
+                    ctrl2: kcreate_vector::PathPoint::new(cx - rx, cy + oy),
+                    end: kcreate_vector::PathPoint::new(cx - rx, cy),
+                },
+                kcreate_vector::PathSegment::Close,
+            ]);
+            let default_name = name.as_deref().unwrap_or("Ellipse");
+            let mut node = Node::new(NodeType::VectorLayer, default_name);
+            node.parent_id = parent;
+            node.bounds = Bounds {
+                x: cx - rx,
+                y: cy - ry,
+                width: rx * 2.0,
+                height: ry * 2.0,
+            };
+            node.metadata.insert(
+                crate::scene_sync::VECTOR_PATH_METADATA_KEY.to_string(),
+                serde_json::to_value(&path)?,
+            );
+            if let Some(f) = fill {
+                node.style.fill = f;
+            }
+            Ok((node, "canvas_create_ellipse"))
+        }
+        CanvasBatchItem::Line {
+            parent,
+            x1,
+            y1,
+            x2,
+            y2,
+            fill,
+            name,
+        } => {
+            let path = kcreate_vector::VectorPath::new(vec![
+                kcreate_vector::PathSegment::MoveTo(kcreate_vector::PathPoint::new(x1, y1)),
+                kcreate_vector::PathSegment::LineTo(kcreate_vector::PathPoint::new(x2, y2)),
+            ]);
+            let bx = x1.min(x2);
+            let by = y1.min(y2);
+            let bw = (x2 - x1).abs();
+            let bh = (y2 - y1).abs();
+            let default_name = name.as_deref().unwrap_or("Line");
+            let mut node = Node::new(NodeType::VectorLayer, default_name);
+            node.parent_id = parent;
+            node.bounds = Bounds {
+                x: bx,
+                y: by,
+                width: bw,
+                height: bh,
+            };
+            node.metadata.insert(
+                crate::scene_sync::VECTOR_PATH_METADATA_KEY.to_string(),
+                serde_json::to_value(&path)?,
+            );
+            if let Some(f) = fill {
+                node.style.fill = f;
+            }
+            Ok((node, "canvas_create_line"))
+        }
+        CanvasBatchItem::Text {
+            parent,
+            x,
+            y,
+            body,
+            family,
+            size,
+            fill,
+            name,
+        } => {
+            let meta = crate::scene_sync::TextLayerMeta {
+                text: body.clone(),
+                font_family: family,
+                font_size: size,
+            };
+            let default_name = name.as_deref().unwrap_or("Text");
+            let mut node = Node::new(NodeType::TextLayer, default_name);
+            node.parent_id = parent;
+            node.bounds = Bounds {
+                x,
+                y,
+                // Same heuristic as single-item canvas_create_text:
+                // bounds width = size × char-count × 0.6, refined by
+                // the layer panel once shaping has run.
+                width: f64::from(size) * (body.len().max(1) as f64) * 0.6,
+                height: f64::from(size),
+            };
+            node.metadata.insert(
+                crate::scene_sync::TEXT_LAYER_METADATA_KEY.to_string(),
+                serde_json::to_value(&meta)?,
+            );
+            if let Some(f) = fill {
+                node.style.fill = f;
+            }
+            Ok((node, "canvas_create_text"))
+        }
+    }
+}
+
+/// Atomic batch creation of vector / text layers.
+///
+/// Why this exists: the per-item helpers (`canvas_create_rect`,
+/// `canvas_create_text`, …) each acquire `slot().write()` exclusively
+/// and run `sync_scene_locked` at the end. Seeding a template with
+/// 12 nodes therefore costs 12 lock acquisitions + 12 scene rebuilds
+/// (plus up to 12 follow-up `document_update_node` round-trips when
+/// the caller wants to stamp `fill` / `name`). On the HomePage →
+/// editor boot path this is dominated by the scene-sync passes.
+///
+/// `canvas_create_nodes` takes the write lock once, inserts every
+/// node in order, records one `Operation` per item against the
+/// existing op-kinds so undo / redo granularity is preserved, then
+/// runs a single `sync_scene_locked` before releasing the lock. Each
+/// item may carry `fill` and `name` fields which are stamped onto the
+/// `Node` *before* `insert_node` is called — so the batch never has
+/// to round-trip through `document_update_node` to colour or label a
+/// node, even though both fields are still independently mutable
+/// afterwards via the normal IPC.
+///
+/// Items are inserted strictly in submission order so the document's
+/// z-order is deterministic from the caller's perspective (the
+/// renderer's draw loop walks children front-to-back of the insertion
+/// list).
+///
+/// Returns the new node ids in the same order as `items`. An empty
+/// `items` is a no-op and returns immediately without taking the
+/// lock.
+pub fn canvas_create_nodes(items: Vec<CanvasBatchItem>) -> Result<Vec<Uuid>> {
+    if items.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut guard = slot().write();
+    let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
+    let mut created_ids = Vec::with_capacity(items.len());
+    for item in items {
+        let (node, op_kind) = build_canvas_batch_node(item)?;
+        let id = ws.project.document.insert_node(node)?;
+        let snapshot = ws
+            .project
+            .document
+            .get_node(id)
+            .map_or(serde_json::Value::Null, |n| {
+                serde_json::to_value(n).unwrap_or(serde_json::Value::Null)
+            });
+        let op = Operation::new(
+            "user",
+            op_kind,
+            serde_json::Value::Null,
+            snapshot,
+            vec![id],
+        );
+        ws.project.execute_operation(op);
+        created_ids.push(id);
+    }
+    ws.project.modified_at = Utc::now();
+    let _ = sync_scene_locked(&mut guard);
+    drop(guard);
+    Ok(created_ids)
+}
+
+// -----------------------------------------------------------------------------
 // Runtime status
 // -----------------------------------------------------------------------------
 

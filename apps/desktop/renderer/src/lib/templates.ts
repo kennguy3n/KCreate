@@ -19,7 +19,11 @@
 // in the editor, just with a blank canvas they can recover from
 // manually.
 
-import type { FillStyle, RgbaColor } from "../../../shared/scene";
+import type {
+  CanvasBatchItem,
+  FillStyle,
+  RgbaColor,
+} from "../../../shared/scene";
 
 /// Resolver context — what the bridge gives us *after* the
 /// artboard has been created. We pass the artboard's world-space
@@ -66,69 +70,95 @@ function solidFill(rgb: string, alpha = 1.0): FillStyle {
   return { kind: "solid", ...hex(rgb, alpha) };
 }
 
-/// Apply `fill` and/or `name` to a freshly created node in a single
-/// `updateNode` IPC round-trip. Both fields live on `UpdateNodeProps`
-/// (see `apps/desktop/shared/scene.ts`) and the bridge merges any
-/// subset of props in one shot, so issuing two sequential calls — one
-/// for `fill`, one for `name` — was pure latency overhead on the
-/// editor boot path. Each template resolver creates 5–12 nodes with
-/// both fields set, so combining halves the IPC traffic on the
-/// HomePage → editor transition.
+/// Named-argument shape for queuing a text node into a
+/// [`BatchBuilder`]. The required fields (`x`, `y`, `body`, `size`)
+/// stay distinct from the optional cosmetic fields (`fill`, `family`,
+/// `name`) so a call site cannot silently reorder the two
+/// height-vs-size or family-vs-name params — the most common
+/// footgun in the previous positional API (Devin Review PR #31
+/// flagged this on `templates.ts:113`).
 ///
-/// Returns immediately (no IPC) when neither field is supplied; the
-/// caller may have legitimate reasons to seed an anonymous, unfilled
-/// node (e.g. a temporary measurement guide).
-///
-/// The presence checks use explicit `=== null` / `=== undefined`
-/// instead of truthiness so an empty-string `name` (a legitimate way
-/// to clear an existing name) still issues the IPC. Truthy checks
-/// would silently drop `name: ""` and `name: undefined` alike, which
-/// is fine for every current call site but a footgun for any future
-/// resolver that genuinely wants to blank out a node's name.
-async function paint(
-  nodeId: string,
-  fill: FillStyle | null,
-  name: string | undefined,
-): Promise<void> {
-  if (fill === null && name === undefined) return;
-  const props: { fill?: FillStyle; name?: string } = {};
-  if (fill !== null) props.fill = fill;
-  if (name !== undefined) props.name = name;
-  await window.kcreate.document.updateNode(nodeId, props);
+/// `fill = null` is rejected at the type level (use `undefined`
+/// instead) so the bridge wire shape never has to carry a nullable
+/// fill; the helper only inserts the field into the batch item
+/// when it's actually set.
+export interface TextSeed {
+  x: number;
+  y: number;
+  body: string;
+  size: number;
+  fill?: FillStyle;
+  family?: string;
+  name?: string;
 }
 
-async function rect(
-  x: number,
-  y: number,
-  w: number,
-  h: number,
-  fill: FillStyle | null = null,
-  name?: string,
-): Promise<string> {
-  const id = await window.kcreate.canvas.createRect(null, x, y, w, h);
-  await paint(id, fill, name);
-  return id;
+/// Named-argument shape for queuing a rectangle into a
+/// [`BatchBuilder`]. Mirrors [`TextSeed`]'s contract — required
+/// geometry first, optional cosmetic fields second.
+export interface RectSeed {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  fill?: FillStyle;
+  name?: string;
 }
 
-async function text(
-  x: number,
-  y: number,
-  body: string,
-  size: number,
-  fill: FillStyle | null = null,
-  family = "sans-serif",
-  name?: string,
-): Promise<string> {
-  const id = await window.kcreate.canvas.createText(
-    null,
-    x,
-    y,
-    body,
-    family,
-    size,
-  );
-  await paint(id, fill, name);
-  return id;
+/// Builds up a list of canvas primitives, then flushes them through
+/// the batch bridge API in a single round-trip. The bridge takes
+/// the workspace write lock once, inserts every item in submission
+/// order, records one operation per item, and runs a single
+/// `sync_scene` — collapsing a 12-node template from ~24 IPC
+/// round-trips (12 × create + 12 × updateNode for fill/name) down
+/// to a single `createNodes` call.
+///
+/// Helpers are synchronous (no IPC during build) so the resolver
+/// body reads as a flat list of geometry decisions. Only `flush()`
+/// touches the bridge.
+interface BatchBuilder {
+  rect(seed: RectSeed): void;
+  text(seed: TextSeed): void;
+  flush(): Promise<string[]>;
+}
+
+/// Construct a fresh [`BatchBuilder`]. Each resolver builds its own
+/// — they don't share state so the order of `apply()` calls is
+/// deterministic from the caller's perspective.
+function makeBatch(): BatchBuilder {
+  const items: CanvasBatchItem[] = [];
+  return {
+    rect({ x, y, w, h, fill, name }) {
+      const item: Extract<CanvasBatchItem, { kind: "rect" }> = {
+        kind: "rect",
+        parent: null,
+        x,
+        y,
+        w,
+        h,
+      };
+      if (fill !== undefined) item.fill = fill;
+      if (name !== undefined) item.name = name;
+      items.push(item);
+    },
+    text({ x, y, body, size, fill, family = "sans-serif", name }) {
+      const item: Extract<CanvasBatchItem, { kind: "text" }> = {
+        kind: "text",
+        parent: null,
+        x,
+        y,
+        body,
+        family,
+        size,
+      };
+      if (fill !== undefined) item.fill = fill;
+      if (name !== undefined) item.name = name;
+      items.push(item);
+    },
+    async flush() {
+      if (items.length === 0) return [];
+      return await window.kcreate.canvas.createNodes(items);
+    },
+  };
 }
 
 /// Brewline-flavoured brand palette. Reused by the demo +
@@ -145,27 +175,26 @@ export const BRAND_PALETTE = {
 
 const BRAND_RESOLVER: TemplateResolver = {
   async apply(ctx) {
+    const b = makeBatch();
     // Heading + tagline anchored to the top of the artboard.
     const { x: ax, y: ay, width: aw, height: ah } = ctx;
     const margin = Math.round(aw * 0.06);
-    await text(
-      ax + margin,
-      ay + margin,
-      "Brand Name",
-      64,
-      solidFill(BRAND_PALETTE.ink),
-      "sans-serif",
-      "Brand title",
-    );
-    await text(
-      ax + margin,
-      ay + margin + 96,
-      "Tagline goes here",
-      24,
-      solidFill(BRAND_PALETTE.espresso),
-      "sans-serif",
-      "Tagline",
-    );
+    b.text({
+      x: ax + margin,
+      y: ay + margin,
+      body: "Brand Name",
+      size: 64,
+      fill: solidFill(BRAND_PALETTE.ink),
+      name: "Brand title",
+    });
+    b.text({
+      x: ax + margin,
+      y: ay + margin + 96,
+      body: "Tagline goes here",
+      size: 24,
+      fill: solidFill(BRAND_PALETTE.espresso),
+      name: "Tagline",
+    });
 
     // Palette swatch row across the middle of the canvas. Four
     // even-width swatches with a small horizontal gap; total row
@@ -235,23 +264,22 @@ const BRAND_RESOLVER: TemplateResolver = {
       const s = swatches[i];
       if (!s) continue;
       const sx = ax + margin + i * (swatchWidth + swatchGap);
-      await rect(
-        sx,
-        swatchY,
-        swatchWidth,
-        swatchHeight,
-        solidFill(s.hex),
-        `Palette / ${s.label}`,
-      );
-      await text(
-        sx,
-        swatchY + swatchHeight + 16,
-        s.label,
-        20,
-        solidFill(BRAND_PALETTE.ink),
-        "sans-serif",
-        `Swatch label / ${s.label}`,
-      );
+      b.rect({
+        x: sx,
+        y: swatchY,
+        w: swatchWidth,
+        h: swatchHeight,
+        fill: solidFill(s.hex),
+        name: `Palette / ${s.label}`,
+      });
+      b.text({
+        x: sx,
+        y: swatchY + swatchHeight + 16,
+        body: s.label,
+        size: 20,
+        fill: solidFill(BRAND_PALETTE.ink),
+        name: `Swatch label / ${s.label}`,
+      });
     }
 
     // Logo placeholder mark anchored to the bottom-left. Rendered
@@ -262,14 +290,14 @@ const BRAND_RESOLVER: TemplateResolver = {
     // stays in lockstep.
     const logoX = ax + margin;
     const logoY = ay + logoTopRelative;
-    await rect(
-      logoX,
-      logoY,
-      logoSize,
-      logoSize,
-      solidFill(BRAND_PALETTE.espresso),
-      "Logo placeholder",
-    );
+    b.rect({
+      x: logoX,
+      y: logoY,
+      w: logoSize,
+      h: logoSize,
+      fill: solidFill(BRAND_PALETTE.espresso),
+      name: "Logo placeholder",
+    });
 
     // Caption placement: by default the caption sits to the *right* of
     // the logomark, vertically centred — the visual the shipped
@@ -305,154 +333,209 @@ const BRAND_RESOLVER: TemplateResolver = {
     const captionY = captionFitsRightOfLogo
       ? logoY + Math.round(logoSize / 2) - 14
       : logoY - captionFontSize - 8;
-    await text(
-      captionX,
-      captionY,
-      captionText,
-      captionFontSize,
-      solidFill(BRAND_PALETTE.espresso),
-      "sans-serif",
-      "Logo caption",
-    );
+    b.text({
+      x: captionX,
+      y: captionY,
+      body: captionText,
+      size: captionFontSize,
+      fill: solidFill(BRAND_PALETTE.espresso),
+      name: "Logo caption",
+    });
+    await b.flush();
   },
 };
 
 const SOCIAL_RESOLVER: TemplateResolver = {
   async apply(ctx) {
+    const b = makeBatch();
     const { x: ax, y: ay, width: aw, height: ah } = ctx;
     // Solid cream background covering the full artboard so the
-    // template reads as "designed" instead of "blank canvas".
-    await rect(ax, ay, aw, ah, solidFill(BRAND_PALETTE.cream), "Background");
+    // template reads as "designed" instead of "blank canvas". The
+    // background's width/height already come from the bridge as
+    // positive integers (artboard preset), but we run them through
+    // `Math.floor` / `Math.max(0, …)` defensively so a future
+    // resolver caller that derives `aw`/`ah` from a user-resized
+    // artboard can't accidentally hand the bridge a negative or
+    // fractional dimension. Mirrors the BRAND/APP_UI clamp pattern.
+    b.rect({
+      x: ax,
+      y: ay,
+      w: Math.max(0, Math.floor(aw)),
+      h: Math.max(0, Math.floor(ah)),
+      fill: solidFill(BRAND_PALETTE.cream),
+      name: "Background",
+    });
     // Burnt-orange band behind the headline to anchor the type.
-    const bandHeight = Math.round(ah * 0.28);
+    // `Math.floor` on the band height + width so the band never
+    // over-allocates against the artboard's right/bottom edges; the
+    // band Y is `Math.round`ed because its anchor is the top of
+    // the headline, which the eye naturally aligns rather than the
+    // exact pixel boundary the rect occupies. `Math.max(0, …)` so a
+    // very short artboard can't yield a negative band height.
+    const bandHeight = Math.max(0, Math.floor(ah * 0.28));
     const bandY = ay + Math.round(ah * 0.18);
-    await rect(
-      ax,
-      bandY,
-      aw,
-      bandHeight,
-      solidFill(BRAND_PALETTE.burntOrange),
-      "Headline band",
-    );
-    await text(
-      ax + Math.round(aw * 0.08),
-      bandY + Math.round(bandHeight * 0.25),
-      "Your Headline",
-      48,
-      solidFill(BRAND_PALETTE.cream),
-      "sans-serif",
-      "Headline",
-    );
-    await text(
-      ax + Math.round(aw * 0.08),
-      bandY + bandHeight + 48,
-      "Add your message here",
-      20,
-      solidFill(BRAND_PALETTE.espresso),
-      "sans-serif",
-      "Body copy",
-    );
+    b.rect({
+      x: ax,
+      y: bandY,
+      w: Math.max(0, Math.floor(aw)),
+      h: bandHeight,
+      fill: solidFill(BRAND_PALETTE.burntOrange),
+      name: "Headline band",
+    });
+    b.text({
+      x: ax + Math.round(aw * 0.08),
+      y: bandY + Math.round(bandHeight * 0.25),
+      body: "Your Headline",
+      size: 48,
+      fill: solidFill(BRAND_PALETTE.cream),
+      name: "Headline",
+    });
+    b.text({
+      x: ax + Math.round(aw * 0.08),
+      y: bandY + bandHeight + 48,
+      body: "Add your message here",
+      size: 20,
+      fill: solidFill(BRAND_PALETTE.espresso),
+      name: "Body copy",
+    });
     // Sage accent dot bottom-right (placeholder for a brand mark).
-    const dotSize = Math.round(aw * 0.08);
-    await rect(
-      ax + aw - dotSize - Math.round(aw * 0.06),
-      ay + ah - dotSize - Math.round(ah * 0.06),
-      dotSize,
-      dotSize,
-      solidFill(BRAND_PALETTE.sage),
-      "Accent",
-    );
+    // `Math.floor` on the dot size + clamp so a very narrow
+    // artboard yields a non-negative, non-overflowing dot.
+    const dotSize = Math.max(0, Math.floor(aw * 0.08));
+    b.rect({
+      x: ax + Math.max(0, aw - dotSize - Math.round(aw * 0.06)),
+      y: ay + Math.max(0, ah - dotSize - Math.round(ah * 0.06)),
+      w: dotSize,
+      h: dotSize,
+      fill: solidFill(BRAND_PALETTE.sage),
+      name: "Accent",
+    });
+    await b.flush();
   },
 };
 
 const PRINT_RESOLVER: TemplateResolver = {
   async apply(ctx) {
+    const b = makeBatch();
     const { x: ax, y: ay, width: aw, height: ah } = ctx;
     // Header bar across the top in espresso brown.
-    const headerHeight = Math.round(ah * 0.16);
-    await rect(
-      ax,
-      ay,
-      aw,
-      headerHeight,
-      solidFill(BRAND_PALETTE.espresso),
-      "Header bar",
-    );
+    // `Math.floor` (not `Math.round`) on heights so the header +
+    // body block + footer never collectively exceed `ah`; the
+    // BRAND/DECK/APP_UI resolvers already pin this invariant on
+    // their respective height budgets. `Math.max(0, …)` mirrors
+    // the BRAND `swatchHeight` clamp so a degenerate short
+    // artboard can't hand `createRect` a negative dimension.
+    const headerHeight = Math.max(0, Math.floor(ah * 0.16));
+    b.rect({
+      x: ax,
+      y: ay,
+      w: Math.max(0, Math.floor(aw)),
+      h: headerHeight,
+      fill: solidFill(BRAND_PALETTE.espresso),
+      name: "Header bar",
+    });
     const margin = Math.round(aw * 0.06);
-    await text(
-      ax + margin,
-      ay + Math.round(headerHeight * 0.3),
-      "Document Title",
-      72,
-      solidFill(BRAND_PALETTE.cream),
-      "sans-serif",
-      "Document title",
-    );
-    // Body placeholder block in cream.
-    await rect(
-      ax + margin,
-      ay + headerHeight + margin,
-      aw - margin * 2,
-      Math.round(ah * 0.5),
-      solidFill(BRAND_PALETTE.cream),
-      "Body block",
-    );
-    await text(
-      ax + margin * 2,
-      ay + headerHeight + margin * 2,
-      "Body copy goes here. Replace this placeholder with",
-      28,
-      solidFill(BRAND_PALETTE.ink),
-      "sans-serif",
-      "Body paragraph",
-    );
-    await text(
-      ax + margin * 2,
-      ay + headerHeight + margin * 2 + 40,
-      "your real content. The header bar above is editable too.",
-      28,
-      solidFill(BRAND_PALETTE.ink),
-      "sans-serif",
-      "Body paragraph 2",
-    );
-    // Footer accent strip in burnt orange.
-    const footerHeight = Math.round(ah * 0.04);
-    await rect(
-      ax,
-      ay + ah - footerHeight,
-      aw,
-      footerHeight,
-      solidFill(BRAND_PALETTE.burntOrange),
-      "Footer accent",
-    );
+    b.text({
+      x: ax + margin,
+      y: ay + Math.round(headerHeight * 0.3),
+      body: "Document Title",
+      size: 72,
+      fill: solidFill(BRAND_PALETTE.cream),
+      name: "Document title",
+    });
+    // Body placeholder block in cream. The body width subtracts
+    // both side margins from the artboard; `Math.max(0, …)` so a
+    // very narrow artboard (where `margin*2 > aw`) can't yield a
+    // negative width. Same protection on the body height.
+    const bodyBlockWidth = Math.max(0, Math.floor(aw - margin * 2));
+    const bodyBlockHeight = Math.max(0, Math.floor(ah * 0.5));
+    b.rect({
+      x: ax + margin,
+      y: ay + headerHeight + margin,
+      w: bodyBlockWidth,
+      h: bodyBlockHeight,
+      fill: solidFill(BRAND_PALETTE.cream),
+      name: "Body block",
+    });
+    b.text({
+      x: ax + margin * 2,
+      y: ay + headerHeight + margin * 2,
+      body: "Body copy goes here. Replace this placeholder with",
+      size: 28,
+      fill: solidFill(BRAND_PALETTE.ink),
+      name: "Body paragraph",
+    });
+    b.text({
+      x: ax + margin * 2,
+      y: ay + headerHeight + margin * 2 + 40,
+      body: "your real content. The header bar above is editable too.",
+      size: 28,
+      fill: solidFill(BRAND_PALETTE.ink),
+      name: "Body paragraph 2",
+    });
+    // Footer accent strip in burnt orange. `Math.floor` so the
+    // footer height never over-allocates against the artboard
+    // bottom edge. `Math.max(0, ay + ah - footerHeight)` so a
+    // negative-height artboard (impossible today, defensive for the
+    // same reason as BRAND `swatchHeight`) can't pin the footer
+    // above the artboard top.
+    const footerHeight = Math.max(0, Math.floor(ah * 0.04));
+    b.rect({
+      x: ax,
+      y: ay + Math.max(0, ah - footerHeight),
+      w: Math.max(0, Math.floor(aw)),
+      h: footerHeight,
+      fill: solidFill(BRAND_PALETTE.burntOrange),
+      name: "Footer accent",
+    });
+    await b.flush();
   },
 };
 
 const APP_UI_RESOLVER: TemplateResolver = {
   async apply(ctx) {
+    const b = makeBatch();
     const { x: ax, y: ay, width: aw, height: ah } = ctx;
-    // App-shell shell with a left rail, header, and content area.
-    const rail = Math.round(aw * 0.12);
-    const headerH = Math.round(ah * 0.08);
-    await rect(ax, ay, aw, ah, solidFill(BRAND_PALETTE.paper), "App background");
-    await rect(ax, ay, rail, ah, solidFill(BRAND_PALETTE.espresso), "Left rail");
-    await rect(
-      ax + rail,
-      ay,
-      aw - rail,
-      headerH,
-      solidFill(BRAND_PALETTE.cream),
-      "Header",
-    );
-    await text(
-      ax + rail + 32,
-      ay + Math.round(headerH * 0.3),
-      "App / Website UI",
-      28,
-      solidFill(BRAND_PALETTE.ink),
-      "sans-serif",
-      "Header title",
-    );
+    // App-shell with a left rail, header, and content area.
+    // `Math.floor` so the rail + content split fits the artboard
+    // exactly: `rail + (aw - rail) = aw` no matter the rounding
+    // mode for `rail`. Mirrors the DECK `colWidth` floor invariant.
+    // `Math.max(0, …)` defends against degenerate artboards a
+    // future surface might pass in.
+    const rail = Math.max(0, Math.floor(aw * 0.12));
+    const headerH = Math.max(0, Math.floor(ah * 0.08));
+    b.rect({
+      x: ax,
+      y: ay,
+      w: Math.max(0, Math.floor(aw)),
+      h: Math.max(0, Math.floor(ah)),
+      fill: solidFill(BRAND_PALETTE.paper),
+      name: "App background",
+    });
+    b.rect({
+      x: ax,
+      y: ay,
+      w: rail,
+      h: Math.max(0, Math.floor(ah)),
+      fill: solidFill(BRAND_PALETTE.espresso),
+      name: "Left rail",
+    });
+    b.rect({
+      x: ax + rail,
+      y: ay,
+      w: Math.max(0, aw - rail),
+      h: headerH,
+      fill: solidFill(BRAND_PALETTE.cream),
+      name: "Header",
+    });
+    b.text({
+      x: ax + rail + 32,
+      y: ay + Math.round(headerH * 0.3),
+      body: "App / Website UI",
+      size: 28,
+      fill: solidFill(BRAND_PALETTE.ink),
+      name: "Header title",
+    });
     // Three content tiles in the body area. `Math.floor` (not
     // `Math.round`) so the three-tile budget is never over-allocated,
     // mirroring the documented rationale on `DECK_RESOLVER`'s
@@ -476,33 +559,41 @@ const APP_UI_RESOLVER: TemplateResolver = {
     const tileHeight = Math.max(0, tileBottom - tileTop);
     for (let i = 0; i < 3; i += 1) {
       const tx = ax + rail + tileMargin + i * (tileWidth + tileMargin);
-      await rect(
-        tx,
-        tileTop,
-        tileWidth,
-        tileHeight,
-        solidFill(BRAND_PALETTE.cream),
-        `Content tile ${i + 1}`,
-      );
-      await text(
-        tx + 24,
-        tileTop + 24,
-        `Section ${i + 1}`,
-        22,
-        solidFill(BRAND_PALETTE.ink),
-        "sans-serif",
-        `Tile heading ${i + 1}`,
-      );
+      b.rect({
+        x: tx,
+        y: tileTop,
+        w: tileWidth,
+        h: tileHeight,
+        fill: solidFill(BRAND_PALETTE.cream),
+        name: `Content tile ${i + 1}`,
+      });
+      b.text({
+        x: tx + 24,
+        y: tileTop + 24,
+        body: `Section ${i + 1}`,
+        size: 22,
+        fill: solidFill(BRAND_PALETTE.ink),
+        name: `Tile heading ${i + 1}`,
+      });
     }
+    await b.flush();
   },
 };
 
 const PHOTO_RESOLVER: TemplateResolver = {
   async apply(ctx) {
+    const b = makeBatch();
     const { x: ax, y: ay, width: aw, height: ah } = ctx;
     // Checkerboard-style background hint so the user can tell
     // we're inside the artboard before they drop a photo in.
-    await rect(ax, ay, aw, ah, solidFill(BRAND_PALETTE.cream), "Photo backdrop");
+    b.rect({
+      x: ax,
+      y: ay,
+      w: Math.max(0, Math.floor(aw)),
+      h: Math.max(0, Math.floor(ah)),
+      fill: solidFill(BRAND_PALETTE.cream),
+      name: "Photo backdrop",
+    });
     // Margin is taken off the SHORT side so the inner drop-zone
     // square fits even on portrait/landscape artboards. The shipped
     // Photo preset is 2048×2048 (square), so on the happy path this
@@ -521,59 +612,64 @@ const PHOTO_RESOLVER: TemplateResolver = {
     // drop zone.
     const innerX = ax + Math.round((aw - innerSize) / 2);
     const innerY = ay + Math.round((ah - innerSize) / 2);
-    await rect(
-      innerX,
-      innerY,
-      innerSize,
-      innerSize,
-      solidFill(BRAND_PALETTE.paper),
-      "Drop zone",
-    );
-    await text(
-      innerX + 48,
-      innerY + 48,
-      "Import a photo",
-      48,
-      solidFill(BRAND_PALETTE.espresso),
-      "sans-serif",
-      "Drop zone heading",
-    );
-    await text(
-      innerX + 48,
-      innerY + 120,
-      "Use AI Assist \u2192 Background removal once imported.",
-      22,
-      solidFill(BRAND_PALETTE.ink),
-      "sans-serif",
-      "Drop zone hint",
-    );
+    b.rect({
+      x: innerX,
+      y: innerY,
+      w: innerSize,
+      h: innerSize,
+      fill: solidFill(BRAND_PALETTE.paper),
+      name: "Drop zone",
+    });
+    b.text({
+      x: innerX + 48,
+      y: innerY + 48,
+      body: "Import a photo",
+      size: 48,
+      fill: solidFill(BRAND_PALETTE.espresso),
+      name: "Drop zone heading",
+    });
+    b.text({
+      x: innerX + 48,
+      y: innerY + 120,
+      body: "Use AI Assist \u2192 Background removal once imported.",
+      size: 22,
+      fill: solidFill(BRAND_PALETTE.ink),
+      name: "Drop zone hint",
+    });
+    await b.flush();
   },
 };
 
 const DECK_RESOLVER: TemplateResolver = {
   async apply(ctx) {
+    const b = makeBatch();
     const { x: ax, y: ay, width: aw, height: ah } = ctx;
-    await rect(ax, ay, aw, ah, solidFill(BRAND_PALETTE.paper), "Slide background");
+    b.rect({
+      x: ax,
+      y: ay,
+      w: Math.max(0, Math.floor(aw)),
+      h: Math.max(0, Math.floor(ah)),
+      fill: solidFill(BRAND_PALETTE.paper),
+      name: "Slide background",
+    });
     const margin = Math.round(aw * 0.06);
     // Title block.
-    await text(
-      ax + margin,
-      ay + margin,
-      "Pitch Deck Title",
-      80,
-      solidFill(BRAND_PALETTE.ink),
-      "sans-serif",
-      "Slide title",
-    );
-    await text(
-      ax + margin,
-      ay + margin + 110,
-      "Subtitle or short positioning line",
-      32,
-      solidFill(BRAND_PALETTE.espresso),
-      "sans-serif",
-      "Subtitle",
-    );
+    b.text({
+      x: ax + margin,
+      y: ay + margin,
+      body: "Pitch Deck Title",
+      size: 80,
+      fill: solidFill(BRAND_PALETTE.ink),
+      name: "Slide title",
+    });
+    b.text({
+      x: ax + margin,
+      y: ay + margin + 110,
+      body: "Subtitle or short positioning line",
+      size: 32,
+      fill: solidFill(BRAND_PALETTE.espresso),
+      name: "Subtitle",
+    });
     // Two-column body for talking points. `colTop` already includes
     // the artboard Y-offset (`ay`), so the closing edge of the
     // column also has to include `ay` — otherwise a non-zero
@@ -603,27 +699,29 @@ const DECK_RESOLVER: TemplateResolver = {
     // a third column with `n * colWidth + (n+1) * margin <= aw`) can
     // rely on without re-deriving the rounding behaviour.
     const colWidth = Math.floor((aw - margin * 3) / 2);
-    await rect(
-      ax + margin,
-      colTop,
-      colWidth,
-      colHeight,
-      solidFill(BRAND_PALETTE.cream),
-      "Column A",
-    );
-    await rect(
-      ax + margin * 2 + colWidth,
-      colTop,
-      colWidth,
-      colHeight,
-      solidFill(BRAND_PALETTE.cream),
-      "Column B",
-    );
+    b.rect({
+      x: ax + margin,
+      y: colTop,
+      w: colWidth,
+      h: colHeight,
+      fill: solidFill(BRAND_PALETTE.cream),
+      name: "Column A",
+    });
+    b.rect({
+      x: ax + margin * 2 + colWidth,
+      y: colTop,
+      w: colWidth,
+      h: colHeight,
+      fill: solidFill(BRAND_PALETTE.cream),
+      name: "Column B",
+    });
+    await b.flush();
   },
 };
 
 const DEV_EXPORT_RESOLVER: TemplateResolver = {
   async apply(ctx) {
+    const b = makeBatch();
     const { x: ax, y: ay, width: aw, height: ah } = ctx;
     // The dev-export preset is the icon-pack starting point, so we
     // frame the canvas like an icon preview surface (filled body
@@ -633,35 +731,52 @@ const DEV_EXPORT_RESOLVER: TemplateResolver = {
     // keeps that boundary explicit so a future contributor doesn't
     // assume the rectangles below are grid-aligned.
     const iconGridSizeHint = 64;
-    await rect(ax, ay, aw, ah, solidFill(BRAND_PALETTE.paper), "Icon backdrop");
-    const inset = Math.round(aw * 0.12);
-    await rect(
-      ax + inset,
-      ay + inset,
-      aw - inset * 2,
-      ah - inset * 2,
-      solidFill(BRAND_PALETTE.burntOrange),
-      "Icon body",
-    );
+    b.rect({
+      x: ax,
+      y: ay,
+      w: Math.max(0, Math.floor(aw)),
+      h: Math.max(0, Math.floor(ah)),
+      fill: solidFill(BRAND_PALETTE.paper),
+      name: "Icon backdrop",
+    });
+    // `Math.floor` on the inset so the icon body's right/bottom
+    // edges never bleed past the artboard. `Math.max(0, …)` on the
+    // resulting body dimensions defends against a degenerate
+    // artboard (where `inset * 2 > aw` would yield a negative
+    // body), mirroring the BRAND/APP_UI clamp pattern.
+    const inset = Math.max(0, Math.floor(aw * 0.12));
+    const bodyW = Math.max(0, aw - inset * 2);
+    const bodyH = Math.max(0, ah - inset * 2);
+    b.rect({
+      x: ax + inset,
+      y: ay + inset,
+      w: bodyW,
+      h: bodyH,
+      fill: solidFill(BRAND_PALETTE.burntOrange),
+      name: "Icon body",
+    });
     // Inner notch so the icon body has visual content out of the box.
-    const notch = Math.round((aw - inset * 2) * 0.35);
-    await rect(
-      ax + Math.round(aw / 2) - Math.round(notch / 2),
-      ay + Math.round(ah / 2) - Math.round(notch / 2),
-      notch,
-      notch,
-      solidFill(BRAND_PALETTE.cream),
-      "Icon notch",
-    );
-    await text(
-      ax + 16,
-      ay + 16,
-      `${aw}×${ah}\u00a0\u00b7\u00a0${iconGridSizeHint}px grid`,
-      18,
-      solidFill(BRAND_PALETTE.espresso),
-      "sans-serif",
-      "Spec caption",
-    );
+    // `Math.floor` so the notch never over-allocates inside the body;
+    // `Math.max(0, …)` defends against the same degenerate-artboard
+    // case as the body above.
+    const notch = Math.max(0, Math.floor(bodyW * 0.35));
+    b.rect({
+      x: ax + Math.round(aw / 2) - Math.round(notch / 2),
+      y: ay + Math.round(ah / 2) - Math.round(notch / 2),
+      w: notch,
+      h: notch,
+      fill: solidFill(BRAND_PALETTE.cream),
+      name: "Icon notch",
+    });
+    b.text({
+      x: ax + 16,
+      y: ay + 16,
+      body: `${aw}×${ah}\u00a0\u00b7\u00a0${iconGridSizeHint}px grid`,
+      size: 18,
+      fill: solidFill(BRAND_PALETTE.espresso),
+      name: "Spec caption",
+    });
+    await b.flush();
   },
 };
 

@@ -46,13 +46,41 @@ export type RightPanelTab =
   | "publish"
   | "encryption";
 
+/// One entry in the RightPanel tab strip. `id` is generic so each
+/// call site keeps its narrowed `RightPanelTab` discriminant after
+/// going through `mkTab` below.
+type Tab = { id: RightPanelTab; label: string; icon: IconName };
+
+/// Typed-identity helper used by the `TABS` `useMemo` factory to
+/// build conditional tab entries. The parameter type validates the
+/// `icon` string against the `IconName` union at compile time. Bare
+/// object literals would widen `icon` to `string` (TypeScript only
+/// narrows literal-typed properties when the contextual type is
+/// propagated, which doesn't happen through a fresh array literal
+/// spread), defeating the whole point of `IconName`. The helper
+/// restores type-checking without forcing every caller to write
+/// `as IconName` casts that silently accept typos.
+///
+/// Hoisted to module scope (instead of `const mkTab = ...` inside
+/// `RightPanel`) for two reasons:
+///   1. It's a pure `t => t` identity — it never captures component
+///      state, props, or closure refs. Keeping it stable across
+///      renders makes the intent obvious.
+///   2. The `useMemo` factory references it; defining it inside the
+///      component body would create a new function identity each
+///      render, and `react-hooks/exhaustive-deps` would (correctly)
+///      flag it as a missing dependency. The factory's stable
+///      `[showAccessibility, showInteraction, showPreflight, showColor]`
+///      dep list is the right set; hoisting keeps that list honest.
+function mkTab<Id extends RightPanelTab>(
+  t: { id: Id; label: string; icon: IconName },
+): { id: Id; label: string; icon: IconName } {
+  return t;
+}
+
 /// Tabs shown by default. Some tabs (Accessibility, Interaction) only
 /// appear when the active editor mode calls for them — gated below.
-const BASE_TABS: ReadonlyArray<{
-  id: RightPanelTab;
-  label: string;
-  icon: IconName;
-}> = [
+const BASE_TABS: ReadonlyArray<Tab> = [
   { id: "properties", label: "Properties", icon: "sliders-horizontal" },
   { id: "effects", label: "Effects", icon: "sparkles" },
   { id: "ai", label: "AI Assist", icon: "bot" },
@@ -133,22 +161,20 @@ export function RightPanel({
   // a fresh array (and new option object literals) on every render,
   // breaking referential equality for any downstream memo.
   //
-  // Each conditional entry goes through `tab(...)`, a typed-identity
-  // helper whose parameter type validates the `icon` string against
-  // the `IconName` union at compile time. Bare object literals would
+  // Each conditional entry goes through the module-scope `mkTab`
+  // helper (defined below the component) — a typed-identity function
+  // whose parameter type validates the `icon` string against the
+  // `IconName` union at compile time. Bare object literals would
   // widen `icon` to `string` (TypeScript only narrows literal-typed
   // properties when the contextual type is propagated, which doesn't
   // happen through a fresh array literal spread), defeating the
   // whole point of `IconName`. The helper restores type-checking
   // without forcing every caller to write `as IconName` casts that
   // silently accept typos. `id` is generic so each tab keeps its
-  // narrowed `RightPanelTab` discriminant.
-  type Tab = { id: RightPanelTab; label: string; icon: IconName };
-  // Renamed `mkTab` (not `tab`) to avoid shadowing the active-tab
-  // `tab` / `setTab` `useState` pair declared below.
-  const mkTab = <Id extends RightPanelTab>(
-    t: { id: Id; label: string; icon: IconName },
-  ): { id: Id; label: string; icon: IconName } => t;
+  // narrowed `RightPanelTab` discriminant. Hoisting it out of the
+  // component body keeps it out of `useMemo`'s captured-deps closure
+  // (it's a pure `t => t` identity, identical every render), which
+  // silences `react-hooks/exhaustive-deps` without false negatives.
   const TABS = useMemo<ReadonlyArray<Tab>>(
     () => [
       ...BASE_TABS,

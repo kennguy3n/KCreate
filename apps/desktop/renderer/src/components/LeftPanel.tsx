@@ -128,12 +128,19 @@ export function LeftPanel({
     >
       <PanelTabs
         tabs={[
-          { id: "pages", label: "Pages" },
-          { id: "artboards", label: "Artboards" },
-          { id: "layers", label: "Layers" },
-          { id: "assets", label: "Assets" },
-          { id: "tokens", label: "Tokens" },
-          { id: "brand", label: "Brand" },
+          // Icons paired with each tab mirror the RightPanel pattern
+          // (see `mkTab` + `BASE_TABS` in `RightPanel.tsx`) so the two
+          // side panels read as the same control surface. Picked by
+          // semantic match: layers ↔ stacked rectangles, artboards ↔
+          // boxed frame, brand ↔ palette, etc. The leading icon is
+          // 14px (inline) so the strip stays narrow enough for a 260px
+          // panel without wrapping the labels.
+          { id: "pages", label: "Pages", icon: "file-text" },
+          { id: "artboards", label: "Artboards", icon: "frame" },
+          { id: "layers", label: "Layers", icon: "layers" },
+          { id: "assets", label: "Assets", icon: "package" },
+          { id: "tokens", label: "Tokens", icon: "variable" },
+          { id: "brand", label: "Brand", icon: "palette" },
         ]}
         active={tab}
         onChange={setTab}
@@ -402,7 +409,11 @@ function PanelTabs<T extends string>({
   active,
   onChange,
 }: {
-  tabs: ReadonlyArray<{ id: T; label: string }>;
+  /// Each tab carries an optional Lucide `icon` rendered before the
+  /// label. Optional (not required) so existing callers — and any
+  /// future ones that need a label-only tab strip — keep compiling
+  /// without a sentinel value.
+  tabs: ReadonlyArray<{ id: T; label: string; icon?: IconName }>;
   active: T;
   onChange: (id: T) => void;
 }): JSX.Element {
@@ -423,7 +434,14 @@ function PanelTabs<T extends string>({
           aria-selected={active === t.id}
           onClick={() => onChange(t.id)}
           style={{
+            // `flex: 1` distributes the strip width evenly; the
+            // inline-flex inner row aligns icon + label without
+            // disturbing that outer distribution.
             flex: 1,
+            display: "inline-flex",
+            alignItems: "center",
+            justifyContent: "center",
+            gap: 4,
             padding: "6px 8px",
             fontSize: 12,
             fontWeight: 500,
@@ -436,6 +454,7 @@ function PanelTabs<T extends string>({
             cursor: "pointer",
           }}
         >
+          {t.icon ? <Icon name={t.icon} size={14} /> : null}
           {t.label}
         </button>
       ))}

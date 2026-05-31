@@ -383,19 +383,35 @@ const PHOTO_RESOLVER: TemplateResolver = {
     // Checkerboard-style background hint so the user can tell
     // we're inside the artboard before they drop a photo in.
     await rect(ax, ay, aw, ah, solidFill(BRAND_PALETTE.cream), "Photo backdrop");
-    const margin = Math.round(aw * 0.1);
-    const innerSize = aw - margin * 2;
+    // Margin is taken off the SHORT side so the inner drop-zone
+    // square fits even on portrait/landscape artboards. The shipped
+    // Photo preset is 2048×2048 (square), so on the happy path this
+    // collapses to `aw * 0.1` (the previous behaviour). The reason
+    // we centre the inner square inside the artboard is so a future
+    // 3000×2000 "photo cleanup" preset — or any custom artboard the
+    // user resizes to a non-square aspect — doesn't get a drop zone
+    // that overflows the shorter axis. Mirrors the defensive
+    // `Math.min` clamp `DECK_RESOLVER` applies to its title reserve
+    // (see `titleReserve` below).
+    const shortSide = Math.min(aw, ah);
+    const margin = Math.round(shortSide * 0.1);
+    const innerSize = Math.max(0, shortSide - margin * 2);
+    // Centre the square inside the artboard so unused space lands on
+    // both sides of the dominant axis instead of below/right of the
+    // drop zone.
+    const innerX = ax + Math.round((aw - innerSize) / 2);
+    const innerY = ay + Math.round((ah - innerSize) / 2);
     await rect(
-      ax + margin,
-      ay + margin,
+      innerX,
+      innerY,
       innerSize,
       innerSize,
       solidFill(BRAND_PALETTE.paper),
       "Drop zone",
     );
     await text(
-      ax + margin + 48,
-      ay + margin + 48,
+      innerX + 48,
+      innerY + 48,
       "Import a photo",
       48,
       solidFill(BRAND_PALETTE.espresso),
@@ -403,8 +419,8 @@ const PHOTO_RESOLVER: TemplateResolver = {
       "Drop zone heading",
     );
     await text(
-      ax + margin + 48,
-      ay + margin + 120,
+      innerX + 48,
+      innerY + 120,
       "Use AI Assist \u2192 Background removal once imported.",
       22,
       solidFill(BRAND_PALETTE.ink),
@@ -479,10 +495,14 @@ const DECK_RESOLVER: TemplateResolver = {
 const DEV_EXPORT_RESOLVER: TemplateResolver = {
   async apply(ctx) {
     const { x: ax, y: ay, width: aw, height: ah } = ctx;
-    // 64-grid alignment hint behind a centred icon glyph
-    // placeholder. A 512px artboard reads as a single "tile" so
-    // we frame the canvas like an icon preview surface.
-    const grid = 64;
+    // The dev-export preset is the icon-pack starting point, so we
+    // frame the canvas like an icon preview surface (filled body
+    // with a centred notch) and label the artboard with the export
+    // grid size. `iconGridSizeHint` is purely a label — nothing
+    // below snaps to it. Naming it `gridHint` (rather than `grid`)
+    // keeps that boundary explicit so a future contributor doesn't
+    // assume the rectangles below are grid-aligned.
+    const iconGridSizeHint = 64;
     await rect(ax, ay, aw, ah, solidFill(BRAND_PALETTE.paper), "Icon backdrop");
     const inset = Math.round(aw * 0.12);
     await rect(
@@ -506,7 +526,7 @@ const DEV_EXPORT_RESOLVER: TemplateResolver = {
     await text(
       ax + 16,
       ay + 16,
-      `${aw}\u00d7${ah}\u00a0\u00b7\u00a0${grid}px grid`,
+      `${aw}\u00d7${ah}\u00a0\u00b7\u00a0${iconGridSizeHint}px grid`,
       18,
       solidFill(BRAND_PALETTE.espresso),
       "sans-serif",

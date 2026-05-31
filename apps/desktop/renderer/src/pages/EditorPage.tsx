@@ -318,7 +318,19 @@ function EditorPageInner({
     refreshComponents,
   ]);
 
-  // Initial load + on-mode-change resync.
+  // Initial-load resync. Fires once on mount because `refreshTree`'s
+  // identity is stable for the provider's lifetime (all of its
+  // transitive deps — `refreshDocumentTree`, `refreshStatus`,
+  // `refreshSelection`, `refreshArtboards`, `refreshComponents` —
+  // come from DocumentContext / EditorContext actions, both of which
+  // are memoised with empty deps so their callable identities never
+  // change).
+  //
+  // Pre-refactor this comment said "Initial load + on-mode-change
+  // resync", which was stale — mode-change reset for the active
+  // tool is handled by a separate `useEffect` further down (the one
+  // keyed on `[mode, tool, setTool]`). Devin Review #0004 on
+  // commit `5b09939` flagged the drift.
   useEffect(() => {
     void refreshTree();
   }, [refreshTree]);

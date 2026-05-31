@@ -39,26 +39,38 @@ const ROOT = resolve(TESTS_DIR, "..");
 /// in-memory ESM bundle and import it via a data: URL so the tests
 /// run without a pre-built `dist/`. Matches the strategy used by
 /// `apps/kchat-extension/tests/manifest.test.mjs`.
+///
+/// The compiled module is memoised at file scope: every test sees the
+/// same imported module reference, which is sound because the
+/// resolver code is purely functional (no module-level state) and is
+/// the same input on every call. Recompiling on each test wastes
+/// ~50–100ms × N tests = up to a second of CI time for a result that
+/// is guaranteed to be byte-identical.
+let _resolverModulePromise = null;
 async function loadResolvers() {
-  const result = await build({
-    entryPoints: [resolve(ROOT, "src/lib/templates.ts")],
-    bundle: true,
-    format: "esm",
-    target: ["es2022"],
-    platform: "neutral",
-    write: false,
-    legalComments: "none",
-    mainFields: ["module", "main"],
-    conditions: ["import", "default"],
-  });
-  const code = result.outputFiles[0]?.text;
-  if (!code) {
-    throw new Error("failed to compile src/lib/templates.ts");
-  }
-  const dataUrl = `data:text/javascript;base64,${Buffer.from(code).toString(
-    "base64",
-  )}`;
-  return import(dataUrl);
+  if (_resolverModulePromise) return _resolverModulePromise;
+  _resolverModulePromise = (async () => {
+    const result = await build({
+      entryPoints: [resolve(ROOT, "src/lib/templates.ts")],
+      bundle: true,
+      format: "esm",
+      target: ["es2022"],
+      platform: "neutral",
+      write: false,
+      legalComments: "none",
+      mainFields: ["module", "main"],
+      conditions: ["import", "default"],
+    });
+    const code = result.outputFiles[0]?.text;
+    if (!code) {
+      throw new Error("failed to compile src/lib/templates.ts");
+    }
+    const dataUrl = `data:text/javascript;base64,${Buffer.from(code).toString(
+      "base64",
+    )}`;
+    return import(dataUrl);
+  })();
+  return _resolverModulePromise;
 }
 
 /// Build a recording stub for `window.kcreate` and install it as
@@ -67,7 +79,16 @@ async function loadResolvers() {
 /// form `n-N` (N = 0, 1, 2, …) to every `createRect` / `createText`
 /// call so the follow-up `updateNode` calls can be correlated with
 /// the node they paint.
-function installRecorder() {
+///
+/// `globalThis.window` is overwritten for the lifetime of the test;
+/// the previous value is saved and restored via `t.after()` so a
+/// future contributor enabling `--test-concurrency` (or interleaving
+/// tests with a jsdom-installing helper) does not stomp on a sibling
+/// suite's window. Pass the test's `t` from the `node:test` callback
+/// to opt into the auto-restore; tests that forget to thread `t`
+/// through will still see the recorder, but won't get cleanup — the
+/// in-tree tests all pass `t` so this stays uniform.
+function installRecorder(t) {
   const calls = [];
   let nextId = 0;
   const recorder = {
@@ -91,8 +112,22 @@ function installRecorder() {
   };
   // jsdom isn't pulled in for these tests; assign a minimal stand-in
   // for `window` so `window.kcreate.*` resolves. The resolver never
-  // touches anything else on `window`.
+  // touches anything else on `window`. We save the previous value
+  // (`undefined` in the default Node runtime, but a real `Window`
+  // object if something like jsdom wired one up) so the teardown can
+  // restore it without unconditionally `delete`ing the global.
+  const hadPrevious = "window" in globalThis;
+  const previous = globalThis.window;
   globalThis.window = { kcreate: recorder };
+  if (t && typeof t.after === "function") {
+    t.after(() => {
+      if (hadPrevious) {
+        globalThis.window = previous;
+      } else {
+        delete globalThis.window;
+      }
+    });
+  }
   return calls;
 }
 
@@ -219,9 +254,9 @@ test("templateResolverFor returns a resolver for every CREATE_OPTIONS id with a 
   );
 });
 
-test("BRAND resolver seeds title, tagline, four palette swatches with labels, and a logo placeholder + caption", async () => {
+test("BRAND resolver seeds title, tagline, four palette swatches with labels, and a logo placeholder + caption", async (t) => {
   const { BRAND_PALETTE, templateResolverFor } = await loadResolvers();
-  const calls = installRecorder();
+  const calls = installRecorder(t);
   await templateResolverFor("brand").apply(A1080);
   assertInsideArtboard(calls, A1080);
   const nodes = nodesFromCalls(calls);
@@ -264,9 +299,63 @@ test("BRAND resolver seeds title, tagline, four palette swatches with labels, an
   assert.equal(named.get("Logo caption").create.kind, "createText");
 });
 
-test("SOCIAL resolver seeds a cream background, burnt-orange headline band, headline + body copy, and sage accent", async () => {
+// The shipped `brand` card on HomePage.tsx wires the editor to a
+// 1024×1024 artboard. The general BRAND test above runs against
+// 1920×1080 (a stress test for the non-square case), so this
+// supplementary case pins the *production* geometry: every seeded
+// node must land inside the actual preset and the resolver must
+// still emit the full set of named nodes (title, tagline, four
+// swatches, logo placeholder + caption) at the smaller square
+// dimension. Mirrors the bot's review suggestion on commit 9746c8e.
+test("BRAND resolver lays out cleanly on the actual 1024\u00d71024 brand preset", async (t) => {
   const { BRAND_PALETTE, templateResolverFor } = await loadResolvers();
-  const calls = installRecorder();
+  const ctx = { x: 0, y: 0, width: 1024, height: 1024 };
+  const calls = installRecorder(t);
+  await templateResolverFor("brand").apply(ctx);
+  assertInsideArtboard(calls, ctx);
+  const nodes = nodesFromCalls(calls);
+  const named = new Map(
+    [...nodes.values()]
+      .map((n) => [nameOf(n), n])
+      .filter(([n]) => n !== null),
+  );
+  // All headline + tagline + swatches + logo nodes must still be
+  // present at the smaller square dimension.
+  for (const required of [
+    "Brand title",
+    "Tagline",
+    "Palette / Espresso",
+    "Palette / Cream",
+    "Palette / Burnt orange",
+    "Palette / Sage",
+    "Logo placeholder",
+    "Logo caption",
+  ]) {
+    assert.ok(named.has(required), `missing '${required}' on 1024\u00d71024`);
+  }
+  // Swatches keep their palette colours.
+  assert.deepEqual(
+    fillOf(named.get("Palette / Espresso")),
+    paletteFill(BRAND_PALETTE.espresso),
+  );
+  assert.deepEqual(
+    fillOf(named.get("Palette / Sage")),
+    paletteFill(BRAND_PALETTE.sage),
+  );
+  // Swatch row sits inside the artboard horizontally (no overflow on
+  // the right edge). Worst-case offender on a tight square preset is
+  // the last swatch's right edge.
+  const lastSwatch = named.get("Palette / Sage");
+  const lastRight = lastSwatch.create.x + lastSwatch.create.w;
+  assert.ok(
+    lastRight <= ctx.width,
+    `last swatch right edge ${lastRight} > artboard width ${ctx.width}`,
+  );
+});
+
+test("SOCIAL resolver seeds a cream background, burnt-orange headline band, headline + body copy, and sage accent", async (t) => {
+  const { BRAND_PALETTE, templateResolverFor } = await loadResolvers();
+  const calls = installRecorder(t);
   // The shipped social preset is 1080×1080.
   const ctx = { x: 0, y: 0, width: 1080, height: 1080 };
   await templateResolverFor("social").apply(ctx);
@@ -299,9 +388,9 @@ test("SOCIAL resolver seeds a cream background, burnt-orange headline band, head
   assert.deepEqual(fillOf(accent), paletteFill(BRAND_PALETTE.sage));
 });
 
-test("PRINT resolver seeds an espresso header bar, cream body block, two body paragraphs, and a burnt-orange footer accent on A4", async () => {
+test("PRINT resolver seeds an espresso header bar, cream body block, two body paragraphs, and a burnt-orange footer accent on A4", async (t) => {
   const { BRAND_PALETTE, templateResolverFor } = await loadResolvers();
-  const calls = installRecorder();
+  const calls = installRecorder(t);
   // A4 @ 150dpi-ish — the shipped print preset.
   const ctx = { x: 0, y: 0, width: 1240, height: 1754 };
   await templateResolverFor("print").apply(ctx);
@@ -334,9 +423,9 @@ test("PRINT resolver seeds an espresso header bar, cream body block, two body pa
   assert.deepEqual(fillOf(footer), paletteFill(BRAND_PALETTE.burntOrange));
 });
 
-test("APP_UI resolver seeds an app-shell layout: background, left rail, header, header title, and three content tiles with headings", async () => {
+test("APP_UI resolver seeds an app-shell layout: background, left rail, header, header title, and three content tiles with headings", async (t) => {
   const { templateResolverFor } = await loadResolvers();
-  const calls = installRecorder();
+  const calls = installRecorder(t);
   await templateResolverFor("app-ui").apply(A1080);
   assertInsideArtboard(calls, A1080);
   const nodes = nodesFromCalls(calls);
@@ -360,14 +449,14 @@ test("APP_UI resolver seeds an app-shell layout: background, left rail, header, 
   }
 });
 
-test("PHOTO resolver clamps the drop zone to the SHORT side so it fits non-square artboards", async () => {
+test("PHOTO resolver clamps the drop zone to the SHORT side so it fits non-square artboards", async (t) => {
   const { BRAND_PALETTE, templateResolverFor } = await loadResolvers();
   // Landscape 3000×2000 — the post-fix behaviour should keep the
   // drop zone fully inside the artboard. The pre-fix code would
   // have placed a 3000-wide drop zone on a 2000-tall canvas (1000px
   // of overflow vertically).
   const ctx = { x: 0, y: 0, width: 3000, height: 2000 };
-  const calls = installRecorder();
+  const calls = installRecorder(t);
   await templateResolverFor("photo").apply(ctx);
   assertInsideArtboard(calls, ctx);
   const nodes = nodesFromCalls(calls);
@@ -392,12 +481,12 @@ test("PHOTO resolver clamps the drop zone to the SHORT side so it fits non-squar
   assert.deepEqual(fillOf(drop), paletteFill(BRAND_PALETTE.paper));
 });
 
-test("DECK resolver keeps two columns visible even on a tight 800×450 artboard", async () => {
+test("DECK resolver keeps two columns visible even on a tight 800×450 artboard", async (t) => {
   const { templateResolverFor } = await loadResolvers();
   // Half-height of the shipped 1920×1080 deck preset — would have
   // collapsed `colHeight` to zero pre-clamp.
   const ctx = { x: 0, y: 0, width: 800, height: 450 };
-  const calls = installRecorder();
+  const calls = installRecorder(t);
   await templateResolverFor("deck").apply(ctx);
   assertInsideArtboard(calls, ctx);
   const nodes = nodesFromCalls(calls);
@@ -414,11 +503,11 @@ test("DECK resolver keeps two columns visible even on a tight 800×450 artboard"
   assert.ok(b.create.h > 0, "Column B height must be positive");
 });
 
-test("DEV_EXPORT resolver labels the artboard with its grid hint", async () => {
+test("DEV_EXPORT resolver labels the artboard with its grid hint", async (t) => {
   const { BRAND_PALETTE, templateResolverFor } = await loadResolvers();
   // The shipped dev-export preset is 512×512.
   const ctx = { x: 0, y: 0, width: 512, height: 512 };
-  const calls = installRecorder();
+  const calls = installRecorder(t);
   await templateResolverFor("dev-export").apply(ctx);
   assertInsideArtboard(calls, ctx);
   const nodes = nodesFromCalls(calls);
@@ -446,7 +535,7 @@ test("DEV_EXPORT resolver labels the artboard with its grid hint", async () => {
   );
 });
 
-test("Resolvers honour a non-zero artboard Y offset (second + later artboards)", async () => {
+test("Resolvers honour a non-zero artboard Y offset (second + later artboards)", async (t) => {
   // The bridge offsets every artboard after the first; the resolver
   // reads `ay` off `artboard.list()` and forwards it through. This
   // test feeds a Y-offset ctx and verifies the seeded nodes land at
@@ -454,7 +543,7 @@ test("Resolvers honour a non-zero artboard Y offset (second + later artboards)",
   // protected by `DECK_RESOLVER`'s "Two-column body" comment.
   const { templateResolverFor } = await loadResolvers();
   const ctx = { x: 0, y: 2200, width: 1920, height: 1080 };
-  const calls = installRecorder();
+  const calls = installRecorder(t);
   await templateResolverFor("deck").apply(ctx);
   assertInsideArtboard(calls, ctx);
   // No node may land above `ay` (would be visible on the wrong slide).

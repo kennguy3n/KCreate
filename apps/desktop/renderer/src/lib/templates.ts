@@ -66,8 +66,28 @@ function solidFill(rgb: string, alpha = 1.0): FillStyle {
   return { kind: "solid", ...hex(rgb, alpha) };
 }
 
-async function paint(nodeId: string, fill: FillStyle): Promise<void> {
-  await window.kcreate.document.updateNode(nodeId, { fill });
+/// Apply `fill` and/or `name` to a freshly created node in a single
+/// `updateNode` IPC round-trip. Both fields live on `UpdateNodeProps`
+/// (see `apps/desktop/shared/scene.ts`) and the bridge merges any
+/// subset of props in one shot, so issuing two sequential calls — one
+/// for `fill`, one for `name` — was pure latency overhead on the
+/// editor boot path. Each template resolver creates 5–12 nodes with
+/// both fields set, so combining halves the IPC traffic on the
+/// HomePage → editor transition.
+///
+/// Returns immediately (no IPC) when neither field is supplied; the
+/// caller may have legitimate reasons to seed an anonymous, unfilled
+/// node (e.g. a temporary measurement guide).
+async function paint(
+  nodeId: string,
+  fill: FillStyle | null,
+  name: string | undefined,
+): Promise<void> {
+  if (!fill && !name) return;
+  const props: { fill?: FillStyle; name?: string } = {};
+  if (fill) props.fill = fill;
+  if (name) props.name = name;
+  await window.kcreate.document.updateNode(nodeId, props);
 }
 
 async function rect(
@@ -79,8 +99,7 @@ async function rect(
   name?: string,
 ): Promise<string> {
   const id = await window.kcreate.canvas.createRect(null, x, y, w, h);
-  if (fill) await paint(id, fill);
-  if (name) await window.kcreate.document.updateNode(id, { name });
+  await paint(id, fill, name);
   return id;
 }
 
@@ -101,8 +120,7 @@ async function text(
     family,
     size,
   );
-  if (fill) await paint(id, fill);
-  if (name) await window.kcreate.document.updateNode(id, { name });
+  await paint(id, fill, name);
   return id;
 }
 
@@ -472,7 +490,17 @@ const DECK_RESOLVER: TemplateResolver = {
     const titleReserve = Math.min(220, Math.round(ah * 0.3));
     const colTop = ay + margin + titleReserve;
     const colHeight = Math.max(0, ay + ah - colTop - margin);
-    const colWidth = Math.round((aw - margin * 3) / 2);
+    // `Math.floor` (not `Math.round`) so the two-column budget is
+    // never over-allocated: `2 * colWidth + 3 * margin <= aw`. With
+    // `Math.round` an odd `(aw - 3*margin)` rounds the half up, e.g.
+    // on 1920×1080: `margin=115`, `(aw - 3*margin)=1575`, `1575/2 ⇒
+    // 788` (round) vs `787` (floor). 2*788 + 3*115 = 1921 > 1920;
+    // 2*787 + 3*115 = 1919 < 1920. Visually invisible because the
+    // overflow is one sub-pixel on the right margin, but the floor
+    // gives a clean invariant any future caller (e.g. someone adding
+    // a third column with `n * colWidth + (n+1) * margin <= aw`) can
+    // rely on without re-deriving the rounding behaviour.
+    const colWidth = Math.floor((aw - margin * 3) / 2);
     await rect(
       ax + margin,
       colTop,

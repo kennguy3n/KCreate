@@ -573,11 +573,18 @@ export function PageNavigator({
           onDismiss={closeMenu}
           ariaLabel="Page actions"
         >
+          {/*
+            Devin Review ANALYSIS_0001 on `ce8c782`: each `handle*`
+            below already calls `setMenu(null)` synchronously before
+            its first `await`, so a second `setMenu(null)` in this
+            closure would just be a redundant state-update React 18
+            batches into the same render. The handlers are the
+            single source of truth for the menu lifecycle.
+          */}
           <MenuItem
             label="Duplicate"
             onClick={() => {
               void handleDuplicate(menu.pageId);
-              setMenu(null);
             }}
           />
           <MenuItem
@@ -585,7 +592,6 @@ export function PageNavigator({
             danger
             onClick={() => {
               void handleDelete(menu.pageId);
-              setMenu(null);
             }}
           />
           {menu.kind === "content" ? (
@@ -598,7 +604,6 @@ export function PageNavigator({
                   label={`${s.label} portrait`}
                   onClick={() => {
                     void handleSetPageSize(menu.pageId, s.id, "portrait");
-                    setMenu(null);
                   }}
                 />
               ))}
@@ -612,7 +617,6 @@ export function PageNavigator({
                       label={m.name}
                       onClick={() => {
                         void handleApplyMaster(menu.pageId, m.id);
-                        setMenu(null);
                       }}
                     />
                   ))}

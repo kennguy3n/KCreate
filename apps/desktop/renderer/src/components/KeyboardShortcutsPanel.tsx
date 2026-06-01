@@ -13,6 +13,7 @@ import {
   type ShortcutBinding,
   type ShortcutCategory,
   bindingsEqual,
+  eventKeyForMatching,
   formatBinding,
   shortcutStore,
 } from "../shortcuts/registry";
@@ -22,6 +23,7 @@ import { colors, radius, spacing } from "../styles/tokens";
 const CATEGORIES: { id: ShortcutCategory; title: string }[] = [
   { id: "editing", title: "Editing" },
   { id: "tools", title: "Tools" },
+  { id: "alignment", title: "Alignment" },
   { id: "view", title: "View" },
   { id: "panels", title: "Panels" },
 ];
@@ -261,8 +263,17 @@ function ShortcutRow({
       ) {
         return;
       }
+      // Route through `eventKeyForMatching` so recording an Alt+letter
+      // chord on macOS captures the physical key ("v", "a", …) rather
+      // than the Option-transformed glyph ("√", "å", …). Without this
+      // detour the captured binding would never match itself at
+      // dispatch time — the user would record Option+V, see the panel
+      // claim it bound "√", and the shortcut would silently fail to
+      // fire. Letting both the recorder and the matcher go through
+      // the same helper guarantees they stay in lock-step.
+      const resolvedKey = eventKeyForMatching(event);
       const next: ShortcutBinding = {
-        key: event.key.length === 1 ? event.key.toLowerCase() : event.key,
+        key: resolvedKey.length === 1 ? resolvedKey.toLowerCase() : resolvedKey,
         mod: event.ctrlKey || event.metaKey,
         shift: event.shiftKey,
         alt: event.altKey,

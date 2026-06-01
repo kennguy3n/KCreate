@@ -45,7 +45,15 @@ export type ActionId =
   | "openExport"
   | "openShortcutsPanel"
   | "copy"
-  | "paste";
+  | "paste"
+  | "alignLeft"
+  | "alignCenterX"
+  | "alignRight"
+  | "alignTop"
+  | "alignCenterY"
+  | "alignBottom"
+  | "distributeHorizontal"
+  | "distributeVertical";
 
 /// A keystroke. `key` follows the `KeyboardEvent.key` convention
 /// (case-insensitive a–z, named keys like "Escape", "Delete",
@@ -72,7 +80,7 @@ export interface ActionMeta {
   readonly description: string;
 }
 
-export type ShortcutCategory = "editing" | "tools" | "view" | "panels";
+export type ShortcutCategory = "editing" | "tools" | "view" | "panels" | "alignment";
 
 /// The shipped defaults. Mirrors the previous hard-coded handler in
 /// `EditorPage.tsx`; users can override any of these via the panel.
@@ -117,6 +125,17 @@ export const DEFAULT_BINDINGS: Record<ActionId, ShortcutBinding> = {
   openShortcutsPanel: { key: "/", mod: true, shift: false, alt: false },
   copy: { key: "c", mod: true, shift: false, alt: false },
   paste: { key: "v", mod: true, shift: false, alt: false },
+  // Phase D — Alignment shortcuts. Figma-style: Alt+letter for align,
+  // Ctrl+Alt+letter for distribute. Only active when ≥2 nodes selected
+  // (handler checks at dispatch time, same as AlignmentToolbar).
+  alignLeft: { key: "a", mod: false, shift: false, alt: true },
+  alignCenterX: { key: "h", mod: false, shift: false, alt: true },
+  alignRight: { key: "d", mod: false, shift: false, alt: true },
+  alignTop: { key: "w", mod: false, shift: false, alt: true },
+  alignCenterY: { key: "v", mod: false, shift: false, alt: true },
+  alignBottom: { key: "s", mod: false, shift: false, alt: true },
+  distributeHorizontal: { key: "h", mod: true, shift: false, alt: true },
+  distributeVertical: { key: "v", mod: true, shift: false, alt: true },
 };
 
 export const ACTION_META: Record<ActionId, ActionMeta> = {
@@ -220,6 +239,46 @@ export const ACTION_META: Record<ActionId, ActionMeta> = {
     description:
       "Commit the in-flight pen path as a `VectorLayer`. No-op when the pen tool has no anchors recorded.",
   },
+  alignLeft: {
+    label: "Align left",
+    category: "alignment",
+    description: "Align selected nodes to the left edge of the group bounding box.",
+  },
+  alignCenterX: {
+    label: "Align center (X)",
+    category: "alignment",
+    description: "Align selected nodes to the horizontal center of the group bounding box.",
+  },
+  alignRight: {
+    label: "Align right",
+    category: "alignment",
+    description: "Align selected nodes to the right edge of the group bounding box.",
+  },
+  alignTop: {
+    label: "Align top",
+    category: "alignment",
+    description: "Align selected nodes to the top edge of the group bounding box.",
+  },
+  alignCenterY: {
+    label: "Align middle (Y)",
+    category: "alignment",
+    description: "Align selected nodes to the vertical center of the group bounding box.",
+  },
+  alignBottom: {
+    label: "Align bottom",
+    category: "alignment",
+    description: "Align selected nodes to the bottom edge of the group bounding box.",
+  },
+  distributeHorizontal: {
+    label: "Distribute horizontal",
+    category: "alignment",
+    description: "Evenly space selected nodes horizontally. Requires 3+ selected.",
+  },
+  distributeVertical: {
+    label: "Distribute vertical",
+    category: "alignment",
+    description: "Evenly space selected nodes vertically. Requires 3+ selected.",
+  },
 };
 
 const STORAGE_KEY = "kcreate.shortcuts.v1";
@@ -261,7 +320,16 @@ class ShortcutStore {
           >;
           // Validate each entry — drop any whose key isn't a
           // non-empty string (a corrupted localStorage shouldn't
-          // brick the editor).
+          // brick the editor). Additionally drop alt-modifier
+          // bindings whose key is a non-ASCII single character: those
+          // are stale macOS Option-key glyphs (e.g. '√' from
+          // Option+V) left over from app versions that pre-date the
+          // `eventKeyForMatching` recorder fix. Dropping them at the
+          // load path is the only way to keep the
+          // `bindingsEqual(a,b) ⇔ matchesBinding(event,a) = matchesBinding(event,b)`
+          // invariant structural — see `isCanonicalAltBinding` for
+          // the full rationale. A dropped entry silently falls back
+          // to its shipped default, which is always ASCII.
           for (const id of Object.keys(parsed) as ActionId[]) {
             const b = parsed[id];
             if (
@@ -271,7 +339,8 @@ class ShortcutStore {
               typeof b.mod === "boolean" &&
               typeof b.shift === "boolean" &&
               typeof b.alt === "boolean" &&
-              id in DEFAULT_BINDINGS
+              id in DEFAULT_BINDINGS &&
+              isCanonicalAltBinding(b)
             ) {
               merged[id] = b;
             }
@@ -417,9 +486,67 @@ function normaliseBindingKey(key: string): string {
   return key.length === 1 ? key.toLowerCase() : key;
 }
 
+/// Derive the binding-key string from a `KeyboardEvent`, transparently
+/// handling the macOS Option dead-key behaviour.
+///
+/// On macOS, pressing Option+letter (without Cmd) transforms
+/// `event.key` into the typed Unicode character (Option+V → "√",
+/// Option+A → "å", etc.). This breaks naive `event.key`-based
+/// matching for any Alt-only binding because the bound `key` is the
+/// pre-transformation letter ("v", "a", …) but the event delivers
+/// the post-transformation glyph. Cmd+Option+letter is unaffected
+/// because Chromium prioritises Cmd for character generation, so
+/// `event.key` stays as the original letter.
+///
+/// `event.code` is the *physical* key identifier and is NOT subject
+/// to this transformation — "KeyV" stays "KeyV" regardless of
+/// modifiers, locale, or input method. We use it as the source of
+/// truth whenever `altKey` is true and the code is one of the
+/// alphabetic `KeyA`–`KeyZ` codes. We deliberately do NOT use
+/// `event.code` unconditionally because (a) for non-alpha keys it
+/// returns codes like "Slash" / "Digit1" that differ from the
+/// `event.key` strings ("/", "1") existing bindings rely on, and
+/// (b) on Dvorak / Colemak layouts `event.code` reflects the
+/// QWERTY position, which would break users who remap their layout.
+/// For Alt-only letter bindings the QWERTY-position behaviour is
+/// actually the desired one — Figma, Sketch, and every other tool
+/// in the space binds Option+letter to the physical key position
+/// rather than the locale-specific glyph.
+export function eventKeyForMatching(event: KeyboardEvent): string {
+  if (event.altKey) {
+    const code = event.code;
+    if (code.length === 4 && code.startsWith("Key")) {
+      // "KeyV" → "v". Always lower-case so it aligns with
+      // `normaliseBindingKey` without an extra fold.
+      return code.charAt(3).toLowerCase();
+    }
+  }
+  return event.key;
+}
+
 /// Two bindings are equal iff a single `KeyboardEvent` would match
 /// both. This is the contract `findConflicts` uses to surface
 /// collisions in the panel; it must agree with `matchesBinding`.
+///
+/// Storage invariant (devin review ANALYSIS_0005 on PR #41): both
+/// inputs MUST have already been normalised to their physical-key
+/// form for the
+/// `bindingsEqual(a,b) ⇔ matchesBinding(event,a) = matchesBinding(event,b)`
+/// equivalence to hold. `matchesBinding` routes the event key through
+/// `eventKeyForMatching` (which prefers `event.code` on Alt-only
+/// chords to side-step the macOS Option dead-key glyph transform),
+/// but `bindingsEqual` has no `KeyboardEvent` to consult — it relies
+/// on every write path having stored the physical key. The invariant
+/// is upheld structurally by:
+///   * `DEFAULT_BINDINGS` (ASCII letters only),
+///   * the recorder in `KeyboardShortcutsPanel.tsx` (routes through
+///     `eventKeyForMatching` before storage),
+///   * the `ShortcutStore` constructor's load-path validator (drops
+///     any alt-binding whose key is a non-ASCII single character via
+///     `isCanonicalAltBinding`, so stale glyphs in localStorage from
+///     pre-fix app versions don't survive into the runtime store).
+/// Together these guarantee any pair of bindings actually present in
+/// the store satisfies the equivalence above.
 export function bindingsEqual(
   a: ShortcutBinding,
   b: ShortcutBinding,
@@ -432,9 +559,40 @@ export function bindingsEqual(
   );
 }
 
+/// Returns `true` if `binding`'s key is in canonical (physical-key)
+/// form for the storage invariant documented on `bindingsEqual`. The
+/// only rejected case is an alt-modifier binding whose `key` is a
+/// single character outside ASCII printable range (0x20–0x7E) — those
+/// are stale macOS Option dead-key glyphs (e.g. '√' for Option+V on
+/// US QWERTY) that pre-date the `eventKeyForMatching` recorder fix.
+///
+/// Recovery via a glyph→letter lookup table is intentionally not
+/// attempted: the mapping is layout-dependent (Option+V produces
+/// different glyphs on Dvorak / Colemak / international layouts), so
+/// a hardcoded table would silently rewrite the binding to the wrong
+/// letter for non-US users. Dropping back to the shipped default
+/// (always ASCII) is the only safe choice.
+///
+/// Non-alt bindings always pass — the Option transformation only
+/// applies when Option is held. Multi-character keys ("Escape",
+/// "ArrowLeft", "F1") always pass — those are DOM `KeyboardEvent.key`
+/// names that are byte-for-byte identical to their physical-key form.
+export function isCanonicalAltBinding(binding: ShortcutBinding): boolean {
+  if (!binding.alt) return true;
+  if (binding.key.length !== 1) return true;
+  const code = binding.key.charCodeAt(0);
+  return code >= 0x20 && code <= 0x7e;
+}
+
 /// Match a `KeyboardEvent` against a binding. Letter keys match
 /// case-insensitively; named keys ("Escape", "Delete", "ArrowLeft",
 /// …) are case-sensitive per the DOM spec.
+///
+/// Letter resolution goes through `eventKeyForMatching` so Alt-only
+/// bindings work on macOS, where the Option key would otherwise
+/// transform `event.key` into a glyph that never matches the bound
+/// letter (see `eventKeyForMatching` doc-comment for the full
+/// rationale).
 export function matchesBinding(
   event: KeyboardEvent,
   binding: ShortcutBinding,
@@ -443,7 +601,10 @@ export function matchesBinding(
   if (mod !== binding.mod) return false;
   if (event.shiftKey !== binding.shift) return false;
   if (event.altKey !== binding.alt) return false;
-  return normaliseBindingKey(event.key) === normaliseBindingKey(binding.key);
+  return (
+    normaliseBindingKey(eventKeyForMatching(event)) ===
+    normaliseBindingKey(binding.key)
+  );
 }
 
 /// Render a binding into a human-readable label

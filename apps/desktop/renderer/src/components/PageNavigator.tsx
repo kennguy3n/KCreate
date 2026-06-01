@@ -29,6 +29,12 @@ import type {
 } from "../../../shared/scene";
 import { colors, radius, spacing } from "../styles/tokens";
 import { errorMessage } from "../lib/errorMessage";
+import {
+  ContextMenu,
+  MenuDivider,
+  MenuItem,
+  MenuSubheading,
+} from "./ContextMenu";
 
 export interface PageNavigatorProps {
   /** Full document tree — we filter to `nodeType === "Page"` ourselves. */
@@ -106,6 +112,11 @@ export function PageNavigator({
     x: number;
     y: number;
   } | null>(null);
+  // Devin Review ANALYSIS_0004 on `ab2bb5f`: stable `closeMenu` so the
+  // capture-phase Escape + outside-click listeners inside `ContextMenu`
+  // don't churn on every parent re-render while the menu is open.
+  // `setMenu` is React-stable, so the empty dep array is safe.
+  const closeMenu = useCallback((): void => setMenu(null), []);
   // Drag-reorder state.
   const dragRef = useRef<string | null>(null);
   const [dropTargetIndex, setDropTargetIndex] = useState<number | null>(null);
@@ -370,14 +381,12 @@ export function PageNavigator({
     }
   };
 
-  // Dismiss the context menu on any outside click. We attach to the
-  // window because the menu floats above the panel.
-  useEffect(() => {
-    if (!menu) return;
-    const onDoc = (): void => setMenu(null);
-    window.addEventListener("click", onDoc);
-    return () => window.removeEventListener("click", onDoc);
-  }, [menu]);
+  // (Outside-click + Escape dismissal is now owned by the shared
+  // `<ContextMenu>` primitive — see `ContextMenu.tsx:127-152`. The
+  // legacy window-click effect that previously lived here became dead
+  // code after the migration: the shared menu's capture-phase
+  // mousedown listener fired first and called `onDismiss` →
+  // `setMenu(null)` before the window-click bubble even reached us.)
 
   return (
     <aside
@@ -561,23 +570,61 @@ export function PageNavigator({
         <ContextMenu
           x={menu.x}
           y={menu.y}
-          kind={menu.kind}
-          pageId={menu.pageId}
-          masters={masters}
-          onDuplicate={(id) => {
-            void handleDuplicate(id);
-          }}
-          onDelete={(id) => {
-            void handleDelete(id);
-          }}
-          onApplyMaster={(contentId, masterId) => {
-            void handleApplyMaster(contentId, masterId);
-          }}
-          onSetPageSize={(id, size, orientation) => {
-            void handleSetPageSize(id, size, orientation);
-          }}
-          onDismiss={() => setMenu(null)}
-        />
+          onDismiss={closeMenu}
+          ariaLabel="Page actions"
+        >
+          {/*
+            Devin Review ANALYSIS_0001 on `ce8c782`: each `handle*`
+            below already calls `setMenu(null)` synchronously before
+            its first `await`, so a second `setMenu(null)` in this
+            closure would just be a redundant state-update React 18
+            batches into the same render. The handlers are the
+            single source of truth for the menu lifecycle.
+          */}
+          <MenuItem
+            label="Duplicate"
+            onClick={() => {
+              void handleDuplicate(menu.pageId);
+            }}
+          />
+          <MenuItem
+            label="Delete"
+            danger
+            onClick={() => {
+              void handleDelete(menu.pageId);
+            }}
+          />
+          {menu.kind === "content" ? (
+            <>
+              <MenuDivider />
+              <MenuSubheading label="Set page size" />
+              {COMMON_SIZES.map((s) => (
+                <MenuItem
+                  key={s.id}
+                  label={`${s.label} portrait`}
+                  onClick={() => {
+                    void handleSetPageSize(menu.pageId, s.id, "portrait");
+                  }}
+                />
+              ))}
+              {masters.length > 0 ? (
+                <>
+                  <MenuDivider />
+                  <MenuSubheading label="Apply master" />
+                  {masters.map((m) => (
+                    <MenuItem
+                      key={m.id}
+                      label={m.name}
+                      onClick={() => {
+                        void handleApplyMaster(menu.pageId, m.id);
+                      }}
+                    />
+                  ))}
+                </>
+              ) : null}
+            </>
+          ) : null}
+        </ContextMenu>
       ) : null}
     </aside>
   );
@@ -729,165 +776,6 @@ function SectionHeader({
       }}
     >
       {label} · {count}
-    </div>
-  );
-}
-
-interface ContextMenuProps {
-  x: number;
-  y: number;
-  kind: PageCardKind;
-  pageId: string;
-  masters: MasterPageInfo[];
-  onDuplicate: (id: string) => void;
-  onDelete: (id: string) => void;
-  onApplyMaster: (contentId: string, masterId: string) => void;
-  onSetPageSize: (
-    id: string,
-    size: PageSizeId,
-    orientation: PageOrientation,
-  ) => void;
-  onDismiss: () => void;
-}
-
-function ContextMenu({
-  x,
-  y,
-  kind,
-  pageId,
-  masters,
-  onDuplicate,
-  onDelete,
-  onApplyMaster,
-  onSetPageSize,
-  onDismiss,
-}: ContextMenuProps): JSX.Element {
-  return (
-    <div
-      role="menu"
-      onClick={(e) => e.stopPropagation()}
-      style={{
-        position: "fixed",
-        left: x,
-        top: y,
-        background: colors.bg,
-        border: `1px solid ${colors.border}`,
-        borderRadius: radius.card,
-        boxShadow: "0 4px 12px rgba(0,0,0,0.08)",
-        padding: spacing.xs,
-        minWidth: 200,
-        zIndex: 1000,
-        fontSize: 12,
-      }}
-    >
-      <MenuItem
-        label="Duplicate"
-        onClick={() => {
-          onDuplicate(pageId);
-          onDismiss();
-        }}
-      />
-      <MenuItem
-        label="Delete"
-        danger
-        onClick={() => {
-          onDelete(pageId);
-          onDismiss();
-        }}
-      />
-      {kind === "content" ? (
-        <>
-          <MenuDivider />
-          <MenuSubheading label="Set page size" />
-          {COMMON_SIZES.map((s) => (
-            <MenuItem
-              key={s.id}
-              label={`${s.label} portrait`}
-              onClick={() => {
-                onSetPageSize(pageId, s.id, "portrait");
-                onDismiss();
-              }}
-            />
-          ))}
-          {masters.length > 0 ? (
-            <>
-              <MenuDivider />
-              <MenuSubheading label="Apply master" />
-              {masters.map((m) => (
-                <MenuItem
-                  key={m.id}
-                  label={m.name}
-                  onClick={() => {
-                    onApplyMaster(pageId, m.id);
-                    onDismiss();
-                  }}
-                />
-              ))}
-            </>
-          ) : null}
-        </>
-      ) : null}
-    </div>
-  );
-}
-
-function MenuItem({
-  label,
-  onClick,
-  danger,
-}: {
-  label: string;
-  onClick: () => void;
-  danger?: boolean;
-}): JSX.Element {
-  return (
-    <button
-      type="button"
-      role="menuitem"
-      onClick={onClick}
-      style={{
-        display: "block",
-        width: "100%",
-        textAlign: "left",
-        padding: "6px 10px",
-        background: "transparent",
-        border: "none",
-        cursor: "pointer",
-        color: danger ? "#B91C1C" : colors.text,
-        borderRadius: 6,
-        fontSize: 12,
-      }}
-    >
-      {label}
-    </button>
-  );
-}
-
-function MenuDivider(): JSX.Element {
-  return (
-    <div
-      style={{
-        height: 1,
-        background: colors.border,
-        margin: `${spacing.xs}px 0`,
-      }}
-    />
-  );
-}
-
-function MenuSubheading({ label }: { label: string }): JSX.Element {
-  return (
-    <div
-      style={{
-        padding: "2px 10px",
-        fontSize: 10,
-        fontWeight: 600,
-        color: colors.textMuted,
-        textTransform: "uppercase",
-        letterSpacing: 0.5,
-      }}
-    >
-      {label}
     </div>
   );
 }

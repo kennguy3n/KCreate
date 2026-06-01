@@ -42,7 +42,9 @@ import { ArtboardDialog } from "../components/ArtboardDialog";
 import { ResponsivePreview } from "../components/ResponsivePreview";
 import { PrototypePlayer } from "../components/PrototypePlayer";
 import type {
+  Alignment,
   ArtboardInfo,
+  DistributeAxis,
   FlexLayout,
   GridLayout,
   NodeInfo,
@@ -329,6 +331,19 @@ function EditorPageInner({
   // keyed on `[mode, tool, setTool]`). Devin Review #0004 on
   // commit `5b09939` flagged the drift.
   useEffect(() => {
+    void refreshTree();
+  }, [refreshTree]);
+
+  // Devin Review ANALYSIS_0007 on `ab2bb5f`: stable identity for
+  // `RightPanel`'s `onAlignmentApplied` prop, which flows into
+  // `AlignmentToolbar`'s `useCallback` deps for both `align` and
+  // `distribute`. An inline `() => { void refreshTree(); }` here
+  // gives every EditorPageInner render a fresh function identity,
+  // forcing the toolbar's button callbacks to rebuild on every parent
+  // render. Wrapping in `useCallback([refreshTree])` mirrors the
+  // `handlePrototypeClose` pattern above — `refreshTree` is itself a
+  // `useCallback` so the dep is stable for the provider's lifetime.
+  const handleAlignmentApplied = useCallback((): void => {
     void refreshTree();
   }, [refreshTree]);
 
@@ -771,6 +786,45 @@ function EditorPageInner({
     }
   }, [nodes, refreshSelection, setStatusMessage]);
 
+  // Phase D — Align/Distribute keyboard shortcut handlers.
+  // Mirrors the AlignmentToolbar's bridge calls 1:1 so the toolbar
+  // buttons and the keyboard map share a single dispatch point.
+  // Requires the same selection cardinality the toolbar enforces
+  // (≥2 to align, ≥3 to distribute); under-selection is a silent
+  // no-op rather than a thrown error so the shortcut feels like a
+  // dead key when it isn't applicable instead of surfacing a toast.
+  //
+  // Reads `selectedIds` through a ref so the `shortcutHandlers`
+  // useMemo doesn't have to re-create every time the selection
+  // changes — matches the `handleCopy` / `handlePaste` pattern above.
+  const handleAlign = useCallback(
+    async (a: Alignment) => {
+      const ids = selectedIdsRef.current;
+      if (ids.length < 2) return;
+      try {
+        await window.kcreate.phase9.documentAlign(ids, a);
+        await refreshTree();
+      } catch (e) {
+        setStatusMessage(`align failed: ${errorMessage(e)}`);
+      }
+    },
+    [selectedIdsRef, refreshTree, setStatusMessage],
+  );
+
+  const handleDistribute = useCallback(
+    async (axis: DistributeAxis) => {
+      const ids = selectedIdsRef.current;
+      if (ids.length < 3) return;
+      try {
+        await window.kcreate.phase9.documentDistribute(ids, axis);
+        await refreshTree();
+      } catch (e) {
+        setStatusMessage(`distribute failed: ${errorMessage(e)}`);
+      }
+    },
+    [selectedIdsRef, refreshTree, setStatusMessage],
+  );
+
   const handleClearSelection = useCallback(async () => {
     try {
       await window.kcreate.canvas.clearSelection();
@@ -937,6 +991,73 @@ function EditorPageInner({
     }
   }, [refreshTree, artboardsRef, nodesRef, selectedIdsRef, setSelectedIds, setStatusMessage]);
 
+  // Phase D — Duplicate a single layer-tree node via the layer-row
+  // context menu. Reuses the clipboard copy+paste primitive so undo/
+  // redo, parent-artboard resolution, and the +20/+20 offset behave
+  // identically to the keyboard `Cmd+C / Cmd+V` flow. We don't touch
+  // the OS clipboard because (1) it would surprise the user if their
+  // text-clipboard contents got overwritten by a UI affordance they
+  // didn't explicitly initiate, and (2) it would race the async OS
+  // clipboard write against the paste read. Instead we serialise the
+  // single node via the bridge and feed the payload straight into the
+  // paste codepath in-process.
+  const handleDuplicateLayer = useCallback(
+    async (id: string) => {
+      const node = nodesRef.current.find((n) => n.id === id);
+      if (!node) return;
+      if (node.nodeType === "Page" || node.nodeType === "Artboard") {
+        setStatusMessage(
+          "pages and artboards duplicate via the page navigator",
+        );
+        return;
+      }
+      try {
+        const payload = await window.kcreate.clipboard.copy([id]);
+        // Resolve target artboard: walk up the parent chain from the
+        // node we just copied; fall back to the first artboard on the
+        // active page if the node is detached.
+        let targetArtboard: string | null = null;
+        let cursor: NodeInfo | undefined = node;
+        while (cursor && cursor.nodeType !== "Artboard") {
+          cursor = cursor.parentId
+            ? nodesRef.current.find((n) => n.id === cursor!.parentId)
+            : undefined;
+        }
+        if (cursor && cursor.nodeType === "Artboard") {
+          targetArtboard = cursor.id;
+        }
+        if (!targetArtboard) {
+          targetArtboard = artboardsRef.current[0]?.id ?? null;
+        }
+        if (!targetArtboard) {
+          setStatusMessage("no artboard to duplicate into");
+          return;
+        }
+        const newRoots = await window.kcreate.clipboard.paste(
+          payload,
+          targetArtboard,
+          20,
+          20,
+        );
+        await refreshTree();
+        if (newRoots.length > 0) {
+          await window.kcreate.canvas.setSelection(newRoots);
+          setSelectedIds(newRoots);
+        }
+        setStatusMessage(`duplicated ${newRoots.length} node(s)`);
+      } catch (e) {
+        setStatusMessage(`duplicate failed: ${errorMessage(e)}`);
+      }
+    },
+    [
+      nodesRef,
+      artboardsRef,
+      refreshTree,
+      setSelectedIds,
+      setStatusMessage,
+    ],
+  );
+
   // ------------------------------------------------------------------
   // Phase 6 Task 25 — drag-and-drop from the OS file manager.
   //
@@ -957,6 +1078,41 @@ function EditorPageInner({
   // `importImageBytes` instead — that one accepts raster only.
   // ------------------------------------------------------------------
 
+  // Phase D — drag-hover visual feedback.
+  //
+  // `dragHover` flips on the first `dragenter` whose payload contains
+  // Files and off again when the matching `dragleave` (or `drop`)
+  // fires. The DOM emits dragenter / dragleave for EVERY descendant
+  // crossing in addition to the root, so a naive boolean toggles on
+  // and off as the cursor sweeps across nested elements (CanvasHost,
+  // overlays, etc.). We count enters minus leaves on a `useRef`
+  // counter — `dragHover === true` iff `counter > 0`. The counter is
+  // reset to zero in `handleCanvasDrop` regardless of error because a
+  // missed `dragleave` after `drop` would otherwise wedge the overlay
+  // on permanently.
+  const [dragHover, setDragHover] = useState(false);
+  const dragHoverCountRef = useRef(0);
+
+  const handleCanvasDragEnter = useCallback(
+    (e: React.DragEvent<HTMLElement>): void => {
+      if (!e.dataTransfer.types.includes("Files")) return;
+      e.preventDefault();
+      dragHoverCountRef.current += 1;
+      if (dragHoverCountRef.current === 1) setDragHover(true);
+    },
+    [],
+  );
+
+  const handleCanvasDragLeave = useCallback(
+    (e: React.DragEvent<HTMLElement>): void => {
+      if (!e.dataTransfer.types.includes("Files")) return;
+      e.preventDefault();
+      dragHoverCountRef.current = Math.max(0, dragHoverCountRef.current - 1);
+      if (dragHoverCountRef.current === 0) setDragHover(false);
+    },
+    [],
+  );
+
   const handleCanvasDragOver = useCallback(
     (e: React.DragEvent<HTMLElement>): void => {
       if (e.dataTransfer.types.includes("Files")) {
@@ -970,8 +1126,17 @@ function EditorPageInner({
 
   const handleCanvasDrop = useCallback(
     (e: React.DragEvent<HTMLElement>): void => {
-      if (!e.dataTransfer.files || e.dataTransfer.files.length === 0) return;
+      // Always clear the hover state on drop, even if the payload is
+      // empty — the OS won't emit a matching dragleave after drop.
+      dragHoverCountRef.current = 0;
+      setDragHover(false);
+      // Prevent default BEFORE the empty-payload early return so an
+      // accidental empty drop (e.g. a drag that crossed the boundary
+      // but released over nothing) doesn't fall through to the
+      // browser's default file-handling (which on Chromium navigates
+      // the window to a file:// URL, killing the editor session).
       e.preventDefault();
+      if (!e.dataTransfer.files || e.dataTransfer.files.length === 0) return;
       const target = artboards[0]?.id ?? null;
       if (!target) {
         setStatusMessage("no artboard available — drop ignored");
@@ -1449,6 +1614,41 @@ function EditorPageInner({
         e.preventDefault();
         void handlePaste();
       },
+      // Phase D — Alignment shortcuts. Same selection-cardinality
+      // guards as the toolbar buttons; under-selection is a silent
+      // no-op (see `handleAlign` / `handleDistribute`).
+      alignLeft: (e) => {
+        e.preventDefault();
+        void handleAlign("left");
+      },
+      alignCenterX: (e) => {
+        e.preventDefault();
+        void handleAlign("center");
+      },
+      alignRight: (e) => {
+        e.preventDefault();
+        void handleAlign("right");
+      },
+      alignTop: (e) => {
+        e.preventDefault();
+        void handleAlign("top");
+      },
+      alignCenterY: (e) => {
+        e.preventDefault();
+        void handleAlign("middle");
+      },
+      alignBottom: (e) => {
+        e.preventDefault();
+        void handleAlign("bottom");
+      },
+      distributeHorizontal: (e) => {
+        e.preventDefault();
+        void handleDistribute("horizontal");
+      },
+      distributeVertical: (e) => {
+        e.preventDefault();
+        void handleDistribute("vertical");
+      },
     }),
     // Depend on `toolStateMachine.cancelPen` / `commitPen`
     // individually rather than the whole `toolStateMachine` object.
@@ -1468,6 +1668,8 @@ function EditorPageInner({
       handleClearSelection,
       handleCopy,
       handlePaste,
+      handleAlign,
+      handleDistribute,
       tryTool,
       setMode,
       setPanActive,
@@ -1780,6 +1982,9 @@ function EditorPageInner({
               }
             })();
           }}
+          onDuplicateNode={(id) => {
+            void handleDuplicateLayer(id);
+          }}
           onSelectMany={(ids) => {
             void (async () => {
               try {
@@ -1839,6 +2044,8 @@ function EditorPageInner({
           onDesignSystemStatus={setStatusMessage}
         />
         <main
+          onDragEnter={handleCanvasDragEnter}
+          onDragLeave={handleCanvasDragLeave}
           onDragOver={handleCanvasDragOver}
           onDrop={handleCanvasDrop}
           onDoubleClick={onMainDoubleClick}
@@ -1848,6 +2055,8 @@ function EditorPageInner({
             minWidth: 0,
             overflow: "hidden",
           }}
+          data-testid="kcreate-canvas-main"
+          data-drag-hover={dragHover ? "true" : "false"}
         >
           <CanvasHost
             width={CANVAS_WIDTH}
@@ -2068,6 +2277,47 @@ function EditorPageInner({
             }
             onClose={handlePrototypeClose}
           />
+          {/*
+            Phase D — drag-hover overlay. Shows a dashed border and a
+            hint label while the user holds a file payload over the
+            canvas surface. `pointer-events: none` so the underlying
+            drop target keeps receiving dragover/drop events. Hidden
+            (not unmounted) when not hovering so CSS transitions can
+            ease in/out cleanly if a future style step adds them.
+          */}
+          {dragHover ? (
+            <div
+              data-testid="kcreate-drag-hover-overlay"
+              role="presentation"
+              style={{
+                position: "absolute",
+                inset: 0,
+                pointerEvents: "none",
+                background: "rgba(59, 130, 246, 0.08)",
+                border: "2px dashed rgba(59, 130, 246, 0.6)",
+                borderRadius: 4,
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+                zIndex: 50,
+              }}
+            >
+              <div
+                style={{
+                  background: colors.bg,
+                  border: `1px solid ${colors.border}`,
+                  borderRadius: 6,
+                  padding: `${spacing.sm}px ${spacing.md}px`,
+                  fontSize: 13,
+                  fontWeight: 600,
+                  color: colors.text,
+                  boxShadow: "0 4px 12px rgba(0,0,0,0.12)",
+                }}
+              >
+                Drop files to import (PNG, JPG, WebP, GIF, SVG, PDF)
+              </div>
+            </div>
+          ) : null}
         </main>
         {rightPanelFocus === "ai" ? (
           <AIAssistPanel
@@ -2087,6 +2337,8 @@ function EditorPageInner({
         ) : (
           <RightPanel
             selected={selected}
+            selectedIds={selectedIds}
+            onAlignmentApplied={handleAlignmentApplied}
             onChange={(changes) => {
               if (!selected) return;
               void handleUpdateNode(selected.id, changes);

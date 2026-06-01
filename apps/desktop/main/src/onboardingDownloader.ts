@@ -630,13 +630,24 @@ export function start(
 
     // 5. Hand the temp path to the bridge installer. The bridge
     // does SHA-256 verification (if the registry pins a hash) and
-    // atomically renames into `models_dir`. We report both phases
-    // separately so the renderer can show distinct "verifying" /
-    // "installing" labels even though the bridge call is a single
-    // synchronous step.
+    // atomically renames into `models_dir`. Both labels are
+    // surfaced BEFORE the bridge call so the renderer can show the
+    // intent in order — the call is synchronous from main's POV so
+    // emitting "installing" after it would lie ("Installing…"
+    // appears while there is nothing left to install). The
+    // renderer processes IPC events sequentially, so both labels
+    // are visible (last-seen "installing" while main blocks on the
+    // bridge), and "done" fires once the bridge returns.
     emitProgress(window, {
       packId,
       phase: "verifying",
+      receivedBytes: received,
+      totalBytes: received,
+      message: "",
+    });
+    emitProgress(window, {
+      packId,
+      phase: "installing",
       receivedBytes: received,
       totalBytes: received,
       message: "",
@@ -653,14 +664,6 @@ export function start(
     // models_dir; the temp is gone, but unlink anyway for the
     // belt-and-braces ENOENT-tolerant cleanup.
     await safeUnlink(temp);
-
-    emitProgress(window, {
-      packId,
-      phase: "installing",
-      receivedBytes: received,
-      totalBytes: received,
-      message: "",
-    });
 
     const report = parseInstallReport(reportJson);
 

@@ -191,16 +191,23 @@ export function WelcomeModal({
   }, [open]);
 
   const handleInstall = useCallback(async () => {
+    // Re-entrancy guard. Mirrors `handlePickFile` exactly: set the
+    // ref synchronously BEFORE any await so a second click during
+    // the same event-loop microtask sees the in-flight flag. The
+    // previous iteration set the ref inside the `setPhase` updater
+    // (which runs during React's commit phase, AFTER setPhase
+    // returns) — fragile, even if React 18 batching made it
+    // unobservable in practice. Bot-flagged ANALYSIS_0001.
     if (installInFlight.current) return;
-    setPhase((prev) => {
-      if (prev.kind !== "loaded") return prev;
-      installInFlight.current = true;
-      return {
-        kind: "installing",
-        pack: prev.pack,
-        tier: prev.tier,
-        progress: null,
-      };
+    if (phase.kind !== "loaded") return;
+    const pack = phase.pack;
+    const tier = phase.tier;
+    installInFlight.current = true;
+    setPhase({
+      kind: "installing",
+      pack,
+      tier,
+      progress: null,
     });
     try {
       const report = await window.kcreate.onboarding.installRecommendedPack();
@@ -214,16 +221,27 @@ export function WelcomeModal({
         };
       });
     } catch (e) {
-      setPhase((prev) => ({
-        kind: "error",
-        tier: prev.kind === "installing" ? prev.tier : null,
-        pack: prev.kind === "installing" ? prev.pack : null,
-        message: errorMessage(e),
-      }));
+      // Guard on `prev.kind === "installing"` so a concurrent
+      // cancel (which already moved us back to "loaded") wins
+      // over the cancelled-promise rejection. Without this guard
+      // the catch unconditionally builds an `"error"` phase, the
+      // `PackCard` disappears (tier/pack become null), and
+      // clicking "Close" persists `onboarding.completed = true`,
+      // making the modal unreachable for users who pressed
+      // Cancel. Bot-flagged BUG_0001.
+      setPhase((prev) => {
+        if (prev.kind !== "installing") return prev;
+        return {
+          kind: "error",
+          tier: prev.tier,
+          pack: prev.pack,
+          message: errorMessage(e),
+        };
+      });
     } finally {
       installInFlight.current = false;
     }
-  }, []);
+  }, [phase]);
 
   const handlePickFile = useCallback(async () => {
     if (installInFlight.current) return;

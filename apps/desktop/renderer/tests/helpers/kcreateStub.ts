@@ -190,6 +190,17 @@ const defaultsByMethod: Record<string, () => unknown> = {
   // a neutral mid-tier so existing tests that previously didn't
   // touch this method keep working; welcome-modal tests override
   // this explicitly per case.
+  //
+  // Field names mirror the on-wire `ResourceLimits` interface in
+  // `apps/desktop/shared/scene.ts:745-782` exactly (`visionModelMaxMb`,
+  // not `effectiveMaxVisionModelMb`, and the required `platform`
+  // string is present). A previous iteration used the wrong vision
+  // field name and omitted `platform` — undetected because the
+  // stub return type was `unknown` and the only renderer caller in
+  // the welcome modal (`tierLabel`) reads `deviceTier` only. Any
+  // future test that asserts on `visionModelMaxMb` would have
+  // silently read `undefined` against the old shape. Bot-flagged
+  // ANALYSIS_0003.
   "runtime.resourceLimits": () => ({
     deviceTier: "1",
     lowResourceMode: false,
@@ -198,7 +209,8 @@ const defaultsByMethod: Record<string, () => unknown> = {
     effectiveMaxModelMb: 4096,
     gpuRenderingAllowed: true,
     imageGenerationAllowed: false,
-    effectiveMaxVisionModelMb: 256,
+    visionModelMaxMb: 256,
+    platform: "Linux",
   }),
   // Phase C — recommended LLM pack id surfaced via the bridge.
   // Defaults to the 1.7B Bonsai pack (matches the tier-1 default

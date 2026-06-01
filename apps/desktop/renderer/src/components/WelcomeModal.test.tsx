@@ -131,7 +131,8 @@ describe("WelcomeModal", () => {
       effectiveMaxModelMb: 4096,
       gpuRenderingAllowed: true,
       imageGenerationAllowed: false,
-      effectiveMaxVisionModelMb: 256,
+      visionModelMaxMb: 256,
+      platform: "Linux",
     }));
 
     render(<WelcomeModal open={true} onDismiss={() => {}} />);
@@ -456,6 +457,86 @@ describe("WelcomeModal", () => {
     // The button vanishes (replaced by Cancel) once installing
     // phase starts; the synchronous guard is the load-bearing
     // protection against a same-task double-click.
+    await flushAsync();
+    expect(
+      stub.calls.filter(
+        (c) => c.method === "onboarding.installRecommendedPack",
+      ).length,
+    ).toBe(1);
+  });
+
+  // Pins BUG_0001 from the round-2 Devin Review sweep on 70ccc3e.
+  // Without the `prev.kind !== "installing"` guard in the install
+  // catch updater, a Cancel-during-install would race the
+  // cancelled-promise rejection: cancel moves to "loaded", catch
+  // then unconditionally overrides to "error" with null tier/pack,
+  // the PackCard disappears, and clicking Close persists
+  // `onboarding.completed = true` (modal unreachable for cancel).
+  it("Cancel during install returns to the loaded phase, not an error", async () => {
+    const stub = kcreateStub();
+    stub.override("llm.recommendedPack", () => SAMPLE_PACK.id);
+    stub.override("aiModel.listModelPacks", () => [SAMPLE_PACK]);
+    // The install IPC rejects with the same "cancelled" sentinel
+    // the main-process onboardingDownloader throws when the
+    // cancel side-channel fires. This is the exact race the bug
+    // describes: cancel handler runs → setPhase queues "loaded";
+    // promise rejects → catch updater previously queued "error".
+    let rejectInstall: (e: Error) => void = () => undefined;
+    stub.override(
+      "onboarding.installRecommendedPack",
+      () =>
+        new Promise((_resolve, reject) => {
+          rejectInstall = reject;
+        }),
+    );
+
+    render(<WelcomeModal open={true} onDismiss={() => {}} />);
+    await flushAsync();
+    fireEvent.click(screen.getByTestId("kcreate-welcome-install"));
+    await flushAsync();
+    // Mid-install. Click Cancel — this fires cancelInstall IPC
+    // and synchronously queues setPhase → "loaded".
+    fireEvent.click(screen.getByTestId("kcreate-welcome-cancel"));
+    // Now reject the in-flight install promise to simulate the
+    // race: cancel updater already queued, rejection arrives next.
+    rejectInstall(new Error("cancelled"));
+    await flushAsync();
+
+    // Pack card should still be visible (loaded phase preserved
+    // tier/pack), error UI should NOT be present.
+    expect(
+      screen.queryByTestId("kcreate-welcome-error"),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.getByTestId("kcreate-welcome-pack-name").textContent,
+    ).toContain("Ternary-Bonsai 1.7B");
+    expect(screen.getByTestId("kcreate-welcome-install")).toBeInTheDocument();
+  });
+
+  // Pins ANALYSIS_0001 from the round-2 Devin Review sweep on
+  // 70ccc3e. The previous handleInstall set installInFlight.current
+  // inside the setPhase updater (i.e. during React's commit phase,
+  // AFTER setPhase returns). A same-task double-click between the
+  // ref check and the React commit could pass the guard and fire
+  // a second installRecommendedPack. The fix mirrors handlePickFile:
+  // set the ref synchronously BEFORE any await.
+  it("install ref is set synchronously before the IPC, so a same-task double-click never fires two IPCs", async () => {
+    const stub = kcreateStub();
+    stub.override("llm.recommendedPack", () => SAMPLE_PACK.id);
+    stub.override("aiModel.listModelPacks", () => [SAMPLE_PACK]);
+    stub.override(
+      "onboarding.installRecommendedPack",
+      () => new Promise(() => undefined),
+    );
+
+    render(<WelcomeModal open={true} onDismiss={() => {}} />);
+    await flushAsync();
+    const btn = screen.getByTestId("kcreate-welcome-install");
+    // Two synchronous clicks in the same microtask, BEFORE
+    // flushing. The synchronous ref guard must reject the second
+    // click without waiting for React's commit phase.
+    fireEvent.click(btn);
+    fireEvent.click(btn);
     await flushAsync();
     expect(
       stub.calls.filter(

@@ -235,11 +235,64 @@ fn bench_sync_document_dense(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_sync_document_steady_state(c: &mut Criterion) {
+    // Phase E target — steady-state replay cost.
+    //
+    // `bench_sync_document_dense` above uses
+    // `sync_document_to_scene_borrowed`, which clears the per-node
+    // cache on every call (cold path). That is the *worst case* —
+    // the path the bridge takes on the first sync of a freshly
+    // opened document. In production the bridge takes the
+    // `sync_document_to_scene` path on every redraw, and most of
+    // those redraws have an empty dirty set (collab presence tick,
+    // hover overlay swap, viewport pan with no document edit), so
+    // every leaf node hits `SceneSync::try_replay_cached` and the
+    // recursive walk never visits leaf-emit metadata again.
+    //
+    // This bench measures *that* path: build a doc, warm the cache
+    // with one sync, then in the iter loop call
+    // `sync_document_to_scene` with an empty dirty set so the
+    // replay path runs end-to-end. The replay path's per-node cost
+    // is the budget for Phase E perf fixes (eliminating wasted
+    // allocations in the reverse-map rebuild and the per-cache-hit
+    // clones). Any future regression that turns a cache hit back
+    // into a re-emit (or that re-introduces per-sync map clones)
+    // will pop loudly here, especially at the 1000-node point.
+    let mut group = c.benchmark_group("scene_sync_document_steady_state");
+    for &count in DOC_NODE_COUNTS {
+        group.throughput(Throughput::Elements(count as u64));
+        group.bench_with_input(BenchmarkId::from_parameter(count), &count, |b, &count| {
+            // Build the doc + SceneSync once per parameter and
+            // reuse them across all iterations of `b.iter()`. After
+            // the warm-up sync below, the document has no pending
+            // edits, so every subsequent `drain_dirty()` returns
+            // empty and every node hits `try_replay_cached`. That
+            // is precisely the steady-state path we want to measure
+            // — reusing one warmed SceneSync is the *whole point*
+            // (a per-iter rebuild would re-emit from scratch and
+            // turn this back into a cold-path bench).
+            let mut doc = build_document_of_size(count);
+            let mut sync = SceneSync::new();
+            // Warm the cache once — populates `node_cache`
+            // and `last_version` for every node.
+            let _ = sync.sync_document_to_scene(&mut doc, None, &[]);
+            b.iter(|| {
+                // Empty dirty set + unchanged versions =>
+                // every node hits the replay path.
+                let scene = sync.sync_document_to_scene(&mut doc, None, &[]);
+                criterion::black_box(scene.objects.len());
+            });
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_presence_cursors,
     bench_presence_selection_halos,
     bench_combined_presence_pipeline,
     bench_sync_document_dense,
+    bench_sync_document_steady_state,
 );
 criterion_main!(benches);

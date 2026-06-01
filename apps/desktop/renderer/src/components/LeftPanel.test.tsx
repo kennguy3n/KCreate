@@ -191,5 +191,65 @@ describe("LeftPanel", () => {
       fireEvent.keyDown(document, { key: "Escape" });
       expect(screen.queryByTestId("ctx-rename")).toBeNull();
     });
+
+    // Regression for Devin Review ANALYSIS_0003 on PR #41: when
+    // `onDelete` is absent, the divider that precedes the Delete row
+    // must not render either — otherwise the menu ends with a
+    // stranded horizontal rule under whatever section preceded it.
+    // The `NodeList` interface declares `onDelete` as optional, so a
+    // future caller (e.g. a future "read-only inspector" surface)
+    // could legitimately omit it.
+    it("omits the trailing Delete divider when onDelete is not wired", () => {
+      // renderLeftPanel does NOT wire onDelete (the default helper
+      // omits it), so this exercises the gated branch.
+      renderLeftPanel([makeNode({ id: "a", name: "Alpha" })]);
+      const row = screen.getByText("Alpha").closest("div");
+      fireEvent.contextMenu(row!);
+      // The Delete item itself is hidden (precondition for the bug)…
+      expect(screen.queryByTestId("ctx-delete")).toBeNull();
+      // …and the menu must not end on a stranded separator. Counting
+      // *all* separators is fragile because `LeftPanel` always wires
+      // a no-op `onSetLayerColor` fallback to its inner `LayersTab`,
+      // so the Layer-color subheading + its preceding divider render
+      // regardless of what the public prop is. The ANALYSIS_0003 fix
+      // is structurally about the *trailing* divider: when `onDelete`
+      // is absent the menu's last DOM child must not be a separator.
+      // Without the fix, the unconditional `<MenuDivider />` above the
+      // (now-hidden) Delete `MenuItem` would render as the final child.
+      const menu = screen.getByRole("menu");
+      const lastChild = menu.lastElementChild;
+      expect(lastChild).not.toBeNull();
+      expect(lastChild!.getAttribute("role")).not.toBe("separator");
+    });
+
+    // Companion: when `onDelete` IS wired, the divider DOES render
+    // (so the Delete row is visually separated from the section
+    // above it). This pins the gate's positive branch.
+    it("renders the trailing Delete divider when onDelete is wired", () => {
+      render(
+        <LeftPanel
+          nodes={[makeNode({ id: "a", name: "Alpha" })]}
+          selectedId={null}
+          onSelect={() => undefined}
+          onDelete={() => undefined}
+          artboards={[]}
+          components={[]}
+        />,
+      );
+      const row = screen.getByText("Alpha").closest("div");
+      fireEvent.contextMenu(row!);
+      expect(screen.getByTestId("ctx-delete")).toBeInTheDocument();
+      // Positive branch of the gate: the Delete row renders, and the
+      // divider immediately precedes it. The strongest structural
+      // invariant is that the Delete `MenuItem` is the menu's last
+      // child and that its immediate sibling is the separator we
+      // gated together with it.
+      const menu = screen.getByRole("menu");
+      const deleteItem = screen.getByTestId("ctx-delete");
+      expect(menu.lastElementChild).toBe(deleteItem);
+      const previous = deleteItem.previousElementSibling;
+      expect(previous).not.toBeNull();
+      expect(previous!.getAttribute("role")).toBe("separator");
+    });
   });
 });

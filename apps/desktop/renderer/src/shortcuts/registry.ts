@@ -320,7 +320,16 @@ class ShortcutStore {
           >;
           // Validate each entry — drop any whose key isn't a
           // non-empty string (a corrupted localStorage shouldn't
-          // brick the editor).
+          // brick the editor). Additionally drop alt-modifier
+          // bindings whose key is a non-ASCII single character: those
+          // are stale macOS Option-key glyphs (e.g. '√' from
+          // Option+V) left over from app versions that pre-date the
+          // `eventKeyForMatching` recorder fix. Dropping them at the
+          // load path is the only way to keep the
+          // `bindingsEqual(a,b) ⇔ matchesBinding(event,a) = matchesBinding(event,b)`
+          // invariant structural — see `isCanonicalAltBinding` for
+          // the full rationale. A dropped entry silently falls back
+          // to its shipped default, which is always ASCII.
           for (const id of Object.keys(parsed) as ActionId[]) {
             const b = parsed[id];
             if (
@@ -330,7 +339,8 @@ class ShortcutStore {
               typeof b.mod === "boolean" &&
               typeof b.shift === "boolean" &&
               typeof b.alt === "boolean" &&
-              id in DEFAULT_BINDINGS
+              id in DEFAULT_BINDINGS &&
+              isCanonicalAltBinding(b)
             ) {
               merged[id] = b;
             }
@@ -517,6 +527,26 @@ export function eventKeyForMatching(event: KeyboardEvent): string {
 /// Two bindings are equal iff a single `KeyboardEvent` would match
 /// both. This is the contract `findConflicts` uses to surface
 /// collisions in the panel; it must agree with `matchesBinding`.
+///
+/// Storage invariant (devin review ANALYSIS_0005 on PR #41): both
+/// inputs MUST have already been normalised to their physical-key
+/// form for the
+/// `bindingsEqual(a,b) ⇔ matchesBinding(event,a) = matchesBinding(event,b)`
+/// equivalence to hold. `matchesBinding` routes the event key through
+/// `eventKeyForMatching` (which prefers `event.code` on Alt-only
+/// chords to side-step the macOS Option dead-key glyph transform),
+/// but `bindingsEqual` has no `KeyboardEvent` to consult — it relies
+/// on every write path having stored the physical key. The invariant
+/// is upheld structurally by:
+///   * `DEFAULT_BINDINGS` (ASCII letters only),
+///   * the recorder in `KeyboardShortcutsPanel.tsx` (routes through
+///     `eventKeyForMatching` before storage),
+///   * the `ShortcutStore` constructor's load-path validator (drops
+///     any alt-binding whose key is a non-ASCII single character via
+///     `isCanonicalAltBinding`, so stale glyphs in localStorage from
+///     pre-fix app versions don't survive into the runtime store).
+/// Together these guarantee any pair of bindings actually present in
+/// the store satisfies the equivalence above.
 export function bindingsEqual(
   a: ShortcutBinding,
   b: ShortcutBinding,
@@ -527,6 +557,31 @@ export function bindingsEqual(
     a.alt === b.alt &&
     normaliseBindingKey(a.key) === normaliseBindingKey(b.key)
   );
+}
+
+/// Returns `true` if `binding`'s key is in canonical (physical-key)
+/// form for the storage invariant documented on `bindingsEqual`. The
+/// only rejected case is an alt-modifier binding whose `key` is a
+/// single character outside ASCII printable range (0x20–0x7E) — those
+/// are stale macOS Option dead-key glyphs (e.g. '√' for Option+V on
+/// US QWERTY) that pre-date the `eventKeyForMatching` recorder fix.
+///
+/// Recovery via a glyph→letter lookup table is intentionally not
+/// attempted: the mapping is layout-dependent (Option+V produces
+/// different glyphs on Dvorak / Colemak / international layouts), so
+/// a hardcoded table would silently rewrite the binding to the wrong
+/// letter for non-US users. Dropping back to the shipped default
+/// (always ASCII) is the only safe choice.
+///
+/// Non-alt bindings always pass — the Option transformation only
+/// applies when Option is held. Multi-character keys ("Escape",
+/// "ArrowLeft", "F1") always pass — those are DOM `KeyboardEvent.key`
+/// names that are byte-for-byte identical to their physical-key form.
+export function isCanonicalAltBinding(binding: ShortcutBinding): boolean {
+  if (!binding.alt) return true;
+  if (binding.key.length !== 1) return true;
+  const code = binding.key.charCodeAt(0);
+  return code >= 0x20 && code <= 0x7e;
 }
 
 /// Match a `KeyboardEvent` against a binding. Letter keys match

@@ -17,12 +17,15 @@ import {
   ACTION_META,
   DEFAULT_BINDINGS,
   bindingsEqual,
+  isCanonicalAltBinding,
   matchesBinding,
   resetShortcutStoreForTests,
   shortcutStore,
   type ActionId,
   type ShortcutBinding,
 } from "./registry";
+
+const STORAGE_KEY = "kcreate.shortcuts.v1";
 
 const ALIGNMENT_IDS = [
   "alignLeft",
@@ -55,6 +58,11 @@ function makeKeyboardEvent(init: {
 
 describe("shortcuts registry: Phase D alignment bindings", () => {
   beforeEach(() => {
+    // Tests that exercise the load path persist entries to
+    // localStorage; clear it before each test so they don't leak.
+    if (typeof window !== "undefined" && window.localStorage) {
+      window.localStorage.removeItem(STORAGE_KEY);
+    }
     resetShortcutStoreForTests();
   });
 
@@ -242,5 +250,90 @@ describe("shortcuts registry: Phase D alignment bindings", () => {
       altKey: true,
     });
     expect(matchesBinding(altSlashEvent, altSlashBinding)).toBe(true);
+  });
+
+  // Regression for Devin Review ANALYSIS_0005 on PR #41: the storage
+  // invariant documented on `bindingsEqual` requires every binding in
+  // the runtime store to be in canonical (physical-key) form so the
+  // `bindingsEqual(a,b) ⇔ matchesBinding(event,a) = matchesBinding(event,b)`
+  // equivalence holds without `bindingsEqual` needing a
+  // `KeyboardEvent` to consult. `isCanonicalAltBinding` is the
+  // structural gate.
+  it("isCanonicalAltBinding accepts ASCII alt-bindings and rejects glyph alt-bindings", () => {
+    // Defaults must all pass.
+    for (const id of Object.keys(DEFAULT_BINDINGS) as ActionId[]) {
+      expect(isCanonicalAltBinding(DEFAULT_BINDINGS[id])).toBe(true);
+    }
+    // Common macOS Option-key glyphs that the pre-fix recorder would
+    // have stored if the user re-bound an alt action: '√' for
+    // Option+V, 'å' for Option+A, '∂' for Option+D, '∑' for Option+W,
+    // 'ß' for Option+S, '˙' for Option+H. All MUST be rejected.
+    const glyphs = ["\u221a", "\u00e5", "\u2202", "\u2211", "\u00df", "\u02d9"];
+    for (const g of glyphs) {
+      expect(
+        isCanonicalAltBinding({ key: g, mod: false, shift: false, alt: true }),
+      ).toBe(false);
+    }
+    // Non-alt bindings always pass even if the key happens to be a
+    // glyph (matchesBinding never routes them through eventKeyForMatching).
+    expect(
+      isCanonicalAltBinding({
+        key: "\u221a",
+        mod: false,
+        shift: false,
+        alt: false,
+      }),
+    ).toBe(true);
+    // Multi-character keys (DOM `KeyboardEvent.key` names) always pass.
+    for (const k of ["Escape", "ArrowLeft", "F1", "Delete"]) {
+      expect(
+        isCanonicalAltBinding({ key: k, mod: false, shift: false, alt: true }),
+      ).toBe(true);
+    }
+  });
+
+  // Regression for Devin Review ANALYSIS_0005 on PR #41: the store
+  // constructor's load-path validator must drop any stored
+  // alt-binding whose key is a non-ASCII glyph so the storage
+  // invariant is upheld structurally. Without this guard, a stale
+  // localStorage entry from a pre-eventKeyForMatching app version
+  // would survive into the runtime store and silently violate the
+  // `bindingsEqual ⇔ matchesBinding` equivalence — a glyph entry
+  // would compare as "no conflict" against an ASCII entry but both
+  // would match the same physical keystroke.
+  it("ShortcutStore drops stale macOS Option-key glyph bindings at load time", () => {
+    // Simulate a pre-fix app version having persisted Alt+V with the
+    // glyph key (Option+V on US QWERTY produces '√').
+    const stale = {
+      alignCenterY: {
+        key: "\u221a",
+        mod: false,
+        shift: false,
+        alt: true,
+      } satisfies ShortcutBinding,
+    };
+    window.localStorage.setItem(STORAGE_KEY, JSON.stringify(stale));
+    resetShortcutStoreForTests();
+    const snap = shortcutStore().snapshot();
+    // Must fall back to the shipped default ("v"), not preserve "√".
+    expect(snap.alignCenterY).toEqual(DEFAULT_BINDINGS.alignCenterY);
+    expect(snap.alignCenterY.key).toBe("v");
+  });
+
+  // Companion: a CANONICAL stored binding (e.g. the user rebound
+  // alignCenterY to Alt+B via the post-fix recorder) MUST survive the
+  // load path unchanged.
+  it("ShortcutStore preserves canonical (physical-key) stored bindings across reload", () => {
+    const rebound = {
+      alignCenterY: {
+        key: "b",
+        mod: false,
+        shift: false,
+        alt: true,
+      } satisfies ShortcutBinding,
+    };
+    window.localStorage.setItem(STORAGE_KEY, JSON.stringify(rebound));
+    resetShortcutStoreForTests();
+    expect(shortcutStore().snapshot().alignCenterY.key).toBe("b");
   });
 });

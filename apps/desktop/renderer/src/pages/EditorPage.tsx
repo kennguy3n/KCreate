@@ -334,6 +334,19 @@ function EditorPageInner({
     void refreshTree();
   }, [refreshTree]);
 
+  // Devin Review ANALYSIS_0007 on `ab2bb5f`: stable identity for
+  // `RightPanel`'s `onAlignmentApplied` prop, which flows into
+  // `AlignmentToolbar`'s `useCallback` deps for both `align` and
+  // `distribute`. An inline `() => { void refreshTree(); }` here
+  // gives every EditorPageInner render a fresh function identity,
+  // forcing the toolbar's button callbacks to rebuild on every parent
+  // render. Wrapping in `useCallback([refreshTree])` mirrors the
+  // `handlePrototypeClose` pattern above — `refreshTree` is itself a
+  // `useCallback` so the dep is stable for the provider's lifetime.
+  const handleAlignmentApplied = useCallback((): void => {
+    void refreshTree();
+  }, [refreshTree]);
+
   // First-time-into-Layout prompt: when the user switches to Layout
   // mode for the first time on an untouched project, pop the
   // TemplatePicker.
@@ -2325,9 +2338,7 @@ function EditorPageInner({
           <RightPanel
             selected={selected}
             selectedIds={selectedIds}
-            onAlignmentApplied={() => {
-              void refreshTree();
-            }}
+            onAlignmentApplied={handleAlignmentApplied}
             onChange={(changes) => {
               if (!selected) return;
               void handleUpdateNode(selected.id, changes);

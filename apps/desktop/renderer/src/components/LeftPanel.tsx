@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 
 import type {
   ArtboardInfo,
@@ -537,6 +537,16 @@ function NodeList({
     }
   }, [ctxMenu, nodes]);
 
+  // Phase D — Devin Review ANALYSIS_0004 on `ab2bb5f`: pass a stable
+  // `closeCtxMenu` identity to `<ContextMenu onDismiss>` (and reuse it
+  // from every item that just wants to close the menu) so the Escape
+  // and outside-click `useEffect` hooks inside `ContextMenu` don't
+  // detach + reattach their capture-phase listeners on every parent
+  // re-render while the menu is open. The empty dep array is safe —
+  // `setCtxMenu` is React-guaranteed-stable and we always close to
+  // `null`, not a derived value.
+  const closeCtxMenu = useCallback((): void => setCtxMenu(null), []);
+
   if (nodes.length === 0) {
     return <EmptyHint>{emptyHint}</EmptyHint>;
   }
@@ -723,7 +733,7 @@ function NodeList({
         <ContextMenu
           x={ctxMenu.x}
           y={ctxMenu.y}
-          onDismiss={() => setCtxMenu(null)}
+          onDismiss={closeCtxMenu}
           ariaLabel="Layer actions"
         >
           <MenuItem
@@ -732,7 +742,7 @@ function NodeList({
             onClick={() => {
               setRenamingId(target.id);
               setDraftName(target.name);
-              setCtxMenu(null);
+              closeCtxMenu();
             }}
           />
           {onDuplicateNode ? (
@@ -742,7 +752,7 @@ function NodeList({
               shortcut="⌘C ⌘V"
               onClick={() => {
                 onDuplicateNode(target.id);
-                setCtxMenu(null);
+                closeCtxMenu();
               }}
             />
           ) : null}
@@ -752,7 +762,7 @@ function NodeList({
             data-testid="ctx-visibility"
             onClick={() => {
               onToggleVisibility?.(target.id, !target.visible);
-              setCtxMenu(null);
+              closeCtxMenu();
             }}
           />
           <MenuItem
@@ -760,7 +770,7 @@ function NodeList({
             data-testid="ctx-lock"
             onClick={() => {
               onToggleLocked?.(target.id, !target.locked);
-              setCtxMenu(null);
+              closeCtxMenu();
             }}
           />
           {onSetLayerColor ? (
@@ -773,7 +783,7 @@ function NodeList({
                   label={p.key.charAt(0).toUpperCase() + p.key.slice(1)}
                   onClick={() => {
                     onSetLayerColor(target.id, p.key);
-                    setCtxMenu(null);
+                    closeCtxMenu();
                   }}
                 />
               ))}
@@ -782,24 +792,32 @@ function NodeList({
                   label="Clear color"
                   onClick={() => {
                     onSetLayerColor(target.id, null);
-                    setCtxMenu(null);
+                    closeCtxMenu();
                   }}
                 />
               ) : null}
             </>
           ) : null}
-          <MenuDivider />
+          {/*
+            Phase D — Devin Review ANALYSIS_0003 on `ab2bb5f`: gate the
+            divider on `onDelete` so a caller that omits the prop (the
+            interface declares it optional) doesn't render a stranded
+            trailing separator under whatever section preceded it.
+          */}
           {onDelete ? (
-            <MenuItem
-              label="Delete"
-              danger
-              data-testid="ctx-delete"
-              shortcut="Del"
-              onClick={() => {
-                onDelete(target.id);
-                setCtxMenu(null);
-              }}
-            />
+            <>
+              <MenuDivider />
+              <MenuItem
+                label="Delete"
+                danger
+                data-testid="ctx-delete"
+                shortcut="Del"
+                onClick={() => {
+                  onDelete(target.id);
+                  closeCtxMenu();
+                }}
+              />
+            </>
           ) : null}
         </ContextMenu>
       );

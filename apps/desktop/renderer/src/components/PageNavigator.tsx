@@ -112,6 +112,11 @@ export function PageNavigator({
     x: number;
     y: number;
   } | null>(null);
+  // Devin Review ANALYSIS_0004 on `ab2bb5f`: stable `closeMenu` so the
+  // capture-phase Escape + outside-click listeners inside `ContextMenu`
+  // don't churn on every parent re-render while the menu is open.
+  // `setMenu` is React-stable, so the empty dep array is safe.
+  const closeMenu = useCallback((): void => setMenu(null), []);
   // Drag-reorder state.
   const dragRef = useRef<string | null>(null);
   const [dropTargetIndex, setDropTargetIndex] = useState<number | null>(null);
@@ -565,7 +570,7 @@ export function PageNavigator({
         <ContextMenu
           x={menu.x}
           y={menu.y}
-          onDismiss={() => setMenu(null)}
+          onDismiss={closeMenu}
           ariaLabel="Page actions"
         >
           <MenuItem

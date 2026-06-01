@@ -1117,8 +1117,13 @@ function EditorPageInner({
       // empty — the OS won't emit a matching dragleave after drop.
       dragHoverCountRef.current = 0;
       setDragHover(false);
-      if (!e.dataTransfer.files || e.dataTransfer.files.length === 0) return;
+      // Prevent default BEFORE the empty-payload early return so an
+      // accidental empty drop (e.g. a drag that crossed the boundary
+      // but released over nothing) doesn't fall through to the
+      // browser's default file-handling (which on Chromium navigates
+      // the window to a file:// URL, killing the editor session).
       e.preventDefault();
+      if (!e.dataTransfer.files || e.dataTransfer.files.length === 0) return;
       const target = artboards[0]?.id ?? null;
       if (!target) {
         setStatusMessage("no artboard available — drop ignored");

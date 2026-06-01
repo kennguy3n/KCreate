@@ -376,14 +376,12 @@ export function PageNavigator({
     }
   };
 
-  // Dismiss the context menu on any outside click. We attach to the
-  // window because the menu floats above the panel.
-  useEffect(() => {
-    if (!menu) return;
-    const onDoc = (): void => setMenu(null);
-    window.addEventListener("click", onDoc);
-    return () => window.removeEventListener("click", onDoc);
-  }, [menu]);
+  // (Outside-click + Escape dismissal is now owned by the shared
+  // `<ContextMenu>` primitive — see `ContextMenu.tsx:127-152`. The
+  // legacy window-click effect that previously lived here became dead
+  // code after the migration: the shared menu's capture-phase
+  // mousedown listener fired first and called `onDismiss` →
+  // `setMenu(null)` before the window-click bubble even reached us.)
 
   return (
     <aside

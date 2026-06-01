@@ -476,6 +476,44 @@ function normaliseBindingKey(key: string): string {
   return key.length === 1 ? key.toLowerCase() : key;
 }
 
+/// Derive the binding-key string from a `KeyboardEvent`, transparently
+/// handling the macOS Option dead-key behaviour.
+///
+/// On macOS, pressing Option+letter (without Cmd) transforms
+/// `event.key` into the typed Unicode character (Option+V → "√",
+/// Option+A → "å", etc.). This breaks naive `event.key`-based
+/// matching for any Alt-only binding because the bound `key` is the
+/// pre-transformation letter ("v", "a", …) but the event delivers
+/// the post-transformation glyph. Cmd+Option+letter is unaffected
+/// because Chromium prioritises Cmd for character generation, so
+/// `event.key` stays as the original letter.
+///
+/// `event.code` is the *physical* key identifier and is NOT subject
+/// to this transformation — "KeyV" stays "KeyV" regardless of
+/// modifiers, locale, or input method. We use it as the source of
+/// truth whenever `altKey` is true and the code is one of the
+/// alphabetic `KeyA`–`KeyZ` codes. We deliberately do NOT use
+/// `event.code` unconditionally because (a) for non-alpha keys it
+/// returns codes like "Slash" / "Digit1" that differ from the
+/// `event.key` strings ("/", "1") existing bindings rely on, and
+/// (b) on Dvorak / Colemak layouts `event.code` reflects the
+/// QWERTY position, which would break users who remap their layout.
+/// For Alt-only letter bindings the QWERTY-position behaviour is
+/// actually the desired one — Figma, Sketch, and every other tool
+/// in the space binds Option+letter to the physical key position
+/// rather than the locale-specific glyph.
+export function eventKeyForMatching(event: KeyboardEvent): string {
+  if (event.altKey) {
+    const code = event.code;
+    if (code.length === 4 && code.startsWith("Key")) {
+      // "KeyV" → "v". Always lower-case so it aligns with
+      // `normaliseBindingKey` without an extra fold.
+      return code.charAt(3).toLowerCase();
+    }
+  }
+  return event.key;
+}
+
 /// Two bindings are equal iff a single `KeyboardEvent` would match
 /// both. This is the contract `findConflicts` uses to surface
 /// collisions in the panel; it must agree with `matchesBinding`.
@@ -494,6 +532,12 @@ export function bindingsEqual(
 /// Match a `KeyboardEvent` against a binding. Letter keys match
 /// case-insensitively; named keys ("Escape", "Delete", "ArrowLeft",
 /// …) are case-sensitive per the DOM spec.
+///
+/// Letter resolution goes through `eventKeyForMatching` so Alt-only
+/// bindings work on macOS, where the Option key would otherwise
+/// transform `event.key` into a glyph that never matches the bound
+/// letter (see `eventKeyForMatching` doc-comment for the full
+/// rationale).
 export function matchesBinding(
   event: KeyboardEvent,
   binding: ShortcutBinding,
@@ -502,7 +546,10 @@ export function matchesBinding(
   if (mod !== binding.mod) return false;
   if (event.shiftKey !== binding.shift) return false;
   if (event.altKey !== binding.alt) return false;
-  return normaliseBindingKey(event.key) === normaliseBindingKey(binding.key);
+  return (
+    normaliseBindingKey(eventKeyForMatching(event)) ===
+    normaliseBindingKey(binding.key)
+  );
 }
 
 /// Render a binding into a human-readable label

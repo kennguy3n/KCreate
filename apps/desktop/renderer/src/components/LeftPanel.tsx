@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 
 import type {
   ArtboardInfo,
@@ -518,6 +518,24 @@ function NodeList({
     x: number;
     y: number;
   } | null>(null);
+
+  // Phase D — clear `ctxMenu` if the targeted row drops out of the
+  // visible `nodes` list (e.g. the user opens the menu then types in
+  // the search filter, or the bridge reports a tree refresh that
+  // removed the node). Otherwise the menu silently disappears in the
+  // render path (`nodes.find(...) === undefined` short-circuits the
+  // IIFE below) but the `ctxMenu` state lingers, so a subsequent
+  // re-add of the same id would resurrect the menu at the old (x, y).
+  // The destructured `ctxMenu?.nodeId` is the only reactive dep we
+  // care about — re-running on every `nodes` identity change would
+  // also work but would fire on every tree refresh, including ones
+  // where the targeted row is still present.
+  useEffect(() => {
+    if (!ctxMenu) return;
+    if (!nodes.some((n) => n.id === ctxMenu.nodeId)) {
+      setCtxMenu(null);
+    }
+  }, [ctxMenu, nodes]);
 
   if (nodes.length === 0) {
     return <EmptyHint>{emptyHint}</EmptyHint>;

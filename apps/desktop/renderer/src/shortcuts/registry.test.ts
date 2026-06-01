@@ -37,6 +37,7 @@ const ALIGNMENT_IDS = [
 
 function makeKeyboardEvent(init: {
   key: string;
+  code?: string;
   ctrlKey?: boolean;
   metaKey?: boolean;
   altKey?: boolean;
@@ -44,6 +45,7 @@ function makeKeyboardEvent(init: {
 }): KeyboardEvent {
   return new KeyboardEvent("keydown", {
     key: init.key,
+    code: init.code ?? "",
     ctrlKey: init.ctrlKey ?? false,
     metaKey: init.metaKey ?? false,
     altKey: init.altKey ?? false,
@@ -140,5 +142,105 @@ describe("shortcuts registry: Phase D alignment bindings", () => {
         expect(bindingsEqual(a, b)).toBe(false);
       }
     }
+  });
+
+  // Regression for the macOS Option dead-key bug: pressing Option+V
+  // (without Cmd) on macOS delivers `event.key === "√"` while the
+  // bound `key` is the pre-transformation letter "v". Without the
+  // `event.code` fallback in `matchesBinding`, alignment shortcuts
+  // would silently fail to fire on every Mac in the user base.
+  //
+  // Each letter row maps Option+<letter> → the Unicode glyph macOS
+  // produces. Values cribbed directly from a macOS Sequoia keyboard
+  // viewer (US-English layout) at the time this test was written.
+  it("matchesBinding honours event.code for Alt-only letter chords (macOS Option key)", () => {
+    const macOptionGlyphs: ReadonlyArray<{
+      action: (typeof ALIGNMENT_IDS)[number];
+      key: string;
+      glyph: string;
+      code: string;
+    }> = [
+      { action: "alignLeft", key: "a", glyph: "\u00e5", code: "KeyA" },
+      { action: "alignCenterX", key: "h", glyph: "\u02d9", code: "KeyH" },
+      { action: "alignRight", key: "d", glyph: "\u2202", code: "KeyD" },
+      { action: "alignTop", key: "w", glyph: "\u2211", code: "KeyW" },
+      { action: "alignCenterY", key: "v", glyph: "\u221a", code: "KeyV" },
+      { action: "alignBottom", key: "s", glyph: "\u00df", code: "KeyS" },
+    ];
+    for (const { action, key, glyph, code } of macOptionGlyphs) {
+      // Simulate the macOS event: `event.key` is the Option-transformed
+      // glyph (would have been `key` on Windows / Linux), `event.code`
+      // remains the physical key identifier.
+      const ev = makeKeyboardEvent({ key: glyph, code, altKey: true });
+      expect(
+        matchesBinding(ev, DEFAULT_BINDINGS[action]),
+        `${action} should fire when the user presses Option+${key} on macOS (event.key="${glyph}", event.code="${code}")`,
+      ).toBe(true);
+    }
+  });
+
+  // Cmd+Option+letter is unaffected by the dead-key bug because
+  // Chromium prioritises Cmd for character generation, so
+  // `event.key` stays as the original letter ("h" / "v"). The
+  // event.code path still has to be a no-op here — if it kicked in
+  // unconditionally we could end up matching a Cmd-only binding
+  // against a Cmd+Option event, or vice versa.
+  it("matchesBinding still distinguishes Alt vs Cmd+Alt on the macOS path", () => {
+    const cmdOptH = makeKeyboardEvent({
+      key: "h",
+      code: "KeyH",
+      metaKey: true,
+      altKey: true,
+    });
+    expect(matchesBinding(cmdOptH, DEFAULT_BINDINGS.distributeHorizontal)).toBe(
+      true,
+    );
+    expect(matchesBinding(cmdOptH, DEFAULT_BINDINGS.alignCenterX)).toBe(false);
+
+    // And an Option-only event with the dead-key glyph should NOT
+    // match the Cmd+Option distribute binding even though its
+    // event.code matches.
+    const optHGlyph = makeKeyboardEvent({
+      key: "\u02d9",
+      code: "KeyH",
+      altKey: true,
+    });
+    expect(
+      matchesBinding(optHGlyph, DEFAULT_BINDINGS.distributeHorizontal),
+    ).toBe(false);
+    expect(matchesBinding(optHGlyph, DEFAULT_BINDINGS.alignCenterX)).toBe(true);
+  });
+
+  // Defence-in-depth: the `event.code` fallback must only kick in
+  // for `KeyA`–`KeyZ` codes when `altKey` is set. Otherwise it
+  // would shadow non-alpha bindings (e.g. an Alt+Slash chord whose
+  // `event.code` is "Slash" but whose bound `key` is "/"). Both
+  // these patterns are currently absent from the registry, but the
+  // helper has to stay safe for future bindings.
+  it("matchesBinding falls back to event.key for non-letter codes even when altKey is set", () => {
+    // An Alt+/ chord on macOS: `event.key === "÷"` and `event.code
+    // === "Slash"`. Neither side of the chord matches "v", so
+    // alignCenterY must NOT fire.
+    const altSlash = makeKeyboardEvent({
+      key: "\u00f7",
+      code: "Slash",
+      altKey: true,
+    });
+    expect(matchesBinding(altSlash, DEFAULT_BINDINGS.alignCenterY)).toBe(false);
+    // And conversely, a hypothetical alt-only binding on `/` would
+    // still match via event.key because the code path doesn't
+    // engage for "Slash".
+    const altSlashBinding: ShortcutBinding = {
+      key: "/",
+      mod: false,
+      shift: false,
+      alt: true,
+    };
+    const altSlashEvent = makeKeyboardEvent({
+      key: "/",
+      code: "Slash",
+      altKey: true,
+    });
+    expect(matchesBinding(altSlashEvent, altSlashBinding)).toBe(true);
   });
 });

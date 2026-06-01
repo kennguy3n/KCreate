@@ -427,11 +427,6 @@ impl SceneSync {
             return false;
         }
         let base_z = *z;
-        // Clone the slice up front so the borrow on `node_cache`
-        // ends before we mutate `self.uuid_to_object_id` /
-        // `self.object_id_to_uuid` below.
-        let cached_objects = entry.objects.clone();
-        let sub_object_ids = entry.sub_object_ids.clone();
         // Use the recorded `z_advance` rather than the cached object
         // count: replay must move the z stream by the same delta the
         // original emit moved it, even if a future emitter chooses to
@@ -441,12 +436,36 @@ impl SceneSync {
         // silently produce mismatched z values the day that
         // assumption changes.
         let advance = entry.z_advance;
-        for obj in cached_objects {
-            let stored_z = obj.z;
-            let mut cloned = obj;
-            cloned.z = base_z.saturating_add(stored_z);
+        // Push cached objects by reference + clone-on-push. We used
+        // to materialise the whole `entry.objects` vec into a
+        // temporary `cached_objects` clone purely to end the borrow
+        // on `node_cache` before the post-loop mutations on
+        // `uuid_to_object_id` / `object_id_to_uuid`. Object clones
+        // still happen (the cache must outlive each emit) but
+        // they're now spread one-per-push instead of eagerly
+        // cloning the entire `Vec<Object>`, and we no longer
+        // allocate the intermediate `cached_objects: Vec<Object>`
+        // at all. For a steady-state sync over a 1000-node doc
+        // that eliminates 1000 wasted `Vec<Object>` heap
+        // allocations per frame.
+        for obj in &entry.objects {
+            let mut cloned = obj.clone();
+            cloned.z = base_z.saturating_add(obj.z);
             objects.push(cloned);
         }
+        // `sub_object_ids` is `Vec<ObjectId>` (i.e. `Vec<u64>`-sized)
+        // and typically holds one entry per leaf node. Cloning it
+        // here ends the `node_cache` borrow so the map-update
+        // mutations below can take `&mut self.{uuid,object}_id_to_*`.
+        // Eliminating this clone too would require either a
+        // split-borrow trick that Rust's borrow checker cannot see
+        // through `HashMap::get` (it doesn't know `node_cache`,
+        // `uuid_to_object_id`, `object_id_to_uuid` are disjoint
+        // fields of `self`) or moving the maps onto a sub-struct
+        // that excludes `node_cache`. Neither is worth the code-
+        // shape disruption for an 8-byte-per-entry clone of a
+        // typically-1-entry vec.
+        let sub_object_ids = entry.sub_object_ids.clone();
         *z = z.saturating_add(advance);
         // Repopulate the maps so hit-testing works the same as a
         // fresh emit. The primary id is the first sub id (every
@@ -583,18 +602,26 @@ impl SceneSync {
         blob_store: Option<&BlobStore>,
         selection: &[Uuid],
     ) -> Scene {
-        // Forget previous mappings so deleted nodes don't linger.
-        // (Re-allocation will reuse the same ids for ids that *do* show
-        // up again because `allocate` checks the map first.)
-        let preserved = std::mem::take(&mut self.uuid_to_object_id);
+        // Rebuild the reverse map (`object_id_to_uuid`) from the
+        // forward map (`uuid_to_object_id`) so the two stay in
+        // lock-step. The forward map persists across syncs so
+        // `allocate` can reuse stable `ObjectId`s for uuids that
+        // re-appear (a node that goes invisible and back, an undo,
+        // etc.); the reverse map is purely derived and only needs
+        // to be valid after each sync.
+        //
+        // Rust's split-borrow rules let us iterate
+        // `&self.uuid_to_object_id` while mutating the disjoint
+        // `&mut self.object_id_to_uuid` directly, so neither a
+        // `mem::take` swap nor a `HashMap::clone()` of the forward
+        // map is needed — both used to live here purely as borrow-
+        // checker workarounds. For a 1000-node steady-state sync
+        // that eliminates one full `HashMap<Uuid, ObjectId>` clone
+        // per call.
         self.object_id_to_uuid.clear();
-        // Reinstate the existing mappings as a side-table; `allocate`
-        // will pick them up so identity is stable across syncs.
-        self.uuid_to_object_id = preserved;
-        // Re-populate the reverse map from the preserved forward map.
-        let forward = self.uuid_to_object_id.clone();
-        for (uuid, obj_id) in &forward {
-            self.object_id_to_uuid.insert(*obj_id, *uuid);
+        self.object_id_to_uuid.reserve(self.uuid_to_object_id.len());
+        for (&uuid, &obj_id) in &self.uuid_to_object_id {
+            self.object_id_to_uuid.insert(obj_id, uuid);
         }
 
         let mut scene = Scene::new(DEFAULT_CLEAR);
@@ -2568,6 +2595,135 @@ mod tests {
             assert!(
                 sync.object_id_for_uuid(*id).is_some(),
                 "uuid {id} dropped from forward map after cached sync",
+            );
+        }
+    }
+
+    /// Phase E regression pin — Target 1 fix. The reverse map
+    /// rebuild in `sync_document_to_scene_inner` used to do a
+    /// wasteful `mem::take` + `HashMap::clone()` of the forward
+    /// map just to satisfy the borrow checker. The Phase E fix
+    /// replaces that with a direct split-borrow iteration over
+    /// `&self.uuid_to_object_id` while inserting into
+    /// `&mut self.object_id_to_uuid`. This test pins the
+    /// observable invariant: after any sync, EVERY entry in the
+    /// forward map must round-trip through the reverse map. If a
+    /// future refactor drops the rebuild loop (or rebuilds it
+    /// incorrectly — e.g. by mistakenly inserting `(uuid, obj_id)`
+    /// instead of `(obj_id, uuid)`), this test pops.
+    #[test]
+    fn forward_and_reverse_maps_stay_in_lockstep_after_sync() {
+        let (mut doc, mut sync, _scene, _ids) = three_vector_scene();
+        // Run a second sync — this exercises the rebuild path that
+        // the cold-start sync also takes on the first call. The
+        // forward map persists; the reverse map is regenerated
+        // from it.
+        let _ = sync.sync_document_to_scene(&mut doc, None, &[]);
+        // Every forward entry must appear in the reverse map with
+        // the inverse key/value.
+        let forward = sync
+            .uuid_to_object_id
+            .iter()
+            .map(|(u, o)| (*u, *o))
+            .collect::<Vec<_>>();
+        assert!(
+            !forward.is_empty(),
+            "precondition: forward map must be populated after a sync of a non-empty doc",
+        );
+        for (uuid, obj_id) in &forward {
+            assert_eq!(
+                sync.uuid_for_object_id(*obj_id),
+                Some(*uuid),
+                "forward entry (uuid={uuid}, obj_id={obj_id:?}) missing from reverse map \
+                 — Phase E reverse-map rebuild regressed",
+            );
+        }
+        // And conversely: every reverse entry must round-trip
+        // through the forward map — catches the case where a
+        // future refactor accidentally populates the reverse map
+        // with stale entries from a previous sync.
+        let reverse = sync
+            .object_id_to_uuid
+            .iter()
+            .map(|(o, u)| (*o, *u))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            reverse.len(),
+            forward.len(),
+            "forward / reverse map sizes diverged \
+             (forward={fwd}, reverse={rev}) — Phase E reverse-map rebuild regressed",
+            fwd = forward.len(),
+            rev = reverse.len(),
+        );
+        for (obj_id, uuid) in &reverse {
+            assert_eq!(
+                sync.object_id_for_uuid(*uuid),
+                Some(*obj_id),
+                "reverse entry (obj_id={obj_id:?}, uuid={uuid}) missing from forward map",
+            );
+        }
+    }
+
+    /// Phase E regression pin — Target 2 fix. The cache-replay
+    /// path used to clone both `entry.objects` and
+    /// `entry.sub_object_ids` purely to end the borrow on
+    /// `node_cache` before mutating the forward/reverse id maps.
+    /// The Phase E fix removes the `entry.objects` clone and
+    /// pushes objects by reference + clone-on-push instead. This
+    /// test pins the load-bearing post-loop behaviour the clone
+    /// existed to support: after a cache-only sync (every node
+    /// hits `try_replay_cached`), the forward map must point
+    /// every node uuid at its primary ObjectId AND the reverse
+    /// map must point every emitted ObjectId back at the right
+    /// node uuid. If a future refactor accidentally drops either
+    /// map update (e.g. by simplifying the post-loop block to
+    /// only touch one map), this test pops.
+    #[test]
+    fn cache_replay_registers_both_forward_and_reverse_maps() {
+        let (mut doc, mut sync, scene_a, ids) = three_vector_scene();
+        // Snapshot the first sync's ObjectIds per uuid so we can
+        // verify the cache-replay path produces the same mapping.
+        let mut expected_primary: HashMap<Uuid, ObjectId> = HashMap::new();
+        for (uuid, obj_id) in &sync.uuid_to_object_id {
+            expected_primary.insert(*uuid, *obj_id);
+        }
+        // Second sync goes 100% through the cache (no version
+        // bumps, no structure changes).
+        let scene_b = sync.sync_document_to_scene(&mut doc, None, &[]);
+        assert_eq!(
+            scene_a.objects.len(),
+            scene_b.objects.len(),
+            "cache replay must produce same object count",
+        );
+        // Forward map: every node uuid must still resolve to its
+        // original primary ObjectId.
+        for uuid in &ids {
+            let actual = sync.object_id_for_uuid(*uuid).unwrap_or_else(|| {
+                panic!("uuid {uuid} dropped from forward map after cache-only sync")
+            });
+            let expected = expected_primary[uuid];
+            assert_eq!(
+                actual, expected,
+                "uuid {uuid} primary ObjectId changed across cache-replay sync",
+            );
+        }
+        // Reverse map: every ObjectId emitted into the scene must
+        // resolve back to a uuid in our doc (catches the case
+        // where the reverse-map insert in the replay path is
+        // accidentally dropped).
+        let doc_uuids: std::collections::HashSet<Uuid> = ids.iter().copied().collect();
+        for obj in &scene_b.objects {
+            let uuid = sync.uuid_for_object_id(obj.id).unwrap_or_else(|| {
+                panic!(
+                    "ObjectId {:?} in replayed scene missing from reverse map \
+                     — Phase E cache-replay map update regressed",
+                    obj.id,
+                )
+            });
+            assert!(
+                doc_uuids.contains(&uuid),
+                "reverse map maps ObjectId {:?} to unknown uuid {uuid}",
+                obj.id,
             );
         }
     }

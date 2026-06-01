@@ -5,8 +5,9 @@
     "moduleResolution": "Node",
     "outDir": "main/dist",
     "rootDir": ".",
-    "types": ["node"],
+    "types": ["node", "vitest/globals"],
     "lib": ["ES2022"]
   },
-  "include": ["main/src/**/*", "shared/**/*"]
+  "include": ["main/src/**/*", "shared/**/*"],
+  "exclude": ["main/src/**/*.test.ts"]
 }

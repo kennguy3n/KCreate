@@ -1003,12 +1003,79 @@ mod tests {
             "expected camelCase wire key `filePath`, got {raw}"
         );
         assert!(
+            raw.contains("\"downloadUrl\""),
+            "expected camelCase wire key `downloadUrl`, got {raw}"
+        );
+        assert!(
             !raw.contains("\"size_bytes\""),
             "snake_case `size_bytes` must not leak onto the wire: {raw}"
         );
         assert!(
             !raw.contains("\"file_path\""),
             "snake_case `file_path` must not leak onto the wire: {raw}"
+        );
+        assert!(
+            !raw.contains("\"download_url\""),
+            "snake_case `download_url` must not leak onto the wire: {raw}"
+        );
+    }
+
+    /// Wire-format lockstep: `InstallReport` is what the Rust bridge
+    /// returns from `aiInstallModelPack` (also flows through the
+    /// Phase C `onboarding.installRecommendedPack` IPC, which forwards
+    /// the JSON unchanged after a Node-side `JSON.parse` /
+    /// `JSON.stringify` round-trip). The TypeScript consumers in
+    /// `apps/desktop/shared/scene.ts::OnboardingInstallReport` and
+    /// `apps/desktop/main/src/onboardingDownloader.ts::OnboardingInstallReport`
+    /// MUST read the camelCase keys (`packId`, `actualSha256`,
+    /// `sizeBytes`) because that's what `#[serde(rename_all =
+    /// "camelCase")]` emits. A previous iteration of the TS layer
+    /// expected snake_case (`pack_id`, `actual_sha256`, `size_bytes`)
+    /// which silently broke the one-click install flow — the
+    /// validation always rejected the Rust-emitted payload because
+    /// every snake_case lookup was `undefined`. This test pins the
+    /// canonical wire shape so any future field rename has to touch
+    /// both sides in lockstep.
+    #[test]
+    fn install_report_serialises_to_camelcase_wire_format() {
+        let report = InstallReport {
+            pack_id: "llm_bonsai_1_7b".into(),
+            actual_sha256: "0".repeat(64),
+            verified: true,
+            size_bytes: 750_000_000,
+        };
+        let raw = serde_json::to_string(&report).unwrap();
+        // Round-trip back to the same struct.
+        let parsed: InstallReport = serde_json::from_str(&raw).unwrap();
+        assert_eq!(parsed, report);
+        // Pin the wire-format key names.
+        assert!(
+            raw.contains("\"packId\""),
+            "expected camelCase wire key `packId`, got {raw}"
+        );
+        assert!(
+            raw.contains("\"actualSha256\""),
+            "expected camelCase wire key `actualSha256`, got {raw}"
+        );
+        assert!(
+            raw.contains("\"sizeBytes\""),
+            "expected camelCase wire key `sizeBytes`, got {raw}"
+        );
+        assert!(
+            raw.contains("\"verified\""),
+            "expected wire key `verified` (no rename), got {raw}"
+        );
+        assert!(
+            !raw.contains("\"pack_id\""),
+            "snake_case `pack_id` must not leak onto the wire: {raw}"
+        );
+        assert!(
+            !raw.contains("\"actual_sha256\""),
+            "snake_case `actual_sha256` must not leak onto the wire: {raw}"
+        );
+        assert!(
+            !raw.contains("\"size_bytes\""),
+            "snake_case `size_bytes` must not leak onto the wire: {raw}"
         );
     }
 

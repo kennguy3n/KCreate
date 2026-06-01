@@ -6,7 +6,7 @@
   "main": "main/dist/main.js",
   "scripts": {
     "build": "tsc -b tsconfig.main.json tsconfig.preload.json && vite build --config renderer/vite.config.ts",
-    "typecheck": "tsc -b tsconfig.main.json tsconfig.preload.json --noEmit && tsc -p renderer/tsconfig.json --noEmit",
+    "typecheck": "tsc -b tsconfig.main.json tsconfig.preload.json --noEmit && tsc -p renderer/tsconfig.json --noEmit && tsc -p tsconfig.tests.json",
     "lint": "eslint --max-warnings=0 main preload renderer",
     "test": "node --test renderer/tests/templates.test.mjs renderer/tests/rightPanelTabs.test.mjs && vitest run --config renderer/vitest.config.ts",
     "test:vitest": "vitest run --config renderer/vitest.config.ts",

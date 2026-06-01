@@ -1125,6 +1125,19 @@ pub fn llm_status() -> NapiResult<String> {
         .map_err(|e| NapiError::from_reason(format!("llm_status: {e}")))
 }
 
+/// Phase C — recommended LLM pack id for the current device tier +
+/// platform. Empty string when the registry has no recommendation
+/// (expected to be never on a supported device — see
+/// [`kcreate_ai::recommended_llm_pack`]). The welcome modal in
+/// the renderer drives the one-click "install recommended pack"
+/// flow off this id; the main process uses it to look up the
+/// canonical download URL from `aiListModelPacks` without ever
+/// surfacing the URL string to the renderer.
+#[napi]
+pub fn llm_recommended_pack() -> String {
+    phase4::llm_recommended_pack().unwrap_or_default()
+}
+
 // LLM chat/completion is a *blocking* HTTP round-trip to the local
 // llama-server (up to a 60 s timeout in `chat_completion_impl`).
 // Exposing it as a synchronous N-API function would block the

@@ -1352,6 +1352,91 @@ export interface LlmBridge {
    * current selection (or whole document if nothing is selected).
    */
   suggestForSelection(): Promise<LlmReply>;
+  /**
+   * Phase C — recommended LLM pack id for the current device tier
+   * (one of `llm_bonsai_1_7b` / `llm_bonsai_4b` / `llm_bonsai_8b`).
+   * Empty string when the registry has no recommendation, which is
+   * expected never on a supported device.
+   */
+  recommendedPack(): Promise<string>;
+}
+
+// -----------------------------------------------------------------------------
+// Phase C — onboarding / first-run welcome bridge
+// -----------------------------------------------------------------------------
+
+/**
+ * Progress event emitted on every ~256 KiB of downloaded bytes
+ * while the welcome modal's one-click install is running. The
+ * shape mirrors `apps/desktop/main/src/onboardingDownloader.ts`
+ * (the channel is in the main process, not the Rust bridge).
+ */
+export interface OnboardingProgress {
+  packId: string;
+  phase:
+    | "resolving"
+    | "connecting"
+    | "downloading"
+    | "verifying"
+    | "installing"
+    | "done"
+    | "error"
+    | "cancelled";
+  receivedBytes: number;
+  totalBytes: number | null;
+  message: string;
+}
+
+/**
+ * Result returned by `onboarding.installRecommendedPack()` on
+ * success. Mirrors the Rust `InstallReport`: `verified=true` means
+ * the registry pinned a SHA-256 and the downloaded bytes match;
+ * `verified=false` means the registry has no pinned hash yet so
+ * the actual hash is reported for the user's records.
+ *
+ * Field naming is `camelCase` to match
+ * `kcreate_ai::InstallReport`'s `#[serde(rename_all =
+ * "camelCase")]` serialisation. The Rust JSON is shipped through
+ * the bridge → main → preload → renderer pipeline unchanged, so
+ * the field names here MUST match the on-wire keys exactly.
+ * See `install_report_serialises_to_camelcase_wire_format` in
+ * `crates/kcreate_ai/src/model_registry.rs` for the lockstep
+ * pin.
+ */
+export interface OnboardingInstallReport {
+  packId: string;
+  verified: boolean;
+  actualSha256: string;
+  sizeBytes: number;
+}
+
+/**
+ * Phase C — one-click recommended-pack download + install. The
+ * renderer NEVER sees a URL; the main process resolves the pack
+ * id via `llm.recommendedPack()`, validates the registry URL
+ * against the host allow-list, streams to a per-process temp
+ * file, then hands it to `aiModel.installModelPack`'s same
+ * SHA-256 verify + atomic rename path.
+ */
+export interface OnboardingBridge {
+  installRecommendedPack(): Promise<OnboardingInstallReport>;
+  cancelInstall(): Promise<void>;
+  /**
+   * Subscribe to progress events. Returns an unsubscribe handle —
+   * the renderer must call it on cleanup to avoid leaking IPC
+   * listeners across re-renders.
+   */
+  onInstallProgress(fn: (progress: OnboardingProgress) => void): () => void;
+}
+
+/**
+ * Phase C — narrow system surface for the welcome modal's "Open
+ * download page" fallback. Only HTTPS URLs whose hostname is in
+ * `apps/desktop/main/src/onboardingDownloader.ALLOWED_HOSTS` are
+ * accepted; everything else throws in the main process.
+ */
+export interface SystemBridge {
+  openExternal(url: string): Promise<void>;
 }
 
 // -----------------------------------------------------------------------------
@@ -4834,6 +4919,8 @@ declare global {
       phase10: Phase10Bridge;
       projectEncryption: ProjectEncryptionBridge;
       annotation: AnnotationBridge;
+      system: SystemBridge;
+      onboarding: OnboardingBridge;
     };
   }
 }
@@ -5911,6 +5998,25 @@ export interface Preferences {
   export: {
     lastDirByFormat: Record<string, string>;
     lastBatchDir: string | null;
+  };
+  /**
+   * Phase C — first-run welcome modal state. `completed` flips to
+   * `true` the first time any close path of the modal fires
+   * (install succeeded, manual file install succeeded, user
+   * clicked "Skip"). `lastSeenPackId` records the recommendation
+   * id the user was shown so a future tier-change pass can
+   * detect when the recommended pack rolled over.
+   *
+   * Mirrors `OnboardingPrefs` in `crates/kcreate_bridge/src/phase10.rs`;
+   * the field is `#[serde(default)]`-loaded on the Rust side so
+   * a preferences file written before Phase C continues to
+   * deserialise into a default-`completed=false` value — which is
+   * the correct first-run behaviour for an existing user who has
+   * never seen the welcome modal.
+   */
+  onboarding: {
+    completed: boolean;
+    lastSeenPackId: string | null;
   };
 }
 

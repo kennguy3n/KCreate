@@ -1181,6 +1181,19 @@ pub struct Preferences {
     /// empty map + `None`).
     #[serde(default)]
     pub export: ExportPrefs,
+    /// Phase C — first-run onboarding. The welcome modal that
+    /// drives the tier-aware "install recommended pack" flow
+    /// checks `onboarding.completed` on startup; once any close
+    /// path fires (install succeeded, user provided their own
+    /// weights file, or user clicked "Skip"), the renderer flips
+    /// this to `true` so the modal is never shown again. The
+    /// `#[serde(default)]` is load-bearing — preferences files
+    /// written before Phase C must continue to load and gain the
+    /// section silently with `completed = false`, which is the
+    /// correct first-run behaviour for an existing user who has
+    /// never seen the welcome modal.
+    #[serde(default)]
+    pub onboarding: OnboardingPrefs,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1251,6 +1264,33 @@ pub struct ExportPrefs {
     pub last_batch_dir: Option<String>,
 }
 
+/// Phase C — first-run welcome / onboarding state.
+///
+/// The renderer's `WelcomeModal` is the only consumer; it is
+/// auto-mounted on `HomePage` when `completed == false` and
+/// dismissed (with `completed = true` persisted) on every
+/// close path. `last_seen_pack_id` records the recommended pack
+/// id the modal surfaced to the user so that a future Phase F
+/// "re-recommend after tier upgrade" pass can detect when the
+/// device tier crossed a boundary (e.g. the user added RAM and
+/// the recommended pack rolled from `llm_bonsai_1_7b` to
+/// `llm_bonsai_4b`) and re-surface the modal with the new
+/// pack — without forcing the modal back on users whose tier
+/// has not changed.
+///
+/// Wire field is `onboarding`. The struct itself derives
+/// `Default` so `#[serde(default)]` on the parent field can
+/// instantiate it cleanly when the section is absent from an
+/// older preferences file.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct OnboardingPrefs {
+    #[serde(default)]
+    pub completed: bool,
+    #[serde(default)]
+    pub last_seen_pack_id: Option<String>,
+}
+
 impl Default for Preferences {
     fn default() -> Self {
         Self {
@@ -1281,6 +1321,7 @@ impl Default for Preferences {
                 audit_log_retention_days: 90,
             },
             export: ExportPrefs::default(),
+            onboarding: OnboardingPrefs::default(),
         }
     }
 }
@@ -1410,6 +1451,76 @@ mod tests {
         // Phase A2 — the new `export` section round-trips empty.
         assert!(back.export.last_dir_by_format.is_empty());
         assert!(back.export.last_batch_dir.is_none());
+        // Phase C — default onboarding is "not yet completed" so the
+        // welcome modal fires on first run for every new install.
+        assert!(!back.onboarding.completed);
+        assert!(back.onboarding.last_seen_pack_id.is_none());
+    }
+
+    #[test]
+    fn preferences_onboarding_section_round_trips_completion_state() {
+        // After the welcome modal closes (any path), the renderer
+        // flips `completed = true` and records the recommended
+        // pack id it surfaced so a future tier-change pass can
+        // detect when the recommendation crossed a boundary.
+        let mut prefs = Preferences::default();
+        prefs.onboarding.completed = true;
+        prefs.onboarding.last_seen_pack_id = Some("llm_bonsai_4b".into());
+        let s = serde_json::to_string(&prefs).expect("serialize");
+        let back: Preferences = serde_json::from_str(&s).expect("deserialize");
+        assert!(back.onboarding.completed);
+        assert_eq!(
+            back.onboarding.last_seen_pack_id.as_deref(),
+            Some("llm_bonsai_4b")
+        );
+    }
+
+    #[test]
+    fn preferences_legacy_file_without_onboarding_section_deserialises() {
+        // A preferences.json written before Phase C has no
+        // `onboarding` section — the renderer must still be able
+        // to load such a file (the new field defaults to a
+        // not-yet-completed `OnboardingPrefs`, which correctly
+        // triggers the first-run welcome modal for users who are
+        // upgrading from a pre-Phase-C build).
+        let legacy = serde_json::json!({
+            "general": {
+                "theme": "dark",
+                "language": "en-US",
+                "autosaveIntervalSec": 60,
+                "scratchProjectCleanupDays": 30,
+            },
+            "canvas": {
+                "defaultGridSpacing": 16.0,
+                "defaultGridSubdivisions": 4,
+                "snapThresholdPx": 6.0,
+                "rulerUnits": "px",
+            },
+            "ai": {
+                "defaultLlmModel": "",
+                "autoStartSidecar": false,
+                "gbnfGrammarDebugging": false,
+            },
+            "performance": {
+                "rasterCacheBudgetMb": 512,
+                "undoDepthOverride": null,
+                "lowResourceMode": false,
+            },
+            "privacy": {
+                "telemetryOptIn": false,
+                "auditLogRetentionDays": 90,
+            },
+            "export": {
+                "lastDirByFormat": {},
+                "lastBatchDir": null,
+            },
+            // No `onboarding` field — must default cleanly so the
+            // upgrading user gets the welcome modal exactly once.
+        });
+        let prefs: Preferences = serde_json::from_value(legacy).expect("legacy preferences load");
+        assert_eq!(prefs.general.theme, "dark");
+        assert!(!prefs.onboarding.completed);
+        assert!(prefs.onboarding.last_seen_pack_id.is_none());
     }
 
     #[test]

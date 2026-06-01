@@ -131,6 +131,17 @@ export function PreferencesPanel({
           lastDirByFormat: {},
           lastBatchDir: null,
         },
+        // Phase C — preserving `completed=true` on a defaults
+        // reset is deliberate. The user has already seen the
+        // welcome modal at least once (resetting preferences from
+        // PreferencesPanel necessarily means they've been past
+        // first-launch); re-triggering it after every reset would
+        // be annoying. The lastSeenPackId is cleared so a future
+        // tier rollover detector sees a clean slate.
+        onboarding: {
+          completed: true,
+          lastSeenPackId: null,
+        },
       };
       await window.kcreate.phase10.preferencesSave(defaultPrefs);
       setPrefs(defaultPrefs);

@@ -7,6 +7,7 @@ import {
   BrowserWindow,
   dialog,
   ipcMain,
+  shell,
   WebContentsView,
   type IpcMainInvokeEvent,
 } from "electron";
@@ -16,6 +17,12 @@ import * as os from "node:os";
 import * as path from "node:path";
 
 import { loadBridge, type Bridge } from "./bridge";
+import {
+  start as startOnboardingDownload,
+  validateOpenExternalUrl,
+  type OnboardingHandle,
+  type OnboardingInstallReport,
+} from "./onboardingDownloader";
 
 /// Naming convention for scratch projects opened from the Home tile.
 /// Centralised here so the cleanup pass (`cleanupScratchProjects`) and
@@ -275,6 +282,23 @@ function requireBridge(): Bridge {
 // window's `closed` event so a stale reference can never outlive the
 // native handle it would hand out.
 let mainWindow: BrowserWindow | null = null;
+
+// Phase C — handle to the in-flight one-click recommended-pack
+// download, or `null` when no download is running. The
+// `kcreate/onboarding/installRecommendedPack` IPC mutates this
+// in lock-step with the download's lifetime; the helper below
+// gives callers (a fresh install request, or the explicit
+// `kcreate/onboarding/cancelInstall` IPC) a single place to
+// cleanly stop an active download without duplicating null
+// checks at every call site.
+let activeOnboardingHandle: OnboardingHandle | null = null;
+
+function cancelOnboardingDownload(): void {
+  if (activeOnboardingHandle) {
+    activeOnboardingHandle.cancel();
+    activeOnboardingHandle = null;
+  }
+}
 
 // Phase A2 — set of directories the user has explicitly approved
 // for sidecar writes (`writeTextFile`) by going through one of the
@@ -1089,6 +1113,13 @@ function registerIpcHandlers(): void {
   );
   ipcMain.handle("kcreate/llm/suggest", (): Promise<string> =>
     requireBridge().llmSuggestForSelection(),
+  );
+  // Phase C — the welcome modal calls this on mount to resolve the
+  // tier-appropriate Bonsai pack id before it shows install CTAs.
+  // Empty string when the registry has no recommendation (expected
+  // never on a supported device).
+  ipcMain.handle("kcreate/llm/recommendedPack", (): string =>
+    requireBridge().llmRecommendedPack(),
   );
   ipcMain.handle("kcreate/ai/suggestLayerNames", (): Promise<string> =>
     requireBridge().aiSuggestLayerNames(),
@@ -2544,6 +2575,54 @@ function registerIpcHandlers(): void {
     });
     if (result.canceled || result.filePaths.length === 0) return null;
     return result.filePaths[0];
+  });
+  // Phase C — one-click recommended-pack download.
+  //
+  // The renderer triggers this with no arguments; the main process
+  // resolves the recommended pack id via the bridge, validates the
+  // download URL from the static registry against an allow-list
+  // (`onboardingDownloader.ALLOWED_HOSTS`), streams the bytes
+  // into a per-process temp file under `os.tmpdir()`, then hands
+  // the temp path to `aiInstallModelPack` (same SHA-256 verify +
+  // atomic rename the manual "I have the file" flow uses). The
+  // renderer never sees the URL — the registry is the only place
+  // a URL flows from, and the allow-list prevents a typo or a
+  // maliciously-edited registry entry from fetching arbitrary
+  // hosts.
+  //
+  // Concurrency: a single in-flight handle is tracked at module
+  // scope (`activeOnboardingHandle`). A second `start` invocation
+  // while one is running cleanly cancels the prior run (matches
+  // the renderer's "close modal mid-download" UX) before kicking
+  // off the new one.
+  ipcMain.handle("kcreate/onboarding/installRecommendedPack", async () => {
+    cancelOnboardingDownload();
+    const win = mainWindow;
+    const handle = startOnboardingDownload(requireBridge(), win);
+    activeOnboardingHandle = handle;
+    try {
+      const report: OnboardingInstallReport = await handle.done;
+      return JSON.stringify(report);
+    } finally {
+      if (activeOnboardingHandle === handle) {
+        activeOnboardingHandle = null;
+      }
+    }
+  });
+  ipcMain.handle("kcreate/onboarding/cancelInstall", () => {
+    cancelOnboardingDownload();
+  });
+  // `kcreate/system/openExternal` exposes Electron's `shell.openExternal`
+  // through a narrow channel that mirrors `onboardingDownloader.validateUrl`'s
+  // allow-list. The welcome modal's "Open download page" fallback uses
+  // this to launch the user's default browser at the Hugging Face
+  // model card when they prefer the manual install flow. Validating
+  // the URL here (not just in the renderer) prevents a
+  // compromised renderer process from coaxing the main process into
+  // opening file://, mailto:, or arbitrary http: URLs.
+  ipcMain.handle("kcreate/system/openExternal", async (_e, url: string) => {
+    const validated = validateOpenExternalUrl(url);
+    await shell.openExternal(validated);
   });
   // `kcreate/pdf/pickFile` opens an Electron-native file picker
   // scoped to .pdf so the renderer can hand the resolved path to

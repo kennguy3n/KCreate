@@ -97,4 +97,99 @@ describe("LeftPanel", () => {
       { id: "b", locked: false },
     ]);
   });
+
+  describe("right-click context menu (Phase D)", () => {
+    it("opens a context menu with the standard action set on right-click", () => {
+      renderLeftPanel([makeNode({ id: "a", name: "Alpha" })]);
+      const row = screen.getByText("Alpha").closest("div");
+      expect(row).not.toBeNull();
+      fireEvent.contextMenu(row!);
+      // Standard items always present
+      expect(screen.getByTestId("ctx-rename")).toBeInTheDocument();
+      expect(screen.getByTestId("ctx-visibility")).toBeInTheDocument();
+      expect(screen.getByTestId("ctx-lock")).toBeInTheDocument();
+    });
+
+    it("hides Duplicate when onDuplicateNode is not wired", () => {
+      renderLeftPanel([makeNode({ id: "a", name: "Alpha" })]);
+      const row = screen.getByText("Alpha").closest("div");
+      fireEvent.contextMenu(row!);
+      expect(screen.queryByTestId("ctx-duplicate")).toBeNull();
+    });
+
+    it("shows Duplicate when onDuplicateNode is wired and fires it on click", () => {
+      const duplicates: string[] = [];
+      render(
+        <LeftPanel
+          nodes={[makeNode({ id: "a", name: "Alpha" })]}
+          selectedId={null}
+          onSelect={() => undefined}
+          onDuplicateNode={(id) => duplicates.push(id)}
+          artboards={[]}
+          components={[]}
+        />,
+      );
+      const row = screen.getByText("Alpha").closest("div");
+      fireEvent.contextMenu(row!);
+      fireEvent.click(screen.getByTestId("ctx-duplicate"));
+      expect(duplicates).toEqual(["a"]);
+    });
+
+    it("Rename item opens the rename input pre-filled with the layer name", () => {
+      renderLeftPanel([makeNode({ id: "a", name: "Alpha" })]);
+      const row = screen.getByText("Alpha").closest("div");
+      fireEvent.contextMenu(row!);
+      fireEvent.click(screen.getByTestId("ctx-rename"));
+      const input = screen.getByDisplayValue("Alpha") as HTMLInputElement;
+      expect(input).toBeInTheDocument();
+      expect(input.tagName).toBe("INPUT");
+    });
+
+    it("Hide/Show item inverts visibility on the targeted row", () => {
+      const { captured } = renderLeftPanel([
+        makeNode({ id: "a", name: "Alpha", visible: true }),
+      ]);
+      const row = screen.getByText("Alpha").closest("div");
+      fireEvent.contextMenu(row!);
+      fireEvent.click(screen.getByTestId("ctx-visibility"));
+      expect(captured.visibility).toEqual([{ id: "a", visible: false }]);
+    });
+
+    it("Lock/Unlock item inverts lock state on the targeted row", () => {
+      const { captured } = renderLeftPanel([
+        makeNode({ id: "a", name: "Alpha", locked: false }),
+      ]);
+      const row = screen.getByText("Alpha").closest("div");
+      fireEvent.contextMenu(row!);
+      fireEvent.click(screen.getByTestId("ctx-lock"));
+      expect(captured.locked).toEqual([{ id: "a", locked: true }]);
+    });
+
+    it("Delete item fires onDelete with the targeted id", () => {
+      const deletes: string[] = [];
+      render(
+        <LeftPanel
+          nodes={[makeNode({ id: "a", name: "Alpha" })]}
+          selectedId={null}
+          onSelect={() => undefined}
+          onDelete={(id) => deletes.push(id)}
+          artboards={[]}
+          components={[]}
+        />,
+      );
+      const row = screen.getByText("Alpha").closest("div");
+      fireEvent.contextMenu(row!);
+      fireEvent.click(screen.getByTestId("ctx-delete"));
+      expect(deletes).toEqual(["a"]);
+    });
+
+    it("Escape dismisses the menu", () => {
+      renderLeftPanel([makeNode({ id: "a", name: "Alpha" })]);
+      const row = screen.getByText("Alpha").closest("div");
+      fireEvent.contextMenu(row!);
+      expect(screen.getByTestId("ctx-rename")).toBeInTheDocument();
+      fireEvent.keyDown(document, { key: "Escape" });
+      expect(screen.queryByTestId("ctx-rename")).toBeNull();
+    });
+  });
 });

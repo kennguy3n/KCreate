@@ -22,6 +22,7 @@ import { colors, radius, spacing } from "../styles/tokens";
 const CATEGORIES: { id: ShortcutCategory; title: string }[] = [
   { id: "editing", title: "Editing" },
   { id: "tools", title: "Tools" },
+  { id: "alignment", title: "Alignment" },
   { id: "view", title: "View" },
   { id: "panels", title: "Panels" },
 ];

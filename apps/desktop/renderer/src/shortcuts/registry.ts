@@ -45,7 +45,15 @@ export type ActionId =
   | "openExport"
   | "openShortcutsPanel"
   | "copy"
-  | "paste";
+  | "paste"
+  | "alignLeft"
+  | "alignCenterX"
+  | "alignRight"
+  | "alignTop"
+  | "alignCenterY"
+  | "alignBottom"
+  | "distributeHorizontal"
+  | "distributeVertical";
 
 /// A keystroke. `key` follows the `KeyboardEvent.key` convention
 /// (case-insensitive a–z, named keys like "Escape", "Delete",
@@ -72,7 +80,7 @@ export interface ActionMeta {
   readonly description: string;
 }
 
-export type ShortcutCategory = "editing" | "tools" | "view" | "panels";
+export type ShortcutCategory = "editing" | "tools" | "view" | "panels" | "alignment";
 
 /// The shipped defaults. Mirrors the previous hard-coded handler in
 /// `EditorPage.tsx`; users can override any of these via the panel.
@@ -117,6 +125,17 @@ export const DEFAULT_BINDINGS: Record<ActionId, ShortcutBinding> = {
   openShortcutsPanel: { key: "/", mod: true, shift: false, alt: false },
   copy: { key: "c", mod: true, shift: false, alt: false },
   paste: { key: "v", mod: true, shift: false, alt: false },
+  // Phase D — Alignment shortcuts. Figma-style: Alt+letter for align,
+  // Ctrl+Alt+letter for distribute. Only active when ≥2 nodes selected
+  // (handler checks at dispatch time, same as AlignmentToolbar).
+  alignLeft: { key: "a", mod: false, shift: false, alt: true },
+  alignCenterX: { key: "h", mod: false, shift: false, alt: true },
+  alignRight: { key: "d", mod: false, shift: false, alt: true },
+  alignTop: { key: "w", mod: false, shift: false, alt: true },
+  alignCenterY: { key: "v", mod: false, shift: false, alt: true },
+  alignBottom: { key: "s", mod: false, shift: false, alt: true },
+  distributeHorizontal: { key: "h", mod: true, shift: false, alt: true },
+  distributeVertical: { key: "v", mod: true, shift: false, alt: true },
 };
 
 export const ACTION_META: Record<ActionId, ActionMeta> = {
@@ -219,6 +238,46 @@ export const ACTION_META: Record<ActionId, ActionMeta> = {
     category: "editing",
     description:
       "Commit the in-flight pen path as a `VectorLayer`. No-op when the pen tool has no anchors recorded.",
+  },
+  alignLeft: {
+    label: "Align left",
+    category: "alignment",
+    description: "Align selected nodes to the left edge of the group bounding box.",
+  },
+  alignCenterX: {
+    label: "Align center (X)",
+    category: "alignment",
+    description: "Align selected nodes to the horizontal center of the group bounding box.",
+  },
+  alignRight: {
+    label: "Align right",
+    category: "alignment",
+    description: "Align selected nodes to the right edge of the group bounding box.",
+  },
+  alignTop: {
+    label: "Align top",
+    category: "alignment",
+    description: "Align selected nodes to the top edge of the group bounding box.",
+  },
+  alignCenterY: {
+    label: "Align middle (Y)",
+    category: "alignment",
+    description: "Align selected nodes to the vertical center of the group bounding box.",
+  },
+  alignBottom: {
+    label: "Align bottom",
+    category: "alignment",
+    description: "Align selected nodes to the bottom edge of the group bounding box.",
+  },
+  distributeHorizontal: {
+    label: "Distribute horizontal",
+    category: "alignment",
+    description: "Evenly space selected nodes horizontally. Requires 3+ selected.",
+  },
+  distributeVertical: {
+    label: "Distribute vertical",
+    category: "alignment",
+    description: "Evenly space selected nodes vertically. Requires 3+ selected.",
   },
 };
 

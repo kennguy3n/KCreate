@@ -17,6 +17,7 @@ import type {
 import { useSessionLocks } from "../hooks/useSessionLocks";
 import { colors, radius, spacing } from "../styles/tokens";
 import { AccessibilityPanel } from "./AccessibilityPanel";
+import { AlignmentToolbar } from "./AlignmentToolbar";
 import { ColorSettingsPanel } from "./ColorSettingsPanel";
 import { InteractionPanel } from "./InteractionPanel";
 import { OpenTypePanel } from "./OpenTypePanel";
@@ -100,6 +101,23 @@ export interface LayoutHandlers {
 
 export interface RightPanelProps {
   selected: NodeInfo | null;
+  /**
+   * Phase D — full multi-selection id list (host-side selection set,
+   * not just the single `selected` row). Required by the AlignmentToolbar
+   * mounted inside the Properties tab; align/distribute only make sense
+   * across a group, so the toolbar gates on `.length >= 2` / `>= 3`.
+   * Optional so existing callers (and the in-tree test harness) keep
+   * compiling — when omitted the toolbar treats it as an empty selection
+   * and stays disabled.
+   */
+  selectedIds?: string[];
+  /**
+   * Phase D — host-side callback fired after a successful align /
+   * distribute IPC so the document tree can be refreshed. Mirrors the
+   * `onApplied` contract on `AlignmentToolbar`. Optional for the same
+   * back-compat reason as `selectedIds`.
+   */
+  onAlignmentApplied?: () => void;
   onChange?: (changes: UpdateNodeProps) => void;
   onRequestExport: () => void;
   layout?: LayoutHandlers;
@@ -138,6 +156,8 @@ export interface RightPanelProps {
 
 export function RightPanel({
   selected,
+  selectedIds,
+  onAlignmentApplied,
   onChange,
   onRequestExport,
   layout,
@@ -380,13 +400,29 @@ export function RightPanel({
           <LockBanner lock={selectedRemoteLock} />
         ) : null}
         {tab === "properties" ? (
-          <PropertiesPanel
-            node={selected}
-            onChange={onChange}
-            layout={layout}
-            onStatus={onStatus}
-            disabled={selectedRemoteLock !== null}
-          />
+          <>
+            {selectedIds && selectedIds.length >= 2 ? (
+              <div
+                style={{
+                  marginBottom: spacing.sm,
+                  borderBottom: `1px solid ${colors.border}`,
+                  paddingBottom: spacing.sm,
+                }}
+              >
+                <AlignmentToolbar
+                  selectedNodeIds={selectedIds}
+                  onApplied={onAlignmentApplied}
+                />
+              </div>
+            ) : null}
+            <PropertiesPanel
+              node={selected}
+              onChange={onChange}
+              layout={layout}
+              onStatus={onStatus}
+              disabled={selectedRemoteLock !== null}
+            />
+          </>
         ) : null}
         {tab === "effects" ? (
           <Hint>

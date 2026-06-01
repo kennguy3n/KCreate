@@ -10,6 +10,12 @@ import { ArtboardPanel } from "./ArtboardPanel";
 import { BrandKitEditor } from "./BrandKitEditor";
 import { BrandVersionPanel } from "./BrandVersionPanel";
 import { ComponentPanel } from "./ComponentPanel";
+import {
+  ContextMenu,
+  MenuDivider,
+  MenuItem,
+  MenuSubheading,
+} from "./ContextMenu";
 import { DesignTokenEditor } from "./DesignTokenEditor";
 import { Icon, type IconName } from "./Icon";
 
@@ -50,6 +56,15 @@ export interface LeftPanelProps {
   onToggleLocked?: (id: string, locked: boolean) => void;
   onRename?: (id: string, name: string) => void;
   onDelete?: (id: string) => void;
+  /**
+   * Phase D Polish — duplicate a single layer-tree node. Wired by
+   * the host (`EditorPage`) to the existing copy+paste flow so the
+   * undo/redo log and clipboard semantics stay consistent with the
+   * keyboard shortcut path. Optional so existing callers (e.g. the
+   * test harness) keep compiling; the layer-tree context menu hides
+   * the "Duplicate" item when this isn't wired.
+   */
+  onDuplicateNode?: (id: string) => void;
   /**
    * Phase 6 Tasks 27-28 — install (or clear, when `color` is null)
    * a layer-colour tag on the given node. The host wires this to
@@ -95,6 +110,7 @@ export function LeftPanel({
   onToggleLocked,
   onRename,
   onDelete,
+  onDuplicateNode,
   onSetLayerColor,
   artboards,
   onRequestCreateArtboard,
@@ -188,6 +204,7 @@ export function LeftPanel({
             onToggleLocked={onToggleLocked}
             onRename={onRename}
             onDelete={onDelete}
+            onDuplicateNode={onDuplicateNode}
             onSetLayerColor={onSetLayerColor ?? noopLayerColor}
           />
         ) : null}
@@ -269,6 +286,7 @@ function LayerTabContent({
   onToggleLocked,
   onRename,
   onDelete,
+  onDuplicateNode,
   onSetLayerColor,
 }: {
   nodes: NodeInfo[];
@@ -281,6 +299,7 @@ function LayerTabContent({
   onToggleLocked?: (id: string, locked: boolean) => void;
   onRename?: (id: string, name: string) => void;
   onDelete?: (id: string) => void;
+  onDuplicateNode?: (id: string) => void;
   onSetLayerColor: (id: string, color: string | null) => void;
 }): JSX.Element {
   // The query matches case-insensitively against the node name AND
@@ -383,6 +402,7 @@ function LayerTabContent({
         onToggleLocked={onToggleLocked}
         onRename={onRename}
         onDelete={onDelete}
+        onDuplicateNode={onDuplicateNode}
         onSetLayerColor={onSetLayerColor}
         emptyHint={
           needle.length > 0
@@ -470,6 +490,7 @@ function NodeList({
   onToggleLocked,
   onRename,
   onDelete,
+  onDuplicateNode,
   onSetLayerColor,
   emptyHint,
   showHierarchy = false,
@@ -481,6 +502,7 @@ function NodeList({
   onToggleLocked?: (id: string, locked: boolean) => void;
   onRename?: (id: string, name: string) => void;
   onDelete?: (id: string) => void;
+  onDuplicateNode?: (id: string) => void;
   onSetLayerColor?: (id: string, color: string | null) => void;
   emptyHint: string;
   showHierarchy?: boolean;
@@ -490,6 +512,12 @@ function NodeList({
   // Which row is currently showing its colour-tag popover. Only one
   // popover at a time so a click outside the row dismisses it.
   const [colorPopoverId, setColorPopoverId] = useState<string | null>(null);
+  // Phase D — right-click context menu state for the layer tree.
+  const [ctxMenu, setCtxMenu] = useState<{
+    nodeId: string;
+    x: number;
+    y: number;
+  } | null>(null);
 
   if (nodes.length === 0) {
     return <EmptyHint>{emptyHint}</EmptyHint>;
@@ -515,6 +543,7 @@ function NodeList({
   };
 
   return (
+    <>
     <ul
       style={{
         listStyle: "none",
@@ -549,6 +578,11 @@ function NodeList({
                 e.stopPropagation();
                 setRenamingId(n.id);
                 setDraftName(n.name);
+              }}
+              onContextMenu={(e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                setCtxMenu({ nodeId: n.id, x: e.clientX, y: e.clientY });
               }}
             >
               <button
@@ -664,6 +698,95 @@ function NodeList({
         );
       })}
     </ul>
+    {ctxMenu ? (() => {
+      const target = nodes.find((n) => n.id === ctxMenu.nodeId);
+      if (!target) return null;
+      return (
+        <ContextMenu
+          x={ctxMenu.x}
+          y={ctxMenu.y}
+          onDismiss={() => setCtxMenu(null)}
+          ariaLabel="Layer actions"
+        >
+          <MenuItem
+            label="Rename"
+            data-testid="ctx-rename"
+            onClick={() => {
+              setRenamingId(target.id);
+              setDraftName(target.name);
+              setCtxMenu(null);
+            }}
+          />
+          {onDuplicateNode ? (
+            <MenuItem
+              label="Duplicate"
+              data-testid="ctx-duplicate"
+              shortcut="⌘C ⌘V"
+              onClick={() => {
+                onDuplicateNode(target.id);
+                setCtxMenu(null);
+              }}
+            />
+          ) : null}
+          <MenuDivider />
+          <MenuItem
+            label={target.visible ? "Hide" : "Show"}
+            data-testid="ctx-visibility"
+            onClick={() => {
+              onToggleVisibility?.(target.id, !target.visible);
+              setCtxMenu(null);
+            }}
+          />
+          <MenuItem
+            label={target.locked ? "Unlock" : "Lock"}
+            data-testid="ctx-lock"
+            onClick={() => {
+              onToggleLocked?.(target.id, !target.locked);
+              setCtxMenu(null);
+            }}
+          />
+          {onSetLayerColor ? (
+            <>
+              <MenuDivider />
+              <MenuSubheading label="Layer color" />
+              {LAYER_COLOR_PALETTE.map((p) => (
+                <MenuItem
+                  key={p.key}
+                  label={p.key.charAt(0).toUpperCase() + p.key.slice(1)}
+                  onClick={() => {
+                    onSetLayerColor(target.id, p.key);
+                    setCtxMenu(null);
+                  }}
+                />
+              ))}
+              {layerColorOf(target) !== null ? (
+                <MenuItem
+                  label="Clear color"
+                  onClick={() => {
+                    onSetLayerColor(target.id, null);
+                    setCtxMenu(null);
+                  }}
+                />
+              ) : null}
+            </>
+          ) : null}
+          <MenuDivider />
+          {onDelete ? (
+            <MenuItem
+              label="Delete"
+              danger
+              data-testid="ctx-delete"
+              shortcut="Del"
+              onClick={() => {
+                onDelete(target.id);
+                setCtxMenu(null);
+              }}
+            />
+          ) : null}
+        </ContextMenu>
+      );
+    })() : null}
+    </>
   );
 }
 

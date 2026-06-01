@@ -262,14 +262,15 @@ fn bench_sync_document_steady_state(c: &mut Criterion) {
     for &count in DOC_NODE_COUNTS {
         group.throughput(Throughput::Elements(count as u64));
         group.bench_with_input(BenchmarkId::from_parameter(count), &count, |b, &count| {
-            // Build a fresh doc + SceneSync inside the setup
-            // closure so the cache state is identical across
-            // iterations. We can't reuse one warmed SceneSync
-            // across iters because each iter's
-            // `drain_dirty()` would only return empty on the
-            // first call after a warm-up; in practice the
-            // setup-per-iter cost is dominated by the actual
-            // sync work we're measuring.
+            // Build the doc + SceneSync once per parameter and
+            // reuse them across all iterations of `b.iter()`. After
+            // the warm-up sync below, the document has no pending
+            // edits, so every subsequent `drain_dirty()` returns
+            // empty and every node hits `try_replay_cached`. That
+            // is precisely the steady-state path we want to measure
+            // — reusing one warmed SceneSync is the *whole point*
+            // (a per-iter rebuild would re-emit from scratch and
+            // turn this back into a cold-path bench).
             let mut doc = build_document_of_size(count);
             let mut sync = SceneSync::new();
             // Warm the cache once — populates `node_cache`

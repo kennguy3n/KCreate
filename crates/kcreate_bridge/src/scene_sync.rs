@@ -2638,28 +2638,43 @@ mod tests {
                  — Phase E reverse-map rebuild regressed",
             );
         }
-        // And conversely: every reverse entry must round-trip
-        // through the forward map — catches the case where a
-        // future refactor accidentally populates the reverse map
-        // with stale entries from a previous sync.
+        // And conversely: every reverse entry must point at a
+        // uuid that still exists in the forward map. We CANNOT
+        // assert `reverse[obj_id] == uuid => forward[uuid] ==
+        // obj_id` here because the reverse map also stores
+        // sub-object ids that point back at their parent node's
+        // uuid (see `allocate_sub_object_id` at scene_sync.rs:394
+        // and the sub-object loop in the replay path at
+        // scene_sync.rs:477-479). For a node with N sub-objects
+        // the forward map has 1 entry (primary id) while the
+        // reverse map has N entries (one per sub-id, all
+        // mapping to the same parent uuid). The fixture used
+        // here (`three_vector_scene`) happens to produce 1
+        // object per node so cardinality would coincidentally
+        // match, but pinning a strict `reverse.len() ==
+        // forward.len()` would create a false-positive failure
+        // the day a future refactor adds a path effect or other
+        // sub-object emitter to the fixture. The actual
+        // observable invariant is the weaker "every reverse
+        // entry's uuid is live in the forward map" — drops
+        // catch the stale-entry regression the strict check
+        // was supposed to catch, without breaking under
+        // legitimate fixture evolution.
         let reverse = sync
             .object_id_to_uuid
             .iter()
             .map(|(o, u)| (*o, *u))
             .collect::<Vec<_>>();
-        assert_eq!(
-            reverse.len(),
-            forward.len(),
-            "forward / reverse map sizes diverged \
-             (forward={fwd}, reverse={rev}) — Phase E reverse-map rebuild regressed",
-            fwd = forward.len(),
-            rev = reverse.len(),
+        assert!(
+            !reverse.is_empty(),
+            "precondition: reverse map must be populated after a sync of a non-empty doc",
         );
         for (obj_id, uuid) in &reverse {
-            assert_eq!(
-                sync.object_id_for_uuid(*uuid),
-                Some(*obj_id),
-                "reverse entry (obj_id={obj_id:?}, uuid={uuid}) missing from forward map",
+            assert!(
+                sync.uuid_to_object_id.contains_key(uuid),
+                "reverse entry (obj_id={obj_id:?}, uuid={uuid}) points at a uuid that is \
+                 no longer present in the forward map — stale reverse entry, Phase E \
+                 reverse-map rebuild regressed",
             );
         }
     }

@@ -34,28 +34,47 @@ import type { BrowserWindow } from "electron";
  * Mirror of `ModelPack` (subset). Kept inline so we don't pull
  * the renderer's `shared/scene.ts` (which depends on Electron
  * renderer types) into the main process.
+ *
+ * Field naming is `camelCase` to match the Rust bridge's
+ * `#[serde(rename_all = "camelCase")]` on `kcreate_ai::ModelPack`
+ * (see `crates/kcreate_ai/src/model_registry.rs:70-99` and the
+ * `pack_serialises_to_camelcase_wire_format` regression test that
+ * pins the on-wire JSON keys). A previous iteration declared these
+ * fields as snake_case (`download_url`, `size_bytes`, `file_path`)
+ * which made every property access on the parsed JSON return
+ * `undefined` — the one-click install always tripped the
+ * "no download URL pinned in the registry" branch even though the
+ * registry had the URL pinned all along. If you rename a field
+ * here, update the Rust struct AND the test in lockstep.
  */
 interface RegistryPack {
   readonly id: string;
   readonly name: string;
   readonly kind: string;
-  readonly download_url: string;
-  readonly size_bytes: number;
-  readonly file_path: string;
+  readonly downloadUrl: string;
+  readonly sizeBytes: number;
+  readonly filePath: string;
 }
 
 /**
  * Progress event emitted on the
  * `kcreate/onboarding/installProgress` channel so the renderer can
- * drive a progress bar. `total_bytes` is `null` until the HTTP
+ * drive a progress bar. `totalBytes` is `null` until the HTTP
  * `Content-Length` is observed (some Hugging Face URLs redirect
  * through a CDN whose first hop omits the header). All numeric
  * fields are byte counts so the renderer can render percentages
  * with whatever precision it wants.
+ *
+ * Field naming is `camelCase` to match every other wire-format
+ * type in the codebase (Rust bridge serialises with
+ * `#[serde(rename_all = "camelCase")]`, and `OnboardingProgress`
+ * sits next to `OnboardingInstallReport` which IS Rust-derived;
+ * keeping the two interfaces in the same convention avoids the
+ * caller switching mental models mid-component).
  */
 export interface OnboardingProgress {
   /** Pack id the download is for. */
-  readonly pack_id: string;
+  readonly packId: string;
   /** Human-readable phase. UI uses it for accessible status text. */
   readonly phase:
     | "resolving"
@@ -67,9 +86,9 @@ export interface OnboardingProgress {
     | "error"
     | "cancelled";
   /** Bytes received from the server so far. `0` until streaming. */
-  readonly received_bytes: number;
+  readonly receivedBytes: number;
   /** Server-reported total in bytes. `null` until known. */
-  readonly total_bytes: number | null;
+  readonly totalBytes: number | null;
   /** Free-text message (filled on `error` / `done`; otherwise empty). */
   readonly message: string;
 }
@@ -79,12 +98,22 @@ export interface OnboardingProgress {
  * successfully. Mirrors the `InstallReport` returned by the Rust
  * installer so the renderer can surface the verified flag + actual
  * sha256 in the welcome-modal completion screen.
+ *
+ * Field naming is `camelCase` to match
+ * `kcreate_ai::InstallReport`'s `#[serde(rename_all =
+ * "camelCase")]` (see
+ * `crates/kcreate_ai/src/model_registry.rs:704-718` and the
+ * `install_report_serialises_to_camelcase_wire_format` regression
+ * test). The bridge returns the JSON of this struct verbatim;
+ * declaring it as snake_case here (an earlier iteration of this
+ * file did) makes every field undefined at runtime which silently
+ * broke the one-click install validation.
  */
 export interface OnboardingInstallReport {
-  readonly pack_id: string;
+  readonly packId: string;
   readonly verified: boolean;
-  readonly actual_sha256: string;
-  readonly size_bytes: number;
+  readonly actualSha256: string;
+  readonly sizeBytes: number;
 }
 
 /**
@@ -174,7 +203,23 @@ function findPack(
   bridge: OnboardingBridge,
   packId: string,
 ): RegistryPack | null {
-  const raw = bridge.aiListModelPacks();
+  return findPackInRegistryJson(bridge.aiListModelPacks(), packId);
+}
+
+/**
+ * Pure parsing helper exposed for unit tests so the wire-format
+ * contract with `kcreate_ai::list_model_packs` can be exercised
+ * without spinning up the real native bridge.
+ *
+ * Returns the first pack whose `id` matches `packId`, or `null`
+ * when no entry matches. Throws on malformed JSON / non-array
+ * payloads so a corrupted catalogue surfaces as an explicit error
+ * rather than a silent install failure.
+ */
+export function findPackInRegistryJson(
+  raw: string,
+  packId: string,
+): RegistryPack | null {
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw);
@@ -200,6 +245,45 @@ function findPack(
     }
   }
   return null;
+}
+
+/**
+ * Pure parsing helper exposed for unit tests. Decodes the JSON
+ * string returned by `aiInstallModelPack` (the verbatim
+ * serialisation of `kcreate_ai::InstallReport`) into the
+ * `OnboardingInstallReport` shape, throwing a typed error when
+ * any expected field is missing or has the wrong runtime type.
+ *
+ * The validation checks the *camelCase* keys that the Rust bridge
+ * actually emits (`packId`, `actualSha256`, `sizeBytes`); pinning
+ * the contract here means a future Rust-side rename (or a
+ * regression in `#[serde(rename_all)]`) is caught at install time
+ * with a meaningful error instead of silently failing one of the
+ * downstream renderer-side reads.
+ */
+export function parseInstallReport(raw: string): OnboardingInstallReport {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (e) {
+    throw new Error(
+      `onboarding: install report was not valid JSON: ${
+        e instanceof Error ? e.message : String(e)
+      }`,
+    );
+  }
+  if (
+    typeof parsed !== "object" ||
+    parsed === null ||
+    typeof (parsed as { packId?: unknown }).packId !== "string" ||
+    typeof (parsed as { verified?: unknown }).verified !== "boolean" ||
+    typeof (parsed as { actualSha256?: unknown }).actualSha256 !==
+      "string" ||
+    typeof (parsed as { sizeBytes?: unknown }).sizeBytes !== "number"
+  ) {
+    throw new Error("onboarding: install report shape was unexpected");
+  }
+  return parsed as OnboardingInstallReport;
 }
 
 /**
@@ -238,7 +322,7 @@ function validateUrl(rawUrl: string): URL {
  * same reason).
  */
 function tempPathFor(pack: RegistryPack): string {
-  const base = path.basename(pack.file_path) || `${pack.id}.bin`;
+  const base = path.basename(pack.filePath) || `${pack.id}.bin`;
   return path.join(os.tmpdir(), `kcreate-onboarding-${process.pid}-${base}`);
 }
 
@@ -302,10 +386,10 @@ function streamDownload(
     }
 
     emitProgress(window, {
-      pack_id: pack.id,
+      packId: pack.id,
       phase: "connecting",
-      received_bytes: 0,
-      total_bytes: null,
+      receivedBytes: 0,
+      totalBytes: null,
       message: "",
     });
 
@@ -375,10 +459,10 @@ function streamDownload(
             : null;
 
         emitProgress(window, {
-          pack_id: pack.id,
+          packId: pack.id,
           phase: "downloading",
-          received_bytes: 0,
-          total_bytes: total,
+          receivedBytes: 0,
+          totalBytes: total,
           message: "",
         });
 
@@ -394,10 +478,10 @@ function streamDownload(
           if (received - lastEmitAt >= PROGRESS_EVENT_INTERVAL_BYTES) {
             lastEmitAt = received;
             emitProgress(window, {
-              pack_id: pack.id,
+              packId: pack.id,
               phase: "downloading",
-              received_bytes: received,
-              total_bytes: total,
+              receivedBytes: received,
+              totalBytes: total,
               message: "",
             });
           }
@@ -420,10 +504,10 @@ function streamDownload(
           // Final flush so the renderer's progress bar lands at
           // 100% before the verify phase starts.
           emitProgress(window, {
-            pack_id: pack.id,
+            packId: pack.id,
             phase: "downloading",
-            received_bytes: received,
-            total_bytes: total ?? received,
+            receivedBytes: received,
+            totalBytes: total ?? received,
             message: "",
           });
           resolve(received);
@@ -470,10 +554,10 @@ export function start(
   const done = (async (): Promise<OnboardingInstallReport> => {
     // 1. Resolve recommended pack id.
     emitProgress(window, {
-      pack_id: "",
+      packId: "",
       phase: "resolving",
-      received_bytes: 0,
-      total_bytes: null,
+      receivedBytes: 0,
+      totalBytes: null,
       message: "",
     });
     const packId = bridge.llmRecommendedPack();
@@ -486,14 +570,14 @@ export function start(
     if (!pack) {
       throw new Error(`recommended pack '${packId}' not in registry`);
     }
-    if (!pack.download_url) {
+    if (!pack.downloadUrl) {
       throw new Error(
         `recommended pack '${packId}' has no download URL pinned in the registry`,
       );
     }
 
     // 3. Validate URL.
-    const validated = validateUrl(pack.download_url);
+    const validated = validateUrl(pack.downloadUrl);
 
     // 4. Stream-download to a per-process temp.
     const temp = tempPathFor(pack);
@@ -522,10 +606,10 @@ export function start(
       await safeUnlink(temp);
       if (state.cancelled) {
         emitProgress(window, {
-          pack_id: packId,
+          packId,
           phase: "cancelled",
-          received_bytes: 0,
-          total_bytes: null,
+          receivedBytes: 0,
+          totalBytes: null,
           message: "",
         });
       }
@@ -535,10 +619,10 @@ export function start(
     if (state.cancelled) {
       await safeUnlink(temp);
       emitProgress(window, {
-        pack_id: packId,
+        packId,
         phase: "cancelled",
-        received_bytes: received,
-        total_bytes: received,
+        receivedBytes: received,
+        totalBytes: received,
         message: "",
       });
       throw new Error("cancelled");
@@ -551,10 +635,10 @@ export function start(
     // "installing" labels even though the bridge call is a single
     // synchronous step.
     emitProgress(window, {
-      pack_id: packId,
+      packId,
       phase: "verifying",
-      received_bytes: received,
-      total_bytes: received,
+      receivedBytes: received,
+      totalBytes: received,
       message: "",
     });
     let reportJson: string;
@@ -571,41 +655,20 @@ export function start(
     await safeUnlink(temp);
 
     emitProgress(window, {
-      pack_id: packId,
+      packId,
       phase: "installing",
-      received_bytes: received,
-      total_bytes: received,
+      receivedBytes: received,
+      totalBytes: received,
       message: "",
     });
 
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(reportJson);
-    } catch (e) {
-      throw new Error(
-        `onboarding: install report was not valid JSON: ${
-          e instanceof Error ? e.message : String(e)
-        }`,
-      );
-    }
-    if (
-      typeof parsed !== "object" ||
-      parsed === null ||
-      typeof (parsed as { pack_id?: unknown }).pack_id !== "string" ||
-      typeof (parsed as { verified?: unknown }).verified !== "boolean" ||
-      typeof (parsed as { actual_sha256?: unknown }).actual_sha256 !==
-        "string" ||
-      typeof (parsed as { size_bytes?: unknown }).size_bytes !== "number"
-    ) {
-      throw new Error("onboarding: install report shape was unexpected");
-    }
-    const report = parsed as OnboardingInstallReport;
+    const report = parseInstallReport(reportJson);
 
     emitProgress(window, {
-      pack_id: packId,
+      packId,
       phase: "done",
-      received_bytes: received,
-      total_bytes: received,
+      receivedBytes: received,
+      totalBytes: received,
       message: "",
     });
 
@@ -613,10 +676,10 @@ export function start(
   })().catch((err: unknown) => {
     const message = err instanceof Error ? err.message : String(err);
     emitProgress(window, {
-      pack_id: "",
+      packId: "",
       phase: message === "cancelled" ? "cancelled" : "error",
-      received_bytes: 0,
-      total_bytes: null,
+      receivedBytes: 0,
+      totalBytes: null,
       message,
     });
     throw err instanceof Error ? err : new Error(message);

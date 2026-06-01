@@ -24,7 +24,18 @@ export default defineConfig({
   test: {
     environment: "jsdom",
     globals: false,
-    include: ["src/**/*.test.{ts,tsx}"],
+    // Renderer tests live under `renderer/src/`; main-process
+    // tests (pure-Node, no DOM) live under `main/src/`. Both are
+    // executed under the same `vitest` runner so wire-format
+    // lockstep tests for the bridge ↔ main ↔ renderer pipeline
+    // can sit in their natural home (next to the code they
+    // exercise) instead of being hoisted into the renderer tree.
+    // The few main-process tests that need a Node environment
+    // override jsdom per-file with `// @vitest-environment node`.
+    include: [
+      "src/**/*.test.{ts,tsx}",
+      path.resolve(__dirname, "../main/src/**/*.test.ts"),
+    ],
     setupFiles: [path.resolve(__dirname, "tests/setup.vitest.ts")],
     css: false,
     // jsdom is single-threaded; keep the runner deterministic by

@@ -1372,7 +1372,7 @@ export interface LlmBridge {
  * (the channel is in the main process, not the Rust bridge).
  */
 export interface OnboardingProgress {
-  pack_id: string;
+  packId: string;
   phase:
     | "resolving"
     | "connecting"
@@ -1382,8 +1382,8 @@ export interface OnboardingProgress {
     | "done"
     | "error"
     | "cancelled";
-  received_bytes: number;
-  total_bytes: number | null;
+  receivedBytes: number;
+  totalBytes: number | null;
   message: string;
 }
 
@@ -1393,12 +1393,21 @@ export interface OnboardingProgress {
  * the registry pinned a SHA-256 and the downloaded bytes match;
  * `verified=false` means the registry has no pinned hash yet so
  * the actual hash is reported for the user's records.
+ *
+ * Field naming is `camelCase` to match
+ * `kcreate_ai::InstallReport`'s `#[serde(rename_all =
+ * "camelCase")]` serialisation. The Rust JSON is shipped through
+ * the bridge → main → preload → renderer pipeline unchanged, so
+ * the field names here MUST match the on-wire keys exactly.
+ * See `install_report_serialises_to_camelcase_wire_format` in
+ * `crates/kcreate_ai/src/model_registry.rs` for the lockstep
+ * pin.
  */
 export interface OnboardingInstallReport {
-  pack_id: string;
+  packId: string;
   verified: boolean;
-  actual_sha256: string;
-  size_bytes: number;
+  actualSha256: string;
+  sizeBytes: number;
 }
 
 /**

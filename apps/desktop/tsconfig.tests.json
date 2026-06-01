@@ -1,0 +1,18 @@
+{
+  "//": "Type-checks test files that aren't covered by the per-package tsconfigs (which intentionally exclude *.test.ts so the production build outputs stay clean). Hooked into `pnpm typecheck` so a typo in a test file fails CI just like any other source error.",
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "module": "CommonJS",
+    "moduleResolution": "Node",
+    "noEmit": true,
+    "rootDir": ".",
+    "types": ["node", "vitest/globals"],
+    "lib": ["ES2022"]
+  },
+  "include": [
+    "main/src/**/*.test.ts",
+    "main/src/**/*.ts",
+    "shared/**/*"
+  ],
+  "exclude": []
+}

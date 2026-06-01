@@ -241,10 +241,10 @@ describe("WelcomeModal", () => {
     stub.override("llm.recommendedPack", () => SAMPLE_PACK.id);
     stub.override("aiModel.listModelPacks", () => [SAMPLE_PACK]);
     stub.override("onboarding.installRecommendedPack", () => ({
-      pack_id: SAMPLE_PACK.id,
+      packId: SAMPLE_PACK.id,
       verified: true,
-      actual_sha256: "abc".repeat(20).slice(0, 64),
-      size_bytes: SAMPLE_PACK.sizeBytes,
+      actualSha256: "abc".repeat(20).slice(0, 64),
+      sizeBytes: SAMPLE_PACK.sizeBytes,
     }));
     let dismissed: { called: boolean; id: string | null } = {
       called: false,
@@ -308,10 +308,10 @@ describe("WelcomeModal", () => {
     expect(emit).not.toBeNull();
     await act(async () => {
       emit?.({
-        pack_id: SAMPLE_PACK.id,
+        packId: SAMPLE_PACK.id,
         phase: "downloading",
-        received_bytes: 250_000_000,
-        total_bytes: 750_000_000,
+        receivedBytes: 250_000_000,
+        totalBytes: 750_000_000,
         message: "",
       });
     });
@@ -323,10 +323,10 @@ describe("WelcomeModal", () => {
     // Resolve to clean up the in-flight promise.
     await act(async () => {
       resolveInstall?.({
-        pack_id: SAMPLE_PACK.id,
+        packId: SAMPLE_PACK.id,
         verified: true,
-        actual_sha256: "0".repeat(64),
-        size_bytes: SAMPLE_PACK.sizeBytes,
+        actualSha256: "0".repeat(64),
+        sizeBytes: SAMPLE_PACK.sizeBytes,
       });
       await Promise.resolve();
     });

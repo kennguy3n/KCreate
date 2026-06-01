@@ -237,11 +237,20 @@ const defaultsByMethod: Record<string, () => unknown> = {
   // Phase C — one-click install. Default mirrors a verified
   // download + install happy path. Tests that drive the error
   // branch override with a throwing resolver.
+  // Field naming is camelCase to match the on-wire JSON keys
+  // emitted by `kcreate_ai::InstallReport` (see
+  // `install_report_serialises_to_camelcase_wire_format` in
+  // `crates/kcreate_ai/src/model_registry.rs`). The renderer-side
+  // `OnboardingInstallReport` and main-process validation both
+  // read the camelCase keys directly — a previous stub iteration
+  // used snake_case (`pack_id`, `actual_sha256`, `size_bytes`)
+  // which was wrong but went undetected because the same wrong
+  // interface was declared on both ends.
   "onboarding.installRecommendedPack": () => ({
-    pack_id: "llm_bonsai_1_7b",
+    packId: "llm_bonsai_1_7b",
     verified: true,
-    actual_sha256: "0".repeat(64),
-    size_bytes: 750_000_000,
+    actualSha256: "0".repeat(64),
+    sizeBytes: 750_000_000,
   }),
   // Phase C — idempotent cancel. Welcome modal calls this on
   // unmount even when no install is in flight, so the default

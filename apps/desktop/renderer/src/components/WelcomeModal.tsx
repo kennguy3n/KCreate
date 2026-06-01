@@ -242,10 +242,10 @@ export function WelcomeModal({
         pack,
         tier: phase.tier,
         progress: {
-          pack_id: pack.id,
+          packId: pack.id,
           phase: "verifying",
-          received_bytes: 0,
-          total_bytes: null,
+          receivedBytes: 0,
+          totalBytes: null,
           message: "",
         },
       });
@@ -257,12 +257,12 @@ export function WelcomeModal({
         kind: "done",
         pack,
         tier: phase.tier,
-        report: {
-          pack_id: report.packId,
-          verified: report.verified,
-          actual_sha256: report.actualSha256,
-          size_bytes: report.sizeBytes,
-        },
+        // `aiModel.installModelPack` returns `ModelInstallReport`
+        // (the Rust `InstallReport` serialisation), which now
+        // shares the same camelCase shape as the
+        // `OnboardingInstallReport` carried by the one-click
+        // install path — no field-name translation needed.
+        report,
       });
     } catch (e) {
       setPhase({
@@ -420,12 +420,12 @@ function WelcomeBody({
       const phaseLabel = progress ? phaseToLabel(progress.phase) : "Starting…";
       const pct =
         progress &&
-        progress.total_bytes &&
-        progress.total_bytes > 0 &&
+        progress.totalBytes &&
+        progress.totalBytes > 0 &&
         progress.phase === "downloading"
           ? Math.min(
               100,
-              Math.round((progress.received_bytes / progress.total_bytes) * 100),
+              Math.round((progress.receivedBytes / progress.totalBytes) * 100),
             )
           : null;
       return (
@@ -454,11 +454,11 @@ function WelcomeBody({
               />
             </div>
             {progress &&
-            progress.total_bytes !== null &&
-            progress.total_bytes > 0 ? (
+            progress.totalBytes !== null &&
+            progress.totalBytes > 0 ? (
               <div style={progressDetailStyle}>
-                {formatBytes(progress.received_bytes)} of{" "}
-                {formatBytes(progress.total_bytes)}
+                {formatBytes(progress.receivedBytes)} of{" "}
+                {formatBytes(progress.totalBytes)}
               </div>
             ) : null}
           </div>
@@ -487,10 +487,10 @@ function WelcomeBody({
           >
             <strong>{pack.name}</strong> is ready.{" "}
             {report.verified
-              ? `Verified ${formatBytes(report.size_bytes)}.`
+              ? `Verified ${formatBytes(report.sizeBytes)}.`
               : `Installed ${formatBytes(
-                  report.size_bytes,
-                )} (no pinned SHA-256 in the registry; actual hash ${report.actual_sha256.slice(
+                  report.sizeBytes,
+                )} (no pinned SHA-256 in the registry; actual hash ${report.actualSha256.slice(
                   0,
                   12,
                 )}…).`}

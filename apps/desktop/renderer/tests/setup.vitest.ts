@@ -20,10 +20,22 @@ import { cleanup } from "@testing-library/react";
 
 import { installKcreateStub } from "./helpers/kcreateStub";
 
+// Most test files run under jsdom and need a `window.kcreate`
+// shim. A small set of pure-Node tests in `apps/desktop/main/src/`
+// opt out of jsdom via `// @vitest-environment node` at the top
+// of the file — they don't have a `window` global and don't
+// interact with the bridge surface, so the stub install would
+// throw a `ReferenceError: window is not defined`. Guarding both
+// hooks on `typeof window !== "undefined"` lets the two
+// environments share one setup file cleanly.
 beforeEach(() => {
-  installKcreateStub();
+  if (typeof window !== "undefined") {
+    installKcreateStub();
+  }
 });
 
 afterEach(() => {
-  cleanup();
+  if (typeof window !== "undefined") {
+    cleanup();
+  }
 });

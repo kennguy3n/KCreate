@@ -149,3 +149,59 @@ jobs:
         run: pnpm lint
       - name: test
         run: pnpm test
+
+  # Electron boot + present-path smoke. This is the lane that would have
+  # caught the WS-1 (clean build never booted) and WS-2 (canvas blank /
+  # present loop frozen) regressions that survived twelve "complete" phases
+  # because nothing in CI ever launched the packaged app. It builds the
+  # bridge cdylib + the main/preload/renderer bundles, then drives the real
+  # Electron binary through playwright-core's `_electron` harness under Xvfb:
+  # boot to HomePage, open the editor, seed a high-contrast rect via the real
+  # `canvas.createNodes` API, and assert the Rust-rendered frame reaches the
+  # HTML <canvas>.
+  smoke:
+    name: smoke (electron boot + present)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: install rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: install bridge build + electron runtime deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwayland-dev libxkbcommon-dev libxcb1-dev libfontconfig1-dev \
+            xvfb \
+            libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 libgbm1 \
+            libgtk-3-0 libasound2 libxshmfence1 libxdamage1 libxfixes3 \
+            libxcomposite1 libxrandr2 libxkbcommon0 libpango-1.0-0 libcairo2 \
+            libxcb1 libxext6 libx11-xcb1 libgl1 libvulkan1 \
+            mesa-vulkan-drivers
+      - uses: Swatinem/rust-cache@v2
+      # Default-feature debug cdylib; the e2e harness resolves it via
+      # KCREATE_BRIDGE_PROFILE=debug -> target/debug/libkcreate_bridge.so.
+      - name: build bridge cdylib
+        run: cargo build -p kcreate_bridge
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.26.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20.11.0"
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      # pnpm 10 skips electron's postinstall, so the binary is never fetched
+      # by `pnpm install` alone. Run the downloader explicitly.
+      - name: fetch electron binary
+        run: node apps/desktop/node_modules/electron/install.js
+      - name: build app bundles (main/preload/renderer)
+        run: pnpm build
+      # GitHub hosted runners can't use Chromium's setuid sandbox, so opt into
+      # --no-sandbox via env; Xvfb provides the headless X display.
+      - name: electron smoke test
+        working-directory: apps/desktop
+        env:
+          KCREATE_BRIDGE_PROFILE: debug
+          KCREATE_E2E_NO_SANDBOX: "1"
+        run: xvfb-run -a pnpm test:e2e

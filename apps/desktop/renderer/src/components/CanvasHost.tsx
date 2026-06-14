@@ -653,6 +653,7 @@ export function CanvasHost(props: CanvasHostProps): JSX.Element {
         background: activeMode === "native" ? "transparent" : undefined,
       }}
       data-presentation-mode={activeMode}
+      data-testid="kcreate-canvas-surface"
       onPointerDown={onPointerDown}
       onPointerMove={onPointerMove}
       onPointerUp={onPointerUp}

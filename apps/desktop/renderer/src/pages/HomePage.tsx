@@ -415,6 +415,7 @@ export function HomePage({
             {CREATE_OPTIONS.map((opt) => (
               <CreateCard
                 key={opt.id}
+                id={opt.id}
                 title={opt.title}
                 blurb={opt.blurb}
                 icon={opt.icon}
@@ -681,12 +682,14 @@ function Section({
 }
 
 function CreateCard({
+  id,
   title,
   blurb,
   icon,
   accent,
   onClick,
 }: {
+  id: string;
   title: string;
   blurb: string;
   icon: IconName;
@@ -697,6 +700,7 @@ function CreateCard({
     <button
       type="button"
       onClick={onClick}
+      data-testid={`kcreate-create-card-${id}`}
       style={{
         textAlign: "left",
         background: colors.bg,

@@ -352,7 +352,10 @@ impl RenderContext {
     ///
     /// If the render still errors after that fallback, the dirty region is
     /// restored so a subsequent retry still knows to repaint the affected
-    /// area. The frame id counter is not incremented on failure.
+    /// area, and the externally-visible frame [`Self::sequence`] is left
+    /// unchanged. (The [`FrameId`] allocated for the attempt is simply
+    /// skipped — the internal `next_frame_id` allocation counter always
+    /// advances, so ids are monotonic but may have gaps after a failure.)
     pub fn render_frame(&self, scene: &Scene) -> Result<FrameId> {
         let dirty = {
             let mut guard = self.dirty_region.lock();
@@ -795,15 +798,11 @@ mod tests {
         let ctx = initialize(64, 64).expect("init");
         let scene = Scene::new(Color::rgba(0.1, 0.2, 0.3, 1.0));
 
-        // Whether this host actually brought up a GPU adapter. When it
-        // did, the injected failure below drives the runtime GPU→CPU
-        // swap; when it didn't (no adapter / `cpu-only`), we're already on
-        // the software rasterizer and the injection is a no-op
-        // (`is_gpu()` is false), so the test still asserts rendering keeps
-        // working.
-        let started_on_gpu = ctx.tier() != GpuTier::SoftwareFallback;
-
-        // Simulate a wgpu device loss on the next render.
+        // Simulate a wgpu device loss on the next render. On a host that
+        // brought up a GPU adapter this drives the runtime GPU→CPU swap;
+        // on a host already on the software rasterizer (no adapter /
+        // `cpu-only`) `is_gpu()` is false so the injection is a no-op and
+        // the test still asserts rendering keeps working.
         ctx.force_next_gpu_failures(1);
         let first = ctx
             .render_frame(&scene)
@@ -832,12 +831,5 @@ mod tests {
             "frame id should advance after fallback: {second:?} !> {first:?}"
         );
         assert_eq!(ctx.tier(), GpuTier::SoftwareFallback);
-
-        // On a GPU-capable host the runtime swap was genuinely exercised:
-        // we started on a GPU tier and ended on the software fallback.
-        assert!(
-            !started_on_gpu || ctx.tier() == GpuTier::SoftwareFallback,
-            "expected GPU→CPU fallback transition"
-        );
     }
 }

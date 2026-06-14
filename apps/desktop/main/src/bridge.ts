@@ -892,11 +892,20 @@ export interface Bridge {
   textListFonts(): string;
   // Phase 3 — LAN collaboration session. All entry points are
   // gated by the bridge crate's `collab` feature flag at compile
-  // time; when the bridge is built without the flag, calls into
-  // these functions will throw a "Method not implemented" napi
-  // error from the runtime resolver. Production builds for
-  // packaged apps must enable the feature; debug builds may opt
-  // out for faster turn-around on UI-only work.
+  // time. When the bridge is built WITHOUT the flag, these exports
+  // are absent from the cdylib entirely — a direct call would throw
+  // `TypeError: ...is not a function` from V8 (there is no napi
+  // "method not implemented" resolver involved; the symbol simply
+  // does not exist). To keep non-collab developer builds usable,
+  // `loadBridge` installs `applyCollabFallbacks` over the raw
+  // exports: read accessors return a benign "no session" snapshot,
+  // fire-and-forget/idempotent calls become no-ops, and the handful
+  // of genuinely user-initiated collab actions (start / join /
+  // KChat install / key + ACL mutations / clipboard share) throw a
+  // single clear "collaboration unavailable in this build" error
+  // instead of a cryptic `is not a function`. Production builds for
+  // packaged apps enable the feature, in which case the fallback
+  // layer detects the present exports and returns them untouched.
   sessionStart(
     seedB64: string,
     displayName: string,
@@ -1299,6 +1308,120 @@ export interface Bridge {
   preferencesSave(prefsJson: string): void;
 }
 
+// Single, actionable message thrown when the renderer triggers a
+// genuinely user-initiated collaboration action against a bridge that
+// was compiled without the `collab` feature. Anything that fires
+// automatically on editor mount degrades silently instead (see
+// `collabFallbacks`); only deliberate "start a session / join / mint
+// membership / mutate keys+ACL / share clipboard" gestures surface
+// this so the user gets a clear reason rather than a cryptic
+// `is not a function`.
+const COLLAB_UNAVAILABLE_MESSAGE =
+  "KCreate collaboration is unavailable in this build: the native bridge " +
+  "was compiled without the `collab` Cargo feature. Rebuild kcreate_bridge " +
+  "with `--features collab` to enable LAN sessions.";
+
+function collabUnavailable(): never {
+  throw new Error(COLLAB_UNAVAILABLE_MESSAGE);
+}
+
+// Fallback implementations for the collab-gated exports, used only when
+// the bridge was built without `--features collab`. Return shapes mirror
+// the RAW native return types (the snake/camel-correct JSON strings the
+// real exports emit), so preload's existing `JSON.parse` paths and the
+// renderer's typed wrappers behave exactly as they do against an idle
+// session. Deliberately omits `kchatSetTrustStorePath`,
+// `kchatDevMintMembership`, and the `kchatBackend*` methods: main.ts
+// already gates those behind `typeof fn === "function"` checks, and
+// synthesising them here would flip that detection and change startup
+// behaviour (trust-store init, dev-mint availability, backend sign-in).
+function collabFallbacks(): Partial<Bridge> {
+  const lockedMembership = JSON.stringify({
+    locked: true,
+    groupId: null,
+    peerId: null,
+    expiresAt: null,
+  });
+  const emptyJournal = JSON.stringify({
+    entryCount: 0,
+    peerCount: 0,
+    byPeer: {},
+  });
+  return {
+    // --- session read accessors → benign "no session" snapshot ---
+    sessionInfo: () => "null",
+    sessionPeers: () => "[]",
+    sessionDrainEvents: () => "[]",
+    sessionLocks: () => "[]",
+    sessionPendingClipboardOffers: () => "[]",
+    sessionJournalSummary: () => emptyJournal,
+    sessionLocalPermission: () => "editor",
+    sessionAclGet: () => null,
+    sessionKeyEpoch: () => null,
+    sessionClaimLocks: () => "[]",
+    sessionFlushPendingOperations: () => 0,
+    sessionTickOutboundBatch: () => 0,
+    // --- session fire-and-forget / idempotent → no-op ---
+    sessionLeave: () => null,
+    sessionSendPresence: () => undefined,
+    sessionReleaseLocks: () => undefined,
+    sessionQueueOperation: () => undefined,
+    sessionSetActivePages: () => undefined,
+    sessionClipboardReject: () => undefined,
+    // --- KChat read / idempotent → benign locked / empty defaults ---
+    kchatMembershipStatus: () => lockedMembership,
+    kchatClearAuthority: () => lockedMembership,
+    kchatTrustedIssuers: () => "[]",
+    kchatDeriveLocalIdentity: () => "null",
+    // --- user-initiated collab actions → single clear error ---
+    sessionStart: collabUnavailable,
+    sessionJoin: collabUnavailable,
+    sessionKickPeer: collabUnavailable,
+    sessionRequestResume: collabUnavailable,
+    sessionSetPeerPermission: collabUnavailable,
+    sessionAclSet: collabUnavailable,
+    sessionRotateKeys: collabUnavailable,
+    sessionClipboardShare: collabUnavailable,
+    sessionClipboardAccept: collabUnavailable,
+    kchatInstallAuthority: collabUnavailable,
+    kchatAddTrustedIssuer: collabUnavailable,
+    kchatRemoveTrustedIssuer: collabUnavailable,
+  };
+}
+
+/**
+ * Install graceful fallbacks for the collab-gated exports when the
+ * native bridge was built without `--features collab`.
+ *
+ * The renderer unconditionally polls `session.info()` / `session.peers()`
+ * / `session.locks()` on every editor mount (six overlays do so) plus
+ * `kchat.membershipStatus()` etc. from the presence/sign-in panels. In a
+ * non-collab developer build those exports are absent from the cdylib, so
+ * each poll threw `TypeError: ...is not a function` back through the IPC
+ * handler — flooding the main-process log on every editor open. This
+ * layer fills only the genuinely-missing exports with no-session
+ * fallbacks; a real `collab` build is detected and returned untouched
+ * with zero overhead.
+ *
+ * Exported for unit testing without a real `process.dlopen`.
+ */
+export function applyCollabFallbacks(raw: Partial<Bridge>): Bridge {
+  // `sessionInfo` is representative: it exists iff the cdylib was built
+  // with `--features collab`, in which case every collab export is
+  // present and must not be shadowed.
+  if (typeof raw.sessionInfo === "function") {
+    return raw as Bridge;
+  }
+  const target = raw as Record<string, unknown>;
+  for (const [name, impl] of Object.entries(collabFallbacks())) {
+    // Fill genuinely-absent exports only; never shadow a present one.
+    if (typeof target[name] !== "function") {
+      target[name] = impl;
+    }
+  }
+  return raw as Bridge;
+}
+
 function bridgeBinaryPath(): string {
   // Allow override for development. In production, the bridge is copied
   // alongside the packaged app via electron-builder's `extraResources`.
@@ -1336,5 +1459,5 @@ export function loadBridge(): Bridge {
     parent: null,
   };
   process.dlopen(moduleStub, binaryPath);
-  return moduleStub.exports as Bridge;
+  return applyCollabFallbacks(moduleStub.exports as Partial<Bridge>);
 }

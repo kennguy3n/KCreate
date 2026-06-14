@@ -284,7 +284,7 @@ pub fn current_scene() -> Result<Scene> {
 /// Re-render the most recently published scene at the renderer's
 /// current viewport and size, returning the new [`FrameId`] — or
 /// `Ok(None)` when no scene has been published yet (nothing to
-/// repaint).
+/// repaint) or no renderer is attached (headless / pre-init).
 ///
 /// This is the explicit "repaint what's already on screen" entry
 /// point used by the present surface after a viewport (pan/zoom) or
@@ -293,15 +293,66 @@ pub fn current_scene() -> Result<Scene> {
 /// fresh frame from the last document-synced scene without shipping
 /// the whole scene back across the IPC boundary every frame.
 ///
-/// Lock-safe: the temporary `scene_slot` guard is dropped at the end
-/// of the `let` binding — before [`render_scene`] acquires `slot()` —
-/// so the lock order stays `slot -> scene_slot` and never inverts.
+/// Unlike [`render_scene`], this borrows the cached scene **in place**
+/// under `scene_slot` and renders it directly — it never clones the
+/// scene out and never writes an identical copy back. For large
+/// documents (thousands of objects) the previous clone-then-write-back
+/// was wasted allocation on the pan/zoom hot path (Devin Review #44).
+///
+/// Lock order is the canonical `slot -> native_slot -> scene_slot`,
+/// matching [`render_scene`] and [`shutdown`]: we take the renderer
+/// lock first, then (native builds only) the native-surface lock, and
+/// finally `scene_slot` for the borrow — so the order can never invert.
 pub fn render_current() -> Result<Option<FrameId>> {
-    let scene = scene_slot().lock().clone();
-    match scene {
-        Some(scene) => render_scene(scene).map(Some),
-        None => Ok(None),
+    let guard = slot().lock();
+    let Some(ctx) = guard.as_ref() else {
+        // No renderer attached (headless / pre-init / post-shutdown):
+        // there is nothing on screen to repaint. Preserves the prior
+        // contract where an empty `scene_slot` yielded `Ok(None)`.
+        return Ok(None);
+    };
+    // Native-surface fast path. Default builds don't compile this
+    // branch (the `native_canvas` feature is off). We acquire
+    // `native_slot` BEFORE `scene_slot` so the borrow path keeps the
+    // same `slot -> native_slot -> scene_slot` order as `render_scene`.
+    #[cfg(feature = "native_canvas")]
+    {
+        let native = native_slot().lock();
+        if let Some(surface) = native.as_ref() {
+            let scene_guard = scene_slot().lock();
+            let id = match scene_guard.as_ref() {
+                Some(scene) => Some(ctx.render_frame_native(scene, surface)?),
+                None => None,
+            };
+            drop(scene_guard);
+            drop(native);
+            drop(guard);
+            return Ok(id);
+        }
     }
+    let scene_guard = scene_slot().lock();
+    let id = match scene_guard.as_ref() {
+        Some(scene) => Some(ctx.render_frame(scene)?),
+        None => None,
+    };
+    drop(scene_guard);
+    drop(guard);
+    Ok(id)
+}
+
+/// Drop the cached scene without tearing down the renderer.
+///
+/// Called by [`crate::document::project_close`] so a closed project's
+/// scene neither lingers in renderer memory nor can be repainted by a
+/// later [`render_current`] (which would otherwise flash stale content
+/// from the previous project before a new one is synced). The renderer
+/// itself — and its last presented frame — stays intact so the host can
+/// keep presenting until it unmounts the canvas.
+///
+/// Acquire-then-drop: holds only `scene_slot` for the duration of the
+/// assignment, so it can never participate in a lock-order inversion.
+pub fn clear_scene() {
+    *scene_slot().lock() = None;
 }
 
 /// Snapshot of the latest published frame (RGBA8). Copies bytes out so
@@ -653,6 +704,33 @@ mod tests {
             "repaint must reproduce the published scene, not a blank frame"
         );
 
+        shutdown();
+    }
+
+    #[test]
+    #[serial]
+    fn clear_scene_drops_cached_scene_so_render_current_is_none() {
+        // `project_close` calls `clear_scene` so a closed project's scene
+        // can't be repainted by a later `render_current`. The renderer
+        // stays attached; only the cached scene is dropped.
+        reset_for_tests();
+        init(32, 16).expect("init");
+        render(RED_RECT_ON_BLACK).expect("render");
+        // Sanity: the scene is cached and repaintable.
+        assert!(
+            render_current().expect("render_current").is_some(),
+            "a published scene must be repaintable before clear_scene"
+        );
+
+        clear_scene();
+
+        // After clearing, there is nothing to repaint even though the
+        // renderer is still initialized (so this is `Ok(None)`, not an
+        // error).
+        assert!(
+            render_current().expect("render_current").is_none(),
+            "render_current must be None after clear_scene drops the cached scene"
+        );
         shutdown();
     }
 

@@ -818,6 +818,11 @@ pub fn project_save() -> Result<()> {
 pub fn project_close() {
     crate::autosave::autosave_reset();
     *slot().write() = None;
+    // Drop the renderer's cached scene too: the closed project's
+    // content must neither linger in renderer memory nor be repainted
+    // by a stray `render_current` before the next project is synced.
+    // The renderer (and its last presented frame) stays attached.
+    crate::state::clear_scene();
 }
 
 /// Snapshot of the open project (or `None` if nothing is open).

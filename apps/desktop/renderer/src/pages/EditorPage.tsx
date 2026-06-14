@@ -533,17 +533,21 @@ function EditorPageInner({
     [artboardsRef, nodesRef, setViewport],
   );
 
-  // One-shot: frame the document the first time artboards load for a
-  // freshly-opened project so the user sees their content immediately
-  // instead of the empty origin artboard. Guarded by a ref so any
-  // manual pan/zoom afterwards is never overridden.
+  // One-shot: frame the document the first time it has something to
+  // show for a freshly-opened project so the user sees their content
+  // immediately instead of the empty origin. Fires as soon as EITHER
+  // top-level artboards OR (for artboard-less pages) loose nodes are
+  // present — `fitToContent` prefers artboards and falls back to the
+  // union of visible node bounds, so a document whose content lives in
+  // loose nodes at a large world offset still gets framed. Guarded by a
+  // ref so any manual pan/zoom afterwards is never overridden.
   const didInitialFitRef = useRef(false);
   useEffect(() => {
     if (didInitialFitRef.current) return;
-    if (artboards.length === 0) return;
+    if (artboards.length === 0 && nodes.length === 0) return;
     didInitialFitRef.current = true;
     fitToContent(artboards);
-  }, [artboards, fitToContent]);
+  }, [artboards, nodes, fitToContent]);
 
   const handleCreateArtboard = useCallback(
     async (args: { name: string; width: number; height: number }) => {

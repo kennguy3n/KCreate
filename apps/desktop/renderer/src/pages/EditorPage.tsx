@@ -44,7 +44,6 @@ import { PrototypePlayer } from "../components/PrototypePlayer";
 import type {
   Alignment,
   ArtboardInfo,
-  Bounds,
   DistributeAxis,
   FlexLayout,
   GridLayout,
@@ -52,7 +51,7 @@ import type {
   ProjectInfo,
   SnapGuide,
 } from "../../../shared/scene";
-import { computeFitViewport } from "../lib/fitViewport";
+import { computeContentFit } from "../lib/fitViewport";
 import { LowResourceBanner } from "../components/LowResourceBanner";
 import { useShortcuts } from "../shortcuts/useShortcuts";
 import type { ShortcutHandlers } from "../shortcuts/useShortcuts";
@@ -512,22 +511,22 @@ function EditorPageInner({
   // so the editor always lands on real content rather than the empty
   // origin artboard.
   const fitToContent = useCallback(
-    (artboardsOverride?: ArtboardInfo[]) => {
+    (artboardsOverride?: ArtboardInfo[], nodesOverride?: NodeInfo[]) => {
+      // Prefer the explicit arguments (the one-shot fit effect passes the
+      // freshly-rendered `artboards`/`nodes` state), falling back to the
+      // refs for the event-handler callers (e.g. the zoom-to-fit button),
+      // where the refs are already current. `computeContentFit` frames the
+      // artboards when present and falls back to the union of visible node
+      // bounds for artboard-less pages, dropping zero-area boxes and
+      // returning null when there's nothing to frame.
       const sourceArtboards = artboardsOverride ?? artboardsRef.current;
-      // Prefer framing the artboards (the document's top-level frames).
-      // Fall back to the union of visible node bounds when a page holds
-      // loose nodes and no artboards. The pure helper drops zero-area
-      // boxes and returns null when there's nothing to frame.
-      const boxes: Bounds[] =
-        sourceArtboards.length > 0
-          ? sourceArtboards.map((a) => ({
-              x: a.x,
-              y: a.y,
-              width: a.width,
-              height: a.height,
-            }))
-          : nodesRef.current.filter((n) => n.visible).map((n) => n.bounds);
-      const fit = computeFitViewport(boxes, CANVAS_WIDTH, CANVAS_HEIGHT);
+      const sourceNodes = nodesOverride ?? nodesRef.current;
+      const fit = computeContentFit(
+        sourceArtboards,
+        sourceNodes,
+        CANVAS_WIDTH,
+        CANVAS_HEIGHT,
+      );
       setViewport(fit ?? DEFAULT_VIEWPORT);
     },
     [artboardsRef, nodesRef, setViewport],
@@ -546,7 +545,12 @@ function EditorPageInner({
     if (didInitialFitRef.current) return;
     if (artboards.length === 0 && nodes.length === 0) return;
     didInitialFitRef.current = true;
-    fitToContent(artboards);
+    // Pass the freshly-rendered `nodes` (not `nodesRef`): this effect runs
+    // as a child of `DocumentProvider`, so React fires it before the
+    // provider's ref-sync effect updates `nodesRef.current` for this
+    // render. For artboard-less docs the ref is still the previous (empty)
+    // value here, which would frame nothing and latch `didInitialFitRef`.
+    fitToContent(artboards, nodes);
   }, [artboards, nodes, fitToContent]);
 
   const handleCreateArtboard = useCallback(

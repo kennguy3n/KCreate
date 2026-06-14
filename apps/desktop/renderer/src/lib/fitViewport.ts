@@ -62,3 +62,48 @@ export function computeFitViewport(
     zoom,
   };
 }
+
+/**
+ * Minimal shape of a node consumed by {@link computeContentFit}: just
+ * its visibility flag and world-space bounds. Structurally satisfied by
+ * the renderer's full `NodeInfo`, so callers pass `NodeInfo[]` directly.
+ */
+export interface FitNode {
+  visible: boolean;
+  bounds: Bounds;
+}
+
+/**
+ * Box-selection policy backing both the user-facing zoom-to-fit and the
+ * one-shot framing on project open: frame the artboards (the document's
+ * top-level frames) when present, otherwise fall back to the union of
+ * *visible* node bounds so artboard-less pages whose content lives in
+ * loose nodes still get framed. Delegates the geometry to
+ * {@link computeFitViewport}, so zero-area boxes are dropped and an
+ * empty document yields `null`.
+ *
+ * Deliberately pure (no refs, no React state): callers must pass the
+ * *current* artboards and nodes. The one-shot fit effect in `EditorPage`
+ * runs as a child effect and therefore fires before the parent
+ * `DocumentProvider` syncs its `nodesRef`, so it must feed this function
+ * the freshly-rendered `nodes` state rather than a ref that is still
+ * stale for the triggering render.
+ */
+export function computeContentFit(
+  artboards: readonly Bounds[],
+  nodes: readonly FitNode[],
+  canvasWidth: number,
+  canvasHeight: number,
+  marginFactor = 0.9,
+): FitViewport | null {
+  const boxes: Bounds[] =
+    artboards.length > 0
+      ? artboards.map((a) => ({
+          x: a.x,
+          y: a.y,
+          width: a.width,
+          height: a.height,
+        }))
+      : nodes.filter((n) => n.visible).map((n) => n.bounds);
+  return computeFitViewport(boxes, canvasWidth, canvasHeight, marginFactor);
+}

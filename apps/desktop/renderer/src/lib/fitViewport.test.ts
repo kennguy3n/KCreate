@@ -9,7 +9,8 @@
 import { describe, it, expect } from "vitest";
 
 import type { Bounds } from "../../../shared/scene";
-import { computeFitViewport } from "./fitViewport";
+import type { FitNode } from "./fitViewport";
+import { computeContentFit, computeFitViewport } from "./fitViewport";
 
 const CANVAS_W = 1024;
 const CANVAS_H = 640;
@@ -86,5 +87,64 @@ describe("computeFitViewport", () => {
     const left = project(vp, box.x, box.y).x;
     const right = project(vp, box.x + box.width, box.y).x;
     expect(right - left).toBeCloseTo(CANVAS_W * margin, 6);
+  });
+});
+
+describe("computeContentFit", () => {
+  const node = (bounds: Bounds, visible = true): FitNode => ({
+    visible,
+    bounds,
+  });
+
+  it("frames the artboards when present, ignoring nodes", () => {
+    const artboards: Bounds[] = [{ x: 0, y: 0, width: 1920, height: 1080 }];
+    // A loose node far away must NOT widen the framed union when
+    // artboards exist (artboards are the document's top-level frames).
+    const nodes = [node({ x: 9000, y: 9000, width: 100, height: 100 })];
+    const vp = computeContentFit(artboards, nodes, CANVAS_W, CANVAS_H);
+    expect(vp).not.toBeNull();
+    const center = project(vp!, 960, 540);
+    expect(center.x).toBeCloseTo(CANVAS_W / 2, 6);
+    expect(center.y).toBeCloseTo(CANVAS_H / 2, 6);
+  });
+
+  it("frames the union of visible node bounds when there are no artboards (regression: artboard-less docs)", () => {
+    // The bug: the one-shot fit effect read a stale (empty) nodes ref, so
+    // artboard-less docs fell back to DEFAULT_VIEWPORT and never framed
+    // their content. With the current nodes passed in, the loose content
+    // at a large world offset is framed and centered.
+    const nodes = [
+      node({ x: 2020, y: 300, width: 400, height: 200 }),
+      node({ x: 2620, y: 300, width: 200, height: 200 }),
+    ];
+    const vp = computeContentFit([], nodes, CANVAS_W, CANVAS_H);
+    expect(vp).not.toBeNull();
+    // Union spans x:[2020,2820], y:[300,500] → center (2420, 400).
+    const center = project(vp!, 2420, 400);
+    expect(center.x).toBeCloseTo(CANVAS_W / 2, 6);
+    expect(center.y).toBeCloseTo(CANVAS_H / 2, 6);
+  });
+
+  it("skips hidden nodes when falling back to node bounds", () => {
+    const nodes = [
+      node({ x: 0, y: 0, width: 100, height: 100 }, false), // hidden → ignored
+      node({ x: 1000, y: 1000, width: 200, height: 200 }),
+    ];
+    const vp = computeContentFit([], nodes, CANVAS_W, CANVAS_H);
+    expect(vp).not.toBeNull();
+    // Only the visible node frames → center (1100, 1100).
+    const center = project(vp!, 1100, 1100);
+    expect(center.x).toBeCloseTo(CANVAS_W / 2, 6);
+    expect(center.y).toBeCloseTo(CANVAS_H / 2, 6);
+  });
+
+  it("returns null when there is nothing with positive area to frame", () => {
+    expect(computeContentFit([], [], CANVAS_W, CANVAS_H)).toBeNull();
+    // Only hidden / zero-area content → still null.
+    const nodes = [
+      node({ x: 0, y: 0, width: 100, height: 100 }, false),
+      node({ x: 10, y: 10, width: 0, height: 0 }),
+    ];
+    expect(computeContentFit([], nodes, CANVAS_W, CANVAS_H)).toBeNull();
   });
 });

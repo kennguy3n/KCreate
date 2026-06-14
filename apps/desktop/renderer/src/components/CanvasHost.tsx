@@ -273,6 +273,10 @@ export function CanvasHost(props: CanvasHostProps): JSX.Element {
           // and zero pixel copies.
           const info = await bridge.frameInfo();
           if (info && info.frameId !== lastFrameIdRef.current) {
+            // Default to the id we observed via the metadata poll. In
+            // offscreen mode we replace this with the id of the frame we
+            // actually acquired below, which may be newer.
+            let presentedId = info.frameId;
             // In native mode the Rust side has already presented the
             // frame directly to the platform window surface — there
             // is nothing for the host to do beyond bookkeeping. Skip
@@ -294,10 +298,15 @@ export function CanvasHost(props: CanvasHostProps): JSX.Element {
                   imageDataRef.current!.data.set(frame.bytes);
                   ctx.putImageData(imageDataRef.current!, 0, 0);
                 }
+                // The renderer may have published a newer frame between
+                // the `frameInfo()` poll and this `acquireFrame()`. Record
+                // the id we actually consumed so the next tick doesn't
+                // re-download a frame we've already presented.
+                presentedId = frame.frameId;
               }
             }
-            lastFrameIdRef.current = info.frameId;
-            props.onFramePresented?.(info.frameId);
+            lastFrameIdRef.current = presentedId;
+            props.onFramePresented?.(presentedId);
           }
         } catch (err) {
           // Surfacing the error to React state would unmount the

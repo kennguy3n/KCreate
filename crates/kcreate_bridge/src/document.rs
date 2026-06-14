@@ -2551,6 +2551,19 @@ pub(crate) fn sync_scene_locked(
                 .append_presence_cursors(&mut scene, &cursors, halo_next_z, viewport_zoom);
         }
     }
+    // The document graph (or presence overlay) just changed, so the
+    // renderer's last-published frame is stale. Mark the whole canvas
+    // dirty before re-rendering: the offscreen renderer's dirty-region
+    // optimisation short-circuits `render_frame` when nothing has
+    // invalidated the framebuffer since the previous frame (it returns
+    // the cached `FrameId` without rebuilding the display list), which
+    // would otherwise keep presenting the stale — or initial blank —
+    // frame after every mutation. Invalidating here is the single
+    // chokepoint that connects a document change to a renderer repaint.
+    // `NotInitialized` is expected when the host runs headlessly (no
+    // renderer attached) and is ignored, exactly like the
+    // `render_scene` call below.
+    let _ = crate::state::invalidate(None);
     // Renderer not initialised is fine here: the host may be working
     // headlessly. Other render errors propagate.
     match crate::state::render_scene(scene) {

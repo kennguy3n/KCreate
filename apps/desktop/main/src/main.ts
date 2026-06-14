@@ -828,6 +828,9 @@ function registerIpcHandlers(): void {
   ipcMain.handle("kcreate/renderer/render", (_e, sceneJson: string) =>
     requireBridge().rendererRender(sceneJson),
   );
+  ipcMain.handle("kcreate/renderer/renderCurrent", () =>
+    requireBridge().rendererRenderCurrent(),
+  );
   ipcMain.handle("kcreate/renderer/getFrame", () =>
     requireBridge().rendererGetFrame(),
   );

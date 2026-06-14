@@ -300,6 +300,11 @@ const renderer: RendererBridge = {
       JSON.stringify(scene),
     )) as number;
   },
+  async renderCurrent(): Promise<number | null> {
+    return (await ipcRenderer.invoke(
+      "kcreate/renderer/renderCurrent",
+    )) as number | null;
+  },
   async getFrame(): Promise<Uint8Array | null> {
     const buf = (await ipcRenderer.invoke(
       "kcreate/renderer/getFrame",

@@ -44,6 +44,7 @@ import { PrototypePlayer } from "../components/PrototypePlayer";
 import type {
   Alignment,
   ArtboardInfo,
+  Bounds,
   DistributeAxis,
   FlexLayout,
   GridLayout,
@@ -51,6 +52,7 @@ import type {
   ProjectInfo,
   SnapGuide,
 } from "../../../shared/scene";
+import { computeFitViewport } from "../lib/fitViewport";
 import { LowResourceBanner } from "../components/LowResourceBanner";
 import { useShortcuts } from "../shortcuts/useShortcuts";
 import type { ShortcutHandlers } from "../shortcuts/useShortcuts";
@@ -187,7 +189,6 @@ function EditorPageInner({
     components,
     docStatus,
     resourceLimits,
-    scene,
   } = documentCtx.state;
   const {
     setArtboardPresets,
@@ -501,6 +502,48 @@ function EditorPageInner({
     setViewport({ panX, panY, zoom });
     void window.kcreate.canvas.setSelection([a.id]).then(refreshSelection);
   }, [refreshSelection, setViewport]);
+
+  // Frame the document content in the viewport with ~10% margin. Uses
+  // the union of every artboard's bounds, falling back to the union of
+  // visible, positive-area node bounds when a page carries loose nodes
+  // and no artboards. Same `screen = world * zoom + pan` transform as
+  // `focusArtboard`, solved for the union box. Backs both the
+  // user-facing zoom-to-fit and the one-shot framing on project open,
+  // so the editor always lands on real content rather than the empty
+  // origin artboard.
+  const fitToContent = useCallback(
+    (artboardsOverride?: ArtboardInfo[]) => {
+      const sourceArtboards = artboardsOverride ?? artboardsRef.current;
+      // Prefer framing the artboards (the document's top-level frames).
+      // Fall back to the union of visible node bounds when a page holds
+      // loose nodes and no artboards. The pure helper drops zero-area
+      // boxes and returns null when there's nothing to frame.
+      const boxes: Bounds[] =
+        sourceArtboards.length > 0
+          ? sourceArtboards.map((a) => ({
+              x: a.x,
+              y: a.y,
+              width: a.width,
+              height: a.height,
+            }))
+          : nodesRef.current.filter((n) => n.visible).map((n) => n.bounds);
+      const fit = computeFitViewport(boxes, CANVAS_WIDTH, CANVAS_HEIGHT);
+      setViewport(fit ?? DEFAULT_VIEWPORT);
+    },
+    [artboardsRef, nodesRef, setViewport],
+  );
+
+  // One-shot: frame the document the first time artboards load for a
+  // freshly-opened project so the user sees their content immediately
+  // instead of the empty origin artboard. Guarded by a ref so any
+  // manual pan/zoom afterwards is never overridden.
+  const didInitialFitRef = useRef(false);
+  useEffect(() => {
+    if (didInitialFitRef.current) return;
+    if (artboards.length === 0) return;
+    didInitialFitRef.current = true;
+    fitToContent(artboards);
+  }, [artboards, fitToContent]);
 
   const handleCreateArtboard = useCallback(
     async (args: { name: string; width: number; height: number }) => {
@@ -1682,10 +1725,8 @@ function EditorPageInner({
   useShortcuts(shortcutHandlers);
 
   const onZoomToFit = useCallback(() => {
-    // No documentBounds API yet; reset to identity. Phase 1 will compute
-    // a bounding box across visible nodes.
-    setViewport(DEFAULT_VIEWPORT);
-  }, [setViewport]);
+    fitToContent();
+  }, [fitToContent]);
 
   // Imperative handle into the AnnotationOverlay. The overlay's root
   // SVG is permanently `pointer-events: none` (so it never blocks
@@ -2061,7 +2102,6 @@ function EditorPageInner({
           <CanvasHost
             width={CANVAS_WIDTH}
             height={CANVAS_HEIGHT}
-            scene={scene}
             viewport={viewport}
             onViewportChange={setViewport}
             onFramePresented={onFrame}

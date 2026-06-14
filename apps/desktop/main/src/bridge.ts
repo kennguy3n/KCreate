@@ -165,6 +165,7 @@ export interface Bridge {
     height: number | null,
   ): void;
   rendererRender(sceneJson: string): number;
+  rendererRenderCurrent(): number | null;
   rendererGetFrame(): Uint8Array | null;
   rendererFrameInfo(): FrameInfoSnake | null;
   rendererAcquireFrame(): AcquiredFrameSnake | null;

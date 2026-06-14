@@ -42,7 +42,12 @@ const appDir = path.resolve(here, "..", "..");
 const ALLOWED_CONSOLE_ERRORS = [
   // Headless software-GL / Vulkan adapter chatter from Chromium + wgpu when
   // no real GPU is present (CI runs under xvfb + lavapipe).
-  /GPU|GL |ANGLE|Vulkan|SwiftShader|fallback|swiftshader|vk|dri3|VA-API|vaapi/i,
+  /GPU|GL |ANGLE|Vulkan|SwiftShader|swiftshader|vk|dri3|VA-API|vaapi/i,
+  // Chromium's specific "Automatic fallback to software WebGL has been
+  // deprecated" notice. Scoped to "fallback to software" so a genuine app
+  // error that merely contains the word "fallback" (e.g. a renderer or cache
+  // fallback failure) still fails the gate.
+  /fallback to software/i,
   // Autofill DevTools-protocol noise emitted by Chromium when DevTools is not
   // attached. Harmless and unrelated to the app.
   /Autofill\.(enable|setAddresses)/i,

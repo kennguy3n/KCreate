@@ -182,7 +182,16 @@ CI is gated to keep PR feedback fast:
 | Lane              | When it runs                                                                                                                                                                                                                                | Jobs                                                                       |
 | ----------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------- |
 | **Fast (default)**| Every PR.                                                                                                                                                                                                                                  | `rust (ubuntu-22.04)`, `node (typescript)`                                 |
+| **Smoke**         | Every PR.                                                                                                                                                                                                                                  | `smoke (electron boot + present)`                                          |
 | **Cross-platform**| Push to `main`; PR with the `full-ci` label; commit message containing `[full-ci]`; manual `workflow_dispatch`.                                                                                                                              | `rust (macos-13)`, `rust (windows-2022)`                                   |
+
+The **Smoke** lane (`ubuntu-22.04`, 30-minute cap) builds the bridge cdylib
+and the main/preload/renderer bundles, then boots the real Electron app under
+Xvfb via `playwright-core` and asserts a document mutation reaches pixels on
+the HTML `<canvas>` (`apps/desktop/tests/e2e/boot.test.mjs`). It is the gate
+that would have caught the boot and blank-canvas regressions that every other
+check missed. Run it locally with `pnpm --filter @kcreate/desktop test:e2e`
+(needs an X display and a built bridge under `target/<profile>/`).
 
 To verify a PR on all three platforms before merge, add the `full-ci`
 label (preferred — it re-runs the matrix on every push to the PR) or

@@ -144,6 +144,33 @@ describe("MagicResizeDialog", () => {
     expect(newIds).toEqual(["story-id", "a4-id"]);
   });
 
+  it("emits targets in on-screen display order, not click order", () => {
+    let received: ResizeTarget[] | null = null;
+    render(
+      <MagicResizeDialog
+        open
+        source={SOURCE}
+        presets={PRESETS}
+        onResize={(targets) => {
+          received = targets;
+        }}
+        onClose={() => {}}
+      />,
+    );
+
+    // Click in REVERSE display order: A4 (print, last) before Instagram
+    // Story (social_media, earlier). The generated artboards should still
+    // come out in display order so their left-to-right layout matches the
+    // grid the user sees.
+    fireEvent.click(screen.getByRole("checkbox", { name: /A4/ }));
+    fireEvent.click(screen.getByRole("checkbox", { name: /Instagram Story/ }));
+    fireEvent.click(screen.getByRole("button", { name: /Generate 2 resizes/ }));
+
+    expect(received).not.toBeNull();
+    const names = (received as unknown as ResizeTarget[]).map((t) => t.preset);
+    expect(names).toEqual(["Instagram Story", "A4"]);
+  });
+
   it("does not fire a second resize while the first is in flight", () => {
     let resizeCalls = 0;
     render(

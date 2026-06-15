@@ -94,6 +94,21 @@ export function MagicResizeDialog({
     return m;
   }, [presets]);
 
+  // Preset keys in the order they appear on screen (category order, then
+  // within-category order). `submit` walks this — not the selection Set's
+  // click order — so the generated artboards are laid out left-to-right in
+  // the same order the user sees the sizes, regardless of which they
+  // clicked first.
+  const orderedKeys = useMemo(() => {
+    const keys: string[] = [];
+    for (const cat of CATEGORY_LABELS) {
+      const items = grouped.get(cat.id);
+      if (!items) continue;
+      for (const p of items) keys.push(presetKey(p));
+    }
+    return keys;
+  }, [grouped]);
+
   if (!open || !source) return null;
 
   const toggle = (key: string): void => {
@@ -111,7 +126,8 @@ export function MagicResizeDialog({
   const submit = (): void => {
     if (submitting) return;
     const targets: ResizeTarget[] = [];
-    for (const key of selected) {
+    for (const key of orderedKeys) {
+      if (!selected.has(key)) continue;
       const preset = byKey.get(key);
       if (preset) targets.push({ preset: preset.name });
     }

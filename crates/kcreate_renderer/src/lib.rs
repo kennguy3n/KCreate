@@ -120,6 +120,15 @@ impl BackendKind {
         }
     }
 
+    /// `true` when the GPU backend is currently installed. The runtime
+    /// fallback in [`RenderContext::render_into_staging`] uses this to
+    /// decide whether a render error is recoverable by swapping to the
+    /// CPU rasterizer (a CPU error is terminal — there is nothing lower
+    /// to fall back to).
+    const fn is_gpu(&self) -> bool {
+        matches!(self, Self::Gpu(_))
+    }
+
     fn render(
         &mut self,
         scene: &Scene,
@@ -153,6 +162,12 @@ pub struct RenderContext {
     dirty_region: Mutex<Option<Rect>>,
     next_frame_id: AtomicU64,
     sequence: AtomicU64,
+    /// Test-only fault injection: the number of subsequent GPU renders
+    /// to force-fail, so the runtime CPU-fallback path can be exercised
+    /// on hosts (including CI under lavapipe) that *do* have a working
+    /// software GPU adapter. Compiled out entirely in non-test builds.
+    #[cfg(test)]
+    forced_gpu_failures: std::sync::atomic::AtomicU32,
 }
 
 impl std::fmt::Debug for RenderContext {
@@ -187,6 +202,8 @@ impl RenderContext {
             dirty_region: Mutex::new(Some(Rect::new(0.0, 0.0, width as f32, height as f32))),
             next_frame_id: AtomicU64::new(1),
             sequence: AtomicU64::new(0),
+            #[cfg(test)]
+            forced_gpu_failures: std::sync::atomic::AtomicU32::new(0),
         })
     }
 
@@ -259,15 +276,86 @@ impl RenderContext {
             Some(Rect::new(0.0, 0.0, self.width as f32, self.height as f32));
     }
 
+    /// Rasterize the current frame into `staging` using the active
+    /// backend, with a runtime GPU→CPU fallback.
+    ///
+    /// On a GPU render error (e.g. a `wgpu` device loss or a surface /
+    /// readback failure), the GPU backend is swapped for a fresh
+    /// software [`CpuBackend`] *in place* and the frame is retried once.
+    /// The CPU rasterizer clears and refills `staging`, so reusing the
+    /// same buffer after a partially-written GPU attempt is safe. After
+    /// the swap [`Self::tier`] reports [`GpuTier::SoftwareFallback`] and
+    /// every later frame renders on the CPU.
+    ///
+    /// Only the backend lock is held here, and it is acquired after the
+    /// caller has already released the per-frame `dirty_region`,
+    /// `viewport`, and `pipeline` locks — so the renderer's lock
+    /// discipline is preserved and the in-place swap cannot deadlock
+    /// against a concurrent reader.
+    fn render_into_staging(
+        &self,
+        scene: &Scene,
+        viewport: &Viewport,
+        display_list: &DisplayList,
+        staging: &mut Vec<u8>,
+    ) -> Result<()> {
+        let size = (self.width, self.height);
+        let mut backend = self.backend.lock();
+
+        #[cfg(test)]
+        let first = if backend.is_gpu() && self.forced_gpu_failures.load(Ordering::Acquire) > 0 {
+            // Test-only fault injection: pretend the GPU render failed so
+            // the fallback is exercised on hosts (incl. CI under lavapipe)
+            // that do have a working software adapter. Never fabricates a
+            // CPU failure.
+            self.forced_gpu_failures.fetch_sub(1, Ordering::AcqRel);
+            Err(RendererError::Wgpu("injected GPU failure (test)".into()))
+        } else {
+            backend.render(scene, viewport, display_list, staging, size)
+        };
+        #[cfg(not(test))]
+        let first = backend.render(scene, viewport, display_list, staging, size);
+
+        match first {
+            Ok(()) => Ok(()),
+            Err(err) if backend.is_gpu() => {
+                log::warn!(
+                    "kcreate_renderer: GPU render failed ({err}); swapping to CPU \
+                     rasterizer and retrying frame"
+                );
+                *backend = BackendKind::Cpu(CpuBackend::new(self.width, self.height));
+                backend.render(scene, viewport, display_list, staging, size)
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    /// Test-only: force the next `n` GPU renders to fail, to exercise the
+    /// runtime CPU fallback in [`Self::render_into_staging`] on hosts that
+    /// have a working GPU adapter.
+    #[cfg(test)]
+    fn force_next_gpu_failures(&self, n: u32) {
+        self.forced_gpu_failures.store(n, Ordering::Release);
+    }
+
     /// Render the given scene to the offscreen target and publish a new frame.
     ///
     /// Returns the [`FrameId`] of the published frame. If no work was needed
     /// (no dirty region and a frame has previously been published), the
     /// previous frame's id is returned and no GPU/CPU work occurs.
     ///
-    /// If the backend errors mid-render, the dirty region is restored so a
-    /// subsequent retry still knows to repaint the affected area. The
-    /// frame id counter is not incremented on failure.
+    /// If the GPU backend errors mid-render (e.g. a `wgpu` device loss),
+    /// the renderer swaps it for a software [`CpuBackend`] in place and
+    /// retries the same frame once, so a lost adapter degrades to CPU
+    /// rasterization instead of freezing the canvas. Init-time
+    /// adapter-absence fallback is handled separately in [`init_backend`].
+    ///
+    /// If the render still errors after that fallback, the dirty region is
+    /// restored so a subsequent retry still knows to repaint the affected
+    /// area, and the externally-visible frame [`Self::sequence`] is left
+    /// unchanged. (The [`FrameId`] allocated for the attempt is simply
+    /// skipped — the internal `next_frame_id` allocation counter always
+    /// advances, so ids are monotonic but may have gaps after a failure.)
     pub fn render_frame(&self, scene: &Scene) -> Result<FrameId> {
         let dirty = {
             let mut guard = self.dirty_region.lock();
@@ -289,13 +377,7 @@ impl RenderContext {
 
         let frame_id = FrameId(self.next_frame_id.fetch_add(1, Ordering::AcqRel));
         let mut staging = self.presenter.acquire_staging(self.width, self.height);
-        let render_result = self.backend.lock().render(
-            scene,
-            &viewport,
-            &display_list,
-            &mut staging,
-            (self.width, self.height),
-        );
+        let render_result = self.render_into_staging(scene, &viewport, &display_list, &mut staging);
         match render_result {
             Ok(()) => {
                 self.presenter.publish(frame_id, staging);
@@ -324,6 +406,14 @@ impl RenderContext {
     /// `device` + `queue` from `GpuBackend`). On the CPU fallback,
     /// returns `RendererError::Wgpu("native present requires GPU
     /// backend")` because there's no device/queue to upload with.
+    ///
+    /// Unlike [`Self::render_frame`], the native path does **not**
+    /// silently swap to the CPU rasterizer on a GPU loss: a software
+    /// backend cannot present into a swapchain. Instead it returns
+    /// `Err`, which the caller (`CanvasHost`) treats as the signal to
+    /// detach the native surface and fall back to the offscreen / IPC
+    /// path — where [`Self::render_frame`] self-heals via the in-place
+    /// GPU→CPU swap described above.
     ///
     /// Like [`Self::render_frame`], this is a no-op when nothing is
     /// dirty: it returns the previous [`FrameId`] without re-running
@@ -691,5 +781,55 @@ mod tests {
         let scene = Scene::new(Color::rgba(0.0, 0.0, 0.0, 1.0));
         let frame = ctx.render_frame(&scene).expect("render");
         assert!(ctx.get_frame_pixels(frame).is_some());
+    }
+
+    /// A GPU device loss *during* a session must not freeze the canvas:
+    /// the renderer should swap to the software rasterizer in place,
+    /// retry the frame, and keep publishing. (Init-time adapter absence
+    /// is covered by `init_backend`; this exercises the runtime path.)
+    ///
+    /// The injected failure fires *before* `backend.render` is called, so
+    /// the test never performs a real GPU submit/readback — that keeps it
+    /// deterministic under headless software Vulkan, where the readback
+    /// path is flaky — while still driving the in-place GPU→CPU swap on
+    /// any host that brought up a GPU adapter.
+    #[test]
+    fn runtime_gpu_failure_falls_back_to_cpu_and_keeps_presenting() {
+        let ctx = initialize(64, 64).expect("init");
+        let scene = Scene::new(Color::rgba(0.1, 0.2, 0.3, 1.0));
+
+        // Simulate a wgpu device loss on the next render. On a host that
+        // brought up a GPU adapter this drives the runtime GPU→CPU swap;
+        // on a host already on the software rasterizer (no adapter /
+        // `cpu-only`) `is_gpu()` is false so the injection is a no-op and
+        // the test still asserts rendering keeps working.
+        ctx.force_next_gpu_failures(1);
+        let first = ctx
+            .render_frame(&scene)
+            .expect("frame still publishes after a GPU loss");
+
+        // The canvas kept presenting on the software rasterizer (after the
+        // swap, or because we were already there)...
+        assert_eq!(ctx.tier(), GpuTier::SoftwareFallback);
+        // ...and the published frame is a complete, valid buffer. Read the
+        // length out immediately so the `FrameLease` (a presenter read
+        // guard) is dropped before the next `render_frame` publishes —
+        // the presenter lock is not reentrant.
+        let pixel_len = ctx
+            .get_frame_pixels(first)
+            .expect("frame after fallback")
+            .pixels()
+            .len();
+        assert_eq!(pixel_len, 64 * 64 * 4);
+
+        // The swap is sticky: subsequent frames keep rendering on the CPU
+        // with no further injection, and the frame id keeps advancing.
+        ctx.invalidate_all();
+        let second = ctx.render_frame(&scene).expect("subsequent frame");
+        assert!(
+            second.0 > first.0,
+            "frame id should advance after fallback: {second:?} !> {first:?}"
+        );
+        assert_eq!(ctx.tier(), GpuTier::SoftwareFallback);
     }
 }

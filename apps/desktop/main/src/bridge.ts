@@ -62,6 +62,11 @@ type NodeInfoSnake = {
   /// shape so the renderer can place hotspot rectangles without a
   /// second IPC hop.
   bounds: BoundsSnake;
+  /// Monotonic revision counter mirroring `lib.rs::NodeInfo::version`
+  /// (`f64`). Required field on the public `NodeInfo` DTO, so it must
+  /// appear here too to keep the wire shape in full lockstep (AGENTS.md
+  /// Rule 4) — the napi struct returns it on every `document_get_tree`.
+  version: number;
 };
 
 type RuntimeStatusSnake = {

@@ -40,14 +40,24 @@ function expectAssignable<T>(_value: T): void {
 
 // The raw bridge wire shapes must be assignable to the public DTOs the
 // preload casts them to. `ProjectInfo` / `RuntimeStatus` /
-// `DocumentStatus` are modelled in full; `NodeInfoSnake` deliberately
-// carries only the subset of `NodeInfo` the layer tree needs (no
-// `version` / `componentInstance` / `metadata`), so its guard is
-// restricted to the fields it does declare.
+// `DocumentStatus` mirror their napi structs field-for-field.
 expectAssignable<ProjectInfo>({} as ProjectInfoSnake);
 expectAssignable<RuntimeStatus>({} as RuntimeStatusSnake);
 expectAssignable<DocumentStatus>({} as DocumentStatusSnake);
-expectAssignable<Pick<NodeInfo, keyof NodeInfoSnake>>({} as NodeInfoSnake);
+
+// `NodeInfo` is guarded in BOTH directions so the lockstep can't be
+// silently weakened (a `Pick<NodeInfo, keyof NodeInfoSnake>` guard would
+// pass even if `NodeInfoSnake` dropped a required field like `version`).
+//   1. The napi struct must be a valid public `NodeInfo` — catches a
+//      dropped/renamed/snake_cased required field.
+//   2. It must carry *nothing* the public DTO lacks. The only fields on
+//      `NodeInfo` the napi struct never emits are the optional
+//      `componentInstance` / `metadata`, so stripping those two yields
+//      exactly `NodeInfoSnake` — catches a stray field on either side.
+expectAssignable<NodeInfo>({} as NodeInfoSnake);
+expectAssignable<NodeInfoSnake>(
+  {} as Omit<NodeInfo, "componentInstance" | "metadata">,
+);
 
 test("public runtime/document DTOs expose their multi-word fields in camelCase", () => {
   // Shaped exactly like the napi objects the bridge returns. These are

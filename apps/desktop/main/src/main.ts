@@ -3422,10 +3422,20 @@ function registerIpcHandlers(): void {
   // gets pointed at the persistent JSON file at startup (see
   // `whenReady` below), and exposes add/remove/list to the
   // renderer's KChatSignInPanel.
-  ipcMain.handle(
-    "kcreate/kchat/set-trust-store-path",
-    (_e, p: string) => requireBridge().kchatSetTrustStorePath(p),
-  );
+  ipcMain.handle("kcreate/kchat/set-trust-store-path", (_e, p: string) => {
+    // Non-collab developer builds omit the trust-store ABI from the
+    // cdylib (the JS bridge does NOT synthesise it — see
+    // `applyCollabFallbacks` in bridge.ts — so `initializeKChatTrustStore`
+    // can detect its absence). Probe before calling so an unused IPC
+    // invocation degrades to an idempotent no-op instead of throwing a
+    // `TypeError` back across the channel. Mirrors the guard in
+    // `initializeKChatTrustStore` below.
+    const fn = requireBridge().kchatSetTrustStorePath;
+    if (typeof fn !== "function") {
+      return undefined;
+    }
+    return fn.call(requireBridge(), p);
+  });
   ipcMain.handle("kcreate/kchat/trusted-issuers", () =>
     requireBridge().kchatTrustedIssuers(),
   );

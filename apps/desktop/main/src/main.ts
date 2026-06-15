@@ -831,6 +831,11 @@ function registerIpcHandlers(): void {
   ipcMain.handle("kcreate/renderer/renderCurrent", () =>
     requireBridge().rendererRenderCurrent(),
   );
+  ipcMain.handle(
+    "kcreate/renderer/setViewportAndRender",
+    (_e, panX: number, panY: number, zoom: number) =>
+      requireBridge().rendererSetViewportAndRender(panX, panY, zoom),
+  );
   ipcMain.handle("kcreate/renderer/getFrame", () =>
     requireBridge().rendererGetFrame(),
   );

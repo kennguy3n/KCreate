@@ -311,6 +311,14 @@ const renderer: RendererBridge = {
       "kcreate/renderer/renderCurrent",
     )) as number | null;
   },
+  async setViewportAndRender(panX, panY, zoom): Promise<number | null> {
+    return (await ipcRenderer.invoke(
+      "kcreate/renderer/setViewportAndRender",
+      panX,
+      panY,
+      zoom,
+    )) as number | null;
+  },
   async getFrame(): Promise<Uint8Array | null> {
     const buf = (await ipcRenderer.invoke(
       "kcreate/renderer/getFrame",

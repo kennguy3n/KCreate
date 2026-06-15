@@ -171,6 +171,11 @@ export interface Bridge {
   ): void;
   rendererRender(sceneJson: string): number;
   rendererRenderCurrent(): number | null;
+  rendererSetViewportAndRender(
+    panX: number,
+    panY: number,
+    zoom: number,
+  ): number | null;
   rendererGetFrame(): Uint8Array | null;
   rendererFrameInfo(): FrameInfoNapi | null;
   rendererAcquireFrame(): AcquiredFrameNapi | null;

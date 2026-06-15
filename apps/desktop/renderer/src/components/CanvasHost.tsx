@@ -247,36 +247,48 @@ export function CanvasHost(props: CanvasHostProps): JSX.Element {
       const tick = async (): Promise<void> => {
         if (cancelled) return;
         try {
-          // Sync the viewport only when the host actually changed it,
-          // then ask the renderer to repaint the current document at the
-          // new viewport. A pan/zoom marks the renderer dirty but does
-          // not by itself rebuild a frame, so without this the canvas
-          // would not follow the viewport. Skipping the IPC round-trip
-          // when nothing changed keeps the steady-state (static
-          // viewport) case free.
+          // Resolve the latest published frame id for this tick. There
+          // are two ways it advances:
+          //
+          //   1. The host changed the viewport (pan/zoom). We fold the
+          //      viewport write and the repaint into a SINGLE IPC round
+          //      trip via `setViewportAndRender`, which returns the new
+          //      frame id directly — so on the pan/zoom hot path we skip
+          //      the separate `frameInfo()` poll below. This halves the
+          //      bridge crossings versus the old
+          //      `setViewport` + `renderCurrent` + `frameInfo` sequence.
+          //
+          //   2. The document mutated (the bridge invalidates +
+          //      re-renders on each scene sync). On a static-viewport
+          //      tick we learn about that with the cheap `frameInfo()`
+          //      metadata poll, so a still canvas costs exactly one
+          //      metadata call per rAF tick and zero pixel copies.
+          let latestFrameId: number | null = null;
           const vp = viewportRef.current;
           const last = lastSentViewportRef.current;
           if (!last || !viewportEquals(last, vp)) {
-            await bridge.setViewport(vp.panX, vp.panY, vp.zoom);
+            latestFrameId = await bridge.setViewportAndRender(
+              vp.panX,
+              vp.panY,
+              vp.zoom,
+            );
             lastSentViewportRef.current = { ...vp };
-            await bridge.renderCurrent();
+          }
+          // Static-viewport tick (or the combined call reported no scene
+          // yet): poll the latest published id so document mutations
+          // still present.
+          if (latestFrameId === null) {
+            const info = await bridge.frameInfo();
+            latestFrameId = info ? info.frameId : null;
           }
 
-          // Present path. Poll the latest published frame id with the
-          // cheap `frameInfo()` metadata call and only pay for the full
-          // pixel readback (`acquireFrame`, ~W×H×4 bytes across IPC)
-          // when the frame actually advanced. The renderer publishes a
-          // new frame whenever the document mutates (the bridge
-          // invalidates + re-renders on each scene sync) or when
-          // `renderCurrent()` runs above for a viewport / resize change,
-          // so a static document costs one metadata poll per rAF tick
-          // and zero pixel copies.
-          const info = await bridge.frameInfo();
-          if (info && info.frameId !== lastFrameIdRef.current) {
-            // Default to the id we observed via the metadata poll. In
-            // offscreen mode we replace this with the id of the frame we
-            // actually acquired below, which may be newer.
-            let presentedId = info.frameId;
+          // Only pay for the full pixel readback (`acquireFrame`,
+          // ~W×H×4 bytes across IPC) when the frame actually advanced.
+          if (latestFrameId !== null && latestFrameId !== lastFrameIdRef.current) {
+            // Default to the id we resolved above. In offscreen mode we
+            // replace this with the id of the frame we actually acquired
+            // below, which may be newer.
+            let presentedId = latestFrameId;
             // In native mode the Rust side has already presented the
             // frame directly to the platform window surface — there
             // is nothing for the host to do beyond bookkeeping. Skip
@@ -299,9 +311,12 @@ export function CanvasHost(props: CanvasHostProps): JSX.Element {
                   ctx.putImageData(imageDataRef.current!, 0, 0);
                 }
                 // The renderer may have published a newer frame between
-                // the `frameInfo()` poll and this `acquireFrame()`. Record
-                // the id we actually consumed so the next tick doesn't
-                // re-download a frame we've already presented.
+                // when we resolved `latestFrameId` above (via
+                // `setViewportAndRender` on a viewport change, or
+                // `frameInfo()` on a static tick) and this
+                // `acquireFrame()`. Record the id we actually consumed so
+                // the next tick doesn't re-download a frame we've already
+                // presented.
                 presentedId = frame.frameId;
               }
             }

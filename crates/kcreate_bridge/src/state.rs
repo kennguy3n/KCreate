@@ -311,33 +311,73 @@ pub fn render_current() -> Result<Option<FrameId>> {
         // contract where an empty `scene_slot` yielded `Ok(None)`.
         return Ok(None);
     };
-    // Native-surface fast path. Default builds don't compile this
-    // branch (the `native_canvas` feature is off). We acquire
-    // `native_slot` BEFORE `scene_slot` so the borrow path keeps the
-    // same `slot -> native_slot -> scene_slot` order as `render_scene`.
+    let id = render_cached_scene_locked(ctx)?;
+    drop(guard);
+    Ok(id)
+}
+
+/// Set the viewport pan/zoom **and** repaint the cached scene in one
+/// locked operation, returning the new [`FrameId`] — or `Ok(None)`
+/// when no scene has been published yet (nothing to repaint) or no
+/// renderer is attached (headless / pre-init / post-shutdown).
+///
+/// This is the present surface's pan/zoom hot path. Folding the
+/// viewport write and the repaint into a single entry point collapses
+/// what were two separate N-API/IPC round-trips ([`set_viewport`] then
+/// [`render_current`]) into one, halving the bridge crossings while the
+/// user is actively panning or zooming. The viewport write marks the
+/// renderer dirty only when the pan/zoom actually changes, so the
+/// subsequent repaint publishes a fresh frame for a real interaction
+/// and reuses the cached frame id for a no-op.
+///
+/// Lock order is the canonical `slot -> native_slot -> scene_slot`:
+/// the viewport write and the repaint share the single `slot` guard
+/// acquired here, and the repaint borrows the cached scene in place
+/// via [`render_cached_scene_locked`] — matching [`render_scene`],
+/// [`render_current`], and [`shutdown`], so the order can never invert.
+pub fn set_viewport_and_render(pan_x: f32, pan_y: f32, zoom: f32) -> Result<Option<FrameId>> {
+    let guard = slot().lock();
+    let Some(ctx) = guard.as_ref() else {
+        return Ok(None);
+    };
+    ctx.set_viewport(Vec2::new(pan_x, pan_y), zoom);
+    let id = render_cached_scene_locked(ctx)?;
+    drop(guard);
+    Ok(id)
+}
+
+/// Repaint the cached scene with the renderer lock **already held**.
+///
+/// Shared by [`render_current`] and [`set_viewport_and_render`] so the
+/// native/offscreen branch selection and the lock-order discipline live
+/// in exactly one place and cannot drift between the two present entry
+/// points. The caller already holds the `slot` guard and lends us `ctx`
+/// borrowed from it; we acquire `native_slot` (native builds only) and
+/// then `scene_slot`, preserving the canonical
+/// `slot -> native_slot -> scene_slot` order. Both inner guards are
+/// released — in reverse acquisition order — when this returns, before
+/// the caller drops `slot`.
+///
+/// Returns `Ok(None)` when no scene has been published yet (nothing to
+/// repaint); the renderer borrows the cached scene in place and never
+/// clones it out.
+fn render_cached_scene_locked(ctx: &RenderContext) -> Result<Option<FrameId>> {
     #[cfg(feature = "native_canvas")]
     {
         let native = native_slot().lock();
         if let Some(surface) = native.as_ref() {
             let scene_guard = scene_slot().lock();
-            let id = match scene_guard.as_ref() {
-                Some(scene) => Some(ctx.render_frame_native(scene, surface)?),
-                None => None,
+            return match scene_guard.as_ref() {
+                Some(scene) => Ok(Some(ctx.render_frame_native(scene, surface)?)),
+                None => Ok(None),
             };
-            drop(scene_guard);
-            drop(native);
-            drop(guard);
-            return Ok(id);
         }
     }
     let scene_guard = scene_slot().lock();
-    let id = match scene_guard.as_ref() {
-        Some(scene) => Some(ctx.render_frame(scene)?),
-        None => None,
-    };
-    drop(scene_guard);
-    drop(guard);
-    Ok(id)
+    match scene_guard.as_ref() {
+        Some(scene) => Ok(Some(ctx.render_frame(scene)?)),
+        None => Ok(None),
+    }
 }
 
 /// Drop the cached scene without tearing down the renderer.
@@ -705,6 +745,104 @@ mod tests {
         );
 
         shutdown();
+    }
+
+    #[test]
+    #[serial]
+    fn set_viewport_and_render_repaints_on_viewport_change() {
+        reset_for_tests();
+        init(32, 16).expect("init");
+
+        // Publish a scene so the combined call has something to repaint.
+        let first = render(RED_RECT_ON_BLACK).expect("render");
+        let before = acquire_frame().expect("acquire").expect("some");
+        let red_before = count_red(&before.bytes);
+        assert!(
+            red_before > 0,
+            "object render must produce non-background (red) pixels, got {red_before}"
+        );
+
+        // A viewport change marks the renderer dirty, so the combined
+        // call publishes a NEW frame carrying the SAME scene (not a
+        // blank one) — exactly what separate set_viewport + render_current
+        // would have produced, but in one lock + one round-trip. We zoom
+        // *out* (and keep pan at the origin) so the centred 8×8 rect
+        // stays inside the 32×16 target and the repaint is still
+        // observably non-blank.
+        let base_zoom = viewport_zoom();
+        let new_zoom = if (base_zoom - 0.75).abs() < 0.001 {
+            0.5
+        } else {
+            0.75
+        };
+        let moved = set_viewport_and_render(0.0, 0.0, new_zoom)
+            .expect("set_viewport_and_render")
+            .expect("scene published");
+        assert_ne!(
+            moved, first,
+            "a viewport change must publish a new frame id"
+        );
+        assert!(
+            (viewport_zoom() - new_zoom).abs() < f32::EPSILON,
+            "the viewport write must have been applied"
+        );
+        let after = acquire_frame().expect("acquire").expect("some");
+        assert_eq!(
+            after.frame_id, moved.0,
+            "acquired frame id must match the combined repaint"
+        );
+        assert!(
+            count_red(&after.bytes) > 0,
+            "repaint must reproduce the published scene (red still \
+             visible), not a blank frame"
+        );
+
+        // Re-issuing the SAME viewport leaves nothing dirty, so the
+        // renderer reuses the cached frame id (no wasted GPU work).
+        let cached = set_viewport_and_render(0.0, 0.0, new_zoom)
+            .expect("set_viewport_and_render")
+            .expect("scene still published");
+        assert_eq!(
+            cached, moved,
+            "an unchanged viewport reuses the cached frame id"
+        );
+
+        shutdown();
+    }
+
+    #[test]
+    #[serial]
+    fn set_viewport_and_render_before_any_render_is_none() {
+        reset_for_tests();
+        init(32, 16).expect("init");
+        // No scene published yet: the viewport write still takes effect,
+        // but there is nothing to repaint, so the combined call returns
+        // None (not an error) just like render_current.
+        assert!(
+            set_viewport_and_render(5.0, 7.0, 1.5)
+                .expect("set_viewport_and_render")
+                .is_none(),
+            "set_viewport_and_render must be None before any scene is published"
+        );
+        assert!(
+            (viewport_zoom() - 1.5).abs() < f32::EPSILON,
+            "the viewport write must apply even with no scene to repaint"
+        );
+        shutdown();
+    }
+
+    #[test]
+    #[serial]
+    fn set_viewport_and_render_without_renderer_is_none() {
+        reset_for_tests();
+        // No init: present-path calls degrade to Ok(None) rather than
+        // erroring, mirroring render_current's headless contract.
+        assert!(
+            set_viewport_and_render(0.0, 0.0, 1.0)
+                .expect("set_viewport_and_render")
+                .is_none(),
+            "set_viewport_and_render must be None when no renderer is attached"
+        );
     }
 
     #[test]

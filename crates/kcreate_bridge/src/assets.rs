@@ -83,15 +83,21 @@ pub struct InsertedAsset {
 /// A single leaf node's world geometry + paint, computed before we take
 /// the workspace lock so the locked section stays short.
 struct PlacedPath {
-    path: kcreate_vector::VectorPath,
+    /// Path geometry already serialized for `metadata[VECTOR_PATH_METADATA_KEY]`.
+    /// We serialize here, in the lock-free prepare phase, rather than inside
+    /// the locked mutation loop: that keeps the only fallible step out of the
+    /// critical section, so node insertion below cannot serialize-fail partway
+    /// and strand half-built nodes outside the single undoable operation.
+    path_json: serde_json::Value,
     bounds: Bounds,
     fill: FillStyle,
     stroke: Option<StrokeStyle>,
 }
 
 /// Convert a parsed [`StyledPath`] (in SVG user space) into a world-space
-/// [`PlacedPath`] using a uniform `scale` then translation `(tx, ty)`.
-fn place(styled: &StyledPath, scale: f64, tx: f64, ty: f64) -> PlacedPath {
+/// [`PlacedPath`] using a uniform `scale` then translation `(tx, ty)`,
+/// serializing the placed geometry up front (see [`PlacedPath::path_json`]).
+fn place(styled: &StyledPath, scale: f64, tx: f64, ty: f64) -> Result<PlacedPath> {
     let path = styled.path.scaled_translated(scale, tx, ty);
     let b = path.bounds();
     let bounds = Bounds {
@@ -114,12 +120,12 @@ fn place(styled: &StyledPath, scale: f64, tx: f64, ty: f64) -> PlacedPath {
         width: s.width * scale,
         ..StrokeStyle::default()
     });
-    PlacedPath {
-        path,
+    Ok(PlacedPath {
+        path_json: serde_json::to_value(&path)?,
         bounds,
         fill,
         stroke,
-    }
+    })
 }
 
 /// Insert the bundled asset `asset_id` onto the canvas as editable
@@ -187,7 +193,10 @@ pub fn insert(
     let tx = x - src.min_x * scale;
     let ty = y - src.min_y * scale;
 
-    let placed: Vec<PlacedPath> = styled.iter().map(|s| place(s, scale, tx, ty)).collect();
+    let placed: Vec<PlacedPath> = styled
+        .iter()
+        .map(|s| place(s, scale, tx, ty))
+        .collect::<Result<Vec<_>>>()?;
 
     // Overall world bounds of the placed artwork (for the group node).
     let mut world = kcreate_vector::BoundingBox::empty();
@@ -232,10 +241,8 @@ pub fn insert(
             stroke: p.stroke,
             ..NodeStyle::default()
         };
-        node.metadata.insert(
-            VECTOR_PATH_METADATA_KEY.to_string(),
-            serde_json::to_value(&p.path)?,
-        );
+        node.metadata
+            .insert(VECTOR_PATH_METADATA_KEY.to_string(), p.path_json);
         let id = ws.project.document.insert_node(node)?;
         node_ids.push(id);
     }

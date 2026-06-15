@@ -57,6 +57,15 @@ pub struct ResizeOptions {
     pub element_scale_min: f64,
     /// Upper bound on the multiplicative element-size change.
     pub element_scale_max: f64,
+    /// Fraction of a frame's extent within which an element edge counts
+    /// as "pinned" to that edge during geometry-based anchor inference.
+    pub edge_fraction: f64,
+    /// Coverage (element extent ÷ frame extent) at or above which an
+    /// edge-to-edge element is treated as spanning (stretching) the axis.
+    pub stretch_coverage: f64,
+    /// Tolerance (as a fraction of frame extent) on the leading/trailing
+    /// inset difference within which an element counts as centered.
+    pub center_tolerance: f64,
 }
 
 impl Default for ResizeOptions {
@@ -68,6 +77,9 @@ impl Default for ResizeOptions {
             max_font_px: 320.0,
             element_scale_min: 0.35,
             element_scale_max: 3.5,
+            edge_fraction: 0.06,
+            stretch_coverage: 0.82,
+            center_tolerance: 0.08,
         }
     }
 }
@@ -142,16 +154,6 @@ enum AxisMode {
     Proportional,
 }
 
-/// Fraction of a frame's extent within which an element edge counts as
-/// "pinned" to that edge.
-const EDGE_FRACTION: f64 = 0.06;
-/// Coverage (element extent ÷ frame extent) at or above which an
-/// edge-to-edge element is treated as spanning the axis.
-const STRETCH_COVERAGE: f64 = 0.82;
-/// Tolerance (as a fraction of frame extent) on the leading/trailing
-/// inset difference within which an element counts as centered.
-const CENTER_TOLERANCE: f64 = 0.08;
-
 /// Reflow `roots` (the direct children of the source frame, each with
 /// their own descendant subtrees) from `source` to `target`.
 ///
@@ -207,7 +209,7 @@ fn reflow(
     let rel_x = node.bounds.x - parent_old.x;
     let rel_y = node.bounds.y - parent_old.y;
 
-    let (h_mode, v_mode) = axis_modes(node, rel_x, rel_y, parent_old);
+    let (h_mode, v_mode) = axis_modes(node, rel_x, rel_y, parent_old, opts);
 
     let (nx_rel, nw) = solve_axis(
         h_mode,
@@ -258,30 +260,54 @@ fn reflow(
     }
 }
 
-/// Pick the [`AxisMode`] for each axis. Explicit (non-default)
-/// constraints win; otherwise geometry is used to infer anchoring.
+/// Pick the [`AxisMode`] for each axis **independently**. An explicit
+/// (non-`Fixed`) constraint on an axis wins; an axis left at the
+/// default `Fixed` value is inferred from the element's geometry.
+///
+/// Deciding per-axis — rather than treating the node as fully explicit
+/// the moment *either* axis is non-default — is what lets a design that
+/// pins only one axis (e.g. `horizontal: Center` with `vertical` left
+/// at its default) still get geometry inference on the untouched axis,
+/// instead of silently snapping it to the leading edge.
 fn axis_modes(
     node: &ResizeNode,
     rel_x: f64,
     rel_y: f64,
     parent_old: Bounds,
+    opts: &ResizeOptions,
 ) -> (AxisMode, AxisMode) {
-    if node.constraints == Constraints::default() {
-        (
-            classify_axis(rel_x, node.bounds.width, parent_old.width),
-            classify_axis(rel_y, node.bounds.height, parent_old.height),
-        )
-    } else {
-        (
-            constraint_axis_mode(node.constraints.horizontal),
-            constraint_axis_mode(node.constraints.vertical),
-        )
-    }
+    (
+        axis_mode(
+            node.constraints.horizontal,
+            rel_x,
+            node.bounds.width,
+            parent_old.width,
+            opts,
+        ),
+        axis_mode(
+            node.constraints.vertical,
+            rel_y,
+            node.bounds.height,
+            parent_old.height,
+            opts,
+        ),
+    )
 }
 
-const fn constraint_axis_mode(c: Constraint) -> AxisMode {
+/// Resolve a single axis: honour an explicit (non-`Fixed`) constraint,
+/// otherwise infer anchoring from the element's geometry. `Fixed` is
+/// the default/unset constraint, so it routes to inference rather than
+/// hard-pinning the leading edge.
+fn axis_mode(
+    c: Constraint,
+    origin: f64,
+    extent: f64,
+    parent: f64,
+    opts: &ResizeOptions,
+) -> AxisMode {
     match c {
-        Constraint::Fixed | Constraint::Min => AxisMode::Start,
+        Constraint::Fixed => classify_axis(origin, extent, parent, opts),
+        Constraint::Min => AxisMode::Start,
         Constraint::Max => AxisMode::End,
         Constraint::Center => AxisMode::Center,
         Constraint::Scale => AxisMode::Proportional,
@@ -291,19 +317,19 @@ const fn constraint_axis_mode(c: Constraint) -> AxisMode {
 
 /// Infer how an axis should reflow from where the element sits within
 /// its frame.
-fn classify_axis(origin: f64, extent: f64, parent: f64) -> AxisMode {
+fn classify_axis(origin: f64, extent: f64, parent: f64, opts: &ResizeOptions) -> AxisMode {
     if parent <= 0.0 {
         return AxisMode::Start;
     }
     let lead = origin;
     let trail = parent - (origin + extent);
     let coverage = extent / parent;
-    let edge = EDGE_FRACTION * parent;
-    let center_tol = CENTER_TOLERANCE * parent;
+    let edge = opts.edge_fraction * parent;
+    let center_tol = opts.center_tolerance * parent;
     let near_lead = lead <= edge;
     let near_trail = trail <= edge;
 
-    if coverage >= STRETCH_COVERAGE && near_lead && near_trail {
+    if coverage >= opts.stretch_coverage && near_lead && near_trail {
         AxisMode::Stretch
     } else if near_lead && !near_trail {
         AxisMode::Start
@@ -596,6 +622,82 @@ mod tests {
         // the new right edge.
         let right_gap = (A4.x + A4.width) - (nb.x + nb.width);
         assert!((right_gap - 30.0).abs() < 1e-6, "right_gap={right_gap}");
+    }
+
+    #[test]
+    fn mixed_constraint_infers_the_default_axis() {
+        // Horizontal is pinned (Center); vertical is left at its default
+        // (Fixed). Per-axis resolution must infer the vertical axis from
+        // geometry — a bottom-anchored element sticks to the bottom —
+        // rather than the old all-or-nothing path that snapped any
+        // default axis to the top the moment the other axis was set.
+        let id = Uuid::new_v4();
+        let mut n = ResizeNode::leaf(id, b(440.0, 1000.0, 200.0, 80.0));
+        n.constraints = Constraints {
+            horizontal: Constraint::Center,
+            vertical: Constraint::Fixed, // default / unset
+        };
+        let out = magic_resize(&[n], SQUARE, STORY, &ResizeOptions::default());
+        let nb = find(&out, id);
+        // Horizontal: stays centered (explicit).
+        let cx = nb.x - STORY.x + nb.width * 0.5;
+        assert!((cx - STORY.width * 0.5).abs() < 1.0, "cx={cx}");
+        // Vertical: inferred bottom-anchor → bottom edge tracks the
+        // frame bottom (NOT snapped to the top).
+        let bottom_gap = (STORY.y + STORY.height) - (nb.y + nb.height);
+        assert!(bottom_gap.abs() < 1.0, "bottom_gap={bottom_gap}");
+    }
+
+    #[test]
+    fn stretch_coverage_threshold_is_tunable() {
+        // A near-full-width bar (90% coverage, edges 5% in) sits above
+        // the default stretch threshold. With the default options the
+        // engine infers Stretch and the bar spans the new width; raising
+        // `stretch_coverage` above the bar's coverage reclassifies it as
+        // Center, so it scales about its midpoint instead. This proves
+        // the inference thresholds are honoured from `ResizeOptions`
+        // rather than baked-in constants.
+        const WIDER: Bounds = Bounds {
+            x: 7000.0,
+            y: 0.0,
+            width: 1620.0,
+            height: 1080.0,
+        };
+        let id = Uuid::new_v4();
+        let bar = ResizeNode::leaf(id, b(54.0, 0.0, 972.0, 120.0));
+
+        let spanned = magic_resize(
+            std::slice::from_ref(&bar),
+            SQUARE,
+            WIDER,
+            &ResizeOptions::default(),
+        );
+        let sb = find(&spanned, id);
+        // Stretch: original 5% insets kept, so it covers most of 1620.
+        assert!(sb.width > 1400.0, "stretched width={}", sb.width);
+        assert!(
+            (sb.x - (WIDER.x + 54.0)).abs() < 1.0,
+            "stretched x={}",
+            sb.x
+        );
+
+        let opts = ResizeOptions {
+            stretch_coverage: 0.95,
+            ..ResizeOptions::default()
+        };
+        let centered = magic_resize(std::slice::from_ref(&bar), SQUARE, WIDER, &opts);
+        let cb = find(&centered, id);
+        // Center: scales about its midpoint → markedly narrower than the
+        // stretched result, and stays centered in the new frame.
+        assert!(cb.width < 1250.0, "centered width={}", cb.width);
+        assert!(
+            sb.width > cb.width + 200.0,
+            "threshold had no effect: {} vs {}",
+            sb.width,
+            cb.width
+        );
+        let cx = cb.x - WIDER.x + cb.width * 0.5;
+        assert!((cx - WIDER.width * 0.5).abs() < 1.0, "cx={cx}");
     }
 
     #[test]

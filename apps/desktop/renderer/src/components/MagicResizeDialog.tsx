@@ -58,11 +58,18 @@ export function MagicResizeDialog({
   onClose,
 }: MagicResizeDialogProps): JSX.Element | null {
   const [selected, setSelected] = useState<ReadonlySet<string>>(new Set());
+  // Latched once the user confirms, so a second click can't fire a
+  // duplicate `onResize` (and spawn duplicate artboards) during the
+  // window before the parent's async handler closes the dialog.
+  const [submitting, setSubmitting] = useState(false);
 
-  // Reset the selection whenever the dialog (re)opens or the source
-  // artboard changes, so a prior session's picks don't linger.
+  // Reset the selection + submit latch whenever the dialog (re)opens or
+  // the source artboard changes, so a prior session's picks don't linger.
   useEffect(() => {
-    if (open) setSelected(new Set());
+    if (open) {
+      setSelected(new Set());
+      setSubmitting(false);
+    }
   }, [open, source?.id]);
 
   // Close-on-ESC. Capture phase so the dialog beats editor shortcuts.
@@ -101,16 +108,19 @@ export function MagicResizeDialog({
   };
 
   const submit = (): void => {
+    if (submitting) return;
     const targets: ResizeTarget[] = [];
     for (const key of selected) {
       const preset = byKey.get(key);
       if (preset) targets.push({ preset: preset.name });
     }
     if (targets.length === 0) return;
+    setSubmitting(true);
     onResize(targets);
   };
 
   const count = selected.size;
+  const submitDisabled = count === 0 || submitting;
 
   return (
     <div
@@ -244,14 +254,18 @@ export function MagicResizeDialog({
           <button
             type="button"
             onClick={submit}
-            disabled={count === 0}
+            disabled={submitDisabled}
             style={{
               ...primaryButton,
-              opacity: count === 0 ? 0.5 : 1,
-              cursor: count === 0 ? "not-allowed" : "pointer",
+              opacity: submitDisabled ? 0.5 : 1,
+              cursor: submitDisabled ? "not-allowed" : "pointer",
             }}
           >
-            {count <= 1 ? "Generate resize" : `Generate ${count} resizes`}
+            {submitting
+              ? "Generating…"
+              : count <= 1
+                ? "Generate resize"
+                : `Generate ${count} resizes`}
           </button>
         </footer>
       </div>

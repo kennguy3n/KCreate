@@ -673,6 +673,13 @@ function EditorPageInner({
     [refreshTree, focusArtboard, setStatusMessage],
   );
 
+  // Stable identity (like `handlePrototypeClose`) so the dialog's
+  // close-on-ESC `useEffect` doesn't re-subscribe its keydown listener
+  // on every unrelated `EditorPage` re-render.
+  const handleMagicResizeClose = useCallback((): void => {
+    setMagicResizeSource(null);
+  }, []);
+
   const handleRenameArtboard = useCallback(
     async (id: string, name: string) => {
       try {
@@ -2492,7 +2499,7 @@ function EditorPageInner({
             void handleMagicResize(magicResizeSource.id, targets);
           }
         }}
-        onClose={() => setMagicResizeSource(null)}
+        onClose={handleMagicResizeClose}
       />
       <TemplatePicker
         open={templatePickerOpen}

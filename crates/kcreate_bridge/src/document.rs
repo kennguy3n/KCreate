@@ -3890,7 +3890,10 @@ struct ResolvedResizeTarget {
     height: f64,
 }
 
-fn resolve_resize_target(spec: &ResizeTargetSpec) -> Result<ResolvedResizeTarget> {
+fn resolve_resize_target(
+    spec: &ResizeTargetSpec,
+    presets: &[kcreate_core::ArtboardPreset],
+) -> Result<ResolvedResizeTarget> {
     // Explicit dimensions take precedence over a preset name so a
     // caller can override a preset's size while keeping its label.
     if let (Some(width), Some(height)) = (spec.width, spec.height) {
@@ -3910,8 +3913,8 @@ fn resolve_resize_target(spec: &ResizeTargetSpec) -> Result<ResolvedResizeTarget
 
     if let Some(preset_name) = spec.preset.as_deref() {
         let trimmed = preset_name.trim();
-        let preset = kcreate_core::standard_presets()
-            .into_iter()
+        let preset = presets
+            .iter()
             .find(|p| p.name.eq_ignore_ascii_case(trimmed))
             .ok_or_else(|| DocumentBridgeError::InvalidArgument {
                 argument: "preset".to_string(),
@@ -4098,10 +4101,13 @@ pub fn magic_resize(source_artboard_id: Uuid, targets: &[ResizeTargetSpec]) -> R
         });
     }
     // Resolve + validate every target up front so a bad spec aborts
-    // before we mutate the graph (all-or-nothing).
+    // before we mutate the graph (all-or-nothing). The preset
+    // catalogue is built once and shared across targets rather than
+    // rebuilt per spec.
+    let presets = kcreate_core::standard_presets();
     let resolved = targets
         .iter()
-        .map(resolve_resize_target)
+        .map(|spec| resolve_resize_target(spec, &presets))
         .collect::<Result<Vec<_>>>()?;
 
     let mut guard = slot().write();

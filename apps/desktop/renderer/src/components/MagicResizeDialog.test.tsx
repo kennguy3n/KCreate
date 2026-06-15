@@ -144,6 +144,35 @@ describe("MagicResizeDialog", () => {
     expect(newIds).toEqual(["story-id", "a4-id"]);
   });
 
+  it("does not fire a second resize while the first is in flight", () => {
+    let resizeCalls = 0;
+    render(
+      <MagicResizeDialog
+        open
+        source={SOURCE}
+        presets={PRESETS}
+        // The parent stays "busy" (does not close the dialog yet),
+        // mirroring the async bridge round-trip window during which a
+        // second click must not spawn duplicate artboards.
+        onResize={() => {
+          resizeCalls += 1;
+        }}
+        onClose={() => {}}
+      />,
+    );
+    fireEvent.click(screen.getByRole("checkbox", { name: /Instagram Story/ }));
+    const generate = screen.getByRole("button", { name: /Generate/ });
+    fireEvent.click(generate);
+    expect(resizeCalls).toBe(1);
+
+    // The action latches: disabled + shows progress.
+    expect(generate).toBeDisabled();
+    expect(generate).toHaveTextContent(/Generating/);
+
+    fireEvent.click(generate);
+    expect(resizeCalls).toBe(1);
+  });
+
   it("Cancel closes without resizing", () => {
     let closed = false;
     let resized = false;

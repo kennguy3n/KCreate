@@ -1929,7 +1929,14 @@ fn mobile_checkout() -> BundledTemplate {
     s.bg("#F8FAFC");
     phone_status_bar(&mut s, "#0F172A");
     s.text(72.0, 150.0, 56.0, "#0F172A", "Checkout", "Title");
-    s.text(72.0, 240.0, 32.0, "#64748B", "Step 3 of 3 · Payment", "Step");
+    s.text(
+        72.0,
+        240.0,
+        32.0,
+        "#64748B",
+        "Step 3 of 3 · Payment",
+        "Step",
+    );
     // Order summary card.
     s.rect(72.0, 320.0, 936.0, 520.0, "#FFFFFF", "Summary card");
     s.rect(72.0, 320.0, 936.0, 12.0, "#6366F1", "Summary accent");
@@ -1958,7 +1965,14 @@ fn mobile_checkout() -> BundledTemplate {
     // Address.
     s.rect(72.0, 1160.0, 936.0, 150.0, "#FFFFFF", "Address row");
     s.text(112.0, 1200.0, 36.0, "#0F172A", "Jordan Rivera", "Addr name");
-    s.text(112.0, 1252.0, 28.0, "#64748B", "128 Market St, SF", "Addr line");
+    s.text(
+        112.0,
+        1252.0,
+        28.0,
+        "#64748B",
+        "128 Market St, SF",
+        "Addr line",
+    );
     // Pay button.
     s.rect(72.0, 1900.0, 936.0, 160.0, "#6366F1", "Pay button");
     s.text_center(540.0, 1948.0, 48.0, "#FFFFFF", "Pay $156.00", "Pay label");
@@ -1984,7 +1998,14 @@ fn mobile_signup() -> BundledTemplate {
     phone_status_bar(&mut s, "#F5F3FF");
     s.text(72.0, 360.0, 76.0, "#FFFFFF", "Create", "Title 1");
     s.text(72.0, 460.0, 76.0, "#DDD6FE", "account", "Title 2");
-    s.text(72.0, 600.0, 34.0, "#E9D5FF", "Join 2M+ creators today", "Subtitle");
+    s.text(
+        72.0,
+        600.0,
+        34.0,
+        "#E9D5FF",
+        "Join 2M+ creators today",
+        "Subtitle",
+    );
     let fields = [
         ("Full name", "Jordan Rivera"),
         ("Email address", "jordan@mail.com"),
@@ -2000,7 +2021,14 @@ fn mobile_signup() -> BundledTemplate {
     s.rect(72.0, 1620.0, 936.0, 150.0, "#7C3AED", "Sign up button");
     s.text_center(540.0, 1664.0, 46.0, "#FFFFFF", "Create account", "Button");
     s.rect(112.0, 1840.0, 856.0, 3.0, "#E2E8F0", "Divider");
-    s.text_center(540.0, 1900.0, 32.0, "#64748B", "Already have an account? Log in", "Footer");
+    s.text_center(
+        540.0,
+        1900.0,
+        32.0,
+        "#64748B",
+        "Already have an account? Log in",
+        "Footer",
+    );
     BundledTemplate {
         dir_name: "mobile-signup.ktemplate",
         manifest: manifest(
@@ -2022,7 +2050,14 @@ fn mobile_search() -> BundledTemplate {
     // Search field.
     s.rect(72.0, 250.0, 936.0, 130.0, "#1E293B", "Search field");
     s.circle(140.0, 315.0, 26.0, "#38BDF8", "Search icon");
-    s.text(200.0, 290.0, 36.0, "#94A3B8", "Search photos, people…", "Search hint");
+    s.text(
+        200.0,
+        290.0,
+        36.0,
+        "#94A3B8",
+        "Search photos, people…",
+        "Search hint",
+    );
     // Filter chips.
     let chips = ["All", "Design", "Nature", "Travel", "Food"];
     let mut cx = 72.0;
@@ -2091,7 +2126,14 @@ fn mobile_chat() -> BundledTemplate {
     // Composer.
     s.rect(0.0, PHONE_H - 200.0, PHONE_W, 200.0, "#FFFFFF", "Composer");
     s.rect(72.0, PHONE_H - 160.0, 760.0, 120.0, "#EAF2F8", "Input");
-    s.text(120.0, PHONE_H - 130.0, 34.0, "#94A3B8", "Message…", "Input hint");
+    s.text(
+        120.0,
+        PHONE_H - 130.0,
+        34.0,
+        "#94A3B8",
+        "Message…",
+        "Input hint",
+    );
     s.circle(930.0, PHONE_H - 100.0, 60.0, "#2563EB", "Send");
     BundledTemplate {
         dir_name: "mobile-chat.ktemplate",
@@ -2114,10 +2156,25 @@ fn mobile_notifications() -> BundledTemplate {
     s.text(820.0, 168.0, 30.0, "#6366F1", "Mark all", "Action");
     let items = [
         ("#6366F1", "New comment", "Maya replied to your post.", "2m"),
-        ("#10B981", "Payment received", "$129.00 from Acme Co.", "18m"),
+        (
+            "#10B981",
+            "Payment received",
+            "$129.00 from Acme Co.",
+            "18m",
+        ),
         ("#F59E0B", "Reminder", "Design review at 3:00 PM.", "1h"),
-        ("#EC4899", "New follower", "Leo started following you.", "3h"),
-        ("#06B6D4", "Backup complete", "Project synced to device.", "5h"),
+        (
+            "#EC4899",
+            "New follower",
+            "Leo started following you.",
+            "3h",
+        ),
+        (
+            "#06B6D4",
+            "Backup complete",
+            "Project synced to device.",
+            "5h",
+        ),
         ("#8B5CF6", "Update ready", "Version 2.4 is available.", "1d"),
     ];
     let mut y = 280.0;
@@ -2155,7 +2212,14 @@ fn mobile_dashboard() -> BundledTemplate {
     s.ellipse_a(960.0, 360.0, 240.0, 240.0, "#A5B4FC", 0.25, "Card glow");
     s.text(120.0, 380.0, 32.0, "#E0E7FF", "Total balance", "Bal label");
     s.text(120.0, 440.0, 96.0, "#FFFFFF", "$48,920", "Bal value");
-    s.text(120.0, 580.0, 32.0, "#C7D2FE", "+12.4% this month", "Bal delta");
+    s.text(
+        120.0,
+        580.0,
+        32.0,
+        "#C7D2FE",
+        "+12.4% this month",
+        "Bal delta",
+    );
     // Stat tiles.
     let stats = [
         ("#10B981", "Income", "$12.4k"),
@@ -2207,7 +2271,14 @@ fn mobile_wallet() -> BundledTemplate {
         s.ellipse_a(960.0, y + 60.0, 200.0, 200.0, accent, 0.30, "Card glow");
         s.rect(120.0, y + 60.0, 110.0, 80.0, accent, "Card chip");
         s.text(120.0, y + 230.0, 48.0, "#FFFFFF", no, "Card number");
-        s.text(120.0, y + 320.0, 28.0, "#CBD5E1", "JORDAN RIVERA", "Card holder");
+        s.text(
+            120.0,
+            y + 320.0,
+            28.0,
+            "#CBD5E1",
+            "JORDAN RIVERA",
+            "Card holder",
+        );
     }
     // Quick actions.
     let actions = [
@@ -2223,7 +2294,11 @@ fn mobile_wallet() -> BundledTemplate {
     }
     // Transactions.
     s.text(72.0, 1380.0, 36.0, "#0F172A", "Recent", "Recent H");
-    let tx = [("Spotify", "-$9.99"), ("Salary", "+$4,200"), ("Groceries", "-$64.20")];
+    let tx = [
+        ("Spotify", "-$9.99"),
+        ("Salary", "+$4,200"),
+        ("Groceries", "-$64.20"),
+    ];
     let mut ty = 1450.0;
     for (label, amount) in tx {
         s.rect(72.0, ty, 936.0, 140.0, "#FFFFFF", "Tx row");
@@ -2252,7 +2327,14 @@ fn mobile_paywall() -> BundledTemplate {
     phone_status_bar(&mut s, "#E0E7FF");
     s.circle(540.0, 360.0, 120.0, "#FBBF24", "Crown");
     s.text_center(540.0, 560.0, 72.0, "#FFFFFF", "Go Premium", "Title");
-    s.text_center(540.0, 670.0, 36.0, "#C7D2FE", "Unlock every pro feature", "Subtitle");
+    s.text_center(
+        540.0,
+        670.0,
+        36.0,
+        "#C7D2FE",
+        "Unlock every pro feature",
+        "Subtitle",
+    );
     let perks = [
         "Unlimited exports in 4K",
         "Remove watermarks",
@@ -2275,8 +2357,22 @@ fn mobile_paywall() -> BundledTemplate {
     s.text_center(780.0, 1420.0, 52.0, "#FFFFFF", "$59.99", "Plan price");
     // CTA.
     s.rect(72.0, 1720.0, 936.0, 160.0, "#FBBF24", "CTA");
-    s.text_center(540.0, 1768.0, 46.0, "#1E1B4B", "Start free trial", "CTA label");
-    s.text_center(540.0, 1940.0, 28.0, "#A5B4FC", "7 days free, cancel anytime", "Fine print");
+    s.text_center(
+        540.0,
+        1768.0,
+        46.0,
+        "#1E1B4B",
+        "Start free trial",
+        "CTA label",
+    );
+    s.text_center(
+        540.0,
+        1940.0,
+        28.0,
+        "#A5B4FC",
+        "7 days free, cancel anytime",
+        "Fine print",
+    );
     BundledTemplate {
         dir_name: "mobile-paywall.ktemplate",
         manifest: manifest(
@@ -2312,8 +2408,22 @@ fn mobile_product() -> BundledTemplate {
     for (i, hex) in swatches.iter().enumerate() {
         s.circle(120.0 + i as f64 * 110.0, 1400.0, 42.0, hex, "Swatch");
     }
-    s.text(72.0, 1500.0, 32.0, "#475569", "Sculpted oak frame with a soft", "Desc 1");
-    s.text(72.0, 1550.0, 32.0, "#475569", "boucle seat — built to last.", "Desc 2");
+    s.text(
+        72.0,
+        1500.0,
+        32.0,
+        "#475569",
+        "Sculpted oak frame with a soft",
+        "Desc 1",
+    );
+    s.text(
+        72.0,
+        1550.0,
+        32.0,
+        "#475569",
+        "boucle seat — built to last.",
+        "Desc 2",
+    );
     // Add to cart.
     s.rect(72.0, 1860.0, 600.0, 160.0, "#0F172A", "Add to cart");
     s.text_center(372.0, 1908.0, 42.0, "#FFFFFF", "Add to cart", "Cart label");
@@ -2355,9 +2465,20 @@ fn mobile_cart() -> BundledTemplate {
     }
     // Promo.
     s.rect(72.0, 1280.0, 936.0, 130.0, "#ECFDF5", "Promo");
-    s.text(120.0, 1318.0, 34.0, "#047857", "Promo: SPRING20 applied", "Promo text");
+    s.text(
+        120.0,
+        1318.0,
+        34.0,
+        "#047857",
+        "Promo: SPRING20 applied",
+        "Promo text",
+    );
     // Totals.
-    let totals = [("Subtotal", "$556.00"), ("Shipping", "$12.00"), ("Discount", "-$111.20")];
+    let totals = [
+        ("Subtotal", "$556.00"),
+        ("Shipping", "$12.00"),
+        ("Discount", "-$111.20"),
+    ];
     let mut ty = 1470.0;
     for (label, value) in totals {
         s.text(72.0, ty, 34.0, "#64748B", label, "Total label");
@@ -2388,8 +2509,22 @@ fn mobile_delivery() -> BundledTemplate {
     // Map area.
     s.rect(0.0, 0.0, PHONE_W, 1120.0, "#C8E6C9", "Map");
     for i in 0..5 {
-        s.rect(0.0, 180.0 + f64::from(i) * 220.0, PHONE_W, 6.0, "#A5D6A7", "Map road");
-        s.rect(120.0 + f64::from(i) * 200.0, 0.0, 6.0, 1120.0, "#A5D6A7", "Map road v");
+        s.rect(
+            0.0,
+            180.0 + f64::from(i) * 220.0,
+            PHONE_W,
+            6.0,
+            "#A5D6A7",
+            "Map road",
+        );
+        s.rect(
+            120.0 + f64::from(i) * 200.0,
+            0.0,
+            6.0,
+            1120.0,
+            "#A5D6A7",
+            "Map road v",
+        );
     }
     // Route + pins.
     s.circle(280.0, 880.0, 36.0, "#1B5E20", "Pin start");
@@ -2417,7 +2552,14 @@ fn mobile_delivery() -> BundledTemplate {
     s.rect(72.0, 1620.0, 936.0, 220.0, "#F1F5F9", "Courier card");
     s.circle(190.0, 1730.0, 80.0, "#A5D6A7", "Courier avatar");
     s.text(320.0, 1670.0, 40.0, "#0F172A", "Marcus D.", "Courier name");
-    s.text(320.0, 1730.0, 30.0, "#64748B", "★ 4.95 · Toyota Prius", "Courier meta");
+    s.text(
+        320.0,
+        1730.0,
+        30.0,
+        "#64748B",
+        "★ 4.95 · Toyota Prius",
+        "Courier meta",
+    );
     s.circle(870.0, 1730.0, 56.0, "#16A34A", "Call");
     s.rect(72.0, 1900.0, 936.0, 150.0, "#16A34A", "Track button");
     s.text_center(540.0, 1944.0, 44.0, "#FFFFFF", "Track order", "Track label");
@@ -2461,7 +2603,14 @@ fn mobile_fitness() -> BundledTemplate {
     }
     // Start workout.
     s.rect(72.0, 1680.0, 936.0, 170.0, "#22D3EE", "Start button");
-    s.text_center(540.0, 1730.0, 46.0, "#0B1120", "Start workout", "Start label");
+    s.text_center(
+        540.0,
+        1730.0,
+        46.0,
+        "#0B1120",
+        "Start workout",
+        "Start label",
+    );
     phone_tab_bar(&mut s, "#111827", "#22D3EE", "#475569");
     BundledTemplate {
         dir_name: "mobile-fitness.ktemplate",
@@ -2486,9 +2635,22 @@ fn mobile_weather() -> BundledTemplate {
     // Big sun + temp.
     s.circle(540.0, 560.0, 150.0, "#FBBF24", "Sun");
     s.text_center(540.0, 760.0, 160.0, "#FFFFFF", "21°", "Temp");
-    s.text_center(540.0, 940.0, 38.0, "#BFDBFE", "Mostly sunny · H 24° L 16°", "Cond");
+    s.text_center(
+        540.0,
+        940.0,
+        38.0,
+        "#BFDBFE",
+        "Mostly sunny · H 24° L 16°",
+        "Cond",
+    );
     // Hourly strip.
-    let hours = [("09", "20°"), ("12", "23°"), ("15", "24°"), ("18", "21°"), ("21", "18°")];
+    let hours = [
+        ("09", "20°"),
+        ("12", "23°"),
+        ("15", "24°"),
+        ("18", "21°"),
+        ("21", "18°"),
+    ];
     for (i, (hr, t)) in hours.iter().enumerate() {
         let x = 72.0 + i as f64 * 190.0;
         s.rect(x, 1120.0, 168.0, 320.0, "#2563EB", "Hour tile");
@@ -2497,7 +2659,12 @@ fn mobile_weather() -> BundledTemplate {
         s.text_center(x + 84.0, 1360.0, 34.0, "#FFFFFF", t, "Hour temp");
     }
     // Daily forecast.
-    let days = [("Mon", "24°", "16°"), ("Tue", "22°", "15°"), ("Wed", "19°", "14°"), ("Thu", "25°", "17°")];
+    let days = [
+        ("Mon", "24°", "16°"),
+        ("Tue", "22°", "15°"),
+        ("Wed", "19°", "14°"),
+        ("Thu", "25°", "17°"),
+    ];
     let mut y = 1520.0;
     for (day, hi, lo) in days {
         s.text(100.0, y, 36.0, "#FFFFFF", day, "Day");
@@ -2531,7 +2698,14 @@ fn mobile_splash() -> BundledTemplate {
     s.rect(470.0, 690.0, 140.0, 140.0, "#0F172A", "Logo cut");
     s.circle(540.0, 760.0, 56.0, "#22D3EE", "Logo dot");
     s.text_center(540.0, 1040.0, 84.0, "#F8FAFC", "Nimbus", "Wordmark");
-    s.text_center(540.0, 1160.0, 36.0, "#94A3B8", "Design, anywhere", "Tagline");
+    s.text_center(
+        540.0,
+        1160.0,
+        36.0,
+        "#94A3B8",
+        "Design, anywhere",
+        "Tagline",
+    );
     // Loading bar.
     s.rect(320.0, 1860.0, 440.0, 16.0, "#1E293B", "Loader track");
     s.rect(320.0, 1860.0, 280.0, 16.0, "#6366F1", "Loader fill");
@@ -2562,7 +2736,14 @@ fn deck_section() -> BundledTemplate {
     s.text(160.0, 440.0, 150.0, "#F8FAFC", "Go-to-market", "Title 1");
     s.text(160.0, 600.0, 150.0, "#94A3B8", "strategy", "Title 2");
     s.rect(160.0, 800.0, 360.0, 8.0, "#F59E0B", "Underline");
-    s.text(160.0, 860.0, 36.0, "#CBD5E1", "How we reach the first 10,000 customers", "Caption");
+    s.text(
+        160.0,
+        860.0,
+        36.0,
+        "#CBD5E1",
+        "How we reach the first 10,000 customers",
+        "Caption",
+    );
     BundledTemplate {
         dir_name: "deck-section.ktemplate",
         manifest: manifest(
@@ -2581,13 +2762,41 @@ fn deck_quote() -> BundledTemplate {
     s.bg("#F8FAFC");
     s.rect(0.0, 0.0, SLIDE_W, 16.0, "#6366F1", "Top rule");
     s.text(150.0, 120.0, 220.0, "#C7D2FE", "\u{201C}", "Quote mark");
-    s.text(300.0, 360.0, 72.0, "#0F172A", "Design is not just what it", "Quote 1");
-    s.text(300.0, 470.0, 72.0, "#0F172A", "looks like and feels like.", "Quote 2");
-    s.text(300.0, 580.0, 72.0, "#6366F1", "Design is how it works.", "Quote 3");
+    s.text(
+        300.0,
+        360.0,
+        72.0,
+        "#0F172A",
+        "Design is not just what it",
+        "Quote 1",
+    );
+    s.text(
+        300.0,
+        470.0,
+        72.0,
+        "#0F172A",
+        "looks like and feels like.",
+        "Quote 2",
+    );
+    s.text(
+        300.0,
+        580.0,
+        72.0,
+        "#6366F1",
+        "Design is how it works.",
+        "Quote 3",
+    );
     s.rect(300.0, 740.0, 120.0, 8.0, "#6366F1", "Rule");
     s.circle(330.0, 860.0, 50.0, "#A5B4FC", "Author avatar");
     s.text(410.0, 820.0, 40.0, "#0F172A", "Steve Jobs", "Author");
-    s.text(410.0, 880.0, 30.0, "#64748B", "Co-founder, Apple", "Author role");
+    s.text(
+        410.0,
+        880.0,
+        30.0,
+        "#64748B",
+        "Co-founder, Apple",
+        "Author role",
+    );
     BundledTemplate {
         dir_name: "deck-quote.ktemplate",
         manifest: manifest(
@@ -2605,7 +2814,14 @@ fn deck_chart_bar() -> BundledTemplate {
     let mut s = Sheet::new(SLIDE_W, SLIDE_H);
     s.bg("#FFFFFF");
     s.text(150.0, 110.0, 64.0, "#0F172A", "Revenue by quarter", "Title");
-    s.text(150.0, 200.0, 32.0, "#64748B", "FY2025 · in millions USD", "Subtitle");
+    s.text(
+        150.0,
+        200.0,
+        32.0,
+        "#64748B",
+        "FY2025 · in millions USD",
+        "Subtitle",
+    );
     // Axis.
     s.rect(150.0, 880.0, 1620.0, 6.0, "#E2E8F0", "X axis");
     let bars = [
@@ -2619,7 +2835,14 @@ fn deck_chart_bar() -> BundledTemplate {
         let h = 560.0 * frac;
         s.rect(x, 880.0 - h, 220.0, h, "#6366F1", "Bar");
         s.rect(x, 880.0 - h, 220.0, 16.0, "#A5B4FC", "Bar cap");
-        s.text_center(x + 110.0, 880.0 - h - 60.0, 36.0, "#0F172A", value, "Bar value");
+        s.text_center(
+            x + 110.0,
+            880.0 - h - 60.0,
+            36.0,
+            "#0F172A",
+            value,
+            "Bar value",
+        );
         s.text_center(x + 110.0, 920.0, 34.0, "#64748B", label, "Bar label");
     }
     s.text(150.0, 1000.0, 30.0, "#10B981", "▲ 112% YoY growth", "Note");
@@ -2643,7 +2866,12 @@ fn deck_comparison() -> BundledTemplate {
     // Two panels.
     s.rect(150.0, 260.0, 760.0, 720.0, "#1E293B", "Panel old");
     s.text(210.0, 320.0, 44.0, "#94A3B8", "The old way", "Old H");
-    let old = ["Manual exports", "No version history", "Locked file formats", "Slow approvals"];
+    let old = [
+        "Manual exports",
+        "No version history",
+        "Locked file formats",
+        "Slow approvals",
+    ];
     let mut oy = 440.0;
     for line in old {
         s.circle(240.0, oy + 18.0, 18.0, "#EF4444", "X dot");
@@ -2652,7 +2880,12 @@ fn deck_comparison() -> BundledTemplate {
     }
     s.rect(1010.0, 260.0, 760.0, 720.0, "#4338CA", "Panel new");
     s.text(1070.0, 320.0, 44.0, "#E0E7FF", "With KCreate", "New H");
-    let new = ["One-click batch export", "Full undo timeline", "Open .kstudio format", "Instant remix"];
+    let new = [
+        "One-click batch export",
+        "Full undo timeline",
+        "Open .kstudio format",
+        "Instant remix",
+    ];
     let mut ny = 440.0;
     for line in new {
         s.circle(1100.0, ny + 18.0, 18.0, "#34D399", "Check dot");
@@ -2686,7 +2919,14 @@ fn deck_timeline() -> BundledTemplate {
     for (i, (hex, q, label)) in nodes.iter().enumerate() {
         let x = 320.0 + i as f64 * 380.0;
         s.circle(x, 564.0, 40.0, hex, "Node");
-        s.rect(x - 3.0, if i % 2 == 0 { 360.0 } else { 600.0 }, 6.0, 160.0, hex, "Stem");
+        s.rect(
+            x - 3.0,
+            if i % 2 == 0 { 360.0 } else { 600.0 },
+            6.0,
+            160.0,
+            hex,
+            "Stem",
+        );
         let cy = if i % 2 == 0 { 300.0 } else { 760.0 };
         s.text_center(x, cy, 40.0, hex, q, "Quarter");
         s.text_center(x, cy + 56.0, 32.0, "#475569", label, "Milestone");
@@ -2711,7 +2951,14 @@ fn deck_closing() -> BundledTemplate {
     s.ellipse_a(1700.0, 180.0, 420.0, 420.0, "#6366F1", 0.45, "Glow B");
     s.text_center(960.0, 380.0, 150.0, "#FFFFFF", "Thank you", "Title");
     s.rect(810.0, 580.0, 300.0, 8.0, "#A5B4FC", "Rule");
-    s.text_center(960.0, 640.0, 40.0, "#C7D2FE", "Let's build something great together", "Subtitle");
+    s.text_center(
+        960.0,
+        640.0,
+        40.0,
+        "#C7D2FE",
+        "Let's build something great together",
+        "Subtitle",
+    );
     let contacts = ["hello@kcreate.app", "kcreate.app", "@kcreate"];
     for (i, c) in contacts.iter().enumerate() {
         let x = 520.0 + i as f64 * 320.0;
@@ -2737,9 +2984,30 @@ fn deck_bignum() -> BundledTemplate {
     s.rect(0.0, 0.0, SLIDE_W, 16.0, "#10B981", "Top rule");
     s.text(150.0, 200.0, 40.0, "#10B981", "THE OPPORTUNITY", "Eyebrow");
     s.text_center(960.0, 360.0, 320.0, "#0F172A", "92%", "Big number");
-    s.text_center(960.0, 760.0, 48.0, "#475569", "of teams say their current tools", "Body 1");
-    s.text_center(960.0, 830.0, 48.0, "#475569", "slow down creative work", "Body 2");
-    s.text_center(960.0, 960.0, 28.0, "#94A3B8", "Source: 2025 Creative Workflow Survey, n=4,200", "Source");
+    s.text_center(
+        960.0,
+        760.0,
+        48.0,
+        "#475569",
+        "of teams say their current tools",
+        "Body 1",
+    );
+    s.text_center(
+        960.0,
+        830.0,
+        48.0,
+        "#475569",
+        "slow down creative work",
+        "Body 2",
+    );
+    s.text_center(
+        960.0,
+        960.0,
+        28.0,
+        "#94A3B8",
+        "Source: 2025 Creative Workflow Survey, n=4,200",
+        "Source",
+    );
     BundledTemplate {
         dir_name: "deck-bignum.ktemplate",
         manifest: manifest(
@@ -2758,9 +3026,24 @@ fn deck_process() -> BundledTemplate {
     s.bg("#0B1120");
     s.text(150.0, 110.0, 64.0, "#F8FAFC", "How it works", "Title");
     let steps = [
-        ("#6366F1", "1", "Import", "Drop in any design or .kstudio file"),
-        ("#06B6D4", "2", "Remix", "Edit layers, colors, and copy freely"),
-        ("#10B981", "3", "Export", "Ship PNG, SVG, or print-ready PDF"),
+        (
+            "#6366F1",
+            "1",
+            "Import",
+            "Drop in any design or .kstudio file",
+        ),
+        (
+            "#06B6D4",
+            "2",
+            "Remix",
+            "Edit layers, colors, and copy freely",
+        ),
+        (
+            "#10B981",
+            "3",
+            "Export",
+            "Ship PNG, SVG, or print-ready PDF",
+        ),
     ];
     for (i, (hex, num, title, body)) in steps.iter().enumerate() {
         let x = 150.0 + i as f64 * 560.0;
@@ -2805,12 +3088,32 @@ fn deck_pricing() -> BundledTemplate {
         }
         s.text(x + 50.0, y + 60.0, 40.0, ink, name, "Plan name");
         s.text(x + 50.0, y + 150.0, 96.0, ink, price, "Plan price");
-        s.text(x + 50.0, y + 280.0, 30.0, if i == 1 { "#C7D2FE" } else { "#64748B" }, who, "Plan who");
+        s.text(
+            x + 50.0,
+            y + 280.0,
+            30.0,
+            if i == 1 { "#C7D2FE" } else { "#64748B" },
+            who,
+            "Plan who",
+        );
         let feats = ["Unlimited projects", "Cloud backup", "Export everything"];
         let mut fy = y + 360.0;
         for f in feats {
-            s.circle(x + 70.0, fy + 14.0, 12.0, if i == 1 { "#34D399" } else { "#6366F1" }, "Feat dot");
-            s.text(x + 100.0, fy, 26.0, if i == 1 { "#E0E7FF" } else { "#475569" }, f, "Feat");
+            s.circle(
+                x + 70.0,
+                fy + 14.0,
+                12.0,
+                if i == 1 { "#34D399" } else { "#6366F1" },
+                "Feat dot",
+            );
+            s.text(
+                x + 100.0,
+                fy,
+                26.0,
+                if i == 1 { "#E0E7FF" } else { "#475569" },
+                f,
+                "Feat",
+            );
             fy += 60.0;
         }
     }
@@ -2834,11 +3137,39 @@ fn deck_testimonial() -> BundledTemplate {
     s.ellipse_a(380.0, 540.0, 280.0, 280.0, "#6366F1", 0.45, "Avatar glow");
     s.circle(380.0, 480.0, 180.0, "#A5B4FC", "Avatar");
     s.text_center(380.0, 720.0, 44.0, "#FFFFFF", "Mara Lopez", "Name");
-    s.text_center(380.0, 780.0, 30.0, "#C7D2FE", "Head of Design, Northwind", "Role");
+    s.text_center(
+        380.0,
+        780.0,
+        30.0,
+        "#C7D2FE",
+        "Head of Design, Northwind",
+        "Role",
+    );
     s.text(880.0, 280.0, 120.0, "#312E81", "\u{201C}", "Quote mark");
-    s.text(880.0, 420.0, 54.0, "#F8FAFC", "KCreate replaced four tools", "Quote 1");
-    s.text(880.0, 500.0, 54.0, "#F8FAFC", "in our stack and cut our", "Quote 2");
-    s.text(880.0, 580.0, 54.0, "#F8FAFC", "production time in half.", "Quote 3");
+    s.text(
+        880.0,
+        420.0,
+        54.0,
+        "#F8FAFC",
+        "KCreate replaced four tools",
+        "Quote 1",
+    );
+    s.text(
+        880.0,
+        500.0,
+        54.0,
+        "#F8FAFC",
+        "in our stack and cut our",
+        "Quote 2",
+    );
+    s.text(
+        880.0,
+        580.0,
+        54.0,
+        "#F8FAFC",
+        "production time in half.",
+        "Quote 3",
+    );
     for i in 0..5 {
         s.circle(900.0 + f64::from(i) * 70.0, 740.0, 24.0, "#FBBF24", "Star");
     }
@@ -2868,8 +3199,22 @@ fn deck_image_text() -> BundledTemplate {
     s.text(1060.0, 320.0, 40.0, "#0EA5E9", "FEATURE", "Eyebrow");
     s.text(1060.0, 400.0, 80.0, "#0F172A", "Real-time", "Title 1");
     s.text(1060.0, 500.0, 80.0, "#0F172A", "collaboration", "Title 2");
-    s.text(1060.0, 640.0, 34.0, "#475569", "See teammates' cursors, comments,", "Body 1");
-    s.text(1060.0, 690.0, 34.0, "#475569", "and edits the moment they happen.", "Body 2");
+    s.text(
+        1060.0,
+        640.0,
+        34.0,
+        "#475569",
+        "See teammates' cursors, comments,",
+        "Body 1",
+    );
+    s.text(
+        1060.0,
+        690.0,
+        34.0,
+        "#475569",
+        "and edits the moment they happen.",
+        "Body 2",
+    );
     s.rect(1060.0, 800.0, 360.0, 110.0, "#0EA5E9", "CTA");
     s.text_center(1240.0, 832.0, 36.0, "#FFFFFF", "Learn more", "CTA label");
     BundledTemplate {
@@ -2940,11 +3285,32 @@ fn pitch_cover() -> BundledTemplate {
     s.ellipse_a(220.0, 160.0, 360.0, 360.0, "#06B6D4", 0.25, "Glow B");
     s.circle(180.0, 200.0, 44.0, "#7C3AED", "Logo");
     s.text(250.0, 168.0, 40.0, "#F8FAFC", "Lumen", "Brand");
-    s.text(160.0, 420.0, 130.0, "#F8FAFC", "The operating system", "Title 1");
-    s.text(160.0, 560.0, 130.0, "#A78BFA", "for solo founders", "Title 2");
+    s.text(
+        160.0,
+        420.0,
+        130.0,
+        "#F8FAFC",
+        "The operating system",
+        "Title 1",
+    );
+    s.text(
+        160.0,
+        560.0,
+        130.0,
+        "#A78BFA",
+        "for solo founders",
+        "Title 2",
+    );
     s.rect(160.0, 740.0, 300.0, 8.0, "#06B6D4", "Rule");
     s.text(160.0, 800.0, 38.0, "#CBD5E1", "Seed round · 2026", "Sub");
-    s.text(160.0, 980.0, 30.0, "#64748B", "Confidential — do not distribute", "Footer");
+    s.text(
+        160.0,
+        980.0,
+        30.0,
+        "#64748B",
+        "Confidential — do not distribute",
+        "Footer",
+    );
     BundledTemplate {
         dir_name: "pitch-cover.ktemplate",
         manifest: manifest(
@@ -2962,11 +3328,33 @@ fn pitch_problem() -> BundledTemplate {
     let mut s = Sheet::new(SLIDE_W, SLIDE_H);
     s.bg("#FFFFFF");
     s.text(150.0, 110.0, 40.0, "#EF4444", "THE PROBLEM", "Eyebrow");
-    s.text(150.0, 190.0, 80.0, "#0F172A", "Founders drown in busywork", "Title");
+    s.text(
+        150.0,
+        190.0,
+        80.0,
+        "#0F172A",
+        "Founders drown in busywork",
+        "Title",
+    );
     let pains = [
-        ("#FEE2E2", "#B91C1C", "11 tools", "to run one small business"),
-        ("#FEF3C7", "#B45309", "60% of time", "spent on admin, not building"),
-        ("#EDE9FE", "#6D28D9", "$0 budget", "for a full operations team"),
+        (
+            "#FEE2E2",
+            "#B91C1C",
+            "11 tools",
+            "to run one small business",
+        ),
+        (
+            "#FEF3C7",
+            "#B45309",
+            "60% of time",
+            "spent on admin, not building",
+        ),
+        (
+            "#EDE9FE",
+            "#6D28D9",
+            "$0 budget",
+            "for a full operations team",
+        ),
     ];
     for (i, (bg, ink, big, small)) in pains.iter().enumerate() {
         let x = 150.0 + i as f64 * 540.0;
@@ -2991,7 +3379,14 @@ fn pitch_solution() -> BundledTemplate {
     let mut s = Sheet::new(SLIDE_W, SLIDE_H);
     s.bg("#ECFEFF");
     s.text(150.0, 110.0, 40.0, "#0891B2", "OUR SOLUTION", "Eyebrow");
-    s.text(150.0, 190.0, 80.0, "#0F172A", "One workspace, everything", "Title");
+    s.text(
+        150.0,
+        190.0,
+        80.0,
+        "#0F172A",
+        "One workspace, everything",
+        "Title",
+    );
     s.rect(150.0, 340.0, 820.0, 600.0, "#0E7490", "Showcase");
     s.rect(200.0, 400.0, 720.0, 90.0, "#155E75", "Window bar");
     s.circle(250.0, 445.0, 18.0, "#F87171", "Dot");
@@ -3063,7 +3458,14 @@ fn pitch_business_model() -> BundledTemplate {
     let mut s = Sheet::new(SLIDE_W, SLIDE_H);
     s.bg("#FFFFFF");
     s.text(150.0, 110.0, 40.0, "#059669", "BUSINESS MODEL", "Eyebrow");
-    s.text(150.0, 190.0, 80.0, "#0F172A", "Predictable, recurring revenue", "Title");
+    s.text(
+        150.0,
+        190.0,
+        80.0,
+        "#0F172A",
+        "Predictable, recurring revenue",
+        "Title",
+    );
     let tiers = [
         ("#ECFDF5", "#047857", "Free", "$0", "Acquisition engine"),
         ("#D1FAE5", "#065F46", "Pro", "$12/mo", "Core revenue driver"),
@@ -3076,7 +3478,14 @@ fn pitch_business_model() -> BundledTemplate {
         s.text(x + 50.0, 510.0, 72.0, "#0F172A", price, "Tier price");
         s.text(x + 50.0, 640.0, 30.0, "#475569", role, "Tier role");
     }
-    s.text(150.0, 920.0, 34.0, "#059669", "Net revenue retention: 124%", "Metric");
+    s.text(
+        150.0,
+        920.0,
+        34.0,
+        "#059669",
+        "Net revenue retention: 124%",
+        "Metric",
+    );
     BundledTemplate {
         dir_name: "pitch-business-model.ktemplate",
         manifest: manifest(
@@ -3093,8 +3502,22 @@ fn pitch_business_model() -> BundledTemplate {
 fn pitch_competition() -> BundledTemplate {
     let mut s = Sheet::new(SLIDE_W, SLIDE_H);
     s.bg("#0B1120");
-    s.text(150.0, 110.0, 40.0, "#38BDF8", "COMPETITIVE LANDSCAPE", "Eyebrow");
-    s.text(150.0, 190.0, 80.0, "#F8FAFC", "We own the top-right", "Title");
+    s.text(
+        150.0,
+        110.0,
+        40.0,
+        "#38BDF8",
+        "COMPETITIVE LANDSCAPE",
+        "Eyebrow",
+    );
+    s.text(
+        150.0,
+        190.0,
+        80.0,
+        "#F8FAFC",
+        "We own the top-right",
+        "Title",
+    );
     // Quadrant.
     s.rect(520.0, 360.0, 900.0, 620.0, "#111827", "Quad bg");
     s.rect(960.0, 360.0, 6.0, 620.0, "#1E293B", "V axis");
@@ -3129,7 +3552,14 @@ fn pitch_financials() -> BundledTemplate {
     let mut s = Sheet::new(SLIDE_W, SLIDE_H);
     s.bg("#FFFFFF");
     s.text(150.0, 110.0, 40.0, "#6366F1", "FINANCIALS", "Eyebrow");
-    s.text(150.0, 190.0, 80.0, "#0F172A", "Path to profitability", "Title");
+    s.text(
+        150.0,
+        190.0,
+        80.0,
+        "#0F172A",
+        "Path to profitability",
+        "Title",
+    );
     s.rect(150.0, 860.0, 1620.0, 6.0, "#E2E8F0", "X axis");
     let cols = [
         ("2024", 0.18, "$0.4M"),
@@ -3147,7 +3577,14 @@ fn pitch_financials() -> BundledTemplate {
     }
     // Break-even marker.
     s.rect(150.0, 560.0, 1620.0, 4.0, "#10B981", "Break-even");
-    s.text(1500.0, 500.0, 28.0, "#10B981", "Break-even 2026", "BE label");
+    s.text(
+        1500.0,
+        500.0,
+        28.0,
+        "#10B981",
+        "Break-even 2026",
+        "BE label",
+    );
     BundledTemplate {
         dir_name: "pitch-financials.ktemplate",
         manifest: manifest(
@@ -3167,7 +3604,14 @@ fn pitch_ask() -> BundledTemplate {
     s.ellipse_a(1660.0, 900.0, 460.0, 460.0, "#312E81", 0.60, "Glow");
     s.text(150.0, 200.0, 40.0, "#C7D2FE", "THE ASK", "Eyebrow");
     s.text(150.0, 300.0, 170.0, "#FFFFFF", "Raising $3M", "Title");
-    s.text(150.0, 500.0, 44.0, "#E0E7FF", "to reach 100k users in 18 months", "Sub");
+    s.text(
+        150.0,
+        500.0,
+        44.0,
+        "#E0E7FF",
+        "to reach 100k users in 18 months",
+        "Sub",
+    );
     let uses = [
         ("40%", "Engineering"),
         ("30%", "Growth & marketing"),
@@ -3208,7 +3652,14 @@ fn social_ig_announcement() -> BundledTemplate {
     s.text(80.0, 320.0, 96.0, "#FFFFFF", "We just", "Title 1");
     s.text(80.0, 430.0, 96.0, "#FFFFFF", "launched", "Title 2");
     s.text(80.0, 540.0, 96.0, "#F97316", "version 2.0", "Title 3");
-    s.text(80.0, 720.0, 36.0, "#CBD5E1", "Faster, smarter, and ready for teams.", "Body");
+    s.text(
+        80.0,
+        720.0,
+        36.0,
+        "#CBD5E1",
+        "Faster, smarter, and ready for teams.",
+        "Body",
+    );
     s.rect(80.0, 840.0, 420.0, 120.0, "#FFFFFF", "CTA");
     s.text_center(290.0, 875.0, 38.0, "#111827", "Learn more", "CTA label");
     BundledTemplate {
@@ -3231,7 +3682,14 @@ fn social_ig_giveaway() -> BundledTemplate {
     s.circle(540.0, 360.0, 140.0, "#EC4899", "Gift");
     s.rect(470.0, 290.0, 140.0, 140.0, "#FDF2F8", "Gift cut");
     s.text_center(540.0, 540.0, 110.0, "#BE185D", "GIVEAWAY", "Title");
-    s.text_center(540.0, 690.0, 40.0, "#9D174D", "Win a $250 gift card", "Prize");
+    s.text_center(
+        540.0,
+        690.0,
+        40.0,
+        "#9D174D",
+        "Win a $250 gift card",
+        "Prize",
+    );
     let steps = ["Follow @kcreate", "Like this post", "Tag two friends"];
     let mut y = 800.0;
     for (i, step) in steps.iter().enumerate() {
@@ -3269,11 +3727,25 @@ fn social_ig_tips() -> BundledTemplate {
     let mut y = 320.0;
     for (i, tip) in tips.iter().enumerate() {
         s.circle(130.0, y + 30.0, 40.0, "#10B981", "Num bg");
-        s.text_center(130.0, y + 6.0, 40.0, "#064E3B", &format!("{}", i + 1), "Num");
+        s.text_center(
+            130.0,
+            y + 6.0,
+            40.0,
+            "#064E3B",
+            &format!("{}", i + 1),
+            "Num",
+        );
         s.text(200.0, y, 32.0, "#D1FAE5", tip, "Tip");
         y += 130.0;
     }
-    s.text(80.0, 1000.0, 28.0, "#6EE7B7", "Save this for later · @kcreate", "Footer");
+    s.text(
+        80.0,
+        1000.0,
+        28.0,
+        "#6EE7B7",
+        "Save this for later · @kcreate",
+        "Footer",
+    );
     BundledTemplate {
         dir_name: "social-ig-tips.ktemplate",
         manifest: manifest(
@@ -3291,9 +3763,23 @@ fn social_ig_testimonial() -> BundledTemplate {
     let mut s = Sheet::new(1080.0, 1080.0);
     s.bg("#1E293B");
     s.text(80.0, 140.0, 200.0, "#334155", "\u{201C}", "Quote mark");
-    s.text(80.0, 380.0, 52.0, "#F8FAFC", "This app completely", "Quote 1");
+    s.text(
+        80.0,
+        380.0,
+        52.0,
+        "#F8FAFC",
+        "This app completely",
+        "Quote 1",
+    );
     s.text(80.0, 460.0, 52.0, "#F8FAFC", "changed how our", "Quote 2");
-    s.text(80.0, 540.0, 52.0, "#38BDF8", "studio ships work.", "Quote 3");
+    s.text(
+        80.0,
+        540.0,
+        52.0,
+        "#38BDF8",
+        "studio ships work.",
+        "Quote 3",
+    );
     for i in 0..5 {
         s.circle(110.0 + f64::from(i) * 70.0, 700.0, 24.0, "#FBBF24", "Star");
     }
@@ -3346,7 +3832,14 @@ fn social_ig_carousel() -> BundledTemplate {
     s.text(80.0, 340.0, 110.0, "#FFFFFF", "The 2026", "Title 1");
     s.text(80.0, 460.0, 110.0, "#FFFFFF", "design", "Title 2");
     s.text(80.0, 580.0, 110.0, "#C4B5FD", "trends", "Title 3");
-    s.text(80.0, 780.0, 34.0, "#C7D2FE", "A 6-part breakdown for creators", "Sub");
+    s.text(
+        80.0,
+        780.0,
+        34.0,
+        "#C7D2FE",
+        "A 6-part breakdown for creators",
+        "Sub",
+    );
     // Pager dots.
     for i in 0..6 {
         let hex = if i == 0 { "#FFFFFF" } else { "#6366F1" };
@@ -3378,7 +3871,14 @@ fn social_story_countdown() -> BundledTemplate {
         s.text_center(x + 110.0, 700.0, 28.0, "#94A3B8", label, "Unit label");
     }
     s.text_center(540.0, 920.0, 80.0, "#FFFFFF", "Spring Sale", "Title");
-    s.text_center(540.0, 1040.0, 40.0, "#C4B5FD", "Up to 50% off everything", "Sub");
+    s.text_center(
+        540.0,
+        1040.0,
+        40.0,
+        "#C4B5FD",
+        "Up to 50% off everything",
+        "Sub",
+    );
     s.rect(240.0, 1640.0, 600.0, 130.0, "#7C3AED", "CTA");
     s.text_center(540.0, 1675.0, 40.0, "#FFFFFF", "Set reminder", "CTA label");
     BundledTemplate {
@@ -3434,7 +3934,14 @@ fn social_reels_cover() -> BundledTemplate {
     s.text_center(540.0, 1160.0, 96.0, "#F9A8D4", "IN 60 SEC", "Title 2");
     s.rect(340.0, 1340.0, 400.0, 90.0, "#DB2777", "Tag");
     s.text_center(540.0, 1362.0, 36.0, "#FFFFFF", "TUTORIAL", "Tag label");
-    s.text_center(540.0, 1700.0, 32.0, "#A1A1AA", "New reels every week · @kcreate", "Footer");
+    s.text_center(
+        540.0,
+        1700.0,
+        32.0,
+        "#A1A1AA",
+        "New reels every week · @kcreate",
+        "Footer",
+    );
     BundledTemplate {
         dir_name: "social-reels-cover.ktemplate",
         manifest: manifest(
@@ -3456,12 +3963,40 @@ fn social_linkedin_post() -> BundledTemplate {
     s.circle(60.0, 45.0, 26.0, "#0A66C2", "Logo");
     s.text(110.0, 28.0, 30.0, "#0A66C2", "KCreate", "Brand");
     s.text(80.0, 170.0, 36.0, "#0A66C2", "LESSON #07", "Eyebrow");
-    s.text(80.0, 240.0, 64.0, "#0F172A", "Ship small, ship often.", "Title");
-    s.text(80.0, 360.0, 30.0, "#475569", "The teams that win aren't the ones with the", "Body 1");
-    s.text(80.0, 410.0, 30.0, "#475569", "biggest plans — they're the ones who keep shipping.", "Body 2");
+    s.text(
+        80.0,
+        240.0,
+        64.0,
+        "#0F172A",
+        "Ship small, ship often.",
+        "Title",
+    );
+    s.text(
+        80.0,
+        360.0,
+        30.0,
+        "#475569",
+        "The teams that win aren't the ones with the",
+        "Body 1",
+    );
+    s.text(
+        80.0,
+        410.0,
+        30.0,
+        "#475569",
+        "biggest plans — they're the ones who keep shipping.",
+        "Body 2",
+    );
     s.circle(110.0, 540.0, 36.0, "#93C5FD", "Avatar");
     s.text(170.0, 510.0, 30.0, "#0F172A", "Dana Cole", "Author");
-    s.text(170.0, 552.0, 24.0, "#64748B", "Founder, KCreate", "Author role");
+    s.text(
+        170.0,
+        552.0,
+        24.0,
+        "#64748B",
+        "Founder, KCreate",
+        "Author role",
+    );
     BundledTemplate {
         dir_name: "social-linkedin-post.ktemplate",
         manifest: manifest(
@@ -3481,7 +4016,14 @@ fn social_x_header() -> BundledTemplate {
     s.ellipse_a(1280.0, 250.0, 360.0, 360.0, "#1D9BF0", 0.40, "Glow");
     s.rect(0.0, 430.0, 1500.0, 70.0, "#16202A", "Lower bar");
     s.text(80.0, 150.0, 80.0, "#FFFFFF", "Building in public.", "Title");
-    s.text(80.0, 270.0, 36.0, "#8B98A5", "Design, code, and the occasional hot take.", "Sub");
+    s.text(
+        80.0,
+        270.0,
+        36.0,
+        "#8B98A5",
+        "Design, code, and the occasional hot take.",
+        "Sub",
+    );
     s.rect(80.0, 360.0, 220.0, 12.0, "#1D9BF0", "Rule");
     s.text(1180.0, 450.0, 28.0, "#8B98A5", "@kcreate_app", "Handle");
     BundledTemplate {
@@ -3504,11 +4046,39 @@ fn social_x_post() -> BundledTemplate {
     s.circle(130.0, 150.0, 44.0, "#1D9BF0", "Avatar");
     s.text(200.0, 120.0, 34.0, "#FFFFFF", "KCreate", "Name");
     s.text(200.0, 168.0, 28.0, "#8B98A5", "@kcreate_app", "Handle");
-    s.text(110.0, 270.0, 48.0, "#FFFFFF", "We rebuilt our renderer in Rust", "Tweet 1");
-    s.text(110.0, 340.0, 48.0, "#FFFFFF", "and exports got 9× faster. 🚀", "Tweet 2");
-    s.text(110.0, 470.0, 28.0, "#8B98A5", "2:14 PM · Jun 12, 2026", "Meta");
+    s.text(
+        110.0,
+        270.0,
+        48.0,
+        "#FFFFFF",
+        "We rebuilt our renderer in Rust",
+        "Tweet 1",
+    );
+    s.text(
+        110.0,
+        340.0,
+        48.0,
+        "#FFFFFF",
+        "and exports got 9× faster. 🚀",
+        "Tweet 2",
+    );
+    s.text(
+        110.0,
+        470.0,
+        28.0,
+        "#8B98A5",
+        "2:14 PM · Jun 12, 2026",
+        "Meta",
+    );
     s.rect(110.0, 520.0, 980.0, 3.0, "#38444D", "Divider");
-    s.text(110.0, 545.0, 28.0, "#8B98A5", "1.2K Reposts   4.8K Likes", "Stats");
+    s.text(
+        110.0,
+        545.0,
+        28.0,
+        "#8B98A5",
+        "1.2K Reposts   4.8K Likes",
+        "Stats",
+    );
     BundledTemplate {
         dir_name: "social-x-post.ktemplate",
         manifest: manifest(
@@ -3554,7 +4124,14 @@ fn social_fb_cover() -> BundledTemplate {
     s.rect(0.0, 250.0, 820.0, 62.0, "#0F5BD6", "Lower bar");
     s.circle(70.0, 130.0, 44.0, "#FFFFFF", "Logo");
     s.text(140.0, 96.0, 52.0, "#FFFFFF", "KCreate Studio", "Title");
-    s.text(140.0, 168.0, 26.0, "#DBEAFE", "Design tools for everyone", "Sub");
+    s.text(
+        140.0,
+        168.0,
+        26.0,
+        "#DBEAFE",
+        "Design tools for everyone",
+        "Sub",
+    );
     s.text(560.0, 268.0, 24.0, "#DBEAFE", "kcreate.app", "URL");
     BundledTemplate {
         dir_name: "social-fb-cover.ktemplate",
@@ -3580,7 +4157,14 @@ fn social_pinterest_pin() -> BundledTemplate {
     s.text(170.0, 920.0, 36.0, "#E11D48", "DIY GUIDE", "Eyebrow");
     s.text(170.0, 1000.0, 72.0, "#881337", "10 cozy fall", "Title 1");
     s.text(170.0, 1090.0, 72.0, "#881337", "home ideas", "Title 2");
-    s.text(170.0, 1220.0, 30.0, "#9F1239", "Easy weekend projects · save for later", "Body");
+    s.text(
+        170.0,
+        1220.0,
+        30.0,
+        "#9F1239",
+        "Easy weekend projects · save for later",
+        "Body",
+    );
     BundledTemplate {
         dir_name: "social-pinterest-pin.ktemplate",
         manifest: manifest(
@@ -3610,7 +4194,14 @@ fn social_podcast_cover() -> BundledTemplate {
     s.text_center(700.0, 300.0, 40.0, "#FCD34D", "THE BUILD LOG", "Eyebrow");
     s.text_center(700.0, 920.0, 130.0, "#FFFFFF", "Makers", "Title 1");
     s.text_center(700.0, 1050.0, 130.0, "#F59E0B", "& Mavericks", "Title 2");
-    s.text_center(700.0, 1200.0, 32.0, "#9CA3AF", "A weekly podcast for builders", "Sub");
+    s.text_center(
+        700.0,
+        1200.0,
+        32.0,
+        "#9CA3AF",
+        "A weekly podcast for builders",
+        "Sub",
+    );
     BundledTemplate {
         dir_name: "social-podcast-cover.ktemplate",
         manifest: manifest(
@@ -3634,7 +4225,11 @@ fn social_ig_event() -> BundledTemplate {
     s.text(80.0, 390.0, 96.0, "#FFFFFF", "Meetup", "Title 2");
     s.text(80.0, 500.0, 96.0, "#22D3EE", "2026", "Title 3");
     s.rect(80.0, 680.0, 920.0, 3.0, "#4338CA", "Divider");
-    let rows = [("📅", "Friday, July 18 · 6:30 PM"), ("📍", "The Foundry, San Francisco"), ("🎟", "Free · RSVP in bio")];
+    let rows = [
+        ("📅", "Friday, July 18 · 6:30 PM"),
+        ("📍", "The Foundry, San Francisco"),
+        ("🎟", "Free · RSVP in bio"),
+    ];
     let mut y = 730.0;
     for (icon, text) in rows {
         s.text(80.0, y, 36.0, "#F9A8D4", icon, "Row icon");
@@ -3689,10 +4284,24 @@ fn poster_movie() -> BundledTemplate {
     s.circle(540.0, 420.0, 150.0, "#0B0B0F", "Moon");
     s.circle(610.0, 380.0, 150.0, "#18181B", "Moon shadow");
     s.rect(0.0, 800.0, POSTER_W, 8.0, "#DC2626", "Hairline");
-    s.text_center(540.0, 880.0, 40.0, "#DC2626", "A FILM BY A. RIVERA", "Credit");
+    s.text_center(
+        540.0,
+        880.0,
+        40.0,
+        "#DC2626",
+        "A FILM BY A. RIVERA",
+        "Credit",
+    );
     s.text_center(540.0, 950.0, 150.0, "#F4F4F5", "AFTER", "Title 1");
     s.text_center(540.0, 1090.0, 150.0, "#F4F4F5", "DARK", "Title 2");
-    s.text_center(540.0, 1260.0, 26.0, "#A1A1AA", "IN THEATERS DECEMBER · RATED PG-13", "Footer");
+    s.text_center(
+        540.0,
+        1260.0,
+        26.0,
+        "#A1A1AA",
+        "IN THEATERS DECEMBER · RATED PG-13",
+        "Footer",
+    );
     BundledTemplate {
         dir_name: "poster-movie.ktemplate",
         manifest: manifest(
@@ -3709,18 +4318,46 @@ fn poster_movie() -> BundledTemplate {
 fn poster_art_expo() -> BundledTemplate {
     let mut s = Sheet::new(POSTER_W, POSTER_H);
     s.bg("#FAF5EB");
-    s.rect(80.0, 80.0, POSTER_W - 160.0, POSTER_H - 160.0, "#FAF5EB", "Mat");
+    s.rect(
+        80.0,
+        80.0,
+        POSTER_W - 160.0,
+        POSTER_H - 160.0,
+        "#FAF5EB",
+        "Mat",
+    );
     s.rect(80.0, 80.0, POSTER_W - 160.0, 8.0, "#1C1917", "Frame top");
-    s.rect(80.0, POSTER_H - 88.0, POSTER_W - 160.0, 8.0, "#1C1917", "Frame bottom");
+    s.rect(
+        80.0,
+        POSTER_H - 88.0,
+        POSTER_W - 160.0,
+        8.0,
+        "#1C1917",
+        "Frame bottom",
+    );
     // Abstract composition.
     s.rect(180.0, 300.0, 320.0, 420.0, "#E11D48", "Block A");
     s.circle(660.0, 420.0, 170.0, "#2563EB", "Block B");
     s.rect(560.0, 560.0, 300.0, 200.0, "#F59E0B", "Block C");
     s.rect(180.0, 740.0, 680.0, 14.0, "#1C1917", "Rule");
-    s.text(180.0, 800.0, 36.0, "#57534E", "MODERN ART EXHIBITION", "Eyebrow");
+    s.text(
+        180.0,
+        800.0,
+        36.0,
+        "#57534E",
+        "MODERN ART EXHIBITION",
+        "Eyebrow",
+    );
     s.text(180.0, 860.0, 110.0, "#1C1917", "Forms", "Title 1");
     s.text(180.0, 980.0, 110.0, "#E11D48", "in Motion", "Title 2");
-    s.text(180.0, 1160.0, 32.0, "#57534E", "Apr 12 – Jun 30 · The Civic Gallery", "Details");
+    s.text(
+        180.0,
+        1160.0,
+        32.0,
+        "#57534E",
+        "Apr 12 – Jun 30 · The Civic Gallery",
+        "Details",
+    );
     BundledTemplate {
         dir_name: "poster-art-expo.ktemplate",
         manifest: manifest(
@@ -3743,7 +4380,11 @@ fn poster_gym() -> BundledTemplate {
     s.text(70.0, 540.0, 150.0, "#F5F5F5", "YOUR", "Title 2");
     s.text(70.0, 690.0, 150.0, "#EAB308", "LIMITS", "Title 3");
     s.rect(80.0, 900.0, 920.0, 4.0, "#262626", "Divider");
-    let perks = ["24/7 access · all locations", "Free intro session", "No joining fee this month"];
+    let perks = [
+        "24/7 access · all locations",
+        "Free intro session",
+        "No joining fee this month",
+    ];
     let mut y = 950.0;
     for perk in perks {
         s.rect(80.0, y + 12.0, 26.0, 26.0, "#EAB308", "Tick");
@@ -3751,7 +4392,14 @@ fn poster_gym() -> BundledTemplate {
         y += 70.0;
     }
     s.rect(80.0, 1190.0, 920.0, 100.0, "#EAB308", "CTA");
-    s.text_center(540.0, 1216.0, 40.0, "#0A0A0A", "JOIN TODAY — IRONWORKS GYM", "CTA label");
+    s.text_center(
+        540.0,
+        1216.0,
+        40.0,
+        "#0A0A0A",
+        "JOIN TODAY — IRONWORKS GYM",
+        "CTA label",
+    );
     BundledTemplate {
         dir_name: "poster-gym.ktemplate",
         manifest: manifest(
@@ -3777,8 +4425,22 @@ fn poster_food() -> BundledTemplate {
     s.text_center(540.0, 120.0, 40.0, "#FED7AA", "GRAND OPENING", "Eyebrow");
     s.text_center(540.0, 840.0, 130.0, "#FFFBEB", "Saffron", "Title 1");
     s.text_center(540.0, 970.0, 80.0, "#F59E0B", "Kitchen", "Title 2");
-    s.text_center(540.0, 1120.0, 34.0, "#FED7AA", "Authentic flavors · open 11am–11pm", "Details");
-    s.text_center(540.0, 1200.0, 30.0, "#FDBA74", "12 Market Street · saffron.kitchen", "Address");
+    s.text_center(
+        540.0,
+        1120.0,
+        34.0,
+        "#FED7AA",
+        "Authentic flavors · open 11am–11pm",
+        "Details",
+    );
+    s.text_center(
+        540.0,
+        1200.0,
+        30.0,
+        "#FDBA74",
+        "12 Market Street · saffron.kitchen",
+        "Address",
+    );
     BundledTemplate {
         dir_name: "poster-food.ktemplate",
         manifest: manifest(
@@ -3805,12 +4467,40 @@ fn poster_real_estate() -> BundledTemplate {
     s.rect(80.0, 110.0, 280.0, 70.0, "#FBBF24", "Badge");
     s.text(105.0, 128.0, 36.0, "#1E3A8A", "FOR SALE", "Badge text");
     s.text(80.0, 780.0, 110.0, "#0F172A", "$845,000", "Price");
-    s.text(80.0, 910.0, 38.0, "#1E3A8A", "4 bed · 3 bath · 2,650 sqft", "Specs");
+    s.text(
+        80.0,
+        910.0,
+        38.0,
+        "#1E3A8A",
+        "4 bed · 3 bath · 2,650 sqft",
+        "Specs",
+    );
     s.rect(80.0, 980.0, 920.0, 3.0, "#CBD5E1", "Divider");
-    s.text(80.0, 1020.0, 34.0, "#334155", "27 Lakeview Drive, Austin TX", "Address");
-    s.text(80.0, 1090.0, 30.0, "#64748B", "Open house Sat & Sun · 1–4pm", "Open house");
+    s.text(
+        80.0,
+        1020.0,
+        34.0,
+        "#334155",
+        "27 Lakeview Drive, Austin TX",
+        "Address",
+    );
+    s.text(
+        80.0,
+        1090.0,
+        30.0,
+        "#64748B",
+        "Open house Sat & Sun · 1–4pm",
+        "Open house",
+    );
     s.rect(80.0, 1180.0, 920.0, 100.0, "#1E3A8A", "CTA");
-    s.text_center(540.0, 1206.0, 36.0, "#FFFFFF", "Jordan Lee · (555) 010-7788", "CTA label");
+    s.text_center(
+        540.0,
+        1206.0,
+        36.0,
+        "#FFFFFF",
+        "Jordan Lee · (555) 010-7788",
+        "CTA label",
+    );
     BundledTemplate {
         dir_name: "poster-real-estate.ktemplate",
         manifest: manifest(
@@ -3833,9 +4523,20 @@ fn poster_workshop() -> BundledTemplate {
     s.text(80.0, 150.0, 36.0, "#0E7490", "HANDS-ON WORKSHOP", "Eyebrow");
     s.text(80.0, 320.0, 120.0, "#083344", "Watercolor", "Title 1");
     s.text(80.0, 450.0, 120.0, "#0891B2", "Basics", "Title 2");
-    s.text(80.0, 640.0, 34.0, "#155E75", "A relaxed 3-hour intro for total beginners.", "Body");
+    s.text(
+        80.0,
+        640.0,
+        34.0,
+        "#155E75",
+        "A relaxed 3-hour intro for total beginners.",
+        "Body",
+    );
     s.rect(80.0, 740.0, 920.0, 3.0, "#67E8F9", "Divider");
-    let rows = [("When", "Sat, May 17 · 10am–1pm"), ("Where", "Studio 4, Riverside Arts"), ("Cost", "$45 · materials included")];
+    let rows = [
+        ("When", "Sat, May 17 · 10am–1pm"),
+        ("Where", "Studio 4, Riverside Arts"),
+        ("Cost", "$45 · materials included"),
+    ];
     let mut y = 800.0;
     for (label, val) in rows {
         s.text(80.0, y, 30.0, "#0E7490", label, "Row label");
@@ -3843,7 +4544,14 @@ fn poster_workshop() -> BundledTemplate {
         y += 90.0;
     }
     s.rect(80.0, 1170.0, 920.0, 100.0, "#0891B2", "CTA");
-    s.text_center(540.0, 1196.0, 36.0, "#FFFFFF", "Reserve your seat — riversidearts.org", "CTA label");
+    s.text_center(
+        540.0,
+        1196.0,
+        36.0,
+        "#FFFFFF",
+        "Reserve your seat — riversidearts.org",
+        "CTA label",
+    );
     BundledTemplate {
         dir_name: "poster-workshop.ktemplate",
         manifest: manifest(
@@ -3869,7 +4577,14 @@ fn poster_travel() -> BundledTemplate {
     s.rect(0.0, 760.0, POSTER_W, 6.0, "#FFFFFF", "Horizon");
     s.text_center(540.0, 120.0, 36.0, "#E0F2FE", "VISIT", "Eyebrow");
     s.text_center(540.0, 980.0, 150.0, "#FFFBEB", "ICELAND", "Title");
-    s.text_center(540.0, 1160.0, 36.0, "#78350F", "Land of fire, ice, and endless sky", "Sub");
+    s.text_center(
+        540.0,
+        1160.0,
+        36.0,
+        "#E0F2FE",
+        "Land of fire, ice, and endless sky",
+        "Sub",
+    );
     BundledTemplate {
         dir_name: "poster-travel.ktemplate",
         manifest: manifest(
@@ -3887,15 +4602,50 @@ fn poster_typographic() -> BundledTemplate {
     let mut s = Sheet::new(POSTER_W, POSTER_H);
     s.bg("#FDE047");
     s.rect(0.0, 0.0, POSTER_W, 120.0, "#0A0A0A", "Top bar");
-    s.rect(0.0, POSTER_H - 120.0, POSTER_W, 120.0, "#0A0A0A", "Bottom bar");
-    s.text(80.0, 70.0, 30.0, "#FDE047", "VOLUME 01 — THE MANIFESTO", "Top label");
+    s.rect(
+        0.0,
+        POSTER_H - 120.0,
+        POSTER_W,
+        120.0,
+        "#0A0A0A",
+        "Bottom bar",
+    );
+    s.text(
+        80.0,
+        70.0,
+        30.0,
+        "#FDE047",
+        "VOLUME 01 — THE MANIFESTO",
+        "Top label",
+    );
     s.text(70.0, 320.0, 170.0, "#0A0A0A", "MAKE", "Title 1");
     s.text(70.0, 500.0, 170.0, "#0A0A0A", "GOOD", "Title 2");
     s.text(70.0, 680.0, 170.0, "#DC2626", "WORK", "Title 3");
     s.rect(80.0, 900.0, 400.0, 12.0, "#0A0A0A", "Rule");
-    s.text(80.0, 960.0, 34.0, "#0A0A0A", "and share it with people", "Body 1");
-    s.text(80.0, 1010.0, 34.0, "#0A0A0A", "who care about the craft.", "Body 2");
-    s.text(80.0, POSTER_H - 92.0, 30.0, "#FDE047", "kcreate.app", "Bottom label");
+    s.text(
+        80.0,
+        960.0,
+        34.0,
+        "#0A0A0A",
+        "and share it with people",
+        "Body 1",
+    );
+    s.text(
+        80.0,
+        1010.0,
+        34.0,
+        "#0A0A0A",
+        "who care about the craft.",
+        "Body 2",
+    );
+    s.text(
+        80.0,
+        POSTER_H - 92.0,
+        30.0,
+        "#FDE047",
+        "kcreate.app",
+        "Bottom label",
+    );
     BundledTemplate {
         dir_name: "poster-typographic.ktemplate",
         manifest: manifest(
@@ -3935,7 +4685,14 @@ fn flyer_restaurant() -> BundledTemplate {
         y += 150.0;
     }
     s.rect(0.0, POSTER_H - 110.0, POSTER_W, 110.0, "#166534", "Footer");
-    s.text_center(540.0, POSTER_H - 86.0, 30.0, "#DCFCE7", "Open daily 11–3 · The Greenhouse · 88 Vine St", "Footer text");
+    s.text_center(
+        540.0,
+        POSTER_H - 86.0,
+        30.0,
+        "#DCFCE7",
+        "Open daily 11–3 · The Greenhouse · 88 Vine St",
+        "Footer text",
+    );
     BundledTemplate {
         dir_name: "flyer-restaurant.ktemplate",
         manifest: manifest(
@@ -3953,21 +4710,39 @@ fn flyer_open_house() -> BundledTemplate {
     let mut s = Sheet::new(POSTER_W, POSTER_H);
     s.bg("#FFFFFF");
     s.rect(0.0, 0.0, POSTER_W, 70.0, "#0F766E", "Top rule");
-    s.text_center(540.0, 150.0, 40.0, "#0F766E", "YOU'RE INVITED TO OUR", "Eyebrow");
+    s.text_center(
+        540.0,
+        150.0,
+        40.0,
+        "#0F766E",
+        "YOU'RE INVITED TO OUR",
+        "Eyebrow",
+    );
     s.text_center(540.0, 230.0, 130.0, "#0F172A", "Open House", "Title");
     s.circle(540.0, 560.0, 200.0, "#CCFBF1", "Disc");
     s.text_center(540.0, 470.0, 36.0, "#0F766E", "SAVE THE DATE", "Disc top");
     s.text_center(540.0, 520.0, 110.0, "#0F766E", "09", "Disc num");
     s.text_center(540.0, 640.0, 40.0, "#0F766E", "AUGUST", "Disc month");
     s.rect(140.0, 850.0, 800.0, 3.0, "#99F6E4", "Divider");
-    let rows = [("Time", "2:00 – 6:00 PM"), ("Place", "Northside Community Center"), ("RSVP", "hello@northside.org")];
+    let rows = [
+        ("Time", "2:00 – 6:00 PM"),
+        ("Place", "Northside Community Center"),
+        ("RSVP", "hello@northside.org"),
+    ];
     let mut y = 910.0;
     for (label, val) in rows {
         s.text_center(540.0 - 200.0, y, 30.0, "#0F766E", label, "Row label");
         s.text_center(540.0 + 120.0, y, 30.0, "#0F172A", val, "Row value");
         y += 80.0;
     }
-    s.text_center(540.0, 1200.0, 30.0, "#64748B", "Refreshments provided · all welcome", "Footer");
+    s.text_center(
+        540.0,
+        1200.0,
+        30.0,
+        "#64748B",
+        "Refreshments provided · all welcome",
+        "Footer",
+    );
     BundledTemplate {
         dir_name: "flyer-open-house.ktemplate",
         manifest: manifest(
@@ -3989,7 +4764,12 @@ fn flyer_fitness_class() -> BundledTemplate {
     s.text(80.0, 120.0, 36.0, "#C4B5FD", "WEEKLY SCHEDULE", "Eyebrow");
     s.text(80.0, 200.0, 120.0, "#FFFFFF", "Move", "Title 1");
     s.text(80.0, 330.0, 120.0, "#A78BFA", "& Flow", "Title 2");
-    let rows = [("MON", "Power Yoga", "6:00 PM"), ("WED", "HIIT Burn", "7:00 PM"), ("FRI", "Pilates Core", "6:30 PM"), ("SAT", "Sunrise Flow", "8:00 AM")];
+    let rows = [
+        ("MON", "Power Yoga", "6:00 PM"),
+        ("WED", "HIIT Burn", "7:00 PM"),
+        ("FRI", "Pilates Core", "6:30 PM"),
+        ("SAT", "Sunrise Flow", "8:00 AM"),
+    ];
     let mut y = 560.0;
     for (day, name, time) in rows {
         s.rect(80.0, y, 920.0, 130.0, "#312E81", "Row card");
@@ -3999,7 +4779,14 @@ fn flyer_fitness_class() -> BundledTemplate {
         s.text(800.0, y + 36.0, 34.0, "#C4B5FD", time, "Time");
         y += 160.0;
     }
-    s.text_center(540.0, 1270.0, 28.0, "#C4B5FD", "Pulse Studio · drop-ins welcome", "Footer");
+    s.text_center(
+        540.0,
+        1270.0,
+        28.0,
+        "#C4B5FD",
+        "Pulse Studio · drop-ins welcome",
+        "Footer",
+    );
     BundledTemplate {
         dir_name: "flyer-fitness-class.ktemplate",
         manifest: manifest(
@@ -4019,7 +4806,13 @@ fn flyer_grand_opening() -> BundledTemplate {
     s.ellipse_a(540.0, 470.0, 460.0, 460.0, "#FCA5A5", 0.20, "Glow");
     // Bunting dots.
     for i in 0..7 {
-        s.circle(120.0 + f64::from(i) * 140.0, 120.0, 30.0, "#FBBF24", "Bunting");
+        s.circle(
+            120.0 + f64::from(i) * 140.0,
+            120.0,
+            30.0,
+            "#FBBF24",
+            "Bunting",
+        );
     }
     s.text_center(540.0, 230.0, 40.0, "#FECACA", "WE'RE OPEN!", "Eyebrow");
     s.text_center(540.0, 320.0, 120.0, "#FFFFFF", "GRAND", "Title 1");
@@ -4028,8 +4821,22 @@ fn flyer_grand_opening() -> BundledTemplate {
     s.text_center(540.0, 660.0, 40.0, "#B91C1C", "FIRST 50", "Offer top");
     s.text_center(540.0, 710.0, 90.0, "#B91C1C", "FREE", "Offer mid");
     s.text_center(540.0, 820.0, 36.0, "#B91C1C", "GIFTS", "Offer bottom");
-    s.text_center(540.0, 1040.0, 40.0, "#FFFFFF", "Saturday, June 21 · 10 AM", "Date");
-    s.text_center(540.0, 1110.0, 32.0, "#FECACA", "240 High Street · Bloom & Co.", "Address");
+    s.text_center(
+        540.0,
+        1040.0,
+        40.0,
+        "#FFFFFF",
+        "Saturday, June 21 · 10 AM",
+        "Date",
+    );
+    s.text_center(
+        540.0,
+        1110.0,
+        32.0,
+        "#FECACA",
+        "240 High Street · Bloom & Co.",
+        "Address",
+    );
     BundledTemplate {
         dir_name: "flyer-grand-opening.ktemplate",
         manifest: manifest(
@@ -4048,15 +4855,43 @@ fn flyer_club_night() -> BundledTemplate {
     s.bg("#09090B");
     s.ellipse_a(360.0, 420.0, 320.0, 320.0, "#7C3AED", 0.55, "Glow A");
     s.ellipse_a(760.0, 560.0, 320.0, 320.0, "#06B6D4", 0.50, "Glow B");
-    s.text(80.0, 110.0, 36.0, "#22D3EE", "SATURDAY NIGHTS PRESENT", "Eyebrow");
+    s.text(
+        80.0,
+        110.0,
+        36.0,
+        "#22D3EE",
+        "SATURDAY NIGHTS PRESENT",
+        "Eyebrow",
+    );
     s.text(70.0, 380.0, 160.0, "#FFFFFF", "PULSE", "Title 1");
     s.text(70.0, 560.0, 160.0, "#A78BFA", "AFTER", "Title 2");
     s.text(70.0, 740.0, 160.0, "#22D3EE", "DARK", "Title 3");
     s.rect(80.0, 980.0, 920.0, 3.0, "#3F3F46", "Divider");
-    s.text(80.0, 1020.0, 36.0, "#FFFFFF", "DJ NOVA · DJ KIRA · LIVE SET", "Lineup");
-    s.text(80.0, 1090.0, 30.0, "#A1A1AA", "Doors 10 PM · The Vault · 21+", "Details");
+    s.text(
+        80.0,
+        1020.0,
+        36.0,
+        "#FFFFFF",
+        "DJ NOVA · DJ KIRA · LIVE SET",
+        "Lineup",
+    );
+    s.text(
+        80.0,
+        1090.0,
+        30.0,
+        "#A1A1AA",
+        "Doors 10 PM · The Vault · 21+",
+        "Details",
+    );
     s.rect(80.0, 1180.0, 920.0, 100.0, "#7C3AED", "CTA");
-    s.text_center(540.0, 1206.0, 36.0, "#FFFFFF", "Tickets at the door · $20", "CTA label");
+    s.text_center(
+        540.0,
+        1206.0,
+        36.0,
+        "#FFFFFF",
+        "Tickets at the door · $20",
+        "CTA label",
+    );
     BundledTemplate {
         dir_name: "flyer-club-night.ktemplate",
         manifest: manifest(
@@ -4078,10 +4913,28 @@ fn flyer_community() -> BundledTemplate {
     s.text(80.0, 110.0, 36.0, "#BAE6FD", "EVERYONE WELCOME", "Eyebrow");
     s.text(80.0, 190.0, 96.0, "#FFFFFF", "Community", "Title 1");
     s.text(80.0, 300.0, 96.0, "#FACC15", "Cleanup Day", "Title 2");
-    s.text(80.0, 500.0, 34.0, "#0F172A", "Join your neighbors for a morning of", "Body 1");
-    s.text(80.0, 552.0, 34.0, "#0F172A", "tidying up Riverside Park together.", "Body 2");
+    s.text(
+        80.0,
+        500.0,
+        34.0,
+        "#0F172A",
+        "Join your neighbors for a morning of",
+        "Body 1",
+    );
+    s.text(
+        80.0,
+        552.0,
+        34.0,
+        "#0F172A",
+        "tidying up Riverside Park together.",
+        "Body 2",
+    );
     s.rect(80.0, 660.0, 920.0, 3.0, "#E2E8F0", "Divider");
-    let rows = [("When", "Sun, Sep 14 · 9 AM – 12 PM"), ("Where", "Riverside Park, main gate"), ("Bring", "Gloves & water — bags provided")];
+    let rows = [
+        ("When", "Sun, Sep 14 · 9 AM – 12 PM"),
+        ("Where", "Riverside Park, main gate"),
+        ("Bring", "Gloves & water — bags provided"),
+    ];
     let mut y = 720.0;
     for (label, val) in rows {
         s.circle(110.0, y + 18.0, 14.0, "#0369A1", "Dot");
@@ -4090,7 +4943,14 @@ fn flyer_community() -> BundledTemplate {
         y += 90.0;
     }
     s.rect(80.0, 1180.0, 920.0, 100.0, "#0369A1", "CTA");
-    s.text_center(540.0, 1206.0, 34.0, "#FFFFFF", "Register free at riverside.org/cleanup", "CTA label");
+    s.text_center(
+        540.0,
+        1206.0,
+        34.0,
+        "#FFFFFF",
+        "Register free at riverside.org/cleanup",
+        "CTA label",
+    );
     BundledTemplate {
         dir_name: "flyer-community.ktemplate",
         manifest: manifest(
@@ -4114,9 +4974,23 @@ fn flyer_product_launch() -> BundledTemplate {
     s.rect(390.0, 340.0, 300.0, 420.0, "#0EA5E9", "Screen");
     s.circle(540.0, 790.0, 20.0, "#475569", "Home");
     s.text_center(540.0, 900.0, 100.0, "#FFFFFF", "Aura One", "Title");
-    s.text_center(540.0, 1020.0, 34.0, "#94A3B8", "The smartphone that disappears", "Sub");
+    s.text_center(
+        540.0,
+        1020.0,
+        34.0,
+        "#94A3B8",
+        "The smartphone that disappears",
+        "Sub",
+    );
     s.rect(290.0, 1130.0, 500.0, 100.0, "#22D3EE", "CTA");
-    s.text_center(540.0, 1156.0, 36.0, "#0F172A", "Pre-order · aura.tech", "CTA label");
+    s.text_center(
+        540.0,
+        1156.0,
+        36.0,
+        "#0F172A",
+        "Pre-order · aura.tech",
+        "CTA label",
+    );
     BundledTemplate {
         dir_name: "flyer-product-launch.ktemplate",
         manifest: manifest(
@@ -4141,19 +5015,52 @@ fn resume_modern() -> BundledTemplate {
     s.rect(0.0, 320.0, A4_W, 10.0, "#6366F1", "Accent rule");
     s.text(80.0, 110.0, 76.0, "#FFFFFF", "Maya Chen", "Name");
     s.text(80.0, 210.0, 38.0, "#A5B4FC", "Marketing Manager", "Role");
-    s.text(720.0, 120.0, 26.0, "#CBD5E1", "maya.chen@mail.com", "Contact 1");
+    s.text(
+        720.0,
+        120.0,
+        26.0,
+        "#CBD5E1",
+        "maya.chen@mail.com",
+        "Contact 1",
+    );
     s.text(720.0, 165.0, 26.0, "#CBD5E1", "+1 555 0193", "Contact 2");
     s.text(720.0, 210.0, 26.0, "#CBD5E1", "Chicago, IL", "Contact 3");
     s.text(80.0, 390.0, 38.0, "#1E293B", "PROFILE", "Section 1");
     s.rect(80.0, 448.0, 120.0, 4.0, "#6366F1", "Rule 1");
-    s.text(80.0, 480.0, 28.0, "#475569", "Data-driven marketer with 7 years growing", "Profile 1");
-    s.text(80.0, 520.0, 28.0, "#475569", "brands through content and lifecycle campaigns.", "Profile 2");
+    s.text(
+        80.0,
+        480.0,
+        28.0,
+        "#475569",
+        "Data-driven marketer with 7 years growing",
+        "Profile 1",
+    );
+    s.text(
+        80.0,
+        520.0,
+        28.0,
+        "#475569",
+        "brands through content and lifecycle campaigns.",
+        "Profile 2",
+    );
     s.text(80.0, 620.0, 38.0, "#1E293B", "EXPERIENCE", "Section 2");
     s.rect(80.0, 678.0, 120.0, 4.0, "#6366F1", "Rule 2");
     let jobs = [
-        ("Marketing Manager — Brightly", "2021–Present", "Scaled organic traffic 3× in 18 months."),
-        ("Growth Lead — Hatch", "2018–2021", "Built the lifecycle email program from zero."),
-        ("Marketing Associate — Verve", "2016–2018", "Ran paid social across four markets."),
+        (
+            "Marketing Manager — Brightly",
+            "2021–Present",
+            "Scaled organic traffic 3× in 18 months.",
+        ),
+        (
+            "Growth Lead — Hatch",
+            "2018–2021",
+            "Built the lifecycle email program from zero.",
+        ),
+        (
+            "Marketing Associate — Verve",
+            "2016–2018",
+            "Ran paid social across four markets.",
+        ),
     ];
     let mut jy = 720.0;
     for (title, dates, desc) in jobs {
@@ -4190,10 +5097,23 @@ fn resume_minimal() -> BundledTemplate {
     s.bg("#FFFFFF");
     s.text(100.0, 140.0, 80.0, "#111827", "Daniel Park", "Name");
     s.text(100.0, 250.0, 34.0, "#6B7280", "Software Engineer", "Role");
-    s.text(100.0, 310.0, 26.0, "#6B7280", "daniel@mail.com · +1 555 0110 · Seattle", "Contact");
+    s.text(
+        100.0,
+        310.0,
+        26.0,
+        "#6B7280",
+        "daniel@mail.com · +1 555 0110 · Seattle",
+        "Contact",
+    );
     s.rect(100.0, 380.0, A4_W - 200.0, 2.0, "#E5E7EB", "Rule top");
     let sections = [
-        ("EXPERIENCE", &["Senior Engineer — Cloudbase · 2020–Present", "Engineer — Datafold · 2017–2020"][..]),
+        (
+            "EXPERIENCE",
+            &[
+                "Senior Engineer — Cloudbase · 2020–Present",
+                "Engineer — Datafold · 2017–2020",
+            ][..],
+        ),
         ("EDUCATION", &["B.S. Computer Science — UW · 2013–2017"][..]),
         ("SKILLS", &["Rust · TypeScript · Go · Postgres · AWS"][..]),
     ];
@@ -4228,11 +5148,32 @@ fn resume_creative() -> BundledTemplate {
     s.ellipse_a(160.0, 1620.0, 320.0, 320.0, "#FCA5A5", 0.40, "Glow B");
     s.circle(220.0, 240.0, 120.0, "#FB923C", "Avatar");
     s.text(380.0, 150.0, 76.0, "#7C2D12", "Lola Vega", "Name");
-    s.text(380.0, 250.0, 36.0, "#EA580C", "Illustrator & Art Director", "Role");
+    s.text(
+        380.0,
+        250.0,
+        36.0,
+        "#EA580C",
+        "Illustrator & Art Director",
+        "Role",
+    );
     s.rect(80.0, 420.0, A4_W - 160.0, 4.0, "#FED7AA", "Rule");
     s.text(80.0, 470.0, 36.0, "#7C2D12", "ABOUT", "Section 1");
-    s.text(80.0, 530.0, 28.0, "#9A3412", "I make playful, bold visuals for brands", "About 1");
-    s.text(80.0, 570.0, 28.0, "#9A3412", "that want to stand out and have fun.", "About 2");
+    s.text(
+        80.0,
+        530.0,
+        28.0,
+        "#9A3412",
+        "I make playful, bold visuals for brands",
+        "About 1",
+    );
+    s.text(
+        80.0,
+        570.0,
+        28.0,
+        "#9A3412",
+        "that want to stand out and have fun.",
+        "About 2",
+    );
     s.text(80.0, 680.0, 36.0, "#7C2D12", "SELECTED WORK", "Section 2");
     let work = [
         ("Sunday Mag — cover series", "2024"),
@@ -4274,14 +5215,53 @@ fn resume_executive() -> BundledTemplate {
     s.rect(0.0, 0.0, A4_W, 260.0, "#0F172A", "Header");
     s.rect(0.0, 256.0, A4_W, 6.0, "#B45309", "Accent");
     s.text_center(A4_W / 2.0, 90.0, 70.0, "#FFFFFF", "RICHARD HALE", "Name");
-    s.text_center(A4_W / 2.0, 180.0, 32.0, "#FCD34D", "Chief Operating Officer", "Role");
-    s.text(80.0, 320.0, 36.0, "#0F172A", "EXECUTIVE SUMMARY", "Section 1");
+    s.text_center(
+        A4_W / 2.0,
+        180.0,
+        32.0,
+        "#FCD34D",
+        "Chief Operating Officer",
+        "Role",
+    );
+    s.text(
+        80.0,
+        320.0,
+        36.0,
+        "#0F172A",
+        "EXECUTIVE SUMMARY",
+        "Section 1",
+    );
     s.rect(80.0, 378.0, A4_W - 160.0, 3.0, "#E2E8F0", "Rule 1");
-    s.text(80.0, 410.0, 28.0, "#334155", "Operations leader with 15+ years scaling", "Summary 1");
-    s.text(80.0, 450.0, 28.0, "#334155", "global teams and double-digit margin growth.", "Summary 2");
-    s.text(80.0, 560.0, 36.0, "#0F172A", "KEY ACHIEVEMENTS", "Section 2");
+    s.text(
+        80.0,
+        410.0,
+        28.0,
+        "#334155",
+        "Operations leader with 15+ years scaling",
+        "Summary 1",
+    );
+    s.text(
+        80.0,
+        450.0,
+        28.0,
+        "#334155",
+        "global teams and double-digit margin growth.",
+        "Summary 2",
+    );
+    s.text(
+        80.0,
+        560.0,
+        36.0,
+        "#0F172A",
+        "KEY ACHIEVEMENTS",
+        "Section 2",
+    );
     s.rect(80.0, 618.0, A4_W - 160.0, 3.0, "#E2E8F0", "Rule 2");
-    let stats = [("+42%", "Revenue growth"), ("3", "Markets launched"), ("$120M", "P&L managed")];
+    let stats = [
+        ("+42%", "Revenue growth"),
+        ("3", "Markets launched"),
+        ("$120M", "P&L managed"),
+    ];
     for (i, (num, label)) in stats.iter().enumerate() {
         let x = 80.0 + i as f64 * 370.0;
         s.rect(x, 660.0, 340.0, 180.0, "#F1F5F9", "Stat card");
@@ -4321,13 +5301,35 @@ fn resume_developer() -> BundledTemplate {
     s.bg("#0F172A");
     s.rect(0.0, 0.0, A4_W, A4_H, "#0F172A", "Bg fill");
     s.text(80.0, 110.0, 70.0, "#E2E8F0", "alex.dev", "Name");
-    s.text(80.0, 210.0, 32.0, "#38BDF8", "// Full-Stack Engineer", "Role");
+    s.text(
+        80.0,
+        210.0,
+        32.0,
+        "#38BDF8",
+        "// Full-Stack Engineer",
+        "Role",
+    );
     s.rect(80.0, 280.0, A4_W - 160.0, 2.0, "#1E293B", "Rule top");
-    s.text(80.0, 320.0, 28.0, "#64748B", "alex@dev.io · github.com/alexdev · Remote", "Contact");
+    s.text(
+        80.0,
+        320.0,
+        28.0,
+        "#64748B",
+        "alex@dev.io · github.com/alexdev · Remote",
+        "Contact",
+    );
     s.text(80.0, 420.0, 34.0, "#38BDF8", "$ experience", "Section 1");
     let jobs = [
-        ("Senior Engineer — Vercel", "2021–Now", "Edge runtime + DX tooling."),
-        ("Engineer — Supabase", "2019–2021", "Realtime + Postgres replication."),
+        (
+            "Senior Engineer — Vercel",
+            "2021–Now",
+            "Edge runtime + DX tooling.",
+        ),
+        (
+            "Engineer — Supabase",
+            "2019–2021",
+            "Realtime + Postgres replication.",
+        ),
         ("Engineer — Indie", "2017–2019", "Shipped 6 products solo."),
     ];
     let mut jy = 490.0;
@@ -4338,7 +5340,15 @@ fn resume_developer() -> BundledTemplate {
         jy += 150.0;
     }
     s.text(80.0, jy + 10.0, 34.0, "#38BDF8", "$ stack", "Section 2");
-    let stack = ["TypeScript", "Rust", "React", "Node", "Postgres", "Docker", "AWS"];
+    let stack = [
+        "TypeScript",
+        "Rust",
+        "React",
+        "Node",
+        "Postgres",
+        "Docker",
+        "AWS",
+    ];
     let mut tx = 80.0;
     let mut ty = jy + 80.0;
     for tool in stack {
@@ -4378,8 +5388,22 @@ fn report_cover_minimal() -> BundledTemplate {
     s.rect(220.0, 470.0, 300.0, 8.0, "#111827", "Rule");
     s.text(220.0, 540.0, 56.0, "#111827", "Building for", "Title 1");
     s.text(220.0, 620.0, 56.0, "#111827", "the long term", "Title 2");
-    s.text(220.0, 1480.0, 30.0, "#6B7280", "Northwind Industries, Inc.", "Company");
-    s.text(220.0, 1530.0, 26.0, "#9CA3AF", "Prepared for shareholders · March 2026", "Meta");
+    s.text(
+        220.0,
+        1480.0,
+        30.0,
+        "#6B7280",
+        "Northwind Industries, Inc.",
+        "Company",
+    );
+    s.text(
+        220.0,
+        1530.0,
+        26.0,
+        "#9CA3AF",
+        "Prepared for shareholders · March 2026",
+        "Meta",
+    );
     BundledTemplate {
         dir_name: "report-cover-minimal.ktemplate",
         manifest: manifest(
@@ -4397,11 +5421,43 @@ fn report_exec_summary() -> BundledTemplate {
     let mut s = Sheet::new(A4_W, A4_H);
     s.bg("#FFFFFF");
     s.rect(0.0, 0.0, A4_W, 180.0, "#1D4ED8", "Header");
-    s.text(80.0, 60.0, 48.0, "#FFFFFF", "Executive Summary", "Header title");
-    s.text(80.0, 230.0, 28.0, "#334155", "This report reviews fiscal year performance across", "Intro 1");
-    s.text(80.0, 270.0, 28.0, "#334155", "revenue, operations, and product, and outlines the", "Intro 2");
-    s.text(80.0, 310.0, 28.0, "#334155", "strategic priorities for the year ahead.", "Intro 3");
-    let stats = [("$48.2M", "Total revenue", "#1D4ED8"), ("+18%", "YoY growth", "#0891B2"), ("92%", "Retention", "#059669")];
+    s.text(
+        80.0,
+        60.0,
+        48.0,
+        "#FFFFFF",
+        "Executive Summary",
+        "Header title",
+    );
+    s.text(
+        80.0,
+        230.0,
+        28.0,
+        "#334155",
+        "This report reviews fiscal year performance across",
+        "Intro 1",
+    );
+    s.text(
+        80.0,
+        270.0,
+        28.0,
+        "#334155",
+        "revenue, operations, and product, and outlines the",
+        "Intro 2",
+    );
+    s.text(
+        80.0,
+        310.0,
+        28.0,
+        "#334155",
+        "strategic priorities for the year ahead.",
+        "Intro 3",
+    );
+    let stats = [
+        ("$48.2M", "Total revenue", "#1D4ED8"),
+        ("+18%", "YoY growth", "#0891B2"),
+        ("92%", "Retention", "#059669"),
+    ];
     for (i, (num, label, hex)) in stats.iter().enumerate() {
         let x = 80.0 + i as f64 * 370.0;
         s.rect(x, 400.0, 340.0, 200.0, "#F1F5F9", "Stat card");
@@ -4440,21 +5496,52 @@ fn report_data_page() -> BundledTemplate {
     let mut s = Sheet::new(A4_W, A4_H);
     s.bg("#FFFFFF");
     s.text(80.0, 90.0, 44.0, "#0F172A", "Quarterly Revenue", "Title");
-    s.text(80.0, 160.0, 28.0, "#64748B", "Revenue by quarter ($M), FY2025", "Subtitle");
+    s.text(
+        80.0,
+        160.0,
+        28.0,
+        "#64748B",
+        "Revenue by quarter ($M), FY2025",
+        "Subtitle",
+    );
     // Bar chart.
     s.rect(80.0, 280.0, 4.0, 560.0, "#CBD5E1", "Y axis");
     s.rect(80.0, 836.0, 1000.0, 4.0, "#CBD5E1", "X axis");
-    let bars = [("Q1", 0.55, "#1D4ED8"), ("Q2", 0.68, "#1D4ED8"), ("Q3", 0.82, "#1D4ED8"), ("Q4", 0.97, "#0891B2")];
+    let bars = [
+        ("Q1", 0.55, "#1D4ED8"),
+        ("Q2", 0.68, "#1D4ED8"),
+        ("Q3", 0.82, "#1D4ED8"),
+        ("Q4", 0.97, "#0891B2"),
+    ];
     for (i, (label, frac, hex)) in bars.iter().enumerate() {
         let x = 180.0 + i as f64 * 220.0;
         let h = 540.0 * frac;
         s.rect(x, 836.0 - h, 150.0, h, hex, "Bar");
-        s.text_center(x + 75.0, 836.0 - h - 44.0, 30.0, "#0F172A", &format!("{:.0}", frac * 14.0), "Bar value");
+        s.text_center(
+            x + 75.0,
+            836.0 - h - 44.0,
+            30.0,
+            "#0F172A",
+            &format!("{:.0}", frac * 14.0),
+            "Bar value",
+        );
         s.text_center(x + 75.0, 860.0, 28.0, "#475569", label, "Bar label");
     }
     // Data table.
-    s.text(80.0, 960.0, 36.0, "#0F172A", "Breakdown by region", "Table title");
-    let rows = [("North America", "$18.4M", "+12%"), ("EMEA", "$15.1M", "+24%"), ("APAC", "$9.8M", "+19%"), ("LATAM", "$4.9M", "+8%")];
+    s.text(
+        80.0,
+        960.0,
+        36.0,
+        "#0F172A",
+        "Breakdown by region",
+        "Table title",
+    );
+    let rows = [
+        ("North America", "$18.4M", "+12%"),
+        ("EMEA", "$15.1M", "+24%"),
+        ("APAC", "$9.8M", "+19%"),
+        ("LATAM", "$4.9M", "+8%"),
+    ];
     s.rect(80.0, 1020.0, 1000.0, 64.0, "#1D4ED8", "Table head");
     s.text(110.0, 1036.0, 28.0, "#FFFFFF", "Region", "Th 1");
     s.text(620.0, 1036.0, 28.0, "#FFFFFF", "Revenue", "Th 2");
@@ -4488,7 +5575,14 @@ fn report_section() -> BundledTemplate {
     s.text(80.0, 760.0, 240.0, "#1E293B", "02", "Big number");
     s.text(80.0, 820.0, 36.0, "#60A5FA", "SECTION TWO", "Eyebrow");
     s.text(80.0, 900.0, 72.0, "#FFFFFF", "Operations", "Title");
-    s.text(80.0, 1010.0, 30.0, "#94A3B8", "How we scaled delivery while holding costs flat.", "Sub");
+    s.text(
+        80.0,
+        1010.0,
+        30.0,
+        "#94A3B8",
+        "How we scaled delivery while holding costs flat.",
+        "Sub",
+    );
     s.rect(80.0, 1100.0, 300.0, 6.0, "#1D4ED8", "Rule");
     BundledTemplate {
         dir_name: "report-section.ktemplate",
@@ -4507,8 +5601,22 @@ fn report_financials() -> BundledTemplate {
     let mut s = Sheet::new(A4_W, A4_H);
     s.bg("#FFFFFF");
     s.rect(0.0, 0.0, A4_W, 160.0, "#064E3B", "Header");
-    s.text(80.0, 50.0, 44.0, "#FFFFFF", "Financial Statements", "Header title");
-    s.text(80.0, 220.0, 32.0, "#0F172A", "Income statement ($000s)", "Table title");
+    s.text(
+        80.0,
+        50.0,
+        44.0,
+        "#FFFFFF",
+        "Financial Statements",
+        "Header title",
+    );
+    s.text(
+        80.0,
+        220.0,
+        32.0,
+        "#0F172A",
+        "Income statement ($000s)",
+        "Table title",
+    );
     let rows = [
         ("Revenue", "48,210", "40,860"),
         ("Cost of revenue", "(18,940)", "(17,120)"),
@@ -4538,7 +5646,14 @@ fn report_financials() -> BundledTemplate {
         s.text(920.0, ry + 14.0, 28.0, "#475569", prev, "Cell prev");
         ry += 60.0;
     }
-    s.text(80.0, ry + 30.0, 24.0, "#94A3B8", "Figures unaudited · prepared under IFRS", "Footnote");
+    s.text(
+        80.0,
+        ry + 30.0,
+        24.0,
+        "#94A3B8",
+        "Figures unaudited · prepared under IFRS",
+        "Footnote",
+    );
     BundledTemplate {
         dir_name: "report-financials.ktemplate",
         manifest: manifest(
@@ -4566,22 +5681,67 @@ fn brochure_trifold() -> BundledTemplate {
     // Panel 1 (cover).
     s.rect(0.0, 0.0, panel, A4_H, "#0EA5E9", "Cover panel");
     s.circle(panel / 2.0, 620.0, 130.0, "#7DD3FC", "Cover mark");
-    s.text_center(panel / 2.0, 540.0, 30.0, "#E0F2FE", "WELCOME TO", "Cover eyebrow");
-    s.text_center(panel / 2.0, 820.0, 56.0, "#FFFFFF", "Lakeside", "Cover title 1");
-    s.text_center(panel / 2.0, 890.0, 56.0, "#FFFFFF", "Clinic", "Cover title 2");
-    s.text_center(panel / 2.0, 1010.0, 26.0, "#BAE6FD", "Your health, our priority", "Cover sub");
+    s.text_center(
+        panel / 2.0,
+        540.0,
+        30.0,
+        "#E0F2FE",
+        "WELCOME TO",
+        "Cover eyebrow",
+    );
+    s.text_center(
+        panel / 2.0,
+        820.0,
+        56.0,
+        "#FFFFFF",
+        "Lakeside",
+        "Cover title 1",
+    );
+    s.text_center(
+        panel / 2.0,
+        890.0,
+        56.0,
+        "#FFFFFF",
+        "Clinic",
+        "Cover title 2",
+    );
+    s.text_center(
+        panel / 2.0,
+        1010.0,
+        26.0,
+        "#BAE6FD",
+        "Your health, our priority",
+        "Cover sub",
+    );
     // Panel 2.
     s.text(panel + 50.0, 120.0, 36.0, "#0F172A", "About us", "P2 title");
     s.rect(panel + 50.0, 178.0, 100.0, 4.0, "#0EA5E9", "P2 rule");
-    let p2 = ["We provide compassionate", "primary care for the whole", "family, close to home and", "open seven days a week."];
+    let p2 = [
+        "We provide compassionate",
+        "primary care for the whole",
+        "family, close to home and",
+        "open seven days a week.",
+    ];
     let mut y = 220.0;
     for line in p2 {
         s.text(panel + 50.0, y, 26.0, "#475569", line, "P2 line");
         y += 46.0;
     }
-    s.text(panel + 50.0, 520.0, 36.0, "#0F172A", "Services", "P2 title 2");
+    s.text(
+        panel + 50.0,
+        520.0,
+        36.0,
+        "#0F172A",
+        "Services",
+        "P2 title 2",
+    );
     s.rect(panel + 50.0, 578.0, 100.0, 4.0, "#0EA5E9", "P2 rule 2");
-    let svc = ["General checkups", "Pediatrics", "Vaccinations", "Lab & diagnostics"];
+    let svc = [
+        "General checkups",
+        "Pediatrics",
+        "Vaccinations",
+        "Lab & diagnostics",
+    ];
     let mut sy = 620.0;
     for item in svc {
         s.circle(panel + 64.0, sy + 14.0, 10.0, "#0EA5E9", "Dot");
@@ -4590,9 +5750,21 @@ fn brochure_trifold() -> BundledTemplate {
     }
     // Panel 3 (contact).
     s.rect(panel * 2.0, 0.0, panel, A4_H, "#0F172A", "Contact panel");
-    s.text(panel * 2.0 + 50.0, 120.0, 36.0, "#FFFFFF", "Visit us", "P3 title");
+    s.text(
+        panel * 2.0 + 50.0,
+        120.0,
+        36.0,
+        "#FFFFFF",
+        "Visit us",
+        "P3 title",
+    );
     s.rect(panel * 2.0 + 50.0, 178.0, 100.0, 4.0, "#0EA5E9", "P3 rule");
-    let p3 = ["12 Lakeside Avenue", "Open Mon–Sun, 8–8", "(555) 010-3322", "lakesideclinic.org"];
+    let p3 = [
+        "12 Lakeside Avenue",
+        "Open Mon–Sun, 8–8",
+        "(555) 010-3322",
+        "lakesideclinic.org",
+    ];
     let mut py = 230.0;
     for line in p3 {
         s.text(panel * 2.0 + 50.0, py, 26.0, "#CBD5E1", line, "P3 line");
@@ -4621,9 +5793,21 @@ fn brochure_real_estate() -> BundledTemplate {
     s.rect(80.0, 60.0, 220.0, 64.0, "#B45309", "Badge");
     s.text(105.0, 76.0, 30.0, "#FFFFFF", "JUST LISTED", "Badge text");
     s.text(80.0, 690.0, 64.0, "#1C1917", "The Aspen House", "Title");
-    s.text(80.0, 780.0, 34.0, "#B45309", "$1,250,000 · 5 bd · 4 ba · 3,800 sqft", "Specs");
+    s.text(
+        80.0,
+        780.0,
+        34.0,
+        "#B45309",
+        "$1,250,000 · 5 bd · 4 ba · 3,800 sqft",
+        "Specs",
+    );
     s.rect(80.0, 850.0, A4_W - 160.0, 3.0, "#E7E5E4", "Rule");
-    let features = ["Chef's kitchen with marble island", "Primary suite with spa bath", "Heated saltwater pool", "Three-car garage & workshop"];
+    let features = [
+        "Chef's kitchen with marble island",
+        "Primary suite with spa bath",
+        "Heated saltwater pool",
+        "Three-car garage & workshop",
+    ];
     let mut y = 900.0;
     for f in features {
         s.circle(100.0, y + 14.0, 10.0, "#B45309", "Dot");
@@ -4631,7 +5815,14 @@ fn brochure_real_estate() -> BundledTemplate {
         y += 70.0;
     }
     s.rect(80.0, 1500.0, A4_W - 160.0, 120.0, "#1C1917", "CTA");
-    s.text_center(A4_W / 2.0, 1536.0, 32.0, "#FFFFFF", "Schedule a tour · Harper & Co · (555) 010-7788", "CTA label");
+    s.text_center(
+        A4_W / 2.0,
+        1536.0,
+        32.0,
+        "#FFFFFF",
+        "Schedule a tour · Harper & Co · (555) 010-7788",
+        "CTA label",
+    );
     BundledTemplate {
         dir_name: "brochure-real-estate.ktemplate",
         manifest: manifest(
@@ -4654,8 +5845,19 @@ fn brochure_travel() -> BundledTemplate {
     s.ellipse(900.0, 660.0, 460.0, 240.0, "#0C4A6E", "Hill front");
     s.text(80.0, 110.0, 36.0, "#A5F3FC", "ESCAPE TO", "Eyebrow");
     s.text(80.0, 200.0, 96.0, "#FFFFFF", "The Coast", "Title");
-    s.text(80.0, 720.0, 32.0, "#155E75", "Three days of sun, sea, and slow mornings.", "Intro");
-    let pkgs = [("Weekend escape", "2 nights · from $320"), ("Coastal week", "5 nights · from $720"), ("Island hop", "7 nights · from $1,100")];
+    s.text(
+        80.0,
+        720.0,
+        32.0,
+        "#155E75",
+        "Three days of sun, sea, and slow mornings.",
+        "Intro",
+    );
+    let pkgs = [
+        ("Weekend escape", "2 nights · from $320"),
+        ("Coastal week", "5 nights · from $720"),
+        ("Island hop", "7 nights · from $1,100"),
+    ];
     let mut y = 820.0;
     for (name, price) in pkgs {
         s.rect(80.0, y, A4_W - 160.0, 150.0, "#FFFFFF", "Pkg card");
@@ -4664,7 +5866,14 @@ fn brochure_travel() -> BundledTemplate {
         s.text(130.0, y + 86.0, 28.0, "#0891B2", price, "Pkg price");
         y += 180.0;
     }
-    s.text_center(A4_W / 2.0, 1560.0, 28.0, "#155E75", "Book at coastlinetours.com · 0800 555 010", "Footer");
+    s.text_center(
+        A4_W / 2.0,
+        1560.0,
+        28.0,
+        "#155E75",
+        "Book at coastlinetours.com · 0800 555 010",
+        "Footer",
+    );
     BundledTemplate {
         dir_name: "brochure-travel.ktemplate",
         manifest: manifest(
@@ -4684,7 +5893,14 @@ fn brochure_product() -> BundledTemplate {
     s.rect(0.0, 0.0, A4_W, 60.0, "#4F46E5", "Top rule");
     s.text(80.0, 120.0, 36.0, "#4F46E5", "PRODUCT GUIDE", "Eyebrow");
     s.text(80.0, 190.0, 80.0, "#0F172A", "Meet Halo", "Title");
-    s.text(80.0, 300.0, 30.0, "#475569", "The smart desk lamp that adapts to you.", "Sub");
+    s.text(
+        80.0,
+        300.0,
+        30.0,
+        "#475569",
+        "The smart desk lamp that adapts to you.",
+        "Sub",
+    );
     // Product render.
     s.rect(820.0, 140.0, 340.0, 360.0, "#EEF2FF", "Product panel");
     s.rect(960.0, 200.0, 24.0, 240.0, "#4F46E5", "Lamp stem");
@@ -4707,7 +5923,14 @@ fn brochure_product() -> BundledTemplate {
         s.text(x + 80.0, y + 52.0, 26.0, "#64748B", desc, "Feat desc");
     }
     s.rect(80.0, 1540.0, A4_W - 160.0, 110.0, "#4F46E5", "CTA");
-    s.text_center(A4_W / 2.0, 1572.0, 32.0, "#FFFFFF", "Available now · $129 · halo.design", "CTA label");
+    s.text_center(
+        A4_W / 2.0,
+        1572.0,
+        32.0,
+        "#FFFFFF",
+        "Available now · $129 · halo.design",
+        "CTA label",
+    );
     BundledTemplate {
         dir_name: "brochure-product.ktemplate",
         manifest: manifest(
@@ -4734,10 +5957,31 @@ fn proposal_cover_light() -> BundledTemplate {
     s.rect(80.0, 290.0, 160.0, 6.0, "#7C3AED", "Rule");
     s.text(80.0, 360.0, 96.0, "#0F172A", "Website", "Title 1");
     s.text(80.0, 470.0, 96.0, "#0F172A", "Redesign", "Title 2");
-    s.text(80.0, 620.0, 32.0, "#64748B", "A proposal for a faster, on-brand web presence.", "Sub");
+    s.text(
+        80.0,
+        620.0,
+        32.0,
+        "#64748B",
+        "A proposal for a faster, on-brand web presence.",
+        "Sub",
+    );
     s.rect(80.0, 1420.0, A4_W - 160.0, 2.0, "#E2E8F0", "Divider");
-    s.text(80.0, 1460.0, 28.0, "#0F172A", "Prepared for: Northwind Co.", "Meta 1");
-    s.text(80.0, 1505.0, 28.0, "#64748B", "Prepared by: Studio Atlas · June 2026", "Meta 2");
+    s.text(
+        80.0,
+        1460.0,
+        28.0,
+        "#0F172A",
+        "Prepared for: Northwind Co.",
+        "Meta 1",
+    );
+    s.text(
+        80.0,
+        1505.0,
+        28.0,
+        "#64748B",
+        "Prepared by: Studio Atlas · June 2026",
+        "Meta 2",
+    );
     BundledTemplate {
         dir_name: "proposal-cover-light.ktemplate",
         manifest: manifest(
@@ -4757,7 +6001,11 @@ fn proposal_scope() -> BundledTemplate {
     s.text(80.0, 100.0, 48.0, "#0F172A", "Scope of Work", "Title");
     s.rect(80.0, 168.0, 140.0, 6.0, "#7C3AED", "Rule");
     let phases = [
-        ("01", "Discovery", "Stakeholder interviews, audit, and goals."),
+        (
+            "01",
+            "Discovery",
+            "Stakeholder interviews, audit, and goals.",
+        ),
         ("02", "Design", "Wireframes, visual design, and prototypes."),
         ("03", "Build", "Front-end build, CMS, and integrations."),
         ("04", "Launch", "QA, migration, training, and go-live."),
@@ -4790,9 +6038,27 @@ fn proposal_pricing() -> BundledTemplate {
     s.text(80.0, 100.0, 48.0, "#0F172A", "Investment", "Title");
     s.rect(80.0, 168.0, 140.0, 6.0, "#7C3AED", "Rule");
     let tiers = [
-        ("Starter", "$4,800", "#F8FAFC", "#0F172A", "5-page site · 4 weeks"),
-        ("Growth", "$9,600", "#7C3AED", "#FFFFFF", "12-page site · CMS · 8 weeks"),
-        ("Scale", "$18,000", "#F8FAFC", "#0F172A", "Custom build · 12 weeks"),
+        (
+            "Starter",
+            "$4,800",
+            "#F8FAFC",
+            "#0F172A",
+            "5-page site · 4 weeks",
+        ),
+        (
+            "Growth",
+            "$9,600",
+            "#7C3AED",
+            "#FFFFFF",
+            "12-page site · CMS · 8 weeks",
+        ),
+        (
+            "Scale",
+            "$18,000",
+            "#F8FAFC",
+            "#0F172A",
+            "Custom build · 12 weeks",
+        ),
     ];
     for (i, (name, price, bg, ink, desc)) in tiers.iter().enumerate() {
         let x = 80.0 + i as f64 * 370.0;
@@ -4803,10 +6069,31 @@ fn proposal_pricing() -> BundledTemplate {
         }
         s.text_center(x + 170.0, 360.0, 40.0, ink, name, "Tier name");
         s.text_center(x + 170.0, 440.0, 72.0, ink, price, "Tier price");
-        s.rect(x + 60.0, 560.0, 220.0, 2.0, if i == 1 { "#A78BFA" } else { "#E2E8F0" }, "Tier rule");
-        s.text_center(x + 170.0, 600.0, 24.0, if i == 1 { "#EDE9FE" } else { "#64748B" }, desc, "Tier desc");
+        s.rect(
+            x + 60.0,
+            560.0,
+            220.0,
+            2.0,
+            if i == 1 { "#A78BFA" } else { "#E2E8F0" },
+            "Tier rule",
+        );
+        s.text_center(
+            x + 170.0,
+            600.0,
+            24.0,
+            if i == 1 { "#EDE9FE" } else { "#64748B" },
+            desc,
+            "Tier desc",
+        );
     }
-    s.text(80.0, 860.0, 28.0, "#64748B", "All tiers include hosting setup and a 30-day support window.", "Footnote");
+    s.text(
+        80.0,
+        860.0,
+        28.0,
+        "#64748B",
+        "All tiers include hosting setup and a 30-day support window.",
+        "Footnote",
+    );
     BundledTemplate {
         dir_name: "proposal-pricing.ktemplate",
         manifest: manifest(
@@ -4826,9 +6113,27 @@ fn proposal_about() -> BundledTemplate {
     s.ellipse_a(160.0, 160.0, 320.0, 320.0, "#7C3AED", 0.4, "Glow");
     s.text(80.0, 120.0, 48.0, "#FFFFFF", "About Studio Atlas", "Title");
     s.rect(80.0, 188.0, 140.0, 6.0, "#A78BFA", "Rule");
-    s.text(80.0, 240.0, 28.0, "#CBD5E1", "We're a small team of designers and engineers", "Body 1");
-    s.text(80.0, 280.0, 28.0, "#CBD5E1", "building thoughtful digital products since 2014.", "Body 2");
-    let stats = [("120+", "Projects shipped"), ("12", "Team members"), ("4.9", "Avg. client rating")];
+    s.text(
+        80.0,
+        240.0,
+        28.0,
+        "#CBD5E1",
+        "We're a small team of designers and engineers",
+        "Body 1",
+    );
+    s.text(
+        80.0,
+        280.0,
+        28.0,
+        "#CBD5E1",
+        "building thoughtful digital products since 2014.",
+        "Body 2",
+    );
+    let stats = [
+        ("120+", "Projects shipped"),
+        ("12", "Team members"),
+        ("4.9", "Avg. client rating"),
+    ];
     for (i, (num, label)) in stats.iter().enumerate() {
         let x = 80.0 + i as f64 * 370.0;
         s.rect(x, 380.0, 340.0, 200.0, "#1E293B", "Stat card");
@@ -4917,8 +6222,22 @@ fn custom_letterhead() -> BundledTemplate {
     s.bg("#FFFFFF");
     s.rect(0.0, 0.0, A4_W, 160.0, "#1E3A8A", "Header band");
     s.circle(110.0, 80.0, 40.0, "#FFFFFF", "Logo");
-    s.text(180.0, 56.0, 40.0, "#FFFFFF", "Northwind Industries", "Brand");
-    s.text(820.0, 64.0, 24.0, "#BFDBFE", "123 Harbor Rd · Boston, MA", "Address");
+    s.text(
+        180.0,
+        56.0,
+        40.0,
+        "#FFFFFF",
+        "Northwind Industries",
+        "Brand",
+    );
+    s.text(
+        820.0,
+        64.0,
+        24.0,
+        "#BFDBFE",
+        "123 Harbor Rd · Boston, MA",
+        "Address",
+    );
     s.text(80.0, 280.0, 28.0, "#0F172A", "June 15, 2026", "Date");
     s.text(80.0, 360.0, 28.0, "#0F172A", "Dear Ms. Chen,", "Salutation");
     let body = [
@@ -4935,10 +6254,31 @@ fn custom_letterhead() -> BundledTemplate {
         y += 50.0;
     }
     s.text(80.0, y + 40.0, 26.0, "#0F172A", "Warm regards,", "Closing");
-    s.text(80.0, y + 100.0, 32.0, "#1E3A8A", "Richard Hale", "Sign name");
-    s.text(80.0, y + 146.0, 24.0, "#64748B", "Chief Operating Officer", "Sign role");
+    s.text(
+        80.0,
+        y + 100.0,
+        32.0,
+        "#1E3A8A",
+        "Richard Hale",
+        "Sign name",
+    );
+    s.text(
+        80.0,
+        y + 146.0,
+        24.0,
+        "#64748B",
+        "Chief Operating Officer",
+        "Sign role",
+    );
     s.rect(0.0, A4_H - 80.0, A4_W, 80.0, "#1E3A8A", "Footer");
-    s.text_center(A4_W / 2.0, A4_H - 56.0, 22.0, "#BFDBFE", "northwind.com · (555) 010-2200 · hello@northwind.com", "Footer text");
+    s.text_center(
+        A4_W / 2.0,
+        A4_H - 56.0,
+        22.0,
+        "#BFDBFE",
+        "northwind.com · (555) 010-2200 · hello@northwind.com",
+        "Footer text",
+    );
     BundledTemplate {
         dir_name: "custom-letterhead.ktemplate",
         manifest: manifest(
@@ -4946,7 +6286,13 @@ fn custom_letterhead() -> BundledTemplate {
             "Letterhead",
             "A4 corporate letterhead with a branded header/footer and a ready-to-edit letter body.",
             TemplateCategory::Custom,
-            &["letterhead", "stationery", "letter", "corporate", "business"],
+            &[
+                "letterhead",
+                "stationery",
+                "letter",
+                "corporate",
+                "business",
+            ],
         ),
         content: s.finish(),
     }
@@ -4960,7 +6306,14 @@ fn custom_invoice() -> BundledTemplate {
     s.text(820.0, 144.0, 26.0, "#64748B", "Date: Jun 15, 2026", "Date");
     s.rect(80.0, 200.0, A4_W - 160.0, 3.0, "#E2E8F0", "Rule top");
     s.text(80.0, 240.0, 26.0, "#94A3B8", "BILL TO", "Bill label");
-    s.text(80.0, 280.0, 30.0, "#0F172A", "Acme Corp · 50 Market St · NYC", "Bill to");
+    s.text(
+        80.0,
+        280.0,
+        30.0,
+        "#0F172A",
+        "Acme Corp · 50 Market St · NYC",
+        "Bill to",
+    );
     // Table head.
     s.rect(80.0, 380.0, A4_W - 160.0, 64.0, "#0F172A", "Table head");
     s.text(110.0, 396.0, 26.0, "#FFFFFF", "Description", "Th 1");
@@ -4984,9 +6337,23 @@ fn custom_invoice() -> BundledTemplate {
         ry += 60.0;
     }
     s.rect(700.0, ry + 30.0, 380.0, 80.0, "#EEF2FF", "Total box");
-    s.text(720.0, ry + 52.0, 30.0, "#4338CA", "Total due", "Total label");
+    s.text(
+        720.0,
+        ry + 52.0,
+        30.0,
+        "#4338CA",
+        "Total due",
+        "Total label",
+    );
     s.text(960.0, ry + 48.0, 38.0, "#4338CA", "$11,240", "Total value");
-    s.text(80.0, ry + 180.0, 24.0, "#94A3B8", "Payment due within 30 days · ACH or card · thank you!", "Footnote");
+    s.text(
+        80.0,
+        ry + 180.0,
+        24.0,
+        "#94A3B8",
+        "Payment due within 30 days · ACH or card · thank you!",
+        "Footnote",
+    );
     BundledTemplate {
         dir_name: "custom-invoice.ktemplate",
         manifest: manifest(
@@ -5013,12 +6380,40 @@ fn custom_certificate() -> BundledTemplate {
     s.rect(110.0, 1126.0, 1534.0, 4.0, "#E7C9A0", "Inset bottom");
     s.circle(877.0, 230.0, 60.0, "#B45309", "Seal");
     s.circle(877.0, 230.0, 38.0, "#FCD34D", "Seal inner");
-    s.text_center(877.0, 340.0, 34.0, "#B45309", "CERTIFICATE OF ACHIEVEMENT", "Eyebrow");
-    s.text_center(877.0, 420.0, 28.0, "#78716C", "This certificate is proudly presented to", "Intro");
+    s.text_center(
+        877.0,
+        340.0,
+        34.0,
+        "#B45309",
+        "CERTIFICATE OF ACHIEVEMENT",
+        "Eyebrow",
+    );
+    s.text_center(
+        877.0,
+        420.0,
+        28.0,
+        "#78716C",
+        "This certificate is proudly presented to",
+        "Intro",
+    );
     s.text_center(877.0, 500.0, 96.0, "#1C1917", "Alex Morgan", "Recipient");
     s.rect(577.0, 640.0, 600.0, 3.0, "#E7C9A0", "Name rule");
-    s.text_center(877.0, 690.0, 28.0, "#57534E", "for outstanding completion of the Advanced", "Body 1");
-    s.text_center(877.0, 730.0, 28.0, "#57534E", "Design Program with distinction.", "Body 2");
+    s.text_center(
+        877.0,
+        690.0,
+        28.0,
+        "#57534E",
+        "for outstanding completion of the Advanced",
+        "Body 1",
+    );
+    s.text_center(
+        877.0,
+        730.0,
+        28.0,
+        "#57534E",
+        "Design Program with distinction.",
+        "Body 2",
+    );
     s.text_center(577.0, 980.0, 26.0, "#1C1917", "Jamie Lee", "Sig 1 name");
     s.rect(437.0, 970.0, 280.0, 2.0, "#A8A29E", "Sig 1 rule");
     s.text_center(577.0, 1020.0, 22.0, "#78716C", "Director", "Sig 1 role");
@@ -5046,8 +6441,22 @@ fn custom_menu() -> BundledTemplate {
     s.text_center(A4_W / 2.0, 180.0, 96.0, "#FFFFFF", "Dinner Menu", "Title");
     s.rect(A4_W / 2.0 - 80.0, 320.0, 160.0, 4.0, "#B45309", "Rule");
     let sections = [
-        ("STARTERS", &[("Bruschetta", "9"), ("Calamari fritti", "13"), ("Burrata & peach", "14")][..]),
-        ("MAINS", &[("Tagliatelle ragù", "22"), ("Branzino al forno", "28"), ("Risotto ai funghi", "21")][..]),
+        (
+            "STARTERS",
+            &[
+                ("Bruschetta", "9"),
+                ("Calamari fritti", "13"),
+                ("Burrata & peach", "14"),
+            ][..],
+        ),
+        (
+            "MAINS",
+            &[
+                ("Tagliatelle ragù", "22"),
+                ("Branzino al forno", "28"),
+                ("Risotto ai funghi", "21"),
+            ][..],
+        ),
         ("DOLCI", &[("Tiramisù", "10"), ("Panna cotta", "9")][..]),
     ];
     let mut y = 400.0;
@@ -5062,7 +6471,14 @@ fn custom_menu() -> BundledTemplate {
         }
         y += 50.0;
     }
-    s.text_center(A4_W / 2.0, A4_H - 90.0, 24.0, "#A8A29E", "Kitchen open 5–11pm · 88 Vine Street", "Footer");
+    s.text_center(
+        A4_W / 2.0,
+        A4_H - 90.0,
+        24.0,
+        "#A8A29E",
+        "Kitchen open 5–11pm · 88 Vine Street",
+        "Footer",
+    );
     BundledTemplate {
         dir_name: "custom-menu.ktemplate",
         manifest: manifest(
@@ -5085,7 +6501,14 @@ fn custom_gift_card() -> BundledTemplate {
     s.text(80.0, 220.0, 90.0, "#FFFFFF", "Gift Card", "Title");
     s.rect(80.0, 360.0, 360.0, 120.0, "#FFFFFF", "Value chip");
     s.text_center(260.0, 388.0, 64.0, "#BE123C", "$50", "Value");
-    s.text(80.0, 520.0, 26.0, "#FECDD3", "Redeemable in-store · no expiry", "Note");
+    s.text(
+        80.0,
+        520.0,
+        26.0,
+        "#FECDD3",
+        "Redeemable in-store · no expiry",
+        "Note",
+    );
     s.text(620.0, 520.0, 26.0, "#FECDD3", "Code: BLOOM-7H2K", "Code");
     BundledTemplate {
         dir_name: "custom-gift-card.ktemplate",
@@ -5111,9 +6534,30 @@ fn custom_ticket() -> BundledTemplate {
     }
     s.text(60.0, 60.0, 30.0, "#C7D2FE", "LIVE MUSIC SERIES", "Eyebrow");
     s.text(60.0, 130.0, 80.0, "#FFFFFF", "Neon Tides", "Title");
-    s.text(60.0, 250.0, 30.0, "#C7D2FE", "Sat · Nov 9 · 8:00 PM", "When");
-    s.text(60.0, 310.0, 30.0, "#C7D2FE", "The Warehouse · Sec A · Row 4", "Where");
-    s.text(60.0, 380.0, 26.0, "#A5B4FC", "Admit One · General Admission", "Admit");
+    s.text(
+        60.0,
+        250.0,
+        30.0,
+        "#C7D2FE",
+        "Sat · Nov 9 · 8:00 PM",
+        "When",
+    );
+    s.text(
+        60.0,
+        310.0,
+        30.0,
+        "#C7D2FE",
+        "The Warehouse · Sec A · Row 4",
+        "Where",
+    );
+    s.text(
+        60.0,
+        380.0,
+        26.0,
+        "#A5B4FC",
+        "Admit One · General Admission",
+        "Admit",
+    );
     s.text_center(1040.0, 120.0, 26.0, "#94A3B8", "SEAT", "Stub label");
     s.text_center(1040.0, 160.0, 60.0, "#FFFFFF", "A4", "Stub seat");
     s.rect(960.0, 280.0, 160.0, 110.0, "#FFFFFF", "QR");
@@ -5140,8 +6584,22 @@ fn custom_postcard() -> BundledTemplate {
     s.ellipse(1080.0, 800.0, 520.0, 200.0, "#075985", "Wave front");
     // Big greeting wordmark.
     s.text_center(750.0, 300.0, 200.0, "#FFFFFF", "ALOHA", "Greeting");
-    s.text_center(750.0, 520.0, 40.0, "#E0F2FE", "Greetings from the islands", "Sub");
-    s.text(80.0, 880.0, 30.0, "#1C1917", "Wish you were here! — M & J", "Note");
+    s.text_center(
+        750.0,
+        520.0,
+        40.0,
+        "#E0F2FE",
+        "Greetings from the islands",
+        "Sub",
+    );
+    s.text(
+        80.0,
+        880.0,
+        30.0,
+        "#1C1917",
+        "Wish you were here! — M & J",
+        "Note",
+    );
     BundledTemplate {
         dir_name: "custom-postcard.ktemplate",
         manifest: manifest(
@@ -5174,13 +6632,41 @@ fn custom_web_hero() -> BundledTemplate {
     // Hero copy.
     s.rect(160.0, 360.0, 220.0, 56.0, "#1E293B", "Badge");
     s.text(186.0, 374.0, 26.0, "#A5B4FC", "NEW · v2.0", "Badge text");
-    s.text(160.0, 450.0, 110.0, "#FFFFFF", "Ship faster with", "Headline 1");
+    s.text(
+        160.0,
+        450.0,
+        110.0,
+        "#FFFFFF",
+        "Ship faster with",
+        "Headline 1",
+    );
     s.text(160.0, 580.0, 110.0, "#818CF8", "Northstar", "Headline 2");
-    s.text(160.0, 740.0, 36.0, "#94A3B8", "The all-in-one platform for modern product teams.", "Sub");
+    s.text(
+        160.0,
+        740.0,
+        36.0,
+        "#94A3B8",
+        "The all-in-one platform for modern product teams.",
+        "Sub",
+    );
     s.rect(160.0, 840.0, 300.0, 90.0, "#6366F1", "Primary CTA");
-    s.text_center(310.0, 866.0, 32.0, "#FFFFFF", "Get started", "Primary label");
+    s.text_center(
+        310.0,
+        866.0,
+        32.0,
+        "#FFFFFF",
+        "Get started",
+        "Primary label",
+    );
     s.rect(490.0, 840.0, 300.0, 90.0, "#1E293B", "Secondary CTA");
-    s.text_center(640.0, 866.0, 32.0, "#E2E8F0", "Book a demo", "Secondary label");
+    s.text_center(
+        640.0,
+        866.0,
+        32.0,
+        "#E2E8F0",
+        "Book a demo",
+        "Secondary label",
+    );
     BundledTemplate {
         dir_name: "custom-web-hero.ktemplate",
         manifest: manifest(
@@ -5216,7 +6702,14 @@ fn custom_infographic() -> BundledTemplate {
         s.text(360.0, y + 120.0, 38.0, "#0F172A", label, "Stat label");
         y += 350.0;
     }
-    s.text_center(540.0, 1850.0, 24.0, "#94A3B8", "Source: KCreate Workplace Survey, n=4,200", "Source");
+    s.text_center(
+        540.0,
+        1850.0,
+        24.0,
+        "#94A3B8",
+        "Source: KCreate Workplace Survey, n=4,200",
+        "Source",
+    );
     BundledTemplate {
         dir_name: "custom-infographic.ktemplate",
         manifest: manifest(
@@ -5238,7 +6731,14 @@ fn custom_email_header() -> BundledTemplate {
     s.circle(120.0, 90.0, 30.0, "#FFFFFF", "Logo");
     s.text(176.0, 70.0, 32.0, "#FFFFFF", "Monthly Digest", "Brand");
     s.text(80.0, 190.0, 72.0, "#FFFFFF", "What's new in June", "Title");
-    s.text(80.0, 300.0, 30.0, "#C7D2FE", "Product updates, tips, and community picks", "Sub");
+    s.text(
+        80.0,
+        300.0,
+        30.0,
+        "#C7D2FE",
+        "Product updates, tips, and community picks",
+        "Sub",
+    );
     BundledTemplate {
         dir_name: "custom-email-header.ktemplate",
         manifest: manifest(
@@ -5263,14 +6763,42 @@ fn custom_coupon() -> BundledTemplate {
         s.rect(x, 554.0, 30.0, 6.0, "#DC2626", "Dash bottom");
     }
     s.rect(760.0, 40.0, 6.0, 520.0, "#FCA5A5", "Split rule");
-    s.text(110.0, 110.0, 32.0, "#DC2626", "LIMITED TIME OFFER", "Eyebrow");
+    s.text(
+        110.0,
+        110.0,
+        32.0,
+        "#DC2626",
+        "LIMITED TIME OFFER",
+        "Eyebrow",
+    );
     s.text(110.0, 200.0, 150.0, "#0F172A", "25% OFF", "Discount");
-    s.text(110.0, 380.0, 32.0, "#475569", "Your next order over $50", "Terms");
-    s.text(110.0, 470.0, 26.0, "#94A3B8", "Valid through Jul 31, 2026", "Expiry");
+    s.text(
+        110.0,
+        380.0,
+        32.0,
+        "#475569",
+        "Your next order over $50",
+        "Terms",
+    );
+    s.text(
+        110.0,
+        470.0,
+        26.0,
+        "#94A3B8",
+        "Valid through Jul 31, 2026",
+        "Expiry",
+    );
     s.text_center(963.0, 170.0, 28.0, "#475569", "USE CODE", "Code label");
     s.rect(810.0, 230.0, 306.0, 110.0, "#FEE2E2", "Code box");
     s.text_center(963.0, 258.0, 56.0, "#DC2626", "SAVE25", "Code");
-    s.text_center(963.0, 420.0, 24.0, "#94A3B8", "Online & in-store", "Code note");
+    s.text_center(
+        963.0,
+        420.0,
+        24.0,
+        "#94A3B8",
+        "Online & in-store",
+        "Code note",
+    );
     BundledTemplate {
         dir_name: "custom-coupon.ktemplate",
         manifest: manifest(
@@ -5289,11 +6817,25 @@ fn custom_name_badge() -> BundledTemplate {
     s.bg("#FFFFFF");
     s.rect(0.0, 0.0, 1050.0, 200.0, "#2563EB", "Header");
     s.text_center(525.0, 70.0, 40.0, "#FFFFFF", "DESIGN SUMMIT 2026", "Event");
-    s.text_center(525.0, 130.0, 26.0, "#BFDBFE", "Berlin · Hall 4", "Event sub");
+    s.text_center(
+        525.0,
+        130.0,
+        26.0,
+        "#BFDBFE",
+        "Berlin · Hall 4",
+        "Event sub",
+    );
     s.text_center(525.0, 280.0, 30.0, "#64748B", "HELLO, MY NAME IS", "Prompt");
     s.text_center(525.0, 350.0, 96.0, "#0F172A", "Sam Okafor", "Name");
     s.rect(325.0, 500.0, 400.0, 3.0, "#E2E8F0", "Rule");
-    s.text_center(525.0, 530.0, 34.0, "#2563EB", "Product Designer · Lumen", "Role");
+    s.text_center(
+        525.0,
+        530.0,
+        34.0,
+        "#2563EB",
+        "Product Designer · Lumen",
+        "Role",
+    );
     s.rect(0.0, 650.0, 1050.0, 100.0, "#EFF6FF", "Footer band");
     s.circle(120.0, 700.0, 34.0, "#2563EB", "Logo");
     s.text(180.0, 682.0, 30.0, "#1E3A8A", "@samokafor", "Handle");
@@ -5319,9 +6861,26 @@ fn custom_price_list() -> BundledTemplate {
     s.text(80.0, 180.0, 84.0, "#FFFFFF", "Price List", "Title");
     s.rect(80.0, 320.0, 140.0, 6.0, "#EC4899", "Rule");
     let sections = [
-        ("HAIR", &[("Cut & style", "$55"), ("Color & gloss", "$120"), ("Balayage", "$180")][..]),
-        ("NAILS", &[("Classic manicure", "$30"), ("Gel manicure", "$45"), ("Spa pedicure", "$55")][..]),
-        ("SKIN", &[("Express facial", "$60"), ("Deep cleanse", "$90")][..]),
+        (
+            "HAIR",
+            &[
+                ("Cut & style", "$55"),
+                ("Color & gloss", "$120"),
+                ("Balayage", "$180"),
+            ][..],
+        ),
+        (
+            "NAILS",
+            &[
+                ("Classic manicure", "$30"),
+                ("Gel manicure", "$45"),
+                ("Spa pedicure", "$55"),
+            ][..],
+        ),
+        (
+            "SKIN",
+            &[("Express facial", "$60"), ("Deep cleanse", "$90")][..],
+        ),
     ];
     let mut y = 400.0;
     for (head, items) in sections {
@@ -5335,7 +6894,14 @@ fn custom_price_list() -> BundledTemplate {
         }
         y += 50.0;
     }
-    s.text_center(A4_W / 2.0, A4_H - 90.0, 24.0, "#94A3B8", "Book online · salonbelle.com · (555) 010-9090", "Footer");
+    s.text_center(
+        A4_W / 2.0,
+        A4_H - 90.0,
+        24.0,
+        "#94A3B8",
+        "Book online · salonbelle.com · (555) 010-9090",
+        "Footer",
+    );
     BundledTemplate {
         dir_name: "custom-price-list.ktemplate",
         manifest: manifest(

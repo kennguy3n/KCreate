@@ -426,11 +426,21 @@ impl Theme {
         kit
     }
 
-    /// Reconstruct a theme from a persisted [`BrandKit`]. Colours are matched
-    /// by role name; any missing role falls back to the [`Theme::default`]
-    /// palette. Type sizes default (a brand kit pins fonts + palette, not the
-    /// size ramp), with the body font taken from the first non-bold font and
-    /// the heading font from the first bold font.
+    /// Reconstruct a theme from a persisted [`BrandKit`].
+    ///
+    /// Colours are honoured two ways. When the kit's entries name roles
+    /// (the round-trip form produced by [`to_brand_kit`](Self::to_brand_kit)),
+    /// each is assigned to its role and any unnamed role falls back to the
+    /// [`Theme::default`] palette. When the kit instead carries a *user*
+    /// palette whose entries don't name roles — colours picked in the brand
+    /// editor, pasted as a hex list, or extracted from an uploaded image —
+    /// roles are assigned from the palette via
+    /// [`derive_from_palette`](Self::derive_from_palette) so the brand
+    /// colours actually drive the theme instead of being silently dropped.
+    ///
+    /// Type sizes default (a brand kit pins fonts + palette, not the size
+    /// ramp), with the body font taken from the first non-bold font and the
+    /// heading font from the first bold font.
     #[must_use]
     pub fn from_brand_kit(kit: &BrandKit) -> Self {
         let mut theme = Self {
@@ -438,10 +448,27 @@ impl Theme {
             name: kit.name.clone(),
             ..Self::default()
         };
+        let mut matched_roles = 0usize;
         for named in &kit.colors {
             if let Some(role) = role_from_str(&named.name) {
                 theme.palette.set(role, named.color);
+                matched_roles += 1;
             }
+        }
+        // No entry named a role → treat the kit as a user palette and
+        // assign roles by dominance. Brand kits keep their palette in
+        // priority order (image extraction returns dominant-first; the
+        // editor appends in pick order), so the earliest entry is the
+        // most prominent and gets the highest weight.
+        if matched_roles == 0 && !kit.colors.is_empty() {
+            let n = kit.colors.len();
+            let weighted: Vec<(RgbaColor, f32)> = kit
+                .colors
+                .iter()
+                .enumerate()
+                .map(|(i, c)| (c.color, (n - i) as f32))
+                .collect();
+            theme.palette = Self::derive_from_palette(&kit.name, &weighted).palette;
         }
         if let Some(body) = kit.fonts.iter().find(|f| f.weight < 600) {
             theme.type_scale.body_font.clone_from(&body.family);
@@ -1319,6 +1346,63 @@ mod tests {
             restored.type_scale.heading_font,
             theme.type_scale.heading_font
         );
+    }
+
+    #[test]
+    fn from_brand_kit_derives_roles_from_unnamed_user_palette() {
+        // A user palette (picked swatches / pasted hex list / image
+        // extraction) names its entries "Color N", not role names. These
+        // must still drive the theme — earlier code only honoured
+        // role-named entries and silently dropped user palettes back to
+        // the default Daybreak palette.
+        let mut kit = BrandKit::new("Acme");
+        let entries = [
+            ("Color 1", "#101828"), // dark, dominant → background
+            ("Color 2", "#2563EB"), // vivid blue → primary candidate
+            ("Color 3", "#F59E0B"), // amber → secondary/accent candidate
+        ];
+        kit.colors = entries
+            .iter()
+            .map(|(name, hex)| NamedColor {
+                name: (*name).to_string(),
+                color: solid(hex),
+            })
+            .collect();
+
+        let theme = Theme::from_brand_kit(&kit);
+        let default = Theme::default();
+
+        // The user palette must actually change the theme.
+        assert_ne!(
+            theme.palette, default.palette,
+            "user palette was dropped to the default palette"
+        );
+        // Dominant (first) colour becomes the background.
+        assert_eq!(theme.palette.background, solid("#101828"));
+        // The two vivid brand colours surface as chromatic roles.
+        let chromatic = [
+            theme.palette.primary,
+            theme.palette.secondary,
+            theme.palette.accent,
+        ];
+        assert!(
+            chromatic.contains(&solid("#2563EB")),
+            "brand blue missing from chromatic roles: {chromatic:?}"
+        );
+        assert!(
+            chromatic.contains(&solid("#F59E0B")),
+            "brand amber missing from chromatic roles: {chromatic:?}"
+        );
+    }
+
+    #[test]
+    fn from_brand_kit_still_honours_role_named_palette() {
+        // A role-named kit (the `to_brand_kit` round-trip form) must keep
+        // exact role assignment — the user-palette fallback must not kick in.
+        let theme = Theme::builtin("forest").expect("forest");
+        let kit = theme.to_brand_kit();
+        let restored = Theme::from_brand_kit(&kit);
+        assert_eq!(restored.palette, theme.palette);
     }
 
     #[test]

@@ -1302,6 +1302,74 @@ const brandKit: BrandKitBridge = {
       filePath,
     )) as string;
   },
+  async setLogoBytes(kitId: string, bytes: Uint8Array): Promise<void> {
+    await ipcRenderer.invoke("kcreate/brandKit/setLogoBytes", kitId, bytes);
+  },
+  async setFontRole(
+    kitId: string,
+    role: "heading" | "body",
+    family: string,
+    embed: boolean,
+  ): Promise<void> {
+    await ipcRenderer.invoke(
+      "kcreate/brandKit/setFontRole",
+      kitId,
+      role,
+      family,
+      embed,
+    );
+  },
+  async extractPaletteFromImage(
+    kitId: string,
+    bytes: Uint8Array,
+    numColors: number,
+  ): Promise<string[]> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/brandKit/extractPaletteFromImage",
+      kitId,
+      bytes,
+      numColors,
+    )) as string;
+    return JSON.parse(raw) as string[];
+  },
+  async insertLogo(
+    kitId: string,
+    parentId: string | null,
+    x: number,
+    y: number,
+    targetSize: number,
+  ): Promise<InsertedAsset> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/brandKit/insertLogo",
+      kitId,
+      parentId,
+      x,
+      y,
+      targetSize,
+    )) as string;
+    return JSON.parse(raw) as InsertedAsset;
+  },
+  async registrySave(kitId: string): Promise<void> {
+    await ipcRenderer.invoke("kcreate/brandKit/registrySave", kitId);
+  },
+  async registryList(): Promise<BrandKit[]> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/brandKit/registryList",
+    )) as string;
+    return JSON.parse(raw) as BrandKit[];
+  },
+  async registryLoad(kitId: string): Promise<string> {
+    return (await ipcRenderer.invoke(
+      "kcreate/brandKit/registryLoad",
+      kitId,
+    )) as string;
+  },
+  async registryDelete(kitId: string): Promise<boolean> {
+    return (await ipcRenderer.invoke(
+      "kcreate/brandKit/registryDelete",
+      kitId,
+    )) as boolean;
+  },
 };
 
 const theme: ThemeBridge = {
@@ -1329,6 +1397,25 @@ const theme: ThemeBridge = {
     const raw = (await ipcRenderer.invoke(
       "kcreate/theme/fromBrandKit",
       JSON.stringify(kit),
+    )) as string;
+    return JSON.parse(raw) as Theme;
+  },
+  async applyToSelection(
+    themeValue: Theme,
+    roots: string[],
+  ): Promise<ApplyThemeReport> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/theme/applyToSelection",
+      JSON.stringify(themeValue),
+      roots,
+    )) as string;
+    return JSON.parse(raw) as ApplyThemeReport;
+  },
+  async deriveFromImage(name: string, bytes: Uint8Array): Promise<Theme> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/theme/deriveFromImage",
+      name,
+      bytes,
     )) as string;
     return JSON.parse(raw) as Theme;
   },

@@ -524,7 +524,11 @@ export function RightPanel({
           )
         ) : null}
         {tab === "theme" && showTheme ? (
-          <ThemePanel onStatus={onStatus} onApplied={onThemeApplied} />
+          <ThemePanel
+            onStatus={onStatus}
+            onApplied={onThemeApplied}
+            selectedIds={selectedIds ?? []}
+          />
         ) : null}
         {tab === "publish" ? (
           <ArtifactPublishPanel onStatus={onStatus} />

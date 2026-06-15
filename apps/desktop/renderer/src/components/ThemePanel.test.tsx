@@ -31,6 +31,67 @@ async function flushAsync(): Promise<void> {
   });
 }
 
+// Drains both the macrotask queue (a `setTimeout(0)`) and microtasks.
+// The file-pick flows chain `File.arrayBuffer()` (a promise) and a
+// bridge call, so a deeper settle than `flushAsync` keeps them
+// deterministic under jsdom.
+async function settle(): Promise<void> {
+  await act(async () => {
+    await new Promise((r) => setTimeout(r, 0));
+    await Promise.resolve();
+    await Promise.resolve();
+  });
+}
+
+// Intercept the next dynamically-created `<input>` (the transient file
+// picker `ThemePanel.pickFileBytes` builds) and synthesize a selection
+// of `bytes` named `name`, without opening a real OS dialog. One-shot:
+// it restores `document.createElement` as soon as it has patched the
+// first input, so React's own inputs are untouched. Call AFTER the
+// initial render so the panel's own inputs don't consume the shot.
+function mockFilePick(name: string, bytes: Uint8Array): () => void {
+  const realCreate = document.createElement.bind(document);
+  let restored = false;
+  const restore = (): void => {
+    if (restored) return;
+    restored = true;
+    document.createElement = realCreate;
+  };
+  document.createElement = ((tag: string): HTMLElement => {
+    const el = realCreate(tag);
+    if (tag === "input") {
+      const input = el as HTMLInputElement;
+      input.click = (): void => {
+        const file = new File([bytes], name, { type: "image/png" });
+        // jsdom's `Blob.arrayBuffer` is unreliable under the test env, so
+        // pin a deterministic promise that yields exactly `bytes`.
+        Object.defineProperty(file, "arrayBuffer", {
+          value: (): Promise<ArrayBuffer> =>
+            Promise.resolve(
+              bytes.buffer.slice(
+                bytes.byteOffset,
+                bytes.byteOffset + bytes.byteLength,
+              ),
+            ),
+          configurable: true,
+        });
+        Object.defineProperty(input, "files", {
+          value: [file],
+          configurable: true,
+        });
+        input.dispatchEvent(new Event("change"));
+      };
+      restore();
+    }
+    return el;
+  }) as typeof document.createElement;
+  return restore;
+}
+
+function kitWithLogo(id: string, name: string, logoAssetId: string): BrandKit {
+  return { ...emptyKit(id, name), logo_asset_id: logoAssetId };
+}
+
 function rgba(r: number, g: number, b: number): RgbaColor {
   return { r, g, b, a: 1 };
 }
@@ -256,5 +317,201 @@ describe("ThemePanel", () => {
       "the generic per-theme failure label is not used for a kit apply",
     ).toBe(false);
     expect(screen.getByLabelText("Apply Flaky Kit")).not.toBeDisabled();
+  });
+
+  // --- H5: apply-to-selection scope --------------------------------------
+
+  it("routes Apply through applyToSelection when the scope is the selection", async () => {
+    const stub = kcreateStub();
+    const themeA = makeTheme("daybreak", "Daybreak");
+    stub.override("theme.listBuiltins", () => [themeA]);
+    stub.override("theme.apply", () => REPORT);
+    stub.override("theme.applyToSelection", () => REPORT);
+
+    render(<ThemePanel selectedIds={["node-1", "node-2"]} />);
+    await flushAsync();
+
+    // Switch the scope toggle to "Selection (2)", then Apply.
+    fireEvent.click(screen.getByRole("radio", { name: "Selection (2)" }));
+    fireEvent.click(screen.getByLabelText("Apply theme"));
+    await flushAsync();
+
+    const sel = stub.calls.find((c) => c.method === "theme.applyToSelection");
+    expect(sel, "selection scope must call theme.applyToSelection").toBeDefined();
+    expect((sel?.args[0] as Theme).id).toBe("daybreak");
+    expect(sel?.args[1], "the current selection ids are forwarded").toEqual([
+      "node-1",
+      "node-2",
+    ]);
+    // The whole-document path must NOT be taken in selection scope.
+    expect(stub.calls.some((c) => c.method === "theme.apply")).toBe(false);
+  });
+
+  it("uses the whole-document path in document scope (the default)", async () => {
+    const stub = kcreateStub();
+    stub.override("theme.listBuiltins", () => [makeTheme("daybreak", "Daybreak")]);
+    stub.override("theme.apply", () => REPORT);
+    stub.override("theme.applyToSelection", () => REPORT);
+
+    render(<ThemePanel selectedIds={["node-1"]} />);
+    await flushAsync();
+
+    // No scope change — document is the default.
+    fireEvent.click(screen.getByLabelText("Apply theme"));
+    await flushAsync();
+
+    expect(stub.calls.some((c) => c.method === "theme.apply")).toBe(true);
+    expect(stub.calls.some((c) => c.method === "theme.applyToSelection")).toBe(
+      false,
+    );
+  });
+
+  it("blocks selection-scope apply when nothing is selected", async () => {
+    const stub = kcreateStub();
+    stub.override("theme.listBuiltins", () => [makeTheme("daybreak", "Daybreak")]);
+
+    render(<ThemePanel selectedIds={[]} />);
+    await flushAsync();
+
+    fireEvent.click(screen.getByRole("radio", { name: "Selection (0)" }));
+
+    // Apply is disabled with an empty selection, and clicking is a no-op.
+    expect(screen.getByLabelText("Apply theme")).toBeDisabled();
+    fireEvent.click(screen.getByLabelText("Apply theme"));
+    await flushAsync();
+    expect(stub.calls.some((c) => c.method === "theme.applyToSelection")).toBe(
+      false,
+    );
+    expect(stub.calls.some((c) => c.method === "theme.apply")).toBe(false);
+  });
+
+  // --- H5: derive a theme from an uploaded image -------------------------
+
+  it("derives a theme from an uploaded image and selects it", async () => {
+    const stub = kcreateStub();
+    stub.override("theme.listBuiltins", () => [makeTheme("daybreak", "Daybreak")]);
+    stub.override("theme.deriveFromImage", () =>
+      makeTheme("derived-sunset-photo", "Sunset photo"),
+    );
+
+    render(<ThemePanel />);
+    await flushAsync();
+
+    const restore = mockFilePick("sunset.png", new Uint8Array([1, 2, 3, 4]));
+    try {
+      fireEvent.click(screen.getByLabelText("Derive theme from image"));
+      await settle();
+    } finally {
+      restore();
+    }
+
+    const call = stub.calls.find((c) => c.method === "theme.deriveFromImage");
+    expect(call, "should call theme.deriveFromImage").toBeDefined();
+    expect(call?.args[0], "default image-theme name is forwarded").toBe(
+      "Image theme",
+    );
+    expect(
+      call?.args[1] as Uint8Array,
+      "the picked image bytes are forwarded",
+    ).toBeInstanceOf(Uint8Array);
+    expect((call?.args[1] as Uint8Array).length).toBe(4);
+    // The derived theme is appended to the list and auto-selected.
+    expect(
+      screen.getByLabelText("Select theme Sunset photo"),
+    ).toBeInTheDocument();
+  });
+
+  // --- H5: cross-project brand library (on-disk registry) ----------------
+
+  it("saves an open kit to the cross-project brand library", async () => {
+    const stub = kcreateStub();
+    stub.override("brandKit.list", () => [emptyKit("kit-3", "Acme")]);
+
+    render(<ThemePanel />);
+    await flushAsync();
+
+    fireEvent.click(screen.getByLabelText("Edit Acme"));
+    await flushAsync();
+    fireEvent.click(screen.getByLabelText("Save brand kit to library"));
+    await flushAsync();
+
+    const save = stub.calls.find((c) => c.method === "brandKit.registrySave");
+    expect(save, "should persist the kit to the registry").toBeDefined();
+    expect(save?.args[0]).toBe("kit-3");
+    // The draft + project are flushed before the registry write.
+    expect(stub.calls.some((c) => c.method === "brandKit.update")).toBe(true);
+    expect(stub.calls.some((c) => c.method === "document.saveProject")).toBe(
+      true,
+    );
+  });
+
+  it("loads a kit from the brand library into the project", async () => {
+    const stub = kcreateStub();
+    stub.override("brandKit.registryList", () => [
+      emptyKit("lib-9", "Studio Brand"),
+    ]);
+    stub.override("brandKit.registryLoad", () => "new-kit-id");
+    stub.override("brandKit.list", () => [emptyKit("new-kit-id", "Studio Brand")]);
+
+    render(<ThemePanel />);
+    await flushAsync();
+
+    fireEvent.click(
+      screen.getByLabelText("Load Studio Brand into this project"),
+    );
+    await flushAsync();
+
+    const load = stub.calls.find((c) => c.method === "brandKit.registryLoad");
+    expect(load, "should hydrate the kit from the registry").toBeDefined();
+    expect(load?.args[0]).toBe("lib-9");
+    // The freshly-loaded project kit opens in the editor.
+    expect(screen.getByLabelText("Brand kit name")).toBeInTheDocument();
+  });
+
+  // --- H5: per-role custom fonts + embedding -----------------------------
+
+  it("sets a heading font through the kit and embeds it by default", async () => {
+    const stub = kcreateStub();
+    stub.override("brandKit.list", () => [emptyKit("kit-5", "Acme")]);
+    stub.override("text.listFonts", () => ["DejaVu Sans", "DejaVu Serif"]);
+
+    render(<ThemePanel />);
+    await flushAsync();
+
+    fireEvent.click(screen.getByLabelText("Edit Acme"));
+    await flushAsync();
+    fireEvent.change(screen.getByLabelText("Heading font"), {
+      target: { value: "DejaVu Serif" },
+    });
+    await flushAsync();
+
+    const call = stub.calls.find((c) => c.method === "brandKit.setFontRole");
+    expect(call, "should apply the heading font through the kit").toBeDefined();
+    // (kitId, role, family, embed) — embed defaults to true in the panel.
+    expect(call?.args).toEqual(["kit-5", "heading", "DejaVu Serif", true]);
+  });
+
+  // --- H5: insert the saved logo as an editable node ---------------------
+
+  it("inserts the saved brand logo as an editable node", async () => {
+    const stub = kcreateStub();
+    stub.override("brandKit.list", () => [
+      kitWithLogo("kit-6", "Acme", "asset-logo-1"),
+    ]);
+
+    let applied = 0;
+    render(<ThemePanel onApplied={() => (applied += 1)} />);
+    await flushAsync();
+
+    fireEvent.click(screen.getByLabelText("Edit Acme"));
+    await flushAsync();
+    fireEvent.click(screen.getByLabelText("Insert brand logo"));
+    await flushAsync();
+
+    const call = stub.calls.find((c) => c.method === "brandKit.insertLogo");
+    expect(call, "should insert the logo via brandKit.insertLogo").toBeDefined();
+    expect(call?.args[0]).toBe("kit-6");
+    // A successful insert refreshes the canvas through onApplied.
+    expect(applied).toBe(1);
   });
 });

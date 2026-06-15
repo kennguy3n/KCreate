@@ -20,6 +20,7 @@ pub mod annotation_bridge;
 pub mod assets;
 pub mod audit;
 pub mod autosave;
+pub mod brand_registry;
 #[cfg(feature = "collab")]
 pub mod collab;
 pub mod document;
@@ -3225,6 +3226,155 @@ pub fn theme_from_brand_kit(kit_json: String) -> NapiResult<String> {
 // `brand_kit_create` / `brand_kit_update` / `brand_kit_list` /
 // `brand_kit_delete` surface (see above) — G4 deliberately reuses
 // that canonical CRUD path rather than adding a parallel one.
+
+// ---------------------------------------------------------------------------
+// H5 — Brand Kit depth: apply-to-selection, derive-from-image, custom
+// fonts + embedding, logo placement, cross-project on-disk registry.
+// ---------------------------------------------------------------------------
+
+/// Apply `theme_json` to a scoped subtree of the open document — the
+/// nodes in `roots` plus their descendants — as a single undoable
+/// operation. An empty `roots` array falls back to the live selection;
+/// an empty scope is a no-op that still returns a (zeroed) report.
+/// Returns a JSON `ApplyThemeReport`.
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn document_apply_theme_to_selection(
+    theme_json: String,
+    roots: Vec<String>,
+) -> NapiResult<String> {
+    let theme: kcreate_core::theme::Theme = serde_json::from_str(&theme_json).map_err(|e| {
+        NapiError::new(
+            Status::InvalidArg,
+            format!("apply_theme_to_selection: invalid theme: {e}"),
+        )
+    })?;
+    let mut root_ids = Vec::with_capacity(roots.len());
+    for r in &roots {
+        root_ids.push(parse_uuid(r)?);
+    }
+    let report =
+        document::document_apply_theme_to_selection(&theme, root_ids).map_err(map_doc_err)?;
+    serde_json::to_string(&report)
+        .map_err(|e| NapiError::from_reason(format!("apply_theme_to_selection: {e}")))
+}
+
+/// Derive a `Theme` from an uploaded image: extract a palette via the
+/// k-means extractor (`kcreate_ai::palette`) then assign roles via
+/// `derive_from_palette`. Pure transform — does not touch the open
+/// project. Returns a JSON `Theme`.
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn theme_derive_from_image(name: String, bytes: Vec<u8>) -> NapiResult<String> {
+    let theme = document::theme_derive_from_image(&name, &bytes).map_err(map_doc_err)?;
+    serde_json::to_string(&theme)
+        .map_err(|e| NapiError::from_reason(format!("theme_derive_from_image: {e}")))
+}
+
+/// Set a brand kit's logo from raw (SVG or raster) bytes, storing the
+/// blob in the project asset table and linking it as the kit's logo.
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn brand_kit_set_logo_bytes(kit_id: String, bytes: Vec<u8>) -> NapiResult<()> {
+    let id = parse_uuid(&kit_id)?;
+    document::brand_kit_set_logo_bytes(id, &bytes).map_err(map_doc_err)
+}
+
+/// Assign a fontdb-discovered font family to a brand kit role
+/// (`"heading"` or `"body"`). When `embed` is true the font file is
+/// resolved and embedded into the project asset table so exports carry
+/// it offline.
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn brand_kit_set_font_role(
+    kit_id: String,
+    role: String,
+    family: String,
+    embed: bool,
+) -> NapiResult<()> {
+    let id = parse_uuid(&kit_id)?;
+    document::brand_kit_set_font_role(id, &role, family, embed).map_err(map_doc_err)
+}
+
+/// Extract up to `num_colors` dominant colors from an uploaded image
+/// and store them as the kit's palette. Returns the hex codes (in
+/// dominance order) as a JSON string array.
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn brand_kit_extract_palette_from_image_bytes(
+    kit_id: String,
+    bytes: Vec<u8>,
+    num_colors: u32,
+) -> NapiResult<String> {
+    let id = parse_uuid(&kit_id)?;
+    let hexes =
+        document::brand_kit_extract_palette_from_image_bytes(id, &bytes, num_colors as usize)
+            .map_err(map_doc_err)?;
+    json_out("brand_kit_extract_palette_from_image_bytes", &hexes)
+}
+
+/// Insert a brand kit's saved logo as editable node(s) at world
+/// position `(x, y)`, uniformly scaled so its longest side equals
+/// `target_size`. SVG logos become recolorable vector groups; raster
+/// logos become a single `RasterLayer`. Returns the `InsertedAsset`
+/// descriptor as JSON.
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn brand_logo_insert(
+    kit_id: String,
+    parent_id: Option<String>,
+    x: f64,
+    y: f64,
+    target_size: f64,
+) -> NapiResult<String> {
+    let id = parse_uuid(&kit_id)?;
+    let parent = match parent_id.as_deref() {
+        Some(s) => Some(parse_uuid(s)?),
+        None => None,
+    };
+    let info = document::brand_logo_insert(id, parent, x, y, target_size).map_err(map_doc_err)?;
+    json_out("brand_logo_insert", &info)
+}
+
+/// Persist the project's brand kit `kit_id` to the cross-project
+/// on-disk registry, bundling its logo + embedded font blobs so a
+/// future session (or different project) can re-hydrate it offline.
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn brand_kit_registry_save(kit_id: String) -> NapiResult<()> {
+    let id = parse_uuid(&kit_id)?;
+    document::brand_kit_registry_save(id).map_err(map_doc_err)
+}
+
+/// List every brand kit saved in the cross-project on-disk registry as
+/// a JSON array of `BrandKit` records (sorted by name then id).
+#[napi]
+pub fn brand_kit_registry_list() -> NapiResult<String> {
+    let kits = document::brand_kit_registry_list().map_err(map_doc_err)?;
+    serde_json::to_string(&kits)
+        .map_err(|e| NapiError::from_reason(format!("brand_kit_registry_list: {e}")))
+}
+
+/// Load a registry brand kit into the open project: re-stores its
+/// blobs under fresh asset ids, relinks the kit's logo / font
+/// references, and upserts it into the project. Returns the kit's id.
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn brand_kit_registry_load(kit_id: String) -> NapiResult<String> {
+    let id = parse_uuid(&kit_id)?;
+    document::brand_kit_registry_load(id)
+        .map(|id| id.to_string())
+        .map_err(map_doc_err)
+}
+
+/// Delete a brand kit from the cross-project on-disk registry. Returns
+/// true when a record was removed; false if none existed.
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn brand_kit_registry_delete(kit_id: String) -> NapiResult<bool> {
+    let id = parse_uuid(&kit_id)?;
+    document::brand_kit_registry_delete(id).map_err(map_doc_err)
+}
 
 // ---------------------------------------------------------------------------
 // Phase 2 — preflight, icon pack, parallel batch, AI model packs,

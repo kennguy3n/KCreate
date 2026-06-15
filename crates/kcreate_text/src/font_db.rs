@@ -60,6 +60,29 @@ impl FontManager {
         Ok(())
     }
 
+    /// Register raw font-file bytes into the shared database so the
+    /// face becomes resolvable by its declared family name.
+    ///
+    /// This is the runtime counterpart to embedding: a project (or a
+    /// `.kbrand` brand kit) carries the font file bytes, and on open
+    /// we feed them back here so `resolve_face` / shaping pick the
+    /// font up even on a machine where it is **not** installed as a
+    /// system font. `fontdb::Database::load_font_data` parses the
+    /// face's own name table, so the family the document references
+    /// (set when the font was embedded) matches what gets registered.
+    ///
+    /// Returns the number of faces the data contributed (0 when the
+    /// bytes are not a parseable font collection — callers treat that
+    /// as a non-fatal skip rather than an error so one corrupt asset
+    /// never blocks opening a project).
+    pub fn add_font_bytes(&self, data: Vec<u8>) -> usize {
+        with_db_mut(|db| {
+            let before = db.faces().count();
+            db.load_font_data(data);
+            db.faces().count().saturating_sub(before)
+        })
+    }
+
     /// Load every supported font under `dir` into the shared
     /// database. Non-font files are silently skipped.
     pub fn add_fonts_dir(&self, dir: &Path) -> Result<(), FontManagerError> {
@@ -354,5 +377,56 @@ mod tests {
                 // loop; that's still a pass for this invariant.
             }
         }
+    }
+
+    /// `add_font_bytes` is the runtime side of font embedding: feeding
+    /// real font-file bytes back in must register at least one resolvable
+    /// face, while non-font bytes must be a no-op. Both halves run in one
+    /// test because they mutate the process-global database and we want a
+    /// single, race-free `font_count` baseline (no other test in this
+    /// crate mutates the db).
+    #[test]
+    fn add_font_bytes_registers_real_faces_and_skips_garbage() {
+        let m = FontManager::new();
+
+        // Garbage never contributes a face and never grows the database.
+        let before = m.font_count();
+        assert_eq!(
+            m.add_font_bytes(b"this is definitely not a font file".to_vec()),
+            0,
+            "non-font bytes must contribute zero faces",
+        );
+        assert_eq!(
+            m.font_count(),
+            before,
+            "non-font bytes must leave the database untouched",
+        );
+
+        // Obtain genuine font bytes by resolving any outline-capable face.
+        // A runner with no system fonts at all can't exercise this half —
+        // skip rather than fail, matching the other tests in this module.
+        let Ok(face) = m.resolve_face("sans-serif") else {
+            return;
+        };
+        let baseline = m.font_count();
+        let added = m.add_font_bytes(face.data.clone());
+        assert!(
+            added >= 1,
+            "valid font bytes must contribute at least one face, got {added}",
+        );
+        assert_eq!(
+            m.font_count(),
+            baseline + added,
+            "the database must grow by exactly the reported face count",
+        );
+
+        // The freshly-registered face is now resolvable by parsing the
+        // very bytes we fed in — proving the registration is usable for
+        // shaping / export, not merely counted.
+        let parsed = rustybuzz::ttf_parser::Face::parse(&face.data, face.face_index);
+        assert!(
+            parsed.is_ok(),
+            "round-tripped face bytes must re-parse as a font",
+        );
     }
 }

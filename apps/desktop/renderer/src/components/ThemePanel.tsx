@@ -46,6 +46,13 @@ export interface ThemePanelProps {
    * about keeping React state (layer tree, properties) in sync.
    */
   onApplied?: () => void;
+  /**
+   * The host's current multi-selection (node ids). Used by the
+   * apply-scope toggle: when scope is "selection" these roots (plus
+   * their descendants) are the only nodes restyled. Empty disables the
+   * selection scope.
+   */
+  selectedIds?: string[];
 }
 
 /** Palette roles in a stable, human-meaningful order for the swatch row. */
@@ -94,20 +101,82 @@ function errMsg(e: unknown): string {
   return JSON.stringify(e);
 }
 
-export function ThemePanel({ onStatus, onApplied }: ThemePanelProps): JSX.Element {
+/**
+ * Open the OS file picker for a single file and resolve its bytes (or
+ * `null` if the user cancels). The renderer is sandboxed, so a transient
+ * `<input type="file">` is the canonical way to read local bytes without
+ * a main-process dialog round-trip (matches `ScreenshotToLayout`'s
+ * `file.arrayBuffer()` flow). The `focus` fallback resolves `null` on
+ * cancel — the dialog closing refocuses the window without firing
+ * `change` — and the deferral lets a real selection win the race.
+ */
+function pickFileBytes(
+  accept: string,
+): Promise<{ name: string; bytes: Uint8Array } | null> {
+  return new Promise((resolve) => {
+    const input = document.createElement("input");
+    input.type = "file";
+    input.accept = accept;
+    let settled = false;
+    const finish = (
+      value: { name: string; bytes: Uint8Array } | null,
+    ): void => {
+      if (settled) return;
+      settled = true;
+      resolve(value);
+    };
+    input.onchange = (): void => {
+      const file = input.files?.[0];
+      if (!file) {
+        finish(null);
+        return;
+      }
+      void file.arrayBuffer().then((buf) => {
+        finish({ name: file.name, bytes: new Uint8Array(buf) });
+      });
+    };
+    window.addEventListener(
+      "focus",
+      () => {
+        window.setTimeout(() => finish(null), 400);
+      },
+      { once: true },
+    );
+    input.click();
+  });
+}
+
+export function ThemePanel({
+  onStatus,
+  onApplied,
+  selectedIds = [],
+}: ThemePanelProps): JSX.Element {
   const [builtins, setBuiltins] = useState<Theme[]>([]);
   // Themes derived from the open document this session (shown first).
   const [derived, setDerived] = useState<Theme[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [deriveName, setDeriveName] = useState("Derived theme");
+  const [imageThemeName, setImageThemeName] = useState("Image theme");
 
   const [kits, setKits] = useState<BrandKit[]>([]);
   // The brand kit currently open in the editor (a working draft copy).
   const [draftKit, setDraftKit] = useState<BrandKit | null>(null);
+  // Brand kits saved to the cross-project on-disk registry.
+  const [registryKits, setRegistryKits] = useState<BrandKit[]>([]);
+  // fontdb-discovered system fonts for the heading/body role pickers.
+  const [systemFonts, setSystemFonts] = useState<string[]>([]);
+  // Embed the chosen face into the project so exports carry it offline.
+  const [embedFonts, setEmbedFonts] = useState(true);
+
+  // Apply scope: whole document vs. the live canvas selection subtree.
+  const [scope, setScope] = useState<"document" | "selection">("document");
 
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [report, setReport] = useState<ApplyThemeReport | null>(null);
+
+  // Selection scope needs at least one selected node to mean anything.
+  const selectionScopeBlocked = scope === "selection" && selectedIds.length === 0;
 
   const allThemes = useMemo<Theme[]>(
     () => [...derived, ...builtins],
@@ -131,15 +200,32 @@ export function ThemePanel({ onStatus, onApplied }: ThemePanelProps): JSX.Elemen
     setKits(list);
   }, []);
 
+  const loadRegistry = useCallback(async () => {
+    const list = (await window.kcreate.brandKit.registryList()) ?? [];
+    setRegistryKits(list);
+  }, []);
+
+  const loadFonts = useCallback(async () => {
+    // Font enumeration failing is non-fatal: the role pickers still let
+    // the user keep the kit's current family, and the shaper falls back
+    // to its registered default when a family can't be resolved.
+    try {
+      const list = await window.kcreate.text.listFonts();
+      setSystemFonts(list);
+    } catch (e) {
+      onStatus?.(`Theme: font enumeration failed — ${errMsg(e)}`);
+    }
+  }, [onStatus]);
+
   useEffect(() => {
     void (async () => {
       try {
-        await Promise.all([loadThemes(), loadKits()]);
+        await Promise.all([loadThemes(), loadKits(), loadRegistry(), loadFonts()]);
       } catch (e) {
         setError(errMsg(e));
       }
     })();
-  }, [loadThemes, loadKits]);
+  }, [loadThemes, loadKits, loadRegistry, loadFonts]);
 
   // Core restyle step: announce the "applying…" status, invoke the
   // bridge, surface the success report, and notify the host. It does
@@ -151,8 +237,17 @@ export function ThemePanel({ onStatus, onApplied }: ThemePanelProps): JSX.Elemen
   // context-specific failure label.
   const performApply = useCallback(
     async (theme: Theme, statusLabel?: string): Promise<void> => {
-      onStatus?.(statusLabel ?? `Theme: applying “${theme.name}”…`);
-      const r = await window.kcreate.theme.apply(theme);
+      const toSelection = scope === "selection";
+      onStatus?.(
+        statusLabel ??
+          `Theme: applying “${theme.name}”${toSelection ? " to selection" : ""}…`,
+      );
+      // Scope routes to the dedicated bridge entry point. Both are a
+      // single undoable Operation; the selection path restyles only the
+      // chosen roots + their descendants and a single Ctrl+Z reverts it.
+      const r = toSelection
+        ? await window.kcreate.theme.applyToSelection(theme, selectedIds)
+        : await window.kcreate.theme.apply(theme);
       setReport(r);
       onStatus?.(
         `Applied “${r.themeName}”: ${r.affectedNodes} nodes — ` +
@@ -161,7 +256,7 @@ export function ThemePanel({ onStatus, onApplied }: ThemePanelProps): JSX.Elemen
       );
       onApplied?.();
     },
-    [onStatus, onApplied],
+    [onStatus, onApplied, scope, selectedIds],
   );
 
   const applyTheme = useCallback(
@@ -183,8 +278,15 @@ export function ThemePanel({ onStatus, onApplied }: ThemePanelProps): JSX.Elemen
 
   const handleApplySelected = useCallback(() => {
     if (selected === null) return;
+    if (selectionScopeBlocked) {
+      setError(
+        "Select one or more nodes on the canvas to restyle a selection, " +
+          "or switch the scope to “Whole document”.",
+      );
+      return;
+    }
     void applyTheme(selected);
-  }, [selected, applyTheme]);
+  }, [selected, applyTheme, selectionScopeBlocked]);
 
   const handleDerive = useCallback(() => {
     void (async () => {
@@ -386,6 +488,226 @@ export function ThemePanel({ onStatus, onApplied }: ThemePanelProps): JSX.Elemen
     );
   }, []);
 
+  // --- Brand-kit asset mutations (logo / palette / fonts) ------------------
+  //
+  // These bridge calls mutate the PERSISTED project kit (they read it from
+  // the workspace by id, not from our local draft), so the draft must be
+  // flushed first or unsaved edits would be lost when we reload. The shared
+  // runner: flush draft → run the mutation → saveProject → reload + reopen
+  // by id to pick up the new asset refs / replaced palette the bridge wrote.
+  const runKitMutation = useCallback(
+    async (label: string, mutate: (kitId: string) => Promise<void>): Promise<void> => {
+      if (draftKit === null) return;
+      const kitId = draftKit.id;
+      setBusy(true);
+      setError(null);
+      onStatus?.(`${label}…`);
+      try {
+        await window.kcreate.brandKit.update(draftKit);
+        await mutate(kitId);
+        await window.kcreate.document.saveProject();
+        const list = (await window.kcreate.brandKit.list()) ?? [];
+        setKits(list);
+        const refreshed = list.find((k) => k.id === kitId) ?? null;
+        if (refreshed !== null) openKit(refreshed);
+        onStatus?.(`${label} — done.`);
+      } catch (e) {
+        const msg = errMsg(e);
+        setError(msg);
+        onStatus?.(`${label} failed: ${msg}`);
+      } finally {
+        setBusy(false);
+      }
+    },
+    [draftKit, openKit, onStatus],
+  );
+
+  const handleImportLogo = useCallback(() => {
+    if (draftKit === null) return;
+    void (async () => {
+      const picked = await pickFileBytes(
+        "image/svg+xml,image/png,image/jpeg,image/webp,.svg",
+      );
+      if (picked === null) return;
+      await runKitMutation(`Setting logo from “${picked.name}”`, (id) =>
+        window.kcreate.brandKit.setLogoBytes(id, picked.bytes),
+      );
+    })();
+  }, [draftKit, runKitMutation]);
+
+  const handlePaletteFromImage = useCallback(() => {
+    if (draftKit === null) return;
+    void (async () => {
+      const picked = await pickFileBytes("image/png,image/jpeg,image/webp");
+      if (picked === null) return;
+      await runKitMutation(
+        `Extracting palette from “${picked.name}”`,
+        async (id) => {
+          await window.kcreate.brandKit.extractPaletteFromImage(
+            id,
+            picked.bytes,
+            6,
+          );
+        },
+      );
+    })();
+  }, [draftKit, runKitMutation]);
+
+  const handleSetRoleFont = useCallback(
+    (role: "heading" | "body", family: string) => {
+      if (draftKit === null || family === "") return;
+      void runKitMutation(`Setting ${role} font to ${family}`, (id) =>
+        window.kcreate.brandKit.setFontRole(id, role, family, embedFonts),
+      );
+    },
+    [draftKit, embedFonts, runKitMutation],
+  );
+
+  const handleInsertLogo = useCallback(() => {
+    if (draftKit === null) return;
+    const kitId = draftKit.id;
+    if (draftKit.logo_asset_id === null) {
+      setError(
+        "This brand kit has no logo yet — import an SVG or raster logo first.",
+      );
+      return;
+    }
+    void (async () => {
+      setBusy(true);
+      setError(null);
+      onStatus?.("Inserting brand logo…");
+      try {
+        const placed = await window.kcreate.brandKit.insertLogo(
+          kitId,
+          null,
+          48,
+          48,
+          160,
+        );
+        onApplied?.();
+        onStatus?.(
+          `Inserted brand logo (${Math.round(placed.width)}×${Math.round(
+            placed.height,
+          )}).`,
+        );
+      } catch (e) {
+        const msg = errMsg(e);
+        setError(msg);
+        onStatus?.(`Insert logo failed: ${msg}`);
+      } finally {
+        setBusy(false);
+      }
+    })();
+  }, [draftKit, onApplied, onStatus]);
+
+  const handleDeriveFromImage = useCallback(() => {
+    void (async () => {
+      const picked = await pickFileBytes("image/png,image/jpeg,image/webp");
+      if (picked === null) return;
+      setBusy(true);
+      setError(null);
+      const name =
+        imageThemeName.trim() === "" ? "Image theme" : imageThemeName.trim();
+      onStatus?.(`Theme: deriving “${name}” from ${picked.name}…`);
+      try {
+        const t = await window.kcreate.theme.deriveFromImage(name, picked.bytes);
+        setDerived((prev) => [t, ...prev.filter((p) => p.id !== t.id)]);
+        setSelectedId(t.id);
+        onStatus?.(`Derived theme “${t.name}” from image — review and Apply.`);
+      } catch (e) {
+        const msg = errMsg(e);
+        setError(msg);
+        onStatus?.(`Derive from image failed: ${msg}`);
+      } finally {
+        setBusy(false);
+      }
+    })();
+  }, [imageThemeName, onStatus]);
+
+  // --- Cross-project brand library (on-disk registry) ----------------------
+
+  const handleSaveToLibrary = useCallback(() => {
+    if (draftKit === null) return;
+    const kitId = draftKit.id;
+    const draftName = draftKit.name;
+    const snapshot = draftKit;
+    void (async () => {
+      setBusy(true);
+      setError(null);
+      onStatus?.(`Saving “${draftName}” to the brand library…`);
+      try {
+        await window.kcreate.brandKit.update(snapshot);
+        await window.kcreate.document.saveProject();
+        await window.kcreate.brandKit.registrySave(kitId);
+        await loadRegistry();
+        onStatus?.(`Saved “${draftName}” to the brand library.`);
+      } catch (e) {
+        const msg = errMsg(e);
+        setError(msg);
+        onStatus?.(`Save to library failed: ${msg}`);
+      } finally {
+        setBusy(false);
+      }
+    })();
+  }, [draftKit, loadRegistry, onStatus]);
+
+  const handleLoadFromLibrary = useCallback(
+    (kit: BrandKit) => {
+      void (async () => {
+        setBusy(true);
+        setError(null);
+        onStatus?.(`Loading “${kit.name}” into this project…`);
+        try {
+          const newId = await window.kcreate.brandKit.registryLoad(kit.id);
+          await window.kcreate.document.saveProject();
+          const list = (await window.kcreate.brandKit.list()) ?? [];
+          setKits(list);
+          const loaded = list.find((k) => k.id === newId) ?? null;
+          if (loaded !== null) openKit(loaded);
+          onStatus?.(`Loaded “${kit.name}” into this project.`);
+        } catch (e) {
+          const msg = errMsg(e);
+          setError(msg);
+          onStatus?.(`Load from library failed: ${msg}`);
+        } finally {
+          setBusy(false);
+        }
+      })();
+    },
+    [openKit, onStatus],
+  );
+
+  const handleDeleteFromLibrary = useCallback(
+    (kitId: string) => {
+      void (async () => {
+        setBusy(true);
+        setError(null);
+        try {
+          await window.kcreate.brandKit.registryDelete(kitId);
+          await loadRegistry();
+          onStatus?.("Removed kit from the brand library.");
+        } catch (e) {
+          const msg = errMsg(e);
+          setError(msg);
+          onStatus?.(`Remove from library failed: ${msg}`);
+        } finally {
+          setBusy(false);
+        }
+      })();
+    },
+    [loadRegistry, onStatus],
+  );
+
+  // Current heading/body family for the role pickers (heading = weight ≥ 600).
+  const headingFont = draftKit?.fonts.find((f) => f.weight >= 600)?.family ?? "";
+  const bodyFont = draftKit?.fonts.find((f) => f.weight < 600)?.family ?? "";
+  const fontOptions = useMemo<string[]>(() => {
+    const set = new Set<string>(systemFonts);
+    if (headingFont !== "") set.add(headingFont);
+    if (bodyFont !== "") set.add(bodyFont);
+    return [...set].sort((a, b) => a.localeCompare(b));
+  }, [systemFonts, headingFont, bodyFont]);
+
   return (
     <div
       style={{
@@ -399,8 +721,39 @@ export function ThemePanel({ onStatus, onApplied }: ThemePanelProps): JSX.Elemen
       <section style={{ display: "flex", flexDirection: "column", gap: spacing.sm }}>
         <SectionTitle>Themes</SectionTitle>
         <p style={{ margin: 0, color: colors.textMuted, fontSize: 11 }}>
-          Applying a theme restyles the whole document in one undoable step.
+          {scope === "selection"
+            ? "Applying restyles the selected nodes (and their children) in one undoable step."
+            : "Applying a theme restyles the whole document in one undoable step."}
         </p>
+        <div
+          role="radiogroup"
+          aria-label="Apply scope"
+          style={{ display: "flex", gap: spacing.xs }}
+        >
+          <button
+            type="button"
+            role="radio"
+            aria-checked={scope === "document"}
+            onClick={() => setScope("document")}
+            style={segmentButtonStyle(scope === "document")}
+          >
+            Whole document
+          </button>
+          <button
+            type="button"
+            role="radio"
+            aria-checked={scope === "selection"}
+            onClick={() => setScope("selection")}
+            style={segmentButtonStyle(scope === "selection")}
+          >
+            Selection ({selectedIds.length})
+          </button>
+        </div>
+        {selectionScopeBlocked ? (
+          <span style={{ color: colors.textMuted, fontSize: 11 }}>
+            Select one or more nodes on the canvas to enable selection scope.
+          </span>
+        ) : null}
         <div style={{ display: "flex", flexDirection: "column", gap: spacing.sm }}>
           {allThemes.map((theme) => (
             <ThemeCard
@@ -418,12 +771,16 @@ export function ThemePanel({ onStatus, onApplied }: ThemePanelProps): JSX.Elemen
         </div>
         <button
           type="button"
-          disabled={busy || selected === null}
+          disabled={busy || selected === null || selectionScopeBlocked}
           onClick={handleApplySelected}
           aria-label="Apply theme"
-          style={primaryButtonStyle(busy || selected === null)}
+          style={primaryButtonStyle(busy || selected === null || selectionScopeBlocked)}
         >
-          {busy ? "Applying…" : `Apply${selected ? ` “${selected.name}”` : ""}`}
+          {busy
+            ? "Applying…"
+            : `Apply${selected ? ` “${selected.name}”` : ""}${
+                scope === "selection" ? " to selection" : ""
+              }`}
         </button>
       </section>
 
@@ -448,6 +805,31 @@ export function ThemePanel({ onStatus, onApplied }: ThemePanelProps): JSX.Elemen
             style={secondaryButtonStyle(busy)}
           >
             Derive
+          </button>
+        </div>
+      </section>
+
+      <section style={{ display: "flex", flexDirection: "column", gap: spacing.sm }}>
+        <SectionTitle>Derive from an image</SectionTitle>
+        <p style={{ margin: 0, color: colors.textMuted, fontSize: 11 }}>
+          Upload a photo or artwork — its dominant colors become a new theme.
+        </p>
+        <div style={{ display: "flex", gap: spacing.sm }}>
+          <input
+            type="text"
+            value={imageThemeName}
+            onChange={(e) => setImageThemeName(e.target.value)}
+            aria-label="Image theme name"
+            style={inputStyle}
+          />
+          <button
+            type="button"
+            disabled={busy}
+            onClick={handleDeriveFromImage}
+            aria-label="Derive theme from image"
+            style={secondaryButtonStyle(busy)}
+          >
+            Upload image…
           </button>
         </div>
       </section>
@@ -538,6 +920,33 @@ export function ThemePanel({ onStatus, onApplied }: ThemePanelProps): JSX.Elemen
             />
           </LabeledField>
 
+          <div style={{ fontSize: 11, color: colors.textMuted }}>Logo</div>
+          <div style={{ display: "flex", alignItems: "center", gap: spacing.sm }}>
+            <span style={{ flex: 1, fontSize: 11, color: colors.textMuted }}>
+              {draftKit.logo_asset_id !== null
+                ? "Logo set — insert it as an editable node."
+                : "No logo yet. Import an SVG or raster image."}
+            </span>
+            <button
+              type="button"
+              disabled={busy}
+              onClick={handleImportLogo}
+              aria-label="Import brand logo"
+              style={miniButtonStyle(busy)}
+            >
+              Import…
+            </button>
+            <button
+              type="button"
+              disabled={busy || draftKit.logo_asset_id === null}
+              onClick={handleInsertLogo}
+              aria-label="Insert brand logo"
+              style={miniButtonStyle(busy || draftKit.logo_asset_id === null)}
+            >
+              Insert
+            </button>
+          </div>
+
           <div style={{ fontSize: 11, color: colors.textMuted }}>Colors</div>
           {draftKit.colors.map((c, i) => (
             <div
@@ -580,16 +989,82 @@ export function ThemePanel({ onStatus, onApplied }: ThemePanelProps): JSX.Elemen
               </button>
             </div>
           ))}
-          <button
-            type="button"
-            onClick={addColor}
-            aria-label="Add color"
-            style={miniButtonStyle(false)}
-          >
-            + Color
-          </button>
+          <div style={{ display: "flex", gap: spacing.sm }}>
+            <button
+              type="button"
+              onClick={addColor}
+              aria-label="Add color"
+              style={miniButtonStyle(false)}
+            >
+              + Color
+            </button>
+            <button
+              type="button"
+              disabled={busy}
+              onClick={handlePaletteFromImage}
+              aria-label="Extract palette from image"
+              style={miniButtonStyle(busy)}
+            >
+              Palette from image…
+            </button>
+          </div>
 
-          <div style={{ fontSize: 11, color: colors.textMuted }}>Fonts</div>
+          <div style={{ fontSize: 11, color: colors.textMuted }}>
+            Heading &amp; body fonts
+          </div>
+          <LabeledField label="Heading">
+            <select
+              value={headingFont}
+              disabled={busy}
+              onChange={(e) => handleSetRoleFont("heading", e.target.value)}
+              aria-label="Heading font"
+              style={inputStyle}
+            >
+              <option value="">Choose a font…</option>
+              {fontOptions.map((f) => (
+                <option key={f} value={f}>
+                  {f}
+                </option>
+              ))}
+            </select>
+          </LabeledField>
+          <LabeledField label="Body">
+            <select
+              value={bodyFont}
+              disabled={busy}
+              onChange={(e) => handleSetRoleFont("body", e.target.value)}
+              aria-label="Body font"
+              style={inputStyle}
+            >
+              <option value="">Choose a font…</option>
+              {fontOptions.map((f) => (
+                <option key={f} value={f}>
+                  {f}
+                </option>
+              ))}
+            </select>
+          </LabeledField>
+          <label
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: spacing.xs,
+              fontSize: 11,
+              color: colors.textMuted,
+            }}
+          >
+            <input
+              type="checkbox"
+              checked={embedFonts}
+              onChange={(e) => setEmbedFonts(e.target.checked)}
+              aria-label="Embed chosen fonts in the project"
+            />
+            Embed chosen fonts (carried into PDF/SVG exports, offline)
+          </label>
+
+          <div style={{ fontSize: 11, color: colors.textMuted }}>
+            Fonts (advanced)
+          </div>
           {draftKit.fonts.map((f, i) => (
             <div
               key={i}
@@ -636,7 +1111,7 @@ export function ThemePanel({ onStatus, onApplied }: ThemePanelProps): JSX.Elemen
             + Font
           </button>
 
-          <div style={{ display: "flex", gap: spacing.sm }}>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: spacing.sm }}>
             <button
               type="button"
               disabled={busy}
@@ -657,6 +1132,15 @@ export function ThemePanel({ onStatus, onApplied }: ThemePanelProps): JSX.Elemen
             </button>
             <button
               type="button"
+              disabled={busy}
+              onClick={handleSaveToLibrary}
+              aria-label="Save brand kit to library"
+              style={secondaryButtonStyle(busy)}
+            >
+              Save to library
+            </button>
+            <button
+              type="button"
               onClick={() => setDraftKit(null)}
               aria-label="Close brand kit editor"
               style={secondaryButtonStyle(false)}
@@ -666,6 +1150,55 @@ export function ThemePanel({ onStatus, onApplied }: ThemePanelProps): JSX.Elemen
           </div>
         </section>
       ) : null}
+
+      <section style={{ display: "flex", flexDirection: "column", gap: spacing.sm }}>
+        <SectionTitle>Brand library</SectionTitle>
+        <p style={{ margin: 0, color: colors.textMuted, fontSize: 11 }}>
+          Brand kits saved to disk and reusable across every project.
+        </p>
+        <div style={{ display: "flex", flexDirection: "column", gap: spacing.xs }}>
+          {registryKits.map((kit) => (
+            <div
+              key={kit.id}
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: spacing.sm,
+                padding: spacing.xs,
+                border: `1px solid ${colors.border}`,
+                borderRadius: radius.md,
+                background: colors.bg,
+              }}
+            >
+              <SwatchRow colorsList={kit.colors.map((c) => c.color)} />
+              <span style={{ flex: 1, fontSize: 11 }}>{kit.name}</span>
+              <button
+                type="button"
+                disabled={busy}
+                onClick={() => handleLoadFromLibrary(kit)}
+                aria-label={`Load ${kit.name} into this project`}
+                style={miniButtonStyle(busy)}
+              >
+                Load
+              </button>
+              <button
+                type="button"
+                disabled={busy}
+                onClick={() => handleDeleteFromLibrary(kit.id)}
+                aria-label={`Delete ${kit.name} from library`}
+                style={miniButtonStyle(busy)}
+              >
+                Delete
+              </button>
+            </div>
+          ))}
+          {registryKits.length === 0 ? (
+            <span style={{ color: colors.textMuted, fontSize: 11 }}>
+              No saved kits yet. Open a kit and choose “Save to library”.
+            </span>
+          ) : null}
+        </div>
+      </section>
 
       {report !== null ? (
         <div style={{ fontSize: 11, color: colors.textMuted }}>
@@ -821,6 +1354,20 @@ function secondaryButtonStyle(disabled: boolean): React.CSSProperties {
     background: colors.bg,
     color: disabled ? colors.textMuted : colors.text,
     cursor: disabled ? "default" : "pointer",
+  };
+}
+
+/** A segmented-control button: highlighted when it is the active choice. */
+function segmentButtonStyle(active: boolean): React.CSSProperties {
+  return {
+    flex: 1,
+    fontSize: 11,
+    padding: `${spacing.xs}px ${spacing.sm}px`,
+    borderRadius: radius.md,
+    border: `1px solid ${active ? colors.accent : colors.border}`,
+    background: active ? colors.accentBgSoft : colors.bg,
+    color: active ? colors.text : colors.textMuted,
+    cursor: "pointer",
   };
 }
 

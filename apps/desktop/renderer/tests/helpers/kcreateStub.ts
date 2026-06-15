@@ -181,12 +181,40 @@ const defaultsByMethod: Record<string, () => unknown> = {
   // fresh copy per call so a test that mutates the result can't bleed
   // into the next.
   "theme.apply": () => ({ ...defaultApplyThemeReport }),
+  // H5 — apply-to-selection routes through a dedicated bridge entry so
+  // the scope toggle in ThemePanel can pick a different path while still
+  // returning the same `ApplyThemeReport` shape.
+  "theme.applyToSelection": () => ({ ...defaultApplyThemeReport }),
   "theme.deriveFromDocument": () => ({ ...defaultTheme }),
+  // H5 — derive a theme from an uploaded image's dominant palette.
+  "theme.deriveFromImage": () => ({ ...defaultTheme }),
   "theme.fromBrandKit": () => ({ ...defaultTheme }),
   "brandKit.list": () => [],
   "brandKit.create": () => "00000000-0000-0000-0000-000000000000",
   "brandKit.update": () => undefined,
   "brandKit.delete": () => true,
+  // H5 — brand-kit asset mutations (logo / palette / fonts) and the
+  // cross-project on-disk registry. Defaults keep ThemePanel mountable
+  // (the mount effect loads the registry + fonts); tests that exercise a
+  // specific flow override with real fixtures.
+  "brandKit.setLogoBytes": () => undefined,
+  "brandKit.setFontRole": () => undefined,
+  "brandKit.extractPaletteFromImage": () => [],
+  "brandKit.insertLogo": () => ({
+    groupId: "group-logo",
+    nodeIds: ["node-logo"],
+    name: "Brand Logo",
+    x: 0,
+    y: 0,
+    width: 160,
+    height: 160,
+  }),
+  "brandKit.registrySave": () => undefined,
+  "brandKit.registryList": () => [],
+  "brandKit.registryLoad": () => "00000000-0000-0000-0000-000000000000",
+  "brandKit.registryDelete": () => true,
+  // H5 — fontdb-discovered system fonts for the heading/body pickers.
+  "text.listFonts": () => [],
   "document.saveProject": () => undefined,
   "export.png": () => 0,
   "export.svg": () => "",

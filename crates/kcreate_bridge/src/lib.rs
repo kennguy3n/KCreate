@@ -6048,6 +6048,13 @@ pub fn ai_generate_themed_design(brief: String, options_json: String) -> NapiRes
 
 #[napi]
 #[allow(clippy::needless_pass_by_value)]
+pub fn ai_refine_themed_design(instruction: String) -> NapiResult<String> {
+    let res = phase10::ai_refine_themed_design(&instruction).map_err(map_doc_err)?;
+    json_out("ai_refine_themed_design", &res)
+}
+
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
 pub fn ai_harmonize_palette(brand_kit_id_str: String, harmony_type: String) -> NapiResult<String> {
     let brand_kit_id = parse_uuid(&brand_kit_id_str)?;
     let res = phase10::ai_harmonize_palette(brand_kit_id, &harmony_type).map_err(map_doc_err)?;

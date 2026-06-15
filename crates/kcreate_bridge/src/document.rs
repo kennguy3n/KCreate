@@ -1562,6 +1562,19 @@ const APPLY_PATCH_COMMANDS: &[&str] = &[
     // group-undo reverse capture needs to roll back the same slots —
     // see `ApplyPatchSnapshot::capture`.
     "apply_theme",
+    // H4 — AI generation depth. `ai_generate_themed_design` /
+    // `ai_refine_themed_design` build a whole generated design (a
+    // tiled page of artboards + themed layers + hero imagery, plus a
+    // theme brand kit) in one shot. Both record a single reversible
+    // [`crate::phase10::ThemedDesignPatch`] (before = undo direction,
+    // after = redo direction) so one Ctrl+Z removes the generated
+    // design and restores whatever the document held before (a prior
+    // generated design, a pristine scratch scaffold, or the user's
+    // own pages) — see the shared arm in [`apply_patch`]. Replay is
+    // pure graph + brand-kit vec ops, so no snapshot slot is needed
+    // in `ApplyPatchSnapshot::capture` (documented no-op arm there).
+    "ai_generate_themed_design",
+    "ai_refine_themed_design",
 ];
 
 #[inline]
@@ -1809,6 +1822,16 @@ impl ApplyPatchSnapshot {
                         }
                     }
                 }
+                // No snapshot slot needed for the remaining
+                // apply_patch commands. Notably H4's
+                // `ai_generate_themed_design` /
+                // `ai_refine_themed_design` carry a fully
+                // self-contained reversible [`crate::phase10::
+                // ThemedDesignPatch`] (removed subtrees + inserted
+                // subtree + brand kit before/after); replaying it via
+                // `apply_patch` is pure graph + brand-kit vec ops that
+                // never fail, so there is nothing extra to capture
+                // here for atomic group rollback.
                 _ => {}
             }
         }
@@ -1930,8 +1953,10 @@ impl ApplyPatchSnapshot {
 /// Used by [`ApplyPatchSnapshot::capture`] so the matching restore
 /// path can re-insert via `DocumentGraph::insert_node` without
 /// hitting a `NodeNotFound` on a child whose parent hasn't been
-/// re-attached yet.
-fn collect_subtree_parent_first(
+/// re-attached yet. Also used by `phase10`'s themed-design generator
+/// to capture the inserted / removed subtrees into a reversible
+/// [`crate::phase10::ThemedDesignPatch`].
+pub(crate) fn collect_subtree_parent_first(
     doc: &kcreate_core::document::DocumentGraph,
     root_id: Uuid,
 ) -> Vec<kcreate_core::node::Node> {
@@ -2516,6 +2541,21 @@ fn apply_patch(ws: &mut Workspace, op: &Operation, patch: &serde_json::Value) ->
             }
             Ok(())
         }
+        // H4 — AI generation depth. `ai_generate_themed_design` and
+        // `ai_refine_themed_design` both carry a single reversible
+        // [`crate::phase10::ThemedDesignPatch`]: before_patch tagged
+        // `Undo`, after_patch tagged `Redo`, same data otherwise. The
+        // patch holds the subtrees the run removed (a prior generated
+        // design and/or a pristine scratch scaffold), the inserted
+        // generated page subtree, and the theme brand kit before /
+        // after. Undo removes the generated design and restores the
+        // prior document + brand kit; redo re-applies the generation.
+        // Replay is pure graph + brand-kit vec ops — see
+        // [`apply_themed_design_patch`].
+        "ai_generate_themed_design" | "ai_refine_themed_design" => {
+            let parsed: crate::phase10::ThemedDesignPatch = serde_json::from_value(patch.clone())?;
+            apply_themed_design_patch(ws, parsed)
+        }
         other => {
             // No-op fall-through for graph operations
             // (document_create_node, canvas_move_node, …) whose
@@ -2541,6 +2581,68 @@ fn apply_patch(ws: &mut Workspace, op: &Operation, patch: &serde_json::Value) ->
             }
             Ok(())
         }
+    }
+}
+
+/// Roll a generated themed design forward (redo) or backward (undo)
+/// from a single [`crate::phase10::ThemedDesignPatch`].
+///
+/// * **Undo** — remove the generated page subtree, re-insert the
+///   subtrees the generation had removed (parent-first, so each child
+///   finds its parent), and restore the prior theme brand kit (or
+///   remove the freshly-created one when there was none before).
+/// * **Redo** — re-remove whatever the generation cleared, re-insert
+///   the generated subtree parent-first, and re-apply the theme
+///   brand kit.
+///
+/// `remove_node` returning `None` (node already gone) is treated as
+/// success so an interrupted group can still cleanly roll back, and
+/// every `insert_node` is parent-first so it never fails on a missing
+/// parent — matching the `clipboard_paste` reversible-subtree arm.
+fn apply_themed_design_patch(
+    ws: &mut Workspace,
+    patch: crate::phase10::ThemedDesignPatch,
+) -> Result<()> {
+    match patch.dir {
+        crate::phase10::ThemedPatchDir::Undo => {
+            ws.project.document.remove_node(patch.inserted_root);
+            for subtree in &patch.removed {
+                for node in subtree {
+                    ws.project.document.insert_node(node.clone())?;
+                }
+            }
+            match patch.brand_kit_before {
+                Some(prior) => upsert_brand_kit(ws, prior),
+                None => {
+                    let created = patch.brand_kit_after.id;
+                    ws.project.brand_kits.retain(|k| k.id != created);
+                }
+            }
+        }
+        crate::phase10::ThemedPatchDir::Redo => {
+            for subtree in &patch.removed {
+                if let Some(root) = subtree.first() {
+                    ws.project.document.remove_node(root.id);
+                }
+            }
+            for node in &patch.inserted {
+                ws.project.document.insert_node(node.clone())?;
+            }
+            upsert_brand_kit(ws, patch.brand_kit_after);
+        }
+    }
+    Ok(())
+}
+
+/// Replace the brand kit with the same id in place, or push it when
+/// absent. Used by [`apply_themed_design_patch`] so undo/redo restore
+/// the exact theme brand kit without disturbing the user's other
+/// kits or their ordering.
+fn upsert_brand_kit(ws: &mut Workspace, kit: kcreate_core::project::BrandKit) {
+    if let Some(existing) = ws.project.brand_kits.iter_mut().find(|k| k.id == kit.id) {
+        *existing = kit;
+    } else {
+        ws.project.brand_kits.push(kit);
     }
 }
 
@@ -8902,6 +9004,9 @@ mod tests {
             "text_set_style",
             // G4 — Theme / Brand Kit instant restyle.
             "apply_theme",
+            // H4 — AI generation depth (generate + refine).
+            "ai_generate_themed_design",
+            "ai_refine_themed_design",
         ]
         .into_iter()
         .collect();

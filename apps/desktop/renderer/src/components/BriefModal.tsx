@@ -79,6 +79,64 @@ const THEME_OPTIONS: ReadonlyArray<{
   { id: "slate", label: "Slate", swatches: ["#EEF2F7", "#2563EB", "#0EA5E9"] },
 ];
 
+/**
+ * Output formats offered by the Gamma-style generator. The `id`
+ * values are the wire strings the bridge accepts
+ * (`kcreate_ai::themed_deck::DesignFormat`). Deck and One-pager are
+ * the original pure-vector formats; Social set / Web page / Document
+ * are the H4 additions that also support diffusion hero imagery.
+ */
+const FORMAT_OPTIONS: ReadonlyArray<{
+  id: ThemedDesignFormat;
+  label: string;
+  testid: string;
+}> = [
+  { id: "deck", label: "Deck", testid: "kcreate-themed-format-deck" },
+  { id: "onePager", label: "One-pager", testid: "kcreate-themed-format-onepager" },
+  {
+    id: "socialPost",
+    label: "Social set",
+    testid: "kcreate-themed-format-socialpost",
+  },
+  { id: "webPage", label: "Web page", testid: "kcreate-themed-format-webpage" },
+  { id: "document", label: "Document", testid: "kcreate-themed-format-document" },
+];
+
+/**
+ * Formats that carry a hero/section image slot. For these the
+ * `useImage` toggle is shown and forwarded; when the diffusion
+ * sidecar is ready the bridge places a real raster, otherwise it
+ * degrades to a tasteful gradient placeholder. Deck / One-pager are
+ * pure-vector and ignore the flag, so it is never sent for them
+ * (keeping their option payload minimal).
+ */
+const IMAGE_FORMATS: ReadonlySet<ThemedDesignFormat> = new Set([
+  "socialPost",
+  "webPage",
+  "document",
+]);
+
+/**
+ * Section-count choices offered per format. These mirror the
+ * `resolved_section_count` clamps in
+ * `kcreate_ai::themed_deck::DesignFormat` so the <select> never shows
+ * a value the bridge would silently clamp away.
+ */
+function sectionChoices(format: ThemedDesignFormat): readonly number[] {
+  switch (format) {
+    case "deck":
+      return [3, 4, 5, 6, 7, 8, 9, 10, 11];
+    case "onePager":
+      return [3, 4, 5, 6];
+    case "socialPost":
+      return [2, 3, 4];
+    case "webPage":
+      return [3, 4, 5];
+    case "document":
+      return [4, 5, 6, 7, 8];
+  }
+}
+
 interface BriefModalProps {
   open: boolean;
   onClose: () => void;
@@ -218,6 +276,11 @@ export function BriefModal({
   const [onePagerSize, setOnePagerSize] = useState<ThemedOnePagerSize>("a4");
   const [sectionCount, setSectionCount] = useState<number | null>(null);
   const [useLlm, setUseLlm] = useState(false);
+  // Diffusion hero imagery is opt-in-by-default for image-bearing
+  // formats; it degrades to a gradient placeholder offline.
+  const [useImage, setUseImage] = useState(true);
+  // Free-text follow-up instruction for the "Refine with AI" loop.
+  const [refineInstruction, setRefineInstruction] = useState("");
 
   // Fetch the real preset list whenever the modal is opened so the
   // SYSTEM_PROMPT enumerates names that the Rust bridge will actually
@@ -288,6 +351,9 @@ export function BriefModal({
       if (format === "onePager") {
         options.onePagerSize = onePagerSize;
       }
+      if (IMAGE_FORMATS.has(format)) {
+        options.useImage = useImage;
+      }
       if (sectionCount !== null) {
         options.sectionCount = sectionCount;
       }
@@ -313,9 +379,31 @@ export function BriefModal({
     onePagerSize,
     sectionCount,
     useLlm,
+    useImage,
     llmReady,
     onApplied,
   ]);
+
+  // "Refine with AI": apply a free-text follow-up to the most recent
+  // generated design. The bridge reloads the stored generation spec,
+  // folds in the instruction, regenerates, and replaces the prior
+  // output in a SINGLE undoable operation; it rejects when there is
+  // no generated design yet (surfaced inline). No `ensureProject`
+  // here — refine only makes sense against an existing generation.
+  const refineThemed = useCallback(async () => {
+    if (refineInstruction.trim().length === 0) return;
+    setPhase({ kind: "applying" });
+    try {
+      const result =
+        await window.kcreate.phase10.aiRefineThemedDesign(refineInstruction);
+      setRefineInstruction("");
+      setPhase({ kind: "idle" });
+      onApplied(result);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      setPhase({ kind: "error", message });
+    }
+  }, [refineInstruction, onApplied]);
 
   const submitBrief = useCallback(async () => {
     if (presets.length === 0) {
@@ -450,7 +538,18 @@ export function BriefModal({
             onSectionCount={setSectionCount}
             useLlm={useLlm}
             onUseLlm={setUseLlm}
+            useImage={useImage}
+            onUseImage={setUseImage}
             llmReady={llmReady}
+            disabled={busy}
+          />
+        )}
+
+        {mode === "themed" && (
+          <RefineControls
+            instruction={refineInstruction}
+            onInstruction={setRefineInstruction}
+            onRefine={() => void refineThemed()}
             disabled={busy}
           />
         )}
@@ -539,6 +638,8 @@ function ThemedControls({
   onSectionCount,
   useLlm,
   onUseLlm,
+  useImage,
+  onUseImage,
   llmReady,
   disabled,
 }: {
@@ -552,6 +653,8 @@ function ThemedControls({
   onSectionCount: (n: number | null) => void;
   useLlm: boolean;
   onUseLlm: (v: boolean) => void;
+  useImage: boolean;
+  onUseImage: (v: boolean) => void;
   llmReady: boolean;
   disabled: boolean;
 }): JSX.Element {
@@ -560,28 +663,21 @@ function ThemedControls({
       <div style={controlRowStyle}>
         <span style={controlLabelStyle}>Format</span>
         <div style={segmentStyle}>
-          <button
-            type="button"
-            onClick={() => onFormat("deck")}
-            disabled={disabled}
-            aria-pressed={format === "deck"}
-            style={format === "deck" ? segmentButtonActiveStyle : segmentButtonStyle}
-            data-testid="kcreate-themed-format-deck"
-          >
-            Deck
-          </button>
-          <button
-            type="button"
-            onClick={() => onFormat("onePager")}
-            disabled={disabled}
-            aria-pressed={format === "onePager"}
-            style={
-              format === "onePager" ? segmentButtonActiveStyle : segmentButtonStyle
-            }
-            data-testid="kcreate-themed-format-onepager"
-          >
-            One-pager
-          </button>
+          {FORMAT_OPTIONS.map((f) => (
+            <button
+              key={f.id}
+              type="button"
+              onClick={() => onFormat(f.id)}
+              disabled={disabled}
+              aria-pressed={format === f.id}
+              style={
+                format === f.id ? segmentButtonActiveStyle : segmentButtonStyle
+              }
+              data-testid={f.testid}
+            >
+              {f.label}
+            </button>
+          ))}
         </div>
       </div>
 
@@ -653,10 +749,7 @@ function ThemedControls({
             data-testid="kcreate-themed-sections"
           >
             <option value="auto">Auto</option>
-            {(format === "deck"
-              ? [4, 5, 6, 7, 8, 9, 10]
-              : [3, 4, 5, 6]
-            ).map((n) => (
+            {sectionChoices(format).map((n) => (
               <option key={n} value={n}>
                 {n}
               </option>
@@ -685,6 +778,79 @@ function ThemedControls({
         />
         <span>Expand with AI {llmReady ? "" : "(model not loaded)"}</span>
       </label>
+
+      {IMAGE_FORMATS.has(format) && (
+        <label
+          style={checkboxRowStyle}
+          title="Generate a hero image with the local diffusion model when it's loaded; otherwise a tasteful gradient placeholder is used. Always offline."
+        >
+          <input
+            type="checkbox"
+            checked={useImage}
+            onChange={(e) => onUseImage(e.target.checked)}
+            disabled={disabled}
+            data-testid="kcreate-themed-useimage"
+          />
+          <span>AI hero imagery</span>
+        </label>
+      )}
+    </div>
+  );
+}
+
+/**
+ * "Refine with AI" entry point. A free-text follow-up instruction
+ * applied to the most recently generated themed design (handled by
+ * `phase10::ai_refine_themed_design`, which rejects when nothing has
+ * been generated yet). Surfaced in themed mode; the Refine button
+ * stays disabled until an instruction is typed.
+ */
+function RefineControls({
+  instruction,
+  onInstruction,
+  onRefine,
+  disabled,
+}: {
+  instruction: string;
+  onInstruction: (v: string) => void;
+  onRefine: () => void;
+  disabled: boolean;
+}): JSX.Element {
+  return (
+    <div style={refineStyle} data-testid="kcreate-themed-refine-panel">
+      <span style={controlLabelStyle}>Refine with AI</span>
+      <p style={refineHelpStyle}>
+        Already generated a design? Describe a change to apply as one
+        undoable step — e.g. <em>make it more minimal</em>,{" "}
+        <em>add a pricing slide</em>, <em>punchier headlines</em>, or{" "}
+        <em>remove the hero image</em>.
+      </p>
+      <div style={refineRowStyle}>
+        <input
+          type="text"
+          value={instruction}
+          onChange={(e) => onInstruction(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter" && !disabled && instruction.trim().length > 0) {
+              e.preventDefault();
+              onRefine();
+            }
+          }}
+          placeholder="Describe a refinement…"
+          disabled={disabled}
+          style={refineInputStyle}
+          data-testid="kcreate-themed-refine-input"
+        />
+        <button
+          type="button"
+          onClick={onRefine}
+          disabled={disabled || instruction.trim().length === 0}
+          style={primaryButtonStyle}
+          data-testid="kcreate-themed-refine"
+        >
+          Refine
+        </button>
+      </div>
     </div>
   );
 }
@@ -929,6 +1095,39 @@ const checkboxRowStyle: React.CSSProperties = {
   fontSize: 13,
   color: colors.text,
   cursor: "pointer",
+};
+
+const refineStyle: React.CSSProperties = {
+  display: "flex",
+  flexDirection: "column",
+  gap: spacing.xs,
+  padding: spacing.md,
+  background: colors.bgSoft,
+  border: `1px solid ${colors.border}`,
+  borderRadius: radius.card,
+};
+
+const refineHelpStyle: React.CSSProperties = {
+  margin: 0,
+  fontSize: 12,
+  color: colors.textMuted,
+};
+
+const refineRowStyle: React.CSSProperties = {
+  display: "flex",
+  gap: spacing.sm,
+  alignItems: "center",
+};
+
+const refineInputStyle: React.CSSProperties = {
+  flex: 1,
+  fontFamily: font.family,
+  fontSize: 13,
+  padding: "7px 9px",
+  background: colors.bg,
+  border: `1px solid ${colors.border}`,
+  borderRadius: radius.sm,
+  color: colors.text,
 };
 
 const errorStyle: React.CSSProperties = {

@@ -42,6 +42,52 @@ pub enum DesignFormat {
     Deck,
     /// A single, vertically-structured page (title block + sections).
     OnePager,
+    /// A matched pair of social posts: a square feed tile plus a
+    /// vertical 9:16 story.
+    SocialPost,
+    /// A marketing landing page: hero + feature grid + call-to-action
+    /// band, on one tall canvas.
+    WebPage,
+    /// A multi-page document / report: cover + paginated body sections
+    /// with running header, footer, and page numbers.
+    Document,
+}
+
+impl DesignFormat {
+    /// Every format, in UI order. Drives the picker and exhaustive
+    /// tests.
+    #[must_use]
+    pub fn all() -> [Self; 5] {
+        [
+            Self::Deck,
+            Self::OnePager,
+            Self::SocialPost,
+            Self::WebPage,
+            Self::Document,
+        ]
+    }
+
+    /// Stable wire token. Mirrors the serde `camelCase` rename so the
+    /// bridge / TypeScript surface and this method never drift.
+    #[must_use]
+    pub fn wire(self) -> &'static str {
+        match self {
+            Self::Deck => "deck",
+            Self::OnePager => "onePager",
+            Self::SocialPost => "socialPost",
+            Self::WebPage => "webPage",
+            Self::Document => "document",
+        }
+    }
+
+    /// Whether this format has a hero/section image slot the diffusion
+    /// path can populate (degrading to a vector gradient placeholder
+    /// when no model is available). Decks and one-pagers stay purely
+    /// vector so their tuned output never changes.
+    #[must_use]
+    pub fn supports_imagery(self) -> bool {
+        matches!(self, Self::SocialPost | Self::WebPage | Self::Document)
+    }
 }
 
 /// Page geometry for one-pager output.
@@ -254,6 +300,43 @@ impl TypeScale {
                 body: 16.0,
                 caption: 12.0,
             },
+            DesignFormat::SocialPost => Self {
+                title: 76.0,
+                heading: 40.0,
+                subheading: 34.0,
+                body: 30.0,
+                caption: 24.0,
+            },
+            DesignFormat::WebPage => Self {
+                title: 72.0,
+                heading: 40.0,
+                subheading: 26.0,
+                body: 20.0,
+                caption: 15.0,
+            },
+            DesignFormat::Document => Self {
+                title: 40.0,
+                heading: 24.0,
+                subheading: 17.0,
+                body: 13.0,
+                caption: 10.0,
+            },
+        }
+    }
+
+    /// Scale every size by `factor` (clamped to a tasteful ±10% band
+    /// so layout variety never produces illegible or oversized type).
+    /// The scaled scale is stored on the [`GeneratedDesign`] so the
+    /// palette/scale invariant continues to hold against it.
+    #[must_use]
+    fn scaled(self, factor: f32) -> Self {
+        let f = factor.clamp(0.9, 1.1);
+        Self {
+            title: self.title * f,
+            heading: self.heading * f,
+            subheading: self.subheading * f,
+            body: self.body * f,
+            caption: self.caption * f,
         }
     }
 
@@ -320,12 +403,15 @@ impl ThemedDesignOptions {
     /// (e.g. `0` or `99`) is treated identically on either path.
     #[must_use]
     pub fn resolved_section_count(&self) -> usize {
-        let (default, max) = match self.format {
-            DesignFormat::Deck => (6usize, 11usize),
-            DesignFormat::OnePager => (4usize, 6usize),
+        let (default, min, max) = match self.format {
+            DesignFormat::Deck => (6usize, 3usize, 11usize),
+            DesignFormat::OnePager => (4usize, 3usize, 6usize),
+            DesignFormat::SocialPost => (3usize, 2usize, 4usize),
+            DesignFormat::WebPage => (3usize, 3usize, 5usize),
+            DesignFormat::Document => (5usize, 4usize, 8usize),
         };
         let n = self.section_count.map_or(default, |v| v as usize);
-        n.clamp(3, max)
+        n.clamp(min, max)
     }
 }
 
@@ -348,9 +434,20 @@ pub struct DesignElement {
     /// Font family ("" for rectangles).
     pub font_family: String,
     /// Fill colour (hex). For text this is the glyph colour; for
-    /// rectangles the fill.
+    /// rectangles the fill; for images the first gradient stop of the
+    /// vector placeholder.
     pub fill: String,
     pub corner_radius: f64,
+    /// Diffusion prompt for image elements. `Some` marks a real
+    /// hero/section image the bridge will try to synthesise (falling
+    /// back to a gradient placeholder offline); `None` keeps the
+    /// element a purely decorative gradient panel.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_prompt: Option<String>,
+    /// Second gradient stop (hex) for image placeholders / two-tone
+    /// accents. `None` keeps a flat fill.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fill_secondary: Option<String>,
 }
 
 /// Semantic role of an element — drives the bridge's node naming and
@@ -375,6 +472,9 @@ pub enum ElementRole {
 pub enum ElementKind {
     Text,
     Rect,
+    /// A raster image slot — populated by diffusion when a model is
+    /// available, otherwise rendered as a gradient placeholder.
+    Image,
 }
 
 /// One page of the generated design.
@@ -932,10 +1032,25 @@ fn title_case(s: &str) -> String {
 #[must_use]
 pub fn generate_design(outline: &DeckOutline, options: ThemedDesignOptions) -> GeneratedDesign {
     let theme = theme(options.theme_id);
-    let scale = TypeScale::for_format(options.format);
+    let variety = Variety::derive(outline, &theme, options.format);
+    // Type-scale variety is applied only to the image-bearing formats
+    // (social / web / document); decks and one-pagers keep their exact
+    // tuned sizes so their geometry never regresses. The scaled scale
+    // is stored on the design, so the palette/scale invariant holds.
+    let base_scale = TypeScale::for_format(options.format);
+    let scale = if options.format.supports_imagery() {
+        base_scale.scaled(variety.scale_factor)
+    } else {
+        base_scale
+    };
     let pages = match options.format {
-        DesignFormat::Deck => layout_deck(outline, &theme, &scale),
-        DesignFormat::OnePager => layout_one_pager(outline, &theme, &scale, options.one_pager_size),
+        DesignFormat::Deck => layout_deck(outline, &theme, &scale, variety),
+        DesignFormat::OnePager => {
+            layout_one_pager(outline, &theme, &scale, options.one_pager_size, variety)
+        }
+        DesignFormat::SocialPost => layout_social_post(outline, &theme, &scale, variety),
+        DesignFormat::WebPage => layout_web_page(outline, &theme, &scale, variety),
+        DesignFormat::Document => layout_document(outline, &theme, &scale, variety),
     };
     GeneratedDesign {
         theme,
@@ -950,17 +1065,27 @@ const DECK_H: f64 = 1080.0;
 const DECK_MARGIN: f64 = 120.0;
 const DECK_CARD_PAD: f64 = 84.0;
 
-fn layout_deck(outline: &DeckOutline, theme: &Theme, scale: &TypeScale) -> Vec<GeneratedPage> {
+fn layout_deck(
+    outline: &DeckOutline,
+    theme: &Theme,
+    scale: &TypeScale,
+    variety: Variety,
+) -> Vec<GeneratedPage> {
     let mut pages = Vec::with_capacity(outline.slides.len() + 1);
-    pages.push(title_slide(outline, theme, scale));
+    pages.push(title_slide(outline, theme, scale, variety));
     let total = outline.slides.len();
     for (i, slide) in outline.slides.iter().enumerate() {
-        pages.push(content_slide(slide, theme, scale, i + 1, total));
+        pages.push(content_slide(slide, theme, scale, i + 1, total, variety));
     }
     pages
 }
 
-fn title_slide(outline: &DeckOutline, theme: &Theme, scale: &TypeScale) -> GeneratedPage {
+fn title_slide(
+    outline: &DeckOutline,
+    theme: &Theme,
+    scale: &TypeScale,
+    variety: Variety,
+) -> GeneratedPage {
     let mut elements = Vec::new();
     let content = Bounds::new(
         DECK_MARGIN,
@@ -978,7 +1103,7 @@ fn title_slide(outline: &DeckOutline, theme: &Theme, scale: &TypeScale) -> Gener
         content.y + content.height * 0.30,
         accent_w,
         accent_h,
-        &theme.primary,
+        variety.accent(theme),
         accent_h / 2.0,
     ));
 
@@ -1048,6 +1173,7 @@ fn content_slide(
     scale: &TypeScale,
     index: usize,
     total: usize,
+    variety: Variety,
 ) -> GeneratedPage {
     let mut elements = Vec::new();
     let card = Bounds::new(
@@ -1082,7 +1208,7 @@ fn content_slide(
         inner.y,
         140.0,
         accent_h,
-        &theme.primary,
+        variety.accent(theme),
         accent_h / 2.0,
     ));
 
@@ -1153,7 +1279,7 @@ fn content_slide(
             block.y + (body_lh - marker) / 2.0,
             marker,
             marker,
-            &theme.primary,
+            variety.accent(theme),
             marker / 2.0,
         ));
         for (li, line) in lines.iter().enumerate() {
@@ -1198,6 +1324,7 @@ fn layout_one_pager(
     theme: &Theme,
     scale: &TypeScale,
     size: OnePagerSize,
+    variety: Variety,
 ) -> Vec<GeneratedPage> {
     let (page_w, page_h) = size.dimensions();
     let margin = 64.0;
@@ -1212,7 +1339,7 @@ fn layout_one_pager(
         content.y,
         96.0,
         accent_h,
-        &theme.primary,
+        variety.accent(theme),
         accent_h / 2.0,
     ));
 
@@ -1329,7 +1456,7 @@ fn layout_one_pager(
                 b.y + (body_lh - marker) / 2.0,
                 marker,
                 marker,
-                &theme.primary,
+                variety.accent(theme),
                 marker / 2.0,
             ));
             elements.push(text(
@@ -1363,6 +1490,855 @@ fn layout_one_pager(
         background: theme.background.clone(),
         elements,
     }]
+}
+
+// ---------------------------------------------------------------------------
+// Layout variety
+// ---------------------------------------------------------------------------
+
+/// Deterministic, content-derived knobs that keep repeated generations
+/// from looking identical without ever compromising legibility. Derived
+/// from a stable hash of the outline + theme + format, so the same brief
+/// always yields the same design (fully offline-reproducible).
+#[derive(Debug, Clone, Copy)]
+struct Variety {
+    /// Type-scale multiplier in a tasteful band (image-bearing formats).
+    scale_factor: f32,
+    /// Use the theme's secondary colour for accents instead of primary.
+    use_secondary_accent: bool,
+    /// Flip the hero composition (image-leading vs text-leading).
+    alt_parity: bool,
+    /// Which call-to-action / eyebrow label to use.
+    cta_index: usize,
+}
+
+const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+fn fnv1a(seed: u64, bytes: &[u8]) -> u64 {
+    let mut h = seed;
+    for &b in bytes {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(FNV_PRIME);
+    }
+    h
+}
+
+impl Variety {
+    fn derive(outline: &DeckOutline, theme: &Theme, format: DesignFormat) -> Self {
+        let mut h = fnv1a(FNV_OFFSET, outline.title.as_bytes());
+        h = fnv1a(h, outline.subtitle.as_bytes());
+        for slide in &outline.slides {
+            h = fnv1a(h, slide.heading.as_bytes());
+        }
+        h = fnv1a(h, theme.id.wire().as_bytes());
+        h = fnv1a(h, format.wire().as_bytes());
+        let steps = [0.94_f32, 0.97, 1.0, 1.03, 1.06];
+        let scale_factor = steps[(h % steps.len() as u64) as usize];
+        Self {
+            scale_factor,
+            use_secondary_accent: (h >> 8) & 1 == 1,
+            alt_parity: (h >> 9) & 1 == 1,
+            cta_index: ((h >> 10) % 3) as usize,
+        }
+    }
+
+    /// The accent colour for this design — primary, or the theme's
+    /// secondary when variety calls for it. Only ever applied to
+    /// non-text elements (bars, markers), so it never affects the
+    /// text-palette invariant.
+    fn accent<'a>(&self, theme: &'a Theme) -> &'a str {
+        if self.use_secondary_accent {
+            &theme.secondary
+        } else {
+            &theme.primary
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shared layout helpers for the image-bearing formats
+// ---------------------------------------------------------------------------
+
+/// One line-group in a vertical text stack.
+struct TextBlock<'a> {
+    role: ElementRole,
+    text: &'a str,
+    font_size: f32,
+    font: &'a str,
+    fill: &'a str,
+}
+
+/// Emit a sequence of wrapped text blocks stacked vertically from
+/// `region.y`, advancing by each block's wrapped height plus `spacing`.
+/// Returns the y just past the last line, so callers place whatever
+/// comes next without overlap. Width comes from `region.width`.
+fn stack_text(
+    out: &mut Vec<DesignElement>,
+    region: Bounds,
+    spacing: f64,
+    blocks: &[TextBlock],
+) -> f64 {
+    let mut y = region.y;
+    for (i, block) in blocks.iter().enumerate() {
+        if i > 0 {
+            y += spacing;
+        }
+        let lines = wrap_text(block.text, block.font_size, region.width);
+        let lh = line_height(block.font_size);
+        for (li, line) in lines.iter().enumerate() {
+            out.push(text(
+                block.role,
+                region.x,
+                y + lh * li as f64,
+                region.width,
+                lh,
+                line,
+                block.font_size,
+                block.font,
+                block.fill,
+            ));
+        }
+        y += lh * lines.len() as f64;
+    }
+    y
+}
+
+const CTA_LABELS: [&str; 3] = ["Learn more", "Get started", "See how it works"];
+const WEB_EYEBROWS: [&str; 3] = ["INTRODUCING", "PRESENTING", "NOW AVAILABLE"];
+
+fn cta_label(variety: Variety) -> &'static str {
+    CTA_LABELS[variety.cta_index % CTA_LABELS.len()]
+}
+
+fn eyebrow_label(variety: Variety) -> &'static str {
+    WEB_EYEBROWS[variety.cta_index % WEB_EYEBROWS.len()]
+}
+
+/// Push a rounded "pill" call-to-action (primary fill + on-background
+/// label) with its top-left at (x, y). Width fits the label within a
+/// tasteful band. Returns the pill height so callers can advance.
+fn push_cta_pill(
+    out: &mut Vec<DesignElement>,
+    theme: &Theme,
+    scale: &TypeScale,
+    x: f64,
+    y: f64,
+    label: &str,
+) -> f64 {
+    let pad_x = 44.0;
+    let lh = line_height(scale.body);
+    let h = (lh + 44.0).max(72.0);
+    let text_w = f64::from(scale.body) * AVG_CHAR_W * label.chars().count() as f64;
+    let w = (text_w + pad_x * 2.0).clamp(220.0, 560.0);
+    out.push(rect(
+        ElementRole::Surface,
+        x,
+        y,
+        w,
+        h,
+        &theme.primary,
+        h / 2.0,
+    ));
+    out.push(text(
+        ElementRole::Body,
+        x + pad_x,
+        y + (h - lh) / 2.0,
+        w - 2.0 * pad_x,
+        lh,
+        label,
+        scale.body,
+        &theme.body_font,
+        &theme.on_background,
+    ));
+    h
+}
+
+/// Build the diffusion prompt for a hero/section image. Honest and
+/// fully deterministic; the bridge feeds it to the local sidecar when a
+/// model is present and otherwise falls back to a gradient placeholder.
+fn hero_prompt(outline: &DeckOutline, theme: &Theme, context: &str) -> String {
+    format!(
+        "{context} for {}, {} colour palette, professional, clean composition, high quality",
+        outline.title.trim(),
+        theme.name.to_ascii_lowercase()
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Format: Social post set (square feed tile + 9:16 story)
+// ---------------------------------------------------------------------------
+
+const SOCIAL_SQUARE: f64 = 1080.0;
+const SOCIAL_STORY_W: f64 = 1080.0;
+const SOCIAL_STORY_H: f64 = 1920.0;
+const SOCIAL_MARGIN: f64 = 84.0;
+
+fn layout_social_post(
+    outline: &DeckOutline,
+    theme: &Theme,
+    scale: &TypeScale,
+    variety: Variety,
+) -> Vec<GeneratedPage> {
+    vec![
+        social_square(outline, theme, scale, variety),
+        social_story(outline, theme, scale, variety),
+    ]
+}
+
+fn social_square(
+    outline: &DeckOutline,
+    theme: &Theme,
+    scale: &TypeScale,
+    variety: Variety,
+) -> GeneratedPage {
+    let mut elements = Vec::new();
+    let m = SOCIAL_MARGIN;
+    let region_w = SOCIAL_SQUARE - 2.0 * m;
+
+    // Full-bleed hero band (diffusion target; gradient fallback).
+    let img_h = 540.0;
+    elements.push(image(
+        0.0,
+        0.0,
+        SOCIAL_SQUARE,
+        img_h,
+        &theme.primary,
+        &theme.secondary,
+        0.0,
+        Some(hero_prompt(outline, theme, "social media hero image")),
+    ));
+
+    // Accent flourish + punchy headline beneath the image.
+    let accent_h = 14.0;
+    let accent_y = img_h + 56.0;
+    elements.push(rect(
+        ElementRole::AccentBar,
+        m,
+        accent_y,
+        132.0,
+        accent_h,
+        variety.accent(theme),
+        accent_h / 2.0,
+    ));
+    let after = stack_text(
+        &mut elements,
+        Bounds::new(m, accent_y + accent_h + 30.0, region_w, 0.0),
+        16.0,
+        &[
+            TextBlock {
+                role: ElementRole::Heading,
+                text: &outline.title,
+                font_size: scale.heading,
+                font: &theme.heading_font,
+                fill: &theme.heading,
+            },
+            TextBlock {
+                role: ElementRole::Subtitle,
+                text: &outline.subtitle,
+                font_size: scale.body,
+                font: &theme.body_font,
+                fill: &theme.muted,
+            },
+        ],
+    );
+
+    push_cta_pill(
+        &mut elements,
+        theme,
+        scale,
+        m,
+        after + 44.0,
+        cta_label(variety),
+    );
+
+    GeneratedPage {
+        title: format!("{} — Post", outline.title),
+        width: SOCIAL_SQUARE,
+        height: SOCIAL_SQUARE,
+        background: theme.background.clone(),
+        elements,
+    }
+}
+
+fn social_story(
+    outline: &DeckOutline,
+    theme: &Theme,
+    scale: &TypeScale,
+    variety: Variety,
+) -> GeneratedPage {
+    let mut elements = Vec::new();
+    let m = SOCIAL_MARGIN;
+    let region_w = SOCIAL_STORY_W - 2.0 * m;
+    let accent = variety.accent(theme);
+
+    let img_h = 720.0;
+    elements.push(image(
+        0.0,
+        0.0,
+        SOCIAL_STORY_W,
+        img_h,
+        &theme.primary,
+        &theme.secondary,
+        0.0,
+        Some(hero_prompt(
+            outline,
+            theme,
+            "vertical social story hero image",
+        )),
+    ));
+
+    let mut y = img_h + 64.0;
+    let accent_h = 16.0;
+    elements.push(rect(
+        ElementRole::AccentBar,
+        m,
+        y,
+        148.0,
+        accent_h,
+        accent,
+        accent_h / 2.0,
+    ));
+    y += accent_h + 36.0;
+
+    let after = stack_text(
+        &mut elements,
+        Bounds::new(m, y, region_w, 0.0),
+        20.0,
+        &[
+            TextBlock {
+                role: ElementRole::Title,
+                text: &outline.title,
+                font_size: scale.title,
+                font: &theme.heading_font,
+                fill: &theme.on_background,
+            },
+            TextBlock {
+                role: ElementRole::Subtitle,
+                text: &outline.subtitle,
+                font_size: scale.subheading,
+                font: &theme.body_font,
+                fill: &theme.muted,
+            },
+        ],
+    );
+    y = after + 44.0;
+
+    // Highlight bullets drawn from the section headings.
+    let body_lh = line_height(scale.body);
+    let marker = 18.0;
+    let bullet_x = m + 44.0;
+    let bullet_w = region_w - 44.0;
+    for slide in outline.slides.iter().take(3) {
+        elements.push(rect(
+            ElementRole::BulletMarker,
+            m,
+            y + (body_lh - marker) / 2.0,
+            marker,
+            marker,
+            accent,
+            marker / 2.0,
+        ));
+        let lines = wrap_text(&slide.heading, scale.body, bullet_w);
+        for (li, line) in lines.iter().enumerate() {
+            elements.push(text(
+                ElementRole::Body,
+                bullet_x,
+                y + body_lh * li as f64,
+                bullet_w,
+                body_lh,
+                line,
+                scale.body,
+                &theme.body_font,
+                &theme.body,
+            ));
+        }
+        y += body_lh * lines.len() as f64 + 18.0;
+    }
+
+    push_cta_pill(&mut elements, theme, scale, m, y + 24.0, cta_label(variety));
+
+    GeneratedPage {
+        title: format!("{} — Story", outline.title),
+        width: SOCIAL_STORY_W,
+        height: SOCIAL_STORY_H,
+        background: theme.background.clone(),
+        elements,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Format: Web page (hero + feature grid + CTA band)
+// ---------------------------------------------------------------------------
+
+const WEB_W: f64 = 1440.0;
+const WEB_MARGIN: f64 = 100.0;
+const WEB_GAP: f64 = 40.0;
+
+fn layout_web_page(
+    outline: &DeckOutline,
+    theme: &Theme,
+    scale: &TypeScale,
+    variety: Variety,
+) -> Vec<GeneratedPage> {
+    let mut elements = Vec::new();
+    let content_w = WEB_W - 2.0 * WEB_MARGIN;
+    let hero_img_h = 460.0;
+    let mut y = 96.0;
+
+    // Hero composition flips with variety: image-leading or text-leading.
+    let text_first = variety.alt_parity;
+    if !text_first {
+        elements.push(image(
+            WEB_MARGIN,
+            y,
+            content_w,
+            hero_img_h,
+            &theme.primary,
+            &theme.secondary,
+            28.0,
+            Some(hero_prompt(outline, theme, "website hero image")),
+        ));
+        y += hero_img_h + 64.0;
+    }
+
+    let cap_lh = line_height(scale.caption);
+    elements.push(text(
+        ElementRole::Body,
+        WEB_MARGIN,
+        y,
+        content_w,
+        cap_lh,
+        eyebrow_label(variety),
+        scale.caption,
+        &theme.body_font,
+        &theme.primary,
+    ));
+    y += cap_lh + 18.0;
+
+    let after = stack_text(
+        &mut elements,
+        Bounds::new(WEB_MARGIN, y, content_w, 0.0),
+        22.0,
+        &[
+            TextBlock {
+                role: ElementRole::Title,
+                text: &outline.title,
+                font_size: scale.title,
+                font: &theme.heading_font,
+                fill: &theme.heading,
+            },
+            TextBlock {
+                role: ElementRole::Subtitle,
+                text: &outline.subtitle,
+                font_size: scale.subheading,
+                font: &theme.body_font,
+                fill: &theme.body,
+            },
+        ],
+    );
+    let cta_h = push_cta_pill(
+        &mut elements,
+        theme,
+        scale,
+        WEB_MARGIN,
+        after + 36.0,
+        cta_label(variety),
+    );
+    y = after + 36.0 + cta_h;
+
+    if text_first {
+        y += 64.0;
+        elements.push(image(
+            WEB_MARGIN,
+            y,
+            content_w,
+            hero_img_h,
+            &theme.primary,
+            &theme.secondary,
+            28.0,
+            Some(hero_prompt(outline, theme, "website hero image")),
+        ));
+        y += hero_img_h;
+    }
+
+    // Feature grid.
+    y += 88.0;
+    let sec_lh = line_height(scale.caption);
+    elements.push(text(
+        ElementRole::Body,
+        WEB_MARGIN,
+        y,
+        content_w,
+        sec_lh,
+        "WHAT YOU GET",
+        scale.caption,
+        &theme.body_font,
+        &theme.primary,
+    ));
+    y += sec_lh + 30.0;
+
+    let n = outline.slides.len().clamp(1, 6);
+    let cols = n.min(3);
+    let rows = n.div_ceil(cols);
+    let card_w = (content_w - WEB_GAP * (cols as f64 - 1.0)) / cols as f64;
+    let card_h = 460.0;
+    let grid_top = y;
+    let pad = 32.0;
+    let panel_h = 176.0;
+    for (i, slide) in outline.slides.iter().take(n).enumerate() {
+        let r = i / cols;
+        let c = i % cols;
+        let cx = WEB_MARGIN + c as f64 * (card_w + WEB_GAP);
+        let cy = grid_top + r as f64 * (card_h + WEB_GAP);
+        elements.push(rect(
+            ElementRole::Surface,
+            cx,
+            cy,
+            card_w,
+            card_h,
+            &theme.surface,
+            24.0,
+        ));
+        // Decorative gradient panel (no prompt → always a placeholder).
+        elements.push(image(
+            cx + pad,
+            cy + pad,
+            card_w - 2.0 * pad,
+            panel_h,
+            &theme.secondary,
+            &theme.primary,
+            16.0,
+            None,
+        ));
+        let tw = card_w - 2.0 * pad;
+        let body_line = slide
+            .bullets
+            .first()
+            .map_or(slide.heading.as_str(), String::as_str);
+        stack_text(
+            &mut elements,
+            Bounds::new(cx + pad, cy + pad + panel_h + 24.0, tw, 0.0),
+            12.0,
+            &[
+                TextBlock {
+                    role: ElementRole::Heading,
+                    text: &slide.heading,
+                    font_size: scale.heading,
+                    font: &theme.heading_font,
+                    fill: &theme.heading,
+                },
+                TextBlock {
+                    role: ElementRole::Body,
+                    text: body_line,
+                    font_size: scale.body,
+                    font: &theme.body_font,
+                    fill: &theme.body,
+                },
+            ],
+        );
+    }
+    y = grid_top + rows as f64 * card_h + (rows as f64 - 1.0) * WEB_GAP;
+
+    // Call-to-action band.
+    y += 72.0;
+    let band_h = 300.0;
+    elements.push(rect(
+        ElementRole::Surface,
+        WEB_MARGIN,
+        y,
+        content_w,
+        band_h,
+        &theme.surface,
+        32.0,
+    ));
+    let band_pad = 64.0;
+    let bx = WEB_MARGIN + band_pad;
+    let bw = content_w - 2.0 * band_pad;
+    let after = stack_text(
+        &mut elements,
+        Bounds::new(bx, y + band_pad, bw, 0.0),
+        16.0,
+        &[
+            TextBlock {
+                role: ElementRole::Heading,
+                text: "Ready to get started?",
+                font_size: scale.heading,
+                font: &theme.heading_font,
+                fill: &theme.heading,
+            },
+            TextBlock {
+                role: ElementRole::Body,
+                text: &outline.subtitle,
+                font_size: scale.body,
+                font: &theme.body_font,
+                fill: &theme.muted,
+            },
+        ],
+    );
+    push_cta_pill(
+        &mut elements,
+        theme,
+        scale,
+        bx,
+        after + 28.0,
+        cta_label(variety),
+    );
+    y += band_h;
+
+    vec![GeneratedPage {
+        title: outline.title.clone(),
+        width: WEB_W,
+        height: y + 96.0,
+        background: theme.background.clone(),
+        elements,
+    }]
+}
+
+// ---------------------------------------------------------------------------
+// Format: Document / report (cover + paginated body)
+// ---------------------------------------------------------------------------
+
+const DOC_W: f64 = 816.0;
+const DOC_H: f64 = 1056.0;
+const DOC_MARGIN: f64 = 72.0;
+
+fn layout_document(
+    outline: &DeckOutline,
+    theme: &Theme,
+    scale: &TypeScale,
+    variety: Variety,
+) -> Vec<GeneratedPage> {
+    let mut pages = vec![doc_cover(outline, theme, scale, variety)];
+
+    let content_w = DOC_W - 2.0 * DOC_MARGIN;
+    let body_top = DOC_MARGIN + 44.0;
+    let body_bottom = DOC_H - DOC_MARGIN - 24.0;
+
+    // Greedy pagination: pack whole sections onto pages. A page is empty
+    // exactly when its cursor is still at `body_top`, so a single
+    // oversized section never triggers a spurious page break.
+    let mut page_groups: Vec<Vec<&SlideOutline>> = vec![Vec::new()];
+    let mut y = body_top;
+    for slide in &outline.slides {
+        let sh = section_height(slide, scale, content_w);
+        if y > body_top && y + sh > body_bottom {
+            page_groups.push(Vec::new());
+            y = body_top;
+        }
+        if let Some(group) = page_groups.last_mut() {
+            group.push(slide);
+        }
+        y += sh + 30.0;
+    }
+
+    let total_pages = page_groups.len() + 1;
+    for (i, group) in page_groups.iter().enumerate() {
+        pages.push(doc_body_page(
+            group,
+            theme,
+            scale,
+            &outline.title,
+            i + 2,
+            total_pages,
+            variety,
+        ));
+    }
+    pages
+}
+
+/// Measured height of a body section (heading + accent rule + gaps +
+/// wrapped paragraphs), used to drive pagination.
+fn section_height(slide: &SlideOutline, scale: &TypeScale, width: f64) -> f64 {
+    let mut h =
+        line_height(scale.heading) * f64::from(wrap_count(&slide.heading, scale.heading, width));
+    h += 8.0 + 4.0 + 16.0; // accent rule + gaps
+    for bullet in &slide.bullets {
+        h += line_height(scale.body) * f64::from(wrap_count(bullet, scale.body, width)) + 10.0;
+    }
+    h
+}
+
+fn doc_cover(
+    outline: &DeckOutline,
+    theme: &Theme,
+    scale: &TypeScale,
+    variety: Variety,
+) -> GeneratedPage {
+    let mut elements = Vec::new();
+    let m = DOC_MARGIN;
+    let region_w = DOC_W - 2.0 * m;
+
+    let img_h = 380.0;
+    elements.push(image(
+        0.0,
+        0.0,
+        DOC_W,
+        img_h,
+        &theme.primary,
+        &theme.secondary,
+        0.0,
+        Some(hero_prompt(outline, theme, "report cover illustration")),
+    ));
+
+    let accent_h = 10.0;
+    let mut y = img_h + 80.0;
+    elements.push(rect(
+        ElementRole::AccentBar,
+        m,
+        y,
+        120.0,
+        accent_h,
+        variety.accent(theme),
+        accent_h / 2.0,
+    ));
+    y += accent_h + 36.0;
+
+    let after = stack_text(
+        &mut elements,
+        Bounds::new(m, y, region_w, 0.0),
+        20.0,
+        &[
+            TextBlock {
+                role: ElementRole::Title,
+                text: &outline.title,
+                font_size: scale.title,
+                font: &theme.heading_font,
+                fill: &theme.heading,
+            },
+            TextBlock {
+                role: ElementRole::Subtitle,
+                text: &outline.subtitle,
+                font_size: scale.subheading,
+                font: &theme.body_font,
+                fill: &theme.muted,
+            },
+        ],
+    );
+
+    elements.push(text(
+        ElementRole::Footer,
+        m,
+        after + 40.0,
+        region_w,
+        line_height(scale.caption),
+        "Prepared with KCreate",
+        scale.caption,
+        &theme.body_font,
+        &theme.muted,
+    ));
+
+    GeneratedPage {
+        title: format!("{} — Cover", outline.title),
+        width: DOC_W,
+        height: DOC_H,
+        background: theme.background.clone(),
+        elements,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn doc_body_page(
+    sections: &[&SlideOutline],
+    theme: &Theme,
+    scale: &TypeScale,
+    doc_title: &str,
+    page_no: usize,
+    total_pages: usize,
+    variety: Variety,
+) -> GeneratedPage {
+    let mut elements = Vec::new();
+    let m = DOC_MARGIN;
+    let content_w = DOC_W - 2.0 * m;
+    let accent = variety.accent(theme);
+
+    // Running header + rule.
+    elements.push(text(
+        ElementRole::Footer,
+        m,
+        m - 38.0,
+        content_w,
+        line_height(scale.caption),
+        doc_title,
+        scale.caption,
+        &theme.body_font,
+        &theme.muted,
+    ));
+    elements.push(rect(
+        ElementRole::AccentBar,
+        m,
+        m - 6.0,
+        content_w,
+        2.0,
+        accent,
+        0.0,
+    ));
+
+    let mut y = m + 44.0;
+    for slide in sections {
+        let after_h = stack_text(
+            &mut elements,
+            Bounds::new(m, y, content_w, 0.0),
+            0.0,
+            &[TextBlock {
+                role: ElementRole::Heading,
+                text: &slide.heading,
+                font_size: scale.heading,
+                font: &theme.heading_font,
+                fill: &theme.heading,
+            }],
+        );
+        elements.push(rect(
+            ElementRole::AccentBar,
+            m,
+            after_h + 8.0,
+            64.0,
+            4.0,
+            accent,
+            2.0,
+        ));
+        y = after_h + 8.0 + 4.0 + 16.0;
+
+        let blocks: Vec<TextBlock> = slide
+            .bullets
+            .iter()
+            .map(|b| TextBlock {
+                role: ElementRole::Body,
+                text: b.as_str(),
+                font_size: scale.body,
+                font: &theme.body_font,
+                fill: &theme.body,
+            })
+            .collect();
+        let after_b = stack_text(
+            &mut elements,
+            Bounds::new(m, y, content_w, 0.0),
+            10.0,
+            &blocks,
+        );
+        y = after_b + 30.0;
+    }
+
+    let footer = format!("Page {page_no} of {total_pages}");
+    elements.push(text(
+        ElementRole::Footer,
+        m,
+        DOC_H - m + 6.0,
+        content_w,
+        line_height(scale.caption),
+        &footer,
+        scale.caption,
+        &theme.body_font,
+        &theme.muted,
+    ));
+
+    GeneratedPage {
+        title: format!("Page {page_no}"),
+        width: DOC_W,
+        height: DOC_H,
+        background: theme.background.clone(),
+        elements,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1440,6 +2416,8 @@ fn text(
         font_family: font_family.to_string(),
         fill: fill.to_string(),
         corner_radius: 0.0,
+        image_prompt: None,
+        fill_secondary: None,
     }
 }
 
@@ -1493,6 +2471,40 @@ fn rect(
         font_family: String::new(),
         fill: fill.to_string(),
         corner_radius,
+        image_prompt: None,
+        fill_secondary: None,
+    }
+}
+
+/// Build an image element. `fill`→`fill_secondary` is the gradient
+/// used as the offline placeholder (and as the diffusion fallback);
+/// `image_prompt` (when `Some`) is the prompt the bridge sends to the
+/// local diffusion sidecar.
+#[allow(clippy::too_many_arguments)]
+fn image(
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+    fill: &str,
+    fill_secondary: &str,
+    corner_radius: f64,
+    image_prompt: Option<String>,
+) -> DesignElement {
+    DesignElement {
+        role: ElementRole::Figure,
+        kind: ElementKind::Image,
+        x,
+        y,
+        width,
+        height,
+        text: None,
+        font_size: 0.0,
+        font_family: String::new(),
+        fill: fill.to_string(),
+        corner_radius,
+        image_prompt,
+        fill_secondary: Some(fill_secondary.to_string()),
     }
 }
 
@@ -1501,7 +2513,14 @@ mod tests {
     use super::*;
 
     fn overlaps(a: &DesignElement, b: &DesignElement) -> bool {
-        a.x < b.x + b.width && b.x < a.x + a.width && a.y < b.y + b.height && b.y < a.y + a.height
+        // A shared edge (e.g. consecutive paragraph lines stacked exactly one
+        // line-height apart) is adjacency, not overlap; require more than a
+        // sub-pixel intersection on both axes so float dust never trips it.
+        const EPS: f64 = 0.05;
+        a.x + EPS < b.x + b.width
+            && b.x + EPS < a.x + a.width
+            && a.y + EPS < b.y + b.height
+            && b.y + EPS < a.y + a.height
     }
 
     #[test]
@@ -1801,5 +2820,256 @@ mod tests {
         assert!(lines.iter().all(|l| !l.is_empty()));
         let single = wrap_text("", 30.0, 200.0);
         assert_eq!(single.len(), 1);
+    }
+
+    // -- new-format invariants -------------------------------------------
+
+    /// The same checks the Deck-only invariant tests enforce, applied to
+    /// any design: populated pages, text colours from the theme palette,
+    /// font sizes from the stored type scale, theme fonts, in-bounds, and
+    /// no text-vs-text overlap.
+    fn assert_design_invariants(design: &GeneratedDesign) {
+        let th = &design.theme;
+        let allowed_colors: Vec<String> =
+            th.text_colors().iter().copied().map(String::from).collect();
+        let allowed_sizes = design.type_scale.all();
+        assert!(!design.pages.is_empty(), "design has no pages");
+        for page in &design.pages {
+            assert!(
+                page.elements.iter().any(|e| e.kind == ElementKind::Text),
+                "page '{}' has no text",
+                page.title
+            );
+            for el in &page.elements {
+                assert!(el.x >= -0.5 && el.y >= -0.5, "element off top-left: {el:?}");
+                assert!(
+                    el.x + el.width <= page.width + 1.0,
+                    "element past right edge: {el:?}"
+                );
+                assert!(el.y <= page.height + 1.0, "element below page: {el:?}");
+                if el.kind != ElementKind::Text {
+                    continue;
+                }
+                assert!(
+                    allowed_colors.contains(&el.fill),
+                    "text fill {} not in palette {:?}",
+                    el.fill,
+                    allowed_colors
+                );
+                assert!(
+                    allowed_sizes
+                        .iter()
+                        .any(|s| (*s - el.font_size).abs() < 0.01),
+                    "font size {} not in scale {:?}",
+                    el.font_size,
+                    allowed_sizes
+                );
+                assert!(el.font_family == th.heading_font || el.font_family == th.body_font);
+            }
+            let texts: Vec<&DesignElement> = page
+                .elements
+                .iter()
+                .filter(|e| e.kind == ElementKind::Text)
+                .collect();
+            for i in 0..texts.len() {
+                for j in (i + 1)..texts.len() {
+                    assert!(
+                        !overlaps(texts[i], texts[j]),
+                        "text overlap on page '{}':\n  {:?}\n  {:?}",
+                        page.title,
+                        texts[i],
+                        texts[j],
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn new_formats_satisfy_invariants_across_themes() {
+        let formats = [
+            DesignFormat::SocialPost,
+            DesignFormat::WebPage,
+            DesignFormat::Document,
+        ];
+        let briefs = [
+            "Pitch deck for an indie coffee roaster with great espresso",
+            "Overview of our 2026 product launch and go to market plan",
+            "Annual sustainability report for a renewable energy startup",
+        ];
+        for format in formats {
+            for id in ThemeId::all() {
+                for brief in briefs {
+                    let opts = ThemedDesignOptions {
+                        format,
+                        theme_id: id,
+                        ..Default::default()
+                    };
+                    let outline = outline_from_brief(brief, opts).unwrap();
+                    let design = generate_design(&outline, opts);
+                    assert_eq!(design.format, format);
+                    assert_design_invariants(&design);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn social_post_is_square_plus_story() {
+        let opts = ThemedDesignOptions {
+            format: DesignFormat::SocialPost,
+            ..Default::default()
+        };
+        let outline = outline_from_brief("Promote our new oat milk latte", opts).unwrap();
+        let design = generate_design(&outline, opts);
+        assert_eq!(design.pages.len(), 2);
+        // Square feed tile.
+        assert!((design.pages[0].width - design.pages[0].height).abs() < 1.0);
+        // Vertical 9:16 story.
+        assert!(design.pages[1].height > design.pages[1].width);
+        // Both carry a real hero image slot (prompt present).
+        assert!(design.pages.iter().all(|p| p
+            .elements
+            .iter()
+            .any(|e| e.kind == ElementKind::Image && e.image_prompt.is_some())));
+    }
+
+    #[test]
+    fn web_page_is_single_tall_page_with_cards() {
+        let opts = ThemedDesignOptions {
+            format: DesignFormat::WebPage,
+            section_count: Some(3),
+            ..Default::default()
+        };
+        let outline = outline_from_brief("Landing page for a habit tracking app", opts).unwrap();
+        let design = generate_design(&outline, opts);
+        assert_eq!(design.pages.len(), 1);
+        let page = &design.pages[0];
+        assert!((page.width - WEB_W).abs() < 1.0);
+        assert!(page.height > page.width, "web page should scroll tall");
+        // A hero image (prompt) plus decorative card panels (no prompt).
+        assert!(page
+            .elements
+            .iter()
+            .any(|e| e.kind == ElementKind::Image && e.image_prompt.is_some()));
+        assert!(page
+            .elements
+            .iter()
+            .any(|e| e.kind == ElementKind::Image && e.image_prompt.is_none()));
+    }
+
+    #[test]
+    fn document_has_cover_and_paginated_body() {
+        let opts = ThemedDesignOptions {
+            format: DesignFormat::Document,
+            section_count: Some(8),
+            ..Default::default()
+        };
+        let outline =
+            outline_from_brief("Quarterly performance report for a SaaS company", opts).unwrap();
+        let design = generate_design(&outline, opts);
+        assert!(design.pages.len() >= 2, "cover + at least one body page");
+        for page in &design.pages {
+            assert!((page.width - DOC_W).abs() < 1.0 && (page.height - DOC_H).abs() < 1.0);
+        }
+        assert!(design.pages[0]
+            .elements
+            .iter()
+            .any(|e| e.kind == ElementKind::Image));
+        assert!(design.pages[0]
+            .elements
+            .iter()
+            .any(|e| e.role == ElementRole::Title));
+        assert!(design.pages[1]
+            .elements
+            .iter()
+            .any(|e| e.role == ElementRole::Heading));
+    }
+
+    #[test]
+    fn generation_is_deterministic_offline() {
+        for format in DesignFormat::all() {
+            let opts = ThemedDesignOptions {
+                format,
+                ..Default::default()
+            };
+            let outline =
+                outline_from_brief("Launch plan for a modern productivity app", opts).unwrap();
+            let a = generate_design(&outline, opts);
+            let b = generate_design(&outline, opts);
+            assert_eq!(
+                format!("{a:?}"),
+                format!("{b:?}"),
+                "format {format:?} is not deterministic"
+            );
+        }
+    }
+
+    #[test]
+    fn image_formats_scale_type_within_band() {
+        for format in [
+            DesignFormat::SocialPost,
+            DesignFormat::WebPage,
+            DesignFormat::Document,
+        ] {
+            let base = TypeScale::for_format(format);
+            for id in ThemeId::all() {
+                let opts = ThemedDesignOptions {
+                    format,
+                    theme_id: id,
+                    ..Default::default()
+                };
+                let outline = outline_from_brief("Modern analytics platform launch", opts).unwrap();
+                let design = generate_design(&outline, opts);
+                let f = design.type_scale.title / base.title;
+                assert!(
+                    (0.9..=1.1).contains(&f),
+                    "scale factor {f} out of band for {format:?}/{id:?}"
+                );
+                // Every size is scaled by the same factor.
+                assert!((design.type_scale.body / base.body - f).abs() < 0.001);
+            }
+        }
+    }
+
+    #[test]
+    fn variety_produces_distinct_layouts() {
+        let format = DesignFormat::WebPage;
+        let briefs = [
+            "Indie coffee roaster brand site",
+            "Productivity app launch page",
+            "Renewable energy annual report",
+        ];
+        let mut factors = std::collections::HashSet::new();
+        for id in ThemeId::all() {
+            for brief in briefs {
+                let opts = ThemedDesignOptions {
+                    format,
+                    theme_id: id,
+                    ..Default::default()
+                };
+                let outline = outline_from_brief(brief, opts).unwrap();
+                let design = generate_design(&outline, opts);
+                factors.insert(format!("{:.3}", design.type_scale.title));
+            }
+        }
+        assert!(factors.len() >= 2, "type-scale variety absent: {factors:?}");
+    }
+
+    #[test]
+    fn deck_and_one_pager_geometry_is_unchanged_by_variety() {
+        // Decks/one-pagers must keep their exact tuned type scale (no
+        // scale-factor variety), so existing output never regresses.
+        for format in [DesignFormat::Deck, DesignFormat::OnePager] {
+            let base = TypeScale::for_format(format);
+            let opts = ThemedDesignOptions {
+                format,
+                ..Default::default()
+            };
+            let outline = outline_from_brief("Pitch deck for a coffee roaster", opts).unwrap();
+            let design = generate_design(&outline, opts);
+            assert!((design.type_scale.title - base.title).abs() < 0.001);
+            assert!((design.type_scale.body - base.body).abs() < 0.001);
+        }
     }
 }

@@ -3751,6 +3751,13 @@ const phase10: Phase10Bridge = {
     )) as string;
     return JSON.parse(raw) as ThemedDesignApplyResult;
   },
+  async aiRefineThemedDesign(instruction) {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/phase10/ai/refine-themed-design",
+      instruction,
+    )) as string;
+    return JSON.parse(raw) as ThemedDesignApplyResult;
+  },
   async aiHarmonizePalette(brandKitId, harmonyType) {
     const raw = (await ipcRenderer.invoke(
       "kcreate/phase10/ai/harmonize-palette",

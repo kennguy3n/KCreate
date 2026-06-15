@@ -106,8 +106,11 @@ fn place(styled: &StyledPath, scale: f64, tx: f64, ty: f64) -> PlacedPath {
     };
     let stroke = styled.stroke.map(|s| StrokeStyle {
         color: s.color,
-        // Stroke width is in SVG user units; scale it with the artwork
-        // so the proportion is preserved at any target size.
+        // `s.width` already carries the SVG's own viewBox→viewport scale
+        // (baked in by `import_svg_styled`), so it is in document-space
+        // units here — not raw SVG user units. Applying the placement
+        // `scale` matches the scale-to-fit used for the geometry, so the
+        // stroke stays proportional at any target size.
         width: s.width * scale,
         ..StrokeStyle::default()
     });

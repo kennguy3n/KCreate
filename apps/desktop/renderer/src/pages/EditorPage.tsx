@@ -1186,9 +1186,16 @@ function EditorPageInner({
     async (assetId: string, worldX: number, worldY: number): Promise<void> => {
       try {
         const size = ELEMENT_INSERT_SIZE;
+        // Parent the element to the first artboard — the same target the
+        // file-drop, paste, and duplicate-layer flows resolve — so it
+        // becomes a real artboard child that clips to, exports with, and
+        // moves alongside the page, rather than a loose document-root
+        // node floating outside every artboard. Falls back to the
+        // document root only for artboard-less pages.
+        const parent = artboardsRef.current[0]?.id ?? null;
         const result = await window.kcreate.assets.insert(
           assetId,
-          null,
+          parent,
           worldX - size / 2,
           worldY - size / 2,
           size,
@@ -1201,7 +1208,7 @@ function EditorPageInner({
         setStatusMessage(`insert element failed: ${errorMessage(e)}`);
       }
     },
-    [refreshTree, setSelectedIds, setStatusMessage],
+    [artboardsRef, refreshTree, setSelectedIds, setStatusMessage],
   );
 
   // Click-to-insert from the Elements panel: drop at the centre of

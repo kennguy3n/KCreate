@@ -27,6 +27,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 
 import type {
+  ImportPickKind,
   TemplateCategory,
   TemplateManifest,
   ThumbnailBytes,
@@ -39,7 +40,7 @@ import {
   CATEGORY_TINT,
 } from "../lib/templateCategories";
 import { computeColumns, computeGridWindow } from "../lib/galleryWindow";
-import { Icon } from "./Icon";
+import { Icon, type IconName } from "./Icon";
 
 /**
  * Grid geometry shared by the layout and the virtualisation math.
@@ -102,6 +103,76 @@ type LoadState =
  */
 const EMPTY_TEMPLATES: ReadonlyArray<TemplateManifest> = [];
 
+/**
+ * Tally a flat manifest list into a per-`category` count map. Shared by
+ * the two paths that populate the filter-chip badges (the unfiltered
+ * main-grid result, and the dedicated unfiltered fetch used while a
+ * filter narrows the grid) so they can never drift apart.
+ */
+function tallyByCategory(
+  templates: ReadonlyArray<TemplateManifest>,
+): Record<string, number> {
+  const tally: Record<string, number> = {};
+  for (const t of templates) {
+    tally[t.category] = (tally[t.category] ?? 0) + 1;
+  }
+  return tally;
+}
+
+/**
+ * A single row in the "Remix from file" dropdown. Each maps to one
+ * `ImportPickKind` and opens a single-purpose OS dialog (a file
+ * picker or a directory picker) — splitting the two avoids the
+ * Windows/Linux limitation where a combined `openFile`+`openDirectory`
+ * dialog silently degrades to directory-only, making bare `*.json`
+ * imports unreachable.
+ */
+function ImportMenuItem({
+  testId,
+  icon,
+  title,
+  subtitle,
+  onClick,
+}: {
+  testId: string;
+  icon: IconName;
+  title: string;
+  subtitle: string;
+  onClick: () => void;
+}): JSX.Element {
+  return (
+    <button
+      type="button"
+      role="menuitem"
+      data-testid={testId}
+      onClick={onClick}
+      style={{
+        display: "flex",
+        alignItems: "center",
+        gap: spacing.sm,
+        background: "transparent",
+        border: "none",
+        borderRadius: 0,
+        padding: `${spacing.sm}px ${spacing.md}px`,
+        color: colors.text,
+        cursor: "pointer",
+        textAlign: "left",
+        font: "inherit",
+        fontSize: 13,
+        width: "100%",
+      }}
+    >
+      <Icon name={icon} size={18} />
+      <span style={{ display: "flex", flexDirection: "column" }}>
+        <span style={{ fontWeight: 600 }}>{title}</span>
+        <span style={{ fontSize: 11, color: colors.textMuted }}>
+          {subtitle}
+        </span>
+      </span>
+    </button>
+  );
+}
+
 export function TemplateGallery({
   onBack,
   onStartFromTemplate,
@@ -139,8 +210,12 @@ export function TemplateGallery({
   const [totalCount, setTotalCount] = useState<number | null>(null);
   // "Remix from file" import state: `importing` disables the button +
   // shows progress; `importError` surfaces a failed pick/import inline.
+  // `importMenuOpen` toggles the small two-option menu (file vs.
+  // package) — the OS dialog can't pick files AND directories at once
+  // on Windows/Linux, so the user chooses which to open.
   const [importing, setImporting] = useState(false);
   const [importError, setImportError] = useState<string | null>(null);
+  const [importMenuOpen, setImportMenuOpen] = useState(false);
   // Bumped to force the catalog (and counts) to reload — e.g. after a
   // successful import registers a new template.
   const [reloadToken, setReloadToken] = useState(0);
@@ -200,6 +275,15 @@ export function TemplateGallery({
       .then((report) => {
         if (cancelled) return;
         setState({ kind: "ready", templates: report.templates });
+        // When neither a category nor a search term is active, this
+        // query already returned the WHOLE library — reuse it for the
+        // chip counts instead of firing a second identical unfiltered
+        // `list()` on every mount/reload (the dedicated counts effect
+        // below only runs while a filter is narrowing the grid).
+        if (effectiveCategory === undefined && effectiveQuery === undefined) {
+          setCounts(tallyByCategory(report.templates));
+          setTotalCount(report.templates.length);
+        }
       })
       .catch((e: unknown) => {
         if (cancelled) return;
@@ -210,23 +294,24 @@ export function TemplateGallery({
     };
   }, [category, query, reloadToken]);
 
-  // Catalog counts for the filter chips. One unfiltered `list()` (no
-  // category, no query) gives the whole library; we tally per category
-  // + total. Re-runs after an import (`reloadToken`). Failures are
+  // Catalog counts for the filter chips always reflect the WHOLE
+  // library, independent of the active filter. While unfiltered, the
+  // main-grid query above already returned the whole library and
+  // populated the counts — so a dedicated unfiltered `list()` is only
+  // needed when a category/search is narrowing the grid (otherwise the
+  // chip totals would shrink to the filtered slice). Failures are
   // swallowed: counts are a nicety, and the main grid already surfaces
   // load errors — we must not let this crash the gallery (the
   // `list()`-rejects test rejects every call).
   useEffect(() => {
+    const filtering = (category ?? undefined) !== undefined || query !== "";
+    if (!filtering) return; // counts already derived from the main grid
     let cancelled = false;
     void window.kcreate.templateMarketplace
       .list(undefined, undefined)
       .then((report) => {
         if (cancelled) return;
-        const tally: Record<string, number> = {};
-        for (const t of report.templates) {
-          tally[t.category] = (tally[t.category] ?? 0) + 1;
-        }
-        setCounts(tally);
+        setCounts(tallyByCategory(report.templates));
         setTotalCount(report.templates.length);
       })
       .catch(() => {
@@ -235,7 +320,7 @@ export function TemplateGallery({
     return () => {
       cancelled = true;
     };
-  }, [reloadToken]);
+  }, [category, query, reloadToken]);
 
   // Memoised so its identity is stable across renders where the load
   // state is unchanged — otherwise the `[]` fallback would be a fresh
@@ -368,18 +453,21 @@ export function TemplateGallery({
     }
   }
 
-  // "Remix from file": pick an external `.kstudio` / `.ktemplate` /
-  // template-content `*.json` via the OS dialog, import it as a new
-  // library template through the real bridge path, then reload the
-  // catalog (clearing filters) and select the freshly-imported entry.
-  // A cancelled dialog (`null` path) is a no-op; failures surface
-  // inline without disturbing the existing grid.
-  async function runImport(): Promise<void> {
+  // "Remix from file": pick an external design via the OS dialog,
+  // import it as a new library template through the real bridge path,
+  // then reload the catalog (clearing filters) and select the
+  // freshly-imported entry. `kind` selects whether to open a file
+  // picker (a bare template-content `*.json`) or a directory picker
+  // (a `.kstudio` project / `.ktemplate` package) — see
+  // `ImportPickKind`. A cancelled dialog (`null` path) is a no-op;
+  // failures surface inline without disturbing the existing grid.
+  async function runImport(kind: ImportPickKind): Promise<void> {
     if (importing) return;
+    setImportMenuOpen(false);
     setImporting(true);
     setImportError(null);
     try {
-      const path = await window.kcreate.templateMarketplace.pickImport();
+      const path = await window.kcreate.templateMarketplace.pickImport(kind);
       if (!path) return;
       const imported = await window.kcreate.templateMarketplace.import({
         sourcePath: path,
@@ -465,34 +553,92 @@ export function TemplateGallery({
               : "Browse professionally-designed starter templates"}
           </span>
         </div>
-        <button
-          type="button"
-          onClick={() => void runImport()}
-          // Disabled while a previous import is in flight or a
-          // "Start from template" round-trip is mid-instantiate (same
-          // navigation-lock rationale as the Back button).
-          disabled={importing || starting !== null}
-          data-testid="kcreate-template-import"
-          aria-label="Import a design file as a new template"
-          style={{
-            display: "inline-flex",
-            alignItems: "center",
-            gap: spacing.xs,
-            background: "transparent",
-            border: `1px solid ${colors.border}`,
-            borderRadius: radius.md,
-            padding: `${spacing.xs}px ${spacing.sm}px`,
-            color: colors.text,
-            cursor: importing || starting ? "default" : "pointer",
-            opacity: importing || starting ? 0.7 : 1,
-            fontSize: 13,
-            whiteSpace: "nowrap",
-            flexShrink: 0,
-          }}
-        >
-          <Icon name="file-plus" size={16} />
-          {importing ? "Importing…" : "Remix from file"}
-        </button>
+        <div style={{ position: "relative", flexShrink: 0 }}>
+          <button
+            type="button"
+            onClick={() => setImportMenuOpen((open) => !open)}
+            // Disabled while a previous import is in flight or a
+            // "Start from template" round-trip is mid-instantiate (same
+            // navigation-lock rationale as the Back button).
+            disabled={importing || starting !== null}
+            data-testid="kcreate-template-import"
+            aria-haspopup="menu"
+            aria-expanded={importMenuOpen}
+            aria-label="Import a design as a new template"
+            style={{
+              display: "inline-flex",
+              alignItems: "center",
+              gap: spacing.xs,
+              background: "transparent",
+              border: `1px solid ${colors.border}`,
+              borderRadius: radius.md,
+              padding: `${spacing.xs}px ${spacing.sm}px`,
+              color: colors.text,
+              cursor: importing || starting ? "default" : "pointer",
+              opacity: importing || starting ? 0.7 : 1,
+              fontSize: 13,
+              whiteSpace: "nowrap",
+            }}
+          >
+            <Icon name="file-plus" size={16} />
+            {importing ? "Importing…" : "Remix from file"}
+            <span aria-hidden style={{ fontSize: 10, marginLeft: 2 }}>
+              ▾
+            </span>
+          </button>
+          {importMenuOpen ? (
+            <>
+              {/* Full-viewport click-catcher so a click anywhere else
+                  dismisses the menu (cheaper + more robust than a
+                  document listener that has to be added/removed). */}
+              <div
+                data-testid="kcreate-template-import-overlay"
+                onClick={() => setImportMenuOpen(false)}
+                style={{
+                  position: "fixed",
+                  inset: 0,
+                  zIndex: 10,
+                }}
+              />
+              <div
+                role="menu"
+                data-testid="kcreate-template-import-menu"
+                onKeyDown={(e) => {
+                  if (e.key === "Escape") setImportMenuOpen(false);
+                }}
+                style={{
+                  position: "absolute",
+                  top: "calc(100% + 4px)",
+                  right: 0,
+                  zIndex: 11,
+                  minWidth: 248,
+                  display: "flex",
+                  flexDirection: "column",
+                  background: colors.bg,
+                  border: `1px solid ${colors.border}`,
+                  borderRadius: radius.md,
+                  boxShadow: shadow.card,
+                  overflow: "hidden",
+                }}
+              >
+                <ImportMenuItem
+                  testId="kcreate-template-import-file"
+                  icon="file-text"
+                  title="From a design file"
+                  subtitle=".json template content"
+                  onClick={() => void runImport("file")}
+                />
+                <ImportMenuItem
+                  testId="kcreate-template-import-package"
+                  icon="package"
+                  title="From a project or package"
+                  subtitle=".kstudio project · .ktemplate folder"
+                  onClick={() => void runImport("directory")}
+                />
+              </div>
+            </>
+          ) : null}
+        </div>
         <input
           type="search"
           value={rawQuery}

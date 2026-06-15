@@ -692,7 +692,10 @@ export interface Bridge {
   // the JSON request) as a NEW library template, persisting a fresh
   // `.ktemplate/` into the marketplace install dir. Returns the new
   // manifest as a JSON string (snake_case serde — parsed by preload).
-  templateImport(requestJson: string): string;
+  // Async (napi `AsyncTask`): a large `.kstudio` parse + serialize +
+  // disk write runs on a worker thread so it never blocks the Electron
+  // main process.
+  templateImport(requestJson: string): Promise<string>;
 
   // Phase 6 — audit log
   auditRecord(eventJson: string): string;

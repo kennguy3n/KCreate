@@ -309,9 +309,24 @@ describe("TemplateGallery", () => {
       ).toBeInTheDocument(),
     );
 
+    // The button opens a two-option menu (the OS dialog can't combine
+    // file + directory picking on Windows/Linux); a `.kstudio` source
+    // is a directory, so pick the "project or package" item.
     fireEvent.click(screen.getByTestId("kcreate-template-import"));
+    fireEvent.click(screen.getByTestId("kcreate-template-import-package"));
 
-    // The picker + import bridge calls fire with the chosen path…
+    // The picker fires for the directory kind…
+    await waitFor(() =>
+      expect(
+        stub.calls.some((c) => c.method === "templateMarketplace.pickImport"),
+      ).toBe(true),
+    );
+    const pickCall = stub.calls.find(
+      (c) => c.method === "templateMarketplace.pickImport",
+    );
+    expect(pickCall?.args[0]).toBe("directory");
+
+    // …and the import bridge call fires with the chosen path.
     await waitFor(() =>
       expect(
         stub.calls.some((c) => c.method === "templateMarketplace.import"),
@@ -342,14 +357,54 @@ describe("TemplateGallery", () => {
     );
 
     fireEvent.click(screen.getByTestId("kcreate-template-import"));
+    fireEvent.click(screen.getByTestId("kcreate-template-import-file"));
 
     await waitFor(() =>
       expect(
         stub.calls.some((c) => c.method === "templateMarketplace.pickImport"),
       ).toBe(true),
     );
+    const pickCall = stub.calls.find(
+      (c) => c.method === "templateMarketplace.pickImport",
+    );
+    expect(pickCall?.args[0]).toBe("file");
     expect(
       stub.calls.some((c) => c.method === "templateMarketplace.import"),
+    ).toBe(false);
+  });
+
+  it("import menu offers a file picker and a package picker", async () => {
+    stubCatalog();
+    const stub = kcreateStub();
+    renderGallery();
+    await waitFor(() =>
+      expect(
+        screen.getByTestId("kcreate-template-card-mobile-login"),
+      ).toBeInTheDocument(),
+    );
+
+    // Menu is closed until the button is clicked.
+    expect(
+      screen.queryByTestId("kcreate-template-import-menu"),
+    ).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByTestId("kcreate-template-import"));
+    expect(
+      screen.getByTestId("kcreate-template-import-file"),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByTestId("kcreate-template-import-package"),
+    ).toBeInTheDocument();
+
+    // Clicking the backdrop dismisses the menu without importing.
+    fireEvent.click(screen.getByTestId("kcreate-template-import-overlay"));
+    await waitFor(() =>
+      expect(
+        screen.queryByTestId("kcreate-template-import-menu"),
+      ).not.toBeInTheDocument(),
+    );
+    expect(
+      stub.calls.some((c) => c.method === "templateMarketplace.pickImport"),
     ).toBe(false);
   });
 });

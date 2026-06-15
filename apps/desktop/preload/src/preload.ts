@@ -49,6 +49,7 @@ import type {
   ThemeBridge,
   TemplateInstantiateReport,
   TemplateImportRequest,
+  ImportPickKind,
   TemplateManifest,
   TemplateMarketplaceBridge,
   MasterPageBridge,
@@ -1748,9 +1749,10 @@ const templateMarketplace: TemplateMarketplaceBridge = {
       templateId,
     )) as ThumbnailBytes;
   },
-  async pickImport(): Promise<string | null> {
+  async pickImport(kind: ImportPickKind): Promise<string | null> {
     return (await ipcRenderer.invoke(
       "kcreate/template/pickImport",
+      kind,
     )) as string | null;
   },
   async import(request: TemplateImportRequest): Promise<TemplateManifest> {

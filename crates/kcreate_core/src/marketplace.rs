@@ -144,6 +144,16 @@ impl LocalMarketplace {
                 .file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or_default();
+            // Sweep leftover staging dirs from an import that was
+            // interrupted (e.g. process killed) between staging and the
+            // atomic rename. They never end in `.ktemplate`, so they are
+            // invisible to the loader anyway; removing them on scan (the
+            // natural startup GC point, serialised via `&mut self`) keeps
+            // crash litter from accumulating.
+            if dir_name.ends_with(".ktemplate.partial") {
+                let _ = std::fs::remove_dir_all(&path);
+                continue;
+            }
             if !dir_name.ends_with(".ktemplate") {
                 continue;
             }
@@ -259,6 +269,16 @@ impl LocalMarketplace {
     /// leaves a half-written `.ktemplate/` on disk that a later
     /// [`Self::scan`] would surface as a broken entry.
     ///
+    /// The two files are written into a temporary sibling directory and
+    /// then **atomically renamed** into the final `.ktemplate/` location
+    /// (same filesystem, so the rename is atomic). The staging name
+    /// deliberately does not end in `.ktemplate`, so a concurrent
+    /// [`Self::scan`] — which only considers `.ktemplate/` dirs that
+    /// carry a `manifest.json` — can never observe a directory that has
+    /// the manifest written but not yet the `content.json`. On any write
+    /// failure the staging dir is removed, so a partial entry is never
+    /// left behind.
+    ///
     /// No `thumbnail.png` is written: the lazy, content-hash-keyed
     /// thumbnail cache (in the bridge) renders it on first view from
     /// the same `content.json`, guaranteeing the preview matches the
@@ -289,7 +309,6 @@ impl LocalMarketplace {
             // never silently overwrite an existing template directory.
             return Err(MarketplaceError::AlreadyInstalled(id));
         }
-        std::fs::create_dir_all(&dest)?;
 
         let manifest = TemplateManifest {
             id,
@@ -307,8 +326,19 @@ impl LocalMarketplace {
         };
         let manifest_json = serde_json::to_string_pretty(&manifest)
             .map_err(|e| MarketplaceError::Serialize(e.to_string()))?;
-        std::fs::write(dest.join("manifest.json"), manifest_json)?;
-        std::fs::write(dest.join("content.json"), &spec.content_json)?;
+
+        // Stage both files in a sibling temp dir whose name does NOT end
+        // in `.ktemplate` (so a concurrent `scan()` ignores it), then
+        // atomically publish with a single rename. Clean up the staging
+        // dir on any failure so we never leave a partial entry on disk.
+        let staging = self.root.join(format!("{dir_name}.partial"));
+        if staging.exists() {
+            std::fs::remove_dir_all(&staging)?;
+        }
+        if let Err(e) = stage_and_publish(&staging, &dest, &manifest_json, &spec.content_json) {
+            let _ = std::fs::remove_dir_all(&staging);
+            return Err(e.into());
+        }
 
         // Register in memory with the same `Local { path }` stamp a
         // `scan()` would apply, so the freshly imported template is
@@ -344,6 +374,25 @@ impl LocalMarketplace {
         }
         Ok(())
     }
+}
+
+/// Write an imported template's `manifest.json` + `content.json` into
+/// `staging`, then atomically rename `staging` onto `dest`. Factored out
+/// of [`LocalMarketplace::import_design`] so the whole "write then
+/// publish" sequence shares one `?`-propagating error path, letting the
+/// caller remove `staging` on any failure (a partial entry is never left
+/// behind). After a successful rename `staging` no longer exists.
+fn stage_and_publish(
+    staging: &Path,
+    dest: &Path,
+    manifest_json: &str,
+    content_json: &str,
+) -> std::io::Result<()> {
+    std::fs::create_dir_all(staging)?;
+    std::fs::write(staging.join("manifest.json"), manifest_json)?;
+    std::fs::write(staging.join("content.json"), content_json)?;
+    std::fs::rename(staging, dest)?;
+    Ok(())
 }
 
 /// Rank a template against an already-lowercased query, or `None` if it
@@ -724,6 +773,74 @@ mod tests {
         assert_eq!(mp.list().len(), 2);
         // A rescan still sees both distinct entries.
         assert_eq!(mp.scan().unwrap(), 2);
+    }
+
+    #[test]
+    fn import_design_publishes_atomically_leaving_no_staging_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("templates");
+        let mut mp = LocalMarketplace::new(&root);
+
+        let manifest = mp
+            .import_design(ImportSpec {
+                name: "Atomic Poster".into(),
+                description: "x".into(),
+                category: TemplateCategory::Poster,
+                tags: vec![],
+                page_count: 1,
+                content_json: valid_content_json(),
+            })
+            .unwrap();
+
+        // Exactly one entry on disk: the final `.ktemplate/`. The
+        // template is only ever observable under its final name, never
+        // a half-written `.partial` staging dir, because publish is a
+        // single atomic rename.
+        let mut ktemplate_dirs = 0usize;
+        for entry in std::fs::read_dir(&root).unwrap() {
+            let name = entry.unwrap().file_name().into_string().unwrap();
+            assert!(!name.ends_with(".partial"), "leftover staging dir: {name}");
+            if name.ends_with(".ktemplate") {
+                ktemplate_dirs += 1;
+            }
+        }
+        assert_eq!(ktemplate_dirs, 1);
+
+        // The published entry is complete and rediscoverable.
+        let Some(TemplateSource::Local { path }) = &manifest.source else {
+            panic!("expected Local source");
+        };
+        assert!(path.join("manifest.json").exists());
+        assert!(path.join("content.json").exists());
+        let mut mp2 = LocalMarketplace::new(&root);
+        assert_eq!(mp2.scan().unwrap(), 1);
+    }
+
+    #[test]
+    fn scan_sweeps_stale_staging_dirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("templates");
+
+        // A valid published template alongside crash litter: a staging
+        // dir left behind when an import was killed between staging and
+        // the atomic rename.
+        write_ktemplate(
+            &root.join("real-design-abcdef01.ktemplate"),
+            &TemplateManifest {
+                name: "Real Design".into(),
+                ..sample_manifest(Uuid::new_v4())
+            },
+        );
+        let stale = root.join("interrupted-deadbeef.ktemplate.partial");
+        std::fs::create_dir_all(&stale).unwrap();
+        std::fs::write(stale.join("manifest.json"), "garbage").unwrap();
+
+        let mut mp = LocalMarketplace::new(&root);
+        // Only the valid template counts; the staging dir is invisible.
+        assert_eq!(mp.scan().unwrap(), 1);
+        // ...and it has been swept from disk so litter can't accumulate.
+        assert!(!stale.exists());
+        assert!(root.join("real-design-abcdef01.ktemplate").exists());
     }
 
     #[test]

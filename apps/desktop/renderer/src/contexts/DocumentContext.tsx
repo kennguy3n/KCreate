@@ -15,12 +15,6 @@
  * without depending on `EditorContext` directly (avoids a circular
  * import — `EditorContext.setStatusMessage` is reached via the
  * provider callback instead).
- *
- * `scene` lives here because conceptually it's a server-derived
- * sample of the document graph. Today it's the empty sentinel; in
- * Phase 1 we'll swap it for a push-based subscription. Having it
- * already routed through the context means that swap doesn't
- * require touching every consumer.
  */
 
 import {
@@ -41,36 +35,8 @@ import type {
   DocumentStatus,
   NodeInfo,
   ResourceLimits,
-  Scene,
 } from "../../../shared/scene";
 import { errorMessage } from "../lib/errorMessage";
-
-/**
- * Empty scene used while we haven't yet pulled one from the
- * bridge. Module-scoped so the reference is stable across re-renders.
- *
- * Deep-frozen at runtime so accidental mutation by a future consumer
- * (e.g. Phase 1's push-subscription path doing `scene.objects.push(...)`
- * on the sentinel before swapping in a real Scene) becomes a strict-mode
- * `TypeError` instead of silently corrupting every other provider
- * instance that shares this module-scoped reference. The `Scene` wire
- * type still declares mutable arrays — the freeze is defense-in-depth
- * at the sentinel only; real bridge-pulled scenes remain mutable as
- * before.
- */
-const EMPTY_SCENE: Scene = (() => {
-  const sentinel: Scene = {
-    clear_color: [0.12, 0.12, 0.14, 1.0],
-    objects: [],
-  };
-  Object.freeze(sentinel.clear_color);
-  Object.freeze(sentinel.objects);
-  Object.freeze(sentinel);
-  return sentinel;
-})();
-
-/** Re-export so EditorPage can keep using the same identity. */
-export { EMPTY_SCENE };
 
 /**
  * Public state surface. Field semantics match the `useState` hooks
@@ -83,7 +49,6 @@ export interface DocumentState {
   components: ComponentInfo[];
   docStatus: DocumentStatus | null;
   resourceLimits: ResourceLimits | null;
-  scene: Scene;
 }
 
 /**
@@ -317,7 +282,6 @@ export function DocumentProvider({
       components,
       docStatus,
       resourceLimits,
-      scene: EMPTY_SCENE,
     }),
     [nodes, artboards, artboardPresets, components, docStatus, resourceLimits],
   );

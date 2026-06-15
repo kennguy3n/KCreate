@@ -2553,6 +2553,9 @@ function EditorPageInner({
             onInteractionsChanged={() => {
               void refreshTree();
             }}
+            onThemeApplied={() => {
+              void refreshTree();
+            }}
             project={project}
           />
         )}

@@ -81,8 +81,9 @@ export function MagicResizeDialog({
         onClose();
       }
     };
-    document.addEventListener("keydown", handler);
-    return () => document.removeEventListener("keydown", handler);
+    document.addEventListener("keydown", handler, { capture: true });
+    return () =>
+      document.removeEventListener("keydown", handler, { capture: true });
   }, [open, onClose]);
 
   const grouped = useMemo(() => groupPresets(presets), [presets]);

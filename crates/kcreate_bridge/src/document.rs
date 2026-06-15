@@ -13723,4 +13723,277 @@ mod tests {
         assert!(matches!(err, DocumentBridgeError::WrongNodeType { .. }));
         project_close();
     }
+
+    // -------------------------------------------------------------------------
+    // Real-design proof. Compose a recognizable promo poster (header band,
+    // headline, hero disc, body copy, CTA button, footer band), Magic-Resize
+    // it to a 9:16 story and an A4 poster, render all three through the real
+    // scene-sync + PNG pipeline, and assert each target is a non-empty,
+    // aspect-correct, *distinct* layout (not a blank or letterboxed frame).
+    // Set `KCREATE_MAGIC_RESIZE_PROOF_DIR` to also dump the three PNGs.
+    // -------------------------------------------------------------------------
+
+    fn rgba(r: f32, g: f32, b: f32) -> kcreate_core::node::RgbaColor {
+        kcreate_core::node::RgbaColor { r, g, b, a: 1.0 }
+    }
+
+    fn set_node_fill(id: Uuid, color: kcreate_core::node::RgbaColor) {
+        let mut guard = slot().write();
+        let ws = guard.as_mut().expect("project open");
+        let node = ws.project.document.get_node_mut(id).expect("node present");
+        node.style.fill = kcreate_core::node::FillStyle::Solid(color);
+        node.touch();
+        drop(guard);
+    }
+
+    fn rect_path(b: kcreate_core::node::Bounds) -> kcreate_vector::VectorPath {
+        use kcreate_vector::{PathPoint, PathSegment, VectorPath};
+        VectorPath::new(vec![
+            PathSegment::MoveTo(PathPoint::new(b.x, b.y)),
+            PathSegment::LineTo(PathPoint::new(b.x + b.width, b.y)),
+            PathSegment::LineTo(PathPoint::new(b.x + b.width, b.y + b.height)),
+            PathSegment::LineTo(PathPoint::new(b.x, b.y + b.height)),
+            PathSegment::Close,
+        ])
+    }
+
+    /// A four-cubic ellipse centered at `(cx, cy)` with radii `(rx, ry)`,
+    /// authored in world coordinates so reflow's affine path remap moves it.
+    fn ellipse_path(cx: f64, cy: f64, rx: f64, ry: f64) -> kcreate_vector::VectorPath {
+        use kcreate_vector::{PathPoint, PathSegment, VectorPath};
+        const K: f64 = 0.552_284_749_830_793_4;
+        let (ox, oy) = (rx * K, ry * K);
+        VectorPath::new(vec![
+            PathSegment::MoveTo(PathPoint::new(cx, cy - ry)),
+            PathSegment::CubicTo {
+                ctrl1: PathPoint::new(cx + ox, cy - ry),
+                ctrl2: PathPoint::new(cx + rx, cy - oy),
+                end: PathPoint::new(cx + rx, cy),
+            },
+            PathSegment::CubicTo {
+                ctrl1: PathPoint::new(cx + rx, cy + oy),
+                ctrl2: PathPoint::new(cx + ox, cy + ry),
+                end: PathPoint::new(cx, cy + ry),
+            },
+            PathSegment::CubicTo {
+                ctrl1: PathPoint::new(cx - ox, cy + ry),
+                ctrl2: PathPoint::new(cx - rx, cy + oy),
+                end: PathPoint::new(cx - rx, cy),
+            },
+            PathSegment::CubicTo {
+                ctrl1: PathPoint::new(cx - rx, cy - oy),
+                ctrl2: PathPoint::new(cx - ox, cy - ry),
+                end: PathPoint::new(cx, cy - ry),
+            },
+            PathSegment::Close,
+        ])
+    }
+
+    fn add_shape(
+        artboard: Uuid,
+        b: kcreate_core::node::Bounds,
+        color: kcreate_core::node::RgbaColor,
+        path: kcreate_vector::VectorPath,
+    ) -> Uuid {
+        let mut guard = slot().write();
+        let ws = guard.as_mut().expect("project open");
+        let mut node = Node::new(NodeType::VectorLayer, "shape".to_string());
+        node.parent_id = Some(artboard);
+        node.bounds = b;
+        node.style.fill = kcreate_core::node::FillStyle::Solid(color);
+        node.metadata.insert(
+            crate::scene_sync::VECTOR_PATH_METADATA_KEY.to_string(),
+            serde_json::to_value(&path).expect("serialize vector path"),
+        );
+        let id = ws.project.document.insert_node(node).expect("insert shape");
+        drop(guard);
+        id
+    }
+
+    fn add_label(
+        artboard: Uuid,
+        b: kcreate_core::node::Bounds,
+        text: &str,
+        font_px: f32,
+        color: kcreate_core::node::RgbaColor,
+    ) -> Uuid {
+        let mut guard = slot().write();
+        let ws = guard.as_mut().expect("project open");
+        let mut node = Node::new(NodeType::TextLayer, "label".to_string());
+        node.parent_id = Some(artboard);
+        node.bounds = b;
+        node.style.fill = kcreate_core::node::FillStyle::Solid(color);
+        let meta = crate::scene_sync::TextLayerMeta {
+            text: text.to_string(),
+            font_family: "Inter".to_string(),
+            font_size: font_px,
+        };
+        node.metadata.insert(
+            crate::scene_sync::TEXT_LAYER_METADATA_KEY.to_string(),
+            serde_json::to_value(&meta).expect("serialize text meta"),
+        );
+        let id = ws.project.document.insert_node(node).expect("insert label");
+        drop(guard);
+        id
+    }
+
+    /// Compose a recognizable 1080² "Summer Fest" promo poster on its own
+    /// artboard and return the artboard id. Children carry default
+    /// constraints so the engine infers anchoring from geometry.
+    fn build_promo_poster() -> Uuid {
+        let ab =
+            artboard_create(None, "Summer Fest".to_string(), 1080.0, 1080.0).expect("artboard");
+        set_node_fill(ab, rgba(0.07, 0.09, 0.20)); // deep-navy background
+        let o = node_bounds(ab);
+        let coral = rgba(0.98, 0.42, 0.36);
+        let sun = rgba(1.0, 0.80, 0.23);
+        let cream = rgba(0.98, 0.96, 0.90);
+        let navy2 = rgba(0.12, 0.16, 0.32);
+
+        // Header band — full width, pinned to the top.
+        let header = bounds(o.x, o.y, 1080.0, 140.0);
+        add_shape(ab, header, coral, rect_path(header));
+        // Headline + subhead — near the top, centered horizontally.
+        add_label(
+            ab,
+            bounds(o.x + 90.0, o.y + 190.0, 900.0, 110.0),
+            "SUMMER FEST",
+            84.0,
+            cream,
+        );
+        add_label(
+            ab,
+            bounds(o.x + 90.0, o.y + 312.0, 900.0, 48.0),
+            "JUNE 21  -  RIVERSIDE PARK",
+            34.0,
+            sun,
+        );
+        // Hero sun disc — centered on both axes.
+        let disc = bounds(o.x + 360.0, o.y + 400.0, 360.0, 360.0);
+        add_shape(
+            ab,
+            disc,
+            sun,
+            ellipse_path(o.x + 540.0, o.y + 580.0, 180.0, 180.0),
+        );
+        // Body copy.
+        add_label(
+            ab,
+            bounds(o.x + 90.0, o.y + 792.0, 900.0, 44.0),
+            "Live music - Food trucks - Fireworks",
+            30.0,
+            cream,
+        );
+        // CTA button — centered, lower third.
+        let cta = bounds(o.x + 360.0, o.y + 858.0, 360.0, 92.0);
+        add_shape(ab, cta, coral, rect_path(cta));
+        add_label(
+            ab,
+            bounds(o.x + 360.0, o.y + 884.0, 360.0, 40.0),
+            "GET TICKETS",
+            34.0,
+            cream,
+        );
+        // Footer band — full width, pinned to the bottom.
+        let footer = bounds(o.x, o.y + 980.0, 1080.0, 100.0);
+        add_shape(ab, footer, navy2, rect_path(footer));
+        ab
+    }
+
+    /// Render a single artboard (by id) through the real document→scene
+    /// translation + PNG encoder, with the longest edge scaled to
+    /// `max_dim_px`. Returns `(png_bytes, out_w, out_h)`.
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_precision_loss,
+        clippy::cast_sign_loss
+    )]
+    fn render_artboard_png(artboard_id: Uuid, max_dim_px: u32) -> (Vec<u8>, u32, u32) {
+        let guard = slot().write();
+        let ws = guard.as_ref().expect("project open");
+        let ab_bounds = ws
+            .project
+            .document
+            .get_node(artboard_id)
+            .expect("artboard present")
+            .bounds;
+        let mut sync = crate::scene_sync::SceneSync::default();
+        let mut scene = sync.sync_document_to_scene_borrowed(&ws.project.document, None, &[]);
+        drop(guard);
+
+        // Translate so the target artboard lands at the renderer origin;
+        // every other artboard falls outside the crop.
+        let dx = -ab_bounds.x as f32;
+        let dy = -ab_bounds.y as f32;
+        for obj in &mut scene.objects {
+            obj.translation.0 += dx;
+            obj.translation.1 += dy;
+        }
+
+        let longest = ab_bounds.width.max(ab_bounds.height).max(1.0);
+        let scale = (f64::from(max_dim_px) / longest) as f32;
+        let opts = PngExportOptions {
+            width: ab_bounds.width.max(1.0) as u32,
+            height: ab_bounds.height.max(1.0) as u32,
+            scale,
+            background: Some(kcreate_renderer::geometry::Color::rgba(1.0, 1.0, 1.0, 1.0)),
+        };
+        let bytes = export_png_to_bytes(&scene, &opts).expect("render artboard png");
+        let out_w = (opts.width as f32 * scale).round() as u32;
+        let out_h = (opts.height as f32 * scale).round() as u32;
+        (bytes, out_w, out_h)
+    }
+
+    #[test]
+    #[serial]
+    fn magic_resize_renders_recognizable_design_across_aspect_ratios() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("mr_proof", dir.path()).expect("create");
+        let src = build_promo_poster();
+
+        let ids = magic_resize(
+            src,
+            &[spec_preset("Instagram Story"), spec_px(2480.0, 3508.0)],
+        )
+        .expect("resize");
+        assert_eq!(ids.len(), 2);
+
+        let square = render_artboard_png(src, 1200);
+        let story = render_artboard_png(ids[0], 1200);
+        let a4 = render_artboard_png(ids[1], 1200);
+
+        // Every target must produce a real PNG with a non-trivial body —
+        // i.e. an actual rendered design, never a blank frame.
+        for (label, render) in [("square", &square), ("story", &story), ("a4", &a4)] {
+            let (bytes, w, h) = render;
+            assert!(
+                bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
+                "{label}: not a PNG"
+            );
+            assert!(
+                bytes.len() > 2_000,
+                "{label}: PNG too small ({} bytes) — likely blank",
+                bytes.len()
+            );
+            assert!(*w > 0 && *h > 0, "{label}: zero output dims");
+        }
+
+        // Aspect ratios are honored (reflow, not uniform scale / letterbox).
+        assert!(square.1.abs_diff(square.2) <= 1, "square should be ~1:1");
+        assert!(story.2 > story.1, "story must be taller than wide (9:16)");
+        assert!(a4.2 > a4.1, "a4 must be taller than wide");
+        // The three renders are genuinely different layouts.
+        assert_ne!(square.0, story.0, "square and story rendered identically");
+        assert_ne!(story.0, a4.0, "story and a4 rendered identically");
+
+        if let Ok(out) = std::env::var("KCREATE_MAGIC_RESIZE_PROOF_DIR") {
+            let out_dir = std::path::Path::new(&out);
+            std::fs::create_dir_all(out_dir).expect("create proof dir");
+            std::fs::write(out_dir.join("01_square_1080.png"), &square.0).expect("write square");
+            std::fs::write(out_dir.join("02_story_1080x1920.png"), &story.0).expect("write story");
+            std::fs::write(out_dir.join("03_a4_2480x3508.png"), &a4.0).expect("write a4");
+        }
+        project_close();
+    }
 }

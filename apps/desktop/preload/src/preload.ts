@@ -20,6 +20,9 @@ import type {
   ArtboardInfo,
   ArtboardPreset,
   ResizeTarget,
+  MagicResizeContent,
+  MagicResizeExportRequest,
+  MagicResizeExportReport,
   BrandKit,
   BrandKitBridge,
   CanvasBatchItem,
@@ -1519,13 +1522,28 @@ const artboard: ArtboardBridge = {
   async magicResize(
     sourceArtboardId: string,
     targets: ResizeTarget[],
+    content?: MagicResizeContent,
   ): Promise<string[]> {
     const raw = (await ipcRenderer.invoke(
       "kcreate/artboard/magic-resize",
       sourceArtboardId,
       JSON.stringify(targets),
+      content === undefined ? "" : JSON.stringify(content),
     )) as string;
     return JSON.parse(raw) as string[];
+  },
+  async magicResizeExportPng(
+    sourceArtboardId: string,
+    targets: ResizeTarget[],
+    request: MagicResizeExportRequest,
+  ): Promise<MagicResizeExportReport> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/artboard/magic-resize-export-png",
+      sourceArtboardId,
+      JSON.stringify(targets),
+      JSON.stringify(request),
+    )) as string;
+    return JSON.parse(raw) as MagicResizeExportReport;
   },
 };
 

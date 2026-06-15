@@ -44,8 +44,8 @@ pub mod validate;
 pub mod webp;
 
 pub use batch::{
-    run_batch, run_batch_parallel, BatchCancel, BatchExportError, BatchExportJob, BatchProgress,
-    BatchResult, BatchStatus, ExportItem,
+    run_batch, run_batch_parallel, run_png_batch_parallel, BatchCancel, BatchExportError,
+    BatchExportJob, BatchProgress, BatchResult, BatchStatus, ExportItem, PngBatchItem,
 };
 pub use cmyk_dither::{quantize_cmyk_image, CmykDither, CmykPixel};
 pub use code_gen::{inspect_node, node_to_css, node_to_react_style, node_to_tailwind, InspectCode};

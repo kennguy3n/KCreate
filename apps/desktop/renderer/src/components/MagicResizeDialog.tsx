@@ -4,6 +4,7 @@ import type {
   ArtboardInfo,
   ArtboardPreset,
   ArtboardPresetCategory,
+  MagicResizeContent,
   ResizeTarget,
 } from "../../../shared/scene";
 import { colors, font, radius, shadow, spacing } from "../styles/tokens";
@@ -21,9 +22,28 @@ export interface MagicResizeDialogProps {
   /**
    * Called when the user confirms with one or more selected targets.
    * The parent owns the `artboard.magicResize` IPC round-trip +
-   * refreshing the tree.
+   * refreshing the tree. `content` carries the content-aware toggles
+   * (text re-fit + image smart-crop).
    */
-  onResize: (targets: ResizeTarget[]) => void;
+  onResize: (
+    targets: ResizeTarget[],
+    content: MagicResizeContent,
+  ) => void | Promise<void>;
+  /**
+   * Called when the user picks "Resize & export all": reflow onto every
+   * selected target AND render each to a PNG in one action. The parent
+   * owns the directory picker + `artboard.magicResizeExportPng` IPC.
+   *
+   * When the handler returns a `Promise`, the dialog drops its busy
+   * latch once that promise settles. That matters for paths that leave
+   * the dialog open instead of closing it — e.g. the user cancels the
+   * export directory picker — so the action buttons re-enable rather
+   * than staying stuck on "Exporting…".
+   */
+  onExport: (
+    targets: ResizeTarget[],
+    content: MagicResizeContent,
+  ) => void | Promise<void>;
   /** Cancel — close without resizing. */
   onClose: () => void;
 }
@@ -55,20 +75,28 @@ export function MagicResizeDialog({
   source,
   presets,
   onResize,
+  onExport,
   onClose,
 }: MagicResizeDialogProps): JSX.Element | null {
   const [selected, setSelected] = useState<ReadonlySet<string>>(new Set());
-  // Latched once the user confirms, so a second click can't fire a
-  // duplicate `onResize` (and spawn duplicate artboards) during the
-  // window before the parent's async handler closes the dialog.
-  const [submitting, setSubmitting] = useState(false);
+  // Content-aware toggles, both on by default (Canva-like behaviour).
+  const [refitText, setRefitText] = useState(true);
+  const [smartCrop, setSmartCrop] = useState(true);
+  // Which action is in flight (if any). Latched once the user confirms
+  // so a second click can't fire a duplicate `onResize` / `onExport`
+  // (and spawn duplicate artboards) during the window before the
+  // parent's async handler closes the dialog.
+  const [busy, setBusy] = useState<null | "resize" | "export">(null);
 
-  // Reset the selection + submit latch whenever the dialog (re)opens or
-  // the source artboard changes, so a prior session's picks don't linger.
+  // Reset the selection, toggles, and busy latch whenever the dialog
+  // (re)opens or the source artboard changes, so a prior session's
+  // picks don't linger.
   useEffect(() => {
     if (open) {
       setSelected(new Set());
-      setSubmitting(false);
+      setRefitText(true);
+      setSmartCrop(true);
+      setBusy(null);
     }
   }, [open, source?.id]);
 
@@ -123,21 +151,48 @@ export function MagicResizeDialog({
     });
   };
 
-  const submit = (): void => {
-    if (submitting) return;
+  const buildTargets = (): ResizeTarget[] => {
     const targets: ResizeTarget[] = [];
     for (const key of orderedKeys) {
       if (!selected.has(key)) continue;
       const preset = byKey.get(key);
       if (preset) targets.push({ preset: preset.name });
     }
+    return targets;
+  };
+
+  // Drop the busy latch once a parent action settles. The content-aware
+  // handlers in the parent are async (`Promise<void>`): on success they
+  // close the dialog, so this component unmounts and the reset is a
+  // harmless no-op; but on a path that leaves the dialog open — most
+  // importantly the user cancelling the export directory picker — the
+  // promise still settles, so we re-enable the buttons rather than
+  // leaving them disabled forever. A synchronous (`void`) handler keeps
+  // the legacy contract where the parent alone owns closing the dialog.
+  const runAction = (result: void | Promise<void>): void => {
+    if (result instanceof Promise) {
+      void result.finally(() => setBusy(null));
+    }
+  };
+
+  const submit = (): void => {
+    if (busy) return;
+    const targets = buildTargets();
     if (targets.length === 0) return;
-    setSubmitting(true);
-    onResize(targets);
+    setBusy("resize");
+    runAction(onResize(targets, { refitText, smartCrop }));
+  };
+
+  const exportAll = (): void => {
+    if (busy) return;
+    const targets = buildTargets();
+    if (targets.length === 0) return;
+    setBusy("export");
+    runAction(onExport(targets, { refitText, smartCrop }));
   };
 
   const count = selected.size;
-  const submitDisabled = count === 0 || submitting;
+  const actionsDisabled = count === 0 || busy !== null;
 
   return (
     <div
@@ -243,6 +298,30 @@ export function MagicResizeDialog({
             );
           })}
         </div>
+        <section
+          style={{
+            display: "flex",
+            flexWrap: "wrap",
+            gap: spacing.md,
+            padding: `${spacing.sm}px ${spacing.lg}px`,
+            borderTop: `1px solid ${colors.border}`,
+          }}
+        >
+          <ContentToggle
+            id="magic-resize-refit-text"
+            label="Re-fit text to box"
+            hint="Shrink-to-fit headlines so they don't overflow or vanish"
+            checked={refitText}
+            onChange={setRefitText}
+          />
+          <ContentToggle
+            id="magic-resize-smart-crop"
+            label="Smart-crop images"
+            hint="Crop toward the subject instead of stretching on aspect change"
+            checked={smartCrop}
+            onChange={setSmartCrop}
+          />
+        </section>
         <footer
           style={{
             display: "flex",
@@ -270,15 +349,27 @@ export function MagicResizeDialog({
           </button>
           <button
             type="button"
-            onClick={submit}
-            disabled={submitDisabled}
+            onClick={exportAll}
+            disabled={actionsDisabled}
             style={{
-              ...primaryButton,
-              opacity: submitDisabled ? 0.5 : 1,
-              cursor: submitDisabled ? "not-allowed" : "pointer",
+              ...secondaryButton,
+              opacity: actionsDisabled ? 0.5 : 1,
+              cursor: actionsDisabled ? "not-allowed" : "pointer",
             }}
           >
-            {submitting
+            {busy === "export" ? "Exporting…" : "Resize & export all"}
+          </button>
+          <button
+            type="button"
+            onClick={submit}
+            disabled={actionsDisabled}
+            style={{
+              ...primaryButton,
+              opacity: actionsDisabled ? 0.5 : 1,
+              cursor: actionsDisabled ? "not-allowed" : "pointer",
+            }}
+          >
+            {busy === "resize"
               ? "Generating…"
               : count <= 1
                 ? "Generate resize"
@@ -346,6 +437,47 @@ function PresetToggle({
         {preset.width} × {preset.height}
       </span>
     </button>
+  );
+}
+
+function ContentToggle({
+  id,
+  label,
+  hint,
+  checked,
+  onChange,
+}: {
+  id: string;
+  label: string;
+  hint: string;
+  checked: boolean;
+  onChange: (next: boolean) => void;
+}): JSX.Element {
+  return (
+    <label
+      htmlFor={id}
+      style={{
+        display: "flex",
+        alignItems: "flex-start",
+        gap: spacing.xs,
+        cursor: "pointer",
+        flex: "1 1 240px",
+      }}
+    >
+      <input
+        id={id}
+        type="checkbox"
+        checked={checked}
+        onChange={(e) => onChange(e.target.checked)}
+        style={{ marginTop: 2, cursor: "pointer" }}
+      />
+      <span style={{ display: "flex", flexDirection: "column", gap: 1 }}>
+        <span style={{ fontSize: 12, fontWeight: 500, color: colors.text }}>
+          {label}
+        </span>
+        <span style={{ fontSize: 10, color: colors.textMuted }}>{hint}</span>
+      </span>
+    </label>
   );
 }
 

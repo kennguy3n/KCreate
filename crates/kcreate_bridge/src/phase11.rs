@@ -448,3 +448,41 @@ impl Task for ProjectSaveTask {
         Ok(())
     }
 }
+
+// -- magic_resize_export_png --------------------------------------------------
+
+/// Async Magic-Resize → batch PNG export. The resize is a single
+/// undoable mutation, but the follow-on render of every generated
+/// artboard to a PNG is CPU-heavy and runs across a rayon pool inside
+/// [`document::magic_resize_export_png`]; on a large/multi-target design
+/// that is easily multiple seconds. Running it on the libuv main thread
+/// would freeze the Electron main process (window drag, menus, every
+/// other IPC) for the duration, so we dispatch the whole operation to
+/// the napi worker pool. The workspace lock is only held for the resize
+/// plus scene build; the parallel render happens off the lock, so
+/// concurrent renderer reads aren't blocked either.
+#[derive(Debug)]
+pub struct MagicResizeExportPngTask {
+    pub source_artboard_id: Uuid,
+    pub targets: Vec<document::ResizeTargetSpec>,
+    pub request: document::MagicResizeExportRequest,
+}
+
+impl Task for MagicResizeExportPngTask {
+    type Output = String;
+    type JsValue = String;
+
+    fn compute(&mut self) -> NapiResult<Self::Output> {
+        let report = document::magic_resize_export_png(
+            self.source_artboard_id,
+            &self.targets,
+            &self.request,
+        )
+        .map_err(map_doc_err)?;
+        serde_json::to_string(&report).map_err(|e| NapiError::from_reason(e.to_string()))
+    }
+
+    fn resolve(&mut self, _env: Env, output: Self::Output) -> NapiResult<Self::JsValue> {
+        Ok(output)
+    }
+}

@@ -635,7 +635,12 @@ export interface Bridge {
   artboardDuplicate(artboardId: string): string;
   artboardResize(artboardId: string, width: number, height: number): void;
   artboardPresets(): string;
-  magicResize(sourceArtboardId: string, targetsJson: string): string;
+  magicResize(sourceArtboardId: string, targetsJson: string, contentJson: string): string;
+  magicResizeExportPng(
+    sourceArtboardId: string,
+    targetsJson: string,
+    requestJson: string,
+  ): Promise<string>;
 
   // Components (Phase 1, Block B)
   componentCreateFromSelection(nodeIds: string[], name: string): string;

@@ -1715,8 +1715,27 @@ function registerIpcHandlers(): void {
   );
   ipcMain.handle(
     "kcreate/artboard/magic-resize",
-    (_e, sourceArtboardId: string, targetsJson: string): string =>
-      requireBridge().magicResize(sourceArtboardId, targetsJson),
+    (
+      _e,
+      sourceArtboardId: string,
+      targetsJson: string,
+      contentJson: string,
+    ): string =>
+      requireBridge().magicResize(sourceArtboardId, targetsJson, contentJson),
+  );
+  ipcMain.handle(
+    "kcreate/artboard/magic-resize-export-png",
+    (
+      _e,
+      sourceArtboardId: string,
+      targetsJson: string,
+      requestJson: string,
+    ): Promise<string> =>
+      requireBridge().magicResizeExportPng(
+        sourceArtboardId,
+        targetsJson,
+        requestJson,
+      ),
   );
 
   // Components (Block B).

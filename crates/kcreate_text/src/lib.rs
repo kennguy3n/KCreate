@@ -32,7 +32,7 @@ pub mod shaper;
 pub mod tokens;
 pub mod wrap;
 
-pub use autofit::{compute_autofit_size, AutofitError, AutofitOptions};
+pub use autofit::{compute_autofit_size, refit_text_to_box, AutofitError, AutofitOptions};
 pub use font_db::{FontInfo, FontManager, FontManagerError};
 pub use hyphenation::{HyphenationPatterns, EN_US_PATTERNS};
 pub use outline::{outline_glyph, OutlineCommand, OutlineError};

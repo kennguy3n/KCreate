@@ -19,6 +19,7 @@ pub mod denoise;
 pub mod design_critique;
 pub mod design_tokens_vlm;
 pub mod diffusion_sidecar;
+pub mod focal_crop;
 pub mod glyph_extract;
 pub mod iconify;
 pub mod image_gen;
@@ -61,6 +62,9 @@ pub use brand_template::{
 pub use color_range::{pack_mask, select_by_color_range};
 pub use denoise::{denoise, DenoiseError, DenoiseOptions};
 pub use diffusion_sidecar::{DiffusionSidecar, DiffusionSidecarConfig};
+pub use focal_crop::{
+    apply_crop, content_aware_crop, crop_for_focal, focal_point, FocalCrop, FocalPoint,
+};
 pub use glyph_extract::{
     extract_glyph, ExtractedGlyph, GlyphCrop, GlyphExtractError, GlyphExtractOptions, GlyphMetrics,
 };

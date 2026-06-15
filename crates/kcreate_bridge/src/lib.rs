@@ -2593,16 +2593,69 @@ pub fn artboard_presets() -> NapiResult<String> {
 /// target (non-destructive; one undoable op). `targets_json` is the
 /// JSON serialization of an array of `ResizeTarget`
 /// (`{ name?, preset?, width?, height? }` — see
-/// `document::ResizeTargetSpec` / `shared/scene.ts`). Returns a JSON
-/// array of the new artboards' UUID strings, in target order.
+/// `document::ResizeTargetSpec` / `shared/scene.ts`). `content_json` is
+/// the JSON `MagicResizeContent` (`{ refitText, smartCrop }`) toggling
+/// content-aware text re-fit + image smart-crop; an empty string
+/// defaults both on. Returns a JSON array of the new artboards' UUID
+/// strings, in target order.
 #[napi]
-pub fn magic_resize(source_artboard_id: String, targets_json: String) -> NapiResult<String> {
+pub fn magic_resize(
+    source_artboard_id: String,
+    targets_json: String,
+    content_json: String,
+) -> NapiResult<String> {
     let id = parse_uuid(&source_artboard_id)?;
     let targets: Vec<document::ResizeTargetSpec> =
         serde_json::from_str(&targets_json).map_err(|e| NapiError::from_reason(e.to_string()))?;
-    let new_ids = document::magic_resize(id, &targets).map_err(map_doc_err)?;
+    let content = parse_magic_resize_content(&content_json)?;
+    let new_ids =
+        document::magic_resize_with_content(id, &targets, content).map_err(map_doc_err)?;
     let id_strings: Vec<String> = new_ids.iter().map(Uuid::to_string).collect();
     serde_json::to_string(&id_strings).map_err(|e| NapiError::from_reason(e.to_string()))
+}
+
+/// **Magic Resize → batch PNG export.** Resize `source_artboard_id`
+/// onto every target (`targets_json`, same shape as [`magic_resize`])
+/// AND render each generated artboard to a PNG inside the request's
+/// `outputDir`, in one action. `request_json` is the JSON
+/// `MagicResizeExportRequest`
+/// (`{ outputDir, content?: { refitText, smartCrop }, maxDimPx? }` —
+/// see `document::MagicResizeExportRequest` / `shared/scene.ts`).
+/// Returns the JSON `MagicResizeExportReport` (`artboard_ids`,
+/// `output_dir`, `written`, `failed`, `duration_ms`).
+///
+/// The resize + parallel PNG render can take multiple seconds for a
+/// large or many-target design, so the work is dispatched to the napi
+/// worker pool (the JS side already awaits a `Promise<string>`) — the
+/// Electron main process event loop stays responsive for the duration.
+#[napi(ts_return_type = "Promise<string>")]
+pub fn magic_resize_export_png(
+    source_artboard_id: String,
+    targets_json: String,
+    request_json: String,
+) -> NapiResult<AsyncTask<phase11::MagicResizeExportPngTask>> {
+    let id = parse_uuid(&source_artboard_id)?;
+    let targets: Vec<document::ResizeTargetSpec> =
+        serde_json::from_str(&targets_json).map_err(|e| NapiError::from_reason(e.to_string()))?;
+    let request: document::MagicResizeExportRequest =
+        serde_json::from_str(&request_json).map_err(|e| NapiError::from_reason(e.to_string()))?;
+    Ok(AsyncTask::new(phase11::MagicResizeExportPngTask {
+        source_artboard_id: id,
+        targets,
+        request,
+    }))
+}
+
+/// Parse the optional `MagicResizeContent` JSON wire payload. An empty
+/// or whitespace-only string defaults both content-aware toggles on
+/// (matching [`document::MagicResizeContentOptions::default`]).
+fn parse_magic_resize_content(
+    content_json: &str,
+) -> NapiResult<document::MagicResizeContentOptions> {
+    if content_json.trim().is_empty() {
+        return Ok(document::MagicResizeContentOptions::default());
+    }
+    serde_json::from_str(content_json).map_err(|e| NapiError::from_reason(e.to_string()))
 }
 
 // -----------------------------------------------------------------------------

@@ -51,6 +51,7 @@ use std::thread;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
+use kcreate_core::document::DocumentGraph;
 use kcreate_core::node::NodeType;
 use kcreate_core::Bounds;
 use kcreate_export::png::{export_png_to_bytes, PngExportOptions};
@@ -114,6 +115,42 @@ impl ThumbnailBytes {
             content_hash: c.content_hash,
         }
     }
+
+    /// Build a [`ThumbnailBytes`] from raw PNG bytes. Used by the
+    /// template gallery: the same constructor serves both a freshly
+    /// rendered preview and a `thumbnail.png` read back from a
+    /// `.ktemplate/` cache on disk, so the wire shape is identical
+    /// regardless of cache state. Pixel dimensions are read from the
+    /// PNG `IHDR` header (dependency-free); `content_hash` is the
+    /// BLAKE3 of the bytes so the renderer can use it as an `<img>`
+    /// cache-busting key.
+    pub fn from_png_bytes(bytes: Vec<u8>) -> Self {
+        let (width, height) = png_dimensions(&bytes).unwrap_or((0, 0));
+        let content_hash = blake3::hash(&bytes).to_hex().to_string();
+        Self {
+            width,
+            height,
+            mime: "image/png".to_string(),
+            byte_size: bytes.len() as u64,
+            bytes_base64: encode_base64(&bytes),
+            content_hash,
+        }
+    }
+}
+
+/// Read `(width, height)` from the `IHDR` chunk of a PNG byte stream.
+/// Returns `None` if the buffer is too short or lacks the PNG
+/// signature. The layout is fixed by the spec: 8-byte signature, then
+/// a chunk header (`4`-byte length + `b"IHDR"`), then big-endian
+/// `width` and `height` `u32`s at byte offsets 16 and 20.
+fn png_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    const PNG_SIGNATURE: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+    if bytes.len() < 24 || bytes[0..8] != PNG_SIGNATURE || &bytes[12..16] != b"IHDR" {
+        return None;
+    }
+    let width = u32::from_be_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]);
+    let height = u32::from_be_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]);
+    Some((width, height))
 }
 
 /// A single recent-project entry, mirroring `RecentProject` on disk
@@ -678,19 +715,60 @@ fn render_scene_to_png(
     max_dim_px: u32,
     background: Option<Color>,
 ) -> Result<(Vec<u8>, u32, u32)> {
-    let (w_px, h_px, scale) = compute_thumbnail_dims(bounds, max_dim_px);
+    let (base_w, base_h, scale) = compute_thumbnail_dims(bounds, max_dim_px);
     let opts = PngExportOptions {
-        width: w_px,
-        height: h_px,
+        width: base_w,
+        height: base_h,
         scale,
         background,
     };
     let bytes = export_png_to_bytes(scene, &opts)
         .map_err(|e| DocumentBridgeError::Internal(format!("thumbnail render: {e}")))?;
-    // `scale` is folded into the output dimensions by export_png.
-    let out_w = (w_px as f32 * scale).round().clamp(1.0, u32::MAX as f32) as u32;
-    let out_h = (h_px as f32 * scale).round().clamp(1.0, u32::MAX as f32) as u32;
+    // `export_png_to_bytes` folds `scale` into the output dimensions
+    // (`final = round(base * scale)`); mirror that here so the cached
+    // width/height match the encoded PNG.
+    let out_w = (f64::from(base_w) * f64::from(scale))
+        .round()
+        .clamp(1.0, f64::from(u32::MAX)) as u32;
+    let out_h = (f64::from(base_h) * f64::from(scale))
+        .round()
+        .clamp(1.0, f64::from(u32::MAX)) as u32;
     Ok((bytes, out_w, out_h))
+}
+
+/// Render a ready-made template's standalone [`DocumentGraph`] to PNG
+/// bytes at gallery-card resolution, returning the raw PNG (the
+/// caller caches it to `<template>.ktemplate/thumbnail.png` and wraps
+/// it in a [`ThumbnailBytes`]).
+///
+/// The template graph has no Page / Artboard — items sit at the root
+/// with absolute coordinates in `[0,0,width,height]` (see
+/// `crate::document::build_template_document`). We render that exact
+/// rectangle so the preview matches the canvas produced by
+/// `template_instantiate_items` pixel-for-pixel.
+///
+/// Uses an ephemeral [`SceneSync`] (no blob store — templates are
+/// pure vector/text, no embedded rasters) so the open project's
+/// scene cache and dirty set are untouched. A white background is
+/// painted underneath as a safety net; authored templates ship a
+/// full-bleed background rect as `items[0]`, so this only shows
+/// through if a template is authored without one.
+pub fn render_template_thumbnail_png(
+    doc: &DocumentGraph,
+    width: f64,
+    height: f64,
+    max_dim_px: u32,
+) -> Result<Vec<u8>> {
+    let bounds = Bounds::new(0.0, 0.0, width.max(1.0), height.max(1.0));
+    let mut template_sync = SceneSync::default();
+    let scene = template_sync.sync_document_to_scene_borrowed(doc, None, &[]);
+    let (bytes, _w, _h) = render_scene_to_png(
+        &scene,
+        bounds,
+        sanitize_dim(max_dim_px),
+        Some(Color::rgba(1.0, 1.0, 1.0, 1.0)),
+    )?;
+    Ok(bytes)
 }
 
 /// Pick the page that should represent the project on the HomePage.
@@ -734,19 +812,33 @@ fn page_ids(ws: &Workspace) -> Vec<Uuid> {
         .collect()
 }
 
-/// Compute thumbnail base dims so the long edge equals `max_dim_px`
-/// (with `scale = 1.0`). Aspect ratio is preserved; both dims are at
-/// least 1.
+/// Compute the [`PngExportOptions`] parameters for a thumbnail whose
+/// long edge lands at `max_dim_px`. Returns `(base_w, base_h, scale)`
+/// where `base_w`/`base_h` are the design's *logical* dimensions
+/// (fed to `PngExportOptions::{width,height}`) and `scale` is the
+/// viewport zoom (`PngExportOptions::scale`) that maps the whole
+/// design into the output buffer. The emitted PNG is therefore
+/// `round(base_w * scale) x round(base_h * scale)`, i.e. its long
+/// edge equals `max_dim_px`; aspect ratio is preserved and both
+/// output dims are at least 1.
+///
+/// `export_png_to_bytes` treats `width`/`height` as the design's
+/// coordinate-space size and `scale` as the viewport zoom (scene
+/// units -> pixels), so the *whole* design must be passed as the base
+/// dims with the downscale folded into `scale`. Passing the already
+/// shrunk output dims with `scale = 1.0` (the previous behavior)
+/// renders the design 1:1 and crops to the top-left rectangle instead
+/// of fitting it — e.g. a 1584x396 banner's top-left 320x80 crop is a
+/// single solid color.
 fn compute_thumbnail_dims(bounds: Bounds, max_dim_px: u32) -> (u32, u32, f32) {
-    let aspect_w = bounds.width.max(1.0);
-    let aspect_h = bounds.height.max(1.0);
+    let design_w = bounds.width.max(1.0);
+    let design_h = bounds.height.max(1.0);
     let max = f64::from(max_dim_px.max(8));
-    let (w, h) = if aspect_w >= aspect_h {
-        (max, (max * (aspect_h / aspect_w)).max(1.0))
-    } else {
-        ((max * (aspect_w / aspect_h)).max(1.0), max)
-    };
-    (w.round() as u32, h.round() as u32, 1.0)
+    let longest = design_w.max(design_h);
+    let scale = max / longest;
+    let base_w = design_w.round().max(1.0) as u32;
+    let base_h = design_h.round().max(1.0) as u32;
+    (base_w, base_h, scale as f32)
 }
 
 fn sanitize_dim(max_dim_px: u32) -> u32 {
@@ -844,26 +936,42 @@ mod tests {
         f
     }
 
+    // Output dimensions after `export_png_to_bytes` folds `scale` into
+    // the buffer: `round(base * scale)`.
+    fn out_dims(base_w: u32, base_h: u32, scale: f32) -> (i32, i32) {
+        let w = (f64::from(base_w) * f64::from(scale)).round() as i32;
+        let h = (f64::from(base_h) * f64::from(scale)).round() as i32;
+        (w, h)
+    }
+
     #[test]
     fn compute_thumbnail_dims_preserves_aspect_ratio_landscape() {
+        // Base dims are the design's logical size; the downscale lands
+        // the long edge at `max_dim_px` while preserving aspect ratio.
         let (w, h, scale) = compute_thumbnail_dims(Bounds::new(0.0, 0.0, 1920.0, 1080.0), 320);
-        assert_eq!(scale, 1.0);
-        assert_eq!(w, 320);
-        assert!((h as i32 - 180).abs() <= 1, "got {h}");
+        assert_eq!((w, h), (1920, 1080));
+        let (out_w, out_h) = out_dims(w, h, scale);
+        assert_eq!(out_w, 320);
+        assert!((out_h - 180).abs() <= 1, "got {out_h}");
     }
 
     #[test]
     fn compute_thumbnail_dims_preserves_aspect_ratio_portrait() {
-        let (w, h, _scale) = compute_thumbnail_dims(Bounds::new(0.0, 0.0, 1080.0, 1920.0), 320);
-        assert_eq!(h, 320);
-        assert!((w as i32 - 180).abs() <= 1, "got {w}");
+        let (w, h, scale) = compute_thumbnail_dims(Bounds::new(0.0, 0.0, 1080.0, 1920.0), 320);
+        assert_eq!((w, h), (1080, 1920));
+        let (out_w, out_h) = out_dims(w, h, scale);
+        assert_eq!(out_h, 320);
+        assert!((out_w - 180).abs() <= 1, "got {out_w}");
     }
 
     #[test]
     fn compute_thumbnail_dims_floors_at_one_pixel() {
-        let (w, h, _scale) = compute_thumbnail_dims(Bounds::new(0.0, 0.0, 0.0, 0.0), 320);
+        let (w, h, scale) = compute_thumbnail_dims(Bounds::new(0.0, 0.0, 0.0, 0.0), 320);
         assert!(w >= 1);
         assert!(h >= 1);
+        let (out_w, out_h) = out_dims(w, h, scale);
+        assert!(out_w >= 1, "got {out_w}");
+        assert!(out_h >= 1, "got {out_h}");
     }
 
     #[test]

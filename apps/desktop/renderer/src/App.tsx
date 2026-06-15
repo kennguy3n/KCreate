@@ -1,10 +1,15 @@
 import { lazy, Suspense, useCallback, useState } from "react";
 
 import { ErrorBoundary } from "./components/ErrorBoundary";
+import { TemplateGallery } from "./components/TemplateGallery";
 import { openScratchProject } from "./lib/scratchProject";
 import { templateResolverFor } from "./lib/templates";
 import { CREATE_OPTIONS, HomePage } from "./pages/HomePage";
-import type { BriefApplyResult, ProjectInfo } from "../../shared/scene";
+import type {
+  BriefApplyResult,
+  ProjectInfo,
+  ThemedDesignApplyResult,
+} from "../../shared/scene";
 
 export { openScratchProject };
 
@@ -22,6 +27,7 @@ const EditorPage = lazy(() =>
 
 type Route =
   | { kind: "home" }
+  | { kind: "templates" }
   | { kind: "editor"; project: ProjectInfo }
   | { kind: "error"; message: string };
 
@@ -213,30 +219,33 @@ export function App(): JSX.Element {
   // guarantees there is an open project (it materialises a scratch
   // one when invoked from HomePage), so `getProjectInfo` is
   // expected to be non-null on this path.
-  const handleBriefApplied = useCallback(async (result: BriefApplyResult) => {
-    try {
-      const project = await window.kcreate.document.getProjectInfo();
-      if (!project) {
-        // Defensive: brief_to_project would have failed if no
-        // project was open, so reaching here means the workspace
-        // was closed between the apply call returning and this
-        // callback firing. Surface a clear error.
+  const handleBriefApplied = useCallback(
+    async (result: BriefApplyResult | ThemedDesignApplyResult) => {
+      try {
+        const project = await window.kcreate.document.getProjectInfo();
+        if (!project) {
+          // Defensive: brief_to_project would have failed if no
+          // project was open, so reaching here means the workspace
+          // was closed between the apply call returning and this
+          // callback firing. Surface a clear error.
+          setRoute({
+            kind: "error",
+            message:
+              "Brief applied but the project was closed before the editor could open it.",
+          });
+          return;
+        }
+        void result;
+        setRoute({ kind: "editor", project });
+      } catch (e) {
         setRoute({
           kind: "error",
-          message:
-            "Brief applied but the project was closed before the editor could open it.",
+          message: e instanceof Error ? e.message : String(e),
         });
-        return;
       }
-      void result;
-      setRoute({ kind: "editor", project });
-    } catch (e) {
-      setRoute({
-        kind: "error",
-        message: e instanceof Error ? e.message : String(e),
-      });
-    }
-  }, []);
+    },
+    [],
+  );
 
   // Open a project from the HomePage's Recent grid. The bridge's
   // `projectOpen` does the heavy lifting (workspace mount, scene
@@ -253,6 +262,51 @@ export function App(): JSX.Element {
       });
     }
   }, []);
+
+  // "Start from template" / "Duplicate & remix" — the G2 jump-start
+  // entry point. Mirrors `handleOpenEditor`'s shape: materialise a
+  // scratch project, pour the template's design into it via the
+  // bridge (`templateMarketplace.instantiate`, which creates an
+  // artboard + all of the template's nodes from its `content.json`),
+  // optionally duplicate that artboard so a "remix" edits a copy,
+  // push the new nodes into the renderer scene, then route into the
+  // editor on the populated canvas.
+  //
+  // Unlike `handleOpenEditor`, failures here are NOT swallowed: this
+  // is a deliberate, explicit user action on a specific template, so
+  // a failure should surface in the gallery (inline, no navigation)
+  // rather than dumping the user onto a blank editor. We close the
+  // half-open scratch project on failure to avoid leaking an empty
+  // workspace, then rethrow so the gallery can show the error and
+  // stay put.
+  const handleStartFromTemplate = useCallback(
+    async (templateId: string, opts: { remix: boolean }) => {
+      const project = await openScratchProject();
+      try {
+        const report =
+          await window.kcreate.templateMarketplace.instantiate(templateId);
+        if (opts.remix) {
+          // Remix = jump-start from a *copy* so the pristine
+          // instantiation stays untouched as a reference. The bridge
+          // offsets the duplicate to its own artboard slot.
+          await window.kcreate.artboard.duplicate(report.artboardId);
+        }
+        // Push the freshly created nodes into the renderer's scene so
+        // the editor opens on the populated canvas instead of waiting
+        // for the next event-driven sync.
+        await window.kcreate.canvas.syncScene();
+      } catch (e) {
+        // Roll back the scratch project we opened above so a failed
+        // instantiation never strands an empty workspace. Swallow any
+        // close error — the original instantiation error is the one
+        // worth surfacing.
+        await window.kcreate.document.closeProject().catch(() => {});
+        throw e;
+      }
+      setRoute({ kind: "editor", project });
+    },
+    [],
+  );
 
   if (route.kind === "editor") {
     return (
@@ -272,6 +326,14 @@ export function App(): JSX.Element {
           <EditorPage project={route.project} onBackHome={handleBackHome} />
         </Suspense>
       </ErrorBoundary>
+    );
+  }
+  if (route.kind === "templates") {
+    return (
+      <TemplateGallery
+        onBack={() => setRoute({ kind: "home" })}
+        onStartFromTemplate={handleStartFromTemplate}
+      />
     );
   }
   if (route.kind === "error") {
@@ -295,6 +357,7 @@ export function App(): JSX.Element {
       onOpenEditor={handleOpenEditor}
       onOpenProject={(p) => void handleOpenProject(p)}
       onBriefApplied={(r) => void handleBriefApplied(r)}
+      onBrowseTemplates={() => setRoute({ kind: "templates" })}
     />
   );
 }

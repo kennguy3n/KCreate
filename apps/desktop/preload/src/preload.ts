@@ -43,6 +43,7 @@ import type {
   LayoutTemplate,
   TemplateCategory,
   TemplateListReport,
+  TemplateInstantiateReport,
   TemplateManifest,
   TemplateMarketplaceBridge,
   MasterPageBridge,
@@ -244,6 +245,7 @@ import type {
   ExtractedGlyphResult,
   ReformatDeckResult,
   BriefToOnePagerResult,
+  ThemedDesignApplyResult,
   HarmonyResult,
   TypePairingResult,
   SvgOptimizeReport,
@@ -1685,6 +1687,20 @@ const templateMarketplace: TemplateMarketplaceBridge = {
   },
   async remove(templateId: string): Promise<void> {
     await ipcRenderer.invoke("kcreate/template/remove", templateId);
+  },
+  async instantiate(
+    templateId: string,
+  ): Promise<TemplateInstantiateReport> {
+    return (await ipcRenderer.invoke(
+      "kcreate/template/instantiate",
+      templateId,
+    )) as TemplateInstantiateReport;
+  },
+  async thumbnail(templateId: string): Promise<ThumbnailBytes> {
+    return (await ipcRenderer.invoke(
+      "kcreate/template/thumbnail",
+      templateId,
+    )) as ThumbnailBytes;
   },
 };
 
@@ -3681,6 +3697,14 @@ const phase10: Phase10Bridge = {
       pageSize,
     )) as string;
     return JSON.parse(raw) as BriefToOnePagerResult;
+  },
+  async aiGenerateThemedDesign(brief, options) {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/phase10/ai/generate-themed-design",
+      brief,
+      JSON.stringify(options),
+    )) as string;
+    return JSON.parse(raw) as ThemedDesignApplyResult;
   },
   async aiHarmonizePalette(brandKitId, harmonyType) {
     const raw = (await ipcRenderer.invoke(

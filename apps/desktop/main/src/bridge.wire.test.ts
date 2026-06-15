@@ -29,6 +29,8 @@ import type {
   NodeInfoSnake,
   RuntimeStatusSnake,
   DocumentStatusSnake,
+  ThumbnailBytesSnake,
+  TemplateInstantiateResultSnake,
 } from "./bridge";
 import type {
   FrameInfo,
@@ -37,6 +39,8 @@ import type {
   NodeInfo,
   RuntimeStatus,
   DocumentStatus,
+  ThumbnailBytes,
+  TemplateInstantiateReport,
 } from "../../shared/scene";
 
 /** Fails to compile unless `value`'s type is assignable to `T`. */
@@ -70,6 +74,20 @@ expectAssignable<DocumentStatus>({} as DocumentStatusSnake);
 expectAssignable<NodeInfo>({} as NodeInfoSnake);
 expectAssignable<NodeInfoSnake>(
   {} as Omit<NodeInfo, "componentInstance" | "metadata">,
+);
+
+// G2 template library: `templateThumbnail` reuses the `ThumbnailBytes`
+// napi struct (so a `byte_size` → `byteSize` regression breaks here),
+// and `templateInstantiate` returns `TemplateInstantiateResult`
+// (`artboard_id` → `artboardId`, `node_ids` → `nodeIds`). Guarded in
+// both directions so neither side can drift a field.
+expectAssignable<ThumbnailBytes>({} as ThumbnailBytesSnake);
+expectAssignable<ThumbnailBytesSnake>({} as ThumbnailBytes);
+expectAssignable<TemplateInstantiateReport>(
+  {} as TemplateInstantiateResultSnake,
+);
+expectAssignable<TemplateInstantiateResultSnake>(
+  {} as TemplateInstantiateReport,
 );
 
 test("public runtime/document DTOs expose their multi-word fields in camelCase", () => {

@@ -293,6 +293,36 @@ const defaultsByMethod: Record<string, () => unknown> = {
     width: 0,
     height: 0,
   }),
+  // Workstream G2 — ready-made template library. `TemplateGallery`
+  // mounts straight into `list` + `thumbnail`; defaults keep the
+  // component mountable (empty gallery, fallback thumbnails) so tests
+  // that don't drive the catalog stay green. Catalog-driving tests
+  // override `templateMarketplace.list` to return a `TemplateListReport`
+  // and `templateMarketplace.thumbnail` to return `ThumbnailBytes`.
+  "templateMarketplace.list": () => ({ templates: [] }),
+  "templateMarketplace.thumbnail": () => null,
+  "templateMarketplace.instantiate": () => ({
+    artboardId: "00000000-0000-0000-0000-000000000000",
+    nodeIds: [],
+  }),
+  // `installLocal` resolves to the installed `TemplateManifest` (not a
+  // list) — mirror that shape so a test that doesn't override it still
+  // type-checks against the real bridge contract. Snake_case fields
+  // match the serde JSON wire format (this is a JSON-string type, not a
+  // `#[napi(object)]`).
+  "templateMarketplace.installLocal": () => ({
+    id: "00000000-0000-0000-0000-000000000000",
+    name: "",
+    description: "",
+    category: "custom",
+    tags: [],
+    thumbnail: null,
+    page_count: 0,
+    author: null,
+    version: "0.0.0",
+    source: null,
+  }),
+  "templateMarketplace.remove": () => undefined,
   setLayerColor: () => undefined,
 };
 
@@ -365,6 +395,8 @@ export function installKcreateStub(): KcreateStubHandle {
     onboarding: namespace("onboarding"),
     system: namespace("system"),
     assets: namespace("assets"),
+    // Workstream G2 — ready-made template library bridge.
+    templateMarketplace: namespace("templateMarketplace"),
     setLayerColor: (...args: unknown[]): unknown =>
       recordCall("setLayerColor", args),
   };

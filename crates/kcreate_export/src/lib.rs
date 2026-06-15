@@ -54,7 +54,7 @@ pub use figma_import::{
     ImportedFigma, ImportedFigmaArtboard, ImportedFigmaNode, ImportedFigmaPage,
 };
 pub use jpeg::{export_jpeg, export_jpeg_to_bytes, JpegExportError, JpegExportOptions};
-pub use page_svg::compose_page_svg;
+pub use page_svg::{compose_page_svg, compose_page_svg_in_frame};
 pub use pdf::{
     export_pdf_from_document, export_pdf_from_document_to_bytes, PdfExportError, PdfExportOptions,
     RasterPixelCache, RasterPixels,

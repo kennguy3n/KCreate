@@ -56,6 +56,8 @@ pub enum MarketplaceError {
     TemplateNotFound(Uuid),
     #[error("template {0} already installed")]
     AlreadyInstalled(Uuid),
+    #[error("serialize error: {0}")]
+    Serialize(String),
 }
 
 /// The local template marketplace — scans, lists, installs, and
@@ -201,6 +203,18 @@ impl LocalMarketplace {
         installed.source = Some(TemplateSource::Local { path: dest });
         self.templates.insert(installed.id, installed.clone());
         Ok(installed)
+    }
+
+    /// Seed the bundled, ready-made template catalog into this
+    /// marketplace's root directory if it has no `.ktemplate/` folders
+    /// yet (copy-if-empty). Returns the number of templates written
+    /// (`0` when already populated). Idempotent; honours whatever root
+    /// the marketplace was constructed with (e.g. a `KCREATE_TEMPLATE_DIR`
+    /// override applied by the bridge). Does not re-scan — callers that
+    /// need the freshly-seeded set in memory should call [`Self::scan`]
+    /// afterwards.
+    pub fn seed_bundled(&self) -> Result<usize, MarketplaceError> {
+        crate::template_library::seed_bundled_templates(&self.root)
     }
 
     /// Remove a template by id. Deletes the `.ktemplate/` folder.

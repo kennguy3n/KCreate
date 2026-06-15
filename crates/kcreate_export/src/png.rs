@@ -127,10 +127,7 @@ mod tests {
         let mut s = Scene::new(Color::rgba(0.0, 0.0, 0.0, 1.0));
         s.add_object(Object::new(
             ObjectKind::Rect(Rect::new(4.0, 4.0, 8.0, 8.0)),
-            Style {
-                fill: Some(Color::rgba(1.0, 0.0, 0.0, 1.0)),
-                stroke: None,
-            },
+            Style::filled(Color::rgba(1.0, 0.0, 0.0, 1.0)),
         ));
         s
     }
@@ -200,10 +197,7 @@ mod tests {
         let mut s = Scene::new(Color::rgba(0.0, 0.0, 0.0, 1.0));
         s.add_object(Object::new(
             ObjectKind::Rect(Rect::new(0.0, 0.0, 16.0, 16.0)),
-            Style {
-                fill: Some(Color::rgba(1.0, 0.0, 0.0, 1.0)),
-                stroke: None,
-            },
+            Style::filled(Color::rgba(1.0, 0.0, 0.0, 1.0)),
         ));
         s
     }

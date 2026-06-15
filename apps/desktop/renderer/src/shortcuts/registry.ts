@@ -44,6 +44,12 @@ export type ActionId =
   | "togglePan"
   | "openExport"
   | "openShortcutsPanel"
+  | "openCommandPalette"
+  | "openTemplates"
+  | "openTheme"
+  | "openElements"
+  | "openMagicResize"
+  | "openAiGenerate"
   | "copy"
   | "paste"
   | "alignLeft"
@@ -123,6 +129,21 @@ export const DEFAULT_BINDINGS: Record<ActionId, ShortcutBinding> = {
   togglePan: { key: " ", mod: false, shift: false, alt: false },
   openExport: { key: "e", mod: true, shift: false, alt: false },
   openShortcutsPanel: { key: "/", mod: true, shift: false, alt: false },
+  // H1 — discoverability. The command palette is the keyboard-first
+  // entry point to every action below; Cmd/Ctrl+K matches the
+  // universal convention (VSCode, Linear, Slack, Notion, Figma's
+  // quick actions) so a first-time user reaches for it instinctively.
+  openCommandPalette: { key: "k", mod: true, shift: false, alt: false },
+  // The five G-wave capabilities each get a direct binding so power
+  // users can jump straight in without the palette. Mod+Shift+letter
+  // keeps them clear of the bare-letter tool shortcuts and the
+  // Mod+letter editing shortcuts; the only existing Mod+Shift binding
+  // is Redo (Mod+Shift+Z), so t/y/e/r/g are all free.
+  openTemplates: { key: "t", mod: true, shift: true, alt: false },
+  openTheme: { key: "y", mod: true, shift: true, alt: false },
+  openElements: { key: "e", mod: true, shift: true, alt: false },
+  openMagicResize: { key: "r", mod: true, shift: true, alt: false },
+  openAiGenerate: { key: "g", mod: true, shift: true, alt: false },
   copy: { key: "c", mod: true, shift: false, alt: false },
   paste: { key: "v", mod: true, shift: false, alt: false },
   // Phase D — Alignment shortcuts. Figma-style: Alt+letter for align,
@@ -220,6 +241,41 @@ export const ACTION_META: Record<ActionId, ActionMeta> = {
     label: "Open Shortcuts Panel",
     category: "panels",
     description: "Open the keyboard shortcuts panel.",
+  },
+  openCommandPalette: {
+    label: "Command palette",
+    category: "panels",
+    description:
+      "Open the fuzzy command palette to search and run any action, panel, or create flow.",
+  },
+  openTemplates: {
+    label: "Browse templates",
+    category: "panels",
+    description:
+      "Open the template picker to start from a ready-made, forkable design.",
+  },
+  openTheme: {
+    label: "Open Theme & Brand kit",
+    category: "panels",
+    description:
+      "Open the Theme panel to restyle the whole document with a theme or brand kit.",
+  },
+  openElements: {
+    label: "Browse elements",
+    category: "panels",
+    description: "Open the Elements library to insert shapes, icons, and assets.",
+  },
+  openMagicResize: {
+    label: "Magic resize",
+    category: "panels",
+    description:
+      "Reflow the active artboard's design into other sizes and aspect ratios.",
+  },
+  openAiGenerate: {
+    label: "Generate with AI",
+    category: "panels",
+    description:
+      "Generate a themed, multi-page design from a short brief (works offline).",
   },
   copy: {
     label: "Copy",

@@ -162,6 +162,14 @@ export interface RightPanelProps {
    * but the "Start session" button is disabled.
    */
   project?: ProjectInfo | null;
+  /**
+   * H1 — programmatic tab focus. The command palette opens a tab
+   * (e.g. "theme") by bumping `seq`; the effect below switches the
+   * active tab on each new `seq`, clamped to the tabs currently
+   * visible for the active `mode`. `seq` (not just the tab id) lets
+   * the same tab be re-requested after the user clicked away.
+   */
+  requestedTab?: { tab: RightPanelTab; seq: number } | null;
 }
 
 export function RightPanel({
@@ -179,6 +187,7 @@ export function RightPanel({
   onInteractionsChanged,
   onThemeApplied,
   project,
+  requestedTab,
 }: RightPanelProps): JSX.Element {
   const showAccessibility = mode === "design" || mode === "inspect";
   const showInteraction = mode === "prototype";
@@ -283,6 +292,22 @@ export function RightPanel({
     const next = clampTabToAvailable(tab, TABS);
     if (next !== tab) setTab(next);
   }, [TABS, tab]);
+  // Honour programmatic tab-open requests from the host (command
+  // palette). Keyed on the request `seq` so the same tab can be
+  // re-opened repeatedly. The requested tab is clamped to the
+  // currently-visible strip: callers must already have put the editor
+  // in a mode where the tab exists (e.g. the palette forces `design`
+  // mode before requesting the mode-gated `theme` tab), but the clamp
+  // is a defensive no-op-to-first fallback if the tab is unavailable.
+  const requestedSeq = requestedTab?.seq ?? null;
+  useEffect(() => {
+    if (requestedTab === null || requestedTab === undefined) return;
+    setTab(clampTabToAvailable(requestedTab.tab, TABS));
+    // Only react to a new `seq`; `requestedTab`/`TABS` are read fresh
+    // inside. Including them would re-fire on unrelated re-renders
+    // (new object literal) or mode flips (new TABS identity).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [requestedSeq]);
   // Keep the active pill scrolled into view in the single-row strip.
   //
   // Devin Review on `3007b71` (PR #33) pointed out that with the

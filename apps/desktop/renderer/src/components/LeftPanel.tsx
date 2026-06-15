@@ -107,6 +107,14 @@ export interface LeftPanelProps {
   // assets bridge keep compiling; the Elements tab still browses the
   // catalog, it just no-ops the click insert.
   onInsertElement?: (assetId: string) => void;
+
+  // H1 — programmatic tab focus. The command palette (and the editor
+  // chrome buttons) open a specific tab by bumping `seq` to a fresh
+  // value; an effect below switches `tab` on each change. `seq`
+  // (rather than just the tab id) lets the same tab be re-requested
+  // after the user has clicked away — a plain value prop would not
+  // re-fire. Optional so existing callers are unaffected.
+  requestedTab?: { tab: LeftPanelTab; seq: number } | null;
 }
 
 export function LeftPanel({
@@ -137,8 +145,25 @@ export function LeftPanel({
   onComponentDetach,
   onDesignSystemStatus,
   onInsertElement,
+  requestedTab,
 }: LeftPanelProps): JSX.Element {
   const [tab, setTab] = useState<LeftPanelTab>("layers");
+  // Honour programmatic tab-open requests from the host (command
+  // palette / chrome buttons). Keyed on the request `seq` so the
+  // same tab can be re-opened repeatedly; the tab id is read off the
+  // latest request inside the effect. All LeftPanel tabs are always
+  // available, so no clamping is needed (unlike RightPanel).
+  const requestedSeq = requestedTab?.seq ?? null;
+  useEffect(() => {
+    if (requestedTab === null || requestedTab === undefined) return;
+    setTab(requestedTab.tab);
+    // `requestedTab` is intentionally omitted from the deps: we react
+    // only to a new `seq`, reading the (possibly newer) tab id off the
+    // ref-fresh prop. Including the object would re-fire on unrelated
+    // parent re-renders that pass a new object literal with the same
+    // seq.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [requestedSeq]);
   // Phase 6 Tasks 27-28 — case-insensitive name filter for the
   // layers tab. Empty string means "show everything". Kept local to
   // LeftPanel so other tabs aren't filtered by the layer query.

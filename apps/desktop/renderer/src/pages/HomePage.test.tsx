@@ -93,6 +93,28 @@ function renderHome() {
   };
 }
 
+function renderHomeWithTemplates() {
+  let browseCount = 0;
+  const utils = render(
+    <HomePage
+      onOpenEditor={() => {}}
+      onOpenProject={() => {}}
+      onBriefApplied={() => {}}
+      onBrowseTemplates={() => {
+        browseCount += 1;
+      }}
+    />,
+  );
+  return {
+    ...utils,
+    captured: {
+      get browseCount() {
+        return browseCount;
+      },
+    },
+  };
+}
+
 describe("HomePage", () => {
   it("renders all 8 job-first create options", () => {
     renderHome();
@@ -172,5 +194,31 @@ describe("HomePage", () => {
     expect(savedPrefs).not.toBeNull();
     expect(savedPrefs!.onboarding.completed).toBe(true);
     expect(screen.queryByTestId("kcreate-welcome-modal")).toBeNull();
+  });
+
+  // H1 — empty-Home discoverability. With no recent projects the
+  // "Recent projects" section must route a brand-new user into the
+  // template gallery rather than dead-ending on an empty grid.
+  it("offers a Browse templates CTA in the empty Recent-projects state", async () => {
+    const stub = kcreateStub();
+    stub.override("recentProjects.list", () => []);
+
+    const { captured } = renderHomeWithTemplates();
+    const cta = await waitFor(() =>
+      screen.getByTestId("kcreate-recents-empty-browse-templates"),
+    );
+    fireEvent.click(cta);
+    expect(captured.browseCount).toBe(1);
+  });
+
+  it("hides the empty-Recents template CTA when no onBrowseTemplates is wired", async () => {
+    const stub = kcreateStub();
+    stub.override("recentProjects.list", () => []);
+
+    renderHome();
+    await flushAsync();
+    expect(
+      screen.queryByTestId("kcreate-recents-empty-browse-templates"),
+    ).toBeNull();
   });
 });

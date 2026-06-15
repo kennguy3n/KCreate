@@ -1,6 +1,8 @@
 import { useTheme } from "../styles/ThemeProvider";
 import { colors, font, radius, spacing } from "../styles/tokens";
 import type { ToolId } from "../pages/EditorPage";
+import { formatBinding } from "../shortcuts/registry";
+import { useShortcutBindings } from "../shortcuts/useShortcuts";
 import { Icon, type IconName } from "./Icon";
 
 export type EditorMode =
@@ -61,7 +63,7 @@ export function defaultPanelForMode(mode: EditorMode): RightPanelFocus {
   return PANEL_FOR_MODE[mode];
 }
 
-const TOOL_LABELS: Record<
+export const TOOL_LABELS: Record<
   ToolId,
   { label: string; key: string; icon: IconName }
 > = {
@@ -85,6 +87,15 @@ export interface TopBarProps {
   onRedo: () => void;
   onExport: () => void;
   onBackHome: () => void;
+  // H1 — discoverability entry points. Optional so existing callers /
+  // tests that don't wire them still compile; each button only renders
+  // when its handler is supplied.
+  /** Open the fuzzy command palette (mouse entry for Cmd/Ctrl+K). */
+  onOpenCommandPalette?: () => void;
+  /** Open the template picker ("Start from a template"). */
+  onOpenTemplates?: () => void;
+  /** Open the AI themed-design brief ("Generate with AI"). */
+  onOpenAiGenerate?: () => void;
 }
 
 export function TopBar(props: TopBarProps): JSX.Element {
@@ -100,9 +111,15 @@ export function TopBar(props: TopBarProps): JSX.Element {
     onRedo,
     onExport,
     onBackHome,
+    onOpenCommandPalette,
+    onOpenTemplates,
+    onOpenAiGenerate,
   } = props;
   const tools = toolsForMode(mode);
   const { themeId, toggle: toggleTheme } = useTheme();
+  // Live binding so the palette hint reflects any user rebind rather
+  // than a hard-coded "⌘K".
+  const bindings = useShortcutBindings();
   return (
     <header
       style={{
@@ -129,6 +146,21 @@ export function TopBar(props: TopBarProps): JSX.Element {
         </span>
       </button>
       <span style={{ fontWeight: 600 }}>{projectName}</span>
+      {onOpenCommandPalette ? (
+        <button
+          type="button"
+          onClick={onOpenCommandPalette}
+          style={paletteTriggerStyle}
+          aria-label="Open command palette"
+          title="Search actions, panels, and tools"
+        >
+          <Icon name="command" size={14} />
+          <span>Search</span>
+          <kbd style={paletteHintStyle}>
+            {formatBinding(bindings.openCommandPalette)}
+          </kbd>
+        </button>
+      ) : null}
       <nav
         style={{
           display: "flex",
@@ -176,6 +208,34 @@ export function TopBar(props: TopBarProps): JSX.Element {
         ))}
       </div>
       <div style={{ flex: 1 }} />
+      {onOpenTemplates ? (
+        <button
+          type="button"
+          onClick={onOpenTemplates}
+          style={pillButton(false)}
+          aria-label="Browse templates"
+          title="Start from a template"
+        >
+          <span style={ICON_ROW_STYLE}>
+            <Icon name="layout" size={14} />
+            Templates
+          </span>
+        </button>
+      ) : null}
+      {onOpenAiGenerate ? (
+        <button
+          type="button"
+          onClick={onOpenAiGenerate}
+          style={pillButton(false)}
+          aria-label="Generate with AI"
+          title="Generate a themed design with AI"
+        >
+          <span style={ICON_ROW_STYLE}>
+            <Icon name="sparkles" size={14} />
+            Generate
+          </span>
+        </button>
+      ) : null}
       <button
         type="button"
         onClick={onUndo}
@@ -218,6 +278,29 @@ export function TopBar(props: TopBarProps): JSX.Element {
     </header>
   );
 }
+
+const paletteTriggerStyle: React.CSSProperties = {
+  display: "inline-flex",
+  alignItems: "center",
+  gap: 6,
+  marginLeft: spacing.sm,
+  border: `1px solid ${colors.border}`,
+  background: colors.bgSoft,
+  color: colors.textMuted,
+  borderRadius: radius.pill,
+  padding: "5px 10px",
+  fontSize: 12,
+  fontWeight: 500,
+  cursor: "pointer",
+};
+
+const paletteHintStyle: React.CSSProperties = {
+  fontSize: 10,
+  border: `1px solid ${colors.border}`,
+  borderRadius: radius.sm,
+  padding: "0 5px",
+  color: colors.textMuted,
+};
 
 function pillButton(primary: boolean, disabled = false): React.CSSProperties {
   return {

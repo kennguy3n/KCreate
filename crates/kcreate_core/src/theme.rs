@@ -39,7 +39,11 @@ use crate::project::{BrandKit, DesignTokens, FontRef, NamedColor, TypographyToke
 /// whole lightness range. Used by both [`assign_roles`] and
 /// [`Theme::derive_from_palette`] so the apply-path and the derive-path agree
 /// on what counts as "a colour".
-const NEUTRAL_CHROMA: f32 = 0.12;
+///
+/// Also reused by [`crate::assets::recolor`] as the single source of truth for
+/// the neutral-vs-chromatic threshold, so theme derivation and asset recolour
+/// classify greys identically.
+pub const NEUTRAL_CHROMA: f32 = 0.12;
 
 /// Semantic colour roles a theme assigns. The restyle maps every painted
 /// colour in a document onto one of these, then paints the theme's colour for

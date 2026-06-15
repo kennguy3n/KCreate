@@ -17,6 +17,7 @@
 use serde::Serialize;
 
 mod catalog;
+pub mod recolor;
 
 /// A bundled vector asset: stable id, display name, category, search
 /// tags, and the embedded SVG source.
@@ -33,6 +34,10 @@ pub struct AssetDef {
     pub name: &'static str,
     /// Top-level category this asset is filed under.
     pub category: AssetCategory,
+    /// Finer sub-category within [`category`](Self::category) (e.g.
+    /// `"Navigation"`, `"Weather"`, `"Charts"`). Lets the panel section a
+    /// large catalogue with per-group counts. Non-empty for every asset.
+    pub group: &'static str,
     /// Lower-case search tags (synonyms / related terms).
     pub tags: &'static [&'static str],
     /// Embedded SVG source. Used both for the panel thumbnail and as the
@@ -151,11 +156,14 @@ pub fn list_category(category: AssetCategory) -> Vec<&'static AssetDef> {
 ///
 /// Every term must match *something* on the asset (AND across terms),
 /// but a term can match the name, id, category, or any tag (OR within a
-/// term). The per-term contribution rewards stronger matches — an exact
-/// name hit beats a name prefix, which beats a substring, which beats a
-/// tag hit — so the most obvious results float to the top.
+/// term). The per-term contribution rewards stronger matches, from
+/// highest to lowest: exact name/id (100), name/id prefix (60), exact
+/// tag (50), name substring (40), exact group/sub-category (35), tag
+/// prefix (30), exact category (25), tag substring (20). So the most
+/// obvious results float to the top.
 fn score(asset: &AssetDef, terms: &[String]) -> Option<i32> {
     let name = asset.name.to_lowercase();
+    let group = asset.group.to_lowercase();
     let mut total = 0i32;
     for term in terms {
         let mut best = 0i32;
@@ -176,6 +184,9 @@ fn score(asset: &AssetDef, terms: &[String]) -> Option<i32> {
             } else if tag.contains(term.as_str()) {
                 best = best.max(20);
             }
+        }
+        if group == *term {
+            best = best.max(35);
         }
         if asset.category.slug() == term || asset.category.label().to_lowercase() == *term {
             best = best.max(25);
@@ -228,9 +239,20 @@ mod tests {
 
     #[test]
     fn catalogue_is_non_empty_and_sized() {
-        // The workstream targets 60-120 curated assets.
+        // The H3 workstream expands the curated set to 400+ assets.
         let n = catalog().len();
-        assert!(n >= 60, "expected >= 60 bundled assets, got {n}");
+        assert!(n >= 400, "expected >= 400 bundled assets, got {n}");
+    }
+
+    #[test]
+    fn every_asset_has_a_group() {
+        for a in catalog() {
+            assert!(
+                !a.group.is_empty(),
+                "asset {:?} has an empty sub-category group",
+                a.id
+            );
+        }
     }
 
     #[test]
@@ -306,6 +328,31 @@ mod tests {
         assert!(
             hits.iter().any(|a| a.id == "search"),
             "tag search should surface the search icon"
+        );
+    }
+
+    #[test]
+    fn arrow_synonyms_all_surface_arrows() {
+        // "arrow", "chevron", and "next" must all reach the arrow set —
+        // tags/synonyms wire the directional vocabulary together.
+        for q in ["arrow", "chevron", "next"] {
+            let hits = search(q, None);
+            assert!(
+                hits.iter().any(|a| a.id == "arrow-right"),
+                "query {q:?} should surface arrow-right"
+            );
+        }
+    }
+
+    #[test]
+    fn search_ranks_exact_name_above_group_and_category() {
+        // "icons" is a category; an asset literally named to match a term
+        // should still outrank a bare category/group hit. Here a tag-exact
+        // hit (chart-bar via "bar") beats a category-only hit.
+        let hits = search("chart", Some(AssetCategory::Icons));
+        assert!(
+            hits.iter().any(|a| a.id == "chart-bar"),
+            "chart query should surface chart-bar"
         );
     }
 

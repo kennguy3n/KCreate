@@ -21,9 +21,11 @@ use chrono::Utc;
 use serde::Serialize;
 use uuid::Uuid;
 
+use kcreate_core::assets::recolor::Recolor;
 use kcreate_core::assets::{self, AssetCategory, AssetDef, CategoryInfo};
-use kcreate_core::node::{Bounds, FillStyle, Node, NodeStyle, NodeType, StrokeStyle};
+use kcreate_core::node::{Bounds, FillStyle, Node, NodeStyle, NodeType, RgbaColor, StrokeStyle};
 use kcreate_core::operation::Operation;
+use kcreate_core::theme::ColorRole;
 use kcreate_vector::{import_svg_styled, StyledPath};
 
 use crate::document::{slot, sync_scene_locked, DocumentBridgeError, Result};
@@ -128,6 +130,45 @@ fn place(styled: &StyledPath, scale: f64, tx: f64, ty: f64) -> Result<PlacedPath
     })
 }
 
+/// Every solid fill / stroke colour painted by `placed`, so a
+/// [`Recolor`] plan can decide whether the asset is mono- or
+/// multi-colour before any colour is changed.
+fn collect_palette(placed: &[PlacedPath]) -> Vec<RgbaColor> {
+    let mut palette = Vec::with_capacity(placed.len() * 2);
+    for p in placed {
+        if let FillStyle::Solid(c) = p.fill {
+            palette.push(c);
+        }
+        if let Some(s) = &p.stroke {
+            palette.push(s.color);
+        }
+    }
+    palette
+}
+
+/// Apply a [`Recolor`] plan to one placed path's solid fill and stroke,
+/// in place. Geometry is untouched, so the node stays fully editable.
+fn recolor_placed(p: &mut PlacedPath, plan: &Recolor) {
+    if let FillStyle::Solid(c) = p.fill {
+        p.fill = FillStyle::Solid(plan.apply(c));
+    }
+    if let Some(stroke) = &mut p.stroke {
+        stroke.color = plan.apply(stroke.color);
+    }
+}
+
+/// The colour inserted assets should be recoloured toward: the
+/// document's theme/brand **accent**, falling back to **primary**.
+/// `None` when no theme is set (a brand-new document) — the neutral
+/// default, where assets keep their authored colours.
+fn theme_accent(ws: &crate::document::Workspace) -> Option<RgbaColor> {
+    let colors = &ws.project.design_tokens.colors;
+    colors
+        .get(ColorRole::Accent.as_str())
+        .or_else(|| colors.get(ColorRole::Primary.as_str()))
+        .copied()
+}
+
 /// Insert the bundled asset `asset_id` onto the canvas as editable
 /// vector node(s).
 ///
@@ -139,6 +180,14 @@ fn place(styled: &StyledPath, scale: f64, tx: f64, ty: f64) -> Result<PlacedPath
 /// [`NodeType::GroupLayer`], recorded as **one** undoable
 /// `assets_insert` [`Operation`]. `parent_id` is the container (an
 /// artboard, typically); `None` attaches to the document root.
+///
+/// If the document carries a theme/brand palette, the placed fills and
+/// strokes are recoloured toward its accent (see
+/// [`kcreate_core::assets::recolor`]) before the nodes are created — a
+/// single-colour asset becomes the accent, a multi-colour illustration
+/// has only its chromatic colours rotated to the accent hue. With no
+/// theme set the asset keeps its authored colours. Recolour only changes
+/// paint, never geometry, so every leaf stays an editable vector node.
 pub fn insert(
     asset_id: &str,
     parent_id: Option<Uuid>,
@@ -226,10 +275,13 @@ pub(crate) fn insert_styled_paths(
     let tx = x - src.min_x * scale;
     let ty = y - src.min_y * scale;
 
-    let placed: Vec<PlacedPath> = styled
+    let mut placed: Vec<PlacedPath> = styled
         .iter()
         .map(|s| place(s, scale, tx, ty))
         .collect::<Result<Vec<_>>>()?;
+    // Authored palette, captured before any recolour, drives the
+    // mono-vs-multi decision in the recolour plan.
+    let palette = collect_palette(&placed);
 
     // Overall world bounds of the placed artwork (for the group node).
     let mut world = kcreate_vector::BoundingBox::empty();
@@ -252,6 +304,17 @@ pub(crate) fn insert_styled_paths(
 
     let mut guard = slot().write();
     let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
+
+    // Theme/brand-aware recolour toward the document's accent. Read the
+    // accent only now that the workspace is locked, then apply the
+    // (infallible) recolour to the already-placed paths — keeping the
+    // fallible geometry serialization out of the critical section.
+    if let Some(accent) = theme_accent(ws) {
+        let plan = Recolor::plan(&palette, accent);
+        for p in &mut placed {
+            recolor_placed(p, &plan);
+        }
+    }
 
     // Group wrapper so the whole asset is one selectable/movable unit.
     let mut group = Node::new(NodeType::GroupLayer, name);
@@ -317,8 +380,9 @@ mod tests {
     use super::*;
     use crate::document::{
         document_node_fill, document_undo, document_update_node, project_close, project_create,
-        reset_for_tests, with_workspace, UpdateNodeProps,
+        reset_for_tests, with_workspace, with_workspace_mut, UpdateNodeProps,
     };
+    use kcreate_core::color::srgb_to_hsl;
     use kcreate_core::node::RgbaColor;
     use serial_test::serial;
 
@@ -328,6 +392,31 @@ mod tests {
 
     fn uuid(s: &str) -> Uuid {
         Uuid::parse_str(s).expect("uuid")
+    }
+
+    /// Set the document's theme accent so inserts recolour toward it.
+    fn set_accent(accent: RgbaColor) {
+        with_workspace_mut(|ws| {
+            ws.project
+                .design_tokens
+                .colors
+                .insert(ColorRole::Accent.as_str().to_string(), accent);
+            Ok(())
+        })
+        .expect("set accent");
+    }
+
+    /// The solid fill of a leaf node, or `None` if it has no solid fill.
+    fn leaf_solid_fill(node: Uuid) -> Option<RgbaColor> {
+        with_workspace(|ws| {
+            Ok(
+                match ws.project.document.get_node(node).expect("leaf").style.fill {
+                    FillStyle::Solid(c) => Some(c),
+                    _ => None,
+                },
+            )
+        })
+        .expect("read fill")
     }
 
     fn op_log_len() -> usize {
@@ -487,6 +576,90 @@ mod tests {
             Ok(())
         })
         .expect("inspect");
+
+        project_close();
+    }
+
+    #[test]
+    #[serial]
+    fn insert_without_theme_keeps_authored_colours() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("assets-neutral", dir.path()).expect("create");
+
+        // A brand-new project has no theme palette, so the asset must
+        // keep its authored fill — the neutral default.
+        let inserted = insert("star", None, 0.0, 0.0, 64.0).expect("insert");
+        let authored = leaf_solid_fill(uuid(&inserted.node_ids[0])).expect("solid fill");
+
+        let accent = RgbaColor::new(0.85, 0.15, 0.15, 1.0);
+        assert!(
+            (authored.r - accent.r).abs() > 0.05 || (authored.b - accent.b).abs() > 0.05,
+            "authored star fill should not already equal the accent ({authored:?})"
+        );
+
+        project_close();
+    }
+
+    #[test]
+    #[serial]
+    fn insert_recolours_mono_asset_to_the_theme_accent() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("assets-mono-recolor", dir.path()).expect("create");
+
+        let accent = RgbaColor::new(0.85, 0.15, 0.15, 1.0);
+        set_accent(accent);
+
+        // "star" is a single-fill shape (mono) → it adopts the accent
+        // outright, while staying an editable vector node.
+        let inserted = insert("star", None, 0.0, 0.0, 64.0).expect("insert");
+        for nid in &inserted.node_ids {
+            let fill = leaf_solid_fill(uuid(nid)).expect("solid fill");
+            assert_eq!(
+                fill, accent,
+                "mono asset leaf should be recoloured to the accent"
+            );
+        }
+
+        project_close();
+    }
+
+    #[test]
+    #[serial]
+    fn insert_recolours_multi_asset_chromatics_to_accent_hue() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("assets-multi-recolor", dir.path()).expect("create");
+
+        let accent = RgbaColor::new(0.85, 0.15, 0.15, 1.0); // red, hue ~0°
+        let (accent_hue, _, _) = srgb_to_hsl(accent.r, accent.g, accent.b);
+        set_accent(accent);
+
+        // "mountain-sun" is a flat multi-colour illustration whose paths
+        // are all chromatic → every fill rotates to the accent hue while
+        // keeping its own lightness (so the composition survives).
+        let inserted = insert("mountain-sun", None, 0.0, 0.0, 120.0).expect("insert");
+        let mut chromatic_leaves = 0;
+        for nid in &inserted.node_ids {
+            let Some(fill) = leaf_solid_fill(uuid(nid)) else {
+                continue;
+            };
+            let (h, s, _) = srgb_to_hsl(fill.r, fill.g, fill.b);
+            if s < 0.05 {
+                continue; // a (recoloured) near-grey carries no meaningful hue
+            }
+            chromatic_leaves += 1;
+            let dh = (h - accent_hue).abs();
+            assert!(
+                !(5.0..=355.0).contains(&dh),
+                "chromatic leaf hue {h} should match the accent hue {accent_hue}"
+            );
+        }
+        assert!(
+            chromatic_leaves >= 2,
+            "expected several chromatic leaves to recolour, got {chromatic_leaves}"
+        );
 
         project_close();
     }

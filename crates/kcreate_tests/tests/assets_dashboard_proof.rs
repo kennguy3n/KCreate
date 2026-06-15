@@ -134,8 +134,8 @@ fn elements_library_composes_a_recognizable_dashboard_png() {
     insert("chart-line", COLS[1] + 70.0, CHART_Y + 70.0, 240.0);
     insert("chart-pie", COLS[2] + 70.0, CHART_Y + 70.0, 240.0);
     // Flat illustrations (multi-colour, left as authored).
-    insert("rocket", COLS[3] + 110.0, CHART_Y + 60.0, 200.0);
-    insert("trophy", COLS[3] + 60.0, CHART_Y + 250.0, 90.0);
+    insert("rocket-illo", COLS[3] + 110.0, CHART_Y + 60.0, 200.0);
+    insert("trophy-illo", COLS[3] + 60.0, CHART_Y + 250.0, 90.0);
 
     // --- export the composed document to PNG -----------------------------
     let out = Path::new(env!("CARGO_TARGET_TMPDIR")).join("g6_elements_dashboard.png");

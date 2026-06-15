@@ -1,17 +1,98 @@
-import { useCallback, useState } from "react";
+import { lazy, Suspense, useCallback, useState } from "react";
 
+import { ErrorBoundary } from "./components/ErrorBoundary";
 import { openScratchProject } from "./lib/scratchProject";
 import { templateResolverFor } from "./lib/templates";
-import { EditorPage } from "./pages/EditorPage";
 import { CREATE_OPTIONS, HomePage } from "./pages/HomePage";
 import type { BriefApplyResult, ProjectInfo } from "../../shared/scene";
 
 export { openScratchProject };
 
+// Lazily load the editor surface so the first paint stays light. The
+// home screen is the entry point and needs none of the editor's weight
+// — EditorPage transitively pulls the canvas/present pipeline, every
+// overlay and panel, the tool state machine, and the shortcut registry,
+// which together dominate the renderer bundle. Splitting it into its own
+// chunk (fetched on first navigation into the editor) keeps the initial
+// download small on-device. `EditorPage` is a named export, so map it
+// onto the `default` export that `React.lazy` expects.
+const EditorPage = lazy(() =>
+  import("./pages/EditorPage").then((m) => ({ default: m.EditorPage })),
+);
+
 type Route =
   | { kind: "home" }
   | { kind: "editor"; project: ProjectInfo }
   | { kind: "error"; message: string };
+
+// Minimal, theme-aware placeholder shown while the editor chunk is being
+// fetched (see the lazy `EditorPage` import above). Kept tiny and
+// dependency-free so it stays in the initial bundle and paints instantly
+// on the brief gap between navigation and the chunk resolving.
+function EditorLoading(): JSX.Element {
+  return (
+    <div
+      style={{
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        height: "100%",
+        background: "var(--kc-bg-canvas)",
+        color: "var(--kc-text-muted)",
+        fontSize: 14,
+      }}
+    >
+      Loading editor…
+    </div>
+  );
+}
+
+// Recovery surface shown if the lazy editor chunk fails to load or the
+// editor throws while mounting. Without this, a chunk-load failure
+// (corrupted asar, a file missing after a partial update) would throw
+// past the root and leave a blank white screen with no way out. Offers
+// a reload (which re-fetches the chunk — the reliable recovery, since
+// `React.lazy` caches a rejected import for the process lifetime) and a
+// way back to the home screen.
+function EditorLoadError(props: {
+  message: string;
+  onReload: () => void;
+  onBackHome: () => void;
+}): JSX.Element {
+  return (
+    <div
+      style={{
+        display: "flex",
+        flexDirection: "column",
+        alignItems: "center",
+        justifyContent: "center",
+        gap: 16,
+        height: "100%",
+        padding: 32,
+        textAlign: "center",
+        background: "var(--kc-bg-canvas)",
+        color: "var(--kc-text)",
+      }}
+    >
+      <div style={{ maxWidth: 420 }}>
+        <div style={{ fontSize: 15, fontWeight: 600, marginBottom: 8 }}>
+          The editor failed to load
+        </div>
+        <div style={{ fontSize: 13, color: "var(--kc-text-muted)" }}>
+          {props.message}
+        </div>
+      </div>
+      <div style={{ display: "flex", gap: 8 }}>
+        <button type="button" onClick={props.onReload}>
+          Reload
+        </button>
+        <button type="button" onClick={props.onBackHome}>
+          Back to home
+        </button>
+      </div>
+    </div>
+  );
+}
 
 export function App(): JSX.Element {
   const [route, setRoute] = useState<Route>({ kind: "home" });
@@ -175,7 +256,22 @@ export function App(): JSX.Element {
 
   if (route.kind === "editor") {
     return (
-      <EditorPage project={route.project} onBackHome={handleBackHome} />
+      <ErrorBoundary
+        fallback={(error, reset) => (
+          <EditorLoadError
+            message={error.message}
+            onReload={() => window.location.reload()}
+            onBackHome={() => {
+              reset();
+              handleBackHome();
+            }}
+          />
+        )}
+      >
+        <Suspense fallback={<EditorLoading />}>
+          <EditorPage project={route.project} onBackHome={handleBackHome} />
+        </Suspense>
+      </ErrorBoundary>
     );
   }
   if (route.kind === "error") {

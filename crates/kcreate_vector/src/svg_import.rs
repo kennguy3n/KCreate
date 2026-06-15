@@ -54,11 +54,17 @@ pub struct StyledPath {
 /// Parse an SVG byte buffer into a flat list of [`VectorPath`]s. Groups
 /// are flattened, transforms are baked in. Paint is discarded — callers
 /// that need fill / stroke colours should use [`import_svg_styled`].
+///
+/// This deliberately does **not** route through [`import_svg_styled`]:
+/// resolving each path's fill / stroke paint (gradient-stop lookup,
+/// opacity folding, stroke-width scale) is wasted work when the caller
+/// only wants geometry. Both entry points share the tree parse and the
+/// recursive walk; they differ only in the per-path converter.
 pub fn import_svg(svg_data: &[u8]) -> Result<Vec<VectorPath>, SvgImportError> {
-    Ok(import_svg_styled(svg_data)?
-        .into_iter()
-        .map(|s| s.path)
-        .collect())
+    let tree = parse_tree(svg_data)?;
+    let mut out = Vec::new();
+    walk_paths(tree.root(), &mut out, &convert_path);
+    Ok(out)
 }
 
 /// Parse an SVG byte buffer into a flat list of [`StyledPath`]s,
@@ -66,11 +72,9 @@ pub fn import_svg(svg_data: &[u8]) -> Result<Vec<VectorPath>, SvgImportError> {
 /// flattened and transforms (including scale) are baked into both the
 /// geometry and the stroke width.
 pub fn import_svg_styled(svg_data: &[u8]) -> Result<Vec<StyledPath>, SvgImportError> {
-    let opt = usvg::Options::default();
-    let tree =
-        usvg::Tree::from_data(svg_data, &opt).map_err(|e| SvgImportError::Parse(e.to_string()))?;
+    let tree = parse_tree(svg_data)?;
     let mut out = Vec::new();
-    walk_group(tree.root(), &mut out);
+    walk_paths(tree.root(), &mut out, &convert_path_styled);
     Ok(out)
 }
 
@@ -80,13 +84,28 @@ pub fn import_svg_file(path: &Path) -> Result<Vec<VectorPath>, SvgImportError> {
     import_svg(&bytes)
 }
 
-fn walk_group(group: &usvg::Group, out: &mut Vec<StyledPath>) {
+/// Parse raw SVG bytes into a usvg tree with the default options.
+fn parse_tree(svg_data: &[u8]) -> Result<usvg::Tree, SvgImportError> {
+    let opt = usvg::Options::default();
+    usvg::Tree::from_data(svg_data, &opt).map_err(|e| SvgImportError::Parse(e.to_string()))
+}
+
+/// Recursively flatten a usvg group, pushing one `T` per `<path>` for
+/// which `convert` yields `Some`. Generic over the per-path converter
+/// so geometry-only ([`convert_path`]) and styled ([`convert_path_styled`])
+/// imports share the same traversal without the geometry-only path
+/// paying for discarded paint resolution.
+fn walk_paths<T>(
+    group: &usvg::Group,
+    out: &mut Vec<T>,
+    convert: &impl Fn(&usvg::Path) -> Option<T>,
+) {
     for node in group.children() {
         match node {
-            usvg::Node::Group(g) => walk_group(g, out),
+            usvg::Node::Group(g) => walk_paths(g, out, convert),
             usvg::Node::Path(p) => {
-                if let Some(styled) = convert_path_styled(p) {
-                    out.push(styled);
+                if let Some(v) = convert(p) {
+                    out.push(v);
                 }
             }
             // Images / text are not vector paths; Phase 0 ignores them.

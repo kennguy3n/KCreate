@@ -405,8 +405,19 @@ mod tests {
         .expect("verify recolor");
         assert!(document_node_fill(first_child).expect("fill").is_some());
 
-        // The insert itself is undoable.
-        assert!(document_undo().expect("undo").is_some());
+        // The recolor above went through `document_update_node`, which
+        // mutates the node in place WITHOUT recording an operation
+        // (graph edits are host-driven — see `document_update_node`).
+        // The pending undo is therefore still the insert, so a single
+        // `document_undo` reverts the whole asset. Assert it is exactly
+        // the `assets_insert` op covering the group + every leaf, rather
+        // than relying on the call merely returning `Some`.
+        let outcome = document_undo().expect("undo").expect("an op to undo");
+        assert_eq!(outcome.command, "assets_insert");
+        assert!(outcome.affected_nodes.contains(&group));
+        for nid in &inserted.node_ids {
+            assert!(outcome.affected_nodes.contains(&uuid(nid)));
+        }
 
         project_close();
     }

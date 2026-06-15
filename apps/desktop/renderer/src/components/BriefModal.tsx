@@ -4,21 +4,25 @@
 // LLM prompt; the model fills out an artboard preset, palette, and
 // starter layers."
 //
-// Flow:
-//   1. User opens the modal from the Home page and types a brief
-//      (e.g. "I need a poster for a coffee-shop grand opening").
-//   2. We hit the local LLM sidecar via `window.kcreate.llm.chat`
-//      with a prompt that asks for STRICT JSON matching
-//      `BriefPlan` (see shared/scene.ts).
-//   3. The reply is parsed + validated; on success we hand the
-//      plan to `window.kcreate.phase9.briefToProject` which
-//      atomically creates the project, applies the brand kit,
-//      and lays down the starter layers. The bridge returns the
-//      new project id + artboard id which the parent uses to
-//      navigate into the editor.
+// The modal hosts two complementary flows:
 //
-// The user can always cancel; nothing is persisted until the
-// bridge call completes successfully.
+//   * "Themed design" (G3 — Gamma-style): pick Deck vs One-pager and a
+//     built-in professional theme, type a brief, hit Generate, and land
+//     on a fully populated, themed, multi-page document. This path is
+//     deterministic (`kcreate_ai::themed_deck`) so it works with NO
+//     local model loaded; when the sidecar is ready the user can opt in
+//     to LLM enrichment, which expands the brief into a structured
+//     outline and falls back to the deterministic planner on any
+//     failure.
+//   * "Single artboard" (the original Phase 9 flow): the local LLM fills
+//     out one artboard preset + palette + starter layers. Requires the
+//     sidecar to be ready.
+//
+// Both flows materialise a scratch project when the modal is opened
+// from the Home page (no workspace mounted yet) before mutating the
+// document, mirroring the "Create new" tile in `App.handleOpenEditor`.
+// The user can always cancel; nothing is persisted until the bridge
+// call completes successfully.
 
 import { useCallback, useEffect, useMemo, useState } from "react";
 import type {
@@ -26,6 +30,11 @@ import type {
   BriefApplyResult,
   BriefPlan,
   LlmMessage,
+  ThemedDesignApplyResult,
+  ThemedDesignFormat,
+  ThemedDesignOptions,
+  ThemedOnePagerSize,
+  ThemeId,
 } from "../../../shared/scene";
 import { openScratchProject } from "../lib/scratchProject";
 import { colors, font, radius, spacing } from "../styles/tokens";
@@ -49,11 +58,43 @@ function normalizePresetName(name: string): string {
   return out;
 }
 
+/**
+ * Built-in themes offered by the Gamma-style generator. The `id`
+ * values are the wire strings the bridge accepts
+ * (`kcreate_ai::themed_deck::ThemeId`); the swatches are a small,
+ * representative slice of each theme's palette (background, primary,
+ * secondary) used purely to preview the look in the picker. The
+ * authoritative palette lives in Rust — these never reach the
+ * document.
+ */
+const THEME_OPTIONS: ReadonlyArray<{
+  id: ThemeId;
+  label: string;
+  swatches: readonly [string, string, string];
+}> = [
+  { id: "midnight", label: "Midnight", swatches: ["#0B1020", "#7C5CFF", "#34D8FF"] },
+  { id: "sunrise", label: "Sunrise", swatches: ["#FBF6EF", "#E2603B", "#F2A65A"] },
+  { id: "forest", label: "Forest", swatches: ["#FFFFFF", "#1E8E5A", "#0F6E6E"] },
+  { id: "ember", label: "Ember", swatches: ["#121212", "#FF8A3D", "#FFC857"] },
+  { id: "slate", label: "Slate", swatches: ["#EEF2F7", "#2563EB", "#0EA5E9"] },
+];
+
 interface BriefModalProps {
   open: boolean;
   onClose: () => void;
-  /** Fired with the bridge result so the shell can navigate. */
-  onApplied: (result: BriefApplyResult) => void;
+  /**
+   * Whether the local LLM sidecar is ready. Gates the "Single
+   * artboard" plan flow (which has no deterministic fallback) and the
+   * optional "expand with AI" toggle on the themed flow. The themed
+   * generator itself works regardless.
+   */
+  llmReady?: boolean;
+  /**
+   * Fired with the bridge result so the shell can navigate into the
+   * editor. The shell only uses it to confirm an apply happened (it
+   * re-reads project info itself), so either result shape is accepted.
+   */
+  onApplied: (result: BriefApplyResult | ThemedDesignApplyResult) => void;
 }
 
 /**
@@ -151,6 +192,8 @@ function parseBriefPlan(
   return { artboardPreset, palette: palette as string[], starterLayers };
 }
 
+type Mode = "themed" | "plan";
+
 type Phase =
   | { kind: "idle" }
   | { kind: "asking" }
@@ -161,11 +204,20 @@ type Phase =
 export function BriefModal({
   open,
   onClose,
+  llmReady = false,
   onApplied,
 }: BriefModalProps): JSX.Element | null {
   const [brief, setBrief] = useState("");
   const [phase, setPhase] = useState<Phase>({ kind: "idle" });
   const [presets, setPresets] = useState<readonly ArtboardPreset[]>([]);
+  const [mode, setMode] = useState<Mode>("themed");
+
+  // Themed-generator controls.
+  const [format, setFormat] = useState<ThemedDesignFormat>("deck");
+  const [themeId, setThemeId] = useState<ThemeId>("midnight");
+  const [onePagerSize, setOnePagerSize] = useState<ThemedOnePagerSize>("a4");
+  const [sectionCount, setSectionCount] = useState<number | null>(null);
+  const [useLlm, setUseLlm] = useState(false);
 
   // Fetch the real preset list whenever the modal is opened so the
   // SYSTEM_PROMPT enumerates names that the Rust bridge will actually
@@ -195,6 +247,66 @@ export function BriefModal({
     [presets],
   );
 
+  const switchMode = useCallback((next: Mode) => {
+    setMode(next);
+    setPhase({ kind: "idle" });
+  }, []);
+
+  // Shared: guarantee an open workspace before any bridge mutation.
+  // The Rust apply paths mutate the currently mounted workspace; when
+  // the modal is opened from `HomePage` no project is open yet so we
+  // materialise a fresh scratch one (same convention as the "Create
+  // new" tile). When opened from inside the editor a workspace already
+  // exists and we compose onto it instead of replacing it.
+  const ensureProject = useCallback(async () => {
+    const current = await window.kcreate.document.getProjectInfo();
+    if (current === null) {
+      await openScratchProject();
+    }
+  }, []);
+
+  const generateThemed = useCallback(async () => {
+    if (brief.trim().length === 0) return;
+    setPhase({ kind: "applying" });
+    try {
+      await ensureProject();
+      const options: ThemedDesignOptions = {
+        format,
+        themeId,
+        useLlm: useLlm && llmReady,
+      };
+      if (format === "onePager") {
+        options.onePagerSize = onePagerSize;
+      }
+      if (sectionCount !== null) {
+        options.sectionCount = sectionCount;
+      }
+      const result = await window.kcreate.phase10.aiGenerateThemedDesign(
+        brief,
+        options,
+      );
+      // Reset before notifying: the parent typically navigates and
+      // unmounts this modal, so post-`onApplied` state writes would be
+      // pointless. Resetting first means a re-mount sees a clean state.
+      setBrief("");
+      setPhase({ kind: "idle" });
+      onApplied(result);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      setPhase({ kind: "error", message });
+    }
+  }, [
+    brief,
+    ensureProject,
+    format,
+    themeId,
+    onePagerSize,
+    sectionCount,
+    useLlm,
+    llmReady,
+    onApplied,
+  ]);
+
   const submitBrief = useCallback(async () => {
     if (presets.length === 0) {
       setPhase({
@@ -218,40 +330,26 @@ export function BriefModal({
     }
   }, [brief, presets, presetKeys]);
 
-  const applyPlan = useCallback(async (plan: BriefPlan) => {
-    setPhase({ kind: "applying" });
-    try {
-      // The Rust `brief_to_project` bridge mutates the currently
-      // mounted workspace. When the modal is opened from
-      // `HomePage` no project is yet open, so we materialise a
-      // fresh scratch project before applying the plan — same
-      // scratch convention used by the "Create new" tile in
-      // `App.handleOpenEditor`. When the modal is opened from
-      // inside the editor a workspace is already mounted and we
-      // skip the scratch step so the brief composes onto the
-      // existing project instead of replacing it.
-      const current = await window.kcreate.document.getProjectInfo();
-      if (current === null) {
-        await openScratchProject();
+  const applyPlan = useCallback(
+    async (plan: BriefPlan) => {
+      setPhase({ kind: "applying" });
+      try {
+        await ensureProject();
+        const result = await window.kcreate.phase9.briefToProject(plan);
+        setBrief("");
+        setPhase({ kind: "idle" });
+        onApplied(result);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        setPhase({ kind: "error", message });
       }
-      const result = await window.kcreate.phase9.briefToProject(plan);
-      // Reset local state *before* notifying the parent. The parent
-      // typically navigates to the editor in response to
-      // `onApplied`, which unmounts this modal — calling
-      // `setBrief` / `setPhase` afterwards is a no-op on the
-      // unmounted component (silent in React 18, but pointless).
-      // Resetting first means a subsequent re-mount sees a clean
-      // initial state without depending on React 18 semantics.
-      setBrief("");
-      setPhase({ kind: "idle" });
-      onApplied(result);
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      setPhase({ kind: "error", message });
-    }
-  }, [onApplied]);
+    },
+    [ensureProject, onApplied],
+  );
 
   if (!open) return null;
+
+  const busy = phase.kind === "asking" || phase.kind === "applying";
 
   return (
     <div style={overlayStyle} role="dialog" aria-modal="true">
@@ -268,30 +366,115 @@ export function BriefModal({
             ×
           </button>
         </header>
+
+        <div style={modeRowStyle} role="tablist" aria-label="Generation mode">
+          <button
+            type="button"
+            role="tab"
+            aria-selected={mode === "themed"}
+            onClick={() => switchMode("themed")}
+            disabled={busy}
+            style={mode === "themed" ? modeTabActiveStyle : modeTabStyle}
+            data-testid="kcreate-brief-mode-themed"
+          >
+            Themed design
+          </button>
+          <button
+            type="button"
+            role="tab"
+            aria-selected={mode === "plan"}
+            onClick={() => switchMode("plan")}
+            disabled={busy || !llmReady}
+            title={
+              llmReady
+                ? undefined
+                : "Start the local LLM in Model Manager to enable this mode"
+            }
+            style={mode === "plan" ? modeTabActiveStyle : modeTabStyle}
+            data-testid="kcreate-brief-mode-plan"
+          >
+            Single artboard
+          </button>
+        </div>
+
         <p style={helpTextStyle}>
-          Describe the design you want. The local model will propose
-          an artboard size, a palette, and a few starter layers. Nothing
-          is created until you click <strong>Apply</strong>.
+          {mode === "themed" ? (
+            <>
+              Describe your topic and pick a format + theme. KCreate lays
+              out a complete, themed multi-page design you can refine.
+              Works offline; turn on <strong>Expand with AI</strong> to let
+              the local model flesh out the content.
+            </>
+          ) : (
+            <>
+              Describe the design you want. The local model will propose an
+              artboard size, a palette, and a few starter layers. Nothing
+              is created until you click <strong>Apply</strong>.
+            </>
+          )}
         </p>
+
         <textarea
           value={brief}
           onChange={(e) => setBrief(e.target.value)}
-          placeholder="e.g. A friendly poster for a coffee-shop grand opening on Saturday."
-          rows={5}
+          placeholder={
+            mode === "themed"
+              ? "e.g. Pitch deck for an indie coffee roaster opening its first café."
+              : "e.g. A friendly poster for a coffee-shop grand opening on Saturday."
+          }
+          rows={4}
           style={textareaStyle}
-          disabled={phase.kind === "asking" || phase.kind === "applying"}
+          disabled={busy}
           data-testid="kcreate-brief-textarea"
         />
+
+        {mode === "themed" && (
+          <ThemedControls
+            format={format}
+            onFormat={setFormat}
+            themeId={themeId}
+            onTheme={setThemeId}
+            onePagerSize={onePagerSize}
+            onOnePagerSize={setOnePagerSize}
+            sectionCount={sectionCount}
+            onSectionCount={setSectionCount}
+            useLlm={useLlm}
+            onUseLlm={setUseLlm}
+            llmReady={llmReady}
+            disabled={busy}
+          />
+        )}
+
         {phase.kind === "error" && (
           <p role="alert" style={errorStyle} data-testid="kcreate-brief-error">
             {phase.message}
           </p>
         )}
-        {phase.kind === "preview" && (
+        {mode === "plan" && phase.kind === "preview" && (
           <BriefPreview plan={phase.plan} />
         )}
+
         <footer style={footerStyle}>
-          {phase.kind === "preview" ? (
+          {mode === "themed" ? (
+            <>
+              <button
+                type="button"
+                onClick={onClose}
+                style={secondaryButtonStyle}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={() => void generateThemed()}
+                disabled={brief.trim().length === 0 || busy}
+                style={primaryButtonStyle}
+                data-testid="kcreate-themed-generate"
+              >
+                {phase.kind === "applying" ? "Generating…" : "Generate"}
+              </button>
+            </>
+          ) : phase.kind === "preview" ? (
             <>
               <button
                 type="button"
@@ -311,21 +494,13 @@ export function BriefModal({
             </>
           ) : (
             <>
-              <button
-                type="button"
-                onClick={onClose}
-                style={secondaryButtonStyle}
-              >
+              <button type="button" onClick={onClose} style={secondaryButtonStyle}>
                 Cancel
               </button>
               <button
                 type="button"
                 onClick={() => void submitBrief()}
-                disabled={
-                  brief.trim().length === 0 ||
-                  phase.kind === "asking" ||
-                  phase.kind === "applying"
-                }
+                disabled={brief.trim().length === 0 || busy}
                 style={primaryButtonStyle}
                 data-testid="kcreate-brief-submit"
               >
@@ -339,6 +514,167 @@ export function BriefModal({
           )}
         </footer>
       </div>
+    </div>
+  );
+}
+
+function ThemedControls({
+  format,
+  onFormat,
+  themeId,
+  onTheme,
+  onePagerSize,
+  onOnePagerSize,
+  sectionCount,
+  onSectionCount,
+  useLlm,
+  onUseLlm,
+  llmReady,
+  disabled,
+}: {
+  format: ThemedDesignFormat;
+  onFormat: (f: ThemedDesignFormat) => void;
+  themeId: ThemeId;
+  onTheme: (t: ThemeId) => void;
+  onePagerSize: ThemedOnePagerSize;
+  onOnePagerSize: (s: ThemedOnePagerSize) => void;
+  sectionCount: number | null;
+  onSectionCount: (n: number | null) => void;
+  useLlm: boolean;
+  onUseLlm: (v: boolean) => void;
+  llmReady: boolean;
+  disabled: boolean;
+}): JSX.Element {
+  return (
+    <div style={controlsStyle} data-testid="kcreate-themed-controls">
+      <div style={controlRowStyle}>
+        <span style={controlLabelStyle}>Format</span>
+        <div style={segmentStyle}>
+          <button
+            type="button"
+            onClick={() => onFormat("deck")}
+            disabled={disabled}
+            aria-pressed={format === "deck"}
+            style={format === "deck" ? segmentButtonActiveStyle : segmentButtonStyle}
+            data-testid="kcreate-themed-format-deck"
+          >
+            Deck
+          </button>
+          <button
+            type="button"
+            onClick={() => onFormat("onePager")}
+            disabled={disabled}
+            aria-pressed={format === "onePager"}
+            style={
+              format === "onePager" ? segmentButtonActiveStyle : segmentButtonStyle
+            }
+            data-testid="kcreate-themed-format-onepager"
+          >
+            One-pager
+          </button>
+        </div>
+      </div>
+
+      <div style={controlRowStyle}>
+        <span style={controlLabelStyle}>Theme</span>
+        <div style={themeRowStyle}>
+          {THEME_OPTIONS.map((t) => (
+            <button
+              key={t.id}
+              type="button"
+              onClick={() => onTheme(t.id)}
+              disabled={disabled}
+              aria-pressed={themeId === t.id}
+              title={t.label}
+              style={{
+                ...themeChipStyle,
+                outline:
+                  themeId === t.id ? `2px solid ${colors.accent}` : "none",
+                outlineOffset: 2,
+              }}
+              data-testid={`kcreate-themed-theme-${t.id}`}
+            >
+              <span style={themeChipSwatchesStyle}>
+                {t.swatches.map((c, i) => (
+                  <span
+                    key={`${t.id}-${i}`}
+                    style={{ ...themeChipSwatchStyle, background: c }}
+                  />
+                ))}
+              </span>
+              <span style={themeChipLabelStyle}>{t.label}</span>
+            </button>
+          ))}
+        </div>
+      </div>
+
+      <div style={controlRowInlineStyle}>
+        {format === "onePager" && (
+          <label style={inlineFieldStyle}>
+            <span style={controlLabelStyle}>Page size</span>
+            <select
+              value={onePagerSize}
+              onChange={(e) =>
+                onOnePagerSize(e.target.value as ThemedOnePagerSize)
+              }
+              disabled={disabled}
+              style={selectStyle}
+              data-testid="kcreate-themed-size"
+            >
+              <option value="a4">A4</option>
+              <option value="letter">Letter</option>
+              <option value="square">Square</option>
+            </select>
+          </label>
+        )}
+        <label style={inlineFieldStyle}>
+          <span style={controlLabelStyle}>
+            {format === "deck" ? "Slides" : "Sections"}
+          </span>
+          <select
+            value={sectionCount === null ? "auto" : String(sectionCount)}
+            onChange={(e) =>
+              onSectionCount(
+                e.target.value === "auto" ? null : Number(e.target.value),
+              )
+            }
+            disabled={disabled}
+            style={selectStyle}
+            data-testid="kcreate-themed-sections"
+          >
+            <option value="auto">Auto</option>
+            {(format === "deck"
+              ? [4, 5, 6, 7, 8, 9, 10]
+              : [3, 4, 5, 6]
+            ).map((n) => (
+              <option key={n} value={n}>
+                {n}
+              </option>
+            ))}
+          </select>
+        </label>
+      </div>
+
+      <label
+        style={{
+          ...checkboxRowStyle,
+          opacity: llmReady ? 1 : 0.55,
+        }}
+        title={
+          llmReady
+            ? "Use the local model to expand the brief into richer content"
+            : "Start the local LLM in Model Manager to enable AI enrichment"
+        }
+      >
+        <input
+          type="checkbox"
+          checked={useLlm && llmReady}
+          onChange={(e) => onUseLlm(e.target.checked)}
+          disabled={disabled || !llmReady}
+          data-testid="kcreate-themed-usellm"
+        />
+        <span>Expand with AI {llmReady ? "" : "(model not loaded)"}</span>
+      </label>
     </div>
   );
 }
@@ -427,6 +763,34 @@ const iconButtonStyle: React.CSSProperties = {
   lineHeight: 1,
 };
 
+const modeRowStyle: React.CSSProperties = {
+  display: "flex",
+  gap: spacing.xs,
+  background: colors.bgSoft,
+  border: `1px solid ${colors.border}`,
+  borderRadius: radius.sm,
+  padding: 3,
+};
+
+const modeTabStyle: React.CSSProperties = {
+  flex: 1,
+  background: "transparent",
+  color: colors.textMuted,
+  border: "none",
+  borderRadius: radius.sm,
+  padding: "7px 10px",
+  fontSize: 13,
+  fontWeight: 600,
+  cursor: "pointer",
+};
+
+const modeTabActiveStyle: React.CSSProperties = {
+  ...modeTabStyle,
+  background: colors.bg,
+  color: colors.text,
+  boxShadow: "0 1px 2px rgba(0,0,0,0.18)",
+};
+
 const helpTextStyle: React.CSSProperties = {
   margin: 0,
   fontSize: 13,
@@ -442,6 +806,119 @@ const textareaStyle: React.CSSProperties = {
   borderRadius: radius.sm,
   color: colors.text,
   resize: "vertical",
+};
+
+const controlsStyle: React.CSSProperties = {
+  display: "flex",
+  flexDirection: "column",
+  gap: spacing.md,
+  padding: spacing.md,
+  background: colors.bgSoft,
+  border: `1px solid ${colors.border}`,
+  borderRadius: radius.card,
+};
+
+const controlRowStyle: React.CSSProperties = {
+  display: "flex",
+  flexDirection: "column",
+  gap: spacing.xs,
+};
+
+const controlRowInlineStyle: React.CSSProperties = {
+  display: "flex",
+  gap: spacing.md,
+  flexWrap: "wrap",
+};
+
+const inlineFieldStyle: React.CSSProperties = {
+  display: "flex",
+  flexDirection: "column",
+  gap: spacing.xs,
+};
+
+const controlLabelStyle: React.CSSProperties = {
+  fontSize: 11,
+  textTransform: "uppercase",
+  letterSpacing: 0.5,
+  color: colors.textMuted,
+};
+
+const segmentStyle: React.CSSProperties = {
+  display: "flex",
+  gap: spacing.xs,
+};
+
+const segmentButtonStyle: React.CSSProperties = {
+  flex: 1,
+  background: colors.bg,
+  color: colors.text,
+  border: `1px solid ${colors.border}`,
+  borderRadius: radius.sm,
+  padding: "7px 12px",
+  fontSize: 13,
+  cursor: "pointer",
+};
+
+const segmentButtonActiveStyle: React.CSSProperties = {
+  ...segmentButtonStyle,
+  background: colors.accent,
+  color: "white",
+  border: `1px solid ${colors.accent}`,
+  fontWeight: 600,
+};
+
+const themeRowStyle: React.CSSProperties = {
+  display: "flex",
+  gap: spacing.sm,
+  flexWrap: "wrap",
+};
+
+const themeChipStyle: React.CSSProperties = {
+  display: "flex",
+  flexDirection: "column",
+  alignItems: "center",
+  gap: 4,
+  background: colors.bg,
+  border: `1px solid ${colors.border}`,
+  borderRadius: radius.sm,
+  padding: 6,
+  cursor: "pointer",
+};
+
+const themeChipSwatchesStyle: React.CSSProperties = {
+  display: "flex",
+  borderRadius: 4,
+  overflow: "hidden",
+  border: `1px solid ${colors.border}`,
+};
+
+const themeChipSwatchStyle: React.CSSProperties = {
+  width: 18,
+  height: 24,
+};
+
+const themeChipLabelStyle: React.CSSProperties = {
+  fontSize: 11,
+  color: colors.text,
+};
+
+const selectStyle: React.CSSProperties = {
+  fontFamily: font.family,
+  fontSize: 13,
+  padding: "6px 8px",
+  background: colors.bg,
+  border: `1px solid ${colors.border}`,
+  borderRadius: radius.sm,
+  color: colors.text,
+};
+
+const checkboxRowStyle: React.CSSProperties = {
+  display: "flex",
+  alignItems: "center",
+  gap: spacing.xs,
+  fontSize: 13,
+  color: colors.text,
+  cursor: "pointer",
 };
 
 const errorStyle: React.CSSProperties = {

@@ -385,6 +385,45 @@ describe("ThemePanel", () => {
     expect(stub.calls.some((c) => c.method === "theme.apply")).toBe(false);
   });
 
+  it("blocks brand-kit apply when selection scope has nothing selected", async () => {
+    // Regression for the review note: the per-kit "Apply" button routes
+    // through the same scope-aware path as the main "Apply theme" button,
+    // so it must be disabled (and a click a no-op) when selection scope is
+    // active with an empty selection — otherwise the kit apply silently
+    // produces a zero-node no-op ("Applied … 0 nodes") with no feedback.
+    const stub = kcreateStub();
+    const kit = emptyKit("kit-13", "Scoped Kit");
+    stub.override("brandKit.list", () => [kit]);
+    stub.override("theme.fromBrandKit", () =>
+      makeTheme("kit-theme", "Kit Theme"),
+    );
+    stub.override("theme.applyToSelection", () => REPORT);
+
+    const statuses: (string | null)[] = [];
+    render(<ThemePanel selectedIds={[]} onStatus={(m) => statuses.push(m)} />);
+    await flushAsync();
+
+    fireEvent.click(screen.getByRole("radio", { name: "Selection (0)" }));
+
+    const applyKit = screen.getByLabelText("Apply Scoped Kit");
+    expect(
+      applyKit,
+      "the per-kit Apply button is disabled in blocked selection scope",
+    ).toBeDisabled();
+    fireEvent.click(applyKit);
+    await flushAsync();
+
+    // Neither the derive nor the selection apply should have run, and no
+    // zero-node "Applied …" status should have been surfaced.
+    expect(stub.calls.some((c) => c.method === "theme.fromBrandKit")).toBe(
+      false,
+    );
+    expect(stub.calls.some((c) => c.method === "theme.applyToSelection")).toBe(
+      false,
+    );
+    expect(statuses.some((s) => s?.startsWith("Applied "))).toBe(false);
+  });
+
   // --- H5: derive a theme from an uploaded image -------------------------
 
   it("derives a theme from an uploaded image and selects it", async () => {

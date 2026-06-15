@@ -131,9 +131,12 @@ function pickFileBytes(
         finish(null);
         return;
       }
-      void file.arrayBuffer().then((buf) => {
-        finish({ name: file.name, bytes: new Uint8Array(buf) });
-      });
+      void file
+        .arrayBuffer()
+        .then((buf) => {
+          finish({ name: file.name, bytes: new Uint8Array(buf) });
+        })
+        .catch(() => finish(null));
     };
     window.addEventListener(
       "focus",
@@ -390,6 +393,16 @@ export function ThemePanel({
 
   const handleApplyKit = useCallback(
     (kit: BrandKit) => {
+      // Brand-kit applies honour the scope toggle exactly like the main
+      // "Apply theme" button, so guard the empty-selection case here too
+      // rather than letting performApply route to a zero-node no-op.
+      if (selectionScopeBlocked) {
+        setError(
+          "Select one or more nodes on the canvas to restyle a selection, " +
+            "or switch the scope to “Whole document”.",
+        );
+        return;
+      }
       void (async () => {
         const label = `Theme: applying brand kit “${kit.name}”…`;
         setBusy(true);
@@ -414,7 +427,7 @@ export function ThemePanel({
         }
       })();
     },
-    [performApply, onStatus],
+    [performApply, onStatus, selectionScopeBlocked],
   );
 
   // Draft mutators (operate on the working copy; persisted on Save).
@@ -867,10 +880,10 @@ export function ThemePanel({
               </button>
               <button
                 type="button"
-                disabled={busy}
+                disabled={busy || selectionScopeBlocked}
                 onClick={() => handleApplyKit(kit)}
                 aria-label={`Apply ${kit.name}`}
-                style={miniButtonStyle(busy)}
+                style={miniButtonStyle(busy || selectionScopeBlocked)}
               >
                 Apply
               </button>
@@ -1123,10 +1136,10 @@ export function ThemePanel({
             </button>
             <button
               type="button"
-              disabled={busy}
+              disabled={busy || selectionScopeBlocked}
               onClick={() => handleApplyKit(draftKit)}
               aria-label="Apply brand kit as theme"
-              style={secondaryButtonStyle(busy)}
+              style={secondaryButtonStyle(busy || selectionScopeBlocked)}
             >
               Apply as theme
             </button>

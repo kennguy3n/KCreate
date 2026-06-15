@@ -13934,4 +13934,380 @@ mod tests {
 
         project_close();
     }
+
+    /// Real-design before/after proof. Builds a recognizable SaaS
+    /// landing-page hero (nav, logo, headline + subhead, primary &
+    /// secondary CTAs, a hero panel, a three-card feature row — real
+    /// copy, never blank rectangles), then drives the *real*
+    /// `document_apply_theme` entry point and renders the workspace
+    /// document to PNG through the production `scene_sync` translation +
+    /// `export_png_to_bytes` (CPU tiny-skia, no GPU). Asserts both themed
+    /// renders are valid PNGs and differ pixel-wise over the SAME layout.
+    /// Set `KCREATE_PROOF_DIR` to also drop the artifacts to disk.
+    #[test]
+    #[serial]
+    fn apply_theme_renders_recognizable_before_after_proof() {
+        use kcreate_core::node::{Bounds, StrokeStyle};
+
+        const W: u32 = 1200;
+        const H: u32 = 800;
+
+        // World-space rectangle path the renderer can rasterise. Matches
+        // the geometry `canvas_create_rect` attaches; `node_translation`
+        // stays at the identity origin so the path renders in place.
+        fn rect_path(x: f64, y: f64, w: f64, h: f64) -> serde_json::Value {
+            let path = kcreate_vector::VectorPath::new(vec![
+                kcreate_vector::PathSegment::MoveTo(kcreate_vector::PathPoint::new(x, y)),
+                kcreate_vector::PathSegment::LineTo(kcreate_vector::PathPoint::new(x + w, y)),
+                kcreate_vector::PathSegment::LineTo(kcreate_vector::PathPoint::new(x + w, y + h)),
+                kcreate_vector::PathSegment::LineTo(kcreate_vector::PathPoint::new(x, y + h)),
+                kcreate_vector::PathSegment::Close,
+            ]);
+            serde_json::to_value(&path).expect("path json")
+        }
+
+        // A solid-filled rect, child of `parent`.
+        fn rect(
+            parent: Uuid,
+            name: &str,
+            (x, y, w, h): (f64, f64, f64, f64),
+            fill: RgbaColor,
+            radius: f64,
+        ) -> Uuid {
+            let mut guard = slot().write();
+            let ws = guard.as_mut().expect("open");
+            let mut node = Node::new(NodeType::VectorLayer, name.to_string());
+            node.parent_id = Some(parent);
+            node.bounds = Bounds {
+                x,
+                y,
+                width: w,
+                height: h,
+            };
+            node.style.fill = FillStyle::Solid(fill);
+            node.style.corner_radius = radius;
+            node.metadata.insert(
+                crate::scene_sync::VECTOR_PATH_METADATA_KEY.to_string(),
+                rect_path(x, y, w, h),
+            );
+            ws.project.document.insert_node(node).expect("rect")
+        }
+
+        // An outlined (stroked, no fill) rounded rect — exercises the
+        // stroke remap path of the restyle.
+        fn outline(
+            parent: Uuid,
+            name: &str,
+            (x, y, w, h): (f64, f64, f64, f64),
+            stroke: RgbaColor,
+            radius: f64,
+        ) -> Uuid {
+            let mut guard = slot().write();
+            let ws = guard.as_mut().expect("open");
+            let mut node = Node::new(NodeType::VectorLayer, name.to_string());
+            node.parent_id = Some(parent);
+            node.bounds = Bounds {
+                x,
+                y,
+                width: w,
+                height: h,
+            };
+            node.style.fill = FillStyle::None;
+            node.style.stroke = Some(StrokeStyle {
+                color: stroke,
+                width: 2.0,
+                ..StrokeStyle::default()
+            });
+            node.style.corner_radius = radius;
+            node.metadata.insert(
+                crate::scene_sync::VECTOR_PATH_METADATA_KEY.to_string(),
+                rect_path(x, y, w, h),
+            );
+            ws.project.document.insert_node(node).expect("outline")
+        }
+
+        // A text layer carrying canonical `TextLayerMeta`; its colour is
+        // `node.style.fill`.
+        fn text(
+            parent: Uuid,
+            name: &str,
+            (x, y, w, h): (f64, f64, f64, f64),
+            copy: &str,
+            font: &str,
+            size: f32,
+            fill: RgbaColor,
+        ) -> Uuid {
+            let meta = kcreate_export::TextLayerMeta {
+                text: copy.to_string(),
+                font_family: font.to_string(),
+                font_size: size,
+            };
+            let mut guard = slot().write();
+            let ws = guard.as_mut().expect("open");
+            let mut node = Node::new(NodeType::TextLayer, name.to_string());
+            node.parent_id = Some(parent);
+            node.bounds = Bounds {
+                x,
+                y,
+                width: w,
+                height: h,
+            };
+            node.style.fill = FillStyle::Solid(fill);
+            node.metadata.insert(
+                crate::scene_sync::TEXT_LAYER_METADATA_KEY.to_string(),
+                serde_json::to_value(&meta).expect("meta"),
+            );
+            ws.project.document.insert_node(node).expect("text")
+        }
+
+        // Translate the open document to a renderer scene and PNG-encode
+        // it through the same export path the host uses.
+        fn render(width: u32, height: u32) -> Vec<u8> {
+            let guard = slot().read();
+            let ws = guard.as_ref().expect("open");
+            let mut sync = crate::scene_sync::SceneSync::new();
+            let scene = sync.sync_document_to_scene_borrowed(&ws.project.document, None, &[]);
+            drop(guard);
+            export_png_to_bytes(
+                &scene,
+                &PngExportOptions {
+                    width,
+                    height,
+                    scale: 1.0,
+                    background: None,
+                },
+            )
+            .expect("png")
+        }
+
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("theme_proof", dir.path()).expect("create");
+
+        // Source-design palette.
+        let white = rgb8(0xFF, 0xFF, 0xFF);
+        let slate_50 = rgb8(0xF1, 0xF5, 0xF9);
+        let navy = rgb8(0x0F, 0x17, 0x2A);
+        let muted = rgb8(0x47, 0x55, 0x69);
+        let blue = rgb8(0x25, 0x63, 0xEB);
+        let green = rgb8(0x10, 0xB9, 0x81);
+        let amber = rgb8(0xF5, 0x9E, 0x0B);
+
+        let page = {
+            let mut guard = slot().write();
+            let ws = guard.as_mut().expect("open");
+            ws.project
+                .document
+                .insert_node(Node::new(NodeType::Page, "Page".to_string()))
+                .expect("page")
+        };
+        let artboard = {
+            let mut guard = slot().write();
+            let ws = guard.as_mut().expect("open");
+            let mut a = Node::new(NodeType::Artboard, "Landing".to_string());
+            a.parent_id = Some(page);
+            a.bounds = Bounds {
+                x: 0.0,
+                y: 0.0,
+                width: f64::from(W),
+                height: f64::from(H),
+            };
+            a.style.fill = FillStyle::Solid(white);
+            ws.project.document.insert_node(a).expect("artboard")
+        };
+
+        // Top navigation.
+        rect(
+            artboard,
+            "Nav bar",
+            (0.0, 0.0, f64::from(W), 72.0),
+            slate_50,
+            0.0,
+        );
+        rect(artboard, "Logo mark", (48.0, 20.0, 32.0, 32.0), blue, 8.0);
+        text(
+            artboard,
+            "Brand",
+            (92.0, 26.0, 160.0, 24.0),
+            "KCreate",
+            "Poppins",
+            20.0,
+            navy,
+        );
+        text(
+            artboard,
+            "Nav Home",
+            (840.0, 28.0, 80.0, 20.0),
+            "Home",
+            "Inter",
+            16.0,
+            muted,
+        );
+        text(
+            artboard,
+            "Nav Pricing",
+            (936.0, 28.0, 90.0, 20.0),
+            "Pricing",
+            "Inter",
+            16.0,
+            muted,
+        );
+        text(
+            artboard,
+            "Nav Docs",
+            (1052.0, 28.0, 70.0, 20.0),
+            "Docs",
+            "Inter",
+            16.0,
+            muted,
+        );
+
+        // Hero copy.
+        text(
+            artboard,
+            "Headline",
+            (80.0, 150.0, 680.0, 150.0),
+            "Design at the speed of thought",
+            "Poppins",
+            52.0,
+            navy,
+        );
+        text(
+            artboard,
+            "Subhead",
+            (80.0, 320.0, 700.0, 90.0),
+            "Restyle your whole document in a single click.",
+            "Inter",
+            22.0,
+            muted,
+        );
+
+        // Calls to action.
+        rect(
+            artboard,
+            "Primary CTA",
+            (80.0, 440.0, 220.0, 60.0),
+            blue,
+            12.0,
+        );
+        text(
+            artboard,
+            "Primary CTA label",
+            (118.0, 458.0, 160.0, 26.0),
+            "Get started",
+            "Inter",
+            18.0,
+            white,
+        );
+        outline(
+            artboard,
+            "Secondary CTA",
+            (320.0, 440.0, 200.0, 60.0),
+            blue,
+            12.0,
+        );
+        text(
+            artboard,
+            "Secondary CTA label",
+            (352.0, 458.0, 160.0, 26.0),
+            "Watch demo",
+            "Inter",
+            18.0,
+            blue,
+        );
+
+        // Hero illustration panel.
+        rect(
+            artboard,
+            "Hero panel",
+            (820.0, 150.0, 320.0, 360.0),
+            green,
+            20.0,
+        );
+        rect(
+            artboard,
+            "Hero accent",
+            (860.0, 200.0, 120.0, 120.0),
+            amber,
+            60.0,
+        );
+
+        // Feature card row.
+        let cards = [
+            (80.0_f64, "Themes", "Switch the entire look instantly."),
+            (470.0, "Brand kits", "Pin your palette and fonts."),
+            (860.0, "Reversible", "Every restyle is one undo away."),
+        ];
+        for (cx, title, body) in cards {
+            rect(artboard, "Card", (cx, 600.0, 260.0, 150.0), slate_50, 16.0);
+            rect(
+                artboard,
+                "Card icon",
+                (cx + 24.0, 624.0, 40.0, 40.0),
+                amber,
+                10.0,
+            );
+            text(
+                artboard,
+                "Card title",
+                (cx + 24.0, 680.0, 220.0, 24.0),
+                title,
+                "Poppins",
+                20.0,
+                navy,
+            );
+            text(
+                artboard,
+                "Card body",
+                (cx + 24.0, 712.0, 220.0, 30.0),
+                body,
+                "Inter",
+                15.0,
+                muted,
+            );
+        }
+
+        // Render the source design, then Theme A (daybreak, light) and
+        // Theme B (midnight, dark) over the identical layout.
+        let original = render(W, H);
+        assert!(
+            original.starts_with(&[0x89, b'P', b'N', b'G']),
+            "original is a PNG"
+        );
+
+        let theme_a = Theme::builtin("daybreak").expect("daybreak");
+        document_apply_theme(&theme_a).expect("apply A");
+        let png_a = render(W, H);
+
+        document_undo().expect("undo").expect("undo outcome");
+
+        let theme_b = Theme::builtin("midnight").expect("midnight");
+        document_apply_theme(&theme_b).expect("apply B");
+        let png_b = render(W, H);
+
+        for (label, png) in [("A", &png_a), ("B", &png_b)] {
+            assert!(
+                png.starts_with(&[0x89, b'P', b'N', b'G']),
+                "theme {label} is a PNG"
+            );
+            assert!(
+                png.windows(4).any(|w| w == b"IDAT"),
+                "theme {label} carries an IDAT chunk"
+            );
+        }
+        assert_ne!(
+            png_a, png_b,
+            "two themes must restyle the same layout differently"
+        );
+
+        if let Ok(out) = std::env::var("KCREATE_PROOF_DIR") {
+            let out = std::path::Path::new(&out);
+            std::fs::create_dir_all(out).expect("proof dir");
+            std::fs::write(out.join("hero_original.png"), &original).expect("write original");
+            std::fs::write(out.join("hero_theme_a_daybreak.png"), &png_a).expect("write A");
+            std::fs::write(out.join("hero_theme_b_midnight.png"), &png_b).expect("write B");
+        }
+
+        project_close();
+    }
 }

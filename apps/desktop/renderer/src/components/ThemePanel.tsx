@@ -142,10 +142,10 @@ export function ThemePanel({ onStatus, onApplied }: ThemePanelProps): JSX.Elemen
   }, [loadThemes, loadKits]);
 
   const applyTheme = useCallback(
-    async (theme: Theme) => {
+    async (theme: Theme, statusLabel?: string) => {
       setBusy(true);
       setError(null);
-      onStatus?.(`Theme: applying “${theme.name}”…`);
+      onStatus?.(statusLabel ?? `Theme: applying “${theme.name}”…`);
       try {
         const r = await window.kcreate.theme.apply(theme);
         setReport(r);
@@ -274,16 +274,20 @@ export function ThemePanel({ onStatus, onApplied }: ThemePanelProps): JSX.Elemen
   const handleApplyKit = useCallback(
     (kit: BrandKit) => {
       void (async () => {
+        const label = `Theme: applying brand kit “${kit.name}”…`;
         setBusy(true);
         setError(null);
-        onStatus?.(`Theme: applying brand kit “${kit.name}”…`);
+        onStatus?.(label);
         try {
           const theme = await window.kcreate.theme.fromBrandKit(kit);
-          await applyTheme(theme);
+          // Pass the brand-kit label through so applyTheme's own
+          // "applying…" status doesn't clobber the kit-specific one.
+          await applyTheme(theme, label);
         } catch (e) {
           const msg = errMsg(e);
           setError(msg);
           onStatus?.(`Apply kit failed: ${msg}`);
+        } finally {
           setBusy(false);
         }
       })();

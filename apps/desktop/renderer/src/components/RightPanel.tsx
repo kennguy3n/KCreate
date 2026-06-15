@@ -232,7 +232,7 @@ export function RightPanel({
       // G4 — Theme / Brand Kit instant restyle. Project-scoped (no
       // node selection needed): applies a theme to the whole
       // document in one undoable op.
-      mkTab({ id: "theme", label: "Theme", icon: "palette" }),
+      mkTab({ id: "theme", label: "Theme", icon: "grid-2x2" }),
       mkTab({ id: "publish", label: "Publish", icon: "globe" }),
       mkTab({ id: "encryption", label: "Encryption", icon: "lock" }),
     ],

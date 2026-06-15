@@ -160,4 +160,66 @@ describe("ThemePanel", () => {
     expect(updateCall, "Save should call brandKit.update").toBeDefined();
     expect((updateCall?.args[0] as BrandKit).id).toBe("kit-1");
   });
+
+  it("applies a brand kit as a theme with the kit-specific status", async () => {
+    const stub = kcreateStub();
+    const kit = emptyKit("kit-7", "Acme Brand");
+    const kitTheme = makeTheme("kit-theme", "Kit Theme");
+    stub.override("brandKit.list", () => [kit]);
+    stub.override("theme.fromBrandKit", () => kitTheme);
+    stub.override("theme.apply", () => REPORT);
+
+    const statuses: (string | null)[] = [];
+    let applied = 0;
+    render(
+      <ThemePanel
+        onStatus={(m) => statuses.push(m)}
+        onApplied={() => (applied += 1)}
+      />,
+    );
+    await flushAsync();
+
+    fireEvent.click(screen.getByLabelText("Apply Acme Brand"));
+    await flushAsync();
+
+    // Composed path: derive a theme from the kit, then apply it.
+    const fromKit = stub.calls.find((c) => c.method === "theme.fromBrandKit");
+    expect(fromKit, "should derive a theme from the kit").toBeDefined();
+    expect((fromKit?.args[0] as BrandKit).id).toBe("kit-7");
+    const applyCall = stub.calls.find((c) => c.method === "theme.apply");
+    expect(applyCall, "should apply the kit-derived theme").toBeDefined();
+    expect((applyCall?.args[0] as Theme).id).toBe("kit-theme");
+    expect(applied, "onApplied fires after a successful kit apply").toBe(1);
+
+    // The kit-specific status is surfaced and is NOT clobbered by the
+    // generic per-theme "applying" label (the statusLabel pass-through).
+    expect(statuses).toContain("Theme: applying brand kit “Acme Brand”…");
+    expect(statuses).not.toContain("Theme: applying “Kit Theme”…");
+
+    // `finally { setBusy(false) }` re-enables the control after success.
+    expect(screen.getByLabelText("Apply Acme Brand")).not.toBeDisabled();
+  });
+
+  it("resets busy when applying a brand kit fails", async () => {
+    const stub = kcreateStub();
+    const kit = emptyKit("kit-9", "Broken Kit");
+    stub.override("brandKit.list", () => [kit]);
+    stub.override("theme.fromBrandKit", () => {
+      throw new Error("derive boom");
+    });
+
+    const statuses: (string | null)[] = [];
+    render(<ThemePanel onStatus={(m) => statuses.push(m)} />);
+    await flushAsync();
+
+    fireEvent.click(screen.getByLabelText("Apply Broken Kit"));
+    await flushAsync();
+
+    expect(
+      statuses.some((s) => s?.startsWith("Apply kit failed:")),
+      "failure surfaces an apply-kit error status",
+    ).toBe(true);
+    // The `finally` re-enables the control even on the failure path.
+    expect(screen.getByLabelText("Apply Broken Kit")).not.toBeDisabled();
+  });
 });

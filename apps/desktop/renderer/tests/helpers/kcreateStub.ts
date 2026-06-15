@@ -18,7 +18,11 @@
 // The stub is reinstalled in `beforeEach` so call logs and overrides
 // don't bleed across tests.
 
-import type { Preferences } from "../../../shared/scene";
+import type {
+  ApplyThemeReport,
+  Preferences,
+  Theme,
+} from "../../../shared/scene";
 
 export interface KcreateStubCall {
   /// Dot-path of the method, e.g. "runtime.status", "export.png".
@@ -105,6 +109,50 @@ const defaultPrefs: Preferences = {
   },
 };
 
+// G4 — Theme / Brand Kit. A complete, valid default `Theme` so any
+// test that renders `ThemePanel` and triggers `theme.deriveFromDocument`
+// or `theme.fromBrandKit` without an explicit override receives a
+// well-formed theme (with all seven palette roles + type/spacing/radii
+// scales) rather than `undefined`. Typed via the imported interface so
+// a future field addition is a compile error here, not a silent runtime
+// gap. Sub-structs are snake_case to mirror `kcreate_core::theme`'s
+// default serde, matching the `Theme` wire shape in `shared/scene.ts`.
+const defaultTheme: Theme = {
+  id: "stub-theme",
+  name: "Stub theme",
+  palette: {
+    background: { r: 1, g: 1, b: 1, a: 1 },
+    surface: { r: 0.95, g: 0.96, b: 0.98, a: 1 },
+    primary: { r: 0.15, g: 0.39, b: 0.92, a: 1 },
+    secondary: { r: 0.05, g: 0.65, b: 0.91, a: 1 },
+    accent: { r: 0.96, g: 0.62, b: 0.04, a: 1 },
+    text: { r: 0.06, g: 0.09, b: 0.16, a: 1 },
+    muted: { r: 0.39, g: 0.45, b: 0.55, a: 1 },
+  },
+  type_scale: {
+    body_font: "Inter",
+    heading_font: "Inter",
+    display: 44,
+    heading: 28,
+    body: 16,
+    caption: 12,
+    line_height: 1.4,
+  },
+  spacing: { xs: 4, sm: 8, md: 16, lg: 24, xl: 40 },
+  radii: { none: 0, small: 4, medium: 8, large: 16, full: 9999 },
+};
+
+// G4 — zeroed `theme.apply` report. `ApplyThemeReport` uses camelCase
+// serde, so the keys are camelCase (unlike `Theme`'s sub-structs above).
+const defaultApplyThemeReport: ApplyThemeReport = {
+  themeId: "stub-theme",
+  themeName: "Stub theme",
+  affectedNodes: 0,
+  recoloredFills: 0,
+  recoloredStrokes: 0,
+  restyledText: 0,
+};
+
 const defaultsByMethod: Record<string, () => unknown> = {
   "runtime.status": () => ({
     version: "test",
@@ -126,6 +174,15 @@ const defaultsByMethod: Record<string, () => unknown> = {
   // default to empty so ThemePanel mounts cleanly; tests that
   // exercise selection / apply override with real fixtures.
   "theme.listBuiltins": () => [],
+  // `theme.apply` resolves to a zeroed report; `deriveFromDocument` and
+  // `fromBrandKit` resolve to a complete default `Theme`. Without these,
+  // a test that renders `ThemePanel` and clicks Apply/Derive without an
+  // override would read `undefined.themeName` / `undefined.id`. Spread a
+  // fresh copy per call so a test that mutates the result can't bleed
+  // into the next.
+  "theme.apply": () => ({ ...defaultApplyThemeReport }),
+  "theme.deriveFromDocument": () => ({ ...defaultTheme }),
+  "theme.fromBrandKit": () => ({ ...defaultTheme }),
   "brandKit.list": () => [],
   "brandKit.create": () => "00000000-0000-0000-0000-000000000000",
   "brandKit.update": () => undefined,

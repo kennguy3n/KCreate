@@ -313,6 +313,19 @@ struct ContentSceneCache {
     /// `overlay_watermark` as the producing rebuild left it, so a
     /// follow-up `append_presence_cursors` resumes the same id stream.
     overlay_watermark: u64,
+    /// Whether the full rebuild that produced this cache was given a
+    /// `blob_store`. Raster emit is the one content path whose output
+    /// depends on `blob_store` presence: with `Some` it emits the real
+    /// image, with `None` it emits a coloured placeholder rect. The
+    /// fast path replays cached content *verbatim* and never consults
+    /// `blob_store`, so serving this cache when the caller's
+    /// `blob_store.is_some()` no longer matches would leave a stale
+    /// placeholder (or a stale image) on screen. The fast-path guard
+    /// compares this against the current call's `blob_store.is_some()`
+    /// and falls through to a full rebuild on any transition. Both
+    /// production callers currently always pass `Some`, so this is
+    /// defensive against a future caller that does not.
+    blob_store_present: bool,
 }
 
 #[derive(Debug, Default)]
@@ -643,7 +656,22 @@ impl SceneSync {
         // highlight overlay. The same no-edits invariant the per-node
         // cache already trusts guarantees the cached content is still
         // current; see [`ContentSceneCache`].
-        if !structure_dirty && dirty_ids.is_empty() && self.content_cache.is_some() {
+        //
+        // The cache is only valid when the `blob_store` presence still
+        // matches the rebuild that produced it: raster emit is the one
+        // content path whose output depends on whether a `blob_store`
+        // was supplied (real image vs. placeholder rect), and the fast
+        // path replays content verbatim without consulting it. A
+        // `None`→`Some` (or `Some`→`None`) transition must therefore
+        // force a full rebuild so rasters are re-emitted. See
+        // [`ContentSceneCache::blob_store_present`].
+        if !structure_dirty
+            && dirty_ids.is_empty()
+            && self
+                .content_cache
+                .as_ref()
+                .is_some_and(|cache| cache.blob_store_present == blob_store.is_some())
+        {
             return self.sync_from_content_cache(doc, selection);
         }
         if structure_dirty {
@@ -764,6 +792,7 @@ impl SceneSync {
             content_objects: staged.clone(),
             content_z: z,
             overlay_watermark: self.overlay_watermark,
+            blob_store_present: blob_store.is_some(),
         });
 
         // Selection highlights go on top, sorted by document order so
@@ -2010,6 +2039,61 @@ mod tests {
         assert_eq!(
             cleared.objects, unselected.objects,
             "clearing the selection must return to the content-only scene"
+        );
+    }
+
+    #[test]
+    fn blob_store_presence_transition_busts_fast_path() {
+        // The fast path replays cached content verbatim and never
+        // consults `blob_store`. Raster emit is the one content path
+        // whose output depends on `blob_store` presence (real image vs.
+        // placeholder rect), so a `None`<->`Some` transition between
+        // syncs of an otherwise-unchanged document MUST force a full
+        // rebuild — otherwise a stale placeholder (or stale image)
+        // would persist. This guards the latent-correctness assumption
+        // that both production callers always pass `Some`.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = BlobStore::new(dir.path()).expect("blob store");
+
+        let mut doc = DocumentGraph::new();
+        let path = unit_square_path();
+        doc.insert_node(vector_node(&path)).expect("insert");
+        let mut sync = SceneSync::new();
+
+        // First sync with no blob store: full rebuild, cache records
+        // `blob_store_present == false`.
+        let _ = sync.sync_document_to_scene(&mut doc, None, &[]);
+        assert_eq!(sync.fast_path_hits, 0, "first sync is a full rebuild");
+
+        // Resync of the unchanged document but now WITH a blob store:
+        // the presence flag no longer matches, so the guard must fall
+        // through to a full rebuild rather than replay the cache.
+        let _ = sync.sync_document_to_scene(&mut doc, Some(&store), &[]);
+        assert_eq!(
+            sync.fast_path_hits, 0,
+            "a None->Some blob_store transition must NOT take the fast path"
+        );
+
+        // With the cache now rebuilt under `Some`, an unchanged resync
+        // that still supplies the blob store matches again and replays.
+        let _ = sync.sync_document_to_scene(&mut doc, Some(&store), &[]);
+        assert_eq!(
+            sync.fast_path_hits, 1,
+            "a matching Some blob_store resync takes the fast path"
+        );
+
+        // The reverse transition (Some -> None) must likewise rebuild.
+        let _ = sync.sync_document_to_scene(&mut doc, None, &[]);
+        assert_eq!(
+            sync.fast_path_hits, 1,
+            "a Some->None blob_store transition must NOT take the fast path"
+        );
+
+        // And a matching None resync replays once more.
+        let _ = sync.sync_document_to_scene(&mut doc, None, &[]);
+        assert_eq!(
+            sync.fast_path_hits, 2,
+            "a matching None blob_store resync takes the fast path"
         );
     }
 

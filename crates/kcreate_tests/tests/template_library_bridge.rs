@@ -31,11 +31,15 @@
 //! racing the other suites.
 
 use std::collections::HashSet;
+use std::fs;
 use std::path::Path;
 use std::sync::OnceLock;
 
 use kcreate_bridge::document::{document_get_tree, project_close, project_create, NodeInfo};
-use kcreate_bridge::phase2::{template_instantiate, template_list, template_thumbnail};
+use kcreate_bridge::phase2::{
+    template_instantiate, template_list, template_thumbnail, template_thumbnail_cached,
+    ThumbnailCacheOutcome,
+};
 use kcreate_core::{bundled_templates, TemplateCategory};
 use serial_test::serial;
 use tempfile::TempDir;
@@ -347,4 +351,103 @@ fn open_project(name: &str) -> TempDir {
     let dir = TempDir::new().expect("project tmpdir");
     project_create(name, dir.path()).expect("project_create");
     dir
+}
+
+/// Thumbnail generation must scale to 120+ templates without
+/// re-rendering on every gallery open. The bridge caches each rendered
+/// `thumbnail.png` to disk keyed by a BLAKE3 hash of its
+/// `content.json`, so a warm cache is served straight from disk
+/// (`Hit`) and only a *content change* forces a re-render
+/// (`Rendered`). This test drives the full lifecycle against a real
+/// seeded template dir:
+///
+/// 1. cold cache → `Rendered` (and the PNG + sidecar land on disk),
+/// 2. warm cache → `Hit` (no re-render — this is the perf win),
+/// 3. content edited → `Rendered` (stale cache correctly invalidated),
+/// 4. content restored → `Rendered` again (the hash key tracks the
+///    bytes both ways, so the cache can never serve a stale preview).
+#[test]
+#[serial]
+fn thumbnail_disk_cache_hits_warm_and_invalidates_on_content_change() {
+    let root = shared_template_dir();
+    let _ = template_list(None, None).expect("seed");
+
+    let catalog = bundled_templates();
+    let t = &catalog[0];
+    let id = t.manifest.id;
+
+    let dir = root.join(t.dir_name);
+    let content_path = dir.join("content.json");
+    let thumb_path = dir.join("thumbnail.png");
+    let sidecar_path = dir.join("thumbnail.cache.json");
+
+    // Snapshot the original content so we can restore it byte-for-byte
+    // afterwards — this dir is shared with the other suites in this
+    // binary, so the template must be left exactly as seeded.
+    let original = fs::read(&content_path).expect("read content.json");
+
+    // Start from a guaranteed-cold cache regardless of whether an
+    // earlier #[serial] test already warmed this template.
+    let _ = fs::remove_file(&thumb_path);
+    let _ = fs::remove_file(&sidecar_path);
+
+    // 1. Cold cache → render + persist PNG and sidecar.
+    let (cold, cold_outcome) = template_thumbnail_cached(id).expect("cold render");
+    assert_eq!(
+        cold_outcome,
+        ThumbnailCacheOutcome::Rendered,
+        "first call with no cache on disk must render"
+    );
+    assert!(thumb_path.exists(), "render should persist thumbnail.png");
+    assert!(
+        sidecar_path.exists(),
+        "render should persist the cache sidecar"
+    );
+    assert!(cold.byte_size > 0 && cold.width > 0 && cold.height > 0);
+
+    // 2. Warm cache → served from disk, identical bytes, no re-render.
+    let (warm, warm_outcome) = template_thumbnail_cached(id).expect("warm read");
+    assert_eq!(
+        warm_outcome,
+        ThumbnailCacheOutcome::Hit,
+        "second call must hit the disk cache instead of re-rendering"
+    );
+    assert_eq!(
+        warm.content_hash, cold.content_hash,
+        "a cache hit must return the very same PNG bytes"
+    );
+
+    // 3. Mutate content.json (valid JSON: trailing whitespace only, so
+    //    the parsed design is unchanged but the on-disk bytes — and
+    //    thus the hash key — differ). The next call must re-render.
+    let mut mutated = original.clone();
+    mutated.extend_from_slice(b"\n   \n");
+    fs::write(&content_path, &mutated).expect("mutate content.json");
+    let (_after_edit, edit_outcome) = template_thumbnail_cached(id).expect("post-edit render");
+    assert_eq!(
+        edit_outcome,
+        ThumbnailCacheOutcome::Rendered,
+        "editing content.json must invalidate the cache and re-render"
+    );
+
+    // 4. Restore the original bytes. The hash key reverts, so the
+    //    sidecar (now stamped with the mutated hash) no longer matches
+    //    and the cache invalidates a second time — proving the key
+    //    tracks content both directions, never serving a stale preview.
+    fs::write(&content_path, &original).expect("restore content.json");
+    let (_restored, restore_outcome) = template_thumbnail_cached(id).expect("post-restore render");
+    assert_eq!(
+        restore_outcome,
+        ThumbnailCacheOutcome::Rendered,
+        "restoring content must also invalidate the stale (mutated) cache"
+    );
+
+    // Leave the shared dir warm + consistent for any later test: a
+    // final call should now hit the freshly re-stamped cache.
+    let (_final, final_outcome) = template_thumbnail_cached(id).expect("final read");
+    assert_eq!(
+        final_outcome,
+        ThumbnailCacheOutcome::Hit,
+        "cache should be warm + consistent again after restore"
+    );
 }

@@ -4168,38 +4168,115 @@ pub fn template_instantiate(template_id: Uuid) -> Result<TemplateInstantiateRepo
     template_instantiate_items(&name, content.width, content.height, content.items)
 }
 
-/// Return the gallery thumbnail for a template as PNG bytes wrapped in
-/// a [`ThumbnailBytes`]. Lazy render-on-miss: if the template's
-/// `.ktemplate/` already has a `thumbnail.png` it is served straight
-/// from disk; otherwise the template's `content.json` is rendered
-/// through the export PNG pipeline at gallery-card resolution, cached
-/// to `thumbnail.png` (best-effort — a read-only template dir still
-/// serves a freshly rendered preview), and returned.
-pub fn template_thumbnail(template_id: Uuid) -> Result<ThumbnailBytes> {
-    /// The 8-byte PNG file signature (magic number). A valid PNG always
-    /// begins with these bytes; anything else on disk under
-    /// `thumbnail.png` is a truncated / half-written / non-PNG file.
-    const PNG_SIGNATURE: [u8; 8] = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+/// Filename of the sidecar that keys a cached `thumbnail.png` to the
+/// exact `content.json` (and render resolution) it was produced from.
+const THUMBNAIL_CACHE_SIDECAR: &str = "thumbnail.cache.json";
 
+/// The 8-byte PNG file signature (magic number). A valid PNG always
+/// begins with these bytes; anything else on disk under
+/// `thumbnail.png` is a truncated / half-written / non-PNG file.
+const PNG_SIGNATURE: [u8; 8] = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+
+/// Sidecar metadata persisted next to a template's `thumbnail.png`,
+/// binding the cached PNG to the precise `content.json` it was
+/// rendered from. The gallery serves the cached PNG only when both the
+/// source content hash and the render resolution still match; any edit
+/// to `content.json` (or a change to the gallery-card resolution)
+/// changes the key and forces a one-time re-render. This is what keeps
+/// thumbnail generation `O(changed templates)` instead of `O(catalog)`
+/// on every gallery open, while still guaranteeing the preview is never
+/// stale with respect to the design it represents.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ThumbnailCacheMeta {
+    /// BLAKE3 hex of the raw `content.json` bytes the PNG was rendered
+    /// from. Hashing the on-disk bytes (rather than the parsed graph)
+    /// keeps the key cheap to compute and independent of how the items
+    /// deserialize.
+    pub content_hash: String,
+    /// Longest-edge pixel budget the cached PNG was rendered at, so a
+    /// future change to [`DEFAULT_THUMBNAIL_MAX_DIM_PX`] invalidates
+    /// every stale-resolution cache instead of serving the wrong size.
+    pub max_dim_px: u32,
+}
+
+/// Whether a [`template_thumbnail_cached`] call served the PNG from the
+/// on-disk cache or had to render it. Exposed so perf tests can assert
+/// the disk cache actually prevents re-rendering at scale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThumbnailCacheOutcome {
+    /// Served straight from a valid, content-matched `thumbnail.png`.
+    Hit,
+    /// Rendered through the export pipeline (cache absent or stale).
+    Rendered,
+}
+
+/// Return the gallery thumbnail for a template as PNG bytes wrapped in
+/// a [`ThumbnailBytes`]. See [`template_thumbnail_cached`] for the
+/// caching contract; this is the thin renderer-facing entry point that
+/// discards the cache outcome.
+pub fn template_thumbnail(template_id: Uuid) -> Result<ThumbnailBytes> {
+    Ok(template_thumbnail_cached(template_id)?.0)
+}
+
+/// Lazy, content-hash-keyed thumbnail generation. Reads the template's
+/// `content.json`, hashes its bytes, and serves the sibling
+/// `thumbnail.png` **only** when a matching `thumbnail.cache.json`
+/// sidecar proves the PNG was rendered from this exact content at the
+/// current gallery resolution ([`ThumbnailCacheOutcome::Hit`]).
+/// Otherwise the design is rendered through the export PNG pipeline,
+/// the PNG + sidecar are written back best-effort (a read-only template
+/// dir still returns a correct freshly-rendered preview — it just
+/// can't persist the cache), and the result is returned as
+/// [`ThumbnailCacheOutcome::Rendered`].
+///
+/// Keying on the content hash (rather than mere file existence) is what
+/// makes the cache correct at scale: editing a template's `content.json`
+/// — e.g. via "Duplicate & remix" or an external edit — changes the
+/// hash and triggers exactly one re-render, while the other 120+ cards
+/// stay served from disk.
+pub fn template_thumbnail_cached(
+    template_id: Uuid,
+) -> Result<(ThumbnailBytes, ThumbnailCacheOutcome)> {
     let dir = template_dir_for(template_id)?;
+    let content_path = dir.join("content.json");
     let thumb_path = dir.join("thumbnail.png");
-    if let Ok(bytes) = std::fs::read(&thumb_path) {
-        // Serve the cached file only when it actually looks like a PNG.
-        // A zero-byte or truncated `thumbnail.png` — e.g. the process
-        // was killed mid-write, or a best-effort write into a
-        // momentarily-full/read-only dir left a partial file — would
-        // otherwise be handed to the renderer as a broken `<img>` and,
-        // because `from_png_bytes` can't parse its header, cached
-        // forever with width/height 0. Validate the signature and fall
-        // through to a fresh render on any failure; the render path
-        // below overwrites the bad cache (Devin Review PR #61
-        // ANALYSIS_0003).
-        if bytes.starts_with(&PNG_SIGNATURE) {
-            return Ok(ThumbnailBytes::from_png_bytes(bytes));
+    let sidecar_path = dir.join(THUMBNAIL_CACHE_SIDECAR);
+
+    // The `content.json` bytes are the single source of truth; hash
+    // them so we can decide whether any cached PNG is still valid.
+    let content_raw = std::fs::read(&content_path).map_err(|e| {
+        DocumentBridgeError::Internal(format!(
+            "template {template_id}: cannot read {}: {e}",
+            content_path.display()
+        ))
+    })?;
+    let content_hash = blake3::hash(&content_raw).to_hex().to_string();
+
+    // Cache hit: a PNG that (a) actually parses as a PNG and (b) has a
+    // sidecar proving it was rendered from this content at this
+    // resolution. A truncated/half-written PNG fails the signature
+    // check and a stale or missing sidecar fails the hash check —
+    // either way we fall through to a fresh render that overwrites the
+    // bad cache (Devin Review PR #61 ANALYSIS_0003).
+    if let Ok(png) = std::fs::read(&thumb_path) {
+        if png.starts_with(&PNG_SIGNATURE) {
+            if let Ok(meta_raw) = std::fs::read(&sidecar_path) {
+                if let Ok(meta) = serde_json::from_slice::<ThumbnailCacheMeta>(&meta_raw) {
+                    if meta.content_hash == content_hash
+                        && meta.max_dim_px == DEFAULT_THUMBNAIL_MAX_DIM_PX
+                    {
+                        return Ok((
+                            ThumbnailBytes::from_png_bytes(png),
+                            ThumbnailCacheOutcome::Hit,
+                        ));
+                    }
+                }
+            }
         }
     }
-    // Cache miss — render from content.json.
-    let (_dir, content) = load_template_content(template_id)?;
+
+    // Cache miss or stale — render from the content we already read.
+    let content: TemplateContentWire = serde_json::from_slice(&content_raw)?;
     let doc = build_template_document(content.items)?;
     let bytes = render_template_thumbnail_png(
         &doc,
@@ -4207,9 +4284,23 @@ pub fn template_thumbnail(template_id: Uuid) -> Result<ThumbnailBytes> {
         content.height,
         DEFAULT_THUMBNAIL_MAX_DIM_PX,
     )?;
-    // Best-effort cache write so repeat opens skip the render.
-    let _ = std::fs::write(&thumb_path, &bytes);
-    Ok(ThumbnailBytes::from_png_bytes(bytes))
+    // Best-effort cache write so repeat opens skip the render. Write the
+    // PNG first; only stamp the sidecar once the PNG landed, so we never
+    // record a hash for a thumbnail that isn't actually on disk (which
+    // would otherwise serve a stale/absent PNG as a "hit").
+    if std::fs::write(&thumb_path, &bytes).is_ok() {
+        let meta = ThumbnailCacheMeta {
+            content_hash,
+            max_dim_px: DEFAULT_THUMBNAIL_MAX_DIM_PX,
+        };
+        if let Ok(meta_json) = serde_json::to_vec(&meta) {
+            let _ = std::fs::write(&sidecar_path, meta_json);
+        }
+    }
+    Ok((
+        ThumbnailBytes::from_png_bytes(bytes),
+        ThumbnailCacheOutcome::Rendered,
+    ))
 }
 
 // -----------------------------------------------------------------------------

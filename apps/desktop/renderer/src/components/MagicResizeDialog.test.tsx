@@ -1,4 +1,4 @@
-// MagicResizeDialog tests (G5 — Magic Resize).
+// MagicResizeDialog tests (G5 Magic Resize + H6 content-aware depth).
 //
 // Pins the dialog's contract:
 //   * presets render grouped and a toggle flips its aria-checked state;
@@ -7,6 +7,10 @@
 //     in one `onResize` call — and routing that through the bridge
 //     `artboard.magicResize` returns two new artboard ids (the
 //     "2 sizes -> 2 new artboards" flow the spec asks for);
+//   * the content-aware toggles (text re-fit + image smart-crop) default
+//     on and are threaded through to both `onResize` and `onExport`;
+//   * "Resize & export all" routes through the real bridge
+//     `artboard.magicResizeExportPng` path and reports the written PNGs;
 //   * Cancel closes without resizing.
 
 import { describe, it, expect } from "vitest";
@@ -17,6 +21,8 @@ import { kcreateStub } from "../../tests/helpers/kcreateStub";
 import type {
   ArtboardInfo,
   ArtboardPreset,
+  MagicResizeContent,
+  MagicResizeExportReport,
   ResizeTarget,
 } from "../../../shared/scene";
 
@@ -43,6 +49,8 @@ const PRESETS: ArtboardPreset[] = [
   { name: "A4", width: 2480, height: 3508, category: "print" },
 ];
 
+const noop = (): void => {};
+
 describe("MagicResizeDialog", () => {
   it("renders nothing when closed", () => {
     const { container } = render(
@@ -50,8 +58,9 @@ describe("MagicResizeDialog", () => {
         open={false}
         source={SOURCE}
         presets={PRESETS}
-        onResize={() => {}}
-        onClose={() => {}}
+        onResize={noop}
+        onExport={noop}
+        onClose={noop}
       />,
     );
     expect(container).toBeEmptyDOMElement();
@@ -63,8 +72,9 @@ describe("MagicResizeDialog", () => {
         open
         source={SOURCE}
         presets={PRESETS}
-        onResize={() => {}}
-        onClose={() => {}}
+        onResize={noop}
+        onExport={noop}
+        onClose={noop}
       />,
     );
     const generate = screen.getByRole("button", { name: /Generate/ });
@@ -80,8 +90,9 @@ describe("MagicResizeDialog", () => {
         open
         source={SOURCE}
         presets={PRESETS}
-        onResize={() => {}}
-        onClose={() => {}}
+        onResize={noop}
+        onExport={noop}
+        onClose={noop}
       />,
     );
     const toggle = screen.getByRole("checkbox", { name: /A4/ });
@@ -99,22 +110,26 @@ describe("MagicResizeDialog", () => {
     handle.override("artboard.magicResize", () => ["story-id", "a4-id"]);
 
     let received: ResizeTarget[] | null = null;
+    let receivedContent: MagicResizeContent | null = null;
     let newIds: string[] = [];
     render(
       <MagicResizeDialog
         open
         source={SOURCE}
         presets={PRESETS}
-        onResize={(targets) => {
+        onResize={(targets, content) => {
           received = targets;
+          receivedContent = content;
           void (async () => {
             newIds = await window.kcreate.artboard.magicResize(
               SOURCE.id,
               targets,
+              content,
             );
           })();
         }}
-        onClose={() => {}}
+        onExport={noop}
+        onClose={noop}
       />,
     );
 
@@ -131,6 +146,9 @@ describe("MagicResizeDialog", () => {
       .sort();
     expect(names).toEqual(["A4", "Instagram Story"]);
 
+    // …with the content-aware toggles defaulting on.
+    expect(receivedContent).toEqual({ refitText: true, smartCrop: true });
+
     // It routed through the bridge once with both targets…
     const calls = handle.calls.filter(
       (c) => c.method === "artboard.magicResize",
@@ -144,6 +162,94 @@ describe("MagicResizeDialog", () => {
     expect(newIds).toEqual(["story-id", "a4-id"]);
   });
 
+  it("defaults content-aware toggles on and threads them through onResize", () => {
+    let received: MagicResizeContent | null = null;
+    render(
+      <MagicResizeDialog
+        open
+        source={SOURCE}
+        presets={PRESETS}
+        onResize={(_targets, content) => {
+          received = content;
+        }}
+        onExport={noop}
+        onClose={noop}
+      />,
+    );
+
+    const refit = screen.getByRole("checkbox", { name: /Re-fit text to box/ });
+    const crop = screen.getByRole("checkbox", { name: /Smart-crop images/ });
+    expect(refit).toBeChecked();
+    expect(crop).toBeChecked();
+
+    // Turn OFF text re-fit, leave smart-crop on, then resize.
+    fireEvent.click(refit);
+    expect(refit).not.toBeChecked();
+    fireEvent.click(screen.getByRole("checkbox", { name: /Instagram Post/ }));
+    fireEvent.click(screen.getByRole("button", { name: /Generate/ }));
+
+    expect(received).toEqual({ refitText: false, smartCrop: true });
+  });
+
+  it("Resize & export all routes through the bridge export path", async () => {
+    const handle = kcreateStub();
+    handle.override("artboard.magicResizeExportPng", () => ({
+      artboard_ids: ["story-id", "a4-id"],
+      output_dir: "/out",
+      written: ["/out/01_story.png", "/out/02_a4.png"],
+      failed: [],
+      duration_ms: 12,
+    }));
+
+    let exportTargets: ResizeTarget[] | null = null;
+    let exportContent: MagicResizeContent | null = null;
+    let report: MagicResizeExportReport | null = null;
+    render(
+      <MagicResizeDialog
+        open
+        source={SOURCE}
+        presets={PRESETS}
+        onResize={noop}
+        onExport={(targets, content) => {
+          exportTargets = targets;
+          exportContent = content;
+          void (async () => {
+            report = await window.kcreate.artboard.magicResizeExportPng(
+              SOURCE.id,
+              targets,
+              { outputDir: "/out", content },
+            );
+          })();
+        }}
+        onClose={noop}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("checkbox", { name: /Instagram Story/ }));
+    fireEvent.click(screen.getByRole("checkbox", { name: /A4/ }));
+    fireEvent.click(
+      screen.getByRole("button", { name: /Resize & export all/ }),
+    );
+    await flushAsync();
+
+    expect(exportTargets).not.toBeNull();
+    expect(exportTargets).toHaveLength(2);
+    expect(exportContent).toEqual({ refitText: true, smartCrop: true });
+
+    // Routed once through the real bridge export channel.
+    const calls = handle.calls.filter(
+      (c) => c.method === "artboard.magicResizeExportPng",
+    );
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.args[0]).toBe(SOURCE.id);
+
+    // …and reported the written PNGs back.
+    expect(report).not.toBeNull();
+    expect((report as unknown as MagicResizeExportReport).written).toHaveLength(
+      2,
+    );
+  });
+
   it("emits targets in on-screen display order, not click order", () => {
     let received: ResizeTarget[] | null = null;
     render(
@@ -154,7 +260,8 @@ describe("MagicResizeDialog", () => {
         onResize={(targets) => {
           received = targets;
         }}
-        onClose={() => {}}
+        onExport={noop}
+        onClose={noop}
       />,
     );
 
@@ -184,7 +291,8 @@ describe("MagicResizeDialog", () => {
         onResize={() => {
           resizeCalls += 1;
         }}
-        onClose={() => {}}
+        onExport={noop}
+        onClose={noop}
       />,
     );
     fireEvent.click(screen.getByRole("checkbox", { name: /Instagram Story/ }));
@@ -211,6 +319,7 @@ describe("MagicResizeDialog", () => {
         onResize={() => {
           resized = true;
         }}
+        onExport={noop}
         onClose={() => {
           closed = true;
         }}

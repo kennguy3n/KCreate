@@ -18,12 +18,14 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use kcreate_core::document::DocumentGraph;
+use kcreate_renderer::Scene;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
 use crate::pdf::{export_pdf_from_document, PdfExportError, PdfExportOptions, RasterPixelCache};
+use crate::png::{export_png_to_bytes, PngExportError, PngExportOptions};
 use crate::svg::{export_svg_from_document, SvgDocumentExportError, SvgExportOptions};
 
 /// One item in a batch export.
@@ -88,8 +90,30 @@ pub enum BatchExportError {
     Svg(#[from] SvgDocumentExportError),
     #[error("pdf: {0}")]
     Pdf(#[from] PdfExportError),
+    #[error("png: {0}")]
+    Png(#[from] PngExportError),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
+}
+
+/// One PNG render in a [`run_png_batch_parallel`] batch.
+///
+/// Unlike [`ExportItem`] (which describes a document export by
+/// reference) a PNG item carries an already-translated renderer
+/// [`Scene`] plus its [`PngExportOptions`]. This is what lets the
+/// Magic-Resize "resize to every preset AND export each to PNG"
+/// one-shot hand a pre-built, per-artboard scene to the parallel
+/// driver: the bridge builds each target's scene under the workspace
+/// lock, then drops the lock before rendering so the rayon workers
+/// never touch the document singleton.
+///
+/// It is intentionally **not** `Serialize`/`Deserialize`: a scene is a
+/// transient render payload, not a persisted job description.
+#[derive(Debug, Clone)]
+pub struct PngBatchItem {
+    pub filename: String,
+    pub scene: Scene,
+    pub options: PngExportOptions,
 }
 
 /// Mid-run progress snapshot reported by [`run_batch_parallel`].
@@ -168,22 +192,81 @@ pub fn run_batch_parallel(
     cancel: &AtomicBool,
     progress_fn: impl Fn(BatchProgress) + Sync + Send,
 ) -> Result<BatchResult, BatchExportError> {
-    std::fs::create_dir_all(&job.output_dir)?;
-    let total = job.items.len();
+    drive_parallel(
+        &job.items,
+        &job.output_dir,
+        cancel,
+        |item| item.filename().to_string(),
+        |item, dir| run_one(item, document, rasters, dir),
+        progress_fn,
+    )
+}
+
+/// Parallel PNG batch runner — the Magic-Resize "export every resized
+/// preset to PNG" one-shot.
+///
+/// Mirrors [`run_batch_parallel`] (rayon pool, per-item isolation,
+/// cancellation between items, one `progress_fn` call per completed
+/// item) but consumes pre-built [`PngBatchItem`] scenes instead of
+/// document-relative [`ExportItem`]s, so the renderer is the only
+/// thing touched on the worker threads. Each item renders through
+/// [`export_png_to_bytes`], which spins up its own offscreen render
+/// context (there is no renderer singleton in `kcreate_renderer`), so
+/// the items are safe to render concurrently.
+pub fn run_png_batch_parallel(
+    items: &[PngBatchItem],
+    output_dir: &Path,
+    cancel: &AtomicBool,
+    progress_fn: impl Fn(BatchProgress) + Sync + Send,
+) -> Result<BatchResult, BatchExportError> {
+    drive_parallel(
+        items,
+        output_dir,
+        cancel,
+        |item| item.filename.clone(),
+        |item, dir| {
+            let bytes = export_png_to_bytes(&item.scene, &item.options)?;
+            std::fs::write(dir.join(&item.filename), bytes)?;
+            Ok(())
+        },
+        progress_fn,
+    )
+}
+
+/// Shared rayon driver behind [`run_batch_parallel`] and
+/// [`run_png_batch_parallel`]. Creates `output_dir`, runs every item
+/// on the global thread pool, isolates per-item failures, honours the
+/// shared `cancel` flag between items, and reports progress once per
+/// completed item.
+fn drive_parallel<T, NameFn, RunFn>(
+    items: &[T],
+    output_dir: &Path,
+    cancel: &AtomicBool,
+    name_of: NameFn,
+    run_item: RunFn,
+    progress_fn: impl Fn(BatchProgress) + Sync + Send,
+) -> Result<BatchResult, BatchExportError>
+where
+    T: Sync,
+    NameFn: Fn(&T) -> String + Sync + Send,
+    RunFn: Fn(&T, &Path) -> Result<(), BatchExportError> + Sync + Send,
+{
+    std::fs::create_dir_all(output_dir)?;
+    let total = items.len();
     let completed = AtomicUsize::new(0);
     let start = Instant::now();
     let succeeded_lock = parking_lot::Mutex::new(Vec::<PathBuf>::with_capacity(total));
     let failed_lock = parking_lot::Mutex::new(Vec::<(String, String)>::new());
 
-    job.items.par_iter().enumerate().for_each(|(idx, item)| {
+    items.par_iter().enumerate().for_each(|(idx, item)| {
         if cancel.load(Ordering::SeqCst) {
             return;
         }
-        let result = run_one(item, document, rasters, &job.output_dir);
-        let name = item.filename().to_string();
+        let name = name_of(item);
+        let result = run_item(item, output_dir);
         match result {
             Ok(()) => {
-                succeeded_lock.lock().push(job.output_dir.join(&name));
+                succeeded_lock.lock().push(output_dir.join(&name));
             }
             Err(e) => {
                 failed_lock
@@ -436,6 +519,105 @@ mod tests {
         assert_eq!(result.succeeded.len(), 1);
         assert_eq!(result.failed.len(), 1);
         assert_eq!(result.failed[0].0, "bad.svg");
+    }
+
+    /// A minimal but non-blank scene: a filled rectangle on a known
+    /// background. Enough to prove the PNG batch path writes real,
+    /// decodable, non-empty raster files.
+    fn scene_with_filled_rect() -> Scene {
+        use kcreate_renderer::geometry::{Color, Rect, Style};
+        use kcreate_renderer::scene::{Object, ObjectKind};
+        let mut scene = Scene::new(Color::rgba(1.0, 1.0, 1.0, 1.0));
+        scene.add_object(Object::new(
+            ObjectKind::Rect(Rect::new(8.0, 8.0, 48.0, 48.0)),
+            Style::filled(Color::rgba(0.86, 0.16, 0.24, 1.0)),
+        ));
+        scene
+    }
+
+    #[test]
+    fn png_batch_writes_non_blank_files() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let items = vec![
+            PngBatchItem {
+                filename: "square.png".into(),
+                scene: scene_with_filled_rect(),
+                options: PngExportOptions {
+                    width: 64,
+                    height: 64,
+                    scale: 1.0,
+                    background: Some(kcreate_renderer::geometry::Color::rgba(1.0, 1.0, 1.0, 1.0)),
+                },
+            },
+            PngBatchItem {
+                filename: "tall.png".into(),
+                scene: scene_with_filled_rect(),
+                options: PngExportOptions {
+                    width: 64,
+                    height: 128,
+                    scale: 1.0,
+                    background: Some(kcreate_renderer::geometry::Color::rgba(1.0, 1.0, 1.0, 1.0)),
+                },
+            },
+        ];
+        let cancel = AtomicBool::new(false);
+        let progress = Mutex::new(Vec::<BatchProgress>::new());
+        let result = run_png_batch_parallel(&items, tmpdir.path(), &cancel, |p| {
+            progress.lock().unwrap().push(p);
+        })
+        .expect("png batch");
+        assert_eq!(result.succeeded.len(), 2);
+        assert!(result.failed.is_empty());
+        assert!(!result.cancelled);
+        assert_eq!(progress.into_inner().unwrap().len(), 2);
+
+        for name in ["square.png", "tall.png"] {
+            let path = tmpdir.path().join(name);
+            assert!(path.exists(), "{name} must exist");
+            let bytes = std::fs::read(&path).unwrap();
+            // PNG magic + non-trivial size.
+            assert_eq!(
+                &bytes[..8],
+                &[0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n']
+            );
+            assert!(
+                bytes.len() > 100,
+                "{name} should be a real PNG, got {} bytes",
+                bytes.len()
+            );
+            // Decode and assert it isn't a single flat color — the
+            // filled rect must produce more than one distinct pixel.
+            let img = image::load_from_memory(&bytes).unwrap().to_rgba8();
+            let first = img.as_raw().chunks_exact(4).next().unwrap().to_vec();
+            let varied = img
+                .as_raw()
+                .chunks_exact(4)
+                .any(|px| px != first.as_slice());
+            assert!(varied, "{name} must not be a single flat color");
+        }
+    }
+
+    #[test]
+    fn png_batch_honours_cancel_flag() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let items: Vec<PngBatchItem> = (0..8)
+            .map(|i| PngBatchItem {
+                filename: format!("p{i}.png"),
+                scene: scene_with_filled_rect(),
+                options: PngExportOptions {
+                    width: 32,
+                    height: 32,
+                    scale: 1.0,
+                    background: None,
+                },
+            })
+            .collect();
+        let cancel = AtomicBool::new(true); // Pre-cancelled.
+        let result =
+            run_png_batch_parallel(&items, tmpdir.path(), &cancel, |_| {}).expect("png batch");
+        assert!(result.cancelled);
+        assert!(result.succeeded.is_empty());
+        assert!(result.failed.is_empty());
     }
 
     #[test]

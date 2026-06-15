@@ -49,6 +49,7 @@ import type {
   DistributeAxis,
   FlexLayout,
   GridLayout,
+  MagicResizeContent,
   NodeInfo,
   ProjectInfo,
   ResizeTarget,
@@ -256,6 +257,11 @@ function EditorPageInner({
   // `null` while the dialog is closed.
   const [magicResizeSource, setMagicResizeSource] =
     useState<ArtboardInfo | null>(null);
+  // Last directory chosen for a Magic-Resize batch PNG export, so the
+  // directory picker reopens where the user last exported.
+  const [magicResizeExportDir, setMagicResizeExportDir] = useState<
+    string | null
+  >(null);
   // TemplatePicker is shown automatically the first time the user
   // enters Layout mode for a given project. The sentinel below is per
   // project id so re-opening a project skips the picker, but switching
@@ -665,12 +671,17 @@ function EditorPageInner({
   // in a single undoable op (the bridge keeps the source untouched),
   // then refresh the tree and focus the first generated artboard.
   const handleMagicResize = useCallback(
-    async (sourceId: string, targets: ResizeTarget[]) => {
+    async (
+      sourceId: string,
+      targets: ResizeTarget[],
+      content: MagicResizeContent,
+    ) => {
       if (targets.length === 0) return;
       try {
         const newIds = await window.kcreate.artboard.magicResize(
           sourceId,
           targets,
+          content,
         );
         const { artboards: list } = await refreshTree();
         const firstId = newIds[0];
@@ -690,6 +701,56 @@ function EditorPageInner({
       }
     },
     [refreshTree, focusArtboard, setStatusMessage],
+  );
+
+  // Magic Resize → batch PNG export: pick an output directory, then
+  // reflow onto every target AND render each generated artboard to a
+  // PNG in one bridge round-trip. The resize stays a single undoable
+  // op; the export is read-only. If the user cancels the directory
+  // picker we leave the dialog open so they can adjust their picks.
+  const handleMagicResizeExport = useCallback(
+    async (
+      sourceId: string,
+      targets: ResizeTarget[],
+      content: MagicResizeContent,
+    ) => {
+      if (targets.length === 0) return;
+      const outputDir = await window.kcreate.runtime.chooseExportDirectory(
+        magicResizeExportDir,
+      );
+      if (!outputDir) {
+        setStatusMessage("Magic Resize export: cancelled.");
+        return;
+      }
+      setMagicResizeExportDir(outputDir);
+      try {
+        const report = await window.kcreate.artboard.magicResizeExportPng(
+          sourceId,
+          targets,
+          { outputDir, content },
+        );
+        const { artboards: list } = await refreshTree();
+        const firstId = report.artboard_ids[0];
+        const focus = firstId
+          ? list.find((a) => a.id === firstId)
+          : undefined;
+        if (focus) focusArtboard(focus);
+        const failedNote =
+          report.failed.length > 0
+            ? `, ${report.failed.length} failed`
+            : "";
+        setStatusMessage(
+          `Magic Resize exported ${report.written.length} PNG${
+            report.written.length === 1 ? "" : "s"
+          } → ${report.output_dir}${failedNote}`,
+        );
+      } catch (e) {
+        setStatusMessage(`magic resize export failed: ${errorMessage(e)}`);
+      } finally {
+        setMagicResizeSource(null);
+      }
+    },
+    [refreshTree, focusArtboard, setStatusMessage, magicResizeExportDir],
   );
 
   // Stable identity (like `handlePrototypeClose`) so the dialog's
@@ -2597,9 +2658,18 @@ function EditorPageInner({
         open={magicResizeSource !== null}
         source={magicResizeSource}
         presets={artboardPresets}
-        onResize={(targets) => {
+        onResize={(targets, content) => {
           if (magicResizeSource) {
-            void handleMagicResize(magicResizeSource.id, targets);
+            void handleMagicResize(magicResizeSource.id, targets, content);
+          }
+        }}
+        onExport={(targets, content) => {
+          if (magicResizeSource) {
+            void handleMagicResizeExport(
+              magicResizeSource.id,
+              targets,
+              content,
+            );
           }
         }}
         onClose={handleMagicResizeClose}

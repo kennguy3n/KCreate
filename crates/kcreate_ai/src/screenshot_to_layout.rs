@@ -93,7 +93,7 @@ pub fn analyze_screenshot_for_layout(
     elements
 }
 
-fn to_grayscale(pixels: &[u8], width: u32, height: u32) -> Vec<u8> {
+pub(crate) fn to_grayscale(pixels: &[u8], width: u32, height: u32) -> Vec<u8> {
     let mut out = Vec::with_capacity((width as usize) * (height as usize));
     for chunk in pixels.chunks_exact(4) {
         // Rec.601.
@@ -104,7 +104,7 @@ fn to_grayscale(pixels: &[u8], width: u32, height: u32) -> Vec<u8> {
     out
 }
 
-fn sobel(gray: &[u8], width: u32, height: u32) -> Vec<u8> {
+pub(crate) fn sobel(gray: &[u8], width: u32, height: u32) -> Vec<u8> {
     let w = width as usize;
     let h = height as usize;
     let mut out = vec![0u8; w * h];

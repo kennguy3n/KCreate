@@ -451,12 +451,30 @@ pub fn standard_presets() -> Vec<ArtboardPreset> {
             720.0,
             PresetCategory::SocialMedia,
         ),
+        ArtboardPreset::new("TikTok / Reel", 1080.0, 1920.0, PresetCategory::SocialMedia),
+        ArtboardPreset::new("Pinterest Pin", 1000.0, 1500.0, PresetCategory::SocialMedia),
+        ArtboardPreset::new("Facebook Post", 1200.0, 630.0, PresetCategory::SocialMedia),
+        ArtboardPreset::new(
+            "YouTube Banner",
+            2560.0,
+            1440.0,
+            PresetCategory::SocialMedia,
+        ),
+        ArtboardPreset::new(
+            "Presentation 16:9",
+            1920.0,
+            1080.0,
+            PresetCategory::SocialMedia,
+        ),
         // Print (300dpi)
         ArtboardPreset::new("A4", 2480.0, 3508.0, PresetCategory::Print),
         ArtboardPreset::new("US Letter", 2550.0, 3300.0, PresetCategory::Print),
         ArtboardPreset::new("A3", 3508.0, 4961.0, PresetCategory::Print),
+        ArtboardPreset::new("A5", 1748.0, 2480.0, PresetCategory::Print),
         ArtboardPreset::new("US Legal", 2550.0, 4200.0, PresetCategory::Print),
         ArtboardPreset::new("Business Card", 1050.0, 600.0, PresetCategory::Print),
+        ArtboardPreset::new("Postcard 4×6", 1200.0, 1800.0, PresetCategory::Print),
+        ArtboardPreset::new("Poster A2", 4961.0, 7016.0, PresetCategory::Print),
     ]
 }
 
@@ -1968,6 +1986,35 @@ mod tests {
         for p in &presets {
             assert!(p.width > 0.0, "preset {} has non-positive width", p.name);
             assert!(p.height > 0.0, "preset {} has non-positive height", p.name);
+        }
+    }
+
+    #[test]
+    fn standard_presets_have_unique_names() {
+        let presets = standard_presets();
+        let mut names: Vec<&str> = presets.iter().map(|p| p.name.as_str()).collect();
+        names.sort_unstable();
+        let before = names.len();
+        names.dedup();
+        assert_eq!(before, names.len(), "preset names must be unique");
+    }
+
+    #[test]
+    fn standard_presets_include_common_extra_sizes() {
+        let presets = standard_presets();
+        // A representative sample of the H6 additions across categories.
+        for (name, w, h) in [
+            ("Pinterest Pin", 1000.0, 1500.0),
+            ("Facebook Post", 1200.0, 630.0),
+            ("A5", 1748.0, 2480.0),
+            ("Poster A2", 4961.0, 7016.0),
+        ] {
+            assert!(
+                presets.iter().any(|p| p.name == name
+                    && (p.width - w).abs() < f64::EPSILON
+                    && (p.height - h).abs() < f64::EPSILON),
+                "missing preset {name} ({w}×{h})",
+            );
         }
     }
 

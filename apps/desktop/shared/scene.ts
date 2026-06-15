@@ -1732,6 +1732,47 @@ export interface ResizeTarget {
   height?: number;
 }
 
+/**
+ * Content-aware Magic-Resize toggles. `refitText` re-fits text layers
+ * to their reflowed box via shaping (line-break + shrink-to-fit)
+ * instead of pure geometric font scaling; `smartCrop` smart-crops
+ * raster layers toward a detected focal point when their box aspect
+ * changes instead of letting the renderer stretch the pixels. Both
+ * default on when omitted. Mirrors
+ * `kcreate_bridge::document::MagicResizeContentOptions`.
+ */
+export interface MagicResizeContent {
+  refitText: boolean;
+  smartCrop: boolean;
+}
+
+/**
+ * Request for the Magic-Resize → batch PNG export one-shot. `outputDir`
+ * is an absolute directory (chosen via the directory picker) the PNGs
+ * are written into; `content` toggles the content-aware behaviour of
+ * the underlying resize; `maxDimPx` optionally caps the longest
+ * exported edge (otherwise each artboard exports at full pixel size).
+ * Mirrors `kcreate_bridge::document::MagicResizeExportRequest`.
+ */
+export interface MagicResizeExportRequest {
+  outputDir: string;
+  content?: MagicResizeContent;
+  maxDimPx?: number;
+}
+
+/**
+ * Result of {@link ArtboardBridge.magicResizeExportPng}: the generated
+ * artboard ids plus a per-file export report. Mirrors
+ * `kcreate_bridge::document::MagicResizeExportReport` (snake_case JSON).
+ */
+export interface MagicResizeExportReport {
+  artboard_ids: string[];
+  output_dir: string;
+  written: string[];
+  failed: string[];
+  duration_ms: number;
+}
+
 export interface ArtboardBridge {
   create(
     pageId: string | null,
@@ -1752,7 +1793,20 @@ export interface ArtboardBridge {
   magicResize(
     sourceArtboardId: string,
     targets: ResizeTarget[],
+    content?: MagicResizeContent,
   ): Promise<string[]>;
+  /**
+   * Magic Resize → batch PNG export: reflow `sourceArtboardId` onto
+   * every target AND render each generated artboard to a PNG in
+   * `request.outputDir`, in one action. Returns the generated artboard
+   * ids plus a per-file success/failure report. The resize is still a
+   * single undoable operation; the export is read-only.
+   */
+  magicResizeExportPng(
+    sourceArtboardId: string,
+    targets: ResizeTarget[],
+    request: MagicResizeExportRequest,
+  ): Promise<MagicResizeExportReport>;
 }
 
 /**

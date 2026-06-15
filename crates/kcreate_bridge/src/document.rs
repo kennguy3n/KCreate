@@ -11,6 +11,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 use std::sync::OnceLock;
 
 use chrono::Utc;
@@ -27,6 +28,7 @@ use kcreate_core::project::{
 use kcreate_core::theme::{build_color_remap, quantize, ColorUsage, RadiusScale, Theme, TypeRole};
 use kcreate_export::png::{export_png_to_bytes, PngExportError, PngExportOptions};
 use kcreate_export::svg::{export_svg_from_document, SvgDocumentExportError, SvgExportOptions};
+use kcreate_export::{run_png_batch_parallel, PngBatchItem};
 use kcreate_layout::{layout_flex, layout_grid, FlexLayout, GridLayout, ResizeNode, ResizeOptions};
 use kcreate_storage::project_io::{ProjectStore, ProjectStoreError};
 use parking_lot::RwLock;
@@ -72,6 +74,8 @@ pub enum DocumentBridgeError {
     Png(#[from] PngExportError),
     #[error(transparent)]
     Svg(#[from] SvgDocumentExportError),
+    #[error(transparent)]
+    Batch(#[from] kcreate_export::BatchExportError),
     #[error("invalid uuid {0:?}: {1}")]
     InvalidUuid(String, uuid::Error),
     #[error("invalid bounds: width={width} height={height} (must be finite and positive)")]
@@ -4031,6 +4035,41 @@ pub struct ResizeTargetSpec {
     pub height: Option<f64>,
 }
 
+/// Content-aware behaviour toggles for [`magic_resize_with_content`].
+///
+/// Both default **on** — the professional Canva-style behaviour — so a
+/// plain [`magic_resize`] call (and every existing caller) opts into
+/// content-aware text re-fit and image smart-crop without changing its
+/// signature. A caller that wants the pure geometric reflow (the
+/// previous G-wave behaviour) flips the relevant flag to `false`.
+///
+/// Mirrors `MagicResizeContent` in `apps/desktop/shared/scene.ts`. The
+/// wire payload is a JSON object; the bridge entry point takes it as a
+/// JSON string so we don't have to register a new `#[napi(object)]`
+/// struct (consistent with how [`ResizeTargetSpec`] is wired).
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct MagicResizeContentOptions {
+    /// Re-fit text layers to their reflowed box via shaping
+    /// (line-break + shrink-to-fit) instead of pure geometric font
+    /// scaling, so a headline neither overflows nor shrinks to nothing
+    /// after a drastic aspect change.
+    pub refit_text: bool,
+    /// Smart-crop raster layers toward a detected focal point when the
+    /// node's box aspect ratio changes, instead of letting the renderer
+    /// stretch the pixels to fill the new bounds.
+    pub smart_crop: bool,
+}
+
+impl Default for MagicResizeContentOptions {
+    fn default() -> Self {
+        Self {
+            refit_text: true,
+            smart_crop: true,
+        }
+    }
+}
+
 /// A target after preset resolution / validation: a concrete label +
 /// pixel size.
 struct ResolvedResizeTarget {
@@ -4166,6 +4205,8 @@ fn remap_vector_path(
 fn apply_resize_result(
     doc: &mut DocumentGraph,
     result: &kcreate_layout::ResizeResult,
+    content: MagicResizeContentOptions,
+    opts: &ResizeOptions,
 ) -> Result<()> {
     for (id, new_bounds) in &result.bounds {
         let Some(node) = doc.get_node_mut(*id) else {
@@ -4203,10 +4244,37 @@ fn apply_resize_result(
             continue;
         };
         let mut meta: kcreate_export::TextLayerMeta = serde_json::from_value(raw.clone())?;
+        // `new_font` is the geometric (proportional) size the rest of
+        // the design scales to — the upper bound for any content-aware
+        // re-fit.
         #[allow(clippy::cast_possible_truncation)]
-        {
-            meta.font_size = *new_font as f32;
-        }
+        let geometric = *new_font as f32;
+        let final_size = if content.refit_text {
+            // Content-aware re-fit: shrink an overflowing headline back
+            // into its reflowed box via shaping, flooring at
+            // `min_font_px`. The box is the node's already-applied new
+            // bounds; the frame options + family come off the node so
+            // columns / insets / wrap-mode are honoured. On a host with
+            // no installed fonts the shaper can't resolve a face, so
+            // `refit_text_to_box` returns `geometric` unchanged — the
+            // graceful fallback keeps the proportional size rather than
+            // collapsing to the floor.
+            let frame = node.text_frame_options();
+            let box_bounds = node.bounds;
+            let style = kcreate_text::paragraph::TextStyle {
+                font_family: meta.font_family.clone(),
+                font_size: geometric,
+                line_height: 1.25,
+            };
+            #[allow(clippy::cast_possible_truncation)]
+            let floor = opts.min_font_px as f32;
+            kcreate_text::refit_text_to_box(
+                &meta.text, &style, &frame, box_bounds, floor, geometric,
+            )
+        } else {
+            geometric
+        };
+        meta.font_size = final_size;
         node.metadata.insert(
             crate::scene_sync::TEXT_LAYER_METADATA_KEY.to_string(),
             serde_json::to_value(&meta)?,
@@ -4234,6 +4302,7 @@ fn resize_cloned_artboard(
     target_bounds: kcreate_core::node::Bounds,
     name: String,
     opts: &ResizeOptions,
+    content: MagicResizeContentOptions,
 ) -> Result<serde_json::Value> {
     // 2. Resize + reposition the clone's artboard frame.
     if let Some(root) = ws.project.document.get_node_mut(new_root) {
@@ -4253,13 +4322,31 @@ fn resize_cloned_artboard(
         .filter_map(|cid| build_resize_node(&ws.project.document, cid))
         .collect();
 
-    // 4. Reflow + apply.
+    // Capture the cloned raster nodes' pre-reflow bounds so the
+    // smart-crop step (4b) can tell which images actually changed
+    // aspect ratio. Done before the reflow mutates them; skipped
+    // entirely when smart-crop is off.
+    let raster_bounds_before = if content.smart_crop {
+        raster_bounds_in_subtree(&ws.project.document, new_root)
+    } else {
+        HashMap::new()
+    };
+
+    // 4. Reflow + apply (bounds, vector geometry, content-aware fonts).
     let result = kcreate_layout::magic_resize(&roots, source_bounds, target_bounds, opts);
-    apply_resize_result(&mut ws.project.document, &result)?;
+    apply_resize_result(&mut ws.project.document, &result, content, opts)?;
 
     // 5. Re-run auto-layout across any LayoutFrame descendants so
     //    stacked/grid groups reflow to their new frame sizes.
     layout_propagate_in_subtree(ws, new_root)?;
+
+    // 4b. Content-aware image smart-crop. Runs after bounds are final
+    //     (post auto-layout) so each raster is cropped to the box it
+    //     actually ends up in. Non-destructive: writes a fresh derived
+    //     blob and repoints only the clone's metadata.
+    if !raster_bounds_before.is_empty() {
+        smart_crop_resized_rasters(ws, &raster_bounds_before)?;
+    }
 
     Ok(ws
         .project
@@ -4268,6 +4355,163 @@ fn resize_cloned_artboard(
         .map_or(serde_json::Value::Null, |n| {
             serde_json::to_value(n).unwrap_or(serde_json::Value::Null)
         }))
+}
+
+/// Map every `RasterLayer` descendant of `root` (carrying image
+/// metadata) to its current bounds. Used by [`resize_cloned_artboard`]
+/// to snapshot raster geometry before the reflow so the smart-crop
+/// step can detect a genuine aspect-ratio change.
+fn raster_bounds_in_subtree(
+    doc: &DocumentGraph,
+    root: Uuid,
+) -> HashMap<Uuid, kcreate_core::node::Bounds> {
+    doc.descendants_of(root)
+        .into_iter()
+        .filter_map(|id| {
+            let node = doc.get_node(id)?;
+            if node.node_type == NodeType::RasterLayer
+                && node
+                    .metadata
+                    .contains_key(crate::scene_sync::RASTER_IMAGE_METADATA_KEY)
+            {
+                Some((id, node.bounds))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// Relative aspect-ratio change below which a raster is left alone: a
+/// near-uniform scale doesn't distort the image, so re-cropping would
+/// only throw pixels away for no visible benefit.
+const SMART_CROP_ASPECT_TOLERANCE: f64 = 0.01;
+
+/// True when two rectangles differ in aspect ratio by more than
+/// [`SMART_CROP_ASPECT_TOLERANCE`] (relative). Degenerate (zero-extent)
+/// bounds never report a change.
+fn aspect_changed(a: kcreate_core::node::Bounds, b: kcreate_core::node::Bounds) -> bool {
+    if a.height.abs() <= f64::EPSILON || b.height.abs() <= f64::EPSILON {
+        return false;
+    }
+    let aspect_a = a.width / a.height;
+    let aspect_b = b.width / b.height;
+    if aspect_a.abs() <= f64::EPSILON {
+        return false;
+    }
+    ((aspect_a - aspect_b) / aspect_a).abs() > SMART_CROP_ASPECT_TOLERANCE
+}
+
+/// Encode an RGBA8 buffer as PNG bytes. Bridge-local twin of
+/// `raster_ops::encode_png` (kept private to that module); used by the
+/// Magic Resize smart-crop to persist a derived crop as a new blob.
+fn encode_rgba_png(rgba: &[u8], width: u32, height: u32) -> Result<Vec<u8>> {
+    let mut png: Vec<u8> = Vec::new();
+    let mut cursor = std::io::Cursor::new(&mut png);
+    image::write_buffer_with_format(
+        &mut cursor,
+        rgba,
+        width,
+        height,
+        image::ColorType::Rgba8,
+        image::ImageFormat::Png,
+    )
+    .map_err(|e| DocumentBridgeError::Io(std::io::Error::other(e.to_string())))?;
+    Ok(png)
+}
+
+/// Smart-crop the reflowed raster layers whose box aspect ratio changed
+/// toward a detected focal point, so the subject is preserved instead
+/// of stretched by the renderer's fill-to-bounds raster path.
+///
+/// `bounds_before` maps each candidate raster node id to its pre-reflow
+/// bounds. For every node whose **new** box aspect differs from its old
+/// box aspect beyond [`SMART_CROP_ASPECT_TOLERANCE`] we: load + decode
+/// the source pixels, compute the max-area crop of the new box's aspect
+/// centred on the focal point ([`kcreate_ai::content_aware_crop`], which
+/// degrades to a center-crop when there's no signal), re-encode the
+/// cropped pixels as a new PNG blob, and repoint the **clone's**
+/// `RasterImageMeta` at it. The original blob is content-addressed and
+/// untouched, so the source artboard stays byte-for-byte unchanged.
+///
+/// Failures on any single node (unreadable blob, undecodable bytes) are
+/// skipped rather than aborting the whole resize — the worst case is
+/// that one image keeps the existing stretch behaviour.
+fn smart_crop_resized_rasters(
+    ws: &mut Workspace,
+    bounds_before: &HashMap<Uuid, kcreate_core::node::Bounds>,
+) -> Result<()> {
+    for (id, old_bounds) in bounds_before {
+        let Some(node) = ws.project.document.get_node(*id) else {
+            continue;
+        };
+        let new_bounds = node.bounds;
+        if !aspect_changed(*old_bounds, new_bounds) {
+            continue;
+        }
+        let Some(meta_value) = node
+            .metadata
+            .get(crate::scene_sync::RASTER_IMAGE_METADATA_KEY)
+        else {
+            continue;
+        };
+        let meta: crate::scene_sync::RasterImageMeta = serde_json::from_value(meta_value.clone())?;
+
+        // Read the source blob under the store lock; decode outside it.
+        let bytes = {
+            let store = ws.store.lock();
+            match store.blobs().load(&meta.blob_hash) {
+                Ok(b) => b,
+                Err(_) => continue,
+            }
+        };
+        let Ok(decoded) = image::load_from_memory(&bytes) else {
+            continue;
+        };
+        let rgba = decoded.to_rgba8();
+        let (src_w, src_h) = rgba.dimensions();
+
+        // Target aspect = the reflowed box. The crop helper only uses
+        // the ratio, so the absolute pixel size is irrelevant; round to
+        // whole pixels and floor at 1 to stay in range.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let target_w = new_bounds.width.round().clamp(1.0, f64::from(u32::MAX)) as u32;
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let target_h = new_bounds.height.round().clamp(1.0, f64::from(u32::MAX)) as u32;
+
+        let Some(crop) =
+            kcreate_ai::content_aware_crop(rgba.as_raw(), src_w, src_h, target_w, target_h)
+        else {
+            continue;
+        };
+        // A full-frame crop is a no-op (source already matches the
+        // target aspect) — skip the re-encode + blob churn.
+        if crop.x == 0 && crop.y == 0 && crop.width == src_w && crop.height == src_h {
+            continue;
+        }
+
+        let cropped = kcreate_ai::apply_crop(rgba.as_raw(), src_w, src_h, crop);
+        let png = encode_rgba_png(&cropped, crop.width, crop.height)?;
+        let blob = ws
+            .store
+            .lock()
+            .blobs()
+            .store(&png, "image/png")
+            .map_err(|e| DocumentBridgeError::Io(std::io::Error::other(e.to_string())))?;
+        let new_meta = crate::scene_sync::RasterImageMeta {
+            blob_hash: blob.hash,
+            width: crop.width,
+            height: crop.height,
+        };
+        if let Some(node) = ws.project.document.get_node_mut(*id) {
+            node.metadata.insert(
+                crate::scene_sync::RASTER_IMAGE_METADATA_KEY.to_string(),
+                serde_json::to_value(&new_meta)?,
+            );
+            node.touch();
+        }
+    }
+    Ok(())
 }
 
 /// Remove a batch of (sub)trees from the document graph, ignoring ids
@@ -4310,6 +4554,23 @@ fn rollback_artboards(ws: &mut Workspace, ids: &[Uuid]) {
 /// leaves the document exactly as it found it (and never logs an
 /// operation). See [`rollback_artboards`].
 pub fn magic_resize(source_artboard_id: Uuid, targets: &[ResizeTargetSpec]) -> Result<Vec<Uuid>> {
+    magic_resize_with_content(
+        source_artboard_id,
+        targets,
+        MagicResizeContentOptions::default(),
+    )
+}
+
+/// [`magic_resize`] with explicit control over the content-aware
+/// behaviour (text re-fit + image smart-crop). `magic_resize` defers
+/// here with both toggles on; callers that want the pure geometric
+/// reflow pass a [`MagicResizeContentOptions`] with the relevant flag
+/// cleared. Same atomicity + single-undo guarantees as `magic_resize`.
+pub fn magic_resize_with_content(
+    source_artboard_id: Uuid,
+    targets: &[ResizeTargetSpec],
+    content: MagicResizeContentOptions,
+) -> Result<Vec<Uuid>> {
     // One-time gap between generated artboards, matching the spacing
     // `artboard_create` / `duplicate_artboard` use.
     const GAP: f64 = 100.0;
@@ -4381,7 +4642,15 @@ pub fn magic_resize(source_artboard_id: Uuid, targets: &[ResizeTargetSpec]) -> R
         //       result, and re-run auto-layout. Any failure here leaves
         //       `new_root` half-built, so unwind it *and* the prior
         //       targets before surfacing the error.
-        match resize_cloned_artboard(ws, new_root, source_bounds, target_bounds, name, &opts) {
+        match resize_cloned_artboard(
+            ws,
+            new_root,
+            source_bounds,
+            target_bounds,
+            name,
+            &opts,
+            content,
+        ) {
             Ok(snapshot) => {
                 cursor_x += target.width + GAP;
                 snapshots.push(snapshot);
@@ -4407,6 +4676,206 @@ pub fn magic_resize(source_artboard_id: Uuid, targets: &[ResizeTargetSpec]) -> R
     let _ = sync_scene_locked(&mut guard);
     drop(guard);
     Ok(new_ids)
+}
+
+/// Request payload for [`magic_resize_export_png`]. JSON-string wire
+/// (camelCase) mirrored by `MagicResizeExportRequest` in
+/// `apps/desktop/shared/scene.ts`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MagicResizeExportRequest {
+    /// Absolute directory the PNGs are written into (vetted by the
+    /// main process's directory-picker before it reaches the bridge).
+    pub output_dir: String,
+    /// Content-aware behaviour for the underlying resize. Defaults on.
+    #[serde(default)]
+    pub content: MagicResizeContentOptions,
+    /// Optional cap on the longest exported edge (px). When set and an
+    /// artboard's longest side exceeds it, that PNG is scaled down to
+    /// fit; otherwise every artboard exports at its full pixel size.
+    #[serde(default)]
+    pub max_dim_px: Option<u32>,
+}
+
+/// Outcome of [`magic_resize_export_png`]: the generated artboard ids
+/// plus a per-file export report. Serialised (snake_case) to JSON for
+/// the N-API boundary.
+#[derive(Debug, Clone, Serialize)]
+pub struct MagicResizeExportReport {
+    /// Ids of the artboards created by the resize, in target order.
+    pub artboard_ids: Vec<Uuid>,
+    /// Directory the files were written to.
+    pub output_dir: String,
+    /// Absolute paths of the PNGs successfully written.
+    pub written: Vec<String>,
+    /// `"filename: error"` for any artboard that failed to export.
+    pub failed: Vec<String>,
+    /// Wall-clock duration of the parallel render, in milliseconds.
+    pub duration_ms: u64,
+}
+
+/// **Magic Resize → batch PNG export** (Canva "resize & download all").
+///
+/// One-shot: run [`magic_resize_with_content`] to generate the target
+/// artboards (a single undoable op, with content-aware text re-fit +
+/// image smart-crop baked in), then render every generated artboard to
+/// a PNG in `request.output_dir` via the parallel batch driver
+/// ([`kcreate_export::run_png_batch_parallel`]).
+///
+/// Rendering is done off the workspace lock: we build each artboard's
+/// translated [`Scene`] + [`PngExportOptions`] while holding the lock,
+/// then drop it before the (CPU-heavy, parallel) render so no other
+/// bridge call is blocked for the duration. The resize itself is the
+/// only mutation; the export is read-only and never touches the
+/// operation log, so a single undo still removes every artboard.
+///
+/// Returns a [`MagicResizeExportReport`] (generated ids + per-file
+/// success/failure) so the host can surface a precise result.
+pub fn magic_resize_export_png(
+    source_artboard_id: Uuid,
+    targets: &[ResizeTargetSpec],
+    request: &MagicResizeExportRequest,
+) -> Result<MagicResizeExportReport> {
+    if request.output_dir.trim().is_empty() {
+        return Err(DocumentBridgeError::InvalidArgument {
+            argument: "output_dir".to_string(),
+            value: "an output directory is required".to_string(),
+        });
+    }
+    let output_dir = PathBuf::from(&request.output_dir);
+
+    // 1. Resize — its own single undoable operation. Smart-crop derives
+    //    are committed to the blob store here, so the scenes built below
+    //    resolve the cropped pixels.
+    let artboard_ids = magic_resize_with_content(source_artboard_id, targets, request.content)?;
+
+    // 2. Build one translated Scene + PngExportOptions per generated
+    //    artboard while holding the workspace + blob lock; collect them
+    //    into render payloads, then drop the lock before rendering.
+    let items: Vec<PngBatchItem> = {
+        let guard = slot().read();
+        let ws = guard.as_ref().ok_or(DocumentBridgeError::NoProject)?;
+        let mut items = Vec::with_capacity(artboard_ids.len());
+        let mut used_names: HashSet<String> = HashSet::with_capacity(artboard_ids.len());
+        for (index, id) in artboard_ids.iter().enumerate() {
+            let Some(node) = ws.project.document.get_node(*id) else {
+                continue;
+            };
+            let ab_bounds = node.bounds;
+            let filename = unique_png_filename(&node.name, index, &mut used_names);
+
+            // Whole-document scene with embedded raster pixels resolved
+            // (Some(blobs)); translate so this artboard lands at the
+            // renderer origin and every other artboard falls outside the
+            // crop. Ephemeral SceneSync so the live scene cache + dirty
+            // set are untouched (same discipline as the thumbnail path).
+            let mut sync = crate::scene_sync::SceneSync::default();
+            let mut scene = sync.sync_document_to_scene_borrowed(
+                &ws.project.document,
+                Some(ws.store.lock().blobs()),
+                &[],
+            );
+            #[allow(clippy::cast_possible_truncation)]
+            let dx = -ab_bounds.x as f32;
+            #[allow(clippy::cast_possible_truncation)]
+            let dy = -ab_bounds.y as f32;
+            for obj in &mut scene.objects {
+                obj.translation.0 += dx;
+                obj.translation.1 += dy;
+            }
+
+            let options = png_export_options_for_bounds(ab_bounds, request.max_dim_px);
+            items.push(PngBatchItem {
+                filename,
+                scene,
+                options,
+            });
+        }
+        items
+    };
+
+    // 3. Render every artboard in parallel, off the lock. The batch
+    //    driver creates `output_dir` and isolates per-item failures.
+    let cancel = AtomicBool::new(false);
+    let result = run_png_batch_parallel(&items, &output_dir, &cancel, |_progress| {})?;
+
+    let written = result
+        .succeeded
+        .iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect();
+    let failed = result
+        .failed
+        .iter()
+        .map(|(name, err)| format!("{name}: {err}"))
+        .collect();
+    Ok(MagicResizeExportReport {
+        artboard_ids,
+        output_dir: output_dir.to_string_lossy().into_owned(),
+        written,
+        failed,
+        duration_ms: result.duration_ms,
+    })
+}
+
+/// Build [`PngExportOptions`] that render `bounds` at full pixel size,
+/// optionally scaled down so the longest edge fits within `max_dim_px`.
+/// White background matches the single-artboard / thumbnail exporters.
+fn png_export_options_for_bounds(
+    bounds: kcreate_core::node::Bounds,
+    max_dim_px: Option<u32>,
+) -> PngExportOptions {
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let width = bounds.width.max(1.0) as u32;
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let height = bounds.height.max(1.0) as u32;
+    let scale = match max_dim_px {
+        Some(cap) if cap > 0 => {
+            let longest = bounds.width.max(bounds.height).max(1.0);
+            if longest > f64::from(cap) {
+                #[allow(clippy::cast_possible_truncation)]
+                let s = (f64::from(cap) / longest) as f32;
+                s
+            } else {
+                1.0
+            }
+        }
+        _ => 1.0,
+    };
+    PngExportOptions {
+        width,
+        height,
+        scale,
+        background: Some(kcreate_renderer::geometry::Color::rgba(1.0, 1.0, 1.0, 1.0)),
+    }
+}
+
+/// Derive a filesystem-safe, unique `.png` filename from an artboard
+/// name. Non-alphanumeric runs collapse to a single `_`; a numeric
+/// prefix keeps the batch in target order and guarantees uniqueness
+/// even when two artboards share a name.
+fn unique_png_filename(name: &str, index: usize, used: &mut HashSet<String>) -> String {
+    let mut slug = String::with_capacity(name.len());
+    let mut prev_us = false;
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() {
+            slug.push(ch.to_ascii_lowercase());
+            prev_us = false;
+        } else if !prev_us {
+            slug.push('_');
+            prev_us = true;
+        }
+    }
+    let slug = slug.trim_matches('_');
+    let base = if slug.is_empty() { "artboard" } else { slug };
+    // Zero-padded index keeps lexical order == target order.
+    let mut candidate = format!("{:02}_{base}.png", index + 1);
+    let mut dedup = 1u32;
+    while !used.insert(candidate.clone()) {
+        candidate = format!("{:02}_{base}_{dedup}.png", index + 1);
+        dedup += 1;
+    }
+    candidate
 }
 
 // -----------------------------------------------------------------------------
@@ -15496,6 +15965,14 @@ mod tests {
         // Header band — full width, pinned to the top.
         let header = bounds(o.x, o.y, 1080.0, 140.0);
         add_shape(ab, header, coral, rect_path(header));
+        // Logo badge — a small sun disc centered in the header.
+        let logo = bounds(o.x + 484.0, o.y + 30.0, 112.0, 112.0);
+        add_shape(
+            ab,
+            logo,
+            sun,
+            ellipse_path(o.x + 540.0, o.y + 86.0, 52.0, 52.0),
+        );
         // Headline + subhead — near the top, centered horizontally.
         add_label(
             ab,
@@ -15511,14 +15988,11 @@ mod tests {
             34.0,
             sun,
         );
-        // Hero sun disc — centered on both axes.
-        let disc = bounds(o.x + 360.0, o.y + 400.0, 360.0, 360.0);
-        add_shape(
-            ab,
-            disc,
-            sun,
-            ellipse_path(o.x + 540.0, o.y + 580.0, 180.0, 180.0),
-        );
+        // Hero photo — a real raster image (sky / ground + a bright sun
+        // subject). Magic Resize's smart-crop reframes it toward the
+        // subject on every aspect change instead of stretching it.
+        let hero = bounds(o.x + 140.0, o.y + 392.0, 800.0, 376.0);
+        add_raster_node(ab, hero, 600, 360, &hero_photo_rgba(600, 360));
         // Body copy.
         add_label(
             ab,
@@ -15561,7 +16035,11 @@ mod tests {
             .expect("artboard present")
             .bounds;
         let mut sync = crate::scene_sync::SceneSync::default();
-        let mut scene = sync.sync_document_to_scene_borrowed(&ws.project.document, None, &[]);
+        let mut scene = sync.sync_document_to_scene_borrowed(
+            &ws.project.document,
+            Some(ws.store.lock().blobs()),
+            &[],
+        );
         drop(guard);
 
         // Translate so the target artboard lands at the renderer origin;
@@ -15637,6 +16115,523 @@ mod tests {
             std::fs::write(out_dir.join("02_story_1080x1920.png"), &story.0).expect("write story");
             std::fs::write(out_dir.join("03_a4_2480x3508.png"), &a4.0).expect("write a4");
         }
+        project_close();
+    }
+
+    // ===================================================================
+    // H6 — content-aware Magic Resize: text re-fit, image smart-crop,
+    // batch resize-and-export. Helpers + tests.
+    // ===================================================================
+
+    /// True when the host has at least one installed font face, so the
+    /// shaper can actually measure text. On a truly headless box with no
+    /// fonts, content-aware re-fit degrades to the geometric size by
+    /// design and the box-fit assertions would be vacuous — those tests
+    /// early-return instead of asserting nothing.
+    fn fonts_available() -> bool {
+        kcreate_text::FontManager::new().font_count() > 0
+    }
+
+    /// Read a text node's `(text, family, font_px, frame, box_bounds)`.
+    fn text_layer(
+        id: Uuid,
+    ) -> (
+        String,
+        String,
+        f32,
+        kcreate_core::node::TextFrameOptions,
+        kcreate_core::node::Bounds,
+    ) {
+        let guard = slot().write();
+        let ws = guard.as_ref().expect("project open");
+        let node = ws.project.document.get_node(id).expect("node present");
+        let raw = node
+            .metadata
+            .get(crate::scene_sync::TEXT_LAYER_METADATA_KEY)
+            .expect("text meta present");
+        let meta: crate::scene_sync::TextLayerMeta =
+            serde_json::from_value(raw.clone()).expect("parse text meta");
+        (
+            meta.text,
+            meta.font_family,
+            meta.font_size,
+            node.text_frame_options(),
+            node.bounds,
+        )
+    }
+
+    /// Shape `text` at `font_px` in `box_bounds` and report whether it
+    /// fits (no overflow). Uses the same `layout_paragraph` path the
+    /// content-aware re-fit measures with, so a `true` here means the
+    /// renderer would draw every line inside the box.
+    fn text_fits_box_at(
+        text: &str,
+        family: &str,
+        font_px: f32,
+        frame: &kcreate_core::node::TextFrameOptions,
+        box_bounds: kcreate_core::node::Bounds,
+    ) -> bool {
+        let style = kcreate_text::paragraph::TextStyle {
+            font_family: family.to_string(),
+            font_size: font_px,
+            line_height: 1.25,
+        };
+        match kcreate_text::layout_paragraph(text, &style, frame, box_bounds, None) {
+            Ok(layout) => !layout.overflow,
+            Err(_) => false,
+        }
+    }
+
+    /// True when the text node at `id` fits its own box at its current
+    /// font size.
+    fn text_node_fits(id: Uuid) -> bool {
+        let (text, family, size, frame, box_bounds) = text_layer(id);
+        text_fits_box_at(&text, &family, size, &frame, box_bounds)
+    }
+
+    /// Insert a `TextLayer` headline child with custom text + font size.
+    fn add_headline(
+        artboard: Uuid,
+        b: kcreate_core::node::Bounds,
+        text: &str,
+        font_px: f32,
+    ) -> Uuid {
+        let mut guard = slot().write();
+        let ws = guard.as_mut().expect("project open");
+        let mut node = Node::new(NodeType::TextLayer, "headline".to_string());
+        node.parent_id = Some(artboard);
+        node.bounds = b;
+        let meta = crate::scene_sync::TextLayerMeta {
+            text: text.to_string(),
+            font_family: "Inter".to_string(),
+            font_size: font_px,
+        };
+        node.metadata.insert(
+            crate::scene_sync::TEXT_LAYER_METADATA_KEY.to_string(),
+            serde_json::to_value(&meta).expect("serialize text meta"),
+        );
+        let id = ws
+            .project
+            .document
+            .insert_node(node)
+            .expect("insert headline");
+        drop(guard);
+        id
+    }
+
+    /// A 1080² poster whose single child is a long headline authored to
+    /// *just* fit its box. A drastic downscale (e.g. → 320²) clamps the
+    /// geometric font larger, relative to its box, than at the source,
+    /// so the geometric size overflows and the content-aware path must
+    /// shrink it back into frame.
+    fn build_refit_poster() -> Uuid {
+        let ab = artboard_create(None, "Refit".to_string(), 1080.0, 1080.0).expect("artboard");
+        let o = node_bounds(ab);
+        add_headline(
+            ab,
+            bounds(o.x + 60.0, o.y + 140.0, 960.0, 260.0),
+            "SUMMER FEST DOWN BY THE RIVERSIDE PARK - LIVE MUSIC, FOOD TRUCKS AND FIREWORKS ALL WEEKEND LONG",
+            46.0,
+        );
+        ab
+    }
+
+    /// Build an `width`×`height` RGBA8 image: a flat `bg` canvas with a
+    /// dense checkerboard "subject" block at `subject` = `(x, y, w, h)`
+    /// alternating `fg` / its inverse. The checkerboard gives the focal
+    /// detector real edges to lock onto; the surround is featureless.
+    fn checkerboard_subject_rgba(
+        width: u32,
+        height: u32,
+        subject: (u32, u32, u32, u32),
+        fg: [u8; 3],
+        bg: [u8; 3],
+    ) -> Vec<u8> {
+        let (sx, sy, sw, sh) = subject;
+        let inv = [255 - fg[0], 255 - fg[1], 255 - fg[2]];
+        let mut px = Vec::with_capacity((width as usize) * (height as usize) * 4);
+        for y in 0..height {
+            for x in 0..width {
+                let in_subject = x >= sx && x < sx + sw && y >= sy && y < sy + sh;
+                let rgb = if in_subject {
+                    if ((x / 8) + (y / 8)) % 2 == 0 {
+                        fg
+                    } else {
+                        inv
+                    }
+                } else {
+                    bg
+                };
+                px.extend_from_slice(&[rgb[0], rgb[1], rgb[2], 255]);
+            }
+        }
+        px
+    }
+
+    /// A small "photo" for the poster's hero slot: two flat sky / ground
+    /// bands with a bright off-centre sun disc. The disc + horizon give
+    /// the focal detector real edges to track; the bands are otherwise
+    /// featureless.
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_sign_loss,
+        clippy::cast_possible_truncation
+    )]
+    fn hero_photo_rgba(width: u32, height: u32) -> Vec<u8> {
+        let sky = [80u8, 140, 220];
+        let ground = [40u8, 120, 70];
+        let sun = [255u8, 220, 90];
+        let cx = width as f32 * 0.62;
+        let cy = height as f32 * 0.34;
+        let r = (width.min(height) as f32) * 0.18;
+        let horizon = (height as f32 * 0.62) as u32;
+        let mut px = Vec::with_capacity((width as usize) * (height as usize) * 4);
+        for y in 0..height {
+            for x in 0..width {
+                let dx = x as f32 - cx;
+                let dy = y as f32 - cy;
+                let rgb = if dx * dx + dy * dy <= r * r {
+                    sun
+                } else if y < horizon {
+                    sky
+                } else {
+                    ground
+                };
+                px.extend_from_slice(&[rgb[0], rgb[1], rgb[2], 255]);
+            }
+        }
+        px
+    }
+
+    /// Count pixels close to `target` (squared RGB distance < 60²), so a
+    /// "subject retained" assertion can't be satisfied by background.
+    fn count_color_pixels(rgba: &[u8], target: [u8; 3]) -> usize {
+        rgba.chunks_exact(4)
+            .filter(|p| {
+                let dr = i32::from(p[0]) - i32::from(target[0]);
+                let dg = i32::from(p[1]) - i32::from(target[1]);
+                let db = i32::from(p[2]) - i32::from(target[2]);
+                dr * dr + dg * dg + db * db < 60 * 60
+            })
+            .count()
+    }
+
+    /// PNG-encode `pixels` (RGBA8, `img_w`×`img_h`), store it as a blob,
+    /// and attach a `RasterLayer` child at `box_bounds` pointing at it.
+    fn add_raster_node(
+        artboard: Uuid,
+        box_bounds: kcreate_core::node::Bounds,
+        img_w: u32,
+        img_h: u32,
+        pixels: &[u8],
+    ) -> Uuid {
+        let png = encode_rgba_png(pixels, img_w, img_h).expect("encode raster png");
+        let mut guard = slot().write();
+        let ws = guard.as_mut().expect("project open");
+        let blob = ws
+            .store
+            .lock()
+            .blobs()
+            .store(&png, "image/png")
+            .expect("store raster blob");
+        let meta = crate::scene_sync::RasterImageMeta {
+            blob_hash: blob.hash,
+            width: img_w,
+            height: img_h,
+        };
+        let mut node = Node::new(NodeType::RasterLayer, "photo".to_string());
+        node.parent_id = Some(artboard);
+        node.bounds = box_bounds;
+        node.metadata.insert(
+            crate::scene_sync::RASTER_IMAGE_METADATA_KEY.to_string(),
+            serde_json::to_value(&meta).expect("serialize raster meta"),
+        );
+        let id = ws
+            .project
+            .document
+            .insert_node(node)
+            .expect("insert raster");
+        drop(guard);
+        id
+    }
+
+    /// A 1080² poster whose single child is a full-bleed raster carrying
+    /// a centred checkerboard subject, so a square→banner resize forces a
+    /// genuine aspect-ratio change for the smart-crop to act on.
+    fn build_raster_poster(subject: (u32, u32, u32, u32)) -> Uuid {
+        let ab = artboard_create(None, "Photo".to_string(), 1080.0, 1080.0).expect("artboard");
+        let o = node_bounds(ab);
+        let pixels = checkerboard_subject_rgba(800, 800, subject, [220, 40, 40], [235, 235, 235]);
+        add_raster_node(ab, bounds(o.x, o.y, 1080.0, 1080.0), 800, 800, &pixels);
+        ab
+    }
+
+    /// Read a raster node's image metadata.
+    fn raster_meta(id: Uuid) -> crate::scene_sync::RasterImageMeta {
+        let guard = slot().write();
+        let ws = guard.as_ref().expect("project open");
+        let node = ws.project.document.get_node(id).expect("node present");
+        let raw = node
+            .metadata
+            .get(crate::scene_sync::RASTER_IMAGE_METADATA_KEY)
+            .expect("raster meta present");
+        serde_json::from_value(raw.clone()).expect("parse raster meta")
+    }
+
+    /// Load + decode a blob to RGBA8, returning `(pixels, width, height)`.
+    fn load_blob_rgba(hash: &str) -> (Vec<u8>, u32, u32) {
+        let bytes = {
+            let guard = slot().write();
+            let ws = guard.as_ref().expect("project open");
+            let store = ws.store.lock();
+            store.blobs().load(hash).expect("load blob")
+        };
+        let img = image::load_from_memory(&bytes)
+            .expect("decode blob")
+            .to_rgba8();
+        let (w, h) = img.dimensions();
+        (img.into_raw(), w, h)
+    }
+
+    #[test]
+    #[serial]
+    fn magic_resize_refits_headline_within_its_box_across_aspects() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("mr_refit", dir.path()).expect("create");
+
+        // No fonts → re-fit degrades to geometric by design and these
+        // bounds assertions would be vacuous. Skip rather than lie.
+        if !fonts_available() {
+            project_close();
+            return;
+        }
+
+        let src = build_refit_poster();
+        // Source headline must itself fit (it's authored to).
+        assert!(
+            text_node_fits(child_ids(src)[0]),
+            "source headline overflows its own box"
+        );
+
+        let targets = [
+            spec_preset("Instagram Story"), // 1080×1920 — taller
+            spec_px(2480.0, 3508.0),        // A4 — larger
+            spec_px(320.0, 320.0),          // drastic downscale
+        ];
+
+        // Same source, same targets, re-fit OFF (pure geometric) vs ON.
+        let geo = magic_resize_with_content(
+            src,
+            &targets,
+            MagicResizeContentOptions {
+                refit_text: false,
+                smart_crop: false,
+            },
+        )
+        .expect("geometric resize");
+        let cw = magic_resize_with_content(
+            src,
+            &targets,
+            MagicResizeContentOptions {
+                refit_text: true,
+                smart_crop: false,
+            },
+        )
+        .expect("content-aware resize");
+
+        let mut shrank_somewhere = false;
+        let mut trace: Vec<String> = Vec::new();
+        for i in 0..targets.len() {
+            let geo_headline = child_ids(geo[i])[0];
+            let cw_headline = child_ids(cw[i])[0];
+            let geo_font = node_font(geo_headline);
+            let cw_font = node_font(cw_headline);
+            trace.push(format!("[target {i}: geo={geo_font:.2} cw={cw_font:.2}]"));
+
+            // Re-fit never inflates past the proportional (geometric) size.
+            assert!(
+                cw_font <= geo_font + 0.5,
+                "target {i}: re-fit {cw_font} exceeded geometric {geo_font}"
+            );
+            // Re-fit keeps the headline inside its reflowed box.
+            assert!(
+                text_node_fits(cw_headline),
+                "target {i}: re-fit headline overflows its box at {cw_font}px"
+            );
+            if cw_font + 0.5 < geo_font {
+                shrank_somewhere = true;
+            }
+        }
+
+        // The drastic downscale forces the geometric font past its box,
+        // so content-aware re-fit must have shrunk the headline somewhere
+        // — proving the shaping path is wired into the resize.
+        assert!(
+            shrank_somewhere,
+            "content-aware re-fit never shrank below geometric: {}",
+            trace.join(" ")
+        );
+        project_close();
+    }
+
+    #[test]
+    #[serial]
+    fn magic_resize_smart_crops_raster_toward_subject() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("mr_crop", dir.path()).expect("create");
+
+        // Centred subject so the retained-subject assertion is robust to
+        // focal-vs-centre; focal precision itself is unit-tested in
+        // kcreate_ai::focal_crop.
+        let src = build_raster_poster((300, 300, 200, 200));
+        let src_raster = child_ids(src)[0];
+        let original_hash = raster_meta(src_raster).blob_hash;
+
+        // Square → wide banner: a genuine aspect change that the renderer
+        // would otherwise resolve by distorting the image.
+        let target = spec_px(1600.0, 600.0);
+
+        // --- Smart-crop ON ---
+        let on = magic_resize_with_content(
+            src,
+            std::slice::from_ref(&target),
+            MagicResizeContentOptions {
+                refit_text: false,
+                smart_crop: true,
+            },
+        )
+        .expect("resize on");
+        let clone_raster = child_ids(on[0])[0];
+        let cropped = raster_meta(clone_raster);
+        assert_ne!(
+            cropped.blob_hash, original_hash,
+            "smart-crop must derive a new blob, not reuse the stretched source"
+        );
+
+        // The derived crop's pixel aspect matches the reflowed box, so the
+        // renderer's fill-to-bounds path draws it undistorted.
+        let box_bounds = node_bounds(clone_raster);
+        let crop_aspect = f64::from(cropped.width) / f64::from(cropped.height);
+        let box_aspect = box_bounds.width / box_bounds.height;
+        assert!(
+            ((crop_aspect - box_aspect) / box_aspect).abs() < 0.02,
+            "crop aspect {crop_aspect} should match box aspect {box_aspect}"
+        );
+
+        // The subject survived: the decoded crop still carries the warm-red
+        // checkerboard, not just flat background.
+        let (px, w, h) = load_blob_rgba(&cropped.blob_hash);
+        assert_eq!(
+            (w, h),
+            (cropped.width, cropped.height),
+            "blob dims match meta"
+        );
+        let subject_px = count_color_pixels(&px, [220, 40, 40]);
+        assert!(
+            subject_px > 500,
+            "subject must be retained in the crop (found {subject_px} subject px)"
+        );
+
+        // Source blob is content-addressed and untouched (non-destructive).
+        assert_eq!(
+            raster_meta(src_raster).blob_hash,
+            original_hash,
+            "source raster blob must not change"
+        );
+
+        // --- Smart-crop OFF: the clone keeps the source blob verbatim ---
+        let off = magic_resize_with_content(
+            src,
+            std::slice::from_ref(&target),
+            MagicResizeContentOptions {
+                refit_text: false,
+                smart_crop: false,
+            },
+        )
+        .expect("resize off");
+        let off_raster = child_ids(off[0])[0];
+        assert_eq!(
+            raster_meta(off_raster).blob_hash,
+            original_hash,
+            "smart-crop off must leave the raster blob untouched"
+        );
+        project_close();
+    }
+
+    #[test]
+    #[serial]
+    fn magic_resize_export_png_writes_non_blank_pngs_in_one_undo() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("mr_export", dir.path()).expect("create");
+        let src = build_promo_poster();
+
+        let out = tmpdir();
+        let out_dir = out.path().join("sizes");
+
+        let depth_before = document_status().expect("status").undo_depth;
+        let ab_before = artboard_count();
+
+        let targets = [
+            spec_preset("Instagram Post"),  // 1080×1080
+            spec_preset("Instagram Story"), // 1080×1920
+            spec_px(2480.0, 3508.0),        // A4
+        ];
+        let request = MagicResizeExportRequest {
+            output_dir: out_dir.to_string_lossy().into_owned(),
+            content: MagicResizeContentOptions::default(),
+            max_dim_px: Some(900),
+        };
+        let report = magic_resize_export_png(src, &targets, &request).expect("export");
+
+        // One PNG per target, none failed.
+        assert_eq!(report.written.len(), targets.len(), "one PNG per target");
+        assert!(
+            report.failed.is_empty(),
+            "no per-file failures: {:?}",
+            report.failed
+        );
+        assert_eq!(report.artboard_ids.len(), targets.len());
+
+        // Each written file exists, is a real PNG, and is non-blank.
+        for path in &report.written {
+            let bytes = std::fs::read(path).expect("read exported png");
+            assert!(
+                bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
+                "{path} is not a PNG"
+            );
+            assert!(
+                bytes.len() > 2_000,
+                "{path} too small ({} bytes) — likely blank",
+                bytes.len()
+            );
+        }
+
+        // The resize added N artboards…
+        assert_eq!(artboard_count(), ab_before + targets.len());
+        // …under exactly ONE undoable op (the export is read-only — it
+        // must not record a second entry on top of the resize).
+        let after = document_status().expect("status");
+        assert_eq!(
+            after.undo_depth,
+            depth_before + 1,
+            "batch resize-export must be a single undoable op"
+        );
+        assert!(after.can_undo);
+
+        // One undo retires the entire batch. Magic Resize is a
+        // graph-mutating op, so (per `document_undo`) the inverse is
+        // folded back by the host tree, not the bridge graph — we assert
+        // the log contract here, matching `magic_resize_is_a_single_undoable_op`.
+        document_undo().expect("undo");
+        let undone = document_status().expect("status");
+        assert_eq!(
+            undone.undo_depth, depth_before,
+            "one undo retires the whole batch resize-export"
+        );
+        assert!(undone.can_redo);
         project_close();
     }
 }

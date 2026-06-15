@@ -2658,20 +2658,16 @@ function EditorPageInner({
         open={magicResizeSource !== null}
         source={magicResizeSource}
         presets={artboardPresets}
-        onResize={(targets, content) => {
-          if (magicResizeSource) {
-            void handleMagicResize(magicResizeSource.id, targets, content);
-          }
-        }}
-        onExport={(targets, content) => {
-          if (magicResizeSource) {
-            void handleMagicResizeExport(
-              magicResizeSource.id,
-              targets,
-              content,
-            );
-          }
-        }}
+        onResize={(targets, content) =>
+          magicResizeSource
+            ? handleMagicResize(magicResizeSource.id, targets, content)
+            : undefined
+        }
+        onExport={(targets, content) =>
+          magicResizeSource
+            ? handleMagicResizeExport(magicResizeSource.id, targets, content)
+            : undefined
+        }
         onClose={handleMagicResizeClose}
       />
       <TemplatePicker

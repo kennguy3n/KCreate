@@ -4755,6 +4755,21 @@ pub fn magic_resize_export_png(
     let items: Vec<PngBatchItem> = {
         let guard = slot().read();
         let ws = guard.as_ref().ok_or(DocumentBridgeError::NoProject)?;
+
+        // Build the whole-document scene ONCE — a single graph traversal
+        // and a single blob-resolution pass — with embedded raster pixels
+        // resolved (Some(blobs)). Each artboard's render payload is then a
+        // cheap clone + translate of this base, instead of re-syncing the
+        // entire document per target (previously O(targets × document)).
+        // Ephemeral SceneSync so the live scene cache + dirty set are
+        // untouched (same discipline as the thumbnail path).
+        let mut sync = crate::scene_sync::SceneSync::default();
+        let base_scene = sync.sync_document_to_scene_borrowed(
+            &ws.project.document,
+            Some(ws.store.lock().blobs()),
+            &[],
+        );
+
         let mut items = Vec::with_capacity(artboard_ids.len());
         let mut used_names: HashSet<String> = HashSet::with_capacity(artboard_ids.len());
         for (index, id) in artboard_ids.iter().enumerate() {
@@ -4764,17 +4779,10 @@ pub fn magic_resize_export_png(
             let ab_bounds = node.bounds;
             let filename = unique_png_filename(&node.name, index, &mut used_names);
 
-            // Whole-document scene with embedded raster pixels resolved
-            // (Some(blobs)); translate so this artboard lands at the
-            // renderer origin and every other artboard falls outside the
-            // crop. Ephemeral SceneSync so the live scene cache + dirty
-            // set are untouched (same discipline as the thumbnail path).
-            let mut sync = crate::scene_sync::SceneSync::default();
-            let mut scene = sync.sync_document_to_scene_borrowed(
-                &ws.project.document,
-                Some(ws.store.lock().blobs()),
-                &[],
-            );
+            // Translate a copy of the base scene so this artboard lands at
+            // the renderer origin and every other artboard falls outside
+            // the export crop.
+            let mut scene = base_scene.clone();
             #[allow(clippy::cast_possible_truncation)]
             let dx = -ab_bounds.x as f32;
             #[allow(clippy::cast_possible_truncation)]

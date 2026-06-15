@@ -308,6 +308,49 @@ describe("MagicResizeDialog", () => {
     expect(resizeCalls).toBe(1);
   });
 
+  it("re-enables the actions when the export settles without closing the dialog", async () => {
+    // Mirrors EditorPage: onExport returns the async handler's Promise.
+    // When that handler bails early — e.g. the user cancels the export
+    // directory picker — it resolves WITHOUT the parent closing the
+    // dialog. The busy latch must clear so the buttons don't stay stuck
+    // on "Exporting…" forever (Devin Review bug).
+    let resolveExport: (() => void) | null = null;
+    render(
+      <MagicResizeDialog
+        open
+        source={SOURCE}
+        presets={PRESETS}
+        onResize={noop}
+        onExport={() =>
+          new Promise<void>((resolve) => {
+            resolveExport = resolve;
+          })
+        }
+        onClose={noop}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("checkbox", { name: /Instagram Story/ }));
+    const exportButton = screen.getByRole("button", {
+      name: /Resize & export all/,
+    });
+    fireEvent.click(exportButton);
+
+    // Latched while the action is in flight.
+    expect(exportButton).toBeDisabled();
+    expect(exportButton).toHaveTextContent(/Exporting/);
+
+    // The handler resolves but does NOT close the dialog (cancel path).
+    await act(async () => {
+      resolveExport?.();
+      await Promise.resolve();
+    });
+
+    // Busy cleared → the action is usable again with the dialog open.
+    expect(exportButton).toBeEnabled();
+    expect(exportButton).toHaveTextContent(/Resize & export all/);
+  });
+
   it("Cancel closes without resizing", () => {
     let closed = false;
     let resized = false;

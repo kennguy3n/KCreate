@@ -232,9 +232,12 @@ pub fn crop_for_focal(
 }
 
 /// Apply a [`FocalCrop`] to an RGBA8 buffer, returning the cropped
-/// pixels row-by-row. The crop is assumed valid for `(width, height)`
-/// (as produced by [`content_aware_crop`]); out-of-range rectangles
-/// are clamped so the function never panics.
+/// pixels row-by-row. The crop rectangle is clamped to `(width, height)`
+/// (it is produced by [`content_aware_crop`] for exactly these
+/// dimensions), and each row is bounds-checked against the actual buffer
+/// length — so a `pixels` slice shorter than `width * height * 4` (a
+/// malformed caller) stops the copy early rather than panicking. The
+/// function is therefore total for every input.
 #[must_use]
 pub fn apply_crop(pixels: &[u8], width: u32, height: u32, crop: FocalCrop) -> Vec<u8> {
     let src_w = width as usize;
@@ -247,7 +250,13 @@ pub fn apply_crop(pixels: &[u8], width: u32, height: u32, crop: FocalCrop) -> Ve
         let src_row = (y0 + row) * src_w + x0;
         let start = src_row * 4;
         let end = start + cw * 4;
-        out.extend_from_slice(&pixels[start..end]);
+        // Row offsets are monotonically increasing, so the first row that
+        // runs past a short buffer means every later row would too — bail
+        // out instead of indexing out of bounds.
+        match pixels.get(start..end) {
+            Some(slice) => out.extend_from_slice(slice),
+            None => break,
+        }
     }
     out
 }
@@ -418,6 +427,34 @@ mod tests {
         assert_eq!(out[4], 6);
         // Second row (x=1, y=2) → red = 1 + 2*4 = 9.
         assert_eq!(out[8], 9);
+    }
+
+    #[test]
+    fn apply_crop_is_total_on_a_short_buffer() {
+        // A caller passing dimensions larger than the actual buffer must
+        // not panic: the copy stops at the last fully-present row. Here we
+        // claim 4×4 but only supply two rows of pixels.
+        let w = 4;
+        let h = 4;
+        let mut px = Vec::new();
+        for y in 0..2 {
+            for x in 0..w {
+                px.extend_from_slice(&[(x + y * w) as u8, 0, 0, 255]);
+            }
+        }
+        let crop = FocalCrop {
+            x: 0,
+            y: 0,
+            width: 4,
+            height: 4,
+        };
+        // No panic, and we get back exactly the rows that existed.
+        let out = apply_crop(&px, w, h, crop);
+        assert_eq!(out.len(), 2 * 4 * 4);
+        assert_eq!(out, px);
+
+        // A completely empty buffer yields an empty crop, still no panic.
+        assert!(apply_crop(&[], w, h, crop).is_empty());
     }
 
     #[test]

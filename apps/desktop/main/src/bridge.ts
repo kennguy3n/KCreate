@@ -612,7 +612,7 @@ export interface Bridge {
     sourceArtboardId: string,
     targetsJson: string,
     requestJson: string,
-  ): string;
+  ): Promise<string>;
 
   // Components (Phase 1, Block B)
   componentCreateFromSelection(nodeIds: string[], name: string): string;

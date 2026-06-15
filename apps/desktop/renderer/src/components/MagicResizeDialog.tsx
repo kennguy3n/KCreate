@@ -25,13 +25,25 @@ export interface MagicResizeDialogProps {
    * refreshing the tree. `content` carries the content-aware toggles
    * (text re-fit + image smart-crop).
    */
-  onResize: (targets: ResizeTarget[], content: MagicResizeContent) => void;
+  onResize: (
+    targets: ResizeTarget[],
+    content: MagicResizeContent,
+  ) => void | Promise<void>;
   /**
    * Called when the user picks "Resize & export all": reflow onto every
    * selected target AND render each to a PNG in one action. The parent
    * owns the directory picker + `artboard.magicResizeExportPng` IPC.
+   *
+   * When the handler returns a `Promise`, the dialog drops its busy
+   * latch once that promise settles. That matters for paths that leave
+   * the dialog open instead of closing it — e.g. the user cancels the
+   * export directory picker — so the action buttons re-enable rather
+   * than staying stuck on "Exporting…".
    */
-  onExport: (targets: ResizeTarget[], content: MagicResizeContent) => void;
+  onExport: (
+    targets: ResizeTarget[],
+    content: MagicResizeContent,
+  ) => void | Promise<void>;
   /** Cancel — close without resizing. */
   onClose: () => void;
 }
@@ -149,12 +161,26 @@ export function MagicResizeDialog({
     return targets;
   };
 
+  // Drop the busy latch once a parent action settles. The content-aware
+  // handlers in the parent are async (`Promise<void>`): on success they
+  // close the dialog, so this component unmounts and the reset is a
+  // harmless no-op; but on a path that leaves the dialog open — most
+  // importantly the user cancelling the export directory picker — the
+  // promise still settles, so we re-enable the buttons rather than
+  // leaving them disabled forever. A synchronous (`void`) handler keeps
+  // the legacy contract where the parent alone owns closing the dialog.
+  const runAction = (result: void | Promise<void>): void => {
+    if (result instanceof Promise) {
+      void result.finally(() => setBusy(null));
+    }
+  };
+
   const submit = (): void => {
     if (busy) return;
     const targets = buildTargets();
     if (targets.length === 0) return;
     setBusy("resize");
-    onResize(targets, { refitText, smartCrop });
+    runAction(onResize(targets, { refitText, smartCrop }));
   };
 
   const exportAll = (): void => {
@@ -162,7 +188,7 @@ export function MagicResizeDialog({
     const targets = buildTargets();
     if (targets.length === 0) return;
     setBusy("export");
-    onExport(targets, { refitText, smartCrop });
+    runAction(onExport(targets, { refitText, smartCrop }));
   };
 
   const count = selected.size;

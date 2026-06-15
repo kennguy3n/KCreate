@@ -1666,7 +1666,7 @@ function registerIpcHandlers(): void {
       sourceArtboardId: string,
       targetsJson: string,
       requestJson: string,
-    ): string =>
+    ): Promise<string> =>
       requireBridge().magicResizeExportPng(
         sourceArtboardId,
         targetsJson,

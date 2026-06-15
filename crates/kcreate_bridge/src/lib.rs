@@ -2618,19 +2618,27 @@ pub fn magic_resize(
 /// see `document::MagicResizeExportRequest` / `shared/scene.ts`).
 /// Returns the JSON `MagicResizeExportReport` (`artboard_ids`,
 /// `output_dir`, `written`, `failed`, `duration_ms`).
-#[napi]
+///
+/// The resize + parallel PNG render can take multiple seconds for a
+/// large or many-target design, so the work is dispatched to the napi
+/// worker pool (the JS side already awaits a `Promise<string>`) — the
+/// Electron main process event loop stays responsive for the duration.
+#[napi(ts_return_type = "Promise<string>")]
 pub fn magic_resize_export_png(
     source_artboard_id: String,
     targets_json: String,
     request_json: String,
-) -> NapiResult<String> {
+) -> NapiResult<AsyncTask<phase11::MagicResizeExportPngTask>> {
     let id = parse_uuid(&source_artboard_id)?;
     let targets: Vec<document::ResizeTargetSpec> =
         serde_json::from_str(&targets_json).map_err(|e| NapiError::from_reason(e.to_string()))?;
     let request: document::MagicResizeExportRequest =
         serde_json::from_str(&request_json).map_err(|e| NapiError::from_reason(e.to_string()))?;
-    let report = document::magic_resize_export_png(id, &targets, &request).map_err(map_doc_err)?;
-    serde_json::to_string(&report).map_err(|e| NapiError::from_reason(e.to_string()))
+    Ok(AsyncTask::new(phase11::MagicResizeExportPngTask {
+        source_artboard_id: id,
+        targets,
+        request,
+    }))
 }
 
 /// Parse the optional `MagicResizeContent` JSON wire payload. An empty

@@ -2534,6 +2534,23 @@ pub fn artboard_presets() -> NapiResult<String> {
     serde_json::to_string(&presets).map_err(|e| NapiError::from_reason(e.to_string()))
 }
 
+/// **Magic Resize.** Reflow the design on `source_artboard_id` onto
+/// one or more target sizes, producing a fresh resized artboard per
+/// target (non-destructive; one undoable op). `targets_json` is the
+/// JSON serialization of an array of `ResizeTarget`
+/// (`{ name?, preset?, width?, height? }` — see
+/// `document::ResizeTargetSpec` / `shared/scene.ts`). Returns a JSON
+/// array of the new artboards' UUID strings, in target order.
+#[napi]
+pub fn magic_resize(source_artboard_id: String, targets_json: String) -> NapiResult<String> {
+    let id = parse_uuid(&source_artboard_id)?;
+    let targets: Vec<document::ResizeTargetSpec> =
+        serde_json::from_str(&targets_json).map_err(|e| NapiError::from_reason(e.to_string()))?;
+    let new_ids = document::magic_resize(id, &targets).map_err(map_doc_err)?;
+    let id_strings: Vec<String> = new_ids.iter().map(Uuid::to_string).collect();
+    serde_json::to_string(&id_strings).map_err(|e| NapiError::from_reason(e.to_string()))
+}
+
 // -----------------------------------------------------------------------------
 // Components (Block B)
 // -----------------------------------------------------------------------------

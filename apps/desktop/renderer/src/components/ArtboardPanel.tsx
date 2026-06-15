@@ -34,6 +34,13 @@ export interface ArtboardPanelProps {
    * the user picks "Resize" from the context menu. */
   onResizeArtboard: (id: string, width: number, height: number) => void;
 
+  /**
+   * Magic Resize the artboard — opens the parent's multi-size dialog.
+   * The reflow logic + IPC live up the tree (the dialog needs the
+   * preset catalogue the parent already holds).
+   */
+  onMagicResize: (id: string) => void;
+
   /** Delete the artboard + its subtree. */
   onDeleteArtboard: (id: string) => void;
 }
@@ -56,6 +63,7 @@ export function ArtboardPanel(props: ArtboardPanelProps): JSX.Element {
     onRenameArtboard,
     onDuplicateArtboard,
     onResizeArtboard,
+    onMagicResize,
     onDeleteArtboard,
   } = props;
   const [renamingId, setRenamingId] = useState<string | null>(null);
@@ -231,6 +239,13 @@ export function ArtboardPanel(props: ArtboardPanelProps): JSX.Element {
                     height: a.height,
                   });
                 }
+                setMenu(null);
+              },
+            },
+            {
+              label: "Magic Resize…",
+              onClick: () => {
+                onMagicResize(menu.id);
                 setMenu(null);
               },
             },

@@ -1635,6 +1635,11 @@ function registerIpcHandlers(): void {
   ipcMain.handle("kcreate/artboard/presets", () =>
     requireBridge().artboardPresets(),
   );
+  ipcMain.handle(
+    "kcreate/artboard/magic-resize",
+    (_e, sourceArtboardId: string, targetsJson: string): string =>
+      requireBridge().magicResize(sourceArtboardId, targetsJson),
+  );
 
   // Components (Block B).
   ipcMain.handle(

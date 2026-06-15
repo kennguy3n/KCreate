@@ -39,6 +39,7 @@ import {
 import { AIAssistPanel } from "../components/AIAssistPanel";
 import { ExportPanel } from "../components/ExportPanel";
 import { ArtboardDialog } from "../components/ArtboardDialog";
+import { MagicResizeDialog } from "../components/MagicResizeDialog";
 import { ResponsivePreview } from "../components/ResponsivePreview";
 import { PrototypePlayer } from "../components/PrototypePlayer";
 import type {
@@ -49,6 +50,7 @@ import type {
   GridLayout,
   NodeInfo,
   ProjectInfo,
+  ResizeTarget,
   SnapGuide,
 } from "../../../shared/scene";
 import { computeContentFit } from "../lib/fitViewport";
@@ -231,6 +233,10 @@ function EditorPageInner({
   // disarm on window blur / visibilitychange) is owned by
   // `EditorContext.EditorProvider`. The host only reads + dispatches.
   const [artboardDialogOpen, setArtboardDialogOpen] = useState(false);
+  // Magic Resize — the source artboard whose design is being reflowed.
+  // `null` while the dialog is closed.
+  const [magicResizeSource, setMagicResizeSource] =
+    useState<ArtboardInfo | null>(null);
   // TemplatePicker is shown automatically the first time the user
   // enters Layout mode for a given project. The sentinel below is per
   // project id so re-opening a project skips the picker, but switching
@@ -635,6 +641,44 @@ function EditorPageInner({
     },
     [refreshTree, setStatusMessage],
   );
+
+  // Magic Resize — reflow `sourceId`'s design onto each picked target
+  // in a single undoable op (the bridge keeps the source untouched),
+  // then refresh the tree and focus the first generated artboard.
+  const handleMagicResize = useCallback(
+    async (sourceId: string, targets: ResizeTarget[]) => {
+      if (targets.length === 0) return;
+      try {
+        const newIds = await window.kcreate.artboard.magicResize(
+          sourceId,
+          targets,
+        );
+        const { artboards: list } = await refreshTree();
+        const firstId = newIds[0];
+        const focus = firstId
+          ? list.find((a) => a.id === firstId)
+          : undefined;
+        if (focus) focusArtboard(focus);
+        setStatusMessage(
+          `Magic Resize created ${newIds.length} artboard${
+            newIds.length === 1 ? "" : "s"
+          }`,
+        );
+      } catch (e) {
+        setStatusMessage(`magic resize failed: ${errorMessage(e)}`);
+      } finally {
+        setMagicResizeSource(null);
+      }
+    },
+    [refreshTree, focusArtboard, setStatusMessage],
+  );
+
+  // Stable identity (like `handlePrototypeClose`) so the dialog's
+  // close-on-ESC `useEffect` doesn't re-subscribe its keydown listener
+  // on every unrelated `EditorPage` re-render.
+  const handleMagicResizeClose = useCallback((): void => {
+    setMagicResizeSource(null);
+  }, []);
 
   const handleRenameArtboard = useCallback(
     async (id: string, name: string) => {
@@ -2070,6 +2114,10 @@ function EditorPageInner({
           onResizeArtboard={(id, w, h) => {
             void handleResizeArtboard(id, w, h);
           }}
+          onMagicResize={(id) => {
+            const a = artboards.find((x) => x.id === id);
+            setMagicResizeSource(a ?? null);
+          }}
           onDeleteArtboard={(id) => {
             void handleDeleteArtboard(id);
           }}
@@ -2441,6 +2489,17 @@ function EditorPageInner({
           void handleCreateArtboard(args);
         }}
         onClose={() => setArtboardDialogOpen(false)}
+      />
+      <MagicResizeDialog
+        open={magicResizeSource !== null}
+        source={magicResizeSource}
+        presets={artboardPresets}
+        onResize={(targets) => {
+          if (magicResizeSource) {
+            void handleMagicResize(magicResizeSource.id, targets);
+          }
+        }}
+        onClose={handleMagicResizeClose}
       />
       <TemplatePicker
         open={templatePickerOpen}

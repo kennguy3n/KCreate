@@ -18,6 +18,7 @@ import type {
   RecentProjectInfo,
   ArtboardInfo,
   ArtboardPreset,
+  ResizeTarget,
   BrandKit,
   BrandKitBridge,
   CanvasBatchItem,
@@ -1388,6 +1389,17 @@ const artboard: ArtboardBridge = {
       "kcreate/artboard/presets",
     )) as string;
     return JSON.parse(raw) as ArtboardPreset[];
+  },
+  async magicResize(
+    sourceArtboardId: string,
+    targets: ResizeTarget[],
+  ): Promise<string[]> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/artboard/magic-resize",
+      sourceArtboardId,
+      JSON.stringify(targets),
+    )) as string;
+    return JSON.parse(raw) as string[];
   },
 };
 

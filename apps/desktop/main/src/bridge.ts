@@ -1466,6 +1466,43 @@ function bridgeBinaryPath(): string {
   return path.join(libDir, name);
 }
 
+// napi-rs synchronous exports built with `napi/dyn-symbols` return an
+// `Error` as a *value* on the failure path instead of throwing it. Each
+// IPC handler forwards that return verbatim through `ipcMain.handle`, so
+// the renderer's `invoke()` *resolves* with an Error object rather than
+// rejecting. Callers that `JSON.parse` the result then crash with
+// "Unexpected token 'E', \"Error: …\" is not valid JSON", and callers that
+// return the string verbatim hand back a bogus Error-shaped value. (The
+// async `AsyncTask` exports are unaffected — their promise rejects
+// cleanly.) Wrapping every bridge method so a returned `Error` is thrown
+// restores normal promise-rejection semantics across the whole IPC surface
+// at a single chokepoint.
+export function normalizeBridgeErrors(raw: Bridge): Bridge {
+  const wrapped = new Map<PropertyKey, unknown>();
+  return new Proxy(raw, {
+    get(target, prop, receiver): unknown {
+      const value = Reflect.get(target, prop, receiver) as unknown;
+      if (typeof value !== "function") {
+        return value;
+      }
+      const cached = wrapped.get(prop);
+      if (cached !== undefined) {
+        return cached;
+      }
+      const fn = value as (...args: unknown[]) => unknown;
+      const guard = (...args: unknown[]): unknown => {
+        const result = fn.apply(target, args);
+        if (result instanceof Error) {
+          throw result;
+        }
+        return result;
+      };
+      wrapped.set(prop, guard);
+      return guard;
+    },
+  }) as Bridge;
+}
+
 export function loadBridge(): Bridge {
   const binaryPath = bridgeBinaryPath();
   // `process.dlopen` lets us load a raw shared library that does not end
@@ -1484,5 +1521,12 @@ export function loadBridge(): Bridge {
     parent: null,
   };
   process.dlopen(moduleStub, binaryPath);
-  return applyCollabFallbacks(moduleStub.exports as Partial<Bridge>);
+  // Compose the two capability layers: first install graceful collab
+  // fallbacks for a non-collab build (so absent `session_*`/`kchat_*`
+  // exports degrade instead of being missing), then normalize the
+  // synchronous error-as-value return convention into thrown errors so
+  // failed calls reject cleanly through the IPC surface.
+  return normalizeBridgeErrors(
+    applyCollabFallbacks(moduleStub.exports as Partial<Bridge>),
+  );
 }

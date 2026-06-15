@@ -252,4 +252,104 @@ describe("TemplateGallery", () => {
       ).toBeInTheDocument(),
     );
   });
+
+  it("tallies category counts from an unfiltered catalog query", async () => {
+    stubCatalog();
+    renderGallery();
+    // The "All" chip badge counts the whole catalog…
+    await waitFor(() =>
+      expect(
+        screen.getByTestId("kcreate-template-cat-all-count"),
+      ).toHaveTextContent(String(CATALOG.length)),
+    );
+    // …and each category chip shows only its own slice (2 mobile-app).
+    expect(
+      screen.getByTestId("kcreate-template-cat-mobile_app-count"),
+    ).toHaveTextContent("2");
+  });
+
+  it("Remix from file imports through the bridge and reloads", async () => {
+    const stub = kcreateStub();
+    let imported = false;
+    const NEW = manifest("imported-remix", "Imported Remix", "custom", [
+      "remix",
+    ]);
+    // The catalog gains the imported template only after import() runs —
+    // mirroring the real bridge persisting it into the install dir.
+    stub.override("templateMarketplace.list", (...args: unknown[]) => {
+      const category = args[0] as TemplateCategory | undefined;
+      const query = (args[1] as string | undefined)?.toLowerCase() ?? "";
+      const base = imported ? [...CATALOG, NEW] : CATALOG;
+      let out = base;
+      if (query) {
+        out = base.filter(
+          (t) =>
+            t.name.toLowerCase().includes(query) ||
+            t.description.toLowerCase().includes(query) ||
+            t.tags.some((tag) => tag.toLowerCase().includes(query)),
+        );
+      } else if (category) {
+        out = base.filter((t) => t.category === category);
+      }
+      return { templates: out };
+    });
+    stub.override(
+      "templateMarketplace.pickImport",
+      () => "/tmp/design.kstudio",
+    );
+    stub.override("templateMarketplace.import", () => {
+      imported = true;
+      return NEW;
+    });
+
+    renderGallery();
+    await waitFor(() =>
+      expect(
+        screen.getByTestId("kcreate-template-card-mobile-login"),
+      ).toBeInTheDocument(),
+    );
+
+    fireEvent.click(screen.getByTestId("kcreate-template-import"));
+
+    // The picker + import bridge calls fire with the chosen path…
+    await waitFor(() =>
+      expect(
+        stub.calls.some((c) => c.method === "templateMarketplace.import"),
+      ).toBe(true),
+    );
+    const importCall = stub.calls.find(
+      (c) => c.method === "templateMarketplace.import",
+    );
+    expect(importCall?.args[0]).toEqual({ sourcePath: "/tmp/design.kstudio" });
+
+    // …and the freshly imported template appears once the grid reloads.
+    await waitFor(() =>
+      expect(
+        screen.getByTestId("kcreate-template-card-imported-remix"),
+      ).toBeInTheDocument(),
+    );
+  });
+
+  it("does not call import when the file picker is cancelled", async () => {
+    stubCatalog();
+    const stub = kcreateStub();
+    stub.override("templateMarketplace.pickImport", () => null);
+    renderGallery();
+    await waitFor(() =>
+      expect(
+        screen.getByTestId("kcreate-template-card-mobile-login"),
+      ).toBeInTheDocument(),
+    );
+
+    fireEvent.click(screen.getByTestId("kcreate-template-import"));
+
+    await waitFor(() =>
+      expect(
+        stub.calls.some((c) => c.method === "templateMarketplace.pickImport"),
+      ).toBe(true),
+    );
+    expect(
+      stub.calls.some((c) => c.method === "templateMarketplace.import"),
+    ).toBe(false);
+  });
 });

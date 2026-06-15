@@ -38,7 +38,22 @@ import {
   CATEGORY_LABELS,
   CATEGORY_TINT,
 } from "../lib/templateCategories";
+import { computeColumns, computeGridWindow } from "../lib/galleryWindow";
 import { Icon } from "./Icon";
+
+/**
+ * Grid geometry shared by the layout and the virtualisation math.
+ * `CARD_MIN_WIDTH` is the `minmax()` floor the auto-fill grid packs to;
+ * `CARD_HEIGHT` is the fixed per-card height (150px thumbnail + the
+ * name/badge footer) so every row is the same height and the windowed
+ * `topPad`/`totalHeight` arithmetic is exact. `GRID_GAP` matches the
+ * gap applied to both the grid and the column packing.
+ */
+const CARD_MIN_WIDTH = 200;
+const CARD_HEIGHT = 210;
+const GRID_GAP = spacing.md;
+/** Padding inside the scroll container (its `padding: spacing.lg`). */
+const GRID_PADDING = spacing.lg;
 
 export interface TemplateGalleryProps {
   /** Return to the HomePage without starting a project. */
@@ -114,6 +129,32 @@ export function TemplateGallery({
     remix: boolean;
   } | null>(null);
   const [startError, setStartError] = useState<string | null>(null);
+  // Per-category catalog counts for the filter chips, plus the grand
+  // total behind the "All" chip. Fetched once (and after an import)
+  // from an unfiltered `list()` so the counts reflect the whole
+  // library, not the currently-filtered view. Empty until that resolves
+  // (and stays empty if it fails — counts are decorative, never block
+  // the gallery).
+  const [counts, setCounts] = useState<Record<string, number>>({});
+  const [totalCount, setTotalCount] = useState<number | null>(null);
+  // "Remix from file" import state: `importing` disables the button +
+  // shows progress; `importError` surfaces a failed pick/import inline.
+  const [importing, setImporting] = useState(false);
+  const [importError, setImportError] = useState<string | null>(null);
+  // Bumped to force the catalog (and counts) to reload — e.g. after a
+  // successful import registers a new template.
+  const [reloadToken, setReloadToken] = useState(0);
+  // Measured scroll-container geometry driving the virtualised grid:
+  // `viewport` (content width/height) feeds the column + row-window
+  // math; `scrollTop` selects which rows are mounted. Both come from
+  // the live `<main>` element via a ResizeObserver + scroll handler, so
+  // only the cards near the viewport are in the DOM at 120+ templates.
+  const scrollRef = useRef<HTMLElement | null>(null);
+  const [viewport, setViewport] = useState<{ width: number; height: number }>({
+    width: 0,
+    height: 0,
+  });
+  const [scrollTop, setScrollTop] = useState(0);
   // Template ids whose thumbnail fetch has already been dispatched.
   // A `Set` in a ref (not state) so recording a dispatch never
   // retriggers the fetch effect — that feedback loop is exactly what
@@ -167,7 +208,34 @@ export function TemplateGallery({
     return () => {
       cancelled = true;
     };
-  }, [category, query]);
+  }, [category, query, reloadToken]);
+
+  // Catalog counts for the filter chips. One unfiltered `list()` (no
+  // category, no query) gives the whole library; we tally per category
+  // + total. Re-runs after an import (`reloadToken`). Failures are
+  // swallowed: counts are a nicety, and the main grid already surfaces
+  // load errors — we must not let this crash the gallery (the
+  // `list()`-rejects test rejects every call).
+  useEffect(() => {
+    let cancelled = false;
+    void window.kcreate.templateMarketplace
+      .list(undefined, undefined)
+      .then((report) => {
+        if (cancelled) return;
+        const tally: Record<string, number> = {};
+        for (const t of report.templates) {
+          tally[t.category] = (tally[t.category] ?? 0) + 1;
+        }
+        setCounts(tally);
+        setTotalCount(report.templates.length);
+      })
+      .catch(() => {
+        /* counts are decorative; ignore load failures */
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [reloadToken]);
 
   // Memoised so its identity is stable across renders where the load
   // state is unchanged — otherwise the `[]` fallback would be a fresh
@@ -176,6 +244,64 @@ export function TemplateGallery({
     () => (state.kind === "ready" ? state.templates : EMPTY_TEMPLATES),
     [state],
   );
+
+  // Column count from the measured track width (auto-fill, matching the
+  // CSS grid below). Subtract the container padding so the count tracks
+  // the real content width, not the padded box.
+  const columns = useMemo(
+    () =>
+      computeColumns(
+        Math.max(0, viewport.width - GRID_PADDING * 2),
+        CARD_MIN_WIDTH,
+        GRID_GAP,
+      ),
+    [viewport.width],
+  );
+  // The slice of cards to mount + the spacer geometry around them.
+  // Before the viewport is measured (jsdom / first paint) this returns
+  // the whole set, so tests and SSR see every card.
+  const gridWindow = useMemo(
+    () =>
+      computeGridWindow({
+        total: templates.length,
+        columns,
+        rowHeight: CARD_HEIGHT,
+        gap: GRID_GAP,
+        scrollTop,
+        viewportHeight: viewport.height,
+        overscanRows: 2,
+      }),
+    [templates.length, columns, scrollTop, viewport.height],
+  );
+  const visibleTemplates = useMemo(
+    () => templates.slice(gridWindow.startIndex, gridWindow.endIndex),
+    [templates, gridWindow.startIndex, gridWindow.endIndex],
+  );
+
+  // Measure the scroll container so the window math has a real viewport.
+  // A ResizeObserver tracks width/height through layout + theme changes;
+  // an explicit read seeds it before the first observer callback. (When
+  // ResizeObserver is absent — jsdom — we stay at the unmeasured 0×0,
+  // which makes the window return the whole set.)
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const measure = (): void =>
+      setViewport({ width: el.clientWidth, height: el.clientHeight });
+    measure();
+    if (typeof ResizeObserver === "undefined") return;
+    const ro = new ResizeObserver(measure);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+
+  // Snap back to the top of the list whenever the visible set changes
+  // (category / search / import) so we never open a shorter result set
+  // already scrolled past its end.
+  useEffect(() => {
+    if (scrollRef.current) scrollRef.current.scrollTop = 0;
+    setScrollTop(0);
+  }, [category, query, reloadToken]);
 
   // Keep a valid selection: default to the first template, and if the
   // current selection falls out of the filtered set, snap back to the
@@ -191,12 +317,15 @@ export function TemplateGallery({
     if (!stillVisible) setSelectedId(first.id);
   }, [templates, selectedId]);
 
-  // Lazily fetch a real thumbnail for every template we don't have one
-  // for yet. Each call hits the bridge's on-disk cache after the first
-  // render, so re-filtering is cheap. Failures degrade to the tinted
-  // fallback tile (never block the grid).
+  // Lazily fetch a real thumbnail for every *visible* template we don't
+  // have one for yet. Scoping the fetch to the windowed slice (not the
+  // whole filtered set) means a 120+ catalog only renders the thumbnails
+  // actually on screen; scrolling pulls in the rest, and `requestedRef`
+  // dedupes so nothing is fetched twice. Each call hits the bridge's
+  // on-disk cache after the first render, so re-filtering is cheap.
+  // Failures degrade to the tinted fallback tile (never block the grid).
   useEffect(() => {
-    for (const template of templates) {
+    for (const template of visibleTemplates) {
       if (requestedRef.current.has(template.id)) continue;
       // Record the dispatch *before* awaiting so a re-render mid-flight
       // can't double-fire it. `thumbs` is intentionally NOT a dependency
@@ -218,7 +347,7 @@ export function TemplateGallery({
           );
         });
     }
-  }, [templates]);
+  }, [visibleTemplates]);
 
   const selected = useMemo(
     () => templates.find((t) => t.id === selectedId) ?? null,
@@ -236,6 +365,34 @@ export function TemplateGallery({
     } catch (e) {
       setStartError(errorMessage(e));
       setStarting(null);
+    }
+  }
+
+  // "Remix from file": pick an external `.kstudio` / `.ktemplate` /
+  // template-content `*.json` via the OS dialog, import it as a new
+  // library template through the real bridge path, then reload the
+  // catalog (clearing filters) and select the freshly-imported entry.
+  // A cancelled dialog (`null` path) is a no-op; failures surface
+  // inline without disturbing the existing grid.
+  async function runImport(): Promise<void> {
+    if (importing) return;
+    setImporting(true);
+    setImportError(null);
+    try {
+      const path = await window.kcreate.templateMarketplace.pickImport();
+      if (!path) return;
+      const imported = await window.kcreate.templateMarketplace.import({
+        sourcePath: path,
+      });
+      setCategory(null);
+      setRawQuery("");
+      setQuery("");
+      setSelectedId(imported.id);
+      setReloadToken((n) => n + 1);
+    } catch (e) {
+      setImportError(errorMessage(e));
+    } finally {
+      setImporting(false);
     }
   }
 
@@ -308,6 +465,34 @@ export function TemplateGallery({
               : "Browse professionally-designed starter templates"}
           </span>
         </div>
+        <button
+          type="button"
+          onClick={() => void runImport()}
+          // Disabled while a previous import is in flight or a
+          // "Start from template" round-trip is mid-instantiate (same
+          // navigation-lock rationale as the Back button).
+          disabled={importing || starting !== null}
+          data-testid="kcreate-template-import"
+          aria-label="Import a design file as a new template"
+          style={{
+            display: "inline-flex",
+            alignItems: "center",
+            gap: spacing.xs,
+            background: "transparent",
+            border: `1px solid ${colors.border}`,
+            borderRadius: radius.md,
+            padding: `${spacing.xs}px ${spacing.sm}px`,
+            color: colors.text,
+            cursor: importing || starting ? "default" : "pointer",
+            opacity: importing || starting ? 0.7 : 1,
+            fontSize: 13,
+            whiteSpace: "nowrap",
+            flexShrink: 0,
+          }}
+        >
+          <Icon name="file-plus" size={16} />
+          {importing ? "Importing…" : "Remix from file"}
+        </button>
         <input
           type="search"
           value={rawQuery}
@@ -346,6 +531,7 @@ export function TemplateGallery({
           label="All"
           tint={colors.accent}
           active={category === null}
+          count={totalCount ?? undefined}
           testId="kcreate-template-cat-all"
           onClick={() => setCategory(null)}
         />
@@ -355,11 +541,29 @@ export function TemplateGallery({
             label={CATEGORY_LABELS[cat]}
             tint={CATEGORY_TINT[cat]}
             active={category === cat}
+            count={totalCount === null ? undefined : (counts[cat] ?? 0)}
             testId={`kcreate-template-cat-${cat}`}
             onClick={() => setCategory(cat)}
           />
         ))}
       </div>
+
+      {importError ? (
+        <div
+          data-testid="kcreate-template-import-error"
+          role="alert"
+          style={{
+            padding: `${spacing.sm}px ${spacing.xl}px`,
+            background: colors.dangerBg,
+            color: colors.danger,
+            fontSize: 13,
+            borderBottom: `1px solid ${colors.border}`,
+            flexShrink: 0,
+          }}
+        >
+          Couldn’t import that file: {importError}
+        </div>
+      ) : null}
 
       <div
         style={{
@@ -369,6 +573,8 @@ export function TemplateGallery({
         }}
       >
         <main
+          ref={scrollRef}
+          onScroll={(e) => setScrollTop(e.currentTarget.scrollTop)}
           style={{
             flex: 1,
             minWidth: 0,
@@ -401,23 +607,36 @@ export function TemplateGallery({
               No templates match {query ? `“${query}”` : "this filter"}.
             </div>
           ) : (
+            // Virtualised grid: a full-height spacer carries the
+            // scrollbar for the whole set, while only the windowed slice
+            // of cards is mounted, absolutely positioned at `topPad`.
+            // The window collapses to "render everything" until the
+            // viewport is measured, so jsdom (zero-size) shows all cards.
             <div
-              style={{
-                display: "grid",
-                gridTemplateColumns:
-                  "repeat(auto-fill, minmax(200px, 1fr))",
-                gap: spacing.md,
-              }}
+              data-testid="kcreate-template-grid"
+              style={{ position: "relative", height: gridWindow.totalHeight }}
             >
-              {templates.map((template) => (
-                <TemplateCard
-                  key={template.id}
-                  template={template}
-                  thumb={thumbs[template.id]}
-                  selected={template.id === selectedId}
-                  onSelect={() => setSelectedId(template.id)}
-                />
-              ))}
+              <div
+                style={{
+                  position: "absolute",
+                  top: gridWindow.topPad,
+                  left: 0,
+                  right: 0,
+                  display: "grid",
+                  gridTemplateColumns: `repeat(${gridWindow.columns}, minmax(${CARD_MIN_WIDTH}px, 1fr))`,
+                  gap: GRID_GAP,
+                }}
+              >
+                {visibleTemplates.map((template) => (
+                  <TemplateCard
+                    key={template.id}
+                    template={template}
+                    thumb={thumbs[template.id]}
+                    selected={template.id === selectedId}
+                    onSelect={() => setSelectedId(template.id)}
+                  />
+                ))}
+              </div>
             </div>
           )}
         </main>
@@ -591,12 +810,15 @@ function CategoryChip({
   label,
   tint,
   active,
+  count,
   testId,
   onClick,
 }: {
   label: string;
   tint: string;
   active: boolean;
+  /** Catalog count shown as a trailing badge; omitted until loaded. */
+  count?: number;
   testId: string;
   onClick: () => void;
 }): JSX.Element {
@@ -607,6 +829,9 @@ function CategoryChip({
       aria-pressed={active}
       onClick={onClick}
       style={{
+        display: "inline-flex",
+        alignItems: "center",
+        gap: spacing.xs,
         padding: `${spacing.xs}px ${spacing.sm}px`,
         borderRadius: radius.pill,
         border: `1px solid ${active ? tint : colors.border}`,
@@ -618,7 +843,23 @@ function CategoryChip({
         whiteSpace: "nowrap",
       }}
     >
-      {label}
+      <span>{label}</span>
+      {count === undefined ? null : (
+        <span
+          data-testid={`${testId}-count`}
+          style={{
+            fontSize: 11,
+            fontWeight: 600,
+            lineHeight: 1,
+            padding: "2px 6px",
+            borderRadius: radius.pill,
+            background: active ? "rgba(255,255,255,0.25)" : colors.bgSoft,
+            color: active ? "#FFFFFF" : colors.textMuted,
+          }}
+        >
+          {count}
+        </span>
+      )}
     </button>
   );
 }
@@ -672,6 +913,9 @@ function TemplateCard({
         outline: selected ? `2px solid ${colors.accentRing}` : "none",
         borderRadius: radius.card,
         padding: 0,
+        // Fixed height keeps every grid row uniform so the windowed
+        // `topPad` / `totalHeight` math lines up exactly with the DOM.
+        height: CARD_HEIGHT,
         overflow: "hidden",
         boxShadow: shadow.card,
         display: "flex",

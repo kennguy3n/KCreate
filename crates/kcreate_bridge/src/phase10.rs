@@ -31,6 +31,7 @@
 //!   * `export_pdf_multi` — multi-page PDF with TOC + outline.
 //!   * `preferences_load` / `preferences_save`.
 
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use base64::Engine as _;
@@ -38,6 +39,7 @@ use chrono::Utc;
 use kcreate_ai::auto_color::{auto_color_correct, AutoColorMode, AutoColorOptions};
 use kcreate_ai::denoise::{denoise, DenoiseOptions};
 use kcreate_ai::glyph_extract::{extract_glyph, GlyphCrop, GlyphExtractOptions};
+use kcreate_ai::image_gen::decode_png_payload_lenient;
 use kcreate_ai::inpaint::{inpaint, mask_from_rects, InpaintOptions, MaskRect};
 use kcreate_ai::one_pager::{
     brief_to_one_pager, BriefToOnePagerOptions, BriefToOnePagerResult, OnePagerPageSize,
@@ -54,7 +56,8 @@ use kcreate_ai::themed_deck::{
 };
 use kcreate_ai::type_pairing::{suggest_type_pairing, TypePairingResult};
 use kcreate_core::node::{
-    Bounds, FillStyle, LineCap, LineJoin, Node, NodeStyle, NodeType, RgbaColor, StrokeStyle,
+    Bounds, FillStyle, GradientKind, GradientStop, LineCap, LineJoin, Node, NodeStyle, NodeType,
+    Point2D, RgbaColor, StrokeStyle,
 };
 use kcreate_core::operation::Operation;
 use kcreate_core::project::{BrandKit, NamedColor};
@@ -70,7 +73,11 @@ use kcreate_export::svg_optimize::{optimize_svg, SvgOptimizeReport};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::document::{blob_load, with_workspace, with_workspace_mut, DocumentBridgeError, Result};
+use crate::document::{
+    blob_load, collect_subtree_parent_first, with_workspace, with_workspace_mut,
+    DocumentBridgeError, Result,
+};
+use crate::phase4::{image_gen_generate, image_gen_status};
 use crate::scene_sync::{
     RasterImageMeta, TextLayerMeta, RASTER_IMAGE_METADATA_KEY, TEXT_LAYER_METADATA_KEY,
     VECTOR_PATH_METADATA_KEY,
@@ -1526,6 +1533,23 @@ struct ThemedDesignRequest {
     /// and falls back to the deterministic planner on any failure.
     #[serde(default)]
     use_llm: bool,
+    /// Opt-in diffusion hero imagery. When `true` *and* the
+    /// image-generation sidecar reports `ready`, image-bearing
+    /// formats (social post / web page / document) get a real
+    /// generated raster; otherwise they degrade to a tasteful
+    /// gradient placeholder. Defaults to `true` so the imagery slot
+    /// is filled (with a placeholder offline) without the caller
+    /// having to opt in. Pure-vector formats (deck / one-pager)
+    /// ignore it.
+    #[serde(default = "default_true")]
+    use_image: bool,
+}
+
+/// serde default for [`ThemedDesignRequest::use_image`]: imagery is
+/// on by default (it degrades to a placeholder when no model is
+/// present, so it is never a hard dependency).
+const fn default_true() -> bool {
+    true
 }
 
 /// Tolerant shape for an LLM-produced outline. Every field defaults
@@ -1569,11 +1593,18 @@ pub struct ThemedDesignApplyResult {
     pub theme_id: String,
     /// Human-readable theme name.
     pub theme_name: String,
-    /// `"deck"` or `"onePager"`.
+    /// Format wire id: `"deck"`, `"onePager"`, `"socialPost"`,
+    /// `"webPage"`, or `"document"`.
     pub format: String,
     /// Whether the outline was enriched by the local LLM sidecar.
     /// `false` means the deterministic planner produced it.
     pub used_llm: bool,
+    /// Whether at least one hero/section image was produced by the
+    /// local diffusion sidecar and placed as a raster layer. `false`
+    /// means the imagery slots degraded to gradient placeholders
+    /// (no model available, imagery disabled, or a pure-vector
+    /// format) — the design still applied fully offline.
+    pub used_image: bool,
 }
 
 /// Brief → fully themed, laid-out, multi-page design applied to the
@@ -1619,8 +1650,245 @@ pub fn ai_generate_themed_design(
     let (outline, used_llm) = build_themed_outline(brief, options, request.use_llm)?;
     let design = generate_design(&outline, options);
 
+    // Carry the full intent forward so a later "refine" can reload it
+    // (stamped on the generated page) and replay the same pipeline.
+    let spec = ThemedSpec {
+        brief: brief.to_string(),
+        options,
+        use_llm: request.use_llm,
+        use_image: request.use_image,
+    };
+
     // Stage 3: apply to the open workspace.
-    apply_generated_design(brief, &design, used_llm)
+    apply_generated_design(&spec, &design, used_llm, "ai_generate_themed_design")
+}
+
+/// Persisted intent behind a generated design, stamped on the
+/// generator-owned root page so [`ai_refine_themed_design`] can
+/// reload it and replay the same pipeline with a tweaked outline /
+/// option set. Mirrors the inputs to [`ai_generate_themed_design`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ThemedSpec {
+    brief: String,
+    options: ThemedDesignOptions,
+    use_llm: bool,
+    #[serde(default = "default_true")]
+    use_image: bool,
+}
+
+/// Metadata key under which the [`ThemedSpec`] is stamped on the
+/// generator-owned root page (alongside
+/// [`THEMED_GENERATED_METADATA_KEY`]). Lets the refine loop recover
+/// the brief + options that produced the current design.
+const THEMED_SPEC_METADATA_KEY: &str = "kcreate:themedSpec";
+
+/// Refine an already-generated themed design with a follow-up
+/// instruction (e.g. "make it more minimal", "add a pricing slide",
+/// "punchier headlines", "remove the hero image"). The instruction
+/// is parsed into a deterministic [`RefineDirective`] that nudges
+/// the stored [`ThemedSpec`] (section count / imagery), then folded
+/// into the brief so the derived copy + layout variety genuinely
+/// change. The result replaces the prior generated design through
+/// the same apply pipeline, recorded as a single undoable
+/// operation.
+///
+/// # Errors
+/// Returns an error if no project is open, the instruction is empty,
+/// or there is no prior generated design to refine.
+pub fn ai_refine_themed_design(instruction: &str) -> Result<ThemedDesignApplyResult> {
+    let instruction = instruction.trim();
+    if instruction.is_empty() {
+        return Err(DocumentBridgeError::InvalidArgument {
+            argument: "instruction".into(),
+            value: "refine instruction must not be empty".into(),
+        });
+    }
+    let prior = load_themed_spec()?.ok_or_else(|| DocumentBridgeError::InvalidArgument {
+        argument: "instruction".into(),
+        value: "no AI-generated design to refine — generate one first".into(),
+    })?;
+
+    let directive = parse_refine_directive(instruction);
+    let mut options = prior.options;
+    // Start from the count the prior design actually resolved to so
+    // repeated refinements accumulate (+1, +1, …) instead of always
+    // nudging the format default.
+    let current = options.resolved_section_count() as i64;
+    let mut next = current;
+    let mut use_image = prior.use_image;
+    match directive {
+        RefineDirective::MoreContent => next = current + 1,
+        RefineDirective::LessContent => next = current - 1,
+        RefineDirective::Minimal => {
+            next = current - 1;
+            use_image = false;
+        }
+        RefineDirective::AddImagery => use_image = true,
+        RefineDirective::RemoveImagery => use_image = false,
+        RefineDirective::Rephrase => {}
+    }
+    // `resolved_section_count` re-clamps per format on the next run,
+    // so an out-of-band value here is harmless; keep it >= 1 so the
+    // stored hint is always sane.
+    options.section_count = Some(next.max(1) as u32);
+
+    // Fold the instruction into the brief. The deterministic planner
+    // hashes the brief for both copy and layout variety, so this
+    // guarantees a refine is never a no-op even when the directive
+    // only rephrases.
+    let brief = format!("{}\n\nRefinement: {}", prior.brief.trim(), instruction);
+
+    let (outline, used_llm) = build_themed_outline(&brief, options, prior.use_llm)?;
+    let design = generate_design(&outline, options);
+    let spec = ThemedSpec {
+        brief,
+        options,
+        use_llm: prior.use_llm,
+        use_image,
+    };
+    apply_generated_design(&spec, &design, used_llm, "ai_refine_themed_design")
+}
+
+/// A deterministic interpretation of a free-text refine instruction.
+/// Keyword-driven so the refine loop works fully offline; the LLM
+/// path (when available) still enriches the *copy* via the folded
+/// brief, but the structural directive never depends on a model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RefineDirective {
+    /// Add a section / slide / more detail.
+    MoreContent,
+    /// Drop a section / tighten / condense.
+    LessContent,
+    /// Strip back to essentials (fewer sections + no imagery).
+    Minimal,
+    /// Explicitly ask for hero/section imagery.
+    AddImagery,
+    /// Explicitly remove hero/section imagery.
+    RemoveImagery,
+    /// No structural change — just re-derive the copy from the
+    /// folded brief (e.g. "punchier headlines", "friendlier tone").
+    Rephrase,
+}
+
+/// Map a free-text instruction to a [`RefineDirective`].
+///
+/// Order matters: imagery intent is checked first (so "remove the photo"
+/// toggles imagery, not the section count), then the `Minimal` bucket,
+/// then — crucially — `LessContent` *before* `MoreContent`.
+///
+/// Direction (more vs. less) is decided by intent **verbs** only. Bare
+/// structure nouns ("section", "slide", "page", "bullet") are
+/// deliberately NOT direction signals because they appear on both sides
+/// ("add a section" vs. "fewer sections"); letting them imply
+/// `MoreContent` made "fewer sections" / "trim the slides" / "remove a
+/// bullet" grow the design instead of shrinking it.
+///
+/// Single-word keywords are matched against the tokenized word set (so
+/// "cut" fires on the word "cut" but not inside "exe**cut**ive"), while
+/// multi-word keywords ("get rid", "less busy") fall back to substring
+/// search. The tokenization is what makes checking `LessContent` first
+/// safe — a naive `contains` would let a reduce keyword embedded in an
+/// unrelated word flip an addition.
+fn parse_refine_directive(instruction: &str) -> RefineDirective {
+    let s = instruction.to_lowercase();
+    let words: HashSet<&str> = s
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .collect();
+    // Single-word needles match whole tokens; multi-word needles (those
+    // containing a space) match as substrings so phrases still work.
+    let has = |needles: &[&str]| {
+        needles.iter().any(|n| {
+            if n.contains(' ') {
+                s.contains(n)
+            } else {
+                words.contains(n)
+            }
+        })
+    };
+
+    if has(&[
+        "image",
+        "images",
+        "imagery",
+        "photo",
+        "photos",
+        "picture",
+        "pictures",
+        "hero",
+        "illustration",
+        "illustrations",
+        "visual",
+        "visuals",
+        "graphic",
+        "graphics",
+        "artwork",
+    ]) {
+        let negated = has(&[
+            "no", "without", "remove", "drop", "hide", "get rid", "less", "fewer",
+        ]);
+        return if negated {
+            RefineDirective::RemoveImagery
+        } else {
+            RefineDirective::AddImagery
+        };
+    }
+    if has(&[
+        "minimal",
+        "minimalist",
+        "simpler",
+        "simplify",
+        "cleaner",
+        "less busy",
+        "sparse",
+        "declutter",
+        "stripped",
+    ]) {
+        return RefineDirective::Minimal;
+    }
+    // Reduce intent is checked before add intent so an explicit "fewer" /
+    // "remove" / "cut" wins even when an add-ish word is also present, and
+    // so a structure noun can never flip a reduction into an addition.
+    if has(&[
+        "fewer", "less", "reduce", "remove", "drop", "delete", "cut", "trim", "shorter", "shorten",
+        "condense", "tighten", "concise",
+    ]) {
+        return RefineDirective::LessContent;
+    }
+    if has(&[
+        "more",
+        "add",
+        "expand",
+        "detailed",
+        "longer",
+        "another",
+        "extra",
+        "additional",
+    ]) {
+        return RefineDirective::MoreContent;
+    }
+    RefineDirective::Rephrase
+}
+
+/// Load the [`ThemedSpec`] stamped on the current generator-owned
+/// root page, if any. Returns `Ok(None)` when no generated design is
+/// present (so the caller can surface a friendly "generate first"
+/// error).
+fn load_themed_spec() -> Result<Option<ThemedSpec>> {
+    with_workspace(|ws| {
+        for root in ws.project.document.root_ids() {
+            let Some(node) = ws.project.document.get_node(*root) else {
+                continue;
+            };
+            if let Some(value) = node.metadata.get(THEMED_SPEC_METADATA_KEY) {
+                if let Ok(spec) = serde_json::from_value::<ThemedSpec>(value.clone()) {
+                    return Ok(Some(spec));
+                }
+            }
+        }
+        Ok(None)
+    })
 }
 
 /// Build the outline, attempting LLM enrichment only when requested
@@ -1734,13 +2002,35 @@ fn extract_json_object(s: &str) -> Option<&str> {
 
 /// Translate a [`GeneratedDesign`] into live document nodes and seed
 /// a brand kit from the theme. One root `Page` holds the tiled slide
-/// `Artboard`s; each artboard owns its themed rectangles and text
-/// runs at world coordinates.
+/// `Artboard`s; each artboard owns its themed rectangles, text runs,
+/// and hero imagery at world coordinates.
+///
+/// `command` is the operation name (`"ai_generate_themed_design"` or
+/// `"ai_refine_themed_design"`) — both share this pipeline and record
+/// a single, fully reversible [`ThemedDesignPatch`] operation so one
+/// Ctrl+Z removes the whole generated design and restores whatever
+/// the document held before (a prior generated design, a pristine
+/// scratch scaffold, or the user's own pages).
+///
+/// Hero/section imagery is pre-rendered through the diffusion sidecar
+/// *before* taking the workspace lock (so a slow generation never
+/// holds the singleton): when the sidecar is ready and `useImage` is
+/// set, image-bearing elements become real raster layers; otherwise
+/// they degrade to a tasteful gradient placeholder. `usedImage` is
+/// honest — `true` only when at least one real raster was produced.
 fn apply_generated_design(
-    brief: &str,
+    spec: &ThemedSpec,
     design: &GeneratedDesign,
     used_llm: bool,
+    command: &'static str,
 ) -> Result<ThemedDesignApplyResult> {
+    // Pre-render hero imagery outside the workspace lock. Keyed by
+    // `(page_index, element_index)` so the apply loop can swap a real
+    // raster in for the matching `Image` element and fall back to the
+    // gradient placeholder everywhere else.
+    let rasters = prerender_imagery(design, spec.use_image);
+    let used_image = !rasters.is_empty();
+
     // Theme palette → brand-kit colours (parsed once, reused below).
     let palette: Vec<RgbaColor> = design
         .theme
@@ -1759,22 +2049,23 @@ fn apply_generated_design(
         .map(|p| p.height)
         .fold(0.0_f64, f64::max);
 
-    let format_wire = match design.format {
-        DesignFormat::Deck => "deck",
-        DesignFormat::OnePager => "onePager",
-    };
+    let format_wire = design.format.wire();
     let theme_wire = design.theme.id.wire();
     let kit_name = format!("{} Theme", design.theme.name);
+    let spec_value = serde_json::to_value(spec).unwrap_or(serde_json::Value::Null);
 
     with_workspace_mut(|ws| {
-        // Replace our own prior output. Re-running the generator (e.g.
-        // to try another theme) must not stack a second tiled deck
-        // beside the first; remove any page a previous run stamped as
-        // generator-owned. Pages the user authored themselves carry no
-        // such stamp and are left untouched, so this never destroys
-        // the user's work.
+        // Capture-then-remove our own prior output. Re-running the
+        // generator (e.g. to try another theme, or a refine) must not
+        // stack a second tiled deck beside the first; remove any page
+        // a previous run stamped as generator-owned. The removed
+        // subtrees are captured parent-first so undo can re-insert
+        // them verbatim. Pages the user authored themselves carry no
+        // stamp and are left untouched, so this never destroys work.
+        let mut removed: Vec<Vec<Node>> = Vec::new();
         for root in ws.project.document.root_ids().to_vec() {
             if node_is_themed_generated(&ws.project.document, root) {
+                removed.push(collect_subtree_parent_first(&ws.project.document, root));
                 ws.project.document.remove_node(root);
             }
         }
@@ -1790,15 +2081,18 @@ fn apply_generated_design(
         // stray blank default artboard. A document that still holds
         // real (user-authored) content is left in place and the deck
         // is appended as a new page, so we never destroy the user's
-        // work.
+        // work. Cleared roots are captured for undo just like above.
         if !document_has_content_layers(&ws.project.document) {
             for root in ws.project.document.root_ids().to_vec() {
+                removed.push(collect_subtree_parent_first(&ws.project.document, root));
                 ws.project.document.remove_node(root);
             }
         }
 
         // Root page container, sized to the full tiled extent. It is
-        // stamped as generator-owned so a future run can replace it.
+        // stamped as generator-owned (so a future run can replace it)
+        // and carries the originating spec (so a refine can reload the
+        // brief + options that produced it).
         let page_title = design
             .pages
             .first()
@@ -1809,6 +2103,8 @@ fn apply_generated_design(
             THEMED_GENERATED_METADATA_KEY.to_string(),
             serde_json::Value::Bool(true),
         );
+        page.metadata
+            .insert(THEMED_SPEC_METADATA_KEY.to_string(), spec_value);
         let page_id = ws
             .project
             .document
@@ -1816,6 +2112,14 @@ fn apply_generated_design(
             .map_err(DocumentBridgeError::Document)?;
 
         // Brand kit (upsert by name) seeded from the theme palette.
+        // Snapshot the prior kit (if any) before mutating so undo can
+        // restore its exact colours / remove a freshly-created one.
+        let brand_kit_before: Option<BrandKit> = ws
+            .project
+            .brand_kits
+            .iter()
+            .find(|k| k.name == kit_name)
+            .cloned();
         let colors: Vec<NamedColor> = palette
             .iter()
             .enumerate()
@@ -1839,11 +2143,20 @@ fn apply_generated_design(
             ws.project.brand_kits.push(kit);
             id
         };
+        let brand_kit_after: BrandKit = ws
+            .project
+            .brand_kits
+            .iter()
+            .find(|k| k.id == brand_kit_id)
+            .cloned()
+            .ok_or_else(|| {
+                DocumentBridgeError::Internal("brand kit vanished after upsert".to_string())
+            })?;
 
         let mut artboard_ids = Vec::with_capacity(tile_count);
         let mut affected: Vec<Uuid> = vec![page_id];
         let mut x_offset = 0.0_f64;
-        for gp in &design.pages {
+        for (pi, gp) in design.pages.iter().enumerate() {
             // Slide artboard, filled with the page background.
             let mut artboard = Node::new(NodeType::Artboard, gp.title.as_str());
             artboard.bounds = Bounds::new(x_offset, 0.0, gp.width, gp.height);
@@ -1857,8 +2170,12 @@ fn apply_generated_design(
             artboard_ids.push(artboard_id);
             affected.push(artboard_id);
 
-            for el in &gp.elements {
-                let node = build_design_node(el, x_offset, artboard_id);
+            for (ei, el) in gp.elements.iter().enumerate() {
+                let node = if let Some(raster) = rasters.get(&(pi, ei)) {
+                    build_raster_node(ws, el, x_offset, artboard_id, raster)?
+                } else {
+                    build_design_node(el, x_offset, artboard_id)
+                };
                 let node_id = ws
                     .project
                     .document
@@ -1869,19 +2186,29 @@ fn apply_generated_design(
             x_offset += gp.width + THEMED_DECK_TILE_GAP;
         }
 
+        // Capture the inserted subtree parent-first so redo can replay
+        // it verbatim, then record one reversible operation.
+        let inserted = collect_subtree_parent_first(&ws.project.document, page_id);
         ws.project.modified_at = Utc::now();
-        let op = Operation::new(
-            "user",
-            "ai_generate_themed_design",
-            serde_json::json!({
-                "brief": brief,
-                "format": format_wire,
-                "themeId": theme_wire,
-            }),
-            serde_json::json!({ "page_id": page_id, "slides": artboard_ids.len() }),
-            affected,
-        )
-        .as_ai_generated();
+        let before = serde_json::to_value(ThemedDesignPatch {
+            dir: ThemedPatchDir::Undo,
+            removed: removed.clone(),
+            inserted: inserted.clone(),
+            inserted_root: page_id,
+            brand_kit_before: brand_kit_before.clone(),
+            brand_kit_after: brand_kit_after.clone(),
+        })
+        .map_err(|e| DocumentBridgeError::Internal(format!("encode themed undo patch: {e}")))?;
+        let after = serde_json::to_value(ThemedDesignPatch {
+            dir: ThemedPatchDir::Redo,
+            removed,
+            inserted,
+            inserted_root: page_id,
+            brand_kit_before,
+            brand_kit_after,
+        })
+        .map_err(|e| DocumentBridgeError::Internal(format!("encode themed redo patch: {e}")))?;
+        let op = Operation::new("user", command, before, after, affected).as_ai_generated();
         ws.project.execute_operation(op);
 
         Ok(ThemedDesignApplyResult {
@@ -1893,8 +2220,212 @@ fn apply_generated_design(
             theme_name: design.theme.name.clone(),
             format: format_wire.to_string(),
             used_llm,
+            used_image,
         })
     })
+}
+
+/// A diffusion-generated hero image, re-encoded to a clean PNG ready
+/// for the content-addressed blob store. Keyed by
+/// `(page_index, element_index)` in [`prerender_imagery`].
+struct RenderedRaster {
+    png_bytes: Vec<u8>,
+    width: u32,
+    height: u32,
+}
+
+/// Diffusion steps for hero imagery — a deliberately modest count so
+/// a one-shot hero renders quickly while still being recognizable.
+const HERO_DIFFUSION_STEPS: u32 = 20;
+
+/// FNV-1a offset basis / prime for the deterministic hero seed.
+const HERO_FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+const HERO_FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+/// Pre-render every image-bearing element through the diffusion
+/// sidecar. Returns an empty map (so every imagery slot falls back to
+/// a gradient placeholder) when imagery is disabled, the format has
+/// no imagery, or the sidecar is not `ready` — keeping the whole
+/// feature fully offline-safe with no panics.
+fn prerender_imagery(
+    design: &GeneratedDesign,
+    use_image: bool,
+) -> HashMap<(usize, usize), RenderedRaster> {
+    let mut out = HashMap::new();
+    if !use_image || !design.format.supports_imagery() {
+        return out;
+    }
+    // One readiness probe up front; if the model is not loaded we skip
+    // straight to placeholders without ever hitting the network.
+    if image_gen_status().state != "ready" {
+        return out;
+    }
+    for (pi, page) in design.pages.iter().enumerate() {
+        for (ei, el) in page.elements.iter().enumerate() {
+            if el.kind != ElementKind::Image {
+                continue;
+            }
+            let Some(prompt) = el.image_prompt.as_ref() else {
+                continue;
+            };
+            let (pw, ph) = hero_pixel_size(el.width, el.height);
+            let seed = hero_seed(prompt);
+            // Any failure (not-ready race, transport error, malformed
+            // payload) degrades to the placeholder for this element.
+            let Ok(payload) =
+                image_gen_generate(prompt.clone(), pw, ph, HERO_DIFFUSION_STEPS, Some(seed))
+            else {
+                continue;
+            };
+            let Ok(img) = decode_png_payload_lenient(&payload.png_b64) else {
+                continue;
+            };
+            let Some(png_bytes) = encode_rgba_png(&img.rgba, img.width, img.height) else {
+                continue;
+            };
+            out.insert(
+                (pi, ei),
+                RenderedRaster {
+                    png_bytes,
+                    width: img.width,
+                    height: img.height,
+                },
+            );
+        }
+    }
+    out
+}
+
+/// Map a hero element's world-space box to a sane diffusion output
+/// size: scale the long edge down to `MAX_EDGE`, clamp both edges into
+/// `[MIN_EDGE, MAX_EDGE]`, and snap each to a multiple of 64 (the tile
+/// size most diffusion UNets expect).
+///
+/// Aspect ratio is *approximately* preserved — the independent clamp and
+/// 64-px snap can shift it for extreme boxes (e.g. a very wide banner
+/// has its short edge floored to `MIN_EDGE`). That is intentional and
+/// harmless: the renderer scales the generated raster into the element's
+/// world bounds anyway, so the exact generation dimensions only steer the
+/// diffusion model's composition, not the final placement.
+fn hero_pixel_size(width: f64, height: f64) -> (u32, u32) {
+    const MAX_EDGE: f64 = 768.0;
+    const MIN_EDGE: f64 = 256.0;
+    let w = width.max(1.0);
+    let h = height.max(1.0);
+    let scale = (MAX_EDGE / w.max(h)).min(1.0);
+    let round64 = |v: f64| {
+        let snapped = ((v / 64.0).round() as u32).max(1) * 64;
+        snapped.max(256)
+    };
+    let pw = round64((w * scale).clamp(MIN_EDGE, MAX_EDGE));
+    let ph = round64((h * scale).clamp(MIN_EDGE, MAX_EDGE));
+    (pw, ph)
+}
+
+/// Deterministic per-prompt diffusion seed (FNV-1a) so the same hero
+/// prompt renders the same image on every run — generation stays
+/// reproducible offline and a refine that doesn't touch a section
+/// keeps its imagery stable.
+fn hero_seed(prompt: &str) -> u64 {
+    let mut hash = HERO_FNV_OFFSET;
+    for b in prompt.as_bytes() {
+        hash ^= u64::from(*b);
+        hash = hash.wrapping_mul(HERO_FNV_PRIME);
+    }
+    hash
+}
+
+/// Encode a decoded RGBA8 buffer back into PNG bytes for the blob
+/// store. Returns `None` on a dimension / encode mismatch so the
+/// caller degrades to the placeholder instead of panicking.
+fn encode_rgba_png(rgba: &[u8], width: u32, height: u32) -> Option<Vec<u8>> {
+    if rgba.len() != (width as usize) * (height as usize) * 4 {
+        return None;
+    }
+    let mut png_bytes = Vec::new();
+    let mut cursor = std::io::Cursor::new(&mut png_bytes);
+    image::write_buffer_with_format(
+        &mut cursor,
+        rgba,
+        width,
+        height,
+        image::ColorType::Rgba8,
+        image::ImageFormat::Png,
+    )
+    .ok()?;
+    Some(png_bytes)
+}
+
+/// Build a [`NodeType::RasterLayer`] node for a hero element backed
+/// by a real diffusion-generated image. The PNG is committed to the
+/// content-addressed blob store; the node's world-space bounds are
+/// the element's box (the renderer scales the pixels into it via
+/// `scene_sync::emit_raster`).
+fn build_raster_node(
+    ws: &crate::document::Workspace,
+    el: &DesignElement,
+    x_offset: f64,
+    artboard_id: Uuid,
+    raster: &RenderedRaster,
+) -> Result<Node> {
+    let blob = ws
+        .store
+        .lock()
+        .blobs()
+        .store(&raster.png_bytes, "image/png")
+        .map_err(|e| DocumentBridgeError::Internal(format!("store hero blob: {e}")))?;
+    let mut node = Node::new(NodeType::RasterLayer, element_node_name(el));
+    node.parent_id = Some(artboard_id);
+    node.bounds = Bounds::new(el.x + x_offset, el.y, el.width.max(1.0), el.height.max(1.0));
+    node.style.corner_radius = el.corner_radius;
+    let meta = RasterImageMeta {
+        blob_hash: blob.hash,
+        width: raster.width,
+        height: raster.height,
+    };
+    node.metadata.insert(
+        RASTER_IMAGE_METADATA_KEY.to_string(),
+        serde_json::to_value(&meta)
+            .map_err(|e| DocumentBridgeError::Internal(format!("encode RasterImageMeta: {e}")))?,
+    );
+    Ok(node)
+}
+
+/// Direction tag for a [`ThemedDesignPatch`] so the single
+/// `apply_patch` arm can roll the generated design forward (redo) or
+/// backward (undo) from the same payload shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) enum ThemedPatchDir {
+    Undo,
+    Redo,
+}
+
+/// Reversible payload for an `ai_generate_themed_design` /
+/// `ai_refine_themed_design` operation. Carries everything needed to
+/// move the document graph between "before generation" and "after
+/// generation" in either direction:
+///
+/// * `removed` — the subtrees this run deleted (prior generated
+///   output and/or a pristine scratch scaffold), each captured
+///   parent-first so they re-insert cleanly.
+/// * `inserted` / `inserted_root` — the new generated page subtree,
+///   also parent-first, and the id of its root page.
+/// * `brand_kit_before` / `brand_kit_after` — the theme brand kit
+///   before and after the upsert, so undo restores the prior colours
+///   (or removes a freshly-created kit) and redo re-applies them.
+///
+/// Replay is effectively infallible (roots have no parent, children
+/// follow their parents, brand-kit edits are pure vec ops), so a
+/// single themed op rolls back atomically with one Ctrl+Z.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct ThemedDesignPatch {
+    pub(crate) dir: ThemedPatchDir,
+    pub(crate) removed: Vec<Vec<Node>>,
+    pub(crate) inserted: Vec<Node>,
+    pub(crate) inserted_root: Uuid,
+    pub(crate) brand_kit_before: Option<BrandKit>,
+    pub(crate) brand_kit_after: BrandKit,
 }
 
 /// Was `id` a root page stamped by a previous run of this generator?
@@ -1970,7 +2501,59 @@ fn build_design_node(el: &DesignElement, x_offset: f64, artboard_id: Uuid) -> No
             );
             node
         }
+        // Offline / no-model fallback for a hero element: a tasteful
+        // vertical gradient `VectorLayer` standing in for the absent
+        // diffusion raster. (When the sidecar IS ready, the apply loop
+        // substitutes a real `RasterLayer` via `build_raster_node` and
+        // this arm is never reached for that element.) The gradient
+        // endpoints are authored in WORLD space to match the
+        // world-space path emitted below — `scene_sync::emit_vector`
+        // applies no style translation to generated nodes.
+        ElementKind::Image => {
+            let mut node = Node::new(NodeType::VectorLayer, element_node_name(el));
+            node.parent_id = Some(artboard_id);
+            node.bounds = Bounds::new(wx, wy, w, h);
+            node.style = NodeStyle {
+                fill: gradient_placeholder_fill(el, wx, wy, h),
+                corner_radius: el.corner_radius,
+                ..NodeStyle::default()
+            };
+            let path = rounded_rect_path(wx, wy, w, h, el.corner_radius);
+            node.metadata.insert(
+                VECTOR_PATH_METADATA_KEY.to_string(),
+                serde_json::to_value(&path).unwrap_or(serde_json::Value::Null),
+            );
+            node
+        }
     }
+}
+
+/// Build the gradient fill for an offline hero placeholder: a
+/// top→bottom linear gradient from the element's primary fill to its
+/// secondary fill (falling back to the primary when none is set).
+/// Endpoints are WORLD-space (`wx, wy` → `wx, wy + h`) so they line
+/// up with the world-space vector path the placeholder carries.
+fn gradient_placeholder_fill(el: &DesignElement, wx: f64, wy: f64, h: f64) -> FillStyle {
+    let top = RgbaColor::from_hex(&el.fill).unwrap_or(RgbaColor::WHITE);
+    let bottom = el
+        .fill_secondary
+        .as_deref()
+        .and_then(RgbaColor::from_hex)
+        .unwrap_or(top);
+    FillStyle::Gradient(GradientKind::Linear {
+        from: Point2D::new(wx, wy),
+        to: Point2D::new(wx, wy + h),
+        stops: vec![
+            GradientStop {
+                offset: 0.0,
+                color: top,
+            },
+            GradientStop {
+                offset: 1.0,
+                color: bottom,
+            },
+        ],
+    })
 }
 
 /// Stable layer name for a design element, derived from its role.
@@ -2104,6 +2687,107 @@ mod tests {
         artboard.parent_id = Some(group);
         let artboard = doc.insert_node(artboard).unwrap();
         assert_eq!(ordered_export_units(&doc), vec![artboard]);
+    }
+
+    #[test]
+    fn refine_directive_reduce_intent_wins_over_structure_nouns() {
+        // Regression: bare structure nouns ("section", "slide", "page",
+        // "bullet") used to imply MoreContent and were checked before
+        // LessContent, so a clear *reduction* that happened to name a
+        // structural unit grew the design instead of shrinking it.
+        for instruction in [
+            "fewer sections",
+            "trim the slides down",
+            "cut a page",
+            "reduce the number of slides",
+            "remove a bullet",
+            "drop a slide",
+            "delete the last section",
+            "shorten it by a page",
+        ] {
+            assert_eq!(
+                parse_refine_directive(instruction),
+                RefineDirective::LessContent,
+                "{instruction:?} should reduce content"
+            );
+        }
+    }
+
+    #[test]
+    fn refine_directive_add_intent_still_increases() {
+        for instruction in [
+            "add a pricing slide",
+            "another section please",
+            "expand the deck",
+            "more detail on pricing",
+            "give it an extra page",
+            "make the body longer",
+        ] {
+            assert_eq!(
+                parse_refine_directive(instruction),
+                RefineDirective::MoreContent,
+                "{instruction:?} should add content"
+            );
+        }
+    }
+
+    #[test]
+    fn refine_directive_imagery_intent_is_checked_first() {
+        assert_eq!(
+            parse_refine_directive("add a hero image"),
+            RefineDirective::AddImagery
+        );
+        assert_eq!(
+            parse_refine_directive("more photos"),
+            RefineDirective::AddImagery
+        );
+        // Negated imagery wins over the section-count buckets even though
+        // "remove"/"fewer" are also reduce verbs.
+        assert_eq!(
+            parse_refine_directive("remove the hero image"),
+            RefineDirective::RemoveImagery
+        );
+        assert_eq!(
+            parse_refine_directive("no illustrations"),
+            RefineDirective::RemoveImagery
+        );
+    }
+
+    #[test]
+    fn refine_directive_minimal_and_rephrase() {
+        assert_eq!(
+            parse_refine_directive("make it more minimal"),
+            RefineDirective::Minimal
+        );
+        assert_eq!(
+            parse_refine_directive("less busy please"),
+            RefineDirective::Minimal
+        );
+        // No structural / imagery intent → just re-derive the copy.
+        assert_eq!(
+            parse_refine_directive("punchier headlines"),
+            RefineDirective::Rephrase
+        );
+        assert_eq!(
+            parse_refine_directive("friendlier tone"),
+            RefineDirective::Rephrase
+        );
+    }
+
+    #[test]
+    fn refine_directive_word_matching_avoids_substring_false_positives() {
+        // "executive" contains "cut" as a substring; whole-word matching
+        // must not treat it as a LessContent reduce verb. With no real
+        // intent verb present this is a pure rephrase.
+        assert_eq!(
+            parse_refine_directive("make the tone more executive"),
+            RefineDirective::MoreContent,
+            "an explicit 'more' should still add, despite 'executive' containing 'cut'"
+        );
+        assert_eq!(
+            parse_refine_directive("a more executive voice"),
+            RefineDirective::MoreContent
+        );
     }
 
     #[test]

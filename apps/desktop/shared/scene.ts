@@ -6149,7 +6149,12 @@ export interface BriefToOnePagerResult {
 export type ThemeId = "midnight" | "sunrise" | "forest" | "ember" | "slate";
 
 /** Output format for the themed design generator. */
-export type ThemedDesignFormat = "deck" | "onePager";
+export type ThemedDesignFormat =
+  | "deck"
+  | "onePager"
+  | "socialPost"
+  | "webPage"
+  | "document";
 
 /** Page size for one-pager output (ignored for decks). */
 export type ThemedOnePagerSize = "letter" | "a4" | "square";
@@ -6173,6 +6178,15 @@ export interface ThemedDesignOptions {
    * model; on any failure the deterministic planner is used instead.
    */
   useLlm?: boolean;
+  /**
+   * Opt-in diffusion hero imagery. When `true` *and* the
+   * image-generation sidecar is `ready`, image-bearing formats
+   * (`socialPost` / `webPage` / `document`) get a real generated
+   * raster; otherwise they degrade to a tasteful gradient
+   * placeholder. Defaults to `true` on the bridge. Pure-vector
+   * formats (`deck` / `onePager`) ignore it.
+   */
+  useImage?: boolean;
 }
 
 /**
@@ -6189,6 +6203,14 @@ export interface ThemedDesignApplyResult {
   themeName: string;
   format: ThemedDesignFormat;
   usedLlm: boolean;
+  /**
+   * Whether at least one hero/section image was produced by the
+   * local diffusion sidecar and placed as a raster layer. `false`
+   * means the imagery slots degraded to gradient placeholders (no
+   * model available, imagery disabled, or a pure-vector format) —
+   * the design still applied fully offline.
+   */
+  usedImage: boolean;
 }
 
 /** Harmony type for `aiHarmonizePalette`. */
@@ -6459,6 +6481,15 @@ export interface Phase10Bridge {
     brief: string,
     options: ThemedDesignOptions,
   ): Promise<ThemedDesignApplyResult>;
+  /**
+   * Refine the most recently generated themed design with a
+   * free-text follow-up instruction (e.g. "make it more minimal",
+   * "add a pricing slide", "punchier headlines", "remove the hero
+   * image"). Replaces the prior generated design in a single
+   * undoable operation. Rejects when there is no generated design to
+   * refine.
+   */
+  aiRefineThemedDesign(instruction: string): Promise<ThemedDesignApplyResult>;
   aiHarmonizePalette(
     brandKitId: string,
     harmonyType: HarmonyType,

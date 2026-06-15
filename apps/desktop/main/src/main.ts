@@ -2509,6 +2509,11 @@ function registerIpcHandlers(): void {
       requireBridge().aiGenerateThemedDesign(brief, optionsJson),
   );
   ipcMain.handle(
+    "kcreate/phase10/ai/refine-themed-design",
+    (_e, instruction: string): string =>
+      requireBridge().aiRefineThemedDesign(instruction),
+  );
+  ipcMain.handle(
     "kcreate/phase10/ai/harmonize-palette",
     (_e, brandKitId: string, harmonyType: string): string =>
       requireBridge().aiHarmonizePalette(brandKitId, harmonyType),

@@ -66,6 +66,7 @@ function fakeResult(
     themeName: "Midnight",
     format: "deck",
     usedLlm: false,
+    usedImage: false,
     ...overrides,
   };
 }
@@ -100,6 +101,13 @@ function lastGenerateCall(stub: ReturnType<typeof kcreateStub>) {
   return calls.at(-1);
 }
 
+function lastRefineCall(stub: ReturnType<typeof kcreateStub>) {
+  const calls = stub.calls.filter(
+    (c) => c.method === "phase10.aiRefineThemedDesign",
+  );
+  return calls.at(-1);
+}
+
 describe("BriefModal — visibility", () => {
   it("renders nothing when closed", () => {
     const { container } = mount({ open: false });
@@ -118,6 +126,22 @@ describe("BriefModal — visibility", () => {
       expect(
         screen.getByTestId(`kcreate-themed-theme-${id}`),
         `theme chip ${id} should render`,
+      ).toBeInTheDocument();
+    }
+  });
+
+  it("exposes all five output formats including the H4 additions", () => {
+    mount();
+    for (const testid of [
+      "kcreate-themed-format-deck",
+      "kcreate-themed-format-onepager",
+      "kcreate-themed-format-socialpost",
+      "kcreate-themed-format-webpage",
+      "kcreate-themed-format-document",
+    ]) {
+      expect(
+        screen.getByTestId(testid),
+        `format button ${testid} should render`,
       ).toBeInTheDocument();
     }
   });
@@ -228,6 +252,68 @@ describe("BriefModal — themed generation", () => {
     ).toBeUndefined();
   });
 
+  it("forwards a social-post request with hero imagery on by default", async () => {
+    const { stub } = mount();
+    stub.override("phase10.aiGenerateThemedDesign", () =>
+      fakeResult({ format: "socialPost", slideCount: 2, usedImage: false }),
+    );
+
+    fireEvent.change(screen.getByTestId("kcreate-brief-textarea"), {
+      target: { value: "Launch announcement for a cold-brew startup" },
+    });
+    // The imagery toggle is hidden for pure-vector formats.
+    expect(screen.queryByTestId("kcreate-themed-useimage")).toBeNull();
+
+    fireEvent.click(screen.getByTestId("kcreate-themed-format-socialpost"));
+    // Now the toggle is present and defaults to on.
+    const imageToggle = screen.getByTestId(
+      "kcreate-themed-useimage",
+    ) as HTMLInputElement;
+    expect(imageToggle.checked).toBe(true);
+
+    fireEvent.click(screen.getByTestId("kcreate-themed-generate"));
+    await flushAsync();
+
+    const options = lastGenerateCall(stub)?.args[1] as ThemedDesignOptions;
+    expect(options.format).toBe("socialPost");
+    expect(options.useImage).toBe(true);
+    // The one-pager-only field never leaks into an image format.
+    expect(options.onePagerSize).toBeUndefined();
+  });
+
+  it("forwards useImage:false when the hero-imagery toggle is cleared", async () => {
+    const { stub } = mount();
+    stub.override("phase10.aiGenerateThemedDesign", () =>
+      fakeResult({ format: "webPage", slideCount: 1, usedImage: false }),
+    );
+
+    fireEvent.change(screen.getByTestId("kcreate-brief-textarea"), {
+      target: { value: "Landing page for an offline-first design tool" },
+    });
+    fireEvent.click(screen.getByTestId("kcreate-themed-format-webpage"));
+    fireEvent.click(screen.getByTestId("kcreate-themed-useimage"));
+    fireEvent.click(screen.getByTestId("kcreate-themed-generate"));
+    await flushAsync();
+
+    const options = lastGenerateCall(stub)?.args[1] as ThemedDesignOptions;
+    expect(options.format).toBe("webPage");
+    expect(options.useImage).toBe(false);
+  });
+
+  it("never forwards useImage for the pure-vector deck format", async () => {
+    const { stub } = mount();
+    stub.override("phase10.aiGenerateThemedDesign", () => fakeResult());
+
+    fireEvent.change(screen.getByTestId("kcreate-brief-textarea"), {
+      target: { value: "Investor deck for a roastery" },
+    });
+    fireEvent.click(screen.getByTestId("kcreate-themed-generate"));
+    await flushAsync();
+
+    const options = lastGenerateCall(stub)?.args[1] as ThemedDesignOptions;
+    expect(options.useImage).toBeUndefined();
+  });
+
   it("includes the page size only for the one-pager format", async () => {
     const { stub } = mount();
     stub.override("phase10.aiGenerateThemedDesign", () =>
@@ -312,6 +398,69 @@ describe("BriefModal — LLM gating", () => {
         .disabled,
       "plan mode is enabled once the model is ready",
     ).toBe(false);
+  });
+});
+
+describe("BriefModal — refine with AI", () => {
+  it("keeps the Refine button disabled until an instruction is typed", () => {
+    mount();
+    const refine = screen.getByTestId(
+      "kcreate-themed-refine",
+    ) as HTMLButtonElement;
+    expect(refine.disabled).toBe(true);
+
+    fireEvent.change(screen.getByTestId("kcreate-themed-refine-input"), {
+      target: { value: "   " },
+    });
+    expect(refine.disabled, "whitespace-only instruction stays disabled").toBe(
+      true,
+    );
+
+    fireEvent.change(screen.getByTestId("kcreate-themed-refine-input"), {
+      target: { value: "make it more minimal" },
+    });
+    expect(refine.disabled).toBe(false);
+  });
+
+  it("forwards the instruction to the refine bridge and applies the result", async () => {
+    const { stub, applied } = mount();
+    const result = fakeResult({ slideCount: 5 });
+    stub.override("phase10.aiRefineThemedDesign", () => result);
+
+    fireEvent.change(screen.getByTestId("kcreate-themed-refine-input"), {
+      target: { value: "add a pricing slide" },
+    });
+    fireEvent.click(screen.getByTestId("kcreate-themed-refine"));
+    await flushAsync();
+
+    const call = lastRefineCall(stub);
+    expect(call, "Refine should invoke the refine bridge").toBeDefined();
+    expect(call?.args[0]).toBe("add a pricing slide");
+    expect(applied).toHaveBeenCalledTimes(1);
+    expect(applied).toHaveBeenCalledWith(result);
+  });
+
+  it("surfaces a refine rejection (no prior generation) as an inline error", async () => {
+    const { stub, applied } = mount();
+    stub.override("phase10.aiRefineThemedDesign", () => {
+      throw new Error(
+        "no AI-generated design to refine — generate one first",
+      );
+    });
+
+    fireEvent.change(screen.getByTestId("kcreate-themed-refine-input"), {
+      target: { value: "punchier headlines" },
+    });
+    fireEvent.click(screen.getByTestId("kcreate-themed-refine"));
+    await flushAsync();
+
+    await waitFor(() => {
+      expect(screen.getByTestId("kcreate-brief-error")).toBeInTheDocument();
+    });
+    expect(screen.getByTestId("kcreate-brief-error").textContent).toContain(
+      "no AI-generated design to refine",
+    );
+    expect(applied).not.toHaveBeenCalled();
   });
 });
 

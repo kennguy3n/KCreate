@@ -1377,6 +1377,7 @@ export interface Bridge {
   aiReformatToDeck(pageIdStr: string): string;
   aiBriefToOnePager(brief: string, pageSize: string | null | undefined): string;
   aiGenerateThemedDesign(brief: string, optionsJson: string): string;
+  aiRefineThemedDesign(instruction: string): string;
   aiHarmonizePalette(brandKitIdStr: string, harmonyType: string): string;
   aiSuggestTypePairing(headingFontName: string): string;
 

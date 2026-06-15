@@ -26,6 +26,8 @@
 // is still owned entirely by Rust); it runs no vector math against the
 // document.
 
+import { useId } from "react";
+
 import type {
   DesignTokens,
   PageOrientation,
@@ -470,6 +472,11 @@ export function LayoutThumbnail({
   const { width, height } = pagePixelSize(page);
   const resolved = resolveAccent(accent, tokens);
   const sections = page.sections ?? [];
+  // Unique per-instance prefix so SVG gradient/def IDs (e.g. the image
+  // section's `linearGradient`) never collide when several thumbnails
+  // are mounted at once (the picker grid + carousel). Colons from
+  // `useId` are stripped so the ids stay valid in `url(#…)` references.
+  const idPrefix = `lt${useId().replace(/:/g, "")}`;
   return (
     <div
       style={{
@@ -494,7 +501,7 @@ export function LayoutThumbnail({
       >
         <rect x={0} y={0} width={width} height={height} fill={SURFACE} />
         {sections.map((section, i) =>
-          renderSection(section, i, resolved, "lt"),
+          renderSection(section, i, resolved, idPrefix),
         )}
       </svg>
       {children}

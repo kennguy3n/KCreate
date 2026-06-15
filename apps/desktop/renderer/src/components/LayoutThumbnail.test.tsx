@@ -155,6 +155,32 @@ describe("LayoutThumbnail", () => {
     expect(rects.length).toBeGreaterThanOrEqual(6);
   });
 
+  it("gives each instance unique gradient ids so simultaneously-mounted thumbnails don't collide", () => {
+    const imagePage: TemplatePageDef = {
+      name: "Cover",
+      page_size: { kind: "a4" },
+      orientation: "landscape",
+      sections: [section("image", 50, 50, 500, 380)],
+    };
+    // Two cards with an image section at the same index render together in
+    // the picker grid; their gradient ids must not clash (a clash makes the
+    // second card paint with the first's accent via document-scoped url(#id)).
+    const { container } = render(
+      <div>
+        <LayoutThumbnail page={imagePage} accent="#0D9488" />
+        <LayoutThumbnail page={imagePage} accent="#DB2777" />
+      </div>,
+    );
+    const ids = Array.from(container.querySelectorAll("linearGradient")).map(
+      (g) => g.getAttribute("id") ?? "",
+    );
+    expect(ids.length).toBe(2);
+    expect(new Set(ids).size).toBe(ids.length);
+    for (const id of ids) {
+      expect(id).not.toContain(":");
+    }
+  });
+
   it("renders overlay children (the page-count pill)", () => {
     const { getByText } = render(
       <LayoutThumbnail page={deckPage} accent="#7E22CE">

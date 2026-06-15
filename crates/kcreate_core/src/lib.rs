@@ -58,7 +58,9 @@ pub use component::{
 pub use config::{DeviceTier, Platform, RuntimeConfig};
 pub use document::{DocumentError, DocumentGraph};
 pub use icc::{cmyk_to_srgb_profiled, convert_color, srgb_to_cmyk_profiled, ColorTransform};
-pub use marketplace::{LocalMarketplace, MarketplaceError, TemplateManifest, TemplateSource};
+pub use marketplace::{
+    ImportSpec, LocalMarketplace, MarketplaceError, TemplateManifest, TemplateSource,
+};
 pub use node::{
     standard_presets, ArtboardPreset, BlendMode, Bounds, Constraint, Constraints, Effect,
     FillStyle, FrameInsets, GradientKind, GradientStop, Interaction, InteractionAction,

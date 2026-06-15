@@ -43,6 +43,36 @@ pub struct TemplateManifest {
     pub source: Option<TemplateSource>,
 }
 
+/// Specification for importing an external design as a new library
+/// template (the "Remix from file" flow).
+///
+/// This type is deliberately **format-agnostic**: extracting an
+/// external `.kstudio` / `.ktemplate` / template `content.json` into
+/// the wire-format `content_json` string is the caller's job (it lives
+/// in the bridge, which can link `kcreate_storage` to read a SQLite
+/// project — `kcreate_core` cannot, to avoid a dependency cycle).
+/// [`LocalMarketplace::import_design`] owns only persistence +
+/// registration, so the import pipeline keeps a single, testable
+/// seam for "turn an arbitrary design into a library entry".
+#[derive(Debug, Clone)]
+pub struct ImportSpec {
+    /// Display name for the new template.
+    pub name: String,
+    /// Human-readable description.
+    pub description: String,
+    /// Library category the imported design is filed under.
+    pub category: TemplateCategory,
+    /// Search tags.
+    pub tags: Vec<String>,
+    /// Number of pages/artboards the design contains (clamped to `>= 1`).
+    pub page_count: u32,
+    /// Wire-format template content (`{ "width", "height", "items": [...] }`)
+    /// already serialised to JSON. Persisted verbatim as `content.json`
+    /// so the imported entry drives the gallery thumbnail and the
+    /// applied canvas through the exact same path as a bundled template.
+    pub content_json: String,
+}
+
 /// Errors from marketplace operations.
 #[derive(Debug, Error)]
 pub enum MarketplaceError {
@@ -58,6 +88,8 @@ pub enum MarketplaceError {
     AlreadyInstalled(Uuid),
     #[error("serialize error: {0}")]
     Serialize(String),
+    #[error("imported design content is not valid template JSON: {0}")]
+    InvalidContent(String),
 }
 
 /// The local template marketplace — scans, lists, installs, and
@@ -155,21 +187,26 @@ impl LocalMarketplace {
         v
     }
 
-    /// Search templates by name or tag (case-insensitive substring).
+    /// Search templates by name, tag, or description (case-insensitive
+    /// substring), ranked by *where* the query matched: a name hit
+    /// outranks a tag hit, which outranks a description-only hit. Within
+    /// the same rank, results are ordered alphabetically by name so the
+    /// ordering stays stable across runs (the `templates` map iterates
+    /// in arbitrary order).
+    ///
+    /// The matched *set* is identical to a plain
+    /// name-OR-tag-OR-description filter — ranking only reorders, never
+    /// drops or adds — so callers that count matches stay correct.
     #[must_use]
     pub fn search(&self, query: &str) -> Vec<&TemplateManifest> {
         let q = query.to_lowercase();
-        let mut v: Vec<_> = self
+        let mut ranked: Vec<(u8, &TemplateManifest)> = self
             .templates
             .values()
-            .filter(|t| {
-                t.name.to_lowercase().contains(&q)
-                    || t.tags.iter().any(|tag| tag.to_lowercase().contains(&q))
-                    || t.description.to_lowercase().contains(&q)
-            })
+            .filter_map(|t| search_rank(t, &q).map(|rank| (rank, t)))
             .collect();
-        v.sort_by(|a, b| a.name.cmp(&b.name));
-        v
+        ranked.sort_by(|(ra, a), (rb, b)| ra.cmp(rb).then_with(|| a.name.cmp(&b.name)));
+        ranked.into_iter().map(|(_, t)| t).collect()
     }
 
     /// Get a template by id.
@@ -205,6 +242,83 @@ impl LocalMarketplace {
         Ok(installed)
     }
 
+    /// Import an external design as a brand-new library template.
+    ///
+    /// The caller supplies a wire-format `content.json` (already
+    /// extracted from whatever source format — see [`ImportSpec`]) plus
+    /// the metadata to file it under. A fresh v4 UUID is minted (so an
+    /// import never collides with a bundled id or a previous import of
+    /// the same source) and the design is written to a collision-free
+    /// `<slug>-<id8>.ktemplate/` folder under the marketplace root,
+    /// then registered in memory so it shows up in [`Self::list`] /
+    /// [`Self::get`] without a rescan.
+    ///
+    /// The `content_json` is validated against the canonical
+    /// [`crate::template_library::TemplateContent`] shape **before**
+    /// anything is written, so a malformed import fails fast and never
+    /// leaves a half-written `.ktemplate/` on disk that a later
+    /// [`Self::scan`] would surface as a broken entry.
+    ///
+    /// No `thumbnail.png` is written: the lazy, content-hash-keyed
+    /// thumbnail cache (in the bridge) renders it on first view from
+    /// the same `content.json`, guaranteeing the preview matches the
+    /// applied canvas.
+    pub fn import_design(
+        &mut self,
+        spec: ImportSpec,
+    ) -> Result<TemplateManifest, MarketplaceError> {
+        // Validate the content up front using the canonical template
+        // type. This rejects garbage before we touch the filesystem and
+        // guarantees the written entry round-trips through seeding,
+        // listing, instantiation, and thumbnail rendering.
+        serde_json::from_str::<crate::template_library::TemplateContent>(&spec.content_json)
+            .map_err(|e| MarketplaceError::InvalidContent(e.to_string()))?;
+
+        if !self.root.exists() {
+            std::fs::create_dir_all(&self.root)?;
+        }
+        let id = Uuid::new_v4();
+        let slug = slugify(&spec.name);
+        // `<slug>-<id8>` keeps folder names readable while the 8-hex
+        // suffix makes collisions (same name imported twice) impossible.
+        let short = &id.simple().to_string()[..8];
+        let dir_name = format!("{slug}-{short}.ktemplate");
+        let dest = self.root.join(&dir_name);
+        if dest.exists() {
+            // The 8-hex suffix makes this astronomically unlikely, but
+            // never silently overwrite an existing template directory.
+            return Err(MarketplaceError::AlreadyInstalled(id));
+        }
+        std::fs::create_dir_all(&dest)?;
+
+        let manifest = TemplateManifest {
+            id,
+            name: spec.name,
+            description: spec.description,
+            category: spec.category,
+            tags: spec.tags,
+            thumbnail: Some("thumbnail.png".to_string()),
+            page_count: spec.page_count.max(1),
+            author: Some("Imported".to_string()),
+            version: "1.0.0".to_string(),
+            // On-disk manifests never persist `source`; `scan()` stamps
+            // it from the discovered path, matching every other entry.
+            source: None,
+        };
+        let manifest_json = serde_json::to_string_pretty(&manifest)
+            .map_err(|e| MarketplaceError::Serialize(e.to_string()))?;
+        std::fs::write(dest.join("manifest.json"), manifest_json)?;
+        std::fs::write(dest.join("content.json"), &spec.content_json)?;
+
+        // Register in memory with the same `Local { path }` stamp a
+        // `scan()` would apply, so the freshly imported template is
+        // immediately visible without a rescan.
+        let mut registered = manifest;
+        registered.source = Some(TemplateSource::Local { path: dest });
+        self.templates.insert(id, registered.clone());
+        Ok(registered)
+    }
+
     /// Seed the bundled, ready-made template catalog into this
     /// marketplace's root directory if it has no `.ktemplate/` folders
     /// yet (copy-if-empty). Returns the number of templates written
@@ -229,6 +343,48 @@ impl LocalMarketplace {
             }
         }
         Ok(())
+    }
+}
+
+/// Rank a template against an already-lowercased query, or `None` if it
+/// doesn't match at all. Lower rank = better: name (0) > tag (1) >
+/// description (2). The predicate (match in *any* of the three) is
+/// identical to the old name-OR-tag-OR-description filter, so the
+/// matched set is unchanged — only the order differs.
+fn search_rank(t: &TemplateManifest, q: &str) -> Option<u8> {
+    if t.name.to_lowercase().contains(q) {
+        Some(0)
+    } else if t.tags.iter().any(|tag| tag.to_lowercase().contains(q)) {
+        Some(1)
+    } else if t.description.to_lowercase().contains(q) {
+        Some(2)
+    } else {
+        None
+    }
+}
+
+/// Turn an arbitrary display name into a filesystem-safe slug:
+/// lowercase ASCII alphanumerics, runs of anything else collapsed to a
+/// single `-`, no leading/trailing `-`. Falls back to a fixed stem when
+/// the name has no usable characters (e.g. all punctuation / non-ASCII)
+/// so the import always produces a valid directory name.
+fn slugify(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    let mut prev_dash = false;
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+            prev_dash = false;
+        } else if !out.is_empty() && !prev_dash {
+            out.push('-');
+            prev_dash = true;
+        }
+    }
+    let trimmed = out.trim_matches('-');
+    if trimmed.is_empty() {
+        "imported-design".to_string()
+    } else {
+        trimmed.to_string()
     }
 }
 
@@ -458,5 +614,185 @@ mod tests {
     fn default_dir_uses_home() {
         let d = LocalMarketplace::default_dir();
         assert!(d.ends_with(".kcreate/templates") || d.ends_with(".kcreate\\templates"));
+    }
+
+    fn valid_content_json() -> String {
+        // A minimal-but-real template: full-bleed background + a label,
+        // matching the wire shape every bundled `content.json` uses.
+        r#"{
+            "width": 800.0,
+            "height": 600.0,
+            "items": [
+                { "kind": "rect", "parent": null, "x": 0.0, "y": 0.0, "w": 800.0, "h": 600.0,
+                  "fill": { "kind": "solid", "r": 0.1, "g": 0.2, "b": 0.3, "a": 1.0 }, "name": "Background" },
+                { "kind": "text", "parent": null, "x": 40.0, "y": 80.0, "body": "Imported",
+                  "family": "sans-serif", "size": 48.0,
+                  "fill": { "kind": "solid", "r": 1.0, "g": 1.0, "b": 1.0, "a": 1.0 }, "name": "Title" }
+            ]
+        }"#
+        .to_string()
+    }
+
+    #[test]
+    fn import_design_writes_registers_and_round_trips() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("templates");
+        let mut mp = LocalMarketplace::new(&root);
+        mp.scan().unwrap();
+        assert_eq!(mp.list().len(), 0);
+
+        let manifest = mp
+            .import_design(ImportSpec {
+                name: "My Remixed Poster".into(),
+                description: "A remix imported from a file".into(),
+                category: TemplateCategory::Poster,
+                tags: vec!["remix".into(), "imported".into()],
+                page_count: 1,
+                content_json: valid_content_json(),
+            })
+            .unwrap();
+
+        // Registered in memory without a rescan.
+        assert_eq!(mp.list().len(), 1);
+        assert!(mp.get(manifest.id).is_some());
+        assert!(matches!(
+            mp.get(manifest.id).unwrap().source,
+            Some(TemplateSource::Local { .. })
+        ));
+
+        // Folder name is a readable slug + 8-hex id suffix.
+        let Some(TemplateSource::Local { path }) = &manifest.source else {
+            panic!("expected Local source");
+        };
+        let dir_name = path.file_name().unwrap().to_str().unwrap();
+        assert!(dir_name.starts_with("my-remixed-poster-"));
+        assert!(dir_name.ends_with(".ktemplate"));
+        assert!(path.join("manifest.json").exists());
+        assert!(path.join("content.json").exists());
+
+        // A fresh marketplace pointed at the same root rediscovers it,
+        // proving the on-disk entry is a valid library template.
+        let mut mp2 = LocalMarketplace::new(&root);
+        assert_eq!(mp2.scan().unwrap(), 1);
+        let rediscovered = mp2.get(manifest.id).unwrap();
+        assert_eq!(rediscovered.name, "My Remixed Poster");
+        assert_eq!(rediscovered.category, TemplateCategory::Poster);
+
+        // The persisted content.json parses back into the canonical type.
+        let raw = std::fs::read_to_string(path.join("content.json")).unwrap();
+        let content: crate::template_library::TemplateContent = serde_json::from_str(&raw).unwrap();
+        assert_eq!(content.items.len(), 2);
+    }
+
+    #[test]
+    fn import_design_rejects_invalid_content_without_writing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("templates");
+        let mut mp = LocalMarketplace::new(&root);
+        let err = mp
+            .import_design(ImportSpec {
+                name: "Broken".into(),
+                description: String::new(),
+                category: TemplateCategory::Custom,
+                tags: vec![],
+                page_count: 1,
+                content_json: "{ not valid json }".into(),
+            })
+            .unwrap_err();
+        assert!(matches!(err, MarketplaceError::InvalidContent(_)));
+        // Nothing was written to disk.
+        assert!(!root.exists() || std::fs::read_dir(&root).unwrap().next().is_none());
+        assert_eq!(mp.list().len(), 0);
+    }
+
+    #[test]
+    fn import_design_same_name_twice_gets_unique_dirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("templates");
+        let mut mp = LocalMarketplace::new(&root);
+        let spec = || ImportSpec {
+            name: "Duplicate Name".into(),
+            description: "x".into(),
+            category: TemplateCategory::Flyer,
+            tags: vec![],
+            page_count: 1,
+            content_json: valid_content_json(),
+        };
+        let a = mp.import_design(spec()).unwrap();
+        let b = mp.import_design(spec()).unwrap();
+        assert_ne!(a.id, b.id);
+        assert_eq!(mp.list().len(), 2);
+        // A rescan still sees both distinct entries.
+        assert_eq!(mp.scan().unwrap(), 2);
+    }
+
+    #[test]
+    fn page_count_clamped_to_at_least_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut mp = LocalMarketplace::new(tmp.path().join("templates"));
+        let m = mp
+            .import_design(ImportSpec {
+                name: "Zero Pages".into(),
+                description: String::new(),
+                category: TemplateCategory::Custom,
+                tags: vec![],
+                page_count: 0,
+                content_json: valid_content_json(),
+            })
+            .unwrap();
+        assert_eq!(m.page_count, 1);
+    }
+
+    #[test]
+    fn slugify_handles_punctuation_and_unicode() {
+        assert_eq!(slugify("My Remixed Poster"), "my-remixed-poster");
+        assert_eq!(slugify("  Hello,  World!! "), "hello-world");
+        assert_eq!(slugify("A/B  C"), "a-b-c");
+        assert_eq!(slugify("***"), "imported-design");
+        assert_eq!(slugify("日本語"), "imported-design");
+        assert_eq!(slugify("café-2024"), "caf-2024");
+    }
+
+    #[test]
+    fn search_ranks_name_above_tag_above_description() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("templates");
+        // "report" appears in: one name, one tag, one description.
+        write_ktemplate(
+            &root.join("desc.ktemplate"),
+            &TemplateManifest {
+                name: "Zulu".into(),
+                description: "quarterly report deck".into(),
+                tags: vec!["misc".into()],
+                ..sample_manifest(Uuid::new_v4())
+            },
+        );
+        write_ktemplate(
+            &root.join("tag.ktemplate"),
+            &TemplateManifest {
+                name: "Yankee".into(),
+                description: "nothing here".into(),
+                tags: vec!["report".into()],
+                ..sample_manifest(Uuid::new_v4())
+            },
+        );
+        write_ktemplate(
+            &root.join("name.ktemplate"),
+            &TemplateManifest {
+                name: "Report Monthly".into(),
+                description: "nothing here".into(),
+                tags: vec!["misc".into()],
+                ..sample_manifest(Uuid::new_v4())
+            },
+        );
+
+        let mut mp = LocalMarketplace::new(&root);
+        mp.scan().unwrap();
+        let results = mp.search("report");
+        assert_eq!(results.len(), 3, "ranking must not drop matches");
+        // name hit first, then tag hit, then description-only hit.
+        assert_eq!(results[0].name, "Report Monthly");
+        assert_eq!(results[1].name, "Yankee");
+        assert_eq!(results[2].name, "Zulu");
     }
 }

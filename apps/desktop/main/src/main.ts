@@ -1854,6 +1854,40 @@ function registerIpcHandlers(): void {
     (_e, templateId: string) =>
       requireBridge().templateThumbnail(templateId),
   );
+  // H2 — "Remix from file": pick an external design (a `.kstudio`
+  // project package, a `.ktemplate` folder, or a bare
+  // template-content `*.json`) to fold into the library. Packages are
+  // directories on Linux/Windows, so the picker offers BOTH file and
+  // directory selection; the OS file-type filters only constrain the
+  // file case. We keep the dialog in the main process so the renderer
+  // never touches the filesystem — it gets back a single chosen path.
+  ipcMain.handle("kcreate/template/pickImport", async () => {
+    const win = mainWindow;
+    if (!win) return null;
+    const result = await dialog.showOpenDialog(win, {
+      title: "Remix a design into the library",
+      properties: ["openFile", "openDirectory"],
+      filters: [
+        {
+          name: "KCreate designs (*.kstudio, *.ktemplate, *.json)",
+          extensions: ["kstudio", "ktemplate", "json"],
+        },
+        { name: "All files", extensions: ["*"] },
+      ],
+    });
+    if (result.canceled || result.filePaths.length === 0) return null;
+    return result.filePaths[0];
+  });
+  // H2 — import the chosen design as a NEW library template. The
+  // renderer hands us a JSON-encoded request ({ sourcePath, optional
+  // name/description/category/tags }); the bridge detects the source
+  // format, inverts it into template content, persists a new
+  // `.ktemplate/` into the install dir, and returns the new manifest.
+  ipcMain.handle(
+    "kcreate/template/import",
+    (_e, requestJson: string): string =>
+      requireBridge().templateImport(requestJson),
+  );
   // Phase 6 — Audit log (Tasks 13–14)
   ipcMain.handle(
     "kcreate/audit/record",

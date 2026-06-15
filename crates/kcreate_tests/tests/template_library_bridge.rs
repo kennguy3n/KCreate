@@ -32,15 +32,18 @@
 
 use std::collections::HashSet;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-use kcreate_bridge::document::{document_get_tree, project_close, project_create, NodeInfo};
-use kcreate_bridge::phase2::{
-    template_instantiate, template_list, template_thumbnail, template_thumbnail_cached,
-    ThumbnailCacheOutcome,
+use kcreate_bridge::document::{
+    document_get_tree, project_close, project_create, project_save, NodeInfo,
 };
-use kcreate_core::{bundled_templates, TemplateCategory};
+use kcreate_bridge::phase2::{
+    template_import, template_instantiate, template_list, template_thumbnail,
+    template_thumbnail_cached, TemplateImportRequest, ThumbnailCacheOutcome,
+};
+use kcreate_core::node::{FillStyle, RgbaColor};
+use kcreate_core::{bundled_templates, TemplateCategory, TemplateContent, TemplateItem};
 use serial_test::serial;
 use tempfile::TempDir;
 
@@ -449,5 +452,299 @@ fn thumbnail_disk_cache_hits_warm_and_invalidates_on_content_change() {
         final_outcome,
         ThumbnailCacheOutcome::Hit,
         "cache should be warm + consistent again after restore"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Import & remix (Build 3): external designs become library templates.
+// ---------------------------------------------------------------------------
+
+fn solid(hex_r: f32, hex_g: f32, hex_b: f32) -> FillStyle {
+    FillStyle::Solid(RgbaColor {
+        r: hex_r,
+        g: hex_g,
+        b: hex_b,
+        a: 1.0,
+    })
+}
+
+/// A small but genuinely populated design (full-bleed background +
+/// text + ellipse + line) so the imported template renders non-blank
+/// and exercises every primitive in the import → instantiate round
+/// trip — never a single blank rectangle.
+fn sample_content() -> TemplateContent {
+    TemplateContent {
+        width: 800.0,
+        height: 600.0,
+        items: vec![
+            TemplateItem::Rect {
+                parent: None,
+                x: 0.0,
+                y: 0.0,
+                w: 800.0,
+                h: 600.0,
+                fill: Some(solid(0.07, 0.09, 0.15)),
+                name: Some("Background".into()),
+            },
+            TemplateItem::Text {
+                parent: None,
+                x: 64.0,
+                y: 96.0,
+                body: "Imported Design".into(),
+                family: "sans-serif".into(),
+                size: 64.0,
+                fill: Some(solid(0.96, 0.97, 1.0)),
+                name: Some("Headline".into()),
+            },
+            TemplateItem::Ellipse {
+                parent: None,
+                cx: 400.0,
+                cy: 360.0,
+                rx: 140.0,
+                ry: 140.0,
+                fill: Some(solid(0.11, 0.31, 0.85)),
+                name: Some("Accent".into()),
+            },
+            TemplateItem::Line {
+                parent: None,
+                x1: 64.0,
+                y1: 520.0,
+                x2: 736.0,
+                y2: 520.0,
+                fill: Some(solid(0.36, 0.4, 0.5)),
+                name: Some("Rule".into()),
+            },
+        ],
+    }
+}
+
+fn write_external_ktemplate(parent: &Path, dir_name: &str, content: &TemplateContent) -> PathBuf {
+    let dir = parent.join(dir_name);
+    fs::create_dir_all(&dir).expect("create external ktemplate dir");
+    let manifest = serde_json::json!({
+        "id": uuid::Uuid::new_v4(),
+        "name": "External Source",
+        "description": "A design authored outside the library",
+        "category": "poster",
+        "tags": ["external", "design"],
+        "thumbnail": "thumbnail.png",
+        "page_count": 1,
+        "author": "Third Party",
+        "version": "2.1.0",
+        "source": null,
+    });
+    fs::write(
+        dir.join("manifest.json"),
+        serde_json::to_string_pretty(&manifest).unwrap(),
+    )
+    .expect("write external manifest");
+    fs::write(
+        dir.join("content.json"),
+        serde_json::to_string_pretty(content).unwrap(),
+    )
+    .expect("write external content");
+    dir
+}
+
+/// Assert an imported template id is fully live: it surfaces in
+/// `template_list`, renders a non-blank thumbnail through the real
+/// export pipeline, and instantiates into a fresh workspace with one
+/// node per authored item.
+fn assert_imported_template_is_live(id: uuid::Uuid, expected_items: usize, label: &str) {
+    let listed = template_list(None, None).expect("list after import");
+    assert!(
+        listed.templates.iter().any(|t| t.id == id),
+        "{label}: imported template should appear in the library"
+    );
+
+    let thumb = template_thumbnail(id).unwrap_or_else(|e| panic!("{label} thumbnail: {e}"));
+    assert_eq!(thumb.mime, "image/png", "{label} thumb mime");
+    assert!(thumb.byte_size > 0, "{label} thumb empty");
+    let colors = distinct_colors(&base64_decode(&thumb.bytes_base64), 16);
+    assert!(
+        colors >= 2,
+        "{label}: imported thumbnail is blank ({colors} distinct color)"
+    );
+
+    let _proj = open_project(&format!("instantiate-{label}"));
+    let report = template_instantiate(id).unwrap_or_else(|e| panic!("{label} instantiate: {e}"));
+    assert_eq!(
+        report.node_ids.len(),
+        expected_items,
+        "{label}: instantiate should create one node per imported item"
+    );
+    project_close();
+}
+
+/// Importing a `.ktemplate/` folder authored outside the library must
+/// copy it into the marketplace root as a brand-new, independently-id'd
+/// entry (a *remix*, not an alias) and leave it fully usable.
+#[test]
+#[serial]
+fn import_ktemplate_folder_registers_lists_instantiates_and_renders() {
+    shared_template_dir();
+    let _ = template_list(None, None).expect("seed");
+
+    let external = TempDir::new().expect("external dir");
+    let content = sample_content();
+    let src = write_external_ktemplate(external.path(), "promo.ktemplate", &content);
+
+    let req = TemplateImportRequest {
+        source_path: src.to_string_lossy().into_owned(),
+        name: Some("Remixed Promo".into()),
+        description: None,
+        category: Some(TemplateCategory::Flyer),
+        tags: Some(vec!["remix".into(), "promo".into()]),
+    };
+    let manifest = template_import(&req).expect("import ktemplate");
+    assert_eq!(manifest.name, "Remixed Promo");
+    assert_eq!(manifest.category, TemplateCategory::Flyer);
+    assert!(manifest.tags.contains(&"remix".to_string()));
+
+    assert_imported_template_is_live(manifest.id, content.items.len(), "ktemplate");
+}
+
+/// Importing a bare template-content `*.json` (no manifest) must derive
+/// sensible defaults and register a working library entry.
+#[test]
+#[serial]
+fn import_template_content_json_registers_and_renders() {
+    shared_template_dir();
+    let _ = template_list(None, None).expect("seed");
+
+    let external = TempDir::new().expect("external dir");
+    let content = sample_content();
+    let json_path = external.path().join("loose-design.json");
+    fs::write(&json_path, serde_json::to_string_pretty(&content).unwrap())
+        .expect("write loose json");
+
+    let req = TemplateImportRequest {
+        source_path: json_path.to_string_lossy().into_owned(),
+        name: None,
+        description: None,
+        category: None,
+        tags: None,
+    };
+    let manifest = template_import(&req).expect("import json");
+    // No explicit name → derived from the file stem.
+    assert_eq!(manifest.name, "loose-design");
+
+    assert_imported_template_is_live(manifest.id, content.items.len(), "json");
+}
+
+/// The headline remix path: import a real `.kstudio` *project* (built
+/// the way the editor builds one — a populated artboard) and have the
+/// bridge invert its node graph back into template content that is
+/// itself a usable, renderable library template.
+#[test]
+#[serial]
+fn import_kstudio_project_inverts_to_template_and_renders() {
+    let _root = shared_template_dir();
+    let _ = template_list(None, None).expect("seed");
+
+    let catalog = bundled_templates();
+    let source_template = &catalog[0];
+
+    // Build a real project on disk: create it, apply a bundled
+    // template so the artboard holds genuine vector + text nodes, then
+    // persist so the .kstudio's document.sqlite has the full graph.
+    let proj_dir = TempDir::new().expect("project dir");
+    project_close();
+    project_create("remix-src", proj_dir.path()).expect("project_create");
+    template_instantiate(source_template.manifest.id).expect("instantiate into project");
+    project_save().expect("project_save");
+    project_close();
+
+    let kstudio_path = proj_dir.path().join("remix-src.kstudio");
+    assert!(
+        kstudio_path.join("document.sqlite").exists(),
+        "project_create + save should produce a .kstudio with a document db"
+    );
+
+    let req = TemplateImportRequest {
+        source_path: kstudio_path.to_string_lossy().into_owned(),
+        name: Some("Remixed From Project".into()),
+        description: None,
+        category: Some(TemplateCategory::Presentation),
+        tags: None,
+    };
+    let manifest = template_import(&req).expect("import kstudio");
+    assert_eq!(manifest.name, "Remixed From Project");
+
+    // The inverse mapping synthesizes a full-bleed background plus one
+    // item per painted leaf, so the imported design must hold at least
+    // the background + the template's own content.
+    let listed = template_list(None, Some("Remixed From Project")).expect("find imported");
+    let imported = listed
+        .templates
+        .iter()
+        .find(|t| t.id == manifest.id)
+        .expect("imported kstudio template listed");
+    assert_eq!(imported.category, TemplateCategory::Presentation);
+
+    // Round-trips through render + instantiate like any other template.
+    let thumb = template_thumbnail(manifest.id).expect("kstudio thumb");
+    let colors = distinct_colors(&base64_decode(&thumb.bytes_base64), 16);
+    assert!(
+        colors >= 2,
+        "kstudio: inverted design rendered blank ({colors} distinct color)"
+    );
+    let _proj = open_project("instantiate-kstudio");
+    let report = template_instantiate(manifest.id).expect("instantiate kstudio import");
+    assert!(
+        report.node_ids.len() >= 2,
+        "kstudio import should yield a background + content, got {}",
+        report.node_ids.len()
+    );
+    project_close();
+}
+
+/// Import must reject bad inputs with a structured error instead of
+/// writing a corrupt entry: a path that does not exist, and a `*.json`
+/// whose contents are not template content.
+#[test]
+#[serial]
+fn import_rejects_nonexistent_and_invalid_sources() {
+    shared_template_dir();
+    let _ = template_list(None, None).expect("seed");
+    let before = template_list(None, None)
+        .expect("count before")
+        .templates
+        .len();
+
+    let missing = TemplateImportRequest {
+        source_path: "/nonexistent/path/to/design.json".into(),
+        name: None,
+        description: None,
+        category: None,
+        tags: None,
+    };
+    assert!(
+        template_import(&missing).is_err(),
+        "importing a nonexistent path must error"
+    );
+
+    let external = TempDir::new().expect("external dir");
+    let bad = external.path().join("not-a-design.json");
+    fs::write(&bad, b"{\"hello\":\"world\"}").expect("write bad json");
+    let bad_req = TemplateImportRequest {
+        source_path: bad.to_string_lossy().into_owned(),
+        name: None,
+        description: None,
+        category: None,
+        tags: None,
+    };
+    assert!(
+        template_import(&bad_req).is_err(),
+        "importing JSON that isn't template content must error"
+    );
+
+    let after = template_list(None, None)
+        .expect("count after")
+        .templates
+        .len();
+    assert_eq!(
+        before, after,
+        "a rejected import must not register or write any library entry"
     );
 }

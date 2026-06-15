@@ -7,7 +7,7 @@
 //! can use the existing [`DocumentBridgeError`] → `NapiError` mapping.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::thread::{self, JoinHandle};
@@ -4166,6 +4166,446 @@ pub fn template_instantiate(template_id: Uuid) -> Result<TemplateInstantiateRepo
     };
     let (_dir, content) = load_template_content(template_id)?;
     template_instantiate_items(&name, content.width, content.height, content.items)
+}
+
+/// Request to import an external design file as a new library template
+/// (the "Remix from file" flow). The renderer picks a file via
+/// `dialog.showOpenDialog`; the bridge detects the source format from
+/// the path, extracts a wire-format `content.json`, and persists it as
+/// a new `.ktemplate/` through
+/// [`kcreate_core::LocalMarketplace::import_design`] (honouring
+/// `KCREATE_TEMPLATE_DIR`).
+///
+/// All metadata fields are optional overrides: when omitted the
+/// importer derives sensible defaults from the source (file stem for
+/// the name, the source format as a tag, `Custom` category, and — for
+/// `.ktemplate` sources — the original manifest's category/tags).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TemplateImportRequest {
+    /// Absolute path to the source: a `.kstudio/` project directory, a
+    /// `.ktemplate/` directory, or a template-content `*.json` file.
+    pub source_path: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub category: Option<kcreate_core::TemplateCategory>,
+    #[serde(default)]
+    pub tags: Option<Vec<String>>,
+}
+
+/// Content + metadata defaults extracted from an import source before
+/// it is filed into the marketplace. The caller layers any explicit
+/// [`TemplateImportRequest`] overrides on top of these defaults.
+struct ExtractedImport {
+    content_json: String,
+    default_name: String,
+    default_description: String,
+    default_category: kcreate_core::TemplateCategory,
+    default_tags: Vec<String>,
+    page_count: u32,
+}
+
+/// Import an external design file as a new library template. Detects
+/// the source format from `source_path`, produces a wire-format
+/// `content.json`, then registers a fresh `.ktemplate/` in the install
+/// dir. Returns the new template's manifest so the renderer can refresh
+/// the gallery (and optionally jump straight into "Start from
+/// template").
+///
+/// Supported sources:
+/// * **`.kstudio/`** project package — opened read-only via
+///   [`kcreate_storage::ProjectStore`]; its primary artboard is
+///   inverted back into template items (the exact inverse of
+///   [`crate::document::build_canvas_batch_node`]).
+/// * **`.ktemplate/`** folder — its `content.json` is taken verbatim
+///   and its `manifest.json` supplies metadata defaults.
+/// * **template `*.json`** — parsed/validated as template content.
+pub fn template_import(req: &TemplateImportRequest) -> Result<kcreate_core::TemplateManifest> {
+    let path = PathBuf::from(&req.source_path);
+    if !path.exists() {
+        return Err(DocumentBridgeError::Internal(format!(
+            "import source does not exist: {}",
+            path.display()
+        )));
+    }
+    let extracted = extract_import_content(&path)?;
+    let spec = kcreate_core::ImportSpec {
+        name: req
+            .name
+            .clone()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or(extracted.default_name),
+        description: req
+            .description
+            .clone()
+            .unwrap_or(extracted.default_description),
+        category: req.category.unwrap_or(extracted.default_category),
+        tags: req
+            .tags
+            .clone()
+            .filter(|t| !t.is_empty())
+            .unwrap_or(extracted.default_tags),
+        page_count: extracted.page_count,
+        content_json: extracted.content_json,
+    };
+    let mut mp = template_marketplace().lock();
+    Ok(mp.import_design(spec)?)
+}
+
+/// Dispatch on the import source's shape: a `.kstudio/` SQLite package,
+/// a `.ktemplate/` folder, or a bare template-content `*.json`. The
+/// directory probes (`document.sqlite` / `content.json`) make detection
+/// robust to a renamed directory whose extension was stripped.
+fn extract_import_content(path: &Path) -> Result<ExtractedImport> {
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("Imported Design")
+        .to_string();
+    let ext = path
+        .extension()
+        .and_then(|s| s.to_str())
+        .map(str::to_ascii_lowercase);
+    let is_dir = path.is_dir();
+    if is_dir && (ext.as_deref() == Some("kstudio") || path.join("document.sqlite").exists()) {
+        extract_from_kstudio(path, &stem)
+    } else if is_dir && (ext.as_deref() == Some("ktemplate") || path.join("content.json").exists())
+    {
+        extract_from_ktemplate(path, &stem)
+    } else if !is_dir && ext.as_deref() == Some("json") {
+        extract_from_json_file(path, &stem)
+    } else {
+        Err(DocumentBridgeError::Internal(format!(
+            "unrecognised import source (expected a .kstudio/ project, a .ktemplate/ folder, \
+             or a template content .json): {}",
+            path.display()
+        )))
+    }
+}
+
+/// Read a `.ktemplate/` folder: its `content.json` is the template
+/// payload verbatim; its `manifest.json` (when present) supplies the
+/// metadata defaults so a re-import preserves the original category and
+/// tags.
+fn extract_from_ktemplate(path: &Path, stem: &str) -> Result<ExtractedImport> {
+    let content_json = std::fs::read_to_string(path.join("content.json"))?;
+    let manifest = std::fs::read_to_string(path.join("manifest.json"))
+        .ok()
+        .and_then(|raw| serde_json::from_str::<kcreate_core::TemplateManifest>(&raw).ok());
+    let (default_name, default_description, default_category, default_tags, page_count) =
+        if let Some(m) = manifest {
+            (
+                format!("{} (remix)", m.name),
+                m.description,
+                m.category,
+                m.tags,
+                m.page_count,
+            )
+        } else {
+            (
+                stem.to_string(),
+                String::new(),
+                kcreate_core::TemplateCategory::Custom,
+                vec!["imported".to_string()],
+                1,
+            )
+        };
+    Ok(ExtractedImport {
+        content_json,
+        default_name,
+        default_description,
+        default_category,
+        default_tags,
+        page_count,
+    })
+}
+
+/// Read a bare template-content `*.json` file. `import_design`
+/// re-validates the JSON parses into [`kcreate_core::TemplateContent`]
+/// before any disk write, so this path stays a thin read.
+fn extract_from_json_file(path: &Path, stem: &str) -> Result<ExtractedImport> {
+    let content_json = std::fs::read_to_string(path)?;
+    Ok(ExtractedImport {
+        content_json,
+        default_name: stem.to_string(),
+        default_description: String::new(),
+        default_category: kcreate_core::TemplateCategory::Custom,
+        default_tags: vec!["imported".to_string()],
+        page_count: 1,
+    })
+}
+
+/// Open a `.kstudio/` project read-only and invert its document graph
+/// back into a [`kcreate_core::TemplateContent`].
+fn extract_from_kstudio(path: &Path, stem: &str) -> Result<ExtractedImport> {
+    let store = kcreate_storage::ProjectStore::open(path)?;
+    let graph = store.load_document()?;
+    let (content, page_count) = kstudio_to_template_content(&graph)?;
+    let content_json = serde_json::to_string(&content)?;
+    Ok(ExtractedImport {
+        content_json,
+        default_name: format!("{stem} (remix)"),
+        default_description: format!("Imported from {stem}.kstudio"),
+        default_category: kcreate_core::TemplateCategory::Custom,
+        default_tags: vec!["imported".to_string(), "kstudio".to_string()],
+        page_count,
+    })
+}
+
+/// Invert a loaded document graph into the wire-format template content
+/// the marketplace persists. This is the faithful inverse of
+/// [`crate::document::build_canvas_batch_node`]: the primary artboard
+/// fixes the canvas size + backdrop, and every vector/text leaf becomes
+/// a [`kcreate_core::TemplateItem`] in artboard-local coordinates.
+///
+/// Returns the content plus the artboard count (used as `page_count`).
+fn kstudio_to_template_content(
+    graph: &kcreate_core::DocumentGraph,
+) -> Result<(kcreate_core::TemplateContent, u32)> {
+    use kcreate_core::node::{FillStyle, RgbaColor};
+    use kcreate_core::{TemplateContent, TemplateItem};
+
+    let artboard_count = graph
+        .iter()
+        .filter(|(_, n)| n.node_type == NodeType::Artboard)
+        .count()
+        .max(1) as u32;
+
+    // Resolve the canvas frame (origin + size + backdrop) and the
+    // ordered set of paintable leaves to emit. Two modes: a primary
+    // artboard (the common case — its bounds define the canvas), or a
+    // documented fallback to the union of all vector/text layers when
+    // the project has no artboard at all.
+    let (origin_x, origin_y, width, height, bg_fill, leaf_ids) =
+        if let Some(aid) = find_first_artboard(graph) {
+            let art = graph.get_node(aid).ok_or_else(|| {
+                DocumentBridgeError::Internal("artboard vanished during import".into())
+            })?;
+            // World origin of the artboard — mirrors `node_world_bounds`
+            // (bounds + own translation; rotation/shear are dropped, as
+            // the template wire format is axis-aligned).
+            let ox = art.bounds.x + art.transform.tx;
+            let oy = art.bounds.y + art.transform.ty;
+            let bg = match &art.style.fill {
+                FillStyle::Solid(c) => FillStyle::Solid(*c),
+                _ => FillStyle::Solid(RgbaColor::WHITE),
+            };
+            let leaves = paint_ordered_leaves(graph, &graph.children_of(aid));
+            (ox, oy, art.bounds.width, art.bounds.height, bg, leaves)
+        } else {
+            let leaves = paint_ordered_leaves(graph, graph.root_ids());
+            let mut union: Option<Bounds> = None;
+            for id in &leaves {
+                if let Some(n) = graph.get_node(*id) {
+                    let wb = Bounds {
+                        x: n.bounds.x + n.transform.tx,
+                        y: n.bounds.y + n.transform.ty,
+                        width: n.bounds.width,
+                        height: n.bounds.height,
+                    };
+                    union = Some(match union {
+                        Some(u) => u.union(&wb),
+                        None => wb,
+                    });
+                }
+            }
+            let u = union.ok_or_else(|| {
+                DocumentBridgeError::Internal(
+                    "imported .kstudio has no artboard and no vector/text layers to import".into(),
+                )
+            })?;
+            (
+                u.x,
+                u.y,
+                u.width.max(1.0),
+                u.height.max(1.0),
+                FillStyle::Solid(RgbaColor::WHITE),
+                leaves,
+            )
+        };
+
+    let mut items: Vec<TemplateItem> = Vec::with_capacity(leaf_ids.len() + 1);
+    // item[0]: full-bleed background so the thumbnail and applied canvas
+    // share an identical backdrop (the bundled-template convention).
+    items.push(TemplateItem::Rect {
+        parent: None,
+        x: 0.0,
+        y: 0.0,
+        w: width,
+        h: height,
+        fill: Some(bg_fill),
+        name: Some("Background".to_string()),
+    });
+
+    for id in leaf_ids {
+        let Some(node) = graph.get_node(id) else {
+            continue;
+        };
+        // Translate the node's local frame into artboard-local canvas
+        // space. Both the node bounds and its vector path live in the
+        // same local frame, so a single offset converts either.
+        let off_x = node.transform.tx - origin_x;
+        let off_y = node.transform.ty - origin_y;
+        let fill = Some(node.style.fill.clone());
+        match node.node_type {
+            NodeType::TextLayer => {
+                let (body, family, size) = match kcreate_export::text_layer_meta(node) {
+                    Some(m) => (m.text, m.font_family, f64::from(m.font_size)),
+                    None => (node.name.clone(), "sans-serif".to_string(), 16.0),
+                };
+                items.push(TemplateItem::Text {
+                    parent: None,
+                    x: node.bounds.x + off_x,
+                    y: node.bounds.y + off_y,
+                    body,
+                    family,
+                    size,
+                    fill,
+                    name: Some(node.name.clone()),
+                });
+            }
+            NodeType::VectorLayer => {
+                items.push(vector_node_to_item(node, off_x, off_y, fill));
+            }
+            // Raster layers reference a blob in the source project's
+            // store, which a portable vector template cannot carry;
+            // skip them (documented, lossy). All other node types are
+            // containers already flattened by `paint_ordered_leaves`.
+            _ => {}
+        }
+    }
+
+    Ok((
+        TemplateContent {
+            width,
+            height,
+            items,
+        },
+        artboard_count,
+    ))
+}
+
+/// Depth-first walk from `roots` (in list order) collecting every
+/// vector/text **leaf** id in paint order. Containers
+/// (artboard/group/page/component/layout) are recursed into; raster
+/// leaves are skipped (vector templates can't carry pixel blobs). The
+/// child-list order matches the renderer's z-stream, so the emitted
+/// template paints back identically.
+fn paint_ordered_leaves(graph: &kcreate_core::DocumentGraph, roots: &[Uuid]) -> Vec<Uuid> {
+    let mut out = Vec::new();
+    for root in roots {
+        collect_paint_leaves(graph, *root, &mut out);
+    }
+    out
+}
+
+fn collect_paint_leaves(graph: &kcreate_core::DocumentGraph, id: Uuid, out: &mut Vec<Uuid>) {
+    let Some(node) = graph.get_node(id) else {
+        return;
+    };
+    match node.node_type {
+        NodeType::VectorLayer | NodeType::TextLayer => out.push(id),
+        NodeType::RasterLayer => {}
+        _ => {
+            for child in graph.children_of(id) {
+                collect_paint_leaves(graph, child, out);
+            }
+        }
+    }
+}
+
+/// Find the primary artboard via a deterministic breadth-first walk
+/// from the ordered root ids. BFS (rather than `iter()`'s nondetermin-
+/// istic HashMap order) makes the chosen artboard stable across loads.
+fn find_first_artboard(graph: &kcreate_core::DocumentGraph) -> Option<Uuid> {
+    let mut queue: std::collections::VecDeque<Uuid> = graph.root_ids().iter().copied().collect();
+    while let Some(id) = queue.pop_front() {
+        if let Some(node) = graph.get_node(id) {
+            if node.node_type == NodeType::Artboard {
+                return Some(id);
+            }
+            for child in graph.children_of(id) {
+                queue.push_back(child);
+            }
+        }
+    }
+    None
+}
+
+/// Classify a vector layer back into the closest template primitive by
+/// inspecting its stored [`kcreate_vector::VectorPath`] command shape —
+/// the exact inverse of the rect/ellipse/line constructions in
+/// [`crate::document::build_canvas_batch_node`]. Unrecognised geometry
+/// falls back to the node's axis-aligned bounds as a `Rect` (documented,
+/// lossy) so no layer is silently dropped.
+fn vector_node_to_item(
+    node: &Node,
+    off_x: f64,
+    off_y: f64,
+    fill: Option<kcreate_core::node::FillStyle>,
+) -> kcreate_core::TemplateItem {
+    use kcreate_core::TemplateItem;
+    use kcreate_vector::PathSegment;
+
+    let name = Some(node.name.clone());
+    let path: Option<VectorPath> = node
+        .metadata
+        .get(crate::scene_sync::VECTOR_PATH_METADATA_KEY)
+        .and_then(|v| serde_json::from_value(v.clone()).ok());
+
+    if let Some(p) = &path {
+        // Line: exactly MoveTo + LineTo.
+        if p.commands.len() == 2 {
+            if let (Some(PathSegment::MoveTo(a)), Some(PathSegment::LineTo(b))) =
+                (p.commands.first(), p.commands.get(1))
+            {
+                return TemplateItem::Line {
+                    parent: None,
+                    x1: a.x + off_x,
+                    y1: a.y + off_y,
+                    x2: b.x + off_x,
+                    y2: b.y + off_y,
+                    fill,
+                    name,
+                };
+            }
+        }
+        // Ellipse: MoveTo + 4×CubicTo + Close (the KAPPA construction).
+        if p.commands.len() == 6
+            && p.commands
+                .iter()
+                .filter(|c| matches!(c, PathSegment::CubicTo { .. }))
+                .count()
+                == 4
+        {
+            let b = &node.bounds;
+            return TemplateItem::Ellipse {
+                parent: None,
+                cx: b.x + b.width / 2.0 + off_x,
+                cy: b.y + b.height / 2.0 + off_y,
+                rx: b.width / 2.0,
+                ry: b.height / 2.0,
+                fill,
+                name,
+            };
+        }
+    }
+
+    // Rect (5-command closed path) + documented lossy fallback for any
+    // other geometry: emit the node's axis-aligned bounds.
+    let b = &node.bounds;
+    TemplateItem::Rect {
+        parent: None,
+        x: b.x + off_x,
+        y: b.y + off_y,
+        w: b.width,
+        h: b.height,
+        fill,
+        name,
+    }
 }
 
 /// Filename of the sidecar that keys a cached `thumbnail.png` to the

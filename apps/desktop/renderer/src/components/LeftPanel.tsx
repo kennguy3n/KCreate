@@ -82,6 +82,7 @@ export interface LeftPanelProps {
   onRenameArtboard?: (id: string, name: string) => void;
   onDuplicateArtboard?: (id: string) => void;
   onResizeArtboard?: (id: string, width: number, height: number) => void;
+  onMagicResize?: (id: string) => void;
   onDeleteArtboard?: (id: string) => void;
 
   // Components-section inputs. Optional so existing callers that
@@ -118,6 +119,7 @@ export function LeftPanel({
   onRenameArtboard,
   onDuplicateArtboard,
   onResizeArtboard,
+  onMagicResize,
   onDeleteArtboard,
   components,
   onComponentCreateFromSelection,
@@ -189,6 +191,7 @@ export function LeftPanel({
             onRenameArtboard={onRenameArtboard ?? noopRename}
             onDuplicateArtboard={onDuplicateArtboard ?? noopArg}
             onResizeArtboard={onResizeArtboard ?? noopResize}
+            onMagicResize={onMagicResize ?? noopArg}
             onDeleteArtboard={onDeleteArtboard ?? noopArg}
           />
         ) : null}

@@ -26,7 +26,7 @@ use kcreate_core::project::{
 };
 use kcreate_export::png::{export_png_to_bytes, PngExportError, PngExportOptions};
 use kcreate_export::svg::{export_svg_from_document, SvgDocumentExportError, SvgExportOptions};
-use kcreate_layout::{layout_flex, layout_grid, FlexLayout, GridLayout};
+use kcreate_layout::{layout_flex, layout_grid, FlexLayout, GridLayout, ResizeNode, ResizeOptions};
 use kcreate_storage::project_io::{ProjectStore, ProjectStoreError};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
@@ -3852,6 +3852,344 @@ pub fn artboard_resize(artboard_id: Uuid, width: f64, height: f64) -> Result<()>
 /// Return the built-in artboard preset catalogue.
 pub fn artboard_presets() -> Vec<kcreate_core::ArtboardPreset> {
     kcreate_core::standard_presets()
+}
+
+// -----------------------------------------------------------------------------
+// Magic Resize (G5) — reflow one design to many sizes
+// -----------------------------------------------------------------------------
+
+/// One requested Magic-Resize target. Either a named `preset`
+/// (resolved against [`kcreate_core::standard_presets`],
+/// case-insensitive) **or** an explicit `width` × `height` in pixels.
+/// When both a preset and explicit dimensions are supplied the
+/// explicit dimensions win. An optional `name` overrides the label of
+/// the generated artboard (otherwise the preset name / pixel size is
+/// used).
+///
+/// Mirrors `ResizeTarget` in `apps/desktop/shared/scene.ts`. The wire
+/// payload is a JSON array of these (the bridge entry point takes the
+/// array as a JSON string so we don't have to register a new
+/// `#[napi(object)]` struct).
+#[derive(Debug, Clone, Deserialize)]
+pub struct ResizeTargetSpec {
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub preset: Option<String>,
+    #[serde(default)]
+    pub width: Option<f64>,
+    #[serde(default)]
+    pub height: Option<f64>,
+}
+
+/// A target after preset resolution / validation: a concrete label +
+/// pixel size.
+struct ResolvedResizeTarget {
+    label: String,
+    width: f64,
+    height: f64,
+}
+
+fn resolve_resize_target(spec: &ResizeTargetSpec) -> Result<ResolvedResizeTarget> {
+    // Explicit dimensions take precedence over a preset name so a
+    // caller can override a preset's size while keeping its label.
+    if let (Some(width), Some(height)) = (spec.width, spec.height) {
+        if !(width.is_finite() && width > 0.0 && height.is_finite() && height > 0.0) {
+            return Err(DocumentBridgeError::InvalidBounds { width, height });
+        }
+        let label = spec
+            .name
+            .clone()
+            .unwrap_or_else(|| format!("{}×{}", width.round() as i64, height.round() as i64));
+        return Ok(ResolvedResizeTarget {
+            label,
+            width,
+            height,
+        });
+    }
+
+    if let Some(preset_name) = spec.preset.as_deref() {
+        let trimmed = preset_name.trim();
+        let preset = kcreate_core::standard_presets()
+            .into_iter()
+            .find(|p| p.name.eq_ignore_ascii_case(trimmed))
+            .ok_or_else(|| DocumentBridgeError::InvalidArgument {
+                argument: "preset".to_string(),
+                value: preset_name.to_string(),
+            })?;
+        let label = spec.name.clone().unwrap_or_else(|| preset.name.clone());
+        return Ok(ResolvedResizeTarget {
+            label,
+            width: preset.width,
+            height: preset.height,
+        });
+    }
+
+    Err(DocumentBridgeError::InvalidArgument {
+        argument: "target".to_string(),
+        value: "expected a `preset` name or both `width` and `height`".to_string(),
+    })
+}
+
+/// Build the reflow-engine input tree for the node `id` (recursively).
+///
+/// Reads each node's absolute [`Bounds`] and anchoring
+/// [`Constraints`] directly off the graph, plus the font size for
+/// text layers (from the canonical `TextLayerMeta` blob). The engine
+/// reasons purely about bounds — consistent with the flex/grid and
+/// constraint solvers, which also ignore `transform` translation
+/// (authored shapes bake position into `bounds` and leave the
+/// transform identity).
+fn build_resize_node(doc: &DocumentGraph, id: Uuid) -> Option<ResizeNode> {
+    let node = doc.get_node(id)?;
+    let font_size = if node.node_type == NodeType::TextLayer {
+        node.metadata
+            .get(crate::scene_sync::TEXT_LAYER_METADATA_KEY)
+            .and_then(|v| serde_json::from_value::<kcreate_export::TextLayerMeta>(v.clone()).ok())
+            .map(|m| f64::from(m.font_size))
+    } else {
+        None
+    };
+    let children = doc
+        .children_of(id)
+        .into_iter()
+        .filter_map(|cid| build_resize_node(doc, cid))
+        .collect();
+    Some(ResizeNode {
+        id,
+        bounds: node.bounds,
+        constraints: node.constraints,
+        font_size,
+        children,
+    })
+}
+
+/// Affine-remap every point of `path` from the `old` bounds rectangle
+/// into the `new` bounds rectangle. Keeps a `VectorLayer`'s stored
+/// geometry consistent with its reflowed `bounds` (the renderer draws
+/// vector paths from their absolute point coordinates, not by scaling
+/// the bounds rect — so the path itself must move).
+fn remap_vector_path(
+    path: &mut kcreate_vector::VectorPath,
+    old: kcreate_core::node::Bounds,
+    new: kcreate_core::node::Bounds,
+) {
+    let sx = if old.width.abs() > f64::EPSILON {
+        new.width / old.width
+    } else {
+        1.0
+    };
+    let sy = if old.height.abs() > f64::EPSILON {
+        new.height / old.height
+    } else {
+        1.0
+    };
+    let map = |p: &mut kcreate_vector::PathPoint| {
+        p.x = new.x + (p.x - old.x) * sx;
+        p.y = new.y + (p.y - old.y) * sy;
+    };
+    for seg in &mut path.commands {
+        match seg {
+            kcreate_vector::PathSegment::MoveTo(p) | kcreate_vector::PathSegment::LineTo(p) => {
+                map(p);
+            }
+            kcreate_vector::PathSegment::QuadTo { ctrl, end } => {
+                map(ctrl);
+                map(end);
+            }
+            kcreate_vector::PathSegment::CubicTo { ctrl1, ctrl2, end } => {
+                map(ctrl1);
+                map(ctrl2);
+                map(end);
+            }
+            kcreate_vector::PathSegment::Close => {}
+        }
+    }
+}
+
+/// Apply a [`kcreate_layout::ResizeResult`] to the cloned subtree:
+/// write each node's new bounds (remapping vector geometry so shapes
+/// actually move/scale), then rewrite text layers' font sizes in
+/// their `TextLayerMeta` blob.
+fn apply_resize_result(
+    doc: &mut DocumentGraph,
+    result: &kcreate_layout::ResizeResult,
+) -> Result<()> {
+    for (id, new_bounds) in &result.bounds {
+        let Some(node) = doc.get_node_mut(*id) else {
+            continue;
+        };
+        let old_bounds = node.bounds;
+        if node.node_type == NodeType::VectorLayer {
+            if let Some(raw) = node
+                .metadata
+                .get(crate::scene_sync::VECTOR_PATH_METADATA_KEY)
+            {
+                if let Ok(mut path) =
+                    serde_json::from_value::<kcreate_vector::VectorPath>(raw.clone())
+                {
+                    remap_vector_path(&mut path, old_bounds, *new_bounds);
+                    node.metadata.insert(
+                        crate::scene_sync::VECTOR_PATH_METADATA_KEY.to_string(),
+                        serde_json::to_value(&path)?,
+                    );
+                }
+            }
+        }
+        node.bounds = *new_bounds;
+        node.touch();
+    }
+
+    for (id, new_font) in &result.fonts {
+        let Some(node) = doc.get_node_mut(*id) else {
+            continue;
+        };
+        let Some(raw) = node
+            .metadata
+            .get(crate::scene_sync::TEXT_LAYER_METADATA_KEY)
+        else {
+            continue;
+        };
+        let mut meta: kcreate_export::TextLayerMeta = serde_json::from_value(raw.clone())?;
+        #[allow(clippy::cast_possible_truncation)]
+        {
+            meta.font_size = *new_font as f32;
+        }
+        node.metadata.insert(
+            crate::scene_sync::TEXT_LAYER_METADATA_KEY.to_string(),
+            serde_json::to_value(&meta)?,
+        );
+        node.touch();
+    }
+    Ok(())
+}
+
+/// **Magic Resize.** Reflow a finished design from its source
+/// artboard onto one or more differently-sized target artboards,
+/// preserving layout intent (anchoring + proportional scaling) rather
+/// than naively stretching.
+///
+/// Non-destructive: the source artboard is never modified — each
+/// target produces a fresh deep-cloned artboard placed in a row to
+/// the right of everything currently on the source's page. All
+/// targets are generated under a **single** undoable operation
+/// (`magic_resize`) so one undo removes every generated artboard at
+/// once.
+///
+/// For each target the pipeline is:
+/// 1. deep-clone the source subtree (new ids) under the same page,
+/// 2. resize + reposition the clone's artboard frame to the target,
+/// 3. run the pure reflow engine ([`kcreate_layout::magic_resize`])
+///    over the cloned children,
+/// 4. apply the new bounds (remapping vector geometry) + scaled fonts,
+/// 5. re-run the flex/grid solvers across any `LayoutFrame`
+///    descendants so stacked/auto-laid-out groups reflow too.
+///
+/// Returns the new artboards' ids in target order.
+pub fn magic_resize(source_artboard_id: Uuid, targets: &[ResizeTargetSpec]) -> Result<Vec<Uuid>> {
+    // One-time gap between generated artboards, matching the spacing
+    // `artboard_create` / `duplicate_artboard` use.
+    const GAP: f64 = 100.0;
+
+    if targets.is_empty() {
+        return Err(DocumentBridgeError::InvalidArgument {
+            argument: "targets".to_string(),
+            value: "at least one target size is required".to_string(),
+        });
+    }
+    // Resolve + validate every target up front so a bad spec aborts
+    // before we mutate the graph (all-or-nothing).
+    let resolved = targets
+        .iter()
+        .map(resolve_resize_target)
+        .collect::<Result<Vec<_>>>()?;
+
+    let mut guard = slot().write();
+    let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
+
+    // Validate the source is an artboard; capture its frame + page.
+    let source = ws
+        .project
+        .document
+        .get_node(source_artboard_id)
+        .ok_or(DocumentBridgeError::NodeNotFound(source_artboard_id))?;
+    if source.node_type != NodeType::Artboard {
+        return Err(DocumentBridgeError::WrongNodeType {
+            expected: NodeType::Artboard,
+            got: source.node_type,
+        });
+    }
+    let source_bounds = source.bounds;
+    let source_name = source.name.clone();
+    let page_id = source
+        .parent_id
+        .ok_or(DocumentBridgeError::NodeNotFound(source_artboard_id))?;
+
+    let opts = ResizeOptions::default();
+    let mut cursor_x = next_artboard_x(&ws.project.document, page_id);
+
+    let mut new_ids: Vec<Uuid> = Vec::with_capacity(resolved.len());
+    let mut snapshots: Vec<serde_json::Value> = Vec::with_capacity(resolved.len());
+
+    for target in &resolved {
+        // 1. Deep clone the source subtree under the same page.
+        let new_root = ws
+            .project
+            .document
+            .clone_subtree(source_artboard_id, Some(page_id))?;
+
+        // 2. Resize + reposition the clone's artboard frame.
+        let target_bounds =
+            kcreate_core::node::Bounds::new(cursor_x, source_bounds.y, target.width, target.height);
+        if let Some(root) = ws.project.document.get_node_mut(new_root) {
+            root.bounds = target_bounds;
+            root.name = format!("{source_name} — {}", target.label);
+            root.touch();
+        }
+        cursor_x += target.width + GAP;
+
+        // 3. Build the reflow input from the cloned children. The
+        //    cloned children are still at the SOURCE's coordinates, so
+        //    the engine's source frame is the original source bounds.
+        let roots: Vec<ResizeNode> = ws
+            .project
+            .document
+            .children_of(new_root)
+            .into_iter()
+            .filter_map(|cid| build_resize_node(&ws.project.document, cid))
+            .collect();
+
+        // 4. Reflow + apply.
+        let result = kcreate_layout::magic_resize(&roots, source_bounds, target_bounds, &opts);
+        apply_resize_result(&mut ws.project.document, &result)?;
+
+        // 5. Re-run auto-layout across any LayoutFrame descendants so
+        //    stacked/grid groups reflow to their new frame sizes.
+        layout_propagate_in_subtree(ws, new_root)?;
+
+        let snapshot = ws
+            .project
+            .document
+            .get_node(new_root)
+            .map_or(serde_json::Value::Null, |n| {
+                serde_json::to_value(n).unwrap_or(serde_json::Value::Null)
+            });
+        snapshots.push(snapshot);
+        new_ids.push(new_root);
+    }
+
+    ws.project.modified_at = Utc::now();
+    let op = Operation::new(
+        "user",
+        "magic_resize",
+        serde_json::to_value(source_artboard_id).unwrap_or(serde_json::Value::Null),
+        serde_json::Value::Array(snapshots),
+        new_ids.clone(),
+    );
+    ws.project.execute_operation(op);
+    let _ = sync_scene_locked(&mut guard);
+    drop(guard);
+    Ok(new_ids)
 }
 
 // -----------------------------------------------------------------------------
@@ -13014,6 +13352,375 @@ mod tests {
             }
             other => panic!("expected NotVectorLayer, got {other:?}"),
         }
+        project_close();
+    }
+
+    // -------------------------------------------------------------------------
+    // Magic Resize (G5)
+    // -------------------------------------------------------------------------
+
+    fn bounds(x: f64, y: f64, w: f64, h: f64) -> kcreate_core::node::Bounds {
+        kcreate_core::node::Bounds::new(x, y, w, h)
+    }
+
+    /// Insert a leaf rectangle under `artboard` with explicit bounds,
+    /// bypassing the operation log so the only op a Magic-Resize test
+    /// records is the resize itself.
+    fn add_rect_child(artboard: Uuid, b: kcreate_core::node::Bounds) -> Uuid {
+        let mut guard = slot().write();
+        let ws = guard.as_mut().expect("project open");
+        let mut node = Node::new(NodeType::VectorLayer, "rect".to_string());
+        node.parent_id = Some(artboard);
+        node.bounds = b;
+        let id = ws.project.document.insert_node(node).expect("insert child");
+        drop(guard);
+        id
+    }
+
+    /// Insert a text leaf under `artboard` carrying a `TextLayerMeta`
+    /// (so the reflow engine has a font size to scale). `font_px` is
+    /// already `f32` to keep the test cast-free.
+    fn add_text_child(artboard: Uuid, b: kcreate_core::node::Bounds, font_px: f32) -> Uuid {
+        let mut guard = slot().write();
+        let ws = guard.as_mut().expect("project open");
+        let mut node = Node::new(NodeType::TextLayer, "headline".to_string());
+        node.parent_id = Some(artboard);
+        node.bounds = b;
+        let meta = crate::scene_sync::TextLayerMeta {
+            text: "SUMMER FEST".to_string(),
+            font_family: "Inter".to_string(),
+            font_size: font_px,
+        };
+        node.metadata.insert(
+            crate::scene_sync::TEXT_LAYER_METADATA_KEY.to_string(),
+            serde_json::to_value(&meta).expect("serialize text meta"),
+        );
+        let id = ws.project.document.insert_node(node).expect("insert text");
+        drop(guard);
+        id
+    }
+
+    fn node_bounds(id: Uuid) -> kcreate_core::node::Bounds {
+        let guard = slot().write();
+        let ws = guard.as_ref().expect("project open");
+        ws.project
+            .document
+            .get_node(id)
+            .expect("node present")
+            .bounds
+    }
+
+    fn child_ids(parent: Uuid) -> Vec<Uuid> {
+        let guard = slot().write();
+        let ws = guard.as_ref().expect("project open");
+        ws.project.document.children_of(parent)
+    }
+
+    fn node_font(id: Uuid) -> f32 {
+        let guard = slot().write();
+        let ws = guard.as_ref().expect("project open");
+        let node = ws.project.document.get_node(id).expect("node present");
+        let raw = node
+            .metadata
+            .get(crate::scene_sync::TEXT_LAYER_METADATA_KEY)
+            .expect("text meta present");
+        serde_json::from_value::<crate::scene_sync::TextLayerMeta>(raw.clone())
+            .expect("parse text meta")
+            .font_size
+    }
+
+    fn artboard_count() -> usize {
+        artboard_list().expect("artboard list").len()
+    }
+
+    /// Build a recognizable 1000×1000 poster: a full-bleed header band
+    /// pinned to the top, a centered logo, a full-bleed footer pinned
+    /// to the bottom, and a headline text layer. Children carry default
+    /// constraints so the engine infers anchoring from geometry — the
+    /// same path real authored designs hit. Returns the source artboard
+    /// id; children are returned in insertion order by `child_ids`:
+    /// `[header, logo, footer, headline]`.
+    fn build_poster() -> Uuid {
+        let ab = artboard_create(None, "Poster".to_string(), 1000.0, 1000.0).expect("artboard");
+        let o = node_bounds(ab);
+        add_rect_child(ab, bounds(o.x, o.y, 1000.0, 120.0)); // header
+        add_rect_child(ab, bounds(o.x + 400.0, o.y + 400.0, 200.0, 200.0)); // centered logo
+        add_rect_child(ab, bounds(o.x, o.y + 920.0, 1000.0, 80.0)); // footer
+        add_text_child(ab, bounds(o.x + 100.0, o.y + 200.0, 800.0, 90.0), 60.0); // headline
+        ab
+    }
+
+    fn spec_px(width: f64, height: f64) -> ResizeTargetSpec {
+        ResizeTargetSpec {
+            name: None,
+            preset: None,
+            width: Some(width),
+            height: Some(height),
+        }
+    }
+
+    fn spec_preset(name: &str) -> ResizeTargetSpec {
+        ResizeTargetSpec {
+            name: None,
+            preset: Some(name.to_string()),
+            width: None,
+            height: None,
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn magic_resize_creates_one_artboard_per_target_at_target_sizes() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("mr_create", dir.path()).expect("create");
+        let src = build_poster();
+        let before = artboard_count();
+
+        // One preset target + one explicit-pixel target.
+        let ids = magic_resize(
+            src,
+            &[spec_preset("Instagram Story"), spec_px(2480.0, 3508.0)],
+        )
+        .expect("magic resize");
+
+        assert_eq!(ids.len(), 2, "two targets => two new artboards");
+        assert_eq!(artboard_count(), before + 2);
+        let story = node_bounds(ids[0]);
+        assert!(
+            (story.width - 1080.0).abs() < 1e-6,
+            "story.w={}",
+            story.width
+        );
+        assert!(
+            (story.height - 1920.0).abs() < 1e-6,
+            "story.h={}",
+            story.height
+        );
+        let a4 = node_bounds(ids[1]);
+        assert!((a4.width - 2480.0).abs() < 1e-6, "a4.w={}", a4.width);
+        assert!((a4.height - 3508.0).abs() < 1e-6, "a4.h={}", a4.height);
+        project_close();
+    }
+
+    #[test]
+    #[serial]
+    fn magic_resize_preserves_anchoring_end_to_end() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("mr_anchor", dir.path()).expect("create");
+        let src = build_poster();
+
+        // Square → 9:16 story: the classic aspect-ratio hop.
+        let ids = magic_resize(src, &[spec_px(1080.0, 1920.0)]).expect("resize");
+        let ab = node_bounds(ids[0]);
+        let kids = child_ids(ids[0]);
+        assert_eq!(kids.len(), 4, "clone preserves the 4 children");
+
+        let header = node_bounds(kids[0]);
+        let logo = node_bounds(kids[1]);
+        let footer = node_bounds(kids[2]);
+
+        // Header spans the full new width and pins to the top.
+        assert!((header.x - ab.x).abs() < 1.0, "header.x={}", header.x);
+        assert!(
+            (header.width - ab.width).abs() < 1.0,
+            "header.width={}",
+            header.width
+        );
+        assert!((header.y - ab.y).abs() < 1.0, "header.y={}", header.y);
+        assert!(
+            header.height < ab.height * 0.25,
+            "header is a band, not a panel: h={}",
+            header.height
+        );
+
+        // Footer spans the width and its bottom edge tracks the frame.
+        let footer_bottom = footer.y + footer.height;
+        assert!(
+            ((ab.y + ab.height) - footer_bottom).abs() < 1.0,
+            "footer bottom gap, bottom={footer_bottom}"
+        );
+        assert!(
+            (footer.width - ab.width).abs() < 1.0,
+            "footer.width={}",
+            footer.width
+        );
+
+        // Logo stays centered on both axes.
+        let cx = logo.x + logo.width * 0.5;
+        let cy = logo.y + logo.height * 0.5;
+        assert!((cx - (ab.x + ab.width * 0.5)).abs() < 1.5, "cx={cx}");
+        assert!((cy - (ab.y + ab.height * 0.5)).abs() < 1.5, "cy={cy}");
+        project_close();
+    }
+
+    #[test]
+    #[serial]
+    fn magic_resize_redistributes_space_without_overflow() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("mr_overflow", dir.path()).expect("create");
+        let src = build_poster();
+
+        // Hop to two very different aspect ratios; nothing may exit the
+        // generated frame (redistribute, don't letterbox/overflow).
+        let ids =
+            magic_resize(src, &[spec_px(1080.0, 1920.0), spec_px(2480.0, 3508.0)]).expect("resize");
+        for id in ids {
+            let ab = node_bounds(id);
+            for child in child_ids(id) {
+                let c = node_bounds(child);
+                assert!(c.x >= ab.x - 1e-6, "left overflow {}", c.x);
+                assert!(c.y >= ab.y - 1e-6, "top overflow {}", c.y);
+                assert!(
+                    c.x + c.width <= ab.x + ab.width + 1e-6,
+                    "right overflow {}",
+                    c.x + c.width
+                );
+                assert!(
+                    c.y + c.height <= ab.y + ab.height + 1e-6,
+                    "bottom overflow {}",
+                    c.y + c.height
+                );
+            }
+        }
+        project_close();
+    }
+
+    #[test]
+    #[serial]
+    fn magic_resize_keeps_fonts_within_clamp_bounds() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("mr_font", dir.path()).expect("create");
+        let src = build_poster();
+        let opts = ResizeOptions::default();
+
+        // To the A4 poster (scales up) and to a tiny 200×200 tile
+        // (scales down) — the headline font must stay inside the clamp
+        // window for both.
+        let ids =
+            magic_resize(src, &[spec_px(2480.0, 3508.0), spec_px(200.0, 200.0)]).expect("resize");
+        for id in ids {
+            let headline = child_ids(id)[3];
+            let fs = f64::from(node_font(headline));
+            assert!(
+                fs >= opts.min_font_px - 1e-6 && fs <= opts.max_font_px + 1e-6,
+                "font {fs} outside [{}, {}]",
+                opts.min_font_px,
+                opts.max_font_px
+            );
+        }
+        project_close();
+    }
+
+    #[test]
+    #[serial]
+    fn magic_resize_is_non_destructive_to_source() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("mr_nondestruct", dir.path()).expect("create");
+        let src = build_poster();
+
+        let before_ab = node_bounds(src);
+        let before_kids: Vec<_> = child_ids(src).into_iter().map(node_bounds).collect();
+        let before_font = node_font(child_ids(src)[3]);
+
+        let _ =
+            magic_resize(src, &[spec_px(1080.0, 1920.0), spec_px(2480.0, 3508.0)]).expect("resize");
+
+        assert_eq!(
+            node_bounds(src),
+            before_ab,
+            "source artboard bounds changed"
+        );
+        let after_kids: Vec<_> = child_ids(src).into_iter().map(node_bounds).collect();
+        assert_eq!(after_kids, before_kids, "source child bounds changed");
+        assert!(
+            (f64::from(node_font(child_ids(src)[3])) - f64::from(before_font)).abs() < 1e-6,
+            "source font changed"
+        );
+        project_close();
+    }
+
+    #[test]
+    #[serial]
+    fn magic_resize_is_a_single_undoable_op() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("mr_undo", dir.path()).expect("create");
+        let src = build_poster();
+
+        let depth_before = document_status().expect("status").undo_depth;
+        let ids = magic_resize(
+            src,
+            &[
+                spec_px(1080.0, 1920.0),
+                spec_px(2480.0, 3508.0),
+                spec_preset("Instagram Post"),
+            ],
+        )
+        .expect("resize");
+        assert_eq!(ids.len(), 3);
+
+        // Three targets, ONE log entry — so a single undo retires the
+        // whole batch (the host folds the inverse back into its tree).
+        let after = document_status().expect("status");
+        assert_eq!(
+            after.undo_depth,
+            depth_before + 1,
+            "all targets must collapse to one undoable op"
+        );
+        assert!(after.can_undo);
+
+        document_undo().expect("undo");
+        let undone = document_status().expect("status");
+        assert_eq!(
+            undone.undo_depth, depth_before,
+            "one undo retires the entire Magic-Resize op"
+        );
+        assert!(undone.can_redo);
+        project_close();
+    }
+
+    #[test]
+    #[serial]
+    fn magic_resize_rejects_empty_targets() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("mr_empty", dir.path()).expect("create");
+        let src = build_poster();
+        let err = magic_resize(src, &[]).expect_err("empty targets must error");
+        assert!(matches!(err, DocumentBridgeError::InvalidArgument { .. }));
+        project_close();
+    }
+
+    #[test]
+    #[serial]
+    fn magic_resize_rejects_unknown_preset() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("mr_badpreset", dir.path()).expect("create");
+        let src = build_poster();
+        let err = magic_resize(src, &[spec_preset("Nonexistent Preset")])
+            .expect_err("unknown preset must error");
+        assert!(matches!(err, DocumentBridgeError::InvalidArgument { .. }));
+        // Nothing was created on the failure path.
+        project_close();
+    }
+
+    #[test]
+    #[serial]
+    fn magic_resize_rejects_non_artboard_source() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("mr_badsrc", dir.path()).expect("create");
+        let text = canvas_create_text(None, 0.0, 0.0, "hi".to_string(), "Inter".to_string(), 12.0)
+            .expect("create text");
+        let err = magic_resize(text, &[spec_px(1080.0, 1920.0)])
+            .expect_err("non-artboard source must error");
+        assert!(matches!(err, DocumentBridgeError::WrongNodeType { .. }));
         project_close();
     }
 }

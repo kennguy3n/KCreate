@@ -1621,6 +1621,20 @@ export interface ArtboardPreset {
   category: ArtboardPresetCategory;
 }
 
+/**
+ * One Magic-Resize target. Either a named `preset` (matched
+ * case-insensitively against {@link ArtboardPreset.name}) **or** an
+ * explicit `width` × `height` in pixels. When both are present the
+ * explicit dimensions win. `name` overrides the generated artboard's
+ * label. Mirrors `kcreate_bridge::document::ResizeTargetSpec`.
+ */
+export interface ResizeTarget {
+  name?: string;
+  preset?: string;
+  width?: number;
+  height?: number;
+}
+
 export interface ArtboardBridge {
   create(
     pageId: string | null,
@@ -1632,6 +1646,16 @@ export interface ArtboardBridge {
   duplicate(artboardId: string): Promise<string>;
   resize(artboardId: string, width: number, height: number): Promise<void>;
   presets(): Promise<ArtboardPreset[]>;
+  /**
+   * Magic Resize: reflow the design on `sourceArtboardId` onto each
+   * target size, returning the new artboards' ids in target order.
+   * Non-destructive (the source is untouched) and a single undoable
+   * operation.
+   */
+  magicResize(
+    sourceArtboardId: string,
+    targets: ResizeTarget[],
+  ): Promise<string[]>;
 }
 
 /**

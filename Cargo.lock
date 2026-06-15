@@ -1789,6 +1789,7 @@ dependencies = [
  "getrandom 0.3.4",
  "image 0.25.10",
  "kcreate_core",
+ "kcreate_layout",
  "log",
  "ort",
  "parking_lot",

@@ -1516,7 +1516,15 @@ impl SceneSync {
         self.record(node.id, obj_id);
         emitted.push(node.id);
         let world = node_world_bounds(node);
-        let style = node_style(node);
+        // Glyph outlines are baked at world coordinates in `draw_text`
+        // (`origin` + outline), and the text object carries no object
+        // translation, so `command_from_object` would translate the
+        // style by (0, 0). A gradient fill from `node_fill` is in the
+        // node's local space, so pre-translate it by the world origin —
+        // the same approach `emit_artboard` uses — so the gradient spans
+        // the text's world bounds and stays locked to the glyphs. Solid
+        // fills are untouched (`translated` is a no-op on them).
+        let style = node_style(node).translated(world.x as f32, world.y as f32);
         let obj = Object::new(
             ObjectKind::Text {
                 origin: Point2::new(world.x as f32, world.y as f32),
@@ -2074,6 +2082,84 @@ mod tests {
             "gradient fill must survive document→scene translation, got {:?}",
             scene.objects[0].style.fill
         );
+    }
+
+    #[test]
+    fn text_gradient_fill_is_translated_into_world_space() {
+        // Regression: a gradient-filled text layer must have its gradient
+        // endpoints translated into world space so they line up with the
+        // glyph outlines (which `draw_text` bakes at world coordinates).
+        // Before the fix the gradient stayed in node-local space while the
+        // glyphs sat at the node's world origin, so the shader sampled the
+        // wrong region.
+        let mut doc = DocumentGraph::new();
+        let mut node = Node::new(NodeType::TextLayer, "headline");
+        node.bounds = Bounds {
+            x: 40.0,
+            y: 80.0,
+            width: 200.0,
+            height: 60.0,
+        };
+        node.style.fill = FillStyle::Gradient(GradientKind::Linear {
+            from: Point2D::new(0.0, 0.0),
+            to: Point2D::new(200.0, 0.0),
+            stops: vec![
+                GradientStop {
+                    offset: 0.0,
+                    color: RgbaColor {
+                        r: 1.0,
+                        g: 0.0,
+                        b: 0.0,
+                        a: 1.0,
+                    },
+                },
+                GradientStop {
+                    offset: 1.0,
+                    color: RgbaColor {
+                        r: 0.0,
+                        g: 0.0,
+                        b: 1.0,
+                        a: 1.0,
+                    },
+                },
+            ],
+        });
+        node.metadata.insert(
+            TEXT_LAYER_METADATA_KEY.to_string(),
+            serde_json::to_value(TextLayerMeta {
+                text: "Sunset".to_string(),
+                font_family: "Inter".to_string(),
+                font_size: 48.0,
+            })
+            .expect("serialise text meta"),
+        );
+        doc.insert_node(node).expect("insert");
+
+        let mut sync = SceneSync::new();
+        let scene = sync.sync_document_to_scene(&mut doc, None, &[]);
+        assert_eq!(scene.objects.len(), 1);
+        let obj = &scene.objects[0];
+        assert!(
+            matches!(obj.kind, ObjectKind::Text { .. }),
+            "expected a text object, got {:?}",
+            obj.kind
+        );
+        match &obj.style.fill {
+            Some(Paint::LinearGradient { from, to, .. }) => {
+                // World origin is bounds + transform (tx/ty default 0).
+                assert_eq!(
+                    (from.x, from.y),
+                    (40.0, 80.0),
+                    "gradient start must be offset to the text's world origin",
+                );
+                assert_eq!(
+                    (to.x, to.y),
+                    (240.0, 80.0),
+                    "gradient end must track the world origin too",
+                );
+            }
+            other => panic!("expected a linear gradient text fill, got {other:?}"),
+        }
     }
 
     #[test]

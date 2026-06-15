@@ -161,6 +161,7 @@ test("clampTabToAvailable: keeps the always-on tabs across every mode", async ()
     "presence",
     "constraints",
     "tokens",
+    "theme",
     "publish",
     "encryption",
   );

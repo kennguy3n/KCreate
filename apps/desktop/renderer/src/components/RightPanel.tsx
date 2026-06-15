@@ -75,8 +75,9 @@ type Tab = { id: RightPanelTab; label: string; icon: IconName };
 ///      component body would create a new function identity each
 ///      render, and `react-hooks/exhaustive-deps` would (correctly)
 ///      flag it as a missing dependency. The factory's stable
-///      `[showAccessibility, showInteraction, showPreflight, showColor]`
-///      dep list is the right set; hoisting keeps that list honest.
+///      `[showAccessibility, showInteraction, showPreflight, showColor,
+///      showTheme]` dep list is the right set; hoisting keeps that
+///      list honest.
 function mkTab<Id extends RightPanelTab>(
   t: { id: Id; label: string; icon: IconName },
 ): { id: Id; label: string; icon: IconName } {
@@ -522,7 +523,7 @@ export function RightPanel({
             <Hint>Select a node to bind design tokens to its properties.</Hint>
           )
         ) : null}
-        {tab === "theme" ? (
+        {tab === "theme" && showTheme ? (
           <ThemePanel onStatus={onStatus} onApplied={onThemeApplied} />
         ) : null}
         {tab === "publish" ? (

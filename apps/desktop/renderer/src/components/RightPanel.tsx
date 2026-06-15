@@ -250,6 +250,15 @@ export function RightPanel({
     ],
     [showAccessibility, showInteraction, showPreflight, showColor, showTheme],
   );
+  // `selectedIds` is optional; coalesce to a stable empty array so the
+  // `?? []` fallback doesn't allocate a fresh `[]` on every render.
+  // ThemePanel lists `selectedIds` in the deps of `performApply` (and the
+  // callbacks layered on it), so a new reference each render would churn
+  // those memoized callbacks for no behavioural change.
+  const stableSelectedIds = useMemo<string[]>(
+    () => selectedIds ?? [],
+    [selectedIds],
+  );
   const [tab, setTab] = useState<RightPanelTab>("properties");
   // Clamp the active tab back into the visible strip whenever the
   // editor `mode` transition removes the entry we were on. Without
@@ -527,7 +536,7 @@ export function RightPanel({
           <ThemePanel
             onStatus={onStatus}
             onApplied={onThemeApplied}
-            selectedIds={selectedIds ?? []}
+            selectedIds={stableSelectedIds}
           />
         ) : null}
         {tab === "publish" ? (

@@ -12,7 +12,7 @@
 // `setup.vitest.ts`; `theme.*` / `brandKit.*` namespaces were added to
 // the stub for this panel.
 
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import { render, screen, fireEvent, act } from "@testing-library/react";
 
 import { ThemePanel } from "./ThemePanel";
@@ -552,5 +552,121 @@ describe("ThemePanel", () => {
     expect(call?.args[0]).toBe("kit-6");
     // A successful insert refreshes the canvas through onApplied.
     expect(applied).toBe(1);
+  });
+
+  // --- R2 #B: loaders stay stable across parent re-renders ---------------
+
+  it("enumerates fonts once even when the parent re-renders with a fresh onStatus", async () => {
+    const stub = kcreateStub();
+
+    // The host re-creates inline `onStatus` handlers on most renders.
+    const { rerender } = render(<ThemePanel onStatus={() => undefined} />);
+    await flushAsync();
+
+    const countFontLoads = (): number =>
+      stub.calls.filter((c) => c.method === "text.listFonts").length;
+    expect(countFontLoads(), "fonts enumerate exactly once on mount").toBe(1);
+
+    // A naive `[onStatus]` dep on the font loader would re-create it on
+    // each of these renders, re-fire the mount effect, and re-enumerate
+    // fonts every time. Capturing `onStatus` by ref keeps every loader
+    // stable so the mount effect runs exactly once.
+    rerender(<ThemePanel onStatus={() => undefined} />);
+    await flushAsync();
+    rerender(<ThemePanel onStatus={() => undefined} />);
+    await flushAsync();
+
+    expect(
+      countFontLoads(),
+      "no re-enumeration when only onStatus identity changes",
+    ).toBe(1);
+  });
+
+  // --- R2 #A: a slow file read survives the cancel-on-refocus fallback ---
+
+  it("keeps a slow image read from being clobbered by the refocus-cancel timeout", async () => {
+    vi.useFakeTimers();
+    try {
+      const stub = kcreateStub();
+      stub.override("theme.deriveFromImage", () =>
+        makeTheme("derived-slow", "Slow image"),
+      );
+
+      render(<ThemePanel />);
+      // The mount effect resolves through microtasks (the stub returns
+      // `Promise.resolve`), so drain those without advancing fake timers.
+      await act(async () => {
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+
+      // Install the picker mock AFTER render (like `mockFilePick`) so the
+      // panel's own inputs don't consume the one-shot. The transient file
+      // input's `arrayBuffer()` stays pending until we resolve it by hand,
+      // and a `focus` fires immediately after `change` — the real
+      // dialog-close ordering (refocus before the read settles) that
+      // triggered the race.
+      let resolveBuf: (b: ArrayBuffer) => void = () => undefined;
+      const bytes = new Uint8Array([5, 6, 7, 8]);
+      const realCreate = document.createElement.bind(document);
+      document.createElement = ((tag: string): HTMLElement => {
+        const el = realCreate(tag);
+        if (tag === "input") {
+          const input = el as HTMLInputElement;
+          input.click = (): void => {
+            const file = new File([bytes], "slow.png", { type: "image/png" });
+            Object.defineProperty(file, "arrayBuffer", {
+              value: (): Promise<ArrayBuffer> =>
+                new Promise<ArrayBuffer>((res) => {
+                  resolveBuf = res;
+                }),
+              configurable: true,
+            });
+            Object.defineProperty(input, "files", {
+              value: [file],
+              configurable: true,
+            });
+            input.dispatchEvent(new Event("change"));
+            // Dialog close refocuses the window before the read settles.
+            window.dispatchEvent(new Event("focus"));
+          };
+          // One-shot: restore so nothing else is intercepted.
+          document.createElement = realCreate;
+        }
+        return el;
+      }) as typeof document.createElement;
+
+      fireEvent.click(screen.getByLabelText("Derive theme from image"));
+
+      // Let the 400ms cancel timeout elapse while the read is still
+      // pending. With the fix this is a no-op (a selection has begun);
+      // without it the picker would resolve `null` here and bail.
+      await act(() => {
+        vi.advanceTimersByTime(500);
+      });
+
+      // The slow read finally lands — the picker must still deliver the
+      // bytes and drive the derive call with them.
+      await act(async () => {
+        resolveBuf(
+          bytes.buffer.slice(
+            bytes.byteOffset,
+            bytes.byteOffset + bytes.byteLength,
+          ),
+        );
+        await Promise.resolve();
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+
+      const call = stub.calls.find((c) => c.method === "theme.deriveFromImage");
+      expect(
+        call,
+        "the slow read still drives theme.deriveFromImage",
+      ).toBeDefined();
+      expect((call?.args[1] as Uint8Array).length).toBe(4);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

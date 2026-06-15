@@ -23,7 +23,7 @@
 // `errMsg`, useCallback/useEffect load+commit, small field
 // sub-components) mirror `ColorSettingsPanel.tsx`.
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import type {
   ApplyThemeReport,
@@ -118,6 +118,13 @@ function pickFileBytes(
     input.type = "file";
     input.accept = accept;
     let settled = false;
+    // Flipped synchronously the instant a file is chosen — i.e. before
+    // the async `arrayBuffer()` read settles. The cancel fallback below
+    // consults this so a real selection whose read outlives the 400ms
+    // timeout is never clobbered with `null` (the `focus` event can
+    // fire before `change`, and a large file's read can take longer
+    // than the timeout).
+    let selectionStarted = false;
     const finish = (
       value: { name: string; bytes: Uint8Array } | null,
     ): void => {
@@ -126,6 +133,7 @@ function pickFileBytes(
       resolve(value);
     };
     input.onchange = (): void => {
+      selectionStarted = true;
       const file = input.files?.[0];
       if (!file) {
         finish(null);
@@ -141,7 +149,13 @@ function pickFileBytes(
     window.addEventListener(
       "focus",
       () => {
-        window.setTimeout(() => finish(null), 400);
+        window.setTimeout(() => {
+          // Treat the refocus as a cancel ONLY when no selection has
+          // begun; once `change` has fired, the read settles `finish`
+          // on its own (success or `.catch`), so bailing here would
+          // race a slow read to a spurious `null`.
+          if (!selectionStarted) finish(null);
+        }, 400);
       },
       { once: true },
     );
@@ -190,6 +204,15 @@ export function ThemePanel({
     [allThemes, selectedId],
   );
 
+  // Latest `onStatus` reachable from stable callbacks without listing it
+  // as a dependency. The host re-creates `onStatus` on most renders, so
+  // capturing it by ref keeps loaders (which run in the mount effect)
+  // from re-firing on every parent render.
+  const onStatusRef = useRef(onStatus);
+  useEffect(() => {
+    onStatusRef.current = onStatus;
+  }, [onStatus]);
+
   const loadThemes = useCallback(async () => {
     const list = (await window.kcreate.theme.listBuiltins()) ?? [];
     setBuiltins(list);
@@ -216,9 +239,14 @@ export function ThemePanel({
       const list = await window.kcreate.text.listFonts();
       setSystemFonts(list);
     } catch (e) {
-      onStatus?.(`Theme: font enumeration failed — ${errMsg(e)}`);
+      // Read `onStatus` through the ref so this loader keeps a STABLE
+      // identity ([] deps). The parent may hand us a fresh `onStatus`
+      // every render; listing it as a dep would re-create `loadFonts`,
+      // re-fire the mount effect, and re-run every loader (incl. a fresh
+      // font enumeration) on each render.
+      onStatusRef.current?.(`Theme: font enumeration failed — ${errMsg(e)}`);
     }
-  }, [onStatus]);
+  }, []);
 
   useEffect(() => {
     void (async () => {

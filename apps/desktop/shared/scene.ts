@@ -2174,6 +2174,12 @@ export interface AssetSummary {
   name: string;
   /** Category slug (matches {@link AssetCategoryInfo.slug}). */
   category: string;
+  /**
+   * Finer sub-category within {@link category} (e.g. `"Navigation"`,
+   * `"Weather"`, `"Charts"`). Lets the panel section a large catalogue
+   * with per-group counts. Non-empty for every asset.
+   */
+  group: string;
   tags: string[];
   svg: string;
 }

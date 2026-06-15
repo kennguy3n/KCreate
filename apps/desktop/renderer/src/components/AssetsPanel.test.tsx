@@ -1,17 +1,22 @@
-// AssetsPanel tests (G6 — Elements / asset library).
+// AssetsPanel tests (G6 + H3 — Elements / asset library).
 //
 // AssetsPanel is self-contained over `window.kcreate.assets.*` for
 // reading the catalog and delegates the insert to an `onInsert`
 // callback. These tests drive the installed `kcreateStub` with a
 // small fixture catalog and assert:
-//   * categories + assets render on mount (list path);
+//   * categories + assets render on mount (list path), grouped into
+//     headed sections with per-section counts;
 //   * typing in the search box routes to `assets.search` and narrows
-//     the grid;
+//     the grid to a single ranked "Results" section;
 //   * selecting a category chip routes to `assets.list` with the
-//     category slug;
+//     category slug and sections by finer sub-group;
 //   * clicking a thumbnail fires `onInsert(assetId)`;
 //   * dragging a thumbnail writes the asset id onto the dataTransfer
-//     under `ASSET_DRAG_MIME` (the canvas drop contract).
+//     under `ASSET_DRAG_MIME` (the canvas drop contract);
+//   * inserting records a "Recently used" row persisted to
+//     `localStorage`;
+//   * the grid is windowed — a large catalog only mounts the rows in
+//     view, not all of them.
 //
 // Data loading is async + debounced (100ms), so we use the async
 // `findBy*` queries which poll until the effect settles.
@@ -29,14 +34,29 @@ const CATS: AssetCategoryInfo[] = [
 ];
 
 const SHAPES: AssetSummary[] = [
-  { id: "circle", name: "Circle", category: "shapes", tags: ["round"], svg: "<svg/>" },
-  { id: "square", name: "Square", category: "shapes", tags: [], svg: "<svg/>" },
+  {
+    id: "circle",
+    name: "Circle",
+    category: "shapes",
+    group: "Geometric",
+    tags: ["round"],
+    svg: "<svg/>",
+  },
+  {
+    id: "square",
+    name: "Square",
+    category: "shapes",
+    group: "Geometric",
+    tags: [],
+    svg: "<svg/>",
+  },
 ];
 const ICONS: AssetSummary[] = [
   {
     id: "chart-bar",
     name: "Bar chart",
     category: "icons",
+    group: "Charts",
     tags: ["chart", "graph"],
     svg: "<svg/>",
   },
@@ -47,8 +67,23 @@ function noop(): void {
   /* intentionally empty */
 }
 
+// Build a large single-category catalog to exercise the windowing.
+function manyIcons(n: number): AssetSummary[] {
+  return Array.from({ length: n }, (_, i) => ({
+    id: `icon-${i}`,
+    name: `Icon ${i}`,
+    category: "icons",
+    group: "Bulk",
+    tags: [],
+    svg: "<svg/>",
+  }));
+}
+
 describe("AssetsPanel", () => {
   beforeEach(() => {
+    // Recently-used persists to localStorage, which is shared across
+    // tests in a jsdom file — clear it so each test starts clean.
+    window.localStorage.clear();
     const stub = kcreateStub();
     stub.override("assets.categories", () => CATS);
     stub.override("assets.list", (category?: unknown) =>
@@ -80,6 +115,14 @@ describe("AssetsPanel", () => {
     expect(
       screen.getByRole("button", { name: "Insert Bar chart" }),
     ).toBeInTheDocument();
+  });
+
+  it("sections the 'All' grid by category", async () => {
+    render(<AssetsPanel onInsert={noop} />);
+    // Section headers carry the category label; counts come from the
+    // assets actually filed under each (2 shapes, 1 icon).
+    expect(await screen.findByText("Shapes")).toBeInTheDocument();
+    expect(screen.getByText("Icons")).toBeInTheDocument();
   });
 
   it("routes a search query through assets.search and narrows the grid", async () => {
@@ -119,6 +162,8 @@ describe("AssetsPanel", () => {
     await waitFor(() => {
       expect(screen.queryByRole("button", { name: "Insert Circle" })).toBeNull();
     });
+    // Single category → sections by finer sub-group.
+    expect(screen.getByText("Charts")).toBeInTheDocument();
     const listCall = stub.calls.find(
       (c) => c.method === "assets.list" && c.args[0] === "icons",
     );
@@ -146,5 +191,48 @@ describe("AssetsPanel", () => {
     fireEvent.dragStart(circle, { dataTransfer });
     expect(data[ASSET_DRAG_MIME]).toBe("circle");
     expect(dataTransfer.effectAllowed).toBe("copy");
+  });
+
+  it("records inserted assets in a Recently used row persisted to localStorage", async () => {
+    const { unmount } = render(<AssetsPanel onInsert={noop} />);
+    const square = await screen.findByRole("button", { name: "Insert Square" });
+    fireEvent.click(square);
+
+    // The recently-used section header appears…
+    const recent = await screen.findByText("Recently used");
+    expect(recent).toBeInTheDocument();
+    // …and the click persisted the id, most-recent-first.
+    expect(JSON.parse(window.localStorage.getItem("kcreate.elements.recent.v1") ?? "[]")).toEqual([
+      "square",
+    ]);
+
+    // It survives a remount (the panel re-reads localStorage on mount).
+    unmount();
+    render(<AssetsPanel onInsert={noop} />);
+    expect(await screen.findByText("Recently used")).toBeInTheDocument();
+    // "Square" now appears twice: once in Recently used, once in Shapes.
+    await waitFor(() => {
+      expect(screen.getAllByRole("button", { name: "Insert Square" }).length).toBe(2);
+    });
+  });
+
+  it("windows a large catalog instead of mounting every thumbnail", async () => {
+    const BULK = manyIcons(600);
+    const stub = kcreateStub();
+    stub.override("assets.categories", () => [
+      { slug: "icons", label: "Icons", count: BULK.length },
+    ]);
+    stub.override("assets.list", () => BULK);
+
+    render(<AssetsPanel onInsert={noop} />);
+    // Some early thumbnails mount…
+    expect(await screen.findByRole("button", { name: "Insert Icon 0" })).toBeInTheDocument();
+    // …but the windowing means the far end of a 600-asset catalog is
+    // NOT in the DOM (it would be without virtualization).
+    expect(screen.queryByRole("button", { name: "Insert Icon 599" })).toBeNull();
+    // The number of mounted thumbnails is bounded well below the total.
+    const mounted = screen.getAllByRole("button", { name: /^Insert Icon/ });
+    expect(mounted.length).toBeGreaterThan(0);
+    expect(mounted.length).toBeLessThan(BULK.length);
   });
 });

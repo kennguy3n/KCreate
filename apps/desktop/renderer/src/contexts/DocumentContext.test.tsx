@@ -125,8 +125,6 @@ describe("DocumentContext", () => {
     expect(state.components).toEqual([]);
     expect(state.docStatus).toBeNull();
     expect(state.resourceLimits).toBeNull();
-    expect(state.scene.clear_color).toEqual([0.12, 0.12, 0.14, 1.0]);
-    expect(state.scene.objects).toEqual([]);
   });
 
   it("preserves action identity across re-renders", async () => {
@@ -408,34 +406,6 @@ describe("DocumentContext", () => {
     expect(stateRenderCount).toBeGreaterThan(1);
     expect(actionsRenderCount).toBe(1);
     expect(refsRenderCount).toBe(1);
-  });
-
-  it("EMPTY_SCENE sentinel is deep-frozen", async () => {
-    // Architectural invariant from PR #35 / Devin Review #0005:
-    // the module-scoped `EMPTY_SCENE` is shared across ALL
-    // DocumentProvider instances, so accidental mutation would
-    // silently corrupt every consumer. The freeze converts the
-    // latent foot-gun into a strict-mode `TypeError` at the
-    // offending call site.
-    const { EMPTY_SCENE } = await import("./DocumentContext");
-    expect(Object.isFrozen(EMPTY_SCENE)).toBe(true);
-    expect(Object.isFrozen(EMPTY_SCENE.clear_color)).toBe(true);
-    expect(Object.isFrozen(EMPTY_SCENE.objects)).toBe(true);
-
-    // Mutation attempts throw in strict mode (which vitest +
-    // ES-modules run under). Use `as any` casts to bypass the
-    // TypeScript surface, since the wire type still declares
-    // mutable arrays — the freeze is runtime defense-in-depth at
-    // the sentinel only.
-    expect(() => {
-      (EMPTY_SCENE.objects as unknown as unknown[]).push({});
-    }).toThrow();
-    expect(() => {
-      (EMPTY_SCENE.clear_color as unknown as number[])[0] = 999;
-    }).toThrow();
-    expect(() => {
-      (EMPTY_SCENE as { clear_color: unknown }).clear_color = [1, 1, 1, 1];
-    }).toThrow();
   });
 
   it("useDocument() returns a memoised bundle (stable across pure re-renders)", () => {

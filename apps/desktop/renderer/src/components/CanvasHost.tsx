@@ -311,9 +311,12 @@ export function CanvasHost(props: CanvasHostProps): JSX.Element {
                   ctx.putImageData(imageDataRef.current!, 0, 0);
                 }
                 // The renderer may have published a newer frame between
-                // the `frameInfo()` poll and this `acquireFrame()`. Record
-                // the id we actually consumed so the next tick doesn't
-                // re-download a frame we've already presented.
+                // when we resolved `latestFrameId` above (via
+                // `setViewportAndRender` on a viewport change, or
+                // `frameInfo()` on a static tick) and this
+                // `acquireFrame()`. Record the id we actually consumed so
+                // the next tick doesn't re-download a frame we've already
+                // presented.
                 presentedId = frame.frameId;
               }
             }

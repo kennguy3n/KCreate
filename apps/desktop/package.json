@@ -11,6 +11,7 @@
     "test": "node --test renderer/tests/templates.test.mjs renderer/tests/rightPanelTabs.test.mjs && vitest run --config renderer/vitest.config.ts",
     "test:vitest": "vitest run --config renderer/vitest.config.ts",
     "test:vitest:watch": "vitest --config renderer/vitest.config.ts",
+    "test:e2e": "node --test tests/e2e/boot.test.mjs",
     "start": "electron .",
     "dev:renderer": "vite --config renderer/vite.config.ts"
   },
@@ -33,6 +34,7 @@
     "eslint-plugin-react": "7.37.2",
     "eslint-plugin-react-hooks": "5.0.0",
     "jsdom": "25.0.1",
+    "playwright-core": "1.60.0",
     "typescript": "5.6.3",
     "vite": "5.4.10",
     "vitest": "2.1.8"

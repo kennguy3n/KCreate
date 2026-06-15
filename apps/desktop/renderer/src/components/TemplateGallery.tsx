@@ -251,6 +251,15 @@ export function TemplateGallery({
       mountedRef.current = false;
     };
   }, []);
+  // A template id we want selected once a *pending* catalog reload lands
+  // (set by `runImport` for the just-imported entry). The async reload
+  // resolves after `runImport` returns, so the selection-guard effect
+  // would otherwise run against the stale `templates` list, fail to find
+  // the imported id, and snap the selection to the first card — leaving
+  // the freshly-imported template in the grid but unselected. The list-
+  // load effect honours this the moment the imported id appears in the
+  // reloaded set; the guard leaves the selection untouched until then.
+  const pendingSelectRef = useRef<string | null>(null);
 
   // Debounce the search box. 180ms is long enough to coalesce a burst
   // of keystrokes but short enough to feel instant.
@@ -275,6 +284,18 @@ export function TemplateGallery({
       .then((report) => {
         if (cancelled) return;
         setState({ kind: "ready", templates: report.templates });
+        // Resolve a pending post-import selection now that we hold the
+        // freshly-loaded list: select the imported template if it is
+        // present, otherwise drop the request and let the selection guard
+        // fall back to a default. Cleared unconditionally so a stale
+        // request can never linger past the reload it was queued for.
+        const pending = pendingSelectRef.current;
+        if (pending !== null) {
+          pendingSelectRef.current = null;
+          if (report.templates.some((t) => t.id === pending)) {
+            setSelectedId(pending);
+          }
+        }
         // When neither a category nor a search term is active, this
         // query already returned the WHOLE library — reuse it for the
         // chip counts instead of firing a second identical unfiltered
@@ -398,6 +419,17 @@ export function TemplateGallery({
       if (selectedId !== null) setSelectedId(null);
       return;
     }
+    // A post-import selection is still pending until the reload that
+    // contains the imported template lands (resolved in the list-load
+    // effect above). While it is outstanding, leave the selection alone:
+    // snapping to the first card here would race the async reload and
+    // leave the imported template unselected once it arrives.
+    if (
+      pendingSelectRef.current !== null &&
+      !templates.some((t) => t.id === pendingSelectRef.current)
+    ) {
+      return;
+    }
     const stillVisible = templates.some((t) => t.id === selectedId);
     if (!stillVisible) setSelectedId(first.id);
   }, [templates, selectedId]);
@@ -475,7 +507,13 @@ export function TemplateGallery({
       setCategory(null);
       setRawQuery("");
       setQuery("");
-      setSelectedId(imported.id);
+      // Defer selection to the reload: the catalog `list()` triggered by
+      // `reloadToken` below resolves asynchronously, so we record the
+      // desired selection and let the list-load effect apply it once the
+      // imported template is actually in `templates`. Calling
+      // `setSelectedId(imported.id)` here would be clobbered by the
+      // selection guard running against the pre-reload list.
+      pendingSelectRef.current = imported.id;
       setReloadToken((n) => n + 1);
     } catch (e) {
       setImportError(errorMessage(e));
@@ -511,9 +549,12 @@ export function TemplateGallery({
           type="button"
           onClick={onBack}
           // Lock navigation while a "Start from template" round-trip is
-          // in flight: leaving mid-instantiate would orphan the scratch
-          // project the host is populating (Devin Review PR #61).
-          disabled={starting !== null}
+          // in flight (leaving mid-instantiate would orphan the scratch
+          // project the host is populating — Devin Review PR #61) or
+          // while a "Remix from file" import is in flight (unmounting
+          // mid-import discards the post-import selection + filter reset;
+          // the import itself still completes in the background).
+          disabled={starting !== null || importing}
           data-testid="kcreate-template-back"
           aria-label="Back to home"
           style={{
@@ -525,8 +566,8 @@ export function TemplateGallery({
             borderRadius: radius.md,
             padding: `${spacing.xs}px ${spacing.sm}px`,
             color: colors.text,
-            cursor: starting ? "default" : "pointer",
-            opacity: starting ? 0.7 : 1,
+            cursor: starting || importing ? "default" : "pointer",
+            opacity: starting || importing ? 0.7 : 1,
             fontSize: 13,
           }}
         >

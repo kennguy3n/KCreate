@@ -343,6 +343,75 @@ describe("TemplateGallery", () => {
         screen.getByTestId("kcreate-template-card-imported-remix"),
       ).toBeInTheDocument(),
     );
+
+    // …and it is the SELECTED card. The catalog `list()` reload runs
+    // asynchronously after `runImport` returns, so a naive
+    // `setSelectedId(imported.id)` in the import handler is clobbered by
+    // the selection guard snapping back to the first card against the
+    // stale pre-reload list. The gallery instead defers the selection to
+    // the reload, so the imported template ends up selected once it
+    // actually lands in the grid. Regression guard for Devin Review
+    // job 118ea49a finding 0001.
+    await waitFor(() =>
+      expect(
+        screen.getByTestId("kcreate-template-card-imported-remix"),
+      ).toHaveAttribute("aria-pressed", "true"),
+    );
+    expect(
+      screen.getByTestId("kcreate-template-card-mobile-login"),
+    ).toHaveAttribute("aria-pressed", "false");
+  });
+
+  it("locks Back and the import button while an import is in flight", async () => {
+    stubCatalog();
+    const stub = kcreateStub();
+    stub.override(
+      "templateMarketplace.pickImport",
+      () => "/tmp/design.kstudio",
+    );
+    // Hold the import open so the in-flight UI state is observable, then
+    // release it and confirm the controls re-enable. The stub wraps the
+    // resolver's return value in `Promise.resolve`, so returning a
+    // pending promise here keeps `runImport`'s `await` suspended until
+    // `releaseImport` fires.
+    let releaseImport: (m: TemplateManifest) => void = () => undefined;
+    stub.override(
+      "templateMarketplace.import",
+      () =>
+        new Promise<TemplateManifest>((resolve) => {
+          releaseImport = resolve;
+        }),
+    );
+
+    renderGallery();
+    await waitFor(() =>
+      expect(
+        screen.getByTestId("kcreate-template-card-mobile-login"),
+      ).toBeInTheDocument(),
+    );
+
+    // Back is interactive before any import begins.
+    expect(screen.getByTestId("kcreate-template-back")).not.toBeDisabled();
+
+    fireEvent.click(screen.getByTestId("kcreate-template-import"));
+    fireEvent.click(screen.getByTestId("kcreate-template-import-package"));
+
+    // While the import promise is pending, Back is locked so navigating
+    // away can't tear down the gallery mid-import. The import button is
+    // disabled for the same reason.
+    await waitFor(() =>
+      expect(screen.getByTestId("kcreate-template-back")).toBeDisabled(),
+    );
+    expect(screen.getByTestId("kcreate-template-import")).toBeDisabled();
+
+    // Releasing the import resolves `runImport`, which re-enables the
+    // navigation controls once the catalog reload settles.
+    releaseImport(
+      manifest("imported-remix", "Imported Remix", "custom", ["remix"]),
+    );
+    await waitFor(() =>
+      expect(screen.getByTestId("kcreate-template-back")).not.toBeDisabled(),
+    );
   });
 
   it("does not call import when the file picker is cancelled", async () => {

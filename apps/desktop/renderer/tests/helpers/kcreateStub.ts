@@ -389,6 +389,24 @@ const defaultsByMethod: Record<string, () => unknown> = {
     source: null,
   }),
   "templateMarketplace.remove": () => undefined,
+  // H2 "Remix from file". `pickImport` resolves to the chosen source
+  // path (or `null` when the OS dialog is cancelled); `import` resolves
+  // to the freshly-registered `TemplateManifest` (snake_case JSON wire
+  // shape, mirroring `installLocal`). Tests that drive the import flow
+  // override both to assert the gallery calls the real bridge path.
+  "templateMarketplace.pickImport": () => null,
+  "templateMarketplace.import": () => ({
+    id: "00000000-0000-0000-0000-000000000000",
+    name: "",
+    description: "",
+    category: "custom",
+    tags: [],
+    thumbnail: null,
+    page_count: 0,
+    author: null,
+    version: "0.0.0",
+    source: null,
+  }),
   setLayerColor: () => undefined,
 };
 

@@ -10,6 +10,7 @@ import {
   shell,
   WebContentsView,
   type IpcMainInvokeEvent,
+  type OpenDialogOptions,
 } from "electron";
 import * as fs from "node:fs/promises";
 import { realpathSync } from "node:fs";
@@ -1853,6 +1854,54 @@ function registerIpcHandlers(): void {
     "kcreate/template/thumbnail",
     (_e, templateId: string) =>
       requireBridge().templateThumbnail(templateId),
+  );
+  // H2 — "Remix from file": pick an external design (a `.kstudio`
+  // project package, a `.ktemplate` folder, or a bare
+  // template-content `*.json`) to fold into the library. The package
+  // formats are *directories* on every OS while a bare template is a
+  // *file*, and Electron's open dialog can't combine file + directory
+  // selection on Windows/Linux (it degrades to directory-only there).
+  // So the renderer tells us which one to pick; each `kind` maps to a
+  // single, deterministic `properties` set that behaves identically on
+  // macOS, Windows, and Linux, keeping every format reachable
+  // everywhere. We keep the dialog in the main process so the renderer
+  // never touches the filesystem — it gets back a single chosen path.
+  ipcMain.handle(
+    "kcreate/template/pickImport",
+    async (_e, kind: "file" | "directory") => {
+      const win = mainWindow;
+      if (!win) return null;
+      const options: OpenDialogOptions =
+        kind === "directory"
+          ? {
+              title: "Remix a project or template package into the library",
+              properties: ["openDirectory"],
+            }
+          : {
+              title: "Remix a design file into the library",
+              properties: ["openFile"],
+              filters: [
+                {
+                  name: "KCreate template content (*.json)",
+                  extensions: ["json"],
+                },
+                { name: "All files", extensions: ["*"] },
+              ],
+            };
+      const result = await dialog.showOpenDialog(win, options);
+      if (result.canceled || result.filePaths.length === 0) return null;
+      return result.filePaths[0];
+    },
+  );
+  // H2 — import the chosen design as a NEW library template. The
+  // renderer hands us a JSON-encoded request ({ sourcePath, optional
+  // name/description/category/tags }); the bridge detects the source
+  // format, inverts it into template content, persists a new
+  // `.ktemplate/` into the install dir, and returns the new manifest.
+  ipcMain.handle(
+    "kcreate/template/import",
+    (_e, requestJson: string) =>
+      requireBridge().templateImport(requestJson),
   );
   // Phase 6 — Audit log (Tasks 13–14)
   ipcMain.handle(

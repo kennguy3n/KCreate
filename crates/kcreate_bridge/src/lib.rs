@@ -128,7 +128,11 @@ fn map_doc_err(e: DocumentBridgeError) -> NapiError {
             kcreate_core::MarketplaceError::DirectoryNotFound(_)
             | kcreate_core::MarketplaceError::ManifestParse { .. }
             | kcreate_core::MarketplaceError::TemplateNotFound(_)
-            | kcreate_core::MarketplaceError::AlreadyInstalled(_) => Status::InvalidArg,
+            | kcreate_core::MarketplaceError::AlreadyInstalled(_)
+            // An imported design whose content.json does not parse into
+            // template content is a bad input file the user chose —
+            // surface inline next to the import control.
+            | kcreate_core::MarketplaceError::InvalidContent(_) => Status::InvalidArg,
             // Serialize failures only arise when writing a bundled
             // template's manifest/content during seeding — an internal
             // bug, not user-correctable; same category as IO failures.
@@ -2941,6 +2945,57 @@ pub fn template_list(category: Option<String>, query: Option<String>) -> NapiRes
 pub fn template_install_local(source_path: String) -> NapiResult<String> {
     let manifest = phase2::template_install_local(&source_path).map_err(map_doc_err)?;
     serde_json::to_string(&manifest).map_err(|e| NapiError::from_reason(e.to_string()))
+}
+
+/// `napi::Task` backing `template_import`. Runs the heavy "Remix from
+/// file" import off the Electron main thread: opening a `.kstudio`
+/// SQLite project package (or reading a `.ktemplate/` folder / template
+/// `*.json`), inverting the source document into template content,
+/// validating it, and persisting a new `.ktemplate/` into the install
+/// dir. The import only touches the marketplace install dir and a
+/// source package it opens read-only — it never touches the renderer
+/// singleton or the live project workspace — and the marketplace's own
+/// mutex serialises concurrent imports, so it is safe on a libuv
+/// worker, exactly like [`TemplateThumbnailTask`]. A large `.kstudio`
+/// parse + serialize + disk write can take long enough to jank the UI
+/// thread if run synchronously (Devin Review PR #67).
+#[derive(Debug)]
+pub struct TemplateImportTask {
+    req: phase2::TemplateImportRequest,
+}
+
+impl Task for TemplateImportTask {
+    type Output = kcreate_core::TemplateManifest;
+    type JsValue = String;
+
+    fn compute(&mut self) -> NapiResult<Self::Output> {
+        phase2::template_import(&self.req).map_err(map_doc_err)
+    }
+
+    fn resolve(&mut self, _env: Env, output: Self::Output) -> NapiResult<Self::JsValue> {
+        serde_json::to_string(&output).map_err(|e| NapiError::from_reason(e.to_string()))
+    }
+}
+
+/// Import an external design file as a new library template (the
+/// "Remix from file" flow). `request_json` is a JSON-encoded
+/// [`phase2::TemplateImportRequest`] (camelCase: `sourcePath`, optional
+/// `name`/`description`/`category`/`tags`). The bridge detects the
+/// source format (`.kstudio/` project, `.ktemplate/` folder, or a
+/// template-content `*.json`), inverts it into template content, and
+/// persists a new `.ktemplate/` into the install dir. Returns the new
+/// `TemplateManifest` as JSON so the renderer can refresh the gallery.
+/// Resolves on a worker thread so a large `.kstudio` import never
+/// blocks the Electron main process.
+#[napi(ts_return_type = "Promise<string>")]
+pub fn template_import(request_json: String) -> NapiResult<AsyncTask<TemplateImportTask>> {
+    let req: phase2::TemplateImportRequest = serde_json::from_str(&request_json).map_err(|e| {
+        NapiError::new(
+            Status::InvalidArg,
+            format!("template_import: invalid request JSON: {e}"),
+        )
+    })?;
+    Ok(AsyncTask::new(TemplateImportTask { req }))
 }
 
 /// Remove an installed local template by id. Deletes the

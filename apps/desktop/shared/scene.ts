@@ -2276,6 +2276,44 @@ export interface TemplateListReport {
 }
 
 /**
+ * H2 "Remix from file" request — mirror of the serde
+ * `kcreate_bridge::phase2::TemplateImportRequest` (camelCase via
+ * `#[serde(rename_all = "camelCase")]`). The request is marshalled as a
+ * JSON string across the N-API boundary (`template_import`), so it is
+ * NOT covered by `bridge.wire.test.ts` (which only guards
+ * `#[napi(object)]` structs); this shape must stay in lockstep with the
+ * Rust struct by hand.
+ *
+ * `sourcePath` is the user-chosen `.kstudio` / `.ktemplate` / `*.json`
+ * path returned by the `pickImport` dialog. The optional fields let the
+ * caller override the metadata the bridge would otherwise derive from
+ * the source (e.g. rename the imported template). Each is omitted (not
+ * sent) when absent so the bridge falls back to its derived default.
+ */
+export interface TemplateImportRequest {
+  sourcePath: string;
+  name?: string;
+  description?: string;
+  category?: TemplateCategory;
+  tags?: string[];
+}
+
+/**
+ * What kind of filesystem entry the "Remix from file" picker selects.
+ *
+ * KCreate's importable designs come in two physical shapes: package
+ * *directories* (`.kstudio` projects and `.ktemplate` folders) and bare
+ * template-content *files* (`*.json`). Electron's open dialog cannot
+ * offer file AND directory selection in the same dialog on Windows or
+ * Linux (it silently degrades to a directory-only picker there), so the
+ * picker is parameterised by which one to open. Each value maps to a
+ * single, deterministic `properties` set that behaves identically on
+ * macOS, Windows, and Linux — keeping every supported format reachable
+ * on every platform.
+ */
+export type ImportPickKind = "file" | "directory";
+
+/**
  * Mirror of `kcreate_bridge::lib::TemplateInstantiateResult` (a
  * `#[napi(object)]` so the fields arrive camelCased). Returned by
  * `templateMarketplace.instantiate` — the artboard the template was
@@ -2328,6 +2366,26 @@ export interface TemplateMarketplaceBridge {
    * renderer pins as an `<img>` `src` (`data:${mime};base64,...`).
    */
   thumbnail(templateId: string): Promise<ThumbnailBytes>;
+  /**
+   * H2 "Remix from file": open a native picker for an external design.
+   * `kind` selects whether the dialog picks a package *directory*
+   * (`.kstudio` project / `.ktemplate` folder) or a bare
+   * template-content *file* (`*.json`) — see {@link ImportPickKind} for
+   * why this is split rather than a single combined dialog. Returns the
+   * chosen absolute path, or `null` if the user cancelled. The dialog
+   * runs in the main process so the renderer never touches the
+   * filesystem.
+   */
+  pickImport(kind: ImportPickKind): Promise<string | null>;
+  /**
+   * H2 "Remix from file": import the design at `request.sourcePath` as
+   * a NEW library template, persisted into the marketplace install dir
+   * (respecting `KCREATE_TEMPLATE_DIR`). The bridge detects the source
+   * format, inverts it into template content, and returns the new
+   * manifest. Rejects with `Status::InvalidArg` when the source path is
+   * missing or its content is not valid template JSON.
+   */
+  import(request: TemplateImportRequest): Promise<TemplateManifest>;
 }
 
 // ---------------------------------------------------------------------------

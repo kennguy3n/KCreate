@@ -75,8 +75,9 @@ type Tab = { id: RightPanelTab; label: string; icon: IconName };
 ///      component body would create a new function identity each
 ///      render, and `react-hooks/exhaustive-deps` would (correctly)
 ///      flag it as a missing dependency. The factory's stable
-///      `[showAccessibility, showInteraction, showPreflight, showColor]`
-///      dep list is the right set; hoisting keeps that list honest.
+///      `[showAccessibility, showInteraction, showPreflight, showColor,
+///      showTheme]` dep list is the right set; hoisting keeps that
+///      list honest.
 function mkTab<Id extends RightPanelTab>(
   t: { id: Id; label: string; icon: IconName },
 ): { id: Id; label: string; icon: IconName } {
@@ -188,6 +189,15 @@ export function RightPanel({
   // wide-gamut RGB working spaces (Display P3, Adobe RGB).
   const showColor =
     mode === "layout" || mode === "export" || mode === "design";
+  // Theme / Brand Kit is a document-wide restyle. Like Color (its
+  // sibling in the colour-management mental model) it only makes
+  // sense in the composition modes — design, layout, export — not
+  // while editing vector paths, raster images, wiring prototype
+  // interactions, or viewing the read-only inspect handoff. Gating
+  // it here (rather than rendering it unconditionally) keeps it out
+  // of those modes and trims the already-crowded tab strip.
+  const showTheme =
+    mode === "design" || mode === "layout" || mode === "export";
   // Memoize so the tab strip array identity is stable as long as the
   // mode-derived booleans don't change. Otherwise the spread allocates
   // a fresh array (and new option object literals) on every render,
@@ -229,14 +239,16 @@ export function RightPanel({
       // otherwise (mirrors how the Properties tab degrades).
       mkTab({ id: "constraints", label: "Constraints", icon: "move" }),
       mkTab({ id: "tokens", label: "Tokens", icon: "variable" }),
-      // G4 — Theme / Brand Kit instant restyle. Project-scoped (no
-      // node selection needed): applies a theme to the whole
-      // document in one undoable op.
-      mkTab({ id: "theme", label: "Theme", icon: "grid-2x2" }),
+      // G4 — Theme / Brand Kit instant restyle. Applies a theme to
+      // the whole document in one undoable op (no node selection
+      // needed), gated to the composition modes — see `showTheme`.
+      ...(showTheme
+        ? [mkTab({ id: "theme", label: "Theme", icon: "grid-2x2" })]
+        : []),
       mkTab({ id: "publish", label: "Publish", icon: "globe" }),
       mkTab({ id: "encryption", label: "Encryption", icon: "lock" }),
     ],
-    [showAccessibility, showInteraction, showPreflight, showColor],
+    [showAccessibility, showInteraction, showPreflight, showColor, showTheme],
   );
   const [tab, setTab] = useState<RightPanelTab>("properties");
   // Clamp the active tab back into the visible strip whenever the
@@ -511,7 +523,7 @@ export function RightPanel({
             <Hint>Select a node to bind design tokens to its properties.</Hint>
           )
         ) : null}
-        {tab === "theme" ? (
+        {tab === "theme" && showTheme ? (
           <ThemePanel onStatus={onStatus} onApplied={onThemeApplied} />
         ) : null}
         {tab === "publish" ? (

@@ -140,6 +140,23 @@ test("boots to HomePage and presents a seeded rect on the editor canvas", async 
   const appUiCard = win.getByTestId("kcreate-create-card-app-ui");
   await appUiCard.waitFor({ state: "visible", timeout: 30_000 });
 
+  // First-run onboarding: a fresh preferences profile (always the case on a
+  // clean CI runner) opens the welcome modal, an `aria-modal` overlay that
+  // intercepts pointer events over the whole HomePage — so the create card
+  // click below would otherwise time out. Dismiss it via its close control,
+  // then wait for it to detach. A returning-user profile (e.g. a repeat local
+  // run) never opens it, so absence within the window is fine.
+  const welcomeClose = win.getByTestId("kcreate-welcome-close");
+  try {
+    await welcomeClose.waitFor({ state: "visible", timeout: 10_000 });
+    await welcomeClose.click();
+    await win
+      .getByTestId("kcreate-welcome-modal")
+      .waitFor({ state: "detached", timeout: 10_000 });
+  } catch {
+    // No welcome modal appeared (onboarding already completed) — proceed.
+  }
+
   // Open the editor (dialog-free scratch project) and wait for the present
   // surface to mount.
   await appUiCard.click();

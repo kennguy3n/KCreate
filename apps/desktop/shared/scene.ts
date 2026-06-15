@@ -2015,6 +2015,94 @@ export interface LayoutStudioBridge {
 }
 
 // ---------------------------------------------------------------------------
+// G6 — Elements / asset library.
+//
+// A built-in, offline catalogue of vector shapes, lines/arrows, icons,
+// frames, and flat illustrations. The catalogue + name/tag search live
+// in `kcreate_core::assets`; SVG parsing + canvas insertion live in
+// `kcreate_bridge::assets`. All four entry points marshal JSON strings
+// across the N-API boundary (so they are NOT covered by
+// `bridge.wire.test.ts`, which only guards the `#[napi(object)]`
+// structs) — the shapes below mirror the serde output of the Rust
+// `CategoryInfo`, `AssetDef`, and `InsertedAsset` types.
+// ---------------------------------------------------------------------------
+
+/** One category tab. Mirrors `kcreate_core::assets::CategoryInfo`. */
+export interface AssetCategoryInfo {
+  /** URL-safe identifier, e.g. `"shapes"` / `"icons"`. */
+  slug: string;
+  /** Human-readable tab label, e.g. `"Shapes"`. */
+  label: string;
+  /** Number of assets in this category. */
+  count: number;
+}
+
+/**
+ * A single catalogue entry. Mirrors the serde output of
+ * `kcreate_core::assets::AssetDef`. `svg` is the raw, self-contained
+ * SVG markup the panel renders directly as a thumbnail (no network,
+ * no file I/O).
+ */
+export interface AssetSummary {
+  id: string;
+  name: string;
+  /** Category slug (matches {@link AssetCategoryInfo.slug}). */
+  category: string;
+  tags: string[];
+  svg: string;
+}
+
+/**
+ * Result of inserting an asset onto the canvas. Mirrors
+ * `kcreate_bridge::assets::InsertedAsset`. The asset is wrapped in a
+ * single `GroupLayer` (`groupId`) containing one editable, recolorable
+ * `VectorLayer` per painted path (`nodeIds`); `x`/`y`/`width`/`height`
+ * are the placed group's world bounds.
+ */
+export interface InsertedAsset {
+  groupId: string;
+  nodeIds: string[];
+  name: string;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+/**
+ * Elements / asset library bridge. `window.kcreate.assets.*`. Backed by
+ * `assets_categories` / `assets_list` / `assets_search` /
+ * `assets_insert` in `crates/kcreate_bridge/src/lib.rs`.
+ */
+export interface AssetsBridge {
+  /** All category tabs, each with its asset count. */
+  categories(): Promise<AssetCategoryInfo[]>;
+  /**
+   * List every asset, optionally narrowed to a single category slug.
+   * Rejects with `InvalidArgument` when `category` is not a known slug.
+   */
+  list(category?: string | null): Promise<AssetSummary[]>;
+  /**
+   * Rank assets by name/tag relevance to `query`, optionally scoped to
+   * a category. A blank query returns the (optionally scoped) catalogue.
+   */
+  search(query: string, category?: string | null): Promise<AssetSummary[]>;
+  /**
+   * Parse the bundled SVG for `assetId` and insert it onto the canvas
+   * as editable vector node(s) under `parentId` (root when `null`),
+   * scaled so its longest side is `targetSize` and placed with its
+   * top-left at `(x, y)`. Single undoable operation.
+   */
+  insert(
+    assetId: string,
+    parentId: string | null,
+    x: number,
+    y: number,
+    targetSize: number,
+  ): Promise<InsertedAsset>;
+}
+
+// ---------------------------------------------------------------------------
 // Phase 3 — Local template marketplace (Tasks 11-12).
 //
 // Mirrors `kcreate_core::marketplace::{TemplateSource, TemplateManifest,
@@ -4919,6 +5007,7 @@ declare global {
       interaction: InteractionBridge;
       masterPage: MasterPageBridge;
       layoutStudio: LayoutStudioBridge;
+      assets: AssetsBridge;
       templateMarketplace: TemplateMarketplaceBridge;
       audit: AuditBridge;
       thumbnail: ThumbnailBridge;

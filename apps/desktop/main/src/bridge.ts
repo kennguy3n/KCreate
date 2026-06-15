@@ -625,6 +625,19 @@ export interface Bridge {
   masterPageDetach(contentPageId: string): void;
   layoutTemplateList(): string;
   layoutTemplateApply(templateId: string): string;
+
+  // G6 — Elements / asset library. All four return JSON strings.
+  assetsCategories(): string;
+  assetsList(category: string | undefined): string;
+  assetsSearch(query: string, category: string | undefined): string;
+  assetsInsert(
+    assetId: string,
+    parentId: string | null,
+    x: number,
+    y: number,
+    targetSize: number,
+  ): string;
+
   templateList(category: string | undefined, query: string | undefined): string;
   templateInstallLocal(sourcePath: string): string;
   templateRemove(templateId: string): void;

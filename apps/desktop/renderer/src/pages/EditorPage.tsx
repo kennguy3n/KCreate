@@ -22,6 +22,7 @@ import { ConflictToast } from "../components/ConflictToast";
 import { InlineTextEditor } from "../components/InlineTextEditor";
 import { CursorOverlay } from "../components/CursorOverlay";
 import { LeftPanel } from "../components/LeftPanel";
+import { ASSET_DRAG_MIME } from "../components/AssetsPanel";
 import { PageNavigator } from "../components/PageNavigator";
 import { PathfinderPanel } from "../components/PathfinderPanel";
 import { PenOverlay } from "../components/PenOverlay";
@@ -71,6 +72,12 @@ export type { ToolId } from "../contexts/EditorContext";
 
 const CANVAS_WIDTH = 1024;
 const CANVAS_HEIGHT = 640;
+
+// G6 — default longest-edge size (world px) for an element inserted
+// from the Elements library. Scaled into the asset's bundled
+// geometry by `assets::insert`; the asset stays editable so the user
+// can freely resize afterwards.
+const ELEMENT_INSERT_SIZE = 160;
 
 // Envelope header prefixed to the OS clipboard payload by `handleCopy`
 // and stripped by `handlePaste`. Lets the paste path distinguish a
@@ -1144,6 +1151,46 @@ function EditorPageInner({
   const [dragHover, setDragHover] = useState(false);
   const dragHoverCountRef = useRef(0);
 
+  // G6 — insert a library element as editable vector node(s) at a
+  // specific world position. Shared by the click path (viewport
+  // centre) and the canvas drop path (drop point). One bridge call →
+  // one undoable op; we then select the new group and pull the tree
+  // so the layers panel + selection overlay reflect the insert. The
+  // `nodes`-keyed sync effect repaints the canvas once the tree lands.
+  const insertElementAt = useCallback(
+    async (assetId: string, worldX: number, worldY: number): Promise<void> => {
+      try {
+        const size = ELEMENT_INSERT_SIZE;
+        const result = await window.kcreate.assets.insert(
+          assetId,
+          null,
+          worldX - size / 2,
+          worldY - size / 2,
+          size,
+        );
+        await window.kcreate.canvas.setSelection([result.groupId]);
+        setSelectedIds([result.groupId]);
+        await refreshTree();
+        setStatusMessage(`Inserted ${result.name}`);
+      } catch (e) {
+        setStatusMessage(`insert element failed: ${errorMessage(e)}`);
+      }
+    },
+    [refreshTree, setSelectedIds, setStatusMessage],
+  );
+
+  // Click-to-insert from the Elements panel: drop at the centre of
+  // the visible viewport. `screen = world * zoom + pan`, so the world
+  // point under the viewport centre is `(centre - pan) / zoom`.
+  const handleInsertElement = useCallback(
+    (assetId: string): void => {
+      const worldX = (CANVAS_WIDTH / 2 - viewport.panX) / viewport.zoom;
+      const worldY = (CANVAS_HEIGHT / 2 - viewport.panY) / viewport.zoom;
+      void insertElementAt(assetId, worldX, worldY);
+    },
+    [insertElementAt, viewport.panX, viewport.panY, viewport.zoom],
+  );
+
   const handleCanvasDragEnter = useCallback(
     (e: React.DragEvent<HTMLElement>): void => {
       if (!e.dataTransfer.types.includes("Files")) return;
@@ -1166,7 +1213,13 @@ function EditorPageInner({
 
   const handleCanvasDragOver = useCallback(
     (e: React.DragEvent<HTMLElement>): void => {
-      if (e.dataTransfer.types.includes("Files")) {
+      // Accept both OS file drops (image / PDF import) and Elements
+      // panel drags (`ASSET_DRAG_MIME`). preventDefault on dragover is
+      // what marks the canvas as a valid drop target.
+      if (
+        e.dataTransfer.types.includes("Files") ||
+        e.dataTransfer.types.includes(ASSET_DRAG_MIME)
+      ) {
         e.preventDefault();
         // Set the drop effect so the OS shows the "copy" cursor.
         e.dataTransfer.dropEffect = "copy";
@@ -1187,6 +1240,21 @@ function EditorPageInner({
       // browser's default file-handling (which on Chromium navigates
       // the window to a file:// URL, killing the editor session).
       e.preventDefault();
+      // Elements-panel drag: insert the asset as editable vector
+      // node(s) at the exact drop point. `getData` is only readable
+      // inside the drop event (not dragover), which is why this lives
+      // here. Handled before the file early-return because an asset
+      // drag carries no `dataTransfer.files`.
+      const assetId = e.dataTransfer.getData(ASSET_DRAG_MIME);
+      if (assetId) {
+        const rect = e.currentTarget.getBoundingClientRect();
+        const sx = e.clientX - rect.left;
+        const sy = e.clientY - rect.top;
+        const worldX = (sx - viewport.panX) / viewport.zoom;
+        const worldY = (sy - viewport.panY) / viewport.zoom;
+        void insertElementAt(assetId, worldX, worldY);
+        return;
+      }
       if (!e.dataTransfer.files || e.dataTransfer.files.length === 0) return;
       const target = artboards[0]?.id ?? null;
       if (!target) {
@@ -1266,7 +1334,15 @@ function EditorPageInner({
         }
       })();
     },
-    [artboards, refreshTree, setStatusMessage],
+    [
+      artboards,
+      refreshTree,
+      setStatusMessage,
+      insertElementAt,
+      viewport.panX,
+      viewport.panY,
+      viewport.zoom,
+    ],
   );
 
   const handleSelect = useCallback(
@@ -2091,6 +2167,7 @@ function EditorPageInner({
             void handleComponentDetach(id);
           }}
           onDesignSystemStatus={setStatusMessage}
+          onInsertElement={handleInsertElement}
         />
         <main
           onDragEnter={handleCanvasDragEnter}

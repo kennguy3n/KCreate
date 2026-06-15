@@ -17,6 +17,7 @@
 #![forbid(unsafe_op_in_unsafe_fn)]
 
 pub mod annotation_bridge;
+pub mod assets;
 pub mod audit;
 pub mod autosave;
 #[cfg(feature = "collab")]
@@ -2784,6 +2785,57 @@ pub fn layout_template_apply(template_id: String) -> NapiResult<String> {
     let ids = document::layout_template_apply(tid).map_err(map_doc_err)?;
     let strs: Vec<String> = ids.into_iter().map(|i| i.to_string()).collect();
     serde_json::to_string(&strs).map_err(|e| NapiError::from_reason(e.to_string()))
+}
+
+// ---------- Elements / asset library (workstream G6) ------------------
+
+/// List the Elements panel's category tabs (slug, label, count) as a
+/// JSON array.
+#[napi]
+pub fn assets_categories() -> NapiResult<String> {
+    json_out("assets_categories", &assets::categories())
+}
+
+/// List bundled assets, optionally filtered to a single category slug
+/// (e.g. `"icons"`). Returns a JSON array of asset descriptors
+/// (`id`, `name`, `category`, `tags`, `svg`).
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn assets_list(category: Option<String>) -> NapiResult<String> {
+    let items = assets::list(category.as_deref()).map_err(map_doc_err)?;
+    json_out("assets_list", &items)
+}
+
+/// Search the bundled asset catalogue by name/tag, optionally within a
+/// single category slug. Returns the same JSON shape as
+/// [`assets_list`], ranked by relevance.
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn assets_search(query: String, category: Option<String>) -> NapiResult<String> {
+    let items = assets::search(&query, category.as_deref()).map_err(map_doc_err)?;
+    json_out("assets_search", &items)
+}
+
+/// Insert a bundled asset as editable vector node(s) at world position
+/// `(x, y)`, uniformly scaled so its longest side equals `target_size`.
+/// `parent_id` is the container (typically an artboard); omit it to
+/// attach to the document root. Returns the `InsertedAsset` descriptor
+/// (group id + leaf node ids + world bounds) as JSON.
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn assets_insert(
+    asset_id: String,
+    parent_id: Option<String>,
+    x: f64,
+    y: f64,
+    target_size: f64,
+) -> NapiResult<String> {
+    let parent = match parent_id.as_deref() {
+        Some(s) => Some(parse_uuid(s)?),
+        None => None,
+    };
+    let info = assets::insert(&asset_id, parent, x, y, target_size).map_err(map_doc_err)?;
+    json_out("assets_insert", &info)
 }
 
 /// List installed local templates. Returns a JSON array of

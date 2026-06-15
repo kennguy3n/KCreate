@@ -1766,6 +1766,34 @@ function registerIpcHandlers(): void {
       requireBridge().layoutTemplateApply(templateId),
   );
 
+  // G6 — Elements / asset library. The bridge returns JSON strings;
+  // the preload layer parses them into the shared wire types.
+  ipcMain.handle("kcreate/assets/categories", (): string =>
+    requireBridge().assetsCategories(),
+  );
+  ipcMain.handle(
+    "kcreate/assets/list",
+    (_e, category: string | undefined): string =>
+      requireBridge().assetsList(category),
+  );
+  ipcMain.handle(
+    "kcreate/assets/search",
+    (_e, query: string, category: string | undefined): string =>
+      requireBridge().assetsSearch(query, category),
+  );
+  ipcMain.handle(
+    "kcreate/assets/insert",
+    (
+      _e,
+      assetId: string,
+      parentId: string | null,
+      x: number,
+      y: number,
+      targetSize: number,
+    ): string =>
+      requireBridge().assetsInsert(assetId, parentId, x, y, targetSize),
+  );
+
   // Local template marketplace (Phase 3 — Tasks 11-12). The
   // renderer's TemplateMarketplace panel calls list/install/remove
   // here; the bridge persists installs by copying the .ktemplate

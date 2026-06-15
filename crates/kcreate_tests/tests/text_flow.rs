@@ -236,10 +236,7 @@ fn slice_export_emits_one_file_per_slice() {
     let mut scene = Scene::new(Color::rgba(0.0, 0.0, 0.0, 1.0));
     let obj = Object::new(
         ObjectKind::Rect(Rect::new(0.0, 0.0, 200.0, 200.0)),
-        Style {
-            fill: Some(Color::rgba(1.0, 0.0, 0.0, 1.0)),
-            stroke: None,
-        },
+        Style::filled(Color::rgba(1.0, 0.0, 0.0, 1.0)),
     );
     scene.add_object(obj);
 

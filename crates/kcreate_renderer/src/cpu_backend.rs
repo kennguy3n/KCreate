@@ -9,12 +9,13 @@
 //! `<canvas>` expects via `ImageData`.
 
 use tiny_skia::{
-    BlendMode, FillRule, IntSize, Paint, Path, PathBuilder, Pixmap, PixmapPaint, PixmapRef,
-    Stroke as SkStroke, Transform,
+    BlendMode, FillRule, GradientStop, IntSize, LinearGradient, Paint, Path, PathBuilder, Pixmap,
+    PixmapPaint, PixmapRef, Point, RadialGradient, Shader, SpreadMode, Stroke as SkStroke,
+    Transform,
 };
 
 use crate::display_list::{DisplayCommand, DisplayList};
-use crate::geometry::{Color, PathCommand, Point2, Style};
+use crate::geometry::{Color, Paint as FillPaint, PathCommand, Point2, Style};
 use crate::scene::Scene;
 use crate::viewport::Viewport;
 use crate::{RendererError, Result};
@@ -78,7 +79,7 @@ impl CpuBackend {
                 }
                 DisplayCommand::FillRect { rect, style } => {
                     if let Some(pb) = path_for_rect(*rect) {
-                        self.draw_path(&pb, *style, transform);
+                        self.draw_path(&pb, style, transform);
                     }
                 }
                 DisplayCommand::BatchedRects { rects, style } => {
@@ -88,7 +89,7 @@ impl CpuBackend {
                     // in a future phase.
                     for rect in rects {
                         if let Some(pb) = path_for_rect(*rect) {
-                            self.draw_path(&pb, *style, transform);
+                            self.draw_path(&pb, style, transform);
                         }
                     }
                 }
@@ -98,27 +99,32 @@ impl CpuBackend {
                     style,
                 } => {
                     if let Some(pb) = path_for_circle(*center, *radius) {
-                        self.draw_path(&pb, *style, transform);
+                        self.draw_path(&pb, style, transform);
                     }
                 }
                 DisplayCommand::FillLine { start, end, style } => {
                     // Lines are stroked, not filled — pretend any "fill"
-                    // request maps to a hairline stroke.
+                    // request maps to a hairline stroke. A gradient fill
+                    // collapses to a representative color for the hairline.
                     let Some(pb) = path_for_line(*start, *end) else {
                         continue;
                     };
                     let stroke_style = if style.stroke.is_some() {
-                        *style
-                    } else if let Some(c) = style.fill {
+                        style.clone()
+                    } else if let Some(c) = style
+                        .fill
+                        .as_ref()
+                        .and_then(FillPaint::representative_color)
+                    {
                         Style::stroked(crate::geometry::Stroke::new(c, 1.0))
                     } else {
-                        *style
+                        style.clone()
                     };
-                    self.draw_path(&pb, stroke_style, transform);
+                    self.draw_path(&pb, &stroke_style, transform);
                 }
                 DisplayCommand::FillPath { commands, style } => {
                     if let Some(pb) = path_for_commands(commands) {
-                        self.draw_path(&pb, *style, transform);
+                        self.draw_path(&pb, style, transform);
                     }
                 }
                 DisplayCommand::DrawImage {
@@ -142,7 +148,7 @@ impl CpuBackend {
                     font_size,
                     style,
                 } => {
-                    self.draw_text(*origin, text, font_family, *font_size, *style, transform);
+                    self.draw_text(*origin, text, font_family, *font_size, style, transform);
                 }
             }
         }
@@ -229,7 +235,7 @@ impl CpuBackend {
         text: &str,
         font_family: &str,
         font_size: f32,
-        style: Style,
+        style: &Style,
         transform: Transform,
     ) {
         if text.is_empty() || !font_size.is_finite() || font_size <= 0.0 {
@@ -264,8 +270,10 @@ impl CpuBackend {
         if let Some(path) = pb.finish() {
             // Default to a solid fill if the caller didn't supply one
             // — text is meaningless without color.
+            let default_style;
             let style = if style.fill.is_none() && style.stroke.is_none() {
-                Style::filled(Color::rgba(0.0, 0.0, 0.0, 1.0))
+                default_style = Style::filled(Color::rgba(0.0, 0.0, 0.0, 1.0));
+                &default_style
             } else {
                 style
             };
@@ -273,15 +281,51 @@ impl CpuBackend {
         }
     }
 
-    fn draw_path(&mut self, path: &Path, style: Style, transform: Transform) {
-        if let Some(fill) = style.fill {
+    /// Paint `path` according to `style`. The fill may be a solid color
+    /// or a linear / radial gradient; `transform` (the viewport matrix)
+    /// is applied to BOTH the path and the gradient shader by tiny-skia's
+    /// `fill_path`, so a gradient stays locked to its shape under pan and
+    /// zoom. Gradient endpoints are therefore supplied in world space with
+    /// an identity shader-local matrix.
+    fn draw_path(&mut self, path: &Path, style: &Style, transform: Transform) {
+        if let Some(fill) = style.fill.as_ref() {
             let mut paint = Paint {
                 anti_alias: true,
                 ..Paint::default()
             };
-            paint.set_color(fill.to_tiny_skia());
-            self.pixmap
-                .fill_path(path, &paint, FillRule::Winding, transform, None);
+            // `false` means the paint has nothing visible to draw (a
+            // gradient with no stops) — skip rather than paint default
+            // black.
+            let paintable = match fill {
+                FillPaint::Solid(c) => {
+                    paint.set_color(c.to_tiny_skia());
+                    true
+                }
+                FillPaint::LinearGradient { from, to, stops } => {
+                    match linear_shader(*from, *to, stops) {
+                        Some(shader) => {
+                            paint.shader = shader;
+                            true
+                        }
+                        None => set_representative_color(&mut paint, fill),
+                    }
+                }
+                FillPaint::RadialGradient {
+                    center,
+                    radius,
+                    stops,
+                } => match radial_shader(*center, *radius, stops) {
+                    Some(shader) => {
+                        paint.shader = shader;
+                        true
+                    }
+                    None => set_representative_color(&mut paint, fill),
+                },
+            };
+            if paintable {
+                self.pixmap
+                    .fill_path(path, &paint, FillRule::Winding, transform, None);
+            }
         }
         if let Some(stroke) = style.stroke {
             let mut paint = Paint {
@@ -296,6 +340,59 @@ impl CpuBackend {
             self.pixmap
                 .stroke_path(path, &paint, &sk_stroke, transform, None);
         }
+    }
+}
+
+/// Convert renderer gradient stops to tiny-skia's representation,
+/// clamping offsets into `[0, 1]`. tiny-skia handles ordering and
+/// premultiplication internally.
+fn to_sk_stops(stops: &[(f32, Color)]) -> Vec<GradientStop> {
+    stops
+        .iter()
+        .map(|(offset, color)| GradientStop::new(offset.clamp(0.0, 1.0), color.to_tiny_skia()))
+        .collect()
+}
+
+/// Build a tiny-skia axial gradient shader from world-space endpoints.
+/// The shader-local matrix is identity; the viewport transform is
+/// applied later by `fill_path` so the gradient pans/zooms with the
+/// shape. Returns `None` for degenerate input (tiny-skia rejects e.g.
+/// non-finite points or fewer than two distinct stops).
+fn linear_shader(from: Point2, to: Point2, stops: &[(f32, Color)]) -> Option<Shader<'static>> {
+    LinearGradient::new(
+        Point::from_xy(from.x, from.y),
+        Point::from_xy(to.x, to.y),
+        to_sk_stops(stops),
+        SpreadMode::Pad,
+        Transform::identity(),
+    )
+}
+
+/// Build a tiny-skia radial gradient shader. The focal point and the
+/// outer-circle center coincide (a standard, non-conical radial), with
+/// inner radius 0 — matching the PDF exporter's `r0 = 0` convention.
+fn radial_shader(center: Point2, radius: f32, stops: &[(f32, Color)]) -> Option<Shader<'static>> {
+    RadialGradient::new(
+        Point::from_xy(center.x, center.y),
+        Point::from_xy(center.x, center.y),
+        radius,
+        to_sk_stops(stops),
+        SpreadMode::Pad,
+        Transform::identity(),
+    )
+}
+
+/// Fall back to a gradient's representative (first-stop) color when the
+/// shader is degenerate, so the shape still paints visibly. Returns
+/// `false` when there is no color to use (no stops), signalling the
+/// caller to skip the fill entirely.
+fn set_representative_color(paint: &mut Paint, fill: &FillPaint) -> bool {
+    match fill.representative_color() {
+        Some(c) => {
+            paint.set_color(c.to_tiny_skia());
+            true
+        }
+        None => false,
     }
 }
 
@@ -375,11 +472,6 @@ fn unpremultiply_in_place(buf: &mut [u8]) {
     }
 }
 
-// Silence the unused `Color` import warning when no color helpers are referenced
-// from this module's body (we only use Color via Style/Stroke).
-#[allow(dead_code)]
-const fn _color_marker(_c: Color) {}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -451,6 +543,93 @@ mod tests {
             .unwrap();
         let idx = (16 * 32 + 16) * 4;
         assert!(out[idx] > 200, "line should brighten center pixel");
+    }
+
+    /// Render a single full-canvas rect with `style` over a black
+    /// background at 1:1 zoom and return the straight-alpha RGBA8
+    /// buffer. Used by the gradient ramp tests below.
+    fn render_full_rect(size: u32, style: Style) -> Vec<u8> {
+        let mut backend = CpuBackend::new(size, size);
+        let scene = Scene::new(Color::rgba(0.0, 0.0, 0.0, 1.0));
+        let mut list = DisplayList::new();
+        let rect = Rect::new(0.0, 0.0, size as f32, size as f32);
+        list.push_raw(DisplayCommand::Clear, None);
+        list.push_raw(DisplayCommand::FillRect { rect, style }, Some(rect));
+        let mut out = Vec::new();
+        backend
+            .render(
+                &scene,
+                &Viewport::new(Vec2::ZERO, 1.0),
+                &list,
+                &mut out,
+                (size, size),
+            )
+            .unwrap();
+        out
+    }
+
+    #[test]
+    fn linear_gradient_fill_forms_horizontal_ramp() {
+        // Red on the left edge → blue on the right edge, in world
+        // space. At 1:1 zoom world == device, so the left half must
+        // read reddish and the right half bluish — proving the fill
+        // is an actual gradient, not a flat representative colour.
+        const SIZE: u32 = 32;
+        let style = Style::linear_gradient(
+            Point2::new(0.0, 0.0),
+            Point2::new(SIZE as f32, 0.0),
+            vec![
+                (0.0, Color::rgba(1.0, 0.0, 0.0, 1.0)),
+                (1.0, Color::rgba(0.0, 0.0, 1.0, 1.0)),
+            ],
+        );
+        let out = render_full_rect(SIZE, style);
+        let px = |x: u32, y: u32| {
+            let i = ((y * SIZE + x) * 4) as usize;
+            (out[i], out[i + 1], out[i + 2])
+        };
+        let (lr, _, lb) = px(2, 16);
+        let (rr, _, rb) = px(SIZE - 3, 16);
+        assert!(
+            lr > 180 && lb < 80,
+            "left edge should be red, got ({lr},_,{lb})"
+        );
+        assert!(
+            rb > 180 && rr < 80,
+            "right edge should be blue, got ({rr},_,{rb})"
+        );
+        // Midpoint is a genuine blend of both endpoints, not a copy of
+        // either: red falls and blue rises monotonically across x.
+        let (mr, _, mb) = px(SIZE / 2, 16);
+        assert!(mr < lr && mr > rr, "red must decrease L→R: {lr},{mr},{rr}");
+        assert!(mb > lb && mb < rb, "blue must increase L→R: {lb},{mb},{rb}");
+    }
+
+    #[test]
+    fn radial_gradient_fill_brightens_toward_center() {
+        // White centre → black rim. The centre pixel must be far
+        // brighter than a pixel near the rect's edge.
+        const SIZE: u32 = 32;
+        let style = Style::radial_gradient(
+            Point2::new(SIZE as f32 / 2.0, SIZE as f32 / 2.0),
+            SIZE as f32 / 2.0,
+            vec![
+                (0.0, Color::rgba(1.0, 1.0, 1.0, 1.0)),
+                (1.0, Color::rgba(0.0, 0.0, 0.0, 1.0)),
+            ],
+        );
+        let out = render_full_rect(SIZE, style);
+        let lum = |x: u32, y: u32| {
+            let i = ((y * SIZE + x) * 4) as usize;
+            u32::from(out[i]) + u32::from(out[i + 1]) + u32::from(out[i + 2])
+        };
+        let center = lum(SIZE / 2, SIZE / 2);
+        let edge = lum(1, 1);
+        assert!(center > 600, "centre should be near white, got {center}");
+        assert!(
+            center > edge + 200,
+            "centre ({center}) must be much brighter than rim ({edge})"
+        );
     }
 
     #[test]

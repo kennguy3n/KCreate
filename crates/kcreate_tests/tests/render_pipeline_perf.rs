@@ -404,7 +404,7 @@ fn batched_rects_replace_consecutive_same_style_fillrects() {
     for i in 0..20 {
         s.add_object(Object::new(
             ObjectKind::Rect(Rect::new(i as f32 * 30.0, 0.0, 20.0, 20.0)),
-            style,
+            style.clone(),
         ));
     }
     let mut p = Pipeline::new();
@@ -451,7 +451,11 @@ fn batched_rects_do_not_merge_across_different_styles() {
     let red = Style::filled(Color::rgba(1.0, 0.0, 0.0, 1.0));
     let green = Style::filled(Color::rgba(0.0, 1.0, 0.0, 1.0));
     for i in 0..4 {
-        let st = if i % 2 == 0 { red } else { green };
+        let st = if i % 2 == 0 {
+            red.clone()
+        } else {
+            green.clone()
+        };
         s.add_object(Object::new(
             ObjectKind::Rect(Rect::new(i as f32 * 30.0, 0.0, 20.0, 20.0)),
             st,

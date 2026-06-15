@@ -256,10 +256,7 @@ mod tests {
         let mut s = Scene::new(Color::rgba(0.0, 0.0, 0.0, 1.0));
         let obj = Object::new(
             ObjectKind::Rect(Rect::new(0.0, 0.0, 100.0, 100.0)),
-            Style {
-                fill: Some(Color::rgba(1.0, 0.0, 0.0, 1.0)),
-                stroke: None,
-            },
+            Style::filled(Color::rgba(1.0, 0.0, 0.0, 1.0)),
         );
         s.add_object(obj);
         s

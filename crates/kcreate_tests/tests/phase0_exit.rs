@@ -321,15 +321,12 @@ fn scene_with_rect() -> Scene {
         b: 0.1,
         a: 1.0,
     });
-    let style = Style {
-        fill: Some(Color {
-            r: 0.9,
-            g: 0.4,
-            b: 0.4,
-            a: 1.0,
-        }),
-        stroke: None,
-    };
+    let style = Style::filled(Color {
+        r: 0.9,
+        g: 0.4,
+        b: 0.4,
+        a: 1.0,
+    });
     let rect = Object::new(ObjectKind::Rect(Rect::new(0.0, 0.0, 16.0, 16.0)), style)
         .with_translation(4.0, 4.0);
     scene.add_object(rect);

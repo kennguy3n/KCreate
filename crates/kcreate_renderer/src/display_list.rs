@@ -127,21 +127,21 @@ impl DisplayList {
         match &object.kind {
             ObjectKind::Rect(r) => DisplayCommand::FillRect {
                 rect: Rect::new(r.x + dx, r.y + dy, r.width, r.height),
-                style: object.style,
+                style: object.style.translated(dx, dy),
             },
             ObjectKind::Circle { center, radius } => DisplayCommand::FillCircle {
                 center: Point2::new(center.x + dx, center.y + dy),
                 radius: *radius,
-                style: object.style,
+                style: object.style.translated(dx, dy),
             },
             ObjectKind::Line { start, end } => DisplayCommand::FillLine {
                 start: Point2::new(start.x + dx, start.y + dy),
                 end: Point2::new(end.x + dx, end.y + dy),
-                style: object.style,
+                style: object.style.translated(dx, dy),
             },
             ObjectKind::Path(cmds) => DisplayCommand::FillPath {
                 commands: cmds.iter().map(|c| translate_path(c, dx, dy)).collect(),
-                style: object.style,
+                style: object.style.translated(dx, dy),
             },
             ObjectKind::Image {
                 rect,
@@ -167,7 +167,7 @@ impl DisplayList {
                 text: text.clone(),
                 font_family: font_family.clone(),
                 font_size: *font_size,
-                style: object.style,
+                style: object.style.translated(dx, dy),
             },
         }
     }

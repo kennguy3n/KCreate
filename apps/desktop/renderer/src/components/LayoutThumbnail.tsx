@@ -131,14 +131,14 @@ function mixHex(hex: string, target: string, t: number): string {
 }
 
 function rgbaToCss(c: RgbaColor): string {
-  // Channels are floats in [0,1] (wire-format contract). Be defensive
-  // about a 0–255 producer by detecting any channel > 1.
-  const scale = c.r > 1 || c.g > 1 || c.b > 1 ? 1 : 255;
-  const r = Math.round(clamp(c.r * scale, 0, 255));
-  const g = Math.round(clamp(c.g * scale, 0, 255));
-  const b = Math.round(clamp(c.b * scale, 0, 255));
-  const a = clamp(c.a, 0, 1);
-  return `rgba(${r}, ${g}, ${b}, ${a})`;
+  // RgbaColor channels are floats in [0,1] per the wire-format contract
+  // (shared/scene.ts), so we clamp to that range and scale to 0–255 —
+  // the same approach the renderer's other rgbaToCss helpers use
+  // (ThemePanel, TokenBindingControl, BrandVersionPanel). Clamping
+  // (rather than range-sniffing) keeps a stray out-of-range channel from
+  // flipping the whole colour to a different scale.
+  const channel = (v: number): number => Math.round(clamp(v, 0, 1) * 255);
+  return `rgba(${channel(c.r)}, ${channel(c.g)}, ${channel(c.b)}, ${clamp(c.a, 0, 1)})`;
 }
 
 /**

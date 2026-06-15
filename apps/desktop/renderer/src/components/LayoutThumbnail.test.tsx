@@ -100,6 +100,20 @@ describe("resolveAccent", () => {
     };
     expect(resolveAccent("#7E22CE", tokens)).toBe("rgba(255, 0, 0, 1)");
   });
+
+  it("clamps out-of-range channels to the [0,1] wire contract", () => {
+    // A channel slightly above 1 (e.g. float drift) must not flip the
+    // colour to a 0–255 interpretation — it is clamped, matching the
+    // renderer's other rgbaToCss helpers.
+    const tokens: DesignTokens = {
+      colors: { primary: { r: 1.0001, g: 0, b: 0, a: 1.5 } },
+      typography: {},
+      spacing: {},
+      radii: {},
+      shadows: {},
+    };
+    expect(resolveAccent("#7E22CE", tokens)).toBe("rgba(255, 0, 0, 1)");
+  });
 });
 
 describe("LayoutThumbnail", () => {

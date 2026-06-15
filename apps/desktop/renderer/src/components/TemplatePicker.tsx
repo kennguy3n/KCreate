@@ -259,7 +259,15 @@ function TemplateCard({
             </span>
           </LayoutThumbnail>
         </div>
-      ) : null}
+      ) : (
+        // A pageless template (only possible for a malformed plugin- or
+        // AI-contributed template) still gets a framed thumbnail slot so
+        // every card keeps the same shape and the grid stays aligned.
+        <div style={cardThumbPlaceholderStyle}>
+          <span style={pageCountPillStyle}>No pages</span>
+          No preview
+        </div>
+      )}
       <div style={cardTitleStyle}>{template.name}</div>
       <div style={cardCategoryStyle}>
         <span
@@ -487,6 +495,21 @@ const cardCategoryStyle: React.CSSProperties = {
   display: "flex",
   gap: spacing.xs,
   marginBottom: 2,
+};
+
+const cardThumbPlaceholderStyle: React.CSSProperties = {
+  position: "relative",
+  width: "100%",
+  aspectRatio: "4 / 3",
+  marginBottom: spacing.sm,
+  background: "#FAFAFA",
+  border: `1px solid ${colors.border}`,
+  borderRadius: 8,
+  display: "flex",
+  alignItems: "center",
+  justifyContent: "center",
+  color: colors.textMuted,
+  fontSize: 11,
 };
 
 const pageCountPillStyle: React.CSSProperties = {

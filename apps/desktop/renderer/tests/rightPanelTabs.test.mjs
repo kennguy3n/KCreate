@@ -108,12 +108,12 @@ test("clampTabToAvailable: falls back to first tab when current removed by mode 
 
 test("clampTabToAvailable: handles every mode-conditional removal", async () => {
   const { clampTabToAvailable } = await loadHelper();
-  // Pin each of the four mode-gated tabs (accessibility,
-  // interaction, preflight, color) — these are the only entries
-  // that can disappear from the strip under a mode transition, so
-  // they're the entire failure surface this helper exists to
-  // handle. Strip without ANY mode-conditional tabs (e.g. image
-  // mode).
+  // Pin each of the five mode-gated tabs (accessibility,
+  // interaction, preflight, color, theme) — these are the only
+  // entries that can disappear from the strip under a mode
+  // transition, so they're the entire failure surface this helper
+  // exists to handle. Strip without ANY mode-conditional tabs (e.g.
+  // image mode).
   const minimalStrip = tabs(
     "properties",
     "effects",
@@ -132,6 +132,7 @@ test("clampTabToAvailable: handles every mode-conditional removal", async () => 
     "interaction",
     "preflight",
     "color",
+    "theme",
   ]) {
     const result = clampTabToAvailable(ghostTab, minimalStrip);
     assert.equal(

@@ -39,6 +39,7 @@ import type {
   LayoutTemplate,
   TemplateCategory,
   TemplateListReport,
+  TemplateInstantiateReport,
   TemplateManifest,
   TemplateMarketplaceBridge,
   MasterPageBridge,
@@ -1633,6 +1634,20 @@ const templateMarketplace: TemplateMarketplaceBridge = {
   },
   async remove(templateId: string): Promise<void> {
     await ipcRenderer.invoke("kcreate/template/remove", templateId);
+  },
+  async instantiate(
+    templateId: string,
+  ): Promise<TemplateInstantiateReport> {
+    return (await ipcRenderer.invoke(
+      "kcreate/template/instantiate",
+      templateId,
+    )) as TemplateInstantiateReport;
+  },
+  async thumbnail(templateId: string): Promise<ThumbnailBytes> {
+    return (await ipcRenderer.invoke(
+      "kcreate/template/thumbnail",
+      templateId,
+    )) as ThumbnailBytes;
   },
 };
 

@@ -43,6 +43,11 @@ import type {
   TemplateManifest,
 } from "../../../shared/scene";
 import { colors, font, radius, spacing } from "../styles/tokens";
+import {
+  ALL_CATEGORIES,
+  CATEGORY_LABELS,
+  CATEGORY_TINT,
+} from "../lib/templateCategories";
 
 export interface TemplateMarketplaceProps {
   /** Bubble status messages to the editor's global status strip. */
@@ -59,37 +64,6 @@ export interface TemplateMarketplaceProps {
    */
   onTemplateInstalled?: (manifest: TemplateManifest) => void;
 }
-
-/// Human-readable labels for the snake_case `TemplateCategory`
-/// discriminants. Kept in lockstep with the Rust enum
-/// (`kcreate_core::project::TemplateCategory`) — adding a category
-/// there must be mirrored here AND in the `CATEGORY_TINT` table.
-const CATEGORY_LABELS: Record<TemplateCategory, string> = {
-  pitch_deck: "Pitch Deck",
-  proposal: "Proposal",
-  brochure: "Brochure",
-  flyer: "Flyer",
-  report: "Report",
-  custom: "Custom",
-};
-
-const CATEGORY_TINT: Record<TemplateCategory, string> = {
-  pitch_deck: "#7E22CE",
-  proposal: "#1D4ED8",
-  brochure: "#0D9488",
-  flyer: "#EA580C",
-  report: "#374151",
-  custom: "#4B5563",
-};
-
-const ALL_CATEGORIES: TemplateCategory[] = [
-  "pitch_deck",
-  "proposal",
-  "brochure",
-  "flyer",
-  "report",
-  "custom",
-];
 
 export function TemplateMarketplace({
   onStatus,

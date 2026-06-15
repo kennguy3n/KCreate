@@ -131,6 +131,16 @@ type ThumbnailBytesSnake = {
   contentHash: string;
 };
 
+// `TemplateInstantiateResultSnake` mirrors
+// `kcreate_bridge::lib::TemplateInstantiateResult`. Returned by
+// `templateInstantiate` — the artboard the template was poured into
+// plus every node id created, so the renderer can select/frame the
+// freshly instantiated design.
+type TemplateInstantiateResultSnake = {
+  artboardId: string;
+  nodeIds: string[];
+};
+
 // `RecentProjectCoverInfoSnake` — cover-thumbnail metadata only.
 // Paired with `thumbnailForCover` / `recentProjectCoverBytes` to
 // fetch the actual pixel bytes.
@@ -165,6 +175,7 @@ export type {
   UndoRedoOutcomeSnake,
   DiscardedBranchSummarySnake,
   ThumbnailBytesSnake,
+  TemplateInstantiateResultSnake,
   RecentProjectCoverInfoSnake,
   RecentProjectInfoSnake,
 };
@@ -628,6 +639,17 @@ export interface Bridge {
   templateList(category: string | undefined, query: string | undefined): string;
   templateInstallLocal(sourcePath: string): string;
   templateRemove(templateId: string): void;
+  // Pour a bundled/marketplace template (resolved by id -> content.json)
+  // into the open workspace as a fresh artboard. Returns the new
+  // artboard id + every node id created so the renderer can select and
+  // frame the instantiated design ("Start from template").
+  templateInstantiate(templateId: string): TemplateInstantiateResultSnake;
+  // Render (or read the cached) thumbnail PNG for a template id. The
+  // PNG is produced by the same Rust export pipeline used for project
+  // covers, so gallery cards are real previews of the applied design.
+  // Async (napi `AsyncTask`): a cold render runs on a worker thread so
+  // it never blocks the Electron main process.
+  templateThumbnail(templateId: string): Promise<ThumbnailBytesSnake>;
 
   // Phase 6 — audit log
   auditRecord(eventJson: string): string;

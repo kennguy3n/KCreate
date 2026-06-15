@@ -6027,7 +6027,13 @@ pub enum CanvasBatchItem {
 /// this out of [`canvas_create_nodes`] keeps the per-item match arm
 /// small and lets the batch loop stay focused on lock ordering +
 /// op-log accounting.
-fn build_canvas_batch_node(item: CanvasBatchItem) -> Result<(Node, &'static str)> {
+///
+/// `pub(crate)` so the template library entry points
+/// ([`template_instantiate_items`], [`build_template_document`]) can
+/// reuse the exact same item → [`Node`] translation rather than
+/// duplicating the geometry/fill construction — a single source of
+/// truth for the `CanvasBatchItem` wire shape.
+pub(crate) fn build_canvas_batch_node(item: CanvasBatchItem) -> Result<(Node, &'static str)> {
     use kcreate_core::node::Bounds;
     match item {
         CanvasBatchItem::Rect {
@@ -6274,6 +6280,220 @@ pub fn canvas_create_nodes(items: Vec<CanvasBatchItem>) -> Result<Vec<Uuid>> {
         Some(e) => Err(e),
         None => Ok(created_ids),
     }
+}
+
+/// Report returned by [`template_instantiate_items`]: the artboard
+/// created to hold the instantiated template plus every content node
+/// id inserted under it, in submission order.
+#[derive(Debug, Clone)]
+pub struct TemplateInstantiateReport {
+    /// The artboard the template content was parented to.
+    pub artboard_id: Uuid,
+    /// Content node ids in `items` submission order.
+    pub node_ids: Vec<Uuid>,
+}
+
+/// Instantiate a ready-made template into the **currently open**
+/// workspace. Creates a new artboard sized to `width` × `height` at
+/// the next free position in the first page, then inserts every
+/// `items` entry as a child of that artboard.
+///
+/// `items` carry absolute coordinates within `[0,0,width,height]` —
+/// the exact space the thumbnail is rendered in (see
+/// [`build_template_document`]), so the live canvas and the gallery
+/// preview are pixel-identical. The artboard is auto-positioned in
+/// the page's horizontal row by [`next_artboard_x`]; each content
+/// node is then shifted by the artboard origin via its `transform`.
+/// `scene_sync` reads world coordinates as `bounds + transform` for
+/// raster/text and `transform` for vector paths (whose path commands
+/// carry baked-in absolute coordinates), so one uniform `transform`
+/// shift relocates every node kind identically.
+///
+/// Parenting the content to the artboard means [`artboard_duplicate`]
+/// deep-clones the whole design — that is the "Duplicate & remix"
+/// path, with no template-specific code.
+///
+/// Mirrors the lock / op-log discipline of [`canvas_create_nodes`]:
+/// one write lock, one `Operation` per node (plus the leading
+/// `artboard_create` op), a single `sync_scene_locked` at the end,
+/// and mid-batch-failure finalization so a partial insert never
+/// leaves ghost nodes (Devin Review PR #32 BUG_0001).
+pub fn template_instantiate_items(
+    name: &str,
+    width: f64,
+    height: f64,
+    items: Vec<CanvasBatchItem>,
+) -> Result<TemplateInstantiateReport> {
+    if !(width.is_finite() && width > 0.0 && height.is_finite() && height > 0.0) {
+        return Err(DocumentBridgeError::InvalidBounds { width, height });
+    }
+    let mut guard = slot().write();
+    let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
+
+    // Resolve the target page (first Page, else create one) exactly
+    // like artboard_create does.
+    let resolved_page = match find_first_page(&ws.project.document) {
+        Some(p) => p,
+        None => ws.project.add_page("Page 1")?,
+    };
+
+    // "Start from template" almost always runs against a brand-new
+    // scratch project, which `project_create` seeds with a single
+    // *empty* default artboard at the origin. Appending a second
+    // artboard beside it (the general insert-into-existing-work case)
+    // would strand the design off-screen: the editor opens centred on
+    // the origin and the user sees the blank default instead of their
+    // template. So when the target page holds exactly one artboard and
+    // it has no children, treat the template as the document itself —
+    // reuse that artboard in place (resized + renamed to the template)
+    // rather than creating a new one. Any other shape (a populated
+    // artboard, or several) means we're inserting into existing work,
+    // so we append left-to-right as before.
+    let reuse_target = {
+        let artboards = ws.project.document.list_artboards(resolved_page);
+        match artboards.as_slice() {
+            [only] if only.children.is_empty() => Some((only.id, only.bounds.x, only.bounds.y)),
+            _ => None,
+        }
+    };
+    let (artboard_id, origin_x, origin_y) = match reuse_target {
+        Some((id, x, y)) => {
+            // Resize the pristine default artboard to the template's
+            // canvas and rename it so the layer tree / page navigator
+            // reads as the template rather than "Page 1 / Artboard 1".
+            let before = ws
+                .project
+                .document
+                .get_node(id)
+                .map_or(serde_json::Value::Null, |n| {
+                    serde_json::to_value(n).unwrap_or(serde_json::Value::Null)
+                });
+            ws.project
+                .document
+                .resize_artboard(id, kcreate_core::node::Bounds::new(x, y, width, height))?;
+            if let Some(node) = ws.project.document.get_node_mut(id) {
+                node.name = name.to_string();
+                node.touch();
+            }
+            let after = ws
+                .project
+                .document
+                .get_node(id)
+                .map_or(serde_json::Value::Null, |n| {
+                    serde_json::to_value(n).unwrap_or(serde_json::Value::Null)
+                });
+            ws.project.execute_operation(Operation::new(
+                "user",
+                "artboard_resize",
+                before,
+                after,
+                vec![id],
+            ));
+            (id, x, y)
+        }
+        None => {
+            // Auto-position the artboard so repeated "Start from
+            // template" clicks lay designs out left-to-right instead of
+            // stacking.
+            let origin_x = next_artboard_x(&ws.project.document, resolved_page);
+            let origin_y = 0.0_f64;
+            let bounds = kcreate_core::node::Bounds::new(origin_x, origin_y, width, height);
+            let artboard_id = ws
+                .project
+                .document
+                .create_artboard(resolved_page, name, bounds)?;
+            let artboard_snapshot = ws
+                .project
+                .document
+                .get_node(artboard_id)
+                .map_or(serde_json::Value::Null, |n| {
+                    serde_json::to_value(n).unwrap_or(serde_json::Value::Null)
+                });
+            ws.project.execute_operation(Operation::new(
+                "user",
+                "artboard_create",
+                serde_json::Value::Null,
+                artboard_snapshot,
+                vec![artboard_id],
+            ));
+            (artboard_id, origin_x, origin_y)
+        }
+    };
+
+    let mut node_ids = Vec::with_capacity(items.len());
+    let mut loop_err: Option<DocumentBridgeError> = None;
+    for item in items {
+        let step = build_canvas_batch_node(item).and_then(|(mut node, op_kind)| {
+            // Re-parent into the freshly created artboard and shift by
+            // the artboard origin so the design lands aligned with its
+            // artboard regardless of how many already exist. A uniform
+            // transform shift works for vector/text/raster alike
+            // because scene_sync derives world coords from `transform`.
+            node.parent_id = Some(artboard_id);
+            node.transform.tx += origin_x;
+            node.transform.ty += origin_y;
+            let id = ws.project.document.insert_node(node)?;
+            let snapshot = ws
+                .project
+                .document
+                .get_node(id)
+                .map_or(serde_json::Value::Null, |n| {
+                    serde_json::to_value(n).unwrap_or(serde_json::Value::Null)
+                });
+            ws.project.execute_operation(Operation::new(
+                "user",
+                op_kind,
+                serde_json::Value::Null,
+                snapshot,
+                vec![id],
+            ));
+            Ok::<Uuid, DocumentBridgeError>(id)
+        });
+        match step {
+            Ok(id) => node_ids.push(id),
+            Err(e) => {
+                loop_err = Some(e);
+                break;
+            }
+        }
+    }
+
+    // The artboard alone is a meaningful mutation, so always finalize.
+    ws.project.modified_at = Utc::now();
+    let _ = sync_scene_locked(&mut guard);
+    drop(guard);
+    match loop_err {
+        Some(e) => Err(e),
+        None => Ok(TemplateInstantiateReport {
+            artboard_id,
+            node_ids,
+        }),
+    }
+}
+
+/// Build a standalone [`DocumentGraph`] from template content items
+/// for **off-document thumbnail rendering**. Items are inserted at
+/// the document root (no Page / Artboard) using their authored
+/// absolute coordinates, so a `scene_sync` pass over
+/// `[0,0,width,height]` reproduces exactly what
+/// [`template_instantiate_items`] paints into a live artboard.
+///
+/// Unlike the live-workspace path this never touches the workspace
+/// slot, the operation log, or the scene-sync singleton — it is a
+/// pure `items` → graph transform used only by the thumbnail
+/// renderer (`crate::thumbnails`).
+pub(crate) fn build_template_document(items: Vec<CanvasBatchItem>) -> Result<DocumentGraph> {
+    let mut doc = DocumentGraph::new();
+    for item in items {
+        let (mut node, _op_kind) = build_canvas_batch_node(item)?;
+        // Force root placement: the ephemeral thumbnail graph has no
+        // artboard. content.json authors items with `parent: null`
+        // anyway; this defends against a stray parent that would not
+        // resolve in this standalone graph.
+        node.parent_id = None;
+        doc.insert_node(node)?;
+    }
+    Ok(doc)
 }
 
 // -----------------------------------------------------------------------------

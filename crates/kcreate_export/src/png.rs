@@ -8,7 +8,7 @@ use std::path::Path;
 
 use image::{codecs::png::PngEncoder, ColorType, ImageEncoder};
 use kcreate_renderer::geometry::Color;
-use kcreate_renderer::{initialize, Scene};
+use kcreate_renderer::{initialize, Scene, Vec2};
 use thiserror::Error;
 
 /// Errors from PNG export.
@@ -72,6 +72,10 @@ pub fn export_png_to_bytes(
     // frame back. We don't reuse the singleton bridge renderer because
     // exports happen at arbitrary scales independent of the UI.
     let ctx = initialize(final_w, final_h)?;
+    // Supersample at `scale`: zoom the viewport so scene units map to
+    // `scale` pixels each, filling the enlarged buffer. Without this the
+    // content renders 1:1 in the top-left and the extra pixels are padding.
+    ctx.set_viewport(Vec2::ZERO, options.scale);
     let _frame_id = ctx.render_frame(&scene)?;
     let rgba: Vec<u8> = {
         let frame = ctx.latest_frame().ok_or(PngExportError::NoFrame)?;
@@ -189,6 +193,59 @@ mod tests {
         let decoded = image::load_from_memory(&bytes).expect("decode png");
         assert_eq!(decoded.width(), 32);
         assert_eq!(decoded.height(), 32);
+    }
+
+    fn full_cover_scene() -> Scene {
+        // A red rect covering the entire 16×16 logical canvas.
+        let mut s = Scene::new(Color::rgba(0.0, 0.0, 0.0, 1.0));
+        s.add_object(Object::new(
+            ObjectKind::Rect(Rect::new(0.0, 0.0, 16.0, 16.0)),
+            Style {
+                fill: Some(Color::rgba(1.0, 0.0, 0.0, 1.0)),
+                stroke: None,
+            },
+        ));
+        s
+    }
+
+    #[test]
+    fn scale_supersamples_content_instead_of_padding() {
+        // Content covering the whole logical canvas must fill the whole
+        // scaled buffer. Before the viewport-zoom fix, `scale > 1`
+        // rendered the scene 1:1 in the top-left and left the rest as
+        // empty padding, so the bottom-right quadrant was background.
+        let opts = PngExportOptions {
+            width: 16,
+            height: 16,
+            scale: 2.0,
+            background: Some(Color::rgba(0.0, 0.0, 0.0, 1.0)),
+        };
+        let bytes = export_png_to_bytes(&full_cover_scene(), &opts).expect("png");
+        let decoded = image::load_from_memory(&bytes)
+            .expect("decode png")
+            .to_rgba8();
+        assert_eq!(decoded.dimensions(), (32, 32));
+
+        let is_fill = |p: &image::Rgba<u8>| p[0] > 200 && p[1] < 60 && p[2] < 60;
+        // The far corner (would be padding without the fix) is the fill.
+        assert!(
+            is_fill(decoded.get_pixel(31, 31)),
+            "far corner must be the supersampled fill, got {:?}",
+            decoded.get_pixel(31, 31)
+        );
+        // The whole bottom-right quadrant is the fill, not background.
+        let mut fill_px = 0u32;
+        for y in 16..32 {
+            for x in 16..32 {
+                if is_fill(decoded.get_pixel(x, y)) {
+                    fill_px += 1;
+                }
+            }
+        }
+        assert_eq!(
+            fill_px, 256,
+            "entire bottom-right quadrant must be supersampled fill"
+        );
     }
 
     #[test]

@@ -16,7 +16,7 @@ use std::path::Path;
 
 use image::{codecs::webp::WebPEncoder, ColorType, ImageEncoder};
 use kcreate_renderer::geometry::Color;
-use kcreate_renderer::{initialize, Scene};
+use kcreate_renderer::{initialize, Scene, Vec2};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -106,6 +106,9 @@ pub fn export_webp_to_bytes(
     let scene = apply_background(scene.clone(), options.background);
 
     let ctx = initialize(final_w, final_h)?;
+    // Supersample at `scale`: zoom the viewport so scene units map to
+    // `scale` pixels each, filling the enlarged buffer (see png.rs).
+    ctx.set_viewport(Vec2::ZERO, options.scale);
     let _frame_id = ctx.render_frame(&scene)?;
     let rgba: Vec<u8> = {
         let frame = ctx.latest_frame().ok_or(WebpExportError::NoFrame)?;
@@ -186,5 +189,39 @@ mod tests {
         // RIFF container header.
         assert_eq!(&bytes[0..4], b"RIFF");
         assert_eq!(&bytes[8..12], b"WEBP");
+    }
+
+    #[test]
+    fn scale_supersamples_content_instead_of_padding() {
+        use kcreate_renderer::geometry::{Rect, Style};
+        use kcreate_renderer::scene::{Object, ObjectKind};
+
+        let mut scene = Scene::new(Color::rgba(0.0, 0.0, 0.0, 1.0));
+        scene.add_object(Object::new(
+            ObjectKind::Rect(Rect::new(0.0, 0.0, 16.0, 16.0)),
+            Style {
+                fill: Some(Color::rgba(1.0, 0.0, 0.0, 1.0)),
+                stroke: None,
+            },
+        ));
+        let opts = WebpExportOptions {
+            width: 16,
+            height: 16,
+            scale: 2.0,
+            quality: 90,
+            lossless: true,
+            background: Some(Color::rgba(0.0, 0.0, 0.0, 1.0)),
+        };
+        let bytes = export_webp_to_bytes(&scene, &opts).expect("webp");
+        let decoded = image::load_from_memory(&bytes)
+            .expect("decode webp")
+            .to_rgba8();
+        assert_eq!(decoded.dimensions(), (32, 32));
+        // The far corner would be empty padding without the viewport-zoom fix.
+        let corner = decoded.get_pixel(31, 31);
+        assert!(
+            corner[0] > 200 && corner[1] < 60 && corner[2] < 60,
+            "far corner must be the supersampled fill, got {corner:?}"
+        );
     }
 }

@@ -419,18 +419,9 @@ pub fn outline_from_brief(
         return Err(ThemedDesignError::Empty);
     }
 
-    let mut lines = trimmed.lines().map(str::trim).filter(|l| !l.is_empty());
-    let raw_title = lines.next().unwrap_or(trimmed);
+    let (raw_title, user_points) = split_brief(trimmed);
 
-    // Remaining lines are user talking points. Strip common list
-    // markers so "- foo" and "* foo" fold into clean phrases.
-    let user_points: Vec<String> = lines
-        .map(strip_list_marker)
-        .filter(|p| !p.is_empty())
-        .map(ToString::to_string)
-        .collect();
-
-    let title = clean_title(raw_title);
+    let title = clean_title(&raw_title);
     let subject = derive_subject(&title);
     let kind = TemplateKind::detect(trimmed);
     let section_count = options.resolved_section_count();
@@ -740,6 +731,129 @@ const GENERIC_SECTIONS: [(&str, &[&str]); 11] = [
 fn strip_list_marker(line: &str) -> &str {
     line.trim_start_matches(['-', '*', '•', '#', '>', '–'])
         .trim()
+}
+
+/// Upper bound on words kept for a generated title so a long run-on
+/// brief can never blow past the title card. Generous enough that a
+/// natural headline ("Pitch deck for an indie coffee roaster") is kept
+/// whole.
+const TITLE_MAX_WORDS: usize = 12;
+
+/// Split a free-form brief into a concise title source plus a list of
+/// talking points.
+///
+/// A multi-line brief keeps its first line as the title and folds the
+/// remaining lines (list markers stripped) into points. A single
+/// paragraph is segmented on sentence boundaries: the first sentence
+/// (trimmed to its leading clause) becomes the title and every
+/// remaining sentence is broken into comma-separated clauses that
+/// become points. This way a one-line prompt yields a tight headline
+/// plus on-topic content instead of dumping the whole paragraph into
+/// the title card.
+fn split_brief(brief: &str) -> (String, Vec<String>) {
+    let mut lines = brief.lines().map(str::trim).filter(|l| !l.is_empty());
+    let first = lines.next().unwrap_or("");
+    let rest_lines: Vec<&str> = lines.collect();
+
+    if !rest_lines.is_empty() {
+        let points = rest_lines
+            .into_iter()
+            .map(strip_list_marker)
+            .filter(|p| !p.is_empty())
+            .map(ToString::to_string)
+            .collect();
+        return (leading_clause(first), points);
+    }
+
+    let sentences = split_sentences(first);
+    let title = leading_clause(sentences.first().map_or(first, String::as_str));
+    let points = sentences
+        .iter()
+        .skip(1)
+        .flat_map(|s| split_clauses(s))
+        .collect();
+    (title, points)
+}
+
+/// Segment text into sentences on `.`/`!`/`?`, keeping non-empty
+/// trimmed fragments. Abbreviations are not special-cased — the
+/// planner only needs rough segmentation.
+fn split_sentences(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    for ch in text.chars() {
+        if matches!(ch, '.' | '!' | '?') {
+            let s = cur.trim();
+            if !s.is_empty() {
+                out.push(s.to_string());
+            }
+            cur.clear();
+        } else {
+            cur.push(ch);
+        }
+    }
+    let s = cur.trim();
+    if !s.is_empty() {
+        out.push(s.to_string());
+    }
+    out
+}
+
+/// Break a sentence into clean talking points on commas, dropping a
+/// leading conjunction and common lead-in verbs ("cover", "including",
+/// …) so "Cover our origin story, the beans we source, and the ask"
+/// folds into tidy phrases.
+fn split_clauses(sentence: &str) -> Vec<String> {
+    sentence
+        .split(',')
+        .map(|clause| {
+            let clause = clause.trim();
+            let clause = clause
+                .strip_prefix("and ")
+                .or_else(|| clause.strip_prefix("And "))
+                .unwrap_or(clause)
+                .trim();
+            strip_leadin(clause)
+        })
+        .filter(|clause| clause.split_whitespace().count() >= 2)
+        .map(ToString::to_string)
+        .collect()
+}
+
+/// Strip a leading imperative lead-in verb from a clause so the
+/// remaining phrase reads as a noun-led bullet.
+fn strip_leadin(clause: &str) -> &str {
+    const LEADINS: [&str; 12] = [
+        "cover ",
+        "covering ",
+        "include ",
+        "including ",
+        "discuss ",
+        "discussing ",
+        "highlight ",
+        "highlighting ",
+        "explain ",
+        "explaining ",
+        "showcase ",
+        "present ",
+    ];
+    let lower = clause.to_ascii_lowercase();
+    for prefix in LEADINS {
+        if lower.starts_with(prefix) {
+            return clause[prefix.len()..].trim_start();
+        }
+    }
+    clause
+}
+
+/// Reduce a sentence to its leading clause (up to the first comma) and
+/// cap it at [`TITLE_MAX_WORDS`] so the title card never overflows.
+fn leading_clause(sentence: &str) -> String {
+    let head = sentence.split(',').next().unwrap_or(sentence).trim();
+    head.split_whitespace()
+        .take(TITLE_MAX_WORDS)
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Clean a raw first line into a presentable title: strip markdown
@@ -1463,6 +1577,67 @@ mod tests {
             .iter()
             .any(|b| b.contains("single-origin beans")));
         assert!(all_bullets.iter().any(|b| b.contains("small batches")));
+    }
+
+    #[test]
+    fn single_paragraph_brief_yields_concise_title_and_folds_points() {
+        let brief = "Pitch deck for an indie coffee roaster. Cover our origin \
+                     story, the single-origin beans we source, our small-batch \
+                     roasting process, the neighborhood cafe experience, early \
+                     traction, and the investment ask.";
+        let opts = ThemedDesignOptions {
+            section_count: Some(6),
+            ..Default::default()
+        };
+        let outline = outline_from_brief(brief, opts).unwrap();
+        // The title is the leading headline, NOT the whole paragraph.
+        assert_eq!(outline.title, "Pitch deck for an indie coffee roaster");
+        assert!(outline.title.split_whitespace().count() <= TITLE_MAX_WORDS);
+        // The trailing sentence's clauses fold into slide bullets, with
+        // lead-in verbs and conjunctions stripped.
+        let all_bullets: Vec<&String> = outline.slides.iter().flat_map(|s| &s.bullets).collect();
+        assert!(all_bullets.iter().any(|b| b.contains("origin story")));
+        assert!(all_bullets
+            .iter()
+            .any(|b| b.contains("single-origin beans")));
+        assert!(all_bullets.iter().any(|b| b.contains("investment ask")));
+        // No folded bullet keeps the "Cover " lead-in or the trailing
+        // "and " conjunction.
+        assert!(!all_bullets.iter().any(|b| b.starts_with("Cover ")));
+        assert!(!all_bullets.iter().any(|b| b.starts_with("and ")));
+    }
+
+    #[test]
+    fn long_run_on_title_is_capped_to_fit() {
+        let brief = "An exhaustive end to end overview of our brand new fully \
+                     integrated cloud native analytics platform launch";
+        let outline = outline_from_brief(brief, ThemedDesignOptions::default()).unwrap();
+        assert!(
+            outline.title.split_whitespace().count() <= TITLE_MAX_WORDS,
+            "title not capped: {}",
+            outline.title
+        );
+    }
+
+    #[test]
+    fn title_never_overflows_title_card_for_paragraph_brief() {
+        let brief = "Pitch deck for an indie coffee roaster. Cover our origin \
+                     story, the single-origin beans we source, our small-batch \
+                     roasting process, the neighborhood cafe experience, early \
+                     traction, and the investment ask.";
+        let opts = ThemedDesignOptions {
+            section_count: Some(6),
+            ..Default::default()
+        };
+        let outline = outline_from_brief(brief, opts).unwrap();
+        let design = generate_design(&outline, opts);
+        let title_page = &design.pages[0];
+        for el in &title_page.elements {
+            assert!(
+                el.y + el.height <= title_page.height + 1.0,
+                "title-card element overflows page bottom: {el:?}"
+            );
+        }
     }
 
     #[test]

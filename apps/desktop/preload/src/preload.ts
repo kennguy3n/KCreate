@@ -35,6 +35,10 @@ import type {
   InteractionAction,
   InteractionBridge,
   InteractionTrigger,
+  AssetsBridge,
+  AssetCategoryInfo,
+  AssetSummary,
+  InsertedAsset,
   LayoutBridge,
   LayoutStudioBridge,
   LayoutTemplate,
@@ -1618,6 +1622,55 @@ const layoutStudio: LayoutStudioBridge = {
       newParent,
       index,
     );
+  },
+};
+
+// ---------------------------------------------------------------------------
+// G6 — Elements / asset library. The bridge returns JSON strings which
+// we parse into the shared wire types.
+// ---------------------------------------------------------------------------
+
+const assets: AssetsBridge = {
+  async categories(): Promise<AssetCategoryInfo[]> {
+    const json = (await ipcRenderer.invoke(
+      "kcreate/assets/categories",
+    )) as string;
+    return JSON.parse(json) as AssetCategoryInfo[];
+  },
+  async list(category?: string | null): Promise<AssetSummary[]> {
+    const json = (await ipcRenderer.invoke(
+      "kcreate/assets/list",
+      category ?? undefined,
+    )) as string;
+    return JSON.parse(json) as AssetSummary[];
+  },
+  async search(
+    query: string,
+    category?: string | null,
+  ): Promise<AssetSummary[]> {
+    const json = (await ipcRenderer.invoke(
+      "kcreate/assets/search",
+      query,
+      category ?? undefined,
+    )) as string;
+    return JSON.parse(json) as AssetSummary[];
+  },
+  async insert(
+    assetId: string,
+    parentId: string | null,
+    x: number,
+    y: number,
+    targetSize: number,
+  ): Promise<InsertedAsset> {
+    const json = (await ipcRenderer.invoke(
+      "kcreate/assets/insert",
+      assetId,
+      parentId,
+      x,
+      y,
+      targetSize,
+    )) as string;
+    return JSON.parse(json) as InsertedAsset;
   },
 };
 
@@ -3828,6 +3881,7 @@ contextBridge.exposeInMainWorld("kcreate", {
   interaction,
   masterPage,
   layoutStudio,
+  assets,
   templateMarketplace,
   audit,
   thumbnail,

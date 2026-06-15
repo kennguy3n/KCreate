@@ -278,6 +278,21 @@ const defaultsByMethod: Record<string, () => unknown> = {
   // "Open download page" fallback. Main-process validation against
   // the host allow-list is the real defence; the stub just records.
   "system.openExternal": () => undefined,
+  // G6 — Elements / asset library. The catalog is static, so the
+  // defaults return an empty set; AssetsPanel tests override these
+  // with a fixture catalog to assert search / insert behaviour.
+  "assets.categories": () => [],
+  "assets.list": () => [],
+  "assets.search": () => [],
+  "assets.insert": () => ({
+    groupId: "group-0",
+    nodeIds: ["node-0"],
+    name: "asset",
+    x: 0,
+    y: 0,
+    width: 0,
+    height: 0,
+  }),
   // Workstream G2 — ready-made template library. `TemplateGallery`
   // mounts straight into `list` + `thumbnail`; defaults keep the
   // component mountable (empty gallery, fallback thumbnails) so tests
@@ -379,6 +394,7 @@ export function installKcreateStub(): KcreateStubHandle {
     aiModel: namespace("aiModel"),
     onboarding: namespace("onboarding"),
     system: namespace("system"),
+    assets: namespace("assets"),
     // Workstream G2 — ready-made template library bridge.
     templateMarketplace: namespace("templateMarketplace"),
     setLayerColor: (...args: unknown[]): unknown =>

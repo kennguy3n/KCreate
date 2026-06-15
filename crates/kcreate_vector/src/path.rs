@@ -407,6 +407,54 @@ impl VectorPath {
             fill_rule: FillRule::NonZero,
         }
     }
+
+    /// Return a copy of this path with `affine` applied to every
+    /// point. Preserves [`Self::closed`] and [`Self::fill_rule`]; the
+    /// returned path gets a fresh [`Self::id`] so it is a distinct
+    /// geometry instance. Used when stamping a library asset onto the
+    /// canvas: the parsed SVG geometry is scaled to the requested size
+    /// and translated to the drop position in one affine, then baked
+    /// into world coordinates (matching how `canvas_create_rect`
+    /// stores world-space geometry with an identity node transform).
+    #[must_use]
+    pub fn transformed(&self, affine: kurbo::Affine) -> Self {
+        let map = |p: PathPoint| PathPoint::from(affine * kurbo::Point::from(p));
+        let commands = self
+            .commands
+            .iter()
+            .map(|cmd| match *cmd {
+                PathSegment::MoveTo(p) => PathSegment::MoveTo(map(p)),
+                PathSegment::LineTo(p) => PathSegment::LineTo(map(p)),
+                PathSegment::QuadTo { ctrl, end } => PathSegment::QuadTo {
+                    ctrl: map(ctrl),
+                    end: map(end),
+                },
+                PathSegment::CubicTo { ctrl1, ctrl2, end } => PathSegment::CubicTo {
+                    ctrl1: map(ctrl1),
+                    ctrl2: map(ctrl2),
+                    end: map(end),
+                },
+                PathSegment::Close => PathSegment::Close,
+            })
+            .collect();
+        Self {
+            id: Uuid::new_v4(),
+            commands,
+            closed: self.closed,
+            fill_rule: self.fill_rule,
+        }
+    }
+
+    /// Convenience over [`Self::transformed`] for callers that don't
+    /// depend on `kurbo`: apply a uniform `scale` about the origin
+    /// followed by a translation, i.e. `world = local * scale +
+    /// (tx, ty)`. The bridge's asset-insert path uses this to place
+    /// parsed SVG geometry into world space without pulling in the
+    /// `kurbo` types at the call site.
+    #[must_use]
+    pub fn scaled_translated(&self, scale: f64, tx: f64, ty: f64) -> Self {
+        self.transformed(kurbo::Affine::translate((tx, ty)) * kurbo::Affine::scale(scale))
+    }
 }
 
 impl fmt::Display for VectorPath {
@@ -522,6 +570,36 @@ mod tests {
         let p = VectorPath::new(Vec::new());
         let b = p.bounds();
         assert!(b.is_empty());
+    }
+
+    #[test]
+    fn transformed_scales_and_translates_bounds() {
+        let r = rect_path(10.0, 10.0); // (0,0)-(10,10)
+        let affine = kurbo::Affine::translate((100.0, 50.0)) * kurbo::Affine::scale(2.0);
+        let t = r.transformed(affine);
+        let b = t.bounds();
+        assert!((b.min_x - 100.0).abs() < 1e-6, "min_x = {}", b.min_x);
+        assert!((b.min_y - 50.0).abs() < 1e-6, "min_y = {}", b.min_y);
+        assert!((b.max_x - 120.0).abs() < 1e-6, "max_x = {}", b.max_x);
+        assert!((b.max_y - 70.0).abs() < 1e-6, "max_y = {}", b.max_y);
+        // Topology preserved, fresh id minted.
+        assert_eq!(t.commands.len(), r.commands.len());
+        assert_eq!(t.closed, r.closed);
+        assert_ne!(t.id, r.id);
+    }
+
+    #[test]
+    fn scaled_translated_matches_manual_affine() {
+        // world = local * scale + (tx, ty); placing a 24-unit SVG box
+        // at drop point (200, 120) scaled to fit a 48px target.
+        let r = rect_path(24.0, 24.0); // (0,0)-(24,24)
+        let scale = 48.0 / 24.0;
+        let t = r.scaled_translated(scale, 200.0, 120.0);
+        let b = t.bounds();
+        assert!((b.min_x - 200.0).abs() < 1e-6, "min_x = {}", b.min_x);
+        assert!((b.min_y - 120.0).abs() < 1e-6, "min_y = {}", b.min_y);
+        assert!((b.max_x - 248.0).abs() < 1e-6, "max_x = {}", b.max_x);
+        assert!((b.max_y - 168.0).abs() < 1e-6, "max_y = {}", b.max_y);
     }
 
     /// Regression test for `ANALYSIS_0007` on PR #2.

@@ -7,6 +7,7 @@ import type {
 } from "../../../shared/scene";
 import { colors, radius, spacing } from "../styles/tokens";
 import { ArtboardPanel } from "./ArtboardPanel";
+import { AssetsPanel } from "./AssetsPanel";
 import { BrandKitEditor } from "./BrandKitEditor";
 import { BrandVersionPanel } from "./BrandVersionPanel";
 import { ComponentPanel } from "./ComponentPanel";
@@ -23,6 +24,7 @@ export type LeftPanelTab =
   | "pages"
   | "artboards"
   | "layers"
+  | "elements"
   | "assets"
   | "tokens"
   | "brand";
@@ -99,6 +101,12 @@ export interface LeftPanelProps {
   // that haven't wired these bridges yet keep working; both tabs
   // render their own empty state when not present.
   onDesignSystemStatus?: (msg: string | null) => void;
+
+  // G6 — Elements / asset library. Insert a bundled vector asset
+  // onto the canvas. Optional so callers that haven't wired the
+  // assets bridge keep compiling; the Elements tab still browses the
+  // catalog, it just no-ops the click insert.
+  onInsertElement?: (assetId: string) => void;
 }
 
 export function LeftPanel({
@@ -128,6 +136,7 @@ export function LeftPanel({
   onComponentSwitchVariant,
   onComponentDetach,
   onDesignSystemStatus,
+  onInsertElement,
 }: LeftPanelProps): JSX.Element {
   const [tab, setTab] = useState<LeftPanelTab>("layers");
   // Phase 6 Tasks 27-28 — case-insensitive name filter for the
@@ -156,6 +165,7 @@ export function LeftPanel({
           { id: "pages", label: "Pages", icon: "file-text" },
           { id: "artboards", label: "Artboards", icon: "frame" },
           { id: "layers", label: "Layers", icon: "layers" },
+          { id: "elements", label: "Elements", icon: "sparkles" },
           { id: "assets", label: "Assets", icon: "package" },
           { id: "tokens", label: "Tokens", icon: "variable" },
           { id: "brand", label: "Brand", icon: "palette" },
@@ -236,6 +246,12 @@ export function LeftPanel({
               Drop or import images, fonts, and palettes here.
             </EmptyHint>
           )
+        ) : null}
+        {tab === "elements" ? (
+          <AssetsPanel
+            onInsert={onInsertElement ?? noopArg}
+            onStatus={onDesignSystemStatus ?? noopStatus}
+          />
         ) : null}
         {tab === "tokens" ? (
           <DesignTokenEditor

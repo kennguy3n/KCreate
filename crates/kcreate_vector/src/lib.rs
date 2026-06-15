@@ -25,4 +25,6 @@ pub use snap::{Axis, SnapEngine, SnapGuide, SnapResult, SnapTarget};
 pub use spatial_index::VectorSpatialIndex;
 pub use stroke::{expand_variable_stroke, sample_profile};
 pub use svg_export::{export_svg, export_svg_to_file, SvgExportError};
-pub use svg_import::{import_svg, import_svg_file, SvgImportError};
+pub use svg_import::{
+    import_svg, import_svg_file, import_svg_styled, StyledPath, StyledStroke, SvgImportError,
+};

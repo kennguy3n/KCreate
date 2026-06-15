@@ -22,6 +22,7 @@ import { ConflictToast } from "../components/ConflictToast";
 import { InlineTextEditor } from "../components/InlineTextEditor";
 import { CursorOverlay } from "../components/CursorOverlay";
 import { LeftPanel } from "../components/LeftPanel";
+import { ASSET_DRAG_MIME } from "../components/AssetsPanel";
 import { PageNavigator } from "../components/PageNavigator";
 import { PathfinderPanel } from "../components/PathfinderPanel";
 import { PenOverlay } from "../components/PenOverlay";
@@ -73,6 +74,24 @@ export type { ToolId } from "../contexts/EditorContext";
 
 const CANVAS_WIDTH = 1024;
 const CANVAS_HEIGHT = 640;
+
+// G6 — default longest-edge size (world px) for an element inserted
+// from the Elements library. Scaled into the asset's bundled
+// geometry by `assets::insert`; the asset stays editable so the user
+// can freely resize afterwards.
+const ELEMENT_INSERT_SIZE = 160;
+
+// Drag payloads the canvas drop zone knows how to handle: an OS file
+// drop (image / PDF / SVG import) or an Elements-panel asset drag
+// (`ASSET_DRAG_MIME`). Single source of truth so the dragenter /
+// dragleave hover counter and the dragover drop-target acceptance can
+// never disagree about what counts as a droppable payload — a mismatch
+// would either wedge the hover overlay on or suppress it for valid
+// drags. `DataTransfer.types` is the only payload metadata readable
+// during dragover (the data itself is locked until drop).
+function isAcceptedDrag(dt: DataTransfer): boolean {
+  return dt.types.includes("Files") || dt.types.includes(ASSET_DRAG_MIME);
+}
 
 // Envelope header prefixed to the OS clipboard payload by `handleCopy`
 // and stripped by `handlePaste`. Lets the paste path distinguish a
@@ -1175,22 +1194,83 @@ function EditorPageInner({
 
   // Phase D — drag-hover visual feedback.
   //
-  // `dragHover` flips on the first `dragenter` whose payload contains
-  // Files and off again when the matching `dragleave` (or `drop`)
-  // fires. The DOM emits dragenter / dragleave for EVERY descendant
-  // crossing in addition to the root, so a naive boolean toggles on
-  // and off as the cursor sweeps across nested elements (CanvasHost,
-  // overlays, etc.). We count enters minus leaves on a `useRef`
-  // counter — `dragHover === true` iff `counter > 0`. The counter is
-  // reset to zero in `handleCanvasDrop` regardless of error because a
-  // missed `dragleave` after `drop` would otherwise wedge the overlay
-  // on permanently.
+  // `dragHover` flips on the first `dragenter` whose payload we can
+  // act on — an OS file drop (`Files`) or an Elements-panel asset
+  // drag (`ASSET_DRAG_MIME`) — and off again when the matching
+  // `dragleave` (or `drop`) fires. The DOM emits dragenter /
+  // dragleave for EVERY descendant crossing in addition to the root,
+  // so a naive boolean toggles on and off as the cursor sweeps across
+  // nested elements (CanvasHost, overlays, etc.). We count enters
+  // minus leaves on a `useRef` counter — `dragHover === true` iff
+  // `counter > 0`. The counter is reset to zero in `handleCanvasDrop`
+  // regardless of error because a missed `dragleave` after `drop`
+  // would otherwise wedge the overlay on permanently.
   const [dragHover, setDragHover] = useState(false);
   const dragHoverCountRef = useRef(0);
+  // Read-latest viewport mirror. The insert callbacks need the live
+  // pan / zoom to map a screen point (viewport centre for clicks, the
+  // drop point for drags) to world space, but they MUST NOT depend on
+  // `viewport` directly: `handleInsertElement` is handed to
+  // `LeftPanel`, and re-creating it on every pan / zoom frame would
+  // churn that subtree. Mirroring into a ref keeps the callbacks
+  // reference-stable while still reading the current viewport — the
+  // same pattern as `selectedIdsRef` / `panActiveRef`.
+  const viewportRef = useRef(viewport);
+  useEffect(() => {
+    viewportRef.current = viewport;
+  }, [viewport]);
+
+  // G6 — insert a library element as editable vector node(s) at a
+  // specific world position. Shared by the click path (viewport
+  // centre) and the canvas drop path (drop point). One bridge call →
+  // one undoable op; we then select the new group and pull the tree
+  // so the layers panel + selection overlay reflect the insert. The
+  // `nodes`-keyed sync effect repaints the canvas once the tree lands.
+  const insertElementAt = useCallback(
+    async (assetId: string, worldX: number, worldY: number): Promise<void> => {
+      try {
+        const size = ELEMENT_INSERT_SIZE;
+        // Parent the element to the first artboard — the same target the
+        // file-drop, paste, and duplicate-layer flows resolve — so it
+        // becomes a real artboard child that clips to, exports with, and
+        // moves alongside the page, rather than a loose document-root
+        // node floating outside every artboard. Falls back to the
+        // document root only for artboard-less pages.
+        const parent = artboardsRef.current[0]?.id ?? null;
+        const result = await window.kcreate.assets.insert(
+          assetId,
+          parent,
+          worldX - size / 2,
+          worldY - size / 2,
+          size,
+        );
+        await window.kcreate.canvas.setSelection([result.groupId]);
+        setSelectedIds([result.groupId]);
+        await refreshTree();
+        setStatusMessage(`Inserted ${result.name}`);
+      } catch (e) {
+        setStatusMessage(`insert element failed: ${errorMessage(e)}`);
+      }
+    },
+    [artboardsRef, refreshTree, setSelectedIds, setStatusMessage],
+  );
+
+  // Click-to-insert from the Elements panel: drop at the centre of
+  // the visible viewport. `screen = world * zoom + pan`, so the world
+  // point under the viewport centre is `(centre - pan) / zoom`.
+  const handleInsertElement = useCallback(
+    (assetId: string): void => {
+      const { panX, panY, zoom } = viewportRef.current;
+      const worldX = (CANVAS_WIDTH / 2 - panX) / zoom;
+      const worldY = (CANVAS_HEIGHT / 2 - panY) / zoom;
+      void insertElementAt(assetId, worldX, worldY);
+    },
+    [insertElementAt],
+  );
 
   const handleCanvasDragEnter = useCallback(
     (e: React.DragEvent<HTMLElement>): void => {
-      if (!e.dataTransfer.types.includes("Files")) return;
+      if (!isAcceptedDrag(e.dataTransfer)) return;
       e.preventDefault();
       dragHoverCountRef.current += 1;
       if (dragHoverCountRef.current === 1) setDragHover(true);
@@ -1200,7 +1280,7 @@ function EditorPageInner({
 
   const handleCanvasDragLeave = useCallback(
     (e: React.DragEvent<HTMLElement>): void => {
-      if (!e.dataTransfer.types.includes("Files")) return;
+      if (!isAcceptedDrag(e.dataTransfer)) return;
       e.preventDefault();
       dragHoverCountRef.current = Math.max(0, dragHoverCountRef.current - 1);
       if (dragHoverCountRef.current === 0) setDragHover(false);
@@ -1210,7 +1290,10 @@ function EditorPageInner({
 
   const handleCanvasDragOver = useCallback(
     (e: React.DragEvent<HTMLElement>): void => {
-      if (e.dataTransfer.types.includes("Files")) {
+      // Accept both OS file drops (image / PDF import) and Elements
+      // panel drags (`ASSET_DRAG_MIME`). preventDefault on dragover is
+      // what marks the canvas as a valid drop target.
+      if (isAcceptedDrag(e.dataTransfer)) {
         e.preventDefault();
         // Set the drop effect so the OS shows the "copy" cursor.
         e.dataTransfer.dropEffect = "copy";
@@ -1231,6 +1314,22 @@ function EditorPageInner({
       // browser's default file-handling (which on Chromium navigates
       // the window to a file:// URL, killing the editor session).
       e.preventDefault();
+      // Elements-panel drag: insert the asset as editable vector
+      // node(s) at the exact drop point. `getData` is only readable
+      // inside the drop event (not dragover), which is why this lives
+      // here. Handled before the file early-return because an asset
+      // drag carries no `dataTransfer.files`.
+      const assetId = e.dataTransfer.getData(ASSET_DRAG_MIME);
+      if (assetId) {
+        const rect = e.currentTarget.getBoundingClientRect();
+        const sx = e.clientX - rect.left;
+        const sy = e.clientY - rect.top;
+        const { panX, panY, zoom } = viewportRef.current;
+        const worldX = (sx - panX) / zoom;
+        const worldY = (sy - panY) / zoom;
+        void insertElementAt(assetId, worldX, worldY);
+        return;
+      }
       if (!e.dataTransfer.files || e.dataTransfer.files.length === 0) return;
       const target = artboards[0]?.id ?? null;
       if (!target) {
@@ -1310,7 +1409,7 @@ function EditorPageInner({
         }
       })();
     },
-    [artboards, refreshTree, setStatusMessage],
+    [artboards, refreshTree, setStatusMessage, insertElementAt],
   );
 
   const handleSelect = useCallback(
@@ -2139,6 +2238,7 @@ function EditorPageInner({
             void handleComponentDetach(id);
           }}
           onDesignSystemStatus={setStatusMessage}
+          onInsertElement={handleInsertElement}
         />
         <main
           onDragEnter={handleCanvasDragEnter}

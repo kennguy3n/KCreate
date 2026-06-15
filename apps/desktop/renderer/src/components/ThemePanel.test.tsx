@@ -222,4 +222,39 @@ describe("ThemePanel", () => {
     // The `finally` re-enables the control even on the failure path.
     expect(screen.getByLabelText("Apply Broken Kit")).not.toBeDisabled();
   });
+
+  it("surfaces the kit-specific label when the apply step (not derive) fails", async () => {
+    // Regression for the composed apply: the derive succeeds but the
+    // bridge `theme.apply` throws. Because `handleApplyKit` composes the
+    // non-lifecycle-managing core directly, the failure propagates to
+    // its own catch and is reported as an "Apply kit failed" message —
+    // not the generic "Theme apply failed" that the standalone path
+    // uses. This pins the fix for the swallowed-error review note.
+    const stub = kcreateStub();
+    const kit = emptyKit("kit-11", "Flaky Kit");
+    stub.override("brandKit.list", () => [kit]);
+    stub.override("theme.fromBrandKit", () => makeTheme("kit-theme", "Kit Theme"));
+    stub.override("theme.apply", () => {
+      throw new Error("apply boom");
+    });
+
+    const statuses: (string | null)[] = [];
+    render(<ThemePanel onStatus={(m) => statuses.push(m)} />);
+    await flushAsync();
+
+    fireEvent.click(screen.getByLabelText("Apply Flaky Kit"));
+    await flushAsync();
+
+    // The apply failure is attributed to the kit operation, and the
+    // generic per-theme failure label is NOT used.
+    expect(
+      statuses.some((s) => s?.startsWith("Apply kit failed:")),
+      "apply-step failure surfaces the kit-specific label",
+    ).toBe(true);
+    expect(
+      statuses.some((s) => s?.startsWith("Theme apply failed:")),
+      "the generic per-theme failure label is not used for a kit apply",
+    ).toBe(false);
+    expect(screen.getByLabelText("Apply Flaky Kit")).not.toBeDisabled();
+  });
 });

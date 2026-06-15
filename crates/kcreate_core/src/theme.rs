@@ -294,8 +294,33 @@ impl RadiusScale {
     /// the theme's small / medium / large radii. `full` is intentionally not
     /// produced here (a bare radius can't be distinguished from a large one
     /// without the node's dimensions) — it is available only as a token.
+    ///
+    /// The mapping is **idempotent**: any radius that already equals one of
+    /// this scale's own steps is returned unchanged, so re-applying the same
+    /// theme never drifts a previously-remapped radius through a neighbouring
+    /// bucket. The fixed bucket thresholds classify *fresh* radii by visual
+    /// intent, but several shipped themes have a `medium`/`large` step that
+    /// sits inside a lower bucket's input range (Forest `medium = 8.0` and
+    /// Mono `medium = 4.0` fall in the `<= 8.0` small bucket; Daybreak/Forest/
+    /// Mono `large <= 20.0` fall in the medium bucket). Without the step
+    /// guard those themes would shrink their own medium/large corners on a
+    /// second apply. The guard makes the operation a true fixpoint on the
+    /// scale's outputs for *every* theme — see
+    /// `radius_remap_is_idempotent_for_all_scales`.
     #[must_use]
     pub fn remap(&self, radius: f64) -> f64 {
+        // Idempotency guard: a radius already sitting on one of this scale's
+        // steps (which is exactly the set of values `remap` can emit) is kept
+        // as-is. Re-applying the same theme is therefore a no-op on radii,
+        // while switching themes still re-quantises fresh values below.
+        const STEP_EPS: f64 = 1e-4;
+        for step in [self.none, self.small, self.medium, self.large] {
+            let step = f64::from(step);
+            if (radius - step).abs() <= STEP_EPS {
+                return step;
+            }
+        }
+        // Fresh radius → classify by visual intent.
         if radius <= 0.5 {
             f64::from(self.none)
         } else if radius <= 8.0 {
@@ -1142,6 +1167,46 @@ mod tests {
         assert_eq!(scale.remap(3.0), 4.0);
         assert_eq!(scale.remap(12.0), 10.0);
         assert_eq!(scale.remap(40.0), 20.0);
+    }
+
+    #[test]
+    fn radius_remap_is_idempotent_for_all_scales() {
+        // Re-applying a theme must never drift corner radii: every value the
+        // remap can emit (the scale's own steps) has to map back to itself,
+        // and remap(remap(x)) == remap(x) for any input. This caught a real
+        // latent bug — Forest (medium = 8.0) and Mono (medium = 4.0) have a
+        // medium step inside the `<= 8.0` small bucket, and Daybreak/Forest/
+        // Mono have a large step `<= 20.0` inside the medium bucket, so a
+        // second apply would shrink their own corners without the step guard.
+        let mut scales: Vec<RadiusScale> = builtin_themes().into_iter().map(|t| t.radii).collect();
+        // Custom / brand-kit themes reuse the default radii, so the derived
+        // path covers them too.
+        scales.push(Theme::derive_from_palette("probe", &[(solid("#2563EB"), 1.0)]).radii);
+        scales.push(
+            Theme::from_brand_kit(&Theme::builtin("grape").expect("grape").to_brand_kit()).radii,
+        );
+
+        for scale in scales {
+            // Each emittable step is a fixpoint.
+            for step in [scale.none, scale.small, scale.medium, scale.large] {
+                let v = f64::from(step);
+                assert!(
+                    (scale.remap(v) - v).abs() < 1e-6,
+                    "scale step {v} must be a remap fixpoint, got {}",
+                    scale.remap(v),
+                );
+            }
+            // remap is idempotent across a sweep of fresh inputs (0..=40 by 0.5).
+            for i in 0..=80 {
+                let x = f64::from(i) * 0.5;
+                let once = scale.remap(x);
+                let twice = scale.remap(once);
+                assert!(
+                    (twice - once).abs() < 1e-6,
+                    "remap not idempotent at {x}: once={once}, twice={twice}",
+                );
+            }
+        }
     }
 
     #[test]

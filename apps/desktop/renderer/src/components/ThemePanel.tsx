@@ -141,20 +141,35 @@ export function ThemePanel({ onStatus, onApplied }: ThemePanelProps): JSX.Elemen
     })();
   }, [loadThemes, loadKits]);
 
+  // Core restyle step: announce the "applying…" status, invoke the
+  // bridge, surface the success report, and notify the host. It does
+  // NOT manage the busy/error lifecycle and lets failures propagate,
+  // so it composes cleanly inside both the standalone `applyTheme`
+  // path and the two-step `handleApplyKit` path (derive → apply)
+  // without double-managing `busy` or swallowing the error — each
+  // caller owns its own try/catch/finally and surfaces a
+  // context-specific failure label.
+  const performApply = useCallback(
+    async (theme: Theme, statusLabel?: string): Promise<void> => {
+      onStatus?.(statusLabel ?? `Theme: applying “${theme.name}”…`);
+      const r = await window.kcreate.theme.apply(theme);
+      setReport(r);
+      onStatus?.(
+        `Applied “${r.themeName}”: ${r.affectedNodes} nodes — ` +
+          `${r.recoloredFills} fills, ${r.recoloredStrokes} strokes, ` +
+          `${r.restyledText} text.`,
+      );
+      onApplied?.();
+    },
+    [onStatus, onApplied],
+  );
+
   const applyTheme = useCallback(
-    async (theme: Theme, statusLabel?: string) => {
+    async (theme: Theme, statusLabel?: string): Promise<void> => {
       setBusy(true);
       setError(null);
-      onStatus?.(statusLabel ?? `Theme: applying “${theme.name}”…`);
       try {
-        const r = await window.kcreate.theme.apply(theme);
-        setReport(r);
-        onStatus?.(
-          `Applied “${r.themeName}”: ${r.affectedNodes} nodes — ` +
-            `${r.recoloredFills} fills, ${r.recoloredStrokes} strokes, ` +
-            `${r.restyledText} text.`,
-        );
-        onApplied?.();
+        await performApply(theme, statusLabel);
       } catch (e) {
         const msg = errMsg(e);
         setError(msg);
@@ -163,7 +178,7 @@ export function ThemePanel({ onStatus, onApplied }: ThemePanelProps): JSX.Elemen
         setBusy(false);
       }
     },
-    [onStatus, onApplied],
+    [performApply, onStatus],
   );
 
   const handleApplySelected = useCallback(() => {
@@ -280,9 +295,14 @@ export function ThemePanel({ onStatus, onApplied }: ThemePanelProps): JSX.Elemen
         onStatus?.(label);
         try {
           const theme = await window.kcreate.theme.fromBrandKit(kit);
-          // Pass the brand-kit label through so applyTheme's own
-          // "applying…" status doesn't clobber the kit-specific one.
-          await applyTheme(theme, label);
+          // Compose the non-lifecycle-managing core directly (rather
+          // than `applyTheme`) so this two-step op keeps a single
+          // busy/error scope and ANY failure — the derive OR the
+          // apply — surfaces the kit-specific label below instead of
+          // applyTheme's generic "Theme apply failed". The `label`
+          // pass-through also keeps the kit-specific "applying…"
+          // status from being clobbered by the per-theme default.
+          await performApply(theme, label);
         } catch (e) {
           const msg = errMsg(e);
           setError(msg);
@@ -292,7 +312,7 @@ export function ThemePanel({ onStatus, onApplied }: ThemePanelProps): JSX.Elemen
         }
       })();
     },
-    [applyTheme, onStatus],
+    [performApply, onStatus],
   );
 
   // Draft mutators (operate on the working copy; persisted on Save).

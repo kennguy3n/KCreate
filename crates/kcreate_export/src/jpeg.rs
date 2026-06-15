@@ -9,7 +9,7 @@ use std::path::Path;
 
 use image::{codecs::jpeg::JpegEncoder, ColorType, ImageEncoder};
 use kcreate_renderer::geometry::Color;
-use kcreate_renderer::{initialize, Scene};
+use kcreate_renderer::{initialize, Scene, Vec2};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -99,6 +99,9 @@ pub fn export_jpeg_to_bytes(
     scene.clear_color = bg;
 
     let ctx = initialize(final_w, final_h)?;
+    // Supersample at `scale`: zoom the viewport so scene units map to
+    // `scale` pixels each, filling the enlarged buffer (see png.rs).
+    ctx.set_viewport(Vec2::ZERO, options.scale);
     let _frame_id = ctx.render_frame(&scene)?;
     let rgba: Vec<u8> = {
         let frame = ctx.latest_frame().ok_or(JpegExportError::NoFrame)?;
@@ -192,5 +195,39 @@ mod tests {
         let bytes = export_jpeg_to_bytes(&empty_scene(), &opts).expect("jpeg");
         // JPEG SOI marker.
         assert_eq!(&bytes[0..2], &[0xFF, 0xD8]);
+    }
+
+    #[test]
+    fn scale_supersamples_content_instead_of_padding() {
+        use kcreate_renderer::geometry::{Rect, Style};
+        use kcreate_renderer::scene::{Object, ObjectKind};
+
+        let mut scene = Scene::new(Color::rgba(0.0, 0.0, 0.0, 1.0));
+        scene.add_object(Object::new(
+            ObjectKind::Rect(Rect::new(0.0, 0.0, 16.0, 16.0)),
+            Style {
+                fill: Some(Color::rgba(1.0, 0.0, 0.0, 1.0)),
+                stroke: None,
+            },
+        ));
+        let opts = JpegExportOptions {
+            width: 16,
+            height: 16,
+            scale: 2.0,
+            quality: 95,
+            background: Some(Color::rgba(0.0, 0.0, 0.0, 1.0)),
+        };
+        let bytes = export_jpeg_to_bytes(&scene, &opts).expect("jpeg");
+        let decoded = image::load_from_memory(&bytes)
+            .expect("decode jpeg")
+            .to_rgba8();
+        assert_eq!(decoded.dimensions(), (32, 32));
+        // The far corner would be empty padding without the viewport-zoom fix.
+        // JPEG is lossy, so use looser thresholds than the PNG/WebP checks.
+        let corner = decoded.get_pixel(31, 31);
+        assert!(
+            corner[0] > 170 && corner[1] < 90 && corner[2] < 90,
+            "far corner must be the supersampled fill, got {corner:?}"
+        );
     }
 }

@@ -2297,9 +2297,16 @@ fn prerender_imagery(
 }
 
 /// Map a hero element's world-space box to a sane diffusion output
-/// size: preserve aspect ratio, cap the long edge, floor the short
-/// edge, and round both to a multiple of 64 (the tile size most
-/// diffusion UNets expect).
+/// size: scale the long edge down to `MAX_EDGE`, clamp both edges into
+/// `[MIN_EDGE, MAX_EDGE]`, and snap each to a multiple of 64 (the tile
+/// size most diffusion UNets expect).
+///
+/// Aspect ratio is *approximately* preserved — the independent clamp and
+/// 64-px snap can shift it for extreme boxes (e.g. a very wide banner
+/// has its short edge floored to `MIN_EDGE`). That is intentional and
+/// harmless: the renderer scales the generated raster into the element's
+/// world bounds anyway, so the exact generation dimensions only steer the
+/// diffusion model's composition, not the final placement.
 fn hero_pixel_size(width: f64, height: f64) -> (u32, u32) {
     const MAX_EDGE: f64 = 768.0;
     const MIN_EDGE: f64 = 256.0;

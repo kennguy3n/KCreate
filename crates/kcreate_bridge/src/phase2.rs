@@ -4176,10 +4176,25 @@ pub fn template_instantiate(template_id: Uuid) -> Result<TemplateInstantiateRepo
 /// to `thumbnail.png` (best-effort — a read-only template dir still
 /// serves a freshly rendered preview), and returned.
 pub fn template_thumbnail(template_id: Uuid) -> Result<ThumbnailBytes> {
+    /// The 8-byte PNG file signature (magic number). A valid PNG always
+    /// begins with these bytes; anything else on disk under
+    /// `thumbnail.png` is a truncated / half-written / non-PNG file.
+    const PNG_SIGNATURE: [u8; 8] = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+
     let dir = template_dir_for(template_id)?;
     let thumb_path = dir.join("thumbnail.png");
     if let Ok(bytes) = std::fs::read(&thumb_path) {
-        if !bytes.is_empty() {
+        // Serve the cached file only when it actually looks like a PNG.
+        // A zero-byte or truncated `thumbnail.png` — e.g. the process
+        // was killed mid-write, or a best-effort write into a
+        // momentarily-full/read-only dir left a partial file — would
+        // otherwise be handed to the renderer as a broken `<img>` and,
+        // because `from_png_bytes` can't parse its header, cached
+        // forever with width/height 0. Validate the signature and fall
+        // through to a fresh render on any failure; the render path
+        // below overwrites the bad cache (Devin Review PR #61
+        // ANALYSIS_0003).
+        if bytes.starts_with(&PNG_SIGNATURE) {
             return Ok(ThumbnailBytes::from_png_bytes(bytes));
         }
     }

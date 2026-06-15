@@ -290,7 +290,23 @@ const defaultsByMethod: Record<string, () => unknown> = {
     artboardId: "00000000-0000-0000-0000-000000000000",
     nodeIds: [],
   }),
-  "templateMarketplace.installLocal": () => ({ templates: [] }),
+  // `installLocal` resolves to the installed `TemplateManifest` (not a
+  // list) — mirror that shape so a test that doesn't override it still
+  // type-checks against the real bridge contract. Snake_case fields
+  // match the serde JSON wire format (this is a JSON-string type, not a
+  // `#[napi(object)]`).
+  "templateMarketplace.installLocal": () => ({
+    id: "00000000-0000-0000-0000-000000000000",
+    name: "",
+    description: "",
+    category: "custom",
+    tags: [],
+    thumbnail: null,
+    page_count: 0,
+    author: null,
+    version: "0.0.0",
+    source: null,
+  }),
   "templateMarketplace.remove": () => undefined,
   setLayerColor: () => undefined,
 };

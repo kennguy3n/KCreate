@@ -2866,15 +2866,43 @@ pub fn template_instantiate(template_id: String) -> NapiResult<TemplateInstantia
         .map_err(map_doc_err)
 }
 
+/// `napi::Task` backing `template_thumbnail`. Renders (or reads from
+/// the on-disk cache) a template's gallery preview off the Electron
+/// main thread. The render path is fully stateless: it builds an
+/// ephemeral `DocumentGraph` + `SceneSync` and rasterises through the
+/// CPU (tiny-skia) export pipeline, touching neither the renderer
+/// singleton nor the project workspace — so it is safe on a libuv
+/// worker, exactly as the `prepare_thumbnails_background` prewarm
+/// thread already relies on. A cold render of a full-bleed design
+/// takes tens of milliseconds, which would jank the UI thread if run
+/// synchronously (Devin Review PR #61 ANALYSIS_0005).
+#[derive(Debug)]
+pub struct TemplateThumbnailTask {
+    id: Uuid,
+}
+
+impl Task for TemplateThumbnailTask {
+    type Output = thumbnails::ThumbnailBytes;
+    type JsValue = ThumbnailBytes;
+
+    fn compute(&mut self) -> NapiResult<Self::Output> {
+        phase2::template_thumbnail(self.id).map_err(map_doc_err)
+    }
+
+    fn resolve(&mut self, _env: Env, output: Self::Output) -> NapiResult<Self::JsValue> {
+        Ok(output.into())
+    }
+}
+
 /// Render (or read from a `thumbnail.png` cache) a template's gallery
 /// thumbnail through the export PNG pipeline. Returns the PNG as
 /// base64 bytes + metadata (same wire shape as project thumbnails).
-#[napi]
-pub fn template_thumbnail(template_id: String) -> NapiResult<ThumbnailBytes> {
+/// Resolves on a worker thread so a cold render never blocks the
+/// Electron main process.
+#[napi(ts_return_type = "Promise<ThumbnailBytes>")]
+pub fn template_thumbnail(template_id: String) -> NapiResult<AsyncTask<TemplateThumbnailTask>> {
     let id = parse_uuid(&template_id)?;
-    phase2::template_thumbnail(id)
-        .map(Into::into)
-        .map_err(map_doc_err)
+    Ok(AsyncTask::new(TemplateThumbnailTask { id }))
 }
 
 // ---------------------------------------------------------------------------

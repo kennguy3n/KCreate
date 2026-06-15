@@ -647,7 +647,9 @@ export interface Bridge {
   // Render (or read the cached) thumbnail PNG for a template id. The
   // PNG is produced by the same Rust export pipeline used for project
   // covers, so gallery cards are real previews of the applied design.
-  templateThumbnail(templateId: string): ThumbnailBytesSnake;
+  // Async (napi `AsyncTask`): a cold render runs on a worker thread so
+  // it never blocks the Electron main process.
+  templateThumbnail(templateId: string): Promise<ThumbnailBytesSnake>;
 
   // Phase 6 — audit log
   auditRecord(eventJson: string): string;

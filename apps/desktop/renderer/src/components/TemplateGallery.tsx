@@ -24,7 +24,7 @@
 // component is a presentation + selection layer only, mirroring how
 // HomePage delegates `onOpenEditor`.
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 import type {
   TemplateCategory,
@@ -114,6 +114,27 @@ export function TemplateGallery({
     remix: boolean;
   } | null>(null);
   const [startError, setStartError] = useState<string | null>(null);
+  // Template ids whose thumbnail fetch has already been dispatched.
+  // A `Set` in a ref (not state) so recording a dispatch never
+  // retriggers the fetch effect — that feedback loop is exactly what
+  // caused the O(N²) duplicate-IPC storm (Devin Review PR #61
+  // BUG_0001): keying the effect off `thumbs` re-ran it on every
+  // resolved preview and re-dispatched every still-in-flight id. Each
+  // id is recorded here exactly once for the gallery's lifetime, so a
+  // template is never fetched twice even across filter/search changes.
+  const requestedRef = useRef<Set<string>>(new Set());
+  // True while this component is mounted. Thumbnail promises check it
+  // (instead of a per-effect-run `cancelled` flag) before committing
+  // bytes, so a result dispatched under one filter still lands after a
+  // quick filter change re-runs the effect — only a real unmount drops
+  // it.
+  const mountedRef = useRef(true);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
 
   // Debounce the search box. 180ms is long enough to coalesce a burst
   // of keystrokes but short enough to feel instant.
@@ -175,28 +196,29 @@ export function TemplateGallery({
   // render, so re-filtering is cheap. Failures degrade to the tinted
   // fallback tile (never block the grid).
   useEffect(() => {
-    let cancelled = false;
     for (const template of templates) {
-      if (template.id in thumbs) continue;
+      if (requestedRef.current.has(template.id)) continue;
+      // Record the dispatch *before* awaiting so a re-render mid-flight
+      // can't double-fire it. `thumbs` is intentionally NOT a dependency
+      // (and no longer read here): the persistent ref is the single
+      // source of truth for "already requested".
+      requestedRef.current.add(template.id);
       void window.kcreate.templateMarketplace
         .thumbnail(template.id)
         .then((bytes) => {
-          if (cancelled) return;
+          if (!mountedRef.current) return;
           setThumbs((prev) =>
             template.id in prev ? prev : { ...prev, [template.id]: bytes },
           );
         })
         .catch(() => {
-          if (cancelled) return;
+          if (!mountedRef.current) return;
           setThumbs((prev) =>
             template.id in prev ? prev : { ...prev, [template.id]: null },
           );
         });
     }
-    return () => {
-      cancelled = true;
-    };
-  }, [templates, thumbs]);
+  }, [templates]);
 
   const selected = useMemo(
     () => templates.find((t) => t.id === selectedId) ?? null,
@@ -243,6 +265,10 @@ export function TemplateGallery({
         <button
           type="button"
           onClick={onBack}
+          // Lock navigation while a "Start from template" round-trip is
+          // in flight: leaving mid-instantiate would orphan the scratch
+          // project the host is populating (Devin Review PR #61).
+          disabled={starting !== null}
           data-testid="kcreate-template-back"
           aria-label="Back to home"
           style={{
@@ -254,7 +280,8 @@ export function TemplateGallery({
             borderRadius: radius.md,
             padding: `${spacing.xs}px ${spacing.sm}px`,
             color: colors.text,
-            cursor: "pointer",
+            cursor: starting ? "default" : "pointer",
+            opacity: starting ? 0.7 : 1,
             fontSize: 13,
           }}
         >

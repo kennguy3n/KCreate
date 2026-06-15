@@ -6337,29 +6337,88 @@ pub fn template_instantiate_items(
         None => ws.project.add_page("Page 1")?,
     };
 
-    // Auto-position the artboard so repeated "Start from template"
-    // clicks lay designs out left-to-right instead of stacking.
-    let origin_x = next_artboard_x(&ws.project.document, resolved_page);
-    let origin_y = 0.0_f64;
-    let bounds = kcreate_core::node::Bounds::new(origin_x, origin_y, width, height);
-    let artboard_id = ws
-        .project
-        .document
-        .create_artboard(resolved_page, name, bounds)?;
-    let artboard_snapshot = ws
-        .project
-        .document
-        .get_node(artboard_id)
-        .map_or(serde_json::Value::Null, |n| {
-            serde_json::to_value(n).unwrap_or(serde_json::Value::Null)
-        });
-    ws.project.execute_operation(Operation::new(
-        "user",
-        "artboard_create",
-        serde_json::Value::Null,
-        artboard_snapshot,
-        vec![artboard_id],
-    ));
+    // "Start from template" almost always runs against a brand-new
+    // scratch project, which `project_create` seeds with a single
+    // *empty* default artboard at the origin. Appending a second
+    // artboard beside it (the general insert-into-existing-work case)
+    // would strand the design off-screen: the editor opens centred on
+    // the origin and the user sees the blank default instead of their
+    // template. So when the target page holds exactly one artboard and
+    // it has no children, treat the template as the document itself —
+    // reuse that artboard in place (resized + renamed to the template)
+    // rather than creating a new one. Any other shape (a populated
+    // artboard, or several) means we're inserting into existing work,
+    // so we append left-to-right as before.
+    let reuse_target = {
+        let artboards = ws.project.document.list_artboards(resolved_page);
+        match artboards.as_slice() {
+            [only] if only.children.is_empty() => Some((only.id, only.bounds.x, only.bounds.y)),
+            _ => None,
+        }
+    };
+    let (artboard_id, origin_x, origin_y) = match reuse_target {
+        Some((id, x, y)) => {
+            // Resize the pristine default artboard to the template's
+            // canvas and rename it so the layer tree / page navigator
+            // reads as the template rather than "Page 1 / Artboard 1".
+            let before = ws
+                .project
+                .document
+                .get_node(id)
+                .map_or(serde_json::Value::Null, |n| {
+                    serde_json::to_value(n).unwrap_or(serde_json::Value::Null)
+                });
+            ws.project
+                .document
+                .resize_artboard(id, kcreate_core::node::Bounds::new(x, y, width, height))?;
+            if let Some(node) = ws.project.document.get_node_mut(id) {
+                node.name = name.to_string();
+                node.touch();
+            }
+            let after = ws
+                .project
+                .document
+                .get_node(id)
+                .map_or(serde_json::Value::Null, |n| {
+                    serde_json::to_value(n).unwrap_or(serde_json::Value::Null)
+                });
+            ws.project.execute_operation(Operation::new(
+                "user",
+                "artboard_resize",
+                before,
+                after,
+                vec![id],
+            ));
+            (id, x, y)
+        }
+        None => {
+            // Auto-position the artboard so repeated "Start from
+            // template" clicks lay designs out left-to-right instead of
+            // stacking.
+            let origin_x = next_artboard_x(&ws.project.document, resolved_page);
+            let origin_y = 0.0_f64;
+            let bounds = kcreate_core::node::Bounds::new(origin_x, origin_y, width, height);
+            let artboard_id = ws
+                .project
+                .document
+                .create_artboard(resolved_page, name, bounds)?;
+            let artboard_snapshot = ws
+                .project
+                .document
+                .get_node(artboard_id)
+                .map_or(serde_json::Value::Null, |n| {
+                    serde_json::to_value(n).unwrap_or(serde_json::Value::Null)
+                });
+            ws.project.execute_operation(Operation::new(
+                "user",
+                "artboard_create",
+                serde_json::Value::Null,
+                artboard_snapshot,
+                vec![artboard_id],
+            ));
+            (artboard_id, origin_x, origin_y)
+        }
+    };
 
     let mut node_ids = Vec::with_capacity(items.len());
     let mut loop_err: Option<DocumentBridgeError> = None;

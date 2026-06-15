@@ -100,8 +100,23 @@ function clamp(value: number, lo: number, hi: number): number {
   return Math.max(lo, Math.min(hi, value));
 }
 
-function hexToRgb(hex: string): { r: number; g: number; b: number } {
-  const clean = hex.replace("#", "");
+/**
+ * Parse a CSS colour string into 0–255 RGB channels. Handles the two
+ * forms that reach a thumbnail: `#RGB`/`#RRGGBB` hex (the category-tint
+ * fallbacks) and `rgb()/rgba()` (what `resolveAccent` emits from a
+ * template's design tokens). The alpha of an `rgba()` is dropped — these
+ * channels feed colour mixing, where opacity isn't meaningful. Anything
+ * unparseable yields black so a malformed token can't throw mid-render.
+ */
+function parseColor(color: string): { r: number; g: number; b: number } {
+  const fn = color.match(/rgba?\(([^)]+)\)/i);
+  if (fn) {
+    const parts = (fn[1] ?? "").split(",").map((p) => parseFloat(p.trim()));
+    const channel = (v: number | undefined): number =>
+      v !== undefined && Number.isFinite(v) ? clamp(Math.round(v), 0, 255) : 0;
+    return { r: channel(parts[0]), g: channel(parts[1]), b: channel(parts[2]) };
+  }
+  const clean = color.replace("#", "");
   const full =
     clean.length === 3
       ? clean
@@ -119,10 +134,10 @@ function hexToRgb(hex: string): { r: number; g: number; b: number } {
   };
 }
 
-/** Mix `hex` toward `target` by `t` (0 = hex, 1 = target). */
-function mixHex(hex: string, target: string, t: number): string {
-  const a = hexToRgb(hex);
-  const b = hexToRgb(target);
+/** Mix CSS colour `from` toward `target` by `t` (0 = from, 1 = target). */
+function mixColor(from: string, target: string, t: number): string {
+  const a = parseColor(from);
+  const b = parseColor(target);
   const k = clamp(t, 0, 1);
   const r = Math.round(a.r + (b.r - a.r) * k);
   const g = Math.round(a.g + (b.g - a.g) * k);
@@ -277,7 +292,7 @@ function ImageSection({
 }: SectionVisualProps): JSX.Element {
   const { x, y, width, height } = section.bounds;
   const gradientId = `${idPrefix}-img`;
-  const light = mixHex(accent, "#FFFFFF", 0.55);
+  const light = mixColor(accent, "#FFFFFF", 0.55);
   // Picture glyph: a sun disc + two mountains, scaled to the block.
   const cx = x + width * 0.32;
   const cy = y + height * 0.34;
@@ -317,7 +332,7 @@ function ChartSection({ section, accent }: SectionVisualProps): JSX.Element {
   const barW = (width - gap * (barCount - 1)) / barCount;
   const heights = [0.45, 0.7, 0.55, 0.85, 0.65, 1];
   const usableH = height * 0.82;
-  const light = mixHex(accent, "#FFFFFF", 0.4);
+  const light = mixColor(accent, "#FFFFFF", 0.4);
   const bars: JSX.Element[] = [];
   for (let i = 0; i < barCount; i += 1) {
     const frac = heights[i] ?? 0.6;
@@ -394,7 +409,7 @@ function PageNumberSection({
         width={width}
         height={Math.max(2, height * 0.7)}
         rx={Math.max(2, height * 0.35)}
-        fill={mixHex(accent, "#FFFFFF", 0.82)}
+        fill={mixColor(accent, "#FFFFFF", 0.82)}
       />
       <text
         x={x + width * 0.5}

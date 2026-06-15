@@ -195,6 +195,35 @@ describe("LayoutThumbnail", () => {
     }
   });
 
+  it("mixes an rgba() design-token accent correctly (no garbled hex parse)", () => {
+    // When a template carries design tokens, resolveAccent returns an
+    // rgba(...) string. The image-section gradient's light stop is mixed
+    // from that accent toward white; parsing it as hex would garble the
+    // colour (rgba(255,0,0,1) → a green tint). Assert the real ramp.
+    const tokens: DesignTokens = {
+      colors: { primary: { r: 1, g: 0, b: 0, a: 1 } },
+      typography: {},
+      spacing: {},
+      radii: {},
+      shadows: {},
+    };
+    const imagePage: TemplatePageDef = {
+      name: "Cover",
+      page_size: { kind: "a4" },
+      orientation: "landscape",
+      sections: [section("image", 50, 50, 500, 380)],
+    };
+    const { container } = render(
+      <LayoutThumbnail page={imagePage} accent="#0D9488" tokens={tokens} />,
+    );
+    const stops = Array.from(container.querySelectorAll("stop")).map((s) =>
+      s.getAttribute("stop-color"),
+    );
+    // First stop is the accent itself; second is the white-mixed light tint.
+    expect(stops[0]).toBe("rgba(255, 0, 0, 1)");
+    expect(stops[1]).toBe("rgb(255, 140, 140)");
+  });
+
   it("renders overlay children (the page-count pill)", () => {
     const { getByText } = render(
       <LayoutThumbnail page={deckPage} accent="#7E22CE">

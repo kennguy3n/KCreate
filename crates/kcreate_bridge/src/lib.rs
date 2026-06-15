@@ -46,6 +46,7 @@ pub mod thumbnails;
 pub mod vector_ops;
 pub mod wire;
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::str::FromStr;
 
@@ -57,9 +58,9 @@ use napi_derive::napi;
 use uuid::Uuid;
 
 use crate::document::{
-    BoundsInfo as CoreBoundsInfo, CreateNodeProps, DocumentBridgeError, NodeInfo as CoreNodeInfo,
-    ProjectInfo as CoreProjectInfo, RuntimeStatus as CoreRuntimeStatus,
-    UndoRedoOutcome as CoreUndoRedoOutcome, UpdateNodeProps,
+    BoundsInfo as CoreBoundsInfo, ComponentInstanceInfo as CoreComponentInstanceInfo,
+    CreateNodeProps, DocumentBridgeError, NodeInfo as CoreNodeInfo, ProjectInfo as CoreProjectInfo,
+    RuntimeStatus as CoreRuntimeStatus, UndoRedoOutcome as CoreUndoRedoOutcome, UpdateNodeProps,
 };
 use crate::state::{
     AcquiredFrame as CoreAcquiredFrame, BridgeError, RendererFrameInfo as CoreFrameInfo,
@@ -450,6 +451,33 @@ impl From<CoreBoundsInfo> for Bounds {
     }
 }
 
+/// Compact snapshot of a [`kcreate_core::ComponentInstance`] for the
+/// host's layer / component panels. Mirrors
+/// [`crate::document::ComponentInstanceInfo`]; the UUIDs are carried as
+/// hex strings (the renderer keys components by their string id) and
+/// `overrides` is a free-form JSON object (per-variant property
+/// overrides). napi-rs emits the snake_case field identifiers as
+/// camelCase (`definition_id` → `definitionId`,
+/// `active_variant_id` → `activeVariantId`), matching
+/// `shared/scene.ts::ComponentInstanceInfo`.
+#[napi(object)]
+#[derive(Debug, Clone)]
+pub struct ComponentInstanceInfo {
+    pub definition_id: String,
+    pub active_variant_id: String,
+    pub overrides: HashMap<String, serde_json::Value>,
+}
+
+impl From<CoreComponentInstanceInfo> for ComponentInstanceInfo {
+    fn from(c: CoreComponentInstanceInfo) -> Self {
+        Self {
+            definition_id: c.definition_id.to_string(),
+            active_variant_id: c.active_variant_id.to_string(),
+            overrides: c.overrides,
+        }
+    }
+}
+
 #[napi(object)]
 #[derive(Debug, Clone)]
 pub struct NodeInfo {
@@ -478,6 +506,20 @@ pub struct NodeInfo {
     /// every renderer panel onto `Number(node.version)` conversions
     /// and break the existing `NodeInfo: { version: number }` shape.
     pub version: f64,
+    /// Present (non-`null`) iff `node_type == "ComponentLayer"` and the
+    /// node carries a parseable `component_instance` metadata payload.
+    /// The renderer's `ComponentPanel` reads this to drive the variant
+    /// switcher. Carried over the napi boundary as a real object (rather
+    /// than dropped, as it was before) via the `serde-json` napi feature
+    /// — `None` becomes JS `null`.
+    pub component_instance: Option<ComponentInstanceInfo>,
+    /// Free-form metadata bag mirroring `kcreate_core::Node::metadata`.
+    /// Drives `LeftPanel`'s layer-colour tags (`metadata.layerColor`),
+    /// `AIAssistPanel`'s raster intrinsic size (`metadata.raster_image`),
+    /// and `RightPanel`'s auto-layout config (`metadata.layout`). Emitted
+    /// as a real JS object via the `serde-json` napi feature; an empty
+    /// bag is sent as `null` so the host can cheaply skip it.
+    pub metadata: Option<HashMap<String, serde_json::Value>>,
 }
 
 impl From<CoreNodeInfo> for NodeInfo {
@@ -496,6 +538,12 @@ impl From<CoreNodeInfo> for NodeInfo {
             locked: c.locked,
             bounds: c.bounds.into(),
             version: c.version as f64,
+            component_instance: c.component_instance.map(Into::into),
+            metadata: if c.metadata.is_empty() {
+                None
+            } else {
+                Some(c.metadata)
+            },
         }
     }
 }
@@ -5903,6 +5951,99 @@ mod tests {
     use crate::document::{DocumentBridgeError, PathBooleanError};
     use kcreate_core::node::NodeType;
     use uuid::Uuid;
+
+    /// The napi `From<CoreNodeInfo> for NodeInfo` must carry the
+    /// `metadata` bag and the `component_instance` payload across the
+    /// boundary. They were previously dropped, so `getDocumentTree()`
+    /// silently returned nodes with no metadata — breaking `LeftPanel`
+    /// layer-colour tags (`metadata.layerColor`), `AIAssistPanel`
+    /// raster intrinsic size (`metadata.raster_image`), `RightPanel`
+    /// auto-layout config (`metadata.layout`), and the `ComponentPanel`
+    /// variant switcher (`componentInstance`).
+    #[test]
+    fn napi_node_info_carries_metadata_and_component_instance() {
+        let def_id = Uuid::new_v4();
+        let variant_id = Uuid::new_v4();
+        let mut overrides = HashMap::new();
+        overrides.insert("label".to_string(), serde_json::json!("Primary"));
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            "layerColor".to_string(),
+            serde_json::Value::String("blue".to_string()),
+        );
+
+        let core = CoreNodeInfo {
+            id: Uuid::new_v4(),
+            node_type: "ComponentLayer".to_string(),
+            parent_id: None,
+            children: vec![],
+            name: "Button".to_string(),
+            visible: true,
+            locked: false,
+            bounds: CoreBoundsInfo {
+                x: 0.0,
+                y: 0.0,
+                width: 10.0,
+                height: 10.0,
+            },
+            version: 3,
+            component_instance: Some(CoreComponentInstanceInfo {
+                definition_id: def_id,
+                active_variant_id: variant_id,
+                overrides: overrides.clone(),
+            }),
+            metadata: metadata.clone(),
+        };
+
+        let napi: NodeInfo = core.into();
+
+        let carried = napi
+            .metadata
+            .expect("metadata must carry across the boundary");
+        assert_eq!(
+            carried.get("layerColor"),
+            Some(&serde_json::Value::String("blue".to_string())),
+        );
+
+        let inst = napi
+            .component_instance
+            .expect("component_instance must carry across the boundary");
+        assert_eq!(inst.definition_id, def_id.to_string());
+        assert_eq!(inst.active_variant_id, variant_id.to_string());
+        assert_eq!(
+            inst.overrides.get("label"),
+            Some(&serde_json::json!("Primary"))
+        );
+    }
+
+    /// An empty metadata bag is sent as `None` (JS `null`) so the host
+    /// can cheaply skip it, and a non-component node carries no
+    /// `component_instance`.
+    #[test]
+    fn napi_node_info_empty_metadata_is_none() {
+        let core = CoreNodeInfo {
+            id: Uuid::new_v4(),
+            node_type: "VectorLayer".to_string(),
+            parent_id: None,
+            children: vec![],
+            name: "Rect".to_string(),
+            visible: true,
+            locked: false,
+            bounds: CoreBoundsInfo {
+                x: 0.0,
+                y: 0.0,
+                width: 1.0,
+                height: 1.0,
+            },
+            version: 0,
+            component_instance: None,
+            metadata: HashMap::new(),
+        };
+
+        let napi: NodeInfo = core.into();
+        assert!(napi.metadata.is_none());
+        assert!(napi.component_instance.is_none());
+    }
 
     /// Every `PathBooleanError` sub-variant must surface as
     /// `Status::InvalidArg`, not `Status::GenericFailure`.

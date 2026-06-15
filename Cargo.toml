@@ -318,7 +318,7 @@ tempfile = "3"
 # `dyn-symbols` resolves napi symbols at runtime via libloading so the crate
 # can be unit-tested without a live Node.js process providing static symbols
 # at link time. When loaded by Node it transparently uses the host's symbols.
-napi = { version = "2.16", default-features = false, features = ["napi6", "dyn-symbols"] }
+napi = { version = "2.16", default-features = false, features = ["napi6", "dyn-symbols", "serde-json"] }
 napi-derive = "2.16"
 napi-build = "2.1"
 

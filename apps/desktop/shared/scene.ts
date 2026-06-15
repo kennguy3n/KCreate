@@ -400,13 +400,21 @@ export interface NodeInfo {
    * the matching `version: f64` comment on the napi `NodeInfo`.
    */
   version: number;
-  componentInstance?: ComponentInstanceInfo;
+  /**
+   * Per-variant component-instance payload, present only on
+   * `ComponentLayer` nodes carrying a parseable `component_instance`
+   * blob. The napi `NodeInfo` now emits this as a real object (via the
+   * `serde-json` napi feature); its `Option<…>` surfaces as `null` for
+   * non-instance nodes, hence the `| null`.
+   */
+  componentInstance?: ComponentInstanceInfo | null;
   /**
    * Free-form metadata bag mirroring `Node::metadata` on the Rust side.
-   * Elided when empty. Used by panels that need structured payloads
-   * (e.g. the auto-layout config under the `"layout"` key).
+   * Used by panels that need structured payloads (layer colour, raster
+   * intrinsic size, auto-layout config under the `"layout"` key). The
+   * napi boundary sends `null` when the bag is empty, hence `| null`.
    */
-  metadata?: Record<string, unknown>;
+  metadata?: Record<string, unknown> | null;
 }
 
 /**

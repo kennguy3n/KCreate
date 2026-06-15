@@ -49,6 +49,16 @@ type BoundsSnake = {
   height: number;
 };
 
+// Mirror of `crates/kcreate_bridge/src/lib.rs::ComponentInstanceInfo`
+// (a `#[napi(object)]` struct). napi-rs rewrites the snake_case Rust
+// field identifiers to camelCase, so `definition_id` / `active_variant_id`
+// arrive as `definitionId` / `activeVariantId`.
+type ComponentInstanceInfoSnake = {
+  definitionId: string;
+  activeVariantId: string;
+  overrides: Record<string, unknown>;
+};
+
 type NodeInfoSnake = {
   id: string;
   nodeType: string;
@@ -67,6 +77,13 @@ type NodeInfoSnake = {
   /// appear here too to keep the wire shape in full lockstep (AGENTS.md
   /// Rule 4) — the napi struct returns it on every `document_get_tree`.
   version: number;
+  /// Per-variant component-instance payload. Carried as a real object
+  /// via the napi `serde-json` feature; the napi `Option<…>` becomes
+  /// JS `null` when the node isn't a component instance.
+  componentInstance?: ComponentInstanceInfoSnake | null;
+  /// Free-form node metadata bag (layer colour, raster intrinsic size,
+  /// auto-layout config, …). `null` when empty (napi `Option` → `null`).
+  metadata?: Record<string, unknown> | null;
 };
 
 type RuntimeStatusSnake = {

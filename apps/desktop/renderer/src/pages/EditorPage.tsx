@@ -2104,7 +2104,28 @@ function EditorPageInner({
       openAiGenerate,
     ],
   );
-  useShortcuts(shortcutHandlers);
+
+  // While a modal overlay is open it owns the keyboard: the global
+  // editor shortcuts must not fire underneath it. Without this a key
+  // pressed over the discovery welcome / command palette / a dialog
+  // would leak through to the canvas — e.g. Escape would also clear
+  // the selection (`clearSelection`) and a bare "r" would switch tools
+  // behind the modal. `useShortcuts` honours `enabled` at dispatch
+  // time (not attach time), so toggling this never flaps the listener.
+  // The command palette additionally manages its own keys via the
+  // focused input, but gating here keeps the contract explicit and
+  // covers non-Escape collisions too. PrototypePlayer is intentionally
+  // excluded — it is a full-screen mode with its own complete keyboard
+  // handling rather than a transient modal.
+  const blockingOverlayOpen =
+    commandPaletteOpen ||
+    welcomeOpen ||
+    briefOpen ||
+    shortcutsPanelOpen ||
+    templatePickerOpen ||
+    artboardDialogOpen ||
+    magicResizeSource !== null;
+  useShortcuts(shortcutHandlers, !blockingOverlayOpen);
 
   const onZoomToFit = useCallback(() => {
     fitToContent();

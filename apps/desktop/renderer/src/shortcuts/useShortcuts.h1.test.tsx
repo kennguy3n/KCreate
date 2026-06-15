@@ -13,8 +13,14 @@ import { render, fireEvent } from "@testing-library/react";
 import { useShortcuts, type ShortcutHandlers } from "./useShortcuts";
 import { resetShortcutStoreForTests } from "./registry";
 
-function Harness({ handlers }: { handlers: ShortcutHandlers }): JSX.Element {
-  useShortcuts(handlers);
+function Harness({
+  handlers,
+  enabled = true,
+}: {
+  handlers: ShortcutHandlers;
+  enabled?: boolean;
+}): JSX.Element {
+  useShortcuts(handlers, enabled);
   return (
     <div>
       <input data-testid="field" />
@@ -61,5 +67,31 @@ describe("useShortcuts — command palette open chord", () => {
     // listener so Ctrl+K typed mid-edit doesn't hijack the keystroke.
     fireEvent.keyDown(field, { key: "k", ctrlKey: true });
     expect(openCommandPalette).not.toHaveBeenCalled();
+  });
+
+  // Regression — Devin Review BUG_0001: while a modal overlay (e.g. the
+  // first-run discovery welcome) is open, EditorPage passes
+  // `enabled=false`, so global editor shortcuts must NOT fire under the
+  // modal. Otherwise Escape would also clear the selection and a bare
+  // "r" would switch tools behind the overlay.
+  it("suppresses every global shortcut while disabled (modal open)", () => {
+    const clearSelection = vi.fn();
+    const toolRect = vi.fn();
+    const { rerender } = render(
+      <Harness handlers={{ clearSelection, toolRect }} enabled={false} />,
+    );
+    fireEvent.keyDown(document.body, { key: "Escape" });
+    fireEvent.keyDown(document.body, { key: "r" });
+    expect(clearSelection).not.toHaveBeenCalled();
+    expect(toolRect).not.toHaveBeenCalled();
+
+    // Re-enabling (modal closed) restores dispatch on the same window
+    // listener — proving the gate is checked at dispatch time, not at
+    // attach time.
+    rerender(<Harness handlers={{ clearSelection, toolRect }} enabled />);
+    fireEvent.keyDown(document.body, { key: "Escape" });
+    fireEvent.keyDown(document.body, { key: "r" });
+    expect(clearSelection).toHaveBeenCalledTimes(1);
+    expect(toolRect).toHaveBeenCalledTimes(1);
   });
 });

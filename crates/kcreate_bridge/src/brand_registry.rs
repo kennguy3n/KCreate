@@ -164,7 +164,17 @@ fn save_record_in(root: &Path, record: &BrandKitRecord) -> io::Result<()> {
     // Drop any sidecars from a previous save that this kit no longer
     // references (e.g. the user replaced the logo or swapped a font),
     // so the kit directory never grows unbounded across re-saves.
-    prune_stale_sidecars(&dir, &keep)?;
+    //
+    // This is pure housekeeping that runs *after* the manifest + every
+    // referenced blob are already durably on disk, so the save has
+    // logically succeeded by this point. A transient failure while
+    // pruning (e.g. the directory listing itself fails) must NOT be
+    // reported back as a save failure — that would make the caller
+    // (`document::brand_kit_registry_save`) surface a spurious error to
+    // the UI for data that is actually safe, prompting a needless retry.
+    // Hence the entire prune is best-effort, not just the per-file
+    // removals inside it.
+    let _ = prune_stale_sidecars(&dir, &keep);
     Ok(())
 }
 
@@ -424,5 +434,62 @@ mod tests {
             .is_none());
         // Second delete reports "nothing there".
         assert!(!delete_kit_in(dir.path(), kit.id).expect("delete again"));
+    }
+
+    // A failure while pruning stale sidecars must not be reported as a
+    // save failure: the manifest + every referenced blob are already
+    // durably written by the time the prune runs. We force the prune's
+    // directory listing to fail by pre-creating the kit dir without read
+    // permission (write+exec only) — `read_dir` then errors with EACCES,
+    // but the writes inside it still succeed. The save must return `Ok`
+    // and the persisted record must load back intact once we restore
+    // read access.
+    #[cfg(unix)]
+    #[test]
+    fn save_succeeds_even_when_prune_listing_fails() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let kit = sample_kit();
+        let kit_dir = root.path().join(kit.id.to_string());
+        fs::create_dir_all(&kit_dir).expect("mkdir kit dir");
+        // 0o300 = owner write+execute, NO read: writes/renames inside the
+        // directory still work, but `fs::read_dir` (the first thing the
+        // prune does) fails with a permission error.
+        fs::set_permissions(&kit_dir, fs::Permissions::from_mode(0o300)).expect("chmod");
+
+        let logo_id = Uuid::new_v4();
+        let mut kit_with_logo = kit;
+        kit_with_logo.logo_asset_id = Some(logo_id);
+        let record = BrandKitRecord {
+            kit: kit_with_logo.clone(),
+            assets: vec![BrandAssetBlob {
+                asset_id: logo_id,
+                mime: "image/png".into(),
+                bytes: vec![4, 2],
+            }],
+        };
+
+        // Sanity-check the premise: the directory is genuinely unreadable
+        // (so the prune's `read_dir` really does fail), yet the save still
+        // returns Ok because the prune is best-effort.
+        assert!(
+            fs::read_dir(&kit_dir).is_err(),
+            "kit dir should be unreadable for the test premise"
+        );
+        save_record_in(root.path(), &record).expect("save must succeed despite prune failure");
+
+        // Restore read access and confirm the record persisted intact.
+        fs::set_permissions(&kit_dir, fs::Permissions::from_mode(0o700)).expect("restore chmod");
+        let loaded = load_record_in(root.path(), kit_with_logo.id)
+            .expect("load ok")
+            .expect("present");
+        assert_eq!(loaded.kit, kit_with_logo);
+        let logo = loaded
+            .assets
+            .iter()
+            .find(|a| a.asset_id == logo_id)
+            .expect("logo blob");
+        assert_eq!(logo.bytes, vec![4, 2]);
     }
 }

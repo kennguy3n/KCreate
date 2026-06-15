@@ -138,6 +138,11 @@ export interface HomePageProps {
    * a project. The shell routes the user into the editor.
    */
   onBriefApplied?: (result: BriefApplyResult) => void;
+  /**
+   * Fired when the user opens the ready-made template gallery (G2
+   * jump-start). The shell routes to the `TemplateGallery` surface.
+   */
+  onBrowseTemplates?: () => void;
 }
 
 /**
@@ -169,6 +174,7 @@ export function HomePage({
   onOpenEditor,
   onOpenProject,
   onBriefApplied,
+  onBrowseTemplates,
 }: HomePageProps): JSX.Element {
   const [status, setStatus] = useState<RuntimeStatus | null>(null);
   const [statusError, setStatusError] = useState<string | null>(null);
@@ -404,6 +410,12 @@ export function HomePage({
           />
         </Section>
 
+        {onBrowseTemplates ? (
+          <Section title="Start from a template">
+            <TemplateGalleryTile onBrowse={onBrowseTemplates} />
+          </Section>
+        ) : null}
+
         <Section title="Create new">
           <div
             style={{
@@ -505,6 +517,58 @@ function BriefTile({
           {ready
             ? "Describe what you want; the local model fills in the canvas, palette, and starter layers."
             : "Start the local LLM in Model Manager to enable brief-driven setup."}
+        </span>
+      </div>
+    </button>
+  );
+}
+
+function TemplateGalleryTile({
+  onBrowse,
+}: {
+  onBrowse: () => void;
+}): JSX.Element {
+  return (
+    <button
+      type="button"
+      onClick={onBrowse}
+      data-testid="kcreate-template-gallery-tile"
+      style={{
+        textAlign: "left",
+        background: colors.bg,
+        border: `1px solid ${colors.border}`,
+        borderRadius: radius.card,
+        padding: spacing.lg,
+        boxShadow: shadow.card,
+        display: "flex",
+        alignItems: "center",
+        gap: spacing.md,
+        cursor: "pointer",
+      }}
+    >
+      <div
+        aria-hidden="true"
+        style={{
+          width: 44,
+          height: 44,
+          borderRadius: 12,
+          background: colors.accent,
+          color: "white",
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+        }}
+      >
+        <Icon name="layout" size={22} />
+      </div>
+      <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+        <span style={{ fontSize: 15, fontWeight: 600, color: colors.text }}>
+          Browse ready-made templates
+        </span>
+        <span style={{ fontSize: 13, color: colors.textMuted }}>
+          Pick a professionally-designed starter — decks, social posts,
+          mobile UI kits, posters, resumes — and jump straight onto a
+          populated canvas.
         </span>
       </div>
     </button>

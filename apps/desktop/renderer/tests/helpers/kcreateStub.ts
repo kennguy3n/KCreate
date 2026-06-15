@@ -278,6 +278,20 @@ const defaultsByMethod: Record<string, () => unknown> = {
   // "Open download page" fallback. Main-process validation against
   // the host allow-list is the real defence; the stub just records.
   "system.openExternal": () => undefined,
+  // Workstream G2 — ready-made template library. `TemplateGallery`
+  // mounts straight into `list` + `thumbnail`; defaults keep the
+  // component mountable (empty gallery, fallback thumbnails) so tests
+  // that don't drive the catalog stay green. Catalog-driving tests
+  // override `templateMarketplace.list` to return a `TemplateListReport`
+  // and `templateMarketplace.thumbnail` to return `ThumbnailBytes`.
+  "templateMarketplace.list": () => ({ templates: [] }),
+  "templateMarketplace.thumbnail": () => null,
+  "templateMarketplace.instantiate": () => ({
+    artboardId: "00000000-0000-0000-0000-000000000000",
+    nodeIds: [],
+  }),
+  "templateMarketplace.installLocal": () => ({ templates: [] }),
+  "templateMarketplace.remove": () => undefined,
   setLayerColor: () => undefined,
 };
 
@@ -349,6 +363,8 @@ export function installKcreateStub(): KcreateStubHandle {
     aiModel: namespace("aiModel"),
     onboarding: namespace("onboarding"),
     system: namespace("system"),
+    // Workstream G2 — ready-made template library bridge.
+    templateMarketplace: namespace("templateMarketplace"),
     setLayerColor: (...args: unknown[]): unknown =>
       recordCall("setLayerColor", args),
   };

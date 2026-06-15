@@ -1792,6 +1792,21 @@ function registerIpcHandlers(): void {
       requireBridge().templateRemove(templateId);
     },
   );
+  // G2 — "Start from template": pour the template's content.json into
+  // the open workspace as a fresh artboard. Returns the new artboard id
+  // + node ids so the renderer can select/frame the design.
+  ipcMain.handle(
+    "kcreate/template/instantiate",
+    (_e, templateId: string) =>
+      requireBridge().templateInstantiate(templateId),
+  );
+  // G2 — gallery card preview: render (or read cached) thumbnail PNG
+  // for a template id via the shared export pipeline.
+  ipcMain.handle(
+    "kcreate/template/thumbnail",
+    (_e, templateId: string) =>
+      requireBridge().templateThumbnail(templateId),
+  );
   // Phase 6 — Audit log (Tasks 13–14)
   ipcMain.handle(
     "kcreate/audit/record",

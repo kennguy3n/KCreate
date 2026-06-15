@@ -127,7 +127,11 @@ fn map_doc_err(e: DocumentBridgeError) -> NapiError {
             | kcreate_core::MarketplaceError::ManifestParse { .. }
             | kcreate_core::MarketplaceError::TemplateNotFound(_)
             | kcreate_core::MarketplaceError::AlreadyInstalled(_) => Status::InvalidArg,
-            kcreate_core::MarketplaceError::Io(_) => Status::GenericFailure,
+            // Serialize failures only arise when writing a bundled
+            // template's manifest/content during seeding — an internal
+            // bug, not user-correctable; same category as IO failures.
+            kcreate_core::MarketplaceError::Io(_)
+            | kcreate_core::MarketplaceError::Serialize(_) => Status::GenericFailure,
         },
         _ => Status::GenericFailure,
     };
@@ -2828,6 +2832,49 @@ pub fn template_install_local(source_path: String) -> NapiResult<String> {
 pub fn template_remove(template_id: String) -> NapiResult<()> {
     let id = parse_uuid(&template_id)?;
     phase2::template_remove(id).map_err(map_doc_err)
+}
+
+/// Wire-format mirror of [`document::TemplateInstantiateReport`]. Ids
+/// are emitted as hex strings so the renderer can string-compare them
+/// against `ArtboardInfo.id` / `NodeInfo.id`.
+#[napi(object)]
+#[derive(Debug, Clone)]
+pub struct TemplateInstantiateResult {
+    pub artboard_id: String,
+    pub node_ids: Vec<String>,
+}
+
+impl From<document::TemplateInstantiateReport> for TemplateInstantiateResult {
+    fn from(r: document::TemplateInstantiateReport) -> Self {
+        Self {
+            artboard_id: r.artboard_id.to_string(),
+            node_ids: r.node_ids.into_iter().map(|i| i.to_string()).collect(),
+        }
+    }
+}
+
+/// Apply a ready-made template to the currently open project: creates
+/// a new artboard sized to the template and populates it with the
+/// template's design (the "Start from template" entry point). Returns
+/// the new artboard id + content node ids so the renderer can select
+/// or duplicate the result.
+#[napi]
+pub fn template_instantiate(template_id: String) -> NapiResult<TemplateInstantiateResult> {
+    let id = parse_uuid(&template_id)?;
+    phase2::template_instantiate(id)
+        .map(Into::into)
+        .map_err(map_doc_err)
+}
+
+/// Render (or read from a `thumbnail.png` cache) a template's gallery
+/// thumbnail through the export PNG pipeline. Returns the PNG as
+/// base64 bytes + metadata (same wire shape as project thumbnails).
+#[napi]
+pub fn template_thumbnail(template_id: String) -> NapiResult<ThumbnailBytes> {
+    let id = parse_uuid(&template_id)?;
+    phase2::template_thumbnail(id)
+        .map(Into::into)
+        .map_err(map_doc_err)
 }
 
 // ---------------------------------------------------------------------------

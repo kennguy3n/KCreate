@@ -659,6 +659,11 @@ pub enum TemplateCategory {
     Brochure,
     Flyer,
     Report,
+    Presentation,
+    SocialMedia,
+    MobileApp,
+    Resume,
+    Poster,
     Custom,
 }
 

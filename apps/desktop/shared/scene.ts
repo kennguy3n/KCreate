@@ -1928,6 +1928,11 @@ export type TemplateCategory =
   | "brochure"
   | "flyer"
   | "report"
+  | "presentation"
+  | "social_media"
+  | "mobile_app"
+  | "resume"
+  | "poster"
   | "custom";
 
 export type SectionKind =
@@ -2061,6 +2066,18 @@ export interface TemplateListReport {
   templates: TemplateManifest[];
 }
 
+/**
+ * Mirror of `kcreate_bridge::lib::TemplateInstantiateResult` (a
+ * `#[napi(object)]` so the fields arrive camelCased). Returned by
+ * `templateMarketplace.instantiate` — the artboard the template was
+ * poured into plus every node id created, so the renderer can select
+ * and frame the freshly instantiated design.
+ */
+export interface TemplateInstantiateReport {
+  artboardId: string;
+  nodeIds: string[];
+}
+
 export interface TemplateMarketplaceBridge {
   /**
    * List installed templates from the marketplace directory.
@@ -2087,6 +2104,21 @@ export interface TemplateMarketplaceBridge {
    * unknown id.
    */
   remove(templateId: string): Promise<void>;
+  /**
+   * "Start from template": pour the template's design (resolved by id
+   * -> its `content.json`) into the currently open workspace as a new
+   * artboard. Returns the new artboard id + every node id created.
+   * Rejects with `Status::InvalidArg` for an unknown id and
+   * `NoProject` when no workspace is open.
+   */
+  instantiate(templateId: string): Promise<TemplateInstantiateReport>;
+  /**
+   * Render (or read the cached) thumbnail PNG for a template id via
+   * the shared export pipeline, so gallery cards show a real preview
+   * of the applied design. `bytesBase64` is a standard base64 PNG the
+   * renderer pins as an `<img>` `src` (`data:${mime};base64,...`).
+   */
+  thumbnail(templateId: string): Promise<ThumbnailBytes>;
 }
 
 // ---------------------------------------------------------------------------

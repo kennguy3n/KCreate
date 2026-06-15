@@ -76,6 +76,11 @@ serial_test = "3"
 # (page count, /Outlines catalog entry). Not pulled into editing-path
 # crates — only into the integration-test crate.
 lopdf = { workspace = true }
+# Used by the G2 template-library integration test
+# (template_library_bridge.rs) to decode the rendered thumbnail PNGs
+# and assert they are non-blank (>= 2 distinct colors). Decode-only;
+# not pulled into any editing-path crate.
+image = { workspace = true }
 
 [lints]
 workspace = true

@@ -41,8 +41,12 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::document::{
-    blob_load, current_scene_safe, sync_scene_after_change, with_workspace, with_workspace_mut,
-    DocumentBridgeError, Result,
+    blob_load, build_template_document, current_scene_safe, sync_scene_after_change,
+    template_instantiate_items, with_workspace, with_workspace_mut, CanvasBatchItem,
+    DocumentBridgeError, Result, TemplateInstantiateReport,
+};
+use crate::thumbnails::{
+    render_template_thumbnail_png, ThumbnailBytes, DEFAULT_THUMBNAIL_MAX_DIM_PX,
 };
 
 // -----------------------------------------------------------------------------
@@ -4013,6 +4017,12 @@ fn template_marketplace() -> &'static Mutex<kcreate_core::LocalMarketplace> {
     MP.get_or_init(|| {
         let root = template_dir();
         let mut mp = kcreate_core::LocalMarketplace::new(root);
+        // Seed the bundled, ready-made catalog on first run
+        // (copy-if-empty) so a fresh install opens to a populated
+        // gallery instead of an empty marketplace. Idempotent: a no-op
+        // once the install dir already has `.ktemplate/` folders, and
+        // honours the `KCREATE_TEMPLATE_DIR` override baked into `root`.
+        let _ = mp.seed_bundled();
         let _ = mp.scan();
         Mutex::new(mp)
     })
@@ -4082,6 +4092,109 @@ pub fn template_remove(template_id: uuid::Uuid) -> Result<()> {
     let mut mp = template_marketplace().lock();
     mp.remove(template_id)?;
     Ok(())
+}
+
+/// On-disk shape of a `.ktemplate/`'s `content.json`: the canvas
+/// dimensions plus the ordered list of design items. This is the
+/// single source of truth that drives BOTH the gallery thumbnail
+/// ([`template_thumbnail`]) and applying the template to the live
+/// workspace ([`template_instantiate`]) — so the preview and the
+/// instantiated canvas are pixel-identical.
+///
+/// `items` deserialize directly into the bridge's [`CanvasBatchItem`]
+/// wire enum, the same type `canvas.createNodes` accepts, so authored
+/// templates and user-created nodes share one geometry/fill path.
+#[derive(Debug, Deserialize)]
+pub struct TemplateContentWire {
+    pub width: f64,
+    pub height: f64,
+    pub items: Vec<CanvasBatchItem>,
+}
+
+/// Resolve an installed template's on-disk `.ktemplate/` directory by
+/// id. Re-scans first so freshly seeded/installed templates resolve
+/// without an app restart; `scan()` stamps `manifest.source` with the
+/// discovered path, which is what we read here.
+fn template_dir_for(template_id: Uuid) -> Result<PathBuf> {
+    let mut mp = template_marketplace().lock();
+    let _ = mp.scan();
+    let manifest = mp
+        .get(template_id)
+        .ok_or(kcreate_core::MarketplaceError::TemplateNotFound(
+            template_id,
+        ))?;
+    match &manifest.source {
+        Some(kcreate_core::TemplateSource::Local { path }) => Ok(path.clone()),
+        None => Err(DocumentBridgeError::Internal(format!(
+            "template {template_id} has no on-disk source"
+        ))),
+    }
+}
+
+/// Read + parse a template's `content.json`, also returning the
+/// resolved `.ktemplate/` directory (so callers can locate the
+/// sibling `thumbnail.png` cache).
+fn load_template_content(template_id: Uuid) -> Result<(PathBuf, TemplateContentWire)> {
+    let dir = template_dir_for(template_id)?;
+    let content_path = dir.join("content.json");
+    let raw = std::fs::read(&content_path).map_err(|e| {
+        DocumentBridgeError::Internal(format!(
+            "template {template_id}: cannot read {}: {e}",
+            content_path.display()
+        ))
+    })?;
+    let content: TemplateContentWire = serde_json::from_slice(&raw)?;
+    Ok((dir, content))
+}
+
+/// Apply a ready-made template to the **currently open** workspace:
+/// reads the template's `content.json`, creates a sized artboard at
+/// the next free position, and inserts the design under it (see
+/// [`crate::document::template_instantiate_items`]). Returns the new
+/// artboard id + content node ids. This is the "Start from template"
+/// entry point; the renderer follows it with `artboard_duplicate`
+/// for "Duplicate & remix".
+pub fn template_instantiate(template_id: Uuid) -> Result<TemplateInstantiateReport> {
+    // Use the manifest name for the artboard so the layers panel reads
+    // e.g. "Login — Welcome Back" rather than a generic "Artboard".
+    let name = {
+        let mut mp = template_marketplace().lock();
+        let _ = mp.scan();
+        mp.get(template_id).map(|m| m.name.clone()).ok_or(
+            kcreate_core::MarketplaceError::TemplateNotFound(template_id),
+        )?
+    };
+    let (_dir, content) = load_template_content(template_id)?;
+    template_instantiate_items(&name, content.width, content.height, content.items)
+}
+
+/// Return the gallery thumbnail for a template as PNG bytes wrapped in
+/// a [`ThumbnailBytes`]. Lazy render-on-miss: if the template's
+/// `.ktemplate/` already has a `thumbnail.png` it is served straight
+/// from disk; otherwise the template's `content.json` is rendered
+/// through the export PNG pipeline at gallery-card resolution, cached
+/// to `thumbnail.png` (best-effort — a read-only template dir still
+/// serves a freshly rendered preview), and returned.
+pub fn template_thumbnail(template_id: Uuid) -> Result<ThumbnailBytes> {
+    let dir = template_dir_for(template_id)?;
+    let thumb_path = dir.join("thumbnail.png");
+    if let Ok(bytes) = std::fs::read(&thumb_path) {
+        if !bytes.is_empty() {
+            return Ok(ThumbnailBytes::from_png_bytes(bytes));
+        }
+    }
+    // Cache miss — render from content.json.
+    let (_dir, content) = load_template_content(template_id)?;
+    let doc = build_template_document(content.items)?;
+    let bytes = render_template_thumbnail_png(
+        &doc,
+        content.width,
+        content.height,
+        DEFAULT_THUMBNAIL_MAX_DIM_PX,
+    )?;
+    // Best-effort cache write so repeat opens skip the render.
+    let _ = std::fs::write(&thumb_path, &bytes);
+    Ok(ThumbnailBytes::from_png_bytes(bytes))
 }
 
 // -----------------------------------------------------------------------------

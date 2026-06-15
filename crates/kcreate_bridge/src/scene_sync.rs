@@ -44,7 +44,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use kcreate_core::document::DocumentGraph;
 use kcreate_core::node::{Node, NodeType, PathEffect};
 use kcreate_renderer::{
-    Color, Object, ObjectId, ObjectKind, PathCommand, Point2, Rect, Scene, Stroke, Style,
+    Color, Object, ObjectId, ObjectKind, Paint, PathCommand, Point2, Rect, Scene, Stroke, Style,
 };
 use kcreate_storage::blobs::BlobStore;
 use kcreate_vector::{PathSegment, VectorPath};
@@ -1012,7 +1012,7 @@ impl SceneSync {
                 PathCommand::Close,
             ];
             let cursor_style = Style {
-                fill: Some(color),
+                fill: Some(Paint::Solid(color)),
                 stroke: Some(Stroke::new(Color::rgba(1.0, 1.0, 1.0, 0.9), 1.0)),
             };
             let cursor_id = Self::next_overlay_id(&mut overlay);
@@ -1033,7 +1033,7 @@ impl SceneSync {
                     cy + cursor_height_world + cursor_label_font_size_world,
                 );
                 let label_style = Style {
-                    fill: Some(color),
+                    fill: Some(Paint::Solid(color)),
                     stroke: None,
                 };
                 let label_id = Self::next_overlay_id(&mut overlay);
@@ -1182,7 +1182,7 @@ impl SceneSync {
                         (world.y - f64::from(outset_world)) as f32 - label_offset_world,
                     );
                     let label_style = Style {
-                        fill: Some(stroke_color),
+                        fill: Some(Paint::Solid(stroke_color)),
                         stroke: None,
                     };
                     let label_id = Self::next_overlay_id(&mut overlay);
@@ -1318,7 +1318,7 @@ impl SceneSync {
                 world.height as f32,
             )),
             Style {
-                fill: Some(ARTBOARD_SHADOW),
+                fill: Some(Paint::Solid(ARTBOARD_SHADOW)),
                 stroke: None,
             },
         )
@@ -1332,11 +1332,16 @@ impl SceneSync {
         let obj_id = self.allocate(node.id);
         self.record(node.id, obj_id);
         emitted.push(node.id);
-        let fill = node_fill(node).unwrap_or(Color::rgba(1.0, 1.0, 1.0, 1.0));
+        // Gradient fills from `node_fill` are in the artboard's local
+        // path space (0..w, 0..h); the rect itself is placed at world
+        // coords with no object translation, so translate the paint to
+        // match. A solid fill is unaffected (`translated` is a no-op).
+        let fill = node_fill(node).unwrap_or_else(|| Paint::Solid(Color::rgba(1.0, 1.0, 1.0, 1.0)));
         let style = Style {
             fill: Some(fill),
             stroke: None,
-        };
+        }
+        .translated(world.x as f32, world.y as f32);
         let obj = Object::new(
             ObjectKind::Rect(Rect::new(
                 world.x as f32,
@@ -1364,7 +1369,7 @@ impl SceneSync {
                     font_size: ARTBOARD_LABEL_FONT_SIZE,
                 },
                 Style {
-                    fill: Some(ARTBOARD_LABEL_COLOR),
+                    fill: Some(Paint::Solid(ARTBOARD_LABEL_COLOR)),
                     stroke: None,
                 },
             )
@@ -1417,7 +1422,7 @@ impl SceneSync {
                 self.allocate_sub_object_id(node.id)
             };
             let commands = vector_path_to_renderer(&sub);
-            let obj = Object::new(ObjectKind::Path(commands), style)
+            let obj = Object::new(ObjectKind::Path(commands), style.clone())
                 .with_id(obj_id)
                 .with_translation(tx as f32, ty as f32)
                 .with_z(*z);
@@ -1479,7 +1484,7 @@ impl SceneSync {
         };
         let style = if matches!(kind, ObjectKind::Rect(_)) {
             Style {
-                fill: Some(RASTER_PLACEHOLDER),
+                fill: Some(Paint::Solid(RASTER_PLACEHOLDER)),
                 stroke: None,
             }
         } else {
@@ -1752,12 +1757,51 @@ const fn node_translation(node: &Node) -> (f64, f64) {
     (node.transform.tx, node.transform.ty)
 }
 
-const fn node_fill(node: &Node) -> Option<Color> {
-    match node.style.fill {
-        kcreate_core::node::FillStyle::Solid(rgba) => {
-            Some(Color::rgba(rgba.r, rgba.g, rgba.b, rgba.a))
+const fn rgba_to_color(c: kcreate_core::node::RgbaColor) -> Color {
+    Color::rgba(c.r, c.g, c.b, c.a)
+}
+
+fn point2d_to_point2(p: kcreate_core::node::Point2D) -> Point2 {
+    Point2::new(p.x as f32, p.y as f32)
+}
+
+/// Lower core gradient stops (f64 offset, `RgbaColor`) to the renderer's
+/// `(f32 offset, Color)` representation, preserving document order.
+fn gradient_stops_to_renderer(stops: &[kcreate_core::node::GradientStop]) -> Vec<(f32, Color)> {
+    stops
+        .iter()
+        .map(|s| (s.offset as f32, rgba_to_color(s.color)))
+        .collect()
+}
+
+/// Translate a node's fill into a renderer [`Paint`]. Solid fills become
+/// `Paint::Solid`; linear / radial gradients carry their endpoints and
+/// stops through so the raster backend can build the matching tiny-skia
+/// shader. Gradient coordinates are in the node's local path space — the
+/// same convention the PDF exporter uses — and the object translation is
+/// applied later when the display list is built. `FillStyle::None` yields
+/// no fill.
+fn node_fill(node: &Node) -> Option<Paint> {
+    use kcreate_core::node::{FillStyle, GradientKind};
+    match &node.style.fill {
+        FillStyle::Solid(rgba) => Some(Paint::Solid(rgba_to_color(*rgba))),
+        FillStyle::Gradient(GradientKind::Linear { from, to, stops }) => {
+            Some(Paint::LinearGradient {
+                from: point2d_to_point2(*from),
+                to: point2d_to_point2(*to),
+                stops: gradient_stops_to_renderer(stops),
+            })
         }
-        kcreate_core::node::FillStyle::None | kcreate_core::node::FillStyle::Gradient(_) => None,
+        FillStyle::Gradient(GradientKind::Radial {
+            center,
+            radius,
+            stops,
+        }) => Some(Paint::RadialGradient {
+            center: point2d_to_point2(*center),
+            radius: *radius as f32,
+            stops: gradient_stops_to_renderer(stops),
+        }),
+        FillStyle::None => None,
     }
 }
 
@@ -1819,7 +1863,10 @@ fn node_style(node: &Node) -> Style {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kcreate_core::node::{Bounds, FillStyle, Node, NodeType, RgbaColor, Transform2D};
+    use kcreate_core::node::{
+        Bounds, FillStyle, GradientKind, GradientStop, Node, NodeType, Point2D, RgbaColor,
+        Transform2D,
+    };
     use kcreate_vector::{PathPoint, PathSegment, VectorPath};
 
     fn unit_square_path() -> VectorPath {
@@ -1900,6 +1947,133 @@ mod tests {
         let obj_id = sync.object_id_for_uuid(id).expect("forward lookup");
         let back = sync.uuid_for_object_id(obj_id).expect("reverse lookup");
         assert_eq!(back, id);
+    }
+
+    #[test]
+    fn linear_gradient_fill_maps_to_linear_paint() {
+        let mut node = Node::new(NodeType::VectorLayer, "grad");
+        node.style.fill = FillStyle::Gradient(GradientKind::Linear {
+            from: Point2D::new(0.0, 0.0),
+            to: Point2D::new(100.0, 0.0),
+            stops: vec![
+                GradientStop {
+                    offset: 0.0,
+                    color: RgbaColor {
+                        r: 1.0,
+                        g: 0.0,
+                        b: 0.0,
+                        a: 1.0,
+                    },
+                },
+                GradientStop {
+                    offset: 1.0,
+                    color: RgbaColor {
+                        r: 0.0,
+                        g: 0.0,
+                        b: 1.0,
+                        a: 1.0,
+                    },
+                },
+            ],
+        });
+        match node_fill(&node).expect("gradient produces a fill") {
+            Paint::LinearGradient { from, to, stops } => {
+                assert_eq!((from.x, from.y), (0.0, 0.0));
+                assert_eq!((to.x, to.y), (100.0, 0.0));
+                assert_eq!(stops.len(), 2);
+                assert_eq!(stops[0], (0.0, Color::rgba(1.0, 0.0, 0.0, 1.0)));
+                assert_eq!(stops[1], (1.0, Color::rgba(0.0, 0.0, 1.0, 1.0)));
+            }
+            other => panic!("expected a linear gradient paint, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn radial_gradient_fill_maps_to_radial_paint() {
+        let mut node = Node::new(NodeType::VectorLayer, "grad");
+        node.style.fill = FillStyle::Gradient(GradientKind::Radial {
+            center: Point2D::new(50.0, 50.0),
+            radius: 25.0,
+            stops: vec![
+                GradientStop {
+                    offset: 0.0,
+                    color: RgbaColor {
+                        r: 1.0,
+                        g: 1.0,
+                        b: 1.0,
+                        a: 1.0,
+                    },
+                },
+                GradientStop {
+                    offset: 1.0,
+                    color: RgbaColor {
+                        r: 0.0,
+                        g: 0.0,
+                        b: 0.0,
+                        a: 1.0,
+                    },
+                },
+            ],
+        });
+        match node_fill(&node).expect("gradient produces a fill") {
+            Paint::RadialGradient {
+                center,
+                radius,
+                stops,
+            } => {
+                assert_eq!((center.x, center.y), (50.0, 50.0));
+                assert_eq!(radius, 25.0);
+                assert_eq!(stops.len(), 2);
+                assert_eq!(stops[0].1, Color::rgba(1.0, 1.0, 1.0, 1.0));
+            }
+            other => panic!("expected a radial gradient paint, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gradient_vector_layer_carries_gradient_into_scene() {
+        // End-to-end: a gradient-filled vector layer must arrive in the
+        // renderer scene as a gradient Paint, not get dropped to a solid
+        // or `None` the way it did before render-parity.
+        let mut doc = DocumentGraph::new();
+        let path = unit_square_path();
+        let mut node = vector_node(&path);
+        node.style.fill = FillStyle::Gradient(GradientKind::Linear {
+            from: Point2D::new(0.0, 0.0),
+            to: Point2D::new(10.0, 0.0),
+            stops: vec![
+                GradientStop {
+                    offset: 0.0,
+                    color: RgbaColor {
+                        r: 0.0,
+                        g: 1.0,
+                        b: 0.0,
+                        a: 1.0,
+                    },
+                },
+                GradientStop {
+                    offset: 1.0,
+                    color: RgbaColor {
+                        r: 0.0,
+                        g: 0.0,
+                        b: 1.0,
+                        a: 1.0,
+                    },
+                },
+            ],
+        });
+        doc.insert_node(node).expect("insert");
+        let mut sync = SceneSync::new();
+        let scene = sync.sync_document_to_scene(&mut doc, None, &[]);
+        assert_eq!(scene.objects.len(), 1);
+        assert!(
+            matches!(
+                scene.objects[0].style.fill,
+                Some(Paint::LinearGradient { .. })
+            ),
+            "gradient fill must survive document→scene translation, got {:?}",
+            scene.objects[0].style.fill
+        );
     }
 
     #[test]

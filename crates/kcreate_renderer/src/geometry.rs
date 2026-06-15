@@ -186,17 +186,91 @@ impl Stroke {
     }
 }
 
+/// A fill paint: a flat color or a linear / radial gradient.
+///
+/// Gradient coordinates live in the **same local space as the shape
+/// geometry they fill** (path points, rect corners, …). The display-list
+/// builder bakes an object's translation into them exactly as it does for
+/// the path coordinates, and the CPU backend hands the viewport transform
+/// to tiny-skia at draw time — so a gradient pans and zooms locked to its
+/// shape. This mirrors the PDF exporter's `node_local_to_pt` convention so
+/// raster output matches vector output pixel-for-pixel.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum Paint {
+    /// Flat color.
+    Solid(Color),
+    /// Axial gradient from `from` to `to`. `stops` are `(offset, color)`
+    /// pairs with `offset` in `[0, 1]`, ascending.
+    LinearGradient {
+        from: Point2,
+        to: Point2,
+        stops: Vec<(f32, Color)>,
+    },
+    /// Radial gradient centered at `center` with the given `radius`
+    /// (inner radius is 0). `stops` are `(offset, color)` pairs with
+    /// `offset` in `[0, 1]`, ascending.
+    RadialGradient {
+        center: Point2,
+        radius: f32,
+        stops: Vec<(f32, Color)>,
+    },
+}
+
+impl Paint {
+    /// A single representative color for contexts that cannot paint a
+    /// gradient (hairline strokes, degenerate-gradient fallbacks). A
+    /// gradient collapses to its first stop, matching the "simplified
+    /// gradient" behavior of vector editors. Returns `None` only for a
+    /// gradient with no stops.
+    pub fn representative_color(&self) -> Option<Color> {
+        match self {
+            Self::Solid(c) => Some(*c),
+            Self::LinearGradient { stops, .. } | Self::RadialGradient { stops, .. } => {
+                stops.first().map(|(_, c)| *c)
+            }
+        }
+    }
+
+    /// Translate gradient geometry by `(dx, dy)`. Solid paint is
+    /// unaffected. Used to bake an object's translation into its fill so
+    /// the gradient stays locked to the (also-translated) geometry.
+    #[must_use]
+    pub fn translated(&self, dx: f32, dy: f32) -> Self {
+        match self {
+            Self::Solid(c) => Self::Solid(*c),
+            Self::LinearGradient { from, to, stops } => Self::LinearGradient {
+                from: Point2::new(from.x + dx, from.y + dy),
+                to: Point2::new(to.x + dx, to.y + dy),
+                stops: stops.clone(),
+            },
+            Self::RadialGradient {
+                center,
+                radius,
+                stops,
+            } => Self::RadialGradient {
+                center: Point2::new(center.x + dx, center.y + dy),
+                radius: *radius,
+                stops: stops.clone(),
+            },
+        }
+    }
+}
+
 /// Style for filled and/or stroked shapes.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+///
+/// `fill` is no longer `Copy` because [`Paint`] can own a `Vec` of
+/// gradient stops; `Style` therefore derives `Clone` (kept `PartialEq`
+/// so the pipeline can batch consecutive same-style rects).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Style {
-    pub fill: Option<Color>,
+    pub fill: Option<Paint>,
     pub stroke: Option<Stroke>,
 }
 
 impl Style {
     pub const fn filled(fill: Color) -> Self {
         Self {
-            fill: Some(fill),
+            fill: Some(Paint::Solid(fill)),
             stroke: None,
         }
     }
@@ -210,8 +284,46 @@ impl Style {
 
     pub const fn fill_and_stroke(fill: Color, stroke: Stroke) -> Self {
         Self {
-            fill: Some(fill),
+            fill: Some(Paint::Solid(fill)),
             stroke: Some(stroke),
+        }
+    }
+
+    /// Build a style from an arbitrary [`Paint`] (solid or gradient).
+    pub const fn painted(fill: Paint) -> Self {
+        Self {
+            fill: Some(fill),
+            stroke: None,
+        }
+    }
+
+    /// Convenience constructor for a linear-gradient fill.
+    pub fn linear_gradient(from: Point2, to: Point2, stops: Vec<(f32, Color)>) -> Self {
+        Self {
+            fill: Some(Paint::LinearGradient { from, to, stops }),
+            stroke: None,
+        }
+    }
+
+    /// Convenience constructor for a radial-gradient fill.
+    pub fn radial_gradient(center: Point2, radius: f32, stops: Vec<(f32, Color)>) -> Self {
+        Self {
+            fill: Some(Paint::RadialGradient {
+                center,
+                radius,
+                stops,
+            }),
+            stroke: None,
+        }
+    }
+
+    /// Return a copy with the fill's gradient geometry translated by
+    /// `(dx, dy)`. Solid fills and strokes are untouched.
+    #[must_use]
+    pub fn translated(&self, dx: f32, dy: f32) -> Self {
+        Self {
+            fill: self.fill.as_ref().map(|p| p.translated(dx, dy)),
+            stroke: self.stroke,
         }
     }
 }

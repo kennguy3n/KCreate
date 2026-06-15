@@ -252,6 +252,16 @@ export function BriefModal({
     setPhase({ kind: "idle" });
   }, []);
 
+  // Deck and one-pager offer different section-count ranges, so a
+  // value picked for one format can be out of range for the other
+  // (the bridge clamps it, but the <select> would then show a stale,
+  // unmatched value). Reset to "Auto" on a format switch to keep the
+  // control's displayed value always valid.
+  const switchFormat = useCallback((next: ThemedDesignFormat) => {
+    setFormat(next);
+    setSectionCount(null);
+  }, []);
+
   // Shared: guarantee an open workspace before any bridge mutation.
   // The Rust apply paths mutate the currently mounted workspace; when
   // the modal is opened from `HomePage` no project is open yet so we
@@ -431,7 +441,7 @@ export function BriefModal({
         {mode === "themed" && (
           <ThemedControls
             format={format}
-            onFormat={setFormat}
+            onFormat={switchFormat}
             themeId={themeId}
             onTheme={setThemeId}
             onePagerSize={onePagerSize}

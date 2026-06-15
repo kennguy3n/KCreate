@@ -1192,12 +1192,21 @@ fn collect_page_svgs() -> Result<Vec<kcreate_export::pdf_multi::PdfPageInput>> {
 ///   we do **not** descend into it (its descendants are rendered by
 ///   `compose_page_svg_in_frame`).
 /// - A `Page` that has at least one `Artboard` descendant is a pure
-///   container — we descend into its children so the artboards become
-///   the pages, and the page itself is **not** emitted (this is what
-///   removes the historical double-count).
+///   container — we descend so the artboards become the pages, and the
+///   page itself is **not** emitted (this is what removes the
+///   historical double-count).
 /// - A `Page` with no `Artboard` descendant (legacy docs that hang
 ///   content directly off the page) becomes one page itself.
+/// - Any other container (e.g. a `GroupLayer` wrapping an artboard) is
+///   never a page on its own, but we still descend through it so a
+///   nested artboard is reached rather than silently dropped. This
+///   keeps the traversal consistent with the broad `descendants_of`
+///   artboard check above. Leaf layers have no children, so they add
+///   nothing.
 fn ordered_export_units(doc: &kcreate_core::document::DocumentGraph) -> Vec<Uuid> {
+    let push_children =
+        |id: Uuid, stack: &mut Vec<Uuid>| stack.extend(doc.children_of(id).into_iter().rev());
+
     let mut out = Vec::new();
     let mut stack: Vec<Uuid> = doc.root_ids().iter().rev().copied().collect();
     while let Some(id) = stack.pop() {
@@ -1212,17 +1221,12 @@ fn ordered_export_units(doc: &kcreate_core::document::DocumentGraph) -> Vec<Uuid
                         .is_some_and(|n| n.node_type == NodeType::Artboard)
                 });
                 if has_artboard {
-                    for child in doc.children_of(id).into_iter().rev() {
-                        stack.push(child);
-                    }
+                    push_children(id, &mut stack);
                 } else {
                     out.push(id);
                 }
             }
-            // Other root-level node kinds were never exported as
-            // their own page (matches the prior Page/Artboard-only
-            // filter); skip them.
-            _ => {}
+            _ => push_children(id, &mut stack),
         }
     }
     out
@@ -1491,6 +1495,12 @@ fn preferences_tmp_path(final_path: &std::path::Path) -> std::path::PathBuf {
 /// tiling convention used across the bridge.
 const THEMED_DECK_TILE_GAP: f64 = 100.0;
 
+/// Metadata flag stamped on the root `Page` this generator creates.
+/// On a subsequent generate it lets us replace our own prior output
+/// in place (instead of accumulating duplicate tiled page trees)
+/// while never touching pages the user authored themselves.
+const THEMED_GENERATED_METADATA_KEY: &str = "kcreate:themedGenerated";
+
 /// Cubic-bezier control offset for a quarter-circle corner
 /// (`4/3 * (sqrt(2) - 1)`); used to round rectangle corners so the
 /// rounding survives SVG/PDF export (which ignores `style.corner_radius`).
@@ -1639,10 +1649,12 @@ fn build_themed_outline(
 /// (so the caller falls back) on any error: not-ready, transport
 /// failure, unparseable reply, or an empty sanitised outline.
 fn llm_enriched_outline(brief: &str, options: ThemedDesignOptions) -> Option<DeckOutline> {
-    let section_count = match options.format {
-        DesignFormat::Deck => options.section_count.unwrap_or(6),
-        DesignFormat::OnePager => options.section_count.unwrap_or(4),
-    };
+    // Resolve through the shared clamp so the model is asked for the
+    // same section count the deterministic planner would produce. A
+    // raw `section_count` (`0`, `99`, …) would otherwise reach the
+    // prompt unbounded and make the LLM and fallback paths diverge at
+    // the boundaries.
+    let section_count = options.resolved_section_count() as u32;
     let messages = build_outline_messages(brief, section_count);
     let reply = crate::llm::llm_chat(messages, 1024, 0.3).ok()?;
     let json = extract_json_object(&reply.content)?;
@@ -1755,29 +1767,48 @@ fn apply_generated_design(
     let kit_name = format!("{} Theme", design.theme.name);
 
     with_workspace_mut(|ws| {
+        // Replace our own prior output. Re-running the generator (e.g.
+        // to try another theme) must not stack a second tiled deck
+        // beside the first; remove any page a previous run stamped as
+        // generator-owned. Pages the user authored themselves carry no
+        // such stamp and are left untouched, so this never destroys
+        // the user's work.
+        for root in ws.project.document.root_ids().to_vec() {
+            if node_is_themed_generated(&ws.project.document, root) {
+                ws.project.document.remove_node(root);
+            }
+        }
+
         // Repurpose a pristine scratch document. A "generate a whole
         // deck from a prompt" action is a *document-creation* action:
         // when the open document carries no content-bearing layers
         // (the default `Page` + empty `Artboard` scaffold a fresh
-        // project — and BriefModal's scratch project — ships with),
+        // project — and BriefModal's scratch project — ships with, or
+        // the empty shell left after removing our prior output above),
         // clear it so the generated deck *becomes* the document. This
         // keeps the canvas and the multi-page PDF export free of a
-        // stray blank default artboard. A document that already holds
-        // real content is left untouched and the deck is appended as a
-        // new page, so we never destroy the user's work.
+        // stray blank default artboard. A document that still holds
+        // real (user-authored) content is left in place and the deck
+        // is appended as a new page, so we never destroy the user's
+        // work.
         if !document_has_content_layers(&ws.project.document) {
             for root in ws.project.document.root_ids().to_vec() {
                 ws.project.document.remove_node(root);
             }
         }
 
-        // Root page container, sized to the full tiled extent.
+        // Root page container, sized to the full tiled extent. It is
+        // stamped as generator-owned so a future run can replace it.
         let page_title = design
             .pages
             .first()
             .map_or_else(|| "Generated Design".to_string(), |p| p.title.clone());
         let mut page = Node::new(NodeType::Page, page_title.as_str());
         page.bounds = Bounds::new(0.0, 0.0, total_width.max(1.0), max_height.max(1.0));
+        page.metadata.insert(
+            THEMED_GENERATED_METADATA_KEY.to_string(),
+            serde_json::Value::Bool(true),
+        );
         let page_id = ws
             .project
             .document
@@ -1863,6 +1894,18 @@ fn apply_generated_design(
             format: format_wire.to_string(),
             used_llm,
         })
+    })
+}
+
+/// Was `id` a root page stamped by a previous run of this generator?
+/// Used to replace prior generated output on a re-run without
+/// touching user-authored pages (which never carry the stamp).
+fn node_is_themed_generated(doc: &kcreate_core::document::DocumentGraph, id: Uuid) -> bool {
+    doc.get_node(id).is_some_and(|n| {
+        n.metadata
+            .get(THEMED_GENERATED_METADATA_KEY)
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
     })
 }
 
@@ -2016,6 +2059,52 @@ fn rounded_rect_path(x: f64, y: f64, w: f64, h: f64, radius: f64) -> kcreate_vec
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ordered_export_units_walks_page_artboards_in_insertion_order() {
+        // Page → [Artboard A, Artboard B]: the page is a pure
+        // container (it has artboard descendants) so it is not emitted;
+        // its artboards become the export units, left-to-right.
+        let mut doc = kcreate_core::document::DocumentGraph::new();
+        let page = doc.insert_node(Node::new(NodeType::Page, "Page")).unwrap();
+        let mut a = Node::new(NodeType::Artboard, "A");
+        a.parent_id = Some(page);
+        let a = doc.insert_node(a).unwrap();
+        let mut b = Node::new(NodeType::Artboard, "B");
+        b.parent_id = Some(page);
+        let b = doc.insert_node(b).unwrap();
+        assert_eq!(ordered_export_units(&doc), vec![a, b]);
+    }
+
+    #[test]
+    fn ordered_export_units_emits_a_page_with_no_artboard_as_itself() {
+        // Legacy single-page docs hang content directly off the page
+        // (no artboard); the page itself becomes the one export unit.
+        let mut doc = kcreate_core::document::DocumentGraph::new();
+        let page = doc.insert_node(Node::new(NodeType::Page, "Page")).unwrap();
+        let mut text = Node::new(NodeType::TextLayer, "Body");
+        text.parent_id = Some(page);
+        doc.insert_node(text).unwrap();
+        assert_eq!(ordered_export_units(&doc), vec![page]);
+    }
+
+    #[test]
+    fn ordered_export_units_reaches_artboard_nested_under_a_group() {
+        // Page → GroupLayer → Artboard. The page reports an artboard
+        // descendant, so it descends; the group is not a page on its
+        // own but the traversal descends through it instead of dropping
+        // it, so the nested artboard is still reached (one export unit,
+        // not zero).
+        let mut doc = kcreate_core::document::DocumentGraph::new();
+        let page = doc.insert_node(Node::new(NodeType::Page, "Page")).unwrap();
+        let mut group = Node::new(NodeType::GroupLayer, "Group");
+        group.parent_id = Some(page);
+        let group = doc.insert_node(group).unwrap();
+        let mut artboard = Node::new(NodeType::Artboard, "Nested");
+        artboard.parent_id = Some(group);
+        let artboard = doc.insert_node(artboard).unwrap();
+        assert_eq!(ordered_export_units(&doc), vec![artboard]);
+    }
 
     #[test]
     fn smart_select_mode_parser_round_trips_known_names() {

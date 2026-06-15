@@ -313,7 +313,13 @@ impl Default for ThemedDesignOptions {
 }
 
 impl ThemedDesignOptions {
-    fn resolved_section_count(&self) -> usize {
+    /// Desired content-section count clamped to a legible range
+    /// (`[3, max]`, where `max` depends on the format). Both the
+    /// deterministic planner and the LLM-enrichment path resolve the
+    /// section count through this method so a caller-supplied extreme
+    /// (e.g. `0` or `99`) is treated identically on either path.
+    #[must_use]
+    pub fn resolved_section_count(&self) -> usize {
         let (default, max) = match self.format {
             DesignFormat::Deck => (6usize, 11usize),
             DesignFormat::OnePager => (4usize, 6usize),

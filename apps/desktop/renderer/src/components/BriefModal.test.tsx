@@ -194,6 +194,40 @@ describe("BriefModal — themed generation", () => {
     expect(options.format).toBe("deck");
   });
 
+  it("resets the slide count to Auto when the format changes", async () => {
+    const { stub } = mount();
+    stub.override("phase10.aiGenerateThemedDesign", () =>
+      fakeResult({ format: "onePager", slideCount: 1 }),
+    );
+
+    fireEvent.change(screen.getByTestId("kcreate-brief-textarea"), {
+      target: { value: "Deck that becomes a one-pager" },
+    });
+    // Pick an explicit slide count that the one-pager range can't offer.
+    fireEvent.change(screen.getByTestId("kcreate-themed-sections"), {
+      target: { value: "10" },
+    });
+    const sections = screen.getByTestId(
+      "kcreate-themed-sections",
+    ) as HTMLSelectElement;
+    expect(sections.value).toBe("10");
+
+    // Switching format must drop the now-out-of-range selection back
+    // to Auto so the control never shows a stale, unmatched value.
+    fireEvent.click(screen.getByTestId("kcreate-themed-format-onepager"));
+    expect(sections.value).toBe("auto");
+
+    fireEvent.click(screen.getByTestId("kcreate-themed-generate"));
+    await flushAsync();
+
+    const options = lastGenerateCall(stub)?.args[1] as ThemedDesignOptions;
+    expect(options.format).toBe("onePager");
+    expect(
+      options.sectionCount,
+      "the stale deck slide count must not leak into the one-pager request",
+    ).toBeUndefined();
+  });
+
   it("includes the page size only for the one-pager format", async () => {
     const { stub } = mount();
     stub.override("phase10.aiGenerateThemedDesign", () =>

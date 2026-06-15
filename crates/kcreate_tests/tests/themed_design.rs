@@ -12,7 +12,9 @@
 //! the process-global workspace singleton, so the suite serialises
 //! against the other bridge tests with `serial_test`.
 
-use kcreate_bridge::document::{document_get_tree, project_close, project_create, project_save};
+use kcreate_bridge::document::{
+    canvas_create_rect, document_get_tree, project_close, project_create, project_save,
+};
 use kcreate_bridge::phase10::{
     ai_generate_themed_design, export_pdf_multi, ThemedDesignApplyResult,
 };
@@ -52,6 +54,23 @@ fn count_node_type(kind: &str) -> usize {
         .expect("tree")
         .into_iter()
         .filter(|n| n.node_type == kind)
+        .count()
+}
+
+/// Count root pages the generator stamped as its own output. A re-run
+/// replaces these in place, so this must stay at exactly `1` no matter
+/// how many times the generator runs against the same project.
+fn count_generated_pages() -> usize {
+    document_get_tree()
+        .expect("tree")
+        .into_iter()
+        .filter(|n| n.node_type == "Page")
+        .filter(|n| {
+            n.metadata
+                .get("kcreate:themedGenerated")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+        })
         .count()
 }
 
@@ -205,6 +224,125 @@ fn rerun_upserts_brand_kit_in_place() {
     assert_eq!(
         first.brand_kit_id, second.brand_kit_id,
         "theme brand kit id must be stable across re-runs (upsert by name)"
+    );
+    project_close();
+}
+
+#[test]
+#[serial]
+fn rerun_replaces_prior_generated_deck_without_accumulating() {
+    // Re-running the generator (e.g. to try a different theme) must
+    // replace its own previous output in place, not stack a second
+    // tiled deck beside the first. Without the generator-owned stamp
+    // the second run would `document_has_content_layers() == true` and
+    // append, doubling the page/artboard count every time.
+    let _dir = open_project("themed-rerun-replace");
+    let first = ai_generate_themed_design(
+        "Pitch deck for an indie coffee roaster",
+        r#"{"format":"deck","themeId":"ember","sectionCount":6}"#,
+    )
+    .expect("first");
+    assert_eq!(count_generated_pages(), 1, "first run creates one deck");
+    assert_eq!(count_node_type("Artboard"), first.slide_count as usize);
+
+    let second = ai_generate_themed_design(
+        "Investor deck for a solar microgrid startup",
+        r#"{"format":"deck","themeId":"midnight","sectionCount":8}"#,
+    )
+    .expect("second");
+
+    assert_eq!(
+        count_generated_pages(),
+        1,
+        "a re-run must replace the prior generated deck, not accumulate a second one"
+    );
+    assert_eq!(
+        count_node_type("Artboard"),
+        second.slide_count as usize,
+        "only the latest deck's artboards should remain after a re-run"
+    );
+    // The replacement really swapped content: midnight + 8 sections.
+    assert_eq!(second.theme_id, "midnight");
+    assert_eq!(second.slide_count, 9);
+    let joined = text_runs().join("\n").to_lowercase();
+    assert!(
+        joined.contains("solar") || joined.contains("microgrid"),
+        "the new brief's subject must replace the old copy; got:\n{joined}"
+    );
+    project_close();
+}
+
+#[test]
+#[serial]
+fn regenerate_preserves_user_authored_content() {
+    // The replace-on-rerun logic keys off a generator-owned stamp, so
+    // it must never remove pages/layers the user authored themselves.
+    // A user rectangle drawn before generating (and a re-generate
+    // afterwards) must survive untouched.
+    let _dir = open_project("themed-preserve-user");
+    let user_rect = canvas_create_rect(None, 32.0, 32.0, 200.0, 120.0).expect("user rect");
+
+    ai_generate_themed_design(
+        "Pitch deck for an indie coffee roaster",
+        r#"{"format":"deck","themeId":"forest"}"#,
+    )
+    .expect("first");
+    assert_eq!(count_generated_pages(), 1);
+    assert!(
+        document_get_tree()
+            .expect("tree")
+            .iter()
+            .any(|n| n.id == user_rect),
+        "user content must survive the first generate"
+    );
+
+    ai_generate_themed_design(
+        "Pitch deck for an indie coffee roaster",
+        r#"{"format":"deck","themeId":"slate"}"#,
+    )
+    .expect("second");
+    assert_eq!(
+        count_generated_pages(),
+        1,
+        "re-generate replaces only the generated deck"
+    );
+    assert!(
+        document_get_tree()
+            .expect("tree")
+            .iter()
+            .any(|n| n.id == user_rect),
+        "user content must survive a re-generate — only generator output is replaced"
+    );
+    project_close();
+}
+
+#[test]
+#[serial]
+fn extreme_section_count_is_clamped() {
+    // `section_count` is clamped to a legible range ([3, 11] for a
+    // deck) by the shared `resolved_section_count`, which both the
+    // deterministic planner and the LLM-enrichment path now honour.
+    // An absurd request must not produce an absurd slide total.
+    let _dir = open_project("themed-clamp-high");
+    let high = ai_generate_themed_design(
+        "Pitch deck for an indie coffee roaster",
+        r#"{"format":"deck","themeId":"ember","sectionCount":99}"#,
+    )
+    .expect("high");
+    assert_eq!(
+        high.slide_count, 12,
+        "section_count=99 clamps to 11 content cards + 1 title card"
+    );
+
+    let _dir2 = open_project("themed-clamp-low");
+    let low = ai_generate_themed_design(
+        "Pitch deck for an indie coffee roaster",
+        r#"{"format":"deck","themeId":"ember","sectionCount":0}"#,
+    )
+    .expect("low");
+    assert_eq!(
+        low.slide_count, 4,
+        "section_count=0 clamps to 3 content cards + 1 title card"
     );
     project_close();
 }

@@ -65,16 +65,13 @@ expectAssignable<DocumentStatus>({} as DocumentStatusSnake);
 // `NodeInfo` is guarded in BOTH directions so the lockstep can't be
 // silently weakened (a `Pick<NodeInfo, keyof NodeInfoSnake>` guard would
 // pass even if `NodeInfoSnake` dropped a required field like `version`).
-//   1. The napi struct must be a valid public `NodeInfo` — catches a
-//      dropped/renamed/snake_cased required field.
-//   2. It must carry *nothing* the public DTO lacks. The only fields on
-//      `NodeInfo` the napi struct never emits are the optional
-//      `componentInstance` / `metadata`, so stripping those two yields
-//      exactly `NodeInfoSnake` — catches a stray field on either side.
+// The napi struct now emits every public field — including the optional
+// `componentInstance` / `metadata` objects (carried via napi's
+// `serde-json` feature) — so the two shapes are fully mutually
+// assignable. A dropped, renamed, snake_cased, or stray field on either
+// side stops one of these assignments from compiling.
 expectAssignable<NodeInfo>({} as NodeInfoSnake);
-expectAssignable<NodeInfoSnake>(
-  {} as Omit<NodeInfo, "componentInstance" | "metadata">,
-);
+expectAssignable<NodeInfoSnake>({} as NodeInfo);
 
 // G2 template library: `templateThumbnail` reuses the `ThumbnailBytes`
 // napi struct (so a `byte_size` → `byteSize` regression breaks here),

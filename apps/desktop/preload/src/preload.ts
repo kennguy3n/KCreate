@@ -252,15 +252,21 @@ import type {
   Preferences,
 } from "../../shared/scene";
 
-type FrameInfoSnake = {
-  frame_id: number;
+// `kcreate/renderer/frameInfo` and `/acquireFrame` forward the bridge's
+// `#[napi(object)]` structs straight through IPC. napi-rs auto-camelCases the
+// Rust field names (`frame_id` → `frameId`, `byte_length` → `byteLength`), so
+// the object arriving here is camelCase — NOT snake_case like the JSON-string
+// IPC paths. Reading `frame_id` here yields `undefined` and silently freezes
+// the present loop (CanvasHost gates repaints on `frameId` changing).
+type FrameInfoNapi = {
+  frameId: number;
   width: number;
   height: number;
-  byte_length: number;
+  byteLength: number;
 };
 
-type AcquiredFrameSnake = {
-  frame_id: number;
+type AcquiredFrameNapi = {
+  frameId: number;
   width: number;
   height: number;
   bytes: Uint8Array;
@@ -300,6 +306,11 @@ const renderer: RendererBridge = {
       JSON.stringify(scene),
     )) as number;
   },
+  async renderCurrent(): Promise<number | null> {
+    return (await ipcRenderer.invoke(
+      "kcreate/renderer/renderCurrent",
+    )) as number | null;
+  },
   async getFrame(): Promise<Uint8Array | null> {
     const buf = (await ipcRenderer.invoke(
       "kcreate/renderer/getFrame",
@@ -313,19 +324,19 @@ const renderer: RendererBridge = {
   async frameInfo(): Promise<FrameInfo | null> {
     const info = (await ipcRenderer.invoke(
       "kcreate/renderer/frameInfo",
-    )) as FrameInfoSnake | null;
+    )) as FrameInfoNapi | null;
     if (!info) return null;
     return {
-      frameId: info.frame_id,
+      frameId: info.frameId,
       width: info.width,
       height: info.height,
-      byteLength: info.byte_length,
+      byteLength: info.byteLength,
     };
   },
   async acquireFrame(): Promise<AcquiredFrame | null> {
     const frame = (await ipcRenderer.invoke(
       "kcreate/renderer/acquireFrame",
-    )) as AcquiredFrameSnake | null;
+    )) as AcquiredFrameNapi | null;
     if (!frame) return null;
     // Node Buffer is a subclass of Uint8Array; tighten to plain
     // Uint8Array so the renderer doesn't see Node-specific Buffer
@@ -337,7 +348,7 @@ const renderer: RendererBridge = {
       frame.bytes.byteLength,
     );
     return {
-      frameId: frame.frame_id,
+      frameId: frame.frameId,
       width: frame.width,
       height: frame.height,
       bytes,

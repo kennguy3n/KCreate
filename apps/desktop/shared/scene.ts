@@ -210,6 +210,18 @@ export interface RendererBridge {
   ): Promise<void>;
   render(scene: Scene): Promise<number>;
   /**
+   * Re-render the renderer's most recently published scene at the
+   * current viewport and size, returning the new frame id — or `null`
+   * when no scene has been published yet.
+   *
+   * The present surface calls this after a viewport (pan/zoom) or
+   * resize change: those operations mark the renderer dirty but do not
+   * by themselves rebuild a frame, and the document graph is owned by
+   * the bridge, so the host repaints without shipping the scene back
+   * across IPC. Mirrors `kcreate_bridge::state::render_current`.
+   */
+  renderCurrent(): Promise<number | null>;
+  /**
    * Returns a copy of the latest RGBA8 pixel buffer, or null if no frame
    * has been published yet.
    *

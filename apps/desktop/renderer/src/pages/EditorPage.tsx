@@ -51,6 +51,7 @@ import type {
   ProjectInfo,
   SnapGuide,
 } from "../../../shared/scene";
+import { computeContentFit } from "../lib/fitViewport";
 import { LowResourceBanner } from "../components/LowResourceBanner";
 import { useShortcuts } from "../shortcuts/useShortcuts";
 import type { ShortcutHandlers } from "../shortcuts/useShortcuts";
@@ -187,7 +188,6 @@ function EditorPageInner({
     components,
     docStatus,
     resourceLimits,
-    scene,
   } = documentCtx.state;
   const {
     setArtboardPresets,
@@ -501,6 +501,57 @@ function EditorPageInner({
     setViewport({ panX, panY, zoom });
     void window.kcreate.canvas.setSelection([a.id]).then(refreshSelection);
   }, [refreshSelection, setViewport]);
+
+  // Frame the document content in the viewport with ~10% margin. Uses
+  // the union of every artboard's bounds, falling back to the union of
+  // visible, positive-area node bounds when a page carries loose nodes
+  // and no artboards. Same `screen = world * zoom + pan` transform as
+  // `focusArtboard`, solved for the union box. Backs both the
+  // user-facing zoom-to-fit and the one-shot framing on project open,
+  // so the editor always lands on real content rather than the empty
+  // origin artboard.
+  const fitToContent = useCallback(
+    (artboardsOverride?: ArtboardInfo[], nodesOverride?: NodeInfo[]) => {
+      // Prefer the explicit arguments (the one-shot fit effect passes the
+      // freshly-rendered `artboards`/`nodes` state), falling back to the
+      // refs for the event-handler callers (e.g. the zoom-to-fit button),
+      // where the refs are already current. `computeContentFit` frames the
+      // artboards when present and falls back to the union of visible node
+      // bounds for artboard-less pages, dropping zero-area boxes and
+      // returning null when there's nothing to frame.
+      const sourceArtboards = artboardsOverride ?? artboardsRef.current;
+      const sourceNodes = nodesOverride ?? nodesRef.current;
+      const fit = computeContentFit(
+        sourceArtboards,
+        sourceNodes,
+        CANVAS_WIDTH,
+        CANVAS_HEIGHT,
+      );
+      setViewport(fit ?? DEFAULT_VIEWPORT);
+    },
+    [artboardsRef, nodesRef, setViewport],
+  );
+
+  // One-shot: frame the document the first time it has something to
+  // show for a freshly-opened project so the user sees their content
+  // immediately instead of the empty origin. Fires as soon as EITHER
+  // top-level artboards OR (for artboard-less pages) loose nodes are
+  // present — `fitToContent` prefers artboards and falls back to the
+  // union of visible node bounds, so a document whose content lives in
+  // loose nodes at a large world offset still gets framed. Guarded by a
+  // ref so any manual pan/zoom afterwards is never overridden.
+  const didInitialFitRef = useRef(false);
+  useEffect(() => {
+    if (didInitialFitRef.current) return;
+    if (artboards.length === 0 && nodes.length === 0) return;
+    didInitialFitRef.current = true;
+    // Pass the freshly-rendered `nodes` (not `nodesRef`): this effect runs
+    // as a child of `DocumentProvider`, so React fires it before the
+    // provider's ref-sync effect updates `nodesRef.current` for this
+    // render. For artboard-less docs the ref is still the previous (empty)
+    // value here, which would frame nothing and latch `didInitialFitRef`.
+    fitToContent(artboards, nodes);
+  }, [artboards, nodes, fitToContent]);
 
   const handleCreateArtboard = useCallback(
     async (args: { name: string; width: number; height: number }) => {
@@ -1682,10 +1733,8 @@ function EditorPageInner({
   useShortcuts(shortcutHandlers);
 
   const onZoomToFit = useCallback(() => {
-    // No documentBounds API yet; reset to identity. Phase 1 will compute
-    // a bounding box across visible nodes.
-    setViewport(DEFAULT_VIEWPORT);
-  }, [setViewport]);
+    fitToContent();
+  }, [fitToContent]);
 
   // Imperative handle into the AnnotationOverlay. The overlay's root
   // SVG is permanently `pointer-events: none` (so it never blocks
@@ -2061,7 +2110,6 @@ function EditorPageInner({
           <CanvasHost
             width={CANVAS_WIDTH}
             height={CANVAS_HEIGHT}
-            scene={scene}
             viewport={viewport}
             onViewportChange={setViewport}
             onFramePresented={onFrame}

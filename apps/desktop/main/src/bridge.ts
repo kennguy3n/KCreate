@@ -8,15 +8,20 @@ import { createRequire } from "node:module";
 import * as path from "node:path";
 import * as process from "node:process";
 
-type FrameInfoSnake = {
-  frame_id: number;
+// `renderer_frame_info` / `renderer_acquire_frame` return `#[napi(object)]`
+// structs directly (not a JSON string), so napi-rs auto-camelCases the Rust
+// field names: `frame_id` → `frameId`, `byte_length` → `byteLength`. These
+// types must stay camelCase to match the real wire shape — unlike the
+// JSON-stringified `*Snake` types below, which preserve serde's snake_case.
+type FrameInfoNapi = {
+  frameId: number;
   width: number;
   height: number;
-  byte_length: number;
+  byteLength: number;
 };
 
-type AcquiredFrameSnake = {
-  frame_id: number;
+type AcquiredFrameNapi = {
+  frameId: number;
   width: number;
   height: number;
   bytes: Uint8Array;
@@ -165,9 +170,10 @@ export interface Bridge {
     height: number | null,
   ): void;
   rendererRender(sceneJson: string): number;
+  rendererRenderCurrent(): number | null;
   rendererGetFrame(): Uint8Array | null;
-  rendererFrameInfo(): FrameInfoSnake | null;
-  rendererAcquireFrame(): AcquiredFrameSnake | null;
+  rendererFrameInfo(): FrameInfoNapi | null;
+  rendererAcquireFrame(): AcquiredFrameNapi | null;
 
   // Native canvas presentation mode (Phase 1, Block A, Tasks 4–6).
   //

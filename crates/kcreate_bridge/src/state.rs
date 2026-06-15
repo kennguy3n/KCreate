@@ -281,6 +281,80 @@ pub fn current_scene() -> Result<Scene> {
         .ok_or(BridgeError::NotInitialized)
 }
 
+/// Re-render the most recently published scene at the renderer's
+/// current viewport and size, returning the new [`FrameId`] — or
+/// `Ok(None)` when no scene has been published yet (nothing to
+/// repaint) or no renderer is attached (headless / pre-init).
+///
+/// This is the explicit "repaint what's already on screen" entry
+/// point used by the present surface after a viewport (pan/zoom) or
+/// resize change. Those operations mark the renderer dirty but do not
+/// by themselves rebuild a frame, so the host calls this to produce a
+/// fresh frame from the last document-synced scene without shipping
+/// the whole scene back across the IPC boundary every frame.
+///
+/// Unlike [`render_scene`], this borrows the cached scene **in place**
+/// under `scene_slot` and renders it directly — it never clones the
+/// scene out and never writes an identical copy back. For large
+/// documents (thousands of objects) the previous clone-then-write-back
+/// was wasted allocation on the pan/zoom hot path (Devin Review #44).
+///
+/// Lock order is the canonical `slot -> native_slot -> scene_slot`,
+/// matching [`render_scene`] and [`shutdown`]: we take the renderer
+/// lock first, then (native builds only) the native-surface lock, and
+/// finally `scene_slot` for the borrow — so the order can never invert.
+pub fn render_current() -> Result<Option<FrameId>> {
+    let guard = slot().lock();
+    let Some(ctx) = guard.as_ref() else {
+        // No renderer attached (headless / pre-init / post-shutdown):
+        // there is nothing on screen to repaint. Preserves the prior
+        // contract where an empty `scene_slot` yielded `Ok(None)`.
+        return Ok(None);
+    };
+    // Native-surface fast path. Default builds don't compile this
+    // branch (the `native_canvas` feature is off). We acquire
+    // `native_slot` BEFORE `scene_slot` so the borrow path keeps the
+    // same `slot -> native_slot -> scene_slot` order as `render_scene`.
+    #[cfg(feature = "native_canvas")]
+    {
+        let native = native_slot().lock();
+        if let Some(surface) = native.as_ref() {
+            let scene_guard = scene_slot().lock();
+            let id = match scene_guard.as_ref() {
+                Some(scene) => Some(ctx.render_frame_native(scene, surface)?),
+                None => None,
+            };
+            drop(scene_guard);
+            drop(native);
+            drop(guard);
+            return Ok(id);
+        }
+    }
+    let scene_guard = scene_slot().lock();
+    let id = match scene_guard.as_ref() {
+        Some(scene) => Some(ctx.render_frame(scene)?),
+        None => None,
+    };
+    drop(scene_guard);
+    drop(guard);
+    Ok(id)
+}
+
+/// Drop the cached scene without tearing down the renderer.
+///
+/// Called by [`crate::document::project_close`] so a closed project's
+/// scene neither lingers in renderer memory nor can be repainted by a
+/// later [`render_current`] (which would otherwise flash stale content
+/// from the previous project before a new one is synced). The renderer
+/// itself — and its last presented frame — stays intact so the host can
+/// keep presenting until it unmounts the canvas.
+///
+/// Acquire-then-drop: holds only `scene_slot` for the duration of the
+/// assignment, so it can never participate in a lock-order inversion.
+pub fn clear_scene() {
+    *scene_slot().lock() = None;
+}
+
 /// Snapshot of the latest published frame (RGBA8). Copies bytes out so
 /// we don't hold the presenter's read lock across the N-API boundary.
 pub fn get_frame_bytes() -> Result<Option<Vec<u8>>> {
@@ -548,6 +622,141 @@ mod tests {
             first, second,
             "no new dirty region should reuse the previous frame id"
         );
+        shutdown();
+    }
+
+    /// Scene JSON used by the render-content guards: an 8×8 red rect on a
+    /// black background, sized to land entirely inside a 32×16 target at
+    /// the default (identity) viewport.
+    const RED_RECT_ON_BLACK: &str = r#"{
+        "clear_color": [0.0, 0.0, 0.0, 1.0],
+        "objects": [{
+            "id": 1, "z": 0, "translation": [0.0, 0.0],
+            "style": { "fill": [1.0, 0.0, 0.0, 1.0], "stroke": null },
+            "kind": { "type": "rect", "x": 4.0, "y": 4.0, "width": 8.0, "height": 8.0 }
+        }]
+    }"#;
+
+    /// Count strongly-red pixels (object fill) in an RGBA8 buffer.
+    fn count_red(bytes: &[u8]) -> usize {
+        bytes
+            .chunks_exact(4)
+            .filter(|p| p[0] > 200 && p[1] < 50 && p[2] < 50)
+            .count()
+    }
+
+    #[test]
+    #[serial]
+    fn render_current_before_any_render_is_none() {
+        reset_for_tests();
+        init(32, 16).expect("init");
+        // Nothing has been published yet, so there is no scene to repaint.
+        assert!(
+            render_current().expect("render_current").is_none(),
+            "render_current must be None before any scene is published"
+        );
+        shutdown();
+    }
+
+    #[test]
+    #[serial]
+    fn render_current_repaints_last_published_scene() {
+        reset_for_tests();
+        init(32, 16).expect("init");
+
+        // Publish a scene, then prove it actually painted the object.
+        let first = render(RED_RECT_ON_BLACK).expect("render");
+        let before = acquire_frame().expect("acquire").expect("some");
+        let red_before = count_red(&before.bytes);
+        assert!(
+            red_before > 0,
+            "object render must produce non-background (red) pixels, got {red_before}"
+        );
+
+        // Without re-dirtying, the renderer reuses the cached frame, so
+        // render_current returns the same id (no wasted GPU work).
+        let cached = render_current()
+            .expect("render_current")
+            .expect("scene published");
+        assert_eq!(
+            cached, first,
+            "render_current with no new dirty region reuses the cached frame id"
+        );
+
+        // After an invalidate, render_current must rebuild the SAME scene
+        // (not an empty one): a new frame id, still carrying the object.
+        invalidate(None).expect("invalidate");
+        let repainted = render_current()
+            .expect("render_current")
+            .expect("scene still published");
+        assert_ne!(
+            repainted, first,
+            "render_current after invalidate must publish a new frame"
+        );
+        let after = acquire_frame().expect("acquire").expect("some");
+        assert_eq!(
+            after.frame_id, repainted.0,
+            "acquired frame id must match the repaint"
+        );
+        assert_eq!(
+            count_red(&after.bytes),
+            red_before,
+            "repaint must reproduce the published scene, not a blank frame"
+        );
+
+        shutdown();
+    }
+
+    #[test]
+    #[serial]
+    fn clear_scene_drops_cached_scene_so_render_current_is_none() {
+        // `project_close` calls `clear_scene` so a closed project's scene
+        // can't be repainted by a later `render_current`. The renderer
+        // stays attached; only the cached scene is dropped.
+        reset_for_tests();
+        init(32, 16).expect("init");
+        render(RED_RECT_ON_BLACK).expect("render");
+        // Sanity: the scene is cached and repaintable.
+        assert!(
+            render_current().expect("render_current").is_some(),
+            "a published scene must be repaintable before clear_scene"
+        );
+
+        clear_scene();
+
+        // After clearing, there is nothing to repaint even though the
+        // renderer is still initialized (so this is `Ok(None)`, not an
+        // error).
+        assert!(
+            render_current().expect("render_current").is_none(),
+            "render_current must be None after clear_scene drops the cached scene"
+        );
+        shutdown();
+    }
+
+    #[test]
+    #[serial]
+    fn render_paints_non_background_pixels() {
+        // Golden guard against the blank-canvas regression: rendering a
+        // scene with an object must yield pixels that differ from the
+        // clear color. A frame that is entirely the background color
+        // (the symptom of the WS-2 bug) fails here.
+        reset_for_tests();
+        init(32, 16).expect("init");
+        render(RED_RECT_ON_BLACK).expect("render");
+        let frame = acquire_frame().expect("acquire").expect("some");
+
+        let total = (frame.width * frame.height) as usize;
+        let red = count_red(&frame.bytes);
+        assert!(
+            red > 0,
+            "expected the red rect to paint at least one pixel, got 0 of {total}"
+        );
+        assert!(
+            red < total,
+            "expected background pixels to remain, but all {total} pixels were the object color"
+        );
+
         shutdown();
     }
 }

@@ -225,6 +225,21 @@ pub fn renderer_render(scene_json: String) -> NapiResult<u32> {
     Ok(id.0 as u32)
 }
 
+/// Re-render the renderer's most recently published scene at the
+/// current viewport and size, returning the new `frameId` — or `null`
+/// when no scene has been published yet.
+///
+/// The present surface calls this after a viewport (pan/zoom) or
+/// resize change so a fresh frame is produced without round-tripping
+/// the whole scene back across IPC. The document graph is owned by the
+/// bridge, so the host never needs to send a scene for a repaint that
+/// doesn't change content.
+#[napi]
+pub fn renderer_render_current() -> NapiResult<Option<u32>> {
+    let id = state::render_current().map_err(map_err)?;
+    Ok(id.map(|id| id.0 as u32))
+}
+
 /// Returns the latest published frame as an RGBA8 `Buffer`, or `null`
 /// if no frame has been rendered yet.
 #[napi]

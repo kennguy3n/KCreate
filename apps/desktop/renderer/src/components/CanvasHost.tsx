@@ -1,14 +1,21 @@
 // CanvasHost — renderer-side presentation surface.
 //
 // This component does NOT render the scene itself. The Rust
-// `kcreate_renderer` crate owns the entire rendering pipeline; this
-// component is purely a presentation surface:
+// `kcreate_renderer` crate owns the entire rendering pipeline and the
+// bridge owns the document graph, so the scene never travels back
+// through JS. This component is purely a presentation surface:
 //   1. Owns an HTML `<canvas>` of the editor viewport dimensions.
-//   2. On every `requestAnimationFrame`, asks the Rust renderer for the
-//      latest frame via the preload-exposed IPC bridge.
+//   2. On every `requestAnimationFrame`, polls the renderer's cheap
+//      frame metadata (`frameInfo()`) over the preload-exposed IPC
+//      bridge and only pulls the full pixel buffer (`acquireFrame()`)
+//      when the published frame id actually advanced.
 //   3. Writes the returned RGBA8 pixel buffer to the canvas via
 //      `putImageData`.
-//   4. Forwards pointer / keyboard events to the bridge so Rust can do
+//   4. On a viewport (pan/zoom) or resize change, asks the renderer to
+//      repaint the current document via `renderCurrent()` — those
+//      operations mark the renderer dirty but do not by themselves
+//      rebuild a frame.
+//   5. Forwards pointer / keyboard events to the bridge so Rust can do
 //      hit testing and tool state.
 //
 // Phase 1, Block A, Task 6 added a dual-mode surface: when `mode` is
@@ -20,8 +27,6 @@
 // works identically in both modes.
 
 import { useCallback, useEffect, useRef, useState } from "react";
-
-import type { Scene } from "../../../shared/scene";
 
 export interface ViewportState {
   panX: number;
@@ -69,12 +74,6 @@ export interface CanvasHostProps {
    * user and to clear their settings toggle.
    */
   onNativeFallback?: (reason: string) => void;
-  /**
-   * The current scene to render. The component sends this to the Rust
-   * renderer when it changes. Sending the same scene object twice is
-   * fine — the renderer's display-list cache short-circuits the work.
-   */
-  scene: Scene;
   /**
    * Viewport pan + zoom. Sent to the renderer when it changes.
    */
@@ -154,7 +153,6 @@ export function CanvasHost(props: CanvasHostProps): JSX.Element {
   // calls — the Rust side also dedupes internally, but skipping the IPC
   // round-trip is strictly better for end-to-end latency.
   const lastSentViewportRef = useRef<Viewport | null>(null);
-  const sceneRef = useRef<Scene>(props.scene);
   const viewportRef = useRef<Viewport>(props.viewport ?? ZERO_VIEWPORT);
   const dprRef = useRef<number>(
     typeof window === "undefined" ? 1 : window.devicePixelRatio || 1,
@@ -171,7 +169,6 @@ export function CanvasHost(props: CanvasHostProps): JSX.Element {
   activeModeRef.current = activeMode;
 
   // Keep refs up to date on every render.
-  sceneRef.current = props.scene;
   viewportRef.current = props.viewport ?? ZERO_VIEWPORT;
 
   // Init / rAF loop. This effect runs ONCE per component mount — its
@@ -234,23 +231,52 @@ export function CanvasHost(props: CanvasHostProps): JSX.Element {
         return;
       }
 
+      // Present whatever the renderer has already published for the
+      // current document at this freshly-initialised size + viewport.
+      // If a project was opened before this surface mounted, its frame
+      // shows immediately; if nothing has been rendered yet,
+      // `renderCurrent()` resolves to null and the first document sync
+      // drives the first frame. A transient failure here must not abort
+      // the present loop, so it is best-effort.
+      try {
+        await bridge.renderCurrent();
+      } catch (err) {
+        console.warn("kcreate initial renderCurrent failed", err);
+      }
+
       const tick = async (): Promise<void> => {
         if (cancelled) return;
         try {
-          // Only sync the viewport if the host actually changed it.
-          // Saves an IPC round trip per frame for the steady-state /
-          // static-viewport case. The Rust side also dedupes, but
-          // skipping the IPC round-trip avoids serializing / awaiting
-          // a no-op promise.
+          // Sync the viewport only when the host actually changed it,
+          // then ask the renderer to repaint the current document at the
+          // new viewport. A pan/zoom marks the renderer dirty but does
+          // not by itself rebuild a frame, so without this the canvas
+          // would not follow the viewport. Skipping the IPC round-trip
+          // when nothing changed keeps the steady-state (static
+          // viewport) case free.
           const vp = viewportRef.current;
           const last = lastSentViewportRef.current;
           if (!last || !viewportEquals(last, vp)) {
             await bridge.setViewport(vp.panX, vp.panY, vp.zoom);
             lastSentViewportRef.current = { ...vp };
+            await bridge.renderCurrent();
           }
 
-          const frameId = await bridge.render(sceneRef.current);
-          if (frameId !== lastFrameIdRef.current) {
+          // Present path. Poll the latest published frame id with the
+          // cheap `frameInfo()` metadata call and only pay for the full
+          // pixel readback (`acquireFrame`, ~W×H×4 bytes across IPC)
+          // when the frame actually advanced. The renderer publishes a
+          // new frame whenever the document mutates (the bridge
+          // invalidates + re-renders on each scene sync) or when
+          // `renderCurrent()` runs above for a viewport / resize change,
+          // so a static document costs one metadata poll per rAF tick
+          // and zero pixel copies.
+          const info = await bridge.frameInfo();
+          if (info && info.frameId !== lastFrameIdRef.current) {
+            // Default to the id we observed via the metadata poll. In
+            // offscreen mode we replace this with the id of the frame we
+            // actually acquired below, which may be newer.
+            let presentedId = info.frameId;
             // In native mode the Rust side has already presented the
             // frame directly to the platform window surface — there
             // is nothing for the host to do beyond bookkeeping. Skip
@@ -272,16 +298,21 @@ export function CanvasHost(props: CanvasHostProps): JSX.Element {
                   imageDataRef.current!.data.set(frame.bytes);
                   ctx.putImageData(imageDataRef.current!, 0, 0);
                 }
+                // The renderer may have published a newer frame between
+                // the `frameInfo()` poll and this `acquireFrame()`. Record
+                // the id we actually consumed so the next tick doesn't
+                // re-download a frame we've already presented.
+                presentedId = frame.frameId;
               }
             }
-            lastFrameIdRef.current = frameId;
-            props.onFramePresented?.(frameId);
+            lastFrameIdRef.current = presentedId;
+            props.onFramePresented?.(presentedId);
           }
         } catch (err) {
           // Surfacing the error to React state would unmount the
-          // component; that's heavy-handed for a transient render
+          // component; that's heavy-handed for a transient present
           // failure. Log it for the devtools and try again next frame.
-          console.warn("kcreate render tick failed", err);
+          console.warn("kcreate present tick failed", err);
         } finally {
           if (!cancelled) {
             rafHandle = requestAnimationFrame(() => {
@@ -413,9 +444,12 @@ export function CanvasHost(props: CanvasHostProps): JSX.Element {
     const dpr = dprRef.current;
     const wPx = Math.max(1, Math.round(props.width * dpr));
     const hPx = Math.max(1, Math.round(props.height * dpr));
-    void bridge.resize(wPx, hPx).catch(() => {
-      /* renderer may not be initialized yet; init effect will catch up */
-    });
+    void bridge
+      .resize(wPx, hPx)
+      .then(() => bridge.renderCurrent())
+      .catch(() => {
+        /* renderer may not be initialized yet; init effect will catch up */
+      });
     const canvas = canvasRef.current;
     if (canvas && ctxRef.current) {
       canvas.width = wPx;

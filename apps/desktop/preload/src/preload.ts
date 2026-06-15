@@ -408,137 +408,29 @@ const renderer: RendererBridge = {
   },
 };
 
-// Snake-case shapes returned from the native bridge. Documented here in
-// the preload so the renderer-facing API is unambiguously camelCase.
-type ProjectInfoSnake = {
-  id: string;
-  name: string;
-  path: string;
-  created_at: string;
-  modified_at: string;
-};
-
-type BoundsSnake = {
-  x: number;
-  y: number;
-  width: number;
-  height: number;
-};
-
-type NodeInfoSnake = {
-  id: string;
-  node_type: string;
-  parent_id: string | null;
-  children: string[];
-  name: string;
-  visible: boolean;
-  locked: boolean;
-  /// Axis-aligned bounds in document space. Mirrors
-  /// `kcreate_core::Node::bounds`; the napi bridge carries it as
-  /// `bounds` directly on every NodeInfo so the renderer can render
-  /// hotspots / hit-test overlays without a second IPC round trip.
-  bounds: BoundsSnake;
-  /// Monotonically-increasing revision counter. Mirrors
-  /// `kcreate_core::node::Node::version` and is carried verbatim
-  /// over the bridge as `version` (not `node_version`) — used by
-  /// renderer panels as a dependency-array signal so their hydrate
-  /// effects refire after undo/redo / collab edits on the same node.
-  version: number;
-  /// Already camelCased on the Rust side via #[serde(rename)]. We
-  /// pass it through verbatim because the inner field names are
-  /// also camelCased (definitionId / activeVariantId).
-  componentInstance?: {
-    definitionId: string;
-    activeVariantId: string;
-    overrides: Record<string, unknown>;
-  };
-  /// Free-form metadata mirror of `Node::metadata`. Omitted when
-  /// empty (Rust skips serializing empty maps).
-  metadata?: Record<string, unknown>;
-};
-
-type RuntimeStatusSnake = {
-  device_tier: string;
-  gpu_available: boolean;
-  gpu_name: string | null;
-  platform: string;
-  total_ram_mb: number;
-};
-
-function projectFromSnake(p: ProjectInfoSnake): ProjectInfo {
-  return {
-    id: p.id,
-    name: p.name,
-    path: p.path,
-    createdAt: p.created_at,
-    modifiedAt: p.modified_at,
-  };
-}
-
-function nodeFromSnake(n: NodeInfoSnake): NodeInfo {
-  return {
-    id: n.id,
-    nodeType: n.node_type,
-    parentId: n.parent_id,
-    children: n.children,
-    name: n.name,
-    visible: n.visible,
-    locked: n.locked,
-    bounds: {
-      x: n.bounds.x,
-      y: n.bounds.y,
-      width: n.bounds.width,
-      height: n.bounds.height,
-    },
-    version: n.version,
-    ...(n.componentInstance ? { componentInstance: n.componentInstance } : {}),
-    ...(n.metadata ? { metadata: n.metadata } : {}),
-  };
-}
-
-type DocumentStatusSnake = {
-  node_count: number;
-  can_undo: boolean;
-  can_redo: boolean;
-  undo_depth: number;
-  redo_depth: number;
-};
-
-function documentStatusFromSnake(s: DocumentStatusSnake): DocumentStatus {
-  return {
-    nodeCount: s.node_count,
-    canUndo: s.can_undo,
-    canRedo: s.can_redo,
-    undoDepth: s.undo_depth,
-    redoDepth: s.redo_depth,
-  };
-}
-
-function runtimeFromSnake(s: RuntimeStatusSnake): RuntimeStatus {
-  return {
-    deviceTier: s.device_tier,
-    gpuAvailable: s.gpu_available,
-    gpuName: s.gpu_name,
-    platform: s.platform,
-    totalRamMb: s.total_ram_mb,
-  };
-}
+// `project_*`, `document_get_tree`, `document_status` and `runtime_status`
+// are exported from the bridge as `#[napi(object)]` structs. napi-rs emits
+// those field identifiers in camelCase (e.g. `node_type` → `nodeType`,
+// `total_ram_mb` → `totalRamMb`), so the returned values already match the
+// camelCase `ProjectInfo` / `NodeInfo` / `DocumentStatus` / `RuntimeStatus`
+// interfaces in `shared/scene.ts` verbatim. We cast them through directly,
+// exactly like `recentProjects.list()` below. (Earlier converters here
+// mis-read these as snake_case, which silently dropped every multi-word
+// field — the cause of the blank RAM badge and the empty "Type" field.)
 
 const document: DocumentBridge = {
   async createProject(name, dir): Promise<ProjectInfo> {
-    const raw = (await ipcRenderer.invoke(
+    return (await ipcRenderer.invoke(
       "kcreate/project/create",
       name,
       dir,
-    )) as ProjectInfoSnake;
-    return projectFromSnake(raw);
+    )) as ProjectInfo;
   },
   async openProject(dir): Promise<ProjectInfo> {
-    const raw = (await ipcRenderer.invoke(
+    return (await ipcRenderer.invoke(
       "kcreate/project/open",
       dir,
-    )) as ProjectInfoSnake;
-    return projectFromSnake(raw);
+    )) as ProjectInfo;
   },
   async saveProject(): Promise<void> {
     await ipcRenderer.invoke("kcreate/project/save");
@@ -547,10 +439,9 @@ const document: DocumentBridge = {
     await ipcRenderer.invoke("kcreate/project/close");
   },
   async getProjectInfo(): Promise<ProjectInfo | null> {
-    const raw = (await ipcRenderer.invoke(
+    return (await ipcRenderer.invoke(
       "kcreate/project/getInfo",
-    )) as ProjectInfoSnake | null;
-    return raw ? projectFromSnake(raw) : null;
+    )) as ProjectInfo | null;
   },
   async isUntouched(): Promise<boolean> {
     return (await ipcRenderer.invoke(
@@ -558,10 +449,9 @@ const document: DocumentBridge = {
     )) as boolean;
   },
   async getDocumentTree(): Promise<NodeInfo[]> {
-    const raw = (await ipcRenderer.invoke(
+    return (await ipcRenderer.invoke(
       "kcreate/document/getTree",
-    )) as NodeInfoSnake[];
-    return raw.map(nodeFromSnake);
+    )) as NodeInfo[];
   },
   /**
    * Phase 11 Block D Task 21 — read the workspace version counter
@@ -683,19 +573,17 @@ const document: DocumentBridge = {
     )) as boolean;
   },
   async status(): Promise<DocumentStatus | null> {
-    const raw = (await ipcRenderer.invoke(
+    return (await ipcRenderer.invoke(
       "kcreate/document/status",
-    )) as DocumentStatusSnake | null;
-    return raw ? documentStatusFromSnake(raw) : null;
+    )) as DocumentStatus | null;
   },
 };
 
 const runtime: RuntimeBridge = {
   async status(): Promise<RuntimeStatus> {
-    const raw = (await ipcRenderer.invoke(
+    return (await ipcRenderer.invoke(
       "kcreate/runtime/status",
-    )) as RuntimeStatusSnake;
-    return runtimeFromSnake(raw);
+    )) as RuntimeStatus;
   },
   async tempDir(): Promise<string> {
     return (await ipcRenderer.invoke("kcreate/runtime/tempDir")) as string;

@@ -27,12 +27,19 @@ type AcquiredFrameNapi = {
   bytes: Uint8Array;
 };
 
+// `ProjectInfoSnake` / `NodeInfoSnake` / `RuntimeStatusSnake` /
+// `DocumentStatusSnake` mirror the `#[napi(object)]` structs of the same
+// stem in `crates/kcreate_bridge/src/lib.rs`. As with `UndoRedoOutcome`
+// below, napi-rs rewrites the Rust snake_case field identifiers to
+// camelCase on the JS side (`node_type` → `nodeType`, `total_ram_mb` →
+// `totalRamMb`), so these wire shapes are camelCase even though the
+// `*Snake` suffix is the house convention for "raw bridge return shape".
 type ProjectInfoSnake = {
   id: string;
   name: string;
   path: string;
-  created_at: string;
-  modified_at: string;
+  createdAt: string;
+  modifiedAt: string;
 };
 
 type BoundsSnake = {
@@ -44,8 +51,8 @@ type BoundsSnake = {
 
 type NodeInfoSnake = {
   id: string;
-  node_type: string;
-  parent_id: string | null;
+  nodeType: string;
+  parentId: string | null;
   children: string[];
   name: string;
   visible: boolean;
@@ -58,19 +65,19 @@ type NodeInfoSnake = {
 };
 
 type RuntimeStatusSnake = {
-  device_tier: string;
-  gpu_available: boolean;
-  gpu_name: string | null;
+  deviceTier: string;
+  gpuAvailable: boolean;
+  gpuName: string | null;
   platform: string;
-  total_ram_mb: number;
+  totalRamMb: number;
 };
 
 type DocumentStatusSnake = {
-  node_count: number;
-  can_undo: boolean;
-  can_redo: boolean;
-  undo_depth: number;
-  redo_depth: number;
+  nodeCount: number;
+  canUndo: boolean;
+  canRedo: boolean;
+  undoDepth: number;
+  redoDepth: number;
 };
 
 // Mirror of `crates/kcreate_bridge/src/lib.rs::UndoRedoOutcome`. The

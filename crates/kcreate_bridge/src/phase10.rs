@@ -31,7 +31,7 @@
 //!   * `export_pdf_multi` — multi-page PDF with TOC + outline.
 //!   * `preferences_load` / `preferences_save`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use base64::Engine as _;
@@ -1771,26 +1771,62 @@ enum RefineDirective {
     Rephrase,
 }
 
-/// Map a free-text instruction to a [`RefineDirective`]. Imagery
-/// intent is checked first (so "remove the photo" toggles imagery,
-/// not the section count), then the minimal / more / less buckets.
+/// Map a free-text instruction to a [`RefineDirective`].
+///
+/// Order matters: imagery intent is checked first (so "remove the photo"
+/// toggles imagery, not the section count), then the `Minimal` bucket,
+/// then — crucially — `LessContent` *before* `MoreContent`.
+///
+/// Direction (more vs. less) is decided by intent **verbs** only. Bare
+/// structure nouns ("section", "slide", "page", "bullet") are
+/// deliberately NOT direction signals because they appear on both sides
+/// ("add a section" vs. "fewer sections"); letting them imply
+/// `MoreContent` made "fewer sections" / "trim the slides" / "remove a
+/// bullet" grow the design instead of shrinking it.
+///
+/// Single-word keywords are matched against the tokenized word set (so
+/// "cut" fires on the word "cut" but not inside "exe**cut**ive"), while
+/// multi-word keywords ("get rid", "less busy") fall back to substring
+/// search. The tokenization is what makes checking `LessContent` first
+/// safe — a naive `contains` would let a reduce keyword embedded in an
+/// unrelated word flip an addition.
 fn parse_refine_directive(instruction: &str) -> RefineDirective {
     let s = instruction.to_lowercase();
-    let has = |words: &[&str]| words.iter().any(|w| s.contains(w));
-    let imagery = has(&[
+    let words: HashSet<&str> = s
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .collect();
+    // Single-word needles match whole tokens; multi-word needles (those
+    // containing a space) match as substrings so phrases still work.
+    let has = |needles: &[&str]| {
+        needles.iter().any(|n| {
+            if n.contains(' ') {
+                s.contains(n)
+            } else {
+                words.contains(n)
+            }
+        })
+    };
+
+    if has(&[
         "image",
+        "images",
         "imagery",
         "photo",
+        "photos",
         "picture",
+        "pictures",
         "hero",
         "illustration",
+        "illustrations",
         "visual",
+        "visuals",
         "graphic",
+        "graphics",
         "artwork",
-    ]);
-    if imagery {
+    ]) {
         let negated = has(&[
-            "no ", "without", "remove", "drop", "hide", "get rid", "less", "fewer",
+            "no", "without", "remove", "drop", "hide", "get rid", "less", "fewer",
         ]);
         return if negated {
             RefineDirective::RemoveImagery
@@ -1800,6 +1836,7 @@ fn parse_refine_directive(instruction: &str) -> RefineDirective {
     }
     if has(&[
         "minimal",
+        "minimalist",
         "simpler",
         "simplify",
         "cleaner",
@@ -1810,16 +1847,26 @@ fn parse_refine_directive(instruction: &str) -> RefineDirective {
     ]) {
         return RefineDirective::Minimal;
     }
+    // Reduce intent is checked before add intent so an explicit "fewer" /
+    // "remove" / "cut" wins even when an add-ish word is also present, and
+    // so a structure noun can never flip a reduction into an addition.
     if has(&[
-        "more", "add", "expand", "detailed", "longer", "another", "extra", "section", "slide",
-        "page", "bullet",
-    ]) {
-        return RefineDirective::MoreContent;
-    }
-    if has(&[
-        "fewer", "shorter", "condense", "trim", "less", "reduce", "cut", "tighten", "concise",
+        "fewer", "less", "reduce", "remove", "drop", "delete", "cut", "trim", "shorter", "shorten",
+        "condense", "tighten", "concise",
     ]) {
         return RefineDirective::LessContent;
+    }
+    if has(&[
+        "more",
+        "add",
+        "expand",
+        "detailed",
+        "longer",
+        "another",
+        "extra",
+        "additional",
+    ]) {
+        return RefineDirective::MoreContent;
     }
     RefineDirective::Rephrase
 }
@@ -2633,6 +2680,107 @@ mod tests {
         artboard.parent_id = Some(group);
         let artboard = doc.insert_node(artboard).unwrap();
         assert_eq!(ordered_export_units(&doc), vec![artboard]);
+    }
+
+    #[test]
+    fn refine_directive_reduce_intent_wins_over_structure_nouns() {
+        // Regression: bare structure nouns ("section", "slide", "page",
+        // "bullet") used to imply MoreContent and were checked before
+        // LessContent, so a clear *reduction* that happened to name a
+        // structural unit grew the design instead of shrinking it.
+        for instruction in [
+            "fewer sections",
+            "trim the slides down",
+            "cut a page",
+            "reduce the number of slides",
+            "remove a bullet",
+            "drop a slide",
+            "delete the last section",
+            "shorten it by a page",
+        ] {
+            assert_eq!(
+                parse_refine_directive(instruction),
+                RefineDirective::LessContent,
+                "{instruction:?} should reduce content"
+            );
+        }
+    }
+
+    #[test]
+    fn refine_directive_add_intent_still_increases() {
+        for instruction in [
+            "add a pricing slide",
+            "another section please",
+            "expand the deck",
+            "more detail on pricing",
+            "give it an extra page",
+            "make the body longer",
+        ] {
+            assert_eq!(
+                parse_refine_directive(instruction),
+                RefineDirective::MoreContent,
+                "{instruction:?} should add content"
+            );
+        }
+    }
+
+    #[test]
+    fn refine_directive_imagery_intent_is_checked_first() {
+        assert_eq!(
+            parse_refine_directive("add a hero image"),
+            RefineDirective::AddImagery
+        );
+        assert_eq!(
+            parse_refine_directive("more photos"),
+            RefineDirective::AddImagery
+        );
+        // Negated imagery wins over the section-count buckets even though
+        // "remove"/"fewer" are also reduce verbs.
+        assert_eq!(
+            parse_refine_directive("remove the hero image"),
+            RefineDirective::RemoveImagery
+        );
+        assert_eq!(
+            parse_refine_directive("no illustrations"),
+            RefineDirective::RemoveImagery
+        );
+    }
+
+    #[test]
+    fn refine_directive_minimal_and_rephrase() {
+        assert_eq!(
+            parse_refine_directive("make it more minimal"),
+            RefineDirective::Minimal
+        );
+        assert_eq!(
+            parse_refine_directive("less busy please"),
+            RefineDirective::Minimal
+        );
+        // No structural / imagery intent → just re-derive the copy.
+        assert_eq!(
+            parse_refine_directive("punchier headlines"),
+            RefineDirective::Rephrase
+        );
+        assert_eq!(
+            parse_refine_directive("friendlier tone"),
+            RefineDirective::Rephrase
+        );
+    }
+
+    #[test]
+    fn refine_directive_word_matching_avoids_substring_false_positives() {
+        // "executive" contains "cut" as a substring; whole-word matching
+        // must not treat it as a LessContent reduce verb. With no real
+        // intent verb present this is a pure rephrase.
+        assert_eq!(
+            parse_refine_directive("make the tone more executive"),
+            RefineDirective::MoreContent,
+            "an explicit 'more' should still add, despite 'executive' containing 'cut'"
+        );
+        assert_eq!(
+            parse_refine_directive("a more executive voice"),
+            RefineDirective::MoreContent
+        );
     }
 
     #[test]

@@ -281,12 +281,65 @@ struct NodeCacheEntry {
     z_advance: i32,
 }
 
-#[derive(Debug, Default)]
+/// Phase 11 perf-at-scale — full-scene fast-path cache.
+///
+/// The per-node [`NodeCacheEntry`] cache only spares the *leaf metadata
+/// walk* for unchanged nodes; [`SceneSync::sync_document_to_scene`]
+/// still recurses the entire tree, rebuilds the reverse id map, sweeps
+/// four `HashMap`s, and runs an `O(N log N)` z-sort on **every** call —
+/// even when the document graph has not changed at all. That happens
+/// constantly: a [`SceneSync::sync_document_to_scene`] fires on every
+/// `canvas_hit_test` (i.e. every hover/move the host queries) and on
+/// every selection change, neither of which mutates the graph. For a
+/// large document that is `O(N log N)` of pure waste per pointer event.
+///
+/// This snapshot holds the *content* objects (everything the tree walk
+/// emitted, **before** selection highlights) from the last full
+/// rebuild, already in the staged order the rebuild produced. When the
+/// next sync sees an empty dirty set and no structural change, it
+/// clones these objects and re-appends only the (selection-sized,
+/// not document-sized) highlight overlay — skipping the walk, the map
+/// rebuild, and the four sweeps entirely. The single batched z-sort is
+/// retained so the output is byte-for-byte identical to a full rebuild.
+#[derive(Debug, Clone)]
+struct ContentSceneCache {
+    /// Objects emitted by the document tree walk, excluding selection
+    /// highlights. Staged exactly as the producing full rebuild left
+    /// them so re-appending highlights + one sort reproduces it.
+    content_objects: Vec<Object>,
+    /// The `z` counter value immediately after the content walk, i.e.
+    /// the base `z` the highlight loop starts from.
+    content_z: i32,
+    /// `overlay_watermark` as the producing rebuild left it, so a
+    /// follow-up `append_presence_cursors` resumes the same id stream.
+    overlay_watermark: u64,
+    /// Whether the full rebuild that produced this cache was given a
+    /// `blob_store`. Raster emit is the one content path whose output
+    /// depends on `blob_store` presence: with `Some` it emits the real
+    /// image, with `None` it emits a coloured placeholder rect. The
+    /// fast path replays cached content *verbatim* and never consults
+    /// `blob_store`, so serving this cache when the caller's
+    /// `blob_store.is_some()` no longer matches would leave a stale
+    /// placeholder (or a stale image) on screen. The fast-path guard
+    /// compares this against the current call's `blob_store.is_some()`
+    /// and falls through to a full rebuild on any transition. Both
+    /// production callers currently always pass `Some`, so this is
+    /// defensive against a future caller that does not.
+    blob_store_present: bool,
+}
+
+#[derive(Debug)]
 pub struct SceneSync {
     uuid_to_object_id: HashMap<Uuid, ObjectId>,
     object_id_to_uuid: HashMap<ObjectId, Uuid>,
     next_id: AtomicU64,
     overlay_watermark: u64,
+    /// Phase 11 perf-at-scale — snapshot of the last full rebuild's
+    /// content objects, used to short-circuit a no-op-document sync
+    /// (hit-test / selection change) without re-walking the tree.
+    /// `None` until the first sync and whenever the cache is
+    /// conservatively invalidated. See [`ContentSceneCache`].
+    content_cache: Option<ContentSceneCache>,
     /// Per-node cache of previously-emitted display-list objects.
     /// Only populated for leaf node types whose `emit_*` is a pure
     /// function of `(node, blob_store)` — Vector, Raster, Text.
@@ -301,6 +354,31 @@ pub struct SceneSync {
     /// from `node_cache` so a cache miss can still update the
     /// version table without allocating an empty entry.
     last_version: HashMap<Uuid, u64>,
+    /// Test-only counter: how many times the no-op-document fast
+    /// path ([`Self::sync_from_content_cache`]) has been taken since
+    /// this `SceneSync` was constructed. Output-equality with a full
+    /// rebuild alone cannot prove the fast path actually ran (that is
+    /// precisely the property under test), so the tests read this
+    /// per-instance counter to assert the branch was exercised. It is
+    /// `#[cfg(test)]` and compiled out of production builds entirely.
+    #[cfg(test)]
+    fast_path_hits: u64,
+}
+
+impl Default for SceneSync {
+    /// Delegates to [`SceneSync::new`] so a `default()`-constructed
+    /// instance is identical to a `new()`-constructed one. The derived
+    /// `Default` would instead zero `next_id` and `overlay_watermark`,
+    /// which is wrong on both counts: the document-object allocator
+    /// would hand out `ObjectId(0)` — the reserved "no object" sentinel
+    /// — for the first node, and `overlay_watermark` would start below
+    /// [`OVERLAY_ID_THRESHOLD`] so [`is_overlay_id`] would mis-classify
+    /// the first artboard overlay as a document object. `thumbnails.rs`
+    /// constructs an ephemeral `SceneSync::default()` per render, so the
+    /// two constructors must agree.
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl SceneSync {
@@ -312,8 +390,11 @@ impl SceneSync {
             // ObjectId(0) is reserved as a sentinel for "no object".
             next_id: AtomicU64::new(1),
             overlay_watermark: OVERLAY_ID_THRESHOLD,
+            content_cache: None,
             node_cache: HashMap::new(),
             last_version: HashMap::new(),
+            #[cfg(test)]
+            fast_path_hits: 0,
         }
     }
 
@@ -363,6 +444,7 @@ impl SceneSync {
         self.object_id_to_uuid.clear();
         self.next_id.store(1, Ordering::Relaxed);
         self.overlay_watermark = OVERLAY_ID_THRESHOLD;
+        self.content_cache = None;
         self.node_cache.clear();
         self.last_version.clear();
     }
@@ -536,7 +618,13 @@ impl SceneSync {
         // entries from a previous mutable sync.
         self.node_cache.clear();
         self.last_version.clear();
-        self.sync_document_to_scene_inner(doc, blob_store, selection)
+        let scene = self.sync_document_to_scene_inner(doc, blob_store, selection);
+        // Conservative: the immutable test-only path bypasses dirty
+        // tracking, so it must never leave a content-cache that a
+        // later production `sync_document_to_scene` could serve as a
+        // no-op fast path. `_inner` populated it above; drop it.
+        self.content_cache = None;
+        scene
     }
 
     /// Translate the document graph into a renderer [`Scene`].
@@ -572,6 +660,36 @@ impl SceneSync {
         selection: &[Uuid],
     ) -> Scene {
         let (dirty_ids, structure_dirty) = doc.drain_dirty();
+        // Phase 11 perf-at-scale — no-op-document fast path. When the
+        // graph has not changed since the last full rebuild (empty
+        // dirty set, no structural change) the entire tree walk,
+        // reverse-map rebuild, and four `HashMap` sweeps are pure
+        // waste: they reproduce exactly the content objects already
+        // captured in `content_cache`. This is the common case for
+        // `canvas_hit_test` (fires on every hover/move) and selection
+        // changes, neither of which mutates the graph. Replay the
+        // cached content and re-append only the (selection-sized)
+        // highlight overlay. The same no-edits invariant the per-node
+        // cache already trusts guarantees the cached content is still
+        // current; see [`ContentSceneCache`].
+        //
+        // The cache is only valid when the `blob_store` presence still
+        // matches the rebuild that produced it: raster emit is the one
+        // content path whose output depends on whether a `blob_store`
+        // was supplied (real image vs. placeholder rect), and the fast
+        // path replays content verbatim without consulting it. A
+        // `None`→`Some` (or `Some`→`None`) transition must therefore
+        // force a full rebuild so rasters are re-emitted. See
+        // [`ContentSceneCache::blob_store_present`].
+        if !structure_dirty
+            && dirty_ids.is_empty()
+            && self
+                .content_cache
+                .as_ref()
+                .is_some_and(|cache| cache.blob_store_present == blob_store.is_some())
+        {
+            return self.sync_from_content_cache(doc, selection);
+        }
         if structure_dirty {
             // Tree shape changed (insert/remove/reparent/reorder).
             // Evict the entire incremental cache because the
@@ -678,12 +796,94 @@ impl SceneSync {
         // this watermark — see [`Self::append_presence_cursors`].
         self.overlay_watermark = overlay.next;
 
+        // Phase 11 perf-at-scale — snapshot the content objects (and
+        // the z / watermark state the highlight + presence emitters
+        // resume from) BEFORE appending selection highlights, so a
+        // following no-op-document sync can replay this exact staged
+        // order without re-walking the tree. Highlights are
+        // selection-dependent and re-derived on every sync, so they
+        // are deliberately excluded from the snapshot. See
+        // [`ContentSceneCache`].
+        self.content_cache = Some(ContentSceneCache {
+            content_objects: staged.clone(),
+            content_z: z,
+            overlay_watermark: self.overlay_watermark,
+            blob_store_present: blob_store.is_some(),
+        });
+
         // Selection highlights go on top, sorted by document order so
         // overlapping selections paint deterministically. Accumulated
         // into the same `staged` vec so the final `add_objects` call
         // sorts everything together — highlights have monotonically
         // increasing `z` values from the post-walk watermark, so the
         // sort places them last regardless.
+        Self::append_selection_highlights(&mut staged, &mut z, doc, selection);
+
+        // Single batched insert + sort. See the `Vec::with_capacity`
+        // comment above for the perf rationale.
+        scene.add_objects(staged);
+
+        scene
+    }
+
+    /// Phase 11 perf-at-scale — no-op-document fast path body.
+    ///
+    /// Replays the content objects captured by the last full rebuild
+    /// (held in [`Self::content_cache`]) and re-appends the current
+    /// selection highlights, skipping the tree walk, the reverse-map
+    /// rebuild, and the four `HashMap` sweeps that
+    /// [`Self::sync_document_to_scene_inner`] performs. The output is
+    /// byte-for-byte identical to a full rebuild of an unchanged
+    /// document (proven by `fast_path_matches_full_rebuild`): the
+    /// cached objects are in the same pre-sort staged order, the
+    /// highlights are appended with the same ids / z values from the
+    /// same `content_z` base, and the single batched `add_objects`
+    /// applies the same stable sort.
+    ///
+    /// Caller MUST guarantee `self.content_cache.is_some()`.
+    fn sync_from_content_cache(&mut self, doc: &DocumentGraph, selection: &[Uuid]) -> Scene {
+        #[cfg(test)]
+        {
+            self.fast_path_hits += 1;
+        }
+        // Copy the scalars and clone the content vec out of the cache
+        // in a tight scope so the immutable borrow of
+        // `self.content_cache` ends before we mutate `self`.
+        let (mut staged, mut z, watermark) = {
+            let cache = self
+                .content_cache
+                .as_ref()
+                .expect("sync_from_content_cache requires a populated content_cache");
+            (
+                cache.content_objects.clone(),
+                cache.content_z,
+                cache.overlay_watermark,
+            )
+        };
+        // Restore the post-content-walk watermark so a follow-up
+        // `append_presence_cursors` resumes the same upward id stream
+        // it would have after a full rebuild.
+        self.overlay_watermark = watermark;
+        Self::append_selection_highlights(&mut staged, &mut z, doc, selection);
+        let mut scene = Scene::new(DEFAULT_CLEAR);
+        scene.add_objects(staged);
+        scene
+    }
+
+    /// Append a stroked highlight rect for each visible selected node
+    /// onto `staged`, advancing `z` per highlight. Shared by the full
+    /// rebuild ([`Self::sync_document_to_scene_inner`]) and the no-op
+    /// fast path ([`Self::sync_from_content_cache`]) so both produce
+    /// identical overlays. Highlights take ids counting down from
+    /// `u64::MAX` so they never collide with real node `ObjectId`s and
+    /// `is_selection_highlight_id` keeps them out of hit-testing; they
+    /// are intentionally NOT recorded in the `uuid <-> object_id` map.
+    fn append_selection_highlights(
+        staged: &mut Vec<Object>,
+        z: &mut i32,
+        doc: &DocumentGraph,
+        selection: &[Uuid],
+    ) {
         let mut highlight_id = u64::MAX;
         for sel_uuid in selection {
             let Some(node) = doc.get_node(*sel_uuid) else {
@@ -707,17 +907,11 @@ impl SceneSync {
                 style,
             )
             .with_id(ObjectId(highlight_id))
-            .with_z(z);
+            .with_z(*z);
             staged.push(highlight);
-            z += 1;
+            *z += 1;
             highlight_id = highlight_id.saturating_sub(1);
         }
-
-        // Single batched insert + sort. See the `Vec::with_capacity`
-        // comment above for the perf rationale.
-        scene.add_objects(staged);
-
-        scene
     }
 
     /// Append remote-peer cursor overlays to an existing scene, in
@@ -1660,6 +1854,40 @@ mod tests {
     }
 
     #[test]
+    fn default_matches_new_allocator_state() {
+        // `thumbnails.rs` builds an ephemeral `SceneSync::default()`
+        // per render, so `default()` must produce the same allocator
+        // state as `new()`. The derived `Default` would zero both
+        // scalars — handing out the reserved `ObjectId(0)` sentinel for
+        // the first node and starting `overlay_watermark` below
+        // `OVERLAY_ID_THRESHOLD`.
+        let from_default = SceneSync::default();
+        let from_new = SceneSync::new();
+        assert_eq!(
+            from_default.next_id.load(Ordering::Relaxed),
+            from_new.next_id.load(Ordering::Relaxed),
+            "default() next_id must match new()",
+        );
+        assert_eq!(
+            from_default.next_id.load(Ordering::Relaxed),
+            1,
+            "first document object must not be the ObjectId(0) sentinel",
+        );
+        assert_eq!(from_default.overlay_watermark, from_new.overlay_watermark);
+        assert_eq!(from_default.overlay_watermark, OVERLAY_ID_THRESHOLD);
+
+        // Behavioural tie-in: the first emitted document object from a
+        // `default()`-constructed sync gets ObjectId(1), never 0.
+        let mut doc = DocumentGraph::new();
+        let path = unit_square_path();
+        let id = doc.insert_node(vector_node(&path)).expect("insert");
+        let mut sync = SceneSync::default();
+        let _ = sync.sync_document_to_scene(&mut doc, None, &[]);
+        let obj_id = sync.object_id_for_uuid(id).expect("forward lookup");
+        assert_eq!(obj_id.0, 1, "first object id must be 1, not the sentinel 0");
+    }
+
+    #[test]
     fn vector_layer_becomes_path_object() {
         let mut doc = DocumentGraph::new();
         let path = unit_square_path();
@@ -1731,6 +1959,191 @@ mod tests {
         assert_eq!(
             first, second,
             "syncing the same document twice must reuse the same ObjectId for the same uuid"
+        );
+    }
+
+    // ---- Phase 11 perf-at-scale: no-op-document fast path ----
+
+    #[test]
+    fn fast_path_matches_full_rebuild() {
+        let mut doc = DocumentGraph::new();
+        let path = unit_square_path();
+        doc.insert_node(vector_node(&path)).expect("insert n1");
+        let mut n2 = vector_node(&path);
+        n2.bounds = Bounds {
+            x: 40.0,
+            y: 20.0,
+            width: 15.0,
+            height: 25.0,
+        };
+        doc.insert_node(n2).expect("insert n2");
+
+        let mut sync = SceneSync::new();
+        // First sync: `content_cache` is `None`, so this is a full
+        // rebuild — and it populates the cache.
+        let full = sync.sync_document_to_scene(&mut doc, None, &[]);
+        assert_eq!(
+            sync.fast_path_hits, 0,
+            "the first sync must be a full rebuild, not the fast path"
+        );
+
+        // Second sync with no edits: empty dirty set + cache present
+        // → no-op fast path.
+        let replayed = sync.sync_document_to_scene(&mut doc, None, &[]);
+        assert_eq!(
+            sync.fast_path_hits, 1,
+            "an unchanged document must take the no-op fast path"
+        );
+        assert_eq!(
+            full, replayed,
+            "the fast-path scene must be identical to the full rebuild it replays"
+        );
+
+        // And it must also match an independent from-scratch rebuild
+        // (fresh SceneSync via the always-full borrowed entry point),
+        // proving the cache didn't drift from a real translation.
+        let mut reference = SceneSync::new();
+        let from_scratch = reference.sync_document_to_scene_borrowed(&doc, None, &[]);
+        assert_eq!(
+            replayed, from_scratch,
+            "the fast-path scene must match an independent full rebuild"
+        );
+    }
+
+    #[test]
+    fn edit_after_cache_forces_full_rebuild() {
+        let mut doc = DocumentGraph::new();
+        let path = unit_square_path();
+        let id = doc.insert_node(vector_node(&path)).expect("insert");
+        let mut sync = SceneSync::new();
+        // Populate the cache, then confirm an unedited resync replays it.
+        let _ = sync.sync_document_to_scene(&mut doc, None, &[]);
+        let cached = sync.sync_document_to_scene(&mut doc, None, &[]);
+        assert_eq!(
+            sync.fast_path_hits, 1,
+            "the unchanged resync must take the fast path"
+        );
+
+        // Edit the node. `get_node_mut` marks it dirty, so the next
+        // sync sees a non-empty dirty set and is forced through a full
+        // rebuild instead of replaying the now-stale cache.
+        {
+            let node = doc.get_node_mut(id).expect("node");
+            node.bounds.x = 250.0;
+            node.bounds.y = 175.0;
+            node.style.fill = FillStyle::Solid(RgbaColor {
+                r: 0.0,
+                g: 0.0,
+                b: 1.0,
+                a: 1.0,
+            });
+            node.touch();
+        }
+        let edited = sync.sync_document_to_scene(&mut doc, None, &[]);
+        assert_eq!(
+            sync.fast_path_hits, 1,
+            "an edited document must NOT take the no-op fast path"
+        );
+        assert_ne!(
+            edited, cached,
+            "the rebuilt scene must reflect the edit, not replay stale cached content"
+        );
+    }
+
+    #[test]
+    fn selection_only_change_takes_fast_path() {
+        let mut doc = DocumentGraph::new();
+        let path = unit_square_path();
+        let id = doc.insert_node(vector_node(&path)).expect("insert");
+        let mut sync = SceneSync::new();
+        // First sync (no selection): full rebuild → cache populated.
+        let unselected = sync.sync_document_to_scene(&mut doc, None, &[]);
+        assert_eq!(sync.fast_path_hits, 0);
+        assert_eq!(unselected.objects.len(), 1, "just the vector object");
+
+        // Selecting a node changes only `selection`, not the graph, so
+        // this must take the fast path AND re-derive the highlight.
+        let selected = sync.sync_document_to_scene(&mut doc, None, &[id]);
+        assert_eq!(
+            sync.fast_path_hits, 1,
+            "a selection-only change must take the fast path"
+        );
+        assert_eq!(
+            selected.objects.len(),
+            2,
+            "vector object + 1 re-derived selection highlight"
+        );
+        let highlight = selected.objects.last().expect("highlight");
+        assert!(
+            highlight.style.stroke.is_some() && highlight.style.fill.is_none(),
+            "the fast-path highlight must be stroked with no fill"
+        );
+
+        // Clearing the selection (still no graph edit) stays on the
+        // fast path and drops the highlight back to content-only.
+        let cleared = sync.sync_document_to_scene(&mut doc, None, &[]);
+        assert_eq!(
+            sync.fast_path_hits, 2,
+            "clearing the selection is also a no-op-document change"
+        );
+        assert_eq!(
+            cleared.objects, unselected.objects,
+            "clearing the selection must return to the content-only scene"
+        );
+    }
+
+    #[test]
+    fn blob_store_presence_transition_busts_fast_path() {
+        // The fast path replays cached content verbatim and never
+        // consults `blob_store`. Raster emit is the one content path
+        // whose output depends on `blob_store` presence (real image vs.
+        // placeholder rect), so a `None`<->`Some` transition between
+        // syncs of an otherwise-unchanged document MUST force a full
+        // rebuild — otherwise a stale placeholder (or stale image)
+        // would persist. This guards the latent-correctness assumption
+        // that both production callers always pass `Some`.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = BlobStore::new(dir.path()).expect("blob store");
+
+        let mut doc = DocumentGraph::new();
+        let path = unit_square_path();
+        doc.insert_node(vector_node(&path)).expect("insert");
+        let mut sync = SceneSync::new();
+
+        // First sync with no blob store: full rebuild, cache records
+        // `blob_store_present == false`.
+        let _ = sync.sync_document_to_scene(&mut doc, None, &[]);
+        assert_eq!(sync.fast_path_hits, 0, "first sync is a full rebuild");
+
+        // Resync of the unchanged document but now WITH a blob store:
+        // the presence flag no longer matches, so the guard must fall
+        // through to a full rebuild rather than replay the cache.
+        let _ = sync.sync_document_to_scene(&mut doc, Some(&store), &[]);
+        assert_eq!(
+            sync.fast_path_hits, 0,
+            "a None->Some blob_store transition must NOT take the fast path"
+        );
+
+        // With the cache now rebuilt under `Some`, an unchanged resync
+        // that still supplies the blob store matches again and replays.
+        let _ = sync.sync_document_to_scene(&mut doc, Some(&store), &[]);
+        assert_eq!(
+            sync.fast_path_hits, 1,
+            "a matching Some blob_store resync takes the fast path"
+        );
+
+        // The reverse transition (Some -> None) must likewise rebuild.
+        let _ = sync.sync_document_to_scene(&mut doc, None, &[]);
+        assert_eq!(
+            sync.fast_path_hits, 1,
+            "a Some->None blob_store transition must NOT take the fast path"
+        );
+
+        // And a matching None resync replays once more.
+        let _ = sync.sync_document_to_scene(&mut doc, None, &[]);
+        assert_eq!(
+            sync.fast_path_hits, 2,
+            "a matching None blob_store resync takes the fast path"
         );
     }
 

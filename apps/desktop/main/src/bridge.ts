@@ -155,6 +155,8 @@ type RecentProjectInfoSnake = {
 };
 
 export type {
+  FrameInfoNapi,
+  AcquiredFrameNapi,
   ProjectInfoSnake,
   NodeInfoSnake,
   BoundsSnake,

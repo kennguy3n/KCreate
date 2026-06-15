@@ -1,17 +1,19 @@
 // @vitest-environment node
 //
-// Wire-format lockstep guard (AGENTS.md Rule 4) for the four
+// Wire-format lockstep guard (AGENTS.md Rule 4) for the
 // `#[napi(object)]` bridge exports whose multi-word fields silently
 // read back `undefined` when the preload mis-modelled them as
-// snake_case — the bug behind the blank RAM badge (P2-7) and the empty
-// properties "Type" field (P2-8).
+// snake_case — the bug behind the blank RAM badge (P2-7), the empty
+// properties "Type" field (P2-8), and the frozen `ResponsivePreview`
+// (`frame_id` → `frameId`).
 //
-// `document_get_tree`, `document_status`, `project_*` and
-// `runtime_status` are exported from `crates/kcreate_bridge/src/lib.rs`
-// as `#[napi(object)]` structs. napi-rs rewrites their snake_case Rust
-// field identifiers to camelCase on the JS side (`node_type` →
-// `nodeType`, `total_ram_mb` → `totalRamMb`), so the raw bridge return
-// types (`*Snake` in `bridge.ts`) and the public DTOs in
+// `renderer_frame_info`, `renderer_acquire_frame`, `document_get_tree`,
+// `document_status`, `project_*` and `runtime_status` are exported from
+// `crates/kcreate_bridge/src/lib.rs` as `#[napi(object)]` structs.
+// napi-rs rewrites their snake_case Rust field identifiers to camelCase
+// on the JS side (`node_type` → `nodeType`, `total_ram_mb` →
+// `totalRamMb`, `frame_id` → `frameId`), so the raw bridge return types
+// (`*Napi` / `*Snake` in `bridge.ts`) and the public DTOs in
 // `shared/scene.ts` must agree on those camelCase names. That agreement
 // is exactly what lets `preload.ts` cast the IPC results straight to
 // the public types instead of running a (previously broken) converter.
@@ -21,12 +23,16 @@
 // ship.
 import { test, expect } from "vitest";
 import type {
+  FrameInfoNapi,
+  AcquiredFrameNapi,
   ProjectInfoSnake,
   NodeInfoSnake,
   RuntimeStatusSnake,
   DocumentStatusSnake,
 } from "./bridge";
 import type {
+  FrameInfo,
+  AcquiredFrame,
   ProjectInfo,
   NodeInfo,
   RuntimeStatus,
@@ -41,6 +47,13 @@ function expectAssignable<T>(_value: T): void {
 // The raw bridge wire shapes must be assignable to the public DTOs the
 // preload casts them to. `ProjectInfo` / `RuntimeStatus` /
 // `DocumentStatus` mirror their napi structs field-for-field.
+//
+// `FrameInfo` / `AcquiredFrame` are guarded the same way: their napi
+// structs emit `frameId` / `byteLength`, so a regression back to
+// `frame_id` / `byte_length` (which froze `ResponsivePreview` after the
+// first frame) stops compiling here.
+expectAssignable<FrameInfo>({} as FrameInfoNapi);
+expectAssignable<AcquiredFrame>({} as AcquiredFrameNapi);
 expectAssignable<ProjectInfo>({} as ProjectInfoSnake);
 expectAssignable<RuntimeStatus>({} as RuntimeStatusSnake);
 expectAssignable<DocumentStatus>({} as DocumentStatusSnake);

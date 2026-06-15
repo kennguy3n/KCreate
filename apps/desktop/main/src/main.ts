@@ -1649,6 +1649,11 @@ function registerIpcHandlers(): void {
   ipcMain.handle("kcreate/artboard/presets", () =>
     requireBridge().artboardPresets(),
   );
+  ipcMain.handle(
+    "kcreate/artboard/magic-resize",
+    (_e, sourceArtboardId: string, targetsJson: string): string =>
+      requireBridge().magicResize(sourceArtboardId, targetsJson),
+  );
 
   // Components (Block B).
   ipcMain.handle(
@@ -1805,6 +1810,21 @@ function registerIpcHandlers(): void {
     (_e, templateId: string): void => {
       requireBridge().templateRemove(templateId);
     },
+  );
+  // G2 — "Start from template": pour the template's content.json into
+  // the open workspace as a fresh artboard. Returns the new artboard id
+  // + node ids so the renderer can select/frame the design.
+  ipcMain.handle(
+    "kcreate/template/instantiate",
+    (_e, templateId: string) =>
+      requireBridge().templateInstantiate(templateId),
+  );
+  // G2 — gallery card preview: render (or read cached) thumbnail PNG
+  // for a template id via the shared export pipeline.
+  ipcMain.handle(
+    "kcreate/template/thumbnail",
+    (_e, templateId: string) =>
+      requireBridge().templateThumbnail(templateId),
   );
   // Phase 6 — Audit log (Tasks 13–14)
   ipcMain.handle(
@@ -2405,6 +2425,11 @@ function registerIpcHandlers(): void {
     "kcreate/phase10/ai/brief-to-one-pager",
     (_e, brief: string, pageSize: string | null): string =>
       requireBridge().aiBriefToOnePager(brief, pageSize),
+  );
+  ipcMain.handle(
+    "kcreate/phase10/ai/generate-themed-design",
+    (_e, brief: string, optionsJson: string): string =>
+      requireBridge().aiGenerateThemedDesign(brief, optionsJson),
   );
   ipcMain.handle(
     "kcreate/phase10/ai/harmonize-palette",

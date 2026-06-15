@@ -1710,6 +1710,20 @@ export interface ArtboardPreset {
   category: ArtboardPresetCategory;
 }
 
+/**
+ * One Magic-Resize target. Either a named `preset` (matched
+ * case-insensitively against {@link ArtboardPreset.name}) **or** an
+ * explicit `width` × `height` in pixels. When both are present the
+ * explicit dimensions win. `name` overrides the generated artboard's
+ * label. Mirrors `kcreate_bridge::document::ResizeTargetSpec`.
+ */
+export interface ResizeTarget {
+  name?: string;
+  preset?: string;
+  width?: number;
+  height?: number;
+}
+
 export interface ArtboardBridge {
   create(
     pageId: string | null,
@@ -1721,6 +1735,16 @@ export interface ArtboardBridge {
   duplicate(artboardId: string): Promise<string>;
   resize(artboardId: string, width: number, height: number): Promise<void>;
   presets(): Promise<ArtboardPreset[]>;
+  /**
+   * Magic Resize: reflow the design on `sourceArtboardId` onto each
+   * target size, returning the new artboards' ids in target order.
+   * Non-destructive (the source is untouched) and a single undoable
+   * operation.
+   */
+  magicResize(
+    sourceArtboardId: string,
+    targets: ResizeTarget[],
+  ): Promise<string[]>;
 }
 
 /**
@@ -2017,6 +2041,11 @@ export type TemplateCategory =
   | "brochure"
   | "flyer"
   | "report"
+  | "presentation"
+  | "social_media"
+  | "mobile_app"
+  | "resume"
+  | "poster"
   | "custom";
 
 export type SectionKind =
@@ -2150,6 +2179,18 @@ export interface TemplateListReport {
   templates: TemplateManifest[];
 }
 
+/**
+ * Mirror of `kcreate_bridge::lib::TemplateInstantiateResult` (a
+ * `#[napi(object)]` so the fields arrive camelCased). Returned by
+ * `templateMarketplace.instantiate` — the artboard the template was
+ * poured into plus every node id created, so the renderer can select
+ * and frame the freshly instantiated design.
+ */
+export interface TemplateInstantiateReport {
+  artboardId: string;
+  nodeIds: string[];
+}
+
 export interface TemplateMarketplaceBridge {
   /**
    * List installed templates from the marketplace directory.
@@ -2176,6 +2217,21 @@ export interface TemplateMarketplaceBridge {
    * unknown id.
    */
   remove(templateId: string): Promise<void>;
+  /**
+   * "Start from template": pour the template's design (resolved by id
+   * -> its `content.json`) into the currently open workspace as a new
+   * artboard. Returns the new artboard id + every node id created.
+   * Rejects with `Status::InvalidArg` for an unknown id and
+   * `NoProject` when no workspace is open.
+   */
+  instantiate(templateId: string): Promise<TemplateInstantiateReport>;
+  /**
+   * Render (or read the cached) thumbnail PNG for a template id via
+   * the shared export pipeline, so gallery cards show a real preview
+   * of the applied design. `bytesBase64` is a standard base64 PNG the
+   * renderer pins as an `<img>` `src` (`data:${mime};base64,...`).
+   */
+  thumbnail(templateId: string): Promise<ThumbnailBytes>;
 }
 
 // ---------------------------------------------------------------------------
@@ -5930,6 +5986,56 @@ export interface BriefToOnePagerResult {
   pageHeight: number;
 }
 
+/**
+ * Built-in professional theme identifiers for the Gamma-style themed
+ * design generator. Mirror of `kcreate_ai::themed_deck::ThemeId`
+ * (`#[serde(rename_all = "camelCase")]`).
+ */
+export type ThemeId = "midnight" | "sunrise" | "forest" | "ember" | "slate";
+
+/** Output format for the themed design generator. */
+export type ThemedDesignFormat = "deck" | "onePager";
+
+/** Page size for one-pager output (ignored for decks). */
+export type ThemedOnePagerSize = "letter" | "a4" | "square";
+
+/**
+ * Options for `aiGenerateThemedDesign`. Serialized to the
+ * `options_json` argument the bridge parses into
+ * `kcreate_bridge::phase10::ThemedDesignRequest`
+ * (`#[serde(rename_all = "camelCase")]`, every field optional). An
+ * empty object yields a Midnight A4 six-slide deck.
+ */
+export interface ThemedDesignOptions {
+  format?: ThemedDesignFormat;
+  themeId?: ThemeId;
+  onePagerSize?: ThemedOnePagerSize;
+  /** Number of content sections; clamped per format by the bridge. */
+  sectionCount?: number;
+  /**
+   * Opt-in LLM enrichment. When `true` *and* the local sidecar is
+   * `ready`, the brief is expanded into a structured outline by the
+   * model; on any failure the deterministic planner is used instead.
+   */
+  useLlm?: boolean;
+}
+
+/**
+ * Mirror of `kcreate_bridge::phase10::ThemedDesignApplyResult`
+ * (`#[serde(rename_all = "camelCase")]`). Returned after the generated
+ * themed design has been applied to the open document.
+ */
+export interface ThemedDesignApplyResult {
+  pageId: string;
+  artboardIds: string[];
+  brandKitId: string;
+  slideCount: number;
+  themeId: ThemeId;
+  themeName: string;
+  format: ThemedDesignFormat;
+  usedLlm: boolean;
+}
+
 /** Harmony type for `aiHarmonizePalette`. */
 export type HarmonyType =
   | "auto"
@@ -6194,6 +6300,10 @@ export interface Phase10Bridge {
     brief: string,
     pageSize: "letter" | "a4" | "square" | null,
   ): Promise<BriefToOnePagerResult>;
+  aiGenerateThemedDesign(
+    brief: string,
+    options: ThemedDesignOptions,
+  ): Promise<ThemedDesignApplyResult>;
   aiHarmonizePalette(
     brandKitId: string,
     harmonyType: HarmonyType,

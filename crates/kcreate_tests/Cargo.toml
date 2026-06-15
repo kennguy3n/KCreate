@@ -67,6 +67,13 @@ tempfile = { workspace = true }
 tiny_http = "0.12"
 uuid = { workspace = true }
 base64 = { workspace = true }
+# Decode-only PNG helper for the integration tests. Used by the
+# gradient render-parity proof (gradient_render_parity.rs) to assert
+# the raster pixels form a real gradient ramp, and by the G2
+# template-library proof (template_library_bridge.rs) to assert the
+# rendered thumbnails are non-blank (>= 2 distinct colours). Not
+# pulled into any editing-path crate.
+image = { workspace = true }
 # Phase 8 Block A integration test (kchat_artifact.rs) — same
 # version pin as the bridge's own use to keep the proc-macro
 # crate de-duplicated in the dep graph.

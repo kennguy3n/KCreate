@@ -9,7 +9,7 @@
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use kcreate_renderer::{
-    Color, Object, ObjectKind, PathCommand, Point2, Rect, Scene, Stroke, Style,
+    Color, Object, ObjectKind, Paint, PathCommand, Point2, Rect, Scene, Stroke, Style,
 };
 use serde::{Deserialize, Serialize};
 
@@ -218,7 +218,10 @@ pub fn parse_scene(json: &str) -> Result<Scene, WireError> {
             },
         };
         let style = Style {
-            fill: obj.style.fill.map(|c| Color::rgba(c[0], c[1], c[2], c[3])),
+            fill: obj
+                .style
+                .fill
+                .map(|c| Paint::Solid(Color::rgba(c[0], c[1], c[2], c[3]))),
             stroke: obj.style.stroke.map(|s| {
                 Stroke::new(
                     Color::rgba(s.color[0], s.color[1], s.color[2], s.color[3]),

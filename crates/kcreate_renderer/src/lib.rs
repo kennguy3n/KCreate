@@ -35,7 +35,7 @@ use thiserror::Error;
 
 pub use cpu_backend::CpuBackend;
 pub use display_list::{DisplayCommand, DisplayList};
-pub use geometry::{Color, PathCommand, Point2, Rect, Stroke, Style, Vec2};
+pub use geometry::{Color, Paint, PathCommand, Point2, Rect, Stroke, Style, Vec2};
 pub use gpu::{GpuBackend, GpuTier};
 pub use native_surface::NativeSurface;
 pub use pipeline::Pipeline;

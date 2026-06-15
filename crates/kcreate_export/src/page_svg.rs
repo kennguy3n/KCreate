@@ -58,6 +58,36 @@ pub fn compose_page_svg<F>(
     page_id: Uuid,
     width: f64,
     height: f64,
+    resolve_blob: F,
+) -> String
+where
+    F: FnMut(&str) -> Option<Vec<u8>>,
+{
+    // The historical contract is "page origin at world (0, 0)". This
+    // is the origin-zero special case of `compose_page_svg_in_frame`.
+    compose_page_svg_in_frame(document, page_id, 0.0, 0.0, width, height, resolve_blob)
+}
+
+/// Compose an SVG for `root_id`'s subtree, cropped to the world-space
+/// frame `(origin_x, origin_y, width, height)`.
+///
+/// This generalises [`compose_page_svg`] for documents whose pages
+/// are **tiled** in world space — e.g. a Gamma-style deck where each
+/// slide is an `Artboard` laid out left-to-right at increasing world
+/// `x`. Leaf nodes store world coordinates, so to render a single
+/// tile (artboard) in isolation the `viewBox` must be offset to that
+/// tile's world origin; otherwise every tile past the first (world
+/// `x > 0`) renders off-canvas and the page comes out blank.
+///
+/// `compose_page_svg` delegates here with `origin = (0, 0)`, which
+/// reproduces its previous output byte-for-byte.
+pub fn compose_page_svg_in_frame<F>(
+    document: &DocumentGraph,
+    root_id: Uuid,
+    origin_x: f64,
+    origin_y: f64,
+    width: f64,
+    height: f64,
     mut resolve_blob: F,
 ) -> String
 where
@@ -65,18 +95,20 @@ where
 {
     let w = width.max(1.0);
     let h = height.max(1.0);
+    let ox = trim_float(origin_x);
+    let oy = trim_float(origin_y);
     let mut s = String::new();
     let _ = write!(
         s,
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
          <svg xmlns=\"http://www.w3.org/2000/svg\" \
          xmlns:xlink=\"http://www.w3.org/1999/xlink\" \
-         width=\"{w}\" height=\"{h}\" viewBox=\"0 0 {w} {h}\">"
+         width=\"{w}\" height=\"{h}\" viewBox=\"{ox} {oy} {w} {h}\">"
     );
     // `descendants_of` walks DFS, which matches the bridge's
     // scene-sync emit order — first-encountered-first-drawn, so the
     // resulting SVG `z` order matches what the canvas shows.
-    for id in document.descendants_of(page_id) {
+    for id in document.descendants_of(root_id) {
         let Some(node) = document.get_node(id) else {
             continue;
         };
@@ -456,6 +488,42 @@ mod tests {
         assert!(svg.contains("fill=\"#ff0000\""));
         assert!(!svg.contains("<image"));
         assert!(!svg.contains("<text"));
+    }
+
+    #[test]
+    fn compose_page_svg_keeps_zero_origin_viewbox() {
+        // Backward-compat: the page-origin-at-(0,0) helper must keep
+        // its historical zero-origin viewBox byte-for-byte.
+        let (doc, page) = build_page(vec![vector_node("v", 0.0, 0.0, 100.0, 100.0)]);
+        let svg = compose_page_svg(&doc, page, 100.0, 100.0, |_| None);
+        assert!(
+            svg.contains("viewBox=\"0 0 100 100\""),
+            "default compose must keep a zero-origin viewBox; got: {svg}"
+        );
+    }
+
+    #[test]
+    fn compose_in_frame_offsets_viewbox_to_world_origin() {
+        // Regression guard for the Gamma-deck tiling bug: a slide whose
+        // world origin is (2020, 0) must render with a viewBox offset
+        // to that origin. With the old hard-coded `0 0 w h` viewBox,
+        // every tile past the first (world x > 0) fell off-canvas and
+        // the PDF page came out blank.
+        let (doc, page) = build_page(vec![
+            vector_node("bg", 2020.0, 0.0, 1920.0, 1080.0),
+            text_node("title", 2120.0, 120.0, 800.0, 80.0, "Second Slide"),
+        ]);
+        let svg = compose_page_svg_in_frame(&doc, page, 2020.0, 0.0, 1920.0, 1080.0, |_| None);
+        assert!(
+            svg.contains("viewBox=\"2020 0 1920 1080\""),
+            "frame viewBox must be offset to the tile's world origin; got: {svg}"
+        );
+        // The off-origin content must survive (the bug dropped it).
+        assert!(
+            svg.contains(">Second Slide</text>"),
+            "text lost; got: {svg}"
+        );
+        assert!(svg.contains("<path"), "background lost; got: {svg}");
     }
 
     #[test]

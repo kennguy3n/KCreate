@@ -13,13 +13,10 @@
 
 import { useEffect, useMemo, useState } from "react";
 
-import type {
-  LayoutTemplate,
-  PageSize,
-  TemplateCategory,
-} from "../../../shared/scene";
+import type { LayoutTemplate, PageSize } from "../../../shared/scene";
 import { colors, font, radius, spacing } from "../styles/tokens";
 import { errorMessage } from "../lib/errorMessage";
+import { CATEGORY_LABELS, CATEGORY_TINT } from "../lib/templateCategories";
 
 export interface TemplatePickerProps {
   /** Controls visibility. Parent owns the open/closed state. */
@@ -36,24 +33,6 @@ export interface TemplatePickerProps {
   /** Status bar tap for transient error / progress messages. */
   onStatus?: (msg: string | null) => void;
 }
-
-const CATEGORY_LABELS: Record<TemplateCategory, string> = {
-  pitch_deck: "Pitch Deck",
-  proposal: "Proposal",
-  brochure: "Brochure",
-  flyer: "Flyer",
-  report: "Report",
-  custom: "Custom",
-};
-
-const CATEGORY_TINT: Record<TemplateCategory, string> = {
-  pitch_deck: "#7E22CE",
-  proposal: "#1D4ED8",
-  brochure: "#0D9488",
-  flyer: "#EA580C",
-  report: "#374151",
-  custom: "#4B5563",
-};
 
 export function TemplatePicker({
   open,

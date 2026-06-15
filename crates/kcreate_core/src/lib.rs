@@ -35,6 +35,7 @@ pub mod node;
 pub mod operation;
 pub mod operation_compress;
 pub mod project;
+pub mod template_library;
 pub mod theme;
 pub mod token_binding;
 
@@ -75,6 +76,9 @@ pub use project::{
     builtin_layout_templates, BrandKit, DesignTokens, ExportFormat, ExportPreset, FontRef,
     LayoutTemplate, NamedColor, Project, ProjectError, SectionKind, ShadowToken, TemplateCategory,
     TemplatePageDef, TemplateSectionDef, TypographyToken,
+};
+pub use template_library::{
+    bundled_templates, seed_bundled_templates, BundledTemplate, TemplateContent, TemplateItem,
 };
 pub use theme::{
     assign_roles, build_color_remap, builtin_themes, contrast_ratio, lightness, quantize,

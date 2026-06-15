@@ -11,8 +11,10 @@ pub mod constraints;
 pub mod flex;
 pub mod grid;
 pub mod padding;
+pub mod resize;
 
 pub use constraints::{apply_constraints, apply_constraints_batch};
 pub use flex::{layout_flex, Alignment, CrossAlignment, FlexDirection, FlexLayout};
 pub use grid::{layout_grid, GridLayout};
 pub use padding::Padding;
+pub use resize::{magic_resize, ResizeNode, ResizeOptions, ResizeResult};

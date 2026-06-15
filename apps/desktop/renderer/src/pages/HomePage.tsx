@@ -408,18 +408,18 @@ export function HomePage({
           gap: spacing.xl,
         }}
       >
+        {onBrowseTemplates ? (
+          <Section title="Start from a template">
+            <TemplateGalleryTile onBrowse={onBrowseTemplates} />
+          </Section>
+        ) : null}
+
         <Section title="Start from a brief">
           <BriefTile
             llmStatus={llmStatus}
             onOpen={() => setBriefOpen(true)}
           />
         </Section>
-
-        {onBrowseTemplates ? (
-          <Section title="Start from a template">
-            <TemplateGalleryTile onBrowse={onBrowseTemplates} />
-          </Section>
-        ) : null}
 
         <Section title="Create new">
           <div
@@ -448,6 +448,7 @@ export function HomePage({
             state={recents}
             covers={covers}
             onOpenProject={onOpenProject ?? null}
+            onBrowseTemplates={onBrowseTemplates ?? null}
           />
         </Section>
 
@@ -899,10 +900,12 @@ function RecentProjectsGrid({
   state,
   covers,
   onOpenProject,
+  onBrowseTemplates,
 }: {
   state: RecentsLoadState;
   covers: Record<string, ThumbnailBytes | null>;
   onOpenProject: ((projectDir: string) => void) | null;
+  onBrowseTemplates: (() => void) | null;
 }): JSX.Element {
   if (state.kind === "idle" || state.kind === "loading") {
     return (
@@ -922,8 +925,34 @@ function RecentProjectsGrid({
   if (state.items.length === 0) {
     return (
       <EmptyState>
-        No recent projects yet. Create one above — your work is saved
-        locally inside <code>.kstudio</code> folders.
+        <div style={{ marginBottom: onBrowseTemplates ? spacing.md : 0 }}>
+          No recent projects yet. Your work is saved locally inside{" "}
+          <code>.kstudio</code> folders — start from a ready-made
+          template to get a real design on the canvas in one click.
+        </div>
+        {onBrowseTemplates ? (
+          <button
+            type="button"
+            onClick={onBrowseTemplates}
+            data-testid="kcreate-recents-empty-browse-templates"
+            style={{
+              display: "inline-flex",
+              alignItems: "center",
+              gap: spacing.xs,
+              background: colors.accent,
+              color: "white",
+              border: "none",
+              borderRadius: radius.sm,
+              padding: "8px 14px",
+              fontSize: 13,
+              fontWeight: 600,
+              cursor: "pointer",
+            }}
+          >
+            <Icon name="layout" size={16} />
+            Browse templates
+          </button>
+        ) : null}
       </EmptyState>
     );
   }

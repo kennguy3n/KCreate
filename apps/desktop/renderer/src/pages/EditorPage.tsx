@@ -21,13 +21,13 @@ import {
 import { ConflictToast } from "../components/ConflictToast";
 import { InlineTextEditor } from "../components/InlineTextEditor";
 import { CursorOverlay } from "../components/CursorOverlay";
-import { LeftPanel } from "../components/LeftPanel";
+import { LeftPanel, type LeftPanelTab } from "../components/LeftPanel";
 import { ASSET_DRAG_MIME } from "../components/AssetsPanel";
 import { PageNavigator } from "../components/PageNavigator";
 import { PathfinderPanel } from "../components/PathfinderPanel";
 import { PenOverlay } from "../components/PenOverlay";
 import { NodeEditOverlay } from "../components/NodeEditOverlay";
-import { RightPanel } from "../components/RightPanel";
+import { RightPanel, type RightPanelTab } from "../components/RightPanel";
 import { SelectionOverlay } from "../components/SelectionOverlay";
 import { SoftProofOverlay } from "../components/SoftProofOverlay";
 import { TemplatePicker } from "../components/TemplatePicker";
@@ -36,7 +36,19 @@ import {
   TopBar,
   toolsForMode,
   defaultPanelForMode,
+  EDITOR_MODES,
+  TOOL_LABELS,
 } from "../components/TopBar";
+import { BriefModal } from "../components/BriefModal";
+import {
+  CommandPalette,
+  type PaletteCommand,
+} from "../components/CommandPalette";
+import {
+  DiscoveryWelcome,
+  type DiscoveryAction,
+} from "../components/DiscoveryWelcome";
+import { CanvasEmptyState } from "../components/CanvasEmptyState";
 import { AIAssistPanel } from "../components/AIAssistPanel";
 import { ExportPanel } from "../components/ExportPanel";
 import { ArtboardDialog } from "../components/ArtboardDialog";
@@ -46,6 +58,7 @@ import { PrototypePlayer } from "../components/PrototypePlayer";
 import type {
   Alignment,
   ArtboardInfo,
+  BriefApplyResult,
   DistributeAxis,
   FlexLayout,
   GridLayout,
@@ -53,11 +66,17 @@ import type {
   ProjectInfo,
   ResizeTarget,
   SnapGuide,
+  ThemedDesignApplyResult,
 } from "../../../shared/scene";
 import { computeContentFit } from "../lib/fitViewport";
 import { LowResourceBanner } from "../components/LowResourceBanner";
-import { useShortcuts } from "../shortcuts/useShortcuts";
+import { useShortcuts, useShortcutBindings } from "../shortcuts/useShortcuts";
 import type { ShortcutHandlers } from "../shortcuts/useShortcuts";
+import { formatBinding } from "../shortcuts/registry";
+import {
+  shouldShowDiscoveryWelcome,
+  markDiscoveryWelcomeSeen,
+} from "../lib/discoveryWelcome";
 import { colors, font, spacing } from "../styles/tokens";
 import { errorMessage } from "../lib/errorMessage";
 import { useToolStateMachine } from "../hooks/useToolStateMachine";
@@ -262,6 +281,32 @@ function EditorPageInner({
   // projects within one session re-prompts.
   const [templatePickerOpen, setTemplatePickerOpen] = useState<boolean>(false);
   const [shortcutsPanelOpen, setShortcutsPanelOpen] = useState<boolean>(false);
+  // H1 — discoverability surfaces. The command palette (Cmd/Ctrl+K) and
+  // the AI themed-design brief are editor-global overlays; the two
+  // tab-request seq counters drive programmatic panel-tab focus (the
+  // command palette / shortcuts open a specific Left/Right panel tab by
+  // bumping `seq` — see `LeftPanel`/`RightPanel`'s `requestedTab`).
+  const [commandPaletteOpen, setCommandPaletteOpen] = useState<boolean>(false);
+  const [briefOpen, setBriefOpen] = useState<boolean>(false);
+  // Whether the local LLM sidecar is `ready`. The themed-design flow
+  // works offline regardless (deterministic planner fallback), so this
+  // only toggles the optional "enrich with the local model" affordance
+  // inside `BriefModal`.
+  const [llmReady, setLlmReady] = useState<boolean>(false);
+  const [leftPanelTabRequest, setLeftPanelTabRequest] = useState<{
+    tab: LeftPanelTab;
+    seq: number;
+  } | null>(null);
+  const [rightPanelTabRequest, setRightPanelTabRequest] = useState<{
+    tab: RightPanelTab;
+    seq: number;
+  } | null>(null);
+  // H1 — first-run discovery welcome. Gated on a localStorage marker
+  // (see `lib/discoveryWelcome.ts`) so it shows exactly once per device.
+  // Computed lazily on mount so returning users never pay the read.
+  const [welcomeOpen, setWelcomeOpen] = useState<boolean>(() =>
+    shouldShowDiscoveryWelcome(),
+  );
   const [layoutPickerShownFor, setLayoutPickerShownFor] = useState<string | null>(
     null,
   );
@@ -489,6 +534,26 @@ function EditorPageInner({
   useEffect(() => {
     void refreshResourceLimits();
   }, [refreshResourceLimits]);
+
+  // H1 — probe the local LLM sidecar once on mount so the "Generate
+  // with AI" brief can offer the optional model-enrichment toggle when
+  // it's ready. The sidecar is opt-in and entirely local; its absence
+  // is normal, so any failure is swallowed and the brief stays on its
+  // deterministic offline planner.
+  useEffect(() => {
+    let cancelled = false;
+    void window.kcreate.llm
+      .status()
+      .then((s) => {
+        if (!cancelled) setLlmReady(s.state === "ready");
+      })
+      .catch(() => {
+        /* sidecar not running — themed flow works offline anyway. */
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   // Load preset catalogue once. It's deterministic and the bridge
   // recomputes it on each call so caching once on mount is fine.
@@ -1699,6 +1764,139 @@ function EditorPageInner({
   const cancelNodeEdit = toolStateMachine.cancelNodeEdit;
   const commitNodeEdit = toolStateMachine.commitNodeEdit;
 
+  // ── H1 discoverability open-handlers ──────────────────────────────
+  // Each handler is the SINGLE source of truth for "reveal capability
+  // X". The command palette entry, the keyboard shortcut, and the
+  // TopBar button all call the same closure, so a capability can never
+  // be reachable through one entry point but silently broken in
+  // another. They live here (after the state machine, before
+  // `shortcutHandlers`) so the shortcut map can list them in its dep
+  // array by stable identity.
+
+  const openCommandPalette = useCallback((): void => {
+    setCommandPaletteOpen((open) => !open);
+  }, []);
+
+  const openTemplates = useCallback((): void => {
+    setTemplatePickerOpen(true);
+  }, []);
+
+  const openAiGenerate = useCallback((): void => {
+    setBriefOpen(true);
+  }, []);
+
+  // The Theme & Brand-kit tab lives in the RightPanel, which only
+  // mounts in the "properties" right-panel modes; of those, only
+  // design + layout also expose the Theme tab (`showTheme`). So when
+  // the current mode can't show Theme we switch to design first, then
+  // request the tab by bumping the seq counter the panel watches.
+  const openTheme = useCallback((): void => {
+    if (mode !== "design" && mode !== "layout") {
+      setMode("design");
+    }
+    setRightPanelTabRequest((prev) => ({
+      tab: "theme",
+      seq: (prev?.seq ?? 0) + 1,
+    }));
+  }, [mode, setMode]);
+
+  // The Elements library is the LeftPanel "elements" tab, available in
+  // every mode, so this just bumps the seq counter.
+  const openElements = useCallback((): void => {
+    setLeftPanelTabRequest((prev) => ({
+      tab: "elements",
+      seq: (prev?.seq ?? 0) + 1,
+    }));
+  }, []);
+
+  // Magic Resize reflows an existing artboard's design into other
+  // sizes, so it needs a source artboard. Prefer one matching the
+  // current selection, else the first artboard; if the document has
+  // none yet, keep the capability discoverable but explain why it's
+  // unavailable rather than opening an empty dialog.
+  const openMagicResize = useCallback((): void => {
+    const source =
+      artboards.find((a) => selectedIds.includes(a.id)) ??
+      artboards[0] ??
+      null;
+    if (source === null) {
+      setStatusMessage("Magic Resize needs an artboard — create one first.");
+      return;
+    }
+    setMagicResizeSource(source);
+  }, [artboards, selectedIds, setStatusMessage]);
+
+  // Switch to a tool from the palette. If the active mode doesn't
+  // expose the tool, hop to design mode first (it exposes all six
+  // drawing tools); the mode-change effect won't clobber the tool
+  // because design includes it.
+  const selectToolFromPalette = useCallback(
+    (next: ToolId): void => {
+      if (!toolsForMode(mode).includes(next)) {
+        setMode("design");
+      }
+      setTool(next);
+    },
+    [mode, setMode, setTool],
+  );
+
+  // Route a finished AI brief: refresh the tree so the generated
+  // content appears, then focus the first new page for the multi-page
+  // themed result (the single-artboard brief leaves the new artboard
+  // selected by the bridge).
+  const handleBriefApplied = useCallback(
+    (result: BriefApplyResult | ThemedDesignApplyResult): void => {
+      setBriefOpen(false);
+      void (async () => {
+        await refreshTree();
+        if ("pageId" in result) {
+          await handleSelectPage(result.pageId);
+        }
+      })();
+    },
+    [refreshTree, handleSelectPage],
+  );
+
+  // Persist that the discovery welcome has been seen and close it. The
+  // marker write is best-effort (private-mode storage can throw) — the
+  // worst case is the welcome reappears next launch, never a thrown
+  // error into the dismiss path.
+  const dismissWelcome = useCallback((): void => {
+    markDiscoveryWelcomeSeen();
+    setWelcomeOpen(false);
+  }, []);
+
+  // The three headline G-wave flows surfaced by both the first-run
+  // welcome and the empty-canvas state. Each routes through the same
+  // open-handler the TopBar buttons and command palette use, so there
+  // is exactly one implementation of each capability.
+  const discoveryActions = useMemo<DiscoveryAction[]>(
+    () => [
+      {
+        id: "templates",
+        label: "Start from a template",
+        description: "Fork a ready-made design and make it yours.",
+        icon: "layout",
+        run: openTemplates,
+      },
+      {
+        id: "ai",
+        label: "Generate with AI",
+        description: "Describe it and let the local model draft it.",
+        icon: "wand",
+        run: openAiGenerate,
+      },
+      {
+        id: "elements",
+        label: "Browse elements",
+        description: "Drop in shapes, icons, and illustrations.",
+        icon: "sparkles",
+        run: openElements,
+      },
+    ],
+    [openTemplates, openAiGenerate, openElements],
+  );
+
   const shortcutHandlers = useMemo<ShortcutHandlers>(
     () => ({
       undo: (e) => {
@@ -1800,6 +1998,33 @@ function EditorPageInner({
         e.preventDefault();
         setShortcutsPanelOpen((open) => !open);
       },
+      // H1 — discoverability bindings. Each routes through the shared
+      // open-handler above so the keystroke, palette entry, and TopBar
+      // button stay lockstep.
+      openCommandPalette: (e) => {
+        e.preventDefault();
+        openCommandPalette();
+      },
+      openTemplates: (e) => {
+        e.preventDefault();
+        openTemplates();
+      },
+      openTheme: (e) => {
+        e.preventDefault();
+        openTheme();
+      },
+      openElements: (e) => {
+        e.preventDefault();
+        openElements();
+      },
+      openMagicResize: (e) => {
+        e.preventDefault();
+        openMagicResize();
+      },
+      openAiGenerate: (e) => {
+        e.preventDefault();
+        openAiGenerate();
+      },
       copy: (e) => {
         e.preventDefault();
         void handleCopy();
@@ -1871,13 +2096,261 @@ function EditorPageInner({
       commitPen,
       cancelNodeEdit,
       commitNodeEdit,
+      openCommandPalette,
+      openTemplates,
+      openTheme,
+      openElements,
+      openMagicResize,
+      openAiGenerate,
     ],
   );
-  useShortcuts(shortcutHandlers);
+
+  // While a modal overlay is open it owns the keyboard: the global
+  // editor shortcuts must not fire underneath it. Without this a key
+  // pressed over the discovery welcome / command palette / a dialog
+  // would leak through to the canvas — e.g. Escape would also clear
+  // the selection (`clearSelection`) and a bare "r" would switch tools
+  // behind the modal. `useShortcuts` honours `enabled` at dispatch
+  // time (not attach time), so toggling this never flaps the listener.
+  // The command palette additionally manages its own keys via the
+  // focused input, but gating here keeps the contract explicit and
+  // covers non-Escape collisions too. PrototypePlayer is intentionally
+  // excluded — it is a full-screen mode with its own complete keyboard
+  // handling rather than a transient modal.
+  const blockingOverlayOpen =
+    commandPaletteOpen ||
+    welcomeOpen ||
+    briefOpen ||
+    shortcutsPanelOpen ||
+    templatePickerOpen ||
+    artboardDialogOpen ||
+    magicResizeSource !== null;
+  useShortcuts(shortcutHandlers, !blockingOverlayOpen);
 
   const onZoomToFit = useCallback(() => {
     fitToContent();
   }, [fitToContent]);
+
+  // Live bindings so the palette shows each command's current
+  // keystroke (honouring any user rebind) rather than a hard-coded
+  // hint.
+  const shortcutBindings = useShortcutBindings();
+
+  // Live, user-rebind-aware label for the command-palette shortcut,
+  // shown in the welcome + empty-canvas hints.
+  const paletteHint = formatBinding(shortcutBindings.openCommandPalette);
+
+  // ── H1 command palette command set ────────────────────────────────
+  // The palette is presentational: it filters/ranks this list and runs
+  // each command's `run`. Every `run` delegates to the SAME handler the
+  // toolbar / shortcut already uses, so there is one implementation of
+  // each action and no "fake" menu items. Grouped in discovery order:
+  // the new G-wave capabilities first, then panels, tools, studios, and
+  // core edit/view actions.
+  const hasArtboards = artboards.length > 0;
+  const hasSelection = selectedIds.length > 0;
+  const commands = useMemo<PaletteCommand[]>(() => {
+    const toolOrder: ToolId[] = [
+      "select",
+      "rect",
+      "ellipse",
+      "line",
+      "pen",
+      "text",
+    ];
+    const toolBindingFor: Record<ToolId, PaletteCommand["shortcut"]> = {
+      select: shortcutBindings.toolSelect,
+      rect: shortcutBindings.toolRect,
+      ellipse: shortcutBindings.toolEllipse,
+      line: shortcutBindings.toolLine,
+      pen: shortcutBindings.toolPen,
+      text: shortcutBindings.toolText,
+    };
+    const list: PaletteCommand[] = [
+      // Create — the headline G-wave flows.
+      {
+        id: "openTemplates",
+        label: "Start from a template",
+        group: "Create",
+        icon: "layout",
+        keywords: ["template", "gallery", "jumpstart", "preset"],
+        shortcut: shortcutBindings.openTemplates,
+        run: openTemplates,
+      },
+      {
+        id: "openAiGenerate",
+        label: "Generate with AI",
+        group: "Create",
+        icon: "sparkles",
+        keywords: ["ai", "brief", "themed", "deck", "slides", "generate"],
+        shortcut: shortcutBindings.openAiGenerate,
+        run: openAiGenerate,
+      },
+      {
+        id: "openMagicResize",
+        label: "Magic resize",
+        group: "Create",
+        icon: "move",
+        keywords: ["resize", "reflow", "adapt", "sizes"],
+        shortcut: shortcutBindings.openMagicResize,
+        disabled: !hasArtboards,
+        disabledReason: "Create an artboard first",
+        run: openMagicResize,
+      },
+      // Panels.
+      {
+        id: "openTheme",
+        label: "Open Theme & Brand kit",
+        group: "Panels",
+        icon: "grid-2x2",
+        keywords: ["theme", "brand", "restyle", "palette", "colors"],
+        shortcut: shortcutBindings.openTheme,
+        run: openTheme,
+      },
+      {
+        id: "openElements",
+        label: "Browse elements",
+        group: "Panels",
+        icon: "sparkles",
+        keywords: ["elements", "assets", "shapes", "icons", "library"],
+        shortcut: shortcutBindings.openElements,
+        run: openElements,
+      },
+      {
+        id: "openExport",
+        label: "Export",
+        group: "Panels",
+        icon: "download",
+        keywords: ["export", "png", "svg", "pdf", "save"],
+        shortcut: shortcutBindings.openExport,
+        run: () => setMode("export"),
+      },
+      {
+        id: "openShortcutsPanel",
+        label: "Keyboard shortcuts",
+        group: "Panels",
+        icon: "command",
+        keywords: ["shortcuts", "keys", "bindings", "hotkeys"],
+        shortcut: shortcutBindings.openShortcutsPanel,
+        run: () => setShortcutsPanelOpen(true),
+      },
+      // Tools.
+      ...toolOrder.map<PaletteCommand>((t) => ({
+        id: `tool:${t}`,
+        label: `${TOOL_LABELS[t].label} tool`,
+        group: "Tools",
+        icon: TOOL_LABELS[t].icon,
+        keywords: ["tool", t],
+        shortcut: toolBindingFor[t],
+        run: () => selectToolFromPalette(t),
+      })),
+      // Studios (editor modes).
+      ...EDITOR_MODES.map<PaletteCommand>(({ mode: m, label }) => ({
+        id: `mode:${m}`,
+        label: `${label} studio`,
+        group: "Studios",
+        icon: "layout",
+        keywords: ["studio", "mode", "switch", m],
+        run: () => setMode(m),
+      })),
+      // Edit / View.
+      {
+        id: "undo",
+        label: "Undo",
+        group: "Edit",
+        icon: "undo",
+        keywords: ["undo", "revert"],
+        shortcut: shortcutBindings.undo,
+        disabled: !canUndo,
+        disabledReason: "Nothing to undo",
+        run: () => void handleUndo(),
+      },
+      {
+        id: "redo",
+        label: "Redo",
+        group: "Edit",
+        icon: "redo",
+        keywords: ["redo"],
+        shortcut: shortcutBindings.redo,
+        disabled: !canRedo,
+        disabledReason: "Nothing to redo",
+        run: () => void handleRedo(),
+      },
+      {
+        id: "selectAll",
+        label: "Select all",
+        group: "Edit",
+        keywords: ["select", "all"],
+        shortcut: shortcutBindings.selectAll,
+        run: () => void handleSelectAll(),
+      },
+      {
+        id: "copy",
+        label: "Copy",
+        group: "Edit",
+        keywords: ["copy", "clipboard"],
+        shortcut: shortcutBindings.copy,
+        disabled: !hasSelection,
+        disabledReason: "Nothing selected",
+        run: () => void handleCopy(),
+      },
+      {
+        id: "paste",
+        label: "Paste",
+        group: "Edit",
+        keywords: ["paste", "clipboard"],
+        shortcut: shortcutBindings.paste,
+        run: () => void handlePaste(),
+      },
+      {
+        id: "deleteSelection",
+        label: "Delete selection",
+        group: "Edit",
+        keywords: ["delete", "remove"],
+        shortcut: shortcutBindings.deleteSelection,
+        disabled: !hasSelection,
+        disabledReason: "Nothing selected",
+        run: () => void handleDeleteSelected(),
+      },
+      {
+        id: "zoomToFit",
+        label: "Zoom to fit",
+        group: "View",
+        keywords: ["zoom", "fit", "frame", "view"],
+        run: onZoomToFit,
+      },
+      {
+        id: "backHome",
+        label: "Back to Home",
+        group: "View",
+        icon: "arrow-left",
+        keywords: ["home", "projects", "back", "close"],
+        run: onBackHome,
+      },
+    ];
+    return list;
+  }, [
+    shortcutBindings,
+    hasArtboards,
+    hasSelection,
+    canUndo,
+    canRedo,
+    openTemplates,
+    openAiGenerate,
+    openMagicResize,
+    openTheme,
+    openElements,
+    selectToolFromPalette,
+    setMode,
+    handleUndo,
+    handleRedo,
+    handleSelectAll,
+    handleCopy,
+    handlePaste,
+    handleDeleteSelected,
+    onZoomToFit,
+    onBackHome,
+  ]);
 
   // Imperative handle into the AnnotationOverlay. The overlay's root
   // SVG is permanently `pointer-events: none` (so it never blocks
@@ -2086,6 +2559,9 @@ function EditorPageInner({
           void handleExport();
         }}
         onBackHome={onBackHome}
+        onOpenCommandPalette={openCommandPalette}
+        onOpenTemplates={openTemplates}
+        onOpenAiGenerate={openAiGenerate}
       />
       <div
         style={{
@@ -2150,6 +2626,7 @@ function EditorPageInner({
           />
         ) : null}
         <LeftPanel
+          requestedTab={leftPanelTabRequest}
           nodes={nodes}
           selectedId={selectedId}
           onSelect={(id) => {
@@ -2397,6 +2874,20 @@ function EditorPageInner({
             wgpu path remains the source of truth for exports.
           */}
           <SoftProofOverlay />
+          {/*
+            H1 empty-canvas CTA. A fresh project with no artboards
+            shows a centred panel routing into the real creation flows
+            (template / AI / elements) instead of a blank void. The
+            overlay root is pointer-events:none so it never blocks
+            canvas gestures around the panel.
+          */}
+          {artboards.length === 0 ? (
+            <CanvasEmptyState
+              paletteHint={paletteHint}
+              onOpenPalette={openCommandPalette}
+              actions={discoveryActions}
+            />
+          ) : null}
           {inlineTextEdit ? (
             <InlineTextEditor
               nodeId={inlineTextEdit.nodeId}
@@ -2532,6 +3023,7 @@ function EditorPageInner({
           />
         ) : (
           <RightPanel
+            requestedTab={rightPanelTabRequest}
             selected={selected}
             selectedIds={selectedIds}
             onAlignmentApplied={handleAlignmentApplied}
@@ -2652,6 +3144,24 @@ function EditorPageInner({
           </div>
         </div>
       ) : null}
+      <CommandPalette
+        open={commandPaletteOpen}
+        commands={commands}
+        onClose={() => setCommandPaletteOpen(false)}
+      />
+      <BriefModal
+        open={briefOpen}
+        onClose={() => setBriefOpen(false)}
+        llmReady={llmReady}
+        onApplied={handleBriefApplied}
+      />
+      <DiscoveryWelcome
+        open={welcomeOpen}
+        paletteHint={paletteHint}
+        onOpenPalette={openCommandPalette}
+        actions={discoveryActions}
+        onDismiss={dismissWelcome}
+      />
     </div>
   );
 }

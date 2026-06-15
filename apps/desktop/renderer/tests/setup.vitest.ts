@@ -20,6 +20,21 @@ import { cleanup } from "@testing-library/react";
 
 import { installKcreateStub } from "./helpers/kcreateStub";
 
+// jsdom has no layout engine, so `Element.prototype.scrollIntoView`
+// is intentionally unimplemented. Components that keep an active row
+// in view on keyboard navigation (e.g. the command palette) call it
+// from an effect; without a stub the effect throws under jsdom even
+// though the behaviour is correct in Electron. Install a no-op so
+// those effects run cleanly in tests. Guarded on `Element` so the
+// pure-Node test files (which opt out of jsdom) don't trip over a
+// missing global.
+if (
+  typeof Element !== "undefined" &&
+  typeof Element.prototype.scrollIntoView !== "function"
+) {
+  Element.prototype.scrollIntoView = function scrollIntoView(): void {};
+}
+
 // Most test files run under jsdom and need a `window.kcreate`
 // shim. A small set of pure-Node tests in `apps/desktop/main/src/`
 // opt out of jsdom via `// @vitest-environment node` at the top

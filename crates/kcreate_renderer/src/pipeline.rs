@@ -21,7 +21,7 @@
 use std::hash::{Hash, Hasher};
 
 use crate::display_list::{DisplayCommand, DisplayList};
-use crate::geometry::{Color, PathCommand, Rect, Stroke, Style};
+use crate::geometry::{Color, Paint, PathCommand, Rect, Stroke, Style};
 use crate::scene::{Object, ObjectKind, Scene};
 use crate::viewport::Viewport;
 
@@ -58,11 +58,53 @@ fn hash_stroke(s: Stroke, h: &mut impl Hasher) {
     s.width.to_bits().hash(h);
 }
 
-fn hash_style(s: Style, h: &mut impl Hasher) {
-    match s.fill {
-        Some(c) => {
+fn hash_point(x: f32, y: f32, h: &mut impl Hasher) {
+    x.to_bits().hash(h);
+    y.to_bits().hash(h);
+}
+
+fn hash_stops(stops: &[(f32, Color)], h: &mut impl Hasher) {
+    stops.len().hash(h);
+    for (offset, color) in stops {
+        offset.to_bits().hash(h);
+        hash_color(*color, h);
+    }
+}
+
+/// Hash a [`Paint`], covering every byte that affects rendered pixels —
+/// the gradient endpoints AND every stop — so mutating a gradient (a new
+/// stop, a moved handle, a recolored stop) invalidates the display-list
+/// cache. A discriminant byte keeps the three variants distinct.
+fn hash_paint(p: &Paint, h: &mut impl Hasher) {
+    match p {
+        Paint::Solid(c) => {
+            0u8.hash(h);
+            hash_color(*c, h);
+        }
+        Paint::LinearGradient { from, to, stops } => {
             1u8.hash(h);
-            hash_color(c, h);
+            hash_point(from.x, from.y, h);
+            hash_point(to.x, to.y, h);
+            hash_stops(stops, h);
+        }
+        Paint::RadialGradient {
+            center,
+            radius,
+            stops,
+        } => {
+            2u8.hash(h);
+            hash_point(center.x, center.y, h);
+            radius.to_bits().hash(h);
+            hash_stops(stops, h);
+        }
+    }
+}
+
+fn hash_style(s: &Style, h: &mut impl Hasher) {
+    match &s.fill {
+        Some(p) => {
+            1u8.hash(h);
+            hash_paint(p, h);
         }
         None => 0u8.hash(h),
     }
@@ -118,7 +160,7 @@ fn hash_object(o: &Object, h: &mut impl Hasher) {
     o.visible.hash(h);
     o.translation.0.to_bits().hash(h);
     o.translation.1.to_bits().hash(h);
-    hash_style(o.style, h);
+    hash_style(&o.style, h);
     match &o.kind {
         ObjectKind::Rect(r) => {
             0u8.hash(h);
@@ -281,7 +323,7 @@ fn batch_consecutive_rects(list: DisplayList) -> DisplayList {
     while i < commands.len() {
         match &commands[i] {
             DisplayCommand::FillRect { rect, style } => {
-                let run_style = *style;
+                let run_style = style.clone();
                 let mut run_rects: Vec<Rect> = vec![*rect];
                 let mut run_bounds = cmd_bounds[i];
                 let mut j = i + 1;
@@ -423,10 +465,14 @@ mod tests {
 
         let list = p.build_display_list(&s, &vp, (100, 100));
         let style = match list.commands.last().expect("cmd") {
-            DisplayCommand::FillRect { style, .. } => *style,
+            DisplayCommand::FillRect { style, .. } => style.clone(),
             other => panic!("unexpected: {other:?}"),
         };
-        let fill = style.fill.expect("fill");
+        let fill = style
+            .fill
+            .as_ref()
+            .and_then(Paint::representative_color)
+            .expect("fill");
         assert!(fill.g > 0.5 && fill.r < 0.5);
     }
 

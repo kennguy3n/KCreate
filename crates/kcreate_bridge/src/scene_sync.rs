@@ -328,7 +328,7 @@ struct ContentSceneCache {
     blob_store_present: bool,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct SceneSync {
     uuid_to_object_id: HashMap<Uuid, ObjectId>,
     object_id_to_uuid: HashMap<ObjectId, Uuid>,
@@ -363,6 +363,22 @@ pub struct SceneSync {
     /// `#[cfg(test)]` and compiled out of production builds entirely.
     #[cfg(test)]
     fast_path_hits: u64,
+}
+
+impl Default for SceneSync {
+    /// Delegates to [`SceneSync::new`] so a `default()`-constructed
+    /// instance is identical to a `new()`-constructed one. The derived
+    /// `Default` would instead zero `next_id` and `overlay_watermark`,
+    /// which is wrong on both counts: the document-object allocator
+    /// would hand out `ObjectId(0)` — the reserved "no object" sentinel
+    /// — for the first node, and `overlay_watermark` would start below
+    /// [`OVERLAY_ID_THRESHOLD`] so [`is_overlay_id`] would mis-classify
+    /// the first artboard overlay as a document object. `thumbnails.rs`
+    /// constructs an ephemeral `SceneSync::default()` per render, so the
+    /// two constructors must agree.
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl SceneSync {
@@ -1835,6 +1851,40 @@ mod tests {
             serde_json::to_value(path).expect("serialise vector path"),
         );
         node
+    }
+
+    #[test]
+    fn default_matches_new_allocator_state() {
+        // `thumbnails.rs` builds an ephemeral `SceneSync::default()`
+        // per render, so `default()` must produce the same allocator
+        // state as `new()`. The derived `Default` would zero both
+        // scalars — handing out the reserved `ObjectId(0)` sentinel for
+        // the first node and starting `overlay_watermark` below
+        // `OVERLAY_ID_THRESHOLD`.
+        let from_default = SceneSync::default();
+        let from_new = SceneSync::new();
+        assert_eq!(
+            from_default.next_id.load(Ordering::Relaxed),
+            from_new.next_id.load(Ordering::Relaxed),
+            "default() next_id must match new()",
+        );
+        assert_eq!(
+            from_default.next_id.load(Ordering::Relaxed),
+            1,
+            "first document object must not be the ObjectId(0) sentinel",
+        );
+        assert_eq!(from_default.overlay_watermark, from_new.overlay_watermark);
+        assert_eq!(from_default.overlay_watermark, OVERLAY_ID_THRESHOLD);
+
+        // Behavioural tie-in: the first emitted document object from a
+        // `default()`-constructed sync gets ObjectId(1), never 0.
+        let mut doc = DocumentGraph::new();
+        let path = unit_square_path();
+        let id = doc.insert_node(vector_node(&path)).expect("insert");
+        let mut sync = SceneSync::default();
+        let _ = sync.sync_document_to_scene(&mut doc, None, &[]);
+        let obj_id = sync.object_id_for_uuid(id).expect("forward lookup");
+        assert_eq!(obj_id.0, 1, "first object id must be 1, not the sentinel 0");
     }
 
     #[test]

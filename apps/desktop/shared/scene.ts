@@ -1578,6 +1578,95 @@ export interface BrandKitBridge {
   import(filePath: string): Promise<string>;
 }
 
+// ---------------------------------------------------------------------------
+// Theme / Brand Kit instant restyle (G4).
+//
+// These mirror `kcreate_core::theme` (Theme / ThemePalette / TypeScale /
+// SpacingScale / RadiusScale) and `kcreate_bridge::document::ApplyThemeReport`.
+// Theme + its sub-structs serialize with default (snake_case) serde, so the
+// field names below are snake_case. `ApplyThemeReport` uses
+// `rename_all = "camelCase"`, so its fields are camelCase.
+// ---------------------------------------------------------------------------
+
+/** A theme's seven-color palette, one color per role. Mirrors
+ * `kcreate_core::theme::ThemePalette`. */
+export interface ThemePalette {
+  background: RgbaColor;
+  surface: RgbaColor;
+  primary: RgbaColor;
+  secondary: RgbaColor;
+  accent: RgbaColor;
+  text: RgbaColor;
+  muted: RgbaColor;
+}
+
+/** A theme's type scale: body + heading font families and one size (px)
+ * per type role, plus a line-height multiplier. Mirrors
+ * `kcreate_core::theme::TypeScale`. */
+export interface TypeScale {
+  body_font: string;
+  heading_font: string;
+  display: number;
+  heading: number;
+  body: number;
+  caption: number;
+  line_height: number;
+}
+
+/** A theme's spacing scale (px). Mirrors `kcreate_core::theme::SpacingScale`. */
+export interface SpacingScale {
+  xs: number;
+  sm: number;
+  md: number;
+  lg: number;
+  xl: number;
+}
+
+/** A theme's corner-radius scale (px). Mirrors
+ * `kcreate_core::theme::RadiusScale`. */
+export interface RadiusScale {
+  none: number;
+  small: number;
+  medium: number;
+  large: number;
+  full: number;
+}
+
+/** A named theme: palette + type scale + spacing + radii. Mirrors
+ * `kcreate_core::theme::Theme`. */
+export interface Theme {
+  id: string;
+  name: string;
+  palette: ThemePalette;
+  type_scale: TypeScale;
+  spacing: SpacingScale;
+  radii: RadiusScale;
+}
+
+/** Summary of what `theme.apply()` changed. Mirrors
+ * `kcreate_bridge::document::ApplyThemeReport` (camelCase serde). */
+export interface ApplyThemeReport {
+  themeId: string;
+  themeName: string;
+  affectedNodes: number;
+  recoloredFills: number;
+  recoloredStrokes: number;
+  restyledText: number;
+}
+
+/**
+ * Theme / Brand-Kit instant-restyle bridge (G4). `apply` runs as a
+ * single undoable operation — one `document.undo()` reverts the whole
+ * restyle. Custom brand kits are persisted through `brandKit.*`;
+ * `fromBrandKit` converts a saved kit into an applyable theme.
+ */
+export interface ThemeBridge {
+  listBuiltins(): Promise<Theme[]>;
+  apply(theme: Theme): Promise<ApplyThemeReport>;
+  deriveFromDocument(name: string): Promise<Theme>;
+  fromBrandKit(kit: BrandKit): Promise<Theme>;
+}
+
 /**
  * Export-preset CRUD bridge. Used by both the Export panel and the
  * project home page (to seed default presets).
@@ -4912,6 +5001,7 @@ declare global {
       export: ExportBridge;
       designTokens: DesignTokensBridge;
       brandKit: BrandKitBridge;
+      theme: ThemeBridge;
       exportPreset: ExportPresetBridge;
       artboard: ArtboardBridge;
       component: ComponentBridge;

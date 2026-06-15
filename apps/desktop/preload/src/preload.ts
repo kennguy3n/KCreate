@@ -7,6 +7,7 @@ import { contextBridge, ipcRenderer } from "electron";
 import type {
   AcquiredFrame,
   AiBridge,
+  ApplyThemeReport,
   ArtboardBridge,
   AuditBridge,
   AuditEvent,
@@ -39,6 +40,8 @@ import type {
   LayoutTemplate,
   TemplateCategory,
   TemplateListReport,
+  Theme,
+  ThemeBridge,
   TemplateManifest,
   TemplateMarketplaceBridge,
   MasterPageBridge,
@@ -1291,6 +1294,36 @@ const brandKit: BrandKitBridge = {
       "kcreate/brandKit/import",
       filePath,
     )) as string;
+  },
+};
+
+const theme: ThemeBridge = {
+  async listBuiltins(): Promise<Theme[]> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/theme/listBuiltins",
+    )) as string;
+    return JSON.parse(raw) as Theme[];
+  },
+  async apply(themeValue: Theme): Promise<ApplyThemeReport> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/theme/apply",
+      JSON.stringify(themeValue),
+    )) as string;
+    return JSON.parse(raw) as ApplyThemeReport;
+  },
+  async deriveFromDocument(name: string): Promise<Theme> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/theme/deriveFromDocument",
+      name,
+    )) as string;
+    return JSON.parse(raw) as Theme;
+  },
+  async fromBrandKit(kit: BrandKit): Promise<Theme> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/theme/fromBrandKit",
+      JSON.stringify(kit),
+    )) as string;
+    return JSON.parse(raw) as Theme;
   },
 };
 
@@ -3785,6 +3818,7 @@ contextBridge.exposeInMainWorld("kcreate", {
   export: exportApi,
   designTokens,
   brandKit,
+  theme,
   exportPreset,
   artboard,
   component,

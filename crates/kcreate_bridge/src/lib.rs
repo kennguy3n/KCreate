@@ -2971,6 +2971,70 @@ pub fn document_set_layer_color(node_id: String, color: Option<String>) -> NapiR
 }
 
 // ---------------------------------------------------------------------------
+// G4 — Theme / Brand Kit instant restyle.
+//
+// Thin N-API marshalling for the theme model + apply-theme entry
+// point. Themes and brand kits are JSON-string types (their internal
+// fields stay snake_case across the wire), so these functions return
+// `serde_json::to_string(..)` and parse via `serde_json::from_str(..)`
+// rather than `#[napi(object)]`. The renderer's `apps/desktop/shared/
+// scene.ts` mirrors these shapes (rule 4).
+// ---------------------------------------------------------------------------
+
+/// Return the built-in professional themes as a JSON array of `Theme`.
+#[napi]
+pub fn theme_list_builtins() -> NapiResult<String> {
+    let themes = kcreate_core::theme::builtin_themes();
+    serde_json::to_string(&themes)
+        .map_err(|e| NapiError::from_reason(format!("theme_list_builtins: {e}")))
+}
+
+/// Apply `theme_json` (a serialised `Theme`) to the open document as a
+/// single undoable operation. Returns a JSON `ApplyThemeReport`.
+#[napi]
+pub fn document_apply_theme(theme_json: String) -> NapiResult<String> {
+    let theme: kcreate_core::theme::Theme = serde_json::from_str(&theme_json).map_err(|e| {
+        NapiError::new(
+            Status::InvalidArg,
+            format!("apply_theme: invalid theme: {e}"),
+        )
+    })?;
+    let report = document::document_apply_theme(&theme).map_err(map_doc_err)?;
+    serde_json::to_string(&report).map_err(|e| NapiError::from_reason(format!("apply_theme: {e}")))
+}
+
+/// Derive a `Theme` from the open document's own palette (reusing the
+/// k-means palette extractor). `name` labels the derived theme.
+/// Returns a JSON `Theme`.
+#[napi]
+pub fn theme_derive_from_document(name: String) -> NapiResult<String> {
+    let theme = document::theme_derive_from_document(&name).map_err(map_doc_err)?;
+    serde_json::to_string(&theme)
+        .map_err(|e| NapiError::from_reason(format!("theme_derive_from_document: {e}")))
+}
+
+/// Build a `Theme` from a `BrandKit` (palette + fonts → roles + type
+/// scale). Pure transform — does not touch the open project. Returns
+/// a JSON `Theme`.
+#[napi]
+pub fn theme_from_brand_kit(kit_json: String) -> NapiResult<String> {
+    let kit: kcreate_core::project::BrandKit = serde_json::from_str(&kit_json).map_err(|e| {
+        NapiError::new(
+            Status::InvalidArg,
+            format!("theme_from_brand_kit: invalid kit: {e}"),
+        )
+    })?;
+    let theme = kcreate_core::theme::Theme::from_brand_kit(&kit);
+    serde_json::to_string(&theme)
+        .map_err(|e| NapiError::from_reason(format!("theme_from_brand_kit: {e}")))
+}
+
+// Custom brand kits are persisted through the existing
+// `brand_kit_create` / `brand_kit_update` / `brand_kit_list` /
+// `brand_kit_delete` surface (see above) — G4 deliberately reuses
+// that canonical CRUD path rather than adding a parallel one.
+
+// ---------------------------------------------------------------------------
 // Phase 2 — preflight, icon pack, parallel batch, AI model packs,
 // plugin sandbox, MCP permissions, screenshot-to-layout.
 // ---------------------------------------------------------------------------

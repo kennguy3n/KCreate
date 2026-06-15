@@ -1602,6 +1602,20 @@ function registerIpcHandlers(): void {
     requireBridge().exportPresetDelete(presetId),
   );
 
+  // Theme / Brand Kit instant restyle (G4)
+  ipcMain.handle("kcreate/theme/listBuiltins", () =>
+    requireBridge().themeListBuiltins(),
+  );
+  ipcMain.handle("kcreate/theme/apply", (_e, themeJson: string) =>
+    requireBridge().documentApplyTheme(themeJson),
+  );
+  ipcMain.handle("kcreate/theme/deriveFromDocument", (_e, name: string) =>
+    requireBridge().themeDeriveFromDocument(name),
+  );
+  ipcMain.handle("kcreate/theme/fromBrandKit", (_e, kitJson: string) =>
+    requireBridge().themeFromBrandKit(kitJson),
+  );
+
   ipcMain.handle(
     "kcreate/artboard/create",
     (

@@ -29,6 +29,7 @@ import { ConstraintsPanel } from "./ConstraintsPanel";
 import { EncryptionPanel } from "./EncryptionPanel";
 import { TextFramePanel } from "./TextFramePanel";
 import { TextStylePanel } from "./TextStylePanel";
+import { ThemePanel } from "./ThemePanel";
 import { TokenBindingControl } from "./TokenBindingControl";
 import { Icon, type IconName } from "./Icon";
 
@@ -46,6 +47,7 @@ export type RightPanelTab =
   | "presence"
   | "constraints"
   | "tokens"
+  | "theme"
   | "publish"
   | "encryption";
 
@@ -147,6 +149,13 @@ export interface RightPanelProps {
   /** Trigger after Interaction add/remove so the host can refresh state. */
   onInteractionsChanged?: () => void;
   /**
+   * G4 — fired after a successful theme/brand-kit apply so the host
+   * can re-fetch the document tree, status, and selection. The
+   * canvas updates independently via the bridge's scene-sync push;
+   * this only resyncs React-side state (layer tree, properties).
+   */
+  onThemeApplied?: () => void;
+  /**
    * Active project, used by the Phase 3 Presence tab. When `null`,
    * the Presence tab still shows (the user can edit display name)
    * but the "Start session" button is disabled.
@@ -167,6 +176,7 @@ export function RightPanel({
   artboards,
   tree,
   onInteractionsChanged,
+  onThemeApplied,
   project,
 }: RightPanelProps): JSX.Element {
   const showAccessibility = mode === "design" || mode === "inspect";
@@ -219,6 +229,10 @@ export function RightPanel({
       // otherwise (mirrors how the Properties tab degrades).
       mkTab({ id: "constraints", label: "Constraints", icon: "move" }),
       mkTab({ id: "tokens", label: "Tokens", icon: "variable" }),
+      // G4 — Theme / Brand Kit instant restyle. Project-scoped (no
+      // node selection needed): applies a theme to the whole
+      // document in one undoable op.
+      mkTab({ id: "theme", label: "Theme", icon: "palette" }),
       mkTab({ id: "publish", label: "Publish", icon: "globe" }),
       mkTab({ id: "encryption", label: "Encryption", icon: "lock" }),
     ],
@@ -496,6 +510,9 @@ export function RightPanel({
           ) : (
             <Hint>Select a node to bind design tokens to its properties.</Hint>
           )
+        ) : null}
+        {tab === "theme" ? (
+          <ThemePanel onStatus={onStatus} onApplied={onThemeApplied} />
         ) : null}
         {tab === "publish" ? (
           <ArtifactPublishPanel onStatus={onStatus} />

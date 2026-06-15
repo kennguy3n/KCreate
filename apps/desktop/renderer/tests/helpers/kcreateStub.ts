@@ -122,6 +122,15 @@ const defaultsByMethod: Record<string, () => unknown> = {
   "phase10.preferencesLoad": () => ({ ...defaultPrefs }),
   "phase10.preferencesSave": () => undefined,
   "designTokens.get": () => null,
+  // G4 — Theme / Brand Kit. `theme.listBuiltins` and `brandKit.list`
+  // default to empty so ThemePanel mounts cleanly; tests that
+  // exercise selection / apply override with real fixtures.
+  "theme.listBuiltins": () => [],
+  "brandKit.list": () => [],
+  "brandKit.create": () => "00000000-0000-0000-0000-000000000000",
+  "brandKit.update": () => undefined,
+  "brandKit.delete": () => true,
+  "document.saveProject": () => undefined,
   "export.png": () => 0,
   "export.svg": () => "",
   "export.pdf": () => 0,
@@ -342,6 +351,9 @@ export function installKcreateStub(): KcreateStubHandle {
     canvas: namespace("canvas"),
     canvasSnap: namespace("canvasSnap"),
     text: namespace("text"),
+    // G4 — Theme / Brand Kit instant restyle.
+    theme: namespace("theme"),
+    brandKit: namespace("brandKit"),
     project: namespace("project"),
     audit: namespace("audit"),
     component: namespace("component"),

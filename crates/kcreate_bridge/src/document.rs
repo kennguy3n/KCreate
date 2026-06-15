@@ -9,7 +9,7 @@
 //! Concurrency: one [`Workspace`] per process, behind a
 //! `parking_lot::Mutex`. All mutations are short and synchronous.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -19,11 +19,12 @@ use kcreate_core::component::{
 };
 use kcreate_core::config::RuntimeConfig;
 use kcreate_core::document::{DocumentError, DocumentGraph};
-use kcreate_core::node::{Node, NodeType};
+use kcreate_core::node::{FillStyle, Node, NodeType, RgbaColor};
 use kcreate_core::operation::Operation;
 use kcreate_core::project::{
     BrandKit, DesignTokens, ExportFormat, ExportPreset, Project, ProjectError, Slice,
 };
+use kcreate_core::theme::{build_color_remap, quantize, ColorUsage, RadiusScale, Theme, TypeRole};
 use kcreate_export::png::{export_png_to_bytes, PngExportError, PngExportOptions};
 use kcreate_export::svg::{export_svg_from_document, SvgDocumentExportError, SvgExportOptions};
 use kcreate_layout::{layout_flex, layout_grid, FlexLayout, GridLayout};
@@ -1553,6 +1554,14 @@ const APPLY_PATCH_COMMANDS: &[&str] = &[
     "text_set_content",
     "text_replace_range",
     "text_set_style",
+    // G4 — Theme / Brand Kit instant restyle. A single
+    // `apply_theme` op snapshots the prior + next `NodeStyle`,
+    // text-layer metadata, and project `DesignTokens` for every node
+    // the restyle touched, so one undo flips the whole document back.
+    // The before / after patches share the [`ApplyThemePatch`] shape;
+    // group-undo reverse capture needs to roll back the same slots —
+    // see `ApplyPatchSnapshot::capture`.
+    "apply_theme",
 ];
 
 #[inline]
@@ -1618,6 +1627,24 @@ struct ApplyPatchSnapshot {
     // either payload (the shape is already verified by the
     // recorder + `apply_patch`).
     text_layer: HashMap<Uuid, TextLayerSnapshot>,
+    // G4 — per-node prior style + text-metadata captured before any
+    // `apply_theme` patch in the group runs. Keyed by node id. The
+    // companion `apply_theme_tokens` holds the project design tokens
+    // at capture time so the whole restyle (tokens + every node)
+    // rolls back atomically on a mid-group failure.
+    apply_theme: HashMap<Uuid, ApplyThemeSnapshot>,
+    apply_theme_tokens: Option<DesignTokens>,
+}
+
+/// Pre-loop snapshot of the node state an `apply_theme` patch may
+/// overwrite: the full `NodeStyle` (fills / strokes / corner radius)
+/// plus both text-metadata slots (`TEXT_LAYER_METADATA_KEY` and the
+/// camelCase `text_style`). `None` for a text slot means the node
+/// had no such key and restore must remove it.
+struct ApplyThemeSnapshot {
+    style: kcreate_core::node::NodeStyle,
+    text_meta: Option<serde_json::Value>,
+    text_style: Option<serde_json::Value>,
 }
 
 /// Pre-loop snapshot of the metadata slots Phase A1 commands write.
@@ -1652,6 +1679,8 @@ impl ApplyPatchSnapshot {
             layer_color: HashMap::new(),
             clipboard_paste: HashMap::new(),
             text_layer: HashMap::new(),
+            apply_theme: HashMap::new(),
+            apply_theme_tokens: None,
         };
         for op in ops {
             // Defence-in-depth: skip commands the apply_patch
@@ -1757,6 +1786,29 @@ impl ApplyPatchSnapshot {
                         });
                     }
                 }
+                "apply_theme" => {
+                    // Capture the design tokens once (the first
+                    // apply_theme op in the group) so restore reverts
+                    // them to the pre-loop value.
+                    snap.apply_theme_tokens
+                        .get_or_insert_with(|| ws.project.design_tokens.clone());
+                    for id in &op.affected_nodes {
+                        if let std::collections::hash_map::Entry::Vacant(slot) =
+                            snap.apply_theme.entry(*id)
+                        {
+                            if let Some(node) = ws.project.document.get_node(*id) {
+                                slot.insert(ApplyThemeSnapshot {
+                                    style: node.style.clone(),
+                                    text_meta: node
+                                        .metadata
+                                        .get(crate::scene_sync::TEXT_LAYER_METADATA_KEY)
+                                        .cloned(),
+                                    text_style: node.metadata.get("text_style").cloned(),
+                                });
+                            }
+                        }
+                    }
+                }
                 _ => {}
             }
         }
@@ -1839,6 +1891,36 @@ impl ApplyPatchSnapshot {
                 // inserted it. Remove root + descendants.
                 ws.project.document.remove_node(root_id);
             }
+        }
+        // G4 — restore per-node style + text metadata, then the
+        // design tokens, so a mid-group apply_theme failure rolls the
+        // whole restyle back to its pre-loop state.
+        for (id, theme_snap) in self.apply_theme {
+            if let Some(node) = ws.project.document.get_node_mut(id) {
+                node.style = theme_snap.style;
+                match theme_snap.text_meta {
+                    Some(v) => {
+                        node.metadata
+                            .insert(crate::scene_sync::TEXT_LAYER_METADATA_KEY.to_string(), v);
+                    }
+                    None => {
+                        node.metadata
+                            .remove(crate::scene_sync::TEXT_LAYER_METADATA_KEY);
+                    }
+                }
+                match theme_snap.text_style {
+                    Some(v) => {
+                        node.metadata.insert("text_style".to_string(), v);
+                    }
+                    None => {
+                        node.metadata.remove("text_style");
+                    }
+                }
+                node.touch();
+            }
+        }
+        if let Some(tokens) = self.apply_theme_tokens {
+            ws.project.design_tokens = tokens;
         }
     }
 }
@@ -2141,6 +2223,32 @@ fn apply_forward_patch(ws: &mut Workspace, op: &Operation) -> Result<()> {
     apply_patch(ws, op, &op.after_patch)
 }
 
+/// Serialized shape of a single node's contribution to an
+/// [`ApplyThemePatch`]. `style` is the full `NodeStyle` (so undo /
+/// redo restore every fill, stroke, and corner radius verbatim);
+/// the two text slots mirror `metadata[TEXT_LAYER_METADATA_KEY]` and
+/// `metadata["text_style"]` and are `None` for non-text nodes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ApplyThemeNodePatch {
+    style: kcreate_core::node::NodeStyle,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    text_meta: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    text_style: Option<serde_json::Value>,
+}
+
+/// Full payload carried by both `before_patch` and `after_patch` of
+/// an `apply_theme` operation: the project `DesignTokens` plus the
+/// per-node style / text snapshot for every node the restyle
+/// touched. Replaying the whole struct is what makes one Ctrl+Z
+/// revert the entire restyle (see the `apply_theme` arm in
+/// [`apply_patch`]).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ApplyThemePatch {
+    design_tokens: DesignTokens,
+    nodes: std::collections::BTreeMap<Uuid, ApplyThemeNodePatch>,
+}
+
 fn apply_patch(ws: &mut Workspace, op: &Operation, patch: &serde_json::Value) -> Result<()> {
     // `project.undo()` / `project.redo()` already bumped
     // `modified_at` before we got here, so we don't need to touch it
@@ -2367,6 +2475,47 @@ fn apply_patch(ws: &mut Workspace, op: &Operation, patch: &serde_json::Value) ->
                 value: format!("expected object with new_root_id or subtree, got {other}"),
             }),
         },
+        // G4 — Theme / Brand Kit instant restyle. Both before_patch
+        // and after_patch carry the full [`ApplyThemePatch`] shape:
+        // the project `DesignTokens` plus a per-node map of the new
+        // `NodeStyle` and text-layer metadata slots. Undo replays
+        // before_patch, redo replays after_patch — so one Ctrl+Z
+        // reverts every recolored fill / stroke / text size in a
+        // single step. We do NOT touch the renderer here;
+        // `document_undo` / `document_redo` re-run scene sync after
+        // the apply_patch loop via `touch_version`.
+        "apply_theme" => {
+            // Deserialize the WHOLE payload up-front so a malformed
+            // patch fails before any mutation (fail-fast, never
+            // half-applied).
+            let parsed: ApplyThemePatch = serde_json::from_value(patch.clone())?;
+            ws.project.design_tokens = parsed.design_tokens;
+            for (id, node_patch) in parsed.nodes {
+                let Some(node) = ws.project.document.get_node_mut(id) else {
+                    // The node was removed by a later op that the LIFO
+                    // operation log undoes before this one in normal
+                    // flows, so it is present at replay time. Skip
+                    // defensively rather than failing the whole
+                    // restyle if the graph has diverged.
+                    continue;
+                };
+                node.style = node_patch.style;
+                // apply_theme only ever rewrites an existing text
+                // slot (never adds one to a non-text node nor removes
+                // one), so both patch directions carry `Some` for the
+                // slots a text node owns and `None` otherwise —
+                // insert-only is the correct symmetric replay.
+                if let Some(meta) = node_patch.text_meta {
+                    node.metadata
+                        .insert(crate::scene_sync::TEXT_LAYER_METADATA_KEY.to_string(), meta);
+                }
+                if let Some(text_style) = node_patch.text_style {
+                    node.metadata.insert("text_style".to_string(), text_style);
+                }
+                node.touch();
+            }
+            Ok(())
+        }
         other => {
             // No-op fall-through for graph operations
             // (document_create_node, canvas_move_node, …) whose
@@ -4706,6 +4855,375 @@ pub fn document_set_layer_color(node_id: Uuid, color: Option<String>) -> Result<
     ws.project.modified_at = Utc::now();
     let _ = sync_scene_locked(&mut guard);
     Ok(new_version)
+}
+
+// -----------------------------------------------------------------------------
+// G4 — Theme / Brand Kit instant restyle.
+//
+// `document_apply_theme` walks the whole document graph and remaps
+// every solid fill / stroke / text color to the theme's role palette,
+// applies the type scale to text layers, and buckets corner radii to
+// the theme's radius scale — all as ONE undoable operation. The
+// restyle is reversible: the recorded `apply_theme` operation carries
+// per-node before/after style + text snapshots (plus the design-token
+// delta), so a single undo restores the prior look exactly (see the
+// `"apply_theme"` arm in `apply_patch` and `ApplyPatchSnapshot`).
+//
+// Color mapping is role-aware, not a flatten-to-one-color: usages are
+// area-weighted across the document and ranked so the most-used fill
+// becomes the background and the most saturated chromatic color
+// becomes the primary (see `kcreate_core::theme::assign_roles`).
+// -----------------------------------------------------------------------------
+
+/// Summary of an [`document_apply_theme`] run, surfaced to the
+/// ThemePanel so it can report what the restyle touched. Mirrors
+/// `ApplyThemeReport` in `apps/desktop/shared/scene.ts`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApplyThemeReport {
+    pub theme_id: String,
+    pub theme_name: String,
+    pub affected_nodes: usize,
+    pub recolored_fills: usize,
+    pub recolored_strokes: usize,
+    pub restyled_text: usize,
+}
+
+/// Area used to weight a node's colors during role assignment. Clamped
+/// to at least `1.0` so degenerate / zero-size nodes still contribute
+/// a vote rather than vanishing.
+fn node_area(node: &Node) -> f64 {
+    let w = node.bounds.width.max(0.0);
+    let h = node.bounds.height.max(0.0);
+    (w * h).max(1.0)
+}
+
+/// Push every solid color carried by `style` (primary + extra fills,
+/// primary + extra strokes) into `out`, each weighted by `area`.
+/// Gradient / none fills are skipped — they carry no single color to
+/// remap.
+fn collect_solid_colors(
+    style: &kcreate_core::node::NodeStyle,
+    area: f64,
+    out: &mut Vec<ColorUsage>,
+) {
+    if let FillStyle::Solid(c) = &style.fill {
+        out.push(ColorUsage::new(*c, area));
+    }
+    for f in &style.extra_fills {
+        if let FillStyle::Solid(c) = f {
+            out.push(ColorUsage::new(*c, area));
+        }
+    }
+    if let Some(stroke) = &style.stroke {
+        out.push(ColorUsage::new(stroke.color, area));
+    }
+    for s in &style.extra_strokes {
+        out.push(ColorUsage::new(s.color, area));
+    }
+}
+
+/// Remap a single color in place via `remap`, preserving nothing the
+/// remap didn't ask for. Returns `true` iff the color actually
+/// changed (so callers can count real recolors, not no-ops).
+fn remap_solid_color(color: &mut RgbaColor, remap: &HashMap<[u8; 4], RgbaColor>) -> bool {
+    if let Some(target) = remap.get(&quantize(*color)) {
+        if *target != *color {
+            *color = *target;
+            return true;
+        }
+    }
+    false
+}
+
+/// Remap a fill in place when it is `Solid`. Gradient / none fills are
+/// left untouched.
+fn remap_solid_fill(fill: &mut FillStyle, remap: &HashMap<[u8; 4], RgbaColor>) -> bool {
+    match fill {
+        FillStyle::Solid(c) => remap_solid_color(c, remap),
+        _ => false,
+    }
+}
+
+/// Recolor every solid color carried by `style` and bucket its corner
+/// radius through `radii`. Returns `(fills_recolored, strokes_recolored)`.
+fn restyle_node_style(
+    style: &mut kcreate_core::node::NodeStyle,
+    remap: &HashMap<[u8; 4], RgbaColor>,
+    radii: &RadiusScale,
+) -> (usize, usize) {
+    let mut fills = 0usize;
+    let mut strokes = 0usize;
+    if remap_solid_fill(&mut style.fill, remap) {
+        fills += 1;
+    }
+    for f in &mut style.extra_fills {
+        if remap_solid_fill(f, remap) {
+            fills += 1;
+        }
+    }
+    if let Some(stroke) = &mut style.stroke {
+        if remap_solid_color(&mut stroke.color, remap) {
+            strokes += 1;
+        }
+    }
+    for s in &mut style.extra_strokes {
+        if remap_solid_color(&mut s.color, remap) {
+            strokes += 1;
+        }
+    }
+    style.corner_radius = radii.remap(style.corner_radius);
+    (fills, strokes)
+}
+
+/// Apply the theme's type scale to a text node. Classifies the node's
+/// current font size into a [`TypeRole`] and rewrites the canonical
+/// `TextLayerMeta` (font family + size) and, when present, the
+/// `text_style` override (family + size + line height) to match the
+/// theme. The text COLOR is `node.style.fill`, already handled by the
+/// fill remap — this only touches typography. Returns `true` iff
+/// anything changed.
+fn restyle_text_node(node: &mut Node, theme: &Theme) -> Result<bool> {
+    let meta_val = node
+        .metadata
+        .get(crate::scene_sync::TEXT_LAYER_METADATA_KEY)
+        .cloned();
+    let style_val = node.metadata.get("text_style").cloned();
+
+    // Classify the role from the canonical meta size when present,
+    // falling back to the override size.
+    let role = meta_val
+        .as_ref()
+        .and_then(|mv| serde_json::from_value::<kcreate_export::TextLayerMeta>(mv.clone()).ok())
+        .map(|m| TypeRole::for_size(m.font_size))
+        .or_else(|| {
+            style_val
+                .as_ref()
+                .and_then(|sv| {
+                    serde_json::from_value::<crate::phase2::TextStyleWire>(sv.clone()).ok()
+                })
+                .map(|s| TypeRole::for_size(s.font_size))
+        });
+    let Some(role) = role else {
+        return Ok(false);
+    };
+    let new_size = theme.type_scale.size_for(role);
+    let new_family = theme.type_scale.font_for(role).to_string();
+    let new_line_height = f64::from(theme.type_scale.line_height);
+
+    let mut changed = false;
+    if let Some(mv) = &meta_val {
+        if let Ok(mut meta) = serde_json::from_value::<kcreate_export::TextLayerMeta>(mv.clone()) {
+            if (meta.font_size - new_size).abs() > f32::EPSILON || meta.font_family != new_family {
+                meta.font_size = new_size;
+                meta.font_family.clone_from(&new_family);
+                node.metadata.insert(
+                    crate::scene_sync::TEXT_LAYER_METADATA_KEY.to_string(),
+                    serde_json::to_value(&meta)?,
+                );
+                changed = true;
+            }
+        }
+    }
+    if let Some(sv) = &style_val {
+        if let Ok(mut wire) = serde_json::from_value::<crate::phase2::TextStyleWire>(sv.clone()) {
+            if (wire.font_size - new_size).abs() > f32::EPSILON
+                || wire.font_family != new_family
+                || (wire.line_height - new_line_height).abs() > f64::EPSILON
+            {
+                wire.font_size = new_size;
+                wire.font_family.clone_from(&new_family);
+                wire.line_height = new_line_height;
+                node.metadata
+                    .insert("text_style".to_string(), serde_json::to_value(&wire)?);
+                changed = true;
+            }
+        }
+    }
+    Ok(changed)
+}
+
+/// Instantly restyle the open document to `theme` as a single undoable
+/// operation. See the module-level section comment for the contract.
+pub fn document_apply_theme(theme: &Theme) -> Result<ApplyThemeReport> {
+    let mut guard = slot().write();
+    let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
+
+    // Pass 1 — collect area-weighted color usages across the whole
+    // document so role assignment is deterministic and global.
+    let mut usages: Vec<ColorUsage> = Vec::new();
+    for (_id, node) in ws.project.document.iter() {
+        let area = node_area(node);
+        collect_solid_colors(&node.style, area, &mut usages);
+    }
+    let remap = build_color_remap(&usages, theme);
+
+    // Design tokens: merge the theme's tokens over the existing ones so
+    // any foreign keys the user defined survive the restyle.
+    let before_tokens = ws.project.design_tokens.clone();
+    let after_tokens = theme.merge_into_tokens(&before_tokens);
+    let tokens_changed = before_tokens != after_tokens;
+    ws.project.design_tokens = after_tokens.clone();
+
+    // Pass 2 — restyle every node, snapshotting before / after so the
+    // whole restyle collapses to one reversible operation. Collect ids
+    // first to avoid holding an immutable borrow across the mutation.
+    let node_ids: Vec<Uuid> = ws.project.document.iter().map(|(id, _)| *id).collect();
+    let mut before_nodes: BTreeMap<Uuid, ApplyThemeNodePatch> = BTreeMap::new();
+    let mut after_nodes: BTreeMap<Uuid, ApplyThemeNodePatch> = BTreeMap::new();
+    let mut recolored_fills = 0usize;
+    let mut recolored_strokes = 0usize;
+    let mut restyled_text = 0usize;
+
+    for id in node_ids {
+        let Some(node) = ws.project.document.get_node_mut(id) else {
+            continue;
+        };
+        let before_style = node.style.clone();
+        let before_meta = node
+            .metadata
+            .get(crate::scene_sync::TEXT_LAYER_METADATA_KEY)
+            .cloned();
+        let before_text_style = node.metadata.get("text_style").cloned();
+
+        let (fills, strokes) = restyle_node_style(&mut node.style, &remap, &theme.radii);
+        let text_changed = if matches!(node.node_type, NodeType::TextLayer) {
+            restyle_text_node(node, theme)?
+        } else {
+            false
+        };
+
+        let style_changed = node.style != before_style;
+        if !style_changed && !text_changed {
+            continue;
+        }
+        node.touch();
+        recolored_fills += fills;
+        recolored_strokes += strokes;
+        if text_changed {
+            restyled_text += 1;
+        }
+
+        let after_meta = node
+            .metadata
+            .get(crate::scene_sync::TEXT_LAYER_METADATA_KEY)
+            .cloned();
+        let after_text_style = node.metadata.get("text_style").cloned();
+        before_nodes.insert(
+            id,
+            ApplyThemeNodePatch {
+                style: before_style,
+                text_meta: before_meta,
+                text_style: before_text_style,
+            },
+        );
+        after_nodes.insert(
+            id,
+            ApplyThemeNodePatch {
+                style: node.style.clone(),
+                text_meta: after_meta,
+                text_style: after_text_style,
+            },
+        );
+    }
+
+    let affected: Vec<Uuid> = before_nodes.keys().copied().collect();
+    let report = ApplyThemeReport {
+        theme_id: theme.id.clone(),
+        theme_name: theme.name.clone(),
+        affected_nodes: affected.len(),
+        recolored_fills,
+        recolored_strokes,
+        restyled_text,
+    };
+
+    // Nothing visibly changed and tokens are identical → don't push a
+    // no-op onto the undo stack.
+    if affected.is_empty() && !tokens_changed {
+        return Ok(report);
+    }
+
+    let before_patch = serde_json::to_value(ApplyThemePatch {
+        design_tokens: before_tokens,
+        nodes: before_nodes,
+    })?;
+    let after_patch = serde_json::to_value(ApplyThemePatch {
+        design_tokens: after_tokens,
+        nodes: after_nodes,
+    })?;
+    let op = Operation::new("user", "apply_theme", before_patch, after_patch, affected);
+    ws.project.execute_operation(op);
+    ws.project.modified_at = Utc::now();
+    let _ = sync_scene_locked(&mut guard);
+    Ok(report)
+}
+
+/// Derive a [`Theme`] from the open document's own palette. Aggregates
+/// area-weighted solid colors across the graph, runs them through
+/// `kcreate_ai::palette::extract_palette` (the same k-means extractor
+/// the AI palette panel uses), and assigns roles. Returns a theme the
+/// caller can preview, tweak, or apply.
+pub fn theme_derive_from_document(name: &str) -> Result<Theme> {
+    let guard = slot().read();
+    let ws = guard.as_ref().ok_or(DocumentBridgeError::NoProject)?;
+    let mut usages: Vec<ColorUsage> = Vec::new();
+    for (_id, node) in ws.project.document.iter() {
+        let area = node_area(node);
+        collect_solid_colors(&node.style, area, &mut usages);
+    }
+    drop(guard);
+    Ok(derive_theme_from_usages(name, &usages))
+}
+
+/// Build a synthetic area-weighted RGBA8 strip from the document's
+/// solid-color usages and run `kcreate_ai::palette::extract_palette`
+/// over it, then assign roles via [`Theme::derive_from_palette`].
+/// Going through the palette extractor (rather than the raw usages)
+/// keeps the "derive from the design's palette" path identical to the
+/// AI palette panel and merges near-duplicate colors via k-means.
+fn derive_theme_from_usages(name: &str, usages: &[ColorUsage]) -> Theme {
+    // Fixed pixel budget distributed across colors proportional to area;
+    // at least one pixel per distinct color so nothing is lost.
+    const BUDGET: usize = 4096;
+    // Aggregate by quantized color so weights are stable / order-free.
+    let mut weights: BTreeMap<[u8; 4], f64> = BTreeMap::new();
+    for u in usages {
+        if u.color.a <= 0.0 {
+            continue;
+        }
+        *weights.entry(quantize(u.color)).or_insert(0.0) += u.area.max(0.0);
+    }
+    let total: f64 = weights.values().sum();
+    if weights.is_empty() || total <= 0.0 {
+        return Theme::derive_from_palette(name, &[]);
+    }
+    let mut pixels: Vec<u8> = Vec::new();
+    for (key, w) in &weights {
+        let count = (((w / total) * BUDGET as f64).round() as usize).max(1);
+        for _ in 0..count {
+            pixels.extend_from_slice(&[key[0], key[1], key[2], 255]);
+        }
+    }
+    let width = (pixels.len() / 4) as u32;
+    let extracted = kcreate_ai::palette::extract_palette(&pixels, width, 1, 7);
+    if extracted.is_empty() {
+        return Theme::derive_from_palette(name, &[]);
+    }
+    let palette: Vec<(RgbaColor, f32)> = extracted
+        .iter()
+        .map(|c| {
+            (
+                RgbaColor::new(
+                    f32::from(c.r) / 255.0,
+                    f32::from(c.g) / 255.0,
+                    f32::from(c.b) / 255.0,
+                    1.0,
+                ),
+                c.frequency,
+            )
+        })
+        .collect();
+    Theme::derive_from_palette(name, &palette)
 }
 
 // -----------------------------------------------------------------------------
@@ -7756,6 +8274,8 @@ mod tests {
             "text_set_content",
             "text_replace_range",
             "text_set_style",
+            // G4 — Theme / Brand Kit instant restyle.
+            "apply_theme",
         ]
         .into_iter()
         .collect();
@@ -13014,6 +13534,404 @@ mod tests {
             }
             other => panic!("expected NotVectorLayer, got {other:?}"),
         }
+        project_close();
+    }
+
+    // -----------------------------------------------------------------
+    // G4 — Theme / Brand Kit instant restyle.
+    //
+    // These exercise the full bridge entry point end-to-end: role-aware
+    // recolor, type-scale application to text, and the single-undoable-op
+    // contract (apply -> one undo restores the prior look exactly). The
+    // pure role-assignment / derive-from-palette logic is unit-tested in
+    // `kcreate_core::theme`; here we prove the document walk + operation
+    // log + apply_patch inverse wiring behave.
+    // -----------------------------------------------------------------
+
+    fn rgb8(r: u8, g: u8, b: u8) -> RgbaColor {
+        RgbaColor::new(
+            f32::from(r) / 255.0,
+            f32::from(g) / 255.0,
+            f32::from(b) / 255.0,
+            1.0,
+        )
+    }
+
+    /// Insert a node with explicit bounds + solid fill straight into the
+    /// open workspace, bypassing the create/update entry points so tests
+    /// get full control over geometry, fill, and corner radius. Returns
+    /// the new node id.
+    fn insert_styled_rect(
+        node_type: NodeType,
+        name: &str,
+        (x, y, w, h): (f64, f64, f64, f64),
+        fill: RgbaColor,
+        corner_radius: f64,
+    ) -> Uuid {
+        use kcreate_core::node::Bounds;
+        let mut guard = slot().write();
+        let ws = guard.as_mut().expect("project open");
+        let mut node = Node::new(node_type, name.to_string());
+        node.bounds = Bounds {
+            x,
+            y,
+            width: w,
+            height: h,
+        };
+        node.style.fill = FillStyle::Solid(fill);
+        node.style.corner_radius = corner_radius;
+        ws.project.document.insert_node(node).expect("insert rect")
+    }
+
+    /// Insert a text node carrying the canonical `TextLayerMeta` (font +
+    /// size) and a `node.style.fill` (the text colour).
+    fn insert_text_node(
+        name: &str,
+        (x, y, w, h): (f64, f64, f64, f64),
+        font_family: &str,
+        font_size: f32,
+        fill: RgbaColor,
+    ) -> Uuid {
+        use kcreate_core::node::Bounds;
+        let meta = kcreate_export::TextLayerMeta {
+            text: "Real recognizable copy".to_string(),
+            font_family: font_family.to_string(),
+            font_size,
+        };
+        let mut guard = slot().write();
+        let ws = guard.as_mut().expect("project open");
+        let mut node = Node::new(NodeType::TextLayer, name.to_string());
+        node.bounds = Bounds {
+            x,
+            y,
+            width: w,
+            height: h,
+        };
+        node.style.fill = FillStyle::Solid(fill);
+        node.metadata.insert(
+            crate::scene_sync::TEXT_LAYER_METADATA_KEY.to_string(),
+            serde_json::to_value(&meta).expect("meta json"),
+        );
+        ws.project.document.insert_node(node).expect("insert text")
+    }
+
+    fn node_solid_fill(id: Uuid) -> RgbaColor {
+        let guard = slot().read();
+        let ws = guard.as_ref().expect("open");
+        match &ws.project.document.get_node(id).expect("node").style.fill {
+            FillStyle::Solid(c) => *c,
+            other => panic!("expected solid fill, got {other:?}"),
+        }
+    }
+
+    fn read_text_meta(id: Uuid) -> kcreate_export::TextLayerMeta {
+        let guard = slot().read();
+        let ws = guard.as_ref().expect("open");
+        let v = ws
+            .project
+            .document
+            .get_node(id)
+            .expect("node")
+            .metadata
+            .get(crate::scene_sync::TEXT_LAYER_METADATA_KEY)
+            .cloned()
+            .expect("text meta present");
+        serde_json::from_value(v).expect("meta")
+    }
+
+    fn snapshot_styles() -> std::collections::BTreeMap<Uuid, kcreate_core::node::NodeStyle> {
+        let guard = slot().read();
+        let ws = guard.as_ref().expect("open");
+        ws.project
+            .document
+            .iter()
+            .map(|(id, n)| (*id, n.style.clone()))
+            .collect()
+    }
+
+    fn snapshot_metadata() -> std::collections::BTreeMap<Uuid, HashMap<String, serde_json::Value>> {
+        let guard = slot().read();
+        let ws = guard.as_ref().expect("open");
+        ws.project
+            .document
+            .iter()
+            .map(|(id, n)| (*id, n.metadata.clone()))
+            .collect()
+    }
+
+    fn snapshot_tokens() -> DesignTokens {
+        let guard = slot().read();
+        let ws = guard.as_ref().expect("open");
+        ws.project.design_tokens.clone()
+    }
+
+    #[test]
+    #[serial]
+    fn apply_theme_remaps_colors_to_roles_area_aware() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("theme_roles", dir.path()).expect("create");
+
+        // A recognizable hero: a large white canvas, a light-grey surface
+        // card, and one saturated-blue call-to-action button. The blue is
+        // the only chromatic colour, so it must land on `primary`; white
+        // covers the most area, so it must land on `background`.
+        let bg = insert_styled_rect(
+            NodeType::VectorLayer,
+            "Canvas",
+            (0.0, 0.0, 1200.0, 800.0),
+            rgb8(0xFF, 0xFF, 0xFF),
+            0.0,
+        );
+        let surface = insert_styled_rect(
+            NodeType::VectorLayer,
+            "Card",
+            (80.0, 80.0, 640.0, 360.0),
+            rgb8(0xF1, 0xF5, 0xF9),
+            16.0,
+        );
+        let primary = insert_styled_rect(
+            NodeType::VectorLayer,
+            "CTA",
+            (120.0, 360.0, 200.0, 56.0),
+            rgb8(0x25, 0x63, 0xEB),
+            12.0,
+        );
+
+        let theme = Theme::builtin("midnight").expect("midnight theme");
+        let report = document_apply_theme(&theme).expect("apply");
+
+        assert_eq!(report.theme_id, "midnight");
+        assert!(
+            report.recolored_fills >= 3,
+            "expected at least the three inserted fills recolored, got {}",
+            report.recolored_fills
+        );
+
+        assert_eq!(
+            quantize(node_solid_fill(bg)),
+            quantize(theme.palette.background),
+            "dominant white fill must map to the theme background"
+        );
+        assert_eq!(
+            quantize(node_solid_fill(surface)),
+            quantize(theme.palette.surface),
+            "light-grey card must map to the theme surface"
+        );
+        assert_eq!(
+            quantize(node_solid_fill(primary)),
+            quantize(theme.palette.primary),
+            "saturated blue CTA must map to the theme primary"
+        );
+
+        // Design tokens were populated from the theme.
+        let tokens = snapshot_tokens();
+        assert_eq!(
+            tokens.colors.get("background").copied().map(quantize),
+            Some(quantize(theme.palette.background)),
+            "design tokens must carry the theme background colour"
+        );
+        assert!(
+            tokens.typography.contains_key("display"),
+            "design tokens must carry the type scale"
+        );
+
+        project_close();
+    }
+
+    #[test]
+    #[serial]
+    fn apply_theme_applies_type_scale_to_text() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("theme_type", dir.path()).expect("create");
+
+        // A display-sized heading and a body paragraph, in fonts that
+        // differ from the theme so the swap is observable.
+        let heading = insert_text_node(
+            "Hero heading",
+            (0.0, 0.0, 600.0, 80.0),
+            "Roboto",
+            40.0,
+            rgb8(0x0F, 0x17, 0x2A),
+        );
+        let body = insert_text_node(
+            "Body copy",
+            (0.0, 120.0, 600.0, 240.0),
+            "Georgia",
+            16.0,
+            rgb8(0x33, 0x41, 0x55),
+        );
+
+        let theme = Theme::builtin("midnight").expect("midnight theme");
+        let report = document_apply_theme(&theme).expect("apply");
+        assert!(
+            report.restyled_text >= 2,
+            "both text nodes should be restyled, got {}",
+            report.restyled_text
+        );
+
+        // 40px -> Display: midnight display = 48px, heading font = Poppins.
+        let hm = read_text_meta(heading);
+        assert!(
+            (hm.font_size - theme.type_scale.display).abs() < f32::EPSILON,
+            "heading size {} != display {}",
+            hm.font_size,
+            theme.type_scale.display
+        );
+        assert_eq!(hm.font_family, theme.type_scale.heading_font);
+
+        // 16px -> Body: midnight body = 16px, body font = Inter.
+        let bm = read_text_meta(body);
+        assert!(
+            (bm.font_size - theme.type_scale.body).abs() < f32::EPSILON,
+            "body size {} != body {}",
+            bm.font_size,
+            theme.type_scale.body
+        );
+        assert_eq!(bm.font_family, theme.type_scale.body_font);
+
+        project_close();
+    }
+
+    #[test]
+    #[serial]
+    fn apply_theme_is_single_undoable_op_restoring_exactly() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("theme_undo", dir.path()).expect("create");
+
+        insert_styled_rect(
+            NodeType::VectorLayer,
+            "Canvas",
+            (0.0, 0.0, 1200.0, 800.0),
+            rgb8(0xFF, 0xFF, 0xFF),
+            4.0,
+        );
+        insert_styled_rect(
+            NodeType::VectorLayer,
+            "CTA",
+            (120.0, 360.0, 200.0, 56.0),
+            rgb8(0x25, 0x63, 0xEB),
+            18.0,
+        );
+        insert_text_node(
+            "Hero heading",
+            (0.0, 0.0, 600.0, 80.0),
+            "Roboto",
+            40.0,
+            rgb8(0x0F, 0x17, 0x2A),
+        );
+
+        let before_styles = snapshot_styles();
+        let before_meta = snapshot_metadata();
+        let before_tokens = snapshot_tokens();
+
+        let status0 = document_status().expect("status");
+        assert_eq!(status0.undo_depth, 0, "no ops before apply");
+
+        let theme = Theme::builtin("forest").expect("forest theme");
+        let report = document_apply_theme(&theme).expect("apply");
+        assert!(report.affected_nodes > 0);
+
+        // The restyle actually changed something.
+        assert_ne!(
+            before_styles,
+            snapshot_styles(),
+            "apply_theme must change node styles"
+        );
+
+        // Exactly one undoable operation was recorded — one Ctrl+Z reverts
+        // the whole restyle.
+        let status1 = document_status().expect("status");
+        assert_eq!(
+            status1.undo_depth, 1,
+            "the entire restyle must collapse to a single operation"
+        );
+        assert!(status1.can_undo);
+
+        document_undo().expect("undo").expect("undo outcome");
+
+        assert_eq!(
+            before_styles,
+            snapshot_styles(),
+            "one undo must restore every node style exactly"
+        );
+        assert_eq!(
+            before_meta,
+            snapshot_metadata(),
+            "one undo must restore text metadata exactly"
+        );
+        assert_eq!(
+            before_tokens,
+            snapshot_tokens(),
+            "one undo must restore the design tokens exactly"
+        );
+
+        // And it is redoable, re-applying the same restyle exactly.
+        document_redo().expect("redo").expect("redo outcome");
+        assert_ne!(
+            before_styles,
+            snapshot_styles(),
+            "redo must re-apply the restyle"
+        );
+
+        project_close();
+    }
+
+    #[test]
+    #[serial]
+    fn theme_derive_from_document_returns_usable_theme() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("theme_derive", dir.path()).expect("create");
+
+        insert_styled_rect(
+            NodeType::VectorLayer,
+            "Canvas",
+            (0.0, 0.0, 1200.0, 800.0),
+            rgb8(0x10, 0x2A, 0x43),
+            0.0,
+        );
+        insert_styled_rect(
+            NodeType::VectorLayer,
+            "Accent",
+            (40.0, 40.0, 160.0, 160.0),
+            rgb8(0xF9, 0x73, 0x16),
+            0.0,
+        );
+
+        let theme = theme_derive_from_document("Derived").expect("derive");
+        assert_eq!(theme.name, "Derived");
+        assert!(
+            theme.id.starts_with("derived-"),
+            "derived theme id should be prefixed, got {}",
+            theme.id
+        );
+
+        // A derived theme must be directly usable: its design tokens cover
+        // every role so applying it can't leave a hole.
+        let tokens = theme.to_design_tokens();
+        for role in [
+            "background",
+            "surface",
+            "primary",
+            "secondary",
+            "accent",
+            "text",
+            "muted",
+        ] {
+            assert!(
+                tokens.colors.contains_key(role),
+                "derived theme missing colour role `{role}`"
+            );
+        }
+
+        // Applying the derived theme to its own document is a valid,
+        // undoable round-trip.
+        let report = document_apply_theme(&theme).expect("apply derived");
+        assert!(report.affected_nodes > 0);
+
         project_close();
     }
 }

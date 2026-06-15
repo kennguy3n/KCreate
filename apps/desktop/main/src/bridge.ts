@@ -562,6 +562,12 @@ export interface Bridge {
   exportPresetList(): string;
   exportPresetDelete(presetId: string): boolean;
 
+  // Theme / Brand Kit instant restyle (G4)
+  themeListBuiltins(): string;
+  documentApplyTheme(themeJson: string): string;
+  themeDeriveFromDocument(name: string): string;
+  themeFromBrandKit(kitJson: string): string;
+
   // Artboards (Phase 1, Block A)
   artboardCreate(
     pageId: string | null,

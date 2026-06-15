@@ -35,6 +35,7 @@ pub mod node;
 pub mod operation;
 pub mod operation_compress;
 pub mod project;
+pub mod theme;
 pub mod token_binding;
 
 pub use align::{
@@ -74,6 +75,11 @@ pub use project::{
     builtin_layout_templates, BrandKit, DesignTokens, ExportFormat, ExportPreset, FontRef,
     LayoutTemplate, NamedColor, Project, ProjectError, SectionKind, ShadowToken, TemplateCategory,
     TemplatePageDef, TemplateSectionDef, TypographyToken,
+};
+pub use theme::{
+    assign_roles, build_color_remap, builtin_themes, contrast_ratio, lightness, quantize,
+    relative_luminance, rotate_hue, saturation, ColorRole, ColorUsage, RadiusScale, SpacingScale,
+    Theme, ThemePalette, TypeRole, TypeScale,
 };
 pub use token_binding::{
     bind_token, nodes_bound_to, propagate_single_token, propagate_token_changes, refresh_style,

@@ -1617,6 +1617,69 @@ function registerIpcHandlers(): void {
     requireBridge().themeFromBrandKit(kitJson),
   );
 
+  // Brand Kit depth (H5)
+  ipcMain.handle(
+    "kcreate/theme/applyToSelection",
+    (_e, themeJson: string, roots: string[]) =>
+      requireBridge().documentApplyThemeToSelection(themeJson, roots),
+  );
+  ipcMain.handle(
+    "kcreate/theme/deriveFromImage",
+    (_e, name: string, bytes: Uint8Array) =>
+      requireBridge().themeDeriveFromImage(name, bytes),
+  );
+  ipcMain.handle(
+    "kcreate/brandKit/setLogoBytes",
+    (_e, kitId: string, bytes: Uint8Array) => {
+      requireBridge().brandKitSetLogoBytes(kitId, bytes);
+    },
+  );
+  ipcMain.handle(
+    "kcreate/brandKit/setFontRole",
+    (_e, kitId: string, role: string, family: string, embed: boolean) => {
+      requireBridge().brandKitSetFontRole(kitId, role, family, embed);
+    },
+  );
+  ipcMain.handle(
+    "kcreate/brandKit/extractPaletteFromImage",
+    (_e, kitId: string, bytes: Uint8Array, numColors: number) =>
+      requireBridge().brandKitExtractPaletteFromImageBytes(
+        kitId,
+        bytes,
+        numColors,
+      ),
+  );
+  ipcMain.handle(
+    "kcreate/brandKit/insertLogo",
+    (
+      _e,
+      kitId: string,
+      parentId: string | null,
+      x: number,
+      y: number,
+      targetSize: number,
+    ) =>
+      requireBridge().brandLogoInsert(
+        kitId,
+        parentId !== null && parentId.length > 0 ? parentId : null,
+        x,
+        y,
+        targetSize,
+      ),
+  );
+  ipcMain.handle("kcreate/brandKit/registrySave", (_e, kitId: string) => {
+    requireBridge().brandKitRegistrySave(kitId);
+  });
+  ipcMain.handle("kcreate/brandKit/registryList", () =>
+    requireBridge().brandKitRegistryList(),
+  );
+  ipcMain.handle("kcreate/brandKit/registryLoad", (_e, kitId: string) =>
+    requireBridge().brandKitRegistryLoad(kitId),
+  );
+  ipcMain.handle("kcreate/brandKit/registryDelete", (_e, kitId: string) =>
+    requireBridge().brandKitRegistryDelete(kitId),
+  );
+
   ipcMain.handle(
     "kcreate/artboard/create",
     (

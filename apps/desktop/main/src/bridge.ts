@@ -596,6 +596,34 @@ export interface Bridge {
   themeDeriveFromDocument(name: string): string;
   themeFromBrandKit(kitJson: string): string;
 
+  // Brand Kit depth (H5): apply-to-selection, derive-from-image,
+  // custom fonts + embedding, logo placement, on-disk registry.
+  documentApplyThemeToSelection(themeJson: string, roots: string[]): string;
+  themeDeriveFromImage(name: string, bytes: Buffer | Uint8Array): string;
+  brandKitSetLogoBytes(kitId: string, bytes: Buffer | Uint8Array): void;
+  brandKitSetFontRole(
+    kitId: string,
+    role: string,
+    family: string,
+    embed: boolean,
+  ): void;
+  brandKitExtractPaletteFromImageBytes(
+    kitId: string,
+    bytes: Buffer | Uint8Array,
+    numColors: number,
+  ): string;
+  brandLogoInsert(
+    kitId: string,
+    parentId: string | null,
+    x: number,
+    y: number,
+    targetSize: number,
+  ): string;
+  brandKitRegistrySave(kitId: string): void;
+  brandKitRegistryList(): string;
+  brandKitRegistryLoad(kitId: string): string;
+  brandKitRegistryDelete(kitId: string): boolean;
+
   // Artboards (Phase 1, Block A)
   artboardCreate(
     pageId: string | null,

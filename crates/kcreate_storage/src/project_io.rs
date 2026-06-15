@@ -1036,6 +1036,24 @@ impl ProjectStore {
         }
     }
 
+    /// Look up an asset's MIME type by id. Returns `Ok(None)` when the
+    /// id isn't in the assets table. Used by the brand-kit registry to
+    /// re-store a kit's logo / font blobs under the right content type
+    /// when persisting it outside the project (`load_asset` returns only
+    /// the bytes, not the type).
+    pub fn asset_mime(&self, id: Uuid) -> Result<Option<String>, ProjectStoreError> {
+        let mime: Option<String> = self
+            .db
+            .conn()
+            .query_row(
+                "SELECT mime_type FROM assets WHERE id = ?1",
+                params![id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(mime)
+    }
+
     /// Persist a brand kit. `id` matches `BrandKit::id`, so this is a
     /// content-replacing upsert — a second save with the same id wins.
     pub fn save_brand_kit(&mut self, kit: &BrandKit) -> Result<(), ProjectStoreError> {

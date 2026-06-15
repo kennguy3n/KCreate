@@ -22,7 +22,8 @@ use kcreate_core::document::{DocumentError, DocumentGraph};
 use kcreate_core::node::{FillStyle, Node, NodeType, RgbaColor};
 use kcreate_core::operation::Operation;
 use kcreate_core::project::{
-    BrandKit, DesignTokens, ExportFormat, ExportPreset, Project, ProjectError, Slice,
+    BrandKit, DesignTokens, ExportFormat, ExportPreset, FontRef, NamedColor, Project, ProjectError,
+    Slice,
 };
 use kcreate_core::theme::{build_color_remap, quantize, ColorUsage, RadiusScale, Theme, TypeRole};
 use kcreate_export::png::{export_png_to_bytes, PngExportError, PngExportOptions};
@@ -616,6 +617,13 @@ pub fn project_open(dir: &Path) -> Result<ProjectInfo> {
     // workspace lock — same locking discipline as `project_create`.
     if let Some(ws) = guard.as_ref() {
         crate::thumbnails::record_recent_project(ws);
+        // Re-register any fonts embedded in this project's brand kits
+        // into the process-wide fontdb so documents authored with a
+        // custom (non-system) font shape + export that font on reopen.
+        let store = ws.store.lock();
+        for kit in &ws.project.brand_kits {
+            register_kit_embedded_fonts(&store, kit);
+        }
     }
     drop(guard);
     // Background pre-warm so the next HomePage visit has fresh
@@ -5551,39 +5559,74 @@ fn restyle_text_node(node: &mut Node, theme: &Theme) -> Result<bool> {
     Ok(changed)
 }
 
-/// Instantly restyle the open document to `theme` as a single undoable
-/// operation. See the module-level section comment for the contract.
-pub fn document_apply_theme(theme: &Theme) -> Result<ApplyThemeReport> {
-    let mut guard = slot().write();
-    let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
+/// Shared core of the theme-apply operation, parameterised by SCOPE.
+///
+/// * `scope == None` → whole-document restyle: every node participates
+///   in role assignment and is restyled, and the theme's design tokens
+///   are merged into the project (the classic `document_apply_theme`
+///   behaviour).
+/// * `scope == Some(ids)` → restyle only those nodes. Role assignment
+///   is derived from the SELECTION's own color usages (so the subtree
+///   is themed on its own terms), and the global `design_tokens` are
+///   left untouched — otherwise a selection-scoped apply would mutate a
+///   document-wide value and a single undo could not restore "exactly".
+///
+/// Returns `(report, mutated)`; `mutated` tells the caller whether to
+/// re-sync the scene. The (non-empty) operation is pushed under the
+/// existing `"apply_theme"` command so the same `apply_patch` arm
+/// reverses it on undo — no new undo machinery, scoped or not.
+fn apply_theme_core(
+    ws: &mut Workspace,
+    theme: &Theme,
+    scope: Option<&HashSet<Uuid>>,
+) -> Result<(ApplyThemeReport, bool)> {
+    // Resolve the node ids to consider, in deterministic document order.
+    // A scoped apply keeps only ids that are part of the scope set.
+    let target_ids: Vec<Uuid> = match scope {
+        None => ws.project.document.iter().map(|(id, _)| *id).collect(),
+        Some(set) => ws
+            .project
+            .document
+            .iter()
+            .map(|(id, _)| *id)
+            .filter(|id| set.contains(id))
+            .collect(),
+    };
 
-    // Pass 1 — collect area-weighted color usages across the whole
-    // document so role assignment is deterministic and global.
+    // Pass 1 — area-weighted color usages over the target set so role
+    // assignment is deterministic.
     let mut usages: Vec<ColorUsage> = Vec::new();
-    for (_id, node) in ws.project.document.iter() {
-        let area = node_area(node);
-        collect_solid_colors(&node.style, area, &mut usages);
+    for id in &target_ids {
+        if let Some(node) = ws.project.document.get_node(*id) {
+            let area = node_area(node);
+            collect_solid_colors(&node.style, area, &mut usages);
+        }
     }
     let remap = build_color_remap(&usages, theme);
 
-    // Design tokens: merge the theme's tokens over the existing ones so
-    // any foreign keys the user defined survive the restyle.
+    // Design tokens: only a whole-document apply touches the global
+    // tokens. A scoped apply leaves them byte-identical so the recorded
+    // operation's token delta is a no-op and undo restores exactly.
     let before_tokens = ws.project.design_tokens.clone();
-    let after_tokens = theme.merge_into_tokens(&before_tokens);
+    let after_tokens = if scope.is_none() {
+        theme.merge_into_tokens(&before_tokens)
+    } else {
+        before_tokens.clone()
+    };
     let tokens_changed = before_tokens != after_tokens;
-    ws.project.design_tokens = after_tokens.clone();
+    if tokens_changed {
+        ws.project.design_tokens = after_tokens.clone();
+    }
 
-    // Pass 2 — restyle every node, snapshotting before / after so the
-    // whole restyle collapses to one reversible operation. Collect ids
-    // first to avoid holding an immutable borrow across the mutation.
-    let node_ids: Vec<Uuid> = ws.project.document.iter().map(|(id, _)| *id).collect();
+    // Pass 2 — restyle each target node, snapshotting before / after so
+    // the whole restyle collapses to one reversible operation.
     let mut before_nodes: BTreeMap<Uuid, ApplyThemeNodePatch> = BTreeMap::new();
     let mut after_nodes: BTreeMap<Uuid, ApplyThemeNodePatch> = BTreeMap::new();
     let mut recolored_fills = 0usize;
     let mut recolored_strokes = 0usize;
     let mut restyled_text = 0usize;
 
-    for id in node_ids {
+    for id in target_ids {
         let Some(node) = ws.project.document.get_node_mut(id) else {
             continue;
         };
@@ -5648,7 +5691,7 @@ pub fn document_apply_theme(theme: &Theme) -> Result<ApplyThemeReport> {
     // Nothing visibly changed and tokens are identical → don't push a
     // no-op onto the undo stack.
     if affected.is_empty() && !tokens_changed {
-        return Ok(report);
+        return Ok((report, false));
     }
 
     let before_patch = serde_json::to_value(ApplyThemePatch {
@@ -5662,7 +5705,78 @@ pub fn document_apply_theme(theme: &Theme) -> Result<ApplyThemeReport> {
     let op = Operation::new("user", "apply_theme", before_patch, after_patch, affected);
     ws.project.execute_operation(op);
     ws.project.modified_at = Utc::now();
-    let _ = sync_scene_locked(&mut guard);
+    Ok((report, true))
+}
+
+/// A zero report for `theme`, used when a scoped apply has nothing to
+/// restyle (empty selection) so the panel can call apply unconditionally.
+fn empty_apply_report(theme: &Theme) -> ApplyThemeReport {
+    ApplyThemeReport {
+        theme_id: theme.id.clone(),
+        theme_name: theme.name.clone(),
+        affected_nodes: 0,
+        recolored_fills: 0,
+        recolored_strokes: 0,
+        restyled_text: 0,
+    }
+}
+
+/// Instantly restyle the open document to `theme` as a single undoable
+/// operation. See the module-level section comment for the contract.
+pub fn document_apply_theme(theme: &Theme) -> Result<ApplyThemeReport> {
+    let mut guard = slot().write();
+    let (report, mutated) = {
+        let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
+        apply_theme_core(ws, theme, None)?
+    };
+    if mutated {
+        let _ = sync_scene_locked(&mut guard);
+    }
+    Ok(report)
+}
+
+/// Restyle only the selected subtree(s) to `theme`, as a single
+/// undoable operation that restores exactly on undo.
+///
+/// `roots` empty → the live document selection is used. Each root
+/// expands to the root plus all of its descendants, so theming a frame
+/// themes everything inside it. An empty resolved scope (nothing
+/// selected, or the selection no longer exists) is a no-op that returns
+/// a zero report rather than erroring, so the panel can wire a single
+/// "apply to selection" button without guarding the selection state.
+pub fn document_apply_theme_to_selection(
+    theme: &Theme,
+    roots: Vec<Uuid>,
+) -> Result<ApplyThemeReport> {
+    let mut guard = slot().write();
+    let (report, mutated) = {
+        let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
+
+        // Explicit roots win; otherwise fall back to the live selection.
+        let roots: Vec<Uuid> = if roots.is_empty() {
+            ws.selection.clone()
+        } else {
+            roots
+        };
+
+        // Expand each existing root into {root} ∪ descendants.
+        let mut scope: HashSet<Uuid> = HashSet::new();
+        for root in roots {
+            if ws.project.document.get_node(root).is_some() {
+                scope.insert(root);
+                scope.extend(ws.project.document.descendants_of(root));
+            }
+        }
+
+        if scope.is_empty() {
+            (empty_apply_report(theme), false)
+        } else {
+            apply_theme_core(ws, theme, Some(&scope))?
+        }
+    };
+    if mutated {
+        let _ = sync_scene_locked(&mut guard);
+    }
     Ok(report)
 }
 
@@ -5714,6 +5828,18 @@ fn derive_theme_from_usages(name: &str, usages: &[ColorUsage]) -> Theme {
     }
     let width = (pixels.len() / 4) as u32;
     let extracted = kcreate_ai::palette::extract_palette(&pixels, width, 1, 7);
+    theme_from_extracted_colors(name, &extracted)
+}
+
+/// Map a k-means [`ExtractedColor`] palette to a [`Theme`] via
+/// [`Theme::derive_from_palette`] (opaque colors, frequency-weighted
+/// role assignment). Empty input yields the neutral fallback theme.
+/// Shared by the derive-from-document and derive-from-image paths so
+/// both turn an extracted palette into a theme identically.
+fn theme_from_extracted_colors(
+    name: &str,
+    extracted: &[kcreate_ai::palette::ExtractedColor],
+) -> Theme {
     if extracted.is_empty() {
         return Theme::derive_from_palette(name, &[]);
     }
@@ -5732,6 +5858,29 @@ fn derive_theme_from_usages(name: &str, usages: &[ColorUsage]) -> Theme {
         })
         .collect();
     Theme::derive_from_palette(name, &palette)
+}
+
+/// Derive a [`Theme`] from an uploaded image's dominant palette.
+/// Decodes the image, extracts up to 7 colors with
+/// `kcreate_ai::palette::extract_palette` (the Canva "brand colors from
+/// a photo" flow), and assigns roles via [`Theme::derive_from_palette`].
+/// Pure/offline and workspace-independent — the caller decides whether
+/// to preview or apply the result. Returns `InvalidArgument` when the
+/// bytes are empty and `Io(InvalidData)` when they aren't a decodable
+/// image.
+pub fn theme_derive_from_image(name: &str, bytes: &[u8]) -> Result<Theme> {
+    if bytes.is_empty() {
+        return Err(DocumentBridgeError::InvalidArgument {
+            argument: "bytes".to_string(),
+            value: "empty image".to_string(),
+        });
+    }
+    let img = image::load_from_memory(bytes)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let rgba = img.to_rgba8();
+    let (width, height) = rgba.dimensions();
+    let extracted = kcreate_ai::palette::extract_palette(rgba.as_raw(), width, height, 7);
+    Ok(theme_from_extracted_colors(name, &extracted))
 }
 
 // -----------------------------------------------------------------------------
@@ -6817,13 +6966,69 @@ pub fn document_import_image_bytes(parent_id: Option<Uuid>, bytes: &[u8]) -> Res
 fn document_import_image_bytes_inner(
     parent_id: Option<Uuid>,
     bytes: &[u8],
-    mime_type: &'static str,
+    mime_type: &str,
 ) -> Result<Uuid> {
+    let (id, _bounds) = import_raster_node(
+        parent_id,
+        bytes,
+        mime_type,
+        "Image",
+        None,
+        "document_import_image",
+    )?;
+    Ok(id)
+}
+
+/// Decode `bytes`, store them in the project's content-addressed blob
+/// store, and insert a [`NodeType::RasterLayer`] referencing the blob
+/// as a single undoable operation. Returns the new node id and its
+/// world-space bounds.
+///
+/// `placement` controls the node's bounds:
+/// * `None` → natural pixel size at the origin `(0, 0)` (the plain
+///   "import an image" flow).
+/// * `Some((x, y, target_size))` → the image is uniformly scaled so its
+///   longest side is `target_size`, with the top-left at `(x, y)` (the
+///   brand-logo placement flow).
+///
+/// `name` labels the node and `op_command` stamps the operation so each
+/// caller keeps its own undo provenance (`document_import_image` vs
+/// `brand_logo_insert`).
+fn import_raster_node(
+    parent_id: Option<Uuid>,
+    bytes: &[u8],
+    mime_type: &str,
+    name: &str,
+    placement: Option<(f64, f64, f64)>,
+    op_command: &str,
+) -> Result<(Uuid, kcreate_core::node::Bounds)> {
     let img = image::load_from_memory(bytes).map_err(|e| {
         DocumentBridgeError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
     })?;
     let rgba = img.to_rgba8();
     let (width, height) = rgba.dimensions();
+    let bounds = match placement {
+        Some((x, y, target_size)) => {
+            let longest = f64::from(width).max(f64::from(height));
+            let scale = if longest > 0.0 {
+                target_size / longest
+            } else {
+                1.0
+            };
+            kcreate_core::node::Bounds {
+                x,
+                y,
+                width: f64::from(width) * scale,
+                height: f64::from(height) * scale,
+            }
+        }
+        None => kcreate_core::node::Bounds {
+            x: 0.0,
+            y: 0.0,
+            width: f64::from(width),
+            height: f64::from(height),
+        },
+    };
     let mut guard = slot().write();
     let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
     let blob = ws
@@ -6837,14 +7042,9 @@ fn document_import_image_bytes_inner(
         width,
         height,
     };
-    let mut node = Node::new(NodeType::RasterLayer, "Image");
+    let mut node = Node::new(NodeType::RasterLayer, name);
     node.parent_id = parent_id;
-    node.bounds = kcreate_core::node::Bounds {
-        x: 0.0,
-        y: 0.0,
-        width: f64::from(width),
-        height: f64::from(height),
-    };
+    node.bounds = bounds;
     node.metadata.insert(
         crate::scene_sync::RASTER_IMAGE_METADATA_KEY.to_string(),
         serde_json::to_value(&meta)?,
@@ -6860,7 +7060,7 @@ fn document_import_image_bytes_inner(
         });
     let op = Operation::new(
         "user",
-        "document_import_image",
+        op_command,
         serde_json::Value::Null,
         snapshot,
         vec![id],
@@ -6868,7 +7068,7 @@ fn document_import_image_bytes_inner(
     ws.project.execute_operation(op);
     let _ = sync_scene_locked(&mut guard);
     drop(guard);
-    Ok(id)
+    Ok((id, bounds))
 }
 
 /// Sniff a MIME type from the file's leading magic bytes. We only
@@ -8876,8 +9076,440 @@ pub fn brand_kit_import(file_path: &Path) -> Result<Uuid> {
     let new_id = kit.id;
     ws.project.brand_kits.push(kit);
     ws.project.modified_at = Utc::now();
+    // Register the just-imported kit's embedded fonts so the family
+    // resolves at render / export time on this machine.
+    if let Some(imported) = ws.project.brand_kits.last() {
+        let store = ws.store.lock();
+        register_kit_embedded_fonts(&store, imported);
+    }
     drop(guard);
     Ok(new_id)
+}
+
+// -----------------------------------------------------------------------------
+// H5 — user brand-kit depth: logo / font roles / palette-from-image /
+// logo placement / cross-project on-disk registry. These compose the
+// existing project-scoped brand_kit CRUD + `.kbrand` import/export with
+// the persistent registry in `brand_registry.rs`.
+// -----------------------------------------------------------------------------
+
+/// Sniff a logo's MIME type from its bytes. SVG (text) is detected by
+/// its root marker so a logo pasted/uploaded without a file extension
+/// still round-trips through the vector insertion path; everything else
+/// falls back to the raster sniff used by image import.
+fn logo_mime_for_bytes(bytes: &[u8]) -> &'static str {
+    let head = &bytes[..bytes.len().min(512)];
+    if let Ok(text) = std::str::from_utf8(head) {
+        let trimmed = text.trim_start_matches('\u{feff}').trim_start();
+        if trimmed.starts_with("<?xml") || trimmed.starts_with("<svg") || trimmed.contains("<svg") {
+            return "image/svg+xml";
+        }
+    }
+    mime_for_bytes(bytes)
+}
+
+/// Sniff a font file's MIME type from its leading magic bytes. Used when
+/// embedding a fontdb-resolved face so the stored asset carries a
+/// sensible content type (the `.kbrand` archive keys fonts by family,
+/// not MIME, so this is purely descriptive).
+fn font_mime_for_bytes(bytes: &[u8]) -> &'static str {
+    if bytes.starts_with(b"OTTO") {
+        "font/otf"
+    } else if bytes.starts_with(b"wOFF") {
+        "font/woff"
+    } else if bytes.starts_with(b"wOF2") {
+        "font/woff2"
+    } else {
+        // TrueType (`0x00010000` / `"true"` / `"ttcf"`) and anything else.
+        "font/ttf"
+    }
+}
+
+/// Register every embedded font referenced by `kit` into the
+/// process-wide font database so the family resolves at shape / export
+/// time even when it is **not** installed as a system font. This is the
+/// runtime half of font embedding: the bytes are persisted with the
+/// project / brand kit, and on open (or import / registry-load) we feed
+/// them back so a document authored with a custom font renders that font
+/// on any machine — otherwise text would silently fall back to a default
+/// face and the export would no longer carry the chosen typography.
+///
+/// Families fontdb already knows (a system font, or one registered by an
+/// earlier call) are skipped via an exact-name probe so repeated opens
+/// don't pile up duplicate faces. A missing or unparseable asset is a
+/// non-fatal skip — one bad blob must never block opening a project.
+fn register_kit_embedded_fonts(store: &ProjectStore, kit: &BrandKit) {
+    let mgr = kcreate_text::FontManager::new();
+    for font in &kit.fonts {
+        let Some(asset_id) = font.embedded_asset_id else {
+            continue;
+        };
+        // Exact-family probe: `find_family` only returns faces whose
+        // name table matches, unlike `resolve_face` (which falls back
+        // to any outline font), so it reliably answers "is THIS family
+        // already loaded?".
+        if !mgr.find_family(&font.family).is_empty() {
+            continue;
+        }
+        if let Ok(Some(bytes)) = store.load_asset(asset_id) {
+            let _ = mgr.add_font_bytes(bytes);
+        }
+    }
+}
+
+/// Replace a brand kit's logo with `bytes` (an SVG or raster image).
+/// The blob is stored in the project asset table under a fresh id and
+/// `logo_asset_id` is repointed at it. The MIME type is sniffed from the
+/// bytes so the later `.kbrand` export and [`brand_logo_insert`] pick the
+/// right (vector vs raster) path.
+pub fn brand_kit_set_logo_bytes(kit_id: Uuid, bytes: &[u8]) -> Result<()> {
+    if bytes.is_empty() {
+        return Err(DocumentBridgeError::InvalidArgument {
+            argument: "bytes".to_string(),
+            value: "empty logo".to_string(),
+        });
+    }
+    let mime = logo_mime_for_bytes(bytes);
+    with_workspace_mut(|ws| {
+        let kit_idx = ws
+            .project
+            .brand_kits
+            .iter()
+            .position(|k| k.id == kit_id)
+            .ok_or(DocumentBridgeError::NodeNotFound(kit_id))?;
+        let asset_id = Uuid::new_v4();
+        ws.store.lock().store_asset_with_id(asset_id, bytes, mime)?;
+        ws.project.brand_kits[kit_idx].logo_asset_id = Some(asset_id);
+        ws.project.modified_at = Utc::now();
+        Ok(())
+    })
+}
+
+/// Set the heading or body font of a brand kit to `family`. When `embed`
+/// is set, the chosen face is resolved from fontdb and its raw file bytes
+/// are stored as a project asset so the `.kbrand` archive (and any
+/// font-embedding export path) carries the actual font.
+///
+/// `role` is `"heading"` or `"body"`. The kit stores one [`FontRef`] per
+/// weight bucket — heading at [`TypeRole::Heading`]'s weight (≥ 600) and
+/// body at [`TypeRole::Body`]'s (< 600) — matching the split
+/// [`Theme::from_brand_kit`] uses to recover each role.
+pub fn brand_kit_set_font_role(
+    kit_id: Uuid,
+    role: &str,
+    family: String,
+    embed: bool,
+) -> Result<()> {
+    let weight = match role {
+        "heading" => TypeRole::Heading.font_weight(),
+        "body" => TypeRole::Body.font_weight(),
+        other => {
+            return Err(DocumentBridgeError::InvalidArgument {
+                argument: "role".to_string(),
+                value: other.to_string(),
+            });
+        }
+    };
+    if family.trim().is_empty() {
+        return Err(DocumentBridgeError::InvalidArgument {
+            argument: "family".to_string(),
+            value: "empty font family".to_string(),
+        });
+    }
+
+    // Resolve the face BEFORE locking the workspace: fontdb maintains its
+    // own process-global lock and scans system fonts, so we never want to
+    // hold the workspace write lock across that work.
+    let resolved_data = if embed {
+        let face = kcreate_text::FontManager::new()
+            .resolve_face(&family)
+            .map_err(|e| DocumentBridgeError::InvalidArgument {
+                argument: "family".to_string(),
+                value: format!("{family}: {e}"),
+            })?;
+        Some(face.data)
+    } else {
+        None
+    };
+
+    with_workspace_mut(|ws| {
+        let kit_idx = ws
+            .project
+            .brand_kits
+            .iter()
+            .position(|k| k.id == kit_id)
+            .ok_or(DocumentBridgeError::NodeNotFound(kit_id))?;
+        let embedded_asset_id = match &resolved_data {
+            Some(data) => {
+                let mime = font_mime_for_bytes(data);
+                let asset_id = Uuid::new_v4();
+                ws.store.lock().store_asset_with_id(asset_id, data, mime)?;
+                Some(asset_id)
+            }
+            None => None,
+        };
+        let font = FontRef {
+            family,
+            weight,
+            italic: false,
+            embedded_asset_id,
+        };
+        let is_heading = weight >= 600;
+        let kit = &mut ws.project.brand_kits[kit_idx];
+        if let Some(existing) = kit
+            .fonts
+            .iter_mut()
+            .find(|f| (f.weight >= 600) == is_heading)
+        {
+            *existing = font;
+        } else {
+            kit.fonts.push(font);
+        }
+        ws.project.modified_at = Utc::now();
+        // Make the embedded face resolvable now so an immediate
+        // apply-theme + export uses it without waiting for a reopen.
+        if resolved_data.is_some() {
+            let store = ws.store.lock();
+            register_kit_embedded_fonts(&store, &ws.project.brand_kits[kit_idx]);
+        }
+        Ok(())
+    })
+}
+
+/// Extract up to `num_colors` dominant colors from an uploaded image and
+/// store them as the kit's palette (the Canva "brand colors from a photo"
+/// flow). Returns the hex codes in dominance order. `num_colors` is
+/// clamped to `1..=64`, matching [`phase9::palette_extract_and_apply_brand_kit`].
+pub fn brand_kit_extract_palette_from_image_bytes(
+    kit_id: Uuid,
+    bytes: &[u8],
+    num_colors: usize,
+) -> Result<Vec<String>> {
+    if bytes.is_empty() {
+        return Err(DocumentBridgeError::InvalidArgument {
+            argument: "bytes".to_string(),
+            value: "empty image".to_string(),
+        });
+    }
+    if !(1..=64).contains(&num_colors) {
+        return Err(DocumentBridgeError::InvalidArgument {
+            argument: "num_colors".to_string(),
+            value: num_colors.to_string(),
+        });
+    }
+    let img = image::load_from_memory(bytes)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let rgba = img.to_rgba8();
+    let (width, height) = rgba.dimensions();
+    let extracted = kcreate_ai::palette::extract_palette(rgba.as_raw(), width, height, num_colors);
+    let named: Vec<NamedColor> = extracted
+        .iter()
+        .enumerate()
+        .map(|(i, c)| NamedColor {
+            name: format!("Color {}", i + 1),
+            color: RgbaColor::new(
+                f32::from(c.r) / 255.0,
+                f32::from(c.g) / 255.0,
+                f32::from(c.b) / 255.0,
+                1.0,
+            ),
+        })
+        .collect();
+    let hex_codes: Vec<String> = named.iter().map(|c| c.color.to_hex()).collect();
+
+    with_workspace_mut(|ws| {
+        let kit = ws
+            .project
+            .brand_kits
+            .iter_mut()
+            .find(|k| k.id == kit_id)
+            .ok_or(DocumentBridgeError::NodeNotFound(kit_id))?;
+        kit.colors = named;
+        ws.project.modified_at = Utc::now();
+        Ok(())
+    })?;
+    Ok(hex_codes)
+}
+
+/// Insert a brand kit's saved logo onto the canvas as an editable node.
+///
+/// SVG logos become a group of recolorable [`NodeType::VectorLayer`]
+/// nodes (so the theme can remap their fills); raster logos become a
+/// single [`NodeType::RasterLayer`]. Either way the artwork is uniformly
+/// scaled so its longest side equals `target_size`, placed with its
+/// top-left at `(x, y)`, and recorded as one undoable `brand_logo_insert`
+/// operation.
+pub fn brand_logo_insert(
+    kit_id: Uuid,
+    parent_id: Option<Uuid>,
+    x: f64,
+    y: f64,
+    target_size: f64,
+) -> Result<crate::assets::InsertedAsset> {
+    // Pull the logo bytes + content type out under a read lock, which is
+    // released when `with_workspace` returns — the insertion helpers below
+    // take their own workspace write lock.
+    let (bytes, mime) = with_workspace(|ws| {
+        let kit = ws
+            .project
+            .brand_kits
+            .iter()
+            .find(|k| k.id == kit_id)
+            .ok_or(DocumentBridgeError::NodeNotFound(kit_id))?;
+        let logo_id = kit
+            .logo_asset_id
+            .ok_or_else(|| DocumentBridgeError::InvalidArgument {
+                argument: "kit_id".to_string(),
+                value: format!("brand kit {kit_id} has no logo"),
+            })?;
+        let store = ws.store.lock();
+        let bytes = store
+            .load_asset(logo_id)?
+            .ok_or(DocumentBridgeError::NodeNotFound(logo_id))?;
+        let mime = store.asset_mime(logo_id)?.unwrap_or_default();
+        Ok((bytes, mime))
+    })?;
+
+    if mime == "image/svg+xml" || logo_mime_for_bytes(&bytes) == "image/svg+xml" {
+        crate::assets::insert_styled_paths(
+            &bytes,
+            "Brand Logo",
+            parent_id,
+            x,
+            y,
+            target_size,
+            "brand_logo_insert",
+            serde_json::json!({ "kit_id": kit_id }),
+        )
+    } else {
+        let raster_mime = if mime.is_empty() {
+            mime_for_bytes(&bytes).to_string()
+        } else {
+            mime
+        };
+        let (id, bounds) = import_raster_node(
+            parent_id,
+            &bytes,
+            &raster_mime,
+            "Brand Logo",
+            Some((x, y, target_size)),
+            "brand_logo_insert",
+        )?;
+        Ok(crate::assets::InsertedAsset {
+            group_id: id.to_string(),
+            node_ids: vec![id.to_string()],
+            name: "Brand Logo".to_string(),
+            x: bounds.x,
+            y: bounds.y,
+            width: bounds.width,
+            height: bounds.height,
+        })
+    }
+}
+
+/// Persist the project's brand kit `kit_id` to the cross-project on-disk
+/// registry (see [`brand_registry`]), bundling every blob it references
+/// (logo + each embedded font) so a future session — or a different
+/// project — can re-hydrate it offline. Overwrites any registry record
+/// with the same id.
+pub fn brand_kit_registry_save(kit_id: Uuid) -> Result<()> {
+    let record = with_workspace(|ws| {
+        let kit = ws
+            .project
+            .brand_kits
+            .iter()
+            .find(|k| k.id == kit_id)
+            .cloned()
+            .ok_or(DocumentBridgeError::NodeNotFound(kit_id))?;
+        let store = ws.store.lock();
+        let mut asset_ids: Vec<Uuid> = Vec::new();
+        if let Some(logo_id) = kit.logo_asset_id {
+            asset_ids.push(logo_id);
+        }
+        for font in &kit.fonts {
+            if let Some(id) = font.embedded_asset_id {
+                asset_ids.push(id);
+            }
+        }
+        let mut seen: HashSet<Uuid> = HashSet::new();
+        let mut assets: Vec<crate::brand_registry::BrandAssetBlob> = Vec::new();
+        for id in asset_ids {
+            if !seen.insert(id) {
+                continue;
+            }
+            if let Some(bytes) = store.load_asset(id)? {
+                let mime = store
+                    .asset_mime(id)?
+                    .unwrap_or_else(|| "application/octet-stream".to_string());
+                assets.push(crate::brand_registry::BrandAssetBlob {
+                    asset_id: id,
+                    mime,
+                    bytes,
+                });
+            }
+        }
+        Ok(crate::brand_registry::BrandKitRecord { kit, assets })
+    })?;
+    crate::brand_registry::save_record(&record)?;
+    Ok(())
+}
+
+/// List the brand kits available in the cross-project on-disk registry
+/// (metadata only — asset blobs are loaded lazily by
+/// [`brand_kit_registry_load`]).
+pub fn brand_kit_registry_list() -> Result<Vec<BrandKit>> {
+    Ok(crate::brand_registry::list_kits()?)
+}
+
+/// Load registry kit `kit_id` into the open project: re-store each of its
+/// bundled blobs under fresh project-asset ids, relink the kit's
+/// logo / font references to those ids, and upsert the kit into the
+/// project (keeping the registry id stable so a re-load replaces in
+/// place). Returns the kit id.
+pub fn brand_kit_registry_load(kit_id: Uuid) -> Result<Uuid> {
+    let record = crate::brand_registry::load_record(kit_id)?
+        .ok_or(DocumentBridgeError::NodeNotFound(kit_id))?;
+    with_workspace_mut(|ws| {
+        let mut id_map: HashMap<Uuid, Uuid> = HashMap::new();
+        {
+            let mut store = ws.store.lock();
+            for asset in &record.assets {
+                let new_id = Uuid::new_v4();
+                store.store_asset_with_id(new_id, &asset.bytes, &asset.mime)?;
+                id_map.insert(asset.asset_id, new_id);
+            }
+        }
+        let mut kit = record.kit;
+        if let Some(old) = kit.logo_asset_id {
+            kit.logo_asset_id = id_map.get(&old).copied();
+        }
+        for font in &mut kit.fonts {
+            if let Some(old) = font.embedded_asset_id {
+                font.embedded_asset_id = id_map.get(&old).copied();
+            }
+        }
+        let new_id = kit.id;
+        if let Some(existing) = ws.project.brand_kits.iter_mut().find(|k| k.id == new_id) {
+            *existing = kit;
+        } else {
+            ws.project.brand_kits.push(kit);
+        }
+        ws.project.modified_at = Utc::now();
+        // Register the loaded kit's embedded fonts so an immediate
+        // apply uses the bundled font even if it isn't installed here.
+        if let Some(loaded) = ws.project.brand_kits.iter().find(|k| k.id == new_id) {
+            let store = ws.store.lock();
+            register_kit_embedded_fonts(&store, loaded);
+        }
+        Ok(new_id)
+    })
+}
+
+/// Delete brand kit `kit_id` from the cross-project on-disk registry.
+/// Returns `true` if a record was removed, `false` if none existed. Does
+/// not touch the open project's in-memory kits.
+pub fn brand_kit_registry_delete(kit_id: Uuid) -> Result<bool> {
+    Ok(crate::brand_registry::delete_kit(kit_id)?)
 }
 
 // -----------------------------------------------------------------------------
@@ -14396,6 +15028,169 @@ mod tests {
         ws.project.design_tokens.clone()
     }
 
+    /// Encode a vertical-band RGBA8 PNG from `bands` (one solid colour per
+    /// equal-width band). Synthesizes a recognizable image for the
+    /// palette-extraction / derive-from-image tests without shipping a
+    /// binary fixture.
+    fn synth_band_png(bands: &[[u8; 3]]) -> Vec<u8> {
+        assert!(!bands.is_empty(), "need at least one band");
+        let height = 64u32;
+        let band_w = 24u32;
+        let width = band_w * bands.len() as u32;
+        let img = image::ImageBuffer::from_fn(width, height, |x, _y| {
+            let idx = ((x / band_w) as usize).min(bands.len() - 1);
+            let c = bands[idx];
+            image::Rgba([c[0], c[1], c[2], 255])
+        });
+        let mut buf = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(img)
+            .write_to(&mut buf, image::ImageFormat::Png)
+            .expect("encode png");
+        buf.into_inner()
+    }
+
+    /// A small recognizable SVG brand mark (rounded square + ring + inner
+    /// square) whose solid fills the theme can remap. Used by the logo
+    /// import / insert tests and the H5 proof.
+    fn brand_logo_svg() -> Vec<u8> {
+        br##"<svg xmlns="http://www.w3.org/2000/svg" width="120" height="120" viewBox="0 0 120 120"><rect x="12" y="12" width="96" height="96" rx="20" fill="#2563EB"/><circle cx="60" cy="60" r="28" fill="#FFFFFF"/><rect x="46" y="46" width="28" height="28" fill="#F59E0B"/></svg>"##.to_vec()
+    }
+
+    /// Insert a `GroupLayer` (optionally under `parent`) and return its id.
+    fn insert_group(parent: Option<Uuid>, name: &str) -> Uuid {
+        let mut guard = slot().write();
+        let ws = guard.as_mut().expect("open");
+        let mut node = Node::new(NodeType::GroupLayer, name.to_string());
+        node.parent_id = parent;
+        ws.project.document.insert_node(node).expect("insert group")
+    }
+
+    /// World-space rectangle path the renderer can rasterise — mirrors the
+    /// geometry `canvas_create_rect` attaches.
+    fn rect_path_value(x: f64, y: f64, w: f64, h: f64) -> serde_json::Value {
+        let path = kcreate_vector::VectorPath::new(vec![
+            kcreate_vector::PathSegment::MoveTo(kcreate_vector::PathPoint::new(x, y)),
+            kcreate_vector::PathSegment::LineTo(kcreate_vector::PathPoint::new(x + w, y)),
+            kcreate_vector::PathSegment::LineTo(kcreate_vector::PathPoint::new(x + w, y + h)),
+            kcreate_vector::PathSegment::LineTo(kcreate_vector::PathPoint::new(x, y + h)),
+            kcreate_vector::PathSegment::Close,
+        ]);
+        serde_json::to_value(&path).expect("path json")
+    }
+
+    /// Insert a solid-filled, renderable rounded rect under `parent`.
+    fn vec_rect(
+        parent: Uuid,
+        name: &str,
+        (x, y, w, h): (f64, f64, f64, f64),
+        fill: RgbaColor,
+        radius: f64,
+    ) -> Uuid {
+        use kcreate_core::node::Bounds;
+        let mut guard = slot().write();
+        let ws = guard.as_mut().expect("open");
+        let mut node = Node::new(NodeType::VectorLayer, name.to_string());
+        node.parent_id = Some(parent);
+        node.bounds = Bounds {
+            x,
+            y,
+            width: w,
+            height: h,
+        };
+        node.style.fill = FillStyle::Solid(fill);
+        node.style.corner_radius = radius;
+        node.metadata.insert(
+            crate::scene_sync::VECTOR_PATH_METADATA_KEY.to_string(),
+            rect_path_value(x, y, w, h),
+        );
+        ws.project.document.insert_node(node).expect("rect")
+    }
+
+    /// Insert a text layer carrying canonical `TextLayerMeta`; its colour
+    /// is `node.style.fill`.
+    fn vec_text(
+        parent: Uuid,
+        name: &str,
+        (x, y, w, h): (f64, f64, f64, f64),
+        copy: &str,
+        font: &str,
+        size: f32,
+        fill: RgbaColor,
+    ) -> Uuid {
+        use kcreate_core::node::Bounds;
+        let meta = kcreate_export::TextLayerMeta {
+            text: copy.to_string(),
+            font_family: font.to_string(),
+            font_size: size,
+        };
+        let mut guard = slot().write();
+        let ws = guard.as_mut().expect("open");
+        let mut node = Node::new(NodeType::TextLayer, name.to_string());
+        node.parent_id = Some(parent);
+        node.bounds = Bounds {
+            x,
+            y,
+            width: w,
+            height: h,
+        };
+        node.style.fill = FillStyle::Solid(fill);
+        node.metadata.insert(
+            crate::scene_sync::TEXT_LAYER_METADATA_KEY.to_string(),
+            serde_json::to_value(&meta).expect("meta"),
+        );
+        ws.project.document.insert_node(node).expect("text")
+    }
+
+    /// Translate the open document to a renderer scene and PNG-encode it
+    /// through the same export path the host uses.
+    fn render_png(width: u32, height: u32) -> Vec<u8> {
+        let guard = slot().read();
+        let ws = guard.as_ref().expect("open");
+        let mut sync = crate::scene_sync::SceneSync::new();
+        let scene = sync.sync_document_to_scene_borrowed(&ws.project.document, None, &[]);
+        drop(guard);
+        export_png_to_bytes(
+            &scene,
+            &PngExportOptions {
+                width,
+                height,
+                scale: 1.0,
+                background: None,
+            },
+        )
+        .expect("png")
+    }
+
+    /// Scoped `KCREATE_BRAND_KIT_DIR` override that restores the previous
+    /// value on drop. Sound because brand-registry tests run `#[serial]`.
+    struct BrandDirEnvGuard {
+        prev: Option<String>,
+    }
+
+    impl BrandDirEnvGuard {
+        fn set(dir: &std::path::Path) -> Self {
+            let prev = std::env::var("KCREATE_BRAND_KIT_DIR").ok();
+            // SAFETY: brand-registry tests are `#[serial]`, so no other
+            // thread reads or writes the process environment concurrently.
+            unsafe {
+                std::env::set_var("KCREATE_BRAND_KIT_DIR", dir);
+            }
+            Self { prev }
+        }
+    }
+
+    impl Drop for BrandDirEnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: see `BrandDirEnvGuard::set`.
+            unsafe {
+                match &self.prev {
+                    Some(v) => std::env::set_var("KCREATE_BRAND_KIT_DIR", v),
+                    None => std::env::remove_var("KCREATE_BRAND_KIT_DIR"),
+                }
+            }
+        }
+    }
+
     #[test]
     #[serial]
     fn apply_theme_remaps_colors_to_roles_area_aware() {
@@ -15037,6 +15832,648 @@ mod tests {
             std::fs::write(out.join("hero_original.png"), &original).expect("write original");
             std::fs::write(out.join("hero_theme_a_daybreak.png"), &png_a).expect("write A");
             std::fs::write(out.join("hero_theme_b_midnight.png"), &png_b).expect("write B");
+        }
+
+        project_close();
+    }
+
+    // -------------------------------------------------------------------------
+    // H5 — Brand Kit depth (user kits, fonts+embed, logo, scope, derive-image)
+    // -------------------------------------------------------------------------
+
+    #[test]
+    #[serial]
+    fn theme_derive_from_image_produces_usable_theme() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("derive_image", dir.path()).expect("create");
+
+        // A recognizable design to restyle (dark canvas + warm accent).
+        insert_styled_rect(
+            NodeType::VectorLayer,
+            "Canvas",
+            (0.0, 0.0, 1200.0, 800.0),
+            rgb8(0x10, 0x2A, 0x43),
+            0.0,
+        );
+        insert_styled_rect(
+            NodeType::VectorLayer,
+            "Accent",
+            (40.0, 40.0, 200.0, 200.0),
+            rgb8(0xF9, 0x73, 0x16),
+            0.0,
+        );
+
+        // Upload an image whose dominant colours differ from the design.
+        let photo = synth_band_png(&[[0x0F, 0x17, 0x2A], [0x25, 0x63, 0xEB], [0xF5, 0x9E, 0x0B]]);
+        let theme = theme_derive_from_image("Sunrise Photo", &photo).expect("derive");
+
+        assert_eq!(theme.name, "Sunrise Photo");
+        assert!(
+            theme.id.starts_with("derived-"),
+            "derived-from-image theme id should be prefixed, got {}",
+            theme.id
+        );
+
+        // Every role is covered, so applying it can't leave a hole.
+        let tokens = theme.to_design_tokens();
+        for role in [
+            "background",
+            "surface",
+            "primary",
+            "secondary",
+            "accent",
+            "text",
+            "muted",
+        ] {
+            assert!(
+                tokens.colors.contains_key(role),
+                "derived theme missing colour role `{role}`"
+            );
+        }
+        // A non-degenerate palette: the background and primary differ.
+        assert_ne!(
+            quantize(theme.palette.background),
+            quantize(theme.palette.primary),
+            "derived palette collapsed background and primary"
+        );
+
+        // It is directly usable as an undoable restyle.
+        let report = document_apply_theme(&theme).expect("apply derived");
+        assert!(report.affected_nodes > 0);
+
+        // Empty bytes are rejected; undecodable bytes surface as an IO error.
+        assert!(theme_derive_from_image("x", &[]).is_err());
+        assert!(theme_derive_from_image("x", b"not an image").is_err());
+
+        project_close();
+    }
+
+    #[test]
+    #[serial]
+    fn brand_kit_extract_palette_from_image_sets_named_colors() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("kit_palette", dir.path()).expect("create");
+
+        let kit_id = brand_kit_create("Photo Brand".to_string()).expect("kit");
+        let photo = synth_band_png(&[
+            [0xE1, 0x1D, 0x48],
+            [0x7C, 0x3A, 0xED],
+            [0xF5, 0x9E, 0x0B],
+            [0x10, 0x18, 0x28],
+        ]);
+        let hexes =
+            brand_kit_extract_palette_from_image_bytes(kit_id, &photo, 4).expect("extract palette");
+        assert!(
+            !hexes.is_empty() && hexes.len() <= 4,
+            "expected 1..=4 colours, got {}",
+            hexes.len()
+        );
+        for h in &hexes {
+            // `RgbaColor::to_hex` encodes `#RRGGBBAA`.
+            assert!(
+                h.starts_with('#') && h.len() == 9,
+                "malformed hex code `{h}`"
+            );
+        }
+
+        // The kit now carries the extracted palette, named in dominance order.
+        let kit = brand_kit_list()
+            .expect("list")
+            .into_iter()
+            .find(|k| k.id == kit_id)
+            .expect("kit present");
+        assert_eq!(kit.colors.len(), hexes.len());
+        for (i, c) in kit.colors.iter().enumerate() {
+            assert_eq!(c.name, format!("Color {}", i + 1));
+        }
+
+        // Argument guards.
+        assert!(brand_kit_extract_palette_from_image_bytes(kit_id, &[], 4).is_err());
+        assert!(brand_kit_extract_palette_from_image_bytes(kit_id, &photo, 0).is_err());
+        assert!(brand_kit_extract_palette_from_image_bytes(kit_id, &photo, 65).is_err());
+
+        project_close();
+    }
+
+    #[test]
+    #[serial]
+    fn brand_kit_set_font_role_embeds_real_font_bytes() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("kit_fonts", dir.path()).expect("create");
+
+        let kit_id = brand_kit_create("Type Brand".to_string()).expect("kit");
+        brand_kit_set_font_role(kit_id, "heading", "DejaVu Serif".to_string(), true)
+            .expect("set heading");
+        brand_kit_set_font_role(kit_id, "body", "DejaVu Sans".to_string(), true).expect("set body");
+
+        let kit = brand_kit_list()
+            .expect("list")
+            .into_iter()
+            .find(|k| k.id == kit_id)
+            .expect("kit present");
+        assert_eq!(kit.fonts.len(), 2, "one font per weight bucket");
+
+        let heading = kit
+            .fonts
+            .iter()
+            .find(|f| f.weight >= 600)
+            .expect("heading font");
+        assert_eq!(heading.family, "DejaVu Serif");
+        assert!(
+            heading.embedded_asset_id.is_some(),
+            "embed=true must store a font asset"
+        );
+        let body = kit
+            .fonts
+            .iter()
+            .find(|f| f.weight < 600)
+            .expect("body font");
+        assert_eq!(body.family, "DejaVu Sans");
+        assert!(body.embedded_asset_id.is_some());
+
+        // The embedded blob is a real sfnt font, not a placeholder.
+        let asset_id = heading.embedded_asset_id.expect("asset id");
+        let bytes = {
+            let guard = slot().read();
+            let ws = guard.as_ref().expect("open");
+            let store = ws.store.lock();
+            store
+                .load_asset(asset_id)
+                .expect("load asset")
+                .expect("asset bytes present")
+        };
+        assert!(bytes.len() > 4, "font asset suspiciously small");
+        let sig = &bytes[..4];
+        assert!(
+            sig == [0x00, 0x01, 0x00, 0x00] || sig == b"OTTO" || sig == b"true" || sig == b"ttcf",
+            "embedded bytes lack a recognised sfnt signature, got {sig:?}"
+        );
+
+        // Re-setting the same role replaces in place rather than appending.
+        brand_kit_set_font_role(kit_id, "heading", "DejaVu Sans Mono".to_string(), false)
+            .expect("replace heading");
+        let kit = brand_kit_list()
+            .expect("list")
+            .into_iter()
+            .find(|k| k.id == kit_id)
+            .expect("kit present");
+        assert_eq!(kit.fonts.len(), 2, "replacing a role must not add a font");
+        let heading = kit
+            .fonts
+            .iter()
+            .find(|f| f.weight >= 600)
+            .expect("heading font");
+        assert_eq!(heading.family, "DejaVu Sans Mono");
+        assert!(
+            heading.embedded_asset_id.is_none(),
+            "embed=false must not store an asset"
+        );
+
+        // Bad arguments are rejected.
+        assert!(brand_kit_set_font_role(kit_id, "subtitle", "X".to_string(), false).is_err());
+        assert!(brand_kit_set_font_role(kit_id, "body", "   ".to_string(), false).is_err());
+
+        project_close();
+    }
+
+    #[test]
+    #[serial]
+    fn brand_logo_insert_places_editable_recolorable_node() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("kit_logo", dir.path()).expect("create");
+
+        let kit_id = brand_kit_create("Logo Brand".to_string()).expect("kit");
+        brand_kit_set_logo_bytes(kit_id, &brand_logo_svg()).expect("set logo");
+
+        let inserted = brand_logo_insert(kit_id, None, 50.0, 60.0, 240.0).expect("insert logo");
+        assert!(!inserted.node_ids.is_empty(), "logo produced no nodes");
+        assert_eq!(inserted.name, "Brand Logo");
+        assert!(
+            inserted.width > 0.0 && inserted.height > 0.0,
+            "logo has zero bounds"
+        );
+        let longest = inserted.width.max(inserted.height);
+        assert!(
+            longest <= 240.5,
+            "logo should scale to at most the target longest side, got {longest}"
+        );
+
+        // At least one inserted node carries an editable, theme-recolorable
+        // solid fill (the SVG path fills).
+        let guard = slot().read();
+        let ws = guard.as_ref().expect("open");
+        let mut found_solid = false;
+        for id_str in &inserted.node_ids {
+            let id = Uuid::parse_str(id_str).expect("uuid");
+            let node = ws
+                .project
+                .document
+                .get_node(id)
+                .expect("inserted node exists");
+            if matches!(node.style.fill, FillStyle::Solid(_)) {
+                found_solid = true;
+            }
+        }
+        drop(guard);
+        assert!(
+            found_solid,
+            "an SVG logo must insert at least one solid-filled, recolorable node"
+        );
+
+        // A kit with no logo cannot insert.
+        let empty_kit = brand_kit_create("No Logo".to_string()).expect("kit");
+        assert!(brand_logo_insert(empty_kit, None, 0.0, 0.0, 64.0).is_err());
+
+        project_close();
+    }
+
+    #[test]
+    #[serial]
+    fn apply_theme_to_selection_touches_only_subtree_and_undo_restores() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("scope_apply", dir.path()).expect("create");
+
+        // Two sibling subtrees painted with identical colours. Theming the
+        // first must leave the second byte-identical.
+        let dark = rgb8(0x20, 0x30, 0x40);
+        let warm = rgb8(0xC0, 0x40, 0x40);
+        let group_a = insert_group(None, "Group A");
+        let a1 = vec_rect(group_a, "A1", (0.0, 0.0, 100.0, 100.0), dark, 0.0);
+        let a2 = vec_rect(group_a, "A2", (0.0, 100.0, 100.0, 100.0), warm, 0.0);
+        let group_b = insert_group(None, "Group B");
+        let b1 = vec_rect(group_b, "B1", (200.0, 0.0, 100.0, 100.0), dark, 0.0);
+        let b2 = vec_rect(group_b, "B2", (200.0, 100.0, 100.0, 100.0), warm, 0.0);
+
+        let before_styles = snapshot_styles();
+        let before_tokens = snapshot_tokens();
+        let a1_before = node_solid_fill(a1);
+        let a2_before = node_solid_fill(a2);
+        let b1_before = node_solid_fill(b1);
+        let b2_before = node_solid_fill(b2);
+
+        assert_eq!(
+            document_status().expect("status").undo_depth,
+            0,
+            "direct inserts must not push undo ops"
+        );
+
+        let theme = Theme::builtin("midnight").expect("midnight theme");
+        document_set_selection(vec![group_a]).expect("select A");
+        let report =
+            document_apply_theme_to_selection(&theme, vec![group_a]).expect("apply to selection");
+        assert!(
+            report.affected_nodes > 0,
+            "scoped apply must restyle the selected subtree"
+        );
+
+        // Group B is untouched — byte identical.
+        assert_eq!(node_solid_fill(b1), b1_before, "sibling B1 must not change");
+        assert_eq!(node_solid_fill(b2), b2_before, "sibling B2 must not change");
+        // Group A actually changed.
+        assert!(
+            node_solid_fill(a1) != a1_before || node_solid_fill(a2) != a2_before,
+            "selected subtree should have been recolored"
+        );
+        // A scoped apply leaves the global design tokens byte-identical.
+        assert_eq!(
+            before_tokens,
+            snapshot_tokens(),
+            "selection-scope apply must not touch global design tokens"
+        );
+
+        // Exactly one undoable operation, and one undo restores everything.
+        assert_eq!(
+            document_status().expect("status").undo_depth,
+            1,
+            "scoped restyle must collapse to one operation"
+        );
+        document_undo().expect("undo").expect("undo outcome");
+        assert_eq!(
+            before_styles,
+            snapshot_styles(),
+            "one undo must restore every node style exactly"
+        );
+        assert_eq!(
+            before_tokens,
+            snapshot_tokens(),
+            "one undo must restore design tokens exactly"
+        );
+
+        project_close();
+    }
+
+    #[test]
+    #[serial]
+    fn brand_kit_registry_roundtrips_across_projects() {
+        let registry = tmpdir();
+        let _env = BrandDirEnvGuard::set(registry.path());
+
+        reset_for_tests();
+        let dir1 = tmpdir();
+        project_create("project_one", dir1.path()).expect("create p1");
+
+        let kit_id = brand_kit_create("Acme Brand".to_string()).expect("kit");
+        brand_kit_set_logo_bytes(kit_id, &brand_logo_svg()).expect("logo");
+        let photo = synth_band_png(&[[0xE1, 0x1D, 0x48], [0x7C, 0x3A, 0xED], [0xF5, 0x9E, 0x0B]]);
+        let palette =
+            brand_kit_extract_palette_from_image_bytes(kit_id, &photo, 3).expect("palette");
+        let palette_len = palette.len();
+        assert!(!palette.is_empty());
+        brand_kit_set_font_role(kit_id, "heading", "DejaVu Serif".to_string(), true)
+            .expect("heading font");
+
+        brand_kit_registry_save(kit_id).expect("save to registry");
+
+        // The kit is discoverable in the cross-project registry.
+        let listed = brand_kit_registry_list().expect("list registry");
+        assert!(
+            listed
+                .iter()
+                .any(|k| k.id == kit_id && k.name == "Acme Brand"),
+            "saved kit must appear in the registry listing"
+        );
+
+        project_close();
+
+        // A brand-new project on disk shares the registry, not the kits.
+        let dir2 = tmpdir();
+        project_create("project_two", dir2.path()).expect("create p2");
+        assert!(
+            brand_kit_list().expect("list").is_empty(),
+            "a fresh project starts with no in-memory kits"
+        );
+
+        let loaded_id = brand_kit_registry_load(kit_id).expect("load from registry");
+        assert_eq!(loaded_id, kit_id, "registry load keeps the kit id stable");
+
+        let kit = brand_kit_list()
+            .expect("list")
+            .into_iter()
+            .find(|k| k.id == kit_id)
+            .expect("kit rehydrated into p2");
+        assert_eq!(kit.name, "Acme Brand");
+        assert_eq!(
+            kit.colors.len(),
+            palette_len,
+            "palette survived the round-trip"
+        );
+        assert_eq!(kit.fonts.len(), 1, "font role survived the round-trip");
+        let logo_id = kit.logo_asset_id.expect("logo survived");
+        let font_id = kit.fonts[0]
+            .embedded_asset_id
+            .expect("embedded font survived");
+
+        // The logo + font blobs were re-hydrated into p2's own asset store.
+        {
+            let guard = slot().read();
+            let ws = guard.as_ref().expect("open");
+            let store = ws.store.lock();
+            assert!(
+                store.load_asset(logo_id).expect("load logo").is_some(),
+                "logo blob must be re-stored in the loading project"
+            );
+            assert!(
+                store.load_asset(font_id).expect("load font").is_some(),
+                "embedded font blob must be re-stored in the loading project"
+            );
+        }
+
+        // Deleting from the registry leaves the loaded project copy intact.
+        assert!(brand_kit_registry_delete(kit_id).expect("delete"));
+        assert!(
+            !brand_kit_registry_list()
+                .expect("list")
+                .iter()
+                .any(|k| k.id == kit_id),
+            "deleted kit must be gone from the registry"
+        );
+        assert!(
+            brand_kit_list()
+                .expect("list")
+                .iter()
+                .any(|k| k.id == kit_id),
+            "registry delete must not touch the open project"
+        );
+
+        project_close();
+    }
+
+    /// Full H5 proof: compose a recognizable SaaS hero, define a brand kit
+    /// (logo + palette-derived-from-an-image + heading/body fonts), then
+    /// render (a) the original, (b) the whole-document branded result with
+    /// the logo placed, and (c) the selection-only branded result. Asserts
+    /// the three renders are distinct PNGs and writes them to
+    /// `KCREATE_PROOF_DIR` when set so they can be opened + attached.
+    #[test]
+    #[serial]
+    fn brand_kit_branding_renders_whole_doc_and_selection_proof() {
+        const W: u32 = 1200;
+        const H: u32 = 800;
+
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("brand_proof", dir.path()).expect("create");
+
+        // Palette for the base design.
+        let white = rgb8(0xFF, 0xFF, 0xFF);
+        let slate_50 = rgb8(0xF1, 0xF5, 0xF9);
+        let navy = rgb8(0x0F, 0x17, 0x2A);
+        let muted = rgb8(0x47, 0x55, 0x69);
+        let blue = rgb8(0x25, 0x63, 0xEB);
+        let green = rgb8(0x10, 0xB9, 0x81);
+        let amber = rgb8(0xF5, 0x9E, 0x0B);
+
+        // Page → artboard.
+        let page = insert_group(None, "Page");
+        let artboard = insert_group(Some(page), "Artboard");
+        vec_rect(artboard, "Canvas", (0.0, 0.0, 1200.0, 800.0), white, 0.0);
+
+        // Top nav.
+        let nav = insert_group(Some(artboard), "Nav");
+        vec_rect(nav, "Nav bar", (0.0, 0.0, 1200.0, 72.0), slate_50, 0.0);
+        vec_rect(nav, "Logo mark", (48.0, 20.0, 32.0, 32.0), blue, 8.0);
+        vec_text(
+            nav,
+            "Brand",
+            (92.0, 24.0, 180.0, 28.0),
+            "KCreate",
+            "DejaVu Serif",
+            22.0,
+            navy,
+        );
+        vec_text(
+            nav,
+            "Nav: Product",
+            (840.0, 28.0, 90.0, 20.0),
+            "Product",
+            "DejaVu Sans",
+            15.0,
+            muted,
+        );
+        vec_text(
+            nav,
+            "Nav: Pricing",
+            (944.0, 28.0, 80.0, 20.0),
+            "Pricing",
+            "DejaVu Sans",
+            15.0,
+            muted,
+        );
+        vec_text(
+            nav,
+            "Nav: Docs",
+            (1040.0, 28.0, 60.0, 20.0),
+            "Docs",
+            "DejaVu Sans",
+            15.0,
+            muted,
+        );
+
+        // Hero (the subtree we later restyle in isolation).
+        let hero = insert_group(Some(artboard), "Hero");
+        vec_text(
+            hero,
+            "Headline",
+            (96.0, 200.0, 620.0, 120.0),
+            "Design at the speed of thought",
+            "DejaVu Serif",
+            48.0,
+            navy,
+        );
+        vec_text(
+            hero,
+            "Subhead",
+            (96.0, 336.0, 560.0, 80.0),
+            "Compose, theme, and ship on-brand designs entirely offline.",
+            "DejaVu Sans",
+            20.0,
+            muted,
+        );
+        vec_rect(hero, "Primary CTA", (96.0, 448.0, 196.0, 56.0), blue, 12.0);
+        vec_text(
+            hero,
+            "Primary CTA label",
+            (128.0, 464.0, 140.0, 24.0),
+            "Get started",
+            "DejaVu Sans",
+            18.0,
+            white,
+        );
+        vec_rect(
+            hero,
+            "Hero panel",
+            (820.0, 150.0, 320.0, 360.0),
+            green,
+            20.0,
+        );
+        vec_rect(
+            hero,
+            "Hero accent",
+            (860.0, 196.0, 120.0, 120.0),
+            amber,
+            60.0,
+        );
+
+        // Feature cards.
+        let cards = insert_group(Some(artboard), "Cards");
+        let labels = ["Themes", "Brand kits", "Reversible"];
+        for (i, label) in labels.iter().enumerate() {
+            let x = 96.0 + (i as f64) * 360.0;
+            vec_rect(cards, "Card", (x, 600.0, 320.0, 140.0), slate_50, 16.0);
+            vec_rect(
+                cards,
+                "Card icon",
+                (x + 24.0, 624.0, 40.0, 40.0),
+                blue,
+                10.0,
+            );
+            vec_text(
+                cards,
+                "Card title",
+                (x + 24.0, 684.0, 260.0, 24.0),
+                label,
+                "DejaVu Sans",
+                18.0,
+                navy,
+            );
+        }
+
+        // (a) Original — no branding, no logo yet.
+        let png_original = render_png(W, H);
+        assert_eq!(&png_original[..4], &[0x89, b'P', b'N', b'G'], "PNG magic");
+        assert!(
+            png_original.windows(4).any(|w| w == b"IDAT"),
+            "original PNG missing image data"
+        );
+
+        // Define a brand kit: logo + palette-derived-from-an-image + fonts.
+        let kit_id = brand_kit_create("Acme".to_string()).expect("kit");
+        brand_kit_set_logo_bytes(kit_id, &brand_logo_svg()).expect("logo");
+        let brand_photo = synth_band_png(&[
+            [0xE1, 0x1D, 0x48],
+            [0x7C, 0x3A, 0xED],
+            [0xF5, 0x9E, 0x0B],
+            [0x10, 0x18, 0x28],
+            [0xF8, 0xFA, 0xFC],
+        ]);
+        brand_kit_extract_palette_from_image_bytes(kit_id, &brand_photo, 5).expect("palette");
+        brand_kit_set_font_role(kit_id, "heading", "DejaVu Serif".to_string(), true)
+            .expect("heading font");
+        brand_kit_set_font_role(kit_id, "body", "DejaVu Sans".to_string(), true)
+            .expect("body font");
+
+        let kit = brand_kit_list()
+            .expect("list")
+            .into_iter()
+            .find(|k| k.id == kit_id)
+            .expect("kit present");
+        let theme = Theme::from_brand_kit(&kit);
+
+        // Place the saved logo as an editable node on the artboard.
+        let logo = brand_logo_insert(kit_id, Some(artboard), 1020.0, 16.0, 40.0).expect("logo");
+        assert!(!logo.node_ids.is_empty());
+
+        // (b) Whole-document branding.
+        let report = document_apply_theme(&theme).expect("apply whole-doc");
+        assert!(report.affected_nodes > 0);
+        let png_whole = render_png(W, H);
+        assert_ne!(
+            png_original, png_whole,
+            "whole-document branding must change the render"
+        );
+
+        // Undo the whole-doc restyle; the placed logo stays.
+        document_undo().expect("undo").expect("undo outcome");
+
+        // (c) Selection-only branding — restyle just the hero subtree.
+        document_set_selection(vec![hero]).expect("select hero");
+        let sel_report =
+            document_apply_theme_to_selection(&theme, vec![hero]).expect("apply to selection");
+        assert!(sel_report.affected_nodes > 0);
+        let png_selection = render_png(W, H);
+        assert_ne!(
+            png_original, png_selection,
+            "selection branding must change the render"
+        );
+        assert_ne!(
+            png_whole, png_selection,
+            "selection-only result must differ from the whole-document result"
+        );
+
+        // Persist proofs when a destination is provided.
+        if let Ok(out) = std::env::var("KCREATE_PROOF_DIR") {
+            let out = std::path::Path::new(&out);
+            std::fs::create_dir_all(out).expect("mkdir proof dir");
+            std::fs::write(out.join("hero_original.png"), &png_original).expect("write original");
+            std::fs::write(out.join("hero_branded_whole_doc.png"), &png_whole)
+                .expect("write whole-doc");
+            std::fs::write(out.join("hero_branded_selection.png"), &png_selection)
+                .expect("write selection");
         }
 
         project_close();

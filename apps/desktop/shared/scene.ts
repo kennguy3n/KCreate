@@ -1584,6 +1584,51 @@ export interface BrandKitBridge {
   /// `BrandKit` referencing those assets is appended. Returns the
   /// new kit's id.
   import(filePath: string): Promise<string>;
+
+  // -- Brand Kit depth (H5) -------------------------------------------------
+
+  /// Set the kit's logo from raw SVG or raster bytes; the blob is
+  /// stored in the project asset table and linked as the kit's logo.
+  setLogoBytes(kitId: string, bytes: Uint8Array): Promise<void>;
+  /// Assign a fontdb-discovered font family to a role. When `embed`
+  /// is true the font file is embedded into the project so exports
+  /// carry it offline.
+  setFontRole(
+    kitId: string,
+    role: "heading" | "body",
+    family: string,
+    embed: boolean,
+  ): Promise<void>;
+  /// Extract up to `numColors` dominant colors from an uploaded image
+  /// and store them as the kit's palette. Returns the hex codes in
+  /// dominance order.
+  extractPaletteFromImage(
+    kitId: string,
+    bytes: Uint8Array,
+    numColors: number,
+  ): Promise<string[]>;
+  /// Insert the kit's saved logo as editable node(s) at world position
+  /// `(x, y)`, scaled so its longest side equals `targetSize`. SVG
+  /// logos become recolorable vector groups; raster logos become a
+  /// single `RasterLayer`. Single undoable operation.
+  insertLogo(
+    kitId: string,
+    parentId: string | null,
+    x: number,
+    y: number,
+    targetSize: number,
+  ): Promise<InsertedAsset>;
+  /// Persist this kit (plus its logo / embedded-font blobs) to the
+  /// cross-project on-disk registry so future sessions can re-use it.
+  registrySave(kitId: string): Promise<void>;
+  /// List every kit saved in the cross-project on-disk registry.
+  registryList(): Promise<BrandKit[]>;
+  /// Load a registry kit into the open project (re-storing its blobs
+  /// under fresh asset ids). Returns the kit's id.
+  registryLoad(kitId: string): Promise<string>;
+  /// Delete a kit from the cross-project on-disk registry. Returns
+  /// true when a record was removed.
+  registryDelete(kitId: string): Promise<boolean>;
 }
 
 // ---------------------------------------------------------------------------
@@ -1673,6 +1718,14 @@ export interface ThemeBridge {
   apply(theme: Theme): Promise<ApplyThemeReport>;
   deriveFromDocument(name: string): Promise<Theme>;
   fromBrandKit(kit: BrandKit): Promise<Theme>;
+  /// H5 — apply a theme to a scoped subtree (the nodes in `roots` plus
+  /// their descendants) as a single undoable operation. An empty
+  /// `roots` array falls back to the live selection.
+  applyToSelection(theme: Theme, roots: string[]): Promise<ApplyThemeReport>;
+  /// H5 — derive a theme from an uploaded image's palette (k-means
+  /// extraction → role assignment). Pure transform; does not mutate
+  /// the open project.
+  deriveFromImage(name: string, bytes: Uint8Array): Promise<Theme>;
 }
 
 /**

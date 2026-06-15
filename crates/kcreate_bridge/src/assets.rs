@@ -146,6 +146,44 @@ pub fn insert(
     y: f64,
     target_size: f64,
 ) -> Result<InsertedAsset> {
+    let def = assets::get(asset_id).ok_or_else(|| DocumentBridgeError::InvalidArgument {
+        argument: "asset_id".into(),
+        value: asset_id.to_string(),
+    })?;
+
+    insert_styled_paths(
+        def.svg.as_bytes(),
+        def.name,
+        parent_id,
+        x,
+        y,
+        target_size,
+        "assets_insert",
+        serde_json::json!({ "asset_id": asset_id }),
+    )
+}
+
+/// Shared core that parses SVG `svg` into editable vector node(s) and
+/// stamps them onto the document graph as a single undoable operation.
+///
+/// Both the asset-library [`insert`] and the brand-logo insertion in
+/// `document::brand_logo_insert` funnel through here so the
+/// SVG → group-of-vector-layers placement logic (scale-to-fit,
+/// aspect-preserving, top-left at `(x, y)`) lives in exactly one place.
+/// `name` labels the wrapping group (and each leaf when the SVG yields
+/// multiple paths); `op_command` / `op_before` parameterise the
+/// recorded [`Operation`] so each caller keeps its own undo provenance.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn insert_styled_paths(
+    svg: &[u8],
+    name: &str,
+    parent_id: Option<Uuid>,
+    x: f64,
+    y: f64,
+    target_size: f64,
+    op_command: &str,
+    op_before: serde_json::Value,
+) -> Result<InsertedAsset> {
     if !x.is_finite() || !y.is_finite() {
         return Err(DocumentBridgeError::InvalidArgument {
             argument: "position".into(),
@@ -159,20 +197,15 @@ pub fn insert(
         });
     }
 
-    let def = assets::get(asset_id).ok_or_else(|| DocumentBridgeError::InvalidArgument {
-        argument: "asset_id".into(),
-        value: asset_id.to_string(),
-    })?;
-
-    let styled = import_svg_styled(def.svg.as_bytes())
-        .map_err(|e| DocumentBridgeError::Internal(format!("asset {asset_id:?} parse: {e}")))?;
+    let styled = import_svg_styled(svg)
+        .map_err(|e| DocumentBridgeError::Internal(format!("{name:?} parse: {e}")))?;
     let styled: Vec<StyledPath> = styled
         .into_iter()
         .filter(|s| !s.path.commands.is_empty())
         .collect();
     if styled.is_empty() {
         return Err(DocumentBridgeError::Internal(format!(
-            "asset {asset_id:?} produced no drawable paths"
+            "{name:?} produced no drawable paths"
         )));
     }
 
@@ -221,19 +254,19 @@ pub fn insert(
     let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
 
     // Group wrapper so the whole asset is one selectable/movable unit.
-    let mut group = Node::new(NodeType::GroupLayer, def.name);
+    let mut group = Node::new(NodeType::GroupLayer, name);
     group.parent_id = parent_id;
     group.bounds = group_bounds;
     let group_id = ws.project.document.insert_node(group)?;
 
     let mut node_ids: Vec<Uuid> = Vec::with_capacity(placed.len());
     for (i, p) in placed.into_iter().enumerate() {
-        let name = if multi {
-            format!("{} {}", def.name, i + 1)
+        let leaf_name = if multi {
+            format!("{name} {}", i + 1)
         } else {
-            def.name.to_string()
+            name.to_string()
         };
-        let mut node = Node::new(NodeType::VectorLayer, name);
+        let mut node = Node::new(NodeType::VectorLayer, leaf_name);
         node.parent_id = Some(group_id);
         node.bounds = p.bounds;
         node.style = NodeStyle {
@@ -255,12 +288,12 @@ pub fn insert(
     affected.extend(node_ids.iter().copied());
     let op = Operation::new(
         "user",
-        "assets_insert",
-        serde_json::json!({ "asset_id": asset_id }),
+        op_command,
+        op_before,
         serde_json::json!({
             "group_id": group_id,
             "node_count": node_ids.len(),
-            "name": def.name,
+            "name": name,
         }),
         affected,
     );
@@ -271,7 +304,7 @@ pub fn insert(
     Ok(InsertedAsset {
         group_id: group_id.to_string(),
         node_ids: node_ids.iter().map(Uuid::to_string).collect(),
-        name: def.name.to_string(),
+        name: name.to_string(),
         x: group_bounds.x,
         y: group_bounds.y,
         width: group_bounds.width,

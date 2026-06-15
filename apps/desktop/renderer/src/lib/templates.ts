@@ -22,6 +22,8 @@
 import type {
   CanvasBatchItem,
   FillStyle,
+  GradientStop,
+  Point2D,
   RgbaColor,
 } from "../../../shared/scene";
 
@@ -70,6 +72,36 @@ function solidFill(rgb: string, alpha = 1.0): FillStyle {
   return { kind: "solid", ...hex(rgb, alpha) };
 }
 
+/// A single gradient colour stop. `offset` is the position along the
+/// gradient axis in `[0, 1]`. Mirrors `kcreate_core::node::GradientStop`
+/// — the same wire shape the FillEditor builds for gradient swatches.
+function stop(offset: number, rgb: string, alpha = 1.0): GradientStop {
+  return { offset, color: hex(rgb, alpha) };
+}
+
+/// Linear gradient fill. `from`/`to` are *normalised, node-local*
+/// coordinates in `[0, 1]` — the renderer maps them onto the node's
+/// bounds, so the helper yields a clean ramp regardless of the rect's
+/// pixel size. Defaults to a top→bottom sweep.
+function linearFill(
+  stops: GradientStop[],
+  from: Point2D = { x: 0, y: 0 },
+  to: Point2D = { x: 0, y: 1 },
+): FillStyle {
+  return { kind: "gradient", shape: "linear", from, to, stops };
+}
+
+/// Radial gradient fill. `center` + `radius` are normalised node-local
+/// values (centre defaults to the middle of the node, radius to half
+/// its shorter extent). Used for soft glows / spotlight accents.
+function radialFill(
+  stops: GradientStop[],
+  center: Point2D = { x: 0.5, y: 0.5 },
+  radius = 0.5,
+): FillStyle {
+  return { kind: "gradient", shape: "radial", center, radius, stops };
+}
+
 /// Named-argument shape for queuing a text node into a
 /// [`BatchBuilder`]. The required fields (`x`, `y`, `body`, `size`)
 /// stay distinct from the optional cosmetic fields (`fill`, `family`,
@@ -104,6 +136,32 @@ export interface RectSeed {
   name?: string;
 }
 
+/// Named-argument shape for queuing an ellipse into a
+/// [`BatchBuilder`]. `cx`/`cy` are the centre, `rx`/`ry` the radii
+/// (matching `CanvasBatchItem`'s `ellipse` variant on the wire). Used
+/// for logomarks, avatars, icon glyphs, and chart points.
+export interface EllipseSeed {
+  cx: number;
+  cy: number;
+  rx: number;
+  ry: number;
+  fill?: FillStyle;
+  name?: string;
+}
+
+/// Named-argument shape for queuing a line into a [`BatchBuilder`].
+/// Endpoints are absolute world-space coordinates; the `fill` colours
+/// the stroke (the renderer treats a line's fill as its stroke paint).
+/// Used for axis rules, dividers, and connectors.
+export interface LineSeed {
+  x1: number;
+  y1: number;
+  x2: number;
+  y2: number;
+  fill?: FillStyle;
+  name?: string;
+}
+
 /// Builds up a list of canvas primitives, then flushes them through
 /// the batch bridge API in a single round-trip. The bridge takes
 /// the workspace write lock once, inserts every item in submission
@@ -117,6 +175,8 @@ export interface RectSeed {
 /// touches the bridge.
 export interface BatchBuilder {
   rect(seed: RectSeed): void;
+  ellipse(seed: EllipseSeed): void;
+  line(seed: LineSeed): void;
   text(seed: TextSeed): void;
   flush(): Promise<string[]>;
 }
@@ -139,6 +199,32 @@ export function makeBatch(): BatchBuilder {
         y,
         w,
         h,
+      };
+      if (fill !== undefined) item.fill = fill;
+      if (name !== undefined) item.name = name;
+      items.push(item);
+    },
+    ellipse({ cx, cy, rx, ry, fill, name }) {
+      const item: Extract<CanvasBatchItem, { kind: "ellipse" }> = {
+        kind: "ellipse",
+        parent: null,
+        cx,
+        cy,
+        rx,
+        ry,
+      };
+      if (fill !== undefined) item.fill = fill;
+      if (name !== undefined) item.name = name;
+      items.push(item);
+    },
+    line({ x1, y1, x2, y2, fill, name }) {
+      const item: Extract<CanvasBatchItem, { kind: "line" }> = {
+        kind: "line",
+        parent: null,
+        x1,
+        y1,
+        x2,
+        y2,
       };
       if (fill !== undefined) item.fill = fill;
       if (name !== undefined) item.name = name;
@@ -185,6 +271,48 @@ export const BRAND_PALETTE = {
   ink: "#111827",
   paper: "#F8FAFC",
 } as const;
+
+/// Modern product-UI design system layered on top of the brand
+/// neutrals for the app / deck / poster showcases. Kept separate from
+/// `BRAND_PALETTE` (which keeps the Brewline coffee identity the brand
+/// board + demo are pinned to) so the product surfaces read as a
+/// contemporary SaaS system: an indigo brand ramp, slate neutral type
+/// scale, hairline dividers, and a small set of status accents for
+/// metric deltas / chart series.
+export const UI_THEME = {
+  /// Primary text — slate-900.
+  ink: "#0F172A",
+  /// Secondary text — slate-600.
+  inkSoft: "#475569",
+  /// Tertiary / caption text + inactive icons — slate-400.
+  muted: "#94A3B8",
+  /// 1px dividers + card outlines — slate-200.
+  hairline: "#E2E8F0",
+  /// Card / panel surface.
+  surface: "#FFFFFF",
+  /// App canvas behind cards — slate-50.
+  canvas: "#F8FAFC",
+  /// Indigo brand ramp (rail / hero gradients).
+  brandDark: "#312E81",
+  brand: "#4F46E5",
+  brandBright: "#6366F1",
+  /// Tint behind the brand colour — indigo-50.
+  brandSoft: "#EEF2FF",
+  /// Status accents for deltas + chart series.
+  emerald: "#10B981",
+  amber: "#F59E0B",
+  rose: "#F43F5E",
+  sky: "#0EA5E9",
+  violet: "#8B5CF6",
+} as const;
+
+/// Clamp a numeric value into `[lo, hi]`. Centralises the
+/// `Math.max(lo, Math.min(hi, v))` pattern the resolvers lean on for
+/// defensive geometry so a degenerate artboard never yields a
+/// negative or overflowing dimension.
+function clamp(value: number, lo: number, hi: number): number {
+  return Math.max(lo, Math.min(hi, value));
+}
 
 const BRAND_RESOLVER: TemplateResolver = {
   async apply(ctx) {
@@ -378,6 +506,17 @@ const SOCIAL_RESOLVER: TemplateResolver = {
       fill: solidFill(BRAND_PALETTE.cream),
       name: "Background",
     });
+    // Eyebrow kicker above the headline band — a small sage label
+    // that gives the post a magazine-style lead-in instead of a bare
+    // headline.
+    b.text({
+      x: ax + Math.round(aw * 0.08),
+      y: ay + Math.round(ah * 0.1),
+      body: "NEW THIS WEEK",
+      size: 22,
+      fill: solidFill(BRAND_PALETTE.sage),
+      name: "Eyebrow",
+    });
     // Burnt-orange band behind the headline to anchor the type.
     // `Math.floor` on the band height + width so the band never
     // over-allocates against the artboard's right/bottom edges; the
@@ -403,6 +542,15 @@ const SOCIAL_RESOLVER: TemplateResolver = {
       fill: solidFill(BRAND_PALETTE.cream),
       name: "Headline",
     });
+    // Sage rule under the headline band to separate headline from body.
+    b.line({
+      x1: ax + Math.round(aw * 0.08),
+      y1: bandY + bandHeight + 28,
+      x2: ax + Math.round(aw * 0.08) + Math.round(aw * 0.16),
+      y2: bandY + bandHeight + 28,
+      fill: solidFill(BRAND_PALETTE.sage),
+      name: "Body rule",
+    });
     b.text({
       x: ax + Math.round(aw * 0.08),
       y: bandY + bandHeight + 48,
@@ -410,6 +558,14 @@ const SOCIAL_RESOLVER: TemplateResolver = {
       size: 20,
       fill: solidFill(BRAND_PALETTE.espresso),
       name: "Body copy",
+    });
+    b.text({
+      x: ax + Math.round(aw * 0.08),
+      y: bandY + bandHeight + 84,
+      body: "Tap the link in bio to read the full story.",
+      size: 16,
+      fill: solidFill(BRAND_PALETTE.espresso, 0.7),
+      name: "Body subcopy",
     });
     // Sage accent dot bottom-right (placeholder for a brand mark).
     // `Math.floor` on the dot size + clamp so a very narrow
@@ -422,6 +578,20 @@ const SOCIAL_RESOLVER: TemplateResolver = {
       h: dotSize,
       fill: solidFill(BRAND_PALETTE.sage),
       name: "Accent",
+    });
+    // A concentric ring inside the accent dot so the brand mark reads
+    // as an intentional badge rather than a flat square.
+    const dotCx = ax + Math.max(0, aw - dotSize - Math.round(aw * 0.06)) +
+      Math.round(dotSize / 2);
+    const dotCy = ay + Math.max(0, ah - dotSize - Math.round(ah * 0.06)) +
+      Math.round(dotSize / 2);
+    b.ellipse({
+      cx: dotCx,
+      cy: dotCy,
+      rx: Math.max(2, Math.round(dotSize * 0.28)),
+      ry: Math.max(2, Math.round(dotSize * 0.28)),
+      fill: solidFill(BRAND_PALETTE.cream),
+      name: "Accent ring",
     });
     await b.flush();
   },
@@ -455,6 +625,24 @@ const PRINT_RESOLVER: TemplateResolver = {
       size: 72,
       fill: solidFill(BRAND_PALETTE.cream),
       name: "Document title",
+    });
+    // Burnt-orange rule + subhead under the masthead title so the
+    // header reads as a designed masthead rather than a flat bar.
+    b.line({
+      x1: ax + margin,
+      y1: ay + Math.round(headerHeight * 0.3) + 92,
+      x2: ax + margin + Math.round(aw * 0.18),
+      y2: ay + Math.round(headerHeight * 0.3) + 92,
+      fill: solidFill(BRAND_PALETTE.burntOrange),
+      name: "Masthead rule",
+    });
+    b.text({
+      x: ax + margin,
+      y: ay + Math.round(headerHeight * 0.3) + 108,
+      body: "Prepared by Northwind · 2026",
+      size: 30,
+      fill: solidFill(BRAND_PALETTE.cream, 0.85),
+      name: "Masthead subtitle",
     });
     // Body placeholder block in cream. The body width subtracts
     // both side margins from the artboard; `Math.max(0, …)` so a
@@ -501,6 +689,14 @@ const PRINT_RESOLVER: TemplateResolver = {
       fill: solidFill(BRAND_PALETTE.burntOrange),
       name: "Footer accent",
     });
+    b.text({
+      x: ax + margin,
+      y: ay + Math.max(0, ah - footerHeight) + Math.round(footerHeight * 0.3),
+      body: "Page 1 · Confidential",
+      size: Math.max(10, Math.round(footerHeight * 0.32)),
+      fill: solidFill(BRAND_PALETTE.cream),
+      name: "Footer caption",
+    });
     await b.flush();
   },
 };
@@ -509,86 +705,495 @@ const APP_UI_RESOLVER: TemplateResolver = {
   async apply(ctx) {
     const b = makeBatch();
     const { x: ax, y: ay, width: aw, height: ah } = ctx;
-    // App-shell with a left rail, header, and content area.
+    // A real product dashboard: gradient nav rail with brand + nav
+    // items + user chip, a top bar with title / search / primary
+    // action, a row of KPI metric cards (with deltas + sparkline), and
+    // a revenue chart card beside a recent-activity list. Composed
+    // entirely from the batch primitives (rect / ellipse / line / text
+    // + gradients) — no new vector math, every node editable.
+    //
     // `Math.floor` so the rail + content split fits the artboard
-    // exactly: `rail + (aw - rail) = aw` no matter the rounding
-    // mode for `rail`. Mirrors the DECK `colWidth` floor invariant.
-    // `Math.max(0, …)` defends against degenerate artboards a
-    // future surface might pass in.
-    const rail = Math.max(0, Math.floor(aw * 0.12));
-    const headerH = Math.max(0, Math.floor(ah * 0.08));
+    // exactly: `rail + (aw - rail) = aw` regardless of the rounding
+    // mode. `Math.max(0, …)` defends against degenerate artboards a
+    // future surface might pass in. Mirrors the DECK `colWidth` floor
+    // invariant.
+    const rail = Math.max(0, Math.floor(aw * 0.165));
+    const headerH = Math.max(0, Math.floor(ah * 0.085));
+    const pad = 28;
+    const contentX = ax + rail;
+    const contentW = Math.max(0, aw - rail);
+    const fullW = Math.max(0, Math.floor(aw));
+    const fullH = Math.max(0, Math.floor(ah));
+
+    // Canvas + gradient rail.
     b.rect({
       x: ax,
       y: ay,
-      w: Math.max(0, Math.floor(aw)),
-      h: Math.max(0, Math.floor(ah)),
-      fill: solidFill(BRAND_PALETTE.paper),
+      w: fullW,
+      h: fullH,
+      fill: solidFill(UI_THEME.canvas),
       name: "App background",
     });
     b.rect({
       x: ax,
       y: ay,
       w: rail,
-      h: Math.max(0, Math.floor(ah)),
-      fill: solidFill(BRAND_PALETTE.espresso),
+      h: fullH,
+      fill: linearFill(
+        [stop(0, UI_THEME.brandDark), stop(1, UI_THEME.brand)],
+        { x: 0, y: 0 },
+        { x: 0.3, y: 1 },
+      ),
       name: "Left rail",
     });
-    b.rect({
-      x: ax + rail,
-      y: ay,
-      w: Math.max(0, aw - rail),
-      h: headerH,
-      fill: solidFill(BRAND_PALETTE.cream),
-      name: "Header",
+
+    // Rail brand lockup.
+    b.ellipse({
+      cx: ax + 30,
+      cy: ay + 40,
+      rx: 13,
+      ry: 13,
+      fill: solidFill(UI_THEME.surface),
+      name: "Brand mark",
     });
     b.text({
-      x: ax + rail + 32,
-      y: ay + Math.round(headerH * 0.3),
-      body: "App / Website UI",
-      size: 28,
-      fill: solidFill(BRAND_PALETTE.ink),
-      name: "Header title",
+      x: ax + 56,
+      y: ay + 30,
+      body: "Northwind",
+      size: 21,
+      fill: solidFill(UI_THEME.surface),
+      name: "Brand wordmark",
     });
-    // Three content tiles in the body area. `Math.floor` (not
-    // `Math.round`) so the three-tile budget is never over-allocated,
-    // mirroring the documented rationale on `DECK_RESOLVER`'s
-    // `colWidth` (see `templates.ts:493-503`). Today the APP_UI
-    // formula has slack — `rail + 4*tileMargin + 3*tileWidth ≤ aw`
-    // leaves ~`tileMargin` of right padding even with `Math.round`'s
-    // worst-case +1 — so this is defensive, not load-bearing. But the
-    // floor invariant `rail + 4*tileMargin + 3*tileWidth ≤ aw` then
-    // holds for any artboard size a future surface might apply this
-    // resolver to, without re-deriving the rounding behaviour.
-    const tileMargin = 32;
-    const tileTop = ay + headerH + tileMargin;
-    const tileBottom = ay + ah - tileMargin;
-    const tileWidth = Math.floor((aw - rail - tileMargin * 4) / 3);
-    // `Math.max(0, ...)` so a future surface applying this resolver
-    // to a very short artboard (`ah < headerH + 2*tileMargin`) doesn't
-    // pass a negative height into `createRect`. Mirrors the documented
-    // clamp on `DECK_RESOLVER`'s `colHeight` (see line 508). Today the
-    // shipped 1440×900 app-ui preset always yields a positive value
-    // (~764px), so this is defensive, not load-bearing.
-    const tileHeight = Math.max(0, tileBottom - tileTop);
-    for (let i = 0; i < 3; i += 1) {
-      const tx = ax + rail + tileMargin + i * (tileWidth + tileMargin);
-      b.rect({
-        x: tx,
-        y: tileTop,
-        w: tileWidth,
-        h: tileHeight,
-        fill: solidFill(BRAND_PALETTE.cream),
-        name: `Content tile ${i + 1}`,
+
+    // Rail navigation. The first row is the active route (subtle
+    // white wash behind it); the rest are muted.
+    const navItems: ReadonlyArray<string> = [
+      "Dashboard",
+      "Projects",
+      "Templates",
+      "Assets",
+      "Reports",
+    ];
+    const navTop = ay + 96;
+    const navStride = 50;
+    for (let i = 0; i < navItems.length; i += 1) {
+      const label = navItems[i] ?? "";
+      const rowY = navTop + i * navStride;
+      const active = i === 0;
+      if (active) {
+        b.rect({
+          x: ax + 14,
+          y: rowY - 4,
+          w: Math.max(0, rail - 28),
+          h: 40,
+          fill: solidFill(UI_THEME.surface, 0.16),
+          name: "Nav highlight",
+        });
+      }
+      b.ellipse({
+        cx: ax + 34,
+        cy: rowY + 16,
+        rx: 8,
+        ry: 8,
+        fill: solidFill(UI_THEME.surface, active ? 0.95 : 0.5),
+        name: `Nav icon ${i + 1}`,
       });
       b.text({
-        x: tx + 24,
-        y: tileTop + 24,
-        body: `Section ${i + 1}`,
-        size: 22,
-        fill: solidFill(BRAND_PALETTE.ink),
-        name: `Tile heading ${i + 1}`,
+        x: ax + 58,
+        y: rowY + 6,
+        body: label,
+        size: 17,
+        fill: solidFill(UI_THEME.surface, active ? 1 : 0.66),
+        name: `Nav label ${i + 1}`,
       });
     }
+
+    // Rail user chip pinned to the bottom.
+    const chipY = ay + fullH - 70;
+    b.ellipse({
+      cx: ax + 34,
+      cy: chipY + 16,
+      rx: 15,
+      ry: 15,
+      fill: solidFill(UI_THEME.emerald),
+      name: "Rail avatar",
+    });
+    b.text({
+      x: ax + 58,
+      y: chipY + 4,
+      body: "Ada Lovelace",
+      size: 15,
+      fill: solidFill(UI_THEME.surface),
+      name: "Rail user",
+    });
+    b.text({
+      x: ax + 58,
+      y: chipY + 24,
+      body: "Product designer",
+      size: 12,
+      fill: solidFill(UI_THEME.surface, 0.6),
+      name: "Rail user role",
+    });
+
+    // Top bar across the content area.
+    b.rect({
+      x: contentX,
+      y: ay,
+      w: contentW,
+      h: headerH,
+      fill: solidFill(UI_THEME.surface),
+      name: "Header",
+    });
+    b.line({
+      x1: contentX,
+      y1: ay + headerH,
+      x2: ax + aw,
+      y2: ay + headerH,
+      fill: solidFill(UI_THEME.hairline),
+      name: "Header divider",
+    });
+    b.text({
+      x: contentX + pad,
+      y: ay + Math.round(headerH * 0.26),
+      body: "Dashboard",
+      size: 28,
+      fill: solidFill(UI_THEME.ink),
+      name: "Header title",
+    });
+    b.text({
+      x: contentX + pad,
+      y: ay + Math.round(headerH * 0.26) + 34,
+      body: "Welcome back, Ada — here's this week at a glance",
+      size: 14,
+      fill: solidFill(UI_THEME.muted),
+      name: "Header subtitle",
+    });
+
+    // Primary action + search field on the right of the top bar.
+    const btnW = 150;
+    const btnH = 42;
+    const ctrlY = ay + Math.max(0, Math.round((headerH - btnH) / 2));
+    const btnX = ax + aw - pad - btnW;
+    b.rect({
+      x: btnX,
+      y: ctrlY,
+      w: btnW,
+      h: btnH,
+      fill: linearFill(
+        [stop(0, UI_THEME.brand), stop(1, UI_THEME.brandBright)],
+        { x: 0, y: 0 },
+        { x: 1, y: 1 },
+      ),
+      name: "Primary button",
+    });
+    b.text({
+      x: btnX + 22,
+      y: ctrlY + 12,
+      body: "+ New project",
+      size: 15,
+      fill: solidFill(UI_THEME.surface),
+      name: "Primary button label",
+    });
+    const searchW = clamp(contentW - pad * 2 - btnW - 360, 160, 320);
+    const searchX = btnX - 20 - searchW;
+    b.rect({
+      x: searchX,
+      y: ctrlY,
+      w: searchW,
+      h: btnH,
+      fill: solidFill(UI_THEME.canvas),
+      name: "Search field",
+    });
+    b.ellipse({
+      cx: searchX + 22,
+      cy: ctrlY + 18,
+      rx: 6,
+      ry: 6,
+      fill: solidFill(UI_THEME.muted),
+      name: "Search glyph",
+    });
+    b.line({
+      x1: searchX + 26,
+      y1: ctrlY + 22,
+      x2: searchX + 32,
+      y2: ctrlY + 28,
+      fill: solidFill(UI_THEME.muted),
+      name: "Search glyph handle",
+    });
+    b.text({
+      x: searchX + 40,
+      y: ctrlY + 13,
+      body: "Search projects…",
+      size: 14,
+      fill: solidFill(UI_THEME.muted),
+      name: "Search placeholder",
+    });
+
+    // KPI metric cards. The three "Content tile" rects are the
+    // pinned named nodes; each gets a top accent strip, a label
+    // ("Tile heading"), a big value, a delta chip, and a sparkline.
+    // `Math.max(0, …)` on width/height so a degenerate artboard
+    // never yields a negative rect (the clamp the APP_UI tile test
+    // pins). Mirrors the DECK `colHeight` clamp.
+    const metrics: ReadonlyArray<{
+      label: string;
+      value: string;
+      delta: string;
+      positive: boolean;
+      accent: string;
+      spark: ReadonlyArray<number>;
+    }> = [
+      {
+        label: "MONTHLY REVENUE",
+        value: "$48,250",
+        delta: "+12.4%",
+        positive: true,
+        accent: UI_THEME.brand,
+        spark: [0.35, 0.5, 0.42, 0.62, 0.55, 0.78, 0.9],
+      },
+      {
+        label: "ACTIVE USERS",
+        value: "12,840",
+        delta: "+4.1%",
+        positive: true,
+        accent: UI_THEME.sky,
+        spark: [0.5, 0.45, 0.6, 0.58, 0.72, 0.68, 0.82],
+      },
+      {
+        label: "CONVERSION",
+        value: "3.8%",
+        delta: "-0.6%",
+        positive: false,
+        accent: UI_THEME.violet,
+        spark: [0.7, 0.66, 0.72, 0.6, 0.64, 0.55, 0.5],
+      },
+    ];
+    const cardsTop = ay + headerH + 28;
+    const cardGap = 24;
+    const cardH = clamp(Math.floor(ah * 0.155), 0, 150);
+    const cardW = Math.max(
+      0,
+      Math.floor((contentW - pad * 2 - cardGap * 2) / 3),
+    );
+    for (let i = 0; i < metrics.length; i += 1) {
+      const m = metrics[i];
+      if (!m) continue;
+      const cardX = contentX + pad + i * (cardW + cardGap);
+      b.rect({
+        x: cardX,
+        y: cardsTop,
+        w: cardW,
+        h: cardH,
+        fill: solidFill(UI_THEME.surface),
+        name: `Content tile ${i + 1}`,
+      });
+      b.rect({
+        x: cardX,
+        y: cardsTop,
+        w: cardW,
+        h: 4,
+        fill: solidFill(m.accent),
+        name: `Card accent ${i + 1}`,
+      });
+      b.text({
+        x: cardX + 22,
+        y: cardsTop + 22,
+        body: m.label,
+        size: 13,
+        fill: solidFill(UI_THEME.muted),
+        name: `Tile heading ${i + 1}`,
+      });
+      b.text({
+        x: cardX + 22,
+        y: cardsTop + 48,
+        body: m.value,
+        size: 36,
+        fill: solidFill(UI_THEME.ink),
+        name: `Metric value ${i + 1}`,
+      });
+      const deltaColor = m.positive ? UI_THEME.emerald : UI_THEME.rose;
+      b.rect({
+        x: cardX + 22,
+        y: cardsTop + 102,
+        w: 78,
+        h: 26,
+        fill: solidFill(deltaColor, 0.14),
+        name: `Delta chip ${i + 1}`,
+      });
+      b.text({
+        x: cardX + 32,
+        y: cardsTop + 107,
+        body: m.delta,
+        size: 13,
+        fill: solidFill(deltaColor),
+        name: `Delta ${i + 1}`,
+      });
+      // Sparkline: connect the normalised series into an upward
+      // trend with line segments coloured by the card accent.
+      const sparkW = Math.max(0, Math.min(120, cardW - 150));
+      const sparkX0 = cardX + cardW - 22 - sparkW;
+      const sparkBottom = cardsTop + cardH - 22;
+      const sparkH = Math.max(0, Math.min(48, cardH - 60));
+      for (let s = 0; s < m.spark.length - 1; s += 1) {
+        const d0 = m.spark[s] ?? 0;
+        const d1 = m.spark[s + 1] ?? 0;
+        const step = m.spark.length > 1 ? sparkW / (m.spark.length - 1) : 0;
+        b.line({
+          x1: sparkX0 + step * s,
+          y1: sparkBottom - sparkH * d0,
+          x2: sparkX0 + step * (s + 1),
+          y2: sparkBottom - sparkH * d1,
+          fill: solidFill(m.accent),
+          name: `Sparkline ${i + 1}-${s + 1}`,
+        });
+      }
+    }
+
+    // Lower row: revenue chart card + recent-activity card.
+    const lowerTop = cardsTop + cardH + 28;
+    const lowerBottom = ay + fullH - pad;
+    const lowerH = Math.max(0, lowerBottom - lowerTop);
+    const chartW = Math.max(
+      0,
+      Math.floor((contentW - pad * 2 - cardGap) * 0.62),
+    );
+    const listW = Math.max(0, contentW - pad * 2 - cardGap - chartW);
+    const chartX = contentX + pad;
+    const listX = chartX + chartW + cardGap;
+
+    b.rect({
+      x: chartX,
+      y: lowerTop,
+      w: chartW,
+      h: lowerH,
+      fill: solidFill(UI_THEME.surface),
+      name: "Chart card",
+    });
+    b.text({
+      x: chartX + 28,
+      y: lowerTop + 24,
+      body: "Revenue over time",
+      size: 18,
+      fill: solidFill(UI_THEME.ink),
+      name: "Chart title",
+    });
+    b.text({
+      x: chartX + 28,
+      y: lowerTop + 50,
+      body: "Last 12 weeks · USD",
+      size: 13,
+      fill: solidFill(UI_THEME.muted),
+      name: "Chart subtitle",
+    });
+    const chartSeries: ReadonlyArray<number> = [
+      0.32, 0.45, 0.38, 0.52, 0.6, 0.48, 0.66, 0.72, 0.64, 0.8, 0.74, 0.92,
+    ];
+    const plotX0 = chartX + 28;
+    const plotRight = chartX + chartW - 28;
+    const plotW = Math.max(0, plotRight - plotX0);
+    const plotBottom = lowerTop + lowerH - 44;
+    const plotTop = lowerTop + 92;
+    const plotH = Math.max(0, plotBottom - plotTop);
+    const barGap = 14;
+    const barW = Math.max(
+      0,
+      Math.floor((plotW - barGap * (chartSeries.length - 1)) / chartSeries.length),
+    );
+    b.line({
+      x1: plotX0,
+      y1: plotBottom,
+      x2: plotRight,
+      y2: plotBottom,
+      fill: solidFill(UI_THEME.hairline),
+      name: "Chart axis",
+    });
+    for (let i = 0; i < chartSeries.length; i += 1) {
+      const d = chartSeries[i] ?? 0;
+      const barH = Math.max(2, Math.round(plotH * d));
+      b.rect({
+        x: plotX0 + i * (barW + barGap),
+        y: plotBottom - barH,
+        w: barW,
+        h: barH,
+        fill: linearFill(
+          [stop(0, UI_THEME.brandBright), stop(1, UI_THEME.brand)],
+          { x: 0, y: 0 },
+          { x: 0, y: 1 },
+        ),
+        name: `Chart bar ${i + 1}`,
+      });
+    }
+
+    b.rect({
+      x: listX,
+      y: lowerTop,
+      w: listW,
+      h: lowerH,
+      fill: solidFill(UI_THEME.surface),
+      name: "Activity card",
+    });
+    b.text({
+      x: listX + 24,
+      y: lowerTop + 24,
+      body: "Recent activity",
+      size: 18,
+      fill: solidFill(UI_THEME.ink),
+      name: "Activity title",
+    });
+    const activity: ReadonlyArray<{ who: string; what: string; tint: string }> =
+      [
+        { who: "Maya Chen", what: "shipped the onboarding flow", tint: UI_THEME.brand },
+        { who: "Devin", what: "generated 6 deck variants", tint: UI_THEME.emerald },
+        { who: "Liam Ortiz", what: "commented on Pricing v3", tint: UI_THEME.amber },
+        { who: "Priya N.", what: "exported the brand kit", tint: UI_THEME.sky },
+        { who: "Sam Park", what: "restyled the report theme", tint: UI_THEME.violet },
+      ];
+    const rowTop0 = lowerTop + 60;
+    const rowStride = clamp(
+      Math.floor((lowerH - 76) / activity.length),
+      0,
+      96,
+    );
+    for (let j = 0; j < activity.length; j += 1) {
+      const row = activity[j];
+      if (!row) continue;
+      const rowY = rowTop0 + j * rowStride;
+      b.ellipse({
+        cx: listX + 40,
+        cy: rowY + 16,
+        rx: 16,
+        ry: 16,
+        fill: solidFill(row.tint),
+        name: `Activity avatar ${j + 1}`,
+      });
+      b.text({
+        x: listX + 68,
+        y: rowY + 4,
+        body: row.who,
+        size: 15,
+        fill: solidFill(UI_THEME.ink),
+        name: `Activity who ${j + 1}`,
+      });
+      b.text({
+        x: listX + 68,
+        y: rowY + 26,
+        body: row.what,
+        size: 13,
+        fill: solidFill(UI_THEME.muted),
+        name: `Activity what ${j + 1}`,
+      });
+      if (j < activity.length - 1) {
+        b.line({
+          x1: listX + 24,
+          y1: rowY + rowStride - 8,
+          x2: listX + listW - 24,
+          y2: rowY + rowStride - 8,
+          fill: solidFill(UI_THEME.hairline),
+          name: `Activity divider ${j + 1}`,
+        });
+      }
+    }
+
     await b.flush();
   },
 };
@@ -597,14 +1202,20 @@ const PHOTO_RESOLVER: TemplateResolver = {
   async apply(ctx) {
     const b = makeBatch();
     const { x: ax, y: ay, width: aw, height: ah } = ctx;
-    // Checkerboard-style background hint so the user can tell
-    // we're inside the artboard before they drop a photo in.
+    // Soft radial wash so the surround reads as an intentional studio
+    // backdrop rather than a flat fill. The PHOTO test pins only the
+    // backdrop's width/height (full-bleed), not its fill, so a radial
+    // gradient is free to use here.
     b.rect({
       x: ax,
       y: ay,
       w: Math.max(0, Math.floor(aw)),
       h: Math.max(0, Math.floor(ah)),
-      fill: solidFill(BRAND_PALETTE.cream),
+      fill: radialFill(
+        [stop(0, BRAND_PALETTE.cream), stop(1, "#EFE6CC")],
+        { x: 0.5, y: 0.42 },
+        0.75,
+      ),
       name: "Photo backdrop",
     });
     // Margin is taken off the SHORT side so the inner drop-zone
@@ -649,6 +1260,37 @@ const PHOTO_RESOLVER: TemplateResolver = {
       fill: solidFill(BRAND_PALETTE.ink),
       name: "Drop zone hint",
     });
+    // L-shaped crop marks at each corner of the drop zone so the
+    // surface reads like a photographer's framing guide. Drawn as
+    // burnt-orange line pairs; lines are decorative chrome and are
+    // skipped by the inside-artboard assertion.
+    const markLen = Math.max(8, Math.round(innerSize * 0.06));
+    const corners: ReadonlyArray<{ cx: number; cy: number; sx: number; sy: number }> = [
+      { cx: innerX, cy: innerY, sx: 1, sy: 1 },
+      { cx: innerX + innerSize, cy: innerY, sx: -1, sy: 1 },
+      { cx: innerX, cy: innerY + innerSize, sx: 1, sy: -1 },
+      { cx: innerX + innerSize, cy: innerY + innerSize, sx: -1, sy: -1 },
+    ];
+    for (let i = 0; i < corners.length; i += 1) {
+      const c = corners[i];
+      if (!c) continue;
+      b.line({
+        x1: c.cx,
+        y1: c.cy,
+        x2: c.cx + c.sx * markLen,
+        y2: c.cy,
+        fill: solidFill(BRAND_PALETTE.burntOrange),
+        name: `Crop mark ${i + 1}H`,
+      });
+      b.line({
+        x1: c.cx,
+        y1: c.cy,
+        x2: c.cx,
+        y2: c.cy + c.sy * markLen,
+        fill: solidFill(BRAND_PALETTE.burntOrange),
+        name: `Crop mark ${i + 1}V`,
+      });
+    }
     await b.flush();
   },
 };
@@ -657,76 +1299,184 @@ const DECK_RESOLVER: TemplateResolver = {
   async apply(ctx) {
     const b = makeBatch();
     const { x: ax, y: ay, width: aw, height: ah } = ctx;
+    const fullW = Math.max(0, Math.floor(aw));
+    const fullH = Math.max(0, Math.floor(ah));
+    const margin = Math.round(aw * 0.06);
+
+    // Title slide: a soft radial-lit canvas, a bold brand accent edge,
+    // an eyebrow → headline → subtitle hierarchy, an accent rule, two
+    // feature cards, and a footer with page number + wordmark.
     b.rect({
       x: ax,
       y: ay,
-      w: Math.max(0, Math.floor(aw)),
-      h: Math.max(0, Math.floor(ah)),
-      fill: solidFill(BRAND_PALETTE.paper),
+      w: fullW,
+      h: fullH,
+      fill: radialFill(
+        [stop(0, UI_THEME.surface), stop(1, UI_THEME.canvas)],
+        { x: 0.28, y: 0.22 },
+        0.95,
+      ),
       name: "Slide background",
     });
-    const margin = Math.round(aw * 0.06);
-    // Title block.
+    // Bold brand accent edge down the left.
+    b.rect({
+      x: ax,
+      y: ay,
+      w: Math.max(0, Math.round(aw * 0.016)),
+      h: fullH,
+      fill: linearFill(
+        [stop(0, UI_THEME.brandBright), stop(1, UI_THEME.brandDark)],
+        { x: 0, y: 0 },
+        { x: 0, y: 1 },
+      ),
+      name: "Accent edge",
+    });
+
+    // Title block hierarchy (eyebrow / headline / subtitle).
+    const titleSize = clamp(Math.round(ah * 0.085), 24, 96);
+    const subSize = clamp(Math.round(ah * 0.032), 12, 34);
+    const eyebrowY = ay + Math.round(ah * 0.15);
+    const titleY = ay + Math.round(ah * 0.21);
+    const subtitleY = titleY + titleSize + Math.round(ah * 0.02);
     b.text({
       x: ax + margin,
-      y: ay + margin,
-      body: "Pitch Deck Title",
-      size: 80,
-      fill: solidFill(BRAND_PALETTE.ink),
+      y: eyebrowY,
+      body: "PRODUCT STRATEGY · 2026",
+      size: clamp(Math.round(ah * 0.026), 10, 22),
+      fill: solidFill(UI_THEME.brand),
+      name: "Eyebrow",
+    });
+    b.text({
+      x: ax + margin,
+      y: titleY,
+      body: "The next chapter of Northwind",
+      size: titleSize,
+      fill: solidFill(UI_THEME.ink),
       name: "Slide title",
     });
     b.text({
       x: ax + margin,
-      y: ay + margin + 110,
-      body: "Subtitle or short positioning line",
-      size: 32,
-      fill: solidFill(BRAND_PALETTE.espresso),
+      y: subtitleY,
+      body: "A product vision for ambient, on-device design",
+      size: subSize,
+      fill: solidFill(UI_THEME.inkSoft),
       name: "Subtitle",
     });
-    // Two-column body for talking points. `colTop` already includes
-    // the artboard Y-offset (`ay`), so the closing edge of the
-    // column also has to include `ay` — otherwise a non-zero
-    // artboard origin (the bridge offsets every artboard after the
-    // first) yields a negative height. Mirrors the shape used by
-    // `APP_UI_RESOLVER` (`tileBottom = ay + ah - tileMargin`,
-    // `tileHeight = tileBottom - tileTop`).
-    //
-    // The 220px title-block reserve fits a 1920×1080 slide (the
-    // shipped deck preset, ~20% of `ah`). Clamping it to at most
-    // 30% of `ah` keeps the columns visible if this resolver is
-    // ever applied to a smaller custom artboard surface — without
-    // that bound a 300px-tall artboard would have a negative
-    // `colHeight` and the two background rects would silently
-    // collapse to zero-size nodes.
-    const titleReserve = Math.min(220, Math.round(ah * 0.3));
-    const colTop = ay + margin + titleReserve;
-    const colHeight = Math.max(0, ay + ah - colTop - margin);
-    // `Math.floor` (not `Math.round`) so the two-column budget is
-    // never over-allocated: `2 * colWidth + 3 * margin <= aw`. With
-    // `Math.round` an odd `(aw - 3*margin)` rounds the half up, e.g.
-    // on 1920×1080: `margin=115`, `(aw - 3*margin)=1575`, `1575/2 ⇒
-    // 788` (round) vs `787` (floor). 2*788 + 3*115 = 1921 > 1920;
-    // 2*787 + 3*115 = 1919 < 1920. Visually invisible because the
-    // overflow is one sub-pixel on the right margin, but the floor
-    // gives a clean invariant any future caller (e.g. someone adding
-    // a third column with `n * colWidth + (n+1) * margin <= aw`) can
-    // rely on without re-deriving the rounding behaviour.
-    const colWidth = Math.floor((aw - margin * 3) / 2);
-    b.rect({
-      x: ax + margin,
-      y: colTop,
-      w: colWidth,
-      h: colHeight,
-      fill: solidFill(BRAND_PALETTE.cream),
-      name: "Column A",
+    b.line({
+      x1: ax + margin,
+      y1: subtitleY + subSize + Math.round(ah * 0.02),
+      x2: ax + margin + Math.round(aw * 0.16),
+      y2: subtitleY + subSize + Math.round(ah * 0.02),
+      fill: solidFill(UI_THEME.brand),
+      name: "Title rule",
     });
-    b.rect({
-      x: ax + margin * 2 + colWidth,
-      y: colTop,
-      w: colWidth,
-      h: colHeight,
-      fill: solidFill(BRAND_PALETTE.cream),
-      name: "Column B",
+
+    // Two feature cards. `colTop`/`colHeight` already include the
+    // artboard Y-offset (`ay`), so the closing edge also includes
+    // `ay` — otherwise a non-zero artboard origin (the bridge offsets
+    // every artboard after the first) yields a negative height.
+    // `Math.max(0, …)` clamps `colHeight` so a short custom artboard
+    // never collapses the cards to negative-size nodes (the DECK
+    // 800×450 + Y-offset tests pin this).
+    const footerH = Math.round(ah * 0.09);
+    const colTop = ay + Math.round(ah * 0.46);
+    const colBottom = ay + fullH - footerH;
+    const colHeight = Math.max(0, colBottom - colTop);
+    // `Math.floor` (not `Math.round`) so the two-column budget is
+    // never over-allocated: `2 * colWidth + 3 * margin <= aw`.
+    const colWidth = Math.floor((aw - margin * 3) / 2);
+    const cards: ReadonlyArray<{
+      name: "Column A" | "Column B";
+      accent: string;
+      heading: string;
+      body: string;
+    }> = [
+      {
+        name: "Column A",
+        accent: UI_THEME.brand,
+        heading: "On-device intelligence",
+        body: "Generate, restyle and resize without a round-trip to the cloud.",
+      },
+      {
+        name: "Column B",
+        accent: UI_THEME.emerald,
+        heading: "Print-ready precision",
+        body: "Vector accuracy and CMYK preflight built into every export.",
+      },
+    ];
+    const headingSize = clamp(Math.round(ah * 0.034), 12, 34);
+    const bodySize = clamp(Math.round(ah * 0.024), 10, 24);
+    const stripH = Math.max(0, Math.round(ah * 0.012));
+    for (let i = 0; i < cards.length; i += 1) {
+      const card = cards[i];
+      if (!card) continue;
+      const cardX = ax + margin + i * (colWidth + margin);
+      b.rect({
+        x: cardX,
+        y: colTop,
+        w: colWidth,
+        h: colHeight,
+        fill: solidFill(UI_THEME.surface),
+        name: card.name,
+      });
+      b.rect({
+        x: cardX,
+        y: colTop,
+        w: colWidth,
+        h: stripH,
+        fill: solidFill(card.accent),
+        name: `${card.name} accent`,
+      });
+      b.ellipse({
+        cx: cardX + Math.round(aw * 0.03),
+        cy: colTop + Math.round(ah * 0.085),
+        rx: Math.max(2, Math.round(ah * 0.022)),
+        ry: Math.max(2, Math.round(ah * 0.022)),
+        fill: solidFill(card.accent, 0.18),
+        name: `${card.name} icon`,
+      });
+      b.text({
+        x: cardX + Math.round(aw * 0.022),
+        y: colTop + Math.round(ah * 0.14),
+        body: card.heading,
+        size: headingSize,
+        fill: solidFill(UI_THEME.ink),
+        name: `${card.name} heading`,
+      });
+      b.text({
+        x: cardX + Math.round(aw * 0.022),
+        y: colTop + Math.round(ah * 0.14) + headingSize + Math.round(ah * 0.02),
+        body: card.body,
+        size: bodySize,
+        fill: solidFill(UI_THEME.inkSoft),
+        name: `${card.name} body`,
+      });
+    }
+
+    // Footer: hairline rule + page marker + wordmark.
+    b.line({
+      x1: ax + margin,
+      y1: ay + fullH - footerH,
+      x2: ax + fullW - margin,
+      y2: ay + fullH - footerH,
+      fill: solidFill(UI_THEME.hairline),
+      name: "Footer rule",
+    });
+    b.text({
+      x: ax + margin,
+      y: ay + fullH - Math.round(footerH * 0.6),
+      body: "01 / 12",
+      size: clamp(Math.round(ah * 0.022), 9, 20),
+      fill: solidFill(UI_THEME.muted),
+      name: "Page number",
+    });
+    b.text({
+      x: ax + fullW - margin - Math.round(aw * 0.12),
+      y: ay + fullH - Math.round(footerH * 0.6),
+      body: "Northwind",
+      size: clamp(Math.round(ah * 0.022), 9, 20),
+      fill: solidFill(UI_THEME.inkSoft),
+      name: "Footer wordmark",
     });
     await b.flush();
   },

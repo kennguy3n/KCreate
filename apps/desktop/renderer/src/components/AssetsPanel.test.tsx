@@ -12,9 +12,11 @@
 //     category slug and sections by finer sub-group;
 //   * clicking a thumbnail fires `onInsert(assetId)`;
 //   * dragging a thumbnail writes the asset id onto the dataTransfer
-//     under `ASSET_DRAG_MIME` (the canvas drop contract);
-//   * inserting records a "Recently used" row persisted to
-//     `localStorage`;
+//     under `ASSET_DRAG_MIME` (the canvas drop contract) but does NOT
+//     record — a cancelled drag must leave no phantom recently-used
+//     entry; recording is the host's job on a successful insert;
+//   * the "Recently used" row reflects the shared `recentElements`
+//     store (persisted to `localStorage`), which the panel only reads;
 //   * the grid is windowed — a large catalog only mounts the rows in
 //     view, not all of them.
 //
@@ -27,6 +29,9 @@ import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import type { AssetCategoryInfo, AssetSummary } from "../../../shared/scene";
 import { kcreateStub } from "../../tests/helpers/kcreateStub";
 import { AssetsPanel, ASSET_DRAG_MIME } from "./AssetsPanel";
+import { recordRecentElement } from "../lib/recentElements";
+
+const RECENT_KEY = "kcreate.elements.recent.v1";
 
 const CATS: AssetCategoryInfo[] = [
   { slug: "shapes", label: "Shapes", count: 2 },
@@ -178,7 +183,7 @@ describe("AssetsPanel", () => {
     expect(inserted).toEqual(["circle"]);
   });
 
-  it("writes the asset id onto the dataTransfer on drag start", async () => {
+  it("writes the asset id onto the dataTransfer on drag start without recording", async () => {
     render(<AssetsPanel onInsert={noop} />);
     const circle = await screen.findByRole("button", { name: "Insert Circle" });
     const data: Record<string, string> = {};
@@ -191,29 +196,44 @@ describe("AssetsPanel", () => {
     fireEvent.dragStart(circle, { dataTransfer });
     expect(data[ASSET_DRAG_MIME]).toBe("circle");
     expect(dataTransfer.effectAllowed).toBe("copy");
+    // A drag-start is NOT an insert: a cancelled drag (released off the
+    // canvas) must leave no recently-used entry. Recording is the
+    // host's job, only once a drop actually inserts.
+    expect(window.localStorage.getItem(RECENT_KEY)).toBeNull();
+    expect(screen.queryByText("Recently used")).toBeNull();
   });
 
-  it("records inserted assets in a Recently used row persisted to localStorage", async () => {
-    const { unmount } = render(<AssetsPanel onInsert={noop} />);
+  it("does not record into Recently used when a thumbnail is merely clicked", async () => {
+    // The panel delegates the insert to `onInsert`; the host records
+    // the recently-used entry only after the insert succeeds. So a
+    // click alone (panel-side) must not touch the store.
+    render(<AssetsPanel onInsert={noop} />);
     const square = await screen.findByRole("button", { name: "Insert Square" });
     fireEvent.click(square);
+    expect(window.localStorage.getItem(RECENT_KEY)).toBeNull();
+    expect(screen.queryByText("Recently used")).toBeNull();
+  });
+
+  it("reflects the shared recentElements store in a Recently used row", async () => {
+    // Simulate the host recording a successful insert.
+    recordRecentElement("square");
+    const { unmount } = render(<AssetsPanel onInsert={noop} />);
 
     // The recently-used section header appears…
-    const recent = await screen.findByText("Recently used");
-    expect(recent).toBeInTheDocument();
-    // …and the click persisted the id, most-recent-first.
-    expect(JSON.parse(window.localStorage.getItem("kcreate.elements.recent.v1") ?? "[]")).toEqual([
+    expect(await screen.findByText("Recently used")).toBeInTheDocument();
+    // …backed by the persisted, most-recent-first id list.
+    expect(JSON.parse(window.localStorage.getItem(RECENT_KEY) ?? "[]")).toEqual([
       "square",
     ]);
-
-    // It survives a remount (the panel re-reads localStorage on mount).
-    unmount();
-    render(<AssetsPanel onInsert={noop} />);
-    expect(await screen.findByText("Recently used")).toBeInTheDocument();
-    // "Square" now appears twice: once in Recently used, once in Shapes.
+    // "Square" appears twice: once in Recently used, once in Shapes.
     await waitFor(() => {
       expect(screen.getAllByRole("button", { name: "Insert Square" }).length).toBe(2);
     });
+
+    // It survives a remount (the panel re-reads the store on mount).
+    unmount();
+    render(<AssetsPanel onInsert={noop} />);
+    expect(await screen.findByText("Recently used")).toBeInTheDocument();
   });
 
   it("windows a large catalog instead of mounting every thumbnail", async () => {

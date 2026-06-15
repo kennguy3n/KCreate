@@ -23,6 +23,7 @@ import { InlineTextEditor } from "../components/InlineTextEditor";
 import { CursorOverlay } from "../components/CursorOverlay";
 import { LeftPanel } from "../components/LeftPanel";
 import { ASSET_DRAG_MIME } from "../components/AssetsPanel";
+import { recordRecentElement } from "../lib/recentElements";
 import { PageNavigator } from "../components/PageNavigator";
 import { PathfinderPanel } from "../components/PathfinderPanel";
 import { PenOverlay } from "../components/PenOverlay";
@@ -1247,6 +1248,10 @@ function EditorPageInner({
         await window.kcreate.canvas.setSelection([result.groupId]);
         setSelectedIds([result.groupId]);
         await refreshTree();
+        // Record the recently-used asset only now that the insert has
+        // actually landed — covers both the click and drop paths from
+        // a single place, so a cancelled drag never records.
+        recordRecentElement(assetId);
         setStatusMessage(`Inserted ${result.name}`);
       } catch (e) {
         setStatusMessage(`insert element failed: ${errorMessage(e)}`);

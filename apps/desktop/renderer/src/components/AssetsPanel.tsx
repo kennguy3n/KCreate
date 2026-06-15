@@ -23,21 +23,28 @@
 //   * the grid is **windowed** — only the rows intersecting the
 //     viewport (plus a small overscan) are mounted, so 400+ thumbnails
 //     stay smooth;
-//   * a **"Recently used"** row leads the grid while browsing,
-//     persisted to `localStorage` so it survives reloads.
+//   * a **"Recently used"** row leads the grid while browsing, sourced
+//     from the shared `recentElements` store (persisted to
+//     `localStorage`) so it survives reloads. The panel only *reads*
+//     that store — recording happens in the host on a successful
+//     insert, so a cancelled drag never leaves a phantom entry.
 
 import {
-  useCallback,
   useEffect,
   useLayoutEffect,
   useMemo,
   useRef,
   useState,
+  useSyncExternalStore,
 } from "react";
 
 import type { AssetCategoryInfo, AssetSummary } from "../../../shared/scene";
 import { colors, radius, spacing } from "../styles/tokens";
 import { errorMessage } from "../lib/errorMessage";
+import {
+  getRecentElementIds,
+  subscribeRecentElements,
+} from "../lib/recentElements";
 
 /// Drag payload key carrying an asset id from a thumbnail to the
 /// canvas drop zone (`EditorPage.handleCanvasDrop`). A custom
@@ -54,11 +61,6 @@ const ALL_TAB = "__all__";
 // over IPC) so this is cheap, but debouncing avoids a burst of
 // list/search round-trips while the user is mid-keystroke.
 const SEARCH_DEBOUNCE_MS = 100;
-
-// `localStorage` key + cap for the "recently used" row. Versioned so a
-// future shape change can be migrated rather than mis-parsed.
-const RECENT_KEY = "kcreate.elements.recent.v1";
-const RECENT_MAX = 12;
 
 // Grid geometry. The grid is virtualised over fixed-height rows: thumb
 // rows pack `GRID_COLS` assets, section headers get their own row.
@@ -94,23 +96,6 @@ type GridRow =
   | { kind: "header"; key: string; label: string; count: number }
   | { kind: "thumbs"; key: string; sectionKey: string; assets: AssetSummary[] };
 
-/// Read the persisted recently-used id list. Tolerant of a missing /
-/// malformed entry (returns `[]`) so a corrupt value can never crash
-/// the panel.
-function readRecentIds(): string[] {
-  try {
-    const raw = window.localStorage.getItem(RECENT_KEY);
-    if (raw === null) return [];
-    const parsed: unknown = JSON.parse(raw);
-    if (!Array.isArray(parsed)) return [];
-    return parsed
-      .filter((x): x is string => typeof x === "string")
-      .slice(0, RECENT_MAX);
-  } catch {
-    return [];
-  }
-}
-
 export interface AssetsPanelProps {
   /// Insert the asset onto the canvas at a host-chosen position
   /// (viewport centre for clicks). Wired by `EditorPage` to
@@ -143,7 +128,13 @@ export function AssetsPanel({
   const [catalogById, setCatalogById] = useState<Map<string, AssetSummary>>(
     () => new Map(),
   );
-  const [recentIds, setRecentIds] = useState<string[]>(() => readRecentIds());
+  // Recently-used ids come from the shared store (written by the host
+  // on a successful insert). Subscribing here keeps the row live as
+  // the user inserts, including drops handled outside this component.
+  const recentIds = useSyncExternalStore(
+    subscribeRecentElements,
+    getRecentElementIds,
+  );
 
   // Stable ref to the status callback so the data-loading effects
   // don't re-fire when the host passes a fresh closure each render.
@@ -227,30 +218,6 @@ export function AssetsPanel({
       clearTimeout(timer);
     };
   }, [active, query]);
-
-  // Record an inserted asset at the head of the recently-used list and
-  // persist it. Called for both click-insert and drag-insert so the
-  // row reflects every way the user pulls an element onto the canvas.
-  const recordRecent = useCallback((id: string) => {
-    setRecentIds((prev) => {
-      const next = [id, ...prev.filter((x) => x !== id)].slice(0, RECENT_MAX);
-      try {
-        window.localStorage.setItem(RECENT_KEY, JSON.stringify(next));
-      } catch {
-        // localStorage unavailable (private mode / quota) — the row
-        // degrades to in-memory only, which is not worth surfacing.
-      }
-      return next;
-    });
-  }, []);
-
-  const handleInsert = useCallback(
-    (id: string) => {
-      recordRecent(id);
-      onInsert(id);
-    },
-    [recordRecent, onInsert],
-  );
 
   const totalCount = useMemo(
     () => categories.reduce((sum, c) => sum + c.count, 0),
@@ -516,8 +483,7 @@ export function AssetsPanel({
                     <AssetThumb
                       key={`${row.sectionKey}:${asset.id}`}
                       asset={asset}
-                      onActivate={handleInsert}
-                      onDragRecord={recordRecent}
+                      onActivate={onInsert}
                     />
                   ))}
                 </div>
@@ -600,11 +566,9 @@ function CategoryChip({
 function AssetThumb({
   asset,
   onActivate,
-  onDragRecord,
 }: {
   asset: AssetSummary;
   onActivate: (assetId: string) => void;
-  onDragRecord: (assetId: string) => void;
 }): JSX.Element {
   const src = useMemo(() => svgDataUrl(asset.svg), [asset.svg]);
   return (
@@ -618,11 +582,11 @@ function AssetThumb({
         // Carry the asset id so the canvas drop zone can insert at
         // the exact drop point. `effectAllowed = "copy"` matches the
         // copy semantics of an insert (the catalog entry is never
-        // consumed). Record it as recently-used too — a drag is an
-        // insert just like a click.
+        // consumed). Recording into "Recently used" happens in the
+        // host once the drop actually inserts — a cancelled drag
+        // (released off-canvas) must not leave a phantom entry.
         e.dataTransfer.setData(ASSET_DRAG_MIME, asset.id);
         e.dataTransfer.effectAllowed = "copy";
-        onDragRecord(asset.id);
       }}
       style={{
         display: "flex",

@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::thread::{self, JoinHandle};
 
@@ -4724,17 +4724,21 @@ pub fn template_thumbnail_cached(
         content.height,
         DEFAULT_THUMBNAIL_MAX_DIM_PX,
     )?;
-    // Best-effort cache write so repeat opens skip the render. Write the
-    // PNG first; only stamp the sidecar once the PNG landed, so we never
-    // record a hash for a thumbnail that isn't actually on disk (which
-    // would otherwise serve a stale/absent PNG as a "hit").
-    if std::fs::write(&thumb_path, &bytes).is_ok() {
+    // Best-effort cache write so repeat opens skip the render. Both the
+    // PNG and its sidecar are published atomically (write a unique temp
+    // sibling, then `rename` it into place), so a concurrent reader — or
+    // a crash mid-write — can never observe a torn/half-written PNG that
+    // would fail the signature check and force a needless re-render. The
+    // PNG is published before the sidecar, so the sidecar only becomes
+    // visible once the thumbnail it stamps is fully on disk (never a
+    // hash recorded for an absent/partial PNG).
+    if atomic_publish(&thumb_path, &bytes).is_ok() {
         let meta = ThumbnailCacheMeta {
             content_hash,
             max_dim_px: DEFAULT_THUMBNAIL_MAX_DIM_PX,
         };
         if let Ok(meta_json) = serde_json::to_vec(&meta) {
-            let _ = std::fs::write(&sidecar_path, meta_json);
+            let _ = atomic_publish(&sidecar_path, &meta_json);
         }
     }
     Ok((
@@ -4745,10 +4749,37 @@ pub fn template_thumbnail_cached(
 
 // -----------------------------------------------------------------------------
 
-#[allow(dead_code)]
-fn _suppress_unused_atomic() {
-    let _ = AtomicBool::new(false);
-    let _ = Ordering::SeqCst;
+/// Process-monotonic counter giving each [`atomic_publish`] call a
+/// unique temp filename, so two thumbnail workers publishing the same
+/// template never collide on the same in-flight temp path.
+static ATOMIC_PUBLISH_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Publish `bytes` to `final_path` atomically: write to a unique sibling
+/// temp file, then `rename` it into place. A same-directory `rename`
+/// replaces the destination in a single step on POSIX and on Windows
+/// (same volume), so a concurrent reader observes either the previous
+/// file or the fully-written new one — never a torn thumbnail. The temp
+/// suffix (pid + a process-monotonic counter) keeps concurrent
+/// publishers of the same template off the same temp path. Best-effort:
+/// any IO error is returned after removing the temp file, so a failed
+/// write leaves no `.tmp` litter behind.
+fn atomic_publish(final_path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut tmp_os = final_path.as_os_str().to_owned();
+    tmp_os.push(format!(
+        ".{}.{}.tmp",
+        std::process::id(),
+        ATOMIC_PUBLISH_SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    let tmp = PathBuf::from(tmp_os);
+    if let Err(e) = std::fs::write(&tmp, bytes) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    if let Err(e) = std::fs::rename(&tmp, final_path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok(())
 }
 
 // -----------------------------------------------------------------------------

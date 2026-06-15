@@ -107,11 +107,26 @@ fn bundled_catalog_seeds_lists_instantiates_and_renders() {
     );
 
     // First bridge call seeds + scans the temp dir.
+    //
+    // Every test in this binary shares ONE process-global marketplace
+    // dir (the bridge keys its singleton off `KCREATE_TEMPLATE_DIR`,
+    // fixed at first access), and the import suites register extra
+    // templates into it. `#[serial]` serialises the tests but does not
+    // pin their order, so assert over the *bundled* id set specifically
+    // rather than the raw total: every bundled template must surface
+    // exactly once (no dropped seed, no duplicate), independent of how
+    // many imported entries a sibling test has also left in the dir.
     let all = template_list(None, None).expect("template_list");
+    let bundled_ids: HashSet<uuid::Uuid> = catalog.iter().map(|t| t.manifest.id).collect();
+    let bundled_listed = all
+        .templates
+        .iter()
+        .filter(|t| bundled_ids.contains(&t.id))
+        .count();
     assert_eq!(
-        all.templates.len(),
+        bundled_listed,
         catalog.len(),
-        "seeding + scan should surface every bundled template"
+        "seeding + scan should surface every bundled template exactly once"
     );
 
     // The seeded `.ktemplate/` folders are physically on disk under
@@ -138,7 +153,12 @@ fn bundled_catalog_seeds_lists_instantiates_and_renders() {
         .count();
     assert!(mobile_expected > 0, "catalog should include mobile UI kits");
     let mobile = template_list(Some(TemplateCategory::MobileApp), None).expect("filter");
-    assert_eq!(mobile.templates.len(), mobile_expected);
+    let mobile_bundled = mobile
+        .templates
+        .iter()
+        .filter(|t| bundled_ids.contains(&t.id))
+        .count();
+    assert_eq!(mobile_bundled, mobile_expected);
     assert!(mobile
         .templates
         .iter()
@@ -453,6 +473,48 @@ fn thumbnail_disk_cache_hits_warm_and_invalidates_on_content_change() {
         ThumbnailCacheOutcome::Hit,
         "cache should be warm + consistent again after restore"
     );
+}
+
+/// The cache write publishes both the PNG and its sidecar via a
+/// write-temp-then-`rename` step (so a concurrent reader can never see a
+/// torn thumbnail). A successful publish must rename its temp file into
+/// place — never leave a `*.tmp` artifact behind in the template dir,
+/// which would otherwise accumulate one stray file per render at scale.
+#[test]
+#[serial]
+fn thumbnail_cache_write_leaves_no_temp_litter() {
+    let root = shared_template_dir();
+    let _ = template_list(None, None).expect("seed");
+
+    let catalog = bundled_templates();
+    let id = catalog[0].manifest.id;
+    let dir = root.join(catalog[0].dir_name);
+    let thumb_path = dir.join("thumbnail.png");
+    let sidecar_path = dir.join("thumbnail.cache.json");
+
+    // Force a cold render so both the PNG and sidecar are published.
+    let _ = fs::remove_file(&thumb_path);
+    let _ = fs::remove_file(&sidecar_path);
+    let (_cold, outcome) = template_thumbnail_cached(id).expect("cold render");
+    assert_eq!(outcome, ThumbnailCacheOutcome::Rendered);
+
+    // After a successful publish the template dir must hold the final
+    // files only — every atomic temp sibling has been renamed away.
+    let leftover: Vec<String> = fs::read_dir(&dir)
+        .expect("read template dir")
+        .filter_map(Result::ok)
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|name| {
+            Path::new(name)
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("tmp"))
+        })
+        .collect();
+    assert!(
+        leftover.is_empty(),
+        "atomic publish must leave no .tmp litter, found: {leftover:?}"
+    );
+    assert!(thumb_path.exists() && sidecar_path.exists());
 }
 
 // ---------------------------------------------------------------------------

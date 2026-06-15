@@ -1793,8 +1793,11 @@ fn apply_generated_design(
                 color: *c,
             })
             .collect();
-        let brand_kit_id = if let Some(kit) =
-            ws.project.brand_kits.iter_mut().find(|k| k.name == kit_name)
+        let brand_kit_id = if let Some(kit) = ws
+            .project
+            .brand_kits
+            .iter_mut()
+            .find(|k| k.name == kit_name)
         {
             kit.colors = colors;
             kit.id

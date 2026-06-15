@@ -519,7 +519,10 @@ mod tests {
             "frame viewBox must be offset to the tile's world origin; got: {svg}"
         );
         // The off-origin content must survive (the bug dropped it).
-        assert!(svg.contains(">Second Slide</text>"), "text lost; got: {svg}");
+        assert!(
+            svg.contains(">Second Slide</text>"),
+            "text lost; got: {svg}"
+        );
         assert!(svg.contains("<path"), "background lost; got: {svg}");
     }
 

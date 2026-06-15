@@ -190,20 +190,20 @@ pub fn theme(id: ThemeId) -> Theme {
             "#8A90AE", "#F4F6FF",
         ),
         ThemeId::Sunrise => (
-            "Sunrise", "#FBF6EF", "#FFFFFF", "#E2603B", "#F2A65A", "#2B2118", "#4F4639",
-            "#9A8F7E", "#2B2118",
+            "Sunrise", "#FBF6EF", "#FFFFFF", "#E2603B", "#F2A65A", "#2B2118", "#4F4639", "#9A8F7E",
+            "#2B2118",
         ),
         ThemeId::Forest => (
-            "Forest", "#FFFFFF", "#F2F7F3", "#1E8E5A", "#0F6E6E", "#10261B", "#3A4A40",
-            "#7E8C84", "#10261B",
+            "Forest", "#FFFFFF", "#F2F7F3", "#1E8E5A", "#0F6E6E", "#10261B", "#3A4A40", "#7E8C84",
+            "#10261B",
         ),
         ThemeId::Ember => (
-            "Ember", "#121212", "#1E1B18", "#FF8A3D", "#FFC857", "#FFF7EE", "#D8CDC2",
-            "#9A8E80", "#FFF7EE",
+            "Ember", "#121212", "#1E1B18", "#FF8A3D", "#FFC857", "#FFF7EE", "#D8CDC2", "#9A8E80",
+            "#FFF7EE",
         ),
         ThemeId::Slate => (
-            "Slate", "#EEF2F7", "#FFFFFF", "#2563EB", "#0EA5E9", "#0F1B2D", "#3C4A60",
-            "#7A879B", "#0F1B2D",
+            "Slate", "#EEF2F7", "#FFFFFF", "#2563EB", "#0EA5E9", "#0F1B2D", "#3C4A60", "#7A879B",
+            "#0F1B2D",
         ),
     };
     Theme {
@@ -810,10 +810,7 @@ fn title_case(s: &str) -> String {
 
 /// Lay out an outline into a fully themed, positioned design.
 #[must_use]
-pub fn generate_design(
-    outline: &DeckOutline,
-    options: ThemedDesignOptions,
-) -> GeneratedDesign {
+pub fn generate_design(outline: &DeckOutline, options: ThemedDesignOptions) -> GeneratedDesign {
     let theme = theme(options.theme_id);
     let scale = TypeScale::for_format(options.format);
     let pages = match options.format {
@@ -866,9 +863,14 @@ fn title_slide(outline: &DeckOutline, theme: &Theme, scale: &TypeScale) -> Gener
     ));
 
     // Title + subtitle stacked, vertically centred via flex.
-    let title_h = line_height(scale.title) * f64::from(wrap_count(&outline.title, scale.title, content.width));
+    let title_h = line_height(scale.title)
+        * f64::from(wrap_count(&outline.title, scale.title, content.width));
     let sub_h = line_height(scale.subheading)
-        * f64::from(wrap_count(&outline.subtitle, scale.subheading, content.width));
+        * f64::from(wrap_count(
+            &outline.subtitle,
+            scale.subheading,
+            content.width,
+        ));
     let id_title = Uuid::new_v4();
     let id_sub = Uuid::new_v4();
     let stack = Bounds::new(
@@ -1105,13 +1107,13 @@ fn layout_one_pager(
     let mut sizes: Vec<(Uuid, f64, f64)> = Vec::new();
 
     let push_block = |role: ElementRole,
-                          content_text: &str,
-                          font_size: f32,
-                          is_bullet: bool,
-                          width: f64,
-                          ids: &mut Vec<Uuid>,
-                          roles: &mut Vec<(ElementRole, String, f32, bool)>,
-                          sizes: &mut Vec<(Uuid, f64, f64)>| {
+                      content_text: &str,
+                      font_size: f32,
+                      is_bullet: bool,
+                      width: f64,
+                      ids: &mut Vec<Uuid>,
+                      roles: &mut Vec<(ElementRole, String, f32, bool)>,
+                      sizes: &mut Vec<(Uuid, f64, f64)>| {
         let id = Uuid::new_v4();
         let lines = wrap_count(content_text, font_size, width);
         ids.push(id);
@@ -1449,7 +1451,8 @@ mod tests {
 
     #[test]
     fn user_points_are_folded_into_bullets() {
-        let brief = "Coffee roaster deck\n- We source single-origin beans\n- Roasted in small batches";
+        let brief =
+            "Coffee roaster deck\n- We source single-origin beans\n- Roasted in small batches";
         let opts = ThemedDesignOptions {
             section_count: Some(3),
             ..Default::default()
@@ -1488,7 +1491,9 @@ mod tests {
                         allowed_colors
                     );
                     assert!(
-                        allowed_sizes.iter().any(|s| (*s - el.font_size).abs() < 0.01),
+                        allowed_sizes
+                            .iter()
+                            .any(|s| (*s - el.font_size).abs() < 0.01),
                         "font size {} not in type scale {:?}",
                         el.font_size,
                         allowed_sizes
@@ -1547,10 +1552,7 @@ mod tests {
                     "element past right edge: {el:?}"
                 );
                 // Text may extend slightly via descenders; allow a row.
-                assert!(
-                    el.y <= page.height + 1.0,
-                    "element below page: {el:?}"
-                );
+                assert!(el.y <= page.height + 1.0, "element below page: {el:?}");
             }
         }
     }

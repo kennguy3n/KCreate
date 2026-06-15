@@ -13,7 +13,9 @@
 //! against the other bridge tests with `serial_test`.
 
 use kcreate_bridge::document::{document_get_tree, project_close, project_create, project_save};
-use kcreate_bridge::phase10::{ai_generate_themed_design, export_pdf_multi, ThemedDesignApplyResult};
+use kcreate_bridge::phase10::{
+    ai_generate_themed_design, export_pdf_multi, ThemedDesignApplyResult,
+};
 use serial_test::serial;
 use tempfile::TempDir;
 
@@ -145,8 +147,8 @@ fn empty_options_default_to_a_deck() {
     // An empty options string must not error — it falls back to the
     // default request (deck / midnight / A4).
     let _dir = open_project("themed-default-options");
-    let result =
-        ai_generate_themed_design("Investor deck for a solar microgrid startup", "").expect("apply");
+    let result = ai_generate_themed_design("Investor deck for a solar microgrid startup", "")
+        .expect("apply");
     assert_eq!(result.format, "deck");
     assert_eq!(result.theme_id, "midnight");
     assert!(result.slide_count >= 4);

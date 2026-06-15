@@ -240,6 +240,28 @@ pub fn renderer_render_current() -> NapiResult<Option<u32>> {
     Ok(id.map(|id| id.0 as u32))
 }
 
+/// Update the viewport pan + zoom **and** repaint the most recently
+/// published scene in one call, returning the new `frameId` — or `null`
+/// when no scene has been published yet (or no renderer is attached).
+///
+/// This folds what were two IPC round-trips on the present surface's
+/// pan/zoom hot path (`renderer_set_viewport` then
+/// `renderer_render_current`) into a single bridge crossing that does
+/// the viewport write and the repaint under one renderer lock. The
+/// viewport write only dirties the renderer when the pan/zoom actually
+/// changes, so the returned id is a fresh frame for a real interaction
+/// and the cached id for a no-op.
+#[napi]
+pub fn renderer_set_viewport_and_render(
+    pan_x: f64,
+    pan_y: f64,
+    zoom: f64,
+) -> NapiResult<Option<u32>> {
+    let id =
+        state::set_viewport_and_render(pan_x as f32, pan_y as f32, zoom as f32).map_err(map_err)?;
+    Ok(id.map(|id| id.0 as u32))
+}
+
 /// Returns the latest published frame as an RGBA8 `Buffer`, or `null`
 /// if no frame has been rendered yet.
 #[napi]

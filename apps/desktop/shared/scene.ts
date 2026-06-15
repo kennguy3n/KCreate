@@ -222,6 +222,24 @@ export interface RendererBridge {
    */
   renderCurrent(): Promise<number | null>;
   /**
+   * Set the viewport pan/zoom **and** repaint the cached scene in one
+   * IPC round trip, returning the new frame id — or `null` when no scene
+   * has been published yet (or no renderer is attached).
+   *
+   * This is the present surface's pan/zoom hot path: it folds what were
+   * two crossings (`setViewport` then `renderCurrent`) into one, doing
+   * the viewport write and the repaint under a single renderer lock on
+   * the Rust side. The viewport write only dirties the renderer when the
+   * pan/zoom actually changes, so the returned id is a fresh frame for a
+   * real interaction and the cached id for a no-op. Mirrors
+   * `kcreate_bridge::state::set_viewport_and_render`.
+   */
+  setViewportAndRender(
+    panX: number,
+    panY: number,
+    zoom: number,
+  ): Promise<number | null>;
+  /**
    * Returns a copy of the latest RGBA8 pixel buffer, or null if no frame
    * has been published yet.
    *

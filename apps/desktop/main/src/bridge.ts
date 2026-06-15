@@ -1330,6 +1330,7 @@ export interface Bridge {
   ): string;
   aiReformatToDeck(pageIdStr: string): string;
   aiBriefToOnePager(brief: string, pageSize: string | null | undefined): string;
+  aiGenerateThemedDesign(brief: string, optionsJson: string): string;
   aiHarmonizePalette(brandKitIdStr: string, harmonyType: string): string;
   aiSuggestTypePairing(headingFontName: string): string;
 

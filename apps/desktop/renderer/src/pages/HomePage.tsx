@@ -6,6 +6,7 @@ import type {
   Preferences,
   RecentProjectInfo,
   RuntimeStatus,
+  ThemedDesignApplyResult,
   ThumbnailBytes,
 } from "../../../shared/scene";
 import { colors, font, radius, shadow, spacing } from "../styles/tokens";
@@ -135,9 +136,13 @@ export interface HomePageProps {
   onOpenProject?: (projectDir: string) => void;
   /**
    * Fired when the "Start from a brief" modal successfully creates
-   * a project. The shell routes the user into the editor.
+   * a project. The shell routes the user into the editor. The result
+   * is either a single-artboard `BriefApplyResult` or a multi-page
+   * `ThemedDesignApplyResult` depending on the chosen mode.
    */
-  onBriefApplied?: (result: BriefApplyResult) => void;
+  onBriefApplied?: (
+    result: BriefApplyResult | ThemedDesignApplyResult,
+  ) => void;
   /**
    * Fired when the user opens the ready-made template gallery (G2
    * jump-start). The shell routes to the `TemplateGallery` surface.
@@ -298,7 +303,7 @@ export function HomePage({
   );
 
   const handleBriefApplied = useCallback(
-    (result: BriefApplyResult) => {
+    (result: BriefApplyResult | ThemedDesignApplyResult) => {
       setBriefOpen(false);
       onBriefApplied?.(result);
     },
@@ -457,6 +462,7 @@ export function HomePage({
       <BriefModal
         open={briefOpen}
         onClose={() => setBriefOpen(false)}
+        llmReady={llmStatus?.state === "ready"}
         onApplied={handleBriefApplied}
       />
       <WelcomeModal
@@ -515,8 +521,8 @@ function BriefTile({
         </span>
         <span style={{ fontSize: 13, color: colors.textMuted }}>
           {ready
-            ? "Describe what you want; the local model fills in the canvas, palette, and starter layers."
-            : "Start the local LLM in Model Manager to enable brief-driven setup."}
+            ? "Describe what you want; generate a themed multi-page deck or one-pager, or let the local model fill a single artboard."
+            : "Describe what you want and generate a themed multi-page deck or one-pager — works offline."}
         </span>
       </div>
     </button>

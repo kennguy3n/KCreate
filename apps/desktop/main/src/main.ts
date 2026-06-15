@@ -2408,6 +2408,11 @@ function registerIpcHandlers(): void {
       requireBridge().aiBriefToOnePager(brief, pageSize),
   );
   ipcMain.handle(
+    "kcreate/phase10/ai/generate-themed-design",
+    (_e, brief: string, optionsJson: string): string =>
+      requireBridge().aiGenerateThemedDesign(brief, optionsJson),
+  );
+  ipcMain.handle(
     "kcreate/phase10/ai/harmonize-palette",
     (_e, brandKitId: string, harmonyType: string): string =>
       requireBridge().aiHarmonizePalette(brandKitId, harmonyType),

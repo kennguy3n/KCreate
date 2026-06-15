@@ -47,9 +47,17 @@ use kcreate_ai::reformat::{reformat_to_deck, ReformatDeckOptions, ReformatDeckRe
 use kcreate_ai::segment::{segment_image, SegmentBackend, SegmentOptions};
 use kcreate_ai::smart_select::smart_select;
 use kcreate_ai::stroke_match::{match_stroke_style, StrokeMatchSummary, StrokeProperties};
+use kcreate_ai::themed_deck::{
+    generate_design, outline_from_brief, sanitize_outline, DeckOutline, DesignElement,
+    DesignFormat, ElementKind, ElementRole, GeneratedDesign, OnePagerSize, SlideOutline, ThemeId,
+    ThemedDesignOptions,
+};
 use kcreate_ai::type_pairing::{suggest_type_pairing, TypePairingResult};
-use kcreate_core::node::{Bounds, LineCap, LineJoin, Node, NodeType, RgbaColor, StrokeStyle};
+use kcreate_core::node::{
+    Bounds, FillStyle, LineCap, LineJoin, Node, NodeStyle, NodeType, RgbaColor, StrokeStyle,
+};
 use kcreate_core::operation::Operation;
+use kcreate_core::project::{BrandKit, NamedColor};
 use kcreate_export::ai_import::{import_illustrator_bytes, AiImportError, AiImportSummary};
 use kcreate_export::pdf_multi::{
     export_pdf_multi_pages, PdfMultiError, PdfMultiOptions, PdfMultiReport,
@@ -63,7 +71,10 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::document::{blob_load, with_workspace, with_workspace_mut, DocumentBridgeError, Result};
-use crate::scene_sync::{RasterImageMeta, RASTER_IMAGE_METADATA_KEY};
+use crate::scene_sync::{
+    RasterImageMeta, TextLayerMeta, RASTER_IMAGE_METADATA_KEY, TEXT_LAYER_METADATA_KEY,
+    VECTOR_PATH_METADATA_KEY,
+};
 
 // ---------------------------------------------------------------------------
 // Internal helpers
@@ -1124,41 +1135,101 @@ pub fn export_pdf_multi(options_json: &str, output_path: &str) -> Result<PdfMult
 fn collect_page_svgs() -> Result<Vec<kcreate_export::pdf_multi::PdfPageInput>> {
     with_workspace(|ws| {
         let mut pages = Vec::new();
-        for (id, n) in ws.project.document.iter() {
-            if n.node_type == NodeType::Page || n.node_type == NodeType::Artboard {
-                // Round-11 fix: walk the full page subtree including
-                // `RasterLayer` and `TextLayer` descendants — the
-                // prior vector-only filter silently produced blank
-                // PDF pages for any document that wasn't purely
-                // vector. `compose_page_svg` emits `<image>` /
-                // `<text>` alongside `<path>`, resolving raster
-                // blobs through the bridge's `BlobStore` (kept out
-                // of `kcreate_export`'s dep graph via a callback).
-                //
-                // `ws.store.lock().blobs()` returns the active `BlobStore`
-                // for the open project; `load(hash)` returns the
-                // blob bytes in whatever encoding they were stored
-                // (PNG/JPEG/WebP for imports, raw RGBA for tile
-                // renders). `compose_page_svg` auto-detects.
-                let store_guard = ws.store.lock();
-                let store = store_guard.blobs();
-                let svg = kcreate_export::compose_page_svg(
-                    &ws.project.document,
-                    *id,
-                    n.bounds.width,
-                    n.bounds.height,
-                    |hash| store.load(hash).ok(),
-                );
-                pages.push(kcreate_export::pdf_multi::PdfPageInput {
-                    title: n.name.clone(),
-                    svg,
-                    width_pt: n.bounds.width.max(1.0),
-                    height_pt: n.bounds.height.max(1.0),
-                });
-            }
+        // Deterministic, double-count-free traversal: each artboard
+        // becomes one PDF page, and a page that has no artboard
+        // descendant (legacy single-page docs that hang content
+        // directly off the page) becomes its own PDF page. Iterating
+        // the document's `HashMap` directly would (a) double-count a
+        // page *and* its child artboards and (b) emit pages in
+        // non-deterministic order. `ordered_export_units` walks the
+        // ordered root/children lists instead, so a tiled deck
+        // exports its slides left-to-right in insertion order.
+        for id in ordered_export_units(&ws.project.document) {
+            let Some(n) = ws.project.document.get_node(id) else {
+                continue;
+            };
+            // Crop each unit to its own world-space frame. Tiled
+            // artboards live at increasing world `x`; rendering with
+            // a `0 0 w h` viewBox would push every slide past the
+            // first off-canvas and produce blank PDF pages. The
+            // origin-aware frame keeps each tile centred in its page.
+            //
+            // The full subtree (incl. `RasterLayer` / `TextLayer`
+            // descendants) is walked by `compose_page_svg_in_frame`;
+            // raster blobs resolve through the bridge's `BlobStore`
+            // via a callback (kept out of `kcreate_export`'s dep
+            // graph), auto-detecting PNG/JPEG/WebP vs. raw RGBA.
+            let store_guard = ws.store.lock();
+            let store = store_guard.blobs();
+            let svg = kcreate_export::compose_page_svg_in_frame(
+                &ws.project.document,
+                id,
+                n.bounds.x,
+                n.bounds.y,
+                n.bounds.width,
+                n.bounds.height,
+                |hash| store.load(hash).ok(),
+            );
+            pages.push(kcreate_export::pdf_multi::PdfPageInput {
+                title: n.name.clone(),
+                svg,
+                width_pt: n.bounds.width.max(1.0),
+                height_pt: n.bounds.height.max(1.0),
+            });
         }
         Ok(pages)
     })
+}
+
+/// Ordered list of nodes that should each become one exported page.
+///
+/// Walks the document's ordered root/children lists (DFS) so output
+/// order is deterministic — a tiled deck exports its slides in
+/// insertion (left-to-right) order rather than `HashMap` order.
+///
+/// Rules:
+/// - An `Artboard` is a self-contained frame: it becomes one page and
+///   we do **not** descend into it (its descendants are rendered by
+///   `compose_page_svg_in_frame`).
+/// - A `Page` that has at least one `Artboard` descendant is a pure
+///   container — we descend so the artboards become the pages, and the
+///   page itself is **not** emitted (this is what removes the
+///   historical double-count).
+/// - A `Page` with no `Artboard` descendant (legacy docs that hang
+///   content directly off the page) becomes one page itself.
+/// - Any other container (e.g. a `GroupLayer` wrapping an artboard) is
+///   never a page on its own, but we still descend through it so a
+///   nested artboard is reached rather than silently dropped. This
+///   keeps the traversal consistent with the broad `descendants_of`
+///   artboard check above. Leaf layers have no children, so they add
+///   nothing.
+fn ordered_export_units(doc: &kcreate_core::document::DocumentGraph) -> Vec<Uuid> {
+    let push_children =
+        |id: Uuid, stack: &mut Vec<Uuid>| stack.extend(doc.children_of(id).into_iter().rev());
+
+    let mut out = Vec::new();
+    let mut stack: Vec<Uuid> = doc.root_ids().iter().rev().copied().collect();
+    while let Some(id) = stack.pop() {
+        let Some(node) = doc.get_node(id) else {
+            continue;
+        };
+        match node.node_type {
+            NodeType::Artboard => out.push(id),
+            NodeType::Page => {
+                let has_artboard = doc.descendants_of(id).into_iter().any(|d| {
+                    doc.get_node(d)
+                        .is_some_and(|n| n.node_type == NodeType::Artboard)
+                });
+                if has_artboard {
+                    push_children(id, &mut stack);
+                } else {
+                    out.push(id);
+                }
+            }
+            _ => push_children(id, &mut stack),
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -1417,12 +1488,623 @@ fn preferences_tmp_path(final_path: &std::path::Path) -> std::path::PathBuf {
 }
 
 // ---------------------------------------------------------------------------
+// Block G3 — Gamma-style themed multi-page generator
+// ---------------------------------------------------------------------------
+
+/// Gap (world units) between tiled slide artboards. Matches the deck
+/// tiling convention used across the bridge.
+const THEMED_DECK_TILE_GAP: f64 = 100.0;
+
+/// Metadata flag stamped on the root `Page` this generator creates.
+/// On a subsequent generate it lets us replace our own prior output
+/// in place (instead of accumulating duplicate tiled page trees)
+/// while never touching pages the user authored themselves.
+const THEMED_GENERATED_METADATA_KEY: &str = "kcreate:themedGenerated";
+
+/// Cubic-bezier control offset for a quarter-circle corner
+/// (`4/3 * (sqrt(2) - 1)`); used to round rectangle corners so the
+/// rounding survives SVG/PDF export (which ignores `style.corner_radius`).
+const KAPPA: f64 = 0.552_284_749_830_793_4;
+
+/// Wire request for [`ai_generate_themed_design`]. Mirrors
+/// [`ThemedDesignOptions`] (so the deterministic generator's enums
+/// are reused verbatim) plus a `useLlm` flag the bridge consumes to
+/// decide whether to enrich the outline with the local sidecar.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ThemedDesignRequest {
+    #[serde(default)]
+    format: DesignFormat,
+    #[serde(default)]
+    theme_id: ThemeId,
+    #[serde(default)]
+    one_pager_size: OnePagerSize,
+    #[serde(default)]
+    section_count: Option<u32>,
+    /// Opt-in LLM enrichment. When `true` *and* the sidecar reports
+    /// `ready`, the bridge asks the model for a structured outline
+    /// and falls back to the deterministic planner on any failure.
+    #[serde(default)]
+    use_llm: bool,
+}
+
+/// Tolerant shape for an LLM-produced outline. Every field defaults
+/// so a partial / sloppy model reply still deserialises; the result
+/// is then run through [`sanitize_outline`], which drops empties and
+/// supplies a fallback title.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LlmOutlineDraft {
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    subtitle: String,
+    #[serde(default)]
+    slides: Vec<LlmSlideDraft>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LlmSlideDraft {
+    #[serde(default)]
+    heading: String,
+    #[serde(default)]
+    bullets: Vec<String>,
+}
+
+/// Result of applying a generated themed design to the open project.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ThemedDesignApplyResult {
+    /// Root page that contains every tiled slide artboard.
+    pub page_id: String,
+    /// One id per slide / page, in left-to-right tiling order.
+    pub artboard_ids: Vec<String>,
+    /// Brand kit seeded from the theme palette.
+    pub brand_kit_id: String,
+    /// Number of pages (title card + content cards for a deck; `1`
+    /// for a one-pager).
+    pub slide_count: u32,
+    /// Theme wire id (`"midnight"`, `"sunrise"`, …).
+    pub theme_id: String,
+    /// Human-readable theme name.
+    pub theme_name: String,
+    /// `"deck"` or `"onePager"`.
+    pub format: String,
+    /// Whether the outline was enriched by the local LLM sidecar.
+    /// `false` means the deterministic planner produced it.
+    pub used_llm: bool,
+}
+
+/// Brief → fully themed, laid-out, multi-page design applied to the
+/// open project.
+///
+/// Pipeline:
+/// 1. Parse `options_json` into a [`ThemedDesignRequest`].
+/// 2. Build a [`DeckOutline`] — LLM-enriched when `useLlm` is set and
+///    the sidecar is `ready`, otherwise via the deterministic
+///    [`outline_from_brief`] planner. Either path degrades to the
+///    deterministic planner so the feature is never a no-op offline.
+/// 3. [`generate_design`] turns the outline into themed, positioned
+///    elements (pure, side-effect free).
+/// 4. Translate the page-local elements into world-space nodes:
+///    a root `Page` → one tiled `Artboard` per slide → themed
+///    `VectorLayer` rectangles + `TextLayer` runs.
+///
+/// # Errors
+/// Returns an error if no project is open, the brief is empty, or a
+/// node insertion fails.
+pub fn ai_generate_themed_design(
+    brief: &str,
+    options_json: &str,
+) -> Result<ThemedDesignApplyResult> {
+    let request: ThemedDesignRequest = if options_json.trim().is_empty() {
+        ThemedDesignRequest::default()
+    } else {
+        serde_json::from_str(options_json).map_err(|e| DocumentBridgeError::InvalidArgument {
+            argument: "options_json".into(),
+            value: format!("{e}"),
+        })?
+    };
+
+    let options = ThemedDesignOptions {
+        format: request.format,
+        theme_id: request.theme_id,
+        one_pager_size: request.one_pager_size,
+        section_count: request.section_count,
+    };
+
+    // Stage 1+2: outline (LLM-enriched if asked + available, else
+    // deterministic) then pure layout.
+    let (outline, used_llm) = build_themed_outline(brief, options, request.use_llm)?;
+    let design = generate_design(&outline, options);
+
+    // Stage 3: apply to the open workspace.
+    apply_generated_design(brief, &design, used_llm)
+}
+
+/// Build the outline, attempting LLM enrichment only when requested
+/// and the sidecar is ready. Any failure on the LLM path falls back
+/// to the deterministic planner, so the returned outline is always
+/// valid. The boolean is `true` only when the LLM outline was used.
+fn build_themed_outline(
+    brief: &str,
+    options: ThemedDesignOptions,
+    use_llm: bool,
+) -> Result<(DeckOutline, bool)> {
+    if use_llm && crate::llm::llm_status().state == "ready" {
+        if let Some(enriched) = llm_enriched_outline(brief, options) {
+            return Ok((enriched, true));
+        }
+    }
+    let outline =
+        outline_from_brief(brief, options).map_err(|e| DocumentBridgeError::InvalidArgument {
+            argument: "brief".into(),
+            value: e.to_string(),
+        })?;
+    Ok((outline, false))
+}
+
+/// Ask the local sidecar for a structured outline. Returns `None`
+/// (so the caller falls back) on any error: not-ready, transport
+/// failure, unparseable reply, or an empty sanitised outline.
+fn llm_enriched_outline(brief: &str, options: ThemedDesignOptions) -> Option<DeckOutline> {
+    // Resolve through the shared clamp so the model is asked for the
+    // same section count the deterministic planner would produce. A
+    // raw `section_count` (`0`, `99`, …) would otherwise reach the
+    // prompt unbounded and make the LLM and fallback paths diverge at
+    // the boundaries.
+    let section_count = options.resolved_section_count() as u32;
+    let messages = build_outline_messages(brief, section_count);
+    let reply = crate::llm::llm_chat(messages, 1024, 0.3).ok()?;
+    let json = extract_json_object(&reply.content)?;
+    let draft: LlmOutlineDraft = serde_json::from_str(json).ok()?;
+    let outline = DeckOutline {
+        title: draft.title,
+        subtitle: draft.subtitle,
+        slides: draft
+            .slides
+            .into_iter()
+            .map(|s| SlideOutline {
+                heading: s.heading,
+                bullets: s.bullets,
+            })
+            .collect(),
+    };
+    sanitize_outline(outline, brief)
+}
+
+/// System + user messages that constrain the model to emit a single
+/// JSON outline object. Kept deliberately small and explicit so even
+/// a tiny local model produces parseable output.
+fn build_outline_messages(brief: &str, section_count: u32) -> Vec<crate::llm::LlmMessage> {
+    let system = format!(
+        "You are a presentation content planner. Respond with ONE JSON object and nothing else \
+         (no markdown, no prose). Shape: {{\"title\": string, \"subtitle\": string, \"slides\": \
+         [{{\"heading\": string, \"bullets\": [string]}}]}}. Produce exactly {section_count} \
+         slides. Each heading is at most 6 words. Each slide has 2 to 4 bullets, each at most 14 \
+         words. Do not include any field other than those shown."
+    );
+    vec![
+        crate::llm::LlmMessage {
+            role: "system".to_string(),
+            content: system,
+        },
+        crate::llm::LlmMessage {
+            role: "user".to_string(),
+            content: format!("Brief:\n{}", brief.trim()),
+        },
+    ]
+}
+
+/// Extract the first balanced top-level `{...}` block from `s`,
+/// tolerating leading/trailing prose or markdown fences a model may
+/// wrap around the JSON. Brace counting respects string literals and
+/// escapes so braces inside string values don't unbalance the scan.
+fn extract_json_object(s: &str) -> Option<&str> {
+    let start = s.find('{')?;
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (i, &b) in s.as_bytes().iter().enumerate().skip(start) {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_string = true,
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&s[start..=i]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Translate a [`GeneratedDesign`] into live document nodes and seed
+/// a brand kit from the theme. One root `Page` holds the tiled slide
+/// `Artboard`s; each artboard owns its themed rectangles and text
+/// runs at world coordinates.
+fn apply_generated_design(
+    brief: &str,
+    design: &GeneratedDesign,
+    used_llm: bool,
+) -> Result<ThemedDesignApplyResult> {
+    // Theme palette → brand-kit colours (parsed once, reused below).
+    let palette: Vec<RgbaColor> = design
+        .theme
+        .palette()
+        .iter()
+        .filter_map(|hex| RgbaColor::from_hex(hex))
+        .collect();
+
+    // Total tiled width / max height for the container page.
+    let tile_count = design.pages.len();
+    let total_width: f64 = design.pages.iter().map(|p| p.width).sum::<f64>()
+        + THEMED_DECK_TILE_GAP * (tile_count.saturating_sub(1) as f64);
+    let max_height = design
+        .pages
+        .iter()
+        .map(|p| p.height)
+        .fold(0.0_f64, f64::max);
+
+    let format_wire = match design.format {
+        DesignFormat::Deck => "deck",
+        DesignFormat::OnePager => "onePager",
+    };
+    let theme_wire = design.theme.id.wire();
+    let kit_name = format!("{} Theme", design.theme.name);
+
+    with_workspace_mut(|ws| {
+        // Replace our own prior output. Re-running the generator (e.g.
+        // to try another theme) must not stack a second tiled deck
+        // beside the first; remove any page a previous run stamped as
+        // generator-owned. Pages the user authored themselves carry no
+        // such stamp and are left untouched, so this never destroys
+        // the user's work.
+        for root in ws.project.document.root_ids().to_vec() {
+            if node_is_themed_generated(&ws.project.document, root) {
+                ws.project.document.remove_node(root);
+            }
+        }
+
+        // Repurpose a pristine scratch document. A "generate a whole
+        // deck from a prompt" action is a *document-creation* action:
+        // when the open document carries no content-bearing layers
+        // (the default `Page` + empty `Artboard` scaffold a fresh
+        // project — and BriefModal's scratch project — ships with, or
+        // the empty shell left after removing our prior output above),
+        // clear it so the generated deck *becomes* the document. This
+        // keeps the canvas and the multi-page PDF export free of a
+        // stray blank default artboard. A document that still holds
+        // real (user-authored) content is left in place and the deck
+        // is appended as a new page, so we never destroy the user's
+        // work.
+        if !document_has_content_layers(&ws.project.document) {
+            for root in ws.project.document.root_ids().to_vec() {
+                ws.project.document.remove_node(root);
+            }
+        }
+
+        // Root page container, sized to the full tiled extent. It is
+        // stamped as generator-owned so a future run can replace it.
+        let page_title = design
+            .pages
+            .first()
+            .map_or_else(|| "Generated Design".to_string(), |p| p.title.clone());
+        let mut page = Node::new(NodeType::Page, page_title.as_str());
+        page.bounds = Bounds::new(0.0, 0.0, total_width.max(1.0), max_height.max(1.0));
+        page.metadata.insert(
+            THEMED_GENERATED_METADATA_KEY.to_string(),
+            serde_json::Value::Bool(true),
+        );
+        let page_id = ws
+            .project
+            .document
+            .insert_node(page)
+            .map_err(DocumentBridgeError::Document)?;
+
+        // Brand kit (upsert by name) seeded from the theme palette.
+        let colors: Vec<NamedColor> = palette
+            .iter()
+            .enumerate()
+            .map(|(i, c)| NamedColor {
+                name: format!("Theme {}", i + 1),
+                color: *c,
+            })
+            .collect();
+        let brand_kit_id = if let Some(kit) = ws
+            .project
+            .brand_kits
+            .iter_mut()
+            .find(|k| k.name == kit_name)
+        {
+            kit.colors = colors;
+            kit.id
+        } else {
+            let mut kit = BrandKit::new(&kit_name);
+            kit.colors = colors;
+            let id = kit.id;
+            ws.project.brand_kits.push(kit);
+            id
+        };
+
+        let mut artboard_ids = Vec::with_capacity(tile_count);
+        let mut affected: Vec<Uuid> = vec![page_id];
+        let mut x_offset = 0.0_f64;
+        for gp in &design.pages {
+            // Slide artboard, filled with the page background.
+            let mut artboard = Node::new(NodeType::Artboard, gp.title.as_str());
+            artboard.bounds = Bounds::new(x_offset, 0.0, gp.width, gp.height);
+            artboard.parent_id = Some(page_id);
+            artboard.style.fill = solid_fill(&gp.background);
+            let artboard_id = ws
+                .project
+                .document
+                .insert_node(artboard)
+                .map_err(DocumentBridgeError::Document)?;
+            artboard_ids.push(artboard_id);
+            affected.push(artboard_id);
+
+            for el in &gp.elements {
+                let node = build_design_node(el, x_offset, artboard_id);
+                let node_id = ws
+                    .project
+                    .document
+                    .insert_node(node)
+                    .map_err(DocumentBridgeError::Document)?;
+                affected.push(node_id);
+            }
+            x_offset += gp.width + THEMED_DECK_TILE_GAP;
+        }
+
+        ws.project.modified_at = Utc::now();
+        let op = Operation::new(
+            "user",
+            "ai_generate_themed_design",
+            serde_json::json!({
+                "brief": brief,
+                "format": format_wire,
+                "themeId": theme_wire,
+            }),
+            serde_json::json!({ "page_id": page_id, "slides": artboard_ids.len() }),
+            affected,
+        )
+        .as_ai_generated();
+        ws.project.execute_operation(op);
+
+        Ok(ThemedDesignApplyResult {
+            page_id: page_id.to_string(),
+            artboard_ids: artboard_ids.iter().map(Uuid::to_string).collect(),
+            brand_kit_id: brand_kit_id.to_string(),
+            slide_count: tile_count as u32,
+            theme_id: theme_wire.to_string(),
+            theme_name: design.theme.name.clone(),
+            format: format_wire.to_string(),
+            used_llm,
+        })
+    })
+}
+
+/// Was `id` a root page stamped by a previous run of this generator?
+/// Used to replace prior generated output on a re-run without
+/// touching user-authored pages (which never carry the stamp).
+fn node_is_themed_generated(doc: &kcreate_core::document::DocumentGraph, id: Uuid) -> bool {
+    doc.get_node(id).is_some_and(|n| {
+        n.metadata
+            .get(THEMED_GENERATED_METADATA_KEY)
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    })
+}
+
+/// Does the document hold any content-bearing leaf layer?
+///
+/// Used to distinguish a pristine scratch document (only the default
+/// `Page` + empty `Artboard` containers a freshly-created project
+/// ships with) from one the user has already drawn into. Pure
+/// containers (`Page` / `Artboard` / `GroupLayer` / `LayoutFrame`) on
+/// their own do not count as content — only leaf layers that actually
+/// carry a design (vector / text / raster / placed component) do.
+fn document_has_content_layers(doc: &kcreate_core::document::DocumentGraph) -> bool {
+    doc.iter().any(|(_, n)| {
+        matches!(
+            n.node_type,
+            NodeType::VectorLayer
+                | NodeType::TextLayer
+                | NodeType::RasterLayer
+                | NodeType::ComponentLayer
+        )
+    })
+}
+
+/// Build a live document node from a page-local [`DesignElement`],
+/// offsetting it into world space by `x_offset` (the slide's tiled
+/// world origin; tiled slides share `y = 0`).
+fn build_design_node(el: &DesignElement, x_offset: f64, artboard_id: Uuid) -> Node {
+    let wx = el.x + x_offset;
+    let wy = el.y;
+    let w = el.width.max(1.0);
+    let h = el.height.max(1.0);
+    match el.kind {
+        ElementKind::Text => {
+            let mut node = Node::new(NodeType::TextLayer, element_node_name(el));
+            node.parent_id = Some(artboard_id);
+            node.bounds = Bounds::new(wx, wy, w, h);
+            node.style = themed_style(&el.fill, 0.0);
+            let meta = TextLayerMeta {
+                text: el.text.clone().unwrap_or_default(),
+                font_family: if el.font_family.is_empty() {
+                    "Inter".to_string()
+                } else {
+                    el.font_family.clone()
+                },
+                font_size: el.font_size,
+            };
+            node.metadata.insert(
+                TEXT_LAYER_METADATA_KEY.to_string(),
+                serde_json::to_value(&meta).unwrap_or(serde_json::Value::Null),
+            );
+            node
+        }
+        ElementKind::Rect => {
+            let mut node = Node::new(NodeType::VectorLayer, element_node_name(el));
+            node.parent_id = Some(artboard_id);
+            node.bounds = Bounds::new(wx, wy, w, h);
+            node.style = themed_style(&el.fill, el.corner_radius);
+            let path = rounded_rect_path(wx, wy, w, h, el.corner_radius);
+            node.metadata.insert(
+                VECTOR_PATH_METADATA_KEY.to_string(),
+                serde_json::to_value(&path).unwrap_or(serde_json::Value::Null),
+            );
+            node
+        }
+    }
+}
+
+/// Stable layer name for a design element, derived from its role.
+fn element_node_name(el: &DesignElement) -> &'static str {
+    match el.role {
+        ElementRole::Surface => "Surface",
+        ElementRole::AccentBar => "Accent Bar",
+        ElementRole::Title => "Title",
+        ElementRole::Subtitle => "Subtitle",
+        ElementRole::Heading => "Heading",
+        ElementRole::Body => "Body",
+        ElementRole::BulletMarker => "Bullet",
+        ElementRole::Figure => "Figure",
+        ElementRole::Footer => "Footer",
+    }
+}
+
+/// Node style with a solid themed fill and an optional corner radius.
+fn themed_style(fill_hex: &str, corner_radius: f64) -> NodeStyle {
+    NodeStyle {
+        fill: solid_fill(fill_hex),
+        corner_radius,
+        ..NodeStyle::default()
+    }
+}
+
+/// Parse a `#RRGGBB` theme colour into a solid fill, defaulting to
+/// white when the string is malformed (themes only ever emit valid
+/// hex, so this is a defensive fallback).
+fn solid_fill(hex: &str) -> FillStyle {
+    FillStyle::Solid(RgbaColor::from_hex(hex).unwrap_or(RgbaColor::WHITE))
+}
+
+/// Build a rectangle path in world coordinates, rounded when
+/// `radius > 0`. Rounded corners are emitted as cubic beziers so the
+/// rounding survives SVG/PDF export (which reads the path, not
+/// `style.corner_radius`).
+fn rounded_rect_path(x: f64, y: f64, w: f64, h: f64, radius: f64) -> kcreate_vector::VectorPath {
+    use kcreate_vector::{PathPoint, PathSegment, VectorPath};
+    let max_r = (w.min(h)) / 2.0;
+    let r = radius.clamp(0.0, max_r.max(0.0));
+    if r <= f64::EPSILON {
+        return VectorPath::new(vec![
+            PathSegment::MoveTo(PathPoint::new(x, y)),
+            PathSegment::LineTo(PathPoint::new(x + w, y)),
+            PathSegment::LineTo(PathPoint::new(x + w, y + h)),
+            PathSegment::LineTo(PathPoint::new(x, y + h)),
+            PathSegment::Close,
+        ]);
+    }
+    let c = r * KAPPA;
+    VectorPath::new(vec![
+        PathSegment::MoveTo(PathPoint::new(x + r, y)),
+        PathSegment::LineTo(PathPoint::new(x + w - r, y)),
+        PathSegment::CubicTo {
+            ctrl1: PathPoint::new(x + w - r + c, y),
+            ctrl2: PathPoint::new(x + w, y + r - c),
+            end: PathPoint::new(x + w, y + r),
+        },
+        PathSegment::LineTo(PathPoint::new(x + w, y + h - r)),
+        PathSegment::CubicTo {
+            ctrl1: PathPoint::new(x + w, y + h - r + c),
+            ctrl2: PathPoint::new(x + w - r + c, y + h),
+            end: PathPoint::new(x + w - r, y + h),
+        },
+        PathSegment::LineTo(PathPoint::new(x + r, y + h)),
+        PathSegment::CubicTo {
+            ctrl1: PathPoint::new(x + r - c, y + h),
+            ctrl2: PathPoint::new(x, y + h - r + c),
+            end: PathPoint::new(x, y + h - r),
+        },
+        PathSegment::LineTo(PathPoint::new(x, y + r)),
+        PathSegment::CubicTo {
+            ctrl1: PathPoint::new(x, y + r - c),
+            ctrl2: PathPoint::new(x + r - c, y),
+            end: PathPoint::new(x + r, y),
+        },
+        PathSegment::Close,
+    ])
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ordered_export_units_walks_page_artboards_in_insertion_order() {
+        // Page → [Artboard A, Artboard B]: the page is a pure
+        // container (it has artboard descendants) so it is not emitted;
+        // its artboards become the export units, left-to-right.
+        let mut doc = kcreate_core::document::DocumentGraph::new();
+        let page = doc.insert_node(Node::new(NodeType::Page, "Page")).unwrap();
+        let mut a = Node::new(NodeType::Artboard, "A");
+        a.parent_id = Some(page);
+        let a = doc.insert_node(a).unwrap();
+        let mut b = Node::new(NodeType::Artboard, "B");
+        b.parent_id = Some(page);
+        let b = doc.insert_node(b).unwrap();
+        assert_eq!(ordered_export_units(&doc), vec![a, b]);
+    }
+
+    #[test]
+    fn ordered_export_units_emits_a_page_with_no_artboard_as_itself() {
+        // Legacy single-page docs hang content directly off the page
+        // (no artboard); the page itself becomes the one export unit.
+        let mut doc = kcreate_core::document::DocumentGraph::new();
+        let page = doc.insert_node(Node::new(NodeType::Page, "Page")).unwrap();
+        let mut text = Node::new(NodeType::TextLayer, "Body");
+        text.parent_id = Some(page);
+        doc.insert_node(text).unwrap();
+        assert_eq!(ordered_export_units(&doc), vec![page]);
+    }
+
+    #[test]
+    fn ordered_export_units_reaches_artboard_nested_under_a_group() {
+        // Page → GroupLayer → Artboard. The page reports an artboard
+        // descendant, so it descends; the group is not a page on its
+        // own but the traversal descends through it instead of dropping
+        // it, so the nested artboard is still reached (one export unit,
+        // not zero).
+        let mut doc = kcreate_core::document::DocumentGraph::new();
+        let page = doc.insert_node(Node::new(NodeType::Page, "Page")).unwrap();
+        let mut group = Node::new(NodeType::GroupLayer, "Group");
+        group.parent_id = Some(page);
+        let group = doc.insert_node(group).unwrap();
+        let mut artboard = Node::new(NodeType::Artboard, "Nested");
+        artboard.parent_id = Some(group);
+        let artboard = doc.insert_node(artboard).unwrap();
+        assert_eq!(ordered_export_units(&doc), vec![artboard]);
+    }
 
     #[test]
     fn smart_select_mode_parser_round_trips_known_names() {

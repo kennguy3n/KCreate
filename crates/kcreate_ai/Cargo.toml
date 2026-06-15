@@ -20,6 +20,10 @@ uuid.workspace = true
 parking_lot.workspace = true
 chrono.workspace = true
 kcreate_core = { path = "../kcreate_core" }
+# Pure flex/grid layout solvers — used by the themed-deck generator
+# (`themed_deck.rs`) to position headings/body without hand-placed
+# coordinates. No networking, no DOM; safe in the editing path.
+kcreate_layout = { path = "../kcreate_layout" }
 log.workspace = true
 rayon.workspace = true
 base64.workspace = true

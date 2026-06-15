@@ -241,6 +241,7 @@ import type {
   ExtractedGlyphResult,
   ReformatDeckResult,
   BriefToOnePagerResult,
+  ThemedDesignApplyResult,
   HarmonyResult,
   TypePairingResult,
   SvgOptimizeReport,
@@ -3643,6 +3644,14 @@ const phase10: Phase10Bridge = {
       pageSize,
     )) as string;
     return JSON.parse(raw) as BriefToOnePagerResult;
+  },
+  async aiGenerateThemedDesign(brief, options) {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/phase10/ai/generate-themed-design",
+      brief,
+      JSON.stringify(options),
+    )) as string;
+    return JSON.parse(raw) as ThemedDesignApplyResult;
   },
   async aiHarmonizePalette(brandKitId, harmonyType) {
     const raw = (await ipcRenderer.invoke(

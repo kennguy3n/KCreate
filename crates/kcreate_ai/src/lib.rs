@@ -40,6 +40,7 @@ pub mod smart_select;
 pub mod stroke_match;
 pub mod style_describe;
 pub mod task_router;
+pub mod themed_deck;
 pub mod tool_call;
 pub mod trace;
 pub mod type_pairing;
@@ -107,6 +108,11 @@ pub use stroke_match::{
 pub use task_router::{
     build_accessibility_prompt, build_design_token_prompt, build_layer_naming_prompt, execute_task,
     parse_layer_naming_reply, AiError, AiResult, AiTask,
+};
+pub use themed_deck::{
+    generate_design, outline_from_brief, sanitize_outline, theme, DeckOutline, DesignElement,
+    DesignFormat, ElementKind, ElementRole, GeneratedDesign, GeneratedPage, OnePagerSize,
+    SlideOutline, Theme, ThemeId, ThemedDesignError, ThemedDesignOptions, TypeScale,
 };
 pub use tool_call::{
     default_design_registry, gbnf_for_registry, parse_tool_call_response, ToolCall,

@@ -8476,39 +8476,7 @@ pub fn export_pdf_file(output_path: &Path, options: &PdfExportRequest) -> Result
 pub fn export_pdf_bytes(options: &PdfExportRequest) -> Result<Vec<u8>> {
     let guard = slot().write();
     let ws = guard.as_ref().ok_or(DocumentBridgeError::NoProject)?;
-    let mut rasters = kcreate_export::pdf::RasterPixelCache::new();
-    // Preload every raster layer's pixels so the export crate doesn't
-    // need to know about the storage layer. Decode happens once per
-    // unique blob hash (HashMap dedupes for free).
-    for (_uuid, node) in ws.project.document.iter() {
-        if !matches!(node.node_type, NodeType::RasterLayer) {
-            continue;
-        }
-        let Some(meta_value) = node
-            .metadata
-            .get(crate::scene_sync::RASTER_IMAGE_METADATA_KEY)
-        else {
-            continue;
-        };
-        let Ok(meta) =
-            serde_json::from_value::<crate::scene_sync::RasterImageMeta>(meta_value.clone())
-        else {
-            continue;
-        };
-        if rasters.contains_key(&meta.blob_hash) {
-            continue;
-        }
-        let bytes = {
-            let store = ws.store.lock();
-            match store.blobs().load(&meta.blob_hash) {
-                Ok(b) => b,
-                Err(_) => continue,
-            }
-        };
-        if let Ok(pixels) = kcreate_export::pdf::RasterPixels::decode(&bytes) {
-            rasters.insert(meta.blob_hash, pixels);
-        }
-    }
+    let rasters = preload_document_rasters(ws);
     let resolved_color_mode = match options.color_mode.as_deref() {
         Some("rgb" | "Rgb") => kcreate_export::pdf::PdfColorMode::Rgb,
         Some("cmyk" | "Cmyk" | "CMYK") => kcreate_export::pdf::PdfColorMode::Cmyk,
@@ -8563,6 +8531,141 @@ pub fn export_pdf_bytes(options: &PdfExportRequest) -> Result<Vec<u8>> {
     .map_err(|e| DocumentBridgeError::Io(std::io::Error::other(e.to_string())))?;
     drop(guard);
     Ok(bytes)
+}
+
+/// Decode every raster layer's pixels into the export crate's
+/// [`RasterPixelCache`], keyed by content-addressed blob hash.
+///
+/// Pulled out of [`export_pdf_bytes`] so both the standard and the
+/// print-ready PDF exporters share one preload path: the export crate
+/// stays storage-agnostic, and a blob is decoded at most once per
+/// export even when many layers reference the same image (the
+/// `HashMap` dedupes on `blob_hash`).
+fn preload_document_rasters(ws: &Workspace) -> kcreate_export::pdf::RasterPixelCache {
+    let mut rasters = kcreate_export::pdf::RasterPixelCache::new();
+    for (_uuid, node) in ws.project.document.iter() {
+        if !matches!(node.node_type, NodeType::RasterLayer) {
+            continue;
+        }
+        let Some(meta_value) = node
+            .metadata
+            .get(crate::scene_sync::RASTER_IMAGE_METADATA_KEY)
+        else {
+            continue;
+        };
+        let Ok(meta) =
+            serde_json::from_value::<crate::scene_sync::RasterImageMeta>(meta_value.clone())
+        else {
+            continue;
+        };
+        if rasters.contains_key(&meta.blob_hash) {
+            continue;
+        }
+        let bytes = {
+            let store = ws.store.lock();
+            match store.blobs().load(&meta.blob_hash) {
+                Ok(b) => b,
+                Err(_) => continue,
+            }
+        };
+        if let Ok(pixels) = kcreate_export::pdf::RasterPixels::decode(&bytes) {
+            rasters.insert(meta.blob_hash, pixels);
+        }
+    }
+    rasters
+}
+
+// -----------------------------------------------------------------------------
+// Print-ready PDF export (bleed + trim/registration marks + CMYK +
+// spot separations). Builds on `kcreate_export::export_print_ready_pdf`.
+// -----------------------------------------------------------------------------
+
+/// Wire-format request for the print-ready PDF exporter. `page_id` is
+/// the artboard/page to print; `options` carries the press parameters
+/// (bleed, mark geometry, color mode, dithering). The renderer sends
+/// `options` as the camelCase [`kcreate_export::PrintReadyOptions`]
+/// JSON; an empty object yields the press-standard defaults (3 mm
+/// bleed, trim + registration marks, CMYK output).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct PrintReadyExportRequest {
+    pub page_id: String,
+    #[serde(default)]
+    pub options: kcreate_export::PrintReadyOptions,
+}
+
+/// Machine-readable summary returned to the renderer after a
+/// print-ready export. Lets the panel report the actual media/trim
+/// box and the spot plates that were separated without re-parsing
+/// the PDF. Serialised as camelCase JSON for the IPC layer.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrintReadyExportOutcome {
+    pub bytes_written: u64,
+    /// `(width, height)` of the MediaBox in millimetres (trim +
+    /// bleed + mark allowance on every side).
+    pub media_box_mm: (f64, f64),
+    /// `(width, height)` of the TrimBox in millimetres (the finished
+    /// piece after cutting).
+    pub trim_box_mm: (f64, f64),
+    pub bleed_mm: f64,
+    /// Names of the spot-color plates that became `/Separation`
+    /// color spaces in the PDF, in plate order.
+    pub spot_plates: Vec<String>,
+    /// `"rgb"`, `"cmyk"`, or `"passThrough"` — the color model the
+    /// page content was emitted in.
+    pub color_mode: String,
+}
+
+fn print_ready_color_mode_label(mode: kcreate_export::pdf::PdfColorMode) -> &'static str {
+    match mode {
+        kcreate_export::pdf::PdfColorMode::Rgb => "rgb",
+        kcreate_export::pdf::PdfColorMode::Cmyk => "cmyk",
+        kcreate_export::pdf::PdfColorMode::PassThrough => "passThrough",
+    }
+}
+
+/// Render the open document's `page_id` to a press-ready PDF in
+/// memory. Returns the PDF bytes plus a [`PrintReadyExportOutcome`]
+/// describing the geometry and separations that were written.
+pub fn export_print_ready_pdf_bytes(
+    request: &PrintReadyExportRequest,
+) -> Result<(Vec<u8>, PrintReadyExportOutcome)> {
+    let page_id = Uuid::parse_str(&request.page_id)
+        .map_err(|e| DocumentBridgeError::InvalidUuid(request.page_id.clone(), e))?;
+    with_workspace(|ws| {
+        let rasters = preload_document_rasters(ws);
+        let result = kcreate_export::export_print_ready_pdf(
+            &ws.project.document,
+            page_id,
+            &request.options,
+            &rasters,
+            &ws.project.spot_color_library,
+        )
+        .map_err(|e| DocumentBridgeError::Internal(e.to_string()))?;
+        let outcome = PrintReadyExportOutcome {
+            bytes_written: result.bytes.len() as u64,
+            media_box_mm: result.media_box_mm,
+            trim_box_mm: result.trim_box_mm,
+            bleed_mm: result.bleed_mm,
+            spot_plates: result.spot_plates,
+            color_mode: print_ready_color_mode_label(result.color_mode).to_string(),
+        };
+        Ok((result.bytes, outcome))
+    })
+}
+
+/// Filesystem companion to [`export_print_ready_pdf_bytes`]: render
+/// the page and write the PDF to `output_path`, returning the
+/// outcome summary (with `bytes_written` reflecting the file size).
+pub fn export_print_ready_pdf_file(
+    output_path: &Path,
+    request: &PrintReadyExportRequest,
+) -> Result<PrintReadyExportOutcome> {
+    let (bytes, mut outcome) = export_print_ready_pdf_bytes(request)?;
+    outcome.bytes_written = bytes.len() as u64;
+    std::fs::write(output_path, bytes)?;
+    Ok(outcome)
 }
 
 // -----------------------------------------------------------------------------

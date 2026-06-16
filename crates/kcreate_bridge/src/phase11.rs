@@ -390,6 +390,37 @@ impl Task for ExportPdfTask {
     }
 }
 
+/// Async print-ready PDF export. Streams a press-ready PDF (bleed +
+/// trim/registration marks + CMYK + spot separations) to disk and
+/// resolves with the export outcome as JSON (media/trim box, bleed,
+/// spot plates, color mode) so the PreflightPanel can summarise the
+/// result without a second round-trip. Heavy (clips, marks, lopdf
+/// post-process), so it runs on the napi worker pool.
+#[derive(Debug)]
+pub struct PrintReadyExportTask {
+    pub output_path: PathBuf,
+    pub request_json: String,
+}
+
+impl Task for PrintReadyExportTask {
+    type Output = String;
+    type JsValue = String;
+
+    fn compute(&mut self) -> NapiResult<Self::Output> {
+        let request: document::PrintReadyExportRequest = serde_json::from_str(&self.request_json)
+            .map_err(|e| {
+            NapiError::from_reason(format!("invalid export_print_ready options JSON: {e}"))
+        })?;
+        let outcome = document::export_print_ready_pdf_file(&self.output_path, &request)
+            .map_err(map_doc_err)?;
+        serde_json::to_string(&outcome).map_err(|e| NapiError::from_reason(e.to_string()))
+    }
+
+    fn resolve(&mut self, _env: Env, output: Self::Output) -> NapiResult<Self::JsValue> {
+        Ok(output)
+    }
+}
+
 /// Async SVG export for documents with > 100 nodes. The small-doc
 /// path stays sync (`export_svg` in lib.rs) — a 5-node SVG export
 /// is microseconds and the worker dispatch overhead would dominate.

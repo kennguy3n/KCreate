@@ -990,6 +990,72 @@ export interface PdfExportOptions {
   cmykDither?: "none" | "floydSteinberg" | "bayer8x8";
 }
 
+/**
+ * Device color space for a print-ready export. These are the exact
+ * `snake_case` wire values `kcreate_export::pdf::PdfColorMode`
+ * (de)serialises (the enum carries its own `rename_all = "snake_case"`,
+ * independent of the parent struct's camelCase), so they cross the
+ * bridge verbatim.
+ */
+export type PrintReadyColorMode = "rgb" | "cmyk" | "pass_through";
+
+/** Dither for CMYK rasterisation — wire values of `CmykDither`. */
+export type PrintReadyDither = "none" | "floyd_steinberg" | "bayer8x8";
+
+/**
+ * Press-ready PDF options. Mirror of `kcreate_export::PrintReadyOptions`
+ * (`rename_all = "camelCase"`, every field defaulted — send a partial
+ * object and the press-standard defaults fill the rest: 3 mm bleed,
+ * trim + registration marks, CMYK output, Floyd–Steinberg dither).
+ */
+export interface PrintReadyOptions {
+  /** Trim width in mm. `<= 0` infers from the page layout / pixel bounds. */
+  trimWidthMm?: number;
+  /** Trim height in mm. Inferred like `trimWidthMm`. */
+  trimHeightMm?: number;
+  /** Bleed on every side, in mm (commercial default 3 mm). */
+  bleedMm?: number;
+  /** Length of each trim / registration mark stroke, in mm. */
+  markLengthMm?: number;
+  /** Gap between the trim edge and the mark, in mm (clamped up to `bleedMm`). */
+  markOffsetMm?: number;
+  /** Trim / registration mark stroke weight, in PDF points (0.25 pt hairline). */
+  markWeightPt?: number;
+  /** Draw trim (crop) marks at the four trim corners. */
+  trimMarks?: boolean;
+  /** Draw registration targets centred in each margin. */
+  registrationMarks?: boolean;
+  /** Content-stream color space (defaults to CMYK). */
+  colorMode?: PrintReadyColorMode;
+  /** Dither used when rasterising images to `/DeviceCMYK`. */
+  cmykDither?: PrintReadyDither;
+  /** Document title written to the PDF info dict. */
+  title?: string;
+}
+
+/**
+ * Request to export one page as a press-ready PDF. Mirror of
+ * `kcreate_bridge::document::PrintReadyExportRequest`.
+ */
+export interface PrintReadyExportRequest {
+  pageId: string;
+  options?: PrintReadyOptions;
+}
+
+/**
+ * Summary returned after a print-ready export. Mirror of
+ * `kcreate_bridge::document::PrintReadyExportOutcome` (camelCase JSON);
+ * box dimensions are `[width, height]` in millimetres.
+ */
+export interface PrintReadyExportOutcome {
+  bytesWritten: number;
+  mediaBoxMm: [number, number];
+  trimBoxMm: [number, number];
+  bleedMm: number;
+  spotPlates: string[];
+  colorMode: "rgb" | "cmyk" | "passThrough";
+}
+
 /** WebP export options. `quality` is 0..100; `lossless` overrides quality. */
 export interface WebpExportOptions {
   width: number;
@@ -1022,6 +1088,16 @@ export interface ExportBridge {
   svg(nodeIds: string[], options: SvgExportOptions): Promise<string>;
   png(outputPath: string, options: PngExportOptions): Promise<number>;
   pdf(outputPath: string, options: PdfExportOptions): Promise<number>;
+  /**
+   * Press-ready PDF for a single page: bleed + trim/registration
+   * marks, CMYK (or pass-through) content, and `/Separation` plates
+   * for any spot inks. Resolves with the export outcome (media/trim
+   * box, bleed, spot plates, color mode).
+   */
+  printReady(
+    outputPath: string,
+    request: PrintReadyExportRequest,
+  ): Promise<PrintReadyExportOutcome>;
   webp(outputPath: string, options: WebpExportOptions): Promise<number>;
   jpeg(outputPath: string, options: JpegExportOptions): Promise<number>;
 }
@@ -2710,6 +2786,7 @@ export type PreflightCheckId =
   | "font_glyph_coverage"
   | "total_ink_coverage"
   | "bleed_area_empty"
+  | "safe_margin"
   | "spot_color_missing";
 
 export interface PreflightIssue {
@@ -2759,6 +2836,14 @@ export interface PreflightOptions {
    * `#[serde(default)]`.
    */
   targetTotalInkCoverage: number;
+  /**
+   * Safe margin inside the trim edge, in millimetres. Foreground
+   * content (text, logos, small graphics) whose bounds fall within
+   * this distance of a trim edge raises a `safe_margin` warning.
+   * `0` disables the check. Full-bleed backgrounds are exempt.
+   * Defaults to 5 mm (the conventional commercial-print safe zone).
+   */
+  safeMarginMm: number;
 }
 
 export interface PreflightRequest {
@@ -2767,8 +2852,43 @@ export interface PreflightRequest {
   options: PreflightOptions;
 }
 
+/**
+ * Request to auto-fix the listed preflight checks then re-run.
+ * `fixes` names the check ids to attempt (e.g. `"bleed_margin"`,
+ * `"color_space"`, `"total_ink_coverage"`). `pageIds` empty = every
+ * page. Mirror of Rust `phase2::PreflightAutofixRequest`.
+ */
+export interface PreflightAutofixRequest {
+  pageIds: string[];
+  options: PreflightOptions;
+  fixes: PreflightCheckId[];
+}
+
+/** What one requested auto-fix did. Mirror of `PreflightFixResult`. */
+export interface PreflightFixResult {
+  check: PreflightCheckId;
+  /** Whether this class of issue is auto-fixable at all. */
+  fixable: boolean;
+  /** Document node ids the fix mutated, as UUID strings. */
+  appliedNodeIds: string[];
+  /** Human-readable summary (what changed, or why it couldn't). */
+  message: string;
+}
+
+/**
+ * Result of an auto-fix pass: what each fix did plus the issues that
+ * remain after re-running preflight. Mirror of
+ * `phase2::PreflightAutofixOutcome`.
+ */
+export interface PreflightAutofixOutcome {
+  applied: PreflightFixResult[];
+  issues: PreflightIssue[];
+}
+
 export interface PreflightBridge {
   run(request: PreflightRequest): Promise<PreflightIssue[]>;
+  /** Apply auto-fixes then re-run; resolves with what changed + remaining issues. */
+  autofix(request: PreflightAutofixRequest): Promise<PreflightAutofixOutcome>;
 }
 
 export type IconPlatformName = "web" | "ios" | "android" | "favicon";

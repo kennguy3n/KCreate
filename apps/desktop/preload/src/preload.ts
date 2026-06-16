@@ -94,6 +94,8 @@ import type {
   NodeInfo,
   PdfExportOptions,
   PngExportOptions,
+  PrintReadyExportRequest,
+  PrintReadyExportOutcome,
   ProjectInfo,
   RendererBridge,
   RendererInfo,
@@ -144,6 +146,8 @@ import type {
   PreflightBridge,
   PreflightIssue,
   PreflightRequest,
+  PreflightAutofixRequest,
+  PreflightAutofixOutcome,
   ScreenshotElement,
   ScreenshotRequest,
   TextRegion,
@@ -791,6 +795,17 @@ const exportApi: ExportBridge = {
       outputPath,
       JSON.stringify(options),
     )) as number;
+  },
+  async printReady(
+    outputPath: string,
+    request: PrintReadyExportRequest,
+  ): Promise<PrintReadyExportOutcome> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/export/printReady",
+      outputPath,
+      JSON.stringify(request),
+    )) as string;
+    return JSON.parse(raw) as PrintReadyExportOutcome;
   },
   async webp(outputPath: string, options: WebpExportOptions): Promise<number> {
     return (await ipcRenderer.invoke(
@@ -1949,6 +1964,15 @@ const preflight: PreflightBridge = {
       JSON.stringify(request),
     )) as string;
     return JSON.parse(raw) as PreflightIssue[];
+  },
+  async autofix(
+    request: PreflightAutofixRequest,
+  ): Promise<PreflightAutofixOutcome> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/preflight/autofix",
+      JSON.stringify(request),
+    )) as string;
+    return JSON.parse(raw) as PreflightAutofixOutcome;
   },
 };
 

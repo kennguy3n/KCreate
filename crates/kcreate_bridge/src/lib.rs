@@ -1502,6 +1502,24 @@ pub fn export_pdf(output_path: String, options_json: String) -> AsyncTask<phase1
     })
 }
 
+/// Export a single page as a press-ready PDF at `output_path` —
+/// bleed + trim/registration marks, CMYK (or pass-through) color, and
+/// spot-color separation plates. `request_json` is a
+/// [`document::PrintReadyExportRequest`] (`{ pageId, options? }`).
+/// Resolves with the export outcome as JSON (media/trim box in mm,
+/// bleed, spot plate names, color mode).
+#[napi(ts_return_type = "Promise<string>")]
+#[allow(clippy::needless_pass_by_value)]
+pub fn export_print_ready_pdf(
+    output_path: String,
+    request_json: String,
+) -> AsyncTask<phase11::PrintReadyExportTask> {
+    AsyncTask::new(phase11::PrintReadyExportTask {
+        output_path: PathBuf::from(output_path),
+        request_json,
+    })
+}
+
 /// Render the current renderer scene to WebP at `output_path`. Returns
 /// the file size in bytes.
 #[napi]
@@ -3504,6 +3522,20 @@ pub fn preflight_run(request_json: String) -> NapiResult<String> {
     };
     let issues = phase2::preflight_run(&req).map_err(map_doc_err)?;
     serde_json::to_string(&issues).map_err(|e| NapiError::from_reason(e.to_string()))
+}
+
+/// Apply the requested preflight auto-fixes (add bleed, RGB→CMYK,
+/// reduce ink) to the open document, then re-run preflight. Returns a
+/// JSON [`phase2::PreflightAutofixOutcome`] — what each requested fix
+/// did plus the issues that remain — so the panel can drive a
+/// fix-and-pass loop. `request_json` is a
+/// [`phase2::PreflightAutofixRequest`] (`{ pageIds?, options?, fixes }`).
+#[napi]
+pub fn preflight_autofix(request_json: String) -> NapiResult<String> {
+    let req: phase2::PreflightAutofixRequest = serde_json::from_str(&request_json)
+        .map_err(|e| NapiError::from_reason(format!("preflight_autofix: invalid JSON: {e}")))?;
+    let outcome = phase2::preflight_autofix(&req).map_err(map_doc_err)?;
+    serde_json::to_string(&outcome).map_err(|e| NapiError::from_reason(e.to_string()))
 }
 
 /// Generate an icon pack for the given platforms and write the files

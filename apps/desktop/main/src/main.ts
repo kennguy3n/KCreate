@@ -2672,6 +2672,14 @@ function registerIpcHandlers(): void {
   ipcMain.handle("kcreate/preflight/run", (_e, requestJson: string) =>
     requireBridge().preflightRun(requestJson),
   );
+  ipcMain.handle("kcreate/preflight/autofix", (_e, requestJson: string) =>
+    requireBridge().preflightAutofix(requestJson),
+  );
+  ipcMain.handle(
+    "kcreate/export/printReady",
+    (_e, outputPath: string, requestJson: string): Promise<string> =>
+      requireBridge().exportPrintReadyPdf(outputPath, requestJson),
+  );
   ipcMain.handle(
     "kcreate/export/iconPack",
     (_e, requestJson: string) => requireBridge().exportIconPack(requestJson),

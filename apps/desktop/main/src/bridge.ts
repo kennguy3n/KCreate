@@ -458,6 +458,9 @@ export interface Bridge {
   exportSvgAsync(nodeIds: string[], optionsJson: string): Promise<string>;
   exportPng(outputPath: string, optionsJson: string): Promise<number>;
   exportPdf(outputPath: string, optionsJson: string): Promise<number>;
+  // Press-ready PDF (bleed + trim/registration marks + CMYK + spot
+  // separations). Resolves with the export-outcome JSON.
+  exportPrintReadyPdf(outputPath: string, requestJson: string): Promise<string>;
   exportWebp(outputPath: string, optionsJson: string): number;
   exportJpeg(outputPath: string, optionsJson: string): number;
 
@@ -761,6 +764,8 @@ export interface Bridge {
   // Phase 2 — print preflight, icon pack, async batch, AI extras,
   // plugin sandbox, MCP permission persistence.
   preflightRun(requestJson: string): string;
+  // Apply preflight auto-fixes then re-run; returns outcome JSON.
+  preflightAutofix(requestJson: string): string;
   exportIconPack(requestJson: string): string;
   exportIconPackBuiltInPlatforms(): string;
   exportBatchStart(jobJson: string): string;

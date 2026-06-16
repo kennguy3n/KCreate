@@ -34,7 +34,7 @@ use crate::pdf_shading::{
 pub use crate::scene_metadata::{RASTER_IMAGE_METADATA_KEY, VECTOR_PATH_METADATA_KEY};
 
 /// One PDF user-space point = 1/72 inch; 1 mm = 1/25.4 inch.
-const PT_PER_MM: f64 = 72.0 / 25.4;
+pub(crate) const PT_PER_MM: f64 = 72.0 / 25.4;
 
 /// Target color space used when writing PDF color operators.
 ///
@@ -360,6 +360,8 @@ pub enum PdfExportError {
     InvalidVectorPath(Uuid, String),
     #[error("invalid raster metadata on node {0}: {1}")]
     InvalidRasterMeta(Uuid, String),
+    #[error("node {0} is not a valid print page: {1}")]
+    InvalidPage(Uuid, String),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
     #[error("image decode: {0}")]
@@ -449,7 +451,7 @@ pub fn export_pdf_from_document_to_bytes(
     inject_shadings(bytes, &pending_shadings).map_err(PdfExportError::from)
 }
 
-const fn as_f32(value: f64) -> f32 {
+pub(crate) const fn as_f32(value: f64) -> f32 {
     // PDF page units fit easily within f32 range, but we still clamp
     // so a NaN/inf in user input becomes a defined fallback instead of
     // a panic downstream.
@@ -574,7 +576,7 @@ fn accumulate_bounds(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn emit_vector(
+pub(crate) fn emit_vector(
     node: &Node,
     layer: &PdfLayerReference,
     origin_x: f64,
@@ -651,7 +653,7 @@ fn emit_vector(
 /// representation. Extracted so the gradient emit path can reuse
 /// the exact same coordinate-space arithmetic as the solid path.
 #[allow(clippy::too_many_arguments)]
-fn build_rings(
+pub(crate) fn build_rings(
     path: &VectorPath,
     tx: f64,
     ty: f64,
@@ -730,6 +732,28 @@ fn build_rings(
     rings
 }
 
+/// Re-express our `(point, is_control)` rings in printpdf's polygon
+/// convention. `build_rings` flags a point when *it* is a Bézier
+/// control handle, but printpdf's `Polygon`/`Line` writer treats the
+/// flag as "the *next* point is a control handle" (it tests the
+/// previous and current flags to decide whether to emit a `c`
+/// operator). Feeding our convention straight through mis-groups
+/// curve points, so every cubic/quad collapses to a straight chord.
+/// Pure line/rect rings are unaffected — every flag is `false` either
+/// way — which is why this only ever surfaced on curved fills.
+fn rings_to_printpdf(rings: Vec<Vec<(Point, bool)>>) -> Vec<Vec<(Point, bool)>> {
+    rings
+        .into_iter()
+        .map(|ring| {
+            let n = ring.len();
+            ring.iter()
+                .enumerate()
+                .map(|(i, &(pt, _))| (pt, i + 1 < n && ring[i + 1].1))
+                .collect()
+        })
+        .collect()
+}
+
 /// Emit a polygon via printpdf's high-level helper, choosing fill
 /// vs stroke based on whether a fill colour was resolved.
 fn emit_solid_or_stroke(
@@ -769,7 +793,7 @@ fn emit_solid_or_stroke(
         PaintMode::Stroke
     };
     let polygon = Polygon {
-        rings,
+        rings: rings_to_printpdf(rings),
         mode,
         winding_order: WindingOrder::NonZero,
     };
@@ -904,7 +928,7 @@ fn emit_gradient(
 /// operator. Anchor-to-anchor segments become `l`. The first
 /// point of a ring is `m`; the last (if equal to the first)
 /// becomes `h`.
-fn emit_raw_path_operators(layer: &PdfLayerReference, rings: &[Vec<(Point, bool)>]) {
+pub(crate) fn emit_raw_path_operators(layer: &PdfLayerReference, rings: &[Vec<(Point, bool)>]) {
     for ring in rings {
         if ring.is_empty() {
             continue;
@@ -984,7 +1008,7 @@ fn node_local_to_pt(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn emit_raster(
+pub(crate) fn emit_raster(
     node: &Node,
     layer: &PdfLayerReference,
     rasters: &RasterPixelCache,
@@ -1147,7 +1171,8 @@ fn raster_to_cmyk_image(
     Ok(Image::from(xobject))
 }
 
-fn world_to_pdf(
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn world_to_pdf(
     wx: f64,
     wy: f64,
     origin_x: f64,
@@ -1204,6 +1229,100 @@ mod tests {
         assert!(bytes > 0);
         let written = std::fs::read(tmp.path()).unwrap();
         assert!(written.starts_with(b"%PDF-"));
+    }
+
+    #[test]
+    fn rings_to_printpdf_flags_predecessor_of_control_points() {
+        let p = |b: bool| (Point::new(Mm(0.0), Mm(0.0)), b);
+        // `build_rings` convention for one cubic: anchor, ctrl, ctrl,
+        // anchor (the two control points carry the flag).
+        let ring = vec![p(false), p(true), p(true), p(false)];
+        let out = rings_to_printpdf(vec![ring]).pop().unwrap();
+        let flags: Vec<bool> = out.iter().map(|(_, b)| *b).collect();
+        // printpdf convention: a flag means "the NEXT point is a Bézier
+        // handle", so the leading anchor + first handle are flagged and
+        // the trailing handle + final anchor are not. This is exactly
+        // what makes printpdf emit `c c1 c2 anchor` instead of folding
+        // the curve into straight chords.
+        assert_eq!(flags, vec![true, true, false, false]);
+    }
+
+    #[test]
+    fn pdf_export_preserves_cubic_curves() {
+        // A closed loop made of four cubic Béziers (a circle). Every
+        // segment is a curve, so the first path operator after the
+        // `m` must be a `c`. The pre-fix bug mis-grouped the control
+        // points and emitted a straight `l` to the first handle first,
+        // collapsing the curve — this asserts that no longer happens.
+        let r = 100.0_f64;
+        let k = r * 0.552_284_749_831;
+        let path = VectorPath::new(vec![
+            PathSegment::MoveTo(PathPoint::new(2.0 * r, r)),
+            PathSegment::CubicTo {
+                ctrl1: PathPoint::new(2.0 * r, r + k),
+                ctrl2: PathPoint::new(r + k, 2.0 * r),
+                end: PathPoint::new(r, 2.0 * r),
+            },
+            PathSegment::CubicTo {
+                ctrl1: PathPoint::new(r - k, 2.0 * r),
+                ctrl2: PathPoint::new(0.0, r + k),
+                end: PathPoint::new(0.0, r),
+            },
+            PathSegment::CubicTo {
+                ctrl1: PathPoint::new(0.0, r - k),
+                ctrl2: PathPoint::new(r - k, 0.0),
+                end: PathPoint::new(r, 0.0),
+            },
+            PathSegment::CubicTo {
+                ctrl1: PathPoint::new(r + k, 0.0),
+                ctrl2: PathPoint::new(2.0 * r, r - k),
+                end: PathPoint::new(2.0 * r, r),
+            },
+            PathSegment::Close,
+        ]);
+        let mut doc = DocumentGraph::new();
+        let page = doc.insert_node(Node::new(NodeType::Page, "Page")).unwrap();
+        let mut node = vector_node(&path, 0.0, 0.0, 2.0 * r, 2.0 * r);
+        node.parent_id = Some(page);
+        node.style.fill = FillStyle::Solid(kcreate_core::node::RgbaColor {
+            r: 0.0,
+            g: 0.0,
+            b: 1.0,
+            a: 1.0,
+        });
+        doc.insert_node(node).unwrap();
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let rasters = RasterPixelCache::new();
+        export_pdf_from_document(&doc, &PdfExportOptions::default(), &rasters, tmp.path()).unwrap();
+        let written = std::fs::read(tmp.path()).unwrap();
+        let stream = pdf_content_stream_text(&written);
+
+        // Four cubic segments → four `c` operators.
+        let curve_ops = stream
+            .lines()
+            .filter(|l| l.trim_end().ends_with(" c"))
+            .count();
+        assert_eq!(
+            curve_ops, 4,
+            "the four-cubic circle must emit four `c` operators, got stream {stream:?}"
+        );
+        // The first path operator after the move must be a curve, not a
+        // straight chord to a control point.
+        let ops: Vec<&str> = stream
+            .lines()
+            .map(str::trim)
+            .filter(|l| l.ends_with(" m") || l.ends_with(" l") || l.ends_with(" c"))
+            .collect();
+        let move_idx = ops
+            .iter()
+            .position(|l| l.ends_with(" m"))
+            .expect("expected a move-to operator");
+        assert!(
+            ops[move_idx + 1].ends_with(" c"),
+            "first path op after move must be a curve, got {:?} in {stream:?}",
+            ops[move_idx + 1]
+        );
     }
 
     /// printpdf compresses content streams by default. The compressed

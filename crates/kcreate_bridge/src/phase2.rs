@@ -1921,9 +1921,16 @@ fn apply_one_proposal(proposal: &kcreate_plugin::ProposedMutation) -> ProposalOu
 // MCP permissions
 // -----------------------------------------------------------------------------
 
+/// The process-wide MCP permission store, shared as an `Arc` between
+/// this bridge surface (which the settings UI drives) and the running
+/// MCP server (which consults the SAME store on every tool call — see
+/// [`crate::document::mcp_start`]). Returning an owned `Arc` rather
+/// than a `&'static` lets [`crate::document::mcp_start`] hand the
+/// server a clone whose grants and master switch stay in lockstep
+/// with the UI without a restart.
 #[cfg(feature = "mcp")]
-fn mcp_permission_store() -> &'static kcreate_mcp::McpPermissionStore {
-    static S: OnceLock<kcreate_mcp::McpPermissionStore> = OnceLock::new();
+pub(crate) fn mcp_permission_store() -> std::sync::Arc<kcreate_mcp::McpPermissionStore> {
+    static S: OnceLock<std::sync::Arc<kcreate_mcp::McpPermissionStore>> = OnceLock::new();
     S.get_or_init(|| {
         let dir = mcp_permission_dir();
         // `open_recoverable` quarantines a corrupt mcp_permissions.json
@@ -1933,9 +1940,24 @@ fn mcp_permission_store() -> &'static kcreate_mcp::McpPermissionStore {
         // surfaces a hard I/O failure (e.g. dir not writable), which we
         // do still treat as fatal — there is no sensible recovery for
         // "cannot create the permissions directory at all".
-        kcreate_mcp::McpPermissionStore::open_recoverable(&dir)
-            .expect("kcreate_bridge: MCP permission directory not writable")
+        std::sync::Arc::new(
+            kcreate_mcp::McpPermissionStore::open_recoverable(&dir)
+                .expect("kcreate_bridge: MCP permission directory not writable"),
+        )
     })
+    .clone()
+}
+
+/// The process-wide registry of *pending* permission prompts — tool
+/// calls a client attempted that have no decision on record yet. The
+/// MCP server records into it (via the [`crate::document::mcp_start`]
+/// gate) and the settings UI drains it as the user approves / denies.
+/// Shared as an `Arc` for the same lockstep reason as the store.
+#[cfg(feature = "mcp")]
+pub(crate) fn mcp_pending() -> std::sync::Arc<kcreate_mcp::PendingPermissions> {
+    static P: OnceLock<std::sync::Arc<kcreate_mcp::PendingPermissions>> = OnceLock::new();
+    P.get_or_init(|| std::sync::Arc::new(kcreate_mcp::PendingPermissions::new()))
+        .clone()
 }
 
 #[cfg(feature = "mcp")]
@@ -1965,7 +1987,12 @@ pub fn mcp_permission_grant(client_id: &str, tool_name: &str, grant: &str) -> Re
     let grant_kind = parse_grant(grant)?;
     mcp_permission_store()
         .grant(client_id, tool_name, grant_kind)
-        .map_err(|e| DocumentBridgeError::Io(std::io::Error::other(e.to_string())))
+        .map_err(|e| DocumentBridgeError::Io(std::io::Error::other(e.to_string())))?;
+    // The user has now made a decision for this (client, tool), so the
+    // queued prompt — if any — is resolved. Drop it so the settings
+    // panel's pending list reflects reality immediately.
+    mcp_pending().clear(client_id, tool_name);
+    Ok(())
 }
 
 #[cfg(not(feature = "mcp"))]
@@ -1980,11 +2007,73 @@ pub fn mcp_permission_grant(_client_id: &str, _tool_name: &str, _grant: &str) ->
 pub fn mcp_permission_revoke(client_id: &str, tool_name: &str) -> Result<()> {
     mcp_permission_store()
         .revoke(client_id, tool_name)
-        .map_err(|e| DocumentBridgeError::Io(std::io::Error::other(e.to_string())))
+        .map_err(|e| DocumentBridgeError::Io(std::io::Error::other(e.to_string())))?;
+    // Revoking is also a decision (back to "prompt next time"); clear
+    // any stale queued prompt for this scope.
+    mcp_pending().clear(client_id, tool_name);
+    Ok(())
 }
 
 #[cfg(not(feature = "mcp"))]
 pub fn mcp_permission_revoke(_client_id: &str, _tool_name: &str) -> Result<()> {
+    Ok(())
+}
+
+/// Whether the MCP master switch is on. With it off, every tool call
+/// is refused regardless of per-tool grants (the grants are preserved
+/// and restored when it is flipped back on).
+#[cfg(feature = "mcp")]
+#[must_use]
+pub fn mcp_master_enabled() -> bool {
+    mcp_permission_store().is_master_enabled()
+}
+
+#[cfg(not(feature = "mcp"))]
+#[must_use]
+pub const fn mcp_master_enabled() -> bool {
+    false
+}
+
+/// Flip the MCP master switch and persist it.
+#[cfg(feature = "mcp")]
+pub fn mcp_set_master_enabled(enabled: bool) -> Result<()> {
+    mcp_permission_store()
+        .set_master_enabled(enabled)
+        .map_err(|e| DocumentBridgeError::Io(std::io::Error::other(e.to_string())))
+}
+
+#[cfg(not(feature = "mcp"))]
+pub fn mcp_set_master_enabled(_enabled: bool) -> Result<()> {
+    Err(DocumentBridgeError::Io(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "MCP feature disabled at compile time",
+    )))
+}
+
+/// JSON array of the pending permission prompts (tool calls awaiting a
+/// user decision), newest activity sorted deterministically. Drives
+/// the settings panel's "approval inbox".
+#[cfg(feature = "mcp")]
+pub fn mcp_pending_list() -> Result<String> {
+    Ok(serde_json::to_string(&mcp_pending().list())?)
+}
+
+#[cfg(not(feature = "mcp"))]
+pub fn mcp_pending_list() -> Result<String> {
+    Ok("[]".to_string())
+}
+
+/// Drop a single queued prompt without recording a grant — e.g. the
+/// user dismissed it. (Approving / denying goes through
+/// [`mcp_permission_grant`], which clears the prompt as a side effect.)
+#[cfg(feature = "mcp")]
+pub fn mcp_pending_clear(client_id: &str, tool_name: &str) -> Result<()> {
+    mcp_pending().clear(client_id, tool_name);
+    Ok(())
+}
+
+#[cfg(not(feature = "mcp"))]
+pub fn mcp_pending_clear(_client_id: &str, _tool_name: &str) -> Result<()> {
     Ok(())
 }
 

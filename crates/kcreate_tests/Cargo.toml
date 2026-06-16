@@ -56,7 +56,7 @@ kcreate_kchat_client = { path = "../kcreate_kchat_client", features = ["test-fix
 # local-first deny-list test (`local_first.rs`) only walks the
 # editing-path crates under DEFAULT features, so enabling the
 # feature here does not weaken the invariant.
-kcreate_bridge = { path = "../kcreate_bridge", features = ["kchat-backend"] }
+kcreate_bridge = { path = "../kcreate_bridge", features = ["kchat-backend", "mcp"] }
 # Phase 7 Block B: community-gated collab tests (collab_communities.rs).
 kcreate_collab_transport = { path = "../kcreate_collab_transport" }
 ed25519-dalek = { workspace = true }

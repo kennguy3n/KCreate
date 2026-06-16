@@ -121,6 +121,7 @@ import type {
   IconPackBridge,
   IconPackPlatform,
   IconPackRequest,
+  McpPendingRequest,
   McpPermission,
   McpPermissionBridge,
   McpPermissionGrant,
@@ -2293,6 +2294,27 @@ const mcpPermission: McpPermissionBridge = {
   async status(): Promise<McpStatus> {
     const raw = (await ipcRenderer.invoke("kcreate/mcp/status")) as string;
     return JSON.parse(raw) as McpStatus;
+  },
+  async masterEnabled(): Promise<boolean> {
+    return (await ipcRenderer.invoke(
+      "kcreate/mcp/masterEnabled",
+    )) as boolean;
+  },
+  async setMasterEnabled(enabled: boolean): Promise<void> {
+    await ipcRenderer.invoke("kcreate/mcp/setMasterEnabled", enabled);
+  },
+  async pendingList(): Promise<McpPendingRequest[]> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/mcp/pending/list",
+    )) as string;
+    return JSON.parse(raw) as McpPendingRequest[];
+  },
+  async pendingClear(clientId: string, toolName: string): Promise<void> {
+    await ipcRenderer.invoke(
+      "kcreate/mcp/pending/clear",
+      clientId,
+      toolName,
+    );
   },
 };
 

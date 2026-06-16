@@ -3488,6 +3488,23 @@ export interface McpStatus {
   port: number;
 }
 
+/**
+ * A queued permission prompt: a tool call an external MCP client
+ * attempted for which the user has no decision on record yet. The
+ * settings panel renders these as an "approval inbox" (Allow once /
+ * Always / Deny). Field names are `snake_case` because the Rust
+ * `PendingPermissionRequest` crosses N-API as a JSON string (which
+ * keeps Rust field names) rather than a camelCased `#[napi(object)]`.
+ */
+export interface McpPendingRequest {
+  client_id: string;
+  tool_name: string;
+  first_requested_at: string;
+  last_requested_at: string;
+  /** How many times this (client, tool) pair has been requested while ungranted. */
+  attempts: number;
+}
+
 export interface McpPermissionBridge {
   list(): Promise<McpPermission[]>;
   grant(
@@ -3497,6 +3514,22 @@ export interface McpPermissionBridge {
   ): Promise<void>;
   revoke(clientId: string, toolName: string): Promise<void>;
   status(): Promise<McpStatus>;
+  /**
+   * Whether the MCP master switch is on. With it off, every tool call
+   * is refused regardless of per-tool grants (the grants are preserved
+   * and restored when it is flipped back on).
+   */
+  masterEnabled(): Promise<boolean>;
+  /** Flip the MCP master switch and persist it. */
+  setMasterEnabled(enabled: boolean): Promise<void>;
+  /** The tool calls awaiting a user decision (the approval inbox). */
+  pendingList(): Promise<McpPendingRequest[]>;
+  /**
+   * Dismiss a single queued prompt without recording a grant.
+   * Approving / denying goes through {@link grant}, which clears the
+   * prompt as a side effect.
+   */
+  pendingClear(clientId: string, toolName: string): Promise<void>;
 }
 
 // ---------------------------------------------------------------------------

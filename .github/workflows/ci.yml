@@ -57,14 +57,20 @@ jobs:
         run: cargo check --workspace --all-targets
       - name: cargo test
         run: cargo test --workspace --all-targets
-      # Feature-gated bridge code the default steps above never compile:
-      # the shared-memory present path (`native_canvas`, the only `unsafe`
-      # in the tree) and the dev-only dense-doc seed affordance
-      # (`dev_seed`). `native_canvas` now ships ON by default in packaged
-      # builds (see `stage-bridge.mjs`), so its clippy + tests are a
-      # required gate, not an afterthought.
+      # Feature-gated code the default steps above never compile: the
+      # shared-memory present path (`native_canvas`, the only `unsafe` in
+      # the tree) and the dev-only dense-doc seed affordance (`dev_seed`).
+      # `native_canvas` now ships ON by default in packaged builds (see
+      # `stage-bridge.mjs`), so its clippy + tests are a required gate, not
+      # an afterthought. `--all-targets` here also debug-compiles the
+      # feature-gated benches (`shared_present_dense`, `frame_present_dense`)
+      # and the `dense_present_proof` example, so they can't bitrot even
+      # though the slow release-profile bench sweep lives on the gated
+      # cross-platform lane below (see the note where the fast lane ends).
       - name: cargo clippy (native_canvas + dev_seed)
         run: cargo clippy -p kcreate_bridge --all-targets --features native_canvas,dev_seed -- -D warnings
+      - name: cargo clippy (renderer dev_seed)
+        run: cargo clippy -p kcreate_renderer --all-targets --features dev_seed -- -D warnings
       - name: cargo test (native_canvas + dev_seed)
         run: cargo test -p kcreate_bridge --features native_canvas,dev_seed
       # Hard gate the local-first invariant. `cargo test --workspace`
@@ -79,14 +85,15 @@ jobs:
       # protocol regression cannot hide behind other crates' output.
       - name: collab protocol tests
         run: cargo test -p kcreate_collab --all-targets
-      - name: cargo bench (compile only)
-        run: |
-          cargo bench -p kcreate_renderer --no-run --features dev_seed
-          cargo bench -p kcreate_bridge --no-run --features native_canvas,dev_seed
-          cargo bench -p kcreate_export --no-run
-          cargo bench -p kcreate_raster --no-run
-          cargo bench -p kcreate_ai --no-run
-          cargo bench -p kcreate_layout --no-run
+      # NOTE: the release-profile `cargo bench --no-run` sweep runs on the
+      # gated cross-platform lane below (and on every push to `main`), not
+      # here. Compiling all benches in the release/bench profile added ~10min
+      # and pushed this lane past its 25min budget. Every bench still gets a
+      # debug compile on each PR — non-gated benches via
+      # `cargo {clippy,test} --workspace --all-targets`, and the
+      # `native_canvas`/`dev_seed`-gated benches via the `--all-targets`
+      # clippy steps above — so this only defers release-profile-only compile
+      # errors (rare) to merge time.
 
   # Cross-platform lane — gated. See header comment for opt-in triggers.
   rust-extended:

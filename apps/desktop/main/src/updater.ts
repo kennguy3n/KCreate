@@ -166,20 +166,39 @@ export function createUpdaterController(deps: UpdaterDeps): UpdaterController {
     });
   }
 
-  const check = async (): Promise<UpdateState> => {
-    if (!supported) return snapshot();
+  // Run an autoUpdater operation and surface the resulting snapshot. The
+  // library routes failures through the `error` event (which the persistent
+  // handler above already turns into an error transition) and, in v6,
+  // resolves rather than rejecting; the local catch is a safety net for an
+  // unexpected synchronous throw. We suppress it when the `error` event
+  // already fired during this call so the renderer receives a single error
+  // transition instead of a redundant double push.
+  const runGuarded = async (op: () => Promise<unknown>): Promise<UpdateState> => {
+    let sawErrorEvent = false;
+    const markErrorEvent = (): void => {
+      sawErrorEvent = true;
+    };
+    autoUpdater.on("error", markErrorEvent);
     try {
-      // `checkForUpdates` drives the `checking` / `available` /
-      // `not-available` / `error` events above, which keep `state`
-      // current; we just surface the resulting snapshot to the caller.
-      await autoUpdater.checkForUpdates();
+      await op();
     } catch (err) {
-      transition({
-        status: "error",
-        error: err instanceof Error ? err.message : String(err),
-      });
+      if (!sawErrorEvent) {
+        transition({
+          status: "error",
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    } finally {
+      autoUpdater.removeListener("error", markErrorEvent);
     }
     return snapshot();
+  };
+
+  const check = async (): Promise<UpdateState> => {
+    if (!supported) return snapshot();
+    // `checkForUpdates` drives the `checking` / `available` /
+    // `not-available` / `error` events above, which keep `state` current.
+    return runGuarded(() => autoUpdater.checkForUpdates());
   };
 
   const download = async (): Promise<UpdateState> => {
@@ -192,15 +211,7 @@ export function createUpdaterController(deps: UpdaterDeps): UpdaterController {
       // than firing a no-target download at the feed.
       return snapshot();
     }
-    try {
-      await autoUpdater.downloadUpdate();
-    } catch (err) {
-      transition({
-        status: "error",
-        error: err instanceof Error ? err.message : String(err),
-      });
-    }
-    return snapshot();
+    return runGuarded(() => autoUpdater.downloadUpdate());
   };
 
   const quitAndInstall = (): void => {

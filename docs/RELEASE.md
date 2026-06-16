@@ -41,6 +41,10 @@ Configuration lives in [`apps/desktop/electron-builder.yml`](../apps/desktop/ele
    `kcreate_bridge.dll`) into `apps/desktop/build/bridge/`. `extraResources`
    maps that to `<resources>/bridge/`. Native libraries **cannot** be
    `dlopen`'d from inside an asar archive, so this must stay unpacked.
+   On macOS it builds both `x86_64-apple-darwin` and `aarch64-apple-darwin`
+   and merges them with `lipo` into a **universal** cdylib (override the
+   set with `KCREATE_BRIDGE_TARGETS`, or point `KCREATE_BRIDGE_SRC` at an
+   already-built artifact).
 
 3. **The app finds the cdylib at runtime.**
    [`bridge.ts::bridgeBinaryPath`](../apps/desktop/main/src/bridge.ts)
@@ -160,11 +164,14 @@ of which is required because the app loads the cdylib via `process.dlopen`).
 electron-builder signs, notarizes, and staples automatically when the
 variables above are present.
 
-> **arm64 / universal.** The macOS config lists both `x64` and `arm64`, but
-> a universal build needs a `lipo`'d cdylib (build the bridge for both
-> `x86_64-apple-darwin` and `aarch64-apple-darwin` and combine them before
-> staging). The CI lane builds the host (x64) slice; produce the arm64
-> slice on Apple silicon (or via cross-compilation) to ship both.
+> **arm64 / universal.** The macOS config ships both `x64` and `arm64`
+> because `stage-bridge.mjs` produces a **universal** cdylib: it builds the
+> bridge for `x86_64-apple-darwin` and `aarch64-apple-darwin` and merges
+> them with `lipo`, so each arch slice embeds a loadable bridge. The CI
+> lane installs both Rust targets and packages `--mac` (both arches). For a
+> fast single-arch dev build, set `KCREATE_BRIDGE_TARGETS=<triple>` and
+> constrain electron-builder to the matching arch (`--x64` / `--arm64`) so
+> you never package an arch whose cdylib slice is missing.
 
 ### Windows
 

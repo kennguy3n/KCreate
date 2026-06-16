@@ -49,9 +49,10 @@ jobs:
             builder_flags: "--linux --x64"
           - os: macos-13
             artifact: mac
-            # macOS arm64 / universal needs a cross-compiled cdylib
-            # (see docs/RELEASE.md); CI builds the host (x64) slice.
-            builder_flags: "--mac --x64"
+            # Ships both mac arches: the bridge is staged as a universal
+            # (x86_64 + arm64) cdylib (see the mac step + stage-bridge.mjs),
+            # so each arch slice embeds a loadable bridge.
+            builder_flags: "--mac"
           - os: windows-2022
             artifact: windows
             builder_flags: "--win --x64"
@@ -87,13 +88,24 @@ jobs:
       - run: pnpm install --frozen-lockfile
 
       - name: build bridge cdylib (release)
+        if: runner.os != 'macOS'
         run: cargo build --release -p kcreate_bridge
+
+      - name: build universal bridge cdylib (release)
+        if: runner.os == 'macOS'
+        # Both apple-darwin slices so stage:bridge can `lipo` them into a
+        # universal cdylib that loads in both the x64 and arm64 .app builds.
+        run: |
+          rustup target add x86_64-apple-darwin aarch64-apple-darwin
+          cargo build --release -p kcreate_bridge --target x86_64-apple-darwin
+          cargo build --release -p kcreate_bridge --target aarch64-apple-darwin
 
       - name: build app bundles (main/preload/renderer)
         run: pnpm --filter @kcreate/desktop build
 
       - name: stage bridge cdylib
-        # The cdylib was just built above; skip the script's own cargo build.
+        # The cdylib slice(s) were just built above; skip the script's own
+        # cargo build. On macOS stage:bridge lipo-merges the two slices.
         env:
           KCREATE_SKIP_BRIDGE_BUILD: "1"
         run: pnpm --filter @kcreate/desktop stage:bridge

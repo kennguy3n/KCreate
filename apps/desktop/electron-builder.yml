@@ -111,6 +111,11 @@ nsis:
   createStartMenuShortcut: true
 
 mac:
+  # Both arches ship. This is only valid because `scripts/stage-bridge.mjs`
+  # produces a UNIVERSAL (x86_64 + arm64) cdylib via `lipo`, so each arch
+  # slice embeds a bridge it can actually load. A single-arch cdylib would
+  # leave the non-host slice broken — constrain the build with `--x64` /
+  # `--arm64` (matching a single-arch cdylib) if you only stage one arch.
   category: public.app-category.graphics-design
   target:
     - target: dmg

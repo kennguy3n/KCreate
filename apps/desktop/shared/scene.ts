@@ -1535,9 +1535,12 @@ export interface UpdateState {
   /** The running app version (`app.getVersion()`). */
   currentVersion: string;
   /**
-   * The configured update feed URL once resolved (e.g. the GitHub
-   * releases base or a generic server), or `null` when no feed is
-   * configured / the build is unpackaged.
+   * The explicitly-configured generic feed URL (from
+   * `KCREATE_UPDATE_FEED_URL`), surfaced for display / diagnostics.
+   * `null` when relying on the provider baked into `app-update.yml`
+   * (e.g. GitHub releases) — in that case a feed *is* configured, it is
+   * just owned by electron-updater rather than overridden here — or when
+   * the build is unpackaged and updates are disabled.
    */
   feedUrl: string | null;
   /** Release metadata once an update is `available` / `downloading` / `downloaded`. */

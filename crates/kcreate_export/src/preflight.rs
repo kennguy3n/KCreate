@@ -1037,7 +1037,7 @@ fn check_node_color_space(
         check: PreflightCheck::ColorSpace,
         severity: PreflightSeverity::Warning,
         message: format!(
-            "Layer '{name}' uses an RGB fill but the target is CMYK; conversion is approximate until Phase 3 ICC support lands.",
+            "Layer '{name}' uses an RGB fill but the target is CMYK; the export applies an approximate sRGB\u{2192}CMYK conversion (no embedded ICC profile).",
             name = node.name,
         ),
         affected_node_id: Some(node.id),

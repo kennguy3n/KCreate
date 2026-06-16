@@ -212,7 +212,7 @@ pub fn handle_export_artboard(
         }
         other => Err((
             codes::INVALID_PARAMS,
-            format!("unsupported format: {other} (Phase 0 supports: svg)"),
+            format!("unsupported format: {other} (supported: svg)"),
         )),
     }
 }

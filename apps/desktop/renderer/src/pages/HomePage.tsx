@@ -12,6 +12,7 @@ import type {
 import { colors, font, radius, shadow, spacing } from "../styles/tokens";
 import { BriefModal } from "../components/BriefModal";
 import { Icon, type IconName } from "../components/Icon";
+import { UpdateControl } from "../components/UpdatePanel";
 import {
   WelcomeModal,
   shouldShowWelcomeModal,
@@ -394,7 +395,16 @@ export function HomePage({
           </span>
           <span>KCreate</span>
         </div>
-        <RuntimeBadge status={status} error={statusError} />
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: spacing.md,
+          }}
+        >
+          <UpdateControl />
+          <RuntimeBadge status={status} error={statusError} />
+        </div>
       </header>
 
       <main

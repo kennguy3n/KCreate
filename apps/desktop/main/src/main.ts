@@ -24,6 +24,12 @@ import {
   type OnboardingHandle,
   type OnboardingInstallReport,
 } from "./onboardingDownloader";
+import {
+  createUpdaterController,
+  UPDATE_STATE_CHANGED_CHANNEL,
+  type UpdaterController,
+} from "./updater";
+import type { UpdateState } from "../../shared/scene";
 
 /// Naming convention for scratch projects opened from the Home tile.
 /// Centralised here so the cleanup pass (`cleanupScratchProjects`) and
@@ -283,6 +289,28 @@ function requireBridge(): Bridge {
 // window's `closed` event so a stale reference can never outlive the
 // native handle it would hand out.
 let mainWindow: BrowserWindow | null = null;
+
+// I1 — auto-update controller. Created once in `app.whenReady` (after the
+// bridge loads) so `app.getVersion()` and `app.isPackaged` are valid. The
+// `kcreate/update/*` IPC handlers proxy to it; `null` only before init.
+let updaterController: UpdaterController | null = null;
+
+function requireUpdater(): UpdaterController {
+  if (!updaterController) {
+    throw new Error("kcreate: update controller accessed before init");
+  }
+  return updaterController;
+}
+
+// Push an `UpdateState` snapshot to the renderer. Mirrors the
+// `broadcastColorSettingsChanged` pattern: no-op when no live window so a
+// background transition (e.g. a download finishing after the window
+// closed) can't throw on a destroyed `webContents`.
+function broadcastUpdateState(state: UpdateState): void {
+  const win = mainWindow;
+  if (!win || win.isDestroyed()) return;
+  win.webContents.send(UPDATE_STATE_CHANGED_CHANNEL, state);
+}
 
 // Phase C — handle to the in-flight one-click recommended-pack
 // download, or `null` when no download is running. The
@@ -2835,6 +2863,17 @@ function registerIpcHandlers(): void {
     const validated = validateOpenExternalUrl(url);
     await shell.openExternal(validated);
   });
+  // I1 — auto-update. Each handler proxies to the single
+  // `UpdaterController`; state transitions it drives are pushed
+  // independently over `UPDATE_STATE_CHANGED_CHANNEL`, but the
+  // imperative handlers also resolve with the resulting snapshot so a
+  // caller that doesn't subscribe still gets an immediate answer.
+  ipcMain.handle("kcreate/update/getState", () => requireUpdater().getState());
+  ipcMain.handle("kcreate/update/check", () => requireUpdater().check());
+  ipcMain.handle("kcreate/update/download", () => requireUpdater().download());
+  ipcMain.handle("kcreate/update/quitAndInstall", () => {
+    requireUpdater().quitAndInstall();
+  });
   // `kcreate/pdf/pickFile` opens an Electron-native file picker
   // scoped to .pdf so the renderer can hand the resolved path to
   // `kcreate/pdf/import`. We keep the picker in the main process
@@ -4091,7 +4130,21 @@ if (!app.requestSingleInstanceLock()) {
   void app.whenReady().then(() => {
     // Load the native bridge synchronously, before any window/IPC traffic
     // can hit `requireBridge()`. See the comment above `let bridge`.
-    bridge = loadBridge();
+    // `app.isPackaged` + `process.resourcesPath` let the resolver find the
+    // cdylib under `<resources>/bridge/` in an installed build (it ships
+    // there via electron-builder `extraResources`) while keeping the
+    // `target/<profile>` dev path for source runs.
+    bridge = loadBridge({
+      isPackaged: app.isPackaged,
+      resourcesPath: process.resourcesPath,
+    });
+    // Wire the auto-updater before IPC so the `kcreate/update/*`
+    // handlers always have a live controller to delegate to. It
+    // self-disables on unpackaged dev runs (reports `disabled`),
+    // so this is a no-op there beyond an idle snapshot.
+    updaterController = createUpdaterController({
+      broadcast: broadcastUpdateState,
+    });
     registerIpcHandlers();
     // Wire the KChat trust-store at `<userData>/kchat_trust.json`.
     // Must run AFTER the bridge is loaded (it dispatches an N-API

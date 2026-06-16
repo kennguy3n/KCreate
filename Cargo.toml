@@ -38,6 +38,16 @@ members = [
     "crates/kcreate_kchat_client",
     "crates/kcreate_tests",
 ]
+# The I4 demo plugins target `wasm32-unknown-unknown` and import host
+# functions that only exist inside the wasmi runtime, so they cannot
+# build for the host target and must stay out of the workspace graph.
+# Their prebuilt `.wasm` binaries are committed under
+# `crates/kcreate_plugin/bundled/`; rebuild via
+# `crates/kcreate_plugin/demo_plugins/build.sh`.
+exclude = [
+    "crates/kcreate_plugin/demo_plugins/grid_arrange",
+    "crates/kcreate_plugin/demo_plugins/palette_apply",
+]
 
 [workspace.package]
 version = "0.0.1"

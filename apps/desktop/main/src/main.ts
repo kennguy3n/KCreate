@@ -2673,9 +2673,18 @@ function registerIpcHandlers(): void {
     (): string => requireBridge().pluginMarketplaceList(),
   );
   ipcMain.handle(
+    "kcreate/phase10/plugin-marketplace/catalog",
+    (): string => requireBridge().pluginMarketplaceCatalog(),
+  );
+  ipcMain.handle(
     "kcreate/phase10/plugin-marketplace/install-local",
     (_e, path: string): string =>
       requireBridge().pluginMarketplaceInstallLocal(path),
+  );
+  ipcMain.handle(
+    "kcreate/phase10/plugin-marketplace/install-bundled",
+    (_e, id: string): string =>
+      requireBridge().pluginMarketplaceInstallBundled(id),
   );
   ipcMain.handle(
     "kcreate/phase10/plugin-marketplace/remove",
@@ -2986,6 +2995,11 @@ function registerIpcHandlers(): void {
     "kcreate/plugin/executeWithContext",
     (_e, id: string, fn: string, input: string) =>
       requireBridge().pluginExecuteWithContext(id, fn, input),
+  );
+  ipcMain.handle(
+    "kcreate/plugin/executeOnSelection",
+    (_e, id: string, fn: string, paramsJson: string) =>
+      requireBridge().pluginExecuteOnSelection(id, fn, paramsJson),
   );
   ipcMain.handle("kcreate/plugin/js/list", () =>
     requireBridge().pluginJsList(),

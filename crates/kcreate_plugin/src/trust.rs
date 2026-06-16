@@ -143,6 +143,38 @@ impl TrustStore {
         Self::from_keys(keys)
     }
 
+    /// Merge additional trusted keys into this store **without**
+    /// overriding keys already present. Used by the host to fold the
+    /// compiled-in bundled publisher key into the user's on-disk trust
+    /// store: a user who has deliberately pinned a different key under
+    /// the same id always wins (their entry is kept; the incoming one
+    /// is skipped). Incoming keys with a fresh id are validated and
+    /// added; a malformed incoming key is an error.
+    pub fn merge_keys(&mut self, keys: Vec<TrustedKey>) -> Result<(), TrustError> {
+        for k in keys {
+            if self.keys.contains_key(&k.id) {
+                continue;
+            }
+            let bytes = decode_b64(&k.public_key_b64)
+                .map_err(|e| TrustError::InvalidKeyEncoding(k.id.clone(), e))?;
+            if bytes.len() != ED25519_PUBLIC_KEY_LEN {
+                return Err(TrustError::WrongKeyLength {
+                    id: k.id,
+                    expected: ED25519_PUBLIC_KEY_LEN,
+                    actual: bytes.len(),
+                });
+            }
+            let arr: [u8; ED25519_PUBLIC_KEY_LEN] = bytes
+                .try_into()
+                .expect("just checked length matches ED25519_PUBLIC_KEY_LEN");
+            let vk = VerifyingKey::from_bytes(&arr)
+                .map_err(|e| TrustError::InvalidKey(k.id.clone(), e.to_string()))?;
+            self.keys.insert(k.id.clone(), vk);
+            self.comments.insert(k.id, k.comment);
+        }
+        Ok(())
+    }
+
     /// Iterator over `(key_id, comment)` pairs in arbitrary order.
     /// Used by the bridge to surface the trust list to the UI.
     pub fn entries(&self) -> impl Iterator<Item = (&str, &str)> + '_ {
@@ -337,5 +369,38 @@ mod tests {
         let store = TrustStore::load_from_path(&path).unwrap();
         assert!(store.contains("disk-key"));
         assert_eq!(store.len(), 1);
+    }
+
+    #[test]
+    fn merge_keys_adds_new_ids_but_keeps_existing_on_collision() {
+        let user_sk = signing_key_from_seed(11);
+        let bundled_sk = signing_key_from_seed(12);
+        // Store starts with the user's own pin under id "shared".
+        let mut store = TrustStore::from_keys(vec![trusted_pair("shared", &user_sk)]).unwrap();
+        // Merge a *different* key under the same id, plus a fresh id.
+        store
+            .merge_keys(vec![
+                trusted_pair("shared", &bundled_sk),
+                trusted_pair("bundled", &bundled_sk),
+            ])
+            .unwrap();
+        assert_eq!(
+            store.len(),
+            2,
+            "fresh id added, colliding id not duplicated"
+        );
+
+        let msg = b"a real manifest payload";
+        // The user's key still owns "shared" (collision skipped).
+        let user_sig = encode_b64(&user_sk.sign(msg).to_bytes());
+        store.verify("shared", msg, &user_sig).unwrap();
+        // The bundled key did NOT take over "shared".
+        let bundled_sig = encode_b64(&bundled_sk.sign(msg).to_bytes());
+        assert!(matches!(
+            store.verify("shared", msg, &bundled_sig),
+            Err(TrustError::VerificationFailed)
+        ));
+        // The bundled key owns its own fresh id.
+        store.verify("bundled", msg, &bundled_sig).unwrap();
     }
 }

@@ -1,0 +1,10 @@
+{
+  "id": "com.kcreate.demo.grid-arrange",
+  "name": "Grid Arrange",
+  "version": "0.1.0",
+  "author": "KCreate Labs",
+  "description": "Tidy the current selection into an even grid. Computes columns from the selection count, snaps every layer onto a uniform cell, and applies the moves as one undoable proposal.",
+  "type": "wasm",
+  "entry_point": "grid_arrange.wasm",
+  "permissions": ["read_document", "write_document"]
+}

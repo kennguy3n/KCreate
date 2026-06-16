@@ -1076,19 +1076,46 @@ pub struct PluginListing {
     pub installed: bool,
 }
 
-/// List installed plugins discovered under `~/.kcreate/plugins/`.
+/// Construct a marketplace rooted at the *same* on-disk plugin
+/// directory the phase-2 registry/runtime use (honouring
+/// `KCREATE_PLUGIN_DIR`) and seeded with the *same* trust store
+/// (user `trusted_keys.json` + the compiled-in bundled publisher key).
+///
+/// `PluginMarketplace::default()` resolves only `HOME`/`USERPROFILE`
+/// and carries an empty trust store, so a plugin installed via the
+/// marketplace would land in a different directory than the one the
+/// runtime scans and would always read back as `unsigned`. Routing
+/// through `phase2` keeps install/list/remove and enable/execute
+/// pointed at one directory with one trust policy.
+fn plugin_marketplace() -> kcreate_plugin::marketplace::PluginMarketplace {
+    kcreate_plugin::marketplace::PluginMarketplace::with_trust(
+        crate::phase2::plugin_dir(),
+        crate::phase2::load_trust_store(),
+    )
+}
+
+/// List installed plugins discovered under the active plugin directory.
 pub fn plugin_marketplace_list() -> Result<Vec<PluginListing>> {
-    let marketplace = kcreate_plugin::marketplace::PluginMarketplace::default();
-    let listings = marketplace
+    let listings = plugin_marketplace()
         .list()
         .map_err(|e| DocumentBridgeError::Internal(format!("plugin_marketplace_list: {e}")))?;
     Ok(listings.into_iter().map(Into::into).collect())
 }
 
+/// Full marketplace catalog: installed plugins first, then every
+/// compiled-in bundled (first-party) plugin that is not yet installed,
+/// each tagged with its trust status and `installed` flag. This is the
+/// offline, on-device source for the in-app gallery — no network.
+pub fn plugin_marketplace_catalog() -> Result<Vec<PluginListing>> {
+    let listings = plugin_marketplace()
+        .catalog()
+        .map_err(|e| DocumentBridgeError::Internal(format!("plugin_marketplace_catalog: {e}")))?;
+    Ok(listings.into_iter().map(Into::into).collect())
+}
+
 /// Install a plugin from a local `.wasm`/`.kcplugin` file.
 pub fn plugin_marketplace_install_local(path: &str) -> Result<PluginListing> {
-    let marketplace = kcreate_plugin::marketplace::PluginMarketplace::default();
-    let listing = marketplace
+    let listing = plugin_marketplace()
         .install_local(std::path::Path::new(path))
         .map_err(|e| {
             DocumentBridgeError::Internal(format!("plugin_marketplace_install_local: {e}"))
@@ -1096,10 +1123,20 @@ pub fn plugin_marketplace_install_local(path: &str) -> Result<PluginListing> {
     Ok(listing.into())
 }
 
+/// Install one of the compiled-in bundled (first-party) plugins by id.
+/// The manifest, signature sidecar, and `.wasm` are written from the
+/// embedded bytes into the active plugin directory; the returned
+/// listing reflects the freshly-scanned trust status.
+pub fn plugin_marketplace_install_bundled(id: &str) -> Result<PluginListing> {
+    let listing = plugin_marketplace().install_bundled(id).map_err(|e| {
+        DocumentBridgeError::Internal(format!("plugin_marketplace_install_bundled: {e}"))
+    })?;
+    Ok(listing.into())
+}
+
 /// Remove a plugin by id.
 pub fn plugin_marketplace_remove(id: &str) -> Result<bool> {
-    let marketplace = kcreate_plugin::marketplace::PluginMarketplace::default();
-    marketplace
+    plugin_marketplace()
         .remove(id)
         .map_err(|e| DocumentBridgeError::Internal(format!("plugin_marketplace_remove: {e}")))
 }

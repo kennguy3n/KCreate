@@ -1,0 +1,26 @@
+# Dev tool: re-signs the bundled demo-plugin manifests with KCreate's
+# deterministic development signing key and regenerates
+# `bundled/trusted_keys.json`. Intentionally OUTSIDE the cargo
+# workspace (its own `[workspace]` table below) so it is not part of
+# the `-D warnings` gate surface and never links into the shipping
+# bridge — it is only ever run by `demo_plugins/build.sh`.
+#
+# The signing key is a FIXED 32-byte seed (see `src/main.rs`). It is a
+# development key, not a production release key: it exists so the
+# bundled demo plugins carry a real, verifiable Ed25519 signature that
+# the in-app trust UX can display as "verified", and so the signatures
+# can be regenerated deterministically whenever a manifest changes.
+[workspace]
+
+[package]
+name = "kcreate_sign_bundled"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+publish = false
+
+[dependencies]
+ed25519-dalek = { version = "2.1", default-features = false, features = ["std", "fast"] }
+base64 = "0.22"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

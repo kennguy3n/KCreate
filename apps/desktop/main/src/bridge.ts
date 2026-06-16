@@ -834,6 +834,11 @@ export interface Bridge {
     function_: string,
     input: string,
   ): string;
+  pluginExecuteOnSelection(
+    id: string,
+    function_: string,
+    paramsJson: string,
+  ): string;
   pluginJsList(): string;
   pluginJsMessage(pluginId: string, messageJson: string): string;
   pluginTrustList(): string;
@@ -1446,7 +1451,9 @@ export interface Bridge {
   // Brand Hub + Plugin Marketplace (Block D)
   aiBrandToBrochure(brandKitIdStr: string, numPages: number): string;
   pluginMarketplaceList(): string;
+  pluginMarketplaceCatalog(): string;
   pluginMarketplaceInstallLocal(path: string): string;
+  pluginMarketplaceInstallBundled(id: string): string;
   pluginMarketplaceRemove(id: string): boolean;
   exportPdfMulti(optionsJson: string, outputPath: string): string;
 

@@ -3882,6 +3882,22 @@ pub fn plugin_execute_with_context(
     phase2::plugin_execute_with_context(&id, &function, &input).map_err(map_doc_err)
 }
 
+/// Run a plugin against the current selection. The bridge builds the
+/// plugin input JSON from the live document (each selected node's id,
+/// position, and size) merged with caller-supplied `params_json`,
+/// executes the plugin in the sandbox with the extended ABI, and
+/// applies any emitted proposals as a single undoable operation.
+/// Returns the same `{output, logs, proposals}` envelope as
+/// `plugin_execute_with_context`.
+#[napi]
+pub fn plugin_execute_on_selection(
+    id: String,
+    function: String,
+    params_json: String,
+) -> NapiResult<String> {
+    phase2::plugin_execute_on_selection(&id, &function, &params_json).map_err(map_doc_err)
+}
+
 /// List installed JS panel plugins. Returns a JSON array of
 /// `JsPanelInfo` so the Electron main process can decide which
 /// sandboxed `BrowserView` instances to mount.
@@ -6437,11 +6453,30 @@ pub fn plugin_marketplace_list() -> NapiResult<String> {
     json_out("plugin_marketplace_list", &res)
 }
 
+/// Full marketplace catalog (installed plugins + not-yet-installed
+/// bundled first-party plugins), each with trust status and
+/// `installed` flag. Offline, on-device — no network.
+#[napi]
+pub fn plugin_marketplace_catalog() -> NapiResult<String> {
+    let res = phase10::plugin_marketplace_catalog().map_err(map_doc_err)?;
+    json_out("plugin_marketplace_catalog", &res)
+}
+
 #[napi]
 #[allow(clippy::needless_pass_by_value)]
 pub fn plugin_marketplace_install_local(path: String) -> NapiResult<String> {
     let res = phase10::plugin_marketplace_install_local(&path).map_err(map_doc_err)?;
     json_out("plugin_marketplace_install_local", &res)
+}
+
+/// Install one of the compiled-in bundled (first-party) plugins by id,
+/// writing its embedded manifest + signature + `.wasm` into the active
+/// plugin directory. Returns the freshly-scanned listing.
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn plugin_marketplace_install_bundled(id: String) -> NapiResult<String> {
+    let res = phase10::plugin_marketplace_install_bundled(&id).map_err(map_doc_err)?;
+    json_out("plugin_marketplace_install_bundled", &res)
 }
 
 #[napi]

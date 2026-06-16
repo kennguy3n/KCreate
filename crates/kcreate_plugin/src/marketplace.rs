@@ -22,8 +22,10 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use zip::ZipArchive;
 
+use crate::bundled::{bundled_plugin, bundled_plugins};
 use crate::manifest::{ManifestError, PluginManifest, PluginPermission};
 use crate::registry::{PluginRegistry, RegistryError, SignatureStatus};
+use crate::trust::TrustStore;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -113,22 +115,52 @@ pub fn default_plugin_dir() -> Option<PathBuf> {
 #[derive(Debug, Clone)]
 pub struct PluginMarketplace {
     plugin_dir: PathBuf,
+    /// Trusted publisher keys used to verify signature sidecars when
+    /// listing or installing. Empty by default; the bridge seeds it
+    /// from the on-disk trust store merged with the bundled publisher
+    /// key so installed signed plugins render as "verified".
+    trust: TrustStore,
 }
 
 impl Default for PluginMarketplace {
     fn default() -> Self {
         let dir =
             default_plugin_dir().unwrap_or_else(|| std::env::temp_dir().join("kcreate-plugins"));
-        Self { plugin_dir: dir }
+        Self {
+            plugin_dir: dir,
+            trust: TrustStore::default(),
+        }
     }
 }
 
 impl PluginMarketplace {
     /// Create a marketplace rooted at `plugin_dir`. The directory is
     /// created on demand by [`Self::list`] / [`Self::install_local`].
+    /// Signature verification uses an empty trust store; use
+    /// [`Self::with_trust`] to surface verified status.
     #[must_use]
     pub fn new(plugin_dir: PathBuf) -> Self {
-        Self { plugin_dir }
+        Self {
+            plugin_dir,
+            trust: TrustStore::default(),
+        }
+    }
+
+    /// Create a marketplace rooted at `plugin_dir` that verifies
+    /// signature sidecars against `trust`. The bridge passes its
+    /// merged on-disk + bundled trust store here so the catalog and
+    /// installed listings report the correct `verified` / `invalid`
+    /// trust state.
+    #[must_use]
+    pub fn with_trust(plugin_dir: PathBuf, trust: TrustStore) -> Self {
+        Self { plugin_dir, trust }
+    }
+
+    /// A registry rooted at this marketplace's plugin dir, carrying
+    /// the configured trust store so signature status is evaluated
+    /// against the right publisher keys.
+    fn registry(&self) -> PluginRegistry {
+        PluginRegistry::with_trust(self.plugin_dir.clone(), self.trust.clone())
     }
 
     /// Enumerate installed plugins. Defensively skips any on-disk
@@ -137,7 +169,7 @@ impl PluginMarketplace {
     /// would otherwise be reachable via [`Self::remove`].
     pub fn list(&self) -> Result<Vec<PluginListing>, MarketplaceError> {
         self.ensure_dir()?;
-        let mut reg = PluginRegistry::new(self.plugin_dir.clone());
+        let mut reg = self.registry();
         reg.scan()?;
         let mut out = Vec::new();
         for manifest in reg.list() {
@@ -148,6 +180,65 @@ impl PluginMarketplace {
             out.push(make_listing(manifest, sig.as_ref(), true));
         }
         Ok(out)
+    }
+
+    /// The full marketplace view: every installed plugin plus every
+    /// bundled demo plugin that is not yet installed (marked
+    /// `installed: false`). Bundled entries report the trust state of
+    /// their embedded signature so the gallery can show them as
+    /// verified before install. Sorted by display name, then id, for
+    /// a stable gallery order.
+    pub fn catalog(&self) -> Result<Vec<PluginListing>, MarketplaceError> {
+        let installed = self.list()?;
+        let installed_ids: std::collections::HashSet<String> =
+            installed.iter().map(|l| l.id.clone()).collect();
+        let mut out = installed;
+        for bp in bundled_plugins() {
+            if installed_ids.contains(bp.id) {
+                continue;
+            }
+            let manifest = bp.manifest()?;
+            let sig = bp.signature_status();
+            out.push(make_listing(&manifest, Some(&sig), false));
+        }
+        out.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.id.cmp(&b.id)));
+        Ok(out)
+    }
+
+    /// Install one of the compiled-in bundled demo plugins by id,
+    /// materialising its embedded `manifest.json`, signature sidecar,
+    /// and `.wasm` into the plugin directory. Atomic: files are
+    /// written to a per-pid staging dir then renamed into place.
+    pub fn install_bundled(&self, id: &str) -> Result<PluginListing, MarketplaceError> {
+        validate_plugin_id(id)?;
+        let bp = bundled_plugin(id).ok_or_else(|| MarketplaceError::NotFound(PathBuf::from(id)))?;
+        self.ensure_dir()?;
+        let dest = self.plugin_dir.join(id);
+        if dest.exists() {
+            return Err(MarketplaceError::AlreadyInstalled(id.to_string()));
+        }
+        sweep_stale_staging(&self.plugin_dir);
+        let staging = self
+            .plugin_dir
+            .join(format!(".staging-{}", std::process::id()));
+        if staging.exists() {
+            let _ = fs::remove_dir_all(&staging);
+        }
+        fs::create_dir_all(&staging)?;
+        fs::write(staging.join("manifest.json"), bp.manifest_json)?;
+        fs::write(staging.join("manifest.json.sig"), bp.signature_json)?;
+        fs::write(staging.join(bp.wasm_name), bp.wasm_bytes)?;
+        fs::rename(&staging, &dest).or_else(|_| {
+            copy_dir_recursive(&staging, &dest)?;
+            fs::remove_dir_all(&staging)
+        })?;
+        // Re-scan so the returned listing reflects on-disk signature
+        // status verified against the configured trust store.
+        let mut reg = self.registry();
+        reg.scan()?;
+        let manifest = bp.manifest()?;
+        let sig = reg.signature_status_for(&manifest.id).cloned();
+        Ok(make_listing(&manifest, sig.as_ref(), true))
     }
 
     /// Install a plugin from a local source: either a directory
@@ -168,7 +259,7 @@ impl PluginMarketplace {
         let (manifest, _raw) = PluginManifest::load_with_raw(&staged_dir)?;
         // Reject duplicates by id — refuse-and-cleanup so the on-disk
         // state stays consistent even on the error path.
-        let mut reg = PluginRegistry::new(self.plugin_dir.clone());
+        let mut reg = self.registry();
         reg.scan()?;
         let already = reg.list().iter().any(|m| {
             m.id == manifest.id
@@ -180,7 +271,7 @@ impl PluginMarketplace {
         }
         // Re-scan to pick up the new plugin and surface signature
         // status.
-        let mut reg2 = PluginRegistry::new(self.plugin_dir.clone());
+        let mut reg2 = self.registry();
         reg2.scan()?;
         let sig = reg2.signature_status_for(&manifest.id).cloned();
         Ok(make_listing(&manifest, sig.as_ref(), true))
@@ -195,7 +286,7 @@ impl PluginMarketplace {
     pub fn remove(&self, id: &str) -> Result<bool, MarketplaceError> {
         validate_plugin_id(id)?;
         self.ensure_dir()?;
-        let mut reg = PluginRegistry::new(self.plugin_dir.clone());
+        let mut reg = self.registry();
         reg.scan()?;
         let manifest = match reg.list().iter().find(|m| m.id == id).copied() {
             Some(m) => m.clone(),
@@ -236,8 +327,19 @@ fn make_listing(
     }
 }
 
+/// Stable wire name for a permission. Matches the serde `snake_case`
+/// rename used everywhere else on the bridge wire (the `PluginPermission`
+/// TS union, `PluginListEntry.permissions`), so the gallery can render
+/// catalog entries and installed entries with one shared component.
 fn permission_str(p: PluginPermission) -> String {
-    format!("{p:?}")
+    match p {
+        PluginPermission::ReadDocument => "read_document",
+        PluginPermission::WriteDocument => "write_document",
+        PluginPermission::ReadAssets => "read_assets",
+        PluginPermission::ExportFiles => "export_files",
+        PluginPermission::NetworkAccess => "network_access",
+    }
+    .to_string()
 }
 
 fn trust_status_str(sig: Option<&SignatureStatus>) -> String {
@@ -473,6 +575,75 @@ mod tests {
         let _ = mp.install_local(&src).unwrap();
         let err = mp.install_local(&src).unwrap_err();
         assert!(matches!(err, MarketplaceError::AlreadyInstalled(_)));
+    }
+
+    #[test]
+    fn catalog_lists_bundled_with_snake_case_permissions_and_trust() {
+        let plugins = TempDir::new().unwrap();
+        let mp = PluginMarketplace::with_trust(
+            plugins.path().to_path_buf(),
+            crate::bundled::bundled_trust_store().unwrap(),
+        );
+        let catalog = mp.catalog().unwrap();
+        let grid = catalog
+            .iter()
+            .find(|p| p.id == "com.kcreate.demo.grid-arrange")
+            .expect("grid-arrange demo present in catalog");
+        // Bundled-but-not-installed, signed by the bundled key.
+        assert!(!grid.installed);
+        assert!(
+            grid.trust_status.starts_with("verified:"),
+            "expected verified trust, got {:?}",
+            grid.trust_status
+        );
+        // Permissions use the snake_case wire form shared with
+        // `PluginListEntry` so the gallery renders both with one pill.
+        assert!(
+            grid.permissions
+                .iter()
+                .all(|p| p.chars().all(|c| c.is_ascii_lowercase() || c == '_')),
+            "permissions must be snake_case, got {:?}",
+            grid.permissions
+        );
+        assert!(grid.permissions.contains(&"write_document".to_string()));
+    }
+
+    #[test]
+    fn install_bundled_round_trips_and_rejects_reinstall() {
+        let plugins = TempDir::new().unwrap();
+        let mp = PluginMarketplace::with_trust(
+            plugins.path().to_path_buf(),
+            crate::bundled::bundled_trust_store().unwrap(),
+        );
+        let listing = mp
+            .install_bundled("com.kcreate.demo.palette-apply")
+            .unwrap();
+        assert_eq!(listing.id, "com.kcreate.demo.palette-apply");
+        assert!(listing.installed);
+        assert!(
+            listing.trust_status.starts_with("verified:"),
+            "freshly installed bundled plugin must verify against the bundled key, got {:?}",
+            listing.trust_status
+        );
+        assert!(mp
+            .list()
+            .unwrap()
+            .iter()
+            .any(|p| p.id == "com.kcreate.demo.palette-apply"));
+        let err = mp
+            .install_bundled("com.kcreate.demo.palette-apply")
+            .unwrap_err();
+        assert!(matches!(err, MarketplaceError::AlreadyInstalled(_)));
+    }
+
+    #[test]
+    fn install_bundled_unknown_id_errors() {
+        let plugins = TempDir::new().unwrap();
+        let mp = PluginMarketplace::new(plugins.path().to_path_buf());
+        let err = mp
+            .install_bundled("com.kcreate.demo.does-not-exist")
+            .unwrap_err();
+        assert!(matches!(err, MarketplaceError::NotFound(_)));
     }
 
     #[test]

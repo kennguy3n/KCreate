@@ -11,6 +11,7 @@
 
 #![forbid(unsafe_op_in_unsafe_fn)]
 
+pub mod bundled;
 pub mod context;
 pub mod js_panel;
 pub mod manifest;
@@ -19,6 +20,9 @@ pub mod registry;
 pub mod trust;
 pub mod wasm_runtime;
 
+pub use bundled::{
+    bundled_plugin, bundled_plugins, bundled_trust_store, bundled_trusted_keys, BundledPlugin,
+};
 pub use context::{
     resolve_document_query, AssetLoader, DocumentQuery, PluginContext, PluginProposal,
     ProposedMutation,

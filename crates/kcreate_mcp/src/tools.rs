@@ -185,7 +185,7 @@ pub fn handle_create_node(
 #[derive(Debug, Clone, Deserialize)]
 pub struct ExportArtboardParams {
     pub id: String,
-    /// Phase 0 supports `"svg"`. PNG/PDF support requires renderer
+    /// This tool supports `"svg"`. PNG/PDF support requires renderer
     /// access and lives on the bridge crate, not this one.
     pub format: String,
     pub path: String,

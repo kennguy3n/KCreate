@@ -16548,6 +16548,220 @@ mod tests {
         .expect("png")
     }
 
+    /// Insert a renderable rect carrying an arbitrary [`FillStyle`]
+    /// (used for gradient render-parity coverage). Mirrors [`vec_rect`]
+    /// but does not force a solid fill.
+    fn vec_rect_fill(
+        parent: Uuid,
+        name: &str,
+        (x, y, w, h): (f64, f64, f64, f64),
+        fill: FillStyle,
+    ) -> Uuid {
+        use kcreate_core::node::Bounds;
+        let mut guard = slot().write();
+        let ws = guard.as_mut().expect("open");
+        let mut node = Node::new(NodeType::VectorLayer, name.to_string());
+        node.parent_id = Some(parent);
+        node.bounds = Bounds {
+            x,
+            y,
+            width: w,
+            height: h,
+        };
+        node.style.fill = fill;
+        node.metadata.insert(
+            crate::scene_sync::VECTOR_PATH_METADATA_KEY.to_string(),
+            rect_path_value(x, y, w, h),
+        );
+        ws.project.document.insert_node(node).expect("rect")
+    }
+
+    /// Decode a PNG byte buffer to `(width, height, rgba8)` for pixel
+    /// assertions. Panics on a malformed buffer — the tests only ever
+    /// feed it freshly-encoded exports.
+    fn decode_rgba(png: &[u8]) -> (u32, u32, Vec<u8>) {
+        let img = image::load_from_memory(png).expect("decode png").to_rgba8();
+        let (w, h) = img.dimensions();
+        (w, h, img.into_raw())
+    }
+
+    /// Sample one RGBA pixel from a decoded buffer.
+    fn pixel_at(w: u32, rgba: &[u8], x: u32, y: u32) -> [u8; 4] {
+        let i = ((y * w + x) * 4) as usize;
+        [rgba[i], rgba[i + 1], rgba[i + 2], rgba[i + 3]]
+    }
+
+    /// Assert a decoded PNG carries a real vertical teal→magenta
+    /// gradient (the fixture used across the render-parity tests):
+    /// well-formed magic, expected dimensions, a sharp top→bottom
+    /// colour change, and no blank-white samples (the shape the
+    /// gradient-drops-to-white defect produced).
+    fn assert_vertical_gradient(label: &str, png: &[u8], w: u32, h: u32) {
+        assert_eq!(&png[..4], &[0x89, b'P', b'N', b'G'], "{label}: PNG magic");
+        let (dw, dh, rgba) = decode_rgba(png);
+        assert_eq!((dw, dh), (w, h), "{label}: export dimensions");
+        let top = pixel_at(dw, &rgba, w / 2, h / 8);
+        let bottom = pixel_at(dw, &rgba, w / 2, h - h / 8);
+        // The vertical gradient runs red↑ (13→242) and green↓
+        // (153→51), so a faithful render differs sharply on both
+        // channels between the top and bottom samples.
+        let dr = (i32::from(top[0]) - i32::from(bottom[0])).abs();
+        let dg = (i32::from(top[1]) - i32::from(bottom[1])).abs();
+        assert!(
+            dr > 60 && dg > 30,
+            "{label}: gradient must vary top→bottom; got top={top:?} bottom={bottom:?} (Δr={dr}, Δg={dg})"
+        );
+        for (where_, px) in [("top", top), ("bottom", bottom)] {
+            assert!(
+                px[0] < 245 || px[1] < 245 || px[2] < 245,
+                "{label}: {where_} sample {px:?} is blank white — gradient dropped"
+            );
+        }
+    }
+
+    /// Regression coverage for the gradient-renders-white defect found
+    /// while capturing design evidence: a gradient fill on a shape
+    /// rendered blank through the host's *live* export path
+    /// (`state::current_scene` → `export_png_to_bytes`) even though the
+    /// fresh-sync path (`render_png`) rendered it correctly.
+    ///
+    /// This drives BOTH paths for the same document so a divergence is
+    /// caught: (a) the control fresh-sync render, and (b) the live
+    /// `renderer_init` → `document_sync_scene` → `export_png_bytes`
+    /// path the desktop app actually uses. A vertical teal→magenta
+    /// gradient must vary top-to-bottom in both renders (proving the
+    /// gradient is honored, not collapsed to white or a flat colour).
+    #[test]
+    #[serial]
+    fn gradient_on_shape_renders_through_live_export_path() {
+        use kcreate_core::node::{FillStyle, GradientKind, GradientStop, Point2D};
+
+        const W: u32 = 240;
+        const H: u32 = 240;
+
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("grad_live", dir.path()).expect("create");
+
+        let page = insert_group(None, "Page");
+        let artboard = insert_group(Some(page), "Artboard");
+
+        // Vertical linear gradient covering the whole artboard, in the
+        // absolute path-local pixel coords the bridge stores verbatim.
+        let teal = rgb8(0x0D, 0x99, 0xD9);
+        let magenta = rgb8(0xF2, 0x33, 0x8C);
+        let fill = FillStyle::Gradient(GradientKind::Linear {
+            from: Point2D { x: 0.0, y: 0.0 },
+            to: Point2D {
+                x: 0.0,
+                y: f64::from(H),
+            },
+            stops: vec![
+                GradientStop {
+                    offset: 0.0,
+                    color: teal,
+                },
+                GradientStop {
+                    offset: 1.0,
+                    color: magenta,
+                },
+            ],
+        });
+        vec_rect_fill(
+            artboard,
+            "Gradient panel",
+            (0.0, 0.0, f64::from(W), f64::from(H)),
+            fill,
+        );
+
+        // (a) Control: fresh-sync render path.
+        let control = render_png(W, H);
+        assert_vertical_gradient("control(render_png)", &control, W, H);
+
+        // (b) Live: the exact path the desktop host drives — initialise
+        // the renderer singleton, sync the document into the live scene
+        // slot, then export from `state::current_scene`.
+        crate::state::init(W, H).expect("renderer init");
+        document_sync_scene().expect("sync scene");
+        let live = export_png_bytes(&PngExportRequest {
+            width: W,
+            height: H,
+            scale: 1.0,
+            background: None,
+        })
+        .expect("export png");
+        assert_vertical_gradient("live(export_png_bytes)", &live, W, H);
+
+        if let Ok(out) = std::env::var("KCREATE_PROOF_DIR") {
+            let out = std::path::Path::new(&out);
+            std::fs::create_dir_all(out).expect("proof dir");
+            std::fs::write(out.join("gradient_control.png"), &control).expect("write control");
+            std::fs::write(out.join("gradient_live_export.png"), &live).expect("write live");
+        }
+
+        project_close();
+    }
+
+    /// End-to-end coverage of a gradient set through the **exact wire
+    /// JSON** the desktop preload sends to `canvas_create_nodes` — the
+    /// everyday "draw a rectangle and fill it with a gradient" gesture.
+    /// Parses the same JSON string `lib.rs::canvas_create_nodes` feeds
+    /// to serde, then drives the live sync + export path. Guards the
+    /// JS→bridge boundary (serde tagged-enum decode) together with the
+    /// renderer so a gradient set this way can never silently render
+    /// white.
+    #[test]
+    #[serial]
+    fn gradient_via_canvas_create_nodes_wire_json_renders() {
+        const W: u32 = 240;
+        const H: u32 = 240;
+
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("grad_wire", dir.path()).expect("create");
+        let page = insert_group(None, "Page");
+        let artboard = insert_group(Some(page), "Artboard");
+
+        // Byte-for-byte the wire shape `shared/scene.ts:CanvasBatchItem`
+        // produces for a rect with a linear gradient fill (the inner
+        // gradient enum is `shape`-tagged and flattened into `fill`).
+        let items_json = serde_json::json!([{
+            "kind": "rect",
+            "parent": artboard.to_string(),
+            "x": 0.0, "y": 0.0, "w": f64::from(W), "h": f64::from(H),
+            "name": "Gradient panel",
+            "fill": {
+                "kind": "gradient",
+                "shape": "linear",
+                "from": { "x": 0.0, "y": 0.0 },
+                "to":   { "x": 0.0, "y": f64::from(H) },
+                "stops": [
+                    { "offset": 0.0, "color": { "r": 0.05, "g": 0.6, "b": 0.85, "a": 1.0 } },
+                    { "offset": 1.0, "color": { "r": 0.95, "g": 0.2, "b": 0.55, "a": 1.0 } }
+                ]
+            }
+        }])
+        .to_string();
+
+        let items: Vec<CanvasBatchItem> =
+            serde_json::from_str(&items_json).expect("parse wire batch json");
+        let ids = canvas_create_nodes(items).expect("create nodes");
+        assert_eq!(ids.len(), 1, "one node created");
+
+        crate::state::init(W, H).expect("renderer init");
+        document_sync_scene().expect("sync scene");
+        let png = export_png_bytes(&PngExportRequest {
+            width: W,
+            height: H,
+            scale: 1.0,
+            background: None,
+        })
+        .expect("export png");
+        assert_vertical_gradient("wire(canvas_create_nodes)", &png, W, H);
+
+        project_close();
+    }
+
     /// Scoped `KCREATE_BRAND_KIT_DIR` override that restores the previous
     /// value on drop. Sound because brand-registry tests run `#[serial]`.
     struct BrandDirEnvGuard {

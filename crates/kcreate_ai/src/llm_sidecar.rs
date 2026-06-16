@@ -985,9 +985,13 @@ mod tests {
         std::fs::write(&model, b"0").expect("write");
 
         // Drive the lifecycle manually: spawn a tiny_http server on
-        // the port we picked, then wait_for_health succeeds.
-        let port = pick_loopback_port().expect("port");
-        let server = tiny_http::Server::http(format!("127.0.0.1:{port}")).expect("server");
+        // an OS-assigned loopback port, then wait_for_health succeeds.
+        let server = tiny_http::Server::http("127.0.0.1:0").expect("server");
+        let port = server
+            .server_addr()
+            .to_ip()
+            .expect("loopback listen addr")
+            .port();
         let handle = std::thread::spawn(move || {
             for req in server.incoming_requests() {
                 let resp = tiny_http::Response::from_string("{\"status\":\"ok\"}");
@@ -1133,8 +1137,12 @@ mod tests {
     #[cfg(feature = "llm_sidecar")]
     #[test]
     fn verify_rejects_foreign_listener_returning_401() {
-        let port = pick_loopback_port().expect("port");
-        let server = tiny_http::Server::http(format!("127.0.0.1:{port}")).expect("server");
+        let server = tiny_http::Server::http("127.0.0.1:0").expect("server");
+        let port = server
+            .server_addr()
+            .to_ip()
+            .expect("loopback listen addr")
+            .port();
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let stop_for_thread = std::sync::Arc::clone(&stop);
         let captured_auth = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
@@ -1195,8 +1203,12 @@ mod tests {
     #[cfg(feature = "llm_sidecar")]
     #[test]
     fn verify_accepts_real_listener_returning_200() {
-        let port = pick_loopback_port().expect("port");
-        let server = tiny_http::Server::http(format!("127.0.0.1:{port}")).expect("server");
+        let server = tiny_http::Server::http("127.0.0.1:0").expect("server");
+        let port = server
+            .server_addr()
+            .to_ip()
+            .expect("loopback listen addr")
+            .port();
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let stop_for_thread = std::sync::Arc::clone(&stop);
         let captured_auth = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
@@ -1263,8 +1275,12 @@ mod tests {
     #[cfg(feature = "llm_sidecar")]
     #[test]
     fn verify_rejects_foreign_listener_returning_404_for_any_token() {
-        let port = pick_loopback_port().expect("port");
-        let server = tiny_http::Server::http(format!("127.0.0.1:{port}")).expect("server");
+        let server = tiny_http::Server::http("127.0.0.1:0").expect("server");
+        let port = server
+            .server_addr()
+            .to_ip()
+            .expect("loopback listen addr")
+            .port();
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let stop_for_thread = std::sync::Arc::clone(&stop);
         let handle = std::thread::spawn(move || {

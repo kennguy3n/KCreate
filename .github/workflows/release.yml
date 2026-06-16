@@ -99,6 +99,10 @@ jobs:
         if: runner.os == 'macOS'
         # Both apple-darwin slices so stage:bridge can `lipo` them into a
         # universal cdylib that loads in both the x64 and arm64 .app builds.
+        # Keep these builds sequential: each writes a distinct triple-scoped
+        # output dir (target/<triple>/release/), so back-to-back invocations
+        # are safe, but cargo shares the workspace target/ for intermediates —
+        # do NOT background them with `&`, which can race on those.
         run: |
           rustup target add x86_64-apple-darwin aarch64-apple-darwin
           cargo build --release -p kcreate_bridge --target x86_64-apple-darwin

@@ -89,7 +89,7 @@ git push origin v0.0.2
 ## CI release lane
 
 [`.github/workflows/release.yml`](../.github/workflows/release.yml) builds
-the full matrix (ubuntu-22.04, macos-13, windows-2022) on native runners
+the full matrix (ubuntu-22.04, macos-14, windows-2022) on native runners
 and uploads the artifacts. It is fully separate from `ci.yml`, so it never
 affects the per-PR fast / smoke lanes.
 

@@ -688,6 +688,7 @@ function NodeList({
                 />
               </button>
               <span
+                role="img"
                 aria-label={`${n.nodeType} layer`}
                 title={n.nodeType}
                 style={{

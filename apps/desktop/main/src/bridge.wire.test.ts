@@ -25,6 +25,7 @@ import { test, expect } from "vitest";
 import type {
   FrameInfoNapi,
   AcquiredFrameNapi,
+  PresentFrameNapi,
   ProjectInfoSnake,
   NodeInfoSnake,
   RuntimeStatusSnake,
@@ -35,6 +36,7 @@ import type {
 import type {
   FrameInfo,
   AcquiredFrame,
+  PresentFrame,
   ProjectInfo,
   NodeInfo,
   RuntimeStatus,
@@ -58,6 +60,12 @@ function expectAssignable<T>(_value: T): void {
 // first frame) stops compiling here.
 expectAssignable<FrameInfo>({} as FrameInfoNapi);
 expectAssignable<AcquiredFrame>({} as AcquiredFrameNapi);
+// `PresentFrame` is the dirty-rect present DTO: its napi struct emits
+// `frameId` / `dirtyX` / `dirtyWidth` / `dirtyHeight`, so a regression to
+// `frame_id` / `dirty_x` (which would silently break the partial
+// `putImageData` in CanvasHost) stops compiling here.
+expectAssignable<PresentFrame>({} as PresentFrameNapi);
+expectAssignable<PresentFrameNapi>({} as PresentFrame);
 expectAssignable<ProjectInfo>({} as ProjectInfoSnake);
 expectAssignable<RuntimeStatus>({} as RuntimeStatusSnake);
 expectAssignable<DocumentStatus>({} as DocumentStatusSnake);

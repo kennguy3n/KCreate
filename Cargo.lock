@@ -2075,6 +2075,7 @@ dependencies = [
  "criterion",
  "crossbeam-channel",
  "glam",
+ "kcreate_perf",
  "kcreate_text",
  "log",
  "parking_lot",

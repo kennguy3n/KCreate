@@ -73,6 +73,7 @@ import type {
   FillStyle,
   StrokeStyleWire,
   FrameInfo,
+  PresentFrame,
   InspectCode,
   JpegExportOptions,
   LayerNamingResult,
@@ -287,6 +288,21 @@ type AcquiredFrameNapi = {
   bytes: Uint8Array;
 };
 
+// `kcreate/renderer/acquirePresent` forwards the bridge's
+// `#[napi(object)]` struct straight through IPC; napi-rs auto-camelCases
+// the Rust field names (`dirty_x` → `dirtyX`, `dirty_width` → `dirtyWidth`).
+type PresentFrameNapi = {
+  frameId: number;
+  width: number;
+  height: number;
+  dirtyX: number;
+  dirtyY: number;
+  dirtyWidth: number;
+  dirtyHeight: number;
+  full: boolean;
+  bytes: Uint8Array;
+};
+
 const renderer: RendererBridge = {
   async init(width, height): Promise<RendererInfo> {
     return (await ipcRenderer.invoke(
@@ -374,6 +390,32 @@ const renderer: RendererBridge = {
       frameId: frame.frameId,
       width: frame.width,
       height: frame.height,
+      bytes,
+    };
+  },
+  async acquirePresent(): Promise<PresentFrame | null> {
+    const present = (await ipcRenderer.invoke(
+      "kcreate/renderer/acquirePresent",
+    )) as PresentFrameNapi | null;
+    if (!present) return null;
+    // Node Buffer is a subclass of Uint8Array; tighten to a plain
+    // Uint8Array over the same ArrayBuffer (explicit byteOffset /
+    // byteLength) so the dirty-rect bytes are handed to the renderer
+    // without an extra copy.
+    const bytes = new Uint8Array(
+      present.bytes.buffer,
+      present.bytes.byteOffset,
+      present.bytes.byteLength,
+    );
+    return {
+      frameId: present.frameId,
+      width: present.width,
+      height: present.height,
+      dirtyX: present.dirtyX,
+      dirtyY: present.dirtyY,
+      dirtyWidth: present.dirtyWidth,
+      dirtyHeight: present.dirtyHeight,
+      full: present.full,
       bytes,
     };
   },

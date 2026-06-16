@@ -27,6 +27,23 @@ type AcquiredFrameNapi = {
   bytes: Uint8Array;
 };
 
+// `renderer_acquire_present` returns an `#[napi(object)]` struct, so the
+// Rust field identifiers are auto-camelCased: `frame_id` → `frameId`,
+// `dirty_x` → `dirtyX`, `dirty_width` → `dirtyWidth`. `bytes` is either the
+// whole frame (`full === true`) or just the `dirty` sub-rect
+// (`full === false`; empty when nothing changed since the last present).
+type PresentFrameNapi = {
+  frameId: number;
+  width: number;
+  height: number;
+  dirtyX: number;
+  dirtyY: number;
+  dirtyWidth: number;
+  dirtyHeight: number;
+  full: boolean;
+  bytes: Uint8Array;
+};
+
 // `ProjectInfoSnake` / `NodeInfoSnake` / `RuntimeStatusSnake` /
 // `DocumentStatusSnake` mirror the `#[napi(object)]` structs of the same
 // stem in `crates/kcreate_bridge/src/lib.rs`. As with `UndoRedoOutcome`
@@ -184,6 +201,7 @@ type RecentProjectInfoSnake = {
 export type {
   FrameInfoNapi,
   AcquiredFrameNapi,
+  PresentFrameNapi,
   ProjectInfoSnake,
   NodeInfoSnake,
   BoundsSnake,
@@ -221,6 +239,7 @@ export interface Bridge {
   rendererGetFrame(): Uint8Array | null;
   rendererFrameInfo(): FrameInfoNapi | null;
   rendererAcquireFrame(): AcquiredFrameNapi | null;
+  rendererAcquirePresent(): PresentFrameNapi | null;
 
   // Native canvas presentation mode (Phase 1, Block A, Tasks 4–6).
   //

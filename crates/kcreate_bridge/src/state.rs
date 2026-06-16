@@ -439,6 +439,44 @@ pub fn acquire_frame() -> Result<Option<AcquiredFrame>> {
     Ok(frame)
 }
 
+/// Fraction of the framebuffer above which a dirty region is presented
+/// as a full frame instead of a sub-rect. Past this point the bookkeeping
+/// and a partial `putImageData` stop paying for themselves versus simply
+/// shipping the whole frame, so we fall back to the full-frame copy.
+const MAX_PARTIAL_PRESENT_FRACTION: f32 = 0.5;
+
+/// Atomically snapshot the latest frame for presentation, returning only
+/// the pixels that changed since the host last consumed a frame.
+///
+/// This is the dirty-rect present path that backs
+/// `renderer_acquire_present`. On a typical edit the returned
+/// [`AcquiredPresent`] carries just the changed sub-rect (`full == false`,
+/// `bytes` sized `dirty_width * dirty_height * 4`); on the first frame,
+/// after a resize, or when the change is large it carries the whole frame
+/// (`full == true`). When nothing changed since the last consume it
+/// returns a zero-sized dirty rect with empty `bytes` so the host can
+/// cheaply skip the blit. Consuming also resets the accumulated dirty
+/// region, so the host's present loop may safely coalesce frames.
+pub fn acquire_present() -> Result<Option<AcquiredPresent>> {
+    let guard = slot().lock();
+    let ctx = guard.as_ref().ok_or(BridgeError::NotInitialized)?;
+    let present = ctx
+        .take_present(MAX_PARTIAL_PRESENT_FRACTION)
+        .map(|snap| AcquiredPresent {
+            frame_id: snap.frame_id.0,
+            width: snap.width,
+            height: snap.height,
+            dirty_x: snap.dirty.x,
+            dirty_y: snap.dirty.y,
+            dirty_width: snap.dirty.width,
+            dirty_height: snap.dirty.height,
+            full: snap.full,
+            bytes: snap.bytes,
+        });
+    drop(guard);
+    Ok(present)
+}
+
 // -----------------------------------------------------------------------------
 // Native canvas presentation path — Phase 1, Block A, Task 5.
 //
@@ -540,6 +578,27 @@ pub struct AcquiredFrame {
     pub frame_id: u64,
     pub width: u32,
     pub height: u32,
+    pub bytes: Vec<u8>,
+}
+
+/// A frame snapshot for the dirty-rect present path.
+///
+/// `bytes` is either the whole frame (`full == true`,
+/// `width * height * 4` bytes) or just the `dirty` sub-rect
+/// (`full == false`, `dirty_width * dirty_height * 4` bytes, possibly
+/// empty when nothing changed). The host patches its persistent
+/// backbuffer with `bytes` and repaints with the matching
+/// `putImageData` form.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcquiredPresent {
+    pub frame_id: u64,
+    pub width: u32,
+    pub height: u32,
+    pub dirty_x: u32,
+    pub dirty_y: u32,
+    pub dirty_width: u32,
+    pub dirty_height: u32,
+    pub full: bool,
     pub bytes: Vec<u8>,
 }
 
@@ -645,6 +704,96 @@ mod tests {
         reset_for_tests();
         init(16, 8).expect("init");
         assert!(acquire_frame().expect("acquire").is_none());
+        shutdown();
+    }
+
+    #[test]
+    #[serial]
+    fn acquire_present_before_first_render_is_none() {
+        reset_for_tests();
+        init(16, 8).expect("init");
+        assert!(acquire_present().expect("acquire").is_none());
+        shutdown();
+    }
+
+    #[test]
+    #[serial]
+    fn acquire_present_first_frame_is_full() {
+        reset_for_tests();
+        init(64, 64).expect("init");
+        let scene_json = r#"{ "clear_color":[0,0,0,1], "objects": [] }"#;
+        let id = render(scene_json).expect("render");
+        let present = acquire_present().expect("acquire").expect("some");
+        assert_eq!(present.frame_id, id.0);
+        assert!(present.full, "first frame must be a full present");
+        assert_eq!(present.dirty_width, 64);
+        assert_eq!(present.dirty_height, 64);
+        assert_eq!(present.bytes.len(), 64 * 64 * 4);
+        shutdown();
+    }
+
+    #[test]
+    #[serial]
+    fn acquire_present_unchanged_redraw_is_empty() {
+        reset_for_tests();
+        init(64, 64).expect("init");
+        let scene_json = r#"{ "clear_color":[0,0,0,1], "objects": [] }"#;
+        render(scene_json).expect("render 1");
+        // Consume the initial full frame.
+        let _ = acquire_present().expect("acquire").expect("some");
+        // Force a re-render of identical pixels.
+        invalidate(None).expect("invalidate");
+        render(scene_json).expect("render 2");
+        let present = acquire_present().expect("acquire").expect("some");
+        assert!(!present.full);
+        assert_eq!(present.dirty_width, 0);
+        assert_eq!(present.dirty_height, 0);
+        assert!(present.bytes.is_empty());
+        shutdown();
+    }
+
+    #[test]
+    #[serial]
+    fn acquire_present_small_edit_is_partial() {
+        reset_for_tests();
+        init(64, 64).expect("init");
+        let empty = r#"{ "clear_color":[0,0,0,1], "objects": [] }"#;
+        render(empty).expect("render 1");
+        let _ = acquire_present().expect("acquire").expect("some");
+
+        // Add a small opaque rect: a sub-region of the frame changes.
+        let edited = r#"{
+            "clear_color": [0.0, 0.0, 0.0, 1.0],
+            "objects": [{
+                "id": 1, "z": 0, "translation": [0.0, 0.0],
+                "style": { "fill": [1.0, 0.0, 0.0, 1.0], "stroke": null },
+                "kind": { "type": "rect", "x": 8.0, "y": 8.0, "width": 10.0, "height": 10.0 }
+            }]
+        }"#;
+        invalidate(None).expect("invalidate");
+        render(edited).expect("render 2");
+        let present = acquire_present().expect("acquire").expect("some");
+        assert!(
+            !present.full,
+            "a small edit must present a sub-rect, not the whole frame"
+        );
+        assert!(present.dirty_width > 0 && present.dirty_height > 0);
+        // The changed region is the ~10x10 rect plus AA fringe — far
+        // smaller than the 64x64 frame.
+        assert!(
+            present.dirty_width <= 16,
+            "dirty width {} too large",
+            present.dirty_width
+        );
+        assert!(
+            present.dirty_height <= 16,
+            "dirty height {} too large",
+            present.dirty_height
+        );
+        assert_eq!(
+            present.bytes.len(),
+            present.dirty_width as usize * present.dirty_height as usize * 4
+        );
         shutdown();
     }
 

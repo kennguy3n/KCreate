@@ -32,6 +32,9 @@ kcreate_text = { path = "../kcreate_text" }
 
 [dev-dependencies]
 criterion.workspace = true
+# Timeline / Report phase instrumentation for the dense present-path
+# proof example (cold-path profiling primitive, no networking).
+kcreate_perf = { path = "../kcreate_perf" }
 
 [features]
 default = []
@@ -56,4 +59,8 @@ harness = false
 
 [[bench]]
 name = "cold_start"
+harness = false
+
+[[bench]]
+name = "frame_present_dense"
 harness = false

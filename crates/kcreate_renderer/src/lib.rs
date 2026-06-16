@@ -39,7 +39,7 @@ pub use geometry::{Color, Paint, PathCommand, Point2, Rect, Stroke, Style, Vec2}
 pub use gpu::{GpuBackend, GpuTier};
 pub use native_surface::NativeSurface;
 pub use pipeline::Pipeline;
-pub use presenter::{FrameId, FrameLease, Presenter};
+pub use presenter::{DirtyRect, FrameId, FrameLease, PresentSnapshot, Presenter};
 pub use scene::{Object, ObjectId, ObjectKind, Scene};
 pub use spatial::SpatialIndex;
 pub use viewport::Viewport;
@@ -380,7 +380,10 @@ impl RenderContext {
         let render_result = self.render_into_staging(scene, &viewport, &display_list, &mut staging);
         match render_result {
             Ok(()) => {
-                self.presenter.publish(frame_id, staging);
+                // `publish_diff` computes the exact changed-pixel
+                // rectangle versus the previous frame so the host can
+                // present only what moved (see `take_present`).
+                self.presenter.publish_diff(frame_id, staging);
                 self.sequence.store(frame_id.0, Ordering::Release);
                 Ok(frame_id)
             }
@@ -578,6 +581,20 @@ impl RenderContext {
     /// Borrow the latest frame, whatever its id.
     pub fn latest_frame(&self) -> Option<FrameLease<'_>> {
         self.presenter.latest()
+    }
+
+    /// Snapshot the latest frame for presentation, returning only the
+    /// pixels that changed since the host last consumed a frame.
+    ///
+    /// This is the dirty-rect present path: on a typical edit the
+    /// returned [`PresentSnapshot`] carries just the changed sub-rect
+    /// (a few KB) instead of the whole framebuffer (megabytes), and the
+    /// accumulated dirty region is reset. Falls back to a full frame on
+    /// the first frame, after a resize, or when the change covers more
+    /// than `max_partial_fraction` of the framebuffer. Returns `None`
+    /// only when nothing has ever been rendered.
+    pub fn take_present(&self, max_partial_fraction: f32) -> Option<PresentSnapshot> {
+        self.presenter.take_present(max_partial_fraction)
     }
 
     /// Currently selected viewport (pan/zoom).

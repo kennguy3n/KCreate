@@ -184,6 +184,27 @@ export interface AcquiredFrame {
   bytes: Uint8Array;
 }
 
+/**
+ * Dirty-rect present snapshot. `bytes` is either the whole frame
+ * (`full === true`, `width * height * 4` bytes) or only the changed
+ * `dirty` sub-rect (`full === false`, `dirtyWidth * dirtyHeight * 4`
+ * bytes — empty when nothing changed since the last present). The host
+ * patches its persistent backbuffer at `(dirtyX, dirtyY)` and repaints
+ * with the matching `putImageData` form. Mirrors
+ * `kcreate_bridge::state::AcquiredPresent`.
+ */
+export interface PresentFrame {
+  frameId: number;
+  width: number;
+  height: number;
+  dirtyX: number;
+  dirtyY: number;
+  dirtyWidth: number;
+  dirtyHeight: number;
+  full: boolean;
+  bytes: Uint8Array;
+}
+
 export interface RendererInfo {
   tier: string;
   width: number;
@@ -256,6 +277,17 @@ export interface RendererBridge {
    * published yet.
    */
   acquireFrame(): Promise<AcquiredFrame | null>;
+  /**
+   * Dirty-rect present path: an atomic snapshot of the latest frame that
+   * carries only the pixels changed since the host last consumed a frame
+   * (or the whole frame on the first frame, after a resize, or when the
+   * change is large — `full === true`). Calling this resets the
+   * accumulated dirty region on the Rust side, so the host invokes it
+   * once per present and patches its persistent backbuffer with the
+   * result. Returns null if no frame has been published yet. Mirrors
+   * `kcreate_bridge::state::acquire_present`.
+   */
+  acquirePresent(): Promise<PresentFrame | null>;
 
   /**
    * Current presentation mode. `"offscreen"` (the default) means the

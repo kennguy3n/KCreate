@@ -846,6 +846,9 @@ function registerIpcHandlers(): void {
   ipcMain.handle("kcreate/renderer/acquireFrame", () =>
     requireBridge().rendererAcquireFrame(),
   );
+  ipcMain.handle("kcreate/renderer/acquirePresent", () =>
+    requireBridge().rendererAcquirePresent(),
+  );
 
   // Native canvas presentation mode (Phase 1, Block A, Tasks 4–6).
   //

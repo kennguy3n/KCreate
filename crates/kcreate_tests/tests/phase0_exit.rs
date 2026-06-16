@@ -298,6 +298,72 @@ fn phase0_mcp_tools_work_locally() {
         fn export_svg(&self, _node_ids: &[Uuid]) -> Result<String, String> {
             Ok("<svg/>".into())
         }
+
+        // The high-level design capabilities are owned by the bridge's
+        // `WorkspaceAccess`; this in-memory double only backs the graph
+        // methods the smoke test exercises (`list_artboards`).
+        fn list_templates(
+            &self,
+            _category: Option<&str>,
+            _query: Option<&str>,
+        ) -> Result<serde_json::Value, String> {
+            Err("unsupported in this test double".into())
+        }
+        fn apply_template(&self, _template_id: Uuid) -> Result<serde_json::Value, String> {
+            Err("unsupported in this test double".into())
+        }
+        fn generate_themed_design(
+            &self,
+            _brief: &str,
+            _options_json: &str,
+        ) -> Result<serde_json::Value, String> {
+            Err("unsupported in this test double".into())
+        }
+        fn list_assets(
+            &self,
+            _category: Option<&str>,
+            _query: Option<&str>,
+        ) -> Result<serde_json::Value, String> {
+            Err("unsupported in this test double".into())
+        }
+        fn insert_asset(
+            &self,
+            _asset_id: &str,
+            _parent_id: Option<Uuid>,
+            _x: f64,
+            _y: f64,
+            _target_size: Option<f64>,
+        ) -> Result<serde_json::Value, String> {
+            Err("unsupported in this test double".into())
+        }
+        fn set_fill(&self, _node_id: Uuid, _fill: serde_json::Value) -> Result<(), String> {
+            Err("unsupported in this test double".into())
+        }
+        fn set_text(&self, _node_id: Uuid, _content: &str) -> Result<(), String> {
+            Err("unsupported in this test double".into())
+        }
+        fn list_themes(&self) -> Result<serde_json::Value, String> {
+            Err("unsupported in this test double".into())
+        }
+        fn apply_theme(&self, _theme_id: &str) -> Result<serde_json::Value, String> {
+            Err("unsupported in this test double".into())
+        }
+        fn magic_resize(
+            &self,
+            _source_artboard_id: Uuid,
+            _targets: serde_json::Value,
+        ) -> Result<serde_json::Value, String> {
+            Err("unsupported in this test double".into())
+        }
+        fn export_design(
+            &self,
+            _node_ids: &[Uuid],
+            _format: &str,
+            _path: &str,
+            _options: serde_json::Value,
+        ) -> Result<serde_json::Value, String> {
+            Err("unsupported in this test double".into())
+        }
     }
 
     let mut doc = DocumentGraph::new();

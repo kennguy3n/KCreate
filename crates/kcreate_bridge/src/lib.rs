@@ -3937,6 +3937,36 @@ pub fn mcp_status() -> NapiResult<String> {
     serde_json::to_string(&status).map_err(|e| NapiError::from_reason(e.to_string()))
 }
 
+/// Whether the MCP master switch is on. With it off every tool call is
+/// refused regardless of per-tool grants (which are preserved).
+#[napi]
+pub fn mcp_master_enabled() -> bool {
+    phase2::mcp_master_enabled()
+}
+
+/// Flip the MCP master switch and persist it.
+#[napi]
+pub fn mcp_set_master_enabled(enabled: bool) -> NapiResult<()> {
+    phase2::mcp_set_master_enabled(enabled).map_err(map_doc_err)
+}
+
+/// JSON array of the pending permission prompts — tool calls a client
+/// attempted that have no decision on record yet. Drives the settings
+/// panel's approval inbox. Each item is a
+/// `kcreate_mcp::PendingPermissionRequest` (snake_case JSON).
+#[napi]
+pub fn mcp_pending_list() -> NapiResult<String> {
+    phase2::mcp_pending_list().map_err(map_doc_err)
+}
+
+/// Dismiss a single queued prompt without recording a grant. Approving
+/// or denying goes through `mcp_permission_grant`, which clears the
+/// prompt as a side effect.
+#[napi]
+pub fn mcp_pending_clear(client_id: String, tool_name: String) -> NapiResult<()> {
+    phase2::mcp_pending_clear(&client_id, &tool_name).map_err(map_doc_err)
+}
+
 // ---------------------------------------------------------------------------
 // Phase 2 — color management
 // ---------------------------------------------------------------------------

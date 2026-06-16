@@ -440,6 +440,21 @@ const defaultsByMethod: Record<string, () => unknown> = {
     source: null,
   }),
   "templateMarketplace.remove": () => undefined,
+  // I5 — MCP automation server settings. Defaults keep
+  // `McpSettingsPanel` mountable (server stopped, master switch on, no
+  // grants, empty approval inbox). Tests override these to drive the
+  // permission-governance UX.
+  "mcp.start": () => 0,
+  "mcp.stop": () => undefined,
+  "mcp.isRunning": () => false,
+  "mcpPermission.status": () => ({ running: false, port: 0 }),
+  "mcpPermission.list": () => [],
+  "mcpPermission.grant": () => undefined,
+  "mcpPermission.revoke": () => undefined,
+  "mcpPermission.masterEnabled": () => true,
+  "mcpPermission.setMasterEnabled": () => undefined,
+  "mcpPermission.pendingList": () => [],
+  "mcpPermission.pendingClear": () => undefined,
   // H2 "Remix from file". `pickImport` resolves to the chosen source
   // path (or `null` when the OS dialog is cancelled); `import` resolves
   // to the freshly-registered `TemplateManifest` (snake_case JSON wire
@@ -552,6 +567,9 @@ export function installKcreateStub(): KcreateStubHandle {
     assets: namespace("assets"),
     // Workstream G2 — ready-made template library bridge.
     templateMarketplace: namespace("templateMarketplace"),
+    // I5 — loopback MCP automation server + permission governance.
+    mcp: namespace("mcp"),
+    mcpPermission: namespace("mcpPermission"),
     setLayerColor: (...args: unknown[]): unknown =>
       recordCall("setLayerColor", args),
   };

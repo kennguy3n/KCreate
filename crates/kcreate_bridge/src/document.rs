@@ -9009,6 +9009,61 @@ pub fn ai_get_action_log() -> Result<String> {
 // MCP server
 // -----------------------------------------------------------------------------
 
+/// Set a node's primary `fill` and record an undoable `mcp_set_fill`
+/// operation. Modeled exactly on [`crate::phase2::text_set_content`]:
+/// snapshot the before/after paint, mutate through `get_node_mut`,
+/// `touch()` the node, stamp `modified_at`, and push the operation
+/// onto the project log so an agent-driven fill is undoable and
+/// persisted identically to a UI edit. The scene is re-synced so the
+/// renderer reflects the new paint next frame.
+#[cfg(feature = "mcp")]
+pub fn mcp_set_node_fill(node_id: Uuid, fill: FillStyle) -> Result<()> {
+    with_workspace_mut(|ws| {
+        let node = ws
+            .project
+            .document
+            .get_node(node_id)
+            .ok_or(DocumentBridgeError::NodeNotFound(node_id))?;
+        let before_json = serde_json::to_value(&node.style.fill)?;
+        let after_json = serde_json::to_value(&fill)?;
+        let node_mut = ws
+            .project
+            .document
+            .get_node_mut(node_id)
+            .ok_or(DocumentBridgeError::NodeNotFound(node_id))?;
+        node_mut.style.fill = fill;
+        node_mut.touch();
+        ws.project.modified_at = Utc::now();
+        let op = Operation::new(
+            "user",
+            "mcp_set_fill",
+            before_json,
+            after_json,
+            vec![node_id],
+        );
+        ws.project.execute_operation(op);
+        Ok(())
+    })?;
+    sync_scene_after_change();
+    Ok(())
+}
+
+/// Parse an optional category slug into a [`kcreate_core::TemplateCategory`],
+/// treating an empty string as "no filter" (so an agent can pass `""`
+/// for "all categories"). Mirrors the converter `lib::template_list`
+/// uses so the MCP surface accepts the same slugs the renderer does.
+#[cfg(feature = "mcp")]
+fn parse_template_category(
+    slug: Option<&str>,
+) -> std::result::Result<Option<kcreate_core::TemplateCategory>, String> {
+    match slug.filter(|s| !s.is_empty()) {
+        Some(s) => serde_json::from_str::<kcreate_core::TemplateCategory>(&format!("\"{s}\""))
+            .map(Some)
+            .map_err(|e| format!("unknown template category {s:?}: {e}")),
+        None => Ok(None),
+    }
+}
+
 /// `DocumentAccess` implementation that talks to the process-global
 /// workspace [`slot`]. Each method takes the workspace lock for the
 /// minimum duration needed.
@@ -9018,13 +9073,22 @@ pub fn ai_get_action_log() -> Result<String> {
 /// on its worker thread — so the workspace lock is held briefly and
 /// never across an `await` boundary. Lock-ordering relative to the
 /// renderer singleton is documented on [`sync_scene_locked`].
+///
+/// Every mutating method funnels through an existing bridge op-path
+/// entry point (`phase2::template_instantiate`, `phase10::ai_generate_themed_design`,
+/// `assets::insert`, `phase2::text_set_content`, [`mcp_set_node_fill`],
+/// [`document_apply_theme`], [`magic_resize`]) so an agent's changes
+/// are recorded as real undoable operations and persisted — never
+/// faked or echoed.
 #[cfg(feature = "mcp")]
 struct WorkspaceAccess;
 
 #[cfg(feature = "mcp")]
 impl kcreate_mcp::tools::DocumentAccess for WorkspaceAccess {
     fn list_artboards(&self) -> Vec<kcreate_mcp::tools::ArtboardInfo> {
-        let guard = slot().write();
+        // Read-only: share the lock with other readers so a discovery
+        // call never blocks a concurrent read.
+        let guard = slot().read();
         let Some(ws) = guard.as_ref() else {
             return Vec::new();
         };
@@ -9046,18 +9110,36 @@ impl kcreate_mcp::tools::DocumentAccess for WorkspaceAccess {
         name: String,
         parent_id: Option<Uuid>,
     ) -> std::result::Result<Uuid, String> {
+        let mut node = Node::new(node_type, name);
+        node.parent_id = parent_id;
         let mut guard = slot().write();
         let ws = guard
             .as_mut()
             .ok_or_else(|| "no project open".to_string())?;
-        let mut node = Node::new(node_type, name);
-        node.parent_id = parent_id;
         let id = ws
             .project
             .document
             .insert_node(node)
             .map_err(|e| e.to_string())?;
         ws.project.modified_at = Utc::now();
+        // Record an operation so the agent's create is undoable, exactly
+        // like a hand gesture: before=null, after=full node, so an undo
+        // deletes the node and a redo recreates it.
+        let snapshot = ws
+            .project
+            .document
+            .get_node(id)
+            .map_or(serde_json::Value::Null, |n| {
+                serde_json::to_value(n).unwrap_or(serde_json::Value::Null)
+            });
+        let op = Operation::new(
+            "user",
+            "mcp_create_node",
+            serde_json::Value::Null,
+            snapshot,
+            vec![id],
+        );
+        ws.project.execute_operation(op);
         // Sync the scene so the renderer sees the new node immediately.
         // Failure to sync (e.g. renderer not initialised in a headless
         // host) is non-fatal: the next renderer_init + sync recovers.
@@ -9066,7 +9148,9 @@ impl kcreate_mcp::tools::DocumentAccess for WorkspaceAccess {
     }
 
     fn export_svg(&self, node_ids: &[Uuid]) -> std::result::Result<String, String> {
-        let guard = slot().write();
+        // Read-only: SVG export reads the document graph and never mutates
+        // it, so take a shared read lock.
+        let guard = slot().read();
         let ws = guard
             .as_ref()
             .ok_or_else(|| "no project open".to_string())?;
@@ -9077,14 +9161,214 @@ impl kcreate_mcp::tools::DocumentAccess for WorkspaceAccess {
         )
         .map_err(|e| e.to_string())
     }
+
+    fn list_templates(
+        &self,
+        category: Option<&str>,
+        query: Option<&str>,
+    ) -> std::result::Result<serde_json::Value, String> {
+        let category = parse_template_category(category)?;
+        let report = crate::phase2::template_list(category, query.filter(|q| !q.is_empty()))
+            .map_err(|e| e.to_string())?;
+        let templates: Vec<serde_json::Value> = report
+            .templates
+            .iter()
+            .map(|t| {
+                serde_json::json!({
+                    "id": t.id.to_string(),
+                    "name": t.name,
+                    "description": t.description,
+                    "category": t.category,
+                    "tags": t.tags,
+                    "page_count": t.page_count,
+                })
+            })
+            .collect();
+        Ok(serde_json::json!({ "templates": templates }))
+    }
+
+    fn apply_template(&self, template_id: Uuid) -> std::result::Result<serde_json::Value, String> {
+        let report = crate::phase2::template_instantiate(template_id).map_err(|e| e.to_string())?;
+        Ok(serde_json::json!({
+            "artboard_id": report.artboard_id.to_string(),
+            "node_ids": report
+                .node_ids
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+        }))
+    }
+
+    fn generate_themed_design(
+        &self,
+        brief: &str,
+        options_json: &str,
+    ) -> std::result::Result<serde_json::Value, String> {
+        let result = crate::phase10::ai_generate_themed_design(brief, options_json)
+            .map_err(|e| e.to_string())?;
+        serde_json::to_value(&result).map_err(|e| e.to_string())
+    }
+
+    fn list_assets(
+        &self,
+        category: Option<&str>,
+        query: Option<&str>,
+    ) -> std::result::Result<serde_json::Value, String> {
+        let category = category.filter(|c| !c.is_empty());
+        let defs = match query.filter(|q| !q.is_empty()) {
+            Some(q) => crate::assets::search(q, category).map_err(|e| e.to_string())?,
+            None => crate::assets::list(category).map_err(|e| e.to_string())?,
+        };
+        let assets: Vec<serde_json::Value> = defs
+            .iter()
+            .map(|d| {
+                serde_json::json!({
+                    "id": d.id,
+                    "name": d.name,
+                    "category": d.category,
+                    "group": d.group,
+                    "tags": d.tags,
+                })
+            })
+            .collect();
+        Ok(serde_json::json!({ "assets": assets }))
+    }
+
+    fn insert_asset(
+        &self,
+        asset_id: &str,
+        parent_id: Option<Uuid>,
+        x: f64,
+        y: f64,
+        target_size: Option<f64>,
+    ) -> std::result::Result<serde_json::Value, String> {
+        // Default placement size matches the Elements panel's default
+        // drop size so agent-placed assets look the same as hand-placed.
+        let size = target_size.unwrap_or(200.0);
+        let inserted =
+            crate::assets::insert(asset_id, parent_id, x, y, size).map_err(|e| e.to_string())?;
+        // Re-shape into the MCP surface's uniform `snake_case` contract.
+        // `InsertedAsset` itself is `camelCase` because it crosses the
+        // napi boundary to the Electron host; the agent-facing tool
+        // result must match the snake_case every other tool returns
+        // (`apply_template` → `node_ids`, etc.) so a client never has to
+        // special-case one tool's key casing.
+        Ok(serde_json::json!({
+            "group_id": inserted.group_id,
+            "node_ids": inserted.node_ids,
+            "name": inserted.name,
+            "x": inserted.x,
+            "y": inserted.y,
+            "width": inserted.width,
+            "height": inserted.height,
+        }))
+    }
+
+    fn set_fill(&self, node_id: Uuid, fill: serde_json::Value) -> std::result::Result<(), String> {
+        let parsed: FillStyle =
+            serde_json::from_value(fill).map_err(|e| format!("invalid fill: {e}"))?;
+        mcp_set_node_fill(node_id, parsed).map_err(|e| e.to_string())
+    }
+
+    fn set_text(&self, node_id: Uuid, content: &str) -> std::result::Result<(), String> {
+        crate::phase2::text_set_content(node_id, content).map_err(|e| e.to_string())
+    }
+
+    fn list_themes(&self) -> std::result::Result<serde_json::Value, String> {
+        let themes: Vec<serde_json::Value> = kcreate_core::theme::builtin_themes()
+            .iter()
+            .map(|t| serde_json::json!({ "id": t.id, "name": t.name }))
+            .collect();
+        Ok(serde_json::json!({ "themes": themes }))
+    }
+
+    fn apply_theme(&self, theme_id: &str) -> std::result::Result<serde_json::Value, String> {
+        let theme = kcreate_core::theme::builtin_themes()
+            .into_iter()
+            .find(|t| t.id == theme_id)
+            .ok_or_else(|| format!("unknown theme id: {theme_id:?}"))?;
+        let report = document_apply_theme(&theme).map_err(|e| e.to_string())?;
+        serde_json::to_value(&report).map_err(|e| e.to_string())
+    }
+
+    fn magic_resize(
+        &self,
+        source_artboard_id: Uuid,
+        targets: serde_json::Value,
+    ) -> std::result::Result<serde_json::Value, String> {
+        let specs: Vec<ResizeTargetSpec> =
+            serde_json::from_value(targets).map_err(|e| format!("invalid targets: {e}"))?;
+        let ids =
+            crate::document::magic_resize(source_artboard_id, &specs).map_err(|e| e.to_string())?;
+        Ok(serde_json::json!({
+            "artboard_ids": ids.iter().map(ToString::to_string).collect::<Vec<_>>(),
+        }))
+    }
+
+    fn export_design(
+        &self,
+        node_ids: &[Uuid],
+        format: &str,
+        path: &str,
+        options: serde_json::Value,
+    ) -> std::result::Result<serde_json::Value, String> {
+        let out = Path::new(path);
+        let format = format.to_ascii_lowercase();
+        let bytes_written: u64 = match format.as_str() {
+            // SVG is per-node + deterministic (no renderer required), so
+            // it honours `node_ids`.
+            "svg" => {
+                let svg = self.export_svg(node_ids)?;
+                let bytes = svg.into_bytes();
+                let written = bytes.len() as u64;
+                std::fs::write(out, &bytes).map_err(|e| e.to_string())?;
+                written
+            }
+            // PNG / PDF render the whole current scene/document (see
+            // `export_png_file` — per-node raster export needs a
+            // document→scene id map the bridge does not expose here).
+            "png" => {
+                let req: PngExportRequest = serde_json::from_value(options)
+                    .map_err(|e| format!("invalid png options: {e}"))?;
+                export_png_file(out, &req).map_err(|e| e.to_string())?
+            }
+            "pdf" => {
+                let req: PdfExportRequest = serde_json::from_value(options)
+                    .map_err(|e| format!("invalid pdf options: {e}"))?;
+                export_pdf_file(out, &req).map_err(|e| e.to_string())?
+            }
+            other => {
+                return Err(format!(
+                    "unsupported export format: {other:?} (use svg, png, or pdf)"
+                ))
+            }
+        };
+        Ok(serde_json::json!({
+            "path": path,
+            "format": format,
+            "bytes_written": bytes_written,
+        }))
+    }
 }
 
 /// Start the local MCP server. Loopback-only. Idempotent.
+///
+/// The server is handed a [`kcreate_mcp::PermissionGate`] built from
+/// the SAME shared permission store + pending registry the settings UI
+/// drives (see [`crate::phase2::mcp_permission_store`] /
+/// [`crate::phase2::mcp_pending`]), so every tool call the server
+/// dispatches is gated by the user's Once/Always/Denied decisions and
+/// the master switch — and a call with no decision on record surfaces
+/// as a pending prompt in the UI.
 #[cfg(feature = "mcp")]
 pub fn mcp_start() -> Result<u32> {
     let access: std::sync::Arc<dyn kcreate_mcp::tools::DocumentAccess> =
         std::sync::Arc::new(WorkspaceAccess);
-    let port = kcreate_mcp::server::start_global(access)
+    let gate = kcreate_mcp::PermissionGate::new(
+        crate::phase2::mcp_permission_store(),
+        crate::phase2::mcp_pending(),
+    );
+    let port = kcreate_mcp::server::start_global(access, gate)
         .map_err(|e| DocumentBridgeError::Io(std::io::Error::other(e.to_string())))?;
     Ok(u32::from(port))
 }

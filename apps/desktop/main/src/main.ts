@@ -3092,6 +3092,24 @@ function registerIpcHandlers(): void {
   ipcMain.handle("kcreate/mcp/status", () =>
     requireBridge().mcpStatus(),
   );
+  ipcMain.handle("kcreate/mcp/masterEnabled", () =>
+    requireBridge().mcpMasterEnabled(),
+  );
+  ipcMain.handle(
+    "kcreate/mcp/setMasterEnabled",
+    (_e, enabled: boolean) => {
+      requireBridge().mcpSetMasterEnabled(enabled);
+    },
+  );
+  ipcMain.handle("kcreate/mcp/pending/list", () =>
+    requireBridge().mcpPendingList(),
+  );
+  ipcMain.handle(
+    "kcreate/mcp/pending/clear",
+    (_e, clientId: string, toolName: string) => {
+      requireBridge().mcpPendingClear(clientId, toolName);
+    },
+  );
 
   // ---------------------------------------------------------------------
   // Phase 2 — color management (ICC / CMYK foundation)

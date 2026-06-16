@@ -851,6 +851,10 @@ export interface Bridge {
   ): void;
   mcpPermissionRevoke(clientId: string, toolName: string): void;
   mcpStatus(): string;
+  mcpMasterEnabled(): boolean;
+  mcpSetMasterEnabled(enabled: boolean): void;
+  mcpPendingList(): string;
+  mcpPendingClear(clientId: string, toolName: string): void;
   // Phase 2 — color management (ICC / CMYK foundation).
   colorSettingsGet(): string;
   colorSettingsUpdate(settingsJson: string): void;

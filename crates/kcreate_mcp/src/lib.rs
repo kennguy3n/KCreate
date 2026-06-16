@@ -1,11 +1,18 @@
 //! `kcreate_mcp` — local Model-Context-Protocol server.
 //!
-//! Phase 0 ships a minimal **loopback-only** HTTP JSON-RPC server
-//! exposing three tools:
+//! A **loopback-only** HTTP JSON-RPC server that lets an external AI
+//! agent compose and export a real KCreate design. It speaks both the
+//! MCP-standard handshake (`initialize` / `tools/list` / `tools/call`)
+//! and back-compatible direct method names, and exposes a rich tool
+//! surface (templates, themed generation, assets, fill / text edits,
+//! theming, magic-resize, export) — see [`tools`].
 //!
-//! 1. `list_artboards` — enumerate artboards (id + name + bounds)
-//! 2. `create_node` — create a node under a parent
-//! 3. `export_artboard` — export a node to a PNG/SVG file
+//! Every tool call is governed by [`permissions::McpPermissionStore`]
+//! (Once / Always / Denied, JSON on-disk) plus a master enable switch;
+//! the server consults the SAME store the settings UI edits and
+//! enqueues a [`permissions::PendingPermissionRequest`] when a client
+//! has no decision on record. Tool identity is taken from the
+//! [`server::CLIENT_HEADER`] HTTP header.
 //!
 //! The server **binds to `127.0.0.1` only** (configurable port; 0
 //! = OS-assigned). It is disabled by default; the bridge starts it
@@ -23,9 +30,13 @@ pub mod protocol;
 pub mod server;
 pub mod tools;
 
-pub use permissions::{McpPermission, McpPermissionStore, PermissionGrant, PermissionStoreError};
+pub use permissions::{
+    McpPermission, McpPermissionStore, PendingPermissionRequest, PendingPermissions,
+    PermissionDecision, PermissionGrant, PermissionStoreError,
+};
 pub use protocol::{JsonRpcError, JsonRpcRequest, JsonRpcResponse};
-pub use server::{McpError, McpServer};
+pub use server::{McpError, McpServer, PermissionGate, ANONYMOUS_CLIENT, CLIENT_HEADER};
 pub use tools::{
-    handle_create_node, handle_export_artboard, handle_list_artboards, DocumentAccess,
+    dispatch_tool, handle_create_node, handle_export_artboard, handle_list_artboards, is_tool,
+    tool_specs, DocumentAccess, ToolSpec,
 };

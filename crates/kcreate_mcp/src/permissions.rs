@@ -11,9 +11,10 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use chrono::{DateTime, Utc};
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -47,6 +48,31 @@ impl PermissionGrant {
     }
 }
 
+/// Outcome of a single [`McpPermissionStore::decide`] gate check.
+///
+/// This is the one accessor the server consults per tool invocation:
+/// it folds the master switch, the stored grant, and the `Once`
+/// consumption transition into a single atomic decision so callers
+/// never have to interleave `is_master_enabled` / `check` /
+/// `consume_if_once` themselves (which would reintroduce the TOCTOU
+/// windows those methods were hardened against).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PermissionDecision {
+    /// The invocation is permitted. A `Once` grant has already been
+    /// consumed (transitioned to [`PermissionGrant::Denied`]) by the
+    /// time this is returned, so the caller must not re-check.
+    Allow,
+    /// The user explicitly denied this `(client, tool)` pair (or a
+    /// `Once` grant was already spent). Refuse without prompting.
+    Denied,
+    /// No decision on record yet — the server should enqueue a pending
+    /// request for the UI and refuse this call until the user acts.
+    Prompt,
+    /// The master MCP automation switch is off, so every tool call is
+    /// refused regardless of individual grants.
+    MasterDisabled,
+}
+
 #[derive(Debug, Error)]
 pub enum PermissionStoreError {
     #[error("io: {0}")]
@@ -55,9 +81,30 @@ pub enum PermissionStoreError {
     Json(#[from] serde_json::Error),
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct StoredFile {
+    #[serde(default)]
     entries: Vec<McpPermission>,
+    /// Master automation switch. Persisted alongside the grants so the
+    /// "MCP automation is paused" state survives editor restarts. A
+    /// permissions file written before this field existed deserialises
+    /// with the field defaulted to `true` (enabled), preserving the
+    /// prior behaviour on upgrade.
+    #[serde(default = "default_master_enabled")]
+    master_enabled: bool,
+}
+
+const fn default_master_enabled() -> bool {
+    true
+}
+
+impl Default for StoredFile {
+    fn default() -> Self {
+        Self {
+            entries: Vec::new(),
+            master_enabled: true,
+        }
+    }
 }
 
 /// Permission store. Owns a JSON file on disk plus an in-memory index.
@@ -65,6 +112,10 @@ struct StoredFile {
 pub struct McpPermissionStore {
     path: PathBuf,
     inner: RwLock<HashMap<(String, String), McpPermission>>,
+    /// Master automation switch. When `false`, [`Self::decide`] refuses
+    /// every tool call before consulting individual grants — a single
+    /// "pause all automation" kill-switch the UI exposes prominently.
+    master_enabled: AtomicBool,
 }
 
 impl McpPermissionStore {
@@ -78,10 +129,12 @@ impl McpPermissionStore {
         std::fs::create_dir_all(dir)?;
         let path = dir.join("mcp_permissions.json");
         let mut map: HashMap<(String, String), McpPermission> = HashMap::new();
+        let mut master_enabled = true;
         if path.exists() {
             let bytes = std::fs::read(&path)?;
             if !bytes.is_empty() {
                 let file: StoredFile = serde_json::from_slice(&bytes)?;
+                master_enabled = file.master_enabled;
                 for entry in file.entries {
                     map.insert((entry.client_id.clone(), entry.tool_name.clone()), entry);
                 }
@@ -90,6 +143,7 @@ impl McpPermissionStore {
         Ok(Self {
             path,
             inner: RwLock::new(map),
+            master_enabled: AtomicBool::new(master_enabled),
         })
     }
 
@@ -111,11 +165,13 @@ impl McpPermissionStore {
         std::fs::create_dir_all(dir)?;
         let path = dir.join("mcp_permissions.json");
         let mut map: HashMap<(String, String), McpPermission> = HashMap::new();
+        let mut master_enabled = true;
         if path.exists() {
             let bytes = std::fs::read(&path)?;
             if !bytes.is_empty() {
                 match serde_json::from_slice::<StoredFile>(&bytes) {
                     Ok(file) => {
+                        master_enabled = file.master_enabled;
                         for entry in file.entries {
                             map.insert((entry.client_id.clone(), entry.tool_name.clone()), entry);
                         }
@@ -136,7 +192,65 @@ impl McpPermissionStore {
         Ok(Self {
             path,
             inner: RwLock::new(map),
+            master_enabled: AtomicBool::new(master_enabled),
         })
+    }
+
+    /// Whether the master automation switch is currently on. When this
+    /// is `false`, [`Self::decide`] returns
+    /// [`PermissionDecision::MasterDisabled`] for every tool call.
+    pub fn is_master_enabled(&self) -> bool {
+        self.master_enabled.load(Ordering::Relaxed)
+    }
+
+    /// Flip the master automation switch and persist the new state.
+    /// Individual grants are left untouched, so turning automation
+    /// back on restores exactly the prior scope set.
+    pub fn set_master_enabled(&self, enabled: bool) -> Result<(), PermissionStoreError> {
+        self.master_enabled.store(enabled, Ordering::Relaxed);
+        self.persist()
+    }
+
+    /// Single atomic permission gate for one tool invocation, folding
+    /// the master switch, the stored grant, and the `Once` consumption
+    /// transition into one [`PermissionDecision`]. This is the only
+    /// method the server's dispatch path needs.
+    pub fn decide(
+        &self,
+        client_id: &str,
+        tool_name: &str,
+    ) -> Result<PermissionDecision, PermissionStoreError> {
+        if !self.is_master_enabled() {
+            return Ok(PermissionDecision::MasterDisabled);
+        }
+        let key = (client_id.to_string(), tool_name.to_string());
+        // Observe-and-(maybe)-consume under a single write lock, mirroring
+        // `consume_if_once`'s atomicity contract so two concurrent calls
+        // can never both spend the same `Once` grant.
+        let (decision, needs_persist) = {
+            let mut guard = self.inner.write();
+            match guard.get(&key).cloned() {
+                None => (PermissionDecision::Prompt, false),
+                Some(entry) => match entry.granted {
+                    PermissionGrant::Always => (PermissionDecision::Allow, false),
+                    PermissionGrant::Denied => (PermissionDecision::Denied, false),
+                    PermissionGrant::Once => {
+                        let demoted = McpPermission {
+                            client_id: entry.client_id,
+                            tool_name: entry.tool_name,
+                            granted: PermissionGrant::Denied,
+                            granted_at: Utc::now(),
+                        };
+                        guard.insert(key, demoted);
+                        (PermissionDecision::Allow, true)
+                    }
+                },
+            }
+        };
+        if needs_persist {
+            self.persist()?;
+        }
+        Ok(decision)
     }
 
     /// Look up the current grant for `(client_id, tool_name)`.
@@ -257,10 +371,124 @@ impl McpPermissionStore {
     fn persist(&self) -> Result<(), PermissionStoreError> {
         let file = StoredFile {
             entries: self.list(),
+            master_enabled: self.master_enabled.load(Ordering::Relaxed),
         };
         let bytes = serde_json::to_vec_pretty(&file)?;
         std::fs::write(&self.path, bytes)?;
         Ok(())
+    }
+}
+
+/// Upper bound on distinct queued prompts. The tool set is fixed and
+/// the loopback server is single-tenant, so this is reached only by an
+/// abusive local client cycling synthetic client-ids/tool-names; past
+/// the cap we evict the least-recently-touched entry rather than let
+/// the queue grow without bound.
+const MAX_PENDING: usize = 256;
+
+/// A queued permission request awaiting a user decision.
+///
+/// Recorded by the server whenever a tool call resolves to
+/// [`PermissionDecision::Prompt`] (an ungranted `(client, tool)`
+/// pair). The McpSettingsPanel polls [`PendingPermissions::list`] and
+/// renders an Allow-Once / Always / Deny prompt per entry; acting on
+/// one writes a grant and clears it from this queue.
+///
+/// Fields use `snake_case` to match [`McpPermission`] — both cross the
+/// N-API boundary as JSON strings (which keep Rust field names) rather
+/// than `#[napi(object)]` structs (which would camelCase them).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingPermissionRequest {
+    pub client_id: String,
+    pub tool_name: String,
+    pub first_requested_at: DateTime<Utc>,
+    pub last_requested_at: DateTime<Utc>,
+    /// How many times this pair has been requested while still
+    /// ungranted — surfaced so the UI can show "asked 3×".
+    pub attempts: u32,
+}
+
+/// In-memory registry of ungranted tool calls awaiting a user
+/// decision. Deliberately NOT persisted: a pending prompt is a
+/// live-session artifact, and reviving stale prompts across restarts
+/// would be confusing (and a minor information leak about what a
+/// client probed in a previous session).
+#[derive(Debug, Default)]
+pub struct PendingPermissions {
+    inner: Mutex<HashMap<(String, String), PendingPermissionRequest>>,
+}
+
+impl PendingPermissions {
+    /// A fresh, empty registry.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record (or refresh) a pending request for `(client, tool)`.
+    /// Re-requesting an already-queued pair bumps its `attempts` and
+    /// `last_requested_at` rather than duplicating the entry.
+    pub fn record(&self, client_id: &str, tool_name: &str) {
+        let key = (client_id.to_string(), tool_name.to_string());
+        let now = Utc::now();
+        let mut guard = self.inner.lock();
+        if let Some(existing) = guard.get_mut(&key) {
+            existing.last_requested_at = now;
+            existing.attempts = existing.attempts.saturating_add(1);
+            return;
+        }
+        if guard.len() >= MAX_PENDING {
+            // Evict the least-recently-touched pending entry to stay
+            // bounded. `min_by_key` over `last_requested_at` is O(n)
+            // but n <= MAX_PENDING and this only fires under abuse.
+            if let Some(victim) = guard
+                .iter()
+                .min_by_key(|(_, v)| v.last_requested_at)
+                .map(|(k, _)| k.clone())
+            {
+                guard.remove(&victim);
+            }
+        }
+        guard.insert(
+            key,
+            PendingPermissionRequest {
+                client_id: client_id.to_string(),
+                tool_name: tool_name.to_string(),
+                first_requested_at: now,
+                last_requested_at: now,
+                attempts: 1,
+            },
+        );
+    }
+
+    /// All queued requests, sorted by `(client_id, tool_name)`.
+    #[must_use]
+    pub fn list(&self) -> Vec<PendingPermissionRequest> {
+        let mut v: Vec<PendingPermissionRequest> = self.inner.lock().values().cloned().collect();
+        v.sort_by(|a, b| {
+            a.client_id
+                .cmp(&b.client_id)
+                .then(a.tool_name.cmp(&b.tool_name))
+        });
+        v
+    }
+
+    /// Drop a single queued request (the user acted on it).
+    pub fn clear(&self, client_id: &str, tool_name: &str) {
+        self.inner
+            .lock()
+            .remove(&(client_id.to_string(), tool_name.to_string()));
+    }
+
+    /// Drop every queued request (e.g. on master-disable).
+    pub fn clear_all(&self) {
+        self.inner.lock().clear();
+    }
+
+    /// Whether the queue is currently empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.inner.lock().is_empty()
     }
 }
 
@@ -400,5 +628,119 @@ mod tests {
         let v = store.list();
         assert_eq!(v[0].client_id, "a");
         assert_eq!(v[1].client_id, "z");
+    }
+
+    #[test]
+    fn decide_folds_master_grant_and_once_consumption() {
+        let dir = tempdir().unwrap();
+        let store = McpPermissionStore::open(dir.path()).unwrap();
+
+        // Ungranted -> Prompt.
+        assert_eq!(
+            store.decide("c1", "create_node").unwrap(),
+            PermissionDecision::Prompt
+        );
+
+        // Always -> Allow (repeatable).
+        store
+            .grant("c1", "create_node", PermissionGrant::Always)
+            .unwrap();
+        assert_eq!(
+            store.decide("c1", "create_node").unwrap(),
+            PermissionDecision::Allow
+        );
+        assert_eq!(
+            store.decide("c1", "create_node").unwrap(),
+            PermissionDecision::Allow
+        );
+
+        // Denied -> Denied.
+        store
+            .grant("c1", "set_fill", PermissionGrant::Denied)
+            .unwrap();
+        assert_eq!(
+            store.decide("c1", "set_fill").unwrap(),
+            PermissionDecision::Denied
+        );
+
+        // Once -> Allow exactly once, then Denied.
+        store
+            .grant("c1", "export_design", PermissionGrant::Once)
+            .unwrap();
+        assert_eq!(
+            store.decide("c1", "export_design").unwrap(),
+            PermissionDecision::Allow
+        );
+        assert_eq!(
+            store.decide("c1", "export_design").unwrap(),
+            PermissionDecision::Denied
+        );
+    }
+
+    #[test]
+    fn master_switch_short_circuits_and_persists() {
+        let dir = tempdir().unwrap();
+        {
+            let store = McpPermissionStore::open(dir.path()).unwrap();
+            assert!(store.is_master_enabled(), "default is enabled");
+            store
+                .grant("c1", "create_node", PermissionGrant::Always)
+                .unwrap();
+            // Master off => even an Always grant is refused.
+            store.set_master_enabled(false).unwrap();
+            assert_eq!(
+                store.decide("c1", "create_node").unwrap(),
+                PermissionDecision::MasterDisabled
+            );
+        }
+        // The off state survives a reopen.
+        let store = McpPermissionStore::open(dir.path()).unwrap();
+        assert!(!store.is_master_enabled());
+        assert_eq!(
+            store.decide("c1", "create_node").unwrap(),
+            PermissionDecision::MasterDisabled
+        );
+        // Re-enabling restores the prior grant scope unchanged.
+        store.set_master_enabled(true).unwrap();
+        assert_eq!(
+            store.decide("c1", "create_node").unwrap(),
+            PermissionDecision::Allow
+        );
+    }
+
+    #[test]
+    fn legacy_file_without_master_field_defaults_enabled() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("mcp_permissions.json");
+        // A permissions file written before `master_enabled` existed.
+        std::fs::write(&path, br#"{"entries":[]}"#).unwrap();
+        let store = McpPermissionStore::open(dir.path()).unwrap();
+        assert!(
+            store.is_master_enabled(),
+            "missing master_enabled must default to enabled on upgrade"
+        );
+    }
+
+    #[test]
+    fn pending_dedups_and_clears() {
+        let pending = PendingPermissions::new();
+        assert!(pending.is_empty());
+
+        pending.record("c1", "create_node");
+        pending.record("c1", "create_node");
+        pending.record("c1", "set_text");
+        let list = pending.list();
+        assert_eq!(list.len(), 2, "same (client,tool) must dedup");
+        let create = list
+            .iter()
+            .find(|p| p.tool_name == "create_node")
+            .expect("create_node pending");
+        assert_eq!(create.attempts, 2, "re-request bumps attempts");
+        assert!(create.last_requested_at >= create.first_requested_at);
+
+        pending.clear("c1", "create_node");
+        assert_eq!(pending.list().len(), 1);
+        pending.clear_all();
+        assert!(pending.is_empty());
     }
 }

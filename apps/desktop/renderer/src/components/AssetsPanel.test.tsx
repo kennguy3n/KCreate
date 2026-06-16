@@ -236,6 +236,51 @@ describe("AssetsPanel", () => {
     expect(await screen.findByText("Recently used")).toBeInTheDocument();
   });
 
+  it("shows the empty-state message when nothing is renderable", async () => {
+    // No recents and an empty catalog → the grid has nothing to show,
+    // so the browse empty-state message replaces it.
+    const stub = kcreateStub();
+    stub.override("assets.list", () => []);
+
+    render(<AssetsPanel onInsert={noop} />);
+    expect(
+      await screen.findByText("No elements in this category."),
+    ).toBeInTheDocument();
+  });
+
+  it("keeps the Recently used row visible when a category load returns no assets", async () => {
+    // The recently-used ids resolve against `catalogById` (the full
+    // catalog loaded once on mount), which stays populated even after a
+    // scoped category load returns []. The empty-state must therefore
+    // be driven by what is actually renderable: a non-empty Recently
+    // used row must still show rather than the "No elements" message.
+    recordRecentElement("circle");
+    const stub = kcreateStub();
+    stub.override("assets.categories", () => [
+      { slug: "shapes", label: "Shapes", count: 2 },
+      { slug: "empty", label: "Empty", count: 0 },
+    ]);
+    stub.override("assets.list", (category?: unknown) =>
+      category === "empty" ? [] : ALL,
+    );
+
+    render(<AssetsPanel onInsert={noop} />);
+    // Recently used resolves from the full catalog loaded on mount.
+    expect(await screen.findByText("Recently used")).toBeInTheDocument();
+
+    // Switch to the category whose scoped load returns [].
+    fireEvent.click(screen.getByRole("tab", { name: /^Empty/ }));
+
+    // Once the scoped load settles (assets === []), the Recently used
+    // row (resolved via catalogById) stays visible instead of the
+    // empty-state message replacing the grid.
+    expect(
+      await screen.findByRole("button", { name: "Insert Circle" }),
+    ).toBeInTheDocument();
+    expect(screen.getByText("Recently used")).toBeInTheDocument();
+    expect(screen.queryByText("No elements in this category.")).toBeNull();
+  });
+
   it("windows a large catalog instead of mounting every thumbnail", async () => {
     const BULK = manyIcons(600);
     const stub = kcreateStub();

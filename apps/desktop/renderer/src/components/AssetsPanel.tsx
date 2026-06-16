@@ -373,6 +373,16 @@ export function AssetsPanel({
     end += 1;
   }
 
+  // Empty state is driven by what is actually renderable, not just the
+  // scoped grid. While browsing, a "Recently used" row can be the only
+  // content when the catalog load fails (assets === []), so the grid
+  // must still show rather than the "No elements" message. While
+  // searching, recents are not shown, so an empty result set is empty.
+  const isEmpty =
+    query.trim().length > 0
+      ? assets.length === 0
+      : assets.length === 0 && recentAssets.length === 0;
+
   return (
     <div
       style={{
@@ -432,7 +442,7 @@ export function AssetsPanel({
         <p style={{ fontSize: 12, color: colors.textMuted, padding: spacing.xs }}>
           Loading elements…
         </p>
-      ) : assets.length === 0 ? (
+      ) : isEmpty ? (
         <p style={{ fontSize: 12, color: colors.textMuted, padding: spacing.xs }}>
           {query.trim().length > 0
             ? `No elements match “${query.trim()}”.`

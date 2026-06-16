@@ -54,9 +54,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::native_canvas::{MappedRegion, MappedRegionRo};
 
-/// Magic number at the head of the shared region: ASCII `"KCSF"`
-/// (KCreate Shared Frame), little-endian.
-const MAGIC: u32 = 0x4843_5346;
+/// Magic number at the head of the shared region: the bytes `KCSF`
+/// (KCreate Shared Frame). Serialized little-endian via `write_u32`.
+const MAGIC: u32 = 0x4B43_5346;
 /// On-disk layout version. Bumped if the header / slot layout changes.
 const VERSION: u32 = 1;
 /// Fixed header length (bytes). A multiple of 4 so every slot — and

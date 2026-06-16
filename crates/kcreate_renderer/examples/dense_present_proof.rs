@@ -18,13 +18,9 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use kcreate_perf::Timeline;
+use kcreate_renderer::dense_doc::{build_dense_document, toggle_marker, DenseDoc};
 use kcreate_renderer::{initialize, DirtyRect, ObjectId, RenderContext, Scene};
 use tiny_skia::{IntSize, Pixmap};
-
-#[path = "../benches/common/dense_doc.rs"]
-mod dense_doc;
-
-use dense_doc::{build_dense_document, toggle_marker, DenseDoc};
 
 const WIDTH: u32 = 1920;
 const HEIGHT: u32 = 1080;

@@ -15,6 +15,11 @@
 
 pub mod compute;
 pub mod cpu_backend;
+/// Dense-document builder for benchmarks, the `dense_present_proof`
+/// example, and the bridge's dev-only seed affordance. Compiled only
+/// behind the `dev_seed` feature so production builds never carry it.
+#[cfg(feature = "dev_seed")]
+pub mod dense_doc;
 pub mod display_list;
 pub mod geometry;
 pub mod gpu;

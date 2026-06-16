@@ -179,7 +179,9 @@ required-features = ["collab"]
 [[bench]]
 name = "shared_present_dense"
 harness = false
-required-features = ["native_canvas"]
+# `native_canvas` for the ring publisher/reader; `dev_seed` for the
+# `dense_doc` builder (now a gated `kcreate_renderer` module).
+required-features = ["native_canvas", "dev_seed"]
 
 [features]
 default = []
@@ -201,6 +203,14 @@ llm = ["kcreate_ai/llm_sidecar"]
 # Phase 0 / Phase 1 default build is `unsafe`-free; the Electron
 # host enables it when the user opts in via the settings toggle.
 native_canvas = ["dep:raw-window-handle", "dep:memmap2"]
+# Enable the dev-only "seed dense doc" affordance: `renderer_seed_dense_scene`
+# builds a 5k–10k node analytics dashboard in-process and renders it into
+# the live renderer so the perf HUD can be captured under pan/zoom on a
+# real dense document. Off by default — production builds expose the
+# N-API entry point but it returns a "feature not compiled in" error, so
+# the IPC surface is stable. Pulls in `kcreate_renderer/dev_seed` (the
+# `dense_doc` builder); adds no networking crates.
+dev_seed = ["kcreate_renderer/dev_seed"]
 # Enable the LAN collaboration transport (QUIC + mDNS) and the
 # `session_*` IPC surface that drives the Phase 3 presence UI. Off
 # by default so the local-first sentinel keeps quinn / rustls /

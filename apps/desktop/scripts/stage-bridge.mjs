@@ -12,11 +12,23 @@
 // it can't load. Building both slices and merging keeps every produced
 // .app/.dmg valid regardless of which arch it targets.
 //
+// The staged cdylib is built with the `native_canvas` feature by default
+// so the shipped app gets the shared-memory present path (zero-IPC
+// full-frame handoff) on supported platforms, with graceful fallback to
+// the dirty-rect IPC path baked into the renderer. The feature gates the
+// only `unsafe` in the tree (the mmap in `native_canvas.rs`); set
+// `KCREATE_BRIDGE_FEATURES=` to build the unsafe-free default instead.
+//
 // Env knobs:
 //   * KCREATE_SKIP_BRIDGE_BUILD=1 — reuse already-built cdylib(s)
 //     (skips `cargo build`); errors if an artifact is missing.
 //   * KCREATE_BRIDGE_SRC=<path>   — copy from an explicit, already-correct
 //     artifact (e.g. a pre-merged universal dylib) instead of building.
+//   * KCREATE_BRIDGE_FEATURES=<f1,f2,...> — Cargo features to build the
+//     bridge with. UNSET defaults to `native_canvas` (the shared-memory
+//     present path). A set-but-blank value (`KCREATE_BRIDGE_FEATURES=`)
+//     is an explicit opt-out that builds with no features. `dev_seed` is
+//     intentionally NOT on by default — it is a dev-only affordance.
 //   * KCREATE_BRIDGE_TARGETS=<t1,t2,...> — override the Rust target triples
 //     to build + merge. Defaults to both apple-darwin triples on macOS and
 //     the host default elsewhere. Set a single triple for a fast
@@ -70,11 +82,26 @@ function run(cmd, args) {
   }
 }
 
+// Resolve the Cargo feature list for the bridge build. UNSET enables the
+// shared-memory present path (`native_canvas`) by default; a set-but-blank
+// value is an explicit opt-out (no features). Otherwise the exact
+// comma-separated list is used.
+function bridgeFeatures() {
+  const raw = process.env["KCREATE_BRIDGE_FEATURES"];
+  if (raw === undefined) return ["native_canvas"];
+  return raw
+    .split(",")
+    .map((f) => f.trim())
+    .filter((f) => f.length > 0);
+}
+
 /** Build one slice. An empty triple uses cargo's default (host) target. */
 function buildSlice(triple) {
   if (skipBuild) return;
   const args = ["build", "--release", "-p", "kcreate_bridge"];
   if (triple) args.push("--target", triple);
+  const features = bridgeFeatures();
+  if (features.length > 0) args.push("--features", features.join(","));
   console.log(`[stage-bridge] cargo ${args.join(" ")}`);
   run("cargo", args);
 }

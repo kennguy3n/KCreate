@@ -718,6 +718,64 @@ pub fn renderer_shared_reader_close() {
     }
 }
 
+/// Number of draw objects in the renderer's most recently published
+/// scene (`0` when nothing has been rendered yet).
+///
+/// The perf HUD's "Nodes" row reads this so the count reflects what the
+/// renderer is actually drawing — including a directly-seeded dense scene
+/// that has no backing document. Always available (not feature-gated).
+#[napi]
+#[must_use]
+pub fn renderer_scene_object_count() -> u32 {
+    state::scene_object_count() as u32
+}
+
+/// Result of [`renderer_seed_dense_scene`]: the new frame id plus the
+/// number of objects the seeded scene actually contains.
+#[napi(object)]
+#[derive(Debug, Clone)]
+pub struct SeedDenseResult {
+    pub frame_id: u32,
+    pub object_count: u32,
+}
+
+/// Dev-only: build a dense ~`target_nodes`-object "analytics dashboard"
+/// scene sized to `width`×`height` and render it directly into the live
+/// renderer, returning the new frame id + object count.
+///
+/// This is the seed behind the dev-only affordance used to capture the
+/// perf HUD under pan/zoom on a real 5k–10k node document. It deliberately
+/// bypasses the document graph (see [`state::seed_dense_scene`]).
+///
+/// Errors with a `feature not compiled in` message when the bridge was
+/// built without the `dev_seed` feature, so the IPC surface is stable in
+/// production builds.
+#[napi]
+#[allow(unused_variables)]
+pub fn renderer_seed_dense_scene(
+    target_nodes: u32,
+    width: f64,
+    height: f64,
+) -> NapiResult<SeedDenseResult> {
+    #[cfg(feature = "dev_seed")]
+    {
+        let (id, object_count) =
+            state::seed_dense_scene(target_nodes, width as f32, height as f32).map_err(map_err)?;
+        Ok(SeedDenseResult {
+            frame_id: id.0 as u32,
+            object_count: object_count as u32,
+        })
+    }
+    #[cfg(not(feature = "dev_seed"))]
+    {
+        Err(napi::Error::from_reason(
+            "renderer_seed_dense_scene: bridge was compiled without the `dev_seed` feature; \
+             the dense-document seed affordance is unavailable in this build."
+                .to_string(),
+        ))
+    }
+}
+
 // =============================================================================
 // Document / project bridge
 // =============================================================================

@@ -256,6 +256,18 @@ export interface SharedPresentRead {
   bytes: Uint8Array;
 }
 
+/**
+ * Result of the dev-only "seed dense doc" affordance: the new frame id
+ * plus the number of objects the seeded scene actually contains. Mirrors
+ * the `#[napi(object)] SeedDenseResult` returned by
+ * `renderer_seed_dense_scene` (`frame_id` → `frameId`, `object_count` →
+ * `objectCount`).
+ */
+export interface SeedDenseResult {
+  frameId: number;
+  objectCount: number;
+}
+
 export interface RendererInfo {
   tier: string;
   width: number;
@@ -424,6 +436,29 @@ export interface RendererBridge {
 
   /** Close the renderer-process shared-memory reader. No-op when none. */
   sharedReaderClose(): void;
+
+  /**
+   * Number of draw objects in the renderer's most recently published
+   * scene (`0` when nothing has rendered yet). The perf HUD's "Nodes" row
+   * reads this so the count reflects what the renderer is actually
+   * drawing — including a directly-seeded dense scene that has no backing
+   * document. Mirrors `kcreate_bridge::state::scene_object_count`.
+   */
+  sceneObjectCount(): Promise<number>;
+
+  /**
+   * Dev-only: build a dense ~`targetNodes`-object "analytics dashboard"
+   * scene sized to `width`×`height` and render it straight into the live
+   * renderer, returning the new frame id + object count. Used to capture
+   * the perf HUD under pan/zoom on a real 5k–10k node document. Rejects
+   * when the bridge was built without the `dev_seed` feature. Mirrors
+   * `kcreate_bridge::state::seed_dense_scene`.
+   */
+  seedDenseScene(
+    targetNodes: number,
+    width: number,
+    height: number,
+  ): Promise<SeedDenseResult>;
 }
 
 /**
@@ -1097,6 +1132,14 @@ export interface RuntimeBridge {
    * or `null` if the user cancelled.
    */
   chooseExportDirectory(defaultDir: string | null): Promise<string | null>;
+  /**
+   * Whether dev-only tooling is enabled for this session, gated on the
+   * `KCREATE_DEV_TOOLS=1` launch environment variable. The renderer uses
+   * this to decide whether to wire up developer affordances — currently
+   * the Ctrl/Cmd+Shift+D "seed dense doc" shortcut that drives the perf
+   * HUD capture. Always `false` in normal/packaged launches.
+   */
+  devToolsEnabled(): Promise<boolean>;
 }
 
 /** PDF export options. `width_mm`/`height_mm` are the page size in mm. */

@@ -28,6 +28,7 @@ import type {
   PresentFrameNapi,
   SharedPresentDescriptorNapi,
   SharedPresentFrameNapi,
+  SeedDenseResultNapi,
   ProjectInfoSnake,
   NodeInfoSnake,
   RuntimeStatusSnake,
@@ -45,6 +46,7 @@ import type {
   PresentFrame,
   SharedPresentDescriptor,
   SharedPresentFrame,
+  SeedDenseResult,
   ProjectInfo,
   NodeInfo,
   RuntimeStatus,
@@ -86,6 +88,12 @@ expectAssignable<SharedPresentDescriptor>({} as SharedPresentDescriptorNapi);
 expectAssignable<SharedPresentDescriptorNapi>({} as SharedPresentDescriptor);
 expectAssignable<SharedPresentFrame>({} as SharedPresentFrameNapi);
 expectAssignable<SharedPresentFrameNapi>({} as SharedPresentFrame);
+// Dev-only "seed dense doc" result: the napi struct emits `frameId` /
+// `objectCount`, so a regression to `frame_id` / `object_count` would
+// silently read back `undefined` on the seed-affordance path. Guarded in
+// both directions.
+expectAssignable<SeedDenseResult>({} as SeedDenseResultNapi);
+expectAssignable<SeedDenseResultNapi>({} as SeedDenseResult);
 expectAssignable<ProjectInfo>({} as ProjectInfoSnake);
 expectAssignable<RuntimeStatus>({} as RuntimeStatusSnake);
 expectAssignable<DocumentStatus>({} as DocumentStatusSnake);

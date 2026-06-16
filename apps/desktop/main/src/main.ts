@@ -896,6 +896,23 @@ function registerIpcHandlers(): void {
   ipcMain.handle("kcreate/renderer/acquirePresent", () =>
     requireBridge().rendererAcquirePresent(),
   );
+  // Number of draw objects in the renderer's most recently published
+  // scene. Drives the perf HUD's "Nodes" row so it reflects what the
+  // renderer is actually drawing — including a directly-seeded dense
+  // scene with no backing document. Always available.
+  ipcMain.handle("kcreate/renderer/sceneObjectCount", () =>
+    requireBridge().rendererSceneObjectCount(),
+  );
+  // Dev-only "seed dense doc": build a dense analytics-dashboard scene of
+  // ~`targetNodes` objects and render it straight into the live renderer
+  // so the perf HUD can be captured under pan/zoom on a real 5k–10k node
+  // document. Rejects when the bridge was built without the `dev_seed`
+  // feature (the renderer surfaces that to the dev as a no-op).
+  ipcMain.handle(
+    "kcreate/renderer/seedDenseScene",
+    (_e, targetNodes: number, width: number, height: number) =>
+      requireBridge().rendererSeedDenseScene(targetNodes, width, height),
+  );
 
   // Native canvas presentation mode (Phase 1, Block A, Tasks 4–6).
   //
@@ -1158,6 +1175,14 @@ function registerIpcHandlers(): void {
   );
   ipcMain.handle("kcreate/runtime/resourceLimits", (): string =>
     requireBridge().resourceLimits(),
+  );
+  // Dev-only tooling gate, resolved from the main process's launch
+  // environment so it can't be spoofed from renderer-side globals.
+  // `KCREATE_DEV_TOOLS=1` turns on the Ctrl/Cmd+Shift+D "seed dense doc"
+  // shortcut used to drive the perf-HUD capture; always off otherwise.
+  ipcMain.handle(
+    "kcreate/runtime/devToolsEnabled",
+    (): boolean => process.env["KCREATE_DEV_TOOLS"] === "1",
   );
 
   // Phase 8 Block E Task 27 — startup-perf profiling. The bridge

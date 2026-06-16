@@ -342,17 +342,32 @@ export function CanvasHost(props: CanvasHostProps): JSX.Element {
       }
       if (t - s.lastNodeCountTs >= PERF_HUD_NODECOUNT_MS) {
         s.lastNodeCountTs = t;
-        const doc = window.kcreate?.document;
-        if (doc) {
-          void doc
-            .status()
-            .then((status) => {
-              if (status) perfStatsRef.current.nodeCount = status.nodeCount;
-            })
-            .catch(() => {
-              /* node count is best-effort decoration for the HUD */
-            });
-        }
+        // Source the "Nodes" row from the renderer's actual draw-object
+        // count so it reflects what is being presented — including a
+        // directly-seeded dense scene that has no backing document. Fall
+        // back to the document's node count when the scene count is
+        // unavailable (older bridge) or zero (nothing rendered yet).
+        void bridge
+          .sceneObjectCount()
+          .then((count) => {
+            if (count > 0) {
+              perfStatsRef.current.nodeCount = count;
+              return;
+            }
+            const doc = window.kcreate?.document;
+            if (!doc) return;
+            void doc
+              .status()
+              .then((status) => {
+                if (status) perfStatsRef.current.nodeCount = status.nodeCount;
+              })
+              .catch(() => {
+                /* node count is best-effort decoration for the HUD */
+              });
+          })
+          .catch(() => {
+            /* node count is best-effort decoration for the HUD */
+          });
       }
       if (t - s.lastPublishTs >= PERF_HUD_PUBLISH_MS) {
         s.lastPublishTs = t;
@@ -768,6 +783,49 @@ export function CanvasHost(props: CanvasHostProps): JSX.Element {
       window.removeEventListener("keydown", onKeyDown);
     };
   }, [perfHud]);
+
+  // Dev-only (KCREATE_DEV_TOOLS=1): Ctrl/Cmd+Shift+D seeds a dense
+  // ~10k-object analytics-dashboard scene straight into the renderer so
+  // the perf HUD can be captured under pan/zoom on a real dense document.
+  // The gate is resolved from the MAIN process's launch environment, so
+  // the chord is inert in normal/packaged builds, and the seed itself is
+  // a no-op when the bridge was built without the `dev_seed` feature.
+  useEffect(() => {
+    const runtime = window.kcreate?.runtime;
+    const bridge = window.kcreate?.renderer;
+    if (!runtime || !bridge) return undefined;
+    let cancelled = false;
+    let removeListener: (() => void) | null = null;
+    void runtime
+      .devToolsEnabled()
+      .then((enabled) => {
+        if (cancelled || !enabled) return;
+        const onKeyDown = (e: KeyboardEvent): void => {
+          if (
+            (e.ctrlKey || e.metaKey) &&
+            e.shiftKey &&
+            !e.altKey &&
+            (e.code === "KeyD" || e.key === "D" || e.key === "d")
+          ) {
+            e.preventDefault();
+            void bridge.seedDenseScene(10000, 1920, 1080).catch(() => {
+              /* no-op when the bridge lacks the `dev_seed` feature */
+            });
+          }
+        };
+        window.addEventListener("keydown", onKeyDown);
+        removeListener = () => {
+          window.removeEventListener("keydown", onKeyDown);
+        };
+      })
+      .catch(() => {
+        /* dev gate is best-effort; default to off */
+      });
+    return () => {
+      cancelled = true;
+      if (removeListener) removeListener();
+    };
+  }, []);
 
   // Pan / zoom interaction state. Tracked in refs so the handlers
   // close over them without recreating on every render — pointer/wheel

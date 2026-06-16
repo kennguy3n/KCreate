@@ -21,7 +21,9 @@
 //     to build + merge. Defaults to both apple-darwin triples on macOS and
 //     the host default elsewhere. Set a single triple for a fast
 //     single-arch dev build (then constrain electron-builder with
-//     `--x64` / `--arm64` to match).
+//     `--x64` / `--arm64` to match). A blank / whitespace-only value is
+//     treated as unset (falls back to the platform default), so it never
+//     silently collapses the macOS universal build to a single host arch.
 
 import { spawnSync } from "node:child_process";
 import {
@@ -96,13 +98,17 @@ function defaultTargets() {
   return [""];
 }
 
-const targets =
-  process.env["KCREATE_BRIDGE_TARGETS"] != null
-    ? process.env["KCREATE_BRIDGE_TARGETS"]
-        .split(",")
-        .map((t) => t.trim())
-        .filter((t) => t.length > 0)
-    : defaultTargets();
+// Parse the override into clean triples. A set-but-blank value (e.g.
+// `KCREATE_BRIDGE_TARGETS=""`) yields an empty list, which we treat as
+// "unset" and fall back to the platform defaults — otherwise it would
+// silently override the macOS universal default with a single host-arch
+// build. To force single-arch, pass an explicit triple.
+const targetOverride = (process.env["KCREATE_BRIDGE_TARGETS"] ?? "")
+  .split(",")
+  .map((t) => t.trim())
+  .filter((t) => t.length > 0);
+
+const targets = targetOverride.length > 0 ? targetOverride : defaultTargets();
 
 // Replace any stale artifact so we never package a previous build.
 rmSync(stageDir, { recursive: true, force: true });

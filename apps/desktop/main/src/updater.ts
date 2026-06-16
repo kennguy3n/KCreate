@@ -163,7 +163,11 @@ export function createUpdaterController(deps: UpdaterDeps): UpdaterController {
       });
     });
     autoUpdater.on("download-progress", (progress: ProgressInfo) => {
-      transition({ status: "downloading", progress: toWireProgress(progress) });
+      transition({
+        status: "downloading",
+        progress: toWireProgress(progress),
+        error: null,
+      });
     });
     autoUpdater.on("update-downloaded", (info: BuilderUpdateInfo) => {
       transition({

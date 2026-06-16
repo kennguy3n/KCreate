@@ -217,7 +217,12 @@ function installRecorder(t) {
 function nodesFromCalls(calls) {
   const nodes = new Map();
   for (const call of calls) {
-    if (call.kind === "createRect" || call.kind === "createText") {
+    if (
+      call.kind === "createRect" ||
+      call.kind === "createText" ||
+      call.kind === "createEllipse" ||
+      call.kind === "createLine"
+    ) {
       nodes.set(call.id, { create: call, updates: [] });
     } else if (call.kind === "updateNode") {
       const entry = nodes.get(call.id);
@@ -732,6 +737,40 @@ test("APP_UI resolver seeds an app-shell layout: background, left rail, header, 
   }
 });
 
+test("APP_UI resolver seeds professional dashboard content: metric values, a bar chart, a primary CTA, and gradient fills", async (t) => {
+  const { templateResolverFor } = await loadResolvers();
+  const calls = installRecorder(t);
+  await templateResolverFor("app-ui").apply(A1080);
+  assertInsideArtboard(calls, A1080);
+  const nodes = nodesFromCalls(calls);
+  const named = new Map(
+    [...nodes.values()]
+      .map((n) => [nameOf(n), n])
+      .filter(([n]) => n !== null),
+  );
+  // Each KPI card surfaces a real metric value + an accent strip — not
+  // a bare labelled rectangle.
+  for (const i of [1, 2, 3]) {
+    assert.ok(named.has(`Metric value ${i}`), `missing 'Metric value ${i}'`);
+    assert.ok(named.has(`Card accent ${i}`), `missing 'Card accent ${i}'`);
+  }
+  // A real multi-bar chart (12 bars) anchors the dashboard.
+  assert.ok(named.has("Chart bar 1"), "missing first chart bar");
+  assert.ok(named.has("Chart bar 12"), "missing twelfth chart bar");
+  // The header carries a primary CTA with real product copy.
+  const cta = named.get("Primary button label");
+  assert.ok(cta, "missing 'Primary button label'");
+  assert.equal(cta.create.body, "+ New project");
+  assert.ok(named.has("Header subtitle"), "missing 'Header subtitle'");
+  // Depth comes from gradients (rail, CTA, chart bars) — the amateur
+  // version was flat fills only.
+  const hasGradient = [...nodes.values()].some((n) => {
+    const f = fillOf(n);
+    return f !== null && f.kind === "gradient";
+  });
+  assert.ok(hasGradient, "expected at least one gradient fill in APP_UI");
+});
+
 test("PHOTO resolver clamps the drop zone to the SHORT side so it fits non-square artboards", async (t) => {
   const { BRAND_PALETTE, templateResolverFor } = await loadResolvers();
   // Landscape 3000×2000 — the post-fix behaviour should keep the
@@ -784,6 +823,31 @@ test("DECK resolver keeps two columns visible even on a tight 800×450 artboard"
   assert.ok(b, "missing 'Column B'");
   assert.ok(a.create.h > 0, "Column A height must be positive");
   assert.ok(b.create.h > 0, "Column B height must be positive");
+});
+
+test("DECK resolver seeds a polished title slide: eyebrow, headline, accent rule, and two feature-card headings", async (t) => {
+  const { templateResolverFor } = await loadResolvers();
+  const ctx = { x: 0, y: 0, width: 1920, height: 1080 };
+  const calls = installRecorder(t);
+  await templateResolverFor("deck").apply(ctx);
+  assertInsideArtboard(calls, ctx);
+  const nodes = nodesFromCalls(calls);
+  const named = new Map(
+    [...nodes.values()]
+      .map((n) => [nameOf(n), n])
+      .filter(([n]) => n !== null),
+  );
+  // A real eyebrow → headline hierarchy, not a single bare title.
+  const eyebrow = named.get("Eyebrow");
+  assert.ok(eyebrow, "missing 'Eyebrow'");
+  assert.equal(eyebrow.create.body, "PRODUCT STRATEGY \u00b7 2026");
+  const title = named.get("Slide title");
+  assert.ok(title, "missing 'Slide title'");
+  assert.equal(title.create.body, "The next chapter of Northwind");
+  // An accent rule + two feature cards with real headings.
+  assert.ok(named.has("Title rule"), "missing 'Title rule'");
+  assert.ok(named.has("Column A heading"), "missing 'Column A heading'");
+  assert.ok(named.has("Column B heading"), "missing 'Column B heading'");
 });
 
 test("DEV_EXPORT resolver labels the artboard with its grid hint", async (t) => {

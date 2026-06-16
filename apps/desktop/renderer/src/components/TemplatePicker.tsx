@@ -13,10 +13,11 @@
 
 import { useEffect, useMemo, useState } from "react";
 
-import type { LayoutTemplate, PageSize } from "../../../shared/scene";
+import type { LayoutTemplate } from "../../../shared/scene";
 import { colors, font, radius, spacing } from "../styles/tokens";
 import { errorMessage } from "../lib/errorMessage";
 import { CATEGORY_LABELS, CATEGORY_TINT } from "../lib/templateCategories";
+import { LayoutThumbnail } from "./LayoutThumbnail";
 
 export interface TemplatePickerProps {
   /** Controls visibility. Parent owns the open/closed state. */
@@ -229,9 +230,7 @@ function TemplateCard({
   onSelect,
 }: TemplateCardProps): JSX.Element {
   const previewPage = template.pages[0];
-  const aspect = previewPage
-    ? aspectFromPageSize(previewPage.page_size, previewPage.orientation === "portrait")
-    : 0.71;
+  const accent = CATEGORY_TINT[template.category];
   return (
     <button
       type="button"
@@ -246,23 +245,29 @@ function TemplateCard({
           : "none",
       }}
     >
-      <div
-        style={{
-          width: "100%",
-          aspectRatio: aspect.toString(),
-          background: "#FAFAFA",
-          border: `1px solid ${colors.border}`,
-          borderRadius: 6,
-          marginBottom: spacing.sm,
-          display: "flex",
-          alignItems: "center",
-          justifyContent: "center",
-          color: colors.textMuted,
-          fontSize: 11,
-        }}
-      >
-        {template.pages.length} page{template.pages.length === 1 ? "" : "s"}
-      </div>
+      {previewPage ? (
+        <div style={{ marginBottom: spacing.sm }}>
+          <LayoutThumbnail
+            page={previewPage}
+            accent={accent}
+            tokens={template.design_tokens}
+            label={template.name}
+          >
+            <span style={pageCountPillStyle}>
+              {template.pages.length} page
+              {template.pages.length === 1 ? "" : "s"}
+            </span>
+          </LayoutThumbnail>
+        </div>
+      ) : (
+        // A pageless template (only possible for a malformed plugin- or
+        // AI-contributed template) still gets a framed thumbnail slot so
+        // every card keeps the same shape and the grid stays aligned.
+        <div style={cardThumbPlaceholderStyle}>
+          <span style={pageCountPillStyle}>No pages</span>
+          No preview
+        </div>
+      )}
       <div style={cardTitleStyle}>{template.name}</div>
       <div style={cardCategoryStyle}>
         <span
@@ -337,45 +342,15 @@ function PreviewCarousel({
   if (!page) {
     return <div style={messageStyle}>No pages.</div>;
   }
-  const portrait = page.orientation === "portrait";
-  const aspect = aspectFromPageSize(page.page_size, portrait);
   return (
     <div>
-      <div
-        style={{
-          position: "relative",
-          width: "100%",
-          aspectRatio: aspect.toString(),
-          background: "#FAFAFA",
-          border: `1px solid ${colors.border}`,
-          borderRadius: 6,
-          marginBottom: spacing.sm,
-          overflow: "hidden",
-        }}
-      >
-        {/* Block out the section boxes so the preview reads as a real layout. */}
-        {page.sections.map((s, i) => (
-          <div
-            key={i}
-            title={s.kind}
-            style={{
-              position: "absolute",
-              left: `${s.bounds.x * 100}%`,
-              top: `${s.bounds.y * 100}%`,
-              width: `${s.bounds.width * 100}%`,
-              height: `${s.bounds.height * 100}%`,
-              background: sectionTint(s.kind),
-              border: `1px solid ${colors.border}`,
-              fontSize: 9,
-              color: colors.textMuted,
-              padding: 2,
-              boxSizing: "border-box",
-              overflow: "hidden",
-            }}
-          >
-            {s.placeholder_text ?? s.kind}
-          </div>
-        ))}
+      <div style={{ marginBottom: spacing.sm }}>
+        <LayoutThumbnail
+          page={page}
+          accent={CATEGORY_TINT[template.category]}
+          tokens={template.design_tokens}
+          label={`${template.name} \u2014 ${page.name}`}
+        />
       </div>
       <div
         style={{
@@ -414,52 +389,6 @@ function PreviewCarousel({
 // ---------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------
-
-function aspectFromPageSize(size: PageSize, portrait: boolean): number {
-  // Ratios are width/height. Returning portrait or landscape on demand
-  // keeps the preview thumbnail proportional to the real page.
-  let portraitRatio: number;
-  if (size.kind === "custom") {
-    portraitRatio = size.height_mm > 0 ? size.width_mm / size.height_mm : 1;
-  } else {
-    portraitRatio = PORTRAIT_ASPECTS[size.kind] ?? 210 / 297;
-  }
-  return portrait ? portraitRatio : 1 / portraitRatio;
-}
-
-const PORTRAIT_ASPECTS: Record<string, number> = {
-  a4: 210 / 297,
-  a3: 297 / 420,
-  a5: 148 / 210,
-  letter: 8.5 / 11,
-  legal: 8.5 / 14,
-  tabloid: 11 / 17,
-  presentation_16x9: 9 / 16,
-  presentation_4x3: 3 / 4,
-};
-
-function sectionTint(kind: string): string {
-  switch (kind) {
-    case "title":
-      return "#DBEAFE";
-    case "subtitle":
-      return "#E0E7FF";
-    case "body_text":
-      return "#F1F5F9";
-    case "image":
-      return "#FEF3C7";
-    case "chart":
-      return "#DCFCE7";
-    case "footer":
-      return "#F3F4F6";
-    case "page_number":
-      return "#F3F4F6";
-    default:
-      return "#F8FAFC";
-  }
-}
-
-
 
 // ---------------------------------------------------------------------
 // Styles
@@ -566,6 +495,35 @@ const cardCategoryStyle: React.CSSProperties = {
   display: "flex",
   gap: spacing.xs,
   marginBottom: 2,
+};
+
+const cardThumbPlaceholderStyle: React.CSSProperties = {
+  position: "relative",
+  width: "100%",
+  aspectRatio: "4 / 3",
+  marginBottom: spacing.sm,
+  background: "#FAFAFA",
+  border: `1px solid ${colors.border}`,
+  borderRadius: 8,
+  display: "flex",
+  alignItems: "center",
+  justifyContent: "center",
+  color: colors.textMuted,
+  fontSize: 11,
+};
+
+const pageCountPillStyle: React.CSSProperties = {
+  position: "absolute",
+  top: 6,
+  right: 6,
+  padding: "2px 8px",
+  borderRadius: radius.pill,
+  background: "rgba(15, 23, 42, 0.72)",
+  color: "#FFFFFF",
+  fontSize: 10,
+  fontWeight: 600,
+  letterSpacing: 0.2,
+  pointerEvents: "none",
 };
 
 const categoryBadgeStyle: React.CSSProperties = {

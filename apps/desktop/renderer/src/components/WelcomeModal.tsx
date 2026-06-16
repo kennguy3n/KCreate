@@ -515,12 +515,10 @@ function WelcomeBody({
             <strong>{pack.name}</strong> {t("welcome.ready.suffix")}{" "}
             {report.verified
               ? t("welcome.verified", { size: formatBytes(report.sizeBytes) })
-              : `Installed ${formatBytes(
-                  report.sizeBytes,
-                )} (no pinned SHA-256 in the registry; actual hash ${report.actualSha256.slice(
-                  0,
-                  12,
-                )}…).`}
+              : t("welcome.unverified", {
+                  size: formatBytes(report.sizeBytes),
+                  hash: report.actualSha256.slice(0, 12),
+                })}
           </p>
           <footer style={footerStyle}>
             <button

@@ -16,6 +16,7 @@
 
 import { useEffect } from "react";
 
+import { useI18n } from "../i18n";
 import { colors, radius, spacing } from "../styles/tokens";
 import { Icon, type IconName } from "./Icon";
 
@@ -66,6 +67,7 @@ export function DiscoveryWelcome({
   actions,
   onDismiss,
 }: DiscoveryWelcomeProps): JSX.Element | null {
+  const { t } = useI18n();
   // Esc dismisses, matching every other overlay in the editor. Bound
   // only while open so we don't hold a listener for a hidden modal.
   useEffect(() => {
@@ -111,18 +113,15 @@ export function DiscoveryWelcome({
         <header style={headerStyle}>
           <div>
             <h2 id="kcreate-discovery-title" style={titleStyle}>
-              Welcome to KCreate
+              {t("discovery.title")}
             </h2>
-            <p style={leadStyle}>
-              Everything is one keystroke away. Press the command
-              palette to jump to any tool, panel, or flow.
-            </p>
+            <p style={leadStyle}>{t("discovery.lead")}</p>
           </div>
           <button
             type="button"
             onClick={onDismiss}
             style={iconButtonStyle}
-            aria-label="Dismiss welcome"
+            aria-label={t("discovery.aria.close")}
             data-testid="kcreate-discovery-close"
           >
             ×
@@ -137,7 +136,7 @@ export function DiscoveryWelcome({
         >
           <span style={paletteButtonLabelStyle}>
             <Icon name="command" size={16} />
-            Open the command palette
+            {t("discovery.openPalette")}
           </span>
           <kbd style={kbdStyle}>{paletteHint}</kbd>
         </button>
@@ -167,7 +166,7 @@ export function DiscoveryWelcome({
             style={secondaryButtonStyle}
             data-testid="kcreate-discovery-skip"
           >
-            Maybe later
+            {t("discovery.skip")}
           </button>
         </footer>
       </div>
@@ -273,7 +272,7 @@ const cardGridStyle: React.CSSProperties = {
 };
 
 const cardStyle: React.CSSProperties = {
-  textAlign: "left",
+  textAlign: "start",
   display: "flex",
   flexDirection: "column",
   gap: spacing.xs,

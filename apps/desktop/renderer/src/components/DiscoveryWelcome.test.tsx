@@ -10,6 +10,8 @@
 import { describe, it, expect, vi } from "vitest";
 import { render, screen, fireEvent } from "@testing-library/react";
 
+import { LocaleProvider } from "../i18n";
+import { resolveMessage } from "../i18n/catalog";
 import {
   DiscoveryWelcome,
   type DiscoveryAction,
@@ -141,5 +143,44 @@ describe("DiscoveryWelcome", () => {
     // …but clicking the backdrop (the dialog root itself) does.
     fireEvent.click(screen.getByTestId("kcreate-discovery-welcome"));
     expect(onDismiss).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("DiscoveryWelcome (localized)", () => {
+  it("renders its chrome from the active catalog (es + ar)", () => {
+    for (const locale of ["es", "ar"] as const) {
+      const { unmount } = render(
+        <LocaleProvider initialLocale={locale}>
+          <DiscoveryWelcome
+            open
+            paletteHint="Ctrl K"
+            onOpenPalette={() => {}}
+            actions={actions([])}
+            onDismiss={() => {}}
+          />
+        </LocaleProvider>,
+      );
+      // Title, lead, palette CTA, and skip button all come from the
+      // catalog rather than hard-coded English.
+      expect(
+        screen.getByText(resolveMessage(locale, "discovery.title")),
+      ).toBeInTheDocument();
+      expect(
+        screen.getByText(resolveMessage(locale, "discovery.lead")),
+      ).toBeInTheDocument();
+      expect(
+        screen.getByText(resolveMessage(locale, "discovery.openPalette")),
+      ).toBeInTheDocument();
+      expect(
+        screen.getByTestId("kcreate-discovery-skip"),
+      ).toHaveTextContent(resolveMessage(locale, "discovery.skip"));
+      // The close control's accessible name is localized too.
+      expect(
+        screen.getByRole("button", {
+          name: resolveMessage(locale, "discovery.aria.close"),
+        }),
+      ).toBeInTheDocument();
+      unmount();
+    }
   });
 });

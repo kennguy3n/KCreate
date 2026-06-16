@@ -71,6 +71,35 @@ export const en = {
   "palette.footer.run": "run",
   "palette.footer.dismiss": "dismiss",
 
+  // Command-palette command set (built in EditorPage). Group headers,
+  // command labels, the tool/studio name templates, and the
+  // disabled-state reasons all flow through here.
+  "palette.group.create": "Create",
+  "palette.group.panels": "Panels",
+  "palette.group.tools": "Tools",
+  "palette.group.studios": "Studios",
+  "palette.group.edit": "Edit",
+  "palette.group.view": "View",
+  "palette.cmd.magicResize": "Magic resize",
+  "palette.cmd.openTheme": "Open Theme & Brand kit",
+  "palette.cmd.openExport": "Export",
+  "palette.cmd.shortcuts": "Keyboard shortcuts",
+  "palette.cmd.undo": "Undo",
+  "palette.cmd.redo": "Redo",
+  "palette.cmd.selectAll": "Select all",
+  "palette.cmd.copy": "Copy",
+  "palette.cmd.paste": "Paste",
+  "palette.cmd.deleteSelection": "Delete selection",
+  "palette.cmd.zoomToFit": "Zoom to fit",
+  "palette.cmd.backHome": "Back to Home",
+  // `{name}` is the localized tool/mode name (see topbar.tool.* / topbar.mode.*).
+  "palette.tool.label": "{name} tool",
+  "palette.studio.label": "{name} studio",
+  "palette.disabled.createArtboard": "Create an artboard first",
+  "palette.disabled.nothingToUndo": "Nothing to undo",
+  "palette.disabled.nothingToRedo": "Nothing to redo",
+  "palette.disabled.nothingSelected": "Nothing selected",
+
   // Welcome / onboarding modal.
   "welcome.title": "Welcome to KCreate",
   "welcome.aria.close": "Close welcome",
@@ -93,6 +122,8 @@ export const en = {
     "Quantised GGUF, runs on your device via llama.cpp. No data leaves your machine.",
   "welcome.ready.suffix": "is ready.",
   "welcome.verified": "Verified {size}.",
+  "welcome.unverified":
+    "Installed {size} (no pinned SHA-256 in the registry; actual hash {hash}…).",
   "welcome.phase.resolving": "Resolving recommendation…",
   "welcome.phase.connecting": "Connecting…",
   "welcome.phase.downloading": "Downloading…",
@@ -101,6 +132,25 @@ export const en = {
   "welcome.phase.done": "Done",
   "welcome.phase.cancelled": "Cancelled",
   "welcome.phase.error": "Error",
+
+  // First-run discovery overlay (editor). Separate from the
+  // bridge-backed welcome modal above.
+  "discovery.title": "Welcome to KCreate",
+  "discovery.lead":
+    "Everything is one keystroke away. Press the command palette to jump to any tool, panel, or flow.",
+  "discovery.aria.close": "Dismiss welcome",
+  "discovery.openPalette": "Open the command palette",
+  "discovery.skip": "Maybe later",
+
+  // Shared create-flow copy — the three headline flows surfaced by the
+  // discovery cards, the empty-canvas state, and the command palette,
+  // kept on one set of keys so each reads identically everywhere.
+  "create.templates.label": "Start from a template",
+  "create.templates.desc": "Fork a ready-made design and make it yours.",
+  "create.ai.label": "Generate with AI",
+  "create.ai.desc": "Describe it and let the local model draft it.",
+  "create.elements.label": "Browse elements",
+  "create.elements.desc": "Drop in shapes, icons, and illustrations.",
 
   // Home page sections.
   "home.section.startFromTemplate": "Start from a template",

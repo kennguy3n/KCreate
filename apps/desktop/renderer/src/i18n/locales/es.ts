@@ -64,6 +64,32 @@ export const es: PartialMessages = {
   "palette.footer.run": "ejecutar",
   "palette.footer.dismiss": "cerrar",
 
+  // Conjunto de comandos de la paleta (se construye en EditorPage).
+  "palette.group.create": "Crear",
+  "palette.group.panels": "Paneles",
+  "palette.group.tools": "Herramientas",
+  "palette.group.studios": "Estudios",
+  "palette.group.edit": "Editar",
+  "palette.group.view": "Ver",
+  "palette.cmd.magicResize": "Cambio de tamaño mágico",
+  "palette.cmd.openTheme": "Abrir Tema y kit de marca",
+  "palette.cmd.openExport": "Exportar",
+  "palette.cmd.shortcuts": "Atajos de teclado",
+  "palette.cmd.undo": "Deshacer",
+  "palette.cmd.redo": "Rehacer",
+  "palette.cmd.selectAll": "Seleccionar todo",
+  "palette.cmd.copy": "Copiar",
+  "palette.cmd.paste": "Pegar",
+  "palette.cmd.deleteSelection": "Eliminar la selección",
+  "palette.cmd.zoomToFit": "Ajustar a la vista",
+  "palette.cmd.backHome": "Volver al inicio",
+  "palette.tool.label": "Herramienta {name}",
+  "palette.studio.label": "Estudio de {name}",
+  "palette.disabled.createArtboard": "Primero crea una mesa de trabajo",
+  "palette.disabled.nothingToUndo": "Nada que deshacer",
+  "palette.disabled.nothingToRedo": "Nada que rehacer",
+  "palette.disabled.nothingSelected": "No hay nada seleccionado",
+
   // Welcome / onboarding modal.
   "welcome.title": "Te damos la bienvenida a KCreate",
   "welcome.aria.close": "Cerrar la bienvenida",
@@ -86,6 +112,8 @@ export const es: PartialMessages = {
     "GGUF cuantizado, se ejecuta en tu dispositivo mediante llama.cpp. Ningún dato sale de tu máquina.",
   "welcome.ready.suffix": "está listo.",
   "welcome.verified": "Verificado {size}.",
+  "welcome.unverified":
+    "Instalado {size} (sin SHA-256 fijado en el registro; hash real {hash}…).",
   "welcome.phase.resolving": "Resolviendo la recomendación…",
   "welcome.phase.connecting": "Conectando…",
   "welcome.phase.downloading": "Descargando…",
@@ -94,6 +122,22 @@ export const es: PartialMessages = {
   "welcome.phase.done": "Hecho",
   "welcome.phase.cancelled": "Cancelado",
   "welcome.phase.error": "Error",
+
+  // Superposición de descubrimiento (primer arranque del editor).
+  "discovery.title": "Te damos la bienvenida a KCreate",
+  "discovery.lead":
+    "Todo está a una tecla de distancia. Abre la paleta de comandos para saltar a cualquier herramienta, panel o flujo.",
+  "discovery.aria.close": "Descartar la bienvenida",
+  "discovery.openPalette": "Abrir la paleta de comandos",
+  "discovery.skip": "Quizá más tarde",
+
+  // Texto compartido de los flujos de creación.
+  "create.templates.label": "Empezar desde una plantilla",
+  "create.templates.desc": "Bifurca un diseño listo para usar y hazlo tuyo.",
+  "create.ai.label": "Generar con IA",
+  "create.ai.desc": "Descríbelo y deja que el modelo local lo redacte.",
+  "create.elements.label": "Explorar elementos",
+  "create.elements.desc": "Añade formas, iconos e ilustraciones.",
 
   // Home page sections.
   "home.section.startFromTemplate": "Empezar desde una plantilla",

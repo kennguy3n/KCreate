@@ -64,6 +64,32 @@ export const ar: PartialMessages = {
   "palette.footer.run": "تشغيل",
   "palette.footer.dismiss": "إغلاق",
 
+  // مجموعة أوامر لوحة الأوامر (تُبنى في EditorPage).
+  "palette.group.create": "إنشاء",
+  "palette.group.panels": "اللوحات",
+  "palette.group.tools": "الأدوات",
+  "palette.group.studios": "الاستوديوهات",
+  "palette.group.edit": "تحرير",
+  "palette.group.view": "عرض",
+  "palette.cmd.magicResize": "تغيير الحجم السحري",
+  "palette.cmd.openTheme": "فتح السمة وطقم العلامة",
+  "palette.cmd.openExport": "تصدير",
+  "palette.cmd.shortcuts": "اختصارات لوحة المفاتيح",
+  "palette.cmd.undo": "تراجع",
+  "palette.cmd.redo": "إعادة",
+  "palette.cmd.selectAll": "تحديد الكل",
+  "palette.cmd.copy": "نسخ",
+  "palette.cmd.paste": "لصق",
+  "palette.cmd.deleteSelection": "حذف التحديد",
+  "palette.cmd.zoomToFit": "ملاءمة العرض",
+  "palette.cmd.backHome": "العودة إلى الرئيسية",
+  "palette.tool.label": "أداة {name}",
+  "palette.studio.label": "استوديو {name}",
+  "palette.disabled.createArtboard": "أنشئ لوح رسم أولًا",
+  "palette.disabled.nothingToUndo": "لا شيء للتراجع عنه",
+  "palette.disabled.nothingToRedo": "لا شيء لإعادته",
+  "palette.disabled.nothingSelected": "لا يوجد تحديد",
+
   // Welcome / onboarding modal.
   "welcome.title": "مرحبًا بك في KCreate",
   "welcome.aria.close": "إغلاق الترحيب",
@@ -85,6 +111,8 @@ export const ar: PartialMessages = {
     "GGUF مضغوط، يعمل على جهازك عبر llama.cpp. لا تغادر أي بيانات جهازك.",
   "welcome.ready.suffix": "جاهز.",
   "welcome.verified": "تم التحقّق {size}.",
+  "welcome.unverified":
+    "تم التثبيت {size} (لا يوجد SHA-256 مثبّت في السجل؛ التجزئة الفعلية {hash}…).",
   "welcome.phase.resolving": "جارٍ تحديد التوصية…",
   "welcome.phase.connecting": "جارٍ الاتصال…",
   "welcome.phase.downloading": "جارٍ التنزيل…",
@@ -93,6 +121,22 @@ export const ar: PartialMessages = {
   "welcome.phase.done": "تم",
   "welcome.phase.cancelled": "أُلغي",
   "welcome.phase.error": "خطأ",
+
+  // طبقة الاستكشاف عند أول تشغيل للمحرّر.
+  "discovery.title": "مرحبًا بك في KCreate",
+  "discovery.lead":
+    "كل شيء على بُعد ضغطة مفتاح. افتح لوحة الأوامر للانتقال إلى أي أداة أو لوحة أو مسار.",
+  "discovery.aria.close": "تجاهل الترحيب",
+  "discovery.openPalette": "فتح لوحة الأوامر",
+  "discovery.skip": "ربما لاحقًا",
+
+  // نص مشترك لمسارات الإنشاء.
+  "create.templates.label": "ابدأ من قالب",
+  "create.templates.desc": "انسخ تصميمًا جاهزًا واجعله خاصًا بك.",
+  "create.ai.label": "إنشاء بالذكاء الاصطناعي",
+  "create.ai.desc": "صِفه ودع النموذج المحلّي يصوغه.",
+  "create.elements.label": "تصفّح العناصر",
+  "create.elements.desc": "أضِف أشكالًا وأيقونات ورسومًا توضيحية.",
 
   // Home page sections.
   "home.section.startFromTemplate": "ابدأ من قالب",

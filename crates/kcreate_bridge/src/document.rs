@@ -1587,6 +1587,13 @@ const APPLY_PATCH_COMMANDS: &[&str] = &[
     // in `ApplyPatchSnapshot::capture` (documented no-op arm there).
     "ai_generate_themed_design",
     "ai_refine_themed_design",
+    // I6 — Print preflight auto-fix. `preflight_autofix` snapshots the
+    // full prior + next `Node` for every layer the fix pass mutated
+    // (add bleed / convert to CMYK / cap total ink), so one Ctrl+Z
+    // reverts the whole pass. before_patch = undo direction, after =
+    // redo, both the [`PreflightAutofixPatch`] shape. `capture` snapshots
+    // the same nodes for atomic group rollback.
+    "preflight_autofix",
 ];
 
 #[inline]
@@ -1659,6 +1666,12 @@ struct ApplyPatchSnapshot {
     // rolls back atomically on a mid-group failure.
     apply_theme: HashMap<Uuid, ApplyThemeSnapshot>,
     apply_theme_tokens: Option<DesignTokens>,
+    // I6 — per-node full `Node` captured before any `preflight_autofix`
+    // patch in the group runs, so a mid-group failure rolls the whole
+    // fix pass (bleed extend / RGB→CMYK / ink cap) back to its pre-loop
+    // state. Restore only replays the geometry + paint fields the fix
+    // touches, never the node's hierarchy.
+    preflight_autofix: HashMap<Uuid, kcreate_core::node::Node>,
 }
 
 /// Pre-loop snapshot of the node state an `apply_theme` patch may
@@ -1706,6 +1719,7 @@ impl ApplyPatchSnapshot {
             text_layer: HashMap::new(),
             apply_theme: HashMap::new(),
             apply_theme_tokens: None,
+            preflight_autofix: HashMap::new(),
         };
         for op in ops {
             // Defence-in-depth: skip commands the apply_patch
@@ -1834,6 +1848,20 @@ impl ApplyPatchSnapshot {
                         }
                     }
                 }
+                "preflight_autofix" => {
+                    // Snapshot the full prior `Node` once per id (first
+                    // op that mentions it) so restore can revert the
+                    // geometry + paint fields the fix overwrote.
+                    for id in &op.affected_nodes {
+                        if let std::collections::hash_map::Entry::Vacant(slot) =
+                            snap.preflight_autofix.entry(*id)
+                        {
+                            if let Some(node) = ws.project.document.get_node(*id) {
+                                slot.insert(node.clone());
+                            }
+                        }
+                    }
+                }
                 // No snapshot slot needed for the remaining
                 // apply_patch commands. Notably H4's
                 // `ai_generate_themed_design` /
@@ -1956,6 +1984,20 @@ impl ApplyPatchSnapshot {
         }
         if let Some(tokens) = self.apply_theme_tokens {
             ws.project.design_tokens = tokens;
+        }
+        // I6 — restore the geometry + paint fields a preflight auto-fix
+        // patch may have overwritten, so a mid-group failure rolls the
+        // whole fix pass back to its pre-loop state. We deliberately do
+        // NOT replay id / parent_id / children / node_type: the fix only
+        // ever edits bounds / transform / style / metadata, so leaving
+        // the hierarchy untouched is both sufficient and safe.
+        for (id, node_snap) in self.preflight_autofix {
+            if let Some(node) = ws.project.document.get_node_mut(id) {
+                node.bounds = node_snap.bounds;
+                node.transform = node_snap.transform;
+                node.style = node_snap.style;
+                node.metadata = node_snap.metadata;
+            }
         }
     }
 }
@@ -2286,6 +2328,24 @@ struct ApplyThemePatch {
     nodes: std::collections::BTreeMap<Uuid, ApplyThemeNodePatch>,
 }
 
+/// Patch payload for a `preflight_autofix` operation: the full prior
+/// (`before_patch`) / next (`after_patch`) [`Node`] snapshot for every
+/// layer the fix pass mutated. Auto-fix only rewrites existing-node
+/// geometry + paint (`bounds`, `transform`, `style`, `metadata`) —
+/// never creates, deletes, or reparents — so replaying those fields
+/// from the snapshot is a complete, symmetric revert that one Ctrl+Z
+/// applies to the whole pass (see the `preflight_autofix` arms in
+/// [`apply_patch`] and [`ApplyPatchSnapshot`]). The full `Node` is
+/// carried (rather than just the four mutated fields) so the record
+/// stays self-describing and forward-compatible if a future fix class
+/// touches another property.
+///
+/// [`Node`]: kcreate_core::node::Node
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct PreflightAutofixPatch {
+    pub(crate) nodes: std::collections::BTreeMap<Uuid, kcreate_core::node::Node>,
+}
+
 fn apply_patch(ws: &mut Workspace, op: &Operation, patch: &serde_json::Value) -> Result<()> {
     // `project.undo()` / `project.redo()` already bumped
     // `modified_at` before we got here, so we don't need to touch it
@@ -2567,6 +2627,37 @@ fn apply_patch(ws: &mut Workspace, op: &Operation, patch: &serde_json::Value) ->
         "ai_generate_themed_design" | "ai_refine_themed_design" => {
             let parsed: crate::phase10::ThemedDesignPatch = serde_json::from_value(patch.clone())?;
             apply_themed_design_patch(ws, parsed)
+        }
+        // I6 — Print preflight auto-fix. Both before_patch and
+        // after_patch carry the full [`PreflightAutofixPatch`] (a
+        // per-node `Node` snapshot for every layer the fix pass
+        // touched). Undo replays before_patch, redo replays
+        // after_patch, so one Ctrl+Z reverts the whole "add bleed /
+        // convert to CMYK / cap ink" pass. We restore ONLY the
+        // geometry + paint fields the fix mutates (`bounds`,
+        // `transform`, `style`, `metadata`) so a node's hierarchy
+        // (parent / children) is never disturbed; `document_undo` /
+        // `document_redo` re-run scene sync after the apply_patch loop.
+        "preflight_autofix" => {
+            // Deserialize the WHOLE payload up-front so a malformed
+            // patch fails before any mutation (fail-fast, never
+            // half-applied).
+            let parsed: PreflightAutofixPatch = serde_json::from_value(patch.clone())?;
+            for (id, snapshot) in parsed.nodes {
+                let Some(node) = ws.project.document.get_node_mut(id) else {
+                    // The node was removed by a later op that the LIFO
+                    // operation log undoes before this one in normal
+                    // flows. Skip defensively rather than failing the
+                    // whole fix pass if the graph has diverged.
+                    continue;
+                };
+                node.bounds = snapshot.bounds;
+                node.transform = snapshot.transform;
+                node.style = snapshot.style;
+                node.metadata = snapshot.metadata;
+                node.touch();
+            }
+            Ok(())
         }
         other => {
             // No-op fall-through for graph operations
@@ -8612,8 +8703,9 @@ pub struct PrintReadyExportOutcome {
     /// Names of the spot-color plates that became `/Separation`
     /// color spaces in the PDF, in plate order.
     pub spot_plates: Vec<String>,
-    /// `"rgb"`, `"cmyk"`, or `"passThrough"` — the color model the
-    /// page content was emitted in.
+    /// `"rgb"`, `"cmyk"`, or `"pass_through"` — the `PdfColorMode`
+    /// wire value the page content was emitted in. Matches the
+    /// representation accepted on input so the field round-trips.
     pub color_mode: String,
 }
 
@@ -8621,7 +8713,7 @@ fn print_ready_color_mode_label(mode: kcreate_export::pdf::PdfColorMode) -> &'st
     match mode {
         kcreate_export::pdf::PdfColorMode::Rgb => "rgb",
         kcreate_export::pdf::PdfColorMode::Cmyk => "cmyk",
-        kcreate_export::pdf::PdfColorMode::PassThrough => "passThrough",
+        kcreate_export::pdf::PdfColorMode::PassThrough => "pass_through",
     }
 }
 
@@ -10219,6 +10311,8 @@ mod tests {
             // H4 — AI generation depth (generate + refine).
             "ai_generate_themed_design",
             "ai_refine_themed_design",
+            // I6 — Print preflight auto-fix (one undoable fix pass).
+            "preflight_autofix",
         ]
         .into_iter()
         .collect();

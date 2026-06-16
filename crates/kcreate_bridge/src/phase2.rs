@@ -48,7 +48,7 @@ use uuid::Uuid;
 use crate::document::{
     blob_load, build_template_document, current_scene_safe, sync_scene_after_change,
     template_instantiate_items, with_workspace, with_workspace_mut, CanvasBatchItem,
-    DocumentBridgeError, Result, TemplateInstantiateReport,
+    DocumentBridgeError, PreflightAutofixPatch, Result, TemplateInstantiateReport,
 };
 use crate::thumbnails::{
     render_template_thumbnail_png, ThumbnailBytes, DEFAULT_THUMBNAIL_MAX_DIM_PX,
@@ -171,6 +171,32 @@ pub fn preflight_autofix(req: &PreflightAutofixRequest) -> Result<PreflightAutof
     let fix_bleed = requested.contains("bleed_margin") || requested.contains("bleed_area_empty");
 
     with_workspace_mut(|ws| {
+        // Snapshot the prior state of every layer a requested fix could
+        // touch, BEFORE mutating, so the whole pass records as a SINGLE
+        // undoable `preflight_autofix` operation — one Ctrl+Z reverts
+        // add-bleed + RGB→CMYK + ink-cap together. A `BTreeMap` keyed by
+        // id dedupes the candidate set (a background can be both a bleed
+        // and a color-space candidate) and orders it deterministically.
+        let mut candidate_ids: Vec<Uuid> = Vec::new();
+        if fix_bleed {
+            for page_id in &pages {
+                candidate_ids.extend(full_bleed_background_candidates(
+                    &ws.project.document,
+                    *page_id,
+                ));
+            }
+        }
+        if requested.contains("color_space") {
+            candidate_ids.extend(color_space_nodes.iter().copied());
+        }
+        if requested.contains("total_ink_coverage") {
+            candidate_ids.extend(tic_nodes.iter().copied());
+        }
+        let before_nodes: std::collections::BTreeMap<Uuid, Node> = candidate_ids
+            .into_iter()
+            .filter_map(|id| ws.project.document.get_node(id).map(|n| (id, n.clone())))
+            .collect();
+
         if fix_bleed {
             applied.push(apply_bleed_fix(
                 &mut ws.project.document,
@@ -227,6 +253,50 @@ pub fn preflight_autofix(req: &PreflightAutofixRequest) -> Result<PreflightAutof
                 },
                 applied_node_ids: ids_to_strings(&fixed),
             });
+        }
+
+        // Record one undoable `preflight_autofix` operation covering
+        // every layer that actually changed. We diff against the
+        // pre-mutation snapshot on exactly the fields the fix helpers
+        // touch (`bounds` / `transform` / `style` / `metadata`) so the
+        // recorded patch — and the matching `apply_patch` restore — stay
+        // in lockstep, and a no-op fix (nothing over the limit) records
+        // nothing. See `document::PreflightAutofixPatch`.
+        let mut before_patch_nodes: std::collections::BTreeMap<Uuid, Node> =
+            std::collections::BTreeMap::new();
+        let mut after_patch_nodes: std::collections::BTreeMap<Uuid, Node> =
+            std::collections::BTreeMap::new();
+        let mut affected: Vec<Uuid> = Vec::new();
+        for (id, prior) in &before_nodes {
+            let Some(current) = ws.project.document.get_node(*id) else {
+                continue;
+            };
+            let changed = prior.bounds != current.bounds
+                || prior.transform != current.transform
+                || prior.style != current.style
+                || prior.metadata != current.metadata;
+            if !changed {
+                continue;
+            }
+            before_patch_nodes.insert(*id, prior.clone());
+            after_patch_nodes.insert(*id, current.clone());
+            affected.push(*id);
+        }
+        if !affected.is_empty() {
+            let before_patch = serde_json::to_value(PreflightAutofixPatch {
+                nodes: before_patch_nodes,
+            })?;
+            let after_patch = serde_json::to_value(PreflightAutofixPatch {
+                nodes: after_patch_nodes,
+            })?;
+            let op = Operation::new(
+                "user",
+                "preflight_autofix",
+                before_patch,
+                after_patch,
+                affected,
+            );
+            ws.project.execute_operation(op);
         }
         Ok(())
     })?;
@@ -6355,7 +6425,9 @@ mod import_tests {
 #[cfg(test)]
 mod preflight_autofix_tests {
     use super::*;
-    use crate::document::{project_close, project_create, reset_for_tests};
+    use crate::document::{
+        document_redo, document_undo, project_close, project_create, reset_for_tests,
+    };
     use kcreate_core::node::{NodeStyle, PageLayout, PageOrientation, PageSize, RgbaColor};
     use kcreate_core::PAGE_LAYOUT_METADATA_KEY;
     use kcreate_export::preflight::PreflightSeverity;
@@ -6606,6 +6678,143 @@ mod preflight_autofix_tests {
         assert!(!after_checks.contains(&PreflightCheck::TotalInkCoverage));
         assert!(!after_checks.contains(&PreflightCheck::BleedMargin));
         assert!(!after_checks.contains(&PreflightCheck::BleedAreaEmpty));
+
+        project_close();
+    }
+
+    /// A full auto-fix pass is a SINGLE undoable operation: one
+    /// `document_undo` reverts add-bleed + RGB→CMYK + ink-cap together
+    /// (the recorded `preflight_autofix` op replays `before_patch`),
+    /// and `document_redo` re-applies them. Proves Devin Review PR #76
+    /// finding #1 — auto-fix no longer mutates the document outside the
+    /// operation log.
+    #[test]
+    #[serial]
+    fn autofix_is_a_single_undoable_operation() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("print-autofix-undo", dir.path()).expect("project");
+        let page_id = insert_a4_page();
+
+        let bg_id = insert_vector_rect(
+            page_id,
+            "Background",
+            0.0,
+            0.0,
+            2480.0,
+            3508.0,
+            NodeStyle {
+                color_override: Some(Color::Cmyk {
+                    c: 0.1,
+                    m: 0.1,
+                    y: 0.1,
+                    k: 0.0,
+                    a: 1.0,
+                }),
+                ..NodeStyle::default()
+            },
+        );
+        let logo_id = insert_vector_rect(
+            page_id,
+            "Logo",
+            1000.0,
+            1500.0,
+            480.0,
+            480.0,
+            NodeStyle {
+                fill: FillStyle::Solid(RgbaColor::new(0.20, 0.45, 0.90, 1.0)),
+                ..NodeStyle::default()
+            },
+        );
+
+        // Snapshot the exact pre-fix state we expect undo to restore.
+        let node_of = |id: Uuid| {
+            with_workspace(|ws| Ok(ws.project.document.get_node(id).cloned()))
+                .expect("read")
+                .expect("node present")
+        };
+        let bg_before = node_of(bg_id);
+        let logo_before = node_of(logo_id);
+        assert!(
+            logo_before.style.color_override.is_none(),
+            "logo starts as an sRGB fill with no CMYK override"
+        );
+
+        let options = PreflightOptions::default();
+        let page_str = page_id.to_string();
+        preflight_autofix(&PreflightAutofixRequest {
+            page_ids: vec![page_str.clone()],
+            options: options.clone(),
+            fixes: vec![
+                "bleed_margin".to_string(),
+                "bleed_area_empty".to_string(),
+                "color_space".to_string(),
+            ],
+        })
+        .expect("autofix");
+
+        // The fix actually changed the document.
+        let bg_fixed = node_of(bg_id);
+        let logo_fixed = node_of(logo_id);
+        assert_ne!(
+            bg_fixed.bounds, bg_before.bounds,
+            "background must have grown into the bleed box"
+        );
+        assert!(
+            matches!(logo_fixed.style.color_override, Some(Color::Cmyk { .. })),
+            "logo must have been converted to a CMYK override"
+        );
+
+        // One undo reverts the WHOLE pass (both layers) atomically.
+        let outcome = document_undo().expect("undo ok").expect("an op to undo");
+        assert_eq!(outcome.command, "preflight_autofix");
+        let bg_undone = node_of(bg_id);
+        let logo_undone = node_of(logo_id);
+        assert_eq!(
+            bg_undone.bounds, bg_before.bounds,
+            "undo must restore the background's pre-fix bounds"
+        );
+        assert_eq!(
+            bg_undone.transform.tx, bg_before.transform.tx,
+            "undo must restore the background's translation"
+        );
+        assert_eq!(
+            bg_undone.metadata.get(VECTOR_PATH_METADATA_KEY),
+            bg_before.metadata.get(VECTOR_PATH_METADATA_KEY),
+            "undo must restore the background's vector path"
+        );
+        assert!(
+            logo_undone.style.color_override.is_none(),
+            "undo must drop the CMYK override the colour fix added"
+        );
+
+        // Re-running preflight on the undone document re-raises the
+        // findings the fix had cleared — proof the revert is real.
+        let reraised = checks(
+            &preflight_run(&PreflightRequest {
+                page_ids: vec![page_str],
+                options,
+            })
+            .expect("preflight after undo"),
+        );
+        assert!(
+            reraised.contains(&PreflightCheck::ColorSpace),
+            "undo must bring back the colour-space finding: {reraised:?}"
+        );
+
+        // Redo re-applies the same pass.
+        let redo = document_redo().expect("redo ok").expect("an op to redo");
+        assert_eq!(redo.command, "preflight_autofix");
+        let logo_redone = node_of(logo_id);
+        assert!(
+            matches!(logo_redone.style.color_override, Some(Color::Cmyk { .. })),
+            "redo must re-apply the CMYK conversion"
+        );
+        assert_eq!(
+            node_of(bg_id).bounds,
+            bg_fixed.bounds,
+            "redo must re-grow the background into the bleed box"
+        );
 
         project_close();
     }

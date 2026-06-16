@@ -1053,7 +1053,12 @@ export interface PrintReadyExportOutcome {
   trimBoxMm: [number, number];
   bleedMm: number;
   spotPlates: string[];
-  colorMode: "rgb" | "cmyk" | "passThrough";
+  /**
+   * The `PdfColorMode` wire value the content was emitted in. Same
+   * representation as the request's {@link PrintReadyColorMode}, so an
+   * `outcome.colorMode` round-trips back into a request unchanged.
+   */
+  colorMode: PrintReadyColorMode;
 }
 
 /** WebP export options. `quality` is 0..100; `lossless` overrides quality. */

@@ -1888,11 +1888,11 @@ function EditorPageInner({
       artboards[0] ??
       null;
     if (source === null) {
-      setStatusMessage("Magic Resize needs an artboard — create one first.");
+      setStatusMessage(t("editor.magicResize.needsArtboard"));
       return;
     }
     setMagicResizeSource(source);
-  }, [artboards, selectedIds, setStatusMessage]);
+  }, [artboards, selectedIds, setStatusMessage, t]);
 
   // Switch to a tool from the palette. If the active mode doesn't
   // expose the tool, hop to design mode first (it exposes all six
@@ -3016,7 +3016,7 @@ function EditorPageInner({
                     cursor: "pointer",
                   }}
                 >
-                  ▶ Play
+                  ▶ {t("editor.preview.play")}
                 </button>
               </div>
               <div style={{ flex: 1, overflow: "auto" }}>
@@ -3070,7 +3070,7 @@ function EditorPageInner({
                   boxShadow: "0 4px 12px rgba(0,0,0,0.12)",
                 }}
               >
-                Drop files to import (PNG, JPG, WebP, GIF, SVG, PDF)
+                {t("editor.import.dropHint")}
               </div>
             </div>
           ) : null}
@@ -3190,7 +3190,7 @@ function EditorPageInner({
         <div
           role="dialog"
           aria-modal="true"
-          aria-label="Keyboard shortcuts"
+          aria-label={t("editor.shortcuts.title")}
           onClick={(e) => {
             if (e.target === e.currentTarget) {
               setShortcutsPanelOpen(false);

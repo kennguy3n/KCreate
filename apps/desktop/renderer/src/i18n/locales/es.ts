@@ -143,6 +143,12 @@ export const es: PartialMessages = {
   "create.elements.label": "Explorar elementos",
   "create.elements.desc": "Añade formas, iconos e ilustraciones.",
 
+  // Llamada a la acción del lienzo vacío.
+  "canvasEmpty.title": "Empieza tu primer diseño",
+  "canvasEmpty.lead":
+    "Elige una plantilla lista para usar, descríbela a la IA o explora la biblioteca de elementos, o pulsa {hint} para todo.",
+  "canvasEmpty.openPalette": "Abrir la paleta de comandos",
+
   // Home page sections.
   "home.section.startFromTemplate": "Empezar desde una plantilla",
   "home.section.startFromBrief": "Empezar desde un resumen",
@@ -215,6 +221,17 @@ export const es: PartialMessages = {
   "editor.status.noSelection": "Sin selección",
   "editor.status.selected":
     "{count, plural, one {# seleccionado} other {# seleccionados}}",
+
+  // Cadenas varias del editor.
+  "editor.magicResize.needsArtboard":
+    "El cambio de tamaño mágico necesita una mesa de trabajo: crea una primero.",
+  "editor.preview.play": "Reproducir",
+  "editor.import.dropHint":
+    "Suelta archivos para importar (PNG, JPG, WebP, GIF, SVG, PDF)",
+  "editor.shortcuts.title": "Atajos de teclado",
+
+  // Marca temporal relativa en las tarjetas de proyectos recientes.
+  "home.recents.justNow": "ahora mismo",
 
   // Language switcher.
   "lang.label": "Idioma",

@@ -156,6 +156,14 @@ export const en = {
   "create.elements.label": "Browse elements",
   "create.elements.desc": "Drop in shapes, icons, and illustrations.",
 
+  // Empty-canvas call to action (shown when a project has no artboards).
+  // `{hint}` in the lead is rendered by the component as a styled <kbd>,
+  // so it is left unsubstituted here and split out at render time.
+  "canvasEmpty.title": "Start your first design",
+  "canvasEmpty.lead":
+    "Pick a ready-made template, describe it to the AI, or browse the elements library — or press {hint} for everything.",
+  "canvasEmpty.openPalette": "Open command palette",
+
   // Home page sections.
   "home.section.startFromTemplate": "Start from a template",
   "home.section.startFromBrief": "Start from a brief",
@@ -228,6 +236,19 @@ export const en = {
   "editor.status.noSelection": "No selection",
   "editor.status.selected":
     "{count, plural, one {# selected} other {# selected}}",
+
+  // Misc inline editor strings (status messages, overlays, hints).
+  "editor.magicResize.needsArtboard":
+    "Magic Resize needs an artboard — create one first.",
+  "editor.preview.play": "Play",
+  "editor.import.dropHint":
+    "Drop files to import (PNG, JPG, WebP, GIF, SVG, PDF)",
+  "editor.shortcuts.title": "Keyboard shortcuts",
+
+  // "< 1 minute" label on Home recent-project cards. Older buckets
+  // (minutes / hours / days) are rendered with the platform
+  // `Intl.RelativeTimeFormat` for locale-correct plurals.
+  "home.recents.justNow": "just now",
 
   // Language switcher.
   "lang.label": "Language",

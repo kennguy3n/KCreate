@@ -142,6 +142,12 @@ export const ar: PartialMessages = {
   "create.elements.label": "تصفّح العناصر",
   "create.elements.desc": "أضِف أشكالًا وأيقونات ورسومًا توضيحية.",
 
+  // دعوة لاتخاذ إجراء على لوح الرسم الفارغ.
+  "canvasEmpty.title": "ابدأ تصميمك الأول",
+  "canvasEmpty.lead":
+    "اختر قالبًا جاهزًا، أو صِفه للذكاء الاصطناعي، أو تصفّح مكتبة العناصر — أو اضغط {hint} للوصول إلى كل شيء.",
+  "canvasEmpty.openPalette": "فتح لوحة الأوامر",
+
   // Home page sections.
   "home.section.startFromTemplate": "ابدأ من قالب",
   "home.section.startFromBrief": "ابدأ من موجز",
@@ -213,6 +219,17 @@ export const ar: PartialMessages = {
   "editor.status.noSelection": "لا يوجد تحديد",
   "editor.status.selected":
     "{count, plural, one {عنصر واحد محدّد} two {عنصران محدّدان} few {# عناصر محدّدة} many {# عنصرًا محدّدًا} other {# عنصر محدّد}}",
+
+  // سلاسل متفرّقة في المحرّر.
+  "editor.magicResize.needsArtboard":
+    "يحتاج تغيير الحجم السحري إلى لوح رسم — أنشئ واحدًا أولًا.",
+  "editor.preview.play": "تشغيل",
+  "editor.import.dropHint":
+    "أفلِت الملفات للاستيراد (PNG، JPG، WebP، GIF، SVG، PDF)",
+  "editor.shortcuts.title": "اختصارات لوحة المفاتيح",
+
+  // طابع زمني نسبي على بطاقات المشاريع الأخيرة.
+  "home.recents.justNow": "الآن",
 
   // Language switcher.
   "lang.label": "اللغة",

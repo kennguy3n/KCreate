@@ -12,7 +12,7 @@ import type {
 import { colors, font, radius, shadow, spacing } from "../styles/tokens";
 import { BriefModal } from "../components/BriefModal";
 import { Icon, type IconName } from "../components/Icon";
-import { useI18n, type MessageKey } from "../i18n";
+import { useI18n, type LocaleId, type MessageKey } from "../i18n";
 import { UpdateControl } from "../components/UpdatePanel";
 import {
   WelcomeModal,
@@ -1010,8 +1010,8 @@ function RecentProjectCard({
   cover: ThumbnailBytes | null;
   onClick: (() => void) | undefined;
 }): JSX.Element {
-  const { t } = useI18n();
-  const subtitle = formatRelativeIso(info.lastOpenedAt);
+  const { t, locale } = useI18n();
+  const subtitle = formatRelativeIso(info.lastOpenedAt, locale, t);
   return (
     <button
       type="button"
@@ -1105,30 +1105,30 @@ function RecentProjectCard({
  * back to the raw ISO string when parsing fails — the bridge already
  * guarantees RFC 3339 UTC, but defending against drift is cheap.
  */
-function formatRelativeIso(iso: string): string {
+function formatRelativeIso(
+  iso: string,
+  locale: LocaleId,
+  t: (key: MessageKey) => string,
+): string {
   const ts = Date.parse(iso);
   if (Number.isNaN(ts)) return iso;
   const deltaMs = Date.now() - ts;
   const minute = 60_000;
   const hour = 60 * minute;
   const day = 24 * hour;
-  // `Math.floor` (not `Math.round`) so each bucket stays strictly
-  // within its label range: 59m → "59m ago", 60m → "1h ago" (we've
-  // already advanced into the next bucket via `deltaMs < hour`),
-  // never the visually-wrong "60m ago". Same reasoning for the hour
-  // → day and day → week boundaries.
-  if (deltaMs < minute) return "just now";
-  if (deltaMs < hour) {
-    const m = Math.floor(deltaMs / minute);
-    return `${m}m ago`;
-  }
-  if (deltaMs < day) {
-    const h = Math.floor(deltaMs / hour);
-    return `${h}h ago`;
-  }
-  if (deltaMs < 7 * day) {
-    const d = Math.floor(deltaMs / day);
-    return d <= 1 ? "yesterday" : `${d}d ago`;
-  }
-  return new Date(ts).toLocaleDateString();
+  if (deltaMs < minute) return t("home.recents.justNow");
+  // Older buckets go through the platform formatter for locale-correct
+  // plurals and RTL. `numeric: "auto"` keeps idiomatic words like
+  // "yesterday"; `style: "narrow"` mirrors the original compact
+  // "5m ago" / "2h ago" shorthand. `Math.floor` (not `Math.round`)
+  // keeps each value strictly inside its bucket so 60m never renders
+  // before `deltaMs` crosses into the hour branch.
+  const rtf = new Intl.RelativeTimeFormat(locale, {
+    numeric: "auto",
+    style: "narrow",
+  });
+  if (deltaMs < hour) return rtf.format(-Math.floor(deltaMs / minute), "minute");
+  if (deltaMs < day) return rtf.format(-Math.floor(deltaMs / hour), "hour");
+  if (deltaMs < 7 * day) return rtf.format(-Math.floor(deltaMs / day), "day");
+  return new Date(ts).toLocaleDateString(locale);
 }

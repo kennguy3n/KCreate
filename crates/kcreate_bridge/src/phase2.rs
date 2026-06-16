@@ -2075,11 +2075,14 @@ fn apply_one_proposal_locked(
             node_type,
             props,
         } => {
-            if doc.get_node(*parent_id).is_none() {
+            // Snapshot the parent *before* `insert_node` appends the new
+            // child to its `children`. We only commit this snapshot to the
+            // builder once insertion succeeds (below).
+            let Some(parent_prior) = doc.get_node(*parent_id).cloned() else {
                 return ProposalOutcome::Rejected {
                     reason: format!("parent node {parent_id} not found"),
                 };
-            }
+            };
             let create_props: crate::document::CreateNodeProps =
                 match serde_json::from_value(props.clone()) {
                     Ok(p) => p,
@@ -2103,6 +2106,20 @@ fn apply_one_proposal_locked(
             };
             match doc.insert_node(node) {
                 Ok(new_id) => {
+                    // Record the parent's *pre-insertion* state before the
+                    // child, so `into_patches` builds a before-snapshot whose
+                    // `children` does not list the just-created node. Without
+                    // this, a later proposal that also touches this parent
+                    // would be the first to `note_initial` it — capturing a
+                    // mid-batch snapshot whose `children` already includes
+                    // `new_id`. Undo would then remove `new_id` but upsert the
+                    // parent still referencing it (a dangling child), and redo
+                    // could duplicate it. `note_initial` keeps only the first
+                    // snapshot per node, so this is a no-op when the parent was
+                    // already touched earlier in the batch (its true pre-batch
+                    // state is already recorded, including the case where the
+                    // parent was itself created by this same batch → `None`).
+                    builder.note_initial(*parent_id, Some(parent_prior));
                     builder.note_initial(new_id, None);
                     ProposalOutcome::Applied { node_id: new_id }
                 }
@@ -5409,6 +5426,144 @@ mod ai_inference_tests {
             with_workspace(|ws| Ok(!ws.project.document.contains(child_id))).expect("contains"),
             "redo removes the child again"
         );
+        project_close();
+    }
+
+    /// A plugin batch that **creates** a child under a parent and then
+    /// also moves that same parent in the same batch must record the
+    /// parent's *pre-batch* state (children list WITHOUT the new child),
+    /// not a mid-batch snapshot taken after `insert_node` already
+    /// appended the child. Otherwise undo would remove the created child
+    /// yet upsert the parent still listing it (a dangling child id), and
+    /// a subsequent redo could duplicate the child in `children`. This
+    /// guards the `note_initial`-before-the-child ordering in the
+    /// `CreateNode` arm of `apply_one_proposal_locked`.
+    #[test]
+    #[serial]
+    fn plugin_create_then_move_parent_undo_has_no_dangling_child() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("plugin-create-move-parent", dir.path()).expect("project");
+
+        // A single artboard with no children to start.
+        let (art_id, art_tx0, art_ty0) = with_workspace_mut(|ws| {
+            let mut art = Node::new(NodeType::Artboard, "Frame");
+            art.bounds = Bounds {
+                x: 0.0,
+                y: 0.0,
+                width: 400.0,
+                height: 300.0,
+            };
+            let art_id = ws.project.document.insert_node(art)?;
+            let art = ws.project.document.get_node(art_id).expect("artboard");
+            Ok::<(Uuid, f64, f64), DocumentBridgeError>((
+                art_id,
+                art.transform.tx,
+                art.transform.ty,
+            ))
+        })
+        .expect("seed document");
+
+        // Order matters: the move touches the parent only *after* the
+        // create has already appended the child to its `children`.
+        let reports = apply_plugin_proposals(
+            "com.kcreate.test.create-move",
+            vec![
+                kcreate_plugin::ProposedMutation::CreateNode {
+                    parent_id: art_id,
+                    node_type: "vector_layer".to_string(),
+                    props: serde_json::json!({ "name": "Added" }),
+                },
+                kcreate_plugin::ProposedMutation::MoveNode {
+                    node_id: art_id,
+                    dx: 25.0,
+                    dy: 40.0,
+                },
+            ],
+        );
+        assert_eq!(reports.len(), 2);
+        let created_id = match reports[0].outcome {
+            ProposalOutcome::Applied { node_id } => node_id,
+            ProposalOutcome::Rejected { .. } => {
+                panic!("create proposal must apply, got {:?}", reports[0].outcome)
+            }
+        };
+        assert!(
+            matches!(reports[1].outcome, ProposalOutcome::Applied { .. }),
+            "move proposal applied: {:?}",
+            reports[1].outcome
+        );
+
+        // Post-apply: artboard owns the new child and has moved.
+        with_workspace(|ws| {
+            let art = ws.project.document.get_node(art_id).expect("artboard");
+            assert!(
+                art.children.contains(&created_id),
+                "artboard lists the created child after apply"
+            );
+            assert!(
+                ws.project.document.get_node(created_id).is_some(),
+                "created child exists after apply"
+            );
+            assert_eq!(art.transform.tx, art_tx0 + 25.0, "artboard moved in x");
+            assert_eq!(art.transform.ty, art_ty0 + 40.0, "artboard moved in y");
+            Ok(())
+        })
+        .expect("post-apply state");
+
+        // Undo: the created child is gone AND the artboard no longer
+        // references it (no dangling child), and the move is reverted.
+        crate::document::document_undo().expect("undo");
+        with_workspace(|ws| {
+            assert!(
+                ws.project.document.get_node(created_id).is_none(),
+                "undo removes the created child"
+            );
+            let art = ws.project.document.get_node(art_id).expect("artboard");
+            assert!(
+                !art.children.contains(&created_id),
+                "undo leaves no dangling reference to the removed child"
+            );
+            for child in &art.children {
+                assert!(
+                    ws.project.document.get_node(*child).is_some(),
+                    "every child id resolves to a live node after undo"
+                );
+            }
+            assert_eq!(art.transform.tx, art_tx0, "undo reverts the move in x");
+            assert_eq!(art.transform.ty, art_ty0, "undo reverts the move in y");
+            Ok(())
+        })
+        .expect("post-undo state");
+
+        // Redo: the child comes back exactly once (no duplicate in
+        // `children`) and the move is reapplied.
+        crate::document::document_redo().expect("redo");
+        with_workspace(|ws| {
+            let art = ws.project.document.get_node(art_id).expect("artboard");
+            let occurrences = art.children.iter().filter(|c| **c == created_id).count();
+            assert_eq!(
+                occurrences, 1,
+                "redo re-inserts the child exactly once (no duplicate)"
+            );
+            assert!(
+                ws.project.document.get_node(created_id).is_some(),
+                "redo restores the created child"
+            );
+            assert_eq!(
+                art.transform.tx,
+                art_tx0 + 25.0,
+                "redo reapplies the move in x"
+            );
+            assert_eq!(
+                art.transform.ty,
+                art_ty0 + 40.0,
+                "redo reapplies the move in y"
+            );
+            Ok(())
+        })
+        .expect("post-redo state");
+
         project_close();
     }
 

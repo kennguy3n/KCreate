@@ -80,6 +80,7 @@ import {
   markDiscoveryWelcomeSeen,
 } from "../lib/discoveryWelcome";
 import { colors, font, spacing } from "../styles/tokens";
+import { useI18n } from "../i18n";
 import { errorMessage } from "../lib/errorMessage";
 import { useToolStateMachine } from "../hooks/useToolStateMachine";
 
@@ -193,6 +194,7 @@ function EditorPageInner({
   project,
   onBackHome,
 }: EditorPageProps): JSX.Element {
+  const { t } = useI18n();
   // Editor UI / tool state lives in `EditorContext`. We destructure
   // here so the existing local variable names in the function body
   // continue to compile unchanged.
@@ -2970,7 +2972,7 @@ function EditorPageInner({
             style={{
               position: "absolute",
               top: spacing.sm,
-              right: spacing.sm,
+              insetInlineEnd: spacing.sm,
               background: "rgba(17, 24, 39, 0.7)",
               color: colors.textInverse,
               fontSize: 11,
@@ -3136,11 +3138,13 @@ function EditorPageInner({
           minHeight: 22,
         }}
       >
-        <span>{statusMessage ?? `Project: ${project.path}`}</span>
-        <span style={{ marginLeft: "auto" }}>
+        <span role="status" aria-live="polite">
+          {statusMessage ?? t("editor.status.project", { path: project.path })}
+        </span>
+        <span style={{ marginInlineStart: "auto" }}>
           {selectedIds.length === 0
-            ? "No selection"
-            : `${selectedIds.length} selected`}
+            ? t("editor.status.noSelection")
+            : t("editor.status.selected", { count: selectedIds.length })}
         </span>
       </footer>
       <ArtboardDialog

@@ -22,6 +22,8 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 
+import { useFocusTrap } from "../a11y/useFocusTrap";
+import { useI18n } from "../i18n";
 import type { ShortcutBinding } from "../shortcuts/registry";
 import { formatBinding } from "../shortcuts/registry";
 import {
@@ -238,6 +240,12 @@ export function CommandPalette({
   const inputRef = useRef<HTMLInputElement | null>(null);
   const listRef = useRef<HTMLDivElement | null>(null);
   const activeRowRef = useRef<HTMLButtonElement | null>(null);
+  const { t } = useI18n();
+  // Contain focus while open and return it to the opener on close.
+  const trapRef = useFocusTrap<HTMLDivElement>({
+    active: open,
+    onEscape: onClose,
+  });
 
   // Reset transient state and refresh history each time the palette
   // opens so it reflects usage from the current session.
@@ -312,10 +320,6 @@ export function CommandPalette({
         if (active && active.kind === "command") runCommand(active.command);
         break;
       }
-      case "Escape":
-        event.preventDefault();
-        onClose();
-        break;
       case "k":
       case "K":
         // Toggle-close: the global Ctrl+K is gated while the input has
@@ -334,20 +338,24 @@ export function CommandPalette({
     <div
       role="dialog"
       aria-modal="true"
-      aria-label="Command palette"
+      aria-label={t("palette.aria.dialog")}
       data-testid="kcreate-command-palette"
       style={overlayStyle}
       onClick={onClose}
     >
-      <div style={paletteStyle} onClick={(e) => e.stopPropagation()}>
+      <div
+        ref={trapRef}
+        style={paletteStyle}
+        onClick={(e) => e.stopPropagation()}
+      >
         <div style={inputRowStyle}>
           <Icon name="search" size={16} />
           <input
             ref={inputRef}
             type="text"
             value={query}
-            placeholder="Search actions, panels, tools…"
-            aria-label="Search commands"
+            placeholder={t("palette.placeholder")}
+            aria-label={t("palette.aria.searchInput")}
             data-testid="kcreate-command-palette-input"
             spellCheck={false}
             autoComplete="off"
@@ -355,16 +363,16 @@ export function CommandPalette({
             onKeyDown={onInputKeyDown}
             style={inputStyle}
           />
-          <kbd style={escHintStyle}>Esc</kbd>
+          <kbd style={escHintStyle}>{t("palette.esc")}</kbd>
         </div>
         <div ref={listRef} role="listbox" style={listStyle}>
           {commandKeys.length === 0 ? (
-            <div style={emptyStyle}>No matching commands.</div>
+            <div style={emptyStyle}>{t("palette.empty")}</div>
           ) : (
             rows.map((row) =>
               row.kind === "header" ? (
                 <div key={`h:${row.label}`} style={headerStyle}>
-                  {row.label}
+                  {row.label === RECENT_GROUP ? t("palette.recent") : row.label}
                 </div>
               ) : (
                 <CommandRow
@@ -383,13 +391,13 @@ export function CommandPalette({
         <div style={footerStyle}>
           <span>
             <kbd style={footKbd}>↑</kbd>
-            <kbd style={footKbd}>↓</kbd> navigate
+            <kbd style={footKbd}>↓</kbd> {t("palette.footer.navigate")}
           </span>
           <span>
-            <kbd style={footKbd}>↵</kbd> run
+            <kbd style={footKbd}>↵</kbd> {t("palette.footer.run")}
           </span>
           <span>
-            <kbd style={footKbd}>esc</kbd> dismiss
+            <kbd style={footKbd}>esc</kbd> {t("palette.footer.dismiss")}
           </span>
         </div>
       </div>

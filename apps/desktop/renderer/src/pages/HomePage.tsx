@@ -12,6 +12,7 @@ import type {
 import { colors, font, radius, shadow, spacing } from "../styles/tokens";
 import { BriefModal } from "../components/BriefModal";
 import { Icon, type IconName } from "../components/Icon";
+import { useI18n, type MessageKey } from "../i18n";
 import { UpdateControl } from "../components/UpdatePanel";
 import {
   WelcomeModal,
@@ -28,8 +29,18 @@ import {
  * created in Rust via `window.kcreate.artboard.create()` once the
  * project exists.
  */
+export type CreateOptionId =
+  | "app-ui"
+  | "brand"
+  | "social"
+  | "photo"
+  | "deck"
+  | "print"
+  | "dev-export"
+  | "import";
+
 export interface CreateOption {
-  id: string;
+  id: CreateOptionId;
   title: string;
   blurb: string;
   nodeType: string;
@@ -182,6 +193,7 @@ export function HomePage({
   onBriefApplied,
   onBrowseTemplates,
 }: HomePageProps): JSX.Element {
+  const { t } = useI18n();
   const [status, setStatus] = useState<RuntimeStatus | null>(null);
   const [statusError, setStatusError] = useState<string | null>(null);
   const [llmStatus, setLlmStatus] = useState<LlmStatus | null>(null);
@@ -419,19 +431,19 @@ export function HomePage({
         }}
       >
         {onBrowseTemplates ? (
-          <Section title="Start from a template">
+          <Section title={t("home.section.startFromTemplate")}>
             <TemplateGalleryTile onBrowse={onBrowseTemplates} />
           </Section>
         ) : null}
 
-        <Section title="Start from a brief">
+        <Section title={t("home.section.startFromBrief")}>
           <BriefTile
             llmStatus={llmStatus}
             onOpen={() => setBriefOpen(true)}
           />
         </Section>
 
-        <Section title="Create new">
+        <Section title={t("home.section.createNew")}>
           <div
             style={{
               display: "grid",
@@ -443,8 +455,8 @@ export function HomePage({
               <CreateCard
                 key={opt.id}
                 id={opt.id}
-                title={opt.title}
-                blurb={opt.blurb}
+                titleKey={`home.create.${opt.id}.title`}
+                blurbKey={`home.create.${opt.id}.blurb`}
                 icon={opt.icon}
                 accent={opt.accent}
                 onClick={() => onOpenEditor(opt.id)}
@@ -453,7 +465,7 @@ export function HomePage({
           </div>
         </Section>
 
-        <Section title="Recent projects">
+        <Section title={t("home.section.recentProjects")}>
           <RecentProjectsGrid
             state={recents}
             covers={covers}
@@ -462,11 +474,11 @@ export function HomePage({
           />
         </Section>
 
-        <Section title="Model status">
+        <Section title={t("home.section.modelStatus")}>
           <ModelStatusGrid status={status} llmStatus={llmStatus} />
         </Section>
 
-        <Section title="Help & learn">
+        <Section title={t("home.section.helpAndLearn")}>
           <HelpAndLearnGrid />
         </Section>
       </main>
@@ -491,6 +503,7 @@ function BriefTile({
   llmStatus: LlmStatus | null;
   onOpen: () => void;
 }): JSX.Element {
+  const { t } = useI18n();
   const ready = llmStatus?.state === "ready";
   return (
     <button
@@ -528,12 +541,10 @@ function BriefTile({
       </div>
       <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
         <span style={{ fontSize: 15, fontWeight: 600, color: colors.text }}>
-          Start from a brief
+          {t("home.brief.title")}
         </span>
         <span style={{ fontSize: 13, color: colors.textMuted }}>
-          {ready
-            ? "Describe what you want; generate a themed multi-page deck or one-pager, or let the local model fill a single artboard."
-            : "Describe what you want and generate a themed multi-page deck or one-pager — works offline."}
+          {ready ? t("home.brief.blurb.ready") : t("home.brief.blurb.offline")}
         </span>
       </div>
     </button>
@@ -545,6 +556,7 @@ function TemplateGalleryTile({
 }: {
   onBrowse: () => void;
 }): JSX.Element {
+  const { t } = useI18n();
   return (
     <button
       type="button"
@@ -580,12 +592,10 @@ function TemplateGalleryTile({
       </div>
       <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
         <span style={{ fontSize: 15, fontWeight: 600, color: colors.text }}>
-          Browse ready-made templates
+          {t("home.template.title")}
         </span>
         <span style={{ fontSize: 13, color: colors.textMuted }}>
-          Pick a professionally-designed starter — decks, social posts,
-          mobile UI kits, posters, resumes — and jump straight onto a
-          populated canvas.
+          {t("home.template.blurb")}
         </span>
       </div>
     </button>
@@ -599,10 +609,11 @@ function ModelStatusGrid({
   status: RuntimeStatus | null;
   llmStatus: LlmStatus | null;
 }): JSX.Element {
+  const { t } = useI18n();
   const gpuLabel = status?.gpuAvailable
     ? (status.gpuName ?? "GPU")
     : status
-      ? "CPU only"
+      ? t("home.model.cpuOnly")
       : "…";
   const llmLabel =
     llmStatus === null
@@ -620,15 +631,15 @@ function ModelStatusGrid({
       data-testid="kcreate-model-status"
     >
       <StatusCard
-        label="Device tier"
+        label={t("home.model.deviceTier")}
         value={status?.deviceTier ?? "…"}
       />
-      <StatusCard label="GPU backend" value={gpuLabel} />
+      <StatusCard label={t("home.model.gpuBackend")} value={gpuLabel} />
       <StatusCard
-        label="System RAM"
-        value={status ? `${status.totalRamMb} MB` : "…"}
+        label={t("home.model.systemRam")}
+        value={status ? t("home.model.ramMb", { mb: status.totalRamMb }) : "…"}
       />
-      <StatusCard label="LLM sidecar" value={llmLabel} />
+      <StatusCard label={t("home.model.llmSidecar")} value={llmLabel} />
     </div>
   );
 }
@@ -670,35 +681,36 @@ function StatusCard({
 }
 
 interface HelpLink {
-  label: string;
-  blurb: string;
+  labelKey: MessageKey;
+  blurbKey: MessageKey;
   href: string;
 }
 
 const HELP_LINKS: ReadonlyArray<HelpLink> = [
   {
-    label: "Getting started",
-    blurb: "First-run walkthrough: artboards, layers, exporting.",
+    labelKey: "home.help.gettingStarted.label",
+    blurbKey: "home.help.gettingStarted.blurb",
     href: "https://kcreate.app/learn/getting-started",
   },
   {
-    label: "Keyboard shortcuts",
-    blurb: "Every shortcut in one place — printable cheat sheet.",
+    labelKey: "home.help.shortcuts.label",
+    blurbKey: "home.help.shortcuts.blurb",
     href: "https://kcreate.app/learn/shortcuts",
   },
   {
-    label: "What's new",
-    blurb: "Changelog and feature highlights.",
+    labelKey: "home.help.whatsNew.label",
+    blurbKey: "home.help.whatsNew.blurb",
     href: "https://kcreate.app/learn/changelog",
   },
   {
-    label: "Architecture",
-    blurb: "Local-first, Rust + Electron, deep technical docs.",
+    labelKey: "home.help.architecture.label",
+    blurbKey: "home.help.architecture.blurb",
     href: "https://kcreate.app/learn/architecture",
   },
 ];
 
 function HelpAndLearnGrid(): JSX.Element {
+  const { t } = useI18n();
   return (
     <div
       style={{
@@ -727,9 +739,11 @@ function HelpAndLearnGrid(): JSX.Element {
             boxShadow: shadow.card,
           }}
         >
-          <span style={{ fontSize: 15, fontWeight: 600 }}>{link.label}</span>
+          <span style={{ fontSize: 15, fontWeight: 600 }}>
+            {t(link.labelKey)}
+          </span>
           <span style={{ fontSize: 13, color: colors.textMuted }}>
-            {link.blurb}
+            {t(link.blurbKey)}
           </span>
         </a>
       ))}
@@ -764,19 +778,20 @@ function Section({
 
 function CreateCard({
   id,
-  title,
-  blurb,
+  titleKey,
+  blurbKey,
   icon,
   accent,
   onClick,
 }: {
   id: string;
-  title: string;
-  blurb: string;
+  titleKey: MessageKey;
+  blurbKey: MessageKey;
   icon: IconName;
   accent: string;
   onClick: () => void;
 }): JSX.Element {
+  const { t } = useI18n();
   return (
     <button
       type="button"
@@ -820,9 +835,11 @@ function CreateCard({
         <Icon name={icon} size={20} />
       </span>
       <span style={{ fontSize: 15, fontWeight: 600, color: colors.text }}>
-        {title}
+        {t(titleKey)}
       </span>
-      <span style={{ fontSize: 13, color: colors.textMuted }}>{blurb}</span>
+      <span style={{ fontSize: 13, color: colors.textMuted }}>
+        {t(blurbKey)}
+      </span>
     </button>
   );
 }
@@ -834,10 +851,11 @@ function RuntimeBadge({
   status: RuntimeStatus | null;
   error: string | null;
 }): JSX.Element {
+  const { t } = useI18n();
   if (error) {
     return (
       <span style={{ fontSize: 12, color: "#B91C1C" }}>
-        runtime probe failed: {error}
+        {t("home.runtime.probeFailed", { error })}
       </span>
     );
   }
@@ -846,7 +864,7 @@ function RuntimeBadge({
   }
   const gpuLabel = status.gpuAvailable
     ? (status.gpuName ?? "GPU")
-    : "CPU only";
+    : t("home.runtime.cpuOnly");
   return (
     <div
       style={{
@@ -917,17 +935,14 @@ function RecentProjectsGrid({
   onOpenProject: ((projectDir: string) => void) | null;
   onBrowseTemplates: (() => void) | null;
 }): JSX.Element {
+  const { t } = useI18n();
   if (state.kind === "idle" || state.kind === "loading") {
-    return (
-      <EmptyState>
-        Loading recent projects&hellip;
-      </EmptyState>
-    );
+    return <EmptyState>{t("home.recents.loading")}</EmptyState>;
   }
   if (state.kind === "error") {
     return (
       <EmptyState>
-        Could not read the recent-projects list:{" "}
+        {t("home.recents.error")}{" "}
         <code>{state.message}</code>
       </EmptyState>
     );
@@ -936,9 +951,7 @@ function RecentProjectsGrid({
     return (
       <EmptyState>
         <div style={{ marginBottom: onBrowseTemplates ? spacing.md : 0 }}>
-          No recent projects yet. Your work is saved locally inside{" "}
-          <code>.kstudio</code> folders — start from a ready-made
-          template to get a real design on the canvas in one click.
+          {t("home.recents.empty")}
         </div>
         {onBrowseTemplates ? (
           <button
@@ -960,7 +973,7 @@ function RecentProjectsGrid({
             }}
           >
             <Icon name="layout" size={16} />
-            Browse templates
+            {t("home.recents.browseTemplates")}
           </button>
         ) : null}
       </EmptyState>
@@ -997,6 +1010,7 @@ function RecentProjectCard({
   cover: ThumbnailBytes | null;
   onClick: (() => void) | undefined;
 }): JSX.Element {
+  const { t } = useI18n();
   const subtitle = formatRelativeIso(info.lastOpenedAt);
   return (
     <button
@@ -1054,7 +1068,7 @@ function RecentProjectCard({
           />
         ) : (
           <span style={{ color: colors.textMuted, fontSize: 12 }}>
-            no preview
+            {t("home.recents.noPreview")}
           </span>
         )}
       </div>

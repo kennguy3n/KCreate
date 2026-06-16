@@ -20,6 +20,10 @@
            outline (TemplatePicker selected card). Replaces
            `${colors.accent}33`. */
         --kc-accent-ring: rgba(124, 58, 237, 0.20);
+        /* Keyboard focus indicator. A darker shade of the accent so
+           the ring clears WCAG AA non-text contrast (3:1) against the
+           white substrate and the accent-filled controls alike. */
+        --kc-focus: #6D28D9;
         --kc-bg: #FFFFFF;
         --kc-bg-soft: #F5F3FF;
         --kc-bg-canvas: #1e1e1e;
@@ -66,6 +70,9 @@
            substrate; the accent hue itself is unchanged. */
         --kc-accent-bg-soft: rgba(124, 58, 237, 0.22);
         --kc-accent-ring: rgba(124, 58, 237, 0.35);
+        /* Brighter focus hue in dark mode so the ring stays clearly
+           visible against the dark substrate. */
+        --kc-focus: #A78BFA;
         --kc-bg: #1F2937;
         --kc-bg-soft: #374151;
         --kc-bg-canvas: #111827;
@@ -106,6 +113,19 @@
         font-family: inherit;
         font-size: inherit;
         cursor: pointer;
+      }
+      /* Visible keyboard focus. `:focus-visible` only paints the ring
+         for keyboard / programmatic focus, so pointer users don't see
+         a ring on click while keyboard users always do. The ring
+         follows the element's border-radius in Chromium. */
+      :focus-visible {
+        outline: 2px solid var(--kc-focus);
+        outline-offset: 2px;
+      }
+      /* Suppress the legacy default outline for pointer-driven focus
+         so the only focus affordance is the `:focus-visible` ring. */
+      :focus:not(:focus-visible) {
+        outline: none;
       }
       .kcreate-shell { display: flex; flex-direction: column; height: 100%; }
     </style>

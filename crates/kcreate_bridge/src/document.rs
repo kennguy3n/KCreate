@@ -2676,6 +2676,13 @@ fn apply_patch(ws: &mut Workspace, op: &Operation, patch: &serde_json::Value) ->
             for node in parsed.upsert {
                 let id = node.id;
                 if ws.project.document.get_node(id).is_some() {
+                    // Overwrite in place. Unlike the insert branch below
+                    // we deliberately do NOT clear `children`: the node
+                    // already lives in the graph with its parent/child
+                    // wiring intact, and the captured `children` list
+                    // matches that live wiring, so replacing the node's
+                    // own fields wholesale keeps the tree consistent with
+                    // nothing to double up.
                     if let Some(existing) = ws.project.document.get_node_mut(id) {
                         *existing = node;
                         existing.touch();

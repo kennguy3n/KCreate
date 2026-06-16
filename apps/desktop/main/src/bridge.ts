@@ -27,6 +27,23 @@ type AcquiredFrameNapi = {
   bytes: Uint8Array;
 };
 
+// `renderer_acquire_present` returns an `#[napi(object)]` struct, so the
+// Rust field identifiers are auto-camelCased: `frame_id` → `frameId`,
+// `dirty_x` → `dirtyX`, `dirty_width` → `dirtyWidth`. `bytes` is either the
+// whole frame (`full === true`) or just the `dirty` sub-rect
+// (`full === false`; empty when nothing changed since the last present).
+type PresentFrameNapi = {
+  frameId: number;
+  width: number;
+  height: number;
+  dirtyX: number;
+  dirtyY: number;
+  dirtyWidth: number;
+  dirtyHeight: number;
+  full: boolean;
+  bytes: Uint8Array;
+};
+
 // `ProjectInfoSnake` / `NodeInfoSnake` / `RuntimeStatusSnake` /
 // `DocumentStatusSnake` mirror the `#[napi(object)]` structs of the same
 // stem in `crates/kcreate_bridge/src/lib.rs`. As with `UndoRedoOutcome`
@@ -184,6 +201,7 @@ type RecentProjectInfoSnake = {
 export type {
   FrameInfoNapi,
   AcquiredFrameNapi,
+  PresentFrameNapi,
   ProjectInfoSnake,
   NodeInfoSnake,
   BoundsSnake,
@@ -221,6 +239,7 @@ export interface Bridge {
   rendererGetFrame(): Uint8Array | null;
   rendererFrameInfo(): FrameInfoNapi | null;
   rendererAcquireFrame(): AcquiredFrameNapi | null;
+  rendererAcquirePresent(): PresentFrameNapi | null;
 
   // Native canvas presentation mode (Phase 1, Block A, Tasks 4–6).
   //
@@ -819,6 +838,11 @@ export interface Bridge {
     id: string,
     function_: string,
     input: string,
+  ): string;
+  pluginExecuteOnSelection(
+    id: string,
+    function_: string,
+    paramsJson: string,
   ): string;
   pluginJsList(): string;
   pluginJsMessage(pluginId: string, messageJson: string): string;
@@ -1432,7 +1456,9 @@ export interface Bridge {
   // Brand Hub + Plugin Marketplace (Block D)
   aiBrandToBrochure(brandKitIdStr: string, numPages: number): string;
   pluginMarketplaceList(): string;
+  pluginMarketplaceCatalog(): string;
   pluginMarketplaceInstallLocal(path: string): string;
+  pluginMarketplaceInstallBundled(id: string): string;
   pluginMarketplaceRemove(id: string): boolean;
   exportPdfMulti(optionsJson: string, outputPath: string): string;
 
@@ -1555,23 +1581,63 @@ export function applyCollabFallbacks(raw: Partial<Bridge>): Bridge {
   return raw as Bridge;
 }
 
-function bridgeBinaryPath(): string {
-  // Allow override for development. In production, the bridge is copied
-  // alongside the packaged app via electron-builder's `extraResources`.
+/**
+ * Runtime context the bridge resolver needs to find the cdylib. The
+ * main process passes Electron's `app.isPackaged` and
+ * `process.resourcesPath`; unit tests pass synthetic values. Keeping
+ * this an explicit parameter (rather than importing `electron` here)
+ * lets `bridge.ts` stay a plain Node module that vitest can load
+ * without an Electron runtime.
+ */
+export interface BridgeResolveContext {
+  /** Electron's `app.isPackaged`: true inside an installed build. */
+  isPackaged: boolean;
+  /** Electron's `process.resourcesPath`: the dir holding `app.asar`. */
+  resourcesPath: string;
+}
+
+/**
+ * Subdirectory under `process.resourcesPath` where electron-builder
+ * stages the cdylib (`extraResources` `to: "bridge"`). Native libraries
+ * cannot be `dlopen`'d from inside an asar archive, so the bridge ships
+ * unpacked here rather than alongside the bundled JS.
+ */
+const PACKAGED_BRIDGE_DIR = "bridge";
+
+/** Platform-specific cdylib filename produced by `cargo build`. */
+export function bridgeBinaryName(
+  platform: NodeJS.Platform = process.platform,
+): string {
+  return platform === "win32"
+    ? "kcreate_bridge.dll"
+    : platform === "darwin"
+      ? "libkcreate_bridge.dylib"
+      : "libkcreate_bridge.so";
+}
+
+export function bridgeBinaryPath(ctx?: BridgeResolveContext): string {
+  // 1. Explicit override always wins — used by the e2e smoke harness,
+  //    CI, and power users pointing at a custom build.
   const override = process.env["KCREATE_BRIDGE_PATH"];
   if (override) return override;
 
+  const name = bridgeBinaryName();
+
+  // 2. Packaged install: there is no `target/` dir. electron-builder
+  //    copied the release cdylib to `<resources>/bridge/` via
+  //    `extraResources`, so resolve it from `process.resourcesPath`.
+  if (ctx?.isPackaged) {
+    return path.join(ctx.resourcesPath, PACKAGED_BRIDGE_DIR, name);
+  }
+
+  // 3. Dev / test: resolve from the Cargo `target/<profile>` dir,
+  //    computed relative to the bundled main process at
+  //    `apps/desktop/main/dist/`. Dev builds default to `debug`; the
+  //    packaged pipeline builds `release` and ships it via (2) above,
+  //    so a packaged context never reaches this branch.
   const profile = process.env["KCREATE_BRIDGE_PROFILE"] ?? "debug";
   const targetRoot = path.resolve(__dirname, "..", "..", "..", "..", "target");
-  const libDir = path.join(targetRoot, profile);
-  const platform = process.platform;
-  const name =
-    platform === "win32"
-      ? "kcreate_bridge.dll"
-      : platform === "darwin"
-        ? "libkcreate_bridge.dylib"
-        : "libkcreate_bridge.so";
-  return path.join(libDir, name);
+  return path.join(targetRoot, profile, name);
 }
 
 // napi-rs synchronous exports built with `napi/dyn-symbols` return an
@@ -1611,8 +1677,8 @@ export function normalizeBridgeErrors(raw: Bridge): Bridge {
   }) as Bridge;
 }
 
-export function loadBridge(): Bridge {
-  const binaryPath = bridgeBinaryPath();
+export function loadBridge(ctx?: BridgeResolveContext): Bridge {
+  const binaryPath = bridgeBinaryPath(ctx);
   // `process.dlopen` lets us load a raw shared library that does not end
   // in `.node`. The Node.js loader populates `module.exports` with the
   // napi-rs addon's exports.

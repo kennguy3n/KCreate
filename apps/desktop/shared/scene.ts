@@ -184,6 +184,27 @@ export interface AcquiredFrame {
   bytes: Uint8Array;
 }
 
+/**
+ * Dirty-rect present snapshot. `bytes` is either the whole frame
+ * (`full === true`, `width * height * 4` bytes) or only the changed
+ * `dirty` sub-rect (`full === false`, `dirtyWidth * dirtyHeight * 4`
+ * bytes — empty when nothing changed since the last present). The host
+ * patches its persistent backbuffer at `(dirtyX, dirtyY)` and repaints
+ * with the matching `putImageData` form. Mirrors
+ * `kcreate_bridge::state::AcquiredPresent`.
+ */
+export interface PresentFrame {
+  frameId: number;
+  width: number;
+  height: number;
+  dirtyX: number;
+  dirtyY: number;
+  dirtyWidth: number;
+  dirtyHeight: number;
+  full: boolean;
+  bytes: Uint8Array;
+}
+
 export interface RendererInfo {
   tier: string;
   width: number;
@@ -256,6 +277,17 @@ export interface RendererBridge {
    * published yet.
    */
   acquireFrame(): Promise<AcquiredFrame | null>;
+  /**
+   * Dirty-rect present path: an atomic snapshot of the latest frame that
+   * carries only the pixels changed since the host last consumed a frame
+   * (or the whole frame on the first frame, after a resize, or when the
+   * change is large — `full === true`). Calling this resets the
+   * accumulated dirty region on the Rust side, so the host invokes it
+   * once per present and patches its persistent backbuffer with the
+   * result. Returns null if no frame has been published yet. Mirrors
+   * `kcreate_bridge::state::acquire_present`.
+   */
+  acquirePresent(): Promise<PresentFrame | null>;
 
   /**
    * Current presentation mode. `"offscreen"` (the default) means the
@@ -1556,6 +1588,105 @@ export interface OnboardingBridge {
  */
 export interface SystemBridge {
   openExternal(url: string): Promise<void>;
+}
+
+// -----------------------------------------------------------------------------
+// I1 — Distribution / auto-update (electron-updater) surface.
+//
+// This namespace is JS-only: the updater lives entirely in the Electron
+// main process (`apps/desktop/main/src/updater.ts`) and never crosses the
+// N-API bridge, so there is no Rust `wire.rs` counterpart to keep in
+// lockstep. The shapes below are plain camelCase JS DTOs (NOT serde
+// JSON-string types), mirroring the values the main process pushes over
+// the `kcreate/update/*` IPC channels.
+// -----------------------------------------------------------------------------
+
+/**
+ * Lifecycle of an update check / download, surfaced to the renderer so
+ * the "Check for updates" affordance can render the right state without
+ * embedding any electron-updater types.
+ *
+ * - `idle`          — nothing in flight; no check has run yet this session.
+ * - `checking`      — a feed check is in progress.
+ * - `available`     — a newer version exists but has not been downloaded.
+ * - `not-available` — the feed confirmed this build is current.
+ * - `downloading`   — the update payload is being fetched (`progress` set).
+ * - `downloaded`    — payload staged; `quitAndInstall` can apply it.
+ * - `error`         — the last operation failed (`error` set).
+ * - `disabled`      — auto-update is unavailable (dev run / no feed / opt-out).
+ */
+export type UpdateStatus =
+  | "idle"
+  | "checking"
+  | "available"
+  | "not-available"
+  | "downloading"
+  | "downloaded"
+  | "error"
+  | "disabled";
+
+/** Download progress for an in-flight update (mirrors electron-updater's `ProgressInfo`). */
+export interface UpdateProgress {
+  /** 0–100. */
+  percent: number;
+  bytesPerSecond: number;
+  transferred: number;
+  total: number;
+}
+
+/** Metadata about an available / downloaded update release. */
+export interface UpdateInfo {
+  version: string;
+  releaseDate: string | null;
+  /** Coalesced to a plain string (electron-updater may hand back a list). */
+  releaseNotes: string | null;
+}
+
+/** Full snapshot of the updater, pushed on every state transition. */
+export interface UpdateState {
+  status: UpdateStatus;
+  /** The running app version (`app.getVersion()`). */
+  currentVersion: string;
+  /**
+   * The explicitly-configured generic feed URL (from
+   * `KCREATE_UPDATE_FEED_URL`), surfaced for display / diagnostics.
+   * `null` when relying on the provider baked into `app-update.yml`
+   * (e.g. GitHub releases) — in that case a feed *is* configured, it is
+   * just owned by electron-updater rather than overridden here — or when
+   * the build is unpackaged and updates are disabled.
+   */
+  feedUrl: string | null;
+  /** Release metadata once an update is `available` / `downloading` / `downloaded`. */
+  info: UpdateInfo | null;
+  /** Live download progress while `status === "downloading"`. */
+  progress: UpdateProgress | null;
+  /** Human-readable failure reason while `status === "error"`. */
+  error: string | null;
+  /**
+   * Whether this build can actually self-update. False for unpackaged
+   * dev runs or when `KCREATE_UPDATE_DISABLED=1`; the UI shows a
+   * read-only "updates managed externally" state in that case.
+   */
+  supported: boolean;
+}
+
+/**
+ * Renderer-facing auto-update surface. Every method round-trips to the
+ * main-process updater; `onStateChange` subscribes to pushed snapshots
+ * and returns an unsubscribe handle (call it on cleanup to avoid leaking
+ * IPC listeners across re-renders, matching `OnboardingBridge`).
+ */
+export interface UpdateBridge {
+  /** Current updater snapshot (cheap; no network). */
+  getState(): Promise<UpdateState>;
+  /** Trigger a feed check; resolves with the resulting state. */
+  check(): Promise<UpdateState>;
+  /** Begin downloading an available update; no-op if none / already downloading. */
+  download(): Promise<UpdateState>;
+  /** Quit and install a downloaded update. Rejects if nothing is staged. */
+  quitAndInstall(): Promise<void>;
+  /** Subscribe to pushed state snapshots; returns an unsubscribe handle. */
+  onStateChange(listener: (state: UpdateState) => void): () => void;
 }
 
 // -----------------------------------------------------------------------------
@@ -3504,6 +3635,13 @@ export type PluginProposalReport =
       outcome: { status: "applied"; node_id: string } | { status: "rejected"; reason: string };
     }
   | {
+      type: "move_node";
+      node_id: string;
+      dx: number;
+      dy: number;
+      outcome: { status: "applied"; node_id: string } | { status: "rejected"; reason: string };
+    }
+  | {
       type: "delete_node";
       node_id: string;
       outcome: { status: "applied"; node_id: string } | { status: "rejected"; reason: string };
@@ -3563,6 +3701,18 @@ export interface PluginBridge {
     id: string,
     fn: string,
     input: string,
+  ): Promise<PluginExecuteWithContextResult>;
+  /**
+   * Run a plugin against the current selection. The bridge builds the
+   * plugin input JSON from the live document (each selected node's id,
+   * position, and size) merged with the caller-supplied `paramsJson`,
+   * runs the plugin under the extended ABI, and applies any emitted
+   * proposals as a single undoable operation.
+   */
+  executeOnSelection(
+    id: string,
+    fn: string,
+    paramsJson: string,
   ): Promise<PluginExecuteWithContextResult>;
   /** List installed JS panel plugins for the Electron host. */
   jsList(): Promise<JsPanelInfo[]>;
@@ -5490,6 +5640,7 @@ declare global {
       annotation: AnnotationBridge;
       system: SystemBridge;
       onboarding: OnboardingBridge;
+      update: UpdateBridge;
     };
   }
 }
@@ -6750,7 +6901,15 @@ export interface Phase10Bridge {
     numPages: number,
   ): Promise<BrochurePlanResult>;
   pluginMarketplaceList(): Promise<PluginListing[]>;
+  /**
+   * Full offline catalog: installed plugins plus every bundled
+   * first-party plugin not yet installed (each with `installed`
+   * flag + trust status). Source for the in-app gallery.
+   */
+  pluginMarketplaceCatalog(): Promise<PluginListing[]>;
   pluginMarketplaceInstallLocal(path: string): Promise<PluginListing>;
+  /** Install a compiled-in bundled plugin by id. */
+  pluginMarketplaceInstallBundled(id: string): Promise<PluginListing>;
   pluginMarketplaceRemove(id: string): Promise<boolean>;
   exportPdfMulti(
     options: Record<string, unknown>,

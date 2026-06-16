@@ -1,0 +1,148 @@
+# I1 — electron-builder packaging configuration for KCreate.
+#
+# Produces signed, installable artifacts for Linux (AppImage + .deb),
+# Windows (NSIS .exe) and macOS (.dmg + .zip), plus the electron-updater
+# feed metadata (latest-linux.yml / latest.yml / latest-mac.yml).
+#
+# Key decisions (see docs/RELEASE.md for the full rationale):
+#   * The whole JS app is pre-bundled by esbuild (main/preload) and Vite
+#     (renderer), so the packaged app needs NO node_modules — `files`
+#     is an explicit allow-list of the build outputs. This sidesteps
+#     pnpm's symlinked store, which electron-builder cannot trace.
+#   * The Rust core ships as the napi cdylib under `build/bridge/`,
+#     mapped to `resources/bridge/` via `extraResources` (UNPACKED —
+#     native libraries cannot be dlopen'd from inside an asar archive).
+#     `bridge.ts::bridgeBinaryPath` resolves it from `process.resourcesPath`
+#     when `app.isPackaged`.
+appId: io.kcreate.desktop
+productName: KCreate
+copyright: Copyright © KCreate contributors. AGPL-3.0-or-later.
+
+# Pin the runtime so a developer's globally-installed Electron can't
+# silently change the packaged binary.
+electronVersion: 33.2.0
+
+directories:
+  # `build/` is .gitignored, so committed packaging assets (icon,
+  # entitlements) live in `buildResources/` instead of the default `build/`.
+  buildResources: buildResources
+  output: release
+
+# Pre-bundled outputs only. Everything the app imports at runtime is
+# inlined by esbuild/Vite, so shipping node_modules would only bloat the
+# image and drag in pnpm symlinks electron-builder can't resolve.
+files:
+  - main/dist/**/*
+  - preload/dist/**/*
+  - renderer/dist/**/*
+  - package.json
+
+asar: true
+
+# The napi cdylib, staged by `scripts/stage-bridge.mjs` into
+# `build/bridge/` before packaging. Lands at `<resources>/bridge/<lib>`.
+extraResources:
+  - from: build/bridge
+    to: bridge
+    filter:
+      - "**/*"
+
+# Default auto-update feed. electron-updater reads the matching
+# `app-update.yml` baked from this block; override at runtime with a
+# generic server via `KCREATE_UPDATE_FEED_URL` (see updater.ts) for
+# self-hosted / air-gapped mirrors.
+publish:
+  - provider: github
+    owner: kennguy3n
+    repo: KCreate
+    releaseType: release
+
+linux:
+  # The npm package is scoped (`@kcreate/desktop`); without an explicit
+  # template the .deb path inherits the `/` and fpm fails. Pin a clean,
+  # product-named artifact filename for every Linux target.
+  artifactName: ${productName}-${version}-${arch}.${ext}
+  category: Graphics
+  synopsis: Local-first, offline design suite
+  description: >-
+    KCreate is a local-first, offline desktop design suite — Penpot's UX,
+    Inkscape's precision, GIMP's raster depth, and Scribus's print-ready
+    output, with no login and no network in the editing path.
+  maintainer: KCreate contributors <maintainers@kcreate.io>
+  desktop:
+    entry:
+      Categories: Graphics;Design;Publishing;
+      Keywords: design;vector;raster;layout;svg;
+  target:
+    - AppImage
+    - deb
+
+deb:
+  # Runtime libraries Electron/Chromium dlopen on Debian/Ubuntu. Pinned
+  # here so `apt install ./KCreate.deb` pulls them rather than failing
+  # at first launch with a cryptic missing-symbol error.
+  depends:
+    - libgtk-3-0
+    - libnotify4
+    - libnss3
+    - libxss1
+    - libxtst6
+    - xdg-utils
+    - libatspi2.0-0
+    - libuuid1
+    - libsecret-1-0
+
+win:
+  target:
+    - target: nsis
+      arch:
+        - x64
+  # Signing is wired via env (see docs/RELEASE.md): set CSC_LINK +
+  # CSC_KEY_PASSWORD (or use an Azure Trusted Signing / EV token) and
+  # electron-builder signs the installer + the app exe automatically.
+
+nsis:
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+  allowElevation: true
+  deleteAppDataOnUninstall: false
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+
+mac:
+  # Both arches ship. This is only valid because `scripts/stage-bridge.mjs`
+  # produces a UNIVERSAL (x86_64 + arm64) cdylib via `lipo`, so each arch
+  # slice embeds a bridge it can actually load. A single-arch cdylib would
+  # leave the non-host slice broken — constrain the build with `--x64` /
+  # `--arm64` (matching a single-arch cdylib) if you only stage one arch.
+  category: public.app-category.graphics-design
+  target:
+    - target: dmg
+      arch:
+        - x64
+        - arm64
+    - target: zip
+      arch:
+        - x64
+        - arm64
+  # Hardened runtime + entitlements are required for notarization. The
+  # cdylib is loaded via process.dlopen, which needs the JIT / unsigned-
+  # executable-memory entitlements below.
+  hardenedRuntime: true
+  gatekeeperAssess: false
+  entitlements: buildResources/entitlements.mac.plist
+  entitlementsInherit: buildResources/entitlements.mac.plist
+  # Notarization: set APPLE_ID + APPLE_APP_SPECIFIC_PASSWORD + APPLE_TEAM_ID
+  # (or APPLE_API_KEY / APPLE_API_KEY_ID / APPLE_API_ISSUER) in the
+  # release environment and electron-builder notarizes + staples.
+
+dmg:
+  # Standard drag-to-Applications layout.
+  contents:
+    - x: 130
+      y: 220
+    - x: 410
+      y: 220
+      type: link
+      path: /Applications

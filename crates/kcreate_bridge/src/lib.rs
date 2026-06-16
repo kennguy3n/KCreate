@@ -65,8 +65,8 @@ use crate::document::{
     RuntimeStatus as CoreRuntimeStatus, UndoRedoOutcome as CoreUndoRedoOutcome, UpdateNodeProps,
 };
 use crate::state::{
-    AcquiredFrame as CoreAcquiredFrame, BridgeError, RendererFrameInfo as CoreFrameInfo,
-    RendererInfo as CoreRendererInfo,
+    AcquiredFrame as CoreAcquiredFrame, AcquiredPresent as CoreAcquiredPresent, BridgeError,
+    RendererFrameInfo as CoreFrameInfo, RendererInfo as CoreRendererInfo,
 };
 
 // Taken by value so it can be passed directly to `Result::map_err`.
@@ -340,6 +340,60 @@ impl From<CoreAcquiredFrame> for AcquiredFrame {
 #[napi]
 pub fn renderer_acquire_frame() -> NapiResult<Option<AcquiredFrame>> {
     state::acquire_frame()
+        .map(|opt| opt.map(Into::into))
+        .map_err(map_err)
+}
+
+/// A frame snapshot for the dirty-rect present path.
+///
+/// `bytes` is either the whole frame (`full == true`) or just the
+/// `dirty` sub-rect (`full == false`; empty when nothing changed since
+/// the last present). The host patches its persistent backbuffer with
+/// `bytes` at the dirty offset and repaints with the matching
+/// `putImageData` form — see `CanvasHost.tsx`. Field names are emitted
+/// to JS as camelCase (`frameId`, `dirtyX`, `dirtyWidth`, …).
+#[napi(object)]
+#[derive(Clone)]
+#[allow(missing_debug_implementations)] // `Buffer` from napi has no Debug impl.
+pub struct PresentFrame {
+    pub frame_id: u32,
+    pub width: u32,
+    pub height: u32,
+    pub dirty_x: u32,
+    pub dirty_y: u32,
+    pub dirty_width: u32,
+    pub dirty_height: u32,
+    pub full: bool,
+    pub bytes: Buffer,
+}
+
+impl From<CoreAcquiredPresent> for PresentFrame {
+    fn from(c: CoreAcquiredPresent) -> Self {
+        Self {
+            frame_id: c.frame_id as u32,
+            width: c.width,
+            height: c.height,
+            dirty_x: c.dirty_x,
+            dirty_y: c.dirty_y,
+            dirty_width: c.dirty_width,
+            dirty_height: c.dirty_height,
+            full: c.full,
+            bytes: Buffer::from(c.bytes),
+        }
+    }
+}
+
+/// Dirty-rect present path: atomically snapshot the latest frame,
+/// returning only the pixels that changed since the host last consumed
+/// a frame (or the whole frame on the first frame / after a resize /
+/// when the change is large).
+///
+/// Returns `null` if no frame has been published yet. This both reads
+/// and resets the accumulated dirty region, so the host calls it once
+/// per present and patches its persistent backbuffer with the result.
+#[napi]
+pub fn renderer_acquire_present() -> NapiResult<Option<PresentFrame>> {
+    state::acquire_present()
         .map(|opt| opt.map(Into::into))
         .map_err(map_err)
 }
@@ -3860,6 +3914,22 @@ pub fn plugin_execute_with_context(
     phase2::plugin_execute_with_context(&id, &function, &input).map_err(map_doc_err)
 }
 
+/// Run a plugin against the current selection. The bridge builds the
+/// plugin input JSON from the live document (each selected node's id,
+/// position, and size) merged with caller-supplied `params_json`,
+/// executes the plugin in the sandbox with the extended ABI, and
+/// applies any emitted proposals as a single undoable operation.
+/// Returns the same `{output, logs, proposals}` envelope as
+/// `plugin_execute_with_context`.
+#[napi]
+pub fn plugin_execute_on_selection(
+    id: String,
+    function: String,
+    params_json: String,
+) -> NapiResult<String> {
+    phase2::plugin_execute_on_selection(&id, &function, &params_json).map_err(map_doc_err)
+}
+
 /// List installed JS panel plugins. Returns a JSON array of
 /// `JsPanelInfo` so the Electron main process can decide which
 /// sandboxed `BrowserView` instances to mount.
@@ -6415,11 +6485,30 @@ pub fn plugin_marketplace_list() -> NapiResult<String> {
     json_out("plugin_marketplace_list", &res)
 }
 
+/// Full marketplace catalog (installed plugins + not-yet-installed
+/// bundled first-party plugins), each with trust status and
+/// `installed` flag. Offline, on-device — no network.
+#[napi]
+pub fn plugin_marketplace_catalog() -> NapiResult<String> {
+    let res = phase10::plugin_marketplace_catalog().map_err(map_doc_err)?;
+    json_out("plugin_marketplace_catalog", &res)
+}
+
 #[napi]
 #[allow(clippy::needless_pass_by_value)]
 pub fn plugin_marketplace_install_local(path: String) -> NapiResult<String> {
     let res = phase10::plugin_marketplace_install_local(&path).map_err(map_doc_err)?;
     json_out("plugin_marketplace_install_local", &res)
+}
+
+/// Install one of the compiled-in bundled (first-party) plugins by id,
+/// writing its embedded manifest + signature + `.wasm` into the active
+/// plugin directory. Returns the freshly-scanned listing.
+#[napi]
+#[allow(clippy::needless_pass_by_value)]
+pub fn plugin_marketplace_install_bundled(id: String) -> NapiResult<String> {
+    let res = phase10::plugin_marketplace_install_bundled(&id).map_err(map_doc_err)?;
+    json_out("plugin_marketplace_install_bundled", &res)
 }
 
 #[napi]

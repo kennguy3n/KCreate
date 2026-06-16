@@ -73,6 +73,7 @@ import type {
   FillStyle,
   StrokeStyleWire,
   FrameInfo,
+  PresentFrame,
   InspectCode,
   JpegExportOptions,
   LayerNamingResult,
@@ -225,6 +226,8 @@ import type {
   OnboardingBridge,
   OnboardingInstallReport,
   OnboardingProgress,
+  UpdateBridge,
+  UpdateState,
   Phase9Bridge,
   GuideInfo,
   GridSettingsInfo,
@@ -288,6 +291,21 @@ type AcquiredFrameNapi = {
   frameId: number;
   width: number;
   height: number;
+  bytes: Uint8Array;
+};
+
+// `kcreate/renderer/acquirePresent` forwards the bridge's
+// `#[napi(object)]` struct straight through IPC; napi-rs auto-camelCases
+// the Rust field names (`dirty_x` → `dirtyX`, `dirty_width` → `dirtyWidth`).
+type PresentFrameNapi = {
+  frameId: number;
+  width: number;
+  height: number;
+  dirtyX: number;
+  dirtyY: number;
+  dirtyWidth: number;
+  dirtyHeight: number;
+  full: boolean;
   bytes: Uint8Array;
 };
 
@@ -378,6 +396,32 @@ const renderer: RendererBridge = {
       frameId: frame.frameId,
       width: frame.width,
       height: frame.height,
+      bytes,
+    };
+  },
+  async acquirePresent(): Promise<PresentFrame | null> {
+    const present = (await ipcRenderer.invoke(
+      "kcreate/renderer/acquirePresent",
+    )) as PresentFrameNapi | null;
+    if (!present) return null;
+    // Node Buffer is a subclass of Uint8Array; tighten to a plain
+    // Uint8Array over the same ArrayBuffer (explicit byteOffset /
+    // byteLength) so the dirty-rect bytes are handed to the renderer
+    // without an extra copy.
+    const bytes = new Uint8Array(
+      present.bytes.buffer,
+      present.bytes.byteOffset,
+      present.bytes.byteLength,
+    );
+    return {
+      frameId: present.frameId,
+      width: present.width,
+      height: present.height,
+      dirtyX: present.dirtyX,
+      dirtyY: present.dirtyY,
+      dirtyWidth: present.dirtyWidth,
+      dirtyHeight: present.dirtyHeight,
+      full: present.full,
       bytes,
     };
   },
@@ -2245,6 +2289,19 @@ const plugin: PluginBridge = {
     )) as string;
     return JSON.parse(raw) as PluginExecuteWithContextResult;
   },
+  async executeOnSelection(
+    id: string,
+    fn: string,
+    paramsJson: string,
+  ): Promise<PluginExecuteWithContextResult> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/plugin/executeOnSelection",
+      id,
+      fn,
+      paramsJson,
+    )) as string;
+    return JSON.parse(raw) as PluginExecuteWithContextResult;
+  },
   async jsList(): Promise<JsPanelInfo[]> {
     const raw = (await ipcRenderer.invoke(
       "kcreate/plugin/js/list",
@@ -3965,10 +4022,23 @@ const phase10: Phase10Bridge = {
     )) as string;
     return JSON.parse(raw) as PluginListing[];
   },
+  async pluginMarketplaceCatalog() {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/phase10/plugin-marketplace/catalog",
+    )) as string;
+    return JSON.parse(raw) as PluginListing[];
+  },
   async pluginMarketplaceInstallLocal(path) {
     const raw = (await ipcRenderer.invoke(
       "kcreate/phase10/plugin-marketplace/install-local",
       path,
+    )) as string;
+    return JSON.parse(raw) as PluginListing;
+  },
+  async pluginMarketplaceInstallBundled(id) {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/phase10/plugin-marketplace/install-bundled",
+      id,
     )) as string;
     return JSON.parse(raw) as PluginListing;
   },
@@ -4045,6 +4115,39 @@ const onboarding: OnboardingBridge = {
   },
 };
 
+// I1 — auto-update surface. The renderer reads the current state via
+// `getState()`, drives a check / download imperatively, and subscribes
+// to pushed transitions via `onStateChange(fn)` (returns an unsubscribe
+// handle, mirroring `onboarding.onInstallProgress`). The updater lives
+// entirely in the main process; this is a thin IPC shim.
+const update: UpdateBridge = {
+  async getState(): Promise<UpdateState> {
+    return (await ipcRenderer.invoke(
+      "kcreate/update/getState",
+    )) as UpdateState;
+  },
+  async check(): Promise<UpdateState> {
+    return (await ipcRenderer.invoke("kcreate/update/check")) as UpdateState;
+  },
+  async download(): Promise<UpdateState> {
+    return (await ipcRenderer.invoke(
+      "kcreate/update/download",
+    )) as UpdateState;
+  },
+  async quitAndInstall(): Promise<void> {
+    await ipcRenderer.invoke("kcreate/update/quitAndInstall");
+  },
+  onStateChange(listener: (state: UpdateState) => void): () => void {
+    const handler = (_e: unknown, state: UpdateState): void => {
+      listener(state);
+    };
+    ipcRenderer.on("kcreate/update/stateChanged", handler);
+    return (): void => {
+      ipcRenderer.removeListener("kcreate/update/stateChanged", handler);
+    };
+  },
+};
+
 contextBridge.exposeInMainWorld("kcreate", {
   renderer,
   document,
@@ -4099,4 +4202,5 @@ contextBridge.exposeInMainWorld("kcreate", {
   annotation,
   system,
   onboarding,
+  update,
 });

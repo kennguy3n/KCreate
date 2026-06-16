@@ -107,7 +107,35 @@ export interface CanvasHostProps {
    * rect tool is active).
    */
   cursor?: string;
+  /**
+   * Show a small performance HUD (fps / frame-time / present payload /
+   * node-count) overlaid on the canvas, fed by numbers measured live in
+   * the present loop. Off by default; when `false` the measurement code
+   * is skipped entirely so it adds zero per-frame overhead.
+   */
+  perfHud?: boolean;
 }
+
+/** Live present-loop metrics surfaced by the optional perf HUD. */
+interface PerfHudStats {
+  /** Exponentially-smoothed frames presented per second. */
+  fps: number;
+  /** Exponentially-smoothed host present-work time per frame, in ms. */
+  frameMs: number;
+  /** Bytes the last present shipped across IPC (dirty sub-rect or full). */
+  bytes: number;
+  /** Whether the last present was a full frame, a partial, or idle. */
+  kind: "full" | "partial" | "idle";
+  /** Node count of the current document (throttled document-status poll). */
+  nodeCount: number;
+}
+
+/** Smoothing factor for the HUD's fps / frame-time EWMAs. */
+const PERF_HUD_EWMA = 0.1;
+/** Minimum interval between HUD React state publishes, in ms (~6 Hz). */
+const PERF_HUD_PUBLISH_MS = 160;
+/** Minimum interval between document-status node-count polls, in ms. */
+const PERF_HUD_NODECOUNT_MS = 1000;
 
 const MIN_ZOOM = 0.1;
 const MAX_ZOOM = 32;
@@ -143,6 +171,7 @@ export function CanvasHost(props: CanvasHostProps): JSX.Element {
     cursor: propCursor,
     mode: requestedMode,
     onNativeFallback,
+    perfHud = false,
   } = props;
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const ctxRef = useRef<CanvasRenderingContext2D | null>(null);
@@ -167,6 +196,39 @@ export function CanvasHost(props: CanvasHostProps): JSX.Element {
   );
   const activeModeRef = useRef<CanvasPresentationMode>("offscreen");
   activeModeRef.current = activeMode;
+
+  // Perf HUD. `perfHudRef` lets the rAF loop (set up once on mount)
+  // read the live toggle without re-running its effect, and
+  // `perfStatsRef` accumulates the measured numbers imperatively so a
+  // 60 Hz present loop never triggers a React re-render — we publish to
+  // `hudStats` state at most every `PERF_HUD_PUBLISH_MS`.
+  // `perfHud` is the host's requested default; the user can also flip
+  // the overlay locally with Ctrl/Cmd+Shift+P (matching the app's
+  // panel-toggle shortcut convention). `null` means "follow the prop".
+  const [hudOverride, setHudOverride] = useState<boolean | null>(null);
+  const hudEnabled = hudOverride ?? perfHud;
+  const perfHudRef = useRef(false);
+  perfHudRef.current = hudEnabled;
+  const perfStatsRef = useRef<{
+    fps: number;
+    frameMs: number;
+    lastTickTs: number;
+    lastPublishTs: number;
+    bytes: number;
+    kind: "full" | "partial" | "idle";
+    nodeCount: number;
+    lastNodeCountTs: number;
+  }>({
+    fps: 0,
+    frameMs: 0,
+    lastTickTs: 0,
+    lastPublishTs: 0,
+    bytes: 0,
+    kind: "idle",
+    nodeCount: 0,
+    lastNodeCountTs: 0,
+  });
+  const [hudStats, setHudStats] = useState<PerfHudStats | null>(null);
 
   // Keep refs up to date on every render.
   viewportRef.current = props.viewport ?? ZERO_VIEWPORT;
@@ -208,6 +270,138 @@ export function CanvasHost(props: CanvasHostProps): JSX.Element {
       canvas.height = h;
     };
 
+    // Record what the last present shipped, for the perf HUD. Cheap and
+    // only called from the offscreen present path; the HUD-enabled
+    // branch reads it on the throttled publish below.
+    const recordPresentMetrics = (
+      bytes: number,
+      kind: "full" | "partial" | "idle",
+    ): void => {
+      if (!perfHudRef.current) return;
+      const s = perfStatsRef.current;
+      s.bytes = bytes;
+      s.kind = kind;
+    };
+
+    // Fold this tick's measured cadence + present-work time into the HUD
+    // EWMAs, refresh the throttled node-count poll, and publish to React
+    // state at most ~6 Hz so the overlay never re-renders the component
+    // at the present loop's rate. `tickStart` is a `performance.now()`
+    // sample taken at the top of the tick.
+    const now = (): number =>
+      typeof performance !== "undefined" ? performance.now() : Date.now();
+    const updatePerfHud = (tickStart: number): void => {
+      const t = now();
+      const s = perfStatsRef.current;
+      if (s.lastTickTs > 0) {
+        const dt = t - s.lastTickTs;
+        if (dt > 0) {
+          const inst = 1000 / dt;
+          s.fps = s.fps > 0 ? s.fps + PERF_HUD_EWMA * (inst - s.fps) : inst;
+        }
+      }
+      s.lastTickTs = t;
+      const work = t - tickStart;
+      if (work >= 0) {
+        s.frameMs =
+          s.frameMs > 0 ? s.frameMs + PERF_HUD_EWMA * (work - s.frameMs) : work;
+      }
+      if (t - s.lastNodeCountTs >= PERF_HUD_NODECOUNT_MS) {
+        s.lastNodeCountTs = t;
+        const doc = window.kcreate?.document;
+        if (doc) {
+          void doc
+            .status()
+            .then((status) => {
+              if (status) perfStatsRef.current.nodeCount = status.nodeCount;
+            })
+            .catch(() => {
+              /* node count is best-effort decoration for the HUD */
+            });
+        }
+      }
+      if (t - s.lastPublishTs >= PERF_HUD_PUBLISH_MS) {
+        s.lastPublishTs = t;
+        setHudStats({
+          fps: s.fps,
+          frameMs: s.frameMs,
+          bytes: s.bytes,
+          kind: s.kind,
+          nodeCount: s.nodeCount,
+        });
+      }
+    };
+
+    // Dirty-rect present: pull only the pixels that changed since the
+    // last present and blit just that sub-rect. The persistent
+    // `imageDataRef` backbuffer accumulates the full frame across
+    // presents, so a partial update patches only the changed rows into
+    // it and repaints a single sub-rectangle. Returns the frame id we
+    // actually consumed (it may be newer than `fallbackId` if the
+    // renderer advanced between the id poll and this call).
+    const presentDirtyRect = async (
+      ensure: (w: number, h: number) => void,
+      fallbackId: number,
+    ): Promise<number> => {
+      const present = await bridge.acquirePresent();
+      if (!present) return fallbackId;
+
+      const {
+        width,
+        height,
+        dirtyX,
+        dirtyY,
+        dirtyWidth,
+        dirtyHeight,
+        full,
+        bytes,
+      } = present;
+
+      if (full) {
+        // Whole-frame present: first frame, post-resize, or a change
+        // large enough that a partial blit no longer pays for itself.
+        if (bytes.byteLength === width * height * 4) {
+          ensure(width, height);
+          imageDataRef.current!.data.set(bytes);
+          ctx.putImageData(imageDataRef.current!, 0, 0);
+          recordPresentMetrics(bytes.byteLength, "full");
+        }
+      } else if (dirtyWidth > 0 && dirtyHeight > 0) {
+        // Partial present: patch the changed rows into the persistent
+        // backbuffer, then repaint only the dirty sub-rect via the
+        // dirty-region form of `putImageData`.
+        const img = imageDataRef.current;
+        const dims = imageDataDimsRef.current;
+        const expected = dirtyWidth * dirtyHeight * 4;
+        if (
+          img &&
+          dims.w === width &&
+          dims.h === height &&
+          bytes.byteLength === expected
+        ) {
+          const data = img.data;
+          const fullStride = width * 4;
+          const rowBytes = dirtyWidth * 4;
+          for (let row = 0; row < dirtyHeight; row += 1) {
+            const srcStart = row * rowBytes;
+            const destStart = (dirtyY + row) * fullStride + dirtyX * 4;
+            data.set(bytes.subarray(srcStart, srcStart + rowBytes), destStart);
+          }
+          ctx.putImageData(img, 0, 0, dirtyX, dirtyY, dirtyWidth, dirtyHeight);
+          recordPresentMetrics(expected, "partial");
+        }
+        // If the backbuffer isn't yet sized to this frame the partial is
+        // skipped; the renderer forces a full present after any resize,
+        // so the next tick resynchronises.
+      } else {
+        // dirtyWidth/Height === 0: the frame id advanced but the pixels
+        // are identical to what we already show — nothing to blit.
+        recordPresentMetrics(0, "idle");
+      }
+
+      return present.frameId;
+    };
+
     (async () => {
       const dpr = dprRef.current;
       const wPx = Math.max(1, Math.round(props.width * dpr));
@@ -246,6 +440,8 @@ export function CanvasHost(props: CanvasHostProps): JSX.Element {
 
       const tick = async (): Promise<void> => {
         if (cancelled) return;
+        const hudOn = perfHudRef.current;
+        const tickStart = hudOn ? now() : 0;
         try {
           // Resolve the latest published frame id for this tick. There
           // are two ways it advances:
@@ -282,8 +478,10 @@ export function CanvasHost(props: CanvasHostProps): JSX.Element {
             latestFrameId = info ? info.frameId : null;
           }
 
-          // Only pay for the full pixel readback (`acquireFrame`,
-          // ~W×H×4 bytes across IPC) when the frame actually advanced.
+          // Only pay for a pixel readback when the frame actually
+          // advanced. On a typical edit the dirty-rect present path ships
+          // just the changed sub-region (`dirtyWidth × dirtyHeight × 4`
+          // bytes) instead of the whole framebuffer.
           if (latestFrameId !== null && latestFrameId !== lastFrameIdRef.current) {
             // Default to the id we resolved above. In offscreen mode we
             // replace this with the id of the frame we actually acquired
@@ -296,33 +494,12 @@ export function CanvasHost(props: CanvasHostProps): JSX.Element {
             // native path stays zero-copy and we do not waste a CPU
             // download on every frame.
             if (activeModeRef.current === "offscreen") {
-              // Atomically get bytes + dimensions in a single IPC round
-              // trip. `acquireFrame` guarantees the buffer length matches
-              // the reported width × height × 4 even if a resize is in
-              // flight on the host side, eliminating the tearing window
-              // that existed when we called `getFrame()` and
-              // `frameInfo()` separately.
-              const frame = await bridge.acquireFrame();
-              if (frame) {
-                const expected = frame.width * frame.height * 4;
-                if (frame.bytes.byteLength === expected) {
-                  ensureImageData(frame.width, frame.height);
-                  imageDataRef.current!.data.set(frame.bytes);
-                  ctx.putImageData(imageDataRef.current!, 0, 0);
-                }
-                // The renderer may have published a newer frame between
-                // when we resolved `latestFrameId` above (via
-                // `setViewportAndRender` on a viewport change, or
-                // `frameInfo()` on a static tick) and this
-                // `acquireFrame()`. Record the id we actually consumed so
-                // the next tick doesn't re-download a frame we've already
-                // presented.
-                presentedId = frame.frameId;
-              }
+              presentedId = await presentDirtyRect(ensureImageData, presentedId);
             }
             lastFrameIdRef.current = presentedId;
             props.onFramePresented?.(presentedId);
           }
+          if (hudOn) updatePerfHud(tickStart);
         } catch (err) {
           // Surfacing the error to React state would unmount the
           // component; that's heavy-handed for a transient present
@@ -473,6 +650,36 @@ export function CanvasHost(props: CanvasHostProps): JSX.Element {
       imageDataDimsRef.current = { w: wPx, h: hPx };
     }
   }, [props.width, props.height]);
+
+  // Drop the overlay's last snapshot when the HUD is switched off so a
+  // stale frame doesn't linger on the next enable.
+  useEffect(() => {
+    if (!hudEnabled) {
+      perfStatsRef.current.lastTickTs = 0;
+      setHudStats(null);
+    }
+  }, [hudEnabled]);
+
+  // Ctrl/Cmd+Shift+P toggles the perf HUD locally. Registered at the
+  // window level (the canvas rarely holds focus) and scoped tightly to
+  // that exact chord so it never shadows a typing or tool shortcut.
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent): void => {
+      if (
+        (e.ctrlKey || e.metaKey) &&
+        e.shiftKey &&
+        !e.altKey &&
+        (e.code === "KeyP" || e.key === "P" || e.key === "p")
+      ) {
+        e.preventDefault();
+        setHudOverride((prev) => !(prev ?? perfHud));
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      window.removeEventListener("keydown", onKeyDown);
+    };
+  }, [perfHud]);
 
   // Pan / zoom interaction state. Tracked in refs so the handlers
   // close over them without recreating on every render — pointer/wheel
@@ -645,37 +852,111 @@ export function CanvasHost(props: CanvasHostProps): JSX.Element {
   }
 
   return (
-    <canvas
-      ref={canvasRef}
+    <>
+      <canvas
+        ref={canvasRef}
+        style={{
+          width: propWidth,
+          height: propHeight,
+          display: "block",
+          cursor: cursor ?? propCursor ?? "default",
+          touchAction: "none",
+          // In native mode the Rust renderer paints straight to the
+          // BrowserWindow's surface beneath the React tree. We keep the
+          // <canvas> element in the layout so pointer events still route
+          // through React (`pointerEvents: "auto"` is the default), but
+          // we have to hide its pixel buffer because the 2D context was
+          // created with `alpha: false` for the offscreen path — that
+          // makes the backing store permanently opaque, and a CSS
+          // `background: transparent` only affects the element box, not
+          // the canvas bitmap (Devin Review BUG-0003). `opacity: 0` is
+          // the cleanest way to keep the element hit-testable while
+          // letting the native surface composit underneath it.
+          opacity: activeMode === "native" ? 0 : undefined,
+          background: activeMode === "native" ? "transparent" : undefined,
+        }}
+        data-presentation-mode={activeMode}
+        data-testid="kcreate-canvas-surface"
+        onPointerDown={onPointerDown}
+        onPointerMove={onPointerMove}
+        onPointerUp={onPointerUp}
+        onPointerLeave={onPointerUp}
+        onWheel={onWheel}
+        onDoubleClick={onDoubleClick}
+        onContextMenu={onContextMenu}
+      />
+      {hudEnabled && hudStats ? <PerfHud stats={hudStats} /> : null}
+    </>
+  );
+}
+
+/** Number of bytes in a kibibyte, for the HUD payload readout. */
+const KIB = 1024;
+
+/**
+ * Small, professional performance overlay. Absolutely positioned in the
+ * canvas pane's top-right corner, non-interactive (`pointerEvents:
+ * none`), and fed entirely by numbers measured in the present loop.
+ */
+function PerfHud({ stats }: { stats: PerfHudStats }): JSX.Element {
+  const payload =
+    stats.kind === "idle"
+      ? "idle"
+      : `${(stats.bytes / KIB).toFixed(1)} KiB ${stats.kind}`;
+  const rows: Array<[string, string]> = [
+    ["FPS", stats.fps.toFixed(0)],
+    ["Frame", `${stats.frameMs.toFixed(2)} ms`],
+    ["Present", payload],
+    ["Nodes", stats.nodeCount.toLocaleString()],
+  ];
+  return (
+    <div
+      data-testid="kcreate-perf-hud"
       style={{
-        width: propWidth,
-        height: propHeight,
-        display: "block",
-        cursor: cursor ?? propCursor ?? "default",
-        touchAction: "none",
-        // In native mode the Rust renderer paints straight to the
-        // BrowserWindow's surface beneath the React tree. We keep the
-        // <canvas> element in the layout so pointer events still route
-        // through React (`pointerEvents: "auto"` is the default), but
-        // we have to hide its pixel buffer because the 2D context was
-        // created with `alpha: false` for the offscreen path — that
-        // makes the backing store permanently opaque, and a CSS
-        // `background: transparent` only affects the element box, not
-        // the canvas bitmap (Devin Review BUG-0003). `opacity: 0` is
-        // the cleanest way to keep the element hit-testable while
-        // letting the native surface composit underneath it.
-        opacity: activeMode === "native" ? 0 : undefined,
-        background: activeMode === "native" ? "transparent" : undefined,
+        position: "absolute",
+        top: 10,
+        right: 10,
+        zIndex: 20,
+        pointerEvents: "none",
+        userSelect: "none",
+        padding: "8px 10px",
+        borderRadius: 8,
+        background: "rgba(17, 19, 24, 0.82)",
+        border: "1px solid rgba(255, 255, 255, 0.08)",
+        boxShadow: "0 2px 10px rgba(0, 0, 0, 0.35)",
+        backdropFilter: "blur(6px)",
+        color: "#e8eaed",
+        font: '11px / 1.45 ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace',
+        letterSpacing: 0.2,
+        minWidth: 132,
       }}
-      data-presentation-mode={activeMode}
-      data-testid="kcreate-canvas-surface"
-      onPointerDown={onPointerDown}
-      onPointerMove={onPointerMove}
-      onPointerUp={onPointerUp}
-      onPointerLeave={onPointerUp}
-      onWheel={onWheel}
-      onDoubleClick={onDoubleClick}
-      onContextMenu={onContextMenu}
-    />
+    >
+      <div
+        style={{
+          fontSize: 9,
+          letterSpacing: 1.2,
+          textTransform: "uppercase",
+          color: "#8a8f98",
+          marginBottom: 4,
+        }}
+      >
+        Performance
+      </div>
+      {rows.map(([label, value]) => (
+        <div
+          key={label}
+          style={{
+            display: "flex",
+            justifyContent: "space-between",
+            gap: 16,
+          }}
+        >
+          <span style={{ color: "#9aa0aa" }}>{label}</span>
+          <span style={{ color: "#e8eaed", fontVariantNumeric: "tabular-nums" }}>
+            {value}
+          </span>
+        </div>
+      ))}
+    </div>
   );
 }

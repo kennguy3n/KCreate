@@ -247,6 +247,33 @@ pub(crate) fn with_workspace_mut<R>(f: impl FnOnce(&mut Workspace) -> Result<R>)
     f(ws)
 }
 
+/// Like [`with_workspace_mut`], but rebuilds the renderer scene from
+/// the mutated workspace before releasing the write lock — exactly the
+/// post-mutation sync the `document_*` helpers perform inline. Use
+/// this for a batch of mutations that must land inside **one** locked
+/// critical section *and* be reflected on the canvas, e.g. folding a
+/// reviewed batch of plugin proposals into a single undoable
+/// operation (see `crate::phase2::apply_plugin_proposals`). Doing the
+/// mutation, the op-record, and the scene sync under one lock is what
+/// makes the whole plugin run atomic and immediately visible.
+///
+/// The closure runs while the workspace write lock is held and must
+/// not re-lock the workspace (parking_lot locks are not reentrant).
+/// A scene-sync failure after a successful closure is logged but not
+/// surfaced, matching the `let _ = sync_scene_locked(..)` convention
+/// used by the other mutation helpers — the workspace state is
+/// already correct; only the cached readback would be stale.
+pub(crate) fn with_workspace_mut_synced<R>(
+    f: impl FnOnce(&mut Workspace) -> Result<R>,
+) -> Result<R> {
+    let mut guard = slot().write();
+    let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
+    let out = f(ws)?;
+    let _ = sync_scene_locked(&mut guard);
+    drop(guard);
+    Ok(out)
+}
+
 /// Load a blob by hash from the open workspace's content-addressed
 /// store. Pulled out so `phase2.rs` does not need to know about the
 /// `ProjectStore` API surface.
@@ -1137,6 +1164,28 @@ pub fn document_create_node(
     parent_id: Option<Uuid>,
     props: &CreateNodeProps,
 ) -> Result<Uuid> {
+    let node = build_node_from_props(node_type, parent_id, props)?;
+    let mut guard = slot().write();
+    let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
+    let id = ws.project.document.insert_node(node)?;
+    ws.project.modified_at = Utc::now();
+    let _ = sync_scene_locked(&mut guard);
+    drop(guard);
+    Ok(id)
+}
+
+/// Build a detached [`Node`] from a `node_type` string plus creation
+/// props, **without** inserting it into any document or touching the
+/// workspace lock. Shared by [`document_create_node`] and the
+/// plugin-proposal apply path (`crate::phase2`'s `CreateNode`
+/// handling) so both produce byte-identical nodes from the same
+/// `CreateNodeProps` shape — there is exactly one place that maps a
+/// node-type string + props to a `Node`.
+pub(crate) fn build_node_from_props(
+    node_type: &str,
+    parent_id: Option<Uuid>,
+    props: &CreateNodeProps,
+) -> Result<Node> {
     let kind = parse_node_type(node_type)?;
     let name = props.name.clone().unwrap_or_else(|| default_name_for(kind));
     let mut node = Node::new(kind, name);
@@ -1150,13 +1199,7 @@ pub fn document_create_node(
     if let Some(meta) = &props.metadata {
         node.metadata.clone_from(meta);
     }
-    let mut guard = slot().write();
-    let ws = guard.as_mut().ok_or(DocumentBridgeError::NoProject)?;
-    let id = ws.project.document.insert_node(node)?;
-    ws.project.modified_at = Utc::now();
-    let _ = sync_scene_locked(&mut guard);
-    drop(guard);
-    Ok(id)
+    Ok(node)
 }
 
 /// Properties accepted on update. Only fields that are `Some` are
@@ -1277,6 +1320,20 @@ pub fn document_update_node(id: Uuid, changes: &UpdateNodeProps) -> Result<()> {
         .document
         .get_node_mut(id)
         .ok_or(DocumentBridgeError::NodeNotFound(id))?;
+    apply_update_props_to_node(node, changes);
+    ws.project.modified_at = Utc::now();
+    let _ = sync_scene_locked(&mut guard);
+    drop(guard);
+    Ok(())
+}
+
+/// Apply an [`UpdateNodeProps`] delta to a node in place, including
+/// the terminal `node.touch()`, without any locking or scene sync.
+/// Shared by [`document_update_node`] and the plugin-proposal apply
+/// path (`crate::phase2`'s `UpdateNode` handling) so both honour the
+/// exact same field semantics — tri-state stroke / profile updates,
+/// wholesale fill replacement, metadata clone — from one definition.
+pub(crate) fn apply_update_props_to_node(node: &mut Node, changes: &UpdateNodeProps) {
     if let Some(name) = &changes.name {
         node.name.clone_from(name);
     }
@@ -1307,10 +1364,6 @@ pub fn document_update_node(id: Uuid, changes: &UpdateNodeProps) -> Result<()> {
         node.style.overprint = overprint;
     }
     node.touch();
-    ws.project.modified_at = Utc::now();
-    let _ = sync_scene_locked(&mut guard);
-    drop(guard);
-    Ok(())
 }
 
 /// Read the current `FillStyle` for a node, serialised as a JSON
@@ -1587,11 +1640,46 @@ const APPLY_PATCH_COMMANDS: &[&str] = &[
     // in `ApplyPatchSnapshot::capture` (documented no-op arm there).
     "ai_generate_themed_design",
     "ai_refine_themed_design",
+    // I4 — plugin marketplace. A reviewed batch of WASM/JS plugin
+    // proposals (move / recolor / create / delete) is folded into a
+    // single `plugin_apply_proposals` op whose before / after patches
+    // are [`PluginApplyPatch`] (undo vs redo direction). Replay is
+    // parse-then-best-effort graph ops that never fail once parsed,
+    // and the op is never grouped, so no extra snapshot slot is
+    // needed in `ApplyPatchSnapshot::capture` (documented no-op arm).
+    "plugin_apply_proposals",
 ];
 
 #[inline]
 fn is_apply_patch_command(cmd: &str) -> bool {
     APPLY_PATCH_COMMANDS.contains(&cmd)
+}
+
+/// Directional graph patch for one batch of applied plugin proposals.
+///
+/// A single `plugin_apply_proposals` [`Operation`] carries two of
+/// these: `before_patch` rolls the batch back (undo) and `after_patch`
+/// rolls it forward (redo). Both are expressed with the same two
+/// primitives so [`apply_patch`] can replay either side through one
+/// arm:
+///
+/// * `remove` — node ids to delete (cascading to descendants); an
+///   already-absent id is a no-op so an interrupted replay is safe.
+/// * `upsert` — full nodes to re-insert or overwrite in place, ordered
+///   **parent-first** so an inserted child always finds its parent.
+///
+/// `crate::phase2` builds both directions while it applies the
+/// proposals: the undo patch captures each touched node's *prior*
+/// full state (and the full subtree of any node a proposal deletes),
+/// the redo patch captures the *resulting* state. Restoring the exact
+/// prior `Node` (geometry, fills, metadata, children) is what lets a
+/// single Ctrl+Z revert an entire plugin run.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub(crate) struct PluginApplyPatch {
+    #[serde(default)]
+    pub remove: Vec<Uuid>,
+    #[serde(default)]
+    pub upsert: Vec<Node>,
 }
 
 /// Snapshot of every workspace field [`apply_patch`] is capable of
@@ -1843,7 +1931,11 @@ impl ApplyPatchSnapshot {
                 // subtree + brand kit before/after); replaying it via
                 // `apply_patch` is pure graph + brand-kit vec ops that
                 // never fail, so there is nothing extra to capture
-                // here for atomic group rollback.
+                // here for atomic group rollback. I4's
+                // `plugin_apply_proposals` is the same shape — its
+                // [`PluginApplyPatch`] holds the full prior / next
+                // nodes, replay is infallible graph ops, and the op is
+                // never grouped — so it also needs no snapshot slot.
                 _ => {}
             }
         }
@@ -2567,6 +2659,47 @@ fn apply_patch(ws: &mut Workspace, op: &Operation, patch: &serde_json::Value) ->
         "ai_generate_themed_design" | "ai_refine_themed_design" => {
             let parsed: crate::phase10::ThemedDesignPatch = serde_json::from_value(patch.clone())?;
             apply_themed_design_patch(ws, parsed)
+        }
+        // I4 — plugin marketplace. Replay one batch of applied plugin
+        // proposals in either direction from a [`PluginApplyPatch`].
+        // Parsing the patch is the only fallible step; the graph ops
+        // below are best-effort and infallible by construction —
+        // `remove_node` tolerates an already-absent id and the
+        // parent-first `upsert` either overwrites an existing node in
+        // place or inserts a fresh one. This mirrors the
+        // `ai_*_themed_design` reversible-subtree arm above.
+        "plugin_apply_proposals" => {
+            let parsed: PluginApplyPatch = serde_json::from_value(patch.clone())?;
+            for id in parsed.remove {
+                ws.project.document.remove_node(id);
+            }
+            for node in parsed.upsert {
+                let id = node.id;
+                if ws.project.document.get_node(id).is_some() {
+                    if let Some(existing) = ws.project.document.get_node_mut(id) {
+                        *existing = node;
+                        existing.touch();
+                    }
+                } else {
+                    // Parent-first ordering guarantees the parent is
+                    // present (or this is a root); a failed insert
+                    // (e.g. a since-removed parent) is skipped rather
+                    // than aborting the rest of the replay.
+                    //
+                    // Clear `children` before insert: a captured
+                    // subtree node still lists its child ids, and
+                    // `insert_node` re-appends each child to its
+                    // parent as the children are themselves inserted
+                    // (they always follow, parent-first), so keeping
+                    // the captured list would double them up. Nodes
+                    // that already exist take the overwrite branch
+                    // above and keep their children untouched.
+                    let mut node = node;
+                    node.children.clear();
+                    let _ = ws.project.document.insert_node(node);
+                }
+            }
+            Ok(())
         }
         other => {
             // No-op fall-through for graph operations
@@ -10116,6 +10249,8 @@ mod tests {
             // H4 — AI generation depth (generate + refine).
             "ai_generate_themed_design",
             "ai_refine_themed_design",
+            // I4 — plugin marketplace (reviewed proposal batch).
+            "plugin_apply_proposals",
         ]
         .into_iter()
         .collect();
@@ -13171,6 +13306,223 @@ mod tests {
             .and_then(|v| v.as_str())
             .unwrap_or("");
         assert_eq!(status, "rejected", "expected rejected, got {status}");
+        project_close();
+    }
+
+    // ------------------------------------------------------------------
+    // I4 — bundled WASM demo plugins, end-to-end through the real host
+    // ABI. These tests install the *shipped* `.wasm` artifacts (the
+    // same bytes the gallery installs), enable them, run them over a
+    // real selection via `plugin_execute_on_selection`, and assert the
+    // document actually changed AND that the change is a single
+    // undoable operation (one `document_undo` reverts it; one
+    // `document_redo` reapplies it). This is the "a test that runs the
+    // WASM plugin and asserts the document changed" deliverable.
+    // ------------------------------------------------------------------
+
+    /// Read the `(tx, ty)` translation of every node in `ids`, in the
+    /// same order, so before/after snapshots compare positionally.
+    fn translations_of(ids: &[Uuid]) -> Vec<(f64, f64)> {
+        with_workspace(|ws| {
+            Ok(ids
+                .iter()
+                .map(|id| {
+                    ws.project
+                        .document
+                        .get_node(*id)
+                        .map_or((f64::NAN, f64::NAN), |n| (n.transform.tx, n.transform.ty))
+                })
+                .collect())
+        })
+        .unwrap()
+    }
+
+    /// Serialised fill of every node in `ids`, in order.
+    fn fills_of(ids: &[Uuid]) -> Vec<serde_json::Value> {
+        with_workspace(|ws| {
+            Ok(ids
+                .iter()
+                .map(|id| {
+                    ws.project
+                        .document
+                        .get_node(*id)
+                        .map_or(serde_json::Value::Null, |n| {
+                            serde_json::to_value(&n.style.fill).unwrap()
+                        })
+                })
+                .collect())
+        })
+        .unwrap()
+    }
+
+    /// Install a bundled demo plugin by id, scan it into the registry,
+    /// and enable it so `plugin_execute_with_context` will run it.
+    fn install_and_enable_bundled(id: &str) {
+        crate::phase10::plugin_marketplace_install_bundled(id).expect("install bundled");
+        // phase2's registry is a separate singleton from the
+        // marketplace's; scan + enable through it so execute sees the
+        // plugin as enabled.
+        crate::phase2::plugin_list().expect("list");
+        crate::phase2::plugin_enable(id).expect("enable");
+    }
+
+    #[test]
+    #[serial]
+    fn demo_grid_arrange_tidies_selection_as_one_undoable_op() {
+        reset_for_tests();
+        let dir = tmpdir();
+        let plugin_dir = tmpdir();
+        let _guard = PluginEnvGuard::new(plugin_dir.path());
+
+        project_create("grid-demo", dir.path()).expect("create");
+        install_and_enable_bundled("com.kcreate.demo.grid-arrange");
+
+        // Four cards, scattered to deliberately untidy positions so
+        // the grid layout has somewhere to move them. `canvas_create_rect`
+        // leaves the transform at the identity; `canvas_move_node` is
+        // what populates `transform.tx/ty` (the coordinate the grid
+        // plugin reads through the injected input).
+        let mut ids = Vec::new();
+        for (w, h) in [(120.0, 80.0), (120.0, 80.0), (120.0, 80.0), (120.0, 80.0)] {
+            ids.push(canvas_create_rect(None, 0.0, 0.0, w, h).expect("rect"));
+        }
+        let scatter = [(310.0, 35.0), (40.0, 250.0), (505.0, 300.0), (165.0, 140.0)];
+        for (id, (dx, dy)) in ids.iter().zip(scatter) {
+            canvas_move_node(*id, dx, dy).expect("scatter");
+        }
+        document_set_selection(ids.clone()).expect("select");
+
+        let before = translations_of(&ids);
+        assert_eq!(before, scatter.to_vec(), "scatter setup");
+
+        let out = crate::phase2::plugin_execute_on_selection(
+            "com.kcreate.demo.grid-arrange",
+            "run",
+            "{\"columns\":2,\"gap\":24}",
+        )
+        .expect("run grid");
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let applied = parsed
+            .get("proposals")
+            .and_then(|v| v.as_array())
+            .map_or(0, |reports| {
+                reports
+                    .iter()
+                    .filter(|r| {
+                        r.get("outcome")
+                            .and_then(|o| o.get("status"))
+                            .and_then(|v| v.as_str())
+                            == Some("applied")
+                    })
+                    .count()
+            });
+        assert!(
+            applied >= 1,
+            "expected at least one applied move, got {out}"
+        );
+
+        let after = translations_of(&ids);
+        assert_ne!(after, before, "grid plugin must move the selection");
+        // The change must be recorded as exactly ONE undoable op,
+        // attributed to the plugin.
+        let cmd = with_workspace(|ws| Ok(ws.project.pending_undo().map(|op| op.command))).unwrap();
+        assert_eq!(
+            cmd.as_deref(),
+            Some("plugin_apply_proposals"),
+            "expected a single plugin_apply_proposals op on top of the log"
+        );
+        // Tidiness check: every card shares one of `columns` distinct
+        // x positions and the rows line up — i.e. it really is a grid.
+        let xs: std::collections::BTreeSet<i64> =
+            after.iter().map(|(x, _)| x.round() as i64).collect();
+        assert_eq!(
+            xs.len(),
+            2,
+            "two columns => two distinct x positions: {after:?}"
+        );
+
+        // One undo reverts the entire layout.
+        document_undo().expect("undo").expect("had undo");
+        assert_eq!(translations_of(&ids), before, "undo must restore scatter");
+        // One redo reapplies it.
+        document_redo().expect("redo").expect("had redo");
+        assert_eq!(translations_of(&ids), after, "redo must restore grid");
+
+        project_close();
+    }
+
+    #[test]
+    #[serial]
+    fn demo_palette_apply_recolors_selection_as_one_undoable_op() {
+        reset_for_tests();
+        let dir = tmpdir();
+        let plugin_dir = tmpdir();
+        let _guard = PluginEnvGuard::new(plugin_dir.path());
+
+        project_create("palette-demo", dir.path()).expect("create");
+        install_and_enable_bundled("com.kcreate.demo.palette-apply");
+
+        let mut ids = Vec::new();
+        for i in 0..3 {
+            ids.push(
+                canvas_create_rect(None, f64::from(i) * 160.0, 0.0, 140.0, 100.0).expect("rect"),
+            );
+        }
+        document_set_selection(ids.clone()).expect("select");
+
+        let before = fills_of(&ids);
+        let out = crate::phase2::plugin_execute_on_selection(
+            "com.kcreate.demo.palette-apply",
+            "run",
+            "{\"saturation\":0.7,\"lightness\":0.55,\"hueOffset\":200}",
+        )
+        .expect("run palette");
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let applied = parsed
+            .get("proposals")
+            .and_then(|v| v.as_array())
+            .map_or(0, |reports| {
+                reports
+                    .iter()
+                    .filter(|r| {
+                        r.get("outcome")
+                            .and_then(|o| o.get("status"))
+                            .and_then(|v| v.as_str())
+                            == Some("applied")
+                    })
+                    .count()
+            });
+        assert_eq!(
+            applied,
+            ids.len(),
+            "every selected node should be recolored"
+        );
+
+        let after = fills_of(&ids);
+        assert_ne!(after, before, "palette plugin must recolor the selection");
+        // Each new fill must be a solid color (the plugin emits
+        // `{"kind":"solid",...}`), proving the proposal really wrote
+        // through `style.fill`.
+        for fill in &after {
+            assert_eq!(
+                fill.get("kind").and_then(|v| v.as_str()),
+                Some("solid"),
+                "expected solid fill, got {fill}"
+            );
+        }
+        // The hue walks per node, so no two cards land on the same color.
+        let distinct: std::collections::BTreeSet<String> =
+            after.iter().map(std::string::ToString::to_string).collect();
+        assert_eq!(distinct.len(), ids.len(), "each card gets a distinct hue");
+
+        let cmd = with_workspace(|ws| Ok(ws.project.pending_undo().map(|op| op.command))).unwrap();
+        assert_eq!(cmd.as_deref(), Some("plugin_apply_proposals"));
+
+        document_undo().expect("undo").expect("had undo");
+        assert_eq!(fills_of(&ids), before, "undo must restore original fills");
+        document_redo().expect("redo").expect("had redo");
+        assert_eq!(fills_of(&ids), after, "redo must restore recolor");
+
         project_close();
     }
 

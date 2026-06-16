@@ -1,0 +1,32 @@
+# Demo plugin: "Grid Arrange". Compiles to a freestanding
+# `wasm32-unknown-unknown` cdylib that runs inside KCreate's wasmi
+# sandbox through the real host ABI (kcreate_get_input /
+# kcreate_write_proposal). It is intentionally OUTSIDE the cargo
+# workspace (see the root `Cargo.toml` `exclude` list) because it
+# targets wasm32 and imports host functions that only exist when
+# linked by the runtime — building it for the host target would fail
+# at link time. Rebuild via `demo_plugins/build.sh`.
+# Empty table => this crate is its own workspace root, fully detached
+# from the parent KCreate workspace (it targets wasm32 only).
+[workspace]
+
+[package]
+name = "kcreate_demo_grid_arrange"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

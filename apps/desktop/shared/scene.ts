@@ -3379,6 +3379,13 @@ export type PluginProposalReport =
       outcome: { status: "applied"; node_id: string } | { status: "rejected"; reason: string };
     }
   | {
+      type: "move_node";
+      node_id: string;
+      dx: number;
+      dy: number;
+      outcome: { status: "applied"; node_id: string } | { status: "rejected"; reason: string };
+    }
+  | {
       type: "delete_node";
       node_id: string;
       outcome: { status: "applied"; node_id: string } | { status: "rejected"; reason: string };
@@ -3438,6 +3445,18 @@ export interface PluginBridge {
     id: string,
     fn: string,
     input: string,
+  ): Promise<PluginExecuteWithContextResult>;
+  /**
+   * Run a plugin against the current selection. The bridge builds the
+   * plugin input JSON from the live document (each selected node's id,
+   * position, and size) merged with the caller-supplied `paramsJson`,
+   * runs the plugin under the extended ABI, and applies any emitted
+   * proposals as a single undoable operation.
+   */
+  executeOnSelection(
+    id: string,
+    fn: string,
+    paramsJson: string,
   ): Promise<PluginExecuteWithContextResult>;
   /** List installed JS panel plugins for the Electron host. */
   jsList(): Promise<JsPanelInfo[]>;
@@ -6625,7 +6644,15 @@ export interface Phase10Bridge {
     numPages: number,
   ): Promise<BrochurePlanResult>;
   pluginMarketplaceList(): Promise<PluginListing[]>;
+  /**
+   * Full offline catalog: installed plugins plus every bundled
+   * first-party plugin not yet installed (each with `installed`
+   * flag + trust status). Source for the in-app gallery.
+   */
+  pluginMarketplaceCatalog(): Promise<PluginListing[]>;
   pluginMarketplaceInstallLocal(path: string): Promise<PluginListing>;
+  /** Install a compiled-in bundled plugin by id. */
+  pluginMarketplaceInstallBundled(id: string): Promise<PluginListing>;
   pluginMarketplaceRemove(id: string): Promise<boolean>;
   exportPdfMulti(
     options: Record<string, unknown>,

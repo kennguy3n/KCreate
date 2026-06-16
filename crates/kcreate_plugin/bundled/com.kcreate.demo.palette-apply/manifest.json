@@ -1,0 +1,10 @@
+{
+  "id": "com.kcreate.demo.palette-apply",
+  "name": "Palette Apply",
+  "version": "0.1.0",
+  "author": "KCreate Labs",
+  "description": "Generate a harmonious golden-angle color palette and recolor the selected layers. Each layer receives a distinct hue at a shared saturation and lightness, applied as one undoable proposal.",
+  "type": "wasm",
+  "entry_point": "palette_apply.wasm",
+  "permissions": ["read_document", "write_document"]
+}

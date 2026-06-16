@@ -2221,6 +2221,19 @@ const plugin: PluginBridge = {
     )) as string;
     return JSON.parse(raw) as PluginExecuteWithContextResult;
   },
+  async executeOnSelection(
+    id: string,
+    fn: string,
+    paramsJson: string,
+  ): Promise<PluginExecuteWithContextResult> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/plugin/executeOnSelection",
+      id,
+      fn,
+      paramsJson,
+    )) as string;
+    return JSON.parse(raw) as PluginExecuteWithContextResult;
+  },
   async jsList(): Promise<JsPanelInfo[]> {
     const raw = (await ipcRenderer.invoke(
       "kcreate/plugin/js/list",
@@ -3941,10 +3954,23 @@ const phase10: Phase10Bridge = {
     )) as string;
     return JSON.parse(raw) as PluginListing[];
   },
+  async pluginMarketplaceCatalog() {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/phase10/plugin-marketplace/catalog",
+    )) as string;
+    return JSON.parse(raw) as PluginListing[];
+  },
   async pluginMarketplaceInstallLocal(path) {
     const raw = (await ipcRenderer.invoke(
       "kcreate/phase10/plugin-marketplace/install-local",
       path,
+    )) as string;
+    return JSON.parse(raw) as PluginListing;
+  },
+  async pluginMarketplaceInstallBundled(id) {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/phase10/plugin-marketplace/install-bundled",
+      id,
     )) as string;
     return JSON.parse(raw) as PluginListing;
   },

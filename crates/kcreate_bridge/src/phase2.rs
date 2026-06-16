@@ -42,8 +42,8 @@ use uuid::Uuid;
 
 use crate::document::{
     blob_load, build_template_document, current_scene_safe, sync_scene_after_change,
-    template_instantiate_items, with_workspace, with_workspace_mut, CanvasBatchItem,
-    DocumentBridgeError, Result, TemplateInstantiateReport,
+    template_instantiate_items, with_workspace, with_workspace_mut, with_workspace_mut_synced,
+    CanvasBatchItem, DocumentBridgeError, Result, TemplateInstantiateReport,
 };
 use crate::thumbnails::{
     render_template_thumbnail_png, ThumbnailBytes, DEFAULT_THUMBNAIL_MAX_DIM_PX,
@@ -1315,7 +1315,7 @@ fn plugin_registry() -> &'static Mutex<kcreate_plugin::PluginRegistry> {
     })
 }
 
-fn plugin_dir() -> PathBuf {
+pub(crate) fn plugin_dir() -> PathBuf {
     if let Ok(env) = std::env::var("KCREATE_PLUGIN_DIR") {
         return PathBuf::from(env);
     }
@@ -1333,25 +1333,42 @@ fn trust_store_path() -> PathBuf {
 }
 
 /// Load the trust store from `trusted_keys.json` if it exists, or
-/// return an empty store otherwise. A malformed file is logged and
-/// treated as empty — it must never prevent the bridge from starting,
-/// since `plugin_list` (and the rest of the host) need to keep
-/// working even for users who never set up the file.
-fn load_trust_store() -> kcreate_plugin::TrustStore {
+/// return an empty store otherwise, then fold in the compiled-in
+/// bundled publisher key(s) so the first-party demo plugins verify as
+/// `verified` out of the box (a user pin under the same id always
+/// wins). A malformed file is logged and treated as empty — it must
+/// never prevent the bridge from starting, since `plugin_list` (and
+/// the rest of the host) need to keep working even for users who never
+/// set up the file.
+pub(crate) fn load_trust_store() -> kcreate_plugin::TrustStore {
     let path = trust_store_path();
-    if !path.exists() {
-        return kcreate_plugin::TrustStore::default();
-    }
-    match kcreate_plugin::TrustStore::load_from_path(&path) {
-        Ok(store) => store,
+    let mut store = if path.exists() {
+        match kcreate_plugin::TrustStore::load_from_path(&path) {
+            Ok(store) => store,
+            Err(e) => {
+                log::warn!(
+                    "kcreate_bridge: trust store at {} could not be loaded ({e}); proceeding with no trusted keys",
+                    path.display(),
+                );
+                kcreate_plugin::TrustStore::default()
+            }
+        }
+    } else {
+        kcreate_plugin::TrustStore::default()
+    };
+    match kcreate_plugin::bundled_trusted_keys() {
+        Ok(keys) => {
+            if let Err(e) = store.merge_keys(keys) {
+                log::warn!(
+                    "kcreate_bridge: could not merge bundled publisher key into trust store ({e})"
+                );
+            }
+        }
         Err(e) => {
-            log::warn!(
-                "kcreate_bridge: trust store at {} could not be loaded ({e}); proceeding with no trusted keys",
-                path.display(),
-            );
-            kcreate_plugin::TrustStore::default()
+            log::warn!("kcreate_bridge: bundled publisher key list is unreadable ({e})");
         }
     }
+    store
 }
 
 fn plugin_runtime() -> &'static kcreate_plugin::WasmPluginRuntime {
@@ -1523,11 +1540,9 @@ pub struct ProposalReport {
 ///    still proceed while the plugin runs.
 /// 4. Execute the plugin under [`kcreate_plugin::PluginContext`].
 /// 5. After the plugin returns, validate each proposal — checking
-///    node-id resolution and parent-id resolution — and apply
-///    accepted ones via [`crate::document::document_create_node`] /
-///    [`crate::document::document_update_node`] /
-///    [`crate::document::document_delete_node`] so they record
-///    operations and become undoable.
+///    node-id / parent-id resolution — and apply the accepted ones
+///    via [`apply_plugin_proposals`], which folds the whole batch
+///    into a single undoable `plugin_apply_proposals` operation.
 /// 6. Return a JSON envelope:
 ///    `{ "output": "...", "logs": [...], "proposals": [ ProposalReport, ... ] }`.
 ///
@@ -1600,13 +1615,76 @@ pub fn plugin_execute_with_context(id: &str, function: &str, input_json: &str) -
         .execute_path_with_context(&path, function, input_json, 64, context)
         .map_err(|e| DocumentBridgeError::Io(std::io::Error::other(e.to_string())))?;
 
-    let reports = apply_plugin_proposals(out.proposals);
+    let reports = apply_plugin_proposals(id, out.proposals);
 
     Ok(serde_json::to_string(&serde_json::json!({
         "output": out.output,
         "logs": out.logs,
         "proposals": reports,
     }))?)
+}
+
+/// Build the host→plugin input envelope for a "run on the current
+/// selection" invocation, then execute the plugin under the extended
+/// ABI via [`plugin_execute_with_context`].
+///
+/// The envelope is:
+///
+/// ```json
+/// { "nodes": [ { "id", "x", "y", "width", "height" }, ... ],
+///   "params": <params_json> }
+/// ```
+///
+/// where `x` / `y` are the node's translation (`transform.tx` /
+/// `transform.ty`) and `width` / `height` come from its `bounds`.
+/// Demo plugins read this via `kcreate_get_input` because the
+/// extended `kcreate_read_document` host fn can only populate the
+/// host's output buffer — it cannot return geometry back into plugin
+/// memory — so the geometry a layout/recolor plugin needs is injected
+/// up front. Plugins emit `move_node` / `update_node` proposals that
+/// flow back through [`apply_plugin_proposals`] as one undoable op.
+///
+/// `params_json` is the raw JSON object supplied by the gallery UI
+/// (e.g. grid columns / gap, palette saturation). A blank string
+/// defaults to `{}`; every demo plugin tolerates missing fields with
+/// sensible defaults. Nodes in the selection that no longer resolve
+/// are silently skipped, matching the document snapshot semantics
+/// used elsewhere in the plugin path.
+pub fn plugin_execute_on_selection(id: &str, function: &str, params_json: &str) -> Result<String> {
+    let selection = crate::document::document_get_selection()?;
+    let nodes: Vec<serde_json::Value> = with_workspace(|ws| {
+        let mut out = Vec::with_capacity(selection.len());
+        for node_id in &selection {
+            if let Some(node) = ws.project.document.get_node(*node_id) {
+                out.push(serde_json::json!({
+                    "id": node.id.to_string(),
+                    "x": node.transform.tx,
+                    "y": node.transform.ty,
+                    "width": node.bounds.width,
+                    "height": node.bounds.height,
+                }));
+            }
+        }
+        Ok(out)
+    })?;
+
+    let params: serde_json::Value = {
+        let trimmed = params_json.trim();
+        if trimmed.is_empty() {
+            serde_json::json!({})
+        } else {
+            serde_json::from_str(trimmed).map_err(|e| {
+                DocumentBridgeError::Io(std::io::Error::other(format!("invalid params json: {e}")))
+            })?
+        }
+    };
+
+    let input = serde_json::to_string(&serde_json::json!({
+        "nodes": nodes,
+        "params": params,
+    }))?;
+
+    plugin_execute_with_context(id, function, &input)
 }
 
 /// List installed JS panel plugins along with their panel configs.
@@ -1776,7 +1854,7 @@ fn plugin_js_message_inner(
             };
             // Single-proposal apply, same code path WASM plugins go
             // through. Report flows back as the outcome's result.
-            let reports = apply_plugin_proposals(vec![mutation]);
+            let reports = apply_plugin_proposals(plugin_id, vec![mutation]);
             let report = reports
                 .into_iter()
                 .next()
@@ -1793,56 +1871,200 @@ fn plugin_js_message_inner(
     }
 }
 
-/// Validate and apply a batch of plugin proposals.
+/// Validate and apply a batch of plugin proposals as a **single
+/// undoable operation**.
+///
+/// Every proposal in a batch is validated and applied under one
+/// workspace write lock ([`with_workspace_mut_synced`]) so the whole
+/// plugin run is atomic: the document ends in the post-batch state
+/// with exactly one `plugin_apply_proposals` operation pushed onto
+/// the log (when anything actually changed), or — if the workspace
+/// is unavailable — nothing changes and every proposal is rejected.
 ///
 /// Per-proposal contract:
-/// * `CreateNode` — parent must resolve to an existing node (or be
-///   the root by leaving `parent_id` resolved to `None` after the
-///   lookup); `node_type` must be one of the strings accepted by
-///   [`crate::document::document_create_node`].
-/// * `UpdateNode` — `node_id` must resolve.
-/// * `DeleteNode` — `node_id` must resolve.
+/// * `CreateNode` — `parent_id` must resolve to an existing node;
+///   `node_type` + `props` parse exactly as
+///   [`crate::document::build_node_from_props`] accepts them.
+/// * `UpdateNode` — `node_id` must resolve; `changes` parse as
+///   [`crate::document::UpdateNodeProps`].
+/// * `MoveNode` — `node_id` must resolve; the node is translated by
+///   `(dx, dy)` in its parent's coordinate space.
+/// * `DeleteNode` — `node_id` must resolve; the whole subtree is
+///   removed and captured so undo restores it.
 ///
-/// Each accepted proposal is applied through the existing
-/// `document_*` helpers so it records an operation and is undoable.
-/// Rejected proposals leave the document unchanged.
-fn apply_plugin_proposals(proposals: Vec<kcreate_plugin::ProposedMutation>) -> Vec<ProposalReport> {
-    proposals
-        .into_iter()
-        .map(|p| {
-            let outcome = apply_one_proposal(&p);
-            ProposalReport {
-                proposal: p,
+/// Unlike the previous implementation (which routed each proposal
+/// through a `document_*` helper that mutated the graph **without**
+/// recording an operation, leaving plugin edits silently
+/// un-undoable), this records one directional
+/// [`crate::document::PluginApplyPatch`] pair describing the net
+/// before/after state of every touched node. Replaying `before_patch`
+/// on undo and `after_patch` on redo is handled by the
+/// `"plugin_apply_proposals"` arm of `apply_patch` in
+/// [`crate::document`]. `plugin_id` is recorded as the operation
+/// actor (`plugin:<id>`) for audit-log provenance.
+fn apply_plugin_proposals(
+    plugin_id: &str,
+    proposals: Vec<kcreate_plugin::ProposedMutation>,
+) -> Vec<ProposalReport> {
+    let result = with_workspace_mut_synced(|ws| {
+        let mut builder = PluginPatchBuilder::default();
+        let mut reports = Vec::with_capacity(proposals.len());
+        for proposal in &proposals {
+            let outcome =
+                apply_one_proposal_locked(&mut ws.project.document, &mut builder, proposal);
+            reports.push(ProposalReport {
+                proposal: proposal.clone(),
                 outcome,
-            }
-        })
-        .collect()
+            });
+        }
+        // Record exactly one operation iff at least one proposal
+        // mutated the graph; a batch of pure rejections leaves the
+        // log (and undo history) untouched.
+        if builder.touched_any() {
+            let (before, after, affected) = builder.into_patches(&ws.project.document);
+            let before_value = serde_json::to_value(&before)?;
+            let after_value = serde_json::to_value(&after)?;
+            ws.project.execute_operation(Operation::new(
+                format!("plugin:{plugin_id}"),
+                "plugin_apply_proposals",
+                before_value,
+                after_value,
+                affected,
+            ));
+        }
+        Ok(reports)
+    });
+    match result {
+        Ok(reports) => reports,
+        Err(e) => proposals
+            .into_iter()
+            .map(|p| ProposalReport {
+                proposal: p,
+                outcome: ProposalOutcome::Rejected {
+                    reason: format!("plugin apply failed: {e}"),
+                },
+            })
+            .collect(),
+    }
 }
 
-fn apply_one_proposal(proposal: &kcreate_plugin::ProposedMutation) -> ProposalOutcome {
+/// Accumulates the per-node before/after states touched by a batch of
+/// proposals so [`apply_plugin_proposals`] can emit one directional
+/// [`crate::document::PluginApplyPatch`] pair.
+///
+/// `initial` records each node's state the **first** time it is
+/// touched (`None` = the node did not exist before, i.e. it was
+/// created by this batch). Final state is read back from the live
+/// document once every proposal has applied, so the net before/after
+/// diff is correct no matter how many proposals touch the same node
+/// or in what order.
+#[derive(Default)]
+struct PluginPatchBuilder {
+    order: Vec<Uuid>,
+    initial: HashMap<Uuid, Option<Node>>,
+}
+
+impl PluginPatchBuilder {
+    fn note_initial(&mut self, id: Uuid, prior: Option<Node>) {
+        if !self.initial.contains_key(&id) {
+            self.order.push(id);
+            self.initial.insert(id, prior);
+        }
+    }
+
+    fn touched_any(&self) -> bool {
+        !self.order.is_empty()
+    }
+
+    /// Build `(before_patch, after_patch, affected_ids)` from the
+    /// recorded initial states and the current (post-batch) document.
+    fn into_patches(
+        self,
+        doc: &kcreate_core::document::DocumentGraph,
+    ) -> (
+        crate::document::PluginApplyPatch,
+        crate::document::PluginApplyPatch,
+        Vec<Uuid>,
+    ) {
+        let mut before = crate::document::PluginApplyPatch::default();
+        let mut after = crate::document::PluginApplyPatch::default();
+        let mut affected = Vec::with_capacity(self.order.len());
+        for id in &self.order {
+            affected.push(*id);
+            let initial = self.initial.get(id).cloned().flatten();
+            let final_state = doc.get_node(*id).cloned();
+            match initial {
+                Some(node) => before.upsert.push(node),
+                None => before.remove.push(*id),
+            }
+            match final_state {
+                Some(node) => after.upsert.push(node),
+                None => after.remove.push(*id),
+            }
+        }
+        // Re-insertion needs parents before children. Updates / moves
+        // overwrite in place so their order is irrelevant, but a
+        // restored subtree (delete-undo) must be parent-first.
+        sort_nodes_parent_first(&mut before.upsert);
+        sort_nodes_parent_first(&mut after.upsert);
+        (before, after, affected)
+    }
+}
+
+/// Stable parent-first topological sort of `nodes` by `parent_id`,
+/// considering only parents that are themselves in the set (a
+/// surviving/external parent imposes no ordering constraint because
+/// it already exists in the document). Affected sets are tiny so the
+/// O(n²) worst case is irrelevant; a dangling cycle falls back to
+/// emitting the remainder as-is rather than looping forever.
+fn sort_nodes_parent_first(nodes: &mut Vec<Node>) {
+    let ids: std::collections::HashSet<Uuid> = nodes.iter().map(|n| n.id).collect();
+    let mut emitted: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
+    let mut result: Vec<Node> = Vec::with_capacity(nodes.len());
+    let mut remaining: Vec<Node> = std::mem::take(nodes);
+    while !remaining.is_empty() {
+        let mut progressed = false;
+        let mut next: Vec<Node> = Vec::new();
+        for node in remaining {
+            let ready = match node.parent_id {
+                Some(parent) if ids.contains(&parent) => emitted.contains(&parent),
+                _ => true,
+            };
+            if ready {
+                emitted.insert(node.id);
+                result.push(node);
+                progressed = true;
+            } else {
+                next.push(node);
+            }
+        }
+        if !progressed {
+            result.extend(next);
+            break;
+        }
+        remaining = next;
+    }
+    *nodes = result;
+}
+
+/// Apply one proposal directly to the live document graph, recording
+/// the touched nodes' pre-mutation state into `builder`. Validation
+/// failures leave the graph unchanged and record nothing.
+fn apply_one_proposal_locked(
+    doc: &mut kcreate_core::document::DocumentGraph,
+    builder: &mut PluginPatchBuilder,
+    proposal: &kcreate_plugin::ProposedMutation,
+) -> ProposalOutcome {
     match proposal {
         kcreate_plugin::ProposedMutation::CreateNode {
             parent_id,
             node_type,
             props,
         } => {
-            // Validate parent existence up front so we return a
-            // clean rejection rather than letting `document_create_node`
-            // fail later with a less specific error.
-            let parent_check =
-                with_workspace(|ws| Ok(ws.project.document.get_node(*parent_id).is_some()));
-            match parent_check {
-                Ok(true) => {}
-                Ok(false) => {
-                    return ProposalOutcome::Rejected {
-                        reason: format!("parent node {parent_id} not found"),
-                    }
-                }
-                Err(e) => {
-                    return ProposalOutcome::Rejected {
-                        reason: format!("workspace unavailable: {e}"),
-                    }
-                }
+            if doc.get_node(*parent_id).is_none() {
+                return ProposalOutcome::Rejected {
+                    reason: format!("parent node {parent_id} not found"),
+                };
             }
             let create_props: crate::document::CreateNodeProps =
                 match serde_json::from_value(props.clone()) {
@@ -1853,29 +2075,34 @@ fn apply_one_proposal(proposal: &kcreate_plugin::ProposedMutation) -> ProposalOu
                         }
                     }
                 };
-            match crate::document::document_create_node(node_type, Some(*parent_id), &create_props)
-            {
-                Ok(new_id) => ProposalOutcome::Applied { node_id: new_id },
+            let node = match crate::document::build_node_from_props(
+                node_type,
+                Some(*parent_id),
+                &create_props,
+            ) {
+                Ok(n) => n,
+                Err(e) => {
+                    return ProposalOutcome::Rejected {
+                        reason: format!("create failed: {e}"),
+                    }
+                }
+            };
+            match doc.insert_node(node) {
+                Ok(new_id) => {
+                    builder.note_initial(new_id, None);
+                    ProposalOutcome::Applied { node_id: new_id }
+                }
                 Err(e) => ProposalOutcome::Rejected {
                     reason: format!("create failed: {e}"),
                 },
             }
         }
         kcreate_plugin::ProposedMutation::UpdateNode { node_id, changes } => {
-            let exists = with_workspace(|ws| Ok(ws.project.document.get_node(*node_id).is_some()));
-            match exists {
-                Ok(true) => {}
-                Ok(false) => {
-                    return ProposalOutcome::Rejected {
-                        reason: format!("node {node_id} not found"),
-                    }
-                }
-                Err(e) => {
-                    return ProposalOutcome::Rejected {
-                        reason: format!("workspace unavailable: {e}"),
-                    }
-                }
-            }
+            let Some(prior) = doc.get_node(*node_id).cloned() else {
+                return ProposalOutcome::Rejected {
+                    reason: format!("node {node_id} not found"),
+                };
+            };
             let update_props: crate::document::UpdateNodeProps =
                 match serde_json::from_value(changes.clone()) {
                     Ok(p) => p,
@@ -1885,34 +2112,47 @@ fn apply_one_proposal(proposal: &kcreate_plugin::ProposedMutation) -> ProposalOu
                         }
                     }
                 };
-            match crate::document::document_update_node(*node_id, &update_props) {
-                Ok(()) => ProposalOutcome::Applied { node_id: *node_id },
-                Err(e) => ProposalOutcome::Rejected {
-                    reason: format!("update failed: {e}"),
-                },
-            }
+            let Some(node) = doc.get_node_mut(*node_id) else {
+                return ProposalOutcome::Rejected {
+                    reason: format!("node {node_id} not found"),
+                };
+            };
+            crate::document::apply_update_props_to_node(node, &update_props);
+            builder.note_initial(*node_id, Some(prior));
+            ProposalOutcome::Applied { node_id: *node_id }
+        }
+        kcreate_plugin::ProposedMutation::MoveNode { node_id, dx, dy } => {
+            let Some(prior) = doc.get_node(*node_id).cloned() else {
+                return ProposalOutcome::Rejected {
+                    reason: format!("node {node_id} not found"),
+                };
+            };
+            let Some(node) = doc.get_node_mut(*node_id) else {
+                return ProposalOutcome::Rejected {
+                    reason: format!("node {node_id} not found"),
+                };
+            };
+            node.transform.tx += *dx;
+            node.transform.ty += *dy;
+            node.touch();
+            builder.note_initial(*node_id, Some(prior));
+            ProposalOutcome::Applied { node_id: *node_id }
         }
         kcreate_plugin::ProposedMutation::DeleteNode { node_id } => {
-            let exists = with_workspace(|ws| Ok(ws.project.document.get_node(*node_id).is_some()));
-            match exists {
-                Ok(true) => {}
-                Ok(false) => {
-                    return ProposalOutcome::Rejected {
-                        reason: format!("node {node_id} not found"),
-                    }
-                }
-                Err(e) => {
-                    return ProposalOutcome::Rejected {
-                        reason: format!("workspace unavailable: {e}"),
-                    }
-                }
+            if doc.get_node(*node_id).is_none() {
+                return ProposalOutcome::Rejected {
+                    reason: format!("node {node_id} not found"),
+                };
             }
-            match crate::document::document_delete_node(*node_id) {
-                Ok(()) => ProposalOutcome::Applied { node_id: *node_id },
-                Err(e) => ProposalOutcome::Rejected {
-                    reason: format!("delete failed: {e}"),
-                },
+            // Capture the full subtree parent-first BEFORE removal so
+            // undo can restore every descendant, then cascade-remove.
+            let subtree = crate::document::collect_subtree_parent_first(doc, *node_id);
+            for n in subtree {
+                let id = n.id;
+                builder.note_initial(id, Some(n));
             }
+            doc.remove_node(*node_id);
+            ProposalOutcome::Applied { node_id: *node_id }
         }
     }
 }

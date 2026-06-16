@@ -76,6 +76,13 @@ pub enum ProposedMutation {
     },
     /// Remove a node (and its children) from the document.
     DeleteNode { node_id: Uuid },
+    /// Translate a node by `(dx, dy)` in its parent's coordinate
+    /// space. This mutates the node's affine `transform.tx/ty` exactly
+    /// as the interactive `canvas_move_node` command does. Layout
+    /// plugins (e.g. "arrange selection into a grid") emit one
+    /// `MoveNode` per node they reposition; the host folds the whole
+    /// batch into a single undoable operation.
+    MoveNode { node_id: Uuid, dx: f64, dy: f64 },
 }
 
 /// A batch of [`ProposedMutation`] entries submitted by a single

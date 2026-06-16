@@ -13394,6 +13394,14 @@ mod tests {
 
         let before = translations_of(&ids);
         assert_eq!(before, scatter.to_vec(), "scatter setup");
+        // Capture `modified_at` so we can prove the plugin run advances
+        // it. Autosave (`autosave.rs`) skips the disk write when
+        // `modified_at` has not moved since the last tick, so a plugin
+        // mutation that failed to bump it would never be persisted.
+        // `apply_plugin_proposals` bumps it via `execute_operation`
+        // (-> `Project::touch_modified`); this guards that invariant
+        // against a future refactor that records the op differently.
+        let before_modified = with_workspace(|ws| Ok(ws.project.modified_at)).unwrap();
 
         let out = crate::phase2::plugin_execute_on_selection(
             "com.kcreate.demo.grid-arrange",
@@ -13423,6 +13431,11 @@ mod tests {
 
         let after = translations_of(&ids);
         assert_ne!(after, before, "grid plugin must move the selection");
+        let after_modified = with_workspace(|ws| Ok(ws.project.modified_at)).unwrap();
+        assert!(
+            after_modified > before_modified,
+            "plugin run must advance project.modified_at so autosave persists it"
+        );
         // The change must be recorded as exactly ONE undoable op,
         // attributed to the plugin.
         let cmd = with_workspace(|ws| Ok(ws.project.pending_undo().map(|op| op.command))).unwrap();

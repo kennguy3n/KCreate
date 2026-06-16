@@ -2683,7 +2683,22 @@ fn apply_patch(ws: &mut Workspace, op: &Operation, patch: &serde_json::Value) ->
                     // matches that live wiring, so replacing the node's
                     // own fields wholesale keeps the tree consistent with
                     // nothing to double up.
+                    //
+                    // This wholesale replace also rewrites `parent_id`
+                    // without fixing up either parent's `children` vec,
+                    // which is sound only while no proposal type
+                    // reparents a node — none of the four
+                    // (`CreateNode`/`UpdateNode`/`MoveNode`/`DeleteNode`)
+                    // do. The debug assertion below pins that invariant:
+                    // if a future `ReparentNode` lands, it fires in debug
+                    // builds so the replay is reworked to update the
+                    // affected `children` lists rather than silently
+                    // corrupting the graph.
                     if let Some(existing) = ws.project.document.get_node_mut(id) {
+                        debug_assert_eq!(
+                            existing.parent_id, node.parent_id,
+                            "plugin_apply_proposals overwrite must not reparent {id}"
+                        );
                         *existing = node;
                         existing.touch();
                     }

@@ -216,7 +216,7 @@ export function PluginManager({ onStatus }: PluginManagerProps): JSX.Element {
           onClick={() => {
             void refresh();
           }}
-          style={pillButton(false)}
+          style={{ ...pillButton(false), marginLeft: "auto" }}
         >
           Refresh
         </button>
@@ -498,7 +498,7 @@ function TrustedAuthorities({
           type="button"
           onClick={onReload}
           disabled={busy}
-          style={pillButton(busy)}
+          style={{ ...pillButton(busy), marginLeft: "auto" }}
         >
           Reload
         </button>

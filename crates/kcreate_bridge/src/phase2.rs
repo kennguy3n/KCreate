@@ -1637,6 +1637,12 @@ pub fn plugin_execute_with_context(id: &str, function: &str, input_json: &str) -
 ///
 /// where `x` / `y` are the node's translation (`transform.tx` /
 /// `transform.ty`) and `width` / `height` come from its `bounds`.
+/// Note these are translation-space values, not world-space: a node's
+/// absolute visual origin is `bounds.x + transform.tx` (and likewise
+/// for `y`). The bundled demo plugins only ever compute *relative*
+/// deltas (grid offsets, recolor) so the `bounds.x` term cancels out;
+/// a future plugin that needs absolute world coordinates must add the
+/// `bounds` origin itself rather than treating `x` / `y` as world-space.
 /// Demo plugins read this via `kcreate_get_input` because the
 /// extended `kcreate_read_document` host fn can only populate the
 /// host's output buffer — it cannot return geometry back into plugin

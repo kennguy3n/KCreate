@@ -8,7 +8,7 @@
 //!
 //! Run with:
 //! ```text
-//! cargo run -p kcreate_renderer --example dense_present_proof --release
+//! cargo run -p kcreate_renderer --example dense_present_proof --release --features dev_seed
 //! ```
 //! Output (PNGs + `benchmark_table.md`) lands in `$KCREATE_PROOF_DIR`
 //! (default `./proof_out`).

@@ -174,6 +174,25 @@ describe("WelcomeModal", () => {
     );
   });
 
+  it("localizes the static pack-resolution error messages", async () => {
+    const stub = kcreateStub();
+    stub.override("llm.recommendedPack", () => "llm_does_not_exist");
+    stub.override("aiModel.listModelPacks", () => [SAMPLE_PACK]);
+
+    render(
+      <LocaleProvider initialLocale="es">
+        <WelcomeModal open={true} onDismiss={() => {}} />
+      </LocaleProvider>,
+    );
+    await flushAsync();
+
+    const error = screen.getByTestId("kcreate-welcome-error");
+    // Spanish catalog copy, with the pack id still interpolated.
+    expect(error.textContent).toContain("no está en el registro de modelos");
+    expect(error.textContent).toContain("llm_does_not_exist");
+    expect(error.textContent).not.toMatch(/not in the model registry/);
+  });
+
   it("clicking Skip after load passes the resolved pack id (for lastSeenPackId) and fires no install IPC", async () => {
     const stub = kcreateStub();
     stub.override("llm.recommendedPack", () => SAMPLE_PACK.id);

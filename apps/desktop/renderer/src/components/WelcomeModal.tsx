@@ -76,7 +76,23 @@ type Phase =
       tier: string;
       report: OnboardingInstallReport;
     }
-  | { kind: "error"; tier: string | null; pack: ModelPack | null; message: string };
+  | {
+      kind: "error";
+      tier: string | null;
+      pack: ModelPack | null;
+      error: WelcomeError;
+    };
+
+/**
+ * Localizable reason pack resolution / install failed. Static
+ * failures carry a catalog `code` resolved in `WelcomeBody` (where the
+ * `t` function is in scope); `raw` wraps a bridge/runtime error string
+ * that has no stable translation key to map against.
+ */
+type WelcomeError =
+  | { code: "noRecommendedPack" }
+  | { code: "packNotInRegistry"; packId: string }
+  | { code: "raw"; text: string };
 
 /**
  * Lazy bootstrap: resolve the recommended pack id via the bridge,
@@ -97,8 +113,7 @@ async function resolveRecommendedPack(): Promise<Phase> {
         kind: "error",
         tier: tierLabel(limits),
         pack: null,
-        message:
-          "Your device tier does not have a recommended local LLM pack yet. You can still install a pack manually from Model Manager.",
+        error: { code: "noRecommendedPack" },
       };
     }
     const pack = packs.find((p) => p.id === packId) ?? null;
@@ -107,7 +122,7 @@ async function resolveRecommendedPack(): Promise<Phase> {
         kind: "error",
         tier: tierLabel(limits),
         pack: null,
-        message: `Recommended pack '${packId}' is not in the model registry. Open Model Manager to install a pack manually.`,
+        error: { code: "packNotInRegistry", packId },
       };
     }
     return {
@@ -121,7 +136,7 @@ async function resolveRecommendedPack(): Promise<Phase> {
       kind: "error",
       tier: null,
       pack: null,
-      message: errorMessage(e),
+      error: { code: "raw", text: errorMessage(e) },
     };
   }
 }
@@ -238,7 +253,7 @@ export function WelcomeModal({
           kind: "error",
           tier: prev.tier,
           pack: prev.pack,
-          message: errorMessage(e),
+          error: { code: "raw", text: errorMessage(e) },
         };
       });
     } finally {
@@ -290,7 +305,7 @@ export function WelcomeModal({
         kind: "error",
         tier: phase.tier,
         pack,
-        message: errorMessage(e),
+        error: { code: "raw", text: errorMessage(e) },
       });
     } finally {
       installInFlight.current = false;
@@ -533,7 +548,15 @@ function WelcomeBody({
         </>
       );
     }
-    case "error":
+    case "error": {
+      const message =
+        phase.error.code === "raw"
+          ? phase.error.text
+          : phase.error.code === "packNotInRegistry"
+            ? t("welcome.error.packNotInRegistry", {
+                packId: phase.error.packId,
+              })
+            : t("welcome.error.noRecommendedPack");
       return (
         <>
           {phase.pack ? <PackCard pack={phase.pack} tier={phase.tier ?? "unknown"} /> : null}
@@ -542,7 +565,7 @@ function WelcomeBody({
             style={errorStyle}
             data-testid="kcreate-welcome-error"
           >
-            {phase.message}
+            {message}
           </p>
           <footer style={footerStyle}>
             <button
@@ -556,6 +579,7 @@ function WelcomeBody({
           </footer>
         </>
       );
+    }
   }
 }
 

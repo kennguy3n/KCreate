@@ -113,6 +113,10 @@ export const ar: PartialMessages = {
   "welcome.verified": "تم التحقّق {size}.",
   "welcome.unverified":
     "تم التثبيت {size} (لا يوجد SHA-256 مثبّت في السجل؛ التجزئة الفعلية {hash}…).",
+  "welcome.error.noRecommendedPack":
+    "لا يحتوي مستوى جهازك بعد على حزمة LLM محلية موصى بها. لا يزال بإمكانك تثبيت حزمة يدويًا من مدير النماذج.",
+  "welcome.error.packNotInRegistry":
+    "الحزمة الموصى بها '{packId}' ليست في سجل النماذج. افتح مدير النماذج لتثبيت حزمة يدويًا.",
   "welcome.phase.resolving": "جارٍ تحديد التوصية…",
   "welcome.phase.connecting": "جارٍ الاتصال…",
   "welcome.phase.downloading": "جارٍ التنزيل…",

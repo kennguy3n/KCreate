@@ -114,6 +114,10 @@ export const es: PartialMessages = {
   "welcome.verified": "Verificado {size}.",
   "welcome.unverified":
     "Instalado {size} (sin SHA-256 fijado en el registro; hash real {hash}…).",
+  "welcome.error.noRecommendedPack":
+    "El nivel de tu dispositivo aún no tiene un paquete de LLM local recomendado. Aún puedes instalar un paquete manualmente desde el Gestor de modelos.",
+  "welcome.error.packNotInRegistry":
+    "El paquete recomendado '{packId}' no está en el registro de modelos. Abre el Gestor de modelos para instalar un paquete manualmente.",
   "welcome.phase.resolving": "Resolviendo la recomendación…",
   "welcome.phase.connecting": "Conectando…",
   "welcome.phase.downloading": "Descargando…",

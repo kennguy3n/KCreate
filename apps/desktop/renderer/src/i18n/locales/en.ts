@@ -124,6 +124,10 @@ export const en = {
   "welcome.verified": "Verified {size}.",
   "welcome.unverified":
     "Installed {size} (no pinned SHA-256 in the registry; actual hash {hash}…).",
+  "welcome.error.noRecommendedPack":
+    "Your device tier does not have a recommended local LLM pack yet. You can still install a pack manually from Model Manager.",
+  "welcome.error.packNotInRegistry":
+    "Recommended pack '{packId}' is not in the model registry. Open Model Manager to install a pack manually.",
   "welcome.phase.resolving": "Resolving recommendation…",
   "welcome.phase.connecting": "Connecting…",
   "welcome.phase.downloading": "Downloading…",

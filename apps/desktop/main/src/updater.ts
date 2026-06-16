@@ -135,12 +135,24 @@ export function createUpdaterController(deps: UpdaterDeps): UpdaterController {
     emit();
   };
 
+  // Monotonic counter bumped by the persistent `error` handler below. It lets
+  // `runGuarded` detect whether the `error` event fired during a given
+  // operation without registering a per-call listener (which would churn —
+  // and, under overlapping calls, accumulate toward Node's
+  // `MaxListenersExceededWarning`).
+  let errorEpoch = 0;
+
   if (supported) {
     autoUpdater.on("checking-for-update", () => {
-      transition({ status: "checking", error: null });
+      transition({ status: "checking", progress: null, error: null });
     });
     autoUpdater.on("update-available", (info: BuilderUpdateInfo) => {
-      transition({ status: "available", info: toWireInfo(info), error: null });
+      transition({
+        status: "available",
+        info: toWireInfo(info),
+        progress: null,
+        error: null,
+      });
     });
     autoUpdater.on("update-not-available", (info: BuilderUpdateInfo) => {
       transition({
@@ -162,7 +174,8 @@ export function createUpdaterController(deps: UpdaterDeps): UpdaterController {
       });
     });
     autoUpdater.on("error", (err: Error) => {
-      transition({ status: "error", error: err.message });
+      errorEpoch += 1;
+      transition({ status: "error", progress: null, error: err.message });
     });
   }
 
@@ -171,25 +184,23 @@ export function createUpdaterController(deps: UpdaterDeps): UpdaterController {
   // handler above already turns into an error transition) and, in v6,
   // resolves rather than rejecting; the local catch is a safety net for an
   // unexpected synchronous throw. We suppress it when the `error` event
-  // already fired during this call so the renderer receives a single error
-  // transition instead of a redundant double push.
+  // already fired during this call — detected by comparing `errorEpoch`
+  // before/after — so the renderer receives a single error transition
+  // instead of a redundant double push. Snapshotting the epoch (rather than
+  // adding a temporary listener per call) keeps the listener count fixed
+  // even when calls overlap.
   const runGuarded = async (op: () => Promise<unknown>): Promise<UpdateState> => {
-    let sawErrorEvent = false;
-    const markErrorEvent = (): void => {
-      sawErrorEvent = true;
-    };
-    autoUpdater.on("error", markErrorEvent);
+    const epochAtStart = errorEpoch;
     try {
       await op();
     } catch (err) {
-      if (!sawErrorEvent) {
+      if (errorEpoch === epochAtStart) {
         transition({
           status: "error",
+          progress: null,
           error: err instanceof Error ? err.message : String(err),
         });
       }
-    } finally {
-      autoUpdater.removeListener("error", markErrorEvent);
     }
     return snapshot();
   };

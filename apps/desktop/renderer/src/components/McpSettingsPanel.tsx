@@ -15,7 +15,7 @@
 // tool call an agent makes surfaces here without the operator having to
 // reopen the panel.
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import type {
   McpPendingRequest,
@@ -171,7 +171,7 @@ export function McpSettingsPanel({
     [onStatus, refresh],
   );
 
-  const grouped = groupByClient(perms);
+  const grouped = useMemo(() => groupByClient(perms), [perms]);
 
   return (
     <div

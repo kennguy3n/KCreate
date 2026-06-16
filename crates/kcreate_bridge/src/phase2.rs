@@ -1928,6 +1928,14 @@ fn apply_plugin_proposals(
         // log (and undo history) untouched.
         if builder.touched_any() {
             let (before, after, affected) = builder.into_patches(&ws.project.document);
+            // Drop any selection entries this batch deleted (`after.remove`)
+            // before recording the op, mirroring the inline prune in
+            // `document_delete_node`. Without it a plugin that deletes a
+            // selected node would leave a ghost id in the selection, which a
+            // later `plugin_execute_on_selection` would feed back into the
+            // plugin input and the scene sync would paint a highlight over a
+            // node that no longer exists.
+            crate::document::prune_selection_for_removed(ws, &after.remove);
             let before_value = serde_json::to_value(&before)?;
             let after_value = serde_json::to_value(&after)?;
             ws.project.execute_operation(Operation::new(
@@ -5306,6 +5314,101 @@ mod ai_inference_tests {
             .max()
             .unwrap();
         assert_eq!(cover, 3, "top suggestion must cluster all three boxes");
+        project_close();
+    }
+
+    /// A plugin `DeleteNode` proposal that removes a currently-selected
+    /// node must prune that id from the workspace selection, exactly as
+    /// the `document_delete_node` helper does — otherwise
+    /// `document_get_selection` would hand a later
+    /// `plugin_execute_on_selection` (and the scene-sync highlight pass)
+    /// a ghost id pointing at a node that no longer exists. The
+    /// undo/redo replay path is covered too: undo restores the node
+    /// (a restored node is not auto-reselected) and redo re-removes it
+    /// without leaving a stale selection entry, proving the
+    /// `apply_patch` arm prunes in both directions.
+    #[test]
+    #[serial]
+    fn plugin_delete_proposal_prunes_selection() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("plugin-delete-selection", dir.path()).expect("project");
+
+        // One artboard with a single child; the child is what we select.
+        let child_id = with_workspace_mut(|ws| {
+            let mut art = Node::new(NodeType::Artboard, "Frame");
+            art.bounds = Bounds {
+                x: 0.0,
+                y: 0.0,
+                width: 400.0,
+                height: 300.0,
+            };
+            let art_id = ws.project.document.insert_node(art)?;
+            let mut child = Node::new(NodeType::VectorLayer, "Box");
+            child.parent_id = Some(art_id);
+            child.bounds = Bounds {
+                x: 10.0,
+                y: 10.0,
+                width: 40.0,
+                height: 40.0,
+            };
+            let child_id = ws.project.document.insert_node(child)?;
+            Ok::<Uuid, DocumentBridgeError>(child_id)
+        })
+        .expect("seed document");
+
+        crate::document::document_set_selection(vec![child_id]).expect("select child");
+        assert_eq!(
+            crate::document::document_get_selection().expect("selection"),
+            vec![child_id],
+            "child is selected before the plugin runs"
+        );
+
+        // A plugin proposes deleting the selected child; the batch folds
+        // into one undoable `plugin_apply_proposals` operation.
+        let reports = apply_plugin_proposals(
+            "com.kcreate.test.delete",
+            vec![kcreate_plugin::ProposedMutation::DeleteNode { node_id: child_id }],
+        );
+        assert_eq!(reports.len(), 1);
+        assert!(
+            matches!(reports[0].outcome, ProposalOutcome::Applied { .. }),
+            "delete proposal applied: {:?}",
+            reports[0].outcome
+        );
+
+        assert!(
+            crate::document::document_get_selection()
+                .expect("selection")
+                .is_empty(),
+            "deleting the selected node must leave no stale selection entry"
+        );
+        assert!(
+            with_workspace(|ws| Ok(!ws.project.document.contains(child_id))).expect("contains"),
+            "child node is gone from the graph"
+        );
+
+        // Undo restores the node through the `apply_patch` replay path.
+        crate::document::document_undo().expect("undo");
+        assert!(
+            with_workspace(|ws| Ok(ws.project.document.contains(child_id))).expect("contains"),
+            "undo restores the deleted child"
+        );
+
+        // Re-select, then redo removes it again — the replay arm must
+        // prune in the redo direction too, leaving a clean selection.
+        crate::document::document_set_selection(vec![child_id]).expect("reselect");
+        crate::document::document_redo().expect("redo");
+        assert!(
+            crate::document::document_get_selection()
+                .expect("selection")
+                .is_empty(),
+            "redo re-removing the node prunes the selection again"
+        );
+        assert!(
+            with_workspace(|ws| Ok(!ws.project.document.contains(child_id))).expect("contains"),
+            "redo removes the child again"
+        );
         project_close();
     }
 

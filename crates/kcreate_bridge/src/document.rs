@@ -274,6 +274,27 @@ pub(crate) fn with_workspace_mut_synced<R>(
     Ok(out)
 }
 
+/// Drop any selection entries naming a node in `removed`.
+///
+/// Used by batch paths that delete nodes *outside* the
+/// [`document_delete_node`] helper — namely a plugin `DeleteNode`
+/// proposal folded into one `plugin_apply_proposals` operation (see
+/// `crate::phase2::apply_plugin_proposals`) and that operation's
+/// undo/redo replay in [`apply_patch`]. It mirrors the inline
+/// `ws.selection.retain` that `document_delete_node` performs so the
+/// host never feeds a ghost id into a later
+/// `plugin_execute_on_selection` or paints a selection highlight over a
+/// node that no longer exists. Lives here (rather than in `phase2`)
+/// because `Workspace::selection` is private to this module. A no-op
+/// when `removed` is empty — the common case, since most plugin batches
+/// only move or recolor.
+pub(crate) fn prune_selection_for_removed(ws: &mut Workspace, removed: &[Uuid]) {
+    if removed.is_empty() {
+        return;
+    }
+    ws.selection.retain(|sel| !removed.contains(sel));
+}
+
 /// Load a blob by hash from the open workspace's content-addressed
 /// store. Pulled out so `phase2.rs` does not need to know about the
 /// `ProjectStore` API surface.
@@ -2670,9 +2691,14 @@ fn apply_patch(ws: &mut Workspace, op: &Operation, patch: &serde_json::Value) ->
         // `ai_*_themed_design` reversible-subtree arm above.
         "plugin_apply_proposals" => {
             let parsed: PluginApplyPatch = serde_json::from_value(patch.clone())?;
-            for id in parsed.remove {
-                ws.project.document.remove_node(id);
+            for id in &parsed.remove {
+                ws.project.document.remove_node(*id);
             }
+            // Keep the selection consistent with the graph on every
+            // replay direction: whichever patch is being applied, its
+            // `remove` set names the nodes leaving the document, so
+            // prune them exactly as the live apply path does.
+            prune_selection_for_removed(ws, &parsed.remove);
             for node in parsed.upsert {
                 let id = node.id;
                 if ws.project.document.get_node(id).is_some() {
@@ -2689,17 +2715,33 @@ fn apply_patch(ws: &mut Workspace, op: &Operation, patch: &serde_json::Value) ->
                     // which is sound only while no proposal type
                     // reparents a node — none of the four
                     // (`CreateNode`/`UpdateNode`/`MoveNode`/`DeleteNode`)
-                    // do. The debug assertion below pins that invariant:
-                    // if a future `ReparentNode` lands, it fires in debug
-                    // builds so the replay is reworked to update the
-                    // affected `children` lists rather than silently
+                    // do. The guard below pins that invariant in every
+                    // build, mirroring the default arm at the bottom of
+                    // this match: debug builds panic so a future
+                    // `ReparentNode` trips CI, and release builds log and
+                    // preserve the live parent/children wiring (applying
+                    // only the node's other fields) rather than silently
                     // corrupting the graph.
                     if let Some(existing) = ws.project.document.get_node_mut(id) {
                         debug_assert_eq!(
                             existing.parent_id, node.parent_id,
                             "plugin_apply_proposals overwrite must not reparent {id}"
                         );
-                        *existing = node;
+                        if existing.parent_id == node.parent_id {
+                            *existing = node;
+                        } else {
+                            log::error!(
+                                "plugin_apply_proposals overwrite would reparent \
+                                 {id} ({:?} -> {:?}); preserving live graph wiring",
+                                existing.parent_id,
+                                node.parent_id
+                            );
+                            let keep_parent = existing.parent_id;
+                            let keep_children = std::mem::take(&mut existing.children);
+                            *existing = node;
+                            existing.parent_id = keep_parent;
+                            existing.children = keep_children;
+                        }
                         existing.touch();
                     }
                 } else {

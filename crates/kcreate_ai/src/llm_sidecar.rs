@@ -985,7 +985,7 @@ mod tests {
         std::fs::write(&model, b"0").expect("write");
 
         // Drive the lifecycle manually: spawn a tiny_http server on
-        // the port we picked, then wait_for_health succeeds.
+        // an OS-assigned loopback port, then wait_for_health succeeds.
         let server = tiny_http::Server::http("127.0.0.1:0").expect("server");
         let port = server
             .server_addr()

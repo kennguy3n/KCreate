@@ -44,6 +44,35 @@ type PresentFrameNapi = {
   bytes: Uint8Array;
 };
 
+// `renderer_shared_present_enable` / `renderer_shared_present_descriptor`
+// return an `#[napi(object)] SharedPresentDescriptor`, so the Rust field
+// identifiers are auto-camelCased: `slot_count` → `slotCount`. This is the
+// one-time handshake payload the renderer process needs to map the
+// shared-memory present ring.
+type SharedPresentDescriptorNapi = {
+  path: string;
+  len: number;
+  width: number;
+  height: number;
+  slotCount: number;
+};
+
+// `renderer_shared_reader_read_into` returns an `#[napi(object)]
+// SharedPresentFrame` (auto-camelCased: `frame_id` → `frameId`, `dirty_x` →
+// `dirtyX`) or `null`. There is no `bytes` field: the pixels were written in
+// place into the `Buffer` the caller passed, so the metadata describes a
+// copy that already landed in the host's ImageData backing buffer.
+type SharedPresentFrameNapi = {
+  frameId: number;
+  width: number;
+  height: number;
+  dirtyX: number;
+  dirtyY: number;
+  dirtyWidth: number;
+  dirtyHeight: number;
+  full: boolean;
+};
+
 // `ProjectInfoSnake` / `NodeInfoSnake` / `RuntimeStatusSnake` /
 // `DocumentStatusSnake` mirror the `#[napi(object)]` structs of the same
 // stem in `crates/kcreate_bridge/src/lib.rs`. As with `UndoRedoOutcome`
@@ -202,6 +231,8 @@ export type {
   FrameInfoNapi,
   AcquiredFrameNapi,
   PresentFrameNapi,
+  SharedPresentDescriptorNapi,
+  SharedPresentFrameNapi,
   ProjectInfoSnake,
   NodeInfoSnake,
   BoundsSnake,
@@ -254,6 +285,33 @@ export interface Bridge {
     height: number,
   ): string;
   rendererSwitchOffscreen(): void;
+
+  // Shared-memory present handoff (push past the dirty-rect IPC ceiling).
+  //
+  // The publisher functions run in the MAIN process (where the renderer
+  // and its framebuffer live); the reader functions run in the RENDERER
+  // process against a bridge `.node` the preload `process.dlopen`s
+  // locally, so per-frame reads never cross IPC. All error/​no-op
+  // gracefully when the bridge was built without the `native_canvas`
+  // feature: `rendererSharedPresentEnable` / `rendererSharedReaderOpen`
+  // throw a "feature not compiled in" error, the getters return `null`,
+  // and the booleans return `false` — the host then stays on the
+  // dirty-rect IPC path.
+  rendererSharedPresentEnable(
+    width: number,
+    height: number,
+  ): SharedPresentDescriptorNapi;
+  rendererSharedPresentDescriptor(): SharedPresentDescriptorNapi | null;
+  rendererSharedPresentEnabled(): boolean;
+  rendererSharedPresentDisable(): void;
+  rendererSharedReaderOpen(descriptor: SharedPresentDescriptorNapi): void;
+  rendererSharedReaderFrameLen(): number | null;
+  rendererSharedReaderIsOpen(): boolean;
+  rendererSharedReaderReadInto(
+    since: number | null,
+    dest: Buffer | Uint8Array,
+  ): SharedPresentFrameNapi | null;
+  rendererSharedReaderClose(): void;
 
   // Document / project lifecycle
   projectCreate(name: string, dir: string): ProjectInfoSnake;
@@ -1681,8 +1739,15 @@ export function normalizeBridgeErrors(raw: Bridge): Bridge {
   }) as Bridge;
 }
 
-export function loadBridge(ctx?: BridgeResolveContext): Bridge {
-  const binaryPath = bridgeBinaryPath(ctx);
+/**
+ * `process.dlopen` the cdylib at an explicit path and wrap it in the same
+ * capability layers as {@link loadBridge}. Split out so the preload can load
+ * a SECOND, renderer-process-local instance of the bridge — using a path the
+ * main process resolved and forwarded — to drive the shared-memory present
+ * reader without any per-frame IPC. The renderer-local instance has its own
+ * process-global reader slot, independent of the main process's publisher.
+ */
+export function loadBridgeFromPath(binaryPath: string): Bridge {
   // `process.dlopen` lets us load a raw shared library that does not end
   // in `.node`. The Node.js loader populates `module.exports` with the
   // napi-rs addon's exports.
@@ -1707,4 +1772,8 @@ export function loadBridge(ctx?: BridgeResolveContext): Bridge {
   return normalizeBridgeErrors(
     applyCollabFallbacks(moduleStub.exports as Partial<Bridge>),
   );
+}
+
+export function loadBridge(ctx?: BridgeResolveContext): Bridge {
+  return loadBridgeFromPath(bridgeBinaryPath(ctx));
 }

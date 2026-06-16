@@ -234,6 +234,31 @@ fn render_table(rows: &[Row]) -> String {
          copy + IPC + putImageData payload drops from the whole framebuffer to a \
          few KiB.\n",
     );
+
+    // Full-frame churn (pan / zoom / scroll) is the case the dirty-rect
+    // path *cannot* shrink: every pixel moves, so the dirty rect
+    // degenerates to the whole framebuffer and the IPC payload is back to
+    // `width*height*4`. That is exactly the per-frame structured-clone the
+    // shared-memory present path eliminates — the renderer process maps the
+    // framebuffer ring and reads it directly, moving 0 bytes over IPC. See
+    // `crates/kcreate_bridge/benches/shared_present_dense.rs` for the
+    // publish/read timings.
+    let full_frame_bytes = WIDTH as usize * HEIGHT as usize * 4;
+    let _ = write!(
+        s,
+        "\n## Full-frame churn (pan / zoom / scroll)\n\n\
+         When the whole frame changes, the dirty rect is the entire \
+         {w}x{h} surface, so the dirty-rect path degenerates to a full \
+         present: **{bytes} per frame** over IPC. The shared-memory present \
+         path maps that framebuffer into the renderer process and reads it \
+         directly — **0 bytes over IPC per frame** — so present cost stops \
+         scaling with the serialized payload. At 60 fps that is \
+         {per_sec:.0} MB/s of IPC traffic removed from the critical path.\n",
+        w = WIDTH,
+        h = HEIGHT,
+        bytes = fmt_bytes(full_frame_bytes),
+        per_sec = (full_frame_bytes as f64 * 60.0) / (1000.0 * 1000.0),
+    );
     s
 }
 

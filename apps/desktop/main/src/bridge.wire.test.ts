@@ -26,6 +26,8 @@ import type {
   FrameInfoNapi,
   AcquiredFrameNapi,
   PresentFrameNapi,
+  SharedPresentDescriptorNapi,
+  SharedPresentFrameNapi,
   ProjectInfoSnake,
   NodeInfoSnake,
   RuntimeStatusSnake,
@@ -37,6 +39,8 @@ import type {
   FrameInfo,
   AcquiredFrame,
   PresentFrame,
+  SharedPresentDescriptor,
+  SharedPresentFrame,
   ProjectInfo,
   NodeInfo,
   RuntimeStatus,
@@ -66,6 +70,16 @@ expectAssignable<AcquiredFrame>({} as AcquiredFrameNapi);
 // `putImageData` in CanvasHost) stops compiling here.
 expectAssignable<PresentFrame>({} as PresentFrameNapi);
 expectAssignable<PresentFrameNapi>({} as PresentFrame);
+// Shared-memory present handoff: the `SharedPresentDescriptor` handshake
+// payload emits `slotCount`, and the `SharedPresentFrame` read result emits
+// `frameId` / `dirtyX` / `dirtyWidth` / `dirtyHeight`. A regression to
+// `slot_count` / `frame_id` / `dirty_x` would silently mis-map the mmap
+// geometry or the per-frame metadata, so both DTOs are guarded in both
+// directions.
+expectAssignable<SharedPresentDescriptor>({} as SharedPresentDescriptorNapi);
+expectAssignable<SharedPresentDescriptorNapi>({} as SharedPresentDescriptor);
+expectAssignable<SharedPresentFrame>({} as SharedPresentFrameNapi);
+expectAssignable<SharedPresentFrameNapi>({} as SharedPresentFrame);
 expectAssignable<ProjectInfo>({} as ProjectInfoSnake);
 expectAssignable<RuntimeStatus>({} as RuntimeStatusSnake);
 expectAssignable<DocumentStatus>({} as DocumentStatusSnake);

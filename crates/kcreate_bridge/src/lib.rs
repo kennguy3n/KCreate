@@ -43,6 +43,8 @@ pub mod phase8;
 pub mod phase9;
 pub mod raster_ops;
 pub mod scene_sync;
+#[cfg(feature = "native_canvas")]
+pub mod shared_present;
 pub mod state;
 pub mod thumbnails;
 pub mod vector_ops;
@@ -460,6 +462,259 @@ pub fn renderer_switch_offscreen() {
     #[cfg(feature = "native_canvas")]
     {
         state::switch_offscreen();
+    }
+}
+
+// =============================================================================
+// Shared-memory present handoff — push past the dirty-rect IPC ceiling.
+//
+// Full-frame churn (pan / zoom / scroll) still moves the whole
+// `width * height * 4` framebuffer across the main → renderer IPC boundary
+// every frame via a structured-clone copy. These exports let the host map a
+// tmpfs-backed framebuffer ring once (the publisher writes each rendered
+// full frame under a seqlock) and read the latest frame straight into an
+// `ImageData` backing buffer from the renderer process — zero bytes over
+// IPC per frame.
+//
+// Always exported (same rationale as the native-canvas surface): in default
+// builds `enable` / `reader_open` error with a "feature not compiled in"
+// message, the descriptor getters return `null`, the booleans return
+// `false`, and `read_into` returns `null`, so the host always has the
+// methods and `CanvasHost` cleanly falls back to the dirty-rect IPC path.
+// =============================================================================
+
+/// Handshake descriptor for the shared-memory present ring. The main
+/// process creates the ring via [`renderer_shared_present_enable`] and ships
+/// this to the renderer process, which maps the same file via
+/// [`renderer_shared_reader_open`]. Field names emit to JS as camelCase
+/// (`slotCount`). Mirrors `state::SharedPresentDescriptor` and the
+/// `SharedPresentDescriptor` interface in `apps/desktop/shared/scene.ts`.
+#[napi(object)]
+#[derive(Debug, Clone)]
+pub struct SharedPresentDescriptor {
+    pub path: String,
+    /// Byte length of the whole mapped region. A JS `number` (f64) carries
+    /// it exactly for any realistic canvas (well under 2^53).
+    pub len: f64,
+    pub width: u32,
+    pub height: u32,
+    pub slot_count: u32,
+}
+
+#[cfg(feature = "native_canvas")]
+impl From<state::SharedPresentDescriptor> for SharedPresentDescriptor {
+    fn from(d: state::SharedPresentDescriptor) -> Self {
+        Self {
+            path: d.path,
+            len: d.len as f64,
+            width: d.width,
+            height: d.height,
+            slot_count: d.slot_count,
+        }
+    }
+}
+
+#[cfg(feature = "native_canvas")]
+impl From<SharedPresentDescriptor> for state::SharedPresentDescriptor {
+    fn from(d: SharedPresentDescriptor) -> Self {
+        Self {
+            path: d.path,
+            len: d.len as u64,
+            width: d.width,
+            height: d.height,
+            slot_count: d.slot_count,
+        }
+    }
+}
+
+/// Metadata for a shared-memory frame copied into the caller's buffer. No
+/// `bytes` field — the pixels were written in place into the `Buffer` the
+/// caller passed to [`renderer_shared_reader_read_into`]. Field names emit
+/// to JS as camelCase (`frameId`, `dirtyX`, …); mirrors the
+/// `SharedPresentFrame` interface in `apps/desktop/shared/scene.ts`.
+#[napi(object)]
+#[derive(Debug, Clone)]
+pub struct SharedPresentFrame {
+    pub frame_id: u32,
+    pub width: u32,
+    pub height: u32,
+    pub dirty_x: u32,
+    pub dirty_y: u32,
+    pub dirty_width: u32,
+    pub dirty_height: u32,
+    pub full: bool,
+}
+
+#[cfg(feature = "native_canvas")]
+impl From<crate::shared_present::SharedFrameMeta> for SharedPresentFrame {
+    fn from(m: crate::shared_present::SharedFrameMeta) -> Self {
+        Self {
+            frame_id: m.frame_id as u32,
+            width: m.width,
+            height: m.height,
+            dirty_x: m.dirty_x,
+            dirty_y: m.dirty_y,
+            dirty_width: m.dirty_width,
+            dirty_height: m.dirty_height,
+            full: m.full,
+        }
+    }
+}
+
+/// Enable (or re-handshake) the shared-memory present ring at the given
+/// framebuffer geometry and return the descriptor the renderer process
+/// needs to map it. Idempotent at a fixed geometry; a geometry change
+/// rebuilds the ring. The renderer must already be initialized.
+///
+/// Errors with a `feature not compiled in` message in default builds; the
+/// host treats that as a signal to stay on the dirty-rect IPC path.
+#[napi]
+#[allow(unused_variables)]
+pub fn renderer_shared_present_enable(
+    width: u32,
+    height: u32,
+) -> NapiResult<SharedPresentDescriptor> {
+    #[cfg(feature = "native_canvas")]
+    {
+        state::shared_present_enable(width, height)
+            .map(Into::into)
+            .map_err(map_err)
+    }
+    #[cfg(not(feature = "native_canvas"))]
+    {
+        Err(napi::Error::from_reason(
+            "renderer_shared_present_enable: bridge was compiled without the `native_canvas` \
+             feature; shared-memory present is unavailable. Stay on the dirty-rect IPC path."
+                .to_string(),
+        ))
+    }
+}
+
+/// Current shared-present descriptor, or `null` when the ring is disabled
+/// (always `null` in default builds).
+#[napi]
+pub fn renderer_shared_present_descriptor() -> Option<SharedPresentDescriptor> {
+    #[cfg(feature = "native_canvas")]
+    {
+        state::shared_present_descriptor().map(Into::into)
+    }
+    #[cfg(not(feature = "native_canvas"))]
+    {
+        None
+    }
+}
+
+/// Whether a shared-memory publisher is currently attached (always `false`
+/// in default builds).
+#[napi]
+#[must_use]
+pub fn renderer_shared_present_enabled() -> bool {
+    #[cfg(feature = "native_canvas")]
+    {
+        state::shared_present_enabled()
+    }
+    #[cfg(not(feature = "native_canvas"))]
+    {
+        false
+    }
+}
+
+/// Disable the shared-memory present ring and unlink its backing file.
+/// No-op in default builds and when already disabled.
+#[napi]
+pub fn renderer_shared_present_disable() {
+    #[cfg(feature = "native_canvas")]
+    {
+        state::shared_present_disable();
+    }
+}
+
+/// Open the shared-memory reader (renderer process) against a descriptor the
+/// main process produced via [`renderer_shared_present_enable`]. Replaces any
+/// previously opened reader (e.g. after a resize re-handshake).
+///
+/// Errors with a `feature not compiled in` message in default builds.
+#[napi]
+#[allow(unused_variables, clippy::needless_pass_by_value)]
+pub fn renderer_shared_reader_open(descriptor: SharedPresentDescriptor) -> NapiResult<()> {
+    #[cfg(feature = "native_canvas")]
+    {
+        state::shared_reader_open(&descriptor.into()).map_err(map_err)
+    }
+    #[cfg(not(feature = "native_canvas"))]
+    {
+        Err(napi::Error::from_reason(
+            "renderer_shared_reader_open: bridge was compiled without the `native_canvas` \
+             feature; shared-memory present is unavailable. Stay on the dirty-rect IPC path."
+                .to_string(),
+        ))
+    }
+}
+
+/// Pixel length (`width * height * 4`) of a frame in the currently open
+/// reader, or `null` when no reader is open. Lets the host size its
+/// `ImageData` backing buffer before the first read.
+#[napi]
+pub fn renderer_shared_reader_frame_len() -> Option<u32> {
+    #[cfg(feature = "native_canvas")]
+    {
+        state::shared_reader_frame_len().map(|n| n as u32)
+    }
+    #[cfg(not(feature = "native_canvas"))]
+    {
+        None
+    }
+}
+
+/// Whether a shared-memory reader is currently open (always `false` in
+/// default builds).
+#[napi]
+#[must_use]
+pub fn renderer_shared_reader_is_open() -> bool {
+    #[cfg(feature = "native_canvas")]
+    {
+        state::shared_reader_open_status()
+    }
+    #[cfg(not(feature = "native_canvas"))]
+    {
+        false
+    }
+}
+
+/// Read the newest shared-memory frame into `dest` (the caller's reusable
+/// `ImageData` backing buffer), skipping the copy when the newest frame id
+/// is not newer than `since`. Returns the frame metadata on a fresh copy,
+/// `null` when nothing newer is available or no reader is open.
+///
+/// The pixels are written *in place* into `dest` (a `Buffer` viewing the
+/// `ImageData`'s `ArrayBuffer`), so this is the single shared-ring →
+/// `ImageData` memcpy of the whole present pipeline — performed in the
+/// renderer process with zero IPC. Always `null` in default builds.
+#[napi]
+#[allow(unused_variables, unused_mut, clippy::needless_pass_by_value)]
+pub fn renderer_shared_reader_read_into(
+    since: Option<u32>,
+    mut dest: Buffer,
+) -> NapiResult<Option<SharedPresentFrame>> {
+    #[cfg(feature = "native_canvas")]
+    {
+        let meta =
+            state::shared_reader_read_into(since.map(u64::from), dest.as_mut()).map_err(map_err)?;
+        Ok(meta.map(Into::into))
+    }
+    #[cfg(not(feature = "native_canvas"))]
+    {
+        Ok(None)
+    }
+}
+
+/// Close the shared-memory reader. No-op in default builds and when none is
+/// open.
+#[napi]
+pub fn renderer_shared_reader_close() {
+    #[cfg(feature = "native_canvas")]
+    {
+        state::shared_reader_close();
     }
 }
 

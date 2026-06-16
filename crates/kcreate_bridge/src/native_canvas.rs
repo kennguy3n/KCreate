@@ -351,6 +351,109 @@ pub fn wrap_handle(bytes: &[u8]) -> Result<Arc<PlatformHandle>, NativeCanvasErro
     Ok(Arc::new(handle_from_bytes(bytes)?))
 }
 
+// -----------------------------------------------------------------------------
+// Memory-mapped region wrappers — shared-memory frame handoff.
+//
+// `memmap2::MmapOptions::map` / `map_mut` are `unsafe fn` because the
+// kernel mapping aliases a file whose bytes another process could
+// concurrently change in ways the Rust abstract machine cannot model.
+// These two wrappers are the **only** new `unsafe` in the shared-memory
+// present path; every higher layer (`shared_present.rs`) operates purely
+// on the safe `&[u8]` / `&mut [u8]` views handed out here, so the unsafe
+// surface stays pinned inside this module behind the `native_canvas`
+// feature, exactly as the crate's `unsafe_code` policy requires.
+//
+// Safety contract shared by both wrappers:
+//
+// - The mapping length is fixed to `len` (the length the file was
+//   `set_len`'d to by [`MappedRegion::create`]). The publisher never
+//   truncates or grows the file while a mapping is live, so the mapped
+//   pages stay backed for the whole lifetime of the wrapper.
+// - We hand out byte slices only; callers (`shared_present.rs`) read and
+//   write through a single-writer / many-reader **seqlock**, so a reader
+//   that observes a half-written frame retries rather than acting on torn
+//   bytes. Tearing therefore degrades to a retry, never to UB.
+// - The wrapper owns the mapping; dropping it unmaps. The backing
+//   `File` is kept alive alongside the mapping by the owners in
+//   `shared_present.rs` (Windows keeps the mapping valid via a duplicated
+//   handle, but holding the `File` is belt-and-suspenders on every OS).
+
+use std::fs::File;
+use std::io;
+
+use memmap2::{Mmap, MmapMut, MmapOptions};
+
+/// A writable shared-memory mapping (publisher side).
+#[derive(Debug)]
+pub struct MappedRegion {
+    mmap: MmapMut,
+}
+
+impl MappedRegion {
+    /// Map `file` (already `set_len`'d to `len`) read-write.
+    pub fn create(file: &File, len: usize) -> io::Result<Self> {
+        // SAFETY: see the module-level contract above. `file` is owned
+        // by the publisher, sized to exactly `len`, and never truncated
+        // while this mapping is live; all access goes through the
+        // seqlock in `shared_present.rs`.
+        let mmap = unsafe { MmapOptions::new().len(len).map_mut(file)? };
+        Ok(Self { mmap })
+    }
+
+    #[must_use]
+    pub fn as_slice(&self) -> &[u8] {
+        &self.mmap
+    }
+
+    #[must_use]
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        &mut self.mmap
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.mmap.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.mmap.is_empty()
+    }
+}
+
+/// A read-only shared-memory mapping (reader side).
+#[derive(Debug)]
+pub struct MappedRegionRo {
+    mmap: Mmap,
+}
+
+impl MappedRegionRo {
+    /// Map `file` read-only over `len` bytes.
+    pub fn open(file: &File, len: usize) -> io::Result<Self> {
+        // SAFETY: see the module-level contract above. The reader opens
+        // the publisher's file read-only; the publisher guarantees the
+        // file is sized to `len` and is never truncated while readers
+        // hold a mapping, and all reads go through the seqlock retry.
+        let mmap = unsafe { MmapOptions::new().len(len).map(file)? };
+        Ok(Self { mmap })
+    }
+
+    #[must_use]
+    pub fn as_slice(&self) -> &[u8] {
+        &self.mmap
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.mmap.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.mmap.is_empty()
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 mod tests {

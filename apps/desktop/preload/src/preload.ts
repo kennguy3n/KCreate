@@ -4,6 +4,8 @@
 
 import { contextBridge, ipcRenderer } from "electron";
 
+import { loadBridgeFromPath, type Bridge } from "../../main/src/bridge";
+
 import type {
   AcquiredFrame,
   AiBridge,
@@ -74,6 +76,8 @@ import type {
   StrokeStyleWire,
   FrameInfo,
   PresentFrame,
+  SharedPresentDescriptor,
+  SharedPresentRead,
   InspectCode,
   JpegExportOptions,
   LayerNamingResult,
@@ -310,6 +314,49 @@ type PresentFrameNapi = {
   bytes: Uint8Array;
 };
 
+// Renderer-process-local bridge instance backing the zero-IPC shared-memory
+// present reader. The main-process bridge owns the publisher; this second
+// instance — `process.dlopen`'d here in the renderer process via a path the
+// main process resolves — owns the reader, so per-frame reads never cross
+// IPC. `undefined` = not yet attempted; `null` = attempted and unavailable
+// (no resolvable path, `dlopen` failed, or the bridge was built without the
+// `native_canvas` feature). On any of those the host stays on the dirty-rect
+// IPC path.
+let readerBridge: Bridge | null | undefined;
+
+function rendererReaderBridge(): Bridge | null {
+  if (readerBridge !== undefined) {
+    return readerBridge;
+  }
+  readerBridge = null;
+  try {
+    const modulePath: unknown = ipcRenderer.sendSync(
+      "kcreate/renderer/bridgeModulePath",
+    );
+    if (typeof modulePath === "string" && modulePath.length > 0) {
+      readerBridge = loadBridgeFromPath(modulePath);
+    }
+  } catch {
+    readerBridge = null;
+  }
+  return readerBridge;
+}
+
+// Reusable destination the reader copies the mapped framebuffer into. A real
+// Node `Buffer` (not a renderer `Uint8Array`) so the N-API `Buffer` argument
+// resolves to the underlying memory. Grown on demand and reused across frames
+// so the steady-state present path does zero per-frame allocation; the
+// `bytes` view handed back to the renderer is consumed synchronously before
+// the next read.
+let readerBuffer: Buffer | null = null;
+
+function readerDest(len: number): Buffer {
+  if (!readerBuffer || readerBuffer.length < len) {
+    readerBuffer = Buffer.allocUnsafe(len);
+  }
+  return readerBuffer;
+}
+
 const renderer: RendererBridge = {
   async init(width, height): Promise<RendererInfo> {
     return (await ipcRenderer.invoke(
@@ -469,6 +516,83 @@ const renderer: RendererBridge = {
   },
   async switchOffscreen(): Promise<void> {
     await ipcRenderer.invoke("kcreate/renderer/switchOffscreen");
+  },
+  async sharedPresentEnable(
+    width,
+    height,
+  ): Promise<SharedPresentDescriptor | null> {
+    return (await ipcRenderer.invoke(
+      "kcreate/renderer/sharedPresent/enable",
+      width,
+      height,
+    )) as SharedPresentDescriptor | null;
+  },
+  async sharedPresentDisable(): Promise<void> {
+    await ipcRenderer.invoke("kcreate/renderer/sharedPresent/disable");
+  },
+  sharedReaderOpen(descriptor): boolean {
+    const local = rendererReaderBridge();
+    if (!local) return false;
+    try {
+      local.rendererSharedReaderOpen(descriptor);
+      return local.rendererSharedReaderIsOpen();
+    } catch {
+      return false;
+    }
+  },
+  sharedReaderRead(since): SharedPresentRead | null {
+    const local = rendererReaderBridge();
+    if (!local) return null;
+    let frameLen: number | null;
+    try {
+      frameLen = local.rendererSharedReaderFrameLen();
+    } catch {
+      return null;
+    }
+    if (frameLen === null || frameLen <= 0) return null;
+    const dest = readerDest(frameLen);
+    let meta;
+    try {
+      meta = local.rendererSharedReaderReadInto(since, dest);
+    } catch {
+      return null;
+    }
+    if (!meta) return null;
+    // Plain Uint8Array view over the preload buffer (no Node-specific Buffer
+    // methods leak to the renderer). Reused next call, so the host consumes
+    // it synchronously.
+    const bytes = new Uint8Array(dest.buffer, dest.byteOffset, frameLen);
+    return {
+      meta: {
+        frameId: meta.frameId,
+        width: meta.width,
+        height: meta.height,
+        dirtyX: meta.dirtyX,
+        dirtyY: meta.dirtyY,
+        dirtyWidth: meta.dirtyWidth,
+        dirtyHeight: meta.dirtyHeight,
+        full: meta.full,
+      },
+      bytes,
+    };
+  },
+  sharedReaderIsOpen(): boolean {
+    const local = rendererReaderBridge();
+    if (!local) return false;
+    try {
+      return local.rendererSharedReaderIsOpen();
+    } catch {
+      return false;
+    }
+  },
+  sharedReaderClose(): void {
+    // Only touch an already-loaded reader; don't `dlopen` just to close.
+    if (!readerBridge) return;
+    try {
+      readerBridge.rendererSharedReaderClose();
+    } catch {
+      // Best-effort: a missing/feature-off reader has nothing to close.
+    }
   },
 };
 

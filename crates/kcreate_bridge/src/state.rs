@@ -23,6 +23,11 @@ pub enum BridgeError {
     Wire(#[from] WireError),
     #[error(transparent)]
     Renderer(#[from] kcreate_renderer::RendererError),
+    /// Shared-memory present path failure (mmap, bad descriptor,
+    /// geometry mismatch). Only reachable in `native_canvas` builds.
+    #[cfg(feature = "native_canvas")]
+    #[error(transparent)]
+    SharedPresent(#[from] crate::shared_present::SharedPresentError),
 }
 
 pub type Result<T> = std::result::Result<T, BridgeError>;
@@ -88,6 +93,11 @@ pub fn shutdown() {
     #[cfg(feature = "native_canvas")]
     {
         *native_slot().lock() = None;
+        // Tear down the shared-memory present ring (publisher unlinks
+        // its tmpfs file on drop) and any local reader. Acquire-then-drop,
+        // co-holding nothing else, so the canonical lock order is safe.
+        *shared_present_slot().lock() = None;
+        *shared_reader_slot().lock() = None;
     }
     *slot().lock() = None;
     *scene_slot().lock() = None;
@@ -100,6 +110,8 @@ pub(crate) fn reset_for_tests() {
     #[cfg(feature = "native_canvas")]
     {
         *native_slot().lock() = None;
+        *shared_present_slot().lock() = None;
+        *shared_reader_slot().lock() = None;
     }
     *slot().lock() = None;
     *scene_slot().lock() = None;
@@ -147,6 +159,13 @@ pub fn resize(width: u32, height: u32) -> Result<()> {
     // builds skip this branch entirely.
     #[cfg(feature = "native_canvas")]
     {
+        // The shared-memory ring is sized to the old framebuffer
+        // geometry, so a resize invalidates its descriptor. Drop the
+        // publisher (its tmpfs file is unlinked on drop); the host
+        // re-handshakes via `shared_present_enable` at the new size and
+        // `CanvasHost` re-opens the reader. Until then the present path
+        // falls back to dirty-rect IPC — no stale-geometry frames.
+        *shared_present_slot().lock() = None;
         let mut native = native_slot().lock();
         if let Some(surface) = native.as_mut() {
             match ctx.resize_native_surface(surface, width, height) {
@@ -268,6 +287,15 @@ pub fn render_scene(scene: Scene) -> Result<FrameId> {
     // deadlock; the lock order is `slot -> scene_slot` and never the
     // reverse (`current_scene()` only takes `scene_slot`).
     *scene_slot().lock() = Some(scene);
+    // Mirror the freshly published full frame into the shared-memory
+    // ring when a publisher is attached (offscreen path only — the
+    // native branch returned above). No-op in default builds and when
+    // shared present is disabled, so the dirty-rect IPC path is
+    // untouched. The `slot` guard is still held; `scene_slot` was
+    // released at the statement above, so we acquire only the innermost
+    // `shared_present_slot` here.
+    #[cfg(feature = "native_canvas")]
+    publish_shared_locked(ctx, id);
     drop(guard);
     Ok(id)
 }
@@ -375,7 +403,17 @@ fn render_cached_scene_locked(ctx: &RenderContext) -> Result<Option<FrameId>> {
     }
     let scene_guard = scene_slot().lock();
     match scene_guard.as_ref() {
-        Some(scene) => Ok(Some(ctx.render_frame(scene)?)),
+        Some(scene) => {
+            let id = ctx.render_frame(scene)?;
+            // Publish into the shared-memory ring on the pan/zoom hot
+            // path too (the full-frame-churn case the shared path
+            // targets). `scene_slot` is held here, so this acquires the
+            // strictly-inner `shared_present_slot` — canonical order
+            // `slot -> scene_slot -> shared_present_slot`.
+            #[cfg(feature = "native_canvas")]
+            publish_shared_locked(ctx, id);
+            Ok(Some(id))
+        }
         None => Ok(None),
     }
 }
@@ -556,6 +594,240 @@ pub fn switch_native(handle_bytes: &[u8], width: u32, height: u32) -> Result<Str
 #[cfg(feature = "native_canvas")]
 pub fn switch_offscreen() {
     *native_slot().lock() = None;
+}
+
+// -----------------------------------------------------------------------------
+// Shared-memory frame handoff — push past the dirty-rect IPC ceiling.
+//
+// The offscreen path ships present bytes across the main → renderer IPC
+// boundary every frame: a structured-clone copy whose cost scales with the
+// changed payload. A single-edit present collapses to a few KiB via the
+// dirty-rect path, but a full-frame change (pan / zoom / scroll) still moves
+// the whole `width * height * 4` framebuffer — megabytes per frame at
+// 1080p+ — and that copy is the remaining present ceiling.
+//
+// The shared-memory path removes that per-frame copy. The publisher (this
+// process — Electron main) mmaps a small tmpfs-backed framebuffer *ring*
+// and, after every offscreen render, writes the freshly published full
+// frame into the next slot under a seqlock. The reader (the Electron
+// renderer process, via a bridge `.node` it `process.dlopen`s locally)
+// maps the same file and copies the latest frame straight into its
+// `ImageData` backing buffer. Zero bytes cross IPC per frame; only a tiny
+// `SharedPresentDescriptor` (path + geometry + slot count) is exchanged
+// once, at handshake time.
+//
+// Everything here is behind `native_canvas` — the only module allowed the
+// `unsafe` mmap (encapsulated in `native_canvas::{MappedRegion,
+// MappedRegionRo}`; the ring logic in `shared_present` is `unsafe`-free).
+// Default builds don't compile any of it, so the present path is exactly
+// the Phase 0 offscreen → presenter → IPC chain and `CanvasHost` falls back
+// to dirty-rect IPC with no behavior change.
+//
+// **Lock order.** `shared_present_slot` and `shared_reader_slot` are the
+// strictly-innermost mutexes: `slot -> native_slot -> scene_slot ->
+// shared_present_slot`. The publisher slot is only ever acquired last (the
+// publish hook in `render_scene` / `render_cached_scene_locked`) or alone
+// (enable / descriptor / disable / resize / shutdown). The reader slot is
+// only ever acquired alone. So neither can participate in an inversion.
+// -----------------------------------------------------------------------------
+
+#[cfg(feature = "native_canvas")]
+use crate::shared_present::{SharedFrameMeta, SharedFramePublisher, SharedFrameReader};
+
+/// Process-wide shared-memory publisher (Electron **main** process). `Some`
+/// once the host has handshaked via [`shared_present_enable`].
+#[cfg(feature = "native_canvas")]
+fn shared_present_slot() -> &'static Mutex<Option<SharedFramePublisher>> {
+    static SHARED_PUBLISHER: OnceLock<Mutex<Option<SharedFramePublisher>>> = OnceLock::new();
+    SHARED_PUBLISHER.get_or_init(|| Mutex::new(None))
+}
+
+/// Process-wide shared-memory reader (Electron **renderer** process). `Some`
+/// once [`shared_reader_open`] has mapped a descriptor. Lives in a different
+/// OS process from [`shared_present_slot`] in production; co-resident only in
+/// single-process tests / benches, where they are distinct slots.
+#[cfg(feature = "native_canvas")]
+fn shared_reader_slot() -> &'static Mutex<Option<SharedFrameReader>> {
+    static SHARED_READER: OnceLock<Mutex<Option<SharedFrameReader>>> = OnceLock::new();
+    SHARED_READER.get_or_init(|| Mutex::new(None))
+}
+
+/// Copy the renderer's latest published full frame into the shared ring,
+/// with the `slot` guard already held by the caller. No-op when no
+/// publisher is attached, or when the published frame's geometry does not
+/// match the ring (a resize is mid-flight and the host has not re-handshaked
+/// yet) — the host keeps presenting via dirty-rect IPC until then.
+///
+/// Acquires only `shared_present_slot`, the innermost mutex, so it cannot
+/// invert the canonical lock order regardless of which present entry point
+/// called it.
+#[cfg(feature = "native_canvas")]
+fn publish_shared_locked(ctx: &RenderContext, frame_id: FrameId) {
+    let mut guard = shared_present_slot().lock();
+    let Some(publisher) = guard.as_mut() else {
+        return;
+    };
+    let Some(lease) = ctx.latest_frame() else {
+        return;
+    };
+    let (pw, ph) = publisher.dimensions();
+    if lease.width() == pw && lease.height() == ph {
+        publisher.publish_full(frame_id.0, lease.pixels());
+    }
+}
+
+/// Enable (or re-handshake) the shared-memory present ring at the given
+/// framebuffer geometry and return the descriptor the renderer process needs
+/// to map it. Idempotent: if a publisher already exists at the same geometry
+/// its existing descriptor is returned unchanged (so repeated handshakes
+/// don't churn the tmpfs file); a geometry change drops the old ring and
+/// creates a fresh one. The renderer must already be initialized.
+///
+/// Acquires only `shared_present_slot`.
+#[cfg(feature = "native_canvas")]
+pub fn shared_present_enable(width: u32, height: u32) -> Result<SharedPresentDescriptor> {
+    let mut guard = shared_present_slot().lock();
+    if let Some(publisher) = guard.as_ref() {
+        let (pw, ph) = publisher.dimensions();
+        if pw == width && ph == height {
+            return Ok(publisher.descriptor().into());
+        }
+    }
+    // Drop any stale-geometry publisher before creating the new one so the
+    // old tmpfs file is unlinked promptly.
+    *guard = None;
+    let publisher = SharedFramePublisher::create(width, height, DEFAULT_SHARED_SLOT_COUNT)?;
+    let descriptor = publisher.descriptor().into();
+    *guard = Some(publisher);
+    Ok(descriptor)
+}
+
+/// Current shared-present descriptor, or `None` when the ring is disabled.
+#[cfg(feature = "native_canvas")]
+#[must_use]
+pub fn shared_present_descriptor() -> Option<SharedPresentDescriptor> {
+    shared_present_slot()
+        .lock()
+        .as_ref()
+        .map(|p| p.descriptor().into())
+}
+
+/// Whether a shared-memory publisher is currently attached.
+#[cfg(feature = "native_canvas")]
+#[must_use]
+pub fn shared_present_enabled() -> bool {
+    shared_present_slot().lock().is_some()
+}
+
+/// Disable the shared-memory present ring and unlink its backing file. No-op
+/// when already disabled. The present path reverts to dirty-rect IPC.
+#[cfg(feature = "native_canvas")]
+pub fn shared_present_disable() {
+    *shared_present_slot().lock() = None;
+}
+
+/// Open the shared-memory reader (Electron **renderer** process) against a
+/// descriptor the main process produced via [`shared_present_enable`].
+/// Replaces any previously opened reader (e.g. after a resize re-handshake).
+///
+/// Acquires only `shared_reader_slot`.
+#[cfg(feature = "native_canvas")]
+pub fn shared_reader_open(descriptor: &SharedPresentDescriptor) -> Result<()> {
+    let reader = SharedFrameReader::open(&descriptor.clone().into())?;
+    *shared_reader_slot().lock() = Some(reader);
+    Ok(())
+}
+
+/// Pixel length (`width * height * 4`) of a frame in the currently open
+/// reader, or `None` when no reader is open. Lets the host size its
+/// `ImageData` backing buffer before the first read.
+#[cfg(feature = "native_canvas")]
+#[must_use]
+pub fn shared_reader_frame_len() -> Option<usize> {
+    shared_reader_slot()
+        .lock()
+        .as_ref()
+        .map(SharedFrameReader::frame_len)
+}
+
+/// Whether a shared-memory reader is currently open.
+#[cfg(feature = "native_canvas")]
+#[must_use]
+pub fn shared_reader_open_status() -> bool {
+    shared_reader_slot().lock().is_some()
+}
+
+/// Read the newest shared-memory frame into `dest` (the caller's reusable
+/// `ImageData` backing buffer), skipping the copy when the newest frame is
+/// not newer than `since`. Returns the frame metadata on a fresh copy,
+/// `Ok(None)` when nothing newer is available or no reader is open.
+///
+/// This is the single per-frame memcpy of the whole pipeline: shared ring →
+/// `ImageData`, performed in the renderer process with zero IPC. Acquires
+/// only `shared_reader_slot`.
+#[cfg(feature = "native_canvas")]
+pub fn shared_reader_read_into(
+    since: Option<u64>,
+    dest: &mut [u8],
+) -> Result<Option<SharedFrameMeta>> {
+    let mut guard = shared_reader_slot().lock();
+    let Some(reader) = guard.as_mut() else {
+        return Ok(None);
+    };
+    let meta = reader.read_new_into(since, dest)?;
+    Ok(meta)
+}
+
+/// Close the shared-memory reader. No-op when none is open.
+#[cfg(feature = "native_canvas")]
+pub fn shared_reader_close() {
+    *shared_reader_slot().lock() = None;
+}
+
+/// Number of slots in the shared-memory present ring. Three gives the reader
+/// a stable slot to copy from while the publisher writes the next and a
+/// third is in flight, so a reader never blocks the publisher.
+#[cfg(feature = "native_canvas")]
+const DEFAULT_SHARED_SLOT_COUNT: u32 = 3;
+
+/// Descriptor the renderer process needs to map the shared-memory present
+/// ring. Mirrors [`crate::shared_present::SharedPresentDescriptor`] in the
+/// `state` DTO vocabulary (so `lib.rs` stays a thin marshalling layer); the
+/// two convert via `From` in both directions.
+#[cfg(feature = "native_canvas")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SharedPresentDescriptor {
+    pub path: String,
+    pub len: u64,
+    pub width: u32,
+    pub height: u32,
+    pub slot_count: u32,
+}
+
+#[cfg(feature = "native_canvas")]
+impl From<crate::shared_present::SharedPresentDescriptor> for SharedPresentDescriptor {
+    fn from(d: crate::shared_present::SharedPresentDescriptor) -> Self {
+        Self {
+            path: d.path,
+            len: d.len,
+            width: d.width,
+            height: d.height,
+            slot_count: d.slot_count,
+        }
+    }
+}
+
+#[cfg(feature = "native_canvas")]
+impl From<SharedPresentDescriptor> for crate::shared_present::SharedPresentDescriptor {
+    fn from(d: SharedPresentDescriptor) -> Self {
+        Self {
+            path: d.path,
+            len: d.len,
+            width: d.width,
+            height: d.height,
+            slot_count: d.slot_count,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1043,6 +1315,147 @@ mod tests {
             red < total,
             "expected background pixels to remain, but all {total} pixels were the object color"
         );
+
+        shutdown();
+    }
+
+    // ---- shared-memory present ring (native_canvas feature) -----------
+    //
+    // These exercise the state-machine behavior added for the shared
+    // present handoff. The publisher and reader live in the same process
+    // here (co-resident); in production they are in the Electron main and
+    // renderer processes respectively, mapping the same backing file.
+
+    #[cfg(feature = "native_canvas")]
+    #[test]
+    #[serial]
+    fn shared_present_round_trips_full_frame() {
+        reset_for_tests();
+        init(32, 16).expect("init");
+        let descriptor = shared_present_enable(32, 16).expect("enable shared present");
+        assert_eq!((descriptor.width, descriptor.height), (32, 16));
+        shared_reader_open(&descriptor).expect("open reader");
+
+        // Render publishes the full frame into the ring after rasterising.
+        let id = render(RED_RECT_ON_BLACK).expect("render");
+
+        let frame_len = shared_reader_frame_len().expect("reader open");
+        assert_eq!(frame_len, 32 * 16 * 4);
+        let mut dest = vec![0u8; frame_len];
+        let meta = shared_reader_read_into(None, &mut dest)
+            .expect("read")
+            .expect("a fresh frame is available");
+        assert_eq!(meta.frame_id, id.0);
+        assert_eq!((meta.width, meta.height), (32, 16));
+        assert!(meta.full, "publisher always ships full frames");
+
+        // The shared read must be byte-identical to the IPC frame bytes —
+        // the two paths present the very same framebuffer.
+        let ipc_bytes = get_frame_bytes().expect("bytes").expect("some");
+        assert_eq!(dest, ipc_bytes, "shared frame must match the IPC frame");
+
+        // The red rect actually painted (not a blank frame).
+        assert!(
+            count_red(&dest) > 0,
+            "shared frame carries the rendered rect"
+        );
+
+        shutdown();
+    }
+
+    #[cfg(feature = "native_canvas")]
+    #[test]
+    #[serial]
+    fn shared_present_enable_is_idempotent_and_resizes() {
+        reset_for_tests();
+        init(32, 16).expect("init");
+        let a = shared_present_enable(32, 16).expect("enable");
+        let b = shared_present_enable(32, 16).expect("re-enable same geometry");
+        // Same geometry reuses the existing ring (same backing file).
+        assert_eq!(a.path, b.path);
+        assert_eq!((a.width, a.height), (b.width, b.height));
+
+        // A geometry change drops the old ring and creates a fresh one.
+        let c = shared_present_enable(64, 48).expect("enable new geometry");
+        assert_ne!(c.path, a.path, "geometry change must rotate the ring file");
+        assert_eq!((c.width, c.height), (64, 48));
+        let current = shared_present_descriptor().expect("descriptor present");
+        assert_eq!((current.width, current.height), (64, 48));
+
+        shutdown();
+    }
+
+    #[cfg(feature = "native_canvas")]
+    #[test]
+    #[serial]
+    fn shared_present_disable_reverts_to_ipc() {
+        reset_for_tests();
+        init(16, 16).expect("init");
+        assert!(!shared_present_enabled());
+        shared_present_enable(16, 16).expect("enable");
+        assert!(shared_present_enabled());
+
+        shared_present_disable();
+        assert!(!shared_present_enabled());
+        assert!(shared_present_descriptor().is_none());
+
+        // Rendering still works with the ring disabled (dirty-rect IPC
+        // fallback path) — no regression.
+        let id = render(RED_RECT_ON_BLACK).expect("render after disable");
+        assert!(id.0 > 0);
+
+        shutdown();
+    }
+
+    #[cfg(feature = "native_canvas")]
+    #[test]
+    #[serial]
+    fn shared_reader_skips_when_not_newer() {
+        reset_for_tests();
+        init(16, 16).expect("init");
+        let descriptor = shared_present_enable(16, 16).expect("enable");
+        shared_reader_open(&descriptor).expect("open reader");
+        let id = render(RED_RECT_ON_BLACK).expect("render");
+
+        let mut dest = vec![0u8; shared_reader_frame_len().expect("open")];
+        let first = shared_reader_read_into(None, &mut dest)
+            .expect("read")
+            .expect("frame available");
+        assert_eq!(first.frame_id, id.0);
+
+        // Asking for frames strictly newer than the one we just read yields
+        // nothing until the publisher advances — no redundant copy.
+        let again = shared_reader_read_into(Some(first.frame_id), &mut dest).expect("read");
+        assert!(again.is_none(), "no copy when nothing newer is published");
+
+        shutdown();
+    }
+
+    #[cfg(feature = "native_canvas")]
+    #[test]
+    #[serial]
+    fn resize_drops_shared_publisher_for_rehandshake() {
+        reset_for_tests();
+        init(32, 16).expect("init");
+        let old = shared_present_enable(32, 16).expect("enable");
+        assert!(shared_present_enabled());
+
+        // A resize invalidates the old framebuffer geometry, so the main
+        // process drops the publisher (unlinking its file). The present
+        // path falls back to dirty-rect IPC until the host re-handshakes.
+        // (The renderer-process reader is re-opened by `CanvasHost`, not by
+        // this main-process call, so it is intentionally left untouched.)
+        resize(64, 48).expect("resize");
+        assert!(!shared_present_enabled(), "publisher dropped on resize");
+        assert!(shared_present_descriptor().is_none());
+
+        // Re-handshaking at the new geometry yields a fresh ring the
+        // renderer can re-open.
+        let new = shared_present_enable(64, 48).expect("re-enable at new size");
+        assert_ne!(new.path, old.path, "resize rotates the ring file");
+        assert_eq!((new.width, new.height), (64, 48));
+        shared_reader_open(&new).expect("reader re-opens at new geometry");
+        assert_eq!(shared_reader_frame_len(), Some(64 * 48 * 4));
 
         shutdown();
     }

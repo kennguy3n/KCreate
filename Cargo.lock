@@ -1848,6 +1848,7 @@ dependencies = [
  "kcreate_text",
  "kcreate_vector",
  "log",
+ "memmap2",
  "napi",
  "napi-build",
  "napi-derive",

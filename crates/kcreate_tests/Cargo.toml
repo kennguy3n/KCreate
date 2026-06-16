@@ -23,6 +23,13 @@ path = "src/lib.rs"
 default = []
 onnx_upscale = ["kcreate_ai/onnx_upscale"]
 onnx_segment = ["kcreate_ai/onnx_segment"]
+# Passthrough for the shared-memory present handoff
+# (tests/shared_present_handoff.rs). Off by default so the standard
+# `cargo test --workspace` run doesn't require the feature; exercise it
+# with `cargo test -p kcreate_tests --features native_canvas`. Pulls in
+# `memmap2` + `raw-window-handle` (both non-networking) only for this
+# test crate, so the editing-path deny-list check stays green.
+native_canvas = ["kcreate_bridge/native_canvas"]
 
 [dev-dependencies]
 # `llm_sidecar` brings in `ureq` for the loopback HTTP client used by

@@ -124,8 +124,13 @@ interface PerfHudStats {
   frameMs: number;
   /** Bytes the last present shipped across IPC (dirty sub-rect or full). */
   bytes: number;
-  /** Whether the last present was a full frame, a partial, or idle. */
-  kind: "full" | "partial" | "idle";
+  /**
+   * How the last present moved pixels: a full IPC frame, a partial IPC
+   * sub-rect, the zero-IPC shared-memory path (`"shared"`), or idle (no
+   * blit). The `"shared"` kind is the win this surface targets — a
+   * full-frame present that crosses no IPC.
+   */
+  kind: "full" | "partial" | "shared" | "idle";
   /** Node count of the current document (throttled document-status poll). */
   nodeCount: number;
 }
@@ -197,6 +202,35 @@ export function CanvasHost(props: CanvasHostProps): JSX.Element {
   const activeModeRef = useRef<CanvasPresentationMode>("offscreen");
   activeModeRef.current = activeMode;
 
+  // Shared-memory present. When the bridge enables a shared framebuffer
+  // ring and the renderer-process reader opens it, full frames are read
+  // directly out of mapped memory with zero bytes crossing the
+  // main↔renderer IPC boundary. `sharedActiveRef` gates the present loop
+  // onto that path; it falls back to the dirty-rect IPC path whenever the
+  // handshake fails (feature off, sandbox, platform, or `dlopen` failure).
+  const sharedActiveRef = useRef(false);
+  const enableSharedPresent = useCallback(
+    async (wPx: number, hPx: number): Promise<void> => {
+      const bridge = window.kcreate?.renderer;
+      if (!bridge) {
+        sharedActiveRef.current = false;
+        return;
+      }
+      try {
+        // The publisher lives in the main process (one IPC round trip to
+        // map the ring); the reader is opened in-process and returns
+        // whether it is live. Any failure leaves the host on the IPC path.
+        const descriptor = await bridge.sharedPresentEnable(wPx, hPx);
+        sharedActiveRef.current = descriptor
+          ? bridge.sharedReaderOpen(descriptor)
+          : false;
+      } catch {
+        sharedActiveRef.current = false;
+      }
+    },
+    [],
+  );
+
   // Perf HUD. `perfHudRef` lets the rAF loop (set up once on mount)
   // read the live toggle without re-running its effect, and
   // `perfStatsRef` accumulates the measured numbers imperatively so a
@@ -215,7 +249,7 @@ export function CanvasHost(props: CanvasHostProps): JSX.Element {
     lastTickTs: number;
     lastPublishTs: number;
     bytes: number;
-    kind: "full" | "partial" | "idle";
+    kind: "full" | "partial" | "shared" | "idle";
     nodeCount: number;
     lastNodeCountTs: number;
   }>({
@@ -275,7 +309,7 @@ export function CanvasHost(props: CanvasHostProps): JSX.Element {
     // branch reads it on the throttled publish below.
     const recordPresentMetrics = (
       bytes: number,
-      kind: "full" | "partial" | "idle",
+      kind: "full" | "partial" | "shared" | "idle",
     ): void => {
       if (!perfHudRef.current) return;
       const s = perfStatsRef.current;
@@ -402,6 +436,34 @@ export function CanvasHost(props: CanvasHostProps): JSX.Element {
       return present.frameId;
     };
 
+    // Shared-memory present: read the newest full frame straight out of
+    // the mapped ring and blit it, with zero bytes across IPC. The
+    // publisher always publishes full frames, so a fresh read is a
+    // whole-frame `putImageData`. `since` is the last frame we presented,
+    // letting the reader skip the copy when nothing advanced. Returns the
+    // presented frame id, or `null` to fall back to the dirty-rect IPC
+    // path (no reader open, stale buffer size, or a torn read this tick).
+    const presentShared = (
+      ensure: (w: number, h: number) => void,
+    ): number | null => {
+      const read = bridge.sharedReaderRead(lastFrameIdRef.current);
+      if (!read) return null;
+      const { meta, bytes } = read;
+      const expected = meta.width * meta.height * 4;
+      if (bytes.byteLength < expected) return null;
+      ensure(meta.width, meta.height);
+      const img = imageDataRef.current;
+      const dims = imageDataDimsRef.current;
+      if (!img || dims.w !== meta.width || dims.h !== meta.height) return null;
+      img.data.set(
+        bytes.byteLength === expected ? bytes : bytes.subarray(0, expected),
+      );
+      ctx.putImageData(img, 0, 0);
+      // Zero IPC bytes — the whole frame moved through shared memory.
+      recordPresentMetrics(0, "shared");
+      return meta.frameId;
+    };
+
     (async () => {
       const dpr = dprRef.current;
       const wPx = Math.max(1, Math.round(props.width * dpr));
@@ -416,6 +478,11 @@ export function CanvasHost(props: CanvasHostProps): JSX.Element {
           viewportRef.current.zoom,
         );
         lastSentViewportRef.current = { ...viewportRef.current };
+        // Negotiate the shared-memory present path before the first
+        // render so the initial frame is published into the ring. A
+        // failure here is non-fatal: `sharedActiveRef` stays false and
+        // the loop uses the dirty-rect IPC path.
+        await enableSharedPresent(wPx, hPx);
       } catch (err) {
         if (!cancelled) {
           setInitError(
@@ -494,7 +561,16 @@ export function CanvasHost(props: CanvasHostProps): JSX.Element {
             // native path stays zero-copy and we do not waste a CPU
             // download on every frame.
             if (activeModeRef.current === "offscreen") {
-              presentedId = await presentDirtyRect(ensureImageData, presentedId);
+              // Prefer the shared-memory path (zero-IPC full frame); fall
+              // back to the dirty-rect IPC present when it is unavailable
+              // or a read could not be satisfied this tick.
+              const sharedId = sharedActiveRef.current
+                ? presentShared(ensureImageData)
+                : null;
+              presentedId =
+                sharedId !== null
+                  ? sharedId
+                  : await presentDirtyRect(ensureImageData, presentedId);
             }
             lastFrameIdRef.current = presentedId;
             props.onFramePresented?.(presentedId);
@@ -638,7 +714,19 @@ export function CanvasHost(props: CanvasHostProps): JSX.Element {
     const hPx = Math.max(1, Math.round(props.height * dpr));
     void bridge
       .resize(wPx, hPx)
-      .then(() => bridge.renderCurrent())
+      .then(async () => {
+        // The bridge drops the shared publisher on resize (its ring is
+        // sized to the old geometry). If we were on the shared path,
+        // re-handshake at the new size before the repaint so the first
+        // new-size frame is published into a fresh ring; gate the loop
+        // off the shared path in the meantime so it never reads a stale
+        // mapping.
+        if (sharedActiveRef.current) {
+          sharedActiveRef.current = false;
+          await enableSharedPresent(wPx, hPx);
+        }
+        await bridge.renderCurrent();
+      })
       .catch(() => {
         /* renderer may not be initialized yet; init effect will catch up */
       });
@@ -649,7 +737,7 @@ export function CanvasHost(props: CanvasHostProps): JSX.Element {
       imageDataRef.current = ctxRef.current.createImageData(wPx, hPx);
       imageDataDimsRef.current = { w: wPx, h: hPx };
     }
-  }, [props.width, props.height]);
+  }, [props.width, props.height, enableSharedPresent]);
 
   // Drop the overlay's last snapshot when the HUD is switched off so a
   // stale frame doesn't linger on the next enable.
@@ -902,7 +990,9 @@ function PerfHud({ stats }: { stats: PerfHudStats }): JSX.Element {
   const payload =
     stats.kind === "idle"
       ? "idle"
-      : `${(stats.bytes / KIB).toFixed(1)} KiB ${stats.kind}`;
+      : stats.kind === "shared"
+        ? "0 KiB · shm"
+        : `${(stats.bytes / KIB).toFixed(1)} KiB ${stats.kind}`;
   const rows: Array<[string, string]> = [
     ["FPS", stats.fps.toFixed(0)],
     ["Frame", `${stats.frameMs.toFixed(2)} ms`],

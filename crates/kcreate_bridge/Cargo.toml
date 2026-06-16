@@ -70,6 +70,15 @@ sysinfo.workspace = true
 # this crate at all, so default builds stay free of unsafe pointer
 # math.
 raw-window-handle = { workspace = true, optional = true }
+# Used only behind the `native_canvas` feature for the shared-memory
+# frame handoff (publisher mmaps a framebuffer ring the renderer
+# process reads directly, eliminating the per-frame IPC copy). The
+# default build does not link it. `memmap2` is already in the
+# workspace graph (via `fontdb` → `kcreate_text`), so gating it here
+# does not widen the default editing-path closure the local-first
+# sentinel walks; the `unsafe` mmap calls live solely in
+# `native_canvas.rs` (the only module allowed `unsafe`).
+memmap2 = { version = "0.9", optional = true }
 # Phase 3 LAN transport. Like `kcreate_mcp`, this is the *only* path
 # by which the bridge can pull a network stack — `kcreate_collab`
 # itself is transport-agnostic and stays in the editing path, but
@@ -161,6 +170,17 @@ name = "collab_perf"
 harness = false
 required-features = ["collab"]
 
+# Native / shared-memory present benchmark. Requires `native_canvas`
+# so the bench can construct the `shared_present` ring publisher +
+# reader. Compares the per-frame full-frame copy the IPC path ships
+# (`take_present(0.0)` materialises a fresh framebuffer Vec every
+# frame) against the shared-memory handoff (publish into a pre-mapped
+# ring slot + a renderer-side read), which moves zero bytes over IPC.
+[[bench]]
+name = "shared_present_dense"
+harness = false
+required-features = ["native_canvas"]
+
 [features]
 default = []
 # Mirror the renderer's CPU-only feature flag for headless N-API builds.
@@ -180,7 +200,7 @@ llm = ["kcreate_ai/llm_sidecar"]
 # `BrowserWindow::getNativeWindowHandle()`. Off by default so the
 # Phase 0 / Phase 1 default build is `unsafe`-free; the Electron
 # host enables it when the user opts in via the settings toggle.
-native_canvas = ["dep:raw-window-handle"]
+native_canvas = ["dep:raw-window-handle", "dep:memmap2"]
 # Enable the LAN collaboration transport (QUIC + mDNS) and the
 # `session_*` IPC surface that drives the Phase 3 presence UI. Off
 # by default so the local-first sentinel keeps quinn / rustls /

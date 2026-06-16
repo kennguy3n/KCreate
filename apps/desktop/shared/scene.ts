@@ -205,6 +205,57 @@ export interface PresentFrame {
   bytes: Uint8Array;
 }
 
+/**
+ * One-time handshake payload for the shared-memory present ring. The main
+ * process creates the ring (`sharedPresentEnable`) and ships this to the
+ * renderer process, which maps the same backing file (`sharedReaderOpen`).
+ * After the handshake the per-frame present path copies straight from the
+ * mapped framebuffer into an `ImageData` backing buffer with zero bytes
+ * over IPC. Mirrors `kcreate_bridge::state::SharedPresentDescriptor` and
+ * the `#[napi(object)] SharedPresentDescriptor` in `lib.rs`.
+ */
+export interface SharedPresentDescriptor {
+  path: string;
+  /** Byte length of the whole mapped region. */
+  len: number;
+  width: number;
+  height: number;
+  slotCount: number;
+}
+
+/**
+ * Metadata for a shared-memory frame. There is no `bytes` field here: at the
+ * N-API layer the pixels are written in place into the reusable `Buffer` the
+ * preload passes the reader, so this struct only describes the copy that
+ * landed. Mirrors `kcreate_bridge::shared_present::SharedFrameMeta` and the
+ * `#[napi(object)] SharedPresentFrame` in `lib.rs`.
+ */
+export interface SharedPresentFrame {
+  frameId: number;
+  width: number;
+  height: number;
+  dirtyX: number;
+  dirtyY: number;
+  dirtyWidth: number;
+  dirtyHeight: number;
+  full: boolean;
+}
+
+/**
+ * Result of a shared-memory read: the frame `meta` plus a `bytes` view over a
+ * preload-owned buffer the reader copied the mapped framebuffer into. The
+ * buffer is reused on the next `sharedReaderRead`, so the host must consume
+ * `bytes` synchronously (e.g. `putImageData`) before the next read.
+ *
+ * This is the renderer-facing shape — it is NOT a wire/N-API struct. The
+ * single shared-ring → buffer memcpy happens in the renderer process, so no
+ * frame bytes ever cross the main↔renderer IPC boundary.
+ */
+export interface SharedPresentRead {
+  meta: SharedPresentFrame;
+  bytes: Uint8Array;
+}
+
 export interface RendererInfo {
   tier: string;
   width: number;
@@ -324,6 +375,55 @@ export interface RendererBridge {
    * readback path. No-op when already in offscreen mode.
    */
   switchOffscreen(): Promise<void>;
+
+  /**
+   * Enable (or re-handshake) the shared-memory present ring in the MAIN
+   * process at the given framebuffer geometry, returning the descriptor
+   * the renderer process needs to map it. One IPC round trip; thereafter
+   * the per-frame present path is zero-IPC. Resolves to `null` when the
+   * shared-memory path is unavailable (the bridge was built without
+   * `native_canvas`, or the main process could not create the ring) — the
+   * host then stays on the dirty-rect IPC path. Mirrors
+   * `kcreate_bridge::state::shared_present_enable`.
+   */
+  sharedPresentEnable(
+    width: number,
+    height: number,
+  ): Promise<SharedPresentDescriptor | null>;
+
+  /**
+   * Disable the shared-memory present ring in the main process and unlink
+   * its backing file. No-op when already disabled.
+   */
+  sharedPresentDisable(): Promise<void>;
+
+  /**
+   * Open the renderer-process shared-memory reader against `descriptor`,
+   * mapping the same file the main process published. Runs IN the renderer
+   * process via a bridge `.node` the preload `process.dlopen`s locally, so
+   * it does not cross IPC. Returns `true` when a reader is now open,
+   * `false` when the renderer-process bridge or the `native_canvas`
+   * feature is unavailable (the host then stays on the dirty-rect IPC
+   * path).
+   */
+  sharedReaderOpen(descriptor: SharedPresentDescriptor): boolean;
+
+  /**
+   * Read the newest shared-memory frame, skipping the copy when nothing
+   * newer than `since` is available. Returns the frame `meta` plus a
+   * `bytes` view over a preload-owned buffer, or `null` when nothing newer
+   * is available / no reader is open. Runs in-process: the mapped
+   * framebuffer is copied once into the preload buffer, with zero bytes
+   * across the main↔renderer IPC boundary. The buffer is reused on the next
+   * call, so the host must consume `bytes` synchronously.
+   */
+  sharedReaderRead(since: number | null): SharedPresentRead | null;
+
+  /** Whether a renderer-process shared-memory reader is currently open. */
+  sharedReaderIsOpen(): boolean;
+
+  /** Close the renderer-process shared-memory reader. No-op when none. */
+  sharedReaderClose(): void;
 }
 
 /**

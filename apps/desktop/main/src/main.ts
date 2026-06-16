@@ -17,7 +17,7 @@ import { realpathSync } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
-import { loadBridge, type Bridge } from "./bridge";
+import { loadBridge, bridgeBinaryPath, type Bridge } from "./bridge";
 import {
   start as startOnboardingDownload,
   validateOpenExternalUrl,
@@ -909,6 +909,44 @@ function registerIpcHandlers(): void {
   ipcMain.handle("kcreate/renderer/presentationMode", () =>
     requireBridge().rendererPresentationMode(),
   );
+
+  // Shared-memory present handoff. The publisher lives in this (main)
+  // process alongside the renderer; the per-frame READER runs in the
+  // renderer process against a bridge `.node` the preload `dlopen`s
+  // locally, so these handlers cover only the one-time handshake — never
+  // a per-frame payload.
+  //
+  // `enable` creates (or re-handshakes) the ring and returns the
+  // descriptor the renderer process needs to map it. Any failure — the
+  // bridge was built without `native_canvas`, or `mmap` failed — resolves
+  // to `null` so the host stays on the dirty-rect IPC path.
+  ipcMain.handle(
+    "kcreate/renderer/sharedPresent/enable",
+    (_e, width: number, height: number) => {
+      try {
+        return requireBridge().rendererSharedPresentEnable(width, height);
+      } catch {
+        return null;
+      }
+    },
+  );
+  ipcMain.handle("kcreate/renderer/sharedPresent/disable", () => {
+    requireBridge().rendererSharedPresentDisable();
+  });
+  // Synchronous lookup of the resolved bridge cdylib path. The preload
+  // uses `ipcRenderer.sendSync` here so it can `process.dlopen` a
+  // renderer-process-local bridge instance for the zero-IPC present
+  // reader. Returns `null` when the path cannot be resolved.
+  ipcMain.on("kcreate/renderer/bridgeModulePath", (event) => {
+    try {
+      event.returnValue = bridgeBinaryPath({
+        isPackaged: app.isPackaged,
+        resourcesPath: process.resourcesPath,
+      });
+    } catch {
+      event.returnValue = null;
+    }
+  });
 
   // Document / project lifecycle.
   //

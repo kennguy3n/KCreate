@@ -3265,6 +3265,33 @@ export interface ModelInstallReport {
   sizeBytes: number;
 }
 
+/// Progress event for the model manager's in-app download
+/// (`aiModel.downloadModelPack`). Pushed from the Electron main
+/// process on every ~256 KiB of downloaded bytes plus on each phase
+/// transition, so the renderer can drive a progress bar + accessible
+/// status text. The download itself lives in the main process (Node
+/// ships TLS; main is outside the Rust editing-path tree) — the
+/// renderer never sees a URL.
+///
+/// The shape mirrors `DownloadProgress` in
+/// `apps/desktop/main/src/modelDownloader.ts`. `totalBytes` is `null`
+/// until the HTTP `Content-Length` is observed.
+export interface ModelDownloadProgress {
+  packId: string;
+  phase:
+    | "resolving"
+    | "connecting"
+    | "downloading"
+    | "verifying"
+    | "installing"
+    | "done"
+    | "error"
+    | "cancelled";
+  receivedBytes: number;
+  totalBytes: number | null;
+  message: string;
+}
+
 export type ScreenshotElementType =
   | "header"
   | "navigation"
@@ -3441,6 +3468,28 @@ export interface AiModelBridge {
   ): Promise<ModelInstallReport>;
   /// Uninstall a model pack by deleting its file. Idempotent.
   uninstallModelPack(packId: string): Promise<void>;
+  /// Download a model pack's weights in-app, with progress. The main
+  /// process resolves the pack's `downloadUrl` from the registry
+  /// (validated against an allow-list), streams the bytes into a temp
+  /// file, then runs the same SHA-256 verify + atomic rename that
+  /// [`installModelPack`] uses. Downloads happen ONLY on this explicit
+  /// call — never in the editing path. Subscribe to
+  /// [`onModelDownloadProgress`] for progress, and call
+  /// [`cancelModelDownload`] to abort. Resolves with the install
+  /// report (mirroring the manual-install flow) on success; rejects
+  /// with `"cancelled"` if aborted.
+  downloadModelPack(packId: string): Promise<ModelInstallReport>;
+  /// Abort the in-flight `downloadModelPack` download, if any. The
+  /// pending `downloadModelPack` promise rejects with `"cancelled"`
+  /// and a final `cancelled` progress event is emitted. No-op when no
+  /// download is running.
+  cancelModelDownload(): Promise<void>;
+  /// Subscribe to [`ModelDownloadProgress`] events for the in-app
+  /// download. Returns an unsubscribe handle — the renderer must call
+  /// it on cleanup to avoid leaking IPC listeners across re-renders.
+  onModelDownloadProgress(
+    fn: (progress: ModelDownloadProgress) => void,
+  ): () => void;
   screenshotToLayout(request: ScreenshotRequest): Promise<ScreenshotElement[]>;
   /// Run the local alt-text heuristic against a raster layer.
   /// Read-only: does NOT persist anything to the document — call

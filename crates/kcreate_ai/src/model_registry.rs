@@ -118,6 +118,15 @@ pub struct ModelPack {
 /// every install of that pack. Always paste hashes computed from the
 /// canonical upstream artefact (see `ModelPack::download_url`).
 const CANONICAL_PACK_HASHES: &[(&str, &str)] = &[
+    // Stable Diffusion 1.5 (fused, fp16) from the Comfy-Org archive
+    // mirror referenced by `image_gen_sd15`'s `download_url`. This is
+    // the smallest real generation model the registry ships, so it is
+    // the one we pin first: download + checksum + run is exercised
+    // end-to-end in CI-adjacent integration tests and by hand.
+    (
+        "image_gen_sd15",
+        "e9476a13728cd75d8279f6ec8bad753a66a1957ca375a1464dc63b37db6e3916",
+    ),
     // Pinned at release time. Example shape (commented out):
     // ("bg_remove_u2net", "0123456789abcdef…"),
 ];
@@ -521,6 +530,30 @@ fn static_packs() -> Vec<ModelPack> {
                 "https://huggingface.co/themindstudio/FLUX-Klein-4B-GGUF/resolve/main/flux-klein-4b-Q4_0.gguf".into(),
             sha256: String::new(),
         },
+        // Smallest real generation model the registry ships:
+        // Stable Diffusion 1.5, fused fp16 `.safetensors` (~2.0 GB).
+        // Unlike FLUX (a *standalone* diffusion model that needs
+        // separate CLIP / T5 / VAE files), an SD 1.x checkpoint
+        // bundles its CLIP + VAE, so sd-server loads it through `-m`
+        // with no companion encoder paths. The bridge selects the
+        // `-m` flag for this pack via `generation_pack_is_fused`.
+        // This is the pack used for the download + checksum + run
+        // proof because it is small enough to fetch and verify in a
+        // CI-sized environment while still producing a recognisable
+        // hero image.
+        ModelPack {
+            id: "image_gen_sd15".into(),
+            name: "Image Generation — Stable Diffusion 1.5 (fp16)".into(),
+            category: ModelPackCategory::Generation,
+            kind: ModelKind::Sidecar,
+            capabilities: vec!["image_generation".into()],
+            size_bytes: 2_132_696_762,
+            file_path: "stable-diffusion-v1-5-pruned-emaonly-fp16.safetensors".into(),
+            installed: false,
+            download_url:
+                "https://huggingface.co/Comfy-Org/stable-diffusion-v1-5-archive/resolve/main/v1-5-pruned-emaonly-fp16.safetensors".into(),
+            sha256: String::new(),
+        },
         // Phase 12 Block A also removed `image_gen_flux_klein_mlx`.
         // sd-server handles FLUX.2 Klein natively with Metal
         // acceleration on Apple Silicon, so the MLX-specific bundle
@@ -648,18 +681,45 @@ pub fn recommended_llm_pack(
 /// belt-and-braces check.
 ///
 /// Phase 12 Block A removed the Apple-Silicon-only MLX branch.
-/// `sd-server` (stable-diffusion.cpp) loads the FLUX.2 Klein GGUF
-/// with Metal acceleration on Apple Silicon and CUDA / Vulkan
-/// elsewhere, so a single recommendation works everywhere.
+/// `sd-server` (stable-diffusion.cpp) loads both packs with Metal
+/// acceleration on Apple Silicon and CUDA / Vulkan elsewhere, so a
+/// single platform-agnostic recommendation works everywhere.
+///
+/// The recommendation is tier-aware: Tier 2 machines (the floor for
+/// image generation) get the small, fully-verified SD 1.5 checkpoint
+/// (`image_gen_sd15`, ~2.0 GB, fits in RAM and fetches + checksums
+/// quickly); Tier 3 machines, which have the headroom for a larger
+/// standalone diffusion model, get FLUX.2 Klein 4B.
 #[must_use]
 pub fn recommended_generation_pack(
     tier: kcreate_core::config::DeviceTier,
     _platform: kcreate_core::config::Platform,
 ) -> Option<&'static str> {
+    use kcreate_core::config::DeviceTier;
     if !tier.image_generation_allowed() {
         return None;
     }
-    Some("image_gen_flux_klein_4b")
+    Some(match tier {
+        DeviceTier::Tier3 => "image_gen_flux_klein_4b",
+        _ => "image_gen_sd15",
+    })
+}
+
+/// Whether a generation pack's weights file is a *fused* full
+/// checkpoint (SD 1.x / SD2 / SDXL `.safetensors`, which bundles
+/// CLIP + VAE and loads via sd-server's `-m`) rather than a
+/// *standalone* diffusion model (FLUX / SD3-style, which loads via
+/// `--diffusion-model` with text encoders + VAE supplied through
+/// `KCREATE_SD_SERVER_EXTRA_ARGS`).
+///
+/// The bridge uses this to pick the correct sd-server CLI flag when
+/// it builds the [`crate::DiffusionSidecarConfig`]. Keyed by pack id
+/// rather than a wire field so the renderer-facing `ModelPack` shape
+/// is unchanged — mirrors the existing `mmproj_for` / `resolve_pack_id`
+/// per-pack lookups.
+#[must_use]
+pub fn generation_pack_is_fused_checkpoint(pack_id: &str) -> bool {
+    matches!(pack_id, "image_gen_sd15")
 }
 
 /// Errors from [`install_model_pack`] / [`uninstall_model_pack`].
@@ -922,6 +982,7 @@ mod tests {
             "bg_remove_threshold",
             "bg_remove_u2net",
             "image_gen_flux_klein_4b",
+            "image_gen_sd15",
             "llm_bonsai_1_7b",
             "llm_bonsai_4b",
             "llm_bonsai_8b",
@@ -1503,6 +1564,70 @@ mod tests {
         );
         assert!(recommended_generation_pack(DeviceTier::Tier2, Platform::LinuxX64).is_some());
         assert!(recommended_generation_pack(DeviceTier::Tier3, Platform::LinuxX64).is_some());
+    }
+
+    /// The generation recommendation is tier-aware: the Tier 2 floor
+    /// gets the small, fully-verified SD 1.5 checkpoint; Tier 3 gets
+    /// the larger FLUX standalone model. Both recommendations must
+    /// resolve to real packs in the catalogue.
+    #[test]
+    fn recommended_generation_pack_is_tier_aware() {
+        use kcreate_core::config::{DeviceTier, Platform};
+        assert_eq!(
+            recommended_generation_pack(DeviceTier::Tier2, Platform::LinuxX64),
+            Some("image_gen_sd15"),
+        );
+        assert_eq!(
+            recommended_generation_pack(DeviceTier::Tier3, Platform::LinuxX64),
+            Some("image_gen_flux_klein_4b"),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let ids: std::collections::HashSet<String> = list_model_packs(dir.path())
+            .into_iter()
+            .map(|p| p.id)
+            .collect();
+        assert!(ids.contains("image_gen_sd15"));
+        assert!(ids.contains("image_gen_flux_klein_4b"));
+    }
+
+    /// `generation_pack_is_fused_checkpoint` selects the sd-server
+    /// load flag in the bridge. SD 1.5 is a fused checkpoint (`-m`);
+    /// FLUX is a standalone diffusion model (`--diffusion-model`).
+    /// An unknown pack id must default to standalone (`false`) so a
+    /// future pack can't accidentally inherit the `-m` path.
+    #[test]
+    fn generation_pack_fused_classification() {
+        assert!(generation_pack_is_fused_checkpoint("image_gen_sd15"));
+        assert!(!generation_pack_is_fused_checkpoint(
+            "image_gen_flux_klein_4b"
+        ));
+        assert!(!generation_pack_is_fused_checkpoint("not_a_real_pack"));
+    }
+
+    /// The SD 1.5 generation pack must be a real, downloadable,
+    /// checksum-pinned `Generation` pack: it carries a download URL,
+    /// the `image_generation` capability, and a canonical SHA-256 the
+    /// installer enforces. This is the pack used for the end-to-end
+    /// download + verify + run proof, so a regression here breaks the
+    /// only fully-exercised generation path.
+    #[test]
+    fn sd15_pack_is_real_and_pinned() {
+        let dir = tempfile::tempdir().unwrap();
+        let pack = list_model_packs(dir.path())
+            .into_iter()
+            .find(|p| p.id == "image_gen_sd15")
+            .expect("image_gen_sd15 is in static_packs");
+        assert_eq!(pack.category, ModelPackCategory::Generation);
+        assert_eq!(pack.kind, ModelKind::Sidecar);
+        assert!(pack.capabilities.iter().any(|c| c == "image_generation"));
+        assert!(pack.download_url.starts_with("https://huggingface.co/"));
+        assert!(!pack.file_path.is_empty());
+        assert!(pack.size_bytes > 1_000_000_000);
+        // The canonical hash is overlaid onto the wire pack so the UI
+        // can show a "Verified" affordance, and the installer enforces
+        // it (unlike the unpinned FLUX pack which still ships "").
+        assert_eq!(pack.sha256.len(), 64);
+        assert_eq!(canonical_hash_for("image_gen_sd15"), pack.sha256);
     }
 
     /// Phase 12 Block A invariant: no recommendation \u2014 vision,

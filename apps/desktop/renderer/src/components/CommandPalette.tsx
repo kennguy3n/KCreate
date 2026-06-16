@@ -248,15 +248,13 @@ export function CommandPalette({
   });
 
   // Reset transient state and refresh history each time the palette
-  // opens so it reflects usage from the current session.
+  // opens so it reflects usage from the current session. Focus is
+  // handled by `useFocusTrap`, which moves the caret into the first
+  // focusable (the search input) on open.
   useEffect(() => {
     if (!open) return;
     setQuery("");
     setHistory(loadCommandHistory());
-    // Focus after the dialog has painted so the caret lands in the
-    // input rather than the element that had focus when Ctrl+K fired.
-    const id = window.requestAnimationFrame(() => inputRef.current?.focus());
-    return () => window.cancelAnimationFrame(id);
   }, [open]);
 
   const rows = useMemo(

@@ -14,8 +14,7 @@
 // AI-model installer on the HomePage), which solves a different
 // problem.
 
-import { useEffect } from "react";
-
+import { useFocusTrap } from "../a11y/useFocusTrap";
 import { useI18n } from "../i18n";
 import { colors, radius, spacing } from "../styles/tokens";
 import { Icon, type IconName } from "./Icon";
@@ -68,21 +67,12 @@ export function DiscoveryWelcome({
   onDismiss,
 }: DiscoveryWelcomeProps): JSX.Element | null {
   const { t } = useI18n();
-  // Esc dismisses, matching every other overlay in the editor. Bound
-  // only while open so we don't hold a listener for a hidden modal.
-  useEffect(() => {
-    if (!open) return;
-    const onKey = (event: KeyboardEvent): void => {
-      if (event.key === "Escape") {
-        event.preventDefault();
-        onDismiss();
-      }
-    };
-    window.addEventListener("keydown", onKey);
-    return () => {
-      window.removeEventListener("keydown", onKey);
-    };
-  }, [open, onDismiss]);
+  // Contain focus while open and return it to the opener on close;
+  // Escape dismisses, matching every other overlay in the editor.
+  const trapRef = useFocusTrap<HTMLDivElement>({
+    active: open,
+    onEscape: onDismiss,
+  });
 
   if (!open) return null;
 
@@ -109,7 +99,7 @@ export function DiscoveryWelcome({
         if (event.target === event.currentTarget) onDismiss();
       }}
     >
-      <div style={dialogStyle}>
+      <div ref={trapRef} style={dialogStyle}>
         <header style={headerStyle}>
           <div>
             <h2 id="kcreate-discovery-title" style={titleStyle}>

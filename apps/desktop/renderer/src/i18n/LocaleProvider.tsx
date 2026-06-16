@@ -4,6 +4,7 @@ import {
   useContext,
   useEffect,
   useMemo,
+  useRef,
   useState,
 } from "react";
 import type { ReactNode } from "react";
@@ -93,33 +94,45 @@ export function LocaleProvider({
   // so screen-reader users hear the switch confirmed in the new locale.
   const [announcement, setAnnouncement] = useState("");
 
+  // The updater stays pure (just the next locale); every side effect
+  // lives in the effect below. React can call a state updater more than
+  // once (StrictMode, concurrent rendering), so persisting / announcing
+  // inside it would be unsafe.
   const setLocale = useCallback((next: LocaleId) => {
-    setLocaleState((prev) => {
-      if (prev === next) return prev;
-      const meta = localeMeta(next);
-      const message = formatMessage(
-        resolveMessage(next, "lang.changed"),
-        { language: meta.nativeName },
-        next,
-      );
-      setAnnouncement(message);
-      try {
-        window.localStorage.setItem(STORAGE_KEY, next);
-      } catch {
-        // Persistence is best-effort; ignore storage failures.
-      }
-      return next;
-    });
+    setLocaleState(next);
   }, []);
+
+  // Locale as of the last committed effect run, so we can tell a real
+  // switch apart from the initial mount (and StrictMode's double-invoke)
+  // and only persist / announce when the locale actually changes.
+  const prevLocaleRef = useRef(locale);
 
   // Reflect the active locale onto the document element so global CSS,
   // logical properties, and assistive tech all see the right language
-  // and writing direction. This is the single place the app flips RTL.
+  // and writing direction (the single place the app flips RTL); then,
+  // on an actual change, persist the choice and announce it in a polite
+  // live region so screen-reader users hear the switch confirmed in the
+  // new locale.
   useEffect(() => {
-    if (typeof document === "undefined") return;
     const meta = localeMeta(locale);
-    document.documentElement.lang = locale;
-    document.documentElement.dir = meta.dir;
+    if (typeof document !== "undefined") {
+      document.documentElement.lang = locale;
+      document.documentElement.dir = meta.dir;
+    }
+    if (prevLocaleRef.current === locale) return;
+    prevLocaleRef.current = locale;
+    try {
+      window.localStorage.setItem(STORAGE_KEY, locale);
+    } catch {
+      // Persistence is best-effort; ignore storage failures.
+    }
+    setAnnouncement(
+      formatMessage(
+        resolveMessage(locale, "lang.changed"),
+        { language: meta.nativeName },
+        locale,
+      ),
+    );
   }, [locale]);
 
   const value = useMemo(() => makeValue(locale, setLocale), [locale, setLocale]);

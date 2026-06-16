@@ -33,6 +33,13 @@ const GRANT_OPTIONS: McpPermissionGrant[] = ["once", "always", "denied"];
 /// server is stopped (nothing can enqueue a prompt then).
 const POLL_INTERVAL_MS = 2500;
 
+/// Consecutive failed poll ticks tolerated before the live poll pauses.
+/// A dead bridge would otherwise emit an error toast every
+/// `POLL_INTERVAL_MS`; instead the failure is surfaced once, then again
+/// when polling pauses, and any successful refresh (including one an
+/// operator action triggers) clears the streak and resumes the poll.
+const MAX_POLL_FAILURES = 5;
+
 export interface McpSettingsPanelProps {
   onStatus?: (msg: string | null) => void;
 }
@@ -55,6 +62,11 @@ export function McpSettingsPanel({
     };
   }, []);
 
+  // Consecutive poll failures; when this crosses MAX_POLL_FAILURES the
+  // live poll pauses (see `pollPaused`) instead of spamming toasts.
+  const pollFailures = useRef(0);
+  const [pollPaused, setPollPaused] = useState(false);
+
   const refresh = useCallback(async () => {
     try {
       const [s, p, m, q] = await Promise.all([
@@ -64,12 +76,27 @@ export function McpSettingsPanel({
         window.kcreate.mcpPermission.pendingList(),
       ]);
       if (!mounted.current) return;
+      if (pollFailures.current !== 0) {
+        pollFailures.current = 0;
+        setPollPaused(false);
+      }
       setStatus(s);
       setPerms(p);
       setMasterOn(m);
       setPending(q);
     } catch (e) {
-      onStatus?.(`mcp: ${errMsg(e)}`);
+      if (!mounted.current) return;
+      pollFailures.current += 1;
+      // Surface the fault once at the start of a failure streak, then
+      // once more when the poll pauses — never on every tick.
+      if (pollFailures.current === 1) {
+        onStatus?.(`mcp: ${errMsg(e)}`);
+      } else if (pollFailures.current === MAX_POLL_FAILURES) {
+        onStatus?.(
+          "MCP: status polling paused after repeated errors — interact with the panel to retry.",
+        );
+        setPollPaused(true);
+      }
     }
   }, [onStatus]);
 
@@ -78,15 +105,17 @@ export function McpSettingsPanel({
   }, [refresh]);
 
   // Live poll while the server is running so prompts surface promptly.
+  // Paused after a run of failures so a dead bridge can't spin a toast
+  // loop; a successful manual refresh clears `pollPaused` and resumes.
   useEffect(() => {
-    if (status?.running !== true) return undefined;
+    if (status?.running !== true || pollPaused) return undefined;
     const id = window.setInterval(() => {
       void refresh();
     }, POLL_INTERVAL_MS);
     return () => {
       window.clearInterval(id);
     };
-  }, [status?.running, refresh]);
+  }, [status?.running, pollPaused, refresh]);
 
   const startServer = useCallback(async () => {
     setBusy(true);

@@ -8889,7 +8889,9 @@ struct WorkspaceAccess;
 #[cfg(feature = "mcp")]
 impl kcreate_mcp::tools::DocumentAccess for WorkspaceAccess {
     fn list_artboards(&self) -> Vec<kcreate_mcp::tools::ArtboardInfo> {
-        let guard = slot().write();
+        // Read-only: share the lock with other readers so a discovery
+        // call never blocks a concurrent read.
+        let guard = slot().read();
         let Some(ws) = guard.as_ref() else {
             return Vec::new();
         };
@@ -8949,7 +8951,9 @@ impl kcreate_mcp::tools::DocumentAccess for WorkspaceAccess {
     }
 
     fn export_svg(&self, node_ids: &[Uuid]) -> std::result::Result<String, String> {
-        let guard = slot().write();
+        // Read-only: SVG export reads the document graph and never mutates
+        // it, so take a shared read lock.
+        let guard = slot().read();
         let ws = guard
             .as_ref()
             .ok_or_else(|| "no project open".to_string())?;

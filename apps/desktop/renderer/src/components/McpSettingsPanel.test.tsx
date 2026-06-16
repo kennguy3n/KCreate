@@ -13,7 +13,7 @@
 // `setup.vitest.ts`; the `mcp` / `mcpPermission` namespaces were added
 // to the stub for this panel.
 
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import { render, screen, fireEvent, act } from "@testing-library/react";
 
 import { McpSettingsPanel } from "./McpSettingsPanel";
@@ -92,6 +92,59 @@ describe("McpSettingsPanel", () => {
     const grant = stub.calls.find((c) => c.method === "mcpPermission.grant");
     expect(grant).toBeDefined();
     expect(grant?.args).toEqual(["demo-agent", "apply_template", "always"]);
+  });
+
+  it("surfaces a poll failure once, then pauses instead of spamming toasts", async () => {
+    // The live poll fires every 2500ms while the server runs. If the
+    // bridge starts failing, the panel must not emit an error toast on
+    // every tick: it surfaces the fault once, then once more when it
+    // pauses the poll after a run of failures.
+    const POLL_MS = 2500;
+    vi.useFakeTimers();
+    try {
+      const stub = kcreateStub();
+      let statusCalls = 0;
+      stub.override("mcpPermission.status", () => {
+        statusCalls += 1;
+        // First poll succeeds (server running, so the interval arms),
+        // then the bridge "crashes" and every later poll rejects.
+        return statusCalls === 1
+          ? RUNNING
+          : Promise.reject(new Error("bridge gone"));
+      });
+      const onStatus = vi.fn();
+
+      render(<McpSettingsPanel onStatus={onStatus} />);
+      // Flush the initial mount refresh (microtask-based, not timed).
+      await act(async () => {
+        await Promise.resolve();
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+
+      // Drive more than MAX_POLL_FAILURES (5) interval ticks.
+      for (let i = 0; i < 7; i += 1) {
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(POLL_MS);
+        });
+      }
+
+      const failureToasts = onStatus.mock.calls.filter(
+        ([m]) =>
+          typeof m === "string" &&
+          (m.includes("bridge gone") || m.includes("polling paused")),
+      );
+      // Exactly two: the first failure + the pause notice — never one
+      // per tick (which would be 5+).
+      expect(failureToasts.length).toBe(2);
+      expect(failureToasts.some(([m]) => String(m).includes("paused"))).toBe(
+        true,
+      );
+      // The poll stopped after pausing, so status was not polled forever.
+      expect(statusCalls).toBe(6);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("lists granted scopes grouped by client and revokes them", async () => {

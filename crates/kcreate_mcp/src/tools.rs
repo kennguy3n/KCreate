@@ -729,7 +729,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
                     "node_ids": {"type": "array", "items": {"type": "string"}},
                     "format": {"type": "string", "description": "svg | png | pdf"},
                     "path": {"type": "string"},
-                    "options": {"type": "object", "description": "Format-specific export options."}
+                    "options": {"type": "object", "description": "Format-specific export options. PNG keys: width, height, scale, background. PDF keys (camelCase): widthMm, heightMm, colorMode, cmykDither. SVG honours node_id(s) and needs no options."}
                 }),
                 &["format", "path"],
             ),

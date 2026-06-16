@@ -1,0 +1,156 @@
+name: release
+
+# I1 — cross-platform release packaging lane.
+#
+# Separate from `ci.yml` so it can never slow down or break the fast /
+# smoke lanes that gate every PR. It builds the installable artifacts for
+# all three desktop platforms and uploads them as workflow artifacts; on a
+# version tag (or an opt-in manual run) it also publishes them — together
+# with the electron-updater feed metadata (latest-linux.yml / latest.yml /
+# latest-mac.yml) — to a GitHub release so the in-app updater can find them.
+#
+# Triggers:
+#   * push of a `v*` tag  → build + publish to the GitHub release.
+#   * workflow_dispatch    → build always; publish only when `publish=true`.
+#
+# Signing is wired through environment secrets (see docs/RELEASE.md). When
+# the secrets are absent the build still succeeds, producing unsigned
+# artifacts — so the lane is exercisable on a fork without credentials.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Publish artifacts + update metadata to a GitHub release"
+        type: boolean
+        default: false
+
+concurrency:
+  group: release-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  package:
+    name: package (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            artifact: linux
+            builder_flags: "--linux --x64"
+          - os: macos-14
+            artifact: mac
+            # Ships both mac arches: the bridge is staged as a universal
+            # (x86_64 + arm64) cdylib (see the mac step + stage-bridge.mjs),
+            # so each arch slice embeds a loadable bridge. The runner arch is
+            # irrelevant — both Rust targets are cross-compiled and `lipo`-
+            # merged regardless of host, and electron-builder emits a
+            # universal dmg/zip either way; macos-14 (arm64) is the current
+            # GA image (macos-13 is being phased out).
+            builder_flags: "--mac"
+          - os: windows-2022
+            artifact: windows
+            builder_flags: "--win --x64"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: install rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: install linux packaging deps
+        if: runner.os == 'Linux'
+        # fakeroot + dpkg build the .deb; the gpu/font headers build the
+        # bridge cdylib; rpm lets electron-builder emit an .rpm too if the
+        # config is extended later.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwayland-dev libxkbcommon-dev libxcb1-dev libfontconfig1-dev \
+            libgl1 libvulkan1 mesa-vulkan-drivers \
+            fakeroot dpkg rpm
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.26.0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20.11.0"
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: build bridge cdylib (release)
+        if: runner.os != 'macOS'
+        run: cargo build --release -p kcreate_bridge
+
+      - name: build universal bridge cdylib (release)
+        if: runner.os == 'macOS'
+        # Both apple-darwin slices so stage:bridge can `lipo` them into a
+        # universal cdylib that loads in both the x64 and arm64 .app builds.
+        # Keep these builds sequential: each writes a distinct triple-scoped
+        # output dir (target/<triple>/release/), so back-to-back invocations
+        # are safe, but cargo shares the workspace target/ for intermediates —
+        # do NOT background them with `&`, which can race on those.
+        run: |
+          rustup target add x86_64-apple-darwin aarch64-apple-darwin
+          cargo build --release -p kcreate_bridge --target x86_64-apple-darwin
+          cargo build --release -p kcreate_bridge --target aarch64-apple-darwin
+
+      - name: build app bundles (main/preload/renderer)
+        run: pnpm --filter @kcreate/desktop build
+
+      - name: stage bridge cdylib
+        # The cdylib slice(s) were just built above; skip the script's own
+        # cargo build. On macOS stage:bridge lipo-merges the two slices.
+        env:
+          KCREATE_SKIP_BRIDGE_BUILD: "1"
+        run: pnpm --filter @kcreate/desktop stage:bridge
+
+      - name: package (electron-builder)
+        working-directory: apps/desktop
+        env:
+          # Publishing to the GitHub release (tag push or opt-in dispatch).
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # macOS code signing + notarization (optional — unset ⇒ unsigned).
+          CSC_LINK: ${{ secrets.CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          # Windows code signing (optional — unset ⇒ unsigned).
+          WIN_CSC_LINK: ${{ secrets.WIN_CSC_LINK }}
+          WIN_CSC_KEY_PASSWORD: ${{ secrets.WIN_CSC_KEY_PASSWORD }}
+        shell: bash
+        run: |
+          PUBLISH="never"
+          if [ "${{ github.event_name }}" = "push" ] || [ "${{ inputs.publish }}" = "true" ]; then
+            PUBLISH="always"
+          fi
+          pnpm exec electron-builder --config electron-builder.yml ${{ matrix.builder_flags }} --publish "$PUBLISH"
+
+      - name: upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: kcreate-${{ matrix.artifact }}
+          path: |
+            apps/desktop/release/*.AppImage
+            apps/desktop/release/*.deb
+            apps/desktop/release/*.dmg
+            apps/desktop/release/*.zip
+            apps/desktop/release/*.exe
+            apps/desktop/release/*.yml
+            apps/desktop/release/*.blockmap
+          if-no-files-found: warn
+          retention-days: 14

@@ -3,6 +3,9 @@
   "version": "0.0.1",
   "private": true,
   "description": "KCreate desktop shell (Electron main + preload + renderer)",
+  "author": "KCreate contributors <maintainers@kcreate.io>",
+  "homepage": "https://github.com/kennguy3n/KCreate",
+  "license": "AGPL-3.0-or-later",
   "main": "main/dist/main.js",
   "scripts": {
     "build": "node build.mjs && vite build --config renderer/vite.config.ts",
@@ -13,9 +16,16 @@
     "test:vitest:watch": "vitest --config renderer/vitest.config.ts",
     "test:e2e": "node --test tests/e2e/boot.test.mjs",
     "start": "electron .",
-    "dev:renderer": "vite --config renderer/vite.config.ts"
+    "dev:renderer": "vite --config renderer/vite.config.ts",
+    "stage:bridge": "node scripts/stage-bridge.mjs",
+    "prepackage": "pnpm build && pnpm stage:bridge",
+    "package": "pnpm prepackage && electron-builder --config electron-builder.yml",
+    "package:linux": "pnpm prepackage && electron-builder --config electron-builder.yml --linux",
+    "package:mac": "pnpm prepackage && electron-builder --config electron-builder.yml --mac",
+    "package:win": "pnpm prepackage && electron-builder --config electron-builder.yml --win"
   },
   "dependencies": {
+    "electron-updater": "^6.8.9",
     "react": "18.3.1",
     "react-dom": "18.3.1"
   },
@@ -29,6 +39,7 @@
     "@typescript-eslint/parser": "8.16.0",
     "@vitejs/plugin-react": "4.3.4",
     "electron": "33.2.0",
+    "electron-builder": "^25.1.8",
     "esbuild": "0.24.0",
     "eslint": "9.16.0",
     "eslint-plugin-react": "7.37.2",

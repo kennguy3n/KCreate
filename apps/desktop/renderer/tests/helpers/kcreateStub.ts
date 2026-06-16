@@ -22,6 +22,7 @@ import type {
   ApplyThemeReport,
   Preferences,
   Theme,
+  UpdateState,
 } from "../../../shared/scene";
 
 export interface KcreateStubCall {
@@ -151,6 +152,20 @@ const defaultApplyThemeReport: ApplyThemeReport = {
   recoloredFills: 0,
   recoloredStrokes: 0,
   restyledText: 0,
+};
+
+// I1 — auto-update. Default snapshot for test land: the harness never
+// runs a packaged build, so the updater reports a disabled, up-to-date
+// state. Typed via the imported interface so a field addition becomes a
+// compile error here rather than a silent runtime gap.
+const defaultUpdateState: UpdateState = {
+  status: "disabled",
+  currentVersion: "0.0.0",
+  feedUrl: null,
+  info: null,
+  progress: null,
+  error: null,
+  supported: false,
 };
 
 const defaultsByMethod: Record<string, () => unknown> = {
@@ -443,6 +458,17 @@ const defaultsByMethod: Record<string, () => unknown> = {
     version: "0.0.0",
     source: null,
   }),
+  // I1 — auto-update. In test land the app is never packaged, so the
+  // default state mirrors what the main-process updater reports on an
+  // unpackaged run: a disabled, up-to-date snapshot. `onStateChange`
+  // returns a no-op unsubscribe (see SYNC_METHODS) so a component that
+  // subscribes in an effect mounts + cleans up without wiring an
+  // override every time.
+  "update.getState": (): UpdateState => ({ ...defaultUpdateState }),
+  "update.check": (): UpdateState => ({ ...defaultUpdateState }),
+  "update.download": (): UpdateState => ({ ...defaultUpdateState }),
+  "update.quitAndInstall": () => undefined,
+  "update.onStateChange": () => (): void => undefined,
   setLayerColor: () => undefined,
 };
 
@@ -461,6 +487,10 @@ const SYNC_METHODS = new Set<string>([
   // in Promise.resolve makes the cleanup call a Promise and
   // throws `destroy is not a function`.
   "onboarding.onInstallProgress",
+  // I1 — `update.onStateChange(fn) => unsubscribe`. Same contract as
+  // the onboarding subscriber above: cleanup must be synchronously
+  // callable.
+  "update.onStateChange",
 ]);
 
 export function installKcreateStub(): KcreateStubHandle {
@@ -517,6 +547,8 @@ export function installKcreateStub(): KcreateStubHandle {
     aiModel: namespace("aiModel"),
     onboarding: namespace("onboarding"),
     system: namespace("system"),
+    // I1 — auto-update surface.
+    update: namespace("update"),
     assets: namespace("assets"),
     // Workstream G2 — ready-made template library bridge.
     templateMarketplace: namespace("templateMarketplace"),

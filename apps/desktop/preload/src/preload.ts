@@ -222,6 +222,8 @@ import type {
   OnboardingBridge,
   OnboardingInstallReport,
   OnboardingProgress,
+  UpdateBridge,
+  UpdateState,
   Phase9Bridge,
   GuideInfo,
   GridSettingsInfo,
@@ -4063,6 +4065,39 @@ const onboarding: OnboardingBridge = {
   },
 };
 
+// I1 — auto-update surface. The renderer reads the current state via
+// `getState()`, drives a check / download imperatively, and subscribes
+// to pushed transitions via `onStateChange(fn)` (returns an unsubscribe
+// handle, mirroring `onboarding.onInstallProgress`). The updater lives
+// entirely in the main process; this is a thin IPC shim.
+const update: UpdateBridge = {
+  async getState(): Promise<UpdateState> {
+    return (await ipcRenderer.invoke(
+      "kcreate/update/getState",
+    )) as UpdateState;
+  },
+  async check(): Promise<UpdateState> {
+    return (await ipcRenderer.invoke("kcreate/update/check")) as UpdateState;
+  },
+  async download(): Promise<UpdateState> {
+    return (await ipcRenderer.invoke(
+      "kcreate/update/download",
+    )) as UpdateState;
+  },
+  async quitAndInstall(): Promise<void> {
+    await ipcRenderer.invoke("kcreate/update/quitAndInstall");
+  },
+  onStateChange(listener: (state: UpdateState) => void): () => void {
+    const handler = (_e: unknown, state: UpdateState): void => {
+      listener(state);
+    };
+    ipcRenderer.on("kcreate/update/stateChanged", handler);
+    return (): void => {
+      ipcRenderer.removeListener("kcreate/update/stateChanged", handler);
+    };
+  },
+};
+
 contextBridge.exposeInMainWorld("kcreate", {
   renderer,
   document,
@@ -4117,4 +4152,5 @@ contextBridge.exposeInMainWorld("kcreate", {
   annotation,
   system,
   onboarding,
+  update,
 });

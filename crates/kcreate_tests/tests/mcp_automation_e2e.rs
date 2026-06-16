@@ -17,11 +17,11 @@
 //!    These are asserted against the SAME shared store the settings UI
 //!    drives (`phase2::mcp_permission_*`).
 //! 2. **Tools mutate the real document.** A recognizable two-card poster
-//!    is composed ENTIRELY via `insert_asset` + `set_fill` + `create_node`
-//!    + `set_text` tool calls, then exported to PNG and SVG via the
-//!    `export_design` tool. The PNG is asserted non-blank (PNG magic +
-//!    IDAT + `>= 2` distinct colours + non-trivial size); the SVG is
-//!    asserted to carry real `<path>` geometry. The composed artwork is
+//!    is composed ENTIRELY via the `insert_asset`, `set_fill`,
+//!    `create_node`, and `set_text` tool calls, then exported to PNG and
+//!    SVG via the `export_design` tool. The PNG is asserted non-blank
+//!    (PNG magic, IDAT, `>= 2` distinct colours, non-trivial size); the
+//!    SVG is asserted to carry real `<path>` geometry. The composed artwork is
 //!    written under `$CARGO_TARGET_TMPDIR` and its path printed (run with
 //!    `-- --nocapture`) so it can be captured for the PR proof.
 //! 3. **Results are undoable.** After composing, a fresh `create_node`
@@ -29,8 +29,8 @@
 //!    returns `Some` with the matching command + affected node — proving
 //!    the tool path went through `execute_operation`, not a fake echo.
 //!
-//! Lives in its own integration binary because the renderer + workspace
-//! + MCP permission store are process-global singletons; a dedicated
+//! Lives in its own integration binary because the renderer, workspace,
+//! and MCP permission store are process-global singletons; a dedicated
 //! file gives this test a clean process no other test has touched.
 
 use std::io::{Read, Write};

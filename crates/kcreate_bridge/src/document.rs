@@ -1661,6 +1661,13 @@ const APPLY_PATCH_COMMANDS: &[&str] = &[
     // in `ApplyPatchSnapshot::capture` (documented no-op arm there).
     "ai_generate_themed_design",
     "ai_refine_themed_design",
+    // I6 — Print preflight auto-fix. `preflight_autofix` snapshots the
+    // full prior + next `Node` for every layer the fix pass mutated
+    // (add bleed / convert to CMYK / cap total ink), so one Ctrl+Z
+    // reverts the whole pass. before_patch = undo direction, after =
+    // redo, both the [`PreflightAutofixPatch`] shape. `capture` snapshots
+    // the same nodes for atomic group rollback.
+    "preflight_autofix",
     // I4 — plugin marketplace. A reviewed batch of WASM/JS plugin
     // proposals (move / recolor / create / delete) is folded into a
     // single `plugin_apply_proposals` op whose before / after patches
@@ -1768,6 +1775,12 @@ struct ApplyPatchSnapshot {
     // rolls back atomically on a mid-group failure.
     apply_theme: HashMap<Uuid, ApplyThemeSnapshot>,
     apply_theme_tokens: Option<DesignTokens>,
+    // I6 — per-node full `Node` captured before any `preflight_autofix`
+    // patch in the group runs, so a mid-group failure rolls the whole
+    // fix pass (bleed extend / RGB→CMYK / ink cap) back to its pre-loop
+    // state. Restore only replays the geometry + paint fields the fix
+    // touches, never the node's hierarchy.
+    preflight_autofix: HashMap<Uuid, kcreate_core::node::Node>,
 }
 
 /// Pre-loop snapshot of the node state an `apply_theme` patch may
@@ -1815,6 +1828,7 @@ impl ApplyPatchSnapshot {
             text_layer: HashMap::new(),
             apply_theme: HashMap::new(),
             apply_theme_tokens: None,
+            preflight_autofix: HashMap::new(),
         };
         for op in ops {
             // Defence-in-depth: skip commands the apply_patch
@@ -1939,6 +1953,20 @@ impl ApplyPatchSnapshot {
                                         .cloned(),
                                     text_style: node.metadata.get("text_style").cloned(),
                                 });
+                            }
+                        }
+                    }
+                }
+                "preflight_autofix" => {
+                    // Snapshot the full prior `Node` once per id (first
+                    // op that mentions it) so restore can revert the
+                    // geometry + paint fields the fix overwrote.
+                    for id in &op.affected_nodes {
+                        if let std::collections::hash_map::Entry::Vacant(slot) =
+                            snap.preflight_autofix.entry(*id)
+                        {
+                            if let Some(node) = ws.project.document.get_node(*id) {
+                                slot.insert(node.clone());
                             }
                         }
                     }
@@ -2069,6 +2097,20 @@ impl ApplyPatchSnapshot {
         }
         if let Some(tokens) = self.apply_theme_tokens {
             ws.project.design_tokens = tokens;
+        }
+        // I6 — restore the geometry + paint fields a preflight auto-fix
+        // patch may have overwritten, so a mid-group failure rolls the
+        // whole fix pass back to its pre-loop state. We deliberately do
+        // NOT replay id / parent_id / children / node_type: the fix only
+        // ever edits bounds / transform / style / metadata, so leaving
+        // the hierarchy untouched is both sufficient and safe.
+        for (id, node_snap) in self.preflight_autofix {
+            if let Some(node) = ws.project.document.get_node_mut(id) {
+                node.bounds = node_snap.bounds;
+                node.transform = node_snap.transform;
+                node.style = node_snap.style;
+                node.metadata = node_snap.metadata;
+            }
         }
     }
 }
@@ -2399,6 +2441,24 @@ struct ApplyThemePatch {
     nodes: std::collections::BTreeMap<Uuid, ApplyThemeNodePatch>,
 }
 
+/// Patch payload for a `preflight_autofix` operation: the full prior
+/// (`before_patch`) / next (`after_patch`) [`Node`] snapshot for every
+/// layer the fix pass mutated. Auto-fix only rewrites existing-node
+/// geometry + paint (`bounds`, `transform`, `style`, `metadata`) —
+/// never creates, deletes, or reparents — so replaying those fields
+/// from the snapshot is a complete, symmetric revert that one Ctrl+Z
+/// applies to the whole pass (see the `preflight_autofix` arms in
+/// [`apply_patch`] and [`ApplyPatchSnapshot`]). The full `Node` is
+/// carried (rather than just the four mutated fields) so the record
+/// stays self-describing and forward-compatible if a future fix class
+/// touches another property.
+///
+/// [`Node`]: kcreate_core::node::Node
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct PreflightAutofixPatch {
+    pub(crate) nodes: std::collections::BTreeMap<Uuid, kcreate_core::node::Node>,
+}
+
 fn apply_patch(ws: &mut Workspace, op: &Operation, patch: &serde_json::Value) -> Result<()> {
     // `project.undo()` / `project.redo()` already bumped
     // `modified_at` before we got here, so we don't need to touch it
@@ -2680,6 +2740,37 @@ fn apply_patch(ws: &mut Workspace, op: &Operation, patch: &serde_json::Value) ->
         "ai_generate_themed_design" | "ai_refine_themed_design" => {
             let parsed: crate::phase10::ThemedDesignPatch = serde_json::from_value(patch.clone())?;
             apply_themed_design_patch(ws, parsed)
+        }
+        // I6 — Print preflight auto-fix. Both before_patch and
+        // after_patch carry the full [`PreflightAutofixPatch`] (a
+        // per-node `Node` snapshot for every layer the fix pass
+        // touched). Undo replays before_patch, redo replays
+        // after_patch, so one Ctrl+Z reverts the whole "add bleed /
+        // convert to CMYK / cap ink" pass. We restore ONLY the
+        // geometry + paint fields the fix mutates (`bounds`,
+        // `transform`, `style`, `metadata`) so a node's hierarchy
+        // (parent / children) is never disturbed; `document_undo` /
+        // `document_redo` re-run scene sync after the apply_patch loop.
+        "preflight_autofix" => {
+            // Deserialize the WHOLE payload up-front so a malformed
+            // patch fails before any mutation (fail-fast, never
+            // half-applied).
+            let parsed: PreflightAutofixPatch = serde_json::from_value(patch.clone())?;
+            for (id, snapshot) in parsed.nodes {
+                let Some(node) = ws.project.document.get_node_mut(id) else {
+                    // The node was removed by a later op that the LIFO
+                    // operation log undoes before this one in normal
+                    // flows. Skip defensively rather than failing the
+                    // whole fix pass if the graph has diverged.
+                    continue;
+                };
+                node.bounds = snapshot.bounds;
+                node.transform = snapshot.transform;
+                node.style = snapshot.style;
+                node.metadata = snapshot.metadata;
+                node.touch();
+            }
+            Ok(())
         }
         // I4 — plugin marketplace. Replay one batch of applied plugin
         // proposals in either direction from a [`PluginApplyPatch`].
@@ -8673,39 +8764,7 @@ pub fn export_pdf_file(output_path: &Path, options: &PdfExportRequest) -> Result
 pub fn export_pdf_bytes(options: &PdfExportRequest) -> Result<Vec<u8>> {
     let guard = slot().write();
     let ws = guard.as_ref().ok_or(DocumentBridgeError::NoProject)?;
-    let mut rasters = kcreate_export::pdf::RasterPixelCache::new();
-    // Preload every raster layer's pixels so the export crate doesn't
-    // need to know about the storage layer. Decode happens once per
-    // unique blob hash (HashMap dedupes for free).
-    for (_uuid, node) in ws.project.document.iter() {
-        if !matches!(node.node_type, NodeType::RasterLayer) {
-            continue;
-        }
-        let Some(meta_value) = node
-            .metadata
-            .get(crate::scene_sync::RASTER_IMAGE_METADATA_KEY)
-        else {
-            continue;
-        };
-        let Ok(meta) =
-            serde_json::from_value::<crate::scene_sync::RasterImageMeta>(meta_value.clone())
-        else {
-            continue;
-        };
-        if rasters.contains_key(&meta.blob_hash) {
-            continue;
-        }
-        let bytes = {
-            let store = ws.store.lock();
-            match store.blobs().load(&meta.blob_hash) {
-                Ok(b) => b,
-                Err(_) => continue,
-            }
-        };
-        if let Ok(pixels) = kcreate_export::pdf::RasterPixels::decode(&bytes) {
-            rasters.insert(meta.blob_hash, pixels);
-        }
-    }
+    let rasters = preload_document_rasters(ws);
     let resolved_color_mode = match options.color_mode.as_deref() {
         Some("rgb" | "Rgb") => kcreate_export::pdf::PdfColorMode::Rgb,
         Some("cmyk" | "Cmyk" | "CMYK") => kcreate_export::pdf::PdfColorMode::Cmyk,
@@ -8760,6 +8819,142 @@ pub fn export_pdf_bytes(options: &PdfExportRequest) -> Result<Vec<u8>> {
     .map_err(|e| DocumentBridgeError::Io(std::io::Error::other(e.to_string())))?;
     drop(guard);
     Ok(bytes)
+}
+
+/// Decode every raster layer's pixels into the export crate's
+/// [`RasterPixelCache`], keyed by content-addressed blob hash.
+///
+/// Pulled out of [`export_pdf_bytes`] so both the standard and the
+/// print-ready PDF exporters share one preload path: the export crate
+/// stays storage-agnostic, and a blob is decoded at most once per
+/// export even when many layers reference the same image (the
+/// `HashMap` dedupes on `blob_hash`).
+fn preload_document_rasters(ws: &Workspace) -> kcreate_export::pdf::RasterPixelCache {
+    let mut rasters = kcreate_export::pdf::RasterPixelCache::new();
+    for (_uuid, node) in ws.project.document.iter() {
+        if !matches!(node.node_type, NodeType::RasterLayer) {
+            continue;
+        }
+        let Some(meta_value) = node
+            .metadata
+            .get(crate::scene_sync::RASTER_IMAGE_METADATA_KEY)
+        else {
+            continue;
+        };
+        let Ok(meta) =
+            serde_json::from_value::<crate::scene_sync::RasterImageMeta>(meta_value.clone())
+        else {
+            continue;
+        };
+        if rasters.contains_key(&meta.blob_hash) {
+            continue;
+        }
+        let bytes = {
+            let store = ws.store.lock();
+            match store.blobs().load(&meta.blob_hash) {
+                Ok(b) => b,
+                Err(_) => continue,
+            }
+        };
+        if let Ok(pixels) = kcreate_export::pdf::RasterPixels::decode(&bytes) {
+            rasters.insert(meta.blob_hash, pixels);
+        }
+    }
+    rasters
+}
+
+// -----------------------------------------------------------------------------
+// Print-ready PDF export (bleed + trim/registration marks + CMYK +
+// spot separations). Builds on `kcreate_export::export_print_ready_pdf`.
+// -----------------------------------------------------------------------------
+
+/// Wire-format request for the print-ready PDF exporter. `page_id` is
+/// the artboard/page to print; `options` carries the press parameters
+/// (bleed, mark geometry, color mode, dithering). The renderer sends
+/// `options` as the camelCase [`kcreate_export::PrintReadyOptions`]
+/// JSON; an empty object yields the press-standard defaults (3 mm
+/// bleed, trim + registration marks, CMYK output).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct PrintReadyExportRequest {
+    pub page_id: String,
+    #[serde(default)]
+    pub options: kcreate_export::PrintReadyOptions,
+}
+
+/// Machine-readable summary returned to the renderer after a
+/// print-ready export. Lets the panel report the actual media/trim
+/// box and the spot plates that were separated without re-parsing
+/// the PDF. Serialised as camelCase JSON for the IPC layer.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrintReadyExportOutcome {
+    pub bytes_written: u64,
+    /// `(width, height)` of the MediaBox in millimetres (trim +
+    /// bleed + mark allowance on every side).
+    pub media_box_mm: (f64, f64),
+    /// `(width, height)` of the TrimBox in millimetres (the finished
+    /// piece after cutting).
+    pub trim_box_mm: (f64, f64),
+    pub bleed_mm: f64,
+    /// Names of the spot-color plates that became `/Separation`
+    /// color spaces in the PDF, in plate order.
+    pub spot_plates: Vec<String>,
+    /// `"rgb"`, `"cmyk"`, or `"pass_through"` — the `PdfColorMode`
+    /// wire value the page content was emitted in. Matches the
+    /// representation accepted on input so the field round-trips.
+    pub color_mode: String,
+}
+
+fn print_ready_color_mode_label(mode: kcreate_export::pdf::PdfColorMode) -> &'static str {
+    match mode {
+        kcreate_export::pdf::PdfColorMode::Rgb => "rgb",
+        kcreate_export::pdf::PdfColorMode::Cmyk => "cmyk",
+        kcreate_export::pdf::PdfColorMode::PassThrough => "pass_through",
+    }
+}
+
+/// Render the open document's `page_id` to a press-ready PDF in
+/// memory. Returns the PDF bytes plus a [`PrintReadyExportOutcome`]
+/// describing the geometry and separations that were written.
+pub fn export_print_ready_pdf_bytes(
+    request: &PrintReadyExportRequest,
+) -> Result<(Vec<u8>, PrintReadyExportOutcome)> {
+    let page_id = Uuid::parse_str(&request.page_id)
+        .map_err(|e| DocumentBridgeError::InvalidUuid(request.page_id.clone(), e))?;
+    with_workspace(|ws| {
+        let rasters = preload_document_rasters(ws);
+        let result = kcreate_export::export_print_ready_pdf(
+            &ws.project.document,
+            page_id,
+            &request.options,
+            &rasters,
+            &ws.project.spot_color_library,
+        )
+        .map_err(|e| DocumentBridgeError::Internal(e.to_string()))?;
+        let outcome = PrintReadyExportOutcome {
+            bytes_written: result.bytes.len() as u64,
+            media_box_mm: result.media_box_mm,
+            trim_box_mm: result.trim_box_mm,
+            bleed_mm: result.bleed_mm,
+            spot_plates: result.spot_plates,
+            color_mode: print_ready_color_mode_label(result.color_mode).to_string(),
+        };
+        Ok((result.bytes, outcome))
+    })
+}
+
+/// Filesystem companion to [`export_print_ready_pdf_bytes`]: render
+/// the page and write the PDF to `output_path`, returning the
+/// outcome summary (with `bytes_written` reflecting the file size).
+pub fn export_print_ready_pdf_file(
+    output_path: &Path,
+    request: &PrintReadyExportRequest,
+) -> Result<PrintReadyExportOutcome> {
+    let (bytes, mut outcome) = export_print_ready_pdf_bytes(request)?;
+    outcome.bytes_written = bytes.len() as u64;
+    std::fs::write(output_path, bytes)?;
+    Ok(outcome)
 }
 
 // -----------------------------------------------------------------------------
@@ -10597,6 +10792,8 @@ mod tests {
             // H4 — AI generation depth (generate + refine).
             "ai_generate_themed_design",
             "ai_refine_themed_design",
+            // I6 — Print preflight auto-fix (one undoable fix pass).
+            "preflight_autofix",
             // I4 — plugin marketplace (reviewed proposal batch).
             "plugin_apply_proposals",
         ]

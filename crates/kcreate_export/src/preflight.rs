@@ -114,6 +114,17 @@ pub enum PreflightCheck {
     /// non-shared ink AND neither node carries an explicit trap
     /// (`overprint = true` on the lighter of the two).
     Trapping,
+    /// A foreground content layer sits inside the trim but within
+    /// the safe margin of a trim edge. Live content (text, logos,
+    /// small graphics) placed this close to the cut line risks
+    /// being clipped by trim drift or looking cramped against the
+    /// edge. Distinct from [`PreflightCheck::BleedMargin`] /
+    /// [`PreflightCheck::BleedAreaEmpty`], which are about content
+    /// that must extend *past* the trim to cover the bleed; this
+    /// one is about content that must stay *inside* the safe area.
+    /// Full-bleed backgrounds are exempt (they are meant to reach
+    /// the edge). Fires once per node listing every offending side.
+    SafeMargin,
 }
 
 impl PreflightCheck {
@@ -134,6 +145,7 @@ impl PreflightCheck {
             Self::SpotColorMissing => "spot_color_missing",
             Self::OverprintTable => "overprint_table",
             Self::Trapping => "trapping",
+            Self::SafeMargin => "safe_margin",
         }
     }
 }
@@ -202,6 +214,15 @@ pub struct PreflightOptions {
     /// fires when a CMYK fill's component sum exceeds this value;
     /// gradient stops are checked individually.
     pub target_total_ink_coverage: f64,
+    /// Safe margin in millimetres inside the trim edge. Foreground
+    /// content layers (text, logos, small graphics) whose bounds
+    /// fall inside the trim but within this distance of a trim edge
+    /// raise a [`PreflightCheck::SafeMargin`] warning. `0.0`
+    /// disables the check. Full-bleed backgrounds (layers covering
+    /// most of the page) are exempt so the check targets live
+    /// content, not the intentional bleed fill. Default 5 mm, the
+    /// conventional commercial-print safe zone.
+    pub safe_margin_mm: f64,
 }
 
 impl PreflightOptions {
@@ -270,6 +291,7 @@ impl Default for PreflightOptions {
             allow_transparency: false,
             target_color_space: ColorSpaceTarget::Cmyk,
             target_total_ink_coverage: 3.0,
+            safe_margin_mm: 5.0,
         }
     }
 }
@@ -387,6 +409,7 @@ pub fn run_preflight_with_spots(
                 continue;
             };
             check_node_for_bleed(node, page_id, &dims, options, &mut issues);
+            check_node_safe_margin(node, page_id, &dims, options, &mut issues);
             check_node_color_space(node, page_id, options, &mut issues);
             check_node_transparency(node, page_id, options, &mut issues);
             check_node_shading(node, page_id, options, &mut issues);
@@ -455,6 +478,81 @@ fn page_dimensions(page: &Node, layout: Option<&PageLayout>) -> PageDimensions {
         height_px,
         px_per_mm,
     }
+}
+
+/// Document pixels per millimetre for `page`, derived from its
+/// [`PageLayout`] metadata (physical size ÷ pixel size) or, absent a
+/// layout, the [`FALLBACK_PRINT_DPI`] assumption. This is the single
+/// source of truth the preflight checks use to convert the
+/// `require_bleed_mm` / `safe_margin_mm` options into pixel bands;
+/// the auto-fix path in the bridge reuses it so a generated fix
+/// lands exactly on the line a re-run validates against.
+#[must_use]
+pub fn page_pixels_per_mm(page: &Node) -> f64 {
+    let layout = read_page_layout(page);
+    page_dimensions(page, layout.as_ref()).px_per_mm
+}
+
+/// Target bounds for a full-bleed background on `page`: the page
+/// rectangle grown by `require_bleed_mm` on every side, expressed in
+/// the same page-relative coordinate frame the bleed checks read
+/// (`check_node_for_bleed` / `check_page_bleed_area_coverage`), i.e.
+/// the page's top-left at the origin. A background placed at exactly
+/// these bounds covers all four bleed strips and clears the
+/// `BleedMargin` / `BleedAreaEmpty` findings. Returns `None` when the
+/// page has no positive pixel size or the requested bleed is
+/// non-positive (nothing to extend).
+#[must_use]
+pub fn page_bleed_box(page: &Node, require_bleed_mm: f64) -> Option<kcreate_core::node::Bounds> {
+    if require_bleed_mm <= 0.0 {
+        return None;
+    }
+    let layout = read_page_layout(page);
+    let dims = page_dimensions(page, layout.as_ref());
+    if dims.width_px <= 0.0 || dims.height_px <= 0.0 || dims.px_per_mm <= 0.0 {
+        return None;
+    }
+    let bleed_px = require_bleed_mm * dims.px_per_mm;
+    Some(kcreate_core::node::Bounds::new(
+        -bleed_px,
+        -bleed_px,
+        dims.width_px + 2.0 * bleed_px,
+        dims.height_px + 2.0 * bleed_px,
+    ))
+}
+
+/// Content-layer descendants of `page_id` large enough to be treated
+/// as full-bleed backgrounds — the same "≥ 85 % of the page area"
+/// rule the safe-margin check uses to exempt backgrounds. These are
+/// the nodes the bleed auto-fix extends to [`page_bleed_box`]:
+/// extending a centred headline or logo would be wrong, but a
+/// near-full-page hero fill is exactly what should grow into the
+/// bleed. Returned in the document's descendant order.
+#[must_use]
+pub fn full_bleed_background_candidates(document: &DocumentGraph, page_id: Uuid) -> Vec<Uuid> {
+    let Some(page) = document.get_node(page_id) else {
+        return Vec::new();
+    };
+    if page.node_type != NodeType::Page {
+        return Vec::new();
+    }
+    let dims = page_dimensions(page, read_page_layout(page).as_ref());
+    if dims.width_px <= 0.0 || dims.height_px <= 0.0 {
+        return Vec::new();
+    }
+    let page_area = dims.width_px * dims.height_px;
+    let threshold = SAFE_MARGIN_BACKGROUND_AREA_RATIO * page_area;
+    collect_descendants(document, page_id)
+        .into_iter()
+        .filter(|id| {
+            document.get_node(*id).is_some_and(|node| {
+                is_content_layer(node.node_type)
+                    && node.bounds.width > 0.0
+                    && node.bounds.height > 0.0
+                    && node.bounds.width * node.bounds.height >= threshold
+            })
+        })
+        .collect()
 }
 
 fn collect_descendants(document: &DocumentGraph, root: Uuid) -> Vec<Uuid> {
@@ -555,6 +653,111 @@ fn is_content_layer(node_type: NodeType) -> bool {
             | NodeType::ComponentLayer
     )
 }
+
+/// Safe-margin check.
+///
+/// Foreground content that sits inside the trim but within
+/// `safe_margin_mm` of a trim edge risks being clipped by trim
+/// drift (the cut tolerance on a guillotine is ±0.5–1 mm) or simply
+/// reads as cramped against the edge. This check flags any content
+/// layer whose bounds fall *inside* the page yet within the safe
+/// margin of an edge, listing every offending side in one warning.
+///
+/// Full-bleed backgrounds are exempt: a layer covering most of the
+/// page is meant to reach (and pass) the trim, and the bleed checks
+/// already own that geometry. We treat a layer as a background when
+/// its area is at least [`SAFE_MARGIN_BACKGROUND_AREA_RATIO`] of the
+/// page area. Layers that *cross* a trim edge on a given side are
+/// skipped for that side too — crossing the trim means the element
+/// is bleeding there, which `check_node_for_bleed` /
+/// `check_page_bleed_area_coverage` evaluate, not this check.
+fn check_node_safe_margin(
+    node: &Node,
+    page_id: Uuid,
+    dims: &PageDimensions,
+    options: &PreflightOptions,
+    issues: &mut Vec<PreflightIssue>,
+) {
+    if !is_content_layer(node.node_type) {
+        return;
+    }
+    if dims.px_per_mm <= 0.0 || options.safe_margin_mm <= 0.0 {
+        return;
+    }
+    if dims.width_px <= 0.0 || dims.height_px <= 0.0 {
+        return;
+    }
+    let b = &node.bounds;
+    if b.width <= 0.0 || b.height <= 0.0 {
+        return;
+    }
+    // Exempt full-bleed backgrounds — they are supposed to touch the
+    // edge. The ratio is generous (85%) so a near-full-page hero
+    // image still counts as a background, while a centred headline or
+    // logo (which is what this check is for) does not.
+    let page_area = dims.width_px * dims.height_px;
+    let node_area = b.width * b.height;
+    if node_area >= SAFE_MARGIN_BACKGROUND_AREA_RATIO * page_area {
+        return;
+    }
+
+    let safe_px = options.safe_margin_mm * dims.px_per_mm;
+    let left = b.x;
+    let right = b.x + b.width;
+    let top = b.y;
+    let bottom = b.y + b.height;
+
+    // A side is flagged when the corresponding edge is strictly
+    // inside the page (so off-canvas scratch content and bleeding
+    // elements are ignored) yet within the safe band.
+    let mut sides: Vec<&'static str> = Vec::with_capacity(4);
+    if left > 0.0 && left < safe_px {
+        sides.push("left");
+    }
+    if right < dims.width_px && right > dims.width_px - safe_px {
+        sides.push("right");
+    }
+    if top > 0.0 && top < safe_px {
+        sides.push("top");
+    }
+    if bottom < dims.height_px && bottom > dims.height_px - safe_px {
+        sides.push("bottom");
+    }
+    if sides.is_empty() {
+        return;
+    }
+    let sides_label = join_sides(&sides);
+    issues.push(PreflightIssue {
+        check: PreflightCheck::SafeMargin,
+        severity: PreflightSeverity::Warning,
+        message: format!(
+            "Layer '{name}' sits within the {margin:.1} mm safe margin on the {sides_label} edge. Move it further inside the trim so a trim drift doesn't clip it.",
+            name = node.name,
+            margin = options.safe_margin_mm,
+        ),
+        affected_node_id: Some(node.id),
+        page_id: Some(page_id),
+    });
+}
+
+/// Render a list of edge labels as a human sentence fragment:
+/// `["left"]` → `"left"`, `["left", "top"]` → `"left and top"`,
+/// `["left", "top", "right"]` → `"left, top, and right"`.
+fn join_sides(sides: &[&'static str]) -> String {
+    match sides {
+        [] => String::new(),
+        [a] => (*a).to_string(),
+        [a, b] => format!("{a} and {b}"),
+        many => {
+            let (last, rest) = many.split_last().expect("non-empty");
+            format!("{}, and {last}", rest.join(", "))
+        }
+    }
+}
+
+/// Fraction of the page area at or above which a layer is treated as
+/// a full-bleed background and exempted from the safe-margin check.
+const SAFE_MARGIN_BACKGROUND_AREA_RATIO: f64 = 0.85;
 
 /// Font-embed + glyph-coverage check.
 ///

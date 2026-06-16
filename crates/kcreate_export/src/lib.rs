@@ -28,6 +28,7 @@ pub mod page_svg;
 pub mod pdf;
 pub mod pdf_import;
 pub mod pdf_multi;
+pub mod pdf_print;
 pub mod pdf_shading;
 pub mod penpot_import;
 pub mod png;
@@ -62,6 +63,7 @@ pub use pdf::{
 pub use pdf_import::{
     import_pdf, ExtractedImage, ExtractedImageData, ImportedPdf, ImportedPdfPage, PdfImportError,
 };
+pub use pdf_print::{export_print_ready_pdf, PrintReadyOptions, PrintReadyPdf};
 pub use png::{export_png, export_png_to_bytes, PngExportError, PngExportOptions};
 pub use sketch_import::{
     import_sketch, parse_sketch_zip, ImportedSketch, ImportedSketchArtboard, ImportedSketchNode,

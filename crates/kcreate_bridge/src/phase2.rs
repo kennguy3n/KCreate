@@ -15,7 +15,9 @@ use std::thread::{self, JoinHandle};
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use chrono::Utc;
-use kcreate_core::node::{Bounds, Node, NodeType};
+use kcreate_core::color::{srgb_to_cmyk, Color};
+use kcreate_core::document::DocumentGraph;
+use kcreate_core::node::{Bounds, FillStyle, Node, NodeType};
 use kcreate_core::operation::Operation;
 use kcreate_export::batch::{
     run_batch_parallel, BatchCancel, BatchExportJob, BatchProgress, BatchResult,
@@ -29,12 +31,15 @@ use kcreate_export::pdf::RasterPixelCache;
 use kcreate_export::pdf_import::{
     import_pdf as pdf_import_run, ExtractedImageData, ImportedPdf, PdfImportError,
 };
-use kcreate_export::preflight::{run_preflight_with_spots, PreflightIssue, PreflightOptions};
+use kcreate_export::preflight::{
+    full_bleed_background_candidates, page_bleed_box, run_preflight_with_spots, PreflightCheck,
+    PreflightIssue, PreflightOptions,
+};
 use kcreate_export::sketch_import::{
     import_sketch as sketch_import_run, ImportedSketch, ImportedSketchArtboard, ImportedSketchNode,
     ImportedSketchPage, SketchImportError, SketchImportWarning,
 };
-use kcreate_export::{TextLayerMeta, TEXT_LAYER_METADATA_KEY};
+use kcreate_export::{TextLayerMeta, TEXT_LAYER_METADATA_KEY, VECTOR_PATH_METADATA_KEY};
 use kcreate_vector::VectorPath;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -43,7 +48,7 @@ use uuid::Uuid;
 use crate::document::{
     blob_load, build_template_document, current_scene_safe, sync_scene_after_change,
     template_instantiate_items, with_workspace, with_workspace_mut, with_workspace_mut_synced,
-    CanvasBatchItem, DocumentBridgeError, Result, TemplateInstantiateReport,
+    CanvasBatchItem, DocumentBridgeError, PreflightAutofixPatch, Result, TemplateInstantiateReport,
 };
 use crate::thumbnails::{
     render_template_thumbnail_png, ThumbnailBytes, DEFAULT_THUMBNAIL_MAX_DIM_PX,
@@ -76,6 +81,543 @@ pub fn preflight_run(req: &PreflightRequest) -> Result<Vec<PreflightIssue>> {
             &ws.project.spot_color_library,
         ))
     })
+}
+
+// -----------------------------------------------------------------------------
+// Preflight auto-fix
+// -----------------------------------------------------------------------------
+
+/// Request for [`preflight_autofix`]. `page_ids` scopes the fix (empty
+/// = every page); `options` MUST match the options the panel ran
+/// preflight with, so the generated fixes land on the exact lines the
+/// checks validate against (bleed width, ink cap, target color
+/// space). `fixes` is the set of check ids the user asked to repair,
+/// e.g. `["bleed_margin", "color_space", "total_ink_coverage"]`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct PreflightAutofixRequest {
+    #[serde(default)]
+    pub page_ids: Vec<String>,
+    #[serde(default)]
+    pub options: PreflightOptions,
+    pub fixes: Vec<String>,
+}
+
+/// Per-check result of an auto-fix pass.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PreflightFixResult {
+    /// The check id this result is for (`"bleed_margin"`, …).
+    pub check: String,
+    /// Whether KCreate can mechanically repair this class of issue.
+    /// `false` for issues that need a human decision (low-res image,
+    /// missing font, content inside the safe margin).
+    pub fixable: bool,
+    /// Ids of the nodes that were actually mutated.
+    pub applied_node_ids: Vec<String>,
+    /// Human-readable summary of what happened (or why nothing did).
+    pub message: String,
+}
+
+/// Outcome of [`preflight_autofix`]: what each requested fix did, plus
+/// the issues that remain after the fixes were applied and preflight
+/// was re-run. A clean run leaves `issues` empty.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PreflightAutofixOutcome {
+    pub applied: Vec<PreflightFixResult>,
+    pub issues: Vec<PreflightIssue>,
+}
+
+/// Apply the requested auto-fixes to the open document, then re-run
+/// preflight and return the remaining issues.
+///
+/// Auto-fixable classes:
+/// * `bleed_margin` / `bleed_area_empty` — grow each full-bleed
+///   background ([`full_bleed_background_candidates`]) to the page's
+///   [`page_bleed_box`]. Vector backgrounds have their geometry +
+///   transform + bounds remapped; raster backgrounds have their
+///   bounds expanded and translation zeroed so the image fills the
+///   bleed.
+/// * `color_space` — bake a `Color::Cmyk` override (via
+///   [`srgb_to_cmyk`]) on every node the `ColorSpace` check flagged,
+///   skipping gradients (a single override would flatten them; the
+///   exporter converts gradient stops at export time anyway).
+/// * `total_ink_coverage` — proportionally scale the emitted CMYK of
+///   every flagged node down to the ink cap, preserving hue.
+///
+/// Every other class is reported with `fixable: false` and guidance,
+/// because a correct repair needs human intent (replace a low-res
+/// asset, embed a font, move content out of the safe margin).
+pub fn preflight_autofix(req: &PreflightAutofixRequest) -> Result<PreflightAutofixOutcome> {
+    let pages = resolve_autofix_pages(&req.page_ids)?;
+    let requested: std::collections::HashSet<&str> = req.fixes.iter().map(String::as_str).collect();
+
+    // Snapshot the findings BEFORE mutating so the color/ink fixes act
+    // on exactly the nodes the checks flagged (the checks are the
+    // single source of truth for "which node needs converting").
+    let before = with_workspace(|ws| {
+        Ok(run_preflight_with_spots(
+            &ws.project.document,
+            &pages,
+            &req.options,
+            &ws.project.spot_color_library,
+        ))
+    })?;
+    let color_space_nodes = affected_nodes_for(&before, PreflightCheck::ColorSpace);
+    let tic_nodes = affected_nodes_for(&before, PreflightCheck::TotalInkCoverage);
+
+    let mut applied: Vec<PreflightFixResult> = Vec::new();
+    let fix_bleed = requested.contains("bleed_margin") || requested.contains("bleed_area_empty");
+
+    with_workspace_mut(|ws| {
+        // Snapshot the prior state of every layer a requested fix could
+        // touch, BEFORE mutating, so the whole pass records as a SINGLE
+        // undoable `preflight_autofix` operation — one Ctrl+Z reverts
+        // add-bleed + RGB→CMYK + ink-cap together. A `BTreeMap` keyed by
+        // id dedupes the candidate set (a background can be both a bleed
+        // and a color-space candidate) and orders it deterministically.
+        let mut candidate_ids: Vec<Uuid> = Vec::new();
+        if fix_bleed {
+            for page_id in &pages {
+                candidate_ids.extend(full_bleed_background_candidates(
+                    &ws.project.document,
+                    *page_id,
+                ));
+            }
+        }
+        if requested.contains("color_space") {
+            candidate_ids.extend(color_space_nodes.iter().copied());
+        }
+        if requested.contains("total_ink_coverage") {
+            candidate_ids.extend(tic_nodes.iter().copied());
+        }
+        let before_nodes: std::collections::BTreeMap<Uuid, Node> = candidate_ids
+            .into_iter()
+            .filter_map(|id| ws.project.document.get_node(id).map(|n| (id, n.clone())))
+            .collect();
+
+        if fix_bleed {
+            applied.push(apply_bleed_fix(
+                &mut ws.project.document,
+                &pages,
+                &req.options,
+            ));
+        }
+        if requested.contains("color_space") {
+            let mut fixed = Vec::new();
+            for node_id in &color_space_nodes {
+                if let Some(node) = ws.project.document.get_node_mut(*node_id) {
+                    if convert_node_to_cmyk(node) {
+                        fixed.push(*node_id);
+                    }
+                }
+            }
+            applied.push(PreflightFixResult {
+                check: PreflightCheck::ColorSpace.id().to_string(),
+                fixable: true,
+                message: if fixed.is_empty() {
+                    "No solid RGB fill needed conversion. Gradient fills are converted to CMYK automatically at export time, so they are left intact.".to_string()
+                } else {
+                    format!(
+                        "Converted {n} layer{s} to a CMYK color so the press sees the same ink the proof does.",
+                        n = fixed.len(),
+                        s = plural(fixed.len()),
+                    )
+                },
+                applied_node_ids: ids_to_strings(&fixed),
+            });
+        }
+        if requested.contains("total_ink_coverage") {
+            let cap = req.options.target_total_ink_coverage;
+            let mut fixed = Vec::new();
+            for node_id in &tic_nodes {
+                if let Some(node) = ws.project.document.get_node_mut(*node_id) {
+                    if reduce_node_ink(node, cap) {
+                        fixed.push(*node_id);
+                    }
+                }
+            }
+            applied.push(PreflightFixResult {
+                check: PreflightCheck::TotalInkCoverage.id().to_string(),
+                fixable: true,
+                message: if fixed.is_empty() {
+                    "No single-color layer exceeded the ink cap. Gradient fills are left intact — reduce their stop colors by hand if a stop is over the limit.".to_string()
+                } else {
+                    format!(
+                        "Scaled {n} layer{s} down to the {cap:.0}% ink limit, keeping each color's hue.",
+                        n = fixed.len(),
+                        s = plural(fixed.len()),
+                        cap = cap * 100.0,
+                    )
+                },
+                applied_node_ids: ids_to_strings(&fixed),
+            });
+        }
+
+        // Record one undoable `preflight_autofix` operation covering
+        // every layer that actually changed. We diff against the
+        // pre-mutation snapshot on exactly the fields the fix helpers
+        // touch (`bounds` / `transform` / `style` / `metadata`) so the
+        // recorded patch — and the matching `apply_patch` restore — stay
+        // in lockstep, and a no-op fix (nothing over the limit) records
+        // nothing. See `document::PreflightAutofixPatch`.
+        let mut before_patch_nodes: std::collections::BTreeMap<Uuid, Node> =
+            std::collections::BTreeMap::new();
+        let mut after_patch_nodes: std::collections::BTreeMap<Uuid, Node> =
+            std::collections::BTreeMap::new();
+        let mut affected: Vec<Uuid> = Vec::new();
+        for (id, prior) in &before_nodes {
+            let Some(current) = ws.project.document.get_node(*id) else {
+                continue;
+            };
+            let changed = prior.bounds != current.bounds
+                || prior.transform != current.transform
+                || prior.style != current.style
+                || prior.metadata != current.metadata;
+            if !changed {
+                continue;
+            }
+            before_patch_nodes.insert(*id, prior.clone());
+            after_patch_nodes.insert(*id, current.clone());
+            affected.push(*id);
+        }
+        if !affected.is_empty() {
+            let before_patch = serde_json::to_value(PreflightAutofixPatch {
+                nodes: before_patch_nodes,
+            })?;
+            let after_patch = serde_json::to_value(PreflightAutofixPatch {
+                nodes: after_patch_nodes,
+            })?;
+            let op = Operation::new(
+                "user",
+                "preflight_autofix",
+                before_patch,
+                after_patch,
+                affected,
+            );
+            ws.project.execute_operation(op);
+        }
+        Ok(())
+    })?;
+
+    // Surface guidance for every requested-but-not-auto-fixable class
+    // exactly once, so the panel can show why the issue persists.
+    for fix in &req.fixes {
+        if matches!(
+            fix.as_str(),
+            "bleed_margin" | "bleed_area_empty" | "color_space" | "total_ink_coverage"
+        ) {
+            continue;
+        }
+        if applied.iter().any(|r| r.check == *fix) {
+            continue;
+        }
+        applied.push(PreflightFixResult {
+            check: fix.clone(),
+            fixable: false,
+            applied_node_ids: Vec::new(),
+            message: non_autofixable_guidance(fix),
+        });
+    }
+
+    sync_scene_after_change();
+
+    let issues = with_workspace(|ws| {
+        Ok(run_preflight_with_spots(
+            &ws.project.document,
+            &pages,
+            &req.options,
+            &ws.project.spot_color_library,
+        ))
+    })?;
+
+    Ok(PreflightAutofixOutcome { applied, issues })
+}
+
+/// Resolve the page-id scope for an auto-fix: parse the supplied ids,
+/// or enumerate every page when the list is empty (mirrors
+/// [`run_preflight_with_spots`]'s "empty = all pages" rule).
+fn resolve_autofix_pages(page_ids: &[String]) -> Result<Vec<Uuid>> {
+    if page_ids.is_empty() {
+        return with_workspace(|ws| {
+            Ok(ws
+                .project
+                .document
+                .iter()
+                .filter(|(_, n)| n.node_type == NodeType::Page)
+                .map(|(id, _)| *id)
+                .collect())
+        });
+    }
+    page_ids
+        .iter()
+        .map(|s| Uuid::parse_str(s).map_err(|e| DocumentBridgeError::InvalidUuid(s.clone(), e)))
+        .collect()
+}
+
+/// Distinct nodes flagged by `check` in `issues`, preserving first-seen
+/// order so the fix touches nodes deterministically.
+fn affected_nodes_for(issues: &[PreflightIssue], check: PreflightCheck) -> Vec<Uuid> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for issue in issues {
+        if issue.check != check {
+            continue;
+        }
+        if let Some(id) = issue.affected_node_id {
+            if seen.insert(id) {
+                out.push(id);
+            }
+        }
+    }
+    out
+}
+
+/// Grow every full-bleed background on `pages` to its page's bleed box.
+fn apply_bleed_fix(
+    document: &mut DocumentGraph,
+    pages: &[Uuid],
+    options: &PreflightOptions,
+) -> PreflightFixResult {
+    // Gather (node, target box) under immutable borrows first, then
+    // mutate — keeps the borrow checker happy and the plan explicit.
+    let mut plan: Vec<(Uuid, Bounds)> = Vec::new();
+    let mut had_candidate = false;
+    for page_id in pages {
+        let Some(bleed_box) = document
+            .get_node(*page_id)
+            .and_then(|page| page_bleed_box(page, options.require_bleed_mm))
+        else {
+            continue;
+        };
+        for node_id in full_bleed_background_candidates(document, *page_id) {
+            had_candidate = true;
+            plan.push((node_id, bleed_box));
+        }
+    }
+
+    let mut fixed = Vec::new();
+    let mut unsupported = 0usize;
+    for (node_id, bleed_box) in plan {
+        match extend_node_to_bleed(document, node_id, bleed_box) {
+            Some(true) => fixed.push(node_id),
+            Some(false) => unsupported += 1,
+            None => {}
+        }
+    }
+
+    let message = if !fixed.is_empty() {
+        let extra = if unsupported > 0 {
+            format!(
+                " {unsupported} near-full-page layer{s} could not be extended automatically (only vector and image backgrounds are supported).",
+                s = plural(unsupported),
+            )
+        } else {
+            String::new()
+        };
+        format!(
+            "Extended {n} background layer{s} past the trim to cover the {bleed:.1} mm bleed on all four sides.{extra}",
+            n = fixed.len(),
+            s = plural(fixed.len()),
+            bleed = options.require_bleed_mm,
+        )
+    } else if had_candidate {
+        "Found a near-full-page layer but could not extend it automatically — only vector and image backgrounds can be auto-bled. Extend it to the bleed box by hand.".to_string()
+    } else {
+        "No full-bleed background to extend. Add a background that covers the page (then re-run), or extend the flagged layer past the trim yourself.".to_string()
+    };
+
+    PreflightFixResult {
+        check: PreflightCheck::BleedMargin.id().to_string(),
+        fixable: true,
+        applied_node_ids: ids_to_strings(&fixed),
+        message,
+    }
+}
+
+/// Extend a single background node to `bleed_box` (page-relative
+/// coordinates, page top-left at the origin — the frame the bleed
+/// checks read). Returns `Some(true)` when the node was remapped,
+/// `Some(false)` when it is a recognised background but an
+/// unsupported type (text / component), and `None` when the node is
+/// missing.
+fn extend_node_to_bleed(
+    document: &mut DocumentGraph,
+    node_id: Uuid,
+    bleed_box: Bounds,
+) -> Option<bool> {
+    let node = document.get_node_mut(node_id)?;
+    match node.node_type {
+        NodeType::VectorLayer => {
+            let Some(value) = node.metadata.get(VECTOR_PATH_METADATA_KEY) else {
+                return Some(false);
+            };
+            let Ok(path) = serde_json::from_value::<VectorPath>(value.clone()) else {
+                return Some(false);
+            };
+            let b = node.bounds;
+            if b.width <= 0.0 || b.height <= 0.0 {
+                return Some(false);
+            }
+            // Map the node's old world extent (bounds) onto the bleed
+            // box. World point for a local path point p is
+            // (transform.t + p); we want new_world = bleed.origin +
+            // (old_world - bounds.origin) ⊙ (bleed.size / bounds.size).
+            // Setting the new transform to bleed.origin, the new local
+            // point is sx·p + sx·(transform - bounds.origin) on x (and
+            // the y analogue), which is exactly this affine.
+            let sx = bleed_box.width / b.width;
+            let sy = bleed_box.height / b.height;
+            let e = sx * (node.transform.tx - b.x);
+            let f = sy * (node.transform.ty - b.y);
+            let remapped = path.scaled_xy_translated(sx, sy, e, f);
+            let Ok(meta) = serde_json::to_value(&remapped) else {
+                return Some(false);
+            };
+            node.metadata
+                .insert(VECTOR_PATH_METADATA_KEY.to_string(), meta);
+            node.transform.tx = bleed_box.x;
+            node.transform.ty = bleed_box.y;
+            node.bounds = bleed_box;
+            Some(true)
+        }
+        NodeType::RasterLayer => {
+            // The raster exporter positions the image at
+            // bounds.origin + transform.t and stretches it to fill
+            // bounds. Expanding the bounds to the bleed box and
+            // zeroing the translation makes the image cover the full
+            // bleed.
+            node.bounds = bleed_box;
+            node.transform.tx = 0.0;
+            node.transform.ty = 0.0;
+            Some(true)
+        }
+        _ => Some(false),
+    }
+}
+
+/// Resolve the single solid sRGB color a node's fill would export as,
+/// or `None` when the fill is a gradient / empty / already device-CMYK
+/// / spot (none of which a single CMYK override can faithfully
+/// represent).
+fn solid_export_srgb(node: &Node) -> Option<(f32, f32, f32, f32)> {
+    if let Some(over) = &node.style.color_override {
+        return match over {
+            Color::Cmyk { .. } | Color::Spot { .. } => None,
+            other => Some(other.to_srgb()),
+        };
+    }
+    match &node.style.fill {
+        FillStyle::Solid(c) => Some((c.r, c.g, c.b, c.a)),
+        FillStyle::None | FillStyle::Gradient(_) => None,
+    }
+}
+
+/// Bake a `Color::Cmyk` override on `node` from its solid sRGB fill.
+/// Returns `false` for gradients / already-CMYK nodes (nothing to do).
+fn convert_node_to_cmyk(node: &mut Node) -> bool {
+    let Some((r, g, b, a)) = solid_export_srgb(node) else {
+        return false;
+    };
+    let (c, m, y, k) = srgb_to_cmyk(r, g, b);
+    node.style.color_override = Some(Color::Cmyk { c, m, y, k, a });
+    true
+}
+
+/// Scale `node`'s emitted CMYK down to `cap` total ink, preserving
+/// hue. Returns `false` when the node is under the cap, has no single
+/// color, or is a spot/gradient the press handles separately.
+fn reduce_node_ink(node: &mut Node, cap: f64) -> bool {
+    if !cap.is_finite() || cap <= 0.0 {
+        return false;
+    }
+    // Determine the CMYK the exporter will emit (override beats fill).
+    let (c, m, y, k, a) = if let Some(over) = &node.style.color_override {
+        match over {
+            Color::Cmyk { c, m, y, k, a } => (*c, *m, *y, *k, *a),
+            // A spot ink prints on its own plate; rescaling its CMYK
+            // fallback would not change the separation. Leave it.
+            Color::Spot { .. } => return false,
+            other => {
+                let (r, g, b, a) = other.to_srgb();
+                let (c, m, y, k) = srgb_to_cmyk(r, g, b);
+                (c, m, y, k, a)
+            }
+        }
+    } else {
+        match &node.style.fill {
+            FillStyle::Solid(col) => {
+                let (c, m, y, k) = srgb_to_cmyk(col.r, col.g, col.b);
+                (c, m, y, k, col.a)
+            }
+            FillStyle::None | FillStyle::Gradient(_) => return false,
+        }
+    };
+    let sum = f64::from(c) + f64::from(m) + f64::from(y) + f64::from(k);
+    if sum <= cap || sum <= 0.0 {
+        return false;
+    }
+    // Scale to a hair under the cap. Rounding the per-channel product
+    // to f32 can otherwise leave the re-summed ink a few ULPs above
+    // the ceiling, which the strict `sum > cap` preflight re-check
+    // would still flag. The 1e-6 relative headroom sits far below any
+    // press's ink-density tolerance yet dwarfs the rounding error.
+    let target = cap * (1.0 - 1e-6);
+    let factor = (target / sum) as f32;
+    node.style.color_override = Some(Color::Cmyk {
+        c: c * factor,
+        m: m * factor,
+        y: y * factor,
+        k: k * factor,
+        a,
+    });
+    true
+}
+
+/// Guidance shown for a requested fix KCreate cannot apply mechanically.
+fn non_autofixable_guidance(check: &str) -> String {
+    match check {
+        "image_resolution" => {
+            "Low-resolution images can't be auto-fixed safely — replace the layer with a higher-DPI source, or scale the layer down until its effective resolution clears the floor."
+        }
+        "safe_margin" => {
+            "Content inside the safe margin needs a layout decision — nudge the flagged layer further inside the trim so a cutting drift can't clip it."
+        }
+        "font_embed" | "font_glyph_coverage" => {
+            "Install the missing font (or pick a family with full glyph coverage) so the press doesn't substitute a fallback face."
+        }
+        "transparency" => {
+            "Confirm your press supports live transparency, or flatten the flagged layer; KCreate leaves the blend intact so you stay in control."
+        }
+        "page_size" => "Set a standard finished size in the page layout so the trim box is unambiguous.",
+        "shading" => {
+            "Repair the gradient: it needs at least two stops with distinct offsets and valid colors."
+        }
+        "spot_color_missing" => {
+            "Register the spot ink in the Spot Color Library so it separates onto its own named plate instead of the CMYK fallback."
+        }
+        "overprint_table" => {
+            "Review the overprint setup with your print provider — automatic changes here risk knocking out the wrong plates."
+        }
+        "trapping" => {
+            "Trapping is press-specific; confirm the trap with your print provider rather than applying a blind spread/choke."
+        }
+        _ => "This issue needs a manual decision and was left unchanged.",
+    }
+    .to_string()
+}
+
+fn ids_to_strings(ids: &[Uuid]) -> Vec<String> {
+    ids.iter().map(Uuid::to_string).collect()
+}
+
+const fn plural(n: usize) -> &'static str {
+    if n == 1 {
+        ""
+    } else {
+        "s"
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -6469,6 +7011,727 @@ mod import_tests {
             after, initial_node_count,
             "failed import must leave the workspace unchanged",
         );
+        project_close();
+    }
+}
+
+#[cfg(test)]
+mod preflight_autofix_tests {
+    use super::*;
+    use crate::document::{
+        document_redo, document_undo, project_close, project_create, reset_for_tests,
+    };
+    use kcreate_core::node::{NodeStyle, PageLayout, PageOrientation, PageSize, RgbaColor};
+    use kcreate_core::PAGE_LAYOUT_METADATA_KEY;
+    use kcreate_export::preflight::PreflightSeverity;
+    use kcreate_vector::{PathPoint, PathSegment};
+    use serial_test::serial;
+
+    fn tmpdir() -> tempfile::TempDir {
+        tempfile::tempdir().expect("tempdir")
+    }
+
+    /// Insert an A4 page (2480×3508 px @ 300 DPI) at the world origin
+    /// carrying its layout metadata, so the bleed / safe-margin /
+    /// coverage checks can derive `px_per_mm` and the trim rectangle.
+    fn insert_a4_page() -> Uuid {
+        with_workspace_mut(|ws| {
+            let mut page = Node::new(NodeType::Page, "Page");
+            let layout = PageLayout::new(PageSize::A4, PageOrientation::Portrait);
+            page.metadata.insert(
+                PAGE_LAYOUT_METADATA_KEY.to_string(),
+                serde_json::to_value(&layout)?,
+            );
+            page.bounds = Bounds {
+                x: 0.0,
+                y: 0.0,
+                width: 2480.0,
+                height: 3508.0,
+            };
+            let id = ws.project.document.insert_node(page)?;
+            Ok::<_, DocumentBridgeError>(id)
+        })
+        .expect("insert page")
+    }
+
+    /// Axis-aligned rectangle path in node-local coordinates.
+    fn rect_path(w: f64, h: f64) -> VectorPath {
+        VectorPath::new(vec![
+            PathSegment::MoveTo(PathPoint::new(0.0, 0.0)),
+            PathSegment::LineTo(PathPoint::new(w, 0.0)),
+            PathSegment::LineTo(PathPoint::new(w, h)),
+            PathSegment::LineTo(PathPoint::new(0.0, h)),
+            PathSegment::Close,
+        ])
+    }
+
+    /// Insert a vector rectangle with the `vector_path` metadata the
+    /// exporter and the bleed auto-fix both require. `style` decides
+    /// the fill / override that drives the colour + ink checks.
+    fn insert_vector_rect(
+        page_id: Uuid,
+        name: &str,
+        x: f64,
+        y: f64,
+        w: f64,
+        h: f64,
+        style: NodeStyle,
+    ) -> Uuid {
+        with_workspace_mut(|ws| {
+            let mut node = Node::new(NodeType::VectorLayer, name);
+            node.parent_id = Some(page_id);
+            node.bounds = Bounds {
+                x,
+                y,
+                width: w,
+                height: h,
+            };
+            node.transform.tx = x;
+            node.transform.ty = y;
+            node.style = style;
+            node.metadata.insert(
+                VECTOR_PATH_METADATA_KEY.to_string(),
+                serde_json::to_value(rect_path(w, h))?,
+            );
+            let id = ws.project.document.insert_node(node)?;
+            Ok::<_, DocumentBridgeError>(id)
+        })
+        .expect("insert vector rect")
+    }
+
+    fn checks(issues: &[PreflightIssue]) -> Vec<PreflightCheck> {
+        issues.iter().map(|i| i.check).collect()
+    }
+
+    /// The headline fix-and-pass loop: build a page that fails on
+    /// bleed, RGB-in-a-CMYK-target, and total-ink-coverage, auto-fix
+    /// every mechanically-fixable class, and assert the re-run comes
+    /// back clean for exactly those classes.
+    #[test]
+    #[serial]
+    fn autofix_clears_bleed_color_and_ink_then_reruns_clean() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("print-autofix", dir.path()).expect("project");
+        let page_id = insert_a4_page();
+
+        // Full-page background that stops at the trim → enters the
+        // bleed zone on all four sides without covering it, and
+        // leaves the bleed ring empty. Device-CMYK so it doesn't also
+        // trip the colour / ink checks.
+        let bg_id = insert_vector_rect(
+            page_id,
+            "Background",
+            0.0,
+            0.0,
+            2480.0,
+            3508.0,
+            NodeStyle {
+                color_override: Some(Color::Cmyk {
+                    c: 0.1,
+                    m: 0.1,
+                    y: 0.1,
+                    k: 0.0,
+                    a: 1.0,
+                }),
+                ..NodeStyle::default()
+            },
+        );
+
+        // A centred logo authored in chromatic sRGB → flagged for
+        // CMYK conversion, but clear of every trim edge so it does
+        // not also trip the safe-margin check.
+        let logo_id = insert_vector_rect(
+            page_id,
+            "Logo",
+            1000.0,
+            1500.0,
+            480.0,
+            480.0,
+            NodeStyle {
+                fill: FillStyle::Solid(RgbaColor::new(0.20, 0.45, 0.90, 1.0)),
+                ..NodeStyle::default()
+            },
+        );
+
+        // A centred panel whose CMYK sums to 360% — over the 300% cap.
+        let dense_id = insert_vector_rect(
+            page_id,
+            "Dense panel",
+            700.0,
+            2400.0,
+            500.0,
+            500.0,
+            NodeStyle {
+                color_override: Some(Color::Cmyk {
+                    c: 0.95,
+                    m: 0.85,
+                    y: 0.85,
+                    k: 0.95,
+                    a: 1.0,
+                }),
+                ..NodeStyle::default()
+            },
+        );
+
+        let options = PreflightOptions::default();
+        let page_str = page_id.to_string();
+
+        // First pass: the three target classes must all fire.
+        let before = preflight_run(&PreflightRequest {
+            page_ids: vec![page_str.clone()],
+            options: options.clone(),
+        })
+        .expect("preflight run");
+        let before_checks = checks(&before);
+        assert!(
+            before_checks.contains(&PreflightCheck::BleedMargin)
+                || before_checks.contains(&PreflightCheck::BleedAreaEmpty),
+            "background at the trim must raise a bleed finding: {before_checks:?}"
+        );
+        assert!(
+            before_checks.contains(&PreflightCheck::ColorSpace),
+            "the sRGB logo must raise a colour-space finding: {before_checks:?}"
+        );
+        assert!(
+            before_checks.contains(&PreflightCheck::TotalInkCoverage),
+            "the 360% panel must raise an ink-coverage finding: {before_checks:?}"
+        );
+
+        // Auto-fix every mechanically-fixable class.
+        let outcome = preflight_autofix(&PreflightAutofixRequest {
+            page_ids: vec![page_str.clone()],
+            options: options.clone(),
+            fixes: vec![
+                "bleed_margin".to_string(),
+                "bleed_area_empty".to_string(),
+                "color_space".to_string(),
+                "total_ink_coverage".to_string(),
+            ],
+        })
+        .expect("autofix");
+
+        let bleed_fix = outcome
+            .applied
+            .iter()
+            .find(|f| f.check == "bleed_margin")
+            .expect("bleed fix reported");
+        assert!(bleed_fix.fixable, "bleed must be auto-fixable");
+        assert_eq!(
+            bleed_fix.applied_node_ids,
+            vec![bg_id.to_string()],
+            "the background is the node that should grow into the bleed"
+        );
+        let color_fix = outcome
+            .applied
+            .iter()
+            .find(|f| f.check == "color_space")
+            .expect("colour fix reported");
+        assert_eq!(color_fix.applied_node_ids, vec![logo_id.to_string()]);
+        let ink_fix = outcome
+            .applied
+            .iter()
+            .find(|f| f.check == "total_ink_coverage")
+            .expect("ink fix reported");
+        assert_eq!(ink_fix.applied_node_ids, vec![dense_id.to_string()]);
+
+        // The re-run inside autofix must already be clean of the three
+        // fixed classes.
+        let remaining = checks(&outcome.issues);
+        for cleared in [
+            PreflightCheck::BleedMargin,
+            PreflightCheck::BleedAreaEmpty,
+            PreflightCheck::ColorSpace,
+            PreflightCheck::TotalInkCoverage,
+        ] {
+            assert!(
+                !remaining.contains(&cleared),
+                "{cleared:?} must be resolved after auto-fix, still present in {remaining:?}"
+            );
+        }
+        // No error-severity issue may survive a full auto-fix pass.
+        assert!(
+            !outcome
+                .issues
+                .iter()
+                .any(|i| i.severity == PreflightSeverity::Error),
+            "auto-fix must leave no hard errors: {:?}",
+            outcome.issues
+        );
+
+        // An independent re-run confirms the fixes persisted on the
+        // document, not just in the autofix return value.
+        let after = preflight_run(&PreflightRequest {
+            page_ids: vec![page_str],
+            options,
+        })
+        .expect("preflight re-run");
+        let after_checks = checks(&after);
+        assert!(!after_checks.contains(&PreflightCheck::ColorSpace));
+        assert!(!after_checks.contains(&PreflightCheck::TotalInkCoverage));
+        assert!(!after_checks.contains(&PreflightCheck::BleedMargin));
+        assert!(!after_checks.contains(&PreflightCheck::BleedAreaEmpty));
+
+        project_close();
+    }
+
+    /// A full auto-fix pass is a SINGLE undoable operation: one
+    /// `document_undo` reverts add-bleed + RGB→CMYK + ink-cap together
+    /// (the recorded `preflight_autofix` op replays `before_patch`),
+    /// and `document_redo` re-applies them. Proves Devin Review PR #76
+    /// finding #1 — auto-fix no longer mutates the document outside the
+    /// operation log.
+    #[test]
+    #[serial]
+    fn autofix_is_a_single_undoable_operation() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("print-autofix-undo", dir.path()).expect("project");
+        let page_id = insert_a4_page();
+
+        let bg_id = insert_vector_rect(
+            page_id,
+            "Background",
+            0.0,
+            0.0,
+            2480.0,
+            3508.0,
+            NodeStyle {
+                color_override: Some(Color::Cmyk {
+                    c: 0.1,
+                    m: 0.1,
+                    y: 0.1,
+                    k: 0.0,
+                    a: 1.0,
+                }),
+                ..NodeStyle::default()
+            },
+        );
+        let logo_id = insert_vector_rect(
+            page_id,
+            "Logo",
+            1000.0,
+            1500.0,
+            480.0,
+            480.0,
+            NodeStyle {
+                fill: FillStyle::Solid(RgbaColor::new(0.20, 0.45, 0.90, 1.0)),
+                ..NodeStyle::default()
+            },
+        );
+
+        // Snapshot the exact pre-fix state we expect undo to restore.
+        let node_of = |id: Uuid| {
+            with_workspace(|ws| Ok(ws.project.document.get_node(id).cloned()))
+                .expect("read")
+                .expect("node present")
+        };
+        let bg_before = node_of(bg_id);
+        let logo_before = node_of(logo_id);
+        assert!(
+            logo_before.style.color_override.is_none(),
+            "logo starts as an sRGB fill with no CMYK override"
+        );
+
+        let options = PreflightOptions::default();
+        let page_str = page_id.to_string();
+        preflight_autofix(&PreflightAutofixRequest {
+            page_ids: vec![page_str.clone()],
+            options: options.clone(),
+            fixes: vec![
+                "bleed_margin".to_string(),
+                "bleed_area_empty".to_string(),
+                "color_space".to_string(),
+            ],
+        })
+        .expect("autofix");
+
+        // The fix actually changed the document.
+        let bg_fixed = node_of(bg_id);
+        let logo_fixed = node_of(logo_id);
+        assert_ne!(
+            bg_fixed.bounds, bg_before.bounds,
+            "background must have grown into the bleed box"
+        );
+        assert!(
+            matches!(logo_fixed.style.color_override, Some(Color::Cmyk { .. })),
+            "logo must have been converted to a CMYK override"
+        );
+
+        // One undo reverts the WHOLE pass (both layers) atomically.
+        let outcome = document_undo().expect("undo ok").expect("an op to undo");
+        assert_eq!(outcome.command, "preflight_autofix");
+        let bg_undone = node_of(bg_id);
+        let logo_undone = node_of(logo_id);
+        assert_eq!(
+            bg_undone.bounds, bg_before.bounds,
+            "undo must restore the background's pre-fix bounds"
+        );
+        assert_eq!(
+            bg_undone.transform.tx, bg_before.transform.tx,
+            "undo must restore the background's translation"
+        );
+        assert_eq!(
+            bg_undone.metadata.get(VECTOR_PATH_METADATA_KEY),
+            bg_before.metadata.get(VECTOR_PATH_METADATA_KEY),
+            "undo must restore the background's vector path"
+        );
+        assert!(
+            logo_undone.style.color_override.is_none(),
+            "undo must drop the CMYK override the colour fix added"
+        );
+
+        // Re-running preflight on the undone document re-raises the
+        // findings the fix had cleared — proof the revert is real.
+        let reraised = checks(
+            &preflight_run(&PreflightRequest {
+                page_ids: vec![page_str],
+                options,
+            })
+            .expect("preflight after undo"),
+        );
+        assert!(
+            reraised.contains(&PreflightCheck::ColorSpace),
+            "undo must bring back the colour-space finding: {reraised:?}"
+        );
+
+        // Redo re-applies the same pass.
+        let redo = document_redo().expect("redo ok").expect("an op to redo");
+        assert_eq!(redo.command, "preflight_autofix");
+        let logo_redone = node_of(logo_id);
+        assert!(
+            matches!(logo_redone.style.color_override, Some(Color::Cmyk { .. })),
+            "redo must re-apply the CMYK conversion"
+        );
+        assert_eq!(
+            node_of(bg_id).bounds,
+            bg_fixed.bounds,
+            "redo must re-grow the background into the bleed box"
+        );
+
+        project_close();
+    }
+
+    /// Classes that need a human decision report `fixable: false`
+    /// with guidance instead of silently doing nothing.
+    #[test]
+    #[serial]
+    fn autofix_reports_non_fixable_classes_with_guidance() {
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("print-autofix-guidance", dir.path()).expect("project");
+        let page_id = insert_a4_page();
+
+        // A headline tight against the top-left trim → safe-margin
+        // warning, which is not mechanically auto-fixable.
+        let _headline = insert_vector_rect(
+            page_id,
+            "Headline",
+            20.0,
+            20.0,
+            300.0,
+            120.0,
+            NodeStyle {
+                color_override: Some(Color::Cmyk {
+                    c: 0.0,
+                    m: 0.0,
+                    y: 0.0,
+                    k: 1.0,
+                    a: 1.0,
+                }),
+                ..NodeStyle::default()
+            },
+        );
+
+        let outcome = preflight_autofix(&PreflightAutofixRequest {
+            page_ids: vec![page_id.to_string()],
+            options: PreflightOptions::default(),
+            fixes: vec!["safe_margin".to_string()],
+        })
+        .expect("autofix");
+
+        let safe = outcome
+            .applied
+            .iter()
+            .find(|f| f.check == "safe_margin")
+            .expect("safe-margin result reported");
+        assert!(!safe.fixable, "safe-margin needs a human decision");
+        assert!(
+            safe.applied_node_ids.is_empty(),
+            "a non-fixable class must not mutate nodes"
+        );
+        assert!(
+            !safe.message.is_empty(),
+            "guidance text must be surfaced to the user"
+        );
+
+        project_close();
+    }
+
+    // ---- Proof-artifact generator ----------------------------------
+    //
+    // Run on demand with:
+    //   cargo test -p kcreate_bridge --lib -- --ignored --nocapture \
+    //       preflight_autofix_tests::generate_i6_proof_artifacts
+    //
+    // It builds a real A4 print poster, captures the FAILING preflight
+    // report, runs the actual auto-fix, captures the CLEAN report, and
+    // exports the print-ready PDF — writing all three to
+    // $KCREATE_PROOF_DIR (default target/i6-proof). Kept `#[ignore]`d
+    // so it never writes files during the normal gate run.
+
+    fn circle_path(r: f64) -> VectorPath {
+        // Four-cubic circle in node-local coordinates, centred at (r, r).
+        let k = r * 0.552_284_749_831;
+        VectorPath::new(vec![
+            PathSegment::MoveTo(PathPoint::new(2.0 * r, r)),
+            PathSegment::CubicTo {
+                ctrl1: PathPoint::new(2.0 * r, r + k),
+                ctrl2: PathPoint::new(r + k, 2.0 * r),
+                end: PathPoint::new(r, 2.0 * r),
+            },
+            PathSegment::CubicTo {
+                ctrl1: PathPoint::new(r - k, 2.0 * r),
+                ctrl2: PathPoint::new(0.0, r + k),
+                end: PathPoint::new(0.0, r),
+            },
+            PathSegment::CubicTo {
+                ctrl1: PathPoint::new(0.0, r - k),
+                ctrl2: PathPoint::new(r - k, 0.0),
+                end: PathPoint::new(r, 0.0),
+            },
+            PathSegment::CubicTo {
+                ctrl1: PathPoint::new(r + k, 0.0),
+                ctrl2: PathPoint::new(2.0 * r, r - k),
+                end: PathPoint::new(2.0 * r, r),
+            },
+            PathSegment::Close,
+        ])
+    }
+
+    fn insert_vector_with_path(
+        page_id: Uuid,
+        name: &str,
+        bounds: Bounds,
+        path: VectorPath,
+        style: NodeStyle,
+    ) -> Uuid {
+        with_workspace_mut(|ws| {
+            let mut node = Node::new(NodeType::VectorLayer, name);
+            node.parent_id = Some(page_id);
+            node.bounds = bounds;
+            node.transform.tx = bounds.x;
+            node.transform.ty = bounds.y;
+            node.style = style;
+            node.metadata.insert(
+                VECTOR_PATH_METADATA_KEY.to_string(),
+                serde_json::to_value(path)?,
+            );
+            let id = ws.project.document.insert_node(node)?;
+            Ok::<_, DocumentBridgeError>(id)
+        })
+        .expect("insert vector node")
+    }
+
+    fn srgb_fill(r: f32, g: f32, b: f32) -> NodeStyle {
+        NodeStyle {
+            fill: FillStyle::Solid(RgbaColor::new(r, g, b, 1.0)),
+            ..NodeStyle::default()
+        }
+    }
+
+    #[test]
+    #[serial]
+    #[ignore = "artifact generator; run explicitly with --ignored"]
+    fn generate_i6_proof_artifacts() {
+        use kcreate_export::pdf::RasterPixelCache;
+        use kcreate_export::{export_print_ready_pdf, PrintReadyOptions};
+
+        let out_dir = std::env::var("KCREATE_PROOF_DIR").map_or_else(
+            |_| std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/i6-proof"),
+            std::path::PathBuf::from,
+        );
+        std::fs::create_dir_all(&out_dir).expect("create proof dir");
+
+        reset_for_tests();
+        let dir = tmpdir();
+        project_create("summer-festival-poster", dir.path()).expect("project");
+        let page_id = insert_a4_page();
+
+        // Recognisable A4 poster, authored the way a designer would
+        // hand it off BEFORE running preflight: a near-full-page sky
+        // that stops at the trim (no bleed), warm sRGB artwork (needs
+        // CMYK), and a dense banner that busts the 300% ink cap.
+        let sky_id = insert_vector_with_path(
+            page_id,
+            "Sky",
+            Bounds {
+                x: 0.0,
+                y: 0.0,
+                width: 2480.0,
+                height: 3508.0,
+            },
+            rect_path(2480.0, 3508.0),
+            srgb_fill(0.05, 0.30, 0.40),
+        );
+        let _sun = insert_vector_with_path(
+            page_id,
+            "Sun",
+            Bounds {
+                x: 860.0,
+                y: 470.0,
+                width: 760.0,
+                height: 760.0,
+            },
+            circle_path(380.0),
+            srgb_fill(0.92, 0.73, 0.18),
+        );
+        let _moon = insert_vector_with_path(
+            page_id,
+            "Moon",
+            Bounds {
+                x: 360.0,
+                y: 600.0,
+                width: 300.0,
+                height: 300.0,
+            },
+            circle_path(150.0),
+            srgb_fill(0.90, 0.88, 0.78),
+        );
+        let _banner = insert_vector_with_path(
+            page_id,
+            "Banner",
+            Bounds {
+                x: 300.0,
+                y: 1500.0,
+                width: 1880.0,
+                height: 380.0,
+            },
+            rect_path(1880.0, 380.0),
+            NodeStyle {
+                color_override: Some(Color::Cmyk {
+                    c: 0.90,
+                    m: 0.85,
+                    y: 0.80,
+                    k: 0.92,
+                    a: 1.0,
+                }),
+                ..NodeStyle::default()
+            },
+        );
+        let bars = [
+            ("Bar Coral", 2080.0, (0.92_f32, 0.44_f32, 0.34_f32)),
+            ("Bar Green", 2260.0, (0.30, 0.70, 0.45)),
+            ("Bar Violet", 2440.0, (0.55, 0.40, 0.85)),
+        ];
+        for (name, y, (r, g, b)) in bars {
+            insert_vector_with_path(
+                page_id,
+                name,
+                Bounds {
+                    x: 400.0,
+                    y,
+                    width: 1680.0,
+                    height: 130.0,
+                },
+                rect_path(1680.0, 130.0),
+                srgb_fill(r, g, b),
+            );
+        }
+
+        let options = PreflightOptions::default();
+        let page_str = page_id.to_string();
+
+        // (a) Failing report — real computed findings.
+        let failing = preflight_run(&PreflightRequest {
+            page_ids: vec![page_str.clone()],
+            options: options.clone(),
+        })
+        .expect("failing preflight");
+        let failing_checks = checks(&failing);
+        assert!(failing_checks.contains(&PreflightCheck::BleedMargin));
+        assert!(failing_checks.contains(&PreflightCheck::ColorSpace));
+        assert!(failing_checks.contains(&PreflightCheck::TotalInkCoverage));
+        std::fs::write(
+            out_dir.join("preflight-failing.json"),
+            serde_json::to_vec_pretty(&failing).unwrap(),
+        )
+        .unwrap();
+
+        // Apply every mechanically-fixable class via the real auto-fix.
+        let outcome = preflight_autofix(&PreflightAutofixRequest {
+            page_ids: vec![page_str.clone()],
+            options: options.clone(),
+            fixes: vec![
+                "bleed_margin".to_string(),
+                "bleed_area_empty".to_string(),
+                "color_space".to_string(),
+                "total_ink_coverage".to_string(),
+            ],
+        })
+        .expect("autofix");
+        assert!(outcome
+            .applied
+            .iter()
+            .any(|f| f.check == "bleed_margin" && f.applied_node_ids == vec![sky_id.to_string()]));
+        std::fs::write(
+            out_dir.join("autofix-applied.json"),
+            serde_json::to_vec_pretty(&outcome.applied).unwrap(),
+        )
+        .unwrap();
+
+        // (b) Clean report after the fix-and-pass loop.
+        let clean = preflight_run(&PreflightRequest {
+            page_ids: vec![page_str],
+            options,
+        })
+        .expect("clean preflight");
+        let clean_checks = checks(&clean);
+        for cleared in [
+            PreflightCheck::BleedMargin,
+            PreflightCheck::BleedAreaEmpty,
+            PreflightCheck::ColorSpace,
+            PreflightCheck::TotalInkCoverage,
+        ] {
+            assert!(
+                !clean_checks.contains(&cleared),
+                "{cleared:?} must be gone after auto-fix, got {clean_checks:?}"
+            );
+        }
+        std::fs::write(
+            out_dir.join("preflight-clean.json"),
+            serde_json::to_vec_pretty(&clean).unwrap(),
+        )
+        .unwrap();
+
+        // (c) Print-ready PDF with bleed + trim/registration marks +
+        // CMYK, exported straight from the fixed workspace document.
+        let print_opts = PrintReadyOptions {
+            title: "KCreate — Summer Festival poster".to_string(),
+            ..PrintReadyOptions::default()
+        };
+        let pdf = with_workspace(|ws| {
+            export_print_ready_pdf(
+                &ws.project.document,
+                page_id,
+                &print_opts,
+                &RasterPixelCache::default(),
+                &ws.project.spot_color_library,
+            )
+            .map_err(|e| DocumentBridgeError::Internal(e.to_string()))
+        })
+        .expect("export print-ready pdf");
+        std::fs::write(out_dir.join("poster-print-ready.pdf"), &pdf.bytes).unwrap();
+        println!(
+            "i6 proof written to {} (media {:.1}×{:.1} mm, trim {:.1}×{:.1} mm, bleed {:.1} mm)",
+            out_dir.display(),
+            pdf.media_box_mm.0,
+            pdf.media_box_mm.1,
+            pdf.trim_box_mm.0,
+            pdf.trim_box_mm.1,
+            pdf.bleed_mm,
+        );
+
         project_close();
     }
 }

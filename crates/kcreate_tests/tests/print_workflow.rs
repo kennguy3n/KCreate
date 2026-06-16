@@ -660,6 +660,89 @@ fn total_ink_coverage_threshold_fires_on_dense_cmyk_fill() {
     );
 }
 
+/// A4 page node carrying both the layout metadata (so preflight can
+/// derive `px_per_mm` from the trim width) and explicit pixel bounds
+/// at 300 DPI (2480×3508). The bleed / safe-margin / coverage checks
+/// all key off `page.bounds`, which `make_page_with_a4` leaves at
+/// zero — so those checks need this richer fixture.
+fn make_a4_page_with_bounds(doc: &mut DocumentGraph) -> Uuid {
+    let mut page = Node::new(NodeType::Page, "P");
+    let layout = PageLayout::new(PageSize::A4, PageOrientation::Portrait);
+    page.metadata.insert(
+        PAGE_LAYOUT_METADATA_KEY.into(),
+        serde_json::to_value(&layout).unwrap(),
+    );
+    page.bounds = Bounds {
+        x: 0.0,
+        y: 0.0,
+        width: 2480.0,
+        height: 3508.0,
+    };
+    doc.insert_node(page).unwrap()
+}
+
+#[test]
+fn safe_margin_flags_content_near_trim_edge() {
+    // A4 @ 300 DPI → 11.81 px/mm, so the default 5 mm safe band is
+    // ~59 px. A headline whose top-left corner sits 20 px from the
+    // trim is well inside that band and a guillotine drift could clip
+    // it — the check must surface a single warning naming both edges.
+    let mut doc = DocumentGraph::new();
+    let page_id = make_a4_page_with_bounds(&mut doc);
+
+    let mut headline = rect_node(page_id, "Headline", 20.0, 20.0, 300.0, 120.0);
+    headline.style.color_override = Some(cmyk_color(0.0, 0.0, 0.0, 1.0));
+    let _ = doc.insert_node(headline).unwrap();
+
+    let issues = run_preflight_with_spots(
+        &doc,
+        &[page_id],
+        &PreflightOptions::default(),
+        &SpotColorLibrary::new(),
+    );
+    let sm: Vec<_> = issues
+        .iter()
+        .filter(|i| i.check == PreflightCheck::SafeMargin)
+        .collect();
+    assert_eq!(
+        sm.len(),
+        1,
+        "a headline inside the safe band should warn exactly once"
+    );
+    assert_eq!(sm[0].severity, PreflightSeverity::Warning);
+    assert!(sm[0].message.contains("Headline"));
+    assert!(
+        sm[0].message.contains("left") && sm[0].message.contains("top"),
+        "both encroached edges must be named: got {}",
+        sm[0].message
+    );
+}
+
+#[test]
+fn safe_margin_exempts_full_bleed_background() {
+    // A near-full-page background (98.6% of the page area) is meant to
+    // reach the trim, so the safe-margin check must exempt it even
+    // though its inset edges fall inside the safe band — otherwise
+    // every full-bleed design would warn.
+    let mut doc = DocumentGraph::new();
+    let page_id = make_a4_page_with_bounds(&mut doc);
+
+    let mut bg = rect_node(page_id, "Background", 10.0, 10.0, 2460.0, 3488.0);
+    bg.style.color_override = Some(cmyk_color(0.1, 0.1, 0.1, 0.0));
+    let _ = doc.insert_node(bg).unwrap();
+
+    let issues = run_preflight_with_spots(
+        &doc,
+        &[page_id],
+        &PreflightOptions::default(),
+        &SpotColorLibrary::new(),
+    );
+    assert!(
+        !issues.iter().any(|i| i.check == PreflightCheck::SafeMargin),
+        "a full-bleed background must be exempt from the safe-margin check"
+    );
+}
+
 #[test]
 fn pantone_fixture_loads_full_solid_coated_subset() {
     // Round-trip the bundled fixture catalogue. This is a real

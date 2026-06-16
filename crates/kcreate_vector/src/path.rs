@@ -455,6 +455,16 @@ impl VectorPath {
     pub fn scaled_translated(&self, scale: f64, tx: f64, ty: f64) -> Self {
         self.transformed(kurbo::Affine::translate((tx, ty)) * kurbo::Affine::scale(scale))
     }
+
+    /// Like [`Self::scaled_translated`] but with independent x/y
+    /// scale: `world = (sx · local.x + tx, sy · local.y + ty)`. Used
+    /// by the print preflight bleed auto-fix to stretch a full-bleed
+    /// background's geometry to the (generally non-square) bleed box
+    /// without the call site depending on `kurbo`.
+    #[must_use]
+    pub fn scaled_xy_translated(&self, sx: f64, sy: f64, tx: f64, ty: f64) -> Self {
+        self.transformed(kurbo::Affine::new([sx, 0.0, 0.0, sy, tx, ty]))
+    }
 }
 
 impl fmt::Display for VectorPath {
@@ -600,6 +610,33 @@ mod tests {
         assert!((b.min_y - 120.0).abs() < 1e-6, "min_y = {}", b.min_y);
         assert!((b.max_x - 248.0).abs() < 1e-6, "max_x = {}", b.max_x);
         assert!((b.max_y - 168.0).abs() < 1e-6, "max_y = {}", b.max_y);
+    }
+
+    #[test]
+    fn scaled_xy_translated_handles_non_square_scale() {
+        // A 1000×600 background grown to a 1018×618 bleed box (the
+        // print preflight bleed auto-fix): each axis scales
+        // independently and the new geometry lands exactly on the
+        // (-9, -9) bleed origin.
+        let r = rect_path(1000.0, 600.0); // (0,0)-(1000,600)
+        let bleed_w = 1018.0;
+        let bleed_h = 618.0;
+        let sx = bleed_w / 1000.0;
+        let sy = bleed_h / 600.0;
+        let t = r.scaled_xy_translated(sx, sy, -9.0, -9.0);
+        let b = t.bounds();
+        assert!((b.min_x - -9.0).abs() < 1e-6, "min_x = {}", b.min_x);
+        assert!((b.min_y - -9.0).abs() < 1e-6, "min_y = {}", b.min_y);
+        assert!(
+            (b.max_x - (-9.0 + bleed_w)).abs() < 1e-6,
+            "max_x = {}",
+            b.max_x
+        );
+        assert!(
+            (b.max_y - (-9.0 + bleed_h)).abs() < 1e-6,
+            "max_y = {}",
+            b.max_y
+        );
     }
 
     /// Regression test for `ANALYSIS_0007` on PR #2.

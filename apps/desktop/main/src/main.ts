@@ -25,6 +25,11 @@ import {
   type OnboardingInstallReport,
 } from "./onboardingDownloader";
 import {
+  startPackDownload,
+  type DownloadHandle,
+  type DownloadInstallReport,
+} from "./modelDownloader";
+import {
   createUpdaterController,
   UPDATE_STATE_CHANGED_CHANNEL,
   type UpdaterController,
@@ -326,6 +331,20 @@ function cancelOnboardingDownload(): void {
   if (activeOnboardingHandle) {
     activeOnboardingHandle.cancel();
     activeOnboardingHandle = null;
+  }
+}
+
+// Handle to the in-flight model-manager download (`kcreate/ai/
+// downloadModelPack`), or `null` when none is running. Tracked
+// separately from `activeOnboardingHandle` so the two flows never
+// cancel each other; the helper centralises the null-check the
+// same way `cancelOnboardingDownload` does.
+let activeModelDownloadHandle: DownloadHandle | null = null;
+
+function cancelModelDownload(): void {
+  if (activeModelDownloadHandle) {
+    activeModelDownloadHandle.cancel();
+    activeModelDownloadHandle = null;
   }
 }
 
@@ -2814,6 +2833,42 @@ function registerIpcHandlers(): void {
   );
   ipcMain.handle("kcreate/ai/uninstallModelPack", (_e, packId: string) => {
     requireBridge().aiUninstallModelPack(packId);
+  });
+  // In-app model download. Mirrors the one-click onboarding flow but
+  // takes an explicit pack id (the model manager already knows which
+  // pack the user clicked) and emits progress on its own channel
+  // (`kcreate/ai/modelDownloadProgress`) so it never cross-talks with
+  // the welcome modal's onboarding download. The main process resolves
+  // the pack's `downloadUrl` from the static registry, validates it
+  // against the host allow-list, streams the bytes into a per-process
+  // temp file, then hands the temp path to `aiInstallModelPack` (same
+  // SHA-256 verify + atomic rename as the manual "I have the file"
+  // path). Downloads only ever start from this explicit user action.
+  //
+  // Concurrency: a single in-flight handle is tracked at module scope
+  // (`activeModelDownloadHandle`). A second download while one is
+  // running cancels the prior run before kicking off the new one.
+  ipcMain.handle("kcreate/ai/downloadModelPack", async (_e, packId: string) => {
+    cancelModelDownload();
+    const win = mainWindow;
+    const handle = startPackDownload(
+      requireBridge(),
+      win,
+      packId,
+      "kcreate/ai/modelDownloadProgress",
+    );
+    activeModelDownloadHandle = handle;
+    try {
+      const report: DownloadInstallReport = await handle.done;
+      return JSON.stringify(report);
+    } finally {
+      if (activeModelDownloadHandle === handle) {
+        activeModelDownloadHandle = null;
+      }
+    }
+  });
+  ipcMain.handle("kcreate/ai/cancelModelDownload", () => {
+    cancelModelDownload();
   });
   // Native file picker scoped to weights files (ONNX / GGUF / a
   // wildcard fallback so users can still install future formats

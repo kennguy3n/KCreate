@@ -363,6 +363,26 @@ const defaultsByMethod: Record<string, () => unknown> = {
     actualSha256: "0".repeat(64),
     sizeBytes: 750_000_000,
   }),
+  // In-app model download. Default mirrors a verified download +
+  // install happy path so a ModelManager test that clicks "Download"
+  // without an override resolves to an installed pack. Tests that
+  // drive the cancel / error branches override with a throwing or
+  // rejecting resolver.
+  "aiModel.downloadModelPack": () => ({
+    packId: "llm_bonsai_1_7b",
+    verified: true,
+    actualSha256: "0".repeat(64),
+    sizeBytes: 750_000_000,
+  }),
+  // Idempotent cancel — ModelManager calls this on unmount even when
+  // no download is in flight, so the default must be a no-op.
+  "aiModel.cancelModelDownload": () => undefined,
+  // Progress subscription. Default returns a no-op unsubscribe (see
+  // SYNC_METHODS) so a component that subscribes in an effect mounts
+  // and cleans up without an explicit override. Tests that drive
+  // progress events override with a resolver that captures the
+  // listener and returns a real unsubscribe.
+  "aiModel.onModelDownloadProgress": () => (): void => undefined,
   // Phase C — one-click install. Default mirrors a verified
   // download + install happy path. Tests that drive the error
   // branch override with a throwing resolver.
@@ -502,6 +522,10 @@ const SYNC_METHODS = new Set<string>([
   // in Promise.resolve makes the cleanup call a Promise and
   // throws `destroy is not a function`.
   "onboarding.onInstallProgress",
+  // In-app model download `aiModel.onModelDownloadProgress(fn) =>
+  // unsubscribe`. Same contract as the onboarding subscriber: the
+  // cleanup handle must be synchronously callable, not a Promise.
+  "aiModel.onModelDownloadProgress",
   // I1 — `update.onStateChange(fn) => unsubscribe`. Same contract as
   // the onboarding subscriber above: cleanup must be synchronously
   // callable.

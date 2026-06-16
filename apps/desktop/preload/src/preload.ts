@@ -129,6 +129,7 @@ import type {
   McpPermissionBridge,
   McpPermissionGrant,
   McpStatus,
+  ModelDownloadProgress,
   ModelInstallReport,
   ModelPack,
   PdfImportBridge,
@@ -2177,6 +2178,34 @@ const aiModel: AiModelBridge = {
   },
   async uninstallModelPack(packId: string): Promise<void> {
     await ipcRenderer.invoke("kcreate/ai/uninstallModelPack", packId);
+  },
+  // In-app model download. The renderer triggers the download with a
+  // pack id, subscribes to progress via `onModelDownloadProgress(fn)`
+  // (returns an unsubscribe handle), and aborts via
+  // `cancelModelDownload()`. The main process owns the network I/O and
+  // the SHA-256 verify + atomic rename — see
+  // `main/src/modelDownloader.ts` for the wire-shape of
+  // `ModelDownloadProgress` / the returned `ModelInstallReport`.
+  async downloadModelPack(packId: string): Promise<ModelInstallReport> {
+    const raw = (await ipcRenderer.invoke(
+      "kcreate/ai/downloadModelPack",
+      packId,
+    )) as string;
+    return JSON.parse(raw) as ModelInstallReport;
+  },
+  async cancelModelDownload(): Promise<void> {
+    await ipcRenderer.invoke("kcreate/ai/cancelModelDownload");
+  },
+  onModelDownloadProgress(
+    fn: (progress: ModelDownloadProgress) => void,
+  ): () => void {
+    const handler = (_e: unknown, progress: ModelDownloadProgress): void => {
+      fn(progress);
+    };
+    ipcRenderer.on("kcreate/ai/modelDownloadProgress", handler);
+    return (): void => {
+      ipcRenderer.removeListener("kcreate/ai/modelDownloadProgress", handler);
+    };
   },
   async screenshotToLayout(
     request: ScreenshotRequest,

@@ -54,6 +54,45 @@ use crate::llm_sidecar::{SidecarError, SidecarResult, SidecarStatus};
 const DEFAULT_HEALTH_TIMEOUT: Duration = Duration::from_secs(90);
 const HEALTH_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
+/// How sd-server is asked to load the primary weights file.
+///
+/// stable-diffusion.cpp distinguishes two shapes of generation
+/// model, and the CLI flag differs between them:
+///
+/// * [`DiffusionModelFlag::Standalone`] — a *standalone* diffusion
+///   model (FLUX / SD3-style split checkpoint). It carries only the
+///   diffusion weights, so the text encoder(s) + VAE must be
+///   supplied separately through `extra_args` (`--clip_l`,
+///   `--t5xxl`, `--vae`, …). sd-server takes the weights via
+///   `--diffusion-model`.
+/// * [`DiffusionModelFlag::FullCheckpoint`] — a *fused* checkpoint
+///   (SD 1.x / SD2 / SDXL `.safetensors`) that already bundles
+///   CLIP + VAE alongside the UNet. sd-server takes it via `-m` and
+///   needs no companion encoder paths.
+///
+/// Defaults to [`DiffusionModelFlag::Standalone`] so the FLUX-class
+/// packs the registry has always shipped keep their exact argv.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DiffusionModelFlag {
+    /// Standalone diffusion model: forwarded as `--diffusion-model`.
+    #[default]
+    Standalone,
+    /// Fused full checkpoint (CLIP + VAE bundled): forwarded as `-m`.
+    FullCheckpoint,
+}
+
+impl DiffusionModelFlag {
+    /// The sd-server CLI flag that introduces the primary weights
+    /// file for this load shape.
+    #[must_use]
+    pub fn cli_flag(self) -> &'static str {
+        match self {
+            Self::Standalone => "--diffusion-model",
+            Self::FullCheckpoint => "-m",
+        }
+    }
+}
+
 /// Tunables for the sd-server lifecycle. Mirrors
 /// [`crate::llm_sidecar::SidecarConfig`] in shape (path-to-binary,
 /// path-to-weights, deadlines, extra args) but with sd-server's
@@ -69,9 +108,13 @@ pub struct DiffusionSidecarConfig {
     /// Path to the `sd-server` executable from
     /// stable-diffusion.cpp.
     pub binary: PathBuf,
-    /// Primary diffusion weights — forwarded as `--diffusion-model`
-    /// when the file lives outside a fused SD checkpoint.
+    /// Primary weights file — forwarded as `--diffusion-model` for a
+    /// standalone diffusion model or `-m` for a fused checkpoint,
+    /// per [`Self::model_flag`].
     pub model_path: PathBuf,
+    /// Whether `model_path` is a standalone diffusion model or a
+    /// fused full checkpoint. Selects the sd-server CLI flag.
+    pub model_flag: DiffusionModelFlag,
     /// Maximum time the supervisor will wait for `/sdcpp/v1/capabilities`
     /// to return 200 before flipping the status to `Error`.
     pub health_timeout: Duration,
@@ -84,15 +127,26 @@ pub struct DiffusionSidecarConfig {
 impl DiffusionSidecarConfig {
     /// Construct a config from a model path with default knobs.
     /// Callers append `extra_args` for FLUX-style multi-component
-    /// loads.
+    /// loads. The model is treated as a standalone diffusion model
+    /// (`--diffusion-model`); use [`Self::with_model_flag`] for a
+    /// fused checkpoint.
     #[must_use]
     pub fn new(binary: PathBuf, model_path: PathBuf) -> Self {
         Self {
             binary,
             model_path,
+            model_flag: DiffusionModelFlag::Standalone,
             health_timeout: DEFAULT_HEALTH_TIMEOUT,
             extra_args: Vec::new(),
         }
+    }
+
+    /// Set how the primary weights file is loaded (standalone
+    /// diffusion model vs. fused full checkpoint).
+    #[must_use]
+    pub fn with_model_flag(mut self, model_flag: DiffusionModelFlag) -> Self {
+        self.model_flag = model_flag;
+        self
     }
 }
 
@@ -112,7 +166,7 @@ pub fn build_argv(config: &DiffusionSidecarConfig, port: u16) -> Vec<String> {
         "127.0.0.1".to_string(),
         "--listen-port".to_string(),
         port.to_string(),
-        "--diffusion-model".to_string(),
+        config.model_flag.cli_flag().to_string(),
         config.model_path.to_string_lossy().into_owned(),
     ];
     for arg in &config.extra_args {
@@ -259,9 +313,10 @@ fn spawn_child(config: &DiffusionSidecarConfig, port: u16) -> SidecarResult<Chil
     }
     cmd.stdout(Stdio::null()).stderr(Stdio::piped());
     log::debug!(
-        "spawning sd-server: {} --listen-port {} --diffusion-model {}",
+        "spawning sd-server: {} --listen-port {} {} {}",
         config.binary.display(),
         port,
+        config.model_flag.cli_flag(),
         config.model_path.display(),
     );
     cmd.spawn().map_err(SidecarError::Spawn)
@@ -406,6 +461,7 @@ mod tests {
         let cfg = DiffusionSidecarConfig {
             binary: PathBuf::from("/usr/local/bin/sd-server"),
             model_path: PathBuf::from("/models/flux.gguf"),
+            model_flag: DiffusionModelFlag::Standalone,
             health_timeout: DEFAULT_HEALTH_TIMEOUT,
             extra_args: vec![
                 "--clip_l".to_string(),
@@ -425,6 +481,46 @@ mod tests {
                 "--clip_l",
                 "/models/clip_l.safetensors",
             ],
+        );
+    }
+
+    /// A fused full checkpoint (SD 1.x / SDXL) must be introduced
+    /// with `-m`, not `--diffusion-model`. The checkpoint bundles
+    /// CLIP + VAE, so no companion encoder args are required — but
+    /// any `extra_args` (threading, VAE tiling, …) still ride along.
+    #[test]
+    fn build_argv_full_checkpoint_uses_dash_m() {
+        let cfg = DiffusionSidecarConfig::new(
+            PathBuf::from("/usr/local/bin/sd-server"),
+            PathBuf::from("/models/sd15.safetensors"),
+        )
+        .with_model_flag(DiffusionModelFlag::FullCheckpoint);
+        let argv = build_argv(&cfg, 41999);
+        assert_eq!(
+            argv,
+            vec![
+                "--listen-ip",
+                "127.0.0.1",
+                "--listen-port",
+                "41999",
+                "-m",
+                "/models/sd15.safetensors",
+            ],
+        );
+    }
+
+    /// The two load shapes differ only in the introducing flag.
+    #[test]
+    fn model_flag_cli_flag_mapping() {
+        assert_eq!(
+            DiffusionModelFlag::Standalone.cli_flag(),
+            "--diffusion-model"
+        );
+        assert_eq!(DiffusionModelFlag::FullCheckpoint.cli_flag(), "-m");
+        // The default preserves the historical FLUX argv.
+        assert_eq!(
+            DiffusionModelFlag::default(),
+            DiffusionModelFlag::Standalone
         );
     }
 

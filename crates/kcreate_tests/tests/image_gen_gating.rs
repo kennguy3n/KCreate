@@ -159,3 +159,45 @@ fn registry_lists_generation_packs_only_when_tier_allows() {
         );
     }
 }
+
+/// The registry's per-pack load-mode classification must stay in
+/// lockstep with the diffusion sidecar's CLI contract. sd-server
+/// loads a **fused** full checkpoint (diffusion + CLIP + VAE in one
+/// file, e.g. SD 1.5) via `-m`, but a **standalone** diffusion/UNet
+/// split (e.g. a FLUX `--diffusion-model` with separate clip/t5/vae)
+/// via `--diffusion-model`. `image_gen_start` picks the flag from
+/// `generation_pack_is_fused_checkpoint`; if that classification and
+/// the flag mapping ever drift apart, sd-server fails to load the
+/// model at runtime ("get sd version from file failed") — a failure
+/// no per-crate unit test catches because it spans the registry and
+/// the sidecar. Freeze the wiring here.
+#[test]
+fn fused_checkpoint_packs_map_to_dash_m_load_flag() {
+    use kcreate_ai::model_registry::generation_pack_is_fused_checkpoint;
+    use kcreate_ai::DiffusionModelFlag;
+
+    // The bundled SD 1.5 generation pack is a fused checkpoint and
+    // MUST therefore be launched with `-m`.
+    assert!(
+        generation_pack_is_fused_checkpoint("image_gen_sd15"),
+        "SD 1.5 is a fused full checkpoint — it must load via `-m`",
+    );
+    assert_eq!(
+        DiffusionModelFlag::FullCheckpoint.cli_flag(),
+        "-m",
+        "fused checkpoints must load via sd-server's `-m` flag",
+    );
+
+    // A standalone diffusion split (the default) maps to
+    // `--diffusion-model`. Any non-fused pack id falls through here.
+    assert!(
+        !generation_pack_is_fused_checkpoint("image_gen_flux_klein_4b"),
+        "FLUX Klein ships a standalone diffusion model + separate \
+         clip/t5/vae, so it must NOT be classified as fused",
+    );
+    assert_eq!(
+        DiffusionModelFlag::Standalone.cli_flag(),
+        "--diffusion-model",
+        "standalone diffusion models must load via `--diffusion-model`",
+    );
+}

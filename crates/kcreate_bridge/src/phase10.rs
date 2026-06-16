@@ -3002,6 +3002,78 @@ mod tests {
         assert_eq!(scale_to_fit(500, 500, 1024), (500, 500));
     }
 
+    /// Build a real WebPage design (which always carries a hero
+    /// `ElementKind::Image` with an `image_prompt`) so the imagery
+    /// pre-render path has something to act on.
+    fn web_design_with_hero() -> GeneratedDesign {
+        let opts = ThemedDesignOptions {
+            format: DesignFormat::WebPage,
+            ..ThemedDesignOptions::default()
+        };
+        let outline = outline_from_brief("Launch our new local-first design suite", opts).unwrap();
+        let design = generate_design(&outline, opts);
+        // Sanity: the fixture genuinely contains a hero image slot, so
+        // an "empty result" below reflects the fallback decision rather
+        // than an absence of image elements.
+        assert!(
+            design.pages.iter().any(|p| p
+                .elements
+                .iter()
+                .any(|e| e.kind == ElementKind::Image && e.image_prompt.is_some())),
+            "WebPage fixture must include a hero image element"
+        );
+        assert!(design.format.supports_imagery());
+        design
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn prerender_imagery_is_empty_when_no_model_is_ready() {
+        // The honest offline fallback: with no diffusion sidecar
+        // loaded (the default state in a fresh test process), the
+        // pre-render must return an empty map so every imagery slot
+        // degrades to its gradient placeholder and `used_image` is
+        // reported as false. This is the contract that keeps the whole
+        // feature network-free with no model installed.
+        assert_ne!(
+            image_gen_status().state,
+            "ready",
+            "no sidecar should be loaded in a fresh test process"
+        );
+        let design = web_design_with_hero();
+        let rasters = prerender_imagery(&design, true);
+        assert!(
+            rasters.is_empty(),
+            "no model ready ⇒ no rasters ⇒ used_image=false"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn prerender_imagery_is_empty_when_imagery_disabled() {
+        // Even on an imagery-capable format, an explicit `use_image =
+        // false` (the BriefModal toggle off) short-circuits before any
+        // readiness probe — the offline gradient path is taken.
+        let design = web_design_with_hero();
+        assert!(prerender_imagery(&design, false).is_empty());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn prerender_imagery_is_empty_for_non_imagery_format() {
+        // Decks stay purely vector: even with imagery enabled and a
+        // model hypothetically ready, a format that does not support
+        // imagery never synthesises a raster.
+        let opts = ThemedDesignOptions {
+            format: DesignFormat::Deck,
+            ..ThemedDesignOptions::default()
+        };
+        let outline = outline_from_brief("Quarterly business review", opts).unwrap();
+        let design = generate_design(&outline, opts);
+        assert!(!design.format.supports_imagery());
+        assert!(prerender_imagery(&design, true).is_empty());
+    }
+
     #[test]
     fn preferences_tmp_path_is_sibling_of_final_path() {
         // The temp path MUST live next to the final path so the

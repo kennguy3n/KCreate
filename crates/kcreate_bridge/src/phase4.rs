@@ -28,7 +28,7 @@ use kcreate_ai::{
     brand_extract::{extract_brand_from_image, BrandExtraction},
     design_critique::critique_design,
     design_tokens_vlm::{suggest_design_tokens, DesignTokenSuggestion},
-    diffusion_sidecar::{DiffusionSidecar, DiffusionSidecarConfig},
+    diffusion_sidecar::{DiffusionModelFlag, DiffusionSidecar, DiffusionSidecarConfig},
     image_gen::{generate_image, ImageGenError, ImageGenRequest},
     llm_sidecar::{LlmSidecar, SidecarConfig, SidecarError, SidecarStatus},
     model_registry::{list_model_packs, recommended_vision_pack},
@@ -566,6 +566,16 @@ pub fn image_gen_start(pack_id: String) -> Phase4Result<u16> {
         )));
     }
     let model_path = dir.join(&pack.file_path);
+    // sd-server takes a fused full checkpoint (SD 1.x / SDXL, which
+    // bundles CLIP + VAE) through `-m`, but a standalone diffusion
+    // model (FLUX / SD3-style) through `--diffusion-model`. The
+    // registry owns that per-pack classification.
+    let model_flag =
+        if kcreate_ai::model_registry::generation_pack_is_fused_checkpoint(&resolved_pack_id) {
+            DiffusionModelFlag::FullCheckpoint
+        } else {
+            DiffusionModelFlag::Standalone
+        };
     // Take the slot lock and stop any existing sidecar *before*
     // spawning the new sd-server child. Diffusion weights are large
     // enough (FLUX.2-Klein-4B is ~2.5 GB on a GPU) that we never
@@ -578,11 +588,11 @@ pub fn image_gen_start(pack_id: String) -> Phase4Result<u16> {
     let cfg = DiffusionSidecarConfig {
         binary: sd_server_binary(),
         model_path,
+        model_flag,
         health_timeout: std::time::Duration::from_mins(2),
-        // FLUX builds need supplementary text-encoder / VAE paths.
-        // Phase 12 leaves the registry shipping the single fused
-        // pack `image_gen_flux_klein_4b`; users who load a
-        // standalone FLUX checkpoint pass component paths through
+        // Standalone FLUX builds need supplementary text-encoder / VAE
+        // paths; a fused SD checkpoint needs none. Either way, users
+        // pass component paths or sd-server knobs through
         // `KCREATE_SD_SERVER_EXTRA_ARGS` (POSIX shell-word parsed —
         // see `parse_sd_server_extra_args`).
         extra_args: parse_sd_server_extra_args()?,

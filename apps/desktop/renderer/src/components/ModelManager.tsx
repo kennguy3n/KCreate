@@ -14,6 +14,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 
 import type {
   LlmStatus,
+  ModelDownloadProgress,
   ModelPack,
   ModelPackCategory,
   ResourceLimits,
@@ -24,13 +25,25 @@ export interface ModelManagerProps {
   onStatus: (msg: string | null) => void;
 }
 
-/// Install / uninstall a model pack. Lives on the parent so the
-/// PackCard can call into it via prop drilling without each card
-/// having to re-resolve `window.kcreate.aiModel`.
+/// Install / uninstall / download a model pack. Lives on the parent
+/// so the PackCard can call into it via prop drilling without each
+/// card having to re-resolve `window.kcreate.aiModel`.
 interface PackActions {
   busy: boolean;
   install: (pack: ModelPack) => void;
   uninstall: (pack: ModelPack) => void;
+  /// Start an in-app, progress-reporting download of the pack's
+  /// weights (the main process resolves the URL + verifies the
+  /// checksum). Only one download runs at a time.
+  download: (pack: ModelPack) => void;
+  /// Abort the in-flight download, if any.
+  cancelDownload: () => void;
+  /// Id of the pack currently downloading, or `null`. The card whose
+  /// `pack.id` matches renders the progress bar + Cancel button.
+  downloadingPackId: string | null;
+  /// Latest progress event for the in-flight download, or `null`
+  /// before the first event lands.
+  progress: ModelDownloadProgress | null;
 }
 
 export function ModelManager({ onStatus }: ModelManagerProps): JSX.Element {
@@ -48,6 +61,34 @@ export function ModelManager({ onStatus }: ModelManagerProps): JSX.Element {
   /// any IPC fires, eliminating the race in a way the React batching
   /// scheduler cannot defeat.
   const inFlightPackId = useRef<string | null>(null);
+  /// Id of the pack whose weights are downloading in-app, or `null`.
+  /// Set when the user clicks Download; cleared when the download
+  /// settles (done / error / cancelled). The PackCard whose id
+  /// matches renders the progress bar.
+  const [downloadingPackId, setDownloadingPackId] = useState<string | null>(
+    null,
+  );
+  /// Latest progress event for the in-flight download. The main
+  /// process is single-flight per channel, so a single slot is
+  /// sufficient — events for the resolving / error phases carry an
+  /// empty packId, which is why the card-to-progress association is
+  /// keyed off `downloadingPackId` (the pack the user clicked) rather
+  /// than the event's own `packId`.
+  const [downloadProgress, setDownloadProgress] =
+    useState<ModelDownloadProgress | null>(null);
+
+  // Subscribe once to main-process download progress. The unsubscribe
+  // handle is synchronous (preload returns a plain function), so the
+  // effect cleanup tears the listener down on unmount to avoid leaking
+  // IPC listeners across the panel's mount lifecycle.
+  useEffect(() => {
+    const unsubscribe = window.kcreate.aiModel.onModelDownloadProgress(
+      (progress) => {
+        setDownloadProgress(progress);
+      },
+    );
+    return unsubscribe;
+  }, []);
 
   const refresh = useCallback(async () => {
     try {
@@ -160,6 +201,60 @@ export function ModelManager({ onStatus }: ModelManagerProps): JSX.Element {
     [onStatus, refresh],
   );
 
+  const downloadPack = useCallback(
+    async (pack: ModelPack) => {
+      if (pack.kind === "built_in") return;
+      if (pack.downloadUrl === "") {
+        onStatus(`${pack.name}: no download URL pinned in the registry.`);
+        return;
+      }
+      // Same synchronous reentry-guard as install — the main process
+      // is single-flight, but guarding here avoids a second IPC round
+      // trip (which would cancel the first download) on a fast
+      // double-click.
+      if (inFlightPackId.current !== null) {
+        onStatus(
+          `${pack.name}: another model action is already in flight; ignoring duplicate click.`,
+        );
+        return;
+      }
+      inFlightPackId.current = pack.id;
+      setBusy(true);
+      setDownloadingPackId(pack.id);
+      setDownloadProgress(null);
+      onStatus(`${pack.name}: downloading weights…`);
+      try {
+        const report = await window.kcreate.aiModel.downloadModelPack(pack.id);
+        if (report.verified) {
+          onStatus(
+            `${pack.name}: downloaded & installed (verified, ${formatBytes(report.sizeBytes)}).`,
+          );
+        } else {
+          onStatus(
+            `${pack.name}: downloaded & installed (UNVERIFIED — actual sha256 ${report.actualSha256.slice(0, 12)}…; registry has no pinned hash yet).`,
+          );
+        }
+        await refresh();
+      } catch (e) {
+        if (errMsg(e) === "cancelled") {
+          onStatus(`${pack.name}: download cancelled.`);
+        } else {
+          onStatus(`${pack.name}: download failed: ${errMsg(e)}`);
+        }
+      } finally {
+        inFlightPackId.current = null;
+        setBusy(false);
+        setDownloadingPackId(null);
+        setDownloadProgress(null);
+      }
+    },
+    [onStatus, refresh],
+  );
+
+  const cancelDownload = useCallback(() => {
+    void window.kcreate.aiModel.cancelModelDownload();
+  }, []);
+
   const handleStop = useCallback(async () => {
     setBusy(true);
     onStatus("LLM: stopping sidecar…");
@@ -264,6 +359,12 @@ export function ModelManager({ onStatus }: ModelManagerProps): JSX.Element {
           uninstall: (pack) => {
             void uninstallPack(pack);
           },
+          download: (pack) => {
+            void downloadPack(pack);
+          },
+          cancelDownload,
+          downloadingPackId,
+          progress: downloadProgress,
         }}
       />
     </section>
@@ -339,9 +440,27 @@ function ModelPacksSection({
   const { visible, disabledIds } = filterPacksForTier(packs, limits);
   const installed = visible.filter((p) => p.installed);
   const available = visible.filter((p) => !p.installed);
+  // Disk usage attributable to optional packs the user installed.
+  // Built-in packs ship `sizeBytes === 0` (they live in the app
+  // bundle, not `models_dir`), so they contribute nothing and the
+  // total honestly reflects what the user downloaded onto disk.
+  const installedBytes = installed.reduce((sum, p) => sum + p.sizeBytes, 0);
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: spacing.sm }}>
-      <h4 style={{ margin: 0, fontSize: 12, fontWeight: 600 }}>Model packs</h4>
+      <div
+        style={{
+          display: "flex",
+          alignItems: "baseline",
+          justifyContent: "space-between",
+        }}
+      >
+        <h4 style={{ margin: 0, fontSize: 12, fontWeight: 600 }}>Model packs</h4>
+        <span style={{ fontSize: 10, color: colors.textMuted }}>
+          {installed.length > 0
+            ? `${installed.length} installed · ${formatBytes(installedBytes)} on disk`
+            : "none installed"}
+        </span>
+      </div>
       {installed.length > 0 ? (
         <PackGroup
           label="Installed"
@@ -398,7 +517,14 @@ function PackCard({
   tierBlocked: boolean;
 }): JSX.Element {
   const optional = pack.kind !== "built_in";
-  const installBlocked =
+  const isDownloading = actions.downloadingPackId === pack.id;
+  // Manual "pick a file you already have" path. Disabled while any
+  // model action is busy or the pack is tier-locked; unlike Download
+  // it stays enabled when no URL is pinned (the whole point of the
+  // manual path is to install a pack the registry can't fetch).
+  const installBlocked = actions.busy || tierBlocked;
+  // In-app download path. Additionally requires a pinned URL.
+  const downloadBlocked =
     actions.busy || pack.downloadUrl === "" || tierBlocked;
   return (
     <article
@@ -445,25 +571,50 @@ function PackCard({
             >
               Uninstall
             </button>
-          ) : (
+          ) : isDownloading ? (
             <button
               type="button"
-              onClick={() => actions.install(pack)}
-              disabled={installBlocked}
-              style={packPrimaryBtnStyle(installBlocked)}
-              title={
-                tierBlocked
-                  ? "Exceeds this machine's vision-model size cap. " +
-                    "Upgrade hardware or pick a smaller pack."
-                  : undefined
-              }
+              onClick={() => actions.cancelDownload()}
+              style={packSecondaryBtnStyle(false)}
             >
-              {tierBlocked ? "Tier locked" : "Install…"}
+              Cancel
             </button>
+          ) : (
+            <div style={{ display: "flex", gap: 4 }}>
+              <button
+                type="button"
+                onClick={() => actions.download(pack)}
+                disabled={downloadBlocked}
+                style={packPrimaryBtnStyle(downloadBlocked)}
+                title={
+                  tierBlocked
+                    ? "Exceeds this machine's vision-model size cap. " +
+                      "Upgrade hardware or pick a smaller pack."
+                    : pack.downloadUrl === ""
+                      ? "No download URL pinned in the registry — use " +
+                        "‘File…’ to install a copy you already have."
+                      : "Download & verify the weights in-app."
+                }
+              >
+                {tierBlocked ? "Tier locked" : "Download"}
+              </button>
+              <button
+                type="button"
+                onClick={() => actions.install(pack)}
+                disabled={installBlocked}
+                style={packSecondaryBtnStyle(installBlocked)}
+                title="Install from a weights file you already downloaded."
+              >
+                File…
+              </button>
+            </div>
           )
         ) : null}
       </div>
-      {optional && pack.downloadUrl && !pack.installed ? (
+      {isDownloading ? (
+        <DownloadProgressBar progress={actions.progress} />
+      ) : null}
+      {optional && pack.downloadUrl && !pack.installed && !isDownloading ? (
         <a
           href={pack.downloadUrl}
           target="_blank"
@@ -477,11 +628,93 @@ function PackCard({
           }}
           title={pack.downloadUrl}
         >
-          Download weights ↗
+          Download weights manually ↗
         </a>
       ) : null}
     </article>
   );
+}
+
+/// Renders the live progress of an in-app model download. Shows a
+/// determinate bar once the server reports a `Content-Length`, an
+/// indeterminate "shimmer-free" full-width track until then, and an
+/// accessible phase label (`Connecting…` / `45% · 1.1 GB / 2.4 GB` /
+/// `Verifying…` / `Installing…`). The bar is driven entirely by the
+/// main-process progress events — the renderer never touches the
+/// network.
+function DownloadProgressBar({
+  progress,
+}: {
+  progress: ModelDownloadProgress | null;
+}): JSX.Element {
+  const phase = progress?.phase ?? "resolving";
+  const received = progress?.receivedBytes ?? 0;
+  const total = progress?.totalBytes ?? null;
+  const pct =
+    total && total > 0
+      ? Math.min(100, Math.round((received / total) * 100))
+      : null;
+  const label = downloadPhaseLabel(phase, received, total, pct);
+  // `aria-busy` while the download is actively running so assistive
+  // tech announces the in-progress state; the role+valuenow expose the
+  // determinate percentage when known.
+  const active =
+    phase !== "done" && phase !== "error" && phase !== "cancelled";
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+      <div
+        role="progressbar"
+        aria-busy={active}
+        aria-valuemin={0}
+        aria-valuemax={100}
+        aria-valuenow={pct ?? undefined}
+        aria-label={`Download ${label}`}
+        style={progressTrackStyle}
+      >
+        <div
+          style={{
+            ...progressFillStyle,
+            width: pct === null ? "100%" : `${pct}%`,
+            opacity: pct === null ? 0.4 : 1,
+          }}
+        />
+      </div>
+      <span style={{ fontSize: 9, color: colors.textMuted }}>{label}</span>
+    </div>
+  );
+}
+
+/// Build the human-readable status line for a download phase. Kept
+/// pure (no React) so the ModelManager test can assert the exact
+/// copy without rendering.
+function downloadPhaseLabel(
+  phase: ModelDownloadProgress["phase"],
+  received: number,
+  total: number | null,
+  pct: number | null,
+): string {
+  switch (phase) {
+    case "resolving":
+      return "Preparing…";
+    case "connecting":
+      return "Connecting…";
+    case "downloading":
+      return pct === null
+        ? `Downloading… ${formatBytes(received)}`
+        : `${pct}% · ${formatBytes(received)} / ${formatBytes(total ?? received)}`;
+    case "verifying":
+      return "Verifying checksum…";
+    case "installing":
+      return "Installing…";
+    case "done":
+      return "Done.";
+    case "cancelled":
+      return "Cancelled.";
+    case "error":
+      return "Failed.";
+    default:
+      return "";
+  }
 }
 
 /// Format a byte count for display. `0` would otherwise render as
@@ -506,6 +739,21 @@ function packPrimaryBtnStyle(disabled: boolean): React.CSSProperties {
     fontWeight: 600,
   };
 }
+
+const progressTrackStyle: React.CSSProperties = {
+  width: "100%",
+  height: 4,
+  borderRadius: radius.pill,
+  background: colors.bgSoft,
+  overflow: "hidden",
+};
+
+const progressFillStyle: React.CSSProperties = {
+  height: "100%",
+  background: colors.accent,
+  borderRadius: radius.pill,
+  transition: "width 120ms linear",
+};
 
 function packSecondaryBtnStyle(disabled: boolean): React.CSSProperties {
   return {

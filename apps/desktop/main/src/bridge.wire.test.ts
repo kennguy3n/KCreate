@@ -34,6 +34,10 @@ import type {
   TemplateInstantiateResultSnake,
 } from "./bridge";
 import type {
+  DownloadProgress,
+  DownloadInstallReport,
+} from "./modelDownloader";
+import type {
   FrameInfo,
   AcquiredFrame,
   PresentFrame,
@@ -43,6 +47,8 @@ import type {
   DocumentStatus,
   ThumbnailBytes,
   TemplateInstantiateReport,
+  ModelDownloadProgress,
+  ModelInstallReport,
 } from "../../shared/scene";
 
 /** Fails to compile unless `value`'s type is assignable to `T`. */
@@ -94,6 +100,21 @@ expectAssignable<TemplateInstantiateReport>(
 expectAssignable<TemplateInstantiateResultSnake>(
   {} as TemplateInstantiateReport,
 );
+
+// In-app model download (append-only IPC, AGENTS.md Rule 4). The
+// progress events the Electron main process pushes on
+// `kcreate/ai/modelDownloadProgress` (`DownloadProgress`) and the
+// install report it resolves `downloadModelPack` with
+// (`DownloadInstallReport`) must stay structurally in lockstep with
+// the renderer-facing DTOs (`ModelDownloadProgress` /
+// `ModelInstallReport`) the preload casts them to. Guarded in both
+// directions so neither the main-process emitter nor the renderer
+// consumer can drift a field name (e.g. `receivedBytes`,
+// `actualSha256`) without breaking compilation here.
+expectAssignable<ModelDownloadProgress>({} as DownloadProgress);
+expectAssignable<DownloadProgress>({} as ModelDownloadProgress);
+expectAssignable<ModelInstallReport>({} as DownloadInstallReport);
+expectAssignable<DownloadInstallReport>({} as ModelInstallReport);
 
 test("public runtime/document DTOs expose their multi-word fields in camelCase", () => {
   // Shaped exactly like the napi objects the bridge returns. These are

@@ -56,7 +56,16 @@ const skipBuild = process.env["KCREATE_SKIP_BRIDGE_BUILD"] === "1";
 function run(cmd, args) {
   const res = spawnSync(cmd, args, { cwd: repoRoot, stdio: "inherit" });
   if (res.status !== 0) {
-    console.error(`[stage-bridge] \`${cmd} ${args.join(" ")}\` failed`);
+    // `status` is null when the child was killed by a signal or never
+    // spawned (e.g. `cargo`/`lipo` not on PATH, where `res.error` is the
+    // ENOENT). Surface whichever detail we have so the failure is
+    // diagnosable rather than a bare "failed".
+    const detail = res.error
+      ? `: ${res.error.message}`
+      : res.signal
+        ? ` (killed by ${res.signal})`
+        : "";
+    console.error(`[stage-bridge] \`${cmd} ${args.join(" ")}\` failed${detail}`);
     process.exit(res.status ?? 1);
   }
 }

@@ -120,6 +120,11 @@ export function createUpdaterController(deps: UpdaterDeps): UpdaterController {
     supported,
   };
 
+  // A shallow clone is sufficient because every nested field is flat:
+  // `UpdateInfo` (version / releaseDate / releaseNotes) and `UpdateProgress`
+  // (percent / bytesPerSecond / transferred / total) hold only primitives.
+  // If a nested object/array is ever added to either, deepen the copy here so
+  // a snapshot can't alias the live `state`.
   const snapshot = (): UpdateState => ({
     ...state,
     info: state.info ? { ...state.info } : null,
@@ -213,7 +218,22 @@ export function createUpdaterController(deps: UpdaterDeps): UpdaterController {
     if (!supported) return snapshot();
     // `checkForUpdates` drives the `checking` / `available` /
     // `not-available` / `error` events above, which keep `state` current.
-    return runGuarded(() => autoUpdater.checkForUpdates());
+    return runGuarded(async () => {
+      const result = await autoUpdater.checkForUpdates();
+      // electron-updater short-circuits and resolves to `null` (emitting no
+      // events) when its own `isUpdaterActive()` gate fails — i.e. there is
+      // no usable feed config: a packaged build missing `app-update.yml`, or
+      // a `KCREATE_UPDATE_FORCE_DEV=1` dev run without `KCREATE_UPDATE_FEED_URL`
+      // / a `dev-app-update.yml`. Without surfacing it the UI would sit on its
+      // prior state with no feedback, so make the misconfiguration explicit.
+      if (result === null) {
+        transition({
+          status: "error",
+          progress: null,
+          error: "Update check could not run: no update feed is configured.",
+        });
+      }
+    });
   };
 
   const download = async (): Promise<UpdateState> => {

@@ -52,6 +52,13 @@ impl GpuBackend {
     /// Attempt to initialize a GPU backend. Returns `Ok(None)` if no
     /// adapter is available, and `Err` only for unexpected wgpu errors.
     pub fn try_new(width: u32, height: u32) -> Result<Option<Self>> {
+        // Decline before constructing a wgpu instance when the GPU is
+        // disabled for this process (see `DISABLE_GPU_ENV`), so a headless
+        // test run never loads a software-Vulkan driver it could fault on
+        // during teardown. Callers fall back to the CPU rasterizer.
+        if crate::gpu_disabled_by_env() {
+            return Ok(None);
+        }
         let mut desc = wgpu::InstanceDescriptor::new_without_display_handle();
         desc.backends = wgpu::Backends::all();
         let instance = wgpu::Instance::new(desc);

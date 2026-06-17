@@ -35,6 +35,22 @@ jobs:
     name: rust (ubuntu-22.04)
     runs-on: ubuntu-22.04
     timeout-minutes: 25
+    # Force every `cargo test` process in this lane onto the CPU rasterizer.
+    # On a headless runner wgpu falls back to Mesa's software Vulkan
+    # (lavapipe), which JIT-compiles shaders through LLVM; a test process that
+    # starts exiting while that work is still resident can fault as the C
+    # runtime finalizes the Mesa/LLVM shared libraries underneath it — a
+    # non-deterministic teardown SIGSEGV/SIGABRT that fires *after* every test
+    # reports `ok` and only ever shows up as flaky CI. Declining the GPU here
+    # makes the lane deterministic; it is behavior-preserving because the GPU
+    # backend rasterizes through the same CPU compositor and only round-trips
+    # the result through wgpu, so pixels are byte-identical on this lane.
+    # The real wgpu present path stays covered every PR by the `smoke` lane
+    # (which boots the packaged app via `process.dlopen`, not Cargo, so it
+    # never sees this var) and by the macOS/Windows matrix below. See
+    # `crates/kcreate_renderer/src/lib.rs` (`DISABLE_GPU_ENV`).
+    env:
+      KCREATE_DISABLE_GPU: "1"
     steps:
       - uses: actions/checkout@v4
       - name: install rust toolchain

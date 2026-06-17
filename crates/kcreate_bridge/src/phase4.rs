@@ -14,7 +14,7 @@
 //!   - **`llm` feature**: pulls `ureq` and the helpers in
 //!     `kcreate_ai::vision_chat` / `image_gen` to talk loopback.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use base64::engine::general_purpose::STANDARD as B64;
@@ -28,10 +28,14 @@ use kcreate_ai::{
     brand_extract::{extract_brand_from_image, BrandExtraction},
     design_critique::critique_design,
     design_tokens_vlm::{suggest_design_tokens, DesignTokenSuggestion},
-    diffusion_sidecar::{DiffusionModelFlag, DiffusionSidecar, DiffusionSidecarConfig},
+    diffusion_sidecar::{
+        DiffusionModelFlag, DiffusionSidecar, DiffusionSidecarConfig, SidecarEngine,
+    },
     image_gen::{generate_image, ImageGenError, ImageGenRequest},
     llm_sidecar::{LlmSidecar, SidecarConfig, SidecarError, SidecarStatus},
-    model_registry::{list_model_packs, recommended_vision_pack},
+    model_registry::{
+        generation_engine_for, list_model_packs, recommended_vision_pack, GenerationEngine,
+    },
     sidecar_dispatcher::{plan_dispatch, DispatchPlan, SidecarRuntime},
     smart_crop::{suggest_crop, CropSuggestion},
     style_describe::{describe_style, StyleDescription},
@@ -507,8 +511,21 @@ pub fn vision_listable_packs() -> Vec<String> {
 // Image generation sidecar
 // -----------------------------------------------------------------------------
 
-fn image_gen_slot() -> &'static Mutex<Option<DiffusionSidecar>> {
-    static SLOT: OnceLock<Mutex<Option<DiffusionSidecar>>> = OnceLock::new();
+/// The currently-running image-generation sidecar plus the metadata
+/// the status IPC reports so the renderer can show the active engine
+/// honestly. `requested_pack_id` is the pack the user asked for;
+/// `pack_id` is what actually loaded — they differ whenever a Bonsai
+/// request gracefully fell back to SD 1.5 because the matching
+/// accelerator / runner was unavailable.
+struct ActiveImageGen {
+    sidecar: DiffusionSidecar,
+    engine: GenerationEngine,
+    pack_id: String,
+    requested_pack_id: String,
+}
+
+fn image_gen_slot() -> &'static Mutex<Option<ActiveImageGen>> {
+    static SLOT: OnceLock<Mutex<Option<ActiveImageGen>>> = OnceLock::new();
     SLOT.get_or_init(|| Mutex::new(None))
 }
 
@@ -524,6 +541,49 @@ fn sd_server_binary() -> PathBuf {
         .map_or_else(|| PathBuf::from("sd-server"), PathBuf::from)
 }
 
+/// The env var that names the Bonsai runner binary for `engine`.
+/// `BonsaiMlx` reads `KCREATE_BONSAI_MLX_BINARY` (the mflux runner on
+/// Apple Silicon); `BonsaiGemlite` reads `KCREATE_BONSAI_GEMLITE_BINARY`
+/// (the gemlite/HQQ runner on CUDA). `SdCpp` has no Bonsai binary.
+fn bonsai_binary_env(engine: GenerationEngine) -> Option<&'static str> {
+    match engine {
+        GenerationEngine::BonsaiMlx => Some("KCREATE_BONSAI_MLX_BINARY"),
+        GenerationEngine::BonsaiGemlite => Some("KCREATE_BONSAI_GEMLITE_BINARY"),
+        GenerationEngine::SdCpp => None,
+    }
+}
+
+/// The env var that carries extra args for the Bonsai runner of
+/// `engine` (companion text-encoder / VAE paths, sampler knobs).
+/// Parsed with the same POSIX shell-word rules as
+/// `KCREATE_SD_SERVER_EXTRA_ARGS` (see [`parse_shell_arg_env`]).
+fn bonsai_extra_args_env(engine: GenerationEngine) -> Option<&'static str> {
+    match engine {
+        GenerationEngine::BonsaiMlx => Some("KCREATE_BONSAI_MLX_EXTRA_ARGS"),
+        GenerationEngine::BonsaiGemlite => Some("KCREATE_BONSAI_GEMLITE_EXTRA_ARGS"),
+        GenerationEngine::SdCpp => None,
+    }
+}
+
+/// Resolve the Bonsai runner binary for `engine`, or `None` when the
+/// env var is unset or names a path that does not exist. A `None`
+/// here is the signal to gracefully fall back to SD 1.5: the host
+/// has selected a Bonsai pack but hasn't installed/pointed at the
+/// out-of-tree runner that can execute it.
+fn bonsai_runner_binary(engine: GenerationEngine) -> Option<PathBuf> {
+    let var = bonsai_binary_env(engine)?;
+    let raw = std::env::var_os(var)?;
+    if raw.is_empty() {
+        return None;
+    }
+    let path = PathBuf::from(raw);
+    if path.exists() {
+        Some(path)
+    } else {
+        None
+    }
+}
+
 /// Wire shape for the image-generation sidecar status. Mirrors
 /// `LlmStatusInfo` so the renderer can render both in one table.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -536,59 +596,138 @@ pub struct ImageGenStatusInfo {
     /// (`Tier ≥ 2` + GPU + not low-resource). The renderer uses
     /// this to drop the entire Generate panel when false.
     pub allowed: bool,
+    /// Stable wire string for the engine actually running
+    /// (`"sd_cpp"` / `"bonsai_mlx"` / `"bonsai_gemlite"`), or `None`
+    /// when stopped. Lets the panel badge name the real engine.
+    pub engine: Option<String>,
+    /// The generation pack actually loaded, or `None` when stopped.
+    /// Differs from `requested_pack_id` after a Bonsai → SD 1.5
+    /// fallback so the UI can be honest about what's running.
+    pub active_pack_id: Option<String>,
+    /// The generation pack the caller asked for, or `None` when
+    /// stopped.
+    pub requested_pack_id: Option<String>,
 }
+
+/// The pack KCreate always falls back to for image generation. SD
+/// 1.5 is a fused full checkpoint that the in-tree sd-server runs on
+/// any platform, so it is the guaranteed-runnable default whenever a
+/// platform-specific Bonsai variant can't execute on this host.
+const SD15_FALLBACK_PACK_ID: &str = "image_gen_sd15";
 
 /// Start the image-generation sidecar for `pack_id`. Hard-gates on
 /// [`kcreate_core::config::RuntimeConfig::image_generation_allowed`]:
 /// returns `Phase4BridgeError::ImageGenNotAllowed` on tiers below
 /// the hard gate. The pack id must exist in the registry; we resolve
 /// the model path under the user's models directory.
+///
+/// Engine routing + graceful fallback: a `sd_cpp` pack (SD 1.5 / FLUX
+/// GGUF) launches the in-tree stable-diffusion.cpp `sd-server`. A
+/// Bonsai pack (`bonsai_mlx` on Apple Silicon, `bonsai_gemlite` on
+/// CUDA) launches an out-of-tree Bonsai runner over the same A1111
+/// loopback contract — but only when this host can actually run it
+/// (matching platform, a configured runner binary, and downloaded
+/// weights). When any precondition is missing we transparently fall
+/// back to SD 1.5 so the Generate action never dead-ends; the status
+/// surface reports the real engine + the requested-vs-active pack so
+/// the UI stays honest about the fallback.
 pub fn image_gen_start(pack_id: String) -> Phase4Result<u16> {
-    let cfg = runtime_slot().lock();
-    if !cfg.image_generation_allowed() {
+    let (allowed, platform) = {
+        let cfg = runtime_slot().lock();
+        (cfg.image_generation_allowed(), cfg.platform)
+    };
+    if !allowed {
         return Err(Phase4BridgeError::ImageGenNotAllowed);
     }
-    drop(cfg);
     let dir = models_root();
     // Phase 12 Block A removed `image_gen_flux_klein_mlx` from the
     // registry; old project files / settings can still reference it.
     // Rewrite transparently to the current FLUX Klein 4B GGUF pack.
-    let resolved_pack_id = resolve_pack_id(&pack_id);
-    let pack = list_model_packs(&dir)
-        .into_iter()
-        .find(|p| p.id == resolved_pack_id)
+    let requested_pack_id = resolve_pack_id(&pack_id);
+    let packs = list_model_packs(&dir);
+    let requested_pack = packs
+        .iter()
+        .find(|p| p.id == requested_pack_id)
         .ok_or_else(|| {
-            Phase4BridgeError::Invalid(format!("unknown image-gen pack: {resolved_pack_id}"))
+            Phase4BridgeError::Invalid(format!("unknown image-gen pack: {requested_pack_id}"))
         })?;
-    if pack.category != kcreate_ai::ModelPackCategory::Generation {
+    if requested_pack.category != kcreate_ai::ModelPackCategory::Generation {
         return Err(Phase4BridgeError::Invalid(format!(
-            "pack {resolved_pack_id} is not an image-generation pack"
+            "pack {requested_pack_id} is not an image-generation pack"
         )));
     }
-    let model_path = dir.join(&pack.file_path);
-    // sd-server takes a fused full checkpoint (SD 1.x / SDXL, which
-    // bundles CLIP + VAE) through `-m`, but a standalone diffusion
-    // model (FLUX / SD3-style) through `--diffusion-model`. The
-    // registry owns that per-pack classification.
-    let model_flag =
-        if kcreate_ai::model_registry::generation_pack_is_fused_checkpoint(&resolved_pack_id) {
-            DiffusionModelFlag::FullCheckpoint
-        } else {
-            DiffusionModelFlag::Standalone
-        };
+
+    // Decide which engine + config to actually launch. A Bonsai
+    // request resolves to its runner config only when this host can
+    // run it; otherwise we fall back to SD 1.5 (the in-tree engine).
+    let requested_engine = generation_engine_for(&requested_pack_id);
+    let (engine, active_pack_id, cfg) = match requested_engine {
+        GenerationEngine::SdCpp => (
+            GenerationEngine::SdCpp,
+            requested_pack_id.clone(),
+            sd_cpp_config(&dir, &requested_pack_id)?,
+        ),
+        GenerationEngine::BonsaiMlx | GenerationEngine::BonsaiGemlite => {
+            match bonsai_launch_config(&dir, requested_pack, requested_engine, platform)? {
+                Some(bonsai_cfg) => (requested_engine, requested_pack_id.clone(), bonsai_cfg),
+                None => {
+                    log::warn!(
+                        "image-gen: Bonsai pack {requested_pack_id} ({}) cannot run on this \
+                         host (platform {platform:?}: needs matching accelerator + a configured \
+                         runner binary + downloaded weights); falling back to {SD15_FALLBACK_PACK_ID}",
+                        requested_engine.as_wire_str(),
+                    );
+                    (
+                        GenerationEngine::SdCpp,
+                        SD15_FALLBACK_PACK_ID.to_string(),
+                        sd_cpp_config(&dir, SD15_FALLBACK_PACK_ID)?,
+                    )
+                }
+            }
+        }
+    };
+
     // Take the slot lock and stop any existing sidecar *before*
-    // spawning the new sd-server child. Diffusion weights are large
-    // enough (FLUX.2-Klein-4B is ~2.5 GB on a GPU) that we never
-    // want two copies resident, even briefly, on a Tier-2 box.
+    // spawning the new child. Diffusion weights are large enough
+    // (FLUX.2-Klein-4B is ~2.5 GB on a GPU) that we never want two
+    // copies resident, even briefly, on a Tier-2 box.
     let mut guard = image_gen_slot().lock();
     if let Some(prev) = guard.as_mut() {
-        prev.stop();
+        prev.sidecar.stop();
     }
     *guard = None;
-    let cfg = DiffusionSidecarConfig {
+    let mut sidecar = DiffusionSidecar::new(cfg);
+    let port = sidecar.start().map_err(Phase4BridgeError::Sidecar)?;
+    *guard = Some(ActiveImageGen {
+        sidecar,
+        engine,
+        pack_id: active_pack_id,
+        requested_pack_id,
+    });
+    Ok(port)
+}
+
+/// Build the sd-server (`stable-diffusion.cpp`) config for `pack_id`,
+/// already known to be a Generation pack under `dir`. sd-server takes
+/// a fused full checkpoint (SD 1.x / SDXL, which bundles CLIP + VAE)
+/// through `-m`, but a standalone diffusion model (FLUX / SD3-style)
+/// through `--diffusion-model`; the registry owns that per-pack
+/// classification.
+fn sd_cpp_config(dir: &Path, pack_id: &str) -> Phase4Result<DiffusionSidecarConfig> {
+    let pack = list_model_packs(dir)
+        .into_iter()
+        .find(|p| p.id == pack_id)
+        .ok_or_else(|| Phase4BridgeError::Invalid(format!("unknown image-gen pack: {pack_id}")))?;
+    let model_flag = if kcreate_ai::model_registry::generation_pack_is_fused_checkpoint(pack_id) {
+        DiffusionModelFlag::FullCheckpoint
+    } else {
+        DiffusionModelFlag::Standalone
+    };
+    Ok(DiffusionSidecarConfig {
         binary: sd_server_binary(),
-        model_path,
+        model_path: dir.join(&pack.file_path),
         model_flag,
+        engine: SidecarEngine::SdCpp,
         health_timeout: std::time::Duration::from_mins(2),
         // Standalone FLUX builds need supplementary text-encoder / VAE
         // paths; a fused SD checkpoint needs none. Either way, users
@@ -596,11 +735,54 @@ pub fn image_gen_start(pack_id: String) -> Phase4Result<u16> {
         // `KCREATE_SD_SERVER_EXTRA_ARGS` (POSIX shell-word parsed —
         // see `parse_sd_server_extra_args`).
         extra_args: parse_sd_server_extra_args()?,
+    })
+}
+
+/// Build the Bonsai-runner config for `pack`, or `None` to signal a
+/// graceful fallback to SD 1.5. Returns `None` whenever this host
+/// can't actually run the Bonsai engine:
+///   - the runtime platform doesn't match the engine (MLX needs
+///     Apple Silicon; GemLite needs an x64 CUDA GPU host),
+///   - no runner binary is configured / present
+///     (`KCREATE_BONSAI_{MLX,GEMLITE}_BINARY`), or
+///   - the pack's weights aren't downloaded yet.
+///
+/// The Bonsai runner speaks the same A1111 loopback contract as
+/// sd-server but loads weights through `--model` (see
+/// [`SidecarEngine::BonsaiRunner`]); companion encoder / VAE paths
+/// and sampler knobs are passed through
+/// `KCREATE_BONSAI_{MLX,GEMLITE}_EXTRA_ARGS`.
+fn bonsai_launch_config(
+    dir: &Path,
+    pack: &kcreate_ai::ModelPack,
+    engine: GenerationEngine,
+    platform: kcreate_core::config::Platform,
+) -> Phase4Result<Option<DiffusionSidecarConfig>> {
+    if !engine.supports_platform(platform) {
+        return Ok(None);
+    }
+    let Some(binary) = bonsai_runner_binary(engine) else {
+        return Ok(None);
     };
-    let mut sidecar = DiffusionSidecar::new(cfg);
-    let port = sidecar.start().map_err(Phase4BridgeError::Sidecar)?;
-    *guard = Some(sidecar);
-    Ok(port)
+    let model_path = dir.join(&pack.file_path);
+    if !model_path.exists() {
+        return Ok(None);
+    }
+    let extra_args = match bonsai_extra_args_env(engine) {
+        Some(var) => parse_shell_arg_env(var)?,
+        None => Vec::new(),
+    };
+    Ok(Some(DiffusionSidecarConfig {
+        binary,
+        model_path,
+        // The Bonsai runner ignores `model_flag` (it loads via
+        // `--model`); keep the default so the field stays meaningful
+        // for any SdCpp reuse of the same struct.
+        model_flag: DiffusionModelFlag::Standalone,
+        engine: SidecarEngine::BonsaiRunner,
+        health_timeout: std::time::Duration::from_mins(2),
+        extra_args,
+    }))
 }
 
 /// Parse the `KCREATE_SD_SERVER_EXTRA_ARGS` env var into an argv
@@ -632,7 +814,20 @@ pub fn image_gen_start(pack_id: String) -> Phase4Result<u16> {
 /// argv and letting sd-server fail with a cryptic missing-file
 /// error.
 fn parse_sd_server_extra_args() -> Phase4Result<Vec<String>> {
-    let Some(raw) = std::env::var_os("KCREATE_SD_SERVER_EXTRA_ARGS") else {
+    parse_shell_arg_env("KCREATE_SD_SERVER_EXTRA_ARGS")
+}
+
+/// Parse the env var named `var` into an argv slice using POSIX
+/// shell-word rules (the `shell-words` crate). Single / double quotes
+/// group spaces into one token and backslash escapes inside double
+/// quotes survive, so Windows paths with spaces work. Unset / empty
+/// => no args. A set-but-malformed (mismatched-quote) value returns
+/// `Phase4BridgeError::Invalid` so the parse failure surfaces to the
+/// renderer instead of silently truncating the argv. Shared by the
+/// sd-server (`KCREATE_SD_SERVER_EXTRA_ARGS`) and Bonsai runner
+/// (`KCREATE_BONSAI_{MLX,GEMLITE}_EXTRA_ARGS`) launch paths.
+fn parse_shell_arg_env(var: &str) -> Phase4Result<Vec<String>> {
+    let Some(raw) = std::env::var_os(var) else {
         return Ok(Vec::new());
     };
     let raw_str = raw.to_string_lossy();
@@ -641,7 +836,7 @@ fn parse_sd_server_extra_args() -> Phase4Result<Vec<String>> {
     }
     shell_words::split(&raw_str).map_err(|e| {
         Phase4BridgeError::Invalid(format!(
-            "KCREATE_SD_SERVER_EXTRA_ARGS could not be parsed as a shell-quoted argv: {e}",
+            "{var} could not be parsed as a shell-quoted argv: {e}",
         ))
     })
 }
@@ -649,8 +844,8 @@ fn parse_sd_server_extra_args() -> Phase4Result<Vec<String>> {
 /// Stop the image-generation sidecar. Idempotent.
 pub fn image_gen_stop() {
     let mut guard = image_gen_slot().lock();
-    if let Some(s) = guard.as_mut() {
-        s.stop();
+    if let Some(active) = guard.as_mut() {
+        active.sidecar.stop();
     }
     *guard = None;
 }
@@ -659,38 +854,56 @@ pub fn image_gen_stop() {
 pub fn image_gen_status() -> ImageGenStatusInfo {
     let allowed = runtime_slot().lock().image_generation_allowed();
     let guard = image_gen_slot().lock();
-    let Some(s) = guard.as_ref() else {
+    let Some(active) = guard.as_ref() else {
         return ImageGenStatusInfo {
             state: "stopped",
             port: None,
             error: None,
             allowed,
+            engine: None,
+            active_pack_id: None,
+            requested_pack_id: None,
         };
     };
-    match s.status() {
+    let engine = Some(active.engine.as_wire_str().to_string());
+    let active_pack_id = Some(active.pack_id.clone());
+    let requested_pack_id = Some(active.requested_pack_id.clone());
+    match active.sidecar.status() {
         SidecarStatus::Stopped => ImageGenStatusInfo {
             state: "stopped",
             port: None,
             error: None,
             allowed,
+            engine,
+            active_pack_id,
+            requested_pack_id,
         },
         SidecarStatus::Starting => ImageGenStatusInfo {
             state: "starting",
             port: None,
             error: None,
             allowed,
+            engine,
+            active_pack_id,
+            requested_pack_id,
         },
         SidecarStatus::Ready { port, .. } => ImageGenStatusInfo {
             state: "ready",
             port: Some(port),
             error: None,
             allowed,
+            engine,
+            active_pack_id,
+            requested_pack_id,
         },
         SidecarStatus::Error { message } => ImageGenStatusInfo {
             state: "error",
             port: None,
             error: Some(message),
             allowed,
+            engine,
+            active_pack_id,
+            requested_pack_id,
         },
     }
 }
@@ -732,7 +945,7 @@ pub fn image_gen_generate(
         let guard = image_gen_slot().lock();
         guard
             .as_ref()
-            .and_then(|s| match s.status() {
+            .and_then(|active| match active.sidecar.status() {
                 SidecarStatus::Ready { port, .. } => Some(port),
                 _ => None,
             })
@@ -961,6 +1174,284 @@ mod tests {
         assert_eq!(back.height, 512);
         assert_eq!(back.png_b64, "iVBORw0KGgo=");
     }
+
+    /// Wire-format lockstep (AGENTS.md §4): the three honesty fields
+    /// added for Bonsai engine selection must serialise as camelCase
+    /// (`engine`, `activePackId`, `requestedPackId`), matching the
+    /// TypeScript `ImageGenStatus` mirror in
+    /// `apps/desktop/shared/scene.ts`. A renderer that reads
+    /// `status.activePackId` to show the honest "running SD 1.5
+    /// (fell back from Bonsai)" badge would silently see `undefined`
+    /// if a future edit dropped the rename.
+    #[test]
+    fn image_gen_status_wire_format_is_camelcase() {
+        let info = ImageGenStatusInfo {
+            state: "ready",
+            port: Some(34567),
+            error: None,
+            allowed: true,
+            engine: Some("sd_cpp".to_string()),
+            active_pack_id: Some("image_gen_sd15".to_string()),
+            requested_pack_id: Some("image_gen_bonsai_gemlite_4b".to_string()),
+        };
+        let json = serde_json::to_string(&info).unwrap();
+        assert!(json.contains("\"engine\":\"sd_cpp\""), "got: {json}");
+        assert!(
+            json.contains("\"activePackId\":\"image_gen_sd15\""),
+            "got: {json}"
+        );
+        assert!(
+            json.contains("\"requestedPackId\":\"image_gen_bonsai_gemlite_4b\""),
+            "got: {json}"
+        );
+        assert!(
+            !json.contains("active_pack_id"),
+            "snake_case leaked: {json}"
+        );
+        assert!(
+            !json.contains("requested_pack_id"),
+            "snake_case leaked: {json}"
+        );
+    }
+
+    // -------------------------------------------------------------
+    // Bonsai image engine selection + graceful SD 1.5 fallback.
+    //
+    // These exercise the bridge-side decision tree that picks the
+    // Bonsai runner only when this host can actually run it, and
+    // otherwise hands `image_gen_start` a `None` so it transparently
+    // falls back to SD 1.5. The pure engine→platform routing itself
+    // is frozen in `kcreate_ai::model_registry`; here we pin the
+    // bridge launch-config wiring around it.
+    // -------------------------------------------------------------
+
+    /// `bonsai_binary_env` / `bonsai_extra_args_env` must map each
+    /// Bonsai engine to its dedicated env var and return `None` for
+    /// the in-tree sd-server engine (which takes no runner binary).
+    #[test]
+    fn bonsai_env_var_names_map_by_engine() {
+        assert_eq!(
+            bonsai_binary_env(GenerationEngine::BonsaiMlx),
+            Some("KCREATE_BONSAI_MLX_BINARY")
+        );
+        assert_eq!(
+            bonsai_binary_env(GenerationEngine::BonsaiGemlite),
+            Some("KCREATE_BONSAI_GEMLITE_BINARY")
+        );
+        assert_eq!(bonsai_binary_env(GenerationEngine::SdCpp), None);
+        assert_eq!(
+            bonsai_extra_args_env(GenerationEngine::BonsaiMlx),
+            Some("KCREATE_BONSAI_MLX_EXTRA_ARGS")
+        );
+        assert_eq!(
+            bonsai_extra_args_env(GenerationEngine::BonsaiGemlite),
+            Some("KCREATE_BONSAI_GEMLITE_EXTRA_ARGS")
+        );
+        assert_eq!(bonsai_extra_args_env(GenerationEngine::SdCpp), None);
+    }
+
+    /// The fallback pack constant must stay a real, runnable,
+    /// in-tree sd-server pack — SD 1.5 routes to `SdCpp` and is a
+    /// fused checkpoint, so it launches on any platform. If a future
+    /// edit retargets the constant at a pack that itself needs a
+    /// special engine, the "graceful fallback" guarantee silently
+    /// breaks.
+    #[test]
+    fn sd15_fallback_constant_is_a_runnable_sdcpp_pack() {
+        assert_eq!(SD15_FALLBACK_PACK_ID, "image_gen_sd15");
+        assert_eq!(
+            generation_engine_for(SD15_FALLBACK_PACK_ID),
+            GenerationEngine::SdCpp
+        );
+        assert!(
+            kcreate_ai::model_registry::generation_pack_is_fused_checkpoint(SD15_FALLBACK_PACK_ID)
+        );
+    }
+
+    /// Helper: fetch a registered Bonsai pack by id from `dir`.
+    fn bonsai_pack(dir: &std::path::Path, id: &str) -> kcreate_ai::ModelPack {
+        list_model_packs(dir)
+            .into_iter()
+            .find(|p| p.id == id)
+            .unwrap_or_else(|| panic!("pack {id} must be registered"))
+    }
+
+    /// A Bonsai engine that doesn't match the runtime platform must
+    /// never launch — `bonsai_launch_config` returns `None` (→ SD 1.5
+    /// fallback) before it even looks at the runner binary or
+    /// weights. GemLite is x64-CUDA-only; MLX is Apple-Silicon-only.
+    #[test]
+    fn bonsai_launch_config_none_on_unsupported_platform() {
+        use kcreate_core::config::Platform;
+        let dir = tempfile::tempdir().unwrap();
+        let gemlite = bonsai_pack(dir.path(), "image_gen_bonsai_gemlite_4b");
+        assert!(bonsai_launch_config(
+            dir.path(),
+            &gemlite,
+            GenerationEngine::BonsaiGemlite,
+            Platform::MacOsAppleSilicon,
+        )
+        .unwrap()
+        .is_none());
+        let mlx = bonsai_pack(dir.path(), "image_gen_bonsai_mlx_4b");
+        assert!(bonsai_launch_config(
+            dir.path(),
+            &mlx,
+            GenerationEngine::BonsaiMlx,
+            Platform::LinuxX64,
+        )
+        .unwrap()
+        .is_none());
+    }
+
+    /// On a supported platform with the weights downloaded, a missing
+    /// runner binary still forces the SD 1.5 fallback: we will not
+    /// pretend Bonsai is runnable when no engine binary is installed.
+    #[test]
+    fn bonsai_launch_config_none_when_runner_binary_absent() {
+        use kcreate_core::config::Platform;
+        let dir = tempfile::tempdir().unwrap();
+        let gemlite = bonsai_pack(dir.path(), "image_gen_bonsai_gemlite_4b");
+        std::fs::write(dir.path().join(&gemlite.file_path), b"weights").unwrap();
+        let _env = BonsaiEnvGuard::new(&[("KCREATE_BONSAI_GEMLITE_BINARY", None)]);
+        assert!(bonsai_launch_config(
+            dir.path(),
+            &gemlite,
+            GenerationEngine::BonsaiGemlite,
+            Platform::LinuxX64,
+        )
+        .unwrap()
+        .is_none());
+    }
+
+    /// On a supported platform with a configured runner binary but
+    /// the weights not yet downloaded, we still fall back — starting
+    /// the runner against a missing model file would only crash it.
+    #[test]
+    fn bonsai_launch_config_none_when_weights_missing() {
+        use kcreate_core::config::Platform;
+        let dir = tempfile::tempdir().unwrap();
+        let gemlite = bonsai_pack(dir.path(), "image_gen_bonsai_gemlite_4b");
+        let bin = dir.path().join("bonsai-runner");
+        std::fs::write(&bin, b"#!/bin/sh\n").unwrap();
+        let _env =
+            BonsaiEnvGuard::new(&[("KCREATE_BONSAI_GEMLITE_BINARY", Some(bin.to_str().unwrap()))]);
+        // Weights deliberately NOT written under `dir`.
+        assert!(bonsai_launch_config(
+            dir.path(),
+            &gemlite,
+            GenerationEngine::BonsaiGemlite,
+            Platform::LinuxX64,
+        )
+        .unwrap()
+        .is_none());
+    }
+
+    /// When the platform matches, the runner binary exists, and the
+    /// weights are downloaded, `bonsai_launch_config` produces a real
+    /// `BonsaiRunner` config: the primary weights load through
+    /// `--model` (not sd-server's `--diffusion-model` / `-m`), the
+    /// binary points at the configured runner, and the per-engine
+    /// `*_EXTRA_ARGS` are shell-parsed onto the argv.
+    #[test]
+    fn bonsai_launch_config_builds_runner_when_host_ready() {
+        use kcreate_core::config::Platform;
+        let dir = tempfile::tempdir().unwrap();
+        let gemlite = bonsai_pack(dir.path(), "image_gen_bonsai_gemlite_4b");
+        let bin = dir.path().join("bonsai-runner");
+        std::fs::write(&bin, b"#!/bin/sh\n").unwrap();
+        let weights = dir.path().join(&gemlite.file_path);
+        std::fs::write(&weights, b"weights").unwrap();
+        let _env = BonsaiEnvGuard::new(&[
+            ("KCREATE_BONSAI_GEMLITE_BINARY", Some(bin.to_str().unwrap())),
+            (
+                "KCREATE_BONSAI_GEMLITE_EXTRA_ARGS",
+                Some("--vae /models/vae.pt"),
+            ),
+        ]);
+        let cfg = bonsai_launch_config(
+            dir.path(),
+            &gemlite,
+            GenerationEngine::BonsaiGemlite,
+            Platform::LinuxX64,
+        )
+        .unwrap()
+        .expect("ready host must produce a Bonsai runner config");
+        assert_eq!(cfg.engine, SidecarEngine::BonsaiRunner);
+        assert_eq!(cfg.binary, bin);
+        assert_eq!(cfg.model_path, weights);
+        assert_eq!(
+            cfg.extra_args,
+            vec!["--vae".to_string(), "/models/vae.pt".to_string()]
+        );
+        // The runner loads weights via `--model`, regardless of the
+        // (ignored-for-Bonsai) DiffusionModelFlag.
+        let argv = kcreate_ai::diffusion_sidecar::build_argv(&cfg, 34567);
+        let model_idx = argv.iter().position(|a| a == "--model").expect("--model");
+        assert_eq!(
+            std::path::Path::new(&argv[model_idx + 1]),
+            weights.as_path()
+        );
+        assert!(!argv.iter().any(|a| a == "--diffusion-model" || a == "-m"));
+    }
+
+    /// Serializes the process-global `KCREATE_BONSAI_*` env vars for
+    /// the launch-config tests, mirroring the discipline the
+    /// `sd_extra_args_env` module enforces for the sd-server var:
+    /// one RAII guard takes a dedicated mutex, installs the scratch
+    /// values, and restores the prior values before releasing the
+    /// lock, so concurrent test executors never observe a torn read.
+    mod bonsai_env {
+        use std::ffi::OsString;
+
+        fn lock() -> &'static parking_lot::Mutex<()> {
+            static LOCK: std::sync::OnceLock<parking_lot::Mutex<()>> = std::sync::OnceLock::new();
+            LOCK.get_or_init(|| parking_lot::Mutex::new(()))
+        }
+
+        pub(super) struct BonsaiEnvGuard {
+            _lock: parking_lot::MutexGuard<'static, ()>,
+            prior: Vec<(&'static str, Option<OsString>)>,
+        }
+
+        impl BonsaiEnvGuard {
+            pub(super) fn new(vars: &[(&'static str, Option<&str>)]) -> Self {
+                let lock = lock().lock();
+                let mut prior = Vec::with_capacity(vars.len());
+                for (key, value) in vars {
+                    prior.push((*key, std::env::var_os(key)));
+                    // SAFETY: the dedicated mutex makes this the single
+                    // writer; every Bonsai-env test goes through this
+                    // guard, so no other thread can race the set/remove.
+                    unsafe {
+                        match value {
+                            Some(v) => std::env::set_var(key, v),
+                            None => std::env::remove_var(key),
+                        }
+                    }
+                }
+                Self { _lock: lock, prior }
+            }
+        }
+
+        impl Drop for BonsaiEnvGuard {
+            fn drop(&mut self) {
+                // SAFETY: `_lock` is still held (struct fields drop
+                // after this body returns), so the restore is
+                // observable before the next waiter proceeds.
+                let entries = std::mem::take(&mut self.prior);
+                for (key, prior) in entries {
+                    unsafe {
+                        match prior {
+                            Some(v) => std::env::set_var(key, v),
+                            None => std::env::remove_var(key),
+                        }
+                    }
+                }
+            }
+        }
+    }
+    use bonsai_env::BonsaiEnvGuard;
 
     // -------------------------------------------------------------
     // KCREATE_SD_SERVER_EXTRA_ARGS parsing — POSIX shell-word rules.

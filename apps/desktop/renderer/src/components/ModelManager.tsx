@@ -385,12 +385,17 @@ export function ModelManager({ onStatus }: ModelManagerProps): JSX.Element {
 ///   (`crates/kcreate_bridge/src/phase4.rs::vision_listable_packs`)
 ///   — using decimal MB here would diverge by ~2.4% and could
 ///   produce edge-case disagreements at tier boundaries.
-/// - Phase 12 removed every `_mlx`-suffixed pack from the registry
-///   (the MLX sidecar is gone), so the historical
-///   "hide MLX packs on non-Apple-Silicon" branch is no longer
-///   needed. Every pack the bridge surfaces here is GGUF and runs
-///   on the same llama-server / sd-server stack regardless of
-///   host platform.
+/// - The legacy `_mlx`-suffixed *LLM* packs were removed from the
+///   registry, so the historical "hide MLX packs on
+///   non-Apple-Silicon" branch is gone. The two **Bonsai image**
+///   packs (`image_gen_bonsai_mlx_4b` / `image_gen_bonsai_gemlite_4b`)
+///   ARE platform-specific — MLX targets Apple Silicon, GemLite an
+///   x86-64 CUDA GPU — but we still list both here so any host can
+///   download/manage either. Run-time platform gating + graceful
+///   fallback to SD 1.5 live in the bridge
+///   (`crates/kcreate_bridge/src/phase4.rs::image_gen_start`), not in
+///   this manager: the manager is for fetching weights, the
+///   ImageGenPanel selector is where a runnable engine is chosen.
 const BINARY_MB = 1024 * 1024;
 function filterPacksForTier(
   packs: ModelPack[],

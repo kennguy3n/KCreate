@@ -201,3 +201,171 @@ fn fused_checkpoint_packs_map_to_dash_m_load_flag() {
         "standalone diffusion models must load via `--diffusion-model`",
     );
 }
+
+/// The two Bonsai image packs must route to their dedicated
+/// inference engines, while SD 1.5 and FLUX Klein stay on the
+/// in-tree sd-server engine. This is the seam that lets the bridge
+/// dispatch a Bonsai request to the external runner (and fall back
+/// to SD 1.5 when it can't) — if a registry edit ever dropped a
+/// Bonsai id from `generation_engine_for`, the request would
+/// silently launch sd-server against a ternary FLUX.2 checkpoint it
+/// cannot parse.
+#[test]
+fn bonsai_packs_route_to_their_platform_engine() {
+    use kcreate_ai::model_registry::{generation_engine_for, GenerationEngine};
+    assert_eq!(
+        generation_engine_for("image_gen_bonsai_mlx_4b"),
+        GenerationEngine::BonsaiMlx,
+    );
+    assert_eq!(
+        generation_engine_for("image_gen_bonsai_gemlite_4b"),
+        GenerationEngine::BonsaiGemlite,
+    );
+    // SD 1.5 (the fallback) and FLUX Klein remain on sd-server.
+    assert_eq!(
+        generation_engine_for("image_gen_sd15"),
+        GenerationEngine::SdCpp,
+    );
+    assert_eq!(
+        generation_engine_for("image_gen_flux_klein_4b"),
+        GenerationEngine::SdCpp,
+    );
+    // Unknown ids fall through to sd-server, never to a Bonsai
+    // runner that may not exist on the host.
+    assert_eq!(
+        generation_engine_for("something_unregistered"),
+        GenerationEngine::SdCpp,
+    );
+}
+
+/// Each Bonsai engine is hardware-locked to the platform its
+/// quantization targets: MLX 2-bit only runs on Apple Silicon,
+/// GemLite 2-bit only on x86-64 CUDA hosts (Windows / Linux).
+/// sd-server runs everywhere — which is exactly why it is the
+/// universal fallback. The bridge consults `supports_platform`
+/// before launching the runner, so this contract is what guarantees
+/// a Bonsai request on the wrong host degrades to SD 1.5 instead of
+/// spawning an engine that cannot execute.
+#[test]
+fn bonsai_engines_gate_to_their_platform() {
+    use kcreate_ai::model_registry::GenerationEngine;
+    use kcreate_core::config::Platform;
+
+    assert!(GenerationEngine::BonsaiMlx.supports_platform(Platform::MacOsAppleSilicon));
+    for p in [
+        Platform::MacOsIntel,
+        Platform::WindowsX64,
+        Platform::LinuxX64,
+        Platform::LinuxArm64,
+    ] {
+        assert!(
+            !GenerationEngine::BonsaiMlx.supports_platform(p),
+            "MLX must not claim support for {p:?}",
+        );
+    }
+
+    assert!(GenerationEngine::BonsaiGemlite.supports_platform(Platform::WindowsX64));
+    assert!(GenerationEngine::BonsaiGemlite.supports_platform(Platform::LinuxX64));
+    for p in [
+        Platform::MacOsIntel,
+        Platform::MacOsAppleSilicon,
+        Platform::LinuxArm64,
+    ] {
+        assert!(
+            !GenerationEngine::BonsaiGemlite.supports_platform(p),
+            "GemLite must not claim support for {p:?}",
+        );
+    }
+
+    // sd-server is the universal fallback — runnable on every host.
+    for p in [
+        Platform::MacOsIntel,
+        Platform::MacOsAppleSilicon,
+        Platform::WindowsX64,
+        Platform::LinuxX64,
+        Platform::LinuxArm64,
+    ] {
+        assert!(
+            GenerationEngine::SdCpp.supports_platform(p),
+            "sd-server must run on {p:?}",
+        );
+    }
+}
+
+/// Platform → Bonsai-variant selection picks the MLX build on Apple
+/// Silicon and the GemLite build on x86-64 Windows / Linux, and
+/// returns `None` on hosts neither Bonsai build targets (Intel Macs,
+/// ARM Linux) — those keep the SD 1.5 default with no Bonsai option.
+#[test]
+fn bonsai_variant_selection_is_platform_correct() {
+    use kcreate_ai::model_registry::bonsai_image_variant_for_platform;
+    use kcreate_core::config::Platform;
+
+    assert_eq!(
+        bonsai_image_variant_for_platform(Platform::MacOsAppleSilicon),
+        Some("image_gen_bonsai_mlx_4b"),
+    );
+    assert_eq!(
+        bonsai_image_variant_for_platform(Platform::WindowsX64),
+        Some("image_gen_bonsai_gemlite_4b"),
+    );
+    assert_eq!(
+        bonsai_image_variant_for_platform(Platform::LinuxX64),
+        Some("image_gen_bonsai_gemlite_4b"),
+    );
+    assert_eq!(
+        bonsai_image_variant_for_platform(Platform::MacOsIntel),
+        None,
+    );
+    assert_eq!(
+        bonsai_image_variant_for_platform(Platform::LinuxArm64),
+        None,
+    );
+}
+
+/// Adding Bonsai must NOT disturb SD 1.5's role as the default
+/// recommendation / fallback (ken's explicit constraint). The
+/// recommendation is a pure function of tier and never returns a
+/// Bonsai pack on any platform — Bonsai is strictly opt-in via the
+/// generation-model selector, while SD 1.5 stays the baseline a
+/// GPU-capable Tier 2 machine gets out of the box.
+#[test]
+fn sd15_stays_the_recommended_generation_default() {
+    use kcreate_ai::model_registry::recommended_generation_pack;
+    use kcreate_core::config::{DeviceTier, Platform};
+
+    let all_platforms = [
+        Platform::MacOsIntel,
+        Platform::MacOsAppleSilicon,
+        Platform::WindowsX64,
+        Platform::LinuxX64,
+        Platform::LinuxArm64,
+    ];
+
+    // Tier 2 (the entry tier that allows generation) recommends
+    // SD 1.5 on every platform — never a Bonsai variant.
+    for p in all_platforms {
+        assert_eq!(
+            recommended_generation_pack(DeviceTier::Tier2, p),
+            Some("image_gen_sd15"),
+            "Tier 2 on {p:?} must default to SD 1.5",
+        );
+    }
+
+    // No tier/platform combination may ever recommend a Bonsai pack.
+    for tier in [
+        DeviceTier::Tier0,
+        DeviceTier::Tier1,
+        DeviceTier::Tier2,
+        DeviceTier::Tier3,
+    ] {
+        for p in all_platforms {
+            if let Some(rec) = recommended_generation_pack(tier, p) {
+                assert!(
+                    !rec.starts_with("image_gen_bonsai_"),
+                    "{tier:?}/{p:?} must not recommend a Bonsai pack, got {rec}",
+                );
+            }
+        }
+    }
+}

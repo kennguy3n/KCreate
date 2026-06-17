@@ -237,7 +237,6 @@ export function CommandPalette({
   const [history, setHistory] = useState<CommandHistory>(() =>
     loadCommandHistory(),
   );
-  const inputRef = useRef<HTMLInputElement | null>(null);
   const listRef = useRef<HTMLDivElement | null>(null);
   const activeRowRef = useRef<HTMLButtonElement | null>(null);
   const { t } = useI18n();
@@ -349,7 +348,6 @@ export function CommandPalette({
         <div style={inputRowStyle}>
           <Icon name="search" size={16} />
           <input
-            ref={inputRef}
             type="text"
             value={query}
             placeholder={t("palette.placeholder")}

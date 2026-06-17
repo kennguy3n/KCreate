@@ -615,6 +615,47 @@ const fn validate_dims(width: u32, height: u32) -> Result<()> {
     Ok(())
 }
 
+/// Environment variable that forces every renderer GPU entry point to
+/// decline, so the process never constructs a [`wgpu::Instance`] and never
+/// loads a Vulkan / Metal / D3D driver.
+///
+/// This exists purely to make headless test runs deterministic. On a
+/// headless Linux CI runner wgpu falls back to Mesa's software Vulkan
+/// (lavapipe), which JIT-compiles shaders through LLVM. If a `cargo test`
+/// process begins to exit while that JIT / GPU work is still resident, the C
+/// runtime finalizes the Mesa/LLVM shared libraries underneath it and the
+/// process faults on the way out — a non-deterministic teardown
+/// SIGSEGV/SIGABRT that fires *after* every test has already reported `ok`,
+/// so it only ever surfaces as flaky CI. (See
+/// `crates/kcreate_bridge/src/thumbnails.rs` for the same race on the
+/// background thumbnail pre-warm worker, gated off by
+/// `KCREATE_DISABLE_THUMBNAIL_PREWARM`.)
+///
+/// When this is truthy, [`GpuBackend::try_new`] and
+/// [`compute::GpuComputeContext::try_new`] return `Ok(None)` before touching
+/// wgpu, so callers transparently take the CPU (`tiny-skia`) path — which on
+/// a software-Vulkan host produces byte-identical pixels anyway, because the
+/// GPU backend rasterizes through the same CPU compositor and only
+/// round-trips the result through wgpu upload/readback. The real wgpu present
+/// path stays covered by the Electron smoke lane (which loads the cdylib via
+/// `process.dlopen`, not Cargo) and by the macOS/Windows matrix, neither of
+/// which sets this variable.
+pub(crate) const DISABLE_GPU_ENV: &str = "KCREATE_DISABLE_GPU";
+
+/// Parse a [`DISABLE_GPU_ENV`] value. Truthy = `1` / `true` / `yes` / `on`
+/// (case-insensitive); everything else — including unset — leaves the GPU on.
+fn gpu_disabled_for_value(value: Option<&str>) -> bool {
+    matches!(
+        value.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+        Some("1" | "true" | "yes" | "on")
+    )
+}
+
+/// Whether [`DISABLE_GPU_ENV`] currently forces the CPU rasterizer.
+pub(crate) fn gpu_disabled_by_env() -> bool {
+    gpu_disabled_for_value(std::env::var(DISABLE_GPU_ENV).ok().as_deref())
+}
+
 fn init_backend(width: u32, height: u32) -> BackendKind {
     if cfg!(feature = "cpu-only") {
         log::info!("kcreate_renderer: cpu-only feature enabled — using CPU backend");
@@ -675,6 +716,25 @@ pub fn invalidate_region(ctx: &mut RenderContext, rect: Rect) {
 )]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gpu_disable_env_parses_truthy_values() {
+        // Truthy spellings disable the GPU (case-insensitive, trimmed).
+        for v in ["1", "true", "TRUE", "Yes", "on", "  on  "] {
+            assert!(gpu_disabled_for_value(Some(v)), "{v:?} should disable GPU");
+        }
+        // Everything else — including unset and "0" — leaves the GPU on.
+        for v in [
+            None,
+            Some("0"),
+            Some("false"),
+            Some("no"),
+            Some(""),
+            Some("off"),
+        ] {
+            assert!(!gpu_disabled_for_value(v), "{v:?} should keep GPU on");
+        }
+    }
 
     #[test]
     fn initialize_zero_dimensions_fails() {

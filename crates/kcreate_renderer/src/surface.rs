@@ -173,6 +173,11 @@ mod tests {
     use super::*;
 
     fn test_device() -> Option<(wgpu::Device, wgpu::Queue)> {
+        // Skip (same as "no adapter") when the GPU is disabled for this
+        // process, so a headless test run never loads software Vulkan.
+        if crate::gpu_disabled_by_env() {
+            return None;
+        }
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let adapter = pollster::block_on(async {
             instance

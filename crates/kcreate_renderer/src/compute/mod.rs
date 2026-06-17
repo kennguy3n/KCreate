@@ -110,6 +110,13 @@ impl GpuComputeContext {
     /// `Ok(None)` when no adapter is available — the bridge should
     /// fall back to CPU filters in that case.
     pub fn try_new() -> Result<Option<Self>, ComputeError> {
+        // Decline before constructing a wgpu instance when the GPU is
+        // disabled for this process (see `crate::DISABLE_GPU_ENV`), so a
+        // headless test run never loads a software-Vulkan driver it could
+        // fault on during teardown. The bridge falls back to CPU filters.
+        if crate::gpu_disabled_by_env() {
+            return Ok(None);
+        }
         let mut desc = wgpu::InstanceDescriptor::new_without_display_handle();
         desc.backends = wgpu::Backends::all();
         let instance = wgpu::Instance::new(desc);

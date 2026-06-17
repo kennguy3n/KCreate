@@ -83,9 +83,10 @@ pub use llm_chat::{
 };
 pub use llm_sidecar::{LlmSidecar, SidecarConfig, SidecarError, SidecarResult, SidecarStatus};
 pub use model_registry::{
-    install_model_pack, is_installed, list_model_packs, mmproj_for, pack_path,
-    recommended_generation_pack, recommended_llm_pack, recommended_vision_pack,
-    uninstall_model_pack, InstallError, InstallReport, ModelKind, ModelPack, ModelPackCategory,
+    bonsai_image_variant_for_platform, generation_engine_for, install_model_pack, is_installed,
+    list_model_packs, mmproj_for, pack_path, recommended_generation_pack, recommended_llm_pack,
+    recommended_vision_pack, uninstall_model_pack, GenerationEngine, InstallError, InstallReport,
+    ModelKind, ModelPack, ModelPackCategory,
 };
 pub use ocr::{detect_text_regions, DetectTextRegionsOptions, OcrError, TextRegion};
 pub use one_pager::{

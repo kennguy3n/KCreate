@@ -40,6 +40,33 @@ function engineLabel(engine: ImageGenEngine | null): string {
   }
 }
 
+// Bonsai image packs are strictly opt-in: they're only ever the active
+// model when the user explicitly picks them, never via an automatic
+// default. Centralised so the pack-id prefix lives in one place.
+function isBonsaiPackId(id: string): boolean {
+  return id.startsWith("image_gen_bonsai_");
+}
+
+// Choose the pack the generation selector defaults to. The
+// device-recommended pack wins whenever it's present in the advertised
+// list; otherwise we fall through installed → advertised packs, always
+// skipping Bonsai so it stays strictly opt-in and never becomes an
+// automatic default (even if `recommendedPack()` ever returns "").
+export function pickDefaultGenerationPack(
+  gens: ModelPack[],
+  recommended: string,
+): string {
+  if (recommended.length > 0 && gens.some((p) => p.id === recommended)) {
+    return recommended;
+  }
+  return (
+    gens.find((p) => p.installed && !isBonsaiPackId(p.id))?.id ??
+    gens.find((p) => !isBonsaiPackId(p.id))?.id ??
+    gens[0]?.id ??
+    ""
+  );
+}
+
 interface ImageGenPanelProps {
   onStatus: (msg: string | null) => void;
   onApplied: () => void;
@@ -93,13 +120,8 @@ export function ImageGenPanel({
         setRecommended(r);
         setGenPacks(gens);
         // Default the selector to the device-recommended pack (SD 1.5
-        // on a Tier 2 GPU box); fall back to the first installed pack,
-        // then to the first advertised pack. Never auto-select a
-        // Bonsai pack — it stays opt-in, SD 1.5 stays the default.
-        const def = gens.some((p) => p.id === r)
-          ? r
-          : (gens.find((p) => p.installed)?.id ?? gens[0]?.id ?? "");
-        setSelectedPack(def);
+        // on a Tier 2 GPU box), never auto-selecting a Bonsai pack.
+        setSelectedPack(pickDefaultGenerationPack(gens, r));
       } catch {
         if (!cancelled) setAllowed(false);
       }
@@ -122,7 +144,7 @@ export function ImageGenPanel({
   const ready = status?.state === "ready";
   const packName = (id: string | null): string =>
     (id ? genPacks.find((p) => p.id === id)?.name : undefined) ?? id ?? "";
-  const selectedIsBonsai = selectedPack.startsWith("image_gen_bonsai_");
+  const selectedIsBonsai = isBonsaiPackId(selectedPack);
   // The bridge reports the requested vs. actually-loaded pack; when
   // they differ a Bonsai request degraded to SD 1.5 on this host.
   const fellBack =

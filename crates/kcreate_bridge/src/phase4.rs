@@ -665,7 +665,7 @@ pub fn image_gen_start(pack_id: String) -> Phase4Result<u16> {
         GenerationEngine::SdCpp => (
             GenerationEngine::SdCpp,
             requested_pack_id.clone(),
-            sd_cpp_config(&dir, &requested_pack_id)?,
+            sd_cpp_config(&dir, &packs, &requested_pack_id)?,
         ),
         GenerationEngine::BonsaiMlx | GenerationEngine::BonsaiGemlite => {
             match bonsai_launch_config(&dir, requested_pack, requested_engine, platform)? {
@@ -680,7 +680,7 @@ pub fn image_gen_start(pack_id: String) -> Phase4Result<u16> {
                     (
                         GenerationEngine::SdCpp,
                         SD15_FALLBACK_PACK_ID.to_string(),
-                        sd_cpp_config(&dir, SD15_FALLBACK_PACK_ID)?,
+                        sd_cpp_config(&dir, &packs, SD15_FALLBACK_PACK_ID)?,
                     )
                 }
             }
@@ -713,9 +713,17 @@ pub fn image_gen_start(pack_id: String) -> Phase4Result<u16> {
 /// through `-m`, but a standalone diffusion model (FLUX / SD3-style)
 /// through `--diffusion-model`; the registry owns that per-pack
 /// classification.
-fn sd_cpp_config(dir: &Path, pack_id: &str) -> Phase4Result<DiffusionSidecarConfig> {
-    let pack = list_model_packs(dir)
-        .into_iter()
+///
+/// `packs` is the already-resolved registry listing from the caller
+/// (`image_gen_start`), threaded through so the SD-1.5 fallback path
+/// doesn't re-walk the registry + re-probe the filesystem.
+fn sd_cpp_config(
+    dir: &Path,
+    packs: &[kcreate_ai::ModelPack],
+    pack_id: &str,
+) -> Phase4Result<DiffusionSidecarConfig> {
+    let pack = packs
+        .iter()
         .find(|p| p.id == pack_id)
         .ok_or_else(|| Phase4BridgeError::Invalid(format!("unknown image-gen pack: {pack_id}")))?;
     let model_flag = if kcreate_ai::model_registry::generation_pack_is_fused_checkpoint(pack_id) {

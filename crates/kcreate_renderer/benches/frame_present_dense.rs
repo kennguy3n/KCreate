@@ -17,12 +17,8 @@
 //! is on the present path, not the (unchanged) rasteriser.
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use kcreate_renderer::dense_doc::{build_dense_document, toggle_marker, DenseDoc};
 use kcreate_renderer::{initialize, RenderContext, Scene};
-
-#[path = "common/dense_doc.rs"]
-mod dense_doc;
-
-use dense_doc::{build_dense_document, toggle_marker, DenseDoc};
 
 const WIDTH: u32 = 1920;
 const HEIGHT: u32 = 1080;

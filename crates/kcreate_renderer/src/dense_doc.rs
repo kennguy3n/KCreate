@@ -1,8 +1,15 @@
-//! Shared builder for the dense "analytics dashboard" document used by
-//! the `frame_present_dense` benchmark and the `dense_present_proof`
-//! example. Kept in `benches/common/` (a subdirectory Cargo does **not**
-//! auto-discover as a target) and pulled into both via `#[path]` so the
-//! 5k / 10k-node scene is defined in exactly one place.
+//! Builder for the dense "analytics dashboard" document used to exercise
+//! the present path at 5k–10k nodes.
+//!
+//! This is a **dev / benchmark** helper, compiled only behind the
+//! `dev_seed` feature so production renderer builds never carry it. It
+//! backs three consumers:
+//!
+//! * the `frame_present_dense` Criterion benchmark (renderer crate),
+//! * the `dense_present_proof` example (renderer crate), and
+//! * the bridge's `seed_dense_scene` dev affordance, which renders the
+//!   scene into the live renderer so the perf HUD can be captured under
+//!   pan/zoom on a real dense document (`shared_present_dense` bench too).
 //!
 //! The scene is a wireframe BI dashboard: a gradient header band, a
 //! gradient sidebar rail, a row of gradient KPI tiles, per-row section
@@ -12,14 +19,12 @@
 //! location; toggling its colour is the canonical "typical edit" whose
 //! dirty rectangle the present path ships instead of the whole frame.
 
-use kcreate_renderer::{
-    Color, Object, ObjectId, ObjectKind, Paint, Point2, Rect, Scene, Stroke, Style,
-};
+use crate::{Color, Object, ObjectId, ObjectKind, Paint, Point2, Rect, Scene, Stroke, Style};
 
 /// A built dense document plus the handle needed to drive a typical
 /// single-element edit against it.
 #[derive(Debug)]
-pub(crate) struct DenseDoc {
+pub struct DenseDoc {
     /// The scene, ready to hand to `render_frame`.
     pub scene: Scene,
     /// Id of the on-top selection marker rect; pass to [`toggle_marker`].
@@ -39,7 +44,7 @@ const CHROME_NODES: usize = 2 + 4 * 3 + 1;
 /// Build a dense dashboard whose node count lands within a handful of
 /// nodes of `target_nodes`, laid out to fill a `width`×`height`
 /// framebuffer. `target_nodes` is expected to be in the thousands.
-pub(crate) fn build_dense_document(target_nodes: usize, width: f32, height: f32) -> DenseDoc {
+pub fn build_dense_document(target_nodes: usize, width: f32, height: f32) -> DenseDoc {
     let mut objects: Vec<Object> = Vec::with_capacity(target_nodes + 8);
     let mut z: i32 = 0;
     let mut push = |objects: &mut Vec<Object>, kind: ObjectKind, style: Style| {
@@ -245,7 +250,7 @@ const NODES_PER_CARD: usize = 4;
 /// Flip the selection marker's fill colour. This is the canonical
 /// single-element edit: only the marker's pixels change between frames,
 /// so the presenter's pixel diff resolves to the marker rect.
-pub(crate) fn toggle_marker(scene: &mut Scene, marker_id: ObjectId, on: bool) {
+pub fn toggle_marker(scene: &mut Scene, marker_id: ObjectId, on: bool) {
     let colour = if on { MARKER_ON } else { MARKER_OFF };
     for obj in &mut scene.objects {
         if obj.id == marker_id {

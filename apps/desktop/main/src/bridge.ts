@@ -73,6 +73,15 @@ type SharedPresentFrameNapi = {
   full: boolean;
 };
 
+// `renderer_seed_dense_scene` returns an `#[napi(object)] SeedDenseResult`
+// (auto-camelCased: `frame_id` → `frameId`, `object_count` → `objectCount`).
+// Dev-only: throws a "feature not compiled in" error when the bridge was
+// built without the `dev_seed` feature.
+type SeedDenseResultNapi = {
+  frameId: number;
+  objectCount: number;
+};
+
 // `ProjectInfoSnake` / `NodeInfoSnake` / `RuntimeStatusSnake` /
 // `DocumentStatusSnake` mirror the `#[napi(object)]` structs of the same
 // stem in `crates/kcreate_bridge/src/lib.rs`. As with `UndoRedoOutcome`
@@ -233,6 +242,7 @@ export type {
   PresentFrameNapi,
   SharedPresentDescriptorNapi,
   SharedPresentFrameNapi,
+  SeedDenseResultNapi,
   ProjectInfoSnake,
   NodeInfoSnake,
   BoundsSnake,
@@ -312,6 +322,24 @@ export interface Bridge {
     dest: Buffer | Uint8Array,
   ): SharedPresentFrameNapi | null;
   rendererSharedReaderClose(): void;
+
+  // Number of draw objects in the renderer's most recently published
+  // scene (0 when nothing has rendered yet). Drives the perf HUD's
+  // "Nodes" row so it reflects what the renderer is actually drawing,
+  // including a directly-seeded dense scene with no backing document.
+  // Always available (not feature-gated).
+  rendererSceneObjectCount(): number;
+
+  // Dev-only "seed dense doc": build a ~`targetNodes`-object analytics
+  // dashboard scene and render it straight into the live renderer so the
+  // perf HUD can be captured under pan/zoom on a real dense document.
+  // Throws a "feature not compiled in" error when the bridge was built
+  // without the `dev_seed` feature.
+  rendererSeedDenseScene(
+    targetNodes: number,
+    width: number,
+    height: number,
+  ): SeedDenseResultNapi;
 
   // Document / project lifecycle
   projectCreate(name: string, dir: string): ProjectInfoSnake;

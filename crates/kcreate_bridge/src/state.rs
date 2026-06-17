@@ -309,6 +309,46 @@ pub fn current_scene() -> Result<Scene> {
         .ok_or(BridgeError::NotInitialized)
 }
 
+/// Number of objects in the most recently rendered scene, or `0` when
+/// no scene has been published yet.
+///
+/// This counts the renderer's actual draw objects — what is on screen —
+/// which is what the perf HUD's "Nodes" row reports. It is intentionally
+/// decoupled from the document graph's node count: a directly-seeded
+/// scene (the dev-only dense-doc affordance) has no backing document, so
+/// the document node count would read zero while thousands of objects are
+/// being rendered and panned/zoomed.
+pub fn scene_object_count() -> usize {
+    scene_slot()
+        .lock()
+        .as_ref()
+        .map_or(0, |scene| scene.objects.len())
+}
+
+/// Dev-only: build a dense "analytics dashboard" scene of ~`target_nodes`
+/// objects sized to `width`×`height` and render it directly into the live
+/// renderer, returning `(frame_id, object_count)`.
+///
+/// This bypasses the document graph on purpose. It exists so the perf HUD
+/// can be captured under real pan/zoom churn on a 5k–10k node document
+/// without plumbing a synthetic document through the whole editing path.
+/// The seeded scene is cached in `scene_slot` like any other, so
+/// [`render_current`] / [`set_viewport_and_render`] re-render it on every
+/// pan/zoom tick; the next document mutation (scene sync) replaces it.
+///
+/// Compiled only behind the `dev_seed` feature — production builds never
+/// carry the dense-doc generator. The N-API wrapper returns a
+/// "feature not compiled in" error when the feature is off, keeping the
+/// IPC surface stable.
+#[cfg(feature = "dev_seed")]
+pub fn seed_dense_scene(target_nodes: u32, width: f32, height: f32) -> Result<(FrameId, usize)> {
+    let doc =
+        kcreate_renderer::dense_doc::build_dense_document(target_nodes as usize, width, height);
+    let object_count = doc.scene.objects.len();
+    let id = render_scene(doc.scene)?;
+    Ok((id, object_count))
+}
+
 /// Re-render the most recently published scene at the renderer's
 /// current viewport and size, returning the new [`FrameId`] — or
 /// `Ok(None)` when no scene has been published yet (nothing to
@@ -1456,6 +1496,64 @@ mod tests {
         assert_eq!((new.width, new.height), (64, 48));
         shared_reader_open(&new).expect("reader re-opens at new geometry");
         assert_eq!(shared_reader_frame_len(), Some(64 * 48 * 4));
+
+        shutdown();
+    }
+
+    #[test]
+    #[serial]
+    fn scene_object_count_tracks_rendered_scene() {
+        reset_for_tests();
+        // No scene published yet → zero, never panics.
+        assert_eq!(scene_object_count(), 0);
+
+        init(32, 16).expect("init");
+        assert_eq!(scene_object_count(), 0);
+
+        let scene_json = r#"{
+            "clear_color": [0.0, 0.0, 0.0, 1.0],
+            "objects": [
+                { "id": 1, "z": 0, "translation": [0.0, 0.0],
+                  "style": { "fill": [1.0, 0.0, 0.0, 1.0], "stroke": null },
+                  "kind": { "type": "rect", "x": 0.0, "y": 0.0, "width": 4.0, "height": 4.0 } },
+                { "id": 2, "z": 1, "translation": [0.0, 0.0],
+                  "style": { "fill": [0.0, 1.0, 0.0, 1.0], "stroke": null },
+                  "kind": { "type": "rect", "x": 4.0, "y": 4.0, "width": 4.0, "height": 4.0 } }
+            ]
+        }"#;
+        render(scene_json).expect("render");
+        assert_eq!(scene_object_count(), 2);
+        shutdown();
+    }
+
+    #[cfg(feature = "dev_seed")]
+    #[test]
+    #[serial]
+    fn seed_dense_scene_renders_and_counts() {
+        reset_for_tests();
+        init(256, 256).expect("init");
+
+        let (frame_id, object_count) = seed_dense_scene(5000, 1920.0, 1080.0).expect("seed");
+        assert!(frame_id.0 > 0, "seeding publishes a real frame");
+        // The builder lands near the target; assert it is genuinely dense
+        // and that the count matches what the renderer now holds.
+        assert!(
+            object_count >= 4000,
+            "seeded scene is dense: {object_count}"
+        );
+        assert_eq!(scene_object_count(), object_count);
+
+        // The seeded scene is cached, so a viewport change re-renders it
+        // (the pan/zoom path the HUD capture exercises) and advances the id.
+        let panned = set_viewport_and_render(120.0, 80.0, 1.5)
+            .expect("re-render at new viewport")
+            .expect("a scene is cached");
+        assert!(panned.0 > frame_id.0, "pan/zoom produces a fresh frame");
+        assert_eq!(
+            scene_object_count(),
+            object_count,
+            "object count is stable across pan"
+        );
 
         shutdown();
     }

@@ -57,6 +57,22 @@ jobs:
         run: cargo check --workspace --all-targets
       - name: cargo test
         run: cargo test --workspace --all-targets
+      # Feature-gated code the default steps above never compile: the
+      # shared-memory present path (`native_canvas`, the only `unsafe` in
+      # the tree) and the dev-only dense-doc seed affordance (`dev_seed`).
+      # `native_canvas` now ships ON by default in packaged builds (see
+      # `stage-bridge.mjs`), so its clippy + tests are a required gate, not
+      # an afterthought. `--all-targets` here also debug-compiles the
+      # feature-gated benches (`shared_present_dense`, `frame_present_dense`)
+      # and the `dense_present_proof` example, so they can't bitrot even
+      # though the slow release-profile bench sweep lives on the gated
+      # cross-platform lane below (see the note where the fast lane ends).
+      - name: cargo clippy (native_canvas + dev_seed)
+        run: cargo clippy -p kcreate_bridge --all-targets --features native_canvas,dev_seed -- -D warnings
+      - name: cargo clippy (renderer dev_seed)
+        run: cargo clippy -p kcreate_renderer --all-targets --features dev_seed -- -D warnings
+      - name: cargo test (native_canvas + dev_seed)
+        run: cargo test -p kcreate_bridge --features native_canvas,dev_seed
       # Hard gate the local-first invariant. `cargo test --workspace`
       # already exercises this, but running it as a discrete step
       # makes the failure mode unmistakable in the CI summary the day
@@ -69,13 +85,15 @@ jobs:
       # protocol regression cannot hide behind other crates' output.
       - name: collab protocol tests
         run: cargo test -p kcreate_collab --all-targets
-      - name: cargo bench (compile only)
-        run: |
-          cargo bench -p kcreate_renderer --no-run
-          cargo bench -p kcreate_export --no-run
-          cargo bench -p kcreate_raster --no-run
-          cargo bench -p kcreate_ai --no-run
-          cargo bench -p kcreate_layout --no-run
+      # NOTE: the release-profile `cargo bench --no-run` sweep runs on the
+      # gated cross-platform lane below (and on every push to `main`), not
+      # here. Compiling all benches in the release/bench profile added ~10min
+      # and pushed this lane past its 25min budget. Every bench still gets a
+      # debug compile on each PR — non-gated benches via
+      # `cargo {clippy,test} --workspace --all-targets`, and the
+      # `native_canvas`/`dev_seed`-gated benches via the `--all-targets`
+      # clippy steps above — so this only defers release-profile-only compile
+      # errors (rare) to merge time.
 
   # Cross-platform lane — gated. See header comment for opt-in triggers.
   rust-extended:
@@ -117,13 +135,21 @@ jobs:
         run: cargo check --workspace --all-targets
       - name: cargo test
         run: cargo test --workspace --all-targets
+      # Mirror the fast lane's feature-gated coverage on macOS + Windows,
+      # where the mmap-backed shared present (`native_canvas`) has
+      # platform-specific code paths worth exercising.
+      - name: cargo clippy (native_canvas + dev_seed)
+        run: cargo clippy -p kcreate_bridge --all-targets --features native_canvas,dev_seed -- -D warnings
+      - name: cargo test (native_canvas + dev_seed)
+        run: cargo test -p kcreate_bridge --features native_canvas,dev_seed
       - name: local-first sentinel
         run: cargo test -p kcreate_tests --test local_first
       - name: collab protocol tests
         run: cargo test -p kcreate_collab --all-targets
       - name: cargo bench (compile only)
         run: |
-          cargo bench -p kcreate_renderer --no-run
+          cargo bench -p kcreate_renderer --no-run --features dev_seed
+          cargo bench -p kcreate_bridge --no-run --features native_canvas,dev_seed
           cargo bench -p kcreate_export --no-run
           cargo bench -p kcreate_raster --no-run
           cargo bench -p kcreate_ai --no-run
@@ -179,10 +205,16 @@ jobs:
             libxcb1 libxext6 libx11-xcb1 libgl1 libvulkan1 \
             mesa-vulkan-drivers
       - uses: Swatinem/rust-cache@v2
-      # Default-feature debug cdylib; the e2e harness resolves it via
-      # KCREATE_BRIDGE_PROFILE=debug -> target/debug/libkcreate_bridge.so.
+      # Debug cdylib built WITH `native_canvas` so the smoke lane boots the
+      # same shared-memory present path that ships on by default (see
+      # `stage-bridge.mjs`); the renderer still falls back to dirty-rect
+      # IPC if the shared handoff is unavailable, so this also guards that
+      # fallback. `dev_seed` is intentionally omitted — the e2e drives the
+      # real `canvas.createNodes` API, not the dev seed affordance. The
+      # harness resolves the artifact via KCREATE_BRIDGE_PROFILE=debug ->
+      # target/debug/libkcreate_bridge.so.
       - name: build bridge cdylib
-        run: cargo build -p kcreate_bridge
+        run: cargo build -p kcreate_bridge --features native_canvas
       - uses: pnpm/action-setup@v4
         with:
           version: 10.26.0

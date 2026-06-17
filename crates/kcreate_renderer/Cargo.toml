@@ -40,6 +40,12 @@ kcreate_perf = { path = "../kcreate_perf" }
 default = []
 # Force the CPU backend even when a GPU adapter is available (useful for CI / headless tests / deterministic frames).
 cpu-only = []
+# Compile the dense-document builder (`dense_doc`). It is a dev / bench
+# helper — the `frame_present_dense` bench, the `dense_present_proof`
+# example, and the bridge's dev-only "seed dense doc" affordance — so it
+# is gated off the default build and production renderer binaries never
+# carry it. Pulls in no extra crates.
+dev_seed = []
 
 [[bench]]
 name = "frame_render_empty"
@@ -64,3 +70,10 @@ harness = false
 [[bench]]
 name = "frame_present_dense"
 harness = false
+# Uses the `dense_doc` builder, which only compiles under `dev_seed`.
+required-features = ["dev_seed"]
+
+[[example]]
+name = "dense_present_proof"
+# Uses the `dense_doc` builder, which only compiles under `dev_seed`.
+required-features = ["dev_seed"]

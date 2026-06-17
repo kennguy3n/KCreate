@@ -78,6 +78,7 @@ import type {
   PresentFrame,
   SharedPresentDescriptor,
   SharedPresentRead,
+  SeedDenseResult,
   InspectCode,
   JpegExportOptions,
   LayerNamingResult,
@@ -595,6 +596,23 @@ const renderer: RendererBridge = {
       // Best-effort: a missing/feature-off reader has nothing to close.
     }
   },
+  async sceneObjectCount(): Promise<number> {
+    return (await ipcRenderer.invoke(
+      "kcreate/renderer/sceneObjectCount",
+    )) as number;
+  },
+  async seedDenseScene(
+    targetNodes,
+    width,
+    height,
+  ): Promise<SeedDenseResult> {
+    return (await ipcRenderer.invoke(
+      "kcreate/renderer/seedDenseScene",
+      targetNodes,
+      width,
+      height,
+    )) as SeedDenseResult;
+  },
 };
 
 // `project_*`, `document_get_tree`, `document_status` and `runtime_status`
@@ -859,6 +877,11 @@ const runtime: RuntimeBridge = {
       "kcreate/runtime/chooseExportDirectory",
       defaultDir,
     )) as string | null;
+  },
+  async devToolsEnabled(): Promise<boolean> {
+    return (await ipcRenderer.invoke(
+      "kcreate/runtime/devToolsEnabled",
+    )) as boolean;
   },
 };
 

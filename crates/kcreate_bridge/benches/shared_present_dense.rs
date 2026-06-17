@@ -32,16 +32,8 @@ use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Through
 use std::hint::black_box;
 
 use kcreate_bridge::shared_present::{SharedFramePublisher, SharedFrameReader};
+use kcreate_renderer::dense_doc::{build_dense_document, DenseDoc};
 use kcreate_renderer::initialize;
-
-// Only the dense-document *builder* is used here (the present handoff is
-// what we time, not a marker edit), so the shared helper's edit utility
-// is dead code in this target.
-#[allow(dead_code)]
-#[path = "../../kcreate_renderer/benches/common/dense_doc.rs"]
-mod dense_doc;
-
-use dense_doc::{build_dense_document, DenseDoc};
 
 const WIDTH: u32 = 1920;
 const HEIGHT: u32 = 1080;

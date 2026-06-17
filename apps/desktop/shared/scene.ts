@@ -5656,6 +5656,15 @@ export interface StyleDescription {
   layout: string[];
 }
 
+/**
+ * Active image-generation engine. Mirror of
+ * `kcreate_ai::model_registry::GenerationEngine::as_wire_str`:
+ * `sd_cpp` is the universal stable-diffusion.cpp sidecar (the
+ * default + fallback), `bonsai_mlx` is the Apple-Silicon MLX 2-bit
+ * runner, `bonsai_gemlite` is the x86-64 CUDA GemLite 2-bit runner.
+ */
+export type ImageGenEngine = "sd_cpp" | "bonsai_mlx" | "bonsai_gemlite";
+
 /** Mirror of `kcreate_bridge::phase4::ImageGenStatusInfo`. */
 export interface ImageGenStatus {
   state: "stopped" | "starting" | "ready" | "error";
@@ -5663,6 +5672,16 @@ export interface ImageGenStatus {
   error: string | null;
   /** Hard gate: when false, the renderer must not show the panel. */
   allowed: boolean;
+  /**
+   * Engine actually running, or `null` when stopped. May differ from
+   * the requested pack's engine when a Bonsai request gracefully
+   * fell back to `sd_cpp` (wrong platform / no runner / no weights).
+   */
+  engine: ImageGenEngine | null;
+  /** Pack id actually loaded (the fallback id after a degrade), or `null`. */
+  activePackId: string | null;
+  /** Pack id the user asked for (before any fallback), or `null`. */
+  requestedPackId: string | null;
 }
 
 /** Mirror of `kcreate_bridge::phase4::GeneratedImagePayload`. */

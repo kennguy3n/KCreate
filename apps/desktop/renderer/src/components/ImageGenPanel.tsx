@@ -16,8 +16,29 @@
 
 import { useEffect, useState } from "react";
 
-import type { ImageGenStatus, GeneratedImage } from "../../../shared/scene";
+import type {
+  ImageGenStatus,
+  ImageGenEngine,
+  GeneratedImage,
+  ModelPack,
+} from "../../../shared/scene";
 import { colors, radius, spacing } from "../styles/tokens";
+
+// Human-readable label for the engine actually driving inference.
+// `sd_cpp` is the universal stable-diffusion.cpp sidecar (SD 1.5 /
+// FLUX Klein); the two Bonsai engines are hardware-locked runners.
+function engineLabel(engine: ImageGenEngine | null): string {
+  switch (engine) {
+    case "bonsai_mlx":
+      return "bonsai-mlx";
+    case "bonsai_gemlite":
+      return "bonsai-gemlite";
+    case "sd_cpp":
+      return "sd-server";
+    default:
+      return "stopped";
+  }
+}
 
 interface ImageGenPanelProps {
   onStatus: (msg: string | null) => void;
@@ -40,6 +61,8 @@ export function ImageGenPanel({
   const [allowed, setAllowed] = useState<boolean | null>(null);
   const [status, setStatus] = useState<ImageGenStatus | null>(null);
   const [recommended, setRecommended] = useState<string>("");
+  const [genPacks, setGenPacks] = useState<ModelPack[]>([]);
+  const [selectedPack, setSelectedPack] = useState<string>("");
   const [prompt, setPrompt] = useState<string>("");
   const [sizeIndex, setSizeIndex] = useState<number>(0);
   const [steps, setSteps] = useState<number>(20);
@@ -59,13 +82,24 @@ export function ImageGenPanel({
         if (cancelled) return;
         setAllowed(ok);
         if (!ok) return;
-        const [s, r] = await Promise.all([
+        const [s, r, packs] = await Promise.all([
           window.kcreate.imageGen.status(),
           window.kcreate.imageGen.recommendedPack(),
+          window.kcreate.aiModel.listModelPacks(),
         ]);
         if (cancelled) return;
+        const gens = packs.filter((p) => p.category === "generation");
         setStatus(s);
         setRecommended(r);
+        setGenPacks(gens);
+        // Default the selector to the device-recommended pack (SD 1.5
+        // on a Tier 2 GPU box); fall back to the first installed pack,
+        // then to the first advertised pack. Never auto-select a
+        // Bonsai pack — it stays opt-in, SD 1.5 stays the default.
+        const def = gens.some((p) => p.id === r)
+          ? r
+          : (gens.find((p) => p.installed)?.id ?? gens[0]?.id ?? "");
+        setSelectedPack(def);
       } catch {
         if (!cancelled) setAllowed(false);
       }
@@ -86,6 +120,16 @@ export function ImageGenPanel({
   }
 
   const ready = status?.state === "ready";
+  const packName = (id: string | null): string =>
+    (id ? genPacks.find((p) => p.id === id)?.name : undefined) ?? id ?? "";
+  const selectedIsBonsai = selectedPack.startsWith("image_gen_bonsai_");
+  // The bridge reports the requested vs. actually-loaded pack; when
+  // they differ a Bonsai request degraded to SD 1.5 on this host.
+  const fellBack =
+    ready &&
+    status?.requestedPackId != null &&
+    status?.activePackId != null &&
+    status.requestedPackId !== status.activePackId;
 
   const refresh = async (): Promise<void> => {
     const s = await window.kcreate.imageGen.status();
@@ -93,11 +137,11 @@ export function ImageGenPanel({
   };
 
   const startSidecar = async (): Promise<void> => {
-    if (!recommended) return;
+    if (!selectedPack) return;
     setPhase("starting");
     onStatus("Starting image-gen sidecar…");
     try {
-      await window.kcreate.imageGen.start(recommended);
+      await window.kcreate.imageGen.start(selectedPack);
       await refresh();
       setPhase("ready");
       onStatus("Image-gen sidecar ready.");
@@ -169,30 +213,65 @@ export function ImageGenPanel({
       <div style={cardHeaderStyle}>
         <strong>Image generation</strong>
         <span style={badgeStyle(ready ? "ok" : "warn")}>
-          {status?.state === "ready"
-            ? `flux :${status.port ?? "?"}`
+          {ready
+            ? `${engineLabel(status?.engine ?? null)} :${status?.port ?? "?"}`
             : (status?.state ?? "stopped")}
         </span>
       </div>
       <p style={hintStyle}>
-        Local FLUX inference. Runs entirely on this machine — no data
-        leaves your device. Tier 2+ GPU recommended.
+        Local diffusion inference. Runs entirely on this machine — no
+        data leaves your device. Tier 2+ GPU recommended.
       </p>
       {!ready ? (
-        <button
-          type="button"
-          onClick={() => {
-            void startSidecar();
-          }}
-          disabled={!recommended || phase === "starting"}
-          style={primaryBtn(!recommended || phase === "starting")}
-        >
-          {phase === "starting"
-            ? "Starting…"
-            : recommended
-              ? `Start (${recommended})`
-              : "No generation pack installed"}
-        </button>
+        <>
+          {genPacks.length > 0 ? (
+            <label style={fieldStyle}>
+              <span style={fieldLabelStyle}>Model</span>
+              <select
+                value={selectedPack}
+                onChange={(e) => setSelectedPack(e.target.value)}
+                disabled={phase === "starting"}
+                style={selectStyle}
+              >
+                {genPacks.map((p) => (
+                  <option key={p.id} value={p.id}>
+                    {p.name}
+                    {p.installed ? "" : " — not downloaded"}
+                    {p.id === recommended ? " (recommended)" : ""}
+                  </option>
+                ))}
+              </select>
+            </label>
+          ) : null}
+          {selectedIsBonsai ? (
+            <p style={hintStyle}>
+              Bonsai ternary 4B runs on Apple Silicon (MLX) or a CUDA
+              GPU (GemLite). On other hardware KCreate falls back to SD
+              1.5 automatically.
+            </p>
+          ) : null}
+          <button
+            type="button"
+            onClick={() => {
+              void startSidecar();
+            }}
+            disabled={!selectedPack || phase === "starting"}
+            style={primaryBtn(!selectedPack || phase === "starting")}
+          >
+            {phase === "starting"
+              ? "Starting…"
+              : selectedPack
+                ? `Start (${packName(selectedPack)})`
+                : "No generation pack installed"}
+          </button>
+        </>
+      ) : null}
+      {fellBack ? (
+        <div style={statusStripStyle("ok")}>
+          Requested {packName(status?.requestedPackId ?? null)} isn&apos;t
+          runnable on this device — running{" "}
+          {packName(status?.activePackId ?? null)} instead.
+        </div>
       ) : null}
       <textarea
         value={prompt}

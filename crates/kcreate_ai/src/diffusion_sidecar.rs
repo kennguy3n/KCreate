@@ -93,6 +93,45 @@ impl DiffusionModelFlag {
     }
 }
 
+/// Which local inference engine this sidecar drives.
+///
+/// The driver is otherwise identical for both engines — same
+/// loopback readiness probe (`/sdcpp/v1/capabilities`) and the same
+/// A1111-compatible `POST /sdapi/v1/txt2img` generation contract —
+/// so the bridge can treat them uniformly. The only difference is the
+/// CLI flag that introduces the primary weights file (see
+/// [`build_argv`]).
+///
+/// * [`SidecarEngine::SdCpp`] — stable-diffusion.cpp's `sd-server`,
+///   which selects `-m` / `--diffusion-model` per
+///   [`DiffusionModelFlag`]. The default, so existing SD 1.5 / FLUX
+///   packs keep their exact argv.
+/// * [`SidecarEngine::BonsaiRunner`] — the external Bonsai Image
+///   Ternary 4B runner (mflux on Apple Silicon, gemlite/HQQ on CUDA),
+///   which takes the primary transformer via `--model` and its
+///   companion text-encoder / VAE files through `extra_args`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SidecarEngine {
+    /// stable-diffusion.cpp `sd-server`.
+    #[default]
+    SdCpp,
+    /// External Bonsai Image Ternary 4B runner.
+    BonsaiRunner,
+}
+
+impl SidecarEngine {
+    /// The CLI flag that introduces the primary weights file for this
+    /// engine. sd-server distinguishes fused vs. standalone via
+    /// `model_flag`; the Bonsai runner takes a single `--model` path.
+    #[must_use]
+    fn primary_weights_flag(self, model_flag: DiffusionModelFlag) -> &'static str {
+        match self {
+            Self::SdCpp => model_flag.cli_flag(),
+            Self::BonsaiRunner => "--model",
+        }
+    }
+}
+
 /// Tunables for the sd-server lifecycle. Mirrors
 /// [`crate::llm_sidecar::SidecarConfig`] in shape (path-to-binary,
 /// path-to-weights, deadlines, extra args) but with sd-server's
@@ -113,8 +152,13 @@ pub struct DiffusionSidecarConfig {
     /// per [`Self::model_flag`].
     pub model_path: PathBuf,
     /// Whether `model_path` is a standalone diffusion model or a
-    /// fused full checkpoint. Selects the sd-server CLI flag.
+    /// fused full checkpoint. Selects the sd-server CLI flag. Ignored
+    /// when `engine` is [`SidecarEngine::BonsaiRunner`].
     pub model_flag: DiffusionModelFlag,
+    /// Which inference engine to drive. Defaults to
+    /// [`SidecarEngine::SdCpp`]; set to [`SidecarEngine::BonsaiRunner`]
+    /// to launch the external Bonsai runner instead.
+    pub engine: SidecarEngine,
     /// Maximum time the supervisor will wait for `/sdcpp/v1/capabilities`
     /// to return 200 before flipping the status to `Error`.
     pub health_timeout: Duration,
@@ -136,6 +180,7 @@ impl DiffusionSidecarConfig {
             binary,
             model_path,
             model_flag: DiffusionModelFlag::Standalone,
+            engine: SidecarEngine::SdCpp,
             health_timeout: DEFAULT_HEALTH_TIMEOUT,
             extra_args: Vec::new(),
         }
@@ -146,6 +191,15 @@ impl DiffusionSidecarConfig {
     #[must_use]
     pub fn with_model_flag(mut self, model_flag: DiffusionModelFlag) -> Self {
         self.model_flag = model_flag;
+        self
+    }
+
+    /// Select the inference engine. [`SidecarEngine::BonsaiRunner`]
+    /// launches the external Bonsai runner (primary weights via
+    /// `--model`) instead of sd-server.
+    #[must_use]
+    pub fn with_engine(mut self, engine: SidecarEngine) -> Self {
+        self.engine = engine;
         self
     }
 }
@@ -166,7 +220,10 @@ pub fn build_argv(config: &DiffusionSidecarConfig, port: u16) -> Vec<String> {
         "127.0.0.1".to_string(),
         "--listen-port".to_string(),
         port.to_string(),
-        config.model_flag.cli_flag().to_string(),
+        config
+            .engine
+            .primary_weights_flag(config.model_flag)
+            .to_string(),
         config.model_path.to_string_lossy().into_owned(),
     ];
     for arg in &config.extra_args {
@@ -312,11 +369,16 @@ fn spawn_child(config: &DiffusionSidecarConfig, port: u16) -> SidecarResult<Chil
         cmd.arg(arg);
     }
     cmd.stdout(Stdio::null()).stderr(Stdio::piped());
+    let engine_label = match config.engine {
+        SidecarEngine::SdCpp => "sd-server",
+        SidecarEngine::BonsaiRunner => "bonsai-runner",
+    };
     log::debug!(
-        "spawning sd-server: {} --listen-port {} {} {}",
+        "spawning {}: {} --listen-port {} {} {}",
+        engine_label,
         config.binary.display(),
         port,
-        config.model_flag.cli_flag(),
+        config.engine.primary_weights_flag(config.model_flag),
         config.model_path.display(),
     );
     cmd.spawn().map_err(SidecarError::Spawn)
@@ -462,6 +524,7 @@ mod tests {
             binary: PathBuf::from("/usr/local/bin/sd-server"),
             model_path: PathBuf::from("/models/flux.gguf"),
             model_flag: DiffusionModelFlag::Standalone,
+            engine: SidecarEngine::SdCpp,
             health_timeout: DEFAULT_HEALTH_TIMEOUT,
             extra_args: vec![
                 "--clip_l".to_string(),
@@ -505,6 +568,50 @@ mod tests {
                 "41999",
                 "-m",
                 "/models/sd15.safetensors",
+            ],
+        );
+    }
+
+    /// The Bonsai runner introduces its primary transformer with a
+    /// generic `--model` flag (ignoring [`DiffusionModelFlag`]) and
+    /// carries its companion text-encoder / VAE files through
+    /// `extra_args`, exactly like the FLUX split does for sd-server.
+    /// The loopback listen flags and the model-first ordering are
+    /// unchanged, so the same readiness probe + txt2img client drive
+    /// both engines.
+    #[test]
+    fn build_argv_bonsai_runner_uses_dash_dash_model() {
+        let cfg = DiffusionSidecarConfig::new(
+            PathBuf::from("/opt/bonsai/bonsai-runner"),
+            PathBuf::from("/models/bonsai-mlx-transformer.safetensors"),
+        )
+        // model_flag is deliberately set to a value the SdCpp path
+        // would honour, to prove the Bonsai engine ignores it.
+        .with_model_flag(DiffusionModelFlag::FullCheckpoint)
+        .with_engine(SidecarEngine::BonsaiRunner);
+        let cfg = DiffusionSidecarConfig {
+            extra_args: vec![
+                "--text-encoder".to_string(),
+                "/models/bonsai-text-encoder.safetensors".to_string(),
+                "--vae".to_string(),
+                "/models/bonsai-vae.safetensors".to_string(),
+            ],
+            ..cfg
+        };
+        let argv = build_argv(&cfg, 42100);
+        assert_eq!(
+            argv,
+            vec![
+                "--listen-ip",
+                "127.0.0.1",
+                "--listen-port",
+                "42100",
+                "--model",
+                "/models/bonsai-mlx-transformer.safetensors",
+                "--text-encoder",
+                "/models/bonsai-text-encoder.safetensors",
+                "--vae",
+                "/models/bonsai-vae.safetensors",
             ],
         );
     }

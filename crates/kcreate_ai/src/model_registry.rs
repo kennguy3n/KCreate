@@ -127,6 +127,20 @@ const CANONICAL_PACK_HASHES: &[(&str, &str)] = &[
         "image_gen_sd15",
         "e9476a13728cd75d8279f6ec8bad753a66a1957ca375a1464dc63b37db6e3916",
     ),
+    // Bonsai Image Ternary 4B primary transformer weights. Pinned to
+    // the upstream `prism-ml` LFS oids of each variant's primary file
+    // (the `download_url` below): the mflux-packed safetensors for the
+    // Apple-Silicon MLX build and the gemlite int2 `state_dict.pt` for
+    // the CUDA build. Companion encoder / VAE files ride on the
+    // runner's own extra args (see `phase4::parse_bonsai_extra_args`).
+    (
+        "image_gen_bonsai_mlx_4b",
+        "b21737bdf02690b7d662907781c4dc8b8bf22a2c98b823b1ca3336f48371a84f",
+    ),
+    (
+        "image_gen_bonsai_gemlite_4b",
+        "a3a7df8a90374fea24afce3b36f00b4c728d0254717143d61f912a7b3070e7ac",
+    ),
     // Pinned at release time. Example shape (commented out):
     // ("bg_remove_u2net", "0123456789abcdef…"),
 ];
@@ -554,16 +568,47 @@ fn static_packs() -> Vec<ModelPack> {
                 "https://huggingface.co/Comfy-Org/stable-diffusion-v1-5-archive/resolve/main/v1-5-pruned-emaonly-fp16.safetensors".into(),
             sha256: String::new(),
         },
-        // Phase 12 Block A also removed `image_gen_flux_klein_mlx`.
-        // sd-server handles FLUX.2 Klein natively with Metal
-        // acceleration on Apple Silicon, so the MLX-specific bundle
-        // is no longer needed. Bonsai Image Ternary 4B was
-        // investigated but is NOT compatible with stable-diffusion.cpp
-        // — its gemlite-2bit and MLX 2bit variants ship with their
-        // own runtimes (HQQ / gemlite kernels / DrawThings) that
-        // sd-server does not support. The full-precision unpacked
-        // safetensors are >7 GB and would defeat the size argument.
-        // We keep FLUX Klein 4B as the sole image-gen recommendation.
+        // Bonsai Image Ternary 4B — a ternary-quantized FLUX.2 Klein
+        // published by `prism-ml` in two accelerator-specific builds.
+        // Neither loads in sd-server/stable-diffusion.cpp: they ship
+        // their own runtimes (mflux on Apple Silicon, gemlite/HQQ
+        // kernels on CUDA), so `generation_engine_for` routes them to
+        // an external Bonsai runner instead of the sd-server sidecar
+        // (see `crates/kcreate_bridge/src/phase4.rs`). They are opt-in
+        // via the generation-model selector — SD 1.5 stays the default
+        // fallback whenever the matching accelerator or runner is
+        // absent. Each pack's `file_path` is the primary transformer
+        // weight; the companion text-encoder / VAE files are passed to
+        // the runner through `KCREATE_BONSAI_*_EXTRA_ARGS`.
+        //
+        // Apple-Silicon (MLX 2-bit): the mflux-packed transformer.
+        ModelPack {
+            id: "image_gen_bonsai_mlx_4b".into(),
+            name: "Image Generation — Bonsai Image Ternary 4B (MLX 2-bit · Apple Silicon)".into(),
+            category: ModelPackCategory::Generation,
+            kind: ModelKind::Sidecar,
+            capabilities: vec!["image_generation".into()],
+            size_bytes: 1_425_271_472,
+            file_path: "bonsai-image-ternary-4b-mlx-2bit-transformer.safetensors".into(),
+            installed: false,
+            download_url:
+                "https://huggingface.co/prism-ml/bonsai-image-ternary-4B-mlx-2bit/resolve/main/transformer-packed-mflux/diffusion_pytorch_model.safetensors".into(),
+            sha256: String::new(),
+        },
+        // CUDA Windows/Linux (GemLite int2): the gemlite state_dict.
+        ModelPack {
+            id: "image_gen_bonsai_gemlite_4b".into(),
+            name: "Image Generation — Bonsai Image Ternary 4B (GemLite 2-bit · CUDA GPU)".into(),
+            category: ModelPackCategory::Generation,
+            kind: ModelKind::Sidecar,
+            capabilities: vec!["image_generation".into()],
+            size_bytes: 1_540_457_482,
+            file_path: "bonsai-image-ternary-4b-gemlite-2bit-transformer.pt".into(),
+            installed: false,
+            download_url:
+                "https://huggingface.co/prism-ml/bonsai-image-ternary-4B-gemlite-2bit/resolve/main/transformer-gemlite-int2/state_dict.pt".into(),
+            sha256: String::new(),
+        },
     ]
 }
 
@@ -720,6 +765,87 @@ pub fn recommended_generation_pack(
 #[must_use]
 pub fn generation_pack_is_fused_checkpoint(pack_id: &str) -> bool {
     matches!(pack_id, "image_gen_sd15")
+}
+
+/// The local inference engine that runs a given image-generation
+/// pack. `sd-server` (stable-diffusion.cpp) drives SD 1.5 and FLUX.2
+/// Klein; the two Bonsai Image Ternary 4B variants ship their own
+/// accelerator-specific runtimes that sd-server cannot load, so they
+/// route to an external Bonsai runner instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GenerationEngine {
+    /// stable-diffusion.cpp `sd-server` — runs on every platform.
+    SdCpp,
+    /// Bonsai Image Ternary 4B, MLX 2-bit build (Apple Silicon /
+    /// mflux runtime).
+    BonsaiMlx,
+    /// Bonsai Image Ternary 4B, GemLite 2-bit build (CUDA GPU /
+    /// gemlite + HQQ runtime).
+    BonsaiGemlite,
+}
+
+impl GenerationEngine {
+    /// Stable wire string surfaced through the image-gen status IPC so
+    /// the UI can report the active engine honestly. Kept in lockstep
+    /// with `apps/desktop/shared/scene.ts`'s `ImageGenEngine` union.
+    #[must_use]
+    pub fn as_wire_str(self) -> &'static str {
+        match self {
+            Self::SdCpp => "sd_cpp",
+            Self::BonsaiMlx => "bonsai_mlx",
+            Self::BonsaiGemlite => "bonsai_gemlite",
+        }
+    }
+
+    /// Whether this engine can run on `platform`. `sd-server` runs
+    /// everywhere; the Bonsai builds are accelerator-specific (MLX
+    /// needs Apple Silicon, GemLite needs a CUDA GPU on Windows or
+    /// x86-64 Linux). The bridge uses this to decide whether a Bonsai
+    /// request can be honoured or must fall back to SD 1.5.
+    #[must_use]
+    pub fn supports_platform(self, platform: kcreate_core::config::Platform) -> bool {
+        use kcreate_core::config::Platform;
+        match self {
+            Self::SdCpp => true,
+            Self::BonsaiMlx => matches!(platform, Platform::MacOsAppleSilicon),
+            Self::BonsaiGemlite => matches!(platform, Platform::WindowsX64 | Platform::LinuxX64),
+        }
+    }
+}
+
+/// The inference engine that runs `pack_id`. Keyed by pack id (like
+/// [`generation_pack_is_fused_checkpoint`] and `mmproj_for`) so the
+/// renderer-facing `ModelPack` shape stays unchanged. Any unknown or
+/// non-Bonsai pack falls through to [`GenerationEngine::SdCpp`].
+#[must_use]
+pub fn generation_engine_for(pack_id: &str) -> GenerationEngine {
+    match pack_id {
+        "image_gen_bonsai_mlx_4b" => GenerationEngine::BonsaiMlx,
+        "image_gen_bonsai_gemlite_4b" => GenerationEngine::BonsaiGemlite,
+        _ => GenerationEngine::SdCpp,
+    }
+}
+
+/// The Bonsai Image Ternary 4B variant pack id that matches
+/// `platform`, or `None` on platforms without a supported Bonsai
+/// accelerator (Intel macOS, ARM Linux).
+///
+/// This is deliberately **NOT** wired into
+/// [`recommended_generation_pack`]: SD 1.5 (and FLUX on Tier 3)
+/// remains the default recommendation, and Bonsai is opt-in via the
+/// generation-model selector. Keeping the MLX variant out of every
+/// `recommended_*` return also preserves the Phase 12 invariant that
+/// no recommendation ends in `_mlx`.
+#[must_use]
+pub fn bonsai_image_variant_for_platform(
+    platform: kcreate_core::config::Platform,
+) -> Option<&'static str> {
+    use kcreate_core::config::Platform;
+    match platform {
+        Platform::MacOsAppleSilicon => Some("image_gen_bonsai_mlx_4b"),
+        Platform::WindowsX64 | Platform::LinuxX64 => Some("image_gen_bonsai_gemlite_4b"),
+        Platform::MacOsIntel | Platform::LinuxArm64 => None,
+    }
 }
 
 /// Errors from [`install_model_pack`] / [`uninstall_model_pack`].
@@ -981,6 +1107,8 @@ mod tests {
         let expected: Vec<&str> = vec![
             "bg_remove_threshold",
             "bg_remove_u2net",
+            "image_gen_bonsai_gemlite_4b",
+            "image_gen_bonsai_mlx_4b",
             "image_gen_flux_klein_4b",
             "image_gen_sd15",
             "llm_bonsai_1_7b",
@@ -1602,6 +1730,160 @@ mod tests {
             "image_gen_flux_klein_4b"
         ));
         assert!(!generation_pack_is_fused_checkpoint("not_a_real_pack"));
+    }
+
+    /// The two Bonsai Image Ternary 4B variants must be real,
+    /// downloadable, checksum-pinned `Generation` packs sitting next to
+    /// SD 1.5 in the registry, each carrying the `image_generation`
+    /// capability and a primary-transformer `file_path`. They are NOT
+    /// fused checkpoints — they route to the Bonsai runner, not
+    /// sd-server's `-m` path.
+    #[test]
+    fn bonsai_image_packs_are_real_and_pinned() {
+        let dir = tempfile::tempdir().unwrap();
+        let packs = list_model_packs(dir.path());
+        for (id, primary_ext, want_hash) in [
+            (
+                "image_gen_bonsai_mlx_4b",
+                ".safetensors",
+                "b21737bdf02690b7d662907781c4dc8b8bf22a2c98b823b1ca3336f48371a84f",
+            ),
+            (
+                "image_gen_bonsai_gemlite_4b",
+                ".pt",
+                "a3a7df8a90374fea24afce3b36f00b4c728d0254717143d61f912a7b3070e7ac",
+            ),
+        ] {
+            let pack = packs
+                .iter()
+                .find(|p| p.id == id)
+                .unwrap_or_else(|| panic!("{id} is in static_packs"));
+            assert_eq!(pack.category, ModelPackCategory::Generation);
+            assert_eq!(pack.kind, ModelKind::Sidecar);
+            assert!(pack.capabilities.iter().any(|c| c == "image_generation"));
+            assert!(
+                pack.download_url
+                    .starts_with("https://huggingface.co/prism-ml/bonsai-image-ternary-4B-"),
+                "{id} must download from the upstream prism-ml repo, got {}",
+                pack.download_url,
+            );
+            assert!(
+                pack.file_path.ends_with(primary_ext) && !pack.file_path.contains('/'),
+                "{id} file_path must be a flat {primary_ext} filename, got {}",
+                pack.file_path,
+            );
+            assert!(pack.size_bytes > 1_000_000_000);
+            // Pinned to the upstream LFS oid so the installer verifies
+            // the primary transformer download.
+            assert_eq!(pack.sha256, want_hash);
+            assert_eq!(canonical_hash_for(id), pack.sha256);
+            // Bonsai is never a fused sd-server checkpoint.
+            assert!(!generation_pack_is_fused_checkpoint(id));
+        }
+    }
+
+    /// Engine routing: only the two Bonsai pack ids select a Bonsai
+    /// runner; everything else (SD 1.5, FLUX, unknown ids) stays on
+    /// sd-server. This is what keeps SD 1.5 the universal fallback.
+    #[test]
+    fn generation_engine_routing() {
+        assert_eq!(
+            generation_engine_for("image_gen_bonsai_mlx_4b"),
+            GenerationEngine::BonsaiMlx,
+        );
+        assert_eq!(
+            generation_engine_for("image_gen_bonsai_gemlite_4b"),
+            GenerationEngine::BonsaiGemlite,
+        );
+        assert_eq!(
+            generation_engine_for("image_gen_sd15"),
+            GenerationEngine::SdCpp,
+        );
+        assert_eq!(
+            generation_engine_for("image_gen_flux_klein_4b"),
+            GenerationEngine::SdCpp,
+        );
+        assert_eq!(
+            generation_engine_for("not_a_real_pack"),
+            GenerationEngine::SdCpp,
+        );
+    }
+
+    /// Engine ⇄ platform compatibility and the platform → Bonsai
+    /// variant mapping must agree: each Bonsai variant only supports
+    /// the platform that selects it, sd-server supports every
+    /// platform, and Intel macOS / ARM Linux have no Bonsai variant.
+    #[test]
+    fn bonsai_engine_platform_compatibility() {
+        use kcreate_core::config::Platform;
+
+        // sd-server is universal.
+        for platform in [
+            Platform::MacOsIntel,
+            Platform::MacOsAppleSilicon,
+            Platform::WindowsX64,
+            Platform::LinuxX64,
+            Platform::LinuxArm64,
+        ] {
+            assert!(GenerationEngine::SdCpp.supports_platform(platform));
+        }
+
+        // MLX → Apple Silicon only.
+        assert!(GenerationEngine::BonsaiMlx.supports_platform(Platform::MacOsAppleSilicon));
+        for platform in [
+            Platform::MacOsIntel,
+            Platform::WindowsX64,
+            Platform::LinuxX64,
+            Platform::LinuxArm64,
+        ] {
+            assert!(!GenerationEngine::BonsaiMlx.supports_platform(platform));
+        }
+
+        // GemLite → CUDA on Windows / x86-64 Linux.
+        for platform in [Platform::WindowsX64, Platform::LinuxX64] {
+            assert!(GenerationEngine::BonsaiGemlite.supports_platform(platform));
+        }
+        for platform in [
+            Platform::MacOsIntel,
+            Platform::MacOsAppleSilicon,
+            Platform::LinuxArm64,
+        ] {
+            assert!(!GenerationEngine::BonsaiGemlite.supports_platform(platform));
+        }
+
+        // The platform → variant map must point at a pack the engine
+        // for that pack actually supports on that platform.
+        for platform in [
+            Platform::MacOsIntel,
+            Platform::MacOsAppleSilicon,
+            Platform::WindowsX64,
+            Platform::LinuxX64,
+            Platform::LinuxArm64,
+        ] {
+            match bonsai_image_variant_for_platform(platform) {
+                Some(id) => {
+                    assert!(generation_engine_for(id).supports_platform(platform));
+                    // Selector must never point at a non-Bonsai pack.
+                    assert_ne!(generation_engine_for(id), GenerationEngine::SdCpp);
+                }
+                None => assert!(matches!(
+                    platform,
+                    Platform::MacOsIntel | Platform::LinuxArm64
+                )),
+            }
+        }
+    }
+
+    /// The engine wire strings are the stable contract the status IPC
+    /// and `apps/desktop/shared/scene.ts` depend on. Freeze them.
+    #[test]
+    fn generation_engine_wire_strings() {
+        assert_eq!(GenerationEngine::SdCpp.as_wire_str(), "sd_cpp");
+        assert_eq!(GenerationEngine::BonsaiMlx.as_wire_str(), "bonsai_mlx");
+        assert_eq!(
+            GenerationEngine::BonsaiGemlite.as_wire_str(),
+            "bonsai_gemlite",
+        );
     }
 
     /// The SD 1.5 generation pack must be a real, downloadable,

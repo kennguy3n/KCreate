@@ -1,9 +1,11 @@
 import { useTheme } from "../styles/ThemeProvider";
 import { colors, font, radius, spacing } from "../styles/tokens";
 import type { ToolId } from "../pages/EditorPage";
+import { useI18n } from "../i18n";
 import { formatBinding } from "../shortcuts/registry";
 import { useShortcutBindings } from "../shortcuts/useShortcuts";
 import { Icon, type IconName } from "./Icon";
+import { LanguageSwitcher } from "./LanguageSwitcher";
 
 export type EditorMode =
   | "design"
@@ -117,6 +119,7 @@ export function TopBar(props: TopBarProps): JSX.Element {
   } = props;
   const tools = toolsForMode(mode);
   const { themeId, toggle: toggleTheme } = useTheme();
+  const { t } = useI18n();
   // Live binding so the palette hint reflects any user rebind rather
   // than a hard-coded "⌘K".
   const bindings = useShortcutBindings();
@@ -138,11 +141,11 @@ export function TopBar(props: TopBarProps): JSX.Element {
         type="button"
         onClick={onBackHome}
         style={pillButton(false)}
-        aria-label="Back to home"
+        aria-label={t("topbar.aria.backToHome")}
       >
         <span style={ICON_ROW_STYLE}>
           <Icon name="arrow-left" size={14} />
-          Home
+          {t("topbar.home")}
         </span>
       </button>
       <span style={{ fontWeight: 600 }}>{projectName}</span>
@@ -151,11 +154,11 @@ export function TopBar(props: TopBarProps): JSX.Element {
           type="button"
           onClick={onOpenCommandPalette}
           style={paletteTriggerStyle}
-          aria-label="Open command palette"
-          title="Search actions, panels, and tools"
+          aria-label={t("topbar.aria.openCommandPalette")}
+          title={t("topbar.search.hint")}
         >
           <Icon name="command" size={14} />
-          <span>Search</span>
+          <span>{t("topbar.search")}</span>
           <kbd style={paletteHintStyle}>
             {formatBinding(bindings.openCommandPalette)}
           </kbd>
@@ -165,11 +168,11 @@ export function TopBar(props: TopBarProps): JSX.Element {
         style={{
           display: "flex",
           gap: spacing.xs,
-          marginLeft: spacing.md,
+          marginInlineStart: spacing.md,
         }}
-        aria-label="Editor mode"
+        aria-label={t("topbar.aria.editorMode")}
       >
-        {EDITOR_MODES.map(({ mode: m, label }) => (
+        {EDITOR_MODES.map(({ mode: m }) => (
           <button
             key={m}
             type="button"
@@ -177,35 +180,41 @@ export function TopBar(props: TopBarProps): JSX.Element {
             style={modeTab(m === mode)}
             aria-pressed={m === mode}
           >
-            {label}
+            {t(`topbar.mode.${m}`)}
           </button>
         ))}
       </nav>
       <div
         role="toolbar"
-        aria-label="Drawing tools"
+        aria-label={t("topbar.aria.drawingTools")}
         style={{
           display: "flex",
           gap: 2,
           padding: "2px",
           background: colors.bgSoft,
           borderRadius: radius.pill,
-          marginLeft: spacing.md,
+          marginInlineStart: spacing.md,
         }}
       >
-        {tools.map((t) => (
-          <button
-            key={t}
-            type="button"
-            onClick={() => onToolChange(t)}
-            aria-pressed={t === tool}
-            aria-label={TOOL_LABELS[t].label}
-            title={`${TOOL_LABELS[t].label} (${TOOL_LABELS[t].key})`}
-            style={toolButton(t === tool)}
-          >
-            <Icon name={TOOL_LABELS[t].icon} size={16} />
-          </button>
-        ))}
+        {tools.map((toolId) => {
+          const label = t(`topbar.tool.${toolId}`);
+          return (
+            <button
+              key={toolId}
+              type="button"
+              onClick={() => onToolChange(toolId)}
+              aria-pressed={toolId === tool}
+              aria-label={label}
+              title={t("topbar.tool.title", {
+                label,
+                key: TOOL_LABELS[toolId].key,
+              })}
+              style={toolButton(toolId === tool)}
+            >
+              <Icon name={TOOL_LABELS[toolId].icon} size={16} />
+            </button>
+          );
+        })}
       </div>
       <div style={{ flex: 1 }} />
       {onOpenTemplates ? (
@@ -213,12 +222,12 @@ export function TopBar(props: TopBarProps): JSX.Element {
           type="button"
           onClick={onOpenTemplates}
           style={pillButton(false)}
-          aria-label="Browse templates"
-          title="Start from a template"
+          aria-label={t("topbar.aria.browseTemplates")}
+          title={t("topbar.templates.hint")}
         >
           <span style={ICON_ROW_STYLE}>
             <Icon name="layout" size={14} />
-            Templates
+            {t("topbar.templates")}
           </span>
         </button>
       ) : null}
@@ -227,12 +236,12 @@ export function TopBar(props: TopBarProps): JSX.Element {
           type="button"
           onClick={onOpenAiGenerate}
           style={pillButton(false)}
-          aria-label="Generate with AI"
-          title="Generate a themed design with AI"
+          aria-label={t("topbar.aria.generateWithAi")}
+          title={t("topbar.generate.hint")}
         >
           <span style={ICON_ROW_STYLE}>
             <Icon name="sparkles" size={14} />
-            Generate
+            {t("topbar.generate")}
           </span>
         </button>
       ) : null}
@@ -240,8 +249,8 @@ export function TopBar(props: TopBarProps): JSX.Element {
         type="button"
         onClick={onUndo}
         disabled={!canUndo}
-        aria-label="Undo"
-        title="Undo"
+        aria-label={t("topbar.aria.undo")}
+        title={t("topbar.aria.undo")}
         style={pillButton(false, !canUndo)}
       >
         <Icon name="undo" size={14} />
@@ -250,29 +259,30 @@ export function TopBar(props: TopBarProps): JSX.Element {
         type="button"
         onClick={onRedo}
         disabled={!canRedo}
-        aria-label="Redo"
-        title="Redo"
+        aria-label={t("topbar.aria.redo")}
+        title={t("topbar.aria.redo")}
         style={pillButton(false, !canRedo)}
       >
         <Icon name="redo" size={14} />
       </button>
+      <LanguageSwitcher />
       <button
         type="button"
         onClick={toggleTheme}
         style={pillButton(false)}
         aria-label={
           themeId === "dark"
-            ? "Switch to light theme"
-            : "Switch to dark theme"
+            ? t("topbar.aria.switchToLight")
+            : t("topbar.aria.switchToDark")
         }
-        title={`Theme: ${themeId === "dark" ? "Dark" : "Light"}`}
+        title={themeId === "dark" ? t("topbar.theme.dark") : t("topbar.theme.light")}
       >
         <Icon name={themeId === "dark" ? "sun" : "moon"} size={14} />
       </button>
       <button type="button" onClick={onExport} style={pillButton(true)}>
         <span style={ICON_ROW_STYLE}>
           <Icon name="download" size={14} />
-          Export
+          {t("topbar.export")}
         </span>
       </button>
     </header>
@@ -283,7 +293,7 @@ const paletteTriggerStyle: React.CSSProperties = {
   display: "inline-flex",
   alignItems: "center",
   gap: 6,
-  marginLeft: spacing.sm,
+  marginInlineStart: spacing.sm,
   border: `1px solid ${colors.border}`,
   background: colors.bgSoft,
   color: colors.textMuted,

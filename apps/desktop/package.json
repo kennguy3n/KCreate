@@ -11,7 +11,7 @@
     "build": "node build.mjs && vite build --config renderer/vite.config.ts",
     "typecheck": "tsc -b tsconfig.main.json tsconfig.preload.json --noEmit && tsc -p renderer/tsconfig.json --noEmit && tsc -p tsconfig.tests.json",
     "lint": "eslint --max-warnings=0 main preload renderer",
-    "test": "node --test renderer/tests/templates.test.mjs renderer/tests/rightPanelTabs.test.mjs && vitest run --config renderer/vitest.config.ts",
+    "test": "node --test renderer/tests/templates.test.mjs renderer/tests/rightPanelTabs.test.mjs renderer/tests/i18nFormat.test.mjs && vitest run --config renderer/vitest.config.ts",
     "test:vitest": "vitest run --config renderer/vitest.config.ts",
     "test:vitest:watch": "vitest --config renderer/vitest.config.ts",
     "test:e2e": "node --test tests/e2e/boot.test.mjs",

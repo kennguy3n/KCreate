@@ -9,6 +9,7 @@ import { render, screen, fireEvent } from "@testing-library/react";
 
 import { CanvasEmptyState } from "./CanvasEmptyState";
 import type { DiscoveryAction } from "./DiscoveryWelcome";
+import { LocaleProvider } from "../i18n";
 
 function makeActions(spies: {
   templates: () => void;
@@ -94,5 +95,45 @@ describe("CanvasEmptyState", () => {
     );
     fireEvent.click(screen.getByTestId("kcreate-canvas-empty-palette"));
     expect(onOpenPalette).toHaveBeenCalledTimes(1);
+  });
+
+  it("renders the English copy and keeps the hint as a real <kbd>", () => {
+    render(
+      <CanvasEmptyState
+        paletteHint="Ctrl K"
+        onOpenPalette={() => {}}
+        actions={makeActions({
+          templates: () => {},
+          ai: () => {},
+          elements: () => {},
+        })}
+      />,
+    );
+    expect(screen.getByText("Start your first design")).toBeInTheDocument();
+    expect(screen.getByText("Open command palette")).toBeInTheDocument();
+    // The `{hint}` marker is split out and rendered as a styled key,
+    // never leaked into the page as literal text.
+    expect(screen.getByText("Ctrl K").tagName).toBe("KBD");
+    expect(document.body.textContent ?? "").not.toContain("{hint}");
+  });
+
+  it("localizes its copy under a non-English provider", () => {
+    render(
+      <LocaleProvider initialLocale="es">
+        <CanvasEmptyState
+          paletteHint="Ctrl K"
+          onOpenPalette={() => {}}
+          actions={makeActions({
+            templates: () => {},
+            ai: () => {},
+            elements: () => {},
+          })}
+        />
+      </LocaleProvider>,
+    );
+    expect(screen.getByText("Empieza tu primer diseño")).toBeInTheDocument();
+    expect(screen.getByText("Abrir la paleta de comandos")).toBeInTheDocument();
+    // Even translated, the keystroke stays a real <kbd> element.
+    expect(screen.getByText("Ctrl K").tagName).toBe("KBD");
   });
 });

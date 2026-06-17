@@ -2,6 +2,7 @@ import { lazy, Suspense, useCallback, useState } from "react";
 
 import { ErrorBoundary } from "./components/ErrorBoundary";
 import { TemplateGallery } from "./components/TemplateGallery";
+import { useI18n } from "./i18n";
 import { openScratchProject } from "./lib/scratchProject";
 import { templateResolverFor } from "./lib/templates";
 import { CREATE_OPTIONS, HomePage } from "./pages/HomePage";
@@ -36,8 +37,11 @@ type Route =
 // dependency-free so it stays in the initial bundle and paints instantly
 // on the brief gap between navigation and the chunk resolving.
 function EditorLoading(): JSX.Element {
+  const { t } = useI18n();
   return (
     <div
+      role="status"
+      aria-live="polite"
       style={{
         display: "flex",
         alignItems: "center",
@@ -48,7 +52,7 @@ function EditorLoading(): JSX.Element {
         fontSize: 14,
       }}
     >
-      Loading editor…
+      {t("app.editor.loading")}
     </div>
   );
 }
@@ -65,6 +69,7 @@ function EditorLoadError(props: {
   onReload: () => void;
   onBackHome: () => void;
 }): JSX.Element {
+  const { t } = useI18n();
   return (
     <div
       style={{
@@ -82,7 +87,7 @@ function EditorLoadError(props: {
     >
       <div style={{ maxWidth: 420 }}>
         <div style={{ fontSize: 15, fontWeight: 600, marginBottom: 8 }}>
-          The editor failed to load
+          {t("app.editor.loadFailed.title")}
         </div>
         <div style={{ fontSize: 13, color: "var(--kc-text-muted)" }}>
           {props.message}
@@ -90,10 +95,10 @@ function EditorLoadError(props: {
       </div>
       <div style={{ display: "flex", gap: 8 }}>
         <button type="button" onClick={props.onReload}>
-          Reload
+          {t("app.action.reload")}
         </button>
         <button type="button" onClick={props.onBackHome}>
-          Back to home
+          {t("app.action.backToHome")}
         </button>
       </div>
     </div>
@@ -101,6 +106,7 @@ function EditorLoadError(props: {
 }
 
 export function App(): JSX.Element {
+  const { t } = useI18n();
   const [route, setRoute] = useState<Route>({ kind: "home" });
 
   const handleOpenEditor = useCallback(async (jobKind: string) => {
@@ -230,8 +236,7 @@ export function App(): JSX.Element {
           // callback firing. Surface a clear error.
           setRoute({
             kind: "error",
-            message:
-              "Brief applied but the project was closed before the editor could open it.",
+            message: t("app.error.briefProjectClosed"),
           });
           return;
         }
@@ -244,7 +249,7 @@ export function App(): JSX.Element {
         });
       }
     },
-    [],
+    [t],
   );
 
   // Open a project from the HomePage's Recent grid. The bridge's
@@ -347,8 +352,9 @@ export function App(): JSX.Element {
           padding: 32,
           color: "#B91C1C",
         }}
+        role="alert"
       >
-        Failed to open project: {route.message}
+        {t("app.error.openProject", { message: route.message })}
       </div>
     );
   }

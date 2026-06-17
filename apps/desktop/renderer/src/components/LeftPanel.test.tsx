@@ -70,6 +70,17 @@ describe("LeftPanel", () => {
     expect(screen.getByText("Beta")).toBeInTheDocument();
   });
 
+  it("exposes the layer-type icon as a labeled image (axe aria-prohibited-attr)", () => {
+    renderLeftPanel([
+      makeNode({ id: "a", name: "Alpha", nodeType: "TextLayer" }),
+    ]);
+    // The type glyph must carry an explicit role so its aria-label is a
+    // permitted attribute — a bare <span aria-label> trips axe's
+    // aria-prohibited-attr rule (104 nodes on a populated canvas).
+    const icon = screen.getByRole("img", { name: "TextLayer layer" });
+    expect(icon).toBeInTheDocument();
+  });
+
   it("toggles visibility by inverting the current value", () => {
     const { captured } = renderLeftPanel([
       makeNode({ id: "a", name: "Alpha", visible: true }),

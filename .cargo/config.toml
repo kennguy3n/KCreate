@@ -1,0 +1,27 @@
+# Cargo configuration for the KCreate workspace.
+#
+# `[env]` values are injected into the environment of every process
+# Cargo launches — including the integration-test binaries under
+# `crates/kcreate_tests/` — but NOT into the shipped desktop app, which
+# Electron loads via `process.dlopen` on `bridge.node` and never runs
+# through Cargo.
+#
+# We use that boundary to disable the background thumbnail pre-warm
+# during tests. The pre-warm worker renders through the offscreen wgpu
+# pipeline, which on a headless CI runner falls back to Mesa's software
+# Vulkan (lavapipe) and JIT-compiles shaders through LLVM. If a test
+# process begins to exit while a detached pre-warm render is mid-JIT,
+# the C runtime finalizes the Mesa/LLVM shared libraries underneath the
+# worker and it faults — a non-deterministic teardown SIGSEGV/SIGABRT
+# that fires *after* every test has already passed and only ever shows
+# up as flaky CI. The pre-warm is a pure UI-latency optimization with no
+# value in a host-less test process, and thumbnails are still generated
+# on demand through the synchronous path, so skipping the worker is
+# behavior-preserving for the tests. See
+# `crates/kcreate_bridge/src/thumbnails.rs` (`DISABLE_PREWARM_ENV`).
+#
+# `force` is left at its default (`false`), so a developer who wants the
+# worker active in a Cargo run can still override it from their shell
+# (e.g. `KCREATE_DISABLE_THUMBNAIL_PREWARM=0 cargo test`).
+[env]
+KCREATE_DISABLE_THUMBNAIL_PREWARM = "1"

@@ -26,6 +26,7 @@ import {
   waitFor,
 } from "@testing-library/react";
 
+import { LocaleProvider } from "../i18n";
 import {
   WelcomeModal,
   shouldShowWelcomeModal,
@@ -173,6 +174,25 @@ describe("WelcomeModal", () => {
     );
   });
 
+  it("localizes the static pack-resolution error messages", async () => {
+    const stub = kcreateStub();
+    stub.override("llm.recommendedPack", () => "llm_does_not_exist");
+    stub.override("aiModel.listModelPacks", () => [SAMPLE_PACK]);
+
+    render(
+      <LocaleProvider initialLocale="es">
+        <WelcomeModal open={true} onDismiss={() => {}} />
+      </LocaleProvider>,
+    );
+    await flushAsync();
+
+    const error = screen.getByTestId("kcreate-welcome-error");
+    // Spanish catalog copy, with the pack id still interpolated.
+    expect(error.textContent).toContain("no está en el registro de modelos");
+    expect(error.textContent).toContain("llm_does_not_exist");
+    expect(error.textContent).not.toMatch(/not in the model registry/);
+  });
+
   it("clicking Skip after load passes the resolved pack id (for lastSeenPackId) and fires no install IPC", async () => {
     const stub = kcreateStub();
     stub.override("llm.recommendedPack", () => SAMPLE_PACK.id);
@@ -277,6 +297,38 @@ describe("WelcomeModal", () => {
 
     expect(dismissed.called).toBe(true);
     expect(dismissed.id).toBe(SAMPLE_PACK.id);
+  });
+
+  it("localizes the unverified-install summary (no pinned SHA-256 path)", async () => {
+    const stub = kcreateStub();
+    stub.override("llm.recommendedPack", () => SAMPLE_PACK.id);
+    stub.override("aiModel.listModelPacks", () => [SAMPLE_PACK]);
+    // verified:false exercises the branch that used to be hard-coded
+    // English regardless of locale (the reviewer-flagged i18n gap).
+    stub.override("onboarding.installRecommendedPack", () => ({
+      packId: SAMPLE_PACK.id,
+      verified: false,
+      actualSha256: "deadbeef".repeat(8),
+      sizeBytes: SAMPLE_PACK.sizeBytes,
+    }));
+
+    render(
+      <LocaleProvider initialLocale="es">
+        <WelcomeModal open={true} onDismiss={() => {}} />
+      </LocaleProvider>,
+    );
+    await flushAsync();
+    fireEvent.click(screen.getByTestId("kcreate-welcome-install"));
+    await flushAsync();
+
+    const done = await screen.findByTestId("kcreate-welcome-done");
+    // Spanish catalog copy, not the old hard-coded English string.
+    expect(done.textContent).toContain(
+      "sin SHA-256 fijado en el registro",
+    );
+    expect(done.textContent).not.toContain("no pinned SHA-256");
+    // The actual-hash prefix is still interpolated into the summary.
+    expect(done.textContent).toContain("deadbeefdead");
   });
 
   it("renders progress updates emitted by the main process", async () => {

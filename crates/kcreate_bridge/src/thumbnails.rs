@@ -477,8 +477,47 @@ impl Drop for PrewarmGuard {
     }
 }
 
+/// Environment variable that disables the background thumbnail
+/// pre-warm.
+///
+/// The pre-warm is a pure UI-latency optimization: it renders each
+/// page's thumbnail ahead of time so the gallery feels instant once a
+/// project is open. In a host-less process — notably `cargo test`,
+/// where the bridge is linked into integration binaries with no
+/// Electron/Node runtime and no UI to populate — there is nothing to
+/// pre-warm *for*, and the worker's offscreen wgpu render falls back to
+/// Mesa's software Vulkan (lavapipe), which JIT-compiles shaders
+/// through LLVM. If the process begins to exit while that JIT is in
+/// flight, the C runtime finalizes the Mesa/LLVM shared libraries
+/// underneath the detached worker and it faults — a non-deterministic
+/// teardown crash (SIGSEGV/SIGABRT) that surfaces *after* every test
+/// has already passed and shows up only as flaky CI. Setting this
+/// variable skips the background worker entirely; thumbnails are still
+/// produced on first access through the synchronous
+/// `ensure_*_thumbnail` path. The workspace `.cargo/config.toml` sets
+/// it for every Cargo-run test process.
+const DISABLE_PREWARM_ENV: &str = "KCREATE_DISABLE_THUMBNAIL_PREWARM";
+
+/// Interprets the raw contents of [`DISABLE_PREWARM_ENV`]. Recognizes
+/// the usual truthy spellings (case- and whitespace-insensitive);
+/// anything else — including an absent variable — leaves the pre-warm
+/// enabled.
+fn prewarm_disabled_for_value(value: Option<&str>) -> bool {
+    matches!(
+        value.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+        Some("1" | "true" | "yes" | "on")
+    )
+}
+
+/// Reads [`DISABLE_PREWARM_ENV`] and reports whether the background
+/// pre-warm should be skipped for this process.
+fn prewarm_disabled_by_env() -> bool {
+    prewarm_disabled_for_value(std::env::var(DISABLE_PREWARM_ENV).ok().as_deref())
+}
+
 /// Kick off a background thread that pre-warms every page's
-/// thumbnail. Returns immediately. Does nothing in low-resource mode.
+/// thumbnail. Returns immediately. Does nothing in low-resource mode
+/// or when [`DISABLE_PREWARM_ENV`] is set.
 ///
 /// Calls are *coalesced*: at most one pre-warm worker runs at a
 /// time. If a second caller arrives while the worker is still
@@ -489,6 +528,10 @@ impl Drop for PrewarmGuard {
 pub fn prepare_thumbnails_background(max_dim_px: u32) -> Result<()> {
     if crate::document::runtime_slot().lock().is_low_resource() {
         log::debug!("thumbnail pre-warm skipped: low_resource_mode on");
+        return Ok(());
+    }
+    if prewarm_disabled_by_env() {
+        log::debug!("thumbnail pre-warm skipped: {DISABLE_PREWARM_ENV} set");
         return Ok(());
     }
     // CAS so two simultaneous callers can't both observe `false` and
@@ -1119,6 +1162,90 @@ mod tests {
         assert!(
             !PREWARM_IN_FLIGHT.load(Ordering::Acquire),
             "flag must be cleared after the panicking worker unwinds"
+        );
+    }
+
+    // --- KCREATE_DISABLE_THUMBNAIL_PREWARM kill-switch -----------------
+    //
+    // The background pre-warm renders through the offscreen wgpu
+    // pipeline, which on a headless host JIT-compiles shaders via
+    // Mesa/LLVM. A detached worker still inside that JIT when the
+    // process exits faults as the C runtime finalizes those DSOs — a
+    // flaky teardown crash that only ever bit CI. `DISABLE_PREWARM_ENV`
+    // skips the worker for host-less processes (set by the workspace
+    // `.cargo/config.toml` for every Cargo-run test). These tests pin
+    // the parsing and the short-circuit.
+
+    #[test]
+    fn prewarm_disabled_for_value_recognizes_truthy_spellings() {
+        for v in ["1", "true", "TRUE", "Yes", " on ", "\ttrue\n"] {
+            assert!(
+                prewarm_disabled_for_value(Some(v)),
+                "{v:?} should disable the pre-warm"
+            );
+        }
+    }
+
+    #[test]
+    fn prewarm_disabled_for_value_leaves_enabled_otherwise() {
+        for v in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("false"),
+            Some("no"),
+            Some("off"),
+            Some("nope"),
+        ] {
+            assert!(
+                !prewarm_disabled_for_value(v),
+                "{v:?} should leave the pre-warm enabled"
+            );
+        }
+    }
+
+    /// RAII guard that sets an env var for the duration of a test and
+    /// restores the prior value on drop. Mirrors the `set_var`
+    /// discipline used by the bridge's plugin tests: env mutation is
+    /// only sound when serialized, so callers must be `#[serial]`.
+    struct ScopedEnv {
+        key: &'static str,
+        prev: Option<String>,
+    }
+
+    impl ScopedEnv {
+        fn set(key: &'static str, value: &str) -> Self {
+            let prev = std::env::var(key).ok();
+            // SAFETY: `set_var` is only unsound under concurrent env
+            // access; the test is `#[serial]`, so no other test thread
+            // touches the environment while this guard is live.
+            unsafe { std::env::set_var(key, value) };
+            Self { key, prev }
+        }
+    }
+
+    impl Drop for ScopedEnv {
+        fn drop(&mut self) {
+            // SAFETY: see `ScopedEnv::set` — still serialized.
+            match &self.prev {
+                Some(v) => unsafe { std::env::set_var(self.key, v) },
+                None => unsafe { std::env::remove_var(self.key) },
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn prepare_background_short_circuits_when_disabled() {
+        let _on = ScopedEnv::set(DISABLE_PREWARM_ENV, "1");
+        // The env gate sits before the in-flight CAS and the workspace
+        // lookup. With no project open, the *non*-gated path would
+        // acquire the gate, find no workspace, and return
+        // `NoProject`; returning `Ok(())` here therefore proves the
+        // gate short-circuited before spawning any worker.
+        assert!(
+            prepare_thumbnails_background(256).is_ok(),
+            "disabled pre-warm must short-circuit to Ok(()) without spawning a worker"
         );
     }
 }

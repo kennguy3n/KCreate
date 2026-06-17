@@ -10,6 +10,7 @@
 import { colors, radius, spacing } from "../styles/tokens";
 import type { DiscoveryAction } from "./DiscoveryWelcome";
 import { Icon } from "./Icon";
+import { useI18n } from "../i18n";
 
 export interface CanvasEmptyStateProps {
   /** Pre-formatted command-palette hint (e.g. `"Ctrl K"`). */
@@ -31,17 +32,24 @@ export function CanvasEmptyState({
   onOpenPalette,
   actions,
 }: CanvasEmptyStateProps): JSX.Element {
+  const { t } = useI18n();
+  // The lead carries a `{hint}` marker where the palette shortcut
+  // should appear as a styled <kbd>; split on it so the keystroke
+  // stays a real element while the surrounding copy is fully
+  // translatable and the marker can sit anywhere a translator needs
+  // it (including in RTL locales).
+  const [leadHead, leadTail = ""] = t("canvasEmpty.lead").split("{hint}");
   return (
     <div style={overlayStyle} data-testid="kcreate-canvas-empty-state">
       <div style={panelStyle}>
         <span aria-hidden="true" style={badgeStyle}>
           <Icon name="sparkles" size={22} />
         </span>
-        <h2 style={titleStyle}>Start your first design</h2>
+        <h2 style={titleStyle}>{t("canvasEmpty.title")}</h2>
         <p style={leadStyle}>
-          Pick a ready-made template, describe it to the AI, or browse
-          the elements library — or press{" "}
-          <kbd style={kbdStyle}>{paletteHint}</kbd> for everything.
+          {leadHead}
+          <kbd style={kbdStyle}>{paletteHint}</kbd>
+          {leadTail}
         </p>
         <div style={actionsRowStyle}>
           {actions.map((action, index) => (
@@ -64,7 +72,7 @@ export function CanvasEmptyState({
           data-testid="kcreate-canvas-empty-palette"
         >
           <Icon name="command" size={14} />
-          Open command palette
+          {t("canvasEmpty.openPalette")}
         </button>
       </div>
     </div>

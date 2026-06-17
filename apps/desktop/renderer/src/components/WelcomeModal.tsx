@@ -32,6 +32,8 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 
+import { useFocusTrap } from "../a11y/useFocusTrap";
+import { useI18n } from "../i18n";
 import type {
   ModelPack,
   OnboardingInstallReport,
@@ -74,7 +76,23 @@ type Phase =
       tier: string;
       report: OnboardingInstallReport;
     }
-  | { kind: "error"; tier: string | null; pack: ModelPack | null; message: string };
+  | {
+      kind: "error";
+      tier: string | null;
+      pack: ModelPack | null;
+      error: WelcomeError;
+    };
+
+/**
+ * Localizable reason pack resolution / install failed. Static
+ * failures carry a catalog `code` resolved in `WelcomeBody` (where the
+ * `t` function is in scope); `raw` wraps a bridge/runtime error string
+ * that has no stable translation key to map against.
+ */
+type WelcomeError =
+  | { code: "noRecommendedPack" }
+  | { code: "packNotInRegistry"; packId: string }
+  | { code: "raw"; text: string };
 
 /**
  * Lazy bootstrap: resolve the recommended pack id via the bridge,
@@ -95,8 +113,7 @@ async function resolveRecommendedPack(): Promise<Phase> {
         kind: "error",
         tier: tierLabel(limits),
         pack: null,
-        message:
-          "Your device tier does not have a recommended local LLM pack yet. You can still install a pack manually from Model Manager.",
+        error: { code: "noRecommendedPack" },
       };
     }
     const pack = packs.find((p) => p.id === packId) ?? null;
@@ -105,7 +122,7 @@ async function resolveRecommendedPack(): Promise<Phase> {
         kind: "error",
         tier: tierLabel(limits),
         pack: null,
-        message: `Recommended pack '${packId}' is not in the model registry. Open Model Manager to install a pack manually.`,
+        error: { code: "packNotInRegistry", packId },
       };
     }
     return {
@@ -119,7 +136,7 @@ async function resolveRecommendedPack(): Promise<Phase> {
       kind: "error",
       tier: null,
       pack: null,
-      message: errorMessage(e),
+      error: { code: "raw", text: errorMessage(e) },
     };
   }
 }
@@ -133,6 +150,7 @@ export function WelcomeModal({
   open,
   onDismiss,
 }: WelcomeModalProps): JSX.Element | null {
+  const { t } = useI18n();
   const [phase, setPhase] = useState<Phase>({ kind: "loading" });
 
   // Synchronous reentry guard against the small window where the
@@ -235,7 +253,7 @@ export function WelcomeModal({
           kind: "error",
           tier: prev.tier,
           pack: prev.pack,
-          message: errorMessage(e),
+          error: { code: "raw", text: errorMessage(e) },
         };
       });
     } finally {
@@ -287,7 +305,7 @@ export function WelcomeModal({
         kind: "error",
         tier: phase.tier,
         pack,
-        message: errorMessage(e),
+        error: { code: "raw", text: errorMessage(e) },
       });
     } finally {
       installInFlight.current = false;
@@ -317,6 +335,12 @@ export function WelcomeModal({
     });
   }, []);
 
+  // Contain focus while open; Escape behaves like "Skip for now".
+  const trapRef = useFocusTrap<HTMLDivElement>({
+    active: open,
+    onEscape: handleSkip,
+  });
+
   if (!open) return null;
 
   return (
@@ -327,28 +351,23 @@ export function WelcomeModal({
       aria-labelledby="kcreate-welcome-title"
       data-testid="kcreate-welcome-modal"
     >
-      <div style={dialogStyle}>
+      <div ref={trapRef} style={dialogStyle}>
         <header style={headerStyle}>
           <h2 id="kcreate-welcome-title" style={titleStyle}>
-            Welcome to KCreate
+            {t("welcome.title")}
           </h2>
           <button
             type="button"
             onClick={handleSkip}
             style={iconButtonStyle}
-            aria-label="Close welcome"
+            aria-label={t("welcome.aria.close")}
             data-testid="kcreate-welcome-close"
           >
             ×
           </button>
         </header>
 
-        <p style={leadStyle}>
-          KCreate runs entirely on your device. Install a local AI
-          model now to enable design suggestions, layer naming, and
-          smart commands — or skip for now and pick one from the
-          Model Manager later.
-        </p>
+        <p style={leadStyle}>{t("welcome.lead")}</p>
 
         <WelcomeBody
           phase={phase}
@@ -380,11 +399,12 @@ function WelcomeBody({
   onDone,
   onSkip,
 }: WelcomeBodyProps): JSX.Element {
+  const { t } = useI18n();
   switch (phase.kind) {
     case "loading":
       return (
         <p style={mutedStyle} data-testid="kcreate-welcome-loading">
-          Detecting your device…
+          {t("welcome.loading")}
         </p>
       );
     case "loaded": {
@@ -397,7 +417,7 @@ function WelcomeBody({
               style={successInlineStyle}
               data-testid="kcreate-welcome-already-installed"
             >
-              You already have this pack installed. You’re good to go.
+              {t("welcome.alreadyInstalled")}
             </p>
           ) : null}
           <footer style={footerStyle}>
@@ -407,7 +427,7 @@ function WelcomeBody({
               style={secondaryButtonStyle}
               data-testid="kcreate-welcome-skip"
             >
-              Skip for now
+              {t("welcome.skip")}
             </button>
             <button
               type="button"
@@ -417,7 +437,7 @@ function WelcomeBody({
               disabled={installedAlready}
               aria-disabled={installedAlready}
             >
-              I already have the file…
+              {t("welcome.pickFile")}
             </button>
             <button
               type="button"
@@ -427,7 +447,7 @@ function WelcomeBody({
               disabled={installedAlready}
               aria-disabled={installedAlready}
             >
-              Install recommended pack
+              {t("welcome.install")}
             </button>
           </footer>
         </>
@@ -435,7 +455,9 @@ function WelcomeBody({
     }
     case "installing": {
       const { pack, tier, progress } = phase;
-      const phaseLabel = progress ? phaseToLabel(progress.phase) : "Starting…";
+      const phaseLabel = progress
+        ? t(`welcome.phase.${progress.phase}`)
+        : t("welcome.starting");
       const pct =
         progress &&
         progress.totalBytes &&
@@ -475,8 +497,10 @@ function WelcomeBody({
             progress.totalBytes !== null &&
             progress.totalBytes > 0 ? (
               <div style={progressDetailStyle}>
-                {formatBytes(progress.receivedBytes)} of{" "}
-                {formatBytes(progress.totalBytes)}
+                {t("welcome.progress.of", {
+                  received: formatBytes(progress.receivedBytes),
+                  total: formatBytes(progress.totalBytes),
+                })}
               </div>
             ) : null}
           </div>
@@ -487,7 +511,7 @@ function WelcomeBody({
               style={secondaryButtonStyle}
               data-testid="kcreate-welcome-cancel"
             >
-              Cancel
+              {t("welcome.cancel")}
             </button>
           </footer>
         </>
@@ -503,15 +527,13 @@ function WelcomeBody({
             role="status"
             data-testid="kcreate-welcome-done"
           >
-            <strong>{pack.name}</strong> is ready.{" "}
+            <strong>{pack.name}</strong> {t("welcome.ready.suffix")}{" "}
             {report.verified
-              ? `Verified ${formatBytes(report.sizeBytes)}.`
-              : `Installed ${formatBytes(
-                  report.sizeBytes,
-                )} (no pinned SHA-256 in the registry; actual hash ${report.actualSha256.slice(
-                  0,
-                  12,
-                )}…).`}
+              ? t("welcome.verified", { size: formatBytes(report.sizeBytes) })
+              : t("welcome.unverified", {
+                  size: formatBytes(report.sizeBytes),
+                  hash: report.actualSha256.slice(0, 12),
+                })}
           </p>
           <footer style={footerStyle}>
             <button
@@ -520,13 +542,21 @@ function WelcomeBody({
               style={primaryButtonStyle}
               data-testid="kcreate-welcome-finish"
             >
-              Get started
+              {t("welcome.finish")}
             </button>
           </footer>
         </>
       );
     }
-    case "error":
+    case "error": {
+      const message =
+        phase.error.code === "raw"
+          ? phase.error.text
+          : phase.error.code === "packNotInRegistry"
+            ? t("welcome.error.packNotInRegistry", {
+                packId: phase.error.packId,
+              })
+            : t("welcome.error.noRecommendedPack");
       return (
         <>
           {phase.pack ? <PackCard pack={phase.pack} tier={phase.tier ?? "unknown"} /> : null}
@@ -535,7 +565,7 @@ function WelcomeBody({
             style={errorStyle}
             data-testid="kcreate-welcome-error"
           >
-            {phase.message}
+            {message}
           </p>
           <footer style={footerStyle}>
             <button
@@ -544,11 +574,12 @@ function WelcomeBody({
               style={primaryButtonStyle}
               data-testid="kcreate-welcome-error-dismiss"
             >
-              Close
+              {t("welcome.errorDismiss")}
             </button>
           </footer>
         </>
       );
+    }
   }
 }
 
@@ -558,42 +589,19 @@ interface PackCardProps {
 }
 
 function PackCard({ pack, tier }: PackCardProps): JSX.Element {
+  const { t } = useI18n();
   return (
-    <section style={packCardStyle} aria-label="Recommended pack">
+    <section style={packCardStyle} aria-label={t("welcome.pack.aria")}>
       <header style={packHeaderStyle}>
-        <span style={packTierStyle}>Tier {tier}</span>
+        <span style={packTierStyle}>{t("welcome.pack.tier", { tier })}</span>
         <span style={packSizeStyle}>{formatBytes(pack.sizeBytes)}</span>
       </header>
       <h3 style={packTitleStyle} data-testid="kcreate-welcome-pack-name">
         {pack.name}
       </h3>
-      <p style={packDescStyle}>
-        Quantised GGUF, runs on your device via llama.cpp. No data
-        leaves your machine.
-      </p>
+      <p style={packDescStyle}>{t("welcome.pack.desc")}</p>
     </section>
   );
-}
-
-function phaseToLabel(p: OnboardingProgress["phase"]): string {
-  switch (p) {
-    case "resolving":
-      return "Resolving recommendation…";
-    case "connecting":
-      return "Connecting…";
-    case "downloading":
-      return "Downloading…";
-    case "verifying":
-      return "Verifying…";
-    case "installing":
-      return "Installing…";
-    case "done":
-      return "Done";
-    case "cancelled":
-      return "Cancelled";
-    case "error":
-      return "Error";
-  }
 }
 
 function formatBytes(bytes: number): string {

@@ -48,7 +48,7 @@ See [`PROPOSAL.md`](./PROPOSAL.md) for the full product spec.
 | UI                   | React 18 + TypeScript 5                                      |
 | Rust core            | Workspace of cdylib + rlib crates (Rust 1.95)                |
 | GPU rendering        | wgpu (Metal / D3D12 / Vulkan / OpenGL)                       |
-| CPU rendering        | `tiny-skia` (real software rasterizer, not a placeholder)    |
+| CPU rendering        | `tiny-skia` (real software rasterizer)                       |
 | Persistence          | SQLite + content-addressed blob store (BLAKE3)               |
 | Local AI             | `llama.cpp` (LLM + Vision-LLM) + `stable-diffusion.cpp` (FLUX image-gen) + ONNX Runtime (loopback sidecars; never network; zero Python) |
 | In-process AI        | Lanczos3 upscale, k-means palette, BFS smart-select, Sobel + CCA screenshot-to-layout, alt-text statistics |

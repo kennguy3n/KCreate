@@ -343,9 +343,9 @@ export function ModelManager({ onStatus }: ModelManagerProps): JSX.Element {
       </div>
 
       <p style={noteStyle}>
-        Models run fully offline on this machine. Pick a GGUF file —
-        Phase 1 does not bundle a download catalog. The sidecar binds
-        to <code style={monoStyle}>127.0.0.1</code> only.
+        Models run fully offline on this machine. Point to a GGUF file
+        to load your own model, or install one from the packs below. The
+        sidecar binds to <code style={monoStyle}>127.0.0.1</code> only.
       </p>
 
       <ModelPacksSection

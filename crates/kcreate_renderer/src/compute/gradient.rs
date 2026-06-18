@@ -46,6 +46,19 @@ pub const GRADIENT_PARAMS_SIZE: u64 = std::mem::size_of::<GradientParams>() as u
 
 const _: () = {
     assert!(GRADIENT_PARAMS_SIZE == 48);
+    // Offset contract vs the WGSL `GradientParams`: the four leading
+    // `u32`s fill bytes 0..16, so each `vec2<f32>` lands on its 8-byte
+    // WGSL alignment boundary. The size assert above catches size drift;
+    // these catch a field reorder that would silently break the layout
+    // match without changing the total size.
+    assert!(std::mem::offset_of!(GradientParams, width) == 0);
+    assert!(std::mem::offset_of!(GradientParams, height) == 4);
+    assert!(std::mem::offset_of!(GradientParams, mode) == 8);
+    assert!(std::mem::offset_of!(GradientParams, stop_count) == 12);
+    assert!(std::mem::offset_of!(GradientParams, p0) == 16);
+    assert!(std::mem::offset_of!(GradientParams, p1) == 24);
+    assert!(std::mem::offset_of!(GradientParams, center) == 32);
+    assert!(std::mem::offset_of!(GradientParams, radius) == 40);
 };
 
 /// A single colour stop: `offset` along the gradient axis in
@@ -115,7 +128,14 @@ impl GpuComputeContext {
             return Err(ComputeError::EmptyGradientStops);
         }
 
+        // `prepare_stops` drops non-finite offsets; if that empties the
+        // list, treat it like an empty request (recoverable — the
+        // dispatcher falls back to the CPU reference, which paints
+        // transparent) rather than dispatching with zero-size buffers.
         let stops = prepare_stops(&spec.stops);
+        if stops.is_empty() {
+            return Err(ComputeError::EmptyGradientStops);
+        }
         let pixel_count = (spec.width as usize) * (spec.height as usize);
         let buf_size = (pixel_count * std::mem::size_of::<u32>()) as u64;
 
@@ -266,12 +286,19 @@ pub fn cpu_render_gradient(spec: &GradientSpec) -> Vec<u8> {
     out
 }
 
-/// Clamp stop offsets to `[0, 1]` and sort ascending (stable), so
-/// both the GPU shader and CPU reference can assume a sorted,
-/// in-range stop list.
+/// Drop stops with non-finite offsets (`NaN`/`±inf`), clamp the rest
+/// to `[0, 1]`, and sort ascending (stable), so both the GPU shader
+/// and CPU reference can assume a sorted, finite, in-range stop list.
+///
+/// Filtering non-finite offsets keeps the two paths in lockstep: a
+/// `NaN` offset would otherwise survive `clamp` (which propagates
+/// `NaN`), sort to an arbitrary position, and then be skipped by the
+/// shader's offset comparisons — yielding a malformed gradient. Both
+/// paths now simply ignore such a stop.
 fn prepare_stops(stops: &[GradientStop]) -> Vec<GradientStop> {
     let mut prepared: Vec<GradientStop> = stops
         .iter()
+        .filter(|s| s.offset.is_finite())
         .map(|s| GradientStop {
             offset: s.offset.clamp(0.0, 1.0),
             color: s.color,
@@ -541,6 +568,50 @@ mod tests {
             ..unsorted
         };
         assert_eq!(cpu_render_gradient(&unsorted), cpu_render_gradient(&sorted));
+    }
+
+    #[test]
+    fn non_finite_offsets_are_dropped_before_sampling() {
+        // NaN / ±inf offsets must be filtered out (they would otherwise
+        // survive `clamp` and sort to an arbitrary position), leaving
+        // only the finite stops in sorted order.
+        let prepared = prepare_stops(&[
+            stop(0.75, [0.0, 0.0, 0.0, 1.0]),
+            stop(f32::NAN, [1.0, 0.0, 0.0, 1.0]),
+            stop(0.25, [0.0, 1.0, 0.0, 1.0]),
+            stop(f32::INFINITY, [0.0, 0.0, 1.0, 1.0]),
+            stop(f32::NEG_INFINITY, [1.0, 1.0, 0.0, 1.0]),
+        ]);
+        let offsets: Vec<f32> = prepared.iter().map(|s| s.offset).collect();
+        assert_eq!(offsets, vec![0.25, 0.75]);
+    }
+
+    #[test]
+    fn non_finite_stop_does_not_change_render() {
+        // A stop with a non-finite offset must render identically to the
+        // same spec with that stop removed — both the GPU shader and CPU
+        // reference simply ignore it, keeping the two paths in lockstep.
+        let base = GradientSpec {
+            width: 48,
+            height: 1,
+            kind: GradientKind::Linear {
+                from: [0.0, 0.0],
+                to: [48.0, 0.0],
+            },
+            stops: vec![
+                stop(0.0, [0.0, 0.0, 1.0, 1.0]),
+                stop(1.0, [1.0, 0.0, 0.0, 1.0]),
+            ],
+        };
+        let with_nan = GradientSpec {
+            stops: vec![
+                stop(0.0, [0.0, 0.0, 1.0, 1.0]),
+                stop(f32::NAN, [0.0, 1.0, 0.0, 1.0]),
+                stop(1.0, [1.0, 0.0, 0.0, 1.0]),
+            ],
+            ..base
+        };
+        assert_eq!(cpu_render_gradient(&with_nan), cpu_render_gradient(&base));
     }
 
     #[test]

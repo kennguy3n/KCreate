@@ -343,9 +343,9 @@ export function ModelManager({ onStatus }: ModelManagerProps): JSX.Element {
       </div>
 
       <p style={noteStyle}>
-        Models run fully offline on this machine. Pick a GGUF file —
-        Phase 1 does not bundle a download catalog. The sidecar binds
-        to <code style={monoStyle}>127.0.0.1</code> only.
+        Models run fully offline on this machine. Point to a GGUF file
+        to load your own model, or install one from the packs below. The
+        sidecar binds to <code style={monoStyle}>127.0.0.1</code> only.
       </p>
 
       <ModelPacksSection
@@ -375,8 +375,8 @@ export function ModelManager({ onStatus }: ModelManagerProps): JSX.Element {
 ///
 /// - Generation packs are **hard-gated** on
 ///   `imageGenerationAllowed`: when the tier+GPU combination
-///   forbids it, those packs are filtered out completely (PROPOSAL
-///   §7 "hard gate, not a soft one").
+///   forbids it, those packs are filtered out completely
+///   ("hard gate, not a soft one").
 /// - Vision packs that exceed `visionModelMaxMb` are still shown
 ///   but their install action is disabled — the user sees what's
 ///   available on a beefier tier without being able to install a

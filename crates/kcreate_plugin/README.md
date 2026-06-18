@@ -11,7 +11,7 @@ This crate ships three things:
    registry that scans a directory of plugins.
 2. The WASM runtime that loads, links, and executes a plugin against
    a strict ABI.
-3. The Phase 2 extended ABI that lets *permission-gated* plugins read
+3. The extended ABI that lets *permission-gated* plugins read
    the live document, fetch assets, and propose mutations that the host
    validates and applies as recordable, undoable operations.
 
@@ -54,7 +54,7 @@ missing or whose `id` / `name` / `version` is empty.
 | `read_document`  | `kcreate_read_document` (document graph queries)          |
 | `read_assets`    | `kcreate_read_asset` (BLAKE3-addressed blob store)        |
 | `write_document` | `kcreate_write_proposal` (queue mutations for host apply) |
-| `export_files`   | reserved (Phase 3)                                        |
+| `export_files`   | reserved                                                  |
 | `network_access` | reserved (denied — the editing path is network-free)      |
 
 Permissions are **declared** in the manifest and **enforced** at the

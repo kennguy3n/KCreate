@@ -405,7 +405,7 @@ impl ArtboardPreset {
     }
 }
 
-/// Built-in artboard presets. Matches the sizes the PROPOSAL.md §4.2
+/// Built-in artboard presets. Matches the sizes the OVERVIEW.md §4.2
 /// "App / Website UI", "Pitch Deck", "Social Post", and
 /// "Flyer / Poster / Brochure" home-screen affordances are spec'd
 /// against, plus the most common social-media and print formats so

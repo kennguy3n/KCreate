@@ -2,14 +2,14 @@
 // drop a CSS overlay over the canvas to simulate the target output
 // profile and (optionally) highlight out-of-gamut pixels.
 //
-// Phase 2 uses a simplified CSS-filter-based simulation:
+// The overlay uses a simplified CSS-filter-based simulation:
 //   - CMYK proof profiles desaturate + slightly warm the canvas so
 //     designers can see the perceptual loss before exporting.
 //   - Wide-gamut RGB proof profiles (Display P3, Adobe RGB) apply a
 //     gentle saturation boost so designers can preview the extra
 //     range without firing the actual GPU ICC transform.
-// The full ICC transform (lcms2 or a pure-Rust equivalent) ships in
-// Phase 3 — see PROGRESS.md.
+// This is a perceptual approximation, not a full ICC transform
+// (lcms2 or a pure-Rust equivalent).
 //
 // The gamut-warning overlay paints a faint bright-green wash on top
 // of the canvas as a placeholder until the renderer can mark

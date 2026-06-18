@@ -108,7 +108,7 @@ pub fn document_unbind_token(node_id: Uuid, property: &str) -> Result<()> {
 /// binding to it. Returns the number of nodes that were touched.
 ///
 /// Called by the brand-kit editor when a token changes value; the
-/// PROPOSAL.md §4.6 acceptance criterion requires this to complete
+/// OVERVIEW.md §4.6 acceptance criterion requires this to complete
 /// in < 100 ms even with thousands of bound nodes.
 pub fn document_propagate_token(token_name: &str) -> Result<usize> {
     with_workspace_mut(|ws| {

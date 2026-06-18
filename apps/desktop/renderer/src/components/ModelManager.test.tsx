@@ -2,8 +2,8 @@
 //
 // Pins the behaviours the spec calls for on the renderer side:
 //   * a generation pack is hard-gated on `imageGenerationAllowed`
-//     (PROPOSAL §7) — hidden entirely when the tier forbids image
-//     generation, surfaced with a Download button when it allows it;
+//     — hidden entirely when the tier forbids image generation,
+//     surfaced with a Download button when it allows it;
 //   * clicking Download routes to `aiModel.downloadModelPack(packId)`
 //     (downloads happen only on explicit user action) and, while the
 //     download is in flight, renders an accessible progress bar driven

@@ -170,7 +170,7 @@ fn scaled_dim(base: u32, scale: f32) -> u32 {
 }
 
 /// Built-in platform presets covering the four targets specified in
-/// PROPOSAL §4.x.
+/// OVERVIEW.md §4.7 (Export Center).
 #[must_use]
 pub fn built_in_platforms() -> Vec<IconPackPlatform> {
     vec![

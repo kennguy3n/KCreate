@@ -297,8 +297,8 @@ const A1080 = { x: 0, y: 0, width: 1920, height: 1080 };
 
 test("BRAND_PALETTE exports the six Brewline colours used by the demo", async () => {
   const { BRAND_PALETTE } = await loadResolvers();
-  // These exact strings are referenced in docs/demo/brewline-v2 +
-  // the resolver visual assertions; pin them here so a rename of
+  // These exact strings back the Brewline demo palette and the
+  // resolver visual assertions; pin them here so a rename of
   // any swatch surfaces as a failed test.
   assert.equal(BRAND_PALETTE.espresso, "#3E2723");
   assert.equal(BRAND_PALETTE.cream, "#FFF8E1");

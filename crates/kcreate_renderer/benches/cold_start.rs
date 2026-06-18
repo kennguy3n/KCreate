@@ -1,6 +1,6 @@
 //! Phase 6 Task 30 — cold-start acceptance criterion.
 //!
-//! PROPOSAL.md §20 lists a target cold-start budget of `< 3 s` on
+//! OVERVIEW.md §8 lists a target cold-start budget of `< 3 s` on
 //! Tier 0 and `< 1 s` on Tier 3. The full cold-start path involves
 //! Electron + Node + Vite + the bridge `.node` cdylib, none of which
 //! we can drive from a `cargo bench`. What we *can* measure — and

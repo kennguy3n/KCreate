@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-description = "LAN collaboration protocol types for KCreate (Phase 3 foundation)"
+description = "LAN collaboration protocol types for KCreate"
 publish = false
 
 [lints]

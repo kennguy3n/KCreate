@@ -2583,7 +2583,7 @@ function EditorPageInner({
     [refreshTree, setStatusMessage],
   );
 
-  // Right-panel content depends on the active mode (see PROPOSAL § 6).
+  // Right-panel content depends on the active mode (see OVERVIEW.md §6.3).
   // Image mode focuses on AI Assist; Export mode focuses on Export
   // presets; everything else lands on the properties inspector.
   const rightPanelFocus = defaultPanelForMode(mode);

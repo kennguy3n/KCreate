@@ -3,7 +3,7 @@
 // HARD gate: this panel renders `null` when
 // `window.kcreate.imageGen.allowed()` returns false. There's no
 // "feature locked" splash, no "upgrade" CTA — the UI element
-// simply doesn't exist. This matches the PROPOSAL.md hard-gate
+// simply doesn't exist. This matches the OVERVIEW.md hard-gate
 // requirement that Tier 0/1 users see no image-gen affordances at
 // all, not even ghosted ones.
 //

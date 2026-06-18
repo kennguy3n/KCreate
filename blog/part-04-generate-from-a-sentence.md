@@ -91,7 +91,7 @@ subject of Part 08.
 
 - AI brief / generate UI: [`apps/desktop/renderer/src/components/BriefModal.tsx`](../apps/desktop/renderer/src/components/BriefModal.tsx)
 - Generative planner + format generators: [`crates/kcreate_ai/`](../crates/kcreate_ai/) and the generative module in [`crates/kcreate_bridge/src/`](../crates/kcreate_bridge/src/)
-- Local image-generation sidecar: [`crates/kcreate_ai/src/llm_sidecar.rs`](../crates/kcreate_ai/src/llm_sidecar.rs)
+- Local image-generation sidecar: [`crates/kcreate_ai/src/diffusion_sidecar.rs`](../crates/kcreate_ai/src/diffusion_sidecar.rs)
 - IPC + public API: [`apps/desktop/main/src/main.ts`](../apps/desktop/main/src/main.ts), [`apps/desktop/preload/src/preload.ts`](../apps/desktop/preload/src/preload.ts)
 
 Previous: [« 03 — A library that jump-starts the work](./part-03-library-jump-start.md) ·

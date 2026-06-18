@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-description = "Local AI sidecar (Phase 0 threshold bg-removal) for KCreate"
+description = "Local AI sidecar for KCreate (background removal, palette extraction, upscale, smart-select, model registry)"
 
 [lints]
 workspace = true

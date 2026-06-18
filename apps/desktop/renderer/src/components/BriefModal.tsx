@@ -1,6 +1,6 @@
 // Phase 9 Block B Task 7 — "Start from a brief" modal.
 //
-// PROPOSAL.md §4.1: "A 'Start from a brief' tile that opens a local
+// OVERVIEW.md §4.1: "A 'Start from a brief' tile that opens a local
 // LLM prompt; the model fills out an artboard preset, palette, and
 // starter layers."
 //

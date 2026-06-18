@@ -10,7 +10,10 @@
 
 use kcreate_raster::filters as cpu_filters;
 use kcreate_raster::tile::TileGrid;
-use kcreate_renderer::compute::{build_curves_lut, build_levels_lut, GpuComputeContext};
+use kcreate_renderer::compute::{
+    build_curves_lut, build_levels_lut, cpu_render_gradient, GpuComputeContext, GradientKind,
+    GradientSpec, GradientStop,
+};
 
 fn gradient_rgba(width: u32, height: u32) -> Vec<u8> {
     let mut out = Vec::with_capacity((width as usize) * (height as usize) * 4);
@@ -209,5 +212,80 @@ fn blur_4096_under_perf_budget() {
     assert!(
         elapsed < budget,
         "GPU blur on 4096x4096 took {elapsed:?}, exceeded {budget:?} budget"
+    );
+}
+
+#[test]
+fn gradient_linear_matches_cpu_within_one_per_channel() {
+    let Some(ctx) = try_context() else { return };
+    let width = 256;
+    let height = 64;
+    let spec = GradientSpec {
+        width,
+        height,
+        kind: GradientKind::Linear {
+            from: [0.0, 0.0],
+            to: [width as f32, 0.0],
+        },
+        stops: vec![
+            GradientStop {
+                offset: 0.0,
+                color: [0.05, 0.10, 0.40, 1.0],
+            },
+            GradientStop {
+                offset: 0.5,
+                color: [0.90, 0.30, 0.10, 1.0],
+            },
+            GradientStop {
+                offset: 1.0,
+                color: [0.95, 0.95, 0.20, 1.0],
+            },
+        ],
+    };
+
+    let gpu_out = ctx.render_gradient(&spec).expect("GPU gradient dispatch");
+    let cpu_out = cpu_render_gradient(&spec);
+
+    // The WGSL shader and the CPU reference share the same straight-
+    // alpha lerp + round-half-up quantisation, so the only source of
+    // divergence is the backend's float rounding. ±1 LSB/channel.
+    let (ok, bad, max_diff) = pixelwise_close(&gpu_out, &cpu_out, 1);
+    assert!(
+        ok,
+        "GPU vs CPU linear gradient diverged: {bad} channels exceeded tolerance, max diff {max_diff}"
+    );
+}
+
+#[test]
+fn gradient_radial_matches_cpu_within_one_per_channel() {
+    let Some(ctx) = try_context() else { return };
+    let width = 128;
+    let height = 128;
+    let spec = GradientSpec {
+        width,
+        height,
+        kind: GradientKind::Radial {
+            center: [width as f32 / 2.0, height as f32 / 2.0],
+            radius: width as f32 / 2.0,
+        },
+        stops: vec![
+            GradientStop {
+                offset: 0.0,
+                color: [1.0, 1.0, 1.0, 1.0],
+            },
+            GradientStop {
+                offset: 1.0,
+                color: [0.10, 0.10, 0.15, 1.0],
+            },
+        ],
+    };
+
+    let gpu_out = ctx.render_gradient(&spec).expect("GPU gradient dispatch");
+    let cpu_out = cpu_render_gradient(&spec);
+
+    let (ok, bad, max_diff) = pixelwise_close(&gpu_out, &cpu_out, 1);
+    assert!(
+        ok,
+        "GPU vs CPU radial gradient diverged: {bad} channels exceeded tolerance, max diff {max_diff}"
     );
 }

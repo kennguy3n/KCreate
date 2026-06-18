@@ -40,6 +40,13 @@ use wgpu::util::DeviceExt;
 const GAUSSIAN_WGSL: &str = include_str!("gaussian_blur.wgsl");
 const LEVELS_CURVES_WGSL: &str = include_str!("levels_curves.wgsl");
 const UNSHARP_WGSL: &str = include_str!("unsharp_mask.wgsl");
+const GRADIENT_WGSL: &str = include_str!("gradient.wgsl");
+
+mod gradient;
+pub use gradient::{
+    cpu_render_gradient, gradient_image, GradientKind, GradientSpec, GradientStop,
+    GRADIENT_PARAMS_SIZE,
+};
 
 const WORKGROUP_DIM: u32 = 8;
 
@@ -88,6 +95,8 @@ pub struct GpuComputeContext {
     lut_bind_layout: wgpu::BindGroupLayout,
     unsharp_pipeline: wgpu::ComputePipeline,
     unsharp_bind_layout: wgpu::BindGroupLayout,
+    gradient_pipeline: wgpu::ComputePipeline,
+    gradient_bind_layout: wgpu::BindGroupLayout,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -102,6 +111,10 @@ pub enum ComputeError {
     Readback(String),
     #[error("wgpu device error: {0}")]
     Device(String),
+    #[error("gradient requires at least one colour stop")]
+    EmptyGradientStops,
+    #[error("gradient dimensions must be non-zero (got {width}x{height})")]
+    ZeroGradientSize { width: u32, height: u32 },
 }
 
 impl GpuComputeContext {
@@ -219,6 +232,8 @@ impl GpuComputeContext {
             UNSHARP_WGSL,
             BindKind::FourBufferUnsharp,
         );
+        let (gradient_pipeline, gradient_bind_layout) =
+            build_pipeline(&device, "gradient", GRADIENT_WGSL, BindKind::FourBuffer);
         Self {
             device,
             queue,
@@ -230,6 +245,8 @@ impl GpuComputeContext {
             lut_bind_layout,
             unsharp_pipeline,
             unsharp_bind_layout,
+            gradient_pipeline,
+            gradient_bind_layout,
         }
     }
 

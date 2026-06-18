@@ -60,6 +60,10 @@ name = "frame_readback"
 harness = false
 
 [[bench]]
+name = "gpu_gradient"
+harness = false
+
+[[bench]]
 name = "viewport_pan"
 harness = false
 

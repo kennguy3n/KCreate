@@ -375,8 +375,8 @@ export function ModelManager({ onStatus }: ModelManagerProps): JSX.Element {
 ///
 /// - Generation packs are **hard-gated** on
 ///   `imageGenerationAllowed`: when the tier+GPU combination
-///   forbids it, those packs are filtered out completely (PROPOSAL
-///   §7 "hard gate, not a soft one").
+///   forbids it, those packs are filtered out completely
+///   ("hard gate, not a soft one").
 /// - Vision packs that exceed `visionModelMaxMb` are still shown
 ///   but their install action is disabled — the user sees what's
 ///   available on a beefier tier without being able to install a

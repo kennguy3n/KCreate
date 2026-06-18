@@ -50,7 +50,7 @@ See [`OVERVIEW.md`](./OVERVIEW.md) for the product overview.
 | GPU rendering        | wgpu (Metal / D3D12 / Vulkan / OpenGL)                       |
 | CPU rendering        | `tiny-skia` (real software rasterizer)                       |
 | Persistence          | SQLite + content-addressed blob store (BLAKE3)               |
-| Local AI             | `llama.cpp` (LLM + Vision-LLM) + `stable-diffusion.cpp` (SD 1.5 + FLUX Klein 4B + Bonsai Image Ternary 4B image-gen) + ONNX Runtime (loopback sidecars; never network; zero Python) |
+| Local AI             | `llama.cpp` (LLM + Vision-LLM) + `stable-diffusion.cpp` (SD 1.5 + FLUX Klein 4B image-gen) + ONNX Runtime — loopback sidecars, never network, zero bundled Python. Optional external Bonsai Image Ternary 4B runner (MLX on Apple Silicon / GemLite on CUDA) on capable hardware. |
 | In-process AI        | Lanczos3 upscale, k-means palette, BFS smart-select, Sobel + CCA screenshot-to-layout, alt-text statistics |
 | Vision actions       | design critique, alt-text, brand / palette / spacing extraction, content-aware crop, design-token + style description, smart layer naming (all GBNF-constrained) |
 | Vector math          | `kurbo`, `i_overlay`, `rstar`                                |

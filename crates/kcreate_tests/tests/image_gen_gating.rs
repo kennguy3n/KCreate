@@ -1,6 +1,6 @@
 //! Phase 4 image-generation tier-gating tests.
 //!
-//! Image generation is a **hard gate**, not a soft one. Per PROPOSAL §7:
+//! Image generation is a **hard gate**, not a soft one:
 //! Tier 0/1 must not see generation UI at all, and the registry must
 //! not advertise generation packs to those tiers. This test file
 //! freezes that contract.

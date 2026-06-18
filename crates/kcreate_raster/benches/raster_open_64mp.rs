@@ -1,6 +1,6 @@
 //! Phase 6 Task 30 — 64-megapixel raster open acceptance bench.
 //!
-//! PROPOSAL.md §20 lists the "Open a 64 MP raster" target as:
+//! OVERVIEW.md §20 lists the "Open a 64 MP raster" target as:
 //! < 4 s Tier 0, < 2 s Tier 1, < 1 s Tier 2+. The path measured here
 //! is `TileGrid::from_image` over an 8192×8192 RGBA8 buffer (~64 MP,
 //! 256 MiB pre-tile pixels), which is the worst-case import on a

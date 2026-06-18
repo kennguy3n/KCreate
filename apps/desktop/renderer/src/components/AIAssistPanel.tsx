@@ -1,7 +1,7 @@
 // AIAssistPanel — Phase 0 local AI workflow.
 //
 // Implements the Ask → Preview → Apply → Edit → Undo pattern from
-// PROPOSAL.md §6.4. The Phase 0 model is `threshold-v0`, a fully
+// OVERVIEW.md §6.4. The Phase 0 model is `threshold-v0`, a fully
 // local, threshold-based background removal that produces a real RGBA
 // mask. Phase 1 swaps the backing model for an ONNX u2net behind the
 // same panel/UX.

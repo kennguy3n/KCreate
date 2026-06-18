@@ -190,7 +190,7 @@ fn blur_4096_under_perf_budget() {
         .expect("4k blur dispatch");
     let elapsed = start.elapsed();
 
-    // PROPOSAL.md §20 target: "64MP Gaussian blur < 500ms on Tier
+    // OVERVIEW.md §20 target: "64MP Gaussian blur < 500ms on Tier
     // 2+". We translate that to a per-pixel rate on the
     // 4096*4096 (16 MP) test image: 500ms / 64 MP = ~8 ns/pixel,
     // so 16 MP should land in ~125ms on a Tier-2 GPU.

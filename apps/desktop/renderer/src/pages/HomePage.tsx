@@ -20,7 +20,7 @@ import {
 } from "../components/WelcomeModal";
 
 /**
- * Job-first create options. The order mirrors PROPOSAL.md §4.1: we
+ * Job-first create options. The order mirrors OVERVIEW.md §4.1: we
  * lead with the workflows that mainstream non-designers use most.
  *
  * `defaultArtboard` is wired through to the editor on click so the

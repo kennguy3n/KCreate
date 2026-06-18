@@ -6,7 +6,7 @@
 //! user edits the "Brand/Primary" color in the brand kit
 //! editor), we walk every node that has a binding to that token
 //! and rewrite the corresponding property in place. The acceptance
-//! criterion is the PROPOSAL.md §4.6 budget: every linked layer
+//! criterion is the OVERVIEW.md §4.6 budget: every linked layer
 //! must be updated in < 100 ms even for thousand-node projects.
 //!
 //! The supported property names are listed in

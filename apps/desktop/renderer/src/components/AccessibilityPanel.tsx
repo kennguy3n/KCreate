@@ -1,6 +1,6 @@
 // AccessibilityPanel — Phase 1, Block A, Task 1.
 //
-// PROPOSAL.md §4.2 calls for "Find accessibility issues → Local report
+// OVERVIEW.md §4.2 calls for "Find accessibility issues → Local report
 // with fix buttons". This panel wraps the existing
 // `window.kcreate.ai.checkAccessibility()` bridge action, which asks
 // the local LLM sidecar to audit the document's contrast, tap

@@ -624,7 +624,7 @@ impl DocumentGraph {
     /// exist and [`DocumentError::WrongNodeType`] if the referenced
     /// node is not a [`NodeType::Page`]. Artboards may only be direct
     /// children of pages in Phase 1 — that constraint matches the
-    /// PROPOSAL.md §4.2 multi-artboard page model and avoids the
+    /// OVERVIEW.md §4.2 multi-artboard page model and avoids the
     /// nested-artboard "scene-within-scene" complexity Figma had to
     /// untangle.
     pub fn create_artboard(&mut self, page_id: Uuid, name: &str, bounds: Bounds) -> Result<Uuid> {

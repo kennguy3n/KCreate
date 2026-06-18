@@ -1,6 +1,6 @@
 // Phase 9 Block C Task 17 — Operation log viewer + AI action filter.
 //
-// PROPOSAL.md §6.3: "History — operation log, including AI actions,
+// OVERVIEW.md §6.3: "History — operation log, including AI actions,
 // with filter + jump-to."
 //
 // Calls `window.kcreate.phase9.operationLogFilter` for the paginated

@@ -1,9 +1,8 @@
 # KCreate — Technical Architecture
 
 This document describes how KCreate is built. It is the technical
-counterpart to `PROPOSAL.md` (product spec) and `PROGRESS.md` (shipping
-status). When the architecture changes, this file is updated in the
-same PR.
+counterpart to `OVERVIEW.md` (product overview). When the architecture
+changes, this file is updated in the same PR.
 
 ---
 
@@ -87,10 +86,9 @@ KCreate runs in up to five distinct processes:
    A1111-compatible `/sdapi/v1/txt2img` against `sd-server`).
    Lifecycle managed by
    `kcreate_ai::llm_sidecar::LlmSidecar` and
-   `kcreate_ai::diffusion_sidecar::DiffusionSidecar`. Phase 12
-   eliminated every Python subprocess — the AI tier is now
-   100% native C++ + ONNX. Runs at a lower priority and is
-   killable independently of the editor.
+   `kcreate_ai::diffusion_sidecar::DiffusionSidecar`. The AI tier
+   is 100% native C++ + ONNX with no Python subprocess. Runs at a
+   lower priority and is killable independently of the editor.
 5. **MCP server** — local-loopback server (built, `kcreate_mcp`).
    Exposes `list_artboards`, `create_node`, `export_artboard` via
    JSON-RPC on `127.0.0.1:<port>`. Gated by an `McpPermissionStore`
@@ -109,7 +107,7 @@ KCreate runs in up to five distinct processes:
    is `sd-server` from
    [stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp)
    — a loopback FLUX inference daemon spawned by
-   `kcreate_ai::diffusion_sidecar` (no Python; see Phase 12).
+   `kcreate_ai::diffusion_sidecar` (no Python).
 
 The renderer process never imports native code. The bridge cdylib lives
 in the Electron main process only.
@@ -129,7 +127,7 @@ The N-API surface is strictly thin. All business logic lives in
 
 ## 10. Canvas rendering
 
-### Phase 0 — offscreen wgpu + readback
+### Offscreen wgpu + readback path
 
 ```
 Scene (JSON) ──► kcreate_bridge::wire::parse_scene
@@ -151,9 +149,9 @@ The Rust side owns the entire pipeline. The Electron renderer only
 calls `ctx.putImageData(...)`. This guarantees we can replace the
 presentation path without rewriting the pipeline.
 
-### Phase 1 — native CanvasHost
+### Native CanvasHost path
 
-Phase 1 replaces only the presentation path: a native child view obtained
+The native CanvasHost replaces only the presentation path: a native child view obtained
 via `raw-window-handle` becomes the wgpu surface, eliminating the
 readback + IPC + `putImageData` round trip. The display list, scene
 graph, viewport, dirty regions, and presenter remain unchanged.
@@ -261,7 +259,7 @@ my-project.kstudio/
 ```
 
 The folder is transparent: any file manager shows its contents. The
-SQLite database is encrypted at rest (Phase 1+ with SQLCipher).
+SQLite database is encrypted at rest with SQLCipher.
 Content-addressed dedup lets re-imports of the same asset cost zero
 disk.
 
@@ -304,7 +302,7 @@ cached LRU; pan only invalidates uncovered regions. Dirty-tile
 tracking for incremental updates.
 
 The LRU machinery lives in a separate
-`kcreate_raster::tile_cache::TileCache<K>` (Phase 8 Block E Task 28).
+`kcreate_raster::tile_cache::TileCache<K>`.
 It is generic over an opaque caller-supplied key (the bridge
 instantiates it as `TileCache<(Uuid, u32, u32)>` for
 `(layer_id, col, row)`), tracks raw pixel bytes via
@@ -336,8 +334,8 @@ those are bridge-internal raster-op concerns.
 
 ### Cold-path startup profiling
 
-Phase 8 Block E Task 27 introduces a tiny `kcreate_perf` crate that
-records named time marks on a monotonic clock. The crate has no
+A tiny `kcreate_perf` crate records named time marks on a monotonic
+clock. The crate has no
 networking, no async, and pulls only `serde` + `serde_json` (both
 already in the workspace), so it is safe to live in the editing-path
 closure walked by `local_first.rs`. It exposes three primitives:
@@ -482,7 +480,7 @@ When detected (or explicitly enabled in `RuntimeConfig`):
 └─────────────────────────────────────────────┘
 ```
 
-### Model packs (Phase 1+)
+### Model packs
 
 - **Core Pack** — small LLM, background removal (e.g. `u2net`), upscale.
 - **Image Pro** — segmentation, inpainting, denoise.
@@ -564,8 +562,7 @@ runs six independent checks over a slice of pages:
 3. `ImageResolution` — every `RasterLayer` is checked against
    `target_dpi`; under-resolution produces a warning, severe
    under-resolution an error.
-4. `ColorSpace` — RGB fills against a CMYK target produce a warning
-   (Phase 3 will add auto-conversion).
+4. `ColorSpace` — RGB fills against a CMYK target produce a warning.
 5. `Transparency` — opacity / blend mode != Normal under a
    non-transparency-aware target produces a warning.
 6. `PageSize` — non-standard `Custom` page sizes produce an info.
@@ -584,9 +581,10 @@ size_bytes, file_path, installed }`. `category` is one of
 `Sidecar` (LLM via the long-running sidecar process). Built-in
 packs (Lanczos upscale, k-means palette, threshold bg-removal, BFS
 smart-select) are always installed; ONNX / sidecar packs compute
-`installed` by probing the local `models_dir`. Phase 2 declares
-neural alternatives (ESRGAN, u2net, SAM); the actual download flow
-is deferred to Phase 3.
+`installed` by probing the local `models_dir`. Neural alternatives
+(ESRGAN, u2net, SAM) are fetched on demand through the model-pack
+installer, which hash-gates each download before it is marked
+installed.
 
 ## 16f. MCP permission store
 
@@ -612,7 +610,7 @@ grants survive restarts. The UI is `McpSettingsPanel.tsx`.
    …) into `ElementType::{Header, Navigation, Hero, TextBlock,
    Image, Button, Card, Footer, Sidebar, Form, List}`.
 
-Output is `Vec<DetectedElement>`. The Phase 4 VLM pass lives in
+Output is `Vec<DetectedElement>`. The VLM refinement pass lives in
 the same module as `refine_with_vlm` (16i) and is wired through
 the AIAssist panel; the Rust pipeline returns the heuristic result
 unchanged when no VLM is available.
@@ -642,10 +640,12 @@ unchanged when no VLM is available.
 
 Bridge entry points: `plugin_list`, `plugin_enable`,
 `plugin_disable`, `plugin_execute(id, function, input_json)`. The
-Phase 2 wire format is intentionally JSON-only; a richer typed API
-(read_document, transform_path, …) lands in Phase 3.
+plugin-execute wire format is intentionally JSON-only; the richer
+typed read ABI (`kcreate_read_document`, `kcreate_read_asset`,
+`kcreate_write_proposal`) is exposed through the extended host
+functions.
 
-## 16i. Vision model integration (Phase 4)
+## 16i. Vision model integration
 
 The vision path reuses the existing loopback-HTTP sidecar pattern
 (see `llm_sidecar.rs`) but extends it in three ways:
@@ -664,8 +664,8 @@ The vision path reuses the existing loopback-HTTP sidecar pattern
    into the OpenAI vision-API shape with a `data:` URI containing
    a base64-encoded PNG. Text-only messages keep their plain
    `"content": "string"` serialisation for backward compatibility
-   — every existing chat caller (Phase 1 LLM, Phase 3 task router)
-   continues to work unchanged.
+   — every existing chat caller (the LLM chat path and the task
+   router) continues to work unchanged.
 3. **Bridge surface.** `crates/kcreate_bridge/src/phase4.rs`
    exposes `vision_start(pack_id)`, `vision_stop`,
    `vision_status`, `vision_describe_image`,
@@ -683,7 +683,7 @@ size at `DeviceTier::vision_model_max_mb` (Tier 0: 500 MB; Tier
 1: 2 GB; Tier 2: 5 GB; Tier 3: 8 GB). Tier 0 + 1 default to
 SmolVLM2-256M; Tier 2 + 3 default to Qwen2.5-VL-4B.
 
-## 16j. Image generation pipeline (Phase 4, Phase 12)
+## 16j. Image generation pipeline
 
 Image generation is a *hard-gated* feature: when
 `RuntimeConfig::image_generation_allowed()` is false (Tier < 2,
@@ -696,10 +696,8 @@ bridge refuses to spawn the sidecar. The pipeline itself:
    --diffusion-model <path>` on a loopback port — the
    `sd-server` binary ships with
    [stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp).
-   Phase 12 replaced the original Python sidecar
-   (`tools/kcreate_diffusion/server.py`, FastAPI + diffusers,
-   ~5 GB of pip deps) with this single C++ binary; KCreate
-   ships zero Python at runtime.
+   It is a single native C++ binary; KCreate ships zero Python
+   at runtime.
 2. Readiness is observed by polling
    `/sdcpp/v1/capabilities` (HTTP 200 JSON) through a
    background `health_worker` thread that mirrors
@@ -722,46 +720,49 @@ Operator overrides:
 - `KCREATE_SD_SERVER_BINARY` — absolute path to a custom
   `sd-server` build (default: PATH lookup of `sd-server`).
 - `KCREATE_SD_SERVER_EXTRA_ARGS` — space-separated additional
-  CLI flags forwarded to `sd-server`. The Phase 12
-  recommended setup passes the FLUX text encoder + VAE
-  component flags here
+  CLI flags forwarded to `sd-server`. The recommended setup
+  passes the FLUX text encoder + VAE component flags here
   (`--clip_l <path> --t5xxl <path> --vae <path>`).
 
-One registry entry ships in this phase:
-`image_gen_flux_klein_4b` (FLUX.2-Klein-4B GGUF). The
-Bonsai Image Ternary variants from prism-ml are *not*
-sd.cpp-compatible (gemlite / MLX 2-bit; sd.cpp's FLUX loader
-rejects the tensor layout) and so are not surfaced in the
-registry.
+The registry surfaces four generation packs across two engines:
 
-## 16k. MLX sidecar (removed in Phase 12)
+- **sd-server sidecar** (`sd-server` from stable-diffusion.cpp):
+  `image_gen_sd15` (Stable Diffusion 1.5, fused fp16 — the small
+  default that loads through `-m` with no companion encoder files)
+  and `image_gen_flux_klein_4b` (FLUX.2-Klein-4B GGUF).
+- **External Bonsai runner** (routed by `generation_engine_for` in
+  `crates/kcreate_bridge/src/phase4.rs`): `image_gen_bonsai_mlx_4b`
+  (Bonsai Image Ternary 4B, MLX 2-bit on Apple Silicon) and
+  `image_gen_bonsai_gemlite_4b` (GemLite 2-bit on CUDA). These
+  ternary-quantized FLUX.2 Klein builds ship their own runtimes
+  (mflux / gemlite kernels) and do not load in sd-server, so they
+  route to the Bonsai runner with their companion text-encoder / VAE
+  files passed through `KCREATE_BONSAI_*_EXTRA_ARGS`.
 
-The original `crates/kcreate_ai/src/mlx_sidecar.rs` wrapped
-`python3 -m mlx_lm.server` on Apple Silicon and used
-`probe_mlx_available()` (a cached
-`python3 -c "import mlx_lm"` probe) to gate spawn-time
-dispatch. Phase 12 deleted the module and the entire MLX
-dispatch arm: `llama.cpp` already has full Metal acceleration
-on Apple Silicon via the `--n-gpu-layers` flag, and the
-new Ternary-Bonsai GGUF packs (1.7B / 4B / 8B) run
-natively under `llama-server` on every supported platform.
-There is no longer a structural mirror sidecar, no
-`SidecarRuntime::MlxLm`, no
-`DispatchReason::Mlx*`, no `gguf_fallback_for_mlx_pack`,
-and no `_mlx`-suffixed model pack IDs.
+The Bonsai packs are opt-in through the generation-model selector;
+Stable Diffusion 1.5 stays the default fallback whenever the matching
+accelerator or runner is absent.
+
+## 16k. Apple Silicon acceleration
+
+`llama.cpp` provides full Metal acceleration on Apple Silicon via the
+`--n-gpu-layers` flag, and the Ternary-Bonsai GGUF packs (1.7B / 4B /
+8B) run natively under `llama-server` on every supported platform, so
+there is no separate MLX sidecar — no `SidecarRuntime::MlxLm`, no
+`DispatchReason::Mlx*`, and no `_mlx`-suffixed model pack IDs.
 
 ### CPU / GPU support by platform
 
-| Platform           | Renderer (Phase 1)   | LLM (Phase 3)    | Vision (Phase 4)              | Image Gen (Phase 4 / 12)         |
+| Platform           | Renderer             | LLM              | Vision                        | Image Gen                        |
 | ------------------ | -------------------- | ---------------- | ----------------------------- | -------------------------------- |
-| macOS (Apple Si)   | wgpu / Metal         | llama-server (Metal) | llama-server (Metal)        | sd-server (Metal, FLUX.2-Klein-4B GGUF) |
+| macOS (Apple Si)   | wgpu / Metal         | llama-server (Metal) | llama-server (Metal)        | sd-server (SD 1.5 / FLUX Klein 4B); Bonsai 4B (MLX) |
 | macOS (Intel)      | wgpu / Metal         | llama-server     | llama-server                  | Disabled (no GPU tier)           |
-| Windows            | wgpu / DX12          | llama-server     | llama-server                  | sd-server (FLUX.2-Klein-4B GGUF, Tier 2+) |
-| Linux (NVIDIA)     | wgpu / Vulkan        | llama-server     | llama-server                  | sd-server (CUDA / Vulkan, FLUX.2-Klein-4B GGUF, Tier 2+) |
+| Windows            | wgpu / DX12          | llama-server     | llama-server                  | sd-server (SD 1.5 / FLUX Klein 4B); Bonsai 4B (GemLite/CUDA), Tier 2+ |
+| Linux (NVIDIA)     | wgpu / Vulkan        | llama-server     | llama-server                  | sd-server (SD 1.5 / FLUX Klein 4B, CUDA/Vulkan); Bonsai 4B (GemLite/CUDA), Tier 2+ |
 | Linux (other GPU)  | wgpu / Vulkan        | llama-server     | llama-server                  | Disabled (CPU diffusion ≠ usable) |
 | CPU fallback       | tiny-skia            | llama-server CPU | SmolVLM2-256M (CPU)           | Disabled                          |
 
-## 17. Plugin types and runtime (Phase 2+)
+## 17. Plugin types and runtime
 
 | Tier     | Runtime          | Capabilities                           | Trust                  |
 | -------- | ---------------- | -------------------------------------- | ---------------------- |
@@ -798,7 +799,7 @@ this from the EditorPage "Import PDF" action; the importer is
 purely additive (creates a new project) and never mutates an
 existing one.
 
-## 17b. Collaboration protocol foundation (Phase 3, ships in PR #7)
+## 17b. Collaboration protocol foundation
 
 `kcreate_collab` is the *protocol-only* foundation for multi-peer
 editing. It is deliberately kept **outside the editing-path
@@ -842,21 +843,20 @@ seal/open round-trips, tampering detection, version mismatch,
 LWW tiebreaks across disjoint and overlapping affected-node sets,
 replay-window rejection, project-id scoping, peer cap.
 
-## 17c. KChat backend integration (Phase 7, ships in PR #17)
+## 17c. KChat backend integration
 
 `kcreate_kchat_client` is the **HTTPS REST client** that lets
 KCreate source membership attestations from the shared KChat /
 Mattermost backend that `uneycom/uney-chat-desktop` also signs
-in to. The integration follows **Option C** of the Phase 7
-pivot: KCreate stays a standalone process and talks to the
+in to. The integration follows **Option C**: KCreate stays a
+standalone process and talks to the
 backend directly over HTTPS, while a thin `.kcz` companion
 extension hosted inside KChat Desktop renders sidebar surfaces
 (`apps/kchat-extension/`). There is no local socket / named-pipe
-IPC between the two desktop apps — that approach (originally
-sketched in PR #17 before the pivot) was abandoned because the
-KChat Desktop Extension Platform is a JS-only sandbox that
-consumes host procedures via `defineProcedure()`, not a
-peer-to-peer Electron IPC bridge.
+IPC between the two desktop apps, because the KChat Desktop
+Extension Platform is a JS-only sandbox that consumes host
+procedures via `defineProcedure()`, not a peer-to-peer Electron
+IPC bridge.
 
 The crate is kept **out of the editing-path dependency tree** —
 even though it links `reqwest` / `rustls` — so the local-first
@@ -982,7 +982,7 @@ kchat_backend_sync_community_roster(id)  -> Task 8 tick:
 
 ### Performance
 
-The Phase 7 bridge tightens the wire under load:
+The collaboration bridge tightens the wire under load:
 
 - **Operation batching.** `session_queue_operation` /
   `session_flush_pending_operations` /
@@ -1018,18 +1018,17 @@ The Phase 7 bridge tightens the wire under load:
 | `kchat-dev-issuer`  | `kcreate_kchat` (implies `collab`)    | off     | Local dev / integration tests: mint a test KChat attestation against a deterministic key. |
 | `kchat-backend`     | `kcreate_kchat_client` (implies `collab`) | off | Production: source attestation from the shared KChat / Mattermost backend over HTTPS REST (Option C). |
 
-Both `kchat-*` flags are mutually compatible — a Phase 7 build
+Both `kchat-*` flags are mutually compatible — a production build
 typically enables `kchat-backend` (production attestation over
 HTTPS REST against the shared KChat / Mattermost backend) and
 keeps `kchat-dev-issuer` for the integration-test crate so the
 test suite can mint deterministic attestations without standing
 up a real backend.
 
-## 17d. KChat artifact publishing pipeline (Phase 8)
+## 17d. KChat artifact publishing pipeline
 
-Phase 8 Block A Tasks 1–2 add the ability to publish design
-artifacts (exported images, PDFs, brand kits) into KChat
-conversations as rich preview cards.
+KCreate can publish design artifacts (exported images, PDFs,
+brand kits) into KChat conversations as rich preview cards.
 
 **Client layer** (`kcreate_kchat_client::artifact`). Two
 methods on `KChatBackendClient`:
@@ -1087,10 +1086,9 @@ Bridge integration tests in
 `crates/kcreate_tests/tests/kchat_artifact.rs` drive the
 entry points end-to-end against the fixture.
 
-## 17e. Design-review annotations (Phase 8)
+## 17e. Design-review annotations
 
-Phase 8 introduces a per-page annotation layer for collaborative
-design review. Annotations live in `kcreate_core::annotation` as
+A per-page annotation layer supports collaborative design review. Annotations live in `kcreate_core::annotation` as
 plain serde-compatible `Annotation` structs:
 
 ```rust
@@ -1144,10 +1142,10 @@ broadcast or misses a packet, the next resume bundle from the
 authoritative peer carries the canonical annotation set
 (LWW-merged by timestamp inside the storage layer).
 
-## 17f. Design-token binding (Phase 8)
+## 17f. Design-token binding
 
-Phase 8 makes design tokens *live* — bound layers update
-within 100 ms of a token change.
+Design tokens are *live* — bound layers update within 100 ms of a
+token change.
 
 `NodeStyle` gains a `token_bindings: BTreeMap<String, String>`
 field mapping style property names (`"fill"`, `"font_size"`,
@@ -1168,17 +1166,17 @@ the binding rules:
   This is the hot path the bridge calls when the user edits a
   brand-kit token; the 1000-node integration test in
   `crates/kcreate_tests/tests/token_binding.rs` confirms it
-  stays well under the PROPOSAL.md §4.6 100 ms budget.
+  stays well under the OVERVIEW.md §4.6 100 ms budget.
 
 The bridge entry point `phase8::document_propagate_token`
 combines `propagate_single_token` with the workspace's brand
 kit and the operation log so an Undo step rolls back every
 affected node atomically.
 
-## 17g. Constraint system (Phase 8)
+## 17g. Constraint system
 
-Phase 8 wires the existing `Constraints` type on `Node` into
-the document resize flow. `Constraints` is per-axis and pairs
+The `Constraints` type on `Node` is wired into the document resize
+flow. `Constraints` is per-axis and pairs
 a horizontal + vertical `Constraint`:
 
 ```rust
@@ -1213,7 +1211,7 @@ the resized frame's children and rewrites each child's bounds
 using `apply_constraints`, then records a single `ResizeFrame`
 operation so the change participates in undo / redo.
 
-## 17h. Smart text auto-fit (Phase 8)
+## 17h. Smart text auto-fit
 
 `kcreate_text::autofit::compute_autofit_size(text, font, min,
 max, frame)` binary-searches for the largest font size that
@@ -1224,7 +1222,7 @@ enabled)` flips a flag on the node; the document resize path
 calls `compute_autofit_size` whenever an auto-fit text node's
 container changes.
 
-## 17i. Page-numbering tokens (Phase 8)
+## 17i. Page-numbering tokens
 
 Page-numbering tokens are stored as a Unicode Private-Use
 sentinel (U+E100) followed by a format selector char. The
@@ -1238,7 +1236,7 @@ subtractive (`IV`, `IX`, `XL`, …) and alphabetic is base-26
 (A–Z, AA–AZ, BA–BZ, …) — both implemented as real algorithms
 in `kcreate_text::tokens`, not as `format!("{n}")`.
 
-## 17j. SQLCipher encryption at rest (Phase 8)
+## 17j. SQLCipher encryption at rest
 
 `kcreate_storage::crypto` derives a 256-bit raw key from a
 user-supplied passphrase via PBKDF2-HMAC-SHA256 with a
@@ -1258,19 +1256,19 @@ project store has three lifecycle entry points:
   the recovery escape hatch. Decrypts the project to a
   plaintext copy at `out`; this is the user-facing answer to
   the "what if I lose my passphrase" failure mode called out
-  in PROPOSAL.md §21.
+  in OVERVIEW.md §21.
 
 Unencrypted projects continue to work; the only behavioural
 difference is whether `PRAGMA key` is issued at open time. The
 salt lives in `manifest.json` so the encrypted DB can be
 recovered even after `change_key`.
 
-## 17k. Brand-kit versioning (Phase 8)
+## 17k. Brand-kit versioning
 
 `kcreate_storage::brand_versions` adds a `brand_kit_versions`
 SQLite table (separate from the live `brand_kits` table) that
-stores immutable JSON snapshots of every save. The Phase 8
-bridge surface exposes save / list / restore / diff:
+stores immutable JSON snapshots of every save. The bridge surface
+exposes save / list / restore / diff:
 
 - `save_brand_kit_version(brand_kit_id, description)` — drops
   a snapshot. `description` is the user's "what changed?"
@@ -1285,9 +1283,9 @@ bridge surface exposes save / list / restore / diff:
   `BrandKitDiff { added_colors, removed_colors,
   changed_colors, added_fonts, removed_fonts, name_changed }`.
   The renderer renders this as the green/red side-by-side
-  diff view PROPOSAL.md §4.6 calls for.
+  diff view OVERVIEW.md §4.6 calls for.
 
-## 17l. Job-first export presets (Phase 8)
+## 17l. Job-first export presets
 
 `kcreate_export::job_presets` ships a curated preset list per
 Home-screen job tile (`JobType::{AppOrWebsiteUi,
@@ -1301,11 +1299,10 @@ Every preset is a real, validatable `ExportPreset` shape
 (format / scale / optional explicit width-height / optional
 bleed / optional background) — never a placeholder.
 
-## 17m. Image Studio bridge surfaces — perspective / HSL / color balance / mask-aware filter (Phase 8)
+## 17m. Image Studio bridge surfaces — perspective / HSL / color balance / mask-aware filter
 
-Phase 8 Block B extends `kcreate_bridge::raster_ops` with four
-new committal bridge surfaces. The pattern is identical to the
-Phase 5 raster ops:
+`kcreate_bridge::raster_ops` exposes four committal bridge surfaces
+for Image Studio. The pattern matches the other raster ops:
 
 1. `load_layer_pixels(node_id)` — decode the PNG blob the
    `RasterImageMeta` points at into a flat `LayerPixels`
@@ -1378,10 +1375,10 @@ N-API surface. TypeScript mirrors land in
 applyHsl, applyColorBalance, applyFilterMasked}`) with the
 `RasterPreviewFilter` discriminated union extended in lockstep.
 
-## 17n. Phase 9 — KChat extension depth, brief→project, design-studio polish, robustness
+## 17n. KChat extension depth, brief→project, design-studio polish, robustness
 
-Phase 9 finishes the proposal-level workflows that Phases 5–8
-deferred. The work falls into four architectural buckets:
+These workflows round out the product across four architectural
+buckets:
 
 **KChat companion extension depth.**
 `apps/kchat-extension/src/` now ships four React panels —
@@ -1399,8 +1396,8 @@ desktop apps are separate Electron processes with no shared
 IPC bus.
 
 **Home screen: brief → project.**
-`kcreate_bridge::phase9::brief_to_project` is the new entry
-point for the proposal's "Start from a brief" flow. The
+`kcreate_bridge::phase9::brief_to_project` is the entry
+point for the "Start from a brief" flow. The
 renderer collects the user's brief in `BriefModal.tsx`,
 ships it to the local LLM sidecar with a GBNF grammar that
 constrains the JSON output to `{ artboard_preset, palette,
@@ -1477,13 +1474,12 @@ of them lands in the editing-path closure walked by
 `crates/kcreate_tests/tests/local_first.rs`. The sentinel
 stays green.
 
-## 17o. Phase 10 — Image Studio AI, Vector / Layout AI, Export AI, plugin marketplace, perf & startup hardening
+## 17o. Image Studio AI, Vector / Layout AI, Export AI, plugin marketplace, perf & startup hardening
 
-Phase 10 closes out the AI-assisted authoring story across
-every studio surface, finishes the Export Center with live
-previews + intelligent compression, lands the local plugin
-marketplace, and tightens the performance envelope. The
-work falls into six architectural buckets:
+AI-assisted authoring spans every studio surface, the Export
+Center offers live previews + intelligent compression, the local
+plugin marketplace is built in, and the performance envelope is
+tight. The work falls into six architectural buckets:
 
 **Image Studio AI pipeline.** `kcreate_ai::denoise`
 implements non-local-means denoising — for each pixel a
@@ -1517,7 +1513,7 @@ stroke geometry (width, dash pattern, cap, join, profile,
 fill colour) onto every target node and returns the
 per-property delta so the caller can render a confirmation
 diff. `kcreate_ai::glyph_extract` pipes a cropped raster
-region through the Phase 9 trace pipeline with
+region through the vector trace pipeline with
 letterform-tuned threshold defaults, simplifies the
 resulting polylines aggressively, and normalises the path
 set to a 1000-unit em-square (the same unit a font tool
@@ -1644,20 +1640,18 @@ shrinking accordingly. Four perf-module tests
 `llm_sidecar_subsystem_ready_mark_fires_once`) lock in
 the lazy contract.
 
-**Local-first invariant.** None of the Phase 10 work pulls
+**Local-first invariant.** None of this work pulls
 networking into the editing-path closure walked by
 `crates/kcreate_tests/tests/local_first.rs`. The plugin
 marketplace operates entirely off the local filesystem;
-the LLM sidecar is unchanged from earlier phases (loopback
-only); export AI, preview, and import all run in-process.
+the LLM sidecar stays loopback-only; export AI, preview, and import all run in-process.
 The sentinel stays green.
 
-## 17p. Phase 11 — Render performance, async bridge, prototype animation, concurrency & security hardening
+## 17p. Render performance, async bridge, prototype animation, concurrency & security hardening
 
-Phase 11 attacks the four widest deltas the audit
-identified between KCreate and the professional reference
-designers (Figma, Affinity, Photoshop): render-pipeline
-throughput, bridge responsiveness, prototype
+Four subsystems carry the deepest engineering, matching the
+professional reference designers (Figma, Affinity, Photoshop) on
+render-pipeline throughput, bridge responsiveness, prototype
 expressiveness, and defence-in-depth.
 
 ### Incremental scene sync
@@ -1726,10 +1720,9 @@ operations (`export_png`, `export_pdf`,
 `export_svg_async`), and `project_save` are now
 `AsyncTask` entry points in
 `crates/kcreate_bridge/src/lib.rs` following the
-Phase 4 `VisionDescribeImageTask` pattern. The filter
+`VisionDescribeImageTask` pattern. The filter
 runs on libuv's threadpool with the workspace lock
 released; resolve is on the main thread. `project_save`
-(Phase 11 follow-up round 7 — Devin Review BUG-0001 r7)
 follows a five-step workspace-lock-free SQLite pattern:
 (1) snapshot `Project` fields under a brief read lock,
 (2) `Arc::clone` the `ProjectStore` handle (the store
@@ -1833,7 +1826,7 @@ atomic. The renderer polls this at 60 fps and skips the
 `refreshTree` IPC round-trip when the counter hasn't
 moved — MVCC-style optimistic reads.
 
-**Lock ordering after Phase 11.** Workspace RwLock →
+**Lock ordering.** Workspace RwLock →
 renderer Mutex → tile-cache Mutex. Documented at the top
 of `crates/kcreate_bridge/src/document.rs` so future
 contributors don't introduce inversion deadlocks.
@@ -1851,7 +1844,7 @@ load — a 1000-operation log uses 60–90 % less memory.
 
 ### Lazy subsystem initialization
 
-Audited every Phase 8/9/10 subsystem on bridge load: tile
+Every heavy subsystem is lazy on bridge load: tile
 cache, LLM sidecar, memory watchdog, audit DB, collab
 transport, and `fontdb` discovery are all deferred behind
 `OnceCell` / first-use guards.
@@ -1935,7 +1928,7 @@ When no pin is configured the client uses reqwest's
 default rustls / system-CA path — pinning is purely
 additive.
 
-### Security model summary (Phase 11)
+### Security model summary
 
 | Surface              | Threat                                        | Defence                                                                                  |
 | -------------------- | --------------------------------------------- | ---------------------------------------------------------------------------------------- |
@@ -1945,7 +1938,7 @@ additive.
 | Pinning misconfig    | Empty / malformed pin silently disables check | Eager hex parse + WebPKI builder error surfaced as `InvalidPinnedCertificate`.            |
 | Renderer trust       | Renderer leaks sidecar credentials            | Bearer token is dropped before `SidecarStatus` crosses the N-API boundary.                |
 
-### Performance targets (Phase 11)
+### Performance targets
 
 | Scenario                                       | Before               | After (Tier 2+)        |
 | ---------------------------------------------- | -------------------- | ---------------------- |
@@ -1957,7 +1950,7 @@ additive.
 | Scene fingerprint with 4 K image               | 48 MB SipHashed      | 8 bytes hashed          |
 | Undo log memory, 1000 ops                      | Full snapshots       | 60–90 % smaller (delta) |
 
-**Local-first invariant.** None of the Phase 11 work
+**Local-first invariant.** None of this work
 pulls networking into the editing-path closure walked by
 `crates/kcreate_tests/tests/local_first.rs`. The only
 new dependency that touches a CA bundle is
@@ -1966,20 +1959,15 @@ new dependency that touches a CA bundle is
 closure by the `kchat-backend` feature gate). The
 sentinel stays green.
 
-## 17q. Phase 12 — Python elimination, native AI stack
+## 17q. Native AI stack
 
-Phase 12 strips every Python runtime dependency from the AI
-stack. The high-level architecture diagram (§ "Overview")
-swapped the `kcreate_diffusion Python sidecar` node for
-`sd.cpp (C++)`; the `ai_rs -. spawn .-> diffusion` edge now
-points at a native binary. §16k (MLX sidecar) is marked
-removed. The new shape is:
+The AI stack is fully native — KCreate ships zero Python, zero
+pip, zero PyTorch at runtime. The shape is:
 
 - **Text + Vision** — `llama-server` (llama.cpp). Metal /
   CUDA / Vulkan / D3D12 acceleration depending on host
   platform. Authentication is per-session bearer token via
-  `--api-key` (carried over from Phase 11 Block D).
-  `mmproj_for` retains the GGUF projector paths for
+  `--api-key`. `mmproj_for` retains the GGUF projector paths for
   multimodal Qwen2.5-VL and SmolVLM2 packs.
 - **Image generation** — `sd-server` (stable-diffusion.cpp,
   [leejet/stable-diffusion.cpp][sd-cpp]). HTTP API:
@@ -1987,8 +1975,8 @@ removed. The new shape is:
   response shape) plus `/sdcpp/v1/capabilities` for
   readiness probing. Loopback-only (`--listen-ip
   127.0.0.1`) — sd-server's `--api-key` flag exists but the
-  loopback-bind + ephemeral-port allocation gives the same
-  no-network-egress guarantee that the Python sidecar had,
+  loopback-bind + ephemeral-port allocation gives a
+  no-network-egress guarantee,
   so auth is intentionally not enabled (no public-LAN
   threat model). Operator overrides:
   `KCREATE_SD_SERVER_BINARY` (absolute path),
@@ -2003,35 +1991,33 @@ removed. The new shape is:
   connect fallback otherwise. Both sidecars allocate
   loopback ports the same way (bind `127.0.0.1:0`, read
   the kernel-assigned port back out, hand to the child).
-- **Model packs.** Three Ternary-Bonsai GGUF entries
+- **Model packs.** Three Ternary-Bonsai GGUF LLM entries
   (`llm_bonsai_1_7b`, `llm_bonsai_4b`, `llm_bonsai_8b`)
-  added to `static_packs()`. `recommended_llm_pack` is
+  live in `static_packs()`. `recommended_llm_pack` is
   tier-aware: Tier 0 → 1.7B, Tier 1 → 4B, Tier 2/3 → 8B.
-  Image gen still ships only FLUX.2-Klein-4B GGUF;
-  Bonsai-Image Ternary variants are gemlite / MLX 2-bit
-  and not loadable by sd.cpp's FLUX backend.
-- **Dispatcher.** `SidecarDispatcher` collapsed to a single
+  Image generation surfaces four packs across two engines:
+  Stable Diffusion 1.5 (fused fp16) and FLUX.2-Klein-4B GGUF
+  through sd-server, plus Bonsai Image Ternary 4B (MLX 2-bit
+  on Apple Silicon, GemLite 2-bit on CUDA) through the
+  external Bonsai runner. SD 1.5 is the default fallback; the
+  Bonsai packs are opt-in (see §16j).
+- **Dispatcher.** `SidecarDispatcher` has a single
   runtime arm (`SidecarRuntime::LlamaServer`).
-  `SidecarHandle` retains the enum shape (one variant for
-  now) so a future Rust-native inference engine can be
-  added without re-typing every consumer.
-  `DispatchPlan` no longer carries an `mlx_available`
-  parameter. `gguf_fallback_for_mlx_pack` is gone.
+  `SidecarHandle` keeps the enum shape (one variant) so a
+  future Rust-native inference engine can be added without
+  re-typing every consumer.
 - **Bridge.** `crates/kcreate_bridge/src/phase4.rs`
-  collapsed `VisionHandle` to `Llama` only; `vision_status`
-  reports `runtime: "llama_server"` exclusively;
+  carries `VisionHandle::Llama`; `vision_status`
+  reports `runtime: "llama_server"`;
   `image_gen_start` constructs `DiffusionSidecarConfig`
-  via two new helpers (`sd_server_binary`,
-  `parse_sd_server_extra_args`).
-  `apps/desktop/shared/scene.ts` mirrors the change:
-  `VisionStatus.runtime` is now
+  via `sd_server_binary` and `parse_sd_server_extra_args`.
+  `apps/desktop/shared/scene.ts` mirrors this:
+  `VisionStatus.runtime` is
   `"llama_server" | null` (forward-compat for a future
   Rust-native runtime variant).
-- **UI.** `ModelManager.tsx::filterPacksForTier` dropped
-  the `_mlx`-suffix branch. `ImageGenPanel.tsx` is
-  unchanged — the `kcreate.imageGen.*` IPC surface kept
-  the same shape, only the implementing sidecar swapped
-  underneath.
+- **UI.** `ModelManager.tsx::filterPacksForTier` filters
+  model packs by hardware tier; `ImageGenPanel.tsx` drives
+  the `kcreate.imageGen.*` IPC surface.
 - **Legacy pack-id migration.**
   `kcreate_ai::model_registry::migrate_legacy_pack_id`
   rewrites the three obsolete MLX ids
@@ -2042,48 +2028,26 @@ removed. The new shape is:
   `image_gen_start`, `vision_mmproj_for`) funnel through
   a single `resolve_pack_id` helper that consults the
   migration table before any dispatcher lookup, so a
-  user upgrading from a Phase 4–11 install whose project
+  user upgrading from an older install whose project
   file or settings JSON still names an `_mlx` pack sees
   a transparent rewrite (with a `log::warn!` deprecation
   notice) rather than an opaque `ModelMissing` error.
   The dispatcher itself is unchanged — it sees a current
   id or surfaces missing; the migration table is a
   user-facing UX layer, not part of the dispatch contract.
-- **Operator override quoting.** Phase 12 originally
-  parsed `KCREATE_SD_SERVER_EXTRA_ARGS` with naive
-  whitespace splitting, which dropped the second half
-  of any Windows path containing spaces. The follow-up
-  Devin-Review pass replaced the parser with
-  `shell-words` (POSIX shell-word rules: double / single
-  quoting plus backslash escapes), so operators can pass
+- **Operator override quoting.** `KCREATE_SD_SERVER_EXTRA_ARGS`
+  is parsed with `shell-words` (POSIX shell-word rules:
+  double / single quoting plus backslash escapes), so
+  operators can pass
   `--clip_l "C:\Program Files\sd-models\clip_l.sft"`
-  literally. Mismatched quotes surface as
-  `Phase4BridgeError::Invalid` instead of a silently
-  truncated argv.
+  literally even on Windows paths with spaces. Mismatched
+  quotes surface as `Phase4BridgeError::Invalid` instead of
+  a silently truncated argv.
 - **Local-first invariant.** Zero new network crates.
   Both sidecars are subprocesses; the HTTP clients
   (`ureq`) live behind the `llm_sidecar` Cargo feature
   and stay outside the editing-path closure walked by
   `crates/kcreate_tests/tests/local_first.rs`.
-- **Deletions.** `crates/kcreate_ai/src/mlx_sidecar.rs`,
-  `tools/kcreate_diffusion/` (FastAPI + diffusers Python
-  daemon), every `_mlx`-suffixed pack ID,
-  `SidecarRuntime::MlxLm`,
-  `DispatchReason::MlxNative` / `MlxUnavailableFallback`,
-  `VisionHandle::Mlx`, `gguf_fallback_for_mlx_pack`,
-  `probe_mlx_available`. KCreate ships zero Python, zero
-  pip, zero PyTorch at runtime.
-
-Phase 12 carries forward (and re-verifies in HEAD) the
-Block D + E hardening originally specced in the audit but
-shipped in PR #27 (Phase 11): content-addressed image
-fingerprinting, R-tree spatial indexing, async N-API for
-raster + export ops, RwLock for workspace reads, LLM
-sidecar bearer-token auth with post-spawn TOCTOU
-verification, prototype transitions + animation engine,
-and component auto-layout propagation through instances
-with override preservation. No gaps were found; no extra
-work was needed in Phase 12 for those items.
 
 [sd-cpp]: https://github.com/leejet/stable-diffusion.cpp
 
@@ -2103,14 +2067,15 @@ work was needed in Phase 12 for those items.
 ## Security and privacy
 
 - Project data lives in `~/Documents/KCreate/projects/` (configurable).
-- SQLite at rest is encrypted (Phase 1+, SQLCipher).
+- SQLite at rest is encrypted (SQLCipher).
 - No telemetry. No background uploads.
 - AI actions are logged locally and visible in the History panel.
 - MCP server is bound to loopback only.
 
-## Phase 5 — Image Studio filters, Vector Studio features, Layout / Brand Hub
+## Image Studio filters, Vector Studio features, Layout / Brand Hub
 
-This section describes the editing-primitive expansions added in Phase 5.
+This section describes the editing-primitive expansions for Image
+Studio, Vector Studio, and the Layout / Brand Hub.
 
 ### Raster filter pipeline
 
@@ -2205,215 +2170,75 @@ This section describes the editing-primitive expansions added in Phase 5.
 
 ```
 crates/
-├── kcreate_core/        # Shared types, node model, document graph, operation log, config  [EXISTS]
-├── kcreate_renderer/    # offscreen wgpu pipeline + CPU fallback + native surface          [EXISTS]
+├── kcreate_core/        # Shared types, node model, document graph, operation log, config
+├── kcreate_renderer/    # offscreen wgpu pipeline + CPU fallback + native surface
 ├── kcreate_bridge/      # N-API cdylib (renderer + document + export + phase2 IPC).
 │                        # `native_canvas.rs` lives behind the `native_canvas` feature
 │                        # flag (only place in the tree where `unsafe_code` is allowed).
-│                        # `phase2.rs` houses every Phase 2 surface — preflight,
+│                        # `phase2.rs` houses the auxiliary N-API surface — preflight,
 │                        # icon pack, batch async, AI model packs, plugin runtime,
 │                        # MCP permission store, screenshot-to-layout — so `lib.rs`
-│                        # stays a thin N-API marshalling layer.                            [EXISTS]
-├── kcreate_vector/      # Path math, boolean ops, SVG import/export, R-tree                [EXISTS]
-├── kcreate_storage/     # SQLite + content-addressed blob store + .kstudio I/O             [EXISTS]
+│                        # stays a thin N-API marshalling layer.
+├── kcreate_vector/      # Path math, boolean ops, SVG import/export, R-tree
+├── kcreate_storage/     # SQLite + content-addressed blob store + .kstudio I/O
 ├── kcreate_export/      # PNG / SVG / PDF / WebP / JPEG export, batch (parallel +
 │                        # async cancel via `Arc<AtomicBool>`), inspect code-gen,
-│                        # PDF preflight, icon pack generator                                [EXISTS]
-├── kcreate_raster/      # tile engine, masks, adjustment layers                            [EXISTS]
-├── kcreate_text/        # font discovery (fontdb), shaping (rustybuzz)                     [EXISTS]
+│                        # PDF preflight, icon pack generator
+├── kcreate_raster/      # tile engine, masks, adjustment layers
+├── kcreate_text/        # font discovery (fontdb), shaping (rustybuzz)
 ├── kcreate_ai/          # task router, bg-removal (threshold + ONNX u2net), LLM sidecar
 │                        # lifecycle (`llm_sidecar.rs`), loopback chat (`llm_chat.rs`),
 │                        # Lanczos3 upscale, k-means palette extraction, BFS flood-fill
 │                        # smart-select, model pack registry, screenshot-to-layout
-│                        # (edge detect + connected components + heuristic classifier)      [EXISTS]
-├── kcreate_layout/      # flex + grid solvers (pure, deterministic)                        [EXISTS]
+│                        # (edge detect + connected components + heuristic classifier)
+├── kcreate_layout/      # flex + grid solvers (pure, deterministic)
 ├── kcreate_mcp/         # local-loopback MCP server (3 tools) + `permissions::McpPermissionStore`
-│                        # (Once / Always / Denied, JSON on-disk persistence)               [EXISTS]
+│                        # (Once / Always / Denied, JSON on-disk persistence)
 ├── kcreate_plugin/      # WASM plugin sandbox (wasmi 0.42, deny-by-default host ABI:
 │                        # kcreate_log, kcreate_get_input{,_len}, kcreate_set_output,
-│                        # plus the Phase 2 extended ABI: kcreate_read_document,
+│                        # plus the extended ABI: kcreate_read_document,
 │                        # kcreate_read_asset, kcreate_write_proposal). JS panel
-│                        # runtime and Ed25519 manifest signing also live here.              [EXISTS]
-├── kcreate_collab/      # Phase 3 collaboration protocol foundation (peer identity,
+│                        # runtime and Ed25519 manifest signing also live here.
+├── kcreate_collab/      # collaboration protocol foundation (peer identity,
 │                        # Lamport clock, signed envelopes, conflict resolver,
 │                        # session w/ replay-window). Transport-agnostic, kept OUT
-│                        # of the editing-path dependency tree.                              [EXISTS]
+│                        # of the editing-path dependency tree.
 ├── kcreate_collab_transport/ # QUIC + mDNS LAN transport (peer discovery,
 │                        # ephemeral cert pinning, frame codec). Only
 │                        # networked crate; opted-in via `collab` feature
-│                        # on `kcreate_bridge`.                                               [EXISTS]
+│                        # on `kcreate_bridge`.
 ├── kcreate_kchat/       # Dev-side KChat group membership issuer.
 │                        # Mints test attestations against deterministic
 │                        # Ed25519 keys. Behind the `kchat-dev-issuer`
-│                        # bridge feature flag.                                              [EXISTS]
-├── kcreate_kchat_client/ # Phase 7 production KChat backend REST client.
+│                        # bridge feature flag.
+├── kcreate_kchat_client/ # production KChat backend REST client.
 │                        # HTTPS-only (`reqwest` + `rustls`) against the
 │                        # shared KChat / Mattermost backend that
 │                        # `uneycom/uney-chat-desktop` also signs in to.
 │                        # Pulled in by `kcreate_bridge` only when the
 │                        # `kchat-backend` feature is enabled; kept out
 │                        # of the editing-path dep tree (local-first
-│                        # sentinel still green).                                            [EXISTS]
-└── kcreate_audit/       # Phase 6 audit trail: append-only operation +
+│                        # sentinel still green).
+└── kcreate_audit/       # audit trail: append-only operation +
                          # AI-action log persisted to a SEPARATE SQLite
                          # database from the project DB. Structured
                          # queries by date / action / node, surfaced
                          # through `kcreate_bridge::audit` and the
-                         # renderer `AuditPanel.tsx`. Phase 7 added
-                         # collab lifecycle events (peer join/leave/
+                         # renderer `AuditPanel.tsx`. The store also
+                         # records collab lifecycle events (peer join/leave/
                          # kick, conflict resolved, KChat connect/
-                         # disconnect) to the same store.                                    [EXISTS]
+                         # disconnect) to the same store.
 ```
 
-Phase 12 removed `tools/kcreate_diffusion/` (the Python FLUX
-sidecar); the entire `tools/` directory is gone. The diffusion
-sidecar is now `sd-server` from
+The diffusion sidecar is `sd-server` from
 [stable-diffusion.cpp](https://github.com/leejet/stable-diffusion.cpp),
-resolved via `KCREATE_SD_SERVER_BINARY` or PATH lookup. See
+resolved via `KCREATE_SD_SERVER_BINARY` or PATH lookup; there is no
+`tools/` directory and no Python runtime. See
 `crates/kcreate_ai/src/diffusion_sidecar.rs`.
 
-`kcreate_audit` shipped as part of Phase 6 (PR #16) and is wired into
+`kcreate_audit` is wired into
 the rest of the workspace via `kcreate_bridge::audit`. It writes to a
 **separate** SQLite database from the project DB (so audit history
 survives `project_close` and project deletion) and exposes
 structured queries by date / action / node.
 
-### What is built vs. planned
-
-| Concern                      | State    | Files                                                |
-| ---------------------------- | -------- | ---------------------------------------------------- |
-| GPU + CPU rendering pipeline | Built    | `crates/kcreate_renderer/src/*`                      |
-| N-API bridge                 | Built    | `crates/kcreate_bridge/src/*`                        |
-| Electron shell               | Built    | `apps/desktop/{main,preload,renderer}`               |
-| Node + document graph        | Built    | `crates/kcreate_core/src/{node,document}.rs`         |
-| Operation log                | Built    | `crates/kcreate_core/src/operation.rs`               |
-| Project model                | Built    | `crates/kcreate_core/src/project.rs`                 |
-| Runtime config / device tier | Built    | `crates/kcreate_core/src/config.rs`                  |
-| SQLite schema + project I/O  | Built    | `crates/kcreate_storage/src/{schema,project_io}.rs`  |
-| Blob store (BLAKE3)          | Built    | `crates/kcreate_storage/src/blobs.rs`                |
-| Path + boolean + SVG         | Built    | `crates/kcreate_vector/src/*`                        |
-| Spatial index                | Built    | `crates/kcreate_vector/src/spatial_index.rs`         |
-| PNG / SVG / PDF / WebP / JPEG export | Built | `crates/kcreate_export/src/{png,svg,pdf,webp,jpeg,batch}.rs` |
-| Home / Editor pages          | Built    | `apps/desktop/renderer/src/pages/*`                  |
-| Document→Scene translator    | Built    | `crates/kcreate_bridge/src/scene_sync.rs`            |
-| Canvas hit testing           | Built    | `crates/kcreate_bridge/src/hit_test.rs`              |
-| Local AI bg removal          | Built    | `crates/kcreate_ai/src/{bg_remove,task_router,action_log}.rs` |
-| Loopback MCP server          | Built    | `crates/kcreate_mcp/src/{server,tools}.rs`           |
-| Raster tile engine           | Built    | `crates/kcreate_raster/src/{tile,layer}.rs`          |
-| Text shaping + outlining     | Built    | `crates/kcreate_text/src/{font_db,shaper,outline}.rs`|
-| Auto-layout (flex + grid)    | Built    | `crates/kcreate_layout/src/{flex,grid,padding}.rs`   |
-| LLM sidecar                  | Built    | `crates/kcreate_ai/src/{llm_sidecar,llm_chat}.rs`    |
-| ONNX bg-removal backend      | Built    | `crates/kcreate_ai/src/bg_remove.rs`                 |
-| Inspect-mode code generation | Built    | `crates/kcreate_export/src/code_gen.rs`              |
-| Native surface foundation    | Built    | `crates/kcreate_renderer/src/native_surface.rs`      |
-| Artboard management          | Built    | `crates/kcreate_core/src/document.rs` (artboard fns) |
-| Component system             | Built    | `crates/kcreate_core/src/component.rs`               |
-| Prototype interactions       | Built    | `crates/kcreate_core/src/node.rs` + `crates/kcreate_bridge/src/document.rs` |
-| Layout Studio page model     | Built    | `crates/kcreate_core/src/{node,project}.rs`          |
-| Master pages                 | Built    | `crates/kcreate_bridge/src/document.rs`              |
-| Native canvas handle         | Built    | `crates/kcreate_bridge/src/native_canvas.rs`         |
-| Accessibility checker        | Built    | `apps/desktop/renderer/src/components/AccessibilityPanel.tsx` |
-| PDF preflight                | Built    | `crates/kcreate_export/src/preflight.rs`             |
-| Icon pack generator          | Built    | `crates/kcreate_export/src/icon_pack.rs`             |
-| Parallel batch + cancel      | Built    | `crates/kcreate_export/src/batch.rs` (`run_batch_parallel`) |
-| AI Lanczos upscale           | Built    | `crates/kcreate_ai/src/upscale.rs`                   |
-| AI k-means palette           | Built    | `crates/kcreate_ai/src/palette.rs`                   |
-| AI flood-fill smart-select   | Built    | `crates/kcreate_ai/src/smart_select.rs`              |
-| AI model pack registry       | Built    | `crates/kcreate_ai/src/model_registry.rs`            |
-| Screenshot-to-layout         | Built    | `crates/kcreate_ai/src/screenshot_to_layout.rs`      |
-| Plugin manifest / registry   | Built    | `crates/kcreate_plugin/src/{manifest,registry}.rs`   |
-| WASM plugin runtime          | Built    | `crates/kcreate_plugin/src/wasm_runtime.rs` (wasmi 0.42) |
-| MCP permission store         | Built    | `crates/kcreate_mcp/src/permissions.rs`              |
-| Phase 2 bridge surface       | Built    | `crates/kcreate_bridge/src/phase2.rs`                |
-| Phase 4 bridge (vision + gen)| Built    | `crates/kcreate_bridge/src/phase4.rs`                |
-| LLM bridge (lifecycle)       | Built    | `crates/kcreate_bridge/src/llm.rs`                   |
-| Collab bridge (session mgmt) | Built    | `crates/kcreate_bridge/src/collab.rs`                |
-| LAN collab transport (QUIC + mDNS) | Built | `crates/kcreate_collab_transport/src/{cert,discovery,host,wire}.rs` |
-| KChat dev issuer             | Built    | `crates/kcreate_kchat/src/lib.rs`                    |
-| Fill editor (solid + gradient) | Built  | `apps/desktop/renderer/src/components/RightPanel.tsx` (FillSection) |
-| OCR text-region detection    | Built    | `crates/kcreate_ai/src/ocr.rs`                       |
-| Vision sidecar (VLM)         | Built    | `crates/kcreate_ai/src/{vision_chat,sidecar_dispatcher}.rs` |
-| Image generation HTTP client | Built    | `crates/kcreate_ai/src/image_gen.rs`                 |
-| sd.cpp diffusion sidecar     | Built (Phase 12) | `crates/kcreate_ai/src/diffusion_sidecar.rs` |
-| Design critique / brand / crop / tokens / style | Built | `crates/kcreate_ai/src/{design_critique,brand_extract,smart_crop,design_tokens_vlm,style_describe}.rs` |
-| Operation journal            | Built    | `crates/kcreate_collab/src/journal.rs`               |
-| Raster filter pipeline (Levels / Curves / blur / sharpen / crop / rotate / flip / heal) | Built (Phase 5) | `crates/kcreate_raster/src/{layer,filters,transform,heal}.rs` |
-| Raster ops bridge            | Built (Phase 5) | `crates/kcreate_bridge/src/raster_ops.rs`     |
-| Filters UI panel             | Built (Phase 5) | `apps/desktop/renderer/src/components/FiltersPanel.tsx` |
-| Vector snap engine (smart guides) | Built (Phase 5) | `crates/kcreate_vector/src/snap.rs`     |
-| Path simplify / smooth / offset | Built (Phase 5) | `crates/kcreate_vector/src/simplify.rs`  |
-| Variable stroke width        | Built (Phase 5) | `crates/kcreate_vector/src/stroke.rs` + `kcreate_core::NodeStyle::stroke_width_profile` |
-| Multi-fill / multi-stroke    | Built (Phase 5) | `kcreate_core::NodeStyle::{fills, strokes}` (back-compat aliases) |
-| Path effects (dash / round corners) | Built (Phase 5) | `crates/kcreate_vector/src/path_effects.rs` |
-| Text flow across linked frames | Built (Phase 5) | `crates/kcreate_text/src/flow.rs`         |
-| Image-text wraps             | Built (Phase 5) | `crates/kcreate_text/src/wrap.rs`             |
-| `.kbrand` import / export    | Built (Phase 5) | `crates/kcreate_export/src/kbrand.rs`         |
-| Slice export                 | Built (Phase 5) | `crates/kcreate_export/src/slice.rs`          |
-| Spot colors + overprint      | Built (Phase 5) | `kcreate_core::color::{Color::Spot, SpotColorLibrary, Overprint}` |
-| Spot color missing preflight | Built (Phase 5) | `crates/kcreate_export/src/preflight.rs` (`PreflightCheck::SpotColorMissing`) |
-| Operational CRDT layer       | Built (Phase 3 / PR #16) | `crates/kcreate_collab/src/crdt.rs` (`OpKind`, per-field merge, move tie-break, delete-wins) |
-| Spot color JSON catalog loader | Built (Phase 3 / PR #16) | `kcreate_core::color::SpotColorLibrary::load_catalog` |
-| Overprint table + trapping preflight | Built (Phase 3 / PR #16) | `crates/kcreate_export/src/preflight.rs` (`PreflightCheck::Overprint`, `Trapping`) |
-| PDF overprint ExtGState      | Built (Phase 3 / PR #16) | `crates/kcreate_export/src/pdf.rs` |
-| Spot color library panel     | Built (Phase 3 / PR #16) | `apps/desktop/renderer/src/components/SpotColorLibraryPanel.tsx` |
-| Model pack installer + hash gate | Built (Phase 3 / PR #16) | `crates/kcreate_ai/src/model_registry.rs` (`install_model_pack`) |
-| ESRGAN ONNX upscale backend  | Built (Phase 3 / PR #16) | `crates/kcreate_ai/src/upscale.rs` (ONNX path) |
-| SAM segmentation             | Built (Phase 3 / PR #16) | `crates/kcreate_ai/src/segment.rs` |
-| Local template marketplace   | Built (Phase 3 / PR #16) | `crates/kcreate_core/src/marketplace.rs` + `apps/desktop/renderer/src/components/TemplateMarketplace.tsx` |
-| Audit trail crate            | Built (Phase 6 / PR #16) | `crates/kcreate_audit/src/{event,store}.rs` (separate SQLite DB) |
-| Audit bridge + panel         | Built (Phase 6 / PR #16) | `crates/kcreate_bridge/src/audit.rs` + `apps/desktop/renderer/src/components/AuditPanel.tsx` |
-| Undo grouping + atomic rollback | Built (Phase 6 / PR #16) | `crates/kcreate_bridge/src/document.rs` (`ApplyPatchSnapshot`, `APPLY_PATCH_COMMANDS`) |
-| Lazy thumbnail generation    | Built (Phase 6 / PR #16) | `crates/kcreate_bridge/src/thumbnails.rs` (coalescing background pre-warm, content-hash cache) |
-| Figma + Sketch importers     | Built (Phase 6 / PR #16) | `crates/kcreate_export/src/{figma_import,sketch_import}.rs` |
-| Keyboard shortcut registry   | Built (Phase 6 / PR #16) | `apps/desktop/renderer/src/shortcuts/{registry,useShortcuts}.ts` + `KeyboardShortcutsPanel.tsx` |
-| Theme system (CSS-variable driven) | Built (Phase 6 / PR #16) | `apps/desktop/renderer/index.html` (`:root[data-theme="dark"]`) + `src/styles/{tokens.ts,ThemeProvider.tsx}` |
-| Drag-and-drop + clipboard    | Built (Phase 6 / PR #16) | `apps/desktop/renderer/src/pages/EditorPage.tsx` + `crates/kcreate_bridge/src/document.rs` (`clipboard_paste` op) |
-| Layer panel search + tagging | Built (Phase 6 / PR #16) | `apps/desktop/renderer/src/components/LayerPanel.tsx` + `layer_color_set` op |
-| E2E workflow tests           | Built (Phase 6 / PR #16) | `crates/kcreate_tests/tests/e2e_workflow.rs` |
-| Acceptance-criteria benchmarks | Built (Phase 6 / PR #16) | `crates/kcreate_export/benches/batch_50_assets.rs` + `crates/kcreate_renderer/benches/{cold_start,viewport_pan,raster_open_64mp}.rs` |
-
-### Recommended Rust dependencies
-
-Already in the workspace: `wgpu`, `pollster`, `bytemuck`, `tiny-skia`,
-`glam`, `parking_lot`, `crossbeam-channel`, `log`, `thiserror`,
-`shared_memory`, `uuid`, `serde`, `serde_json`, `criterion`, `napi`,
-`napi-derive`, `napi-build`.
-
-Added in this phase:
-
-| Crate       | Purpose                                                                 |
-| ----------- | ----------------------------------------------------------------------- |
-| `chrono`    | Timestamps with timezone awareness for operation log and MCP permissions. |
-| `rusqlite`  | SQLite (bundled feature, statically linked).                            |
-| `blake3`    | Content-addressed hashing for the blob store.                           |
-| `kurbo`     | Path math (Bezier evaluation, derivatives, lengths).                    |
-| `i_overlay` | Production polygon Boolean operations.                                  |
-| `usvg`      | SVG parsing.                                                            |
-| `rstar`     | R-tree for spatial queries on layers.                                   |
-| `image`     | PNG encoding for export.                                                |
-| `sys-info`  | Cross-platform RAM and CPU probe for device tiering.                    |
-| `ureq`      | Blocking HTTP client for the loopback LLM sidecar (`127.0.0.1` only).   |
-| `ort`       | ONNX Runtime bindings for u2net background-removal model.               |
-| `raw-window-handle` | Window-handle abstraction for the Phase 1 native swapchain surface. |
-| `rayon`     | Row-parallel Lanczos resampling, parallel batch export driver.          |
-| `printpdf`  | PDF generation for the Phase 0 export pipeline.                         |
-| `rustybuzz` | Text shaping for `kcreate_text`.                                        |
-| `fontdb`    | Font discovery for `kcreate_text` (bitmap-only fonts skipped).          |
-| `base64`    | Base64 round-trip for AI image bridges and screenshot-to-layout.        |
-| `tiny_http` | Loopback JSON-RPC for the MCP server.                                   |
-| `wasmi`     | Pure-Rust WASM runtime for the plugin sandbox (no LLVM, no system deps). |
-| `quinn`     | QUIC endpoint for the LAN collab transport.                              |
-| `rustls`    | Pure-Rust TLS underneath quinn; ephemeral certs pinned to peer Ed25519.  |
-| `rcgen`     | Self-signed cert chain generation for the transport handshake.           |
-| `mdns-sd`   | Pure-Rust mDNS-SD responder + browser for peer discovery.                |
-| `tokio`     | Async runtime for the transport actor (editing path stays sync).         |
-| `ed25519-dalek` | Peer identity signing for collab envelopes + plugin manifests.       |
-| `chrono`    | Timestamps with timezone awareness (operation log, MCP permissions).     |
-| `lopdf`     | PDF *read* for the Phase 3 PDF-import path.                              |
-| `zip`       | `.kbrand` archive read/write (Phase 5).                                  |
-
-Planned for Phase 5+:
-
-| Crate         | Purpose                              |
-| ------------- | ------------------------------------ |
-| `resvg`       | Render SVG to raster for previews.   |

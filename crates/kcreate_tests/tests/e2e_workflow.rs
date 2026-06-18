@@ -1,6 +1,6 @@
 //! Phase 6 Task 29 — end-to-end workflow integration tests.
 //!
-//! Exercises the five user journeys from `PROPOSAL.md` §5 against the
+//! Exercises the five user journeys from `OVERVIEW.md` §5 against the
 //! public crate APIs (no Electron, no GPU, no network). Each scenario
 //! drives the editing path far enough to reach an export artefact so a
 //! regression in any of the supporting crates — document graph,

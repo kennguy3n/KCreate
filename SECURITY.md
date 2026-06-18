@@ -33,7 +33,7 @@ KCreate's architecture is built around five principles:
 1. **Local-first.** No telemetry, no background uploads, no automatic
    cloud sync. The editor must function fully offline.
 2. **Encrypted storage.** Project SQLite databases are encrypted at
-   rest (Phase 1+ via SQLCipher). Asset blobs are content-addressed
+   rest (via SQLCipher). Asset blobs are content-addressed
    and stored in the project folder; they inherit the project's
    encryption key.
 3. **Renderer sandbox.** The Electron renderer process runs with
@@ -61,7 +61,7 @@ We consider the following classes of vulnerability in scope:
   machine reach the loopback-bound MCP server.
 - **Operation log / audit tampering.** Any path that lets an attacker
   modify or delete the operation log without leaving traces.
-- **Privilege escalation via signed plug-ins** (Phase 2+).
+- **Privilege escalation via signed plug-ins.**
 
 ## Out of scope
 

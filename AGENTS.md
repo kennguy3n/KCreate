@@ -1,8 +1,7 @@
 # KCreate — agent guide
 
 This file is for AI coding agents (Devin, Codex, etc.). Human contributors
-should read `README.md`, `PROPOSAL.md`, `ARCHITECTURE.md`, and `PROGRESS.md`
-first.
+should read `README.md`, `OVERVIEW.md`, and `ARCHITECTURE.md` first.
 
 ## Layout
 
@@ -31,12 +30,12 @@ KCreate/
 │   │                        code-gen (CSS / Tailwind / React)
 │   ├── kcreate_perf/        cold-path startup profiling primitives
 │   │                        (`Timeline`, `Scope`, `Report`, process-wide
-│   │                        `startup` singleton). Phase 8 Block E Task 27.
+│   │                        `startup` singleton).
 │   │                        Zero networking — safe in the editing-path
 │   │                        closure walked by `local_first.rs`.
-│   ├── kcreate_raster/      tile engine, masks, adjustment layers (Phase 1),
+│   ├── kcreate_raster/      tile engine, masks, adjustment layers,
 │   │                        bounded `TileCache<K>` LRU
-│   │                        (`tile_cache.rs`, Phase 8 Block E Task 28)
+│   │                        (`tile_cache.rs`)
 │   ├── kcreate_text/        font discovery (fontdb), shaping (rustybuzz),
 │   │                        outline walking (ttf-parser) → renderer paths
 │   ├── kcreate_ai/          local AI task router, action log, bg removal
@@ -53,20 +52,20 @@ KCreate/
 │   │                        Once / Always / Denied, JSON on-disk)
 │   ├── kcreate_plugin/      WASM plugin sandbox (wasmi 0.42, deny-by-default
 │   │                        host ABI: kcreate_log, kcreate_get_input{,_len},
-│   │                        kcreate_set_output, plus the Phase 2 extended
+│   │                        kcreate_set_output, plus the extended
 │   │                        ABI: kcreate_read_document, kcreate_read_asset,
 │   │                        kcreate_write_proposal). Page-count
 │   │                        ResourceLimiter; no FS / network / DOM access.
 │   │                        Manifest + registry persist enabled state to
 │   │                        JSON. Ed25519 manifest signing + JS panel
-│   │                        runtime live here too (Phase 2 PR #7).
-│   ├── kcreate_collab/      Phase 3 collaboration protocol foundation
-│   │                        (peer identity, Lamport clock, Ed25519-signed
+│   │                        runtime live here too.
+│   ├── kcreate_collab/      collaboration protocol (peer identity,
+│   │                        Lamport clock, Ed25519-signed
 │   │                        envelopes, Hello/Welcome/Op/Presence/Heartbeat/
 │   │                        Goodbye messages, LWW conflict resolver,
 │   │                        ProjectSession w/ per-peer nonce replay window).
 │   │                        Transport-agnostic; deliberately OUT of the
-│   │                        editing-path dependency tree so a future
+│   │                        editing-path dependency tree so the LAN
 │   │                        transport (QUIC + mDNS) can pull in network
 │   │                        crates without breaking the local-first
 │   │                        sentinel.
@@ -78,8 +77,8 @@ KCreate/
 │   │                        Deterministic Ed25519 derivation + signed-
 │   │                        attestation minting. Behind `kchat-dev-issuer`
 │   │                        feature flag on kcreate_bridge.
-│   ├── kcreate_kchat_client/ Phase 7 production KChat backend REST
-│   │                        client (Option C pivot). HTTPS-only
+│   ├── kcreate_kchat_client/ production KChat backend REST
+│   │                        client. HTTPS-only
 │   │                        `reqwest`/`rustls` client that talks to
 │   │                        the shared KChat / Mattermost backend
 │   │                        uney-chat-desktop also signs in to.
@@ -92,7 +91,7 @@ KCreate/
 │   │                        path dep tree so the local-first
 │   │                        sentinel (`local_first.rs`) stays green
 │   │                        even though the crate links `reqwest`.
-│   ├── kcreate_audit/       Phase 6 audit trail: append-only operation +
+│   ├── kcreate_audit/       audit trail: append-only operation +
 │   │                        AI-action log persisted to a SEPARATE SQLite
 │   │                        DB from the project DB (so audit history
 │   │                        survives project close / delete). Structured
@@ -106,9 +105,8 @@ KCreate/
 │       ├── preload/         context-bridge exposing `window.kcreate.*`
 │       └── renderer/        Vite + React app (HomePage, EditorPage,
 │                            CanvasHost is the present surface)
-├── PROPOSAL.md              product spec
+├── OVERVIEW.md              product overview
 ├── ARCHITECTURE.md          technical architecture
-├── PROGRESS.md              phase tracking
 ├── CONTRIBUTING.md          contributor guide
 ├── SECURITY.md              security policy
 └── .github/workflows/ci.yml fast lane (ubuntu + node) + smoke lane (`smoke`: every PR; boots Electron under Xvfb via playwright-core and asserts a document mutation reaches canvas pixels — `apps/desktop/tests/e2e/boot.test.mjs`) + gated cross-platform matrix (macos-13 + windows-2022, opt-in via `full-ci` label / `[full-ci]` in commit msg / push to main / workflow_dispatch). Every job has `timeout-minutes`.
@@ -117,11 +115,11 @@ KCreate/
 ## Architecture contract
 
 - Rust owns the **entire rendering pipeline** (scene graph → display list →
-  GPU commands → readback) from day 1. The Electron renderer never runs
+  GPU commands → readback). The Electron renderer never runs
   any vector math.
 - The presentation path is offscreen wgpu → CPU readback → IPC →
-  `putImageData` on an HTML `<canvas>`. Phase 1 swaps **only** the
-  presentation path (`presenter.rs` + `CanvasHost.tsx`), not the
+  `putImageData` on an HTML `<canvas>`. The presentation swap touches
+  **only** `presenter.rs` + `CanvasHost.tsx`, not the
   pipeline.
 - All crates compile and pass tests without a live Node runtime (we use
   `napi/dyn-symbols` so `cargo test` works in CI without Electron).
@@ -236,7 +234,7 @@ pnpm lint
 | Plugin manifest / registry               | `crates/kcreate_plugin/src/{manifest,registry}.rs` |
 | WASM plugin execution                    | `crates/kcreate_plugin/src/wasm_runtime.rs`        |
 | Plugin signing (Ed25519)                 | `crates/kcreate_plugin/src/trust.rs` (+ `PluginSignature` in `manifest.rs`) |
-| PDF import (Phase 2 PR #7)               | `crates/kcreate_export/src/pdf_import.rs`          |
+| PDF import                               | `crates/kcreate_export/src/pdf_import.rs`          |
 | Collaboration protocol — peer identity   | `crates/kcreate_collab/src/peer.rs`                |
 | Collaboration protocol — Lamport clock   | `crates/kcreate_collab/src/clock.rs`               |
 | Collaboration protocol — signed envelopes| `crates/kcreate_collab/src/envelope.rs`            |
@@ -244,7 +242,7 @@ pnpm lint
 | Collaboration protocol — conflict resolve| `crates/kcreate_collab/src/conflict.rs`            |
 | Collaboration protocol — session state   | `crates/kcreate_collab/src/session.rs`             |
 | MCP permissions                          | `crates/kcreate_mcp/src/permissions.rs`            |
-| Phase 2 N-API marshalling                | thin wrapper in `kcreate_bridge/src/lib.rs`, logic in `phase2.rs` |
+| N-API marshalling (`phase2`)             | thin wrapper in `kcreate_bridge/src/lib.rs`, logic in `phase2.rs` |
 | PreflightPanel                           | `apps/desktop/renderer/src/components/PreflightPanel.tsx` |
 | IconPackDialog                           | `apps/desktop/renderer/src/components/IconPackDialog.tsx` |
 | PluginManager                            | `apps/desktop/renderer/src/components/PluginManager.tsx` |
@@ -264,7 +262,7 @@ pnpm lint
 | Transport wire codec                     | `crates/kcreate_collab_transport/src/wire.rs` |
 | Transport TLS cert bundle                | `crates/kcreate_collab_transport/src/cert.rs` |
 | Session bridge                           | `crates/kcreate_bridge/src/collab.rs` |
-| Phase 4 bridge surface                   | `crates/kcreate_bridge/src/phase4.rs` |
+| Bridge surface (`phase4`)                | `crates/kcreate_bridge/src/phase4.rs` |
 | LLM bridge (lifecycle + chat)            | `crates/kcreate_bridge/src/llm.rs` |
 | Operation journal                        | `crates/kcreate_collab/src/journal.rs` |
 | KChat authority types                    | `crates/kcreate_collab/src/kchat.rs` |
@@ -341,9 +339,9 @@ pnpm lint
 | Color range selection                    | `crates/kcreate_ai/src/color_range.rs` |
 | Perspective transform                    | `crates/kcreate_raster/src/transform.rs` (`perspective_transform`) |
 | HSL / Color balance adjustment layers    | `crates/kcreate_raster/src/layer.rs` (`AdjustmentLayer::{HueSaturation, ColorBalance}`) |
-| Phase 8 bridge surface                   | `crates/kcreate_bridge/src/phase8.rs` |
-| Phase 8 wire format (TypeScript mirror)  | `apps/desktop/shared/scene.ts` (`Phase8Bridge` + types) |
-| Phase 9 bridge surface                   | `crates/kcreate_bridge/src/phase9.rs` (brief→project, AI trace / iconify / palette / alt-text, PSD / Penpot import, SVG preview, history filter, align/distribute, guides, grid settings, export validation) |
+| Bridge surface (`phase8`)                | `crates/kcreate_bridge/src/phase8.rs` |
+| Wire format (`phase8`, TypeScript mirror) | `apps/desktop/shared/scene.ts` (`Phase8Bridge` + types) |
+| Bridge surface (`phase9`)                | `crates/kcreate_bridge/src/phase9.rs` (brief→project, AI trace / iconify / palette / alt-text, PSD / Penpot import, SVG preview, history filter, align/distribute, guides, grid settings, export validation) |
 | Memory pressure watchdog                 | `crates/kcreate_bridge/src/perf.rs` (`memory_watchdog_start`, `drain_memory_events`, `MemoryPressureEvent`) |
 | Project autosave + crash recovery        | `crates/kcreate_bridge/src/autosave.rs` (`autosave_start`, `autosave_force_now`, `autosave_recovery_available`, `autosave_recover`, `autosave_dismiss_recovery`) |
 | Raster-to-vector trace (Otsu + Moore)    | `crates/kcreate_ai/src/trace.rs` |
@@ -360,7 +358,7 @@ pnpm lint
 | GridOverlay (per-artboard grid)          | `apps/desktop/renderer/src/components/GridOverlay.tsx` |
 | AlignmentToolbar UI                      | `apps/desktop/renderer/src/components/AlignmentToolbar.tsx` |
 | BriefModal (Start-from-a-brief)          | `apps/desktop/renderer/src/components/BriefModal.tsx` |
-| Phase 9 wire format (TypeScript mirror)  | `apps/desktop/shared/scene.ts` (`BriefApplyResult`, `TraceResult`, `IconifyResultInfo`, `GuideInfo`, `GridSettings`, `MemoryPressureEvent`, `AutosaveStatusInfo`, `ExportValidationReport`, `OperationLogEntry`, …) |
+| Wire format (`phase9`, TypeScript mirror) | `apps/desktop/shared/scene.ts` (`BriefApplyResult`, `TraceResult`, `IconifyResultInfo`, `GuideInfo`, `GridSettings`, `MemoryPressureEvent`, `AutosaveStatusInfo`, `ExportValidationReport`, `OperationLogEntry`, …) |
 | KChat extension — project browser        | `apps/kchat-extension/src/ProjectBrowserPanel.tsx` |
 | KChat extension — artifact preview cards | `apps/kchat-extension/src/ArtifactCard.tsx` |
 | KChat extension — session status badge   | `apps/kchat-extension/src/SessionStatusBadge.tsx` |
@@ -384,14 +382,14 @@ pnpm lint
 | Workspace preferences persistence        | `crates/kcreate_bridge/src/phase10.rs` (`preferences_load`, `preferences_save`) |
 | Incremental scene diff                   | `crates/kcreate_bridge/src/scene_sync.rs` (`scene_version`, `DirtySet<Uuid>`) |
 | Startup lazy-init marks                  | `crates/kcreate_bridge/src/perf.rs` (`tile_cache_lock`, `mark_llm_sidecar_ready`, `memory_watchdog_start`, `TILE_CACHE_READY_MARKED`, `LLM_SIDECAR_READY_MARKED`, `MEMORY_WATCHDOG_READY_MARKED`) |
-| Phase 10 bridge surface                  | `crates/kcreate_bridge/src/phase10.rs` |
-| Phase 10 wire format (TypeScript mirror) | `apps/desktop/shared/scene.ts` (`Phase10Bridge` + types) |
+| Bridge surface (`phase10`)               | `crates/kcreate_bridge/src/phase10.rs` |
+| Wire format (`phase10`, TypeScript mirror) | `apps/desktop/shared/scene.ts` (`Phase10Bridge` + types) |
 | MagicWandTool UI                         | `apps/desktop/renderer/src/components/MagicWandTool.tsx` |
 | FloatingToolbar UI                       | `apps/desktop/renderer/src/components/FloatingToolbar.tsx` |
 | ExportPreviewPanel UI                    | `apps/desktop/renderer/src/components/ExportPreviewPanel.tsx` |
 | BatchExportProgress UI                   | `apps/desktop/renderer/src/components/BatchExportProgress.tsx` |
 | PreferencesPanel UI                      | `apps/desktop/renderer/src/components/PreferencesPanel.tsx` |
-| Phase 11 bridge surface                  | `crates/kcreate_bridge/src/phase11.rs` |
+| Bridge surface (`phase11`)               | `crates/kcreate_bridge/src/phase11.rs` |
 | Dirty-set + structure-dirty tracking     | `crates/kcreate_core/src/document.rs` (`drain_dirty`, `mark_dirty`, `structure_dirty`) |
 | R-tree spatial index                     | `crates/kcreate_core/src/document.rs` (`SpatialEntry`, `spatial_index`, `query_point`) |
 | GPU compute Gaussian blur shader         | `crates/kcreate_renderer/src/compute/gaussian_blur.wgsl` |
@@ -399,7 +397,7 @@ pnpm lint
 | GPU compute unsharp mask shader          | `crates/kcreate_renderer/src/compute/unsharp_mask.wgsl` |
 | GPU compute context (wgpu plumbing)      | `crates/kcreate_renderer/src/compute/mod.rs` (`GpuComputeContext`) |
 | Bridge-side GPU compute dispatch         | `crates/kcreate_bridge/src/gpu_compute.rs` |
-| Async N-API for raster / export / save   | `crates/kcreate_bridge/src/lib.rs` (`AsyncTask` wrappers; see Phase 11 block) |
+| Async N-API for raster / export / save   | `crates/kcreate_bridge/src/lib.rs` (`AsyncTask` wrappers; see the `phase11` async block) |
 | Prototype transition + easing types      | `crates/kcreate_core/src/node.rs` (`Transition`, `AnimationType`, `EasingCurve`, `SlideDirection`) |
 | EasingEngine (cubic-bezier + spring)     | `apps/desktop/renderer/src/lib/EasingEngine.ts` |
 | Auto-layout overrides                    | `crates/kcreate_layout/src/{flex,grid}.rs` (`layout_*_with_overrides`) |
@@ -408,5 +406,5 @@ pnpm lint
 | ACL encryption (ChaCha20-Poly1305)       | `crates/kcreate_collab/src/acl.rs` (`encrypt_acl_bytes`, `decrypt_acl_bytes`, `looks_like_encrypted_acl`) |
 | ACL load / save / migration              | `crates/kcreate_bridge/src/collab.rs` (`load_project_acl`, `save_project_acl`) |
 | KChat REST cert pinning                  | `crates/kcreate_kchat_client/src/pinning.rs` (`PinnedCertVerifier`, `build_pinned_tls_config`) |
-| Phase 11 wire format (TypeScript mirror) | `apps/desktop/shared/scene.ts` (Phase 11 async signatures + transition types) |
-| Phase 11 cross-crate tests               | `crates/kcreate_tests/tests/{dirty_tracking,incremental_sync,render_pipeline_perf,gpu_compute,prototype_advanced,component_autolayout,concurrency,scale_validation,llm_sidecar_auth}.rs` |
+| Wire format (`phase11`, TypeScript mirror) | `apps/desktop/shared/scene.ts` (`phase11` async signatures + transition types) |
+| Cross-crate tests (`phase11`)            | `crates/kcreate_tests/tests/{dirty_tracking,incremental_sync,render_pipeline_perf,gpu_compute,prototype_advanced,component_autolayout,concurrency,scale_validation,llm_sidecar_auth}.rs` |

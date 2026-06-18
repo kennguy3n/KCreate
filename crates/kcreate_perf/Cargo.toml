@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-description = "Lightweight startup + cold-path profiling primitives for KCreate (Phase 8 Block E Task 27)"
+description = "Lightweight startup + cold-path profiling primitives for KCreate"
 
 [features]
 # Exposes `kcreate_perf::startup::reset_for_tests` to dependent

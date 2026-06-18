@@ -26,7 +26,7 @@ Your files stay on your disk. AI runs on your hardware.
 - **MCP / Plugin Hub** — local-loopback MCP server and sandboxed
   plug-ins.
 
-See [`PROPOSAL.md`](./PROPOSAL.md) for the full product spec.
+See [`OVERVIEW.md`](./OVERVIEW.md) for the product overview.
 
 ## Core principles
 
@@ -50,7 +50,7 @@ See [`PROPOSAL.md`](./PROPOSAL.md) for the full product spec.
 | GPU rendering        | wgpu (Metal / D3D12 / Vulkan / OpenGL)                       |
 | CPU rendering        | `tiny-skia` (real software rasterizer)                       |
 | Persistence          | SQLite + content-addressed blob store (BLAKE3)               |
-| Local AI             | `llama.cpp` (LLM + Vision-LLM) + `stable-diffusion.cpp` (FLUX image-gen) + ONNX Runtime (loopback sidecars; never network; zero Python) |
+| Local AI             | `llama.cpp` (LLM + Vision-LLM) + `stable-diffusion.cpp` (SD 1.5 + FLUX Klein 4B + Bonsai Image Ternary 4B image-gen) + ONNX Runtime (loopback sidecars; never network; zero Python) |
 | In-process AI        | Lanczos3 upscale, k-means palette, BFS smart-select, Sobel + CCA screenshot-to-layout, alt-text statistics |
 | Vision actions       | design critique, alt-text, brand / palette / spacing extraction, content-aware crop, design-token + style description, smart layer naming (all GBNF-constrained) |
 | Vector math          | `kurbo`, `i_overlay`, `rstar`                                |
@@ -63,19 +63,19 @@ See [`PROPOSAL.md`](./PROPOSAL.md) for the full product spec.
 | Collaboration protocol | Ed25519-signed envelopes, Lamport clocks, LWW + operational CRDT conflict resolution, append-only operation journal, 60-min QUIC cert rotation, per-peer rate limits, ChaCha20-Poly1305 encrypted clipboard share over BLAKE3-derived X25519 session keys |
 | KChat backend integration | `kcreate_kchat_client`: HTTPS REST (`reqwest` + `rustls`) to the shared KChat / Mattermost backend that `uneycom/uney-chat-desktop` also signs in to; community-gated sessions + member roster sync + conversation-based document sharing (opt-in via `kchat-backend` feature on `kcreate_bridge`). A thin `.kcz` companion extension (`apps/kchat-extension/`) renders a sidebar inside KChat Desktop and bridges deeplinks back to KCreate. |
 | Brand kit format     | `.kbrand` ZIP archive: `manifest.json` + `fonts/` (TTF/OTF) + `logos/` (PNG/SVG/JPEG) |
-| Import edges (Phase 9) | `psd` (Adobe PSD layered import), `kamadak-exif` (JPEG / WebP EXIF round-trip), `resvg` (SVG-to-raster preview + thumbnail rasterisation) |
-| Robustness (Phase 9) | Memory-pressure watchdog (`kcreate_bridge::perf::memory_watchdog_start`, `sysinfo`-backed), opt-in autosave + crash recovery (`kcreate_bridge::autosave`), export pre-flight validation (`kcreate_export::validate`) |
-| Image Studio AI (Phase 10) | Non-local-means denoise (`kcreate_ai::denoise`), PatchMatch exemplar inpaint (`kcreate_ai::inpaint`), histogram + gray-world auto colour (`kcreate_ai::auto_color`), magic-wand selection tool (`kcreate_ai::smart_select` + `MagicWandTool.tsx`), SAM segmentation tool with smart-select fallback |
-| Vector / Layout / Brand AI (Phase 10) | Stroke-style match (`kcreate_ai::stroke_match`), glyph extraction from photo (`kcreate_ai::glyph_extract`), LLM-driven reformat-to-deck (`kcreate_ai::reformat`) + brief-to-one-pager (`kcreate_ai::one_pager`) + palette harmonisation (`kcreate_ai::palette_harmonize`) + type pairing (`kcreate_ai::type_pairing`) + brand-to-brochure (`kcreate_ai::brand_template`) |
-| Export AI (Phase 10) | Element-aware SVG optimiser with protected `<text>` / `<style>` / CDATA regions (`kcreate_export::svg_optimize`), SSIM-targeted smart-compress for raster (`kcreate_export::smart_compress`), live export preview (`ExportPreviewPanel.tsx`), AI/Illustrator subset import (`kcreate_export::ai_import`), multi-page PDF with TOC / outline / hyperlinks / per-page subset fonts (`kcreate_export::pdf_multi`) |
-| Plugin ecosystem (Phase 10) | Local plugin marketplace (`kcreate_plugin::marketplace`, `PluginManager.tsx` "Marketplace" tab) with Ed25519 signature verification on install |
-| Performance & robustness (Phase 10) | Incremental scene diff with per-node `scene_version` + `DirtySet<Uuid>` (`kcreate_bridge::scene_sync`), undo-log delta compression + BLAKE3 blob-ref swapping (`kcreate_core::operation_compress`, configurable via `RuntimeConfig::{compress_undo_log, undo_blob_threshold_bytes}`), startup lazy-init for tile cache / LLM sidecar / memory watchdog with `bridge.<subsystem>.subsystem_ready` startup-timeline marks |
-| Render performance (Phase 11) | Incremental scene sync with `DocumentGraph::drain_dirty` + cached per-node `Vec<Object>` lists (`kcreate_bridge::scene_sync`), BLAKE3 content-addressed image fingerprints on `ObjectKind::Image` (8 bytes hashed per frame vs walking a 48 MB pixel buffer), R-tree spatial index for hit testing (`kcreate_core::document::DocumentGraph` + `kcreate_bridge::hit_test`), batched `FillRect` / `StrokeRect` display-list commands (`kcreate_renderer::pipeline::DisplayCommand::BatchedRects`) |
-| GPU compute filters (Phase 11) | Two-pass separable Gaussian blur, 256-entry-LUT levels / curves, and reuse-the-blur unsharp mask compute pipelines (`crates/kcreate_renderer/src/compute/{gaussian_blur,levels_curves,unsharp_mask}.wgsl`) sharing `wgpu::Device` + `Queue` with `GpuBackend`; CPU fallback when no adapter is available |
-| Async bridge (Phase 11) | Raster filter family (`raster_apply_blur` / `_sharpen` / `_levels` / `_curves` / `_hsl` / `_color_balance` / `_perspective` / `_apply_filter_masked` / `raster_crop`), export operations (`export_png`, `export_pdf`, `export_svg_async`), and `project_save` run as `napi::AsyncTask`s; `project_save` snapshots inside the write guard so concurrent edits can't corrupt the save |
-| Prototype animation (Phase 11) | `Transition { AnimationType, duration_ms, EasingCurve (incl. cubic-bezier + spring), SlideDirection }`, hover / press / `MouseEnter` / `MouseLeave` / `AfterDelay` triggers, `SwitchVariant` Smart-Animate name-matched interpolation (bounds / opacity / HSL fill / corner radius), auto-layout propagation through component instances with depth-bounded recursion + override-aware solvers (`apps/desktop/renderer/src/lib/EasingEngine.ts`, `apps/desktop/renderer/src/components/PrototypePlayer.tsx`, `kcreate_layout::flex::layout_flex_with_overrides`, `kcreate_layout::grid::layout_grid_with_overrides`) |
-| Workspace concurrency (Phase 11) | `RwLock<Option<Workspace>>` in `kcreate_bridge::document` (audited read/write call sites), per-node `version: u64` + `document_version: AtomicU64` for lock-free MVCC polling, delta-compressed operations (`kcreate_core::operation_compress::OperationDelta`), lazy subsystem init for tile cache / LLM sidecar / memory watchdog / audit DB / collab transport / `fontdb` (background scan), 10 000-node scale validation |
-| Security hardening (Phase 11) | Per-session 32-byte bearer-token-authenticated LLM sidecar (`kcreate_ai::llm_sidecar` + `--api-key`), TOCTOU port-allocation fix via post-spawn `GET /v1/models` verification handshake, ChaCha20-Poly1305 ACL encryption with auto-migration of plaintext on encrypted projects (`kcreate_collab::acl::{encrypt_acl_bytes,decrypt_acl_bytes}` + `KCAClv1` magic + 12-byte nonce wire format), KChat REST certificate pinning via custom `rustls::ServerCertVerifier` chaining the Mozilla WebPKI root store with a constant-time leaf-cert SHA-256 fingerprint check (`kcreate_kchat_client::pinning`) |
+| Import edges         | `psd` (Adobe PSD layered import), `kamadak-exif` (JPEG / WebP EXIF round-trip), `resvg` (SVG-to-raster preview + thumbnail rasterisation) |
+| Robustness           | Memory-pressure watchdog (`kcreate_bridge::perf::memory_watchdog_start`, `sysinfo`-backed), opt-in autosave + crash recovery (`kcreate_bridge::autosave`), export pre-flight validation (`kcreate_export::validate`) |
+| Image Studio AI      | Non-local-means denoise (`kcreate_ai::denoise`), PatchMatch exemplar inpaint (`kcreate_ai::inpaint`), histogram + gray-world auto colour (`kcreate_ai::auto_color`), magic-wand selection tool (`kcreate_ai::smart_select` + `MagicWandTool.tsx`), SAM segmentation tool with smart-select fallback |
+| Vector / Layout / Brand AI | Stroke-style match (`kcreate_ai::stroke_match`), glyph extraction from photo (`kcreate_ai::glyph_extract`), LLM-driven reformat-to-deck (`kcreate_ai::reformat`) + brief-to-one-pager (`kcreate_ai::one_pager`) + palette harmonisation (`kcreate_ai::palette_harmonize`) + type pairing (`kcreate_ai::type_pairing`) + brand-to-brochure (`kcreate_ai::brand_template`) |
+| Export AI            | Element-aware SVG optimiser with protected `<text>` / `<style>` / CDATA regions (`kcreate_export::svg_optimize`), SSIM-targeted smart-compress for raster (`kcreate_export::smart_compress`), live export preview (`ExportPreviewPanel.tsx`), AI/Illustrator subset import (`kcreate_export::ai_import`), multi-page PDF with TOC / outline / hyperlinks (`kcreate_export::pdf_multi`) |
+| Plugin ecosystem     | Local plugin marketplace (`kcreate_plugin::marketplace`, `PluginManager.tsx` "Marketplace" tab) with Ed25519 signature verification on install |
+| Performance & robustness | Incremental scene diff with per-node `scene_version` + `DirtySet<Uuid>` (`kcreate_bridge::scene_sync`), undo-log delta compression + BLAKE3 blob-ref swapping (`kcreate_core::operation_compress`, configurable via `RuntimeConfig::{compress_undo_log, undo_blob_threshold_bytes}`), startup lazy-init for tile cache / LLM sidecar / memory watchdog with `bridge.<subsystem>.subsystem_ready` startup-timeline marks |
+| Render performance    | Incremental scene sync with `DocumentGraph::drain_dirty` + cached per-node `Vec<Object>` lists (`kcreate_bridge::scene_sync`), BLAKE3 content-addressed image fingerprints on `ObjectKind::Image` (8 bytes hashed per frame vs walking a 48 MB pixel buffer), R-tree spatial index for hit testing (`kcreate_core::document::DocumentGraph` + `kcreate_bridge::hit_test`), batched `FillRect` / `StrokeRect` display-list commands (`kcreate_renderer::pipeline::DisplayCommand::BatchedRects`) |
+| GPU compute filters  | Two-pass separable Gaussian blur, 256-entry-LUT levels / curves, and reuse-the-blur unsharp mask compute pipelines (`crates/kcreate_renderer/src/compute/{gaussian_blur,levels_curves,unsharp_mask}.wgsl`) sharing `wgpu::Device` + `Queue` with `GpuBackend`; CPU fallback when no adapter is available |
+| Async bridge         | Raster filter family (`raster_apply_blur` / `_sharpen` / `_levels` / `_curves` / `_hsl` / `_color_balance` / `_perspective` / `_apply_filter_masked` / `raster_crop`), export operations (`export_png`, `export_pdf`, `export_svg_async`), and `project_save` run as `napi::AsyncTask`s; `project_save` snapshots inside the write guard so concurrent edits can't corrupt the save |
+| Prototype animation  | `Transition { AnimationType, duration_ms, EasingCurve (incl. cubic-bezier + spring), SlideDirection }`, hover / press / `MouseEnter` / `MouseLeave` / `AfterDelay` triggers, `SwitchVariant` Smart-Animate name-matched interpolation (bounds / opacity / HSL fill / corner radius), auto-layout propagation through component instances with depth-bounded recursion + override-aware solvers (`apps/desktop/renderer/src/lib/EasingEngine.ts`, `apps/desktop/renderer/src/components/PrototypePlayer.tsx`, `kcreate_layout::flex::layout_flex_with_overrides`, `kcreate_layout::grid::layout_grid_with_overrides`) |
+| Workspace concurrency | `RwLock<Option<Workspace>>` in `kcreate_bridge::document` (audited read/write call sites), per-node `version: u64` + `document_version: AtomicU64` for lock-free MVCC polling, delta-compressed operations (`kcreate_core::operation_compress::OperationDelta`), lazy subsystem init for tile cache / LLM sidecar / memory watchdog / audit DB / collab transport / `fontdb` (background scan), 10 000-node scale validation |
+| Security hardening    | Per-session 32-byte bearer-token-authenticated LLM sidecar (`kcreate_ai::llm_sidecar` + `--api-key`), TOCTOU port-allocation fix via post-spawn `GET /v1/models` verification handshake, ChaCha20-Poly1305 ACL encryption with auto-migration of plaintext on encrypted projects (`kcreate_collab::acl::{encrypt_acl_bytes,decrypt_acl_bytes}` + `KCAClv1` magic + 12-byte nonce wire format), KChat REST certificate pinning via custom `rustls::ServerCertVerifier` chaining the Mozilla WebPKI root store with a constant-time leaf-cert SHA-256 fingerprint check (`kcreate_kchat_client::pinning`) |
 
 See [`ARCHITECTURE.md`](./ARCHITECTURE.md) for the technical design.
 
@@ -83,7 +83,7 @@ See [`ARCHITECTURE.md`](./ARCHITECTURE.md) for the technical design.
 
 | Platform | Architectures | Notes |
 | --- | --- | --- |
-| macOS  | Intel + Apple Silicon | Metal backend on wgpu; llama.cpp + sd.cpp ship with native Metal acceleration on Apple Silicon (no MLX or Python required — see Phase 12). |
+| macOS  | Intel + Apple Silicon | Metal backend on wgpu; llama.cpp + sd.cpp ship with native Metal acceleration on Apple Silicon (no MLX or Python required). |
 | Windows | x64 | D3D12 backend on wgpu. |
 | Linux  | x64 + arm64 | Vulkan backend on wgpu (mesa ≥ 22 or proprietary drivers). `fontconfig` is required at runtime for system-font discovery; the build script vendors `fontconfig-sys`. **Wayland support: graceful fallback** — if the compositor refuses a window surface (no XDG/X11 bridge), the renderer transparently switches to its offscreen path so the canvas still renders. X11 (`xcb`) is the recommended display server for end users. |
 
@@ -148,7 +148,7 @@ cargo build --workspace --features kcreate_bridge/kchat-backend
 flag — used by the integration tests to mint test attestations
 without standing up a real backend — remains available.
 
-Run the Phase 7 collab performance benchmarks (criterion):
+Run the collab performance benchmarks (criterion):
 
 ```bash
 cargo bench -p kcreate_bridge --features collab --bench collab_perf
@@ -203,9 +203,9 @@ KCreate/
 │   ├── kcreate_mcp/              Loopback-only MCP server (3 tools) + permission store
 │   │                              (Once / Always / Denied)
 │   ├── kcreate_plugin/           WASM plugin sandbox (wasmi 0.42, deny-by-default host ABI;
-│   │                              Phase 2 extended ABI + Ed25519 manifest signing +
+│   │                              extended ABI + Ed25519 manifest signing +
 │   │                              JS panel runtime)
-│   ├── kcreate_collab/           Phase 3 collaboration protocol foundation (peer identity,
+│   ├── kcreate_collab/           Collaboration protocol foundation (peer identity,
 │   │                              Lamport clock, signed envelopes, conflict resolver,
 │   │                              project session). Kept OUT of editing-path deps.
 │   ├── kcreate_collab_transport/ QUIC + mDNS LAN transport (peer discovery, ephemeral
@@ -214,7 +214,7 @@ KCreate/
 │   ├── kcreate_kchat/            Dev-side KChat group-membership issuer (test attestations
 │   │                              against deterministic Ed25519 keys). Behind
 │   │                              `kchat-dev-issuer` feature flag.
-│   ├── kcreate_kchat_client/     Phase 7 KChat backend REST client. HTTPS-only
+│   ├── kcreate_kchat_client/     KChat backend REST client. HTTPS-only
 │   │                              (`reqwest` + `rustls`) against the shared KChat /
 │   │                              Mattermost backend that `uneycom/uney-chat-desktop`
 │   │                              also signs in to. Behind the `kchat-backend`
@@ -225,9 +225,8 @@ KCreate/
 │   │                              collab lifecycle events. Separate SQLite DB so audit
 │   │                              history survives project close/delete.
 │   └── kcreate_tests/            Cross-crate integration tests
-├── PROPOSAL.md                   Product specification
+├── OVERVIEW.md                   Product overview
 ├── ARCHITECTURE.md               Technical architecture
-├── PROGRESS.md                   Phase tracking
 ├── CONTRIBUTING.md               Contributor guide
 ├── SECURITY.md                   Security policy
 ├── AGENTS.md                     Notes for AI coding agents
@@ -238,9 +237,9 @@ KCreate/
 
 ## Collaboration & KChat backend integration
 
-Phase 7 connects KCreate's LAN collaboration stack to the
+KCreate connects its LAN collaboration stack to the
 shared KChat / Mattermost backend that `uneycom/uney-chat-desktop`
-also signs in to (the **Option C** integration shape). The
+also signs in to. The
 integration is opt-in through the `kchat-backend` feature flag
 on `kcreate_bridge` and stays local-first for the editing path:
 the closure walked by

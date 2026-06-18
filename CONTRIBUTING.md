@@ -109,16 +109,15 @@ setup beyond the workspace toolchain.
 Bridge tests share a process-global renderer singleton; they use the
 `serial_test` crate to run serialized.
 
-The Phase 4 vision sidecar (`kcreate_ai::vision_chat`) and the FLUX
+The vision sidecar (`kcreate_ai::vision_chat`) and the FLUX
 image-generation sidecar (`kcreate_ai::diffusion_sidecar` +
 `kcreate_ai::image_gen`) optionally spawn native C++ subprocesses
 (`llama-server` for chat / vision, `sd-server` from
 [stable-diffusion.cpp][sd-cpp] for diffusion). They are NOT required
 for building or testing — without them the bridge still loads and
 the relevant tier of model packs is reported as unavailable rather
-than failing. Phase 12 (PROGRESS.md §"Phase 12") removed all Python
-subprocess dependencies; KCreate ships zero Python, pip, or PyTorch
-at runtime.
+than failing. The AI stack is fully native: KCreate ships zero
+Python, pip, or PyTorch at runtime.
 
 The bridge resolves both binaries by PATH lookup at sidecar-start
 time. Set `KCREATE_SD_SERVER_BINARY` to point at a non-PATH

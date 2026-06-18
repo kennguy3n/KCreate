@@ -23,7 +23,7 @@ import { colors, radius, spacing } from "../styles/tokens";
 interface Breakpoint {
   id: "desktop" | "tablet" | "mobile";
   label: string;
-  width: number; // device-independent pixels, matches PROPOSAL.md §4.2 spec
+  width: number; // device-independent pixels, matches OVERVIEW.md §4.2 spec
 }
 
 const BREAKPOINTS: ReadonlyArray<Breakpoint> = [

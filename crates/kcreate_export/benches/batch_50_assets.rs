@@ -1,6 +1,6 @@
 //! Acceptance-criteria benchmark: **50-asset batch export**.
 //!
-//! OVERVIEW.md §20 lists "50-asset batch export time" alongside the
+//! OVERVIEW.md §8 lists "50-asset batch export time" alongside the
 //! other Tier 0 performance acceptance criteria (cold start, pan/zoom
 //! at 1000 nodes, 64 MP raster open). This benchmark fills the slot
 //! by measuring the wall-clock time for `run_batch` (sequential) and

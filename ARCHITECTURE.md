@@ -1256,7 +1256,7 @@ project store has three lifecycle entry points:
   the recovery escape hatch. Decrypts the project to a
   plaintext copy at `out`; this is the user-facing answer to
   the "what if I lose my passphrase" failure mode called out
-  in OVERVIEW.md §21.
+  in OVERVIEW.md §9.
 
 Unencrypted projects continue to work; the only behavioural
 difference is whether `PRAGMA key` is issued at open time. The

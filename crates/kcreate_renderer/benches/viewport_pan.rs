@@ -4,7 +4,7 @@
 //!
 //! Phase 6 Task 30 — acceptance-criteria coverage. The
 //! `viewport_pan_1000_nodes` group mirrors the 1000-node pan/zoom
-//! target from OVERVIEW.md §20 (30 fps Tier 0, 60 fps Tier 1+). Pair
+//! target from OVERVIEW.md §8 (30 fps Tier 0, 60 fps Tier 1+). Pair
 //! it with the `cold_start` bench in `kcreate_renderer/benches/` for
 //! the renderer-init half of the cold-start budget.
 
@@ -44,7 +44,7 @@ fn bench_pan(c: &mut Criterion) {
 }
 
 /// 1000-node pan benchmark — acceptance criterion from
-/// OVERVIEW.md §20: 30 fps Tier 0, 60 fps Tier 1+. The bench reports
+/// OVERVIEW.md §8: 30 fps Tier 0, 60 fps Tier 1+. The bench reports
 /// per-frame time; convert to fps via `1 / time_per_iter` to compare
 /// against the target.
 fn bench_pan_1000_nodes(c: &mut Criterion) {

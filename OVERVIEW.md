@@ -360,7 +360,7 @@ KCreate's UI uses the KChat token set:
 
 ---
 
-## 15. Import / export compatibility
+## 7. Import / export compatibility
 
 | Format          | Import | Export | Notes                                              |
 | --------------- | :----: | :----: | -------------------------------------------------- |
@@ -381,7 +381,7 @@ Legend: ✅ first-class · ⚠️ best-effort · — not applicable.
 
 ---
 
-## 20. Performance targets
+## 8. Performance targets
 
 ### Local-first
 
@@ -416,7 +416,7 @@ Legend: ✅ first-class · ⚠️ best-effort · — not applicable.
 
 ---
 
-## 21. Key risks and mitigations
+## 9. Key risks and mitigations
 
 | Risk                                                              | Severity | Mitigation                                                                                 |
 | ----------------------------------------------------------------- | -------- | ------------------------------------------------------------------------------------------ |
